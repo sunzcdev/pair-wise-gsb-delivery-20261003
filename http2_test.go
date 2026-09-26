@@ -713,3 +713,281 @@ type buffConn struct {
 func (c *buffConn) Read(b []byte) (int, error) {
 	return c.r.Read(b)
 }
+
+// startTCPFinalAfterEOFServer starts a TCP server that reads each connection
+// until EOF (client half-close), then sends finalMsg and closes.
+func startTCPFinalAfterEOFServer(t *testing.T, finalMsg string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(io.Discard, conn)
+				_, _ = io.WriteString(conn, finalMsg)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// startTCPEchoServer starts a TCP server that echoes back everything it receives.
+func startTCPEchoServer(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// readAllWithTimeout reads r to EOF, failing the test if it takes too long.
+func readAllWithTimeout(t *testing.T, r io.Reader) []byte {
+	t.Helper()
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(r)
+		ch <- result{b, err}
+	}()
+	select {
+	case res := <-ch:
+		require.NoError(t, res.err)
+		return res.b
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out reading from tunnel")
+		return nil
+	}
+}
+
+// TestHTTP2ConnectParallelTunnels is the acceptance scenario for CONNECT over
+// HTTP/2: multiple tunnels multiplexed on a single H2 connection. Tunnel 1
+// half-closes its write direction after the request and the target returns a
+// final chunk afterwards; tunnel 2 keeps transferring the whole time. Later
+// tunnels are cancelled / timed out / closed and must not terminate tunnel 2.
+func TestHTTP2ConnectParallelTunnels(t *testing.T) {
+	finalAddr := startTCPFinalAfterEOFServer(t, "final-chunk")
+	echoAddr := startTCPEchoServer(t)
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		return goproxy.OkConnect, host
+	})
+
+	proxySrv := httptest.NewUnstartedServer(proxy)
+	proxySrv.EnableHTTP2 = true
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	h2client := dialH2Proxy(t, proxySrv.URL)
+
+	connect := func(ctx context.Context, addr string) (resp *http.Response, pw *io.PipeWriter) {
+		t.Helper()
+		pr, pw := io.Pipe()
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+addr, pr)
+		require.NoError(t, err)
+		resp, err = h2client.RoundTrip(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return resp, pw
+	}
+
+	// Tunnel 2: continuous echo traffic for the whole test.
+	resp2, pw2 := connect(context.Background(), echoAddr)
+	echoErr := make(chan error, 1)
+	stopEcho := make(chan struct{})
+	var echoRounds atomic.Uint64
+	go func() {
+		msg := []byte("ping")
+		buf := make([]byte, len(msg))
+		for {
+			select {
+			case <-stopEcho:
+				return
+			default:
+			}
+			if _, err := pw2.Write(msg); err != nil {
+				echoErr <- err
+				return
+			}
+			if _, err := io.ReadFull(resp2.Body, buf); err != nil {
+				echoErr <- err
+				return
+			}
+			echoRounds.Add(1)
+		}
+	}()
+	waitEchoAdvance := func() {
+		t.Helper()
+		before := echoRounds.Load()
+		require.Eventually(t, func() bool {
+			return echoRounds.Load() > before
+		}, 5*time.Second, 5*time.Millisecond, "echo tunnel stopped making progress")
+	}
+	waitEchoAdvance()
+
+	// Tunnel 1: send the request, half-close the write direction, then the
+	// target returns its final chunk.
+	resp1, pw1 := connect(context.Background(), finalAddr)
+	_, err := pw1.Write([]byte("request-data"))
+	require.NoError(t, err)
+	require.NoError(t, pw1.Close()) // client half-close: END_STREAM
+	final := readAllWithTimeout(t, resp1.Body)
+	assert.Equal(t, "final-chunk", string(final))
+	_ = resp1.Body.Close()
+	waitEchoAdvance() // tunnel 1's half-close and close must not kill tunnel 2
+
+	// Tunnel 3: cancelled mid-flight; tunnel 2 must survive.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	resp3, pw3 := connect(ctx3, echoAddr)
+	_, err = pw3.Write([]byte("x"))
+	require.NoError(t, err)
+	_, err = resp3.Body.Read(make([]byte, 1))
+	require.NoError(t, err)
+	cancel3()
+	_ = pw3.Close()
+	_ = resp3.Body.Close()
+	waitEchoAdvance()
+
+	// Tunnel 4: client-side timeout; tunnel 2 must survive.
+	ctx4, cancel4 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel4()
+	resp4, pw4 := connect(ctx4, echoAddr)
+	_, err = pw4.Write([]byte("y"))
+	require.NoError(t, err)
+	_, err = resp4.Body.Read(make([]byte, 1))
+	require.NoError(t, err)
+	<-ctx4.Done()
+	_ = pw4.Close()
+	_ = resp4.Body.Close()
+	waitEchoAdvance()
+
+	// Tunnel 2 is still healthy after everything else ended.
+	close(stopEcho)
+	select {
+	case err := <-echoErr:
+		t.Fatalf("echo tunnel broke while other tunnels ended: %v", err)
+	default:
+	}
+	_ = pw2.Close()
+	_ = resp2.Body.Close()
+}
+
+// TestHTTP2ConnectBackpressurePerStream verifies that flow control is applied
+// per stream: a tunnel whose client stops reading stalls (bounded buffering,
+// no unbounded queue at the proxy) without blocking a sibling tunnel on the
+// same H2 connection.
+func TestHTTP2ConnectBackpressurePerStream(t *testing.T) {
+	const total = 8 << 20 // 8 MiB
+	var written atomic.Int64
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				buf := make([]byte, 32*1024)
+				for written.Load() < total {
+					n, err := conn.Write(buf)
+					written.Add(int64(n))
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	echoAddr := startTCPEchoServer(t)
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		return goproxy.OkConnect, host
+	})
+
+	proxySrv := httptest.NewUnstartedServer(proxy)
+	proxySrv.EnableHTTP2 = true
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	h2client := dialH2Proxy(t, proxySrv.URL)
+
+	// Tunnel 1: the target floods 8 MiB, the client never reads (yet).
+	pr1, pw1 := io.Pipe()
+	defer pw1.Close()
+	req1, err := http.NewRequestWithContext(context.Background(), http.MethodConnect,
+		"https://"+ln.Addr().String(), pr1)
+	require.NoError(t, err)
+	resp1, err := h2client.RoundTrip(req1)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp1.StatusCode)
+
+	// Wait until the target's writer stalls: the proxy must not absorb the
+	// whole stream into an unbounded queue.
+	var stalled int64
+	require.Eventually(t, func() bool {
+		stalled = written.Load()
+		time.Sleep(150 * time.Millisecond)
+		return written.Load() == stalled
+	}, 10*time.Second, 200*time.Millisecond, "target writer never stalled")
+	require.Positive(t, stalled)
+	require.Less(t, stalled, int64(total),
+		"proxy buffered the whole stream although the client is not reading")
+
+	// Tunnel 2 on the same H2 connection still flows while tunnel 1 is stalled.
+	pr2, pw2 := io.Pipe()
+	defer pw2.Close()
+	req2, err := http.NewRequestWithContext(context.Background(), http.MethodConnect,
+		"https://"+echoAddr, pr2)
+	require.NoError(t, err)
+	resp2, err := h2client.RoundTrip(req2)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+	_, err = pw2.Write([]byte("ping"))
+	require.NoError(t, err)
+	echoBuf := make([]byte, len("ping"))
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(resp2.Body, echoBuf)
+		readErr <- err
+	}()
+	select {
+	case err := <-readErr:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled tunnel blocked a sibling stream on the same H2 connection")
+	}
+	assert.Equal(t, "ping", string(echoBuf))
+	_ = resp2.Body.Close()
+
+	// Draining tunnel 1 delivers the full stream.
+	got := readAllWithTimeout(t, resp1.Body)
+	assert.Len(t, got, total)
+	_ = resp1.Body.Close()
+}

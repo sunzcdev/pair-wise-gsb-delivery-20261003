@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
@@ -309,31 +308,53 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		// In HTTP/1.1 mode the client is waiting for the 200 confirmation;
 		// In HTTP/2 mode we send it now, after we know the dial succeeded.
 		if isH2Tunnel {
+			h2c := proxyClient.(*h2StreamConn)
 			w.WriteHeader(http.StatusOK)
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 
-			// H2 handler must block until the tunnel closes, the HTTP/2 server
-			// keeps the stream alive only while ServeHTTP is running.
+			// The H2 handler must block until the tunnel closes: the HTTP/2
+			// server keeps the stream alive only while ServeHTTP is running.
+			// Returning ends the response side of this stream (END_STREAM)
+			// without affecting the other streams of the connection.
+			//
+			// If the client cancels or resets this stream, r.Context() is
+			// canceled; closing both tunnel ends unblocks the copy loops.
+			// The context is per-stream, so other tunnels multiplexed on the
+			// same H2 connection are not affected.
+			stop := context.AfterFunc(r.Context(), func() {
+				_ = targetSiteCon.Close()
+				_ = proxyClient.Close()
+			})
+			defer stop()
+
 			var wg sync.WaitGroup
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				err := copyOrWarn(ctx, targetSiteCon, proxyClient)
-				if err != nil && proxy.ConnectionErrHandler != nil {
-					proxy.ConnectionErrHandler(proxyClient, ctx, err)
-				}
+				// target -> client (response direction)
+				_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
 				_ = targetSiteCon.Close()
-				// Goroutine 2 may be blocked writing to the H2 stream (flow-control
-				// stall). Set a past deadline to unblock it immediately.
-				_ = proxyClient.SetWriteDeadline(time.Now())
+				// Unblock the client -> target loop if it is still reading
+				// the request body; the response direction is done.
+				_ = proxyClient.Close()
 			}()
 			go func() {
 				defer wg.Done()
-				_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
-				// Close r.Body to unblock goroutine 1 if it is still reading from
-				// the H2 stream.
+				// client -> target (request direction)
+				_, err := io.Copy(targetSiteCon, proxyClient)
+				if err != nil && !isH2TunnelTeardownErr(err) && !h2c.closedByUs() {
+					ctx.Warnf("Error copying to target: %s", err)
+					if proxy.ConnectionErrHandler != nil {
+						proxy.ConnectionErrHandler(proxyClient, ctx, err)
+					}
+				}
+				// Propagate the client's half-close (END_STREAM) so the target
+				// sees EOF and can send its final bytes before closing.
+				if hc, ok := targetSiteCon.(halfClosable); ok {
+					_ = hc.CloseWrite()
+				}
 				_ = proxyClient.Close()
 			}()
 			wg.Wait()
@@ -612,6 +633,17 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			go mitmWork()
 		}
 	}
+}
+
+// isH2TunnelTeardownErr reports whether err is a normal end of an H2 CONNECT
+// tunnel (client closed, cancelled or reset the stream) rather than a real
+// copy failure.
+func isH2TunnelTeardownErr(err error) bool {
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeCancel
 }
 
 func httpError(w io.Writer, ctx *ProxyCtx, err error) {

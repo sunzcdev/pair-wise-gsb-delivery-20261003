@@ -27,6 +27,11 @@ type h2StreamConn struct {
 	ctrl   *http.ResponseController
 	local  net.Addr
 	remote net.Addr
+
+	// closedByUsFlag records whether Close was called locally (tunnel
+	// teardown), as opposed to the peer ending or resetting the stream.
+	// Used to tell normal shutdown apart from real copy errors.
+	closedByUsFlag atomic.Bool
 }
 
 // responseWriterProvider is implemented by h2StreamConn so that httpError
@@ -62,7 +67,12 @@ func (c *h2StreamConn) Write(b []byte) (int, error) {
 }
 
 func (c *h2StreamConn) Close() error {
+	c.closedByUsFlag.Store(true)
 	return c.r.Close()
+}
+
+func (c *h2StreamConn) closedByUs() bool {
+	return c.closedByUsFlag.Load()
 }
 
 func (c *h2StreamConn) LocalAddr() net.Addr {
