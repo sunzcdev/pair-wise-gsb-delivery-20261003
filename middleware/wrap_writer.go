@@ -14,30 +14,49 @@ import (
 // hook into various parts of the response process.
 func NewWrapResponseWriter(w http.ResponseWriter, protoMajor int) WrapResponseWriter {
 	_, fl := w.(http.Flusher)
+	_, rf := w.(io.ReaderFrom)
 
 	bw := basicWriter{ResponseWriter: w}
 
 	if protoMajor == 2 {
+		// HTTP/2 connections cannot be hijacked, but the writer may
+		// support server push.
 		_, ps := w.(http.Pusher)
-		if fl && ps {
+		switch {
+		case fl && ps && rf:
 			return &http2FancyWriter{bw}
+		case fl && ps:
+			return &flushPusherWriter{bw}
+		case fl && rf:
+			return &flushReaderFromWriter{bw}
+		case ps && rf:
+			return &pusherReaderFromWriter{bw}
+		case ps:
+			return &pusherWriter{bw}
 		}
 	} else {
 		_, hj := w.(http.Hijacker)
-		_, rf := w.(io.ReaderFrom)
-		if fl && hj && rf {
+		switch {
+		case fl && hj && rf:
 			return &httpFancyWriter{bw}
-		}
-		if fl && hj {
+		case fl && hj:
 			return &flushHijackWriter{bw}
-		}
-		if hj {
+		case fl && rf:
+			return &flushReaderFromWriter{bw}
+		case hj && rf:
+			return &hijackReaderFromWriter{bw}
+		case hj:
 			return &hijackWriter{bw}
+		case rf:
+			return &readerFromWriter{bw}
 		}
 	}
 
 	if fl {
 		return &flushWriter{bw}
+	}
+	if rf {
+		return &readerFromWriter{bw}
 	}
 
 	return &bw
@@ -147,6 +166,27 @@ func (b *basicWriter) Discard() {
 	b.discard = true
 }
 
+// readFrom is the shared implementation behind the ReadFrom method of the
+// wrapper types that expose io.ReaderFrom. It is intentionally unexported:
+// basicWriter itself must not satisfy io.ReaderFrom, only the wrappers whose
+// underlying ResponseWriter does.
+func (b *basicWriter) readFrom(r io.Reader) (int64, error) {
+	if b.tee != nil || b.discard {
+		// Route through basicWriter.Write so that the tee and discard semantics
+		// are honored (the fast ReaderFrom path below would bypass both, writing
+		// straight to the original ResponseWriter). basicWriter.Write already
+		// increments basicWriter.bytes, so we must NOT add n again here (that
+		// would double-count).
+		n, err := io.Copy(b, r)
+		return n, err
+	}
+	rf := b.ResponseWriter.(io.ReaderFrom)
+	b.maybeWriteHeader()
+	n, err := rf.ReadFrom(r)
+	b.bytes += int(n)
+	return n, err
+}
+
 // flushWriter ...
 type flushWriter struct {
 	basicWriter
@@ -187,6 +227,93 @@ func (f *flushHijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 var _ http.Flusher = &flushHijackWriter{}
 var _ http.Hijacker = &flushHijackWriter{}
 
+// readerFromWriter ...
+type readerFromWriter struct {
+	basicWriter
+}
+
+func (f *readerFromWriter) ReadFrom(r io.Reader) (int64, error) {
+	return f.basicWriter.readFrom(r)
+}
+
+var _ io.ReaderFrom = &readerFromWriter{}
+
+// flushReaderFromWriter ...
+type flushReaderFromWriter struct {
+	basicWriter
+}
+
+func (f *flushReaderFromWriter) Flush() {
+	f.basicWriter.flush()
+}
+
+func (f *flushReaderFromWriter) ReadFrom(r io.Reader) (int64, error) {
+	return f.basicWriter.readFrom(r)
+}
+
+var _ http.Flusher = &flushReaderFromWriter{}
+var _ io.ReaderFrom = &flushReaderFromWriter{}
+
+// hijackReaderFromWriter ...
+type hijackReaderFromWriter struct {
+	basicWriter
+}
+
+func (f *hijackReaderFromWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj := f.basicWriter.ResponseWriter.(http.Hijacker)
+	return hj.Hijack()
+}
+
+func (f *hijackReaderFromWriter) ReadFrom(r io.Reader) (int64, error) {
+	return f.basicWriter.readFrom(r)
+}
+
+var _ http.Hijacker = &hijackReaderFromWriter{}
+var _ io.ReaderFrom = &hijackReaderFromWriter{}
+
+// pusherWriter ...
+type pusherWriter struct {
+	basicWriter
+}
+
+func (f *pusherWriter) Push(target string, opts *http.PushOptions) error {
+	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
+}
+
+var _ http.Pusher = &pusherWriter{}
+
+// flushPusherWriter ...
+type flushPusherWriter struct {
+	basicWriter
+}
+
+func (f *flushPusherWriter) Flush() {
+	f.basicWriter.flush()
+}
+
+func (f *flushPusherWriter) Push(target string, opts *http.PushOptions) error {
+	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
+}
+
+var _ http.Flusher = &flushPusherWriter{}
+var _ http.Pusher = &flushPusherWriter{}
+
+// pusherReaderFromWriter ...
+type pusherReaderFromWriter struct {
+	basicWriter
+}
+
+func (f *pusherReaderFromWriter) Push(target string, opts *http.PushOptions) error {
+	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
+}
+
+func (f *pusherReaderFromWriter) ReadFrom(r io.Reader) (int64, error) {
+	return f.basicWriter.readFrom(r)
+}
+
+var _ http.Pusher = &pusherReaderFromWriter{}
+var _ io.ReaderFrom = &pusherReaderFromWriter{}
+
 // httpFancyWriter is a HTTP writer that additionally satisfies
 // http.Flusher, http.Hijacker, and io.ReaderFrom. It exists for the common case
 // of wrapping the http.ResponseWriter that package http gives you, in order to
@@ -204,34 +331,16 @@ func (f *httpFancyWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return hj.Hijack()
 }
 
-func (f *http2FancyWriter) Push(target string, opts *http.PushOptions) error {
-	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
-}
-
 func (f *httpFancyWriter) ReadFrom(r io.Reader) (int64, error) {
-	if f.basicWriter.tee != nil || f.basicWriter.discard {
-		// Route through basicWriter.Write so that the tee and discard semantics
-		// are honored (the fast ReaderFrom path below would bypass both, writing
-		// straight to the original ResponseWriter). basicWriter.Write already
-		// increments basicWriter.bytes, so we must NOT add n again here (that
-		// would double-count).
-		n, err := io.Copy(&f.basicWriter, r)
-		return n, err
-	}
-	rf := f.basicWriter.ResponseWriter.(io.ReaderFrom)
-	f.basicWriter.maybeWriteHeader()
-	n, err := rf.ReadFrom(r)
-	f.basicWriter.bytes += int(n)
-	return n, err
+	return f.basicWriter.readFrom(r)
 }
 
 var _ http.Flusher = &httpFancyWriter{}
 var _ http.Hijacker = &httpFancyWriter{}
-var _ http.Pusher = &http2FancyWriter{}
 var _ io.ReaderFrom = &httpFancyWriter{}
 
 // http2FancyWriter is a HTTP2 writer that additionally satisfies
-// http.Flusher, and io.ReaderFrom. It exists for the common case
+// http.Flusher, http.Pusher, and io.ReaderFrom. It exists for the common case
 // of wrapping the http.ResponseWriter that package http gives you, in order to
 // make the proxied object support the full method set of the proxied object.
 type http2FancyWriter struct {
@@ -242,4 +351,14 @@ func (f *http2FancyWriter) Flush() {
 	f.basicWriter.flush()
 }
 
+func (f *http2FancyWriter) Push(target string, opts *http.PushOptions) error {
+	return f.basicWriter.ResponseWriter.(http.Pusher).Push(target, opts)
+}
+
+func (f *http2FancyWriter) ReadFrom(r io.Reader) (int64, error) {
+	return f.basicWriter.readFrom(r)
+}
+
 var _ http.Flusher = &http2FancyWriter{}
+var _ http.Pusher = &http2FancyWriter{}
+var _ io.ReaderFrom = &http2FancyWriter{}
