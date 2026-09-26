@@ -199,6 +199,7 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	receipt    *Receipt
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -313,6 +314,16 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 	return c.SetWithTTL(key, value, cost, 0*time.Second)
 }
 
+// SetWithReceipt works like Set but additionally returns a Receipt that
+// tracks the final outcome of this specific write. The returned bool still
+// only reports whether the write entered the processing queue; use the
+// Receipt to learn whether the policy actually accepted the item.
+//
+// See Set for more information.
+func (c *Cache[K, V]) SetWithReceipt(key K, value V, cost int64) (*Receipt, bool) {
+	return c.SetWithTTLReceipt(key, value, cost, 0*time.Second)
+}
+
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
 // after the specified TTL (time to live) has passed. A zero value means the value never
 // expires, which is identical to calling Set. A negative value is a no-op and the value
@@ -320,8 +331,25 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	_, ok := c.setWithTTL(key, value, cost, ttl, nil)
+	return ok
+}
+
+// SetWithTTLReceipt works like SetWithTTL but additionally returns a Receipt
+// that tracks the final outcome of this specific write.
+//
+// See SetWithTTL and SetWithReceipt for more information.
+func (c *Cache[K, V]) SetWithTTLReceipt(key K, value V, cost int64, ttl time.Duration) (*Receipt, bool) {
+	return c.setWithTTL(key, value, cost, ttl, newReceipt())
+}
+
+// setWithTTL is the shared implementation of the Set variants. A nil receipt
+// keeps the lightweight path: no wait object is allocated and no outcome is
+// tracked.
+func (c *Cache[K, V]) setWithTTL(key K, value V, cost int64, ttl time.Duration, receipt *Receipt) (*Receipt, bool) {
 	if c == nil || c.isClosed.Load() {
-		return false
+		receipt.resolve(WriteClosed)
+		return receipt, false
 	}
 
 	var expiration time.Time
@@ -331,7 +359,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		break
 	case ttl < 0:
 		// Treat this a no-op.
-		return false
+		receipt.resolve(WriteDropped)
+		return receipt, false
 	default:
 		expiration = time.Now().Add(ttl)
 	}
@@ -344,6 +373,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		receipt:    receipt,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -354,23 +384,38 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	// Attempt to send item to cachePolicy.
 	select {
 	case c.setBuf <- i:
-		return true
+		return receipt, true
 	default:
 		if i.flag == itemUpdate {
 			// Return true if this was an update operation since we've already
 			// updated the storedItems. For all the other operations (set/delete), we
 			// return false which means the item was not inserted.
-			return true
+			// The value has already been applied to storedItems above; only
+			// the policy bookkeeping was dropped.
+			receipt.resolve(WriteApplied)
+			return receipt, true
 		}
 		c.Metrics.add(dropSets, keyHash, 1)
-		return false
+		receipt.resolve(WriteDropped)
+		return receipt, false
 	}
 }
 
 // Del deletes the key-value item from the cache if it exists.
 func (c *Cache[K, V]) Del(key K) {
+	c.del(key, nil)
+}
+
+// DelWithReceipt works like Del but returns a Receipt that is resolved once
+// this specific delete has been processed by the policy.
+func (c *Cache[K, V]) DelWithReceipt(key K) *Receipt {
+	return c.del(key, newReceipt())
+}
+
+func (c *Cache[K, V]) del(key K, receipt *Receipt) *Receipt {
 	if c == nil || c.isClosed.Load() {
-		return
+		receipt.resolve(WriteClosed)
+		return receipt
 	}
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
@@ -384,7 +429,9 @@ func (c *Cache[K, V]) Del(key K) {
 		flag:     itemDelete,
 		Key:      keyHash,
 		Conflict: conflictHash,
+		receipt:  receipt,
 	}
+	return receipt
 }
 
 // GetTTL returns the TTL for the specified key and a bool that is true if the
@@ -437,6 +484,15 @@ func (c *Cache[K, V]) Close() {
 	close(c.stop)
 	close(c.done)
 	close(c.setBuf)
+	// Resolve receipts of any writes that were queued after processItems
+	// stopped and will never be processed.
+	for i := range c.setBuf {
+		if i.wait != nil {
+			close(i.wait)
+			continue
+		}
+		i.receipt.resolve(WriteClosed)
+	}
 	c.cachePolicy.Close()
 	c.cleanupTicker.Stop()
 	c.isClosed.Store(true)
@@ -462,6 +518,7 @@ loop:
 				close(i.wait)
 				continue
 			}
+			i.receipt.resolve(WriteDropped)
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
@@ -554,13 +611,22 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
+				if i.Cost > c.cachePolicy.MaxCost() {
+					// The item can never fit in the cache, so don't bother
+					// asking the policy to admit it.
+					c.onReject(i)
+					i.receipt.resolve(WriteCostExceeded)
+					break
+				}
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
+					i.receipt.resolve(WriteApplied)
 				} else {
 					c.onReject(i)
+					i.receipt.resolve(WriteRejected)
 				}
 				for _, victim := range victims {
 					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
@@ -569,11 +635,13 @@ func (c *Cache[K, V]) processItems() {
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				i.receipt.resolve(WriteApplied)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
 				c.onExit(val)
+				i.receipt.resolve(WriteApplied)
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
