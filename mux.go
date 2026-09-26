@@ -45,6 +45,14 @@ type Mux struct {
 	// Controls the behaviour of middleware chain generation when a mux
 	// is registered as an inline group inside another mux.
 	inline bool
+
+	// namedRoutes maps route names to their routing patterns, as registered
+	// via Name(). It enables reverse URL generation via URL().
+	namedRoutes map[string]string
+
+	// lastPattern is the routing pattern of the most recently registered
+	// route on this mux, used by Name().
+	lastPattern string
 }
 
 // NewMux returns a newly initialized Mux object that implements the Router
@@ -445,6 +453,9 @@ func (mx *Mux) handle(method methodTyp, pattern string, handler http.Handler) *n
 	} else {
 		h = handler
 	}
+
+	// Record the pattern for Name()
+	mx.lastPattern = pattern
 
 	// Add the endpoint to the tree and return the node
 	return mx.tree.InsertRoute(method, pattern, h)

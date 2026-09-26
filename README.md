@@ -327,6 +327,33 @@ func MyRequestHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### Named routes & reverse URL generation
+
+Routes can optionally be named right after registration, and URLs can later be
+generated from the name instead of hand-building path strings - handy for
+redirects and resource links. Naming is entirely optional; unnamed routes work
+exactly as before.
+
+```go
+r := chi.NewRouter()
+r.Get("/users/{id}", showUser)
+r.Name("user.show")
+
+// generate a URL by route name; query params are passed separately
+u, err := r.URL("user.show", map[string]string{"id": "42"}, url.Values{"tab": {"info"}})
+// u.Path == "/users/42", u.String() == "/users/42?tab=info"
+```
+
+`URL` supports plain `{param}` placeholders, `{param:regexp}` placeholders
+(values are validated against the regexp), trailing `*` wildcards, and routes
+named on sub-routers mounted with `Mount` - even multiple levels deep, with
+placeholders in the mount patterns. Parameter values that contain `/`, `%`,
+spaces or non-ASCII characters are percent-encoded: the result always carries
+a fully decoded `Path`, and `RawPath` (set only when encoding is needed)
+decodes back to `Path` in exactly one pass. Unknown names, duplicate names,
+missing or unexpected parameters, and values that don't match a route's
+regexp all produce an error instead of a silently broken link.
+
 
 ## Middlewares
 
