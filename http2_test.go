@@ -659,6 +659,134 @@ func TestMitmProxyOverHTTP2(t *testing.T) {
 	assert.True(t, mitmCalled)
 }
 
+// TestH2ConnectAcceptParallelTunnels verifies that multiple standard CONNECT
+// tunnels can share a single HTTP/2 connection to the proxy:
+//   - a client half-close (END_STREAM) is propagated to the target, which can
+//     then send its final response back through the tunnel;
+//   - completing, cancelling or timing out one tunnel does not affect the
+//     other tunnels multiplexed on the same H2 connection.
+func TestH2ConnectAcceptParallelTunnels(t *testing.T) {
+	// Target 1: waits for the client to half-close, then sends its final
+	// chunk and closes.
+	halfCloseLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer halfCloseLn.Close()
+	go func() {
+		for {
+			c, err := halfCloseLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, c) // read until client EOF
+				_, _ = io.WriteString(c, "final-chunk-after-halfclose")
+				_ = c.Close()
+			}()
+		}
+	}()
+
+	// Target 2: echo server, keeps streaming until disconnected.
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer echoLn.Close()
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		return goproxy.OkConnect, host
+	})
+
+	proxySrv := httptest.NewUnstartedServer(proxy)
+	proxySrv.EnableHTTP2 = true
+	proxySrv.StartTLS()
+	defer proxySrv.Close()
+
+	// A single H2 connection to the proxy carries all the tunnels below.
+	h2client := dialH2Proxy(t, proxySrv.URL)
+
+	openTunnel := func(ctx context.Context, addr string) (*http.Response, *io.PipeWriter) {
+		t.Helper()
+		pr, pw := io.Pipe()
+		req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+addr, pr)
+		require.NoError(t, err)
+		resp, err := h2client.RoundTrip(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return resp, pw
+	}
+
+	// Tunnel 2: continuous echo traffic, opened first and used throughout
+	// the lifecycle of the other tunnels.
+	resp2, pw2 := openTunnel(context.Background(), echoLn.Addr().String())
+	defer resp2.Body.Close()
+	defer pw2.Close()
+
+	echoRoundTrip := func(msg string) {
+		t.Helper()
+		_, err := pw2.Write([]byte(msg))
+		require.NoError(t, err)
+		buf := make([]byte, len(msg))
+		_, err = io.ReadFull(resp2.Body, buf)
+		require.NoError(t, err)
+		require.Equal(t, msg, string(buf))
+	}
+	echoRoundTrip("before-tunnel-1")
+
+	// Tunnel 1: send the request, then half-close the write direction.
+	// The target replies with its final chunk only after seeing the EOF.
+	resp1, pw1 := openTunnel(context.Background(), halfCloseLn.Addr().String())
+	_, err = pw1.Write([]byte("request-payload"))
+	require.NoError(t, err)
+	require.NoError(t, pw1.Close()) // END_STREAM: client half-closes
+
+	final, err := io.ReadAll(resp1.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "final-chunk-after-halfclose", string(final))
+	_ = resp1.Body.Close()
+
+	// Tunnel 1 completed and closed: tunnel 2 must be unaffected.
+	echoRoundTrip("after-tunnel-1-closed")
+
+	// Tunnel 3: cancelled mid-transfer; tunnel 2 must survive.
+	ctx3, cancel3 := context.WithCancel(context.Background())
+	resp3, pw3 := openTunnel(ctx3, echoLn.Addr().String())
+	_, err = pw3.Write([]byte("ping"))
+	require.NoError(t, err)
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(resp3.Body, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf))
+	cancel3()
+	_ = resp3.Body.Close()
+	_ = pw3.Close()
+	echoRoundTrip("after-tunnel-3-cancel")
+
+	// Tunnel 4: times out mid-transfer; tunnel 2 must still survive.
+	ctx4, cancel4 := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel4()
+	resp4, pw4 := openTunnel(ctx4, echoLn.Addr().String())
+	_, err = pw4.Write([]byte("ping"))
+	require.NoError(t, err)
+	_, err = io.ReadFull(resp4.Body, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf))
+	<-ctx4.Done()
+	_ = resp4.Body.Close()
+	_ = pw4.Close()
+	echoRoundTrip("after-tunnel-4-timeout")
+}
+
 // dialH2Proxy connects to proxyURL over TLS, negotiates H2, and returns an
 // *http2.ClientConn ready to send requests.
 func dialH2Proxy(t *testing.T, proxyURL string) *http2.ClientConn {

@@ -16,7 +16,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
@@ -320,21 +319,30 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			wg.Add(2)
 			go func() {
 				defer wg.Done()
-				err := copyOrWarn(ctx, targetSiteCon, proxyClient)
+				// client -> target
+				err := copyOrWarnH2(ctx, targetSiteCon, proxyClient)
 				if err != nil && proxy.ConnectionErrHandler != nil {
 					proxy.ConnectionErrHandler(proxyClient, ctx, err)
 				}
-				_ = targetSiteCon.Close()
-				// Goroutine 2 may be blocked writing to the H2 stream (flow-control
-				// stall). Set a past deadline to unblock it immediately.
-				_ = proxyClient.SetWriteDeadline(time.Now())
+				// The client half-closed its send direction (END_STREAM on the
+				// request body). Propagate the EOF to the target so it can finish
+				// processing and send its final response; the target -> client
+				// direction stays open to deliver those last bytes.
+				if tc, ok := targetSiteCon.(halfClosable); ok {
+					_ = tc.CloseWrite()
+				} else {
+					_ = targetSiteCon.Close()
+				}
 			}()
 			go func() {
 				defer wg.Done()
+				// target -> client
 				_ = copyOrWarn(ctx, proxyClient, targetSiteCon)
-				// Close r.Body to unblock goroutine 1 if it is still reading from
-				// the H2 stream.
+				// The target will not send any more data: close r.Body to unblock
+				// goroutine 1 if it is still reading from the H2 stream, and close
+				// the target connection in case it is blocked writing to it.
 				_ = proxyClient.Close()
+				_ = targetSiteCon.Close()
 			}()
 			wg.Wait()
 		} else {
@@ -650,6 +658,25 @@ func copyOrWarn(ctx *ProxyCtx, dst io.Writer, src io.Reader) error {
 	_, err := io.Copy(dst, src)
 	if err != nil && errors.Is(err, net.ErrClosed) {
 		// Discard closed connection errors
+		err = nil
+	} else if err != nil {
+		ctx.Warnf("Error copying to client: %s", err)
+	}
+	return err
+}
+
+// h2BodyClosedErr matches the unexported error returned by net/http's HTTP/2
+// server (and x/net/http2) when reading a request body that the handler side
+// has already closed.
+const h2BodyClosedErr = "body closed by handler"
+
+// copyOrWarnH2 is the H2-tunnel variant of copyOrWarn for the client->target
+// direction: when the target->client copy finishes first it closes the request
+// body, and a blocked read on that body fails with h2BodyClosedErr. That is
+// normal tunnel teardown, not a warning.
+func copyOrWarnH2(ctx *ProxyCtx, dst io.Writer, src io.Reader) error {
+	_, err := io.Copy(dst, src)
+	if err != nil && (errors.Is(err, net.ErrClosed) || err.Error() == h2BodyClosedErr) {
 		err = nil
 	} else if err != nil {
 		ctx.Warnf("Error copying to client: %s", err)
