@@ -42,6 +42,9 @@ type Mux struct {
 	// The middleware stack
 	middlewares []func(http.Handler) http.Handler
 
+	// Named routes registered on this mux for reverse URL generation
+	named map[string]*namedRoute
+
 	// Controls the behaviour of middleware chain generation when a mux
 	// is registered as an inline group inside another mux.
 	inline bool

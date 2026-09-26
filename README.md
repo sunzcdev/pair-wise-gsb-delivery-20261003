@@ -224,6 +224,29 @@ type Router interface {
 	Query(pattern string, h http.HandlerFunc)
 	Trace(pattern string, h http.HandlerFunc)
 
+	// Named routing along `pattern`, registering each route under `name`
+	// for reverse URL generation with URL. Registering the same name for
+	// two different patterns on one mux panics.
+	NamedHandle(name, pattern string, h http.Handler)
+	NamedHandleFunc(name, pattern string, h http.HandlerFunc)
+	NamedMethod(name, method, pattern string, h http.Handler)
+	NamedMethodFunc(name, method, pattern string, h http.HandlerFunc)
+	NamedConnect(name, pattern string, h http.HandlerFunc)
+	NamedDelete(name, pattern string, h http.HandlerFunc)
+	NamedGet(name, pattern string, h http.HandlerFunc)
+	NamedHead(name, pattern string, h http.HandlerFunc)
+	NamedOptions(name, pattern string, h http.HandlerFunc)
+	NamedPatch(name, pattern string, h http.HandlerFunc)
+	NamedPost(name, pattern string, h http.HandlerFunc)
+	NamedPut(name, pattern string, h http.HandlerFunc)
+	NamedQuery(name, pattern string, h http.HandlerFunc)
+	NamedTrace(name, pattern string, h http.HandlerFunc)
+
+	// URL generates a URL for the route registered under `name`,
+	// substituting path placeholders from `params` and appending
+	// `query` as the query string.
+	URL(name string, params map[string]string, query url.Values) (*url.URL, error)
+
 	// NotFound defines a handler to respond whenever a route could
 	// not be found.
 	NotFound(h http.HandlerFunc)
@@ -326,6 +349,32 @@ func MyRequestHandler(w http.ResponseWriter, r *http.Request) {
   w.Write([]byte(fmt.Sprintf("hi %v, %v", userID, key)))
 }
 ```
+
+### Named routes & reverse URL generation
+
+Routes can optionally be registered under a name with the `Named*` variants of
+the routing methods, and later turned back into URLs with `URL` - handy for
+issuing redirects and resource links without hand-building path strings.
+
+```go
+r := chi.NewRouter()
+r.NamedGet("user.show", "/users/{id}", showUser)
+
+api := chi.NewRouter()
+api.NamedGet("article.show", "/articles/{id:\\d+}", showArticle)
+r.Mount("/orgs/{orgID}/api", api)
+
+// Mount prefixes of sub-routers are composed into the generated path.
+u, err := r.URL("article.show", map[string]string{"orgID": "7", "id": "42"}, url.Values{"tab": {"comments"}})
+// u.Path == "/orgs/7/api/articles/42", u.String() == "/orgs/7/api/articles/42?tab=comments"
+```
+
+The trailing `*` wildcard is addressed with the params key `"*"`. Placeholder
+values are percent-encoded into `RawPath` exactly once, so `Path` always holds
+the decoded path; query parameters are passed separately and are never consumed
+as path parameters. Unknown names, duplicate registrations, missing or extra
+parameters, and values rejected by a `{param:regexp}` constraint are reported
+as errors instead of silently producing a broken link.
 
 
 ## Middlewares

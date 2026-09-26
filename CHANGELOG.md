@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added optional named routes and reverse URL generation: register routes with
+  the new `Named*` methods (e.g. `NamedGet`) and build URLs with `Mux.URL`,
+  which composes `Mount` prefixes, validates `{param:regexp}` constraints and
+  percent-encodes placeholder values exactly once
+
+
 ## v5.0.12 (2024-02-16)
 
 - History of changes: see https://github.com/go-chi/chi/compare/v5.0.11...v5.0.12

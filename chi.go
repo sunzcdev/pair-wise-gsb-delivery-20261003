@@ -56,7 +56,10 @@
 //	"/date/{yyyy:\\d\\d\\d\\d}/{mm:\\d\\d}/{dd:\\d\\d}" matches "/date/2017/04/01"
 package chi
 
-import "net/http"
+import (
+	"net/http"
+	"net/url"
+)
 
 // NewRouter returns a new Mux object that implements the Router interface.
 func NewRouter() *Mux {
@@ -106,6 +109,29 @@ type Router interface {
 	Put(pattern string, h http.HandlerFunc)
 	Query(pattern string, h http.HandlerFunc)
 	Trace(pattern string, h http.HandlerFunc)
+
+	// Named routing along `pattern`, registering each route under `name`
+	// for reverse URL generation with URL. Registering the same name for
+	// two different patterns on one mux panics.
+	NamedHandle(name, pattern string, h http.Handler)
+	NamedHandleFunc(name, pattern string, h http.HandlerFunc)
+	NamedMethod(name, method, pattern string, h http.Handler)
+	NamedMethodFunc(name, method, pattern string, h http.HandlerFunc)
+	NamedConnect(name, pattern string, h http.HandlerFunc)
+	NamedDelete(name, pattern string, h http.HandlerFunc)
+	NamedGet(name, pattern string, h http.HandlerFunc)
+	NamedHead(name, pattern string, h http.HandlerFunc)
+	NamedOptions(name, pattern string, h http.HandlerFunc)
+	NamedPatch(name, pattern string, h http.HandlerFunc)
+	NamedPost(name, pattern string, h http.HandlerFunc)
+	NamedPut(name, pattern string, h http.HandlerFunc)
+	NamedQuery(name, pattern string, h http.HandlerFunc)
+	NamedTrace(name, pattern string, h http.HandlerFunc)
+
+	// URL generates a URL for the route registered under `name`,
+	// substituting path placeholders from `params` and appending
+	// `query` as the query string.
+	URL(name string, params map[string]string, query url.Values) (*url.URL, error)
 
 	// NotFound defines a handler to respond whenever a route could
 	// not be found.
