@@ -1135,3 +1135,138 @@ func TestCacheWithTTL(t *testing.T) {
 		})
 	}
 }
+
+func waitReceipt(t *testing.T, r *WriteReceipt) WriteStatus {
+	t.Helper()
+	require.NotNil(t, r)
+	select {
+	case status := <-r.Done():
+		return status
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for write receipt")
+		return WriteStatus(-1)
+	}
+}
+
+func newReceiptTestCache(t *testing.T, maxCost int64) *Cache[string, int] {
+	t.Helper()
+	c, err := NewCache(&Config[string, int]{
+		NumCounters:        100,
+		MaxCost:            maxCost,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(c.Close)
+	return c
+}
+
+func TestWriteReceiptAccepted(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	ok, r := c.SetWithReceipt("k", 1, 1)
+	require.True(t, ok)
+	require.Equal(t, WriteAccepted, waitReceipt(t, r))
+
+	val, found := c.Get("k")
+	require.True(t, found)
+	require.Equal(t, 1, val)
+}
+
+func TestWriteReceiptUpdate(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	_, r1 := c.SetWithReceipt("k", 1, 1)
+	require.Equal(t, WriteAccepted, waitReceipt(t, r1))
+
+	_, r2 := c.SetWithReceipt("k", 2, 1)
+	require.Equal(t, WriteUpdated, waitReceipt(t, r2))
+
+	val, found := c.Get("k")
+	require.True(t, found)
+	require.Equal(t, 2, val)
+}
+
+func TestWriteReceiptGenerations(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	// Two writes to the same key with a delete in between. Each receipt must
+	// report the fate of its own generation of the operation.
+	ok1, r1 := c.SetWithReceipt("k", 1, 1)
+	require.True(t, ok1)
+	rd := c.DelWithReceipt("k")
+	ok2, r2 := c.SetWithReceipt("k", 2, 1)
+	require.True(t, ok2)
+
+	require.Equal(t, WriteAccepted, waitReceipt(t, r1))
+	require.Equal(t, WriteDeleted, waitReceipt(t, rd))
+	require.Equal(t, WriteAccepted, waitReceipt(t, r2))
+
+	val, found := c.Get("k")
+	require.True(t, found)
+	require.Equal(t, 2, val)
+}
+
+func TestWriteReceiptCostExceeded(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	// The write enters the queue but can never fit in the cache.
+	ok, r := c.SetWithReceipt("big", 1, 11)
+	require.True(t, ok)
+	require.Equal(t, WriteCostExceeded, waitReceipt(t, r))
+
+	_, found := c.Get("big")
+	require.False(t, found)
+}
+
+func TestWriteReceiptRejected(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	require.True(t, c.Set("a", 1, 5))
+	c.Wait()
+	// Give "a" enough hits that a newcomer isn't worth keeping. BufferItems
+	// is 64, so push more than that to make sure the policy sees the hits.
+	for i := 0; i < 100; i++ {
+		c.Get("a")
+	}
+	// Let the get buffer propagate to the policy.
+	time.Sleep(wait)
+
+	ok, r := c.SetWithReceipt("b", 2, 6)
+	require.True(t, ok)
+	require.Equal(t, WriteRejected, waitReceipt(t, r))
+
+	_, found := c.Get("b")
+	require.False(t, found)
+}
+
+func TestWriteReceiptDropped(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+
+	// A negative TTL is a no-op: the write is discarded up front.
+	ok, r := c.SetWithTTLReceipt("k", 1, 1, -time.Second)
+	require.False(t, ok)
+	require.Equal(t, WriteDropped, waitReceipt(t, r))
+}
+
+func TestWriteReceiptClosed(t *testing.T) {
+	c := newReceiptTestCache(t, 10)
+	c.Close()
+
+	ok, r := c.SetWithReceipt("k", 1, 1)
+	require.False(t, ok)
+	require.Equal(t, WriteClosed, waitReceipt(t, r))
+
+	rd := c.DelWithReceipt("k")
+	require.Equal(t, WriteClosed, waitReceipt(t, rd))
+}
+
+func TestWriteReceiptStatusString(t *testing.T) {
+	require.Equal(t, "accepted", WriteAccepted.String())
+	require.Equal(t, "updated", WriteUpdated.String())
+	require.Equal(t, "deleted", WriteDeleted.String())
+	require.Equal(t, "rejected", WriteRejected.String())
+	require.Equal(t, "dropped", WriteDropped.String())
+	require.Equal(t, "cost-exceeded", WriteCostExceeded.String())
+	require.Equal(t, "closed", WriteClosed.String())
+}

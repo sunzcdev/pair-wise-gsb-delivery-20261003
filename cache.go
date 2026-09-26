@@ -190,6 +190,91 @@ const (
 	itemUpdate
 )
 
+// WriteStatus describes the final outcome of a single write operation (Set or
+// Del) once it has been fully processed by the cache.
+type WriteStatus int
+
+const (
+	// WriteAccepted means the item was admitted by the admission policy and
+	// stored in the cache.
+	WriteAccepted WriteStatus = iota
+	// WriteUpdated means the write was applied as an update to an already
+	// existing key.
+	WriteUpdated
+	// WriteDeleted means the delete was applied.
+	WriteDeleted
+	// WriteRejected means the admission policy (TinyLFU) decided the item
+	// isn't worth keeping.
+	WriteRejected
+	// WriteDropped means the write never made it through the write buffer,
+	// either because the buffer was full or because the buffered write was
+	// discarded (e.g. by Clear) before being processed.
+	WriteDropped
+	// WriteCostExceeded means the item's cost is greater than the cache's
+	// MaxCost, so it can never be admitted.
+	WriteCostExceeded
+	// WriteClosed means the cache was already closed when the write was
+	// attempted, so it was never processed.
+	WriteClosed
+)
+
+func (s WriteStatus) String() string {
+	switch s {
+	case WriteAccepted:
+		return "accepted"
+	case WriteUpdated:
+		return "updated"
+	case WriteDeleted:
+		return "deleted"
+	case WriteRejected:
+		return "rejected"
+	case WriteDropped:
+		return "dropped"
+	case WriteCostExceeded:
+		return "cost-exceeded"
+	case WriteClosed:
+		return "closed"
+	default:
+		return "unknown"
+	}
+}
+
+// WriteReceipt is a per-write handle that lets callers observe the final
+// outcome of that exact write operation. A receipt is completed exactly once,
+// when the write it belongs to has been fully processed (or discarded).
+//
+// Because each write gets its own receipt, consecutive writes to the same key
+// (even with deletes in between) are tracked independently: every receipt
+// reports the fate of its own generation of the operation.
+type WriteReceipt struct {
+	ch chan WriteStatus
+}
+
+func newWriteReceipt() *WriteReceipt {
+	return &WriteReceipt{ch: make(chan WriteStatus, 1)}
+}
+
+// complete delivers the final status. It is nil-safe so the lightweight write
+// path (no receipt requested) doesn't need extra branches.
+func (r *WriteReceipt) complete(status WriteStatus) {
+	if r == nil {
+		return
+	}
+	r.ch <- status
+}
+
+// Done returns a channel that receives exactly one WriteStatus once the write
+// has been fully processed. It is never closed without a value being sent.
+func (r *WriteReceipt) Done() <-chan WriteStatus {
+	return r.ch
+}
+
+// Wait blocks until the write has been fully processed and returns its final
+// status.
+func (r *WriteReceipt) Wait() WriteStatus {
+	return <-r.ch
+}
+
 // Item is a full representation of what's stored in the cache for each key-value pair.
 type Item[V any] struct {
 	flag       itemFlag
@@ -199,6 +284,7 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	receipt    *WriteReceipt
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -313,6 +399,19 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 	return c.SetWithTTL(key, value, cost, 0*time.Second)
 }
 
+// SetWithReceipt works like Set but additionally returns a WriteReceipt that
+// is completed once this exact write has been fully processed by the cache.
+//
+// The returned boolean keeps the same meaning as Set: it only reports whether
+// the write entered the processing pipeline (true) or was dropped up front
+// (false). The receipt separates "entered the queue" from "policy finished
+// with it": use receipt.Wait() (or select on receipt.Done()) to learn the
+// final WriteStatus of this specific write, e.g. WriteAccepted, WriteRejected
+// or WriteCostExceeded.
+func (c *Cache[K, V]) SetWithReceipt(key K, value V, cost int64) (bool, *WriteReceipt) {
+	return c.SetWithTTLReceipt(key, value, cost, 0*time.Second)
+}
+
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
 // after the specified TTL (time to live) has passed. A zero value means the value never
 // expires, which is identical to calling Set. A negative value is a no-op and the value
@@ -320,8 +419,28 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	ok, _ := c.set(key, value, cost, ttl, false)
+	return ok
+}
+
+// SetWithTTLReceipt works like SetWithTTL but additionally returns a
+// WriteReceipt, just like SetWithReceipt does for Set.
+func (c *Cache[K, V]) SetWithTTLReceipt(key K, value V, cost int64, ttl time.Duration) (bool, *WriteReceipt) {
+	return c.set(key, value, cost, ttl, true)
+}
+
+// set is the shared implementation for all Set variants. When withReceipt is
+// false, no WriteReceipt is allocated, keeping the plain Set path as light as
+// before.
+func (c *Cache[K, V]) set(key K, value V, cost int64, ttl time.Duration, withReceipt bool) (bool, *WriteReceipt) {
+	var receipt *WriteReceipt
+	if withReceipt {
+		receipt = newWriteReceipt()
+	}
+
 	if c == nil || c.isClosed.Load() {
-		return false
+		receipt.complete(WriteClosed)
+		return false, receipt
 	}
 
 	var expiration time.Time
@@ -331,7 +450,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		break
 	case ttl < 0:
 		// Treat this a no-op.
-		return false
+		receipt.complete(WriteDropped)
+		return false, receipt
 	default:
 		expiration = time.Now().Add(ttl)
 	}
@@ -344,6 +464,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		receipt:    receipt,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -354,23 +475,43 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	// Attempt to send item to cachePolicy.
 	select {
 	case c.setBuf <- i:
-		return true
+		return true, receipt
 	default:
 		if i.flag == itemUpdate {
 			// Return true if this was an update operation since we've already
 			// updated the storedItems. For all the other operations (set/delete), we
 			// return false which means the item was not inserted.
-			return true
+			receipt.complete(WriteUpdated)
+			return true, receipt
 		}
 		c.Metrics.add(dropSets, keyHash, 1)
-		return false
+		receipt.complete(WriteDropped)
+		return false, receipt
 	}
 }
 
 // Del deletes the key-value item from the cache if it exists.
 func (c *Cache[K, V]) Del(key K) {
+	c.del(key, false)
+}
+
+// DelWithReceipt works like Del but returns a WriteReceipt that is completed
+// (with WriteDeleted) once this exact delete has been applied by the
+// processing goroutine. This is useful to order subsequent operations after
+// the delete has fully propagated through the policy.
+func (c *Cache[K, V]) DelWithReceipt(key K) *WriteReceipt {
+	return c.del(key, true)
+}
+
+func (c *Cache[K, V]) del(key K, withReceipt bool) *WriteReceipt {
+	var receipt *WriteReceipt
+	if withReceipt {
+		receipt = newWriteReceipt()
+	}
+
 	if c == nil || c.isClosed.Load() {
-		return
+		receipt.complete(WriteClosed)
+		return receipt
 	}
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
@@ -384,7 +525,9 @@ func (c *Cache[K, V]) Del(key K) {
 		flag:     itemDelete,
 		Key:      keyHash,
 		Conflict: conflictHash,
+		receipt:  receipt,
 	}
+	return receipt
 }
 
 // GetTTL returns the TTL for the specified key and a bool that is true if the
@@ -462,6 +605,8 @@ loop:
 				close(i.wait)
 				continue
 			}
+			// The write was discarded before the policy could process it.
+			i.receipt.complete(WriteDropped)
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
@@ -554,13 +699,24 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
+				if i.Cost > c.cachePolicy.MaxCost() {
+					// The item can never fit in the cache. The policy would
+					// reject it anyway, but classifying it here lets the
+					// receipt distinguish cost overflow from a TinyLFU
+					// rejection.
+					c.onReject(i)
+					i.receipt.complete(WriteCostExceeded)
+					continue
+				}
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
+					i.receipt.complete(WriteAccepted)
 				} else {
 					c.onReject(i)
+					i.receipt.complete(WriteRejected)
 				}
 				for _, victim := range victims {
 					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
@@ -569,11 +725,13 @@ func (c *Cache[K, V]) processItems() {
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				i.receipt.complete(WriteUpdated)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
 				c.onExit(val)
+				i.receipt.complete(WriteDeleted)
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
