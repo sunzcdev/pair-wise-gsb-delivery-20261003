@@ -50,6 +50,7 @@ const (
 	StatusBadCommandSequence       = 503 // RFC 959, 4.2.1
 	StatusNotImplementedParam      = 504 // RFC 959, 4.2.1
 	StatusNotLoggedIn              = 530 // RFC 959, 4.2.1
+	StatusActionNotTakenPolicy     = 534 // RFC 2228, 3.2
 	StatusActionNotTaken           = 550 // RFC 959, 4.2.1
 	StatusActionAborted            = 552 // RFC 959, 4.2.1
 	StatusActionNotTakenNoFile     = 553 // RFC 959, 4.2.1

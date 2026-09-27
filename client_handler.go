@@ -93,6 +93,7 @@ type clientHandler struct {
 	paramsMutex         sync.RWMutex    // mutex to protect the parameters exposed to the library users
 	driver              ClientDriver    // Client handling driver
 	conn                net.Conn        // TCP connection
+	rawConn             net.Conn        // connection underlying a TLS control connection, used by CCC
 	user                string          // Authenticated user
 	path                string          // Current path
 	listPath            string          // Path for NLST/LIST requests
@@ -155,6 +156,18 @@ func (c *clientHandler) disconnect() error {
 			"Problem disconnecting a client",
 			"err", err,
 		)
+	}
+
+	// the TLS layer doesn't close the connection it is built upon (see noCloseConn)
+	if c.rawConn != nil {
+		if errRaw := c.rawConn.Close(); errRaw != nil {
+			c.logger.Warn(
+				"Problem closing the raw connection",
+				"err", errRaw,
+			)
+		}
+
+		c.rawConn = nil
 	}
 
 	c.connClosed = true

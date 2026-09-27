@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -12,10 +13,24 @@ import (
 
 var errUnknownHash = errors.New("unknown hash algorithm")
 
+// noCloseConn wraps a connection so that closing the TLS layer built on top
+// of it (which sends the close_notify alert) doesn't close the underlying
+// connection. The underlying connection is closed through the rawConn field
+// of the clientHandler.
+type noCloseConn struct {
+	net.Conn
+}
+
+func (noCloseConn) Close() error { return nil }
+
 func (c *clientHandler) handleAUTH(_ string) error {
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
 		c.writeMessage(StatusAuthAccepted, "AUTH command ok. Expecting TLS Negotiation.")
-		c.conn = tls.Server(c.conn, tlsConfig)
+		// The raw connection is kept around and wrapped so that a later CCC
+		// command can shut the TLS layer down without closing it.
+		rawConn := c.conn
+		c.conn = tls.Server(noCloseConn{Conn: rawConn}, tlsConfig)
+		c.rawConn = rawConn
 		c.reader = bufio.NewReaderSize(c.conn, maxCommandSize)
 		c.writer = bufio.NewWriter(c.conn)
 		c.setTLSForControl(true)
@@ -245,6 +260,10 @@ func (c *clientHandler) handleFEAT(_ string) error {
 	// This code made me think about adding this: https://github.com/stianstr/ftpserver/commit/387f2ba
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); tlsConfig != nil && err == nil {
 		features = append(features, "AUTH TLS", "PBSZ", "PROT")
+
+		if c.server.settings.EnableCCC {
+			features = append(features, "CCC")
+		}
 	}
 
 	if c.server.settings.EnableHASH {

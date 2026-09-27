@@ -38,7 +38,7 @@ var commandsMap = map[string]*CommandDescription{ //nolint:gochecknoglobals
 	"AUTH": {Fn: (*clientHandler).handleAUTH, Open: true},
 	"PROT": {Fn: (*clientHandler).handlePROT, Open: true},
 	"PBSZ": {Fn: (*clientHandler).handlePBSZ, Open: true},
-	"CCC":  {Fn: (*clientHandler).handleNotImplemented},
+	"CCC":  {Fn: (*clientHandler).handleCCC},
 	"CONF": {Fn: (*clientHandler).handleNotImplemented},
 	"ENC":  {Fn: (*clientHandler).handleNotImplemented},
 	"MIC":  {Fn: (*clientHandler).handleNotImplemented},

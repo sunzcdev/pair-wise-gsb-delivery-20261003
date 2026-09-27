@@ -367,6 +367,7 @@ type Settings struct {
 	DisableSTAT             bool
 	DisableSYST             bool         // Disable SYST
 	EnableCOMB              bool         // Enable COMB support
+	EnableCCC               bool         // Enable CCC support (clear control connection, RFC 4217)
 	DeflateCompressionLevel int          // Deflate compression level (0-9). 0 means disabled
 	DefaultTransferType     TransferType // Transfer type to use if the client don't send the TYPE command
 	// DisableASCIIConversion disables CRLF/LF line-ending conversion for TYPE A (ASCII) transfers.

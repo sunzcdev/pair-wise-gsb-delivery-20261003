@@ -33,6 +33,7 @@ If you're interested in a fully featured FTP server, you should use [sftpgo](htt
    * [AUTH](https://tools.ietf.org/html/rfc2228#page-6) - Control session protection
    * [AUTH TLS](https://tools.ietf.org/html/rfc4217#section-4.1) - TLS session
    * [PROT](https://tools.ietf.org/html/rfc2228#page-8) - Transfer protection
+   * [CCC](https://tools.ietf.org/html/rfc4217#section-5) - Clear control connection (requires `EnableCCC`)
    * [EPRT/EPSV](https://tools.ietf.org/html/rfc2428) - IPv6 support
    * [MDTM](https://tools.ietf.org/html/rfc3659#page-8) - File Modification Time
    * [SIZE](https://tools.ietf.org/html/rfc3659#page-11) - Size of a file
