@@ -25,7 +25,7 @@ func init() {
 func queryTest(domain, selector string, txtLookup txtLookupFunc) (*queryResult, error) {
 	record := selector + "._domainkey." + domain
 	switch record {
-	case "brisbane._domainkey.example.com", "brisbane._domainkey.example.org", "test._domainkey.football.example.com":
+	case "brisbane._domainkey.example.com", "brisbane._domainkey.example.org", "test._domainkey.football.example.com", "test2026._domainkey.example.org", "test2027._domainkey.example.org":
 		return parsePublicKey(dnsPublicKey)
 	case "newengland._domainkey.example.com":
 		return parsePublicKey(dnsRawRSAPublicKey)

@@ -70,6 +70,173 @@ type SignOptions struct {
 	QueryMethods []QueryMethod
 }
 
+// signParams holds signing parameters normalized from SignOptions.
+type signParams struct {
+	headerCan Canonicalization
+	bodyCan   Canonicalization
+	keyAlgo   string
+	hash      crypto.Hash
+	hashAlgo  string
+}
+
+// checkSignOptions validates SignOptions and normalizes them into signParams.
+func checkSignOptions(options *SignOptions) (signParams, error) {
+	var p signParams
+
+	if options == nil {
+		return p, fmt.Errorf("dkim: no options specified")
+	}
+	if options.Domain == "" {
+		return p, fmt.Errorf("dkim: no domain specified")
+	}
+	if options.Selector == "" {
+		return p, fmt.Errorf("dkim: no selector specified")
+	}
+	if options.Signer == nil {
+		return p, fmt.Errorf("dkim: no signer specified")
+	}
+
+	p.headerCan = options.HeaderCanonicalization
+	if p.headerCan == "" {
+		p.headerCan = CanonicalizationSimple
+	}
+	if _, ok := canonicalizers[p.headerCan]; !ok {
+		return p, fmt.Errorf("dkim: unknown header canonicalization %q", p.headerCan)
+	}
+
+	p.bodyCan = options.BodyCanonicalization
+	if p.bodyCan == "" {
+		p.bodyCan = CanonicalizationSimple
+	}
+	if _, ok := canonicalizers[p.bodyCan]; !ok {
+		return p, fmt.Errorf("dkim: unknown body canonicalization %q", p.bodyCan)
+	}
+
+	switch options.Signer.Public().(type) {
+	case *rsa.PublicKey:
+		p.keyAlgo = "rsa"
+	case ed25519.PublicKey:
+		p.keyAlgo = "ed25519"
+	default:
+		return p, fmt.Errorf("dkim: unsupported key algorithm %T", options.Signer.Public())
+	}
+
+	p.hash = options.Hash
+	switch options.Hash {
+	case 0: // sha256 is the default
+		p.hash = crypto.SHA256
+		fallthrough
+	case crypto.SHA256:
+		p.hashAlgo = "sha256"
+	case crypto.SHA1:
+		return p, fmt.Errorf("dkim: hash algorithm too weak: sha1")
+	default:
+		return p, fmt.Errorf("dkim: unsupported hash algorithm")
+	}
+
+	if options.HeaderKeys != nil {
+		ok := false
+		for _, k := range options.HeaderKeys {
+			if strings.EqualFold(k, "From") {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return p, fmt.Errorf("dkim: the From header field must be signed")
+		}
+	}
+
+	return p, nil
+}
+
+// signHeader hashes the header fields and signs them, returning the
+// DKIM-Signature header field params. bodyHashed is the hash of the
+// canonicalized body.
+func signHeader(h header, options *SignOptions, p signParams, bodyHashed []byte) (map[string]string, error) {
+	params := map[string]string{
+		"v":  "1",
+		"a":  p.keyAlgo + "-" + p.hashAlgo,
+		"bh": base64.StdEncoding.EncodeToString(bodyHashed),
+		"c":  string(p.headerCan) + "/" + string(p.bodyCan),
+		"d":  options.Domain,
+		//"l": "", // TODO
+		"s": options.Selector,
+		"t": formatTime(now()),
+		//"z": "", // TODO
+	}
+
+	var headerKeys []string
+	if options.HeaderKeys != nil {
+		headerKeys = options.HeaderKeys
+	} else {
+		for _, kv := range h {
+			k, _ := parseHeaderField(kv)
+			headerKeys = append(headerKeys, k)
+		}
+	}
+	params["h"] = formatTagList(headerKeys)
+
+	if options.Identifier != "" {
+		params["i"] = options.Identifier
+	}
+
+	if options.QueryMethods != nil {
+		methods := make([]string, len(options.QueryMethods))
+		for i, method := range options.QueryMethods {
+			methods[i] = string(method)
+		}
+		params["q"] = formatTagList(methods)
+	}
+
+	if !options.Expiration.IsZero() {
+		params["x"] = formatTime(options.Expiration)
+	}
+
+	// Hash and sign headers
+	hasher := p.hash.New()
+	picker := newHeaderPicker(h)
+	for _, k := range headerKeys {
+		kv := picker.Pick(k)
+		if kv == "" {
+			// The Signer MAY include more instances of a header field name
+			// in "h=" than there are actual corresponding header fields so
+			// that the signature will not verify if additional header
+			// fields of that name are added.
+			continue
+		}
+
+		kv = canonicalizers[p.headerCan].CanonicalizeHeader(kv)
+		if _, err := io.WriteString(hasher, kv); err != nil {
+			return nil, err
+		}
+	}
+
+	params["b"] = ""
+	sigField := formatSignature(params)
+	sigField = canonicalizers[p.headerCan].CanonicalizeHeader(sigField)
+	sigField = strings.TrimRight(sigField, crlf)
+	if _, err := io.WriteString(hasher, sigField); err != nil {
+		return nil, err
+	}
+	hashed := hasher.Sum(nil)
+
+	// Don't pass Hash to Sign for ed25519 as it doesn't support it
+	// and will return an error ("ed25519: cannot sign hashed message").
+	hash := p.hash
+	if p.keyAlgo == "ed25519" {
+		hash = crypto.Hash(0)
+	}
+
+	sig, err := options.Signer.Sign(randReader, hashed, hash)
+	if err != nil {
+		return nil, err
+	}
+	params["b"] = base64.StdEncoding.EncodeToString(sig)
+
+	return params, nil
+}
+
 // Signer generates a DKIM signature.
 //
 // The whole message header and body must be written to the Signer. Close should
@@ -88,70 +255,9 @@ type Signer struct {
 // NewSigner creates a new signer. It returns an error if SignOptions is
 // invalid.
 func NewSigner(options *SignOptions) (*Signer, error) {
-	if options == nil {
-		return nil, fmt.Errorf("dkim: no options specified")
-	}
-	if options.Domain == "" {
-		return nil, fmt.Errorf("dkim: no domain specified")
-	}
-	if options.Selector == "" {
-		return nil, fmt.Errorf("dkim: no selector specified")
-	}
-	if options.Signer == nil {
-		return nil, fmt.Errorf("dkim: no signer specified")
-	}
-
-	headerCan := options.HeaderCanonicalization
-	if headerCan == "" {
-		headerCan = CanonicalizationSimple
-	}
-	if _, ok := canonicalizers[headerCan]; !ok {
-		return nil, fmt.Errorf("dkim: unknown header canonicalization %q", headerCan)
-	}
-
-	bodyCan := options.BodyCanonicalization
-	if bodyCan == "" {
-		bodyCan = CanonicalizationSimple
-	}
-	if _, ok := canonicalizers[bodyCan]; !ok {
-		return nil, fmt.Errorf("dkim: unknown body canonicalization %q", bodyCan)
-	}
-
-	var keyAlgo string
-	switch options.Signer.Public().(type) {
-	case *rsa.PublicKey:
-		keyAlgo = "rsa"
-	case ed25519.PublicKey:
-		keyAlgo = "ed25519"
-	default:
-		return nil, fmt.Errorf("dkim: unsupported key algorithm %T", options.Signer.Public())
-	}
-
-	hash := options.Hash
-	var hashAlgo string
-	switch options.Hash {
-	case 0: // sha256 is the default
-		hash = crypto.SHA256
-		fallthrough
-	case crypto.SHA256:
-		hashAlgo = "sha256"
-	case crypto.SHA1:
-		return nil, fmt.Errorf("dkim: hash algorithm too weak: sha1")
-	default:
-		return nil, fmt.Errorf("dkim: unsupported hash algorithm")
-	}
-
-	if options.HeaderKeys != nil {
-		ok := false
-		for _, k := range options.HeaderKeys {
-			if strings.EqualFold(k, "From") {
-				ok = true
-				break
-			}
-		}
-		if !ok {
-			return nil, fmt.Errorf("dkim: the From header field must be signed")
-		}
+	p, err := checkSignOptions(options)
+	if err != nil {
+		return nil, err
 	}
 
 	done := make(chan error, 1)
@@ -179,8 +285,8 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 
 		// Hash body
-		hasher := hash.New()
-		can := canonicalizers[bodyCan].CanonicalizeBody(hasher)
+		hasher := p.hash.New()
+		can := canonicalizers[p.bodyCan].CanonicalizeBody(hasher)
 		if _, err := io.Copy(can, br); err != nil {
 			closeReadWithError(err)
 			return
@@ -189,89 +295,12 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 			closeReadWithError(err)
 			return
 		}
-		bodyHashed := hasher.Sum(nil)
 
-		params := map[string]string{
-			"v":  "1",
-			"a":  keyAlgo + "-" + hashAlgo,
-			"bh": base64.StdEncoding.EncodeToString(bodyHashed),
-			"c":  string(headerCan) + "/" + string(bodyCan),
-			"d":  options.Domain,
-			//"l": "", // TODO
-			"s": options.Selector,
-			"t": formatTime(now()),
-			//"z": "", // TODO
-		}
-
-		var headerKeys []string
-		if options.HeaderKeys != nil {
-			headerKeys = options.HeaderKeys
-		} else {
-			for _, kv := range h {
-				k, _ := parseHeaderField(kv)
-				headerKeys = append(headerKeys, k)
-			}
-		}
-		params["h"] = formatTagList(headerKeys)
-
-		if options.Identifier != "" {
-			params["i"] = options.Identifier
-		}
-
-		if options.QueryMethods != nil {
-			methods := make([]string, len(options.QueryMethods))
-			for i, method := range options.QueryMethods {
-				methods[i] = string(method)
-			}
-			params["q"] = formatTagList(methods)
-		}
-
-		if !options.Expiration.IsZero() {
-			params["x"] = formatTime(options.Expiration)
-		}
-
-		// Hash and sign headers
-		hasher.Reset()
-		picker := newHeaderPicker(h)
-		for _, k := range headerKeys {
-			kv := picker.Pick(k)
-			if kv == "" {
-				// The Signer MAY include more instances of a header field name
-				// in "h=" than there are actual corresponding header fields so
-				// that the signature will not verify if additional header
-				// fields of that name are added.
-				continue
-			}
-
-			kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
-			if _, err := io.WriteString(hasher, kv); err != nil {
-				closeReadWithError(err)
-				return
-			}
-		}
-
-		params["b"] = ""
-		sigField := formatSignature(params)
-		sigField = canonicalizers[headerCan].CanonicalizeHeader(sigField)
-		sigField = strings.TrimRight(sigField, crlf)
-		if _, err := io.WriteString(hasher, sigField); err != nil {
-			closeReadWithError(err)
-			return
-		}
-		hashed := hasher.Sum(nil)
-
-		// Don't pass Hash to Sign for ed25519 as it doesn't support it
-		// and will return an error ("ed25519: cannot sign hashed message").
-		if keyAlgo == "ed25519" {
-			hash = crypto.Hash(0)
-		}
-
-		sig, err := options.Signer.Sign(randReader, hashed, hash)
+		params, err := signHeader(h, options, p, hasher.Sum(nil))
 		if err != nil {
 			closeReadWithError(err)
 			return
 		}
-		params["b"] = base64.StdEncoding.EncodeToString(sig)
 
 		s.sigParams = params
 		closeReadWithError(nil)
