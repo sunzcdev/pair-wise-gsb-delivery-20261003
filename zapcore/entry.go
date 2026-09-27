@@ -244,6 +244,13 @@ func (ce *CheckedEntry) reset() {
 // the CheckedEntry reference to a pool for immediate re-use. Finally, it
 // executes any required CheckWriteAction.
 func (ce *CheckedEntry) Write(fields ...Field) {
+	ce.write(fields, nil)
+}
+
+// write is the shared implementation of Write and WriteWithReceipt. If
+// receipts is non-nil, a WriteReceipt is appended to it for every Core the
+// entry is written to.
+func (ce *CheckedEntry) write(fields []Field, receipts *[]WriteReceipt) {
 	if ce == nil {
 		return
 	}
@@ -273,7 +280,11 @@ func (ce *CheckedEntry) Write(fields ...Field) {
 
 	var err error
 	for i := range ce.cores {
-		err = multierr.Append(err, ce.cores[i].Write(ent, fields))
+		werr := ce.cores[i].Write(ent, fields)
+		if receipts != nil {
+			*receipts = append(*receipts, WriteReceipt{Core: ce.cores[i], Err: werr})
+		}
+		err = multierr.Append(err, werr)
 	}
 	if err != nil && ce.ErrorOutput != nil {
 		_, _ = fmt.Fprintf(
