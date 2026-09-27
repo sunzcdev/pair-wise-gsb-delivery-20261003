@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"io"
 
 	"github.com/emersion/go-sasl"
@@ -63,6 +64,50 @@ type Session interface {
 	//
 	// r must be consumed before Data returns.
 	Data(r io.Reader) error
+}
+
+// ContextSession is an add-on interface for Session. It can be implemented
+// by backends that need to track the lifetime of a mail transaction, e.g.
+// to abort an anti-spam check or an object storage upload when the
+// transaction is terminated early.
+//
+// A new transaction context is created when a MAIL command is accepted and
+// is cancelled when the transaction ends, that is:
+//
+//   - when the transaction completes (DATA or BDAT ... LAST finishes,
+//     successfully or with a backend error),
+//   - when the client issues RSET, HELO/EHLO/LHLO or STARTTLS,
+//   - when a new MAIL command replaces the current transaction,
+//   - when the backend rejects the MAIL command itself,
+//   - when the connection is closed.
+//
+// A cancelled context is never reused: the next MAIL command on the same
+// connection always starts a transaction with a fresh context.
+//
+// Note on timeliness: cancellation caused by a client disconnect is only
+// detected at points where the server itself reads from the connection
+// (the next command, the next BDAT chunk relay, or the message data
+// reader hitting EOF). The server deliberately does not read the
+// connection from a separate goroutine to notice disconnects earlier,
+// because concurrent reads would steal protocol data from the command and
+// data readers. As a consequence, a backend blocked in DataContext without
+// performing I/O may not observe a disconnect until the transaction
+// otherwise ends; such backends should use their own deadlines if prompt
+// detection is required.
+type ContextSession interface {
+	Session
+
+	// MailContext is like Mail but additionally receives the context of
+	// the newly started transaction.
+	MailContext(ctx context.Context, from string, opts *MailOptions) error
+	// RcptContext is like Rcpt but additionally receives the context of
+	// the current transaction.
+	RcptContext(ctx context.Context, to string, opts *RcptOptions) error
+	// DataContext is like Data but additionally receives the context of
+	// the current transaction.
+	//
+	// r must be consumed before DataContext returns.
+	DataContext(ctx context.Context, r io.Reader) error
 }
 
 // LMTPSession is an add-on interface for Session. It can be implemented by

@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -44,6 +45,16 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// connCtx is cancelled when the connection is closed.
+	connCtx    context.Context
+	connCancel context.CancelFunc
+
+	// txnCtx is the context of the current mail transaction. It is
+	// started by MAIL and cancelled by RSET, DATA/BDAT completion or
+	// connection close. Guarded by locker.
+	txnCtx    context.Context
+	txnCancel context.CancelFunc
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -51,6 +62,7 @@ func newConn(c net.Conn, s *Server) *Conn {
 		server: s,
 		conn:   c,
 	}
+	sc.connCtx, sc.connCancel = context.WithCancel(context.Background())
 
 	sc.init()
 	return sc
@@ -166,9 +178,82 @@ func (c *Conn) setSession(session Session) {
 	c.session = session
 }
 
+// startTransaction begins a new mail transaction, cancelling the context of
+// any previous one, and returns the new transaction context.
+func (c *Conn) startTransaction() context.Context {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+
+	c.endTransactionLocked()
+	c.txnCtx, c.txnCancel = context.WithCancel(c.connCtx)
+	return c.txnCtx
+}
+
+// endTransaction cancels the context of the current mail transaction, if
+// any.
+func (c *Conn) endTransaction() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.endTransactionLocked()
+}
+
+// endTransactionLocked cancels the transaction context. c.locker must be
+// held.
+func (c *Conn) endTransactionLocked() {
+	if c.txnCancel != nil {
+		c.txnCancel()
+		c.txnCancel = nil
+		c.txnCtx = nil
+	}
+}
+
+// transactionContext returns the context of the current mail transaction,
+// or the connection context if no transaction is in progress.
+func (c *Conn) transactionContext() context.Context {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.txnCtx != nil {
+		return c.txnCtx
+	}
+	return c.connCtx
+}
+
+// sessionMail dispatches to MailContext if the session implements
+// ContextSession, and to Mail otherwise.
+func (c *Conn) sessionMail(ctx context.Context, from string, opts *MailOptions) error {
+	sess := c.Session()
+	if cs, ok := sess.(ContextSession); ok {
+		return cs.MailContext(ctx, from, opts)
+	}
+	return sess.Mail(from, opts)
+}
+
+// sessionRcpt dispatches to RcptContext if the session implements
+// ContextSession, and to Rcpt otherwise.
+func (c *Conn) sessionRcpt(ctx context.Context, to string, opts *RcptOptions) error {
+	sess := c.Session()
+	if cs, ok := sess.(ContextSession); ok {
+		return cs.RcptContext(ctx, to, opts)
+	}
+	return sess.Rcpt(to, opts)
+}
+
+// sessionData dispatches to DataContext if the session implements
+// ContextSession, and to Data otherwise.
+func (c *Conn) sessionData(ctx context.Context, r io.Reader) error {
+	sess := c.Session()
+	if cs, ok := sess.(ContextSession); ok {
+		return cs.DataContext(ctx, r)
+	}
+	return sess.Data(r)
+}
+
 func (c *Conn) Close() error {
 	c.locker.Lock()
 	defer c.locker.Unlock()
+
+	c.endTransactionLocked()
+	c.connCancel()
 
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
@@ -471,7 +556,9 @@ func (c *Conn) handleMail(arg string) {
 		}
 	}
 
-	if err := c.Session().Mail(from, opts); err != nil {
+	ctx := c.startTransaction()
+	if err := c.sessionMail(ctx, from, opts); err != nil {
+		c.endTransaction()
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -783,7 +870,7 @@ func (c *Conn) handleRcpt(arg string) {
 		}
 	}
 
-	if err := c.Session().Rcpt(recipient, opts); err != nil {
+	if err := c.sessionRcpt(c.transactionContext(), recipient, opts); err != nil {
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -984,7 +1071,7 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
+	code, enhancedCode, msg := dataErrorToStatus(c.sessionData(c.transactionContext(), r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
@@ -1041,6 +1128,7 @@ func (c *Conn) handleBdat(arg string) {
 		r, c.bdatPipe = io.Pipe()
 
 		c.dataResult = make(chan error, 1)
+		txnCtx := c.transactionContext()
 
 		go func() {
 			defer func() {
@@ -1054,11 +1142,11 @@ func (c *Conn) handleBdat(arg string) {
 
 			var err error
 			if !c.server.LMTP {
-				err = c.Session().Data(r)
+				err = c.sessionData(txnCtx, r)
 			} else {
 				lmtpSession, ok := c.Session().(LMTPSession)
 				if !ok {
-					err = c.Session().Data(r)
+					err = c.sessionData(txnCtx, r)
 					for _, rcpt := range c.recipients {
 						c.bdatStatus.SetStatus(rcpt, err)
 					}
@@ -1075,7 +1163,11 @@ func (c *Conn) handleBdat(arg string) {
 	c.lineLimitReader.LineLimit = 0
 
 	chunk := io.LimitReader(c.text.R, int64(size))
-	_, err = io.Copy(c.bdatPipe, chunk)
+	n, err := io.Copy(c.bdatPipe, chunk)
+	if err == nil && n < int64(size) {
+		// The client closed the connection before sending the whole chunk.
+		err = io.ErrUnexpectedEOF
+	}
 	if err != nil {
 		// Backend might return an error early using CloseWithError without consuming
 		// the whole chunk.
@@ -1214,7 +1306,7 @@ func (c *Conn) handleDataLMTP() {
 	lmtpSession, ok := c.Session().(LMTPSession)
 	if !ok {
 		// Fallback to using a single status for all recipients.
-		err := c.Session().Data(r)
+		err := c.sessionData(c.transactionContext(), r)
 		r.limited = false
 		io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 		for _, rcpt := range c.recipients {
@@ -1335,6 +1427,8 @@ func (c *Conn) readLine() (string, error) {
 func (c *Conn) reset() {
 	c.locker.Lock()
 	defer c.locker.Unlock()
+
+	c.endTransactionLocked()
 
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
