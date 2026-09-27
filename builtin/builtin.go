@@ -476,6 +476,8 @@ var Builtins = []*Function{
 	},
 	{
 		Name: "now",
+		// now() reads the current time; it is the canonical impure builtin.
+		Impure: true,
 		Func: func(args ...any) (any, error) {
 			if len(args) == 0 {
 				return time.Now(), nil

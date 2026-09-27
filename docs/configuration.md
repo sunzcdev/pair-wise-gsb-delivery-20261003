@@ -132,3 +132,41 @@ The timezone is used for the following functions:
 date("2024-11-23 12:00:00") // parses the date in the specified timezone
 now() // returns the current time in the specified timezone
 ```
+
+## Pure rule mode
+
+Rules that must be archived and replayed deterministically (e.g. risk-control rules) cannot read the current time,
+randomness, or any external state at evaluation time. The [`Pure`](https://pkg.go.dev/github.com/expr-lang/expr#Pure)
+option enables pure rule mode, in which the host explicitly declares the pure functions allowed to be called:
+
+```go
+program, err := expr.Compile(
+    `riskScore(Amount) >= 50 && len(Tags) > 0`,
+    expr.Env(env),
+    expr.Function("riskScore", riskScore),
+    expr.Pure("riskScore"), // host-declared pure functions
+)
+```
+
+In pure rule mode an expression may only call:
+
+- functions explicitly declared via `expr.Pure(...)`;
+- builtins known to be pure (e.g. `len`, `abs`, `filter`).
+
+The following are rejected at compile time:
+
+- calls to undeclared functions;
+- object method calls (e.g. `User.IsAdult()`);
+- indirect calls through variables or computed function values (e.g. `let f = riskScore; f(x)`);
+- builtins that read external state (e.g. `now()`), even if the host declares them;
+- `ConstExpr` functions not declared via `expr.Pure(...)`, as they execute host code at compile time.
+
+The restriction is enforced during type checking and re-validated after the optimization phase; the compile error
+reports the call chain that broke the constraint:
+
+```text
+pure mode: call to undeclared function "auditLog" is not allowed (call chain: len(...) -> filter(...) -> auditLog(...))
+```
+
+The host declaration is the trust boundary: expr does not verify that a declared function is actually free of side
+effects.

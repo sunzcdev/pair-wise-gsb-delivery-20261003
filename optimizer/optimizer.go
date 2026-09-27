@@ -21,6 +21,13 @@ func Optimize(node *Node, config *conf.Config) error {
 		}
 	}
 	if config != nil && len(config.ConstFns) > 0 {
+		if config.Pure {
+			for name := range config.ConstFns {
+				if !config.PureFuncs[name] {
+					return fmt.Errorf("pure mode: const expression %q must be declared as a pure function via expr.Pure", name)
+				}
+			}
+		}
 		for limit := 100; limit >= 0; limit-- {
 			constExpr := &constExpr{
 				fns: config.ConstFns,

@@ -170,6 +170,34 @@ func Function(name string, fn func(params ...any) (any, error), types ...any) Op
 	}
 }
 
+// Pure enables pure rule mode, intended for rules that must be archived and
+// replayed deterministically: the expression must not read the current time,
+// randomness, or any external state at evaluation time.
+//
+// In pure mode an expression may only call:
+//   - functions explicitly declared by the host via this option;
+//   - builtins known to be pure (e.g. len, abs, filter).
+//
+// Undeclared functions, object method calls, indirect calls (through
+// variables or computed function values), and builtins that read external
+// state (e.g. now) are rejected at compile time. The restriction is enforced
+// during type checking and re-validated after the optimization phase; the
+// returned error reports the call chain that broke the constraint.
+//
+// The host declaration is the trust boundary: expr does not verify that a
+// declared function is actually free of side effects.
+func Pure(functions ...string) Option {
+	return func(c *conf.Config) {
+		c.Pure = true
+		if c.PureFuncs == nil {
+			c.PureFuncs = make(map[string]bool, len(functions))
+		}
+		for _, name := range functions {
+			c.PureFuncs[name] = true
+		}
+	}
+}
+
 // DisableAllBuiltins disables all builtins.
 func DisableAllBuiltins() Option {
 	return func(c *conf.Config) {
@@ -250,6 +278,12 @@ func Compile(input string, ops ...Option) (*vm.Program, error) {
 			}
 			return nil, err
 		}
+	}
+
+	// Pure rule mode is enforced during type checking (see checker) and
+	// re-validated here, after the optimization phase rewrote the tree.
+	if err := checker.ValidatePure(tree, config); err != nil {
+		return nil, err
 	}
 
 	program, err := compiler.Compile(tree, config)

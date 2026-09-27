@@ -13,6 +13,10 @@ type Function struct {
 	Validate  func(args []reflect.Type) (reflect.Type, error)
 	Deref     func(i int, arg reflect.Type) bool
 	Predicate bool
+	// Impure marks builtins that read external state (current time, randomness,
+	// environment) or produce side effects. Impure builtins are rejected when
+	// compiling with pure rule mode enabled (expr.Pure).
+	Impure bool
 }
 
 func (f *Function) Type() reflect.Type {

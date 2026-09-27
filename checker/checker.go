@@ -135,6 +135,10 @@ func (v *Checker) check(tree *parser.Tree) (reflect.Type, error) {
 		return t, v.err.Bind(tree.Source)
 	}
 
+	if err := ValidatePure(tree, v.config); err != nil {
+		return t, err
+	}
+
 	if v.config.Expect != reflect.Invalid {
 		if v.config.ExpectAny {
 			if nt.IsUnknown(&v.config.NtCache) {

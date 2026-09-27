@@ -36,6 +36,12 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	// Pure enables pure rule mode: only functions explicitly declared by the
+	// host (PureFuncs) and builtins known to be pure may be called. Method
+	// calls, indirect calls and builtins reading external state (e.g. now)
+	// are rejected at compile time.
+	Pure      bool
+	PureFuncs map[string]bool
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
