@@ -65,6 +65,22 @@ type Session struct {
 	// acceptCh is used to pass ready streams to the client
 	acceptCh chan *Stream
 
+	// extProbeDone is closed once the stream metadata capability
+	// negotiation has completed (or was never started).
+	extProbeDone chan struct{}
+
+	// extProbeRespCh delivers the capability probe result to the
+	// negotiation goroutine.
+	extProbeRespCh chan bool
+
+	// streamMetaEnabled is 1 once the stream metadata extension has
+	// been negotiated with the peer.
+	streamMetaEnabled int32
+
+	// pendingAdmissions tracks inbound streams waiting for an admission
+	// decision. Protected by streamLock.
+	pendingAdmissions int
+
 	// sendCh is used to mark a stream as ready to send,
 	// or to send a header out directly.
 	sendCh chan *sendReady
@@ -99,19 +115,21 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	}
 
 	s := &Session{
-		config:     config,
-		logger:     logger,
-		conn:       conn,
-		bufRead:    bufio.NewReader(conn),
-		pings:      make(map[uint32]chan struct{}),
-		streams:    make(map[uint32]*Stream),
-		inflight:   make(map[uint32]struct{}),
-		synCh:      make(chan struct{}, config.AcceptBacklog),
-		acceptCh:   make(chan *Stream, config.AcceptBacklog),
-		sendCh:     make(chan *sendReady, 64),
-		recvDoneCh: make(chan struct{}),
-		sendDoneCh: make(chan struct{}),
-		shutdownCh: make(chan struct{}),
+		config:         config,
+		logger:         logger,
+		conn:           conn,
+		bufRead:        bufio.NewReader(conn),
+		pings:          make(map[uint32]chan struct{}),
+		streams:        make(map[uint32]*Stream),
+		inflight:       make(map[uint32]struct{}),
+		synCh:          make(chan struct{}, config.AcceptBacklog),
+		acceptCh:       make(chan *Stream, config.AcceptBacklog),
+		extProbeDone:   make(chan struct{}),
+		extProbeRespCh: make(chan bool, 1),
+		sendCh:         make(chan *sendReady, 64),
+		recvDoneCh:     make(chan struct{}),
+		sendDoneCh:     make(chan struct{}),
+		shutdownCh:     make(chan struct{}),
 	}
 	if client {
 		s.nextStreamID = 1
@@ -122,6 +140,11 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	go s.send()
 	if config.EnableKeepAlive {
 		go s.keepalive()
+	}
+	if config.EnableStreamMeta {
+		go s.negotiateStreamMeta()
+	} else {
+		close(s.extProbeDone)
 	}
 	return s
 }
@@ -159,8 +182,57 @@ func (s *Session) Open() (net.Conn, error) {
 	return conn, nil
 }
 
+// OpenWithMeta is used to create a new stream as a net.Conn, attaching
+// bounded service metadata via the stream metadata extension.
+func (s *Session) OpenWithMeta(ctx context.Context, meta []byte) (net.Conn, error) {
+	conn, err := s.OpenStreamWithMeta(ctx, meta)
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
+}
+
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.openStream(nil)
+}
+
+// OpenStreamWithMeta is used to create a new stream, attaching bounded
+// service metadata (up to 1024 bytes) that the peer can inspect in its
+// AdmitStream callback before accepting or rejecting the stream. It
+// requires the optional stream metadata extension to be enabled on both
+// ends; the given context is only used while waiting for the capability
+// negotiation to complete. If the peer did not negotiate the extension,
+// ErrStreamMetaUnsupported is returned and no unknown frames are sent.
+func (s *Session) OpenStreamWithMeta(ctx context.Context, meta []byte) (*Stream, error) {
+	if len(meta) == 0 {
+		return s.OpenStream()
+	}
+	if len(meta) > maxStreamMetaSize {
+		return nil, ErrStreamMetaTooLarge
+	}
+	if !s.config.EnableStreamMeta {
+		return nil, ErrStreamMetaUnsupported
+	}
+
+	// Wait for the capability negotiation to conclude. We must never
+	// send metadata frames to a peer that has not opted in.
+	select {
+	case <-s.extProbeDone:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.shutdownCh:
+		return nil, ErrSessionShutdown
+	}
+	if atomic.LoadInt32(&s.streamMetaEnabled) == 0 {
+		return nil, ErrStreamMetaUnsupported
+	}
+	return s.openStream(meta)
+}
+
+// openStream is used to create a new stream, optionally announcing it
+// with service metadata first.
+func (s *Session) openStream(meta []byte) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, ErrSessionShutdown
 	}
@@ -196,6 +268,19 @@ GET_ID:
 		go s.setOpenTimeout(stream)
 	}
 
+	// Announce the stream metadata before the SYN so the peer can run
+	// its admission decision before surfacing the stream.
+	if len(meta) > 0 {
+		if err := s.sendStreamMeta(id, meta); err != nil {
+			select {
+			case <-s.synCh:
+			default:
+				s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+			}
+			return nil, err
+		}
+	}
+
 	// Send the window update to create
 	if err := stream.sendWindowUpdate(); err != nil {
 		select {
@@ -206,6 +291,49 @@ GET_ID:
 		return nil, err
 	}
 	return stream, nil
+}
+
+// sendStreamMeta sends a stream metadata frame announcing a new stream.
+func (s *Session) sendStreamMeta(id uint32, meta []byte) error {
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeStreamMeta, 0, id, uint32(len(meta)))
+	return s.waitForSend(hdr, meta)
+}
+
+// negotiateStreamMeta probes the peer for support of the stream
+// metadata extension. A peer that understands the probe answers with
+// pingIDStreamMetaAck; any other peer echoes the probe ID back, which
+// disables the extension locally.
+func (s *Session) negotiateStreamMeta() {
+	defer close(s.extProbeDone)
+
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typePing, flagSYN, 0, pingIDStreamMetaProbe)
+	if err := s.sendNoWait(hdr); err != nil {
+		return
+	}
+
+	t := timerPool.Get()
+	timer := t.(*time.Timer)
+	timer.Reset(s.config.ConnectionWriteTimeout)
+	defer func() {
+		timer.Stop()
+		select {
+		case <-timer.C:
+		default:
+		}
+		timerPool.Put(t)
+	}()
+
+	select {
+	case supported := <-s.extProbeRespCh:
+		if supported {
+			atomic.StoreInt32(&s.streamMetaEnabled, 1)
+		}
+	case <-timer.C:
+		s.logger.Printf("[WARN] yamux: stream metadata capability probe timed out, extension disabled")
+	case <-s.shutdownCh:
+	}
 }
 
 // setOpenTimeout implements a timeout for streams that are opened but not established.
@@ -334,6 +462,10 @@ func (s *Session) Ping() (time.Duration, error) {
 	s.pingLock.Lock()
 	id := s.pingID
 	s.pingID++
+	if s.pingID >= pingIDStreamMetaAck {
+		// The top of the ID space is reserved for capability probes.
+		s.pingID = 0
+	}
 	s.pings[id] = ch
 	s.pingLock.Unlock()
 
@@ -543,6 +675,7 @@ var (
 		typeWindowUpdate: (*Session).handleStreamMessage,
 		typePing:         (*Session).handlePing,
 		typeGoAway:       (*Session).handleGoAway,
+		typeStreamMeta:   (*Session).handleStreamMeta,
 	}
 )
 
@@ -566,7 +699,11 @@ func (s *Session) recvLoop() error {
 		}
 
 		mt := hdr.MsgType()
-		if mt < typeData || mt > typeGoAway {
+		if mt < typeData || mt > typeStreamMeta {
+			return ErrInvalidMsgType
+		}
+		if mt == typeStreamMeta && !s.config.EnableStreamMeta {
+			s.logger.Printf("[ERR] yamux: unexpected stream metadata frame, extension disabled")
 			return ErrInvalidMsgType
 		}
 
@@ -636,6 +773,24 @@ func (s *Session) handlePing(hdr header) error {
 	// Check if this is a query, respond back in a separate context so we
 	// don't interfere with the receiving thread blocking for the write.
 	if flags&flagSYN == flagSYN {
+		// Intercept stream metadata capability probes. A peer that
+		// supports the extension answers with pingIDStreamMetaAck;
+		// anything else (including a plain echo, which is what a peer
+		// without the extension produces) means it must not be used.
+		if pingID == pingIDStreamMetaProbe {
+			resp := pingIDStreamMetaProbe
+			if s.config.EnableStreamMeta {
+				resp = pingIDStreamMetaAck
+			}
+			go func() {
+				hdr := header(make([]byte, headerSize))
+				hdr.encode(typePing, flagACK, 0, resp)
+				if err := s.sendNoWait(hdr); err != nil {
+					s.logger.Printf("[WARN] yamux: failed to send capability reply: %v", err)
+				}
+			}()
+			return nil
+		}
 		go func() {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, flagACK, 0, pingID)
@@ -643,6 +798,15 @@ func (s *Session) handlePing(hdr header) error {
 				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
 			}
 		}()
+		return nil
+	}
+
+	// Handle a capability probe response.
+	if pingID == pingIDStreamMetaProbe || pingID == pingIDStreamMetaAck {
+		select {
+		case s.extProbeRespCh <- pingID == pingIDStreamMetaAck:
+		default:
+		}
 		return nil
 	}
 
@@ -676,6 +840,116 @@ func (s *Session) handleGoAway(hdr header) error {
 	return nil
 }
 
+// handleStreamMeta handles a stream metadata frame. The frame announces
+// a new stream and carries bounded service metadata; the stream stays
+// pending until the admission callback accepts or rejects it.
+func (s *Session) handleStreamMeta(hdr header) error {
+	id := hdr.StreamID()
+	length := hdr.Length()
+	if length > maxStreamMetaSize {
+		s.logger.Printf("[ERR] yamux: stream metadata too large: %d", length)
+		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
+		}
+		return ErrStreamMetaTooLarge
+	}
+
+	meta := make([]byte, length)
+	if _, err := io.ReadFull(s.bufRead, meta); err != nil {
+		s.logger.Printf("[ERR] yamux: failed to read stream metadata: %v", err)
+		return err
+	}
+
+	// Reject immediately if we are doing a go away
+	if atomic.LoadInt32(&s.localGoAway) == 1 {
+		hdr := header(make([]byte, headerSize))
+		hdr.encode(typeWindowUpdate, flagRST, id, 0)
+		return s.sendNoWait(hdr)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream := newStream(s, id, streamSYNReceived)
+	stream.meta = meta
+	stream.admitCancel = cancel
+	stream.metaAnnounced = true
+
+	s.streamLock.Lock()
+	if _, ok := s.streams[id]; ok {
+		// Metadata must arrive before the SYN and only once.
+		s.streamLock.Unlock()
+		cancel()
+		s.logger.Printf("[WARN] yamux: unexpected stream metadata for stream: %d", id)
+		return nil
+	}
+	if s.pendingAdmissions >= s.config.AcceptBacklog {
+		s.streamLock.Unlock()
+		cancel()
+		s.logger.Printf("[WARN] yamux: admission backlog exceeded, forcing connection reset")
+		hdr := header(make([]byte, headerSize))
+		hdr.encode(typeWindowUpdate, flagRST, id, 0)
+		return s.sendNoWait(hdr)
+	}
+	s.streams[id] = stream
+	s.pendingAdmissions++
+	s.streamLock.Unlock()
+
+	s.runAdmission(ctx, stream, meta)
+	return nil
+}
+
+// runAdmission evaluates the admission callback for a pending stream in
+// a dedicated goroutine, so that a slow or cancelled callback can never
+// stall the receive loop and the data or control frames of other
+// streams.
+func (s *Session) runAdmission(ctx context.Context, stream *Stream, meta []byte) {
+	go func() {
+		accepted := true
+		if s.config.AdmitStream != nil {
+			accepted = s.config.AdmitStream(ctx, meta)
+		}
+		s.completeAdmission(stream, accepted)
+	}()
+}
+
+// completeAdmission hands an accepted stream over to the application
+// via the accept queue, or resets a rejected one.
+func (s *Session) completeAdmission(stream *Stream, accepted bool) {
+	s.streamLock.Lock()
+	s.pendingAdmissions--
+	if s.streams[stream.id] != stream {
+		// The stream was reset or the session shut down while the
+		// admission callback was running.
+		s.streamLock.Unlock()
+		return
+	}
+	if accepted {
+		select {
+		case s.acceptCh <- stream:
+			s.streamLock.Unlock()
+			return
+		default:
+			// Backlog exceeded! RST the stream
+			s.logger.Printf("[WARN] yamux: backlog exceeded, forcing connection reset")
+			delete(s.streams, stream.id)
+			s.streamLock.Unlock()
+			stream.forceClose()
+			hdr := header(make([]byte, headerSize))
+			hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
+			_ = s.sendNoWait(hdr)
+			return
+		}
+	}
+	delete(s.streams, stream.id)
+	s.streamLock.Unlock()
+
+	stream.forceClose()
+	hdr := header(make([]byte, headerSize))
+	hdr.encode(typeWindowUpdate, flagRST, stream.id, 0)
+	if err := s.sendNoWait(hdr); err != nil {
+		s.logger.Printf("[WARN] yamux: failed to reset rejected stream: %v", err)
+	}
+}
+
 // incomingStream is used to create a new incoming stream
 func (s *Session) incomingStream(id uint32) error {
 	// Reject immediately if we are doing a go away
@@ -692,7 +966,14 @@ func (s *Session) incomingStream(id uint32) error {
 	defer s.streamLock.Unlock()
 
 	// Check if stream already exists
-	if _, ok := s.streams[id]; ok {
+	if existing, ok := s.streams[id]; ok {
+		if existing.metaAnnounced && !existing.synReceived {
+			// The stream was announced by an earlier metadata frame;
+			// this SYN completes its handshake and needs no further
+			// action here.
+			existing.synReceived = true
+			return nil
+		}
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
 		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
@@ -722,6 +1003,9 @@ func (s *Session) incomingStream(id uint32) error {
 // was not yet established, then this will give the credit back.
 func (s *Session) closeStream(id uint32) {
 	s.streamLock.Lock()
+	if stream, ok := s.streams[id]; ok && stream.admitCancel != nil {
+		stream.admitCancel()
+	}
 	if _, ok := s.inflight[id]; ok {
 		select {
 		case <-s.synCh:

@@ -4,6 +4,7 @@
 package yamux
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -47,6 +48,26 @@ type Config struct {
 	// and send a RST to the remote side.
 	StreamCloseTimeout time.Duration
 
+	// EnableStreamMeta enables the optional stream metadata extension.
+	// When enabled on both ends, the side opening a stream may attach
+	// bounded service metadata (up to 1024 bytes) that is delivered to
+	// the peer before the stream is handed to the application. Support
+	// is negotiated with a capability probe when the session starts;
+	// peers that do not understand the extension are never sent frames
+	// they cannot parse.
+	EnableStreamMeta bool
+
+	// AdmitStream, if set, is invoked for every incoming stream that
+	// carries service metadata, before the stream is surfaced by
+	// AcceptStream. Returning false rejects the stream with a RST and
+	// the application never sees it. The callback runs in its own
+	// goroutine, so it may be slow without stalling data or control
+	// frames of other streams, and its context is cancelled if the
+	// stream is reset or the session shuts down while it runs.
+	// A nil callback accepts all streams carrying metadata.
+	// Requires EnableStreamMeta.
+	AdmitStream func(ctx context.Context, meta []byte) bool
+
 	// LogOutput is used to control the log destination. Either Logger or
 	// LogOutput can be set, not both.
 	LogOutput io.Writer
@@ -85,6 +106,9 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.AdmitStream != nil && !config.EnableStreamMeta {
+		return fmt.Errorf("AdmitStream requires EnableStreamMeta")
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

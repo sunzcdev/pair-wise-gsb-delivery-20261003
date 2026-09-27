@@ -79,6 +79,15 @@ var (
 
 	// ErrKeepAliveTimeout is sent if a missed keepalive caused the stream close
 	ErrKeepAliveTimeout = fmt.Errorf("keepalive timeout")
+
+	// ErrStreamMetaUnsupported is returned when opening a stream with
+	// service metadata but the peer did not negotiate the optional
+	// stream metadata extension.
+	ErrStreamMetaUnsupported = fmt.Errorf("stream metadata extension not supported by peer")
+
+	// ErrStreamMetaTooLarge is returned when service metadata exceeds
+	// maxStreamMetaSize bytes.
+	ErrStreamMetaTooLarge = fmt.Errorf("stream metadata exceeds maximum size")
 )
 
 const (
@@ -104,6 +113,33 @@ const (
 	// GoAway is sent to terminate a session. The StreamID
 	// should be 0 and the length is an error code.
 	typeGoAway
+
+	// typeStreamMeta announces a new stream and carries bounded,
+	// opaque service metadata. It is part of the optional stream
+	// metadata extension and must only be sent after the extension
+	// has been negotiated with the capability probe. Peers that did
+	// not negotiate the extension treat it as an invalid message type.
+	typeStreamMeta
+)
+
+const (
+	// pingIDStreamMetaProbe is a reserved ping ID used to probe the
+	// peer for support of the stream metadata extension. A peer that
+	// supports the extension answers with pingIDStreamMetaAck. Any
+	// other peer simply echoes the probe ID back, which is interpreted
+	// as "not supported". The reserved IDs are never allocated by Ping.
+	pingIDStreamMetaProbe uint32 = 0xFFFFFFFF
+
+	// pingIDStreamMetaAck is the reserved ping ID used to positively
+	// answer a stream metadata capability probe.
+	pingIDStreamMetaAck uint32 = 0xFFFFFFFE
+)
+
+const (
+	// maxStreamMetaSize bounds the service metadata payload that may
+	// be attached to a stream, keeping admission decisions cheap and
+	// the receive buffer usage bounded.
+	maxStreamMetaSize = 1024
 )
 
 const (

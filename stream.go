@@ -5,6 +5,7 @@ package yamux
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -62,6 +63,25 @@ type Stream struct {
 	// closeTimer is set with stateLock held to honor the StreamCloseTimeout
 	// setting on Session.
 	closeTimer *time.Timer
+
+	// meta holds the optional service metadata announced through the
+	// stream metadata extension. It is assigned before the stream is
+	// published in the session's stream map and is immutable afterwards.
+	meta []byte
+
+	// metaAnnounced is true if the stream was created by a stream
+	// metadata frame, in which case the following SYN completes the
+	// handshake instead of declaring a new stream. Assigned before the
+	// stream is published and immutable afterwards.
+	metaAnnounced bool
+
+	// synReceived is true once the SYN for a meta-announced stream has
+	// been received. Guarded by session.streamLock.
+	synReceived bool
+
+	// admitCancel cancels the context of a running admission callback.
+	// Assigned before the stream is published and immutable afterwards.
+	admitCancel context.CancelFunc
 }
 
 // newStream is used to construct a new stream within
@@ -94,6 +114,17 @@ func (s *Stream) Session() *Session {
 // StreamID returns the ID of this stream
 func (s *Stream) StreamID() uint32 {
 	return s.id
+}
+
+// Meta returns the service metadata the peer attached when opening the
+// stream via the stream metadata extension, or nil if none was provided.
+func (s *Stream) Meta() []byte {
+	if s.meta == nil {
+		return nil
+	}
+	meta := make([]byte, len(s.meta))
+	copy(meta, s.meta)
+	return meta
 }
 
 // Read is used to read from the stream. It is safe to call Write, Read, and/or
@@ -411,6 +442,9 @@ func (s *Stream) forceClose() {
 	s.stateLock.Lock()
 	s.state = streamClosed
 	s.stateLock.Unlock()
+	if s.admitCancel != nil {
+		s.admitCancel()
+	}
 	s.notifyWaiting()
 }
 

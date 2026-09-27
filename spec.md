@@ -42,6 +42,11 @@ message types are supported:
 
 * 0x3 Go Away - Used to close a session.
 
+* 0x4 Stream Metadata - Optional extension frame. Announces a new
+  stream and carries bounded service metadata. Must only be sent
+  after the stream metadata extension has been negotiated; see
+  "Stream Metadata Extension" below.
+
 ## Flag Field
 
 The flags field is used to provide additional information related
@@ -76,6 +81,8 @@ The meaning of the length field depends on the message type:
 * Window update - provides a delta update to the window size
 * Ping - Contains an opaque value, echoed back
 * Go Away - Contains an error code
+* Stream Metadata - provides the length of metadata bytes following
+  the header
 
 # Message Flow
 
@@ -138,3 +145,50 @@ provide an error code:
 * 0x0 Normal termination
 * 0x1 Protocol error
 * 0x2 Internal error
+
+# Stream Metadata Extension
+
+This optional extension lets the side opening a stream attach bounded,
+opaque service metadata (for example a service name) to the handshake,
+so the receiver can accept or reject the stream before handing it to
+the application. It is designed so that endpoints with and without the
+extension interoperate safely.
+
+## Capability negotiation
+
+Support must be negotiated before any Stream Metadata frame is sent.
+The negotiation reuses the Ping message so that peers without the
+extension never receive a frame type they cannot parse:
+
+* The ping ID 0xFFFFFFFF is reserved as a capability probe. An
+  endpoint with the extension enabled sends a Ping (SYN, StreamID 0)
+  with this ID when the session starts.
+* A peer that implements and enables the extension replies with a
+  Ping (ACK, StreamID 0) using the reserved ID 0xFFFFFFFE.
+* A peer without the extension simply echoes the probe ID back, as it
+  would for any other ping. Receiving the echoed probe ID (or any
+  other value) means the extension is not supported.
+
+The IDs 0xFFFFFFFF and 0xFFFFFFFE are reserved and must not be used
+for ordinary pings. If the negotiation does not confirm support, the
+sender must not emit Stream Metadata frames.
+
+## Opening a stream with metadata
+
+To open a stream with metadata, the opener first sends a Stream
+Metadata frame with the new StreamID and the metadata payload (at most
+1024 bytes), immediately followed by the usual SYN frame for that
+StreamID.
+
+The receiver registers the stream as pending and evaluates its
+admission policy (for example an application callback) asynchronously,
+so a slow decision never stalls the receive loop or other streams.
+While pending, the stream is not yet surfaced to the application:
+
+* If admitted, the stream is queued for acceptance and the normal
+  ACK is sent when the application accepts it.
+* If rejected, the receiver replies with RST and the stream is never
+  surfaced to the application.
+
+Streams opened without a Stream Metadata frame follow the regular
+message flow unchanged.
