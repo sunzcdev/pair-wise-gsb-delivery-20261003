@@ -1,0 +1,6 @@
+p, alice, data1, read, allow, mask=ssn
+p, alice, data1, read, allow, watermark=owner
+p, bob, data2, read, allow, mask=ssn
+p, bob, data2, read, allow, mask=none
+p, carol, data3, read, allow, mask=ssn
+p, carol, data3, read, allow, mask=ssn

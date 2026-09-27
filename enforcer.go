@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/casbin/casbin/v3/constant"
 	"github.com/casbin/casbin/v3/detector"
 	"github.com/casbin/casbin/v3/effector"
 	"github.com/casbin/casbin/v3/log"
@@ -60,6 +61,8 @@ type Enforcer struct {
 	autoNotifyDispatcher bool
 	acceptJsonRequest    bool
 	gFunctionCache       bool
+
+	obligationsMerger ObligationsMerger
 
 	aiConfig AIConfig
 }
@@ -699,7 +702,7 @@ func (e *Enforcer) invalidateMatcherMap() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, obligations *Obligations, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
 
 	defer func() {
@@ -818,6 +821,12 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	var effect effector.Effect
 	var explainIndex int
 
+	effectExpr := e.model["e"][eType].Value
+	priorityEffect := effectExpr == constant.PriorityEffect || effectExpr == constant.SubjectPriorityEffect
+	// With obligations requested, an allow decision is not final while scanning:
+	// all effective allow rules must be found so their obligations can be merged.
+	allowExplainIndex := -1
+
 	if policyLen := len(e.model["p"][pType].Policy); policyLen != 0 && strings.Contains(expString, pType+"_") { //nolint:nestif // TODO: reduce function complexity
 		policyEffects = make([]effector.Effect, policyLen)
 		matcherResults = make([]float64, policyLen)
@@ -873,13 +882,22 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			//	break
 			// }
 
-			effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
+			effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, policyIndex, policyLen)
 			if err != nil {
 				return false, err
 			}
 			if effect != effector.Indeterminate {
-				break
+				if obligations == nil || effect == effector.Deny || priorityEffect {
+					break
+				}
+				if allowExplainIndex == -1 {
+					allowExplainIndex = explainIndex
+				}
 			}
+		}
+		if obligations != nil && effect == effector.Indeterminate && allowExplainIndex != -1 {
+			effect = effector.Allow
+			explainIndex = allowExplainIndex
 		}
 	} else {
 		if hasEval && len(e.model["p"][pType].Policy) == 0 {
@@ -903,10 +921,18 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			policyEffects[0] = effector.Indeterminate
 		}
 
-		effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, 0, 1)
+		effect, explainIndex, err = e.eft.MergeEffects(effectExpr, policyEffects, matcherResults, 0, 1)
 		if err != nil {
 			return false, err
 		}
+	}
+
+	if obligations != nil && effect == effector.Allow {
+		merged, collectErr := e.collectObligations(pType, pTokens, priorityEffect, explainIndex, policyEffects, matcherResults)
+		if collectErr != nil {
+			return false, collectErr
+		}
+		*obligations = merged
 	}
 
 	if explains != nil {
@@ -940,25 +966,25 @@ func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, 
 
 // Enforce decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (sub, obj, act).
 func (e *Enforcer) Enforce(rvals ...interface{}) (bool, error) {
-	return e.enforce("", nil, rvals...)
+	return e.enforce("", nil, nil, rvals...)
 }
 
 // EnforceWithMatcher use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
 func (e *Enforcer) EnforceWithMatcher(matcher string, rvals ...interface{}) (bool, error) {
-	return e.enforce(matcher, nil, rvals...)
+	return e.enforce(matcher, nil, nil, rvals...)
 }
 
 // EnforceEx explain enforcement by informing matched rules.
 func (e *Enforcer) EnforceEx(rvals ...interface{}) (bool, []string, error) {
 	explain := []string{}
-	result, err := e.enforce("", &explain, rvals...)
+	result, err := e.enforce("", &explain, nil, rvals...)
 	return result, explain, err
 }
 
 // EnforceExWithMatcher use a custom matcher and explain enforcement by informing matched rules.
 func (e *Enforcer) EnforceExWithMatcher(matcher string, rvals ...interface{}) (bool, []string, error) {
 	explain := []string{}
-	result, err := e.enforce(matcher, &explain, rvals...)
+	result, err := e.enforce(matcher, &explain, nil, rvals...)
 	return result, explain, err
 }
 
@@ -966,7 +992,7 @@ func (e *Enforcer) EnforceExWithMatcher(matcher string, rvals ...interface{}) (b
 func (e *Enforcer) BatchEnforce(requests [][]interface{}) ([]bool, error) {
 	var results []bool
 	for _, request := range requests {
-		result, err := e.enforce("", nil, request...)
+		result, err := e.enforce("", nil, nil, request...)
 		if err != nil {
 			return results, err
 		}
@@ -979,7 +1005,7 @@ func (e *Enforcer) BatchEnforce(requests [][]interface{}) ([]bool, error) {
 func (e *Enforcer) BatchEnforceWithMatcher(matcher string, requests [][]interface{}) ([]bool, error) {
 	var results []bool
 	for _, request := range requests {
-		result, err := e.enforce(matcher, nil, request...)
+		result, err := e.enforce(matcher, nil, nil, request...)
 		if err != nil {
 			return results, err
 		}

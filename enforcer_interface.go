@@ -62,6 +62,7 @@ type IEnforcer interface {
 	EnforceWithMatcher(matcher string, rvals ...interface{}) (bool, error)
 	EnforceEx(rvals ...interface{}) (bool, []string, error)
 	EnforceExWithMatcher(matcher string, rvals ...interface{}) (bool, []string, error)
+	EnforceWithObligations(rvals ...interface{}) (bool, Obligations, error)
 	BatchEnforce(requests [][]interface{}) ([]bool, error)
 	BatchEnforceWithMatcher(matcher string, requests [][]interface{}) ([]bool, error)
 	Explain(rvals ...interface{}) (string, error)
