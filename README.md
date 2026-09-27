@@ -42,6 +42,7 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
   * Optional `time.Time` parsing
   * Optional placeholder interpolation
   * Supports zlib compression.
+  * Session state tracking (`CLIENT_SESSION_TRACK`): schema, system variable and GTID changes are exposed via the `SessionStateCallback` option and the `SessionStater` interface.
 
 ## Requirements
 

@@ -80,12 +80,13 @@ type Config struct {
 	compress       bool // Enable zlib compression
 	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
 
-	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
-	encodedAttributes string                               // Encoded connection attributes
-	paramOrder        []string                             // Order of connection parameters parsed from the DSN
-	pubKey            *rsa.PublicKey                       // Server public key
-	timeTruncate      time.Duration                        // Truncate time.Time values to the specified duration
-	charsets          []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
+	beforeConnect        func(context.Context, *Config) error // Invoked before a connection is established
+	encodedAttributes    string                               // Encoded connection attributes
+	paramOrder           []string                             // Order of connection parameters parsed from the DSN
+	pubKey               *rsa.PublicKey                       // Server public key
+	sessionStateCallback func([]SessionStateChange)           // Invoked when the server reports session state changes
+	timeTruncate         time.Duration                        // Truncate time.Time values to the specified duration
+	charsets             []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
 }
 
 // Functional Options Pattern
@@ -153,6 +154,18 @@ func TimeTruncate(d time.Duration) Option {
 func BeforeConnect(fn func(context.Context, *Config) error) Option {
 	return func(cfg *Config) error {
 		cfg.beforeConnect = fn
+		return nil
+	}
+}
+
+// SessionStateCallback sets the function to be invoked with the structured
+// session state changes (schema, system variables, GTIDs, ...) reported by the
+// server once a command has fully completed. It requires server support for
+// CLIENT_SESSION_TRACK (MySQL 5.7+ / MariaDB 10.2+). The accumulated state is
+// also available via the SessionStater interface.
+func SessionStateCallback(fn func([]SessionStateChange)) Option {
+	return func(cfg *Config) error {
+		cfg.sessionStateCallback = fn
 		return nil
 	}
 }

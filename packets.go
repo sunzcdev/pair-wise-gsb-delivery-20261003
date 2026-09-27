@@ -289,6 +289,7 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 			clientPluginAuth |
 			clientMultiResults |
 			clientConnectAttrs |
+			clientSessionTrack |
 			clientDeprecateEOF
 
 	if mc.cfg.ClientFoundRows {
@@ -590,6 +591,9 @@ func (mc *mysqlConn) handleErrorPacket(data []byte) error {
 		return ErrMalformPkt
 	}
 
+	// The command aborted; drop any staged session state changes.
+	mc.pendingSessionState = nil
+
 	// 0xff [1 byte]
 
 	// Error Number [16 bit uint]
@@ -690,12 +694,37 @@ func (mc *okHandler) handleOkPacket(data []byte) error {
 
 	// server_status [2 bytes]
 	mc.status = readStatus(data[1+n+m : 1+n+m+2])
+
+	// warning count [2 bytes]
+	// session state info [optional, CLIENT_SESSION_TRACK]
+	if err := mc.conn().readOkSessionState(data, 1+n+m+2); err != nil {
+		return err
+	}
+
 	if mc.status&statusMoreResultsExists != 0 {
 		return nil
 	}
 
-	// warning count [2 bytes]
+	// The command has fully completed; publish staged session state changes.
+	mc.conn().commitSessionState()
 
+	return nil
+}
+
+// handleEofOkPacket processes an OK packet that terminates a result set
+// (0xFE header, sent in place of an EOF packet when CLIENT_DEPRECATE_EOF is
+// enabled). It updates the connection status and stages any session state
+// changes, publishing them once no more results follow.
+func (mc *mysqlConn) handleEofOkPacket(data []byte) error {
+	_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
+	_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
+	mc.status = readStatus(data[1+n+m:])
+	if err := mc.readOkSessionState(data, 1+n+m+2); err != nil {
+		return err
+	}
+	if mc.status&statusMoreResultsExists == 0 {
+		mc.commitSessionState()
+	}
 	return nil
 }
 
@@ -827,11 +856,8 @@ func (rows *textRows) readRow(dest []driver.Value) error {
 			// Deprecated EOF packet
 			// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
 			mc.status = readStatus(data[3:])
-		} else {
-			// Ok Packet with an 0xFE header
-			_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-			_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
-			mc.status = readStatus(data[1+n+m:])
+		} else if err := mc.handleEofOkPacket(data); err != nil {
+			return err
 		}
 		rows.rs.done = true
 		if !rows.HasNextResultSet() {
@@ -950,11 +976,8 @@ func (mc *mysqlConn) skipRows() error {
 				if mc.capabilities&clientDeprecateEOF == 0 {
 					// EOF packet
 					mc.status = readStatus(data[3:])
-				} else {
-					// OK packet with an 0xFE header
-					_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-					_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
-					mc.status = readStatus(data[1+n+m:])
+				} else if err := mc.handleEofOkPacket(data); err != nil {
+					return err
 				}
 				return nil
 			}
@@ -1307,11 +1330,8 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 			if rows.mc.capabilities&clientDeprecateEOF == 0 {
 				// EOF packet
 				rows.mc.status = readStatus(data[3:])
-			} else {
-				// OK Packet with an 0xFE header
-				_, _, n := readLengthEncodedInteger(data[1:])
-				_, _, m := readLengthEncodedInteger(data[1+n:])
-				rows.mc.status = readStatus(data[1+n+m:])
+			} else if err := rows.mc.handleEofOkPacket(data); err != nil {
+				return err
 			}
 			rows.rs.done = true
 			if !rows.HasNextResultSet() {

@@ -47,6 +47,10 @@ type mysqlConn struct {
 	finished chan<- struct{}
 	canceled atomicError // set non-nil if conn is canceled
 	closed   atomic.Bool // set when conn is closed, before closech is closed
+
+	// session state tracking (CLIENT_SESSION_TRACK)
+	sessionState        SessionState         // published state, see SessionState()
+	pendingSessionState []SessionStateChange // staged until the command completes
 }
 
 // Helper function to call per-connection logger.

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+* Support `CLIENT_SESSION_TRACK`. Session state changes reported by the server
+  (default schema, system variables, transaction GTIDs, ...) are parsed from OK
+  packets and published once the corresponding command has fully completed.
+  Use the new `SessionStateCallback` option to receive structured changes, or
+  read the accumulated state via the `SessionStater` interface.
+
 ## v1.10.1 (2026-09-02)
 
 * Fix `Config.FormatDSN()` dropping `Addr` when `Net` is empty.
