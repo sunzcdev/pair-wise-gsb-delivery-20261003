@@ -13,6 +13,7 @@ type item struct {
 // MemStore represents the session store.
 type MemStore struct {
 	items       map[string]item
+	versions    map[string]uint64
 	mu          sync.RWMutex
 	stopCleanup chan bool
 }
@@ -29,7 +30,8 @@ func New() *MemStore {
 // from running (i.e. expired sessions will not be removed).
 func NewWithCleanupInterval(cleanupInterval time.Duration) *MemStore {
 	m := &MemStore{
-		items: make(map[string]item),
+		items:    make(map[string]item),
+		versions: make(map[string]uint64),
 	}
 
 	if cleanupInterval > 0 {
@@ -68,9 +70,55 @@ func (m *MemStore) Commit(token string, b []byte, expiry time.Time) error {
 		object:     b,
 		expiration: expiry.UnixNano(),
 	}
+	m.versions[token]++
 	m.mu.Unlock()
 
 	return nil
+}
+
+// FindVersioned returns the data and version for a given session token from
+// the MemStore instance. If the session token is not found or is expired, the
+// returned exists flag will be set to false and the version will be 0.
+func (m *MemStore) FindVersioned(token string) ([]byte, uint64, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	item, found := m.items[token]
+	if !found {
+		return nil, 0, false, nil
+	}
+
+	if time.Now().UnixNano() > item.expiration {
+		return nil, 0, false, nil
+	}
+
+	return item.object, m.versions[token], true, nil
+}
+
+// CommitVersioned adds a session token and data to the MemStore instance with
+// the given expiry time, but only if the version of the data currently stored
+// for the token equals expectedVersion (0 means the token must not currently
+// exist). The returned committed flag reports whether the commit was applied.
+func (m *MemStore) CommitVersioned(token string, b []byte, expiry time.Time, expectedVersion uint64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var currentVersion uint64
+	if it, found := m.items[token]; found && time.Now().UnixNano() <= it.expiration {
+		currentVersion = m.versions[token]
+	}
+
+	if currentVersion != expectedVersion {
+		return false, nil
+	}
+
+	m.items[token] = item{
+		object:     b,
+		expiration: expiry.UnixNano(),
+	}
+	m.versions[token] = currentVersion + 1
+
+	return true, nil
 }
 
 // Delete removes a session token and corresponding data from the MemStore
@@ -78,6 +126,7 @@ func (m *MemStore) Commit(token string, b []byte, expiry time.Time) error {
 func (m *MemStore) Delete(token string) error {
 	m.mu.Lock()
 	delete(m.items, token)
+	delete(m.versions, token)
 	m.mu.Unlock()
 
 	return nil
@@ -135,6 +184,7 @@ func (m *MemStore) deleteExpired() {
 	for token, item := range m.items {
 		if now > item.expiration {
 			delete(m.items, token)
+			delete(m.versions, token)
 		}
 	}
 	m.mu.Unlock()

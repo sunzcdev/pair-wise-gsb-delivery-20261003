@@ -39,6 +39,13 @@ type sessionData struct {
 	status   Status
 	token    string
 	values   map[string]interface{}
+	// baseline holds a copy of the session values as they were when loaded
+	// from the store (or as they were after the last successful commit). It
+	// is used as the merge base when committing to a VersionedStore.
+	baseline map[string]interface{}
+	// loaded reports whether the session data was loaded from the store
+	// (rather than being a brand new session).
+	loaded   bool
 	mu       sync.Mutex
 }
 
@@ -100,6 +107,9 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		return nil, err
 	}
 
+	sd.baseline = cloneValues(sd.values)
+	sd.loaded = true
+
 	// By default, set the expiry time to the deadline.
 	sd.expiry = sd.deadline
 
@@ -133,6 +143,16 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		if sd.token, err = generateToken(); err != nil {
 			return "", time.Time{}, err
 		}
+	}
+
+	if _, ok := s.Store.(VersionedStore); ok {
+		if err := s.commitWithMerge(sd); err != nil {
+			return "", time.Time{}, err
+		}
+
+		sd.status = Committed
+
+		return sd.token, sd.expiry, nil
 	}
 
 	b, err := s.Codec.Encode(sd.deadline, sd.values)
@@ -171,6 +191,8 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	// Reset everything else to defaults.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.baseline = nil
+	sd.loaded = false
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
@@ -332,6 +354,8 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.token = newToken
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
+	sd.baseline = nil
+	sd.loaded = false
 
 	return nil
 }
@@ -586,6 +610,9 @@ func (s *SessionManager) Iterate(ctx context.Context, fn func(context.Context) e
 		if err != nil {
 			return err
 		}
+
+		sd.baseline = cloneValues(sd.values)
+		sd.loaded = true
 
 		ctx = s.addSessionDataToContext(ctx, sd)
 

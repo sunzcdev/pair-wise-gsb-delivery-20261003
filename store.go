@@ -56,3 +56,32 @@ type IterableCtxStore interface {
 	// context.Context.
 	AllCtx(ctx context.Context) (map[string][]byte, error)
 }
+
+// VersionedStore is an optional interface for session stores which support
+// versioned reads and compare-and-swap commits. When the store used by a
+// SessionManager implements this interface, commits are performed using a
+// three-way merge between the data loaded at the start of the request cycle
+// (the baseline), the data currently in the store, and the changes made
+// during the request cycle. This prevents concurrent requests for the same
+// session from silently overwriting each other's changes (the "last write
+// wins" problem): changes to different keys are merged, and conflicting
+// changes to the same key are reported to the caller via a ConflictError
+// instead of being silently resolved.
+type VersionedStore interface {
+	Store
+
+	// FindVersioned is the same as Store.Find, except it also returns a
+	// version number which uniquely identifies the stored data. The version
+	// must change every time the data for the token is modified or deleted.
+	// If the token is not found the version return value should be 0.
+	FindVersioned(token string) (b []byte, version uint64, found bool, err error)
+
+	// CommitVersioned is the same as Store.Commit, except the commit only
+	// succeeds if the version of the data currently stored for the token
+	// equals expectedVersion (an expectedVersion of 0 means the token must
+	// not currently exist). The committed return value reports whether the
+	// commit was applied; a false value (with a nil error) indicates a
+	// version mismatch, i.e. the stored data changed between the
+	// corresponding FindVersioned call and this commit.
+	CommitVersioned(token string, b []byte, expiry time.Time, expectedVersion uint64) (committed bool, err error)
+}
