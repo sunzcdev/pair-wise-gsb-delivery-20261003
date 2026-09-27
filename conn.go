@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/textproto"
 	"regexp"
@@ -40,6 +41,17 @@ type Conn struct {
 	bdatStatus      *statusCollector // used for BDAT on LMTP
 	dataResult      chan error
 	bytesReceived   int64 // counts total size of chunks when BDAT is used
+
+	// BDAT rejection draining state. When the backend rejects the message
+	// before consuming it entirely, remaining chunk data is discarded
+	// instead of being delivered, until BDAT LAST or RSET is received.
+	// The amount of discarded data is bounded by Server.BdatRejectBytes
+	// and Server.BdatRejectTimeout; once either budget is exhausted the
+	// connection is closed.
+	bdatDrain         bool
+	bdatDrainErr      error // error reported in response to drained chunks
+	bdatDrainLeft     int64 // remaining drain byte budget
+	bdatDrainDeadline time.Time
 
 	fromReceived bool
 	recipients   []string
@@ -106,6 +118,28 @@ func (c *Conn) handle(cmd string, arg string) {
 	}
 
 	cmd = strings.ToUpper(cmd)
+	if c.bdatDrain {
+		// The backend rejected the message early, remaining BDAT chunks
+		// are drained and rejected until the client finishes the
+		// transaction with BDAT LAST or aborts it with RSET. Chunk data
+		// is consumed by octet count, so message content is never
+		// interpreted as commands here.
+		switch cmd {
+		case "BDAT":
+			c.handleBdat(arg)
+		case "RSET":
+			c.reset()
+			c.writeResponse(250, EnhancedCode{2, 0, 0}, "Session reset")
+		case "NOOP":
+			c.writeResponse(250, EnhancedCode{2, 0, 0}, "I have successfully done nothing")
+		case "QUIT":
+			c.writeResponse(221, EnhancedCode{2, 0, 0}, "Bye")
+			c.Close()
+		default:
+			c.writeResponse(503, EnhancedCode{5, 5, 1}, "Message transfer was rejected, finish it with BDAT LAST or abort with RSET")
+		}
+		return
+	}
 	switch cmd {
 	case "SEND", "SOML", "SAML", "EXPN", "HELP", "TURN":
 		// These commands are not implemented in any state
@@ -1022,6 +1056,23 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
+	if c.bdatDrain {
+		// The message was already rejected by the backend, discard the
+		// chunk and repeat the rejection. The session is resumed once
+		// the last chunk is drained.
+		c.lineLimitReader.LineLimit = 0
+		ok := c.drainBdatChunk(int64(size))
+		c.lineLimitReader.LineLimit = c.server.MaxLineLength
+		if !ok {
+			return
+		}
+		c.writeResponse(dataErrorToStatus(c.bdatDrainErr))
+		if last {
+			c.reset()
+		}
+		return
+	}
+
 	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
@@ -1075,10 +1126,21 @@ func (c *Conn) handleBdat(arg string) {
 	c.lineLimitReader.LineLimit = 0
 
 	chunk := io.LimitReader(c.text.R, int64(size))
-	_, err = io.Copy(c.bdatPipe, chunk)
+	cr := &countingReader{R: chunk}
+	written, err := io.Copy(c.bdatPipe, cr)
 	if err != nil {
-		// Backend might return an error early using CloseWithError without consuming
-		// the whole chunk.
+		// The backend might have finished early (e.g. rejected the
+		// message) without consuming the whole chunk. If so, its result
+		// is already available since the pipe is closed only after the
+		// backend goroutine sends it.
+		select {
+		case backendErr := <-c.dataResult:
+			c.handleBdatReject(backendErr, int64(size)-cr.N, cr.N-written, last)
+			return
+		default:
+		}
+
+		// Otherwise the connection itself is broken.
 		io.Copy(ioutil.Discard, chunk)
 
 		c.writeResponse(dataErrorToStatus(err))
@@ -1088,7 +1150,6 @@ func (c *Conn) handleBdat(arg string) {
 		}
 
 		c.reset()
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
 		return
 	}
 
@@ -1125,6 +1186,111 @@ func (c *Conn) handleBdat(arg string) {
 // ErrDataReset is returned by Reader pased to Data function if client does not
 // send another BDAT command and instead closes connection or issues RSET command.
 var ErrDataReset = errors.New("smtp: message transmission aborted")
+
+// countingReader counts the number of bytes read from the underlying reader.
+type countingReader struct {
+	R io.Reader
+	N int64
+}
+
+func (r *countingReader) Read(b []byte) (int, error) {
+	n, err := r.R.Read(b)
+	r.N += int64(n)
+	return n, err
+}
+
+// handleBdatReject switches the connection into draining mode after the
+// backend finished the message early without consuming it entirely.
+// remaining is the number of unread octets of the current chunk, discarded
+// is the number of octets already read from the client but not consumed by
+// the backend.
+//
+// The rest of the current chunk and any pipelined chunks are discarded
+// within the budgets configured with Server.BdatRejectBytes and
+// Server.BdatRejectTimeout so that the session can be resumed once BDAT
+// LAST or RSET arrives. If a budget is exhausted, the connection is
+// closed instead.
+func (c *Conn) handleBdatReject(backendErr error, remaining, discarded int64, last bool) {
+	if backendErr == errPanic {
+		c.writeResponse(dataErrorToStatus(backendErr))
+		c.Close()
+		return
+	}
+
+	if c.server.BdatRejectBytes < 0 {
+		// Draining is disabled, report the rejection and close.
+		c.writeResponse(dataErrorToStatus(backendErr))
+		c.Close()
+		return
+	}
+
+	// The backend goroutine is done, make sure the pipe is closed and
+	// will not be used again.
+	if c.bdatPipe != nil {
+		c.bdatPipe.CloseWithError(ErrDataReset)
+		c.bdatPipe = nil
+	}
+
+	c.bdatDrain = true
+	c.bdatDrainErr = backendErr
+	c.bdatDrainLeft = c.server.BdatRejectBytes
+	if c.bdatDrainLeft == 0 {
+		c.bdatDrainLeft = math.MaxInt64
+	}
+	// Octets read from the client but not delivered to the backend count
+	// against the drain budget too.
+	c.bdatDrainLeft -= discarded
+	if c.bdatDrainLeft < 0 {
+		c.writeResponse(421, EnhancedCode{4, 4, 2}, "Too much data after message rejection, closing connection")
+		c.Close()
+		return
+	}
+	c.bdatDrainDeadline = time.Time{}
+	if c.server.BdatRejectTimeout != 0 {
+		c.bdatDrainDeadline = time.Now().Add(c.server.BdatRejectTimeout)
+	}
+
+	// Discard the rest of the current chunk. The line limit is still
+	// disabled from the chunk transfer.
+	if !c.drainBdatChunk(remaining) {
+		return
+	}
+	c.lineLimitReader.LineLimit = c.server.MaxLineLength
+
+	c.writeResponse(dataErrorToStatus(backendErr))
+
+	if last {
+		c.reset()
+	}
+}
+
+// drainBdatChunk reads and discards exactly size octets of BDAT chunk data,
+// bounding the read by the rejection drain budgets. If the byte or time
+// budget is exhausted, it closes the connection and returns false.
+func (c *Conn) drainBdatChunk(size int64) bool {
+	if size > c.bdatDrainLeft {
+		c.writeResponse(421, EnhancedCode{4, 4, 2}, "Too much data after message rejection, closing connection")
+		c.Close()
+		return false
+	}
+	c.bdatDrainLeft -= size
+
+	if !c.bdatDrainDeadline.IsZero() {
+		c.conn.SetReadDeadline(c.bdatDrainDeadline)
+	}
+	_, err := io.CopyN(ioutil.Discard, c.text.R, size)
+	if c.server.ReadTimeout != 0 {
+		c.conn.SetReadDeadline(time.Now().Add(c.server.ReadTimeout))
+	} else {
+		c.conn.SetReadDeadline(time.Time{})
+	}
+	if err != nil {
+		c.writeResponse(421, EnhancedCode{4, 4, 2}, "Failed to drain rejected message, closing connection")
+		c.Close()
+		return false
+	}
+	return true
+}
 
 var errPanic = &SMTPError{
 	Code:         421,
@@ -1323,7 +1489,19 @@ func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
 
 // Reads a line of input
 func (c *Conn) readLine() (string, error) {
-	if c.server.ReadTimeout != 0 {
+	if c.bdatDrain && !c.bdatDrainDeadline.IsZero() {
+		// While draining a rejected BDAT transaction, bound the wait for
+		// further commands by the drain deadline as well.
+		deadline := c.bdatDrainDeadline
+		if c.server.ReadTimeout != 0 {
+			if d := time.Now().Add(c.server.ReadTimeout); d.Before(deadline) {
+				deadline = d
+			}
+		}
+		if err := c.conn.SetReadDeadline(deadline); err != nil {
+			return "", err
+		}
+	} else if c.server.ReadTimeout != 0 {
 		if err := c.conn.SetReadDeadline(time.Now().Add(c.server.ReadTimeout)); err != nil {
 			return "", err
 		}
@@ -1342,6 +1520,10 @@ func (c *Conn) reset() {
 	}
 	c.bdatStatus = nil
 	c.bytesReceived = 0
+	c.bdatDrain = false
+	c.bdatDrainErr = nil
+	c.bdatDrainLeft = 0
+	c.bdatDrainDeadline = time.Time{}
 
 	// BDAT disables the line limit while reading a chunk, the transaction is over now.
 	c.lineLimitReader.LineLimit = c.server.MaxLineLength

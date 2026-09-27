@@ -1192,12 +1192,184 @@ func TestServer_Chunking_EarlyErrorDuringChunk(t *testing.T) {
 		t.Fatal("Invalid BDAT response:", scanner.Text())
 	}
 
+	// The transaction is still open, remaining chunks are drained and
+	// rejected until BDAT LAST.
+	io.WriteString(c, "BDAT 0 LAST\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "555 5.0.0 I failed") {
+		t.Fatal("Invalid BDAT LAST response:", scanner.Text())
+	}
+
 	// See that command stream state is not corrupted e.g. server is still not
 	// waiting for remaining chunk octets.
 	io.WriteString(c, "NOOP\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+}
+
+func TestServer_Chunking_EarlyRejectDrain(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	be.dataErr = &smtp.SMTPError{
+		Code:         555,
+		EnhancedCode: smtp.EnhancedCode{5, 0, 0},
+		Message:      "I failed",
+	}
+	be.dataErrOffset = 5
+	be.dataErrors = make(chan error, 10)
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	// The backend reads a few octets and rejects the message, the server
+	// drains the rest of the short chunk and reports the rejection.
+	io.WriteString(c, "BDAT 8\r\n")
+	io.WriteString(c, "Hey <3\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "555 5.0.0 I failed") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	if err := <-be.dataErrors; err != be.dataErr {
+		t.Fatal("Backend received a different error:", err)
+	}
+
+	// Pipelined chunks sent before the client noticed the rejection are
+	// drained as well. Chunk data is consumed by octet count, so text
+	// looking like commands is not executed.
+	evil := "RSET\r\nMAIL FROM:<root@nsa.gov>\r\nNOOP\r\n"
+	io.WriteString(c, fmt.Sprintf("BDAT %d\r\n", len(evil)))
+	io.WriteString(c, evil)
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "555 5.0.0 I failed") {
+		t.Fatal("Invalid drained BDAT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "BDAT 4 LAST\r\n")
+	io.WriteString(c, "bye\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "555 5.0.0 I failed") {
+		t.Fatal("Invalid drained BDAT LAST response:", scanner.Text())
+	}
+
+	// The transaction is over, the session can be reused.
+	io.WriteString(c, "NOOP\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid NOOP response:", scanner.Text())
+	}
+
+	// The MAIL command hidden in the chunk data was not executed.
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "502 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+}
+
+func TestServer_Chunking_EarlyRejectDrainTimeout(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+	s.BdatRejectTimeout = 500 * time.Millisecond
+
+	be.dataErr = &smtp.SMTPError{
+		Code:         555,
+		EnhancedCode: smtp.EnhancedCode{5, 0, 0},
+		Message:      "I failed",
+	}
+	be.dataErrOffset = 5
+	be.dataErrors = make(chan error, 10)
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	// The client announces a huge chunk but never finishes sending it.
+	// The server cannot wait forever while draining the rejected message.
+	io.WriteString(c, "BDAT 1000000 LAST\r\n")
+	io.WriteString(c, "0123456789")
+
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "421 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+	if scanner.Scan() {
+		t.Fatal("Expected connection to be closed, got:", scanner.Text())
+	}
+
+	if err := <-be.dataErrors; err != be.dataErr {
+		t.Fatal("Backend received a different error:", err)
+	}
+}
+
+func TestServer_Chunking_EarlyRejectDrainBudget(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+	s.BdatRejectBytes = 100
+
+	be.dataErr = &smtp.SMTPError{
+		Code:         555,
+		EnhancedCode: smtp.EnhancedCode{5, 0, 0},
+		Message:      "I failed",
+	}
+	be.dataErrOffset = 5
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	// The remaining chunk data exceeds the drain byte budget, so the
+	// connection is closed instead of absorbing it.
+	io.WriteString(c, "BDAT 1000 LAST\r\n")
+	io.WriteString(c, strings.Repeat("a", 1000))
+
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "421 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+	if scanner.Scan() {
+		t.Fatal("Expected connection to be closed, got:", scanner.Text())
 	}
 }
 

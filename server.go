@@ -41,6 +41,22 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// Maximum number of bytes the server will read and discard while
+	// draining a BDAT transaction after the backend rejected the message
+	// early. The server keeps consuming the current and any pipelined
+	// chunks until BDAT LAST or RSET so the session can be resumed; if
+	// the budget is exhausted first, the connection is closed instead.
+	//
+	// Negative values disable draining: the connection is closed right
+	// after the rejection response is sent. Zero means no limit (not
+	// recommended).
+	BdatRejectBytes int64
+	// Maximum time the server will spend draining a rejected BDAT
+	// transaction, including waiting for the client to send remaining
+	// chunk data and further commands. Once exceeded, the connection is
+	// closed. Zero means no limit (not recommended).
+	BdatRejectTimeout time.Duration
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool
@@ -95,6 +111,9 @@ func NewServer(be Backend) *Server {
 	return &Server{
 		// Doubled maximum line length per RFC 5321 (Section 4.5.3.1.6)
 		MaxLineLength: 2000,
+
+		BdatRejectBytes:   1024 * 1024,
+		BdatRejectTimeout: time.Minute,
 
 		Backend:  be,
 		done:     make(chan struct{}, 1),
