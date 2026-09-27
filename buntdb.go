@@ -2335,6 +2335,244 @@ func IndexJSONCaseSensitive(path string) func(a, b string) bool {
 	}
 }
 
+// JSONIndexField describes a single field of a composite JSON index.
+// See IndexJSONComposite for more information.
+type JSONIndexField struct {
+	// Path is a GJSON path to the field in the JSON document.
+	Path string
+	// Desc sorts this field in descending order. The entire comparison
+	// of the field is reversed, including the JSON type ordering.
+	Desc bool
+}
+
+// IndexJSONComposite provides for the ability to create an index on
+// multiple JSON fields, where each field has its own sort direction.
+// For example, an index that is ordered by "category" ascending and
+// then "value" descending can be created with:
+//
+//	db.CreateIndex("catval", "*", buntdb.IndexJSONComposite(
+//		buntdb.JSONIndexField{Path: "category"},
+//		buntdb.JSONIndexField{Path: "value", Desc: true},
+//	))
+//
+// Each field is compared using a fixed JSON type ordering:
+//
+//	missing path < null < false < true < number < string < array/object
+//
+// Numbers are compared using their exact decimal value. They are not
+// converted to float64, so integers larger than 2^53 keep their full
+// precision, and all JSON number forms (integers, decimals, exponents,
+// and negatives) are supported. Strings are compared case-insensitively,
+// which matches the behavior of IndexJSON. Arrays and objects are
+// compared by their raw JSON text.
+//
+// It returns a helper function used by CreateIndex.
+func IndexJSONComposite(fields ...JSONIndexField) func(a, b string) bool {
+	return func(a, b string) bool {
+		for i := range fields {
+			c := compareJSONValues(
+				gjson.Get(a, fields[i].Path),
+				gjson.Get(b, fields[i].Path),
+			)
+			if c == 0 {
+				continue
+			}
+			if fields[i].Desc {
+				return c > 0
+			}
+			return c < 0
+		}
+		return false
+	}
+}
+
+// jsonTypeRank returns the fixed sort rank of a JSON value.
+func jsonTypeRank(res gjson.Result) int {
+	if !res.Exists() {
+		return 0 // missing path
+	}
+	switch res.Type {
+	case gjson.Null:
+		return 1
+	case gjson.False:
+		return 2
+	case gjson.True:
+		return 3
+	case gjson.Number:
+		return 4
+	case gjson.String:
+		return 5
+	default:
+		return 6 // arrays and objects
+	}
+}
+
+// compareJSONValues compares two JSON values using the fixed type
+// ordering documented in IndexJSONComposite. It returns -1 when a is
+// less than b, +1 when a is greater than b, and 0 when they are equal.
+func compareJSONValues(a, b gjson.Result) int {
+	ra, rb := jsonTypeRank(a), jsonTypeRank(b)
+	if ra != rb {
+		if ra < rb {
+			return -1
+		}
+		return 1
+	}
+	switch ra {
+	case 4: // number
+		if a.Raw == "" || b.Raw == "" {
+			// should not happen with results from gjson.Get
+			switch {
+			case a.Num < b.Num:
+				return -1
+			case a.Num > b.Num:
+				return 1
+			}
+			return 0
+		}
+		return compareJSONNumbers(a.Raw, b.Raw)
+	case 5: // string, case-insensitive
+		if IndexString(a.Str, b.Str) {
+			return -1
+		}
+		if IndexString(b.Str, a.Str) {
+			return 1
+		}
+		return 0
+	case 6: // array or object
+		return strings.Compare(a.Raw, b.Raw)
+	}
+	return 0
+}
+
+// jsonNumber is an exact decimal representation of a JSON number.
+// The value is sign * 0.digits * 10^exp.
+type jsonNumber struct {
+	sign   int    // -1, 0, or +1
+	digits string // significant digits, no leading or trailing zeros
+	exp    int64  // base-10 exponent of the normalized form
+}
+
+// parseJSONNumber parses a JSON number into its exact decimal form.
+func parseJSONNumber(s string) (jsonNumber, bool) {
+	var num jsonNumber
+	i := 0
+	neg := false
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		neg = s[i] == '-'
+		i++
+	}
+	intStart := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	intPart := s[intStart:i]
+	fracPart := ""
+	if i < len(s) && s[i] == '.' {
+		i++
+		fracStart := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		fracPart = s[fracStart:i]
+	}
+	if len(intPart)+len(fracPart) == 0 {
+		return num, false
+	}
+	var exp int64
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		expNeg := false
+		if i < len(s) && (s[i] == '-' || s[i] == '+') {
+			expNeg = s[i] == '-'
+			i++
+		}
+		expStart := i
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			// saturate the exponent to avoid overflow. magnitudes this
+			// large dominate any mantissa-length adjustment.
+			if exp < 1<<60 {
+				exp = exp*10 + int64(s[i]-'0')
+				if exp > 1<<60 {
+					exp = 1 << 60
+				}
+			}
+			i++
+		}
+		if i == expStart {
+			return num, false
+		}
+		if expNeg {
+			exp = -exp
+		}
+	}
+	if i != len(s) {
+		return num, false
+	}
+	digits := intPart + fracPart
+	// normalize to 0.digits * 10^exp
+	exp += int64(len(intPart))
+	zeros := 0
+	for zeros < len(digits) && digits[zeros] == '0' {
+		zeros++
+	}
+	digits = digits[zeros:]
+	exp -= int64(zeros)
+	digits = strings.TrimRight(digits, "0")
+	if digits == "" {
+		return num, true // zero
+	}
+	num.sign = 1
+	if neg {
+		num.sign = -1
+	}
+	num.digits = digits
+	num.exp = exp
+	return num, true
+}
+
+// compareJSONNumbers compares two raw JSON numbers by their exact
+// decimal value. It returns -1, 0, or +1.
+func compareJSONNumbers(a, b string) int {
+	na, ok1 := parseJSONNumber(a)
+	nb, ok2 := parseJSONNumber(b)
+	if !ok1 || !ok2 {
+		// fall back to float64 comparison for invalid numbers
+		fa, _ := strconv.ParseFloat(a, 64)
+		fb, _ := strconv.ParseFloat(b, 64)
+		switch {
+		case fa < fb:
+			return -1
+		case fa > fb:
+			return 1
+		}
+		return 0
+	}
+	if na.sign != nb.sign {
+		if na.sign < nb.sign {
+			return -1
+		}
+		return 1
+	}
+	if na.sign == 0 {
+		return 0
+	}
+	var c int
+	if na.exp != nb.exp {
+		if na.exp < nb.exp {
+			c = -1
+		} else {
+			c = 1
+		}
+	} else {
+		c = strings.Compare(na.digits, nb.digits)
+	}
+	if na.sign < 0 {
+		c = -c
+	}
+	return c
+}
+
 // Desc is a helper function that changes the order of an index.
 func Desc(less func(a, b string) bool) func(a, b string) bool {
 	return func(a, b string) bool { return less(b, a) }

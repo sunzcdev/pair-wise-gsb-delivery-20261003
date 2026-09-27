@@ -2657,6 +2657,322 @@ func TestJSONIndex(t *testing.T) {
 	}
 }
 
+func testAscendKeys(t *testing.T, tx *Tx, index string) string {
+	t.Helper()
+	var keys []string
+	if err := tx.Ascend(index, func(key, value string) bool {
+		keys = append(keys, key)
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(keys, ",")
+}
+
+func TestIndexJSONCompositeTypeOrder(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.CreateIndex("vals", "*",
+		IndexJSONComposite(JSONIndexField{Path: "val"})); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateIndex("vals_desc", "*",
+		IndexJSONComposite(JSONIndexField{Path: "val", Desc: true})); err != nil {
+		t.Fatal(err)
+	}
+	docs := []struct{ key, val string }{
+		{"k_str2", `{"val":"Banana"}`},
+		{"k_num2", `{"val":2.5}`},
+		{"k_true", `{"val":true}`},
+		{"k_null", `{"val":null}`},
+		{"k_obj", `{"val":{"a":1}}`},
+		{"k_missing", `{"other":1}`},
+		{"k_num1", `{"val":-3}`},
+		{"k_false", `{"val":false}`},
+		{"k_str1", `{"val":"apple"}`},
+		{"k_arr", `{"val":[1,2]}`},
+		{"k_num3", `{"val":10}`},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for _, doc := range docs {
+			if _, _, err := tx.Set(doc.key, doc.val, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// fixed type order:
+	// missing < null < false < true < number < string < array/object
+	expect := "k_missing,k_null,k_false,k_true," +
+		"k_num1,k_num2,k_num3,k_str1,k_str2,k_arr,k_obj"
+	expectDesc := "k_obj,k_arr,k_str2,k_str1," +
+		"k_num3,k_num2,k_num1,k_true,k_false,k_null,k_missing"
+	if err := db.View(func(tx *Tx) error {
+		if keys := testAscendKeys(t, tx, "vals"); keys != expect {
+			t.Fatalf("expected %v, got %v", expect, keys)
+		}
+		if keys := testAscendKeys(t, tx, "vals_desc"); keys != expectDesc {
+			t.Fatalf("expected %v, got %v", expectDesc, keys)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompareJSONNumbers(t *testing.T) {
+	// equal values across different representations
+	eq := [][2]string{
+		{"1e3", "1000"},
+		{"9007199254740993", "9.007199254740993e15"},
+		{"-0", "0"},
+		{"0.5", "5e-1"},
+		{"10", "1E1"},
+		{"2.50", "2.5"},
+	}
+	for _, pair := range eq {
+		if c := compareJSONNumbers(pair[0], pair[1]); c != 0 {
+			t.Fatalf("expected %v == %v, got %v", pair[0], pair[1], c)
+		}
+		if c := compareJSONNumbers(pair[1], pair[0]); c != 0 {
+			t.Fatalf("expected %v == %v, got %v", pair[1], pair[0], c)
+		}
+	}
+	// ordered pairs, including adjacent integers beyond 2^53,
+	// exponent forms, and negatives
+	lt := [][2]string{
+		{"9007199254740992", "9007199254740993"},
+		{"9007199254740993", "9007199254740994"},
+		{"-9007199254740993", "-9007199254740992"},
+		{"-9007199254740994", "-9007199254740993"},
+		{"123456789012345678901234567890", "123456789012345678901234567891"},
+		{"-123456789012345678901234567891", "-123456789012345678901234567890"},
+		{"999", "1e3"},
+		{"1e3", "1000.5"},
+		{"2.5e2", "1e3"},
+		{"-1.5e3", "-1499"},
+		{"-1e-3", "0"},
+		{"0", "1e-3"},
+		{"-1e3", "-999"},
+	}
+	for _, pair := range lt {
+		if c := compareJSONNumbers(pair[0], pair[1]); c != -1 {
+			t.Fatalf("expected %v < %v, got %v", pair[0], pair[1], c)
+		}
+		if c := compareJSONNumbers(pair[1], pair[0]); c != 1 {
+			t.Fatalf("expected %v > %v, got %v", pair[1], pair[0], c)
+		}
+	}
+}
+
+func TestIndexJSONCompositeBigNumbers(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.CreateIndex("nums", "*",
+		IndexJSONComposite(JSONIndexField{Path: "v"})); err != nil {
+		t.Fatal(err)
+	}
+	docs := []struct{ key, val string }{
+		{"n5", `{"v":9007199254740994}`},
+		{"n2", `{"v":-9007199254740992}`},
+		{"n8", `{"v":123456789012345678901234567891}`},
+		{"n4", `{"v":9007199254740993}`},
+		{"n1", `{"v":-9007199254740993}`},
+		{"n6", `{"v":1.5e3}`},
+		{"n3", `{"v":9007199254740992}`},
+		{"n7", `{"v":123456789012345678901234567890}`},
+		{"n0", `{"v":-1.5e3}`},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for _, doc := range docs {
+			if _, _, err := tx.Set(doc.key, doc.val, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expect := "n1,n2,n0,n6,n3,n4,n5,n7,n8"
+	if err := db.View(func(tx *Tx) error {
+		if keys := testAscendKeys(t, tx, "nums"); keys != expect {
+			t.Fatalf("expected %v, got %v", expect, keys)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIndexJSONCompositeCategoryValueDesc(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	// category ascending, value descending
+	if err := db.CreateIndex("catval", "*", IndexJSONComposite(
+		JSONIndexField{Path: "category"},
+		JSONIndexField{Path: "value", Desc: true},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	docs := []struct{ key, val string }{
+		{"1", `{"category":"fruit","value":9007199254740992}`},
+		{"2", `{"category":"veg","value":200}`},
+		{"3", `{"category":"fruit","value":9007199254740993}`},
+		{"4", `{"category":"fruit","value":5}`},
+		{"5", `{"category":"veg","value":100}`},
+		{"6", `{"category":"Fungi","value":50}`},
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for _, doc := range docs {
+			if _, _, err := tx.Set(doc.key, doc.val, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expect := "3,1,4,6,2,5"
+	if err := db.View(func(tx *Tx) error {
+		if keys := testAscendKeys(t, tx, "catval"); keys != expect {
+			t.Fatalf("expected %v, got %v", expect, keys)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIndexJSONCompositeUpdateRollback(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.CreateIndex("catval", "*", IndexJSONComposite(
+		JSONIndexField{Path: "category"},
+		JSONIndexField{Path: "value", Desc: true},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("1", `{"category":"a","value":1}`, nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("2", `{"category":"a","value":3}`, nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("3", `{"category":"a","value":2}`, nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check := func(expect string) {
+		t.Helper()
+		if err := db.View(func(tx *Tx) error {
+			if keys := testAscendKeys(t, tx, "catval"); keys != expect {
+				t.Fatalf("expected %v, got %v", expect, keys)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check("2,3,1")
+
+	// a committed update reorders the index
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("1", `{"category":"a","value":4}`, nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	check("1,2,3")
+
+	// a rolled-back update leaves the index untouched
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tx.Set("2", `{"category":"a","value":20}`, nil); err != nil {
+		t.Fatal(err)
+	}
+	if keys := testAscendKeys(t, tx, "catval"); keys != "2,1,3" {
+		t.Fatalf("expected %v, got %v", "2,1,3", keys)
+	}
+	tx.Rollback()
+	check("1,2,3")
+
+	// a rolled-back delete leaves the index untouched
+	tx, err = db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Delete("1"); err != nil {
+		t.Fatal(err)
+	}
+	if keys := testAscendKeys(t, tx, "catval"); keys != "2,3" {
+		t.Fatalf("expected %v, got %v", "2,3", keys)
+	}
+	tx.Rollback()
+	check("1,2,3")
+}
+
+func TestIndexJSONDefaultUnchanged(t *testing.T) {
+	less := IndexJSON("v")
+	// numbers are still compared as float64, so adjacent integers
+	// beyond 2^53 compare equal
+	if less(`{"v":9007199254740992}`, `{"v":9007199254740993}`) ||
+		less(`{"v":9007199254740993}`, `{"v":9007199254740992}`) {
+		t.Fatal("IndexJSON numeric comparison changed")
+	}
+	// the gjson type order is unchanged:
+	// null < false < number < string < true
+	order := []string{
+		`{"v":null}`, `{"v":false}`, `{"v":-1}`, `{"v":"a"}`, `{"v":true}`,
+	}
+	for i := 0; i < len(order)-1; i++ {
+		if !less(order[i], order[i+1]) {
+			t.Fatalf("expected %v < %v", order[i], order[i+1])
+		}
+	}
+	// strings remain case-insensitive
+	if !less(`{"v":"apple"}`, `{"v":"Banana"}`) {
+		t.Fatal("IndexJSON string comparison changed")
+	}
+
+	// custom less functions still work as before
+	db := testOpen(t)
+	defer testClose(db)
+	if err := db.CreateIndex("custom", "*",
+		func(a, b string) bool { return a > b }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("1", "a", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("2", "b", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("3", "c", nil); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		if keys := testAscendKeys(t, tx, "custom"); keys != "3,2,1" {
+			t.Fatalf("expected %v, got %v", "3,2,1", keys)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOnExpiredSync(t *testing.T) {
 	db := testOpen(t)
 	defer testClose(db)

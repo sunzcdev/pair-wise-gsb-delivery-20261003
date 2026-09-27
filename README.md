@@ -463,6 +463,30 @@ db.CreateIndex("last_name_age", "*",
 
 This will create a multi value index where the last name is ascending and the age is descending.
 
+## Composite JSON Index
+The `IndexJSONComposite` helper creates an index on multiple JSON fields,
+where each field has its own sort direction. For example, an index ordered
+by "category" ascending and then "value" descending:
+
+```go
+db.CreateIndex("catval", "*", buntdb.IndexJSONComposite(
+    buntdb.JSONIndexField{Path: "category"},
+    buntdb.JSONIndexField{Path: "value", Desc: true},
+))
+```
+
+Each field is compared using a fixed JSON type ordering:
+
+```
+missing path < null < false < true < number < string < array/object
+```
+
+Numbers are compared using their exact decimal value. They are not converted
+to float64, so integers larger than 2^53 keep their full precision, and all
+JSON number forms (integers, decimals, exponents, and negatives) are
+supported. Strings are compared case-insensitively, matching the behavior of
+`IndexJSON`.
+
 ## Collate i18n Indexes
 
 Using the external [collate package](https://github.com/tidwall/collate) it's possible to create
