@@ -59,9 +59,26 @@ type Stream struct {
 	// establishCh is notified if the stream is established or being closed.
 	establishCh chan struct{}
 
+	// establishOnce ensures establishCh is closed exactly once.
+	establishOnce sync.Once
+
 	// closeTimer is set with stateLock held to honor the StreamCloseTimeout
 	// setting on Session.
 	closeTimer *time.Timer
+
+	// synFlags are extra flags OR'd into the initial SYN frame.
+	synFlags uint16
+
+	// awaitMeta marks an inbound stream waiting for its StreamMeta frame
+	// before admission. Guarded by stateLock.
+	awaitMeta bool
+
+	// metaTimer bounds the wait for a StreamMeta frame.
+	metaTimer *time.Timer
+
+	// meta holds the service metadata of an admitted stream. It is set
+	// before the stream is queued for Accept and never changes after.
+	meta *StreamMetadata
 }
 
 // newStream is used to construct a new stream within
@@ -79,7 +96,7 @@ func newStream(session *Session, id uint32, state streamState) *Stream {
 		sendWindow:   initialStreamWindow,
 		recvNotifyCh: make(chan struct{}, 1),
 		sendNotifyCh: make(chan struct{}, 1),
-		establishCh:  make(chan struct{}, 1),
+		establishCh:  make(chan struct{}),
 	}
 	s.readDeadline.Store(time.Time{})
 	s.writeDeadline.Store(time.Time{})
@@ -94,6 +111,19 @@ func (s *Stream) Session() *Session {
 // StreamID returns the ID of this stream
 func (s *Stream) StreamID() uint32 {
 	return s.id
+}
+
+// ServiceMetadata returns the service metadata the opener attached to
+// this stream, or nil if the stream carries none. It is only meaningful
+// for streams obtained via Accept on a session that negotiated the
+// service metadata extension.
+func (s *Stream) ServiceMetadata() *StreamMetadata {
+	return s.meta
+}
+
+// notifyEstablished unblocks all waiters on establishCh exactly once.
+func (s *Stream) notifyEstablished() {
+	s.establishOnce.Do(func() { close(s.establishCh) })
 }
 
 // Read is used to read from the stream. It is safe to call Write, Read, and/or
@@ -264,7 +294,7 @@ func (s *Stream) sendFlags() uint16 {
 	var flags uint16
 	switch s.state {
 	case streamInit:
-		flags |= flagSYN
+		flags |= flagSYN | s.synFlags
 		s.state = streamSYNSent
 	case streamSYNReceived:
 		flags |= flagACK
@@ -437,7 +467,7 @@ func (s *Stream) processFlags(flags uint16) error {
 		if s.state == streamSYNSent {
 			s.state = streamEstablished
 		}
-		asyncNotify(s.establishCh)
+		s.notifyEstablished()
 		s.session.establishStream(s.id)
 	}
 	if flags&flagFIN == flagFIN {
@@ -470,7 +500,7 @@ func (s *Stream) processFlags(flags uint16) error {
 func (s *Stream) notifyWaiting() {
 	asyncNotify(s.recvNotifyCh)
 	asyncNotify(s.sendNotifyCh)
-	asyncNotify(s.establishCh)
+	s.notifyEstablished()
 }
 
 // incrSendWindow updates the size of our send window

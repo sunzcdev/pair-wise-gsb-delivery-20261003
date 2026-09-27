@@ -47,6 +47,25 @@ type Config struct {
 	// and send a RST to the remote side.
 	StreamCloseTimeout time.Duration
 
+	// EnableServiceMetadata opts this endpoint into the optional service
+	// metadata extension. Capabilities are negotiated with ordinary Ping
+	// frames when the session starts; no extension frames are ever sent
+	// to a peer that did not negotiate them, so enabling this is safe
+	// with older peers. Required on the opener side to use OpenService.
+	EnableServiceMetadata bool
+
+	// AdmissionHandler, when set, enables the service metadata extension
+	// and is invoked for each inbound stream that carries metadata,
+	// before the stream is queued for Accept. Returning an error rejects
+	// the stream with a RST. The handler runs per stream in its own
+	// goroutine, so it may be slow and must honor context cancellation.
+	AdmissionHandler AdmissionHandler
+
+	// MaxStreamMetadataSize bounds the encoded service metadata payload
+	// this endpoint will send or accept. Zero selects the default of
+	// 4096 bytes. Values are capped at 1 MiB.
+	MaxStreamMetadataSize uint32
+
 	// LogOutput is used to control the log destination. Either Logger or
 	// LogOutput can be set, not both.
 	LogOutput io.Writer
@@ -85,6 +104,9 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.MaxStreamMetadataSize > hardMaxStreamMetadataSize {
+		return fmt.Errorf("MaxStreamMetadataSize must not exceed %d", hardMaxStreamMetadataSize)
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

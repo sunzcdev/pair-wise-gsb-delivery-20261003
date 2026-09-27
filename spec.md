@@ -138,3 +138,65 @@ provide an error code:
 * 0x0 Normal termination
 * 0x1 Protocol error
 * 0x2 Internal error
+
+# Optional Extension: Service Metadata
+
+The service metadata extension lets the opening side attach a bounded
+set of attributes (a service name plus key/value pairs) to a new stream,
+so the receiving side can accept or reject the stream before handing it
+to the application. The extension is optional and fully negotiated:
+endpoints that do not implement it see no wire difference.
+
+## Capability negotiation
+
+Extensions must be negotiated before any extension frame is sent.
+Negotiation reuses ordinary Ping frames so that unaware peers are never
+exposed to a frame type they cannot parse:
+
+* The initiator sends a Ping with the SYN flag and the magic Length
+  value `0x59584D51` ("YXMQ").
+
+* A peer that implements the extension replies with a Ping ACK whose
+  Length is `0x59584D00 | caps`, where `caps` is a bit mask. Bit 0
+  (`0x01`) indicates support for service metadata.
+
+* An unaware peer simply echoes the opaque ping value back
+  (`0x59584D51`), which the initiator reads as "no capabilities".
+
+Sending the query itself declares support for the extension, so a
+receiver of the query can record the peer as capable immediately.
+
+An endpoint must not set the META flag or send Stream Meta frames
+unless both sides support the extension.
+
+## Opening a stream with metadata
+
+To attach metadata, the opener sets the META flag (`0x10`) on the
+initial SYN frame and immediately sends a Stream Meta frame (type 0x4)
+for the same StreamID, before any data frames. The Length field of the
+Stream Meta frame carries the payload size; receivers must bound it
+(1 MiB hard limit) and should apply a smaller configured limit.
+
+The payload is encoded in network order as:
+
+* Service name length (16 bits), followed by the service name bytes
+* Attribute count (16 bits), followed by that many attributes, each
+  encoded as key length (16 bits), key bytes, value length (16 bits),
+  value bytes
+
+## Admission
+
+Upon receiving the Stream Meta frame, the receiver runs its admission
+decision asynchronously, so a slow decision never blocks data or
+control frames of other streams:
+
+* If the stream is admitted, it is queued for the application and
+  acknowledged with an ACK as usual once accepted.
+
+* If the stream is rejected, the receiver sends a RST for the stream
+  and never surfaces it to the application. The opener observes the
+  reset as a stream rejection.
+
+Data frames pipelined by the opener before the admission decision are
+buffered within the usual receive window and discarded if the stream is
+rejected.

@@ -80,6 +80,12 @@ type Session struct {
 	shutdownCh      chan struct{}
 	shutdownLock    sync.Mutex
 	shutdownErrLock sync.Mutex
+
+	// peerExtCaps holds the extension capabilities negotiated with the
+	// peer. extDoneCh is closed once negotiation has concluded.
+	peerExtCaps uint32
+	extDoneCh   chan struct{}
+	extOnce     sync.Once
 }
 
 // sendReady is used to either mark a stream as ready
@@ -112,6 +118,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		recvDoneCh: make(chan struct{}),
 		sendDoneCh: make(chan struct{}),
 		shutdownCh: make(chan struct{}),
+		extDoneCh:  make(chan struct{}),
 	}
 	if client {
 		s.nextStreamID = 1
@@ -122,6 +129,9 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	go s.send()
 	if config.EnableKeepAlive {
 		go s.keepalive()
+	}
+	if s.serviceMetaEnabled() {
+		go s.negotiateServiceMeta()
 	}
 	return s
 }
@@ -161,6 +171,12 @@ func (s *Session) Open() (net.Conn, error) {
 
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.openStream(0)
+}
+
+// openStream is used to create a new stream, optionally carrying extra
+// flags on the initial SYN frame.
+func (s *Session) openStream(synFlags uint16) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, ErrSessionShutdown
 	}
@@ -187,6 +203,7 @@ GET_ID:
 
 	// Register the stream
 	stream := newStream(s, id, streamInit)
+	stream.synFlags = synFlags
 	s.streamLock.Lock()
 	s.streams[id] = stream
 	s.inflight[id] = struct{}{}
@@ -543,6 +560,7 @@ var (
 		typeWindowUpdate: (*Session).handleStreamMessage,
 		typePing:         (*Session).handlePing,
 		typeGoAway:       (*Session).handleGoAway,
+		typeStreamMeta:   (*Session).handleStreamMeta,
 	}
 )
 
@@ -566,7 +584,7 @@ func (s *Session) recvLoop() error {
 		}
 
 		mt := hdr.MsgType()
-		if mt < typeData || mt > typeGoAway {
+		if mt < typeData || mt > typeStreamMeta {
 			return ErrInvalidMsgType
 		}
 
@@ -582,7 +600,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	id := hdr.StreamID()
 	flags := hdr.Flags()
 	if flags&flagSYN == flagSYN {
-		if err := s.incomingStream(id); err != nil {
+		if err := s.incomingStream(id, flags); err != nil {
 			return err
 		}
 	}
@@ -636,6 +654,24 @@ func (s *Session) handlePing(hdr header) error {
 	// Check if this is a query, respond back in a separate context so we
 	// don't interfere with the receiving thread blocking for the write.
 	if flags&flagSYN == flagSYN {
+		// A capability query means the peer implements the service
+		// metadata extension. Reply with our own capability bits. An
+		// unaware peer never sends this value.
+		if pingID == extPingQuery {
+			s.completeServiceMetaNegotiation(extCapServiceMeta)
+			var caps uint32
+			if s.serviceMetaEnabled() {
+				caps |= extCapServiceMeta
+			}
+			go func() {
+				hdr := header(make([]byte, headerSize))
+				hdr.encode(typePing, flagACK, 0, extPingRespPrefix|caps)
+				if err := s.sendNoWait(hdr); err != nil {
+					s.logger.Printf("[WARN] yamux: failed to send capability reply: %v", err)
+				}
+			}()
+			return nil
+		}
 		go func() {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, flagACK, 0, pingID)
@@ -643,6 +679,17 @@ func (s *Session) handlePing(hdr header) error {
 				s.logger.Printf("[WARN] yamux: failed to send ping reply: %v", err)
 			}
 		}()
+		return nil
+	}
+
+	// A capability response concludes negotiation. An unaware peer
+	// echoes the query verbatim, which reads as "no capabilities".
+	if pingID == extPingQuery {
+		s.completeServiceMetaNegotiation(0)
+		return nil
+	}
+	if pingID&extPingRespMask == extPingRespPrefix {
+		s.completeServiceMetaNegotiation(pingID &^ extPingRespMask)
 		return nil
 	}
 
@@ -677,7 +724,7 @@ func (s *Session) handleGoAway(hdr header) error {
 }
 
 // incomingStream is used to create a new incoming stream
-func (s *Session) incomingStream(id uint32) error {
+func (s *Session) incomingStream(id uint32, flags uint16) error {
 	// Reject immediately if we are doing a go away
 	if atomic.LoadInt32(&s.localGoAway) == 1 {
 		hdr := header(make([]byte, headerSize))
@@ -685,8 +732,31 @@ func (s *Session) incomingStream(id uint32) error {
 		return s.sendNoWait(hdr)
 	}
 
+	wantMeta := flags&flagMETA == flagMETA
+	if wantMeta && !s.serviceMetaActive() {
+		s.logger.Printf("[ERR] yamux: META flag without negotiated extension")
+		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
+			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
+		}
+		return ErrUnexpectedFlag
+	}
+
 	// Allocate a new stream
 	stream := newStream(s, id, streamSYNReceived)
+	if wantMeta {
+		// Defer admission until the announced StreamMeta frame arrives.
+		// Bound the wait so a peer cannot pin the stream forever.
+		stream.awaitMeta = true
+		stream.metaTimer = time.AfterFunc(s.metaWaitTimeout(), func() {
+			stream.stateLock.Lock()
+			awaiting := stream.awaitMeta
+			stream.stateLock.Unlock()
+			if awaiting {
+				s.logger.Printf("[WARN] yamux: stream %d timed out waiting for metadata", id)
+				s.rejectStream(stream)
+			}
+		})
+	}
 
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
@@ -702,6 +772,12 @@ func (s *Session) incomingStream(id uint32) error {
 
 	// Register the stream
 	s.streams[id] = stream
+
+	if wantMeta {
+		// The stream stays pending until handleStreamMeta admits or
+		// rejects it; it is not queued for Accept yet.
+		return nil
+	}
 
 	// Check if we've exceeded the backlog
 	select {

@@ -79,6 +79,22 @@ var (
 
 	// ErrKeepAliveTimeout is sent if a missed keepalive caused the stream close
 	ErrKeepAliveTimeout = fmt.Errorf("keepalive timeout")
+
+	// ErrServiceMetaUnsupported is returned by OpenService when the peer
+	// did not negotiate the service metadata extension.
+	ErrServiceMetaUnsupported = fmt.Errorf("service metadata extension not supported by peer")
+
+	// ErrMetadataTooLarge is returned when service metadata exceeds the
+	// configured or hard size bound.
+	ErrMetadataTooLarge = fmt.Errorf("service metadata too large")
+
+	// ErrInvalidMetadata is returned when a service metadata payload
+	// cannot be decoded.
+	ErrInvalidMetadata = fmt.Errorf("invalid service metadata")
+
+	// ErrStreamRejected is returned to the opener when the remote side
+	// rejected the stream during admission control.
+	ErrStreamRejected = fmt.Errorf("stream rejected by peer")
 )
 
 const (
@@ -104,6 +120,13 @@ const (
 	// GoAway is sent to terminate a session. The StreamID
 	// should be 0 and the length is an error code.
 	typeGoAway
+
+	// StreamMeta carries bounded service metadata for a newly opened
+	// stream. It is part of the optional service metadata extension and
+	// must only be sent after capability negotiation succeeded. It is
+	// sent immediately after the SYN frame carrying flagMETA, before any
+	// data frames for the stream.
+	typeStreamMeta
 )
 
 const (
@@ -121,11 +144,44 @@ const (
 
 	// RST is used to hard close a given stream.
 	flagRST
+
+	// META is set on a SYN frame to signal that a StreamMeta frame
+	// follows for this stream. Only used after the service metadata
+	// extension has been negotiated. Peers that do not know the flag
+	// ignore it, but senders must not set it before negotiation.
+	flagMETA
 )
 
 const (
 	// initialStreamWindow is the initial stream window size
 	initialStreamWindow uint32 = 256 * 1024
+)
+
+const (
+	// extPingQuery is sent as the Length of a Ping frame to negotiate
+	// optional extensions. A peer that implements the extension replies
+	// with extPingRespPrefix|caps; an unaware peer simply echoes the
+	// value back, which is detected as "not supported".
+	extPingQuery uint32 = 0x59584D51 // "YXMQ"
+
+	// extPingRespPrefix is the high 24 bits of a capability response.
+	extPingRespPrefix uint32 = 0x59584D00 // "YXM\0"
+	extPingRespMask   uint32 = 0xFFFFFF00
+
+	// extCapServiceMeta indicates support for the service metadata
+	// extension (flagMETA + typeStreamMeta frames).
+	extCapServiceMeta uint32 = 1 << 0
+)
+
+const (
+	// defaultMaxStreamMetadataSize is the default bound on the encoded
+	// service metadata payload.
+	defaultMaxStreamMetadataSize uint32 = 4096
+
+	// hardMaxStreamMetadataSize is the absolute bound on a StreamMeta
+	// payload. Frames announcing a larger payload are a protocol error,
+	// so a receiver never allocates beyond this limit.
+	hardMaxStreamMetadataSize uint32 = 1 << 20
 )
 
 const (
