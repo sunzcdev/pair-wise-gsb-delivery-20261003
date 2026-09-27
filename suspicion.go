@@ -43,6 +43,18 @@ type suspicion struct {
 	// confirmations is a map of "from" nodes that have confirmed a given
 	// node is suspect. This prevents double counting.
 	confirmations map[string]struct{}
+
+	// domainFn optionally resolves a node name to the failure domain it
+	// belongs to (for example a rack or availability zone). It may be nil,
+	// in which case every node is treated as its own domain and the
+	// confirmation counting behaves exactly as before.
+	domainFn func(nodeName string) string
+
+	// domains tracks the failure domains that have already contributed an
+	// independent confirmation. Confirmations from additional nodes in an
+	// already-counted domain are still recorded (and re-gossiped) but do
+	// not accelerate the timer.
+	domains map[string]struct{}
 }
 
 // newSuspicion returns a timer started with the max time, and that will drive
@@ -51,11 +63,24 @@ type suspicion struct {
 // gossiped back to us. The minimum time will be used if no confirmations are
 // called for (k <= 0).
 func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn func(int)) *suspicion {
+	return newSuspicionWithDomains(from, k, min, max, nil, fn)
+}
+
+// newSuspicionWithDomains is like newSuspicion but takes an optional
+// function that maps a node name to its failure domain. When domainFn is
+// non-nil, confirmations are deduplicated by domain: only the first
+// confirmation from each distinct domain counts towards accelerating the
+// timer. Nodes whose domain is unknown (empty string) are each counted
+// individually, so the timer always makes progress even with partial
+// domain information.
+func newSuspicionWithDomains(from string, k int, min time.Duration, max time.Duration, domainFn func(string) string, fn func(int)) *suspicion {
 	s := &suspicion{
 		k:             int32(k),
 		min:           min,
 		max:           max,
 		confirmations: make(map[string]struct{}),
+		domainFn:      domainFn,
+		domains:       make(map[string]struct{}),
 	}
 
 	// Exclude the from node from any confirmations.
@@ -114,6 +139,26 @@ func (s *suspicion) Confirm(from string) bool {
 		return false
 	}
 	s.confirmations[from] = struct{}{}
+
+	// Resolve the failure domain for this peer. Because peers are
+	// deduplicated by name above, a node cannot inflate the count by
+	// reporting a different domain later; only the domain seen with its
+	// first confirmation counts. Peers with no known domain each count
+	// individually so missing domain information never stalls the timer.
+	domain := from
+	if s.domainFn != nil {
+		if d := s.domainFn(from); d != "" {
+			domain = d
+		}
+	}
+	if _, ok := s.domains[domain]; ok {
+		// This domain has already contributed an independent
+		// confirmation. The peer itself is new, so report this as new
+		// information (it will be re-gossiped), but don't accelerate
+		// the timer again for the same domain.
+		return true
+	}
+	s.domains[domain] = struct{}{}
 
 	// Compute the new timeout given the current number of confirmations and
 	// adjust the timer. If the timeout becomes negative *and* we can cleanly

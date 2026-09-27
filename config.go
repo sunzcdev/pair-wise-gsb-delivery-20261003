@@ -108,6 +108,23 @@ type Config struct {
 	// nodes failed in a reasonable amount of time.
 	SuspicionMaxTimeoutMult int
 
+	// NodeFailureDomain, if non-nil, returns the failure domain (for
+	// example a rack or availability zone) that the given node belongs to.
+	// When set, suspect confirmations are deduplicated by domain: only the
+	// first confirmation from each distinct domain counts towards
+	// accelerating suspicion timers. This prevents a group of nodes that
+	// share a failure domain (and are therefore likely to lose sight of a
+	// peer together) from being treated as independent evidence.
+	//
+	// Nodes for which this returns an empty string are each counted
+	// individually, and suspicion timers always fire at the max timeout
+	// even if not enough distinct domains confirm, so partial or missing
+	// domain information can only delay, never prevent, a decision.
+	//
+	// If nil (the default), every node is counted independently and no
+	// domain information is required from the application.
+	NodeFailureDomain func(nodeName string) string
+
 	// PushPullInterval is the interval between complete state syncs.
 	// Complete state syncs are done with a single node over TCP and are
 	// quite expensive relative to standard gossiped messages. Setting this
