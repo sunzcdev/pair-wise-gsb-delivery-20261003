@@ -210,6 +210,44 @@ then a single address is selected to test, using the following logic:
   [ preferred_ip_protocol: <string> | default = "ip6" ]
   [ ip_protocol_fallback: <boolean> | default = true ]
 
+  # Probe every resolved address of the target hostname instead of a single
+  # one. The hostname is resolved exactly once into a fixed candidate set and
+  # each candidate address is probed within the overall probe timeout, while
+  # the Host header and TLS SNI keep using the original hostname.
+  #
+  # Aggregate results are exported via probe_http_addresses{result=...}
+  # (succeeded, failed, untested) and probe_http_address_success_ratio.
+  # Per-address details are only reported in the debug logs, bounded by
+  # max_addresses.
+  #
+  # Note: with strategy "any" the remaining addresses are cancelled as soon
+  # as one address succeeds. Cancelled or not-yet-started addresses are
+  # reported as untested and are never counted as successes.
+  #
+  # multi_address cannot be combined with enable_http3, and requires local
+  # DNS resolution (it cannot skip the resolve phase when a proxy is used).
+  multi_address:
+    # Enable probing of all resolved addresses.
+    [ enabled: <boolean> | default = false ]
+
+    # How the per-address results decide the overall probe result:
+    #   all:   every candidate address must succeed.
+    #   any:   at least one candidate address must succeed.
+    #   ratio: the ratio of succeeded addresses over all candidate
+    #          addresses must be at least min_success_ratio.
+    [ strategy: <string> | default = "all" ]
+
+    # Minimum ratio of successful addresses, required with strategy "ratio".
+    # Must be in the range (0, 1].
+    [ min_success_ratio: <float> ]
+
+    # Maximum number of candidate addresses probed. If the hostname resolves
+    # to more addresses, the set is truncated. Cannot exceed 256.
+    [ max_addresses: <int> | default = 16 ]
+
+    # Maximum number of addresses probed in parallel.
+    [ max_concurrency: <int> | default = 4 ]
+
   # The body of the HTTP request used in probe.
   [ body: <string> ]
 

@@ -285,6 +285,16 @@ func (bc *byteCounter) Read(p []byte) (int, error) {
 var userAgentDefaultHeader = fmt.Sprintf("Blackbox-Exporter/%s", version.Version)
 
 func ProbeHTTP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (success bool) {
+	if module.HTTP.MultiAddress.Enabled {
+		return probeHTTPMultiAddress(ctx, target, module, registry, logger, lookupIPAddrs)
+	}
+	return probeHTTP(ctx, target, module, registry, logger, nil)
+}
+
+// probeHTTP probes a single address of the target. When pinnedIP is not nil,
+// the DNS resolution phase is skipped and the request is sent to that address
+// while the Host header and TLS ServerName keep using the target hostname.
+func probeHTTP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger, pinnedIP *net.IPAddr) (success bool) {
 	var redirects int
 	var (
 		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -393,7 +403,12 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	targetPort := targetURL.Port()
 
 	var ip *net.IPAddr
-	if shouldResolveDNSWithProxy(module.HTTP) {
+	if pinnedIP != nil {
+		// The address was resolved upfront by the multi-address probe; use
+		// it as-is so every candidate is checked exactly once.
+		ip = pinnedIP
+		logger.Debug("Using pinned address", "target", targetHost, "ip", ip.String())
+	} else if shouldResolveDNSWithProxy(module.HTTP) {
 		var lookupTime float64
 		ip, lookupTime, err = chooseProtocol(ctx, module.HTTP.IPProtocol, module.HTTP.IPProtocolFallback, targetHost, registry, logger)
 		durationGaugeVec.WithLabelValues("resolve").Add(lookupTime)

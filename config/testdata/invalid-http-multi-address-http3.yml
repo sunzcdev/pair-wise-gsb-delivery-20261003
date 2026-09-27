@@ -1,0 +1,8 @@
+modules:
+  http_multi:
+    prober: http
+    http:
+      enable_http3: true
+      enable_http2: false
+      multi_address:
+        enabled: true

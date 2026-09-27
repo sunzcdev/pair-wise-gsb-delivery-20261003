@@ -1,0 +1,7 @@
+modules:
+  http_multi:
+    prober: http
+    http:
+      multi_address:
+        enabled: true
+        strategy: bogus

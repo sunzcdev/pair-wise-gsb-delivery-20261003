@@ -89,7 +89,28 @@ var (
 	DefaultWebsocketProbe = WebsocketProbe{
 		IPProtocolFallback: true,
 	}
+
+	// DefaultMultiAddressProbe set default value for MultiAddressProbe
+	DefaultMultiAddressProbe = MultiAddressProbe{
+		Strategy:       MultiAddressStrategyAll,
+		MaxAddresses:   16,
+		MaxConcurrency: 4,
+	}
 )
+
+const (
+	// MultiAddressStrategyAll requires every candidate address to succeed.
+	MultiAddressStrategyAll = "all"
+	// MultiAddressStrategyAny requires at least one candidate address to succeed.
+	MultiAddressStrategyAny = "any"
+	// MultiAddressStrategyRatio requires a minimum ratio of successful addresses.
+	MultiAddressStrategyRatio = "ratio"
+)
+
+// MaxMultiAddressCandidates is the hard upper bound for the number of
+// candidate addresses probed in multi-address mode. It keeps the per-address
+// diagnostics bounded.
+const MaxMultiAddressCandidates = 256
 
 type Config struct {
 	Modules map[string]Module `yaml:"modules" json:"modules"`
@@ -330,6 +351,18 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	MultiAddress                 MultiAddressProbe       `yaml:"multi_address,omitempty" json:"multi_address,omitzero"`
+}
+
+// MultiAddressProbe configures probing of every resolved address of the
+// target hostname instead of a single one. The candidate set is resolved
+// once and each address is probed within the overall probe timeout.
+type MultiAddressProbe struct {
+	Enabled          bool    `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Strategy         string  `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	MinSuccessRatio  float64 `yaml:"min_success_ratio,omitempty" json:"min_success_ratio,omitempty"`
+	MaxAddresses     int     `yaml:"max_addresses,omitempty" json:"max_addresses,omitempty"`
+	MaxConcurrency   int     `yaml:"max_concurrency,omitempty" json:"max_concurrency,omitempty"`
 }
 
 type GRPCProbe struct {
@@ -502,6 +535,54 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 		if s.HTTPClientConfig.EnableHTTP2 {
 			return errors.New("when enable_http3 is true, enable_http2 must be set to false")
 		}
+	}
+
+	if s.MultiAddress.Enabled {
+		if err := s.MultiAddress.validate(); err != nil {
+			return err
+		}
+		if s.UseHTTP3 {
+			return errors.New("multi_address cannot be used together with enable_http3")
+		}
+	}
+
+	return nil
+}
+
+// validate checks the multi-address configuration and applies defaults.
+func (m *MultiAddressProbe) validate() error {
+	if m.Strategy == "" {
+		m.Strategy = DefaultMultiAddressProbe.Strategy
+	}
+	switch m.Strategy {
+	case MultiAddressStrategyAll, MultiAddressStrategyAny:
+		if m.MinSuccessRatio != 0 {
+			return fmt.Errorf("min_success_ratio is only valid with strategy %q", MultiAddressStrategyRatio)
+		}
+	case MultiAddressStrategyRatio:
+		if m.MinSuccessRatio <= 0 || m.MinSuccessRatio > 1 {
+			return errors.New("min_success_ratio must be in the range (0, 1]")
+		}
+	default:
+		return fmt.Errorf("multi_address strategy %q is not valid, must be one of %q, %q, %q",
+			m.Strategy, MultiAddressStrategyAll, MultiAddressStrategyAny, MultiAddressStrategyRatio)
+	}
+
+	if m.MaxAddresses < 0 {
+		return errors.New("max_addresses cannot be negative")
+	}
+	if m.MaxAddresses == 0 {
+		m.MaxAddresses = DefaultMultiAddressProbe.MaxAddresses
+	}
+	if m.MaxAddresses > MaxMultiAddressCandidates {
+		return fmt.Errorf("max_addresses cannot exceed %d", MaxMultiAddressCandidates)
+	}
+
+	if m.MaxConcurrency < 0 {
+		return errors.New("max_concurrency cannot be negative")
+	}
+	if m.MaxConcurrency == 0 {
+		m.MaxConcurrency = DefaultMultiAddressProbe.MaxConcurrency
 	}
 
 	return nil
