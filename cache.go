@@ -69,6 +69,9 @@ type Cache[K Key, V any] struct {
 	// ignoreInternalCost dictates whether to ignore the cost of internally storing
 	// the item in the cost calculation.
 	ignoreInternalCost bool
+	// borrows tracks outstanding Borrow/Release references and the cost of
+	// values that are logically evicted but still pinned by borrowers.
+	borrows *borrowTracker
 	// cleanupTicker is used to periodically check for entries whose TTL has passed.
 	cleanupTicker *time.Ticker
 	// Metrics contains a running log of important statistics like hits, misses,
@@ -199,6 +202,10 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	// entry, when non-nil, tracks outstanding borrows of Value so that its
+	// release (OnEvict/OnExit) can be deferred until the last borrower
+	// releases it.
+	entry *refEntry[V]
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -219,13 +226,17 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	case config.TtlTickerDurationInSec == 0:
 		config.TtlTickerDurationInSec = bucketDurationSecs
 	}
+	borrows := newBorrowTracker()
 	policy := newPolicy[V](config.NumCounters, config.MaxCost)
+	// Cost pinned by outstanding borrows counts against the cache budget.
+	policy.evict.reserved = &borrows.pinnedCost
 	cache := &Cache[K, V]{
 		storedItems:        newStore[V](),
 		cachePolicy:        policy,
 		getBuf:             newRingBuffer(policy, config.BufferItems),
 		setBuf:             make(chan *Item[V], setBufSize),
 		keyToHash:          config.KeyToHash,
+		borrows:            borrows,
 		stop:               make(chan struct{}),
 		done:               make(chan struct{}),
 		cost:               config.Cost,
@@ -347,8 +358,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
-	if prev, ok := c.storedItems.Update(i); ok {
-		c.onExit(prev)
+	if prev, entry, ok := c.storedItems.Update(i); ok {
+		c.evictItem(&Item[V]{Key: keyHash, Conflict: conflictHash, Value: prev, entry: entry}, c.exitValue)
 		i.flag = itemUpdate
 	}
 	// Attempt to send item to cachePolicy.
@@ -374,8 +385,8 @@ func (c *Cache[K, V]) Del(key K) {
 	}
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
-	_, prev := c.storedItems.Del(keyHash, conflictHash)
-	c.onExit(prev)
+	_, prev, entry := c.storedItems.Del(keyHash, conflictHash)
+	c.evictItem(&Item[V]{Key: keyHash, Conflict: conflictHash, Value: prev, entry: entry}, c.exitValue)
 	// If we've set an item, it would be applied slightly later.
 	// So we must push the same item to `setBuf` with the deletion flag.
 	// This ensures that if a set is followed by a delete, it will be
@@ -465,7 +476,7 @@ loop:
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
-				c.onEvict(i)
+				c.evictItem(i, c.onEvict)
 			}
 		default:
 			break loop
@@ -474,7 +485,9 @@ loop:
 
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
-	c.storedItems.Clear(c.onEvict)
+	c.storedItems.Clear(func(i *Item[V]) {
+		c.evictItem(i, c.onEvict)
+	})
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -556,15 +569,17 @@ func (c *Cache[K, V]) processItems() {
 			case itemNew:
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
-					c.storedItems.Set(i)
+					if prev, entry, replaced := c.storedItems.Set(i); replaced {
+						c.evictItem(&Item[V]{Key: i.Key, Conflict: i.Conflict, Value: prev, entry: entry}, c.exitValue)
+					}
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
 				} else {
 					c.onReject(i)
 				}
 				for _, victim := range victims {
-					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
-					onEvict(victim)
+					victim.Conflict, victim.Value, victim.entry = c.storedItems.Del(victim.Key, 0)
+					c.evictItem(victim, onEvict)
 				}
 
 			case itemUpdate:
@@ -572,11 +587,13 @@ func (c *Cache[K, V]) processItems() {
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
-				_, val := c.storedItems.Del(i.Key, i.Conflict)
-				c.onExit(val)
+				_, val, entry := c.storedItems.Del(i.Key, i.Conflict)
+				c.evictItem(&Item[V]{Key: i.Key, Value: val, entry: entry}, c.exitValue)
 			}
 		case <-c.cleanupTicker.C:
-			c.storedItems.Cleanup(c.cachePolicy, onEvict)
+			c.storedItems.Cleanup(c.cachePolicy, func(i *Item[V]) {
+				c.evictItem(i, onEvict)
+			})
 		case <-c.stop:
 			c.done <- struct{}{}
 			return
@@ -611,6 +628,9 @@ const (
 	// floor.
 	dropGets
 	keepGets
+	// This keeps track of borrows rejected because the borrowed cost budget
+	// was exhausted.
+	rejectBorrows
 	// This should be the final enum. Other enums should be set before this.
 	doNotUse
 )
@@ -639,6 +659,8 @@ func stringFor(t metricType) string {
 		return "gets-dropped"
 	case keepGets:
 		return "gets-kept"
+	case rejectBorrows:
+		return "borrows-rejected"
 	default:
 		return "unidentified"
 	}
@@ -744,6 +766,13 @@ func (p *Metrics) GetsDropped() uint64 {
 // GetsKept is the number of Get counter increments that are kept.
 func (p *Metrics) GetsKept() uint64 {
 	return p.get(keepGets)
+}
+
+// BorrowsRejected is the number of Borrow calls that were rejected because
+// the borrowed cost budget (MaxCost) was already exhausted by outstanding
+// borrows.
+func (p *Metrics) BorrowsRejected() uint64 {
+	return p.get(rejectBorrows)
 }
 
 // Ratio is the number of Hits over all accesses (Hits + Misses). This is the

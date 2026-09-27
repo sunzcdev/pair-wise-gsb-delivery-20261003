@@ -217,11 +217,11 @@ func TestShouldUpdate(t *testing.T) {
 	}
 	s.Set(&i)
 	i.Value = 1
-	_, ok := s.Update(&i)
+	_, _, ok := s.Update(&i)
 	require.False(t, ok)
 
 	i.Value = 3
-	_, ok = s.Update(&i)
+	_, _, ok = s.Update(&i)
 	require.True(t, ok)
 }
 
@@ -235,7 +235,7 @@ func TestStoreUpdate(t *testing.T) {
 	}
 	s.Set(&i)
 	i.Value = 2
-	_, ok := s.Update(&i)
+	_, _, ok := s.Update(&i)
 	require.True(t, ok)
 
 	val, ok := s.Get(key, conflict)
@@ -247,7 +247,7 @@ func TestStoreUpdate(t *testing.T) {
 	require.Equal(t, 2, val)
 
 	i.Value = 3
-	_, ok = s.Update(&i)
+	_, _, ok = s.Update(&i)
 	require.True(t, ok)
 
 	val, ok = s.Get(key, conflict)
@@ -260,7 +260,7 @@ func TestStoreUpdate(t *testing.T) {
 		Conflict: conflict,
 		Value:    2,
 	}
-	_, ok = s.Update(&i)
+	_, _, ok = s.Update(&i)
 	require.False(t, ok)
 	val, ok = s.Get(key, conflict)
 	require.False(t, ok)
@@ -290,7 +290,7 @@ func TestStoreCollision(t *testing.T) {
 	require.True(t, ok)
 	require.NotEqual(t, 2, val)
 
-	_, ok = s.Update(&i)
+	_, _, ok = s.Update(&i)
 	require.False(t, ok)
 	val, ok = s.Get(1, 0)
 	require.True(t, ok)

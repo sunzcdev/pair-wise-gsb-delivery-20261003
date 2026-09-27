@@ -7,6 +7,16 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in `Cache.Borrow`/`Borrowed.Release` lifecycle for cached values. Values obtained
+  via `Borrow` are not released (via `OnEvict`/`OnExit`) when they are replaced, deleted,
+  expired or the cache is closed; the release is deferred until the last borrower calls
+  `Release`. Outstanding borrows and pinned (logically evicted but still borrowed) values
+  account their cost against `MaxCost` and are observable via `Cache.BorrowedCost`,
+  `Cache.BorrowedItems`, `Cache.PinnedCost`, `Cache.PinnedItems` and
+  `Metrics.BorrowsRejected`. Plain `Get` does not get this guarantee.
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed

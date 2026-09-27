@@ -97,7 +97,7 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	defer p.Unlock()
 
 	// Cannot add an item bigger than entire cache.
-	if cost > p.evict.getMaxCost() {
+	if cost > p.evict.getMaxCost()-p.evict.reservedCost() {
 		return nil, false
 	}
 
@@ -183,7 +183,7 @@ func (p *defaultPolicy[V]) Del(key uint64) {
 
 func (p *defaultPolicy[V]) Cap() int64 {
 	p.Lock()
-	capacity := p.evict.getMaxCost() - p.evict.used
+	capacity := p.evict.getMaxCost() - p.evict.used - p.evict.reservedCost()
 	p.Unlock()
 	return capacity
 }
@@ -251,6 +251,10 @@ type sampledLFU struct {
 	used     int64
 	metrics  *Metrics
 	keyCosts map[uint64]int64
+	// reserved, when set, tracks cost that is logically evicted but still
+	// pinned by outstanding borrows. It counts against the max cost budget
+	// until the last borrower releases the value.
+	reserved *atomic.Int64
 }
 
 func newSampledLFU(maxCost int64) *sampledLFU {
@@ -269,7 +273,14 @@ func (p *sampledLFU) updateMaxCost(maxCost int64) {
 }
 
 func (p *sampledLFU) roomLeft(cost int64) int64 {
-	return p.getMaxCost() - (p.used + cost)
+	return p.getMaxCost() - p.reservedCost() - (p.used + cost)
+}
+
+func (p *sampledLFU) reservedCost() int64 {
+	if p.reserved == nil {
+		return 0
+	}
+	return p.reserved.Load()
 }
 
 func (p *sampledLFU) fillSample(in []*policyPair) []*policyPair {

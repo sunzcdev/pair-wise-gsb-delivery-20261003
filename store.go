@@ -17,7 +17,9 @@ type storeItem[V any] struct {
 	key        uint64
 	conflict   uint64
 	value      V
+	cost       int64
 	expiration time.Time
+	entry      *refEntry[V]
 }
 
 // store is the interface fulfilled by all hash map implementations in this
@@ -33,13 +35,21 @@ type store[V any] interface {
 	Expiration(uint64) time.Time
 	// Set adds the key-value pair to the Map or updates the value if it's
 	// already present. The key-value pair is passed as a pointer to an
-	// item object.
-	Set(*Item[V])
+	// item object. It returns the value and borrow entry being replaced, if
+	// any, so the caller can account for the old value going out of scope.
+	Set(*Item[V]) (V, *refEntry[V], bool)
 	// Del deletes the key-value pair from the Map.
-	Del(uint64, uint64) (uint64, V)
+	Del(uint64, uint64) (uint64, V, *refEntry[V])
 	// Update attempts to update the key with a new value and returns true if
-	// successful.
-	Update(*Item[V]) (V, bool)
+	// successful. It also returns the borrow entry of the replaced value, if
+	// any.
+	Update(*Item[V]) (V, *refEntry[V], bool)
+	// peek returns the storeItem associated with the key without mutating
+	// any borrow state.
+	peek(uint64, uint64) (storeItem[V], bool)
+	// borrow returns the storeItem associated with the key and registers a
+	// new borrow on its borrow entry, creating the entry if needed.
+	borrow(uint64, uint64) (storeItem[V], bool)
 	// Cleanup removes items that have an expired TTL.
 	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
 	// Clear clears all contents of the store.
@@ -114,21 +124,29 @@ func (sm *shardedMap[V]) Expiration(key uint64) time.Time {
 	return sm.shards[key%numShards].Expiration(key)
 }
 
-func (sm *shardedMap[V]) Set(i *Item[V]) {
+func (sm *shardedMap[V]) Set(i *Item[V]) (V, *refEntry[V], bool) {
 	if i == nil {
 		// If item is nil make this Set a no-op.
-		return
+		return zeroValue[V](), nil, false
 	}
 
-	sm.shards[i.Key%numShards].Set(i)
+	return sm.shards[i.Key%numShards].Set(i)
 }
 
-func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
+func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V, *refEntry[V]) {
 	return sm.shards[key%numShards].Del(key, conflict)
 }
 
-func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
+func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, *refEntry[V], bool) {
 	return sm.shards[newItem.Key%numShards].Update(newItem)
+}
+
+func (sm *shardedMap[V]) peek(key, conflict uint64) (storeItem[V], bool) {
+	return sm.shards[key%numShards].peek(key, conflict)
+}
+
+func (sm *shardedMap[V]) borrow(key, conflict uint64) (storeItem[V], bool) {
+	return sm.shards[key%numShards].borrow(key, conflict)
 }
 
 func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
@@ -187,10 +205,10 @@ func (m *lockedMap[V]) Expiration(key uint64) time.Time {
 	return m.data[key].expiration
 }
 
-func (m *lockedMap[V]) Set(i *Item[V]) {
+func (m *lockedMap[V]) Set(i *Item[V]) (V, *refEntry[V], bool) {
 	if i == nil {
 		// If the item is nil make this Set a no-op.
-		return
+		return zeroValue[V](), nil, false
 	}
 
 	m.Lock()
@@ -201,10 +219,10 @@ func (m *lockedMap[V]) Set(i *Item[V]) {
 		// The item existed already. We need to check the conflict key and reject the
 		// update if they do not match. Only after that the expiration map is updated.
 		if i.Conflict != 0 && (i.Conflict != item.conflict) {
-			return
+			return zeroValue[V](), nil, false
 		}
 		if m.shouldUpdate != nil && !m.shouldUpdate(i.Value, item.value) {
-			return
+			return zeroValue[V](), nil, false
 		}
 		m.em.update(i.Key, i.Conflict, item.expiration, i.Expiration)
 	} else {
@@ -217,19 +235,26 @@ func (m *lockedMap[V]) Set(i *Item[V]) {
 		key:        i.Key,
 		conflict:   i.Conflict,
 		value:      i.Value,
+		cost:       i.Cost,
 		expiration: i.Expiration,
 	}
+	if ok {
+		// Return the replaced value and its borrow entry so the caller can
+		// account for the old value going out of scope.
+		return item.value, item.entry, true
+	}
+	return zeroValue[V](), nil, false
 }
 
-func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
+func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V, *refEntry[V]) {
 	m.Lock()
 	defer m.Unlock()
 	item, ok := m.data[key]
 	if !ok {
-		return 0, zeroValue[V]()
+		return 0, zeroValue[V](), nil
 	}
 	if conflict != 0 && (conflict != item.conflict) {
-		return 0, zeroValue[V]()
+		return 0, zeroValue[V](), nil
 	}
 
 	if !item.expiration.IsZero() {
@@ -237,21 +262,21 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
 	}
 
 	delete(m.data, key)
-	return item.conflict, item.value
+	return item.conflict, item.value, item.entry
 }
 
-func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
+func (m *lockedMap[V]) Update(newItem *Item[V]) (V, *refEntry[V], bool) {
 	m.Lock()
 	defer m.Unlock()
 	item, ok := m.data[newItem.Key]
 	if !ok {
-		return zeroValue[V](), false
+		return zeroValue[V](), nil, false
 	}
 	if newItem.Conflict != 0 && (newItem.Conflict != item.conflict) {
-		return zeroValue[V](), false
+		return zeroValue[V](), nil, false
 	}
 	if m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, item.value) {
-		return item.value, false
+		return item.value, nil, false
 	}
 
 	m.em.update(newItem.Key, newItem.Conflict, item.expiration, newItem.Expiration)
@@ -259,22 +284,74 @@ func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
 		key:        newItem.Key,
 		conflict:   newItem.Conflict,
 		value:      newItem.Value,
+		cost:       newItem.Cost,
 		expiration: newItem.Expiration,
 	}
 
-	return item.value, true
+	return item.value, item.entry, true
+}
+
+func (m *lockedMap[V]) peek(key, conflict uint64) (storeItem[V], bool) {
+	m.RLock()
+	item, ok := m.data[key]
+	m.RUnlock()
+	if !ok {
+		return storeItem[V]{}, false
+	}
+	if conflict != 0 && (conflict != item.conflict) {
+		return storeItem[V]{}, false
+	}
+
+	// Handle expired items.
+	if !item.expiration.IsZero() && time.Now().After(item.expiration) {
+		return storeItem[V]{}, false
+	}
+	return item, true
+}
+
+func (m *lockedMap[V]) borrow(key, conflict uint64) (storeItem[V], bool) {
+	m.Lock()
+	defer m.Unlock()
+	item, ok := m.data[key]
+	if !ok {
+		return storeItem[V]{}, false
+	}
+	if conflict != 0 && (conflict != item.conflict) {
+		return storeItem[V]{}, false
+	}
+
+	// Handle expired items.
+	if !item.expiration.IsZero() && time.Now().After(item.expiration) {
+		return storeItem[V]{}, false
+	}
+
+	if item.entry == nil {
+		// Lazily create the borrow entry. The cache itself holds one
+		// reference which is dropped when the value leaves the store.
+		entry := &refEntry[V]{cost: item.cost}
+		entry.refs.Store(1)
+		item.entry = entry
+		m.data[key] = item
+	}
+	item.entry.refs.Add(1)
+	return item, true
 }
 
 func (m *lockedMap[V]) Clear(onEvict func(item *Item[V])) {
 	m.Lock()
 	defer m.Unlock()
-	i := &Item[V]{}
 	if onEvict != nil {
 		for _, si := range m.data {
-			i.Key = si.key
-			i.Conflict = si.conflict
-			i.Value = si.value
-			onEvict(i)
+			// Allocate a new Item per entry because the eviction may be
+			// deferred (borrowed values) and the Item is retained until the
+			// last borrower releases it.
+			onEvict(&Item[V]{
+				Key:      si.key,
+				Conflict: si.conflict,
+				Value:    si.value,
+				Cost:     si.cost,
+				entry:    si.entry,
+			})
 		}
 	}
 	m.data = make(map[uint64]storeItem[V])
