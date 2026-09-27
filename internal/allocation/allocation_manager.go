@@ -84,8 +84,10 @@ type Manager struct {
 	log                      logging.LeveledLogger
 	tcpConnectionBindTimeout time.Duration
 
-	allocations  map[FiveTupleFingerprint]*Allocation
-	reservations []*reservation
+	allocations        map[FiveTupleFingerprint]*Allocation
+	reservations       []*reservation
+	revokedLock        sync.RWMutex
+	revokedPermissions map[string]map[string]struct{} // userID -> set of peer IPs
 
 	allocatePacketConn func(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error)
 	allocateListener   func(conf AllocateListenerConfig) (net.Listener, net.Addr, error)
@@ -115,6 +117,7 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 	return &Manager{
 		log:                      config.LeveledLogger,
 		allocations:              make(map[FiveTupleFingerprint]*Allocation, 64),
+		revokedPermissions:       make(map[string]map[string]struct{}),
 		allocatePacketConn:       config.AllocatePacketConn,
 		allocateListener:         config.AllocateListener,
 		allocateConn:             config.AllocateConn,
@@ -240,6 +243,13 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	m.allocations[fiveTuple.Fingerprint()] = alloc
 	m.lock.Unlock()
 
+	// Apply administrative revocations that predate this allocation.
+	m.revokedLock.RLock()
+	for fingerprint := range m.revokedPermissions[userID] {
+		alloc.revokeFingerprint(fingerprint)
+	}
+	m.revokedLock.RUnlock()
+
 	if m.EventHandler.OnAllocationCreated != nil {
 		m.EventHandler.OnAllocationCreated(fiveTuple.SrcAddr, fiveTuple.DstAddr,
 			fiveTuple.Protocol.String(), userID, realm, alloc.RelayAddr, requestedPort)
@@ -355,6 +365,82 @@ func (m *Manager) GrantPermission(sourceAddr net.Addr, peerIP net.IP) error {
 	}
 
 	return errAdminProhibited
+}
+
+// RevokePermission administratively revokes userID's permission to communicate with
+// peerIP, without waiting for the permission to expire. Existing permissions and
+// channel bindings to the peer are removed from all of the user's allocations, and
+// future attempts to (re-)create them are rejected until RestorePermission is called.
+//
+// Revocation is keyed on the authenticated user identity (as returned by the
+// AuthHandler), not on the client transport address. Returns the number of
+// allocations affected.
+func (m *Manager) RevokePermission(userID string, peerIP net.IP) int {
+	m.revokedLock.Lock()
+	peers, ok := m.revokedPermissions[userID]
+	if !ok {
+		peers = make(map[string]struct{})
+		m.revokedPermissions[userID] = peers
+	}
+	peers[peerIP.String()] = struct{}{}
+	m.revokedLock.Unlock()
+
+	peerAddr := &net.UDPAddr{IP: peerIP}
+	affected := 0
+
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	for _, a := range m.allocations {
+		if a.userID == userID {
+			a.RevokePermission(peerAddr)
+			affected++
+		}
+	}
+
+	return affected
+}
+
+// RestorePermission lifts a revocation previously installed by RevokePermission,
+// allowing the user to explicitly re-authorize the peer (e.g. via a new
+// CreatePermission or ChannelBind request). Returns whether a revocation was lifted.
+func (m *Manager) RestorePermission(userID string, peerIP net.IP) bool {
+	m.revokedLock.Lock()
+	peers, ok := m.revokedPermissions[userID]
+	_, existed := peers[peerIP.String()]
+	if existed {
+		delete(peers, peerIP.String())
+		if len(peers) == 0 {
+			delete(m.revokedPermissions, userID)
+		}
+	}
+	m.revokedLock.Unlock()
+
+	peerAddr := &net.UDPAddr{IP: peerIP}
+
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+	for _, a := range m.allocations {
+		if a.userID == userID {
+			a.RestorePermission(peerAddr)
+		}
+	}
+
+	return ok && existed
+}
+
+// IsPermissionRevoked reports whether userID's permission to communicate with
+// peerIP has been administratively revoked.
+func (m *Manager) IsPermissionRevoked(userID string, peerIP net.IP) bool {
+	m.revokedLock.RLock()
+	defer m.revokedLock.RUnlock()
+
+	peers, ok := m.revokedPermissions[userID]
+	if !ok {
+		return false
+	}
+	_, revoked := peers[peerIP.String()]
+
+	return revoked
 }
 
 // CreateTCPConnection creates a new outbound TCP Connection and returns the Connection-ID

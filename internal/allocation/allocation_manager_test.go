@@ -215,6 +215,56 @@ func randomFiveTuple() *FiveTuple {
 	}
 }
 
+// Test that permission revocation is keyed on the authenticated user identity,
+// applies to existing and future allocations, and requires an explicit restore.
+func TestManagerRevokePermission(t *testing.T) {
+	turnSocket, err := net.ListenPacket("udp4", "0.0.0.0:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	manager, err := newTestManager()
+	assert.NoError(t, err)
+
+	userA, userB := "user-a", "user-b"
+	peerIP := net.ParseIP("127.0.0.1")
+	peerAddr := &net.UDPAddr{IP: peerIP, Port: 5000}
+
+	allocA, err := manager.CreateAllocation(randomFiveTuple(), turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, userA, "", proto.RequestedFamilyIPv4)
+	assert.NoError(t, err)
+	allocB, err := manager.CreateAllocation(randomFiveTuple(), turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, userB, "", proto.RequestedFamilyIPv4)
+	assert.NoError(t, err)
+
+	allocA.AddPermission(NewPermission(peerAddr, manager.log, DefaultPermissionTimeout))
+	allocB.AddPermission(NewPermission(peerAddr, manager.log, DefaultPermissionTimeout))
+
+	// Revoking userA must not touch userB's allocation.
+	assert.Equal(t, 1, manager.RevokePermission(userA, peerIP))
+	assert.True(t, manager.IsPermissionRevoked(userA, peerIP))
+	assert.False(t, manager.IsPermissionRevoked(userB, peerIP))
+	assert.Nil(t, allocA.GetPermission(peerAddr))
+	assert.NotNil(t, allocB.GetPermission(peerAddr))
+
+	// The revocation also applies to allocations created after it.
+	allocA2, err := manager.CreateAllocation(randomFiveTuple(), turnSocket, proto.ProtoUDP,
+		0, proto.DefaultLifetime, userA, "", proto.RequestedFamilyIPv4)
+	assert.NoError(t, err)
+	allocA2.AddPermission(NewPermission(peerAddr, manager.log, DefaultPermissionTimeout))
+	assert.Nil(t, allocA2.GetPermission(peerAddr), "Revocation must apply to new allocations")
+
+	// Re-authorization requires an explicit restore.
+	assert.True(t, manager.RestorePermission(userA, peerIP))
+	assert.False(t, manager.IsPermissionRevoked(userA, peerIP))
+	assert.False(t, manager.RestorePermission(userA, peerIP), "No revocation left to restore")
+
+	perm := NewPermission(peerAddr, manager.log, DefaultPermissionTimeout)
+	allocA.AddPermission(perm)
+	assert.Equal(t, perm, allocA.GetPermission(peerAddr))
+
+	assert.NoError(t, manager.Close())
+	assert.NoError(t, turnSocket.Close())
+}
+
 func newTestManager() (*Manager, error) {
 	loggerFactory := logging.NewDefaultLoggerFactory()
 

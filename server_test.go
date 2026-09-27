@@ -714,6 +714,177 @@ func TestServer(t *testing.T) { //nolint:maintidx
 	})
 }
 
+// TestServerRevokePermission verifies that an administrator can revoke a user's
+// permission to a peer at runtime: established bidirectional traffic (ChannelData
+// and the reverse relay path) is cut immediately, concurrent refreshes cannot
+// resurrect the revoked permission, and re-authorization requires an explicit
+// restore. Revocation is keyed on the authenticated user identity, not the
+// client transport address.
+func TestServerRevokePermission(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	// The authenticated user identity differs from the username on purpose:
+	// revocation must be keyed on the identity returned by the AuthHandler.
+	userID := "authenticated-user"
+	credMap := map[string][]byte{
+		testUser: GenerateAuthKey(testUser, "pion.ly", "pass"),
+	}
+
+	udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (string, []byte, bool) {
+			if pw, ok := credMap[ra.Username]; ok {
+				return userID, pw, true
+			}
+
+			return "", nil, false
+		},
+		PacketConnConfigs: []PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("127.0.0.1"),
+					Address:      "127.0.0.1",
+				},
+			},
+		},
+		Realm:         "pion.ly",
+		LoggerFactory: loggerFactory,
+	})
+	assert.NoError(t, err)
+
+	// Echo peer: returns everything it receives.
+	peerConn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	assert.NoError(t, err)
+	go func() {
+		buf := make([]byte, 1600)
+		for {
+			n, addr, rerr := peerConn.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			_, _ = peerConn.WriteTo(buf[:n], addr)
+		}
+	}()
+	peerAddr, ok := peerConn.LocalAddr().(*net.UDPAddr)
+	assert.True(t, ok)
+
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	assert.NoError(t, err)
+
+	client, err := NewClient(&ClientConfig{
+		STUNServerAddr: testAddr,
+		TURNServerAddr: testAddr,
+		Conn:           conn,
+		Username:       testUser,
+		Password:       "pass",
+		Realm:          "pion.ly",
+		LoggerFactory:  loggerFactory,
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, client.Listen())
+
+	relayConn, err := client.Allocate()
+	assert.NoError(t, err)
+
+	buf := make([]byte, 1600)
+	echoRoundTrip := func(payload string) error {
+		if _, werr := relayConn.WriteTo([]byte(payload), peerAddr); werr != nil {
+			return werr
+		}
+		if derr := relayConn.SetReadDeadline(time.Now().Add(5 * timeout)); derr != nil {
+			return derr
+		}
+		_, _, rerr := relayConn.ReadFrom(buf)
+
+		return rerr
+	}
+
+	// Establish normal bidirectional traffic (Send indication first).
+	assert.NoError(t, echoRoundTrip("hello"))
+
+	// Wait until the client's write triggered a channel bind on the server.
+	fiveTuple := &allocation.FiveTuple{
+		Protocol: allocation.UDP,
+		SrcAddr:  conn.LocalAddr(),
+		DstAddr:  udpListener.LocalAddr(),
+	}
+	assert.Eventually(t, func() bool {
+		a := server.allocationManagers[0].GetAllocation(fiveTuple)
+
+		return a != nil && len(a.ListChannelBindings()) == 1
+	}, 5*time.Second, interval)
+
+	// Traffic now flows over the bound channel in both directions.
+	assert.NoError(t, echoRoundTrip("over-channel"))
+
+	// Revoking a different user identity must not affect this allocation.
+	assert.Equal(t, 0, server.RevokePermission("someone-else", peerAddr.IP))
+	assert.NoError(t, echoRoundTrip("still-flowing"))
+
+	// Revoke the authenticated user's permission to the peer.
+	assert.Equal(t, 1, server.RevokePermission(userID, peerAddr.IP))
+
+	alloc := server.allocationManagers[0].GetAllocation(fiveTuple)
+	assert.NotNil(t, alloc)
+	assert.Nil(t, alloc.GetPermission(peerAddr), "permission must be gone after revocation")
+	assert.Empty(t, alloc.ListChannelBindings(), "channel binding must be torn down after revocation")
+
+	// The client keeps sending ChannelData on its (locally still valid) binding;
+	// the server drops it and the peer observes the cut.
+	for range 3 {
+		_, err = relayConn.WriteTo([]byte("after-revoke"), peerAddr)
+		assert.NoError(t, err)
+	}
+	assert.NoError(t, peerConn.SetReadDeadline(time.Now().Add(2*timeout)))
+	_, _, err = peerConn.ReadFrom(buf)
+	assert.Error(t, err, "peer must not receive ChannelData after revocation")
+
+	// The reverse relay path is cut as well: peer traffic never reaches the client.
+	_, err = peerConn.WriteTo([]byte("inbound"), relayConn.LocalAddr())
+	assert.NoError(t, err)
+	assert.NoError(t, relayConn.SetReadDeadline(time.Now().Add(2*timeout)))
+	_, _, err = relayConn.ReadFrom(buf)
+	assert.Error(t, err, "client must not receive relayed peer data after revocation")
+
+	// A refresh racing the revocation must not resurrect the permission:
+	// the client's CreatePermission is rejected with 403 (Forbidden).
+	err = client.CreatePermission(peerAddr)
+	assert.Error(t, err)
+	var turnErr *stun.TurnError
+	assert.ErrorAs(t, err, &turnErr)
+	assert.Equal(t, stun.CodeForbidden, turnErr.ErrorCodeAttr.Code)
+	assert.Nil(t, alloc.GetPermission(peerAddr), "rejected refresh must not resurrect the permission")
+	assert.Empty(t, alloc.ListChannelBindings())
+
+	// Re-authorization requires an explicit restore plus a new client permission.
+	assert.True(t, server.RestorePermission(userID, peerAddr.IP))
+	assert.NoError(t, client.CreatePermission(peerAddr))
+	assert.NotNil(t, alloc.GetPermission(peerAddr), "permission must be re-creatable after explicit restore")
+
+	// The reverse relay path works again once re-authorized.
+	_, err = peerConn.WriteTo([]byte("welcome-back"), relayConn.LocalAddr())
+	assert.NoError(t, err)
+	assert.NoError(t, relayConn.SetReadDeadline(time.Now().Add(5*timeout)))
+	n, _, err := relayConn.ReadFrom(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, "welcome-back", string(buf[:n]))
+
+	assert.NoError(t, relayConn.Close())
+	client.Close()
+	assert.NoError(t, conn.Close())
+	assert.NoError(t, peerConn.Close())
+	assert.NoError(t, server.Close())
+}
+
 func TestServerHandleComprehensionRequiredAttribute(t *testing.T) {
 	lim := test.TimeOut(time.Second * 30)
 	defer lim.Stop()

@@ -117,6 +117,46 @@ func TestRemovePermission(t *testing.T) {
 	assert.Nil(t, foundPermission, "Got permission should be nil after removed.")
 }
 
+func TestRevokePermission(t *testing.T) {
+	log := logging.NewDefaultLoggerFactory().NewLogger("test")
+	alloc := NewAllocation(nil, nil, EventHandler{}, log)
+
+	peerAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:5000")
+	assert.NoError(t, err)
+
+	// Establish a permission and a channel binding for the peer.
+	perm := NewPermission(peerAddr, log, DefaultPermissionTimeout)
+	alloc.AddPermission(perm)
+	assert.Equal(t, perm, alloc.GetPermission(peerAddr))
+
+	assert.NoError(t, alloc.AddChannelBind(
+		NewChannelBind(0x4000, peerAddr, log), proto.DefaultLifetime, DefaultPermissionTimeout))
+	assert.NotNil(t, alloc.GetChannelByAddr(peerAddr))
+
+	// Revocation removes both immediately.
+	alloc.RevokePermission(peerAddr)
+	assert.Nil(t, alloc.GetPermission(peerAddr), "Revoked permission must be removed")
+	assert.Nil(t, alloc.GetChannelByAddr(peerAddr), "Channel binding to revoked peer must be removed")
+	assert.True(t, alloc.IsPermissionRevoked(peerAddr))
+
+	// A refresh racing the revocation must not resurrect the permission.
+	alloc.AddPermission(NewPermission(peerAddr, log, DefaultPermissionTimeout))
+	assert.Nil(t, alloc.GetPermission(peerAddr), "Refresh must not resurrect a revoked permission")
+
+	// A ChannelBind must not implicitly re-create a revoked permission.
+	err = alloc.AddChannelBind(NewChannelBind(0x4001, peerAddr, log), proto.DefaultLifetime, DefaultPermissionTimeout)
+	assert.ErrorIs(t, err, ErrPermissionRevoked)
+	assert.Nil(t, alloc.GetChannelByAddr(peerAddr))
+
+	// Re-authorization requires an explicit restore.
+	alloc.RestorePermission(peerAddr)
+	assert.False(t, alloc.IsPermissionRevoked(peerAddr))
+
+	perm = NewPermission(peerAddr, log, DefaultPermissionTimeout)
+	alloc.AddPermission(perm)
+	assert.Equal(t, perm, alloc.GetPermission(peerAddr), "Permission should be addable after explicit restore")
+}
+
 func TestAddChannelBind(t *testing.T) {
 	alloc := NewAllocation(nil, nil, EventHandler{}, nil)
 

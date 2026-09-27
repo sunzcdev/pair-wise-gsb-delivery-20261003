@@ -38,6 +38,7 @@ type Allocation struct {
 	fiveTuple           *FiveTuple
 	permissionsLock     sync.RWMutex
 	permissions         map[string]*Permission
+	revokedPermissions  map[string]struct{}
 	channelBindingsLock sync.RWMutex
 	channelBindings     []*ChannelBind
 	lifetimeTimer       *time.Timer
@@ -70,13 +71,14 @@ func NewAllocation(
 	log logging.LeveledLogger,
 ) *Allocation {
 	return &Allocation{
-		TurnSocket:     turnSocket,
-		fiveTuple:      fiveTuple,
-		permissions:    make(map[string]*Permission, 64),
-		closed:         make(chan any),
-		eventHandler:   eventHandler,
-		log:            log,
-		tcpConnections: make(map[proto.ConnectionID]*tcpConnection),
+		TurnSocket:         turnSocket,
+		fiveTuple:          fiveTuple,
+		permissions:        make(map[string]*Permission, 64),
+		revokedPermissions: make(map[string]struct{}),
+		closed:             make(chan any),
+		eventHandler:       eventHandler,
+		log:                log,
+		tcpConnections:     make(map[proto.ConnectionID]*tcpConnection),
 	}
 }
 
@@ -92,18 +94,23 @@ func (a *Allocation) GetPermission(addr net.Addr) *Permission {
 func (a *Allocation) AddPermission(perms *Permission) {
 	fingerprint := ipnet.FingerprintAddr(perms.Addr)
 
-	a.permissionsLock.RLock()
-	existedPermission, ok := a.permissions[fingerprint]
-	a.permissionsLock.RUnlock()
+	a.permissionsLock.Lock()
+	if _, revoked := a.revokedPermissions[fingerprint]; revoked {
+		a.permissionsLock.Unlock()
+		a.log.Warnf("Not adding permission for %v on %v, permission has been revoked",
+			perms.Addr, a.fiveTuple)
 
+		return
+	}
+	existedPermission, ok := a.permissions[fingerprint]
 	if ok {
+		a.permissionsLock.Unlock()
 		existedPermission.refresh(perms.timeout)
 
 		return
 	}
 
 	perms.allocation = a
-	a.permissionsLock.Lock()
 	a.permissions[fingerprint] = perms
 	a.permissionsLock.Unlock()
 
@@ -116,6 +123,76 @@ func (a *Allocation) AddPermission(perms *Permission) {
 	}
 
 	perms.start(perms.timeout)
+}
+
+// RevokePermission administratively revokes the permission for the peer IP of addr.
+// The permission and every channel binding to that peer IP are removed immediately,
+// and the peer is marked as revoked so that concurrent or subsequent refreshes
+// cannot resurrect it. Re-authorization requires an explicit RestorePermission.
+func (a *Allocation) RevokePermission(addr net.Addr) {
+	fingerprint := ipnet.FingerprintAddr(addr)
+
+	a.permissionsLock.Lock()
+	a.revokedPermissions[fingerprint] = struct{}{}
+	perm, existed := a.permissions[fingerprint]
+	delete(a.permissions, fingerprint)
+	a.permissionsLock.Unlock()
+
+	if existed {
+		if perm.lifetimeTimer != nil {
+			perm.lifetimeTimer.Stop()
+		}
+
+		if a.eventHandler.OnPermissionDeleted != nil {
+			if u, ok := addr.(*net.UDPAddr); ok {
+				a.eventHandler.OnPermissionDeleted(a.fiveTuple.SrcAddr, a.fiveTuple.DstAddr,
+					a.fiveTuple.Protocol.String(), a.userID, a.realm,
+					a.RelayAddr, u.IP)
+			}
+		}
+	}
+
+	// Channel bindings to the revoked peer IP are torn down as well, cutting
+	// ChannelData traffic in both directions.
+	peerIP, _, err := ipnet.AddrIPPort(addr)
+	if err != nil {
+		return
+	}
+	for _, cb := range a.ListChannelBindings() {
+		cbIP, _, cbErr := ipnet.AddrIPPort(cb.Peer)
+		if cbErr == nil && cbIP.Equal(peerIP) {
+			if a.RemoveChannelBind(cb.Number) && cb.lifetimeTimer != nil {
+				cb.lifetimeTimer.Stop()
+			}
+		}
+	}
+}
+
+// RestorePermission lifts a revocation previously installed by RevokePermission,
+// allowing the peer to be explicitly re-authorized (e.g. via a new CreatePermission
+// or ChannelBind request).
+func (a *Allocation) RestorePermission(addr net.Addr) {
+	a.permissionsLock.Lock()
+	defer a.permissionsLock.Unlock()
+	delete(a.revokedPermissions, ipnet.FingerprintAddr(addr))
+}
+
+// IsPermissionRevoked reports whether the permission for addr has been
+// administratively revoked on this allocation.
+func (a *Allocation) IsPermissionRevoked(addr net.Addr) bool {
+	a.permissionsLock.RLock()
+	defer a.permissionsLock.RUnlock()
+	_, revoked := a.revokedPermissions[ipnet.FingerprintAddr(addr)]
+
+	return revoked
+}
+
+// revokeFingerprint marks a permission fingerprint as revoked without touching
+// any existing permission. Used to apply pre-existing revocations to new allocations.
+func (a *Allocation) revokeFingerprint(fingerprint string) {
+	a.permissionsLock.Lock()
+	defer a.permissionsLock.Unlock()
+	a.revokedPermissions[fingerprint] = struct{}{}
 }
 
 // RemovePermission removes the net.Addr's fingerprint from the allocation's permissions.
@@ -148,6 +225,11 @@ func (a *Allocation) ListPermissions() []*Permission {
 // AddChannelBind adds a new ChannelBind to the allocation, it also updates the
 // permissions needed for this ChannelBind.
 func (a *Allocation) AddChannelBind(chanBind *ChannelBind, channelLifetime, permissionLifetime time.Duration) error {
+	// A revoked peer permission cannot be re-created implicitly by a ChannelBind.
+	if a.IsPermissionRevoked(chanBind.Peer) {
+		return ErrPermissionRevoked
+	}
+
 	// Check that this channel id isn't bound to another transport address, and
 	// that this transport address isn't bound to another channel number.
 	channelByNumber := a.GetChannelByNumber(chanBind.Number)
