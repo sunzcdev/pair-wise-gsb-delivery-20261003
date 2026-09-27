@@ -17,6 +17,11 @@ var (
 	// peer address that is already bound to a different channel number.
 	ErrSamePeerDifferentChannel = errors.New("you cannot use the same peer with different channel number")
 
+	// ErrPermissionRevoked is returned when a client attempts to create or refresh
+	// a permission or channel binding towards a peer whose access has been
+	// administratively revoked for the authenticated user.
+	ErrPermissionRevoked = errors.New("permission to peer has been revoked")
+
 	errAllocatePacketConnMustBeSet  = errors.New("AllocatePacketConn must be set")
 	errAllocateListenerMustBeSet    = errors.New("AllocateListener must be set")
 	errAllocateConnMustBeSet        = errors.New("AllocateConn must be set")

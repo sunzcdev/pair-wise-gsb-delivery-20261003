@@ -410,6 +410,13 @@ func handleCreatePermissionRequest(req Request, stunMsg *stun.Message) error {
 			return err
 		}
 
+		if req.AllocationManager.IsPermissionRevoked(userID, peerAddress.IP) {
+			req.Log.Infof("permission revoked for user %s to peer %s", userID, peerAddress.IP)
+			errorCode = stun.CodeForbidden
+
+			return allocation.ErrPermissionRevoked
+		}
+
 		req.Log.Debugf("Adding permission for %s", net.JoinHostPort(
 			peerAddress.IP.String(), strconv.Itoa(peerAddress.Port)))
 
@@ -538,6 +545,16 @@ func handleChannelBindRequest(req Request, stunMsg *stun.Message) error { // nol
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, unauthorizedRequestMsg...)
 	}
 
+	if req.AllocationManager.IsPermissionRevoked(userID, peerAddr.IP) {
+		req.Log.Infof("channel bind denied, permission revoked for user %s to peer %s", userID, peerAddr.IP)
+
+		forbiddenMsg := buildMsg(stunMsg.TransactionID,
+			stun.NewType(stun.MethodChannelBind, stun.ClassErrorResponse),
+			&stun.ErrorCodeAttribute{Code: stun.CodeForbidden})
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, allocation.ErrPermissionRevoked, forbiddenMsg...)
+	}
+
 	peerNetAddr := &net.UDPAddr{IP: peerAddr.IP, Port: peerAddr.Port}
 	req.Log.Debugf("Binding channel %d to %s", channel, peerAddr)
 	err = alloc.AddChannelBind(allocation.NewChannelBind(
@@ -643,6 +660,16 @@ func handleConnectRequest(req Request, stunMsg *stun.Message) error {
 		req.Log.Infof("permission denied for client %s to peer %s", req.SrcAddr, peerAddr.IP)
 
 		return buildAndSendErr(req.Conn, req.SrcAddr, err, buildMsg(
+			stunMsg.TransactionID,
+			stun.NewType(stun.MethodConnect, stun.ClassErrorResponse),
+			&stun.ErrorCodeAttribute{Code: stun.CodeForbidden},
+		)...)
+	}
+
+	if req.AllocationManager.IsPermissionRevoked(userID, peerAddr.IP) {
+		req.Log.Infof("connect denied, permission revoked for user %s to peer %s", userID, peerAddr.IP)
+
+		return buildAndSendErr(req.Conn, req.SrcAddr, allocation.ErrPermissionRevoked, buildMsg(
 			stunMsg.TransactionID,
 			stun.NewType(stun.MethodConnect, stun.ClassErrorResponse),
 			&stun.ErrorCodeAttribute{Code: stun.CodeForbidden},

@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -712,6 +714,206 @@ func TestServer(t *testing.T) { //nolint:maintidx
 		assert.NoError(t, err)
 		defer relayConn.Close() //nolint:errcheck
 	})
+}
+
+// recordingPeer is a UDP peer that records every payload it receives and
+// remembers the relay address that "ping"-prefixed payloads arrived from, so
+// the test can observe exactly which relayed packets cross the server.
+type recordingPeer struct {
+	conn     net.PacketConn
+	mu       sync.Mutex
+	received map[string]int
+	relay    net.Addr
+}
+
+func (p *recordingPeer) readLoop() {
+	buf := make([]byte, 1600)
+	for {
+		n, src, err := p.conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		msg := string(buf[:n])
+		p.mu.Lock()
+		p.received[msg]++
+		if strings.HasPrefix(msg, "ping") {
+			p.relay = src
+		}
+		p.mu.Unlock()
+	}
+}
+
+func (p *recordingPeer) count(msg string) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.received[msg]
+}
+
+func (p *recordingPeer) relayAddr() net.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.relay
+}
+
+func TestServerRevokePermission(t *testing.T) { //nolint:maintidx
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	loggerFactory := logging.NewDefaultLoggerFactory()
+
+	otherUser := "otherUser"
+	credMap := map[string][]byte{
+		testUser:  GenerateAuthKey(testUser, "pion.ly", "pass"),
+		otherUser: GenerateAuthKey(otherUser, "pion.ly", "pass"),
+	}
+
+	udpListener, err := net.ListenPacket("udp4", testAddr) // nolint: noctx
+	assert.NoError(t, err)
+
+	server, err := NewServer(ServerConfig{
+		AuthHandler: func(ra *RequestAttributes) (userID string, key []byte, ok bool) {
+			if pw, ok := credMap[ra.Username]; ok {
+				return ra.Username, pw, true
+			}
+
+			return "", nil, false
+		},
+		PacketConnConfigs: []PacketConnConfig{
+			{
+				PacketConn: udpListener,
+				RelayAddressGenerator: &RelayAddressGeneratorStatic{
+					RelayAddress: net.ParseIP("127.0.0.1"),
+					Address:      "127.0.0.1",
+				},
+			},
+		},
+		Realm:         "pion.ly",
+		LoggerFactory: loggerFactory,
+	})
+	assert.NoError(t, err)
+
+	peerConn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+	assert.NoError(t, err)
+	peerAddr, ok := peerConn.LocalAddr().(*net.UDPAddr)
+	assert.True(t, ok)
+	peer := &recordingPeer{conn: peerConn, received: map[string]int{}}
+	go peer.readLoop()
+
+	newClient := func(username string) (*Client, net.PacketConn) {
+		clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
+		assert.NoError(t, err)
+
+		client, err := NewClient(&ClientConfig{
+			STUNServerAddr: testAddr,
+			TURNServerAddr: testAddr,
+			Conn:           clientConn,
+			Username:       username,
+			Password:       "pass",
+			Realm:          "pion.ly",
+			// Short intervals so the client's automatic permission and
+			// channel binding refreshes fire while the revocation is in
+			// effect: they must not resurrect the revoked permission.
+			PermissionRefreshInterval: 200 * time.Millisecond,
+			LoggerFactory:             loggerFactory,
+			bindingRefreshInterval:    500 * time.Millisecond,
+			bindingCheckInterval:      200 * time.Millisecond,
+		})
+		assert.NoError(t, err)
+		assert.NoError(t, client.Listen())
+
+		return client, clientConn
+	}
+
+	client, conn := newClient(testUser)
+	relayConn, err := client.Allocate()
+	assert.NoError(t, err)
+
+	// Phase 1: establish normal bidirectional traffic. The first write
+	// installs the permission and channel binding on the server.
+	_, err = relayConn.WriteTo([]byte("ping-before"), peerAddr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return peer.count("ping-before") == 1 }, timeout, interval)
+
+	_, err = peerConn.WriteTo([]byte("pong-before"), peer.relayAddr())
+	assert.NoError(t, err)
+	buf := make([]byte, 1600)
+	assert.NoError(t, relayConn.SetReadDeadline(time.Now().Add(timeout)))
+	n, _, err := relayConn.ReadFrom(buf)
+	assert.NoError(t, err)
+	assert.Equal(t, "pong-before", string(buf[:n]))
+
+	// A second user on the same client IP (127.0.0.1) with access to the same
+	// peer: revocation is keyed by authenticated user identity, not client IP.
+	otherClient, otherConn := newClient(otherUser)
+	otherRelayConn, err := otherClient.Allocate()
+	assert.NoError(t, err)
+	_, err = otherRelayConn.WriteTo([]byte("other-ping-before"), peerAddr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return peer.count("other-ping-before") == 1 }, timeout, interval)
+
+	// Phase 2: revoke testUser's access to the peer while traffic is flowing.
+	affected := server.RevokePermission(testUser, peerAddr.IP)
+	assert.Equal(t, 1, affected)
+
+	// The client keeps sending (ChannelData on its locally still bound
+	// channel, Send indications once the binding refresh is rejected); none of
+	// it may reach the peer. This window spans several automatic permission
+	// and channel binding refresh ticks, which must not resurrect the
+	// revoked permission.
+	for i := range 5 {
+		_, err = relayConn.WriteTo([]byte(fmt.Sprintf("ping-after-%d", i)), peerAddr)
+		assert.NoError(t, err)
+		time.Sleep(100 * time.Millisecond)
+	}
+	for i := range 5 {
+		assert.Equal(t, 0, peer.count(fmt.Sprintf("ping-after-%d", i)))
+	}
+
+	// The reverse relay path is cut as well: traffic from the peer never
+	// reaches the client.
+	_, err = peerConn.WriteTo([]byte("pong-after"), peer.relayAddr())
+	assert.NoError(t, err)
+	assert.NoError(t, relayConn.SetReadDeadline(time.Now().Add(timeout)))
+	_, _, err = relayConn.ReadFrom(buf)
+	assert.Error(t, err)
+
+	// An explicit CreatePermission refresh is rejected and does not
+	// resurrect the permission.
+	assert.Error(t, client.CreatePermission(peerAddr))
+	time.Sleep(300 * time.Millisecond) // let more automatic refresh ticks fire
+	_, err = relayConn.WriteTo([]byte("ping-after-refresh"), peerAddr)
+	assert.NoError(t, err)
+	time.Sleep(timeout)
+	assert.Equal(t, 0, peer.count("ping-after-refresh"))
+
+	// The other user on the same client IP is unaffected.
+	_, err = otherRelayConn.WriteTo([]byte("other-ping-after"), peerAddr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return peer.count("other-ping-after") == 1 }, timeout, interval)
+
+	// Phase 3: re-authorization requires the explicit RestorePermission call.
+	// Afterwards normal client operations can grant the permission again.
+	server.RestorePermission(testUser, peerAddr.IP)
+	assert.NoError(t, client.CreatePermission(peerAddr))
+	_, err = relayConn.WriteTo([]byte("ping-restored"), peerAddr)
+	assert.NoError(t, err)
+	assert.Eventually(t, func() bool { return peer.count("ping-restored") == 1 }, timeout, interval)
+
+	assert.NoError(t, relayConn.Close())
+	client.Close()
+	assert.NoError(t, conn.Close())
+
+	assert.NoError(t, otherRelayConn.Close())
+	otherClient.Close()
+	assert.NoError(t, otherConn.Close())
+
+	assert.NoError(t, peerConn.Close())
+	assert.NoError(t, server.Close())
 }
 
 func TestServerHandleComprehensionRequiredAttribute(t *testing.T) {

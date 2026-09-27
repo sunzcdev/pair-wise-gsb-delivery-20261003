@@ -47,6 +47,12 @@ type Allocation struct {
 	log                 logging.LeveledLogger
 	addressFamily       proto.RequestedAddressFamily // RFC 6156
 
+	// isPermissionRevoked reports whether the allocation's user is currently
+	// administratively revoked from communicating with the given peer IP.
+	// It is consulted as a backstop so that permission/channel refreshes racing
+	// with a revocation cannot resurrect revoked state.
+	isPermissionRevoked func(userID string, peerIP net.IP) bool
+
 	// Relay Transport for UDP
 	relayPacketConn net.PacketConn
 
@@ -90,6 +96,14 @@ func (a *Allocation) GetPermission(addr net.Addr) *Permission {
 
 // AddPermission adds a new permission to the allocation.
 func (a *Allocation) AddPermission(perms *Permission) {
+	if a.isPermissionRevoked != nil {
+		if ip, _, err := ipnet.AddrIPPort(perms.Addr); err == nil && a.isPermissionRevoked(a.userID, ip) {
+			a.log.Infof("Ignoring permission for %v: access revoked for user %s", perms.Addr, a.userID)
+
+			return
+		}
+	}
+
 	fingerprint := ipnet.FingerprintAddr(perms.Addr)
 
 	a.permissionsLock.RLock()
@@ -145,9 +159,48 @@ func (a *Allocation) ListPermissions() []*Permission {
 	return ps
 }
 
+// revokePeer removes the permission and every channel binding towards peerIP,
+// immediately cutting both relay directions (Send indications/ChannelData to the
+// peer and relayed traffic from the peer) without waiting for the permission
+// lifetime to expire. It reports whether any state was removed.
+func (a *Allocation) revokePeer(peerIP net.IP) bool {
+	removed := false
+
+	for _, p := range a.ListPermissions() {
+		ip, _, err := ipnet.AddrIPPort(p.Addr)
+		if err != nil || !ip.Equal(peerIP) {
+			continue
+		}
+		a.RemovePermission(p.Addr)
+		p.lifetimeTimer.Stop()
+		removed = true
+	}
+
+	for _, c := range a.ListChannelBindings() {
+		ip, _, err := ipnet.AddrIPPort(c.Peer)
+		if err != nil || !ip.Equal(peerIP) {
+			continue
+		}
+		if a.RemoveChannelBind(c.Number) {
+			c.lifetimeTimer.Stop()
+			removed = true
+		}
+	}
+
+	return removed
+}
+
 // AddChannelBind adds a new ChannelBind to the allocation, it also updates the
 // permissions needed for this ChannelBind.
 func (a *Allocation) AddChannelBind(chanBind *ChannelBind, channelLifetime, permissionLifetime time.Duration) error {
+	if a.isPermissionRevoked != nil {
+		if ip, _, err := ipnet.AddrIPPort(chanBind.Peer); err == nil && a.isPermissionRevoked(a.userID, ip) {
+			a.log.Infof("Rejecting ChannelBind to %v: access revoked for user %s", chanBind.Peer, a.userID)
+
+			return ErrPermissionRevoked
+		}
+	}
+
 	// Check that this channel id isn't bound to another transport address, and
 	// that this transport address isn't bound to another channel number.
 	channelByNumber := a.GetChannelByNumber(chanBind.Number)

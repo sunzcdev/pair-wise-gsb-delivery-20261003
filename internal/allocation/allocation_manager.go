@@ -78,14 +78,24 @@ type reservation struct {
 	port  int
 }
 
+// revocationKey identifies a revoked (user, peer IP) pair. The user is the
+// authenticated identity returned by the AuthHandler, never the client
+// transport address.
+type revocationKey struct {
+	userID string
+	peerIP string
+}
+
 // Manager is used to hold active allocations.
 type Manager struct {
 	lock                     sync.RWMutex
 	log                      logging.LeveledLogger
 	tcpConnectionBindTimeout time.Duration
 
-	allocations  map[FiveTupleFingerprint]*Allocation
-	reservations []*reservation
+	allocations     map[FiveTupleFingerprint]*Allocation
+	reservations    []*reservation
+	revocationsLock sync.RWMutex
+	revocations     map[revocationKey]struct{}
 
 	allocatePacketConn func(conf AllocateListenerConfig) (net.PacketConn, net.Addr, error)
 	allocateListener   func(conf AllocateListenerConfig) (net.Listener, net.Addr, error)
@@ -121,7 +131,59 @@ func NewManager(config ManagerConfig) (*Manager, error) {
 		permissionHandler:        config.PermissionHandler,
 		EventHandler:             config.EventHandler,
 		tcpConnectionBindTimeout: tcpConnectionBindTimeout,
+		revocations:              make(map[revocationKey]struct{}),
 	}, nil
+}
+
+// RevokePermission immediately revokes userID's access to peerIP on every
+// allocation the user holds on this Manager. Existing permissions and channel
+// bindings towards the peer are removed so both relay directions are cut
+// without waiting for the permission lifetime to expire.
+//
+// The revocation stays in effect until RestorePermission is called: while it
+// is active, CreatePermission and ChannelBind requests from userID towards
+// peerIP are rejected, so concurrent or subsequent refreshes cannot resurrect
+// the revoked permission. It returns the number of allocations on which state
+// towards peerIP was removed.
+func (m *Manager) RevokePermission(userID string, peerIP net.IP) int {
+	m.revocationsLock.Lock()
+	m.revocations[revocationKey{userID: userID, peerIP: peerIP.String()}] = struct{}{}
+	m.revocationsLock.Unlock()
+
+	m.lock.RLock()
+	defer m.lock.RUnlock()
+
+	affected := 0
+	for _, a := range m.allocations {
+		if a.userID != userID {
+			continue
+		}
+		if a.revokePeer(peerIP) {
+			affected++
+		}
+	}
+
+	return affected
+}
+
+// RestorePermission lifts a revocation previously installed by RevokePermission,
+// allowing userID to establish permissions towards peerIP again through new
+// CreatePermission or ChannelBind requests.
+func (m *Manager) RestorePermission(userID string, peerIP net.IP) {
+	m.revocationsLock.Lock()
+	delete(m.revocations, revocationKey{userID: userID, peerIP: peerIP.String()})
+	m.revocationsLock.Unlock()
+}
+
+// IsPermissionRevoked reports whether userID's access to peerIP has been
+// revoked via RevokePermission and not yet restored.
+func (m *Manager) IsPermissionRevoked(userID string, peerIP net.IP) bool {
+	m.revocationsLock.RLock()
+	defer m.revocationsLock.RUnlock()
+
+	_, ok := m.revocations[revocationKey{userID: userID, peerIP: peerIP.String()}]
+
+	return ok
 }
 
 // GetAllocation fetches the allocation matching the passed FiveTuple.
@@ -194,6 +256,7 @@ func (m *Manager) CreateAllocation( // nolint: cyclop
 	alloc.userID = userID
 	alloc.realm = realm
 	alloc.addressFamily = addressFamily
+	alloc.isPermissionRevoked = m.IsPermissionRevoked
 
 	switch protocol {
 	case proto.ProtoUDP:

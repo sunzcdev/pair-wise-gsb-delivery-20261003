@@ -132,6 +132,39 @@ func (s *Server) AllocationCount() int {
 	return allocs
 }
 
+// RevokePermission immediately revokes userID's permission to exchange traffic
+// with peerIP on every allocation the user holds on this server. Existing
+// permissions and channel bindings towards the peer are removed, so Send
+// indications and ChannelData towards the peer as well as relayed traffic from
+// the peer are dropped without waiting for the permission lifetime to expire.
+//
+// The revocation is keyed by the authenticated user identity (the userID
+// returned by the AuthHandler), not by the client transport address, and stays
+// in effect until RestorePermission is called: while revoked, CreatePermission
+// and ChannelBind requests from userID towards peerIP are rejected with
+// 403 (Forbidden), so in-flight or subsequent refreshes cannot resurrect the
+// revoked permission. Re-authorization requires an explicit RestorePermission
+// call followed by new CreatePermission/ChannelBind requests from the client.
+//
+// It returns the number of allocations on which state towards peerIP was removed.
+func (s *Server) RevokePermission(userID string, peerIP net.IP) int {
+	affected := 0
+	for _, am := range s.allocationManagers {
+		affected += am.RevokePermission(userID, peerIP)
+	}
+
+	return affected
+}
+
+// RestorePermission lifts a revocation previously installed by RevokePermission,
+// allowing userID to establish permissions towards peerIP again through new
+// CreatePermission or ChannelBind requests.
+func (s *Server) RestorePermission(userID string, peerIP net.IP) {
+	for _, am := range s.allocationManagers {
+		am.RestorePermission(userID, peerIP)
+	}
+}
+
 // Close stops the TURN Server.
 // It cleans up any associated state and closes all connections it is managing.
 func (s *Server) Close() error {
