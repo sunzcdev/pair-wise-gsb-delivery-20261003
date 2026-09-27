@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"database/sql/driver"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -147,5 +148,26 @@ func TestConvertJSON(t *testing.T) {
 
 	if _, ok := out.(json.RawMessage); !ok {
 		t.Fatalf("json.RawMessage converted, got %#v %T", out, out)
+	}
+}
+
+func TestConvertLongDataReader(t *testing.T) {
+	r := LongDataReader{Reader: strings.NewReader("blob")}
+
+	output, err := converter{}.ConvertValue(r)
+	if err != nil {
+		t.Fatal("LongDataReader not convertible", err)
+	}
+	if output != r {
+		t.Fatalf("LongDataReader not passed through, got %#v %T", output, output)
+	}
+
+	// A pointer is dereferenced like for any other value.
+	output, err = converter{}.ConvertValue(&r)
+	if err != nil {
+		t.Fatal("*LongDataReader not convertible", err)
+	}
+	if output != r {
+		t.Fatalf("*LongDataReader not passed through, got %#v %T", output, output)
 	}
 }

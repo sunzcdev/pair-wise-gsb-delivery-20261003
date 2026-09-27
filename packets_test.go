@@ -11,7 +11,9 @@ package mysql
 import (
 	"bytes"
 	"database/sql/driver"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -223,6 +225,267 @@ func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
 	if len(conn.data) != 0 {
 		t.Fatal("COM_STMT_RESET response was not consumed")
 	}
+}
+
+// capturedPacket is a packet written to a mockConn, split into sequence
+// number and payload (everything after the 4-byte packet header).
+type capturedPacket struct {
+	seq     byte
+	payload []byte
+}
+
+func capturedPackets(t *testing.T, conn *mockConn) []capturedPacket {
+	t.Helper()
+	var pkts []capturedPacket
+	for written := conn.written; len(written) > 0; {
+		packetLen := 4 + getUint24(written)
+		if packetLen > len(written) {
+			t.Fatalf("invalid packet length: got %d, remaining bytes %d", packetLen, len(written))
+		}
+		pkts = append(pkts, capturedPacket{seq: written[3], payload: written[4:packetLen]})
+		written = written[packetLen:]
+	}
+	return pkts
+}
+
+// onceReader is a single-use io.Reader: it fails when Read is called again
+// after the data was fully consumed.
+type onceReader struct {
+	data []byte
+	pos  int
+	done bool
+}
+
+func (r *onceReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, errors.New("single-use reader was read again")
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	if r.pos == len(r.data) {
+		r.done = true
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func longDataPayload(size int) []byte {
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+	return payload
+}
+
+func TestWriteExecutePacketStreamsLongDataReader(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128 // chunk size is 128 - 1 (command) - 4 (stmtID) - 2 (paramID) - 1 = 120
+	stmt := mysqlStmt{mc: mc, id: 7, paramCount: 3}
+
+	// 300 bytes: 3 chunks of 120, 120 and 60 bytes.
+	payload := longDataPayload(300)
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		LongDataReader{Reader: &onceReader{data: payload}},
+		int64(42),
+		LongDataReader{}, // NULL
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkts := capturedPackets(t, conn)
+	if len(pkts) != 4 {
+		t.Fatalf("unexpected packet count: got %d, want 4 (3 long data + 1 execute)", len(pkts))
+	}
+
+	// Every COM_STMT_SEND_LONG_DATA packet restarts the packet sequence.
+	var streamed []byte
+	for i, pkt := range pkts[:3] {
+		if pkt.payload[0] != comStmtSendLongData {
+			t.Fatalf("packet %d: unexpected command: got %d, want %d", i, pkt.payload[0], comStmtSendLongData)
+		}
+		if pkt.seq != 0 {
+			t.Fatalf("packet %d: unexpected sequence: got %d, want 0", i, pkt.seq)
+		}
+		if id := binary.LittleEndian.Uint32(pkt.payload[1:5]); id != stmt.id {
+			t.Fatalf("packet %d: unexpected statement id: got %d, want %d", i, id, stmt.id)
+		}
+		if id := binary.LittleEndian.Uint16(pkt.payload[5:7]); id != 0 {
+			t.Fatalf("packet %d: unexpected param id: got %d, want 0", i, id)
+		}
+		if len(pkt.payload)-7 > 120 {
+			t.Fatalf("packet %d: chunk exceeds the chunk size: got %d, want <= 120", i, len(pkt.payload)-7)
+		}
+		streamed = append(streamed, pkt.payload[7:]...)
+	}
+	if !bytes.Equal(streamed, payload) {
+		t.Fatalf("streamed data does not match the reader content: got %d bytes, want %d", len(streamed), len(payload))
+	}
+
+	// The execute packet references the streamed parameter by type only.
+	exec := pkts[3].payload
+	if exec[0] != comStmtExecute {
+		t.Fatalf("unexpected command: got %d, want %d", exec[0], comStmtExecute)
+	}
+	if id := binary.LittleEndian.Uint32(exec[1:5]); id != stmt.id {
+		t.Fatalf("unexpected statement id: got %d, want %d", id, stmt.id)
+	}
+	nullMask := exec[10]
+	if nullMask != 1<<2 {
+		t.Fatalf("unexpected NULL-bitmap: got %08b, want only bit 2 set", nullMask)
+	}
+	if exec[11] != 0x01 {
+		t.Fatalf("unexpected new-params-bound-flag: got %d, want 1", exec[11])
+	}
+	paramTypes := exec[12:18]
+	if want := []byte{byte(fieldTypeBLOB), 0, byte(fieldTypeLongLong), 0, byte(fieldTypeNULL), 0}; !bytes.Equal(paramTypes, want) {
+		t.Fatalf("unexpected param types: got %v, want %v", paramTypes, want)
+	}
+	// Only the int64 parameter has an in-packet value.
+	if values := exec[18:]; len(values) != 8 || binary.LittleEndian.Uint64(values) != 42 {
+		t.Fatalf("unexpected param values: got %v", values)
+	}
+}
+
+func TestWriteExecutePacketLongDataReaderBoundedMemory(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+
+	// 2.5 MiB payload, larger than the 1 MiB chunk size.
+	payload := longDataPayload(5<<19 + 123)
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		LongDataReader{Reader: &onceReader{data: payload}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkts := capturedPackets(t, conn)
+	if len(pkts) != 4 {
+		t.Fatalf("unexpected packet count: got %d, want 4 (3 long data + 1 execute)", len(pkts))
+	}
+
+	var streamed []byte
+	maxPacket := 0
+	for i, pkt := range pkts[:3] {
+		if pkt.payload[0] != comStmtSendLongData {
+			t.Fatalf("packet %d: unexpected command: got %d, want %d", i, pkt.payload[0], comStmtSendLongData)
+		}
+		maxPacket = max(maxPacket, len(pkt.payload))
+		streamed = append(streamed, pkt.payload[7:]...)
+	}
+	// The whole parameter is never buffered in a single packet: each chunk is
+	// bounded by longDataReaderChunkSize plus the packet overhead.
+	if limit := longDataReaderChunkSize + 7; maxPacket > limit {
+		t.Fatalf("packet exceeds the chunk size limit: got %d, want <= %d", maxPacket, limit)
+	}
+	if !bytes.Equal(streamed, payload) {
+		t.Fatalf("streamed data does not match the reader content: got %d bytes, want %d", len(streamed), len(payload))
+	}
+}
+
+func TestWriteExecutePacketLongDataReaderError(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128 // chunk size is 120
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
+
+	errRead := errors.New("reader failed")
+	// 150 bytes: two chunks (120 and 30 bytes) are sent before the reader fails.
+	reader := &failAfterReader{data: longDataPayload(150), err: errRead}
+
+	conn.queuedReplies = [][]byte{{
+		0x07, 0x00, 0x00, 0x01, // Packet header: 7-byte payload, sequence 1.
+		iOK,        // OK packet header.
+		0x00,       // Zero affected rows.
+		0x00,       // Zero last insert ID.
+		0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT.
+		0x00, 0x00, // Zero warnings.
+	}}
+
+	// The error returned to database/sql must not trigger an automatic retry:
+	// the reader is partially consumed and cannot be replayed.
+	_, err := stmt.Exec([]driver.Value{LongDataReader{Reader: reader}, int64(1)})
+	if !errors.Is(err, errRead) {
+		t.Fatalf("unexpected error: got %v, want %v", err, errRead)
+	}
+	if err == driver.ErrBadConn {
+		t.Fatal("error must not be driver.ErrBadConn: the statement cannot be replayed")
+	}
+
+	// The partially sent parameter must be discarded by resetting the
+	// statement on the server.
+	pkts := capturedPackets(t, conn)
+	var commands []byte
+	for _, pkt := range pkts {
+		commands = append(commands, pkt.payload[0])
+	}
+	if want := []byte{comStmtSendLongData, comStmtSendLongData, comStmtReset}; !bytes.Equal(commands, want) {
+		t.Fatalf("unexpected command order: got %v, want %v", commands, want)
+	}
+	if len(conn.data) != 0 {
+		t.Fatal("COM_STMT_RESET response was not consumed")
+	}
+	if conn.closed {
+		t.Fatal("connection must stay usable after a reader error")
+	}
+
+	// The statement must be reusable for the next normal execution.
+	conn.queuedReplies = [][]byte{{
+		0x07, 0x00, 0x00, 0x01, // Packet header: 7-byte payload, sequence 1.
+		iOK,        // OK packet header.
+		0x00,       // Zero affected rows.
+		0x00,       // Zero last insert ID.
+		0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT.
+		0x00, 0x00, // Zero warnings.
+	}}
+	if _, err := stmt.Exec([]driver.Value{int64(1), int64(2)}); err != nil {
+		t.Fatalf("statement not reusable after reader error: %v", err)
+	}
+	pkts = capturedPackets(t, conn)
+	if last := pkts[len(pkts)-1]; last.payload[0] != comStmtExecute {
+		t.Fatalf("unexpected last command: got %d, want %d", last.payload[0], comStmtExecute)
+	}
+}
+
+func TestWriteExecutePacketLongDataReaderWriteErrorNotRetryable(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.rawConn = conn // so that a write error closes the mock connection
+	mc.maxAllowedPacket = 128
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+	conn.writeErrors = map[int]error{1: errors.New("network write failed")}
+
+	// Without a reader parameter this failure would surface as
+	// driver.ErrBadConn so database/sql retries on a fresh connection. With a
+	// reader parameter the statement cannot be replayed, so the error must
+	// not be driver.ErrBadConn.
+	_, err := stmt.Exec([]driver.Value{LongDataReader{Reader: &onceReader{data: longDataPayload(10)}}})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if err == driver.ErrBadConn {
+		t.Fatal("error must not be driver.ErrBadConn: the statement cannot be replayed")
+	}
+	if !conn.closed {
+		t.Fatal("connection must be closed after a network write error")
+	}
+}
+
+// failAfterReader serves data and fails with err once the data is exhausted.
+type failAfterReader struct {
+	data []byte
+	pos  int
+	err  error
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, r.err
+	}
+	n := copy(p, r.data[r.pos:])
+	r.pos += n
+	return n, nil
 }
 
 func TestReadPacketSingleByte(t *testing.T) {

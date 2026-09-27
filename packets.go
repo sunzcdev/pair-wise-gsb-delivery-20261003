@@ -1048,10 +1048,82 @@ func (stmt *mysqlStmt) reset() error {
 	return handleOk.readResultOK()
 }
 
+// longDataReaderChunkSize caps the amount of memory used while streaming a
+// LongDataReader parameter, independent of maxAllowedPacket.
+const longDataReaderChunkSize = 1 << 20 // 1 MiB
+
+// writeCommandLongDataReader streams the content of r to the server in chunks
+// using COM_STMT_SEND_LONG_DATA packets. Only a single chunk is kept in
+// memory at a time, so arbitrarily large parameters can be sent without
+// loading them into memory first.
+func (stmt *mysqlStmt) writeCommandLongDataReader(paramID int, r io.Reader) error {
+	mc := stmt.mc
+
+	// After the header (bytes 0-3) follows before the data:
+	// 1 byte command
+	// 4 bytes stmtID
+	// 2 bytes paramID
+	const dataOffset = 1 + 4 + 2
+
+	chunkSize := min(longDataReaderChunkSize, mc.maxAllowedPacket-1-dataOffset)
+	if chunkSize < 1 {
+		return ErrPktTooLarge
+	}
+
+	data := make([]byte, 4+dataOffset+chunkSize)
+
+	// Add command byte [1 byte]
+	data[4] = comStmtSendLongData
+
+	// Add stmtID [32 bit]
+	binary.LittleEndian.PutUint32(data[5:], stmt.id)
+
+	// Add paramID [16 bit]
+	binary.LittleEndian.PutUint16(data[9:], uint16(paramID))
+
+	for {
+		n, err := r.Read(data[4+dataOffset:])
+		if n > 0 {
+			if werr := mc.writePacket(data[:4+dataOffset+n]); werr != nil {
+				return werr
+			}
+			// Every COM_LONG_DATA packet resets the packet sequence.
+			mc.resetSequence()
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
 type stmtLongData struct {
 	paramID int
 	data    []byte
 	text    string
+}
+
+type stmtLongDataReader struct {
+	paramID int
+	r       io.Reader
+}
+
+// nonRetryableErr makes sure err does not cause database/sql to retry the
+// statement. A statement with LongDataReader parameters consumes its readers
+// while executing, so it cannot be replayed safely and even connection errors
+// that are normally safe to retry must not be reported as driver.ErrBadConn.
+func nonRetryableErr(err error, hasReader bool) error {
+	if !hasReader {
+		return err
+	}
+	if err == errBadConnNoWrite || err == driver.ErrBadConn {
+		// Deliberately not wrapping with %w: the retry decision in
+		// database/sql must not match driver.ErrBadConn through errors.Is.
+		return fmt.Errorf("mysql: %v (statement with LongDataReader parameter cannot be retried)", err)
+	}
+	return err
 }
 
 // Execute Prepared Statement
@@ -1074,6 +1146,7 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	var data []byte
 	var err error
 	var longData []stmtLongData
+	var longDataReaders []stmtLongDataReader
 
 	if len(args) == 0 {
 		data, err = mc.buf.takeBuffer(minPktLen)
@@ -1206,6 +1279,19 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 					longData = append(longData, stmtLongData{paramID: i, text: v})
 				}
 
+			case LongDataReader:
+				// Handle LongDataReader{nil} as a NULL value
+				if v.Reader == nil {
+					nullMask[i/8] |= 1 << (uint(i) & 7)
+					paramTypes[i+i] = byte(fieldTypeNULL)
+					paramTypes[i+i+1] = 0x00
+					continue
+				}
+
+				paramTypes[i+i] = byte(fieldTypeBLOB)
+				paramTypes[i+i+1] = 0x00
+				longDataReaders = append(longDataReaders, stmtLongDataReader{paramID: i, r: v.Reader})
+
 			case time.Time:
 				paramTypes[i+i] = byte(fieldTypeString)
 				paramTypes[i+i+1] = 0x00
@@ -1262,13 +1348,25 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 			if resetErr := stmt.reset(); resetErr != nil {
 				mc.close()
 			}
-			return err
+			return nonRetryableErr(err, len(longDataReaders) > 0)
+		}
+	}
+	for _, param := range longDataReaders {
+		if err = stmt.writeCommandLongDataReader(param.paramID, param.r); err != nil {
+			// The server may have stored partial parameter data. Reset the
+			// statement so it can be reused, and never report a retryable
+			// error: the reader is (partially) consumed and cannot be
+			// replayed by database/sql.
+			if resetErr := stmt.reset(); resetErr != nil {
+				mc.close()
+			}
+			return nonRetryableErr(err, true)
 		}
 	}
 
 	err = mc.writePacket(data)
 	mc.syncSequence()
-	return err
+	return nonRetryableErr(err, len(longDataReaders) > 0)
 }
 
 // For each remaining resultset in the stream, discards its rows and updates

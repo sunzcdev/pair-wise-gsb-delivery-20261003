@@ -38,6 +38,7 @@ A MySQL-Driver for Go's [database/sql](https://golang.org/pkg/database/sql/) pac
   * Supports queries larger than 16MB
   * Full [`sql.RawBytes`](https://golang.org/pkg/database/sql/#RawBytes) support.
   * Intelligent `LONG DATA` handling in prepared statements
+  * Streaming of large BLOB parameters in prepared statements via `io.Reader`
   * Secure `LOAD DATA LOCAL INFILE` support with file allowlisting and `io.Reader` support
   * Optional `time.Time` parsing
   * Optional placeholder interpolation
@@ -565,6 +566,25 @@ Files must be explicitly allowed by registering them with `mysql.RegisterLocalFi
 To use a `io.Reader` a handler function must be registered with `mysql.RegisterReaderHandler(name, handler)` which returns a `io.Reader` or `io.ReadCloser`. The Reader is available with the filepath `Reader::<name>` then. Choose different names for different handlers and `DeregisterReaderHandler` when you don't need it anymore.
 
 See the [godoc of Go-MySQL-Driver](https://godoc.org/github.com/go-sql-driver/mysql "golang mysql driver documentation") for details.
+
+
+### Streaming BLOB parameters
+Large BLOBs can be inserted with prepared statements without loading the whole value into memory by wrapping an `io.Reader` with `mysql.LongDataReader`:
+```go
+import "github.com/go-sql-driver/mysql"
+```
+```go
+file, err := os.Open("blob.bin")
+if err != nil {
+	// handle error
+}
+defer file.Close()
+
+_, err = db.Exec("INSERT INTO files (content) VALUES (?)", mysql.LongDataReader{Reader: file})
+```
+The reader is streamed to the server in chunks using `COM_STMT_SEND_LONG_DATA`. A `mysql.LongDataReader` with a nil `Reader` is sent as `NULL`.
+
+Please note that the reader is consumed while the statement executes and cannot be replayed. If reading fails midway, the partially sent parameter is discarded by resetting the statement on the server, and the returned error never triggers an automatic retry by `database/sql`.
 
 
 ### `time.Time` support

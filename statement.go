@@ -23,6 +23,22 @@ type mysqlStmt struct {
 	columns    []mysqlField
 }
 
+// LongDataReader wraps an io.Reader so it can be used as a prepared statement
+// parameter. The content of the reader is streamed to the server in chunks
+// using COM_STMT_SEND_LONG_DATA, without buffering the whole value in memory.
+// This is useful for importing large BLOBs.
+//
+// The reader is consumed while the statement executes and cannot be replayed.
+// If reading fails midway, the partially sent parameter is discarded by
+// resetting the statement on the server and the returned error is never
+// driver.ErrBadConn, so database/sql will not silently retry the statement
+// with an already-consumed reader.
+//
+// A LongDataReader with a nil Reader is sent as NULL.
+type LongDataReader struct {
+	io.Reader
+}
+
 func (stmt *mysqlStmt) Close() error {
 	if stmt.mc == nil || stmt.mc.closed.Load() {
 		// driver.Stmt.Close could be called more than once, thus this function
@@ -161,6 +177,10 @@ type converter struct{}
 func (c converter) ConvertValue(v any) (driver.Value, error) {
 	if driver.IsValue(v) {
 		return v, nil
+	}
+
+	if r, ok := v.(LongDataReader); ok {
+		return r, nil
 	}
 
 	if vr, ok := v.(driver.Valuer); ok {
