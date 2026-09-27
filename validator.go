@@ -28,6 +28,9 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+	batch          *batchCollector // batch external rule collector, nil unless StructBatchCtx is used
+	flNs           []byte          // field namespace, captured only when batch != nil
+	flStructNs     []byte          // field struct namespace, captured only when batch != nil
 }
 
 // parent and current will be the same the first run of validateStruct
@@ -378,6 +381,11 @@ OUTER:
 				v.cf = cf
 				v.ct = ct
 
+				if v.batch != nil {
+					v.flNs = ns
+					v.flStructNs = structNs
+				}
+
 				if ct.fn(ctx, v) {
 					if ct.isBlockEnd {
 						ct = ct.next
@@ -470,6 +478,11 @@ OUTER:
 			v.flField = current
 			v.cf = cf
 			v.ct = ct
+
+			if v.batch != nil {
+				v.flNs = ns
+				v.flStructNs = structNs
+			}
 
 			if !ct.fn(ctx, v) {
 				v.str1 = appendAltName(ns, cf.altName)
