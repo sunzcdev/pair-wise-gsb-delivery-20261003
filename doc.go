@@ -166,8 +166,30 @@ For example:
 
 The prefix "TZ=(TIME ZONE)" is also supported for legacy compatibility.
 
-Be aware that jobs scheduled during daylight-savings leap-ahead transitions will
-not be run!
+Daylight Saving Time
+
+By default, schedules advance in absolute time: jobs scheduled during a
+daylight-savings leap-ahead transition will not be run, and jobs scheduled in
+the repeated period of a fall-back transition run at the first occurrence of
+their wall-clock time.
+
+This can be customized per schedule with cron.WithDSTPolicy, which applies
+equally to schedules using CRON_TZ=/TZ= or cron.WithLocation:
+
+  - Ambiguous times (fall-back, a wall-clock time occurs twice): run only the
+    first occurrence (AmbiguousFirst), only the second (AmbiguousSecond), or
+    both (AmbiguousBoth).
+  - Nonexistent times (spring-forward, a wall-clock time never occurs): skip
+    the run (NonexistentSkip), or push it to the first valid moment after the
+    jump ends (NonexistentPush).
+
+For example:
+
+	sched, _ := cron.ParseStandard("CRON_TZ=America/New_York 30 2 * * *")
+	c.Schedule(cron.WithDSTPolicy(sched, cron.AmbiguousBoth, cron.NonexistentPush), job)
+
+Fixed-interval "@every" schedules are not affected by these policies; they
+always keep their absolute-interval semantics.
 
 Job Wrappers
 

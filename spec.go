@@ -9,6 +9,16 @@ type SpecSchedule struct {
 
 	// Override location for this schedule.
 	Location *time.Location
+
+	// AmbiguousPolicy selects which occurrence(s) of a wall-clock time to
+	// use when clocks are turned back and the time happens twice.
+	// The zero value, AmbiguousDefault, preserves the historical behavior.
+	AmbiguousPolicy AmbiguousTimePolicy
+
+	// NonexistentPolicy selects how to handle a wall-clock time that does
+	// not exist because clocks jumped forward. The zero value,
+	// NonexistentDefault, preserves the historical behavior.
+	NonexistentPolicy NonexistentTimePolicy
 }
 
 // bounds provides a range of acceptable values (plus a map of name to value).
@@ -56,6 +66,12 @@ const (
 // Next returns the next time this schedule is activated, greater than the given
 // time.  If no time can be found to satisfy the schedule, return the zero time.
 func (s *SpecSchedule) Next(t time.Time) time.Time {
+	// Schedules with an explicit DST policy use the policy-aware path;
+	// the default path below is left untouched.
+	if s.AmbiguousPolicy != AmbiguousDefault || s.NonexistentPolicy != NonexistentDefault {
+		return s.nextWithDSTPolicy(t)
+	}
+
 	// General approach
 	//
 	// For Month, Day, Hour, Minute, Second:
