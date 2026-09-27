@@ -43,3 +43,15 @@ func WithLogger(logger Logger) Option {
 		c.logger = logger
 	}
 }
+
+// WithDSTPolicy sets the default policies for handling daylight-saving
+// transitions on every SpecSchedule added to this cron (including schedules
+// using CRON_TZ=/TZ= prefixes). Schedules whose policies were already set
+// explicitly keep their own values. Schedules with fixed-interval semantics,
+// such as those produced by "@every", are unaffected.
+func WithDSTPolicy(repeated RepeatedPolicy, skipped SkippedPolicy) Option {
+	return func(c *Cron) {
+		c.repeatedPolicy = repeated
+		c.skippedPolicy = skipped
+	}
+}

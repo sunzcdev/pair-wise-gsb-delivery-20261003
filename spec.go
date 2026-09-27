@@ -9,6 +9,16 @@ type SpecSchedule struct {
 
 	// Override location for this schedule.
 	Location *time.Location
+
+	// RepeatedPolicy determines how wall-clock times that occur twice
+	// (daylight-saving fall-back) are handled. The zero value preserves
+	// the historical behavior.
+	RepeatedPolicy RepeatedPolicy
+
+	// SkippedPolicy determines how wall-clock times that do not exist
+	// (daylight-saving spring-forward) are handled. The zero value
+	// preserves the historical behavior.
+	SkippedPolicy SkippedPolicy
 }
 
 // bounds provides a range of acceptable values (plus a map of name to value).
@@ -56,6 +66,12 @@ const (
 // Next returns the next time this schedule is activated, greater than the given
 // time.  If no time can be found to satisfy the schedule, return the zero time.
 func (s *SpecSchedule) Next(t time.Time) time.Time {
+	// Schedules with an explicit DST policy use a wall-clock based search
+	// that resolves ambiguous and nonexistent local times deterministically.
+	if s.RepeatedPolicy != RepeatedDefault || s.SkippedPolicy != SkippedDefault {
+		return s.nextPolicy(t)
+	}
+
 	// General approach
 	//
 	// For Month, Day, Hour, Minute, Second:
@@ -172,6 +188,106 @@ WRAP:
 	}
 
 	return t.In(origLocation)
+}
+
+// nextPolicy implements Next for schedules carrying an explicit DST policy.
+// It searches in pure wall-clock space (using UTC as a stand-in so that
+// wall-clock arithmetic is never disturbed by transitions) and resolves each
+// matching wall-clock time into absolute instant(s) according to the
+// configured policies. The result is always strictly after the input.
+func (s *SpecSchedule) nextPolicy(t time.Time) time.Time {
+	origLocation := t.Location()
+	loc := s.Location
+	if loc == time.Local {
+		loc = t.Location()
+	}
+	input := t
+	lt := t.In(loc)
+
+	// Wall-clock cursor, expressed as if its fields were UTC.
+	w := time.Date(lt.Year(), lt.Month(), lt.Day(), lt.Hour(), lt.Minute(), lt.Second(), 0, time.UTC)
+
+	// If the input falls inside a fall-back fold, wall-clock times shortly
+	// before the cursor still have their second occurrence ahead of the
+	// input. Rewind the cursor to the start of the repeated interval so
+	// those occurrences are considered; occurrences not later than the
+	// input are filtered out when resolving.
+	for _, tr := range transitionsNear(input, loc) {
+		if tr.before > tr.after {
+			fold := time.Duration(tr.before-tr.after) * time.Second
+			if input.Before(tr.at.Add(fold)) {
+				repeatStart := tr.at.Add(time.Duration(tr.after) * time.Second)
+				if repeatStart.Before(w) {
+					w = repeatStart
+				}
+			}
+		}
+	}
+
+	// If no time is found within five years, return zero.
+	yearLimit := w.Year() + 5
+
+	for {
+		if w.Year() > yearLimit {
+			return time.Time{}
+		}
+		if 1<<uint(w.Month())&s.Month == 0 {
+			w = time.Date(w.Year(), w.Month(), 1, 0, 0, 0, 0, time.UTC).AddDate(0, 1, 0)
+			continue
+		}
+		if !dayMatches(s, w) {
+			w = time.Date(w.Year(), w.Month(), w.Day(), 0, 0, 0, 0, time.UTC).AddDate(0, 0, 1)
+			continue
+		}
+		if 1<<uint(w.Hour())&s.Hour == 0 {
+			w = time.Date(w.Year(), w.Month(), w.Day(), w.Hour(), 0, 0, 0, time.UTC).Add(time.Hour)
+			continue
+		}
+		if 1<<uint(w.Minute())&s.Minute == 0 {
+			w = w.Truncate(time.Minute).Add(time.Minute)
+			continue
+		}
+		if 1<<uint(w.Second())&s.Second == 0 {
+			w = w.Add(time.Second)
+			continue
+		}
+		if next, ok := s.resolve(w, loc, input); ok {
+			return next.In(origLocation)
+		}
+		// The matching wall-clock time has no usable occurrence (it falls
+		// into a skipped gap, or all of its occurrences are not later than
+		// the input). Advance one second and keep searching.
+		w = w.Add(time.Second)
+	}
+}
+
+// resolve maps a matching wall-clock time to the next absolute activation
+// instant strictly after input, honoring the schedule's DST policies.
+func (s *SpecSchedule) resolve(wall time.Time, loc *time.Location, input time.Time) (time.Time, bool) {
+	occ := occurrences(wall, loc)
+	if len(occ) == 0 {
+		// The wall-clock time does not exist (spring-forward gap).
+		if s.SkippedPolicy == SkippedShift {
+			if end, ok := gapEnd(wall, loc); ok && end.After(input) {
+				return end, true
+			}
+		}
+		return time.Time{}, false
+	}
+	switch s.RepeatedPolicy {
+	case RepeatedFirst:
+		occ = occ[:1]
+	case RepeatedSecond:
+		if len(occ) > 1 {
+			occ = occ[1:]
+		}
+	}
+	for _, o := range occ {
+		if o.After(input) {
+			return o, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // dayMatches returns true if the schedule's day-of-week and day-of-month

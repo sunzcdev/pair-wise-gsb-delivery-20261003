@@ -22,6 +22,10 @@ type Cron struct {
 	runningMu sync.Mutex
 	location  *time.Location
 	parser    ScheduleParser
+
+	repeatedPolicy RepeatedPolicy
+	skippedPolicy  SkippedPolicy
+
 	nextID    EntryID
 	jobWaiter sync.WaitGroup
 }
@@ -161,7 +165,7 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 	c.nextID++
 	entry := &Entry{
 		ID:         c.nextID,
-		Schedule:   schedule,
+		Schedule:   c.applyDSTPolicy(schedule),
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
 	}
@@ -171,6 +175,28 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		c.add <- entry
 	}
 	return entry.ID
+}
+
+// applyDSTPolicy applies the cron-wide DST policies (see WithDSTPolicy) to
+// spec schedules that do not already carry an explicit policy. Other
+// schedule types, e.g. the fixed-interval schedules behind "@every", are
+// returned unchanged.
+func (c *Cron) applyDSTPolicy(schedule Schedule) Schedule {
+	if c.repeatedPolicy == RepeatedDefault && c.skippedPolicy == SkippedDefault {
+		return schedule
+	}
+	spec, ok := schedule.(*SpecSchedule)
+	if !ok {
+		return schedule
+	}
+	adjusted := *spec
+	if adjusted.RepeatedPolicy == RepeatedDefault {
+		adjusted.RepeatedPolicy = c.repeatedPolicy
+	}
+	if adjusted.SkippedPolicy == SkippedDefault {
+		adjusted.SkippedPolicy = c.skippedPolicy
+	}
+	return &adjusted
 }
 
 // Entries returns a snapshot of the cron entries.

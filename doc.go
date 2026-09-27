@@ -166,8 +166,28 @@ For example:
 
 The prefix "TZ=(TIME ZONE)" is also supported for legacy compatibility.
 
-Be aware that jobs scheduled during daylight-savings leap-ahead transitions will
-not be run!
+Daylight-saving transitions
+
+By default, jobs whose wall-clock time is skipped by a daylight-saving
+leap-ahead transition will not be run, and jobs whose wall-clock time occurs
+twice when clocks fall back may run twice.
+
+This behavior can be customized per schedule by setting the RepeatedPolicy
+and SkippedPolicy fields of a SpecSchedule, or for every schedule added to a
+Cron instance with the WithDSTPolicy option:
+
+	c := cron.New(cron.WithDSTPolicy(cron.RepeatedFirst, cron.SkippedShift))
+	c.AddFunc("CRON_TZ=America/New_York 30 2 * * *", ...)
+
+RepeatedPolicy selects which occurrence(s) of a repeated wall-clock time
+activate the job: RepeatedFirst, RepeatedSecond or RepeatedBoth.
+
+SkippedPolicy selects what happens when the wall-clock time does not exist:
+SkippedSkip drops the activation, while SkippedShift moves it to the first
+valid moment after the clock jump ends.
+
+Schedules with fixed-interval semantics ("@every 1h") are not affected by
+these policies; they always fire at exact intervals.
 
 Job Wrappers
 
