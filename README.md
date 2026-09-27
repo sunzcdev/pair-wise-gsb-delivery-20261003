@@ -8,7 +8,7 @@ A Go library and tools to authenticate e-mails.
 
 * [`dkim`]: create and verify [DKIM signatures][DKIM]
 * [`authres`]: create and parse [Authentication-Results header fields][Authentication-Results]
-* [`dmarc`]: fetch [DMARC] records
+* [`dmarc`]: fetch [DMARC] records and evaluate messages against them
 
 ## Tools
 
