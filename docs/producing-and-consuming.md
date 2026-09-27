@@ -237,3 +237,50 @@ membership, your cluster must be at least 2.4.0, and you can use the
 [`InstanceID`][23] option.
 
 [23]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#InstanceID
+
+### Merging partitions by event time
+
+Kafka guarantees ordering only within a single partition. If you want to
+process multiple partitions in event time order without maintaining a
+per-partition heap yourself, [`EventTimeMerger`][24] provides an optional
+read view on top of your normal poll loop: you feed it fetches, and it
+returns records merged by watermark.
+
+```go
+merger := kgo.NewEventTimeMerger(
+    kgo.EventTimeAllowedLateness(5*time.Second), // out-of-orderness bound
+    kgo.EventTimeIdleTimeout(30*time.Second),    // silent partitions stop blocking
+    kgo.EventTimeMaxBuffered(10_000),            // memory cap
+)
+for {
+    fetches := cl.PollFetches(ctx)
+    out := merger.Add(fetches)
+    for _, r := range out.Records { /* in watermark order */ }
+    for _, r := range out.Late { /* past the watermark: side output */ }
+}
+```
+
+The semantics, precisely:
+
+- Each partition's watermark is its maximum observed event time minus the
+  allowed lateness; the global watermark is the minimum over contributing
+  partitions. A buffered record is emitted once the global watermark
+  reaches its event time.
+- A record arriving behind the current watermark is returned in
+  `EventTimeOutput.Late` instead of being merged; it is never dropped
+  silently. A partition's first observed record is exempt, so a newly
+  assigned partition's backlog is not judged late.
+- A partition with no records for the idle timeout stops contributing to
+  the watermark (call `Tick` when polls are empty to notice this); it
+  rejoins when it produces again.
+- Revoked partitions (call `Revoke` from your `OnPartitionsRevoked`) flush
+  their buffered records with reason `EventTimeRevoked`; `Drain` flushes
+  everything on shutdown.
+- Emitted records keep their original topic, partition, and offset, so
+  offset commits are unaffected.
+
+This is a best-effort merge, not global ordering: records forced out by
+the buffer cap, revocation, or draining can be emitted ahead of the
+watermark, and late records bypass the ordered stream entirely.
+
+[24]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#EventTimeMerger
