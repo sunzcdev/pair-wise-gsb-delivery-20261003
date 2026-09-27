@@ -269,6 +269,13 @@ type GRPCBroker struct {
 	clientStreams map[uint32]*gRPCBrokerPending
 	serverStreams map[uint32]*gRPCBrokerPending
 
+	// leases tracks active leased endpoints by ID, and revokedLeases
+	// records recently revoked lease IDs (with the time of revocation) so
+	// that late knocks for them can be refused deterministically instead of
+	// being routed to a new pending stream.
+	leases        map[uint32]*BrokerLease
+	revokedLeases map[uint32]time.Time
+
 	unixSocketCfg  UnixSocketConfig
 	addrTranslator runner.AddrTranslator
 
@@ -293,6 +300,8 @@ func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, 
 
 		clientStreams: make(map[uint32]*gRPCBrokerPending),
 		serverStreams: make(map[uint32]*gRPCBrokerPending),
+		leases:        make(map[uint32]*BrokerLease),
+		revokedLeases: make(map[uint32]time.Time),
 		muxer:         muxer,
 
 		unixSocketCfg:  unixSocketCfg,
@@ -423,6 +432,18 @@ func (b *GRPCBroker) Close() error {
 	b.o.Do(func() {
 		close(b.doneCh)
 	})
+
+	// Reclaim any leased endpoints that are still active.
+	b.Lock()
+	leases := make([]*BrokerLease, 0, len(b.leases))
+	for _, l := range b.leases {
+		leases = append(leases, l)
+	}
+	b.Unlock()
+	for _, l := range leases {
+		_ = l.Revoke()
+	}
+
 	return nil
 }
 
@@ -439,6 +460,13 @@ func (b *GRPCBroker) listenForKnocks(id uint32) error {
 			// Also shouldn't be possible.
 			if msg.Knock == nil || !msg.Knock.Knock || msg.Knock.Ack {
 				return fmt.Errorf("knock received for service ID %d with incorrect values; knock=%+v", id, msg.Knock)
+			}
+
+			// If the endpoint was a lease that has since been revoked,
+			// refuse the knock deterministically so the dialer fails fast
+			// instead of dialling a stale endpoint.
+			if b.isLeaseRevoked(id) {
+				return b.refuseKnock(id)
 			}
 
 			// Successful knock, open the door for the given ID.
@@ -462,6 +490,49 @@ func (b *GRPCBroker) listenForKnocks(id uint32) error {
 			}
 		case <-p.doneCh:
 			return nil
+		}
+	}
+}
+
+// refuseKnock sends a negative acknowledgement for a knock that arrived for
+// a revoked leased endpoint.
+func (b *GRPCBroker) refuseKnock(id uint32) error {
+	err := b.streamer.Send(&plugin.ConnInfo{
+		ServiceId: id,
+		Knock: &plugin.ConnInfo_Knock{
+			Knock: true,
+			Ack:   true,
+			Error: fmt.Sprintf("broker endpoint %d is no longer leased", id),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("error sending knock refusal: %w", err)
+	}
+	return nil
+}
+
+// isLeaseRevoked reports whether the given ID belongs to a leased endpoint
+// that has been revoked or expired.
+func (m *GRPCBroker) isLeaseRevoked(id uint32) bool {
+	m.Lock()
+	defer m.Unlock()
+	_, ok := m.revokedLeases[id]
+	return ok
+}
+
+// revokeLease removes the lease from the active set and records a tombstone
+// so late knocks for its ID are refused. Tombstones are swept once they are
+// old enough that no in-flight knock could still reference them.
+func (m *GRPCBroker) revokeLease(id uint32) {
+	m.Lock()
+	defer m.Unlock()
+
+	delete(m.leases, id)
+	m.revokedLeases[id] = time.Now()
+
+	for tombstone, revokedAt := range m.revokedLeases {
+		if time.Since(revokedAt) > time.Minute {
+			delete(m.revokedLeases, tombstone)
 		}
 	}
 }
@@ -587,6 +658,16 @@ func (m *GRPCBroker) Run() {
 		// Initialize the waiter
 		var p *gRPCBrokerPending
 		if msg.Knock != nil && msg.Knock.Knock && !msg.Knock.Ack {
+			if m.isLeaseRevoked(msg.ServiceId) {
+				// The endpoint was a lease that has been revoked. Refuse
+				// the knock deterministically so the dialer fails fast
+				// rather than waiting for a timeout, and so the stale ID
+				// can never be matched to a different endpoint.
+				if err := m.refuseKnock(msg.ServiceId); err != nil {
+					log.Printf("[ERR] plugin: error refusing knock for revoked lease %d: %s", msg.ServiceId, err)
+				}
+				continue
+			}
 			p = m.getServerStream(msg.ServiceId)
 			// The server side doesn't close the channel immediately as it needs
 			// to continuously listen for knocks.

@@ -1,5 +1,8 @@
 ## Unreleased
 
+ENHANCEMENTS:
+* broker: Added leased gRPC broker endpoints (`LeaseEndpoint`, `LeaseAcceptAndServe`). Leases bind an endpoint's lifetime to a request context and TTL, support explicit renewal (`Extend`) and revocation (`Revoke`), and guarantee that a late dial for a reclaimed endpoint fails deterministically instead of reaching another service through a reused ID.
+
 SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 
