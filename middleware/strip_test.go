@@ -327,3 +327,52 @@ func TestRedirectSlashes_PreventBackslashRelativeOpenRedirect(t *testing.T) {
 		})
 	}
 }
+
+func TestStripSlashesEscapedStrategy(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(StripSlashes)
+	r.SetPathStrategy(chi.PathStrategyEscaped)
+
+	r.Get("/objects/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(chi.URLParam(r, "key")))
+	})
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	// The trailing literal slash is stripped; the %2F inside the {key}
+	// segment is preserved.
+	if _, resp := testRequest(t, ts, "GET", "/objects/a%2Fb/", nil); resp != "a/b" {
+		t.Fatal(resp)
+	}
+	if _, resp := testRequest(t, ts, "GET", "/objects/a%2Fb", nil); resp != "a/b" {
+		t.Fatal(resp)
+	}
+}
+
+func TestRedirectSlashesEscapedStrategy(t *testing.T) {
+	r := chi.NewRouter()
+	r.Use(RedirectSlashes)
+	r.SetPathStrategy(chi.PathStrategyEscaped)
+
+	r.Get("/objects/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(chi.URLParam(r, "key")))
+	})
+
+	ts := httptest.NewServer(r)
+	defer ts.Close()
+
+	// The redirect Location keeps the escaped %2F so the redirected request
+	// still routes to the same {key} value.
+	resp, _ := testRequestNoRedirect(t, ts, "GET", "/objects/a%2Fb/", nil)
+	if resp.StatusCode != http.StatusMovedPermanently {
+		t.Fatalf("expected 301, got %d", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/objects/a%2Fb" {
+		t.Fatalf("expected Location %q, got %q", "/objects/a%2Fb", loc)
+	}
+
+	if _, resp := testRequest(t, ts, "GET", "/objects/a%2Fb/", nil); resp != "a/b" {
+		t.Fatal(resp)
+	}
+}

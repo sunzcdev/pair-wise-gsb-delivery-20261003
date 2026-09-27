@@ -7,6 +7,7 @@ package chi
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"reflect"
 	"regexp"
 	"slices"
@@ -455,7 +456,17 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 				}
 
 				if ntyp == ntRegexp && xn.rex != nil {
-					if !xn.rex.MatchString(xsearch[:p]) {
+					segment := xsearch[:p]
+					if rctx.pathStrategy == PathStrategyEscaped {
+						// Match the regexp against the decoded segment, so
+						// patterns are written in the same decoded form as
+						// the values they capture. Segments that fail to
+						// decode are matched as captured.
+						if decoded, err := url.PathUnescape(segment); err == nil {
+							segment = decoded
+						}
+					}
+					if !xn.rex.MatchString(segment) {
 						continue
 					}
 				} else if strings.IndexByte(xsearch[:p], '/') != -1 {

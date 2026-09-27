@@ -10,6 +10,38 @@ import (
 
 var _ Router = &Mux{}
 
+// PathStrategy determines how a Mux derives the routing path from a request
+// URL, and how URL parameter values are exposed.
+type PathStrategy int
+
+const (
+	// PathStrategyDefault is the historical chi behavior: the routing path is
+	// r.URL.RawPath when it is set, otherwise r.URL.Path, and URL parameter
+	// values are returned exactly as captured from that path, without any
+	// percent-decoding.
+	PathStrategyDefault PathStrategy = iota
+
+	// PathStrategyEscaped routes on r.URL.EscapedPath(), so the escaped form
+	// of the request path defines the segment boundaries. In particular, an
+	// encoded slash (%2F) remains inside a single path segment, allowing a
+	// {param} placeholder to capture a value that contains a slash.
+	//
+	// Under this strategy:
+	//   - static pattern segments are matched byte-wise against the escaped
+	//     path, so write them in their escaped (URL-safe) form,
+	//   - {param} and * wildcard values are captured raw and percent-decoded
+	//     once when read via Context.URLParam / chi.URLParam,
+	//   - {param:regexp} expressions are matched against the decoded segment,
+	//   - Context.URLParamRaw / chi.URLParamRaw return the raw captured
+	//     (still escaped) value,
+	//   - mounted sub-routers inherit the strategy, and the escaped path is
+	//     forwarded across Mount boundaries without splitting %2F segments.
+	//
+	// If r.URL.RawPath is invalid, r.URL.EscapedPath() falls back to
+	// re-escaping r.URL.Path, so such requests route on the decoded path.
+	PathStrategyEscaped
+)
+
 // Mux is a simple HTTP route multiplexer that parses a request path,
 // records any URL params, and executes an end handler. It implements
 // the http.Handler interface and is friendly with the standard library.
@@ -45,6 +77,10 @@ type Mux struct {
 	// Controls the behaviour of middleware chain generation when a mux
 	// is registered as an inline group inside another mux.
 	inline bool
+
+	// pathStrategy controls how the routing path is derived from the request
+	// URL. See SetPathStrategy.
+	pathStrategy PathStrategy
 }
 
 // NewMux returns a newly initialized Mux object that implements the Router
@@ -55,6 +91,22 @@ func NewMux() *Mux {
 		return NewRouteContext()
 	}
 	return mux
+}
+
+// SetPathStrategy sets the strategy used to derive the routing path from a
+// request URL. The default is PathStrategyDefault. It must be called before
+// the mux starts serving requests.
+//
+// The strategy is a root-router setting: it is stored on the routing context
+// of each request and governs the whole request lifecycle, including any
+// mounted sub-routers. SetPathStrategy also propagates to sub-routers that
+// are already mounted, and Mount() propagates the current strategy to
+// newly mounted chi routers, so a mounted tree stays consistent.
+func (mx *Mux) SetPathStrategy(strategy PathStrategy) {
+	mx.pathStrategy = strategy
+	mx.updateSubRoutes(func(subMux *Mux) {
+		subMux.SetPathStrategy(strategy)
+	})
 }
 
 // ServeHTTP is the single method of the http.Handler interface that makes
@@ -82,6 +134,7 @@ func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rctx.Reset()
 	rctx.Routes = mx
 	rctx.parentCtx = r.Context()
+	rctx.pathStrategy = mx.pathStrategy
 
 	// NOTE: r.WithContext() causes 2 allocations and context.WithValue() causes 1 allocation
 	r = r.WithContext(context.WithValue(r.Context(), RouteCtxKey, rctx))
@@ -257,6 +310,7 @@ func (mx *Mux) With(middlewares ...func(http.Handler) http.Handler) Router {
 	im := &Mux{
 		pool: mx.pool, inline: true, parent: mx, tree: mx.tree, middlewares: mws,
 		notFoundHandler: mx.notFoundHandler, methodNotAllowedHandler: mx.methodNotAllowedHandler,
+		pathStrategy: mx.pathStrategy,
 	}
 
 	return im
@@ -318,6 +372,9 @@ func (mx *Mux) Mount(pattern string, handler http.Handler) {
 	}
 	if ok && subr.methodNotAllowedHandler == nil && mx.methodNotAllowedHandler != nil {
 		subr.MethodNotAllowed(mx.methodNotAllowedHandler)
+	}
+	if ok && subr.pathStrategy != mx.pathStrategy {
+		subr.SetPathStrategy(mx.pathStrategy)
 	}
 
 	mountHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +441,8 @@ func (mx *Mux) Find(rctx *Context, method, path string) string {
 	if !ok {
 		return ""
 	}
+
+	rctx.pathStrategy = mx.pathStrategy
 
 	node, _, _ := mx.tree.FindRoute(rctx, m, path)
 	pattern := rctx.routePattern
@@ -459,7 +518,9 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The request routing path
 	routePath := rctx.RoutePath
 	if routePath == "" {
-		if r.URL.RawPath != "" {
+		if rctx.pathStrategy == PathStrategyEscaped {
+			routePath = r.URL.EscapedPath()
+		} else if r.URL.RawPath != "" {
 			routePath = r.URL.RawPath
 		} else {
 			routePath = r.URL.Path
@@ -483,7 +544,7 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	if _, _, h := mx.tree.FindRoute(rctx, method, routePath); h != nil {
 		// Set http.Request path values from our request context
 		for i, key := range rctx.URLParams.Keys {
-			value := rctx.URLParams.Values[i]
+			value := rctx.decodeURLParam(rctx.URLParams.Values[i])
 			r.SetPathValue(key, value)
 		}
 		r.Pattern = rctx.RoutePattern()

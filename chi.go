@@ -54,6 +54,16 @@
 //	"/page/*" matches "/page/intro/latest"
 //	"/page/{other}/latest" also matches "/page/intro/latest"
 //	"/date/{yyyy:\\d\\d\\d\\d}/{mm:\\d\\d}/{dd:\\d\\d}" matches "/date/2017/04/01"
+//
+// # Path strategies
+//
+// By default, a Mux routes on r.URL.RawPath when it is set, otherwise on
+// r.URL.Path, and URL parameter values are returned exactly as captured.
+// Calling [Mux.SetPathStrategy] with [PathStrategyEscaped] opts into routing
+// on r.URL.EscapedPath(), so an encoded slash (%2F) stays inside a single
+// path segment and a {param} placeholder can capture a value containing a
+// slash. Under that strategy, [URLParam] returns the percent-decoded value
+// and [URLParamRaw] returns the value as captured.
 package chi
 
 import "net/http"

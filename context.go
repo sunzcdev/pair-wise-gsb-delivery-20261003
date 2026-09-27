@@ -3,13 +3,27 @@ package chi
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 )
 
 // URLParam returns the url parameter from a http.Request object.
+//
+// When the router uses PathStrategyEscaped, the returned value is
+// percent-decoded; use URLParamRaw to get the value as captured.
 func URLParam(r *http.Request, key string) string {
 	return URLParamFromCtx(r.Context(), key)
+}
+
+// URLParamRaw returns the url parameter from a http.Request object exactly
+// as captured from the routing path, without percent-decoding. It differs
+// from URLParam only when the router uses PathStrategyEscaped.
+func URLParamRaw(r *http.Request, key string) string {
+	if rctx := RouteContext(r.Context()); rctx != nil {
+		return rctx.URLParamRaw(key)
+	}
+	return ""
 }
 
 // URLParamFromCtx returns the url parameter from a http.Request Context.
@@ -76,6 +90,10 @@ type Context struct {
 
 	methodsAllowed   []methodTyp // allowed methods in case of a 405
 	methodNotAllowed bool
+
+	// pathStrategy is the path strategy in effect for the request, copied
+	// from the root Mux. See Mux.SetPathStrategy.
+	pathStrategy PathStrategy
 }
 
 // Reset a routing context to its initial state.
@@ -93,6 +111,7 @@ func (x *Context) Reset() {
 	x.methodNotAllowed = false
 	x.methodsAllowed = x.methodsAllowed[:0]
 	x.parentCtx = nil
+	x.pathStrategy = PathStrategyDefault
 }
 
 // Clone a routing context so that it may be used outside of the request/response
@@ -121,13 +140,52 @@ func (x *Context) Clone() *Context {
 
 // URLParam returns the corresponding URL parameter value from the request
 // routing context.
+//
+// When the router uses PathStrategyEscaped, the captured value is
+// percent-decoded once before it is returned (e.g. a {key} param captured
+// from "/objects/a%2Fb" is returned as "a/b"). Use URLParamRaw for the
+// undecoded value.
 func (x *Context) URLParam(key string) string {
+	for i, k := range slices.Backward(x.URLParams.Keys) {
+		if k == key {
+			return x.decodeURLParam(x.URLParams.Values[i])
+		}
+	}
+	return ""
+}
+
+// URLParamRaw returns the corresponding URL parameter value from the request
+// routing context exactly as captured from the routing path, without
+// percent-decoding. It differs from URLParam only when the router uses
+// PathStrategyEscaped.
+func (x *Context) URLParamRaw(key string) string {
 	for i, k := range slices.Backward(x.URLParams.Keys) {
 		if k == key {
 			return x.URLParams.Values[i]
 		}
 	}
 	return ""
+}
+
+// PathStrategy returns the path strategy in effect for the routing context.
+func (x *Context) PathStrategy() PathStrategy {
+	if x == nil {
+		return PathStrategyDefault
+	}
+	return x.pathStrategy
+}
+
+// decodeURLParam percent-decodes a captured URL parameter value when the
+// escaped path strategy is in effect. Values that fail to decode are
+// returned as captured.
+func (x *Context) decodeURLParam(value string) string {
+	if x.pathStrategy != PathStrategyEscaped {
+		return value
+	}
+	if decoded, err := url.PathUnescape(value); err == nil {
+		return decoded
+	}
+	return value
 }
 
 // RoutePattern builds the routing pattern string for the particular

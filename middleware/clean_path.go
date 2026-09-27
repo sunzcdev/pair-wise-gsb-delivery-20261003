@@ -15,7 +15,9 @@ func CleanPath(next http.Handler) http.Handler {
 
 		routePath := rctx.RoutePath
 		if routePath == "" {
-			if r.URL.RawPath != "" {
+			if rctx.PathStrategy() == chi.PathStrategyEscaped {
+				routePath = r.URL.EscapedPath()
+			} else if r.URL.RawPath != "" {
 				routePath = r.URL.RawPath
 			} else {
 				routePath = r.URL.Path

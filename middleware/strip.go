@@ -17,6 +17,8 @@ func StripSlashes(next http.Handler) http.Handler {
 		rctx := chi.RouteContext(r.Context())
 		if rctx != nil && rctx.RoutePath != "" {
 			path = rctx.RoutePath
+		} else if rctx != nil && rctx.PathStrategy() == chi.PathStrategyEscaped {
+			path = r.URL.EscapedPath()
 		} else {
 			path = r.URL.Path
 		}
@@ -44,6 +46,8 @@ func RedirectSlashes(next http.Handler) http.Handler {
 		rctx := chi.RouteContext(r.Context())
 		if rctx != nil && rctx.RoutePath != "" {
 			path = rctx.RoutePath
+		} else if rctx != nil && rctx.PathStrategy() == chi.PathStrategyEscaped {
+			path = r.URL.EscapedPath()
 		} else {
 			path = r.URL.Path
 		}
