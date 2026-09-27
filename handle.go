@@ -226,6 +226,9 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 	sf.goFunc(func() {
 		// read from client and write to remote server
 		conns := sync.Map{}
+		// reassembly state of fragmented UDP request datagrams (RFC 1928,
+		// section 7); it belongs to this association and is dropped with it
+		frags := newFragmentReassembler()
 		bufPool := sf.bufferPool.Get()
 		defer func() {
 			sf.bufferPool.Put(bufPool)
@@ -256,6 +259,15 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 			srcEqual := ((request.DestAddr.IP.IsUnspecified()) || request.DestAddr.IP.Equal(srcAddr.IP)) && (request.DestAddr.Port == 0 || request.DestAddr.Port == srcAddr.Port) //nolint:lll
 			if !srcEqual {
 				continue
+			}
+
+			if pk.Frag != 0 {
+				data, ok := frags.process(srcAddr.String(), pk.DstAddr.String(), pk.Frag, pk.Data)
+				if !ok {
+					continue
+				}
+				pk.Data = data
+				pk.Frag = 0
 			}
 
 			connKey := srcAddr.String() + "--" + pk.DstAddr.String()
