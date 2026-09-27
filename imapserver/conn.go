@@ -36,6 +36,7 @@ var internalServerErrorResp = &imap.StatusResponse{
 // A Conn represents an IMAP connection to the server.
 type Conn struct {
 	server   *Server
+	rw       io.ReadWriter
 	br       *bufio.Reader
 	bw       *bufio.Writer
 	encMutex sync.Mutex
@@ -44,8 +45,9 @@ type Conn struct {
 	conn    net.Conn
 	enabled imap.CapSet
 
-	state   imap.ConnState
-	session Session
+	state      imap.ConnState
+	session    Session
+	compressed bool
 }
 
 func newConn(c net.Conn, server *Server) *Conn {
@@ -55,6 +57,7 @@ func newConn(c net.Conn, server *Server) *Conn {
 	return &Conn{
 		conn:    c,
 		server:  server,
+		rw:      rw,
 		br:      br,
 		bw:      bw,
 		enabled: make(imap.CapSet),
@@ -226,6 +229,9 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleCapability(dec)
 	case "STARTTLS":
 		err = c.handleStartTLS(tag, dec)
+		sendOK = false
+	case "COMPRESS":
+		err = c.handleCompress(tag, dec)
 		sendOK = false
 	case "AUTHENTICATE":
 		err = c.handleAuthenticate(tag, dec)

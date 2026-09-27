@@ -49,6 +49,12 @@ type Options struct {
 	// InsecureAuth allows clients to authenticate without TLS. In this mode,
 	// the server is susceptible to man-in-the-middle attacks.
 	InsecureAuth bool
+	// CompressMaxDecompressedBytes is the maximum total number of bytes the
+	// DEFLATE decompressor may produce on a connection after COMPRESS=DEFLATE
+	// has been negotiated. It guards against decompression bombs: once the
+	// limit is exceeded, the connection is terminated. If zero, a default
+	// limit of 1 GiB is applied. If negative, decompression is unlimited.
+	CompressMaxDecompressedBytes int64
 	// Raw ingress and egress data will be written to this writer, if any.
 	// Note, this may include sensitive information such as credentials used
 	// during authentication.

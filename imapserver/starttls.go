@@ -12,7 +12,9 @@ import (
 
 func (c *Conn) canStartTLS() bool {
 	_, isTLS := c.conn.(*tls.Conn)
-	return c.server.options.TLSConfig != nil && c.state == imap.ConnStateNotAuthenticated && !isTLS
+	// RFC 4978 section 3: TLS must be negotiated before compression, so
+	// STARTTLS is not allowed once COMPRESS=DEFLATE is active.
+	return c.server.options.TLSConfig != nil && c.state == imap.ConnStateNotAuthenticated && !isTLS && !c.compressed
 }
 
 func (c *Conn) handleStartTLS(tag string, dec *imapwire.Decoder) error {
@@ -67,6 +69,7 @@ func (c *Conn) handleStartTLS(tag string, dec *imapwire.Decoder) error {
 	c.mutex.Unlock()
 
 	rw := c.server.options.wrapReadWriter(tlsConn)
+	c.rw = rw
 	c.br.Reset(rw)
 	c.bw.Reset(rw)
 

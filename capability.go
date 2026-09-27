@@ -26,6 +26,7 @@ const (
 	CapSearchRes    Cap = "SEARCHRES"     // RFC 5182
 	CapEnable       Cap = "ENABLE"        // RFC 5161
 	CapIdle         Cap = "IDLE"          // RFC 2177
+	CapCompressDeflate Cap = "COMPRESS=DEFLATE" // RFC 4978
 	CapSASLIR       Cap = "SASL-IR"       // RFC 4959
 	CapListExtended Cap = "LIST-EXTENDED" // RFC 5258
 	CapListStatus   Cap = "LIST-STATUS"   // RFC 5819
