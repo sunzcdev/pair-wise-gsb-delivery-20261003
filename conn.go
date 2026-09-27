@@ -44,6 +44,10 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// Per-transaction message size limit provided by the backend session
+	// (SizeLimitSession), zero if the backend does not impose one.
+	sessionSizeLimit int64
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -206,6 +210,18 @@ func (c *Conn) authAllowed() bool {
 	return isTLS || c.server.AllowInsecureAuth
 }
 
+// maxMessageBytes returns the effective message size limit for the current
+// transaction, that is the stricter one of the server-wide limit
+// (Server.MaxMessageBytes) and the limit provided by the backend session
+// (SizeLimitSession), if any. Zero means no limit.
+func (c *Conn) maxMessageBytes() int64 {
+	limit := c.server.MaxMessageBytes
+	if c.sessionSizeLimit > 0 && (limit <= 0 || c.sessionSizeLimit < limit) {
+		limit = c.sessionSizeLimit
+	}
+	return limit
+}
+
 // protocolError writes errors responses and closes the connection once too many
 // have occurred.
 func (c *Conn) protocolError(code int, ec EnhancedCode, msg string) {
@@ -325,6 +341,14 @@ func (c *Conn) handleMail(arg string) {
 		return
 	}
 
+	// MAIL starts a new transaction: discard the byte count accumulated
+	// for the previous one and ask the backend for its own size limit.
+	c.bytesReceived = 0
+	c.sessionSizeLimit = 0
+	if sess, ok := c.Session().(SizeLimitSession); ok {
+		c.sessionSizeLimit = sess.SizeLimit()
+	}
+
 	arg, ok := cutPrefixFold(arg, "FROM:")
 	if !ok {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting MAIL arg syntax of FROM:<address>")
@@ -357,7 +381,7 @@ func (c *Conn) handleMail(arg string) {
 				return
 			}
 
-			if c.server.MaxMessageBytes > 0 && int64(size) > c.server.MaxMessageBytes {
+			if max := c.maxMessageBytes(); max > 0 && int64(size) > max {
 				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 				return
 			}
@@ -1022,7 +1046,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
+	if max := c.maxMessageBytes(); max != 0 && c.bytesReceived+int64(size) > max {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
@@ -1342,6 +1366,7 @@ func (c *Conn) reset() {
 	}
 	c.bdatStatus = nil
 	c.bytesReceived = 0
+	c.sessionSizeLimit = 0
 
 	// BDAT disables the line limit while reading a chunk, the transaction is over now.
 	c.lineLimitReader.LineLimit = c.server.MaxLineLength

@@ -51,6 +51,11 @@ type backend struct {
 
 	panicOnMail bool
 	userErr     error
+
+	// Per-session size limit returned by SizeLimit and the number of
+	// times the backend was asked for it.
+	sizeLimit      int64
+	sizeLimitCalls int
 }
 
 func (be *backend) NewSession(_ *smtp.Conn) (smtp.Session, error) {
@@ -122,6 +127,11 @@ func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	s.msg.To = append(s.msg.To, to)
 	s.msg.RcptOpts = append(s.msg.RcptOpts, opts)
 	return nil
+}
+
+func (s *session) SizeLimit() int64 {
+	s.backend.sizeLimitCalls++
+	return s.backend.sizeLimit
 }
 
 func (s *session) Data(r io.Reader) error {
@@ -1794,5 +1804,186 @@ func TestServerMTPRIORITY(t *testing.T) {
 	}
 	if *opts.MTPriority != expectedPriority {
 		t.Fatalf("MTPriority: want %d, got %d", expectedPriority, *opts.MTPriority)
+	}
+}
+
+func TestServerSizeLimitSession_Mail(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	// The backend limit is stricter than the server-wide one.
+	s.MaxMessageBytes = 200
+	be.sizeLimit = 100
+
+	// A declared SIZE exceeding the backend limit is rejected at MAIL time.
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=101\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "552 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+
+	// A declared SIZE within the backend limit is accepted.
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=100\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+
+	if be.sizeLimitCalls != 2 {
+		t.Fatal("Backend SizeLimit was not called once per MAIL:", be.sizeLimitCalls)
+	}
+}
+
+func TestServerSizeLimitSession_StricterOfTwo(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	// The server-wide limit is stricter than the backend one.
+	s.MaxMessageBytes = 50
+	be.sizeLimit = 100
+
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=75\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "552 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=50\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+}
+
+func TestServerSizeLimitSession_Data(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	be.sizeLimit = 10
+
+	// SIZE is declared smaller than the actual message contents, the
+	// accumulated body is what counts.
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=5\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+	io.WriteString(c, "RCPT TO:<bob@example.com>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid RCPT response:", res)
+	}
+	io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("Invalid DATA response:", res)
+	}
+	io.WriteString(c, "This is way more than ten bytes.\r\n.\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "552 ") {
+		t.Fatal("Invalid DATA response:", res)
+	}
+
+	// The oversized transaction must not be committed.
+	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+		t.Fatal("Oversized message was committed:", be.messages, be.anonmsgs)
+	}
+
+	// The connection recovers at the protocol boundary: RSET and the next
+	// MAIL start from a clean slate.
+	io.WriteString(c, "RSET\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid RSET response:", res)
+	}
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid MAIL response:", res)
+	}
+	io.WriteString(c, "RCPT TO:<bob@example.com>\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid RCPT response:", res)
+	}
+	io.WriteString(c, "DATA\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("Invalid DATA response:", res)
+	}
+	io.WriteString(c, "tiny\r\n.\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid DATA response:", res)
+	}
+
+	if len(be.messages) != 1 {
+		t.Fatal("Invalid number of sent messages:", be.messages)
+	}
+	if string(be.messages[0].Data) != "tiny\r\n" {
+		t.Fatal("Invalid message data:", be.messages[0].Data)
+	}
+}
+
+func TestServerSizeLimitSession_Bdat(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	be.sizeLimit = 16
+
+	mailAndRcpt := func() {
+		t.Helper()
+		io.WriteString(c, "MAIL FROM:<alice@wonderland.book>\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Fatal("Invalid MAIL response:", res)
+		}
+		io.WriteString(c, "RCPT TO:<bob@example.com>\r\n")
+		if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+			t.Fatal("Invalid RCPT response:", res)
+		}
+	}
+
+	// The first chunk fits into the limit.
+	mailAndRcpt()
+	io.WriteString(c, "BDAT 10\r\n")
+	io.WriteString(c, "0123456789")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid BDAT response:", res)
+	}
+
+	// RSET clears the accumulated byte count.
+	io.WriteString(c, "RSET\r\n")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid RSET response:", res)
+	}
+
+	// The same chunk fits again after RSET, but the accumulated total of
+	// multiple chunks exceeds the limit and the transaction is aborted.
+	mailAndRcpt()
+	io.WriteString(c, "BDAT 10\r\n")
+	io.WriteString(c, "0123456789")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid BDAT response:", res)
+	}
+	io.WriteString(c, "BDAT 10\r\n")
+	io.WriteString(c, "0123456789")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "552 ") {
+		t.Fatal("Invalid BDAT response:", res)
+	}
+
+	// The oversized transaction must not be committed.
+	if len(be.messages) != 0 || len(be.anonmsgs) != 0 {
+		t.Fatal("Oversized message was committed:", be.messages, be.anonmsgs)
+	}
+
+	// The next MAIL starts from a clean slate and a message within the
+	// limit is accepted on the same connection.
+	mailAndRcpt()
+	io.WriteString(c, "BDAT 16 LAST\r\n")
+	io.WriteString(c, "0123456789abcdef")
+	if res := readReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Invalid BDAT response:", res)
+	}
+
+	if len(be.messages) != 1 {
+		t.Fatal("Invalid number of sent messages:", be.messages)
+	}
+	if string(be.messages[0].Data) != "0123456789abcdef" {
+		t.Fatal("Invalid message data:", be.messages[0].Data)
+	}
+
+	if be.sizeLimitCalls != 3 {
+		t.Fatal("Backend SizeLimit was not called once per MAIL:", be.sizeLimitCalls)
 	}
 }

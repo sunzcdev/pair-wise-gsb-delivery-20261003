@@ -100,3 +100,19 @@ type AuthSession interface {
 	AuthMechanisms() []string
 	Auth(mech string) (sasl.Server, error)
 }
+
+// SizeLimitSession is an add-on interface for Session. It can be implemented
+// by the backend to enforce a per-session message size limit, for example
+// a limit specific to the tenant the session belongs to.
+type SizeLimitSession interface {
+	Session
+
+	// SizeLimit returns the maximum message size in bytes the backend is
+	// willing to accept for the current transaction. It is called while
+	// handling the MAIL command.
+	//
+	// The effective limit is the stricter one of the value returned here
+	// and Server.MaxMessageBytes. A non-positive value means the backend
+	// does not impose any additional limit.
+	SizeLimit() int64
+}
