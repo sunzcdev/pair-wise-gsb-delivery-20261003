@@ -700,3 +700,102 @@ func stop(cron *Cron) chan bool {
 func newWithSeconds() *Cron {
 	return New(WithParser(secondParser), WithChain())
 }
+
+// A merged pending run executes within the in-flight job goroutine, so Stop
+// waits for it, and no run is started after the scheduler has stopped.
+func TestMergeIfStillRunningStop(t *testing.T) {
+	j := newBlockingJob()
+	cron := New(WithParser(secondParser),
+		WithChain(MergeIfStillRunning(DiscardLogger)))
+	if _, err := cron.AddJob("* * * * * ?", j); err != nil {
+		t.Fatal(err)
+	}
+	cron.Start()
+
+	// The first trigger starts a run that blocks.
+	select {
+	case <-j.started:
+	case <-time.After(OneSecond):
+		t.Fatal("expected job to start")
+	}
+
+	// The next tick fires while the first run is blocked and is merged into
+	// a single pending run.
+	time.Sleep(OneSecond)
+
+	// Stop the scheduler with a run in flight and a pending merged run.
+	ctx := cron.Stop()
+
+	// Release the first run; the merged pending run must start immediately.
+	j.release <- struct{}{}
+	select {
+	case <-j.started:
+	case <-time.After(OneSecond):
+		t.Fatal("expected merged pending run to start after first run finished")
+	}
+
+	// Stop must wait for the merged pending run to complete.
+	j.release <- struct{}{}
+	select {
+	case <-ctx.Done():
+	case <-time.After(OneSecond):
+		t.Fatal("expected Stop to complete once the merged pending run finished")
+	}
+	if c := j.Runs(); c != 2 {
+		t.Errorf("expected 2 runs (initial + merged pending), got %d", c)
+	}
+
+	// No further run starts after the scheduler has stopped.
+	select {
+	case <-j.started:
+		t.Error("expected no run to start after stop")
+	case <-time.After(OneSecond):
+	}
+	if c := j.Runs(); c != 2 {
+		t.Errorf("expected no additional runs after stop, got %d", c)
+	}
+}
+
+// Remove prevents future triggers but does not cancel a pending run that was
+// already merged into the in-flight invocation: it executes exactly once.
+func TestMergeIfStillRunningRemove(t *testing.T) {
+	j := newBlockingJob()
+	cron := New(WithParser(secondParser),
+		WithChain(MergeIfStillRunning(DiscardLogger)))
+	id, err := cron.AddJob("* * * * * ?", j)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cron.Start()
+	defer cron.Stop()
+
+	// The first trigger starts a run that blocks.
+	select {
+	case <-j.started:
+	case <-time.After(OneSecond):
+		t.Fatal("expected job to start")
+	}
+
+	// The next tick is merged into a pending run; then remove the entry.
+	time.Sleep(OneSecond)
+	cron.Remove(id)
+
+	// The merged pending run still executes exactly once.
+	j.release <- struct{}{}
+	select {
+	case <-j.started:
+	case <-time.After(OneSecond):
+		t.Fatal("expected merged pending run to execute after Remove")
+	}
+	j.release <- struct{}{}
+
+	// No further triggers fire after the entry is removed.
+	select {
+	case <-j.started:
+		t.Error("expected no runs after entry removed")
+	case <-time.After(2 * OneSecond):
+	}
+	if c := j.Runs(); c != 2 {
+		t.Errorf("expected exactly 2 runs, got %d", c)
+	}
+}

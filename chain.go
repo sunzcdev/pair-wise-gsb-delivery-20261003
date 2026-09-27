@@ -10,6 +10,14 @@ import (
 // JobWrapper decorates the given Job with some behavior.
 type JobWrapper func(Job) Job
 
+// TriggeredJob is an optional interface that a Job may implement to receive
+// the time of the trigger that caused each run. Wrappers that understand
+// this interface (such as MergeIfStillRunning) invoke RunWithTrigger instead
+// of Run. Jobs that do not implement it are simply invoked via Run.
+type TriggeredJob interface {
+	RunWithTrigger(trigger time.Time)
+}
+
 // Chain is a sequence of JobWrappers that decorates submitted jobs with
 // cross-cutting behaviors like logging or synchronization.
 type Chain struct {
@@ -88,5 +96,86 @@ func SkipIfStillRunning(logger Logger) JobWrapper {
 				logger.Info("skip")
 			}
 		})
+	}
+}
+
+// MergeIfStillRunning coalesces invocations of the Job that arrive while a
+// previous invocation is still running into a single pending run. When the
+// in-progress run completes, the pending run starts immediately, using the
+// most recent trigger time as its metadata. It logs merges to the given
+// logger at Info level.
+//
+// This differs from SkipIfStillRunning (which drops triggers) and
+// DelayIfStillRunning (which queues every trigger): any number of triggers
+// that arrive during a single run produce exactly one additional run.
+//
+// Semantics for edge cases:
+//   - A trigger that arrives exactly as a run finishes is not lost: it either
+//     merges into a pending run consumed by the in-flight invocation, or it
+//     starts a fresh invocation. Exactly one run results, never two.
+//   - Panics are recovered and logged so that a pending run is still executed
+//     and the wrapper is never left stuck in the "running" state. Compose
+//     with Recover (inside this wrapper) to also log stack traces.
+//   - The pending run executes within the goroutine of the in-flight
+//     invocation, so Cron.Stop waits for it via the job waiter, and
+//     Cron.Remove cannot cancel it once merged; both only prevent future
+//     triggers. No run is started after the scheduler has stopped.
+//
+// Jobs implementing TriggeredJob receive the trigger time of each run: the
+// pending run observes the most recent merged trigger time.
+func MergeIfStillRunning(logger Logger) JobWrapper {
+	return func(j Job) Job {
+		var mu sync.Mutex
+		var running, pending bool
+		var pendingTrigger time.Time
+		return FuncJob(func() {
+			trigger := time.Now()
+			mu.Lock()
+			if running {
+				// A run is in progress: merge this trigger into the single
+				// pending run, keeping the most recent trigger time.
+				pending = true
+				pendingTrigger = trigger
+				mu.Unlock()
+				logger.Info("merge")
+				return
+			}
+			running = true
+			mu.Unlock()
+
+			for {
+				runTriggered(j, trigger, logger)
+				mu.Lock()
+				if !pending {
+					running = false
+					mu.Unlock()
+					return
+				}
+				trigger = pendingTrigger
+				pending = false
+				mu.Unlock()
+			}
+		})
+	}
+}
+
+// runTriggered invokes the job, passing the trigger time to jobs that
+// implement TriggeredJob. Panics are recovered and logged so that the
+// caller's bookkeeping (e.g. the MergeIfStillRunning state machine) always
+// completes and a pending run is never dropped due to a panic.
+func runTriggered(j Job, trigger time.Time, logger Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			err, ok := r.(error)
+			if !ok {
+				err = fmt.Errorf("%v", r)
+			}
+			logger.Error(err, "panic")
+		}
+	}()
+	if tj, ok := j.(TriggeredJob); ok {
+		tj.RunWithTrigger(trigger)
+	} else {
+		j.Run()
 	}
 }

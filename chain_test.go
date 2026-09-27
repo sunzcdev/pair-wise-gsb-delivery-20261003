@@ -240,3 +240,244 @@ func TestChainSkipIfStillRunning(t *testing.T) {
 	})
 
 }
+
+// blockingJob is a job whose runs are controlled by the test: each run
+// signals its start on the started channel and blocks until a token is
+// received on release. It records the trigger time of every run.
+type blockingJob struct {
+	m        sync.Mutex
+	triggers []time.Time
+	started  chan struct{}
+	release  chan struct{}
+}
+
+func newBlockingJob() *blockingJob {
+	return &blockingJob{
+		started: make(chan struct{}, 100),
+		release: make(chan struct{}, 100),
+	}
+}
+
+func (j *blockingJob) Run() { j.RunWithTrigger(time.Time{}) }
+
+func (j *blockingJob) RunWithTrigger(trigger time.Time) {
+	j.m.Lock()
+	j.triggers = append(j.triggers, trigger)
+	j.m.Unlock()
+	j.started <- struct{}{}
+	<-j.release
+}
+
+func (j *blockingJob) Runs() int {
+	j.m.Lock()
+	defer j.m.Unlock()
+	return len(j.triggers)
+}
+
+func (j *blockingJob) Trigger(i int) time.Time {
+	j.m.Lock()
+	defer j.m.Unlock()
+	return j.triggers[i]
+}
+
+func TestChainMergeIfStillRunning(t *testing.T) {
+
+	t.Run("runs immediately", func(t *testing.T) {
+		var j countJob
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(&j)
+		go wrappedJob.Run()
+		time.Sleep(2 * time.Millisecond) // Give the job 2ms to complete.
+		if c := j.Done(); c != 1 {
+			t.Errorf("expected job run once, immediately, got %d", c)
+		}
+	})
+
+	t.Run("second run immediate if first done", func(t *testing.T) {
+		var j countJob
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(&j)
+		go func() {
+			go wrappedJob.Run()
+			time.Sleep(time.Millisecond)
+			go wrappedJob.Run()
+		}()
+		// Poll for both runs to complete, allowing for scheduling delays.
+		deadline := time.After(time.Second)
+		for j.Done() != 2 {
+			select {
+			case <-deadline:
+				t.Fatalf("expected job run twice, immediately, got %d", j.Done())
+			case <-time.After(time.Millisecond):
+			}
+		}
+	})
+
+	t.Run("ten triggers merge into one pending run", func(t *testing.T) {
+		j := newBlockingJob()
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(j)
+
+		// The first trigger starts a run that blocks.
+		go wrappedJob.Run()
+		<-j.started
+
+		// Nine more triggers arrive while the first run is blocked. Each
+		// merged trigger returns immediately rather than queuing.
+		for i := 0; i < 9; i++ {
+			merged := make(chan struct{})
+			go func() {
+				wrappedJob.Run()
+				close(merged)
+			}()
+			select {
+			case <-merged:
+			case <-time.After(time.Second):
+				t.Fatal("expected merged trigger to return immediately")
+			}
+		}
+		if c := j.Runs(); c != 1 {
+			t.Fatalf("expected only the first run started, got %d", c)
+		}
+
+		// Releasing the first run causes exactly one merged follow-up run.
+		j.release <- struct{}{}
+		<-j.started
+		j.release <- struct{}{}
+
+		// No further run starts: 10 triggers produced exactly 2 runs.
+		select {
+		case <-j.started:
+			t.Fatal("expected no third run, got one")
+		case <-time.After(50 * time.Millisecond):
+		}
+		if c := j.Runs(); c != 2 {
+			t.Errorf("expected 10 triggers to produce 2 runs, got %d", c)
+		}
+	})
+
+	t.Run("pending run uses most recent trigger time", func(t *testing.T) {
+		j := newBlockingJob()
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(j)
+
+		go wrappedJob.Run()
+		<-j.started
+
+		// Fire several merged triggers; record the moment just before the
+		// last one so we can prove the pending run observed the most recent
+		// trigger rather than an earlier one.
+		var beforeLast time.Time
+		for i := 0; i < 5; i++ {
+			// Space the triggers apart so their timestamps are distinct even
+			// on platforms with a coarse system clock.
+			time.Sleep(5 * time.Millisecond)
+			merged := make(chan struct{})
+			if i == 4 {
+				beforeLast = time.Now()
+			}
+			go func() {
+				wrappedJob.Run()
+				close(merged)
+			}()
+			<-merged
+		}
+
+		j.release <- struct{}{}
+		<-j.started
+		j.release <- struct{}{}
+
+		if c := j.Runs(); c != 2 {
+			t.Fatalf("expected 2 runs, got %d", c)
+		}
+		if got := j.Trigger(1); got.Before(beforeLast) {
+			t.Errorf("expected pending run to use the most recent trigger time (>= %v), got %v", beforeLast, got)
+		}
+		if got, want := j.Trigger(1), j.Trigger(0); !got.After(want) {
+			t.Errorf("expected pending trigger %v to be later than first trigger %v", got, want)
+		}
+	})
+
+	t.Run("jobs without TriggeredJob still run", func(t *testing.T) {
+		var j countJob
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(&j)
+		go wrappedJob.Run()
+		time.Sleep(2 * time.Millisecond)
+		if c := j.Done(); c != 1 {
+			t.Errorf("expected plain job run once, got %d", c)
+		}
+	})
+
+	t.Run("panic recovered, pending run still executes", func(t *testing.T) {
+		j := newBlockingJob()
+		var runs int
+		panicking := FuncJob(func() {
+			j.m.Lock()
+			runs++
+			n := runs
+			j.m.Unlock()
+			j.started <- struct{}{}
+			<-j.release
+			if n == 1 {
+				panic("boom")
+			}
+		})
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(panicking)
+
+		// First run blocks, then panics when released.
+		go wrappedJob.Run()
+		<-j.started
+
+		// A trigger arrives while the first run is blocked.
+		merged := make(chan struct{})
+		go func() {
+			wrappedJob.Run()
+			close(merged)
+		}()
+		<-merged
+
+		// The panic is recovered and the merged pending run still executes.
+		j.release <- struct{}{}
+		select {
+		case <-j.started:
+		case <-time.After(time.Second):
+			t.Fatal("expected pending run to execute after recovered panic")
+		}
+		j.release <- struct{}{}
+
+		// The wrapper is not stuck: a later trigger starts a fresh run.
+		time.Sleep(10 * time.Millisecond)
+		go wrappedJob.Run()
+		select {
+		case <-j.started:
+		case <-time.After(time.Second):
+			t.Fatal("expected wrapper to accept new triggers after panic")
+		}
+		j.release <- struct{}{}
+	})
+
+	t.Run("triggers racing run completion never get stuck", func(t *testing.T) {
+		var j countJob
+		j.delay = time.Millisecond
+		wrappedJob := NewChain(MergeIfStillRunning(DiscardLogger)).Then(&j)
+
+		// Fire bursts of triggers that race against the completion of the
+		// in-flight runs.
+		for burst := 0; burst < 10; burst++ {
+			for i := 0; i < 5; i++ {
+				go wrappedJob.Run()
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond) // quiesce
+		started, done := j.Started(), j.Done()
+		if started != done {
+			t.Errorf("expected all started runs to complete, got started=%d done=%d", started, done)
+		}
+
+		// The wrapper is not stuck in the running state: a fresh trigger
+		// after quiescing runs to completion exactly once.
+		go wrappedJob.Run()
+		time.Sleep(10 * time.Millisecond)
+		if got := j.Done(); got != done+1 {
+			t.Errorf("expected exactly one more run after quiescing, got %d (want %d)", got, done+1)
+		}
+	})
+
+}
