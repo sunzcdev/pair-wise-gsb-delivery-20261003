@@ -55,6 +55,9 @@ type Cache[K Key, V any] struct {
 	onReject func(*Item[V])
 	// onExit is called whenever a value goes out of scope from the cache.
 	onExit (func(V))
+	// borrows tracks values obtained via Borrow so that their resource
+	// release is deferred until the last borrow ends.
+	borrows borrowRegistry[V]
 	// KeyToHash function is used to customize the key hashing algorithm.
 	// Each key will be hashed using the provided function. If keyToHash value
 	// is not set, the default keyToHash function is used.
@@ -278,6 +281,10 @@ func (c *Cache[K, V]) Wait() {
 // Get returns the value (if any) and a boolean representing whether the
 // value was found or not. The value can be nil and the boolean can be true at
 // the same time. Get will not return expired items.
+//
+// Get does not borrow the value: if the key is evicted, deleted or replaced
+// after Get returns, the value's OnEvict/OnExit callbacks may run while the
+// caller still uses it. Use Borrow when that lifecycle guarantee is needed.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
 	if c == nil || c.isClosed.Load() {
 		return zeroValue[V](), false
@@ -337,6 +344,11 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	}
 
 	keyHash, conflictHash := c.keyToHash(key)
+	// Reject new writes while too much cost is held by outstanding borrows.
+	if borrowed := c.BorrowedCost(); borrowed > 0 && borrowed+cost > c.cachePolicy.MaxCost() {
+		c.Metrics.add(rejectSetBorrow, keyHash, 1)
+		return false
+	}
 	i := &Item[V]{
 		flag:       itemNew,
 		Key:        keyHash,
@@ -348,7 +360,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
 	if prev, ok := c.storedItems.Update(i); ok {
-		c.onExit(prev)
+		c.releaseValue(keyHash, prev, func() { c.onExit(prev) })
 		i.flag = itemUpdate
 	}
 	// Attempt to send item to cachePolicy.
@@ -375,7 +387,7 @@ func (c *Cache[K, V]) Del(key K) {
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
 	_, prev := c.storedItems.Del(keyHash, conflictHash)
-	c.onExit(prev)
+	c.releaseValue(keyHash, prev, func() { c.onExit(prev) })
 	// If we've set an item, it would be applied slightly later.
 	// So we must push the same item to `setBuf` with the deletion flag.
 	// This ensures that if a set is followed by a delete, it will be
@@ -465,7 +477,7 @@ loop:
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
-				c.onEvict(i)
+				c.releaseValue(i.Key, i.Value, func() { c.onEvict(i) })
 			}
 		default:
 			break loop
@@ -474,7 +486,9 @@ loop:
 
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
-	c.storedItems.Clear(c.onEvict)
+	c.storedItems.Clear(func(i *Item[V]) {
+		c.releaseValue(i.Key, i.Value, func() { c.onEvict(i) })
+	})
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -532,7 +546,7 @@ func (c *Cache[K, V]) processItems() {
 			delete(startTs, i.Key)
 		}
 		if c.onEvict != nil {
-			c.onEvict(i)
+			c.releaseValue(i.Key, i.Value, func() { c.onEvict(i) })
 		}
 	}
 
@@ -573,7 +587,7 @@ func (c *Cache[K, V]) processItems() {
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
-				c.onExit(val)
+				c.releaseValue(i.Key, val, func() { c.onExit(val) })
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
@@ -611,6 +625,12 @@ const (
 	// floor.
 	dropGets
 	keepGets
+	// The following keep track of borrows: successful borrows, borrows
+	// rejected because too much cost is currently borrowed, and sets
+	// rejected for the same reason.
+	borrow
+	rejectBorrow
+	rejectSetBorrow
 	// This should be the final enum. Other enums should be set before this.
 	doNotUse
 )
@@ -639,6 +659,12 @@ func stringFor(t metricType) string {
 		return "gets-dropped"
 	case keepGets:
 		return "gets-kept"
+	case borrow:
+		return "borrows"
+	case rejectBorrow:
+		return "borrows-rejected"
+	case rejectSetBorrow:
+		return "sets-rejected-borrow"
 	default:
 		return "unidentified"
 	}
@@ -744,6 +770,23 @@ func (p *Metrics) GetsDropped() uint64 {
 // GetsKept is the number of Get counter increments that are kept.
 func (p *Metrics) GetsKept() uint64 {
 	return p.get(keepGets)
+}
+
+// Borrows is the number of successful Borrow calls.
+func (p *Metrics) Borrows() uint64 {
+	return p.get(borrow)
+}
+
+// BorrowsRejected is the number of Borrow calls rejected because the total
+// borrowed cost would have exceeded MaxCost.
+func (p *Metrics) BorrowsRejected() uint64 {
+	return p.get(rejectBorrow)
+}
+
+// SetsRejectedBorrow is the number of Set calls rejected because too much
+// cost is currently held by outstanding borrows.
+func (p *Metrics) SetsRejectedBorrow() uint64 {
+	return p.get(rejectSetBorrow)
 }
 
 // Ratio is the number of Hits over all accesses (Hits + Misses). This is the

@@ -7,6 +7,18 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Added
+
+- `Cache.Borrow`/`Borrowed.Release`: an optional borrow API for values that need
+  deferred resource release. Logical eviction (replace, TTL expiry, `Del`,
+  `Close`) still takes effect immediately, but the `OnEvict`/`OnExit` callbacks
+  for a borrowed value run only after the last borrow ends and the value is
+  released. Borrowed values keep occupying cost, observable via
+  `Cache.BorrowedCost`, and new borrows or writes are rejected once the borrowed
+  cost reaches `MaxCost` (see the new `Borrows`, `BorrowsRejected` and
+  `SetsRejectedBorrow` metrics). Plain `Get` is unchanged and does not provide
+  this lifecycle guarantee.
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed

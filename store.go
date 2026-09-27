@@ -267,15 +267,24 @@ func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
 
 func (m *lockedMap[V]) Clear(onEvict func(item *Item[V])) {
 	m.Lock()
-	defer m.Unlock()
-	i := &Item[V]{}
-	if onEvict != nil {
-		for _, si := range m.data {
-			i.Key = si.key
-			i.Conflict = si.conflict
-			i.Value = si.value
-			onEvict(i)
-		}
+	items := make([]storeItem[V], 0, len(m.data))
+	for _, si := range m.data {
+		items = append(items, si)
 	}
 	m.data = make(map[uint64]storeItem[V])
+	m.Unlock()
+
+	// Call onEvict without holding the shard lock: eviction callbacks may
+	// take locks (e.g. the borrow registry) that are also taken before the
+	// shard lock on other paths such as Borrow.
+	if onEvict == nil {
+		return
+	}
+	i := &Item[V]{}
+	for _, si := range items {
+		i.Key = si.key
+		i.Conflict = si.conflict
+		i.Value = si.value
+		onEvict(i)
+	}
 }
