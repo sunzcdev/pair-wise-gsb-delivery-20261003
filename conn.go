@@ -279,6 +279,8 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	strictTextValidation bool // validate UTF-8 of text messages while reading
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {
@@ -1028,6 +1030,9 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			c.reader = c.messageReader
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
+			}
+			if frameType == TextMessage && c.strictTextValidation {
+				c.reader = &utf8Reader{c: c, r: c.reader}
 			}
 			return frameType, c.reader, nil
 		}

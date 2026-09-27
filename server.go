@@ -71,6 +71,15 @@ type Upgrader struct {
 	// guarantee that compression will be supported. Currently only "no context
 	// takeover" modes are supported.
 	EnableCompression bool
+
+	// StrictTextValidation specifies whether the server validates the UTF-8
+	// encoding of received text messages. The validation is performed
+	// incrementally as the message is read, without buffering the entire
+	// message, and spans fragmented and compressed messages. When a text
+	// message contains invalid UTF-8, the connection sends a close message
+	// with code CloseInvalidFramePayloadData and read methods return
+	// ErrInvalidUTF8. Binary messages are not validated.
+	StrictTextValidation bool
 }
 
 func (u *Upgrader) returnError(w http.ResponseWriter, r *http.Request, status int, reason string) (*Conn, error) {
@@ -212,6 +221,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	c := newConn(netConn, true, u.ReadBufferSize, u.WriteBufferSize, u.WriteBufferPool, br, writeBuf)
 	c.subprotocol = subprotocol
+	c.strictTextValidation = u.StrictTextValidation
 
 	if compress {
 		c.newCompressionWriter = compressNoContextTakeover
