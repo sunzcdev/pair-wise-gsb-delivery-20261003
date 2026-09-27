@@ -12,6 +12,13 @@ The intention is that, with maturity some of the packages would graduate to stab
 
 Packages within this module are listed below.
 
+## Metrics
+
+The `metrics` package contains experimental metric types that may eventually
+graduate into the stable `prometheus` package. It currently provides
+`WeightedHistogram`, a classic histogram accepting observations with an
+integer weight, applied atomically as a single statistical event.
+
 ## Remote
 
 NOTE: The `api/remote` package is used by `prometheus/prometheus`. Any changes to this package should ensure Prometheus is not affected (e.g. does not break Prometheus on upgrade or if it breaks, the Prometheus gets updated soon.
