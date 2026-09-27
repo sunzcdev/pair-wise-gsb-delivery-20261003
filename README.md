@@ -93,6 +93,28 @@ func main() {
 }
 ```
 
+### Tag-based invalidation
+
+Items can be associated with one or more tags when they are set, and every
+item sharing a tag can be invalidated with a single call. This is useful when
+a batch of cached entries derives from the same source data: after the source
+changes, invalidate the tag to drop all of its stale values at once.
+
+```go
+// set values associated with tags
+cache.SetWithTags("user:1:profile", profile, 1, "user:1")
+cache.SetWithTags("user:1:settings", settings, 1, "user:1", "settings")
+
+// the source data changed: drop every item tagged "user:1"
+cache.InvalidateTags("user:1")
+```
+
+`InvalidateTags` also discards matching writes that are still queued
+internally, so old values cannot reappear afterwards. When it returns, the
+invalidated items are no longer visible to `Get`; the per-key `OnEvict` /
+`OnExit` / `OnReject` callbacks of the invalidated items are invoked
+asynchronously and are not waited for.
+
 ## Benchmarks
 
 The benchmarks can be found in

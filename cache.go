@@ -71,6 +71,12 @@ type Cache[K Key, V any] struct {
 	ignoreInternalCost bool
 	// cleanupTicker is used to periodically check for entries whose TTL has passed.
 	cleanupTicker *time.Ticker
+	// tags indexes keys by the tags they were Set with, so that all items
+	// sharing a tag can be invalidated together.
+	tags *tagIndex
+	// invMu serializes InvalidateTags calls (and their pause/resume of the
+	// processItems goroutine) against each other.
+	invMu sync.Mutex
 	// Metrics contains a running log of important statistics like hits, misses,
 	// and dropped items.
 	Metrics *Metrics
@@ -198,7 +204,11 @@ type Item[V any] struct {
 	Value      V
 	Cost       int64
 	Expiration time.Time
-	wait       chan struct{}
+	// Tags are the tags this item was associated with via SetWithTags or
+	// SetWithTTLAndTags. It is nil for items set without tags.
+	Tags   []string
+	tagGen uint64
+	wait   chan struct{}
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -231,6 +241,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 		cost:               config.Cost,
 		ignoreInternalCost: config.IgnoreInternalCost,
 		cleanupTicker:      time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
+		tags:               newTagIndex(),
 	}
 	cache.storedItems.SetShouldUpdateFn(config.ShouldUpdate)
 	cache.onExit = func(val V) {
@@ -310,7 +321,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 // value type V. Calling `append` may update the underlined array pointer which
 // will not be reflected in the cache.
 func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
-	return c.SetWithTTL(key, value, cost, 0*time.Second)
+	return c.set(key, value, cost, 0*time.Second, nil)
 }
 
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
@@ -320,6 +331,31 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.set(key, value, cost, ttl, nil)
+}
+
+// SetWithTags works like Set but additionally associates the key with the
+// given tags. All items sharing a tag can be invalidated together with
+// InvalidateTags. An item may belong to multiple tags. Setting a key that
+// already exists replaces both its value and its tag set: the previous tags
+// no longer apply to the key.
+//
+// See Set for more information.
+func (c *Cache[K, V]) SetWithTags(key K, value V, cost int64, tags ...string) bool {
+	return c.set(key, value, cost, 0*time.Second, tags)
+}
+
+// SetWithTTLAndTags works like SetWithTTL but additionally associates the key
+// with the given tags, combining the behavior of SetWithTTL and SetWithTags.
+//
+// See Set and SetWithTags for more information.
+func (c *Cache[K, V]) SetWithTTLAndTags(key K, value V, cost int64, ttl time.Duration, tags ...string) bool {
+	return c.set(key, value, cost, ttl, tags)
+}
+
+// set is the internal implementation backing Set, SetWithTTL, SetWithTags and
+// SetWithTTLAndTags.
+func (c *Cache[K, V]) set(key K, value V, cost int64, ttl time.Duration, tags []string) bool {
 	if c == nil || c.isClosed.Load() {
 		return false
 	}
@@ -337,6 +373,11 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	}
 
 	keyHash, conflictHash := c.keyToHash(key)
+	// Register the key's tags synchronously, replacing any previous tag set.
+	// Doing this before the item is queued ensures that a subsequent
+	// InvalidateTags observes the key even while the write is still sitting
+	// in the asynchronous setBuf queue.
+	tagGen := c.tags.set(keyHash, tags)
 	i := &Item[V]{
 		flag:       itemNew,
 		Key:        keyHash,
@@ -344,6 +385,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		Tags:       append([]string(nil), tags...),
+		tagGen:     tagGen,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -362,6 +405,9 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 			// return false which means the item was not inserted.
 			return true
 		}
+		// The write was dropped; roll back the tag registration unless a
+		// newer Set has re-registered the key in the meantime.
+		c.tags.delIfGen(keyHash, tagGen)
 		c.Metrics.add(dropSets, keyHash, 1)
 		return false
 	}
@@ -376,6 +422,9 @@ func (c *Cache[K, V]) Del(key K) {
 	// Delete immediately.
 	_, prev := c.storedItems.Del(keyHash, conflictHash)
 	c.onExit(prev)
+	// Remove the key from the tag index so the tag -> key mapping doesn't
+	// leak entries for deleted keys.
+	c.tags.del(keyHash)
 	// If we've set an item, it would be applied slightly later.
 	// So we must push the same item to `setBuf` with the deletion flag.
 	// This ensures that if a set is followed by a delete, it will be
@@ -385,6 +434,115 @@ func (c *Cache[K, V]) Del(key K) {
 		Key:      keyHash,
 		Conflict: conflictHash,
 	}
+}
+
+// InvalidateTags invalidates every item associated with any of the given
+// tags. An item associated with several tags is invalidated if any of its
+// tags is invalidated. The tags themselves and all of their index entries
+// are removed from the cache's tag index.
+//
+// Writes that are still sitting in the asynchronous write queue when
+// InvalidateTags is called are handled specially: the processing goroutine
+// is paused, the queue is drained, and queued writes belonging to an
+// invalidated tag or key are discarded before the queue is resumed, so old
+// values cannot be (re-)applied after the invalidation.
+//
+// Completion boundary: when InvalidateTags returns, the invalidated items
+// are no longer visible to Get and cannot reappear later as a result of
+// writes that were already queued when the call began. InvalidateTags does
+// NOT wait for the per-key callbacks (OnEvict/OnExit for items removed from
+// the store, OnReject for queued writes that were discarded) of the
+// invalidated items to finish; those callbacks are invoked asynchronously.
+// Sets that run concurrently with or after InvalidateTags may or may not be
+// affected by it. Items that have already expired but have not yet been
+// cleaned up are left to the regular TTL cleanup.
+func (c *Cache[K, V]) InvalidateTags(tags ...string) {
+	if c == nil || c.isClosed.Load() || len(tags) == 0 {
+		return
+	}
+	c.invMu.Lock()
+	defer c.invMu.Unlock()
+
+	// Pause the processing goroutine so that no queued writes are applied
+	// while the invalidation is in progress.
+	c.stop <- struct{}{}
+	<-c.done
+
+	// Remove the tags and all keys registered under them from the index.
+	keys := c.tags.take(tags...)
+
+	tagSet := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		tagSet[tag] = struct{}{}
+	}
+
+	// Drain the write buffer. Queued writes belonging to an invalidated tag
+	// or key are stale: they must never be applied, otherwise old values
+	// would reappear after the invalidation. All other queued writes are
+	// kept and re-enqueued below, in their original order.
+	var pending, rejected []*Item[V]
+drain:
+	for {
+		select {
+		case i := <-c.setBuf:
+			if i.wait != nil {
+				pending = append(pending, i)
+				continue
+			}
+			_, stale := keys[i.Key]
+			if !stale {
+				for _, tag := range i.Tags {
+					if _, ok := tagSet[tag]; ok {
+						stale = true
+						break
+					}
+				}
+			}
+			if stale {
+				// For itemUpdate the value was already written to the store
+				// synchronously and is removed below; itemDelete needs no
+				// action. Only itemNew values never reached the store, so
+				// they are reported as rejected.
+				if i.flag == itemNew {
+					rejected = append(rejected, i)
+				}
+				continue
+			}
+			pending = append(pending, i)
+		default:
+			break drain
+		}
+	}
+
+	// Remove the invalidated keys from the store and the policy.
+	var evicted []*Item[V]
+	for key := range keys {
+		value, ok := c.storedItems.Get(key, 0)
+		if !ok {
+			continue
+		}
+		c.cachePolicy.Del(key)
+		conflict, _ := c.storedItems.Del(key, 0)
+		evicted = append(evicted, &Item[V]{Key: key, Conflict: conflict, Value: value})
+	}
+
+	// Resume the processing goroutine and re-enqueue the surviving writes.
+	go c.processItems()
+	for _, i := range pending {
+		c.setBuf <- i
+	}
+
+	// Invoke the callbacks asynchronously: the invalidation is complete as
+	// soon as the old values can no longer be observed, there is no need to
+	// wait for every per-key callback to finish before returning.
+	go func() {
+		for _, i := range evicted {
+			c.onEvict(i)
+		}
+		for _, i := range rejected {
+			c.onReject(i)
+		}
+	}()
 }
 
 // GetTTL returns the TTL for the specified key and a bool that is true if the
@@ -475,6 +633,7 @@ loop:
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
+	c.tags.clear()
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -527,6 +686,9 @@ func (c *Cache[K, V]) processItems() {
 		}
 	}
 	onEvict := func(i *Item[V]) {
+		// The stored value is gone (evicted or expired); drop its tag index
+		// entry unless a newer Set is still queued for the key.
+		c.tags.delIfApplied(i.Key)
 		if ts, has := startTs[i.Key]; has {
 			c.Metrics.trackEviction(int64(time.Since(ts) / time.Second))
 			delete(startTs, i.Key)
@@ -557,9 +719,13 @@ func (c *Cache[K, V]) processItems() {
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
+					c.tags.markApplied(i.Key, i.tagGen)
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
 				} else {
+					// The item never entered the cache; drop its tag
+					// registration unless a newer Set superseded it.
+					c.tags.delIfGen(i.Key, i.tagGen)
 					c.onReject(i)
 				}
 				for _, victim := range victims {
@@ -569,6 +735,7 @@ func (c *Cache[K, V]) processItems() {
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				c.tags.markApplied(i.Key, i.tagGen)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
