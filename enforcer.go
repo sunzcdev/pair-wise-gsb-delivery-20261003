@@ -61,6 +61,8 @@ type Enforcer struct {
 	acceptJsonRequest    bool
 	gFunctionCache       bool
 
+	exclusions roleExclusionSet
+
 	aiConfig AIConfig
 }
 

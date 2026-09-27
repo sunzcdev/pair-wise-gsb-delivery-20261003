@@ -30,4 +30,9 @@ var (
 	// GetAllowedObjectConditions errors.
 	ErrObjCondition   = errors.New("need to meet the prefix required by the object condition")
 	ErrEmptyCondition = errors.New("GetAllowedObjectConditions have an empty condition")
+
+	// Authorization session errors.
+	ErrRoleNotGranted        = errors.New("error: the role is not granted to the user")
+	ErrRoleMutuallyExclusive = errors.New("error: the role is mutually exclusive with an active role in the session")
+	ErrSessionNoActiveRole   = errors.New("error: session has no active role")
 )
