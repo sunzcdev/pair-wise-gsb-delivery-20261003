@@ -106,3 +106,11 @@ var (
 	// Deprecated: Use the error variables defined in the bbolt/errors package.
 	ErrIncompatibleValue = errors.ErrIncompatibleValue
 )
+
+// These errors can occur when compacting a database.
+var (
+	// ErrCompactSourceChanged is returned when resuming an interrupted
+	// compaction and the source database has been modified since the
+	// previous run, so the saved progress can no longer be used.
+	ErrCompactSourceChanged = errors.ErrCompactSourceChanged
+)

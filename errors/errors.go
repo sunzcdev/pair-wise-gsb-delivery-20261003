@@ -85,3 +85,11 @@ var (
 	// source and target buckets, while source and target buckets are in different database files.
 	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
 )
+
+// These errors can occur when compacting a database.
+var (
+	// ErrCompactSourceChanged is returned when resuming an interrupted
+	// compaction and the source database has been modified since the
+	// previous run, so the saved progress can no longer be used.
+	ErrCompactSourceChanged = errors.New("compact source changed since the previous run")
+)
