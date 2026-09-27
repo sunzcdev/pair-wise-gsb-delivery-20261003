@@ -216,52 +216,19 @@ type WalkFunc func(path []int, entity *Entity, err error) error
 // Walk walks the entity's multipart tree, calling walkFunc for each part in
 // the tree, including the root entity.
 //
+// Walk doesn't descend into message/rfc822 entities. See WalkWithOptions for
+// a more flexible version of Walk.
+//
 // Walk consumes the entity.
 func (e *Entity) Walk(walkFunc WalkFunc) error {
-	var multipartReaders []MultipartReader
-	var path []int
-	part := e
-	for {
-		var err error
-		if part == nil {
-			if len(multipartReaders) == 0 {
-				break
-			}
-
-			// Get the next part from the last multipart reader
-			mr := multipartReaders[len(multipartReaders)-1]
-			part, err = mr.NextPart()
-			if err == io.EOF {
-				multipartReaders = multipartReaders[:len(multipartReaders)-1]
-				path = path[:len(path)-1]
-				continue
-			} else if IsUnknownEncoding(err) || IsUnknownCharset(err) {
-				// Forward the error to walkFunc
-			} else if err != nil {
-				return err
-			}
-
-			path[len(path)-1]++
-		}
-
-		// Copy the path since we'll mutate it on the next iteration
-		var pathCopy []int
+	return e.WalkWithOptions(func(path []WalkStep, entity *Entity, err error) (WalkDecision, error) {
+		var intPath []int
 		if len(path) > 0 {
-			pathCopy = make([]int, len(path))
-			copy(pathCopy, path)
+			intPath = make([]int, len(path))
+			for i, step := range path {
+				intPath[i] = step.Part
+			}
 		}
-
-		if err := walkFunc(pathCopy, part, err); err != nil {
-			return err
-		}
-
-		if mr := part.MultipartReader(); mr != nil {
-			multipartReaders = append(multipartReaders, mr)
-			path = append(path, -1)
-		}
-
-		part = nil
-	}
-
-	return nil
+		return WalkDescend, walkFunc(intPath, entity, err)
+	}, nil)
 }
