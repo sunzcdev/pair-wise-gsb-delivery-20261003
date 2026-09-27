@@ -344,6 +344,13 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 			continue
 		}
 
+		if fields.unknownFields != nil {
+			if err := d.decodeUnknownField(v, fields.unknownFields, name); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if d.flags&disallowUnknownFieldsFlag != 0 {
 			return fmt.Errorf("msgpack: unknown field %q", name)
 		}

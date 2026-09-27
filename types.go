@@ -127,7 +127,8 @@ type fields struct {
 	List    []*field
 	AsArray bool
 
-	hasOmitEmpty bool
+	unknownFields *field
+	hasOmitEmpty  bool
 }
 
 func newFields(typ reflect.Type) *fields {
@@ -195,6 +196,15 @@ func getFields(typ reflect.Type, fallbackTag string) *fields {
 		}
 
 		if f.PkgPath != "" && !f.Anonymous {
+			continue
+		}
+
+		if f.Type == unknownFieldsMapType {
+			if fs.unknownFields != nil {
+				log.Printf("msgpack: %s already has an UnknownFieldsMap field", fs.Type)
+			} else {
+				fs.unknownFields = &field{name: f.Name, index: f.Index}
+			}
 			continue
 		}
 

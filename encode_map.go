@@ -1,6 +1,7 @@
 package msgpack
 
 import (
+	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -192,11 +193,22 @@ func (e *Encoder) EncodeMapLen(l int) error {
 func encodeStructValue(e *Encoder, strct reflect.Value) error {
 	structFields := structs.Fields(strct.Type(), e.structTag)
 	if e.flags&arrayEncodedStructsFlag != 0 || structFields.AsArray {
+		if structFields.unknownFields != nil {
+			if unknown := unknownFieldsValue(strct, structFields.unknownFields); len(unknown) > 0 {
+				return fmt.Errorf("msgpack: %s: UnknownFieldsMap is not supported for array-encoded structs",
+					strct.Type())
+			}
+		}
 		return encodeStructValueAsArray(e, strct, structFields.List)
 	}
 	fields := structFields.OmitEmpty(e, strct)
 
-	if err := e.EncodeMapLen(len(fields)); err != nil {
+	unknownKeys, unknown, err := unknownFieldsEntries(strct, structFields)
+	if err != nil {
+		return err
+	}
+
+	if err := e.EncodeMapLen(len(fields) + len(unknownKeys)); err != nil {
 		return err
 	}
 
@@ -209,7 +221,7 @@ func encodeStructValue(e *Encoder, strct reflect.Value) error {
 		}
 	}
 
-	return nil
+	return encodeUnknownFields(e, unknownKeys, unknown)
 }
 
 func encodeStructValueAsArray(e *Encoder, strct reflect.Value, fields []*field) error {
