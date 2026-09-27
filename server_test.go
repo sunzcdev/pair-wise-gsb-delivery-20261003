@@ -1796,3 +1796,211 @@ func TestServerMTPRIORITY(t *testing.T) {
 		t.Fatalf("MTPriority: want %d, got %d", expectedPriority, *opts.MTPriority)
 	}
 }
+
+// txnBackend records the transaction contexts seen by the session and can
+// optionally block in Data until the transaction context is cancelled.
+type txnBackend struct {
+	mu       sync.Mutex
+	mailCtxs []context.Context
+	mailErr  error
+
+	blockData bool
+	dataDone  chan error
+}
+
+func (be *txnBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	return &txnSession{be: be, conn: c}, nil
+}
+
+func (be *txnBackend) mailCtx(t *testing.T, i int) context.Context {
+	t.Helper()
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	if i >= len(be.mailCtxs) {
+		t.Fatalf("MAIL was called %d times, want at least %d", len(be.mailCtxs), i+1)
+	}
+	return be.mailCtxs[i]
+}
+
+func (be *txnBackend) setMailErr(err error) {
+	be.mu.Lock()
+	defer be.mu.Unlock()
+	be.mailErr = err
+}
+
+type txnSession struct {
+	be   *txnBackend
+	conn *smtp.Conn
+}
+
+func (s *txnSession) Reset() {}
+
+func (s *txnSession) Logout() error { return nil }
+
+func (s *txnSession) Mail(from string, opts *smtp.MailOptions) error {
+	s.be.mu.Lock()
+	s.be.mailCtxs = append(s.be.mailCtxs, s.conn.Context())
+	err := s.be.mailErr
+	s.be.mu.Unlock()
+	return err
+}
+
+func (s *txnSession) Rcpt(to string, opts *smtp.RcptOptions) error { return nil }
+
+func (s *txnSession) Data(r io.Reader) error {
+	if s.be.blockData {
+		// Simulate a backend blocked on an external operation (e.g. an
+		// anti-spam service lookup) that is aborted on cancellation.
+		ctx := s.conn.Context()
+		<-ctx.Done()
+		s.be.dataDone <- ctx.Err()
+		return ctx.Err()
+	}
+	_, err := io.Copy(ioutil.Discard, r)
+	s.be.dataDone <- err
+	return err
+}
+
+func testTxnServer(t *testing.T, be *txnBackend) (s *smtp.Server, c net.Conn, scanner *bufio.Scanner) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s = smtp.NewServer(be)
+	s.Domain = "localhost"
+
+	go s.Serve(l)
+
+	c, err = net.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner = bufio.NewScanner(c)
+	return
+}
+
+// readFullReply reads a possibly multi-line reply and returns its last line.
+func readFullReply(t *testing.T, scanner *bufio.Scanner) string {
+	t.Helper()
+	for {
+		line := readReply(t, scanner)
+		if len(line) < 4 {
+			t.Fatalf("Malformed reply line: %q", line)
+		}
+		if line[3] == ' ' {
+			return line
+		}
+		if line[3] != '-' {
+			t.Fatalf("Malformed reply line: %q", line)
+		}
+	}
+}
+
+func TestServerTransactionContextDisconnect(t *testing.T) {
+	be := &txnBackend{
+		blockData: true,
+		dataDone:  make(chan error, 1),
+	}
+	s, c, scanner := testTxnServer(t, be)
+	defer s.Close()
+
+	readFullReply(t, scanner) // greeting
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	readFullReply(t, scanner)
+	io.WriteString(c, "MAIL FROM:<alice@example.org>\r\n")
+	readFullReply(t, scanner)
+	io.WriteString(c, "RCPT TO:<bob@example.org>\r\n")
+	readFullReply(t, scanner)
+
+	// Start a BDAT transaction but never send the chunk, then go away.
+	// The backend blocks in Data until the transaction context is
+	// cancelled by the connection teardown.
+	io.WriteString(c, "BDAT 10\r\n")
+	c.Close()
+
+	select {
+	case err := <-be.dataDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Data returned %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Data did not return after client disconnect")
+	}
+}
+
+func TestServerTransactionContextReset(t *testing.T) {
+	be := &txnBackend{
+		dataDone: make(chan error, 1),
+	}
+	s, c, scanner := testTxnServer(t, be)
+	defer s.Close()
+	defer c.Close()
+
+	readFullReply(t, scanner) // greeting
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	readFullReply(t, scanner)
+
+	// First transaction: cancelled with RSET.
+	io.WriteString(c, "MAIL FROM:<alice@example.org>\r\n")
+	readFullReply(t, scanner)
+	io.WriteString(c, "RCPT TO:<bob@example.org>\r\n")
+	readFullReply(t, scanner)
+	io.WriteString(c, "RSET\r\n")
+	if res := readFullReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("RSET rejected:", res)
+	}
+
+	ctx1 := be.mailCtx(t, 0)
+	if err := ctx1.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Transaction context not cancelled after RSET: %v", err)
+	}
+
+	// Second transaction on the same connection: must get a fresh
+	// context and succeed.
+	io.WriteString(c, "MAIL FROM:<alice@example.org>\r\n")
+	readFullReply(t, scanner)
+	io.WriteString(c, "RCPT TO:<bob@example.org>\r\n")
+	readFullReply(t, scanner)
+
+	ctx2 := be.mailCtx(t, 1)
+	if ctx2 == ctx1 {
+		t.Fatal("Transaction context was reused across transactions")
+	}
+	if err := ctx2.Err(); err != nil {
+		t.Fatalf("New transaction context already cancelled: %v", err)
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	if res := readFullReply(t, scanner); !strings.HasPrefix(res, "354 ") {
+		t.Fatal("DATA rejected:", res)
+	}
+	io.WriteString(c, "Subject: test\r\n\r\nbody\r\n.\r\n")
+	if res := readFullReply(t, scanner); !strings.HasPrefix(res, "250 ") {
+		t.Fatal("Message rejected:", res)
+	}
+	if err := <-be.dataDone; err != nil {
+		t.Fatal("Data returned error:", err)
+	}
+
+	// Once the transaction is over, its context is cancelled.
+	select {
+	case <-ctx2.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("Transaction context not cancelled after DATA")
+	}
+
+	// A backend error on MAIL ends the transaction right away.
+	be.setMailErr(errors.New("rejected"))
+	io.WriteString(c, "MAIL FROM:<alice@example.org>\r\n")
+	if res := readFullReply(t, scanner); !strings.HasPrefix(res, "451 ") {
+		t.Fatal("MAIL error not propagated:", res)
+	}
+	ctx3 := be.mailCtx(t, 2)
+	if err := ctx3.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Transaction context not cancelled after MAIL error: %v", err)
+	}
+}

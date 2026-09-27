@@ -1,6 +1,7 @@
 package smtp
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -35,6 +36,15 @@ type Conn struct {
 	locker     sync.Mutex
 	binarymime bool
 
+	// connCtx is cancelled when the connection is closed.
+	connCtx    context.Context
+	connCancel context.CancelFunc
+
+	// txnCtx is the context of the current mail transaction. It is
+	// cancelled when the transaction ends (see Conn.Context).
+	txnCtx    context.Context
+	txnCancel context.CancelFunc
+
 	lineLimitReader *lineLimitReader
 	bdatPipe        *io.PipeWriter
 	bdatStatus      *statusCollector // used for BDAT on LMTP
@@ -51,6 +61,7 @@ func newConn(c net.Conn, s *Server) *Conn {
 		server: s,
 		conn:   c,
 	}
+	sc.connCtx, sc.connCancel = context.WithCancel(context.Background())
 
 	sc.init()
 	return sc
@@ -160,6 +171,70 @@ func (c *Conn) Session() Session {
 	return c.session
 }
 
+// Context returns the context of the current mail transaction.
+//
+// A new transaction context is created when a MAIL command is accepted. It
+// is cancelled when the transaction ends, that is:
+//
+//   - the message data has been processed (DATA or the last BDAT chunk),
+//     regardless of whether the backend returned an error;
+//   - the client issues RSET, HELO/EHLO or STARTTLS, or a new MAIL command
+//     starts the next transaction;
+//   - the connection is closed.
+//
+// A cancelled context is never reused: each MAIL command starts a fresh
+// context derived from the connection context.
+//
+// If no transaction is currently active, the connection-wide context is
+// returned. It is cancelled when the connection is closed.
+//
+// Cancellation is only detected at protocol command boundaries. In
+// particular, while the message body is being transferred with DATA, the
+// connection is owned by the protocol loop: a backend blocking in Data
+// without consuming the passed reader will not be woken up if the client
+// goes away. The server deliberately does not read the connection
+// concurrently to detect this earlier, since that would steal protocol
+// data from the command loop. Backends that need prompt detection should
+// consume the reader passed to Data (reads fail once the connection
+// breaks) or rely on BDAT/CHUNKING, where the context is cancelled as
+// soon as the connection error is noticed between chunks.
+//
+// Context must not be called from Session.Reset or Session.Logout, as
+// these are invoked with the connection lock held.
+func (c *Conn) Context() context.Context {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	if c.txnCtx != nil {
+		return c.txnCtx
+	}
+	return c.connCtx
+}
+
+// startTransaction begins a new mail transaction context, cancelling the
+// previous one if any.
+func (c *Conn) startTransaction() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.endTransactionLocked()
+	c.txnCtx, c.txnCancel = context.WithCancel(c.connCtx)
+}
+
+// endTransaction cancels the current mail transaction context, if any.
+func (c *Conn) endTransaction() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	c.endTransactionLocked()
+}
+
+// endTransactionLocked is endTransaction with c.locker already held.
+func (c *Conn) endTransactionLocked() {
+	if c.txnCancel != nil {
+		c.txnCancel()
+		c.txnCancel = nil
+		c.txnCtx = nil
+	}
+}
+
 func (c *Conn) setSession(session Session) {
 	c.locker.Lock()
 	defer c.locker.Unlock()
@@ -174,6 +249,9 @@ func (c *Conn) Close() error {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
 	}
+
+	c.endTransactionLocked()
+	c.connCancel()
 
 	if c.session != nil {
 		c.session.Logout()
@@ -471,7 +549,10 @@ func (c *Conn) handleMail(arg string) {
 		}
 	}
 
+	c.startTransaction()
 	if err := c.Session().Mail(from, opts); err != nil {
+		// The backend rejected the transaction, release its context.
+		c.endTransaction()
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
@@ -1345,6 +1426,8 @@ func (c *Conn) reset() {
 
 	// BDAT disables the line limit while reading a chunk, the transaction is over now.
 	c.lineLimitReader.LineLimit = c.server.MaxLineLength
+
+	c.endTransactionLocked()
 
 	if c.session != nil {
 		c.session.Reset()

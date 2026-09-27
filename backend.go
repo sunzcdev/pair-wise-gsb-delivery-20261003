@@ -31,6 +31,11 @@ var (
 
 // A SMTP server backend.
 type Backend interface {
+	// NewSession is called after the client greets the server. The
+	// connection can be retained by the returned session to access the
+	// current mail transaction context via Conn.Context, e.g. to abort
+	// anti-spam checks or object storage writes when the transaction is
+	// cancelled.
 	NewSession(c *Conn) (Session, error)
 }
 
@@ -62,6 +67,10 @@ type Session interface {
 	// Set currently processed message contents and send it.
 	//
 	// r must be consumed before Data returns.
+	//
+	// The context of the current mail transaction is available via
+	// Conn.Context and is cancelled once the transaction is over. See
+	// its documentation for the exact cancellation guarantees.
 	Data(r io.Reader) error
 }
 
