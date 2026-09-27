@@ -28,6 +28,10 @@ type ProxyCtx struct {
 	Session   int64
 	certStore CertStorage
 	Proxy     *ProxyHttpServer
+	// bodyPreviews tracks the RequestBodyPreview instances created through
+	// PreviewRequestBody, keyed by the request they were installed on, so
+	// that multiple filters share a single staging buffer per request.
+	bodyPreviews map[*http.Request]*RequestBodyPreview
 }
 
 type RoundTripper interface {
