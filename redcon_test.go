@@ -767,3 +767,245 @@ func TestPubSub(t *testing.T) {
 	// stop the timeout
 	final <- true
 }
+
+func TestPubSubSlowConsumer(t *testing.T) {
+	policies := []struct {
+		name   string
+		policy SlowConsumerPolicy
+	}{
+		{"close", SlowConsumerClose},
+		{"drop", SlowConsumerDrop},
+	}
+	for i, p := range policies {
+		t.Run(p.name, func(t *testing.T) {
+			testPubSubSlowConsumer(t, p.policy, 12360+i)
+		})
+	}
+}
+
+func testPubSubSlowConsumer(t *testing.T, policy SlowConsumerPolicy,
+	port int,
+) {
+	defer time.AfterFunc(time.Minute, func() {
+		panic("test timed out")
+	}).Stop()
+
+	var ps PubSub
+	ps.SetMaxQueue(16)
+	ps.SetSlowConsumerPolicy(policy)
+	addr := fmt.Sprintf(":%d", port)
+	go func() {
+		panic(ListenAndServe(addr, func(conn Conn, cmd Command) {
+			switch strings.ToLower(string(cmd.Args[0])) {
+			default:
+				conn.WriteError("ERR unknown command '" +
+					string(cmd.Args[0]) + "'")
+			case "subscribe":
+				for i := 1; i < len(cmd.Args); i++ {
+					ps.Subscribe(conn, string(cmd.Args[i]))
+				}
+			case "publish":
+				count := ps.Publish(string(cmd.Args[1]),
+					string(cmd.Args[2]))
+				conn.WriteInt(count)
+			}
+		}, nil, nil))
+	}()
+
+	dial := func() net.Conn {
+		for i := 0; i < 50; i++ {
+			conn, err := net.Dial("tcp", addr)
+			if err == nil {
+				return conn
+			}
+			time.Sleep(time.Millisecond * 100)
+		}
+		t.Fatal("could not connect to server")
+		return nil
+	}
+	readFrame := func(rd *bufio.Reader) (RESP, error) {
+		var buf []byte
+		for {
+			line, err := rd.ReadBytes('\n')
+			if err != nil {
+				return RESP{}, err
+			}
+			buf = append(buf, line...)
+			n, resp := ReadNextRESP(buf)
+			if n == 0 {
+				continue
+			}
+			return resp, nil
+		}
+	}
+	mustRead := func(rd *bufio.Reader) []RESP {
+		resp, err := readFrame(rd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Type != Array {
+			t.Fatalf("expected array, got %v", resp.Type)
+		}
+		var vals []RESP
+		resp.ForEach(func(item RESP) bool {
+			vals = append(vals, item)
+			return true
+		})
+		return vals
+	}
+
+	// Client A subscribes and then stops reading.
+	connA := dial()
+	defer connA.Close()
+	fmt.Fprintf(connA, "subscribe chan\r\n")
+	rdA := bufio.NewReader(connA)
+	if vals := mustRead(rdA); string(vals[0].Data) != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %s", vals[0].Data)
+	}
+
+	// Client B subscribes and keeps reading.
+	connB := dial()
+	defer connB.Close()
+	fmt.Fprintf(connB, "subscribe chan\r\n")
+	rdB := bufio.NewReader(connB)
+	if vals := mustRead(rdB); string(vals[0].Data) != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %s", vals[0].Data)
+	}
+
+	// Publish large messages. Client A's queue fills up and the slow
+	// consumer policy kicks in, while client B keeps receiving. The
+	// publishes must not block on A's stuck network writes. The publishes
+	// are paced so that the fast consumer can keep up while the stuck
+	// one inevitably reaches the queue limit.
+	const total = 40
+	msg := strings.Repeat("x", 1<<20)
+	recvB := make(chan error, 1)
+	go func() {
+		for i := 0; i < total; i++ {
+			resp, err := readFrame(rdB)
+			if err != nil {
+				recvB <- err
+				return
+			}
+			var vals []RESP
+			resp.ForEach(func(item RESP) bool {
+				vals = append(vals, item)
+				return true
+			})
+			if len(vals) != 3 || string(vals[0].Data) != "message" ||
+				string(vals[2].Data) != msg {
+				recvB <- fmt.Errorf("invalid message frame")
+				return
+			}
+		}
+		recvB <- nil
+	}()
+	for i := 0; i < total; i++ {
+		ps.Publish("chan", msg)
+		time.Sleep(time.Millisecond * 15)
+	}
+	select {
+	case err := <-recvB:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the fast subscriber")
+	}
+
+	stats := ps.Stats()
+	switch policy {
+	case SlowConsumerClose:
+		if stats.Evicted != 1 {
+			t.Fatalf("expected 1 evicted connection, got %d",
+				stats.Evicted)
+		}
+		if stats.Dropped != 0 {
+			t.Fatalf("expected 0 dropped messages, got %d",
+				stats.Dropped)
+		}
+		// The slow connection must be closed by the server. Drain
+		// whatever is still buffered and expect EOF, not a timeout.
+		connA.SetReadDeadline(time.Now().Add(10 * time.Second))
+		var err error
+		for {
+			_, err = readFrame(rdA)
+			if err != nil {
+				break
+			}
+		}
+		if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+			t.Fatal("expected the slow connection to be closed")
+		}
+	case SlowConsumerDrop:
+		if stats.Dropped == 0 {
+			t.Fatal("expected dropped messages")
+		}
+		if stats.Evicted != 0 {
+			t.Fatalf("expected 0 evicted connections, got %d",
+				stats.Evicted)
+		}
+		// The slow connection stays open. Drain whatever remains in
+		// its queue.
+		connA.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for {
+			if _, err := readFrame(rdA); err != nil {
+				break
+			}
+		}
+		// The connection is still alive and answers to ping.
+		connA.SetReadDeadline(time.Now().Add(10 * time.Second))
+		fmt.Fprintf(connA, "ping hello\r\n")
+		for {
+			vals := mustRead(rdA)
+			if string(vals[0].Data) == "pong" {
+				break
+			}
+		}
+		// The connection is still subscribed and receives new
+		// messages.
+		ps.Publish("chan", "final")
+		if vals := mustRead(rdA); string(vals[0].Data) != "message" ||
+			string(vals[2].Data) != "final" {
+			t.Fatal("slow connection did not receive new message")
+		}
+		// The fast connection receives it too.
+		if vals := mustRead(rdB); string(vals[0].Data) != "message" ||
+			string(vals[2].Data) != "final" {
+			t.Fatal("fast connection did not receive new message")
+		}
+	}
+
+	// Unsubscribe and close B. The stuck or evicted A must not hold the
+	// PubSub lock, so these complete promptly.
+	fmt.Fprintf(connB, "unsubscribe chan\r\n")
+	if vals := mustRead(rdB); string(vals[0].Data) != "unsubscribe" {
+		t.Fatalf("expected unsubscribe confirmation, got %s",
+			vals[0].Data)
+	}
+	fmt.Fprintf(connB, "quit\r\n")
+	line, err := rdB.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "+OK\r\n" {
+		t.Fatalf("expected +OK, got %q", line)
+	}
+
+	// Close both clients and wait for the server to remove them.
+	connA.Close()
+	connB.Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ps.mu.RLock()
+		empty := len(ps.conns) == 0 && ps.chans.Len() == 0
+		ps.mu.RUnlock()
+		if empty {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connections were not cleaned up")
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+}

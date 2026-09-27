@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -1102,13 +1103,80 @@ func (m *ServeMux) ServeRESP(conn Conn, cmd Command) {
 	}
 }
 
+// SlowConsumerPolicy determines how PubSub handles a subscribed connection
+// that is not reading fast enough and whose outbound queue is full.
+type SlowConsumerPolicy int
+
+const (
+	// SlowConsumerClose closes the slow connection. This is the default
+	// policy and matches the Redis behavior for slow pubsub clients.
+	SlowConsumerClose SlowConsumerPolicy = iota
+	// SlowConsumerDrop drops the message that does not fit into the
+	// connection's outbound queue. The connection stays open.
+	SlowConsumerDrop
+)
+
+// DefaultPubSubQueueSize is the default maximum number of outbound
+// messages that may be queued for a single subscribed connection.
+const DefaultPubSubQueueSize = 1024
+
+// PubSubStats contains PubSub statistics.
+type PubSubStats struct {
+	// Dropped is the total number of messages that were dropped because a
+	// subscriber's outbound queue was full (SlowConsumerDrop policy).
+	Dropped uint64
+	// Evicted is the total number of connections that were closed because
+	// they were too slow to keep up (SlowConsumerClose policy).
+	Evicted uint64
+}
+
 // PubSub is a Redis compatible pub/sub server
 type PubSub struct {
-	mu     sync.RWMutex
-	nextid uint64
-	initd  bool
-	chans  *btree.BTree
-	conns  map[Conn]*pubSubConn
+	mu      sync.RWMutex
+	nextid  uint64
+	initd   bool
+	chans   *btree.BTree
+	conns   map[Conn]*pubSubConn
+	maxq    atomic.Int32
+	policy  atomic.Int32
+	dropped atomic.Uint64
+	evicted atomic.Uint64
+}
+
+// SetMaxQueue sets the maximum number of outbound messages that may be
+// queued for a single subscribed connection before the slow consumer
+// policy is applied. A value less than one resets the limit to
+// DefaultPubSubQueueSize. The new limit only applies to connections that
+// subscribe after the call.
+func (ps *PubSub) SetMaxQueue(n int) {
+	if n <= 0 {
+		n = DefaultPubSubQueueSize
+	}
+	ps.maxq.Store(int32(n))
+}
+
+// SetSlowConsumerPolicy sets the policy for handling subscribed
+// connections whose outbound queue is full. The default is
+// SlowConsumerClose.
+func (ps *PubSub) SetSlowConsumerPolicy(policy SlowConsumerPolicy) {
+	ps.policy.Store(int32(policy))
+}
+
+// Stats returns the PubSub statistics, which allows for observing how
+// slow consumers are being handled.
+func (ps *PubSub) Stats() PubSubStats {
+	return PubSubStats{
+		Dropped: ps.dropped.Load(),
+		Evicted: ps.evicted.Load(),
+	}
+}
+
+func (ps *PubSub) queueSize() int {
+	n := ps.maxq.Load()
+	if n <= 0 {
+		return DefaultPubSubQueueSize
+	}
+	return int(n)
 }
 
 // Subscribe a connection to PubSub
@@ -1121,7 +1189,14 @@ func (ps *PubSub) Psubscribe(conn Conn, channel string) {
 	ps.subscribe(conn, true, channel)
 }
 
-// Publish a message to subscribers
+// Publish a message to subscribers.
+//
+// Every subscribed connection has its own bounded outbound queue, so a
+// connection that stops reading can only delay itself; it never blocks
+// other subscribers and never holds the PubSub lock while writing to the
+// network. Messages and (un)subscribe confirmations are delivered to a
+// connection in the order in which Publish, Subscribe and Unsubscribe
+// acquire the PubSub lock.
 func (ps *PubSub) Publish(channel, message string) int {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
@@ -1129,25 +1204,26 @@ func (ps *PubSub) Publish(channel, message string) int {
 		return 0
 	}
 	var sent int
-	// write messages to all clients that are subscribed on the channel
+	// enqueue the message to all clients that are subscribed on the channel
+	data := messageFrame(false, "", channel, message)
 	pivot := &pubSubEntry{pattern: false, channel: channel}
 	ps.chans.Ascend(pivot, func(item interface{}) bool {
 		entry := item.(*pubSubEntry)
 		if entry.channel != pivot.channel || entry.pattern != pivot.pattern {
 			return false
 		}
-		entry.sconn.writeMessage(entry.pattern, "", channel, message)
+		entry.sconn.enqueue(ps, data)
 		sent++
 		return true
 	})
 
-	// match on and write all psubscribe clients
+	// match on and enqueue to all psubscribe clients
 	pivot = &pubSubEntry{pattern: true}
 	ps.chans.Ascend(pivot, func(item interface{}) bool {
 		entry := item.(*pubSubEntry)
 		if match.Match(channel, entry.channel) {
-			entry.sconn.writeMessage(entry.pattern, entry.channel, channel,
-				message)
+			entry.sconn.enqueue(ps, messageFrame(true, entry.channel,
+				channel, message))
 		}
 		sent++
 		return true
@@ -1162,6 +1238,8 @@ type pubSubConn struct {
 	conn    Conn
 	dconn   DetachedConn
 	entries map[*pubSubEntry]bool
+	queue   chan []byte
+	closed  bool
 }
 
 type pubSubEntry struct {
@@ -1170,22 +1248,93 @@ type pubSubEntry struct {
 	channel string
 }
 
-func (sconn *pubSubConn) writeMessage(pat bool, pchan, channel, msg string) {
-	sconn.mu.Lock()
-	defer sconn.mu.Unlock()
+// messageFrame serializes a (p)message frame.
+func messageFrame(pat bool, pchan, channel, msg string) []byte {
+	var data []byte
 	if pat {
-		sconn.dconn.WriteArray(4)
-		sconn.dconn.WriteBulkString("pmessage")
-		sconn.dconn.WriteBulkString(pchan)
-		sconn.dconn.WriteBulkString(channel)
-		sconn.dconn.WriteBulkString(msg)
+		data = AppendArray(data, 4)
+		data = AppendBulkString(data, "pmessage")
+		data = AppendBulkString(data, pchan)
 	} else {
-		sconn.dconn.WriteArray(3)
-		sconn.dconn.WriteBulkString("message")
-		sconn.dconn.WriteBulkString(channel)
-		sconn.dconn.WriteBulkString(msg)
+		data = AppendArray(data, 3)
+		data = AppendBulkString(data, "message")
 	}
-	sconn.dconn.Flush()
+	data = AppendBulkString(data, channel)
+	data = AppendBulkString(data, msg)
+	return data
+}
+
+// enqueue adds a serialized frame to the connection's outbound queue. The
+// slow consumer policy is applied when the queue is full.
+func (sconn *pubSubConn) enqueue(ps *PubSub, data []byte) {
+	sconn.mu.Lock()
+	if sconn.closed {
+		sconn.mu.Unlock()
+		return
+	}
+	select {
+	case sconn.queue <- data:
+		sconn.mu.Unlock()
+	default:
+		sconn.mu.Unlock()
+		ps.handleSlowConsumer(sconn)
+	}
+}
+
+// handleSlowConsumer applies the configured policy to a connection whose
+// outbound queue is full.
+func (ps *PubSub) handleSlowConsumer(sconn *pubSubConn) {
+	if SlowConsumerPolicy(ps.policy.Load()) == SlowConsumerDrop {
+		ps.dropped.Add(1)
+		return
+	}
+	ps.evicted.Add(1)
+	sconn.close()
+}
+
+// close marks the connection as closed and closes the network connection,
+// which unblocks the writer and background goroutines. The connection's
+// entries are removed by the background goroutine.
+func (sconn *pubSubConn) close() {
+	sconn.mu.Lock()
+	sconn.closed = true
+	sconn.mu.Unlock()
+	closeNetConn(sconn.dconn)
+}
+
+// shutdown stops accepting new outbound frames and lets the writer
+// goroutine drain the queue and close the network connection.
+func (sconn *pubSubConn) shutdown() {
+	sconn.mu.Lock()
+	if !sconn.closed {
+		sconn.closed = true
+		close(sconn.queue)
+	}
+	sconn.mu.Unlock()
+}
+
+// writer is the dedicated outbound goroutine for the connection. It is the
+// only goroutine that writes to the detached connection, thus a client
+// that stops reading can only block itself.
+func (sconn *pubSubConn) writer() {
+	for data := range sconn.queue {
+		sconn.dconn.WriteRaw(data)
+		if err := sconn.dconn.Flush(); err != nil {
+			break
+		}
+	}
+	closeNetConn(sconn.dconn)
+}
+
+// closeNetConn closes the underlying network connection of a detached
+// connection. Unlike Close, it does not flush the write buffer, which
+// could block forever on a client that stopped reading.
+func closeNetConn(dconn DetachedConn) {
+	if nc, ok := dconn.(interface{ NetConn() net.Conn }); ok {
+		nc.NetConn().Close()
+		return
+	}
+	dconn.Close()
 }
 
 // bgrunner runs in the background and reads incoming commands from the
@@ -1195,14 +1344,12 @@ func (sconn *pubSubConn) bgrunner(ps *PubSub) {
 		// client connection has ended, disconnect from the PubSub instances
 		// and close the network connection.
 		ps.mu.Lock()
-		defer ps.mu.Unlock()
 		for entry := range sconn.entries {
 			ps.chans.Delete(entry)
 		}
 		delete(ps.conns, sconn.conn)
-		sconn.mu.Lock()
-		defer sconn.mu.Unlock()
-		sconn.dconn.Close()
+		ps.mu.Unlock()
+		sconn.shutdown()
 	}()
 	for {
 		cmd, err := sconn.dconn.ReadCommand()
@@ -1215,13 +1362,8 @@ func (sconn *pubSubConn) bgrunner(ps *PubSub) {
 		switch strings.ToLower(string(cmd.Args[0])) {
 		case "psubscribe", "subscribe":
 			if len(cmd.Args) < 2 {
-				func() {
-					sconn.mu.Lock()
-					defer sconn.mu.Unlock()
-					sconn.dconn.WriteError(fmt.Sprintf("ERR wrong number of "+
-						"arguments for '%s'", cmd.Args[0]))
-					sconn.dconn.Flush()
-				}()
+				sconn.enqueue(ps, AppendError(nil, fmt.Sprintf(
+					"ERR wrong number of arguments for '%s'", cmd.Args[0])))
 				continue
 			}
 			command := strings.ToLower(string(cmd.Args[0]))
@@ -1243,13 +1385,7 @@ func (sconn *pubSubConn) bgrunner(ps *PubSub) {
 				}
 			}
 		case "quit":
-			func() {
-				sconn.mu.Lock()
-				defer sconn.mu.Unlock()
-				sconn.dconn.WriteString("OK")
-				sconn.dconn.Flush()
-				sconn.dconn.Close()
-			}()
+			sconn.enqueue(ps, AppendOK(nil))
 			return
 		case "ping":
 			var msg string
@@ -1258,32 +1394,20 @@ func (sconn *pubSubConn) bgrunner(ps *PubSub) {
 			case 2:
 				msg = string(cmd.Args[1])
 			default:
-				func() {
-					sconn.mu.Lock()
-					defer sconn.mu.Unlock()
-					sconn.dconn.WriteError(fmt.Sprintf("ERR wrong number of "+
-						"arguments for '%s'", cmd.Args[0]))
-					sconn.dconn.Flush()
-				}()
+				sconn.enqueue(ps, AppendError(nil, fmt.Sprintf(
+					"ERR wrong number of arguments for '%s'", cmd.Args[0])))
 				continue
 			}
-			func() {
-				sconn.mu.Lock()
-				defer sconn.mu.Unlock()
-				sconn.dconn.WriteArray(2)
-				sconn.dconn.WriteBulkString("pong")
-				sconn.dconn.WriteBulkString(msg)
-				sconn.dconn.Flush()
-			}()
+			var data []byte
+			data = AppendArray(data, 2)
+			data = AppendBulkString(data, "pong")
+			data = AppendBulkString(data, msg)
+			sconn.enqueue(ps, data)
 		default:
-			func() {
-				sconn.mu.Lock()
-				defer sconn.mu.Unlock()
-				sconn.dconn.WriteError(fmt.Sprintf("ERR Can't execute '%s': "+
-					"only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are "+
-					"allowed in this context", cmd.Args[0]))
-				sconn.dconn.Flush()
-			}()
+			sconn.enqueue(ps, AppendError(nil, fmt.Sprintf(
+				"ERR Can't execute '%s': only (P)SUBSCRIBE / (P)UNSUBSCRIBE"+
+					" / PING / QUIT are allowed in this context",
+				cmd.Args[0])))
 		}
 	}
 }
@@ -1340,11 +1464,14 @@ func (ps *PubSub) subscribe(conn Conn, pattern bool, channel string) {
 			conn:    conn,
 			dconn:   dconn,
 			entries: make(map[*pubSubEntry]bool),
+			queue:   make(chan []byte, ps.queueSize()),
 		}
 		ps.conns[conn] = sconn
+		// start the dedicated outbound writer. A client that stops
+		// reading can only block this goroutine, never the PubSub
+		// instance or the other subscribers.
+		go sconn.writer()
 	}
-	sconn.mu.Lock()
-	defer sconn.mu.Unlock()
 
 	// add an entry to the pubsub btree
 	entry := &pubSubEntry{
@@ -1355,22 +1482,23 @@ func (ps *PubSub) subscribe(conn Conn, pattern bool, channel string) {
 	ps.chans.Set(entry)
 	sconn.entries[entry] = true
 
-	// send a message to the client
-	sconn.dconn.WriteArray(3)
+	// enqueue the confirmation to the client
+	var data []byte
+	data = AppendArray(data, 3)
 	if pattern {
-		sconn.dconn.WriteBulkString("psubscribe")
+		data = AppendBulkString(data, "psubscribe")
 	} else {
-		sconn.dconn.WriteBulkString("subscribe")
+		data = AppendBulkString(data, "subscribe")
 	}
-	sconn.dconn.WriteBulkString(channel)
+	data = AppendBulkString(data, channel)
 	var count int
 	for entry := range sconn.entries {
 		if entry.pattern == pattern {
 			count++
 		}
 	}
-	sconn.dconn.WriteInt(count)
-	sconn.dconn.Flush()
+	data = AppendInt(data, int64(count))
+	sconn.enqueue(ps, data)
 
 	// start the background client operation
 	if !ok {
@@ -1383,24 +1511,23 @@ func (ps *PubSub) unsubscribe(conn Conn, pattern, all bool, channel string) {
 	defer ps.mu.Unlock()
 	// fetch the pubSubConn. This must exist
 	sconn := ps.conns[conn]
-	sconn.mu.Lock()
-	defer sconn.mu.Unlock()
 
+	var data []byte
 	removeEntry := func(entry *pubSubEntry) {
 		if entry != nil {
 			ps.chans.Delete(entry)
 			delete(sconn.entries, entry)
 		}
-		sconn.dconn.WriteArray(3)
+		data = AppendArray(data, 3)
 		if pattern {
-			sconn.dconn.WriteBulkString("punsubscribe")
+			data = AppendBulkString(data, "punsubscribe")
 		} else {
-			sconn.dconn.WriteBulkString("unsubscribe")
+			data = AppendBulkString(data, "unsubscribe")
 		}
 		if entry != nil {
-			sconn.dconn.WriteBulkString(entry.channel)
+			data = AppendBulkString(data, entry.channel)
 		} else {
-			sconn.dconn.WriteNull()
+			data = AppendNull(data)
 		}
 		var count int
 		for entry := range sconn.entries {
@@ -1408,7 +1535,7 @@ func (ps *PubSub) unsubscribe(conn Conn, pattern, all bool, channel string) {
 				count++
 			}
 		}
-		sconn.dconn.WriteInt(count)
+		data = AppendInt(data, int64(count))
 	}
 	if all {
 		// unsubscribe from all (p)subscribe entries
@@ -1434,7 +1561,9 @@ func (ps *PubSub) unsubscribe(conn Conn, pattern, all bool, channel string) {
 			}
 		}
 	}
-	sconn.dconn.Flush()
+	if len(data) > 0 {
+		sconn.enqueue(ps, data)
+	}
 }
 
 // SetIdleClose will automatically close idle connections after the specified
