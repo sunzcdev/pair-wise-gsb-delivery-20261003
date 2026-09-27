@@ -838,6 +838,24 @@ func (c *Conn) handleAuth(arg string) {
 
 	mechanism := strings.ToUpper(parts[0])
 
+	// If an auth policy is in place, reject mechanisms that are not
+	// allowed on this connection, either because the backend does not
+	// support them or because the policy disallows them for the current
+	// connection state.
+	if c.server.AuthPolicy != nil {
+		mechAllowed := false
+		for _, name := range c.authMechanisms() {
+			if strings.EqualFold(name, mechanism) {
+				mechAllowed = true
+				break
+			}
+		}
+		if !mechAllowed {
+			c.writeError(454, EnhancedCode{4, 7, 0}, ErrAuthUnknownMechanism)
+			return
+		}
+	}
+
 	// Parse client initial response if there is one
 	var ir []byte
 	if len(parts) > 1 {
@@ -903,10 +921,40 @@ func decodeSASLResponse(s string) ([]byte, error) {
 }
 
 func (c *Conn) authMechanisms() []string {
-	if authSession, ok := c.Session().(AuthSession); ok {
-		return authSession.AuthMechanisms()
+	authSession, ok := c.Session().(AuthSession)
+	if !ok {
+		return nil
 	}
-	return nil
+
+	mechs := authSession.AuthMechanisms()
+
+	// Filter the mechanisms through the server auth policy, if any. The
+	// policy result is intersected with the backend list so that it cannot
+	// enable mechanisms the backend does not support. Mechanism names are
+	// compared case-insensitively. This is computed on each call from the
+	// current connection state, so results are never retained across
+	// STARTTLS, failed handshakes or connection state resets.
+	if policy := c.server.AuthPolicy; policy != nil {
+		var tlsState *tls.ConnectionState
+		if state, ok := c.TLSConnectionState(); ok {
+			tlsState = &state
+		}
+
+		allowed := make(map[string]bool)
+		for _, mech := range policy(tlsState, mechs) {
+			allowed[strings.ToUpper(mech)] = true
+		}
+
+		filtered := make([]string, 0, len(mechs))
+		for _, mech := range mechs {
+			if allowed[strings.ToUpper(mech)] {
+				filtered = append(filtered, mech)
+			}
+		}
+		mechs = filtered
+	}
+
+	return mechs
 }
 
 func (c *Conn) auth(mech string) (sasl.Server, error) {

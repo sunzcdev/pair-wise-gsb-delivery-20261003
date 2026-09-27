@@ -30,6 +30,9 @@ type message struct {
 type backend struct {
 	authDisabled bool
 
+	// Mechanisms offered by AuthMechanisms. Defaults to PLAIN if nil.
+	authMechs []string
+
 	messages []*message
 	anonmsgs []*message
 
@@ -78,12 +81,20 @@ func (s *session) AuthMechanisms() []string {
 	if s.backend.authDisabled {
 		return nil
 	}
+	if s.backend.authMechs != nil {
+		return s.backend.authMechs
+	}
 	return []string{sasl.Plain}
 }
 
 func (s *session) Auth(mech string) (sasl.Server, error) {
 	if s.backend.authDisabled {
 		return nil, smtp.ErrAuthUnsupported
+	}
+	if strings.EqualFold(mech, sasl.Anonymous) {
+		return sasl.NewAnonymousServer(func(trace string) error {
+			return nil
+		}), nil
 	}
 	return sasl.NewPlainServer(func(identity, username, password string) error {
 		if identity != "" && identity != username {

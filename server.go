@@ -41,6 +41,22 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// AuthPolicy, if set, is called to determine which authentication
+	// mechanisms are allowed on a connection. It receives the connection's
+	// TLS state (or nil if the connection is not encrypted) and the list of
+	// mechanisms supported by the backend, and returns the list of
+	// mechanisms allowed for this connection. The returned list is
+	// intersected (case-insensitively) with the backend's list, so the
+	// policy cannot enable mechanisms the backend does not support.
+	//
+	// The policy is evaluated for every EHLO and AUTH command using the
+	// current connection state. In particular, it is re-evaluated after
+	// STARTTLS completes, and results allowed before a failed TLS
+	// handshake or a connection state reset are not retained.
+	//
+	// If nil, all mechanisms supported by the backend are allowed.
+	AuthPolicy func(state *tls.ConnectionState, mechs []string) []string
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool
