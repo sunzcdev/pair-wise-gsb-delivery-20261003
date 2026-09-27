@@ -35,6 +35,10 @@ type Conn struct {
 	locker     sync.Mutex
 	binarymime bool
 
+	// wg tracks backend goroutines spawned for this connection (e.g. the
+	// BDAT Data handler), so that connection termination waits for them.
+	wg sync.WaitGroup
+
 	lineLimitReader *lineLimitReader
 	bdatPipe        *io.PipeWriter
 	bdatStatus      *statusCollector // used for BDAT on LMTP
@@ -170,6 +174,10 @@ func (c *Conn) Close() error {
 	c.locker.Lock()
 	defer c.locker.Unlock()
 
+	return c.closeLocked()
+}
+
+func (c *Conn) closeLocked() error {
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
 		c.bdatPipe = nil
@@ -181,6 +189,28 @@ func (c *Conn) Close() error {
 	}
 
 	return c.conn.Close()
+}
+
+// transactionActive reports whether a mail transaction is in progress, i.e.
+// the client has issued MAIL FROM and the transaction has not been completed
+// or reset yet.
+func (c *Conn) transactionActive() bool {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+	return c.fromReceived
+}
+
+// closeIfIdle closes the connection only if no mail transaction is in
+// progress. No response is written, so it is safe to call while the client
+// might be transmitting a message body.
+func (c *Conn) closeIfIdle() {
+	c.locker.Lock()
+	defer c.locker.Unlock()
+
+	if c.fromReceived {
+		return
+	}
+	c.closeLocked()
 }
 
 // TLSConnectionState returns the connection's TLS connection state.
@@ -476,8 +506,11 @@ func (c *Conn) handleMail(arg string) {
 		return
 	}
 
-	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
+	c.locker.Lock()
 	c.fromReceived = true
+	c.locker.Unlock()
+
+	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
 }
 
 // This regexp matches 'hexchar' token defined in
@@ -1042,7 +1075,9 @@ func (c *Conn) handleBdat(arg string) {
 
 		c.dataResult = make(chan error, 1)
 
+		c.wg.Add(1)
 		go func() {
+			defer c.wg.Done()
 			defer func() {
 				if err := recover(); err != nil {
 					c.handlePanic(err, c.bdatStatus)

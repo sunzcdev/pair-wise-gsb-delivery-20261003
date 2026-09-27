@@ -2,11 +2,13 @@ package smtp_test
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-smtp"
 )
@@ -244,5 +246,83 @@ func TestServer_LMTP_DuplicatedRcpt(t *testing.T) {
 
 	if len(be.messages) != 0 || len(be.anonmsgs) != 1 {
 		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+}
+
+func TestServerShutdown_LMTP(t *testing.T) {
+	be, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
+		s.LMTP = true
+		be := s.Backend.(*backend)
+		be.implementLMTPData = true
+		be.lmtpStatus = []struct {
+			addr string
+			err  error
+		}{
+			{"root@gchq.gov.uk", errors.New("nah")},
+			{"root@bnd.bund.de", nil},
+		}
+	})
+	defer c.Close()
+
+	sendLHLO(t, scanner, c)
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@bnd.bund.de>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	// Begin the message body, then request a shutdown in the middle of the
+	// DATA phase.
+	io.WriteString(c, "First half of the body\r\n")
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(context.Background())
+	}()
+
+	// Shutdown must not interrupt the ongoing transaction.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-shutdownDone:
+		t.Fatal("Shutdown returned while a transaction was in progress:", err)
+	default:
+	}
+
+	io.WriteString(c, "Second half of the body\r\n")
+	io.WriteString(c, ".\r\n")
+
+	// Per-recipient statuses must be delivered as usual.
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "554 5.0.0 <root@gchq.gov.uk>") {
+		t.Fatal("Invalid DATA first response:", scanner.Text())
+	}
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA second response:", scanner.Text())
+	}
+
+	// Now that the transaction is complete, the server must terminate the
+	// connection instead of processing further commands.
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "421 ") {
+		t.Fatal("Expected connection termination after transaction, got:", scanner.Text())
+	}
+
+	if err := <-shutdownDone; err != nil {
+		t.Fatal("Shutdown error:", err)
+	}
+
+	// The message body must have been delivered intact: no SMTP response
+	// may have been interleaved while the body was read.
+	if len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.anonmsgs))
+	}
+	expected := "First half of the body\r\nSecond half of the body\r\n"
+	if got := string(be.anonmsgs[0].Data); got != expected {
+		t.Fatalf("Invalid message body: %q", got)
 	}
 }

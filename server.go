@@ -155,11 +155,21 @@ func (s *Server) handleConn(c *Conn) error {
 
 	defer func() {
 		c.Close()
+		// Wait for backend work spawned by this connection (e.g. BDAT
+		// Data handlers) to terminate.
+		c.wg.Wait()
 
 		s.locker.Lock()
 		delete(s.conns, c)
 		s.locker.Unlock()
 	}()
+
+	// The server may have been shut down between Accept and this point.
+	select {
+	case <-s.done:
+		return nil
+	default:
+	}
 
 	if tlsConn, ok := c.conn.(*tls.Conn); ok {
 		if d := s.ReadTimeout; d != 0 {
@@ -176,6 +186,19 @@ func (s *Server) handleConn(c *Conn) error {
 	c.greet()
 
 	for {
+		// If the server is shutting down, terminate the connection as
+		// soon as it is idle. A connection in the middle of a mail
+		// transaction is left alone so that no response is interleaved
+		// with the message body being read.
+		select {
+		case <-s.done:
+			if !c.transactionActive() {
+				c.writeResponse(421, EnhancedCode{4, 3, 2}, "Server shutting down, bye")
+				return nil
+			}
+		default:
+		}
+
 		line, err := c.readLine()
 		if err == nil {
 			cmd, arg, err := parseCmd(line)
@@ -284,12 +307,16 @@ func (s *Server) Close() error {
 }
 
 // Shutdown gracefully shuts down the server without interrupting any
-// active connections. Shutdown works by first closing all open
-// listeners and then waiting indefinitely for connections to return to
-// idle and then shut down.
+// active mail transactions. Shutdown works by first closing all open
+// listeners, then closing all idle connections, and then waiting
+// indefinitely for connections with a transaction in progress to
+// complete it and shut down.
+//
 // If the provided context expires before the shutdown is complete,
-// Shutdown returns the context's error, otherwise it returns any
-// error returned from closing the Server's underlying Listener(s).
+// Shutdown forcibly closes the remaining connections, which cancels any
+// backend work in progress, waits for all connection handlers and backend
+// work to terminate, and returns the context's error. Otherwise it returns
+// any error returned from closing the Server's underlying Listener(s).
 func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.done:
@@ -305,6 +332,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			err = lerr
 		}
 	}
+
+	// Close connections that are not in the middle of a mail transaction
+	// right away. Connections with a transaction in progress are closed by
+	// their handlers once the transaction is completed.
+	for c := range s.conns {
+		c.closeIfIdle()
+	}
 	s.locker.Unlock()
 
 	connDone := make(chan struct{})
@@ -315,6 +349,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// The deadline has been reached: forcibly close the remaining
+		// connections. Closing a connection makes its message body
+		// readers fail, which cancels any backend work in progress. No
+		// response is written, so nothing gets interleaved with a
+		// message body being transmitted.
+		s.locker.Lock()
+		for c := range s.conns {
+			c.Close()
+		}
+		s.locker.Unlock()
+
+		// Make sure all connection handlers and the backend work they
+		// spawned have terminated before returning.
+		<-connDone
 		return ctx.Err()
 	case <-connDone:
 		return err
