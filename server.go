@@ -71,6 +71,12 @@ type Upgrader struct {
 	// guarantee that compression will be supported. Currently only "no context
 	// takeover" modes are supported.
 	EnableCompression bool
+
+	// EnableStrictTextRead specifies if the server should validate that text
+	// messages received from the peer are valid UTF-8 encoded text. The
+	// validation is performed incrementally as the message is read. See the
+	// Conn.EnableStrictTextRead method for more information.
+	EnableStrictTextRead bool
 }
 
 func (u *Upgrader) returnError(w http.ResponseWriter, r *http.Request, status int, reason string) (*Conn, error) {
@@ -212,6 +218,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	c := newConn(netConn, true, u.ReadBufferSize, u.WriteBufferSize, u.WriteBufferPool, br, writeBuf)
 	c.subprotocol = subprotocol
+	c.strictTextRead = u.EnableStrictTextRead
 
 	if compress {
 		c.newCompressionWriter = compressNoContextTakeover

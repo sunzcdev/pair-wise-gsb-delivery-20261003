@@ -89,6 +89,11 @@ var ErrCloseSent = errors.New("websocket: close sent")
 // read limit set for the connection.
 var ErrReadLimit = errors.New("websocket: read limit exceeded")
 
+// ErrInvalidUTF8 is returned when a text message read from the peer is not
+// valid UTF-8 encoded text. This error is only returned when strict text
+// validation is enabled with the EnableStrictTextRead method.
+var ErrInvalidUTF8 = errors.New("websocket: invalid utf8")
+
 // netError satisfies the net Error interface.
 type netError struct {
 	msg       string
@@ -279,6 +284,8 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	strictTextRead bool // whether to validate UTF-8 while reading text messages
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {
@@ -1029,6 +1036,9 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			if c.readDecompress {
 				c.reader = c.newDecompressionReader(c.reader)
 			}
+			if c.strictTextRead && frameType == TextMessage {
+				c.reader = &utf8Reader{c: c, r: c.reader}
+			}
 			return frameType, c.reader, nil
 		}
 	}
@@ -1122,6 +1132,17 @@ func (c *Conn) SetReadDeadline(t time.Time) error {
 // and returns ErrReadLimit to the application.
 func (c *Conn) SetReadLimit(limit int64) {
 	c.readLimit = limit
+}
+
+// EnableStrictTextRead enables and disables strict validation of text
+// messages read from the peer. When enabled, the payload of text messages is
+// validated as UTF-8 encoded text incrementally as the message is read,
+// without buffering the entire message in memory. Binary messages are not
+// validated. If a text message contains invalid UTF-8, the connection sends
+// a close message with code CloseInvalidFramePayloadData to the peer and the
+// message reader returns ErrInvalidUTF8.
+func (c *Conn) EnableStrictTextRead(enable bool) {
+	c.strictTextRead = enable
 }
 
 // CloseHandler returns the current close handler
