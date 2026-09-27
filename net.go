@@ -801,7 +801,7 @@ func (m *Memberlist) encodeAndSendMsg(a Address, msgType messageType, msg any) e
 // opportunistically create a compoundMsg and piggy back other broadcasts.
 func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 	// Check if we can piggy back any messages
-	bytesAvail := m.config.UDPBufferSize - len(msg) - compoundHeaderOverhead - labelOverhead(m.config.Label)
+	bytesAvail := m.packetBudget(a) - len(msg) - compoundHeaderOverhead - labelOverhead(m.config.Label)
 	if m.config.EncryptionEnabled() && m.config.GossipVerifyOutgoing {
 		bytesAvail -= encryptOverhead(m.encryptionVersion())
 	}
@@ -822,6 +822,27 @@ func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 
 	// Send the message
 	return m.rawSendMsgPacket(a, nil, compound.Bytes())
+}
+
+// packetBudget returns the maximum number of bytes that may be put on the
+// wire in a single packet towards the given destination, including any
+// headers memberlist adds (compound message header, encryption overhead and
+// label). It starts from the globally configured UDPBufferSize, which always
+// remains the upper bound, and shrinks it if the transport reports a smaller
+// effective budget for the peer or a smaller per-node budget is configured.
+func (m *Memberlist) packetBudget(a Address) int {
+	budget := m.config.UDPBufferSize
+	if t, ok := m.transport.(PacketBudgetAwareTransport); ok {
+		if b := t.PacketBudget(a); b > 0 && b < budget {
+			budget = b
+		}
+	}
+	if m.config.PacketBudgetForNode != nil && a.Name != "" {
+		if b := m.config.PacketBudgetForNode(a.Name); b > 0 && b < budget {
+			budget = b
+		}
+	}
+	return budget
 }
 
 // rawSendMsgPacket is used to send message via packet to another host without

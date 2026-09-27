@@ -101,6 +101,24 @@ type NodeAwareTransport interface {
 	DialAddressTimeout(addr Address, timeout time.Duration) (net.Conn, error)
 }
 
+// PacketBudgetAwareTransport is an optional interface that a Transport can
+// implement to report a smaller effective packet budget towards specific
+// peers. This is useful when some peers are reachable only through links
+// with a lower MTU (such as tunnels), where a packet sized for the global
+// UDPBufferSize would be silently dropped.
+//
+// The reported budget is the maximum number of bytes that may be put on the
+// wire in a single packet towards the given address, including any headers
+// memberlist adds (compound message header, encryption overhead and label).
+// The configured UDPBufferSize always remains the upper bound, so a
+// transport can only shrink the budget, never grow it.
+type PacketBudgetAwareTransport interface {
+	// PacketBudget returns the maximum effective packet size in bytes for
+	// the given destination. A return value <= 0 means the transport has
+	// no opinion and the default budget is used.
+	PacketBudget(addr Address) int
+}
+
 type shimNodeAwareTransport struct {
 	Transport
 }
@@ -113,6 +131,15 @@ func (t *shimNodeAwareTransport) WriteToAddress(b []byte, addr Address) (time.Ti
 
 func (t *shimNodeAwareTransport) DialAddressTimeout(addr Address, timeout time.Duration) (net.Conn, error) {
 	return t.DialTimeout(addr.Addr, timeout)
+}
+
+// PacketBudget forwards the budget reported by the wrapped transport if it
+// is budget aware, so that shimming doesn't hide it.
+func (t *shimNodeAwareTransport) PacketBudget(addr Address) int {
+	if pt, ok := t.Transport.(PacketBudgetAwareTransport); ok {
+		return pt.PacketBudget(addr)
+	}
+	return 0
 }
 
 type labelWrappedTransport struct {
@@ -160,4 +187,13 @@ func (t *labelWrappedTransport) DialTimeout(addr string, timeout time.Duration) 
 		return nil, fmt.Errorf("failed to add label header to stream: %w", err)
 	}
 	return conn, nil
+}
+
+// PacketBudget forwards the budget reported by the wrapped transport if it
+// is budget aware, so that label wrapping doesn't hide it.
+func (t *labelWrappedTransport) PacketBudget(addr Address) int {
+	if pt, ok := t.NodeAwareTransport.(PacketBudgetAwareTransport); ok {
+		return pt.PacketBudget(addr)
+	}
+	return 0
 }

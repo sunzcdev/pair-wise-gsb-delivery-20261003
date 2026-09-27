@@ -3,6 +3,10 @@
 
 package memberlist
 
+import (
+	"github.com/hashicorp/go-metrics"
+)
+
 /*
 The broadcast mechanism works by maintaining a sorted list of messages to be
 sent out. When a message is to be broadcast, the retransmit count
@@ -78,6 +82,18 @@ func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{
 // a maximum byte size, while imposing a per-broadcast overhead. This is used
 // to fill a UDP packet with piggybacked data
 func (m *Memberlist) getBroadcasts(overhead, limit int) [][]byte {
+	// Explicitly reject any broadcast that could never fit into a packet,
+	// even an otherwise empty one sized at the global UDPBufferSize, so
+	// that it doesn't sit at the head of the queue forever. Broadcasts
+	// that merely don't fit the (possibly per-peer reduced) limit of this
+	// particular call are left queued: they may still fit towards other
+	// peers or in a later, emptier packet.
+	maxLimit := m.maxBroadcastLimit()
+	for _, msg := range m.broadcasts.PruneOversized(overhead, maxLimit) {
+		m.logger.Printf("[WARN] memberlist: Dropping broadcast of %d bytes that can never fit in a packet (budget %d bytes)", len(msg), maxLimit)
+		metrics.IncrCounterWithLabels([]string{"memberlist", "broadcast", "dropped"}, 1, m.metricLabels)
+	}
+
 	// Get memberlist messages first
 	toSend := m.broadcasts.GetBroadcasts(overhead, limit)
 
@@ -105,4 +121,16 @@ func (m *Memberlist) getBroadcasts(overhead, limit int) [][]byte {
 		}
 	}
 	return toSend
+}
+
+// maxBroadcastLimit returns the largest byte limit that could ever be
+// available for broadcasts in a single packet, based on the global
+// UDPBufferSize and the fixed overheads (compound message header, label and
+// encryption). Per-peer budgets can only make the effective limit smaller.
+func (m *Memberlist) maxBroadcastLimit() int {
+	limit := m.config.UDPBufferSize - compoundHeaderOverhead - labelOverhead(m.config.Label)
+	if m.config.EncryptionEnabled() {
+		limit -= encryptOverhead(m.encryptionVersion())
+	}
+	return limit
 }

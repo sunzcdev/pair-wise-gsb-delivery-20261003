@@ -368,6 +368,38 @@ func (q *TransmitLimitedQueue) NumQueued() int {
 	return q.lenLocked()
 }
 
+// PruneOversized removes any queued broadcasts that could never fit within
+// the given per-message overhead and byte limit, even in an otherwise empty
+// packet. Each removed broadcast has Finished called on it so that it does
+// not sit at the head of the queue forever, and the dropped messages are
+// returned so the caller can log or otherwise handle the rejection.
+func (q *TransmitLimitedQueue) PruneOversized(overhead, limit int) [][]byte {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.lenLocked() == 0 {
+		return nil
+	}
+
+	var (
+		dropped [][]byte
+		remove  []*limitedBroadcast
+	)
+	q.walkReadOnlyLocked(false, func(cur *limitedBroadcast) bool {
+		msg := cur.b.Message()
+		if len(msg)+overhead > limit {
+			dropped = append(dropped, msg)
+			remove = append(remove, cur)
+		}
+		return true
+	})
+	for _, cur := range remove {
+		cur.b.Finished()
+		q.deleteItem(cur)
+	}
+	return dropped
+}
+
 // lenLocked returns the length of the overall queue datastructure. You must
 // hold the mutex.
 func (q *TransmitLimitedQueue) lenLocked() int {

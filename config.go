@@ -238,7 +238,24 @@ type Config struct {
 	// be able to increase this to get more content into each gossip packet.
 	// This is a legacy name for backward compatibility but should really be
 	// called PacketBufferSize now that we have generalized the transport.
+	//
+	// This is the global upper bound for every packet. It can be shrunk on
+	// a per-peer basis via PacketBudgetForNode or a transport implementing
+	// PacketBudgetAwareTransport, but never exceeded.
 	UDPBufferSize int
+
+	// PacketBudgetForNode optionally returns the maximum number of bytes
+	// that may be put on the wire in a single packet towards the named
+	// node, including any headers memberlist adds (compound message
+	// header, encryption overhead and label). This is useful when some
+	// peers are reachable only through links with a lower MTU (such as
+	// tunnels), where larger packets are silently dropped.
+	//
+	// A return value <= 0 means there is no per-node override. The
+	// effective budget for a peer is the smallest of UDPBufferSize, this
+	// value, and any budget reported by the transport, so this can only
+	// shrink the budget, never grow it.
+	PacketBudgetForNode func(nodeName string) int
 
 	// DeadNodeReclaimTime controls the time before a dead node's name can be
 	// reclaimed by one with a different address or port. By default, this is 0,
