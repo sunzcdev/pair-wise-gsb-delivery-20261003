@@ -2,6 +2,7 @@ package imapserver
 
 import (
 	"bufio"
+	"compress/flate"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -44,8 +45,10 @@ type Conn struct {
 	conn    net.Conn
 	enabled imap.CapSet
 
-	state   imap.ConnState
-	session Session
+	state       imap.ConnState
+	session     Session
+	compressed  bool
+	flateWriter *flate.Writer
 }
 
 func newConn(c net.Conn, server *Server) *Conn {
@@ -98,6 +101,7 @@ func (c *Conn) serve() {
 			c.server.logger().Printf("panic handling command: %v\n%s", v, debug.Stack())
 		}
 
+		c.closeCompress()
 		c.conn.Close()
 	}()
 
@@ -226,6 +230,9 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleCapability(dec)
 	case "STARTTLS":
 		err = c.handleStartTLS(tag, dec)
+		sendOK = false
+	case "COMPRESS":
+		err = c.handleCompress(tag, dec)
 		sendOK = false
 	case "AUTHENTICATE":
 		err = c.handleAuthenticate(tag, dec)

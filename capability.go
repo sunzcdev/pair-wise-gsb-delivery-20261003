@@ -15,8 +15,9 @@ const (
 	CapIMAP4rev1 Cap = "IMAP4rev1" // RFC 3501
 	CapIMAP4rev2 Cap = "IMAP4rev2" // RFC 9051
 
-	CapStartTLS      Cap = "STARTTLS"
-	CapLoginDisabled Cap = "LOGINDISABLED"
+	CapStartTLS        Cap = "STARTTLS"
+	CapLoginDisabled   Cap = "LOGINDISABLED"
+	CapCompressDeflate Cap = "COMPRESS=DEFLATE" // RFC 4978
 
 	// Folded in IMAP4rev2
 	CapNamespace    Cap = "NAMESPACE"     // RFC 2342
