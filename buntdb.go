@@ -45,6 +45,12 @@ var (
 	// ErrIndexExists is returned when an index already exists in the database.
 	ErrIndexExists = errors.New("index exists")
 
+	// ErrIndexConflict is returned when an operation violates the unique
+	// constraint of an index. Two values are considered conflicting when
+	// the index less function treats them as equal, even if the raw
+	// strings are not identical.
+	ErrIndexConflict = errors.New("index conflict")
+
 	// ErrInvalidOperation is returned when an operation cannot be completed.
 	ErrInvalidOperation = errors.New("invalid operation")
 
@@ -298,7 +304,7 @@ func (idx *index) clearCopy() *index {
 }
 
 // rebuild rebuilds the index
-func (idx *index) rebuild() {
+func (idx *index) rebuild() error {
 	// initialize trees
 	if idx.less != nil {
 		idx.btr = btreeNew(lessCtx(idx))
@@ -307,6 +313,7 @@ func (idx *index) rebuild() {
 		idx.rtr = rtred.New(idx)
 	}
 	// iterate through all keys and fill the index
+	var err error
 	btreeAscend(idx.db.keys, func(item interface{}) bool {
 		dbi := item.(*dbItem)
 		if !idx.match(dbi.key) {
@@ -314,6 +321,13 @@ func (idx *index) rebuild() {
 			return true
 		}
 		if idx.less != nil {
+			if idx.opts.Unique && idx.uniqueConflict(dbi) != nil {
+				// two distinct keys share a value that the less
+				// function considers equal. this violates the
+				// unique constraint of the index.
+				err = ErrIndexConflict
+				return false
+			}
 			idx.btr.Set(dbi)
 		}
 		if idx.rect != nil {
@@ -321,6 +335,39 @@ func (idx *index) rebuild() {
 		}
 		return true
 	})
+	return err
+}
+
+// uniqueConflict returns an item already contained in the index that the
+// unique constraint considers equal to the provided item. Two items are
+// considered equal when the index less function orders neither before the
+// other. An item with the same key is not a conflict because it will be
+// replaced by the provided item. Returns nil when there is no conflict or
+// when the index does not enforce uniqueness.
+func (idx *index) uniqueConflict(item *dbItem) *dbItem {
+	if idx.btr == nil || !idx.opts.Unique {
+		return nil
+	}
+	var conflict *dbItem
+	itemKey := item.key
+	// All items that the less function considers equal to the provided
+	// item are grouped together in the tree and ordered by their key.
+	// An empty pivot key sorts before any of them, so the scan starts at
+	// the first equal item.
+	pivot := &dbItem{val: item.val}
+	btreeAscendGreaterOrEqual(idx.btr, pivot, func(found interface{}) bool {
+		dbi := found.(*dbItem)
+		if idx.less(item.val, dbi.val) {
+			// moved past the group of equal items
+			return false
+		}
+		if dbi.key != itemKey {
+			conflict = dbi
+			return false
+		}
+		return true
+	})
+	return conflict
 }
 
 // CreateIndex builds a new index and populates it with items.
@@ -1191,7 +1238,10 @@ func (tx *Tx) rollbackInner() {
 			// this could be an expensive process if the database has many
 			// items or the index is complex.
 			tx.db.idxs[name] = idx
-			idx.rebuild()
+			// A unique index conflict cannot occur here because the
+			// rollback restores the dataset to a state that previously
+			// satisfied the constraint.
+			_ = idx.rebuild()
 		}
 	}
 }
@@ -1524,6 +1574,15 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 			// The caller is requesting that this item expires. Convert the
 			// TTL to an absolute time and bind it to the item.
 			item.opts = &dbItemOpts{ex: true, exat: time.Now().Add(opts.TTL)}
+		}
+	}
+	// Verify that the new item does not violate the unique constraint of
+	// any index before mutating the database. This keeps the main data,
+	// all indexes, and the rollback information untouched on conflict.
+	for _, idx := range tx.db.idxs {
+		if idx.btr != nil && idx.opts.Unique && idx.match(key) &&
+			idx.uniqueConflict(item) != nil {
+			return "", false, ErrIndexConflict
 		}
 	}
 	// Insert the item into the keys tree.
@@ -2047,6 +2106,15 @@ type IndexOptions struct {
 	// CaseInsensitiveKeyMatching allow for case-insensitive
 	// matching on keys when setting key/values.
 	CaseInsensitiveKeyMatching bool
+
+	// Unique indicates that the index enforces a uniqueness constraint
+	// on the indexed values. Two values are considered equal, and thus
+	// conflicting, when the index less function orders neither before
+	// the other, even if the raw strings are not identical. Operations
+	// that would introduce a duplicate fail with ErrIndexConflict.
+	// This option only applies to b-tree indexes and is ignored by
+	// spatial indexes.
+	Unique bool
 }
 
 // CreateIndex builds a new index and populates it with items.
@@ -2165,7 +2233,12 @@ func (tx *Tx) createIndex(name string, pattern string,
 		db:      tx.db,
 		opts:    sopts,
 	}
-	idx.rebuild()
+	if err := idx.rebuild(); err != nil {
+		// The index failed to build, likely due to a unique constraint
+		// conflict in the existing data. The index has not been added to
+		// the database, so there is nothing to clean up.
+		return err
+	}
 	// save the index
 	tx.db.idxs[name] = idx
 	if tx.wc.rbkeys == nil {
