@@ -4,6 +4,24 @@ Contains experimental utilities and APIs for Prometheus.
 
 Packages within this module are listed below.
 
+## Weighted Histogram
+
+The `weightedhistogram` package provides an experimental histogram that
+accepts integer-weighted observations via `ObserveWithWeight(value, weight)`.
+It targets pipelines that pre-aggregate identical measurements into (value,
+count) pairs, where replaying the count with repeated `Observe` calls would
+be wasteful. Each weighted observation is applied as one atomic statistical
+event, so `Collect` always returns a consistent snapshot.
+
+```go
+    import "github.com/prometheus/client_golang/exp/weightedhistogram"
+    ...
+
+    h := weightedhistogram.New(weightedhistogram.Opts{Buckets: []float64{0.1, 0.5, 1, 5}})
+    h.ObserveWithWeight(0.3, 1500) // Counts 0.3 a thousand and a half times, in O(buckets).
+    snapshot := h.Collect()
+```
+
 ## Remote
 
 This module contains production quality code with explicitly unstable API. Any code in this module can change its API or be removed; use with care.
