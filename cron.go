@@ -36,6 +36,27 @@ type Job interface {
 	Run()
 }
 
+// TriggerJob is an optional interface for jobs that need to know the
+// scheduled time that triggered each run, e.g. jobs coalescing triggers
+// that arrived while a previous run was still in progress.
+//
+// The scheduler detects this interface on the (wrapped) job and invokes
+// RunAt with the entry's scheduled activation time instead of Run. Jobs
+// that do not implement it are invoked via Run as usual, so implementing
+// it is fully backwards compatible.
+type TriggerJob interface {
+	RunAt(triggerTime time.Time)
+}
+
+// runJob runs j, passing the trigger time along if j implements TriggerJob.
+func runJob(j Job, t time.Time) {
+	if tj, ok := j.(TriggerJob); ok {
+		tj.RunAt(t)
+		return
+	}
+	j.Run()
+}
+
 // Schedule describes a job's duty cycle.
 type Schedule interface {
 	// Next returns the next activation time, later than the given time.
@@ -270,7 +291,7 @@ func (c *Cron) run() {
 					if e.Next.After(now) || e.Next.IsZero() {
 						break
 					}
-					c.startJob(e.WrappedJob)
+					c.startJob(e.WrappedJob, e.Next)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
@@ -304,12 +325,13 @@ func (c *Cron) run() {
 	}
 }
 
-// startJob runs the given job in a new goroutine.
-func (c *Cron) startJob(j Job) {
+// startJob runs the given job in a new goroutine, passing the scheduled
+// activation time to jobs that implement TriggerJob.
+func (c *Cron) startJob(j Job, t time.Time) {
 	c.jobWaiter.Add(1)
 	go func() {
 		defer c.jobWaiter.Done()
-		j.Run()
+		runJob(j, t)
 	}()
 }
 

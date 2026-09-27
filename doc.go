@@ -178,6 +178,8 @@ to achieve the following effects:
   - Recover any panics from jobs (activated by default)
   - Delay a job's execution if the previous run hasn't completed yet
   - Skip a job's execution if the previous run hasn't completed yet
+  - Coalesce triggers received while the previous run hasn't completed yet
+    into a single follow-up run
   - Log each job's invocations
 
 Install wrappers for all jobs added to a cron using the `cron.WithChain` option:
