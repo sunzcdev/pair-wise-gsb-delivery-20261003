@@ -33,6 +33,12 @@ type MemDB struct {
 
 	// There can only be a single writer at once
 	writer sync.Mutex
+
+	// watchMu guards rangeWatchers, which holds the active WatchRange
+	// subscriptions keyed by table and index. Subscriptions are removed
+	// when they fire or when Stop is called on the RangeIterator.
+	watchMu       sync.Mutex
+	rangeWatchers map[tableIndex]map[*rangeWatcher]struct{}
 }
 
 // NewMemDB creates a new MemDB with the given schema.

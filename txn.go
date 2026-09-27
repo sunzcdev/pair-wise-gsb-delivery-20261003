@@ -40,6 +40,11 @@ type Txn struct {
 	// it is nil at transaction start then changes are not tracked.
 	changes Changes
 
+	// indexMutations tracks the encoded index keys inserted or deleted during
+	// the transaction so that WatchRange subscriptions can be notified at
+	// commit time.
+	indexMutations map[tableIndex]*indexMutation
+
 	modified map[tableIndex]*iradix.Txn
 }
 
@@ -122,6 +127,7 @@ func (txn *Txn) Abort() {
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
+	txn.indexMutations = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -152,6 +158,11 @@ func (txn *Txn) Commit() {
 	newRoot := txn.rootTxn.CommitOnly()
 	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
 
+	// Notify any WatchRange subscribers whose range intersects the keys
+	// mutated by this transaction. This happens after the root pointer is
+	// swapped so that woken observers will see the new state.
+	txn.db.notifyRangeWatchers(txn.indexMutations)
+
 	// Now issue all of the mutation updates (this is safe to call
 	// even if mutation tracking isn't enabled); we do this after
 	// the root pointer is swapped so that waking responders will
@@ -164,6 +175,7 @@ func (txn *Txn) Commit() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.indexMutations = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -271,6 +283,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 					// value anyways.
 					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
 						indexTxn.Delete(valExist)
+						txn.recordIndexKeys(table, name, valExist)
 					}
 				}
 			}
@@ -290,6 +303,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		for _, val := range vals {
 			indexTxn.Insert(val, obj)
 		}
+		txn.recordIndexKeys(table, name, vals...)
 	}
 	if txn.changes != nil {
 		txn.changes = append(txn.changes, Change{
@@ -363,6 +377,7 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 					val = append(val, idVal...)
 				}
 				indexTxn.Delete(val)
+				txn.recordIndexKeys(table, name, val)
 			}
 		}
 	}
@@ -465,6 +480,7 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 						val = append(val, idVal...)
 					}
 					indexTxn.Delete(val)
+					txn.recordIndexKeys(table, name, val)
 				}
 			}
 		}
@@ -476,6 +492,9 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 		if !ok {
 			panic(fmt.Errorf("prefix %v matched some entries but DeletePrefix did not delete any ", prefix))
 		}
+		// The exact keys removed by the subtree delete are not tracked, so
+		// conservatively fire all WatchRange subscriptions on this index.
+		txn.markIndexDirty(table, deletePrefixIndex)
 		return true, nil
 	}
 	return false, nil
