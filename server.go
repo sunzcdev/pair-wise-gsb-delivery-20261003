@@ -89,6 +89,13 @@ type ServeConfig struct {
 	// server will create a default logger.
 	Logger hclog.Logger
 
+	// DisableHandshakeSocket forces the plugin to perform the initial
+	// handshake by writing it to stdout, even if the client offered a
+	// dedicated handshake channel for this launch. This is an explicit
+	// compatibility path for environments where the plugin cannot connect
+	// back to the client's handshake channel.
+	DisableHandshakeSocket bool
+
 	// Test, if non-nil, will put plugin serving into "test mode". This is
 	// meant to be used as part of `go test` within a plugin's codebase to
 	// launch the plugin in-process and output a ReattachConfig.
@@ -442,8 +449,23 @@ func Serve(opts *ServeConfig) {
 		if os.Getenv(envMultiplexGRPC) != "" {
 			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
 		}
-		fmt.Printf("%s\n", protocolLine)
-		_ = os.Stdout.Sync()
+
+		// If the client offered a dedicated handshake channel for this
+		// launch, deliver the handshake over it so that the plugin's stdout
+		// remains free for other output. Fall back to the legacy stdout
+		// handshake if no channel was offered or it cannot be reached.
+		sent := false
+		if !opts.DisableHandshakeSocket {
+			sent, err = sendHandshakeLine(protocolLine)
+			if err != nil {
+				logger.Error("error sending handshake over dedicated channel, "+
+					"falling back to stdout", "error", err)
+			}
+		}
+		if !sent {
+			fmt.Printf("%s\n", protocolLine)
+			_ = os.Stdout.Sync()
+		}
 	} else if ch := opts.Test.ReattachConfigCh; ch != nil {
 		// Send back the reattach config that can be used. This isn't
 		// quite ready if they connect immediately but the client should

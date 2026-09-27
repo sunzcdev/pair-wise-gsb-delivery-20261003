@@ -5,6 +5,7 @@ SECURITY:
 
 ENHANCEMENTS:
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
+* client/server: The initial handshake can now be performed over a dedicated channel (a unix socket, or loopback TCP with an ephemeral port on Windows) authenticated with a random per-launch token, instead of the plugin's stdout. This makes plugin startup more reliable, as plugins no longer need to avoid writing to stdout before the handshake completes. The legacy stdout handshake remains available via `DisableHandshakeSocket` on `ClientConfig` and `ServeConfig`.
 
 ## v1.7.0
 

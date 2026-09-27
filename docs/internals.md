@@ -8,14 +8,16 @@ process that itself uses plugins. The "server" is the plugin process.
 
 For a server:
 
-  1. Output handshake to stdout
+  1. Send the handshake over the dedicated handshake channel, or output it
+     to stdout for older clients
   2. Wait for connection on control address
   3. Serve plugins over control address
 
 For a client:
 
   1. Launch a plugin binary
-  2. Read and verify handshake from plugin stdout
+  2. Read and verify the handshake from the dedicated handshake channel, or
+     from the plugin's stdout for older plugins
   3. Connect to plugin control address using desired protocol
   4. Dispense plugins using control connection
 
@@ -23,7 +25,9 @@ For a client:
 
 The handshake is the initial communication between a plugin and a host
 process to determine how the host process can connect and communicate to
-the plugin. This handshake is done over the plugin process's stdout.
+the plugin. Newer clients and plugins perform this handshake over a
+dedicated channel (see below); otherwise it is done over the plugin
+process's stdout.
 
 The `go-plugin` library itself handles the handshake when using the
 `Server` to serve a plugin. **You do not need to understand the internals
@@ -61,6 +65,38 @@ Where:
     is omitted (older versions), this is "netrpc" for Go net/rpc. This can
     also be "grpc". This is the protocol that the plugin wants to speak to
     the host process with.
+
+## Handshake Channel
+
+By default, newer clients offer a dedicated handshake channel so that the
+handshake does not depend on the plugin's stdout, which plugins and their
+dependencies may write to at any time. Before starting the plugin, the
+client creates a listener (a unix socket, or loopback TCP with an ephemeral
+port on Windows) and generates a random one-time token for the launch. It
+passes both to the plugin through environment variables:
+
+ * `PLUGIN_HANDSHAKE_NETWORK`: the network type of the channel, "unix" or "tcp".
+
+ * `PLUGIN_HANDSHAKE_ADDR`: the address of the client's handshake listener.
+
+ * `PLUGIN_HANDSHAKE_TOKEN`: the one-time credential for this launch.
+
+To perform the handshake over the channel, the plugin connects to the
+listener and sends a single line, terminated with a newline:
+
+```
+TOKEN|CORE-PROTOCOL-VERSION|APP-PROTOCOL-VERSION|NETWORK-TYPE|NETWORK-ADDR|PROTOCOL
+```
+
+The client only accepts the handshake line if the token matches the one it
+generated for this launch; connections presenting a missing, incorrect, or
+stale token are rejected, and the client keeps waiting for the correct
+plugin instance. Once the handshake completes (or the start fails), the
+client closes the channel and removes any resources it created.
+
+If the environment variables are not set, the plugin should use the legacy
+stdout handshake instead. Setting `DisableHandshakeSocket` on `ClientConfig`
+or `ServeConfig` forces the legacy stdout handshake explicitly.
 
 ## Environment Variables
 

@@ -513,6 +513,17 @@ func TestHelperProcess(*testing.T) {
 	case "mock":
 		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
 		<-make(chan int)
+	case "test-interface-junk-stdout":
+		// Simulate a noisy dependency writing to stdout before the plugin
+		// handshake happens.
+		fmt.Println("some junk printed by a plugin dependency before the handshake")
+		Serve(&ServeConfig{
+			HandshakeConfig: testHandshake,
+			Plugins:         testPluginMap,
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
 	case "start-timeout":
 		time.Sleep(1 * time.Minute)
 		os.Exit(1)

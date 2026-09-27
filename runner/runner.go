@@ -10,7 +10,8 @@ import (
 
 // Runner defines the interface required by go-plugin to manage the lifecycle of
 // of a plugin and attempt to negotiate a connection with it. Note that this
-// is orthogonal to the protocol and transport used, which is negotiated over stdout.
+// is orthogonal to the protocol and transport used, which is negotiated during
+// the handshake, over the dedicated handshake channel or the plugin's stdout.
 type Runner interface {
 	// Start should start the plugin and ensure any work required for servicing
 	// other interface methods is done. If the context is cancelled, it should
@@ -23,7 +24,8 @@ type Runner interface {
 	// connection.
 	Diagnose(ctx context.Context) string
 
-	// Stdout is used to negotiate the go-plugin protocol.
+	// Stdout is used to negotiate the go-plugin protocol with plugins that
+	// use the legacy stdout handshake.
 	Stdout() io.ReadCloser
 
 	// Stderr is used for forwarding plugin logs to the host process logger.

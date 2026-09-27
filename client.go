@@ -113,6 +113,11 @@ type Client struct {
 
 	unixSocketCfg UnixSocketConfig
 
+	// handshake, if non-nil, is the dedicated handshake channel offered to
+	// the plugin for this launch. It is stored in an atomic pointer because
+	// it is published while Start is still holding the client lock.
+	handshake atomic.Pointer[clientHandshake]
+
 	grpcMuxerOnce sync.Once
 	grpcMuxer     *grpcmux.GRPCClientMuxer
 }
@@ -274,6 +279,16 @@ type ClientConfig struct {
 	// UnixSocketConfig configures additional options for any Unix sockets
 	// that are created. Not normally required. Not supported on Windows.
 	UnixSocketConfig *UnixSocketConfig
+
+	// DisableHandshakeSocket disables the dedicated handshake channel and
+	// forces the legacy handshake over the plugin's stdout. By default the
+	// client offers each plugin launch a dedicated channel (a unix socket,
+	// or loopback TCP on Windows) authenticated with a random one-time
+	// token, so that plugins don't have to keep their stdout clean for the
+	// handshake. Plugins that don't support the channel are still detected
+	// via the legacy stdout handshake. Set this only if the dedicated
+	// channel cannot work in your environment.
+	DisableHandshakeSocket bool
 }
 
 type UnixSocketConfig struct {
@@ -496,6 +511,10 @@ func (c *Client) killed() bool {
 //
 // This method can safely be called multiple times.
 func (c *Client) Kill() {
+	// Make sure the dedicated handshake channel, if any, is cleaned up even
+	// if the plugin never completed its handshake.
+	c.closeHandshake()
+
 	// Grab a lock to read some private fields.
 	c.l.Lock()
 	runner := c.runner
@@ -699,6 +718,25 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", EnvUnixSocketGroup, c.unixSocketCfg.Group))
 	}
 
+	// Offer the plugin a dedicated handshake channel so that the handshake
+	// doesn't depend on the plugin keeping its stdout clean. The channel is
+	// authenticated with a random one-time token generated for this launch,
+	// and is cleaned up once the handshake completes or the start fails.
+	if !c.config.DisableHandshakeSocket {
+		hs, hsErr := newClientHandshake(c.unixSocketCfg, c.config.StartTimeout)
+		if hsErr != nil {
+			return nil, fmt.Errorf("error creating handshake listener: %w", hsErr)
+		}
+		c.handshake.Store(hs)
+		defer func() {
+			if err != nil {
+				c.closeHandshake()
+			}
+		}()
+		cmd.Env = append(cmd.Env, hs.env()...)
+		go hs.acceptLoop(c.logger)
+	}
+
 	var runner runner.Runner
 	switch {
 	case c.config.RunnerFunc != nil:
@@ -821,130 +859,188 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		}()
 	}()
 
-	// Some channels for the next step
-	timeout := time.After(c.config.StartTimeout)
+	// The handshake can arrive over the dedicated handshake channel, or
+	// over stdout for plugins that don't support the channel.
+	var handshakeLineCh <-chan string
+	if hs := c.handshake.Load(); hs != nil {
+		handshakeLineCh = hs.lineCh
+	}
 
 	// Start looking for the address
 	c.logger.Debug("waiting for RPC address", "plugin", runner.Name())
-	select {
-	case <-timeout:
-		err = errors.New("timeout while waiting for plugin to start")
-	case <-c.doneCtx.Done():
-		err = errors.New("plugin exited before we could connect")
-	case line, ok := <-linesCh:
-		// Trim the line and split by "|" in order to get the parts of
-		// the output.
-		line = strings.TrimSpace(line)
-		parts := strings.Split(line, "|")
-		if len(parts) < 4 {
-			errText := fmt.Sprintf("Unrecognized remote plugin message: %s", line)
-			if !ok {
-				errText += "\n" + "Failed to read any lines from plugin's stdout"
-			}
-			additionalNotes := runner.Diagnose(context.Background())
-			if additionalNotes != "" {
-				errText += "\n" + additionalNotes
-			}
-			err = errors.New(errText)
-			return
-		}
-
-		// Check the core protocol. Wrapped in a {} for scoping.
-		{
-			var coreProtocol int
-			coreProtocol, err = strconv.Atoi(parts[0])
-			if err != nil {
-				err = fmt.Errorf("error parsing core protocol version: %s", err)
-				return
-			}
-
-			if coreProtocol != CoreProtocolVersion {
-				err = fmt.Errorf("incompatible core API version with plugin. "+
-					"Plugin version: %s, Core version: %d\n\n"+
-					"To fix this, the plugin usually only needs to be recompiled.\n"+
-					"Please report this to the plugin author", parts[0], CoreProtocolVersion)
-				return
-			}
-		}
-
-		// Test the API version
-		version, pluginSet, err := c.checkProtoVersion(parts[1])
-		if err != nil {
-			return addr, err
-		}
-
-		// set the Plugins value to the compatible set, so the version
-		// doesn't need to be passed through to the ClientProtocol
-		// implementation.
-		c.config.Plugins = pluginSet
-		c.negotiatedVersion = version
-		c.logger.Debug("using plugin", "version", version)
-
-		network, address, err := runner.PluginToHost(parts[2], parts[3])
-		if err != nil {
-			return addr, err
-		}
-
-		switch network {
-		case "tcp":
-			addr, err = net.ResolveTCPAddr("tcp", address)
-			if err != nil {
-				return nil, err
-			}
-		case "unix":
-			addr, err = net.ResolveUnixAddr("unix", address)
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("unknown address type: %s", address)
-		}
-
-		// If we have a server type, then record that. We default to net/rpc
-		// for backwards compatibility.
-		c.protocol = ProtocolNetRPC
-		if len(parts) >= 5 {
-			c.protocol = Protocol(parts[4])
-		}
-
-		found := false
-		for _, p := range c.config.AllowedProtocols {
-			if p == c.protocol {
-				found = true
-				break
-			}
-		}
-		if !found {
-			err = fmt.Errorf("unsupported plugin protocol %q. Supported: %v",
-				c.protocol, c.config.AllowedProtocols)
-			return addr, err
-		}
-
-		// See if we have a TLS certificate from the server.
-		// Checking if the length is > 50 rules out catching the unused "extra"
-		// data returned from some older implementations.
-		if len(parts) >= 6 && len(parts[5]) > 50 {
-			err := c.loadServerCert(parts[5])
-			if err != nil {
-				return nil, fmt.Errorf("error parsing server cert: %s", err)
-			}
-		}
-
-		if c.config.GRPCBrokerMultiplex && c.protocol == ProtocolGRPC {
-			if len(parts) <= 6 {
-				return nil, fmt.Errorf("%w; for Go plugins, you will need to update the "+
-					"github.com/hashicorp/go-plugin dependency and recompile", ErrGRPCBrokerMuxNotSupported)
-			}
-			if muxSupported, err := strconv.ParseBool(parts[6]); err != nil {
-				return nil, fmt.Errorf("error parsing %q as a boolean for gRPC broker multiplexing support", parts[6])
-			} else if !muxSupported {
-				return nil, ErrGRPCBrokerMuxNotSupported
-			}
-		}
+	addr, err = c.waitForHandshake(runner, linesCh, handshakeLineCh)
+	if err != nil {
+		return nil, err
 	}
+
+	// The handshake is complete, so the dedicated channel is no longer
+	// needed.
+	c.closeHandshake()
 
 	c.address = addr
 	return
+}
+
+// closeHandshake shuts down the dedicated handshake channel and cleans up
+// its resources, if one was created for this launch.
+func (c *Client) closeHandshake() {
+	if hs := c.handshake.Load(); hs != nil {
+		hs.close()
+	}
+}
+
+// waitForHandshake waits for the plugin to deliver its handshake line,
+// either over the dedicated handshake channel (socketLineCh, if non-nil) or
+// over the plugin's stdout (stdoutLineCh) for plugins that don't support
+// the channel. While a dedicated channel is available, stdout lines that
+// don't look like a legacy handshake are ignored, so plugins are free to
+// write to stdout during startup.
+func (c *Client) waitForHandshake(r runner.Runner, stdoutLineCh <-chan string, socketLineCh <-chan string) (net.Addr, error) {
+	timeout := time.After(c.config.StartTimeout)
+	for {
+		select {
+		case <-timeout:
+			return nil, errors.New("timeout while waiting for plugin to start")
+		case <-c.doneCtx.Done():
+			return nil, errors.New("plugin exited before we could connect")
+		case line := <-socketLineCh:
+			c.logger.Debug("received plugin handshake over the dedicated handshake channel")
+			return c.negotiateHandshake(r, line)
+		case line, ok := <-stdoutLineCh:
+			if !ok {
+				if socketLineCh != nil {
+					// The plugin closed stdout without sending a legacy
+					// handshake. Keep waiting for the dedicated handshake
+					// channel until it delivers, the plugin exits, or we
+					// time out.
+					stdoutLineCh = nil
+					continue
+				}
+				errText := "Unrecognized remote plugin message: " +
+					"\n" + "Failed to read any lines from plugin's stdout"
+				additionalNotes := r.Diagnose(context.Background())
+				if additionalNotes != "" {
+					errText += "\n" + additionalNotes
+				}
+				return nil, errors.New(errText)
+			}
+			if socketLineCh != nil && !looksLikeHandshake(line) {
+				c.logger.Debug("ignoring non-handshake line from plugin stdout", "line", strings.TrimSpace(line))
+				continue
+			}
+			return c.negotiateHandshake(r, line)
+		}
+	}
+}
+
+// negotiateHandshake parses and validates a plugin handshake line, however
+// it was delivered, and returns the address to connect to the plugin on.
+func (c *Client) negotiateHandshake(r runner.Runner, line string) (net.Addr, error) {
+	// Trim the line and split by "|" in order to get the parts of
+	// the output.
+	line = strings.TrimSpace(line)
+	parts := strings.Split(line, "|")
+	if len(parts) < 4 {
+		errText := fmt.Sprintf("Unrecognized remote plugin message: %s", line)
+		additionalNotes := r.Diagnose(context.Background())
+		if additionalNotes != "" {
+			errText += "\n" + additionalNotes
+		}
+		return nil, errors.New(errText)
+	}
+
+	// Check the core protocol. Wrapped in a {} for scoping.
+	{
+		var coreProtocol int
+		coreProtocol, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return nil, fmt.Errorf("error parsing core protocol version: %s", err)
+		}
+
+		if coreProtocol != CoreProtocolVersion {
+			return nil, fmt.Errorf("incompatible core API version with plugin. "+
+				"Plugin version: %s, Core version: %d\n\n"+
+				"To fix this, the plugin usually only needs to be recompiled.\n"+
+				"Please report this to the plugin author", parts[0], CoreProtocolVersion)
+		}
+	}
+
+	// Test the API version
+	version, pluginSet, err := c.checkProtoVersion(parts[1])
+	if err != nil {
+		return nil, err
+	}
+
+	// set the Plugins value to the compatible set, so the version
+	// doesn't need to be passed through to the ClientProtocol
+	// implementation.
+	c.config.Plugins = pluginSet
+	c.negotiatedVersion = version
+	c.logger.Debug("using plugin", "version", version)
+
+	network, address, err := r.PluginToHost(parts[2], parts[3])
+	if err != nil {
+		return nil, err
+	}
+
+	var addr net.Addr
+	switch network {
+	case "tcp":
+		addr, err = net.ResolveTCPAddr("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+	case "unix":
+		addr, err = net.ResolveUnixAddr("unix", address)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown address type: %s", address)
+	}
+
+	// If we have a server type, then record that. We default to net/rpc
+	// for backwards compatibility.
+	c.protocol = ProtocolNetRPC
+	if len(parts) >= 5 {
+		c.protocol = Protocol(parts[4])
+	}
+
+	found := false
+	for _, p := range c.config.AllowedProtocols {
+		if p == c.protocol {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("unsupported plugin protocol %q. Supported: %v",
+			c.protocol, c.config.AllowedProtocols)
+	}
+
+	// See if we have a TLS certificate from the server.
+	// Checking if the length is > 50 rules out catching the unused "extra"
+	// data returned from some older implementations.
+	if len(parts) >= 6 && len(parts[5]) > 50 {
+		err := c.loadServerCert(parts[5])
+		if err != nil {
+			return nil, fmt.Errorf("error parsing server cert: %s", err)
+		}
+	}
+
+	if c.config.GRPCBrokerMultiplex && c.protocol == ProtocolGRPC {
+		if len(parts) <= 6 {
+			return nil, fmt.Errorf("%w; for Go plugins, you will need to update the "+
+				"github.com/hashicorp/go-plugin dependency and recompile", ErrGRPCBrokerMuxNotSupported)
+		}
+		if muxSupported, err := strconv.ParseBool(parts[6]); err != nil {
+			return nil, fmt.Errorf("error parsing %q as a boolean for gRPC broker multiplexing support", parts[6])
+		} else if !muxSupported {
+			return nil, ErrGRPCBrokerMuxNotSupported
+		}
+	}
+
+	return addr, nil
 }
 
 // loadServerCert is used by AutoMTLS to read an x.509 cert returned by the
