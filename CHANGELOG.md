@@ -1,5 +1,8 @@
 ## Unreleased
 
+ENHANCEMENTS:
+* grpc: Added leased broker endpoints (`AcceptWithLease`/`AcceptAndServeWithLease`) that bind an endpoint's lifetime to a context or TTL, with explicit `Renew`/`Revoke`. Revoked endpoint IDs are reserved for a grace period so late connections cannot find a different service through a reused numeric ID.
+
 SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 

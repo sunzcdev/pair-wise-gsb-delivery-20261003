@@ -31,6 +31,10 @@ type streamer interface {
 	Close()
 }
 
+// defaultClientStreamTimeout is how long Dial waits for connection info,
+// and how long received connection info is kept before being discarded.
+const defaultClientStreamTimeout = 5 * time.Second
+
 // sendErr is used to pass errors back during a send.
 type sendErr struct {
 	i  *plugin.ConnInfo
@@ -269,6 +273,22 @@ type GRPCBroker struct {
 	clientStreams map[uint32]*gRPCBrokerPending
 	serverStreams map[uint32]*gRPCBrokerPending
 
+	// leases tracks active leased endpoints by ID, and revokedLeases
+	// reserves recently revoked IDs for a grace period so a late
+	// connection can never find a different service through a reused
+	// numeric ID.
+	leases        map[uint32]*BrokerLease
+	revokedLeases map[uint32]time.Time
+
+	// leaseRevokeGrace is how long a revoked endpoint ID stays reserved.
+	// It is a field rather than a constant so tests can shorten it.
+	leaseRevokeGrace time.Duration
+
+	// clientStreamTimeout is how long Dial waits for connection info and
+	// how long stale connection info is kept before being discarded. It
+	// is a field rather than a constant so tests can shorten it.
+	clientStreamTimeout time.Duration
+
 	unixSocketCfg  UnixSocketConfig
 	addrTranslator runner.AddrTranslator
 
@@ -295,6 +315,11 @@ func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, 
 		serverStreams: make(map[uint32]*gRPCBrokerPending),
 		muxer:         muxer,
 
+		leases:              make(map[uint32]*BrokerLease),
+		revokedLeases:       make(map[uint32]time.Time),
+		leaseRevokeGrace:    brokerLeaseRevokeGrace,
+		clientStreamTimeout: defaultClientStreamTimeout,
+
 		unixSocketCfg:  unixSocketCfg,
 		addrTranslator: addrTranslator,
 	}
@@ -304,6 +329,28 @@ func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, 
 //
 // This should not be called multiple times with the same ID at one time.
 func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
+	return b.accept(id, nil)
+}
+
+// accept registers and accepts a connection by ID. If lease is non-nil the
+// ID is registered to the lease; otherwise the ID must not be held by an
+// active lease. Recently revoked IDs are rejected so they cannot be reused
+// while stale connection info may still be in flight.
+func (b *GRPCBroker) accept(id uint32, lease *BrokerLease) (net.Listener, error) {
+	b.Lock()
+	if err := b.endpointAvailableLocked(id); err != nil {
+		b.Unlock()
+		return nil, err
+	}
+	if _, ok := b.leases[id]; ok {
+		b.Unlock()
+		return nil, fmt.Errorf("grpc broker: service ID %d: %w", id, ErrBrokerLeaseConflict)
+	}
+	if lease != nil {
+		b.leases[id] = lease
+	}
+	b.Unlock()
+
 	if b.muxer.Enabled() {
 		p := b.getServerStream(id)
 		go func() {
@@ -423,6 +470,19 @@ func (b *GRPCBroker) Close() error {
 	b.o.Do(func() {
 		close(b.doneCh)
 	})
+
+	// Revoke any outstanding leases so their listeners and callbacks are
+	// released with the broker.
+	b.Lock()
+	leases := make([]*BrokerLease, 0, len(b.leases))
+	for _, l := range b.leases {
+		leases = append(leases, l)
+	}
+	b.Unlock()
+	for _, l := range leases {
+		_ = l.Revoke()
+	}
+
 	return nil
 }
 
@@ -524,17 +584,31 @@ func (b *GRPCBroker) Dial(id uint32) (conn *grpc.ClientConn, err error) { return
 // Dial opens a connection by ID with options.
 func (b *GRPCBroker) DialWithOptions(id uint32, opts ...grpc.DialOption) (conn *grpc.ClientConn, err error) {
 	if b.muxer.Enabled() {
+		b.Lock()
+		err := b.endpointAvailableLocked(id)
+		b.Unlock()
+		if err != nil {
+			return nil, err
+		}
+
 		return dialGRPCConn(b.tls, b.muxDial(id), opts...)
 	}
 
 	var c *plugin.ConnInfo
 
-	// Open the stream
-	p := b.getClientStream(id)
+	// Open the stream. Registering the pending stream is atomic with the
+	// revoked-lease check, so a Dial racing with Revoke either fails fast
+	// or is failed by the revocation itself, never by its timeout.
+	p, err := b.registerClientStream(id)
+	if err != nil {
+		return nil, err
+	}
 	select {
 	case c = <-p.ch:
-		close(p.doneCh)
-	case <-time.After(5 * time.Second):
+		p.once.Do(func() { close(p.doneCh) })
+	case <-p.doneCh:
+		return nil, fmt.Errorf("grpc broker: dial of service ID %d failed: %w", id, ErrBrokerLeaseRevoked)
+	case <-time.After(b.clientStreamTimeout):
 		return nil, fmt.Errorf("timeout waiting for connection info")
 	}
 
@@ -607,6 +681,10 @@ func (m *GRPCBroker) getClientStream(id uint32) *gRPCBrokerPending {
 	m.Lock()
 	defer m.Unlock()
 
+	return m.clientStreamLocked(id)
+}
+
+func (m *GRPCBroker) clientStreamLocked(id uint32) *gRPCBrokerPending {
 	p, ok := m.clientStreams[id]
 	if ok {
 		return p
@@ -617,6 +695,34 @@ func (m *GRPCBroker) getClientStream(id uint32) *gRPCBrokerPending {
 		doneCh: make(chan struct{}),
 	}
 	return m.clientStreams[id]
+}
+
+// registerClientStream returns the pending stream for a new Dial,
+// atomically checking that the endpoint ID is not reserved by a recently
+// revoked lease. Combining the check with the registration is what makes
+// the outcome of a Dial racing with Revoke deterministic: the Dial either
+// fails fast here, or its pending stream is closed by the revocation.
+func (m *GRPCBroker) registerClientStream(id uint32) (*gRPCBrokerPending, error) {
+	m.Lock()
+	defer m.Unlock()
+
+	if err := m.endpointAvailableLocked(id); err != nil {
+		return nil, err
+	}
+
+	// A pending stream whose doneCh is already closed (e.g. by a lease
+	// revocation) is dead; replace it so the ID can be dialed again once
+	// its reservation has expired.
+	if p, ok := m.clientStreams[id]; ok {
+		select {
+		case <-p.doneCh:
+			delete(m.clientStreams, id)
+		default:
+			return p, nil
+		}
+	}
+
+	return m.clientStreamLocked(id), nil
 }
 
 // getServerStream is a buffer to receive knocks to a multiplexed stream ID
@@ -642,7 +748,7 @@ func (m *GRPCBroker) timeoutWait(id uint32, p *gRPCBrokerPending) {
 	// for a timeout.
 	select {
 	case <-p.doneCh:
-	case <-time.After(5 * time.Second):
+	case <-time.After(m.clientStreamTimeout):
 	}
 
 	m.Lock()
