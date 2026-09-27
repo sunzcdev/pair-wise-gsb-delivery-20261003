@@ -381,13 +381,20 @@ func (n *node) setEndpoint(method methodTyp, handler http.Handler, pattern strin
 }
 
 func (n *node) FindRoute(rctx *Context, method methodTyp, path string) (*node, endpoints, http.Handler) {
+	return n.findRoute(rctx, method, path, nil)
+}
+
+// findRoute is FindRoute with an optional tracer that records the traversal
+// for diagnostics (see Mux.Explain). A nil tracer keeps the hot path free of
+// any tracing overhead.
+func (n *node) findRoute(rctx *Context, method methodTyp, path string, tr *routeTracer) (*node, endpoints, http.Handler) {
 	// Reset the context routing pattern and params
 	rctx.routePattern = ""
 	rctx.routeParams.Keys = rctx.routeParams.Keys[:0]
 	rctx.routeParams.Values = rctx.routeParams.Values[:0]
 
 	// Find the routing handlers for the path
-	rn := n.findRoute(rctx, method, path)
+	rn := n.matchRoute(rctx, method, path, tr)
 	if rn == nil {
 		return nil, nil, nil
 	}
@@ -407,7 +414,8 @@ func (n *node) FindRoute(rctx *Context, method methodTyp, path string) (*node, e
 
 // Recursive edge traversal by checking all nodeTyp groups along the way.
 // It's like searching through a multi-dimensional radix trie.
-func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
+// A non-nil tracer records each attempted branch for Mux.Explain.
+func (n *node) matchRoute(rctx *Context, method methodTyp, path string, tr *routeTracer) *node {
 	nn := n
 	search := path
 
@@ -428,14 +436,51 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 		switch ntyp {
 		case ntStatic:
 			xn = nds.findEdge(label)
-			if xn == nil || !strings.HasPrefix(xsearch, xn.prefix) {
+			if xn == nil {
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(ntStatic),
+						Path:    xsearch,
+						Outcome: OutcomeMiss,
+						Note:    fmt.Sprintf("no static edge for label %q", string(label)),
+					})
+				}
 				continue
+			}
+			if !strings.HasPrefix(xsearch, xn.prefix) {
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(ntStatic),
+						Prefix:  xn.prefix,
+						Path:    xsearch,
+						Outcome: OutcomeMiss,
+						Note:    fmt.Sprintf("path does not start with static prefix %q", xn.prefix),
+					})
+				}
+				continue
+			}
+			if tr != nil {
+				tr.add(RouteStep{
+					Node:    nodeTypName(ntStatic),
+					Prefix:  xn.prefix,
+					Path:    xsearch,
+					Value:   xn.prefix,
+					Outcome: OutcomeMatch,
+				})
 			}
 			xsearch = xsearch[len(xn.prefix):]
 
 		case ntParam, ntRegexp:
 			// short-circuit and return no matching route for empty param values
 			if xsearch == "" {
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(ntyp),
+						Path:    xsearch,
+						Outcome: OutcomeMiss,
+						Note:    "empty remaining path cannot fill a param",
+					})
+				}
 				continue
 			}
 
@@ -448,19 +493,67 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 					if xn.tail == '/' {
 						p = len(xsearch)
 					} else {
+						if tr != nil {
+							tr.add(RouteStep{
+								Node:    nodeTypName(ntyp),
+								Prefix:  xn.prefix,
+								Path:    xsearch,
+								Outcome: OutcomeMiss,
+								Note:    fmt.Sprintf("param tail delimiter %q not found", string(xn.tail)),
+							})
+						}
 						continue
 					}
 				} else if ntyp == ntRegexp && p == 0 {
+					if tr != nil {
+						tr.add(RouteStep{
+							Node:    nodeTypName(ntyp),
+							Prefix:  xn.prefix,
+							Path:    xsearch,
+							Outcome: OutcomeMiss,
+							Note:    "empty regexp candidate",
+						})
+					}
 					continue
 				}
 
 				if ntyp == ntRegexp && xn.rex != nil {
 					if !xn.rex.MatchString(xsearch[:p]) {
+						if tr != nil {
+							tr.add(RouteStep{
+								Node:    nodeTypName(ntRegexp),
+								Prefix:  xn.prefix,
+								Path:    xsearch,
+								Value:   xsearch[:p],
+								Outcome: OutcomeMiss,
+								Note:    fmt.Sprintf("candidate %q does not match regexp %q", xsearch[:p], xn.rex.String()),
+							})
+						}
 						continue
 					}
 				} else if strings.IndexByte(xsearch[:p], '/') != -1 {
 					// avoid a match across path segments
+					if tr != nil {
+						tr.add(RouteStep{
+							Node:    nodeTypName(ntyp),
+							Prefix:  xn.prefix,
+							Path:    xsearch,
+							Value:   xsearch[:p],
+							Outcome: OutcomeMiss,
+							Note:    "param value would span path segments",
+						})
+					}
 					continue
+				}
+
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(ntyp),
+						Prefix:  xn.prefix,
+						Path:    xsearch,
+						Value:   xsearch[:p],
+						Outcome: OutcomeMatch,
+					})
 				}
 
 				prevlen := len(rctx.routeParams.Values)
@@ -487,16 +580,39 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 						// flag that the routing context found a route, but not a corresponding
 						// supported method
 						rctx.methodNotAllowed = true
+						if tr != nil {
+							tr.add(RouteStep{
+								Node:    nodeTypName(ntyp),
+								Prefix:  xn.prefix,
+								Outcome: OutcomeMethodNotAllowed,
+								Note:    fmt.Sprintf("endpoint exists but not for method %s", reverseMethodMap[method]),
+							})
+						}
 					}
 				}
 
 				// recursively find the next node on this branch
-				fin := xn.findRoute(rctx, method, xsearch)
+				if tr != nil {
+					tr.depth++
+				}
+				fin := xn.matchRoute(rctx, method, xsearch, tr)
+				if tr != nil {
+					tr.depth--
+				}
 				if fin != nil {
 					return fin
 				}
 
 				// not found on this branch, reset vars
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(ntyp),
+						Prefix:  xn.prefix,
+						Path:    xsearch,
+						Outcome: OutcomeBacktrack,
+						Note:    "no match deeper on this branch, trying siblings",
+					})
+				}
 				rctx.routeParams.Values = rctx.routeParams.Values[:prevlen]
 				xsearch = search
 			}
@@ -505,6 +621,15 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 
 		default:
 			// catch-all nodes
+			if tr != nil {
+				tr.add(RouteStep{
+					Node:    nodeTypName(ntCatchAll),
+					Path:    search,
+					Value:   search,
+					Outcome: OutcomeMatch,
+					Note:    "wildcard consumes the remaining path",
+				})
+			}
 			rctx.routeParams.Values = append(rctx.routeParams.Values, search)
 			xn = nds[0]
 			xsearch = ""
@@ -535,13 +660,39 @@ func (n *node) findRoute(rctx *Context, method methodTyp, path string) *node {
 				// flag that the routing context found a route, but not a corresponding
 				// supported method
 				rctx.methodNotAllowed = true
+				if tr != nil {
+					tr.add(RouteStep{
+						Node:    nodeTypName(xn.typ),
+						Prefix:  xn.prefix,
+						Outcome: OutcomeMethodNotAllowed,
+						Note:    fmt.Sprintf("endpoint exists but not for method %s", reverseMethodMap[method]),
+					})
+				}
 			}
 		}
 
 		// recursively find the next node..
-		fin := xn.findRoute(rctx, method, xsearch)
+		if tr != nil {
+			tr.depth++
+		}
+		fin := xn.matchRoute(rctx, method, xsearch, tr)
+		if tr != nil {
+			tr.depth--
+		}
 		if fin != nil {
 			return fin
+		}
+
+		// a static branch that matched its prefix but dead-ended falls back
+		// to the remaining sibling branches (param, regexp, catch-all)
+		if tr != nil && xn.typ == ntStatic {
+			tr.add(RouteStep{
+				Node:    nodeTypName(ntStatic),
+				Prefix:  xn.prefix,
+				Path:    xsearch,
+				Outcome: OutcomeBacktrack,
+				Note:    "static branch dead-ended, falling back to siblings",
+			})
 		}
 
 		// Did not find final handler, let's remove the param here if it was set
