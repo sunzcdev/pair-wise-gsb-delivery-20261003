@@ -35,6 +35,84 @@ func TestFindMissing(t *testing.T) {
 	}
 }
 
+func TestCommitVersioned(t *testing.T) {
+	m := NewWithCleanupInterval(0)
+	expiry := time.Now().Add(time.Minute)
+
+	err := m.Commit("session_token", []byte("v1_data"), expiry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, version, found, err := m.FindVersioned("session_token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected token to be found")
+	}
+
+	// A commit with the correct expected version succeeds and bumps the
+	// version.
+	committed, err := m.CommitVersioned("session_token", []byte("v2_data"), expiry, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !committed {
+		t.Fatal("expected commit to succeed")
+	}
+
+	b, newVersion, found, err := m.FindVersioned("session_token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !bytes.Equal(b, []byte("v2_data")) {
+		t.Fatalf("got %v (found %v): expected %v", b, found, []byte("v2_data"))
+	}
+	if newVersion == version {
+		t.Fatal("expected version to change after commit")
+	}
+
+	// A commit with a stale expected version is a no-op.
+	committed, err = m.CommitVersioned("session_token", []byte("v3_data"), expiry, version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed {
+		t.Fatal("expected commit with stale version to fail")
+	}
+
+	b, found, err = m.Find("session_token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !bytes.Equal(b, []byte("v2_data")) {
+		t.Fatalf("got %v (found %v): expected %v", b, found, []byte("v2_data"))
+	}
+}
+
+func TestCommitVersionedMissing(t *testing.T) {
+	m := NewWithCleanupInterval(0)
+
+	// A versioned commit must never create a token which does not exist
+	// (e.g. one which was deleted by a concurrent Destroy).
+	committed, err := m.CommitVersioned("missing_session_token", []byte("data"), time.Now().Add(time.Minute), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed {
+		t.Fatal("expected commit for missing token to fail")
+	}
+
+	_, found, err := m.Find("missing_session_token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatal("missing token was created by CommitVersioned")
+	}
+}
+
 func TestCommitNew(t *testing.T) {
 	m := NewWithCleanupInterval(0)
 

@@ -8,6 +8,7 @@ import (
 type item struct {
 	object     []byte
 	expiration int64
+	version    uint64
 }
 
 // MemStore represents the session store.
@@ -67,10 +68,57 @@ func (m *MemStore) Commit(token string, b []byte, expiry time.Time) error {
 	m.items[token] = item{
 		object:     b,
 		expiration: expiry.UnixNano(),
+		version:    m.items[token].version + 1,
 	}
 	m.mu.Unlock()
 
 	return nil
+}
+
+// FindVersioned returns the data and current version for a given session
+// token from the MemStore instance. If the session token is not found or is
+// expired, the returned exists flag will be set to false.
+func (m *MemStore) FindVersioned(token string) ([]byte, uint64, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	item, found := m.items[token]
+	if !found {
+		return nil, 0, false, nil
+	}
+
+	if time.Now().UnixNano() > item.expiration {
+		return nil, 0, false, nil
+	}
+
+	return item.object, item.version, true, nil
+}
+
+// CommitVersioned adds the session token and data to the MemStore instance
+// with the given expiry time, but only if the version of the data currently
+// held in the store is equal to expectedVersion (a compare-and-swap
+// operation). If the versions do not match, or the token does not exist (or
+// is expired), nothing is stored and the returned committed flag is false.
+func (m *MemStore) CommitVersioned(token string, b []byte, expiry time.Time, expectedVersion uint64) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, found := m.items[token]
+	if !found || time.Now().UnixNano() > current.expiration {
+		return false, nil
+	}
+
+	if current.version != expectedVersion {
+		return false, nil
+	}
+
+	m.items[token] = item{
+		object:     b,
+		expiration: expiry.UnixNano(),
+		version:    current.version + 1,
+	}
+
+	return true, nil
 }
 
 // Delete removes a session token and corresponding data from the MemStore

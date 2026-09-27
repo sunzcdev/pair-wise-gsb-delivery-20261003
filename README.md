@@ -28,6 +28,7 @@ This project has reached a **stable** status. It is actively maintained with ong
     - [Configuring the Session Store](#configuring-the-session-store)
     - [Using Custom Session Stores](#using-custom-session-stores)
       - [Using Custom Session Stores (with context.Context)](#using-custom-session-stores-with-contextcontext)
+      - [Versioned Session Stores (optimistic concurrency)](#versioned-session-stores-optimistic-concurrency)
     - [Multiple Sessions per Request](#multiple-sessions-per-request)
     - [Enumerate All Sessions](#enumerate-all-sessions)
     - [Multiple Writes, Flushing and Streaming Responses](#multiple-writes-flushing-and-streaming-responses)
@@ -241,6 +242,31 @@ type IterableCtxStore interface {
 	AllCtx(ctx context.Context) (map[string][]byte, error)
 }
 ```
+
+#### Versioned Session Stores (optimistic concurrency)
+
+By default, if two concurrent request cycles modify the same session, the last commit silently overwrites the other request's changes (last-write-wins). Stores can opt in to safer behavior by implementing the [`scs.VersionedStore`](https://pkg.go.dev/github.com/alexedwards/scs/v2#VersionedStore) interface (the included `memstore` supports it):
+
+```go
+type VersionedStore interface {
+	Store
+
+	// FindVersioned is the same as Store.Find, except it also returns the
+	// current version of the stored data.
+	FindVersioned(token string) (b []byte, version uint64, found bool, err error)
+
+	// CommitVersioned is the same as Store.Commit, except the commit only
+	// succeeds if the version of the data currently held in the store is
+	// equal to expectedVersion (a compare-and-swap operation).
+	CommitVersioned(token string, b []byte, expiry time.Time, expectedVersion uint64) (committed bool, err error)
+}
+```
+
+When the store implements `VersionedStore`, committing a session performs a three-way, field-level merge between the values as they were when the session was loaded, the values currently held in the store, and the changes made during the request cycle:
+
+* Changes to *different* fields are merged together, so concurrent requests no longer lose each other's updates.
+* Conflicting changes to the *same* field cause the commit to fail with a [`*scs.ConflictError`](https://pkg.go.dev/github.com/alexedwards/scs/v2#ConflictError) (which names the conflicting fields) instead of silently applying last-write-wins. When using the `LoadAndSave()` middleware the error is passed to `ErrorFunc`.
+* If the session was deleted from the store after it was loaded (e.g. by a concurrent `Destroy()` call), the commit fails with a `*ConflictError` and the destroyed session is never resurrected by an in-flight request.
 
 ### Preventing Session Fixation
 

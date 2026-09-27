@@ -34,6 +34,37 @@ type IterableStore interface {
 	All() (map[string][]byte, error)
 }
 
+// VersionedStore is the interface for session stores which support optimistic
+// concurrency control. It is an optional extension to the Store interface.
+//
+// When the store set on a SessionManager implements VersionedStore, committing
+// a session which was loaded from the store performs a three-way, field-level
+// merge between the values as they were when the session was loaded, the
+// values currently held in the store, and the changes made during the request
+// cycle. Changes to different fields are merged together; conflicting changes
+// to the same field cause the commit to fail with a *ConflictError instead of
+// silently applying last-write-wins semantics. A commit also fails with a
+// *ConflictError if the session was deleted from the store (e.g. by a
+// concurrent Destroy call) after it was loaded, so that an in-flight request
+// can never resurrect a destroyed session.
+type VersionedStore interface {
+	Store
+
+	// FindVersioned is the same as Store.Find, except it also returns the
+	// current version of the stored data. The version is an opaque,
+	// monotonically increasing identifier for the stored data.
+	FindVersioned(token string) (b []byte, version uint64, found bool, err error)
+
+	// CommitVersioned is the same as Store.Commit, except the commit only
+	// succeeds if the version of the data currently held in the store is
+	// equal to expectedVersion (a compare-and-swap operation). If the
+	// versions do not match, or the token does not exist in the store, the
+	// commit must be a no-op and the committed return value must be false.
+	// In particular, CommitVersioned must never create a token which does
+	// not already exist in the store.
+	CommitVersioned(token string, b []byte, expiry time.Time, expectedVersion uint64) (committed bool, err error)
+}
+
 // CtxStore is an interface for session stores which take a context.Context
 // parameter.
 type CtxStore interface {

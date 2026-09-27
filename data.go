@@ -6,11 +6,45 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// ConflictError is returned by Commit when the session store implements
+// VersionedStore and the session data cannot be merged safely with the data
+// currently held in the store. This happens when another request cycle has
+// concurrently modified the same session fields, or has destroyed the
+// session, since the session was loaded. No data is written to the store when
+// a ConflictError is returned; last-write-wins semantics are never applied
+// silently.
+type ConflictError struct {
+	// Token is the session token which could not be committed.
+	Token string
+
+	// Keys contains the names of the session data fields which were
+	// modified both locally and by a concurrent request cycle. It is empty
+	// if the conflict was not caused by a field-level clash (i.e. if
+	// Deleted is true, or the store state changed while committing).
+	Keys []string
+
+	// Deleted is true if the session was deleted from the store (for
+	// example by a concurrent Destroy call) after it was loaded.
+	Deleted bool
+}
+
+func (e *ConflictError) Error() string {
+	switch {
+	case e.Deleted:
+		return fmt.Sprintf("scs: commit conflict: session %q was deleted after it was loaded", e.Token)
+	case len(e.Keys) > 0:
+		return fmt.Sprintf("scs: commit conflict: session %q has conflicting modifications to keys %v", e.Token, e.Keys)
+	default:
+		return fmt.Sprintf("scs: commit conflict: session %q was concurrently modified", e.Token)
+	}
+}
 
 // Status represents the state of the session data during a request cycle.
 type Status int
@@ -34,12 +68,13 @@ const (
 )
 
 type sessionData struct {
-	deadline time.Time
-	expiry   time.Time
-	status   Status
-	token    string
-	values   map[string]interface{}
-	mu       sync.Mutex
+	deadline   time.Time
+	expiry     time.Time
+	status     Status
+	token      string
+	values     map[string]interface{}
+	baseValues map[string]interface{}
+	mu         sync.Mutex
 }
 
 func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
@@ -100,6 +135,11 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		return nil, err
 	}
 
+	// Keep a copy of the values as they were when the session was loaded.
+	// If the store supports versioned commits, this acts as the baseline
+	// for the three-way merge performed by Commit.
+	sd.baseValues = copyValues(sd.values)
+
 	// By default, set the expiry time to the deadline.
 	sd.expiry = sd.deadline
 
@@ -135,6 +175,18 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		}
 	}
 
+	if sd.baseValues != nil {
+		if _, ok := s.Store.(VersionedStore); ok {
+			if err := s.mergeCommit(ctx, sd); err != nil {
+				return "", time.Time{}, err
+			}
+
+			sd.status = Committed
+
+			return sd.token, sd.expiry, nil
+		}
+	}
+
 	b, err := s.Codec.Encode(sd.deadline, sd.values)
 	if err != nil {
 		return "", time.Time{}, err
@@ -147,6 +199,119 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 	sd.status = Committed
 
 	return sd.token, sd.expiry, nil
+}
+
+// mergeCommit commits the session data to a VersionedStore using a three-way,
+// field-level merge between the values as they were when the session was
+// loaded (sd.baseValues), the values currently held in the store, and the
+// current (locally modified) values. It returns a *ConflictError if the merge
+// cannot be completed safely.
+func (s *SessionManager) mergeCommit(ctx context.Context, sd *sessionData) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		b, version, found, err := s.doStoreFindVersioned(ctx, sd.token)
+		if err != nil {
+			return err
+		}
+
+		// The session no longer exists in the store (e.g. it was destroyed
+		// by a concurrent request cycle). It must not be resurrected.
+		if !found {
+			return &ConflictError{Token: sd.token, Deleted: true}
+		}
+
+		_, currentValues, err := s.Codec.Decode(b)
+		if err != nil {
+			return err
+		}
+
+		merged, conflicts := mergeValues(sd.baseValues, currentValues, sd.values)
+		if len(conflicts) > 0 {
+			return &ConflictError{Token: sd.token, Keys: conflicts}
+		}
+
+		b, err = s.Codec.Encode(sd.deadline, merged)
+		if err != nil {
+			return err
+		}
+
+		committed, err := s.doStoreCommitVersioned(ctx, sd.token, b, sd.expiry, version)
+		if err != nil {
+			return err
+		}
+
+		if committed {
+			sd.values = merged
+			sd.baseValues = copyValues(merged)
+			return nil
+		}
+
+		// The store state changed between FindVersioned and CommitVersioned.
+		// Re-read and retry the merge.
+	}
+
+	return &ConflictError{Token: sd.token}
+}
+
+// mergeValues performs a three-way, field-level merge of session values. base
+// holds the values as they were when the session was loaded, current holds
+// the values currently in the store, and local holds the values including the
+// modifications made during this request cycle. It returns the merged values,
+// plus the names of any fields which were changed both locally and remotely
+// with differing results.
+func mergeValues(base, current, local map[string]interface{}) (map[string]interface{}, []string) {
+	merged := make(map[string]interface{}, len(current))
+	for key, val := range current {
+		merged[key] = val
+	}
+
+	keys := make(map[string]struct{}, len(base)+len(local))
+	for key := range base {
+		keys[key] = struct{}{}
+	}
+	for key := range local {
+		keys[key] = struct{}{}
+	}
+
+	var conflicts []string
+
+	for key := range keys {
+		baseVal, baseOK := base[key]
+		localVal, localOK := local[key]
+
+		localChanged := localOK != baseOK || !reflect.DeepEqual(localVal, baseVal)
+		if !localChanged {
+			continue
+		}
+
+		currentVal, currentOK := current[key]
+		remoteChanged := currentOK != baseOK || !reflect.DeepEqual(currentVal, baseVal)
+
+		// If both sides changed the same field, the changes only merge
+		// cleanly when they are identical. Otherwise the conflict must be
+		// surfaced to the caller.
+		if remoteChanged && !(localOK == currentOK && reflect.DeepEqual(localVal, currentVal)) {
+			conflicts = append(conflicts, key)
+			continue
+		}
+
+		if localOK {
+			merged[key] = localVal
+		} else {
+			delete(merged, key)
+		}
+	}
+
+	sort.Strings(conflicts)
+
+	return merged, conflicts
+}
+
+func copyValues(values map[string]interface{}) map[string]interface{} {
+	copied := make(map[string]interface{}, len(values))
+	for key, val := range values {
+		copied[key] = val
+	}
+	return copied
 }
 
 // Destroy deletes the session data from the session store and sets the session
@@ -171,6 +336,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	// Reset everything else to defaults.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.baseValues = nil
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
@@ -332,6 +498,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.token = newToken
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
+	sd.baseValues = nil
 
 	return nil
 }
@@ -737,6 +904,32 @@ func (s *SessionManager) doStoreCommit(ctx context.Context, token string, b []by
 		return c.CommitCtx(ctx, token, b, expiry)
 	}
 	return s.Store.Commit(token, b, expiry)
+}
+
+func (s *SessionManager) doStoreFindVersioned(ctx context.Context, token string) (b []byte, version uint64, found bool, err error) {
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	c, ok := s.Store.(interface {
+		FindVersionedCtx(context.Context, string) ([]byte, uint64, bool, error)
+	})
+	if ok {
+		return c.FindVersionedCtx(ctx, token)
+	}
+	return s.Store.(VersionedStore).FindVersioned(token)
+}
+
+func (s *SessionManager) doStoreCommitVersioned(ctx context.Context, token string, b []byte, expiry time.Time, expectedVersion uint64) (committed bool, err error) {
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	c, ok := s.Store.(interface {
+		CommitVersionedCtx(context.Context, string, []byte, time.Time, uint64) (bool, error)
+	})
+	if ok {
+		return c.CommitVersionedCtx(ctx, token, b, expiry, expectedVersion)
+	}
+	return s.Store.(VersionedStore).CommitVersioned(token, b, expiry, expectedVersion)
 }
 
 func (s *SessionManager) doStoreAll(ctx context.Context) (map[string][]byte, error) {
