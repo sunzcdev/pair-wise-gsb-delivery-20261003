@@ -53,8 +53,15 @@ type roaEvent struct {
 	EventType roaEventType
 	Src       string
 	Data      []byte
-	conn      *net.TCPConn
+	conn      net.Conn
 	timestamp time.Time
+}
+
+// pendingROA is a single RTR update (announce or withdraw) staged until
+// the EndOfData PDU completes the update it belongs to.
+type pendingROA struct {
+	roa *table.ROA
+	add bool
 }
 
 type roaManager struct {
@@ -166,13 +173,21 @@ func (m *roaManager) HandleROAEvent(ev *roaEvent) {
 	}
 	switch ev.EventType {
 	case roaDisconnected:
+		if ev.conn != client.conn {
+			// A stale connection from before the last reconnect
+			// must not tear down the current state.
+			m.logger.Info("Ignore disconnect from a stale RTR connection",
+				slog.String("Topic", "rpki"),
+				slog.Any("Key", ev.Src))
+			return
+		}
 		m.logger.Info("ROA server is disconnected",
 			slog.String("Topic", "rpki"),
 			slog.Any("Key", ev.Src))
 		client.state.Downtime = time.Now().Unix()
 		// clear state
 		client.endOfData = false
-		client.pendingROAs = make([]*table.ROA, 0)
+		client.pendingROAs = make([]pendingROA, 0)
 		client.state.RpkiMessages = oc.RpkiMessages{}
 		client.conn = nil
 		go client.tryConnect()
@@ -184,8 +199,16 @@ func (m *roaManager) HandleROAEvent(ev *roaEvent) {
 			slog.Any("Key", ev.Src))
 		client.conn = ev.conn
 		client.state.Uptime = time.Now().Unix()
-		go client.established()
+		go client.established(ev.conn)
 	case roaRTR:
+		if client.conn == nil || ev.conn != client.conn {
+			// Late message from an old connection; applying it
+			// could roll the table back to a stale generation.
+			m.logger.Info("Ignore RTR message from a stale connection",
+				slog.String("Topic", "rpki"),
+				slog.Any("Key", ev.Src))
+			return
+		}
 		m.handleRTRMsg(client, &client.state, ev.Data)
 	case roaLifetimeout:
 		// a) already reconnected but hasn't received
@@ -243,6 +266,11 @@ func (m *roaManager) handleRTRMsg(client *roaClient, state *oc.RpkiServerState, 
 		case *rtr.RTRCacheResponse:
 			received.CacheResponse++
 			client.endOfData = false
+			// A new update cycle starts; stage its changes under the
+			// session of this CacheResponse and discard anything left
+			// over from an interrupted cycle.
+			client.pendingSessionID = msg.SessionID
+			client.pendingROAs = make([]pendingROA, 0)
 		case *rtr.RTRIPPrefix:
 			family := bgp.AFI_IP
 			if msg.Type == rtr.RTR_IPV4_PREFIX {
@@ -252,14 +280,17 @@ func (m *roaManager) handleRTRMsg(client *roaClient, state *oc.RpkiServerState, 
 				received.Ipv6Prefix++
 			}
 			roa := table.NewROA(family, msg.Prefix.AsSlice(), msg.PrefixLen, msg.MaxLen, msg.AS, client.host)
-			if msg.Flags&1 == 1 {
-				if client.endOfData {
+			add := msg.Flags&1 == 1
+			if client.endOfData {
+				if add {
 					m.table.Add(roa)
 				} else {
-					client.pendingROAs = append(client.pendingROAs, roa)
+					m.table.Delete(roa)
 				}
 			} else {
-				m.table.Delete(roa)
+				// Stage announcements and withdrawals alike so the
+				// table only ever sees a complete RTR update.
+				client.pendingROAs = append(client.pendingROAs, pendingROA{roa: roa, add: add})
 			}
 		case *rtr.RTREndOfData:
 			received.EndOfData++
@@ -268,6 +299,24 @@ func (m *roaManager) handleRTRMsg(client *roaClient, state *oc.RpkiServerState, 
 				// previous session
 				m.table.DeleteAll(client.host)
 			}
+			if client.pendingSessionID == msg.SessionID {
+				// Apply the staged update atomically; validation
+				// results are re-evaluated against the complete set.
+				for _, p := range client.pendingROAs {
+					if p.add {
+						m.table.Add(p.roa)
+					} else {
+						m.table.Delete(p.roa)
+					}
+				}
+			} else {
+				m.logger.Info("Ignore staged ROAs: EndOfData session doesn't match CacheResponse session",
+					slog.String("Topic", "rpki"),
+					slog.String("Host", client.host),
+					slog.Uint64("CacheResponseSession", uint64(client.pendingSessionID)),
+					slog.Uint64("EndOfDataSession", uint64(msg.SessionID)))
+			}
+			client.pendingROAs = make([]pendingROA, 0)
 			client.sessionID = msg.SessionID
 			client.serialNumber = msg.SerialNumber
 			client.endOfData = true
@@ -275,10 +324,6 @@ func (m *roaManager) handleRTRMsg(client *roaClient, state *oc.RpkiServerState, 
 				client.timer.Stop()
 				client.timer = nil
 			}
-			for _, roa := range client.pendingROAs {
-				m.table.Add(roa)
-			}
-			client.pendingROAs = make([]*table.ROA, 0)
 		case *rtr.RTRCacheReset:
 			if err := client.softReset(); err != nil {
 				m.logger.Error("Failed to send soft reset",
@@ -340,7 +385,7 @@ func (m *roaManager) GetServers() []*oc.RpkiServer {
 
 type roaClient struct {
 	host         string
-	conn         *net.TCPConn
+	conn         net.Conn
 	state        oc.RpkiServerState
 	eventCh      chan *roaEvent
 	sessionID    uint16
@@ -349,9 +394,12 @@ type roaClient struct {
 	timer        *time.Timer
 	lifetime     int64
 	endOfData    bool
-	pendingROAs  []*table.ROA
-	cancelfnc    context.CancelFunc
-	ctx          context.Context
+	// session of the in-progress update cycle, taken from the
+	// CacheResponse PDU that started it
+	pendingSessionID uint16
+	pendingROAs      []pendingROA
+	cancelfnc        context.CancelFunc
+	ctx              context.Context
 }
 
 func newRoaClient(address, port string, ch chan *roaEvent, lifetime int64) *roaClient {
@@ -360,7 +408,7 @@ func newRoaClient(address, port string, ch chan *roaEvent, lifetime int64) *roaC
 		host:        net.JoinHostPort(address, port),
 		eventCh:     ch,
 		lifetime:    lifetime,
-		pendingROAs: make([]*table.ROA, 0),
+		pendingROAs: make([]pendingROA, 0),
 		ctx:         ctx,
 		cancelfnc:   cancel,
 	}
@@ -391,7 +439,7 @@ func (c *roaClient) softReset() error {
 		}
 		c.state.RpkiMessages.RpkiSent.ResetQuery++
 		c.endOfData = false
-		c.pendingROAs = make([]*table.ROA, 0)
+		c.pendingROAs = make([]pendingROA, 0)
 	}
 	return nil
 }
@@ -421,7 +469,7 @@ func (c *roaClient) tryConnect() {
 			c.eventCh <- &roaEvent{
 				EventType: roaConnected,
 				Src:       c.host,
-				conn:      conn.(*net.TCPConn),
+				conn:      conn,
 				timestamp: time.Now(),
 			}
 			return
@@ -429,12 +477,13 @@ func (c *roaClient) tryConnect() {
 	}
 }
 
-func (c *roaClient) established() (err error) {
+func (c *roaClient) established(conn net.Conn) (err error) {
 	defer func() {
-		c.conn.Close()
+		conn.Close()
 		c.eventCh <- &roaEvent{
 			EventType: roaDisconnected,
 			Src:       c.host,
+			conn:      conn,
 			timestamp: time.Now(),
 		}
 	}()
@@ -445,7 +494,7 @@ func (c *roaClient) established() (err error) {
 
 	for {
 		var data []byte
-		data, err = readRTRMessage(c.conn)
+		data, err = readRTRMessage(conn)
 		if err != nil {
 			return err
 		}
@@ -454,6 +503,7 @@ func (c *roaClient) established() (err error) {
 			EventType: roaRTR,
 			Src:       c.host,
 			Data:      data,
+			conn:      conn,
 			timestamp: time.Now(),
 		}
 	}
