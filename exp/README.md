@@ -68,3 +68,37 @@ Also contains handler methods for applications that would like to handle and sto
 ```
 
 For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/api/remote).
+
+## Exemplars
+
+The `exemplars` package provides a bounded, time-windowed exemplar reservoir.
+Instead of keeping only the most recent observation per bucket, it retains up
+to a configurable number of candidate observations from a sliding time window
+and selects exposable exemplars from them using an explicit sampling rule
+(uniform without replacement, or weight-proportional via A-Res). The clock and
+random source are injectable so selection outcomes are reproducible in tests.
+
+```go
+    import (
+        "github.com/prometheus/client_golang/exp/exemplars"
+    )
+    ...
+
+    reservoir := exemplars.NewReservoir(exemplars.Config{
+        Capacity:     64,
+        Window:       5 * time.Minute,
+        MaxExemplars: 4,
+    })
+
+    reservoir.Observe(exemplars.Observation{
+        Value:  latency.Seconds(),
+        Labels: map[string]string{"trace_id": traceID},
+    })
+
+    for _, e := range reservoir.Exemplars() {
+        // Attach e to the metric's exemplar output.
+    }
+```
+
+Note that retention is biased towards recent observations once the pool is
+full; see the package documentation for the exact distribution guarantees.
