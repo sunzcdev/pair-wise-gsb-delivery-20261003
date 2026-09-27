@@ -22,7 +22,7 @@ func readHeader(r *bufio.Reader) (header, error) {
 	for {
 		l, err := tr.ReadLine()
 		if err != nil {
-			return h, fmt.Errorf("failed to read header: %v", err)
+			return h, fmt.Errorf("failed to read header: %w", err)
 		}
 
 		if len(l) == 0 {

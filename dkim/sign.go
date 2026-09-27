@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"fmt"
+	"hash"
 	"io"
 	"strconv"
 	"strings"
@@ -85,9 +86,17 @@ type Signer struct {
 	sigParams map[string]string // only valid after done received nil
 }
 
-// NewSigner creates a new signer. It returns an error if SignOptions is
-// invalid.
-func NewSigner(options *SignOptions) (*Signer, error) {
+// signConfig holds the normalized signing parameters derived from
+// SignOptions.
+type signConfig struct {
+	headerCan Canonicalization
+	bodyCan   Canonicalization
+	keyAlgo   string
+	hash      crypto.Hash
+	hashAlgo  string
+}
+
+func checkSignOptions(options *SignOptions) (*signConfig, error) {
 	if options == nil {
 		return nil, fmt.Errorf("dkim: no options specified")
 	}
@@ -154,6 +163,109 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 	}
 
+	return &signConfig{
+		headerCan: headerCan,
+		bodyCan:   bodyCan,
+		keyAlgo:   keyAlgo,
+		hash:      hash,
+		hashAlgo:  hashAlgo,
+	}, nil
+}
+
+// computeSignature signs the already-parsed header and the already-computed
+// body hash with the provided options.
+func computeSignature(h header, options *SignOptions, cfg *signConfig, bodyHashed []byte) (map[string]string, error) {
+	params := map[string]string{
+		"v":  "1",
+		"a":  cfg.keyAlgo + "-" + cfg.hashAlgo,
+		"bh": base64.StdEncoding.EncodeToString(bodyHashed),
+		"c":  string(cfg.headerCan) + "/" + string(cfg.bodyCan),
+		"d":  options.Domain,
+		//"l": "", // TODO
+		"s": options.Selector,
+		"t": formatTime(now()),
+		//"z": "", // TODO
+	}
+
+	var headerKeys []string
+	if options.HeaderKeys != nil {
+		headerKeys = options.HeaderKeys
+	} else {
+		for _, kv := range h {
+			k, _ := parseHeaderField(kv)
+			headerKeys = append(headerKeys, k)
+		}
+	}
+	params["h"] = formatTagList(headerKeys)
+
+	if options.Identifier != "" {
+		params["i"] = options.Identifier
+	}
+
+	if options.QueryMethods != nil {
+		methods := make([]string, len(options.QueryMethods))
+		for i, method := range options.QueryMethods {
+			methods[i] = string(method)
+		}
+		params["q"] = formatTagList(methods)
+	}
+
+	if !options.Expiration.IsZero() {
+		params["x"] = formatTime(options.Expiration)
+	}
+
+	// Hash and sign headers
+	hasher := cfg.hash.New()
+	picker := newHeaderPicker(h)
+	for _, k := range headerKeys {
+		kv := picker.Pick(k)
+		if kv == "" {
+			// The Signer MAY include more instances of a header field name
+			// in "h=" than there are actual corresponding header fields so
+			// that the signature will not verify if additional header
+			// fields of that name are added.
+			continue
+		}
+
+		kv = canonicalizers[cfg.headerCan].CanonicalizeHeader(kv)
+		if _, err := io.WriteString(hasher, kv); err != nil {
+			return nil, err
+		}
+	}
+
+	params["b"] = ""
+	sigField := formatSignature(params)
+	sigField = canonicalizers[cfg.headerCan].CanonicalizeHeader(sigField)
+	sigField = strings.TrimRight(sigField, crlf)
+	if _, err := io.WriteString(hasher, sigField); err != nil {
+		return nil, err
+	}
+	hashed := hasher.Sum(nil)
+
+	// Don't pass Hash to Sign for ed25519 as it doesn't support it
+	// and will return an error ("ed25519: cannot sign hashed message").
+	hash := cfg.hash
+	if cfg.keyAlgo == "ed25519" {
+		hash = crypto.Hash(0)
+	}
+
+	sig, err := options.Signer.Sign(randReader, hashed, hash)
+	if err != nil {
+		return nil, err
+	}
+	params["b"] = base64.StdEncoding.EncodeToString(sig)
+
+	return params, nil
+}
+
+// NewSigner creates a new signer. It returns an error if SignOptions is
+// invalid.
+func NewSigner(options *SignOptions) (*Signer, error) {
+	cfg, err := checkSignOptions(options)
+	if err != nil {
+		return nil, err
+	}
+
 	done := make(chan error, 1)
 	pr, pw := io.Pipe()
 
@@ -179,8 +291,8 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		}
 
 		// Hash body
-		hasher := hash.New()
-		can := canonicalizers[bodyCan].CanonicalizeBody(hasher)
+		hasher := cfg.hash.New()
+		can := canonicalizers[cfg.bodyCan].CanonicalizeBody(hasher)
 		if _, err := io.Copy(can, br); err != nil {
 			closeReadWithError(err)
 			return
@@ -189,89 +301,12 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 			closeReadWithError(err)
 			return
 		}
-		bodyHashed := hasher.Sum(nil)
 
-		params := map[string]string{
-			"v":  "1",
-			"a":  keyAlgo + "-" + hashAlgo,
-			"bh": base64.StdEncoding.EncodeToString(bodyHashed),
-			"c":  string(headerCan) + "/" + string(bodyCan),
-			"d":  options.Domain,
-			//"l": "", // TODO
-			"s": options.Selector,
-			"t": formatTime(now()),
-			//"z": "", // TODO
-		}
-
-		var headerKeys []string
-		if options.HeaderKeys != nil {
-			headerKeys = options.HeaderKeys
-		} else {
-			for _, kv := range h {
-				k, _ := parseHeaderField(kv)
-				headerKeys = append(headerKeys, k)
-			}
-		}
-		params["h"] = formatTagList(headerKeys)
-
-		if options.Identifier != "" {
-			params["i"] = options.Identifier
-		}
-
-		if options.QueryMethods != nil {
-			methods := make([]string, len(options.QueryMethods))
-			for i, method := range options.QueryMethods {
-				methods[i] = string(method)
-			}
-			params["q"] = formatTagList(methods)
-		}
-
-		if !options.Expiration.IsZero() {
-			params["x"] = formatTime(options.Expiration)
-		}
-
-		// Hash and sign headers
-		hasher.Reset()
-		picker := newHeaderPicker(h)
-		for _, k := range headerKeys {
-			kv := picker.Pick(k)
-			if kv == "" {
-				// The Signer MAY include more instances of a header field name
-				// in "h=" than there are actual corresponding header fields so
-				// that the signature will not verify if additional header
-				// fields of that name are added.
-				continue
-			}
-
-			kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
-			if _, err := io.WriteString(hasher, kv); err != nil {
-				closeReadWithError(err)
-				return
-			}
-		}
-
-		params["b"] = ""
-		sigField := formatSignature(params)
-		sigField = canonicalizers[headerCan].CanonicalizeHeader(sigField)
-		sigField = strings.TrimRight(sigField, crlf)
-		if _, err := io.WriteString(hasher, sigField); err != nil {
-			closeReadWithError(err)
-			return
-		}
-		hashed := hasher.Sum(nil)
-
-		// Don't pass Hash to Sign for ed25519 as it doesn't support it
-		// and will return an error ("ed25519: cannot sign hashed message").
-		if keyAlgo == "ed25519" {
-			hash = crypto.Hash(0)
-		}
-
-		sig, err := options.Signer.Sign(randReader, hashed, hash)
+		params, err := computeSignature(h, options, cfg, hasher.Sum(nil))
 		if err != nil {
 			closeReadWithError(err)
 			return
 		}
-		params["b"] = base64.StdEncoding.EncodeToString(sig)
 
 		s.sigParams = params
 		closeReadWithError(nil)
@@ -330,6 +365,119 @@ func Sign(w io.Writer, r io.Reader, options *SignOptions) error {
 	}
 	_, err = io.Copy(w, &b)
 	return err
+}
+
+// A SignResult holds the outcome of signing a message with one of the
+// SignOptions passed to SignMultiple.
+type SignResult struct {
+	// Signature is the whole DKIM-Signature header field that the caller
+	// should prepend to the message. It contains both the header field
+	// name, its value and the final CRLF. It is empty if Err is non-nil.
+	Signature string
+	// Err is set when signing with this entry's SignOptions failed (e.g.
+	// its crypto.Signer returned an error). It doesn't affect the other
+	// entries.
+	Err error
+}
+
+// SignMultiple signs a message with multiple sets of options in a single
+// pass over the message. It is typically used during key rotation, when a
+// message must carry signatures for both the old and the new selector.
+//
+// The message body is read from r exactly once. Options entries which use
+// the same hash algorithm and body canonicalization share the same body
+// canonicalization and hashing work. Memory usage doesn't depend on the
+// message size, so SignMultiple is suitable for messages with large
+// attachments.
+//
+// The returned slice contains one SignResult per options entry, in the same
+// order. If signing fails for a single entry, the other entries are still
+// processed and the failure is reported in that entry's SignResult.Err. An
+// error is only returned directly for failures which prevent signing as a
+// whole: invalid options, or a failure to read the message from r.
+//
+// SignMultiple doesn't spawn any background goroutine: if the caller stops
+// reading from its source or r returns an error, SignMultiple returns
+// immediately without leaving any internal pipeline behind.
+//
+// The returned signatures should be prepended to the message header, in
+// order.
+func SignMultiple(r io.Reader, optionsList []*SignOptions) ([]*SignResult, error) {
+	if len(optionsList) == 0 {
+		return nil, fmt.Errorf("dkim: no options specified")
+	}
+
+	cfgs := make([]*signConfig, len(optionsList))
+	for i, options := range optionsList {
+		cfg, err := checkSignOptions(options)
+		if err != nil {
+			return nil, err
+		}
+		cfgs[i] = cfg
+	}
+
+	// Read header
+	br := bufio.NewReader(r)
+	h, err := readHeader(br)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group options by hash algorithm and body canonicalization, so that
+	// entries sharing them also share the canonicalization and hashing work.
+	type bodyKey struct {
+		hash crypto.Hash
+		can  Canonicalization
+	}
+	type bodyGroup struct {
+		hasher hash.Hash
+		can    io.WriteCloser
+		sum    []byte
+	}
+	groups := make(map[bodyKey]*bodyGroup)
+	for _, cfg := range cfgs {
+		key := bodyKey{cfg.hash, cfg.bodyCan}
+		if _, ok := groups[key]; !ok {
+			hasher := cfg.hash.New()
+			groups[key] = &bodyGroup{
+				hasher: hasher,
+				can:    canonicalizers[cfg.bodyCan].CanonicalizeBody(hasher),
+			}
+		}
+	}
+
+	// Hash the body, streaming it through each group's canonicalizer
+	writers := make([]io.Writer, 0, len(groups))
+	for _, g := range groups {
+		writers = append(writers, g.can)
+	}
+	if _, err := io.Copy(io.MultiWriter(writers...), br); err != nil {
+		return nil, err
+	}
+	for _, g := range groups {
+		if err := g.can.Close(); err != nil {
+			return nil, err
+		}
+		g.sum = g.hasher.Sum(nil)
+	}
+
+	// Sign the header for each options entry independently, so that a
+	// failing crypto.Signer doesn't prevent the other signatures from being
+	// generated
+	results := make([]*SignResult, len(optionsList))
+	for i, options := range optionsList {
+		res := new(SignResult)
+		results[i] = res
+
+		key := bodyKey{cfgs[i].hash, cfgs[i].bodyCan}
+		params, err := computeSignature(h, options, cfgs[i], groups[key].sum)
+		if err != nil {
+			res.Err = err
+			continue
+		}
+		res.Signature = formatSignature(params)
+	}
+	return results, nil
 }
 
 func formatSignature(params map[string]string) string {
