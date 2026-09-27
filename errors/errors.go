@@ -84,4 +84,22 @@ var (
 	// ErrDifferentDB is returned when trying to move a sub-bucket between
 	// source and target buckets, while source and target buckets are in different database files.
 	ErrDifferentDB = errors.New("the source and target buckets are in different database files")
+
+	// ErrCompactSourceChanged is returned when resuming an interrupted
+	// resumable compaction, but the source database has been modified (its
+	// txid changed) since the interrupted run recorded its progress. The
+	// partially written destination must be discarded and the compaction
+	// restarted from scratch, because data from two different points in
+	// time cannot be spliced into a single consistent destination.
+	ErrCompactSourceChanged = errors.New("compact: source database changed since progress was recorded")
+
+	// ErrCompactDstNotEmpty is returned when the destination of a resumable
+	// compaction contains data but no resumable compaction progress record,
+	// so its state cannot be reconciled with a resumable copy.
+	ErrCompactDstNotEmpty = errors.New("compact: destination is not empty and has no compaction progress record")
+
+	// ErrCompactReservedBucket is returned when the source database contains
+	// a root bucket whose name collides with the reserved compaction
+	// progress bucket, making a resumable compaction ambiguous.
+	ErrCompactReservedBucket = errors.New("compact: source contains the reserved compaction progress bucket")
 )
