@@ -71,6 +71,9 @@ type Cache[K Key, V any] struct {
 	ignoreInternalCost bool
 	// cleanupTicker is used to periodically check for entries whose TTL has passed.
 	cleanupTicker *time.Ticker
+	// tags indexes key hashes by tag name so that groups of items sharing a
+	// tag can be invalidated together via InvalidateTags.
+	tags *tagIndex
 	// Metrics contains a running log of important statistics like hits, misses,
 	// and dropped items.
 	Metrics *Metrics
@@ -199,6 +202,9 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	// tags are the tag names associated with the key when the item was
+	// written via SetWithTags or SetWithTTLAndTags.
+	tags []string
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -231,6 +237,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 		cost:               config.Cost,
 		ignoreInternalCost: config.IgnoreInternalCost,
 		cleanupTicker:      time.NewTicker(time.Duration(config.TtlTickerDurationInSec) * time.Second / 2),
+		tags:               newTagIndex(),
 	}
 	cache.storedItems.SetShouldUpdateFn(config.ShouldUpdate)
 	cache.onExit = func(val V) {
@@ -320,6 +327,15 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.SetWithTTLAndTags(key, value, cost, ttl)
+}
+
+// SetWithTTLAndTags works like SetWithTTL but also associates the key with
+// the given tags, so the key can later be invalidated as part of a group via
+// InvalidateTags. Calling it with no tags is identical to SetWithTTL.
+//
+// See SetWithTags and SetWithTTL for more information.
+func (c *Cache[K, V]) SetWithTTLAndTags(key K, value V, cost int64, ttl time.Duration, tags ...string) bool {
 	if c == nil || c.isClosed.Load() {
 		return false
 	}
@@ -344,6 +360,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		tags:       tags,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -375,6 +392,7 @@ func (c *Cache[K, V]) Del(key K) {
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
 	_, prev := c.storedItems.Del(keyHash, conflictHash)
+	c.tags.untrack(keyHash)
 	c.onExit(prev)
 	// If we've set an item, it would be applied slightly later.
 	// So we must push the same item to `setBuf` with the deletion flag.
@@ -475,6 +493,7 @@ loop:
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
+	c.tags.clear()
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -531,9 +550,7 @@ func (c *Cache[K, V]) processItems() {
 			c.Metrics.trackEviction(int64(time.Since(ts) / time.Second))
 			delete(startTs, i.Key)
 		}
-		if c.onEvict != nil {
-			c.onEvict(i)
-		}
+		c.evictItem(i)
 	}
 
 	for {
@@ -543,37 +560,8 @@ func (c *Cache[K, V]) processItems() {
 				close(i.wait)
 				continue
 			}
-			// Calculate item cost value if new or update.
-			if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
-				i.Cost = c.cost(i.Value)
-			}
-			if !c.ignoreInternalCost {
-				// Add the cost of internally storing the object.
-				i.Cost += itemSize
-			}
-
-			switch i.flag {
-			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
-				if added {
-					c.storedItems.Set(i)
-					c.Metrics.add(keyAdd, i.Key, 1)
-					trackAdmission(i.Key)
-				} else {
-					c.onReject(i)
-				}
-				for _, victim := range victims {
-					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
-					onEvict(victim)
-				}
-
-			case itemUpdate:
-				c.cachePolicy.Update(i.Key, i.Cost)
-
-			case itemDelete:
-				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
-				_, val := c.storedItems.Del(i.Key, i.Conflict)
-				c.onExit(val)
+			if added := c.applySetItem(i, onEvict); added {
+				trackAdmission(i.Key)
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
@@ -582,6 +570,60 @@ func (c *Cache[K, V]) processItems() {
 			return
 		}
 	}
+}
+
+// evictItem removes the item's key from the tag index and runs the eviction
+// callbacks. It is called whenever an item leaves the cache due to eviction
+// or expiration.
+func (c *Cache[K, V]) evictItem(i *Item[V]) {
+	c.tags.untrack(i.Key)
+	if c.onEvict != nil {
+		c.onEvict(i)
+	}
+}
+
+// applySetItem applies a single item from the set buffer to the policy and
+// the store, keeping the tag index in sync. It reports whether a new key was
+// admitted to the cache (only possible for itemNew items).
+func (c *Cache[K, V]) applySetItem(i *Item[V], onEvict func(*Item[V])) bool {
+	// Calculate item cost value if new or update.
+	if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
+		i.Cost = c.cost(i.Value)
+	}
+	if !c.ignoreInternalCost {
+		// Add the cost of internally storing the object.
+		i.Cost += itemSize
+	}
+
+	switch i.flag {
+	case itemNew:
+		victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+		if added {
+			c.storedItems.Set(i)
+			c.tags.track(i.Key, i.tags)
+			c.Metrics.add(keyAdd, i.Key, 1)
+		} else {
+			c.onReject(i)
+		}
+		for _, victim := range victims {
+			victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
+			onEvict(victim)
+		}
+		return added
+
+	case itemUpdate:
+		c.cachePolicy.Update(i.Key, i.Cost)
+		// The value was already stored when Set was called. Refresh the
+		// key's tag associations so replaced values drop their old tags.
+		c.tags.track(i.Key, i.tags)
+
+	case itemDelete:
+		c.cachePolicy.Del(i.Key) // Deals with metrics updates.
+		_, val := c.storedItems.Del(i.Key, i.Conflict)
+		c.tags.untrack(i.Key)
+		c.onExit(val)
+	}
+	return false
 }
 
 // collectMetrics just creates a new *Metrics instance and adds the pointers
