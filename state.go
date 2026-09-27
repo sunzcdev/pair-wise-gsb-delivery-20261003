@@ -610,17 +610,16 @@ func (m *Memberlist) gossip() {
 	})
 	m.nodeLock.RUnlock()
 
-	// Compute the bytes available
-	bytesAvail := m.config.UDPBufferSize - compoundHeaderOverhead - labelOverhead(m.config.Label)
-	if m.config.EncryptionEnabled() {
-		bytesAvail -= encryptOverhead(m.encryptionVersion())
-	}
-
 	for _, node := range kNodes {
+		// Compute the bytes available for this specific peer, which may
+		// have a smaller effective packet budget than the global
+		// UDPBufferSize (e.g. when reached over a tunnel).
+		bytesAvail := m.packetBytesAvail(node.FullAddress())
+
 		// Get any pending broadcasts
 		msgs := m.getBroadcasts(compoundOverhead, bytesAvail)
 		if len(msgs) == 0 {
-			return
+			continue
 		}
 
 		addr := node.Address()

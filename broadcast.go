@@ -71,6 +71,15 @@ func (m *Memberlist) encodeBroadcastNotify(node string, msgType messageType, msg
 // be invalidated by a future message about the same node
 func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{}) {
 	b := &memberlistBroadcast{node, msg, notify}
+	if max := m.maxBroadcastBytes(); len(msg) > max {
+		// A message that could never fit into a packet for any peer must
+		// not sit at the head of the queue forever, so reject it
+		// explicitly and notify any waiters.
+		m.logger.Printf("[ERR] memberlist: rejecting broadcast for node %q: message of %d bytes exceeds the maximum broadcast size of %d bytes",
+			node, len(msg), max)
+		b.Finished()
+		return
+	}
 	m.broadcasts.QueueBroadcast(b)
 }
 

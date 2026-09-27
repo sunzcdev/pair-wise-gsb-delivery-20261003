@@ -101,6 +101,18 @@ type NodeAwareTransport interface {
 	DialAddressTimeout(addr Address, timeout time.Duration) (net.Conn, error)
 }
 
+// PacketBudgetTransport is an optional interface that a Transport can
+// implement to report a smaller effective packet budget for a destination,
+// for example when the path to that peer traverses a tunnel with a lower
+// MTU and larger packets would be silently dropped. The returned value is
+// the maximum number of bytes that should be put into a single packet to
+// the given address, including any label header; a non-positive value
+// means the transport has no opinion. The effective budget never exceeds
+// the configured UDPBufferSize.
+type PacketBudgetTransport interface {
+	PacketBudget(addr Address) int
+}
+
 type shimNodeAwareTransport struct {
 	Transport
 }
@@ -138,6 +150,16 @@ func (t *labelWrappedTransport) WriteTo(buf []byte, addr string) (time.Time, err
 		return time.Time{}, err
 	}
 	return t.NodeAwareTransport.WriteTo(buf, addr)
+}
+
+// PacketBudget forwards any transport-reported packet budget through the
+// label wrapper so that it remains visible to memberlist. It returns 0
+// (no opinion) if the wrapped transport does not report a budget.
+func (t *labelWrappedTransport) PacketBudget(addr Address) int {
+	if bt, ok := t.NodeAwareTransport.(PacketBudgetTransport); ok {
+		return bt.PacketBudget(addr)
+	}
+	return 0
 }
 
 func (t *labelWrappedTransport) DialAddressTimeout(addr Address, timeout time.Duration) (net.Conn, error) {

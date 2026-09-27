@@ -85,6 +85,7 @@ const (
 	compoundHeaderOverhead = 2   // Assumed header overhead
 	compoundOverhead       = 2   // Assumed overhead per entry in compoundHeader
 	userMsgOverhead        = 1
+	crcHeaderOverhead      = 5                     // hasCrcMsg type byte plus 4-byte CRC, added for protocol >= 5 peers
 	blockingWarning        = 10 * time.Millisecond // Warn if a UDP packet takes this long to process
 	maxPushStateBytes      = 20 * 1024 * 1024
 	maxPushStateNodes      = 1024 * 1024      // Each requires conservatively  ~20 bytes when encoded
@@ -801,10 +802,7 @@ func (m *Memberlist) encodeAndSendMsg(a Address, msgType messageType, msg any) e
 // opportunistically create a compoundMsg and piggy back other broadcasts.
 func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 	// Check if we can piggy back any messages
-	bytesAvail := m.config.UDPBufferSize - len(msg) - compoundHeaderOverhead - labelOverhead(m.config.Label)
-	if m.config.EncryptionEnabled() && m.config.GossipVerifyOutgoing {
-		bytesAvail -= encryptOverhead(m.encryptionVersion())
-	}
+	bytesAvail := m.packetBytesAvail(a) - len(msg)
 	extra := m.getBroadcasts(compoundOverhead, bytesAvail)
 
 	// Fast path if nothing to piggypack
@@ -822,6 +820,57 @@ func (m *Memberlist) sendMsg(a Address, msg []byte) error {
 
 	// Send the message
 	return m.rawSendMsgPacket(a, nil, compound.Bytes())
+}
+
+// packetBudget returns the effective packet budget in bytes for packets
+// sent to the given address. This is the minimum of the configured
+// UDPBufferSize (which always remains the upper bound), any per-peer
+// budget override from the configuration, and any budget reported by the
+// transport.
+func (m *Memberlist) packetBudget(a Address) int {
+	budget := m.config.UDPBufferSize
+	if m.config.PacketBudgetFunc != nil {
+		if b, ok := m.config.PacketBudgetFunc(a.Addr); ok && b > 0 && b < budget {
+			budget = b
+		}
+	}
+	if bt, ok := m.transport.(PacketBudgetTransport); ok {
+		if b := bt.PacketBudget(a); b > 0 && b < budget {
+			budget = b
+		}
+	}
+	return budget
+}
+
+// packetBytesAvailForBudget returns the number of bytes available for
+// message payloads in a packet with the given total wire budget, after
+// reserving space for the actual wire length overhead: the compound
+// message header, the CRC header, the packet label, and encryption, as
+// applicable.
+func (m *Memberlist) packetBytesAvailForBudget(budget int) int {
+	avail := budget - compoundHeaderOverhead - crcHeaderOverhead - labelOverhead(m.config.Label)
+	if m.config.EncryptionEnabled() {
+		avail -= encryptOverhead(m.encryptionVersion())
+	}
+	if avail < 0 {
+		avail = 0
+	}
+	return avail
+}
+
+// packetBytesAvail returns the number of bytes available for message
+// payloads in a packet sent to the given address, accounting for the
+// effective per-peer packet budget.
+func (m *Memberlist) packetBytesAvail(a Address) int {
+	return m.packetBytesAvailForBudget(m.packetBudget(a))
+}
+
+// maxBroadcastBytes returns the largest single broadcast message that
+// could ever be packed into a packet, derived from the global
+// UDPBufferSize. Per-peer budgets can only shrink the effective budget,
+// so anything larger than this can never be sent to any peer.
+func (m *Memberlist) maxBroadcastBytes() int {
+	return m.packetBytesAvailForBudget(m.config.UDPBufferSize) - compoundOverhead
 }
 
 // rawSendMsgPacket is used to send message via packet to another host without
@@ -884,6 +933,15 @@ func (m *Memberlist) rawSendMsgPacket(a Address, node *Node, msg []byte) error {
 			return err
 		}
 		msg = buf.Bytes()
+	}
+
+	// Enforce the effective packet budget for this destination on the
+	// final wire length (including the label, which is prepended by the
+	// transport). Packets that would exceed the budget are rejected
+	// explicitly rather than being silently dropped by the network.
+	wireLen := len(msg) + labelOverhead(m.config.Label)
+	if budget := m.packetBudget(a); budget > 0 && wireLen > budget {
+		return fmt.Errorf("memberlist: packet of %d bytes exceeds effective budget of %d bytes for %s", wireLen, budget, a.Addr)
 	}
 
 	metrics.IncrCounterWithLabels([]string{"memberlist", "udp", "sent"}, float32(len(msg)), m.metricLabels)

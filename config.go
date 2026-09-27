@@ -240,6 +240,18 @@ type Config struct {
 	// called PacketBufferSize now that we have generalized the transport.
 	UDPBufferSize int
 
+	// PacketBudgetFunc is an optional hook that provides a per-peer packet
+	// send budget. It is called with the destination address in "host:port"
+	// form; if it returns true, the returned budget is used as an upper
+	// bound on the number of bytes put into a single packet to that peer.
+	// This is useful when some peers are reached through tunnels or links
+	// with a smaller MTU, where larger packets are silently dropped. The
+	// effective budget for a peer is the minimum of UDPBufferSize, any
+	// budget returned by this function, and any budget reported by the
+	// transport (see PacketBudgetTransport), so UDPBufferSize always
+	// remains the upper bound.
+	PacketBudgetFunc func(addr string) (budget int, ok bool)
+
 	// DeadNodeReclaimTime controls the time before a dead node's name can be
 	// reclaimed by one with a different address or port. By default, this is 0,
 	// meaning nodes cannot be reclaimed this way.
