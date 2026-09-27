@@ -806,13 +806,57 @@ func (m *Memberlist) nextSeqNo() uint32 {
 }
 
 // nextIncarnation returns the next incarnation number in a thread safe way
-func (m *Memberlist) nextIncarnation() uint32 {
-	return m.incarnation.Add(1)
+func (m *Memberlist) nextIncarnation() (uint32, error) {
+	return m.bumpIncarnation(1)
 }
 
 // skipIncarnation adds the positive offset to the incarnation number.
-func (m *Memberlist) skipIncarnation(offset uint32) uint32 {
-	return m.incarnation.Add(offset)
+func (m *Memberlist) skipIncarnation(offset uint32) (uint32, error) {
+	return m.bumpIncarnation(offset)
+}
+
+// bumpIncarnation advances the local incarnation number by delta. When an
+// IncarnationStore is configured, the new incarnation is durably reserved
+// (in batches, to bound the number of writes) before it is returned, so a
+// restarted process can never publish an incarnation that its predecessor
+// already used. Reservation failures and exhaustion of the uint32
+// incarnation space are reported as explicit errors.
+func (m *Memberlist) bumpIncarnation(delta uint32) (uint32, error) {
+	if m.config.IncarnationStore == nil {
+		// Pure in-memory mode keeps the historical behavior.
+		return m.incarnation.Add(delta), nil
+	}
+
+	m.incarnationLock.Lock()
+	defer m.incarnationLock.Unlock()
+
+	current := m.incarnation.Load()
+	if current > math.MaxUint32-delta {
+		return 0, ErrIncarnationExhausted
+	}
+	next := current + delta
+	if next > m.incarnationReserved.Load() {
+		batch := m.incarnationBatch()
+		if next > math.MaxUint32-batch {
+			return 0, ErrIncarnationExhausted
+		}
+		high := next + batch
+		if err := m.config.IncarnationStore.Reserve(high); err != nil {
+			return 0, fmt.Errorf("failed to persist incarnation reservation: %w", err)
+		}
+		m.incarnationReserved.Store(high)
+	}
+	m.incarnation.Store(next)
+	return next, nil
+}
+
+// incarnationBatch returns the number of incarnation numbers to reserve with
+// the IncarnationStore in a single write.
+func (m *Memberlist) incarnationBatch() uint32 {
+	if m.config.IncarnationReserveBatch > 0 {
+		return m.config.IncarnationReserveBatch
+	}
+	return DefaultIncarnationReserveBatch
 }
 
 // estNumNodes is used to get the current estimate of the number of nodes
@@ -911,9 +955,17 @@ func (m *Memberlist) invokeNackHandler(nack nackResp) {
 // nodeLock is held.
 func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 	// Make sure the incarnation number beats the accusation.
-	inc := m.nextIncarnation()
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		m.logger.Printf("[ERR] memberlist: Cannot refute an accusation for '%s': %v", me.Name, err)
+		return
+	}
 	if accusedInc >= inc {
-		inc = m.skipIncarnation(accusedInc - inc + 1)
+		inc, err = m.skipIncarnation(accusedInc - inc + 1)
+		if err != nil {
+			m.logger.Printf("[ERR] memberlist: Cannot refute an accusation for '%s': %v", me.Name, err)
+			return
+		}
 	}
 	me.Incarnation = inc
 

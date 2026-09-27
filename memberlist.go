@@ -44,6 +44,9 @@ type Memberlist struct {
 	numNodes    atomic.Uint32 // Number of known nodes (estimate)
 	pushPullReq atomic.Uint32 // Number of push/pull requests
 
+	incarnationLock     sync.Mutex    // Serializes incarnation reservations
+	incarnationReserved atomic.Uint32 // Highest incarnation durably reserved
+
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
 	advertisePort uint16
@@ -224,6 +227,18 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
+	}
+
+	// Seed the incarnation counter from the persistence provider, if any,
+	// so that a restarted process never publishes an incarnation that its
+	// predecessor could have gossiped.
+	if conf.IncarnationStore != nil {
+		high, err := conf.IncarnationStore.Load()
+		if err != nil {
+			return nil, fmt.Errorf("failed to load persisted incarnation: %w", err)
+		}
+		m.incarnation.Store(high)
+		m.incarnationReserved.Store(high)
 	}
 
 	// Get the final advertise address from the transport, which may need
@@ -461,8 +476,13 @@ func (m *Memberlist) setAlive() error {
 		}
 	}
 
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		return err
+	}
+
 	a := alive{
-		Incarnation: m.nextIncarnation(),
+		Incarnation: inc,
 		Node:        m.config.Name,
 		Addr:        addr,
 		Port:        uint16(port),
@@ -526,8 +546,12 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 	m.nodeLock.RUnlock()
 
 	// Format a new alive message
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		return err
+	}
 	a := alive{
-		Incarnation: m.nextIncarnation(),
+		Incarnation: inc,
 		Node:        m.config.Name,
 		Addr:        state.Addr,
 		Port:        state.Port,
