@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 	"github.com/things-go/go-socks5/statute"
@@ -65,16 +66,28 @@ type Server struct {
 	userConnectMiddlewares   MiddlewareChain
 	userBindMiddlewares      MiddlewareChain
 	userAssociateMiddlewares MiddlewareChain
+	// fragTimeout is the reassembly timer for fragmented UDP datagrams
+	// (RFC 1928 REASSEMBLY TIMER), defaults to 5 seconds
+	fragTimeout time.Duration
+	// fragMaxGroupSize bounds the bytes cached for a single fragment
+	// sequence, defaults to 1MiB
+	fragMaxGroupSize int
+	// fragMaxTotalSize bounds the bytes cached for all fragment sequences
+	// of one UDP association, defaults to 4MiB
+	fragMaxTotalSize int
 }
 
 // NewServer creates a new Server
 func NewServer(opts ...Option) *Server {
 	srv := &Server{
-		authMethods: []Authenticator{},
-		bufferPool:  bufferpool.NewPool(32 * 1024),
-		resolver:    DNSResolver{},
-		rules:       NewPermitAll(),
-		logger:      NewLogger(log.New(io.Discard, "socks5: ", log.LstdFlags)),
+		authMethods:      []Authenticator{},
+		bufferPool:       bufferpool.NewPool(32 * 1024),
+		resolver:         DNSResolver{},
+		rules:            NewPermitAll(),
+		logger:           NewLogger(log.New(io.Discard, "socks5: ", log.LstdFlags)),
+		fragTimeout:      defaultFragTimeout,
+		fragMaxGroupSize: defaultFragMaxGroupSize,
+		fragMaxTotalSize: defaultFragMaxTotalSize,
 	}
 
 	for _, opt := range opts {

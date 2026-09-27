@@ -226,9 +226,11 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 	sf.goFunc(func() {
 		// read from client and write to remote server
 		conns := sync.Map{}
+		reassembler := newFragmentReassembler(sf.fragTimeout, sf.fragMaxGroupSize, sf.fragMaxTotalSize)
 		bufPool := sf.bufferPool.Get()
 		defer func() {
 			sf.bufferPool.Put(bufPool)
+			reassembler.Close()
 			bindLn.Close() // nolint: errcheck
 			conns.Range(func(key, value any) bool {
 				if connTarget, ok := value.(net.Conn); !ok {
@@ -256,6 +258,16 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 			srcEqual := ((request.DestAddr.IP.IsUnspecified()) || request.DestAddr.IP.Equal(srcAddr.IP)) && (request.DestAddr.Port == 0 || request.DestAddr.Port == srcAddr.Port) //nolint:lll
 			if !srcEqual {
 				continue
+			}
+
+			if pk.Frag != 0 {
+				// fragmented datagram: only forward once the fragment
+				// sequence has been fully reassembled (RFC 1928)
+				var ok bool
+				pk, ok = reassembler.push(srcAddr.String(), pk)
+				if !ok {
+					continue
+				}
 			}
 
 			connKey := srcAddr.String() + "--" + pk.DstAddr.String()

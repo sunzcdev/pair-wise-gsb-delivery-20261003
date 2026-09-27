@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 )
@@ -173,5 +174,38 @@ func WithAssociateMiddleware(m Middleware) Option {
 func WithUseBindIpBaseResolveAsUdpAddr(b bool) Option {
 	return func(s *Server) {
 		s.useBindIpBaseResolveAsUdpAddr = b
+	}
+}
+
+// WithFragmentTimeout sets the reassembly timer for fragmented UDP datagrams
+// (RFC 1928 REASSEMBLY TIMER). RFC 1928 requires it to be no less than
+// 5 seconds, which is also the default. Values <= 0 keep the default.
+func WithFragmentTimeout(d time.Duration) Option {
+	return func(s *Server) {
+		if d > 0 {
+			s.fragTimeout = d
+		}
+	}
+}
+
+// WithFragmentMaxGroupSize bounds the bytes cached for a single UDP fragment
+// sequence; a sequence exceeding it is abandoned. Defaults to 1MiB.
+// Values <= 0 keep the default.
+func WithFragmentMaxGroupSize(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.fragMaxGroupSize = n
+		}
+	}
+}
+
+// WithFragmentMaxTotalSize bounds the bytes cached for all UDP fragment
+// sequences of one UDP association. Defaults to 4MiB.
+// Values <= 0 keep the default.
+func WithFragmentMaxTotalSize(n int) Option {
+	return func(s *Server) {
+		if n > 0 {
+			s.fragMaxTotalSize = n
+		}
 	}
 }

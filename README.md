@@ -23,6 +23,7 @@ The package has the following features:
 - User/Password authentication optional user addr limit
 - Support for the CONNECT command
 - Support for the ASSOCIATE command
+- UDP fragment reassembly (RFC 1928 FRAG field)
 - Rules to do granular filtering of commands
 - Custom DNS resolution
 - Custom goroutine pool
