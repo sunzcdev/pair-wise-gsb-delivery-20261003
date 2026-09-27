@@ -491,52 +491,57 @@ func (obj JSONWebSignature) VerifyMulti(verificationKey interface{}) (int, Signa
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey interface{}) (int, Signature, error) {
-	for i, signature := range obj.Signatures {
-		if signature.header != nil {
-			// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
-			// 4.1.11. "crit" (Critical) Header Parameter
-			// "When used, this Header Parameter MUST be integrity
-			// protected; therefore, it MUST occur only within the JWS
-			// Protected Header."
-			err := signature.header.checkNoCritical()
-			if err != nil {
-				continue
-			}
-		}
-
-		if signature.protected != nil {
-			// Check for only supported critical headers
-			err := signature.protected.checkSupportedCritical(supportedCritical)
-			if err != nil {
-				continue
-			}
-		}
-
-		// If the verification key is a JWK Set, pick a key based on this signature's
-		// "kid" header. If no match, skip this signature.
-		key, err := tryJWKS(verificationKey, signature.Header)
-		if err != nil {
-			continue
-		}
-		verifier, err := newVerifier(key)
-		if err != nil {
+	for i := range obj.Signatures {
+		if err := obj.verifySignature(payload, &obj.Signatures[i], verificationKey); err != nil {
 			continue
 		}
 
-		input, err := obj.computeAuthData(payload, &signature)
-		if err != nil {
-			continue
-		}
-
-		headers := signature.mergedHeaders()
-		alg := headers.getSignatureAlgorithm()
-		err = verifier.verifyPayload(input, signature.Signature, alg)
-		if err != nil {
-			continue
-		}
-
-		return i, signature, nil
+		return i, obj.Signatures[i], nil
 	}
 
 	return -1, Signature{}, ErrCryptoFailure
+}
+
+// verifySignature verifies a single signature of the object against the given
+// verification key. The key types accepted are the same as for
+// JSONWebSignature.Verify. Header values (including "kid") are never trusted
+// to establish identity; only a successful cryptographic verification counts.
+func (obj JSONWebSignature) verifySignature(payload []byte, signature *Signature, verificationKey interface{}) error {
+	if signature.header != nil {
+		// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
+		// 4.1.11. "crit" (Critical) Header Parameter
+		// "When used, this Header Parameter MUST be integrity
+		// protected; therefore, it MUST occur only within the JWS
+		// Protected Header."
+		if err := signature.header.checkNoCritical(); err != nil {
+			return err
+		}
+	}
+
+	if signature.protected != nil {
+		// Check for only supported critical headers
+		if err := signature.protected.checkSupportedCritical(supportedCritical); err != nil {
+			return err
+		}
+	}
+
+	// If the verification key is a JWK Set, pick a key based on this signature's
+	// "kid" header. If no match, reject.
+	key, err := tryJWKS(verificationKey, signature.Header)
+	if err != nil {
+		return err
+	}
+	verifier, err := newVerifier(key)
+	if err != nil {
+		return err
+	}
+
+	input, err := obj.computeAuthData(payload, signature)
+	if err != nil {
+		return err
+	}
+
+	headers := signature.mergedHeaders()
+	alg := headers.getSignatureAlgorithm()
+	return verifier.verifyPayload(input, signature.Signature, alg)
 }
