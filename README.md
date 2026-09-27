@@ -313,6 +313,15 @@ func multiWriteHandler(w http.ResponseWriter, r *http.Request) {
 
 If you modify the session data and forget to call `Commit`, the `LoadAndSave` middleware will panic with an `ErrUncommittedModification` error.
 
+Alternatively, you can set `SessionManager.BufferSize` to a value greater than zero to enable buffered mode. In buffered mode the response status code, headers and body (up to `BufferSize` bytes) are buffered, and the session data is committed only after the handler returns — so handlers may freely modify the session data after writing to the response. The buffered response is sent to the client only if the final commit succeeds; if the commit fails, the buffered response is discarded and `ErrorFunc` is called instead.
+
+```go
+sessionManager := scs.New()
+sessionManager.BufferSize = 4096
+```
+
+In buffered mode, calling `Flush` or exceeding the buffer limit commits the session immediately and streams the remainder of the response directly to the client (modifying the session data after that point will panic with `ErrUncommittedModification`). Hijacking commits the session and sends any buffered response before the connection is taken over. If the handler panics, the buffered response is discarded and the session is not committed.
+
 Flushing responses is supported via the `http.NewResponseController` type (available in Go >= 1.20). 
 
 ```go

@@ -48,6 +48,19 @@ type SessionManager struct {
 	// a function which logs the error and returns a customized HTML error page.
 	ErrorFunc func(http.ResponseWriter, *http.Request, error)
 
+	// BufferSize controls whether the LoadAndSave middleware buffers the
+	// response. If BufferSize is greater than zero, the response status code,
+	// headers and body (up to a maximum of BufferSize bytes) are buffered
+	// instead of being written directly to the client, and the session data
+	// is committed after the handler has returned. This allows handlers to
+	// modify the session data after writing to the response. The buffered
+	// response is only sent to the client if the final commit succeeds; if
+	// the commit fails, the buffered response is discarded and ErrorFunc is
+	// called instead. The default value is 0, which disables buffering and
+	// causes the session to be committed the first time the handler writes
+	// to the response.
+	BufferSize int
+
 	// HashTokenInStore controls whether or not to store the session token or a hashed version in the store.
 	HashTokenInStore bool
 
@@ -138,6 +151,22 @@ func NewSession() *SessionManager {
 // LoadAndSave provides middleware which automatically loads and saves session
 // data for the current request, and communicates the session token to and from
 // the client in a cookie.
+//
+// If SessionManager.BufferSize is greater than zero, LoadAndSave runs in
+// buffered mode:
+//
+//   - The session is committed after the handler returns, and the buffered
+//     response is only sent to the client if the commit succeeds. If the
+//     commit fails, the buffered response is discarded and ErrorFunc is
+//     called with the underlying ResponseWriter instead.
+//   - If the handler calls Flush, or the buffered body exceeds BufferSize
+//     bytes, the session is committed immediately and the remainder of the
+//     response is streamed directly to the client. Modifying the session
+//     data after that point will cause a panic with ErrUncommittedModification.
+//   - If the handler hijacks the connection, the session is committed and
+//     any buffered response is sent before the connection is hijacked.
+//   - If the handler panics, the buffered response is discarded, the session
+//     is not committed, and the panic propagates to the caller.
 func (s *SessionManager) LoadAndSave(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Vary", "Cookie")
@@ -155,6 +184,44 @@ func (s *SessionManager) LoadAndSave(next http.Handler) http.Handler {
 		}
 
 		sr := r.WithContext(ctx)
+
+		if s.BufferSize > 0 {
+			bw := &bufferedResponseWriter{
+				w:              w,
+				request:        sr,
+				sessionManager: s,
+				limit:          s.BufferSize,
+				header:         make(http.Header),
+			}
+
+			next.ServeHTTP(bw, sr)
+
+			// If the connection was hijacked, the handler has taken over
+			// responsibility for it and there is nothing more to do.
+			if bw.hijacked {
+				return
+			}
+
+			// If the response was already streamed to the client (because of
+			// a Flush, Hijack or the buffer limit being exceeded) the session
+			// will have been committed at that point, and any subsequent
+			// modifications are uncommitted.
+			if bw.streamed {
+				if s.Status(ctx) == Modified {
+					panic(ErrUncommittedModification)
+				}
+				return
+			}
+
+			err = s.commitAndAddSessionCookie(bw, sr)
+			if err != nil {
+				s.ErrorFunc(w, sr, err)
+				return
+			}
+
+			bw.flush()
+			return
+		}
 
 		sw := &sessionResponseWriter{
 			ResponseWriter: w,
