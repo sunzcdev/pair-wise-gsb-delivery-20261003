@@ -2,15 +2,24 @@ package ftpserver
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strconv"
 	"strings"
 	"time"
 )
 
 var errUnknownHash = errors.New("unknown hash algorithm")
+
+// cccShutdownTimeout is the maximum time we wait for the client's TLS
+// close_notify alert after sending ours when handling the CCC command.
+// Some (legacy) clients never send it: after this delay we switch the
+// control channel to plaintext anyway.
+var cccShutdownTimeout = 5 * time.Second //nolint:gochecknoglobals // overridden by tests
 
 func (c *clientHandler) handleAUTH(_ string) error {
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
@@ -24,6 +33,107 @@ func (c *clientHandler) handleAUTH(_ string) error {
 	}
 
 	return nil
+}
+
+func (c *clientHandler) handleCCC(_ string) error {
+	if !c.server.settings.EnableCCC {
+		c.writeMessage(StatusCommandNotImplemented, "CCC is disabled")
+
+		return nil
+	}
+
+	tlsConn, ok := c.conn.(*tls.Conn)
+	if !ok || !c.HasTLSForControl() {
+		c.writeMessage(StatusBadCommandSequence, "CCC requires a TLS protected control channel")
+
+		return nil
+	}
+
+	c.writeMessage(StatusOK, "CCC command ok, control channel is now clear")
+	c.clearControlChannel(tlsConn)
+
+	return nil
+}
+
+// clearControlChannel performs the TLS shutdown of the control channel and
+// switches it back to plaintext. The TCP connection stays open and the data
+// channel protection (PROT) is not affected.
+func (c *clientHandler) clearControlChannel(tlsConn *tls.Conn) {
+	rawConn := tlsConn.NetConn()
+
+	// Commands pipelined after CCC inside the TLS session were received (and
+	// decrypted) while the channel was still protected: they are valid
+	// commands and must not be lost. On the other hand, bytes that only exist
+	// at the TLS record layer (alerts, the close_notify itself) must never be
+	// interpreted as plaintext commands.
+	var pending bytes.Buffer
+
+	if c.reader != nil && c.reader.Buffered() > 0 {
+		if _, err := io.CopyN(&pending, c.reader, int64(c.reader.Buffered())); err != nil {
+			c.logger.Warn("Could not preserve buffered commands during CCC", "err", err)
+		}
+	}
+
+	// Send our close_notify alert: this shuts down the TLS write side without
+	// closing the underlying TCP connection.
+	if err := tlsConn.CloseWrite(); err != nil {
+		c.logger.Warn("Could not send the TLS close_notify alert", "err", err)
+		_ = c.disconnect()
+		c.reader = nil
+
+		return
+	}
+
+	// Wait for the client's close_notify. Anything decrypted here is still
+	// TLS-protected application data, so we keep it as commands.
+	if err := rawConn.SetReadDeadline(time.Now().Add(cccShutdownTimeout)); err != nil {
+		c.logger.Warn("Could not set the CCC shutdown deadline", "err", err)
+	}
+
+	buf := make([]byte, maxCommandSize)
+
+	for {
+		n, err := tlsConn.Read(buf)
+		if n > 0 {
+			pending.Write(buf[:n])
+		}
+
+		if err != nil {
+			var netErr net.Error
+
+			switch {
+			case errors.Is(err, io.EOF):
+				// The client sent its close_notify: clean TLS shutdown.
+			case errors.As(err, &netErr) && netErr.Timeout():
+				c.logger.Warn("Client did not send its TLS close_notify, switching to plaintext anyway")
+			default:
+				c.logger.Warn("Error while waiting for the TLS close_notify", "err", err)
+			}
+
+			break
+		}
+	}
+
+	// Clear the deadline, the idle timeout logic sets its own on each read.
+	// The write deadline must be cleared too: CloseWrite sets it to "now".
+	if err := rawConn.SetDeadline(time.Time{}); err != nil {
+		c.logger.Warn("Could not clear the CCC shutdown deadline", "err", err)
+	}
+
+	c.conn = rawConn
+
+	var reader io.Reader = rawConn
+	if pending.Len() > 0 {
+		reader = io.MultiReader(&pending, rawConn)
+	}
+
+	c.reader = bufio.NewReaderSize(reader, maxCommandSize)
+	c.writer = bufio.NewWriter(rawConn)
+	c.setTLSForControl(false)
+
+	if c.debug {
+		c.logger.Debug("Control channel switched back to plaintext")
+	}
 }
 
 func (c *clientHandler) handlePROT(param string) error {
@@ -245,6 +355,10 @@ func (c *clientHandler) handleFEAT(_ string) error {
 	// This code made me think about adding this: https://github.com/stianstr/ftpserver/commit/387f2ba
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); tlsConfig != nil && err == nil {
 		features = append(features, "AUTH TLS", "PBSZ", "PROT")
+
+		if c.server.settings.EnableCCC {
+			features = append(features, "CCC")
+		}
 	}
 
 	if c.server.settings.EnableHASH {

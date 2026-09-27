@@ -359,10 +359,15 @@ type Settings struct {
 	DisableMLST                     bool             // Disable MLST support
 	DisableMFMT                     bool             // Disable MFMT support (modify file mtime)
 	TLSRequired                     TLSRequirement   // defines the TLS mode
-	DisableLISTArgs                 bool             // Disable ls like options (-a,-la etc.) for directory listing
-	DisableSite                     bool             // Disable SITE command
-	DisableActiveMode               bool             // Disable Active FTP
-	EnableHASH                      bool             // Enable support for calculating hash value of files
+	// EnableCCC enables support for the CCC (Clear Command Channel) command, which
+	// downgrades the control channel from TLS to plaintext after authentication.
+	// The data channel protection (PROT) is left untouched. It is disabled by
+	// default because it weakens the security of the session.
+	EnableCCC         bool // Enable CCC (clear command channel) support
+	DisableLISTArgs   bool // Disable ls like options (-a,-la etc.) for directory listing
+	DisableSite       bool // Disable SITE command
+	DisableActiveMode bool // Disable Active FTP
+	EnableHASH        bool // Enable support for calculating hash value of files
 	// DisableSTAT disables Server STATUS. STAT on files and directories still works.
 	DisableSTAT             bool
 	DisableSYST             bool         // Disable SYST
