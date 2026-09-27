@@ -47,6 +47,12 @@ func (stmt *mysqlStmt) ColumnConverter(idx int) driver.ValueConverter {
 }
 
 func (stmt *mysqlStmt) CheckNamedValue(nv *driver.NamedValue) (err error) {
+	// An io.Reader is streamed to the server via COM_STMT_SEND_LONG_DATA
+	// when the statement is executed. Pass it through untouched so large
+	// BLOBs never have to be loaded into memory at once.
+	if _, ok := nv.Value.(io.Reader); ok {
+		return nil
+	}
 	nv.Value, err = converter{}.ConvertValue(nv.Value)
 	return
 }

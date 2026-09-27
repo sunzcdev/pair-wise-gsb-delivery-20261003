@@ -11,7 +11,9 @@ package mysql
 import (
 	"bytes"
 	"database/sql/driver"
+	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -222,6 +224,265 @@ func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
 	}
 	if len(conn.data) != 0 {
 		t.Fatal("COM_STMT_RESET response was not consumed")
+	}
+}
+
+// readOnceReader yields data in chunks of at most chunk bytes per Read. It
+// simulates a stream that cannot be replayed: once drained, every further
+// Read reports io.EOF, and eofReads counts how often the drained reader was
+// read again (e.g. by an unsafe retry).
+type readOnceReader struct {
+	data     []byte
+	chunk    int
+	reads    int
+	eofReads int
+}
+
+func (r *readOnceReader) Read(p []byte) (int, error) {
+	r.reads++
+	if len(r.data) == 0 {
+		r.eofReads++
+		return 0, io.EOF
+	}
+	n := min(len(p), len(r.data), r.chunk)
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// failAfterReader yields data and then fails with err.
+type failAfterReader struct {
+	data []byte
+	err  error
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := min(len(p), len(r.data))
+	copy(p, r.data[:n])
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// splitPackets splits written into packet payloads (without the 4-byte
+// packet headers).
+func splitPackets(t *testing.T, written []byte) [][]byte {
+	t.Helper()
+	var packets [][]byte
+	for len(written) > 0 {
+		packetLen := 4 + getUint24(written)
+		if packetLen > len(written) {
+			t.Fatalf("invalid packet length: got %d, remaining bytes %d", packetLen, len(written))
+		}
+		packets = append(packets, written[4:packetLen])
+		written = written[packetLen:]
+	}
+	return packets
+}
+
+func TestWriteExecutePacketStreamsReaderLongData(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 64
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 3}
+
+	blob := bytes.Repeat([]byte{'x'}, 200) // larger than a single chunk
+	reader := &readOnceReader{data: blob, chunk: 100}
+
+	err := stmt.writeExecutePacket([]driver.Value{reader, int64(42), "inline"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := splitPackets(t, conn.written)
+	if len(packets) != 5 {
+		t.Fatalf("unexpected packet count: got %d, want 5 (4 long data + 1 execute)", len(packets))
+	}
+
+	// The reader parameter is streamed in bounded chunks, never buffered
+	// as a whole. Every long-data packet must fit into maxAllowedPacket.
+	var reassembled []byte
+	for i, pkt := range packets[:4] {
+		if pkt[0] != comStmtSendLongData {
+			t.Fatalf("packet %d: unexpected command: got %#x, want %#x", i, pkt[0], comStmtSendLongData)
+		}
+		if len(pkt) > mc.maxAllowedPacket-1 {
+			t.Fatalf("packet %d: payload exceeds maxAllowedPacket: got %d bytes", i, len(pkt))
+		}
+		if paramID := binary.LittleEndian.Uint16(pkt[5:7]); paramID != 0 {
+			t.Fatalf("packet %d: unexpected param ID: got %d, want 0", i, paramID)
+		}
+		reassembled = append(reassembled, pkt[7:]...)
+	}
+	if !bytes.Equal(reassembled, blob) {
+		t.Fatalf("streamed data mismatch: got %d bytes, want %d bytes", len(reassembled), len(blob))
+	}
+
+	// The reader must be consumed exactly once and not be re-read.
+	if reader.eofReads != 1 {
+		t.Fatalf("reader was read after EOF: got %d times, want 1", reader.eofReads)
+	}
+
+	// The execute packet carries the parameter types but no long data.
+	exec := packets[4]
+	if exec[0] != comStmtExecute {
+		t.Fatalf("unexpected command: got %#x, want %#x", exec[0], comStmtExecute)
+	}
+	// Header (10) + NULL-bitmap (1) + new-params-bound flag (1) = 12.
+	if got := exec[12]; got != byte(fieldTypeBLOB) {
+		t.Fatalf("unexpected type for reader parameter: got %#x, want %#x", got, byte(fieldTypeBLOB))
+	}
+	if got := exec[14]; got != byte(fieldTypeLongLong) {
+		t.Fatalf("unexpected type for int64 parameter: got %#x, want %#x", got, byte(fieldTypeLongLong))
+	}
+	if got := exec[16]; got != byte(fieldTypeString) {
+		t.Fatalf("unexpected type for string parameter: got %#x, want %#x", got, byte(fieldTypeString))
+	}
+	// Values: int64(42) followed by the length-encoded string "inline".
+	if got := binary.LittleEndian.Uint64(exec[18:26]); got != 42 {
+		t.Fatalf("unexpected int64 parameter value: got %d, want 42", got)
+	}
+	if got := string(exec[27:]); got != "inline" {
+		t.Fatalf("unexpected string parameter value: got %q, want %q", got, "inline")
+	}
+}
+
+func TestWriteExecutePacketReaderChunkBound(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	// Keep the default 64 MiB maxAllowedPacket: the chunk size must stay
+	// bounded by longDataChunkSize regardless.
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+
+	size := 2*longDataChunkSize + 12345
+	reader := &readOnceReader{data: make([]byte, size), chunk: size}
+
+	err := stmt.writeExecutePacket([]driver.Value{reader})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := splitPackets(t, conn.written)
+	if len(packets) != 4 {
+		t.Fatalf("unexpected packet count: got %d, want 4 (3 long data + 1 execute)", len(packets))
+	}
+	total := 0
+	for i, pkt := range packets[:3] {
+		if pkt[0] != comStmtSendLongData {
+			t.Fatalf("packet %d: unexpected command: got %#x, want %#x", i, pkt[0], comStmtSendLongData)
+		}
+		// 7 bytes of command + statement ID + param ID precede the data.
+		if len(pkt) > 7+longDataChunkSize {
+			t.Fatalf("packet %d: chunk exceeds longDataChunkSize: got %d bytes", i, len(pkt)-7)
+		}
+		total += len(pkt) - 7
+	}
+	if total != size {
+		t.Fatalf("streamed data mismatch: got %d bytes, want %d bytes", total, size)
+	}
+}
+
+func TestWriteExecutePacketEmptyReader(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+
+	err := stmt.writeExecutePacket([]driver.Value{bytes.NewReader(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packets := splitPackets(t, conn.written)
+	if len(packets) != 1 {
+		t.Fatalf("unexpected packet count: got %d, want 1 (execute only)", len(packets))
+	}
+	if packets[0][0] != comStmtExecute {
+		t.Fatalf("unexpected command: got %#x, want %#x", packets[0][0], comStmtExecute)
+	}
+}
+
+func TestWriteExecutePacketReaderErrorResetsStmt(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 64
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+	conn.queuedReplies = [][]byte{{
+		0x07, 0x00, 0x00, 0x01, // Packet header: 7-byte payload, sequence 1.
+		iOK,        // OK packet header.
+		0x00,       // Zero affected rows.
+		0x00,       // Zero last insert ID.
+		0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT.
+		0x00, 0x00, // Zero warnings.
+	}}
+
+	readErr := errors.New("read failed")
+	reader := &failAfterReader{data: bytes.Repeat([]byte{'a'}, 100), err: readErr}
+
+	err := stmt.writeExecutePacket([]driver.Value{reader})
+	if err != readErr {
+		t.Fatalf("unexpected error: got %v, want %v", err, readErr)
+	}
+
+	// The server may have stored partial long data for the statement, so
+	// it must be reset before the statement can be reused. The execute
+	// packet must not be sent.
+	var commands []byte
+	for _, pkt := range splitPackets(t, conn.written) {
+		commands = append(commands, pkt[0])
+	}
+	if want := []byte{comStmtSendLongData, comStmtSendLongData, comStmtReset}; !bytes.Equal(commands, want) {
+		t.Fatalf("unexpected command order: got %v, want %v", commands, want)
+	}
+	if len(conn.data) != 0 {
+		t.Fatal("COM_STMT_RESET response was not consumed")
+	}
+
+	// The next normal execution on the reset statement must work.
+	if err := stmt.writeExecutePacket([]driver.Value{int64(1)}); err != nil {
+		t.Fatal(err)
+	}
+	packets := splitPackets(t, conn.written)
+	if got := packets[len(packets)-1][0]; got != comStmtExecute {
+		t.Fatalf("unexpected command after reset: got %#x, want %#x", got, comStmtExecute)
+	}
+}
+
+func TestWriteExecutePacketReaderErrorNotRetryable(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 1}
+	conn.writeErrors = map[int]error{1: errors.New("long data write failed")}
+	conn.queuedReplies = [][]byte{{
+		0x07, 0x00, 0x00, 0x01, // Packet header: 7-byte payload, sequence 1.
+		iOK,        // OK packet header.
+		0x00,       // Zero affected rows.
+		0x00,       // Zero last insert ID.
+		0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT.
+		0x00, 0x00, // Zero warnings.
+	}}
+
+	reader := &readOnceReader{data: bytes.Repeat([]byte{'a'}, 64), chunk: 64}
+
+	err := stmt.writeExecutePacket([]driver.Value{reader})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	// The reader has been consumed, so the statement cannot be re-executed
+	// with the same arguments. The error must not be turned into
+	// driver.ErrBadConn, which would make database/sql retry automatically
+	// and stream the drained reader.
+	if err == errBadConnNoWrite {
+		t.Fatal("error must not be errBadConnNoWrite for statements with io.Reader parameters")
+	}
+	if marked := mc.markBadConn(err); marked == driver.ErrBadConn {
+		t.Fatal("error must not trigger an automatic retry by database/sql")
+	}
+	if reader.reads != 1 {
+		t.Fatalf("reader was read more than once: got %d reads, want 1", reader.reads)
+	}
+
+	// The failed write must still have triggered a statement reset.
+	packets := splitPackets(t, conn.written)
+	if got := packets[len(packets)-1][0]; got != comStmtReset {
+		t.Fatalf("unexpected last command: got %#x, want %#x", got, comStmtReset)
 	}
 }
 

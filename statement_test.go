@@ -149,3 +149,27 @@ func TestConvertJSON(t *testing.T) {
 		t.Fatalf("json.RawMessage converted, got %#v %T", out, out)
 	}
 }
+
+func TestCheckNamedValueReader(t *testing.T) {
+	stmt := &mysqlStmt{}
+
+	// An io.Reader is passed through untouched so it can be streamed via
+	// COM_STMT_SEND_LONG_DATA at execution time.
+	reader := bytes.NewReader([]byte("blob"))
+	nv := &driver.NamedValue{Value: reader}
+	if err := stmt.CheckNamedValue(nv); err != nil {
+		t.Fatal("io.Reader not accepted", err)
+	}
+	if nv.Value != reader {
+		t.Fatalf("io.Reader not passed through, got %#v %T", nv.Value, nv.Value)
+	}
+
+	// A []byte keeps its existing behavior.
+	nv = &driver.NamedValue{Value: []byte("blob")}
+	if err := stmt.CheckNamedValue(nv); err != nil {
+		t.Fatal("[]byte not accepted", err)
+	}
+	if out, ok := nv.Value.([]byte); !ok || !bytes.Equal(out, []byte("blob")) {
+		t.Fatalf("[]byte not preserved, got %#v %T", nv.Value, nv.Value)
+	}
+}

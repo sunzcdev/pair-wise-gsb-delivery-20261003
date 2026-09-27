@@ -1040,6 +1040,54 @@ func (stmt *mysqlStmt) writeCommandLongData(paramID int, arg []byte) error {
 	return nil
 }
 
+// longDataChunkSize bounds the memory used to stream a single io.Reader
+// parameter via COM_STMT_SEND_LONG_DATA, independent of maxAllowedPacket.
+const longDataChunkSize = 1 << 20
+
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_send_long_data.html
+func (stmt *mysqlStmt) writeCommandLongDataFromReader(paramID int, r io.Reader) error {
+	// After the header (bytes 0-3) follows before the data:
+	// 1 byte command
+	// 4 bytes stmtID
+	// 2 bytes paramID
+	const dataOffset = 1 + 4 + 2
+
+	// The reader is streamed in chunks so that large BLOBs are never
+	// loaded into memory at once.
+	chunkSize := min(stmt.mc.maxAllowedPacket-1-dataOffset, longDataChunkSize)
+	if chunkSize < 1 {
+		return ErrPktTooLarge
+	}
+
+	data := make([]byte, 4+dataOffset+chunkSize)
+
+	// Add command byte [1 byte]
+	data[4] = comStmtSendLongData
+
+	// Add stmtID [32 bit]
+	binary.LittleEndian.PutUint32(data[5:], stmt.id)
+
+	// Add paramID [16 bit]
+	binary.LittleEndian.PutUint16(data[9:], uint16(paramID))
+
+	for {
+		n, err := r.Read(data[4+dataOffset:])
+		if n > 0 {
+			if werr := stmt.mc.writePacket(data[:4+dataOffset+n]); werr != nil {
+				return werr
+			}
+			// Every COM_LONG_DATA packet reset Packet Sequence
+			stmt.mc.resetSequence()
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
 func (stmt *mysqlStmt) reset() error {
 	handleOk := stmt.mc.clearResult()
 	if err := stmt.mc.writeCommandPacketUint32(comStmtReset, stmt.id); err != nil {
@@ -1052,6 +1100,7 @@ type stmtLongData struct {
 	paramID int
 	data    []byte
 	text    string
+	reader  io.Reader
 }
 
 // Execute Prepared Statement
@@ -1074,6 +1123,7 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	var data []byte
 	var err error
 	var longData []stmtLongData
+	var hasReader bool
 
 	if len(args) == 0 {
 		data, err = mc.buf.takeBuffer(minPktLen)
@@ -1206,6 +1256,14 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 					longData = append(longData, stmtLongData{paramID: i, text: v})
 				}
 
+			case io.Reader:
+				// Streamed via COM_STMT_SEND_LONG_DATA, regardless of size,
+				// so the parameter is never buffered in memory as a whole.
+				paramTypes[i+i] = byte(fieldTypeBLOB)
+				paramTypes[i+i+1] = 0x00
+				longData = append(longData, stmtLongData{paramID: i, reader: v})
+				hasReader = true
+
 			case time.Time:
 				paramTypes[i+i] = byte(fieldTypeString)
 				paramTypes[i+i+1] = 0x00
@@ -1253,21 +1311,40 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// associated with the statement on the server.
 	mc.resetSequence()
 	for _, param := range longData {
-		if param.data != nil {
+		switch {
+		case param.reader != nil:
+			err = stmt.writeCommandLongDataFromReader(param.paramID, param.reader)
+		case param.data != nil:
 			err = stmt.writeCommandLongData(param.paramID, param.data)
-		} else {
+		default:
 			err = stmt.writeCommandLongData(param.paramID, []byte(param.text))
 		}
 		if err != nil {
+			// The server may already have stored partial long data for this
+			// statement. Reset it so the statement is not reused with stale
+			// parameter data.
 			if resetErr := stmt.reset(); resetErr != nil {
 				mc.close()
 			}
-			return err
+			return noRetryError(err, hasReader)
 		}
 	}
 
 	err = mc.writePacket(data)
 	mc.syncSequence()
+	return noRetryError(err, hasReader)
+}
+
+// noRetryError guards against unsafe automatic retries by database/sql.
+// errBadConnNoWrite is turned into driver.ErrBadConn by markBadConn, which
+// makes database/sql re-execute the statement. That is not safe once an
+// io.Reader parameter has been (partially) consumed: a retry would stream
+// the drained reader and silently store truncated data. Replace the error
+// with one that does not trigger a retry.
+func noRetryError(err error, hasReader bool) error {
+	if err == errBadConnNoWrite && hasReader {
+		return fmt.Errorf("mysql: cannot safely retry a statement with io.Reader parameters: %w", err)
+	}
 	return err
 }
 
