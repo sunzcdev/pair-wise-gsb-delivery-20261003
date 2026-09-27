@@ -37,6 +37,7 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true
+- Request filters can `preview` the beginning of a request body and `replay` it downstream without consuming it, using `NewRequestBodyPreview`: staging is bounded in memory, spills to a temp file past the budget, and never forces the whole upload to be read before forwarding
 
 ## Proxy modes
 1. Regular HTTP proxy
