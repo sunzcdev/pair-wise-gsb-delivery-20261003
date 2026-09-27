@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -699,9 +700,14 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", EnvUnixSocketGroup, c.unixSocketCfg.Group))
 	}
 
-	var runner runner.Runner
-	switch {
-	case c.config.RunnerFunc != nil:
+	// Set up a dedicated handshake channel so the plugin can perform the
+	// protocol handshake without writing to stdout, which plugin
+	// dependencies may use for their own output during initialization.
+	// The host generates a random per-launch token that the plugin must
+	// present before its protocol line is accepted. The legacy stdout
+	// handshake remains as an explicit compatibility path for plugins
+	// that don't support the channel.
+	if runtime.GOOS != "windows" && c.unixSocketCfg.socketDir == "" {
 		c.unixSocketCfg.socketDir, err = os.MkdirTemp(c.unixSocketCfg.TempDir, "plugin-dir")
 		if err != nil {
 			return nil, err
@@ -712,6 +718,38 @@ func (c *Client) Start() (addr net.Addr, err error) {
 			err = setGroupWritable(c.unixSocketCfg.socketDir, c.unixSocketCfg.Group, 0o770)
 			if err != nil {
 				return nil, err
+			}
+		}
+	}
+
+	handshake, err := newHandshakeServer(c.unixSocketCfg.socketDir, c.logger)
+	if err != nil {
+		return nil, err
+	}
+	// Close the channel on any return path so failed or cancelled starts
+	// don't leak the listener or its socket file.
+	defer func() { _ = handshake.close() }()
+
+	cmd.Env = append(cmd.Env,
+		fmt.Sprintf("%s=%s", envHandshakeAddr, handshake.addr()),
+		fmt.Sprintf("%s=%s", envHandshakeToken, handshake.token),
+	)
+
+	var runner runner.Runner
+	switch {
+	case c.config.RunnerFunc != nil:
+		if c.unixSocketCfg.socketDir == "" {
+			c.unixSocketCfg.socketDir, err = os.MkdirTemp(c.unixSocketCfg.TempDir, "plugin-dir")
+			if err != nil {
+				return nil, err
+			}
+			// os.MkdirTemp creates folders with 0o700, so if we have a group
+			// configured we need to make it group-writable.
+			if c.unixSocketCfg.Group != "" {
+				err = setGroupWritable(c.unixSocketCfg.socketDir, c.unixSocketCfg.Group, 0o770)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", EnvUnixSocketDir, c.unixSocketCfg.socketDir))
@@ -824,21 +862,54 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	// Some channels for the next step
 	timeout := time.After(c.config.StartTimeout)
 
+	// Accept connections on the dedicated handshake channel. The first
+	// correctly authenticated protocol line wins.
+	handshakeCh := make(chan string, 1)
+	go handshake.accept(handshakeCh, c.config.StartTimeout)
+
 	// Start looking for the address
 	c.logger.Debug("waiting for RPC address", "plugin", runner.Name())
-	select {
-	case <-timeout:
-		err = errors.New("timeout while waiting for plugin to start")
-	case <-c.doneCtx.Done():
-		err = errors.New("plugin exited before we could connect")
-	case line, ok := <-linesCh:
+
+	var line string
+	stdoutOK := true
+waitLoop:
+	for {
+		select {
+		case <-timeout:
+			err = errors.New("timeout while waiting for plugin to start")
+			break waitLoop
+		case <-c.doneCtx.Done():
+			err = errors.New("plugin exited before we could connect")
+			break waitLoop
+		case line = <-handshakeCh:
+			c.logger.Debug("received handshake over dedicated channel", "plugin", runner.Name())
+			break waitLoop
+		case l, ok := <-linesCh:
+			if !ok {
+				line, stdoutOK = l, ok
+				break waitLoop
+			}
+			// A line on stdout only counts as a legacy handshake attempt
+			// if it has the shape of a protocol negotiation line. Anything
+			// else is output from the plugin or its dependencies that
+			// happens to interleave with the handshake, so we ignore it
+			// and keep waiting for the dedicated channel.
+			if len(strings.Split(strings.TrimSpace(l), "|")) >= 4 {
+				line = l
+				break waitLoop
+			}
+			c.logger.Debug("ignoring non-handshake line from plugin stdout", "line", l)
+		}
+	}
+
+	if err == nil {
 		// Trim the line and split by "|" in order to get the parts of
 		// the output.
 		line = strings.TrimSpace(line)
 		parts := strings.Split(line, "|")
 		if len(parts) < 4 {
 			errText := fmt.Sprintf("Unrecognized remote plugin message: %s", line)
-			if !ok {
+			if !stdoutOK {
 				errText += "\n" + "Failed to read any lines from plugin's stdout"
 			}
 			additionalNotes := runner.Diagnose(context.Background())

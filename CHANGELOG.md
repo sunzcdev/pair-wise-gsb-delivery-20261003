@@ -1,5 +1,18 @@
 ## Unreleased
 
+FEATURES:
+
+* client/server: The protocol handshake can now be performed over a dedicated
+  channel instead of stdout. The host creates a per-launch listener (Unix
+  socket on Unix, ephemeral loopback TCP port on Windows) with a random
+  authentication token, passed to the plugin via the `PLUGIN_HANDSHAKE_ADDR`
+  and `PLUGIN_HANDSHAKE_TOKEN` environment variables. The plugin authenticates
+  with the token and then exchanges its protocol, address, and certificate
+  information over the channel, so output written to stdout during plugin
+  initialization can no longer corrupt the handshake. The legacy stdout
+  handshake remains as an explicit compatibility path for older clients and
+  plugins.
+
 SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 

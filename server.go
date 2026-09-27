@@ -442,8 +442,22 @@ func Serve(opts *ServeConfig) {
 		if os.Getenv(envMultiplexGRPC) != "" {
 			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
 		}
-		fmt.Printf("%s\n", protocolLine)
-		_ = os.Stdout.Sync()
+
+		// If the client set up a dedicated handshake channel, authenticate
+		// with the per-launch token and send the protocol line there, so
+		// that the handshake doesn't depend on stdout. Otherwise, fall back
+		// to the legacy stdout handshake for older clients.
+		if handshakeAddr := os.Getenv(envHandshakeAddr); handshakeAddr != "" {
+			err := sendHandshake(handshakeAddr, os.Getenv(envHandshakeToken), protocolLine)
+			if err != nil {
+				logger.Error("plugin handshake error", "error", err)
+				exitCode = 1
+				return
+			}
+		} else {
+			fmt.Printf("%s\n", protocolLine)
+			_ = os.Stdout.Sync()
+		}
 	} else if ch := opts.Test.ReattachConfigCh; ch != nil {
 		// Send back the reattach config that can be used. This isn't
 		// quite ready if they connect immediately but the client should

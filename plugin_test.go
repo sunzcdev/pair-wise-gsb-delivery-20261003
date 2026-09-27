@@ -570,6 +570,33 @@ func TestHelperProcess(*testing.T) {
 
 		// Shouldn't reach here but make sure we exit anyways
 		os.Exit(0)
+	case "test-grpc-junk-stdout":
+		// Simulate a plugin dependency that writes to stdout during
+		// initialization, before the handshake completes. This would
+		// corrupt the legacy stdout handshake, so starting this plugin
+		// successfully requires the dedicated handshake channel.
+		fmt.Println("junk output from a plugin dependency during init")
+		Serve(&ServeConfig{
+			HandshakeConfig: testHandshake,
+			Plugins:         testGRPCPluginMap,
+			GRPCServer:      DefaultGRPCServer,
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
+	case "test-grpc-legacy-handshake":
+		// Force the legacy stdout handshake path by ignoring the dedicated
+		// handshake channel configuration, simulating an old plugin.
+		os.Unsetenv(envHandshakeAddr)
+		os.Unsetenv(envHandshakeToken)
+		Serve(&ServeConfig{
+			HandshakeConfig: testHandshake,
+			Plugins:         testGRPCPluginMap,
+			GRPCServer:      DefaultGRPCServer,
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
 	case "test-grpc-tls":
 		// Serve!
 		Serve(&ServeConfig{

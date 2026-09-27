@@ -8,14 +8,16 @@ process that itself uses plugins. The "server" is the plugin process.
 
 For a server:
 
-  1. Output handshake to stdout
+  1. Output handshake to the dedicated handshake channel, or to stdout
+     for older hosts
   2. Wait for connection on control address
   3. Serve plugins over control address
 
 For a client:
 
   1. Launch a plugin binary
-  2. Read and verify handshake from plugin stdout
+  2. Read and verify the handshake from the dedicated handshake channel,
+     or from the plugin's stdout for older plugins
   3. Connect to plugin control address using desired protocol
   4. Dispense plugins using control connection
 
@@ -23,7 +25,24 @@ For a client:
 
 The handshake is the initial communication between a plugin and a host
 process to determine how the host process can connect and communicate to
-the plugin. This handshake is done over the plugin process's stdout.
+the plugin.
+
+Newer clients and plugins perform the handshake over a dedicated channel
+so that output written to the plugin process's stdout (for example by
+plugin dependencies during initialization) cannot corrupt the handshake.
+The host creates a listener (a Unix socket on Unix systems, an ephemeral
+TCP port on 127.0.0.1 on Windows), generates a random per-launch token,
+and passes both to the plugin via the `PLUGIN_HANDSHAKE_ADDR` and
+`PLUGIN_HANDSHAKE_TOKEN` environment variables. The plugin connects to
+the address, sends the token followed by a newline to authenticate, and
+then sends the handshake line described below followed by a newline.
+Connections that present an incorrect token are rejected, and only the
+first authenticated handshake is used.
+
+If `PLUGIN_HANDSHAKE_ADDR` is not set, the plugin falls back to the
+legacy handshake, which is done over the plugin process's stdout. Clients
+also continue to accept the handshake line from stdout so that older
+plugins keep working.
 
 The `go-plugin` library itself handles the handshake when using the
 `Server` to serve a plugin. **You do not need to understand the internals
