@@ -127,6 +127,8 @@ type fields struct {
 	List    []*field
 	AsArray bool
 
+	unknownFields *field
+
 	hasOmitEmpty bool
 }
 
@@ -184,6 +186,26 @@ func getFields(typ reflect.Type, fallbackTag string) *fields {
 
 		tag := tagparser.Parse(tagStr)
 		if tag.Name == "-" {
+			continue
+		}
+
+		if tag.HasOption("unknownfields") {
+			if f.PkgPath != "" {
+				err := fmt.Errorf("msgpack: unknownfields field %s.%s must be exported", typ, f.Name)
+				panic(err)
+			}
+			if fs.unknownFields != nil {
+				err := fmt.Errorf("msgpack: %s has multiple unknownfields fields", typ)
+				panic(err)
+			}
+			if !isUnknownFieldsType(f.Type) {
+				err := fmt.Errorf("msgpack: unknownfields field %s.%s must be a map with string keys and RawMessage values, got %s", typ, f.Name, f.Type)
+				panic(err)
+			}
+			fs.unknownFields = &field{
+				name:  f.Name,
+				index: f.Index,
+			}
 			continue
 		}
 

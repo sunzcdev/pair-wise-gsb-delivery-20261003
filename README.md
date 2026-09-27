@@ -27,6 +27,11 @@
 - Renaming fields via `msgpack:"my_field_name"` and alias via `msgpack:"alias:another_name"`.
 - Omitting individual empty fields via `msgpack:",omitempty"` tag or all
   [empty fields in a struct](https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#example-Marshal-OmitEmpty).
+- Preserving unknown struct fields via `msgpack:",unknownfields"` so a service can decode a
+  message from a newer version, modify known fields, and re-encode it without losing the rest.
+  Unknown values are kept as raw MessagePack bytes (nested containers and extension types
+  included) and are re-encoded together with the known fields. See [UnknownFields] for the
+  collision and duplicate key semantics.
 - [Map keys sorting](https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#Encoder.SetSortMapKeys).
 - Encoding/decoding all
   [structs as arrays](https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#Encoder.UseArrayEncodedStructs)
@@ -39,6 +44,7 @@
 
 [customencoder]: https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#CustomEncoder
 [customdecoder]: https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#CustomDecoder
+[unknownfields]: https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#UnknownFields
 [encoder.setcustomstructtag]:
   https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#Encoder.SetCustomStructTag
 [decoder.setcustomstructtag]:

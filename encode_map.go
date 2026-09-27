@@ -196,7 +196,16 @@ func encodeStructValue(e *Encoder, strct reflect.Value) error {
 	}
 	fields := structFields.OmitEmpty(e, strct)
 
-	if err := e.EncodeMapLen(len(fields)); err != nil {
+	var unknown UnknownFields
+	var unknownKeys []string
+	if structFields.unknownFields != nil {
+		if v, ok := fieldByIndex(strct, structFields.unknownFields.index); ok && !v.IsNil() {
+			unknown = v.Convert(unknownFieldsType).Interface().(UnknownFields)
+			unknownKeys = filterUnknownKeys(unknown, structFields)
+		}
+	}
+
+	if err := e.EncodeMapLen(len(fields) + len(unknownKeys)); err != nil {
 		return err
 	}
 
@@ -209,7 +218,32 @@ func encodeStructValue(e *Encoder, strct reflect.Value) error {
 		}
 	}
 
+	for _, k := range unknownKeys {
+		if err := e.EncodeString(k); err != nil {
+			return err
+		}
+		if err := e.write(unknown[k]); err != nil {
+			return err
+		}
+	}
+
 	return nil
+}
+
+// filterUnknownKeys returns the sorted keys of the unknown fields container
+// that do not collide with a known field name. Colliding entries are
+// dropped so that the encoded map never contains duplicate keys and the
+// known field always wins. Keys are sorted for deterministic output.
+func filterUnknownKeys(unknown UnknownFields, structFields *fields) []string {
+	keys := make([]string, 0, len(unknown))
+	for k := range unknown {
+		if _, ok := structFields.Map[k]; ok {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func encodeStructValueAsArray(e *Encoder, strct reflect.Value, fields []*field) error {

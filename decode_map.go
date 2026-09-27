@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/vmihailenco/msgpack/v5/msgpcode"
 )
@@ -344,6 +345,13 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 			continue
 		}
 
+		if fields.unknownFields != nil {
+			if err := d.decodeUnknownField(v, fields.unknownFields, name); err != nil {
+				return err
+			}
+			continue
+		}
+
 		if d.flags&disallowUnknownFieldsFlag != 0 {
 			return fmt.Errorf("msgpack: unknown field %q", name)
 		}
@@ -352,5 +360,25 @@ func (d *Decoder) decodeStruct(v reflect.Value, n int) error {
 		}
 	}
 
+	return nil
+}
+
+// decodeUnknownField decodes the next value as raw MessagePack bytes and
+// stores it in the struct's unknown fields container under the given name.
+func (d *Decoder) decodeUnknownField(strct reflect.Value, f *field, name string) error {
+	// The name aliases the decoder's scratch buffer (see decodeStringTemp),
+	// which is reused while reading the value, so it must be cloned.
+	name = strings.Clone(name)
+
+	raw, err := d.DecodeRaw()
+	if err != nil {
+		return err
+	}
+
+	v := fieldByIndexAlloc(strct, f.index)
+	if v.IsNil() {
+		v.Set(reflect.MakeMap(v.Type()))
+	}
+	v.SetMapIndex(reflect.ValueOf(name), reflect.ValueOf(raw))
 	return nil
 }
