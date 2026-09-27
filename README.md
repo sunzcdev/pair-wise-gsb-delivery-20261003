@@ -21,6 +21,7 @@ If you need version 4, use `go get -u gopkg.in/evanphx/json-patch.v4`
 # Use It!
 * [Create and apply a merge patch](#create-and-apply-a-merge-patch)
 * [Create and apply a JSON Patch](#create-and-apply-a-json-patch)
+* [Generate a JSON Patch from two documents](#generate-a-json-patch-from-two-documents)
 * [Comparing JSON documents](#comparing-json-documents)
 * [Combine merge patches](#combine-merge-patches)
 
@@ -193,6 +194,60 @@ $ go run main.go
 "original" is structurally equal to "similar"
 "original" is _not_ structurally equal to "different"
 ```
+
+## Generate a JSON Patch from two documents
+`jsonpatch.CreatePatch(original, modified, opts...)` (v5) calculates an
+[RFC 6902 JSON Patch](http://tools.ietf.org/html/rfc6902) that transforms one
+document into the other. Objects are diffed key by key and arrays index by
+index.
+
+Arrays whose elements carry a stable identity (such as a `name` or `id`
+field) can be registered with `jsonpatch.WithArrayIdentity(path, key)`. Their
+elements are then matched by identity instead of by index, so reorderings are
+expressed as `move` operations and elements that appear or disappear produce
+precise `add`/`remove` operations, instead of the whole array being
+replaced. Elements that both moved and changed get a `move` plus targeted
+`replace` operations.
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+
+	jsonpatch "github.com/evanphx/json-patch/v5"
+)
+
+func main() {
+	original := []byte(`{"services": [
+		{"name": "web", "replicas": 3},
+		{"name": "api", "replicas": 2}
+	]}`)
+	modified := []byte(`{"services": [
+		{"name": "api", "replicas": 5},
+		{"name": "web", "replicas": 3}
+	]}`)
+
+	patch, err := jsonpatch.CreatePatch(original, modified,
+		jsonpatch.WithArrayIdentity("/services", "name"))
+	if err != nil {
+		panic(err)
+	}
+	out, _ := json.Marshal(patch)
+	fmt.Println(string(out))
+	// [{"from":"/services/1","op":"move","path":"/services/0"},
+	//  {"op":"replace","path":"/services/0/replicas","value":5}]
+}
+```
+
+If an element of an identity-keyed array is missing its identity key, holds a
+duplicate identity, or the identity is not a string or number, `CreatePatch`
+fails with an error wrapping `ErrMissingIdentity`, `ErrDuplicateIdentity` or
+`ErrInvalidIdentity`. Passing
+`jsonpatch.WithIdentityMismatchMode(jsonpatch.IdentityMismatchPositional)`
+instead falls back to a deterministic index-by-index diff for the offending
+array only. Elements are never paired up arbitrarily.
 
 ## Combine merge patches
 Given two JSON merge patch documents, it is possible to combine them into a 
