@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tidwall/assert"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/lotsa"
 )
 
@@ -2957,4 +2958,269 @@ func TestIssue112(t *testing.T) {
 		})
 		return err
 	})
+	db.Close()
+}
+
+func TestUniqueIndex(t *testing.T) {
+	db := testOpen(t)
+	defer testClose(db)
+
+	// ciLess is a case-insensitive comparator. Values that differ only
+	// by case are considered equal, even though their raw bytes differ.
+	ciLess := func(a, b string) bool {
+		return strings.ToLower(a) < strings.ToLower(b)
+	}
+
+	// seed the database and create a regular non-unique index that is
+	// used to verify that failed operations leave other indexes intact.
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("user:1", "Alice", nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("user:2", "Bob", nil); err != nil {
+			return err
+		}
+		return tx.CreateIndex("allnames", "user:*", IndexString)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Creating a unique index over existing data that contains values
+	// the comparator considers equal must fail. The conflicting values
+	// "Alice" and "ALICE" differ only by case.
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("user:3", "ALICE", nil); err != nil {
+			return err
+		}
+		return tx.CreateIndexOptions("names", "user:*",
+			&IndexOptions{Unique: true}, ciLess)
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+	// The failed create must not leave a half-built index behind, and
+	// the rolled-back transaction must have removed user:3.
+	if err := db.View(func(tx *Tx) error {
+		names, err := tx.Indexes()
+		if err != nil {
+			return err
+		}
+		if len(names) != 1 || names[0] != "allnames" {
+			t.Fatalf("expected only 'allnames', got '%v'", names)
+		}
+		if _, err := tx.Get("user:3"); err != ErrNotFound {
+			t.Fatalf("expected '%v', got '%v'", ErrNotFound, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// create the unique index over non-conflicting data
+	if err := db.Update(func(tx *Tx) error {
+		return tx.CreateIndexOptions("names", "user:*",
+			&IndexOptions{Unique: true}, ciLess)
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// a byte-identical duplicate value is rejected
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:3", "Alice", nil)
+		return err
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+
+	// a value that is only equal under the case-insensitive comparator
+	// is also rejected, even though the raw bytes differ.
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:3", "aLiCe", nil)
+		return err
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+
+	// the failed sets must not have modified the primary data
+	if err := db.View(func(tx *Tx) error {
+		if _, err := tx.Get("user:3"); err != ErrNotFound {
+			t.Fatalf("expected '%v', got '%v'", ErrNotFound, err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// keys that do not match the index pattern are not constrained
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("other:1", "alice", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// a distinct value is accepted
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:3", "Carol", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// replacing a key with a value equal to its own current value is
+	// allowed, because a key never conflicts with itself.
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:1", "ALICE", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// deleting an item frees its value for reuse by another key within
+	// the same transaction.
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.Delete("user:1"); err != nil {
+			return err
+		}
+		_, _, err := tx.Set("user:9", "alice", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Modifying a key so that it conflicts with another key fails, and
+	// the primary data, all indexes, and the rollback behavior stay
+	// consistent.
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("user:2", "CAROL", nil); err != nil {
+			return err
+		}
+		// unreachable, but would be rolled back along with the tx
+		_, _, err := tx.Set("user:4", "Dave", nil)
+		return err
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		val, err := tx.Get("user:2")
+		if err != nil {
+			return err
+		}
+		if val != "Bob" {
+			t.Fatalf("expected 'Bob', got '%v'", val)
+		}
+		if _, err := tx.Get("user:4"); err != ErrNotFound {
+			t.Fatalf("expected '%v', got '%v'", ErrNotFound, err)
+		}
+		// both the unique index and the non-unique index must contain
+		// exactly the expected entries.
+		expect := []string{"user:9:alice", "user:2:Bob", "user:3:Carol"}
+		for _, index := range []string{"names", "allnames"} {
+			var vals []string
+			if err := tx.Ascend(index, func(key, value string) bool {
+				vals = append(vals, key+":"+value)
+				return true
+			}); err != nil {
+				return err
+			}
+			if strings.Join(vals, ",") != strings.Join(expect, ",") {
+				t.Fatalf("index '%v': expected '%v', got '%v'",
+					index, expect, vals)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// a rolled-back transaction restores deleted items and removes
+	// newly inserted ones, in the primary data and in all indexes.
+	var errAbort = errors.New("force a rollback")
+	if err := db.Update(func(tx *Tx) error {
+		if _, err := tx.Delete("user:9"); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("user:10", "Eve", nil); err != nil {
+			return err
+		}
+		return errAbort
+	}); err != errAbort {
+		t.Fatalf("expected '%v', got '%v'", errAbort, err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		val, err := tx.Get("user:9")
+		if err != nil {
+			return err
+		}
+		if val != "alice" {
+			t.Fatalf("expected 'alice', got '%v'", val)
+		}
+		if _, err := tx.Get("user:10"); err != ErrNotFound {
+			t.Fatalf("expected '%v', got '%v'", ErrNotFound, err)
+		}
+		// the restored value must be indexed and still enforced
+		var vals []string
+		if err := tx.Ascend("names", func(key, value string) bool {
+			vals = append(vals, key+":"+value)
+			return true
+		}); err != nil {
+			return err
+		}
+		expect := []string{"user:9:alice", "user:2:Bob", "user:3:Carol"}
+		if strings.Join(vals, ",") != strings.Join(expect, ",") {
+			t.Fatalf("expected '%v', got '%v'", expect, vals)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:11", "ALICE", nil)
+		return err
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+
+	// A JSON comparator considers two values equal based on the
+	// document content rather than the raw bytes.
+	jsonLess := func(a, b string) bool {
+		return strings.ToLower(gjson.Get(a, "name").String()) <
+			strings.ToLower(gjson.Get(b, "name").String())
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("doc:1", `{"name":"Alice","age":30}`, nil); err != nil {
+			return err
+		}
+		return tx.CreateIndexOptions("docnames", "doc:*",
+			&IndexOptions{Unique: true}, jsonLess)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// different field order, different case, and different age, but
+	// the comparator still considers the values equal.
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("doc:2", `{"age":31,"name":"ALICE"}`, nil)
+		return err
+	}); err != ErrIndexConflict {
+		t.Fatalf("expected '%v', got '%v'", ErrIndexConflict, err)
+	}
+	// a genuinely different document is accepted
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("doc:2", `{"name":"Bob","age":31}`, nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// dropping the unique index removes the constraint
+	if err := db.Update(func(tx *Tx) error {
+		return tx.DropIndex("names")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("user:5", "carol", nil)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

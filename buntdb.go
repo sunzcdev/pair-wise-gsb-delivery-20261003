@@ -45,6 +45,12 @@ var (
 	// ErrIndexExists is returned when an index already exists in the database.
 	ErrIndexExists = errors.New("index exists")
 
+	// ErrIndexConflict is returned when an operation would violate the
+	// uniqueness constraint of a unique index. Two values are considered
+	// equal when the index less function reports that neither is less
+	// than the other, even if their raw bytes differ.
+	ErrIndexConflict = errors.New("index conflict")
+
 	// ErrInvalidOperation is returned when an operation cannot be completed.
 	ErrInvalidOperation = errors.New("invalid operation")
 
@@ -276,6 +282,37 @@ func (idx *index) match(key string) bool {
 	return match.Match(key, idx.pattern)
 }
 
+// equal reports whether the index less function considers the values
+// a and b to be equal. Two values are equal when neither is less than
+// the other, even if their raw bytes differ.
+func (idx *index) equal(a, b string) bool {
+	return !idx.less(a, b) && !idx.less(b, a)
+}
+
+// findConflict returns the first item in the index with a value that the
+// index less function considers equal to the value of the provided item.
+// An item with the same key as the provided item is not considered a
+// conflict. Returns nil when no conflicting item exists.
+func (idx *index) findConflict(item *dbItem) *dbItem {
+	var found *dbItem
+	// A probe with an empty key sorts before all items with an equal
+	// value and after all items with a lesser value, so the scan starts
+	// at the first item with an equal or greater value.
+	probe := &dbItem{val: item.val}
+	btreeAscendGreaterOrEqual(idx.btr, probe, func(i interface{}) bool {
+		dbi := i.(*dbItem)
+		if !idx.equal(item.val, dbi.val) {
+			return false
+		}
+		if dbi.key != item.key {
+			found = dbi
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 // clearCopy creates a copy of the index, but with an empty dataset.
 func (idx *index) clearCopy() *index {
 	// copy the index meta information
@@ -297,8 +334,10 @@ func (idx *index) clearCopy() *index {
 	return nidx
 }
 
-// rebuild rebuilds the index
-func (idx *index) rebuild() {
+// rebuild rebuilds the index. When the index has the unique option
+// enabled, an ErrIndexConflict is returned if the existing data contains
+// values that the index less function considers equal.
+func (idx *index) rebuild() error {
 	// initialize trees
 	if idx.less != nil {
 		idx.btr = btreeNew(lessCtx(idx))
@@ -307,6 +346,7 @@ func (idx *index) rebuild() {
 		idx.rtr = rtred.New(idx)
 	}
 	// iterate through all keys and fill the index
+	var err error
 	btreeAscend(idx.db.keys, func(item interface{}) bool {
 		dbi := item.(*dbItem)
 		if !idx.match(dbi.key) {
@@ -314,6 +354,11 @@ func (idx *index) rebuild() {
 			return true
 		}
 		if idx.less != nil {
+			if idx.opts.Unique && idx.findConflict(dbi) != nil {
+				// found two values that the index considers equal.
+				err = ErrIndexConflict
+				return false
+			}
 			idx.btr.Set(dbi)
 		}
 		if idx.rect != nil {
@@ -321,6 +366,7 @@ func (idx *index) rebuild() {
 		}
 		return true
 	})
+	return err
 }
 
 // CreateIndex builds a new index and populates it with items.
@@ -1191,7 +1237,9 @@ func (tx *Tx) rollbackInner() {
 			// this could be an expensive process if the database has many
 			// items or the index is complex.
 			tx.db.idxs[name] = idx
-			idx.rebuild()
+			// A conflict error cannot be handled here, so it is ignored.
+			// The data being restored was valid when the index was dropped.
+			_ = idx.rebuild()
 		}
 	}
 }
@@ -1524,6 +1572,20 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 			// The caller is requesting that this item expires. Convert the
 			// TTL to an absolute time and bind it to the item.
 			item.opts = &dbItemOpts{ex: true, exat: time.Now().Add(opts.TTL)}
+		}
+	}
+	// Check that the new item does not violate the uniqueness constraint
+	// of any unique index. This must happen before any data is modified
+	// so that a conflict leaves the database untouched.
+	for _, idx := range tx.db.idxs {
+		if idx.btr == nil || !idx.opts.Unique {
+			continue
+		}
+		if !idx.match(key) {
+			continue
+		}
+		if idx.findConflict(item) != nil {
+			return "", false, ErrIndexConflict
 		}
 	}
 	// Insert the item into the keys tree.
@@ -2047,6 +2109,16 @@ type IndexOptions struct {
 	// CaseInsensitiveKeyMatching allow for case-insensitive
 	// matching on keys when setting key/values.
 	CaseInsensitiveKeyMatching bool
+
+	// Unique requires that all values in the index are unique, as
+	// determined by the index less function. Two values are considered
+	// equal when neither is less than the other, even if their raw
+	// bytes differ. Creating a unique index over existing data that
+	// contains equal values fails with ErrIndexConflict, and any Set
+	// operation that would introduce a duplicate value fails with
+	// ErrIndexConflict before any data is modified. This option has
+	// no effect on spatial indexes.
+	Unique bool
 }
 
 // CreateIndex builds a new index and populates it with items.
@@ -2165,7 +2237,12 @@ func (tx *Tx) createIndex(name string, pattern string,
 		db:      tx.db,
 		opts:    sopts,
 	}
-	idx.rebuild()
+	if err := idx.rebuild(); err != nil {
+		// The index could not be built, for example due to a unique
+		// constraint conflict in the existing data. The index has not
+		// been saved, so nothing is left behind.
+		return err
+	}
 	// save the index
 	tx.db.idxs[name] = idx
 	if tx.wc.rbkeys == nil {
