@@ -88,12 +88,14 @@ type Validate struct {
 	customFuncs            map[reflect.Type]CustomTypeFunc
 	aliases                map[string]string
 	validations            map[string]internalValidationFuncWrapper
+	batchRules             map[string]*batchRule
 	transTagFunc           map[ut.Translator]map[string]TranslationFunc // map[<locale>]map[<tag>]TranslationFunc
 	rules                  map[reflect.Type]map[string]string
 	tagCache               *tagCache
 	structCache            *structCache
 	hasCustomFuncs         bool
 	hasTagNameFunc         bool
+	hasBatchRules          bool
 	requiredStructEnabled  bool
 	privateFieldValidation bool
 	omitBlankFieldNames    bool
@@ -372,6 +374,12 @@ func (v *Validate) StructCtx(ctx context.Context, s interface{}) (err error) {
 
 	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
 
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
+
 	if len(vd.errs) > 0 {
 		err = vd.errs
 		vd.errs = nil
@@ -417,6 +425,12 @@ func (v *Validate) StructFilteredCtx(ctx context.Context, s interface{}, fn Filt
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
 	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -504,6 +518,12 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 
 	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
 
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
+
 	if len(vd.errs) > 0 {
 		err = vd.errs
 		vd.errs = nil
@@ -568,6 +588,12 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 
 	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
 
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
+
 	if len(vd.errs) > 0 {
 		err = vd.errs
 		vd.errs = nil
@@ -622,6 +648,12 @@ func (v *Validate) VarCtx(ctx context.Context, field interface{}, tag string) (e
 	vd.isPartial = false
 	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
 
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
+
 	if len(vd.errs) > 0 {
 		err = vd.errs
 		vd.errs = nil
@@ -673,6 +705,12 @@ func (v *Validate) VarWithValueCtx(ctx context.Context, field interface{}, other
 	vd.top = otherVal
 	vd.isPartial = false
 	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -731,6 +769,12 @@ func (v *Validate) VarWithKeyCtx(ctx context.Context, key string, field interfac
 	vd.top = val
 	vd.isPartial = false
 	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], cField, ctag)
+
+	if err = vd.resolveBatch(ctx); err != nil {
+		vd.errs = nil
+		v.pool.Put(vd)
+		return
+	}
 
 	if len(vd.errs) > 0 {
 		err = vd.errs

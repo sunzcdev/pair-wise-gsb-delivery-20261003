@@ -28,6 +28,7 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+	batchPending   []batchEntry // deferred external batch checks, drained by resolveBatch
 }
 
 // parent and current will be the same the first run of validateStruct
@@ -470,6 +471,16 @@ OUTER:
 			v.flField = current
 			v.cf = cf
 			v.ct = ct
+
+			if v.v.hasBatchRules {
+				if rule, ok := v.v.batchRules[ct.tag]; ok {
+					// external batch rule: defer the remote check, the key is
+					// collected now and resolved in bulk after traversal.
+					v.collectBatch(ctx, rule, ct, cf, current, kind, typ, ns, structNs)
+					ct = ct.next
+					continue
+				}
+			}
 
 			if !ct.fn(ctx, v) {
 				v.str1 = appendAltName(ns, cf.altName)

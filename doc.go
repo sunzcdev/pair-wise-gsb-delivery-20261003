@@ -52,6 +52,34 @@ Custom Validation functions can be added. Example:
 	// NOTES: using the same tag name as an existing function
 	//        will overwrite the existing one
 
+# Batch External Validations
+
+Validations that require a remote lookup (e.g. "does this product ID exist")
+can be registered as batch rules so a request with hundreds of values only
+performs one remote call per rule and scope instead of one per field:
+
+	validate.RegisterBatchValidation("sku_exists",
+		func(ctx context.Context, scope string, keys []string) (map[string]bool, error) {
+			return productClient.Exists(ctx, scope, keys) // one batched remote call
+		},
+		validator.WithBatchScope(func(ctx context.Context, fl validator.FieldLevel) string {
+			return fl.Parent().FieldByName("Tenant").String() // keep tenants separated
+		}),
+	)
+
+During validation the tag only collects the keys to check while all other,
+local validations run as usual. After the struct has been traversed the
+collected keys are deduplicated per (rule, scope), checked with a single
+BatchCheckFunc call per group and the results are mapped back onto the
+individual fields as ValidationErrors.
+
+If the remote backend itself fails (or the context is canceled mid-validation)
+the validation call returns a *BatchError wrapping the cause, NOT
+ValidationErrors: a backend being unavailable is not a "value does not exist"
+verdict. Keys missing from the returned map are treated as invalid.
+
+Batch tags cannot be used within an 'or' (|) expression.
+
 # Valuer Interface
 
 Custom types can implement the Valuer interface to return the value that should
