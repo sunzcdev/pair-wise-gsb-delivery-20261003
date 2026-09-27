@@ -463,6 +463,45 @@ db.CreateIndex("last_name_age", "*",
 
 This will create a multi value index where the last name is ascending and the age is descending.
 
+## Structured JSON Indexes
+
+`IndexJSONFields` builds a compound index over structured JSON fields and adds
+two guarantees that `IndexJSON` does not provide:
+
+- Numbers keep exact decimal precision. They are compared as decimals rather
+  than converted to `float64`, so adjacent integers beyond `2^53` stay
+  distinct, and scientific notation (e.g. `1e309`) and negative numbers are
+  ordered by their mathematical value.
+- Every field has an explicit, fixed type order. When two documents resolve
+  to different JSON types at the same path, the type itself decides the
+  ordering first.
+
+The default type order is:
+
+```
+missing < null < false < true < number < string < object/array
+```
+
+`missing` means the path does not exist; an explicit `null` is a separate
+type that sorts after it. Each `JSONField` may reverse its order with `Desc`,
+switch string comparison to case-sensitive, or override the type order with
+`TypeOrder`.
+
+For example, sort by `category` ascending and `score` (a very large integer)
+descending:
+
+```go
+db.CreateIndex("ranking", "*", buntdb.IndexJSONFields(
+    buntdb.JSONField{Path: "category"},
+    buntdb.JSONField{Path: "score", Desc: true},
+))
+```
+
+Numbers such as `9007199254740992` and `9007199254740993` are then ordered
+correctly. `IndexJSON` is unchanged and retains its original float64-based
+rules; use the new API only when exact numeric ordering or the fixed type
+order is needed.
+
 ## Collate i18n Indexes
 
 Using the external [collate package](https://github.com/tidwall/collate) it's possible to create
