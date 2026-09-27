@@ -225,6 +225,29 @@ func MaxNodes(n uint) Option {
 	}
 }
 
+// PureRule enables pure rule mode, intended for rules that are archived and
+// re-evaluated later: the compiled expression must not read the current time,
+// randomness, or any external state at run time. Only calls to the functions
+// and builtins explicitly listed in allowedFunctions are permitted; any other
+// function, any object method call, and any indirect call (through a
+// variable, an array element, or another computed callee) is rejected at
+// compile time with an error pointing at the offending call chain.
+//
+// The restriction is enforced on the typed AST after type checking and again
+// after the optimization passes, so calls introduced by patchers (such as
+// operator overloading) or by optimizer rewrites cannot bypass it.
+//
+// The host declaration is the trust boundary: expr does not verify that the
+// declared Go functions are actually free of side effects.
+func PureRule(allowedFunctions ...string) Option {
+	return func(c *conf.Config) {
+		c.PureMode = true
+		for _, name := range allowedFunctions {
+			c.PureFunctions[name] = true
+		}
+	}
+}
+
 // Compile parses and compiles given input expression to bytecode program.
 func Compile(input string, ops ...Option) (*vm.Program, error) {
 	config := conf.CreateNew()
@@ -250,6 +273,12 @@ func Compile(input string, ops ...Option) (*vm.Program, error) {
 			}
 			return nil, err
 		}
+	}
+
+	// Re-check purity after optimization: optimizer rewrites must not be
+	// able to introduce or expose calls that violate pure rule mode.
+	if err := checker.CheckPurity(tree, config); err != nil {
+		return nil, err
 	}
 
 	program, err := compiler.Compile(tree, config)

@@ -36,6 +36,17 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	// PureMode restricts expressions to a host-declared set of pure
+	// functions. It is intended for rules that must be archived and
+	// re-evaluated later with a deterministic result: undeclared
+	// functions, object method calls, and indirect calls are rejected
+	// during type checking and again after the optimization passes.
+	PureMode bool
+	// PureFunctions is the set of function and builtin names the host
+	// explicitly declared as pure. The declaration is the trust
+	// boundary: the library does not verify the declared Go functions
+	// for real side effects.
+	PureFunctions map[string]bool
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
@@ -46,13 +57,14 @@ type Config struct {
 // CreateNew creates new config with default values.
 func CreateNew() *Config {
 	c := &Config{
-		Optimize:     true,
-		ShortCircuit: true,
-		MaxNodes:     DefaultMaxNodes,
-		ConstFns:     make(map[string]reflect.Value),
-		Functions:    make(map[string]*builtin.Function),
-		Builtins:     make(map[string]*builtin.Function),
-		Disabled:     make(map[string]bool),
+		Optimize:      true,
+		ShortCircuit:  true,
+		MaxNodes:      DefaultMaxNodes,
+		ConstFns:      make(map[string]reflect.Value),
+		Functions:     make(map[string]*builtin.Function),
+		Builtins:      make(map[string]*builtin.Function),
+		Disabled:      make(map[string]bool),
+		PureFunctions: make(map[string]bool),
 	}
 	for _, f := range builtin.Builtins {
 		c.Builtins[f.Name] = f

@@ -132,3 +132,34 @@ The timezone is used for the following functions:
 date("2024-11-23 12:00:00") // parses the date in the specified timezone
 now() // returns the current time in the specified timezone
 ```
+
+## PureRule
+
+Rules that are archived and re-evaluated later (audit, risk control, replay)
+must not read the current time, randomness, or any external state at run
+time. The [`PureRule`](https://pkg.go.dev/github.com/expr-lang/expr#PureRule)
+option enables pure rule mode: only the functions and builtins explicitly
+declared by the host may be called.
+
+```go
+program, err := expr.Compile(
+    `Amount <= Limit && Score + boost(Score) >= Threshold`,
+    expr.Env(RiskEnv{}),
+    boost,
+    expr.PureRule("boost"), // host declares boost as pure
+)
+```
+
+In pure rule mode the compiler rejects, with an error pointing at the
+offending call chain:
+
+- calls to functions or builtins not declared via `PureRule` (e.g. `now()`);
+- object method calls (e.g. `CreatedAt.After(other)`);
+- indirect calls through variables or computed callees
+  (e.g. `let f = Callback; f()`).
+
+The restriction is enforced on the typed AST after type checking and again
+after the optimization passes, so calls introduced by patchers (such as
+operator overloading) or by optimizer rewrites cannot bypass it. The host
+declaration is the trust boundary: expr does not verify that the declared Go
+functions are actually free of side effects.

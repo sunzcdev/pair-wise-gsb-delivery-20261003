@@ -42,6 +42,10 @@ func ParseCheck(input string, config *conf.Config) (*parser.Tree, error) {
 		return tree, err
 	}
 
+	if err := CheckPurity(tree, config); err != nil {
+		return tree, err
+	}
+
 	return tree, nil
 }
 
