@@ -1,6 +1,7 @@
 package scs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log"
@@ -55,6 +56,34 @@ type SessionManager struct {
 	// context.Context. If you are setting this manually, please make sure it is
 	// a unique value for each SessionManager instance
 	ContextKey contextKey
+
+	// BufferSize controls whether the LoadAndSave middleware buffers the
+	// response, and the maximum size of the buffered response body in bytes.
+	// The default value of 0 disables buffering.
+	//
+	// When buffering is disabled, the session is committed to the store the
+	// first time the handler writes to the response (or when the handler
+	// returns, if nothing was written), and modifying the session data after
+	// that point results in a panic with ErrUncommittedModification.
+	//
+	// When BufferSize is greater than zero, the response status code, headers
+	// and body are buffered in memory instead of being sent directly to the
+	// client. This allows the handler to continue modifying the session data
+	// after writing the response body. After the handler returns, the session
+	// is committed and, only if the commit succeeds, the buffered response is
+	// sent to the client. If the commit fails, the buffered response is
+	// discarded (the client never sees the original status code, body or
+	// session cookie) and ErrorFunc is called instead.
+	//
+	// If the buffered body would exceed BufferSize, Write returns
+	// ErrResponseTooLarge and nothing is sent to the client. Calls to Flush
+	// are no-ops (flushing would defeat the purpose of buffering), and Hijack
+	// is not supported and returns an error. If the handler panics, the
+	// buffered response is discarded, the session is not committed, and the
+	// panic propagates as normal — because nothing has been written to the
+	// underlying ResponseWriter yet, any recovery middleware can still send
+	// an error response to the client.
+	BufferSize int
 }
 
 // SessionCookie contains the configuration settings for session cookies.
@@ -155,6 +184,31 @@ func (s *SessionManager) LoadAndSave(next http.Handler) http.Handler {
 		}
 
 		sr := r.WithContext(ctx)
+
+		if s.BufferSize > 0 {
+			bw := &bufferedResponseWriter{
+				ResponseWriter: w,
+				buf:            new(bytes.Buffer),
+				limit:          s.BufferSize,
+			}
+
+			next.ServeHTTP(bw, sr)
+
+			err := s.commitAndAddSessionCookie(w, sr)
+			if err != nil {
+				s.ErrorFunc(w, sr, err)
+				return
+			}
+
+			status := bw.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+
+			w.WriteHeader(status)
+			w.Write(bw.buf.Bytes())
+			return
+		}
 
 		sw := &sessionResponseWriter{
 			ResponseWriter: w,

@@ -341,6 +341,23 @@ Please note that the same warning applies here: modification of session data aft
 
 Note that the `http.ResponseWriter` passed on by the [`LoadAndSave()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.LoadAndSave) middleware does not support the `http.Flusher` interface directly. This effectively means that flushing/streaming is only supported by SCS if you are using Go >= 1.20.
 
+### Buffering Responses
+
+If you have handlers which need to modify the session data *after* writing the response body (for example, pages which render the body first and update user preferences afterwards), you can set `BufferSize` to a positive value to enable response buffering:
+
+```go
+sessionManager := scs.New()
+sessionManager.BufferSize = 1024 * 1024 // Buffer responses up to 1MB.
+```
+
+When buffering is enabled, the response status code, headers and body are buffered in memory instead of being sent directly to the client. After the handler returns, the session is committed and, only if the commit succeeds, the buffered response is sent to the client. If the commit fails, the buffered response is discarded — the client never sees the original status code, body or session cookie — and `ErrorFunc` is called instead.
+
+Please note:
+
+* If the buffered body would exceed `BufferSize`, `Write` returns an `ErrResponseTooLarge` error and nothing is sent to the client.
+* Calls to `Flush` are no-ops, and hijacking the connection is not supported (`Hijack` returns an error).
+* If the handler panics, the buffered response is discarded, the session is not committed, and the panic propagates as normal. Because nothing has been written to the underlying `http.ResponseWriter` yet, any recovery middleware can still send an error response to the client.
+
 ### Hijacking Responses
 
 Hijacking responses is supported via the `http.NewResponseController` type (available in Go >= 1.20). Please note that the `http.ResponseWriter` passed on by the [`LoadAndSave()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.LoadAndSave) middleware does not support the `http.Hijacker` interface directly. This effectively means that hijacking is only supported by SCS if you are using Go >= 1.20.
