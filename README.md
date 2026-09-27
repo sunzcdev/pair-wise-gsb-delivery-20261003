@@ -21,6 +21,7 @@ If you need version 4, use `go get -u gopkg.in/evanphx/json-patch.v4`
 # Use It!
 * [Create and apply a merge patch](#create-and-apply-a-merge-patch)
 * [Create and apply a JSON Patch](#create-and-apply-a-json-patch)
+* [Generate an RFC 6902 patch from two documents](#generate-an-rfc-6902-patch-from-two-documents)
 * [Comparing JSON documents](#comparing-json-documents)
 * [Combine merge patches](#combine-merge-patches)
 
@@ -148,6 +149,33 @@ $ go run main.go
 Original document: {"name": "John", "age": 24, "height": 3.21}
 Modified document: {"age":24,"name":"Jane"}
 ```
+
+## Generate an RFC 6902 patch from two documents
+`jsonpatch.CreatePatch(original, modified)` (v5) computes an RFC 6902 patch
+that transforms one JSON document into another. By default arrays are compared
+element by index.
+
+For configuration-style documents whose array elements carry a stable
+identifier, `jsonpatch.CreatePatchWithOptions` accepts a
+`jsonpatch.DiffOptions` whose `ArrayIdentityKeys` maps a JSON Pointer
+addressing an array to the name of the member identifying each element. Such
+arrays are diffed by identity: reorderings become `move` operations, and
+content changes, insertions and deletions become targeted
+`replace`/`add`/`remove` operations instead of a wholesale array replacement.
+
+```go
+opts := &jsonpatch.DiffOptions{
+	ArrayIdentityKeys: map[string]string{"/servers": "id"},
+}
+patch, err := jsonpatch.CreatePatchWithOptions(original, modified, opts)
+```
+
+Identity values must be unique strings or numbers. If an identity is
+duplicated or missing, the behavior is controlled by
+`DiffOptions.OnIdentityMismatch`: it either fails with an error wrapping
+`jsonpatch.ErrDuplicateIdentity`/`jsonpatch.ErrMissingIdentity` (the default),
+or deterministically falls back to index-based comparison for that array
+(`jsonpatch.IdentityMismatchFallback`). Elements are never paired at random.
 
 ## Comparing JSON documents
 Due to potential whitespace and ordering differences, one cannot simply compare
