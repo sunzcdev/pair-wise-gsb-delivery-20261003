@@ -1,0 +1,4 @@
+p, alice, data1, export, allow, ssn,
+p, alice, data1, export, allow, , owner
+p, alice, data1, read, allow, , 
+p, bob, data1, export, deny, ssn,

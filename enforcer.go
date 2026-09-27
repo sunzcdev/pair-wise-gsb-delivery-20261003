@@ -61,6 +61,8 @@ type Enforcer struct {
 	acceptJsonRequest    bool
 	gFunctionCache       bool
 
+	obligationsConflictStrategy ObligationsConflictStrategy
+
 	aiConfig AIConfig
 }
 
@@ -699,7 +701,7 @@ func (e *Enforcer) invalidateMatcherMap() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) {
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
 
 	defer func() {
@@ -716,6 +718,37 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		return true, nil
 	}
 
+	res, err := e.evaluate(matcher, false, rvals...)
+	if err != nil {
+		return false, err
+	}
+
+	if explains != nil {
+		if res.explainIndex != -1 && len(e.model["p"][res.pType].Policy) > res.explainIndex {
+			*explains = e.model["p"][res.pType].Policy[res.explainIndex]
+		}
+	}
+
+	// effect -> result
+	return res.effect == effector.Allow, nil
+}
+
+// enforcementResult holds the outcome of evaluating a matcher against the policy.
+type enforcementResult struct {
+	effect       effector.Effect
+	explainIndex int
+	effects      []effector.Effect
+	matches      []float64
+	pType        string
+	eType        string
+	hasPolicy    bool
+}
+
+// evaluate runs the matcher against the policy rules and merges the rule effects
+// into a final decision. When evaluateAll is true the matcher is evaluated for
+// every policy rule even after the decision is already determined, so callers can
+// inspect every rule that took part in the decision (e.g. to collect obligations).
+func (e *Enforcer) evaluate(matcher string, evaluateAll bool, rvals ...interface{}) (res *enforcementResult, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
 	functions := e.fm.GetFunctions()
 	if _, ok := e.model["g"]; ok {
 		for key, ast := range e.model["g"] {
@@ -779,7 +812,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 					mapValue, err = util.JsonToMap(rval)
 					if err != nil {
 						// Return a clear error when JSON-like string fails to parse
-						return false, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
+						return nil, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
 					}
 					rvals[i] = mapValue
 				}
@@ -801,11 +834,11 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	var expression *govaluate.EvaluableExpression
 	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"invalid request size: expected %d, got %d, rvals: %v",
 			len(e.model["r"][rType].Tokens),
 			len(rvals),
@@ -818,14 +851,17 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	var effect effector.Effect
 	var explainIndex int
 
+	res = &enforcementResult{pType: pType, eType: eType, explainIndex: -1}
+
 	if policyLen := len(e.model["p"][pType].Policy); policyLen != 0 && strings.Contains(expString, pType+"_") { //nolint:nestif // TODO: reduce function complexity
+		res.hasPolicy = true
 		policyEffects = make([]effector.Effect, policyLen)
 		matcherResults = make([]float64, policyLen)
 
 		for policyIndex, pvals := range e.model["p"][pType].Policy {
 			// log.LogPrint("Policy Rule: ", pvals)
 			if len(e.model["p"][pType].Tokens) != len(pvals) {
-				return false, fmt.Errorf(
+				return nil, fmt.Errorf(
 					"invalid policy size: expected %d, got %d, pvals: %v",
 					len(e.model["p"][pType].Tokens),
 					len(pvals),
@@ -837,7 +873,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			result, err := expression.Eval(parameters)
 			// log.LogPrint("Result: ", result)
 			if err != nil {
-				return false, err
+				return nil, err
 			}
 
 			// set to no-match at first
@@ -852,7 +888,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 					matcherResults[policyIndex] = 1
 				}
 			default:
-				return false, errors.New("matcher result should be bool, int or float")
+				return nil, errors.New("matcher result should be bool, int or float")
 			}
 
 			if j, ok := parameters.pTokens[pType+"_eft"]; ok {
@@ -873,17 +909,34 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			//	break
 			// }
 
-			effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
-			if err != nil {
-				return false, err
+			if !evaluateAll {
+				effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
+				if err != nil {
+					return nil, err
+				}
+				if effect != effector.Indeterminate {
+					break
+				}
 			}
-			if effect != effector.Indeterminate {
-				break
+		}
+
+		if evaluateAll {
+			// Replay the effect merging over the fully evaluated rules. The
+			// prefix slices keep this equivalent to the short-circuiting loop
+			// above for every built-in effect expression.
+			for policyIndex := 0; policyIndex < policyLen; policyIndex++ {
+				effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects[:policyIndex+1], matcherResults[:policyIndex+1], policyIndex, policyLen)
+				if err != nil {
+					return nil, err
+				}
+				if effect != effector.Indeterminate {
+					break
+				}
 			}
 		}
 	} else {
 		if hasEval && len(e.model["p"][pType].Policy) == 0 {
-			return false, errors.New("please make sure rule exists in policy when using eval() in matcher")
+			return nil, errors.New("please make sure rule exists in policy when using eval() in matcher")
 		}
 
 		policyEffects = make([]effector.Effect, 1)
@@ -894,7 +947,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 		result, err := expression.Eval(parameters)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 
 		if result.(bool) {
@@ -905,20 +958,16 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 
 		effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, 0, 1)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
 	}
 
-	if explains != nil {
-		if explainIndex != -1 && len(e.model["p"][pType].Policy) > explainIndex {
-			*explains = e.model["p"][pType].Policy[explainIndex]
-		}
-	}
+	res.effect = effect
+	res.explainIndex = explainIndex
+	res.effects = policyEffects
+	res.matches = matcherResults
 
-	// effect -> result
-	result := effect == effector.Allow
-
-	return result, nil
+	return res, nil
 }
 
 func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, functions map[string]govaluate.ExpressionFunction) (*govaluate.EvaluableExpression, error) {

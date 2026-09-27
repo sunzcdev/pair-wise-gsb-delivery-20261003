@@ -1,0 +1,3 @@
+p, 1, alice, data1, export, deny,
+p, 10, alice, data1, export, allow, ssn
+p, 5, bob, data2, read, allow, watermark

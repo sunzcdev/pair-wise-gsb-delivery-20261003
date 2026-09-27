@@ -64,6 +64,7 @@ type IEnforcer interface {
 	EnforceExWithMatcher(matcher string, rvals ...interface{}) (bool, []string, error)
 	BatchEnforce(requests [][]interface{}) ([]bool, error)
 	BatchEnforceWithMatcher(matcher string, requests [][]interface{}) ([]bool, error)
+	EnforceWithObligations(rvals ...interface{}) (bool, Obligations, error)
 	Explain(rvals ...interface{}) (string, error)
 
 	/* RBAC API */
