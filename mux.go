@@ -45,6 +45,10 @@ type Mux struct {
 	// Controls the behaviour of middleware chain generation when a mux
 	// is registered as an inline group inside another mux.
 	inline bool
+
+	// The path strategy used to derive the routing path of a request
+	// and to expose captured URL parameter values. See SetPathStrategy.
+	pathStrategy PathStrategy
 }
 
 // NewMux returns a newly initialized Mux object that implements the Router
@@ -81,6 +85,7 @@ func (mx *Mux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rctx = mx.pool.Get().(*Context)
 	rctx.Reset()
 	rctx.Routes = mx
+	rctx.pathStrategy = mx.pathStrategy
 	rctx.parentCtx = r.Context()
 
 	// NOTE: r.WithContext() causes 2 allocations and context.WithValue() causes 1 allocation
@@ -257,6 +262,7 @@ func (mx *Mux) With(middlewares ...func(http.Handler) http.Handler) Router {
 	im := &Mux{
 		pool: mx.pool, inline: true, parent: mx, tree: mx.tree, middlewares: mws,
 		notFoundHandler: mx.notFoundHandler, methodNotAllowedHandler: mx.methodNotAllowedHandler,
+		pathStrategy: mx.pathStrategy,
 	}
 
 	return im
@@ -330,6 +336,9 @@ func (mx *Mux) Mount(pattern string, handler http.Handler) {
 		n := len(rctx.URLParams.Keys) - 1
 		if n >= 0 && rctx.URLParams.Keys[n] == "*" && len(rctx.URLParams.Values) > n {
 			rctx.URLParams.Values[n] = ""
+			if len(rctx.rawURLParamValues) > n {
+				rctx.rawURLParamValues[n] = ""
+			}
 		}
 
 		handler.ServeHTTP(w, r)
@@ -459,7 +468,12 @@ func (mx *Mux) routeHTTP(w http.ResponseWriter, r *http.Request) {
 	// The request routing path
 	routePath := rctx.RoutePath
 	if routePath == "" {
-		if r.URL.RawPath != "" {
+		if rctx.pathStrategy == PathStrategyUnescaped {
+			// Route on the escaped form of the path so that escaped
+			// slashes (%2F) stay inside a single path segment. An
+			// invalid RawPath hint is ignored by EscapedPath.
+			routePath = r.URL.EscapedPath()
+		} else if r.URL.RawPath != "" {
 			routePath = r.URL.RawPath
 		} else {
 			routePath = r.URL.Path

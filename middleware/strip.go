@@ -17,6 +17,10 @@ func StripSlashes(next http.Handler) http.Handler {
 		rctx := chi.RouteContext(r.Context())
 		if rctx != nil && rctx.RoutePath != "" {
 			path = rctx.RoutePath
+		} else if rctx != nil && rctx.PathStrategy() == chi.PathStrategyUnescaped {
+			// Use the escaped form of the path so that escaped slashes
+			// (%2F) are not treated as segment boundaries.
+			path = r.URL.EscapedPath()
 		} else {
 			path = r.URL.Path
 		}
@@ -44,6 +48,11 @@ func RedirectSlashes(next http.Handler) http.Handler {
 		rctx := chi.RouteContext(r.Context())
 		if rctx != nil && rctx.RoutePath != "" {
 			path = rctx.RoutePath
+		} else if rctx != nil && rctx.PathStrategy() == chi.PathStrategyUnescaped {
+			// Use the escaped form of the path so that escaped slashes
+			// (%2F) are not treated as segment boundaries, and so the
+			// redirect target keeps the original escaping.
+			path = r.URL.EscapedPath()
 		} else {
 			path = r.URL.Path
 		}

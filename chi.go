@@ -54,6 +54,17 @@
 //	"/page/*" matches "/page/intro/latest"
 //	"/page/{other}/latest" also matches "/page/intro/latest"
 //	"/date/{yyyy:\\d\\d\\d\\d}/{mm:\\d\\d}/{dd:\\d\\d}" matches "/date/2017/04/01"
+//
+// # Path strategies
+//
+// By default, chi routes on the raw (escaped) request path when it is
+// available and exposes URL parameters exactly as captured. A Mux may
+// opt into a different path strategy with [Mux.SetPathStrategy], e.g.
+// [PathStrategyUnescaped], which preserves the raw segment boundaries
+// of the request path while routing and percent-decodes each captured
+// parameter exactly once, so a route "/objects/{key}" serves a request
+// to "/objects/a%2Fb" with key "a/b". See [PathStrategy], [URLParam]
+// and [URLParamRaw] for details.
 package chi
 
 import "net/http"

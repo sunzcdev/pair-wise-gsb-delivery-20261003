@@ -327,6 +327,40 @@ func MyRequestHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### Path strategies and escaped slashes
+
+By default (`chi.PathStrategyEscaped`), chi routes on `r.URL.RawPath` when it is set and
+exposes URL parameters exactly as captured, so a request to `/objects/a%2Fb` yields
+`chi.URLParam(r, "key") == "a%2Fb"`.
+
+If your keys may contain slashes encoded as `%2F`, opt into `chi.PathStrategyUnescaped`:
+
+```go
+r := chi.NewRouter()
+r.SetPathStrategy(chi.PathStrategyUnescaped)
+
+r.Get("/objects/{key}", func(w http.ResponseWriter, r *http.Request) {
+  key := chi.URLParam(r, "key")       // "a/b"     for GET /objects/a%2Fb
+  raw := chi.URLParamRaw(r, "key")    // "a%2Fb"   the captured value before decoding
+  _, _ = key, raw
+})
+```
+
+Under this strategy the router always matches against the escaped form of the path
+(`r.URL.EscapedPath()`), so an escaped slash stays inside a single path segment while
+matching, and each captured parameter is percent-decoded exactly once before being
+exposed: `/objects/a%2Fb` gives `"a/b"`, while `/objects/a%252Fb` gives `"a%2Fb"`.
+Static segments, regexp and wildcard parameters, sub-routers mounted with `Mount`,
+`middleware.CleanPath`, `middleware.StripSlashes` and `middleware.RedirectSlashes`
+all follow the same rule and never re-split a preserved segment boundary. Note that
+regexp parameters are matched against the escaped segment text, and that an invalid
+`r.URL.RawPath` hint is ignored in favor of the escaped form of `r.URL.Path`.
+
+To get the other form of a parameter: with `PathStrategyUnescaped` use
+`chi.URLParamRaw` for the still-escaped value; with the default strategy
+`chi.URLParam`/`chi.URLParamRaw` already return the captured value, which you can
+decode yourself with `url.PathUnescape`.
+
 
 ## Middlewares
 

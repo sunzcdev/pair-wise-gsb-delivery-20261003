@@ -15,7 +15,11 @@ func CleanPath(next http.Handler) http.Handler {
 
 		routePath := rctx.RoutePath
 		if routePath == "" {
-			if r.URL.RawPath != "" {
+			if rctx.PathStrategy() == chi.PathStrategyUnescaped {
+				// Clean the escaped form of the path so that escaped
+				// slashes (%2F) are not treated as segment boundaries.
+				routePath = r.URL.EscapedPath()
+			} else if r.URL.RawPath != "" {
 				routePath = r.URL.RawPath
 			} else {
 				routePath = r.URL.Path

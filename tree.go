@@ -394,7 +394,17 @@ func (n *node) FindRoute(rctx *Context, method methodTyp, path string) (*node, e
 
 	// Record the routing params in the request lifecycle
 	rctx.URLParams.Keys = append(rctx.URLParams.Keys, rctx.routeParams.Keys...)
-	rctx.URLParams.Values = append(rctx.URLParams.Values, rctx.routeParams.Values...)
+	rctx.rawURLParamValues = append(rctx.rawURLParamValues, rctx.routeParams.Values...)
+	if rctx.pathStrategy == PathStrategyUnescaped {
+		// Routing matched against the escaped form of the path, so the
+		// captured values are still percent-escaped; decode them exactly
+		// once before exposing them to handlers.
+		for _, value := range rctx.routeParams.Values {
+			rctx.URLParams.Values = append(rctx.URLParams.Values, unescapePathParam(value))
+		}
+	} else {
+		rctx.URLParams.Values = append(rctx.URLParams.Values, rctx.routeParams.Values...)
+	}
 
 	// Record the routing pattern in the request lifecycle
 	if rn.endpoints[method].pattern != "" {

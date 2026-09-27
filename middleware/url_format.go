@@ -53,6 +53,11 @@ func URLFormat(next http.Handler) http.Handler {
 		rctx := chi.RouteContext(r.Context())
 		if rctx != nil && rctx.RoutePath != "" {
 			path = rctx.RoutePath
+		} else if rctx != nil && rctx.PathStrategy() == chi.PathStrategyUnescaped {
+			// Trim the format suffix from the escaped form of the path,
+			// so the routing path stays in escaped form and escaped
+			// slashes (%2F) are not treated as segment boundaries.
+			path = r.URL.EscapedPath()
 		}
 
 		if strings.Index(path, ".") > 0 {

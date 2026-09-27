@@ -8,6 +8,14 @@ import (
 )
 
 // URLParam returns the url parameter from a http.Request object.
+//
+// The returned form depends on the path strategy of the mux that served
+// the request (see Mux.SetPathStrategy). With the default
+// PathStrategyEscaped, the value is returned exactly as captured from
+// the routing path, e.g. "a%2Fb" for a request to "/objects/a%2Fb".
+// With PathStrategyUnescaped, the value is percent-decoded exactly once,
+// e.g. "a/b". Use URLParamRaw to always get the captured, undecoded
+// form.
 func URLParam(r *http.Request, key string) string {
 	return URLParamFromCtx(r.Context(), key)
 }
@@ -16,6 +24,29 @@ func URLParam(r *http.Request, key string) string {
 func URLParamFromCtx(ctx context.Context, key string) string {
 	if rctx := RouteContext(ctx); rctx != nil {
 		return rctx.URLParam(key)
+	}
+	return ""
+}
+
+// URLParamRaw returns the url parameter from a http.Request object
+// exactly as captured from the routing path, before any decoding
+// prescribed by the mux's path strategy is applied. For example, a
+// parameter captured from a request to "/objects/a%2Fb" is returned as
+// "a%2Fb" regardless of the path strategy.
+//
+// Note that under the default PathStrategyEscaped the routing path may
+// be r.URL.Path itself (when r.URL.RawPath is unset), in which case the
+// captured value is already decoded; under PathStrategyUnescaped the
+// routing path is always the escaped form of the path.
+func URLParamRaw(r *http.Request, key string) string {
+	return URLParamRawFromCtx(r.Context(), key)
+}
+
+// URLParamRawFromCtx returns the raw url parameter from a http.Request
+// Context. See URLParamRaw.
+func URLParamRawFromCtx(ctx context.Context, key string) string {
+	if rctx := RouteContext(ctx); rctx != nil {
+		return rctx.URLParamRaw(key)
 	}
 	return ""
 }
@@ -59,6 +90,15 @@ type Context struct {
 	// routing lifecycle across a stack of sub-routers.
 	URLParams RouteParams
 
+	// rawURLParamValues are the URL parameter values exactly as captured
+	// from the routing path, before any decoding prescribed by the path
+	// strategy. They are aligned by index with URLParams.Keys.
+	rawURLParamValues []string
+
+	// pathStrategy is the path strategy in effect for the request,
+	// copied from the root mux serving the request.
+	pathStrategy PathStrategy
+
 	// Route parameters matched for the current sub-router. It is
 	// intentionally unexported so it can't be tampered.
 	routeParams RouteParams
@@ -86,6 +126,8 @@ func (x *Context) Reset() {
 	x.RoutePatterns = x.RoutePatterns[:0]
 	x.URLParams.Keys = x.URLParams.Keys[:0]
 	x.URLParams.Values = x.URLParams.Values[:0]
+	x.rawURLParamValues = x.rawURLParamValues[:0]
+	x.pathStrategy = PathStrategyEscaped
 
 	x.routePattern = ""
 	x.routeParams.Keys = x.routeParams.Keys[:0]
@@ -109,6 +151,7 @@ func (x *Context) Clone() *Context {
 
 	clone.URLParams.Keys = slices.Clone(x.URLParams.Keys)
 	clone.URLParams.Values = slices.Clone(x.URLParams.Values)
+	clone.rawURLParamValues = slices.Clone(x.rawURLParamValues)
 
 	clone.routeParams.Keys = slices.Clone(x.routeParams.Keys)
 	clone.routeParams.Values = slices.Clone(x.routeParams.Values)
@@ -120,7 +163,8 @@ func (x *Context) Clone() *Context {
 }
 
 // URLParam returns the corresponding URL parameter value from the request
-// routing context.
+// routing context. See the package-level URLParam function for the form
+// of the returned value under each path strategy.
 func (x *Context) URLParam(key string) string {
 	for i, k := range slices.Backward(x.URLParams.Keys) {
 		if k == key {
@@ -128,6 +172,29 @@ func (x *Context) URLParam(key string) string {
 		}
 	}
 	return ""
+}
+
+// URLParamRaw returns the corresponding URL parameter value from the
+// request routing context exactly as captured from the routing path,
+// before any decoding prescribed by the path strategy. See the
+// package-level URLParamRaw function.
+func (x *Context) URLParamRaw(key string) string {
+	for i, k := range slices.Backward(x.URLParams.Keys) {
+		if k == key {
+			if i < len(x.rawURLParamValues) {
+				return x.rawURLParamValues[i]
+			}
+			return x.URLParams.Values[i]
+		}
+	}
+	return ""
+}
+
+// PathStrategy returns the path strategy in effect for the request.
+// It is copied from the root mux serving the request; see
+// Mux.SetPathStrategy.
+func (x *Context) PathStrategy() PathStrategy {
+	return x.pathStrategy
 }
 
 // RoutePattern builds the routing pattern string for the particular
