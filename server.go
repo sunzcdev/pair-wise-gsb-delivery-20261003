@@ -41,6 +41,23 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// AuthPolicy is an optional callback used to filter the SASL
+	// mechanisms that may be used on a connection. It is called with each
+	// mechanism supported by the backend and the effective set of allowed
+	// mechanisms is the intersection of the backend list and the
+	// mechanisms for which AuthPolicy returns true.
+	//
+	// The callback is consulted both when the AUTH capability is
+	// advertised in EHLO responses and when the AUTH command is executed.
+	// It is invoked every time the capabilities are computed, so it always
+	// observes the current connection state (e.g. Conn.TLSConnectionState)
+	// and no previously allowed result is retained after STARTTLS or a
+	// connection state reset. Mechanism names should be compared
+	// case-insensitively.
+	//
+	// If nil, all mechanisms supported by the backend are allowed.
+	AuthPolicy func(c *Conn, mech string) bool
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

@@ -838,6 +838,11 @@ func (c *Conn) handleAuth(arg string) {
 
 	mechanism := strings.ToUpper(parts[0])
 
+	if c.server.AuthPolicy != nil && !c.authMechAllowed(mechanism) {
+		c.writeError(504, EnhancedCode{5, 7, 4}, ErrAuthUnknownMechanism)
+		return
+	}
+
 	// Parse client initial response if there is one
 	var ir []byte
 	if len(parts) > 1 {
@@ -904,9 +909,32 @@ func decodeSASLResponse(s string) ([]byte, error) {
 
 func (c *Conn) authMechanisms() []string {
 	if authSession, ok := c.Session().(AuthSession); ok {
-		return authSession.AuthMechanisms()
+		mechs := authSession.AuthMechanisms()
+		if policy := c.server.AuthPolicy; policy != nil {
+			allowed := make([]string, 0, len(mechs))
+			for _, mech := range mechs {
+				if policy(c, mech) {
+					allowed = append(allowed, mech)
+				}
+			}
+			mechs = allowed
+		}
+		return mechs
 	}
 	return nil
+}
+
+// authMechAllowed reports whether the SASL mechanism mech may be used on
+// this connection. The mechanism must be both supported by the backend and
+// allowed by the server's AuthPolicy, if any. Mechanism names are compared
+// case-insensitively.
+func (c *Conn) authMechAllowed(mech string) bool {
+	for _, allowed := range c.authMechanisms() {
+		if strings.EqualFold(allowed, mech) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Conn) auth(mech string) (sasl.Server, error) {

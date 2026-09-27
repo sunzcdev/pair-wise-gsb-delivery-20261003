@@ -1,9 +1,11 @@
 package smtp_test
 
 import (
+	"crypto/tls"
 	"errors"
 	"io"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-sasl"
@@ -102,6 +104,107 @@ func ExampleServer() {
 
 	log.Println("Starting server at", s.Addr)
 	if err := s.ListenAndServe(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+// The CertBackend offers the EXTERNAL mechanism in addition to PLAIN, but
+// relies on the server's AuthPolicy to only enable EXTERNAL for connections
+// that present a TLS client certificate.
+type CertBackend struct{}
+
+func (bkd *CertBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
+	return &CertSession{}, nil
+}
+
+type CertSession struct {
+	auth bool
+}
+
+func (s *CertSession) AuthMechanisms() []string {
+	return []string{sasl.Plain, sasl.External}
+}
+
+func (s *CertSession) Auth(mech string) (sasl.Server, error) {
+	switch strings.ToUpper(mech) {
+	case sasl.Plain:
+		return sasl.NewPlainServer(func(identity, username, password string) error {
+			if username != "username" || password != "password" {
+				return errors.New("Invalid username or password")
+			}
+			s.auth = true
+			return nil
+		}), nil
+	case sasl.External:
+		return sasl.NewExternalServer(func(identity string) error {
+			s.auth = true
+			return nil
+		}), nil
+	default:
+		return nil, smtp.ErrAuthUnknownMechanism
+	}
+}
+
+func (s *CertSession) Mail(from string, opts *smtp.MailOptions) error {
+	if !s.auth {
+		return smtp.ErrAuthRequired
+	}
+	log.Println("Mail from:", from)
+	return nil
+}
+
+func (s *CertSession) Rcpt(to string, opts *smtp.RcptOptions) error {
+	if !s.auth {
+		return smtp.ErrAuthRequired
+	}
+	log.Println("Rcpt to:", to)
+	return nil
+}
+
+func (s *CertSession) Data(r io.Reader) error {
+	if !s.auth {
+		return smtp.ErrAuthRequired
+	}
+	if b, err := io.ReadAll(r); err != nil {
+		return err
+	} else {
+		log.Println("Data:", string(b))
+	}
+	return nil
+}
+
+func (s *CertSession) Reset() {}
+
+func (s *CertSession) Logout() error {
+	return nil
+}
+
+// ExampleServer_authPolicy runs an SMTP server that only enables the
+// EXTERNAL mechanism for connections with a verified TLS client
+// certificate. PLAIN remains available on any TLS connection.
+func ExampleServer_authPolicy() {
+	be := &CertBackend{}
+
+	s := smtp.NewServer(be)
+
+	s.Addr = "localhost:1465"
+	s.Domain = "localhost"
+	s.TLSConfig = &tls.Config{
+		// Certificates: serverCert,
+		ClientAuth: tls.RequireAnyClientCert,
+	}
+	// Filter the backend's mechanisms based on the live connection state:
+	// EXTERNAL is only allowed once the client has presented a certificate.
+	s.AuthPolicy = func(c *smtp.Conn, mech string) bool {
+		if !strings.EqualFold(mech, sasl.External) {
+			return true
+		}
+		state, ok := c.TLSConnectionState()
+		return ok && len(state.PeerCertificates) > 0
+	}
+
+	log.Println("Starting TLS server at", s.Addr)
+	if err := s.ListenAndServeTLS(); err != nil {
 		log.Fatal(err)
 	}
 }

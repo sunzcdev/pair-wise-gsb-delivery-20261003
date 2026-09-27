@@ -4,11 +4,18 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"math/big"
 	"net"
 	"strings"
 	"sync"
@@ -29,6 +36,7 @@ type message struct {
 
 type backend struct {
 	authDisabled bool
+	authMechs    []string
 
 	messages []*message
 	anonmsgs []*message
@@ -77,6 +85,9 @@ var _ smtp.AuthSession = (*session)(nil)
 func (s *session) AuthMechanisms() []string {
 	if s.backend.authDisabled {
 		return nil
+	}
+	if s.backend.authMechs != nil {
+		return s.backend.authMechs
 	}
 	return []string{sasl.Plain}
 }
@@ -1795,4 +1806,248 @@ func TestServerMTPRIORITY(t *testing.T) {
 	if *opts.MTPriority != expectedPriority {
 		t.Fatalf("MTPriority: want %d, got %d", expectedPriority, *opts.MTPriority)
 	}
+}
+
+// ehloCaps issues an EHLO command on an already-greeted connection and
+// returns the advertised capabilities.
+func ehloCaps(t *testing.T, c net.Conn, scanner *bufio.Scanner) map[string]bool {
+	t.Helper()
+
+	io.WriteString(c, "EHLO localhost\r\n")
+
+	scanner.Scan()
+	if scanner.Text() != "250-Hello localhost" {
+		t.Fatal("Invalid EHLO response:", scanner.Text())
+	}
+
+	caps := make(map[string]bool)
+	for scanner.Scan() {
+		s := scanner.Text()
+		if strings.HasPrefix(s, "250 ") {
+			caps[strings.TrimPrefix(s, "250 ")] = true
+			break
+		}
+		if !strings.HasPrefix(s, "250-") {
+			t.Fatal("Invalid capability response:", s)
+		}
+		caps[strings.TrimPrefix(s, "250-")] = true
+	}
+	return caps
+}
+
+func TestServerAuthPolicy(t *testing.T) {
+	requireTLS := func(s *smtp.Server) {
+		s.AuthPolicy = func(c *smtp.Conn, mech string) bool {
+			_, isTLS := c.TLSConnectionState()
+			return isTLS
+		}
+	}
+	_, s, c, scanner, caps := testServerEhlo(t, requireTLS)
+	defer s.Close()
+
+	if _, ok := caps["AUTH PLAIN"]; ok {
+		t.Fatal("AUTH PLAIN must not be advertised when AuthPolicy disallows it")
+	}
+
+	// The policy must be enforced during AUTH execution too, not only
+	// hidden from the EHLO response.
+	io.WriteString(c, "AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "504 ") {
+		t.Fatal("AUTH PLAIN must be rejected when AuthPolicy disallows it:", scanner.Text())
+	}
+}
+
+func TestServerAuthPolicyMechCase(t *testing.T) {
+	mixedCase := func(s *smtp.Server) {
+		s.Backend.(*backend).authMechs = []string{"Plain"}
+		s.AuthPolicy = func(c *smtp.Conn, mech string) bool {
+			return strings.EqualFold(mech, "PLAIN")
+		}
+	}
+	_, s, c, scanner, caps := testServerEhlo(t, mixedCase)
+	defer s.Close()
+
+	if _, ok := caps["AUTH Plain"]; !ok {
+		t.Fatal("AUTH Plain capability is missing:", caps)
+	}
+
+	// Mechanism names must be matched case-insensitively when executing
+	// the AUTH command.
+	io.WriteString(c, "AUTH pLaIn AHVzZXJuYW1lAHBhc3N3b3Jk\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "235 ") {
+		t.Fatal("Invalid AUTH response:", scanner.Text())
+	}
+}
+
+func TestServerAuthSASLAbort(t *testing.T) {
+	_, s, c, scanner, caps := testServerEhlo(t)
+	defer s.Close()
+
+	if _, ok := caps["AUTH PLAIN"]; !ok {
+		t.Fatal("AUTH PLAIN capability is missing when auth is enabled")
+	}
+
+	io.WriteString(c, "AUTH PLAIN\r\n")
+	scanner.Scan()
+	if scanner.Text() != "334 " {
+		t.Fatal("Invalid AUTH response:", scanner.Text())
+	}
+
+	// Abort the SASL negotiation, then make sure a new attempt still works.
+	io.WriteString(c, "*\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "501 ") {
+		t.Fatal("Invalid AUTH abort response:", scanner.Text())
+	}
+
+	io.WriteString(c, "AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "235 ") {
+		t.Fatal("Invalid AUTH response after abort:", scanner.Text())
+	}
+}
+
+func generateTestClientCert(t *testing.T) tls.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// testServerCert is a PEM-encoded self-signed TLS cert for 127.0.0.1 and
+// example.com, generated with crypto/tls/generate_cert.go.
+var testServerCert = []byte(`
+-----BEGIN CERTIFICATE-----
+MIICFDCCAX2gAwIBAgIRAK0xjnaPuNDSreeXb+z+0u4wDQYJKoZIhvcNAQELBQAw
+EjEQMA4GA1UEChMHQWNtZSBDbzAgFw03MDAxMDEwMDAwMDBaGA8yMDg0MDEyOTE2
+MDAwMFowEjEQMA4GA1UEChMHQWNtZSBDbzCBnzANBgkqhkiG9w0BAQEFAAOBjQAw
+gYkCgYEA0nFbQQuOWsjbGtejcpWz153OlziZM4bVjJ9jYruNw5n2Ry6uYQAffhqa
+JOInCmmcVe2siJglsyH9aRh6vKiobBbIUXXUU1ABd56ebAzlt0LobLlx7pZEMy30
+LqIi9E6zmL3YvdGzpYlkFRnRrqwEtWYbGBf3znO250S56CCWH2UCAwEAAaNoMGYw
+DgYDVR0PAQH/BAQDAgKkMBMGA1UdJQQMMAoGCCsGAQUFBwMBMA8GA1UdEwEB/wQF
+MAMBAf8wLgYDVR0RBCcwJYILZXhhbXBsZS5jb22HBH8AAAGHEAAAAAAAAAAAAAAA
+AAAAAAEwDQYJKoZIhvcNAQELBQADgYEAbZtDS2dVuBYvb+MnolWnCNqvw1w5Gtgi
+NmvQQPOMgM3m+oQSCPRTNGSg25e1Qbo7bgQDv8ZTnq8FgOJ/rbkyERw2JckkHpD4
+n4qcK27WkEDBtQFlPihIM8hLIuzWoi/9wygiElTy/tVL3y7fGCvY2/k1KBthtZGF
+tN8URjVmyEo=
+-----END CERTIFICATE-----`)
+
+// testServerKey is the private key for testServerCert.
+var testServerKey = []byte(`
+-----BEGIN RSA PRIVATE KEY-----
+MIICXgIBAAKBgQDScVtBC45ayNsa16NylbPXnc6XOJkzhtWMn2Niu43DmfZHLq5h
+AB9+Gpok4icKaZxV7ayImCWzIf1pGHq8qKhsFshRddRTUAF3np5sDOW3QuhsuXHu
+lkQzLfQuoiL0TrOYvdi90bOliWQVGdGurAS1ZhsYF/fOc7bnRLnoIJYfZQIDAQAB
+AoGBAMst7OgpKyFV6c3JwyI/jWqxDySL3caU+RuTTBaodKAUx2ZEmNJIlx9eudLA
+kucHvoxsM/eRxlxkhdFxdBcwU6J+zqooTnhu/FE3jhrT1lPrbhfGhyKnUrB0KKMM
+VY3IQZyiehpxaeXAwoAou6TbWoTpl9t8ImAqAMY8hlULCUqlAkEA+9+Ry5FSYK/m
+542LujIcCaIGoG1/Te6Sxr3hsPagKC2rH20rDLqXwEedSFOpSS0vpzlPAzy/6Rbb
+PHTJUhNdwwJBANXkA+TkMdbJI5do9/mn//U0LfrCR9NkcoYohxfKz8JuhgRQxzF2
+6jpo3q7CdTuuRixLWVfeJzcrAyNrVcBq87cCQFkTCtOMNC7fZnCTPUv+9q1tcJyB
+vNjJu3yvoEZeIeuzouX9TJE21/33FaeDdsXbRhQEj23cqR38qFHsF1qAYNMCQQDP
+QXLEiJoClkR2orAmqjPLVhR3t2oB3INcnEjLNSq8LHyQEfXyaFfu4U9l5+fRPL2i
+jiC0k/9L5dHUsF0XZothAkEA23ddgRs+Id/HxtojqqUT27B8MT/IGNrYsp4DvS/c
+qgkeluku4GjxRlDMBuXk94xOBEinUs+p/hwP1Alll80Tpg==
+-----END RSA PRIVATE KEY-----`)
+
+func TestServerAuthPolicyClientCert(t *testing.T) {
+	keypair, err := tls.X509KeyPair(testServerCert, testServerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCert := generateTestClientCert(t)
+
+	requireClientCert := func(s *smtp.Server) {
+		s.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{keypair},
+			ClientAuth:   tls.RequestClientCert,
+		}
+		s.AuthPolicy = func(c *smtp.Conn, mech string) bool {
+			state, isTLS := c.TLSConnectionState()
+			return isTLS && len(state.PeerCertificates) > 0
+		}
+	}
+
+	startTLS := func(t *testing.T, c net.Conn, scanner *bufio.Scanner, certs ...tls.Certificate) (net.Conn, *bufio.Scanner) {
+		t.Helper()
+
+		io.WriteString(c, "STARTTLS\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "220 ") {
+			t.Fatal("Invalid STARTTLS response:", scanner.Text())
+		}
+
+		tlsConn := tls.Client(c, &tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:     certs,
+		})
+		if err := tlsConn.Handshake(); err != nil {
+			t.Fatal("TLS handshake failed:", err)
+		}
+		return tlsConn, bufio.NewScanner(tlsConn)
+	}
+
+	t.Run("WithoutClientCert", func(t *testing.T) {
+		_, s, c, scanner, caps := testServerEhlo(t, requireClientCert)
+		defer s.Close()
+
+		if _, ok := caps["AUTH PLAIN"]; ok {
+			t.Fatal("AUTH PLAIN must not be advertised before STARTTLS")
+		}
+		if _, ok := caps["STARTTLS"]; !ok {
+			t.Fatal("STARTTLS capability is missing")
+		}
+
+		// Capabilities are recomputed after STARTTLS: without a client
+		// certificate the mechanism stays disallowed.
+		c, scanner = startTLS(t, c, scanner)
+		caps = ehloCaps(t, c, scanner)
+		if _, ok := caps["AUTH PLAIN"]; ok {
+			t.Fatal("AUTH PLAIN must not be advertised without a client certificate")
+		}
+
+		io.WriteString(c, "AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "504 ") {
+			t.Fatal("AUTH PLAIN must be rejected without a client certificate:", scanner.Text())
+		}
+	})
+
+	t.Run("WithClientCert", func(t *testing.T) {
+		_, s, c, scanner, caps := testServerEhlo(t, requireClientCert)
+		defer s.Close()
+
+		if _, ok := caps["AUTH PLAIN"]; ok {
+			t.Fatal("AUTH PLAIN must not be advertised before STARTTLS")
+		}
+
+		c, scanner = startTLS(t, c, scanner, clientCert)
+		caps = ehloCaps(t, c, scanner)
+		if _, ok := caps["AUTH PLAIN"]; !ok {
+			t.Fatal("AUTH PLAIN capability is missing with a client certificate:", caps)
+		}
+
+		io.WriteString(c, "AUTH PLAIN AHVzZXJuYW1lAHBhc3N3b3Jk\r\n")
+		scanner.Scan()
+		if !strings.HasPrefix(scanner.Text(), "235 ") {
+			t.Fatal("Invalid AUTH response:", scanner.Text())
+		}
+	})
 }
