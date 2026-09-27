@@ -805,14 +805,56 @@ func (m *Memberlist) nextSeqNo() uint32 {
 	return atomic.AddUint32(&m.sequenceNum, 1)
 }
 
-// nextIncarnation returns the next incarnation number in a thread safe way
-func (m *Memberlist) nextIncarnation() uint32 {
-	return m.incarnation.Add(1)
+// nextIncarnation returns the next incarnation number in a thread safe way.
+// When an IncarnationStore is configured, it reserves and persists a new
+// batch of incarnations if the current reservation has been used up, and
+// returns an error if the reservation fails or the uint32 space is
+// exhausted.
+func (m *Memberlist) nextIncarnation() (uint32, error) {
+	if m.config.IncarnationStore == nil {
+		return m.incarnation.Add(1), nil
+	}
+
+	m.incarnationLock.Lock()
+	defer m.incarnationLock.Unlock()
+	current := m.incarnation.Load()
+	if current == math.MaxUint32 {
+		return 0, fmt.Errorf("cannot allocate incarnation beyond the uint32 range: %w",
+			ErrIncarnationExhausted)
+	}
+	next := current + 1
+	if next > m.incarnationReserved {
+		if err := m.reserveIncarnationsLocked(next); err != nil {
+			return 0, err
+		}
+	}
+	m.incarnation.Store(next)
+	return next, nil
 }
 
 // skipIncarnation adds the positive offset to the incarnation number.
-func (m *Memberlist) skipIncarnation(offset uint32) uint32 {
-	return m.incarnation.Add(offset)
+// Like nextIncarnation, it reserves and persists additional incarnations
+// first when an IncarnationStore is configured.
+func (m *Memberlist) skipIncarnation(offset uint32) (uint32, error) {
+	if m.config.IncarnationStore == nil {
+		return m.incarnation.Add(offset), nil
+	}
+
+	m.incarnationLock.Lock()
+	defer m.incarnationLock.Unlock()
+	current := m.incarnation.Load()
+	if uint64(current)+uint64(offset) > math.MaxUint32 {
+		return 0, fmt.Errorf("cannot skip %d incarnations from %d beyond the uint32 range: %w",
+			offset, current, ErrIncarnationExhausted)
+	}
+	next := current + offset
+	if next > m.incarnationReserved {
+		if err := m.reserveIncarnationsLocked(next); err != nil {
+			return 0, err
+		}
+	}
+	m.incarnation.Store(next)
+	return next, nil
 }
 
 // estNumNodes is used to get the current estimate of the number of nodes
@@ -909,11 +951,17 @@ func (m *Memberlist) invokeNackHandler(nack nackResp) {
 // accusedInc value, or you can supply 0 to just get the next incarnation number.
 // This alters the node state that's passed in so this MUST be called while the
 // nodeLock is held.
-func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
+func (m *Memberlist) refute(me *nodeState, accusedInc uint32) error {
 	// Make sure the incarnation number beats the accusation.
-	inc := m.nextIncarnation()
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		return err
+	}
 	if accusedInc >= inc {
-		inc = m.skipIncarnation(accusedInc - inc + 1)
+		inc, err = m.skipIncarnation(accusedInc - inc + 1)
+		if err != nil {
+			return err
+		}
 	}
 	me.Incarnation = inc
 
@@ -933,6 +981,7 @@ func (m *Memberlist) refute(me *nodeState, accusedInc uint32) {
 		},
 	}
 	m.encodeAndBroadcast(me.Addr.String(), aliveMsg, a)
+	return nil
 }
 
 // aliveNode is invoked by the network layer when we get a message about a
@@ -1110,7 +1159,10 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 			bytes.Equal(a.Vsn, versions) {
 			return
 		}
-		m.refute(state, a.Incarnation)
+		if err := m.refute(state, a.Incarnation); err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed to refute an alive message for '%s': %v", a.Node, err)
+			return
+		}
 		m.logger.Printf("[WARN] memberlist: Refuting an alive message for '%s' (%v:%d) meta:(%v VS %v), vsn:(%v VS %v)", a.Node, net.IP(a.Addr), a.Port, a.Meta, state.Meta, a.Vsn, versions)
 	} else {
 		m.encodeBroadcastNotify(a.Node, aliveMsg, a, notify)
@@ -1187,7 +1239,10 @@ func (m *Memberlist) suspectNode(s *suspect) {
 
 	// If this is us we need to refute, otherwise re-broadcast
 	if state.Name == m.config.Name {
-		m.refute(state, s.Incarnation)
+		if err := m.refute(state, s.Incarnation); err != nil {
+			m.logger.Printf("[ERR] memberlist: Failed to refute a suspect message (from: %s): %v", s.From, err)
+			return
+		}
 		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (from: %s)", s.From)
 		return // Do not mark ourself suspect
 	} else {
@@ -1274,7 +1329,10 @@ func (m *Memberlist) deadNode(d *dead) {
 	if state.Name == m.config.Name {
 		// If we are not leaving we need to refute
 		if !m.hasLeft() {
-			m.refute(state, d.Incarnation)
+			if err := m.refute(state, d.Incarnation); err != nil {
+				m.logger.Printf("[ERR] memberlist: Failed to refute a dead message (from: %s): %v", d.From, err)
+				return
+			}
 			m.logger.Printf("[WARN] memberlist: Refuting a dead message (from: %s)", d.From)
 			return // Do not mark ourself dead
 		}

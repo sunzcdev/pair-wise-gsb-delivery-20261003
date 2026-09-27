@@ -44,6 +44,9 @@ type Memberlist struct {
 	numNodes    atomic.Uint32 // Number of known nodes (estimate)
 	pushPullReq atomic.Uint32 // Number of push/pull requests
 
+	incarnationLock     sync.Mutex // Serializes incarnation reservation
+	incarnationReserved uint32     // Highest incarnation persisted to the store
+
 	advertiseLock sync.RWMutex
 	advertiseAddr net.IP
 	advertisePort uint16
@@ -224,6 +227,12 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	}
 	m.broadcasts.NumNodes = func() int {
 		return m.estNumNodes()
+	}
+
+	// Restore and reserve the local incarnation before announcing
+	// ourselves so a restarted node never publishes a stale incarnation.
+	if err := m.initIncarnation(); err != nil {
+		return nil, err
 	}
 
 	// Get the final advertise address from the transport, which may need
@@ -452,6 +461,11 @@ func (m *Memberlist) setAlive() error {
 		m.logger.Printf("[WARN] memberlist: Binding to public address without encryption!")
 	}
 
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		return fmt.Errorf("failed to allocate incarnation: %w", err)
+	}
+
 	// Set any metadata from the delegate.
 	var meta []byte
 	if m.config.Delegate != nil {
@@ -462,7 +476,7 @@ func (m *Memberlist) setAlive() error {
 	}
 
 	a := alive{
-		Incarnation: m.nextIncarnation(),
+		Incarnation: inc,
 		Node:        m.config.Name,
 		Addr:        addr,
 		Port:        uint16(port),
@@ -525,9 +539,14 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 	state := m.nodeMap[m.config.Name]
 	m.nodeLock.RUnlock()
 
+	inc, err := m.nextIncarnation()
+	if err != nil {
+		return fmt.Errorf("failed to allocate incarnation: %w", err)
+	}
+
 	// Format a new alive message
 	a := alive{
-		Incarnation: m.nextIncarnation(),
+		Incarnation: inc,
 		Node:        m.config.Name,
 		Addr:        state.Addr,
 		Port:        state.Port,

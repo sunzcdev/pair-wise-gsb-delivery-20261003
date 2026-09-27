@@ -266,6 +266,25 @@ type Config struct {
 	// go-msgpack v1.1.5 by default). Decoding is not affected, as all
 	// go-msgpack v2.1.0+ decoders know how to decode both formats.
 	MsgpackUseNewTimeFormat bool
+
+	// IncarnationStore is an optional persistence provider for the local
+	// node's incarnation number. When set, the incarnation is restored on
+	// startup and reserved ahead in batches, so that a restarted process
+	// reusing the same node name never publishes an incarnation lower than
+	// one its previous process already used. This prevents stale alive,
+	// suspect and dead messages still circulating in the network from
+	// overriding the restarted node's fresh state.
+	//
+	// If nil (the default), the incarnation is kept in memory only and
+	// behavior is unchanged from previous versions.
+	IncarnationStore IncarnationStore
+
+	// IncarnationReserveBatch controls how many incarnation numbers are
+	// reserved (and persisted to IncarnationStore) at a time. Larger
+	// batches reduce the number of disk writes at the cost of skipping up
+	// to this many incarnation numbers on each restart. Only used when
+	// IncarnationStore is set. Defaults to DefaultIncarnationReserveBatch.
+	IncarnationReserveBatch uint32
 }
 
 // ParseCIDRs return a possible empty list of all Network that have been parsed
