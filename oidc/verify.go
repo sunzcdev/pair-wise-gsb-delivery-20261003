@@ -310,28 +310,35 @@ func (v *IDTokenVerifier) verifyJWT(ctx context.Context, rawIDToken string) ([]b
 
 	// Parse and verify the signature first. This at least forces the user to have
 	// a valid, signed ID token before we do any other processing.
-	jws, err := jose.ParseSigned(rawIDToken, supportedSigAlgs)
+	return parseAndVerifyJWT(ctx, v.keySet, rawIDToken, supportedSigAlgs, v.config.InsecureSkipSignatureCheck)
+}
+
+// parseAndVerifyJWT parses a raw JWT, verifies its signature against the key
+// set, and returns the payload and signature. Header and claim validation is
+// left to the caller.
+func parseAndVerifyJWT(ctx context.Context, keySet KeySet, rawToken string, supportedSigAlgs []jose.SignatureAlgorithm, insecureSkipSignatureCheck bool) ([]byte, jose.Signature, error) {
+	jws, err := jose.ParseSigned(rawToken, supportedSigAlgs)
 	if err != nil {
 		return nil, jose.Signature{}, fmt.Errorf("oidc: malformed jwt: %v", err)
 	}
 	switch len(jws.Signatures) {
 	case 0:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: id token not signed")
+		return nil, jose.Signature{}, fmt.Errorf("oidc: token not signed")
 	case 1:
 	default:
-		return nil, jose.Signature{}, fmt.Errorf("oidc: multiple signatures on id token not supported")
+		return nil, jose.Signature{}, fmt.Errorf("oidc: multiple signatures on token not supported")
 	}
 	sig := jws.Signatures[0]
 
 	var payload []byte
-	if v.config.InsecureSkipSignatureCheck {
+	if insecureSkipSignatureCheck {
 		// Yolo mode.
 		payload = jws.UnsafePayloadWithoutVerification()
 	} else {
 		// The JWT is attached here for the happy path to avoid the verifier from
 		// having to parse the JWT twice.
 		ctx = context.WithValue(ctx, parsedJWTKey, jws)
-		payload, err = v.keySet.VerifySignature(ctx, rawIDToken)
+		payload, err = keySet.VerifySignature(ctx, rawToken)
 		if err != nil {
 			return nil, jose.Signature{}, fmt.Errorf("failed to verify signature: %v", err)
 		}
