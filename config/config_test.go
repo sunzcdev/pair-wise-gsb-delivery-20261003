@@ -136,6 +136,18 @@ func TestLoadBadConfigs(t *testing.T) {
 			input: "testdata/invalid-grpc-check-revoked-without-tls.yml",
 			want:  `error parsing config file: check_revoked cannot be used when tls is false`,
 		},
+		{
+			input: "testdata/invalid-probe-all-addresses-policy.yml",
+			want:  `error parsing config file: probe_all_addresses success_policy 'most' is not valid, must be one of all, any, ratio`,
+		},
+		{
+			input: "testdata/invalid-probe-all-addresses-ratio.yml",
+			want:  `error parsing config file: probe_all_addresses min_success_ratio must be in the (0, 1] range, got 1.500000`,
+		},
+		{
+			input: "testdata/invalid-probe-all-addresses-unix.yml",
+			want:  `error parsing config file: probe_all_addresses is not supported for the unix prober`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

@@ -1,0 +1,8 @@
+modules:
+  http_all_addresses:
+    prober: http
+    timeout: 5s
+    probe_all_addresses:
+      enabled: true
+      success_policy: ratio
+      min_success_ratio: 1.5

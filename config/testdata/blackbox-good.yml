@@ -1,4 +1,13 @@
 modules:
+  http_all_addresses:
+    prober: http
+    timeout: 10s
+    probe_all_addresses:
+      enabled: true
+      max_addresses: 8
+      max_parallel: 4
+      success_policy: ratio
+      min_success_ratio: 0.5
   http_2xx:
     prober: http
     timeout: 5s

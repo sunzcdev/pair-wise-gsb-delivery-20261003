@@ -29,6 +29,24 @@ var protocolToGauge = map[string]float64{
 	"ip6": 6,
 }
 
+// forcedIPAddrContextKey is the context key used to pin a probe to a
+// specific, pre-resolved IP address. It is used by the
+// probe_all_addresses mode so that every candidate address is dialed
+// directly while the target hostname is kept for the Host header and
+// the TLS server name.
+type forcedIPAddrContextKey struct{}
+
+// WithForcedIPAddr returns a context that makes chooseProtocol return
+// the given IP address without performing a DNS lookup.
+func WithForcedIPAddr(ctx context.Context, ip *net.IPAddr) context.Context {
+	return context.WithValue(ctx, forcedIPAddrContextKey{}, ip)
+}
+
+func forcedIPAddrFromContext(ctx context.Context) *net.IPAddr {
+	ip, _ := ctx.Value(forcedIPAddrContextKey{}).(*net.IPAddr)
+	return ip
+}
+
 // Returns the IP for the IPProtocol and lookup time.
 func chooseProtocol(ctx context.Context, IPProtocol string, fallbackIPProtocol bool, target string, registry *prometheus.Registry, logger *slog.Logger) (ip *net.IPAddr, lookupTime float64, err error) {
 	var fallbackProtocol string
@@ -49,6 +67,17 @@ func chooseProtocol(ctx context.Context, IPProtocol string, fallbackIPProtocol b
 	registry.MustRegister(probeIPProtocolGauge)
 	registry.MustRegister(probeDNSLookupTimeSeconds)
 	registry.MustRegister(probeIPAddrHash)
+
+	if forced := forcedIPAddrFromContext(ctx); forced != nil {
+		if forced.IP.To4() != nil {
+			probeIPProtocolGauge.Set(4)
+		} else {
+			probeIPProtocolGauge.Set(6)
+		}
+		probeIPAddrHash.Set(ipHash(forced.IP))
+		logger.Debug("Using pre-resolved target address", "target", target, "ip", forced.IP.String())
+		return forced, 0.0, nil
+	}
 
 	if IPProtocol == "ip6" || IPProtocol == "" {
 		IPProtocol = "ip6"

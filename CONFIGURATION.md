@@ -70,6 +70,52 @@ then a single address is selected to test, using the following logic:
   [ unix: <unix_probe> ]
   [ websocket: <websocket_probe> ]
 
+  # Probe every resolved address of the target instead of a single one.
+  [ probe_all_addresses: <probe_all_addresses> ]
+
+```
+
+### `<probe_all_addresses>`
+
+When enabled, the target hostname is resolved once into a fixed set of
+candidate addresses and every candidate is probed individually within the
+module's total timeout budget. Each connection is dialed to the candidate
+IP address directly, while the HTTP `Host` header and the TLS server name
+keep using the original target hostname. This mode is not supported for
+the `unix` prober.
+
+The overall probe result is derived from the per-address results according
+to the configured success policy. Metrics are aggregate counts only
+(`probe_addresses_total`, `probe_addresses_succeeded`,
+`probe_addresses_failed`, `probe_addresses_untested`); per-address details
+are available in the bounded diagnostic log output (see the `debug` query
+parameter).
+
+With the `any` policy the remaining addresses are skipped as soon as one
+address succeeds; with `all` they are skipped as soon as one fails.
+Skipped addresses - and probes cancelled when the total time budget runs
+out - are reported as `untested` and never count as successes.
+
+```yml
+  # Whether to probe every resolved address of the target.
+  [ enabled: <boolean> | default = false ]
+
+  # Maximum number of resolved addresses to probe.
+  [ max_addresses: <int> | default = 16 ]
+
+  # Maximum number of addresses probed concurrently. All per-address
+  # probes share the module timeout as a total time budget.
+  [ max_parallel: <int> | default = 4 ]
+
+  # How per-address results aggregate into the overall result:
+  # all: every address must succeed.
+  # any: at least one address must succeed.
+  # ratio: at least min_success_ratio of the addresses must succeed.
+  [ success_policy: <string> | default = "all" ]
+
+  # Minimum fraction of addresses that must succeed when success_policy
+  # is "ratio". Must be in the (0, 1] range.
+  [ min_success_ratio: <float> | default = 0.5 ]
 ```
 
 ### `<http_probe>`

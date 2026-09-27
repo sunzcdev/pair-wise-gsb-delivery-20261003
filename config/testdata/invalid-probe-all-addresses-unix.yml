@@ -1,0 +1,6 @@
+modules:
+  unix_all_addresses:
+    prober: unix
+    timeout: 5s
+    probe_all_addresses:
+      enabled: true

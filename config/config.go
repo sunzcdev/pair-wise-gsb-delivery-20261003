@@ -44,12 +44,13 @@ import (
 var (
 	// DefaultModule set default configuration for the Module
 	DefaultModule = Module{
-		HTTP:      DefaultHTTPProbe,
-		TCP:       DefaultTCPProbe,
-		ICMP:      DefaultICMPProbe,
-		DNS:       DefaultDNSProbe,
-		Unix:      DefaultUnixProbe,
-		Websocket: DefaultWebsocketProbe,
+		HTTP:              DefaultHTTPProbe,
+		TCP:               DefaultTCPProbe,
+		ICMP:              DefaultICMPProbe,
+		DNS:               DefaultDNSProbe,
+		Unix:              DefaultUnixProbe,
+		Websocket:         DefaultWebsocketProbe,
+		ProbeAllAddresses: DefaultProbeAllAddresses,
 	}
 
 	// DefaultHTTPProbe set default value for HTTPProbe
@@ -89,6 +90,21 @@ var (
 	DefaultWebsocketProbe = WebsocketProbe{
 		IPProtocolFallback: true,
 	}
+
+	// DefaultProbeAllAddresses set default value for ProbeAllAddresses
+	DefaultProbeAllAddresses = ProbeAllAddresses{
+		MaxAddresses:    16,
+		MaxParallel:     4,
+		SuccessPolicy:   SuccessPolicyAll,
+		MinSuccessRatio: 0.5,
+	}
+)
+
+// Success policies for the probe_all_addresses mode.
+const (
+	SuccessPolicyAll   = "all"
+	SuccessPolicyAny   = "any"
+	SuccessPolicyRatio = "ratio"
 )
 
 type Config struct {
@@ -294,15 +310,40 @@ func MustNewRegexp(s string) Regexp {
 }
 
 type Module struct {
-	Prober    string         `yaml:"prober,omitempty" json:"prober,omitempty"`
-	Timeout   time.Duration  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	HTTP      HTTPProbe      `yaml:"http,omitempty" json:"http,omitzero"`
-	TCP       TCPProbe       `yaml:"tcp,omitempty" json:"tcp,omitzero"`
-	ICMP      ICMPProbe      `yaml:"icmp,omitempty" json:"icmp,omitzero"`
-	DNS       DNSProbe       `yaml:"dns,omitempty" json:"dns,omitzero"`
-	GRPC      GRPCProbe      `yaml:"grpc,omitempty" json:"grpc,omitzero"`
-	Unix      UnixProbe      `yaml:"unix,omitempty" json:"unix,omitzero"`
-	Websocket WebsocketProbe `yaml:"websocket,omitempty" json:"websocket,omitzero"`
+	Prober            string            `yaml:"prober,omitempty" json:"prober,omitempty"`
+	Timeout           time.Duration     `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	HTTP              HTTPProbe         `yaml:"http,omitempty" json:"http,omitzero"`
+	TCP               TCPProbe          `yaml:"tcp,omitempty" json:"tcp,omitzero"`
+	ICMP              ICMPProbe         `yaml:"icmp,omitempty" json:"icmp,omitzero"`
+	DNS               DNSProbe          `yaml:"dns,omitempty" json:"dns,omitzero"`
+	GRPC              GRPCProbe         `yaml:"grpc,omitempty" json:"grpc,omitzero"`
+	Unix              UnixProbe         `yaml:"unix,omitempty" json:"unix,omitzero"`
+	Websocket         WebsocketProbe    `yaml:"websocket,omitempty" json:"websocket,omitzero"`
+	ProbeAllAddresses ProbeAllAddresses `yaml:"probe_all_addresses,omitempty" json:"probe_all_addresses,omitzero"`
+}
+
+// ProbeAllAddresses configures the "probe all resolved addresses" mode.
+// When enabled, the target hostname is resolved once to a fixed set of
+// candidate addresses and every candidate is probed individually (the
+// connection is made to the candidate IP while the Host header and the
+// TLS server name keep using the original hostname). The overall probe
+// result is derived from the per-address results according to the
+// configured success policy.
+type ProbeAllAddresses struct {
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MaxAddresses caps the number of resolved addresses that are probed.
+	MaxAddresses int `yaml:"max_addresses,omitempty" json:"max_addresses,omitempty"`
+	// MaxParallel caps how many addresses are probed concurrently. All
+	// probes share the module timeout as a total time budget.
+	MaxParallel int `yaml:"max_parallel,omitempty" json:"max_parallel,omitempty"`
+	// SuccessPolicy decides how per-address results aggregate into the
+	// overall result: "all", "any" or "ratio".
+	SuccessPolicy string `yaml:"success_policy,omitempty" json:"success_policy,omitempty"`
+	// MinSuccessRatio is the minimum fraction of addresses that must
+	// succeed when SuccessPolicy is "ratio". Addresses that were not
+	// tested (e.g. cancelled early or out of time budget) never count
+	// as successes.
+	MinSuccessRatio float64 `yaml:"min_success_ratio,omitempty" json:"min_success_ratio,omitempty"`
 }
 
 type HTTPProbe struct {
@@ -438,11 +479,36 @@ func (s *Module) UnmarshalYAML(unmarshal func(any) error) error {
 	switch s.Prober {
 	case "http", "tcp", "icmp", "dns", "grpc", "unix", "websocket":
 		// valid
-		return nil
 	default:
 		// invalid
 		return fmt.Errorf("prober '%s' is not valid", s.Prober)
 	}
+	return s.ProbeAllAddresses.validate(s.Prober)
+}
+
+func (p *ProbeAllAddresses) validate(prober string) error {
+	if !p.Enabled {
+		return nil
+	}
+	if prober == "unix" {
+		return fmt.Errorf("probe_all_addresses is not supported for the unix prober")
+	}
+	if p.MaxAddresses < 1 {
+		return fmt.Errorf("probe_all_addresses max_addresses must be at least 1, got %d", p.MaxAddresses)
+	}
+	if p.MaxParallel < 1 {
+		return fmt.Errorf("probe_all_addresses max_parallel must be at least 1, got %d", p.MaxParallel)
+	}
+	switch p.SuccessPolicy {
+	case SuccessPolicyAll, SuccessPolicyAny:
+	case SuccessPolicyRatio:
+		if p.MinSuccessRatio <= 0 || p.MinSuccessRatio > 1 {
+			return fmt.Errorf("probe_all_addresses min_success_ratio must be in the (0, 1] range, got %f", p.MinSuccessRatio)
+		}
+	default:
+		return fmt.Errorf("probe_all_addresses success_policy '%s' is not valid, must be one of all, any, ratio", p.SuccessPolicy)
+	}
+	return nil
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.

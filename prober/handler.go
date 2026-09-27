@@ -130,7 +130,12 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	registry.MustRegister(probeSuccessGauge)
 	registry.MustRegister(probeDurationGauge)
 	registry.MustRegister(probeTimeoutGauge)
-	success := prober(ctx, target, module, registry, slLogger)
+	var success bool
+	if module.ProbeAllAddresses.Enabled {
+		success = ProbeAllAddresses(ctx, target, module, registry, prober, slLogger)
+	} else {
+		success = prober(ctx, target, module, registry, slLogger)
+	}
 	duration := time.Since(start).Seconds()
 	probeDurationGauge.Set(duration)
 	probeTimeoutGauge.Set(timeoutSeconds)

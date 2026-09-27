@@ -1,0 +1,7 @@
+modules:
+  http_all_addresses:
+    prober: http
+    timeout: 5s
+    probe_all_addresses:
+      enabled: true
+      success_policy: most
