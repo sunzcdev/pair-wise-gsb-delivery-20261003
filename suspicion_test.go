@@ -199,3 +199,143 @@ func TestSuspicion_Timer_Immediate(t *testing.T) {
 		t.Fatalf("should have fired")
 	}
 }
+
+func TestSuspicion_Timer_FailureDomains(t *testing.T) {
+	const k = 3
+	const min = 400 * time.Millisecond
+	const max = 4400 * time.Millisecond
+
+	// With k = 3 a single independent confirmation drives the timeout to
+	// the midpoint: 4400ms - log(2)/log(4) * (4400ms - 400ms) = 2400ms,
+	// while k independent confirmations drive it all the way to min.
+	const singleDomainExpected = 2400 * time.Millisecond
+
+	run := func(t *testing.T, confirmations []string, domainOf func(string) (string, bool)) (time.Duration, int) {
+		ch := make(chan time.Duration, 1)
+		var numConfirmations int
+		start := time.Now()
+		f := func(n int) {
+			numConfirmations = n
+			ch <- time.Since(start)
+		}
+		s := newSuspicionWithDomain("me", k, min, max, f, domainOf)
+		for _, from := range confirmations {
+			s.Confirm(from)
+		}
+		select {
+		case d := <-ch:
+			return d, numConfirmations
+		case <-time.After(max + 2*time.Second):
+			t.Fatalf("should have fired")
+			return 0, 0
+		}
+	}
+
+	// Ten confirmations that all come from a single failure domain (for
+	// example, one rack that lost sight of the target) must count as only
+	// one independent confirmation.
+	oneRack := func(string) (string, bool) { return "rack-a", true }
+	singleDomainNodes := []string{"n0", "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9"}
+	singleElapsed, singleN := run(t, singleDomainNodes, oneRack)
+	if singleN != 1 {
+		t.Fatalf("single domain: bad independent confirmations %d != 1", singleN)
+	}
+	if singleElapsed < singleDomainExpected || singleElapsed > singleDomainExpected+500*time.Millisecond {
+		t.Fatalf("single domain: fired after %9.6f, expected around %9.6f",
+			singleElapsed.Seconds(), singleDomainExpected.Seconds())
+	}
+
+	// Three confirmations from three independent failure domains must
+	// drive the timer to the minimum.
+	racks := map[string]string{"n0": "rack-a", "n1": "rack-b", "n2": "rack-c"}
+	threeRacks := func(node string) (string, bool) {
+		rack, ok := racks[node]
+		return rack, ok
+	}
+	multiElapsed, multiN := run(t, []string{"n0", "n1", "n2"}, threeRacks)
+	if multiN != 3 {
+		t.Fatalf("three domains: bad independent confirmations %d != 3", multiN)
+	}
+	if multiElapsed > min+500*time.Millisecond {
+		t.Fatalf("three domains: fired after %9.6f, expected around %9.6f",
+			multiElapsed.Seconds(), min.Seconds())
+	}
+
+	// The correlated confirmations must result in a strictly later
+	// decision than the independent ones.
+	if multiElapsed >= singleElapsed {
+		t.Fatalf("three domains (%9.6f) should decide faster than one domain (%9.6f)",
+			multiElapsed.Seconds(), singleElapsed.Seconds())
+	}
+}
+
+func TestSuspicion_FailureDomain_NodeSwitchingDomains(t *testing.T) {
+	domains := map[string]string{"n1": "rack-a", "n2": "rack-b"}
+	domainOf := func(node string) (string, bool) {
+		domain, ok := domains[node]
+		return domain, ok
+	}
+	s := newSuspicionWithDomain("me", 3, 100*time.Millisecond, 30*time.Second, func(int) {}, domainOf)
+
+	if !s.Confirm("n1") {
+		t.Fatalf("first confirmation should be new info")
+	}
+	if n := s.n.Load(); n != 1 {
+		t.Fatalf("bad independent confirmations %d != 1", n)
+	}
+
+	// A node that switches domains mid-way must not bypass the dedup and
+	// count a second time.
+	domains["n1"] = "rack-c"
+	if s.Confirm("n1") {
+		t.Fatalf("confirmation from the same node should not be new info, even after a domain change")
+	}
+	if n := s.n.Load(); n != 1 {
+		t.Fatalf("domain switch must not add an independent confirmation, got %d", n)
+	}
+
+	// A different node in a new domain counts as independent.
+	if !s.Confirm("n2") {
+		t.Fatalf("confirmation from a new domain should be new info")
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("bad independent confirmations %d != 2", n)
+	}
+
+	// A different node in an already-seen domain is new info worth
+	// gossiping, but must not accelerate the timer.
+	domains["n3"] = "rack-a"
+	if !s.Confirm("n3") {
+		t.Fatalf("confirmation from a new node should be new info")
+	}
+	if n := s.n.Load(); n != 2 {
+		t.Fatalf("correlated confirmation must not add an independent confirmation, got %d", n)
+	}
+}
+
+func TestSuspicion_FailureDomain_MissingDomain(t *testing.T) {
+	// Nodes without any domain information fall back to plain node
+	// counting so missing data can never stall failure detection.
+	domainOf := func(string) (string, bool) { return "", false }
+
+	ch := make(chan int, 1)
+	start := time.Now()
+	s := newSuspicionWithDomain("me", 3, 400*time.Millisecond, 30*time.Second, func(n int) {
+		ch <- n
+	}, domainOf)
+	s.Confirm("n1")
+	s.Confirm("n2")
+	s.Confirm("n3")
+
+	select {
+	case n := <-ch:
+		if n != 3 {
+			t.Fatalf("bad independent confirmations %d != 3", n)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("should have fired near the minimum timeout, took %9.6f", elapsed.Seconds())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("should have fired")
+	}
+}

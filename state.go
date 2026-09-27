@@ -1242,7 +1242,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			m.deadNode(d)
 		}
 	}
-	m.nodeTimers[s.Node] = newSuspicion(s.From, k, min, max, fn)
+	m.nodeTimers[s.Node] = newSuspicionWithDomain(s.From, k, min, max, fn, m.config.FailureDomainFunc)
 }
 
 // deadNode is invoked by the network layer when we get a message

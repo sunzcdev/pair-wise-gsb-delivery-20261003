@@ -43,6 +43,19 @@ type suspicion struct {
 	// confirmations is a map of "from" nodes that have confirmed a given
 	// node is suspect. This prevents double counting.
 	confirmations map[string]struct{}
+
+	// domainOf is an optional function that maps a confirming node to the
+	// failure domain it belongs to (for example a rack or availability
+	// zone). When nil, every confirming node counts as an independent
+	// confirmation.
+	domainOf func(node string) (domain string, ok bool)
+
+	// domains tracks the failure domains that have already contributed an
+	// independent confirmation. Confirmations from additional nodes in an
+	// already-seen domain are correlated (for example, an entire rack that
+	// lost sight of the target together) and must not accelerate the timer
+	// further.
+	domains map[string]struct{}
 }
 
 // newSuspicion returns a timer started with the max time, and that will drive
@@ -51,11 +64,25 @@ type suspicion struct {
 // gossiped back to us. The minimum time will be used if no confirmations are
 // called for (k <= 0).
 func newSuspicion(from string, k int, min time.Duration, max time.Duration, fn func(int)) *suspicion {
+	return newSuspicionWithDomain(from, k, min, max, fn, nil)
+}
+
+// newSuspicionWithDomain is like newSuspicion but takes an optional function
+// that maps a confirming node to its failure domain. When domainOf is
+// non-nil, only the first confirmation from each distinct failure domain is
+// treated as independent and accelerates the timer; confirmations from
+// additional nodes in an already-seen domain are still recorded (so the
+// gossip keeps flowing) but do not accelerate the timer. Nodes whose domain
+// is unknown (domainOf returns ok == false) are each treated as independent
+// so that missing domain information can never stall failure detection.
+func newSuspicionWithDomain(from string, k int, min time.Duration, max time.Duration, fn func(int), domainOf func(string) (string, bool)) *suspicion {
 	s := &suspicion{
 		k:             int32(k),
 		min:           min,
 		max:           max,
 		confirmations: make(map[string]struct{}),
+		domainOf:      domainOf,
+		domains:       make(map[string]struct{}),
 	}
 
 	// Exclude the from node from any confirmations.
@@ -114,6 +141,23 @@ func (s *suspicion) Confirm(from string) bool {
 		return false
 	}
 	s.confirmations[from] = struct{}{}
+
+	// If failure domains are in play, decide whether this confirmation is
+	// independent. The dedup above is keyed by node name, so a node cannot
+	// gain another independent confirmation by reporting a different domain
+	// later. Nodes without any domain information are treated as
+	// independent so missing data falls back to plain node counting.
+	if s.domainOf != nil {
+		if domain, ok := s.domainOf(from); ok {
+			if _, seen := s.domains[domain]; seen {
+				// This is new information worth gossiping, but it is
+				// correlated with a confirmation we already counted, so
+				// it must not accelerate the timer.
+				return true
+			}
+			s.domains[domain] = struct{}{}
+		}
+	}
 
 	// Compute the new timeout given the current number of confirmations and
 	// adjust the timer. If the timeout becomes negative *and* we can cleanly

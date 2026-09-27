@@ -108,6 +108,24 @@ type Config struct {
 	// nodes failed in a reasonable amount of time.
 	SuspicionMaxTimeoutMult int
 
+	// FailureDomainFunc is an optional callback the application can provide
+	// to map a node name to the failure domain it belongs to (for example a
+	// rack or availability zone). When set, the suspicion mechanism treats
+	// confirmations from nodes in the same failure domain as correlated:
+	// only the first confirmation from each distinct domain accelerates the
+	// suspect timer. This protects against correlated failures, such as an
+	// entire rack losing sight of a node at once, being mistaken for many
+	// independent confirmations.
+	//
+	// Nodes for which the callback returns ok == false are each treated as
+	// independent confirmations, so missing domain information never stalls
+	// failure detection. The returned domain is an opaque label that is
+	// only ever compared for equality; applications are not required to
+	// expose real rack or zone names. When nil (the default), every
+	// confirming node counts as an independent confirmation, preserving the
+	// historical behavior.
+	FailureDomainFunc func(node string) (domain string, ok bool)
+
 	// PushPullInterval is the interval between complete state syncs.
 	// Complete state syncs are done with a single node over TCP and are
 	// quite expensive relative to standard gossiped messages. Setting this
