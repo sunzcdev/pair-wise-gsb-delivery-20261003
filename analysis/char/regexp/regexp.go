@@ -40,6 +40,32 @@ func (s *CharFilter) Filter(input []byte) []byte {
 	return s.r.ReplaceAll(input, s.replacement)
 }
 
+// FilterWithOffsetMapping filters the input and records how the offsets of
+// the output relate to the offsets of the input, so that token offsets can
+// be mapped back onto the original text. Each match of the regexp produces
+// a pair of anchors delimiting the replaced region; the bytes between
+// matches are copied through unchanged and map one-to-one.
+func (s *CharFilter) FilterWithOffsetMapping(input []byte) ([]byte, *analysis.OffsetMapping) {
+	matches := s.r.FindAllSubmatchIndex(input, -1)
+	if len(matches) == 0 {
+		return input, nil
+	}
+	out := make([]byte, 0, len(input))
+	anchors := make([]analysis.OffsetAnchor, 0, 2*len(matches)+2)
+	anchors = append(anchors, analysis.OffsetAnchor{Filtered: 0, Original: 0})
+	last := 0
+	for _, match := range matches {
+		out = append(out, input[last:match[0]]...)
+		anchors = append(anchors, analysis.OffsetAnchor{Filtered: len(out), Original: match[0]})
+		out = s.r.Expand(out, s.replacement, input, match)
+		anchors = append(anchors, analysis.OffsetAnchor{Filtered: len(out), Original: match[1]})
+		last = match[1]
+	}
+	out = append(out, input[last:]...)
+	anchors = append(anchors, analysis.OffsetAnchor{Filtered: len(out), Original: len(input)})
+	return out, analysis.NewOffsetMapping(anchors)
+}
+
 func CharFilterConstructor(config map[string]interface{}, cache *registry.Cache) (analysis.CharFilter, error) {
 	regexpStr, ok := config["regexp"].(string)
 	if !ok {

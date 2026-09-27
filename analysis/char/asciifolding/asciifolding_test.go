@@ -17,7 +17,9 @@ package asciifolding
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestAsciiFoldingFilter(t *testing.T) {
@@ -120,5 +122,72 @@ func TestAsciiFoldingFilter(t *testing.T) {
 				t.Errorf("\nExpected:\n`%s`\ngot:\n`%s`\n", string(test.output), string(output))
 			}
 		})
+	}
+}
+
+func TestFilterWithOffsetMapping(t *testing.T) {
+	tests := []struct {
+		input    string
+		filtered string
+		// spans of the filtered text and what they map back to in the input
+		spans map[string]string
+	}{
+		{
+			input:    "résumé Æsop",
+			filtered: "resume AEsop",
+			spans: map[string]string{
+				"resume": "résumé",
+				"AEsop":  "Æsop",
+			},
+		},
+		{
+			input:    "déjà vu",
+			filtered: "deja vu",
+			spans: map[string]string{
+				"deja": "déjà",
+				"vu":   "vu",
+			},
+		},
+		{
+			input:    "plain ascii",
+			filtered: "plain ascii",
+			spans: map[string]string{
+				"plain": "plain",
+				"ascii": "ascii",
+			},
+		},
+	}
+
+	filter := New()
+	for _, test := range tests {
+		filtered, mapping := filter.FilterWithOffsetMapping([]byte(test.input))
+		if string(filtered) != test.filtered {
+			t.Errorf("expected filtered text %q, got %q", test.filtered, filtered)
+			continue
+		}
+		if test.input == test.filtered && mapping != nil {
+			t.Errorf("expected nil mapping for unchanged input %q", test.input)
+		}
+		for fspan, ospan := range test.spans {
+			start := strings.Index(test.filtered, fspan)
+			end := start + len(fspan)
+			ostart, oend := mapping.MapStart(start), mapping.MapEnd(end)
+			if got := test.input[ostart:oend]; got != ospan {
+				t.Errorf("input %q: filtered span %q [%d, %d) mapped to %q, want %q",
+					test.input, fspan, start, end, got, ospan)
+			}
+			if !utf8.ValidString(test.input[ostart:oend]) {
+				t.Errorf("input %q: mapped span [%d, %d) splits a UTF-8 character",
+					test.input, ostart, oend)
+			}
+		}
+	}
+
+	// the mapped output must match the plain Filter output
+	input := []byte("Æsop's résumé déjà vu")
+	mapped, _ := filter.FilterWithOffsetMapping(input)
+	if string(mapped) != string(filter.Filter(input)) {
+		t.Errorf("FilterWithOffsetMapping output %q differs from Filter output %q",
+			mapped, filter.Filter(input))
 	}
 }

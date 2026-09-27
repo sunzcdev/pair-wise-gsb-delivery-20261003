@@ -45,6 +45,13 @@ func (s *CharFilter) Filter(input []byte) []byte {
 		})
 }
 
+// FilterWithOffsetMapping filters the input and returns a nil (identity)
+// offset mapping: this filter replaces every matched tag byte-for-byte
+// with spaces, so offsets in the output already line up with the input.
+func (s *CharFilter) FilterWithOffsetMapping(input []byte) ([]byte, *analysis.OffsetMapping) {
+	return s.Filter(input), nil
+}
+
 func CharFilterConstructor(config map[string]interface{}, cache *registry.Cache) (analysis.CharFilter, error) {
 	return New(), nil
 }

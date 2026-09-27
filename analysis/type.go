@@ -19,6 +19,15 @@ import (
 	"time"
 )
 
+// CharFilter transforms the raw input bytes before tokenization. Filters
+// that change the length of the input (expanding HTML entities, removing
+// tags, folding multi-byte characters, ...) shift the offsets of all
+// following text; such filters should also implement
+// OffsetMappingCharFilter so token offsets can be mapped back onto the
+// original text (e.g. for accurate highlighting). Filters that do not
+// implement OffsetMappingCharFilter are treated as identity mappings:
+// offsets pass through unchanged, exactly as they did before offset
+// mappings existed.
 type CharFilter interface {
 	Filter([]byte) []byte
 }
@@ -83,10 +92,22 @@ type DefaultAnalyzer struct {
 }
 
 func (a *DefaultAnalyzer) Analyze(input []byte) TokenStream {
+	tokens, _ := a.AnalyzeWithOffsetMapping(input)
+	return tokens
+}
+
+// AnalyzeWithOffsetMapping analyzes the input like Analyze, and also
+// returns the offset mapping composed from the char filter chain, which
+// maps offsets in the filtered (tokenized) text back to offsets in the
+// original input. The returned tokens already have their Start/End offsets
+// expressed in original input coordinates, so highlights land on the text
+// the user actually stored. The mapping is nil when none of the char
+// filters provide offset information, in which case token offsets are
+// passed through unchanged (the historical behavior).
+func (a *DefaultAnalyzer) AnalyzeWithOffsetMapping(input []byte) (TokenStream, *OffsetMapping) {
+	var mapping *OffsetMapping
 	if a.CharFilters != nil {
-		for _, cf := range a.CharFilters {
-			input = cf.Filter(input)
-		}
+		input, mapping = ApplyCharFilters(a.CharFilters, input)
 	}
 	tokens := a.Tokenizer.Tokenize(input)
 	if a.TokenFilters != nil {
@@ -94,7 +115,13 @@ func (a *DefaultAnalyzer) Analyze(input []byte) TokenStream {
 			tokens = tf.Filter(tokens)
 		}
 	}
-	return tokens
+	if !mapping.IsIdentity() {
+		for _, token := range tokens {
+			token.Start = mapping.MapStart(token.Start)
+			token.End = mapping.MapEnd(token.End)
+		}
+	}
+	return tokens, mapping
 }
 
 var ErrInvalidDateTime = fmt.Errorf("unable to parse datetime with any of the layouts")

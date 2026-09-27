@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"sort"
 
+	"github.com/blevesearch/bleve/v2/analysis"
 	"github.com/blevesearch/bleve/v2/search"
 )
 
@@ -41,6 +42,25 @@ func (tl *TermLocation) Overlaps(other *TermLocation) bool {
 }
 
 type TermLocations []*TermLocation
+
+// MapOffsets rewrites the Start/End of every location from filtered-text
+// coordinates back to original-text coordinates using the given offset
+// mapping (typically composed from an analyzer's char filter chain). This
+// lets a highlighter place markers on the stored original text even when
+// the term locations were produced from char-filtered text. A nil or
+// identity mapping leaves the locations unchanged.
+func (t TermLocations) MapOffsets(m *analysis.OffsetMapping) {
+	if m.IsIdentity() {
+		return
+	}
+	for _, tl := range t {
+		if tl == nil {
+			continue
+		}
+		tl.Start = m.MapStart(tl.Start)
+		tl.End = m.MapEnd(tl.End)
+	}
+}
 
 func (t TermLocations) Len() int      { return len(t) }
 func (t TermLocations) Swap(i, j int) { t[i], t[j] = t[j], t[i] }

@@ -18,6 +18,8 @@
 package asciifolding
 
 import (
+	"unicode/utf8"
+
 	"github.com/blevesearch/bleve/v2/analysis"
 	"github.com/blevesearch/bleve/v2/registry"
 )
@@ -41,8 +43,48 @@ func (s *AsciiFoldingFilter) Filter(input []byte) []byte {
 	// Worst-case length required if all runes fold to 4 runes
 	out := make([]rune, length, length*4)
 
-	out = foldToASCII(in, 0, out, 0, length)
-	return []byte(string(out))
+	out, n := foldToASCII(in, 0, out, 0, length)
+	return []byte(string(out[:n]))
+}
+
+// FilterWithOffsetMapping folds the input to ASCII and records how the
+// offsets of the output relate to the offsets of the input. Folding is
+// rune-local (each input rune maps to zero or more output runes
+// independently), so an anchor is recorded at every rune boundary where
+// the byte delta between input and output changes; between anchors the
+// mapping is an exact shift.
+func (s *AsciiFoldingFilter) FilterWithOffsetMapping(input []byte) ([]byte, *analysis.OffsetMapping) {
+	if len(input) == 0 {
+		return input, nil
+	}
+
+	in := []rune(string(input))
+	out := make([]rune, 0, len(in))
+	buf := make([]rune, 4, 8)
+
+	var anchors []analysis.OffsetAnchor
+	inBytes, outBytes, delta := 0, 0, 0
+	for pos, r := range in {
+		folded, n := foldToASCII(in, pos, buf, 0, 1)
+		folded = folded[:n]
+		out = append(out, folded...)
+		inBytes += utf8.RuneLen(r)
+		for _, fr := range folded {
+			outBytes += utf8.RuneLen(fr)
+		}
+		if newDelta := outBytes - inBytes; newDelta != delta {
+			anchors = append(anchors, analysis.OffsetAnchor{Filtered: outBytes, Original: inBytes})
+			delta = newDelta
+		}
+	}
+	if len(anchors) == 0 {
+		return []byte(string(out)), nil
+	}
+	anchors = append([]analysis.OffsetAnchor{{Filtered: 0, Original: 0}}, anchors...)
+	if last := anchors[len(anchors)-1]; last.Filtered != outBytes || last.Original != inBytes {
+		anchors = append(anchors, analysis.OffsetAnchor{Filtered: outBytes, Original: inBytes})
+	}
+	return []byte(string(out)), analysis.NewOffsetMapping(anchors)
 }
 
 func AsciiFoldingFilterConstructor(config map[string]interface{}, cache *registry.Cache) (analysis.CharFilter, error) {
@@ -56,9 +98,12 @@ func init() {
 	}
 }
 
-// Converts characters above ASCII to their ASCII equivalents.
+// foldToASCII folds length runes of input (starting at inputPos) into
+// output (starting at outputPos), returning the possibly grown output
+// slice along with the offset one past the last rune written.
+// It converts characters above ASCII to their ASCII equivalents.
 // For example, accents are removed from accented characters.
-func foldToASCII(input []rune, inputPos int, output []rune, outputPos int, length int) []rune {
+func foldToASCII(input []rune, inputPos int, output []rune, outputPos int, length int) ([]rune, int) {
 	end := inputPos + length
 	for pos := inputPos; pos < end; pos++ {
 		c := input[pos]
@@ -3568,5 +3613,5 @@ func foldToASCII(input []rune, inputPos int, output []rune, outputPos int, lengt
 			}
 		}
 	}
-	return output
+	return output, outputPos
 }
