@@ -31,6 +31,10 @@ type MemDB struct {
 	root    unsafe.Pointer // *iradix.Tree underneath
 	primary bool
 
+	// watchers tracks live range watch subscriptions. It is only set on the
+	// primary DB; snapshots never register or notify range watchers.
+	watchers *rangeWatcherRegistry
+
 	// There can only be a single writer at once
 	writer sync.Mutex
 }
@@ -44,9 +48,10 @@ func NewMemDB(schema *DBSchema) (*MemDB, error) {
 
 	// Create the MemDB
 	db := &MemDB{
-		schema:  schema,
-		root:    unsafe.Pointer(iradix.New()),
-		primary: true,
+		schema:   schema,
+		root:     unsafe.Pointer(iradix.New()),
+		primary:  true,
+		watchers: newRangeWatcherRegistry(),
 	}
 	if err := db.initialize(); err != nil {
 		return nil, err

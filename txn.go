@@ -40,7 +40,41 @@ type Txn struct {
 	// it is nil at transaction start then changes are not tracked.
 	changes Changes
 
+	// mutatedKeys tracks the index keys inserted or deleted by a write
+	// transaction, and mutatedPrefixes the deleted prefix subtrees, so that
+	// range watch subscriptions can be notified when the transaction
+	// commits.
+	mutatedKeys     map[tableIndex][][]byte
+	mutatedPrefixes map[tableIndex][][]byte
+
 	modified map[tableIndex]*iradix.Txn
+}
+
+// recordKeyMutation notes that the given index key was inserted or deleted
+// so that range watchers can be notified when the transaction commits.
+func (txn *Txn) recordKeyMutation(table, index string, key []byte) {
+	if txn.db.watchers == nil {
+		return
+	}
+	if txn.mutatedKeys == nil {
+		txn.mutatedKeys = make(map[tableIndex][][]byte)
+	}
+	idx := tableIndex{table, index}
+	txn.mutatedKeys[idx] = append(txn.mutatedKeys[idx], bytes.Clone(key))
+}
+
+// recordPrefixMutation notes that the subtree of the given index carrying
+// the given prefix was deleted so that range watchers can be notified when
+// the transaction commits.
+func (txn *Txn) recordPrefixMutation(table, index string, prefix []byte) {
+	if txn.db.watchers == nil {
+		return
+	}
+	if txn.mutatedPrefixes == nil {
+		txn.mutatedPrefixes = make(map[tableIndex][][]byte)
+	}
+	idx := tableIndex{table, index}
+	txn.mutatedPrefixes[idx] = append(txn.mutatedPrefixes[idx], bytes.Clone(prefix))
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -122,6 +156,8 @@ func (txn *Txn) Abort() {
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
+	txn.mutatedKeys = nil
+	txn.mutatedPrefixes = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -161,9 +197,27 @@ func (txn *Txn) Commit() {
 	}
 	txn.rootTxn.Notify()
 
+	// Notify any range watch subscriptions affected by the mutated index
+	// keys. This is done after the root pointer is swapped so that woken
+	// observers will see the new state.
+	if txn.db.watchers != nil {
+		for idx, keys := range txn.mutatedKeys {
+			for _, key := range keys {
+				txn.db.watchers.notifyKey(idx, key)
+			}
+		}
+		for idx, prefixes := range txn.mutatedPrefixes {
+			for _, prefix := range prefixes {
+				txn.db.watchers.notifyPrefix(idx, prefix)
+			}
+		}
+	}
+
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.mutatedKeys = nil
+	txn.mutatedPrefixes = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -271,6 +325,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 					// value anyways.
 					if i >= len(vals) || !bytes.Equal(valExist, vals[i]) {
 						indexTxn.Delete(valExist)
+						txn.recordKeyMutation(table, name, valExist)
 					}
 				}
 			}
@@ -289,6 +344,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		// Update the value of the index
 		for _, val := range vals {
 			indexTxn.Insert(val, obj)
+			txn.recordKeyMutation(table, name, val)
 		}
 	}
 	if txn.changes != nil {
@@ -363,6 +419,7 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 					val = append(val, idVal...)
 				}
 				indexTxn.Delete(val)
+				txn.recordKeyMutation(table, name, val)
 			}
 		}
 	}
@@ -465,6 +522,7 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 						val = append(val, idVal...)
 					}
 					indexTxn.Delete(val)
+					txn.recordKeyMutation(table, name, val)
 				}
 			}
 		}
@@ -476,6 +534,7 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 		if !ok {
 			panic(fmt.Errorf("prefix %v matched some entries but DeletePrefix did not delete any ", prefix))
 		}
+		txn.recordPrefixMutation(table, deletePrefixIndex, []byte(prefix))
 		return true, nil
 	}
 	return false, nil
@@ -838,6 +897,88 @@ func (txn *Txn) ReverseLowerBound(table, index string, args ...interface{}) (Res
 	return iter, nil
 }
 
+// WatchRange is used to construct a ResultIterator over all the rows that
+// have an index value within the range [lower, upper): the lower bound is
+// inclusive and the upper bound is exclusive. A nil lower bound matches all
+// values below upper, and a nil upper bound makes the range unbounded above.
+//
+// Unlike LowerBound, the returned ResultIterator can be watched. WatchCh
+// returns a channel that is closed once a subsequent write transaction
+// commits a change that may alter the result of the query: inserting or
+// deleting a key within the range, or updating an object whose old or new
+// index key falls within the range. Writes that only touch keys outside the
+// range do not close the channel. Since each read transaction operates on an
+// isolated snapshot, a new read transaction must be started to observe the
+// changes that have been made.
+//
+// The bounds are applied to the encoded index keys. For non-unique indexes
+// the primary key is appended to the index key, so objects that share a
+// duplicate index value are all considered inside the range as long as the
+// index value itself is within the bounds.
+//
+// Watch subscriptions are only tracked by the primary DB. On a snapshot, or
+// when the range is empty (lower >= upper), the returned WatchCh will be nil
+// and so will block forever.
+//
+// See the documentation for ResultIterator to understand the behaviour of the
+// returned ResultIterator.
+func (txn *Txn) WatchRange(table, index string, lower, upper interface{}) (ResultIterator, error) {
+	// Get the table schema
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return nil, fmt.Errorf("invalid table '%s'", table)
+	}
+
+	// Get the index schema
+	indexSchema, ok := tableSchema.Indexes[index]
+	if !ok {
+		return nil, fmt.Errorf("invalid index '%s'", index)
+	}
+
+	// Build the encoded bounds. A nil bound leaves that side of the range
+	// unbounded.
+	var lowerVal, upperVal []byte
+	var err error
+	if lower != nil {
+		lowerVal, err = indexSchema.Indexer.FromArgs(lower)
+		if err != nil {
+			return nil, fmt.Errorf("index error: %v", err)
+		}
+	}
+	if upper != nil {
+		upperVal, err = indexSchema.Indexer.FromArgs(upper)
+		if err != nil {
+			return nil, fmt.Errorf("index error: %v", err)
+		}
+	}
+
+	// Get an iterator over the index and seek it to the lower bound
+	indexTxn := txn.readableIndex(table, indexSchema.Name)
+	indexIter := indexTxn.Root().Iterator()
+	indexIter.SeekLowerBound(lowerVal)
+
+	// Create an iterator bounded above by the upper bound
+	iter := &radixIterator{
+		iter:  indexIter,
+		upper: upperVal,
+	}
+
+	// Register the watch subscription with the primary DB. Empty ranges can
+	// never match a mutation, so no subscription is needed for them.
+	if txn.db.watchers != nil &&
+		(lowerVal == nil || upperVal == nil || bytes.Compare(lowerVal, upperVal) < 0) {
+		watcher := &rangeWatcher{
+			lower: lowerVal,
+			upper: upperVal,
+			ch:    make(chan struct{}),
+		}
+		idx := tableIndex{table, indexSchema.Name}
+		iter.watchCh = txn.db.watchers.add(idx, watcher)
+	}
+
+	return iter, nil
+}
+
 // objectID is a tuple of table name and the raw internal id byte slice
 // converted to a string. It's only converted to a string to make it comparable
 // so this struct can be used as a map index.
@@ -969,6 +1110,10 @@ func (txn *Txn) Defer(fn func()) {
 type radixIterator struct {
 	iter    *iradix.Iterator
 	watchCh <-chan struct{}
+
+	// upper, if non-nil, is the exclusive upper bound on the keys returned
+	// by the iterator.
+	upper []byte
 }
 
 func (r *radixIterator) WatchCh() <-chan struct{} {
@@ -976,8 +1121,11 @@ func (r *radixIterator) WatchCh() <-chan struct{} {
 }
 
 func (r *radixIterator) Next() interface{} {
-	_, value, ok := r.iter.Next()
+	key, value, ok := r.iter.Next()
 	if !ok {
+		return nil
+	}
+	if r.upper != nil && bytes.Compare(key, r.upper) >= 0 {
 		return nil
 	}
 	return value
