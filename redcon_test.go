@@ -767,3 +767,205 @@ func TestPubSub(t *testing.T) {
 	// stop the timeout
 	final <- true
 }
+
+func dialRetry(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	for i := 0; i < 50; i++ {
+		conn, err := net.Dial("tcp", addr)
+		if err == nil {
+			return conn
+		}
+		time.Sleep(time.Millisecond * 100)
+	}
+	t.Fatal("could not connect to server")
+	return nil
+}
+
+// readRESP reads a single RESP array from the reader and returns its items.
+func readRESP(t *testing.T, rd *bufio.Reader, buf *[]byte) []RESP {
+	t.Helper()
+	for {
+		line, err := rd.ReadBytes('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		*buf = append(*buf, line...)
+		n, resp := ReadNextRESP(*buf)
+		if n == 0 {
+			continue
+		}
+		*buf = (*buf)[n:]
+		if resp.Type != Array {
+			t.Fatalf("expected array, got %v", resp.Type)
+		}
+		var vals []RESP
+		resp.ForEach(func(item RESP) bool {
+			vals = append(vals, item)
+			return true
+		})
+		return vals
+	}
+}
+
+func startPubSubServer(t *testing.T, ps *PubSub, addr string) (done chan bool) {
+	t.Helper()
+	done = make(chan bool)
+	go func() {
+		go func() {
+			tch := time.NewTicker(time.Millisecond)
+			defer tch.Stop()
+			payload := strings.Repeat("x", 1024)
+			for {
+				select {
+				case <-tch.C:
+				case <-done:
+					return
+				}
+				ps.Publish("events", payload)
+			}
+		}()
+		panic(ListenAndServe(addr, func(conn Conn, cmd Command) {
+			switch strings.ToLower(string(cmd.Args[0])) {
+			default:
+				conn.WriteError("ERR unknown command '" +
+					string(cmd.Args[0]) + "'")
+			case "subscribe":
+				for i := 1; i < len(cmd.Args); i++ {
+					ps.Subscribe(conn, string(cmd.Args[i]))
+				}
+			}
+		}, nil, nil))
+	}()
+	return done
+}
+
+// TestPubSubSlowConsumer verifies that a subscriber that stops reading does
+// not stall publishes, subscribes, or unsubscribes of the other
+// subscribers. The overflow stays local to the slow connection's send
+// queue, which is bounded by QueueSize, and overflows are observable
+// through Dropped().
+func TestPubSubSlowConsumer(t *testing.T) {
+	addr := ":12347"
+	var ps PubSub
+	ps.QueueSize = 8
+	ps.SlowConsumerPolicy = SlowConsumerDrop
+	done := startPubSubServer(t, &ps, addr)
+	defer close(done)
+
+	// slow client subscribes and then never reads again
+	slow := dialRetry(t, addr)
+	defer slow.Close()
+	slow.SetReadDeadline(time.Now().Add(time.Second * 30))
+	fmt.Fprintf(slow, "subscribe events\r\n")
+	slowrd := bufio.NewReader(slow)
+	var sbuf []byte
+	if vals := readRESP(t, slowrd, &sbuf); string(vals[0].Data) != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %v", vals)
+	}
+
+	// fast client keeps reading while the slow client is stuck
+	fast := dialRetry(t, addr)
+	defer fast.Close()
+	fast.SetReadDeadline(time.Now().Add(time.Second * 30))
+	fmt.Fprintf(fast, "subscribe events\r\n")
+	fastrd := bufio.NewReader(fast)
+	var fbuf []byte
+	if vals := readRESP(t, fastrd, &fbuf); string(vals[0].Data) != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %v", vals)
+	}
+
+	// The fast client must keep receiving messages even though the slow
+	// client's send queue is full. With the old implementation the blocked
+	// write would hold the PubSub lock and stall these receives.
+	const want = 200
+	received := 0
+	for received < want {
+		vals := readRESP(t, fastrd, &fbuf)
+		if string(vals[0].Data) != "message" {
+			t.Fatalf("expected message, got %v", vals)
+		}
+		received++
+	}
+
+	// The slow client's bounded queue must have overflowed by now, and the
+	// overflow must be observable.
+	deadline := time.Now().Add(time.Second * 10)
+	for ps.Dropped() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond * 10)
+	}
+	if ps.Dropped() == 0 {
+		t.Fatal("expected dropped messages for the slow consumer")
+	}
+
+	// Unsubscribing the fast client must succeed while the slow client is
+	// still stuck.
+	fmt.Fprintf(fast, "unsubscribe events\r\n")
+	if vals := readRESP(t, fastrd, &fbuf); string(vals[0].Data) != "unsubscribe" {
+		t.Fatalf("expected unsubscribe confirmation, got %v", vals)
+	}
+
+	// Quitting must return OK and close the connection.
+	fmt.Fprintf(fast, "quit\r\n")
+	line, err := fastrd.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line != "+OK\r\n" {
+		t.Fatalf("expected +OK, got %q", line)
+	}
+	fast.Close()
+	slow.Close()
+
+	// both connections must eventually be removed from the PubSub
+	deadline = time.Now().Add(time.Second * 10)
+	for time.Now().Before(deadline) {
+		ps.mu.RLock()
+		n := len(ps.conns)
+		ps.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	t.Fatal("expected all connections to be removed")
+}
+
+// TestPubSubSlowConsumerClose verifies that the SlowConsumerClose policy
+// closes the connection of a subscriber whose send queue is full, and that
+// the closure is observable through Closed().
+func TestPubSubSlowConsumerClose(t *testing.T) {
+	addr := ":12348"
+	var ps PubSub
+	ps.QueueSize = 4
+	ps.SlowConsumerPolicy = SlowConsumerClose
+	done := startPubSubServer(t, &ps, addr)
+	defer close(done)
+
+	slow := dialRetry(t, addr)
+	defer slow.Close()
+	fmt.Fprintf(slow, "subscribe events\r\n")
+	slowrd := bufio.NewReader(slow)
+	var sbuf []byte
+	if vals := readRESP(t, slowrd, &sbuf); string(vals[0].Data) != "subscribe" {
+		t.Fatalf("expected subscribe confirmation, got %v", vals)
+	}
+	// stop reading and wait for the queue to overflow
+	deadline := time.Now().Add(time.Second * 30)
+	for ps.Closed() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond * 10)
+	}
+	if ps.Closed() == 0 {
+		t.Fatal("expected the slow connection to be closed")
+	}
+	if ps.Dropped() == 0 {
+		t.Fatal("expected dropped messages for the slow consumer")
+	}
+	// the closed connection must eventually fail a read
+	slow.SetReadDeadline(time.Now().Add(time.Second * 10))
+	for {
+		// drain any buffered data until the closed connection fails
+		if _, err := slowrd.ReadBytes('\n'); err != nil {
+			break
+		}
+	}
+}
