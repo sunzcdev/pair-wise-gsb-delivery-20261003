@@ -1322,6 +1322,7 @@ func TestServer_TooLongCommand(t *testing.T) {
 
 func TestServerShutdown(t *testing.T) {
 	_, s, c, _ := testServerGreeted(t)
+	defer c.Close()
 
 	ctx := context.Background()
 	errChan := make(chan error)
@@ -1332,13 +1333,7 @@ func TestServerShutdown(t *testing.T) {
 		errChan <- s.Shutdown(ctx)
 	}()
 
-	select {
-	case err := <-errChan:
-		t.Fatal("Expected no err because conn is open:", err)
-	default:
-		c.Close()
-	}
-
+	// The connection is idle, so Shutdown closes it and returns.
 	errOne := <-errChan
 	if errOne != nil {
 		t.Fatal("Expected err to be nil:", errOne)
@@ -1347,6 +1342,321 @@ func TestServerShutdown(t *testing.T) {
 	errTwo := <-errChan
 	if errTwo != smtp.ErrServerClosed {
 		t.Fatal("Expected err to be ErrServerClosed:", errTwo)
+	}
+}
+
+// expectNoResponse fails the test if the server sends anything within 50ms.
+// It is used to make sure a graceful shutdown does not inject a response
+// while a message body is being transmitted.
+func expectNoResponse(t *testing.T, c net.Conn) {
+	t.Helper()
+
+	if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.Read(make([]byte, 1))
+	c.SetReadDeadline(time.Time{})
+	if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
+		return
+	}
+	t.Fatal("Expected no response from server, got error:", err)
+}
+
+func TestServerShutdown_DATA(t *testing.T) {
+	be, s, c, scanner := testServerGreeted(t)
+	defer c.Close()
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	// Start transmitting the body, but do not terminate it yet.
+	io.WriteString(c, "Hello\r\n")
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(context.Background())
+	}()
+
+	// Shutdown must wait for the transaction to complete and must not
+	// send any response while the message body is being read.
+	expectNoResponse(t, c)
+	select {
+	case err := <-shutdownDone:
+		t.Fatal("Shutdown returned while a transaction was in progress:", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Finish the message. The first (and only) response must be the
+	// regular DATA completion reply.
+	io.WriteString(c, "World\r\n.\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA completion response:", scanner.Text())
+	}
+
+	if err := <-shutdownDone; err != nil {
+		t.Fatal("Shutdown failed:", err)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.anonmsgs))
+	}
+	if want := "Hello\r\nWorld\r\n"; string(be.anonmsgs[0].Data) != want {
+		t.Fatal("Invalid mail data:", string(be.anonmsgs[0].Data))
+	}
+
+	// The connection must be closed once the transaction is over.
+	if scanner.Scan() {
+		t.Fatal("Expected connection to be closed, got:", scanner.Text())
+	}
+}
+
+func TestServerShutdown_BDAT(t *testing.T) {
+	be, s, c, scanner := testServerGreeted(t)
+	defer c.Close()
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+
+	// First chunk of a multi-chunk BDAT transfer.
+	io.WriteString(c, "BDAT 5\r\nHello")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid BDAT response:", scanner.Text())
+	}
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(context.Background())
+	}()
+
+	// The transaction is still in progress, Shutdown must wait.
+	expectNoResponse(t, c)
+	select {
+	case err := <-shutdownDone:
+		t.Fatal("Shutdown returned while a transaction was in progress:", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Send the final chunk, the transfer must complete normally.
+	io.WriteString(c, "BDAT 6 LAST\r\n World")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid BDAT LAST response:", scanner.Text())
+	}
+
+	if err := <-shutdownDone; err != nil {
+		t.Fatal("Shutdown failed:", err)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.anonmsgs))
+	}
+	if want := "Hello World"; string(be.anonmsgs[0].Data) != want {
+		t.Fatal("Invalid mail data:", string(be.anonmsgs[0].Data))
+	}
+
+	if scanner.Scan() {
+		t.Fatal("Expected connection to be closed, got:", scanner.Text())
+	}
+}
+
+func TestServerShutdown_LMTP(t *testing.T) {
+	be, s, c, scanner := testServerGreetedLMTP(t, func(s *smtp.Server) {
+		s.LMTP = true
+		be := s.Backend.(*backend)
+		be.implementLMTPData = true
+		be.lmtpStatus = []struct {
+			addr string
+			err  error
+		}{
+			{"root@gchq.gov.uk", errors.New("nah")},
+			{"root@bnd.bund.de", nil},
+		}
+	})
+	defer c.Close()
+
+	sendLHLO(t, scanner, c)
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@bnd.bund.de>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	io.WriteString(c, "Hey <3\r\n")
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(context.Background())
+	}()
+
+	expectNoResponse(t, c)
+	select {
+	case err := <-shutdownDone:
+		t.Fatal("Shutdown returned while a transaction was in progress:", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	io.WriteString(c, ".\r\n")
+
+	// Per-recipient statuses must be delivered as usual.
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "554 5.0.0 <root@gchq.gov.uk>") {
+		t.Fatal("Invalid DATA first response:", scanner.Text())
+	}
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA second response:", scanner.Text())
+	}
+
+	if err := <-shutdownDone; err != nil {
+		t.Fatal("Shutdown failed:", err)
+	}
+
+	if len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", len(be.anonmsgs))
+	}
+
+	if scanner.Scan() {
+		t.Fatal("Expected connection to be closed, got:", scanner.Text())
+	}
+}
+
+func TestServerShutdown_ForceCloseDATA(t *testing.T) {
+	be, s, c, scanner := testServerGreeted(t, func(s *smtp.Server) {
+		s.Backend.(*backend).dataErrors = make(chan error, 1)
+	})
+	defer c.Close()
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+
+	// Start the body but never terminate it: the backend is blocked
+	// reading the message.
+	io.WriteString(c, "Hello\r\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(ctx)
+	}()
+
+	// No response may be injected into the body being read.
+	expectNoResponse(t, c)
+
+	if err := <-shutdownDone; err != context.DeadlineExceeded {
+		t.Fatal("Expected Shutdown to return context.DeadlineExceeded, got:", err)
+	}
+
+	// Once Shutdown returned, the backend work must have been cancelled
+	// already: Data runs on the connection handler goroutine, which
+	// Shutdown waits for.
+	select {
+	case err := <-be.dataErrors:
+		if err == nil {
+			t.Fatal("Expected Data to fail after force close")
+		}
+	default:
+		t.Fatal("Shutdown returned before the backend Data call terminated")
+	}
+
+	if len(be.anonmsgs) != 0 {
+		t.Fatal("Message must not be delivered after force close")
+	}
+}
+
+func TestServerShutdown_ForceCloseBDAT(t *testing.T) {
+	be, s, c, scanner := testServerGreeted(t, func(s *smtp.Server) {
+		s.Backend.(*backend).dataErrors = make(chan error, 1)
+	})
+	defer c.Close()
+
+	io.WriteString(c, "EHLO localhost\r\n")
+	for scanner.Scan() {
+		if strings.HasPrefix(scanner.Text(), "250 ") {
+			break
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+
+	// Announce a chunk but never send it completely: both the connection
+	// handler and the backend Data goroutine are blocked.
+	io.WriteString(c, "BDAT 10\r\nHel")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- s.Shutdown(ctx)
+	}()
+
+	expectNoResponse(t, c)
+
+	if err := <-shutdownDone; err != context.DeadlineExceeded {
+		t.Fatal("Expected Shutdown to return context.DeadlineExceeded, got:", err)
+	}
+
+	// The backend Data call blocked on the BDAT pipe must be unblocked
+	// by the force close.
+	select {
+	case err := <-be.dataErrors:
+		if err == nil {
+			t.Fatal("Expected Data to fail after force close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Backend Data call was not cancelled by force close")
+	}
+
+	if len(be.anonmsgs) != 0 {
+		t.Fatal("Message must not be delivered after force close")
 	}
 }
 

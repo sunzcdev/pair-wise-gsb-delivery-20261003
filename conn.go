@@ -44,6 +44,11 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// shutdown is set when the server is gracefully shutting down. The
+	// connection is closed as soon as the current mail transaction (if
+	// any) completes.
+	shutdown bool
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -181,6 +186,30 @@ func (c *Conn) Close() error {
 	}
 
 	return c.conn.Close()
+}
+
+// inTransactionLocked reports whether the connection is in the middle of a
+// mail transaction (MAIL FROM was received and the transaction was not
+// completed or reset yet). c.locker must be held.
+func (c *Conn) inTransactionLocked() bool {
+	return c.fromReceived || c.bdatPipe != nil
+}
+
+// requestShutdown initiates a graceful shutdown of the connection. If the
+// connection is idle, it is closed immediately. If a mail transaction is in
+// progress, the connection is kept open and will be closed once the
+// transaction completes or is reset. No response is written to the client,
+// so a message body being transmitted is never interrupted by a stray
+// reply.
+func (c *Conn) requestShutdown() {
+	c.locker.Lock()
+	c.shutdown = true
+	idle := !c.inTransactionLocked()
+	c.locker.Unlock()
+
+	if idle {
+		c.Close()
+	}
 }
 
 // TLSConnectionState returns the connection's TLS connection state.
@@ -1334,7 +1363,6 @@ func (c *Conn) readLine() (string, error) {
 
 func (c *Conn) reset() {
 	c.locker.Lock()
-	defer c.locker.Unlock()
 
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
@@ -1352,4 +1380,13 @@ func (c *Conn) reset() {
 
 	c.fromReceived = false
 	c.recipients = nil
+
+	shutdown := c.shutdown
+	c.locker.Unlock()
+
+	// The transaction is over: if a graceful shutdown was requested, the
+	// connection is now idle and can be closed.
+	if shutdown {
+		c.Close()
+	}
 }

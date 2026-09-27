@@ -88,6 +88,10 @@ type Server struct {
 	locker    sync.Mutex
 	listeners []net.Listener
 	conns     map[*Conn]struct{}
+
+	// shuttingDown is set once Shutdown or Close is called. Newly accepted
+	// connections are closed gracefully right away.
+	shuttingDown bool
 }
 
 // New creates a new SMTP server.
@@ -151,7 +155,12 @@ func (s *Server) Serve(l net.Listener) error {
 func (s *Server) handleConn(c *Conn) error {
 	s.locker.Lock()
 	s.conns[c] = struct{}{}
+	shuttingDown := s.shuttingDown
 	s.locker.Unlock()
+
+	if shuttingDown {
+		c.requestShutdown()
+	}
 
 	defer func() {
 		c.Close()
@@ -269,6 +278,7 @@ func (s *Server) Close() error {
 
 	var err error
 	s.locker.Lock()
+	s.shuttingDown = true
 	for _, l := range s.listeners {
 		if lerr := l.Close(); lerr != nil && err == nil {
 			err = lerr
@@ -284,12 +294,17 @@ func (s *Server) Close() error {
 }
 
 // Shutdown gracefully shuts down the server without interrupting any
-// active connections. Shutdown works by first closing all open
-// listeners and then waiting indefinitely for connections to return to
-// idle and then shut down.
+// active transactions. Shutdown works by first closing all open
+// listeners, then closing idle connections and waiting for connections
+// with an in-progress mail transaction to finish it. Once the
+// transaction completes, the connection is closed.
+//
 // If the provided context expires before the shutdown is complete,
-// Shutdown returns the context's error, otherwise it returns any
-// error returned from closing the Server's underlying Listener(s).
+// all remaining connections are closed forcefully, interrupting any
+// backend work in progress, and Shutdown waits for the connections and
+// their backend work to terminate before returning the context's error.
+// Otherwise Shutdown returns any error returned from closing the
+// Server's underlying Listener(s).
 func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.done:
@@ -300,10 +315,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	var err error
 	s.locker.Lock()
+	s.shuttingDown = true
 	for _, l := range s.listeners {
 		if lerr := l.Close(); lerr != nil && err == nil {
 			err = lerr
 		}
+	}
+
+	// Ask all active connections to terminate: idle connections are
+	// closed immediately, connections in the middle of a mail transaction
+	// are closed once the transaction completes.
+	for c := range s.conns {
+		c.requestShutdown()
 	}
 	s.locker.Unlock()
 
@@ -315,6 +338,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-ctx.Done():
+		// The context expired: force-close all remaining connections.
+		// This aborts any message data being read and unblocks backend
+		// routines waiting on the connection.
+		s.locker.Lock()
+		for c := range s.conns {
+			c.Close()
+		}
+		s.locker.Unlock()
+
+		// Make sure all connection handlers and the backend work they
+		// spawned have actually terminated before returning.
+		<-connDone
 		return ctx.Err()
 	case <-connDone:
 		return err
