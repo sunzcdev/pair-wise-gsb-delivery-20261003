@@ -60,6 +60,20 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrIndexBuildCanceled is returned by IndexBuild.Wait when the
+	// background index build was canceled with IndexBuild.Cancel.
+	ErrIndexBuildCanceled = errors.New("index build canceled")
+
+	// ErrIndexBuildOverflow is returned by IndexBuild.Wait when the
+	// number of pending changes exceeded the bounded capacity of the
+	// build and the incremental catch-up could not keep up.
+	ErrIndexBuildOverflow = errors.New("index build pending overflow")
+
+	// ErrIndexBuildReset is returned by IndexBuild.Wait when the
+	// database contents were reset (DeleteAll or a flushdb load) while
+	// the background index build was in progress.
+	ErrIndexBuildReset = errors.New("index build reset")
 )
 
 const useAbsEx = true
@@ -67,19 +81,20 @@ const useAbsEx = true
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
-	mu        sync.RWMutex      // the gatekeeper for all fields
-	file      *os.File          // the underlying file
-	buf       []byte            // a buffer to write to
-	keys      *btree.BTree      // a tree of all item ordered by key
-	exps      *btree.BTree      // a tree of items ordered by expiration
-	idxs      map[string]*index // the index trees.
-	insIdxs   []*index          // a reuse buffer for gathering indexes
-	flushes   int               // a count of the number of disk flushes
-	closed    bool              // set when the database has been closed
-	config    Config            // the database configuration
-	persist   bool              // do we write to disk
-	shrinking bool              // when an aof shrink is in-process.
-	lastaofsz int               // the size of the last shrink aof size
+	mu        sync.RWMutex           // the gatekeeper for all fields
+	file      *os.File               // the underlying file
+	buf       []byte                 // a buffer to write to
+	keys      *btree.BTree           // a tree of all item ordered by key
+	exps      *btree.BTree           // a tree of items ordered by expiration
+	idxs      map[string]*index      // the index trees.
+	insIdxs   []*index               // a reuse buffer for gathering indexes
+	flushes   int                    // a count of the number of disk flushes
+	closed    bool                   // set when the database has been closed
+	config    Config                 // the database configuration
+	persist   bool                   // do we write to disk
+	shrinking bool                   // when an aof shrink is in-process.
+	lastaofsz int                    // the size of the last shrink aof size
+	builds    map[string]*IndexBuild // in-progress background index builds
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -147,6 +162,7 @@ func Open(path string) (*DB, error) {
 	db.keys = btreeNew(lessCtx(nil))
 	db.exps = btreeNew(lessCtx(&exctx{db}))
 	db.idxs = make(map[string]*index)
+	db.builds = make(map[string]*IndexBuild)
 	// initialize default configuration
 	db.config = Config{
 		SyncPolicy:           EverySecond,
@@ -183,6 +199,10 @@ func (db *DB) Close() error {
 		return ErrDatabaseClosed
 	}
 	db.closed = true
+	// fail any in-progress background index builds.
+	for _, b := range db.builds {
+		b.fail(ErrDatabaseClosed)
+	}
 	if db.persist {
 		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
@@ -506,6 +526,12 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 	}
 	// reuse the index list slice
 	db.insIdxs = idxs[:0]
+	// notify in-progress background index builds of the changed key.
+	if len(db.builds) > 0 {
+		for _, b := range db.builds {
+			b.addPending(item.key)
+		}
+	}
 	// we must return the previous item to the caller.
 	return pdbi
 }
@@ -536,6 +562,12 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 			if idx.rtr != nil {
 				// Remove it from the rtree index.
 				idx.rtr.Remove(pdbi)
+			}
+		}
+		// notify in-progress background index builds of the changed key.
+		if len(db.builds) > 0 {
+			for _, b := range db.builds {
+				b.addPending(pdbi.key)
 			}
 		}
 	}
@@ -956,6 +988,10 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 			db.keys = btreeNew(lessCtx(nil))
 			db.exps = btreeNew(lessCtx(&exctx{db}))
 			db.idxs = make(map[string]*index)
+			// fail any in-progress background index builds.
+			for _, b := range db.builds {
+				b.fail(ErrIndexBuildReset)
+			}
 		} else {
 			return totalSize, ErrInvalid
 		}
@@ -1107,6 +1143,12 @@ func (tx *Tx) DeleteAll() error {
 	tx.db.keys = btreeNew(lessCtx(nil))
 	tx.db.exps = btreeNew(lessCtx(&exctx{tx.db}))
 	tx.db.idxs = make(map[string]*index)
+
+	// fail any in-progress background index builds. the keyspace they
+	// were scanning no longer exists.
+	for _, b := range tx.db.builds {
+		b.fail(ErrIndexBuildReset)
+	}
 
 	// finally re-create the indexes
 	for name, idx := range tx.wc.rbidxs {

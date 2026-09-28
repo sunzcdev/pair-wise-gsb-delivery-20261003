@@ -251,6 +251,41 @@ user:1:age 49
 user:4:age 63
 ```
 
+### Background index builds
+`CreateIndex` holds the write lock for the entire scan, which blocks write
+transactions on large databases. `CreateIndexAsync` (and
+`CreateSpatialIndexAsync` for spatial indexes) builds the index in the
+background instead, scanning the keyspace in small batches so that writes
+can proceed concurrently.
+
+```go
+build, err := db.CreateIndexAsync("names", "user:*", nil, buntdb.IndexString)
+if err != nil {
+	log.Fatal(err)
+}
+// optionally watch progress or cancel
+go func() {
+	for range time.Tick(time.Second) {
+		scanned, total := build.Progress()
+		fmt.Printf("scanned %d of %d\n", scanned, total)
+	}
+}()
+// wait for the index to be published
+if err := build.Wait(); err != nil {
+	log.Fatal(err)
+}
+```
+
+The index is not visible to queries until the build completes successfully.
+Changes made while the build is running are tracked and replayed before the
+index is published, so the result is identical to a synchronous rebuild
+performed after the writes stopped. The number of tracked changes is bounded
+by `BackgroundIndexOptions.MaxPendingChanges`; when the build cannot keep up
+it fails with `ErrIndexBuildOverflow` rather than accumulating changes
+without limit. A build can be aborted at any time with `build.Cancel()`.
+Failed or canceled builds only discard their own candidate index; indexes
+that are already in use are never affected.
+
 ## Spatial Indexes
 BuntDB has support for spatial indexes by storing rectangles in an [R-tree](https://en.wikipedia.org/wiki/R-tree). An R-tree is organized in a similar manner as a [B-tree](https://en.wikipedia.org/wiki/B-tree), and both are balanced trees. But, an R-tree is special because it can operate on data that is in multiple dimensions. This is super handy for Geospatial applications.
 
