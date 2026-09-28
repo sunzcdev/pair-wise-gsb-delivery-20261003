@@ -99,6 +99,13 @@ type VerifyOptions struct {
 	// signatures are verified, the rest are ignored and ErrTooManySignatures
 	// is returned. If zero, there is no maximum.
 	MaxVerifications int
+	// Diagnostics, if set, receives diagnostic events describing how header
+	// fields are picked and how the header and body are canonicalized. This
+	// is useful to troubleshoot a canonicalization mismatch with the
+	// signer. Events never contain message content, so comparing with the
+	// signer requires the signer's original message or its own diagnostic
+	// trace.
+	Diagnostics *Diagnostics
 }
 
 // Verify checks if a message's signatures are valid. It returns one
@@ -211,6 +218,11 @@ func parallelVerify(r io.Reader, h header, signatures []*signature, options *Ver
 
 func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOptions) (*Verification, error) {
 	verif := new(Verification)
+
+	var diag *diagnostics
+	if options != nil {
+		diag = newDiagnostics(options.Diagnostics)
+	}
 
 	params, err := parseHeaderParams(sigValue)
 	if err != nil {
@@ -368,7 +380,7 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 
 	// Check body hash
 	hasher := hash.New()
-	wc := canonicalizers[bodyCan].CanonicalizeBody(hasher)
+	wc := canonicalizers[bodyCan].CanonicalizeBody(hasher, diag)
 	if _, err := io.Copy(wc, r); err != nil {
 		return verif, err
 	}
@@ -381,9 +393,9 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 
 	// Compute data hash
 	hasher.Reset()
-	picker := newHeaderPicker(h)
+	picker := newHeaderPicker(h, diag)
 	for _, key := range headerKeys {
-		kv := picker.Pick(key)
+		kv, off := picker.Pick(key)
 		if kv == "" {
 			// The field MAY contain names of header fields that do not exist
 			// when signed; nonexistent header fields do not contribute to the
@@ -391,14 +403,28 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 			continue
 		}
 
-		kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
-		if _, err := hasher.Write([]byte(kv)); err != nil {
+		canKV := canonicalizers[headerCan].CanonicalizeHeader(kv)
+		diag.emit(DiagnosticEvent{
+			Stage:       DiagnosticStageHeader,
+			InputOffset: off,
+			InputLength: len(kv),
+			OutputBytes: len(canKV),
+			Summary:     fmt.Sprintf("canonicalized %q header field", strings.ToLower(key)),
+		})
+		if _, err := hasher.Write([]byte(canKV)); err != nil {
 			return verif, err
 		}
 	}
 	canSigField := removeSignature(sigField)
 	canSigField = canonicalizers[headerCan].CanonicalizeHeader(canSigField)
 	canSigField = strings.TrimRight(canSigField, "\r\n")
+	diag.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageHeader,
+		InputOffset: headerFieldOffset(h, sigField),
+		InputLength: len(sigField),
+		OutputBytes: len(canSigField),
+		Summary:     "canonicalized DKIM-Signature header field (signature value emptied)",
+	})
 	if _, err := hasher.Write([]byte(canSigField)); err != nil {
 		return verif, err
 	}

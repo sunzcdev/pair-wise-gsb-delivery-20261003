@@ -58,7 +58,7 @@ func TestSimpleCanonicalizer_CanonicalBody(t *testing.T) {
 	for _, test := range simpleCanonicalizerBodyTests {
 		b.Reset()
 
-		wc := c.CanonicalizeBody(&b)
+		wc := c.CanonicalizeBody(&b, nil)
 		for _, chunk := range test.original {
 			if _, err := wc.Write([]byte(chunk)); err != nil {
 				t.Fatalf("Expected no error while writing to simple body canonicalizer, got: %v", err)
@@ -158,7 +158,7 @@ func TestRelaxedCanonicalizer_CanonicalBody(t *testing.T) {
 	for _, test := range relaxedCanonicalizerBodyTests {
 		b.Reset()
 
-		wc := c.CanonicalizeBody(&b)
+		wc := c.CanonicalizeBody(&b, nil)
 		if _, err := wc.Write([]byte(test.original)); err != nil {
 			t.Errorf("Expected no error while writing to relaxed body canonicalizer, got: %v", err)
 		} else if err := wc.Close(); err != nil {
@@ -177,7 +177,7 @@ func TestRelaxedCanonicalizer_CanonicalBody_splitCRLF(t *testing.T) {
 	}
 
 	var b bytes.Buffer
-	wc := new(relaxedCanonicalizer).CanonicalizeBody(&b)
+	wc := new(relaxedCanonicalizer).CanonicalizeBody(&b, nil)
 	for _, b := range writes {
 		if _, err := wc.Write(b); err != nil {
 			t.Errorf("Expected no error while writing to relaxed body canonicalizer, got: %v", err)

@@ -1,6 +1,7 @@
 package dkim
 
 import (
+	"fmt"
 	"io"
 	"strings"
 )
@@ -15,7 +16,7 @@ const (
 
 type canonicalizer interface {
 	CanonicalizeHeader(s string) string
-	CanonicalizeBody(w io.Writer) io.WriteCloser
+	CanonicalizeBody(w io.Writer, d *diagnostics) io.WriteCloser
 }
 
 var canonicalizers = map[Canonicalization]canonicalizer{
@@ -56,6 +57,9 @@ type simpleBodyCanonicalizer struct {
 	w         io.Writer
 	crlfBuf   []byte
 	crlfFixer crlfFixer
+	d         *diagnostics
+	in        int
+	out       int
 }
 
 func (c *simpleBodyCanonicalizer) Write(b []byte) (int, error) {
@@ -85,26 +89,49 @@ func (c *simpleBodyCanonicalizer) Write(b []byte) (int, error) {
 	if end > 0 {
 		_, err = c.w.Write(b[:end])
 	}
+
+	c.d.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageBody,
+		InputOffset: c.in,
+		InputLength: written,
+		OutputBytes: end,
+		Summary:     "canonicalized body chunk",
+	})
+	c.in += written
+	c.out += end
+
 	return written, err
 }
 
 func (c *simpleBodyCanonicalizer) Close() error {
+	dropped := countTrailingLineBreaks(c.crlfBuf)
+
 	// Flush crlfBuf if it ends with a single \r (without a matching \n)
 	if len(c.crlfBuf) > 0 && c.crlfBuf[len(c.crlfBuf)-1] == '\r' {
 		if _, err := c.w.Write(c.crlfBuf); err != nil {
 			return err
 		}
+		c.out += len(c.crlfBuf)
 	}
 	c.crlfBuf = nil
 
 	if _, err := c.w.Write([]byte(crlf)); err != nil {
 		return err
 	}
+	c.out += len(crlf)
+
+	c.d.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageBody,
+		InputOffset: 0,
+		InputLength: c.in,
+		OutputBytes: c.out,
+		Summary:     fmt.Sprintf("simple body: discarded %d trailing line break(s), wrote final CRLF", dropped),
+	})
 	return nil
 }
 
-func (c *simpleCanonicalizer) CanonicalizeBody(w io.Writer) io.WriteCloser {
-	return &simpleBodyCanonicalizer{w: w}
+func (c *simpleCanonicalizer) CanonicalizeBody(w io.Writer, d *diagnostics) io.WriteCloser {
+	return &simpleBodyCanonicalizer{w: w, d: d}
 }
 
 type relaxedCanonicalizer struct{}
@@ -128,6 +155,9 @@ type relaxedBodyCanonicalizer struct {
 	wsp       bool
 	written   bool
 	crlfFixer crlfFixer
+	d         *diagnostics
+	in        int
+	out       int
 }
 
 func (c *relaxedBodyCanonicalizer) Write(b []byte) (int, error) {
@@ -161,20 +191,62 @@ func (c *relaxedBodyCanonicalizer) Write(b []byte) (int, error) {
 	}
 
 	_, err := c.w.Write(canonical)
+
+	c.d.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageBody,
+		InputOffset: c.in,
+		InputLength: written,
+		OutputBytes: len(canonical),
+		Summary:     "canonicalized body chunk",
+	})
+	c.in += written
+	c.out += len(canonical)
+
 	return written, err
 }
 
 func (c *relaxedBodyCanonicalizer) Close() error {
+	dropped := countTrailingLineBreaks(c.crlfBuf)
+
+	var summary string
 	if c.written {
 		if _, err := c.w.Write([]byte(crlf)); err != nil {
 			return err
 		}
+		c.out += len(crlf)
+		summary = fmt.Sprintf("relaxed body: discarded %d trailing line break(s)", dropped)
+	} else {
+		summary = "relaxed body: empty body, no output"
 	}
+
+	c.d.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageBody,
+		InputOffset: 0,
+		InputLength: c.in,
+		OutputBytes: c.out,
+		Summary:     summary,
+	})
 	return nil
 }
 
-func (c *relaxedCanonicalizer) CanonicalizeBody(w io.Writer) io.WriteCloser {
-	return &relaxedBodyCanonicalizer{w: w}
+func (c *relaxedCanonicalizer) CanonicalizeBody(w io.Writer, d *diagnostics) io.WriteCloser {
+	return &relaxedBodyCanonicalizer{w: w, d: d}
+}
+
+// countTrailingLineBreaks counts the number of CRLF or lone LF line breaks
+// in b. It is used to report how many trailing line breaks were discarded
+// during body canonicalization.
+func countTrailingLineBreaks(b []byte) int {
+	n := 0
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\r' && i+1 < len(b) && b[i+1] == '\n' {
+			i++
+		}
+		if b[i] == '\r' || b[i] == '\n' {
+			n++
+		}
+	}
+	return n
 }
 
 type limitedWriter struct {

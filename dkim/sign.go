@@ -68,6 +68,14 @@ type SignOptions struct {
 	//
 	// If nil, it is implicitly defined as QueryMethodDNSTXT.
 	QueryMethods []QueryMethod
+
+	// Diagnostics, if set, receives diagnostic events describing how header
+	// fields are picked and how the header and body are canonicalized. This
+	// is useful to troubleshoot a canonicalization mismatch with a
+	// verifier. Events never contain message content, so comparing with a
+	// verifier requires the verifier's original message or its own
+	// diagnostic trace.
+	Diagnostics *Diagnostics
 }
 
 // Signer generates a DKIM signature.
@@ -157,6 +165,8 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 	done := make(chan error, 1)
 	pr, pw := io.Pipe()
 
+	diag := newDiagnostics(options.Diagnostics)
+
 	s := &Signer{
 		pw:   pw,
 		done: done,
@@ -180,7 +190,7 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 
 		// Hash body
 		hasher := hash.New()
-		can := canonicalizers[bodyCan].CanonicalizeBody(hasher)
+		can := canonicalizers[bodyCan].CanonicalizeBody(hasher, diag)
 		if _, err := io.Copy(can, br); err != nil {
 			closeReadWithError(err)
 			return
@@ -232,9 +242,9 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 
 		// Hash and sign headers
 		hasher.Reset()
-		picker := newHeaderPicker(h)
+		picker := newHeaderPicker(h, diag)
 		for _, k := range headerKeys {
-			kv := picker.Pick(k)
+			kv, off := picker.Pick(k)
 			if kv == "" {
 				// The Signer MAY include more instances of a header field name
 				// in "h=" than there are actual corresponding header fields so
@@ -243,8 +253,15 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 				continue
 			}
 
-			kv = canonicalizers[headerCan].CanonicalizeHeader(kv)
-			if _, err := io.WriteString(hasher, kv); err != nil {
+			canKV := canonicalizers[headerCan].CanonicalizeHeader(kv)
+			diag.emit(DiagnosticEvent{
+				Stage:       DiagnosticStageHeader,
+				InputOffset: off,
+				InputLength: len(kv),
+				OutputBytes: len(canKV),
+				Summary:     fmt.Sprintf("canonicalized %q header field", strings.ToLower(k)),
+			})
+			if _, err := io.WriteString(hasher, canKV); err != nil {
 				closeReadWithError(err)
 				return
 			}
@@ -254,6 +271,13 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		sigField := formatSignature(params)
 		sigField = canonicalizers[headerCan].CanonicalizeHeader(sigField)
 		sigField = strings.TrimRight(sigField, crlf)
+		diag.emit(DiagnosticEvent{
+			Stage:       DiagnosticStageHeader,
+			InputOffset: -1,
+			InputLength: 0,
+			OutputBytes: len(sigField),
+			Summary:     "canonicalized generated DKIM-Signature header field (signature value emptied)",
+		})
 		if _, err := io.WriteString(hasher, sigField); err != nil {
 			closeReadWithError(err)
 			return

@@ -71,6 +71,19 @@ func parseHeaderField(s string) (string, string) {
 	return strings.TrimSpace(key), strings.TrimSpace(value)
 }
 
+// headerFieldOffset returns the byte offset of the first header field equal
+// to kv within the header block, or -1 if there is none.
+func headerFieldOffset(h header, kv string) int {
+	off := 0
+	for _, field := range h {
+		if field == kv {
+			return off
+		}
+		off += len(field)
+	}
+	return -1
+}
+
 func parseHeaderParams(s string) (map[string]string, error) {
 	pairs := strings.Split(s, ";")
 	params := make(map[string]string)
@@ -138,19 +151,41 @@ func sortParams(params map[string]string) ([]string, string, bool) {
 }
 
 type headerPicker struct {
-	h      header
-	picked map[string]int
+	h       header
+	offsets []int
+	picked  map[string]int
+	d       *diagnostics
 }
 
-func newHeaderPicker(h header) *headerPicker {
+func newHeaderPicker(h header, d *diagnostics) *headerPicker {
+	offsets := make([]int, len(h))
+	off := 0
+	for i, kv := range h {
+		offsets[i] = off
+		off += len(kv)
+	}
 	return &headerPicker{
-		h:      h,
-		picked: make(map[string]int),
+		h:       h,
+		offsets: offsets,
+		picked:  make(map[string]int),
+		d:       d,
 	}
 }
 
-func (p *headerPicker) Pick(key string) string {
+// Pick selects the next instance of the named header field, starting from
+// the bottom of the header block. It returns the raw header field and its
+// byte offset within the header block, or "" and -1 if there is no such
+// field left.
+func (p *headerPicker) Pick(key string) (string, int) {
 	key = strings.ToLower(key)
+
+	total := 0
+	for _, kv := range p.h {
+		k, _ := parseHeaderField(kv)
+		if strings.EqualFold(k, key) {
+			total++
+		}
+	}
 
 	at := p.picked[key]
 	for i := len(p.h) - 1; i >= 0; i-- {
@@ -163,10 +198,24 @@ func (p *headerPicker) Pick(key string) string {
 
 		if at == 0 {
 			p.picked[key]++
-			return kv
+			p.d.emit(DiagnosticEvent{
+				Stage:       DiagnosticStageHeaderPick,
+				InputOffset: p.offsets[i],
+				InputLength: len(kv),
+				OutputBytes: 0,
+				Summary:     fmt.Sprintf("picked %q occurrence %d of %d (newest first)", key, p.picked[key], total),
+			})
+			return kv, p.offsets[i]
 		}
 		at--
 	}
 
-	return ""
+	p.d.emit(DiagnosticEvent{
+		Stage:       DiagnosticStageHeaderPick,
+		InputOffset: -1,
+		InputLength: 0,
+		OutputBytes: 0,
+		Summary:     fmt.Sprintf("no %q header field to pick", key),
+	})
+	return "", -1
 }
