@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 )
@@ -69,6 +70,15 @@ func WithBindIP(ip net.IP) Option {
 			s.bindIP = make(net.IP, 0, len(ip))
 			s.bindIP = append(s.bindIP, ip...)
 		}
+	}
+}
+
+// WithBindTimeout sets the maximum time a BIND command waits for the
+// expected inbound connection after the first reply has been sent.
+// A non-positive duration restores the default of 2 minutes.
+func WithBindTimeout(d time.Duration) Option {
+	return func(s *Server) {
+		s.bindTimeout = d
 	}
 }
 

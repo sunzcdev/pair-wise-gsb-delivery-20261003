@@ -8,9 +8,14 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/things-go/go-socks5/statute"
 )
+
+// defaultBindTimeout is the default time the server waits for the inbound
+// connection requested by a BIND command.
+const defaultBindTimeout = 2 * time.Minute
 
 // AddressRewriter is used to rewrite a destination transparently
 type AddressRewriter interface {
@@ -168,13 +173,142 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	return nil
 }
 
-// handleBind is used to handle a connect command
-func (sf *Server) handleBind(_ context.Context, writer io.Writer, _ *Request) error {
-	// TODO: Support bind
-	if err := SendReply(writer, statute.RepCommandNotSupported, nil); err != nil {
-		return fmt.Errorf("failed to send reply: %v", err)
+// handleBind is used to handle a bind command.
+//
+// Per RFC 1928 section 6, the server sends two replies to the client over
+// the control connection. The first reply reports the address the server is
+// listening on; the second reply reports the connecting host's address and is
+// only sent after an inbound connection from the expected peer has been
+// accepted. Bidirectional relaying starts only after the second reply.
+func (sf *Server) handleBind(_ context.Context, writer io.Writer, request *Request) error {
+	timeout := sf.bindTimeout
+	if timeout <= 0 {
+		timeout = defaultBindTimeout
+	}
+
+	// Bind a listener for the inbound connection.
+	listenIP := sf.bindIP
+	if listenIP == nil {
+		if localAddr, ok := request.LocalAddr.(*net.TCPAddr); ok {
+			listenIP = localAddr.IP
+		} else {
+			listenIP = net.IPv4zero
+		}
+	}
+	bindLn, err := net.ListenTCP("tcp", &net.TCPAddr{IP: listenIP, Port: 0})
+	if err != nil {
+		sf.logger.Errorf("bind listener for %v failed, %v", request.DestAddr, err)
+		if replyErr := SendReply(writer, statute.RepServerFailure, nil); replyErr != nil {
+			return fmt.Errorf("failed to send reply, %v", replyErr)
+		}
+		return fmt.Errorf("listen for bind failed, %v", err)
+	}
+	defer bindLn.Close() // nolint: errcheck
+
+	// First reply: report the listener address, not the overall success.
+	if err := SendReply(writer, statute.RepSuccess, bindLn.Addr()); err != nil {
+		return fmt.Errorf("failed to send first bind reply, %v", err)
+	}
+
+	// Detect a prematurely closed control connection without consuming any
+	// application data the client might send after the second reply: bytes are
+	// pumped into a pipe that feeds the later client-to-peer relay.
+	pipeReader, pipeWriter := io.Pipe()
+	clientGone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(pipeWriter, request.Reader)
+		pipeWriter.Close() // nolint: errcheck
+		close(clientGone)
+	}()
+	defer pipeReader.Close() // nolint: errcheck
+
+	deadline := time.Now().Add(timeout)
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	for {
+		if err := bindLn.SetDeadline(deadline); err != nil {
+			if replyErr := SendReply(writer, statute.RepServerFailure, nil); replyErr != nil {
+				return fmt.Errorf("failed to send reply, %v", replyErr)
+			}
+			return fmt.Errorf("set bind deadline failed, %v", err)
+		}
+
+		acceptCh := make(chan acceptResult, 1)
+		go func() {
+			inbound, acceptErr := bindLn.Accept()
+			acceptCh <- acceptResult{conn: inbound, err: acceptErr}
+		}()
+
+		select {
+		case <-clientGone:
+			return errors.New("bind control connection closed by client")
+		case res := <-acceptCh:
+			if res.err != nil {
+				var netErr net.Error
+				if errors.As(res.err, &netErr) && netErr.Timeout() {
+					if replyErr := SendReply(writer, statute.RepTTLExpired, nil); replyErr != nil {
+						return fmt.Errorf("failed to send reply, %v", replyErr)
+					}
+					return fmt.Errorf("timed out waiting for inbound bind connection, %v", res.err)
+				}
+				if replyErr := SendReply(writer, statute.RepServerFailure, nil); replyErr != nil {
+					return fmt.Errorf("failed to send reply, %v", replyErr)
+				}
+				return fmt.Errorf("accept inbound bind connection failed, %v", res.err)
+			}
+
+			if !bindSourceAllowed(request.DestAddr, res.conn.RemoteAddr()) {
+				sf.logger.Errorf(
+					"reject inbound bind connection from %v, expected %v",
+					res.conn.RemoteAddr(), request.DestAddr,
+				)
+				res.conn.Close() // nolint: errcheck
+				continue
+			}
+
+			// Second reply: report the connected peer's address.
+			if err := SendReply(writer, statute.RepSuccess, res.conn.RemoteAddr()); err != nil {
+				res.conn.Close() // nolint: errcheck
+				return fmt.Errorf("failed to send second bind reply, %v", err)
+			}
+
+			return sf.relayBind(writer, pipeReader, res.conn)
+		}
+	}
+}
+
+// relayBind shuffles data in both directions between the SOCKS client and
+// the accepted inbound connection until either side terminates.
+func (sf *Server) relayBind(writer io.Writer, clientReader io.Reader, inbound net.Conn) error {
+	defer inbound.Close() // nolint: errcheck
+
+	errCh := make(chan error, 2)
+	sf.goFunc(func() { errCh <- sf.Proxy(inbound, clientReader) })
+	sf.goFunc(func() { errCh <- sf.Proxy(writer, inbound) })
+	for i := 0; i < 2; i++ {
+		if e := <-errCh; e != nil {
+			return e
+		}
 	}
 	return nil
+}
+
+// bindSourceAllowed reports whether an inbound connection matches the
+// expected peer described in the BIND request. An unspecified address or a
+// zero port in the request acts as a wildcard, mirroring RFC 1928 semantics.
+func bindSourceAllowed(expected *statute.AddrSpec, actual net.Addr) bool {
+	if expected == nil {
+		return false
+	}
+	tcpAddr, ok := actual.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	ipOK := expected.IP.IsUnspecified() || len(expected.IP) == 0 || expected.IP.Equal(tcpAddr.IP)
+	portOK := expected.Port == 0 || expected.Port == tcpAddr.Port
+	return ipOK && portOK
 }
 
 // handleAssociate is used to handle a connect command

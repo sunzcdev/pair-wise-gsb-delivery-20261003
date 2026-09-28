@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 	"github.com/things-go/go-socks5/statute"
@@ -42,6 +43,9 @@ type Server struct {
 	rewriter AddressRewriter
 	// bindIP is used for bind or udp associate
 	bindIP net.IP
+	// bindTimeout limits how long a BIND request waits for the inbound
+	// connection; defaults to defaultBindTimeout when non-positive.
+	bindTimeout time.Duration
 	// useBindIpResolveAsUdpAddr is used to resolve bindIP as udp address
 	// default false, use  &net.UDPAddr{IP: request.LocalAddr.(*net.TCPAddr).IP, Port: 0}
 	useBindIpBaseResolveAsUdpAddr bool

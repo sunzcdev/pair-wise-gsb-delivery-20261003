@@ -11,7 +11,7 @@ This repository implements a SOCKS5 proxy server library in Go. It provides a fl
 ### Core Components
 
 - **Server** (`server.go`): Main entry point. Created via `NewServer` with functional options (`option.go`). Handles incoming connections, authentication, and request routing.
-- **Request Handling** (`handle.go`): Processes CONNECT, BIND, and ASSOCIATE commands. CONNECT proxies TCP traffic; ASSOCIATE handles UDP tunneling; BIND is not yet implemented (TODO).
+- **Request Handling** (`handle.go`): Processes CONNECT, BIND, and ASSOCIATE commands. CONNECT proxies TCP traffic; ASSOCIATE handles UDP tunneling; BIND accepts an inbound connection on a server listener and relays it (two-reply flow per RFC 1928).
 - **Authentication** (`auth.go`): Pluggable authenticators (`Authenticator` interface). Built-in `NoAuthAuthenticator` and `UserPassAuthenticator`. Credentials are validated via `CredentialStore` (`credentials.go`).
 - **Rules** (`ruleset.go`): `RuleSet` interface for allowing/denying commands. Default `PermitCommand` provides simple command-based filtering.
 - **Resolver** (`resolver.go`): `NameResolver` interface for custom DNS resolution. Default `DNSResolver` uses system DNS.
@@ -40,7 +40,7 @@ The server is configured via functional options (`With*` functions in `option.go
 4. If allowed, executes command-specific handler (with optional middleware and user override).
 5. CONNECT: establishes TCP proxy between client and target.
 6. ASSOCIATE: sets up UDP relay, managing bidirectional datagrams between client and remote hosts.
-7. BIND: not implemented (returns command not supported).
+7. BIND: opens a TCP listener, sends the listen address as the first reply, waits for the expected inbound connection (source must match the request's DST.ADDR/DST.PORT, with unspecified/zero acting as wildcards), then sends the peer address as the second reply and relays bidirectionally. Wait timeout (`WithBindTimeout`, default 2m) replies `TTL expired`; an early-closed control connection tears the listener down.
 
 ### Concurrency
 
@@ -96,7 +96,7 @@ go mod verify
 - **Testing**: Use `-race` flag for data‑race detection. Coverage reports are uploaded to Codecov.
 - **Linting**: The CI runs a subset of golangci-lint checkers; you can run the same locally.
 - **Error Handling**: The library logs errors via the configured `Logger`; it returns errors for fatal conditions.
-- **Protocol Compliance**: Implements RFC 1928 (SOCKS5). BIND command is not yet supported (TODO).
+- **Protocol Compliance**: Implements RFC 1928 (SOCKS5), including the two-reply BIND flow.
 - **Example**: The example server (`_example/main.go`) listens on `:10800`; the README shows `:8000` for illustration.
 - **Buffer Pooling**: Default buffer size is 32KB. Custom pools must implement `bufferpool.BufPool`.
 - **Goroutine Pool**: Optional; if not provided, each connection spawns a new goroutine.
