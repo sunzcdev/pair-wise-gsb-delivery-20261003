@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 )
@@ -173,5 +174,14 @@ func WithAssociateMiddleware(m Middleware) Option {
 func WithUseBindIpBaseResolveAsUdpAddr(b bool) Option {
 	return func(s *Server) {
 		s.useBindIpBaseResolveAsUdpAddr = b
+	}
+}
+
+// WithBindTimeout is used to set the timeout for waiting the inbound
+// connection of a bind command. If not set or not positive, a default
+// timeout of 2 minutes is used.
+func WithBindTimeout(timeout time.Duration) Option {
+	return func(s *Server) {
+		s.bindTimeout = timeout
 	}
 }

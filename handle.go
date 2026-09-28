@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/things-go/go-socks5/statute"
 )
@@ -168,11 +169,139 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	return nil
 }
 
-// handleBind is used to handle a connect command
-func (sf *Server) handleBind(_ context.Context, writer io.Writer, _ *Request) error {
-	// TODO: Support bind
-	if err := SendReply(writer, statute.RepCommandNotSupported, nil); err != nil {
-		return fmt.Errorf("failed to send reply: %v", err)
+// defaultBindTimeout is the default timeout for waiting the inbound connection of a bind command
+const defaultBindTimeout = 2 * time.Minute
+
+// handleBind is used to handle a bind command
+//
+// It implements the two-phase reply of RFC 1928: the first reply reports the
+// address the server is listening on, the second reply is sent only after an
+// inbound connection from the expected peer has arrived, and reports the
+// address of that peer. Afterwards data is relayed between the control
+// connection and the inbound connection.
+func (sf *Server) handleBind(_ context.Context, writer io.Writer, request *Request) error {
+	// Listen on the same local address as the control connection, or bindIP if set
+	listenIP := sf.bindIP
+	if listenIP == nil {
+		if tcpAddr, ok := request.LocalAddr.(*net.TCPAddr); ok {
+			listenIP = tcpAddr.IP
+		}
+	}
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: listenIP, Port: 0})
+	if err != nil {
+		if err := SendReply(writer, statute.RepServerFailure, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return fmt.Errorf("bind listen failed, %v", err)
+	}
+	defer listener.Close() // nolint: errcheck
+
+	// First reply: report the address the server is listening on.
+	// The bind is not complete yet, the client must wait for the second reply.
+	if err := SendReply(writer, statute.RepSuccess, listener.Addr()); err != nil {
+		return fmt.Errorf("failed to send reply, %v", err)
+	}
+
+	timeout := sf.bindTimeout
+	if timeout <= 0 {
+		timeout = defaultBindTimeout
+	}
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	sf.goFunc(func() {
+		conn, err := listener.Accept()
+		acceptCh <- acceptResult{conn, err}
+	})
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	// Monitor the control connection while waiting: the client must neither
+	// send data nor disconnect before the second reply. The read is bounded
+	// by a read deadline so it can be interrupted once the inbound
+	// connection arrives or the wait times out.
+	var ctrlCh chan error
+	ctrlConn, canDeadline := writer.(net.Conn)
+	if canDeadline {
+		if err := ctrlConn.SetReadDeadline(time.Now().Add(timeout)); err == nil {
+			ctrlCh = make(chan error, 1)
+			sf.goFunc(func() {
+				_, err := request.Reader.Read(make([]byte, 1))
+				ctrlCh <- err
+			})
+		}
+	}
+
+	var inbound net.Conn
+	select {
+	case res := <-acceptCh:
+		if res.err != nil {
+			return fmt.Errorf("bind accept failed, %v", res.err)
+		}
+		inbound = res.conn
+	case err := <-ctrlCh:
+		// The control connection was closed by the client (or the client
+		// unexpectedly sent data) while waiting for the inbound connection.
+		return fmt.Errorf("bind: control connection terminated while waiting for inbound connection, %v", err)
+	case <-timer.C:
+		if err := SendReply(writer, statute.RepTTLExpired, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return errors.New("bind: timed out waiting for inbound connection")
+	}
+	listener.Close() // nolint: errcheck
+
+	// Stop the control connection monitor before reusing request.Reader for
+	// proxying: force the pending read to return, wait for the goroutine to
+	// finish, then clear the deadline.
+	if ctrlCh != nil {
+		ctrlConn.SetReadDeadline(time.Now()) // nolint: errcheck
+		<-ctrlCh
+		ctrlConn.SetReadDeadline(time.Time{}) // nolint: errcheck
+	}
+
+	// The inbound connection must come from the expected peer.
+	remoteTCP, ok := inbound.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		inbound.Close() // nolint: errcheck
+		if err := SendReply(writer, statute.RepConnectionRefused, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return fmt.Errorf("bind: unexpected inbound peer type %T", inbound.RemoteAddr())
+	}
+	dest := request.DestAddr
+	match := (dest.IP == nil || dest.IP.IsUnspecified() || dest.IP.Equal(remoteTCP.IP)) &&
+		(dest.Port == 0 || dest.Port == remoteTCP.Port)
+	if !match {
+		inbound.Close() // nolint: errcheck
+		if err := SendReply(writer, statute.RepConnectionRefused, nil); err != nil {
+			return fmt.Errorf("failed to send reply, %v", err)
+		}
+		return fmt.Errorf("bind: unexpected inbound peer %v, expect %v", remoteTCP, dest)
+	}
+
+	// Second reply: report the address of the connected peer.
+	if err := SendReply(writer, statute.RepSuccess, inbound.RemoteAddr()); err != nil {
+		inbound.Close() // nolint: errcheck
+		return fmt.Errorf("failed to send reply, %v", err)
+	}
+	defer inbound.Close() // nolint: errcheck
+
+	// Start proxying between the control connection and the inbound connection
+	errCh := make(chan error, 2)
+	sf.goFunc(func() { errCh <- sf.Proxy(inbound, request.Reader) })
+	sf.goFunc(func() { errCh <- sf.Proxy(writer, inbound) })
+	// Wait
+	for i := 0; i < 2; i++ {
+		e := <-errCh
+		if e != nil {
+			// return from this function closes inbound (and conn).
+			return e
+		}
 	}
 	return nil
 }

@@ -644,6 +644,162 @@ func TestSOCKS5_Associate(t *testing.T) {
 	})
 }
 
+// setupBindControlConn starts the socks server and performs the handshake and
+// the BIND request on a fresh control connection, returning the control
+// connection and the first reply (which carries the bind listen address).
+func setupBindControlConn(t *testing.T, srv *Server, dst statute.AddrSpec) (net.Conn, statute.Reply) {
+	t.Helper()
+
+	l, err := net.Listen("tcp", "127.0.0.1:0") // nolint: noctx
+	require.NoError(t, err)
+	t.Cleanup(func() { l.Close() }) // nolint: errcheck
+	go func() { srv.Serve(l) }()    // nolint: errcheck
+
+	ctrl, err := net.Dial("tcp", l.Addr().String()) // nolint: noctx
+	require.NoError(t, err)
+
+	// handshake: no auth
+	_, err = ctrl.Write([]byte{statute.VersionSocks5, 1, statute.MethodNoAuth})
+	require.NoError(t, err)
+	out := make([]byte, 2)
+	_, err = io.ReadFull(ctrl, out)
+	require.NoError(t, err)
+	require.Equal(t, []byte{statute.VersionSocks5, statute.MethodNoAuth}, out)
+
+	// BIND request
+	reqHead := statute.Request{
+		Version:  statute.VersionSocks5,
+		Command:  statute.CommandBind,
+		Reserved: 0,
+		DstAddr:  dst,
+	}
+	_, err = ctrl.Write(reqHead.Bytes())
+	require.NoError(t, err)
+
+	// first reply: reports the address the server is listening on
+	rep1, err := statute.ParseReply(ctrl)
+	require.NoError(t, err)
+	require.Equal(t, statute.RepSuccess, rep1.Response)
+	require.NotZero(t, rep1.BndAddr.Port)
+
+	return ctrl, rep1
+}
+
+func TestSOCKS5_Bind(t *testing.T) {
+	t.Run("bind", func(t *testing.T) {
+		srv := NewServer(
+			WithLogger(NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
+		)
+		ctrl, rep1 := setupBindControlConn(t, srv, statute.AddrSpec{
+			AddrType: statute.ATYPIPv4,
+			IP:       net.ParseIP("127.0.0.1"),
+			Port:     0,
+		})
+		defer ctrl.Close() // nolint: errcheck
+
+		// the external service reverse-connects to the reported listen address
+		peer, err := net.Dial("tcp", (&net.TCPAddr{IP: rep1.BndAddr.IP, Port: rep1.BndAddr.Port}).String()) // nolint: noctx
+		require.NoError(t, err)
+		defer peer.Close() // nolint: errcheck
+
+		// second reply: reports the address of the connected peer
+		rep2, err := statute.ParseReply(ctrl)
+		require.NoError(t, err)
+		require.Equal(t, statute.RepSuccess, rep2.Response)
+		require.Equal(t, peer.LocalAddr().(*net.TCPAddr).Port, rep2.BndAddr.Port)
+		require.True(t, rep2.BndAddr.IP.Equal(net.ParseIP("127.0.0.1")))
+
+		// data flows from the client (control connection) to the peer
+		_, err = ctrl.Write([]byte("ping"))
+		require.NoError(t, err)
+		buf := make([]byte, 4)
+		peer.SetDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+		_, err = io.ReadFull(peer, buf)
+		require.NoError(t, err)
+		require.Equal(t, []byte("ping"), buf)
+
+		// data flows from the peer back to the client
+		_, err = peer.Write([]byte("pong"))
+		require.NoError(t, err)
+		ctrl.SetDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+		_, err = io.ReadFull(ctrl, buf)
+		require.NoError(t, err)
+		require.Equal(t, []byte("pong"), buf)
+	})
+
+	t.Run("bind/timeout", func(t *testing.T) {
+		srv := NewServer(
+			WithBindTimeout(200*time.Millisecond),
+			WithLogger(NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
+		)
+		ctrl, _ := setupBindControlConn(t, srv, statute.AddrSpec{
+			AddrType: statute.ATYPIPv4,
+			IP:       net.ParseIP("127.0.0.1"),
+			Port:     0,
+		})
+		defer ctrl.Close() // nolint: errcheck
+
+		// no inbound connection arrives: the second reply reports the failure
+		ctrl.SetDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+		rep2, err := statute.ParseReply(ctrl)
+		require.NoError(t, err)
+		require.Equal(t, statute.RepTTLExpired, rep2.Response)
+	})
+
+	t.Run("bind/unexpectedPeer", func(t *testing.T) {
+		srv := NewServer(
+			WithLogger(NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
+		)
+		// expect a peer from port 1, which no real connection will match
+		ctrl, rep1 := setupBindControlConn(t, srv, statute.AddrSpec{
+			AddrType: statute.ATYPIPv4,
+			IP:       net.ParseIP("127.0.0.1"),
+			Port:     1,
+		})
+		defer ctrl.Close() // nolint: errcheck
+
+		peer, err := net.Dial("tcp", (&net.TCPAddr{IP: rep1.BndAddr.IP, Port: rep1.BndAddr.Port}).String()) // nolint: noctx
+		require.NoError(t, err)
+		defer peer.Close() // nolint: errcheck
+
+		// the inbound connection comes from an unexpected source: the second
+		// reply reports the failure and the peer connection is closed
+		ctrl.SetDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+		rep2, err := statute.ParseReply(ctrl)
+		require.NoError(t, err)
+		require.Equal(t, statute.RepConnectionRefused, rep2.Response)
+
+		peer.SetDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+		_, err = peer.Read(make([]byte, 1))
+		require.Error(t, err)
+	})
+
+	t.Run("bind/controlConnClosed", func(t *testing.T) {
+		srv := NewServer(
+			WithLogger(NewLogger(log.New(os.Stdout, "socks5: ", log.LstdFlags))),
+		)
+		ctrl, rep1 := setupBindControlConn(t, srv, statute.AddrSpec{
+			AddrType: statute.ATYPIPv4,
+			IP:       net.ParseIP("127.0.0.1"),
+			Port:     0,
+		})
+
+		// the client goes away before the inbound connection arrives:
+		// the bind listener must be torn down
+		require.NoError(t, ctrl.Close())
+
+		bindAddr := (&net.TCPAddr{IP: rep1.BndAddr.IP, Port: rep1.BndAddr.Port}).String()
+		require.Eventually(t, func() bool {
+			conn, err := net.DialTimeout("tcp", bindAddr, 100*time.Millisecond) // nolint: noctx
+			if err != nil {
+				return true
+			}
+			conn.Close() // nolint: errcheck
+			return false
+		}, 2*time.Second, 50*time.Millisecond)
+	})
+}
+
 func Test_SocksWithProxy(t *testing.T) {
 	// Create a local listener
 	l, err := net.Listen("tcp", "127.0.0.1:0") // nolint: noctx

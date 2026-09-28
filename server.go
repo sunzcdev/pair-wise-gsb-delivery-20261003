@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 	"github.com/things-go/go-socks5/statute"
@@ -53,6 +54,9 @@ type Server struct {
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// Optional function for dialing out with the access of request detail.
 	dialWithRequest func(ctx context.Context, network, addr string, request *Request) (net.Conn, error)
+	// bindTimeout is the timeout for waiting the inbound connection of a bind command.
+	// Defaults to defaultBindTimeout if not provided.
+	bindTimeout time.Duration
 	// buffer pool
 	bufferPool bufferpool.BufPool
 	// goroutine pool
