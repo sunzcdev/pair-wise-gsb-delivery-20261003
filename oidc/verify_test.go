@@ -1,14 +1,18 @@
 package oidc
 
 import (
+	"context"
 	"crypto"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -492,6 +496,355 @@ func TestDistClaimResolver(t *testing.T) {
 		})
 	}
 
+}
+
+// TestAggregatedClaims verifies support for "_claim_sources" entries that
+// carry an aggregated claims JWT. Two independent issuers back two sources:
+//
+//   - "https://university.example" issues the "degree" claim.
+//   - "https://employer.example" issues the "job_title" and "department"
+//     claims, proving a source referenced by multiple claims is verified
+//     once while failures still name every affected claim.
+func TestAggregatedClaims(t *testing.T) {
+	ctx := t.Context()
+
+	idpKey := newRSAKey(t)
+	uniKey := newRSAKey(t)
+	employerKey := newRSAKey(t)
+
+	const (
+		idpIssuer      = "https://foo"
+		uniIssuer      = "https://university.example"
+		employerIssuer = "https://employer.example"
+	)
+
+	uniVerifier := NewVerifier(uniIssuer, &StaticKeySet{PublicKeys: []crypto.PublicKey{uniKey.pub}}, &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+	})
+	employerVerifier := NewVerifier(employerIssuer, &StaticKeySet{PublicKeys: []crypto.PublicKey{employerKey.pub}}, &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+	})
+
+	// University JWT: only "degree" is referenced. The extra "gpa", "iss",
+	// and "sub" members must not be merged into the main token.
+	uniToken := uniKey.sign(t, []byte(`{
+		"iss": "https://university.example",
+		"aud": "client1",
+		"sub": "student-123",
+		"degree": {"type": "BachelorDegree", "name": "B.Sc. Computer Science"},
+		"gpa": 3.9
+	}`))
+
+	// Employer JWT: both "job_title" and "department" reference this source.
+	employerToken := employerKey.sign(t, []byte(`{
+		"iss": "https://employer.example",
+		"aud": "client1",
+		"sub": "employee-456",
+		"job_title": "Software Engineer",
+		"department": "Platform"
+	}`))
+
+	idTokenPayload := fmt.Sprintf(`{
+		"iss": "https://foo",
+		"aud": "client1",
+		"sub": "user-789",
+		"_claim_names": {
+			"degree": "uni",
+			"job_title": "employer",
+			"department": "employer"
+		},
+		"_claim_sources": {
+			"uni": {"JWT": %q},
+			"employer": {"JWT": %q}
+		}
+	}`, uniToken, employerToken)
+
+	rawIDToken := idpKey.sign(t, []byte(idTokenPayload))
+
+	config := &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+		ClaimSourceVerifiers: map[string]*IDTokenVerifier{
+			"uni":      uniVerifier,
+			"employer": employerVerifier,
+		},
+	}
+	verifier := NewVerifier(idpIssuer, &StaticKeySet{PublicKeys: []crypto.PublicKey{idpKey.pub}}, config)
+
+	token, err := verifier.Verify(ctx, rawIDToken)
+	if err != nil {
+		t.Fatalf("verifying token with aggregated claims: %v", err)
+	}
+
+	// Both issuers' referenced claims are merged into the main token.
+	var merged struct {
+		Subject string `json:"sub"`
+		Degree  struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		} `json:"degree"`
+		JobTitle   string   `json:"job_title"`
+		Department string   `json:"department"`
+		GPA        *float64 `json:"gpa"`
+	}
+	if err := token.Claims(&merged); err != nil {
+		t.Fatalf("unmarshaling merged claims: %v", err)
+	}
+	if merged.Subject != "user-789" {
+		t.Errorf("main token subject not preserved, got %q", merged.Subject)
+	}
+	if merged.Degree.Type != "BachelorDegree" || merged.Degree.Name != "B.Sc. Computer Science" {
+		t.Errorf("degree claim not merged, got %#v", merged.Degree)
+	}
+	if merged.JobTitle != "Software Engineer" {
+		t.Errorf("job_title claim not merged, got %q", merged.JobTitle)
+	}
+	if merged.Department != "Platform" {
+		t.Errorf("department claim not merged, got %q", merged.Department)
+	}
+	if merged.GPA != nil {
+		t.Errorf("unreferenced claim from aggregated JWT must not be merged, got gpa=%v", *merged.GPA)
+	}
+
+	var rawMerged map[string]json.RawMessage
+	if err := json.Unmarshal(token.claims, &rawMerged); err != nil {
+		t.Fatalf("unmarshaling raw merged claims: %v", err)
+	}
+	if _, ok := rawMerged["iss"]; !ok {
+		t.Errorf("main token issuer claim missing")
+	}
+	if got := string(rawMerged["iss"]); got != `"https://foo"` {
+		t.Errorf("main token issuer must not be overwritten by an aggregated JWT, got %s", got)
+	}
+
+	// The endpoint-based source metadata is still exposed for lazy resolution.
+	if !reflect.DeepEqual(token.distributedClaims, map[string]claimSource{
+		"degree":     {JWT: uniToken},
+		"job_title":  {JWT: employerToken},
+		"department": {JWT: employerToken},
+	}) {
+		t.Errorf("unexpected distributed claim sources: %#v", token.distributedClaims)
+	}
+}
+
+// countingKeySet records how many times VerifySignature is invoked.
+type countingKeySet struct {
+	inner KeySet
+	calls int
+}
+
+func (c *countingKeySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	c.calls++
+	return c.inner.VerifySignature(ctx, jwt)
+}
+
+func TestAggregatedClaimsVerifiedOncePerSource(t *testing.T) {
+	ctx := t.Context()
+
+	idpKey := newRSAKey(t)
+	employerKey := newRSAKey(t)
+
+	const employerIssuer = "https://employer.example"
+
+	employerKeySet := &countingKeySet{inner: &StaticKeySet{PublicKeys: []crypto.PublicKey{employerKey.pub}}}
+	employerVerifier := NewVerifier(employerIssuer, employerKeySet, &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+	})
+
+	employerToken := employerKey.sign(t, []byte(`{
+		"iss": "https://employer.example",
+		"aud": "client1",
+		"sub": "employee-456",
+		"job_title": "Software Engineer",
+		"department": "Platform"
+	}`))
+
+	// Three claim names reference the same employer source.
+	idTokenPayload := fmt.Sprintf(`{
+		"iss": "https://foo",
+		"aud": "client1",
+		"_claim_names": {
+			"job_title": "employer",
+			"department": "employer",
+			"team": "employer"
+		},
+		"_claim_sources": {
+			"employer": {"JWT": %q}
+		}
+	}`, employerToken)
+
+	// "team" is intentionally absent from the JWT: verification itself runs
+	// once, then the missing referenced claim fails the merge.
+	verifier := NewVerifier("https://foo", &StaticKeySet{PublicKeys: []crypto.PublicKey{idpKey.pub}}, &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+		ClaimSourceVerifiers: map[string]*IDTokenVerifier{
+			"employer": employerVerifier,
+		},
+	})
+
+	_, err := verifier.Verify(ctx, idpKey.sign(t, []byte(idTokenPayload)))
+	if err == nil {
+		t.Fatalf("expected error for missing referenced claim")
+	}
+	if !strings.Contains(err.Error(), `aggregated claims source "employer" does not contain claim "team"`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if employerKeySet.calls != 1 {
+		t.Fatalf("expected source to be verified once despite 3 references, got %d verifications", employerKeySet.calls)
+	}
+}
+
+func TestAggregatedClaimsErrors(t *testing.T) {
+	ctx := t.Context()
+
+	idpKey := newRSAKey(t)
+	uniKey := newRSAKey(t)
+	otherKey := newRSAKey(t)
+
+	const (
+		idpIssuer = "https://foo"
+		uniIssuer = "https://university.example"
+	)
+
+	uniVerifier := NewVerifier(uniIssuer, &StaticKeySet{PublicKeys: []crypto.PublicKey{uniKey.pub}}, &Config{
+		ClientID:        "client1",
+		SkipExpiryCheck: true,
+	})
+
+	uniToken := func(t *testing.T, payload string) string {
+		return uniKey.sign(t, []byte(payload))
+	}
+
+	tests := []struct {
+		name      string
+		payload   func(t *testing.T) string
+		verifiers map[string]*IDTokenVerifier
+		wantErr   string
+	}{
+		{
+			name: "noVerifier",
+			payload: func(t *testing.T) string {
+				agg := uniToken(t, `{
+					"iss": "https://university.example",
+					"aud": "client1",
+					"degree": {"name": "B.Sc."}
+				}`)
+				return fmt.Sprintf(`{
+					"iss": "https://foo",
+					"aud": "client1",
+					"_claim_names": {"degree": "uni"},
+					"_claim_sources": {"uni": {"JWT": %q}}
+				}`, agg)
+			},
+			verifiers: map[string]*IDTokenVerifier(nil),
+			wantErr:   `no verifier configured for aggregated claims source "uni" (claims degree)`,
+		},
+		{
+			name: "untrustedIssuer",
+			payload: func(t *testing.T) string {
+				agg := uniToken(t, `{
+					"iss": "https://evil.example",
+					"aud": "client1",
+					"degree": {"name": "B.Sc."}
+				}`)
+				return fmt.Sprintf(`{
+					"iss": "https://foo",
+					"aud": "client1",
+					"_claim_names": {"degree": "uni"},
+					"_claim_sources": {"uni": {"JWT": %q}}
+				}`, agg)
+			},
+			verifiers: map[string]*IDTokenVerifier{"uni": uniVerifier},
+			wantErr:   `failed to verify aggregated claims source "uni" (claims degree)`,
+		},
+		{
+			name: "badSignatureAffectsMultipleClaims",
+			payload: func(t *testing.T) string {
+				agg := otherKey.sign(t, []byte(`{
+					"iss": "https://university.example",
+					"aud": "client1",
+					"job_title": "Engineer",
+					"department": "Platform"
+				}`))
+				return fmt.Sprintf(`{
+					"iss": "https://foo",
+					"aud": "client1",
+					"_claim_names": {"job_title": "employer", "department": "employer"},
+					"_claim_sources": {"employer": {"JWT": %q}}
+				}`, agg)
+			},
+			verifiers: map[string]*IDTokenVerifier{"employer": uniVerifier},
+			wantErr:   `failed to verify aggregated claims source "employer" (claims department, job_title)`,
+		},
+		{
+			name: "referencedClaimMissing",
+			payload: func(t *testing.T) string {
+				agg := uniToken(t, `{
+					"iss": "https://university.example",
+					"aud": "client1",
+					"gpa": 3.9
+				}`)
+				return fmt.Sprintf(`{
+					"iss": "https://foo",
+					"aud": "client1",
+					"_claim_names": {"degree": "uni"},
+					"_claim_sources": {"uni": {"JWT": %q}}
+				}`, agg)
+			},
+			verifiers: map[string]*IDTokenVerifier{"uni": uniVerifier},
+			wantErr:   `aggregated claims source "uni" does not contain claim "degree"`,
+		},
+		{
+			name: "unreferencedSourceIgnored",
+			payload: func(t *testing.T) string {
+				// "unused" has no verifier, but nothing in "_claim_names"
+				// points at it, so it must be ignored.
+				agg := uniToken(t, `{
+					"iss": "https://university.example",
+					"aud": "client1",
+					"degree": {"name": "B.Sc."}
+				}`)
+				return fmt.Sprintf(`{
+					"iss": "https://foo",
+					"aud": "client1",
+					"_claim_names": {"degree": "uni"},
+					"_claim_sources": {
+						"uni": {"JWT": %q},
+						"unused": {"JWT": "not-a-jwt"}
+					}
+				}`, agg)
+			},
+			verifiers: map[string]*IDTokenVerifier{"uni": uniVerifier},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rawIDToken := idpKey.sign(t, []byte(test.payload(t)))
+			verifier := NewVerifier(idpIssuer, &StaticKeySet{PublicKeys: []crypto.PublicKey{idpKey.pub}}, &Config{
+				ClientID:             "client1",
+				SkipExpiryCheck:      true,
+				ClaimSourceVerifiers: test.verifiers,
+			})
+			_, err := verifier.Verify(ctx, rawIDToken)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected no error, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got none", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("expected error containing %q, got %q", test.wantErr, err.Error())
+			}
+		})
+	}
 }
 
 type resolverTest struct {

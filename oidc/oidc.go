@@ -619,6 +619,7 @@ type idToken struct {
 type claimSource struct {
 	Endpoint    string `json:"endpoint"`
 	AccessToken string `json:"access_token"`
+	JWT         string `json:"JWT"`
 }
 
 type stringAsBool bool
