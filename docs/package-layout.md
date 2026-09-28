@@ -120,3 +120,29 @@ if err != nil {
 Package `kbin` is a small utility package that is for speaking the binary
 protocol that Kafka speaks. This is useful for reading from and writing
 to Kafka.
+
+## Package [kencrypt](https://pkg.go.dev/github.com/twmb/franz-go/pkg/kencrypt)
+
+Package `kencrypt` is an optional application-layer record envelope
+encryption layer. It encrypts record values while leaving keys in plaintext
+so that partitioning and routing are unaffected, and it preserves nil-value
+tombstones. Envelopes carry a format version and key ID (supporting key
+rotation through an injectable `KeyProvider`), and the record's topic, key,
+and a configurable set of headers are authenticated so that tampering or
+copying a record to another topic fails decryption.
+
+Usage:
+
+```go
+provider, _ := kencrypt.NewMapProvider("key-1", map[string][]byte{
+    "key-1": key, // 32 byte AES-256 key
+})
+cipher := kencrypt.NewCipher(provider, kencrypt.AuthenticateHeaders("tenant"))
+
+client, _ := kgo.NewClient(
+    kgo.SeedBrokers(seeds...),
+    kgo.WithHooks(cipher.Hook(func(err error) {
+        // encryption/decryption failure; the record is never half-decrypted
+    })),
+)
+```
