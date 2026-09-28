@@ -3,10 +3,12 @@ package oidc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
@@ -29,6 +31,27 @@ type TokenExpiredError struct {
 
 func (e *TokenExpiredError) Error() string {
 	return fmt.Sprintf("oidc: token is expired (Token Expiry: %v)", e.Expiry)
+}
+
+// ClaimSourceError indicates that [IDTokenVerifier.Verify] failed to resolve a
+// JWT ("aggregated claims") entry in the ID Token's "_claim_sources" member.
+type ClaimSourceError struct {
+	// Source is the name of the claim source in "_claim_sources".
+	Source string
+	// Claims are the claim names in "_claim_names" that reference the source
+	// and are therefore affected by the failure.
+	Claims []string
+	// Err is the underlying failure.
+	Err error
+}
+
+func (e *ClaimSourceError) Error() string {
+	return fmt.Sprintf("oidc: failed to resolve claims %q from JWT claim source %q: %v",
+		strings.Join(e.Claims, ", "), e.Source, e.Err)
+}
+
+func (e *ClaimSourceError) Unwrap() error {
+	return e.Err
 }
 
 // KeySet is a set of public JSON Web Keys that can be used to validate the signature
@@ -115,6 +138,19 @@ type Config struct {
 	// This option MUST NOT be used when receiving an ID Token from sources other
 	// than the token endpoint.
 	InsecureSkipSignatureCheck bool
+
+	// ClaimSourceVerifiers maps names in the ID Token's "_claim_sources" member
+	// to verifiers for JWT ("aggregated claims") claim sources. Callers are
+	// responsible for configuring each verifier with the trusted issuer and
+	// keys of the claims provider.
+	//
+	// Claims from a verified JWT source are merged into the ID Token's claims,
+	// but only the claims explicitly named by the ID Token's "_claim_names"
+	// member are accepted. Other claims in the source JWT, such as "iss" or
+	// "sub", never override the ID Token's own claims.
+	//
+	// A JWT claim source without a configured verifier causes Verify to fail.
+	ClaimSourceVerifiers map[string]*IDTokenVerifier
 }
 
 // VerifierContext returns an IDTokenVerifier that uses the provider's key set to
@@ -175,6 +211,85 @@ func resolveDistributedClaim(ctx context.Context, verifier *IDTokenVerifier, src
 	}
 
 	return token.claims, nil
+}
+
+// resolveAggregatedClaims verifies the JWT entries in the ID Token's
+// "_claim_sources" member and merges the claims referenced by "_claim_names"
+// into the token's claims. Each source is verified at most once, no matter how
+// many claim names reference it. Only claims explicitly named by "_claim_names"
+// are merged; all other claims in the source JWT, including "iss" and "sub",
+// are ignored.
+func (v *IDTokenVerifier) resolveAggregatedClaims(ctx context.Context, t *IDToken, token *idToken) error {
+	// Group the claim names in "_claim_names" by JWT claim source.
+	claimsBySource := make(map[string][]string)
+	for claimName, sourceName := range token.ClaimNames {
+		src, ok := token.ClaimSources[sourceName]
+		if !ok || src.JWT == "" {
+			// Unknown sources are rejected by Verify. Endpoint sources are
+			// resolved through resolveDistributedClaim instead.
+			continue
+		}
+		claimsBySource[sourceName] = append(claimsBySource[sourceName], claimName)
+	}
+	if len(claimsBySource) == 0 {
+		return nil
+	}
+
+	merged := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(t.claims, &merged); err != nil {
+		return fmt.Errorf("oidc: failed to unmarshal claims: %v", err)
+	}
+
+	sourceNames := make([]string, 0, len(claimsBySource))
+	for sourceName := range claimsBySource {
+		sourceNames = append(sourceNames, sourceName)
+	}
+	slices.Sort(sourceNames)
+
+	for _, sourceName := range sourceNames {
+		claimNames := claimsBySource[sourceName]
+		slices.Sort(claimNames)
+
+		verifier, ok := v.config.ClaimSourceVerifiers[sourceName]
+		if !ok {
+			return &ClaimSourceError{
+				Source: sourceName,
+				Claims: claimNames,
+				Err:    errors.New("no verifier configured for JWT claim source"),
+			}
+		}
+
+		srcToken, err := verifier.Verify(ctx, token.ClaimSources[sourceName].JWT)
+		if err != nil {
+			return &ClaimSourceError{Source: sourceName, Claims: claimNames, Err: err}
+		}
+		var srcClaims map[string]json.RawMessage
+		if err := json.Unmarshal(srcToken.claims, &srcClaims); err != nil {
+			return &ClaimSourceError{
+				Source: sourceName,
+				Claims: claimNames,
+				Err:    fmt.Errorf("failed to unmarshal claims: %v", err),
+			}
+		}
+		for _, claimName := range claimNames {
+			raw, ok := srcClaims[claimName]
+			if !ok {
+				return &ClaimSourceError{
+					Source: sourceName,
+					Claims: claimNames,
+					Err:    fmt.Errorf("JWT does not contain claim %q", claimName),
+				}
+			}
+			merged[claimName] = raw
+		}
+	}
+
+	payload, err := json.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("oidc: failed to marshal merged claims: %v", err)
+	}
+	t.claims = payload
+	return nil
 }
 
 // Verify parses a raw ID Token, verifies it's been signed by the provider, performs
@@ -281,6 +396,10 @@ func (v *IDTokenVerifier) Verify(ctx context.Context, rawIDToken string) (*IDTok
 				return nil, fmt.Errorf("oidc: current time %v before the nbf (not before) time: %v", nowTime, nbfTime)
 			}
 		}
+	}
+
+	if err := v.resolveAggregatedClaims(ctx, t, &token); err != nil {
+		return nil, err
 	}
 
 	return t, nil
