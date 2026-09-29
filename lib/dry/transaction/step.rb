@@ -23,26 +23,29 @@ module Dry
       attr_reader :call_args
 
       def initialize(adapter:, name:, operation_name:, options:, operation: nil, call_args: [])
-        @adapter = StepAdapter[adapter, operation,
-          {**options, step_name: name, operation_name: operation_name}]
+        options = {**options, step_name: name, operation_name: operation_name}
+        options[:publisher] = self if options.key?(:checks)
+
+        @adapter = StepAdapter[adapter, operation, options]
         @name = name
         @operation_name = operation_name
         @call_args = call_args
       end
       # rubocop:enable Metrics/ParameterLists
 
-      def with(operation: UNDEFINED, call_args: UNDEFINED)
-        return self if operation == UNDEFINED && call_args == UNDEFINED
+      def with(operation: UNDEFINED, call_args: UNDEFINED, options: UNDEFINED)
+        return self if operation == UNDEFINED && call_args == UNDEFINED && options == UNDEFINED
 
         new_operation = operation == UNDEFINED ? adapter.operation : operation
         new_call_args = call_args == UNDEFINED ? self.call_args : Array(call_args)
+        new_options = options == UNDEFINED ? adapter.options : adapter.options.merge(options)
 
         self.class.new(
           adapter: adapter,
           name: name,
           operation_name: operation_name,
           operation: new_operation,
-          options: adapter.options,
+          options: new_options,
           call_args: new_call_args
         )
       end
@@ -78,6 +81,15 @@ module Dry
 
       def external?
         !!operation_name
+      end
+
+      def group?
+        adapter.options.key?(:checks)
+      end
+
+      def check_names
+        checks = adapter.options[:checks]
+        checks.is_a?(Hash) ? checks.keys : Array(checks)
       end
 
       def arity

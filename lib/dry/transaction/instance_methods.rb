@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "dry/transaction/callable"
 require "dry/transaction/result_matcher"
 require "dry/transaction/stack"
 
@@ -15,8 +16,12 @@ module Dry
 
       def initialize(steps: self.class.steps, listeners: nil, **operations)
         @steps = steps.map { |step|
-          operation = resolve_operation(step, **operations)
-          step.with(operation: operation)
+          if step.group?
+            step.with(options: {checks: resolve_group_checks(step, **operations)})
+          else
+            operation = resolve_operation(step, **operations)
+            step.with(operation: operation)
+          end
         }
         @operations = operations
         @stack = Stack.new(@steps)
@@ -99,6 +104,25 @@ module Dry
         end
       end
 
+      def resolve_group_checks(step, **operations)
+        checks = step.adapter.options[:checks]
+        return checks if checks.is_a?(Hash) # checks are already resolved
+
+        checks.to_h { |check_name|
+          [check_name, Callable[resolve_group_check(check_name, **operations)]]
+        }
+      end
+
+      def resolve_group_check(check_name, **operations)
+        if operations[check_name]
+          operations[check_name]
+        elsif methods.include?(check_name) || private_methods.include?(check_name)
+          method(check_name)
+        else
+          raise MissingStepError, check_name
+        end
+      end
+
       def assert_valid_step_args(step_args)
         step_args.each_key do |step_name|
           unless steps.any? { |step| step.name == step_name }
@@ -109,6 +133,8 @@ module Dry
 
       def assert_step_arity
         steps.each do |step|
+          next if step.group?
+
           num_args_required = step.arity >= 0 ? step.arity : ~step.arity
           num_args_supplied = step.call_args.length + 1 # add 1 for main `input`
 

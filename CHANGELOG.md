@@ -7,6 +7,14 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- New `validate` step adapter for grouping independent validation checks that share the same
+  input. Every check in a group runs to completion and all failures are collected into a single
+  `Failure`. When the whole group succeeds, the named outputs returned by each check are merged,
+  with duplicate output keys raising a `DuplicateCheckOutputError` instead of being silently
+  overwritten. Sub-check results are published as step events carrying a `:group` key, so
+  listeners can tell them apart from the whole-group result
 
 ## [0.16.0] - 2024-01-17
 

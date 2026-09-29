@@ -25,5 +25,29 @@ module Dry
         super("step +#{step_name}+ requires one or more exception classes provided via +catch:+")
       end
     end
+
+    class MissingCheckListError < ArgumentError
+      def initialize(step_name)
+        super("validation group +#{step_name}+ requires one or more checks provided via +checks:+")
+      end
+    end
+
+    class InvalidCheckOutputError < ArgumentError
+      def initialize(step_name, check_name)
+        super(
+          "check +#{check_name}+ in validation group +#{step_name}+ must return a Success " \
+          "wrapping a hash of named outputs"
+        )
+      end
+    end
+
+    class DuplicateCheckOutputError < ArgumentError
+      def initialize(step_name, check_name, key)
+        super(
+          "check +#{check_name}+ in validation group +#{step_name}+ declares output key " \
+          "+#{key}+, which is already declared by another check in the group"
+        )
+      end
+    end
   end
 end

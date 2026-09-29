@@ -18,7 +18,19 @@ module Dry
               [step.name, operation]
             }
 
-            super(**kwargs, **operation_kwargs)
+            check_kwargs = self.class.steps.select(&:group?).flat_map(&:check_names).uniq.to_h { |check_name|
+              operation = kwargs.fetch(check_name) {
+                if ops_container&.key?(check_name)
+                  ops_container[check_name]
+                else
+                  nil
+                end
+              }
+
+              [check_name, operation]
+            }
+
+            super(**kwargs, **check_kwargs, **operation_kwargs)
           end
         end
       end
