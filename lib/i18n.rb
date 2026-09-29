@@ -12,6 +12,7 @@ module I18n
   autoload :Backend, 'i18n/backend'
   autoload :Config,  'i18n/config'
   autoload :Gettext, 'i18n/gettext'
+  autoload :InterpolationChecker, 'i18n/interpolation_checker'
   autoload :Locale,  'i18n/locale'
   autoload :Tests,   'i18n/tests'
   autoload :Middleware,   'i18n/middleware'

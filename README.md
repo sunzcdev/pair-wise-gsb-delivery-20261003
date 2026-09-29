@@ -95,6 +95,28 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 
 For more information and lots of resources see [the 'Resources' page on the wiki](https://github.com/ruby-i18n/i18n/wiki/Resources).
 
+## Checking interpolation parameters across locales
+
+`I18n::InterpolationChecker` compares the interpolation parameters of every
+translation against a reference locale, catching mistakes like `%{user_name}`
+in the source but `%{username}` in a translation before the data is released.
+It understands plural branches, escaped percent signs (`%%`) and Symbol
+aliases, only reads YAML/JSON files (it never evaluates Ruby locale files or
+calls callables), and returns a structured list of issues:
+
+```ruby
+checker = I18n::InterpolationChecker.new(
+  reference_locale: :en,
+  allowed_branch_differences: {
+    'inbox.messages' => { other: { extra: %i[unread] } }
+  }
+)
+issues = checker.check_dir('config/locales')
+issues.each do |issue|
+  puts "#{issue.locale}: #{issue.key} missing=#{issue.missing} extra=#{issue.extra} (#{issue.source})"
+end
+```
+
 ## Tests
 
 You can run tests both with
