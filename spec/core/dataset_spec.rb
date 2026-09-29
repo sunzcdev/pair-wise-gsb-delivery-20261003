@@ -3730,6 +3730,99 @@ describe "Dataset#import" do
   end
 end
 
+describe "Dataset#import_with_identity" do
+  before do
+    @db = Sequel.mock
+    @db.extend_datasets do
+      def supports_returning?(type) true end
+      def multi_insert_sql_strategy; :values end
+      Sequel::Dataset.def_sql_method(self, :insert, %w'insert into columns values returning')
+    end
+    @ds = @db[:items]
+  end
+
+  it "should return empty array without a query if no values" do
+    @ds.import_with_identity([:name], [], :identity=>:name).must_equal []
+    @db.sqls.must_equal []
+  end
+
+  it "should match returned rows to input values by identity key" do
+    @db.fetch = [{:id=>1, :name=>'a'}, {:id=>2, :name=>'b'}]
+    @ds.import_with_identity([:name], [['a'], ['b']], :identity=>:name, :returning=>:id).must_equal [
+      {:input=>['a'], :row=>{:id=>1, :name=>'a'}},
+      {:input=>['b'], :row=>{:id=>2, :name=>'b'}}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('a'), ('b') RETURNING id, name"]
+  end
+
+  it "should match returned rows to input values even if rows are returned out of order and rows are missing" do
+    @db.fetch = [{:id=>3, :name=>'c'}, {:id=>1, :name=>'a'}]
+    @ds.import_with_identity([:name], [['a'], ['b'], ['c']], :identity=>:name, :returning=>:id).must_equal [
+      {:input=>['a'], :row=>{:id=>1, :name=>'a'}},
+      {:input=>['b'], :row=>nil},
+      {:input=>['c'], :row=>{:id=>3, :name=>'c'}}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('a'), ('b'), ('c') RETURNING id, name"]
+  end
+
+  it "should support an array of identity columns" do
+    @db.fetch = [{:id=>2, :x=>'b', :y=>2}, {:id=>1, :x=>'a', :y=>1}]
+    @ds.import_with_identity([:x, :y], [['a', 1], ['b', 2]], :identity=>[:x, :y], :returning=>:id).must_equal [
+      {:input=>['a', 1], :row=>{:id=>1, :x=>'a', :y=>1}},
+      {:input=>['b', 2], :row=>{:id=>2, :x=>'b', :y=>2}}]
+    @db.sqls.must_equal ["INSERT INTO items (x, y) VALUES ('a', 1), ('b', 2) RETURNING id, x, y"]
+  end
+
+  it "should use the dataset's RETURNING columns if the dataset already uses RETURNING" do
+    @db.fetch = [{:id=>1, :name=>'a'}]
+    @ds.returning(:id, :name).import_with_identity([:name], [['a']], :identity=>:name).must_equal [
+      {:input=>['a'], :row=>{:id=>1, :name=>'a'}}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('a') RETURNING id, name"]
+  end
+
+  it "should raise an error before inserting if identity keys are duplicated" do
+    proc{@ds.import_with_identity([:name], [['a'], ['a']], :identity=>:name)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if identity keys are duplicated for an identity column array" do
+    proc{@ds.import_with_identity([:x, :y], [['a', 1], ['b', 2], ['a', 1]], :identity=>[:x, :y])}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if RETURNING is not supported" do
+    ds = Sequel.mock[:items]
+    proc{ds.import_with_identity([:name], [['a']], :identity=>:name)}.must_raise Sequel::Error
+  end
+
+  it "should raise an error before inserting if the :identity option is not given" do
+    proc{@ds.import_with_identity([:name], [['a']])}.must_raise Sequel::Error
+    proc{@ds.import_with_identity([:name], [['a']], :identity=>[])}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if an identity column is not being imported" do
+    proc{@ds.import_with_identity([:name], [['a']], :identity=>:id)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error if columns are empty and values are not empty" do
+    proc{@ds.import_with_identity([], [[]], :identity=>:name)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should respect :server option" do
+    @db = Sequel.mock(:servers=>{:s1=>{}})
+    @db.extend_datasets do
+      def supports_returning?(type) true end
+      def multi_insert_sql_strategy; :values end
+      Sequel::Dataset.def_sql_method(self, :insert, %w'insert into columns values returning')
+    end
+    @db.fetch = [{:id=>1, :name=>'a'}]
+    @db[:items].import_with_identity([:name], [['a']], :identity=>:name, :returning=>:id, :server=>:s1).must_equal [
+      {:input=>['a'], :row=>{:id=>1, :name=>'a'}}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('a') RETURNING id, name -- s1"]
+  end
+end
+
 describe "Dataset#multi_insert" do
   before do
     @db = Sequel.mock(:servers=>{:s1=>{}})

@@ -417,6 +417,83 @@ module Sequel
       end
     end
 
+    # Insert multiple records into the associated table, using RETURNING to
+    # return the inserted rows, and match each returned row to the input
+    # value that produced it.
+    #
+    # When using #import on a dataset that uses RETURNING, the caller is
+    # responsible for matching the returned rows to the input values, which
+    # is not reliable, since the database is free to return rows in any
+    # order, and may not return a row for every input value (such as when
+    # using INSERT ... ON CONFLICT DO NOTHING to skip conflicting rows).
+    # This method uses a caller-provided identity key to match each returned
+    # row to the related input value, so callers do not need to assume the
+    # returned rows are in the same order as the input values.
+    #
+    # This returns an array of hashes, one for each input value, in the same
+    # order as the input values.  Each hash contains:
+    #
+    # :input :: The input value array.
+    # :row :: The row hash returned by the database for the input value, or
+    #         nil if the database did not return a row for the input value
+    #         (e.g. the row was skipped due to a conflict).
+    #
+    # Options:
+    # :identity :: Required. A column or array of columns used to match each
+    #              row returned by RETURNING to the input value that produced
+    #              it.  Each column must be one of the columns being imported,
+    #              and the combination of identity column values must be
+    #              unique for each input value.  The identity columns are
+    #              always included in the columns returned by RETURNING.
+    # :returning :: A column or array of additional columns to return using
+    #               RETURNING.  This is ignored if the dataset already uses
+    #               RETURNING, in which case the dataset's RETURNING columns
+    #               must include the identity columns.
+    # :server :: Set the server/shard to use for the transaction and insert
+    #            queries.
+    #
+    # This raises an +Error+ before inserting anything if the :identity
+    # option is missing or invalid, if any two input values have the same
+    # identity key, or if the database does not support RETURNING for
+    # inserts.
+    #
+    # Examples:
+    #
+    #   DB[:items].insert_conflict.import_with_identity(
+    #     [:name, :value], [['a', 1], ['b', 2]], identity: :name, returning: :id)
+    #   # INSERT INTO items (name, value) VALUES ('a', 1), ('b', 2)
+    #   # ON CONFLICT DO NOTHING RETURNING id, name
+    #   # => [{input: ['a', 1], row: {id: 1, name: 'a'}},
+    #   #     {input: ['b', 2], row: nil}]
+    def import_with_identity(columns, values, opts=OPTS)
+      return [] if values.empty?
+      raise(Error, 'Using Sequel::Dataset#import_with_identity with an empty column array is not allowed') if columns.empty?
+      identity = Array(opts[:identity])
+      raise(Error, 'Using Sequel::Dataset#import_with_identity requires a non-empty :identity option') if identity.empty?
+      identity_indexes = identity.map do |column|
+        columns.index(column) || raise(Error, "identity column #{column.inspect} is not one of the columns given to Sequel::Dataset#import_with_identity")
+      end
+
+      seen = {}
+      values.each do |value|
+        key = value.values_at(*identity_indexes)
+        raise(Error, "duplicate identity key in values given to Sequel::Dataset#import_with_identity: #{key.inspect}") if seen.key?(key)
+        seen[key] = true
+      end
+
+      ds = opts[:server] ? server(opts[:server]) : self
+      ds = ds.returning(*(Array(opts[:returning]) | identity)) unless ds.opts[:returning]
+
+      rows_by_key = {}
+      ds._import_with_identity(columns, values, opts).each do |row|
+        rows_by_key[row.values_at(*identity)] = row
+      end
+
+      values.map do |value|
+        {input: value, row: rows_by_key.delete(value.values_at(*identity_indexes))}
+      end
+    end
+
     # Inserts values into the associated table.  The returned value is generally
     # the value of the autoincremented primary key for the inserted row, assuming that
     # a single row is inserted and the table has an autoincrementing primary key.
@@ -1134,6 +1211,21 @@ module Sequel
         stmts = multi_insert_sql(columns, values)
         _import_transaction(stmts, trans_opts){stmts.each{|st| execute_dui(st)}}
       end
+    end
+
+    # Internals of #import_with_identity.  Execute the insert statements for
+    # the given values, collecting all rows returned via RETURNING into a
+    # single array.  A transaction is only used if there are multiple
+    # statements to execute.
+    def _import_with_identity(columns, values, opts)
+      trans_opts = Hash[opts]
+      trans_opts.delete(:identity)
+      trans_opts.delete(:returning)
+      trans_opts[:server] = @opts[:server]
+      stmts = multi_insert_sql(columns, values)
+      rows = []
+      _import_transaction(stmts, trans_opts){stmts.each{|st| returning_fetch_rows(st){|row| rows << row}}}
+      rows
     end
 
     # Return an array of arrays of values given by the symbols in ret_cols.
