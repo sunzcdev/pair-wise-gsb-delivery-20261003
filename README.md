@@ -86,6 +86,27 @@ calculator.evaluate!('10 * x')
 Dentaku::UnboundVariableError: Dentaku::UnboundVariableError
 ```
 
+Every error Dentaku raises -- from the tokenizer, the parser, or evaluation
+itself -- carries the character range of the offending source text, so an
+editor can highlight it in the user's original formula:
+
+```ruby
+begin
+  calculator.evaluate!('10 + 1 / 0')
+rescue Dentaku::Error => e
+  e.source_range                #=> #<Dentaku::SourceRange 5...10>
+  '10 + 1 / 0'[e.source_range.to_range]  #=> "1 / 0"
+end
+```
+
+`source_range` is a half-open character range (`start_offset...end_offset`)
+into the original expression string. Offsets count characters, so multi-line
+formulas, comments, aliases, escaped strings, and multibyte text (e.g.
+Chinese identifiers) do not shift them. When a function call fails -- including
+a custom function -- the range marks that specific call, and `call_trace`
+lists the enclosing call sites from the inside out. Errors never include the
+argument values passed to a function.
+
 Dentaku has built-in functions (including `if`, `not`, `min`, `max`, `sum`, and
 `round`) and the ability to define custom functions (see below). Functions
 generally work like their counterparts in Excel:

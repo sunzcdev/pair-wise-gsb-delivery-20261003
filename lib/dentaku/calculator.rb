@@ -81,11 +81,23 @@ module Dentaku
         unbound = node.dependencies(memory)
 
         unless unbound.empty?
-          raise UnboundVariableError.new(unbound),
-                "no value provided for variables: #{unbound.uniq.join(', ')}"
+          error = UnboundVariableError.new(unbound)
+          attach_unbound_source(error, node, unbound.first)
+          raise error, "no value provided for variables: #{unbound.uniq.join(', ')}"
         end
 
         node.value(memory)
+      end
+    end
+
+    # points the error at the first occurrence of the offending identifier
+    # in the user's expression
+    private def attach_unbound_source(error, node, identifier)
+      node.each_node do |child|
+        next unless child.is_a?(AST::Identifier) && child.identifier == identifier
+
+        error.attach_source(child)
+        break
       end
     end
 

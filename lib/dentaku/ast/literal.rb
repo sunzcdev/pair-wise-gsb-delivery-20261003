@@ -7,6 +7,7 @@ module Dentaku
         @token = token
         @value = token.value
         @type  = token.category
+        @source_range = token.source_range if token.respond_to?(:source_range)
       end
 
       def value(*)

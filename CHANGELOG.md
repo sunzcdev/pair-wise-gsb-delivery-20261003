@@ -1,5 +1,22 @@
 # Change Log
 
+## Unreleased
+- tokenizer, parser, and evaluation errors now carry a `source_range`: a
+  half-open character range into the original expression string, suitable
+  for highlighting the failing text in an editor. Function call failures
+  (including custom functions) additionally record a `call_trace` of the
+  enclosing call sites, innermost first. Offsets are character-based and
+  are mapped back through comment stripping and alias expansion, so
+  multi-line formulas, escaped strings, and multibyte identifiers do not
+  shift them. Foreign exceptions escaping from custom function bodies are
+  annotated in place (via `Dentaku::ErrorLocation`) without changing their
+  class or message.
+- string literals now recognize backslash escapes (`\"`, `\'`, `\\`), so an
+  escaped quote no longer terminates the token early
+- `Dentaku::MathDomainError` no longer retains the argument values passed
+  to the failing math function; it exposes `arg_count` instead of `args`,
+  so error results cannot leak sensitive inputs
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

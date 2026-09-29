@@ -1,6 +1,8 @@
 module Dentaku
   class Token
     attr_reader :category, :raw_value, :value
+    # Dentaku::SourceRange of this token in the original expression
+    attr_accessor :source_range
 
     def initialize(category, value, raw_value = nil)
       @category  = category

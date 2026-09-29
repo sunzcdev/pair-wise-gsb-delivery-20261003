@@ -103,12 +103,24 @@ module Dentaku
         new(:numeric, NumericParser::HEXADECIMAL_PATTERN, lambda { |raw| NumericParser.parse_hexadecimal_string(raw) })
       end
 
+      # string bodies accept backslash escapes so a quoted quote does not
+      # end the token early; the raw match (including escapes) is kept as
+      # the token's raw_value so source ranges stay exact
       def double_quoted_string
-        new(:string, '"[^"]*"', lambda { |raw| raw.gsub(/^"|"$/, '') })
+        new(:string, '"([^"\\\\]|\\\\.)*"', lambda { |raw| unescape_string(raw, '"') })
       end
 
       def single_quoted_string
-        new(:string, "'[^']*'", lambda { |raw| raw.gsub(/^'|'$/, '') })
+        new(:string, "'([^'\\\\]|\\\\.)*'", lambda { |raw| unescape_string(raw, "'") })
+      end
+
+      def unescape_string(raw, quote)
+        raw[1...-1].gsub(/\\(.)/) do
+          case Regexp.last_match(1)
+          when quote, '\\' then Regexp.last_match(1)
+          else Regexp.last_match(0)
+          end
+        end
       end
 
       def negate

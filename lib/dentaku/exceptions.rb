@@ -1,9 +1,64 @@
+require 'dentaku/source_range'
+
 module Dentaku
+  # Location API shared by every error Dentaku raises. It can also be
+  # mixed into foreign exceptions (e.g. a NoMethodError escaping from a
+  # custom function body) so that any error surfacing from an evaluation
+  # points back at the user's original expression.
+  module ErrorLocation
+    # the innermost Dentaku::SourceRange this error was observed at --
+    # the range an editor should highlight
+    def source_range
+      @source_range
+    end
+
+    # source ranges of enclosing function calls, innermost first
+    def call_trace
+      @call_trace ||= []
+    end
+
+    # Records where the error surfaced. Accepts an AST node (its
+    # source_range is used, and function calls are pushed onto the
+    # call_trace) or a bare Dentaku::SourceRange. Returns self so raise
+    # sites can chain: `raise error.attach_source(range)`.
+    def attach_source(node_or_range)
+      range =
+        if node_or_range.is_a?(Dentaku::SourceRange)
+          node_or_range
+        elsif node_or_range.respond_to?(:source_range)
+          node_or_range.source_range
+        end
+
+      return self if range.nil?
+
+      @source_range ||= range
+
+      if !node_or_range.is_a?(Dentaku::SourceRange) &&
+         node_or_range.respond_to?(:call_site?) && node_or_range.call_site?
+        call_trace.push(range) unless call_trace.last == range
+      end
+
+      self
+    end
+  end
+
   # Shared by all Dentaku exceptions so that `rescue Dentaku::Error` catches
   # everything the gem raises, including exceptions that subclass Ruby
   # built-ins (Dentaku::ArgumentError, Dentaku::ZeroDivisionError).
   module Error
+    include ErrorLocation
+
     attr_accessor :assigned_to
+
+    # Attaches source location to any exception, including ones raised by
+    # user code inside custom functions. The exception's class and message
+    # are left untouched -- in particular, no argument values are added.
+    def self.attach_source(exception, node_or_range)
+      exception.extend(ErrorLocation) unless exception.respond_to?(:attach_source)
+      exception.attach_source(node_or_range)
+    rescue FrozenError, TypeError
+      exception
+    end
   end
 
   class BaseError < StandardError
@@ -19,11 +74,13 @@ module Dentaku
   end
 
   class MathDomainError < BaseError
-    attr_reader :function_name, :args
+    attr_reader :function_name, :arg_count
 
     def initialize(function_name, args)
       @function_name = function_name
-      @args = args
+      # only the count is retained: argument values may be sensitive and
+      # must not travel with the error result
+      @arg_count = args.respond_to?(:length) ? args.length : args
     end
   end
 

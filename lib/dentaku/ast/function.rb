@@ -13,6 +13,10 @@ module Dentaku
         @args = args
       end
 
+      def call_site?
+        true
+      end
+
       def accept(visitor)
         visitor.visit_function(self)
       end
