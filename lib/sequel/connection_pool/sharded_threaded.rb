@@ -17,6 +17,10 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
   #                  Sequel uses Hash.new(:default).  You can use a hash with a default proc
   #                  that raises an error if you want to catch all cases where a nonexistent
   #                  server is used.
+  # :pool_wait_graph :: Enable the connection wait graph, which detects
+  #                     cycles of execution units waiting for
+  #                     connections held by each other, and raises
+  #                     Sequel::PoolWaitCycle instead of deadlocking.
   def initialize(db, opts = OPTS)
     super
     @available_connections = {}
@@ -131,12 +135,16 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
     end
     begin
       conn = acquire(t, server)
+      wait_graph_hold(t, server)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       sync{@connections_to_remove << conn} if conn && disconnect_error?(e)
       raise
     ensure
-      sync{release(t, conn, server)} if conn
+      if conn
+        sync{release(t, conn, server)}
+        wait_graph_release(t, server)
+      end
       while dconn = sync{@connections_to_disconnect.shift}
         disconnect_connection(dconn)
       end
@@ -231,7 +239,12 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
       end
       # simplecov:enable
 
-      @waiters[server].wait(@mutex, timeout)
+      begin
+        wait_graph_wait(thread, server)
+        @waiters[server].wait(@mutex, timeout)
+      ensure
+        wait_graph_stop_waiting(thread)
+      end
 
       # Connection still not available, could be because a connection was disconnected,
       # may have to retry assign_connection to see if a new connection can be made.
@@ -258,6 +271,7 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
         alloc.to_a.each do |t,c|
           unless t.alive?
             remove(t, c, server)
+            wait_graph_release(t, server)
           end
         end
         n = nil

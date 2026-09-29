@@ -1,5 +1,7 @@
 # frozen-string-literal: true
 
+require_relative 'connection_pool/wait_graph'
+
 # The base connection pool class, which all other connection pools are based
 # on.  This class is not instantiated directly, but subclasses should at
 # the very least implement the following API:
@@ -116,6 +118,7 @@ class Sequel::ConnectionPool
     @after_connect = opts[:after_connect] # SEQUEL6: Remove
     @connect_sqls = opts[:connect_sqls] # SEQUEL6: Remove
     @error_classes = db.send(:database_error_classes).dup.freeze
+    @wait_graph = Sequel.connection_wait_graph if opts[:pool_wait_graph]
   end
   
   # An array of symbols for all shards/servers, which is a single <tt>:default</tt> by default.
@@ -171,5 +174,62 @@ class Sequel::ConnectionPool
     rescue Exception=>exception
       raise Sequel.convert_exception_class(exception, Sequel::DatabaseConnectionError)
     end || raise(Sequel::DatabaseConnectionError, "Connection parameters not valid")
+  end
+
+  # The following methods update the connection wait graph when the
+  # :pool_wait_graph option is used, and are no-ops otherwise.  The
+  # owner is the current execution unit (Sequel.current), and the
+  # resource is a [pool, server] pair.  No connection credentials are
+  # exposed to the graph or included in raised diagnostics.
+
+  # Record that the owner holds a connection for the server.
+  def wait_graph_hold(owner, server)
+    @wait_graph.hold(owner, [self, server]) if @wait_graph
+    nil
+  end
+
+  # Record that the owner released a connection for the server.
+  def wait_graph_release(owner, server)
+    @wait_graph.release(owner, [self, server]) if @wait_graph
+    nil
+  end
+
+  # Record that the owner is about to block waiting for a connection
+  # for the server.  Raises Sequel::PoolWaitCycle if the wait would
+  # complete a cycle of owners waiting on each other.
+  def wait_graph_wait(owner, server)
+    if @wait_graph && (chain = @wait_graph.wait(owner, [self, server]))
+      raise_wait_cycle(chain)
+    end
+    nil
+  end
+
+  # Record that the owner is no longer waiting for a connection,
+  # because it acquired one, timed out, or an exception was raised.
+  def wait_graph_stop_waiting(owner)
+    @wait_graph.stop_waiting(owner) if @wait_graph
+    nil
+  end
+
+  # Raise a PoolWaitCycle for the given chain, which alternates owners
+  # and [pool, server] resources, starting and ending with the same
+  # owner.  The message includes the full wait chain, but no connection
+  # credentials.
+  def raise_wait_cycle(chain)
+    parts = []
+    i = 0
+    while i < chain.length - 1
+      owner = chain[i]
+      pool, server = chain[i + 1]
+      next_owner = chain[i + 2]
+      part = "#{owner.inspect} is waiting for server #{server.inspect}"
+      if (name = pool.db.opts[:name])
+        part << " (database name: #{name})"
+      end
+      part << " held by #{next_owner.inspect}"
+      parts << part
+      i += 2
+    end
+    raise Sequel::PoolWaitCycle, "connection pool wait cycle detected: #{parts.join('; ')}"
   end
 end

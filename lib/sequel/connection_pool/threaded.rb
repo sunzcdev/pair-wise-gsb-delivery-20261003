@@ -25,6 +25,10 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
   #                     will open (default 4)
   # :pool_timeout :: The amount of seconds to wait to acquire a connection
   #                  before raising a PoolTimeout error (default 5)
+  # :pool_wait_graph :: Enable the connection wait graph, which detects
+  #                     cycles of execution units waiting for
+  #                     connections held by each other, and raises
+  #                     Sequel::PoolWaitCycle instead of deadlocking.
   def initialize(db, opts = OPTS)
     super
     @max_size = Integer(opts[:max_connections] || 4)
@@ -91,6 +95,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     end
     begin
       conn = acquire(t)
+      wait_graph_hold(t, :default)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       if disconnect_error?(e)
@@ -101,11 +106,13 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
           @allocated.delete(t)
           @waiter.signal
         end
+        wait_graph_release(t, :default)
       end
       raise
     ensure
       if conn
         sync{release(t)}
+        wait_graph_release(t, :default)
         if @connection_handling == :disconnect
           disconnect_connection(conn)
         end
@@ -177,7 +184,12 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
       end
       # simplecov:enable
 
-      @waiter.wait(@mutex, timeout)
+      begin
+        wait_graph_wait(thread, :default)
+        @waiter.wait(@mutex, timeout)
+      ensure
+        wait_graph_stop_waiting(thread)
+      end
 
       # Connection still not available, could be because a connection was disconnected,
       # may have to retry assign_connection to see if a new connection can be made.
@@ -205,6 +217,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
         allocated.keys.each do |t|
           unless t.alive?
             (to_disconnect ||= []) << allocated.delete(t)
+            wait_graph_release(t, :default)
           end
         end
         n = nil

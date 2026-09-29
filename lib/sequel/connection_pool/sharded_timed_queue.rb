@@ -21,6 +21,10 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
   #                  Sequel uses Hash.new(:default).  You can use a hash with a default proc
   #                  that raises an error if you want to catch all cases where a nonexistent
   #                  server is used.
+  # :pool_wait_graph :: Enable the connection wait graph, which detects
+  #                     cycles of execution units waiting for
+  #                     connections held by each other, and raises
+  #                     Sequel::PoolWaitCycle instead of deadlocking.
   def initialize(db, opts = OPTS)
     super
 
@@ -127,6 +131,7 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
 
     begin
       conn = acquire(t, server)
+      wait_graph_hold(t, server)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       if disconnect_error?(e)
@@ -135,10 +140,14 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
         disconnect_pool_connection(oconn, server) if oconn
         sync{@allocated[server].delete(t)}
         fill_queue(server, 1)
+        wait_graph_release(t, server)
       end
       raise
     ensure
-      release(t, conn, server) if conn
+      if conn
+        release(t, conn, server)
+        wait_graph_release(t, server)
+      end
     end
   end
 
@@ -297,6 +306,7 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
       alloc.keys.each do |t|
         unless t.alive?
           (to_disconnect ||= []) << alloc.delete(t)
+          wait_graph_release(t, server)
           current_size -= 1
         end
       end
@@ -323,7 +333,7 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
   # Calling code should not have the mutex when calling this.
   def acquire(thread, server)
     queue = sync{@queues[server]}
-    if conn = available(queue, server) || try_make_new(server) || wait_until_available(queue, server)
+    if conn = available(queue, server) || try_make_new(server) || wait_until_available(thread, queue, server)
       sync{@allocated[server][thread] = conn}
     else
       name = db.opts[:name]
@@ -340,8 +350,13 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
   # Return the next connection in the pool if there is one available. If not, wait
   # until the timeout for a connection to become available. If there is still no
   # available connection, return nil.
-  def wait_until_available(queue, _server)
-    queue.pop(timeout: @timeout)
+  def wait_until_available(thread, queue, server)
+    begin
+      wait_graph_wait(thread, server)
+      queue.pop(timeout: @timeout)
+    ensure
+      wait_graph_stop_waiting(thread)
+    end
   end
 
   # Returns the connection owned by the supplied thread for the given server,

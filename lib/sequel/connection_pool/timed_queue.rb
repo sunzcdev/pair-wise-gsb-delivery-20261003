@@ -15,6 +15,10 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
   #                     will open (default 4)
   # :pool_timeout :: The amount of seconds to wait to acquire a connection
   #                  before raising a PoolTimeout (default 5)
+  # :pool_wait_graph :: Enable the connection wait graph, which detects
+  #                     cycles of execution units waiting for
+  #                     connections held by each other, and raises
+  #                     Sequel::PoolWaitCycle instead of deadlocking.
   def initialize(db, opts = OPTS)
     super
     @max_size = Integer(opts[:max_connections] || 4)
@@ -89,6 +93,7 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
 
     begin
       conn = acquire(t)
+      wait_graph_hold(t, :default)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       if disconnect_error?(e)
@@ -97,10 +102,14 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
         disconnect_connection(oconn) if oconn
         sync{@allocated.delete(t)}
         fill_queue(1)
+        wait_graph_release(t, :default)
       end
       raise
     ensure
-      release(t) if conn
+      if conn
+        release(t)
+        wait_graph_release(t, :default)
+      end
     end
   end
 
@@ -200,6 +209,7 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
       @allocated.keys.each do |t|
         unless t.alive?
           (to_disconnect ||= []) << @allocated.delete(t)
+          wait_graph_release(t, :default)
           current_size -= 1
         end
       end
@@ -225,7 +235,7 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
   #
   # Calling code should not have the mutex when calling this.
   def acquire(thread)
-    if conn = available || try_make_new || wait_until_available
+    if conn = available || try_make_new || wait_until_available(thread)
       sync{@allocated[thread] = conn}
     else
       name = db.opts[:name]
@@ -242,8 +252,13 @@ class Sequel::TimedQueueConnectionPool < Sequel::ConnectionPool
   # Return the next connection in the pool if there is one available. If not, wait
   # until the timeout for a connection to become available. If there is still no
   # available connection, return nil.
-  def wait_until_available
-    @queue.pop(timeout: @timeout)
+  def wait_until_available(thread)
+    begin
+      wait_graph_wait(thread, :default)
+      @queue.pop(timeout: @timeout)
+    ensure
+      wait_graph_stop_waiting(thread)
+    end
   end
 
   # Returns the connection owned by the supplied thread,

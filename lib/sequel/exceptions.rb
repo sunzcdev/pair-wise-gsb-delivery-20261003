@@ -122,6 +122,14 @@ module Sequel
   ).name
 
   (
+  # Error raised when the connection pool detects that acquiring a
+  # connection would create a wait cycle (deadlock) between execution
+  # units holding and waiting for connections.  Only raised when the
+  # :pool_wait_graph connection pool option is enabled.
+  PoolWaitCycle = Class.new(Error)
+  ).name
+
+  (
   # Error that you should raise to signal a rollback of the current transaction.
   # The transaction block will catch this exception, rollback the current transaction,
   # and won't reraise it (unless a reraise is requested).
