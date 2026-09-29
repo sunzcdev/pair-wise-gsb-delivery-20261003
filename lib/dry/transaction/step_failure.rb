@@ -7,6 +7,7 @@ module Dry
     class StepFailure
       attr_reader :step
       attr_reader :value
+      attr_reader :path
 
       # @api private
       def self.call(step, value)
@@ -20,9 +21,19 @@ module Dry
         # rubocop:enable Style/CaseEquality
       end
 
-      def initialize(step, value)
+      def initialize(step, value, path: [step.name])
         @step = step
         @value = value
+        @path = path
+      end
+
+      # Returns a copy of the failure with the given step names prepended to
+      # the path of steps leading to the failure (e.g. the enclosing branch
+      # step and branch names for failures raised inside a branch).
+      #
+      # @api private
+      def prepend_path(*names)
+        self.class.new(step, value, path: names + path)
       end
     end
   end
