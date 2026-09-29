@@ -93,6 +93,31 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * ActiveRecord (optionally: ActiveRecord::Missing and ActiveRecord::StoreProcs)
 * KeyValue (uses active_support/json and cannot store procs)
 
+## Checking locale files
+
+`I18n::LocaleChecker` compares the interpolation placeholders of every locale
+in a directory against a reference locale, catching mismatches such as an
+English `Hello %{user_name}` translated as `你好 %{username}` before the
+files ship. It understands pluralization branches, escaped percent signs
+(`%%{name}` is not a placeholder) and Symbol aliases, only reads the
+directory (Ruby locale files are never evaluated and callable values are
+never called), and reports a structured list of issues:
+
+```ruby
+checker = I18n::LocaleChecker.new(
+  "config/locales",
+  reference_locale: :en,
+  allowed_branch_differences: {
+    zh: [:one],                          # zh keys may lack the :one branch
+    ru: { "inbox.messages" => [:few] }   # one specific key may lack :few
+  }
+)
+
+checker.check.each do |issue|
+  puts "#{issue.locale} #{issue.key}: #{issue.type} #{issue.params.inspect} (#{issue.location})"
+end
+```
+
 For more information and lots of resources see [the 'Resources' page on the wiki](https://github.com/ruby-i18n/i18n/wiki/Resources).
 
 ## Tests

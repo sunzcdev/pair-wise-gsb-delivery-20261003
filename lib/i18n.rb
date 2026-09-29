@@ -13,6 +13,7 @@ module I18n
   autoload :Config,  'i18n/config'
   autoload :Gettext, 'i18n/gettext'
   autoload :Locale,  'i18n/locale'
+  autoload :LocaleChecker, 'i18n/locale_checker'
   autoload :Tests,   'i18n/tests'
   autoload :Middleware,   'i18n/middleware'
 

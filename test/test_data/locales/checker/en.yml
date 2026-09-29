@@ -1,0 +1,14 @@
+en:
+  welcome: "Hello %{user_name}"
+  greeting: "Hi %{user_name}, you have %{count} notifications"
+  literal_percent: "Use %%{user_name} as a literal, %{count} left"
+  formatted: "Progress: %<percent>.1f%%"
+  inbox:
+    messages:
+      one: "%{count} message for %{user_name}"
+      other: "%{count} messages for %{user_name}"
+  shared:
+    farewell: "Goodbye %{user_name}"
+  alias_to_farewell: !ruby/symbol shared.farewell
+  second_alias_to_farewell: !ruby/symbol shared.farewell
+  promo_code: "Use code %{code}"

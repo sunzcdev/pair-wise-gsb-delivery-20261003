@@ -1,0 +1,13 @@
+zh:
+  welcome: "你好 %{username}"
+  greeting: "你好 %{user_name}，你有 %{count} 条通知"
+  literal_percent: "%{count} 剩余"
+  formatted: "进度：%<percent>.1f%%"
+  inbox:
+    messages:
+      other: "%{count} 条消息，%{user_name}"
+  shared:
+    farewell: "再见 %{user_name}"
+  alias_to_farewell: !ruby/symbol shared.farewell
+  second_alias_to_farewell: !ruby/symbol shared.farewell
+  promo_code: !ruby/symbol shared.missing
