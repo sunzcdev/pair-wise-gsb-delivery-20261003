@@ -127,6 +127,41 @@ RSpec.describe JWT::Token do
     end
   end
 
+  context 'when payload is unencoded (b64: false)' do
+    let(:header) { { 'b64' => false, 'crit' => ['b64'] } }
+    let(:payload) { "raw.pay\nload\r\nwith\xFFbinary\x00bytes".b }
+
+    it 'uses the raw payload bytes as the encoded payload' do
+      expect(token.encoded_payload).to eq(payload)
+      expect(token.encoded_payload.encoding).to eq(Encoding::BINARY)
+    end
+
+    it 'signs over the raw payload bytes' do
+      token.detach_payload!
+      token.sign!(algorithm: 'HS256', key: 'secret')
+
+      encoded_token = JWT::EncodedToken.new(token.jwt)
+      encoded_token.encoded_payload = payload
+      expect(encoded_token.valid_signature?(algorithm: 'HS256', key: 'secret')).to be(true)
+    end
+
+    context 'when the crit header does not include b64' do
+      let(:header) { { 'b64' => false } }
+
+      it 'raises an error on sign' do
+        expect { token.sign!(algorithm: 'HS256', key: 'secret') }.to raise_error(JWT::EncodeError, 'The "crit" header must include "b64" when the "b64" header is false')
+      end
+    end
+
+    context 'when payload is not a String' do
+      let(:payload) { { 'pay' => 'load' } }
+
+      it 'raises an error on sign' do
+        expect { token.sign!(algorithm: 'HS256', key: 'secret') }.to raise_error(JWT::EncodeError, 'Payload must be a String when the "b64" header is false')
+      end
+    end
+  end
+
   describe '#verify_claims!' do
     context 'when required_claims is passed' do
       it 'raises error' do

@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add `JWT::DetachedPayload` for signing and verifying raw bytes transferred over a separate channel with a detached signature and an explicitly declared unencoded (`b64: false`) payload
 - Your contribution here
 
 **Fixes and enhancements:**

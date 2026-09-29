@@ -59,7 +59,7 @@ module JWT
     #
     # @return [String] the encoded payload of the JWT token.
     def encoded_payload
-      @encoded_payload ||= ::JWT::Base64.url_encode(JWT::JSON.generate(payload))
+      @encoded_payload ||= unencoded_payload? ? raw_payload : ::JWT::Base64.url_encode(JWT::JSON.generate(payload))
     end
 
     # Returns the signing input of the JWT token.
@@ -95,6 +95,8 @@ module JWT
     def sign!(key:, algorithm:)
       raise ::JWT::EncodeError, 'Token already signed' if @signature
 
+      validate_unencoded_payload_declaration!
+
       JWA.create_signer(algorithm: algorithm, key: key).tap do |signer|
         header.merge!(signer.jwa.header) { |_key, old, _new| old }
         @signature = signer.sign(data: signing_input)
@@ -128,5 +130,24 @@ module JWT
     #
     # @return [String] the JWT token as a string.
     alias to_s jwt
+
+    private
+
+    def unencoded_payload?
+      header['b64'] == false
+    end
+
+    def raw_payload
+      raise ::JWT::EncodeError, 'Payload must be a String when the "b64" header is false' unless payload.is_a?(String)
+
+      payload.b
+    end
+
+    def validate_unencoded_payload_declaration!
+      return unless unencoded_payload?
+      return if header['crit'].is_a?(Array) && header['crit'].include?('b64')
+
+      raise ::JWT::EncodeError, 'The "crit" header must include "b64" when the "b64" header is false'
+    end
   end
 end

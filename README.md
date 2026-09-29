@@ -325,6 +325,20 @@ encoded_token.verify_signature!(algorithm: 'HS256', key: "secret")
 encoded_token.payload # => {"pay"=>"load"}
 ```
 
+### Detached signature for raw bytes
+
+The `JWT::DetachedPayload` entry point signs and verifies raw bytes transferred over a separate channel. The payload is used in its raw, unencoded form, explicitly declared with the `b64` protected header and the corresponding `crit` entry ([RFC 7797](https://datatracker.ietf.org/doc/html/rfc7797)), and detached from the compact serialization ([RFC 7515, Appendix F](https://datatracker.ietf.org/doc/html/rfc7515#appendix-F)). The payload is never JSON parsed, generated or transcoded, so dots, newlines and non-UTF-8 bytes are signed and verified byte for byte.
+
+```ruby
+raw_bytes = File.binread('document.pdf')
+
+jwt = JWT::DetachedPayload.sign(raw_bytes, key: 'secret', algorithm: 'HS256')
+# => "eyJiNjQiOmZhbHNlLCJjcml0IjpbImI2NCJdLCJhbGciOiJIUzI1NiJ9..<signature>"
+
+JWT::DetachedPayload.verify(jwt, raw_bytes, key: 'secret', algorithm: 'HS256') # => true
+JWT::DetachedPayload.valid?(jwt, raw_bytes, key: 'secret', algorithm: 'HS256') # => true
+```
+
 ## Claims
 
 JSON Web Token defines some reserved claim names and defines how they should be
