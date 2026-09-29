@@ -66,6 +66,28 @@ I18n.config.with(locale: :ja).set!
 `set!` stores a frozen config in the current execution context.
 This keeps inherited state safe and lets updates happen by replacing config objects.
 
+### Per-request translation overlays
+
+When one service hosts multiple brands, a small set of translations can be
+overridden for the duration of a block without touching the global backend:
+
+```ruby
+I18n::Backend::Simple.include(I18n::Backend::Overlay)
+
+I18n.with_overlay(en: { greeting: 'Welcome to Brand A' }) do
+  I18n.t(:greeting) # => "Welcome to Brand A"
+end
+```
+
+The overlay is a read-only, fiber-local stack: it nests, is scoped per
+locale, is restored even when the block raises, and keys it does not cover
+resolve through the regular backend. A key set to `nil` masks exactly that
+key (behaving like a stored nil), while the explicit tombstone
+`I18n::Backend::Overlay::DELETED` masks the key and its entire subtree.
+When combined with the Cache module, the active overlay is mixed into the
+cache key so one brand's cached result is never served to another brand.
+See `I18n::Backend::Overlay` for details.
+
 ## Features
 
 * Translation and localization

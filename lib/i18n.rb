@@ -122,6 +122,14 @@ module I18n
       config.backend.eager_load!
     end
 
+    # Runs the given block with a read-only translation overlay on top of
+    # the current backend, so a service hosting multiple brands can
+    # temporarily override a small set of translations per request.
+    # See I18n::Backend::Overlay.
+    def with_overlay(overlays, &block)
+      Backend::Overlay.with(overlays, &block)
+    end
+
     # Translates, pluralizes and interpolates a given key using a given locale,
     # scope, and default, as well as interpolation values.
     #
