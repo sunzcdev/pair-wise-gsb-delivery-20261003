@@ -483,6 +483,16 @@ vehicle.state_paths(:from => :parked, :to => :first_gear) # => [[
                                                           #       #<StateMachines:Transition attribute=:state event=:ignite from="parked" ...>,
                                                           #       #<StateMachines:Transition attribute=:state event=:shift_up from="idling" ...>
                                                           #    ]]
+
+# Events can declare a non-negative cost, and the lowest-cost path to a
+# target state can be planned without firing any events or running actions
+Vehicle.state_machine.event(:ignite).cost         # => 1 (default)
+path = Vehicle.state_machine.cost_path_for(vehicle, :to => :first_gear)
+path.status                                       # => :reachable (or :pending / :unreachable)
+path.cost                                         # => 2
+path.events                                       # => [:ignite, :shift_up]
+path.guards                                       # => guards along the path; :if / :unless conditions are flagged :pending
+                                                  #    since they cannot be evaluated without running application code
 # Skipping state_machine and writing to attributes directly
 vehicle.state = "parked"
 vehicle.state                   # => "parked"

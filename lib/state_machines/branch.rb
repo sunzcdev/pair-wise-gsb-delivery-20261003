@@ -149,6 +149,17 @@ module StateMachines
       match
     end
 
+    # Determines whether the state guards (if_state / unless_state and their
+    # all/any variants) configured for this branch pass for the given object.
+    #
+    # Unlike :if / :unless conditions, state guards only read the current
+    # state of other machines on the object.  They never run application
+    # code, so they can be evaluated safely while planning paths without
+    # firing any events.
+    def state_guards_match?(object)
+      state_guards.empty? || validate_and_check_state_guards(object, state_guards)
+    end
+
     def draw(graph, event, valid_states, io = $stdout)
       event.machine.renderer.draw_branch(self, graph, event, valid_states, io)
     end

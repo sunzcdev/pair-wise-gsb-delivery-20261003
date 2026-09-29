@@ -21,6 +21,11 @@ module StateMachines
     # The human-readable name for the event
     attr_writer :human_name
 
+    # The non-negative cost declared for firing this event.  Costs are used
+    # when planning lowest-cost paths through the state machine.  Defaults
+    # to 1.
+    attr_reader :cost
+
     # The list of branches that determine what state this event transitions
     # objects to when fired
     attr_reader :branches
@@ -33,16 +38,18 @@ module StateMachines
     #
     # Configuration options:
     # * <tt>:human_name</tt> - The human-readable version of this event's name
-    def initialize(machine, name, options = nil, human_name: nil, **extra_options) # :nodoc:
+    # * <tt>:cost</tt> - The non-negative cost of firing this event
+    def initialize(machine, name, options = nil, human_name: nil, cost: nil, **extra_options) # :nodoc:
       # Handle both old hash style and new kwargs style for backward compatibility
       case options
       in Hash
-        # Old style: initialize(machine, name, {human_name: 'Custom Name'})
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
+        # Old style: initialize(machine, name, {human_name: 'Custom Name', cost: 2})
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name, :cost)
         human_name = options[:human_name]
+        cost = options[:cost]
       in nil
-        # New style: initialize(machine, name, human_name: 'Custom Name')
-        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :human_name) unless extra_options.empty?
+        # New style: initialize(machine, name, human_name: 'Custom Name', cost: 2)
+        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :human_name, :cost) unless extra_options.empty?
       else
         # Handle unexpected options
         raise ArgumentError, "Unexpected positional argument in Event initialize: #{options.inspect}"
@@ -52,6 +59,8 @@ module StateMachines
       @name = name
       @qualified_name = machine.namespace ? :"#{name}_#{machine.namespace}" : name
       @human_name = human_name || @name.to_s.tr('_', ' ')
+      @cost = 1
+      self.cost = cost if cost
       reset
 
       # Output a warning if another event has a conflicting qualified name
@@ -75,6 +84,14 @@ module StateMachines
     # "turn on" instead of "turn_on"
     def human_name(klass = @machine.owner_class)
       @human_name.is_a?(Proc) ? @human_name.call(self, klass) : @human_name
+    end
+
+    # Sets the cost for firing this event.  The cost must be a non-negative
+    # number so that lowest-cost path searches are guaranteed to terminate.
+    def cost=(value)
+      raise ArgumentError, "cost must be a non-negative number, got #{value.inspect}" unless value.is_a?(Numeric) && value >= 0
+
+      @cost = value
     end
 
     # Evaluates the given block within the context of this event.  This simply

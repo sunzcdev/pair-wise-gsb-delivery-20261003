@@ -231,7 +231,7 @@ module StateMachines
       #   end
       def event(*names, &)
         options = names.last.is_a?(Hash) ? names.pop : {}
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name, :cost)
 
         # Store the context so that it can be used for / matched against any event
         # that gets added
@@ -249,6 +249,7 @@ module StateMachines
           # Update the configuration for the event(s)
           events.each do |event|
             event.human_name = options[:human_name] if options.include?(:human_name)
+            event.cost = options[:cost] if options.include?(:cost)
 
             # Add any states that may have been referenced within the event
             add_states(event.known_states)
@@ -430,6 +431,33 @@ module StateMachines
       #   vehicle.state_paths.events    # => [:ignite, :shift_up, :shift_down]
       def paths_for(object, requirements = {})
         PathCollection.new(object, self, requirements)
+      end
+
+      # Finds the lowest-cost sequence of transitions that moves the given
+      # object from its current state (or a custom +from+ state) to the
+      # target +to+ state, based on the costs declared for each event.
+      #
+      # The search is purely static: no events are fired and no actions are
+      # run.  Guards that can be evaluated safely (the +if_state+ family,
+      # which only reads the current state of other machines) are used to
+      # prune impossible transitions.  Transitions guarded by application
+      # code (+if+ / +unless+) cannot be verified without running that code,
+      # so they are kept as candidates and flagged as pending in the result.
+      #
+      # Valid requirement options:
+      # * <tt>:from</tt> - The initial state to start from.  Default is the
+      #   object's current state.
+      # * <tt>:to</tt> - The target end state.  Required.
+      #
+      # == Examples
+      #
+      #   path = vehicle.state_machine.cost_path_for(vehicle, to: :first_gear)
+      #   path.status       # => :reachable (or :pending / :unreachable)
+      #   path.cost         # => 2
+      #   path.events       # => [:ignite, :shift_up]
+      #   path.guards       # => [{event: :ignite, guard: :if, condition: :seatbelt_on?, status: :pending}, ...]
+      def cost_path_for(object, requirements = {})
+        CostPath.new(object, self, requirements)
       end
     end
   end

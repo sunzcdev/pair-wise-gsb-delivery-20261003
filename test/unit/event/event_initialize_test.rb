@@ -9,12 +9,12 @@ class EventInitializeTest < StateMachinesTest
 
   def test_should_raise_exception_if_invalid_option_specified
     exception = assert_raises(ArgumentError) { StateMachines::Event.new(@machine, :ignite, invalid: true) }
-    assert_equal 'Unknown key: :invalid. Valid keys are: :human_name', exception.message
+    assert_equal 'Unknown key: :invalid. Valid keys are: :human_name, :cost', exception.message
   end
 
   def test_should_raise_exception_if_invalid_option_specified_with_kwargs
     exception = assert_raises(ArgumentError) { StateMachines::Event.new(@machine, :ignite, nil, invalid: true) }
-    assert_equal 'Unknown key: :invalid. Valid keys are: :human_name', exception.message
+    assert_equal 'Unknown key: :invalid. Valid keys are: :human_name, :cost', exception.message
   end
 
   def test_should_set_human_name_from_options
