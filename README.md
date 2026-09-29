@@ -121,6 +121,50 @@ Or install it yourself as:
     header['Set-Cookie'] = cookie2.set_cookie_value
 
 
+## SameSite-aware send-set filtering
+
+`HTTP::Cookie` understands the `SameSite` attribute (`Strict`, `Lax`
+and `None`), both when parsing `Set-Cookie` headers and when set
+directly on a cookie:
+
+    cookie = HTTP::Cookie.new('sid', 's12345', origin: uri, samesite: :lax)
+
+By default `HTTP::CookieJar#cookies(url)` keeps its traditional
+behavior and does not filter by SameSite.  To get a SameSite-aware
+send set, pass a request context describing the initiator site, the
+top-level navigation flag, the HTTP method and the redirect chain:
+
+    context = HTTP::CookieJar::SameSiteContext.new(
+      initiator: 'https://app.example.com/',   # site that initiated the request (nil = direct access)
+      top_level: false,                        # true for top-level navigations
+      method: 'GET',                           # HTTP method of the request
+      redirect_chain: ['https://example.com/'] # URLs already visited in this chain
+    )
+
+    reasons = {}
+    header['Cookie'] = HTTP::Cookie.cookie_value(
+      jar.cookies(uri, context, exclude_reasons: reasons))
+    # reasons maps each excluded cookie to a reason symbol, e.g. :samesite_strict
+
+A plain hash with the same keys can be given instead of a
+`SameSiteContext`.  Two URIs are "same-site" when they share the same
+scheme and the same registrable domain (eTLD+1), and a request is
+same-site only if the initiator (if any) and every hop of the
+redirect chain are same-site with the request target.
+
+The decision table implemented is as follows:
+
+| Cookie SameSite | same-site request | cross-site, top-level safe method (GET/HEAD/OPTIONS/TRACE) | cross-site, otherwise |
+|-----------------|-------------------|------------------------------------------------------------|-----------------------|
+| `Strict`        | send              | exclude (`:samesite_strict`)                               | exclude (`:samesite_strict`) |
+| `Lax`           | send              | send                                                       | exclude (`:samesite_lax`) |
+| `None`          | send, but only with the `Secure` attribute (`:samesite_none_secure` otherwise) |||
+| (unset)         | treated as `Lax` ("Lax-by-default") |||
+
+Since a `SameSite=None` cookie is required to carry the `Secure`
+attribute and secure cookies are only sent over HTTPS, `None` cookies
+never travel over an insecure transport.
+
 ## Incompatibilities with Mechanize::Cookie/CookieJar
 
 There are several incompatibilities between

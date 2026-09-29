@@ -110,8 +110,32 @@ class HTTP::CookieJar
   # Gets an array of cookies sorted by the path and creation time.  If
   # `url` is given, only ones that should be sent to the URL/URI are
   # selected, with the access time of each of them updated.
-  def cookies(url = nil)
-    each(url).sort
+  #
+  # An optional `context` (a HTTP::CookieJar::SameSiteContext, or a
+  # hash of its keyword arguments) further filters the send set by
+  # each cookie's SameSite attribute; see HTTP::CookieJar::SameSiteContext
+  # for the decision table.  When `context` is omitted (or `url` is
+  # nil), no SameSite filtering takes place and the behavior is
+  # unchanged from previous versions.
+  #
+  # If `exclude_reasons` is given (a hash or any object responding to
+  # `#[]=`), it is populated with each excluded cookie mapped to a
+  # reason symbol, e.g. `:samesite_strict`.
+  def cookies(url = nil, context = nil, exclude_reasons: nil)
+    if url.nil? || (context = SameSiteContext.wrap(context)).nil?
+      return each(url).sort
+    end
+
+    uri = HTTP::Cookie::URIParser.parse(url)
+    [].tap { |selected|
+      each(uri) { |cookie|
+        if (reason = context.exclusion_reason(cookie, uri)).nil?
+          selected << cookie
+        elsif exclude_reasons
+          exclude_reasons[cookie] = reason
+        end
+      }
+    }.sort
   end
 
   # Tests if the jar is empty.  If `url` is given, tests if there is
@@ -328,3 +352,4 @@ end
 
 require 'http/cookie_jar/abstract_store'
 require 'http/cookie_jar/abstract_saver'
+require 'http/cookie_jar/same_site_context'

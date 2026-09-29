@@ -31,9 +31,17 @@ class HTTP::Cookie
     name        value
     domain      for_domain  path
     secure      httponly
+    samesite
     expires     max_age
     created_at  accessed_at
   ]
+
+  # SameSite attribute values mapped to their canonical symbols.
+  SAMESITE_VALUES = {
+    'strict' => :strict,
+    'lax'    => :lax,
+    'none'   => :none,
+  }.freeze
   # :startdoc:
 
   # The cookie name.  It may not be nil or empty.
@@ -132,7 +140,7 @@ class HTTP::Cookie
   #
   def initialize(*args)
     @name = @origin = @domain = @path =
-      @expires = @max_age = nil
+      @expires = @max_age = @samesite = nil
     @for_domain = @secure = @httponly = false
     @session = true
     @created_at = @accessed_at = Time.now
@@ -312,6 +320,8 @@ class HTTP::Cookie
                 cookie.secure = avalue
               when 'httponly'
                 cookie.httponly = avalue
+              when 'samesite'
+                cookie.samesite = avalue
               end
             rescue => e
               logger.warn("Couldn't parse #{aname} '#{avalue}': #{e}") if logger
@@ -479,6 +489,33 @@ class HTTP::Cookie
   attr_accessor :httponly
   alias httponly? httponly
 
+  # The SameSite attribute value as a symbol: `:strict`, `:lax` or
+  # `:none`, or nil if the attribute is not set.
+  #
+  # The setter accepts a case-insensitive string or a symbol, and
+  # raises ArgumentError for any other value.  Note that a cookie
+  # with `SameSite=None` is expected to carry the Secure attribute
+  # (cf. RFC 6265bis); see HTTP::CookieJar::SameSiteContext for how
+  # this is enforced when selecting cookies to send.
+  attr_reader :samesite
+
+  # See #samesite.
+  def samesite= value
+    @samesite =
+      case value
+      when nil
+        nil
+      when Symbol
+        SAMESITE_VALUES[value.to_s.downcase] or
+          raise ArgumentError, "invalid SameSite value: #{value.inspect}"
+      else
+        str = String.try_convert(value) or
+          raise TypeError, "#{value.class} is not a String"
+        SAMESITE_VALUES[str.downcase] or
+          raise ArgumentError, "invalid SameSite value: #{str.inspect}"
+      end
+  end
+
   # The session flag. (the opposite of persistent-flag)
   #
   # A cookie with this flag on should be hidden from a client script.
@@ -631,6 +668,9 @@ class HTTP::Cookie
     if @httponly
       string << "; HttpOnly"
     end
+    if @samesite
+      string << "; SameSite=#{@samesite.to_s.capitalize}"
+    end
     if @secure
       string << "; Secure"
     end
@@ -668,7 +708,10 @@ class HTTP::Cookie
   # YAML serialization helper for Psych.
   def encode_with(coder)
     PERSISTENT_PROPERTIES.each { |key|
-      coder[key.to_s] = instance_variable_get(:"@#{key}")
+      value = instance_variable_get(:"@#{key}")
+      # Serialize the SameSite value as a string so that the YAML
+      # stays loadable with safe_load without permitting Symbol.
+      coder[key.to_s] = key == 'samesite' && value ? value.to_s : value
     }
   end
 

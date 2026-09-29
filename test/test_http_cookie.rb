@@ -525,6 +525,39 @@ class TestHTTPCookie < Test::Unit::TestCase
     }
   end
 
+  def test_samesite
+    url = URI.parse('http://rubyforge.org/')
+
+    {
+      'SameSite=Strict' => :strict,
+      'samesite=lax'    => :lax,
+      'SAMESITE=None'   => :none,
+      'SameSite=STRICT' => :strict,
+    }.each { |attr, expected|
+      cookie, = HTTP::Cookie.parse("foo=bar; #{attr}", url)
+      assert_equal(expected, cookie.samesite, "SameSite value of #{attr.inspect}")
+      assert_equal(expected.to_s.capitalize, cookie.set_cookie_value[/SameSite=(\w+)/, 1])
+    }
+
+    cookie, = HTTP::Cookie.parse('foo=bar', url)
+    assert_nil(cookie.samesite)
+    assert_no_match(/SameSite/, cookie.set_cookie_value)
+
+    # An invalid value is ignored in parsing.
+    cookie, = HTTP::Cookie.parse('foo=bar; SameSite=Bogus', url)
+    assert_nil(cookie.samesite)
+
+    cookie = HTTP::Cookie.new('foo', 'bar', :samesite => :lax)
+    assert_equal(:lax, cookie.samesite)
+    cookie.samesite = 'None'
+    assert_equal(:none, cookie.samesite)
+    cookie.samesite = nil
+    assert_nil(cookie.samesite)
+    assert_raises(ArgumentError) { cookie.samesite = :bogus }
+    assert_raises(ArgumentError) { cookie.samesite = 'bogus' }
+    assert_raises(TypeError) { cookie.samesite = 42 }
+  end
+
   def test_parse_cookie_no_spaces
     url = URI.parse('http://rubyforge.org/')
     cookie_params = @cookie_params
@@ -1184,6 +1217,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         max_age: 3600,
         name: 'Foo',
         path: '/',
+        samesite: nil,
         secure: cookie.secure?,
         value: 'Bar',
       }
@@ -1203,6 +1237,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         max_age: nil,
         name: 'Foo',
         path: '/',
+        samesite: nil,
         secure: cookie.secure?,
         value: 'Bar',
       }
