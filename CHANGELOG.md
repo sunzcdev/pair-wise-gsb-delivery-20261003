@@ -1,5 +1,8 @@
 ## Unreleased
 
+* New: Add `pin_settings` to evaluate dynamic settings once per request
+  * Pinned settings are memoized on first access during a request and re-evaluated on the next one; circular dependencies raise `Sinatra::CircularSettingDependency` with the dependency chain.
+
 ## 4.2.1 / 2025-10-10
 
 * Fix: Revert "`PATH_INFO` can never be empty" ([#2124](https://github.com/sinatra/sinatra/pull/2124))

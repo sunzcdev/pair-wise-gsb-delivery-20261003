@@ -89,8 +89,9 @@ like [rerun](https://github.com/alexch/rerun) or
     - [Dealing with Date and Time](#dealing-with-date-and-time)
     - [Looking Up Template Files](#looking-up-template-files)
   - [Configuration](#configuration)
-    - [Configuring attack protection](#configuring-attack-protection)
-    - [Available Settings](#available-settings)
+- [Pinning settings per request](#pinning-settings-per-request)
+- [Configuring attack protection](#configuring-attack-protection)
+- [Available Settings](#available-settings)
   - [Lifecycle Events](#lifecycle-events)
   - [Environments](#environments)
   - [Error Handling](#error-handling)
@@ -1906,6 +1907,34 @@ get '/' do
   ...
 end
 ```
+
+### Pinning settings per request
+
+Dynamic settings (those defined with a block or proc) are evaluated on
+every access. If a setting should stay consistent for the duration of a
+request — for example a config version that may change while the request
+is being handled — pin it with `pin_settings`:
+
+```ruby
+set :config_version, proc { Config.current_version }
+pin_settings :config_version
+
+get '/' do
+  settings.config_version # evaluated once ...
+  settings.config_version # ... and reused for the rest of this request
+end
+```
+
+A pinned setting is evaluated the first time it is accessed during a
+request and the result is reused until the request finishes; the next
+request evaluates it again. Settings that are not pinned keep their
+default behavior, and accessing a pinned setting outside of a request
+(e.g. while the app boots) evaluates it on every access.
+
+Pinned settings may depend on other settings; a circular dependency
+raises `Sinatra::CircularSettingDependency` with the chain of settings
+that led to the cycle. If evaluating a pinned setting raises an error,
+the result is not memoized, so a later access evaluates it again.
 
 ### Configuring attack protection
 

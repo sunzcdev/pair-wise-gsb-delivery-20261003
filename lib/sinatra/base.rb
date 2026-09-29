@@ -282,6 +282,12 @@ module Sinatra
     def http_status; 404 end
   end
 
+  # Raised when settings pinned per request (see Sinatra::Base.pin_settings)
+  # depend on each other cyclically. The message contains the chain of
+  # settings that led to the cycle.
+  class CircularSettingDependency < Error
+  end
+
   # Methods available to routes, before/after filters, and views.
   module Helpers
     # Set or retrieve the response status code.
@@ -967,6 +973,34 @@ module Sinatra
     end
   end
 
+  # Per-request store for settings pinned with Base.pin_settings.
+  # Values are memoized on first access and dropped when the request
+  # finishes. Settings that raise while being evaluated are not
+  # memoized, so a later access (in the same or a following request)
+  # evaluates them again.
+  class PinnedSettings
+    def initialize
+      @values = {}
+      @evaluating = []
+    end
+
+    def fetch(name)
+      return @values[name] if @values.key?(name)
+
+      if @evaluating.include?(name)
+        chain = (@evaluating + [name]).join(' -> ')
+        raise CircularSettingDependency, "circular setting dependency: #{chain}"
+      end
+
+      @evaluating << name
+      begin
+        @values[name] = yield
+      ensure
+        @evaluating.pop
+      end
+    end
+  end
+
   # Base class for all Sinatra applications and middleware.
   class Base
     include Rack::Utils
@@ -999,18 +1033,20 @@ module Sinatra
       @pinned_response = nil
       template_cache.clear if settings.reload_templates
 
-      invoke { dispatch! }
-      invoke { error_block!(response.status) } unless @env['sinatra.error']
+      self.class.with_pinned_settings do
+        invoke { dispatch! }
+        invoke { error_block!(response.status) } unless @env['sinatra.error']
 
-      unless @response['content-type']
-        if Array === body && body[0].respond_to?(:content_type)
-          content_type body[0].content_type
-        elsif (default = settings.default_content_type)
-          content_type default
+        unless @response['content-type']
+          if Array === body && body[0].respond_to?(:content_type)
+            content_type body[0].content_type
+          elsif (default = settings.default_content_type)
+            content_type default
+          end
         end
-      end
 
-      @response.finish
+        @response.finish
+      end
     end
 
     # Access settings defined with Base.set.
@@ -1316,6 +1352,7 @@ module Sinatra
         @middleware     = []
         @prototype      = nil
         @extensions     = []
+        @pinned_settings = []
 
         @templates = if superclass.respond_to?(:templates)
                        Hash.new { |_hash, key| superclass.templates[key] }
@@ -1381,6 +1418,7 @@ module Sinatra
         define_singleton("#{option}=", setter)
         define_singleton(option, getter)
         define_singleton("#{option}?", "!!#{option}") unless method_defined? "#{option}?"
+        wrap_pinned_setting(option.to_sym) if pinned_settings.include?(option.to_sym)
         self
       end
 
@@ -1392,6 +1430,52 @@ module Sinatra
       # Same as calling `set :option, false` for each of the given options.
       def disable(*opts)
         opts.each { |key| set(key, false) }
+      end
+
+      # Pins the given settings for the duration of a request. A pinned
+      # setting is evaluated the first time it is accessed during a
+      # request and the result is reused for the rest of that request,
+      # so dynamic (proc based) settings like a config version stay
+      # consistent while the request is being handled. The next request
+      # evaluates the setting again. Settings that are not pinned keep
+      # their default behavior, and reads outside of a request (e.g.
+      # while the app boots) always evaluate the setting directly.
+      #
+      # Pinned settings may depend on other settings; a circular
+      # dependency raises Sinatra::CircularSettingDependency.
+      def pin_settings(*names)
+        names.each do |name|
+          name = name.to_sym
+          next if pinned_settings.include?(name)
+
+          @pinned_settings << name
+          wrap_pinned_setting(name) if respond_to?(name)
+        end
+        self
+      end
+
+      # Settings pinned per request on this class and all superclasses.
+      def pinned_settings
+        if superclass.respond_to?(:pinned_settings)
+          (superclass.pinned_settings + @pinned_settings).uniq
+        else
+          @pinned_settings
+        end
+      end
+
+      # Runs the block with a per-request store for pinned settings.
+      # Nested apps (e.g. mounted sub applications) each get their own
+      # store for the duration of their call.
+      def with_pinned_settings # :nodoc:
+        return yield if pinned_settings.empty?
+
+        stack = (Thread.current[:sinatra_pinned_settings] ||= [])
+        stack.push(PinnedSettings.new)
+        begin
+          yield
+        ensure
+          stack.pop
+        end
       end
 
       # Define a custom error handler. Optionally takes either an Exception
@@ -1732,6 +1816,23 @@ module Sinatra
           undef_method(name) if method_defined? name
           String === content ? class_eval("def #{name}() #{content}; end") : define_method(name, &content)
         end
+      end
+
+      # Wraps the getter of the given setting so accesses during a
+      # request go through the per-request pinned settings store.
+      def wrap_pinned_setting(name)
+        getter = singleton_class.instance_method(name)
+        wrapper = proc { read_pinned_setting(name) { getter.bind(self).call } }
+        define_singleton(name, wrapper)
+      end
+
+      # Evaluates the block once per request when a pinned settings
+      # store is active, and directly (on every access) otherwise.
+      def read_pinned_setting(name)
+        context = Thread.current[:sinatra_pinned_settings]&.last
+        return yield unless context
+
+        context.fetch(name) { yield }
       end
 
       # Condition for matching host name. Parameter might be String or Regexp.

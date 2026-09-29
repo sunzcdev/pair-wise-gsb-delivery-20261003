@@ -651,4 +651,192 @@ class SettingsTest < Minitest::Test
       end
     end
   end
+
+  describe 'pin_settings' do
+    it 'evaluates a pinned setting once per request' do
+      counter = 0
+      @base.set :version, proc { counter += 1 }
+      @base.pin_settings :version
+      seen = nil
+      @base.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = @base
+
+      get '/'
+      assert_equal [1, 1], seen
+      assert_equal 1, counter
+
+      get '/'
+      assert_equal [2, 2], seen
+      assert_equal 2, counter
+    end
+
+    it 'evaluates settings that are not pinned on every access' do
+      counter = 0
+      @base.set :version, proc { counter += 1 }
+      seen = nil
+      @base.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = @base
+
+      get '/'
+      assert_equal [1, 2], seen
+      assert_equal 2, counter
+    end
+
+    it 'evaluates pinned settings on every access outside of a request' do
+      counter = 0
+      @base.set :version, proc { counter += 1 }
+      @base.pin_settings :version
+
+      assert_equal 1, @base.version
+      assert_equal 2, @base.version
+      assert_equal 2, counter
+    end
+
+    it 'can pin a setting before it is defined' do
+      counter = 0
+      @base.pin_settings :version
+      @base.set :version, proc { counter += 1 }
+      seen = nil
+      @base.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = @base
+
+      get '/'
+      assert_equal [1, 1], seen
+      assert_equal 1, counter
+    end
+
+    it 'keeps a setting pinned when it is set again' do
+      counter = 0
+      @base.set :version, proc { counter += 1 }
+      @base.pin_settings :version
+      @base.set :version, proc { counter += 1 }
+      seen = nil
+      @base.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = @base
+
+      get '/'
+      assert_equal [1, 1], seen
+      assert_equal 1, counter
+    end
+
+    it 'memoizes settings that pinned settings depend on' do
+      counter = 0
+      @base.set :base_value, proc { counter += 1 }
+      @base.set :derived, proc { base_value * 10 }
+      @base.pin_settings :base_value, :derived
+      seen = nil
+      @base.get('/') { seen = [settings.derived, settings.base_value, settings.derived]; 'ok' }
+      @app = @base
+
+      get '/'
+      assert_equal [10, 1, 10], seen
+      assert_equal 1, counter
+    end
+
+    it 'raises with the dependency chain on circular dependencies' do
+      @base.set :first, proc { second }
+      @base.set :second, proc { first }
+      @base.pin_settings :first, :second
+      @base.set :raise_errors, true
+      @base.set :show_exceptions, false
+      @base.get('/') { settings.first.to_s }
+      @app = @base
+
+      error = assert_raises(Sinatra::CircularSettingDependency) { get '/' }
+      assert_include error.message, 'first -> second -> first'
+    end
+
+    it 'does not memoize settings that fail to evaluate' do
+      counter = 0
+      @base.set :fragile, proc { counter += 1; raise 'boom' if counter.odd?; counter }
+      @base.pin_settings :fragile
+      seen = nil
+      @base.get('/') do
+        begin
+          settings.fragile
+        rescue RuntimeError
+          :rescued
+        end
+        seen = settings.fragile
+        'ok'
+      end
+      @app = @base
+
+      get '/'
+      assert_equal 2, seen
+      assert_equal 2, counter
+
+      get '/'
+      assert_equal 4, seen
+      assert_equal 4, counter
+    end
+
+    it 'pins inherited settings in subclasses' do
+      counter = 0
+      @base.set :version, proc { counter += 1 }
+      @base.pin_settings :version
+      sub = Sinatra.new(@base)
+      seen = nil
+      sub.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = sub
+
+      get '/'
+      assert_equal [1, 1], seen
+
+      get '/'
+      assert_equal [2, 2], seen
+      assert_equal 2, counter
+    end
+
+    it 'lets subclasses pin their own settings' do
+      counter = 0
+      sub = Sinatra.new(@base)
+      sub.set :version, proc { counter += 1 }
+      sub.pin_settings :version
+      seen = nil
+      sub.get('/') { seen = [settings.version, settings.version]; 'ok' }
+      @app = sub
+
+      get '/'
+      assert_equal [1, 1], seen
+      assert_equal 1, counter
+    end
+
+    it 'pins settings per request in mounted sub applications' do
+      main_counter = 0
+      sub_counter = 0
+
+      @base.set :version, proc { main_counter += 1 }
+      @base.pin_settings :version
+      @base.get('/') { [settings.version, settings.version].join('-') }
+
+      sub = Sinatra.new(Sinatra::Base)
+      sub.set :version, proc { sub_counter += 1 }
+      sub.pin_settings :version
+      sub.get('/') { [settings.version, settings.version].join('-') }
+
+      main = @base
+      builder = Rack::Builder.new
+      builder.map('/sub') { run sub }
+      builder.map('/') { run main }
+      @app = builder.to_app
+
+      get '/'
+      assert_equal '1-1', body
+      assert_equal 1, main_counter
+      assert_equal 0, sub_counter
+
+      get '/sub'
+      assert_equal '1-1', body
+      assert_equal 1, sub_counter
+
+      get '/sub'
+      assert_equal '2-2', body
+      assert_equal 2, sub_counter
+
+      get '/'
+      assert_equal '2-2', body
+      assert_equal 2, main_counter
+    end
+  end
 end
