@@ -9,6 +9,7 @@ Compatibility:
 
 Features:
 
+* Add Mail::SMTPConnection#deliver_with_result! returning a Mail::SMTPDeliveryResult with per-recipient responses and DATA phase status, so callers can retry only undelivered recipients
 * Updated README to improve around sending multipart mail @kapfenho
 * Add delivery_interceptors method to Mail class to fetch registered interceptors @ghousemohamed
 
