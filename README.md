@@ -83,9 +83,44 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 
 * Cache
 * Pluralization: lambda pluralizers stored as translation data
+* Message patterns: opt-in, ICU-style select/plural messages (see below)
 * Locale fallbacks, RFC4647 compliant (optionally: RFC4646 locale validation)
 * [Gettext support](https://github.com/ruby-i18n/i18n/wiki/Gettext)
 * Translation metadata
+
+### Message patterns
+
+For messages that need to switch on both a count and another value (e.g. a
+recipient's title), plain pluralization hashes become unwieldy. Message
+patterns are an explicitly opt-in translation type supporting literal text,
+parameters, value-based `select`, category-based `plural`, and arbitrary
+nesting. Plain translation strings are never parsed as patterns.
+
+```ruby
+I18n::Backend::Simple.include(I18n::Backend::MessagePattern)
+
+I18n.backend.store_translations(:en, :notify => I18n::MessagePattern.new(
+  '{title, select, ' \
+  'formal{Dear customer, you have {count, plural, one{# message} other{# messages}}.} ' \
+  'other{You have {count, plural, =0{no messages} one{# message} other{# messages}}!}}'
+))
+
+I18n.t(:notify, :title => :formal, :count => 1) # => "Dear customer, you have 1 message."
+I18n.t(:notify, :title => :casual, :count => 0) # => "You have no messages!"
+```
+
+* `{name}` inserts a value; `{name, select, a{..} other{..}}` switches on a
+  value; `{name, plural, one{..} other{..}}` switches on the CLDR plural
+  category of a number (with `=N` exact matches and `#` for the number).
+* Branch bodies are full messages, so selects and plurals nest freely.
+  Every `select`/`plural` requires an `other` default branch.
+* Escaping: `''` is a literal apostrophe; a single quote before `{`, `}` or
+  `#` quotes literal text until the next `'` (e.g. `'{not a placeholder}'`).
+* Only the selected branch is evaluated: callable values referenced solely
+  by unselected branches are never called.
+* `I18n::MessagePattern.compile` returns cached, immutable pattern
+  instances; invalid patterns raise `I18n::MessagePattern::SyntaxError`
+  pointing at the exact line and column of the problem.
 
 ## Alternative Backend
 
