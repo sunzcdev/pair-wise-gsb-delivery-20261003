@@ -1,3 +1,8 @@
+## Unreleased
+
+- Add a secure reception mode to `HTTP::CookieJar` (`HTTP::CookieJar.new(secure_reception: true)`) that enforces the `__Secure-` and `__Host-` cookie name prefix rules of RFC 6265bis on parsing, manual `#add` and file import.  `HTTP::Cookie#domain_attribute?` is added to record whether the Domain attribute was explicitly given, distinguishing it from a domain inferred from the origin.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

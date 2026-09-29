@@ -133,7 +133,7 @@ class HTTP::Cookie
   def initialize(*args)
     @name = @origin = @domain = @path =
       @expires = @max_age = nil
-    @for_domain = @secure = @httponly = false
+    @for_domain = @secure = @httponly = @domain_attribute = false
     @session = true
     @created_at = @accessed_at = Time.now
     case argc = args.size
@@ -390,6 +390,7 @@ class HTTP::Cookie
     case domain
     when nil
       @for_domain = false
+      @domain_attribute = false
       if @origin
         @domain_name = DomainName.new(@origin.host)
         @domain = @domain_name.hostname
@@ -398,8 +399,10 @@ class HTTP::Cookie
       end
       return nil
     when DomainName
+      @domain_attribute = true
       @domain_name = domain
     else
+      @domain_attribute = true
       domain = (String.try_convert(domain) or
         raise TypeError, "#{domain.class} is not a String")
       if domain.start_with?('.')
@@ -422,6 +425,18 @@ class HTTP::Cookie
       @for_domain = for_domain unless for_domain.nil?
     end
     @domain = @domain_name.hostname
+  end
+
+  # Whether the cookie domain was explicitly specified, e.g. via a
+  # Domain attribute in a Set-Cookie header or the `:domain` option,
+  # as opposed to being inferred from the origin URI.
+  #
+  # This evidence is kept because "no Domain attribute was given" and
+  # "the Domain attribute value happened to equal the origin host"
+  # are different things, which matters for the `__Host-` cookie name
+  # prefix rules enforced by HTTP::CookieJar's secure reception mode.
+  def domain_attribute?
+    @domain_attribute
   end
 
   # Returns the domain, with a dot prefixed only if the domain flag is
@@ -460,7 +475,12 @@ class HTTP::Cookie
     # Delay setting @origin because #domain= or #path= may fail
     origin = HTTP::Cookie::URIParser.parse(origin)
     if URI::HTTP === origin
-      self.domain ||= origin.host
+      # Derive the domain from the origin without marking it as an
+      # explicitly given Domain attribute (see #domain_attribute?).
+      unless @domain
+        @domain_name = DomainName.new(origin.host)
+        @domain = @domain_name.hostname
+      end
       self.path   ||= (origin + './').path
     end
     @origin = origin

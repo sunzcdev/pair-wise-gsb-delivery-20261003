@@ -245,6 +245,44 @@ class TestHTTPCookie < Test::Unit::TestCase
     assert_equal 'example.com', cookie.dot_domain
   end
 
+  def test_domain_attribute_evidence
+    url = URI.parse('http://example.com/')
+
+    # No Domain attribute: the domain is inferred from the origin.
+    cookie = HTTP::Cookie.parse('a=b', url).first
+    assert_equal 'example.com', cookie.domain
+    assert_false cookie.domain_attribute?
+
+    # A Domain attribute whose value equals the origin host still
+    # counts as explicitly given.
+    cookie = HTTP::Cookie.parse('a=b; Domain=example.com', url).first
+    assert_equal 'example.com', cookie.domain
+    assert_true cookie.domain_attribute?
+
+    # A Domain attribute for a parent domain, of course, counts too.
+    cookie = HTTP::Cookie.parse('a=b; Domain=.example.com', url).first
+    assert_true cookie.domain_attribute?
+
+    # A Domain attribute on an IP address origin, where the for_domain
+    # flag gets negated, still counts as explicitly given.
+    cookie = HTTP::Cookie.parse('a=b; Domain=127.0.0.1', 'http://127.0.0.1/').first
+    assert_false cookie.for_domain?
+    assert_true cookie.domain_attribute?
+
+    # Manually built cookies: the :domain option is explicit, while a
+    # domain derived from the origin is not.
+    cookie = HTTP::Cookie.new('a', 'b', :domain => 'example.com')
+    assert_true cookie.domain_attribute?
+
+    cookie = HTTP::Cookie.new('a', 'b', :origin => 'http://example.com/')
+    assert_equal 'example.com', cookie.domain
+    assert_false cookie.domain_attribute?
+
+    # Resetting the domain to nil clears the evidence.
+    cookie.domain = nil
+    assert_false cookie.domain_attribute?
+  end
+
   def test_parse_max_age
     url = URI.parse('http://localhost/')
 

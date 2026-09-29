@@ -100,6 +100,22 @@ Or install it yourself as:
 
 
     ########################
+    # Secure reception mode
+    ########################
+
+    # Initialize a cookie jar that enforces the __Secure-/__Host-
+    # cookie name prefix rules (RFC 6265bis)
+    jar = HTTP::CookieJar.new(secure_reception: true)
+
+    # In this mode, cookies whose name starts with "__Secure-" or
+    # "__Host-" (case-insensitive) are only accepted when they have
+    # the Secure attribute set and come from a secure (https) origin.
+    # "__Host-" cookies must additionally have Path=/ and no Domain
+    # attribute.  Cookies with an unknown origin are never trusted,
+    # and a rejected cookie never overwrites an existing entry.  The
+    # check applies uniformly to #parse, #add and #load.
+
+    ########################
     # Server side example
     ########################
 

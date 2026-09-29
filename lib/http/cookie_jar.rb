@@ -49,12 +49,38 @@ class HTTP::CookieJar
   # specified store class.  For example, the `:mozilla`
   # (HTTP::CookieJar::MozillaStore) store class requires a `:filename`
   # option.  See individual store classes for details.
+  #
+  # :secure_reception
+  # : If true, the secure reception mode is enabled, in which cookies
+  #   with a `__Secure-` or `__Host-` name prefix are only accepted
+  #   when they satisfy the rules of RFC 6265bis:
+  #
+  #   * `__Secure-`: the Secure attribute must be set and the cookie
+  #     must be received from a secure (https) origin.
+  #   * `__Host-`: in addition to the above, the path must be `/` and
+  #     no Domain attribute must have been given.  Note that a Domain
+  #     attribute whose value happens to equal the origin host still
+  #     counts as "given" and leads to rejection.
+  #
+  #   A cookie whose origin is unknown is never considered trustworthy,
+  #   so such prefixed cookies are rejected in this mode.  This check
+  #   is applied uniformly to cookies parsed from Set-Cookie headers,
+  #   added manually via #add, and imported from a file via #load, and
+  #   a rejected cookie never overwrites an existing entry.
+  #   (default: `false`)
   def initialize(options = nil)
     opthash = {
       :store => :hash,
     }
     opthash.update(options) if options
+    @secure_reception = !!opthash.delete(:secure_reception)
     @store = get_impl(AbstractStore, opthash[:store], opthash)
+  end
+
+  # Whether the secure reception mode is enabled.  See ::new for
+  # details.
+  def secure_reception?
+    @secure_reception
   end
 
   # The copy constructor.  Not all backend store classes support cloning.
@@ -86,15 +112,61 @@ class HTTP::CookieJar
   #       jar.origin = origin
   #       jar.add(cookie)     # acceptance check is performed
   def add(cookie)
-    @store.add(cookie) if
-      begin
-        cookie.acceptable?
-      rescue RuntimeError => e
-        raise ArgumentError, e.message
-      end
+    store_if_acceptable(cookie)
     self
   end
   alias << add
+
+  # Adds a cookie to the underlying store if it is acceptable to this
+  # jar, and returns whether it was actually stored.
+  def store_if_acceptable(cookie)
+    if begin
+         acceptable_in_jar?(cookie)
+       rescue RuntimeError => e
+         raise ArgumentError, e.message
+       end
+      @store.add(cookie)
+      true
+    else
+      false
+    end
+  end
+  private :store_if_acceptable
+
+  # Case-insensitive cookie name prefixes subject to the secure
+  # reception mode.  See ::new for the rules.
+  SECURE_NAME_PREFIX = '__secure-'.freeze
+  HOST_NAME_PREFIX   = '__host-'.freeze
+
+  # Tests if a cookie is acceptable to this jar, taking the secure
+  # reception mode into account.
+  def acceptable_in_jar?(cookie)
+    cookie.acceptable? or return false
+    return true unless @secure_reception
+
+    case cookie.name
+    when /\A#{HOST_NAME_PREFIX}/i
+      acceptable_secure_prefix?(cookie) &&
+        cookie.path == '/' &&
+        !cookie.for_domain? &&
+        !cookie.domain_attribute?
+    when /\A#{SECURE_NAME_PREFIX}/i
+      acceptable_secure_prefix?(cookie)
+    else
+      true
+    end
+  end
+  private :acceptable_in_jar?
+
+  # Common requirements for the `__Secure-` and `__Host-` name
+  # prefixes: the Secure attribute must be set and the origin must be
+  # known and secure.  An unknown origin is never trusted.
+  def acceptable_secure_prefix?(cookie)
+    return false unless cookie.secure?
+    origin = cookie.origin
+    !origin.nil? && URI::HTTPS === origin
+  end
+  private :acceptable_secure_prefix?
 
   # Deletes a cookie that has the same name, domain and path as a
   # given cookie from the jar and returns self.
@@ -167,12 +239,14 @@ class HTTP::CookieJar
     if block_given?
       HTTP::Cookie.parse(set_cookie, origin, options).tap { |cookies|
         cookies.select! { |cookie|
-          yield(cookie) && add(cookie)
+          yield(cookie) && store_if_acceptable(cookie)
         }
       }
     else
-      HTTP::Cookie.parse(set_cookie, origin, options) { |cookie|
-        add(cookie)
+      HTTP::Cookie.parse(set_cookie, origin, options).tap { |cookies|
+        cookies.select! { |cookie|
+          store_if_acceptable(cookie)
+        }
       }
     end
   end

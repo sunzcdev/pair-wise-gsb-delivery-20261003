@@ -1002,4 +1002,151 @@ module TestHTTPCookieJar
     STDERR.puts 'sqlite3 missing?'
     false
   end
+
+  class TestSecureReception < Test::Unit::TestCase
+    def setup
+      @jar = HTTP::CookieJar.new(:secure_reception => true)
+    end
+
+    def test_option
+      assert_false HTTP::CookieJar.new.secure_reception?
+      assert_true @jar.secure_reception?
+    end
+
+    def test_secure_prefix
+      # Secure attribute set and received from a secure origin: accepted.
+      assert_equal 1, @jar.parse('__Secure-a=1; Secure', 'https://example.com/').size
+      # Missing the Secure attribute: rejected.
+      assert_equal 0, @jar.parse('__Secure-b=1', 'https://example.com/').size
+      # Received from an insecure origin: rejected.
+      assert_equal 0, @jar.parse('__Secure-c=1; Secure', 'http://example.com/').size
+      assert_equal %w[__Secure-a], @jar.to_a.map(&:name)
+    end
+
+    def test_host_prefix
+      assert_equal 1, @jar.parse('__Host-a=1; Secure; Path=/', 'https://example.com/').size
+      # A Domain attribute is given, even though its value equals the
+      # origin host: rejected.
+      assert_equal 0, @jar.parse('__Host-b=1; Secure; Path=/; Domain=example.com', 'https://example.com/').size
+      # Path other than "/": rejected.
+      assert_equal 0, @jar.parse('__Host-c=1; Secure; Path=/x', 'https://example.com/x').size
+      # Missing the Secure attribute: rejected.
+      assert_equal 0, @jar.parse('__Host-d=1; Path=/', 'https://example.com/').size
+      # Received from an insecure origin: rejected.
+      assert_equal 0, @jar.parse('__Host-e=1; Secure; Path=/', 'http://example.com/').size
+      assert_equal %w[__Host-a], @jar.to_a.map(&:name)
+    end
+
+    def test_prefix_match_is_case_insensitive
+      assert_equal 0, @jar.parse('__host-a=1; Secure; Path=/; Domain=example.com', 'https://example.com/').size
+      assert_equal 1, @jar.parse('__HOST-b=1; Secure; Path=/', 'https://example.com/').size
+      assert_equal 0, @jar.parse('__secure-c=1', 'https://example.com/').size
+    end
+
+    def test_manual_add
+      # A cookie whose origin is unknown is never trusted.
+      @jar.add(HTTP::Cookie.new('__Secure-a', '1',
+          :domain => 'example.com', :path => '/', :secure => true))
+      assert_equal 0, @jar.to_a.size
+
+      @jar.add(HTTP::Cookie.new('__Host-a', '1',
+          :origin => 'https://example.com/', :path => '/', :secure => true))
+      assert_equal %w[__Host-a], @jar.to_a.map(&:name)
+
+      # An explicitly given domain counts as a Domain attribute even
+      # when it equals the origin host.
+      @jar.add(HTTP::Cookie.new('__Host-b', '1',
+          :origin => 'https://example.com/', :domain => 'example.com',
+          :path => '/', :secure => true))
+      assert_equal %w[__Host-a], @jar.to_a.map(&:name)
+    end
+
+    def test_rejected_cookie_does_not_overwrite
+      @jar.parse('__Host-a=legit; Secure; Path=/', 'https://example.com/')
+      assert_equal 1, @jar.to_a.size
+
+      # Same name, domain and path, but failing the prefix rules:
+      # none of these may replace the existing entry.
+      @jar.parse('__Host-a=evil; Path=/', 'https://example.com/')
+      @jar.parse('__Host-a=evil; Secure; Path=/; Domain=example.com', 'https://example.com/')
+      @jar.add(HTTP::Cookie.new('__Host-a', 'evil',
+          :domain => 'example.com', :path => '/', :secure => true))
+
+      cookies = @jar.to_a
+      assert_equal 1, cookies.size
+      assert_equal 'legit', cookies.first.value
+    end
+
+    def test_unprefixed_cookies_unaffected
+      assert_equal 1, @jar.parse('plain=1', 'http://example.com/').size
+      assert_equal 1, @jar.parse('secureish=1; Secure', 'http://example.com/').size
+    end
+
+    def test_disabled_by_default
+      jar = HTTP::CookieJar.new
+      assert_equal 1, jar.parse('__Host-a=1; Path=/', 'http://example.com/').size
+      assert_equal 1, jar.parse('__Secure-b=1', 'http://example.com/').size
+    end
+
+    def test_load_yaml_file
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.yml')
+        # Simulate a file written before the secure reception mode
+        # existed: the recorded cookies carry no origin information.
+        HTTP::CookieJar.new.tap { |jar|
+          jar.add(HTTP::Cookie.new('__Host-a', '1',
+              :domain => 'example.com', :path => '/', :secure => true,
+              :expires => Time.now + 86400))
+          jar.add(HTTP::Cookie.new('plain', '1',
+              :domain => 'example.com', :path => '/',
+              :expires => Time.now + 86400))
+          jar.save(filename)
+        }
+
+        # Without a known secure origin the __Host- entry cannot be
+        # trusted and is rejected, while the plain cookie is imported.
+        @jar.load(filename)
+        assert_equal %w[plain], @jar.to_a.map(&:name)
+
+        # A jar without the mode imports everything as before.
+        jar = HTTP::CookieJar.new
+        jar.load(filename)
+        assert_equal 2, jar.to_a.size
+      end
+    end
+
+    def test_load_cookiestxt_file
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.txt')
+        HTTP::CookieJar.new.tap { |jar|
+          jar.add(HTTP::Cookie.new('__Secure-a', '1',
+              :domain => 'example.com', :path => '/', :secure => true,
+              :expires => Time.now + 86400))
+          jar.save(filename, :cookiestxt)
+        }
+
+        @jar.load(filename, :cookiestxt)
+        assert_equal 0, @jar.to_a.size
+      end
+    end
+
+    def test_load_does_not_clobber_existing_entry
+      @jar.parse('__Host-a=legit; Secure; Path=/', 'https://example.com/')
+
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.yml')
+        HTTP::CookieJar.new.tap { |jar|
+          jar.add(HTTP::Cookie.new('__Host-a', 'evil',
+              :domain => 'example.com', :path => '/', :secure => true,
+              :expires => Time.now + 86400))
+          jar.save(filename)
+        }
+
+        @jar.load(filename)
+        cookies = @jar.to_a
+        assert_equal 1, cookies.size
+        assert_equal 'legit', cookies.first.value
+      end
+    end
+  end
 end
