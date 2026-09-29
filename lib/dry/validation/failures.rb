@@ -51,13 +51,26 @@ module Dry
       #   @param meta [Hash] The hash containing the message as value for the :text key
       #   @example
       #     failure({text: :invalid, key: value})
+      #   @example attach structured fix candidates via the :suggestions key
+      #     failure({text: :invalid, suggestions: [{operation: :delete, path: [:legacy]}]})
+      #
+      # @overload failure(message, tokens, suggestions)
+      #   Attach structured fix candidates that could resolve this failure.
+      #   Each entry is either a Suggestion or a Hash like
+      #   `{operation: :replace, path: [:status], value: "active"}` or
+      #   `{operation: :delete, path: [:legacy_field]}`
+      #   @param message [String, Symbol] The message text or identifier
+      #   @param tokens [Hash] The message tokens
+      #   @param suggestions [Array<Suggestion, Hash>] The fix candidates
+      #   @example
+      #     failure("is invalid", {}, [{operation: :delete, path: [:legacy]}])
       #
       # @see Evaluator#key
       # @see Evaluator#base
       #
       # @api public
-      def failure(message, tokens = EMPTY_HASH)
-        opts << {message: message, tokens: tokens, path: path}
+      def failure(message, tokens = EMPTY_HASH, suggestions = EMPTY_ARRAY)
+        opts << {message: message, tokens: tokens, path: path, suggestions: suggestions}
         self
       end
 

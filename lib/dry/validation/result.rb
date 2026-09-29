@@ -17,7 +17,7 @@ module Dry
       # @param [Dry::Schema::Result] schema_result
       #
       # @api private
-      def self.new(schema_result, context = ::Concurrent::Map.new, options = EMPTY_HASH)
+      def self.new(schema_result, context = ::Concurrent::Map.new, options = EMPTY_HASH, **rest)
         result = super
         yield(result) if block_given?
         result.freeze
@@ -44,13 +44,29 @@ module Dry
       # @api private
       attr_reader :options
 
+      # The contract that produced this result (used to re-validate fixed input)
+      #
+      # @return [Contract, nil]
+      #
+      # @api private
+      attr_reader :contract
+
+      # The original, unmodified input that was validated
+      #
+      # @return [Hash, nil]
+      #
+      # @api private
+      attr_reader :input
+
       # Initialize a new result
       #
       # @api private
-      def initialize(schema_result, context, options)
+      def initialize(schema_result, context, options, contract: nil, input: nil)
         @schema_result = schema_result
         @context = context
         @options = options
+        @contract = contract
+        @input = input
         @errors = initialize_errors
       end
 
@@ -101,6 +117,118 @@ module Dry
       # @api public
       def error?(key)
         errors.any? { |msg| Schema::Path[msg.path].include?(Schema::Path[key]) }
+      end
+
+      # All structured fix candidates attached to the errors
+      #
+      # Every suggestion keeps a reference to the error it came from via
+      # Suggestion#error. Identical suggestions reported by multiple errors
+      # are returned only once.
+      #
+      # @return [Array<Suggestion>]
+      #
+      # @api public
+      def suggestions
+        @suggestions ||= errors.flat_map { |msg|
+          next EMPTY_ARRAY unless msg.respond_to?(:suggestions)
+
+          msg.suggestions.map { |suggestion| suggestion.with_error(msg) }
+        }.uniq.freeze
+      end
+
+      # Suggestions that can all be applied together
+      #
+      # This is the maximal conflict-free set: every suggestion in it is
+      # compatible with every other one, regardless of application order.
+      #
+      # @return [Array<Suggestion>]
+      #
+      # @api public
+      def compatible_suggestions
+        @compatible_suggestions ||= (suggestions - conflicting_suggestions).freeze
+      end
+
+      # Suggestions that cannot be merged automatically
+      #
+      # These are mutually exclusive with at least one other suggestion -
+      # the caller must explicitly choose which ones to apply.
+      #
+      # @return [Array<Suggestion>]
+      #
+      # @api public
+      def conflicting_suggestions
+        @conflicting_suggestions ||= conflict_groups.flatten.freeze
+      end
+
+      # Groups of mutually exclusive suggestions
+      #
+      # Each group contains suggestions that conflict with one another
+      # (same path with different replacements, parent/child paths, array
+      # index shifts). At most a conflict-free subset of each group can be
+      # applied together with the compatible suggestions.
+      #
+      # @return [Array<Array<Suggestion>>]
+      #
+      # @api public
+      def conflict_groups
+        @conflict_groups ||= suggestions.each_with_object([]) { |suggestion, groups|
+          overlapping = groups.select { |group|
+            group.any? { |other| suggestion.conflicts_with?(other) }
+          }
+
+          if overlapping.empty?
+            groups << [suggestion]
+          else
+            merged = overlapping.each_with_object([]) { |group, acc|
+              acc.concat(group)
+            } << suggestion
+            groups.reject! { |group| overlapping.include?(group) }
+            groups << merged
+          end
+        }.select { |group| group.size > 1 }.map(&:freeze).freeze
+      end
+
+      # Apply the explicitly selected suggestions to a copy of the original
+      # input and re-validate it exactly once
+      #
+      # This never modifies the original input or this result, and it never
+      # loops: the new result is returned as-is, even when it still contains
+      # errors (possibly with new suggestions).
+      #
+      # @param [Array<Suggestion>] selected A conflict-free set of suggestions
+      #
+      # @raise [ConflictingSuggestionsError] when the selection contains
+      #   suggestions that conflict with each other
+      # @raise [InvalidSuggestionError] when a selected suggestion does not
+      #   come from this result
+      #
+      # @return [Result] A new result produced from the fixed input
+      #
+      # @api public
+      def apply_suggestions(selected = compatible_suggestions)
+        unless contract && input
+          raise InvalidSuggestionError,
+                "suggestions can only be applied to results built by a contract"
+        end
+
+        selected = Array(selected)
+
+        unknown = selected.reject { |suggestion| suggestions.include?(suggestion) }
+        unless unknown.empty?
+          raise InvalidSuggestionError, "#{unknown.inspect} did not come from this result"
+        end
+
+        selected.combination(2) do |one, two|
+          if one.conflicts_with?(two)
+            raise ConflictingSuggestionsError, "#{one.inspect} conflicts with #{two.inspect}"
+          end
+        end
+
+        fixed_input = selected.reduce(Suggestion.deep_dup(input)) { |acc, suggestion|
+          suggestion.apply(acc)
+        }
+
+        contract.call(fixed_input)
       end
 
       # Check if the base schema (without rules) includes an error for the provided key
@@ -194,6 +322,10 @@ module Dry
       def freeze
         values.freeze
         errors.freeze
+        suggestions
+        compatible_suggestions
+        conflicting_suggestions
+        conflict_groups
         super
       end
 

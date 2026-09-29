@@ -29,6 +29,12 @@ module Dry
     # Error raised when a localized message was not found
     MissingMessageError = ::Class.new(::StandardError)
 
+    # Error raised when selected suggestions conflict with each other
+    ConflictingSuggestionsError = ::Class.new(::StandardError)
+
+    # Error raised when a suggestion that did not come from the result is selected
+    InvalidSuggestionError = ::Class.new(::StandardError)
+
     # Error raised when trying to define a schema in a contract class that already has a schema
     DuplicateSchemaError = ::Class.new(::StandardError)
 

@@ -97,7 +97,7 @@ module Dry
           context.each { |key, value| map[key] = value }
         end
 
-        Result.new(schema.(input), context_map) do |result|
+        Result.new(schema.(input), context_map, contract: self, input: input) do |result|
           rules.each do |rule|
             next if rule.keys.any? { |key| error?(result, key) }
 

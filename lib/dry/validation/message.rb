@@ -29,6 +29,13 @@ module Dry
       # @api public
       attr_reader :meta
 
+      # Structured fix candidates attached to this error
+      #
+      # @return [Array<Suggestion>]
+      #
+      # @api public
+      attr_reader :suggestions
+
       # A localized message type
       #
       # Localized messsages can be translated to other languages at run-time
@@ -48,7 +55,7 @@ module Dry
         # @api public
         def evaluate(**opts)
           evaluated_text, rest = text.(**opts)
-          Message.new(evaluated_text, path: path, meta: rest.merge(meta))
+          Message.new(evaluated_text, path: path, meta: rest.merge(meta), suggestions: suggestions)
         end
       end
 
@@ -57,19 +64,20 @@ module Dry
       # @return [Message, Message::Localized]
       #
       # @api private
-      def self.[](text, path, meta)
+      def self.[](text, path, meta, suggestions = EMPTY_ARRAY)
         klass = text.respond_to?(:call) ? Localized : Message
-        klass.new(text, path: path, meta: meta)
+        klass.new(text, path: path, meta: meta, suggestions: suggestions)
       end
 
       # Initialize a new error object
       #
       # @api private
       # rubocop: disable Lint/MissingSuper
-      def initialize(text, path:, meta: EMPTY_HASH)
+      def initialize(text, path:, meta: EMPTY_HASH, suggestions: EMPTY_ARRAY)
         @text = text
         @path = Array(path)
         @meta = meta
+        @suggestions = suggestions
       end
       # rubocop: enable Lint/MissingSuper
 
