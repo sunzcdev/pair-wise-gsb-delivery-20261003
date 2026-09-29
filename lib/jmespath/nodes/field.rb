@@ -9,17 +9,34 @@ module JMESPath
       end
 
       def visit(value)
-        if value.respond_to?(:to_ary) && @key.is_a?(Integer)
-          value.to_ary[@key]
+        if value.is_a?(Missing)
+          value.child(@key)
+        elsif value.respond_to?(:to_ary) && @key.is_a?(Integer)
+          array = value.to_ary
+          if Diagnostic.active? && (@key >= array.size || @key < -array.size)
+            Missing.new([@key])
+          else
+            array[@key]
+          end
         elsif value.respond_to?(:to_hash)
           value = value.to_hash
-          if !(v = value[@key]).nil?
+          if Diagnostic.active?
+            if value.key?(@key)
+              value[@key]
+            elsif @key_sym && value.key?(@key_sym)
+              value[@key_sym]
+            else
+              Missing.new([@key])
+            end
+          elsif !(v = value[@key]).nil?
             v
           elsif @key_sym && !(v = value[@key_sym]).nil?
             v
           end
         elsif value.is_a?(Struct) && value.respond_to?(@key)
           value[@key]
+        elsif Diagnostic.active? && value.is_a?(Struct)
+          Missing.new([@key])
         end
       end
 
@@ -47,18 +64,38 @@ module JMESPath
       end
 
       def visit(obj)
+        diagnostic = Diagnostic.active?
+        path = []
         @keys.reduce(obj) do |value, key|
-          if value.respond_to?(:to_ary) && key.is_a?(Integer)
-            value.to_ary[key]
+          path << key
+          if value.is_a?(Missing)
+            value.child(key)
+          elsif value.respond_to?(:to_ary) && key.is_a?(Integer)
+            array = value.to_ary
+            if diagnostic && (key >= array.size || key < -array.size)
+              Missing.new(path.dup)
+            else
+              array[key]
+            end
           elsif value.respond_to?(:to_hash)
             value = value.to_hash
-            if !(v = value[key]).nil?
+            if diagnostic
+              if value.key?(key)
+                value[key]
+              elsif (sym = @key_syms[key]) && value.key?(sym)
+                value[sym]
+              else
+                Missing.new(path.dup)
+              end
+            elsif !(v = value[key]).nil?
               v
             elsif (sym = @key_syms[key]) && !(v = value[sym]).nil?
               v
             end
           elsif value.is_a?(Struct) && value.respond_to?(key)
             value[key]
+          elsif diagnostic && value.is_a?(Struct)
+            Missing.new(path.dup)
           end
         end
       end

@@ -20,7 +20,12 @@ module JMESPath
       end
 
       def visit(value)
-        call(@children.map { |child| child.visit(value) })
+        args = @children.map { |child| child.visit(value) }
+        if (missing = args.find { |arg| arg.is_a?(Missing) })
+          missing
+        else
+          call(args)
+        end
       end
 
       def optimize

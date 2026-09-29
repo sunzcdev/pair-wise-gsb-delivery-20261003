@@ -50,13 +50,21 @@ module JMESPath
     module Comparators
       class Eq < Comparator
         def check(left_value, right_value)
-          Util.as_json(left_value) == Util.as_json(right_value)
+          if left_value.is_a?(Missing) || right_value.is_a?(Missing)
+            left_value.is_a?(Missing) && right_value.is_a?(Missing)
+          else
+            Util.as_json(left_value) == Util.as_json(right_value)
+          end
         end
       end
 
       class Neq < Comparator
         def check(left_value, right_value)
-          Util.as_json(left_value) != Util.as_json(right_value)
+          if left_value.is_a?(Missing) || right_value.is_a?(Missing)
+            left_value.is_a?(Missing) != right_value.is_a?(Missing)
+          else
+            Util.as_json(left_value) != Util.as_json(right_value)
+          end
         end
       end
 

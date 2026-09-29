@@ -42,6 +42,14 @@ module JMESPath
 
       private
 
+      def values_equal?(left_value, right_value)
+        if left_value.is_a?(Missing) || right_value.is_a?(Missing)
+          left_value.is_a?(Missing) && right_value.is_a?(Missing)
+        else
+          Util.as_json(left_value) == Util.as_json(right_value)
+        end
+      end
+
       def comparable?(left_value, right_value)
         COMPARABLE_TYPES.any? do |type|
           left_value.is_a?(type) && right_value.is_a?(type)
@@ -53,7 +61,7 @@ module JMESPath
       COMPARATOR_TO_CONDITION[Comparators::Eq] = self
 
       def visit(value)
-        Util.as_json(@left.visit(value)) == Util.as_json(@right.visit(value)) ? @child.visit(value) : nil
+        values_equal?(@left.visit(value), @right.visit(value)) ? @child.visit(value) : nil
       end
 
       def optimize
@@ -72,7 +80,7 @@ module JMESPath
       end
 
       def visit(value)
-        Util.as_json(@left.visit(value)) == @right ? @child.visit(value) : nil
+        values_equal?(@left.visit(value), @right) ? @child.visit(value) : nil
       end
     end
 
@@ -80,7 +88,7 @@ module JMESPath
       COMPARATOR_TO_CONDITION[Comparators::Neq] = self
 
       def visit(value)
-        Util.as_json(@left.visit(value)) != Util.as_json(@right.visit(value)) ? @child.visit(value) : nil
+        !values_equal?(@left.visit(value), @right.visit(value)) ? @child.visit(value) : nil
       end
 
       def optimize
@@ -99,7 +107,7 @@ module JMESPath
       end
 
       def visit(value)
-        Util.as_json(@left.visit(value)) != @right ? @child.visit(value) : nil
+        !values_equal?(@left.visit(value), @right) ? @child.visit(value) : nil
       end
     end
 

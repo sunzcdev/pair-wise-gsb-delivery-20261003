@@ -8,7 +8,8 @@ module JMESPath
       #   https://github.com/jmespath/jmespath.site/blob/master/docs/proposals/improved-filters.rst#and-expressions-1
       #
       def falsey?(value)
-        !value ||
+        value.is_a?(Missing) ||
+          !value ||
           (value.respond_to?(:to_ary) && value.to_ary.empty?) ||
           (value.respond_to?(:to_hash) && value.to_hash.empty?) ||
           (value.respond_to?(:to_str) && value.to_str.empty?) ||

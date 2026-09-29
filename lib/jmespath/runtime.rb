@@ -57,6 +57,21 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # Searches `data` using the diagnostic mode. Keys that are absent
+    # from the data are tracked internally as {Missing} sentinels and
+    # reported in the result as serializable hashes of the shape
+    # `{ '$missing' => 'path.to.key' }`. Explicit `null` values in the
+    # data continue to be returned as `nil`.
+    #
+    # @param [String<JMESPath>] expression
+    # @param [Hash] data
+    # @return [Mixed,nil] A result free of {Missing} sentinels.
+    def diagnostic_search(expression, data)
+      Diagnostic.activate do
+        Diagnostic.sanitize(search(expression, data))
+      end
+    end
+
     private
 
     def default_parser(options)

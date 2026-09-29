@@ -9,6 +9,8 @@ module JMESPath
 
       def visit(value)
         value = @child.visit(value)
+        return value if value.is_a?(Missing)
+
         if value.respond_to?(:to_ary)
           value.to_ary.each_with_object([]) do |v, values|
             if v.respond_to?(:to_ary)

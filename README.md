@@ -70,6 +70,56 @@ File.open('/path/to/data.json', 'r', encoding:'UTF-8') do |file|
 end
 ```
 
+## Diagnostic Mode
+
+When reviewing configuration data, a key that was never written means
+something different than a key explicitly set to `null`. The default
+`JMESPath.search` collapses both into `nil`. `JMESPath.diagnostic_search`
+keeps them apart: internally, absent keys evaluate to a `missing`
+sentinel that propagates through the expression, and the final result
+reports each missing value as a serializable hash of the shape
+`{ '$missing' => 'path.to.key' }`. The sentinel object itself never
+appears in the returned result.
+
+The truth table below shows how `missing` behaves at the boundaries,
+compared to an explicit `null` and to the default mode:
+
+| Context | Expression | Explicit `null` | `missing` (diagnostic mode) | Default `search` |
+| --- | --- | --- | --- | --- |
+| Lookup | `a` | `nil` | `{ '$missing' => 'a' }` | `nil` |
+| Equality | ``a == `null` `` | `true` | `false` | `true` |
+| Inequality | ``a != `null` `` | `false` | `true` | `false` |
+| Equality, both sides | `a == b` (both absent) | — | `true` | `true` |
+| Ordering | ``a > `1` `` | `nil` | `nil` | `nil` |
+| Logic | ``a \|\| `1` `` / ``a && `1` `` | `1` / `nil` | `1` / `{ '$missing' => 'a' }` (falsey) | `1` / `nil` |
+| Projection | `list[*].a` | dropped | dropped | dropped |
+| Function argument | `length(a)` | `InvalidTypeError` | `{ '$missing' => 'a' }` (propagates) | `InvalidTypeError` |
+
+Running both modes over the same input, including a multi-level path
+that goes missing mid-path:
+
+```ruby
+data = {
+  'service' => {
+    'endpoint' => nil, # explicitly null
+    'tags' => ['a', 'b']
+  }
+}
+
+# Default mode: null and missing are indistinguishable.
+JMESPath.search('service.endpoint', data)
+#=> nil
+JMESPath.search('service.timeout.retries', data)
+#=> nil
+
+# Diagnostic mode: explicit null stays nil, missing keys are reported
+# with the full path that was attempted.
+JMESPath.diagnostic_search('service.endpoint', data)
+#=> nil
+JMESPath.diagnostic_search('service.timeout.retries', data)
+#=> { '$missing' => 'service.timeout.retries' }
+```
+
 ## Links of Interest
 
 * [Release Notes](https://github.com/trevorrowe/jmespath.rb/releases)

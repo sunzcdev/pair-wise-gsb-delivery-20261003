@@ -1,6 +1,11 @@
 Unreleased Changes
 ------------------
 
+* Feature - Add `JMESPath.diagnostic_search`, a diagnostic mode that
+  distinguishes absent keys from explicit `null` values. Absent keys are
+  tracked internally as a `missing` sentinel and reported in results as
+  serializable `{ '$missing' => 'path.to.key' }` hashes.
+
 1.6.2 (2022-11-25)
 ------------------
 
