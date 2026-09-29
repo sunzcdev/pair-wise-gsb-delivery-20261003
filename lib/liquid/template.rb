@@ -212,8 +212,78 @@ module Liquid
       render(*args)
     end
 
+    # Renders the template lazily, delivering the output in chunks as they
+    # are produced instead of first concatenating everything into one big
+    # string.
+    #
+    # Returns an Enumerator of String chunks. Rendering only progresses as
+    # the enumerator is consumed, so the caller may stop at any point: no
+    # further template code (variable lookups, Drop methods, filters, ...)
+    # is executed once consumption stops, and resource limit accounting
+    # follows the actual execution, exactly as with #render.
+    #
+    # Tags which need their complete body up front (e.g. {% capture %})
+    # buffer their own content locally; everything else is streamed.
+    #
+    # Accepts the same arguments as #render, except that the :output option
+    # is not supported (chunks are delivered through the enumerator).
+    #
+    # Exceptions raised while rendering are delivered at the corresponding
+    # consumption position: the chunks produced before the failure are
+    # yielded first, and the exception is raised by the Enumerator#next call
+    # that would have produced the failing chunk.
+    #
+    # Example:
+    #
+    #   template.render_each('user_name' => 'bob').each do |chunk|
+    #     response.write(chunk)
+    #   end
+    #
+    def render_each(*args)
+      Enumerator.new do |yielder|
+        output = ChunkedOutput.new(yielder)
+
+        render_args = args.dup
+        render_args << nil if render_args.empty?
+        options = render_args.size > 1 && render_args.last.is_a?(Hash) ? render_args.pop.dup : {}
+        options[:output] = output
+
+        render(*render_args, options)
+      end
+    end
+
+    # Like #render_each, but rethrows errors instead of rendering them as
+    # error messages (see #render!).
+    def render_each!(*args)
+      @rethrow_errors = true
+      render_each(*args)
+    end
+
     def render_to_output_buffer(context, output)
       render(context, output: output)
+    end
+
+    # @api private
+    # Output buffer used by #render_each. Implements the subset of the
+    # String API the render pipeline relies on (`<<` and `bytesize`) and
+    # forwards every appended chunk to the consumer. `bytesize` is
+    # cumulative so that ResourceLimits#render_length_limit keeps
+    # accounting for the total output size.
+    class ChunkedOutput
+      attr_reader :bytesize
+
+      def initialize(yielder)
+        @yielder  = yielder
+        @bytesize = 0
+      end
+
+      def <<(chunk)
+        unless chunk.empty?
+          @bytesize += chunk.bytesize
+          @yielder.yield(chunk)
+        end
+        self
+      end
     end
 
     private
