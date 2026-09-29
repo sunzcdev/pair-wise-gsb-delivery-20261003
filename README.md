@@ -214,6 +214,8 @@ Numeric: `MIN`, `MAX`, `SUM`, `AVG`, `COUNT`, `ROUND`, `ROUNDDOWN`, `ROUNDUP`, `
 
 Selections: `CASE` (syntax see [spec](https://github.com/rubysolo/dentaku/blob/main/lib/dentaku/ast/case.rb))
 
+Local bindings: `LET` (syntax see [spec](https://github.com/rubysolo/dentaku/blob/main/lib/dentaku/ast/functions/let.rb))
+
 String: `LEFT`, `RIGHT`, `MID`, `LEN`, `FIND`, `SUBSTITUTE`, `CONCAT`, `CONTAINS`
 
 Collection: `MAP`, `FILTER`, `ALL`, `ANY`, `PLUCK`
