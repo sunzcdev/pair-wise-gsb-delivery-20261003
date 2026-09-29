@@ -12,6 +12,14 @@ require "dry/transaction/errors"
 module Dry
   # Business transaction DSL
   module Transaction
+    # Thread-local key marking that a step operation is being invoked, so a
+    # transaction called as another transaction's operation keeps its
+    # StepFailure wrapper (and its structured failure address) intact for
+    # the parent transaction to compose
+    #
+    # @api private
+    NESTED_OPERATION_CALL_KEY = :dry_transaction_nested_operation_call
+
     def self.included(klass)
       klass.include(Dry::Transaction())
     end

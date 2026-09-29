@@ -30,6 +30,10 @@ module Dry
 
         if block
           ResultMatcher.(result, &block)
+        elsif Thread.current[NESTED_OPERATION_CALL_KEY]
+          # Keep the StepFailure wrapper intact so the parent transaction
+          # can compose this failure's address into its own
+          result
         else
           result.or { |step_failure|
             # Unwrap the value from the StepFailure and return it directly

@@ -50,10 +50,17 @@ module Dry
       def call(input, continue = RETURN)
         args = [input, *call_args]
 
-        if adapter.yields?
-          with_broadcast(args) { adapter.(args, &continue) }
-        else
-          continue.(with_broadcast(args) { adapter.(args) })
+        nested = Thread.current[NESTED_OPERATION_CALL_KEY]
+        Thread.current[NESTED_OPERATION_CALL_KEY] = true
+
+        begin
+          if adapter.yields?
+            with_broadcast(args) { adapter.(args, &continue) }
+          else
+            continue.(with_broadcast(args) { adapter.(args) })
+          end
+        ensure
+          Thread.current[NESTED_OPERATION_CALL_KEY] = nested
         end
       end
 

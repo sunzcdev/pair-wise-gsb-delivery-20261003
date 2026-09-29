@@ -7,6 +7,20 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Structured failure addresses for nested transactions. When a transaction is
+  used as another transaction's operation, `StepFailure` now carries a `#path`
+  of step names from the outermost parent step down to the leaf step that
+  failed, while the original failure value (including any original exception)
+  is preserved unchanged across all levels of nesting. `ResultMatcher` failure
+  cases accept an address array to match the full path (e.g.
+  `m.failure([:create_user, :validate])`) or any parent-level prefix of it
+  (e.g. `m.failure([:create_user])`), which tells apart same-named steps in
+  different subflows. Matching with a plain step name still compares against
+  the leaf step only, so existing single-level matchers are unaffected.
+  Overlapping cases are evaluated in definition order (first match wins), so
+  define more specific addresses before broader ones.
 
 ## [0.16.0] - 2024-01-17
 
