@@ -251,6 +251,28 @@ encoded_token.payload # => { 'exp'=>1234, 'jti'=>'1234", 'sub'=>'my-subject' }
 encoded_token.header # {'kid'=>'hmac', 'alg'=>'HS256'}
 ```
 
+#### Verification receipts
+
+When verification results are cached, a bare boolean cannot tell under which policy a token was verified. The `JWT::EncodedToken#verify_with_receipt!` method performs a full signature and claim verification and returns an immutable `JWT::VerificationReceipt` binding the token bytes, the algorithm, a caller provided policy identifier, the verification time and the checks that passed.
+
+```ruby
+receipt = encoded_token.verify_with_receipt!(policy: :session,
+                                             signature: { algorithm: 'HS256', key: 'secret' },
+                                             claims: [:exp])
+receipt.jwt         # => "eyJhbGciOiJIUzI1NiJ9..." (the verified token bytes)
+receipt.algorithm   # => "HS256"
+receipt.policy      # => :session
+receipt.verified_at # => 2026-09-30 12:00:00 +0800
+receipt.checks      # => [:signature, :exp]
+```
+
+A receipt is only issued when the complete verification succeeds - a failed verification raises and issues nothing. Every call verifies again and issues a fresh receipt; previously issued receipts are never mutated. A receipt proves only the policy it was issued for, so a cached receipt must be checked against the requested policy before it is trusted:
+
+```ruby
+receipt.covers?(:admin)      # => false, another policy is not proven
+receipt.for_token?(token)    # => false once the token bytes have changed
+```
+
 A JWK can be used to sign and verify the token if it's possible to derive the signing algorithm from the key.
 
 ```ruby

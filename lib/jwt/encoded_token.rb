@@ -116,6 +116,41 @@ module JWT
       nil
     end
 
+    # Verifies the token signature and claims and issues an immutable
+    # {VerificationReceipt} binding the token bytes, the algorithm and the
+    # caller provided policy identifier.
+    #
+    # A receipt is only issued when the full verification succeeds; a failed
+    # verification raises and issues nothing. Every call performs the complete
+    # verification again and issues a new receipt with a fresh verification
+    # time - previously issued receipts are never mutated or reused.
+    #
+    # @example
+    #  receipt = encoded_token.verify_with_receipt!(policy: :session,
+    #                                               signature: { algorithm: 'HS256', key: 'secret' },
+    #                                               claims: [:exp])
+    #  receipt.covers?(:session) # => true
+    #
+    # @param policy [Object] identifier of the verification policy, bound to the issued receipt.
+    # @param signature [Hash] the parameters for signature verification (see {#verify_signature!}).
+    # @param claims [Array<Symbol>, Hash] the claims to verify (see {#verify_claims!}).
+    # @return [VerificationReceipt] the immutable verification receipt.
+    # @raise [ArgumentError] if no policy identifier is given.
+    # @raise [JWT::Error] if the signature or claim verification fails.
+    def verify_with_receipt!(policy:, signature:, claims: nil)
+      raise ArgumentError, 'A policy identifier is required to issue a verification receipt' if policy.nil?
+
+      verify_signature!(**signature)
+      claims.is_a?(Array) ? verify_claims!(*claims) : verify_claims!(claims)
+
+      VerificationReceipt.send(:new,
+                               jwt: jwt,
+                               algorithm: header['alg'],
+                               policy: policy,
+                               verified_at: Time.now,
+                               checks: [:signature, *claim_check_names(claims)])
+    end
+
     # Verifies the token signature and claims.
     # By default it verifies the 'exp' claim.
 
@@ -196,6 +231,11 @@ module JWT
       return DEFAULT_CLAIMS if options.first.nil?
 
       options
+    end
+
+    def claim_check_names(claims)
+      options = claims.is_a?(Array) ? claims : [claims]
+      claims_options(options).flat_map { |option| option.is_a?(Hash) ? option.keys : option }
     end
 
     def decode_payload
