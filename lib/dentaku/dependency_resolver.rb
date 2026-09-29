@@ -8,6 +8,13 @@ module Dentaku
       self.new(vars_to_dependencies_hash, case_sensitive).sort
     end
 
+    # every independent cycle in the graph, as arrays of the original
+    # variable names; groups and their members are sorted so the output is
+    # stable regardless of declaration order
+    def self.find_cycles(vars_to_dependencies_hash, case_sensitive = false)
+      self.new(vars_to_dependencies_hash, case_sensitive).cycles
+    end
+
     def initialize(vars_to_dependencies_hash, case_sensitive = false)
       @case_sensitive = case_sensitive
       @key_mapping = Hash[vars_to_dependencies_hash.keys.map { |k| [normalized_name(k), k] }]
@@ -19,6 +26,13 @@ module Dentaku
       tsort.map { |k| @key_mapping.fetch(k, k) }
     end
 
+    def cycles
+      strongly_connected_components
+        .select { |component| component.size > 1 || self_dependent?(component.first) }
+        .map { |component| component.map { |k| @key_mapping.fetch(k, k) }.sort }
+        .sort
+    end
+
     def tsort_each_node(&block)
       @vars_to_deps.each_key(&block)
     end
@@ -28,6 +42,10 @@ module Dentaku
     end
 
     private
+
+    def self_dependent?(node)
+      @vars_to_deps.fetch(node.to_s, []).include?(node.to_s)
+    end
 
     def normalized_name(variable_name)
       @case_sensitive ? variable_name.to_s : variable_name.to_s.downcase

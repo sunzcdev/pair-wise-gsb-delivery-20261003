@@ -1,3 +1,5 @@
+require 'tsort'
+
 module Dentaku
   # Shared by all Dentaku exceptions so that `rescue Dentaku::Error` catches
   # everything the gem raises, including exceptions that subclass Ruby
@@ -15,6 +17,32 @@ module Dentaku
 
     def initialize(unbound_variables)
       @unbound_variables = unbound_variables
+    end
+  end
+
+  # Raised/reported when a batch of formulas cannot be solved because of
+  # cyclic dependencies. Subclasses TSort::Cyclic for backwards
+  # compatibility, but carries the full diagnostic picture: every
+  # independent cycle group plus the formulas that transitively depend on a
+  # cycle and therefore cannot be evaluated either.
+  class CyclicDependencyError < TSort::Cyclic
+    include Error
+
+    attr_reader :cycles, :blocked
+
+    def initialize(cycles, blocked = [])
+      @cycles = cycles
+      @blocked = blocked
+      super(default_message)
+    end
+
+    private
+
+    def default_message
+      groups = cycles.map { |cycle| (cycle + [cycle.first]).join(' -> ') }
+      message = "cyclic dependencies detected: #{groups.join('; ')}"
+      message += "; unable to evaluate: #{blocked.join(', ')}" unless blocked.empty?
+      message
     end
   end
 

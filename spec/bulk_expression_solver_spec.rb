@@ -283,4 +283,104 @@ RSpec.describe Dentaku::BulkExpressionSolver do
       expect(results).to eq(a: :undefined, b: :undefined)
     end
   end
+
+  describe "cyclic dependency diagnostics" do
+    let(:expressions) do
+      {
+        alpha:   "beta + 1",
+        beta:    "alpha + 1",
+        gamma:   "delta + 1",
+        delta:   "gamma + 1",
+        blocked: "alpha + delta",
+        ok:      "1 + 1",
+        also_ok: "ok * 3"
+      }
+    end
+
+    it "reports every independent cycle and still solves unaffected formulas" do
+      errors = []
+      result = described_class.new(expressions, calculator).solve do |ex|
+        errors << ex
+        :cyclic
+      end
+
+      expect(result).to eq(
+        alpha:   :cyclic,
+        beta:    :cyclic,
+        gamma:   :cyclic,
+        delta:   :cyclic,
+        blocked: :cyclic,
+        ok:      2,
+        also_ok: 6
+      )
+
+      expect(errors.map(&:assigned_to))
+        .to eq(%w[alpha beta delta gamma blocked])
+      errors.each do |error|
+        expect(error).to be_a(Dentaku::CyclicDependencyError)
+        expect(error).to be_a(TSort::Cyclic)
+        expect(error.cycles).to eq([["alpha", "beta"], ["delta", "gamma"]])
+        expect(error.blocked).to eq(["blocked"])
+      end
+    end
+
+    it "raises a single error listing all cycle groups from solve!" do
+      expect { described_class.new(expressions, calculator).solve! }
+        .to raise_error(Dentaku::CyclicDependencyError, /alpha -> beta -> alpha.*delta -> gamma -> delta/m)
+    end
+
+    it "remains compatible with handlers expecting TSort::Cyclic" do
+      expect { described_class.new(expressions, calculator).solve! }
+        .to raise_error(TSort::Cyclic)
+    end
+
+    it "normalizes case when grouping cycle members" do
+      expressions = { First: "SECOND + 1", Second: "first + 1", ok: "2" }
+      error = nil
+      result = described_class.new(expressions, calculator).solve do |ex|
+        error ||= ex
+        :cyclic
+      end
+
+      expect(result).to eq(First: :cyclic, Second: :cyclic, ok: 2)
+      expect(error.cycles).to eq([["First", "Second"]])
+    end
+
+    it "follows calculator aliases when detecting cycles" do
+      calculator = Dentaku::Calculator.new(aliases: { "max" => ["biggest"] })
+      expressions = { alpha: "biggest(beta, 1)", beta: "alpha + 1", ok: "biggest(2, 3)" }
+      error = nil
+      result = described_class.new(expressions, calculator).solve do |ex|
+        error ||= ex
+        :cyclic
+      end
+
+      expect(result).to eq(alpha: :cyclic, beta: :cyclic, ok: 3)
+      expect(error.cycles).to eq([["alpha", "beta"]])
+    end
+
+    it "does not mistake same-named external inputs for formula nodes" do
+      expressions = { alpha: "beta + 1", beta: "alpha + 1" }
+      solver = described_class.new(expressions, calculator.store(beta: 10))
+      expect(solver.solve!).to eq(alpha: 11, beta: 12)
+    end
+
+    it "still allows self-referential formulas backed by stored values" do
+      expressions = { x: "x + 1", y: "x * 2" }
+      solver = described_class.new(expressions, calculator.store(x: 1))
+      expect(solver.solve!).to eq(x: 2, y: 4)
+    end
+
+    it "reports a bare self-reference as a single-node cycle" do
+      error = nil
+      result = described_class.new({ x: "x + 1" }, calculator).solve do |ex|
+        error = ex
+        :cyclic
+      end
+
+      expect(result).to eq(x: :cyclic)
+      expect(error.cycles).to eq([["x"]])
+      expect(error.blocked).to eq([])
+    end
+  end
 end

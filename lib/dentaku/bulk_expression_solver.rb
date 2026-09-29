@@ -96,7 +96,7 @@ module Dentaku
 
       context = calculator.memory.merge(evaluated_facts)
 
-      variables_in_resolve_order.each_with_object({}) do |var_name, results|
+      results = variables_in_resolve_order.each_with_object({}) do |var_name, results|
         next if expressions[var_name].nil?
 
         with_rescues(var_name, results, block) do
@@ -111,9 +111,29 @@ module Dentaku
         end
       end
 
-    rescue TSort::Cyclic => ex
-      block.call(ex)
-      {}
+      report_cycle_errors(results, &block)
+
+      results
+    end
+
+    # every expression that is part of a cycle, or transitively depends on
+    # one, gets its own CyclicDependencyError carrying the full diagnostic
+    # picture; unaffected expressions have already been solved above
+    def report_cycle_errors(results, &block)
+      return unless cycle_error
+
+      (cycle_error.cycles.flatten + cycle_error.blocked).each do |var_name|
+        next unless expressions.has_key?(var_name)
+
+        ex = CyclicDependencyError.new(cycle_error.cycles, cycle_error.blocked)
+        ex.assigned_to = var_name
+        results[var_name] = block.call(ex)
+
+        stored_name = normalized_name(var_name)
+        if results[var_name] == :undefined && calculator.memory.has_key?(stored_name)
+          results[var_name] = calculator.memory[stored_name]
+        end
+      end
     end
 
     def with_rescues(var_name, results, block)
@@ -153,12 +173,57 @@ module Dentaku
     end
 
     def variables_in_resolve_order
-      cache_key = "#{!!calculator.case_sensitive}|#{expressions.keys.map(&:to_s).sort.join("|")}"
-      @ordered_deps ||= self.class.dependency_cache.fetch(cache_key) {
-        DependencyResolver.find_resolve_order(dependencies, calculator.case_sensitive).tap do |d|
-          self.class.dependency_cache[cache_key] = d if calculator.cache_dependency_order?
+      @ordered_deps ||= begin
+        deps = dependencies
+        cycles = DependencyResolver.find_cycles(deps, calculator.case_sensitive)
+
+        if cycles.any?
+          blocked = blocked_variables(deps, cycles)
+          @cycle_error = CyclicDependencyError.new(cycles, blocked & expressions.keys)
+          affected = cycles.flatten + blocked
+          deps = deps.reject { |k, _| affected.include?(k) }
         end
-      }
+
+        cache_key = "#{!!calculator.case_sensitive}|#{expressions.keys.map(&:to_s).sort.join("|")}|#{affected ? affected.sort.join("|") : ""}"
+        self.class.dependency_cache.fetch(cache_key) {
+          DependencyResolver.find_resolve_order(deps, calculator.case_sensitive).tap do |d|
+            self.class.dependency_cache[cache_key] = d if calculator.cache_dependency_order?
+          end
+        }
+      end
     end
+
+    # all variables that transitively depend on a cycle member, following
+    # the dependency edges backwards from each cycle; names are normalized
+    # the same way the calculator normalizes them so case and aliasing
+    # rules match the rest of the solver
+    def blocked_variables(deps, cycles)
+      normalized_deps = Hash[deps.map { |k, v| [normalized_name(k), v.map { |d| normalized_name(d) }] }]
+      original_names = Hash[deps.keys.map { |k| [normalized_name(k), k] }]
+
+      dependents = Hash.new { |h, k| h[k] = [] }
+      normalized_deps.each do |var, var_deps|
+        var_deps.each { |dep| dependents[dep] << var }
+      end
+
+      seen = {}
+      blocked = []
+      queue = cycles.flatten.map { |name| normalized_name(name) }
+      queue.each { |name| seen[name] = true }
+
+      until queue.empty?
+        dependents[queue.shift].each do |dependent|
+          next if seen[dependent]
+
+          seen[dependent] = true
+          blocked << dependent
+          queue << dependent
+        end
+      end
+
+      blocked.map { |name| original_names.fetch(name, name) }.sort
+    end
+
+    attr_reader :cycle_error
   end
 end
