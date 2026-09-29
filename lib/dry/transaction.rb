@@ -47,6 +47,9 @@ module Dry
   #   exception is raised, which will be caught and returned as a `Failure`.
   # * `tee`   --- ignore the output of the operation and pass through its original
   #   input as a `Success`
+  # * `branch` --- run one of several named sub-step stacks, selected by a pure
+  #   selector operation, and join its result back into the main step flow via
+  #   an explicit per-branch mapping
   #
   # [dry-monads]: https://rubygems.org/gems/dry-monads
   #

@@ -47,6 +47,27 @@ module Dry
         )
       end
 
+      # @api private
+      def with_options(new_options)
+        self.class.new(
+          adapter: adapter,
+          name: name,
+          operation_name: operation_name,
+          operation: adapter.operation,
+          options: adapter.options.merge(new_options),
+          call_args: call_args
+        )
+      end
+
+      # All steps nested within this step's branches (if any), deepest last.
+      #
+      # @api private
+      def sub_steps
+        adapter.options.fetch(:branches, {}).values.flat_map { |branch|
+          branch.steps.flat_map { |sub_step| [sub_step, *sub_step.sub_steps] }
+        }
+      end
+
       def call(input, continue = RETURN)
         args = [input, *call_args]
 

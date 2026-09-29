@@ -25,5 +25,11 @@ module Dry
         super("step +#{step_name}+ requires one or more exception classes provided via +catch:+")
       end
     end
+
+    class UnknownBranchError < ArgumentError
+      def initialize(step_name, branch_name)
+        super("step +`#{step_name}`+ selected unknown branch +`#{branch_name}`+")
+      end
+    end
   end
 end

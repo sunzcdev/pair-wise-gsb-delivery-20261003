@@ -14,10 +14,7 @@ module Dry
       attr_reader :stack
 
       def initialize(steps: self.class.steps, listeners: nil, **operations)
-        @steps = steps.map { |step|
-          operation = resolve_operation(step, **operations)
-          step.with(operation: operation)
-        }
+        @steps = steps.map { |step| resolve_step(step, operations) }
         @operations = operations
         @stack = Stack.new(@steps)
         subscribe(listeners) unless listeners.nil?
@@ -43,10 +40,10 @@ module Dry
 
         if listeners.is_a?(Hash)
           listeners.each do |step_name, listener|
-            steps.detect { |step| step.name == step_name }.subscribe(listener)
+            all_steps.detect { |step| step.name == step_name }.subscribe(listener)
           end
         else
-          steps.each do |step|
+          all_steps.each do |step|
             step.subscribe(listeners)
           end
         end
@@ -68,6 +65,21 @@ module Dry
 
       private
 
+      def all_steps
+        steps.flat_map { |step| [step, *step.sub_steps] }
+      end
+
+      def resolve_step(step, operations)
+        resolved = step.with(operation: resolve_operation(step, **operations))
+
+        branches = resolved.adapter.options[:branches]
+        return resolved unless branches
+
+        resolved.with_options(branches: branches.transform_values { |branch|
+          branch.with_steps(branch.steps.map { |sub_step| resolve_step(sub_step, operations) })
+        })
+      end
+
       def respond_to_missing?(name, _include_private = false)
         steps.any? { |step| step.name == name }
       end
@@ -86,7 +98,9 @@ module Dry
       end
 
       def resolve_operation(step, **operations)
-        if step.internal? && operations[step.name]
+        if step.operation
+          step.operation
+        elsif step.internal? && operations[step.name]
           operations[step.name]
         elsif methods.include?(step.name) || private_methods.include?(step.name)
           method(step.name)

@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "dry/transaction/branch_builder"
+
 module Dry
   module Transaction
     class DSL < Module
@@ -28,16 +30,29 @@ module Dry
       def define_dsl
         module_exec(@step_adapters) do |step_adapters|
           step_adapters.each do |adapter_name, adapter|
-            define_method(adapter_name) do |step_name, with: nil, **options|
-              operation_name = with
+            if adapter_name.to_sym == :branch
+              define_method(adapter_name) do |step_name, with: nil, selector: nil, &block|
+                steps << BranchBuilder.build(
+                  adapter: adapter,
+                  step_adapters: step_adapters,
+                  name: step_name,
+                  operation_name: with,
+                  selector: selector,
+                  &block
+                )
+              end
+            else
+              define_method(adapter_name) do |step_name, with: nil, **options|
+                operation_name = with
 
-              steps << Step.new(
-                adapter: adapter,
-                name: step_name,
-                operation_name: operation_name,
-                operation: nil, # operations are resolved only when transactions are instantiated
-                options: options
-              )
+                steps << Step.new(
+                  adapter: adapter,
+                  name: step_name,
+                  operation_name: operation_name,
+                  operation: nil, # operations are resolved only when transactions are instantiated
+                  options: options
+                )
+              end
             end
           end
         end
