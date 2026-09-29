@@ -290,6 +290,23 @@ encoded_token.verify!(signature: { algorithm: 'RS256', key_finder: key_finder})
 encoded_token.payload # => { 'pay' => 'load' }
 ```
 
+A `JWT::JWK::KeyFinder` instance can safely be shared between threads. When
+multiple threads miss the same unknown `kid` at the same time, only one of
+them calls the JWKS loader with `invalidate: true` while the others wait for
+the shared result. Unknown kids are negatively cached for a bounded time to
+avoid hammering the loader. A failed refresh keeps the previously loaded keys,
+and a refresh issued earlier never overwrites a newer successful result. Any
+network access stays in the application provided loader — the gem never
+performs HTTP requests on its own.
+
+```ruby
+key_finder = JWT::JWK::KeyFinder.new(
+  jwks: ->(options) { MyJwksFetcher.fetch(options) }, # application provided loader
+  unknown_kid_cache_ttl: 60,  # seconds an unknown kid is remembered (0 disables the cache)
+  unknown_kid_cache_size: 128 # maximum number of remembered unknown kids
+)
+```
+
 Using a custom keyfinder proc.
 
 ```ruby

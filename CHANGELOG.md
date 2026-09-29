@@ -6,7 +6,7 @@
 
 **Features:**
 
-- Your contribution here
+- Add instance-level refresh coordination and a bounded, TTL-based negative cache for unknown kids to `JWT::JWK::KeyFinder`
 
 **Fixes and enhancements:**
 
