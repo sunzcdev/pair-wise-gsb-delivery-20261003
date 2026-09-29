@@ -1,5 +1,7 @@
 === master
 
+* Add typecast_params.strict for reporting paths of submitted parameters not consumed in the block, and typecast_params.ignore for explicitly ignoring parameter paths (jeremyevans)
+
 * Persist keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
 
 * Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)

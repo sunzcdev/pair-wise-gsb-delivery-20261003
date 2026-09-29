@@ -225,6 +225,51 @@ class Roda
     # data (string keys), to semitrusted data that can be used internally (trusted in the sense that
     # the expected types are used, not that you trust the values).
     #
+    # If you want to make sure that your application handles all submitted parameters,
+    # so that you can detect cases where clients submit unexpected parameters (such as
+    # misspelled parameter names after an API change), you can use +strict+.  +strict+
+    # yields the params to the block, and returns an array of paths for all parameters
+    # that were not consumed inside the block:
+    #
+    #   unhandled_params = typecast_params.strict do |tp|
+    #     tp.pos_int!('page')
+    #     tp['artist'].str!('name')
+    #   end
+    #
+    #   # With params: {'page'=>'1', 'artist'=>{'name'=>'A', 'nmae'=>'B'}, 'debug'=>'1'}
+    #   # unhandled_params => ['artist[nmae]', 'debug']
+    #
+    # Consumption is tracked for nested hashes and arrays, including hashes inside
+    # arrays, and reading the same parameter multiple times is supported.  Parameters
+    # are considered consumed even if their conversion fails, and conversion errors
+    # raised inside the block are reraised by +strict+ without modification.
+    #
+    # If there are parameters that you expect to be submitted but do not need to
+    # handle, you can explicitly ignore them by path using +ignore+, so they are not
+    # included in the value returned by +strict+:
+    #
+    #   unhandled_params = typecast_params.strict do |tp|
+    #     tp.pos_int!('page')
+    #     tp.ignore('debug')
+    #     tp.ignore('artist', 'nmae')
+    #   end
+    #
+    # +ignore+ does not raise an error if the ignored path is not present in the
+    # parameters.
+    #
+    # +strict+ can be called recursively, with each block returning the unconsumed
+    # parameters for its own subtree:
+    #
+    #   unhandled_params = typecast_params.strict do |tp|
+    #     tp.pos_int!('page')
+    #     unhandled_artist_params = tp['artist'].strict do |stp|
+    #       stp.str!('name')
+    #     end
+    #   end
+    #
+    # Note that +strict+ does not modify +request.params+, it only reports which
+    # submitted parameters were not consumed.
+    #
     # Note that if there are multiple conversion errors raised inside a +convert!+ or +convert_each!+ 
     # block, they are recorded and a single TypecastParams::Error instance is raised after
     # processing the block.  TypecastParams::Error#param_names can be called on the exception to
@@ -655,6 +700,12 @@ class Roda
 
           @subs[key] = sub
           sub.sub_capture(@capture, @symbolize, @skip_missing)
+          sub.sub_strict_paths(strict_paths)
+
+          path = keys(key)
+          sp = @strict_paths
+          sp[path] = :touched unless sp[path] == :consumed
+
           sub
         end
 
@@ -736,6 +787,70 @@ class Roda
               end
             end
           end
+        end
+
+        # Yield the receiver to the given block, and return an array of paths
+        # for submitted parameters that were not consumed.  This is useful for
+        # detecting parameters submitted by the client that the application
+        # does not handle, such as misspelled parameter names:
+        #
+        #   unhandled_params = typecast_params.strict do |tp|
+        #     tp.pos_int!('page')
+        #     tp['artist'].str!('name')
+        #   end
+        #
+        #   # With params: {'page'=>'1', 'artist'=>{'name'=>'A', 'nmae'=>'B'}, 'debug'=>'1'}
+        #   # unhandled_params => ['artist[nmae]', 'debug']
+        #
+        # Consumption is tracked for nested hashes and arrays (including
+        # hashes inside arrays), and reading the same parameter multiple
+        # times is supported.  Parameters are considered consumed even if
+        # their conversion fails, and conversion errors raised inside the
+        # block are reraised without modification.  Use +ignore+ to exclude
+        # known parameters from the returned value.  +strict+ can be called
+        # recursively, with each block returning unconsumed parameters for
+        # its own subtree.  +strict+ does not modify the parameters, it only
+        # reports which parameters were not consumed.
+        def strict
+          yield self
+          unconsumed_params(strict_paths, @obj, Array(@nesting), [])
+        end
+
+        # Ignore the parameter at the given path when checking for unconsumed
+        # parameters using +strict+.  Each argument is one element of the
+        # parameter path (a string for hash parameters, an integer for array
+        # entries), or a single array containing the path elements can be
+        # given:
+        #
+        #   typecast_params.strict do |tp|
+        #     tp.pos_int!('page')
+        #     tp.ignore('debug')
+        #     tp.ignore('artist', 'nmae')
+        #   end
+        #
+        # +ignore+ does not raise an error if the ignored path is not present
+        # in the parameters, and it does not read the parameter values.
+        def ignore(*path)
+          path = path.first if path.length == 1 && path[0].is_a?(Array)
+          if path.empty?
+            raise ProgrammerError, "ignore requires at least one parameter path element"
+          end
+
+          sp = strict_paths
+          full = Array(@nesting)
+          last = path.length - 1
+          path.each_with_index do |k, i|
+            unless k.is_a?(String) || k.is_a?(Integer)
+              raise ProgrammerError, "invalid argument used to ignore parameter: #{k.inspect}"
+            end
+            full = full + [k]
+            if i == last
+              sp[full] = :consumed
+            else
+              sp[full] = :touched unless sp[full] == :consumed
+            end
+          end
+          nil
         end
 
         # Convert values nested under the current obj.  Traverses the current object using +nest+, then converts
@@ -850,6 +965,19 @@ class Roda
             @skip_missing = skip_missing
             @params = @obj.class.new
           end
+        end
+
+        # Set the strict parameter consumption tracker for the receiver and
+        # all existing subordinate params objects.  Called automatically when
+        # a subordinate params object is created.
+        def sub_strict_paths(paths)
+          @strict_paths = paths
+          if @subs
+            @subs.each_value do |sub|
+              sub.sub_strict_paths(paths)
+            end
+          end
+          paths
         end
         
         private
@@ -967,6 +1095,59 @@ class Roda
           Array(@nesting) + Array(key)
         end
 
+        # The hash tracking consumed and touched parameter paths, used by
+        # +strict+ to determine unconsumed parameters.  Created lazily, and
+        # shared by the receiver and all subordinate params objects, so that
+        # consumption is tracked across the entire params tree.
+        def strict_paths
+          @strict_paths || sub_strict_paths({})
+        end
+
+        # Recursively collect the paths of all parameters in +obj+ that have
+        # not been consumed or ignored, appending them to +paths+.
+        def unconsumed_params(sp, obj, prefix, paths)
+          case obj
+          when Hash
+            obj.each do |k, v|
+              unconsumed_param(sp, k, v, prefix, paths)
+            end
+          when Array
+            obj.each_with_index do |v, i|
+              unconsumed_param(sp, i, v, prefix, paths)
+            end
+          end
+          paths
+        end
+
+        # Check whether the parameter at +key+ with value +v+ was consumed,
+        # and if not, append its path (or the unconsumed paths inside it,
+        # for partially consumed hashes and arrays) to +paths+.
+        def unconsumed_param(sp, key, v, prefix, paths)
+          path = prefix + [key]
+          case sp[path]
+          when :consumed
+            # parameter was consumed or explicitly ignored
+          when :touched
+            if v.is_a?(Hash) || v.is_a?(Array)
+              unconsumed_params(sp, v, path, paths)
+            else
+              paths << strict_param_name(path)
+            end
+          else
+            paths << strict_param_name(path)
+          end
+        end
+
+        # Format the parameter path for unconsumed parameter reporting.
+        def strict_param_name(path)
+          first, *rest = path
+          v = first.to_s.dup
+          rest.each do |param|
+            v << "[#{param}]"
+          end
+          v
+        end
+
         # Handle any conversion errors.  By default, reraises Error instances with the keys set,
         # converts ::ArgumentError instances to Error instances, and reraises other exceptions.
         def handle_error(key, reason, e, do_raise=false)
@@ -1004,6 +1185,10 @@ class Roda
         def process_arg(meth, key, default, type)
           case key
           when String
+            # Mark the parameter as consumed before conversion, so that
+            # parameters are considered consumed even if conversion fails.
+            strict_paths[keys(key)] = :consumed
+
             v = process(meth, key, default, type)
 
             if @capture

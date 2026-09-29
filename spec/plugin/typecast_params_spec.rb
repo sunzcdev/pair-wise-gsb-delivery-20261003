@@ -1440,6 +1440,113 @@ describe "typecast_params plugin" do
   it "should raise error invalid params format" do
     proc{Roda::RodaPlugins::TypecastParams::Params.new([]).int('a')}.must_raise @tp_error
   end
+
+  it "#strict should return unconsumed parameter paths" do
+    tp('a=1&b=2&c[d]=3&c[e]=4').strict do |t|
+      t.pos_int!('a')
+      t['c'].pos_int!('d')
+    end.must_equal ['b', 'c[e]']
+  end
+
+  it "#strict should handle mixed successful, failed, and unknown parameters" do
+    tp('a=1&b=bad&c=2').strict do |t|
+      t.pos_int!('a').must_equal 1
+      t.pos_int('b').must_be_nil
+    end.must_equal ['c']
+  end
+
+  it "#strict should reraise conversion errors raised inside the block without modification" do
+    e = error{tp('a=bad&b=1').strict{|t| t.pos_int!('a')}}
+    e.keys.must_equal ['a']
+    e.reason.must_equal :invalid_value
+  end
+
+  it "#strict should handle the same field being read multiple times" do
+    tp('a=1&b=2').strict do |t|
+      t.pos_int!('a')
+      t.str!('a')
+      t.pos_int!('a')
+    end.must_equal ['b']
+  end
+
+  it "#strict should consider parameters consumed before the block" do
+    t = tp('a=1&b=2')
+    t.pos_int!('a')
+    t.strict{|s| s.pos_int!('b')}.must_equal []
+  end
+
+  it "#strict should handle hashes inside arrays" do
+    tp({'a'=>[{'b'=>'1', 'c'=>'2'}, {'b'=>'3', 'd'=>'4'}]}).strict do |t|
+      t['a'][0].pos_int!('b')
+      t['a'][1].pos_int!('b')
+    end.must_equal ['a[0][c]', 'a[1][d]']
+  end
+
+  it "#strict should report untouched array entries as a whole" do
+    tp('a[][b]=1&a[][b]=2&c=3').strict do |t|
+      t['a'][0].pos_int!('b')
+    end.must_equal ['a[1]', 'c']
+  end
+
+  it "#strict should handle dig and convert!" do
+    tp('a[b]=1&a[c]=2&d[e]=3&d[f]=4').strict do |t|
+      t.dig!(:pos_int, 'a', 'b').must_equal 1
+      t.convert!('d') do |t2|
+        t2.pos_int!('e')
+      end
+    end.must_equal ['a[c]', 'd[f]']
+  end
+
+  it "#strict should handle convert_each! for arrays of hashes" do
+    tp({'a'=>[{'b'=>'1', 'c'=>'2'}, {'b'=>'3', 'c'=>'4'}], 'd'=>'5'}).strict do |t|
+      t['a'].convert_each! do |t2|
+        t2.pos_int!('b')
+      end
+    end.must_equal ['a[0][c]', 'a[1][c]', 'd']
+  end
+
+  it "#strict should support nested strict blocks with separate scopes" do
+    inner = nil
+    tp('a=1&b[c]=2&b[d]=3&e=4').strict do |t|
+      t.pos_int!('a')
+      inner = t['b'].strict do |t2|
+        t2.pos_int!('c')
+      end
+    end.must_equal ['b[d]', 'e']
+    inner.must_equal ['b[d]']
+  end
+
+  it "#strict should allow ignoring parameters by path" do
+    tp('a=1&b=2&c[d]=3&c[e]=4&f=5').strict do |t|
+      t.pos_int!('a')
+      t.ignore('b')
+      t.ignore('c', 'd')
+      t.ignore(['f'])
+      t.ignore('missing', 'path')
+    end.must_equal ['c[e]']
+  end
+
+  it "#ignore should raise ProgrammerError for invalid arguments" do
+    proc{tp('a=1').ignore(:a)}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+    proc{tp('a=1').ignore}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "#strict should not modify request.params" do
+    params = {
+      'a'=>'1',
+      'b'=>{'c'=>'2', 'd'=>'3'},
+      'e'=>[{'f'=>'4'}, {'g'=>'5'}],
+      'h'=>'6'
+    }
+    orig = Marshal.load(Marshal.dump(params))
+    tp(params).strict do |t|
+      t.pos_int!('a')
+      t['b'].pos_int!('c')
+      t['e'][0].pos_int!('f')
+      t.ignore('h')
+    end.must_equal ['b[d]', 'e[1]']
+    params.must_equal orig
+  end
 end
 
 describe "typecast_params plugin" do 
