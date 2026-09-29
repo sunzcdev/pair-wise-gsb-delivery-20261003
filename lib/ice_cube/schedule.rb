@@ -307,6 +307,54 @@ module IceCube
       n.nil? ? occurrences.last : occurrences[-n..]
     end
 
+    # The default maximum number of occurrences that ordinal lookups will
+    # walk when the schedule's rules can't be computed arithmetically.
+    DEFAULT_OCCURRENCE_BUDGET = 10_000
+
+    # Locate the nth occurrence (1-based) of the schedule in the final,
+    # deduplicated sequence of occurrences - the same ordering produced by
+    # enumerating from the start time. Returns an Occurrence, or nil when
+    # the schedule has fewer than n occurrences.
+    #
+    # Schedules reducing to a single pure-interval rule (with optional
+    # COUNT/UNTIL) are computed arithmetically in constant time. Any other
+    # combination (multiple or overlapping rules, exception rules or
+    # times, BYxxx selections) falls back to walking the sequence, which
+    # is limited to +budget+ occurrences and raises BudgetExceeded when
+    # that isn't enough. Pass a larger :budget, or budget: nil to allow
+    # an unbounded walk.
+    def occurrence_at(n, budget: DEFAULT_OCCURRENCE_BUDGET)
+      unless n.is_a?(Integer) && n >= 1
+        raise ArgumentError, "Expecting a positive Integer ordinal, got #{n.inspect}"
+      end
+      case (step = fast_path_step)
+      when :single_occurrence
+        (n == 1) ? Occurrence.new(start_time, start_time + duration) : nil
+      when nil
+        occurrence_at_by_enumeration(n, budget)
+      else
+        unit, amount, dst_adjust, rule = step
+        fast_path_occurrence_at(n, unit, amount, dst_adjust, rule)
+      end
+    end
+
+    # Count how many occurrences of the final, deduplicated sequence fall
+    # strictly before the given time. Uses the same arithmetic fast path
+    # and budgeted enumeration fallback as #occurrence_at.
+    def occurrences_before(time, budget: DEFAULT_OCCURRENCE_BUDGET)
+      time = TimeUtil.match_zone(time, start_time) or
+        raise ArgumentError, "Time required, got #{time.inspect}"
+      case (step = fast_path_step)
+      when :single_occurrence
+        (time > start_time) ? 1 : 0
+      when nil
+        occurrences_before_by_enumeration(time, budget)
+      else
+        unit, amount, dst_adjust, rule = step
+        fast_path_occurrences_before(time, unit, amount, dst_adjust, rule)
+      end
+    end
+
     # String serialization
     def to_s
       pieces = []
@@ -506,6 +554,128 @@ module IceCube
       else
         @all_recurrence_rules
       end
+    end
+
+    # Returns the arithmetic shape of the schedule when its occurrences
+    # can be computed directly: :single_occurrence for a schedule with no
+    # recurrence rules, or [unit, step, dst_adjust, rule] for a lone
+    # pure-interval rule. Returns nil when the combination of rules,
+    # recurrence times or exceptions requires enumeration.
+    def fast_path_step
+      return nil unless @all_exception_rules.empty?
+      return :single_occurrence if @all_recurrence_rules.empty?
+      return nil unless @all_recurrence_rules.size == 1
+      rule = @all_recurrence_rules.first
+      return nil unless rule.is_a?(ValidatedRule)
+      step = rule.fast_path_step
+      step && [*step, rule]
+    end
+
+    # The time of the kth (0-based) occurrence of a pure-interval rule,
+    # computed directly from the start time.
+    def fast_path_time_at(k, unit, step, dst_adjust)
+      wrapper = TimeUtil::TimeWrapper.new(start_time, dst_adjust)
+      wrapper.add(unit, step * k)
+      wrapper.to_time
+    end
+
+    def fast_path_occurrence_at(n, unit, step, dst_adjust, rule)
+      count = rule.occurrence_count
+      return nil if count && n > count
+      time = fast_path_time_at(n - 1, unit, step, dst_adjust)
+      until_time = rule.until_time
+      if until_time && time > TimeUtil.ensure_time(until_time, start_time, true)
+        return nil
+      end
+      Occurrence.new(time, time + duration)
+    end
+
+    def fast_path_occurrences_before(time, unit, step, dst_adjust, rule)
+      return 0 if time <= start_time
+      count = fast_path_count_before(time, unit, step, dst_adjust)
+      if (max = rule.occurrence_count) && count > max
+        count = max
+      end
+      if (until_time = rule.until_time)
+        until_time = TimeUtil.ensure_time(until_time, start_time, true)
+        total = fast_path_count_before(until_time, unit, step, dst_adjust)
+        total += 1 if fast_path_time_at(total, unit, step, dst_adjust) <= until_time
+        count = total if count > total
+      end
+      count
+    end
+
+    # The number of pure-interval occurrences strictly before +time+,
+    # ignoring COUNT/UNTIL limits. An approximate index is derived
+    # arithmetically and then corrected exactly; the estimate is only ever
+    # off by a step or two (clock-of-day, month lengths, DST), so this
+    # stays constant time regardless of how far +time+ is in the future.
+    def fast_path_count_before(time, unit, step, dst_adjust)
+      k = fast_path_index_estimate(time, unit, step)
+      k = 0 if k < 0
+      k += 1 while fast_path_time_at(k, unit, step, dst_adjust) < time
+      k -= 1 while k > 0 && fast_path_time_at(k - 1, unit, step, dst_adjust) >= time
+      k
+    end
+
+    def fast_path_index_estimate(time, unit, step)
+      case unit
+      when :sec
+        ((time - start_time) / step).ceil
+      when :min
+        ((time - start_time) / (step * ONE_MINUTE)).ceil
+      when :hour
+        ((time - start_time) / (step * ONE_HOUR)).ceil
+      when :day
+        ((time.to_date - start_time.to_date) / step.to_f).ceil
+      when :month
+        months = (time.year - start_time.year) * 12 + time.month - start_time.month
+        (months / step.to_f).ceil
+      when :year
+        ((time.year - start_time.year) / step.to_f).ceil
+      end
+    end
+
+    def occurrence_at_by_enumeration(n, budget)
+      validate_ordinal_budget!(budget)
+      result = nil
+      walked = 0
+      enumerate_occurrences(start_time).each do |occurrence|
+        walked += 1
+        check_ordinal_budget!(walked, budget, "occurrence_at(#{n})")
+        if walked == n
+          result = occurrence
+          break
+        end
+      end
+      result
+    end
+
+    def occurrences_before_by_enumeration(time, budget)
+      validate_ordinal_budget!(budget)
+      count = 0
+      walked = 0
+      enumerate_occurrences(start_time, time).each do |occurrence|
+        walked += 1
+        check_ordinal_budget!(walked, budget, "occurrences_before(#{time})")
+        break unless occurrence < time
+        count += 1
+      end
+      count
+    end
+
+    def validate_ordinal_budget!(budget)
+      return if budget.nil? || (budget.is_a?(Integer) && budget >= 1)
+      raise ArgumentError, "Expecting a positive Integer or nil budget, got #{budget.inspect}"
+    end
+
+    def check_ordinal_budget!(walked, budget, description)
+      return unless budget && walked > budget
+      raise BudgetExceeded,
+        "#{description} cannot be computed arithmetically for this " \
+        "combination of rules and walking more than #{budget} occurrences " \
+        "exceeds the budget; pass a larger :budget or budget: nil to allow " \
+        "the enumeration fallback"
     end
   end
 end

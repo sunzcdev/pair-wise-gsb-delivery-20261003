@@ -23,6 +23,12 @@ module IceCube
         :day
       end
 
+      # The arithmetic step between occurrences when this interval is the
+      # rule's only constraint, used by the ordinal fast path.
+      def fast_path_step
+        [:day, interval]
+      end
+
       def dst_adjust?
         true
       end

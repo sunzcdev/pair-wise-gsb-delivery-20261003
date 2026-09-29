@@ -90,6 +90,11 @@ schedule.remaining_occurrences          # for terminating schedules
 schedule.previous_occurrence(from_time)
 schedule.previous_occurrences(4, from_time)
 
+# or locate an occurrence by its ordinal in the final, deduplicated
+# sequence (1-based), or count how many occurrences happen before a time
+schedule.occurrence_at(100_000)        # 100,000th occurrence
+schedule.occurrences_before(from_time) # => 99_999
+
 # or include prior occurrences with a duration overlapping from_time
 schedule.next_occurrences(4, from_time, spans: true)
 schedule.occurrences_between(from_time, to_time, spans: true)
@@ -117,6 +122,29 @@ maintain compatibility with the ical
 RFC: http://www.kanzaki.com/docs/ical/rrule.html
 
 To limit schedules use `count` or `until` on the recurrence rules. Setting `end_time` on the schedule just sets the duration (from the start time) for each occurrence.
+
+---
+
+## Ordinal lookups
+
+`occurrence_at(n)` and `occurrences_before(time)` work on the final,
+deduplicated sequence of occurrences, so COUNT, UNTIL, overlapping rules
+and exception times are all reflected in the ordinals.
+
+Schedules that reduce to a single pure-interval rule (with optional
+`count`/`until`) are computed arithmetically in constant time - asking for
+the 100,000th occurrence doesn't walk the 99,999 before it. Any other
+combination (multiple rules, exception rules or times, BYxxx selections)
+falls back to enumerating the sequence, limited to a budget of 10,000
+occurrences by default. When the budget isn't enough the lookup raises
+`IceCube::BudgetExceeded` instead of silently grinding away; pass a larger
+`:budget`, or `budget: nil` for an unbounded walk.
+
+```ruby
+schedule.occurrence_at(100_000)                 # fast path, constant time
+schedule.occurrence_at(100_000, budget: nil)    # allow walking any distance
+schedule.occurrences_before(time, budget: 100)  # walk at most 100 occurrences
+```
 
 ---
 

@@ -20,6 +20,12 @@ module IceCube
         :min
       end
 
+      # The arithmetic step between occurrences when this interval is the
+      # rule's only constraint, used by the ordinal fast path.
+      def fast_path_step
+        [:min, interval]
+      end
+
       def dst_adjust?
         false
       end

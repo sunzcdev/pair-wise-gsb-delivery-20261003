@@ -26,6 +26,13 @@ module IceCube
 
     attr_reader :validations
 
+    # Validation keys that keep a rule directly computable: its base
+    # interval, the implicit schedule locks and COUNT/UNTIL limits.
+    FAST_PATH_VALIDATION_KEYS = [
+      :interval, :count, :until,
+      :base_sec, :base_min, :base_hour, :base_day, :base_wday, :base_month
+    ].freeze
+
     def initialize(interval = 1)
       @validations = {}
     end
@@ -71,6 +78,20 @@ module IceCube
 
     def full_required?
       !occurrence_count.nil?
+    end
+
+    # When the rule is a pure interval recurrence, occurrences land exactly
+    # on start_time + k * step, so Schedule ordinal lookups can compute them
+    # arithmetically instead of walking the sequence. Returns
+    # [unit, step, dst_adjust] or nil when other validations require
+    # enumeration.
+    def fast_path_step
+      interval_validations = @validations[:interval]
+      return nil unless interval_validations && interval_validations.size == 1
+      return nil unless (@validations.keys - FAST_PATH_VALIDATION_KEYS).empty?
+      validation = interval_validations.first
+      unit, step = validation.fast_path_step
+      [unit, step, validation.dst_adjust?]
     end
 
     def to_s
