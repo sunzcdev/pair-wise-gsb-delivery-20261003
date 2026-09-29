@@ -290,6 +290,20 @@ encoded_token.verify!(signature: { algorithm: 'RS256', key_finder: key_finder})
 encoded_token.payload # => { 'pay' => 'load' }
 ```
 
+When the JWKS mixes signing and encryption keys, or the same `kid` is used by
+multiple keys, an explicit verification purpose policy can be given. The
+policy jointly checks the `kty`, `alg`, `use` and `key_ops` members of each
+key. Missing `alg`, `use` or `key_ops` members are treated as unrestricted
+(they are optional in RFC 7517), while contradictory declarations (for
+example `use: "sig"` combined with `key_ops: ["encrypt"]`) always reject the
+key. If more than one key still matches after filtering, an ambiguity error
+is raised instead of silently relying on the order of the set.
+
+```ruby
+policy = JWT::JWK::VerificationPolicy.new(kty: 'RSA', algorithm: 'RS256')
+key_finder = JWT::JWK::KeyFinder.new(jwks: JWT::JWK::Set.new(jwk), policy: policy)
+```
+
 Using a custom keyfinder proc.
 
 ```ruby

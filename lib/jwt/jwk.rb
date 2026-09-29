@@ -2,6 +2,7 @@
 
 require_relative 'jwk/key_finder'
 require_relative 'jwk/set'
+require_relative 'jwk/verification_policy'
 
 module JWT
   # JSON Web Key (JWK)

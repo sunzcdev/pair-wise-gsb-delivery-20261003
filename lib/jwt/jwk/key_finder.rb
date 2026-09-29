@@ -12,8 +12,15 @@ module JWT
       # @option options [Array] :key_fields the fields to use for key matching,
       #                         the order of the fields are used to determine
       #                         the priority of the keys.
+      # @option options [JWT::JWK::VerificationPolicy] :policy an explicit
+      #                         verification purpose policy used to filter
+      #                         candidate keys by kty, alg, use and key_ops.
+      #                         When given, multiple remaining candidates for
+      #                         the same kid raise an ambiguity error instead
+      #                         of silently picking the first one.
       def initialize(options)
         @allow_nil_kid = options[:allow_nil_kid]
+        @policy = options[:policy]
         jwks_or_loader = options[:jwks]
 
         @jwks_loader = if jwks_or_loader.respond_to?(:call)
@@ -60,13 +67,25 @@ module JWT
 
         # First try without invalidation to facilitate application caching
         @jwks ||= JWT::JWK::Set.new(@jwks_loader.call(key_field => kid))
-        jwk = @jwks.find { |key| key_matcher.call(key) }
+        jwk = find_key(key_matcher, kid)
 
         return jwk if jwk
 
         # Second try, invalidate for backwards compatibility
         @jwks = JWT::JWK::Set.new(@jwks_loader.call(invalidate: true, kid_not_found: true, key_field => kid))
-        @jwks.find { |key| key_matcher.call(key) }
+        find_key(key_matcher, kid)
+      end
+
+      def find_key(key_matcher, kid)
+        matches = @jwks.select { |key| key_matcher.call(key) }
+        return matches.first unless @policy
+
+        candidates = @policy.candidates(matches)
+        if candidates.size > 1
+          raise ::JWT::SignatureError, "Multiple keys matching kid #{kid} and the verification policy found in jwks"
+        end
+
+        candidates.first
       end
     end
   end

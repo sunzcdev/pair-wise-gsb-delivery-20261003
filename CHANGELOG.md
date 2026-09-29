@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add `JWT::JWK::VerificationPolicy`, an explicit verification purpose policy for `JWT::JWK::KeyFinder` that jointly checks `kty`, `alg`, `use` and `key_ops` and raises on ambiguous `kid` matches - Your contribution here
 - Your contribution here
 
 **Fixes and enhancements:**
