@@ -23,6 +23,7 @@ module IceCube
 
   autoload :CountExceeded, "ice_cube/errors/count_exceeded"
   autoload :UntilExceeded, "ice_cube/errors/until_exceeded"
+  autoload :UnknownIcalFieldsError, "ice_cube/errors/unknown_ical_fields_error"
 
   autoload :ValidatedRule, "ice_cube/validated_rule"
   autoload :SingleOccurrenceRule, "ice_cube/single_occurrence_rule"

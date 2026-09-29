@@ -154,6 +154,43 @@ ical = schedule.to_ical
 IceCube::Schedule.from_ical(ical)
 ```
 
+### ICAL extension fields
+
+External systems sometimes attach non-standard fields to an `RRULE`. IceCube
+never discards these silently: by default `Rule.from_ical` and
+`Schedule.from_ical` raise `IceCube::UnknownIcalFieldsError` when a field is
+not understood. Callers must explicitly choose how to handle them:
+
+``` ruby
+IceCube::Rule.from_ical("FREQ=DAILY;X-FOO=bar")                        # raises UnknownIcalFieldsError
+IceCube::Rule.from_ical("FREQ=DAILY;X-FOO=bar", extensions: :ignore)   # discards X-FOO
+rule = IceCube::Rule.from_ical("FREQ=DAILY;X-FOO=bar", extensions: :preserve)
+rule.to_ical # 'FREQ=DAILY;X-FOO=bar' - preserved fields are re-emitted
+```
+
+Field names are case-insensitive and stored uppercase, values are kept as
+their raw strings, and repeating any field raises `ArgumentError`. Preserved
+fields also survive `to_hash`/`from_hash` and `to_yaml`/`from_yaml` round
+trips, but are never treated as executable rule logic.
+
+To inspect a rule without deciding yet, use the parse result directly:
+
+``` ruby
+parsed = IceCube::IcalParser.parse_rule("FREQ=DAILY;X-FOO=bar")
+parsed.rule       # the executable IceCube::Rule
+parsed.extensions # { "X-FOO" => "bar" }
+```
+
+If an extension later becomes meaningful to your application, register a
+handler and it will be applied to the parsed rule instead of being reported
+as unknown:
+
+``` ruby
+IceCube::IcalParser.register_extension("X-COUNT-CAP") do |rule, value|
+  rule.count(value.to_i)
+end
+```
+
 ---
 
 ## Using your words

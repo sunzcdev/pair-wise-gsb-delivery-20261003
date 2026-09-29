@@ -9,6 +9,14 @@ module IceCube
 
     attr_reader :uses
 
+    # Extension fields preserved from iCal parsing (see IcalParser).
+    # A hash of uppercase field name to raw string value.
+    attr_writer :ical_extensions
+
+    def ical_extensions
+      @ical_extensions ||= {}
+    end
+
     def reset
     end
 
@@ -31,8 +39,10 @@ module IceCube
     end
 
     # Convert from ical string and create a rule
-    def self.from_ical(ical)
-      IceCube::IcalParser.rule_from_ical(ical)
+    # Unknown extension fields are rejected unless the caller explicitly
+    # passes extensions: :ignore or extensions: :preserve
+    def self.from_ical(ical, extensions: :reject)
+      IceCube::IcalParser.rule_from_ical(ical, extensions: extensions)
     end
 
     # Yaml implementation
@@ -85,6 +95,8 @@ module IceCube
         hash[:validations]&.each do |name, args|
           apply_validation(rule, name, args)
         end
+
+        rule.ical_extensions = hash[:ical_extensions].dup if hash[:ical_extensions]
 
         rule
       end

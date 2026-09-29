@@ -90,7 +90,9 @@ module IceCube
           validation.build_hash(builder)
         end
       end
-      builder.to_hash
+      hash = builder.to_hash
+      hash[:ical_extensions] = ical_extensions.dup unless ical_extensions.empty?
+      hash
     end
 
     def to_ical
@@ -100,7 +102,11 @@ module IceCube
           validation.build_ical(builder)
         end
       end
-      builder.to_s
+      ical = builder.to_s
+      ical_extensions.each do |name, value|
+        ical += ";#{name}=#{value}"
+      end
+      ical
     end
 
     # Get the collection that contains validations of a certain type
