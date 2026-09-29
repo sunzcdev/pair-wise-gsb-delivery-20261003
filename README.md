@@ -492,6 +492,54 @@ vehicle.state_name              # => :parked
 # vehicle.state = :parked
 ```
 
+## State Snapshots
+
+For persisting state across process restarts, objects can export and restore
+their state machines as plain, JSON-compatible data.  No arbitrary Ruby
+objects are ever loaded -- snapshots only contain strings, numbers, booleans,
+nil, arrays, and hashes with string keys.
+
+```ruby
+vehicle = Vehicle.new
+snapshot = vehicle.state_machines_snapshot
+# => [{"machine" => "state", "version" => 1, "value" => "parked"}]
+
+# Later (e.g. after a restart), restore from JSON:
+vehicle.restore_state_machines_snapshot(JSON.parse(File.read("snapshot.json")))
+```
+
+Restoration validates *every* machine entry before writing anything: if any
+entry is malformed, references an unknown machine/state, or cannot be
+migrated, a `StateMachines::SnapshotError` is raised and the object is left
+completely unchanged.  Restoration writes state attributes directly -- no
+events are fired and no transition callbacks or actions are run.
+
+### Definition versions and migrations
+
+State names may change between releases.  Give a machine an explicit
+definition `version` and register migrations between adjacent versions so
+older snapshots can still be restored:
+
+```ruby
+class Vehicle
+  state_machine :state, initial: :parked, version: 2 do
+    # Snapshots written by version 1 used "waiting" for what is now "parked"
+    migrate_version 1 do |value|
+      value == "waiting" ? "parked" : value
+    end
+
+    event :ignite do
+      transition parked: :idling
+    end
+  end
+end
+```
+
+When a snapshot with an older version is restored, each registered migration
+is applied in turn until the current version is reached.  Snapshots from a
+*newer* definition than the running code, or ones missing a migration step,
+are rejected with `StateMachines::SnapshotError`.
+
 ## Testing
 
 State Machines provides an optional `TestHelper` module with assertion methods to make testing state machines easier and more expressive.

@@ -141,6 +141,36 @@ module StateMachines
       fire_events(*(events + [run_action])) || raise(StateMachines::InvalidParallelTransition.new(self, events))
     end
 
+    # Builds a JSON-compatible snapshot of the current state of every state
+    # machine on this object.  The result only contains plain data (strings,
+    # integers, etc.) and can safely be serialized with JSON.generate.
+    #
+    # == Example
+    #
+    #   vehicle.state_machines_snapshot
+    #   # => [{"machine" => "state", "version" => 1, "value" => "parked"},
+    #   #     {"machine" => "alarm_state", "version" => 1, "value" => "active"}]
+    def state_machines_snapshot
+      self.class.state_machines.snapshot(self)
+    end
+
+    # Restores the state of every state machine on this object from a
+    # snapshot previously built via #state_machines_snapshot.  Only
+    # JSON-compatible data is accepted; arbitrary Ruby objects are never
+    # instantiated from the snapshot.
+    #
+    # All machines are validated before anything is written: if any entry is
+    # invalid, a StateMachines::SnapshotError is raised and this object is
+    # left completely unchanged.  Restoration writes state attributes
+    # directly -- no events are fired and no callbacks or actions are run.
+    #
+    # == Example
+    #
+    #   vehicle.restore_state_machines_snapshot(JSON.parse(File.read('snapshot.json')))
+    def restore_state_machines_snapshot(snapshots)
+      self.class.state_machines.restore_snapshot(self, snapshots)
+    end
+
     protected
 
     def initialize_state_machines(options = {}, &) # :nodoc:

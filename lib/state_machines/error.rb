@@ -112,4 +112,8 @@ module StateMachines
   # A method was called in an invalid state context
   class InvalidContext < Error
   end
+
+  # A state machine snapshot failed validation or could not be restored
+  class SnapshotError < Error
+  end
 end

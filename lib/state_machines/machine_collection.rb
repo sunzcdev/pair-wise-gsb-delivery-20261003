@@ -89,6 +89,56 @@ module StateMachines
       AttributeTransitionCollection.new(transitions.compact, { use_transactions: resolve_use_transactions }.merge(options))
     end
 
+    # Builds a JSON-compatible snapshot of the current state of every machine
+    # for the given object.  The result is an array of entries, each
+    # containing the machine identifier, its definition version, and its
+    # current state value.  It can be serialized with JSON.generate and
+    # restored later via #restore_snapshot.
+    #
+    # Raises StateMachines::SnapshotError if any machine's current state value
+    # cannot be represented as JSON-compatible data.
+    def snapshot(object)
+      map { |_name, machine| machine.snapshot(object) }
+    end
+
+    # Restores the state of every machine on the given object from a snapshot
+    # previously built via #snapshot (typically after a JSON round-trip).
+    #
+    # All entries are fully validated -- including version migrations and
+    # known-state checks -- *before* anything is written to the object.  If
+    # any entry is invalid, a StateMachines::SnapshotError is raised and the
+    # object is left completely unchanged.
+    #
+    # States are restored by writing each machine's attribute directly: no
+    # events are fired and no transition callbacks or actions are run.
+    def restore_snapshot(object, snapshots)
+      unless snapshots.is_a?(Array)
+        raise SnapshotError.new(object, "Snapshot must be an Array of entries, got #{snapshots.class}")
+      end
+
+      # Phase 1: validate every entry and resolve the value to write
+      resolved = []
+      snapshots.each do |entry|
+        machine_id = entry.is_a?(Hash) ? entry['machine'] : nil
+        machine = machine_id && detect { |_name, candidate| candidate.name.to_s == machine_id }&.last
+        unless machine
+          raise SnapshotError.new(object, "Snapshot references an unknown state machine: #{machine_id.inspect}")
+        end
+
+        if resolved.any? { |resolved_machine, _value| resolved_machine == machine }
+          raise SnapshotError.new(object, "Snapshot contains multiple entries for state machine #{machine.name.inspect}")
+        end
+
+        resolved << [machine, machine.resolve_snapshot(object, entry)]
+      end
+
+      # Phase 2: all entries validated -- write the resolved states directly,
+      # bypassing events, callbacks, and actions
+      resolved.each { |machine, value| machine.write(object, :state, value) }
+
+      true
+    end
+
     protected
 
     def resolve_use_transactions
