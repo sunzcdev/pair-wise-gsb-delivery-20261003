@@ -7,6 +7,21 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Contracts can be mounted into other contracts via `Contract.mount`, both for nested hashes and for arrays of hashes (`each: true`). Mounted contracts' output is written back to the parent result and their errors (including base errors and meta) are moved to the mount path. Context passing is controlled per mount via the `context:` option and stays isolated between mount points
+
+  ```ruby
+  class OrderContract < Dry::Validation::Contract
+    params do
+      required(:shipping_address).hash
+      required(:contacts).array(:hash)
+    end
+
+    mount AddressContract, at: :shipping_address
+    mount AddressContract, at: :contacts, each: true
+  end
+  ```
 
 ## [1.11.1] - 2025-01-21
 

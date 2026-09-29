@@ -98,6 +98,10 @@ module Dry
         end
 
         Result.new(schema.(input), context_map) do |result|
+          self.class.mounts.each do |mounted_contract|
+            mounted_contract.(result)
+          end
+
           rules.each do |rule|
             next if rule.keys.any? { |key| error?(result, key) }
 

@@ -101,6 +101,49 @@ module Dry
           end
         end
 
+        # Mount a contract at a path within the input
+        #
+        # Mounted contracts are applied to the (nested) input found under the
+        # given path when the contract is called. Their output is written back
+        # to the result and their errors are moved to the mount path.
+        #
+        # @example mount a contract for a nested hash
+        #   class OrderContract < Dry::Validation::Contract
+        #     params do
+        #       required(:shipping_address).hash
+        #     end
+        #
+        #     mount AddressContract, at: :shipping_address
+        #   end
+        #
+        # @example mount a contract for each element of an array
+        #   class OrderContract < Dry::Validation::Contract
+        #     params do
+        #       required(:contacts).array(:hash)
+        #     end
+        #
+        #     mount AddressContract, at: :contacts, each: true
+        #   end
+        #
+        # @param [Class<Contract>, Contract] contract The contract to mount,
+        #   either as a class (instantiated without arguments) or an instance
+        # @param [Symbol, Array<Symbol>] at The path at which the contract is mounted
+        # @param [Bool] each Apply the contract to each element of an array
+        # @param [true, false, Hash] context Context passed to the mounted
+        #   contract: +true+ passes a copy of the parent context, a Hash is
+        #   passed as-is and +false+ (default) passes no context
+        #
+        # @return [MountedContract]
+        #
+        # @api public
+        def mount(contract, at:, each: false, context: false)
+          ensure_valid_keys(at, via: :mount) if __schema__
+
+          MountedContract.new(contract, path: at, each: each, context: context).tap do |mounted|
+            mounts << mounted
+          end
+        end
+
         # A shortcut that can be used to define contracts that won't be reused or inherited
         #
         # @example
@@ -135,6 +178,17 @@ module Dry
             .concat(superclass.respond_to?(:rules) ? superclass.rules : EMPTY_ARRAY)
         end
 
+        # Return contracts mounted in this class
+        #
+        # @return [Array<MountedContract>]
+        #
+        # @api private
+        def mounts
+          @mounts ||= EMPTY_ARRAY
+            .dup
+            .concat(superclass.respond_to?(:mounts) ? superclass.mounts : EMPTY_ARRAY)
+        end
+
         # Return messages configured for this class
         #
         # @return [Dry::Schema::Messages]
@@ -147,7 +201,7 @@ module Dry
         private
 
         # @api private
-        def ensure_valid_keys(*keys)
+        def ensure_valid_keys(*keys, via: :rule)
           valid_paths = key_map.to_dot_notation
           key_paths = key_paths(keys)
 
@@ -161,9 +215,9 @@ module Dry
 
           return if invalid_keys.empty?
 
-          raise InvalidKeysError, <<~STR.strip
-            #{name}.rule specifies keys that are not defined by the schema: #{invalid_keys.inspect}
-          STR
+          raise InvalidKeysError,
+                "#{name}.#{via} specifies keys that are not defined by the schema: " \
+                "#{invalid_keys.inspect}"
         end
 
         # @api private
