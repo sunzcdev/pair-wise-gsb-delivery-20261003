@@ -166,6 +166,175 @@ describe Rack::Session::Cookie do
     end
   end
 
+  describe 'StrictJSON' do
+    coder = Rack::Session::Cookie::StrictJSON.new
+
+    def encode_payload(payload)
+      [::JSON.dump(payload)].pack('m0')
+    end
+
+    it 'round-trips all supported types' do
+      time = Time.new(2026, 9, 30, 12, 30, 45, '+08:00')
+      session = {
+        "string" => "hello",
+        "true" => true,
+        "false" => false,
+        "nil" => nil,
+        "integer" => 42,
+        "float" => 1.5,
+        "time" => time,
+        "array" => [1, "two", [3.0]],
+        "hash" => {"nested" => {"key" => "value"}},
+      }
+
+      decoded = coder.decode(coder.encode(session))
+
+      decoded.must_equal session
+      decoded["time"].must_equal time
+      decoded["time"].utc_offset.must_equal 8 * 60 * 60
+    end
+
+    it 'round-trips large integers' do
+      integer = 10**40 + 12345
+      coder.decode(coder.encode({"big" => integer}))["big"].must_equal integer
+      coder.decode(coder.encode({"big" => -integer}))["big"].must_equal(-integer)
+    end
+
+    it 'round-trips times with timezones' do
+      time = Time.new(2026, 1, 2, 3, 4, 5.5, '-05:30')
+      decoded = coder.decode(coder.encode({"at" => time}))["at"]
+      decoded.must_equal time
+      decoded.utc_offset.must_equal(-(5 * 60 + 30) * 60)
+    end
+
+    it 'round-trips deeply nested structures' do
+      nested = {"value" => "leaf"}
+      20.times{|i| nested = {"level_#{i}" => [i, nested]}}
+      coder.decode(coder.encode(nested)).must_equal nested
+    end
+
+    it 'tags the payload with a version' do
+      payload = ::JSON.parse(coder.encode({}).unpack1('m0'))
+      payload["version"].must_equal Rack::Session::Cookie::StrictJSON::VERSION
+    end
+
+    it 'rejects payloads with an unsupported version' do
+      encoded = encode_payload("version" => 2, "data" => {"type" => "nil"})
+      lambda{coder.decode(encoded)}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+    end
+
+    it 'rejects duplicate hash keys' do
+      encoded = encode_payload(
+        "version" => 1,
+        "data" => {
+          "type" => "hash",
+          "value" => [
+            ["key", {"type" => "string", "value" => "one"}],
+            ["key", {"type" => "string", "value" => "two"}],
+          ],
+        },
+      )
+      lambda{coder.decode(encoded)}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+    end
+
+    it 'rejects unknown type tags' do
+      encoded = encode_payload("version" => 1, "data" => {"type" => "object", "value" => "Object"})
+      lambda{coder.decode(encoded)}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+    end
+
+    it 'rejects malformed payloads' do
+      lambda{coder.decode("not base64 or json")}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+    end
+
+    it 'rejects circular structures' do
+      array = []
+      array << array
+      lambda{coder.encode(array)}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+
+      hash = {}
+      hash["self"] = hash
+      lambda{coder.encode(hash)}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+    end
+
+    it 'rejects structures nested too deeply' do
+      max = Rack::Session::Cookie::StrictJSON::MAX_DEPTH
+
+      deep = []
+      current = deep
+      (max + 1).times do
+        child = []
+        current << child
+        current = child
+      end
+      lambda{coder.encode(deep)}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+
+      node = {"type" => "nil"}
+      (max + 1).times{node = {"type" => "array", "value" => [node]}}
+      encoded = encode_payload("version" => 1, "data" => node)
+      lambda{coder.decode(encoded)}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+    end
+
+    it 'rejects unsupported types' do
+      lambda{coder.encode({"key" => :symbol})}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+      lambda{coder.encode({"key" => Object.new})}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+      lambda{coder.encode({key: "symbol keys are not strings"})}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+    end
+
+    it 'rejects non-finite floats' do
+      lambda{coder.encode(Float::INFINITY)}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+      lambda{coder.encode(Float::NAN)}.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+    end
+
+    it 'never instantiates arbitrary classes when decoding' do
+      constructed = 0
+      side_effect = Class.new do
+        define_method(:initialize) do
+          constructed += 1
+        end
+      end
+      Object.const_set(:SideEffectConstructor, side_effect)
+
+      begin
+        # A payload which merely mentions the class name as data:
+        decoded = coder.decode(coder.encode({"class" => "SideEffectConstructor"}))
+        decoded.must_equal({"class" => "SideEffectConstructor"})
+
+        # A payload which attempts to use the class name as a type tag:
+        encoded = encode_payload("version" => 1, "data" => {"type" => "SideEffectConstructor", "value" => {}})
+        lambda{coder.decode(encoded)}.must_raise Rack::Session::Cookie::StrictJSON::DecodeError
+
+        constructed.must_equal 0
+      ensure
+        Object.send(:remove_const, :SideEffectConstructor)
+      end
+    end
+
+    it 'fails atomically without writing a session cookie' do
+      broken = lambda do |env|
+        env["rack.session"]["symbol"] = :not_supported
+        Rack::Response.new("Nothing").to_a
+      end
+
+      lambda{
+        response_for(app: [broken, {
+          coder: Rack::Session::Cookie::StrictJSON.new,
+          let_coder_handle_secure_encoding: true,
+        }])
+      }.must_raise Rack::Session::Cookie::StrictJSON::EncodeError
+    end
+
+    it 'works as a session coder through the middleware' do
+      coder = Rack::Session::Cookie::StrictJSON.new
+      options = {coder: coder, let_coder_handle_secure_encoding: true}
+
+      response = response_for(app: [incrementor, options])
+      response["Set-Cookie"].wont_be_nil
+
+      response = response_for(app: [incrementor, options], cookie: response)
+      response.body.must_match(/"counter"\s*=>\s*2/)
+    end
+  end
+
   it "warns if no secret is given" do
     Rack::Session::Cookie.new(incrementor)
     @warnings.first.must_match(/no secret/i)

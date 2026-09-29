@@ -10,6 +10,7 @@ require 'zlib'
 require 'json'
 require 'base64'
 require 'delegate'
+require 'time'
 
 require 'rack/constants'
 require 'rack/utils'
@@ -50,6 +51,11 @@ module Rack
     # Lastly, a :coder option is also accepted. When used, both encryption and
     # the legacy HMAC will be skipped. This option could create security issues
     # in your application!
+    #
+    # A safe alternative is Rack::Session::Cookie::StrictJSON, which only
+    # supports a fixed set of core types (String, true/false, nil, Integer,
+    # finite Float, Time, Array, and Hash with String keys) and never
+    # instantiates arbitrary classes when decoding.
     #
     # Example:
     #
@@ -142,6 +148,184 @@ module Rack
       class Identity
         def encode(str); str; end
         def decode(str); str; end
+      end
+
+      # A safe session coder which only supports a fixed set of core types:
+      # String, true/false, nil, Integer, finite Float, Time, Array, and Hash
+      # with String keys. Every value is wrapped in an explicit type tag and
+      # the payload carries a version, so the format can evolve safely.
+      #
+      # Decoding only ever constructs the supported core types: it performs no
+      # constant lookup, no Marshal loading, and no arbitrary class callbacks.
+      # Duplicate hash keys, unknown type tags, circular structures, and
+      # excessively deep nesting all raise deterministic errors.
+      #
+      # Encoding is atomic: the complete payload is built in memory and is
+      # either returned in full or not at all, so a failure can never write a
+      # partial session cookie.
+      class StrictJSON < Base64
+        VERSION = 1
+        MAX_DEPTH = 100
+
+        class Error < StandardError; end
+        class EncodeError < Error; end
+        class DecodeError < Error; end
+
+        def encode(object)
+          super(::JSON.dump(
+            "version" => VERSION,
+            "data" => encode_value(object, 0, {}),
+          ))
+        end
+
+        def decode(string)
+          return unless string
+
+          payload = ::JSON.parse(super(string), max_nesting: false)
+
+          unless payload.is_a?(Hash) && payload["version"] == VERSION && payload.key?("data")
+            raise DecodeError, "Unsupported session payload."
+          end
+
+          decode_value(payload["data"], 0)
+        rescue ::JSON::ParserError => error
+          raise DecodeError, error.message
+        end
+
+        private
+
+        def encode_value(value, depth, seen)
+          if depth > MAX_DEPTH
+            raise EncodeError, "Session data is nested too deeply."
+          end
+
+          case value
+          when nil
+            {"type" => "nil"}
+          when true, false
+            {"type" => "boolean", "value" => value}
+          when String
+            {"type" => "string", "value" => value}
+          when Integer
+            {"type" => "integer", "value" => value.to_s}
+          when Float
+            unless value.finite?
+              raise EncodeError, "Cannot encode non-finite Float."
+            end
+            {"type" => "float", "value" => value.to_s}
+          when Time
+            {"type" => "time", "value" => value.iso8601(9)}
+          when Session::SessionId
+            # Session ids are stored as plain strings, matching the
+            # behaviour of the JSON-based coders.
+            {"type" => "string", "value" => value.to_s}
+          when Array
+            encode_container(value, seen) do
+              {"type" => "array", "value" => value.map{|element| encode_value(element, depth + 1, seen)}}
+            end
+          when Hash
+            encode_container(value, seen) do
+              {"type" => "hash", "value" => value.map do |key, element|
+                unless key.is_a?(String)
+                  raise EncodeError, "Session hash keys must be strings."
+                end
+                [key, encode_value(element, depth + 1, seen)]
+              end}
+            end
+          else
+            raise EncodeError, "Cannot encode #{value.class}."
+          end
+        end
+
+        def encode_container(value, seen)
+          id = value.object_id
+          if seen[id]
+            raise EncodeError, "Cannot encode circular structure."
+          end
+
+          seen[id] = true
+          begin
+            yield
+          ensure
+            seen.delete(id)
+          end
+        end
+
+        def decode_value(node, depth)
+          if depth > MAX_DEPTH
+            raise DecodeError, "Session data is nested too deeply."
+          end
+
+          unless node.is_a?(Hash) && node["type"].is_a?(String)
+            raise DecodeError, "Invalid node in session payload."
+          end
+
+          case node["type"]
+          when "nil"
+            nil
+          when "boolean"
+            value = node["value"]
+            unless value == true || value == false
+              raise DecodeError, "Invalid boolean in session payload."
+            end
+            value
+          when "string"
+            decode_typed(node, String)
+          when "integer"
+            value = decode_typed(node, String)
+            unless value.match?(/\A-?\d+\z/)
+              raise DecodeError, "Invalid integer in session payload."
+            end
+            Integer(value, 10)
+          when "float"
+            value = decode_typed(node, String)
+            float = Float(value, exception: false)
+            unless float&.finite?
+              raise DecodeError, "Invalid float in session payload."
+            end
+            float
+          when "time"
+            value = decode_typed(node, String)
+            begin
+              Time.iso8601(value)
+            rescue ArgumentError
+              raise DecodeError, "Invalid time in session payload."
+            end
+          when "array"
+            value = decode_typed(node, Array)
+            value.map{|element| decode_value(element, depth + 1)}
+          when "hash"
+            value = decode_typed(node, Array)
+            decode_hash(value, depth)
+          else
+            raise DecodeError, "Unknown type tag: #{node["type"]}"
+          end
+        end
+
+        def decode_typed(node, klass)
+          value = node["value"]
+          unless value.is_a?(klass)
+            raise DecodeError, "Invalid #{node["type"]} in session payload."
+          end
+          value
+        end
+
+        def decode_hash(entries, depth)
+          hash = {}
+          entries.each do |entry|
+            unless entry.is_a?(Array) && entry.size == 2 && entry[0].is_a?(String)
+              raise DecodeError, "Invalid hash entry in session payload."
+            end
+
+            key = entry[0]
+            if hash.key?(key)
+              raise DecodeError, "Duplicate hash key in session payload: #{key}"
+            end
+
+            hash[key] = decode_value(entry[1], depth + 1)
+          end
+          hash
+        end
       end
 
       class Marshal
