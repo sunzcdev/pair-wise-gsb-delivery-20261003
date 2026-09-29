@@ -6,7 +6,7 @@ module Dry
     #
     # @api public
     class Message < Schema::Message
-      include ::Dry::Equalizer(:text, :path, :meta)
+      include ::Dry::Equalizer(:text, :path, :meta, :warning)
 
       # The error message text
       #
@@ -29,6 +29,16 @@ module Dry
       # @api public
       attr_reader :meta
 
+      # Whether this is a warning rather than a failure
+      #
+      # Warnings never make a result fail, they are collected separately
+      # in {Result#warnings}
+      #
+      # @return [Boolean]
+      #
+      # @api public
+      attr_reader :warning
+
       # A localized message type
       #
       # Localized messsages can be translated to other languages at run-time
@@ -48,7 +58,7 @@ module Dry
         # @api public
         def evaluate(**opts)
           evaluated_text, rest = text.(**opts)
-          Message.new(evaluated_text, path: path, meta: rest.merge(meta))
+          Message.new(evaluated_text, path: path, meta: rest.merge(meta), warning: warning?)
         end
       end
 
@@ -57,21 +67,31 @@ module Dry
       # @return [Message, Message::Localized]
       #
       # @api private
-      def self.[](text, path, meta)
+      def self.[](text, path, meta, warning: false)
         klass = text.respond_to?(:call) ? Localized : Message
-        klass.new(text, path: path, meta: meta)
+        klass.new(text, path: path, meta: meta, warning: warning)
       end
 
       # Initialize a new error object
       #
       # @api private
       # rubocop: disable Lint/MissingSuper
-      def initialize(text, path:, meta: EMPTY_HASH)
+      def initialize(text, path:, meta: EMPTY_HASH, warning: false)
         @text = text
         @path = Array(path)
         @meta = meta
+        @warning = warning
       end
       # rubocop: enable Lint/MissingSuper
+
+      # Check if this is a warning rather than a failure
+      #
+      # @return [Boolean]
+      #
+      # @api public
+      def warning?
+        @warning
+      end
 
       # Check if this is a base error not associated with any key
       #

@@ -10,7 +10,7 @@ module Dry
     #
     # @api public
     class Result
-      include ::Dry::Equalizer(:schema_result, :context, :errors, inspect: false)
+      include ::Dry::Equalizer(:schema_result, :context, :errors, :warnings, inspect: false)
 
       # Build a new result
       #
@@ -52,6 +52,7 @@ module Dry
         @context = context
         @options = options
         @errors = initialize_errors
+        @warnings = MessageSet.new([], options)
       end
 
       # Return values wrapper with the input processed by schema
@@ -78,6 +79,40 @@ module Dry
         new_options.empty? ? @errors : @errors.with(schema_errors(new_options), new_options)
       end
 
+      # Get warning set
+      #
+      # Warnings share the path, meta-data and localized message resolution of
+      # failures, but they never make a result unsuccessful
+      #
+      # @!macro errors-options
+      #
+      # @return [MessageSet]
+      #
+      # @api public
+      def warnings(new_options = EMPTY_HASH)
+        if new_options.empty?
+          @warnings
+        else
+          @warnings.with(@warnings.to_a, options.merge(**new_options))
+        end
+      end
+
+      # Get all diagnostics, both failures and warnings
+      #
+      # Messages are grouped by path: when a path has both failures and
+      # warnings, the failures come first. Messages of the same severity keep
+      # the order in which they were produced.
+      #
+      # @!macro errors-options
+      #
+      # @return [MessageSet]
+      #
+      # @api public
+      def diagnostics(new_options = EMPTY_HASH)
+        messages = order_diagnostics(errors(new_options).to_a + warnings(new_options).to_a)
+        MessageSet.new(messages, options.merge(source: messages, **new_options))
+      end
+
       # Check if result is successful
       #
       # @return [Bool]
@@ -101,6 +136,13 @@ module Dry
       # @api public
       def error?(key)
         errors.any? { |msg| Schema::Path[msg.path].include?(Schema::Path[key]) }
+      end
+
+      # Check if values include a warning for the provided key
+      #
+      # @api public
+      def warning?(key)
+        warnings.any? { |msg| Schema::Path[msg.path].include?(Schema::Path[key]) }
       end
 
       # Check if the base schema (without rules) includes an error for the provided key
@@ -148,6 +190,14 @@ module Dry
         self
       end
 
+      # Add a new warning for the provided key
+      #
+      # @api private
+      def add_warning(warning)
+        @warnings.add(warning)
+        self
+      end
+
       # Read a value under provided key
       #
       # @param [Symbol] key
@@ -182,9 +232,10 @@ module Dry
       # @api public
       def inspect
         if context.empty?
-          "#<#{self.class}#{to_h} errors=#{errors.to_h}>"
+          "#<#{self.class}#{to_h} errors=#{errors.to_h}#{inspect_warnings}>"
         else
-          "#<#{self.class}#{to_h} errors=#{errors.to_h} context=#{context.each.to_h}>"
+          "#<#{self.class}#{to_h} errors=#{errors.to_h}#{inspect_warnings} " \
+            "context=#{context.each.to_h}>"
         end
       end
 
@@ -194,6 +245,7 @@ module Dry
       def freeze
         values.freeze
         errors.freeze
+        warnings.freeze
         super
       end
 
@@ -212,6 +264,25 @@ module Dry
       end
 
       private
+
+      # @api private
+      def inspect_warnings
+        warnings.empty? ? EMPTY_STRING : " warnings=#{warnings.to_h}"
+      end
+
+      # Order diagnostics so failures precede warnings sharing the same path
+      #
+      # Paths keep the order of their first diagnostic; within a path group
+      # the stable partition preserves production order per severity
+      #
+      # @api private
+      def order_diagnostics(messages)
+        messages
+          .group_by { |msg| Array(msg.respond_to?(:path) ? msg.path : EMPTY_ARRAY) }
+          .values
+          .flat_map { |group| group.partition { |msg| !msg.respond_to?(:warning?) || !msg.warning? } }
+          .flatten(1)
+      end
 
       # @api private
       def initialize_errors(options = self.options)

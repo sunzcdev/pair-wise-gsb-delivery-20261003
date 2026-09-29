@@ -2,6 +2,7 @@ en:
   dry_validation:
     rules:
       email: "E-mail"
+      legacy: "Legacy field"
     errors:
       format: "has invalid format"
       rules:
@@ -9,6 +10,7 @@ en:
         email:
           invalid: "oh noez bad email"
           taken: "looks like %{email} is taken"
+          deprecated: "is deprecated, please migrate"
         city:
           invalid: "is not a valid city name"
         address:
@@ -20,3 +22,7 @@ en:
           toddler: "should be included in %{list}"
         small_integers:
           too_big: "is too big!"
+        items:
+          legacy: "uses a deprecated format"
+        legacy:
+          deprecated: "is deprecated, please migrate"

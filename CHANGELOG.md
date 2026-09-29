@@ -7,6 +7,14 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Warning-level rule messages: rules can now call `key.warning(...)`/`base.warning(...)`.
+  Warnings use the same paths, meta data and localized message resolution as failures but
+  never make a result unsuccessful. They are available via `Result#warnings`, while
+  `Result#diagnostics` returns both failures and warnings with a per-message `warning?`
+  severity flag (failures precede warnings sharing the same path)
+
 
 ## [1.11.1] - 2025-01-21
 

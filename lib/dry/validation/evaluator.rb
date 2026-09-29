@@ -104,16 +104,30 @@ module Dry
         @base ||= Failures.new
       end
 
-      # Return aggregated failures
+      # Return aggregated failures (non-warning diagnostics)
       #
       # @return [Array<Hash>]
       #
       # @api private
       def failures
         @failures ||= []
-        @failures += @base.opts if defined?(@base)
-        @failures.concat(@key.values.flat_map(&:opts)) if defined?(@key)
+        @failures += @base.failures if defined?(@base)
+        @failures.concat(@key.values.flat_map(&:failures)) if defined?(@key)
         @failures
+      end
+
+      # Return aggregated warnings
+      #
+      # Warnings never make a result fail and never affect rule dependencies
+      #
+      # @return [Array<Hash>]
+      #
+      # @api private
+      def warnings
+        @warnings ||= []
+        @warnings += @base.warning_messages if defined?(@base)
+        @warnings.concat(@key.values.flat_map(&:warning_messages)) if defined?(@key)
+        @warnings
       end
 
       # @api private

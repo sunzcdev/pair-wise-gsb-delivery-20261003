@@ -61,9 +61,59 @@ module Dry
         self
       end
 
+      # Set warning
+      #
+      # A warning is a non-blocking diagnostic: it shares the same path and
+      # message resolution as a failure, but it never makes the result fail.
+      #
+      # @overload warning(message)
+      #   Set message text explicitly
+      #   @param message [String] The message text
+      #   @example
+      #     warning('this is deprecated')
+      #
+      # @overload warning(id)
+      #   Use message identifier (needs localized messages setup)
+      #   @param id [Symbol] The message id
+      #   @example
+      #     warning(:legacy_format)
+      #
+      # @overload warning(meta_hash)
+      #   Use meta_hash[:text] as a message (either explicitely or as an identifier),
+      #   setting the rest of the hash as message meta attribute
+      #   @param meta [Hash] The hash containing the message as value for the :text key
+      #   @example
+      #     warning({text: :deprecated, code: 102})
+      #
+      # @see Failures#failure
+      #
+      # @api public
+      def warning(message, tokens = EMPTY_HASH)
+        opts << {message: message, tokens: tokens, path: path, warning: true}
+        self
+      end
+
+      # Return only failure-level options
+      #
+      # @return [Array<Hash>]
+      #
+      # @api private
+      def failures
+        opts.reject { |opt| opt[:warning] }
+      end
+
+      # Return only warning-level options
+      #
+      # @return [Array<Hash>]
+      #
+      # @api private
+      def warning_messages
+        opts.select { |opt| opt[:warning] }
+      end
+
       # @api private
       def empty?
-        opts.empty?
+        failures.empty?
       end
     end
   end

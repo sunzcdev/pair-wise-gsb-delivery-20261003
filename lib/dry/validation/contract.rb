@@ -106,6 +106,10 @@ module Dry
             rule_result.failures.each do |failure|
               result.add_error(message_resolver.(**failure))
             end
+
+            rule_result.warnings.each do |warning|
+              result.add_warning(message_resolver.(**warning))
+            end
           end
         end
       end

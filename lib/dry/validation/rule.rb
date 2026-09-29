@@ -90,6 +90,7 @@ module Dry
               evaluator = with(macros: macros, keys: [path], index: idx, &block)
 
               failures.concat(evaluator.failures)
+              warnings.concat(evaluator.warnings)
             end
           end
         end

@@ -25,15 +25,23 @@ module Dry
         # If message argument is a Hash, then it MUST have a :text key,
         # which value will be used as the message value
         #
+        # @param [Boolean] warning Whether the resolved message is a warning
+        #
         # @return [Message, Message::Localized]
         #
         # @api public
-        def call(message:, tokens:, path:, meta: EMPTY_HASH)
+        def call(message:, tokens:, path:, meta: EMPTY_HASH, warning: false)
           case message
           when ::Symbol
-            Message[->(**opts) { message(message, path: path, tokens: tokens, **opts) }, path, meta]
+            Message[
+              ->(**opts) { message(message, path: path, tokens: tokens, **opts) },
+              path, meta, warning: warning
+            ]
           when ::String
-            Message[->(**opts) { [message_text(message, path: path, **opts), meta] }, path, meta]
+            Message[
+              ->(**opts) { [message_text(message, path: path, **opts), meta] },
+              path, meta, warning: warning
+            ]
           when ::Hash
             meta = message.dup
             text = meta.delete(:text) { |key|
@@ -42,7 +50,7 @@ module Dry
               STR
             }
 
-            call(message: text, tokens: tokens, path: path, meta: meta)
+            call(message: text, tokens: tokens, path: path, meta: meta, warning: warning)
           else
             raise ArgumentError, <<~STR
               +message+ must be either a Symbol, String or Hash (#{message.inspect} given)
