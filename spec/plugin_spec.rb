@@ -130,3 +130,152 @@ describe "plugins" do
     app.plugins.frozen?.must_equal true
   end
 end
+
+describe "load_plugins" do
+  def tracked_plugin(configured, deps: [], conflicts: [])
+    mod = Module.new do
+      define_singleton_method(:plugin_dependencies){deps} unless deps.empty?
+      define_singleton_method(:plugin_conflicts){conflicts} unless conflicts.empty?
+      define_singleton_method(:configure){|app| configured << self}
+    end
+    mod
+  end
+
+  it "should load plugins in dependency order and configure shared dependencies only once" do
+    configured = []
+    d = tracked_plugin(configured)
+    b = tracked_plugin(configured, deps: [d])
+    c = tracked_plugin(configured, deps: [d])
+    a = tracked_plugin(configured, deps: [b, c])
+
+    app = Class.new(Roda)
+    app.load_plugins(a, d).must_be_nil
+
+    configured.must_equal [d, b, c, a]
+    app.plugins.last(4).must_equal [d, b, c, a]
+  end
+
+  it "should resolve dependencies given as symbols of registered plugins" do
+    configured = []
+    b = tracked_plugin(configured)
+    Roda::RodaPlugins.register_plugin(:lp_dep_b, b)
+    a = tracked_plugin(configured, deps: [:lp_dep_b])
+
+    app = Class.new(Roda)
+    app.load_plugins(a)
+
+    configured.must_equal [b, a]
+  end
+
+  it "should raise with dependency chain before configuring anything when a dependency is missing" do
+    configured = []
+    b = tracked_plugin(configured, deps: [:lp_missing_dep])
+    a = tracked_plugin(configured, deps: [b])
+
+    app = Class.new(Roda)
+    before = app.plugins.dup
+    e = proc{app.load_plugins(a)}.must_raise(Roda::RodaError)
+    e.message.must_include ':lp_missing_dep'
+    e.message.must_include 'dependency chain'
+
+    configured.must_equal []
+    app.plugins.must_equal before
+  end
+
+  it "should raise with dependency chain before configuring anything when a dependency cycle is detected" do
+    configured = []
+    a = tracked_plugin(configured)
+    b = tracked_plugin(configured)
+    Roda::RodaPlugins.register_plugin(:lp_cycle_a, a)
+    Roda::RodaPlugins.register_plugin(:lp_cycle_b, b)
+    a.define_singleton_method(:plugin_dependencies){[:lp_cycle_b]}
+    b.define_singleton_method(:plugin_dependencies){[:lp_cycle_a]}
+
+    app = Class.new(Roda)
+    e = proc{app.load_plugins(:lp_cycle_a)}.must_raise(Roda::RodaError)
+    e.message.must_include ':lp_cycle_a -> :lp_cycle_b -> :lp_cycle_a'
+
+    configured.must_equal []
+  end
+
+  it "should raise with dependency chain before configuring anything when plugins in the group conflict" do
+    configured = []
+    x = tracked_plugin(configured)
+    Roda::RodaPlugins.register_plugin(:lp_conflict_x, x)
+    y = tracked_plugin(configured, deps: [], conflicts: [:lp_conflict_x])
+    z = tracked_plugin(configured, deps: [y])
+
+    app = Class.new(Roda)
+    e = proc{app.load_plugins(x, z)}.must_raise(Roda::RodaError)
+    e.message.must_include 'conflict'
+    e.message.must_include ':lp_conflict_x'
+    e.message.must_include 'dependency chain'
+
+    configured.must_equal []
+    app.plugins.wont_include x
+    app.plugins.wont_include z
+  end
+
+  it "should detect conflicts with already loaded plugins in both directions" do
+    configured = []
+    x = tracked_plugin(configured)
+    y = tracked_plugin(configured, conflicts: [x])
+    z = tracked_plugin(configured)
+    w = tracked_plugin(configured, conflicts: [z])
+
+    app = Class.new(Roda)
+    app.load_plugins(x, z)
+    configured.must_equal [x, z]
+
+    proc{app.load_plugins(y)}.must_raise(Roda::RodaError)
+    proc{app.load_plugins(w)}.must_raise(Roda::RodaError)
+    configured.must_equal [x, z]
+    app.plugins.wont_include y
+    app.plugins.wont_include w
+  end
+
+  it "should take plugins loaded by the parent class into account without modifying the parent" do
+    configured = []
+    x = tracked_plugin(configured)
+    y = tracked_plugin(configured, deps: [x])
+    z = tracked_plugin(configured, conflicts: [x])
+
+    parent = Class.new(Roda)
+    parent.load_plugins(x)
+    configured.must_equal [x]
+
+    child = Class.new(parent)
+    child.load_plugins(y)
+    configured.must_equal [x, y]
+    child.plugins.must_equal parent.plugins + [y]
+    parent.plugins.wont_include y
+
+    proc{child.load_plugins(z)}.must_raise(Roda::RodaError)
+    configured.must_equal [x, y]
+    child.plugins.wont_include z
+    parent.plugins.wont_include z
+  end
+
+  it "should leave independent apps unaffected after a failed load" do
+    configured = []
+    good = tracked_plugin(configured)
+    bad = tracked_plugin(configured, deps: [:lp_another_missing_dep])
+
+    app1 = Class.new(Roda)
+    app2 = Class.new(Roda)
+
+    proc{app1.load_plugins(good, bad)}.must_raise(Roda::RodaError)
+    configured.must_equal []
+    app1.plugins.must_equal Class.new(Roda).plugins
+
+    app2.load_plugins(good)
+    configured.must_equal [good]
+    app2.plugins.must_equal Class.new(Roda).plugins + [good]
+  end
+
+  it "should raise when loading plugins into a frozen class" do
+    app = Class.new(Roda)
+    app.freeze
+    proc{app.load_plugins(Module.new)}.must_raise(Roda::RodaError)
+  end
+end

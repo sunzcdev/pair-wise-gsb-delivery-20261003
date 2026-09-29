@@ -327,6 +327,49 @@ class Roda
         ruby2_keywords(:plugin) if respond_to?(:ruby2_keywords, true)
         # simplecov:enable
 
+        # Load a group of plugins into the current class, resolving any
+        # dependencies declared by the plugins.  This is similar to calling
+        # #plugin for each plugin, but the plugins can declare dependencies
+        # on and conflicts with other plugins, and the entire group is
+        # validated before any plugin is configured:
+        #
+        # * Plugins are loaded in dependency order, so a plugin is always
+        #   configured after the plugins it depends on.
+        # * Each plugin is configured at most once, even if multiple
+        #   plugins in the group depend on it or it was already loaded.
+        # * If a declared dependency cannot be loaded, a dependency cycle
+        #   is detected, or two plugins conflict, a RodaError is raised
+        #   before any plugin in the group is configured, leaving the
+        #   current class (and any superclass) unmodified.  The error
+        #   message includes the dependency chain related to the failure.
+        #
+        # Plugins declare dependencies and conflicts by defining
+        # +plugin_dependencies+ and +plugin_conflicts+ methods that return
+        # arrays of plugin symbols and/or modules:
+        #
+        #   module MyPlugin
+        #     def self.plugin_dependencies
+        #       [:render]
+        #     end
+        #
+        #     def self.plugin_conflicts
+        #       [OtherPlugin]
+        #     end
+        #   end
+        #
+        #   Roda.load_plugins :render, MyPlugin
+        #
+        # Plugins already loaded into the current class (including plugins
+        # loaded into a superclass before it was subclassed) are taken into
+        # account when resolving dependencies and conflicts. Returns nil.
+        def load_plugins(*plugins)
+          raise RodaError, "Cannot add plugins to a frozen Roda class" if frozen?
+          RodaPlugins.plan_plugins(@plugins, plugins).each do |mod|
+            plugin(mod)
+          end
+          nil
+        end
+
         # Setup routing tree for the current Roda application, and build the
         # underlying rack application using the stored middleware. Requires
         # a block, which is yielded the request.  By convention, the block

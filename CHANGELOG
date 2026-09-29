@@ -1,5 +1,7 @@
 === master
 
+* Add Roda.load_plugins for loading a group of plugins as a unit, with plugin-declared dependencies (plugin_dependencies) and conflicts (plugin_conflicts), detecting missing dependencies, cycles, and conflicts before any plugin is configured (jeremyevans)
+
 * Persist keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
 
 * Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)
