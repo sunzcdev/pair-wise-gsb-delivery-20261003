@@ -10,7 +10,7 @@ module Dry
     #
     # @api public
     class Result
-      include ::Dry::Equalizer(:schema_result, :context, :errors, inspect: false)
+      include ::Dry::Equalizer(:schema_result, :context, :errors, :warnings, inspect: false)
 
       # Build a new result
       #
@@ -52,6 +52,7 @@ module Dry
         @context = context
         @options = options
         @errors = initialize_errors
+        @warnings = initialize_warnings
       end
 
       # Return values wrapper with the input processed by schema
@@ -78,7 +79,43 @@ module Dry
         new_options.empty? ? @errors : @errors.with(schema_errors(new_options), new_options)
       end
 
+      # Get warning set
+      #
+      # Warnings are messages added via `warning` in rules. They don't affect
+      # the result status and are never mixed into {#errors}
+      #
+      # @!macro errors-options
+      #   @param [Hash] new_options
+      #   @option new_options [Symbol] :locale Set locale for messages
+      #   @option new_options [Boolean] :hints Enable/disable hints
+      #   @option new_options [Boolean] :full Get messages that include key names
+      #
+      # @return [MessageSet]
+      #
+      # @api public
+      def warnings(new_options = EMPTY_HASH)
+        new_options.empty? ? @warnings : @warnings.with(@warnings.to_a, new_options)
+      end
+
+      # Get all diagnostics (both failures and warnings) as a single message set
+      #
+      # Messages are sorted by path; when the same path has both failures and
+      # warnings, failures come first. Messages with equal paths and severities
+      # keep the order in which they were added.
+      #
+      # Use Message#severity (or #failure?/#warning?) to tell them apart
+      # instead of parsing message texts
+      #
+      # @return [MessageSet]
+      #
+      # @api public
+      def diagnostics
+        @diagnostics
+      end
+
       # Check if result is successful
+      #
+      # A result with only warnings is still successful
       #
       # @return [Bool]
       #
@@ -140,11 +177,17 @@ module Dry
         }
       end
 
-      # Add a new error for the provided key
+      # Add a new message for the provided key
+      #
+      # Failures are added to the error set, warnings to the warning set
       #
       # @api private
       def add_error(error)
-        @errors.add(error)
+        if error.warning?
+          @warnings.add(error)
+        else
+          @errors.add(error)
+        end
         self
       end
 
@@ -192,8 +235,12 @@ module Dry
       #
       # @api private
       def freeze
+        return self if frozen?
+
         values.freeze
         errors.freeze
+        warnings.freeze
+        @diagnostics = initialize_diagnostics.freeze
         super
       end
 
@@ -216,6 +263,30 @@ module Dry
       # @api private
       def initialize_errors(options = self.options)
         MessageSet.new(schema_errors(options), options)
+      end
+
+      # @api private
+      def initialize_warnings
+        MessageSet.new(EMPTY_ARRAY.dup, options)
+      end
+
+      # @api private
+      def initialize_diagnostics
+        messages = (@errors.to_a + @warnings.to_a)
+          .each_with_index
+          .sort_by { |message, index|
+            [message.path.map { |key| key.to_s }, message_severity_rank(message), index]
+          }
+          .map(&:first)
+
+        MessageSet.new(messages, options)
+      end
+
+      # Schema messages are always failures, rule messages carry a severity
+      #
+      # @api private
+      def message_severity_rank(message)
+        message.respond_to?(:warning?) && message.warning? ? 1 : 0
       end
 
       # @api private

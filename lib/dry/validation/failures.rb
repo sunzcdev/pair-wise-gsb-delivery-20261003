@@ -57,7 +57,41 @@ module Dry
       #
       # @api public
       def failure(message, tokens = EMPTY_HASH)
-        opts << {message: message, tokens: tokens, path: path}
+        opts << {message: message, tokens: tokens, path: path, severity: :failure}
+        self
+      end
+
+      # Set warning
+      #
+      # Warnings use the same message resolution as failures (explicit text,
+      # localized message identifiers and meta hashes), but they don't make
+      # the result a failure and they don't prevent dependent rules from
+      # being executed
+      #
+      # @overload warning(message)
+      #   Set message text explicitly
+      #   @param message [String] The message text
+      #   @example
+      #     warning('this looks deprecated')
+      #
+      # @overload warning(id)
+      #   Use message identifier (needs localized messages setup)
+      #   @param id [Symbol] The message id
+      #   @example
+      #     warning(:legacy_format)
+      #
+      # @overload warning(meta_hash)
+      #   Use meta_hash[:text] as a message (either explicitely or as an identifier),
+      #   setting the rest of the hash as error meta attribute
+      #   @param meta [Hash] The hash containing the message as value for the :text key
+      #   @example
+      #     warning({text: :legacy_format, key: value})
+      #
+      # @see Failures#failure
+      #
+      # @api public
+      def warning(message, tokens = EMPTY_HASH)
+        opts << {message: message, tokens: tokens, path: path, severity: :warning}
         self
       end
 

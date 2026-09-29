@@ -87,6 +87,7 @@ module Dry
       # @return [Failures]
       #
       # @see Failures#failure
+      # @see Failures#warning
       #
       # @api public
       def key(path = self.path)
@@ -98,6 +99,7 @@ module Dry
       # @return [Failures]
       #
       # @see Failures#failure
+      # @see Failures#warning
       #
       # @api public
       def base

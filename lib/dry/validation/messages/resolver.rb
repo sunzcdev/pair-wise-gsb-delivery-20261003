@@ -28,12 +28,22 @@ module Dry
         # @return [Message, Message::Localized]
         #
         # @api public
-        def call(message:, tokens:, path:, meta: EMPTY_HASH)
+        def call(message:, tokens:, path:, meta: EMPTY_HASH, severity: :failure)
           case message
           when ::Symbol
-            Message[->(**opts) { message(message, path: path, tokens: tokens, **opts) }, path, meta]
+            Message[
+              ->(**opts) { message(message, path: path, tokens: tokens, **opts) },
+              path,
+              meta,
+              severity: severity
+            ]
           when ::String
-            Message[->(**opts) { [message_text(message, path: path, **opts), meta] }, path, meta]
+            Message[
+              ->(**opts) { [message_text(message, path: path, **opts), meta] },
+              path,
+              meta,
+              severity: severity
+            ]
           when ::Hash
             meta = message.dup
             text = meta.delete(:text) { |key|
@@ -42,7 +52,7 @@ module Dry
               STR
             }
 
-            call(message: text, tokens: tokens, path: path, meta: meta)
+            call(message: text, tokens: tokens, path: path, meta: meta, severity: severity)
           else
             raise ArgumentError, <<~STR
               +message+ must be either a Symbol, String or Hash (#{message.inspect} given)

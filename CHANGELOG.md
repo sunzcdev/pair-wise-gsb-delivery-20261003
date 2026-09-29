@@ -7,6 +7,15 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Warning-level rule messages via `key.warning`/`base.warning` in rules. Warnings share path, meta
+  and localized message resolution with failures, but a result with only warnings is still
+  successful, `Result#errors` never includes them, and they don't prevent dependent rules from
+  running. Use `Result#warnings` for the warning set and `Result#diagnostics` for all messages
+  (sorted by path, failures before warnings at the same path). Messages expose `#severity`,
+  `#failure?` and `#warning?` so callers don't need to parse message texts
+
 
 ## [1.11.1] - 2025-01-21
 
