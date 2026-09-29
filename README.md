@@ -136,6 +136,68 @@ the schedule's start_time. Schedule start times are supported as:
 
 ---
 
+## Business Day Adjustment
+
+Schedules can optionally move occurrences that fall on non-business days
+(e.g. a monthly settlement date landing on a weekend or holiday) to a
+nearby business day. Whether a day is a business day is decided entirely
+by a pure callback you provide - it receives a `Date` and returns truthy
+for business days. ice_cube ships no holiday calendar and never touches
+the system time zone for this feature.
+
+```ruby
+schedule = IceCube::Schedule.new(Time.utc(2026, 1, 31, 9, 0)) do |s|
+  s.add_recurrence_rule IceCube::Rule.monthly.day_of_month(31)
+  s.adjust_to_business_days(direction: :forward, max_days: 3) do |date|
+    (1..5).cover?(date.wday) && !HOLIDAYS.include?(date)
+  end
+end
+
+schedule.first # => 2026-02-02 09:00 UTC (Saturday Jan 31 moved to Monday)
+```
+
+* `direction:` - `:forward` moves occurrences to a later date, `:backward`
+  to an earlier date. Defaults to `:forward`.
+* `max_days:` - the movement budget in calendar days. When no business day
+  exists within the budget, enumeration raises
+  `IceCube::BusinessDayAdjustmentError`, which carries the unadjusted
+  `occurrence_time`, the `direction` and the `max_days` that failed.
+
+The adjustment preserves each occurrence's time of day and the schedule's
+duration, and applies everywhere occurrences are enumerated (`first`,
+`occurrences`, `occurrences_between`, `next_occurrence`, ...).
+
+### Ordering and merging semantics
+
+The adjustment is a post-processing step over the raw occurrence stream:
+
+1. Rules generate raw occurrences; `count` and `until` apply to the
+   *unadjusted* times (a merged collision still consumes one count per raw
+   occurrence, so merging can reduce the number of emitted occurrences).
+2. Exception rules and exception times match *unadjusted* times; excluded
+   occurrences are removed before adjustment and never shift.
+3. Surviving occurrences move to their business day. Two raw occurrences
+   that move to the same time merge into a single occurrence.
+4. Range bounds apply to the adjusted times, except that an occurrence
+   whose raw time is inside the range is kept even when a `:backward`
+   shift moves it before the opening time.
+
+Because two raw occurrences can merge into one, the provenance of every
+emitted occurrence is available:
+
+```ruby
+schedule.occurrences_with_provenance(from, to).each do |entry|
+  entry.start_time # the adjusted occurrence time
+  entry.sources    # the original (unadjusted) times that merged into it
+  entry.merged?    # true when more than one raw occurrence merged
+end
+```
+
+The adjustment is runtime-only: it is not included in `to_hash`, `to_yaml`
+or `to_ical` serialization, since the callback cannot be serialized.
+
+---
+
 ## Persistence
 
 ice_cube implements its own hash-based .to_yaml, so you can quickly (and

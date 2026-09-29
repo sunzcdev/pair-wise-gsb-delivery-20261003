@@ -12,14 +12,39 @@ module IceCube
     attr_reader :end_time
     deprecated_alias :end_date, :end_time
 
+    # Get the optional business day adjustment
+    attr_reader :business_day_adjustment
+
     # Create a new schedule
     def initialize(start_time = nil, options = {})
       self.start_time = start_time || TimeUtil.now
       self.end_time = self.start_time + options[:duration] if options[:duration]
       self.end_time = options[:end_time] if options[:end_time]
+      self.business_day_adjustment = options[:business_day_adjustment] if options[:business_day_adjustment]
       @all_recurrence_rules = []
       @all_exception_rules = []
       yield self if block_given?
+    end
+
+    # Set an optional BusinessDayAdjustment that moves occurrences falling
+    # on non-business days to a nearby business day. The adjustment is a
+    # runtime-only post-processing step: it is applied after rules, count,
+    # until and exceptions (which all operate on unadjusted times) and is
+    # not included in serialization.
+    def business_day_adjustment=(adjustment)
+      unless adjustment.nil? || adjustment.is_a?(BusinessDayAdjustment)
+        raise ArgumentError, "Expected IceCube::BusinessDayAdjustment, got #{adjustment.class}"
+      end
+      @business_day_adjustment = adjustment
+    end
+
+    # Convenience for setting a BusinessDayAdjustment inline:
+    #
+    #   schedule.adjust_to_business_days(direction: :forward, max_days: 3) do |date|
+    #     (1..5).cover?(date.wday)
+    #   end
+    def adjust_to_business_days(direction: :forward, max_days: 7, &block)
+      self.business_day_adjustment = BusinessDayAdjustment.new(direction: direction, max_days: max_days, &block)
     end
 
     # Set start_time
@@ -293,6 +318,22 @@ module IceCube
       occurs_between?(time, time)
     end
 
+    # Occurrences between two times paired with their adjustment
+    # provenance. Each entry is an AdjustedOccurrence whose #sources list
+    # the original (unadjusted) start times that merged into it. Without a
+    # business day adjustment, each occurrence maps to itself.
+    def occurrences_with_provenance(opening_time, closing_time)
+      raise ArgumentError, "closing_time is required" unless closing_time
+      opening_time, closing_time = normalize_window(opening_time, closing_time)
+      if business_day_adjustment
+        enumerate_adjusted_occurrences(opening_time, closing_time, {}).to_a
+      else
+        enumerate_raw_occurrences(opening_time, closing_time, {}).map do |occurrence|
+          AdjustedOccurrence.new(occurrence, [occurrence.start_time])
+        end
+      end
+    end
+
     # Get the first n occurrences, or the first occurrence if n is skipped
     def first(n = nil)
       occurrences = enumerate_occurrences(start_time).take(n || 1)
@@ -414,14 +455,35 @@ module IceCube
       @all_exception_rules.each(&:reset)
     end
 
-    # Find all of the occurrences for the schedule between opening_time
-    # and closing_time
-    # Iteration is unrolled in pairs to skip duplicate times in end of DST
-    def enumerate_occurrences(opening_time, closing_time = nil, options = {})
+    # Normalize the enumeration window against the schedule's start_time
+    def normalize_window(opening_time, closing_time)
       opening_time = TimeUtil.match_zone(opening_time, start_time)
       closing_time = TimeUtil.match_zone(closing_time, start_time)
       opening_time += TimeUtil.subsec(start_time) - TimeUtil.subsec(opening_time)
       opening_time = start_time if opening_time < start_time
+      [opening_time, closing_time]
+    end
+
+    # Find all of the occurrences for the schedule between opening_time
+    # and closing_time
+    # Iteration is unrolled in pairs to skip duplicate times in end of DST
+    def enumerate_occurrences(opening_time, closing_time = nil, options = {})
+      opening_time, closing_time = normalize_window(opening_time, closing_time)
+      base = if business_day_adjustment
+        enumerate_adjusted_occurrences(opening_time, closing_time, options)
+      else
+        enumerate_raw_occurrences(opening_time, closing_time, options)
+      end
+      Enumerator.new do |yielder|
+        base.each do |entry|
+          occurrence = entry.is_a?(AdjustedOccurrence) ? entry.occurrence : entry
+          yielder << (block_given? ? yield(occurrence) : occurrence)
+        end
+      end
+    end
+
+    # Raw (unadjusted) occurrences between opening_time and closing_time
+    def enumerate_raw_occurrences(opening_time, closing_time, options)
       spans = options[:spans] == true && duration != 0
       Enumerator.new do |yielder|
         reset
@@ -432,10 +494,69 @@ module IceCube
           break unless (t0 = next_time(t1, closing_time))
           break if closing_time && t0 > closing_time
           if spans ? (t0.end_time > opening_time) : (t0 >= opening_time)
-            yielder << (block_given? ? yield(t0) : t0)
+            yielder << t0
           end
           t1 = t0 + 1
         end
+      end
+    end
+
+    # Apply the business day adjustment to the raw occurrence stream.
+    #
+    # Raw occurrences are generated in a window expanded by the adjustment
+    # budget so occurrences just outside the requested range can shift
+    # into it. Adjusted occurrences are emitted in time order; raw
+    # occurrences that move to the same time merge into a single
+    # AdjustedOccurrence whose #sources record every original start time.
+    def enumerate_adjusted_occurrences(opening_time, closing_time, options)
+      adjustment = business_day_adjustment
+      span = adjustment.max_days * ONE_DAY
+      raw_opening = adjustment.shifts_later? ? opening_time - span : opening_time
+      raw_opening = start_time if raw_opening < start_time
+      raw_closing = closing_time
+      raw_closing += span if raw_closing && adjustment.shifts_earlier?
+      spans = options[:spans] == true && duration != 0
+      Enumerator.new do |yielder|
+        pending = []
+        raw_occurrences = enumerate_raw_occurrences(raw_opening, raw_closing, options)
+        loop do
+          raw = begin
+            raw_occurrences.next
+          rescue StopIteration
+            nil
+          end
+          # Upcoming raw occurrences can no longer adjust to a time at or
+          # below this threshold, so pending entries under it are final.
+          threshold = raw && (adjustment.shifts_later? ? raw.start_time : raw.start_time - span)
+          while pending.any? && (raw.nil? || pending.first.start_time <= threshold)
+            entry = pending.shift
+            # An occurrence belongs to the window when its adjusted time
+            # reaches the opening, or when its raw time did (a backward
+            # shift may move an in-window occurrence before the opening).
+            # The closing bound always applies to the adjusted time.
+            reaches_opening = if spans
+              entry.end_time > opening_time || entry.sources.last >= opening_time
+            else
+              entry.start_time >= opening_time || entry.sources.last >= opening_time
+            end
+            before_closing = closing_time.nil? || entry.start_time <= closing_time
+            yielder << entry if reaches_opening && before_closing
+          end
+          break unless raw
+          occurrence = adjustment.adjust_occurrence(raw)
+          merge_pending(pending, AdjustedOccurrence.new(occurrence, [raw.start_time]))
+        end
+      end
+    end
+
+    # Insert an AdjustedOccurrence into the sorted pending list, merging
+    # sources when another raw occurrence already moved to the same time
+    def merge_pending(pending, entry)
+      if (index = pending.index { |e| e.start_time == entry.start_time })
+        pending[index].merge!(entry)
+      else
+        index = pending.index { |e| e.start_time > entry.start_time } || pending.length
+        pending.insert(index, entry)
       end
     end
 
