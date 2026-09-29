@@ -120,6 +120,55 @@ To limit schedules use `count` or `until` on the recurrence rules. Setting `end_
 
 ---
 
+## Business Day Adjustment
+
+Schedules that generate dates like monthly settlement dates can optionally
+shift occurrences that fall on non-business days to a nearby business day:
+
+```ruby
+holidays = [Date.new(2026, 1, 30), Date.new(2026, 2, 2)]
+business_day = ->(time) { (1..5).cover?(time.wday) && !holidays.include?(time.to_date) }
+
+schedule = IceCube::Schedule.new(Time.utc(2026, 1, 31, 9)) do |s|
+  s.add_recurrence_rule IceCube::Rule.monthly.day_of_month(-1) # last day of month
+  s.adjust_to_business_days(direction: :forward, max_days: 3, &business_day)
+end
+
+schedule.first(2) # => [2026-02-03 09:00 UTC, 2026-03-02 09:00 UTC]
+```
+
+* `direction:` is `:forward` (move later) or `:backward` (move earlier).
+* `max_days:` caps how many calendar days an occurrence may move.
+* The block is a pure callback that decides whether a day is a business day.
+  It receives a `Time` in the schedule's own time zone and must return
+  truthy/falsy without side effects.
+* Shifting moves whole calendar days in the schedule's own time zone
+  (wall-clock time is preserved across DST). The system time zone is never
+  read or modified.
+
+Order of operations when enumerating:
+
+1. Recurrence rules generate raw occurrences; rule `count` and `until`
+   constraints apply to these raw (unadjusted) times.
+2. Exception rules/times remove raw occurrences. An excepted raw occurrence
+   produces no adjusted occurrence, and exceptions never match adjusted dates.
+3. Each surviving raw occurrence is shifted to the nearest business day.
+4. Two raw occurrences shifted onto the same calendar day merge into a single
+   occurrence. The merged occurrence keeps the earliest adjusted time and
+   reports every contributing raw time via `Occurrence#original_times`;
+   `Occurrence#adjusted?` reports whether it moved.
+
+Because adjustment happens after rule evaluation, an adjusted occurrence may
+land past the rule's `until` time (or a query's closing time) by up to
+`max_days` days. If no business day exists within `max_days` of a raw
+occurrence, enumeration raises `IceCube::BusinessDayAdjustmentError`, which
+carries `occurrence_time`, `direction` and `max_days`.
+
+The adjustment is a runtime-only setting (the predicate is a callback) and is
+not included in `to_hash` / `to_yaml` / `to_ical` serialization.
+
+---
+
 ## Time Zones and ActiveSupport vs. Standard Ruby Time Classes
 
 ice_cube works great without ActiveSupport but only supports the environment's

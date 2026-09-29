@@ -29,10 +29,26 @@ module IceCube
     alias_method :first, :start_time
     alias_method :last, :end_time
 
-    def initialize(start_time, end_time = nil)
+    def initialize(start_time, end_time = nil, original_times: nil)
       @start_time = start_time
       @end_time = end_time || start_time
+      @original_times = original_times
       __setobj__ @start_time
+    end
+
+    # The raw (unadjusted) occurrence times that produced this occurrence.
+    # When a Schedule applies a business day adjustment, several raw
+    # occurrences may be merged into one adjusted occurrence; this lists
+    # every contributing raw start_time in chronological order. For
+    # unadjusted occurrences it is simply [start_time].
+    def original_times
+      @original_times || [start_time]
+    end
+
+    # True when a business day adjustment moved (or merged) this occurrence
+    # away from its raw schedule time.
+    def adjusted?
+      !@original_times.nil? && @original_times != [start_time]
     end
 
     def to_i

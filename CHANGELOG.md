@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [UNRELEASED]
 ### Added
+- Optional business day adjustment for schedules via `Schedule#adjust_to_business_days`. Raw occurrences that fall on non-business days (decided by a caller-supplied pure predicate) are shifted forward or backward by whole calendar days up to a configurable `max_days`; collisions on the same day merge into one occurrence reporting its sources via `Occurrence#original_times`, and `IceCube::BusinessDayAdjustmentError` is raised when no business day is found within budget.
 - Support for BYSETPOS with all rule frequencies (yearly, monthly, weekly, daily, hourly, minutely, secondly). ([#449](https://github.com/ice-cube-ruby/ice_cube/pull/449)) by [@nehresma](https://github.com/nehresma) and [@NicolasMarlier](https://github.com/NicolasMarlier)
 
 ### Changed

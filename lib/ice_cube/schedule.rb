@@ -12,6 +12,9 @@ module IceCube
     attr_reader :end_time
     deprecated_alias :end_date, :end_time
 
+    # Get the configured business day adjustment, if any
+    attr_reader :business_day_adjustment
+
     # Create a new schedule
     def initialize(start_time = nil, options = {})
       self.start_time = start_time || TimeUtil.now
@@ -40,6 +43,44 @@ module IceCube
 
     def duration=(seconds)
       @end_time = start_time + seconds
+    end
+
+    # Configure an optional business day adjustment for this schedule.
+    #
+    # When set, every raw occurrence produced by the recurrence rules is
+    # shifted to a business day after rule evaluation. The adjustment is a
+    # runtime-only setting: it is not included in to_hash / to_yaml / to_ical
+    # serialization because the business day predicate is a caller-supplied
+    # callback.
+    #
+    # Order of operations when enumerating occurrences:
+    #
+    # 1. Recurrence rules generate raw occurrences. Rule +count+ and +until+
+    #    constraints apply to these raw (unadjusted) times.
+    # 2. Exception rules and exception times remove raw occurrences; an
+    #    excepted raw occurrence produces no adjusted occurrence at all.
+    # 3. Each surviving raw occurrence is shifted, whole calendar days in
+    #    the schedule's own time zone, to the nearest business day in
+    #    +direction+ (at most +max_days+ days). The system time zone is
+    #    never used or modified.
+    # 4. Adjusted occurrences landing on the same calendar day are merged
+    #    into a single occurrence. The merged occurrence keeps the earliest
+    #    adjusted time and reports every contributing raw time through
+    #    Occurrence#original_times.
+    #
+    # Because adjustment happens after rule evaluation, an adjusted
+    # occurrence may fall outside the rule's +until+ time or a query's
+    # closing time by up to +max_days+ days.
+    #
+    # The business day predicate must be a pure callback receiving a Time
+    # (in the schedule's zone) and returning truthy for business days.
+    # Raises BusinessDayAdjustmentError during enumeration when no business
+    # day exists within +max_days+ of a raw occurrence.
+    def adjust_to_business_days(direction: :forward, max_days: 7, &block)
+      @business_day_adjustment = BusinessDayAdjustment.new(
+        direction: direction, max_days: max_days, &block
+      )
+      self
     end
 
     # Add a recurrence time to the schedule
@@ -423,7 +464,7 @@ module IceCube
       opening_time += TimeUtil.subsec(start_time) - TimeUtil.subsec(opening_time)
       opening_time = start_time if opening_time < start_time
       spans = options[:spans] == true && duration != 0
-      Enumerator.new do |yielder|
+      enum = Enumerator.new do |yielder|
         reset
         t1 = full_required? ? start_time : opening_time
         t1 -= duration if spans
@@ -437,6 +478,58 @@ module IceCube
           t1 = t0 + 1
         end
       end
+      business_day_adjustment ? apply_business_day_adjustment(enum) : enum
+    end
+
+    # Post-process a raw occurrence stream with the configured business day
+    # adjustment. Adjusted occurrences that land on the same calendar day
+    # (in the schedule's zone) are merged into one occurrence keeping the
+    # earliest adjusted time; every contributing raw time is recorded in
+    # Occurrence#original_times. Results are emitted in adjusted-time order
+    # using a small buffer, since a raw occurrence may move at most
+    # max_days days.
+    def apply_business_day_adjustment(raw_occurrences)
+      adjustment = business_day_adjustment
+      Enumerator.new do |yielder|
+        buffer = []
+        raw_occurrences.each do |raw|
+          adjusted = adjust_occurrence(raw, adjustment)
+          if (index = buffer.index { |o| same_adjusted_day?(o, adjusted) })
+            buffer[index] = merge_adjusted_occurrences(buffer[index], adjusted)
+          else
+            position = buffer.index { |o| adjusted < o } || buffer.length
+            buffer.insert(position, adjusted)
+          end
+          cutoff = raw.start_time - (adjustment.max_days + 1) * ONE_DAY
+          yielder << buffer.shift while buffer.any? && buffer.first.start_time < cutoff
+        end
+        buffer.each { |occurrence| yielder << occurrence }
+      end
+    end
+
+    # Shift a single occurrence to a business day, moving start and end by
+    # the same whole-day delta and recording the raw start_time as source.
+    def adjust_occurrence(occurrence, adjustment)
+      adjusted_start = adjustment.adjust(occurrence.start_time)
+      delta = adjusted_start.to_i - occurrence.start_time.to_i
+      return occurrence if delta == 0
+      Occurrence.new(
+        adjusted_start,
+        occurrence.end_time + delta,
+        original_times: [occurrence.start_time]
+      )
+    end
+
+    # Merge two adjusted occurrences that share a calendar day, keeping the
+    # earliest adjusted time and combining their raw sources.
+    def merge_adjusted_occurrences(a, b)
+      keeper, extra = (b.start_time < a.start_time) ? [b, a] : [a, b]
+      originals = (keeper.original_times + extra.original_times).sort
+      Occurrence.new(keeper.start_time, keeper.end_time, original_times: originals)
+    end
+
+    def same_adjusted_day?(a, b)
+      a.year == b.year && a.month == b.month && a.day == b.day
     end
 
     # Get the next time after (or including) a specific time
