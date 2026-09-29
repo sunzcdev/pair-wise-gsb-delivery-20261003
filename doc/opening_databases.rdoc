@@ -108,6 +108,10 @@ The following options can be specified and are passed to the database's internal
 :connect_sqls :: An array of sql strings to execute on each new connection, after :after_connect runs.
 :max_connections :: The maximum size of the connection pool (4 connections by default on most databases)
 :pool_timeout :: The number of seconds to wait if a connection cannot be acquired before raising an error (5 seconds by default)
+:pool_wait_cycle_detection :: Whether to detect cycles of threads/fibers holding connections and waiting
+                               for connections held by each other (which would otherwise deadlock until
+                               the pool timeout), raising Sequel::PoolDeadlock for the checkout that
+                               would complete the cycle (false by default)
 :single_threaded :: Whether to use a single-threaded (non-thread safe) connection pool
 
 == Adapter specific connection options

@@ -25,6 +25,12 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
   #                     will open (default 4)
   # :pool_timeout :: The amount of seconds to wait to acquire a connection
   #                  before raising a PoolTimeout error (default 5)
+  # :pool_wait_cycle_detection :: Whether to detect cycles of threads/fibers
+  #                               holding connections and waiting for
+  #                               connections held by each other, raising
+  #                               Sequel::PoolDeadlock for the checkout that
+  #                               would complete the cycle instead of blocking
+  #                               until the pool timeout (default false)
   def initialize(db, opts = OPTS)
     super
     @max_size = Integer(opts[:max_connections] || 4)
@@ -91,6 +97,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
     end
     begin
       conn = acquire(t)
+      register_wait_cycle_hold(t, :default)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       if disconnect_error?(e)
@@ -104,6 +111,7 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
       end
       raise
     ensure
+      unregister_wait_cycle_hold(t, :default)
       if conn
         sync{release(t)}
         if @connection_handling == :disconnect
@@ -177,7 +185,11 @@ class Sequel::ThreadedConnectionPool < Sequel::ConnectionPool
       end
       # simplecov:enable
 
-      @waiter.wait(@mutex, timeout)
+      if @wait_cycle_detection
+        with_wait_cycle_wait(thread, :default){@waiter.wait(@mutex, timeout)}
+      else
+        @waiter.wait(@mutex, timeout)
+      end
 
       # Connection still not available, could be because a connection was disconnected,
       # may have to retry assign_connection to see if a new connection can be made.

@@ -1594,3 +1594,297 @@ all_pools.each do |pc, desc|
     end
   end
 end
+
+describe "Connection pool wait cycle detection" do
+  make_barrier = lambda do |n|
+    m = Mutex.new
+    cv = ConditionVariable.new
+    count = 0
+    lambda do
+      m.synchronize do
+        count += 1
+        if count >= n
+          cv.broadcast
+        else
+          cv.wait(m)
+        end
+      end
+    end
+  end
+
+  wait_graph_waits = lambda{Sequel::ConnectionPool.const_get(:WAIT_GRAPH_WAITS)}
+  wait_graph_holds = lambda{Sequel::ConnectionPool.const_get(:WAIT_GRAPH_HOLDS)}
+
+  get_cycle_pool = lambda do |pool_class, opts={}|
+    disconnect_proc = opts.delete(:disconnect_proc)
+    db = mock_db.call(disconnect_proc, {:host=>'cycle-host', :user=>'cycle-user', :password=>'cycle-secret'}){|s| s}
+    Sequel::ConnectionPool.get_pool(db, {
+      :pool_class=>pool_class,
+      :max_connections=>1,
+      :pool_timeout=>5,
+      :pool_wait_cycle_detection=>true
+    }.merge(opts))
+  end
+
+  record_errors = lambda do
+    errors = []
+    error_mutex = Mutex.new
+    [errors, lambda{|e| error_mutex.synchronize{errors << e}}]
+  end
+
+  sharded_cycle_pool_classes = [:sharded_threaded]
+  unsharded_cycle_pool_classes = [:threaded]
+  if RUBY_VERSION >= '3.2'
+    sharded_cycle_pool_classes << sharded_timed_queue_connection_pool
+    unsharded_cycle_pool_classes << timed_queue_connection_pool
+  end
+
+  sharded_cycle_pool_classes.each do |pool_class|
+    describe "with #{pool_class} pool" do
+      it "should detect two-owner wait cycles and abort the borrow completing the cycle" do
+        pool = get_cycle_pool.call(pool_class, :servers=>{:a=>{}})
+        barrier = make_barrier.call(2)
+        errors, record = record_errors.call
+
+        borrow = lambda do |held, wanted|
+          pool.hold(held) do
+            barrier.call
+            begin
+              pool.hold(wanted){}
+            rescue Sequel::PoolDeadlock => e
+              record.call(e)
+            end
+          end
+        end
+        t1 = Thread.new{borrow.call(:default, :a)}
+        t2 = Thread.new{borrow.call(:a, :default)}
+        t1.join
+        t2.join
+
+        errors.length.must_equal 1
+        message = errors.first.message
+        message.must_include "wait cycle detected"
+        message.scan(/waiting on/).length.must_equal 2
+        message.must_include "server: :default"
+        message.must_include "server: :a"
+        message.wont_include "cycle-secret"
+        message.wont_include "cycle-user"
+        message.wont_include "cycle-host"
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should detect three-owner wait cycles" do
+        pool = get_cycle_pool.call(pool_class, :servers=>{:a=>{}, :b=>{}})
+        barrier = make_barrier.call(3)
+        errors, record = record_errors.call
+
+        threads = [[:default, :a], [:a, :b], [:b, :default]].map do |held, wanted|
+          Thread.new do
+            pool.hold(held) do
+              barrier.call
+              begin
+                pool.hold(wanted){}
+              rescue Sequel::PoolDeadlock => e
+                record.call(e)
+              end
+            end
+          end
+        end
+        threads.each(&:join)
+
+        errors.length.must_equal 1
+        errors.first.message.scan(/waiting on/).length.must_equal 3
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should not raise for acyclic waits" do
+        pool = get_cycle_pool.call(pool_class)
+        barrier = make_barrier.call(2)
+        queue = Queue.new
+        gotten = nil
+        errors, record = record_errors.call
+
+        t1 = Thread.new do
+          pool.hold(:default) do
+            barrier.call
+            queue.pop
+          end
+        end
+        t2 = Thread.new do
+          barrier.call
+          begin
+            pool.hold(:default){|c| gotten = c}
+          rescue StandardError => e
+            record.call(e)
+          end
+        end
+
+        until wait_graph_waits.call.key?(t2) || !t2.alive?
+          sleep 0.01
+        end
+        queue.push(nil)
+        t1.join
+        t2.join
+
+        errors.must_be_empty
+        gotten.must_equal :default
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should handle same-owner reentrant holds without false cycle detection" do
+        pool = get_cycle_pool.call(pool_class, :servers=>{:a=>{}})
+        pool.hold(:default) do |c1|
+          pool.hold(:default){|c2| c2.must_equal c1}
+          pool.hold(:a) do |c3|
+            c3.must_equal :a
+            wait_graph_holds.call[Sequel.current].length.must_equal 2
+          end
+        end
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should remove waits from the wait graph on timeout" do
+        pool = get_cycle_pool.call(pool_class, :pool_timeout=>0.05)
+        queue = Queue.new
+        t1 = Thread.new{pool.hold(:default){queue.pop}}
+        until wait_graph_holds.call.key?(t1) || !t1.alive?
+          sleep 0.01
+        end
+
+        proc{pool.hold(:default){}}.must_raise(Sequel::PoolTimeout)
+        wait_graph_waits.call.must_be_empty
+
+        queue.push(nil)
+        t1.join
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should remove holds from the wait graph on disconnect errors" do
+        disconnects = []
+        pool = get_cycle_pool.call(pool_class, :disconnect_proc=>proc{|c| disconnects << c})
+        proc{pool.hold(:default){raise Sequel::DatabaseDisconnectError}}.must_raise(Sequel::DatabaseDisconnectError)
+        disconnects.length.must_equal 1
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should detect wait cycles across separate pools" do
+        pool1 = get_cycle_pool.call(pool_class)
+        pool2 = get_cycle_pool.call(pool_class)
+        barrier = make_barrier.call(2)
+        errors, record = record_errors.call
+
+        borrow = lambda do |pool_a, pool_b|
+          pool_a.hold(:default) do
+            barrier.call
+            begin
+              pool_b.hold(:default){}
+            rescue Sequel::PoolDeadlock => e
+              record.call(e)
+            end
+          end
+        end
+        t1 = Thread.new{borrow.call(pool1, pool2)}
+        t2 = Thread.new{borrow.call(pool2, pool1)}
+        t1.join
+        t2.join
+
+        errors.length.must_equal 1
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should not detect cycles unless the :pool_wait_cycle_detection option is used" do
+        pool = Sequel::ConnectionPool.get_pool(mock_db.call{|s| s}, :pool_class=>pool_class, :max_connections=>1, :pool_timeout=>0.05, :servers=>{:a=>{}})
+        barrier = make_barrier.call(2)
+        done = Queue.new
+        release = Queue.new
+        errors, record = record_errors.call
+
+        borrow = lambda do |held, wanted|
+          pool.hold(held) do
+            barrier.call
+            begin
+              pool.hold(wanted){}
+            rescue Sequel::PoolTimeout => e
+              record.call(e)
+            end
+            done.push(nil)
+            release.pop
+          end
+        end
+        t1 = Thread.new{borrow.call(:default, :a)}
+        t2 = Thread.new{borrow.call(:a, :default)}
+        2.times{done.pop}
+        2.times{release.push(nil)}
+        t1.join
+        t2.join
+
+        errors.length.must_equal 2
+        errors.each{|e| e.class.must_equal Sequel::PoolTimeout}
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+    end
+  end
+
+  unsharded_cycle_pool_classes.each do |pool_class|
+    describe "with #{pool_class} pool" do
+      it "should detect wait cycles across separate pools" do
+        pool1 = get_cycle_pool.call(pool_class)
+        pool2 = get_cycle_pool.call(pool_class)
+        barrier = make_barrier.call(2)
+        errors, record = record_errors.call
+
+        borrow = lambda do |pool_a, pool_b|
+          pool_a.hold do
+            barrier.call
+            begin
+              pool_b.hold{}
+            rescue Sequel::PoolDeadlock => e
+              record.call(e)
+            end
+          end
+        end
+        t1 = Thread.new{borrow.call(pool1, pool2)}
+        t2 = Thread.new{borrow.call(pool2, pool1)}
+        t1.join
+        t2.join
+
+        errors.length.must_equal 1
+        errors.first.message.scan(/waiting on/).length.must_equal 2
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should remove waits from the wait graph on timeout" do
+        pool = get_cycle_pool.call(pool_class, :pool_timeout=>0.05)
+        queue = Queue.new
+        t1 = Thread.new{pool.hold{queue.pop}}
+        until wait_graph_holds.call.key?(t1) || !t1.alive?
+          sleep 0.01
+        end
+
+        proc{pool.hold{}}.must_raise(Sequel::PoolTimeout)
+        wait_graph_waits.call.must_be_empty
+
+        queue.push(nil)
+        t1.join
+        wait_graph_holds.call.must_be_empty
+      end
+
+      it "should remove holds from the wait graph on disconnect errors" do
+        disconnects = []
+        pool = get_cycle_pool.call(pool_class, :disconnect_proc=>proc{|c| disconnects << c})
+        proc{pool.hold{raise Sequel::DatabaseDisconnectError}}.must_raise(Sequel::DatabaseDisconnectError)
+        disconnects.length.must_equal 1
+        wait_graph_waits.call.must_be_empty
+        wait_graph_holds.call.must_be_empty
+      end
+    end
+  end
+end

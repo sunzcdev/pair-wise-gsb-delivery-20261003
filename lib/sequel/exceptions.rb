@@ -122,6 +122,14 @@ module Sequel
   ).name
 
   (
+  # Error raised when the connection pool detects that waiting for a database
+  # connection would result in a deadlock, due to a cycle of threads/fibers
+  # holding connections and waiting for connections held by each other.  Only
+  # raised when the pool's :pool_wait_cycle_detection option is enabled.
+  PoolDeadlock = Class.new(PoolTimeout)
+  ).name
+
+  (
   # Error that you should raise to signal a rollback of the current transaction.
   # The transaction block will catch this exception, rollback the current transaction,
   # and won't reraise it (unless a reraise is requested).

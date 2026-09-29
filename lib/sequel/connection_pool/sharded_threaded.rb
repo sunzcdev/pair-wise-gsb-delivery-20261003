@@ -17,6 +17,12 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
   #                  Sequel uses Hash.new(:default).  You can use a hash with a default proc
   #                  that raises an error if you want to catch all cases where a nonexistent
   #                  server is used.
+  # :pool_wait_cycle_detection :: Whether to detect cycles of threads/fibers
+  #                               holding connections and waiting for
+  #                               connections held by each other, raising
+  #                               Sequel::PoolDeadlock for the checkout that
+  #                               would complete the cycle instead of blocking
+  #                               until the pool timeout (default false)
   def initialize(db, opts = OPTS)
     super
     @available_connections = {}
@@ -131,11 +137,13 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
     end
     begin
       conn = acquire(t, server)
+      register_wait_cycle_hold(t, server)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       sync{@connections_to_remove << conn} if conn && disconnect_error?(e)
       raise
     ensure
+      unregister_wait_cycle_hold(t, server)
       sync{release(t, conn, server)} if conn
       while dconn = sync{@connections_to_disconnect.shift}
         disconnect_connection(dconn)
@@ -231,7 +239,11 @@ class Sequel::ShardedThreadedConnectionPool < Sequel::ThreadedConnectionPool
       end
       # simplecov:enable
 
-      @waiters[server].wait(@mutex, timeout)
+      if @wait_cycle_detection
+        with_wait_cycle_wait(thread, server){@waiters[server].wait(@mutex, timeout)}
+      else
+        @waiters[server].wait(@mutex, timeout)
+      end
 
       # Connection still not available, could be because a connection was disconnected,
       # may have to retry assign_connection to see if a new connection can be made.

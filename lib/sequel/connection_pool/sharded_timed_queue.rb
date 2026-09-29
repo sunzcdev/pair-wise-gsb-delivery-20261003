@@ -21,6 +21,12 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
   #                  Sequel uses Hash.new(:default).  You can use a hash with a default proc
   #                  that raises an error if you want to catch all cases where a nonexistent
   #                  server is used.
+  # :pool_wait_cycle_detection :: Whether to detect cycles of threads/fibers
+  #                               holding connections and waiting for
+  #                               connections held by each other, raising
+  #                               Sequel::PoolDeadlock for the checkout that
+  #                               would complete the cycle instead of blocking
+  #                               until the pool timeout (default false)
   def initialize(db, opts = OPTS)
     super
 
@@ -127,6 +133,7 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
 
     begin
       conn = acquire(t, server)
+      register_wait_cycle_hold(t, server)
       yield conn
     rescue Sequel::DatabaseDisconnectError, *@error_classes => e
       if disconnect_error?(e)
@@ -138,6 +145,7 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
       end
       raise
     ensure
+      unregister_wait_cycle_hold(t, server)
       release(t, conn, server) if conn
     end
   end
@@ -340,8 +348,12 @@ class Sequel::ShardedTimedQueueConnectionPool < Sequel::ConnectionPool
   # Return the next connection in the pool if there is one available. If not, wait
   # until the timeout for a connection to become available. If there is still no
   # available connection, return nil.
-  def wait_until_available(queue, _server)
-    queue.pop(timeout: @timeout)
+  def wait_until_available(queue, server)
+    if @wait_cycle_detection
+      with_wait_cycle_wait(Sequel.current, server){queue.pop(timeout: @timeout)}
+    else
+      queue.pop(timeout: @timeout)
+    end
   end
 
   # Returns the connection owned by the supplied thread for the given server,

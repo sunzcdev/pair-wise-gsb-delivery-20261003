@@ -84,6 +84,123 @@ class Sequel::ConnectionPool
   end
   extend ClassMethods
 
+  # Mutex protecting the wait graph data structures.
+  WAIT_GRAPH_MUTEX = Mutex.new
+
+  # Wait graph of checked out connections, used for wait cycle detection.
+  # Maps owners (Sequel.current values) to hashes of [pool, server] pairs
+  # to checkout counts.  Only used by pools with the
+  # :pool_wait_cycle_detection option enabled.
+  WAIT_GRAPH_HOLDS = {}.compare_by_identity
+
+  # Wait graph of connection waits, used for wait cycle detection.
+  # Maps owners (Sequel.current values) to the [pool, server] pair the
+  # owner is currently waiting on.  Only used by pools with the
+  # :pool_wait_cycle_detection option enabled.
+  WAIT_GRAPH_WAITS = {}.compare_by_identity
+
+  private_constant :WAIT_GRAPH_MUTEX, :WAIT_GRAPH_HOLDS, :WAIT_GRAPH_WAITS
+
+  # Register in the wait graph that the owner holds a connection to the
+  # given server on the given pool.
+  def self.wait_graph_register_hold(owner, pool, server)
+    target = [pool, server].freeze
+    WAIT_GRAPH_MUTEX.synchronize do
+      targets = (WAIT_GRAPH_HOLDS[owner] ||= {})
+      targets[target] = targets.fetch(target, 0) + 1
+    end
+    nil
+  end
+
+  # Remove a previously registered hold from the wait graph.  Does nothing
+  # if the owner does not have a registered hold for the pool and server.
+  def self.wait_graph_unregister_hold(owner, pool, server)
+    WAIT_GRAPH_MUTEX.synchronize do
+      if targets = WAIT_GRAPH_HOLDS[owner]
+        target = [pool, server]
+        case targets[target]
+        when nil
+          # Nothing registered, nothing to do
+        when 1
+          targets.delete(target)
+          WAIT_GRAPH_HOLDS.delete(owner) if targets.empty?
+        else
+          targets[target] -= 1
+        end
+      end
+    end
+    nil
+  end
+
+  # Register in the wait graph that the owner is waiting for a connection
+  # to the given server on the given pool.  Raises Sequel::PoolDeadlock
+  # without registering the wait if the wait would create a cycle in the
+  # wait graph.
+  def self.wait_graph_register_wait(owner, pool, server)
+    target = [pool, server].freeze
+    WAIT_GRAPH_MUTEX.synchronize do
+      if chain = wait_graph_cycle(owner, target)
+        raise Sequel::PoolDeadlock, wait_graph_cycle_message(chain)
+      end
+      WAIT_GRAPH_WAITS[owner] = target
+    end
+    nil
+  end
+
+  # Remove a previously registered wait from the wait graph.
+  def self.wait_graph_unregister_wait(owner)
+    WAIT_GRAPH_MUTEX.synchronize{WAIT_GRAPH_WAITS.delete(owner)}
+    nil
+  end
+
+  # If the owner waiting for the given target (pool and server pair) would
+  # create a cycle in the wait graph, return an array of [owner, target]
+  # pairs forming the cycle.  The calling code should hold WAIT_GRAPH_MUTEX.
+  def self.wait_graph_cycle(owner, target)
+    visited = {}.compare_by_identity
+    stack = wait_graph_holders(target).map{|holder| [holder, [[owner, target]]]}
+
+    until stack.empty?
+      current, chain = stack.pop
+      return chain if current.equal?(owner)
+      next if visited[current]
+      visited[current] = true
+
+      if current_target = WAIT_GRAPH_WAITS[current]
+        new_chain = chain + [[current, current_target]]
+        wait_graph_holders(current_target).each do |holder|
+          stack.push([holder, new_chain])
+        end
+      end
+    end
+
+    nil
+  end
+  private_class_method :wait_graph_cycle
+
+  # An array of owners currently holding connections for the given target
+  # (pool and server pair).  The calling code should hold WAIT_GRAPH_MUTEX.
+  def self.wait_graph_holders(target)
+    holders = []
+    WAIT_GRAPH_HOLDS.each_pair do |owner, targets|
+      holders << owner if targets.key?(target)
+    end
+    holders
+  end
+  private_class_method :wait_graph_holders
+
+  # Error message for the given wait graph cycle, describing each owner in
+  # the cycle and the pool server it is waiting on.  This intentionally
+  # does not include any connection credentials.
+  def self.wait_graph_cycle_message(chain)
+    parts = chain.map do |owner, (pool, server)|
+      "#{owner.inspect} waiting on #{pool.pool_type} pool server: #{server.inspect}"
+    end
+    parts << chain.first[0].inspect
+    "connection pool wait cycle detected: #{parts.join(' -> ')}"
+  end
+  private_class_method :wait_graph_cycle_message
+
   # The after_connect proc used for this pool.  This is called with each new
   # connection made, and is usually used to set custom per-connection settings.
   # Deprecated.
@@ -115,6 +232,7 @@ class Sequel::ConnectionPool
     @use_old_connect_api = false # SEQUEL6: Remove
     @after_connect = opts[:after_connect] # SEQUEL6: Remove
     @connect_sqls = opts[:connect_sqls] # SEQUEL6: Remove
+    @wait_cycle_detection = opts[:pool_wait_cycle_detection]
     @error_classes = db.send(:database_error_classes).dup.freeze
   end
   
@@ -171,5 +289,31 @@ class Sequel::ConnectionPool
     rescue Exception=>exception
       raise Sequel.convert_exception_class(exception, Sequel::DatabaseConnectionError)
     end || raise(Sequel::DatabaseConnectionError, "Connection parameters not valid")
+  end
+
+  # If wait cycle detection is enabled for the pool, register in the wait
+  # graph that the owner holds a connection to the given server.
+  def register_wait_cycle_hold(owner, server)
+    Sequel::ConnectionPool.wait_graph_register_hold(owner, self, server) if @wait_cycle_detection
+  end
+
+  # If wait cycle detection is enabled for the pool, remove the owner's
+  # hold on the given server from the wait graph.
+  def unregister_wait_cycle_hold(owner, server)
+    Sequel::ConnectionPool.wait_graph_unregister_hold(owner, self, server) if @wait_cycle_detection
+  end
+
+  # Register in the wait graph that the owner is waiting for a connection
+  # to the given server, yield to wait for the connection, and remove the
+  # wait from the wait graph when the wait is over.  Raises
+  # Sequel::PoolDeadlock if the wait would create a cycle in the wait
+  # graph.  This should only be called if wait cycle detection is enabled.
+  def with_wait_cycle_wait(owner, server)
+    Sequel::ConnectionPool.wait_graph_register_wait(owner, self, server)
+    begin
+      yield
+    ensure
+      Sequel::ConnectionPool.wait_graph_unregister_wait(owner)
+    end
   end
 end
