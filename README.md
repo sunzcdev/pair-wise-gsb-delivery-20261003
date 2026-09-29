@@ -1907,6 +1907,31 @@ get '/' do
 end
 ```
 
+### Pinning settings to the request
+
+Settings assigned a block or `Proc` are evaluated every time they are
+accessed. Some dynamic values, however, should stay consistent for the
+duration of a request, for example the configuration version used to
+serve it. Mark those settings with `pin_to_request` to evaluate them
+lazily on first access within a request and reuse the result for the
+remainder of that request:
+
+```ruby
+set(:config_version) { Config.current_version }
+pin_to_request :config_version
+
+get '/' do
+  settings.config_version # evaluated once per request
+end
+```
+
+Pinned settings may read other settings, including pinned ones; circular
+dependencies raise an error reporting the dependency chain. Access outside
+of a request (e.g. while the application boots) is still evaluated on
+every access, and settings are never cached unless pinned. If evaluating
+a pinned setting fails, the failure is not reused: the next access
+evaluates the setting again.
+
 ### Configuring attack protection
 
 Sinatra is using

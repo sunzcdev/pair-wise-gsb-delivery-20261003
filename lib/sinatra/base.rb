@@ -992,25 +992,27 @@ module Sinatra
     end
 
     def call!(env) # :nodoc:
-      @env      = env
-      @params   = IndifferentHash.new
-      @request  = Request.new(env)
-      @response = Response.new
-      @pinned_response = nil
-      template_cache.clear if settings.reload_templates
+      self.class.with_pinned_settings do
+        @env      = env
+        @params   = IndifferentHash.new
+        @request  = Request.new(env)
+        @response = Response.new
+        @pinned_response = nil
+        template_cache.clear if settings.reload_templates
 
-      invoke { dispatch! }
-      invoke { error_block!(response.status) } unless @env['sinatra.error']
+        invoke { dispatch! }
+        invoke { error_block!(response.status) } unless @env['sinatra.error']
 
-      unless @response['content-type']
-        if Array === body && body[0].respond_to?(:content_type)
-          content_type body[0].content_type
-        elsif (default = settings.default_content_type)
-          content_type default
+        unless @response['content-type']
+          if Array === body && body[0].respond_to?(:content_type)
+            content_type body[0].content_type
+          elsif (default = settings.default_content_type)
+            content_type default
+          end
         end
-      end
 
-      @response.finish
+        @response.finish
+      end
     end
 
     # Access settings defined with Base.set.
@@ -1300,6 +1302,10 @@ module Sinatra
         %r{zeitwerk/(core_ext/)?kernel\.rb}                 # Zeitwerk kernel#require decorator
       ].freeze
 
+      # Thread (fiber) local key holding the pinned settings store of the
+      # request currently being processed, if any. See pin_to_request.
+      PINNED_SETTINGS_STORE_KEY = :sinatra_pinned_settings_store
+
       attr_reader :routes, :filters, :templates, :errors, :on_start_callback, :on_stop_callback
 
       def callers_to_ignore
@@ -1381,6 +1387,7 @@ module Sinatra
         define_singleton("#{option}=", setter)
         define_singleton(option, getter)
         define_singleton("#{option}?", "!!#{option}") unless method_defined? "#{option}?"
+        wrap_pinned_setting(option.to_sym) if pinned_settings.include?(option.to_sym)
         self
       end
 
@@ -1392,6 +1399,38 @@ module Sinatra
       # Same as calling `set :option, false` for each of the given options.
       def disable(*opts)
         opts.each { |key| set(key, false) }
+      end
+
+      # Marks the given settings as pinned to the request. The value of a
+      # pinned setting is evaluated lazily on first access within a request
+      # and reused for the remainder of that request, so dynamic settings
+      # (such as a configuration version) stay consistent for the duration
+      # of a request. Pinned settings may read other settings, including
+      # pinned ones; circular dependencies raise an error reporting the
+      # dependency chain. Access outside of a request (e.g. while the
+      # application boots) keeps its own semantics and is evaluated every
+      # time, as with any other setting. Settings are not cached unless
+      # pinned with this method.
+      def pin_to_request(*options)
+        options.each do |option|
+          name = option.to_sym
+          raise ArgumentError, "cannot pin unknown setting: #{name}" unless respond_to? name
+
+          pinned = (@pinned_settings ||= [])
+          pinned << name unless pinned.include?(name)
+          wrap_pinned_setting(name)
+        end
+        self
+      end
+
+      # Settings pinned to the request with pin_to_request, including those
+      # inherited from superclasses.
+      def pinned_settings
+        if superclass.respond_to?(:pinned_settings)
+          (@pinned_settings ||= []) | superclass.pinned_settings
+        else
+          @pinned_settings ||= []
+        end
       end
 
       # Define a custom error handler. Optionally takes either an Exception
@@ -1679,6 +1718,20 @@ module Sinatra
         synchronize { prototype.call(env) }
       end
 
+      # Runs the block with a per-request store for pinned settings (see
+      # pin_to_request). Nested requests, such as a mounted Sinatra app
+      # called from another Sinatra app, reuse the enclosing store.
+      def with_pinned_settings(&block) # :nodoc:
+        return yield if pinned_settings.empty? || Thread.current[PINNED_SETTINGS_STORE_KEY]
+
+        Thread.current[PINNED_SETTINGS_STORE_KEY] = { values: {}, evaluating: [] }
+        begin
+          yield
+        ensure
+          Thread.current[PINNED_SETTINGS_STORE_KEY] = nil
+        end
+      end
+
       # Like Kernel#caller but excluding certain magic entries and without
       # line / method information; the resulting array contains filenames only.
       def caller_files
@@ -1731,6 +1784,40 @@ module Sinatra
         singleton_class.class_eval do
           undef_method(name) if method_defined? name
           String === content ? class_eval("def #{name}() #{content}; end") : define_method(name, &content)
+        end
+      end
+
+      # Wraps the getter of the given setting so its value is evaluated at
+      # most once per request. See pin_to_request.
+      def wrap_pinned_setting(name)
+        getter = singleton_class.instance_method(name)
+        wrapper = proc { evaluate_pinned_setting(name) { getter.bind(self).call } }
+        define_singleton(name, wrapper)
+      end
+
+      # Evaluates a pinned setting, reusing the result for the remainder of
+      # the current request. Outside of a request the setting is evaluated
+      # on every access. Failed evaluations are not reused: the setting is
+      # evaluated again on the next access.
+      def evaluate_pinned_setting(name)
+        store = Thread.current[PINNED_SETTINGS_STORE_KEY]
+        return yield unless store
+
+        key = [self, name]
+        values = store[:values]
+        evaluating = store[:evaluating]
+        return values[key] if values.key? key
+
+        if (position = evaluating.index(key))
+          chain = (evaluating[position..] + [key]).map { |(_, setting)| setting }.join(' -> ')
+          raise Error, "circular dependency detected between pinned settings: #{chain}"
+        end
+
+        evaluating << key
+        begin
+          values[key] = yield
+        ensure
+          evaluating.pop
         end
       end
 
@@ -2117,7 +2204,8 @@ module Sinatra
     delegate :get, :patch, :put, :post, :delete, :head, :options, :link, :unlink,
              :template, :layout, :before, :after, :error, :not_found, :configure,
              :set, :mime_type, :enable, :disable, :use, :development?, :test?,
-             :production?, :helpers, :settings, :register, :on_start, :on_stop
+             :production?, :helpers, :settings, :register, :on_start, :on_stop,
+             :pin_to_request
 
     class << self
       attr_accessor :target

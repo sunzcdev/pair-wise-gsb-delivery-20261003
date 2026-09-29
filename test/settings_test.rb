@@ -651,4 +651,188 @@ class SettingsTest < Minitest::Test
       end
     end
   end
+
+  describe 'pin_to_request' do
+    it 'evaluates a pinned setting once per request' do
+      count = 0
+      mock_app do
+        set(:version) { count += 1 }
+        pin_to_request :version
+        get('/') { [settings.version, settings.version, settings.version].join(',') }
+      end
+
+      get '/'
+      assert_body '1,1,1'
+      assert_equal 1, count
+
+      get '/'
+      assert_body '2,2,2'
+      assert_equal 2, count
+    end
+
+    it 'evaluates pinned settings on every access outside of a request' do
+      count = 0
+      @base.set(:version) { count += 1 }
+      @base.pin_to_request :version
+
+      assert_equal 1, @base.version
+      assert_equal 2, @base.version
+      assert_equal 2, count
+    end
+
+    it 'does not cache settings that are not pinned' do
+      count = 0
+      mock_app do
+        set(:version) { count += 1 }
+        get('/') { [settings.version, settings.version].join(',') }
+      end
+
+      get '/'
+      assert_body '1,2'
+      assert_equal 2, count
+    end
+
+    it 'raises an ArgumentError for unknown settings' do
+      assert_raises(ArgumentError) { @base.pin_to_request :unknown_setting }
+    end
+
+    it 'keeps settings pinned when they are set again' do
+      count = 0
+      mock_app do
+        set(:version) { count += 1 }
+        pin_to_request :version
+        set(:version) { count += 10 }
+        get('/') { [settings.version, settings.version].join(',') }
+      end
+
+      get '/'
+      assert_body '10,10'
+      assert_equal 10, count
+    end
+
+    it 'evaluates settings a pinned setting depends on only once per request' do
+      versions = 0
+      configs = 0
+      mock_app do
+        set(:version) { versions += 1 }
+        set(:config) { configs += 1; "config-#{version}" }
+        pin_to_request :version, :config
+        get('/') { [settings.config, settings.config, settings.version].join(',') }
+      end
+
+      get '/'
+      assert_body 'config-1,config-1,1'
+      assert_equal 1, versions
+      assert_equal 1, configs
+
+      get '/'
+      assert_body 'config-2,config-2,2'
+    end
+
+    it 'raises an error reporting the chain on circular dependencies' do
+      klass = Sinatra.new(Sinatra::Base)
+      klass.set(:first) { klass.second }
+      klass.set(:second) { klass.third }
+      klass.set(:third) { klass.first }
+      klass.pin_to_request :first, :second, :third
+
+      error = assert_raises(Sinatra::Error) do
+        klass.with_pinned_settings { klass.first }
+      end
+      assert_equal 'circular dependency detected between pinned settings: first -> second -> third -> first',
+                   error.message
+    end
+
+    it 'is inherited by subclasses' do
+      count = 0
+      parent = Sinatra.new(Sinatra::Base)
+      parent.set(:version) { count += 1 }
+      parent.pin_to_request :version
+
+      mock_app(parent) do
+        get('/') { [settings.version, settings.version].join(',') }
+      end
+
+      get '/'
+      assert_body '1,1'
+      assert_equal 1, count
+
+      get '/'
+      assert_body '2,2'
+      assert_equal 2, count
+    end
+
+    it 'memoizes pinned settings of apps mounted inside a request' do
+      sub_count = 0
+      sub = Sinatra.new(Sinatra::Base) do
+        set(:version) { sub_count += 1 }
+        pin_to_request :version
+        get('/') { [settings.version, settings.version].join(',') }
+      end
+
+      parent_count = 0
+      mock_app do
+        set(:version) { parent_count += 1 }
+        pin_to_request :version
+        get('/mounted') do
+          body = sub.call(env.merge('PATH_INFO' => '/')).last.each.to_a.join
+          "parent=#{settings.version},sub=#{body},parent=#{settings.version}"
+        end
+      end
+
+      get '/mounted'
+      assert_body 'parent=1,sub=1,1,parent=1'
+      assert_equal 1, parent_count
+      assert_equal 1, sub_count
+
+      get '/mounted'
+      assert_body 'parent=2,sub=2,2,parent=2'
+      assert_equal 2, parent_count
+      assert_equal 2, sub_count
+    end
+
+    it 'does not cache failed evaluations' do
+      count = 0
+      mock_app do
+        set(:version) { count += 1; raise 'boom' if count.odd?; count }
+        pin_to_request :version
+        get('/') do
+          first = begin
+            settings.version
+          rescue RuntimeError
+            'error'
+          end
+          "#{first},#{settings.version}"
+        end
+      end
+
+      get '/'
+      assert_body 'error,2'
+
+      get '/'
+      assert_body 'error,4'
+      assert_equal 4, count
+    end
+
+    it 'does not reuse values from a failed request' do
+      count = 0
+      mock_app do
+        enable :show_exceptions
+        set(:version) { count += 1 }
+        pin_to_request :version
+        get('/') do
+          raise 'boom' if settings.version == 1
+
+          "version=#{settings.version}"
+        end
+      end
+
+      get '/'
+      assert_equal 500, status
+
+      get '/'
+      assert_body 'version=2'
+      assert_equal 2, count
+    end
+  end
 end
