@@ -16,7 +16,7 @@ module Dentaku
         :*
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         cast(@node.value(context)) * -1
       end
 

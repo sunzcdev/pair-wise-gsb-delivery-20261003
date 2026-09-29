@@ -7,7 +7,7 @@ module Dentaku
         @node = node
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         @node.value(context)
       end
 

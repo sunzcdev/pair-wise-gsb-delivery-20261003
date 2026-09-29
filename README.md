@@ -429,6 +429,38 @@ c.evaluate('rrrrround!(8.2) + округлить(8.4)')
 # 16
 ```
 
+ERROR SOURCE LOCATIONS
+----------------------
+
+Every error Dentaku raises while tokenizing, parsing, or evaluating a
+formula carries the character range of the offending source in the
+*original* formula string, so a formula editor can highlight it.  Ranges
+are character offsets (exclusive end) and are unaffected by comment
+stripping, alias expansion, multibyte identifiers, escapes in string
+literals, or newlines:
+
+```ruby
+calculator = Dentaku::Calculator.new
+begin
+  calculator.evaluate!('1 + 10 / (5 - 5)')
+rescue Dentaku::Error => e
+  e.location #=> 4...16 -- '10 / (5 - 5)'
+  e.trace    #=> [4...16, 0...16] -- nested expressions, innermost first
+end
+```
+
+Errors raised inside a custom function are wrapped in
+`Dentaku::FunctionError`, which names the function and points at that
+specific call site without echoing the argument values (which may be
+sensitive); the original exception is available via `#original`:
+
+```ruby
+calculator.add_function(:flaky, :numeric, ->(x) { raise 'boom' })
+calculator.evaluate!('flaky(1) + flaky(1)')
+#=> Dentaku::FunctionError: Error in function `flaky` (RuntimeError)
+#   with e.location == 11...19, selecting the second `flaky(1)` call
+```
+
 THANKS
 ------
 

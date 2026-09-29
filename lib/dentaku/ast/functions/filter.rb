@@ -3,7 +3,7 @@ require_relative './enum'
 module Dentaku
   module AST
     class Filter < Enum
-      def value(context = {})
+      def evaluate(context = {})
         collection      = Array(@args[0].value(context))
         item_identifier = @args[1].identifier
         expression      = @args[2]

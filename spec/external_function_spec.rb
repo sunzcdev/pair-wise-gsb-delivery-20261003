@@ -98,7 +98,11 @@ describe Dentaku::Calculator do
 
       it 'includes REVERSE' do
         expect(custom_calculator.evaluate('REVERSE(\'Dentaku\')')).to eq('ukatneD')
-        expect { custom_calculator.evaluate('REVERSE(22)') }.to raise_error(NoMethodError)
+        expect { custom_calculator.evaluate!('REVERSE(22)') }.to raise_error(Dentaku::FunctionError) { |error|
+          expect(error.message).to include('reverse')
+          expect(error.message).not_to include('22')
+          expect(error.original).to be_a(NoMethodError)
+        }
         expect(@counts["Dentaku"]).to eq(1)
       end
 

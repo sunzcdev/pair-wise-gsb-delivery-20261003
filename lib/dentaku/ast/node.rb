@@ -7,6 +7,23 @@ module Dentaku
       STATIC_MODE_KEY = "__static_dependencies".freeze
       STATIC_CONTEXT = { STATIC_MODE_KEY => true }.freeze
 
+      # Range of character offsets (exclusive end) into the original formula
+      # string that this node was parsed from; nil for synthetic nodes
+      attr_writer :location
+
+      def location
+        @location
+      end
+
+      # evaluates this node, annotating any Dentaku error with the source
+      # locations of the whole chain of enclosing expressions
+      def value(context = {})
+        evaluate(context)
+      rescue Dentaku::Error => e
+        e.record_trace(self)
+        raise
+      end
+
       def self.precedence
         0
       end

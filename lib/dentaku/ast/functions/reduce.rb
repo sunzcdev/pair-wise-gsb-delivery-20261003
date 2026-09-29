@@ -35,7 +35,7 @@ module Dentaku
         collection_deps + expression_deps + inital_value_deps
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         collection      = Array(@args[0].value(context))
         memo_identifier = @args[1].identifier
         item_identifier = @args[2].identifier

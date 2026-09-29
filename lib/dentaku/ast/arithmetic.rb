@@ -28,7 +28,7 @@ module Dentaku
         raise NotImplementedError
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         calculate(left.value(context), right.value(context))
       end
 
@@ -153,7 +153,7 @@ module Dentaku
         10
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         left_value = left.value(context)
         right_value = right.value(context)
 
@@ -174,7 +174,7 @@ module Dentaku
         10
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         left_value = left.value(context)
         right_value = right.value(context)
 
@@ -201,7 +201,7 @@ module Dentaku
         :/
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         r = decimal(cast(right.value(context)))
         raise Dentaku::ZeroDivisionError if r.zero?
 
@@ -230,7 +230,7 @@ module Dentaku
         :%
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         r = decimal(cast(right.value(context)))
         raise Dentaku::ZeroDivisionError if r.zero?
 
@@ -256,7 +256,7 @@ module Dentaku
         @left.dependencies(context)
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         cast(left.value(context)) * 0.01
       end
 

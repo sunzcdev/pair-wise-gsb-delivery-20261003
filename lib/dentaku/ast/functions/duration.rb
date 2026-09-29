@@ -35,7 +35,7 @@ module Dentaku
         :duration
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         value_node, unit_node = *@args
         Value.new(value_node.value(context), unit_node.identifier)
       end

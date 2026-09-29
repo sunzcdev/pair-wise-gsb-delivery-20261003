@@ -38,6 +38,9 @@ module Dentaku
       @function_registry = options.fetch(:function_registry, nil)
       @case_sensitive    = options.fetch(:case_sensitive, false)
       @skip_indices      = []
+      @function_tokens   = []
+      @grouping_tokens   = []
+      @last_token        = nil
     end
 
     def consume(count = 2)
@@ -66,7 +69,9 @@ module Dentaku
       else
         fail! :invalid_statement if output_size < args_size
         args = Array.new(args_size) { output.pop }.reverse
-        output.push operation.new(*args)
+        node = operation.new(*args)
+        node.location = node_location(operation, args)
+        output.push node
       end
 
       if operation.respond_to?(:callback) && !operation.callback.nil?
@@ -74,9 +79,17 @@ module Dentaku
       end
     rescue ::ArgumentError => e
       raise if e.is_a?(Dentaku::ArgumentError)
-      raise Dentaku::ArgumentError.for(:invalid_value), e.message
+      error = Dentaku::ArgumentError.for(:invalid_value)
+      error.location ||= span_location(args)
+      raise error, e.message
+    rescue ParseError => e
+      e.location ||= span_location(args)
+      raise
     rescue NodeError => e
-      raise ParseError.for(:node_invalid, operation: operation, operand: e.operand, expected: e.expected, actual: e.actual), e.message
+      offending = e.operand == :left ? args.first : args.last
+      error = ParseError.for(:node_invalid, operation: operation, operand: e.operand, expected: e.expected, actual: e.actual)
+      error.location ||= offending && offending.location
+      raise error, e.message
     end
 
     def parse
@@ -91,6 +104,7 @@ module Dentaku
 
         token = input[i]
         lookahead = input[i + 1]
+        @last_token = token
         process_token(token, lookahead, i)
         i += 1
       end
@@ -154,9 +168,10 @@ module Dentaku
 
     def handle_function(token)
       func = function(token)
-      fail! :undefined_function, function_name: token.value if func.nil?
+      fail! :undefined_function, function_name: token.value, token: token if func.nil?
       arities.push 0
       operations.push func
+      @function_tokens.push(token)
     end
 
     def handle_case(token)
@@ -265,16 +280,22 @@ module Dentaku
           @skip_indices << token_index + 1
           arities.pop
           consume(0)
+          extend_location(output.last, lookahead)
         else
           operations.push AST::Grouping
+          @grouping_tokens.push(token)
         end
 
       when :close
         consume while operations.any? && operations.last != AST::Grouping
         lparen = operations.pop
         fail! :unbalanced_parenthesis, token: token unless lparen == AST::Grouping
+        open_token = @grouping_tokens.pop
         if operations.last && operations.last < AST::Function
           consume(arities.pop.succ)
+          extend_location(output.last, token)
+        else
+          extend_location(output.last, token, open_token)
         end
 
       when :comma
@@ -287,8 +308,37 @@ module Dentaku
       end
     end
 
+    # source range for a freshly built node: functions span from their name
+    # token, everything else spans its operands
+    def node_location(operation, args)
+      if operation.is_a?(Class) && operation <= AST::Function
+        token = @function_tokens.pop
+        start = token && token.location && token.location.begin
+        finish = args.last && args.last.location && args.last.location.end
+        start && finish ? start...finish : (token && token.location)
+      else
+        span_location(args)
+      end
+    end
+
+    def span_location(args)
+      first = args.first && args.first.location
+      last = args.last && args.last.location
+      first && last ? first.begin...last.end : first
+    end
+
+    def extend_location(node, token, start_token = nil)
+      return unless node && node.location && token && token.location
+
+      start = start_token && start_token.location ? start_token.location.begin : node.location.begin
+      node.location = start...token.location.end
+    end
+
     def fail!(reason, **meta)
-      raise ParseError.for(reason, **meta)
+      error = ParseError.for(reason, **meta)
+      error.location ||= meta[:token] && meta[:token].location
+      error.location ||= @last_token && @last_token.location
+      raise error
     end
   end
 end

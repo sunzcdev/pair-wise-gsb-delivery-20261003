@@ -12,7 +12,7 @@ module Dentaku
         3
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         collection = Array(@args[0].value(context))
 
         unless collection.all? { |elem| elem.is_a?(Hash) }

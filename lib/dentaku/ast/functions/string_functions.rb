@@ -30,7 +30,7 @@ module Dentaku
           @string, @length = *@args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           string = @string.value(context).to_s
           length = Dentaku::NumericParser.ensure_numeric!(@length.value(context)).to_i
           negative_argument_failure('LEFT') if length < 0
@@ -52,7 +52,7 @@ module Dentaku
           @string, @length = *@args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           string = @string.value(context).to_s
           length = Dentaku::NumericParser.ensure_numeric!(@length.value(context)).to_i
           negative_argument_failure('RIGHT') if length < 0
@@ -74,7 +74,7 @@ module Dentaku
           @string, @offset, @length = *@args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           string = @string.value(context).to_s
           offset = Dentaku::NumericParser.ensure_numeric!(@offset.value(context)).to_i
           negative_argument_failure('MID', 'offset') if offset < 0
@@ -98,7 +98,7 @@ module Dentaku
           @string = @args[0]
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           string = @string.value(context).to_s
           string.length
         end
@@ -122,7 +122,7 @@ module Dentaku
           @needle, @haystack = *@args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           needle = @needle.value(context)
           needle = needle.to_s unless needle.is_a?(Regexp)
           haystack = @haystack.value(context).to_s
@@ -149,7 +149,7 @@ module Dentaku
           @original, @search, @replacement = *@args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           original = @original.value(context).to_s
           search = @search.value(context)
           search = search.to_s unless search.is_a?(Regexp)
@@ -171,7 +171,7 @@ module Dentaku
           super
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           @args.map { |arg| arg.value(context).to_s }.join
         end
       end
@@ -190,7 +190,7 @@ module Dentaku
           @needle, @haystack = *args
         end
 
-        def value(context = {})
+        def evaluate(context = {})
           @haystack.value(context).to_s.include? @needle.value(context).to_s
         end
 

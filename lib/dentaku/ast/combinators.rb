@@ -34,7 +34,7 @@ module Dentaku
         super
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         left_value = begin
           left.value(context)
         rescue UnboundVariableError => unbound

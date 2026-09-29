@@ -1,5 +1,19 @@
 # Change Log
 
+## Unreleased
+- all Dentaku errors now carry the character range of the offending source
+  in the original formula string. Tokenizer, parser, and evaluation errors
+  respond to `#location` (a `start...end` character-offset range suitable
+  for slicing the formula), and evaluation errors additionally respond to
+  `#trace` with the source ranges of the whole chain of nested expressions,
+  innermost first. Positions stay correct through comment stripping, alias
+  expansion, multibyte (e.g. Chinese) identifiers, escapes in string
+  literals, and multi-line formulas. Errors raised by user-registered
+  functions are wrapped in `Dentaku::FunctionError`, which names the
+  function and points at the exact call site without echoing argument
+  values (which may be sensitive); the original exception remains
+  available via `#original`/`#cause`.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

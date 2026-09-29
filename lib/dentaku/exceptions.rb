@@ -3,7 +3,21 @@ module Dentaku
   # everything the gem raises, including exceptions that subclass Ruby
   # built-ins (Dentaku::ArgumentError, Dentaku::ZeroDivisionError).
   module Error
-    attr_accessor :assigned_to
+    attr_accessor :assigned_to, :location
+
+    # source ranges of the nested expressions that were being evaluated when
+    # this error was raised, innermost first
+    def trace
+      @trace ||= []
+    end
+
+    # called by AST::Node#value as the error propagates up the tree so the
+    # error ends up with the full chain of enclosing expression locations
+    def record_trace(node)
+      @location ||= node.location
+      trace << node.location if node.location
+      self
+    end
   end
 
   class BaseError < StandardError
@@ -34,6 +48,28 @@ module Dentaku
       @expected = Array(expected)
       @actual = actual
       @operand = operand
+    end
+  end
+
+  # Raised when a custom (user-registered) function fails while being called.
+  # The message deliberately names only the function and the original error
+  # class: argument values may be sensitive and must not leak into the error
+  # result. The original exception is available via #original (and #cause).
+  class FunctionError < BaseError
+    attr_reader :function_name, :original
+
+    def initialize(function_name, original = nil)
+      @function_name = function_name
+      @original = original
+      super(default_message)
+    end
+
+    private
+
+    def default_message
+      message = "Error in function `#{function_name}`"
+      message += " (#{original.class})" if original
+      message
     end
   end
 

@@ -41,7 +41,7 @@ module Dentaku
         raise Dentaku::MathDomainError.new(name, args)
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         args = @args.flatten.map { |a|Dentaku::NumericParser.ensure_numeric!(a.value(context)) }
         self.class.call(*args)
       end

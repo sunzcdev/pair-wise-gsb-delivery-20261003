@@ -23,7 +23,7 @@ module Dentaku
         @index = index
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         structure = @structure.value(context)
         index = @index.value(context)
 

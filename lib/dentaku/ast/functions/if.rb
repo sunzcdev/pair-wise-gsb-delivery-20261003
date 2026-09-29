@@ -23,7 +23,7 @@ module Dentaku
         [predicate, left, right]
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         predicate.value(context) ? left.value(context) : right.value(context)
       end
 

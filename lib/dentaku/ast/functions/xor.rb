@@ -12,7 +12,7 @@ module Dentaku
         Float::INFINITY
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         if @args.empty?
           raise Dentaku::ArgumentError.for(
             :too_few_arguments,

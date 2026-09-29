@@ -3,7 +3,7 @@ require_relative './operation'
 module Dentaku
   module AST
     class Bitwise < Operation
-      def value(context = {})
+      def evaluate(context = {})
         left_value = left.value(context)
         right_value = right.value(context)
 

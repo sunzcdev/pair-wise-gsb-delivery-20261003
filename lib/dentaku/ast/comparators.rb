@@ -15,7 +15,7 @@ module Dentaku
         raise NotImplementedError
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         l = validate_value(cast(left.value(context)))
         r = validate_value(cast(right.value(context)))
 

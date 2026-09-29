@@ -1,5 +1,8 @@
 module Dentaku
   class Token
+    # location is a Range of character offsets (exclusive end) into the
+    # original, unrewritten formula string
+    attr_accessor :location
     attr_reader :category, :raw_value, :value
 
     def initialize(category, value, raw_value = nil)

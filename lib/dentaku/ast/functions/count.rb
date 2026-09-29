@@ -11,7 +11,7 @@ module Dentaku
         Float::INFINITY
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         if @args.length == 1
           first_arg = @args[0].value(context)
           return first_arg.length if first_arg.respond_to?(:length)

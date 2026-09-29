@@ -18,7 +18,7 @@ module Dentaku
         @elements = *elements
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         @elements.map { |el| el.value(context) }
       end
 

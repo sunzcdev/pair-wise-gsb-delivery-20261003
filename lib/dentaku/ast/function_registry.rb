@@ -1,3 +1,5 @@
+require_relative '../exceptions'
+
 module Dentaku
   module AST
     class FunctionRegistry < Hash
@@ -77,9 +79,16 @@ module Dentaku
             @implementation.parameters.select { |type, _name| type == :rest }.any? ? Float::INFINITY : @implementation.parameters.count
           end
 
-          def value(context = {})
+          # Non-Dentaku errors raised by the user's implementation are
+          # wrapped in a FunctionError that names the function being called
+          # without echoing the argument values, which may be sensitive.
+          def evaluate(context = {})
             args = @args.map { |a| a.value(context) }
             self.class.implementation.call(*args)
+          rescue Dentaku::Error
+            raise
+          rescue ::StandardError => e
+            raise Dentaku::FunctionError.new(self.class.name, e)
           end
 
           def type

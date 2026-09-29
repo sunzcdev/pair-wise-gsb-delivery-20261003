@@ -10,9 +10,10 @@ module Dentaku
       def initialize(token, options = {})
         @case_sensitive = options.fetch(:case_sensitive, false)
         @identifier = standardize_case(token.value)
+        @location = token.location
       end
 
-      def value(context = {})
+      def evaluate(context = {})
         v = context.fetch(identifier) do
           raise UnboundVariableError.new([identifier]),
                 "no value provided for variables: #{identifier}"
