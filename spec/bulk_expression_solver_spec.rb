@@ -283,4 +283,100 @@ RSpec.describe Dentaku::BulkExpressionSolver do
       expect(results).to eq(a: :undefined, b: :undefined)
     end
   end
+
+  describe "cycle diagnostics" do
+    let(:expressions) do
+      {
+        alpha:   "beta + 1",
+        beta:    "alpha + 1",
+        gamma:   "delta * 2",
+        delta:   "gamma - 1",
+        stuck:   "alpha + gamma",
+        base:    "10",
+        doubled: "base * 2"
+      }
+    end
+
+    it "reports every independent cycle group and blocked formula while solving the rest" do
+      exceptions = []
+      result = described_class.new(expressions, calculator).solve do |ex|
+        exceptions << ex
+        :undefined
+      end
+
+      expect(result).to eq(
+        alpha:   :undefined,
+        beta:    :undefined,
+        gamma:   :undefined,
+        delta:   :undefined,
+        stuck:   :undefined,
+        base:    10,
+        doubled: 20
+      )
+
+      expect(exceptions).to all(be_a(Dentaku::CyclicDependencyError))
+      expect(exceptions.map(&:assigned_to)).to match_array(
+        %w[alpha beta gamma delta stuck]
+      )
+
+      error = exceptions.first
+      expect(error.cycles).to eq([["alpha", "beta"], ["delta", "gamma"]])
+      expect(error.blocked).to eq(["stuck"])
+      expect(error.message).to include("alpha -> beta -> alpha")
+      expect(error.message).to include("delta -> gamma -> delta")
+      expect(error.message).to include("stuck")
+    end
+
+    it "raises a single error listing all cycles and blocked formulas in strict mode" do
+      expect {
+        described_class.new(expressions, calculator).solve!
+      }.to raise_error(Dentaku::CyclicDependencyError) { |ex|
+        expect(ex.cycles).to eq([["alpha", "beta"], ["delta", "gamma"]])
+        expect(ex.blocked).to eq(["stuck"])
+      }
+    end
+
+    it "remains a TSort::Cyclic for backwards compatibility" do
+      expect {
+        described_class.new(expressions, calculator).solve!
+      }.to raise_error(TSort::Cyclic)
+    end
+
+    it "groups variables whose names differ only by case" do
+      expressions = {Alpha: "BETA + 1", BETA: "alpha + 1", fine: "5"}
+      error = nil
+      result = described_class.new(expressions, calculator).solve do |ex|
+        error ||= ex
+        :undefined
+      end
+
+      expect(result).to eq(Alpha: :undefined, BETA: :undefined, fine: 5)
+      expect(error.cycles).to eq([["Alpha", "BETA"]])
+      expect(error.blocked).to eq([])
+    end
+
+    it "does not mistake same-named external inputs for formula nodes" do
+      calculator.store(count: 4, limit: 5)
+      expressions = {
+        count:   "count + 1",
+        summary: "limit * 2"
+      }
+
+      result = described_class.new(expressions, calculator).solve
+      expect(result).to eq(count: 5, summary: 10)
+    end
+
+    it "honours the error handler's return value for cyclic and blocked variables" do
+      result = described_class.new(expressions, calculator).solve { :nope }
+      expect(result).to eq(
+        alpha:   :nope,
+        beta:    :nope,
+        gamma:   :nope,
+        delta:   :nope,
+        stuck:   :nope,
+        base:    10,
+        doubled: 20
+      )
+    end
+  end
 end

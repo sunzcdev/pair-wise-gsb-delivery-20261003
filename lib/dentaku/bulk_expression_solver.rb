@@ -96,7 +96,13 @@ module Dentaku
 
       context = calculator.memory.merge(evaluated_facts)
 
-      variables_in_resolve_order.each_with_object({}) do |var_name, results|
+      deps = dependencies
+      cycles = DependencyResolver.find_cycles(deps, calculator.case_sensitive)
+      blocked = cycles.any? ? blocked_variables(deps, cycles.flatten) : []
+
+      results = report_cycles(cycles, blocked, &block)
+
+      variables_in_resolve_order(deps, cycles.flatten + blocked).each do |var_name|
         next if expressions[var_name].nil?
 
         with_rescues(var_name, results, block) do
@@ -111,9 +117,51 @@ module Dentaku
         end
       end
 
-    rescue TSort::Cyclic => ex
-      block.call(ex)
-      {}
+      results
+    end
+
+    # one diagnostic error listing every cycle group is shared by all
+    # affected variables, so a single solve surfaces all loops at once
+    # instead of only the first one TSort happens to hit
+    def report_cycles(cycles, blocked, &block)
+      unsolvable = cycles.flatten + blocked
+      return {} if unsolvable.empty?
+
+      error = CyclicDependencyError.new(cycles, blocked: blocked)
+      unsolvable.each_with_object({}) do |var_name, results|
+        next unless expressions.key?(var_name)
+
+        ex = error.dup
+        ex.assigned_to = var_name
+        results[var_name] = block.call(ex)
+      end
+    end
+
+    # variables that are not part of a cycle themselves but can never be
+    # evaluated because they (transitively) depend on one
+    def blocked_variables(deps, cyclic_vars)
+      normalized_keys = Hash[deps.keys.map { |k| [normalized_name(k), k] }]
+      seen = {}
+      cyclic_vars.each { |v| seen[normalized_name(v)] = true }
+
+      reverse_deps = Hash.new { |h, k| h[k] = [] }
+      deps.each do |var, var_deps|
+        var_deps.each { |d| reverse_deps[normalized_name(d)] << normalized_name(var) }
+      end
+
+      blocked = []
+      queue = seen.keys
+      until queue.empty?
+        reverse_deps[queue.shift].each do |dependent|
+          next if seen[dependent]
+
+          seen[dependent] = true
+          blocked << dependent
+          queue << dependent
+        end
+      end
+
+      blocked.map { |b| normalized_keys.fetch(b, b) }.sort
     end
 
     def with_rescues(var_name, results, block)
@@ -152,10 +200,15 @@ module Dentaku
       end
     end
 
-    def variables_in_resolve_order
+    def variables_in_resolve_order(deps = dependencies, exclude = [])
+      unless exclude.empty?
+        solvable = deps.reject { |k, _| exclude.include?(k) }
+        return DependencyResolver.find_resolve_order(solvable, calculator.case_sensitive)
+      end
+
       cache_key = "#{!!calculator.case_sensitive}|#{expressions.keys.map(&:to_s).sort.join("|")}"
       @ordered_deps ||= self.class.dependency_cache.fetch(cache_key) {
-        DependencyResolver.find_resolve_order(dependencies, calculator.case_sensitive).tap do |d|
+        DependencyResolver.find_resolve_order(deps, calculator.case_sensitive).tap do |d|
           self.class.dependency_cache[cache_key] = d if calculator.cache_dependency_order?
         end
       }

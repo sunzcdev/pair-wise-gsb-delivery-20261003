@@ -1,5 +1,15 @@
 # Change Log
 
+## Unreleased
+- bulk solving now reports every circular reference at once instead of
+  failing on the first one `TSort` happens to hit. `Calculator#solve!` raises
+  the new `Dentaku::CyclicDependencyError` (still a `TSort::Cyclic`), which
+  carries `cycles` (each independent cycle group) and `blocked` (formulas
+  that cannot be evaluated because they depend on a cycle). The non-bang
+  `Calculator#solve` reports the same error per affected variable through its
+  handler and still returns results for the unaffected formulas instead of
+  `:undefined` for everything.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized
