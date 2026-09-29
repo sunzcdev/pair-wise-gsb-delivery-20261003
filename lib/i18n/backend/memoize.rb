@@ -37,17 +37,30 @@ module I18n
         def lookup(locale, key, scope = nil, options = EMPTY_HASH)
           flat_key  = I18n::Backend::Flatten.normalize_flat_keys(locale,
             key, scope, options[:separator]).to_sym
-          flat_hash = memoized_lookup[locale.to_sym]
+          flat_hash = memoized_lookup[memoize_catalog_version][locale.to_sym]
           flat_hash.key?(flat_key) ? flat_hash[flat_key] : (flat_hash[flat_key] = super)
         end
 
         def memoized_lookup
-          @memoized_lookup ||= I18n.new_double_nested_cache
+          @memoized_lookup ||= Concurrent::Map.new do |versions, version|
+            versions[version] = I18n.new_double_nested_cache
+          end
+        end
+
+        # Backends that expose versioned catalogs (e.g. Simple) memoize
+        # lookups per catalog version, so entries computed from one published
+        # version are never served for another version.
+        def memoize_catalog_version
+          respond_to?(:catalog_version) ? catalog_version : nil
         end
 
         def reset_memoizations!(locale=nil)
           @memoized_locales = nil
-          (locale ? memoized_lookup[locale.to_sym] : memoized_lookup).clear
+          if locale
+            memoized_lookup.each_pair { |_version, locales| locales[locale.to_sym].clear }
+          else
+            memoized_lookup.clear
+          end
         end
     end
   end

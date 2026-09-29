@@ -78,7 +78,16 @@ module I18n
     # TODO Should the cache be cleared if new translations are stored?
     module Cache
       def translate(locale, key, options = EMPTY_HASH)
-        I18n.perform_caching? ? fetch(cache_key(locale, key, options)) { super } : super
+        return super unless I18n.perform_caching?
+
+        # Backends with versioned catalogs (e.g. Simple) pin the catalog
+        # version around the whole translation, so the cache key and the
+        # computed value always belong to the same catalog version.
+        if respond_to?(:with_pinned_catalog, true)
+          with_pinned_catalog { fetch(cache_key(locale, key, options)) { super } }
+        else
+          fetch(cache_key(locale, key, options)) { super }
+        end
       end
 
       protected
@@ -100,7 +109,12 @@ module I18n
 
         def cache_key(locale, key, options)
           # This assumes that only simple, native Ruby values are passed to I18n.translate.
-          "i18n/#{I18n.cache_namespace}/#{locale}/#{digest_item(key)}/#{digest_item(options)}"
+          segments = ['i18n', I18n.cache_namespace]
+          # Distinguish catalog versions so that entries cached for one
+          # published version are never served for another version.
+          segments << catalog_version if respond_to?(:catalog_version)
+          segments += [locale, digest_item(key), digest_item(options)]
+          segments.join('/')
         end
 
       private

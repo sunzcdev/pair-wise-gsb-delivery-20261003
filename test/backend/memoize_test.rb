@@ -77,7 +77,8 @@ class I18nBackendMemoizeTest < I18nBackendSimpleTest
 
     memoized_lookup = backend.send(:memoized_lookup)
     puts memoized_lookup.inspect if $VERBOSE
-    assert_equal 3, memoized_lookup.size, "NON-THREAD-SAFE lookup memoization backend: #{memoized_lookup.class}"
+    locales_count = memoized_lookup.each_pair.inject(0) { |sum, (_version, locales)| sum + locales.size }
+    assert_equal 3, locales_count, "NON-THREAD-SAFE lookup memoization backend: #{memoized_lookup.class}"
     # if a plain Hash is used might eventually end up in a weird (inconsistent) state
   end
 
