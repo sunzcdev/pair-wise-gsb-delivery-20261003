@@ -218,6 +218,34 @@ String: `LEFT`, `RIGHT`, `MID`, `LEN`, `FIND`, `SUBSTITUTE`, `CONCAT`, `CONTAINS
 
 Collection: `MAP`, `FILTER`, `ALL`, `ANY`, `PLUCK`
 
+Bindings: `LET`
+
+LOCAL BINDINGS
+--------------
+
+When a complex formula repeats the same subexpression, `LET` gives it a
+local name: `LET(name1, value1, name2, value2, ..., body)` binds each name
+to its value and evaluates `body` as the result.
+
+```ruby
+calculator.evaluate('LET(d, SQRT(a^2 + b^2), d + 1 / d)', a: 3, b: 4)
+#=> 5.2
+```
+
+The semantics are deterministic:
+
+* Bindings are evaluated strictly left to right, so a value expression may
+  reference names bound before it, but never names bound after it.  A name
+  that is not yet bound locally resolves against the outer scope (and is
+  reported as unbound if it is missing there, too).
+* Rebinding a name shadows the earlier binding, and a local binding shadows
+  an external variable of the same name -- but only inside the `LET`.
+* `LET` expressions nest, and inner bindings shadow outer ones.
+* Local bindings live in a private copy of the evaluation context.  They are
+  never written back to the calculator's memory, even when the body raises.
+* Dependency analysis (`dependencies` and `identifiers`) excludes local
+  bindings and only reports names the expression still needs from outside.
+
 RESOLVING DEPENDENCIES
 ----------------------
 
