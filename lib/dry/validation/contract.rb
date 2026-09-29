@@ -101,7 +101,7 @@ module Dry
           rules.each do |rule|
             next if rule.keys.any? { |key| error?(result, key) }
 
-            rule_result = rule.(self, result)
+            rule_result = call_rule(rule, result)
 
             rule_result.failures.each do |failure|
               result.add_error(message_resolver.(**failure))
@@ -121,6 +121,58 @@ module Dry
       end
 
       private
+
+      # Apply a single rule, optionally isolating its context writes
+      #
+      # When `config.transactional_context` is enabled, the rule runs against
+      # a detached copy of the committed context. Its writes (including key
+      # deletions and nested hash/array mutations) are merged back only when
+      # the rule succeeds; on failure or exception they are discarded.
+      #
+      # @api private
+      def call_rule(rule, result)
+        return rule.(self, result) unless config.transactional_context
+
+        working_context = detach_context(result.context)
+        rule_result = rule.(self, result, context: working_context)
+
+        merge_context(result.context, working_context) if rule_result.failures.empty?
+
+        rule_result
+      end
+
+      # Build a detached copy of the context with deeply duplicated
+      # hash/array containers, so in-progress writes stay isolated
+      #
+      # @api private
+      def detach_context(context)
+        ::Concurrent::Map.new.tap do |map|
+          context.each { |key, value| map[key] = detach_context_value(value) }
+        end
+      end
+
+      # @api private
+      def detach_context_value(value)
+        case value
+        when ::Concurrent::Map
+          detach_context(value)
+        when ::Hash
+          value.each_with_object(value.class.new) { |(k, v), copy| copy[k] = detach_context_value(v) }
+        when ::Array
+          value.map { |element| detach_context_value(element) }
+        else
+          value
+        end
+      end
+
+      # Merge the working context back into the committed one
+      #
+      # @api private
+      def merge_context(context, working_context)
+        context.keys.each { |key| context.delete(key) unless working_context.key?(key) }
+        working_context.each { |key, value| context[key] = value }
+        context
+      end
 
       # @api private
       def error?(result, spec)

@@ -7,6 +7,12 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Optional transactional rule context via `config.transactional_context = true`. Each rule
+  runs against a detached copy of the committed context and its writes (including key
+  deletions and nested hash/array mutations) are merged back only when the rule succeeds;
+  on failure or exception the rule's writes are discarded
 
 ## [1.11.1] - 2025-01-21
 

@@ -110,10 +110,10 @@ module Dry
       #
       # @api private
       def failures
-        @failures ||= []
-        @failures += @base.opts if defined?(@base)
-        @failures.concat(@key.values.flat_map(&:opts)) if defined?(@key)
-        @failures
+        @failures ||= [].tap do |failures|
+          failures.concat(@base.opts) if defined?(@base)
+          failures.concat(@key.values.flat_map(&:opts)) if defined?(@key)
+        end
       end
 
       # @api private

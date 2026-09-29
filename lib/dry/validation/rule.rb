@@ -29,9 +29,10 @@ module Dry
       #
       # @param [Contract] contract
       # @param [Result] result
+      # @param [Concurrent::Map] context
       #
       # @api private
-      def call(contract, result)
+      def call(contract, result, context: result.context)
         Evaluator.new(
           contract,
           keys: keys,
@@ -39,7 +40,7 @@ module Dry
           block_options: block_options,
           result: result,
           values: result.values,
-          _context: result.context,
+          _context: context,
           &block
         )
       end

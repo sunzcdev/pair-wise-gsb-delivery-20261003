@@ -10,6 +10,12 @@ module Dry
     class Config < Schema::Config
       setting :macros, default: Macros::Container.new, constructor: :dup.to_proc
 
+      # When enabled, each rule runs against an isolated copy of the context
+      # and its writes are merged back only if the rule succeeds
+      #
+      # @api public
+      setting :transactional_context, default: false
+
       # @api private
       def dup
         config = super
