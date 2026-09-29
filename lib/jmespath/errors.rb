@@ -15,5 +15,7 @@ module JMESPath
     class InvalidArityError < Error; end
 
     class UnknownFunctionError < Error; end
+
+    class MaterializationError < Error; end
   end
 end

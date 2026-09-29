@@ -10,6 +10,7 @@ module JMESPath
   require 'jmespath/nodes'
   require 'jmespath/parser'
   require 'jmespath/runtime'
+  require 'jmespath/streaming'
   require 'jmespath/token'
   require 'jmespath/token_stream'
   require 'jmespath/util'
@@ -34,6 +35,17 @@ module JMESPath
     # @api private
     def load_json(path)
       JSON.parse(File.open(path, 'r', encoding: 'UTF-8', &:read))
+    end
+
+    # @param [String] expression A valid
+    #   [JMESPath](https://github.com/boto/jmespath) expression.
+    # @param [#next,#each] source A read-only array source. See
+    #   {Streaming} for the source protocol.
+    # @return [Streaming::Stream] Returns a lazy, single-pass
+    #   `Enumerable` of matched values, produced as the source is
+    #   pulled.
+    def stream(expression, source, runtime_options = {})
+      Runtime.new(runtime_options).stream(expression, source)
     end
   end
 end

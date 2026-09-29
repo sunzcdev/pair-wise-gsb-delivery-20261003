@@ -40,6 +40,9 @@ module JMESPath
         @children = children
       end
 
+      # @api private
+      attr_reader :children
+
       def visit(value)
         @children.reduce(value) do |v, child|
           child.visit(v)

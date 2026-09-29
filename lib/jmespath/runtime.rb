@@ -40,10 +40,18 @@ module JMESPath
     #   will still be raised, but unexpected data sent to visit will
     #   result in nil being returned.
     #
+    # @option options [Boolean] :allow_materialization (true) Used by
+    #   {#stream}. When `false`, expressions that cannot be evaluated
+    #   incrementally (e.g. `sort`, negative indices) are rejected with
+    #   {Errors::MaterializationError} before the source is consumed.
+    #   When `true`, the source is materialized into an array for such
+    #   expressions.
+    #
     # @option options [Parser,CachingParser] :parser
     #
     def initialize(options = {})
       @parser = options[:parser] || default_parser(options)
+      @allow_materialization = options.fetch(:allow_materialization, true)
     end
 
     # @return [Parser, CachingParser]
@@ -55,6 +63,23 @@ module JMESPath
     def search(expression, data)
       optimized_expression = @parser.parse(expression).optimize
       optimized_expression.visit(data)
+    end
+
+    # Streams the results of a JMESPath expression over a read-only
+    # array source, pulling elements from the source on demand. See
+    # {Streaming} for the source protocol and the set of nodes that can
+    # be evaluated incrementally.
+    #
+    # @param [String<JMESPath>] expression
+    # @param [#next,#each] source A read-only array source.
+    # @return [Streaming::Stream] A lazy, single-pass `Enumerable` of
+    #   results.
+    def stream(expression, source)
+      optimized_expression = @parser.parse(expression).optimize
+      Streaming.stream(
+        optimized_expression, source,
+        allow_materialization: @allow_materialization
+      )
     end
 
     private

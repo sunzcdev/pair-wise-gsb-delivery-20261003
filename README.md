@@ -70,6 +70,36 @@ File.open('/path/to/data.json', 'r', encoding:'UTF-8') do |file|
 end
 ```
 
+## Streaming
+
+In addition to searching fully loaded Ruby objects, `JMESPath.stream` can
+evaluate expressions over a read-only array source, pulling elements on
+demand. Filters and projections produce results as data is read, so
+consumers can stop early without traversing the rest of the source.
+
+A source is any object that responds to `next` (raising `StopIteration`
+when exhausted, like an `Enumerator`) or to `each`. If the source responds
+to `close`, it is closed exactly once when the stream is fully consumed,
+abandoned early, or raises an error.
+
+```ruby
+source = MyRecordSource.new # responds to #next and #close
+stream = JMESPath.stream('[?state == `"open"`].title', source)
+stream.first(3) #=> ["first", "second", "third"] (source is now closed)
+```
+
+Expressions built from projections, filters, flattening and non-negative
+slices are evaluated incrementally. Expressions that require the whole
+array up front (e.g. `sort`, `reverse`, negative indices) materialize the
+source into an array first. To disallow materialization, pass
+`:allow_materialization => false`; such expressions are then rejected with
+`JMESPath::Errors::MaterializationError` before the source is consumed.
+
+```ruby
+JMESPath.stream('sort(@)', source, allow_materialization: false)
+#=> raises JMESPath::Errors::MaterializationError
+```
+
 ## Links of Interest
 
 * [Release Notes](https://github.com/trevorrowe/jmespath.rb/releases)
