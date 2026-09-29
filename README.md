@@ -9,6 +9,7 @@ A Go library and tools to authenticate e-mails.
 * [`dkim`]: create and verify [DKIM signatures][DKIM]
 * [`authres`]: create and parse [Authentication-Results header fields][Authentication-Results]
 * [`dmarc`]: fetch [DMARC] records
+* [`dmarcreport`]: parse [DMARC] aggregate reports
 
 ## Tools
 
@@ -29,3 +30,4 @@ MIT
 [`dkim`]: https://pkg.go.dev/github.com/emersion/go-msgauth/dkim
 [`authres`]: https://pkg.go.dev/github.com/emersion/go-msgauth/authres
 [`dmarc`]: https://pkg.go.dev/github.com/emersion/go-msgauth/dmarc
+[`dmarcreport`]: https://pkg.go.dev/github.com/emersion/go-msgauth/dmarcreport
