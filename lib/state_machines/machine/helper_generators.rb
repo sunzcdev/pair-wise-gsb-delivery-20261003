@@ -14,6 +14,7 @@ module StateMachines
         define_path_helpers
         define_action_helpers if define_action_helpers?
         define_name_helpers
+        define_defer_helpers
       end
 
       # Defines the initial values for state machine attributes.  Static values
@@ -118,6 +119,20 @@ module StateMachines
         # Gets the human state name for the current value
         define_helper(:instance, "human_#{attribute(:name)}") do |machine, object|
           machine.states.match!(object).human_name(object.class)
+        end
+      end
+
+      # Adds helper methods for inspecting the object-level deferred event
+      # queue and the outcome of the most recent replay round
+      def define_defer_helpers
+        # Gets the events currently waiting in the object's deferred queue
+        define_helper(:instance, attribute(:deferred_events)) do |machine, object|
+          machine.deferred_events(object)
+        end
+
+        # Gets the replay results (with outcomes) from the last replay round
+        define_helper(:instance, attribute(:deferred_replay_results)) do |machine, object|
+          machine.last_defer_replay(object)
         end
       end
     end

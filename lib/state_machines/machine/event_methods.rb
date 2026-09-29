@@ -13,6 +13,10 @@ module StateMachines
       # * <tt>:human_name</tt> - The human-readable version of this event's name.
       #   By default, this is either defined by the integration or stringifies the
       #   name and converts underscores to spaces.
+      # * <tt>:defer</tt> - Whether firing this event in a state where it has no
+      #   matching transition stores it (with its arguments) in the object's
+      #   deferred event queue instead of failing.  Deferred events are replayed
+      #   in order after the next successful transition.  Default is false.
       #
       # == Instance methods
       #
@@ -231,7 +235,7 @@ module StateMachines
       #   end
       def event(*names, &)
         options = names.last.is_a?(Hash) ? names.pop : {}
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name, :defer)
 
         # Store the context so that it can be used for / matched against any event
         # that gets added
@@ -249,6 +253,7 @@ module StateMachines
           # Update the configuration for the event(s)
           events.each do |event|
             event.human_name = options[:human_name] if options.include?(:human_name)
+            event.defer(options[:defer]) if options.include?(:defer)
 
             # Add any states that may have been referenced within the event
             add_states(event.known_states)

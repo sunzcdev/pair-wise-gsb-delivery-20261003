@@ -15,7 +15,7 @@ module StateMachines
                        end
         
         # Validate options including integration-specific options
-        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async]
+        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async, :defer_queue_limit, :defer_replay_limit]
         valid_keys += @integration.integration_options if @integration
         StateMachines::OptionsValidator.assert_valid_keys!(options, valid_keys)
 
@@ -40,6 +40,8 @@ module StateMachines
         @initialize_state = options[:initialize]
         @action_hook_defined = false
         @async_requested = options[:async]
+        @defer_queue_limit = options[:defer_queue_limit] || Deferring::DEFAULT_DEFER_QUEUE_LIMIT
+        @defer_replay_limit = options[:defer_replay_limit] || Deferring::DEFAULT_DEFER_REPLAY_LIMIT
 
         self.owner_class = owner_class
 

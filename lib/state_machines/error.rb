@@ -112,4 +112,16 @@ module StateMachines
   # A method was called in an invalid state context
   class InvalidContext < Error
   end
+
+  # The object's deferred event queue has reached its configured limit
+  class DeferredQueueFull < Error
+    # The machine whose limit was hit
+    attr_reader :machine
+
+    def initialize(object, machine) # :nodoc:
+      @machine = machine
+
+      super(object, "Cannot defer more than #{machine.defer_queue_limit} event(s) for #{machine.name.inspect}")
+    end
+  end
 end

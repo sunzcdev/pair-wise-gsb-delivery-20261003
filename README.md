@@ -341,6 +341,69 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+## Deferring Events
+
+Some events cannot be handled in the current state but become fireable after a
+later transition.  Events explicitly declared with `defer` (either as an event
+option or inside the event's context block) are stored, together with their
+arguments, in an object-level pending queue instead of failing.  Queued events
+are replayed in order after the next successful transition:
+
+```ruby
+class Vehicle
+  state_machine initial: :parked do
+    event :ignite do
+      transition parked: :idling
+    end
+
+    event :shift_up, defer: true do
+      transition idling: :first_gear
+    end
+
+    event :shift_down do
+      defer # equivalent to passing defer: true
+      transition first_gear: :idling
+    end
+  end
+end
+
+vehicle = Vehicle.new
+vehicle.shift_up(:smoothly)  # => :deferred (queued with its arguments)
+vehicle.state_deferred_events # => [#<StateMachines::DeferredEvent event=:shift_up args=[:smoothly] ...>]
+vehicle.ignite               # => true, replays the queue: shift_up fires with :smoothly
+vehicle.state                # => "first_gear"
+```
+
+Events that are *not* declared deferrable keep the original behavior: firing
+them in an invalid state returns `false` (or raises
+`StateMachines::InvalidTransition` for the bang version).
+
+Both the queue and each replay round are bounded, configurable per machine:
+
+```ruby
+state_machine defer_queue_limit: 25, defer_replay_limit: 10 do
+  ...
+end
+```
+
+* `defer_queue_limit` - maximum number of deferred events held per object.
+  Deferring beyond the limit raises `StateMachines::DeferredQueueFull`.
+* `defer_replay_limit` - maximum number of events replayed in a single round.
+  An event that keeps deferring itself is retried at most this many times per
+  round, so it can never block the caller; whatever is still pending stays
+  queued for the next round.
+
+Every replay round is observable through `state_deferred_replay_results`, which
+lists each replayed entry with its `outcome`:
+
+* `:performed` - the event transitioned successfully
+* `:deferred` - the event still could not fire and was re-queued (this also
+  covers events fired from transition callbacks during the replay)
+* `:failed` - a transition matched but failed to perform (e.g. a halted
+  `before_transition`)
+* `:error` - an exception was raised while replaying (available on the entry's
+  `error` attribute)
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.

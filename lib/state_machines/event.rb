@@ -29,20 +29,27 @@ module StateMachines
     # branches/transitions as the source
     attr_reader :known_states
 
+    # Whether this event may be deferred when it cannot fire in the object's
+    # current state
+    attr_writer :deferrable
+
     # Creates a new event within the context of the given machine
     #
     # Configuration options:
     # * <tt>:human_name</tt> - The human-readable version of this event's name
-    def initialize(machine, name, options = nil, human_name: nil, **extra_options) # :nodoc:
+    # * <tt>:defer</tt> - Whether this event can be deferred when it cannot be
+    #   fired in the object's current state
+    def initialize(machine, name, options = nil, human_name: nil, defer: false, **extra_options) # :nodoc:
       # Handle both old hash style and new kwargs style for backward compatibility
       case options
       in Hash
         # Old style: initialize(machine, name, {human_name: 'Custom Name'})
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name, :defer)
         human_name = options[:human_name]
+        defer = options[:defer] if options.include?(:defer)
       in nil
         # New style: initialize(machine, name, human_name: 'Custom Name')
-        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :human_name) unless extra_options.empty?
+        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :human_name, :defer) unless extra_options.empty?
       else
         # Handle unexpected options
         raise ArgumentError, "Unexpected positional argument in Event initialize: #{options.inspect}"
@@ -52,6 +59,7 @@ module StateMachines
       @name = name
       @qualified_name = machine.namespace ? :"#{name}_#{machine.namespace}" : name
       @human_name = human_name || @name.to_s.tr('_', ' ')
+      @deferrable = defer
       reset
 
       # Output a warning if another event has a conflicting qualified name
@@ -81,6 +89,27 @@ module StateMachines
     # provides a DSL-like syntax for defining transitions.
     def context(&)
       instance_eval(&)
+    end
+
+    # Marks whether this event can be deferred when it cannot be fired in the
+    # object's current state.  Deferred events are stored, along with their
+    # arguments, in the object's deferred event queue and replayed in order
+    # after the next successful transition.
+    #
+    # Can be used within an event's context block:
+    #
+    #   event :ignite do
+    #     defer
+    #     transition :parked => :idling
+    #   end
+    def defer(value = true)
+      @deferrable = value
+    end
+
+    # Whether this event gets stored in the object's deferred event queue
+    # (instead of failing) when it cannot be fired in the current state
+    def deferrable?
+      @deferrable
     end
 
     # Creates a new transition that determines what to change the current state
@@ -163,13 +192,23 @@ module StateMachines
     # If no transitions can be made, then this will return false, otherwise
     # true.
     #
+    # If no transition can be made but the event is deferrable, the event and
+    # its arguments are stored in the object's deferred event queue and
+    # <tt>:deferred</tt> is returned.  Queued events are replayed in order
+    # after the next successful transition.
+    #
     # Any additional arguments are passed to the StateMachines::Transition#perform
     # instance method.
     def fire(object, *event_args)
       machine.reset(object)
 
       if (transition = transition_for(object, {}, *event_args))
-        transition.perform(*event_args)
+        result = transition.perform(*event_args)
+        machine.replay_deferred_events(object) if result
+        result
+      elsif deferrable?
+        machine.defer_event(object, self, event_args)
+        :deferred
       else
         on_failure(object, *event_args)
         false

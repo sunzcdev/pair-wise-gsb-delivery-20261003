@@ -21,6 +21,8 @@ require 'state_machines/matcher_helpers'
 require 'state_machines/transition'
 require 'state_machines/transition_collection'
 
+require 'state_machines/deferred_event'
+
 require 'state_machines/branch'
 
 require 'state_machines/helper_module'
