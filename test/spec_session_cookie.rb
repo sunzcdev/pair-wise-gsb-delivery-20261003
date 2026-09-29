@@ -619,4 +619,187 @@ describe Rack::Session::Cookie do
     response.body.must_match /"counter"\s*=>\s*2/
     response.body.must_match(/\A{[^}]+}\z/)
   end
+
+  describe 'server-side expiry' do
+    counter_reader = lambda do |env|
+      Rack::Response.new(env["rack.session"]["counter"].inspect).to_a
+    end
+
+    it "stores timing metadata inside the authenticated payload, hidden from the app" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      coder = Rack::Session::Cookie::Base64::Marshal.new
+      app = [incrementor, { coder: coder, clock: clock, idle_timeout: 60 }]
+
+      response = response_for(app: app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+
+      encoded = response["Set-Cookie"].split('=', 2).last.split(';').first
+      decoded = coder.decode(Rack::Utils.unescape(encoded))
+      metadata = decoded[Rack::Session::Cookie::TIMING_METADATA_KEY]
+      metadata["created_at"].must_equal now.to_i
+      metadata["last_activity_at"].must_equal now.to_i
+    end
+
+    it "discards the session after the absolute lifetime when an old cookie is replayed" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      app = [incrementor, { secrets: @secret, clock: clock, absolute_lifetime: 3600, expire_after: 86_400 }]
+
+      response = response_for(app: app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+      cookie = response["Set-Cookie"]
+
+      now += 1800
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+
+      # The client-side cookie (expire_after: 1 day) is still valid, but the
+      # server-side absolute lifetime embedded in the authenticated payload
+      # has been exceeded: replaying the cookie starts a fresh session.
+      now += 1801
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it "discards the session after the idle timeout when an old cookie is replayed" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      app = [incrementor, { secrets: @secret, clock: clock, idle_timeout: 60 }]
+
+      response = response_for(app: app)
+      cookie = response["Set-Cookie"]
+
+      now += 30
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      now += 61
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it "ignores client-side cookie expiry attributes when replaying an expired cookie" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      app = [incrementor, { secrets: @secret, clock: clock, idle_timeout: 60 }]
+
+      response = response_for(app: app)
+      value = response["Set-Cookie"].split(';').first
+
+      # The client extends the cookie's expiry attribute and replays it
+      # after the server-side idle timeout has elapsed.
+      now += 61
+      replayed = "#{value}; expires=#{(Time.now + 31_536_000).httpdate}; path=/"
+      response = response_for(app: app, cookie: replayed)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it "only re-issues the cookie on read-only requests once the renewal threshold is reached" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      options = { secrets: @secret, clock: clock, idle_timeout: 1000, renew_after: 40 }
+
+      response = response_for(app: [incrementor, options])
+      cookie = response["Set-Cookie"]
+
+      set_cookie_count = 0
+      10.times do
+        now += 25
+        response = response_for(app: [counter_reader, options], cookie: cookie)
+        response.body.must_equal "1"
+        if response["Set-Cookie"]
+          set_cookie_count += 1
+          cookie = response["Set-Cookie"]
+        end
+      end
+
+      # Renewal happens at t=50,100,...,250 (idle >= 40s): 5 Set-Cookie
+      # headers for 10 read-only requests, not 10.
+      set_cookie_count.must_equal 5
+    end
+
+    it "does not reset the creation time when renewing" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      options = { secrets: @secret, clock: clock, idle_timeout: 1000, renew_after: 40, absolute_lifetime: 120 }
+
+      response = response_for(app: [incrementor, options])
+      cookie = response["Set-Cookie"]
+
+      now += 50
+      response = response_for(app: [counter_reader, options], cookie: cookie)
+      response.body.must_equal "1"
+      response["Set-Cookie"].wont_be :nil?
+      cookie = response["Set-Cookie"]
+
+      now += 50
+      response = response_for(app: [counter_reader, options], cookie: cookie)
+      response.body.must_equal "1"
+      response["Set-Cookie"].wont_be :nil?
+      cookie = response["Set-Cookie"]
+
+      # Idle time is only 51s (well below idle_timeout), but the session is
+      # 151s old: the renewals above did not reset the creation time.
+      now += 51
+      response = response_for(app: [counter_reader, options], cookie: cookie)
+      response.body.must_equal "nil"
+    end
+
+    it "accepts legacy cookies without timing metadata and stamps them on re-issue" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+
+      legacy_app = [incrementor, { secrets: @secret }]
+      response = response_for(app: legacy_app)
+      legacy_cookie = response["Set-Cookie"]
+
+      timed_app = [incrementor, { secrets: @secret, clock: clock, idle_timeout: 60 }]
+      response = response_for(app: timed_app, cookie: legacy_cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # The re-issued cookie is now stamped: the idle timeout is enforced
+      # against the time of the first request after enabling the option.
+      now += 61
+      response = response_for(app: timed_app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it "re-issues a legacy cookie once on a read-only request to stamp timing metadata" do
+      legacy_app = [incrementor, { secrets: @secret }]
+      response = response_for(app: legacy_app)
+      legacy_cookie = response["Set-Cookie"]
+
+      reader_app = [counter_reader, { secrets: @secret, idle_timeout: 60 }]
+      response = response_for(app: reader_app, cookie: legacy_cookie)
+      response.body.must_equal "1"
+      response["Set-Cookie"].wont_be :nil?
+
+      response = response_for(app: reader_app, cookie: response["Set-Cookie"])
+      response.body.must_equal "1"
+      response["Set-Cookie"].must_be_nil
+    end
+
+    it "tolerates clock rollback by clamping elapsed time to zero" do
+      now = Time.at(1_700_000_000)
+      clock = proc { now }
+      app = [incrementor, { secrets: @secret, clock: clock, idle_timeout: 60, absolute_lifetime: 3600 }]
+
+      response = response_for(app: app)
+      cookie = response["Set-Cookie"]
+
+      now += 30
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # The clock jumps backwards past the creation time: the session must
+      # neither expire nor error out.
+      now = Time.at(1_700_000_000 - 1000)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>3}.to_s)
+    end
+  end
 end

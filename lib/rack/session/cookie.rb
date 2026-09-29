@@ -87,8 +87,57 @@ module Rack
     #     }.new
     #   })
     #
+    # == Server-side session expiry
+    #
+    # In addition to the client-side cookie expiry (:expire_after / :max_age,
+    # which the client is free to ignore), the following options enforce
+    # server-side session lifetimes. The creation time and last activity time
+    # of the session are stored inside the authenticated (encrypted or
+    # HMAC-protected) cookie payload, so clients cannot extend a session by
+    # modifying cookie attributes or replaying an old cookie:
+    #
+    # * :absolute_lifetime
+    #     Maximum number of seconds a session may live, counted from its
+    #     creation time. Once exceeded, the session is discarded regardless
+    #     of activity. Renewals (see :renew_after) never reset the creation
+    #     time, so this limit cannot be extended by activity.
+    # * :idle_timeout
+    #     Maximum number of seconds a session may remain unused. Each
+    #     request that writes the session slides this window; read-only
+    #     requests only slide it once the :renew_after threshold is reached.
+    # * :renew_after
+    #     Number of seconds of inactivity after which a read-only request
+    #     re-issues the cookie with a fresh last-activity time. Below this
+    #     threshold, read-only requests do not send a Set-Cookie header at
+    #     all. Defaults to half of :idle_timeout. Only meaningful together
+    #     with :idle_timeout.
+    # * :clock
+    #     A callable returning the current time (a Time or epoch seconds),
+    #     used for all server-side expiry checks. Defaults to
+    #     `proc { Time.now }`. Inject a fake clock in tests.
+    #
+    # Migration: cookies written before these options were enabled carry no
+    # timing metadata. They are still accepted; the server-side clock starts
+    # at the first request seen after enabling the options, and the metadata
+    # is stamped into the cookie the next time it is re-issued. To forcibly
+    # invalidate pre-existing sessions instead, rotate :secrets.
+    #
+    # Clock rollback: if the clock moves backwards (e.g. NTP correction),
+    # negative elapsed time is clamped to zero. Sessions neither expire
+    # prematurely nor gain extra lifetime; the timers effectively pause
+    # until the clock catches up.
+    #
 
     class Cookie < Abstract::PersistedSecure
+      # Reserved key inside the authenticated cookie payload that carries the
+      # server-side timing metadata (epoch seconds). It is stripped from the
+      # session data before the application sees it.
+      TIMING_METADATA_KEY = '__rack.session.timing__'
+
+      # Environment key used to pass the unpacked timing metadata from the
+      # request phase to the commit phase.
+      RACK_SESSION_TIMING = 'rack.session.cookie.timing'
+
       # Encode session cookies as Base64
       class Base64
         def encode(str)
@@ -195,6 +244,13 @@ module Rack
         # encryption could present a major security issue.
         @coder = options[:coder] ||= Base64::Marshal.new
 
+        # Server-side expiry options. See the class documentation for the
+        # migration and clock-rollback semantics.
+        @absolute_lifetime = options[:absolute_lifetime]
+        @idle_timeout = options[:idle_timeout]
+        @renew_after = options[:renew_after] || (@idle_timeout && @idle_timeout / 2)
+        @clock = options[:clock] || proc { Time.now }
+
         super(app, options.merge!(cookie_only: true))
       end
 
@@ -243,10 +299,27 @@ module Rack
               # if encryptors are present but decryption failed, the cookie is rejected.
               session_data = coder.decode(cookie_data)
             end
+
+            session_data = extract_and_validate_timing_metadata(request, session_data)
           end
 
           request.set_header(k, session_data || {})
         end
+      end
+
+      # Commit the session, but avoid re-issuing the cookie for read-only
+      # requests unless the idle-time renewal threshold has been reached.
+      def commit_session(req, res)
+        session = req.get_header RACK_SESSION
+
+        if @idle_timeout && read_only_session?(session) &&
+            !force_options?(session.options) && !renewal_needed?(req)
+          # The session was only read and the renewal threshold has not been
+          # reached: leave the client-side cookie untouched.
+          return
+        end
+
+        super
       end
 
       def persistent_session_id!(data, sid = nil)
@@ -266,6 +339,7 @@ module Rack
 
       def write_session(req, session_id, session, options)
         session = session.merge("session_id" => session_id)
+        session = session.merge(TIMING_METADATA_KEY => timing_metadata_for_write(req)) if timing_enabled?
         session_data = encode_session_data(session)
 
         if session_data.size > (4096 - @key.size)
@@ -289,6 +363,87 @@ module Rack
 
       def legacy_generate_hmac(data)
         OpenSSL::HMAC.hexdigest(@legacy_hmac, @legacy_hmac_secret, data)
+      end
+
+      def timing_enabled?
+        @absolute_lifetime || @idle_timeout
+      end
+
+      def clock_now
+        @clock.call.to_i
+      end
+
+      # Strip the timing metadata from the decoded cookie payload, validate
+      # it against the injected clock, and stash it in the environment for
+      # the commit phase. Returns the session data the application should
+      # see, or nil if the session has expired server-side.
+      def extract_and_validate_timing_metadata(request, session_data)
+        return session_data unless session_data.is_a?(Hash)
+
+        metadata = session_data.delete(TIMING_METADATA_KEY)
+        return session_data unless timing_enabled?
+
+        if metadata.nil?
+          # Migration: cookies written before server-side expiry was enabled
+          # carry no timing metadata. Accept the session and leave the
+          # metadata unset; it will be stamped with the current time when
+          # the cookie is next re-issued.
+          return session_data
+        end
+
+        if timing_metadata_valid?(metadata)
+          request.set_header(RACK_SESSION_TIMING, metadata)
+          session_data
+        else
+          request.get_header(RACK_ERRORS).puts("Session cookie expired server-side; discarding session.")
+          nil
+        end
+      end
+
+      def timing_metadata_valid?(metadata)
+        created_at = metadata["created_at"]
+        last_activity_at = metadata["last_activity_at"]
+        return false unless created_at && last_activity_at
+
+        now = clock_now
+        # Clock rollback: clamp negative elapsed time to zero so a backwards
+        # clock neither expires sessions nor extends their lifetime.
+        age = [now - created_at.to_i, 0].max
+        idle = [now - last_activity_at.to_i, 0].max
+
+        return false if @absolute_lifetime && age > @absolute_lifetime
+        return false if @idle_timeout && idle > @idle_timeout
+
+        true
+      end
+
+      # Build the timing metadata for a cookie being written. The creation
+      # time is carried over from the existing cookie (renewal never resets
+      # it); only the last-activity time is refreshed.
+      def timing_metadata_for_write(req)
+        now = clock_now
+        previous = req.get_header(RACK_SESSION_TIMING) || {}
+
+        {
+          "created_at" => previous["created_at"] || now,
+          "last_activity_at" => now,
+        }
+      end
+
+      def read_only_session?(session)
+        session.respond_to?(:written?) && session.loaded? && !session.written?
+      end
+
+      # Whether a read-only request should re-issue the cookie to slide the
+      # idle-timeout window.
+      def renewal_needed?(req)
+        return false unless @idle_timeout
+
+        metadata = req.get_header(RACK_SESSION_TIMING)
+        # Legacy cookie without timing metadata: re-issue once to stamp it.
+        return true unless metadata
+
+        clock_now - metadata["last_activity_at"].to_i >= @renew_after
       end
 
       def encode_session_data(session)

@@ -69,6 +69,7 @@ module Rack
           @store = store
           @req = req
           @loaded = false
+          @written = false
         end
 
         def id
@@ -166,6 +167,12 @@ module Rack
           @loaded
         end
 
+        # Whether the session was mutated (written to) during this request,
+        # as opposed to only being read.
+        def written?
+          @written
+        end
+
         def empty?
           load_for_read!
           @data.empty?
@@ -188,6 +195,7 @@ module Rack
         end
 
         def load_for_write!
+          @written = true
           load! unless loaded?
         end
 
