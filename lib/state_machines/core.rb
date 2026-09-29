@@ -20,6 +20,7 @@ require 'state_machines/matcher_helpers'
 
 require 'state_machines/transition'
 require 'state_machines/transition_collection'
+require 'state_machines/event_sequence'
 
 require 'state_machines/branch'
 

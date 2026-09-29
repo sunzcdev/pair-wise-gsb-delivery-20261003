@@ -109,6 +109,40 @@ module StateMachines
     end
   end
 
+  # A sequence of events failed to run in order
+  class InvalidEventSequence < Error
+    # The events that were attempted to be run in sequence
+    attr_reader :events
+
+    # The event that failed.  This is nil if the failure happened while
+    # committing the sequence (i.e. running the machine actions) rather
+    # than while firing one of the events.
+    attr_reader :failed_event
+
+    # The zero-based index of the failed event within the sequence.  This is
+    # nil if the failure happened while committing the sequence.
+    attr_reader :failed_index
+
+    # The per-step results for the sequence at the time of the failure.
+    # Each entry is a hash mapping +:event+, +:machine+, and +:status+
+    # (+:pending+, +:success+, or +:failed+).
+    attr_reader :steps
+
+    def initialize(object, events, failed_index = nil, steps = []) # :nodoc:
+      @events = events
+      @failed_index = failed_index
+      @failed_event = failed_index ? events[failed_index] : nil
+      @steps = steps.map(&:dup)
+
+      message = if failed_event
+                  "Cannot run event sequence: step #{failed_index + 1} (#{failed_event.inspect}) of #{events.map(&:inspect).join(', ')} failed"
+                else
+                  "Cannot commit event sequence: #{events.map(&:inspect).join(', ')}"
+                end
+      super(object, message)
+    end
+  end
+
   # A method was called in an invalid state context
   class InvalidContext < Error
   end

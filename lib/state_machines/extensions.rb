@@ -141,6 +141,68 @@ module StateMachines
       fire_events(*(events + [run_action])) || raise(StateMachines::InvalidParallelTransition.new(self, events))
     end
 
+    # Runs a sequence of events in order.  Each event is fired only after the
+    # previous one has completed, so every event sees the states left behind
+    # by the events before it.  This allows multiple events to be chained on
+    # the *same* state machine, unlike #fire_events which runs events in
+    # parallel on different machines.
+    #
+    # The sequence is all-or-nothing:
+    # * The action configured for each machine (e.g. +save+) is only run once
+    #   *all* events have transitioned successfully, committing the new
+    #   states.
+    # * If any event (or the final commit) fails, the states of every machine
+    #   involved are restored to their original values, along with any pending
+    #   event attributes (e.g. +state_event+), and a
+    #   StateMachines::InvalidEventSequence error is raised.  The error
+    #   identifies exactly which step failed via +failed_event+,
+    #   +failed_index+, and the per-step +steps+ statuses.
+    #
+    # External side effects (e.g. records created in callbacks) are *not*
+    # rolled back automatically.  If the sequence must be atomic with respect
+    # to a database, provide a transaction boundary with a block.  The block
+    # is yielded a runner that performs the sequence; a failing sequence
+    # raises through the block so the surrounding transaction rolls back:
+    #
+    #   vehicle.fire_event_sequence(:ignite, :shift_up) do |sequence|
+    #     Vehicle.transaction { sequence.call }
+    #   end
+    #
+    # Event sequences cannot be nested: calling this method from within a
+    # running sequence (e.g. from a transition callback) raises
+    # StateMachines::InvalidContext.
+    #
+    # == Example
+    #
+    #   class Vehicle
+    #     state_machine :initial => :parked do
+    #       event :ignite do
+    #         transition :parked => :idling
+    #       end
+    #
+    #       event :shift_up do
+    #         transition :idling => :first_gear
+    #       end
+    #
+    #       event :park do
+    #         transition :idling => :parked
+    #       end
+    #     end
+    #   end
+    #
+    #   vehicle = Vehicle.new                           # => #<Vehicle:0xb7c02850 @state="parked">
+    #   vehicle.fire_event_sequence(:ignite, :shift_up) # => true
+    #   vehicle.state                                   # => "first_gear"
+    #
+    #   # If any event fails, nothing is committed and the failing step is
+    #   # reported
+    #   vehicle.fire_event_sequence(:park, :ignite, :shift_up)
+    #   # => StateMachines::InvalidEventSequence: Cannot run event sequence: step 1 (:park) of :park, :ignite, :shift_up failed
+    #   vehicle.state                                   # => "first_gear"
+    def fire_event_sequence(*events, &block)
+      self.class.state_machines.fire_event_sequence(self, *events, &block)
+    end
+
     protected
 
     def initialize_state_machines(options = {}, &) # :nodoc:

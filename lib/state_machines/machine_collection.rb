@@ -76,6 +76,29 @@ module StateMachines
       end
     end
 
+    # Runs a sequence of events in order on the given object.  See
+    # StateMachines::InstanceMethods#fire_event_sequence for more
+    # information.
+    #
+    # If a block is given, it is yielded a runner that performs the sequence,
+    # allowing the caller to wrap the run in its own transaction boundary.
+    def fire_event_sequence(object, *events)
+      raise ArgumentError, 'At least one event must be specified' if events.empty?
+
+      if object.instance_variable_get(:@_state_machine_event_sequence_running)
+        raise(InvalidContext.new(object, 'Cannot run an event sequence from within another event sequence'))
+      end
+
+      object.instance_variable_set(:@_state_machine_event_sequence_running, true)
+      begin
+        sequence = EventSequence.new(object, self, events, use_transactions: resolve_use_transactions)
+        runner = -> { sequence.perform }
+        block_given? ? yield(runner) : runner.call
+      ensure
+        object.instance_variable_set(:@_state_machine_event_sequence_running, false)
+      end
+    end
+
     # Builds the collection of transitions for all event attributes defined on
     # the given object.  This will only include events whose machine actions
     # match the one specified.
