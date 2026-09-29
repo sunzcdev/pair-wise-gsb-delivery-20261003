@@ -23,6 +23,20 @@ module JMESPath
       def optimize
         self.class.new(@child.optimize)
       end
+
+      def streamable?
+        @child.streamable? && @child.streams_array?
+      end
+
+      def streams_array?
+        true
+      end
+
+      def stream_each(values)
+        @child.stream_each(values).lazy.flat_map do |value|
+          value.respond_to?(:to_ary) ? value.to_ary : [value]
+        end
+      end
     end
   end
 end

@@ -13,6 +13,24 @@ module JMESPath
       def chains_with?(_other)
         false
       end
+
+      # Whether this node can be evaluated incrementally over a
+      # streaming array source, producing results as elements are read.
+      # Nodes that require the full input up front (e.g. sort, negative
+      # indices) return `false` and must be materialized before
+      # evaluation.
+      # @api private
+      def streamable?
+        false
+      end
+
+      # Whether a streaming node emits the elements of an array (`true`)
+      # or a single scalar result (`false`). Only meaningful when
+      # {#streamable?} returns `true`.
+      # @api private
+      def streams_array?
+        false
+      end
     end
 
     require  'jmespath/nodes/subexpression'

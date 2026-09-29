@@ -39,6 +39,38 @@ module JMESPath
         end
       end
 
+      def streamable?
+        # Slices with a negative step or negative endpoints require the
+        # total length and therefore materialization.
+        (@step.nil? || @step > 0) &&
+          (@start.nil? || @start >= 0) &&
+          (@stop.nil? || @stop >= 0)
+      end
+
+      def streams_array?
+        true
+      end
+
+      def stream_each(values)
+        start = @start || 0
+        stop = @stop
+        step = @step || 1
+        # number of elements to emit; computed up front so the source
+        # is not read past the end of the slice
+        remaining = stop ? [(stop - start + step - 1) / step, 0].max : nil
+        Enumerator.new do |yielder|
+          emitted = 0
+          unless remaining == 0
+            values.each_with_index do |value, index|
+              next unless index >= start && ((index - start) % step).zero?
+              yielder << value
+              emitted += 1
+              break if remaining && emitted >= remaining
+            end
+          end
+        end
+      end
+
       private
 
       def adjust_slice(length, start, stop, step)

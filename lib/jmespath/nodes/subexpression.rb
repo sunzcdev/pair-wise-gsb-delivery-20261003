@@ -59,6 +59,21 @@ module JMESPath
         end
         Chain.new(children)
       end
+
+      def streamable?
+        @children.all?(&:streamable?) &&
+          @children[0...-1].all?(&:streams_array?)
+      end
+
+      def streams_array?
+        @children.last.streams_array?
+      end
+
+      def stream_each(values)
+        @children.reduce(values) do |enum, child|
+          child.stream_each(enum)
+        end
+      end
     end
   end
 end

@@ -31,6 +31,23 @@ module JMESPath
         ChainedField.new([@key, *other.keys])
       end
 
+      def streamable?
+        # Only non-negative integer keys (i.e. index expressions) can
+        # stream; negative indices require materializing the source.
+        @key.is_a?(Integer) && @key >= 0
+      end
+
+      def stream_each(values)
+        key = @key
+        Enumerator.new do |yielder|
+          values.each_with_index do |value, index|
+            next unless index == key
+            yielder << value
+            break
+          end
+        end
+      end
+
       protected
 
       def keys

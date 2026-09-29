@@ -1,6 +1,12 @@
 Unreleased Changes
 ------------------
 
+* Feature - Add `JMESPath.stream` and `JMESPath::Runtime#stream`, evaluating
+  expressions over a read-only, streaming array source. Filters, projections,
+  flatten, non-negative indices and slices produce results as elements are
+  read; expressions that require materialization (e.g. `sort`, negative
+  indices) can be rejected up front with the `:materialize => false` option.
+
 1.6.2 (2022-11-25)
 ------------------
 

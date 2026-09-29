@@ -15,5 +15,9 @@ module JMESPath
     class InvalidArityError < Error; end
 
     class UnknownFunctionError < Error; end
+
+    # Raised when a streaming query cannot be evaluated incrementally
+    # and materializing the source is not allowed.
+    class StreamingNotSupportedError < Error; end
   end
 end

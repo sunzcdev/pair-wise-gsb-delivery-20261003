@@ -70,6 +70,36 @@ File.open('/path/to/data.json', 'r', encoding:'UTF-8') do |file|
 end
 ```
 
+## Streaming
+
+In addition to searching complete Ruby objects, `JMESPath.stream` can evaluate expressions over a read-only, streaming array source. Filters and projections produce results as elements are read, so consumers can stop early without reading the entire source.
+
+A streaming source must respond to `#each`, yielding array elements in order. If the source responds to `#close`, it is closed exactly once: when iteration completes, when the consumer stops early (e.g. via `break`, `first` or `take`), or when an error is raised while evaluating the query.
+
+```ruby
+class RowSource
+  def each
+    # yield rows one at a time, e.g. from a database cursor
+  end
+
+  def close
+    # release the underlying resource
+  end
+end
+
+result = JMESPath.stream('[?state == `active`].name', RowSource.new)
+result.take(3) # reads only until 3 matches are found, then closes the source
+```
+
+Only expressions that can be evaluated incrementally stream element by element: filters, projections, flatten, non-negative indices and slices, and chains of these. Expressions that require the full input up front (e.g. `sort`, negative indices or slices) are evaluated by materializing the source into an array. Pass `materialize: false` to reject such expressions with a `JMESPath::Errors::StreamingNotSupportedError` before the source is consumed:
+
+```ruby
+JMESPath.stream('sort(@)', source, materialize: false)
+#=> raises JMESPath::Errors::StreamingNotSupportedError
+```
+
+The returned `JMESPath::StreamingResult` is a lazy, forward-only `Enumerable`. Each element of the result array is yielded in order; expressions with a non-array result yield that value as a single element.
+
 ## Links of Interest
 
 * [Release Notes](https://github.com/trevorrowe/jmespath.rb/releases)

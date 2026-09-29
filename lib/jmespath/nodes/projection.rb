@@ -50,6 +50,21 @@ module JMESPath
       def fast_instance
         FastArrayProjection.new(@target.optimize, @projection.optimize)
       end
+
+      def streamable?
+        @target.streamable? && @target.streams_array?
+      end
+
+      def streams_array?
+        true
+      end
+
+      def stream_each(values)
+        projection = @projection
+        @target.stream_each(values).lazy.map do |value|
+          projection.visit(value)
+        end.reject(&:nil?)
+      end
     end
 
     class FastArrayProjection < ArrayProjection

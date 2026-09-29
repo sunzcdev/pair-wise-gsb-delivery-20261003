@@ -6,6 +6,18 @@ module JMESPath
       def visit(value)
         value
       end
+
+      def streamable?
+        true
+      end
+
+      def streams_array?
+        true
+      end
+
+      def stream_each(values)
+        values
+      end
     end
   end
 end
