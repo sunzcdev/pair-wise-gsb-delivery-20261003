@@ -121,6 +121,30 @@ Or install it yourself as:
     header['Set-Cookie'] = cookie2.set_cookie_value
 
 
+    ########################
+    # Top-level site partitioning
+    ########################
+
+    # When the same third-party service is embedded by multiple
+    # top-level sites, its cookies can be isolated per site by giving
+    # each embedding context an explicit partition key.  The partition
+    # key is part of the cookie identity, so cookies that share the
+    # same name, domain and path but differ in the partition key
+    # coexist independently.
+
+    # Store received cookies under the partition of the calling
+    # context; the key is never guessed from the request URL
+    jar.parse(value, uri, partition_key: 'https://site-a.example')
+
+    # Send only the cookies of that partition
+    header["Cookie"] = HTTP::Cookie.cookie_value(
+      jar.cookies(uri, 'https://site-a.example'))
+
+    # Cookies without a partition key are unpartitioned and behave
+    # exactly as before.  Files saved by older versions load as
+    # unpartitioned cookies.
+
+
 ## Incompatibilities with Mechanize::Cookie/CookieJar
 
 There are several incompatibilities between

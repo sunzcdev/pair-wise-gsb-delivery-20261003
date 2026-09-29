@@ -1,3 +1,16 @@
+## Unreleased
+
+- Add an explicit top-level site partition key (`HTTP::Cookie#partition_key`).
+  The partition key is part of the cookie identity, so cookies that share the
+  same name, domain and path but differ in the partition key are stored,
+  looked up, overwritten, deleted and persisted independently.  The partition
+  of the calling context is passed explicitly, e.g. `jar.parse(value, uri,
+  partition_key: "https://site-a.example")` and `jar.cookies(uri,
+  "https://site-a.example")`; it is never guessed from the request URL.
+  Unpartitioned cookies behave as before, and files saved by older versions
+  load as unpartitioned cookies.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

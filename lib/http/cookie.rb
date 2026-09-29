@@ -33,6 +33,7 @@ class HTTP::Cookie
     secure      httponly
     expires     max_age
     created_at  accessed_at
+    partition_key
   ]
   # :startdoc:
 
@@ -108,6 +109,21 @@ class HTTP::Cookie
   #
   # :attr_accessor: max_age
 
+  # The top-level site partition key of the cookie, or nil if the
+  # cookie is unpartitioned.
+  #
+  # When a third-party service is embedded by multiple top-level
+  # sites, each embedding context can be given its own partition key
+  # (typically the top-level site origin, e.g. "https://site-a.example")
+  # so that cookies for the same name, domain and path are stored and
+  # looked up independently per partition.  A nil partition key means
+  # the cookie is unpartitioned and behaves the traditional way.
+  #
+  # The setter accepts a string-like or nil.  An empty string is
+  # treated as nil (unpartitioned).
+  #
+  # :attr_accessor: partition_key
+
   # :call-seq:
   #     new(name, value = nil)
   #     new(name, value = nil, **attr_hash)
@@ -132,7 +148,7 @@ class HTTP::Cookie
   #
   def initialize(*args)
     @name = @origin = @domain = @path =
-      @expires = @max_age = nil
+      @expires = @max_age = @partition_key = nil
     @for_domain = @secure = @httponly = false
     @session = true
     @created_at = @accessed_at = Time.now
@@ -252,6 +268,10 @@ class HTTP::Cookie
     # :created_at
     # : The creation time of the cookies parsed.
     #
+    # :partition_key
+    # : The top-level site partition key to set on the cookies parsed.
+    # Cookies parsed without this option are unpartitioned.
+    #
     # :logger
     # : Logger object useful for debugging
     #
@@ -277,6 +297,7 @@ class HTTP::Cookie
       if options
         logger = options[:logger]
         created_at = options[:created_at]
+        partition_key = options[:partition_key]
       end
       origin = HTTP::Cookie::URIParser.parse(origin)
 
@@ -291,6 +312,7 @@ class HTTP::Cookie
             next
           end
           cookie.created_at = created_at if created_at
+          cookie.partition_key = partition_key if partition_key
           attrs.each { |aname, avalue|
             begin
               case aname
@@ -472,6 +494,21 @@ class HTTP::Cookie
   # protocol like HTTPS.
   attr_accessor :secure
   alias secure? secure
+
+  attr_reader :partition_key
+
+  # See #partition_key.
+  def partition_key= key
+    @partition_key =
+      case key
+      when nil
+        nil
+      else
+        key = (String.try_convert(key) or
+          raise TypeError, "#{key.class} is not a String")
+        key.empty? ? nil : key
+      end
+  end
 
   # The HttpOnly flag. (http-only-flag)
   #
@@ -681,6 +718,7 @@ class HTTP::Cookie
   def yaml_initialize(tag, map)
     expires = nil
     @origin = nil
+    @partition_key = nil
     map.each { |key, value|
       case key
       when 'expires'

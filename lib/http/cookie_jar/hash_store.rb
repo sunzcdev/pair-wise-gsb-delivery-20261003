@@ -3,9 +3,14 @@
 class HTTP::CookieJar
   # A store class that uses a hash-based cookie store.
   #
-  # In this store, cookies that share the same name, domain and path
-  # will overwrite each other regardless of the `for_domain` flag
-  # value.  This store is built after the storage model described in
+  # In this store, cookies that share the same name, domain, path and
+  # partition key will overwrite each other regardless of the
+  # `for_domain` flag value.  Cookies that only differ in the
+  # partition key (see HTTP::Cookie#partition_key) are stored
+  # independently of each other, and unpartitioned cookies (nil
+  # partition key) are stored the traditional way.
+  #
+  # This store is built after the storage model described in
   # RFC 6265 5.3 where there is no mention of how the host-only-flag
   # affects in storing cookies.  On the other hand, in MozillaStore
   # two cookies with the same name, domain and path coexist as long as
@@ -32,9 +37,12 @@ class HTTP::CookieJar
       super
 
       @jar = {
-      # hostname => {
-      #   path => {
-      #     name => cookie,
+      # partition_key => {
+      #   hostname => {
+      #     path => {
+      #       name => cookie,
+      #       ...
+      #     },
       #     ...
       #   },
       #   ...
@@ -51,23 +59,24 @@ class HTTP::CookieJar
     end
 
     def add(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
+      path_cookies = (((@jar[cookie.partition_key] ||= {})[cookie.domain] ||= {})[cookie.path] ||= {})
       path_cookies[cookie.name] = cookie
       cleanup if (@gc_index += 1) >= @gc_threshold
       self
     end
 
     def delete(cookie)
-      path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
+      path_cookies = (((@jar[cookie.partition_key] ||= {})[cookie.domain] ||= {})[cookie.path] ||= {})
       path_cookies.delete(cookie.name)
       self
     end
 
-    def each(uri = nil) # :yield: cookie
+    def each(uri = nil, partition_key = nil) # :yield: cookie
       now = Time.now
       if uri
         tpath = uri.path
-        @jar.each { |domain, paths|
+        jar = @jar[partition_key] or return self
+        jar.each { |domain, paths|
           paths.each { |path, hash|
             next unless HTTP::Cookie.path_match?(path, tpath)
             hash.delete_if { |name, cookie|
@@ -85,15 +94,17 @@ class HTTP::CookieJar
         }
       else
         synchronize {
-          @jar.each { |domain, paths|
-            paths.each { |path, hash|
-              hash.delete_if { |name, cookie|
-                if cookie.expired?(now)
-                  true
-                else
-                  yield cookie
-                  false
-                end
+          @jar.each { |partition_key, jar|
+            jar.each { |domain, paths|
+              paths.each { |path, hash|
+                hash.delete_if { |name, cookie|
+                  if cookie.expired?(now)
+                    true
+                  else
+                    yield cookie
+                    false
+                  end
+                }
               }
             }
           }
@@ -114,28 +125,30 @@ class HTTP::CookieJar
       synchronize {
         break if @gc_index == 0
 
-        @jar.each { |domain, paths|
-          domain_cookies = []
+        @jar.each { |partition_key, jar|
+          jar.each { |domain, paths|
+            domain_cookies = []
 
-          paths.each { |path, hash|
-            hash.delete_if { |name, cookie|
-              if cookie.expired?(now) || (session && cookie.session?)
-                true
-              else
-                domain_cookies << cookie
-                false
-              end
+            paths.each { |path, hash|
+              hash.delete_if { |name, cookie|
+                if cookie.expired?(now) || (session && cookie.session?)
+                  true
+                else
+                  domain_cookies << cookie
+                  false
+                end
+              }
             }
+
+            if (debt = domain_cookies.size - HTTP::Cookie::MAX_COOKIES_PER_DOMAIN) > 0
+              domain_cookies.sort_by!(&:created_at)
+              domain_cookies.slice!(0, debt).each { |cookie|
+                delete(cookie)
+              }
+            end
+
+            all_cookies.concat(domain_cookies)
           }
-
-          if (debt = domain_cookies.size - HTTP::Cookie::MAX_COOKIES_PER_DOMAIN) > 0
-            domain_cookies.sort_by!(&:created_at)
-            domain_cookies.slice!(0, debt).each { |cookie|
-              delete(cookie)
-            }
-          end
-
-          all_cookies.concat(domain_cookies)
         }
 
         if (debt = all_cookies.size - HTTP::Cookie::MAX_COOKIES_TOTAL) > 0
@@ -145,11 +158,14 @@ class HTTP::CookieJar
           }
         end
 
-        @jar.delete_if { |domain, paths|
-          paths.delete_if { |path, hash|
-            hash.empty?
+        @jar.delete_if { |partition_key, jar|
+          jar.delete_if { |domain, paths|
+            paths.delete_if { |path, hash|
+              hash.empty?
+            }
+            paths.empty?
           }
-          paths.empty?
+          jar.empty?
         }
 
         @gc_index = 0

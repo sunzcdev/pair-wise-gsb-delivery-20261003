@@ -98,10 +98,11 @@ class HTTP::CookieJar
     def initialize(options = nil)
       super
 
-      @origin_attributes = encode_www_form({}.tap { |params|
+      @origin_attributes_params = {}.tap { |params|
         params['appId'] = @app_id if @app_id.nonzero?
         params['inBrowserElement'] = 1 if @in_browser_element
-      })
+      }
+      @origin_attributes = encode_www_form(@origin_attributes_params)
 
       @filename = options[:filename] or raise ArgumentError, ':filename option is missing'
 
@@ -358,7 +359,7 @@ class HTTP::CookieJar
     def db_add(cookie)
       @stmt[:add].execute({
           :baseDomain => cookie.domain_name.domain || cookie.domain,
-          :originAttributes => @origin_attributes,
+          :originAttributes => encode_origin_attributes(cookie.partition_key),
           :name => cookie.name, :value => cookie.value,
           :host => cookie.dot_domain,
           :path => cookie.path,
@@ -379,6 +380,7 @@ class HTTP::CookieJar
       DELETE FROM moz_cookies
         WHERE appId = :appId AND
               inBrowserElement = :inBrowserElement AND
+              originAttributes = :originAttributes AND
               name = :name AND
               host = :host AND
               path = :path
@@ -388,6 +390,7 @@ class HTTP::CookieJar
       @stmt[:delete].execute({
           :appId => @app_id,
           :inBrowserElement => @in_browser_element ? 1 : 0,
+          :originAttributes => encode_origin_attributes(cookie.partition_key),
           :name => cookie.name,
           :host => cookie.dot_domain,
           :path => cookie.path,
@@ -421,6 +424,22 @@ class HTTP::CookieJar
 
     def deserialize_usectime(value)
       Time.at(value ? value / 1e6 : 0)
+    end
+
+    # Encodes the origin attributes for a cookie, including its
+    # top-level site partition key if any.
+    def encode_origin_attributes(partition_key)
+      if partition_key
+        encode_www_form(@origin_attributes_params.merge('partitionKey' => partition_key))
+      else
+        @origin_attributes
+      end
+    end
+
+    # Extracts the top-level site partition key from an origin
+    # attributes string, or returns nil if there is none.
+    def decode_partition_key(origin_attributes)
+      get_query_param(origin_attributes, 'partitionKey')
     end
 
     public
@@ -461,7 +480,7 @@ class HTTP::CookieJar
               expiry >= :expiry
     SQL
 
-    def each(uri = nil, &block) # :yield: cookie
+    def each(uri = nil, partition_key = nil, &block) # :yield: cookie
       now = Time.now
       if uri
         thost = DomainName.new(uri.host)
@@ -472,6 +491,8 @@ class HTTP::CookieJar
             :inBrowserElement => @in_browser_element ? 1 : 0,
             :expiry => now.to_i,
           }).each { |row|
+          next unless decode_partition_key(row['originAttributes']) == partition_key
+
           if secure = row['isSecure'] != 0
             next unless URI::HTTPS === uri
           end
@@ -486,6 +507,7 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = secure
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              attrs[:partition_key] = partition_key
             })
 
           if cookie.valid_for_uri?(uri)
@@ -493,11 +515,11 @@ class HTTP::CookieJar
             @stmt[:update_lastaccessed].execute({
                 'lastAccessed' => serialize_usectime(now),
                 'id' => row['id'],
-              })
+            })
             yield cookie
           end
         }
-        @sjar.each(uri, &block)
+        @sjar.each(uri, partition_key, &block)
       else
         @stmt[:all_cookies].execute({
             :appId => @app_id,
@@ -514,6 +536,7 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = row['isSecure'] != 0
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              attrs[:partition_key] = decode_partition_key(row['originAttributes'])
             })
 
           yield cookie

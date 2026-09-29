@@ -67,11 +67,16 @@ class HTTP::CookieJar::AbstractStore
   # should be good to send to the given URI,
   # i.e. cookie.valid_for_uri?(uri) evaluates to true.
   #
+  # If +uri+ is given, an optional argument +partition_key+ specifies
+  # the top-level site partition of the calling context, and only
+  # cookies stored under that partition key are yielded.  If it is
+  # nil, only unpartitioned cookies are yielded.
+  #
   # If (and only if) the +uri+ option is given, last access time of
   # each cookie is updated to the current time.
   #
   # This is an abstract method that each subclass must override.
-  def each(uri = nil, &block) # :yield: cookie
+  def each(uri = nil, partition_key = nil, &block) # :yield: cookie
     # if uri
     #   ...
     # else

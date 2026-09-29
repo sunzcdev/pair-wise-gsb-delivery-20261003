@@ -54,7 +54,7 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
   # Serializes the cookie into a cookies.txt line.
   def cookie_to_record(cookie)
     cookie.instance_eval {
-      [
+      record = [
         @httponly ? HTTPONLY_PREFIX + dot_domain : dot_domain,
         @for_domain ? True : False,
         @path,
@@ -63,11 +63,19 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
         @name,
         @value
       ]
+      # An optional eighth field carries the top-level site partition
+      # key.  It is omitted for unpartitioned cookies so that the
+      # traditional 7-field format is kept.
+      record << @partition_key if @partition_key
+      record
     }.join("\t") << @linefeed
   end
 
   # Parses a line from cookies.txt and returns a cookie object if the
   # line represents a cookie record or returns nil otherwise.
+  # Lines with the traditional 7 fields are loaded as unpartitioned
+  # cookies; an optional eighth field is taken as the top-level site
+  # partition key.
   def parse_record(line)
     case line
     when RE_HTTPONLY_PREFIX
@@ -84,10 +92,15 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
     path,		# Path for which the cookie is relevant
     s_secure,		# Requires a secure connection
     s_expires,		# Time the cookie expires (Unix epoch time)
-    name, value = line.split("\t", 7)
+    name, value,
+    partition_key = line.split("\t", 8)
     return nil if value.nil?
 
-    value.chomp!
+    if partition_key
+      partition_key.chomp!
+    else
+      value.chomp!
+    end
 
     if (expires_seconds = s_expires.to_i).nonzero?
       expires = Time.at(expires_seconds)
@@ -100,6 +113,7 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
       :path => path,
       :secure => s_secure == True,
       :httponly => httponly,
+      :partition_key => partition_key,
       :expires => expires)
   end
 end

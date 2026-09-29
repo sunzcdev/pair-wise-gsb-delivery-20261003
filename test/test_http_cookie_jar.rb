@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 require File.expand_path('helper', File.dirname(__FILE__))
 require 'tmpdir'
+require 'stringio'
 
 module TestHTTPCookieJar
   class TestAutoloading < Test::Unit::TestCase
@@ -726,6 +727,150 @@ module TestHTTPCookieJar
       end
 
       assert_equal(0, @jar.to_a.length)
+    end
+
+    # Three cookies sharing the same name, domain and path, differing
+    # only in the top-level site partition key.
+    def add_partitioned_cookies(jar)
+      jar.add(HTTP::Cookie.new(cookie_values(:value => 'unpartitioned')))
+      jar.add(HTTP::Cookie.new(cookie_values(:value => 'site-a',
+          :partition_key => 'https://site-a.example')))
+      jar.add(HTTP::Cookie.new(cookie_values(:value => 'site-b',
+          :partition_key => 'https://site-b.example')))
+    end
+
+    def assert_partitioned_cookies(jar, url, unpartitioned_value, site_a_value, site_b_value)
+      assert_equal([unpartitioned_value].compact,
+                   jar.cookies(url).map { |c| c.value })
+      assert_equal([site_a_value].compact,
+                   jar.cookies(url, 'https://site-a.example').map { |c| c.value })
+      assert_equal([site_b_value].compact,
+                   jar.cookies(url, 'https://site-b.example').map { |c| c.value })
+    end
+
+    def test_partitioned_cookies_coexist
+      url = 'http://rubyforge.org/'
+
+      add_partitioned_cookies(@jar)
+
+      assert_equal(3, @jar.to_a.length)
+      assert_partitioned_cookies(@jar, url, 'unpartitioned', 'site-a', 'site-b')
+
+      assert_equal(false, @jar.empty?(url, 'https://site-a.example'))
+      assert_equal(true,  @jar.empty?(url, 'https://site-c.example'))
+    end
+
+    def test_partitioned_cookie_overwrite_is_scoped
+      url = 'http://rubyforge.org/'
+
+      add_partitioned_cookies(@jar)
+
+      # Replacing the cookie of one partition must not touch the
+      # cookies of the other partitions.
+      @jar.add(HTTP::Cookie.new(cookie_values(:value => 'site-a2',
+          :partition_key => 'https://site-a.example')))
+
+      assert_equal(3, @jar.to_a.length)
+      assert_partitioned_cookies(@jar, url, 'unpartitioned', 'site-a2', 'site-b')
+    end
+
+    def test_partitioned_cookie_delete_is_scoped
+      url = 'http://rubyforge.org/'
+
+      add_partitioned_cookies(@jar)
+
+      @jar.delete(HTTP::Cookie.new(cookie_values(
+          :partition_key => 'https://site-b.example')))
+
+      assert_equal(2, @jar.to_a.length)
+      assert_partitioned_cookies(@jar, url, 'unpartitioned', 'site-a', nil)
+
+      @jar.delete(HTTP::Cookie.new(cookie_values))
+
+      assert_equal(1, @jar.to_a.length)
+      assert_partitioned_cookies(@jar, url, nil, 'site-a', nil)
+    end
+
+    def test_parse_with_partition_key
+      url = 'http://rubyforge.org/'
+
+      @jar.parse('Foo=Bar; Path=/', url,
+                 :partition_key => 'https://site-a.example')
+      @jar.parse('Foo=Baz; Path=/', url)
+
+      assert_equal(['Bar'], @jar.cookies(url, 'https://site-a.example').map { |c| c.value })
+      assert_equal(['Baz'], @jar.cookies(url).map { |c| c.value })
+    end
+
+    def test_partitioned_cookies_save_load_yaml
+      url = 'http://rubyforge.org/'
+
+      add_partitioned_cookies(@jar)
+
+      Dir.mktmpdir do |dir|
+        @jar.save(File.join(dir, 'cookies.yml'))
+
+        @jar2.load(File.join(dir, 'cookies.yml'))
+        assert_equal(3, @jar2.to_a.length)
+        assert_partitioned_cookies(@jar2, url, 'unpartitioned', 'site-a', 'site-b')
+      end
+    end
+
+    def test_partitioned_cookies_save_load_cookiestxt
+      url = 'http://rubyforge.org/'
+
+      add_partitioned_cookies(@jar)
+
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.txt')
+        @jar.save(filename, :format => :cookiestxt)
+
+        @jar2.load(filename, :format => :cookiestxt)
+        assert_equal(3, @jar2.to_a.length)
+        assert_partitioned_cookies(@jar2, url, 'unpartitioned', 'site-a', 'site-b')
+      end
+    end
+
+    def test_load_legacy_yaml_without_partition_key
+      url = 'http://rubyforge.org/'
+
+      # A YAML stream in the old format has no partition key; cookies
+      # loaded from it must be treated as unpartitioned.
+      legacy = <<~'END'
+        ---
+        - !ruby/object:HTTP::Cookie
+          name: Foo
+          value: Bar
+          domain: rubyforge.org
+          for_domain: true
+          path: /
+          secure: false
+          httponly: false
+          expires:
+          max_age:
+          created_at: 2026-09-30 00:00:00.000000000 Z
+          accessed_at: 2026-09-30 00:00:00.000000000 Z
+      END
+
+      @jar.load(StringIO.new(legacy))
+
+      cookie, = @jar.cookies(url)
+      assert_equal('Bar', cookie.value)
+      assert_equal(nil, cookie.partition_key)
+    end
+
+    def test_load_legacy_cookiestxt_without_partition_key
+      url = 'http://rubyforge.org/'
+
+      # A traditional 7-field cookies.txt record loads as an
+      # unpartitioned cookie.
+      legacy = ".rubyforge.org\tTRUE\t/\tFALSE\t4133980799\tFoo\tBar\n"
+
+      @jar.load(StringIO.new(legacy), :format => :cookiestxt)
+
+      cookie, = @jar.cookies(url)
+      assert_equal('Bar', cookie.value)
+      assert_equal(nil, cookie.partition_key)
     end
 
     def test_accessed_at

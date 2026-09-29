@@ -1169,6 +1169,36 @@ class TestHTTPCookie < Test::Unit::TestCase
     assert_equal true,  HTTP::Cookie.path_match?('/admin', '/admin/index')
   end
 
+  def test_partition_key
+    cookie = HTTP::Cookie.new(cookie_values)
+    assert_equal nil, cookie.partition_key
+
+    cookie = HTTP::Cookie.new(cookie_values.merge({ :partition_key => 'https://site-a.example' }))
+    assert_equal 'https://site-a.example', cookie.partition_key
+
+    cookie.partition_key = 'https://site-b.example'
+    assert_equal 'https://site-b.example', cookie.partition_key
+
+    cookie.partition_key = nil
+    assert_equal nil, cookie.partition_key
+
+    # an empty string is treated as unpartitioned
+    cookie.partition_key = ''
+    assert_equal nil, cookie.partition_key
+
+    assert_raises(TypeError) {
+      cookie.partition_key = 42
+    }
+
+    # round-trips through YAML
+    cookie = HTTP::Cookie.new(cookie_values.merge({ :partition_key => 'https://site-a.example' }))
+    assert_equal 'https://site-a.example', load_yaml(cookie.to_yaml).partition_key
+
+    # a YAML stream saved by an older version has no partition key
+    yaml = cookie.to_yaml.gsub(/^partition_key:.*\n/, '')
+    assert_equal nil, load_yaml(yaml).partition_key
+  end
+
   def test_to_h
     now = Time.now
 
@@ -1183,6 +1213,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         httponly: cookie.httponly?,
         max_age: 3600,
         name: 'Foo',
+        partition_key: nil,
         path: '/',
         secure: cookie.secure?,
         value: 'Bar',
@@ -1202,6 +1233,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         httponly: cookie.httponly?,
         max_age: nil,
         name: 'Foo',
+        partition_key: nil,
         path: '/',
         secure: cookie.secure?,
         value: 'Bar',
