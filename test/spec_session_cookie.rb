@@ -54,6 +54,15 @@ describe Rack::Session::Cookie do
     Rack::Response.new("Nothing").to_a
   end
 
+  # A mutable clock for testing server-side session lifetimes. Returns a
+  # clock callable and a travel callable which advances the clock.
+  mutable_clock = lambda do
+    state = { now: Time.now }
+    clock = lambda { state[:now] }
+    travel = lambda { |seconds| state[:now] += seconds }
+    [clock, travel]
+  end
+
   def response_for(options = {})
     request_options = options.fetch(:request, {})
     cookie = if options[:cookie].is_a?(Rack::Response)
@@ -618,5 +627,176 @@ describe Rack::Session::Cookie do
     response.body.must_match /"value"\s*=>\s*"#{'A' * 256}"/
     response.body.must_match /"counter"\s*=>\s*2/
     response.body.must_match(/\A{[^}]+}\z/)
+  end
+
+  describe 'server-side session lifetime' do
+    it 'enforces the absolute lifetime server-side, even if the client keeps or rewrites the cookie' do
+      clock, travel = mutable_clock.call
+      app = [incrementor, { secrets: @secret, absolute_lifetime: 60, expire_after: 3600, clock: clock }]
+
+      response = response_for(app: app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+      cookie = response["Set-Cookie"]
+      cookie.must_match(/expires=/i)
+
+      travel.call(30)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+
+      # Advance past the absolute lifetime and replay the original cookie.
+      # The client may keep the cookie past its client-side expiry, but the
+      # creation time inside the authenticated content governs:
+      travel.call(31)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+
+      # Rewriting the client-side expiry attribute does not help either:
+      extended = cookie.sub(/expires=[^;]+/i) { "expires=#{(Time.now + 3600*24*365).httpdate}" }
+      response = response_for(app: app, cookie: extended)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'expires sessions that have been idle for too long' do
+      clock, travel = mutable_clock.call
+      app = [incrementor, { secrets: @secret, idle_timeout: 60, clock: clock }]
+
+      response = response_for(app: app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+      cookie = response["Set-Cookie"]
+
+      travel.call(30)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      travel.call(59)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>3}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # 60 seconds of idleness: the session is expired, replaying the last
+      # cookie does not resume it:
+      travel.call(60)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'only re-issues the cookie for read-only requests once the renewal threshold is reached' do
+      clock, travel = mutable_clock.call
+      options = { secrets: @secret, idle_timeout: 600, renewal_threshold: 100, clock: clock }
+
+      response = response_for(app: [incrementor, options])
+      response["Set-Cookie"].wont_be_nil
+      cookie = response["Set-Cookie"]
+
+      read_only_app = [session_id, options]
+
+      # Read-only requests below the renewal threshold never re-issue the cookie:
+      set_cookie_count = 0
+      5.times do
+        travel.call(10)
+        response = response_for(app: read_only_app, cookie: cookie)
+        set_cookie_count += 1 if response["Set-Cookie"]
+        cookie = response["Set-Cookie"] || cookie
+      end
+      set_cookie_count.must_equal 0
+
+      # Once the renewal threshold is reached, the cookie is re-issued exactly once:
+      travel.call(60)
+      response = response_for(app: read_only_app, cookie: cookie)
+      response["Set-Cookie"].wont_be_nil
+      cookie = response["Set-Cookie"]
+
+      travel.call(10)
+      response = response_for(app: read_only_app, cookie: cookie)
+      response["Set-Cookie"].must_be_nil
+    end
+
+    it 'renews the idle timer without resetting the creation time' do
+      clock, travel = mutable_clock.call
+      options = { secrets: @secret, absolute_lifetime: 90, idle_timeout: 60, renewal_threshold: 10, clock: clock }
+
+      response = response_for(app: [incrementor, options])
+      response.body.must_equal ({"counter"=>1}.to_s)
+      cookie = response["Set-Cookie"]
+
+      read_only_app = [session_id, options]
+
+      # Renew twice via read-only requests; each renewal must preserve the
+      # original creation time:
+      travel.call(30)
+      response = response_for(app: read_only_app, cookie: cookie)
+      response["Set-Cookie"].wont_be_nil
+      cookie = response["Set-Cookie"]
+
+      travel.call(30)
+      response = response_for(app: read_only_app, cookie: cookie)
+      response["Set-Cookie"].wont_be_nil
+      cookie = response["Set-Cookie"]
+
+      # 91 seconds since creation: even though the session was recently
+      # renewed (the idle timer is fresh), the absolute lifetime expires it:
+      travel.call(31)
+      response = response_for(app: [incrementor, options], cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'migrates legacy cookies without time metadata' do
+      clock, travel = mutable_clock.call
+
+      # Create a cookie with an application that does not track lifetimes:
+      legacy_app = [incrementor, { secrets: @secret }]
+      response = response_for(app: legacy_app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+      legacy_cookie = response["Set-Cookie"]
+
+      # Enable lifetime management: the legacy cookie is accepted and
+      # stamped with fresh timestamps when the session is written:
+      timed_app = [incrementor, { secrets: @secret, absolute_lifetime: 60, clock: clock }]
+      response = response_for(app: timed_app, cookie: legacy_cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      travel.call(30)
+      response = response_for(app: timed_app, cookie: cookie)
+      response.body.must_equal ({"counter"=>3}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # The absolute lifetime is measured from the time of migration:
+      travel.call(31)
+      response = response_for(app: timed_app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'tolerates the clock moving backwards' do
+      clock, travel = mutable_clock.call
+      app = [incrementor, { secrets: @secret, absolute_lifetime: 60, clock: clock }]
+
+      response = response_for(app: app)
+      response.body.must_equal ({"counter"=>1}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # The clock moves backwards: the session is neither expired nor
+      # erroneously renewed, and elapsed time is clamped to zero:
+      travel.call(-20)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>2}.to_s)
+      cookie = response["Set-Cookie"]
+
+      travel.call(10)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>3}.to_s)
+      cookie = response["Set-Cookie"]
+
+      # Once the clock catches up, the lifetime is enforced as usual:
+      travel.call(50)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>4}.to_s)
+      cookie = response["Set-Cookie"]
+
+      travel.call(21)
+      response = response_for(app: app, cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
   end
 end
