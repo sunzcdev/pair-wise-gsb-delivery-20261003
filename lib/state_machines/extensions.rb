@@ -141,6 +141,27 @@ module StateMachines
       fire_events(*(events + [run_action])) || raise(StateMachines::InvalidParallelTransition.new(self, events))
     end
 
+    # Gets the list of events that were deferred on this object because they
+    # could not be handled in the object's current state.  Each entry is a
+    # StateMachines::DeferredEvent holding the machine name, event name, and
+    # the arguments the event was originally invoked with.
+    #
+    # Only events explicitly declared via StateMachines::Machine#defer_events
+    # (or the <tt>:defer</tt> event option) are queued; all other events keep
+    # the default failure behavior.
+    def deferred_events
+      Array(instance_variable_get(:@_state_machines_deferred_events)).dup
+    end
+
+    # Gets the StateMachines::DeferredReplayReport for the most recent replay
+    # of deferred events on the given machine (default: :state), or nil if no
+    # replay has run yet.  The report records which entries fired, which were
+    # deferred again, and which failed (including the raised error).
+    def deferred_replay_report(machine_name = :state)
+      reports = instance_variable_get(:@_state_machines_deferred_replay_reports)
+      reports && reports[machine_name]
+    end
+
     protected
 
     def initialize_state_machines(options = {}, &) # :nodoc:

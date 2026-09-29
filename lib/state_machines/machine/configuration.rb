@@ -15,7 +15,7 @@ module StateMachines
                        end
         
         # Validate options including integration-specific options
-        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async]
+        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async, :defer_queue_size, :defer_replay_limit]
         valid_keys += @integration.integration_options if @integration
         StateMachines::OptionsValidator.assert_valid_keys!(options, valid_keys)
 
@@ -40,6 +40,9 @@ module StateMachines
         @initialize_state = options[:initialize]
         @action_hook_defined = false
         @async_requested = options[:async]
+        @deferred_event_names = []
+        @defer_queue_size = options.fetch(:defer_queue_size, 100)
+        @defer_replay_limit = options.fetch(:defer_replay_limit, 10)
 
         self.owner_class = owner_class
 
@@ -73,6 +76,7 @@ module StateMachines
         @callbacks = { before: @callbacks[:before].dup, after: @callbacks[:after].dup, failure: @callbacks[:failure].dup }
         @async_requested = orig.instance_variable_get(:@async_requested)
         @async_mode_enabled = orig.instance_variable_get(:@async_mode_enabled)
+        @deferred_event_names = @deferred_event_names.dup
       end
 
       # Sets the class which is the owner of this state machine.  Any methods

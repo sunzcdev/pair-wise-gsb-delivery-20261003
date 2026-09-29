@@ -231,7 +231,7 @@ module StateMachines
       #   end
       def event(*names, &)
         options = names.last.is_a?(Hash) ? names.pop : {}
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name, :defer)
 
         # Store the context so that it can be used for / matched against any event
         # that gets added
@@ -253,6 +253,9 @@ module StateMachines
             # Add any states that may have been referenced within the event
             add_states(event.known_states)
           end
+
+          # Mark the event(s) as deferrable if requested
+          defer_events(*events.map(&:name)) if options[:defer]
         end
 
         events.length == 1 ? events.first : events

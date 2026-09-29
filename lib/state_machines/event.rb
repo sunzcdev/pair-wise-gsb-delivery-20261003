@@ -163,13 +163,24 @@ module StateMachines
     # If no transitions can be made, then this will return false, otherwise
     # true.
     #
+    # If the event was declared deferrable (see StateMachines::Machine#defer_events)
+    # and no transition can be made in the object's current state, the event
+    # and its arguments are stored on the object's deferred queue and
+    # +:deferred+ is returned.  Deferred events are replayed, in order, after
+    # the next successful transition on the same machine.
+    #
     # Any additional arguments are passed to the StateMachines::Transition#perform
     # instance method.
     def fire(object, *event_args)
       machine.reset(object)
 
       if (transition = transition_for(object, {}, *event_args))
-        transition.perform(*event_args)
+        result = transition.perform(*event_args)
+        machine.replay_deferred_events(object) if result
+        result
+      elsif machine.deferred_event?(name)
+        machine.defer_event(object, name, event_args)
+        :deferred
       else
         on_failure(object, *event_args)
         false

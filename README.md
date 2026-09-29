@@ -341,6 +341,52 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+## Deferring Events
+
+Events that cannot be handled in the current state can be explicitly deferred.
+They are stored, together with their arguments, on a per-object pending queue
+and replayed in order after the next successful transition:
+
+```ruby
+class Vehicle
+  state_machine :state, initial: :parked do
+    event :ignite do
+      transition parked: :idling
+    end
+
+    event :shift_up, defer: true do
+      transition idling: :first_gear
+    end
+    # ...or mark existing events: defer_events :shift_up
+  end
+end
+
+vehicle = Vehicle.new
+vehicle.shift_up            # => :deferred (cannot shift up while parked)
+vehicle.deferred_events     # => [#<StateMachines::DeferredEvent event=:shift_up args=[]>]
+vehicle.ignite              # => true, replays :shift_up afterwards
+vehicle.state               # => "first_gear"
+```
+
+Events that are *not* declared deferrable keep the default behavior (`false`
+from the event, `StateMachines::InvalidTransition` from the bang version).
+
+Both the queue and each replay round are bounded (configurable via
+`defer_queue_size`, default 100, and `defer_replay_limit`, default 10), so an
+event that keeps being deferred can never block the caller. Overflowing the
+queue raises `StateMachines::DeferredQueueOverflow`.
+
+Every replay round stores a `StateMachines::DeferredReplayReport` on the
+object, recording which entries fired, which were deferred again, and which
+failed (including the raised error):
+
+```ruby
+report = vehicle.deferred_replay_report
+report.fired       # entries that transitioned during the last replay
+report.redeferred  # entries that were deferred again
+report.failed      # [entry, error] pairs for entries whose replay raised
+```
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.
