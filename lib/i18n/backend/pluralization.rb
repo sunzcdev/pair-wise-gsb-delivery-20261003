@@ -25,6 +25,14 @@ module I18n
       # As of v41, 6 locale-specific plural categories are defined:
       #   :few, :many, :one, :other, :two, :zero
       #
+      # When the count is given as text (e.g. "1.00") or as a BigDecimal it
+      # is passed to the rule as an I18n::Count, which preserves the original
+      # decimal representation (see I18n::Count for the available operands).
+      # Rules that do not know about I18n::Count keep working: numeric
+      # messages are delegated to a plain numeric, and I18n::Count.numeric(count)
+      # can be used to explicitly unwrap the count to an Integer or BigDecimal
+      # (never a Float).
+      #
       # n.b., The :one plural category does not imply the number 1.
       # Instead, :one is a category for any number that behaves like 1 in
       # that locale. For example, in some locales, :one is used for numbers

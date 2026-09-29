@@ -87,6 +87,23 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * [Gettext support](https://github.com/ruby-i18n/i18n/wiki/Gettext)
 * Translation metadata
 
+## Decimal-preserving pluralization counts
+
+Counts given as text keep their decimal representation all the way to the
+pluralization rule, so `"1"`, `"1.0"` and `"1.00"` stay distinguishable and
+long fractions are never coerced to a `Float`:
+
+```ruby
+I18n.t(:invoices, count: "1.00") # the rule receives an I18n::Count
+```
+
+`I18n::Count` exposes read-only operands such as `integer_part`,
+`fraction_part` and `fraction_digits` (the number of visible fraction
+digits), and interpolates as its original text. Rules that don't know about
+`I18n::Count` keep working through numeric delegation, or can unwrap the
+count explicitly via `I18n::Count.numeric(count)` / `count.to_numeric`,
+which return an `Integer` or a `Rational` - never a `Float`.
+
 ## Alternative Backend
 
 * Chain

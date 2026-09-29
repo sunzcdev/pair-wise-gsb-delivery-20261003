@@ -40,6 +40,14 @@ module I18n
 
         count = options[:count]
 
+        # Preserve the decimal representation of counts given as text (or as
+        # BigDecimal) so that pluralization rules can tell "1", "1.0" and
+        # "1.00" apart. See I18n::Count.
+        if count.is_a?(String) || (defined?(BigDecimal) && count.is_a?(BigDecimal))
+          count = I18n::Count.parse(count)
+          options = options.merge(:count => count) if count.is_a?(I18n::Count)
+        end
+
         if entry.nil? && (subtrees? || !count)
           if (options.key?(:default) && !options[:default].nil?) || !options.key?(:default)
             throw(:exception, I18n::MissingTranslation.new(locale, key, options))
