@@ -87,8 +87,50 @@ module Rack
     #     }.new
     #   })
     #
+    # Session revocation ("log out of all devices") is supported through the
+    # :revocation_check option. The cookie carries a subject identifier (stored
+    # in the session under REVOCATION_SUBJECT_KEY) and the epoch at which the
+    # session was issued (stored under REVOCATION_EPOCH_KEY, managed by this
+    # middleware). On every request the current epoch for the subject is
+    # resolved by calling the :revocation_check proc with the subject; if it
+    # does not match the epoch stored in the cookie, the session is rejected.
+    # The proc is expected to consult your own datastore (a database client is
+    # deliberately not included) and return the current epoch, e.g. an integer
+    # that you increment to revoke all sessions for a subject:
+    #
+    #   Rack::Session::Cookie.new(application, {
+    #     secrets: secret,
+    #     revocation_check: ->(subject) { SessionEpochs.fetch(subject) },
+    #   })
+    #
+    # Behavior is specified as follows:
+    # * Anonymous sessions (no subject stored in the session) are never
+    #   checked and the revocation_check proc is not called.
+    # * If the subject changes during a request (subject switching), the new
+    #   subject is checked when the session is written, and the cookie is
+    #   stamped with the new subject's current epoch.
+    # * If the revocation_check proc raises or returns nil (callback
+    #   unavailable), the middleware fails closed: the session is rejected on
+    #   read and not saved on write.
+    # * Within a single request, the proc is called at most once per subject;
+    #   the result is memoized in the request environment.
+    # * The epoch stored in the cookie is always re-stamped from the
+    #   revocation_check proc when the session is written, never copied from
+    #   the incoming cookie. A cookie issued before an epoch bump therefore
+    #   cannot become valid again through session renewal.
+    #
 
     class Cookie < Abstract::PersistedSecure
+      # Session key holding the subject identifier used for revocation checks.
+      # Applications set this (e.g. to the user id) to enroll a session in
+      # revocation checking.
+      REVOCATION_SUBJECT_KEY = "_revocation_subject"
+
+      # Session key holding the epoch at which the session was issued. This is
+      # managed by the middleware and overwritten on every write; applications
+      # should not set it directly.
+      REVOCATION_EPOCH_KEY = "_revocation_epoch"
+
       # Encode session cookies as Base64
       class Base64
         def encode(str)
@@ -157,6 +199,8 @@ module Rack
       attr_reader :coder, :encryptors
 
       def initialize(app, options = {})
+        @revocation_check = options.delete(:revocation_check)
+
         # support both :secrets and :secret for backwards compatibility
         secrets = [*(options[:secrets] || options[:secret])]
 
@@ -245,8 +289,55 @@ module Rack
             end
           end
 
-          request.set_header(k, session_data || {})
+          request.set_header(k, revoked(request, session_data) ? {} : session_data || {})
         end
+      end
+
+      # Is the unpacked session data revoked? Always false when no
+      # :revocation_check is configured or the session is anonymous (carries
+      # no subject identifier).
+      def revoked(request, session_data)
+        return false unless @revocation_check
+        return false unless session_data
+
+        subject = session_data[REVOCATION_SUBJECT_KEY]
+        return false unless subject
+
+        current_epoch = current_revocation_epoch(request, subject)
+
+        if current_epoch.nil?
+          request.env[Rack::RACK_ERRORS].puts "Session revocation check unavailable for subject #{subject.inspect}; rejecting session."
+          return true
+        end
+
+        if session_data[REVOCATION_EPOCH_KEY] != current_epoch
+          request.env[Rack::RACK_ERRORS].puts "Session revoked for subject #{subject.inspect}: issued at epoch #{session_data[REVOCATION_EPOCH_KEY].inspect}, current epoch is #{current_epoch.inspect}."
+          return true
+        end
+
+        false
+      end
+
+      # Resolve the current revocation epoch for a subject, calling the
+      # :revocation_check proc at most once per subject per request. Returns
+      # nil when the proc is unavailable (raised or returned nil).
+      def current_revocation_epoch(request, subject)
+        epochs = request.get_header(RACK_SESSION_REVOCATION_EPOCHS)
+        unless epochs
+          epochs = {}
+          request.set_header(RACK_SESSION_REVOCATION_EPOCHS, epochs)
+        end
+
+        unless epochs.key?(subject)
+          epochs[subject] = begin
+            @revocation_check.call(subject)
+          rescue => error
+            request.env[Rack::RACK_ERRORS].puts "Session revocation check failed for subject #{subject.inspect}: #{error.message}"
+            nil
+          end
+        end
+
+        epochs[subject]
       end
 
       def persistent_session_id!(data, sid = nil)
@@ -265,6 +356,23 @@ module Rack
       end
 
       def write_session(req, session_id, session, options)
+        if @revocation_check
+          session = session.dup
+          subject = session[REVOCATION_SUBJECT_KEY]
+
+          if subject
+            # Always re-stamp the epoch from the revocation check, never from
+            # the incoming cookie, so a cookie issued before an epoch bump
+            # cannot be renewed back into validity.
+            current_epoch = current_revocation_epoch(req, subject)
+            return nil unless current_epoch
+
+            session[REVOCATION_EPOCH_KEY] = current_epoch
+          else
+            session.delete(REVOCATION_EPOCH_KEY)
+          end
+        end
+
         session = session.merge("session_id" => session_id)
         session_data = encode_session_data(session)
 
