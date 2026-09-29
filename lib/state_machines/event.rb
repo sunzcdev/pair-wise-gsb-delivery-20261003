@@ -144,15 +144,51 @@ module StateMachines
 
         # Branch allows for the transition to occur
         from = requirements[:from]
-        to = if match[:to].is_a?(LoopbackMatcher)
-               from
-             else
-               values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
-
-               match[:to].filter(values).first
-             end
+        to = resolve_to_state(match, requirements, from)
 
         return Transition.new(object, machine, name, from, to, !custom_from_state)
+      end
+
+      # No transition matched
+      nil
+    end
+
+    # Plans the next available transition for the given object without
+    # running it.  This works like +transition_for+, but returns a
+    # StateMachines::TransitionPlan describing the starting state, target
+    # state, selected branch, and the kinds of callbacks that would run --
+    # no action or transition callbacks are executed.
+    #
+    # Only guards that can be safely pre-checked are evaluated while
+    # planning: state guards and if/unless conditions declared as pure via
+    # StateMachines::Machine#pure_guard.  Any other guard is skipped and
+    # reported in the plan's +unchecked_guards+; it will be verified when
+    # (and only when) the plan is performed.
+    #
+    # If no transition can be planned, then this will return nil.
+    #
+    # Valid requirement options are the same as for +transition_for+.
+    #
+    # == Example
+    #
+    #   plan = machine.event(:ignite).plan(vehicle)
+    #   plan.from_name       # => :parked
+    #   plan.to_name         # => :idling
+    #   plan.callback_kinds  # => [:before, :after]
+    #   plan.perform         # actually fires the event, re-validating first
+    def plan(object, requirements = {}, *event_args)
+      StateMachines::OptionsValidator.assert_valid_keys!(requirements, :from, :to, :guard)
+      requirements[:from] = machine.states.match!(object).name unless (custom_from_state = requirements.include?(:from))
+
+      branches.each do |branch|
+        next unless (result = branch.match_precheckable(object, requirements, event_args, machine.pure_guards))
+
+        # Branch allows for the transition to occur
+        from = requirements[:from]
+        to = resolve_to_state(result[:requirements], requirements, from)
+
+        transition = Transition.new(object, machine, name, from, to, !custom_from_state)
+        return TransitionPlan.new(transition, branch, result[:unchecked_guards])
       end
 
       # No transition matched
@@ -233,6 +269,12 @@ module StateMachines
         machine.event(name).transition_for(object, *args, **kwargs)
       end
 
+      # Plans the next transition that would be performed if the event were
+      # fired now, without running any action or callbacks
+      machine.define_helper(:instance, "#{qualified_name}_plan") do |machine, object, *args, **kwargs|
+        machine.event(name).plan(object, *args, **kwargs)
+      end
+
       # Fires the event
       machine.define_helper(:instance, qualified_name) do |machine, object, *args, **kwargs|
         machine.event(name).fire(object, *args, **kwargs)
@@ -241,6 +283,17 @@ module StateMachines
       # Fires the event, raising an exception if it fails
       machine.define_helper(:instance, "#{qualified_name}!") do |machine, object, *args, **kwargs|
         object.send(qualified_name, *args, **kwargs) || raise(StateMachines::InvalidTransition.new(object, machine, name))
+      end
+    end
+
+    # Resolves the state to transition to based on the given branch match
+    def resolve_to_state(match, requirements, from)
+      if match[:to].is_a?(LoopbackMatcher)
+        from
+      else
+        values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
+
+        match[:to].filter(values).first
       end
     end
   end

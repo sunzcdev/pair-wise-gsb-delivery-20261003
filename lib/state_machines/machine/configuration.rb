@@ -33,6 +33,7 @@ module StateMachines
         @events = EventCollection.new(self)
         @states = StateCollection.new(self)
         @callbacks = { before: [], after: [], failure: [] }
+        @pure_guards = []
         @namespace = options[:namespace]
         @messages = options[:messages] || {}
         @action = options[:action]
@@ -71,6 +72,7 @@ module StateMachines
         @states = @states.dup
         @states.machine = self
         @callbacks = { before: @callbacks[:before].dup, after: @callbacks[:after].dup, failure: @callbacks[:failure].dup }
+        @pure_guards = @pure_guards.dup
         @async_requested = orig.instance_variable_get(:@async_requested)
         @async_mode_enabled = orig.instance_variable_get(:@async_mode_enabled)
       end

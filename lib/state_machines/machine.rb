@@ -12,6 +12,7 @@ require_relative 'machine/configuration'
 require_relative 'machine/state_methods'
 require_relative 'machine/event_methods'
 require_relative 'machine/callbacks'
+require_relative 'machine/pure_guards'
 require_relative 'machine/rendering'
 require_relative 'machine/integration'
 require_relative 'machine/async_extensions'
@@ -430,6 +431,7 @@ module StateMachines
     include StateMethods
     include EventMethods
     include Callbacks
+    include PureGuards
     include Rendering
     include Integration
 

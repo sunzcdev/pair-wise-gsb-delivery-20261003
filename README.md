@@ -341,6 +341,81 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+# Planning Transitions
+
+Events can be *planned* separately from being fired.  Planning an event returns a
+`StateMachines::TransitionPlan` describing what would happen -- the starting state, the
+target state, the selected branch, and the kinds of callbacks that would run -- without
+running the machine's action or any transition callbacks.  This lets callers inspect the
+outcome first and decide whether to go through with it.
+
+```ruby
+class Vehicle
+  state_machine initial: :parked, action: :save do
+    # Declares :seatbelt_on? as a pure check that is safe to evaluate while planning
+    pure_guard :seatbelt_on?
+
+    event :ignite do
+      transition parked: :idling, if: :seatbelt_on?
+    end
+
+    event :park do
+      transition idling: :parked
+    end
+
+    event :shift_up do
+      transition idling: :first_gear
+    end
+  end
+end
+
+vehicle = Vehicle.new
+plan = vehicle.ignite_plan      # => #<StateMachines::TransitionPlan event=:ignite from_name=:parked to_name=:idling ...>
+plan.from_name                  # => :parked
+plan.to_name                    # => :idling
+plan.branch                     # => the selected StateMachines::Branch
+plan.callback_kinds             # => [:before, :after] (kinds that would run, based on event/from/to requirements)
+plan.verified?                  # => true (all guards were pre-checkable)
+vehicle.state                   # => "parked" (nothing was run)
+
+plan.perform                    # actually fires the event: re-validates, runs callbacks + action
+```
+
+## Guard pre-checks
+
+Planning never runs arbitrary application code.  Only guards that are safe to pre-check
+are evaluated while planning:
+
+* state guards (`:if_state` and friends), which only read state, and
+* `:if` / `:unless` conditions explicitly declared as pure via `pure_guard`.
+
+Any other guard (procs, strings, or undeclared methods) is skipped while planning and
+reported on the plan; it is only verified when the plan is performed:
+
+```ruby
+plan = vehicle.ignite_plan
+plan.verified?          # => false
+plan.unchecked_guards   # => [{ type: :if, condition: :seatbelt_on? }] (if not declared via pure_guard)
+```
+
+## Stale plans
+
+A plan is a snapshot, never a blank check.  Performing a plan re-reads the object's
+current state and re-evaluates *all* of the event's guards before anything is run.  If
+the object has moved on -- for example because another event was fired after the plan
+was built -- the plan is stale and will not be forced onto the object:
+
+```ruby
+plan = vehicle.ignite_plan      # planned: parked => idling
+vehicle.ignite                  # the object moves on in the meantime...
+vehicle.shift_up                # ...as other events fire
+plan.stale?                     # => true
+plan.perform                    # => StateMachines::StalePlanError
+```
+
+`StateMachines::StalePlanError` is also raised if the event's guards no longer resolve
+to the planned transition at perform time.
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.

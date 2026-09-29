@@ -149,6 +149,37 @@ module StateMachines
       match
     end
 
+    # Attempts to match the given object / query like +match+, but only
+    # evaluates guards that can be safely pre-checked: state guards (which
+    # only read state) and if/unless conditions declared as pure (see
+    # StateMachines::Machine#pure_guard).  All other guards are skipped and
+    # reported so that the caller can flag them as unverified.
+    #
+    # If a match is found, a hash of the following form is returned:
+    #
+    #   { requirements: {...}, unchecked_guards: [{ type: :if, condition: ... }, ...] }
+    #
+    # Otherwise, nil is returned if there was no match.
+    def match_precheckable(object, query = {}, event_args = [], pure_guards = [])
+      StateMachines::OptionsValidator.assert_valid_keys!(query, :from, :to, :on, :guard)
+
+      return unless (match = match_query(query)) && matches_precheckable_conditions?(object, query, event_args, pure_guards)
+
+      { requirements: match, unchecked_guards: unchecked_guards(pure_guards) }
+    end
+
+    # The if/unless conditions configured for this branch that cannot be
+    # safely evaluated ahead of time.  Only conditions declared as pure (via
+    # StateMachines::Machine#pure_guard) are considered pre-checkable; procs,
+    # strings, and undeclared methods are reported here.  State guards always
+    # count as pre-checkable since they only read state.
+    def unchecked_guards(pure_guards = [])
+      guards = []
+      Array(if_condition).each { |condition| guards << { type: :if, condition: condition } unless pure_condition?(condition, pure_guards) }
+      Array(unless_condition).each { |condition| guards << { type: :unless, condition: condition } unless pure_condition?(condition, pure_guards) }
+      guards
+    end
+
     def draw(graph, event, valid_states, io = $stdout)
       event.machine.renderer.draw_branch(self, graph, event, valid_states, io)
     end
@@ -230,6 +261,31 @@ module StateMachines
     end
 
     private
+
+    # Determines whether the given if/unless condition is declared as pure
+    # and can therefore be safely evaluated when planning an event
+    def pure_condition?(condition, pure_guards)
+      condition.is_a?(Symbol) && pure_guards.include?(condition)
+    end
+
+    # Verifies the pre-checkable conditionals for this branch.  Conditions
+    # that are not declared as pure are skipped; state guards are always
+    # verified since they only read state.
+    def matches_precheckable_conditions?(object, query, event_args, pure_guards)
+      return true if query[:guard] == false
+
+      precheckable_if = Array(if_condition).select { |condition| pure_condition?(condition, pure_guards) }
+      precheckable_unless = Array(unless_condition).select { |condition| pure_condition?(condition, pure_guards) }
+
+      if_passes = precheckable_if.all? { |condition| evaluate_method_with_event_args(object, condition, event_args) }
+      unless_passes = precheckable_unless.none? { |condition| evaluate_method_with_event_args(object, condition, event_args) }
+
+      return false unless if_passes && unless_passes
+
+      return true if state_guards.empty?
+
+      validate_and_check_state_guards(object, state_guards)
+    end
 
     def validate_and_check_state_guards(object, guards)
       guards.all? do |guard_type, conditions|
