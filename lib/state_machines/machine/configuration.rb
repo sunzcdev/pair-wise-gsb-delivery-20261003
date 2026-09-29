@@ -15,7 +15,7 @@ module StateMachines
                        end
         
         # Validate options including integration-specific options
-        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async]
+        valid_keys = [:attribute, :initial, :initialize, :action, :plural, :namespace, :integration, :messages, :use_transactions, :async, :version]
         valid_keys += @integration.integration_options if @integration
         StateMachines::OptionsValidator.assert_valid_keys!(options, valid_keys)
 
@@ -40,6 +40,10 @@ module StateMachines
         @initialize_state = options[:initialize]
         @action_hook_defined = false
         @async_requested = options[:async]
+        @version = options[:version] || 1
+        unless @version.is_a?(Integer) && @version >= 1
+          raise ArgumentError, "version must be a positive integer, got #{@version.inspect}"
+        end
 
         self.owner_class = owner_class
 
@@ -71,6 +75,7 @@ module StateMachines
         @states = @states.dup
         @states.machine = self
         @callbacks = { before: @callbacks[:before].dup, after: @callbacks[:after].dup, failure: @callbacks[:failure].dup }
+        @migrations = orig.instance_variable_get(:@migrations)&.dup
         @async_requested = orig.instance_variable_get(:@async_requested)
         @async_mode_enabled = orig.instance_variable_get(:@async_mode_enabled)
       end

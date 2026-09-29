@@ -15,6 +15,8 @@ require_relative 'machine/callbacks'
 require_relative 'machine/rendering'
 require_relative 'machine/integration'
 require_relative 'machine/async_extensions'
+require_relative 'snapshot'
+require_relative 'machine/snapshot'
 require_relative 'syntax_validator'
 
 module StateMachines
@@ -429,9 +431,10 @@ module StateMachines
     include Configuration
     include StateMethods
     include EventMethods
-    include Callbacks
-    include Rendering
-    include Integration
+  include Callbacks
+  include Rendering
+  include Integration
+  include Snapshot
 
     # Whether to ignore any conflicts that are detected for helper methods that
     # get generated for a machine's owner class.  Default is false.

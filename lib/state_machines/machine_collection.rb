@@ -47,6 +47,55 @@ module StateMachines
       result
     end
 
+    # Builds a JSON-compatible snapshot of the current state of every machine
+    # in this collection for the given object.  The snapshot is keyed by
+    # machine name and captures each machine's definition version and state
+    # value, so it can be persisted (e.g. via JSON.generate) and restored
+    # after a restart.
+    #
+    # == Example
+    #
+    #   Vehicle.state_machines.snapshot(vehicle)
+    #   # => {"state"=>{"version"=>1, "value"=>"parked"}, "alarm_state"=>{"version"=>2, "value"=>"active"}}
+    def snapshot(object)
+      each_with_object({}) do |(name, machine), result|
+        result[name.to_s] = machine.snapshot(object)
+      end
+    end
+
+    # Restores machine states previously exported via #snapshot onto the
+    # given object.
+    #
+    # Every machine is fully validated -- including version migrations and
+    # state lookups -- *before* anything is written, so a broken snapshot
+    # raises StateMachines::InvalidSnapshot and leaves the object completely
+    # untouched.  States are written directly to the machine attributes:
+    # no events are fired and no callbacks or actions are run.
+    #
+    # The snapshot must be JSON-compatible data (e.g. the result of
+    # JSON.parse); arbitrary Ruby objects are not accepted.
+    def restore(object, snapshot)
+      unless snapshot.is_a?(Hash) && StateMachines::Snapshot.json_compatible?(snapshot)
+        raise InvalidSnapshot, 'Snapshot must be a JSON-compatible hash of machine snapshots'
+      end
+
+      unknown = snapshot.keys - keys.map(&:to_s)
+      raise InvalidSnapshot, "Snapshot contains unknown state machines: #{unknown.join(', ')}" if unknown.any?
+
+      # Validate every machine and compute the values to write *before*
+      # modifying the object, so a broken snapshot can never leave the
+      # object partially restored
+      writes = map do |name, machine|
+        entry = snapshot[name.to_s]
+        raise InvalidSnapshot, "Snapshot is missing an entry for #{name.inspect}" if entry.nil?
+
+        [machine, machine.restore_value(entry)]
+      end
+
+      writes.each { |machine, value| machine.write(object, :state, value) }
+      object
+    end
+
     # Runs one or more events in parallel on the given object.  See
     # StateMachines::InstanceMethods#fire_events for more information.
     def fire_events(object, *events)

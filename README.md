@@ -341,6 +341,82 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+## Snapshots & Persistence
+
+Background workers and other long-lived processes often need to persist their
+state machines and restore them after a restart. `MachineCollection#snapshot`
+exports every machine on an object as a plain, JSON-compatible hash keyed by
+machine name, capturing the machine's definition version and current state
+value:
+
+```ruby
+class Job
+  state_machine :state, initial: :pending do
+    event :start do
+      transition pending: :running
+    end
+  end
+
+  state_machine :alarm_state, initial: :active do
+    event :silence do
+      transition active: :off
+    end
+  end
+end
+
+job = Job.new
+snapshot = Job.state_machines.snapshot(job)
+# => {"state"=>{"version"=>1, "value"=>"pending"}, "alarm_state"=>{"version"=>1, "value"=>"active"}}
+
+File.write('job.snapshot', JSON.generate(snapshot))
+```
+
+Restore it later (even in a new process) with `restore`:
+
+```ruby
+snapshot = JSON.parse(File.read('job.snapshot'))
+Job.state_machines.restore(job, snapshot)
+```
+
+Restoring is safe by design:
+
+* **Atomic** -- every machine is fully validated *before* anything is written.
+  If any entry is broken, `StateMachines::InvalidSnapshot` is raised and the
+  object is left completely untouched (no partial restores).
+* **No side effects** -- states are written directly to the attributes; no
+  events are fired and no callbacks or actions are run.
+* **Data only** -- snapshots must be JSON-compatible values (string keys,
+  scalars, arrays, hashes). Arbitrary Ruby objects are never accepted or
+  deserialized.
+
+### Versioned definitions and migrations
+
+When a new release renames states, bump the machine's `version` and register
+an explicit migration between adjacent versions. Snapshots written by older
+versions are migrated step by step on restore:
+
+```ruby
+class Job
+  state_machine :state, initial: :queued, version: 2 do
+    # version 1 stored "pending"; version 2 calls it "queued"
+    migrate(1) { |value| value == 'pending' ? 'queued' : value }
+
+    event :start do
+      transition queued: :running
+    end
+  end
+end
+
+# A snapshot written by version 1 still restores correctly:
+Job.state_machines.restore(job, 'state' => { 'version' => 1, 'value' => 'pending' },
+                               'alarm_state' => { 'version' => 1, 'value' => 'active' })
+job.state # => "queued"
+```
+
+If a snapshot's version has no registered migration path to the current
+version (or is newer than the definition), restore raises
+`StateMachines::InvalidSnapshot` instead of guessing.
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.

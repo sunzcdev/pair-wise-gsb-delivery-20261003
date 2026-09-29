@@ -112,4 +112,12 @@ module StateMachines
   # A method was called in an invalid state context
   class InvalidContext < Error
   end
+
+  # A state machine snapshot failed validation while being exported or
+  # restored
+  class InvalidSnapshot < Error
+    def initialize(message) # :nodoc:
+      super(nil, message)
+    end
+  end
 end
