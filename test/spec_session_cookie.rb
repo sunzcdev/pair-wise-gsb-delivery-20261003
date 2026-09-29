@@ -49,6 +49,16 @@ describe Rack::Session::Cookie do
     Rack::Response.new(env["rack.session"].inspect).to_a
   end
 
+  sizer = lambda do |env|
+    size = Rack::Request.new(env).params["size"].to_i
+    env["rack.session"]["payload"] = "x" * size
+    Rack::Response.new("ok").to_a
+  end
+
+  payload_size = lambda do |env|
+    Rack::Response.new(env["rack.session"]["payload"].to_s.bytesize.to_s).to_a
+  end
+
   destroy_session = lambda do |env|
     env["rack.session"].destroy
     Rack::Response.new("Nothing").to_a
@@ -66,6 +76,27 @@ describe Rack::Session::Cookie do
     app_with_cookie = Rack::Session::Cookie.new(*options[:app])
     app_with_cookie = Rack::Lint.new(app_with_cookie)
     Rack::MockRequest.new(app_with_cookie).get("/", request_options)
+  end
+
+  # Simulates a browser cookie jar: applies the Set-Cookie headers of the
+  # response to the jar, honoring cookie deletions.
+  def extract_cookies(response, jar = {})
+    Array(response["Set-Cookie"]).each do |header|
+      pair, attributes = header.split(';', 2)
+      name, value = pair.split('=', 2)
+
+      if attributes =~ /max-age=0|expires=Thu, 01 Jan 1970/
+        jar.delete(name)
+      else
+        jar[name] = value
+      end
+    end
+
+    jar
+  end
+
+  def cookie_header_for(jar)
+    jar.map { |name, value| "#{name}=#{value}" }.join('; ')
   end
 
   def random_encryptor_secret
@@ -618,5 +649,166 @@ describe Rack::Session::Cookie do
     response.body.must_match /"value"\s*=>\s*"#{'A' * 256}"/
     response.body.must_match /"counter"\s*=>\s*2/
     response.body.must_match(/\A{[^}]+}\z/)
+  end
+
+  describe 'chunked cookies' do
+    chunk_name = /\Arack\.session\.[0-9a-f]{16}\.\d+\z/
+    chunk_header = /\Arack\.session\.[0-9a-f]{16}\.\d+=/
+
+    it 'requires secrets when chunking is enabled' do
+      lambda {
+        Rack::Session::Cookie.new(incrementor, chunked: true)
+      }.must_raise ArgumentError
+    end
+
+    it 'writes small sessions as a single cookie when chunking is enabled' do
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }])
+      response["Set-Cookie"].must_include "rack.session="
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'reads plain single cookies when chunking is enabled' do
+      response = response_for(app: [incrementor, { secrets: @secret }])
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }], cookie: response)
+      response.body.must_equal ({"counter"=>2}.to_s)
+    end
+
+    it 'splits oversized sessions into a manifest and generation-tagged chunks' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=9000" })
+
+      cookies = Array(response["Set-Cookie"])
+      cookies.size.must_be :>, 2
+      cookies.first.must_match(/\Arack\.session=/)
+      cookies[1..-1].each { |header| header.must_match(chunk_header) }
+
+      # The chunks reassemble into the original session.
+      jar = extract_cookies(response)
+      response = response_for(app: [payload_size, { secrets: @secret, chunked: true }], cookie: cookie_header_for(jar))
+      response.body.must_equal "9000"
+    end
+
+    it 'handles consecutive size changes, deleting stale tail chunks' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+
+      # Start small: a single plain cookie.
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=10" })
+      jar = extract_cookies(response)
+      jar.keys.must_equal ["rack.session"]
+
+      # Grow beyond a single cookie: manifest plus chunk cookies.
+      response = response_for(app: app, cookie: cookie_header_for(jar), request: { "QUERY_STRING" => "size=9000" })
+      jar = extract_cookies(response, jar)
+      chunk_count = jar.keys.grep(chunk_name).size
+      chunk_count.must_be :>=, 2
+
+      # Shrink within chunking: fewer chunks, stale tail chunks deleted.
+      response = response_for(app: app, cookie: cookie_header_for(jar), request: { "QUERY_STRING" => "size=4500" })
+      deletions = Array(response["Set-Cookie"]).grep(/max-age=0/)
+      jar = extract_cookies(response, jar)
+      new_chunk_count = jar.keys.grep(chunk_name).size
+      new_chunk_count.must_be :<, chunk_count
+      deletions.size.must_equal chunk_count - new_chunk_count
+
+      # Shrink back to a single cookie: all remaining chunks deleted.
+      response = response_for(app: app, cookie: cookie_header_for(jar), request: { "QUERY_STRING" => "size=10" })
+      deletions = Array(response["Set-Cookie"]).grep(/max-age=0/)
+      deletions.size.must_equal new_chunk_count
+      jar = extract_cookies(response, jar)
+      jar.keys.must_equal ["rack.session"]
+
+      # The shrunken session still reads back correctly.
+      response = response_for(app: [payload_size, { secrets: @secret, chunked: true }], cookie: cookie_header_for(jar))
+      response.body.must_equal "10"
+    end
+
+    it 'rejects the session when the browser returns only some chunks' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=9000" })
+      jar = extract_cookies(response)
+
+      # The browser "loses" one of the chunk cookies.
+      jar.delete(jar.keys.grep(chunk_name).first)
+
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }], cookie: cookie_header_for(jar))
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'rejects the session when a chunk cookie is sent twice' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=9000" })
+      jar = extract_cookies(response)
+
+      chunk_pair = cookie_header_for(jar).split('; ').find { |pair| pair =~ chunk_header }
+      cookie = "#{cookie_header_for(jar)}; #{chunk_pair}"
+
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }], cookie: cookie)
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'rejects the session when chunks from different generations are mixed' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+
+      # Two independent chunked sessions use different generations.
+      jar_a = extract_cookies(response_for(app: app, request: { "QUERY_STRING" => "size=9000" }))
+      jar_b = extract_cookies(response_for(app: app, request: { "QUERY_STRING" => "size=9000" }))
+
+      # The browser sends one session's manifest with chunks from both.
+      jar = jar_a.merge(jar_b)
+
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }], cookie: cookie_header_for(jar))
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'rejects the session when a chunk is tampered with' do
+      app = [sizer, { secrets: @secret, chunked: true }]
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=9000" })
+      jar = extract_cookies(response)
+
+      name = jar.keys.grep(chunk_name).first
+      jar[name] = jar[name].sub(/[A-Za-z0-9]/) { |char| char == "A" ? "B" : "A" }
+
+      response = response_for(app: [incrementor, { secrets: @secret, chunked: true }], cookie: cookie_header_for(jar))
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'rejects manifests that exceed the chunk limit' do
+      manifest = Rack::Session::Encryptor.new(@secret).encrypt(
+        "rack.session.chunks" => {
+          "generation" => "0" * 16,
+          "count" => 5,
+          "digest" => Digest::SHA256.hexdigest("chunks")
+        }
+      )
+
+      response = response_for(
+        app: [incrementor, { secrets: @secret, chunked: true }],
+        cookie: "rack.session=#{Rack::Utils.escape(manifest)}"
+      )
+      response.body.must_equal ({"counter"=>1}.to_s)
+    end
+
+    it 'refuses to write sessions that exceed the chunk limit' do
+      huge = lambda do |env|
+        env["rack.session"]["payload"] = "x" * 100_000
+        Rack::Response.new("ok").to_a
+      end
+
+      lambda {
+        response_for(app: [huge, { secrets: @secret, chunked: true }], request: { fatal: true })
+      }.must_raise Rack::MockRequest::FatalWarning
+    end
+
+    it 'accounts all Set-Cookie headers against the header budget' do
+      # The manifest and chunk cookies together exceed the budget: the
+      # session is dropped instead of bypassing the limit via chunking.
+      app = [sizer, { secrets: @secret, chunked: true, header_budget: 4096 }]
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=9000" })
+      response["Set-Cookie"].must_be_nil
+
+      # A small session fits within the same budget.
+      response = response_for(app: app, request: { "QUERY_STRING" => "size=10" })
+      response["Set-Cookie"].wont_be_nil
+    end
   end
 end
