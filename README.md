@@ -325,6 +325,32 @@ encoded_token.verify_signature!(algorithm: 'HS256', key: "secret")
 encoded_token.payload # => {"pay"=>"load"}
 ```
 
+## Detached signatures over raw bytes
+
+The `JWT::DetachedPayload` module provides an entry point, separate from `JWT.encode`/`JWT.decode`, for generating and verifying detached signatures ([RFC 7515 Appendix F](https://datatracker.ietf.org/doc/html/rfc7515#appendix-F)) over external raw payload bytes. The payload is treated as opaque bytes: it is never JSON processed or transcoded, so payloads containing dots, newlines or non-UTF-8 bytes are signed and verified exactly as given.
+
+```ruby
+payload = File.binread('document.bin')
+
+jwt = JWT::DetachedPayload.encode(payload, 'secret', 'HS256')
+# => "eyJhbGciOiJIUzI1NiJ9..HIt3_cMfBEC4IC6wk4zIuuQtDGUwztKc1-zJYH_COVk"
+
+payload, header = JWT::DetachedPayload.decode(jwt, payload, 'secret', true, algorithm: 'HS256')
+```
+
+### Unencoded payload mode
+
+The explicitly declared unencoded payload mode ([RFC 7797](https://datatracker.ietf.org/doc/html/rfc7797)) signs the payload bytes as-is, without base64url encoding. The mode is declared in the protected header via `"b64": false` together with the corresponding `"crit"` entry, and must be confirmed by the verifier via the `unencoded: true` option.
+
+```ruby
+jwt = JWT::DetachedPayload.encode(payload, 'secret', 'HS256', {}, unencoded: true)
+
+payload, header = JWT::DetachedPayload.decode(jwt, payload, 'secret', true, algorithm: 'HS256', unencoded: true)
+header # => {"b64"=>false, "crit"=>["b64"], "alg"=>"HS256"}
+```
+
+Verification fails if the payload differs by even a single byte, if the token also carries an embedded payload, or if the unencoded payload declaration does not match the `unencoded` option.
+
 ## Claims
 
 JSON Web Token defines some reserved claim names and defines how they should be

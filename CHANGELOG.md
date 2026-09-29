@@ -7,6 +7,7 @@
 **Features:**
 
 - Your contribution here
+- Add `JWT::DetachedPayload` for generating and verifying detached signatures over external raw payload bytes, with support for the explicitly declared unencoded payload mode (`b64: false` with `crit`)
 
 **Fixes and enhancements:**
 
