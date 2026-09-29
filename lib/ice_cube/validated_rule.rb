@@ -108,6 +108,59 @@ module IceCube
       @validations[key] ||= []
     end
 
+    # Explain whether this rule generates an occurrence at the given time,
+    # and if not, why not. Returns structured data (no localized strings) so
+    # that interfaces can translate the result themselves:
+    #
+    #   {
+    #     rule: self,
+    #     matched: true/false,
+    #     blockers: [:before_start_time, :condition_mismatch,
+    #                :count_exceeded, :until_exceeded],
+    #     conditions: [{name:, index:, matched:, offset:, expected:, actual:}],
+    #     limits: {count: {limit:, used:, remaining:, exceeded:},
+    #              until: {time:, exceeded:}}
+    #   }
+    #
+    # The rule is never mutated: COUNT usage is replayed on a disposable copy
+    # rebuilt from #to_hash, and only for rules carrying a COUNT validation,
+    # so the replay terminates after at most +count+ emissions and never
+    # walks an unbounded sequence.
+    def explain(time, start_time)
+      effective_start = full_required? ? realign(start_time, start_time) : realign(time, start_time)
+      blockers = []
+      conditions = []
+      limits = {}
+
+      blockers << :before_start_time if time < effective_start
+
+      validation_names.each do |name|
+        group = []
+        @validations[name].each_with_index do |validation, index|
+          if validation.type == :limit
+            limits[name] = explain_limit(name, validation, time, effective_start)
+            blockers << :"#{name}_exceeded" if limits[name][:exceeded]
+          else
+            group << explain_condition(name, index, validation, time, effective_start)
+          end
+        end
+        # Validations within a type group are alternatives: the group accepts
+        # the time as soon as any of its validations does.
+        unless group.empty? || group.any? { |condition| condition[:matched] }
+          blockers << :condition_mismatch
+        end
+        conditions.concat(group)
+      end
+
+      {
+        rule: self,
+        matched: blockers.empty?,
+        blockers: blockers.uniq,
+        conditions: conditions,
+        limits: limits
+      }
+    end
+
     # Fully replace validations
     def replace_validations_for(key, arr)
       if arr.nil?
@@ -136,6 +189,66 @@ module IceCube
       validation_names.all? do |type|
         validation_accepts_or_updates_time?(@validations[type])
       end
+    end
+
+    # Evaluate a single non-limit validation against +time+ and describe the
+    # outcome. The +name+ and +index+ pair locates the sub-condition within
+    # the rule so callers can point at the exact failing part.
+    def explain_condition(name, index, validation, time, start_time)
+      offset = validation.validate(time, start_time)
+      matched = offset.nil? || offset == 0
+      condition = {name: name, index: index, matched: matched}
+      condition[:offset] = offset unless matched
+      if validation.respond_to?(:value)
+        expected = validation.value
+        expected = start_time.send(validation.type) if expected.nil? && time.respond_to?(validation.type)
+        condition[:expected] = expected
+        condition[:actual] = time.send(validation.type) if time.respond_to?(validation.type)
+      elsif validation.respond_to?(:occ)
+        condition[:expected] = {day: validation.day, occurrence: validation.occ}
+      elsif validation.respond_to?(:interval)
+        condition[:expected] = validation.interval
+      elsif validation.respond_to?(:by_set_pos)
+        condition[:expected] = validation.by_set_pos
+      end
+      condition
+    end
+
+    # Describe a COUNT or UNTIL limit at the given time.
+    def explain_limit(name, validation, time, start_time)
+      case name
+      when :count
+        used = count_uses_before(time, start_time)
+        {
+          limit: validation.count,
+          used: used,
+          remaining: [validation.count - used, 0].max,
+          exceeded: used >= validation.count
+        }
+      when :until
+        end_time = TimeUtil.ensure_time(validation.time, start_time, true)
+        {time: end_time, exceeded: time > end_time}
+      end
+    end
+
+    # Number of occurrences this rule emits strictly before +time+. Replayed
+    # on a disposable copy so the rule's own enumeration state is untouched.
+    # Only called for rules with a COUNT validation, so the replay stops
+    # after at most +count+ emissions (CountExceeded) and never traverses an
+    # unbounded sequence.
+    def count_uses_before(time, start_time)
+      copy = Rule.from_hash(to_hash)
+      copy.reset
+      uses = 0
+      t = start_time
+      while (candidate = copy.next_time(t, start_time, time - 1))
+        break if candidate >= time
+        uses += 1
+        t = candidate + 1
+      end
+      uses
+    rescue CountExceeded, UntilExceeded
+      uses
     end
 
     def find_acceptable_time_before(boundary)

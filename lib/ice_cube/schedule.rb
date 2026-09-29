@@ -293,6 +293,52 @@ module IceCube
       occurs_between?(time, time)
     end
 
+    # Explain why the schedule does or does not occur at the given time.
+    # Returns structured data only (no localized strings) so interfaces can
+    # translate it themselves:
+    #
+    #   {
+    #     time: time,
+    #     occurs: true/false,
+    #     reasons: [:before_start_time, :no_recurrence_match,
+    #               :excluded_by_exception],
+    #     start_time: ..., end_time: ...,
+    #     recurrence: {matched:, rules: [...], times: [...], implicit_start: ...},
+    #     exceptions: {matched:, rules: [...], times: [...]}
+    #   }
+    #
+    # Each rule entry comes from ValidatedRule#explain and pinpoints the
+    # failing sub-conditions (by validation name and index) as well as any
+    # COUNT / UNTIL / start-of-schedule limits that applied.
+    #
+    # The explanation never mutates the rules, so subsequent enumerations
+    # are unaffected, and it never walks an unbounded sequence: COUNT usage
+    # is replayed only for rules that carry a COUNT validation.
+    def explain(time)
+      time = TimeUtil.match_zone(time, start_time) or
+        raise ArgumentError, "Time required, got #{time.inspect}"
+      time += TimeUtil.subsec(start_time) - TimeUtil.subsec(time)
+      before_start = time < start_time
+
+      recurrence = explain_recurrence(time, before_start)
+      exceptions = explain_exceptions(time)
+
+      reasons = []
+      reasons << :before_start_time if before_start
+      reasons << :no_recurrence_match unless recurrence[:matched]
+      reasons << :excluded_by_exception if recurrence[:matched] && exceptions[:matched]
+
+      {
+        time: time,
+        occurs: reasons.empty?,
+        reasons: reasons,
+        start_time: start_time,
+        end_time: end_time,
+        recurrence: recurrence,
+        exceptions: exceptions
+      }
+    end
+
     # Get the first n occurrences, or the first occurrence if n is skipped
     def first(n = nil)
       occurrences = enumerate_occurrences(start_time).take(n || 1)
@@ -482,6 +528,34 @@ module IceCube
       return true if terminating?
       method_name = caller(1..1).first.split(" ").last
       raise ArgumentError, "All recurrence rules must specify .until or .count to use #{method_name}"
+    end
+
+    # Explain the inclusion side of the schedule at the given time.
+    def explain_recurrence(time, before_start)
+      rules = recurrence_rules.map.with_index do |rule, index|
+        rule.explain(time, start_time).merge(index: index)
+      end
+      times = recurrence_times.map do |rtime|
+        {time: rtime, matched: rtime == time}
+      end
+      implicit_start = recurrence_rules.empty? ? {time: start_time, matched: time == start_time} : nil
+      included = rules.any? { |report| report[:matched] } ||
+        times.any? { |entry| entry[:matched] } ||
+        (implicit_start && implicit_start[:matched])
+      matched = !before_start && included ? true : false
+      {matched: matched, rules: rules, times: times, implicit_start: implicit_start}
+    end
+
+    # Explain the exclusion side of the schedule at the given time.
+    def explain_exceptions(time)
+      rules = exception_rules.map.with_index do |rule, index|
+        rule.explain(time, start_time).merge(index: index)
+      end
+      times = exception_times.map do |extime|
+        {time: extime, matched: extime == time}
+      end
+      matched = rules.any? { |report| report[:matched] } || times.any? { |entry| entry[:matched] }
+      {matched: matched, rules: rules, times: times}
     end
 
     def implicit_start_occurrence_rule

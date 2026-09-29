@@ -120,6 +120,40 @@ To limit schedules use `count` or `until` on the recurrence rules. Setting `end_
 
 ---
 
+## Explaining occurrences
+
+`Schedule#explain(time)` reports why the schedule does or does not occur at a
+given time. It returns structured data only (no localized strings), so
+interfaces can translate the result themselves:
+
+```ruby
+# a date that is both included and excluded
+schedule = IceCube::Schedule.new(Time.utc(2026, 1, 5, 9)) do |s|
+  s.add_recurrence_rule IceCube::Rule.daily
+  s.add_exception_rule IceCube::Rule.weekly.day(:monday)
+end
+schedule.explain(Time.utc(2026, 1, 12, 9))[:reasons] # => [:excluded_by_exception]
+
+# just past the COUNT limit
+schedule = IceCube::Schedule.new(Time.utc(2026, 1, 5, 9)) do |s|
+  s.add_recurrence_rule IceCube::Rule.daily.count(3)
+end
+report = schedule.explain(Time.utc(2026, 1, 8, 9))
+report[:reasons] # => [:no_recurrence_match]
+report[:recurrence][:rules].first[:blockers] # => [:count_exceeded]
+report[:recurrence][:rules].first[:limits][:count]
+# => {limit: 3, used: 3, remaining: 0, exceeded: true}
+```
+
+Each rule report pinpoints the failing sub-conditions of combined rules by
+validation name and index (e.g. `{name: :day, index: 1, matched: false,
+expected: 5, actual: 1}`), along with any COUNT / UNTIL / start-of-schedule
+limits that applied. Explaining never mutates the rules, so subsequent
+enumerations are unaffected, and it never walks an unbounded sequence: COUNT
+usage is replayed only for rules that carry a COUNT validation.
+
+---
+
 ## Time Zones and ActiveSupport vs. Standard Ruby Time Classes
 
 ice_cube works great without ActiveSupport but only supports the environment's
