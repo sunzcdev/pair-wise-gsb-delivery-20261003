@@ -98,10 +98,11 @@ class HTTP::CookieJar
     def initialize(options = nil)
       super
 
-      @origin_attributes = encode_www_form({}.tap { |params|
+      @origin_attributes_params = {}.tap { |params|
         params['appId'] = @app_id if @app_id.nonzero?
         params['inBrowserElement'] = 1 if @in_browser_element
-      })
+      }
+      @origin_attributes = encode_www_form(@origin_attributes_params)
 
       @filename = options[:filename] or raise ArgumentError, ':filename option is missing'
 
@@ -358,7 +359,7 @@ class HTTP::CookieJar
     def db_add(cookie)
       @stmt[:add].execute({
           :baseDomain => cookie.domain_name.domain || cookie.domain,
-          :originAttributes => @origin_attributes,
+          :originAttributes => origin_attributes_for(cookie),
           :name => cookie.name, :value => cookie.value,
           :host => cookie.dot_domain,
           :path => cookie.path,
@@ -379,6 +380,7 @@ class HTTP::CookieJar
       DELETE FROM moz_cookies
         WHERE appId = :appId AND
               inBrowserElement = :inBrowserElement AND
+              originAttributes = :originAttributes AND
               name = :name AND
               host = :host AND
               path = :path
@@ -388,11 +390,19 @@ class HTTP::CookieJar
       @stmt[:delete].execute({
           :appId => @app_id,
           :inBrowserElement => @in_browser_element ? 1 : 0,
+          :originAttributes => origin_attributes_for(cookie),
           :name => cookie.name,
           :host => cookie.dot_domain,
           :path => cookie.path,
         })
       self
+    end
+
+    # Computes the origin attributes string for a cookie, including
+    # its partition key if it has one.
+    def origin_attributes_for(cookie)
+      partition = cookie.partition or return @origin_attributes
+      encode_www_form(@origin_attributes_params.merge('partitionKey' => partition))
     end
 
     if RUBY_VERSION >= '1.9'
@@ -461,7 +471,7 @@ class HTTP::CookieJar
               expiry >= :expiry
     SQL
 
-    def each(uri = nil, &block) # :yield: cookie
+    def each(uri = nil, partition: nil, &block) # :yield: cookie
       now = Time.now
       if uri
         thost = DomainName.new(uri.host)
@@ -486,9 +496,11 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = secure
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              attrs[:partition]   = get_query_param(row['originAttributes'], 'partitionKey')
             })
 
-          if cookie.valid_for_uri?(uri)
+          if partition_match?(cookie.partition, partition) &&
+              cookie.valid_for_uri?(uri)
             cookie.accessed_at = now
             @stmt[:update_lastaccessed].execute({
                 'lastAccessed' => serialize_usectime(now),
@@ -497,7 +509,7 @@ class HTTP::CookieJar
             yield cookie
           end
         }
-        @sjar.each(uri, &block)
+        @sjar.each(uri, partition: partition, &block)
       else
         @stmt[:all_cookies].execute({
             :appId => @app_id,
@@ -514,6 +526,7 @@ class HTTP::CookieJar
               attrs[:created_at]  = deserialize_usectime(row['creationTime'])
               attrs[:secure]      = row['isSecure'] != 0
               attrs[:httponly]    = row['isHttpOnly'] != 0
+              attrs[:partition]   = get_query_param(row['originAttributes'], 'partitionKey')
             })
 
           yield cookie

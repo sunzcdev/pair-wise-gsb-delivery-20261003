@@ -4,8 +4,10 @@ class HTTP::CookieJar
   # A store class that uses a hash-based cookie store.
   #
   # In this store, cookies that share the same name, domain and path
-  # will overwrite each other regardless of the `for_domain` flag
-  # value.  This store is built after the storage model described in
+  # and partition key will overwrite each other regardless of the
+  # `for_domain` flag value.  Cookies that differ in the partition
+  # key are stored independently of each other.  This store is built
+  # after the storage model described in
   # RFC 6265 5.3 where there is no mention of how the host-only-flag
   # affects in storing cookies.  On the other hand, in MozillaStore
   # two cookies with the same name, domain and path coexist as long as
@@ -34,7 +36,7 @@ class HTTP::CookieJar
       @jar = {
       # hostname => {
       #   path => {
-      #     name => cookie,
+      #     [name, partition] => cookie,
       #     ...
       #   },
       #   ...
@@ -52,29 +54,30 @@ class HTTP::CookieJar
 
     def add(cookie)
       path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies[cookie.name] = cookie
+      path_cookies[[cookie.name, cookie.partition]] = cookie
       cleanup if (@gc_index += 1) >= @gc_threshold
       self
     end
 
     def delete(cookie)
       path_cookies = ((@jar[cookie.domain] ||= {})[cookie.path] ||= {})
-      path_cookies.delete(cookie.name)
+      path_cookies.delete([cookie.name, cookie.partition])
       self
     end
 
-    def each(uri = nil) # :yield: cookie
+    def each(uri = nil, partition: nil) # :yield: cookie
       now = Time.now
       if uri
         tpath = uri.path
         @jar.each { |domain, paths|
           paths.each { |path, hash|
             next unless HTTP::Cookie.path_match?(path, tpath)
-            hash.delete_if { |name, cookie|
+            hash.delete_if { |key, cookie|
               if cookie.expired?(now)
                 true
               else
-                if cookie.valid_for_uri?(uri)
+                if partition_match?(cookie.partition, partition) &&
+                    cookie.valid_for_uri?(uri)
                   cookie.accessed_at = now
                   yield cookie
                 end
@@ -87,7 +90,7 @@ class HTTP::CookieJar
         synchronize {
           @jar.each { |domain, paths|
             paths.each { |path, hash|
-              hash.delete_if { |name, cookie|
+              hash.delete_if { |key, cookie|
                 if cookie.expired?(now)
                   true
                 else
@@ -118,7 +121,7 @@ class HTTP::CookieJar
           domain_cookies = []
 
           paths.each { |path, hash|
-            hash.delete_if { |name, cookie|
+            hash.delete_if { |key, cookie|
               if cookie.expired?(now) || (session && cookie.session?)
                 true
               else

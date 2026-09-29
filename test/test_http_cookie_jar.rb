@@ -1,5 +1,6 @@
 # frozen_string_literal: false
 require File.expand_path('helper', File.dirname(__FILE__))
+require 'stringio'
 require 'tmpdir'
 
 module TestHTTPCookieJar
@@ -896,6 +897,157 @@ module TestHTTPCookieJar
         jar.store.instance_variable_get(:@jar)
       ]
       assert_equal @jar.cookies, jar.cookies
+    end
+  end
+
+  class TestPartitionedCookies < Test::Unit::TestCase
+    SITE_A = 'https://site-a.example'
+    SITE_B = 'https://site-b.example'
+
+    def setup
+      @jar = HTTP::CookieJar.new
+      @url = URI('http://rubyforge.org/')
+    end
+
+    def partitioned_cookie(value, partition)
+      HTTP::Cookie.new(
+        :name     => 'Foo',
+        :value    => value,
+        :domain   => 'rubyforge.org',
+        :for_domain => true,
+        :path     => '/',
+        :expires  => Time.now + 10 * 86400,
+        :origin   => 'http://rubyforge.org/',
+        :partition => partition)
+    end
+
+    def add_three_cookies
+      @jar.add(partitioned_cookie('unpartitioned', nil))
+      @jar.add(partitioned_cookie('site-a', SITE_A))
+      @jar.add(partitioned_cookie('site-b', SITE_B))
+    end
+
+    def cookie_values_for(url, partition = nil)
+      @jar.cookies(url, :partition => partition).map(&:value).sort
+    end
+
+    def test_partition_normalization
+      cookie = partitioned_cookie('x', 'HTTPS://Site-A.Example:443/some/path?q=1')
+      assert_equal 'https://site-a.example', cookie.partition
+      assert_nil partitioned_cookie('x', nil).partition
+      assert_raises(ArgumentError) {
+        partitioned_cookie('x', 'not a url')
+      }
+    end
+
+    def test_partition_isolation_and_replacement
+      add_three_cookies
+
+      # three distinct cookies coexist
+      assert_equal 3, @jar.cookies.length
+
+      # without a partition context only the unpartitioned cookie is sent
+      assert_equal %w[unpartitioned], cookie_values_for(@url)
+
+      # each partition context sees its own cookie plus the unpartitioned one
+      assert_equal %w[site-a unpartitioned], cookie_values_for(@url, SITE_A)
+      assert_equal %w[site-b unpartitioned], cookie_values_for(@url, SITE_B)
+
+      # replacing one cookie leaves the other two intact
+      @jar.add(partitioned_cookie('site-a-v2', SITE_A))
+      assert_equal 3, @jar.cookies.length
+      assert_equal %w[site-a-v2 unpartitioned], cookie_values_for(@url, SITE_A)
+      assert_equal %w[site-b unpartitioned], cookie_values_for(@url, SITE_B)
+      assert_equal %w[unpartitioned], cookie_values_for(@url)
+
+      # deleting one cookie leaves the other two intact
+      @jar.delete(partitioned_cookie('whatever', SITE_B))
+      assert_equal 2, @jar.cookies.length
+      assert_equal %w[unpartitioned], cookie_values_for(@url, SITE_B)
+      assert_equal %w[site-a-v2 unpartitioned], cookie_values_for(@url, SITE_A)
+    end
+
+    def test_parse_with_partition_context
+      @jar.parse('Foo=Bar; Path=/', 'http://rubyforge.org/', :partition => SITE_A)
+
+      assert_equal [], cookie_values_for(@url)
+      assert_equal %w[Bar], cookie_values_for(@url, SITE_A)
+      assert_equal [], cookie_values_for(@url, SITE_B)
+    end
+
+    def test_partition_persistence_yaml
+      add_three_cookies
+
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.yml')
+        @jar.save(filename)
+
+        jar2 = HTTP::CookieJar.new
+        jar2.load(filename)
+
+        assert_equal 3, jar2.cookies.length
+        assert_equal %w[unpartitioned], jar2.cookies(@url).map(&:value)
+        assert_equal %w[site-a unpartitioned],
+          jar2.cookies(@url, :partition => SITE_A).map(&:value).sort
+        assert_equal %w[site-b unpartitioned],
+          jar2.cookies(@url, :partition => SITE_B).map(&:value).sort
+
+        # replacement still only affects its own partition after load
+        jar2.add(partitioned_cookie('site-a-v2', SITE_A))
+        assert_equal 3, jar2.cookies.length
+        assert_equal %w[site-a-v2 unpartitioned],
+          jar2.cookies(@url, :partition => SITE_A).map(&:value).sort
+        assert_equal %w[site-b unpartitioned],
+          jar2.cookies(@url, :partition => SITE_B).map(&:value).sort
+      end
+    end
+
+    def test_partition_persistence_cookiestxt
+      add_three_cookies
+
+      Dir.mktmpdir do |dir|
+        filename = File.join(dir, 'cookies.txt')
+        @jar.save(filename, :format => :cookiestxt)
+
+        jar2 = HTTP::CookieJar.new
+        jar2.load(filename, :format => :cookiestxt)
+
+        assert_equal 3, jar2.cookies.length
+        assert_equal %w[unpartitioned], jar2.cookies(@url).map(&:value)
+        assert_equal %w[site-a unpartitioned],
+          jar2.cookies(@url, :partition => SITE_A).map(&:value).sort
+        assert_equal %w[site-b unpartitioned],
+          jar2.cookies(@url, :partition => SITE_B).map(&:value).sort
+      end
+    end
+
+    def test_old_yaml_file_is_unpartitioned
+      yaml = YAML.dump([partitioned_cookie('Bar', nil)])
+      # simulate a file saved before partition support existed
+      yaml = yaml.lines.reject { |line| line.start_with?('  partition:') }.join
+
+      jar = HTTP::CookieJar.new
+      jar.load(StringIO.new(yaml))
+
+      cookie = jar.cookies(@url).first
+      assert_not_nil cookie
+      assert_nil cookie.partition
+      assert_equal %w[Bar], jar.cookies(@url, :partition => SITE_A).map(&:value)
+    end
+
+    def test_old_cookiestxt_file_is_unpartitioned
+      line = [
+        '.rubyforge.org', 'TRUE', '/', 'FALSE',
+        (Time.now + 10 * 86400).to_i, 'Foo', 'Bar'
+      ].join("\t") << "\n"
+
+      jar = HTTP::CookieJar.new
+      jar.load(StringIO.new(line), :format => :cookiestxt)
+
+      cookie = jar.cookies(@url).first
+      assert_not_nil cookie
+      assert_nil cookie.partition
+      assert_equal %w[Bar], jar.cookies(@url, :partition => SITE_A).map(&:value)
     end
   end
 

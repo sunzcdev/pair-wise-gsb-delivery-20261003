@@ -33,6 +33,7 @@ class HTTP::Cookie
     secure      httponly
     expires     max_age
     created_at  accessed_at
+    partition
   ]
   # :startdoc:
 
@@ -132,7 +133,7 @@ class HTTP::Cookie
   #
   def initialize(*args)
     @name = @origin = @domain = @path =
-      @expires = @max_age = nil
+      @expires = @max_age = @partition = nil
     @for_domain = @secure = @httponly = false
     @session = true
     @created_at = @accessed_at = Time.now
@@ -252,6 +253,11 @@ class HTTP::Cookie
     # :created_at
     # : The creation time of the cookies parsed.
     #
+    # :partition
+    # : The top-level site partition key (an HTTP(S) URL) of the
+    # calling context.  Every cookie parsed is tagged with this
+    # partition key.
+    #
     # :logger
     # : Logger object useful for debugging
     #
@@ -277,6 +283,7 @@ class HTTP::Cookie
       if options
         logger = options[:logger]
         created_at = options[:created_at]
+        partition = options[:partition]
       end
       origin = HTTP::Cookie::URIParser.parse(origin)
 
@@ -319,6 +326,7 @@ class HTTP::Cookie
           }
 
           cookie.origin = origin
+          cookie.partition = partition if partition
 
           cookie.acceptable? or next
 
@@ -344,6 +352,22 @@ class HTTP::Cookie
           hash[name] ||= value
         }
       }
+    end
+
+    # Normalizes a top-level site partition key into a canonical
+    # `"scheme://host[:port]"` string, or nil if `partition` is nil.
+    # ArgumentError is raised if `partition` is not an HTTP(S) URL
+    # with a host.
+    def normalize_partition(partition)
+      return nil if partition.nil?
+      uri = HTTP::Cookie::URIParser.parse(partition)
+      unless URI::HTTP === uri && uri.host
+        raise ArgumentError, "partition must be an HTTP(S) URL: #{partition.inspect}"
+      end
+      port = uri.port == uri.default_port ? nil : ":#{uri.port}"
+      "#{uri.scheme.downcase}://#{uri.host.downcase}#{port}"
+    rescue URI::InvalidURIError
+      raise ArgumentError, "partition must be an HTTP(S) URL: #{partition.inspect}"
     end
   end
 
@@ -440,6 +464,23 @@ class HTTP::Cookie
   # cookie will be sent only to the host indicated by the #domain.
   attr_accessor :for_domain
   alias for_domain? for_domain
+
+  # The top-level site partition key of the cookie, as a normalized
+  # `"scheme://host[:port]"` string, or nil if the cookie is
+  # unpartitioned.
+  #
+  # Cookies that share the same name, domain and path but differ in
+  # this key are stored as distinct cookies, so that the same
+  # third-party service embedded in different sites gets isolated
+  # cookie state.  An unpartitioned cookie (nil) is visible in every
+  # partition context.
+  attr_reader :partition
+
+  # See #partition.  Accepts an HTTP(S) URL/URI or a string-like
+  # representing one; nil clears the partition.
+  def partition=(partition)
+    @partition = HTTP::Cookie.normalize_partition(partition)
+  end
 
   attr_reader :path
 
@@ -681,6 +722,7 @@ class HTTP::Cookie
   def yaml_initialize(tag, map)
     expires = nil
     @origin = nil
+    @partition = nil
     map.each { |key, value|
       case key
       when 'expires'

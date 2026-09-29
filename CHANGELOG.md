@@ -1,3 +1,15 @@
+## Unreleased
+
+- Add top-level site partition keys for cookie isolation.  A cookie can
+  now carry an explicit `:partition` key (an HTTP(S) URL of the
+  top-level site), which becomes part of the cookie identity alongside
+  name, domain and path, so the same third-party service embedded in
+  different sites gets isolated cookie state.  `HTTP::CookieJar#cookies`,
+  `#each` and `#empty?` take a `:partition` keyword for the calling
+  context, and `HTTP::Cookie.parse`/`HTTP::CookieJar#parse` accept a
+  `:partition` option.  Unpartitioned cookies behave as before, and
+  cookie files saved by older versions load as unpartitioned.
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

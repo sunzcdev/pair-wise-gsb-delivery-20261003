@@ -66,6 +66,9 @@ class HTTP::CookieJar
   # any case.  A given cookie must have domain and path attributes
   # set, or ArgumentError is raised.
   #
+  # Cookies are identified by name, domain, path and partition key,
+  # so a cookie only overwrites another that shares all of them.
+  #
   # Whether a cookie with the `for_domain` flag on overwrites another
   # with the flag off or vice versa depends on the store used.  See
   # individual store classes for that matter.
@@ -96,8 +99,8 @@ class HTTP::CookieJar
   end
   alias << add
 
-  # Deletes a cookie that has the same name, domain and path as a
-  # given cookie from the jar and returns self.
+  # Deletes a cookie that has the same name, domain, path and
+  # partition key as a given cookie from the jar and returns self.
   #
   # How the `for_domain` flag value affects the set of deleted cookies
   # depends on the store used.  See individual store classes for that
@@ -110,15 +113,21 @@ class HTTP::CookieJar
   # Gets an array of cookies sorted by the path and creation time.  If
   # `url` is given, only ones that should be sent to the URL/URI are
   # selected, with the access time of each of them updated.
-  def cookies(url = nil)
-    each(url).sort
+  #
+  # If `partition` is given, it is taken as the top-level site of the
+  # calling context and partitioned cookies are selected only when
+  # their partition key matches it.  Unpartitioned cookies are always
+  # selected.  Without `partition`, only unpartitioned cookies are
+  # selected.
+  def cookies(url = nil, partition: nil)
+    each(url, partition: partition).sort
   end
 
   # Tests if the jar is empty.  If `url` is given, tests if there is
   # no cookie for the URL.
-  def empty?(url = nil)
+  def empty?(url = nil, partition: nil)
     if url
-      each(url) { return false }
+      each(url, partition: partition) { return false }
       return true
     else
       @store.empty?
@@ -135,15 +144,22 @@ class HTTP::CookieJar
   #
   # If (and only if) the `uri` option is given, last access time of
   # each cookie is updated to the current time.
-  def each(uri = nil, &block) # :yield: cookie
-    block_given? or return enum_for(__method__, uri)
+  #
+  # If `partition` is given together with `uri`, it is taken as the
+  # top-level site of the calling context and partitioned cookies are
+  # yielded only when their partition key matches it.  Unpartitioned
+  # cookies are always yielded.  Without `partition`, only
+  # unpartitioned cookies are yielded.
+  def each(uri = nil, partition: nil, &block) # :yield: cookie
+    block_given? or return enum_for(__method__, uri, partition: partition)
 
     if uri
       uri = HTTP::Cookie::URIParser.parse(uri)
       return self unless URI::HTTP === uri && uri.host
+      partition = HTTP::Cookie.normalize_partition(partition)
     end
 
-    @store.each(uri, &block)
+    @store.each(uri, partition: partition, &block)
     self
   end
   include Enumerable
@@ -161,6 +177,9 @@ class HTTP::CookieJar
   #         HTTP::Cookie.parse(set_cookie, origin) { |cookie|
   #           jar.add(cookie)
   #         }
+  #
+  # Pass the `:partition` option with the top-level site of the
+  # calling context to tag the parsed cookies with a partition key.
   #
   # See HTTP::Cookie.parse for available options.
   def parse(set_cookie, origin, options = nil) # :yield: cookie
