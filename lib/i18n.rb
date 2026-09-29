@@ -7,6 +7,7 @@ require 'i18n/version'
 require 'i18n/utils'
 require 'i18n/exceptions'
 require 'i18n/interpolate/ruby'
+require 'i18n/fragment_reference'
 
 module I18n
   autoload :Backend, 'i18n/backend'
@@ -26,6 +27,7 @@ module I18n
     fallback_in_progress
     fallback_original_locale
     format
+    fragment_state
     object
     raise
     resolve

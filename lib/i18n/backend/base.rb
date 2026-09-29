@@ -53,6 +53,15 @@ module I18n
           throw(:exception, I18n::MissingTranslation.new(locale, key, options))
         end
 
+        if entry.is_a?(I18n::FragmentString)
+          entry = I18n::FragmentReference.expand(
+            entry,
+            locale,
+            I18n.normalize_keys(locale, key, options[:scope]).join('.'),
+            options[:fragment_state]
+          )
+        end
+
         deep_interpolation = options[:deep_interpolation]
         skip_interpolation = options[:skip_interpolation]
         values = Utils.except(options, *RESERVED_KEYS) unless options.empty?

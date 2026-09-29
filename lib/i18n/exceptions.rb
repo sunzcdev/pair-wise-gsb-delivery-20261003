@@ -111,6 +111,42 @@ module I18n
     end
   end
 
+  # Base class for errors raised while expanding fragment references
+  # (see I18n::FragmentReference). The message always includes the
+  # reference chain that led to the error.
+  class FragmentReferenceError < ArgumentError
+    attr_reader :chain
+
+    def initialize(chain, detail)
+      @chain = chain.dup.freeze
+      super("#{detail} (fragment reference chain: #{@chain.join(' -> ')})")
+    end
+  end
+
+  class FragmentReferenceCycle < FragmentReferenceError
+    def initialize(chain, reference)
+      super(chain + [reference], "circular fragment reference to #{reference.inspect}")
+    end
+  end
+
+  class FragmentReferenceDepthExceeded < FragmentReferenceError
+    def initialize(chain, max_depth)
+      super(chain, "fragment references exceed the maximum depth of #{max_depth}")
+    end
+  end
+
+  class FragmentReferenceExpansionTooLong < FragmentReferenceError
+    def initialize(chain, max_length)
+      super(chain, "fragment reference expansion exceeds the maximum length of #{max_length}")
+    end
+  end
+
+  class MissingFragmentReference < FragmentReferenceError
+    def initialize(chain, missing)
+      super(chain + [missing.keys.join('.')], "referenced translation is missing: #{missing.message}")
+    end
+  end
+
   class UnknownFileType < ArgumentError
     attr_reader :type, :filename
     def initialize(type, filename)

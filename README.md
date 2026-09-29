@@ -66,10 +66,44 @@ I18n.config.with(locale: :ja).set!
 `set!` stores a frozen config in the current execution context.
 This keeps inherited state safe and lets updates happen by replacing config objects.
 
+### Fragment references
+
+A translation can embed other translations as fragments. Unlike `default` or
+symbol aliases, fragment references can appear anywhere in a message, can
+appear multiple times, and each reference can carry its own interpolation
+parameters:
+
+```ruby
+I18n.backend.store_translations(:en,
+  product_name: "Gadget",
+  greeting: "Hello %{name}!",
+  promo: I18n.fragment("Deal: ${ref:product_name} - ${ref:greeting, name: Alice}")
+)
+
+I18n.t(:promo) # => "Deal: Gadget - Hello Alice!"
+```
+
+References use the syntax `${ref:some.key}` with optional parameters
+`${ref:some.key, name: Alice, count: 2}` (quote values containing `}`, e.g.
+`name: "%{user}"`, to interpolate values from the outer translation).
+
+References are resolved with the locale of the current translation and the
+backend's fallback strategy, and are expanded recursively. Expansion is
+bounded by `I18n::FragmentReference.max_depth` (default 8) and
+`I18n::FragmentReference.max_expansion_length` (default 16384). Circular
+references, exceeded limits and missing referenced translations raise an
+`I18n::FragmentReferenceError` whose message reports the full reference
+chain.
+
+Only translations marked with `I18n.fragment(...)` (i.e. wrapped in
+`I18n::FragmentString`) enable this syntax; plain strings are returned
+untouched.
+
 ## Features
 
 * Translation and localization
 * Interpolation of values to translations
+* Fragment references (reusable translation snippets with per-reference parameters)
 * Pluralization (CLDR compatible)
 * Customizable transliteration to ASCII
 * Flexible defaults
