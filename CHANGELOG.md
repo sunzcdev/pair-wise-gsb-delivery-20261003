@@ -7,6 +7,19 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Contracts can annotate rules with business **purposes** (e.g. `:draft` vs
+  `:submit`) via `rule(..., purposes: ...)` and register them with
+  `purposes :submit, includes: ...`. Calling a contract with
+  `contract.call(input, purposes: :submit)` compiles a purpose-specific rule
+  set. Compilation explicitly resolves cross-purpose dependencies declared with
+  `depends_on:` (topologically ordered, cycles and missing deps raise at
+  compile time), caches each purpose combination per class, and exposes
+  `result.rule_selection` / `result.rules_applied` / `result.rules_omitted` so
+  you can see which rules were selected and which were skipped for the purpose.
+  Subclass purpose registries and compiled rule sets stay isolated from their
+  parents.
 
 ## [1.11.1] - 2025-01-21
 

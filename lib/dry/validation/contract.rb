@@ -84,12 +84,20 @@ module Dry
       #
       # @param [Hash] input The input to validate
       # @param [Hash] context Initial context for rules
+      # @param [Array<Symbol>, Symbol] purposes One or more business purposes
+      #   that select which rules run (for example `:draft` or `:submit`).
+      #   When omitted, every rule is eligible (the universal combination).
       #
-      # @return [Result]
+      # @return [Result] The result exposes which rules were selected via
+      #   {Result#rule_selection}.
       #
       # @api public
       # rubocop: disable Metrics/AbcSize
-      def call(input, context = EMPTY_HASH)
+      def call(input = EMPTY_HASH, context = EMPTY_HASH, purposes: nil, **rest)
+        # Preserve `contract.(key: value)` input calls: any keyword that is not
+        # the reserved `:purposes` belongs to the input hash.
+        input = input.merge(rest) if input.is_a?(::Hash) && rest.any?
+
         validate_input_type(input)
 
         context_map = ::Concurrent::Map.new.tap do |map|
@@ -97,8 +105,10 @@ module Dry
           context.each { |key, value| map[key] = value }
         end
 
-        Result.new(schema.(input), context_map) do |result|
-          rules.each do |rule|
+        rule_selection = self.class.compile_rules(purposes)
+
+        Result.new(schema.(input), context_map, EMPTY_HASH, rule_selection) do |result|
+          rule_selection.rules.each do |rule|
             next if rule.keys.any? { |key| error?(result, key) }
 
             rule_result = rule.(self, result)

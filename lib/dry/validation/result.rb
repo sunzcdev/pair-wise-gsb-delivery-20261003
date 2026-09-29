@@ -15,9 +15,17 @@ module Dry
       # Build a new result
       #
       # @param [Dry::Schema::Result] schema_result
+      # @param [Concurrent::Map] context
+      # @param [Hash] options
+      # @param [Contract::RuleSelection, nil] rule_selection
       #
       # @api private
-      def self.new(schema_result, context = ::Concurrent::Map.new, options = EMPTY_HASH)
+      def self.new(
+        schema_result,
+        context = ::Concurrent::Map.new,
+        options = EMPTY_HASH,
+        rule_selection = nil
+      )
         result = super
         yield(result) if block_given?
         result.freeze
@@ -44,14 +52,40 @@ module Dry
       # @api private
       attr_reader :options
 
+      # Rules selected/omitted for the purpose combination that produced this result
+      #
+      # @return [Contract::RuleSelection, nil]
+      #
+      # @api public
+      attr_reader :rule_selection
+
       # Initialize a new result
       #
       # @api private
-      def initialize(schema_result, context, options)
+      def initialize(schema_result, context, options, rule_selection = nil)
         @schema_result = schema_result
         @context = context
         @options = options
+        @rule_selection = rule_selection
         @errors = initialize_errors
+      end
+
+      # Rules compiled for this call, in their execution order
+      #
+      # @return [Array<Rule>]
+      #
+      # @api public
+      def rules_applied
+        rule_selection ? rule_selection.rules : EMPTY_ARRAY
+      end
+
+      # Rules skipped because their purposes were not part of the combination
+      #
+      # @return [Array<Rule>]
+      #
+      # @api public
+      def rules_omitted
+        rule_selection ? rule_selection.omitted_rules : EMPTY_ARRAY
       end
 
       # Return values wrapper with the input processed by schema

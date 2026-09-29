@@ -15,10 +15,25 @@ module Dry
     class Rule < Function
       include ::Dry::Equalizer(:keys, :block, inspect: false)
 
+      # @!attribute [r] name
+      #   @return [Symbol, nil] Explicit identifier used to reference the rule as a dependency
+      #   @api private
+      option :name, default: proc { nil }, optional: true
+
       # @!attribute [r] keys
       #   @return [Array<Symbol, String, Hash>]
       #   @api private
       option :keys
+
+      # @!attribute [r] purposes
+      #   @return [Array<Symbol>] Purposes for which this rule is eligible
+      #   @api private
+      option :purposes, default: proc { EMPTY_ARRAY.dup }
+
+      # @!attribute [r] depends_on
+      #   @return [Array<Symbol>] Names of rules that must run before this one
+      #   @api private
+      option :depends_on, default: proc { EMPTY_ARRAY.dup }
 
       # @!attribute [r] macros
       #   @return [Array<Symbol>]
@@ -42,6 +57,56 @@ module Dry
           _context: result.context,
           &block
         )
+      end
+
+      # Stable identifier used to resolve cross-purpose rule dependencies
+      #
+      # @return [Symbol]
+      #
+      # @api private
+      def id
+        return name unless name.nil?
+
+        key = keys.first
+        return :"rule_#{object_id}" unless key.is_a?(::Symbol) || key.is_a?(::String)
+
+        Schema::Path[key].to_a.map(&:to_s).join(DOT).to_sym
+      end
+
+      # Annotate the rule with the business purposes it serves
+      #
+      # A rule without any purpose is a base rule that runs for every
+      # purpose combination.
+      #
+      # @example
+      #   rule(:terms).purposes(:submit) do
+      #     key.failure("must be accepted") unless values[:terms]
+      #   end
+      #
+      # @return [Rule]
+      #
+      # @api public
+      def for_purposes(*names)
+        @purposes = purposes.concat(names.flatten.map(&:to_sym)).uniq
+        self
+      end
+
+      # Declare rules that must be compiled and run before this one
+      #
+      # Dependencies are pulled in across purposes, so a selected rule can
+      # rely on a rule that belongs to a purpose that was not requested.
+      #
+      # @example
+      #   rule(:total).depends_on(:line_items).purposes(:submit) do
+      #     key.failure("mismatch") if values[:total] < 0
+      #   end
+      #
+      # @return [Rule]
+      #
+      # @api public
+      def depends(*names)
+        @depends_on = depends_on.concat(names.flatten.map(&:to_sym)).uniq
+        self
       end
 
       # Define which macros should be executed
