@@ -148,6 +148,19 @@ module Dry
         self
       end
 
+      # Set a value under the provided path
+      #
+      # This is used by mounted contracts to replace the value at the mount
+      # path with the sub-contract's output
+      #
+      # @api private
+      def set_value(path, value)
+        keys = Schema::Path[path].to_a
+        parent = keys[0..-2].reduce(values.data) { |data, key| data[key] }
+        parent[keys.last] = value
+        self
+      end
+
       # Read a value under provided key
       #
       # @param [Symbol] key

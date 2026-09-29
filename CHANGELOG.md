@@ -8,6 +8,14 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 ## [Unreleased]
 
 
+### Added
+
+- Sub-contracts can now be mounted at a path via `Contract.mount`, for single
+  objects and arrays of objects (`each: true`). The sub-contract's output is
+  merged into the parent result and its errors (including base errors and meta
+  data) are re-pathed under the mount path. Context passing is controlled per
+  mount via the `context:` option and never leaks between mount points
+
 ## [1.11.1] - 2025-01-21
 
 

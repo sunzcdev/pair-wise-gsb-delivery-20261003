@@ -101,6 +101,57 @@ module Dry
           end
         end
 
+        # Mount a sub-contract for a nested value
+        #
+        # The sub-contract is applied to the value found under the given path
+        # after the parent's schema and rules were applied. Its output replaces
+        # the value at the mount path and its errors are re-pathed under the
+        # mount path (base errors are attached to the mount path itself).
+        #
+        # @example single object
+        #   mount :address, AddressContract.new
+        #
+        # @example array of objects
+        #   mount :contacts, ContactContract.new, each: true
+        #
+        # @example passing the parent's context to the sub-contract
+        #   mount :address, AddressContract.new, context: true
+        #
+        # @example passing only specific context keys to the sub-contract
+        #   mount :address, AddressContract.new, context: [:current_user]
+        #
+        # @param [Symbol, String, Array] path Path at which the sub-contract is mounted
+        # @param [Contract, Class<Contract>] contract A contract instance or class
+        # @param [Boolean] each Apply the contract to each element of an array
+        # @param [Boolean, Array<Symbol>, Hash] context Context passing declaration.
+        #   When `false` (default) the sub-contract receives no parent context,
+        #   when `true` it receives a snapshot of the parent's context, when an
+        #   Array it receives only the listed keys and when a Hash the hash
+        #   itself is used as the initial context. Context writes never leak
+        #   back into the parent or other mount points.
+        #
+        # @return [Mount]
+        #
+        # @api public
+        def mount(path, contract, each: false, context: false)
+          contract = contract.new if contract.is_a?(::Class)
+
+          unless contract.is_a?(Contract)
+            raise ::ArgumentError, <<~STR.strip
+              +contract+ must be a Dry::Validation::Contract (#{contract.inspect} given)
+            STR
+          end
+
+          Mount.new(
+            path: Schema::Path[path].to_a,
+            contract: contract,
+            each: each,
+            context: context
+          ).tap do |mount|
+            mounts << mount
+          end
+        end
+
         # A shortcut that can be used to define contracts that won't be reused or inherited
         #
         # @example
@@ -133,6 +184,17 @@ module Dry
           @rules ||= EMPTY_ARRAY
             .dup
             .concat(superclass.respond_to?(:rules) ? superclass.rules : EMPTY_ARRAY)
+        end
+
+        # Return mounts defined in this class
+        #
+        # @return [Array<Mount>]
+        #
+        # @api private
+        def mounts
+          @mounts ||= EMPTY_ARRAY
+            .dup
+            .concat(superclass.respond_to?(:mounts) ? superclass.mounts : EMPTY_ARRAY)
         end
 
         # Return messages configured for this class

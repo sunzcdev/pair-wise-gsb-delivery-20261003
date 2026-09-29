@@ -75,6 +75,11 @@ module Dry
       #   @api private
       option :rules, default: -> { self.class.rules }
 
+      # @!attribute [r] mounts
+      #   @return [Array<Mount>]
+      #   @api private
+      option :mounts, default: -> { self.class.mounts }
+
       # @!attribute [r] message_resolver
       #   @return [Messages::Resolver]
       #   @api private
@@ -106,6 +111,10 @@ module Dry
             rule_result.failures.each do |failure|
               result.add_error(message_resolver.(**failure))
             end
+          end
+
+          mounts.each do |mount|
+            mount.(result)
           end
         end
       end
