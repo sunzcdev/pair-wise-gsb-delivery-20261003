@@ -30,17 +30,30 @@ module Dry
 
         @options = options
 
-        @yields = @adapter
-          .parameters
-          .any? { |type, _| type == :block }
+        parameters = @adapter.parameters
+
+        @yields = parameters.any? { |type, _| type == :block }
+
+        # Adapters accepting a 4th argument receive the keyword arguments
+        # separately; adapters with the legacy 3-argument signature (e.g.
+        # custom adapters) are called without them
+        @accepts_kwargs = parameters.count { |type, _| type != :block } >= 4
       end
 
       def yields?
         @yields
       end
 
-      def call(args, &block)
-        adapter.(operation, options, args, &block)
+      def accepts_kwargs?
+        @accepts_kwargs
+      end
+
+      def call(args, kwargs = {}, &block)
+        if accepts_kwargs?
+          adapter.(operation, options, args, kwargs, &block)
+        else
+          adapter.(operation, options, args, &block)
+        end
       end
 
       def with(operation = self.operation, new_options = {})

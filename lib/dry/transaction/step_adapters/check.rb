@@ -7,9 +7,9 @@ module Dry
       class Check
         include Dry::Monads[:result]
 
-        def call(operation, _options, args)
+        def call(operation, _options, args, kwargs = {})
           input = args[0]
-          res = operation.(*args)
+          res = operation.(*args, **kwargs)
           res == true || res.is_a?(Success) ? Success(input) : Failure(input)
         end
       end

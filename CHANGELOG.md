@@ -7,6 +7,15 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- `with_step_args` now supports keyword arguments: step arguments can be given as a Hash with
+  `:args` (positional) and `:kwargs` (keyword) keys, e.g.
+  `with_step_args(validate: {args: ["jane"], kwargs: {strict: true}})`. The legacy Array form keeps
+  its existing behaviour, including treating a trailing plain Hash as keyword arguments.
+- Step arguments are validated against the actual operation signature (required/optional positional
+  parameters, required/optional keyword parameters and `**keyrest`) before any step is executed,
+  raising `ArgumentError`s that name the offending step
 
 ## [0.16.0] - 2024-01-17
 

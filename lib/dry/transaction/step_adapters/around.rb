@@ -7,8 +7,8 @@ module Dry
       class Around
         include Dry::Monads[:result]
 
-        def call(operation, options, args, &block)
-          result = operation.(*args, &block)
+        def call(operation, options, args, kwargs = {}, &block)
+          result = operation.(*args, **kwargs, &block)
 
           unless result.is_a?(Dry::Monads::Result)
             raise InvalidResultError, options[:step_name]

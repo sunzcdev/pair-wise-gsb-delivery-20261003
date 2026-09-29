@@ -118,6 +118,23 @@ RSpec.describe Dry::Transaction::Step do
         expect(new_step.call_args).to_not eq step.call_args
       end
     end
+
+    context "with call_kwargs argument" do
+      let(:call_kwargs) { {num: 12} }
+
+      it "returns new instance with only call_kwargs changed" do
+        new_step = step.with(call_kwargs: call_kwargs)
+        expect(new_step).to_not eq step
+        expect(new_step.operation_name).to eq step.operation_name
+        expect(new_step.call_kwargs).to eq call_kwargs
+      end
+
+      it "preserves call_kwargs when only the operation changes" do
+        step_with_kwargs = step.with(call_kwargs: call_kwargs)
+        new_step = step_with_kwargs.with(operation: proc { |a, b| a * b })
+        expect(new_step.call_kwargs).to eq call_kwargs
+      end
+    end
   end
 
   describe "#arity" do
