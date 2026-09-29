@@ -40,4 +40,6 @@ require 'state_machines/path_collection'
 require 'state_machines/machine'
 require 'state_machines/machine_collection'
 
+require 'state_machines/event_sequence'
+
 require 'state_machines/macro_methods'

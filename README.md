@@ -247,6 +247,24 @@ vehicle.alarm_state_name                        # => :active
 
 vehicle.fire_events!(:ignite, :enable_alarm)    # => StateMachines:InvalidParallelTransition: Cannot run events in parallel: ignite, enable_alarm
 
+# Events can also be fired in sequence, each seeing the previous event's state.
+# The action (e.g. save) is only committed if every event succeeds; otherwise
+# all states and staged event attributes are rolled back.  The result keeps
+# track of which step failed instead of just returning false.
+result = vehicle.fire_event_sequence(:shift_down, :park)  # => #<StateMachines::EventSequence::Result ...>
+result.success?                                           # => true
+
+result = vehicle.fire_event_sequence(:park, :ignite)
+result.success?                                           # => false
+result.failed_event                                       # => :park
+result.failure_reason                                     # => :invalid_transition
+
+# Callers can wrap the sequence in their own transaction boundary (external
+# side effects are never rolled back automatically)
+vehicle.fire_event_sequence(:ignite, :shift_up) do |run|
+  Vehicle.transaction { run.call }
+end
+
 # Coordinated State Management
 
 State machines can coordinate with each other using state guards, allowing transitions to depend on the state of other state machines within the same object. This enables complex system modeling where components are interdependent.

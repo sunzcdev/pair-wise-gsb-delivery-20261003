@@ -141,6 +141,63 @@ module StateMachines
       fire_events(*(events + [run_action])) || raise(StateMachines::InvalidParallelTransition.new(self, events))
     end
 
+    # Runs one or more events in sequence on this object.  Each event is
+    # fired one after another, so every event sees the state left behind by
+    # the previous one.  The machine's action (e.g. +save+) is only invoked
+    # once *all* events have transitioned successfully; if any event fails,
+    # every machine's state is rolled back to its original value and any
+    # event attributes staged mid-sequence are restored.
+    #
+    # External side effects (e.g. records created in callbacks, API calls)
+    # are *not* rolled back automatically.  To wrap the sequence in your own
+    # transaction boundary, pass a block that invokes the given callable:
+    #
+    #   vehicle.fire_event_sequence(:ignite, :shift_up) do |run|
+    #     Vehicle.transaction { run.call }
+    #   end
+    #
+    # == Failure attribution
+    #
+    # Instead of a plain boolean, this returns a
+    # StateMachines::EventSequence::Result that identifies which step failed
+    # and why:
+    #
+    #   result = vehicle.fire_event_sequence(:ignite, :shift_up, :park)
+    #   result.success?        # => false
+    #   result.failed_event    # => :shift_up
+    #   result.failure_reason  # => :invalid_transition
+    #
+    # == Example
+    #
+    #   class Vehicle
+    #     state_machine :initial => :parked do
+    #       event :ignite do
+    #         transition :parked => :idling
+    #       end
+    #
+    #       event :shift_up do
+    #         transition :idling => :first_gear, :first_gear => :second_gear
+    #       end
+    #     end
+    #   end
+    #
+    #   vehicle = Vehicle.new                                 # => #<Vehicle:0xb7c02850 @state="parked">
+    #   vehicle.fire_event_sequence(:ignite, :shift_up)       # => #<StateMachines::EventSequence::Result ...>
+    #   vehicle.state                                         # => "first_gear"
+    #
+    #   # If any event fails, all states are rolled back
+    #   result = vehicle.fire_event_sequence(:shift_up, :ignite)
+    #   result.success?                                       # => false
+    #   result.failed_event                                   # => :ignite
+    #   vehicle.state                                         # => "first_gear"
+    #
+    # *Note* that sequences cannot be nested: firing another sequence on the
+    # same object from within a running sequence (e.g. in a transition
+    # callback) raises StateMachines::InvalidContext.
+    def fire_event_sequence(*events, &)
+      self.class.state_machines.fire_event_sequence(self, *events, &)
+    end
+
     protected
 
     def initialize_state_machines(options = {}, &) # :nodoc:

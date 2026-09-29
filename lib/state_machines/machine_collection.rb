@@ -76,6 +76,15 @@ module StateMachines
       end
     end
 
+    # Runs one or more events in sequence on the given object.  See
+    # StateMachines::InstanceMethods#fire_event_sequence for more information.
+    def fire_event_sequence(object, *events, &)
+      run_action = [true, false].include?(events.last) ? events.pop : true
+
+      sequence = EventSequence.new(object, events, actions: run_action, use_transactions: resolve_use_transactions)
+      sequence.perform(&)
+    end
+
     # Builds the collection of transitions for all event attributes defined on
     # the given object.  This will only include events whose machine actions
     # match the one specified.
