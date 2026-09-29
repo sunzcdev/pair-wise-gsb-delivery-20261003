@@ -3852,6 +3852,85 @@ describe "Dataset#multi_insert" do
   end
 end
 
+describe "Dataset#multi_insert_map" do
+  before do
+    @db = Sequel.mock(:servers=>{:s1=>{}})
+    @db.extend_datasets do
+      def supports_returning?(type) true end
+      def multi_insert_sql_strategy; :values end
+      Sequel::Dataset.def_sql_method(self, :insert, %w'insert into columns values returning')
+    end
+    @ds = @db[:items].returning(:id, :name)
+    @list = [{:name=>'abc'}, {:name=>'def'}, {:name=>'ghi'}]
+  end
+
+  it "should return nil without a query if no hashes" do
+    @ds.multi_insert_map([], :key=>:name).must_be_nil
+    @db.sqls.must_equal []
+  end
+
+  it "should match returned rows to input hashes by key, even if rows are returned out of order and rows are missing" do
+    @ds = @ds.with_fetch([{:id=>3, :name=>'ghi'}, {:id=>1, :name=>'abc'}])
+    @ds.multi_insert_map(@list, :key=>:name).must_equal [{:id=>1, :name=>'abc'}, nil, {:id=>3, :name=>'ghi'}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('abc'), ('def'), ('ghi') RETURNING id, name"]
+  end
+
+  it "should accept a callable as the :key option" do
+    @ds = @ds.with_fetch([{:id=>2, :name=>'DEF'}, {:id=>1, :name=>'ABC'}])
+    @ds.multi_insert_map(@list, :key=>lambda{|h| h[:name].upcase}).must_equal [{:id=>1, :name=>'ABC'}, {:id=>2, :name=>'DEF'}, nil]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('abc'), ('def'), ('ghi') RETURNING id, name"]
+  end
+
+  it "should use a transaction when inserting rows using multiple statements" do
+    @ds = @ds.with_extend{def multi_insert_sql_strategy; :separate end}
+    @ds = @ds.with_fetch([[{:id=>1, :name=>'abc'}], [{:id=>2, :name=>'def'}], [{:id=>3, :name=>'ghi'}]])
+    @ds.multi_insert_map(@list, :key=>:name).must_equal [{:id=>1, :name=>'abc'}, {:id=>2, :name=>'def'}, {:id=>3, :name=>'ghi'}]
+    @db.sqls.must_equal ['BEGIN',
+      "INSERT INTO items (name) VALUES ('abc') RETURNING id, name",
+      "INSERT INTO items (name) VALUES ('def') RETURNING id, name",
+      "INSERT INTO items (name) VALUES ('ghi') RETURNING id, name",
+      'COMMIT']
+  end
+
+  it "should respect :server option" do
+    @ds = @ds.with_fetch([{:id=>1, :name=>'abc'}])
+    @ds.multi_insert_map([{:name=>'abc'}], :key=>:name, :server=>:s1).must_equal [{:id=>1, :name=>'abc'}]
+    @db.sqls.must_equal ["INSERT INTO items (name) VALUES ('abc') RETURNING id, name -- s1"]
+  end
+
+  it "should raise an error before inserting if the database does not support RETURNING" do
+    db = Sequel.mock
+    ds = db[:items].clone(:returning=>[:id, :name])
+    proc{ds.multi_insert_map(@list, :key=>:name)}.must_raise Sequel::Error
+    db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if the dataset does not use RETURNING" do
+    proc{@db[:items].multi_insert_map(@list, :key=>:name)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if no :key option is given" do
+    proc{@ds.multi_insert_map(@list)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if the input hashes have duplicate keys" do
+    proc{@ds.multi_insert_map([{:name=>'abc'}, {:name=>'def'}, {:name=>'abc'}], :key=>:name)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error before inserting if the input hashes have duplicate keys using a callable :key" do
+    proc{@ds.multi_insert_map([{:name=>'abc'}, {:name=>'ABC'}], :key=>lambda{|h| h[:name].upcase})}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+
+  it "should raise an error if columns are empty and values are not empty" do
+    proc{@ds.multi_insert_map([{}], :key=>:name)}.must_raise Sequel::Error
+    @db.sqls.must_equal []
+  end
+end
+
 describe "Dataset#update_sql" do
   before do
     @ds = Sequel.mock.dataset.from(:items)

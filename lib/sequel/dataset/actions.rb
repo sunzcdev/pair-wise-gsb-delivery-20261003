@@ -13,7 +13,7 @@ module Sequel
     ACTION_METHODS = (<<-METHS).split.map(&:to_sym).freeze
       << [] all as_hash as_set avg count columns columns! delete each
       empty? fetch_rows first first! get import insert last
-      map max min multi_insert paged_each select_hash select_hash_groups
+      map max min multi_insert multi_insert_map paged_each select_hash select_hash_groups
       select_map select_order_map select_set single_record single_record!
       single_value single_value! sum to_hash to_hash_groups
       truncate update where_all where_each where_single_value
@@ -596,6 +596,72 @@ module Sequel
       import(columns, hashes.map{|h| columns.map{|c| h[c]}}, opts)
     end
 
+    # This is a front end for import that, like #multi_insert, allows you to
+    # submit an array of hashes, but uses the dataset's RETURNING clause to
+    # match each inserted row back to the input hash it came from:
+    #
+    #   DB[:table].returning(:id, :x).multi_insert_map([{x: 1}, {x: 2}], :key=>:x)
+    #   # INSERT INTO table (x) VALUES (1), (2) RETURNING id, x
+    #   # => [{id: 1, x: 1}, {id: 2, x: 2}]
+    #
+    # This is useful when inserting multiple rows with a RETURNING clause
+    # where some rows may not be inserted, such as when using
+    # insert_conflict to skip conflicting rows.  In that case, the rows
+    # returned by RETURNING cannot be reliably matched to the input hashes
+    # by position, so a key is used to match them instead.
+    #
+    # The dataset must use a RETURNING clause (see #returning), and the
+    # database must support RETURNING for insert queries.  An Error is
+    # raised before any INSERT query is issued if either requirement is
+    # not met.
+    #
+    # Returns an array with one entry per input hash, in the same order as
+    # the input hashes.  Each entry is the row returned by RETURNING for
+    # the matching input hash, or nil if no row was returned for the input
+    # hash (e.g. the insert of the row was skipped due to a conflict).
+    #
+    # Be aware that all hashes should have the same keys if you use this
+    # calling method, otherwise some columns could be missed or set to null
+    # instead of to default values.
+    #
+    # Options:
+    # :key :: Required.  Specifies how to compute the key used to match
+    #         input hashes to returned rows.  If a Symbol, the value for
+    #         that key in each hash is used.  Otherwise, the value is
+    #         called with each input hash and each returned row, and should
+    #         return the key for the hash or row.  The key for each input
+    #         hash must be unique; an Error is raised before any INSERT
+    #         query is issued if the same key is used by multiple input
+    #         hashes.
+    # :server :: Set the server/shard to use for the transaction and insert
+    #            queries.
+    # :skip_transaction :: Do not use a transaction even when using multiple
+    #                      INSERT queries.
+    def multi_insert_map(hashes, opts=OPTS)
+      return if hashes.empty?
+      raise(Error, "RETURNING is not supported on #{db.database_type}") unless supports_returning?(:insert)
+      raise(Error, 'Using Sequel::Dataset#multi_insert_map requires the dataset to use RETURNING, use #returning to set the returned columns') unless uses_returning?(:insert)
+      key = opts[:key]
+      raise(Error, 'Using Sequel::Dataset#multi_insert_map requires a :key option') unless key
+      key_proc = key.respond_to?(:call) ? key : lambda{|h| h[key]}
+
+      columns = hashes.first.keys
+      raise(Error, 'Using Sequel::Dataset#multi_insert_map with an empty column array is not allowed') if columns.empty?
+
+      input_keys = hashes.map{|h| key_proc.call(h)}
+      seen_keys = {}
+      input_keys.each do |input_key|
+        raise(Error, "Duplicate key in Sequel::Dataset#multi_insert_map input: #{input_key.inspect}") if seen_keys.has_key?(input_key)
+        seen_keys[input_key] = true
+      end
+
+      ds = opts[:server] ? server(opts[:server]) : self
+      values = hashes.map{|h| columns.map{|c| h[c]}}
+      returned = {}
+      ds._multi_insert_map(columns, values, opts).each{|r| returned[key_proc.call(r)] = r}
+      input_keys.map{|input_key| returned[input_key]}
+    end
+
     # Yields each row in the dataset, but internally uses multiple queries as needed to
     # process the entire result set without keeping all rows in the dataset in memory,
     # even if the underlying driver buffers all query results in memory.
@@ -1131,9 +1197,23 @@ module Sequel
       if opts[:return] == :primary_key
         _import_transaction(values, trans_opts){values.map{|v| insert(columns, v)}}
       else
-        stmts = multi_insert_sql(columns, values)
-        _import_transaction(stmts, trans_opts){stmts.each{|st| execute_dui(st)}}
+      stmts = multi_insert_sql(columns, values)
+      _import_transaction(stmts, trans_opts){stmts.each{|st| execute_dui(st)}}
       end
+    end
+
+    # Internals of #multi_insert_map.  Insert the given values and return
+    # an array of hashes, one for each row returned by the RETURNING clause
+    # of the insert statements.  A transaction is only used if there are
+    # multiple statements to execute.
+    def _multi_insert_map(columns, values, opts)
+      trans_opts = Hash[opts]
+      trans_opts.delete(:key)
+      trans_opts[:server] = @opts[:server]
+      stmts = multi_insert_sql(columns, values)
+      rows = []
+      _import_transaction(stmts, trans_opts){stmts.each{|st| returning_fetch_rows(st){|r| rows << r}}}
+      rows
     end
 
     # Return an array of arrays of values given by the symbols in ret_cols.

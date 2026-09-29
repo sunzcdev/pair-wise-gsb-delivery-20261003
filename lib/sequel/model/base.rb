@@ -15,7 +15,7 @@ module Sequel
     #   filter, first, first!, for_update, from, from_self, full_join, full_outer_join,
     #   get, graph, grep, group, group_and_count, group_append, group_by, having, import,
     #   inner_join, insert, intersect, invert, join, join_table, last, left_join,
-    #   left_outer_join, limit, lock_style, map, max, min, multi_insert, naked, natural_full_join,
+    #   left_outer_join, limit, lock_style, map, max, min, multi_insert, multi_insert_map, naked, natural_full_join,
     #   natural_join, natural_left_join, natural_right_join, offset, order, order_append, order_by,
     #   order_more, order_prepend, paged_each, qualify, reverse, reverse_order, right_join,
     #   right_outer_join, select, select_all, select_append, select_group, select_hash,

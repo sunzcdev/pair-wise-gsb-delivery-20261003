@@ -86,7 +86,7 @@ SELECT (All Records):: all, each, map, as_hash, to_hash_groups, select_map, sele
 SELECT (First Record):: first, last, [], single_record
 SELECT (Single Value):: get, single_value
 SELECT (Aggregates):: count, avg, max, min, sum
-INSERT:: insert, <<, import, multi_insert
+INSERT:: insert, <<, import, multi_insert, multi_insert_map
 UPDATE:: update
 DELETE:: delete
 other:: columns, columns!, truncate
