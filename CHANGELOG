@@ -1,5 +1,7 @@
 === master
 
+* Add tentative plugin for tentative routing branches, restoring path, captures, and response state when the branch is abandoned
+
 * Persist keys set in Roda.opts to class instance variables, add attr_reader methods for much faster access (jeremyevans)
 
 * Add rescue_classes keyword argument to invalid_request_body plugin (jeremyevans)
