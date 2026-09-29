@@ -9,6 +9,10 @@ Compatibility:
 
 Features:
 
+* Add Mail::DeliveryStatus: structured parsing of message/delivery-status bodies
+  with message-level fields and one record per recipient (keeping action, status,
+  diagnostic-code and unknown extensions per record), exposed as
+  Mail::Message#delivery_status and Mail::Part#delivery_status
 * Updated README to improve around sending multipart mail @kapfenho
 * Add delivery_interceptors method to Mail class to fetch registered interceptors @ghousemohamed
 
@@ -22,6 +26,10 @@ Code Improvements:
 
 Bug Fixes:
 
+* Mail::Part#retryable? no longer raises NoMethodError on reports covering
+  several recipients; bounced?/retryable? now consider every recipient record
+* Mail::Part#bounced? now checks every recipient record of a multi-recipient
+  report instead of only the first one
 * Regression: Preserve message-level charset when adding parts (related to Rails ActionMailer) @shields
 * Regression: Adding a part should not reset the mail's charset to nil @railsbob
 

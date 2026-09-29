@@ -562,6 +562,45 @@ Results in the same email as done using the block form
 @mail.retryable?       #=> false
 ```
 
+### Reading a Delivery Status Report (message/delivery-status):
+
+A single bounce message can report a different outcome per recipient: one
+delivered, one delayed, one permanently failed. `mail.delivery_status`
+parses the message/delivery-status part into message-level fields and one
+record per recipient:
+
+```ruby
+@mail = Mail.read('/path/to/bounce_message.eml')
+
+status = @mail.delivery_status
+status.reporting_mta        #=> "dns; mail.example.net"
+status.arrival_date         #=> "Wed, 30 Sep 2026 09:14:32 +0800 (CST)"
+status.message_extensions   #=> {"X-Postfix-Queue-ID" => "4A1B2C3D4E"}
+
+status.recipient_records.each do |record|
+  record.final_recipient    #=> "rfc822; failed@example.com"
+  record.action             #=> "failed"
+  record.status             #=> "5.1.1"
+  record.diagnostic_code    #=> "smtp; 550 5.1.1 <failed@example.com>... User unknown"
+  record.extensions         #=> {"X-Retry-Queue" => "bulk"} (unknown fields, kept per record)
+  record.bounced?           #=> true  (action: failed)
+  record.retryable?         #=> false (status 5.x.x is permanent)
+end
+```
+
+The single-value accessors above (`action`, `error_status`,
+`final_recipient`, `diagnostic_code`, `remote_mta`) are kept for backward
+compatibility: they return the single value when the report covers one
+recipient, or an array of per-recipient values when it covers several.
+`bounced?` is true if any recipient permanently failed; `retryable?` is
+true if any recipient has a non-permanent (non 5.x.x) status.
+
+Parsing is strict: a recipient record missing a required field
+(Final-Recipient, Action or Status) raises
+`Mail::DeliveryStatus::MissingFieldError`, and malformed lines raise
+`Mail::DeliveryStatus::ParseError`. The legacy single-value accessors keep
+working on such malformed reports by falling back to a lenient parse.
+
 ### Attaching and Detaching Files
 
 You can just read the file off an absolute path, Mail will try

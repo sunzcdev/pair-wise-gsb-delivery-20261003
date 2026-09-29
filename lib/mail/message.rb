@@ -1558,6 +1558,27 @@ module Mail
       @delivery_status_part
     end
 
+    # Returns the parsed message/delivery-status report (a Mail::DeliveryStatus)
+    # of a multipart/report; report-type=delivery-status email, or nil.
+    #
+    # A single bounce message can report a different outcome per recipient
+    # (delivered, delayed, failed...). Use this structured interface to walk
+    # every recipient record:
+    #
+    #   mail.delivery_status.recipient_records.each do |record|
+    #     puts "#{record.final_recipient}: #{record.action} (#{record.status})"
+    #   end
+    #
+    # The single-value accessors below (action, error_status, ...) are kept
+    # for backward compatibility: they return the value of the single
+    # recipient record, or an array of per-recipient values when the report
+    # covers several recipients. bounced? is true if any recipient
+    # permanently failed; retryable? is true if any recipient has a
+    # non-permanent (non 5.x.x) status.
+    def delivery_status
+      delivery_status_part and delivery_status_part.delivery_status
+    end
+
     def bounced?
       delivery_status_part and delivery_status_part.bounced?
     end

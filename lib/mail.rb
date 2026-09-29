@@ -47,6 +47,7 @@ module Mail # :doc:
   require 'mail/body'
   require 'mail/field'
   require 'mail/field_list'
+  require 'mail/delivery_status'
 
   register_autoload :Envelope, 'mail/envelope'
 

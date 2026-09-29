@@ -47,21 +47,38 @@ module Mail
       (main_type =~ /message/i && sub_type =~ /delivery-status/i) && body =~ /Status:/
     end
 
+    # Returns the parsed message/delivery-status body of this part as a
+    # Mail::DeliveryStatus, or nil if this part is not a delivery status
+    # report. Exposes the message-level fields (Reporting-MTA, Arrival-Date,
+    # ...) and one RecipientRecord per reported recipient.
+    #
+    # Raises Mail::DeliveryStatus::ParseError if the body is malformed, and
+    # Mail::DeliveryStatus::MissingFieldError if a recipient record lacks a
+    # field required by RFC 3464 (Final-Recipient, Action or Status).
+    def delivery_status
+      return nil unless delivery_status_report_part?
+
+      unless defined? @delivery_status
+        @delivery_status = DeliveryStatus.parse(body.decoded)
+      end
+      @delivery_status
+    end
+
     def delivery_status_data
       delivery_status_report_part? ? parse_delivery_status_report : {}
     end
 
+    # Returns true if any recipient record in the report has a permanent
+    # failure (action: failed). A single report can cover several recipients
+    # with mixed outcomes; bounced? is true as soon as at least one of them
+    # permanently failed.
     def bounced?
-      if action.is_a?(Array)
-        !!(action.first =~ /failed/i)
-      else
-        !!(action =~ /failed/i)
-      end
+      Array(action).any? { |a| a.to_s =~ /failed/i }
     end
 
 
-    # Either returns the action if the message has just a single report, or an
-    # array of all the actions, one for each report
+    # Either returns the action if the message has just a single recipient
+    # record, or an array of all the actions, one for each recipient record
     def action
       get_return_values('action')
     end
@@ -82,20 +99,51 @@ module Mail
       get_return_values('remote-mta')
     end
 
+    # Returns true if the delivery failure may be transient. With several
+    # recipient records, retryable? is true when at least one record has a
+    # non-permanent (non 5.x.x) status.
     def retryable?
-      !(error_status =~ /^5/)
+      statuses = Array(error_status)
+      statuses.empty? || statuses.any? { |s| s.to_s !~ /^5/ }
     end
 
     private
 
     def get_return_values(key)
-      if delivery_status_data[key].is_a?(Array)
-        delivery_status_data[key].map { |a| a.value }
-      elsif !delivery_status_data[key].nil?
-        delivery_status_data[key].value
+      if (status = structured_delivery_status)
+        values = status.recipient_records.map { |record| record[key] }.compact
+        values.length > 1 ? values : values.first
+      else
+        legacy_return_values(key)
+      end
+    end
+
+    # Fallback for reports whose body cannot be strictly parsed: keep the
+    # historical behaviour of merging every field group into a single header.
+    def legacy_return_values(key)
+      data = delivery_status_data
+      if data[key].is_a?(Array)
+        data[key].map { |a| a.value }
+      elsif !data[key].nil?
+        data[key].value
       else
         nil
       end
+    end
+
+    # Strictly parsed delivery status, or nil when the body does not follow
+    # RFC 3464 (legacy single-value accessors fall back to the lenient
+    # header merge in that case).
+    def structured_delivery_status
+      unless defined? @structured_delivery_status
+        @structured_delivery_status =
+          begin
+            delivery_status
+          rescue DeliveryStatus::ParseError
+            nil
+          end
+      end
+      @structured_delivery_status
     end
 
     # A part may not have a header.... so, just init a body if no header
