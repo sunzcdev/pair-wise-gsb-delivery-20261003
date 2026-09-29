@@ -251,6 +251,39 @@ encoded_token.payload # => { 'exp'=>1234, 'jti'=>'1234", 'sub'=>'my-subject' }
 encoded_token.header # {'kid'=>'hmac', 'alg'=>'HS256'}
 ```
 
+#### Verification receipts
+
+A boolean "verified" result does not say under which policy a token was verified. `JWT::EncodedToken#verify_with_receipt!` performs a full verification (signature and claims) and returns an immutable `JWT::VerificationReceipt` that binds the raw token bytes, the algorithm and a caller provided policy identifier, and records the verification time and the checks that passed. A receipt is only issued when the full verification succeeds; a failed verification raises and issues nothing.
+
+```ruby
+encoded_token = JWT::EncodedToken.new(token.jwt)
+
+# Two different policies verifying the same token
+admin_receipt = encoded_token.verify_with_receipt!(
+  signature: { algorithm: 'HS256', key: 'secret' },
+  claims: [:exp, { iss: 'https://issuer.example' }],
+  policy: :admin_api
+)
+admin_receipt.policy     # => :admin_api
+admin_receipt.algorithm  # => 'HS256'
+admin_receipt.checks     # => [:signature, :exp, :iss]
+admin_receipt.verified_at # => 2026-09-30 12:00:00 +0800
+
+public_receipt = encoded_token.verify_with_receipt!(
+  signature: { algorithm: 'HS256', key: 'secret' },
+  claims: [:exp],
+  policy: :public_api
+)
+
+# A receipt only proves the policy it was issued under. The public
+# receipt does not prove the admin policy passed, and vice versa.
+public_receipt.valid_for?(:admin_api) # => false
+public_receipt.covers?(:iss)          # => false
+admin_receipt.valid_for?(:admin_api)  # => true
+```
+
+Receipts are immutable historical records: repeated verification re-runs the full verification and issues a new receipt with a fresh `verified_at`, and a previously issued receipt is never affected by later failures. Receipts cannot be constructed from `unverified_payload` or by hand; `JWT::VerificationReceipt.new` is private and only the library issues receipts after a successful verification.
+
 A JWK can be used to sign and verify the token if it's possible to derive the signing algorithm from the key.
 
 ```ruby

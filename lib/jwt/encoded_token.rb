@@ -116,6 +116,34 @@ module JWT
       nil
     end
 
+    # Verifies the token signature and claims and issues an immutable
+    # receipt for the successful verification.
+    #
+    # The receipt binds the raw token bytes, the algorithm and the given
+    # policy identifier, and records the verification time and the checks
+    # that passed. A receipt is only issued when the full verification
+    # succeeds; on failure an error is raised and no receipt is issued.
+    # Repeated calls re-run the full verification and issue a new receipt
+    # with a fresh verification time.
+    #
+    # @example
+    #  encoded_token.verify_with_receipt!(signature: { algorithm: 'HS256', key: 'secret' },
+    #                                     claims: [:exp],
+    #                                     policy: :public_api)
+    #
+    # @param signature [Hash] the parameters for signature verification (see {#verify_signature!}).
+    # @param claims [Array<Symbol>, Hash] the claims to verify (see {#verify_claims!}).
+    # @param policy [Object] a caller provided identifier for the verification policy.
+    # @return [JWT::VerificationReceipt] the receipt for the successful verification.
+    # @raise [JWT::Error] if the signature or claim verification fails.
+    def verify_with_receipt!(signature:, claims: nil, policy:)
+      verify!(signature: signature, claims: claims)
+      VerificationReceipt.issue(token: jwt,
+                                algorithm: header['alg'],
+                                policy: policy,
+                                checks: [:signature] + claim_check_names(claims))
+    end
+
     # Verifies the token signature and claims.
     # By default it verifies the 'exp' claim.
 
@@ -196,6 +224,11 @@ module JWT
       return DEFAULT_CLAIMS if options.first.nil?
 
       options
+    end
+
+    def claim_check_names(claims)
+      options = claims.nil? ? DEFAULT_CLAIMS : (claims.is_a?(Array) ? claims : [claims])
+      options.flat_map { |option| option.is_a?(Hash) ? option.keys : option }
     end
 
     def decode_payload

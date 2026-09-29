@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add immutable `JWT::VerificationReceipt` issued by `JWT::EncodedToken#verify_with_receipt!`, binding the raw token bytes, algorithm and a caller provided policy identifier
 - Your contribution here
 
 **Fixes and enhancements:**
