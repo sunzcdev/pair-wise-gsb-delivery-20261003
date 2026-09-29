@@ -69,7 +69,16 @@ module Liquid
           inner_context[key] = context.evaluate(value)
         end
         inner_context[context_variable_name] = var unless var.nil?
-        partial.render_to_output_buffer(inner_context, output)
+        if (source_map = context.source_map)
+          source_map.push_frame(partial.name, line_number)
+          begin
+            partial.render_to_output_buffer(inner_context, output)
+          ensure
+            source_map.pop_frame
+          end
+        else
+          partial.render_to_output_buffer(inner_context, output)
+        end
         forloop&.send(:increment!)
       }
 

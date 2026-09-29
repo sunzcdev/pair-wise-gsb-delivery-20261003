@@ -17,12 +17,14 @@ module Liquid
     def initialize
       @nodelist = []
       @blank    = true
+      @positions = nil
     end
 
     def parse(tokenizer, parse_context, &block)
       raise FrozenError, "can't modify frozen Liquid::BlockBody" if frozen?
 
       parse_context.line_number = tokenizer.line_number
+      @positions = [] if parse_context.track_source_positions?
 
       if tokenizer.for_liquid_tag
         parse_for_liquid_tag(tokenizer, parse_context, &block)
@@ -33,12 +35,15 @@ module Liquid
 
     def freeze
       @nodelist.freeze
+      @positions&.freeze
       super
     end
 
     private def parse_for_liquid_tag(tokenizer, parse_context)
       while (token = tokenizer.shift)
         unless token.empty? || token.match?(WhitespaceOrNothing)
+          position = tokenizer.token_position if @positions
+
           unless token =~ LiquidTagToken
             # line isn't empty but didn't match tag syntax, yield and let the
             # caller raise a syntax error
@@ -60,6 +65,7 @@ module Liquid
           new_tag = tag.parse(tag_name, markup, tokenizer, parse_context)
           @blank &&= new_tag.blank?
           @nodelist << new_tag
+          @positions << position if @positions
         end
         parse_context.line_number = tokenizer.line_number
       end
@@ -129,6 +135,8 @@ module Liquid
     private def parse_for_document(tokenizer, parse_context, &block)
       while (token = tokenizer.shift)
         next if token.empty?
+        position = tokenizer.token_position if @positions
+
         case
         when token.start_with?(TAGSTART)
           whitespace_handler(token, parse_context)
@@ -157,9 +165,11 @@ module Liquid
           new_tag = tag.parse(tag_name, markup, tokenizer, parse_context)
           @blank &&= new_tag.blank?
           @nodelist << new_tag
+          @positions << position if @positions
         when token.start_with?(VARSTART)
           whitespace_handler(token, parse_context)
           @nodelist << create_variable(token, parse_context)
+          @positions << position if @positions
           @blank = false
         else
           if parse_context.trim_whitespace
@@ -167,6 +177,7 @@ module Liquid
           end
           parse_context.trim_whitespace = false
           @nodelist << token
+          @positions << position if @positions
           @blank &&= token.match?(WhitespaceOrNothing)
         end
         parse_context.line_number = tokenizer.line_number
@@ -210,6 +221,13 @@ module Liquid
     # Note that it is now preferred to use the `liquid` tag for this use case.
     def remove_blank_strings
       raise "remove_blank_strings only support being called on a blank block body" unless @blank
+      if @positions
+        kept = []
+        @nodelist.each_with_index do |node, idx|
+          kept << @positions[idx] unless node.instance_of?(String)
+        end
+        @positions = kept
+      end
       @nodelist.reject! { |node| node.instance_of?(String) }
     end
 
@@ -221,6 +239,11 @@ module Liquid
       freeze unless frozen?
 
       context.resource_limits.increment_render_score(@nodelist.length)
+
+      if (source_map = context.source_map)
+        render_to_output_buffer_with_source_map(context, output, source_map)
+        return output
+      end
 
       idx = 0
       while (node = @nodelist[idx])
@@ -242,6 +265,37 @@ module Liquid
     end
 
     private
+
+    # Same as the regular render loop, but records the output byte range of
+    # each node into the source map. Only nodes rendered into the root
+    # output buffer are recorded (e.g. {% capture %} renders into its own
+    # buffer and is attributed to the capture tag itself instead).
+    def render_to_output_buffer_with_source_map(context, output, source_map)
+      record = output.equal?(source_map.output)
+
+      idx = 0
+      while (node = @nodelist[idx])
+        start_byte = output.bytesize
+        interrupt  = false
+
+        if node.instance_of?(String)
+          output << node
+        else
+          render_node(context, output, node)
+          interrupt = context.interrupt?
+        end
+
+        source_map.record(start_byte, output.bytesize, node, @positions&.at(idx), context) if record
+
+        break if interrupt
+
+        idx += 1
+
+        context.resource_limits.increment_write_score(output)
+      end
+
+      output
+    end
 
     def render_node(context, output, node)
       BlockBody.render_node(context, output, node)

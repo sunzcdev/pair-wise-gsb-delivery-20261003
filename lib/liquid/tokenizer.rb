@@ -4,7 +4,7 @@ require "strscan"
 
 module Liquid
   class Tokenizer
-    attr_reader :line_number, :for_liquid_tag
+    attr_reader :line_number, :for_liquid_tag, :token_position
 
     TAG_END = /%\}/
     TAG_OR_VARIABLE_START = /\{[\{\%]/
@@ -19,17 +19,21 @@ module Liquid
       string_scanner:,
       line_numbers: false,
       line_number: nil,
-      for_liquid_tag: false
+      for_liquid_tag: false,
+      positions: false
     )
       @line_number = line_number || (line_numbers ? 1 : nil)
       @for_liquid_tag = for_liquid_tag
       @source = source.to_s.to_str
       @offset = 0
       @tokens = []
+      @positions = positions && !for_liquid_tag
+      @token_position = nil
 
       if @source
         @ss = string_scanner
         @ss.string = @source
+        compute_line_offsets if @positions
         tokenize
       end
     end
@@ -38,6 +42,8 @@ module Liquid
       token = @tokens[@offset]
 
       return unless token
+
+      compute_token_position if @positions
 
       @offset += 1
 
@@ -49,6 +55,24 @@ module Liquid
     end
 
     private
+
+    # Byte offsets of the start of each line, used to derive 1-based
+    # [line, column] positions for tokens. Only computed when position
+    # tracking is enabled (source_map).
+    def compute_line_offsets
+      @token_offsets = []
+      @line_offsets  = [0]
+      while @ss.skip_until(NEWLINE)
+        @line_offsets << @ss.pos
+      end
+      @ss.reset
+    end
+
+    def compute_token_position
+      token_start = @token_offsets[@offset]
+      line = @line_offsets.bsearch_index { |line_start| line_start > token_start } || @line_offsets.length
+      @token_position = [line, token_start - @line_offsets[line - 1] + 1]
+    end
 
     def tokenize
       if @for_liquid_tag
@@ -65,6 +89,8 @@ module Liquid
       token = next_token
 
       return unless token
+
+      @token_offsets << @last_token_start if @positions
 
       token
     end
@@ -94,6 +120,7 @@ module Liquid
 
     def next_text_token
       start = @ss.pos
+      @last_token_start = start
 
       unless @ss.skip_until(TAG_OR_VARIABLE_START)
         token = @ss.rest
@@ -113,6 +140,7 @@ module Liquid
 
     def next_variable_token
       start = @ss.pos - 2
+      @last_token_start = start
 
       byte_a = byte_b = @ss.scan_byte
 
@@ -146,6 +174,8 @@ module Liquid
 
     def next_tag_token
       start = @ss.pos - 2
+      @last_token_start = start
+
       if (len = @ss.skip_until(TAG_END))
         @source.byteslice(start, len + 2)
       else
@@ -154,6 +184,7 @@ module Liquid
     end
 
     def next_tag_token_with_start(start)
+      @last_token_start = start
       @ss.skip_until(TAG_END)
       @source.byteslice(start, @ss.pos - start)
     end

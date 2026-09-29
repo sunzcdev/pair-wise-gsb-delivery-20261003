@@ -64,6 +64,12 @@ module Liquid
       @warnings ||= []
     end
 
+    # The active Liquid::SourceMap when source mapping is enabled for this
+    # render, nil otherwise.
+    def source_map
+      @registers.static[:source_map]
+    end
+
     def strainer
       @strainer ||= @environment.create_strainer(self, @filters)
     end

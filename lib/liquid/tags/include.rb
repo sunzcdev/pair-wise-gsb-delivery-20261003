@@ -55,6 +55,9 @@ module Liquid
       old_template_name = context.template_name
       old_partial       = context.partial
 
+      source_map = context.source_map
+      source_map&.push_frame(partial.name, line_number)
+
       begin
         context.template_name = partial.name
         context.partial = true
@@ -77,6 +80,7 @@ module Liquid
       ensure
         context.template_name = old_template_name
         context.partial       = old_partial
+        source_map&.pop_frame
       end
 
       output

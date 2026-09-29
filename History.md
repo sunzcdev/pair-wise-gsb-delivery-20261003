@@ -1,5 +1,9 @@
 # Liquid Change Log
 
+## Unreleased
+
+* Add optional output source mapping (`source_map: true`): `Template#source_map` attributes UTF-8 byte ranges of the rendered output to template names, line/column positions and nested render/include call locations
+
 ## 5.14.0
 
 * Avoid materializing integer ranges in `for` and `tablerow` loops, and account for each visited range item [Ian Ker-Seymer]

@@ -20,6 +20,12 @@ module Liquid
 
     attr_reader :profiler
 
+    # When the template was parsed or rendered with <tt>source_map: true</tt>,
+    # this is the Liquid::SourceMap recorded during the last render. It maps
+    # UTF-8 byte ranges of the rendered output back to template names,
+    # line/column positions and nested render/include call locations.
+    attr_reader :source_map
+
     class << self
       # Sets how strict the parser should be.
       # :lax acts like liquid 2.5 and silently ignores malformed tags in most cases.
@@ -141,6 +147,8 @@ module Liquid
     def render(*args)
       return '' if @root.nil?
 
+      @source_map = nil
+
       context = case args.first
       when Liquid::Context
         c = args.shift
@@ -169,6 +177,7 @@ module Liquid
       when Hash
         options = args.pop
         output  = options[:output] if options[:output]
+        render_with_source_map = options[:source_map]
         static_registers = context.registers.static
 
         options[:registers]&.each do |key, register|
@@ -192,12 +201,23 @@ module Liquid
       previous_error_mode = context.registers.static[:template_error_mode]
       context.registers.static[:template_error_mode] = @error_mode
 
+      owns_source_map = false
+      if (@source_map_enabled || render_with_source_map) && !context.partial &&
+          context.registers.static[:source_map].nil?
+        @source_map = SourceMap.new(context.template_name)
+        context.registers.static[:source_map] = @source_map
+        owns_source_map = true
+      end
+
       begin
         # render the nodelist.
-        @root.render_to_output_buffer(context, output || +'')
+        output ||= +''
+        @source_map.output = output if owns_source_map
+        @root.render_to_output_buffer(context, output)
       rescue Liquid::MemoryError => e
         context.handle_error(e)
       ensure
+        context.registers.static.delete(:source_map) if owns_source_map
         if previous_error_mode
           context.registers.static[:template_error_mode] = previous_error_mode
         else
@@ -223,9 +243,10 @@ module Liquid
         raise "Profiler not loaded, require 'liquid/profiler' first" unless defined?(Liquid::Profiler)
       end
 
-      @options      = options
-      @profiling    = profiling
-      @line_numbers = options[:line_numbers] || @profiling
+      @options            = options
+      @profiling          = profiling
+      @source_map_enabled = !!options[:source_map]
+      @line_numbers       = options[:line_numbers] || @profiling || @source_map_enabled
       parse_context = if options.is_a?(ParseContext)
         options
       else

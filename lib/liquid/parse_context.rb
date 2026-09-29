@@ -47,7 +47,14 @@ module Liquid
         string_scanner: @string_scanner,
         line_number: start_line_number,
         for_liquid_tag: for_liquid_tag,
+        positions: track_source_positions?,
       )
+    end
+
+    # Whether token positions (line/column) should be tracked so that an
+    # output source map can attribute rendered bytes to template fragments.
+    def track_source_positions?
+      !!self[:source_map]
     end
 
     def safe_parse_expression(parser)

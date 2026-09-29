@@ -161,3 +161,29 @@ output and does not by itself limit CPU work for output-free loops.
 To help track usages of a feature or code path in production, we have released opt-in usage tracking. To enable this, we provide an empty `Liquid:: Usage.increment` method which you can customize to your needs. The feature is well suited to https://github.com/Shopify/statsd-instrument. However, the choice of implementation is up to you.
 
 Once you have enabled usage tracking, we recommend reporting any events through Github Issues that your system may be logging. It is highly likely this event has been added to consider deprecating or improving code specific to this event, so please raise any concerns.
+
+### Output source mapping
+
+To find out which template fragment produced a given part of the rendered
+output (for example, to locate the source of unexpected text in a generated
+email), enable the optional source map:
+
+```ruby
+template = Liquid::Template.parse(source, source_map: true)
+output   = template.render(assigns)
+
+entry = template.source_map.lookup(byte_offset)
+entry.template_name # => "snippets/card"
+entry.line_number   # => 3
+entry.column        # => 8 (1-based byte column)
+entry.node_type     # => :text, :variable or :tag
+entry.stack         # => nested {% render %}/{% include %} call locations
+```
+
+`Liquid::SourceMap` attributes UTF-8 byte ranges of the output to template
+nodes. Use `lookup(byte_offset)` for a single byte, `entries_at(byte_offset)`
+to also see zero-length entries (e.g. a variable that rendered nothing), and
+`query(start_byte, end_byte)` for all fragments overlapping a byte range.
+Only template names and source positions are recorded; rendered values are
+never copied into the map. Source mapping can also be enabled for a single
+render with `template.render(assigns, source_map: true)`.
