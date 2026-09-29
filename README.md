@@ -161,6 +161,30 @@ I have tried to simplify it some:
    provide encoded parameter values when you call the parameter names through the
    <code>object.parameters['<parameter_name>']</code> method call.
 
+## Checking Server Capabilities Before Sending
+
+Before delivering a message, you can check it read-only against the SMTP
+extensions a server advertises with `Mail::EncodingPlan`:
+
+```ruby
+plan = mail.encoding_plan(capabilities: %i[8bitmime smtputf8])
+
+plan.compatible?            # can the message be delivered at all?
+plan.required_capabilities  # capabilities the server must still offer
+plan.reencodings            # parts that will be losslessly re-encoded
+plan.blockers               # items that cannot be degraded, with reasons
+
+fit_message = plan.apply    # a new, re-encoded message; mail is unchanged
+```
+
+The plan analyzes non-ASCII envelope addresses, header fields, body
+transfer encodings, and line lengths. Non-ASCII header text is
+re-encoded as RFC 2047 encoded-words, 8bit/binary bodies as
+quoted-printable or base64, and internationalized envelope domains with
+IDNA. An internationalized local part is never rewritten into another
+address: it requires SMTPUTF8 and is reported as a blocker otherwise.
+No network probing is performed.
+
 ## Contributing
 
 Please do!  Contributing is easy in Mail.  Please read the [CONTRIBUTING.md](CONTRIBUTING.md) document for more info.

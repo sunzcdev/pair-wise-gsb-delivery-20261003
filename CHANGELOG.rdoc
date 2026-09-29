@@ -9,6 +9,10 @@ Compatibility:
 
 Features:
 
+* Add Mail::EncodingPlan, a read-only preflight check that reports which SMTP
+  capabilities a message needs, which parts can be losslessly re-encoded, and
+  which items block delivery, and can apply the plan to a copy of the message
+
 * Updated README to improve around sending multipart mail @kapfenho
 * Add delivery_interceptors method to Mail class to fetch registered interceptors @ghousemohamed
 

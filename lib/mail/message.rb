@@ -1131,6 +1131,20 @@ module Mail
         end
     end
 
+    # Builds a read-only Mail::EncodingPlan for this message against the
+    # given SMTP server capabilities (e.g. :smtputf8, :'8bitmime',
+    # :binarymime). The plan reports which capabilities the message
+    # needs, which parts can be losslessly re-encoded, and which items
+    # block delivery. Does not modify the message or probe the network.
+    #
+    # Example:
+    #
+    #  plan = mail.encoding_plan(capabilities: %i[8bitmime])
+    #  plan.compatible? #=> true
+    def encoding_plan( capabilities: [] )
+      Mail::EncodingPlan.new(self, capabilities: capabilities)
+    end
+
     # Returns the decoded value of the subject field, as a single string.
     #
     # Example:
