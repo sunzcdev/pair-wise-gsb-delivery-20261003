@@ -49,6 +49,7 @@ module Mail # :doc:
   require 'mail/field_list'
 
   register_autoload :Envelope, 'mail/envelope'
+  register_autoload :Thread, 'mail/thread'
 
   # Autoload header field elements and transfer encodings.
   require 'mail/elements'
