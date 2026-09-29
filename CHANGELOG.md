@@ -7,6 +7,9 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- New `check_group` step type: runs a group of independent checks against the same input, collecting every failure into a single `Failure` (no short-circuiting inside the group). When all checks pass, their declared outputs (hashes returned via `Success`) are merged, raising `Dry::Transaction::DuplicateOutputKeyError` on duplicate keys. Each check publishes its own step events alongside the group's events.
 
 ## [0.16.0] - 2024-01-17
 

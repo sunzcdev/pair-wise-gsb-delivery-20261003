@@ -42,8 +42,10 @@ module Dry
         @listeners = listeners
 
         if listeners.is_a?(Hash)
+          all_steps = steps.flat_map { |step| [step, *step.substeps] }
+
           listeners.each do |step_name, listener|
-            steps.detect { |step| step.name == step_name }.subscribe(listener)
+            all_steps.detect { |step| step.name == step_name }.subscribe(listener)
           end
         else
           steps.each do |step|
@@ -86,16 +88,30 @@ module Dry
       end
 
       def resolve_operation(step, **operations)
-        if step.internal? && operations[step.name]
-          operations[step.name]
+        operation = operations[step.name]
+
+        if operation.is_a?(Array)
+          resolve_group_operations(step, operation)
+        elsif step.internal? && operation
+          operation
         elsif methods.include?(step.name) || private_methods.include?(step.name)
           method(step.name)
-        elsif operations[step.name].respond_to?(:call)
-          operations[step.name]
-        elsif operations[step.name]
+        elsif operation.respond_to?(:call)
+          operation
+        elsif operation
           raise InvalidStepError, step.name
         else
           raise MissingStepError, step.name
+        end
+      end
+
+      def resolve_group_operations(step, operations)
+        if operations.any?(&:nil?)
+          raise MissingStepError, step.name
+        elsif operations.all? { |operation| operation.respond_to?(:call) }
+          operations
+        else
+          raise InvalidStepError, step.name
         end
       end
 

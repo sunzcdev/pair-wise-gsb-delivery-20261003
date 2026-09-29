@@ -76,6 +76,10 @@ module Dry
         !external?
       end
 
+      def substeps
+        []
+      end
+
       def external?
         !!operation_name
       end

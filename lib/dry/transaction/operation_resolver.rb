@@ -8,10 +8,12 @@ module Dry
           define_method :initialize do |**kwargs|
             operation_kwargs = self.class.steps.select(&:operation_name).to_h { |step|
               operation = kwargs.fetch(step.name) {
-                if ops_container&.key?(step.operation_name)
+                if step.operation_name.is_a?(Array)
+                  step.operation_name.map { |name|
+                    ops_container&.[](name) if ops_container&.key?(name)
+                  }
+                elsif ops_container&.key?(step.operation_name)
                   ops_container[step.operation_name]
-                else
-                  nil
                 end
               }
 

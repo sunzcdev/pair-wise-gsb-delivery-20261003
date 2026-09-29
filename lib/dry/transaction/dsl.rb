@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "dry/transaction/step_group"
+
 module Dry
   module Transaction
     class DSL < Module
@@ -39,6 +41,29 @@ module Dry
                 options: options
               )
             end
+          end
+
+          define_method(:check_group) do |step_name, with:, **options|
+            check_names = Array(with)
+
+            sub_steps = check_names.map do |check_name|
+              Step.new(
+                adapter: step_adapters[:step],
+                name: check_name,
+                operation_name: check_name,
+                operation: nil, # operations are resolved only when transactions are instantiated
+                options: options
+              )
+            end
+
+            steps << StepGroup.new(
+              adapter: step_adapters[:step],
+              name: step_name,
+              operation_name: check_names,
+              operation: nil, # operations are resolved only when transactions are instantiated
+              options: options,
+              steps: sub_steps
+            )
           end
         end
       end

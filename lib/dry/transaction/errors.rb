@@ -25,5 +25,11 @@ module Dry
         super("step +#{step_name}+ requires one or more exception classes provided via +catch:+")
       end
     end
+
+    class DuplicateOutputKeyError < ArgumentError
+      def initialize(step_name, key)
+        super("check group +#{step_name}+ cannot merge duplicate output key +#{key}+")
+      end
+    end
   end
 end
