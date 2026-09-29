@@ -90,6 +90,25 @@ schedule.remaining_occurrences          # for terminating schedules
 schedule.previous_occurrence(from_time)
 schedule.previous_occurrences(4, from_time)
 
+# or locate the occurrence at a 0-based position, and count how many
+# occurrences happen before a given time. Positions always refer to the
+# final, deduplicated sequence of occurrences (after COUNT/UNTIL limits,
+# overlapping rules and exception times have been applied).
+result = schedule.occurrence_at(100_000)   # => IceCube::OrdinalResult
+result.time                              # the 100_001st occurrence (or nil)
+result.strategy                          # => :arithmetic or :enumeration
+result.exact?                            # true when computed in O(1)
+result.iterations                        # occurrences walked (0 when exact)
+
+schedule.occurrences_before(time).count  # => Integer
+
+# A schedule made of a single plain interval rule (optionally bounded by
+# .count/.until) is answered arithmetically, without enumerating any
+# occurrences. Any other combination falls back to enumeration bounded by
+# a budget (default IceCube::Positioning::DEFAULT_BUDGET), raising
+# IceCube::BudgetExceeded when the budget is not enough:
+schedule.occurrence_at(100_000, budget: 1_000_000)
+
 # or include prior occurrences with a duration overlapping from_time
 schedule.next_occurrences(4, from_time, spans: true)
 schedule.occurrences_between(from_time, to_time, spans: true)

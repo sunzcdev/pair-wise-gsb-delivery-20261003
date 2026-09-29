@@ -299,6 +299,32 @@ module IceCube
       n.nil? ? occurrences.first : occurrences
     end
 
+    # Locate the occurrence at a 0-based index in the schedule's final,
+    # deduplicated sequence of occurrences (after COUNT/UNTIL limits,
+    # overlapping rules and exception times have been applied).
+    #
+    # Returns an OrdinalResult whose #time is the occurrence, or nil when
+    # the schedule ends before +index+. A schedule made of a single plain
+    # interval rule (optionally bounded by +count+/+until+) is computed
+    # arithmetically in O(1); any other combination falls back to
+    # enumerating at most +budget+ occurrences and raises BudgetExceeded
+    # when that is not enough. Inspect OrdinalResult#strategy to see which
+    # path produced the answer.
+    def occurrence_at(index, budget: Positioning::DEFAULT_BUDGET)
+      Positioning.occurrence_at(self, index, budget: budget)
+    end
+
+    # Count how many of the schedule's occurrences happen strictly before
+    # +time+ in the final, deduplicated sequence of occurrences. Like
+    # #occurrence_at, this uses an arithmetic fast path when the schedule
+    # allows it and a budget-constrained enumeration otherwise; see
+    # OrdinalResult#strategy.
+    def occurrences_before(time, budget: Positioning::DEFAULT_BUDGET)
+      time = TimeUtil.match_zone(time, start_time) or
+        raise ArgumentError, "Time required, got #{time.inspect}"
+      Positioning.occurrences_before(self, time, budget: budget)
+    end
+
     # Get the final n occurrences of a terminating schedule
     # or the final one if no n is given
     def last(n = nil)

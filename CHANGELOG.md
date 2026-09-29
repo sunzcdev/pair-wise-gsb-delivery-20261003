@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [UNRELEASED]
 ### Added
+- Ordinal positioning and reverse counting: `Schedule#occurrence_at(index)` and `Schedule#occurrences_before(time)`. Schedules made of a single plain interval rule (optionally bounded by `count`/`until`) are answered arithmetically in O(1); other combinations fall back to budget-constrained enumeration and the returned `IceCube::OrdinalResult` reports the strategy used. Enumeration raises `IceCube::BudgetExceeded` when the budget is exceeded.
 - Support for BYSETPOS with all rule frequencies (yearly, monthly, weekly, daily, hourly, minutely, secondly). ([#449](https://github.com/ice-cube-ruby/ice_cube/pull/449)) by [@nehresma](https://github.com/nehresma) and [@NicolasMarlier](https://github.com/NicolasMarlier)
 
 ### Changed
