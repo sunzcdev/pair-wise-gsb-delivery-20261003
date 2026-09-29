@@ -1638,6 +1638,35 @@ module Mail
       !attachments.empty?
     end
 
+    # Returns a Mail::RelatedResources view over this message (or part)
+    # when it is a multipart/related container itself, or over the first
+    # multipart/related part found within it. Returns nil when there is
+    # no multipart/related container.
+    #
+    # The view resolves the "cid:" references of the container's root
+    # body part (selected with the container's +start+ parameter) against
+    # the parts of that container only:
+    #
+    #  view = mail.related_resources
+    #  view.referenced   #=> inline resources used by the root body
+    #  view.unreferenced #=> inline resources nothing refers to
+    #  view.dangling     #=> "cid:" references with no matching part
+    #
+    # Nested multipart/related containers are scopes of their own; ask
+    # the nested part for its own view:
+    #
+    #  inner = mail.all_parts.detect { |p| p.mime_type == 'multipart/related' }
+    #  inner.related_resources
+    def related_resources
+      container =
+        if multipart? && sub_type.to_s.downcase == 'related'
+          self
+        else
+          all_parts.detect { |p| p.multipart? && p.sub_type.to_s.downcase == 'related' }
+        end
+      container && RelatedResources.new(container)
+    end
+
     # Accessor for html_part
     def html_part(&block)
       if block_given?
