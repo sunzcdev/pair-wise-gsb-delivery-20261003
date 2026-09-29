@@ -682,6 +682,21 @@ The application can choose to implement some kind of JWK cache invalidation or o
 Tokens without a specified key identifier (`kid` or `x5t`) are rejected by default.
 This behaviour may be overwritten by setting the `allow_nil_kid` option for `decode` to `true`.
 
+A JWK Set may mix signing and encryption keys, or reuse the same `kid` for keys of
+different types. By default the first key matching the key identifier is used. An
+explicit verification purpose policy can be enabled via the `verification_policy`
+option to jointly check the `kty`, `alg`, `use` and `key_ops` members of every
+matching key against the token algorithm:
+
+```ruby
+JWT.decode(token, nil, true, algorithms: algorithms, jwks: jwks, verification_policy: true)
+```
+
+Absent `alg`, `use` and `key_ops` members impose no restriction, while contradictory
+declarations (for example `use: 'sig'` combined with a `key_ops` lacking `'verify'`)
+raise a `JWT::JWKError`. If more than one key qualifies, a `JWT::SignatureError` is
+raised instead of relying on the order of the keys in the set.
+
 ```ruby
 jwks_loader = ->(options) do
   # The jwk loader would fetch the set of JWKs from a trusted source.

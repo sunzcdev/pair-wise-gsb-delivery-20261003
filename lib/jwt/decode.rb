@@ -69,7 +69,8 @@ module JWT
         @key = ::JWT::JWK::KeyFinder.new(
           jwks: @options[:jwks],
           allow_nil_kid: @options[:allow_nil_kid],
-          key_fields: @options[:key_fields]
+          key_fields: @options[:key_fields],
+          verification_policy: @options[:verification_policy]
         ).call(token)
       end
 

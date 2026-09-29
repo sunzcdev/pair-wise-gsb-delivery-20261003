@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add an explicit verification purpose policy (`verification_policy` option / `JWT::JWK::VerificationPolicy`) to `JWT::JWK::KeyFinder`, jointly checking `kty`, `alg`, `use` and `key_ops` when multiple keys share a `kid`, raising on contradictory metadata and ambiguous matches
 - Your contribution here
 
 **Fixes and enhancements:**
