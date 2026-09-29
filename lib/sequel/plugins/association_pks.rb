@@ -41,13 +41,31 @@ module Sequel
     #
     # By default, if you pass a nil value to the setter, an exception will be raised.
     # You can change this behavior by using the :association_pks_nil association option.
-    # If set to :ignore, the setter will take no action if nil is given.
-    # If set to :remove, the setter will treat the nil as an empty array, removing
-    # the association all currently associated values.
-    #
-    # For many_to_many associations, association_pks assumes the related pks can be
-    # accessed directly from the join table.  This works in most cases, but in cases
-    # where the :right_primary_key association option is used to specify a different
+# If set to :ignore, the setter will take no action if nil is given.
+# If set to :remove, the setter will treat the nil as an empty array, removing
+# the association all currently associated values.
+#
+# By default, the setter uses a delete/exclude-then-insert approach for
+# many_to_many associations, and an update-all-matching approach for
+# one_to_many associations.  If the :association_pks_differential association
+# option is used, the setter uses a differential approach instead.  It first
+# retrieves the currently associated primary keys, and then only deletes the
+# join table rows for primary keys that are no longer associated, and only
+# inserts rows for newly associated primary keys (for one_to_many
+# associations, it only updates rows that are entering or leaving the
+# association).  Rows for primary keys that remain associated are kept as
+# they are, and are not deleted and recreated.  If the new primary key set
+# is the same as the current set, no write queries are issued.  Duplicate
+# primary keys passed to the setter are normalized before processing.  For
+# associations with conditions, only rows inside the association's scope are
+# considered, so join table rows belonging to other scopes are not
+# accidentally deleted.  If applying the changes fails, any cached or
+# delayed primary keys for the association are discarded, so the model
+# visible state stays consistent with the rolled back database state.
+#
+# For many_to_many associations, association_pks assumes the related pks can be
+# accessed directly from the join table.  This works in most cases, but in cases
+# where the :right_primary_key association option is used to specify a different
     # primary key in the associated table, association_pks will return the value of
     # the association primary keys (foreign key values to associated table in the join
     # table), not the associated model primary keys.  If you would like to use the
@@ -136,25 +154,57 @@ module Sequel
           end
 
           if !opts[:read_only] && !join_associated_table
-            opts[:pks_setter] = lambda do |pks|
-              if pks.empty?
-                public_send(opts[:remove_all_method])
-              else
-                checked_transaction do
-                  if clpk
-                    lpkv = lpk.map{|k| get_column_value(k)}
-                    cond = lk.zip(lpkv)
-                  else
-                    lpkv = get_column_value(lpk)
-                    cond = {lk=>lpkv}
+            opts[:pks_setter] = if opts[:association_pks_differential]
+              lambda do |pks|
+                if clpk
+                  lpkv = lpk.map{|k| get_column_value(k)}
+                  cond = lk.zip(lpkv)
+                else
+                  lpkv = get_column_value(lpk)
+                  cond = {lk=>lpkv}
+                end
+                ds = _join_table_dataset(opts).where(cond)
+                current_pks = if opts[:conditions]
+                  _association_pks_scoped_pks(opts)
+                else
+                  ds.select_map(rk)
+                end
+                remove_pks = current_pks - pks
+                add_pks = pks - current_pks
+
+                unless remove_pks.empty? && add_pks.empty?
+                  checked_transaction do
+                    ds.where(rk=>remove_pks).delete unless remove_pks.empty?
+                    unless add_pks.empty?
+                      lpkv = Array(lpkv)
+                      key_array = crk ? add_pks.map{|pk| lpkv + pk} : add_pks.map{|pk| lpkv + [pk]}
+                      key_columns = Array(lk) + Array(rk)
+                      ds.import(key_columns, key_array)
+                    end
                   end
-                  ds = _join_table_dataset(opts).where(cond)
-                  ds.exclude(rk=>pks).delete
-                  pks -= ds.select_map(rk)
-                  lpkv = Array(lpkv)
-                  key_array = crk ? pks.map{|pk| lpkv + pk} : pks.map{|pk| lpkv + [pk]}
-                  key_columns = Array(lk) + Array(rk)
-                  ds.import(key_columns, key_array)
+                end
+              end
+            else
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
+                else
+                  checked_transaction do
+                    if clpk
+                      lpkv = lpk.map{|k| get_column_value(k)}
+                      cond = lk.zip(lpkv)
+                    else
+                      lpkv = get_column_value(lpk)
+                      cond = {lk=>lpkv}
+                    end
+                    ds = _join_table_dataset(opts).where(cond)
+                    ds.exclude(rk=>pks).delete
+                    pks -= ds.select_map(rk)
+                    lpkv = Array(lpkv)
+                    key_array = crk ? pks.map{|pk| lpkv + pk} : pks.map{|pk| lpkv + [pk]}
+                    key_columns = Array(lk) + Array(rk)
+                    ds.import(key_columns, key_array)
+                  end
                 end
               end
             end
@@ -183,12 +233,9 @@ module Sequel
           end
 
           unless opts[:read_only]
-            opts[:pks_setter] = lambda do |pks|
-              if pks.empty?
-                public_send(opts[:remove_all_method])
-              else
+            opts[:pks_setter] = if opts[:association_pks_differential]
+              lambda do |pks|
                 primary_key = opts.associated_class.primary_key
-                pkh = {primary_key=>pks}
 
                 if key.is_a?(Array)
                   h = {}
@@ -202,10 +249,43 @@ module Sequel
                   nh = {key=>nil}
                 end
 
-                checked_transaction do
-                  ds = public_send(opts.dataset_method)
-                  ds.unfiltered.where(pkh).update(h)
-                  ds.exclude(pkh).update(nh)
+                ds = public_send(opts.dataset_method)
+                current_pks = ds.select_map(primary_key)
+                add_pks = pks - current_pks
+                remove_pks = current_pks - pks
+
+                unless add_pks.empty? && remove_pks.empty?
+                  checked_transaction do
+                    ds.unfiltered.where(primary_key=>add_pks).update(h) unless add_pks.empty?
+                    ds.where(primary_key=>remove_pks).update(nh) unless remove_pks.empty?
+                  end
+                end
+              end
+            else
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
+                else
+                  primary_key = opts.associated_class.primary_key
+                  pkh = {primary_key=>pks}
+
+                  if key.is_a?(Array)
+                    h = {}
+                    nh = {}
+                    key.zip(pk).each do|k, v|
+                      h[k] = v
+                      nh[k] = nil
+                    end
+                  else
+                    h = {key=>pk}
+                    nh = {key=>nil}
+                  end
+
+                  checked_transaction do
+                    ds = public_send(opts.dataset_method)
+                    ds.unfiltered.where(pkh).update(h)
+                    ds.exclude(pkh).update(nh)
+                  end
                 end
               end
             end
@@ -220,9 +300,18 @@ module Sequel
         # call the related association pks setters.
         def after_save
           if assoc_pks = @_association_pks
-            assoc_pks.each do |name, pks|
-             # pks_setter_method is private
-              send(model.association_reflection(name)[:pks_setter_method], pks)
+            begin
+              assoc_pks.each do |name, pks|
+               # pks_setter_method is private
+                send(model.association_reflection(name)[:pks_setter_method], pks)
+              end
+            rescue
+              # If setting the association pks fails, the transaction around
+              # the save is rolled back.  Discard the saved pks for
+              # differential associations, so the model visible state stays
+              # consistent with the rolled back database state.
+              assoc_pks.delete_if{|name, _| model.association_reflection(name)[:association_pks_differential]}
+              raise
             end
             @_association_pks = nil
           end
@@ -279,13 +368,39 @@ module Sequel
 
           pks = convert_pk_array(opts, pks)
 
+          if opts[:association_pks_differential]
+            pks = pks.uniq
+
+            # If the pks are cached and match the given pks, the association
+            # is already in the desired state, so no action is needed.
+            if !opts.fetch(:delay_pks, true) && @_association_pks && (cached_pks = @_association_pks[opts[:name]])
+              return if (cached_pks - pks).empty? && (pks - cached_pks).empty?
+            end
+          end
+
           if opts.fetch(:delay_pks, true)
             modified!
             (@_association_pks ||= {})[opts[:name]] = pks
           else
             # pks_setter_method is private
             send(opts[:pks_setter_method], pks)
+
+            # Update the cached pks only after the setter has completed
+            # successfully, so a failure does not leave the cache
+            # inconsistent with the database.
+            if opts[:association_pks_differential] && opts[:cache_pks]
+              (@_association_pks ||= {})[opts[:name]] = pks
+            end
           end
+        end
+
+        # Return the current primary key values inside the association's
+        # scope, respecting the association's conditions.  Used by the
+        # differential many_to_many setter to make sure join table rows
+        # outside the association's scope are not modified.
+        def _association_pks_scoped_pks(opts)
+          rpk = opts.right_primary_key
+          _dataset(opts).select_map(Sequel.public_send(rpk.is_a?(Array) ? :deep_qualify : :qualify, opts.associated_class.table_name, rpk)).uniq
         end
 
         # If the associated class's primary key column type is integer,
