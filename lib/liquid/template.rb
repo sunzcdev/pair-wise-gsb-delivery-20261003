@@ -20,6 +20,10 @@ module Liquid
 
     attr_reader :profiler
 
+    # The Liquid::SourceMap recorded during the last render when the
+    # `source_map` render option was used, nil otherwise.
+    attr_reader :source_map
+
     class << self
       # Sets how strict the parser should be.
       # :lax acts like liquid 2.5 and silently ignores malformed tags in most cases.
@@ -137,6 +141,10 @@ module Liquid
     #  * <tt>filters</tt> : array with local filters
     #  * <tt>registers</tt> : hash with register variables. Those can be accessed from
     #    filters and tags and might be useful to integrate liquid more with its host application
+    #  * <tt>source_map</tt> : pass <tt>true</tt> or a Liquid::SourceMap instance to record
+    #    which template source produced each byte of the output. The map is available
+    #    via Template#source_map after rendering. Parse the template with
+    #    <tt>line_numbers: true</tt> to include line and column information.
     #
     def render(*args)
       return '' if @root.nil?
@@ -164,12 +172,18 @@ module Liquid
       end
 
       output = nil
+      source_map = nil
 
       case args.last
       when Hash
         options = args.pop
         output  = options[:output] if options[:output]
         static_registers = context.registers.static
+
+        if (source_map_option = options[:source_map])
+          source_map = source_map_option.is_a?(Liquid::SourceMap) ? source_map_option : Liquid::SourceMap.new
+          context.source_map = source_map
+        end
 
         options[:registers]&.each do |key, register|
           static_registers[key] = register
@@ -192,9 +206,21 @@ module Liquid
       previous_error_mode = context.registers.static[:template_error_mode]
       context.registers.static[:template_error_mode] = @error_mode
 
+      output ||= +''
+
+      if (active_source_map = context.source_map)
+        # Byte offsets are recorded relative to this buffer; nested renders
+        # (partials) share it, while side buffers (e.g. {% capture %}) are
+        # not recorded.
+        active_source_map.root_buffer = output if source_map || active_source_map.root_buffer.nil?
+        @source_map = active_source_map
+      else
+        @source_map = nil
+      end
+
       begin
         # render the nodelist.
-        @root.render_to_output_buffer(context, output || +'')
+        @root.render_to_output_buffer(context, output)
       rescue Liquid::MemoryError => e
         context.handle_error(e)
       ensure

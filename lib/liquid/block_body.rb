@@ -23,6 +23,7 @@ module Liquid
       raise FrozenError, "can't modify frozen Liquid::BlockBody" if frozen?
 
       parse_context.line_number = tokenizer.line_number
+      parse_context.source_column = tokenizer.token_column
 
       if tokenizer.for_liquid_tag
         parse_for_liquid_tag(tokenizer, parse_context, &block)
@@ -49,7 +50,7 @@ module Liquid
 
           if tag_name == 'liquid'
             parse_context.line_number -= 1
-            next parse_liquid_tag(markup, parse_context)
+            next parse_liquid_tag(markup, parse_context, liquid_tag_column(token, Regexp.last_match.begin(2), parse_context))
           end
 
           unless (tag = parse_context.environment.tag_for_name(tag_name))
@@ -62,6 +63,7 @@ module Liquid
           @nodelist << new_tag
         end
         parse_context.line_number = tokenizer.line_number
+        parse_context.source_column = tokenizer.token_column
       end
 
       yield nil, nil
@@ -107,14 +109,28 @@ module Liquid
       end
     end
 
-    private def parse_liquid_tag(markup, parse_context)
+    private def parse_liquid_tag(markup, parse_context, start_column = nil)
       liquid_tag_tokenizer = parse_context.new_tokenizer(
-        markup, start_line_number: parse_context.line_number, for_liquid_tag: true
+        markup, start_line_number: parse_context.line_number, for_liquid_tag: true, start_column: start_column
       )
       parse_for_liquid_tag(liquid_tag_tokenizer, parse_context) do |end_tag_name, _end_tag_markup|
         if end_tag_name
           BlockBody.unknown_tag_in_liquid_tag(end_tag_name, parse_context)
         end
+      end
+    end
+
+    # 1-based character column of the markup inside a {% liquid %} tag token,
+    # or nil when line tracking is disabled.
+    private def liquid_tag_column(token, markup_char_offset, parse_context)
+      column = parse_context.source_column
+      return unless column
+
+      prefix = token[0...markup_char_offset]
+      if (newline_index = prefix.rindex("\n"))
+        markup_char_offset - newline_index
+      else
+        column + markup_char_offset
       end
     end
 
@@ -145,7 +161,7 @@ module Liquid
           end
 
           if tag_name == 'liquid'
-            parse_liquid_tag(markup, parse_context)
+            parse_liquid_tag(markup, parse_context, liquid_tag_column(token, Regexp.last_match.begin(4), parse_context))
             next
           end
 
@@ -170,6 +186,7 @@ module Liquid
           @blank &&= token.match?(WhitespaceOrNothing)
         end
         parse_context.line_number = tokenizer.line_number
+        parse_context.source_column = tokenizer.token_column
       end
 
       yield nil, nil
@@ -222,6 +239,10 @@ module Liquid
 
       context.resource_limits.increment_render_score(@nodelist.length)
 
+      if (source_map = context.source_map) && source_map.root_buffer.equal?(output)
+        return render_to_output_buffer_with_source_map(context, output, source_map)
+      end
+
       idx = 0
       while (node = @nodelist[idx])
         if node.instance_of?(String)
@@ -242,6 +263,44 @@ module Liquid
     end
 
     private
+
+    def render_to_output_buffer_with_source_map(context, output, source_map)
+      idx = 0
+      while (node = @nodelist[idx])
+        start_byte = output.bytesize
+
+        if node.instance_of?(String)
+          output << node
+          source_map.record(start_byte, output.bytesize, context.template_name, nil, nil, 'text')
+        else
+          render_node(context, output, node)
+          source_map.record(
+            start_byte,
+            output.bytesize,
+            context.template_name,
+            node.line_number,
+            node.source_column,
+            source_map_node_type(node),
+          )
+          # If we get an Interrupt that means the block must stop processing.
+          break if context.interrupt?
+        end
+        idx += 1
+
+        context.resource_limits.increment_write_score(output)
+      end
+
+      output
+    end
+
+    def source_map_node_type(node)
+      case node
+      when Variable
+        'variable'
+      when Tag
+        node.tag_name
+      end
+    end
 
     def render_node(context, output, node)
       BlockBody.render_node(context, output, node)

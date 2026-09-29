@@ -5,7 +5,7 @@ require 'liquid/tag/disableable'
 
 module Liquid
   class Tag
-    attr_reader :nodelist, :tag_name, :line_number, :parse_context
+    attr_reader :nodelist, :tag_name, :line_number, :source_column, :parse_context
     alias_method :options, :parse_context
     include ParserSwitching
 
@@ -36,6 +36,7 @@ module Liquid
       @markup        = markup
       @parse_context = parse_context
       @line_number   = parse_context.line_number
+      @source_column = parse_context.source_column
     end
 
     def parse(_tokens)

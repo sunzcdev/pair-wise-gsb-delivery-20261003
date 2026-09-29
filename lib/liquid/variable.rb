@@ -19,6 +19,7 @@ module Liquid
     MarkupWithQuotedFragment = /(#{QuotedFragment})(.*)/om
 
     attr_accessor :filters, :name, :line_number
+    attr_reader :source_column
     attr_reader :parse_context
     alias_method :options, :parse_context
 
@@ -29,6 +30,7 @@ module Liquid
       @name          = nil
       @parse_context = parse_context
       @line_number   = parse_context.line_number
+      @source_column = parse_context.source_column
 
       strict_parse_with_error_mode_fallback(markup)
     end

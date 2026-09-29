@@ -2,7 +2,7 @@
 
 module Liquid
   class ParseContext
-    attr_accessor :locale, :line_number, :trim_whitespace, :depth
+    attr_accessor :locale, :line_number, :trim_whitespace, :depth, :source_column
     attr_reader :partial, :warnings, :error_mode, :environment
 
     def initialize(options = Const::EMPTY_HASH)
@@ -41,12 +41,13 @@ module Liquid
       Parser.new(@string_scanner, reject_bare_brackets: @error_mode == :strict2 || @error_mode == :rigid)
     end
 
-    def new_tokenizer(source, start_line_number: nil, for_liquid_tag: false)
+    def new_tokenizer(source, start_line_number: nil, for_liquid_tag: false, start_column: nil)
       Tokenizer.new(
         source: source,
         string_scanner: @string_scanner,
         line_number: start_line_number,
         for_liquid_tag: for_liquid_tag,
+        start_column: start_column,
       )
     end
 

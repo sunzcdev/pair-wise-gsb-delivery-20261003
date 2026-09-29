@@ -19,9 +19,11 @@ module Liquid
       string_scanner:,
       line_numbers: false,
       line_number: nil,
-      for_liquid_tag: false
+      for_liquid_tag: false,
+      start_column: nil
     )
       @line_number = line_number || (line_numbers ? 1 : nil)
+      @start_column = start_column
       @for_liquid_tag = for_liquid_tag
       @source = source.to_s.to_str
       @offset = 0
@@ -48,6 +50,12 @@ module Liquid
       token
     end
 
+    # 1-based character column (in the template source) of the next token to
+    # be shifted, or nil when line tracking is disabled.
+    def token_column
+      @token_columns&.[](@offset)
+    end
+
     private
 
     def tokenize
@@ -57,8 +65,34 @@ module Liquid
         @tokens << shift_normal until @ss.eos?
       end
 
+      compute_token_columns if @line_number
+
       @source = nil
       @ss = nil
+    end
+
+    # Computes the 1-based character column of every token. Tokens partition
+    # the source contiguously, so columns can be derived from character
+    # lengths and newline positions. For `{% liquid %}` tag tokenizers, the
+    # first token starts at the column where the tag's markup begins and every
+    # following token starts its own source line.
+    def compute_token_columns
+      if @for_liquid_tag
+        first_column = @start_column || 1
+        @token_columns = Array.new(@tokens.length) { |i| i.zero? ? first_column : 1 }
+        return
+      end
+
+      @token_columns = []
+      char_offset = 0
+      line_start  = 0
+      @tokens.each do |token|
+        @token_columns << (char_offset - line_start + 1)
+        if (newline_index = token.rindex("\n"))
+          line_start = char_offset + newline_index + 1
+        end
+        char_offset += token.length
+      end
     end
 
     def shift_normal

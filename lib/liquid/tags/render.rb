@@ -43,7 +43,14 @@ module Liquid
     end
 
     def render_to_output_buffer(context, output)
-      render_tag(context, output)
+      source_map = context.source_map
+      source_map&.push_frame(context.template_name, line_number, source_column)
+
+      begin
+        render_tag(context, output)
+      ensure
+        source_map&.pop_frame
+      end
     end
 
     def render_tag(context, output)
