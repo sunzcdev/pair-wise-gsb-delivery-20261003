@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [UNRELEASED]
 ### Added
+- `IceCube::ScheduleComparison` and `Schedule#compare_occurrences` for comparing the occurrence times of two schedules over a finite window, reporting the earliest difference (and which side it belongs to), equality within the window, or an incomplete result when the work budget is exhausted.
 - Support for BYSETPOS with all rule frequencies (yearly, monthly, weekly, daily, hourly, minutely, secondly). ([#449](https://github.com/ice-cube-ruby/ice_cube/pull/449)) by [@nehresma](https://github.com/nehresma) and [@NicolasMarlier](https://github.com/NicolasMarlier)
 
 ### Changed

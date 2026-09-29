@@ -293,6 +293,16 @@ module IceCube
       occurs_between?(time, time)
     end
 
+    # Compare this schedule's occurrence times with another schedule's
+    # over the finite window between +opening_time+ and +closing_time+
+    # (inclusive). Returns an IceCube::ScheduleComparison reporting
+    # whether both schedules occur at the same times throughout the
+    # window, or the earliest difference and which side it belongs to
+    # (this schedule is :left, +other_schedule+ is :right).
+    def compare_occurrences(other_schedule, opening_time, closing_time, max_steps: ScheduleComparison::DEFAULT_MAX_STEPS)
+      ScheduleComparison.compare(self, other_schedule, opening_time, closing_time, max_steps: max_steps)
+    end
+
     # Get the first n occurrences, or the first occurrence if n is skipped
     def first(n = nil)
       occurrences = enumerate_occurrences(start_time).take(n || 1)
