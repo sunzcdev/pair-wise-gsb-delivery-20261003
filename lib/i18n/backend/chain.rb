@@ -56,11 +56,14 @@ module I18n
         def translate(locale, key, default_options = EMPTY_HASH)
           namespace = nil
           options = Utils.except(default_options, :default)
+          trace = default_options[:explain]
 
           backends.each do |backend|
             catch(:exception) do
               options = default_options if backend == backends.last
+              step = trace&.record(:chain, :backend => backend, :locale => locale, :key => key, :hit => false)
               translation = backend.translate(locale, key, options)
+              step&.hit! unless translation.nil?
               if namespace_lookup?(translation, options)
                 namespace = _deep_merge(translation, namespace || {})
               elsif !translation.nil? || (options.key?(:default) && options[:default].nil?)

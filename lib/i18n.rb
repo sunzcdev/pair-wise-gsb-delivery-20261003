@@ -7,6 +7,7 @@ require 'i18n/version'
 require 'i18n/utils'
 require 'i18n/exceptions'
 require 'i18n/interpolate/ruby'
+require 'i18n/explain'
 
 module I18n
   autoload :Backend, 'i18n/backend'
@@ -19,6 +20,7 @@ module I18n
   RESERVED_KEYS = %i[
     cascade
     deep_interpolation
+    explain
     skip_interpolation
     default
     exception_handler
@@ -261,6 +263,29 @@ module I18n
       translate(key, **options, raise: true)
     end
     alias :t! :translate!
+
+    # Translates the given key exactly like +translate+ does, but additionally
+    # collects an explanation of how the translation was resolved: which
+    # backends were queried, for which locales and keys, which fallback
+    # locales, cascade levels and symbol aliases were followed, and which
+    # storage location finally produced the hit.
+    #
+    # Returns an I18n::Explain::Result which keeps the translation and the
+    # explanation separate:
+    #
+    #   result = I18n.explain(:'foo.bar', :locale => :de)
+    #   result.translation      # => the translated value
+    #   result.trace            # => I18n::Explain::Trace with all resolution steps
+    #   result.trace.hit        # => the step that hit, incl. its storage location
+    #
+    # The explanation is recorded while the translation is being resolved, so
+    # explaining never re-queries a backend or runs interpolation callables an
+    # extra time, and no global state is written.
+    def explain(key = nil, throw: false, raise: false, locale: nil, **options)
+      trace = I18n::Explain::Trace.new
+      translation = translate(key, throw: throw, raise: raise, locale: locale, **options, explain: trace)
+      I18n::Explain::Result.new(translation, trace)
+    end
 
     # Returns an array of interpolation keys for the given translation key
     #

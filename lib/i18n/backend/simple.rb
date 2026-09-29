@@ -94,16 +94,23 @@ module I18n
           init_translations unless initialized?
           keys = I18n.normalize_keys(locale, key, scope, options[:separator])
 
-          keys.inject(translations) do |result, _key|
-            return nil unless result.is_a?(Hash)
+          result = keys.inject(translations) do |result, _key|
+            break nil unless result.is_a?(Hash)
             unless result.has_key?(_key)
               _key = _key.to_s.to_sym
-              return nil unless result.has_key?(_key)
+              break nil unless result.has_key?(_key)
             end
             result = result[_key]
             result = resolve_entry(locale, _key, result, Utils.except(options.merge(:scope => nil), :count)) if result.is_a?(Symbol)
             result
           end
+
+          if (trace = options[:explain])
+            trace.record(:lookup, :backend => self, :locale => locale, :key => key,
+                         :keys => keys, :hit => !result.nil?, :store => translations)
+          end
+
+          result
         end
       end
 

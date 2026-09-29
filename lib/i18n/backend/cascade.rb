@@ -47,6 +47,10 @@ module I18n
 
         begin
           result = super
+          if (trace = options[:explain])
+            trace.record(:cascade, :backend => self, :locale => locale, :key => key,
+                         :scope => scope.dup, :hit => !result.nil?)
+          end
           return result unless result.nil?
           scope = scope.dup
         end while (!scope.empty? || !skip_root) && scope.slice!(-step, step)

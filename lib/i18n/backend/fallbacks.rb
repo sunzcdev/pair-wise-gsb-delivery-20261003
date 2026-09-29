@@ -55,7 +55,10 @@ module I18n
         I18n.fallbacks[locale].each do |fallback|
           begin
             catch(:exception) do
+              step = options[:explain]&.record(:fallback, :backend => self, :locale => fallback, :key => key,
+                                               :from => locale, :hit => false)
               result = super(fallback, key, fallback_options)
+              step&.hit! unless result.nil?
               unless result.nil?
                 on_fallback(locale, fallback, key, options) if locale.to_s != fallback.to_s
                 return result
@@ -79,6 +82,7 @@ module I18n
 
           case subject
           when Symbol
+            options[:explain]&.record(:alias, :backend => self, :locale => options[:fallback_original_locale], :key => subject, :from => object)
             I18n.translate(subject, **options.merge(
               :locale => options[:fallback_original_locale],
               :throw => true,
