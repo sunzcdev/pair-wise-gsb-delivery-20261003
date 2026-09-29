@@ -273,6 +273,42 @@ the Database, just remove that option.  If you are setting:
 
 just remove or comment out that code.
 
+=== shard_merge Extension
+
+For read-only queries that need rows from multiple shards combined in a
+single sort order (for example, a "top N" query spanning shards), the
+shard_merge extension adds Dataset#shard_merge, an explicit entry point for
+merging rows across shards:
+
+  DB.extension :shard_merge
+  merge = DB[:items].where(active: true).
+    shard_merge([:shard1, :shard2, :shard3], order: [:created_at, :id], limit: 10)
+  merge.each{|row| ... }
+
+shard_merge returns a lazy, single-pass Enumerable.  Rows are pulled from
+each shard in pages using keyset pagination (no OFFSET), and a k-way merge
+yields rows in global order.  At most one page per shard is held in memory
+at a time, so shards are never read into memory in full.  The :page_size
+option controls the number of rows read per shard per query (default 1000).
+
+The :order option is required, and the final entry must be a unique column
+(such as the primary key) so the ordering is total and ties are broken
+deterministically.  Order entries must be column names, or Sequel.asc or
+Sequel.desc of column names.  Rows with equal sort keys on different shards
+are all returned, with ties broken deterministically by shard position in
+the shard list.
+
+Each page read is an independent query on its own shard.  Transaction
+semantics are limited to each shard itself: no cross-shard transaction is
+used and no cross-shard snapshot is taken, so rows inserted or deleted on a
+shard while the merge is running may or may not be reflected in the results.
+
+Use the block form of +each+ (or Enumerable methods such as +first+ and
++take+) so that all shard sources are closed deterministically when
+iteration finishes, whether it finishes normally, via +break+, or via an
+exception.  If a shard read raises an error, the error is propagated to the
+caller and all shard sources are closed.
+
 == JDBC
 
 If you are using the jdbc adapter, note that it does not handle separate
@@ -283,4 +319,3 @@ for that shard as the value.  Example:
 
   DB=Sequel.connect('jdbc:postgresql://primary_server/database', 
     servers: {read_only: {uri: 'jdbc:postgresql://replica_server/database'}})
-
