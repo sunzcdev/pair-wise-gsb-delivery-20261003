@@ -16,6 +16,7 @@ module I18n
     autoload :Memoize,               'i18n/backend/memoize'
     autoload :Metadata,              'i18n/backend/metadata'
     autoload :Pluralization,         'i18n/backend/pluralization'
+    autoload :References,            'i18n/backend/references'
     autoload :Simple,                'i18n/backend/simple'
     autoload :Transliterator,        'i18n/backend/transliterator'
   end

@@ -103,6 +103,61 @@ module I18n
     end
   end
 
+  # Raised when a fragment reference (%{ref:key}) points to a key that can
+  # not be resolved. The message includes the whole reference chain and the
+  # underlying reason so the error is not reduced to a bare
+  # "translation missing".
+  class MissingReference < ArgumentError
+    attr_reader :key, :chain
+    def initialize(key, chain, reason = nil)
+      @key, @chain = key, chain
+      message = "missing reference #{key.inspect} in reference chain #{chain.join(' -> ')}"
+      message << ": #{reason}" if reason
+      super message
+    end
+  end
+
+  # Raised when fragment references form a cycle. The reported chain lists
+  # every key that was being expanded, ending with the key that closes the
+  # loop.
+  class CircularReference < ArgumentError
+    attr_reader :chain
+    def initialize(chain)
+      @chain = chain
+      super "circular reference detected: #{chain.join(' -> ')}"
+    end
+  end
+
+  # Raised when reference expansion is nested deeper than
+  # I18n::Backend::References.max_depth.
+  class ReferenceDepthExceeded < ArgumentError
+    attr_reader :chain, :max_depth
+    def initialize(chain, max_depth)
+      @chain, @max_depth = chain, max_depth
+      super "reference chain #{chain.join(' -> ')} exceeds the maximum reference depth of #{max_depth}"
+    end
+  end
+
+  # Raised when an expanded translation grows beyond
+  # I18n::Backend::References.max_length characters.
+  class ReferenceExpansionTooLong < ArgumentError
+    attr_reader :chain, :max_length
+    def initialize(chain, max_length)
+      @chain, @max_length = chain, max_length
+      super "reference expansion at #{chain.join(' -> ')} exceeds the maximum expansion length of #{max_length} characters"
+    end
+  end
+
+  # Raised when a fragment reference is malformed or resolves to a value
+  # that can not be embedded into a string (e.g. a subtree).
+  class InvalidReference < ArgumentError
+    attr_reader :chain
+    def initialize(message, chain)
+      @chain = chain
+      super "#{message} (reference chain #{chain.join(' -> ')})"
+    end
+  end
+
   class ReservedInterpolationKey < ArgumentError
     attr_reader :key, :string
     def initialize(key, string)

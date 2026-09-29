@@ -66,10 +66,41 @@ I18n.config.with(locale: :ja).set!
 `set!` stores a frozen config in the current execution context.
 This keeps inherited state safe and lets updates happen by replacing config objects.
 
+### Fragment references
+
+A translation can embed fragments of other translations at explicitly marked
+positions. Unlike a Symbol alias, which replaces the whole value, references
+can appear multiple times in a single message and each reference can pass its
+own interpolation arguments:
+
+```ruby
+I18n::Backend::Simple.include(I18n::Backend::References)
+
+I18n.backend.store_translations(:en,
+  product: "Acme",
+  greeting: "Hello %{name}",
+  tagline: "%{ref:product} says %{ref:greeting(name=%{user})} - %{ref:product}!")
+
+I18n.t(:tagline, user: "Bob") # => "Acme says Hello Bob - Acme!"
+```
+
+References are resolved through `I18n.translate` with the locale of the
+current translation, so locale fallbacks apply to referenced fragments too.
+Plain strings are never scanned for references: the syntax is only enabled
+for backends that include the `References` module, and only `%{ref:key}`
+markers are expanded (`%%{ref:key}` stays literal).
+
+Expansion is guarded by `I18n::Backend::References.max_depth` (default 5) and
+`I18n::Backend::References.max_length` (default 10_000). Circular references
+raise `I18n::CircularReference` and missing fragments raise
+`I18n::MissingReference`; both report the full reference chain, e.g.
+`circular reference detected: a -> b -> a`.
+
 ## Features
 
 * Translation and localization
 * Interpolation of values to translations
+* Fragment references (`%{ref:key}`) with per-reference interpolation arguments
 * Pluralization (CLDR compatible)
 * Customizable transliteration to ASCII
 * Flexible defaults
