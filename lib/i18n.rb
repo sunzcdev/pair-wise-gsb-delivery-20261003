@@ -387,6 +387,25 @@ module I18n
       end
     end
 
+    # Executes the block with a read-only translation overlay: a small set of
+    # translations that temporarily overrides the backend for the current
+    # fiber, e.g. to serve multiple brands from one service.
+    #
+    #   I18n.with_overlay(:en => { :greeting => 'Welcome to Acme' }) do
+    #     I18n.t(:greeting) # => "Welcome to Acme"
+    #   end
+    #
+    # Keys not present in the overlay fall through to the regular backend.
+    # Use I18n::Backend::Overlay::DELETE as a value to explicitly delete a
+    # key. See I18n::Backend::Overlay for details.
+    #
+    # The backend must include I18n::Backend::Overlay for this to take
+    # effect. The global backend is never swapped and the previous context
+    # is restored even when the block raises.
+    def with_overlay(translations, &block)
+      I18n::Backend::Overlay.with_overlay(translations, &block)
+    end
+
     # Merges the given locale, key and scope into a single array of keys.
     # Splits keys that contain dots into multiple keys. Makes sure all
     # keys are Symbols.

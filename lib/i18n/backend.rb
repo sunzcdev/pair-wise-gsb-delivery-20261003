@@ -15,6 +15,7 @@ module I18n
     autoload :LazyLoadable,          'i18n/backend/lazy_loadable'
     autoload :Memoize,               'i18n/backend/memoize'
     autoload :Metadata,              'i18n/backend/metadata'
+    autoload :Overlay,               'i18n/backend/overlay'
     autoload :Pluralization,         'i18n/backend/pluralization'
     autoload :Simple,                'i18n/backend/simple'
     autoload :Transliterator,        'i18n/backend/transliterator'
