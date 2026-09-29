@@ -112,6 +112,21 @@ schedule.add_recurrence_rule IceCube::Rule.daily.until(Date.today + 30)
 schedule.each_occurrence { |t| puts t }
 ```
 
+### Sub-second scheduling
+
+For local scheduling below one-second resolution, use `Rule.subsecondly` with
+an exact interval (Integer, `Rational`, `BigDecimal` or decimal `String`).
+Occurrences always land on `start_time + (n * interval)` using exact rational
+arithmetic, so repeated advancement never accumulates floating point drift
+and the nanoseconds of the start time are preserved. Intervals finer than
+nanosecond precision, and inexact `Float` input, raise an `ArgumentError`.
+
+```ruby
+schedule = IceCube::Schedule.new(Time.now) do |s|
+  s.add_recurrence_rule IceCube::Rule.subsecondly(Rational(1, 8)).count(100)
+end
+```
+
 The reason that schedules have durations and not individual rules, is to
 maintain compatibility with the ical
 RFC: http://www.kanzaki.com/docs/ical/rrule.html

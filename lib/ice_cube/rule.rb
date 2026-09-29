@@ -3,13 +3,21 @@ require "yaml"
 module IceCube
   class Rule
     INTERVAL_TYPES = [
-      :secondly, :minutely, :hourly,
+      :subsecondly, :secondly, :minutely, :hourly,
       :daily, :weekly, :monthly, :yearly
     ]
 
     attr_reader :uses
 
     def reset
+    end
+
+    # The smallest step between successive occurrences of this rule, used by
+    # Schedule to advance the search after each occurrence is found. Rules
+    # with whole-second (or larger) granularity step by one second;
+    # SubsecondlyRule steps by its exact Rational interval.
+    def occurrence_step
+      ONE_SECOND
     end
 
     # Is this a terminating schedule?
@@ -44,9 +52,9 @@ module IceCube
     def self.from_yaml(yaml)
       # Ruby 2.6-3.0 use positional args, Ruby 3.1+ uses keyword args for YAML.safe_load
       if RUBY_VERSION < "3.1"
-        from_hash YAML.safe_load(yaml, [Date, Symbol, Time])
+        from_hash YAML.safe_load(yaml, [Date, Symbol, Time, Rational])
       else
-        from_hash YAML.safe_load(yaml, permitted_classes: [Date, Symbol, Time])
+        from_hash YAML.safe_load(yaml, permitted_classes: [Date, Symbol, Time, Rational])
       end
     end
 
@@ -104,6 +112,11 @@ module IceCube
 
     # Convenience methods for creating Rules
     class << self
+      # Subsecondly Rule
+      def subsecondly(interval = 1)
+        SubsecondlyRule.new(interval)
+      end
+
       # Secondly Rule
       def secondly(interval = 1)
         SecondlyRule.new(interval)

@@ -27,6 +27,7 @@ module IceCube
   autoload :ValidatedRule, "ice_cube/validated_rule"
   autoload :SingleOccurrenceRule, "ice_cube/single_occurrence_rule"
 
+  autoload :SubsecondlyRule, "ice_cube/rules/subsecondly_rule"
   autoload :SecondlyRule, "ice_cube/rules/secondly_rule"
   autoload :MinutelyRule, "ice_cube/rules/minutely_rule"
   autoload :HourlyRule, "ice_cube/rules/hourly_rule"
@@ -42,6 +43,7 @@ module IceCube
     autoload :Count, "ice_cube/validations/count"
     autoload :Until, "ice_cube/validations/until"
 
+    autoload :SubsecondlyInterval, "ice_cube/validations/subsecondly_interval"
     autoload :SecondlyInterval, "ice_cube/validations/secondly_interval"
     autoload :MinutelyInterval, "ice_cube/validations/minutely_interval"
     autoload :DailyInterval, "ice_cube/validations/daily_interval"
