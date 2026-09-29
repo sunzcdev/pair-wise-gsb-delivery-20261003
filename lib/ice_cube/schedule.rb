@@ -293,6 +293,17 @@ module IceCube
       occurs_between?(time, time)
     end
 
+    # Explain why the schedule does or does not occur at a given time.
+    # Returns structured data (see IceCube::Explanation) describing which
+    # recurrence and exception rules matched, which sub-conditions of
+    # composite rules accepted or rejected the time, and whether COUNT,
+    # UNTIL or the start_time limit applied. Explaining never consumes
+    # COUNT state and never enumerates unbounded sequences, so it cannot
+    # change subsequent enumeration results.
+    def explain(time)
+      Explanation.explain(self, time)
+    end
+
     # Get the first n occurrences, or the first occurrence if n is skipped
     def first(n = nil)
       occurrences = enumerate_occurrences(start_time).take(n || 1)

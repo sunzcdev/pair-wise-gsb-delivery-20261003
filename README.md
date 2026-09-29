@@ -120,6 +120,30 @@ To limit schedules use `count` or `until` on the recurrence rules. Setting `end_
 
 ---
 
+## Explaining why a time does (not) occur
+
+`Schedule#explain` reports, for a specific time, which recurrence rules and
+exception rules matched, which sub-conditions of composite rules accepted or
+rejected the time, and whether a `count`, `until` or `start_time` limit
+applied. The result is structured data (no translated strings), so user
+interfaces can localize it themselves. Explaining never consumes `count`
+state and never enumerates unbounded sequences, so it cannot change
+subsequent enumeration results.
+
+```ruby
+schedule = IceCube::Schedule.new(Time.utc(2026, 1, 1, 9)) do |s|
+  s.add_recurrence_rule IceCube::Rule.daily.count(3)
+end
+
+schedule.explain(Time.utc(2026, 1, 4, 9, 0, 0))
+# => {occurs: false, reasons: [:no_matching_recurrence, :count_exceeded],
+#     recurrence: [{matched: false, blocked_by: [:count],
+#                   limits: {count: {max: 3, used: 3, exceeded: true}}, ...}],
+#     ...}
+```
+
+---
+
 ## Time Zones and ActiveSupport vs. Standard Ruby Time Classes
 
 ice_cube works great without ActiveSupport but only supports the environment's
