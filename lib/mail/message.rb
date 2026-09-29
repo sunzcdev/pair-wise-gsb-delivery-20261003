@@ -1541,6 +1541,21 @@ module Mail
       multipart? && /^report$/i.match?(sub_type)
     end
 
+    # Returns true if the message is a multipart/related
+    def multipart_related?
+      multipart? && /^related$/i.match?(sub_type)
+    end
+
+    # Returns a Mail::RelatedResources view over this message or part when it
+    # is a multipart/related container, nil otherwise. The view determines the
+    # root body from the Content-Type +start+ parameter, resolves Content-ID
+    # references within this MIME scope, and lists referenced, unreferenced,
+    # and dangling resources. Nested multipart/related containers are exposed
+    # as their own scoped views via Mail::RelatedResources#nested.
+    def related_resources
+      Mail::RelatedResources.new(self) if multipart_related?
+    end
+
     # Returns true if the message is a multipart/report; report-type=delivery-status;
     def delivery_status_report?
       multipart_report? && /^delivery-status$/i.match?(content_type_parameters['report-type'])

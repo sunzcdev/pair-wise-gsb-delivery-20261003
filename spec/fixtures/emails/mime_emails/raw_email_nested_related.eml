@@ -1,0 +1,59 @@
+From: sender@example.com
+To: reader@example.com
+Subject: Nested multipart/related scopes sharing a Content-ID
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="outer-boundary"; start="<outer-body@example>"
+
+--outer-boundary
+Content-Type: image/png
+Content-Transfer-Encoding: 8bit
+Content-ID: <shared@example>
+Content-Disposition: inline; filename="outer-shared.png"
+
+OUTER-SHARED-IMAGE
+--outer-boundary
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+Content-ID: <outer-body@example>
+
+<html><body>
+<p>Outer body</p>
+<img src="cid:shared@example">
+<img src="cid:outer-only@example">
+<img src="cid:missing@example">
+</body></html>
+--outer-boundary
+Content-Type: image/png
+Content-Transfer-Encoding: 8bit
+Content-ID: <outer-only@example>
+Content-Disposition: inline; filename="outer-only.png"
+
+OUTER-ONLY-IMAGE
+--outer-boundary
+Content-Type: image/gif
+Content-Transfer-Encoding: 8bit
+Content-ID: <unreferenced@example>
+Content-Disposition: inline; filename="unreferenced.gif"
+
+UNREFERENCED-IMAGE
+--outer-boundary
+Content-Type: multipart/related; boundary="inner-boundary"
+
+--inner-boundary
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+Content-ID: <inner-body@example>
+
+<html><body>
+<p>Inner body</p>
+<img src="cid:shared@example">
+</body></html>
+--inner-boundary
+Content-Type: image/png
+Content-Transfer-Encoding: 8bit
+Content-ID: <shared@example>
+Content-Disposition: inline; filename="inner-shared.png"
+
+INNER-SHARED-IMAGE
+--inner-boundary--
+--outer-boundary--
