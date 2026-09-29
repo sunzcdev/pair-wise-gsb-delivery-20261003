@@ -17,6 +17,7 @@ require 'rack/utils'
 require_relative 'abstract/id'
 require_relative 'encryptor'
 require_relative 'constants'
+require_relative 'cookie/safe'
 
 module Rack
 
@@ -50,6 +51,12 @@ module Rack
     # Lastly, a :coder option is also accepted. When used, both encryption and
     # the legacy HMAC will be skipped. This option could create security issues
     # in your application!
+    #
+    # Rack::Session::Cookie::Safe is provided as a coder which supports a
+    # limited set of safe types (String, true/false, nil, Integer, finite
+    # Float, Time, Array and Hash with String keys) using an explicit,
+    # versioned format. Unlike Marshal, decoding never performs constant
+    # lookup or instantiates application classes.
     #
     # Example:
     #
@@ -265,6 +272,10 @@ module Rack
       end
 
       def write_session(req, session_id, session, options)
+        # Store the public session id as a plain string, so that coders
+        # which only support primitive types (e.g. Safe) can serialize the
+        # session. Both forms are accepted when reading the session back.
+        session_id = session_id.public_id if session_id.respond_to?(:public_id)
         session = session.merge("session_id" => session_id)
         session_data = encode_session_data(session)
 
@@ -274,6 +285,12 @@ module Rack
         else
           SessionId.new(session_id, session_data)
         end
+      rescue Safe::EncodeError => error
+        # Encoding builds the payload in memory, so a failure here means no
+        # cookie data was generated at all; drop the session rather than
+        # writing a partial cookie.
+        req.get_header(RACK_ERRORS).puts("Warning! Rack::Session::Cookie failed to encode session: #{error.message}")
+        nil
       end
 
       def delete_session(req, session_id, options)
