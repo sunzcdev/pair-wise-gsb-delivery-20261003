@@ -4,6 +4,7 @@ require_relative './case/case_then'
 require_relative './case/case_switch_variable'
 require_relative './case/case_else'
 require 'dentaku/exceptions'
+require 'dentaku/units'
 
 module Dentaku
   module AST
@@ -53,15 +54,18 @@ module Dentaku
         switch_value = @switch.value(context)
         @conditions.each do |condition|
           if condition.when.value(context) == switch_value
-            return condition.then.value(context)
+            return check_branch_units(condition.then.value(context), context)
           end
         end
 
-        if @else
-          return @else.value(context)
+        result = if @else
+          @else.value(context)
         else
           raise ArgumentError.for(:invalid_value), "No block matched the switch value '#{switch_value}'"
         end
+
+        check_branch_units(result, context)
+        result
       end
 
       def dependencies(context = {})
@@ -85,6 +89,29 @@ module Dentaku
       end
 
       private
+
+      # in units mode, every branch must agree on its result dimension;
+      # non-taken branches are only evaluated for the check when they are
+      # side-effect free
+      def check_branch_units(result, context)
+        return result unless context[Dentaku::Units::CONTEXT_KEY]
+
+        branches = @conditions.map(&:then) + [@else].compact
+        branches.each do |branch|
+          next unless branch.pure?
+
+          begin
+            Dentaku::Units.assert_compatible!(result, branch.value(context), node: self)
+          rescue Dentaku::UnitError
+            raise
+          rescue Dentaku::Error
+            # branch not evaluable in this context; skip it
+            next
+          end
+        end
+
+        result
+      end
 
       # pruning evaluates the switch and each when-clause until one matches;
       # all of them must be side-effect free before we may do that

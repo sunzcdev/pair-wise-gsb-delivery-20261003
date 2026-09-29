@@ -1,5 +1,20 @@
 # Change Log
 
+## [Unreleased]
+- add an optional unit dimension mode (`Dentaku::Calculator.new(units: ...)`).
+  Input variables can declare units via `{value:, unit:}` hashes,
+  `Dentaku::Units::Quantity` values, or per-variable declarations
+  (`units: {distance: :m}`). Arithmetic propagates dimensions, converts
+  between compatible units automatically (`90 s + 1500 ms #=> 91.5 s`),
+  derives new dimensions from multiplication/division (`m / s`), and
+  collapses cancelled dimensions to plain dimensionless numbers.
+  Incompatible addition, subtraction, comparison and modulo raise
+  `Dentaku::UnitError` annotated with the offending subexpression.
+  `SUM`/`AVG`/`MIN`/`MAX`/`ABS`/`ROUND`/`ROUNDUP`/`ROUNDDOWN` propagate
+  units, `IF`/`CASE` verify that all branches agree on their result
+  dimension, and custom functions are checked the same way. Formulas
+  without units behave exactly as before.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

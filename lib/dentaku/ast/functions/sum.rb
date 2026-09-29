@@ -1,4 +1,5 @@
 require_relative '../function'
+require 'dentaku/units'
 
 Dentaku::AST::Function.register(:sum, :numeric, ->(*args) {
   if args.empty?
@@ -8,5 +9,6 @@ Dentaku::AST::Function.register(:sum, :numeric, ->(*args) {
     )
   end
 
-  args.flatten.map { |arg| Dentaku::NumericParser.ensure_numeric!(arg) }.reduce(0, :+)
+  values = args.flatten.map { |arg| Dentaku::Units.numeric_or_quantity(arg) }
+  values.empty? ? 0 : values.reduce(:+)
 })

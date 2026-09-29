@@ -5,22 +5,24 @@ require 'dentaku/flat_hash'
 require 'dentaku/parser'
 require 'dentaku/string_casing'
 require 'dentaku/token'
+require 'dentaku/units'
 
 module Dentaku
   class Calculator
     include StringCasing
     attr_reader :result, :memory, :tokenizer, :case_sensitive,
-                :nested_data_support, :ast_cache, :raw_date_literals
+                :nested_data_support, :ast_cache, :raw_date_literals, :units
 
     def initialize(case_sensitive: false, aliases: nil, nested_data_support: true,
                    raw_date_literals: true, ast_cache: {},
-                   cache_ast: nil, cache_dependency_order: nil)
+                   cache_ast: nil, cache_dependency_order: nil, units: false)
       clear
       @tokenizer = Tokenizer.new
       @case_sensitive = case_sensitive
       @aliases = aliases
       @nested_data_support = nested_data_support
       @raw_date_literals = raw_date_literals
+      @units = units
       @ast_cache = ast_cache
       @cache_ast = cache_ast
       @cache_dependency_order = cache_dependency_order
@@ -167,7 +169,10 @@ module Dentaku
     end
 
     def evaluation_context(data, evaluation_mode)
-      data.key?(:__evaluation_mode) ? data : data.merge(__evaluation_mode: evaluation_mode)
+      return data if data.key?(:__evaluation_mode)
+
+      data = data.merge(__evaluation_mode: evaluation_mode)
+      units_enabled? ? data.merge(Units::CONTEXT_KEY => true) : data
     end
 
     def store(key_or_hash, value = nil)
@@ -209,11 +214,31 @@ module Dentaku
 
     private def pairs_to_store(key_or_hash, value)
       if value.nil?
+        key_or_hash = Units.coerce_data(key_or_hash) if units_enabled?
         key_or_hash = FlatHash.from_hash_with_intermediates(key_or_hash) if nested_data_support
-        key_or_hash.map { |key, val| [standardize_case(key.to_s), val] }
+        key_or_hash.map { |key, val| [standardize_case(key.to_s), apply_declared_unit(key, val)] }
       else
-        [[standardize_case(key_or_hash.to_s), value]]
+        value = Units.coerce_data(value) if units_enabled?
+        [[standardize_case(key_or_hash.to_s), apply_declared_unit(key_or_hash, value)]]
       end
+    end
+
+    def units_enabled?
+      !!@units
+    end
+
+    # units: {name => unit} declarations; plain numeric values stored
+    # under these names are wrapped in quantities with the declared unit
+    private def unit_declarations
+      @unit_declarations ||= units.is_a?(Hash) \
+        ? units.each_with_object({}) { |(k, u), h| h[standardize_case(k.to_s)] = u }
+        : {}
+    end
+
+    private def apply_declared_unit(key, value)
+      return value unless units_enabled?
+
+      Units.apply_declared(value, unit_declarations[standardize_case(key.to_s)])
     end
 
     def store_formula(key, formula)

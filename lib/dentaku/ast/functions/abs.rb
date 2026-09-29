@@ -1,5 +1,6 @@
 require_relative '../function'
+require 'dentaku/units'
 
 Dentaku::AST::Function.register(:abs, :numeric, lambda { |numeric|
-  Dentaku::NumericParser.ensure_numeric!(numeric).abs
+  Dentaku::Units.numeric_or_quantity(numeric).abs
 })

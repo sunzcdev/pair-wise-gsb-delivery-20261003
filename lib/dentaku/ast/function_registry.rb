@@ -1,3 +1,5 @@
+require 'dentaku/units'
+
 module Dentaku
   module AST
     class FunctionRegistry < Hash
@@ -80,6 +82,10 @@ module Dentaku
           def value(context = {})
             args = @args.map { |a| a.value(context) }
             self.class.implementation.call(*args)
+          rescue Dentaku::UnitError => e
+            # a custom function mixed incompatible dimensions; point at
+            # the call site
+            raise Dentaku::Units.locate(e, self)
           end
 
           def type

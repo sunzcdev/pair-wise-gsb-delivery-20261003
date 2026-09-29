@@ -1,4 +1,5 @@
 require_relative '../function'
+require 'dentaku/units'
 
 module Dentaku
   module AST
@@ -24,7 +25,10 @@ module Dentaku
       end
 
       def value(context = {})
-        predicate.value(context) ? left.value(context) : right.value(context)
+        taken = predicate.value(context)
+        result = (taken ? left : right).value(context)
+        check_branch_units(result, taken ? right : left, context)
+        result
       end
 
       def node_type
@@ -44,6 +48,21 @@ module Dentaku
       end
 
       private
+
+      # in units mode, both branches must agree on their result dimension;
+      # the untaken branch is only evaluated for the check when it is
+      # side-effect free
+      def check_branch_units(result, other_branch, context)
+        return unless context[Dentaku::Units::CONTEXT_KEY] && other_branch.pure?
+
+        Dentaku::Units.assert_compatible!(result, other_branch.value(context), node: self)
+      rescue Dentaku::UnitError
+        raise
+      rescue Dentaku::Error
+        # the untaken branch cannot be evaluated in this context
+        # (e.g. unbound variables pruned from the dependencies); skip
+        nil
+      end
 
       def all_arg_dependencies(context)
         args.flat_map { |arg| arg.dependencies(context) }.uniq

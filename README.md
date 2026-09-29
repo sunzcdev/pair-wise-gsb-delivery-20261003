@@ -429,6 +429,58 @@ c.evaluate('rrrrround!(8.2) + округлить(8.4)')
 # 16
 ```
 
+UNITS
+------
+
+Dentaku can optionally track the physical dimension (time, length, mass)
+of values, so a backend metric is not just a number but a number with a
+unit. Enable it per calculator with `units: true` and declare units on
+input variables, either inline or at construction:
+
+```ruby
+calculator = Dentaku::Calculator.new(units: true)
+
+calculator.evaluate!('response_time + queue_time',
+  response_time: { value: 90,   unit: :s },
+  queue_time:    { value: 1500, unit: :ms })
+#=> 91.5 s (compatible units are converted automatically)
+
+# or declare units up front and pass plain numbers:
+calculator = Dentaku::Calculator.new(units: { distance: :m, time: :s })
+calculator.evaluate!('distance / time', distance: 100, time: 9.58)
+#=> 10.438... m/s (multiplication and division derive new dimensions)
+```
+
+Values can also be passed as `Dentaku::Units::Quantity.new(500, :ms)`.
+Built-in units: `s/ms/min/h` (time), `m/km/cm/mm` (length), `kg/g`
+(mass); register your own with
+`Dentaku::Units.register(:ft, :length, 0.3048)`.
+
+Rules:
+
+- Addition, subtraction, comparison and modulo require matching
+  dimensions and convert between compatible units automatically.
+- Multiplication and division combine dimensions (`m / s` is speed);
+  when dimensions cancel out (`m / m`) the result is a plain,
+  dimensionless number.
+- `SUM`, `AVG`, `MIN`, `MAX`, `ABS`, `ROUND`, `ROUNDUP` and `ROUNDDOWN`
+  propagate units; `IF` and `CASE` require all branches to agree on
+  their result dimension; custom functions built on arithmetic are
+  checked the same way.
+- Incompatible operations raise `Dentaku::UnitError`, which names the
+  offending subexpression:
+
+```ruby
+calculator.evaluate!('(track_length + lap_time) * 2',
+  track_length: { value: 400, unit: :m },
+  lap_time:     { value: 63,  unit: :s })
+#=> Dentaku::UnitError: cannot add quantities with incompatible
+#    dimensions (length vs time) in "track_length + lap_time"
+```
+
+Formulas and variables without units behave exactly as before.
+See `examples/units_demo.rb` for a runnable demo.
+
 THANKS
 ------
 

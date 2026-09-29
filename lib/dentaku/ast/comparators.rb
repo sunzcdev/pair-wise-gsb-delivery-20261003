@@ -1,4 +1,5 @@
 require_relative './operation'
+require 'dentaku/units'
 
 module Dentaku
   module AST
@@ -20,6 +21,9 @@ module Dentaku
         r = validate_value(cast(right.value(context)))
 
         l.public_send(operator, r)
+      rescue Dentaku::UnitError => e
+        # annotate with the subexpression whose operands cannot be compared
+        raise Dentaku::Units.locate(e, self)
       rescue ::ArgumentError, ::TypeError => e
         raise Dentaku::ArgumentError.for(:incompatible_type, actual: r, expected: l.class), e.message
       end

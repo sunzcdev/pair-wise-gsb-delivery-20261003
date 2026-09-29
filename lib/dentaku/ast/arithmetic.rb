@@ -1,5 +1,6 @@
 require_relative './operation'
 require_relative '../date_arithmetic'
+require 'dentaku/units'
 require 'bigdecimal'
 require 'bigdecimal/util'
 
@@ -40,6 +41,10 @@ module Dentaku
 
         result = begin
           l.public_send(operator, r)
+        rescue Dentaku::UnitError => e
+          # annotate with the smallest subexpression whose operands have
+          # incompatible dimensions
+          raise Dentaku::Units.locate(e, self)
         rescue ::TypeError => e
           # Right cannot be converted to a suitable type for left. e.g. [] + 1
           raise Dentaku::ArgumentError.for(:incompatible_type, actual: r, expected: l.class), e.message
@@ -234,7 +239,11 @@ module Dentaku
         r = decimal(cast(right.value(context)))
         raise Dentaku::ZeroDivisionError if r.zero?
 
-        cast(cast(left.value(context)) % r)
+        begin
+          cast(cast(left.value(context)) % r)
+        rescue Dentaku::UnitError => e
+          raise Dentaku::Units.locate(e, self)
+        end
       end
     end
 
