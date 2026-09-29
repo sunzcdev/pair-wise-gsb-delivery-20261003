@@ -226,6 +226,31 @@ to use, which can be useful if you are mixing sharding and primary/replica serve
     end
   end
 
+=== shard_merge Extension
+
+The shard_merge extension adds Database#shard_merge, an explicit entry
+point for read-only queries that need the top N rows across multiple
+shards using the same ordering on every shard:
+
+  DB.extension :shard_merge
+  reader = DB.shard_merge([:s1, :s2, :s3], :events,
+    order: [Sequel.desc(:created_at), :id],
+    unique: :id,
+    limit: 100)
+  reader.each{|row| ... }
+
+The ordering must end with a unique tiebreaker column (given via
++:unique+) so the global order is total and deterministic.  The
+returned reader is lazily consumed: each shard is read in pages (the
++:page_size+ option, default 1000) only as the merge advances, so
+shards are never loaded into memory in full.  All shard cursors are
+closed when iteration completes, when the caller stops early, or when
+a read raises an exception (which is then propagated).
+
+Note that each shard is read independently on its own connection.
+Transaction semantics are limited to each individual shard;
+shard_merge does not provide a consistent snapshot across shards.
+
 === arbitrary_servers Extension
 
 By default, Sequel's sharding support is designed to work with predefined shards.  It ships
@@ -283,4 +308,3 @@ for that shard as the value.  Example:
 
   DB=Sequel.connect('jdbc:postgresql://primary_server/database', 
     servers: {read_only: {uri: 'jdbc:postgresql://replica_server/database'}})
-
