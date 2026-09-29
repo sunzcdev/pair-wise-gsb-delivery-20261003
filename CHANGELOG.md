@@ -7,6 +7,17 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- New `scope` step adapter for scoped resources: the operation acquires a
+  resource and returns a `Dry::Transaction::ScopedResource` (handle + release
+  action); the handle is passed to the remaining steps and the resource is
+  released when the scope exits, on Success, Failure, raised exceptions and
+  around-step short-circuits alike. Nested scopes release in reverse order of
+  acquisition. Release failures never replace the main outcome nor stop the
+  remaining releases; they are raised as `Dry::Transaction::CleanupError`,
+  which preserves the release failures (`#errors`) alongside the main result
+  (`#result`) or flow exception (`#cause`)
 
 ## [0.16.0] - 2024-01-17
 

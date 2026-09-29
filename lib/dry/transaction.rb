@@ -8,6 +8,7 @@ require "dry/transaction/version"
 require "dry/transaction/step_adapters"
 require "dry/transaction/builder"
 require "dry/transaction/errors"
+require "dry/transaction/scoped_resource"
 
 module Dry
   # Business transaction DSL
