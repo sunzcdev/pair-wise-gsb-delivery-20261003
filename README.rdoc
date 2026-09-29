@@ -1102,6 +1102,41 @@ So, a simple plugin to add an instance method would be:
 
   Roda.plugin MarkdownHelper
 
+=== Plugin dependencies and conflicts
+
+Plugins that are designed to be used as a group can declare their
+dependencies on other plugins, as well as conflicts with other plugins,
+by extending <tt>Roda::RodaPlugins::Declarations</tt>:
+
+  module MarkdownHelper
+    extend Roda::RodaPlugins::Declarations
+
+    depends_on :render
+    conflicts_with :json
+  end
+
+Declared dependencies and conflicts are taken into account when loading
+a group of plugins at once using <tt>Roda.plugin_group</tt>:
+
+  Roda.plugin_group :render, MarkdownHelper
+
++plugin_group+ resolves the declared dependencies before loading
+anything, loads dependencies before the plugins depending on them, and
+configures each plugin only once, even if multiple plugins in the group
+depend on it.  Plugins already loaded into the class (including plugins
+inherited from a superclass) are taken into account, so dependencies
+they provide are not loaded again, and conflicts with them are
+detected.  If a dependency cannot be loaded, a dependency cycle is
+detected, or a conflict is found, a <tt>Roda::RodaError</tt> including
+the related dependency chain is raised before any plugin in the group
+is loaded.
+
+Each entry given to +plugin_group+ can be a plugin module, a symbol for
+a registered plugin, or an array containing a plugin module or symbol
+followed by arguments to pass to the plugin's +configure+ method:
+
+  Roda.plugin_group :render, [MarkdownHelper, safe: true]
+
 === Registering plugins
 
 If you want to ship a Roda plugin in a gem,

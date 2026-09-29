@@ -327,6 +327,32 @@ class Roda
         ruby2_keywords(:plugin) if respond_to?(:ruby2_keywords, true)
         # simplecov:enable
 
+        # Load a group of plugins into the current class at once.  Each
+        # entry can be a plugin module, a symbol for a registered plugin,
+        # or an array containing a plugin module or symbol followed by
+        # arguments to pass to the plugin's configure method.  Returns nil.
+        #
+        # Before any plugin in the group is loaded, the dependencies
+        # declared by the plugins (see Roda::RodaPlugins::Declarations)
+        # are resolved, and the group is checked for dependency cycles and
+        # for conflicts with other plugins in the group or with plugins
+        # already loaded into the class (including plugins inherited from
+        # a superclass).  If a dependency cannot be loaded, a cycle is
+        # detected, or a conflict is found, a RodaError including the
+        # related dependency chain is raised before any plugin in the
+        # group is loaded.  Dependencies are loaded before the plugins
+        # depending on them, and each plugin is configured only once,
+        # even if multiple plugins in the group depend on it.  Example:
+        #
+        #   plugin_group :render, :csrf, [MyPlugin, 1]
+        def plugin_group(*plugins)
+          raise RodaError, "Cannot add plugins to a frozen Roda class" if frozen?
+          RodaPlugins.resolve_plugin_group(@plugins, plugins).each do |mod, args|
+            plugin(mod, *args)
+          end
+          nil
+        end
+
         # Setup routing tree for the current Roda application, and build the
         # underlying rack application using the stored middleware. Requires
         # a block, which is yielded the request.  By convention, the block
