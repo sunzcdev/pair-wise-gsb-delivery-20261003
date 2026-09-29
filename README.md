@@ -341,6 +341,44 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+## Compensating Resource Cleanup
+
+`state_machines` rolls back the *state value* when a transition fails, but callbacks often
+acquire resources of their own (reserving inventory, creating files, enqueueing jobs).
+To clean those up, a callback can register a **compensation** once its preparation step
+has completed successfully:
+
+```ruby
+class Order
+  state_machine initial: :pending do
+    before_transition do |order, transition|
+      order.reserve_inventory
+      transition.register_compensation(:release_inventory) { order.release_inventory }
+    end
+
+    event :confirm do
+      transition pending: :confirmed
+    end
+  end
+end
+```
+
+If the transition fails after registration -- a later guard, callback, or the action
+itself halts, fails, or raises -- the registered compensations run in reverse
+registration order while the transition rolls back.
+
+This convention is intentionally best-effort:
+
+* Only compensations that were registered run.  A preparation step that did not complete
+  (and therefore never registered) is never undone, and failures that happen before any
+  registration (including guards that prevent the transition from starting) leave
+  nothing to undo.
+* Compensation errors are collected separately in `transition.compensation_errors` and
+  every remaining compensation is still attempted; the original error that caused the
+  failure is the one that propagates.
+* It is **not** a distributed transaction: it cannot guarantee that arbitrary external
+  systems are rolled back, only that your undo blocks are called.
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.

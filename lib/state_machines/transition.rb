@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'state_machines/eval_helpers'
+
 module StateMachines
   # Module to extend Fiber instances for pausable state tracking
   module PausableFiber
@@ -13,6 +15,13 @@ module StateMachines
   # * A starting state
   # * An ending state
   class Transition
+    include EvalHelpers
+
+    # A compensation (undo) action registered for a preparation step that
+    # completed successfully while this transition was being performed.
+    # Pairs an optional descriptive name with the block that undoes the step.
+    Compensation = Struct.new(:name, :block)
+
     # The object being transitioned
     attr_reader :object
 
@@ -34,6 +43,15 @@ module StateMachines
 
     # Whether the transition is only existing temporarily for the object
     attr_writer :transient
+
+    # The compensations registered so far for this transition, in
+    # registration order.  See #register_compensation.
+    attr_reader :compensations
+
+    # The errors raised by compensations while this transition was being
+    # rolled back, in the order they were raised.  These are collected
+    # separately so that the original reason for the failure is preserved.
+    attr_reader :compensation_errors
 
     # Creates a new, specific transition
     def initialize(object, machine, event, from_name, to_name, read_state = true) # :nodoc:
@@ -254,8 +272,65 @@ module StateMachines
       @persisted = true
     end
 
+    # Registers a compensation (undo) action for a preparation step that has
+    # already completed successfully.  If this transition is rolled back
+    # later on -- for example because a subsequent callback halts or raises,
+    # or the action fails -- the registered compensations are run in reverse
+    # registration order.
+    #
+    # Only register a compensation *after* its preparation step succeeded:
+    # steps that never completed must not be registered and will therefore
+    # never be undone.
+    #
+    # This is a best-effort convention for releasing resources acquired in
+    # callbacks.  It is *not* a distributed transaction and cannot guarantee
+    # that arbitrary external systems are rolled back.
+    #
+    # == Example
+    #
+    #   before_transition do |order, transition|
+    #     order.reserve_inventory
+    #     transition.register_compensation(:release_inventory) { order.release_inventory }
+    #   end
+    #
+    # The block may optionally declare the object and/or the transition as
+    # parameters, like any other callback.
+    def register_compensation(name = nil, &block)
+      raise ArgumentError, 'A block is required to register a compensation' unless block
+
+      compensation = Compensation.new(name, block)
+      compensations << compensation
+      compensation
+    end
+
+    # Runs the compensations registered via #register_compensation in reverse
+    # registration order, without touching the object's state.  Each
+    # compensation block is evaluated against the object being transitioned
+    # and may declare the object and/or this transition as parameters.
+    #
+    # Errors raised by a compensation are collected in #compensation_errors
+    # and never re-raised, so that every remaining compensation is still
+    # attempted and the original reason for the failure is preserved.
+    #
+    # Compensations are drained once run: calling this again has no effect
+    # unless new compensations were registered in the meantime.
+    def run_compensations
+      pending = @compensations
+      @compensations = []
+      pending.reverse_each do |compensation|
+        evaluate_method(object, compensation.block, self)
+      rescue StandardError => e
+        compensation_errors << e
+      end
+    end
+
     # Rolls back changes made to the object's state via this transition.  This
     # will revert the state back to the +from+ value.
+    #
+    # Any compensations registered via #register_compensation are run in
+    # reverse registration order.  Errors raised by compensations are
+    # collected in #compensation_errors and do not prevent the remaining
+    # compensations from running.
     #
     # == Example
     #
@@ -279,14 +354,24 @@ module StateMachines
     #   transition.rollback
     #   vehicle.state             # => "parked"
     def rollback
+      run_compensations
+      collected = @compensation_errors
       reset
+      # Preserve errors collected while compensating: reset starts a fresh
+      # list, but a transition may be rolled back more than once per failure
+      # and the original compensation errors must not be lost
+      @compensation_errors.concat(collected)
       machine.write(object, :state, from)
     end
 
     # Resets any tracking of which callbacks have already been run and whether
-    # the state has already been persisted
+    # the state has already been persisted.  Any compensations that were
+    # registered (but not yet run) and any collected compensation errors are
+    # discarded as well.
     def reset
       @before_run = @persisted = @after_run = false
+      @compensations = []
+      @compensation_errors = []
       # Kill so ensure blocks in paused callbacks still run (CRuby only:
       # TruffleRuby lacks Fiber#kill, JRuby's doesn't wait for ensure)
       @paused_fiber.kill if RUBY_ENGINE == 'ruby' && @paused_fiber&.alive? && !@paused_fiber.equal?(Fiber.current)

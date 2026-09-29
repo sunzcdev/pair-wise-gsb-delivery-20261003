@@ -72,7 +72,14 @@ module StateMachines
           run_actions
         else
           within_transaction do
-            catch(:halt) { run_callbacks(&) }
+            begin
+              catch(:halt) { run_callbacks(&) }
+            rescue StandardError
+              # Run compensations registered by completed preparation steps
+              # even when a callback raises, then re-raise the original error
+              run_compensations
+              raise
+            end
             rollback unless success?
           end
         end
@@ -184,6 +191,12 @@ module StateMachines
     # Rolls back changes made to the object's states via each transition
     def rollback
       each(&:rollback)
+    end
+
+    # Runs the compensations registered by each transition (in reverse
+    # registration order per transition) without rolling back state
+    def run_compensations
+      each(&:run_compensations)
     end
 
     # Wraps the given block with a rescue handler so that any exceptions that
