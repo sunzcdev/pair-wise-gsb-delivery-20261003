@@ -31,10 +31,14 @@ class HTTP::Cookie
     name        value
     domain      for_domain  path
     secure      httponly
+    samesite
     expires     max_age
     created_at  accessed_at
   ]
   # :startdoc:
+
+  # SameSite attribute values that HTTP::Cookie recognizes.
+  SAMESITE_VALUES = [:strict, :lax, :none].freeze
 
   # The cookie name.  It may not be nil or empty.
   #
@@ -108,6 +112,18 @@ class HTTP::Cookie
   #
   # :attr_accessor: max_age
 
+  # The SameSite attribute value: `:strict`, `:lax`, `:none` or nil.
+  #
+  # The setter accepts a symbol or a string, case insensitively, and
+  # normalizes it to one of the symbols above.  Any other value
+  # raises ArgumentError.
+  #
+  # A cookie with this attribute set is subject to SameSite send
+  # filtering in HTTP::CookieJar when a request context is given.
+  # See HTTP::CookieJar::SameSite for the rules applied.
+  #
+  # :attr_accessor: samesite
+
   # :call-seq:
   #     new(name, value = nil)
   #     new(name, value = nil, **attr_hash)
@@ -132,7 +148,7 @@ class HTTP::Cookie
   #
   def initialize(*args)
     @name = @origin = @domain = @path =
-      @expires = @max_age = nil
+      @expires = @max_age = @samesite = nil
     @for_domain = @secure = @httponly = false
     @session = true
     @created_at = @accessed_at = Time.now
@@ -312,6 +328,8 @@ class HTTP::Cookie
                 cookie.secure = avalue
               when 'httponly'
                 cookie.httponly = avalue
+              when 'samesite'
+                cookie.samesite = avalue
               end
             rescue => e
               logger.warn("Couldn't parse #{aname} '#{avalue}': #{e}") if logger
@@ -479,6 +497,26 @@ class HTTP::Cookie
   attr_accessor :httponly
   alias httponly? httponly
 
+  # See the class document for the SameSite attribute.
+  attr_reader :samesite
+
+  # Sets the SameSite attribute value.  Accepts `:strict`, `:lax`,
+  # `:none` or nil, or a string thereof in any letter case.
+  def samesite=(value)
+    @samesite =
+      case value
+      when nil
+        nil
+      when Symbol, String
+        sym = value.to_s.downcase.to_sym
+        SAMESITE_VALUES.include?(sym) or
+          raise ArgumentError, "invalid SameSite value: #{value.inspect}"
+        sym
+      else
+        raise TypeError, "#{value.class} is not a Symbol or String"
+      end
+  end
+
   # The session flag. (the opposite of persistent-flag)
   #
   # A cookie with this flag on should be hidden from a client script.
@@ -633,6 +671,9 @@ class HTTP::Cookie
     end
     if @secure
       string << "; Secure"
+    end
+    if @samesite
+      string << "; SameSite=#{@samesite.to_s.capitalize}"
     end
     string
   end

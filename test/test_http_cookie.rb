@@ -1184,6 +1184,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         max_age: 3600,
         name: 'Foo',
         path: '/',
+        samesite: nil,
         secure: cookie.secure?,
         value: 'Bar',
       }
@@ -1203,6 +1204,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         max_age: nil,
         name: 'Foo',
         path: '/',
+        samesite: nil,
         secure: cookie.secure?,
         value: 'Bar',
       }

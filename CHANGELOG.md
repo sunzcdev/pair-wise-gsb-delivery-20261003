@@ -1,3 +1,16 @@
+## Unreleased
+
+- Add support for the `SameSite` cookie attribute (`:strict`, `:lax`
+  and `:none`), parsed from and emitted in `Set-Cookie` header values.
+- Add opt-in SameSite filtering of the cookies selected for sending:
+  `HTTP::CookieJar#cookies`, `#each` and `#empty?` accept a
+  `samesite:` request context (initiating site, top-level navigation
+  flag, HTTP method and redirect chain), and the new
+  `HTTP::CookieJar#samesite_exclusions` reports why cookies were
+  excluded.  See `HTTP::CookieJar::SameSite` for the decision table.
+  Calls without a context behave exactly as before.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

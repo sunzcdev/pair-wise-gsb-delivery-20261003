@@ -79,6 +79,54 @@ Or install it yourself as:
     jar.save(filename)
 
 
+### SameSite filtering
+
+`HTTP::Cookie` understands the `SameSite` attribute (`:strict`,
+`:lax` or `:none`), both when parsing `Set-Cookie` header values and
+when generating them:
+
+    cookie = HTTP::Cookie.new("sid", "s12345", domain: 'example.org',
+                                               path: '/',
+                                               samesite: :lax)
+    cookie.set_cookie_value
+    # => "sid=s12345; Path=/; SameSite=Lax"
+
+By default `HTTP::CookieJar#cookies` does not filter by SameSite, so
+existing code keeps working unchanged.  Pass a request context with
+the `samesite:` option to enable filtering:
+
+    jar.cookies(uri, samesite: {
+      site: 'https://shop.example.org/',  # the site that initiated the request
+                                          # (nil/omitted: the destination itself,
+                                          #  i.e. a direct visit)
+      top_level: true,                    # a top-level navigation?
+      method: 'GET',                      # the HTTP method
+      redirect_chain: [],                 # URLs redirected through so far
+    })
+
+The rules adopted are as follows.  A request is considered
+_same-site_ when the initiating site and the destination URL share
+the same scheme and registrable domain, _and_ every URL in the
+redirect chain is also same-site with the initiating site.  A
+redirect chain that crosses a site boundary taints the whole request,
+even if it eventually comes back to the original site.
+
+| SameSite attribute | Sent when |
+| ------------------ | --------- |
+| `Strict`           | The request is same-site. |
+| `Lax`              | The request is same-site, or it is a top-level navigation with a safe method (`GET`, `HEAD`, `OPTIONS` or `TRACE`) and the redirect chain has not crossed a site boundary. |
+| `None`             | Always, but only if the cookie has the `Secure` attribute, which in turn confines it to secure (HTTPS) destinations. |
+| (not set)          | Always (legacy behavior). |
+
+To find out why cookies were excluded, use
+`HTTP::CookieJar#samesite_exclusions`, which maps each excluded
+cookie to a reason symbol (`:samesite_strict_cross_site`,
+`:samesite_lax_cross_site` or `:samesite_none_not_secure`):
+
+    jar.samesite_exclusions(uri, samesite: { site: 'https://ads.example.net/' })
+    # => {#<HTTP::Cookie:...> => :samesite_strict_cross_site, ...}
+
+
     ########################
     # Client side example 2
     ########################

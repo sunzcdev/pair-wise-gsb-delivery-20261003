@@ -110,19 +110,50 @@ class HTTP::CookieJar
   # Gets an array of cookies sorted by the path and creation time.  If
   # `url` is given, only ones that should be sent to the URL/URI are
   # selected, with the access time of each of them updated.
-  def cookies(url = nil)
-    each(url).sort
+  #
+  # If the `samesite` option is given, the selection is additionally
+  # filtered by each cookie's SameSite attribute according to the
+  # request context described by the option value.  See
+  # HTTP::CookieJar::SameSite for the context format and the rules
+  # applied.  Without the option, no SameSite filtering takes place
+  # and the behavior is unchanged.
+  def cookies(url = nil, samesite: nil)
+    each(url, samesite: samesite).sort
   end
 
   # Tests if the jar is empty.  If `url` is given, tests if there is
   # no cookie for the URL.
-  def empty?(url = nil)
+  #
+  # The `samesite` option works just as in #cookies.
+  def empty?(url = nil, samesite: nil)
     if url
-      each(url) { return false }
+      each(url, samesite: samesite) { return false }
       return true
     else
       @store.empty?
     end
+  end
+
+  # Returns a Hash of the cookies for `url` that are excluded by
+  # SameSite filtering under the given request context, mapping each
+  # excluded cookie to a Symbol explaining why.  Cookies that would
+  # not be sent for other reasons (expired, domain/path mismatch,
+  # secure transport, etc.) are not included.
+  #
+  # See HTTP::CookieJar::SameSite for the context format and the
+  # possible reason values.
+  def samesite_exclusions(url, samesite:)
+    uri = HTTP::Cookie::URIParser.parse(url)
+    context = SameSite.context(samesite, uri)
+    {}.tap { |exclusions|
+      if URI::HTTP === uri && uri.host
+        @store.each(uri) { |cookie|
+          if reason = SameSite.exclusion_reason(cookie, context)
+            exclusions[cookie] = reason
+          end
+        }
+      end
+    }
   end
 
   # Iterates over all cookies that are not expired in no particular
@@ -135,15 +166,30 @@ class HTTP::CookieJar
   #
   # If (and only if) the `uri` option is given, last access time of
   # each cookie is updated to the current time.
-  def each(uri = nil, &block) # :yield: cookie
-    block_given? or return enum_for(__method__, uri)
+  #
+  # If the `samesite` option is given together with `uri`, cookies
+  # are additionally filtered by their SameSite attribute according
+  # to the request context described by the option value.  See
+  # HTTP::CookieJar::SameSite for the context format and the rules
+  # applied.
+  def each(uri = nil, samesite: nil, &block) # :yield: cookie
+    block_given? or return enum_for(__method__, uri, samesite: samesite)
 
     if uri
       uri = HTTP::Cookie::URIParser.parse(uri)
       return self unless URI::HTTP === uri && uri.host
     end
 
-    @store.each(uri, &block)
+    if samesite
+      uri or
+        raise ArgumentError, 'a URI must be given to filter by SameSite context'
+      context = SameSite.context(samesite, uri)
+      @store.each(uri) { |cookie|
+        yield cookie unless SameSite.exclusion_reason(cookie, context)
+      }
+    else
+      @store.each(uri, &block)
+    end
     self
   end
   include Enumerable
@@ -328,3 +374,4 @@ end
 
 require 'http/cookie_jar/abstract_store'
 require 'http/cookie_jar/abstract_saver'
+require 'http/cookie_jar/samesite'
