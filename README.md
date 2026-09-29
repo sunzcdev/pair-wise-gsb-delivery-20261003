@@ -161,6 +161,35 @@ I have tried to simplify it some:
    provide encoded parameter values when you call the parameter names through the
    <code>object.parameters['<parameter_name>']</code> method call.
 
+### Checking a message against server capabilities
+
+Before delivering, you can check whether a message fits the SMTP extension
+capabilities a server offered (e.g. from its EHLO reply) without changing the
+message:
+
+```ruby
+plan = mail.encoding_plan(capabilities: %w[8BITMIME SMTPUTF8])
+plan.deliverable?           # => false if anything blocks delivery
+plan.required_capabilities  # => capabilities needed to send the message as-is
+plan.missing_capabilities   # => required capabilities the server did not offer
+plan.adjustments            # => parts that will be losslessly re-encoded to fit
+plan.blockers               # => parts that cannot be delivered or downgraded
+```
+
+The plan looks at the envelope addresses, the header fields, and each body's
+transfer encoding and line lengths.  Non-ASCII headers can be losslessly
+re-encoded as RFC 2047 encoded-words, and 8bit or binary bodies as
+quoted-printable or base64.  A non-ASCII envelope address, however, requires
+SMTPUTF8: an internationalized address is never rewritten to another address,
+so it blocks delivery when the capability is missing.
+
+Applying a deliverable plan returns a new message with the re-encodings
+carried out; the original message is left unchanged:
+
+```ruby
+deliverable_copy = plan.apply  # raises Mail::EncodingPlan::UnsatisfiableError if blocked
+```
+
 ## Contributing
 
 Please do!  Contributing is easy in Mail.  Please read the [CONTRIBUTING.md](CONTRIBUTING.md) document for more info.

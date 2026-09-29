@@ -1131,6 +1131,19 @@ module Mail
         end
     end
 
+    # Builds a read-only Mail::EncodingPlan for this message against the
+    # SMTP extension capabilities offered by a target server.  The plan
+    # reports which capabilities the message needs, which parts can be
+    # losslessly re-encoded to fit, and what blocks delivery outright.
+    #
+    # Example:
+    #
+    #  plan = mail.encoding_plan(capabilities: %w[8BITMIME SMTPUTF8])
+    #  plan.deliverable? #=> true
+    def encoding_plan(capabilities: [])
+      Mail::EncodingPlan.new(self, capabilities: capabilities)
+    end
+
     # Returns the decoded value of the subject field, as a single string.
     #
     # Example:
