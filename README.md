@@ -247,6 +247,50 @@ vehicle.alarm_state_name                        # => :active
 
 vehicle.fire_events!(:ignite, :enable_alarm)    # => StateMachines:InvalidParallelTransition: Cannot run events in parallel: ignite, enable_alarm
 
+# Planning Transitions
+
+Events can build a plan before anything is executed, so callers can inspect
+what *would* happen and decide whether to go through with it.  Planning never
+runs the transition's action or callbacks:
+
+```ruby
+plan = vehicle.ignite_plan        # => #<StateMachines::TransitionPlan event=:ignite from_name=:parked to_name=:idling precheckable=true>
+plan.from_name                    # => :parked
+plan.to_name                      # => :idling
+plan.branch                       # => the branch selected for the transition
+plan.callback_types               # => [:before, :around, :after]
+
+plan.execute                      # performs the planned transition
+```
+
+Guards are not run while planning unless they are explicitly declared as pure
+(side-effect free) checks via the `:precheck` option.  Guards that cannot be
+safely pre-checked are marked as deferred on the plan and are only verified
+when the plan is executed:
+
+```ruby
+event :ignite do
+  transition parked: :idling, if: :seatbelt_on?, precheck: :seatbelt_on?
+end
+
+plan = vehicle.ignite_plan
+plan.precheckable?                # => true (all guards were pre-checked)
+plan.deferred_guards              # => guards that could not be pre-checked
+plan.guards.first.passed?         # => true / false / nil (nil when deferred)
+```
+
+A plan is a snapshot.  If the object's state or requirements change after
+planning (e.g. another event fires), the plan goes stale and will not be
+forced through:
+
+```ruby
+plan = vehicle.ignite_plan
+vehicle.park                      # another event changes the state
+plan.stale?                       # => true
+plan.valid?                       # => false
+plan.execute                      # => StateMachines::StalePlanError
+```
+
 # Coordinated State Management
 
 State machines can coordinate with each other using state guards, allowing transitions to depend on the state of other state machines within the same object. This enables complex system modeling where components are interdependent.

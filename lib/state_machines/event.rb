@@ -97,6 +97,14 @@ module StateMachines
     #    end
     #  end
     #
+    # Guard conditions that are pure (side-effect free) can be declared as
+    # precheckable via the <tt>:precheck</tt> option.  This allows them to be
+    # evaluated when planning a transition via #plan_for:
+    #
+    #  event :ignite do
+    #    transition :parked => :idling, :if => :seatbelt_on?, :precheck => :seatbelt_on?
+    #  end
+    #
     # See StateMachines::Machine#transition for a description of the possible
     # configurations for defining transitions.
     def transition(options)
@@ -104,7 +112,7 @@ module StateMachines
 
       # Only a certain subset of explicit options are allowed for transition
       # requirements
-      StateMachines::OptionsValidator.assert_valid_keys!(options, :from, :to, :except_from, :except_to, :if, :unless, :if_state, :unless_state, :if_all_states, :unless_all_states, :if_any_state, :unless_any_state) if (options.keys - %i[from to on except_from except_to except_on if unless if_state unless_state if_all_states unless_all_states if_any_state unless_any_state]).empty?
+      StateMachines::OptionsValidator.assert_valid_keys!(options, :from, :to, :except_from, :except_to, :if, :unless, :if_state, :unless_state, :if_all_states, :unless_all_states, :if_any_state, :unless_any_state, :precheck) if (options.keys - %i[from to on except_from except_to except_on if unless if_state unless_state if_all_states unless_all_states if_any_state unless_any_state precheck]).empty?
 
       branches << branch = Branch.new(options.merge(on: name))
       @known_states |= branch.known_states
@@ -153,6 +161,58 @@ module StateMachines
              end
 
         return Transition.new(object, machine, name, from, to, !custom_from_state)
+      end
+
+      # No transition matched
+      nil
+    end
+
+    # Builds a plan for the next transition that would be performed on the
+    # given object if this event were fired, without running the transition's
+    # action or any callbacks.  If no transition can be planned, then this
+    # will return nil.
+    #
+    # The plan captures the starting state, target state, selected branch,
+    # and the callback categories the transition would pass through.  Guard
+    # conditions declared as precheckable (via the <tt>:precheck</tt> option
+    # on transitions) are evaluated immediately; all other guards are
+    # recorded on the plan as deferred and only verified when the plan gets
+    # executed.
+    #
+    # Valid requirement options:
+    # * <tt>:from</tt> - One or more states being transitioned from.  If none
+    #   are specified, then this will be the object's current state.
+    # * <tt>:to</tt> - One or more states being transitioned to.  If none are
+    #   specified, then this will match any to state.
+    # * <tt>:guard</tt> - Whether to evaluate precheckable guards while
+    #   planning.  Default is true.
+    #
+    # Event arguments are passed to precheckable guard conditions if they
+    # accept multiple parameters.
+    def plan_for(object, requirements = {}, *event_args)
+      StateMachines::OptionsValidator.assert_valid_keys!(requirements, :from, :to, :guard)
+      requirements = requirements.dup
+      requirements[:from] = machine.states.match!(object).name unless (custom_from_state = requirements.include?(:from))
+
+      branches.each do |branch|
+        next unless (match = branch.match(object, requirements.merge(guard: false), event_args))
+
+        guard_checks = plan_guard_checks(branch, object, requirements, event_args)
+
+        # A pre-checked guard that fails disqualifies this branch
+        next if guard_checks.any? { |check| check.checked? && !check.passed? }
+
+        # Branch allows for the transition to occur
+        from = requirements[:from]
+        to = if match[:to].is_a?(LoopbackMatcher)
+               from
+             else
+               values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
+
+               match[:to].filter(values).first
+             end
+
+        return TransitionPlan.new(object, machine, self, from, to, branch, guard_checks, requirements, event_args, !custom_from_state)
       end
 
       # No transition matched
@@ -233,6 +293,12 @@ module StateMachines
         machine.event(name).transition_for(object, *args, **kwargs)
       end
 
+      # Builds a plan for the transition that would be performed if the
+      # event were fired now, without running it
+      machine.define_helper(:instance, "#{qualified_name}_plan") do |machine, object, *args, **kwargs|
+        machine.event(name).plan_for(object, *args, **kwargs)
+      end
+
       # Fires the event
       machine.define_helper(:instance, qualified_name) do |machine, object, *args, **kwargs|
         machine.event(name).fire(object, *args, **kwargs)
@@ -242,6 +308,34 @@ module StateMachines
       machine.define_helper(:instance, "#{qualified_name}!") do |machine, object, *args, **kwargs|
         object.send(qualified_name, *args, **kwargs) || raise(StateMachines::InvalidTransition.new(object, machine, name))
       end
+    end
+
+    # Builds the guard checks for a branch being considered during planning.
+    # State guards and guards declared as precheckable are evaluated now;
+    # all other guards are recorded as deferred.
+    def plan_guard_checks(branch, object, requirements, event_args)
+      checks = []
+
+      if requirements[:guard] == false
+        branch.state_guards.each { |kind, conditions| checks << TransitionPlan::GuardCheck.new(kind, conditions, false) }
+        branch.guards.each { |kind, condition| checks << TransitionPlan::GuardCheck.new(kind, condition, false) }
+        return checks
+      end
+
+      branch.state_guards.each do |kind, conditions|
+        checks << TransitionPlan::GuardCheck.new(kind, conditions, true, branch.evaluate_state_guards(object, kind, conditions))
+      end
+
+      branch.guards.each do |kind, condition|
+        if branch.precheckable?(condition)
+          result = branch.evaluate_guard(object, condition, event_args)
+          checks << TransitionPlan::GuardCheck.new(kind, condition, true, kind == :if ? !!result : !result)
+        else
+          checks << TransitionPlan::GuardCheck.new(kind, condition, false)
+        end
+      end
+
+      checks
     end
   end
 end

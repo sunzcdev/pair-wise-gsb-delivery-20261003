@@ -37,11 +37,17 @@ module StateMachines
     # * +to+ / +except_to+
     attr_reader :known_states
 
+    # The guard conditions explicitly declared as pure checks that are safe
+    # to evaluate while planning a transition (via the <tt>:precheck</tt>
+    # option)
+    attr_reader :precheckable_conditions
+
     # Creates a new branch
     def initialize(options = {}) # :nodoc:
       # Build conditionals
       @if_condition = options.delete(:if)
       @unless_condition = options.delete(:unless)
+      @precheckable_conditions = Array(options.delete(:precheck)).freeze
       @if_state_condition = build_state_guard(options, :if_state)
       @unless_state_condition = build_state_guard(options, :unless_state)
       @if_all_states_condition = build_state_guard(options, :if_all_states)
@@ -109,6 +115,33 @@ module StateMachines
     #   branch.matches?(object, :on => :park, :from => :parked, :to => :idling)   # => false
     def matches?(object, query = {})
       !match(object, query).nil?
+    end
+
+    # The if/unless guard conditions configured for this branch as a list of
+    # [kind, condition] pairs, in the order they get evaluated.  State guards
+    # are exposed separately via #state_guards.
+    def guards
+      @guards ||= (Array(if_condition).map { |condition| [:if, condition] } +
+                   Array(unless_condition).map { |condition| [:unless, condition] }).freeze
+    end
+
+    # Determines whether the given guard condition was explicitly declared
+    # as a pure check that is safe to evaluate while planning a transition
+    def precheckable?(condition)
+      precheckable_conditions.include?(condition)
+    end
+
+    # Evaluates a single if/unless guard condition against the given object.
+    # This should only be used for conditions declared as precheckable.
+    def evaluate_guard(object, condition, event_args = [])
+      evaluate_method_with_event_args(object, condition, event_args)
+    end
+
+    # Evaluates a single group of state guards (e.g. :if_state) against the
+    # given object.  State guards only read state from other machines, so
+    # they are always safe to evaluate while planning a transition.
+    def evaluate_state_guards(object, guard_type, conditions)
+      validate_and_check_state_guards(object, guard_type => conditions)
     end
 
     # Alias for Minitest's assert_match

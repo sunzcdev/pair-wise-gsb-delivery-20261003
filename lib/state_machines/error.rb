@@ -112,4 +112,17 @@ module StateMachines
   # A method was called in an invalid state context
   class InvalidContext < Error
   end
+
+  # A transition plan was executed after the object's state or guard
+  # conditions changed, making the plan's assumptions no longer valid
+  class StalePlanError < Error
+    # The plan that could no longer be executed
+    attr_reader :plan
+
+    def initialize(plan) # :nodoc:
+      @plan = plan
+
+      super(plan.object, "Cannot execute plan for #{plan.machine.name.inspect} via #{plan.event_name.inspect} from #{plan.from_name.inspect}: the object's state or requirements changed since the plan was created")
+    end
+  end
 end
