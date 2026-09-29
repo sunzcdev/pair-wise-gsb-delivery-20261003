@@ -14,6 +14,7 @@ module I18n
     autoload :KeyValue,              'i18n/backend/key_value'
     autoload :LazyLoadable,          'i18n/backend/lazy_loadable'
     autoload :Memoize,               'i18n/backend/memoize'
+    autoload :MessagePattern,        'i18n/backend/message_pattern'
     autoload :Metadata,              'i18n/backend/metadata'
     autoload :Pluralization,         'i18n/backend/pluralization'
     autoload :Simple,                'i18n/backend/simple'

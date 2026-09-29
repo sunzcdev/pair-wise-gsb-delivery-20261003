@@ -86,6 +86,47 @@ This keeps inherited state safe and lets updates happen by replacing config obje
 * Locale fallbacks, RFC4647 compliant (optionally: RFC4646 locale validation)
 * [Gettext support](https://github.com/ruby-i18n/i18n/wiki/Gettext)
 * Translation metadata
+* Message patterns (opt-in structured message format, see below)
+
+## Message patterns
+
+For messages that select wording by several values at once (e.g. a count
+*and* a gender), `I18n::MessagePattern` provides a small, explicitly
+opt-in pattern format. Plain translation strings are never affected.
+
+```ruby
+pattern = I18n::MessagePattern.parse(
+  "{gender, select, " \
+    "male{{count, plural, one{He has one message} other{He has # messages}}} " \
+    "female{{count, plural, one{She has one message} other{She has # messages}}} " \
+    "other{{count, plural, one{They have one message} other{They have # messages}}}}"
+)
+pattern.render(gender: :female, count: 3) # => "She has 3 messages"
+```
+
+Syntax:
+
+* `{name}` interpolates a parameter.
+* `{name, select, key{message} other{message}}` selects a branch by the
+  parameter's value; `other` is the required default branch.
+* `{name, plural, one{message} other{message}}` selects a branch by the
+  plural category of a number (categories: `zero one two few many other`,
+  plus exact `=n` branches). Inside a plural branch, `#` renders the number.
+* Branches nest arbitrarily.
+* `\{`, `\}` and `\\` produce literal `{`, `}` and `\`.
+
+Parsed patterns are cached per source string, and only the selected
+branches are evaluated when rendering. Syntax errors are reported with the
+exact line/column and a caret pointing at the problem.
+
+To use patterns through the backend, include the opt-in module and either
+store `I18n::MessagePattern` instances as translation data or pass
+`message_pattern: true` to treat a looked-up string as a pattern:
+
+```ruby
+I18n::Backend::Simple.include(I18n::Backend::MessagePattern)
+I18n.t(:inbox, count: 2, message_pattern: true)
+```
 
 ## Alternative Backend
 
