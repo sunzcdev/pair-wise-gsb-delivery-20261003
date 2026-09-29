@@ -80,6 +80,11 @@ module StateMachines
       @event.human_name(@object.class)
     end
 
+    # The cost declared by the event that triggered this transition
+    def cost
+      @event.cost
+    end
+
     # The state name *before* the transition
     def from_name
       @from_state.name

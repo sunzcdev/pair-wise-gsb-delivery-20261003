@@ -36,6 +36,7 @@ require 'state_machines/event_collection'
 
 require 'state_machines/path'
 require 'state_machines/path_collection'
+require 'state_machines/cost_path'
 
 require 'state_machines/machine'
 require 'state_machines/machine_collection'
