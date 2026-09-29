@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require 'mail/smtp_envelope'
+require 'mail/smtp_delivery_result'
 
 module Mail
   # == Sending Email with SMTP
@@ -52,6 +53,59 @@ module Mail
       envelope = Mail::SmtpEnvelope.new(mail)
       response = smtp.sendmail(envelope.message, envelope.from, envelope.to)
       settings[:return_response] ? response : self
+    end
+
+    # Send the message via SMTP, recipient by recipient, and return a
+    # Mail::SMTPDeliveryResult describing the server's response for each
+    # envelope recipient and whether the message DATA was successfully
+    # submitted.
+    #
+    # Unlike #deliver!, a rejected recipient does not abort the delivery:
+    # every envelope recipient (To, Cc and Bcc addresses) is attempted,
+    # and DATA is submitted as long as at least one recipient was
+    # accepted. Use the returned result to retry only the addresses that
+    # were not delivered:
+    #
+    #   result = Mail.delivery_method.deliver_detailed!(mail)
+    #   retry_later(result.retryable_to) unless result.success?
+    #
+    # If the connection is lost while submitting DATA, the result is
+    # marked unknown (result.unknown?) instead of failed, because the
+    # server may already have accepted the message. Such recipients are
+    # excluded from result.retryable_to; do not auto-resend to them.
+    #
+    # A rejected MAIL FROM still raises, as no recipient can be
+    # attempted without a valid reverse-path.
+    def deliver_detailed!(mail)
+      envelope = Mail::SmtpEnvelope.new(mail)
+      result = Mail::SMTPDeliveryResult.new(envelope.from, envelope.to)
+
+      smtp.mailfrom(envelope.from)
+
+      envelope.to.each do |address|
+        begin
+          result.record_recipient_accepted(address, smtp.rcptto(address))
+        rescue Net::SMTPError => error
+          result.record_recipient_rejected(address, error)
+        end
+      end
+
+      if result.recipients.any?(&:accepted?)
+        begin
+          result.record_data_success(smtp.data(envelope.message))
+        rescue Net::SMTPError => error
+          # The server gave a definitive answer: the message was not
+          # accepted, so every accepted recipient is safe to retry.
+          result.record_data_failure(error)
+        rescue StandardError => error
+          # The connection was lost during DATA. The server may or may
+          # not have accepted the message, so the outcome is unknown:
+          # do not treat it as a failure and auto-resend.
+          result.record_data_unknown(error)
+        end
+      end
+
+      result
     end
   end
 end

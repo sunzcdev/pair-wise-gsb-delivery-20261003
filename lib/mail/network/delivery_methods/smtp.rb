@@ -112,6 +112,30 @@ module Mail
       settings[:return_response] ? response : self
     end
 
+    # Send the message within a single SMTP session, recipient by
+    # recipient, and return a Mail::SMTPDeliveryResult describing the
+    # server's response for each envelope recipient and whether the
+    # message DATA was successfully submitted.
+    #
+    # Unlike #deliver!, a rejected recipient does not abort the
+    # delivery: every envelope recipient (To, Cc and Bcc addresses) is
+    # attempted, and DATA is submitted as long as at least one recipient
+    # was accepted. Use the returned result to retry only the addresses
+    # that were not delivered:
+    #
+    #   result = Mail.delivery_method.deliver_detailed!(mail)
+    #   retry_later(result.retryable_to) unless result.success?
+    #
+    # If the connection is lost while submitting DATA, the result is
+    # marked unknown (result.unknown?) instead of failed, because the
+    # server may already have accepted the message. Such recipients are
+    # excluded from result.retryable_to; do not auto-resend to them.
+    def deliver_detailed!(mail)
+      start_smtp_session do |smtp|
+        Mail::SMTPConnection.new(:connection => smtp).deliver_detailed!(mail)
+      end
+    end
+
     private
       # `k` is said to be provided when `settings` has a non-nil value for `k`.
       def setting_provided?(k)
