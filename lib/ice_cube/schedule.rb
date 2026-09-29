@@ -4,6 +4,10 @@ module IceCube
   class Schedule
     extend Deprecated
 
+    # Default cap on the number of matched occurrence pairs that
+    # {#compare_occurrences} walks before reporting an incomplete result.
+    DEFAULT_COMPARISON_LIMIT = 100_000
+
     # Get the start time
     attr_reader :start_time
     deprecated_alias :start_date, :start_time
@@ -293,6 +297,83 @@ module IceCube
       occurs_between?(time, time)
     end
 
+    # Compare the occurrences this schedule actually produces against another
+    # schedule over a bounded time interval, without inspecting serialized
+    # representations.
+    #
+    # The two occurrence streams are merged in time order starting at
+    # +begin_time+ (defaults to the earlier of the two start times) and ending
+    # at +closing_time+ (required). The earliest time produced by only one of
+    # the schedules terminates the comparison; otherwise every occurrence in
+    # the interval is walked before the schedules are declared equal, so
+    # checking only the first few occurrences can never produce a false match.
+    #
+    # Because rules may be very sparse, +limit+ bounds the amount of work by
+    # capping the number of matched occurrence pairs consumed. When the cap is
+    # reached the result is +:incomplete+ and carries the verified time range;
+    # pass the returned +verified_through+ as the next +begin_time+ to resume.
+    # A nil +limit+ removes the cap (sensible only for terminating schedules).
+    #
+    # @param [IceCube::Schedule] other the schedule to compare against
+    # @param [Time] closing_time the end of the compared interval
+    # @param [Time] begin_time the start of the compared interval
+    # @param [Integer, nil] limit matched-pair work budget
+    # @return [IceCube::ComparisonResult]
+    def compare_occurrences(other, closing_time, begin_time = nil, limit: DEFAULT_COMPARISON_LIMIT)
+      unless other.is_a?(Schedule)
+        raise ArgumentError, "expected an IceCube::Schedule, got #{other.inspect}"
+      end
+      closing_time = TimeUtil.ensure_time(closing_time) or
+        raise ArgumentError, "closing_time is required to bound the comparison"
+      begin_time =
+        if begin_time
+          TimeUtil.ensure_time(begin_time)
+        else
+          [start_time, other.start_time].min
+        end
+
+      mine = occurrence_stream(begin_time, closing_time)
+      theirs = other.occurrence_stream(begin_time, closing_time)
+
+      next_one = lambda do |enum|
+        enum.next
+      rescue StopIteration
+        nil
+      end
+      left = next_one.call(mine)
+      right = next_one.call(theirs)
+      examined = 0
+
+      loop do
+        if left.nil?
+          if right
+            return ComparisonResult.new(:different, time: right, side: :other, examined: examined)
+          end
+          return ComparisonResult.new(:equal, examined: examined)
+        end
+        if right.nil?
+          return ComparisonResult.new(:different, time: left, side: :self, examined: examined)
+        end
+
+        if left.start_time == right.start_time
+          if limit && examined >= limit
+            return ComparisonResult.new(
+              :incomplete,
+              examined: examined,
+              verified_through: left.start_time
+            )
+          end
+          examined += 1
+          left = next_one.call(mine)
+          right = next_one.call(theirs)
+        elsif left.start_time < right.start_time
+          return ComparisonResult.new(:different, time: left, side: :self, examined: examined)
+        else
+          return ComparisonResult.new(:different, time: right, side: :other, examined: examined)
+        end
+      end
+    end
+
     # Get the first n occurrences, or the first occurrence if n is skipped
     def first(n = nil)
       occurrences = enumerate_occurrences(start_time).take(n || 1)
@@ -404,6 +485,15 @@ module IceCube
     def self.load(yaml)
       return yaml if yaml.nil? || yaml == ""
       from_yaml(yaml)
+    end
+
+    protected
+
+    # Stream every occurrence in [opening_time, closing_time], inclusive of
+    # both boundaries. Visible to other Schedule instances so two schedules
+    # can merge their streams without changing the public enumeration API.
+    def occurrence_stream(opening_time, closing_time)
+      enumerate_occurrences(opening_time, closing_time)
     end
 
     private
