@@ -1,3 +1,14 @@
+## Unreleased
+
+- Add `HTTP::Cookie::SetCookie`, a fidelity-preserving representation
+  of a Set-Cookie header value.  It keeps the original attribute
+  order, spelling and unknown attributes, rewrites only the relevant
+  segment when a known attribute is edited (with an explicit
+  duplicate-attribute rule), offers the existing HTTP::Cookie
+  semantic view via `#to_cookie`, and never introduces CR/LF into the
+  serialized output.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

@@ -210,6 +210,7 @@ class HTTP::Cookie
   end
 
   autoload :Scanner, 'http/cookie/scanner'
+  autoload :SetCookie, 'http/cookie/set_cookie'
 
   class << self
     # Tests if +target_path+ is under +base_path+ as described in RFC

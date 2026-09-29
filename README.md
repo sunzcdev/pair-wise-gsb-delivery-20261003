@@ -121,6 +121,29 @@ Or install it yourself as:
     header['Set-Cookie'] = cookie2.set_cookie_value
 
 
+## Fidelity-preserving Set-Cookie rewriting
+
+`HTTP::Cookie::SetCookie` parses a Set-Cookie header value without
+losing information, which is useful for intermediaries (e.g. proxy
+services) that need to adjust an attribute like Expires or Path while
+forwarding everything else untouched.  The original attribute order,
+spelling, spacing, quoting and unknown attributes are preserved byte
+for byte, and `#to_cookie` gives the semantic HTTP::Cookie view.
+
+    sc = HTTP::Cookie::SetCookie.parse(
+      'uid=u12345; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/app; SameSite=Lax')
+
+    sc.expires = Time.now + 7*86400   # rewrites only the Expires segment
+    sc.path = '/'                     # rewrites only the Path segment
+    sc.to_s        #=> 'uid=u12345; Expires=...; Path=/; SameSite=Lax'
+    sc.to_cookie('http://example.org/')  #=> semantic HTTP::Cookie view
+
+Duplicate known attributes follow an explicit rule: reads take the
+last valid occurrence (matching HTTP::Cookie::Scanner), while writes
+replace the first occurrence in place and remove later duplicates.
+Values containing CR or LF are rejected both at parse time and in the
+writers, so serialization can never inject header lines.
+
 ## Incompatibilities with Mechanize::Cookie/CookieJar
 
 There are several incompatibilities between
