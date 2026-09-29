@@ -53,6 +53,7 @@ module IceCube
       @time = time
       @start_time ||= realign(time, start_time)
       @time = @start_time if @time < @start_time
+      align_subsecond_precision
 
       return nil unless find_acceptable_time_before(closing_time)
 
@@ -67,6 +68,13 @@ module IceCube
 
     def realign(opening_time, start_time)
       start_time
+    end
+
+    # Whether this rule produces occurrences at sub-second precision. Only
+    # sub-secondly rules do; all other rules emit on the start time's
+    # subsecond component.
+    def subsecond_precision?
+      false
     end
 
     def full_required?
@@ -136,6 +144,18 @@ module IceCube
       validation_names.all? do |type|
         validation_accepts_or_updates_time?(@validations[type])
       end
+    end
+
+    # Whole-second rules only emit occurrences aligned to the start time's
+    # subsecond component. Align off-grid probes upward to the next aligned
+    # time so that sub-second enumeration steps (from schedules that also
+    # contain sub-secondly rules) cannot produce off-grid occurrences.
+    def align_subsecond_precision
+      return if subsecond_precision?
+      delta = TimeUtil.subsec(@start_time) - TimeUtil.subsec(@time)
+      return if delta.zero?
+      delta += 1 if delta < 0
+      @time += delta
     end
 
     def find_acceptable_time_before(boundary)

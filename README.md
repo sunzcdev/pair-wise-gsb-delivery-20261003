@@ -308,6 +308,23 @@ schedule.add_recurrence_rule IceCube::Rule.secondly
 schedule.add_recurrence_rule IceCube::Rule.secondly(15).hour_of_day(12)
 ```
 
+### Subsecondly (every fraction of a second)
+
+For sub-second scheduling, intervals must be exact: pass a `Rational`,
+`BigDecimal`, exact decimal `String`, or whole-second `Integer`. `Float`
+intervals are rejected because they cannot represent decimal fractions
+exactly, and intervals must be a whole number of nanoseconds. Occurrences
+are computed with exact rational arithmetic, so repeated advancement never
+drifts, and the nanoseconds of the schedule's start time are preserved.
+
+```ruby
+# every 125 milliseconds
+schedule.add_recurrence_rule IceCube::Rule.subsecondly(Rational(1, 8))
+
+# every 100 milliseconds, 5 times
+schedule.add_recurrence_rule IceCube::Rule.subsecondly(BigDecimal("0.1")).count(5)
+```
+
 ---
 
 ## recurring_select

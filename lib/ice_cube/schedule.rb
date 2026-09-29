@@ -168,13 +168,13 @@ module IceCube
     # The next n occurrences after now
     def next_occurrences(num, from = nil, options = {})
       from = TimeUtil.match_zone(from, start_time) || TimeUtil.now(start_time)
-      enumerate_occurrences(from + 1, nil, options).take(num)
+      enumerate_occurrences(from + occurrence_step, nil, options).take(num)
     end
 
     # The next occurrence after now (overridable)
     def next_occurrence(from = nil, options = {})
       from = TimeUtil.match_zone(from, start_time) || TimeUtil.now(start_time)
-      enumerate_occurrences(from + 1, nil, options).next
+      enumerate_occurrences(from + occurrence_step, nil, options).next
     rescue StopIteration
       nil
     end
@@ -183,14 +183,14 @@ module IceCube
     def previous_occurrence(from)
       from = TimeUtil.match_zone(from, start_time) or raise ArgumentError, "Time required, got #{from.inspect}"
       return nil if from <= start_time
-      enumerate_occurrences(start_time, from - 1).to_a.last
+      enumerate_occurrences(start_time, from - occurrence_step).to_a.last
     end
 
     # The previous n occurrences before a given time
     def previous_occurrences(num, from)
       from = TimeUtil.match_zone(from, start_time) or raise ArgumentError, "Time required, got #{from.inspect}"
       return [] if from <= start_time
-      a = enumerate_occurrences(start_time, from - 1).to_a
+      a = enumerate_occurrences(start_time, from - occurrence_step).to_a
       (a.size > num) ? a[-1 * num, a.size] : a
     end
 
@@ -420,11 +420,16 @@ module IceCube
     def enumerate_occurrences(opening_time, closing_time = nil, options = {})
       opening_time = TimeUtil.match_zone(opening_time, start_time)
       closing_time = TimeUtil.match_zone(closing_time, start_time)
-      opening_time += TimeUtil.subsec(start_time) - TimeUtil.subsec(opening_time)
+      # Aligning the opening subsec to the start time only makes sense for
+      # whole-second grids; sub-second rules compare exact times instead.
+      if occurrence_step >= ONE_SECOND
+        opening_time += TimeUtil.subsec(start_time) - TimeUtil.subsec(opening_time)
+      end
       opening_time = start_time if opening_time < start_time
       spans = options[:spans] == true && duration != 0
       Enumerator.new do |yielder|
         reset
+        step = occurrence_step
         t1 = full_required? ? start_time : opening_time
         t1 -= duration if spans
         t1 = start_time if t1 < start_time
@@ -434,9 +439,17 @@ module IceCube
           if spans ? (t0.end_time > opening_time) : (t0 >= opening_time)
             yielder << (block_given? ? yield(t0) : t0)
           end
-          t1 = t0 + 1
+          t1 = t0 + step
         end
       end
+    end
+
+    # The smallest step (in seconds) by which enumeration advances past an
+    # emitted occurrence. Whole-second rules step by one second; sub-second
+    # rules step by one nanosecond so no occurrence is ever skipped.
+    def occurrence_step
+      step = @all_recurrence_rules.map(&:min_step).min
+      step || ONE_SECOND
     end
 
     # Get the next time after (or including) a specific time
@@ -458,7 +471,7 @@ module IceCube
         candidates.each do |rule, candidate|
           rule.increment_uses if candidate == min_time && rule.respond_to?(:increment_uses)
         end
-        next (time = min_time + 1) if exception_time?(min_time)
+        next (time = min_time + occurrence_step) if exception_time?(min_time)
         break Occurrence.new(min_time, min_time + duration)
       end
     end
