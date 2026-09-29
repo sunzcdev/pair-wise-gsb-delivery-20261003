@@ -12,3 +12,5 @@ require (
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	gopkg.in/yaml.v3 v3.0.0-20200313102051-9f266ea9e77c // indirect
 )
+
+replace github.com/vmihailenco/msgpack/v5 => F:\GSB\workspaces\scheduler-20260926-clean-40\go-20260927-b03-281\B
