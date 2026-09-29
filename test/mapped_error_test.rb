@@ -21,6 +21,12 @@ end
 class FirstError < RuntimeError; end
 class SecondError < RuntimeError; end
 
+class InfraError < RuntimeError; end
+
+class CyclicCauseError < RuntimeError
+  attr_accessor :cause
+end
+
 class MappedErrorTest < Minitest::Test
   def test_default
     assert true
@@ -245,6 +251,196 @@ class MappedErrorTest < Minitest::Test
       get '/'
       assert_equal 500, status
       assert_equal 'Second!', body
+    end
+  end
+
+  describe 'Exception Cause Mappings' do
+    it 'does not match handlers against causes by default' do
+      mock_app do
+        set :raise_errors, false
+        error(FooError) { 'cause handler' }
+        error(Exception) { 'generic handler' }
+        get('/') do
+          begin
+            raise FooError
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 500, status
+      assert_equal 'generic handler', body
+    end
+
+    it 'matches handlers against causes when error_causes is enabled' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) { 'cause handler' }
+        error(Exception) { 'generic handler' }
+        get('/') do
+          begin
+            raise FooError
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 500, status
+      assert_equal 'cause handler', body
+    end
+
+    it 'prefers handlers for the raised exception over handlers for its cause' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(InfraError) { 'top handler' }
+        error(FooError) { 'cause handler' }
+        get('/') do
+          begin
+            raise FooError
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 'top handler', body
+    end
+
+    it 'prefers superclass handlers of the raised exception over handlers for deeper causes' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(RuntimeError) { 'superclass handler' }
+        error(FooError) { 'cause handler' }
+        get('/') do
+          begin
+            raise FooError
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 'superclass handler', body
+    end
+
+    it 'walks deeper causes until a handler matches' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) { 'deep cause handler' }
+        get('/') do
+          begin
+            begin
+              raise FooError
+            rescue FooError
+              raise SecondError
+            end
+          rescue SecondError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 'deep cause handler', body
+    end
+
+    it 'exposes both the raised exception and the matched cause to the handler' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) do |matched|
+          "matched: #{matched.message} / top: #{env['sinatra.error'].message}"
+        end
+        get('/') do
+          begin
+            raise FooError, 'business failure'
+          rescue FooError
+            raise InfraError, 'infrastructure wrapper'
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 'matched: business failure / top: infrastructure wrapper', body
+    end
+
+    it 'falls back to status code handlers when no cause matches' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) { 'cause handler' }
+        error(500) { 'status handler' }
+        get('/') { raise InfraError }
+      end
+
+      get '/'
+      assert_equal 500, status
+      assert_equal 'status handler', body
+    end
+
+    it 'stops walking cyclic cause chains' do
+      first = CyclicCauseError.new('first')
+      second = CyclicCauseError.new('second')
+      first.cause = second
+      second.cause = first
+
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) { 'cause handler' }
+        get('/') { raise first }
+      end
+
+      get '/'
+      assert_equal 500, status
+      refute_equal 'cause handler', body
+    end
+
+    it 'does not recurse infinitely when a cause handler raises' do
+      mock_app do
+        set :raise_errors, false
+        set :error_causes, true
+        error(FooError) { raise FooError, 'from handler' }
+        get('/') do
+          begin
+            raise FooError, 'business failure'
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      assert_raises(FooError) { get '/' }
+    end
+
+    it 'inherits cause handlers from the base class' do
+      base = Class.new(Sinatra::Base)
+      base.error(FooError) { 'base cause handler' }
+
+      mock_app(base) do
+        set :raise_errors, false
+        set :error_causes, true
+        get('/') do
+          begin
+            raise FooError
+          rescue FooError
+            raise InfraError
+          end
+        end
+      end
+
+      get '/'
+      assert_equal 'base cause handler', body
     end
   end
 

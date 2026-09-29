@@ -96,6 +96,7 @@ like [rerun](https://github.com/alexch/rerun) or
   - [Error Handling](#error-handling)
     - [Not Found](#not-found)
     - [Error](#error)
+    - [Matching Exception Causes](#matching-exception-causes)
   - [Rack Middleware](#rack-middleware)
   - [Testing](#testing)
   - [Sinatra::Base - Middleware, Libraries, and Modular Apps](#sinatrabase---middleware-libraries-and-modular-apps)
@@ -2329,6 +2330,37 @@ error 400..510 do
   'Boom'
 end
 ```
+
+### Matching Exception Causes
+
+Infrastructure code often wraps your exceptions in its own error classes
+before they reach Sinatra. By default, `error` handlers only look at the
+class of the raised exception itself. Enable the `error_causes` setting to
+also match handlers against the exception's cause chain:
+
+```ruby
+set :error_causes, true
+
+error MyCustomError do |matched|
+  "So what happened was... #{matched.message}"
+end
+
+get '/' do
+  begin
+    raise MyCustomError, 'something bad'
+  rescue MyCustomError
+    raise SomeInfraError, 'wrapped by infrastructure'
+  end
+end
+```
+
+Handlers are tried in the following order: handlers for the raised
+exception's own class, then its superclasses, then the same for its
+`cause`, its cause's `cause`, and so on, with status code handlers tried
+last. Inside the handler, the block parameter is the exception that
+actually matched, while `env['sinatra.error']` always holds the originally
+raised exception. Cycles in the cause chain are followed only once, so a
+looped chain cannot hang the request.
 
 Sinatra installs special `not_found` and `error` handlers when
 running under the development environment to display nice stack traces

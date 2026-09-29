@@ -1230,7 +1230,7 @@ module Sinatra
         headers['X-Cascade'] = 'pass' if settings.x_cascade?
       end
 
-      if (res = error_block!(boom.class, boom) || error_block!(status, boom))
+      if (res = error_block_for_exception!(boom, status))
         return res
       end
 
@@ -1248,6 +1248,31 @@ module Sinatra
       raise boom if settings.raise_errors? || settings.show_exceptions?
 
       error_block! Exception, boom
+    end
+
+    # Find a custom error block for the given exception and HTTP status.
+    # When the error_causes setting is enabled, the exception's cause chain
+    # is walked as well: handlers matching the raised exception and its
+    # superclasses take precedence over handlers matching its cause, and so
+    # on down the chain. The handler receives the exception it matched as
+    # block parameter, while env['sinatra.error'] always holds the
+    # originally raised exception. Cycles in the cause chain are followed
+    # only once.
+    def error_block_for_exception!(boom, status)
+      return error_block!(boom.class, boom) || error_block!(status, boom) unless settings.error_causes?
+
+      seen = {}
+      exception = boom
+      while exception
+        break if seen[exception.object_id]
+
+        seen[exception.object_id] = true
+        res = error_block!(exception.class, exception)
+        return res if res
+
+        exception = exception.cause
+      end
+      error_block!(status, boom)
     end
 
     # Find an custom error block for the key(s) specified.
@@ -1945,6 +1970,7 @@ module Sinatra
     set :protection, true
     set :method_override, false
     set :use_code, false
+    set :error_causes, false
     set :default_encoding, 'utf-8'
     set :x_cascade, true
     set :add_charset, %w[javascript xml xhtml+xml].map { |t| "application/#{t}" }
