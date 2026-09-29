@@ -619,4 +619,202 @@ describe Rack::Session::Cookie do
     response.body.must_match /"counter"\s*=>\s*2/
     response.body.must_match(/\A{[^}]+}\z/)
   end
+
+  describe 'chunked sessions' do
+    sizer = lambda do |env|
+      req = Rack::Request.new(env)
+      if size = req.params["size"]
+        env["rack.session"]["data"] = "x" * size.to_i
+      end
+      Rack::Response.new(env["rack.session"]["data"].to_s.bytesize.to_s).to_a
+    end
+
+    def chunked_request(app, options = {})
+      session = Rack::Session::Cookie.new(app, { secrets: @secret, chunked: true }.merge(options))
+      Rack::MockRequest.new(Rack::Lint.new(session))
+    end
+
+    def set_cookie_headers(response)
+      headers = response["Set-Cookie"]
+      return [] unless headers
+      headers.is_a?(Array) ? headers : headers.split("\n")
+    end
+
+    # Simulate a browser cookie jar: apply Set-Cookie headers, honoring
+    # deletions, and build Cookie request headers back.
+    def apply_set_cookies(jar, response)
+      set_cookie_headers(response).each do |header|
+        name, value = header.split(';', 2).first.split('=', 2)
+        if header.include?("expires=Thu, 01 Jan 1970")
+          jar.delete(name)
+        else
+          jar[name] = value
+        end
+      end
+      jar
+    end
+
+    def cookie_header(jar)
+      jar.map { |name, value| "#{name}=#{value}" }.join("; ")
+    end
+
+    def chunk_names(jar)
+      jar.keys.grep(/\Arack\.session\./).sort
+    end
+
+    it 'requires a secret to authenticate the chunk manifest' do
+      lambda {
+        Rack::Session::Cookie.new(sizer, chunked: true)
+      }.must_raise ArgumentError
+    end
+
+    it 'keeps small sessions in a single cookie' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=10"))
+      jar.keys.must_equal %w[rack.session]
+      jar["rack.session"].wont_match(/\Achunked\./)
+
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "10"
+    end
+
+    it 'reads plain single cookies written without chunking' do
+      plain = Rack::MockRequest.new(Rack::Lint.new(
+        Rack::Session::Cookie.new(sizer, secrets: @secret)
+      ))
+
+      jar = {}
+      apply_set_cookies(jar, plain.get("/?size=10"))
+      jar["rack.session"].wont_match(/\Achunked\./)
+
+      response = chunked_request(sizer).get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "10"
+    end
+
+    it 'chunks large sessions and removes stale chunks across two consecutive size changes' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=10"))
+      jar.keys.must_equal %w[rack.session]
+
+      # First size change: grow beyond a single cookie.
+      response = mock.get("/?size=9000", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "9000"
+      apply_set_cookies(jar, response)
+
+      manifest = jar["rack.session"]
+      manifest.must_match(/\Achunked\.[0-9a-f]+\.\d+\.[0-9a-f]{64}\z/)
+      generation = manifest.split('.')[1]
+
+      chunks = chunk_names(jar)
+      chunks.size.must_be :>=, 2
+      chunks.each { |name| name.must_include ".#{generation}." }
+
+      # The chunks are reassembled in order on the way back in.
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "9000"
+
+      # Second size change: shrink back below the single-cookie limit, the
+      # old tail chunks must be deleted.
+      response = mock.get("/?size=10", "HTTP_COOKIE" => cookie_header(jar))
+      deletions = set_cookie_headers(response).select { |header| header.include?("expires=Thu, 01 Jan 1970") }
+      deletions.size.must_equal chunks.size
+      apply_set_cookies(jar, response)
+
+      jar.keys.must_equal %w[rack.session]
+      jar["rack.session"].wont_match(/\Achunked\./)
+
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "10"
+    end
+
+    it 'rejects the session when the browser only sends back some chunks' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=9000"))
+      chunk_names(jar).size.must_be :>=, 2
+
+      # The browser evicted one chunk and only returns the rest.
+      jar.delete(chunk_names(jar).last)
+
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "0"
+    end
+
+    it 'rejects duplicate chunks' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=9000"))
+
+      duplicate = chunk_names(jar).first
+      header = "#{cookie_header(jar)}; #{duplicate}=#{jar[duplicate]}"
+
+      response = mock.get("/", "HTTP_COOKIE" => header)
+      response.body.must_equal "0"
+    end
+
+    it 'rejects chunks mixed from different generations' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=9000"))
+      stale = jar.select { |name, _| name =~ /\Arack\.session\./ }
+
+      # Regenerate the session: new generation, old chunks are expired.
+      apply_set_cookies(jar, mock.get("/?size=9000", "HTTP_COOKIE" => cookie_header(jar)))
+      chunk_names(jar).wont_equal stale.keys.sort
+
+      # The browser held on to chunks from the previous generation.
+      stale.each { |name, value| jar[name] = value }
+
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "0"
+    end
+
+    it 'rejects a manifest with an invalid signature' do
+      jar = {}
+      mock = chunked_request(sizer)
+
+      apply_set_cookies(jar, mock.get("/?size=9000"))
+
+      jar["rack.session"] = jar["rack.session"].sub(/.\z/) { |char| char == "a" ? "b" : "a" }
+
+      response = mock.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "0"
+    end
+
+    it 'rejects manifests exceeding the chunk count limit' do
+      jar = {}
+      apply_set_cookies(jar, chunked_request(sizer).get("/?size=9000"))
+
+      limited = chunked_request(sizer, chunked: { max_chunks: 2 })
+      response = limited.get("/", "HTTP_COOKIE" => cookie_header(jar))
+      response.body.must_equal "0"
+    end
+
+    it 'refuses to write sessions exceeding the chunk count limit' do
+      mock = chunked_request(sizer, chunked: { max_chunks: 2 })
+
+      response = mock.get("/?size=9000")
+      set_cookie_headers(response).must_equal []
+    end
+
+    it 'counts all Set-Cookie headers toward the header budget' do
+      # 3 chunks fit within the count limit, but not within the byte budget.
+      mock = chunked_request(sizer, chunked: { max_chunks: 8, max_bytes: 5000 })
+      response = mock.get("/?size=9000")
+      set_cookie_headers(response).must_equal []
+
+      # With a sufficient budget the very same session is written.
+      jar = {}
+      mock = chunked_request(sizer, chunked: { max_chunks: 8, max_bytes: 16_384 })
+      apply_set_cookies(jar, mock.get("/?size=9000"))
+      chunk_names(jar).size.must_be :>=, 2
+    end
+  end
 end

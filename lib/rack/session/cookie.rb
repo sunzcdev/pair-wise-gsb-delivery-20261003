@@ -42,6 +42,28 @@ module Rack
     #
     # Refer to Rack::Session::Encryptor for more details on these options.
     #
+    # When the encoded session no longer fits into a single cookie, an
+    # explicitly enabled chunked mode can split it over several cookies:
+    #
+    # * :chunked
+    #     Enable chunked session cookies. Accepts +true+ or a Hash with
+    #     :max_chunks (default 8) and :max_bytes (the total budget for all
+    #     Set-Cookie headers emitted for a single session write, default
+    #     4096 * (max_chunks + 1)). Requires :secrets or :legacy_hmac_secret,
+    #     which is used to authenticate the chunk manifest.
+    #
+    # In chunked mode, the main session cookie holds an authenticated manifest
+    # ("chunked.<generation>.<count>.<hmac>") and the encoded session data is
+    # stored, in order, in generation-tagged chunk cookies named
+    # "<key>.<generation>.<index>". The chunks are reassembled in order before
+    # being handed to the regular decryptor. Missing, duplicate, oversized or
+    # foreign-generation chunks, an out-of-range chunk count, or an invalid
+    # manifest signature all reject the entire session. When a session shrinks
+    # again, stale chunk cookies are deleted. Every Set-Cookie header written
+    # for a session (manifest, chunks and stale chunk deletions) counts toward
+    # the :max_bytes budget, so chunking cannot be used to bypass the header
+    # size limits.
+    #
     # Prior to version TODO, the session hash was stored as base64 encoded
     # marshalled data. When a :secret option was supplied, the integrity of the
     # encoded data was protected with HMAC-SHA1. This functionality is still
@@ -89,6 +111,13 @@ module Rack
     #
 
     class Cookie < Abstract::PersistedSecure
+      # Prefix of the manifest value stored in the main session cookie when
+      # the session data is split over several chunk cookies.
+      CHUNKED_MANIFEST_PREFIX = 'chunked.'
+
+      # Default maximum number of chunk cookies per session.
+      CHUNKED_DEFAULT_MAX_CHUNKS = 8
+
       # Encode session cookies as Base64
       class Base64
         def encode(str)
@@ -196,6 +225,22 @@ module Rack
         @coder = options[:coder] ||= Base64::Marshal.new
 
         super(app, options.merge!(cookie_only: true))
+
+        if chunked_options = options[:chunked]
+          chunked_options = {} unless chunked_options.is_a?(Hash)
+
+          @chunked_max_chunks = chunked_options.fetch(:max_chunks, CHUNKED_DEFAULT_MAX_CHUNKS)
+          @chunked_max_bytes = chunked_options.fetch(:max_bytes, 4096 * (@chunked_max_chunks + 1))
+
+          unless secret = secrets.first || @legacy_hmac_secret
+            raise ArgumentError,
+              'Rack::Session::Cookie :chunked requires :secrets or :legacy_hmac_secret to authenticate the chunk manifest'
+          end
+
+          @chunked_manifest_key = OpenSSL::HMAC.digest(
+            OpenSSL::Digest.new('SHA256'), secret, "Rack::Session::Cookie chunk manifest #{@key}"
+          )
+        end
       end
 
       private
@@ -212,7 +257,7 @@ module Rack
 
       def unpacked_cookie_data(request)
         request.fetch_header(RACK_SESSION_UNPACKED_COOKIE_DATA) do |k|
-          if cookie_data = request.cookies[@key]
+          if cookie_data = read_cookie_data(request)
             session_data = nil
 
             # Try to decrypt the session data with our encryptors
@@ -249,6 +294,139 @@ module Rack
         end
       end
 
+      # Returns the encoded session data for the request. When the main
+      # session cookie holds a chunk manifest, the chunk cookies are
+      # validated and reassembled in order first. Returns nil when there is
+      # no session cookie, or when a chunked session fails validation, in
+      # which case the entire session is rejected.
+      def read_cookie_data(request)
+        return unless cookie_data = request.cookies[@key]
+
+        if cookie_data.start_with?(CHUNKED_MANIFEST_PREFIX)
+          reassemble_chunked_session(request, cookie_data)
+        else
+          cookie_data
+        end
+      end
+
+      def chunked?
+        !@chunked_max_chunks.nil?
+      end
+
+      def chunk_name_pattern
+        @chunk_name_pattern ||= /\A#{Regexp.escape(@key)}\.([0-9a-f]+)\.(\d+)\z/
+      end
+
+      def chunk_manifest_hmac(generation, count)
+        OpenSSL::HMAC.hexdigest(
+          OpenSSL::Digest.new('SHA256'), @chunked_manifest_key,
+          "#{CHUNKED_MANIFEST_PREFIX}#{generation}.#{count}"
+        )
+      end
+
+      # Extract chunk cookies from the raw Cookie header, mirroring
+      # Rack::Utils.parse_cookies_header, so that duplicate chunk cookies
+      # (which the parsed cookie Hash would silently merge) can be rejected.
+      def extract_chunk_cookies(request)
+        chunks = {}
+        duplicates = false
+
+        if header = request.get_header('HTTP_COOKIE')
+          header.split(/; */).each do |cookie|
+            name, value = cookie.split('=', 2)
+            next unless name && value
+
+            if (match = chunk_name_pattern.match(name))
+              if chunks.key?(name)
+                duplicates = true
+              else
+                chunks[name] = [match[1], match[2].to_i, (Rack::Utils.unescape(value) rescue value)]
+              end
+            end
+          end
+        end
+
+        [chunks, duplicates]
+      end
+
+      # Validate the manifest and its chunks, and return the reassembled
+      # encoded session data. Any validation failure rejects the entire
+      # session by returning nil.
+      def reassemble_chunked_session(request, manifest)
+        errors = request.env[Rack::RACK_ERRORS]
+
+        unless chunked?
+          errors.puts 'Session cookie chunk manifest rejected: chunked sessions are not enabled.'
+          return nil
+        end
+
+        parts = manifest.split('.')
+        generation, count, hmac = parts[1], parts[2], parts[3]
+
+        unless parts.size == 4 &&
+               generation =~ /\A[0-9a-f]+\z/ &&
+               count =~ /\A\d+\z/ &&
+               hmac =~ /\A[0-9a-f]{64}\z/
+          errors.puts 'Session cookie chunk manifest rejected: malformed manifest.'
+          return nil
+        end
+
+        count = count.to_i
+
+        unless count.between?(1, @chunked_max_chunks)
+          errors.puts "Session cookie chunk manifest rejected: chunk count #{count} is out of range."
+          return nil
+        end
+
+        unless Rack::Utils.secure_compare(hmac, chunk_manifest_hmac(generation, count))
+          errors.puts 'Session cookie chunk manifest rejected: invalid signature.'
+          return nil
+        end
+
+        chunks, duplicates = extract_chunk_cookies(request)
+
+        if duplicates
+          errors.puts 'Session cookie chunks rejected: duplicate chunk cookie.'
+          return nil
+        end
+
+        unless chunks.all? { |_, (chunk_generation, _, _)| chunk_generation == generation }
+          errors.puts 'Session cookie chunks rejected: chunks from other generations present.'
+          return nil
+        end
+
+        unless chunks.size == count
+          errors.puts "Session cookie chunks rejected: expected #{count} chunks, got #{chunks.size}."
+          return nil
+        end
+
+        data = String.new
+
+        count.times do |index|
+          name = "#{@key}.#{generation}.#{index}"
+
+          unless entry = chunks[name]
+            errors.puts "Session cookie chunks rejected: missing chunk #{index}."
+            return nil
+          end
+
+          if entry[2].bytesize > 4096 - name.bytesize
+            errors.puts "Session cookie chunks rejected: chunk #{index} exceeds the per-cookie size limit."
+            return nil
+          end
+
+          data << entry[2]
+        end
+
+        data
+      end
+
+      # Names of chunk cookies sent by the client which are not part of the
+      # given keep list, and should therefore be expired.
+      def stale_chunk_names(request, keep = [])
+        request.cookies.keys.select { |name| name.match?(chunk_name_pattern) } - keep
+      end
+
       def persistent_session_id!(data, sid = nil)
         data ||= {}
         data["session_id"] ||= sid || generate_sid
@@ -268,11 +446,87 @@ module Rack
         session = session.merge("session_id" => session_id)
         session_data = encode_session_data(session)
 
-        if session_data.size > (4096 - @key.size)
+        if session_data.size <= (4096 - @key.size)
+          # The session fits in a single cookie. Expire any stale chunk
+          # cookies left over from a previously larger session.
+          expire_stale_chunks(req)
+
+          SessionId.new(session_id, session_data)
+        elsif chunked?
+          write_chunked_session(req, session_id, session_data)
+        else
           req.get_header(RACK_ERRORS).puts("Warning! Rack::Session::Cookie data size exceeds 4K.")
           nil
-        else
-          SessionId.new(session_id, session_data)
+        end
+      end
+
+      # Split the encoded session data over generation-tagged chunk cookies,
+      # storing an authenticated manifest in the main session cookie. All
+      # Set-Cookie headers emitted for the write (manifest, chunks and stale
+      # chunk deletions) count toward the header budget; exceeding the chunk
+      # count limit or the budget drops the session instead of saving it.
+      def write_chunked_session(req, session_id, session_data)
+        generation = @sid_secure.hex(8)
+        chunks = []
+        offset = 0
+
+        while offset < session_data.bytesize
+          name = "#{@key}.#{generation}.#{chunks.size}"
+          chunk = session_data.byteslice(offset, 4096 - name.bytesize)
+          chunks << [name, chunk]
+          offset += chunk.bytesize
+        end
+
+        if chunks.size > @chunked_max_chunks
+          req.get_header(RACK_ERRORS).puts(
+            "Warning! Rack::Session::Cookie data size exceeds #{@chunked_max_chunks} chunks."
+          )
+          return nil
+        end
+
+        manifest = "#{CHUNKED_MANIFEST_PREFIX}#{generation}.#{chunks.size}.#{chunk_manifest_hmac(generation, chunks.size)}"
+
+        stale = stale_chunk_names(req, chunks.map(&:first))
+
+        # Every Set-Cookie header written for this session counts toward
+        # the header budget.
+        budget = @key.bytesize + manifest.bytesize
+        chunks.each { |name, value| budget += name.bytesize + value.bytesize }
+        stale.each { |name| budget += name.bytesize }
+
+        if budget > @chunked_max_bytes
+          req.get_header(RACK_ERRORS).puts(
+            "Warning! Rack::Session::Cookie chunked data exceeds the #{@chunked_max_bytes} bytes header budget."
+          )
+          return nil
+        end
+
+        req.set_header(RACK_SESSION_CHUNKED_WRITE, chunks)
+        req.set_header(RACK_SESSION_CHUNKED_EXPIRE, stale) unless stale.empty?
+
+        SessionId.new(session_id, manifest)
+      end
+
+      # Record any stale chunk cookies from the request, so they can be
+      # expired alongside the session cookie.
+      def expire_stale_chunks(req, keep = [])
+        stale = stale_chunk_names(req, keep)
+        req.set_header(RACK_SESSION_CHUNKED_EXPIRE, stale) unless stale.empty?
+      end
+
+      def set_cookie(request, response, cookie)
+        super
+
+        if chunks = request.get_header(RACK_SESSION_CHUNKED_WRITE)
+          chunks.each do |name, value|
+            response.set_cookie(name, cookie.merge(value: value))
+          end
+        end
+
+        if stale = request.get_header(RACK_SESSION_CHUNKED_EXPIRE)
+          stale.each do |name|
+            response.delete_cookie(name, path: cookie[:path], domain: cookie[:domain])
+          end
         end
       end
 
