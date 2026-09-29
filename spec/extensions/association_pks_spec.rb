@@ -541,4 +541,249 @@ describe "Sequel::Plugins::AssociationPks" do
     ar = @Artist.load(:id=>1)
     proc{ar.album_pks = nil}.must_raise Sequel::Error
   end
+
+  describe ":delta_pks" do
+    before do
+      @db = Sequel.mock(:autoid=>1, :fetch=>proc do |sql|
+        case sql
+        when /SELECT tag_id FROM scoped_albums_tags WHERE .*album_id = (\d)/
+          a = []
+          a << {:tag_id=>1} if $1 == '1'
+          a << {:tag_id=>2} if $1 == '1'
+          a
+        when /SELECT tag_id FROM albums_tags WHERE \(album_id = (\d)\)/
+          a = []
+          a << {:tag_id=>1} if $1 == '1'
+          a << {:tag_id=>2} if $1 != '3'
+          a << {:tag_id=>3} if $1 == '2'
+          a
+        when /SELECT first, last FROM albums_vocalists WHERE .*album_id = (\d)/
+          a = []
+          a << {:first=>"F1", :last=>"L1"} if $1 == '1'
+          a << {:first=>"F2", :last=>"L2"} if $1 != '3'
+          a << {:first=>"F3", :last=>"L3"} if $1 == '2'
+          a
+        when "SELECT id FROM albums WHERE (albums.artist_id = 1)"
+          [{:id=>1}, {:id=>2}, {:id=>3}]
+        end
+      end)
+      @Album = Class.new(Sequel::Model(@db[:albums]))
+      @Album.columns :id
+      @Tag = Class.new(Sequel::Model(@db[:tags]))
+      @Tag.columns :id
+      @Vocalist = Class.new(Sequel::Model(@db[:vocalists]))
+      @Vocalist.columns :first, :last, :album_id
+      @Vocalist.set_primary_key [:first, :last]
+      @Artist = Class.new(Sequel::Model(@db[:artists]))
+      @Artist.columns :id
+      @AlbumOne = Class.new(Sequel::Model(@db[:albums]))
+      @AlbumOne.columns :id, :artist_id
+      @Album.plugin :association_pks
+      @Vocalist.plugin :association_pks
+      @Artist.plugin :association_pks
+      @db.sqls
+    end
+
+    it "should only delete removed and insert added join rows for many_to_many associations" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = [2, 4]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+        'DELETE FROM albums_tags WHERE ((album_id = 1) AND (tag_id IN (1)))',
+        'INSERT INTO albums_tags (album_id, tag_id) VALUES (1, 4)'
+      ]
+    end
+
+    it "should not issue any write statements when setting the same set of keys a second time" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      album = @Album.load(:id=>1)
+      album.tag_pks = [1, 2]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+      ]
+      @db.sqls
+
+      album.tag_pks = [2, 1]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+      ]
+    end
+
+    it "should normalize duplicate keys before diffing for many_to_many associations" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = [2, 2, 1, 1]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+      ]
+    end
+
+    it "should only insert added keys when none of the current keys are removed" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = [1, 2, 3]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+        'INSERT INTO albums_tags (album_id, tag_id) VALUES (1, 3)'
+      ]
+    end
+
+    it "should only delete removed keys when all new keys already exist" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = [2]
+      @db.sqls.must_equal [
+        'SELECT tag_id FROM albums_tags WHERE (album_id = 1)',
+        'DELETE FROM albums_tags WHERE ((album_id = 1) AND (tag_id IN (1)))'
+      ]
+    end
+
+    it "should remove all join rows when setting an empty set" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = []
+      @db.sqls.must_equal [
+        'DELETE FROM albums_tags WHERE (album_id = 1)'
+      ]
+    end
+
+    it "should handle composite right keys when diffing many_to_many associations" do
+      @Album.many_to_many :vocalists, :class=>@Vocalist, :join_table=>:albums_vocalists, :left_key=>:album_id, :right_key=>[:first, :last], :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).vocalist_pks = [["F2", "L2"], ["F4", "L4"]]
+      sqls = @db.sqls
+      sqls[0].must_equal "SELECT first, last FROM albums_vocalists WHERE (album_id = 1)"
+      sqls[1].must_equal "DELETE FROM albums_vocalists WHERE ((album_id = 1) AND ((first, last) IN (('F1', 'L1'))))"
+      sqls[2].must_equal "INSERT INTO albums_vocalists (album_id, first, last) VALUES (1, 'F4', 'L4')"
+      sqls.length.must_equal 3
+    end
+
+    it "should not write when setting the same composite right keys with duplicates" do
+      @Album.many_to_many :vocalists, :class=>@Vocalist, :join_table=>:albums_vocalists, :left_key=>:album_id, :right_key=>[:first, :last], :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).vocalist_pks = [["F2", "L2"], ["F1", "L1"], ["F1", "L1"]]
+      @db.sqls.must_equal [
+        "SELECT first, last FROM albums_vocalists WHERE (album_id = 1)",
+      ]
+    end
+
+    it "should handle composite left keys when diffing many_to_many associations" do
+      @db = Sequel.mock(:autoid=>1, :fetch=>proc do |sql|
+        case sql
+        when /SELECT instrument_id FROM vocalists_instruments WHERE \(\(first = 'F1'\) AND \(last = 'L1'\)\)/
+          [{:instrument_id=>1}, {:instrument_id=>2}]
+        end
+      end)
+      vocalist_model = Class.new(Sequel::Model(@db[:vocalists]))
+      vocalist_model.columns :first, :last
+      vocalist_model.set_primary_key [:first, :last]
+      instrument_model = Class.new(Sequel::Model(@db[:instruments]))
+      instrument_model.columns :id
+      vocalist_model.plugin :association_pks
+      vocalist_model.many_to_many :instruments, :class=>instrument_model, :join_table=>:vocalists_instruments, :left_key=>[:first, :last], :delay_pks=>false, :delta_pks=>true
+      @db.sqls
+
+      vocalist_model.load(:first=>'F1', :last=>'L1').instrument_pks = [2, 3]
+      @db.sqls.must_equal [
+        "SELECT instrument_id FROM vocalists_instruments WHERE ((first = 'F1') AND (last = 'L1'))",
+        "DELETE FROM vocalists_instruments WHERE ((first = 'F1') AND (last = 'L1') AND (instrument_id IN (1)))",
+        "INSERT INTO vocalists_instruments (first, last, instrument_id) VALUES ('F1', 'L1', 3)"
+      ]
+    end
+
+    it "should scope deletes and inserts using the join table conditions of the association" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:scoped_albums_tags, :left_key=>:album_id,
+        :join_table_block=>proc{|ds| ds.where(:scope=>1)},
+        :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).tag_pks = [2, 3]
+      @db.sqls.must_equal [
+        "SELECT tag_id FROM scoped_albums_tags WHERE ((scope = 1) AND (album_id = 1))",
+        "DELETE FROM scoped_albums_tags WHERE ((scope = 1) AND (album_id = 1) AND (tag_id IN (1)))",
+        "INSERT INTO scoped_albums_tags (album_id, tag_id) VALUES (1, 3)"
+      ]
+    end
+
+    it "should scope composite key deletes using the join table conditions of the association" do
+      @Album.many_to_many :vocalists, :class=>@Vocalist, :join_table=>:albums_vocalists, :left_key=>:album_id, :right_key=>[:first, :last],
+        :join_table_block=>proc{|ds| ds.where(:active=>true)},
+        :delay_pks=>false, :delta_pks=>true
+      @Album.load(:id=>1).vocalist_pks = [["F2", "L2"]]
+      @db.sqls.must_equal [
+        "SELECT first, last FROM albums_vocalists WHERE ((active IS TRUE) AND (album_id = 1))",
+        "DELETE FROM albums_vocalists WHERE ((active IS TRUE) AND (album_id = 1) AND ((first, last) IN (('F1', 'L1'))))"
+      ]
+    end
+
+    it "should clear the cached pks and rollback when a change fails" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>false, :delta_pks=>true, :cache_pks=>true
+      album = @Album.load(:id=>1)
+      album.use_transactions = true
+     album.tag_pks.must_equal [1, 2]
+     @db.sqls
+
+     @db.numrows = proc {|sql| raise Sequel::DatabaseError, "boom" if sql =~ /DELETE/; 1}
+     proc{album.tag_pks = [2, 4]}.must_raise Sequel::DatabaseError
+     sqls = @db.sqls
+     sqls.must_include "BEGIN"
+     sqls.must_include "ROLLBACK"
+     sqls.wont_include(/INSERT/)
+
+     @db.numrows = 1
+     album.tag_pks.must_equal [1, 2]
+     @db.sqls.must_equal ['SELECT tag_id FROM albums_tags WHERE (album_id = 1)']
+   end
+
+    it "should only update disassociated and newly associated rows for one_to_many associations" do
+      @Artist.one_to_many :albums, :class=>@AlbumOne, :key=>:artist_id, :delay_pks=>false, :delta_pks=>true
+      @Artist.load(:id=>1).album_pks = [2, 3, 4]
+      @db.sqls.must_equal [
+        "SELECT id FROM albums WHERE (albums.artist_id = 1)",
+        "UPDATE albums SET artist_id = NULL WHERE ((albums.artist_id = 1) AND (id IN (1)))",
+        "UPDATE albums SET artist_id = 1 WHERE (id IN (4))"
+      ]
+    end
+
+    it "should not issue write statements when setting the same one_to_many keys with duplicates" do
+      @Artist.one_to_many :albums, :class=>@AlbumOne, :key=>:artist_id, :delay_pks=>false, :delta_pks=>true
+      @Artist.load(:id=>1).album_pks = [1, 2, 3, 3, 2, 1]
+      @db.sqls.must_equal [
+        "SELECT id FROM albums WHERE (albums.artist_id = 1)",
+      ]
+    end
+
+    it "should diff composite left keys correctly for one_to_many associations" do
+      @db = Sequel.mock(:autoid=>1, :fetch=>proc do |sql|
+        case sql
+        when /SELECT id FROM instruments WHERE \(\(instruments.first = 'F1'\) AND \(instruments.last = 'L1'\)\)/
+          [{:id=>1}, {:id=>2}]
+        end
+      end)
+      vocalist_model = Class.new(Sequel::Model(@db[:vocalists]))
+      vocalist_model.columns :first, :last
+      vocalist_model.set_primary_key [:first, :last]
+      instrument_model = Class.new(Sequel::Model(@db[:instruments]))
+      instrument_model.columns :id, :first, :last
+      vocalist_model.plugin :association_pks
+      vocalist_model.one_to_many :instruments, :class=>instrument_model, :key=>[:first, :last], :delay_pks=>false, :delta_pks=>true
+      @db.sqls
+
+      vocalist_model.load(:first=>'F1', :last=>'L1').instrument_pks = [2, 3]
+      @db.sqls.must_equal [
+        "SELECT id FROM instruments WHERE ((instruments.first = 'F1') AND (instruments.last = 'L1'))",
+        "UPDATE instruments SET first = NULL, last = NULL WHERE ((instruments.first = 'F1') AND (instruments.last = 'L1') AND (id IN (1)))",
+        "UPDATE instruments SET first = 'F1', last = 'L1' WHERE (id IN (3))"
+      ]
+    end
+
+    it "should keep delayed pks consistent with the database when the persisted change fails" do
+      @Album.many_to_many :tags, :class=>@Tag, :join_table=>:albums_tags, :left_key=>:album_id, :delay_pks=>:always, :delta_pks=>true
+      album = @Album.load(:id=>1)
+      album.tag_pks.must_equal [1, 2]
+      album.tag_pks = [2, 4]
+      album.tag_pks.must_equal [2, 4]
+
+     album.use_transactions = true
+     @db.numrows = proc {|sql| raise Sequel::DatabaseError, "boom" if sql =~ /INSERT/; 1}
+     proc{album.save_changes}.must_raise Sequel::DatabaseError
+
+     @db.numrows = 1
+     @db.sqls.must_include "ROLLBACK"
+     album.tag_pks.must_equal [1, 2]
+     @db.sqls.must_equal ['SELECT tag_id FROM albums_tags WHERE (album_id = 1)']
+   end
+  end
 end

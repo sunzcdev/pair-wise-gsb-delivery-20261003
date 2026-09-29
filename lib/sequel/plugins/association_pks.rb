@@ -45,6 +45,18 @@ module Sequel
     # If set to :remove, the setter will treat the nil as an empty array, removing
     # the association all currently associated values.
     #
+    # By default, the setter always issues both disassociation (DELETE/UPDATE) and
+    # association (INSERT/UPDATE) statements, even if most of the associated objects
+    # are unchanged.  If you use the :delta_pks association option, the setter will
+    # only make the changes needed to move between the current association and the
+    # given one: join rows for keys no longer present are deleted, rows for new keys
+    # are inserted, and rows for retained keys are not touched.  Duplicate keys in
+    # the given array are treated as a single key, and the changes are scoped using
+    # the association's own dataset, so rows outside of the association scope are
+    # not modified.  Setting the same keys again results in no DELETE/INSERT/UPDATE
+    # statements.  If the change fails, any transaction is rolled back and the
+    # cached association pks are cleared so the object reflects the database state.
+    #
     # For many_to_many associations, association_pks assumes the related pks can be
     # accessed directly from the join table.  This works in most cases, but in cases
     # where the :right_primary_key association option is used to specify a different
@@ -136,25 +148,62 @@ module Sequel
           end
 
           if !opts[:read_only] && !join_associated_table
-            opts[:pks_setter] = lambda do |pks|
-              if pks.empty?
-                public_send(opts[:remove_all_method])
-              else
-                checked_transaction do
-                  if clpk
-                    lpkv = lpk.map{|k| get_column_value(k)}
-                    cond = lk.zip(lpkv)
-                  else
-                    lpkv = get_column_value(lpk)
-                    cond = {lk=>lpkv}
+            opts[:pks_setter] = if opts[:delta_pks]
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
+                else
+                  checked_transaction do
+                    if clpk
+                      lpkv = lpk.map{|k| get_column_value(k)}
+                      cond = lk.zip(lpkv)
+                    else
+                      lpkv = get_column_value(lpk)
+                      cond = {lk=>lpkv}
+                    end
+
+                    # Scope by the same join table dataset used to read the
+                    # association pks, so the difference is only computed for
+                    # rows that are visible through the association.
+                    ds = _join_table_dataset(opts).where(cond)
+                    existing_pks = ds.select_map(rk)
+                    removed_pks = existing_pks - pks
+                    added_pks = pks - existing_pks
+
+                    unless removed_pks.empty?
+                      ds.where(rk=>removed_pks).delete
+                    end
+
+                    unless added_pks.empty?
+                      lpkv = Array(lpkv)
+                      key_array = crk ? added_pks.map{|pk| lpkv + pk} : added_pks.map{|pk| lpkv + [pk]}
+                      key_columns = Array(lk) + Array(rk)
+                      ds.import(key_columns, key_array)
+                    end
                   end
-                  ds = _join_table_dataset(opts).where(cond)
-                  ds.exclude(rk=>pks).delete
-                  pks -= ds.select_map(rk)
-                  lpkv = Array(lpkv)
-                  key_array = crk ? pks.map{|pk| lpkv + pk} : pks.map{|pk| lpkv + [pk]}
-                  key_columns = Array(lk) + Array(rk)
-                  ds.import(key_columns, key_array)
+                end
+              end
+            else
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
+                else
+                  checked_transaction do
+                    if clpk
+                      lpkv = lpk.map{|k| get_column_value(k)}
+                      cond = lk.zip(lpkv)
+                    else
+                      lpkv = get_column_value(lpk)
+                      cond = {lk=>lpkv}
+                    end
+                    ds = _join_table_dataset(opts).where(cond)
+                    ds.exclude(rk=>pks).delete
+                    pks -= ds.select_map(rk)
+                    lpkv = Array(lpkv)
+                    key_array = crk ? pks.map{|pk| lpkv + pk} : pks.map{|pk| lpkv + [pk]}
+                    key_columns = Array(lk) + Array(rk)
+                    ds.import(key_columns, key_array)
+                  end
                 end
               end
             end
@@ -183,29 +232,69 @@ module Sequel
           end
 
           unless opts[:read_only]
-            opts[:pks_setter] = lambda do |pks|
-              if pks.empty?
-                public_send(opts[:remove_all_method])
-              else
-                primary_key = opts.associated_class.primary_key
-                pkh = {primary_key=>pks}
-
-                if key.is_a?(Array)
-                  h = {}
-                  nh = {}
-                  key.zip(pk).each do|k, v|
-                    h[k] = v
-                    nh[k] = nil
-                  end
+            opts[:pks_setter] = if opts[:delta_pks]
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
                 else
-                  h = {key=>pk}
-                  nh = {key=>nil}
-                end
+                  primary_key = opts.associated_class.primary_key
 
-                checked_transaction do
-                  ds = public_send(opts.dataset_method)
-                  ds.unfiltered.where(pkh).update(h)
-                  ds.exclude(pkh).update(nh)
+                  if key.is_a?(Array)
+                    h = {}
+                    nh = {}
+                    key.zip(pk).each do|k, v|
+                      h[k] = v
+                      nh[k] = nil
+                    end
+                  else
+                    h = {key=>pk}
+                    nh = {key=>nil}
+                  end
+
+                  checked_transaction do
+                    ds = public_send(opts.dataset_method)
+                    # Compute the difference against the currently associated
+                    # pks, using the association's own (possibly conditional)
+                    # dataset so only in-scope rows are modified.
+                    existing_pks = ds.select_map(primary_key)
+                    removed_pks = existing_pks - pks
+                    added_pks = pks - existing_pks
+
+                    unless removed_pks.empty?
+                      ds.where(primary_key=>removed_pks).update(nh)
+                    end
+
+                    unless added_pks.empty?
+                      ds.unfiltered.where(primary_key=>added_pks).update(h)
+                    end
+                  end
+                end
+              end
+            else
+              lambda do |pks|
+                if pks.empty?
+                  public_send(opts[:remove_all_method])
+                else
+                  primary_key = opts.associated_class.primary_key
+                  pkh = {primary_key=>pks}
+
+                  if key.is_a?(Array)
+                    h = {}
+                    nh = {}
+                    key.zip(pk).each do|k, v|
+                      h[k] = v
+                      nh[k] = nil
+                    end
+                  else
+                    h = {key=>pk}
+                    nh = {key=>nil}
+                  end
+
+                  checked_transaction do
+                    ds = public_send(opts.dataset_method)
+                    ds.unfiltered.where(pkh).update(h)
+                    ds.exclude(pkh).update(nh)
+                  end
                 end
               end
             end
@@ -220,9 +309,17 @@ module Sequel
         # call the related association pks setters.
         def after_save
           if assoc_pks = @_association_pks
-            assoc_pks.each do |name, pks|
-             # pks_setter_method is private
-              send(model.association_reflection(name)[:pks_setter_method], pks)
+            begin
+              assoc_pks.each do |name, pks|
+                # pks_setter_method is private
+                send(model.association_reflection(name)[:pks_setter_method], pks)
+              end
+            rescue Exception
+              # The save transaction is rolled back, so drop the pending and
+              # cached association pks to keep the object consistent with the
+              # database state.
+              @_association_pks = nil
+              raise
             end
             @_association_pks = nil
           end
@@ -254,10 +351,10 @@ module Sequel
           elsif cache_or_delay && @_association_pks && (objs = @_association_pks[opts[:name]])
             objs
           elsif do_cache
-           # pks_getter_method is private
+            # pks_getter_method is private
             (@_association_pks ||= {})[opts[:name]] = send(opts[:pks_getter_method])
           else
-           # pks_getter_method is private
+            # pks_getter_method is private
             send(opts[:pks_getter_method])
           end
         end
@@ -278,13 +375,26 @@ module Sequel
           end
 
           pks = convert_pk_array(opts, pks)
+          pks = pks.uniq if opts[:delta_pks]
 
           if opts.fetch(:delay_pks, true)
             modified!
             (@_association_pks ||= {})[opts[:name]] = pks
           else
             # pks_setter_method is private
-            send(opts[:pks_setter_method], pks)
+            begin
+              send(opts[:pks_setter_method], pks)
+            rescue Exception
+              # The database changes were rolled back, so drop any cached
+              # value instead of exposing an association state that was not
+              # persisted.
+              @_association_pks.delete(opts[:name]) if @_association_pks
+              raise
+            end
+
+            if opts[:cache_pks]
+              (@_association_pks ||= {})[opts[:name]] = pks
+            end
           end
         end
 

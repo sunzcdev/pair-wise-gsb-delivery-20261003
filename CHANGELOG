@@ -1,5 +1,7 @@
 === master
 
+* Support :delta_pks association option in the association_pks plugin, so setters only delete and insert the join rows needed for the difference between the current and given association pks (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)
