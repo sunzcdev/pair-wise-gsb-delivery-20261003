@@ -9,7 +9,7 @@ require "rack/session/encryptor"
 describe Rack::Session do
   describe "with an encryptor" do
     let(:secret) { "." * 64 }
-    let(:encryptor) { Rack::Session::Encryptor.new(secret) }
+    let(:encryptor) { Rack::Session::Encryptor.new(secret, legacy_mode: true) }
 
     def self.test_session_cookie(value, cookie)
       it "decrypts the cookie to produce #{value.inspect}" do

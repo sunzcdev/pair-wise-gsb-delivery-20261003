@@ -342,50 +342,203 @@ module Rack
         end
       end
 
+      class V3 < V2
+        # Options may include the same options as V2, plus:
+        # * :application_id
+        #     An application-defined identifier. Messages encrypted for one
+        #     application cannot be decrypted by another application.
+        # * :path
+        #     The server-configured cookie path. This is included in the
+        #     authenticated data together with :purpose (the cookie name).
+        #
+        # Cryptography and Output Format:
+        #
+        #   urlsafe_encode64(version + salt + IV + authentication tag + ciphertext)
+        #
+        # The binary wire format is identical to V2. V3 additionally
+        # authenticates length-prefixed application_id, purpose and path values.
+
+        def decrypt(base64_data)
+          data = Base64.urlsafe_decode64(base64_data)
+          if data.bytesize <= 61
+            raise InvalidMessage, 'invalid message'
+          end
+
+          version = data[0]
+          raise InvalidMessage, 'invalid message' unless version == "\3"
+
+          ciphertext = data.slice!(61..-1)
+          auth_tag = data.slice!(45, 16)
+          cipher_iv = data.slice!(33, 12)
+
+          cipher = new_cipher
+          cipher.decrypt
+          salt = data.slice(1, 32)
+          set_cipher_key(cipher, message_secret_from_salt(salt))
+          cipher.iv = cipher_iv
+          cipher.auth_tag = auth_tag
+          cipher.auth_data = authenticated_data(data)
+
+          plaintext = cipher.update(ciphertext) << cipher.final
+
+          deserialized_message plaintext
+        rescue ArgumentError, OpenSSL::Cipher::CipherError
+          raise InvalidSignature, 'invalid message'
+        end
+
+        def encrypt(message)
+          version = "\3"
+
+          serialized_payload = serialize_payload(message)
+
+          cipher = new_cipher
+          cipher.encrypt
+          salt, message_secret = new_salt_and_message_secret
+          set_cipher_key(cipher, message_secret)
+          cipher.iv_len = 12
+          cipher_iv = cipher.random_iv
+
+          data = String.new
+          data << version
+          data << salt
+
+          cipher.auth_data = authenticated_data(data)
+          encrypted_data = cipher.update(serialized_payload) << cipher.final
+
+          data << cipher_iv
+          data << auth_tag_from(cipher)
+          data << encrypted_data
+
+          Base64.urlsafe_encode64(data)
+        end
+
+        private
+
+        def authenticated_data(data)
+          context = data.dup
+
+          [
+            @options[:application_id],
+            @options[:purpose],
+            @options[:path]
+          ].each do |value|
+            value = String.new(value.to_s).force_encoding(Encoding::BINARY)
+            context << [value.bytesize].pack('Q>')
+            context << value
+          end
+
+          context
+        end
+      end
+
       def initialize(secret, opts = {})
+        @secret = secret
         opts = opts.dup
 
-        @mode = opts.delete(:mode)&.to_sym || :guess_version
+        @mode = opts.delete(:mode)&.to_sym || :v3
+        @legacy_mode = normalize_legacy_mode(opts.delete(:legacy_mode))
+        @options = opts
+
         case @mode
         when :v1
           @v1 = V1.new(secret, opts)
         when :v2
           @v2 = V2.new(secret, opts)
-        else
+        when :v3
+          @v3 = V3.new(secret, opts)
+        when :guess_version
+          @legacy_mode = :guess_version
           @v1 = V1.new(secret, opts)
           @v2 = V2.new(secret, opts)
+          @v3 = V3.new(secret, opts)
+        else
+          raise ArgumentError, "invalid mode: #{@mode}"
         end
       end
 
       def decrypt(base64_data)
-        decryptor =
-          case @mode
-          when :v2
-            v2
-          when :v1
-            v1
+        case @mode
+        when :v1
+          v1.decrypt(base64_data)
+        when :v2
+          v2.decrypt(base64_data)
+        when :v3
+          decrypt_v3(base64_data)
+        when :guess_version
+          if message_version(base64_data) == "\3"
+            v3.decrypt(base64_data)
           else
-            guess_decryptor(base64_data)
+            guess_decryptor(base64_data).decrypt(base64_data)
           end
-
-        decryptor.decrypt(base64_data)
+        end
       end
 
       def encrypt(message)
-        encryptor =
-          case @mode
-          when :v1
-            v1
-          else
-            v2
-          end
-
-        encryptor.encrypt(message)
+        case @mode
+        when :v1
+          v1.encrypt(message)
+        when :v2
+          v2.encrypt(message)
+        else
+          v3.encrypt(message)
+        end
       end
 
       private
 
-      attr_reader :v1, :v2
+      attr_reader :v1, :v2, :v3
+
+      def v1
+        @v1 ||= V1.new(@secret, @options)
+      end
+
+      def v2
+        @v2 ||= V2.new(@secret, @options)
+      end
+
+      def v3
+        @v3 ||= V3.new(@secret, @options)
+      end
+
+      def decrypt_v3(base64_data)
+        if message_version(base64_data) == "\3"
+          v3.decrypt(base64_data)
+        else
+          legacy_decryptor(base64_data).decrypt(base64_data)
+        end
+      end
+
+      def legacy_decryptor(base64_data)
+        case @legacy_mode
+        when :v1
+          v1
+        when :v2
+          v2
+        when :guess_version
+          guess_decryptor(base64_data)
+        else
+          raise InvalidMessage, 'legacy encrypted cookies are not accepted'
+        end
+      end
+
+      def normalize_legacy_mode(legacy_mode)
+        case legacy_mode
+        when nil, false
+          false
+        when true
+          :guess_version
+        when Symbol, String
+          mode = legacy_mode.to_sym
+
+          if [:v1, :v2, :guess_version].include?(mode)
+            mode
+          else
+            raise ArgumentError, "invalid legacy_mode: #{legacy_mode}"
+          end
+        else
+          raise ArgumentError, "invalid legacy_mode: #{legacy_mode.inspect}"
+        end
+      end
 
       def guess_decryptor(base64_data)
         raise InvalidMessage, 'invalid message' if base64_data.nil? || base64_data.bytesize < 4
@@ -402,9 +555,20 @@ module Rack
           v2
         when "\1"
           v1
+        when "\3"
+          v3
         else
           raise InvalidMessage, 'invalid message'
         end
+      rescue ArgumentError
+        raise InvalidMessage, 'invalid message'
+      end
+
+      def message_version(base64_data)
+        raise InvalidMessage, 'invalid message' if base64_data.nil? || base64_data.bytesize < 4
+
+        first_encoded_4_bytes = base64_data.slice(0, 4).tr('-_', '+/')
+        Base64.strict_decode64(first_encoded_4_bytes)[0]
       rescue ArgumentError
         raise InvalidMessage, 'invalid message'
       end

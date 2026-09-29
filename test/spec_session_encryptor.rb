@@ -320,6 +320,58 @@ describe Rack::Session::Encryptor do
     end
   end
 
+  describe 'V3' do
+    def new_v3(secret, opts = {})
+      Rack::Session::Encryptor::V3.new(secret, {
+        application_id: 'application',
+        purpose: 'rack.session',
+        path: '/'
+      }.merge(opts))
+    end
+
+    it 'encrypts and decrypts a message' do
+      encryptor = new_v3(@secret)
+      message = encryptor.encrypt({ 'foo' => 'bar' })
+
+      encryptor.decrypt(message).must_equal({ 'foo' => 'bar' })
+    end
+
+    it 'raises for a different application id' do
+      encryptor = new_v3(@secret, application_id: 'one')
+      other_encryptor = new_v3(@secret, application_id: 'two')
+      message = other_encryptor.encrypt({ 'foo' => 'bar' })
+
+      -> { encryptor.decrypt(message) }.must_raise Rack::Session::Encryptor::InvalidSignature
+    end
+
+    it 'raises for a different purpose' do
+      encryptor = new_v3(@secret, purpose: 'one.session')
+      other_encryptor = new_v3(@secret, purpose: 'two.session')
+      message = other_encryptor.encrypt({ 'foo' => 'bar' })
+
+      -> { encryptor.decrypt(message) }.must_raise Rack::Session::Encryptor::InvalidSignature
+    end
+
+    it 'raises for a different path' do
+      encryptor = new_v3(@secret, path: '/one')
+      other_encryptor = new_v3(@secret, path: '/two')
+      message = other_encryptor.encrypt({ 'foo' => 'bar' })
+
+      -> { encryptor.decrypt(message) }.must_raise Rack::Session::Encryptor::InvalidSignature
+    end
+
+    it 'raises InvalidMessage on version mismatch' do
+      encryptor = new_v3(@secret)
+      message = encryptor.encrypt({ 'foo' => 'bar' })
+
+      decoded_message = Base64.urlsafe_decode64(message)
+      decoded_message[0] = "\2"
+      reencoded_message = Base64.urlsafe_encode64(decoded_message)
+
+      -> { encryptor.decrypt(reencoded_message) }.must_raise Rack::Session::Encryptor::InvalidMessage
+    end
+  end
+
   describe '#encrypt' do
     it 'encrypts the message with encrytor v1 when initialitialized with mode v1' do
       encryptor = Rack::Session::Encryptor.new(@secret, { mode: :v1 })
@@ -330,13 +382,13 @@ describe Rack::Session::Encryptor do
       version.must_equal "\1"
     end
 
-    it 'encrypts the message with encrytor v1 when initialitialized with a mode other than v1' do
-      encryptor = Rack::Session::Encryptor.new(@secret, { mode: :not_v1 })
+    it 'encrypts the message with encryptor v3 by default' do
+      encryptor = Rack::Session::Encryptor.new(@secret)
 
       encrypted_message = encryptor.encrypt({ 'foo' => 'bar' })
       version = Base64.urlsafe_decode64(encrypted_message)[0]
 
-      version.must_equal "\2"
+      version.must_equal "\3"
     end
   end
 
@@ -360,18 +412,42 @@ describe Rack::Session::Encryptor do
     end
 
     it 'decrypts the message by trying to guess the encryptor when initialized without a mode' do
-      encryptor_without_mode = Rack::Session::Encryptor.new(@secret)
+      encryptor_without_mode = Rack::Session::Encryptor.new(@secret, mode: :guess_version)
       encryptor_mode_v1 = Rack::Session::Encryptor.new(@secret, { mode: :v1 })
       encryptor_mode_v2 = Rack::Session::Encryptor.new(@secret, { mode: :v2 })
+      encryptor_mode_v3 = Rack::Session::Encryptor.new(@secret, { mode: :v3 })
 
       encrypted_message_v1 = encryptor_mode_v1.encrypt({ 'foo' => 'bar' })
       encrypted_message_v2 = encryptor_mode_v2.encrypt({ 'foo' => 'bar' })
+      encrypted_message_v3 = encryptor_mode_v3.encrypt({ 'foo' => 'bar' })
 
       decrypted_message_v1 = encryptor_without_mode.decrypt(encrypted_message_v1)
       decrypted_message_v2 = encryptor_without_mode.decrypt(encrypted_message_v2)
+      decrypted_message_v3 = encryptor_without_mode.decrypt(encrypted_message_v3)
 
       decrypted_message_v1.must_equal({ 'foo' => 'bar' })
       decrypted_message_v2.must_equal({ 'foo' => 'bar' })
+      decrypted_message_v3.must_equal({ 'foo' => 'bar' })
+    end
+
+    it 'does not decrypt old encrypted messages by default' do
+      encryptor = Rack::Session::Encryptor.new(@secret)
+      v1_message = Rack::Session::Encryptor.new(@secret, mode: :v1).encrypt({ 'foo' => 'bar' })
+      v2_message = Rack::Session::Encryptor.new(@secret, mode: :v2).encrypt({ 'foo' => 'bar' })
+
+      -> { encryptor.decrypt(v1_message) }.must_raise Rack::Session::Encryptor::InvalidMessage
+      -> { encryptor.decrypt(v2_message) }.must_raise Rack::Session::Encryptor::InvalidMessage
+    end
+
+    it 'decrypts scoped V2 legacy messages while writing V3' do
+      encryptor = Rack::Session::Encryptor.new(@secret, legacy_mode: :v2)
+      v2_message = Rack::Session::Encryptor.new(@secret, mode: :v2).encrypt({ 'foo' => 'bar' })
+      v1_message = Rack::Session::Encryptor.new(@secret, mode: :v1).encrypt({ 'foo' => 'bar' })
+
+      encryptor.decrypt(v2_message).must_equal({ 'foo' => 'bar' })
+      -> { encryptor.decrypt(v1_message) }.must_raise Rack::Session::Encryptor::InvalidMessage
+
+      Base64.urlsafe_decode64(encryptor.encrypt({ 'foo' => 'bar' }))[0].must_equal "\3"
     end
 
     # Rack's parse_cookies_header applies URI.decode_www_form_component to

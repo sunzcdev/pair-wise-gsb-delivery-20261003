@@ -72,6 +72,14 @@ describe Rack::Session::Cookie do
     SecureRandom.random_bytes(64)
   end
 
+  def cookie_value(response)
+    Rack::Utils.unescape(response["Set-Cookie"].split('=', 2).last.split(';', 2).first.strip)
+  end
+
+  def request_with_cookie(app, key, value)
+    response_for(app: app, cookie: "#{key}=#{value}")
+  end
+
   before do
     # Random key, as a hex string
     @secret = random_encryptor_secret
@@ -390,6 +398,19 @@ describe Rack::Session::Cookie do
     response.body.must_equal ({"counter" => 1}.to_s)
   end
 
+  it 'does not use the encryption secret as an implicit legacy HMAC secret' do
+    forged_payload = Rack::Session::Cookie::Base64::Marshal.new.encode(
+      'session_id' => 'attacker-fixed', 'counter' => 999
+    )
+    forged_digest = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA1.new, @secret, forged_payload)
+    forged_cookie = "rack.session=#{forged_payload}--#{forged_digest}"
+
+    app = [incrementor, { secrets: @secret }]
+    response = response_for(app: app, cookie: forged_cookie)
+
+    response.body.must_equal ({"counter" => 1}.to_s)
+  end
+
   it 'rejects session cookie with different purpose' do
     app = [incrementor, { secrets: @secrets }]
     other_app = [incrementor, { secrets: @secrets, key: 'other' }]
@@ -401,6 +422,122 @@ describe Rack::Session::Cookie do
     response.body.must_equal ({"counter"=>2}.to_s)
 
     response = response_for(app: other_app, cookie: response)
+    response.body.must_equal ({"counter"=>1}.to_s)
+  end
+
+  it 'does not exchange encrypted cookies between applications sharing a secret' do
+    first_app = [incrementor, {
+      secrets: @secret, application_id: 'first-application', key: 'shared.session', path: '/app'
+    }]
+    second_app = [incrementor, {
+      secrets: @secret, application_id: 'second-application', key: 'shared.session', path: '/app'
+    }]
+
+    response = response_for(app: first_app)
+    encrypted_cookie = cookie_value(response)
+
+    response = request_with_cookie(second_app, 'shared.session', encrypted_cookie)
+    response.body.must_equal ({"counter"=>1}.to_s)
+  end
+
+  it 'accepts app_id as an application identifier alias' do
+    first_app = [incrementor, {
+      secrets: @secret, app_id: 'application', key: 'shared.session'
+    }]
+    second_app = [incrementor, {
+      secrets: @secret, app_id: 'other-application', key: 'shared.session'
+    }]
+
+    response = response_for(app: first_app)
+
+    response = request_with_cookie(second_app, 'shared.session', cookie_value(response))
+    response.body.must_equal ({"counter"=>1}.to_s)
+  end
+
+  it 'does not exchange renamed encrypted cookies between applications sharing a secret' do
+    first_app = [incrementor, {
+      secrets: @secret, application_id: 'application', key: 'first.session', path: '/'
+    }]
+    second_app = [incrementor, {
+      secrets: @secret, application_id: 'application', key: 'second.session', path: '/'
+    }]
+
+    response = response_for(app: first_app)
+    encrypted_cookie = cookie_value(response)
+
+    response = request_with_cookie(second_app, 'second.session', encrypted_cookie)
+    response.body.must_equal ({"counter"=>1}.to_s)
+  end
+
+  it 'does not exchange encrypted cookies configured for different paths' do
+    first_app = [incrementor, {
+      secrets: @secret, application_id: 'application', key: 'shared.session', path: '/first'
+    }]
+    second_app = [incrementor, {
+      secrets: @secret, application_id: 'application', key: 'shared.session', path: '/second'
+    }]
+
+    response = response_for(app: first_app)
+    encrypted_cookie = cookie_value(response)
+
+    response = request_with_cookie(second_app, 'shared.session', encrypted_cookie)
+    response.body.must_equal ({"counter"=>1}.to_s)
+  end
+
+  it 'rejects old encrypted cookies when migration is not enabled' do
+    old_app = [incrementor, {
+      secrets: @secret,
+      application_id: 'application',
+      key: 'rack.session',
+      mode: :v2
+    }]
+    new_app = [incrementor, {
+      secrets: @secret,
+      application_id: 'application',
+      key: 'rack.session'
+    }]
+
+    response = response_for(app: old_app)
+    old_cookie = cookie_value(response)
+    Base64.urlsafe_decode64(old_cookie)[0].must_equal "\2"
+
+    response = request_with_cookie(new_app, 'rack.session', old_cookie)
+    response.body.must_equal ({"counter"=>1}.to_s)
+
+    new_cookie = cookie_value(response)
+    Base64.urlsafe_decode64(new_cookie)[0].must_equal "\3"
+
+    response = request_with_cookie(new_app, 'rack.session', new_cookie)
+    response.body.must_equal ({"counter"=>2}.to_s)
+  end
+
+  it 'accepts old encrypted cookies only for the explicitly configured migration scope' do
+    old_app = [incrementor, {
+      secrets: @secret,
+      application_id: 'application',
+      key: 'rack.session',
+      mode: :v2
+    }]
+    migrating_app = [incrementor, {
+      secrets: @secret,
+      application_id: 'application',
+      key: 'rack.session',
+      legacy_mode: :v2
+    }]
+    renamed_app = [incrementor, {
+      secrets: @secret,
+      application_id: 'application',
+      key: 'renamed.session',
+      legacy_mode: :v2
+    }]
+
+    response = response_for(app: old_app)
+    old_cookie = cookie_value(response)
+
+    response = request_with_cookie(migrating_app, 'rack.session', old_cookie)
+    response.body.must_equal ({"counter"=>2}.to_s)
+
+    response = request_with_cookie(renamed_app, 'renamed.session', old_cookie)
     response.body.must_equal ({"counter"=>1}.to_s)
   end
 

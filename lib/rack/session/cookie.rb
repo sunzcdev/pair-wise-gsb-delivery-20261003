@@ -39,13 +39,21 @@ module Rack
     # * :gzip_over
     #     For message data over this many bytes, compress it with the deflate
     #     algorithm.
+    # * :application_id
+    #     An application-defined identifier included in the encrypted cookie's
+    #     authenticated context. Use a different value for applications that
+    #     share a secret.
+    # * :legacy_mode
+    #     Accept old encrypted cookies during an explicit migration. May be
+    #     +false+ (the default), +:v1+, +:v2+ or +true+ to accept V1/V2. New
+    #     cookies are always written in the current format.
     #
     # Refer to Rack::Session::Encryptor for more details on these options.
     #
     # Prior to version TODO, the session hash was stored as base64 encoded
-    # marshalled data. When a :secret option was supplied, the integrity of the
-    # encoded data was protected with HMAC-SHA1. This functionality is still
-    # supported using a set of a legacy options.
+    # marshalled data. When a :legacy_hmac_secret option is supplied, the
+    # integrity of the encoded data is protected with HMAC-SHA1. This explicit
+    # migration option is disabled by default.
     #
     # Lastly, a :coder option is also accepted. When used, both encryption and
     # the legacy HMAC will be skipped. This option could create security issues
@@ -159,9 +167,21 @@ module Rack
       def initialize(app, options = {})
         # support both :secrets and :secret for backwards compatibility
         secrets = [*(options[:secrets] || options[:secret])]
+        application_id = options[:application_id] || options[:app_id] || options[:application]
+        legacy_mode =
+          options[:legacy_mode] ||
+          options[:legacy_version] ||
+          options[:migrate_legacy] ||
+          options[:accept_legacy] ||
+          options[:legacy_encrypted_cookies]
 
         encryptor_opts = {
-          purpose: options[:key], serialize_json: options[:serialize_json]
+          application_id: application_id,
+          purpose: options.fetch(:key, RACK_SESSION),
+          path: options.fetch(:path, '/'),
+          serialize_json: options[:serialize_json],
+          mode: options[:mode],
+          legacy_mode: legacy_mode
         }
 
         # For each secret, create an Encryptor. We have iterate this Array at
@@ -170,12 +190,13 @@ module Rack
           Rack::Session::Encryptor.new secret, encryptor_opts
         end
 
-        # If a legacy HMAC secret is present, initialize those features.
-        # Fallback to :secret for backwards compatibility.
-        if options.has_key?(:legacy_hmac_secret) || options.has_key?(:secret)
+        # Legacy HMAC cookies must be enabled explicitly with the scoped
+        # legacy secret. The encryption :secret is not used as an implicit
+        # migration fallback.
+        if options.has_key?(:legacy_hmac_secret)
           @legacy_hmac = options.fetch(:legacy_hmac, 'SHA1')
 
-          @legacy_hmac_secret = options[:legacy_hmac_secret] || options[:secret]
+          @legacy_hmac_secret = options[:legacy_hmac_secret]
           @legacy_hmac_coder  = options.fetch(:legacy_hmac_coder, Base64::Marshal.new)
         else
           @legacy_hmac = false
