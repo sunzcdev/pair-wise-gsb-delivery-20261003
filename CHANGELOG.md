@@ -7,6 +7,9 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Added a strict mode for `around` steps. Enable it with `strict: true` to make their continuation usable at most once during that invocation; reuse after the around operation returns or from another invocation raises `Dry::Transaction::InvalidContinuationError` before subsequent steps run.
 
 ## [0.16.0] - 2024-01-17
 

@@ -20,6 +20,12 @@ module Dry
       end
     end
 
+    class InvalidContinuationError < ArgumentError
+      def initialize(step_name, reason)
+        super("step +#{step_name}+ continuation #{reason}")
+      end
+    end
+
     class MissingCatchListError < ArgumentError
       def initialize(step_name)
         super("step +#{step_name}+ requires one or more exception classes provided via +catch:+")
