@@ -352,6 +352,168 @@ describe "route_csrf plugin" do
     body('/b/a/b', "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(body('/b/a', 'HTTPS'=>'on', 'HTTP_HOST'=>'foo.com', 'CP'=>'a/b'))}")).must_equal '/b/a/b2'
   end
 
+  it "supports binding CSRF tokens to a field structure" do
+    route_csrf_app do |r|
+      r.get "token-fields" do
+        csrf_token('/foo', 'POST', r.params['f'].to_s.split(','))
+      end
+    end
+
+    token_for = lambda{|fields| body("/token-fields", 'QUERY_STRING'=>"f=#{Rack::Utils.escape(fields.join(','))}")}
+    submit = lambda{|token, query| body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&#{query}"))}
+
+    # All of these tokens are for POST /foo, they differ only in field structure
+    t_ab = token_for.call(%w'a b')
+    t_abc = token_for.call(%w'a b c')
+    t_ab.length.must_be :>, 84
+
+    # tokens bound to a field structure accept submissions using only allowed fields
+    submit.call(t_ab, "a=1&b=2").must_equal 'f'
+    # field values are not bound to the token
+    submit.call(t_ab, "a=x&b=y").must_equal 'f'
+    # parameter order in the submission does not matter
+    submit.call(t_ab, "b=2&a=1").must_equal 'f'
+    # field order when generating the token does not matter either
+    submit.call(token_for.call(%w'b a'), "a=1&b=2").must_equal 'f'
+    # submitting a subset of the allowed fields is allowed
+    submit.call(t_ab, "a=1").must_equal 'f'
+    # repeated fields do not change the field structure
+    submit.call(t_ab, "a=1&a=2").must_equal 'f'
+
+    # submissions with additional fields are rejected
+    proc{submit.call(t_ab, "a=1&b=2&c=3")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+    proc{submit.call(t_ab, "a=1&c=3")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    # a token bound to a larger field structure can be reused for submissions
+    # using a subset of its fields
+    submit.call(t_abc, "a=1&b=2&c=3").must_equal 'f'
+    submit.call(t_abc, "a=1&b=2").must_equal 'f'
+    submit.call(t_abc, "c=3").must_equal 'f'
+    # but a token bound to a smaller field structure cannot be reused for
+    # submissions using additional fields
+    proc{submit.call(t_ab, "a=1&b=2&c=3")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    # query string parameters are part of the submitted field structure
+    proc{body("/foo", "REQUEST_METHOD"=>'POST', 'QUERY_STRING'=>'c=3', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(t_ab)}&a=1&b=2"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    # tokens bound to a field structure are still bound to request method and path
+    proc{body("/bar", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(t_ab)}&a=1"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+    proc{body("/foo", "REQUEST_METHOD"=>'PUT', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(t_ab)}&a=1"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    # tokens not bound to a field structure are not affected
+    token = body("/token/foo")
+    token.length.must_equal 84
+    submit.call(token, "a=1&b=2&c=3").must_equal 'f'
+  end
+
+  it "supports binding CSRF tokens to nested and array field structures" do
+    route_csrf_app do |r|
+      r.get "token-fields" do
+        csrf_token('/foo', 'POST', r.params['f'].to_s.split(','))
+      end
+    end
+
+    token_for = lambda{|fields| body("/token-fields", 'QUERY_STRING'=>"f=#{Rack::Utils.escape(fields.join(','))}")}
+    submit = lambda{|token, query| body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&#{query}"))}
+    esc = Rack::Utils.method(:escape)
+
+    t_user = token_for.call(['user[name]'])
+    submit.call(t_user, "#{esc.call('user[name]')}=x").must_equal 'f'
+    # a scalar field has a different structure than a hash with the same name
+    proc{submit.call(t_user, "user=x")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+    # nested fields that were not declared are rejected
+    proc{submit.call(t_user, "#{esc.call('user[email]')}=x")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+    # deeper nesting has a different structure
+    proc{submit.call(t_user, "#{esc.call('user[name][first]')}=x")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    t_tags = token_for.call(['tags[]'])
+    # any number of array entries is allowed
+    submit.call(t_tags, "#{esc.call('tags[]')}=1").must_equal 'f'
+    submit.call(t_tags, "#{esc.call('tags[]')}=1&#{esc.call('tags[]')}=2&#{esc.call('tags[]')}=3").must_equal 'f'
+    # an array of hashes has a different structure than an array of scalars
+    proc{submit.call(t_tags, "#{esc.call('tags[][name]')}=x")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    t_items = token_for.call(['items[][amount]'])
+    submit.call(t_items, "#{esc.call('items[][amount]')}=1&#{esc.call('items[][amount]')}=2").must_equal 'f'
+    # additional fields in later array entries are rejected
+    proc{submit.call(t_items, "#{esc.call('items[][amount]')}=1&#{esc.call('items[][admin]')}=2")}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+  end
+
+  it "supports binding CSRF tokens to an empty field structure" do
+    route_csrf_app do |r|
+      r.get "token-fields" do
+        csrf_token('/foo', 'POST', [])
+      end
+    end
+    token = body("/token-fields")
+    body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}")).must_equal 'f'
+    proc{body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+  end
+
+  it "rejects tampered field-structure-bound CSRF tokens" do
+    route_csrf_app do |r|
+      r.get "token-fields" do
+        csrf_token('/foo', 'POST', %w'a b')
+      end
+    end
+    token = body("/token-fields")
+    submit = lambda{|t| body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(t)}&a=1&b=2"))}
+    submit.call(token).must_equal 'f'
+
+    t2 = token.dup
+    t2.setbyte(1, t2.getbyte(1) ^ 1)
+    proc{submit.call(t2)}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    t2 = token.dup
+    t2.setbyte(45, t2.getbyte(45) ^ 1)
+    proc{submit.call(t2)}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    t2 = token.dup
+    t2.setbyte(-2, t2.getbyte(-2) ^ 1)
+    proc{submit.call(t2)}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    t2 = token.dup
+    t2[1] = '|'
+    proc{submit.call(t2)}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+  end
+
+  it "supports field-structure-bound CSRF tokens that are not request-specific if :require_request_specific_tokens is false" do
+    route_csrf_app(:require_request_specific_tokens=>false) do |r|
+      r.get "token-fields" do
+        csrf_token(nil, nil, %w'a b')
+      end
+    end
+    token = body("/token-fields")
+    body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1")).must_equal 'f'
+    body("/bar", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1&b=2")).must_equal 'b'
+    proc{body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1&c=2"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+  end
+
+  it "supports field structure binding via csrf_tag and csrf_formaction_tag" do
+    route_csrf_app{csrf_tag('/foo', 'POST', %w'a b')}
+    body =~ /\A<input type="hidden" name="_csrf" value="([+\/0-9A-Za-z]+={0,2})" \/>\z/
+    token = $1
+    body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1&b=2")).must_equal 'f'
+    proc{body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("_csrf=#{Rack::Utils.escape(token)}&a=1&c=2"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+
+    route_csrf_app{csrf_formaction_tag('/foo', 'POST', %w'a b')}
+    body =~ /\A<input type="hidden" name="([^"]+)" value="([+\/0-9A-Za-z]+={0,2})" \/>\z/
+    field = CGI.unescapeHTML($1)
+    token = $2
+    body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("#{Rack::Utils.escape(field)}=#{Rack::Utils.escape(token)}&a=1")).must_equal 'f'
+    proc{body("/foo", "REQUEST_METHOD"=>'POST', 'rack.input'=>rack_input("#{Rack::Utils.escape(field)}=#{Rack::Utils.escape(token)}&a=1&c=2"))}.must_raise Roda::RodaPlugins::RouteCsrf::InvalidToken
+  end
+
+  it "raises an error when binding CSRF tokens to invalid field names" do
+    route_csrf_app do |r|
+      r.get "token-fields" do
+        csrf_token('/foo', 'POST', [r.params['f']])
+      end
+    end
+    proc{body("/token-fields", 'QUERY_STRING'=>"f=a%5B")}.must_raise Roda::RodaError
+    proc{body("/token-fields", 'QUERY_STRING'=>"f=")}.must_raise Roda::RodaError
+  end
+
 begin
   require 'rack/csrf'
 rescue LoadError

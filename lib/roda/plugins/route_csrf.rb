@@ -106,13 +106,17 @@ class Roda
     #                      path, or full URL (using appropriate URL encoding).
     # csrf_tag(path=nil, method='POST') :: An HTML hidden input tag string containing the CSRF token, suitable
     #                                      for placing in an HTML form.  Takes the same arguments as csrf_token.
-    # csrf_token(path=nil, method='POST') :: The value of the csrf token, in case it needs to be accessed
+    # csrf_token(path=nil, method='POST', fields=nil) :: The value of the csrf token, in case it needs to be accessed
     #                                        directly.  It is recommended to call this method with a
     #                                        path, which will create a request-specific token.  Calling
     #                                        this method without an argument will create a token that is
     #                                        not specific to the request, but such a token will only
     #                                        work if you set the :require_request_specific_tokens option
     #                                        to false, which is a bad idea from a security standpoint.
+    #                                        If the fields argument is given, it should be an array of
+    #                                        field names the related form is allowed to submit, and the
+    #                                        token will be bound to that field structure (see the
+    #                                        "Field Structure Binding" section below).
     # use_request_specific_csrf_tokens? :: Whether the plugin is configured to only support
     #                                      request-specific tokens, true by default.
     # valid_csrf?(opts={}) :: Returns whether the submitted CSRF token is valid (also true if
@@ -131,6 +135,35 @@ class Roda
     #                 this method, as the token generated is not request-specific and
     #                 will not work unless you set the :require_request_specific_tokens option to
     #                 false, which is a bad idea from a security standpoint.
+    #
+    # == Field Structure Binding
+    #
+    # By default, CSRF tokens are bound to the request method and path, but not
+    # to the parameters the related form submits.  If multiple forms submit to
+    # the same endpoint, and some forms are allowed to submit more sensitive
+    # fields than others, you can bind a CSRF token to the field structure of
+    # the related form by passing a fields argument when generating the token:
+    #
+    #   csrf_tag('/foo', 'POST', ['name', 'user[email]', 'tags[]'])
+    #
+    # Field names use the same format as HTML input names, with "[]" used for
+    # array entries (e.g. "tags[]" or "items[][amount]").  When a token bound
+    # to a field structure is submitted, check_csrf! additionally verifies
+    # that the submitted parameters only use the allowed fields, rejecting
+    # submissions that include other fields (such as hidden fields an attacker
+    # adds to the form submission).  Submitting only a subset of the allowed
+    # fields is supported, so forms with optional fields (such as checkboxes
+    # that browsers do not submit when unchecked) work as expected.
+    #
+    # Only the field structure is bound to the token, not the field values,
+    # and neither parameter order nor array indices nor repeated fields affect
+    # the field structure.  The CSRF token fields themselves are excluded from
+    # the field structure.
+    #
+    # Field structure binding is optional.  Tokens generated without a fields
+    # argument use the same format as before and are verified without a field
+    # structure check, so using field structure binding for some forms does
+    # not affect other forms.
     #
     # == Token Cryptography
     #
@@ -157,6 +190,21 @@ class Roda
     # By using an HMAC for tokens not specific to a request, it is not possible to use a
     # valid CSRF token that is not specific to a request to generate a valid request-specific
     # CSRF token.  
+    #
+    # For CSRF tokens bound to a field structure, this pseudocode generates the HMAC:
+    #
+    #   hmac = HMAC(secret, "F\n" + method + "\n" + path + "\n" + canonical_field_structure + "\n" + random_data)
+    #
+    # This pseudocode generates the final CSRF token in that case:
+    #
+    #   token = Base64Encode(random_data + canonical_field_structure + hmac)
+    #
+    # The canonical field structure is a deterministic serialization of the
+    # allowed field paths, using byte-length prefixed path segments, so it
+    # does not depend on field order and cannot be ambiguous for unusual
+    # field names.  The different HMAC message format ensures tokens bound
+    # to a field structure cannot be used as tokens not bound to a field
+    # structure, and vice versa.
     #
     # By including random data in the HMAC for all tokens, different tokens are generated
     # each time, mitigating compression ratio attacks such as BREACH.
@@ -305,9 +353,25 @@ class Roda
         # argument.  By default, it a path is provided, the POST request method will
         # be assumed.  To generate a token for a non-POST request method, pass the
         # method as the second argument.
-        def csrf_token(path=nil, method=('POST' if path))
+        #
+        # If the fields argument is given, it should be an array of strings or
+        # symbols specifying the names of the fields the related form is allowed
+        # to submit, using the same format as HTML input names (e.g. "name",
+        # "user[email]", or "tags[]").  The generated token will be bound to the
+        # given field structure, and check_csrf! will additionally verify that
+        # the submitted parameters only use the given fields.  Only the field
+        # structure is bound to the token, not the field values, and array
+        # indices are not part of the field structure, so "tags[]" allows
+        # submitting any number of "tags[]" entries.
+        def csrf_token(path=nil, method=('POST' if path), fields=nil)
           token = SecureRandom.random_bytes(31)
-          token << csrf_hmac(token, method, path)
+          if fields
+            field_structure = csrf_canonical_field_structure(fields)
+            hmac = csrf_field_hmac(token, method, path, field_structure)
+            token << field_structure << hmac
+          else
+            token << csrf_hmac(token, method, path)
+          end
           [token].pack("m0")
         end
 
@@ -368,30 +432,50 @@ class Roda
 
           # 31 byte random initialization vector
           # 32 byte HMAC
-          # 63 bytes total
-          # 84 bytes when base64 encoded
-          unless encoded_token.bytesize == 84
+          # 63 bytes total (84 bytes when base64 encoded) for tokens that are
+          # not bound to a field structure.  Tokens bound to a field structure
+          # also contain the canonical field structure between the random data
+          # and the HMAC, and are therefore longer.
+          unless encoded_token.bytesize >= 84
             return "encoded token length is not 84"
           end
 
           begin
-            submitted_hmac = Base64_.decode64(encoded_token)
+            submitted_token = Base64_.decode64(encoded_token)
           rescue ArgumentError
             return "encoded token is not valid base64"
           end
 
-          random_data = submitted_hmac.slice!(0...31)
+          unless submitted_token.bytesize >= 63
+            return "encoded token length is not 84"
+          end
 
-          if csrf_compare(csrf_hmac(random_data, method, path), submitted_hmac)
+          random_data = submitted_token.byteslice(0, 31)
+          submitted_hmac = submitted_token.byteslice(-32, 32)
+          field_structure = submitted_token.byteslice(31...-32)
+
+          if field_structure.empty? && csrf_compare(csrf_hmac(random_data, method, path), submitted_hmac)
             return
+          end
+
+          if csrf_compare(csrf_field_hmac(random_data, method, path, field_structure), submitted_hmac)
+            return if csrf_valid_field_structure?(field_structure, opts)
+            return "submitted parameters include fields not allowed by the CSRF token"
           end
 
           if opts[:require_request_specific_tokens]
             "decoded token is not valid for request method and path"
           else
-            unless csrf_compare(csrf_hmac(random_data, '', ''), submitted_hmac)
-              "decoded token is not valid for either request method and path or for blank method and path"
+            if field_structure.empty? && csrf_compare(csrf_hmac(random_data, '', ''), submitted_hmac)
+              return
             end
+
+            if csrf_compare(csrf_field_hmac(random_data, '', '', field_structure), submitted_hmac)
+              return if csrf_valid_field_structure?(field_structure, opts)
+              return "submitted parameters include fields not allowed by the CSRF token"
+            end
+
+            "decoded token is not valid for either request method and path or for blank method and path"
           end
         end
         
@@ -408,6 +492,105 @@ class Roda
         # Return the HMAC-SHA-256 for the secret and the given arguments.
         def csrf_hmac(random_data, method, path)
           OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, csrf_secret, "#{method.to_s.upcase}#{path}#{random_data}")
+        end
+
+        # Return the HMAC-SHA-256 for a CSRF token bound to a field structure.
+        # This uses a different message format than csrf_hmac, so that tokens
+        # bound to a field structure cannot be used as tokens not bound to a
+        # field structure, and vice versa.
+        def csrf_field_hmac(random_data, method, path, field_structure)
+          OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, csrf_secret, "F\n#{method.to_s.upcase}\n#{path}\n#{field_structure}\n#{random_data}")
+        end
+
+        # Return the canonical field structure for the given array of field
+        # names.  The canonical field structure is a deterministic
+        # serialization of the field paths, so it does not depend on the
+        # order the fields are given in.
+        def csrf_canonical_field_structure(fields)
+          paths = fields.map{|field| csrf_serialize_field_path(csrf_parse_field_name(field))}
+          paths.uniq!
+          paths.sort!
+          paths.map{|path| "#{path.bytesize}:#{path}"}.join
+        end
+
+        # Parse a field name in HTML input name format (such as "foo[bar][]")
+        # into an array of field path segments.  Array entries are represented
+        # by empty segments.
+        def csrf_parse_field_name(field)
+          field = field.to_s
+          segments = []
+          rest = field
+          until rest.empty?
+            if segments.empty? && rest[0] != '['
+              if i = rest.index('[')
+                segments << rest.byteslice(0...i)
+                rest = rest.byteslice(i..-1)
+              else
+                segments << rest
+                rest = ''
+              end
+            elsif match = /\A\[([^\[\]]*)\]/.match(rest)
+              segments << match[1]
+              rest = match.post_match
+            else
+              raise RodaError, "invalid field name passed to csrf_token: #{field.inspect}"
+            end
+          end
+          raise RodaError, "empty field name passed to csrf_token" if segments.empty?
+          segments
+        end
+
+        # Serialize a field path (array of segments) into a string.  Each
+        # segment is byte-length prefixed, so field names containing
+        # separator characters cannot change the meaning of the
+        # serialization.
+        def csrf_serialize_field_path(segments)
+          segments.map{|segment| "#{segment.bytesize}:#{segment}"}.join(',')
+        end
+
+        # Append serialized field paths for the given parameter value to the
+        # paths array.  Hash values are recursed into with the key appended
+        # to the current path, array values are recursed into with an empty
+        # segment appended to the current path (so array indices are not part
+        # of the field structure), and other values are treated as leaf
+        # fields.  Top-level fields in the exclude array are skipped (used to
+        # exclude the CSRF token fields).
+        def csrf_accumulate_field_paths(value, segments, paths, exclude=nil)
+          case value
+          when Hash
+            value.each do |k, v|
+              k = k.to_s
+              next if exclude && exclude.include?(k)
+              csrf_accumulate_field_paths(v, segments + [k], paths)
+            end
+          when Array
+            value.each do |v|
+              csrf_accumulate_field_paths(v, segments + [''], paths)
+            end
+          else
+            paths << csrf_serialize_field_path(segments)
+          end
+        end
+
+        # Whether the fields used by the submitted parameters are all allowed
+        # by the canonical field structure bound to the CSRF token.  The CSRF
+        # token fields themselves are excluded from the check.
+        def csrf_valid_field_structure?(field_structure, opts)
+          allowed = {}
+          until field_structure.empty?
+            i = field_structure.index(':')
+            length = field_structure.byteslice(0...i).to_i
+            allowed[field_structure.byteslice(i + 1, length)] = true
+            field_structure = field_structure.byteslice(i + 1 + length..-1) || ''
+          end
+
+          exclude = [opts[:field].to_s, opts[:formaction_field].to_s]
+          paths = []
+          csrf_accumulate_field_paths(@_request.params, [], paths, exclude)
+          paths.each do |path|
+            return false unless allowed[path]
+          end
+          true
         end
 
         # If a secret has not already been specified, generate a random 32-byte
