@@ -121,6 +121,27 @@ Or install it yourself as:
     header['Set-Cookie'] = cookie2.set_cookie_value
 
 
+    ########################
+    # Proxy side example
+    ########################
+
+    # Parse a Set-Cookie value without losing the original attribute
+    # order, spelling or unknown extension attributes
+    set_cookie = HTTP::Cookie::SetCookie.new(
+      'uid=u12345; Path=/; X-Custom="a;b"; Secure')
+
+    # Adjust a known attribute; only the first occurrence is
+    # rewritten in place and duplicates are dropped, while every
+    # other segment is serialized back byte-for-byte
+    set_cookie.expires = Time.now + 7*86400
+
+    # Get the semantic view as an HTTP::Cookie when needed
+    cookie = set_cookie.to_cookie(my_url)
+
+    # Replace the Set-Cookie response header
+    header['Set-Cookie'] = set_cookie.to_s
+
+
 ## Incompatibilities with Mechanize::Cookie/CookieJar
 
 There are several incompatibilities between
