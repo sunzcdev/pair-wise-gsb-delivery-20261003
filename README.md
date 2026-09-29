@@ -52,6 +52,17 @@ For standard use you can just pass it the content of a file and call render with
 @template.render('name' => 'tobi')                # => "hi tobi"
 ```
 
+### Streaming rendering
+
+For large output you can stream the rendered chunks instead of building one
+big string. `render_each` yields every chunk as soon as it is produced, and
+rendering only advances while you consume, so you can stop early at any point:
+
+```ruby
+@template.render_each('name' => 'tobi') { |chunk| io.write(chunk) }
+@template.render_each('name' => 'tobi').first(3) # => first 3 chunks, then rendering stops
+```
+
 ### Concept of Environments
 
 In Liquid, a "Environment" is a scoped environment that encapsulates custom tags, filters, and other configurations. This allows you to define and isolate different sets of functionality for different contexts, avoiding global overrides that can lead to conflicts and unexpected behavior.

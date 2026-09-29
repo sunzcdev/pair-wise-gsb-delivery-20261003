@@ -141,6 +141,63 @@ module Liquid
     def render(*args)
       return '' if @root.nil?
 
+      context, output = build_context(args)
+      render_with_context(context, output || +'')
+    end
+
+    # Renders the template incrementally, delivering chunks of output as they
+    # are produced instead of concatenating everything into one big string.
+    #
+    # When called with a block, every chunk is yielded as soon as it is
+    # rendered; use +break+ to stop rendering early. When called without a
+    # block, a lazy Enumerator is returned and rendering only advances as
+    # chunks are pulled from it, so resource limit counting and Drop accesses
+    # only reflect what was actually consumed. Nothing is rendered in the
+    # background once the consumer stops.
+    #
+    # Tags that need their complete body (like {% capture %}) buffer their own
+    # content locally; everything else (variables, filters, loops, {% render %})
+    # is streamed with the same semantics as #render.
+    #
+    # Accepts the same arguments as #render, except the :output option which
+    # is ignored because chunks are delivered to the caller directly.
+    #
+    #   template.render_each('user_name' => 'bob') { |chunk| io.write(chunk) }
+    #   template.render_each('user_name' => 'bob').first(3) # => first 3 chunks
+    #
+    def render_each(*args)
+      return enum_for(:render_each, *args) unless block_given?
+      return if @root.nil?
+
+      context, = build_context(args)
+
+      output = StreamOutput.new { |chunk| yield chunk }
+      result = render_with_context(context, output)
+      # A String result means a MemoryError was handled; deliver its message
+      # as the final chunk.
+      yield result if result.is_a?(String) && !result.empty?
+      nil
+    end
+
+    # Like #render_each, but exceptions raised while rendering are re-raised
+    # to the consumer at the position where they occur (see #render!).
+    def render_each!(*args, &block)
+      @rethrow_errors = true
+      render_each(*args, &block)
+    end
+
+    def render!(*args)
+      @rethrow_errors = true
+      render(*args)
+    end
+
+    def render_to_output_buffer(context, output)
+      render(context, output: output)
+    end
+
+    private
+
+    def build_context(args)
       context = case args.first
       when Liquid::Context
         c = args.shift
@@ -189,6 +246,10 @@ module Liquid
 
       context.template_name ||= name
 
+      [context, output]
+    end
+
+    def render_with_context(context, output)
       previous_error_mode = context.registers.static[:template_error_mode]
       context.registers.static[:template_error_mode] = @error_mode
 
@@ -206,17 +267,6 @@ module Liquid
         @errors = context.errors
       end
     end
-
-    def render!(*args)
-      @rethrow_errors = true
-      render(*args)
-    end
-
-    def render_to_output_buffer(context, output)
-      render(context, output: output)
-    end
-
-    private
 
     def configure_options(options)
       if (profiling = options[:profile])
