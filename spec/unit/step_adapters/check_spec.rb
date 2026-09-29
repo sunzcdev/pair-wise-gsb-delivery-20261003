@@ -11,12 +11,12 @@ RSpec.describe Dry::Transaction::StepAdapters::Check, :adapter do
 
   describe "#call" do
     it "returns the result of the operation as output" do
-      expect(subject.(operation, options, ["right"])).to eql(Success("right"))
+      expect(subject.(operation, options, ["right"], {})).to eql(Success("right"))
     end
 
     context "when check fails" do
       it "return a Failure" do
-        expect(subject.(operation, options, ["wrong"])).to eql(Failure("wrong"))
+        expect(subject.(operation, options, ["wrong"], {})).to eql(Failure("wrong"))
       end
     end
 
@@ -26,7 +26,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Check, :adapter do
       }
 
       it "return a Success" do
-        expect(subject.(operation, options, ["input"])).to eql(Success("input"))
+        expect(subject.(operation, options, ["input"], {})).to eql(Success("input"))
       end
     end
 
@@ -36,7 +36,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Check, :adapter do
       }
 
       it "return a Failure" do
-        expect(subject.(operation, options, ["input"])).to eql(Failure("input"))
+        expect(subject.(operation, options, ["input"], {})).to eql(Failure("input"))
       end
     end
   end

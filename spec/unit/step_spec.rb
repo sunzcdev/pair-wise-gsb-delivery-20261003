@@ -118,6 +118,25 @@ RSpec.describe Dry::Transaction::Step do
         expect(new_step.call_args).to_not eq step.call_args
       end
     end
+
+    context "with call_kwargs argument" do
+      let(:call_kwargs) { {mode: "x"} }
+      it "returns new instance with only call_kwargs changed" do
+        new_step = step.with(call_kwargs: call_kwargs)
+        expect(new_step).to_not eq step
+        expect(new_step.operation_name).to eq step.operation_name
+        expect(new_step.call_kwargs).to eq call_kwargs
+        expect(new_step.call_args).to eq step.call_args
+      end
+    end
+
+    context "with chained call_args and call_kwargs" do
+      it "preserves both argument sets" do
+        new_step = step.with(call_args: [12]).with(call_kwargs: {mode: "x"})
+        expect(new_step.call_args).to eq [12]
+        expect(new_step.call_kwargs).to eq(mode: "x")
+      end
+    end
   end
 
   describe "#arity" do
@@ -138,6 +157,16 @@ RSpec.describe Dry::Transaction::Step do
       end
 
       it { is_expected.to eq 3 }
+    end
+  end
+
+  describe "#parameters" do
+    subject { step.parameters }
+
+    context "when operation has positional and keyword parameters" do
+      let(:operation) { -> (input, mode:) { [input, mode] } }
+
+      it { is_expected.to eq [[:req, :input], [:keyreq, :mode]] }
     end
   end
 end

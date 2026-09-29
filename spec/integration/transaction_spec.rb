@@ -471,13 +471,11 @@ RSpec.describe "Transactions" do
   end
 
   context "keyword arguments" do
-    let(:input) { {name: "jane", age: 20} }
-
     let(:upcaser) do
       Class.new {
         include Dry::Monads[:result]
 
-        def call(name: "John", **rest)
+        def call(input, name: "John", **rest)
           Success({name: name[0].upcase + name[1..], **rest})
         end
       }.new
@@ -492,7 +490,9 @@ RSpec.describe "Transactions" do
     end
 
     it "calls the operations" do
-      expect(transaction.(input).value!).to eql(name: "Jane", age: 20)
+      result = transaction.with_step_args(camelize: {name: "jane", age: 20}).(nil)
+
+      expect(result.value!).to eql(name: "Jane", age: 20)
     end
   end
 

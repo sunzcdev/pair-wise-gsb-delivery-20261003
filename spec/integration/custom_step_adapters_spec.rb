@@ -27,7 +27,7 @@ RSpec.describe "Custom step adapters" do
       class CustomStepAdapters < Dry::Transaction::StepAdapters
         extend Dry::Monads[:result]
 
-        register :enqueue, -> operation, _options, args {
+        register :enqueue, -> operation, _options, args, _kwargs {
           Test::QUEUE << operation.(*args)
           Success(args[0])
         }

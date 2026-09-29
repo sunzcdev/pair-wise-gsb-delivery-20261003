@@ -7,6 +7,26 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- `with_step_args` now formally supports Ruby keyword arguments. Step arguments
+  are stored and passed as separate positional and keyword sets: pass an Array
+  for positional arguments, a Hash for keyword arguments, or a two-element
+  `[Array, Hash]` pair for both. Keyword arguments are threaded through
+  internal methods, external callables, and all step adapters (including
+  `around`), and are preserved when steps are carried over into new
+  transactions.
+- Step arguments are validated against each operation's actual signature
+  (required/optional positional, required keyword, and keyrest parameters)
+  before any step runs. Errors name the offending step.
+
+### Changed
+
+- A trailing Hash in positional step arguments (or a Hash input) is no longer
+  implicitly converted to keyword arguments. Pass keyword arguments explicitly
+  via `with_step_args` instead.
+- Custom step adapters now receive keyword arguments as a fourth parameter:
+  `call(operation, options, args, kwargs)`.
 
 ## [0.16.0] - 2024-01-17
 

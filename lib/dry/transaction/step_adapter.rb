@@ -39,8 +39,8 @@ module Dry
         @yields
       end
 
-      def call(args, &block)
-        adapter.(operation, options, args, &block)
+      def call(args, kwargs, &block)
+        adapter.(operation, options, args, kwargs, &block)
       end
 
       def with(operation = self.operation, new_options = {})

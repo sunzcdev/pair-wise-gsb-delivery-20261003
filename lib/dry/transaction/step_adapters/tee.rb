@@ -7,8 +7,8 @@ module Dry
       class Tee
         include Dry::Monads[:result]
 
-        def call(operation, _options, args)
-          operation.(*args)
+        def call(operation, _options, args, kwargs)
+          operation.(*args, **kwargs)
           Success(args[0])
         end
       end

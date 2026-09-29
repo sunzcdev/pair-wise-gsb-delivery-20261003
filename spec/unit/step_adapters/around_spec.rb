@@ -21,7 +21,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Around, :adapter do
 
       it "raises an InvalidResultError" do
         expect {
-          subject.(operation, options, ["input"], &continue)
+          subject.(operation, options, ["input"], {}, &continue)
         }.to raise_error(
           Dry::Transaction::InvalidResultError,
           "step +unit+ must return a Result object"
@@ -31,7 +31,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Around, :adapter do
 
     context "passing a block" do
       it "returns a Success value with result from block" do
-        expect(subject.(operation, options, ["input"], &continue)).to eql(Success("INPUT terminated"))
+        expect(subject.(operation, options, ["input"], {}, &continue)).to eql(Success("INPUT terminated"))
       end
     end
 
@@ -41,7 +41,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Around, :adapter do
       }
 
       it "return a Failure value" do
-        expect(subject.(operation, options, ["input"], &continue)).to eql(Failure("INPUT"))
+        expect(subject.(operation, options, ["input"], {}, &continue)).to eql(Failure("INPUT"))
       end
     end
   end

@@ -11,7 +11,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Map, :adapter do
 
   describe "#call" do
     it "return a Success value" do
-      expect(subject.(operation, options, "input")).to eql(Success("INPUT"))
+      expect(subject.(operation, options, "input", {})).to eql(Success("INPUT"))
     end
   end
 end

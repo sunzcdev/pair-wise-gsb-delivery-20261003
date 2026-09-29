@@ -13,7 +13,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Raw, adapter: true do
 
       it "raises an InvalidResultError" do
         expect {
-          subject.(operation, options, "input")
+          subject.(operation, options, "input", {})
         }.to raise_error(
           Dry::Transaction::InvalidResultError,
           "step +unit+ must return a Result object"
@@ -27,7 +27,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Raw, adapter: true do
       }
 
       it "return a Success value" do
-        expect(subject.(operation, options, "input")).to eql(Success("INPUT"))
+        expect(subject.(operation, options, "input", {})).to eql(Success("INPUT"))
       end
     end
   end

@@ -9,12 +9,12 @@ module Dry
       class Try
         include Dry::Monads[:result]
 
-        def call(operation, options, args)
+        def call(operation, options, args, kwargs)
           unless options[:catch]
             raise MissingCatchListError, options[:step_name]
           end
 
-          result = operation.(*args)
+          result = operation.(*args, **kwargs)
           Success(result)
         rescue *Array(options[:catch]) => exception
           exception = options[:raise].new(exception.message) if options[:raise]

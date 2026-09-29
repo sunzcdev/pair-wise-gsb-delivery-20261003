@@ -24,7 +24,7 @@ module Dry
       end
 
       def call(input = nil, &block)
-        assert_step_arity
+        assert_step_args
 
         result = stack.(Success(input))
 
@@ -56,8 +56,9 @@ module Dry
         assert_valid_step_args(step_args)
 
         new_steps = steps.map { |step|
-          if step_args[step.name]
-            step.with(call_args: step_args[step.name])
+          if step_args.key?(step.name)
+            call_args, call_kwargs = extract_step_args(step.name, step_args[step.name])
+            step.with(call_args: call_args, call_kwargs: call_kwargs)
           else
             step
           end
@@ -107,15 +108,70 @@ module Dry
         end
       end
 
-      def assert_step_arity
+      # Extracts positional and keyword arguments from a `with_step_args` value:
+      #
+      # - an Array is a list of positional arguments
+      # - a Hash is a set of keyword arguments
+      # - a two-element `[Array, Hash]` pair provides both positional and
+      #   keyword arguments
+      def extract_step_args(step_name, value)
+        case value
+        when Hash
+          [[], value]
+        when Array
+          if value.size == 2 && value[0].is_a?(Array) && value[1].is_a?(Hash)
+            value
+          else
+            [value, {}]
+          end
+        else
+          raise ArgumentError,
+            "step arguments for +#{step_name}+ must be an Array of positional " \
+            "arguments or a Hash of keyword arguments"
+        end
+      end
+
+      # Checks every step's supplied arguments against its operation's actual
+      # signature before any step is run, so argument errors are raised up
+      # front rather than partway through the transaction.
+      def assert_step_args
         steps.each do |step|
-          num_args_required = step.arity >= 0 ? step.arity : ~step.arity
+          parameters = step.parameters
+
+          num_args_required = parameters.count { |type, _| type == :req }
           num_args_supplied = step.call_args.length + 1 # add 1 for main `input`
 
           if num_args_required > num_args_supplied
             raise ArgumentError, "not enough arguments supplied for step +#{step.name}+"
           end
+
+          assert_step_kwargs(step, parameters)
         end
+      end
+
+      def assert_step_kwargs(step, parameters)
+        keyreq = parameters.select { |type, _| type == :keyreq }.map(&:last)
+        missing = keyreq - step.call_kwargs.keys
+
+        unless missing.empty?
+          raise ArgumentError,
+            "missing keyword arguments #{format_kwargs(missing)} for step +#{step.name}+"
+        end
+
+        return if step.call_kwargs.empty?
+        return if parameters.any? { |type, _| type == :keyrest }
+
+        accepted = parameters.select { |type, _| type == :key || type == :keyreq }.map(&:last)
+        unknown = step.call_kwargs.keys - accepted
+
+        unless unknown.empty?
+          raise ArgumentError,
+            "unknown keyword arguments #{format_kwargs(unknown)} for step +#{step.name}+"
+        end
+      end
+
+      def format_kwargs(names)
+        names.map { |name| ":#{name}" }.join(", ")
       end
     end
   end

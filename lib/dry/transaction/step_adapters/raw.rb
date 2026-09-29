@@ -9,8 +9,8 @@ module Dry
     class StepAdapters
       # @api private
       class Raw < Around
-        def call(operation, options, args)
-          super(operation, options, args, &nil)
+        def call(operation, options, args, kwargs)
+          super(operation, options, args, kwargs, &nil)
         end
       end
 

@@ -7,8 +7,8 @@ module Dry
       class Map
         include Dry::Monads[:result]
 
-        def call(operation, _options, args)
-          Success(operation.(*args))
+        def call(operation, _options, args, kwargs)
+          Success(operation.(*args, **kwargs))
         end
       end
 

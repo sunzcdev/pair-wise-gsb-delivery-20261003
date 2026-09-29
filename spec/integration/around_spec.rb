@@ -15,13 +15,13 @@ RSpec.describe "around steps" do
         end
       }
 
-      register :persist_user do |user:, **other|
-        self[:database] << [:user, user]
-        Success(other)
+      register :persist_user do |input|
+        self[:database] << [:user, input[:user]]
+        Success(input)
       end
 
-      register :persist_account do |account:|
-        self[:database] << [:account, account]
+      register :persist_account do |input|
+        self[:database] << [:account, input[:account]]
         Success(true)
       end
     end

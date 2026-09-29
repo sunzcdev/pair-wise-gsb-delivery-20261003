@@ -24,7 +24,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Try do
 
       it "raises an ArgumentError" do
         expect {
-          subject.(operation, options, ["something"])
+          subject.(operation, options, ["something"], {})
         }.to raise_error(
           Dry::Transaction::MissingCatchListError,
           "step +unit+ requires one or more exception classes provided via +catch:+"
@@ -35,11 +35,11 @@ RSpec.describe Dry::Transaction::StepAdapters::Try do
     context "with the :catch option" do
       context "when the error was raised" do
         it "returns a Failure value" do
-          expect(subject.(operation, options, [1234])).to be_a_failure
+          expect(subject.(operation, options, [1234], {})).to be_a_failure
         end
 
         it "returns the raised error as output" do
-          result = subject.(operation, options, [1234])
+          result = subject.(operation, options, [1234], {})
           expect(result.failure).to be_a Test::NotValidError
           expect(result.failure.message).to eql("not a string")
         end
@@ -53,11 +53,11 @@ RSpec.describe Dry::Transaction::StepAdapters::Try do
           }
 
           it "returns a Failure value" do
-            expect(subject.(operation, options, [1234])).to be_a_failure
+            expect(subject.(operation, options, [1234], {})).to be_a_failure
           end
 
           it "returns the error specified by :raise as output" do
-            result = subject.(operation, options, [1234])
+            result = subject.(operation, options, [1234], {})
             expect(result.failure).to be_a Test::BetterNamingError
             expect(result.failure.message).to eql("not a string")
           end
@@ -66,7 +66,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Try do
 
       context "when the error was NOT raised" do
         it "returns a Success value" do
-          expect(subject.(operation, options, ["input"])).to eql(Success("INPUT"))
+          expect(subject.(operation, options, ["input"], {})).to eql(Success("INPUT"))
         end
 
         context "when using the :raise option" do
@@ -78,7 +78,7 @@ RSpec.describe Dry::Transaction::StepAdapters::Try do
           }
 
           it "returns a Success value" do
-            expect(subject.(operation, options, ["input"])).to eql(Success("INPUT"))
+            expect(subject.(operation, options, ["input"], {})).to eql(Success("INPUT"))
           end
         end
       end
