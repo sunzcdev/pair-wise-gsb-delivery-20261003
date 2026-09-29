@@ -24,6 +24,7 @@ const (
 	disallowUnknownFieldsFlag
 	usePreallocateValues
 	disableAllocLimitFlag
+	rejectDuplicateMapKeysFlag
 )
 
 type bufReader interface {
@@ -181,6 +182,16 @@ func (d *Decoder) DisableAllocLimit(on bool) {
 		d.flags |= disableAllocLimitFlag
 	} else {
 		d.flags &= ^disableAllocLimitFlag
+	}
+}
+
+// DisallowDuplicateMapKeys causes DecodeOrderedMap to reject maps containing
+// semantically equal keys. By default duplicate keys are preserved in order.
+func (d *Decoder) DisallowDuplicateMapKeys(on bool) {
+	if on {
+		d.flags |= rejectDuplicateMapKeysFlag
+	} else {
+		d.flags &= ^rejectDuplicateMapKeysFlag
 	}
 }
 
