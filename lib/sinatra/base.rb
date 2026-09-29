@@ -297,7 +297,7 @@ module Sinatra
         def block.each; yield(call) end
         response.body = block
       elsif value
-        unless request.head? || value.is_a?(Rack::Files::BaseIterator) || value.is_a?(Stream)
+        unless request.head? || value.is_a?(Rack::Files::BaseIterator) || value.is_a?(Stream) || value.is_a?(SSE)
           headers.delete 'content-length'
         end
         response.body = value
@@ -505,6 +505,217 @@ module Sinatra
       end
     end
 
+    # A pull-based Rack body for Server-Sent Events.
+    class SSE
+      class ClosedError < StandardError
+        def initialize
+          super('SSE stream is closed')
+        end
+      end
+
+      HEARTBEAT_FRAME = ": heartbeat\n\n"
+
+      def initialize(
+        producer = nil,
+        heartbeat: nil,
+        clock: Time,
+        &block
+      )
+        producer ||= block
+        raise ArgumentError, 'a producer block is required' unless producer
+
+        @producer = producer
+        @heartbeat_interval = normalize_heartbeat_interval(heartbeat)
+        @clock = clock
+        @callbacks = []
+        @cancel_callbacks = []
+        @closed = false
+        @canceled = false
+        @fiber = nil
+        @finished = false
+        @started = false
+        @last_heartbeat = nil
+        @heartbeat_sent = false
+      end
+
+      def each(&front)
+        raise ArgumentError, 'a block is required' unless block_given?
+
+        start
+        producer_error = nil
+        until finished?
+          frame =
+            begin
+              next_frame
+            rescue Exception
+              producer_error = $!
+              @finished = true
+              raise
+            end
+          break unless frame
+
+          front.call(frame)
+        end
+      ensure
+        if producer_error
+          @closed = true
+          @callbacks.each(&:call)
+        else
+          close
+        end
+      end
+
+      def event(data = nil, id: nil, event: nil, retry: nil)
+        id = validate_field!(:id, id)
+        event = validate_field!(:event, event)
+        retry_ms = validate_retry!(binding.local_variable_get(:retry))
+
+        frame = +''
+        unless data.nil?
+          data.to_s.split(/\r\n|\r|\n/, -1).each { |line| frame << "data: #{line}\n" }
+        end
+        frame << "id: #{id}\n" unless id.nil?
+        frame << "event: #{event}\n" unless event.nil?
+        frame << "retry: #{retry_ms}\n" unless retry_ms.nil?
+        frame << "\n"
+
+        submit(frame)
+      end
+
+      def comment(text)
+        text = text.to_s
+        reject_newlines!(:comment, text)
+        submit(comment_frame(text))
+      end
+
+      def heartbeat(text = 'heartbeat')
+        comment(text)
+      end
+
+      def close
+        return if closed?
+
+        @closed = true
+        @canceled = !@finished && (!@fiber || @fiber.alive?)
+        begin
+          resume_producer if @fiber&.alive?
+        rescue ClosedError
+          @finished = true
+        end
+        @cancel_callbacks.each(&:call) if @canceled
+        @callbacks.each(&:call)
+      end
+
+      def on_close(&block)
+        return block.call if closed?
+
+        @callbacks << block
+      end
+
+      def on_cancel(&block)
+        return block.call if closed? && @canceled
+
+        @cancel_callbacks << block
+      end
+
+      def closed?
+        @closed
+      end
+
+      private
+
+      def start
+        return if @started
+
+        @started = true
+        return if closed?
+
+        @last_heartbeat = now
+        @fiber = Fiber.new do
+          @producer.call(self)
+          @finished = true
+        end
+      end
+
+      def next_frame
+        return nil if finished?
+
+        if heartbeat_frame_due? && !@heartbeat_sent
+          @heartbeat_sent = true
+          frame = HEARTBEAT_FRAME
+        else
+          @heartbeat_sent = false
+          frame = resume_producer
+        end
+        return nil if finished?
+
+        @last_heartbeat = now
+        frame
+      end
+
+      def resume_producer
+        @fiber.resume
+      end
+
+      def submit(frame)
+        raise ClosedError if closed?
+        raise RuntimeError, 'SSE events can only be emitted while the body is being enumerated' unless @fiber
+
+        @heartbeat_sent = false
+        Fiber.yield(frame)
+        return if closed?
+
+        frame
+      end
+
+      def comment_frame(text)
+        text.empty? ? ":\n\n" : ": #{text}\n\n"
+      end
+
+      def heartbeat_frame_due?
+        @heartbeat_interval && now - @last_heartbeat >= @heartbeat_interval
+      end
+
+      def now
+        @clock.respond_to?(:now) ? @clock.now : @clock.call
+      end
+
+      def finished?
+        @finished || !@fiber || !@fiber.alive?
+      end
+
+      def normalize_heartbeat_interval(value)
+        return nil if value.nil? || value == false
+
+        value = Float(value)
+        raise ArgumentError, 'heartbeat interval must be greater than or equal to 0' if value.negative?
+
+        value
+      end
+
+      def validate_field!(name, value)
+        return if value.nil?
+
+        value = value.to_s
+        reject_newlines!(name, value)
+        value
+      end
+
+      def validate_retry!(value)
+        return nil if value.nil?
+
+        reject_newlines!(:retry, value.to_s) if String === value
+        retry_ms = Integer(value)
+        raise ArgumentError, 'retry must be greater than or equal to 0' if retry_ms.negative?
+
+        retry_ms
+      end
+
+      def reject_newlines!(name, value)
+        raise ArgumentError, "#{name} cannot contain line breaks" if /[\r\n]/.match?(value)
+      end
+    end
+
     # Allows to start sending data to the client even though later parts of
     # the response body have not yet been generated.
     #
@@ -523,6 +734,14 @@ module Sinatra
         Stream.new(scheduler, keep_open) { |out| with_params(current) { yield(out) } }
       end
       body stream
+    end
+
+    # Returns a pull-based Server-Sent Events response body.
+    def sse(heartbeat: nil, clock: Time, &block)
+      response['content-type'] ||= 'text/event-stream'
+      current = @params.dup
+      producer = proc { |stream| with_params(current) { yield(stream) } }
+      body SSE.new(producer, heartbeat: heartbeat, clock: clock)
     end
 
     # Specify response freshness policy for HTTP caches (Cache-Control header).
@@ -739,6 +958,8 @@ module Sinatra
   #   :scope          If set, template is evaluate with the binding of the given
   #                   object rather than the application instance.
   #   :views          Views directory to use.
+  SSE = Helpers::SSE
+
   module Templates
     module ContentTyped
       attr_accessor :content_type
