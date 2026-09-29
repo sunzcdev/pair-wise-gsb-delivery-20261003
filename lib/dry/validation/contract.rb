@@ -65,6 +65,11 @@ module Dry
       #   @api public
       option :default_context, default: -> { EMPTY_HASH }
 
+      # @!attribute [r] transactional_context
+      #   @return [Bool] Whether context changes are rolled back when a rule fails
+      #   @api public
+      option :transactional_context, default: -> { config.transactional_context }
+
       # @!attribute [r] schema
       #   @return [Dry::Schema::Params, Dry::Schema::JSON, Dry::Schema::Processor]
       #   @api private
@@ -101,9 +106,9 @@ module Dry
           rules.each do |rule|
             next if rule.keys.any? { |key| error?(result, key) }
 
-            rule_result = rule.(self, result)
+            failures = apply_rule(rule, result)
 
-            rule_result.failures.each do |failure|
+            failures.each do |failure|
               result.add_error(message_resolver.(**failure))
             end
           end
@@ -121,6 +126,57 @@ module Dry
       end
 
       private
+
+      # Apply a single rule to the result
+      #
+      # When transactional context is enabled, the rule runs against a deep
+      # copy of the committed context and its changes are merged back only
+      # when the rule didn't fail. When the rule raises, the copy is simply
+      # discarded, which rolls back any of its writes.
+      #
+      # Returns the rule's failures, which must be read exactly once because
+      # `Evaluator#failures` is not idempotent.
+      #
+      # @api private
+      def apply_rule(rule, result)
+        return rule.(self, result).failures unless transactional_context
+
+        transaction = deep_copy_context(result.context)
+        failures = rule.(self, result, context: transaction).failures
+        commit_context(result.context, transaction) if failures.empty?
+        failures
+      end
+
+      # Merge a successful rule's context changes into the committed context
+      #
+      # @api private
+      def commit_context(context, transaction)
+        context.keys.each { |key| context.delete(key) unless transaction.key?(key) }
+        transaction.each { |key, value| context[key] = value }
+      end
+
+      # Deep-copy the committed context so that a rule can freely add or
+      # delete keys and mutate nested hashes and arrays without affecting
+      # other rules
+      #
+      # @api private
+      def deep_copy_context(context)
+        ::Concurrent::Map.new.tap do |copy|
+          context.each { |key, value| copy[key] = deep_copy_context_value(value) }
+        end
+      end
+
+      # @api private
+      def deep_copy_context_value(value)
+        case value
+        when ::Hash
+          value.to_h { |key, nested| [key, deep_copy_context_value(nested)] }
+        when ::Array
+          value.map { |nested| deep_copy_context_value(nested) }
+        else
+          value
+        end
+      end
 
       # @api private
       def error?(result, spec)
