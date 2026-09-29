@@ -239,6 +239,62 @@ class Roda
     # inside the block may return nil if there is a error raised, and nested calls to
     # +convert!+ and +convert_each!+ may not return values.
     #
+    # If you want to make sure that your code handles all submitted parameters, which can
+    # help find issues such as clients submitting misspelled parameter names after an API
+    # change, you can use the +strict+ method with a block.  +strict+ tracks parameter
+    # access inside the block, and returns an array of paths for submitted parameters
+    # that were not accessed inside the block:
+    #
+    #   # params: {'page'=>'1', 'artist'=>{'name'=>'A', 'age'=>'30'},
+    #   #          'albums'=>[{'id'=>'1'}, {'id'=>'2', 'tracks'=>'10'}],
+    #   #          'pagee'=>'2'}
+    #   unconsumed = typecast_params.strict do |tp|
+    #     tp.pos_int!('page')
+    #     tp['artist'].str!('name')
+    #     tp['albums'][0].pos_int!('id')
+    #     tp['albums'][1].pos_int!('id')
+    #   end
+    #   # unconsumed: ['artist[age]', 'albums[][tracks]', 'pagee']
+    #
+    # The returned paths use the same format as TypecastParams::Error#param_name.
+    # Access is tracked through nested hashes and through each object inside arrays,
+    # and accessing the same parameter multiple times is fine.  Any conversion method
+    # (including +[]+, +dig+, +convert!+, and +convert_each!+) counts as access.
+    # Note that accessing a parameter with a conversion method such as +any+ or +Hash+
+    # counts as consuming the entire value, while accessing a nested hash or array
+    # with +[]+ only traverses into it, and the entries inside it still need to be
+    # accessed to be considered consumed.
+    #
+    # If a conversion inside the block fails, the parameter still counts as accessed
+    # (since the access was attempted), and the conversion error is still raised as
+    # usual (+strict+ does not rescue or hide conversion errors).
+    #
+    # If there are submitted parameters that you are aware of and do not need to
+    # handle, you can explicitly ignore them by path inside the block:
+    #
+    #   unconsumed = typecast_params.strict do |tp|
+    #     tp.pos_int!('page')
+    #     tp.ignore('csrf_token')
+    #     tp.ignore('artist', 'age') # or: tp['artist'].ignore('age')
+    #   end
+    #
+    # +strict+ can be nested, and each +strict+ block has its own scope, so an inner
+    # +strict+ block only reports parameters not accessed inside the inner block,
+    # while the outer +strict+ block considers accesses in both blocks:
+    #
+    #   # params: {'artist'=>{'name'=>'A', 'age'=>'30'}, 'page'=>'1'}
+    #   unconsumed = typecast_params.strict do |tp|
+    #     inner_unconsumed = tp['artist'].strict do |st|
+    #       st.str!('name')
+    #     end
+    #     # inner_unconsumed: ['artist[age]']
+    #     tp.pos_int!('page')
+    #   end
+    #   # unconsumed: ['artist[age]']
+    #
+    # +strict+ does not modify +request.params+, it only tracks access to the
+    # parameters and returns the paths that were not accessed.
+    #
     # When loading the typecast_params plugin, a subclass of +TypecastParams::Params+ is created
     # specific to the Roda application.  You can add support for custom types by passing a block
     # when loading the typecast_params plugin.  This block is executed in the context of the
@@ -631,6 +687,7 @@ class Roda
         def [](key)
           @subs ||= {}
           if sub = @subs[key]
+            _strict_mark_traversed(key)
             return sub
           end
 
@@ -655,6 +712,8 @@ class Roda
 
           @subs[key] = sub
           sub.sub_capture(@capture, @symbolize, @skip_missing)
+          sub.sub_strict_stack(@_strict_stack)
+          _strict_mark_traversed(key)
           sub
         end
 
@@ -761,6 +820,68 @@ class Roda
           _dig(true, type, nest, key)
         end
 
+        # Track parameter access inside the given block, and return an array of
+        # paths for submitted parameters that were not accessed inside the block.
+        # The returned paths use the same format as TypecastParams::Error#param_name.
+        # See the plugin documentation for details and examples.
+        def strict
+          raise ProgrammerError, "a block is required when calling strict" unless defined?(yield)
+
+          unless stack = @_strict_stack
+            _propagate_strict_stack(stack = [])
+          end
+
+          scope = {}
+          stack << scope
+
+          begin
+            yield self
+          ensure
+            stack.pop
+          end
+
+          unconsumed = []
+          _strict_unconsumed_walk(@obj, scope, _strict_path, unconsumed)
+          unconsumed.uniq!
+          unconsumed
+        end
+
+        # Explicitly ignore the parameter at the given path inside a +strict+
+        # block, so it is not reported as unconsumed when the block finishes.
+        # Multiple arguments can be given to ignore a nested path:
+        #
+        #   tp.ignore('csrf_token')
+        #   tp.ignore('artist', 'age') # same as: tp['artist'].ignore('age')
+        #
+        # Ignoring a path that is not present in the parameters is a no-op.
+        def ignore(*keys)
+          raise ProgrammerError, "ignore requires at least one key" if keys.empty?
+          unless (stack = @_strict_stack) && !stack.empty?
+            raise ProgrammerError, "ignore can only be called inside a strict block"
+          end
+
+          target = self
+          last = keys.length - 1
+          keys.each_with_index do |key, i|
+            unless key.is_a?(String) || key.is_a?(Integer)
+              raise ProgrammerError, "invalid key passed to ignore: #{key.inspect}"
+            end
+
+            if i == last
+              target._strict_mark_consumed(key)
+            else
+              begin
+                target = target[key]
+              rescue Error
+                # Path is not present in the parameters, nothing to ignore
+                return nil
+              end
+            end
+          end
+
+          nil
+        end
+
         # Convert the value of +key+ to an array of values of the given +type+. If +default+ is
         # given, any +nil+ values in the array are replaced with +default+.  If +key+ is an array
         # then this returns an array of arrays, one for each respective value of +key+. If there is
@@ -851,8 +972,108 @@ class Roda
             @params = @obj.class.new
           end
         end
-        
+
+        # Inherit the strict scope stack from the parent object.
+        def sub_strict_stack(stack)
+          @_strict_stack = stack
+        end
+
+        # Set the strict scope stack on the receiver and all existing sub
+        # objects, so parameter access anywhere in the tree is tracked.
+        def _propagate_strict_stack(stack)
+          @_strict_stack = stack
+          if @subs
+            @subs.each_value do |sub|
+              sub._propagate_strict_stack(stack) if sub
+            end
+          end
+        end
+
+        # Mark the given key on the current object as consumed in all active
+        # strict scopes.
+        def _strict_mark_consumed(key)
+          _strict_mark(key, 0)
+        end
+
+        # Mark the given key on the current object as traversed in all active
+        # strict scopes.
+        def _strict_mark_traversed(key)
+          _strict_mark(key, 1)
+        end
+
         private
+
+        # Internals of strict access tracking.  +slot+ is 0 for consumed keys
+        # and 1 for traversed keys.  Marks are stored per active scope, keyed
+        # by the absolute path of the current object in the params tree.
+        def _strict_mark(key, slot)
+          if stack = @_strict_stack
+            path = _strict_path
+            stack.each do |scope|
+              if marks = scope[path]
+                marks[slot][key] = true
+              else
+                marks = [{}, {}]
+                marks[slot][key] = true
+                scope[path] = marks
+              end
+            end
+          end
+          nil
+        end
+
+        # The absolute path of the current object in the params tree, used as
+        # the key for strict scope tracking.
+        def _strict_path
+          @_strict_path ||= Array(@nesting)
+        end
+
+        # Recursively walk +obj+ (a hash or array from the parameters), adding
+        # the paths of parameters not consumed in the strict +scope+ to +result+.
+        def _strict_unconsumed_walk(obj, scope, path, result)
+          if marks = scope[path]
+            consumed = marks[0]
+            traversed = marks[1]
+          end
+
+          case obj
+          when Hash
+            obj.each do |key, value|
+              _strict_check_unconsumed(key, value, scope, path, result, consumed, traversed)
+            end
+          when Array
+            obj.each_with_index do |value, i|
+              _strict_check_unconsumed(i, value, scope, path, result, consumed, traversed)
+            end
+          end
+
+          result
+        end
+
+        # Check a single parameter entry for strict unconsumed tracking.  If the
+        # entry was traversed into but not fully consumed, recurse into it.
+        def _strict_check_unconsumed(key, value, scope, path, result, consumed, traversed)
+          if consumed && consumed.has_key?(key)
+            # Key was consumed, consider the entire subtree consumed
+          elsif traversed && traversed.has_key?(key) && (value.is_a?(Hash) || value.is_a?(Array))
+            _strict_unconsumed_walk(value, scope, path + [key], result)
+          else
+            result << _strict_path_string(path + [key])
+          end
+        end
+
+        # Format a strict unconsumed path, using the same format as
+        # TypecastParams::Error#param_name.
+        def _strict_path_string(keys)
+          first, *rest = keys
+          v = first.to_s.dup
+          rest.each do |param|
+            v << "["
+            v << param.to_s unless param.is_a?(Integer)
+            v << "]"
+          end
+          v
+        end
 
         # Whether to symbolize keys when capturing.  Note that the method
         # is renamed to +symbolize?+.
@@ -1004,6 +1225,7 @@ class Roda
         def process_arg(meth, key, default, type)
           case key
           when String
+            _strict_mark_consumed(key)
             v = process(meth, key, default, type)
 
             if @capture

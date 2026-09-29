@@ -1440,6 +1440,151 @@ describe "typecast_params plugin" do
   it "should raise error invalid params format" do
     proc{Roda::RodaPlugins::TypecastParams::Params.new([]).int('a')}.must_raise @tp_error
   end
+
+  it "#strict should return paths for parameters not accessed inside the block" do
+    tp('a=1&b=2&c=3').strict do |tp|
+      tp.pos_int!('a')
+      tp.pos_int!('b')
+    end.must_equal ['c']
+
+    tp('a=1&b=2').strict do |tp|
+      tp.pos_int!('a')
+      tp.pos_int!('b')
+    end.must_equal []
+
+    tp('a=1').strict do |tp|
+    end.must_equal ['a']
+  end
+
+  it "#strict should track access through nested hashes and objects inside arrays" do
+    tp({'a'=>{'b'=>'1', 'c'=>'2'}, 'd'=>[{'e'=>'3'}, {'f'=>'4'}, {'e'=>'5', 'g'=>'6'}]}).strict do |tp|
+      tp['a'].pos_int!('b')
+      tp['d'][0].pos_int!('e')
+      tp['d'][2].pos_int!('e')
+    end.must_equal ['a[c]', 'd[]', 'd[][g]']
+  end
+
+  it "#strict should handle accessing the same parameter multiple times" do
+    tp('a=1&b=2').strict do |tp|
+      tp.pos_int!('a')
+      tp.pos_int!('a')
+      tp.str!('a')
+      tp.pos_int!('b')
+      tp.str!('b')
+    end.must_equal []
+  end
+
+  it "#strict should consider conversion methods consuming the entire value, and [] only traversing" do
+    tp('a[b]=1&a[c]=2&d[e]=3&f[g]=4').strict do |tp|
+      tp.Hash!('a')
+      tp['d'].any('e')
+      tp['f']
+    end.must_equal ['f[g]']
+  end
+
+  it "#strict should count failed conversions as access and not hide the conversion error" do
+    e = error do
+      tp('b=2').strict do |tp|
+        tp.pos_int!('a')
+      end
+    end
+    e.must_be_instance_of @tp_error
+    e.param_name.must_equal 'a'
+    e.reason.must_equal :missing
+
+    # Failed conversions that do not raise still count as access
+    tp('a=-1&b=2').strict do |tp|
+      tp.pos_int('a').must_be_nil
+    end.must_equal ['b']
+  end
+
+  it "#strict should raise ProgrammerError if called without a block" do
+    lambda{tp.strict}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "#ignore should explicitly ignore parameters by path inside #strict" do
+    tp('a=1&b=2&c[d]=3&c[e]=4&f[][g]=5&f[][h]=6').strict do |tp|
+      tp.pos_int!('a')
+      tp.ignore('b')
+      tp['c'].pos_int!('d')
+      tp.ignore('c', 'e')
+      tp.ignore('f', 0, 'g')
+      tp['f'][0].ignore('h')
+    end.must_equal []
+
+    # Ignoring a path not present in the parameters is a no-op
+    tp('a=1').strict do |tp|
+      tp.pos_int!('a')
+      tp.ignore('b')
+      tp.ignore('c', 'd')
+    end.must_equal []
+  end
+
+  it "#ignore should raise ProgrammerError when called outside #strict or with invalid arguments" do
+    lambda{tp.ignore('a')}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+    lambda{tp.ignore}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+    lambda{tp.strict{|tp| tp.ignore(:a)}}.must_raise Roda::RodaPlugins::TypecastParams::ProgrammerError
+  end
+
+  it "#strict should support nested strict blocks with separate scopes" do
+    inner_unconsumed = nil
+    unconsumed = tp('a[b]=1&a[c]=2&d=3&e=4').strict do |tp|
+      inner_unconsumed = tp['a'].strict do |stp|
+        stp.pos_int!('b')
+      end
+      tp.pos_int!('d')
+    end
+    inner_unconsumed.must_equal ['a[c]']
+    unconsumed.must_equal ['a[c]', 'e']
+  end
+
+  it "#strict should track access made via dig, convert!, and convert_each!" do
+    tp('a[b]=1&c=2&d[][e]=3&d[][e]=4&d[][f]=5').strict do |tp|
+      tp.dig!(:pos_int, 'a', 'b')
+      tp.convert! do |ctp|
+        ctp.pos_int!('c')
+      end
+      tp['d'].convert_each! do |dtp|
+        dtp.pos_int!('e')
+      end
+    end.must_equal ['d[][f]']
+  end
+
+  it "#strict should work with mixed successful conversions, failed conversions, and unknown parameters, without modifying request.params" do
+    params = {
+      'page'=>'2',
+      'per_page'=>'-5',
+      'artist'=>{'name'=>'A', 'age'=>'30'},
+      'albums'=>[{'id'=>'1'}, {'id'=>'2', 'tracks'=>'10'}],
+      'csrf_token'=>'token',
+      'pagee'=>'2'
+    }
+    params_before = Marshal.load(Marshal.dump(params))
+
+    unconsumed = tp(params).strict do |tp|
+      tp.pos_int!('page').must_equal 2
+      tp.pos_int('per_page').must_be_nil
+      tp['artist'].str!('name').must_equal 'A'
+      tp['albums'][0].pos_int!('id').must_equal 1
+      tp['albums'][1].pos_int!('id').must_equal 2
+      tp.ignore('csrf_token')
+    end
+    unconsumed.must_equal ['artist[age]', 'albums[][tracks]', 'pagee']
+    params.must_equal params_before
+
+    # Same check when a conversion error is raised inside the block
+    params = {'a'=>'1', 'b'=>'x'}
+    params_before = Marshal.load(Marshal.dump(params))
+    e = error do
+      tp(params).strict do |tp|
+        tp.pos_int!('a')
+        tp.pos_int!('b')
+      end
+    end
+    e.must_be_instance_of @tp_error
+    e.param_name.must_equal 'b'
+    params.must_equal params_before
+  end
 end
 
 describe "typecast_params plugin" do 
