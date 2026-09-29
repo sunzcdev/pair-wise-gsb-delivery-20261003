@@ -52,6 +52,24 @@ RSpec.describe 'README.md code test' do
         expect(decoded_token).to eq([{ 'data' => 'test' }, { 'alg' => 'PS256' }])
       end
     end
+
+    it 'signs with an external key in two steps' do
+      ecdsa_key = OpenSSL::PKey::EC.generate('prime256v1')
+
+      request = JWT.prepare_signature({ 'pay' => 'load' }, algorithm: 'ES256')
+
+      expect(request.digest).to eq('SHA256')
+      expect(request.signature_format).to eq(:ecdsa_raw)
+      expect(request.signature_length).to eq(64)
+
+      # external signer: hash the input and hand back the raw R || S signature
+      der = ecdsa_key.dsa_sign_asn1(OpenSSL::Digest.new(request.digest).digest(request.signing_input))
+      signature = OpenSSL::ASN1.decode(der).value.map { |value| value.value.to_s(2).rjust(32, "\x00") }.join
+
+      token = request.complete(signature, key: ecdsa_key.public_key)
+
+      expect(JWT.decode(token.jwt, ecdsa_key.public_key, true, algorithm: 'ES256').first).to eq({ 'pay' => 'load' })
+    end
   end
 
   context 'claims' do

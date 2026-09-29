@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add `JWT::SigningRequest` for two-step signing with keys held outside the application: prepare the signing input and algorithm requirements, sign externally, then complete the token with the returned signature
 - Your contribution here
 
 **Fixes and enhancements:**

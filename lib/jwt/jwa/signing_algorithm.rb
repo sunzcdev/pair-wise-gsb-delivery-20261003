@@ -22,6 +22,25 @@ module JWT
         alg&.casecmp(alg_to_check)&.zero? == true
       end
 
+      # Returns the name of the digest the data must be hashed with when
+      # signing, or nil when the algorithm does not use a digest.
+      def digest
+        nil
+      end
+
+      # Returns the representation expected for signatures handed back from
+      # an external signer. :raw means the native signature bytes,
+      # :ecdsa_raw means the JWS raw R || S fixed-width concatenation.
+      def signature_format
+        :raw
+      end
+
+      # Returns the expected byte length of a signature, or nil when the
+      # algorithm does not prescribe a fixed length.
+      def signature_length
+        nil
+      end
+
       def header(*)
         { 'alg' => alg }
       end

@@ -27,13 +27,15 @@ module JWT
         raise JWT::VerificationError, 'Signature verification raised'
       end
 
+      def digest
+        @digest
+      end
+
       register_algorithm(new('RS256'))
       register_algorithm(new('RS384'))
       register_algorithm(new('RS512'))
 
       private
-
-      attr_reader :digest
     end
   end
 end

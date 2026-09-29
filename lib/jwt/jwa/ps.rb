@@ -27,6 +27,10 @@ module JWT
         raise JWT::VerificationError, 'Signature verification raised'
       end
 
+      def digest
+        ::OpenSSL::Digest.new(digest_algorithm).name
+      end
+
       register_algorithm(new('PS256'))
       register_algorithm(new('PS384'))
       register_algorithm(new('PS512'))

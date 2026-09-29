@@ -35,6 +35,29 @@ module JWT
         raise JWT::VerificationError, 'Signature verification raised'
       end
 
+      def digest
+        ::OpenSSL::Digest.new(@digest).name
+      end
+
+      # ECDSA signatures in JWS are the raw fixed-width concatenation of the
+      # R and S values, not the ASN.1/DER representation OpenSSL produces.
+      def signature_format
+        :ecdsa_raw
+      end
+
+      def signature_length
+        RAW_SIGNATURE_LENGTHS.fetch(alg)
+      end
+
+      # Byte length of the raw R || S signature per algorithm, as defined by
+      # RFC 7518 section 3.4.
+      RAW_SIGNATURE_LENGTHS = {
+        'ES256' => 64,
+        'ES256K' => 64,
+        'ES384' => 96,
+        'ES512' => 132
+      }.freeze
+
       NAMED_CURVES = {
         'prime256v1' => {
           algorithm: 'ES256',
@@ -86,8 +109,6 @@ module JWT
       end
 
       private
-
-      attr_reader :digest
 
       def curve_by_name(name)
         self.class.curve_by_name(name)

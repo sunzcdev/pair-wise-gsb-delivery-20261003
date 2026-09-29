@@ -23,13 +23,17 @@ module JWT
       def sign(data:, signing_key:)
         validate_key!(signing_key) { |message| raise_sign_error!(message) }
 
-        OpenSSL::HMAC.digest(digest.new, signing_key, data)
+        OpenSSL::HMAC.digest(@digest.new, signing_key, data)
       end
 
       def verify(data:, signature:, verification_key:)
         validate_key!(verification_key) { |message| raise_verify_error!(message) }
 
-        SecurityUtils.secure_compare(signature, OpenSSL::HMAC.digest(digest.new, verification_key, data))
+        SecurityUtils.secure_compare(signature, OpenSSL::HMAC.digest(@digest.new, verification_key, data))
+      end
+
+      def digest
+        @digest.new.name
       end
 
       register_algorithm(new('HS256', OpenSSL::Digest::SHA256))
@@ -37,8 +41,6 @@ module JWT
       register_algorithm(new('HS512', OpenSSL::Digest::SHA512))
 
       private
-
-      attr_reader :digest
 
       # Yields a message for the first problem found with the key. The caller
       # raises it, so signing and verification failures keep their own error class.

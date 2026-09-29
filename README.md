@@ -325,6 +325,29 @@ encoded_token.verify_signature!(algorithm: 'HS256', key: "secret")
 encoded_token.payload # => {"pay"=>"load"}
 ```
 
+## Signing with an external key
+
+When the private key is held outside the application (for example in an HSM, a KMS or a separate signing service), signing can be split into two steps. `JWT::SigningRequest` freezes the header and payload, exposes the exact bytes to sign together with the algorithm requirements, and completes the token once the external signer hands the signature back.
+
+```ruby
+request = JWT.prepare_signature({ 'pay' => 'load' }, algorithm: 'ES256')
+
+request.signing_input    # the bytes the external signer must sign
+request.algorithm        # => "ES256"
+request.digest           # => "SHA256", the digest the input must be hashed with
+request.signature_format # => :ecdsa_raw, the expected signature representation
+request.signature_length # => 64, the expected signature size in bytes
+
+signature = my_external_signer.sign(request.signing_input)
+
+token = request.complete(signature, key: public_key) # key is optional, verifies the signature before completing
+token.jwt # => "eyJhb..."
+```
+
+For ECDSA algorithms the signature must be handed back in the JWS raw format: the fixed-width concatenation `R || S` (64 bytes for ES256, 96 for ES384, 132 for ES512), **not** the ASN.1/DER representation that OpenSSL and most HSMs produce natively. Other algorithms expect the native signature bytes (`:raw`).
+
+The signature is bound to the frozen signing input of the request. When a verification `key` is given to `complete`, a signature made for another request or for tampered data is rejected with `JWT::VerificationError`. Signatures that do not match the expected format are rejected with `JWT::EncodeError`.
+
 ## Claims
 
 JSON Web Token defines some reserved claim names and defines how they should be

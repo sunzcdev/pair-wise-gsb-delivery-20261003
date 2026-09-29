@@ -11,6 +11,7 @@ require 'jwt/jwk'
 require 'jwt/claims'
 require 'jwt/encoded_token'
 require 'jwt/token'
+require 'jwt/signing_request'
 
 # JSON Web Token implementation
 #
@@ -44,5 +45,18 @@ module JWT
   # @return [Array<Hash>] the decoded payload and headers.
   def decode(jwt, key = nil, verify = true, options = {}, &keyfinder) # rubocop:disable Style/OptionalBooleanParameter
     Decode.new(jwt, key, verify, configuration.decode.to_h.merge(options), &keyfinder).decode_segments
+  end
+
+  # Prepares a two-step signing request for a key held outside the
+  # application. The returned request exposes the bytes to sign and the
+  # algorithm requirements; the externally computed signature is handed
+  # back via JWT::SigningRequest#complete.
+  #
+  # @param payload [Hash] the payload to sign.
+  # @param algorithm [String, Object] the algorithm the external signer will use.
+  # @param header [Hash] additional headers to include in the JWT.
+  # @return [JWT::SigningRequest] the prepared signing request.
+  def prepare_signature(payload, algorithm:, header: {})
+    SigningRequest.new(payload: payload, header: header, algorithm: algorithm)
   end
 end

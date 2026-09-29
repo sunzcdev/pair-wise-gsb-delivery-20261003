@@ -103,6 +103,20 @@ module JWT
       nil
     end
 
+    # Attaches an externally computed signature to the token.
+    #
+    # @api private
+    # @param signature [String] the signature for the signing input.
+    # @return [void]
+    # @raise [JWT::EncodeError] if the token is already signed
+    def attach_signature(signature)
+      raise ::JWT::EncodeError, 'Token already signed' if @signature
+
+      @signature = signature
+
+      nil
+    end
+
     # Verifies the claims of the token.
     # @param options [Array<Symbol>, Hash] the claims to verify.
     # @raise [JWT::ClaimValidationError] if the claims are invalid.
