@@ -40,6 +40,9 @@ module Dentaku
 
         result = begin
           l.public_send(operator, r)
+        rescue Dentaku::Units::MismatchError => e
+          # unit mismatch: point at this subexpression (innermost wins)
+          raise e.locate(self)
         rescue ::TypeError => e
           # Right cannot be converted to a suitable type for left. e.g. [] + 1
           raise Dentaku::ArgumentError.for(:incompatible_type, actual: r, expected: l.class), e.message
@@ -206,6 +209,8 @@ module Dentaku
         raise Dentaku::ZeroDivisionError if r.zero?
 
         cast(cast(left.value(context)) / r)
+      rescue Dentaku::Units::MismatchError => e
+        raise e.locate(self)
       end
 
       def self.precedence
@@ -235,6 +240,8 @@ module Dentaku
         raise Dentaku::ZeroDivisionError if r.zero?
 
         cast(cast(left.value(context)) % r)
+      rescue Dentaku::Units::MismatchError => e
+        raise e.locate(self)
       end
     end
 

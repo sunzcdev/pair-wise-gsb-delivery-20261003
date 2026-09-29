@@ -8,7 +8,7 @@ module Dentaku
         nil
       end
 
-      def register(name, type, implementation, callback = nil, volatile: false)
+      def register(name, type, implementation, callback = nil, volatile: false, unit: nil)
         function = Class.new(Function) do
           def self.name=(name)
             @name = name.to_s
@@ -65,6 +65,16 @@ module Dentaku
             @volatile
           end
 
+          # declared result unit for custom functions in units mode; nil
+          # means the result passes through unchecked
+          def self.result_unit=(unit)
+            @result_unit = unit
+          end
+
+          def self.result_unit
+            @result_unit
+          end
+
           def self.arity
             @implementation.arity < 0 ? nil : @implementation.arity
           end
@@ -79,11 +89,21 @@ module Dentaku
 
           def value(context = {})
             args = @args.map { |a| a.value(context) }
-            self.class.implementation.call(*args)
+            result = self.class.implementation.call(*args)
+            coerce_result_unit(result, context)
           end
 
           def type
             self.class.type
+          end
+
+          private
+
+          def coerce_result_unit(result, context)
+            unit = self.class.result_unit
+            return result unless unit && context[Dentaku::Units::MODE_KEY]
+
+            Dentaku::Units.coerce_result(result, unit, node: self)
           end
         end
 
@@ -96,6 +116,7 @@ module Dentaku
         function.implementation = implementation
         function.callback = callback
         function.volatile = volatile
+        function.result_unit = unit
 
         self[function_name(name)] = function
       end

@@ -24,7 +24,10 @@ module Dentaku
       end
 
       def value(context = {})
-        predicate.value(context) ? left.value(context) : right.value(context)
+        taken, untaken = predicate.value(context) ? [left, right] : [right, left]
+        result = taken.value(context)
+        check_branch_units(result, untaken, context)
+        result
       end
 
       def node_type
@@ -44,6 +47,23 @@ module Dentaku
       end
 
       private
+
+      # in units mode both branches must agree on dimension; the untaken
+      # branch is only probed when it is side-effect free, and a branch that
+      # fails to evaluate (e.g. a guarded division) skips the check
+      def check_branch_units(result, other_branch, context)
+        return unless context[Dentaku::Units::MODE_KEY]
+        return unless other_branch.pure?
+
+        other_value =
+          begin
+            other_branch.value(context)
+          rescue Dentaku::Error
+            return
+          end
+
+        Dentaku::Units.assert_compatible!(result, other_value, node: self)
+      end
 
       def all_arg_dependencies(context)
         args.flat_map { |arg| arg.dependencies(context) }.uniq

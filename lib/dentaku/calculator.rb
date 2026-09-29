@@ -5,22 +5,25 @@ require 'dentaku/flat_hash'
 require 'dentaku/parser'
 require 'dentaku/string_casing'
 require 'dentaku/token'
+require 'dentaku/units'
 
 module Dentaku
   class Calculator
     include StringCasing
     attr_reader :result, :memory, :tokenizer, :case_sensitive,
-                :nested_data_support, :ast_cache, :raw_date_literals
+                :nested_data_support, :ast_cache, :raw_date_literals, :units
 
     def initialize(case_sensitive: false, aliases: nil, nested_data_support: true,
                    raw_date_literals: true, ast_cache: {},
-                   cache_ast: nil, cache_dependency_order: nil)
+                   cache_ast: nil, cache_dependency_order: nil, units: false)
       clear
       @tokenizer = Tokenizer.new
       @case_sensitive = case_sensitive
       @aliases = aliases
       @nested_data_support = nested_data_support
       @raw_date_literals = raw_date_literals
+      @units = units
+      @unit_declarations = {}
       @ast_cache = ast_cache
       @cache_ast = cache_ast
       @cache_dependency_order = cache_dependency_order
@@ -34,16 +37,16 @@ module Dentaku
       @aliases || Dentaku.aliases
     end
 
-    def self.add_function(name, type, body, callback = nil, volatile: false)
-      Dentaku::AST::FunctionRegistry.default.register(name, type, body, callback, volatile: volatile)
+    def self.add_function(name, type, body, callback = nil, volatile: false, unit: nil)
+      Dentaku::AST::FunctionRegistry.default.register(name, type, body, callback, volatile: volatile, unit: unit)
     end
 
     def self.add_functions(functions)
       functions.each { |(name, type, body, callback, volatile)| add_function(name, type, body, callback, volatile: !!volatile) }
     end
 
-    def add_function(name, type, body, callback = nil, volatile: false)
-      @function_registry.register(name, type, body, callback, volatile: volatile)
+    def add_function(name, type, body, callback = nil, volatile: false, unit: nil)
+      @function_registry.register(name, type, body, callback, volatile: volatile, unit: unit)
       self
     end
 
@@ -167,7 +170,26 @@ module Dentaku
     end
 
     def evaluation_context(data, evaluation_mode)
-      data.key?(:__evaluation_mode) ? data : data.merge(__evaluation_mode: evaluation_mode)
+      context = data.key?(:__evaluation_mode) ? data : data.merge(__evaluation_mode: evaluation_mode)
+      if @units && !context.key?(Dentaku::Units::MODE_KEY)
+        context = context.merge(Dentaku::Units::MODE_KEY => true)
+      end
+      context
+    end
+
+    # declares the unit of input variables for a calculator in units mode;
+    # values bound to a declared name (via evaluate/store) are tagged with
+    # the unit, turning plain numerics into quantities
+    def declare_units(units)
+      unless @units
+        raise Dentaku::Units::ModeError,
+              "unit declarations require units mode: Dentaku::Calculator.new(units: true)"
+      end
+
+      units.each do |name, unit|
+        @unit_declarations[standardize_case(name.to_s)] = unit
+      end
+      self
     end
 
     def store(key_or_hash, value = nil)
@@ -210,10 +232,20 @@ module Dentaku
     private def pairs_to_store(key_or_hash, value)
       if value.nil?
         key_or_hash = FlatHash.from_hash_with_intermediates(key_or_hash) if nested_data_support
-        key_or_hash.map { |key, val| [standardize_case(key.to_s), val] }
+        key_or_hash.map { |key, val| [standardize_case(key.to_s), val] }.map { |pair| apply_unit_declaration(pair) }
       else
-        [[standardize_case(key_or_hash.to_s), value]]
+        [apply_unit_declaration([standardize_case(key_or_hash.to_s), value])]
       end
+    end
+
+    # tags values bound to a declared variable with their unit
+    private def apply_unit_declaration((key, value))
+      unit = @unit_declarations[key]
+      return [key, value] unless unit
+      return [key, value] if value.is_a?(Dentaku::Units::Quantity)
+      return [key, value] unless value.is_a?(::Numeric)
+
+      [key, Dentaku::Units::Quantity.new(value, unit)]
     end
 
     def store_formula(key, formula)

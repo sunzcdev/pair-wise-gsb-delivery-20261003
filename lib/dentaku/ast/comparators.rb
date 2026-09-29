@@ -20,6 +20,9 @@ module Dentaku
         r = validate_value(cast(right.value(context)))
 
         l.public_send(operator, r)
+      rescue Dentaku::Units::MismatchError => e
+        # unit mismatch: point at this comparison subexpression
+        raise e.locate(self)
       rescue ::ArgumentError, ::TypeError => e
         raise Dentaku::ArgumentError.for(:incompatible_type, actual: r, expected: l.class), e.message
       end

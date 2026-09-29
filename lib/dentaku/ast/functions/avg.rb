@@ -9,5 +9,5 @@ Dentaku::AST::Function.register(:avg, :numeric, ->(*args) {
     )
   end
 
-  flatten_args.map { |arg| Dentaku::NumericParser.ensure_numeric!(arg) }.reduce(0, :+) / BigDecimal(flatten_args.length)
+  flatten_args.map { |arg| Dentaku::Units.unwrap_numeric(arg) }.reduce(0, :+) / BigDecimal(flatten_args.length)
 })

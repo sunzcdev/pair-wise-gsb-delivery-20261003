@@ -8,5 +8,5 @@ Dentaku::AST::Function.register(:sum, :numeric, ->(*args) {
     )
   end
 
-  args.flatten.map { |arg| Dentaku::NumericParser.ensure_numeric!(arg) }.reduce(0, :+)
+  args.flatten.map { |arg| Dentaku::Units.unwrap_numeric(arg) }.reduce(0, :+)
 })

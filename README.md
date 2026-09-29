@@ -429,6 +429,55 @@ c.evaluate('rrrrround!(8.2) + округлить(8.4)')
 # 16
 ```
 
+UNITS
+-----
+
+Dentaku has an optional unit-dimension mode for formulas whose values are
+physical quantities (durations, lengths, masses) rather than bare numbers.
+Enable it per calculator and declare the units of your input variables:
+
+```ruby
+calculator = Dentaku::Calculator.new(units: true)
+calculator.declare_units(elapsed: :ms, timeout: :s)
+
+result = calculator.evaluate!('elapsed + timeout', elapsed: 500, timeout: 2)
+#=> 2.5 s (compatible units are converted automatically)
+result.to(:ms) #=> 2500 ms
+```
+
+You can also pass quantities directly as values, without declarations:
+
+```ruby
+calculator.evaluate!('distance / duration',
+  distance: Dentaku::Units.quantity(120, :km),
+  duration: Dentaku::Units.quantity(2, :h))
+#=> 60 km/h (a derived dimension: length/time)
+```
+
+Multiplication and division derive compound dimensions, and dimensions that
+cancel out collapse to a plain dimensionless ratio (`500 ms / 2 s #=> 0.25`).
+Addition, subtraction, and comparison of incompatible dimensions raise
+`Dentaku::Units::MismatchError`, pointing at the offending subexpression:
+
+```ruby
+calculator.evaluate!('1 + (length + duration) * 2', ...)
+#=> Dentaku::Units::MismatchError: cannot add 10 m and 5 s: incompatible
+#   dimensions (length vs time) in subexpression `length + duration`
+```
+
+`IF` and `CASE` branches must agree on dimension, and custom functions can
+declare their result unit so it is checked (and converted) on every call:
+
+```ruby
+calculator.add_function(:double, :numeric, ->(x) { x * 2 }, unit: :ms)
+```
+
+Built-in units: `ms`, `s`, `min`, `h`/`hr` (time); `mm`, `cm`, `m`, `km`,
+`ft`, `mi` (length); `g`, `kg` (mass). `ABS`, `MIN`, `MAX`, `ROUND`,
+`ROUNDUP`, `ROUNDDOWN`, `SUM`, and `AVG` propagate units. Formulas without
+units behave exactly as before. See `examples/units_demo.rb` for a runnable
+tour.
+
 THANKS
 ------
 

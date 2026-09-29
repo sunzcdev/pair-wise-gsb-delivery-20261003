@@ -53,12 +53,16 @@ module Dentaku
         switch_value = @switch.value(context)
         @conditions.each do |condition|
           if condition.when.value(context) == switch_value
-            return condition.then.value(context)
+            result = condition.then.value(context)
+            check_branch_units(context, result)
+            return result
           end
         end
 
         if @else
-          return @else.value(context)
+          result = @else.value(context)
+          check_branch_units(context, result)
+          return result
         else
           raise ArgumentError.for(:invalid_value), "No block matched the switch value '#{switch_value}'"
         end
@@ -85,6 +89,27 @@ module Dentaku
       end
 
       private
+
+      # in units mode every branch of the CASE must agree on dimension;
+      # only side-effect free branches are probed, and a branch that fails
+      # to evaluate skips the check
+      def check_branch_units(context, result)
+        return unless context[Dentaku::Units::MODE_KEY]
+
+        branches = @conditions.map(&:then) + [@else].compact
+        branches.each do |branch|
+          next unless branch.pure?
+
+          other_value =
+            begin
+              branch.value(context)
+            rescue Dentaku::Error
+              next
+            end
+
+          Dentaku::Units.assert_compatible!(result, other_value, node: self)
+        end
+      end
 
       # pruning evaluates the switch and each when-clause until one matches;
       # all of them must be side-effect free before we may do that

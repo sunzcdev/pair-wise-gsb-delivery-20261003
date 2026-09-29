@@ -1,5 +1,16 @@
 # Change Log
 
+## [Unreleased]
+- added an optional unit-dimension mode (`Dentaku::Calculator.new(units: true)`).
+  Input variables can declare units (`declare_units`) or be passed as
+  `Dentaku::Units::Quantity` values; arithmetic propagates dimensions and
+  converts compatible units automatically, while incompatible addition,
+  subtraction, and comparison raise `Dentaku::Units::MismatchError` with the
+  offending subexpression in the message. `IF`/`CASE` branches and custom
+  function results (via `add_function(..., unit:)`) are dimension-checked,
+  and `ABS`, `MIN`, `MAX`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `SUM`, and `AVG`
+  propagate units. Formulas without units are unaffected.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized
