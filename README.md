@@ -247,6 +247,43 @@ vehicle.alarm_state_name                        # => :active
 
 vehicle.fire_events!(:ignite, :enable_alarm)    # => StateMachines:InvalidParallelTransition: Cannot run events in parallel: ignite, enable_alarm
 
+```
+
+# Compensating resource preparation
+
+`state_machines` rolls back the *state value* when a transition fails, but
+callbacks often prepare additional resources (seats, files, jobs) that the
+state machine knows nothing about.  To clean those up, a callback can
+register a compensation ("undo") action on the transition *after* its
+preparation has succeeded:
+
+```ruby
+class Vehicle
+  state_machine do
+    before_transition on: :ignite do |vehicle, transition|
+      vehicle.reserve_seat
+      transition.register_compensation { vehicle.release_seat }
+    end
+  end
+end
+```
+
+If the transition later fails -- a guard, callback, or action halts, returns
+false, or raises -- the registered compensations run in reverse registration
+order (last registered, first run):
+
+* Only completed preparations are compensated, because the undo action is
+  registered after the preparation succeeds.  A preparation that raises
+  midway never registers, so it is never compensated.
+* Each registered compensation runs at most once.
+* Errors raised by compensations are collected separately in
+  `transition.compensation_errors` instead of being raised, so the original
+  cause of the transition failure is preserved.
+* On success, registered compensations are simply discarded.
+
+Note that this is a best-effort convention, not a transaction: it cannot
+guarantee that side effects in arbitrary external systems are undone.
+
 # Coordinated State Management
 
 State machines can coordinate with each other using state guards, allowing transitions to depend on the state of other state machines within the same object. This enables complex system modeling where components are interdependent.
