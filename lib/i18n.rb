@@ -5,6 +5,7 @@ require 'concurrent/hash'
 
 require 'i18n/version'
 require 'i18n/utils'
+require 'i18n/count'
 require 'i18n/exceptions'
 require 'i18n/interpolate/ruby'
 

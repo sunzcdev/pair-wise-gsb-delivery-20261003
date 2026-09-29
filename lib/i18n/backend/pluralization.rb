@@ -36,6 +36,18 @@ module I18n
       # (e.g. "I don't have any cars") or count == 1 (e.g. "I have a single car")
       # use the explicit `"0"` and `"1"` keys.
       # https://unicode-org.github.io/cldr/ldml/tr35-numbers.html#Explicit_0_1_rules
+      #
+      # == Counts with a preserved decimal representation
+      #
+      # Passing an I18n::Count as the :count option lets rules distinguish
+      # text input such as "1", "1.0" and "1.00". The Count travels through
+      # translate (including the Fallbacks backend) to the rule unchanged -
+      # it is never converted to a Float - and interpolates as its original
+      # text. Rules that predate I18n::Count and expect a plain Numeric keep
+      # working because Count supports the common numeric protocol
+      # (comparison, arithmetic, coercion); I18n::Count#to_numeric is the
+      # compatibility entry point for anything that needs an explicit
+      # Integer or Rational.
       def pluralize(locale, entry, count)
         return entry unless entry.is_a?(Hash) && count
 

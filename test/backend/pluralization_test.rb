@@ -92,4 +92,87 @@ class I18nBackendPluralizationTest < I18n::TestCase
     assert_equal "I have 1 Porsche 🚗", I18n.t(:'automobiles.porsche', count: 1, :locale => :xx)
     assert_equal "I have 20 Porsches 🚗", I18n.t(:'automobiles.porsche', count: 20, :locale => :xx)
   end
+
+  # A rule that deliberately branches on the number of visible fraction
+  # digits, proving the decimal representation survives all the way to the
+  # rule instead of being collapsed into a Float.
+  def decimal_places_rule(seen = nil)
+    lambda do |count|
+      seen << count if seen
+      case count.decimal_places
+      when 0 then :one
+      when 1 then :few
+      else :many
+      end
+    end
+  end
+
+  test "passes an I18n::Count to the rule without losing the decimal representation" do
+    seen = []
+    store_translations(:xx, :i18n => { :plural => { :rule => decimal_places_rule(seen) } })
+    entry = { :one => 'one', :few => 'few', :many => 'many' }
+
+    assert_equal 'one',  I18n.t(:count => I18n::Count.new('1'),    :default => entry, :locale => :xx)
+    assert_equal 'few',  I18n.t(:count => I18n::Count.new('1.0'),  :default => entry, :locale => :xx)
+    assert_equal 'many', I18n.t(:count => I18n::Count.new('1.00'), :default => entry, :locale => :xx)
+
+    assert seen.all? { |count| count.is_a?(I18n::Count) }, "rule must receive I18n::Count, not a Float"
+    assert_equal %w[1 1.0 1.00], seen.map(&:to_s)
+  end
+
+  test "passes negative counts with visible fraction digits to the rule" do
+    store_translations(:xx, :i18n => { :plural => { :rule => decimal_places_rule } })
+    entry = { :one => 'one', :few => 'few', :many => 'many' }
+
+    assert_equal 'one',  I18n.t(:count => I18n::Count.new('-1'),    :default => entry, :locale => :xx)
+    assert_equal 'few',  I18n.t(:count => I18n::Count.new('-1.0'),  :default => entry, :locale => :xx)
+    assert_equal 'many', I18n.t(:count => I18n::Count.new('-1.00'), :default => entry, :locale => :xx)
+  end
+
+  test "passes very long decimal counts to the rule without precision loss" do
+    seen = []
+    store_translations(:xx, :i18n => { :plural => { :rule => decimal_places_rule(seen) } })
+    entry = { :one => 'one', :few => 'few', :many => 'many' }
+
+    long = '1.' + '0' * 49 + '1'
+    assert_equal 'many', I18n.t(:count => I18n::Count.new(long), :default => entry, :locale => :xx)
+    assert_equal 50, seen.last.decimal_places
+    assert_equal long, seen.last.to_s
+  end
+
+  test "interpolates an I18n::Count as its original decimal representation" do
+    store_translations(:xx, :i18n => { :plural => { :rule => decimal_places_rule } })
+    store_translations(:xx, :things => { :many => '%{count} things' })
+    assert_equal '1.00 things', I18n.t(:things, :count => I18n::Count.new('1.00'), :locale => :xx)
+  end
+
+  test "legacy numeric rules keep working when given an I18n::Count" do
+    # @rule from setup is a legacy numeric rule: it only uses arithmetic and
+    # comparison, which I18n::Count delegates to its numeric value.
+    assert_equal 'one',  I18n.t(:count => I18n::Count.new('21'),   :default => @entry, :locale => :xx)
+    assert_equal 'many', I18n.t(:count => I18n::Count.new('11'),   :default => @entry, :locale => :xx)
+    assert_equal 'few',  I18n.t(:count => I18n::Count.new('2.00'), :default => @entry, :locale => :xx)
+  end
+
+  test "explicit 0 and 1 keys apply to I18n::Count with fraction digits" do
+    assert_equal 'single', I18n.t(:count => I18n::Count.new('1.00'), :default => @entry, :locale => :xx)
+    assert_equal 'none',   I18n.t(:count => I18n::Count.new('0.0'),  :default => @entry, :locale => :xx)
+  end
+
+  test "works with the default english pluralization rules" do
+    entry = { :one => 'one', :other => 'other' }
+    assert_equal 'one',   I18n.t(:count => I18n::Count.new('1.00'), :default => entry, :locale => :pirate)
+    assert_equal 'other', I18n.t(:count => I18n::Count.new('2.0'),  :default => entry, :locale => :pirate)
+  end
+
+  test "passes an I18n::Count through fallbacks to the rule unchanged" do
+    seen = []
+    store_translations(:xx, :i18n => { :plural => { :rule => decimal_places_rule(seen) } })
+    store_translations(:xx, :things => { :many => '%{count} things', :other => 'other' })
+
+    assert_equal '1.00 things', I18n.t(:things, :count => I18n::Count.new('1.00'), :locale => :'xx-XX')
+    assert_equal 1, seen.size
+    assert_instance_of I18n::Count, seen.first
+    assert_equal '1.00', seen.first.to_s
+  end
 end
