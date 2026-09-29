@@ -2035,6 +2035,14 @@ set :protection, :session => true
     </dd>
     <dd>Enabled if your app is not thread-safe. Disabled by default.</dd>
 
+  <dt>match_error_causes</dt>
+    <dd>
+      Whether or not <tt>error</tt> handlers also match exceptions in the
+      raised exception's cause chain. The raised exception (and handlers for
+      its superclasses) takes precedence over deeper causes. Disabled by
+      default.
+    </dd>
+
   <dt>method_override</dt>
     <dd>
       Use <tt>_method</tt> magic to allow put/delete forms in browsers that
@@ -2333,6 +2341,37 @@ end
 Sinatra installs special `not_found` and `error` handlers when
 running under the development environment to display nice stack traces
 and additional debugging information in your browser.
+
+### Matching Exception Causes
+
+Sometimes infrastructure code wraps your exceptions, so the exception that
+reaches Sinatra is not the one your application wants to handle. Enable the
+`match_error_causes` setting to let `error` handlers match exceptions
+anywhere in the raised exception's cause chain:
+
+```ruby
+set :match_error_causes, true
+
+error MyCustomError do |e|
+  "handled #{e.class} while processing #{env['sinatra.error'].class}"
+end
+
+get '/' do
+  begin
+    raise MyCustomError, 'something bad'
+  rescue
+    raise MyWrapperError, 'wrapped'
+  end
+end
+```
+
+Handlers are matched against the raised exception first (including handlers
+registered for its superclasses), then against its cause, and so on down the
+chain. The handler receives the matched exception as its block argument,
+while `env['sinatra.error']` always refers to the exception that was
+actually raised. Cyclic cause chains are detected and terminate. This
+setting is disabled by default, preserving the historical behavior of only
+matching the raised exception.
 
 ### Behavior with `raise_errors` option
 

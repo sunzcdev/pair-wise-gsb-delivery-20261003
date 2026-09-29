@@ -1230,9 +1230,12 @@ module Sinatra
         headers['X-Cascade'] = 'pass' if settings.x_cascade?
       end
 
-      if (res = error_block!(boom.class, boom) || error_block!(status, boom))
-        return res
+      res = nil
+      each_error_exception(boom) do |exception|
+        break if (res = error_block!(exception.class, exception))
       end
+      res ||= error_block!(status, boom)
+      return res if res
 
       if not_found? || bad_request?
         if boom.message && boom.message != boom.class.name
@@ -1248,6 +1251,25 @@ module Sinatra
       raise boom if settings.raise_errors? || settings.show_exceptions?
 
       error_block! Exception, boom
+    end
+
+    # Yields the raised exception and, when the +match_error_causes+ setting
+    # is enabled, each exception in its cause chain, from the outermost
+    # exception down to the deepest cause. Handlers registered for an
+    # exception (or one of its superclasses) take precedence over handlers
+    # for deeper causes. The walk is iterative and keeps track of already
+    # visited exceptions, so cyclic cause chains terminate.
+    def each_error_exception(boom)
+      seen = { boom.object_id => true }
+      yield boom
+      return unless settings.match_error_causes?
+
+      cause = boom.cause
+      while cause && !seen[cause.object_id]
+        seen[cause.object_id] = true
+        yield cause
+        cause = cause.cause
+      end
     end
 
     # Find an custom error block for the key(s) specified.
@@ -1939,6 +1961,7 @@ module Sinatra
     set :raise_errors, proc { test? }
     set :dump_errors, proc { !test? }
     set :show_exceptions, proc { development? }
+    set :match_error_causes, false
     set :sessions, false
     set :session_store, Rack::Session::Cookie
     set :logging, false
