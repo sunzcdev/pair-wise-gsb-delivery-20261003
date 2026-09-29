@@ -989,6 +989,95 @@ class TestHTTPCookie < Test::Unit::TestCase
     assert_equal false, cookie.acceptable_from_uri?('http://foo.uk/')
   end
 
+  def test_domain_specified
+    # explicitly given via the :domain option
+    cookie = HTTP::Cookie.new('a', 'b', :domain => 'example.com')
+    assert_equal true, cookie.domain_specified?
+
+    # taken from the origin host
+    cookie = HTTP::Cookie.new('a', 'b', :origin => 'https://example.com/')
+    assert_equal false, cookie.domain_specified?
+
+    # explicitly assigned
+    cookie.domain = 'example.com'
+    assert_equal true, cookie.domain_specified?
+
+    # reset to nil
+    cookie.domain = nil
+    assert_equal false, cookie.domain_specified?
+
+    # a Domain attribute in a Set-Cookie header
+    cookie = HTTP::Cookie.parse('a=b; Domain=example.com', 'https://example.com/').first
+    assert_equal true, cookie.domain_specified?
+
+    # no Domain attribute in a Set-Cookie header
+    cookie = HTTP::Cookie.parse('a=b', 'https://example.com/').first
+    assert_equal false, cookie.domain_specified?
+
+    # the evidence survives a to_h round trip
+    assert_equal false, HTTP::Cookie.new(cookie.to_h).domain_specified?
+  end
+
+  def test_secure_prefix
+    # the Secure attribute is required
+    assert_equal 0, HTTP::Cookie.parse('__Secure-a=b', 'https://example.com/').size
+    # a secure origin is required
+    assert_equal 0, HTTP::Cookie.parse('__Secure-a=b; Secure', 'http://example.com/').size
+    # Secure attribute and secure origin
+    cookies = HTTP::Cookie.parse('__Secure-a=b; Secure', 'https://example.com/')
+    assert_equal 1, cookies.size
+    assert_equal true, cookies.first.valid_name_prefix?
+    # the prefix match is case insensitive
+    assert_equal 0, HTTP::Cookie.parse('__SECURE-a=b', 'https://example.com/').size
+    # a merely similar name is not affected
+    assert_equal 1, HTTP::Cookie.parse('__SecureX-a=b', 'http://example.com/').size
+  end
+
+  def test_host_prefix
+    url = 'https://example.com/'
+    # OK: Secure, Path=/ and no Domain attribute
+    cookies = HTTP::Cookie.parse('__Host-a=b; Secure; Path=/', url)
+    assert_equal 1, cookies.size
+    assert_equal true, cookies.first.valid_name_prefix?
+    # the Secure attribute is required
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Path=/', url).size
+    # a secure origin is required
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Secure; Path=/', 'http://example.com/').size
+    # the path must be /
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Secure; Path=/foo', url).size
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Secure', 'https://example.com/foo/').size
+    # a Domain attribute is not allowed, even if its value happens to
+    # equal the origin host
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Secure; Path=/; Domain=example.com', url).size
+    # a Domain attribute for an IP address host, where the for_domain
+    # flag cannot be used as evidence
+    assert_equal 0, HTTP::Cookie.parse('__Host-a=b; Secure; Path=/; Domain=127.0.0.1', 'https://127.0.0.1/').size
+    # a merely similar name is not affected
+    assert_equal 1, HTTP::Cookie.parse('__Hostile-a=b', 'http://example.com/').size
+  end
+
+  def test_prefix_with_manually_built_cookies
+    # an unknown origin cannot be assumed to be secure
+    cookie = HTTP::Cookie.new('__Secure-a', 'b', :secure => true,
+      :domain => 'example.com', :path => '/')
+    assert_equal false, cookie.acceptable?
+
+    cookie = HTTP::Cookie.new('__Host-a', 'b', :secure => true, :path => '/',
+      :domain => 'example.com')
+    assert_equal false, cookie.acceptable?
+
+    # all requirements met
+    cookie = HTTP::Cookie.new('__Host-a', 'b', :secure => true, :path => '/',
+      :origin => 'https://example.com/')
+    assert_equal true, cookie.acceptable?
+
+    # an explicitly given domain counts as a Domain attribute even if
+    # its value equals the origin host
+    cookie = HTTP::Cookie.new('__Host-a', 'b', :secure => true, :path => '/',
+      :domain => 'example.com', :origin => 'https://example.com/')
+    assert_equal false, cookie.acceptable?
+  end
+
   def test_valid_for_uri?
     {
       HTTP::Cookie.parse('a1=b',
@@ -1156,6 +1245,42 @@ class TestHTTPCookie < Test::Unit::TestCase
     assert_equal nil, ycookie.expires
   end
 
+  def test_yaml_domain_specified
+    # the evidence about the Domain attribute is persisted
+    cookie = HTTP::Cookie.parse('a=b', 'https://example.com/').first
+    ycookie = load_yaml(cookie.to_yaml)
+    assert_equal false, ycookie.domain_specified?
+
+    cookie = HTTP::Cookie.parse('a=b; Domain=example.com', 'https://example.com/').first
+    ycookie = load_yaml(cookie.to_yaml)
+    assert_equal true, ycookie.domain_specified?
+  end
+
+  def test_yaml_legacy_format_without_domain_specified
+    # a YAML dump made by an old version carries no evidence about
+    # the Domain attribute
+    yaml = <<~YAML
+      --- !ruby/object:HTTP::Cookie
+      name: a
+      value: b
+      domain: example.com
+      for_domain: false
+      path: "/"
+      secure: true
+      httponly: false
+      expires:
+      max_age:
+      created_at: 2026-09-30 00:00:00.000000000 Z
+      accessed_at: 2026-09-30 00:00:00.000000000 Z
+    YAML
+    cookie = load_yaml(yaml)
+    assert_equal 'example.com', cookie.domain
+    assert_equal false, cookie.for_domain?
+    # with no evidence recorded, it cannot be proved that the Domain
+    # attribute was absent, so it is treated as specified
+    assert_equal true, cookie.domain_specified?
+  end
+
   def test_s_path_match?
     assert_equal true,  HTTP::Cookie.path_match?('/admin/', '/admin/index')
     assert_equal false, HTTP::Cookie.path_match?('/admin/', '/Admin/index')
@@ -1178,6 +1303,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         accessed_at: now,
         created_at: now,
         domain: 'rubyforge.org',
+        domain_specified: true,
         expires: nil,
         for_domain: true,
         httponly: cookie.httponly?,
@@ -1197,6 +1323,7 @@ class TestHTTPCookie < Test::Unit::TestCase
         accessed_at: now,
         created_at: now,
         domain: 'rubyforge.org',
+        domain_specified: true,
         expires: now,
         for_domain: true,
         httponly: cookie.httponly?,

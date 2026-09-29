@@ -66,6 +66,17 @@ class HTTP::CookieJar
   # any case.  A given cookie must have domain and path attributes
   # set, or ArgumentError is raised.
   #
+  # As a secure acceptance measure, a cookie whose name has a
+  # `__Secure-` or `__Host-` prefix is accepted only if the
+  # requirements for the prefix are met (see
+  # HTTP::Cookie#valid_name_prefix?).  The same check is applied to
+  # every cookie that enters the jar, whether it is parsed from a
+  # Set-Cookie header, added manually with this method, or imported
+  # from a file with #load.  A cookie whose origin is unknown, as is
+  # the case with cookies loaded from a file, is never assumed to
+  # come from a secure origin.  A rejected cookie never replaces an
+  # existing cookie in the jar.
+  #
   # Whether a cookie with the `for_domain` flag on overwrites another
   # with the flag off or vice versa depends on the store used.  See
   # individual store classes for that matter.

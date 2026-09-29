@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 require File.expand_path('helper', File.dirname(__FILE__))
 require 'tmpdir'
+require 'stringio'
 
 module TestHTTPCookieJar
   class TestAutoloading < Test::Unit::TestCase
@@ -245,6 +246,133 @@ module TestHTTPCookieJar
       assert_raises(ArgumentError) {
         @jar.add(cookie)
       }
+    end
+
+    def test_parse_rejects_invalid_prefix_cookies
+      url = 'https://example.com/'
+
+      # __Secure- requires the Secure attribute and a secure origin
+      assert_equal 0, @jar.parse('__Secure-a=b', url).size
+      assert_equal 0, @jar.parse('__Secure-a=b; Secure', 'http://example.com/').size
+      assert_equal 1, @jar.parse('__Secure-a=b; Secure', url).size
+
+      # __Host- additionally requires Path=/ and no Domain attribute
+      assert_equal 0, @jar.parse('__Host-c=d; Secure; Path=/; Domain=example.com', url).size
+      assert_equal 0, @jar.parse('__Host-c=d; Secure; Path=/foo', url).size
+      assert_equal 1, @jar.parse('__Host-c=d; Secure; Path=/', url).size
+
+      assert_equal %w[__Host-c __Secure-a], @jar.each.map { |cookie| cookie.name }.sort
+    end
+
+    def test_add_rejects_invalid_prefix_cookies
+      url = 'https://example.com/'
+
+      # the origin is unknown and cannot be assumed trustworthy
+      @jar.add(HTTP::Cookie.new('__Secure-a', 'b', :secure => true,
+        :domain => 'example.com', :path => '/'))
+      assert_equal true, @jar.empty?
+
+      # a Domain attribute is present although its value equals the
+      # origin host
+      @jar.add(HTTP::Cookie.new('__Host-a', 'b', :secure => true, :path => '/',
+        :domain => 'example.com', :origin => url))
+      assert_equal true, @jar.empty?
+
+      # all requirements met
+      @jar.add(HTTP::Cookie.new('__Host-a', 'b', :secure => true, :path => '/',
+        :origin => url))
+      assert_equal 1, @jar.each.to_a.size
+    end
+
+    def test_rejected_prefix_cookie_does_not_overwrite
+      url = 'https://example.com/'
+      @jar.parse('__Host-a=b; Secure; Path=/', url)
+      assert_equal %w[b], @jar.cookies(url).map { |cookie| cookie.value }
+
+      # same name, domain and path, but non-conforming: must not
+      # replace the valid cookie
+      @jar.parse('__Host-a=evil; Path=/', url)
+      @jar.add(HTTP::Cookie.new('__Host-a', 'evil', :path => '/', :origin => url))
+      @jar.parse('__Host-a=evil; Secure; Path=/; Domain=example.com', url)
+
+      assert_equal %w[b], @jar.cookies(url).map { |cookie| cookie.value }
+    end
+
+    def test_load_legacy_yaml_with_prefix_cookies
+      url = 'https://example.com/'
+      # a valid __Host- cookie is already in the jar
+      @jar.parse('__Host-a=b; Secure; Path=/', url)
+
+      # a YAML file saved by an old version, which carries no
+      # domain_specified evidence
+      yaml = <<~YAML
+        ---
+        - !ruby/object:HTTP::Cookie
+          name: __Host-a
+          value: evil
+          domain: example.com
+          for_domain: false
+          path: "/"
+          secure: true
+          httponly: false
+          expires:
+          max_age:
+          created_at: 2026-09-30 00:00:00.000000000 Z
+          accessed_at: 2026-09-30 00:00:00.000000000 Z
+        - !ruby/object:HTTP::Cookie
+          name: plain
+          value: ok
+          domain: example.com
+          for_domain: false
+          path: "/"
+          secure: false
+          httponly: false
+          expires:
+          max_age:
+          created_at: 2026-09-30 00:00:00.000000000 Z
+          accessed_at: 2026-09-30 00:00:00.000000000 Z
+      YAML
+
+      @jar.load(StringIO.new(yaml))
+
+      # the imported __Host- cookie is rejected because its origin is
+      # unknown, and the existing valid cookie is kept
+      assert_equal 'b', @jar.each.find { |cookie| cookie.name == '__Host-a' }.value
+      # a cookie without a special name is imported as before
+      assert_equal 'ok', @jar.each.find { |cookie| cookie.name == 'plain' }.value
+    end
+
+    def test_save_load_prefix_cookies_yaml
+      url = 'https://example.com/'
+      @jar.parse('__Host-a=b; Secure; Path=/', url)
+      @jar.parse('plain=c; Path=/', url)
+
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, 'cookies.yml')
+        @jar.save(file, :session => true)
+
+        # the evidence that no Domain attribute was given is preserved
+        assert_match(/^  domain_specified: false$/, File.read(file))
+
+        @jar2.load(file)
+        # the __Host- cookie is not accepted back because its origin
+        # is unknown, while the plain cookie is
+        assert_equal %w[plain], @jar2.each.map { |cookie| cookie.name }
+      end
+    end
+
+    def test_save_load_prefix_cookies_cookiestxt
+      url = 'https://example.com/'
+      @jar.parse('__Host-a=b; Secure; Path=/', url)
+      @jar.parse('plain=c; Path=/', url)
+
+      Dir.mktmpdir do |dir|
+        file = File.join(dir, 'cookies.txt')
+        @jar.save(file, :format => :cookiestxt, :session => true)
+        @jar2.load(file, :format => :cookiestxt)
+        # the same gate applies: an unknown origin is not trusted
+        assert_equal %w[plain], @jar2.each.map { |cookie| cookie.name }
+      end
     end
 
     def test_add_does_not_reject_cookies_from_a_nested_subdomain

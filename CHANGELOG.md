@@ -1,3 +1,17 @@
+## Unreleased
+
+- Enforce the `__Secure-` and `__Host-` cookie name prefix
+  requirements (RFC 6265bis) in `HTTP::Cookie#acceptable?`, so that
+  `HTTP::CookieJar` rejects non-conforming cookies uniformly whether
+  they are parsed from a Set-Cookie header, added manually, or
+  imported from a file.  A cookie whose origin is unknown is never
+  assumed to come from a secure origin, and a rejected cookie never
+  replaces an existing cookie in the jar.  A new persistent property
+  `HTTP::Cookie#domain_specified` records whether the Domain
+  attribute was explicitly given, distinguishing it from a domain
+  value that merely equals the origin host.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

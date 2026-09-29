@@ -24,8 +24,18 @@ class HTTP::Cookie
   # least)
   MAX_COOKIES_TOTAL = 3000
 
+  # Cookie name prefix that requires the Secure attribute and a
+  # secure origin.  See #valid_name_prefix?.
+  SECURE_PREFIX = '__Secure-'
+  # Cookie name prefix that additionally requires a Path of "/" and
+  # no Domain attribute.  See #valid_name_prefix?.
+  HOST_PREFIX = '__Host-'
+
   # :stopdoc:
   UNIX_EPOCH = Time.at(0)
+
+  RE_SECURE_PREFIX = /\A#{SECURE_PREFIX}/i
+  RE_HOST_PREFIX = /\A#{HOST_PREFIX}/i
 
   PERSISTENT_PROPERTIES = %w[
     name        value
@@ -33,6 +43,7 @@ class HTTP::Cookie
     secure      httponly
     expires     max_age
     created_at  accessed_at
+    domain_specified
   ]
   # :startdoc:
 
@@ -133,7 +144,7 @@ class HTTP::Cookie
   def initialize(*args)
     @name = @origin = @domain = @path =
       @expires = @max_age = nil
-    @for_domain = @secure = @httponly = false
+    @for_domain = @secure = @httponly = @domain_specified = false
     @session = true
     @created_at = @accessed_at = Time.now
     case argc = args.size
@@ -158,7 +169,7 @@ class HTTP::Cookie
       raise ArgumentError, "wrong number of arguments (#{argc} for 1-3)"
     end
     for_domain = false
-    domain = max_age = origin = nil
+    domain = max_age = origin = domain_specified = nil
     attr_hash.each_pair { |okey, val|
       case key ||= okey
       when :name
@@ -167,6 +178,9 @@ class HTTP::Cookie
         value = val
       when :domain
         domain = val
+      when :domain_specified, :domain_specified?
+        # Applied below after domain and origin are set
+        domain_specified = val
       when :path
         self.path = val
       when :origin
@@ -205,6 +219,7 @@ class HTTP::Cookie
     @for_domain = for_domain
     self.domain = domain if domain
     self.origin = origin if origin
+    @domain_specified = domain_specified unless domain_specified.nil?
     self.max_age = max_age if max_age
     self.value = value.nil? && (@expires || @max_age) ? '' : value
   end
@@ -390,6 +405,7 @@ class HTTP::Cookie
     case domain
     when nil
       @for_domain = false
+      @domain_specified = false
       if @origin
         @domain_name = DomainName.new(@origin.host)
         @domain = @domain_name.hostname
@@ -422,6 +438,7 @@ class HTTP::Cookie
       @for_domain = for_domain unless for_domain.nil?
     end
     @domain = @domain_name.hostname
+    @domain_specified = true
   end
 
   # Returns the domain, with a dot prefixed only if the domain flag is
@@ -440,6 +457,15 @@ class HTTP::Cookie
   # cookie will be sent only to the host indicated by the #domain.
   attr_accessor :for_domain
   alias for_domain? for_domain
+
+  # Whether the domain value was explicitly specified, e.g. via a
+  # Domain attribute in a Set-Cookie header or the `:domain` option,
+  # rather than taken from the origin host.  This is kept as evidence
+  # for validating the `__Host-` name prefix (see
+  # #valid_name_prefix?), where a Domain attribute whose value
+  # happens to equal the origin host still counts as present.
+  attr_accessor :domain_specified
+  alias domain_specified? domain_specified
 
   attr_reader :path
 
@@ -460,8 +486,13 @@ class HTTP::Cookie
     # Delay setting @origin because #domain= or #path= may fail
     origin = HTTP::Cookie::URIParser.parse(origin)
     if URI::HTTP === origin
-      self.domain ||= origin.host
-      self.path   ||= (origin + './').path
+      unless @domain
+        self.domain = origin.host
+        # The domain value is taken from the origin, not given via a
+        # Domain attribute.
+        @domain_specified = false
+      end
+      self.path ||= (origin + './').path
     end
     @origin = origin
   end
@@ -569,8 +600,12 @@ class HTTP::Cookie
   end
 
   # Tests if it is OK to accept this cookie considering its origin.
-  # If either domain or path is missing, raises ArgumentError.  If
-  # origin is missing, returns true.
+  # If either domain or path is missing, raises ArgumentError.
+  #
+  # If the name has a `__Secure-` or `__Host-` prefix, the
+  # requirements for the prefix must be met (see
+  # #valid_name_prefix?); an unknown origin is never assumed to be
+  # trustworthy.  Otherwise, if origin is missing, returns true.
   def acceptable?
     case
     when @domain.nil?
@@ -578,9 +613,38 @@ class HTTP::Cookie
     when @path.nil?
       raise "path is missing"
     when @origin.nil?
-      true
+      valid_name_prefix?
     else
-      acceptable_from_uri?(@origin)
+      valid_name_prefix? && acceptable_from_uri?(@origin)
+    end
+  end
+
+  # Tests if the origin of this cookie is a known secure (HTTPS) URL.
+  # If the origin is unknown, e.g. when the cookie was loaded from a
+  # file, it cannot be assumed trustworthy and this method returns
+  # false.
+  def secure_origin?
+    URI::HTTPS === @origin
+  end
+
+  # Tests if the requirements imposed by the cookie name prefixes
+  # `__Secure-` and `__Host-` (RFC 6265bis 4.1.3) are satisfied.
+  # Returns true if the name has neither prefix.
+  #
+  # A `__Secure-` cookie must have the Secure attribute and come from
+  # a secure origin.  A `__Host-` cookie must additionally have a
+  # path of "/" and must not have a Domain attribute; note that a
+  # Domain attribute whose value happens to equal the origin host
+  # still counts as present (see #domain_specified).
+  def valid_name_prefix?
+    case @name
+    when RE_HOST_PREFIX
+      secure_origin? && @secure && @path == '/' &&
+        !@for_domain && !@domain_specified
+    when RE_SECURE_PREFIX
+      secure_origin? && @secure
+    else
+      true
     end
   end
 
