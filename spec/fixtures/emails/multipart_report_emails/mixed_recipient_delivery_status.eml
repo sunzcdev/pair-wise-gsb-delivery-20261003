@@ -1,0 +1,60 @@
+Return-Path: <>
+Date: Tue, 30 Sep 2025 10:15:00 +0800
+From: Mail Delivery System <postmaster@example.com>
+To: sender@example.com
+Subject: Delivery report for three recipients
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status;
+ boundary="delivery-status-boundary"
+
+--delivery-status-boundary
+Content-Type: text/plain
+
+Delivery results differ by recipient.
+
+--delivery-status-boundary
+Content-Type: message/delivery-status
+
+Reporting-MTA: dns; mta.example.com
+X-Generated-By: example-mta
+Arrival-Date: Tue, 30 Sep 2025 10:14:00 +0800
+
+Original-Recipient: rfc822;success@example.net
+Final-Recipient: rfc822; success@example.net
+Action: delivered
+Status: 2.0.0
+X-Delivery-Queue: outgoing
+Remote-MTA: dns; mx.example.net
+Diagnostic-Code: smtp; 250 2.0.0 Message accepted for delivery
+Last-Attempt-Date: Tue, 30 Sep 2025 10:15:01 +0800
+
+Original-Recipient: rfc822;delayed@example.org
+Final-Recipient: rfc822; delayed@example.org
+Action: delayed
+Status: 4.2.2
+X-Retry-After: 1800
+Remote-MTA: dns; mx.example.org
+Diagnostic-Code: smtp; 452 4.2.2 Mailbox full; delivery will be
+ retried later by the relay
+Last-Attempt-Date: Tue, 30 Sep 2025 10:15:02 +0800
+
+Original-Recipient: rfc822;failed@example.invalid
+Final-Recipient: rfc822; failed@example.invalid
+Action: failed
+Status: 5.1.1
+X-Failure-Code: recipient-unknown
+Remote-MTA: dns; mx.example.invalid
+Diagnostic-Code: smtp; 550 5.1.1 Recipient address does not exist and
+ cannot be retried by the sending system
+Last-Attempt-Date: Tue, 30 Sep 2025 10:15:03 +0800
+
+--delivery-status-boundary
+Content-Type: text/rfc822-headers
+
+Return-Path: <sender@example.com>
+From: Sender <sender@example.com>
+To: success@example.net, delayed@example.org, failed@example.invalid
+Message-ID: <mixed-dsn@example.com>
+Subject: Original message
+
+--delivery-status-boundary--

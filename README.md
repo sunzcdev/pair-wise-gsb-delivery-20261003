@@ -562,6 +562,24 @@ Results in the same email as done using the block form
 @mail.retryable?       #=> false
 ```
 
+A delivery status notification can contain different results for several
+recipients. The legacy accessors above return an array when there is more than
+one recipient; `bounced?` and `retryable?` remain single-valued for backwards
+compatibility and use the first recipient record. Inspect
+`delivery_status` for complete, per-recipient results:
+
+```ruby
+@mail.delivery_status.message_fields['reporting-mta']
+@mail.delivery_status.recipients.map do |recipient|
+  {
+    address: recipient['final-recipient'],
+    action: recipient['action'],
+    status: recipient['status'],
+    diagnostic_code: recipient['diagnostic-code']
+  }
+end
+```
+
 ### Attaching and Detaching Files
 
 You can just read the file off an absolute path, Mail will try

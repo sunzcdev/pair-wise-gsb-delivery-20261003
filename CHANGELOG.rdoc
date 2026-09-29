@@ -11,6 +11,7 @@ Features:
 
 * Updated README to improve around sending multipart mail @kapfenho
 * Add delivery_interceptors method to Mail class to fetch registered interceptors @ghousemohamed
+* Parse and re-encode message-level and per-recipient message/delivery-status fields, including mixed delivery reports and unknown extensions
 
 Code Improvements:
 

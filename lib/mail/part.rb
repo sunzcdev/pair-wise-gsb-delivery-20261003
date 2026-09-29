@@ -48,20 +48,24 @@ module Mail
     end
 
     def delivery_status_data
-      delivery_status_report_part? ? parse_delivery_status_report : {}
+      delivery_status || {}
+    end
+
+    def delivery_status
+      @delivery_status ||=
+        if delivery_status_report_part?
+          DeliveryStatus.parse(body.raw_source)
+        end
     end
 
     def bounced?
-      if action.is_a?(Array)
-        !!(action.first =~ /failed/i)
-      else
-        !!(action =~ /failed/i)
-      end
+      delivery_status && delivery_status.bounced?
     end
 
-
     # Either returns the action if the message has just a single report, or an
-    # array of all the actions, one for each report
+    # array of all the actions, one for each recipient. Legacy predicates remain
+    # single-valued and represent the first recipient record; inspect
+    # delivery_status.recipients for mixed reports.
     def action
       get_return_values('action')
     end
@@ -83,19 +87,22 @@ module Mail
     end
 
     def retryable?
-      !(error_status =~ /^5/)
+      delivery_status && delivery_status.retryable?
+    end
+
+    def encoded
+      if delivery_status_report_part?
+        @body = Mail::Body.new(delivery_status.encoded)
+        @body.encoding = '7bit'
+      end
+
+      super
     end
 
     private
 
     def get_return_values(key)
-      if delivery_status_data[key].is_a?(Array)
-        delivery_status_data[key].map { |a| a.value }
-      elsif !delivery_status_data[key].nil?
-        delivery_status_data[key].value
-      else
-        nil
-      end
+      delivery_status_data[key]
     end
 
     # A part may not have a header.... so, just init a body if no header
@@ -108,10 +115,6 @@ module Mail
         self.header = "Content-Type: text/plain\r\n"
         self.body   = raw_source
       end
-    end
-
-    def parse_delivery_status_report
-      @delivery_status_data ||= Header.new(body.to_s.gsub("\r\n\r\n", "\r\n"))
     end
 
   end

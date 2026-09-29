@@ -1562,6 +1562,10 @@ module Mail
       delivery_status_part and delivery_status_part.bounced?
     end
 
+    def delivery_status
+      delivery_status_part and delivery_status_part.delivery_status
+    end
+
     def action
       delivery_status_part and delivery_status_part.action
     end
