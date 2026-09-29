@@ -84,12 +84,14 @@ module Dry
       #
       # @param [Hash] input The input to validate
       # @param [Hash] context Initial context for rules
+      # @param [Array<Symbol>] purposes One or more purposes to select rules for
       #
       # @return [Result]
       #
       # @api public
       # rubocop: disable Metrics/AbcSize
-      def call(input, context = EMPTY_HASH)
+      def call(input = nil, context = EMPTY_HASH, purposes: nil, **extra_input)
+        input = merge_input(input, extra_input)
         validate_input_type(input)
 
         context_map = ::Concurrent::Map.new.tap do |map|
@@ -97,8 +99,11 @@ module Dry
           context.each { |key, value| map[key] = value }
         end
 
-        Result.new(schema.(input), context_map) do |result|
-          rules.each do |rule|
+        selection = compiled_rules(purposes)
+
+        Result.new(schema.(input), context_map, selection) do |result|
+          selection.applied.each do |entry|
+            rule = entry.rule
             next if rule.keys.any? { |key| error?(result, key) }
 
             rule_result = rule.(self, result)
@@ -121,6 +126,42 @@ module Dry
       end
 
       private
+
+      # Combine a positional input hash with keyword-style input
+      #
+      # Supports both +contract.call(email: "x")+ (kwargs become the input) and
+      # +contract.call({email: "x"}, context, purposes: :submit)+.
+      #
+      # @return [Hash]
+      #
+      # @api private
+      def merge_input(input, extra_input)
+        return extra_input if input.nil?
+        return input.merge(extra_input) unless extra_input.empty?
+
+        input
+      end
+
+      # Compile (once per combination of purposes) the ordered rules to run
+      #
+      # Caching is per contract instance and keyed by the exact purpose
+      # combination, so different calls can never reuse each other's plan.
+      #
+      # @return [RuleSelection]
+      #
+      # @api private
+      def compiled_rules(purposes)
+        key = Array(purposes).flatten.map(&:to_sym).sort.freeze
+
+        rule_cache.fetch_or_store(key) do
+          RuleCompiler.new(rules).compile(key)
+        end
+      end
+
+      # @api private
+      def rule_cache
+        @rule_cache ||= ::Concurrent::Map.new
+      end
 
       # @api private
       def error?(result, spec)

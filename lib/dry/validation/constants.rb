@@ -39,5 +39,11 @@ module Dry
         super("#{klass} cannot be instantiated without a schema defined")
       end
     end
+
+    # Error raised when a rule declares a dependency on an unknown rule
+    InvalidDependencyError = ::Class.new(::StandardError)
+
+    # Error raised when rule dependencies form a cycle for a given combination of purposes
+    CircularDependencyError = ::Class.new(::StandardError)
   end
 end

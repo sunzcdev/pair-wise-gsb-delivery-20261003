@@ -7,6 +7,18 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Rules can be tagged with one or more purposes via `Rule#for` (e.g.
+  `rule(:consent).for(:submit)`), forced to run for a purpose with
+  `Rule#required_when`, and wired to other rules with `Rule#depends`.
+  `Contract#call(input, context, purposes: ...)` compiles an ordered selection
+  for the requested combination, pulling in transitive dependencies. The result
+  exposes `Result#rule_selection` explaining which rules were applied (and why)
+  and which were omitted. Selections are cached per contract instance and per
+  purpose combination, and adding purposes in a subclass no longer affects the
+  parent contract.
+
 
 ## [1.11.1] - 2025-01-21
 

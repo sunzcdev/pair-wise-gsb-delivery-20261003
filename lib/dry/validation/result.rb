@@ -15,10 +15,12 @@ module Dry
       # Build a new result
       #
       # @param [Dry::Schema::Result] schema_result
+      # @param [Concurrent::Map] context
       #
       # @api private
-      def self.new(schema_result, context = ::Concurrent::Map.new, options = EMPTY_HASH)
-        result = super
+      def self.new(schema_result, context = ::Concurrent::Map.new, rule_selection = nil)
+        result = allocate
+        result.send(:initialize, schema_result, context, rule_selection)
         yield(result) if block_given?
         result.freeze
       end
@@ -44,13 +46,21 @@ module Dry
       # @api private
       attr_reader :options
 
+      # Description of which rules ran and which were skipped by purpose
+      #
+      # @return [RuleSelection]
+      #
+      # @api public
+      attr_reader :rule_selection
+
       # Initialize a new result
       #
       # @api private
-      def initialize(schema_result, context, options)
+      def initialize(schema_result, context, rule_selection)
         @schema_result = schema_result
         @context = context
-        @options = options
+        @options = EMPTY_HASH
+        @rule_selection = rule_selection
         @errors = initialize_errors
       end
 

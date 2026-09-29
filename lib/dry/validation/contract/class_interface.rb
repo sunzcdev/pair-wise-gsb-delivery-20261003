@@ -90,6 +90,14 @@ module Dry
         #     failure('please provide a valid street address') if valid_street?(values[:street])
         #   end
         #
+        # @example tagging the rule with purposes through {Rule#for},
+        #   {Rule#required_when} or {Rule#depends}
+        #   rule(:consent).for(:submit) do
+        #     key.failure('must be accepted') unless values[:consent]
+        #   end
+        #
+        # @param [Array] keys The keys the rule applies to
+        #
         # @return [Rule]
         #
         # @api public
