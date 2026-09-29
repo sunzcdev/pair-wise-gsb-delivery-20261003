@@ -87,8 +87,58 @@ module Rack
     #     }.new
     #   })
     #
+    # Session revocation ("log out of all devices"):
+    #
+    # The :revocation option adds a small revocation interface on top of the
+    # encrypted cookie. The cookie additionally carries only two pieces of
+    # metadata: a subject identifier (taken from the session) and the epoch
+    # at which the session was issued. The application supplies a callback
+    # which returns the current epoch for a subject; if it does not match
+    # the epoch stored in the cookie, the session is rejected. Bumping the
+    # epoch (e.g. in your own database) therefore invalidates all previously
+    # issued cookies for that subject. The library does not ship any database
+    # client: where and how epochs are stored is entirely up to the
+    # application.
+    #
+    #   Rack::Session::Cookie.new(application, {
+    #     secrets: 'a randomly generated, raw binary string 64 bytes in size',
+    #     revocation: {
+    #       # Where to find the subject identifier in the session. May be a
+    #       # session key (String/Symbol) or a callable receiving the session
+    #       # data and returning the subject (or nil for anonymous sessions).
+    #       subject: "user_id",
+    #       # Required callable returning the current epoch for a subject.
+    #       # Epochs should be simple values (e.g. Integer or String) so they
+    #       # survive serialization. Returning nil or raising is treated as
+    #       # "epoch unavailable" and fails closed.
+    #       epoch: ->(subject) { UserEpochs.fetch(subject) },
+    #     },
+    #   })
+    #
+    # Behaviour:
+    # * Anonymous sessions (no subject) are not revocable: the callback is
+    #   never invoked for them and no epoch is stored in their cookie.
+    # * The callback is invoked at most once per subject per request; the
+    #   result (including failures) is memoized in the request environment,
+    #   so repeated session reads within one request do not repeat the call.
+    # * If the callback raises or returns nil, the check fails closed: on
+    #   read the session is rejected, on write the session is not persisted.
+    # * When the subject changes within a request (e.g. logging in as a
+    #   different user), the epoch is resolved freshly for the new subject
+    #   and stored in the newly issued cookie.
+    # * A cookie issued before an epoch bump can never become valid again:
+    #   it is rejected on read, so its stale epoch is never copied into a
+    #   renewed cookie. Renewing simply issues a fresh anonymous cookie.
+    #
 
     class Cookie < Abstract::PersistedSecure
+      # Session key under which the issuing epoch is stored.
+      SESSION_EPOCH_KEY = "session_epoch"
+
+      # Sentinel for "the current epoch could not be resolved".
+      UNKNOWN_EPOCH = Object.new
+      private_constant :UNKNOWN_EPOCH
+
       # Encode session cookies as Base64
       class Base64
         def encode(str)
@@ -195,6 +245,17 @@ module Rack
         # encryption could present a major security issue.
         @coder = options[:coder] ||= Base64::Marshal.new
 
+        # Optional revocation interface. Removed from the options so the
+        # callables are not leaked into the per-request session options.
+        if revocation = options.delete(:revocation)
+          @revocation_subject = revocation.fetch(:subject)
+          @revocation_epoch = revocation.fetch(:epoch)
+
+          unless @revocation_epoch.respond_to?(:call)
+            raise ArgumentError, ":revocation :epoch must respond to #call"
+          end
+        end
+
         super(app, options.merge!(cookie_only: true))
       end
 
@@ -243,10 +304,76 @@ module Rack
               # if encryptors are present but decryption failed, the cookie is rejected.
               session_data = coder.decode(cookie_data)
             end
+
+            session_data = check_revocation(request, session_data) if session_data
           end
 
           request.set_header(k, session_data || {})
         end
+      end
+
+      # Validate the unpacked session data against the current revocation
+      # epoch. Returns the session data if it is valid, or nil if the
+      # session must be rejected. Called at most once per request, as the
+      # caller memoizes the result in the request environment.
+      def check_revocation(request, session_data)
+        return session_data unless @revocation_epoch
+        return session_data unless session_data.is_a?(Hash)
+
+        subject = revocation_subject(session_data)
+
+        # Anonymous sessions carry no subject and are not revocable; the
+        # epoch callback is not invoked for them.
+        return session_data if subject.nil?
+
+        epoch = resolve_revocation_epoch(request, subject)
+
+        if epoch == UNKNOWN_EPOCH
+          request.env[Rack::RACK_ERRORS].puts "Session rejected: revocation epoch unavailable for subject #{subject.inspect}."
+          nil
+        elsif epoch != session_data[SESSION_EPOCH_KEY]
+          request.env[Rack::RACK_ERRORS].puts "Session rejected: stale revocation epoch for subject #{subject.inspect}."
+          nil
+        else
+          session_data
+        end
+      end
+
+      # Extract the subject identifier from the session data.
+      def revocation_subject(session_data)
+        if @revocation_subject.respond_to?(:call)
+          @revocation_subject.call(session_data)
+        else
+          session_data[@revocation_subject.to_s]
+        end
+      end
+
+      # Resolve the current epoch for a subject via the application
+      # callback. Results (including failures) are memoized in the request
+      # environment, so the callback runs at most once per subject per
+      # request, no matter how often the session is read or written.
+      def resolve_revocation_epoch(request, subject)
+        cache = request.get_header(RACK_SESSION_REVOCATION_EPOCHS)
+        unless cache
+          cache = {}
+          request.set_header(RACK_SESSION_REVOCATION_EPOCHS, cache)
+        end
+
+        if cache.key?(subject)
+          cache[subject]
+        else
+          cache[subject] = fetch_revocation_epoch(request, subject)
+        end
+      end
+
+      def fetch_revocation_epoch(request, subject)
+        epoch = @revocation_epoch.call(subject)
+
+        # A nil epoch is treated as unavailable and fails closed.
+        epoch.nil? ? UNKNOWN_EPOCH : epoch
+      rescue => error
+        request.env[Rack::RACK_ERRORS].puts "Session revocation epoch callback failed: #{error.message}"
+        UNKNOWN_EPOCH
       end
 
       def persistent_session_id!(data, sid = nil)
@@ -265,6 +392,27 @@ module Rack
       end
 
       def write_session(req, session_id, session, options)
+        if @revocation_epoch
+          subject = revocation_subject(session)
+
+          if subject.nil?
+            # Anonymous sessions do not carry a revocation epoch.
+            session = session.dup
+            session.delete(SESSION_EPOCH_KEY)
+          else
+            epoch = resolve_revocation_epoch(req, subject)
+
+            # Fail closed: without a current epoch we cannot issue a valid
+            # authenticated cookie, so the session is not persisted.
+            return false if epoch == UNKNOWN_EPOCH
+
+            # Always stamp the *current* epoch, never one copied from an
+            # incoming cookie, so a revoked cookie cannot be renewed back
+            # into validity.
+            session = session.merge(SESSION_EPOCH_KEY => epoch)
+          end
+        end
+
         session = session.merge("session_id" => session_id)
         session_data = encode_session_data(session)
 
