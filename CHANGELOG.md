@@ -7,6 +7,19 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Structured failure addresses for nested transactions. When a transaction is
+  used as an operation of another transaction, failures are chained so the full
+  address of the failure is preserved: `Transaction#call` now returns a
+  `Dry::Transaction::FailureResult` exposing `#step_failure` and `#address`
+  (e.g. `[:parent_step, :child_step]`), while `#failure` still returns the
+  original failure value or exception. `ResultMatcher` failure cases also
+  accept an address array to match a full address or a parent-level prefix
+  (e.g. `m.failure([:parent_step, :child_step])` or `m.failure([:parent_step])`);
+  matching by a single step name still matches the step that raised the
+  failure. Overlapping failure cases are resolved in definition order (first
+  match wins), so list more specific addresses before broader ones.
 
 ## [0.16.0] - 2024-01-17
 

@@ -2,6 +2,7 @@
 
 require "dry/transaction/result_matcher"
 require "dry/transaction/stack"
+require "dry/transaction/failure_result"
 
 module Dry
   module Transaction
@@ -32,8 +33,9 @@ module Dry
           ResultMatcher.(result, &block)
         else
           result.or { |step_failure|
-            # Unwrap the value from the StepFailure and return it directly
-            Failure(step_failure.value)
+            # Keep the StepFailure (with its structured address) attached to
+            # the returned result, while #failure remains the original value
+            FailureResult.new(step_failure)
           }
         end
       end

@@ -60,12 +60,14 @@ module Dry
       def with_broadcast(args)
         publish(:step, step_name: name, args: args)
 
-        yield.fmap { |value|
+        result = yield
+
+        result.fmap { |value|
           publish(:step_succeeded, step_name: name, args: args, value: value)
           value
         }.or { |value|
           Failure(
-            StepFailure.(self, value) {
+            StepFailure.(self, value, cause: nested_step_failure(result)) {
               publish(:step_failed, step_name: name, args: args, value: value)
             }
           )
@@ -86,6 +88,15 @@ module Dry
 
       def operation
         adapter.operation
+      end
+
+      private
+
+      # The StepFailure carried by a nested transaction's result, if any
+      #
+      # @api private
+      def nested_step_failure(result)
+        result.step_failure if result.respond_to?(:step_failure)
       end
     end
   end
