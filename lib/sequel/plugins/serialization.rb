@@ -67,17 +67,29 @@ module Sequel
     #   user.permissions = {global: 'read-only'}
     #   user.save
     #
-    # Note that if you mutate serialized column values without reassigning them,
-    # those changes won't be picked up by <tt>Model#save_changes</tt> or
-    # <tt>Model#update</tt>.  Example:
-    #
-    #   user = User[1]
-    #   user.permissions[:global] = 'foo'
-    #   user.save_changes # Will not pick up changes to permissions
-    #
-    # You can use the +serialization_modification_detection+ plugin to pick
-    # up such changes.
-    module Serialization
+# Note that if you mutate serialized column values without reassigning them,
+# those changes won't be picked up by <tt>Model#save_changes</tt> or
+# <tt>Model#update</tt>.  Example:
+#
+#   user = User[1]
+#   user.permissions[:global] = 'foo'
+#   user.save_changes # Will not pick up changes to permissions
+#
+# You can use the +serialization_modification_detection+ plugin to pick
+# up such changes.
+#
+# As an alternative to in-place mutation, you can use +edit_serialized+
+# to edit a serialized column value inside a block.  The block receives
+# an isolated deep copy of the current value.  If the block exits
+# normally and the edited value passes validation for the column, the
+# column value is replaced.  If the block raises an exception or the
+# edited value is rejected by validation, the column value is left
+# unmodified:
+#
+#   user.edit_serialized(:permissions) do |permissions|
+#     permissions[:global] = 'read-write'
+#   end
+module Serialization
       # The default serializers supported by the serialization module.
       # Use register_format to add serializers to this hash.
       REGISTERED_FORMATS = {}
@@ -196,6 +208,54 @@ module Sequel
           @deserialized_values ||= {}
         end
 
+        # Edit the serialized column value in isolation, yielding a deep
+        # copy of the current value to the block.  If the block raises an
+        # exception, or the edited value does not pass validation for the
+        # column, the column value is not modified.  Otherwise, the column
+        # value is replaced with the edited value.  Returns true if the
+        # column value was replaced (or the block made no changes), and
+        # false if the edited value was rejected by validation.
+        #
+        #   user.edit_serialized(:permissions) do |permissions|
+        #     permissions[:global] = 'read-write'
+        #   end
+        #
+        # The object yielded to the block is a deep copy of the current
+        # value, so modifying it inside the block does not affect the
+        # model until the edit is committed, and modifying it after the
+        # block returns never affects the model.  Nested hashes and arrays
+        # are copied, subobjects shared inside the value remain shared
+        # inside the copy, and frozen values are copied into unfrozen
+        # duplicates.
+        def edit_serialized(column)
+          raise Error, "edit_serialized called on non-serialized column: #{column.inspect}" unless model.deserialization_map.has_key?(column)
+
+          current = public_send(column)
+          edited = isolated_serialized_value(current)
+          yield edited
+          return true if edited == current
+
+          # Validate the edited value on a duplicate of the model, so a
+          # validation failure leaves the receiver completely unmodified.
+          check = dup
+          check.send(:"#{column}=", edited)
+          begin
+            check.send(:_valid?, OPTS)
+          rescue HookFailed
+            # Validation was halted by a hook before it could run, so
+            # the edited value was not verified.
+            return false
+          end
+          column_errors = check.errors[column]
+          return false unless column_errors.nil? || column_errors.empty?
+
+          # Assign a separate copy of the edited value, so that later
+          # modification of the object yielded to the block does not
+          # modify the model's value.
+          public_send(:"#{column}=", isolated_serialized_value(edited))
+          true
+        end
+
         # Freeze the deserialized values
         def freeze
           deserialized_values
@@ -245,6 +305,37 @@ module Sequel
           unless v.nil?
             raise Sequel::Error, "no entry in serialization_map for #{column.inspect}" unless callable = model.serialization_map[column]
             callable.call(v)
+          end
+        end
+
+        # Return a deep copy of a serialized value, used to isolate values
+        # yielded to edit_serialized blocks from the model's actual value.
+        # Copies nested hashes and arrays, keeps subobjects shared inside
+        # the value shared inside the copy, and duplicates frozen values
+        # into unfrozen copies.
+        def isolated_serialized_value(value, memo = {}.compare_by_identity)
+          if Hash === value || Array === value
+            return memo[value] if memo.has_key?(value)
+
+            copy = value.dup
+            memo[value] = copy
+
+            if Hash === value
+              copy.clear
+              value.each do |k, v|
+                copy[isolated_serialized_value(k, memo)] = isolated_serialized_value(v, memo)
+              end
+            else
+              copy.map!{|v| isolated_serialized_value(v, memo)}
+            end
+
+            copy
+          else
+            begin
+              value.dup
+            rescue TypeError
+              value
+            end
           end
         end
       end

@@ -423,4 +423,180 @@ describe "Serialization plugin" do
     @c.plugin :serialization
     proc{@c.serialize_attributes :yaml}.must_raise Sequel::Error
   end
+
+  it "should support edit_serialized for atomically committing nested edits made inside a block" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.load(:id=>1, :abc=>'{"user":{"name":"a","tags":["x"]},"flags":[true,false]}')
+    o.edit_serialized(:abc) do |v|
+      v['user']['name'] = 'b'
+      v['user']['tags'] << 'y'
+      v['flags'][0] = false
+    end.must_equal true
+    o.abc.must_equal({'user'=>{'name'=>'b', 'tags'=>['x', 'y']}, 'flags'=>[false, false]})
+    o.changed_columns.must_equal [:abc]
+  end
+
+  it "should have edit_serialized not modify the model value while the block is running" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.load(:id=>1, :abc=>'{"a":{"b":1}}')
+    o.edit_serialized(:abc) do |v|
+      v['a']['b'] = 2
+      o.abc.must_equal({'a'=>{'b'=>1}})
+    end
+    o.abc.must_equal({'a'=>{'b'=>2}})
+  end
+
+  it "should have edit_serialized not modify the value if the block raises an exception" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.load(:id=>1, :abc=>'{"a":{"b":1}}')
+    proc do
+      o.edit_serialized(:abc) do |v|
+        v['a']['b'] = 2
+        raise ArgumentError, 'boom'
+      end
+    end.must_raise(ArgumentError)
+    o.abc.must_equal({'a'=>{'b'=>1}})
+    o.changed_columns.must_equal []
+  end
+
+  it "should have edit_serialized not modify the value if the edited value fails validation for the column" do
+    @c.plugin :serialization, :json, :abc
+    @c.send(:define_method, :validate){errors.add(:abc, 'is not ok') unless abc['ok']}
+    o = @c.load(:id=>1, :abc=>'{"ok":true,"n":1}')
+    o.edit_serialized(:abc) do |v|
+      v.delete('ok')
+      v['n'] = 2
+    end.must_equal false
+    o.abc.must_equal({'ok'=>true, 'n'=>1})
+    o.changed_columns.must_equal []
+    o.errors.must_be_empty
+  end
+
+  it "should have edit_serialized only consider validation errors on the edited column" do
+    @c.plugin :serialization, :json, :abc
+    @c.send(:define_method, :validate) do
+      errors.add(:id, 'bad id')
+      errors.add(:abc, 'is not ok') unless abc['ok']
+    end
+    o = @c.load(:id=>1, :abc=>'{"ok":true}')
+    o.edit_serialized(:abc){|v| v['x'] = 1}.must_equal true
+    o.abc.must_equal({'ok'=>true, 'x'=>1})
+  end
+
+  it "should have edit_serialized not modify the value if validation is halted by a hook" do
+    @c.plugin :serialization, :json, :abc
+    @c.send(:define_method, :before_validation){raise Sequel::HookFailed}
+    o = @c.load(:id=>1, :abc=>'{"a":1}')
+    o.edit_serialized(:abc){|v| v['a'] = 2}.must_equal false
+    o.abc.must_equal({'a'=>1})
+    o.changed_columns.must_equal []
+  end
+
+  it "should have edit_serialized not let later modification of the yielded object affect the model" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.load(:id=>1, :abc=>'{"a":{"b":[1]}}')
+    yielded = nil
+    o.edit_serialized(:abc) do |v|
+      yielded = v
+      v['a']['b'] << 2
+    end
+    o.abc.must_equal({'a'=>{'b'=>[1, 2]}})
+    yielded['a']['b'] << 3
+    yielded['a']['x'] = true
+    o.abc.must_equal({'a'=>{'b'=>[1, 2]}})
+  end
+
+  it "should have edit_serialized keep shared subobjects shared inside the yielded copy" do
+    @c.plugin :serialization, :json, :abc
+    shared = {'x'=>1}
+    o = @c.new
+    o.abc = {'a'=>shared, 'b'=>shared}
+    o.edit_serialized(:abc) do |v|
+      v['a'].equal?(v['b']).must_equal true
+      v['a'].equal?(shared).must_equal false
+      v['a']['x'] = 2
+    end.must_equal true
+    o.abc['a'].equal?(o.abc['b']).must_equal true
+    o.abc['b']['x'].must_equal 2
+    o.abc['a'].equal?(shared).must_equal false
+    shared.must_equal({'x'=>1})
+  end
+
+  it "should have edit_serialized support editing frozen values" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.new
+    value = {'a'=>[1, 2].freeze, 'b'=>{'c'=>3}.freeze}.freeze
+    o.abc = value
+    o.edit_serialized(:abc) do |v|
+      v.frozen?.must_equal false
+      v['a'].frozen?.must_equal false
+      v['a'] << 3
+      v['b']['c'] = 4
+    end.must_equal true
+    o.abc.must_equal({'a'=>[1, 2, 3], 'b'=>{'c'=>4}})
+    value.must_equal({'a'=>[1, 2], 'b'=>{'c'=>3}})
+    value['a'].frozen?.must_equal true
+  end
+
+  it "should have edit_serialized be a no-op if the block does not change the value" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.load(:id=>1, :abc=>'{"a":1}')
+    o.edit_serialized(:abc){|v| v['a']}.must_equal true
+    o.edit_serialized(:abc){|v| v['a'] = 2; v['a'] = 1}.must_equal true
+    o.abc.must_equal({'a'=>1})
+    o.changed_columns.must_equal []
+  end
+
+  it "should have edit_serialized handle nil values" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.new
+    yielded = :not_yielded
+    o.edit_serialized(:abc){|v| yielded = v}.must_equal true
+    yielded.must_be_nil
+    o.abc.must_be_nil
+    o.changed_columns.must_equal []
+  end
+
+  it "should have edit_serialized raise an error for non-serialized columns" do
+    @c.plugin :serialization, :json, :abc
+    o = @c.new
+    proc{o.edit_serialized(:id){|v| v}}.must_raise(Sequel::Error)
+  end
+
+  it "should have edit_serialized work correctly with the dirty plugin" do
+    @c.plugin :serialization, :json, :abc
+    @c.plugin :dirty
+    o = @c.load(:id=>1, :abc=>'{"a":1}')
+    o.column_changes.must_equal({})
+    o.edit_serialized(:abc){|v| v['a'] = 2}.must_equal true
+    o.column_changed?(:abc).must_equal true
+    o.initial_value(:abc).must_equal({'a'=>1})
+    o.column_changes.must_equal(:abc=>[{'a'=>1}, {'a'=>2}])
+    o.changed_columns.must_equal [:abc]
+  end
+
+  it "should have edit_serialized work correctly with serialization_modification_detection" do
+    @c.set_primary_key :id
+    @c.plugin :serialization, :json, :abc
+    @c.plugin :serialization_modification_detection
+    o = @c.load(:id=>1, :abc=>'{"a":{"b":1}}')
+    o.changed_columns.must_equal []
+    o.edit_serialized(:abc){|v| v['a']['b'] = 2}.must_equal true
+    o.changed_columns.must_equal [:abc]
+    o.save_changes
+    DB.sqls.last.must_equal "UPDATE items SET abc = '{\"a\":{\"b\":2}}' WHERE (id = 1)"
+    o.changed_columns.must_equal []
+  end
+
+  it "should have edit_serialized work correctly with refresh" do
+    @c.set_primary_key :id
+    @c.plugin :serialization, :json, :abc
+    @c.dataset = @c.dataset.with_fetch(:id=>1, :abc=>'{"a":2}')
+    o = @c.load(:id=>1, :abc=>'{"a":1}')
+    o.edit_serialized(:abc){|v| v['a'] = 99}.must_equal true
+    o.abc.must_equal('a'=>99)
+    o.refresh
+    o.abc.must_equal('a'=>2)
+    o.changed_columns.must_equal []
+  end
 end
