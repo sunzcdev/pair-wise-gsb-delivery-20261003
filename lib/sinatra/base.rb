@@ -21,6 +21,7 @@ require 'uri'
 # other files we need
 require 'sinatra/indifferent_hash'
 require 'sinatra/show_exceptions'
+require 'sinatra/sse'
 require 'sinatra/version'
 
 require_relative 'middleware/logger'
@@ -523,6 +524,21 @@ module Sinatra
         Stream.new(scheduler, keep_open) { |out| with_params(current) { yield(out) } }
       end
       body stream
+    end
+
+    # Server-Sent Events response. Yields an SSE::Emitter to the block and
+    # returns a pull-based Rack body: frames are only produced as the
+    # consumer pulls them, and closing the body cancels the producer.
+    #
+    #   get '/events' do
+    #     sse do |out|
+    #       out.event 'hello', id: 1
+    #       out.heartbeat
+    #     end
+    #   end
+    def sse(heartbeat_interval: SSE::DEFAULT_HEARTBEAT_INTERVAL, clock: SSE::MONOTONIC_CLOCK, &block)
+      content_type 'text/event-stream'
+      SSE.new(heartbeat_interval: heartbeat_interval, clock: clock, &block)
     end
 
     # Specify response freshness policy for HTTP caches (Cache-Control header).
