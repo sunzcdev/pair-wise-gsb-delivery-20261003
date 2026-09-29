@@ -27,13 +27,15 @@ module JWT
         raise JWT::VerificationError, 'Signature verification raised'
       end
 
+      # Returns the name of the digest an external signer must apply to the
+      # signing input before signing.
+      #
+      # @return [String] the OpenSSL digest name (e.g. "SHA256").
+      attr_reader :digest
+
       register_algorithm(new('RS256'))
       register_algorithm(new('RS384'))
       register_algorithm(new('RS512'))
-
-      private
-
-      attr_reader :digest
     end
   end
 end

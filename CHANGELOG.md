@@ -6,6 +6,7 @@
 
 **Features:**
 
+- Add two-step ("external") signing via `JWT::Token#prepare_signature` and `JWT::PreparedSignature#complete` for keys living outside the application
 - Your contribution here
 
 **Fixes and enhancements:**

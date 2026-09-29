@@ -26,6 +26,29 @@ module JWT
         { 'alg' => alg }
       end
 
+      # Returns the name of the digest an external signer must apply to the
+      # signing input, or nil when the algorithm does not prescribe one.
+      #
+      # @return [String, nil] the OpenSSL digest name (e.g. "SHA256").
+      def digest
+        nil
+      end
+
+      # Validates and normalizes a signature produced by an external signer
+      # into the representation used inside a JWT.
+      #
+      # @param signature [String] the signature returned by the external signer.
+      # @param format [Symbol] the representation of the given signature.
+      #   Algorithms supporting multiple representations accept algorithm
+      #   specific formats, others only accept +:raw+ (the exact JWS bytes).
+      # @return [String] the normalized signature, ready to be embedded in a token.
+      def normalize_external_signature(signature, format: :raw)
+        raise_sign_error!("Unsupported signature format #{format.inspect} for #{alg}. Only :raw is supported") unless format == :raw
+        raise_sign_error!('Signature must be a String') unless signature.is_a?(String)
+
+        signature
+      end
+
       def sign(*)
         raise_sign_error!('Algorithm implementation is missing the sign method')
       end

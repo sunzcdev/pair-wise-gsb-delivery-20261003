@@ -325,6 +325,38 @@ encoded_token.verify_signature!(algorithm: 'HS256', key: "secret")
 encoded_token.payload # => {"pay"=>"load"}
 ```
 
+### External (two-step) signing
+
+When the private key lives outside the application (HSM, KMS, a separate signing service), the token can be prepared for signing in one step and completed with the externally produced signature in another.
+
+Preparing freezes the token header and payload and exposes the exact bytes to sign along with the algorithm requirements:
+
+```ruby
+token = JWT::Token.new(payload: { pay: 'load' })
+prepared = token.prepare_signature(algorithm: 'ES256')
+
+prepared.signing_input # the exact bytes to hand to the external signer
+prepared.algorithm     # "ES256"
+prepared.digest        # "SHA256", the digest the signer must apply first
+```
+
+The external signer signs `prepared.signing_input` (applying `prepared.digest` first when the algorithm requires it) and the result is passed back to complete the token:
+
+```ruby
+signature = external_signing_service.sign(prepared.signing_input)
+jwt = prepared.complete(signature)
+```
+
+Each prepared request is bound to the frozen signing input of its own token — a signature produced for another request results in a token that does not verify.
+
+By default `complete` expects the exact JWS signature bytes (`format: :raw`). For ECDSA algorithms an ASN.1 DER encoded signature (as returned by e.g. `OpenSSL::PKey::EC#dsa_sign_asn1`) can be passed with `format: :der` and is converted to the raw `R||S` form required by JWS:
+
+```ruby
+prepared = token.prepare_signature(algorithm: 'ES256')
+der_signature = ec_private_key.dsa_sign_asn1(OpenSSL::Digest.new(prepared.digest).digest(prepared.signing_input))
+jwt = prepared.complete(der_signature, format: :der)
+```
+
 ## Claims
 
 JSON Web Token defines some reserved claim names and defines how they should be

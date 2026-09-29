@@ -94,11 +94,47 @@ module JWT
     # @raise [JWT::EncodeError] if the token is already signed or other problems when signing
     def sign!(key:, algorithm:)
       raise ::JWT::EncodeError, 'Token already signed' if @signature
+      raise ::JWT::EncodeError, 'Token is prepared for external signing' if @prepared_signature
 
       JWA.create_signer(algorithm: algorithm, key: key).tap do |signer|
         header.merge!(signer.jwa.header) { |_key, old, _new| old }
         @signature = signer.sign(data: signing_input)
       end
+
+      nil
+    end
+
+    # Prepares the token for two-step ("external") signing, for cases where
+    # the private key lives outside the application.
+    #
+    # The token header and payload are frozen and the returned
+    # {PreparedSignature} exposes the exact bytes to sign along with the
+    # algorithm requirements. The externally produced signature is then
+    # passed to {PreparedSignature#complete} to finish the token.
+    #
+    #   prepared = token.prepare_signature(algorithm: 'ES256')
+    #   jwt = prepared.complete(external_signer.sign(prepared.signing_input), format: :der)
+    #
+    # @param algorithm [String, Object] the algorithm to use for signing.
+    # @return [JWT::PreparedSignature] the prepared signing request.
+    # @raise [JWT::EncodeError] if the token is already signed or prepared.
+    def prepare_signature(algorithm:)
+      raise ::JWT::EncodeError, 'Token already signed' if @signature
+      raise ::JWT::EncodeError, 'Token is already prepared for external signing' if @prepared_signature
+
+      @prepared_signature = PreparedSignature.new(self, algorithm)
+    end
+
+    # Attaches an externally produced signature to the token.
+    #
+    # @api private
+    # @param signature [String] the signature over the token signing input.
+    # @return [void]
+    # @raise [JWT::EncodeError] if the token is already signed.
+    def apply_signature(signature)
+      raise ::JWT::EncodeError, 'Token already signed' if @signature
+
+      @signature = signature
 
       nil
     end

@@ -35,6 +35,41 @@ module JWT
         raise JWT::VerificationError, 'Signature verification raised'
       end
 
+      # Returns the name of the digest an external signer must apply to the
+      # signing input before signing.
+      #
+      # @return [String] the OpenSSL digest name (e.g. "SHA256").
+      def digest
+        OpenSSL::Digest.new(@digest).name
+      end
+
+      # Validates and normalizes an externally produced ECDSA signature into
+      # the raw R||S representation used inside a JWT (JWS, RFC 7518 3.4).
+      #
+      # @param signature [String] the signature returned by the external signer.
+      # @param format [Symbol] the representation of the given signature:
+      #   - +:raw+ - the fixed length R||S concatenation, exactly as embedded in the token.
+      #   - +:der+ - an ASN.1 DER encoded +SEQUENCE { r INTEGER, s INTEGER }+,
+      #     as returned by e.g. +OpenSSL::PKey::EC#dsa_sign_asn1+.
+      # @return [String] the raw R||S signature, ready to be embedded in a token.
+      def normalize_external_signature(signature, format: :raw)
+        raise_sign_error!('Signature must be a String') unless signature.is_a?(String)
+
+        raw = case format
+              when :raw then signature
+              when :der then der_to_raw(signature)
+              else
+                raise_sign_error!("Unsupported signature format #{format.inspect} for #{alg}. Expected :raw or :der")
+              end
+
+        expected_length = raw_signature_length
+        unless raw.bytesize == expected_length
+          raise_sign_error!("Invalid ECDSA signature length for #{alg}: expected #{expected_length} bytes, got #{raw.bytesize}")
+        end
+
+        raw
+      end
+
       NAMED_CURVES = {
         'prime256v1' => {
           algorithm: 'ES256',
@@ -87,10 +122,33 @@ module JWT
 
       private
 
-      attr_reader :digest
-
       def curve_by_name(name)
         self.class.curve_by_name(name)
+      end
+
+      # Byte length of one ECDSA signature component (R or S) for the
+      # curve matching this algorithm.
+      def coordinate_length
+        @coordinate_length ||= begin
+          curve_name, = NAMED_CURVES.find { |_name, definition| definition[:algorithm] == alg }
+          (OpenSSL::PKey::EC::Group.new(curve_name).degree + 7) / 8
+        end
+      end
+
+      def raw_signature_length
+        2 * coordinate_length
+      end
+
+      def der_to_raw(signature)
+        asn1 = OpenSSL::ASN1.decode(signature)
+        values = asn1.respond_to?(:value) ? asn1.value : nil
+        unless values.is_a?(Array) && values.size == 2 && values.all? { |value| value.is_a?(OpenSSL::ASN1::Integer) }
+          raise_sign_error!('Invalid DER-encoded ECDSA signature: expected a SEQUENCE of two INTEGERs')
+        end
+
+        values.map { |value| value.value.to_s(2).rjust(coordinate_length, "\x00") }.join
+      rescue OpenSSL::ASN1::ASN1Error
+        raise_sign_error!('Invalid DER-encoded ECDSA signature')
       end
 
       # Signing-side counterpart of {.curve_by_name}. An unsupported curve on the
