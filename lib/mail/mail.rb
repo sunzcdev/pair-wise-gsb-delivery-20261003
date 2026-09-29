@@ -249,13 +249,13 @@ module Mail
     t = Time.now
     sprintf(RANDOM_TAG,
             t.to_i, t.tv_usec,
-            $$, Thread.current.object_id.abs, self.uniq, rand(255))
+            $$, ::Thread.current.object_id.abs, self.uniq, rand(255))
   end
 
   private
 
   def self.something_random
-    (Thread.current.object_id * rand(255) / Time.now.to_f).to_s.slice(-3..-1).to_i
+    (::Thread.current.object_id * rand(255) / Time.now.to_f).to_s.slice(-3..-1).to_i
   end
 
   def self.uniq
