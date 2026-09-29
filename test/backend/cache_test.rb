@@ -79,7 +79,7 @@ class I18nBackendCacheTest < I18n::TestCase
 
   test "adds locale and hash of key and hash of options" do
     options = { :bar => 1 }
-    assert_equal "i18n//en/#{:foo.to_s.hash}/#{options.to_s.hash}", I18n.backend.send(:cache_key, :en, :foo, options)
+    assert_equal "i18n//v0/en/#{:foo.to_s.hash}/#{options.to_s.hash}", I18n.backend.send(:cache_key, :en, :foo, options)
   end
 
   test "cache_key uses configured digest method" do
@@ -87,7 +87,7 @@ class I18nBackendCacheTest < I18n::TestCase
     options = { :bar => 1 }
     options_hash = options.inspect
     with_cache_key_digest(digest) do
-      assert_equal "i18n//en/#{digest.hexdigest(:foo.to_s)}/#{digest.hexdigest(options_hash)}", I18n.backend.send(:cache_key, :en, :foo, options)
+      assert_equal "i18n//v0/en/#{digest.hexdigest(:foo.to_s)}/#{digest.hexdigest(options_hash)}", I18n.backend.send(:cache_key, :en, :foo, options)
     end
   end
 

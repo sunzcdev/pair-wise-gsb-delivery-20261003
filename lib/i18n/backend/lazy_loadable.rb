@@ -80,6 +80,7 @@ module I18n
       def reload!
         if lazy_load?
           @initialized_locales = nil
+          @catalog = nil
           @translations = nil
         else
           super

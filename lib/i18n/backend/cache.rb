@@ -100,7 +100,14 @@ module I18n
 
         def cache_key(locale, key, options)
           # This assumes that only simple, native Ruby values are passed to I18n.translate.
-          "i18n/#{I18n.cache_namespace}/#{locale}/#{digest_item(key)}/#{digest_item(options)}"
+          "i18n/#{I18n.cache_namespace}/#{cache_key_version}#{locale}/#{digest_item(key)}/#{digest_item(options)}"
+        end
+
+        # Backends with versioned catalogs (e.g. Simple) include the catalog
+        # version in the cache key, so cached values from a previous catalog
+        # version are never served after a new version was published.
+        def cache_key_version
+          "v#{catalog_version}/" if respond_to?(:catalog_version)
         end
 
       private

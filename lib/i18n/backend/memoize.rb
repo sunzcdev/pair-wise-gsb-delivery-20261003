@@ -21,6 +21,10 @@ module I18n
         super
       end
 
+      def publish(data, options = EMPTY_HASH)
+        super.tap { reset_memoizations! }
+      end
+
       def reload!
         reset_memoizations!
         super
@@ -36,9 +40,19 @@ module I18n
 
         def lookup(locale, key, scope = nil, options = EMPTY_HASH)
           flat_key  = I18n::Backend::Flatten.normalize_flat_keys(locale,
-            key, scope, options[:separator]).to_sym
+            key, scope, options[:separator])
+          # Memoized values are scoped to the catalog version so that a
+          # translation pinned to an older version can neither read nor
+          # pollute the memoizations of a freshly published version.
+          version   = memoize_catalog_version
+          flat_key  = "#{version}##{flat_key}" if version
+          flat_key  = flat_key.to_sym
           flat_hash = memoized_lookup[locale.to_sym]
           flat_hash.key?(flat_key) ? flat_hash[flat_key] : (flat_hash[flat_key] = super)
+        end
+
+        def memoize_catalog_version
+          catalog_version if respond_to?(:catalog_version)
         end
 
         def memoized_lookup
