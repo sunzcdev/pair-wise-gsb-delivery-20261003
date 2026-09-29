@@ -161,3 +161,44 @@ output and does not by itself limit CPU work for output-free loops.
 To help track usages of a feature or code path in production, we have released opt-in usage tracking. To enable this, we provide an empty `Liquid:: Usage.increment` method which you can customize to your needs. The feature is well suited to https://github.com/Shopify/statsd-instrument. However, the choice of implementation is up to you.
 
 Once you have enabled usage tracking, we recommend reporting any events through Github Issues that your system may be logging. It is highly likely this event has been added to consider deprecating or improving code specific to this event, so please raise any concerns.
+
+### Template inheritance (optional extension)
+
+`Liquid::TemplateInheritance` is an opt-in extension that keeps a common
+skeleton in a parent template while children only override named blocks:
+
+```liquid
+{% comment %} notification (parent, loaded via the file system) {% endcomment %}
+Subject: update
+{% block body %}generic body{% endblock %}
+{% block footer %}sent by Acme{% endblock %}
+
+{% comment %} child template {% endcomment %}
+{% extends 'notification' %}
+{% block body %}Your order shipped{% endblock %}
+```
+
+Inside an overriding block, `{% super %}` renders the nearest ancestor
+block with the same name. Enable it on an environment:
+
+```ruby
+environment = Liquid::Environment.build do |env|
+  Liquid::TemplateInheritance.register!(env)
+end
+```
+
+Semantics:
+
+* `extends` must be a top-level tag, appear before any non-whitespace
+  output, and appear at most once per template.
+* `block` must be a top-level tag and block names must be unique per
+  template. Violations raise `Liquid::SyntaxError` at parse time.
+* `extends`/`block` cannot be used inside partials (`render`/`include`);
+  `super` renders nothing when there is no parent block content.
+* In a multi-level chain (child -> mid -> base) the most derived override
+  wins; `super` walks one level up the chain at a time.
+* Parent templates are loaded through the environment's file system and
+  cached per render context; overrides are applied through the render
+  context only, so a cached parent is never mutated by a child.
+* A cycle in the inheritance chain raises `Liquid::StackLevelError` with
+  the offending chain (e.g. `alpha -> beta -> alpha`).
