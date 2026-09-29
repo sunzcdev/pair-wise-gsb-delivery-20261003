@@ -678,6 +678,15 @@ This can be used to implement caching of remotely fetched JWK Sets.
 Key identifiers can be specified using `kid`, `x5t` header parameters.
 If the requested identifier is not found from the given set the loader will be called a second time with the `kid_not_found` option set to `true`.
 The application can choose to implement some kind of JWK cache invalidation or other mechanism to handle such cases.
+The gem never performs network requests itself, fetching the keys (over HTTP or otherwise) is always the responsibility of the application provided loader.
+
+`JWT::JWK::KeyFinder` instances are thread safe and coordinate refreshes on the instance level: when multiple
+threads resolve the same unknown key identifier concurrently, only one refresh (loader call with `kid_not_found: true`)
+is performed while the other threads wait for it to finish. Unknown key identifiers are remembered in a negative
+cache, bounded in size (`negative_cache_capacity`, 128 by default) and lifetime (`negative_cache_ttl`, 30 seconds by
+default), so repeated misses do not hammer the loader. When a refresh fails the previously fetched keys are kept,
+and a refresh issued earlier never overwrites keys applied by a newer successful refresh. To benefit from the
+coordination, share a single `JWT::JWK::KeyFinder` instance between threads, for example via `JWT::EncodedToken#verify!`.
 
 Tokens without a specified key identifier (`kid` or `x5t`) are rejected by default.
 This behaviour may be overwritten by setting the `allow_nil_kid` option for `decode` to `true`.

@@ -11,6 +11,7 @@
 **Fixes and enhancements:**
 
 - Your contribution here
+- Make `JWT::JWK::KeyFinder` thread safe with instance level coordination of concurrent JWKS refreshes, a bounded negative cache (`negative_cache_ttl`, `negative_cache_capacity`) for unknown kids, key preservation on refresh failures and protection against stale refresh results overwriting newer ones
 
 ## [v3.3.0](https://github.com/jwt/ruby-jwt/tree/v3.3.0) (2026-09-11)
 
