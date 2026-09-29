@@ -154,6 +154,41 @@ ical = schedule.to_ical
 IceCube::Schedule.from_ical(ical)
 ```
 
+### RRULE extensions
+
+External systems sometimes attach non-standard components to an RRULE.
+`IceCube::IcalParser.parse_rule` reads them without throwing the information
+away: it returns an `IceCube::ParsedRule` that keeps the executable rule
+separate from the unrecognized components.
+
+``` ruby
+result = IceCube::IcalParser.parse_rule("FREQ=DAILY;X-ROOM=main")
+
+result.extensions # => [#<IceCube::ParsedRule::Extension name="X-ROOM" value="main">]
+result.to_ical    # => "FREQ=DAILY;X-ROOM=main" (extensions survive the round-trip)
+
+result.to_rule                        # raises IceCube::UnknownRuleExtension
+result.to_rule(extensions: :ignore)   # => the executable IceCube::Rule
+```
+
+Component names are matched case-insensitively and normalized to uppercase,
+extension values are preserved verbatim, repeated known components raise
+`ArgumentError`, and repeated extensions are all kept in order. Unknown
+extensions are never treated as no-ops: executing the rule requires an
+explicit `extensions: :reject` (the default) or `extensions: :ignore`.
+
+Extensions understood by your application can be registered so they are
+applied to the rule at parse time:
+
+``` ruby
+IceCube::IcalParser.register_extension("X-COUNT-LIMIT") do |rule, value|
+  rule.count(value.to_i)
+end
+
+IceCube::IcalParser.parse_rule("FREQ=DAILY;X-COUNT-LIMIT=3").to_rule
+# => IceCube::Rule.daily.count(3)
+```
+
 ---
 
 ## Using your words

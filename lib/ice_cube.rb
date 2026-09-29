@@ -12,6 +12,7 @@ module IceCube
   autoload :Rule, "ice_cube/rule"
   autoload :Schedule, "ice_cube/schedule"
   autoload :Occurrence, "ice_cube/occurrence"
+  autoload :ParsedRule, "ice_cube/parsed_rule"
 
   autoload :IcalBuilder, "ice_cube/builders/ical_builder"
   autoload :HashBuilder, "ice_cube/builders/hash_builder"
@@ -23,6 +24,7 @@ module IceCube
 
   autoload :CountExceeded, "ice_cube/errors/count_exceeded"
   autoload :UntilExceeded, "ice_cube/errors/until_exceeded"
+  autoload :UnknownRuleExtension, "ice_cube/errors/unknown_rule_extension"
 
   autoload :ValidatedRule, "ice_cube/validated_rule"
   autoload :SingleOccurrenceRule, "ice_cube/single_occurrence_rule"
