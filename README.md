@@ -58,6 +58,68 @@ JMESPath.search('foo.bar', data)
 #=> "value"
 ```
 
+## Diagnostic Mode
+
+When reviewing configuration files, a key that is absent often means
+something different than a key explicitly set to `null`. The default
+`JMESPath.search` maps both to `nil`. `JMESPath.diagnose` keeps them
+apart: it evaluates the expression with an internal `missing` sentinel
+and returns a JSON serializable report instead of a plain value.
+
+```ruby
+JMESPath.diagnose(expression, data)
+#=> {"value" => ..., "diagnostics" => [{"path" => "...", "reason" => "..."}]}
+```
+
+The `"value"` follows the default semantics (missing becomes `nil`), and
+`"diagnostics"` lists where the expression relied on something absent.
+Reasons are `"missing_key"`, `"index_out_of_bounds"`, `"not_traversable"`
+and `"function_argument"`. The internal sentinel never leaks into the
+report.
+
+How `missing` behaves inside an expression, compared to `null`:
+
+| Context | `null` | `missing` (diagnostic mode) |
+| --- | --- | --- |
+| `a == \`null\`` | `true` | `false` |
+| `a != \`null\`` | `false` | `true` |
+| `a > \`1\`` (ordering) | `null` | `null` |
+| `!a`, `a && b`, `a \|\| b` | falsey | falsey |
+| `[*].a` projection | element dropped | element dropped + recorded |
+| `f(a)` function argument | passed as `null` | passed as `null` + recorded |
+
+Running both modes over the same input, including a path that goes
+missing in the middle (see `examples/diagnose.rb`):
+
+```ruby
+data = {
+  'service' => {
+    'endpoint' => 'https://example.com',
+    'retries'  => nil,                 # explicitly null
+    # 'timeout' is absent
+    'tags' => [{ 'name' => 'a' }, { 'name' => 'b', 'weight' => 2 }]
+  }
+}
+
+JMESPath.search('service.timeout.seconds', data)
+#=> nil
+JMESPath.diagnose('service.timeout.seconds', data)
+#=> {"value"=>nil,
+#    "diagnostics"=>[{"path"=>"service.timeout", "reason"=>"missing_key"}]}
+
+JMESPath.search('service.timeout == `null`', data)
+#=> true
+JMESPath.diagnose('service.timeout == `null`', data)
+#=> {"value"=>false,
+#    "diagnostics"=>[{"path"=>"service.timeout", "reason"=>"missing_key"}]}
+
+JMESPath.search('service.tags[*].weight', data)
+#=> [2]
+JMESPath.diagnose('service.tags[*].weight', data)
+#=> {"value"=>[2],
+#    "diagnostics"=>[{"path"=>"weight", "reason"=>"missing_key"}]}
+```
+
 ## JSON Documents
 
 If you have JSON documents on disk, or IO objects that contain JSON documents, you can pass them as the data argument.

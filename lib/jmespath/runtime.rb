@@ -57,6 +57,30 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # Searches data in diagnostic mode. Unlike {#search}, a missing
+    # key/index is tracked internally with a sentinel and reported
+    # separately from an explicit `null` value.
+    #
+    # @param [String<JMESPath>] expression
+    # @param [Hash] data
+    # @return [Hash] A JSON serializable report with two keys:
+    #
+    #   * `"value"` - the search result, with missing values as `nil`.
+    #   * `"diagnostics"` - an array of entries, each with a `"path"`,
+    #     a `"reason"` (`"missing_key"`, `"index_out_of_bounds"`,
+    #     `"not_traversable"` or `"function_argument"`) and an optional
+    #     `"detail"`.
+    def diagnose(expression, data)
+      optimized_expression = @parser.parse(expression).optimize
+      result, context = DiagnosticContext.activate do
+        optimized_expression.visit(data)
+      end
+      {
+        'value' => DiagnosticContext.sanitize(result),
+        'diagnostics' => context.entries
+      }
+    end
+
     private
 
     def default_parser(options)

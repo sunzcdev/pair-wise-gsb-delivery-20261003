@@ -8,8 +8,8 @@ module JMESPath
       end
 
       def visit(value)
-        if value.nil?
-          value
+        if value.nil? || value.equal?(MISSING)
+          nil
         else
           @children.map { |n| n.visit(value) }
         end

@@ -9,18 +9,21 @@ module JMESPath
         @children = children
         @options = options
         @disable_visit_errors = @options[:disable_visit_errors]
+        @function_name = @options[:function_name]
       end
 
       def self.create(name, children, options = {})
         if (type = FUNCTIONS[name])
-          type.new(children, options)
+          type.new(children, options.merge(function_name: name))
         else
           raise Errors::UnknownFunctionError, "unknown function #{name}()"
         end
       end
 
       def visit(value)
-        call(@children.map { |child| child.visit(value) })
+        args = @children.map { |child| child.visit(value) }
+        args = coerce_missing_args(args) if DiagnosticContext.active?
+        call(args)
       end
 
       def optimize
@@ -36,6 +39,23 @@ module JMESPath
       end
 
       private
+
+      # Diagnostic mode: functions keep the default semantics, so MISSING
+      # arguments are coerced to `null` and a diagnostic entry is recorded.
+      def coerce_missing_args(args)
+        args.map do |arg|
+          if arg.equal?(MISSING)
+            DiagnosticContext.current.record(
+              nil,
+              'function_argument',
+              "missing value coerced to null in #{@function_name}() argument"
+            )
+            nil
+          else
+            DiagnosticContext.sanitize(arg)
+          end
+        end
+      end
 
       def maybe_raise(error_type, message)
         raise error_type, message unless @disable_visit_errors

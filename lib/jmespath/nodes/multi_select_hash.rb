@@ -8,7 +8,7 @@ module JMESPath
       end
 
       def visit(value)
-        if value.nil?
+        if value.nil? || value.equal?(MISSING)
           nil
         else
           @kv_pairs.each_with_object({}) do |pair, hash|

@@ -13,7 +13,7 @@ module JMESPath
           list = []
           targets.each do |v|
             vv = @projection.visit(v)
-            list << vv unless vv.nil?
+            list << vv unless vv.nil? || vv.equal?(MISSING)
           end
           list
         end
@@ -37,7 +37,11 @@ module JMESPath
     module FastProjector
       def visit(value)
         if (targets = extract_targets(@target.visit(value)))
-          targets.compact
+          if DiagnosticContext.active?
+            targets.reject { |v| v.nil? || v.equal?(MISSING) }
+          else
+            targets.compact
+          end
         end
       end
     end

@@ -13,6 +13,25 @@ module JMESPath
       def chains_with?(_other)
         false
       end
+
+      private
+
+      # Records a diagnostic entry and returns the MISSING sentinel.
+      # Only called when a DiagnosticContext is active.
+      def record_missing(path, reason = 'missing_key')
+        DiagnosticContext.current.record(path, reason)
+        MISSING
+      end
+
+      def append_diagnostic_path(path, key)
+        if key.is_a?(Integer)
+          "#{path}[#{key}]"
+        elsif path.empty?
+          key.to_s
+        else
+          "#{path}.#{key}"
+        end
+      end
     end
 
     require  'jmespath/nodes/subexpression'
