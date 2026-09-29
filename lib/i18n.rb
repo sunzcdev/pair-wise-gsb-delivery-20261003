@@ -6,6 +6,7 @@ require 'concurrent/hash'
 require 'i18n/version'
 require 'i18n/utils'
 require 'i18n/exceptions'
+require 'i18n/explanation'
 require 'i18n/interpolate/ruby'
 
 module I18n
@@ -21,6 +22,7 @@ module I18n
     deep_interpolation
     skip_interpolation
     default
+    explain
     exception_handler
     fallback
     fallback_in_progress
@@ -261,6 +263,28 @@ module I18n
       translate(key, **options, raise: true)
     end
     alias :t! :translate!
+
+    # Translates the given key exactly like I18n.translate does and, in the
+    # same pass, collects an I18n::Explanation describing how the result was
+    # resolved. Returns the translation and the explanation as a pair:
+    #
+    #   translation, explanation = I18n.explain(:'foo.bar', :locale => :de)
+    #   explanation.steps # => [{ :type => :chain, :backend => ..., ... }, ...]
+    #   explanation.hit   # => { :type => :lookup, :backend => ..., :locale => :en,
+    #                     #      :keys => [:en, :foo, :bar], :found => true }
+    #
+    # The explanation is recorded while the backends resolve the translation,
+    # so no backend is queried twice and no interpolation callable is
+    # executed for the sake of the explanation. It works transparently
+    # through the Chain, Fallbacks and Cascade modules as well as symbol
+    # aliases. The explanation is returned separately from the translation
+    # and no global state is written.
+    def explain(key = nil, locale: nil, **options)
+      locale ||= config.locale
+      explanation = Explanation.new(key, locale)
+      translation = translate(key, **options.merge(:locale => locale, :explain => explanation))
+      [translation, explanation]
+    end
 
     # Returns an array of interpolation keys for the given translation key
     #

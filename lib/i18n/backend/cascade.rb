@@ -45,7 +45,10 @@ module I18n
         scope = I18n.normalize_keys(nil, key, scope, separator)
         key   = (scope.slice!(-offset, offset) || []).join(separator)
 
+        explain = options[:explain]
+
         begin
+          explain&.record(:cascade, :backend => self, :locale => locale, :scope => scope.dup, :key => key)
           result = super
           return result unless result.nil?
           scope = scope.dup

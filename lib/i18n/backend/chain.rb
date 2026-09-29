@@ -60,6 +60,7 @@ module I18n
           backends.each do |backend|
             catch(:exception) do
               options = default_options if backend == backends.last
+              options[:explain]&.record(:chain, :backend => backend, :locale => locale, :key => key)
               translation = backend.translate(locale, key, options)
               if namespace_lookup?(translation, options)
                 namespace = _deep_merge(translation, namespace || {})

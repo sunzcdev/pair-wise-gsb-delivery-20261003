@@ -30,6 +30,9 @@ module I18n
         raise InvalidLocale.new(locale) unless locale
         return nil if key.nil? && !options.key?(:default)
 
+        explain = options[:explain]
+        explain&.record(:translate, :backend => self, :locale => locale, :key => key)
+
         entry = lookup(locale, key, options[:scope], options) unless key.nil?
 
         if entry.nil? && options.key?(:default)
@@ -149,9 +152,11 @@ module I18n
         # subjects will be returned directly.
         def resolve(locale, object, subject, options = EMPTY_HASH)
           return subject if options[:resolve] == false
+          explain = options[:explain]
           result = catch(:exception) do
             case subject
             when Symbol
+              explain&.record(:resolve, :backend => self, :locale => locale, :key => subject)
               I18n.translate(
                 subject,
                 **options.merge(
