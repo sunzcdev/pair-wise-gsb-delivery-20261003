@@ -74,6 +74,68 @@ module Dry
         # @param exc [Exception]
         # @return [Task]
         def failed(exc) = new(Promise.reject(exc))
+
+        # Runs a loop over Task-returning steps and returns a Task
+        # for the final value.
+        #
+        # The block is called with the current state and must return
+        # a Task producing a control marker: Continue(next_state) to
+        # keep looping or Done(value) to stop. A rejected task halts
+        # the loop and its error is propagated as is, without calling
+        # the block again.
+        #
+        # Steps that have already completed are advanced in a trampoline
+        # loop, so any number of them runs without growing the Ruby call
+        # stack (unlike a recursion built on top of #bind). Steps that
+        # are still running are chained asynchronously: the calling
+        # thread is never blocked waiting for them.
+        #
+        # @example
+        #   Dry::Monads::Task.tail_rec(0) do |i|
+        #     Task { i < 10 ? Continue(i + 1) : Done(i) }
+        #   end # => Task(value=10)
+        #
+        # @param initial [Object] initial state
+        # @yieldparam state [Object] current state
+        # @yieldreturn [Task] a task of Continue(state) or Done(value)
+        # @return [Task]
+        def tail_rec(initial, &block)
+          state = initial
+
+          loop do
+            task = block.call(state)
+
+            unless task.is_a?(Task)
+              raise ::TypeError,
+                    "Task.tail_rec expects the block to return a Task, " \
+                    "got: #{task.inspect}"
+            end
+
+            promise = task.__send__(:promise)
+
+            if promise.fulfilled?
+              step = TailRec.check_step!(promise.value)
+
+              return pure(step.value) if step.is_a?(TailRec::Done)
+
+              state = step.state
+            elsif promise.rejected?
+              return task
+            else
+              # The step is still running: chain the rest of the loop
+              # asynchronously instead of blocking the calling thread
+              return task.bind do |value|
+                step = TailRec.check_step!(value)
+
+                if step.is_a?(TailRec::Done)
+                  pure(step.value)
+                else
+                  tail_rec(step.state, &block)
+                end
+              end
+            end
+          end
+        end
       end
 
       include ConversionStubs[:to_maybe, :to_result]
@@ -290,6 +352,7 @@ module Dry
         end
 
         include Constructors
+        include TailRec::Constructors
       end
     end
 

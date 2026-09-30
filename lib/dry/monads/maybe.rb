@@ -43,6 +43,49 @@ module Dry
         def to_proc
           @to_proc ||= method(:coerce).to_proc
         end
+
+        # Runs a stack-safe loop over Maybe-returning steps.
+        #
+        # The block is called with the current state and must return
+        # a Some wrapping a control marker: Continue(next_state) to
+        # keep looping or Done(value) to stop. None halts the loop and
+        # is returned as is, without calling the block again.
+        # The loop is trampolined so it doesn't grow the Ruby call stack,
+        # unlike a recursion built on top of #bind.
+        #
+        # Note that Done(nil) is coerced to None since Some cannot hold nil.
+        #
+        # @example
+        #   Dry::Monads::Maybe.tail_rec(0) do |i|
+        #     Some(i < 10 ? Continue(i + 1) : Done(i))
+        #   end # => Some(10)
+        #
+        # @param initial [Object] initial state
+        # @yieldparam state [Object] current state
+        # @yieldreturn [Maybe] Some(Continue)/Some(Done) or None
+        # @return [Maybe::Some, Maybe::None]
+        def tail_rec(initial)
+          state = initial
+
+          loop do
+            result = yield(state)
+
+            case result
+            when Some
+              step = TailRec.check_step!(result.value!)
+
+              return Maybe.coerce(step.value) if step.is_a?(TailRec::Done)
+
+              state = step.state
+            when None
+              return result
+            else
+              raise ::TypeError,
+                    "Maybe.tail_rec expects the block to return a Maybe, " \
+                    "got: #{result.inspect}"
+            end
+          end
+        end
       end
 
       # Returns true for an instance of a {Maybe::None} monad.
@@ -302,6 +345,7 @@ module Dry
         end
 
         include Constructors
+        include TailRec::Constructors
       end
 
       # Utilities for working with hashes storing Maybe values

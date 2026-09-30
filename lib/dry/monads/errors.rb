@@ -19,6 +19,17 @@ module Dry
       end
     end
 
+    # Raised when a tail_rec step produces something
+    # that is not a Continue/Done control marker.
+    class InvalidTailRecStepError < ::TypeError
+      def initialize(step)
+        super(
+          "tail_rec steps must return Continue(state) to keep looping " \
+          "or Done(value) to stop, got: #{step.inspect}"
+        )
+      end
+    end
+
     # Improper use of None
     class ConstructorNotAppliedError < ::NoMethodError
       def initialize(method_name, constructor_name)

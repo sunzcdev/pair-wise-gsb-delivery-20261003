@@ -29,6 +29,47 @@ module Dry
         def pure(value = Undefined, &block)
           Success.new(Undefined.default(value, block))
         end
+
+        # Runs a stack-safe loop over Result-returning steps.
+        #
+        # The block is called with the current state and must return
+        # a Success wrapping a control marker: Continue(next_state) to
+        # keep looping or Done(value) to stop. A Failure halts the loop
+        # and is returned as is, without calling the block again.
+        # The loop is trampolined so it doesn't grow the Ruby call stack,
+        # unlike a recursion built on top of #bind.
+        #
+        # @example
+        #   Dry::Monads::Result.tail_rec(0) do |i|
+        #     Success(i < 10 ? Continue(i + 1) : Done(i))
+        #   end # => Success(10)
+        #
+        # @param initial [Object] initial state
+        # @yieldparam state [Object] current state
+        # @yieldreturn [Result] Success(Continue)/Success(Done) or Failure
+        # @return [Result::Success, Result::Failure]
+        def tail_rec(initial)
+          state = initial
+
+          loop do
+            result = yield(state)
+
+            case result
+            when Success
+              step = TailRec.check_step!(result.value!)
+
+              return Success.new(step.value) if step.is_a?(TailRec::Done)
+
+              state = step.state
+            when Failure
+              return result
+            else
+              raise ::TypeError,
+                    "Result.tail_rec expects the block to return a Result, " \
+                    "got: #{result.inspect}"
+            end
+          end
+        end
       end
 
       # Returns self, added to keep the interface compatible with other monads.
@@ -317,6 +358,7 @@ module Dry
         end
 
         include Constructors
+        include TailRec::Constructors
       end
     end
 

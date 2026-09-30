@@ -9,6 +9,19 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- New `tail_rec` combinator for `Result`, `Maybe`, and `Task`. It runs a stack-safe loop over monadic steps: each step returns `Continue(next_state)` to keep looping or `Done(value)` to stop. `Failure`, `None`, and rejected tasks halt the loop with their usual semantics. Completed task steps are advanced in a trampoline loop (no Ruby stack growth), while pending ones are chained asynchronously without blocking the calling thread. The `Continue`/`Done` constructors are available via `Dry::Monads.Continue`/`Dry::Monads.Done` and are included in the `:result`, `:maybe`, and `:task` mixins.
+
+  ```ruby
+  include Dry::Monads[:result]
+
+  Dry::Monads::Result.tail_rec(cursor: nil, acc: []) do |state|
+    fetch_page(state[:cursor]).fmap do |page|
+      acc = state[:acc] + page.items
+      page.next_cursor ? Continue(cursor: page.next_cursor, acc: acc) : Done(acc)
+    end
+  end
+  ```
+
 ### Changed
 
 ### Deprecated
