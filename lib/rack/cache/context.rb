@@ -182,7 +182,7 @@ module Rack::Cache
           if fresh_enough?(entry)
             record :fresh
             entry.headers['age'] = entry.age.to_s
-            entry
+            range_response(entry) || entry
           else
             record :stale
             if fault_tolerant?
@@ -196,6 +196,174 @@ module Rack::Cache
           fetch
         end
       end
+    end
+
+    # Attempt to satisfy a Range request from a fresh, complete cache entry.
+    # Returns a 206 or 416 Response when the Range header applies, or nil
+    # when the request must be served with the full representation (no Range
+    # header, non-GET method, malformed range-set, unknown representation
+    # size, or an If-Range validator that doesn't match).
+    #
+    # http://tools.ietf.org/html/rfc7233
+    def range_response(entry)
+      return unless @request.get?
+      return unless entry.status == 200
+      header = @env['HTTP_RANGE']
+      return unless header
+      return unless if_range_satisfied_by?(entry)
+      size = representation_size(entry)
+      return unless size
+      ranges = parse_byte_ranges(header, size)
+      return unless ranges
+      record :range
+      if ranges.empty?
+        unsatisfiable_range_response(entry, size)
+      elsif ranges.length == 1
+        single_range_response(entry, ranges[0], size)
+      else
+        multipart_range_response(entry, ranges, size)
+      end
+    end
+
+    # Evaluate the If-Range header against the cache entry's validators.
+    # Entity-tags are compared using the strong comparison function, so a
+    # weak validator never matches; an HTTP-date must be identical to the
+    # entry's Last-Modified value.
+    #
+    # http://tools.ietf.org/html/rfc7233#section-3.2
+    def if_range_satisfied_by?(entry)
+      validator = @env['HTTP_IF_RANGE']
+      return true unless validator
+      validator = validator.strip
+      if validator.start_with?('"', 'W/"')
+        !validator.start_with?('W/') && validator == entry.etag.to_s
+      else
+        last_modified = entry.last_modified
+        !last_modified.nil? && last_modified == validator
+      end
+    end
+
+    # The size in bytes of the representation actually stored in the cache,
+    # as recorded in the Content-Length header when the entry was written.
+    # Byte positions are interpreted against this stored representation
+    # as-is (e.g., still content-encoded); it is never decoded first.
+    def representation_size(entry)
+      length = entry.headers['content-length']
+      length && length.to_i >= 0 ? length.to_i : nil
+    end
+
+    # Parse a Range header into an Array of [first, last] byte positions
+    # (inclusive) that are satisfiable for a representation of the given
+    # size. Returns nil when the header uses an unknown unit or is
+    # malformed (in which case it must be ignored), and an empty Array
+    # when no requested range is satisfiable (a 416 response).
+    #
+    # http://tools.ietf.org/html/rfc7233#section-2.1
+    def parse_byte_ranges(header, size)
+      match = /\A\s*bytes\s*=\s*(\S.*)\z/.match(header)
+      return nil unless match
+      ranges = []
+      match[1].split(',').each do |spec|
+        return nil unless spec =~ /\A\s*(?:(\d+)\s*-\s*(\d*)|-(\d+))\s*\z/
+        if $3
+          # suffix-byte-range-spec: the last N bytes of the representation
+          suffix = $3.to_i
+          next if suffix == 0 || size == 0
+          first = size - suffix
+          first = 0 if first < 0
+          ranges << [first, size - 1]
+        else
+          first = $1.to_i
+          next if first >= size
+          last = $2.nil? || $2.empty? ? size - 1 : $2.to_i
+          last = size - 1 if last >= size
+          next if last < first
+          ranges << [first, last]
+        end
+      end
+      ranges
+    end
+
+    # Walk the stored body chunks exactly once, collecting the requested
+    # byte ranges without ever joining the whole representation into a
+    # single string. Returns one Array of chunk pieces per range, in the
+    # order the ranges were given.
+    def slice_body_ranges(body, ranges)
+      slices = ranges.map { [] }
+      position = 0
+      body.each do |chunk|
+        offset = position
+        position += chunk.bytesize
+        ranges.each_with_index do |(first, last), index|
+          next if last < offset || first >= position
+          from = first > offset ? first - offset : 0
+          to = last < position ? last - offset : chunk.bytesize - 1
+          slices[index] << chunk.byteslice(from, to - from + 1)
+        end
+      end
+      body.close if body.respond_to?(:close)
+      slices
+    end
+
+    # Build a 416 Range Not Satisfiable response for the entry.
+    def unsatisfiable_range_response(entry, size)
+      entry.body.close if entry.body.respond_to?(:close)
+      response = entry.dup
+      response.status = 416
+      response.body = []
+      response.headers['content-range'] = "bytes */#{size}"
+      response.headers.delete('content-length')
+      response
+    end
+
+    # Build a 206 Partial Content response for a single byte range.
+    def single_range_response(entry, range, size)
+      first, last = range
+      response = entry.dup
+      response.status = 206
+      response.body = slice_body_ranges(entry.body, [range])[0]
+      response.headers['content-range'] = "bytes #{first}-#{last}/#{size}"
+      response.headers['content-length'] = (last - first + 1).to_s
+      response.headers['accept-ranges'] = 'bytes'
+      response
+    end
+
+    # Build a 206 Partial Content response carrying each byte range in a
+    # separate multipart/byteranges body part. The Content-Length accounts
+    # for the boundary delimiters, per-part headers, and range data so the
+    # overall message stays self-consistent.
+    #
+    # http://tools.ietf.org/html/rfc7233#section-4.1
+    def multipart_range_response(entry, ranges, size)
+      slices = slice_body_ranges(entry.body, ranges)
+      boundary = "rack-cache-#{rand(1 << 64).to_s(16)}"
+      content_type = entry.headers['content-type']
+      body, length = [], 0
+      ranges.each_with_index do |(first, last), index|
+        part = "--#{boundary}\r\n"
+        part << "Content-Type: #{content_type}\r\n" if content_type
+        part << "Content-Range: bytes #{first}-#{last}/#{size}\r\n\r\n"
+        body << part
+        length += part.bytesize
+        slices[index].each do |piece|
+          body << piece
+          length += piece.bytesize
+        end
+        body << "\r\n"
+        length += 2
+      end
+      closing = "--#{boundary}--\r\n"
+      body << closing
+      length += closing.bytesize
+
+      response = entry.dup
+      response.status = 206
+      response.body = body
+      response.headers['content-type'] = "multipart/byteranges; boundary=#{boundary}"
+      response.headers['content-length'] = length.to_s
+      response.headers['accept-ranges'] = 'bytes'
+      response.headers.delete('content-range')
+      response
     end
 
     # Returns stale cache on exception.

@@ -230,6 +230,7 @@ module Rack::Cache
       content-language
       content-length
       content-md5
+      content-range
       content-type
       last-modified
     ].to_set
