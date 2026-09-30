@@ -149,6 +149,24 @@ template.render!({ 'x' => 1}, { strict_variables: true })
 #=> Liquid::UndefinedVariable: Liquid error: undefined variable y
 ```
 
+### Protected blocks
+
+Use the `protect` tag to make an optional section atomic. Output from the protected section is discarded when a
+Liquid template error is raised, and the `fallback` section is rendered instead. Process-level exceptions are not
+caught. Assignments remain local to either section, while resource usage consumed by the failed section still counts
+against the render.
+
+```liquid
+{% protect %}
+  {{ recommendation.body }}
+{% fallback %}
+  Recommendations are temporarily unavailable.
+{% endprotect %}
+```
+
+The fallback can read safe diagnostics from `error.message`, `error.type`, `error.template_name`, and
+`error.line_number`. The original exception, cause, and backtrace are not exposed.
+
 ### Resource limits
 
 `render_score_limit` and `cumulative_render_score_limit` account for each item visited by

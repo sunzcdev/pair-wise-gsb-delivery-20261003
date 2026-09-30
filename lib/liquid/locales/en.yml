@@ -18,6 +18,8 @@
       inline_comment_invalid: "Syntax error in tag '#' - Each line of comments must be prefixed by the '#' character"
       invalid_delimiter: "'%{tag}' is not a valid delimiter for %{block_name} tags. use %{block_delimiter}"
       invalid_template_encoding: "Invalid template encoding"
+      protect_missing_fallback: "Syntax Error in 'protect' - Valid syntax: {% protect %}{% fallback %}{% endprotect %}"
+      protect_multiple_fallback: "Syntax Error in 'protect' - Only one fallback block is allowed"
       render: "Syntax error in tag 'render' - Template name must be a quoted string"
       table_row: "Syntax Error in 'table_row loop' - Valid syntax: table_row [item] in [collection] cols=3"
       table_row_invalid_attribute: "Invalid attribute '%{attribute}' in tablerow loop. Valid attributes are cols, limit, offset, and range"

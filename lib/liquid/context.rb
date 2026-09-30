@@ -105,6 +105,32 @@ module Liquid
       exception_renderer.call(e).to_s
     end
 
+    # @api private
+    def with_isolated_errors
+      previous_errors = @errors
+      @errors = []
+      yield
+    ensure
+      @errors = previous_errors
+    end
+
+    # @api private
+    def with_local_scope
+      local_scope = {}
+      if base_scope_depth + @scopes.length + 1 > Block::MAX_DEPTH
+        raise StackLevelError, "Nesting too deep"
+      end
+
+      @scopes.unshift(local_scope)
+      @scopes.push(local_scope)
+      @base_scope_depth -= 1
+      yield
+    ensure
+      @base_scope_depth += 1
+      @scopes.shift if @scopes.first.equal?(local_scope)
+      @scopes.pop if @scopes.last.equal?(local_scope)
+    end
+
     def invoke(method, *args)
       strainer.invoke(method, *args).to_liquid
     end
