@@ -321,6 +321,77 @@ RSpec.describe(Dry::Monads::Result) do
         )
       end
     end
+
+    describe "#bind_if" do
+      it "calls the factory once when the condition continues" do
+        calls = 0
+        outcome = success[2].bind_if(-> v { success[v.even?] }) { |v|
+          calls += 1
+          success[v * 10]
+        }
+
+        expect(outcome).to eql(success[20])
+        expect(calls).to be(1)
+      end
+
+      it "can continue with a Failure from the factory" do
+        outcome = success[2].bind_if(-> _ { success[true] }) { failure[:nope] }
+
+        expect(outcome).to eql(failure[:nope])
+      end
+
+      it "completes with the fallback value without calling the factory" do
+        calls = 0
+        outcome = success[3].bind_if(-> v { success[v.even?] }, :skipped) { |v|
+          calls += 1
+          success[v * 10]
+        }
+
+        expect(outcome).to eql(success[:skipped])
+        expect(calls).to be(0)
+      end
+
+      it "uses Unit as the default fallback" do
+        outcome = success[3].bind_if(-> _ { success[false] }) { raise }
+
+        expect(outcome).to eql(success[unit])
+      end
+
+      it "returns a Failure from the condition without calling the factory" do
+        calls = 0
+        outcome = success[2].bind_if(-> _ { failure[:closed] }) { |v|
+          calls += 1
+          success[v]
+        }
+
+        expect(outcome).to eql(failure[:closed])
+        expect(calls).to be(0)
+      end
+
+      it "propagates errors raised by the factory" do
+        expect {
+          success[2].bind_if(-> _ { success[true] }) { raise ArgumentError, "boom" }
+        }.to raise_error(ArgumentError, "boom")
+      end
+
+      it "raises a TypeError when the factory doesn't return a Result" do
+        expect {
+          success[2].bind_if(-> _ { success[true] }) { :not_a_result }
+        }.to raise_error(TypeError, /factory must return a Result/)
+      end
+
+      it "raises a TypeError when the condition doesn't return a Result" do
+        expect {
+          success[2].bind_if(-> _ { true }) { raise }
+        }.to raise_error(TypeError, /condition must return a Result/)
+      end
+
+      it "requires a factory block" do
+        expect {
+          success[2].bind_if(-> _ { success[true] })
+        }.to raise_error(ArgumentError, /factory block/)
+      end
+    end
   end
 
   describe result::Failure do
@@ -368,6 +439,12 @@ RSpec.describe(Dry::Monads::Result) do
 
       it "ignores extra arguments" do
         expect(subject.bind(1, 2, 3) { raise }).to be subject
+      end
+    end
+
+    describe "#bind_if" do
+      it "returns itself without calling the condition or the factory" do
+        expect(subject.bind_if(-> _ { raise }) { raise }).to be subject
       end
     end
 

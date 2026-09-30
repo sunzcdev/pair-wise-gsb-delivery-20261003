@@ -127,6 +127,51 @@ module Dry
         #
         # @return [Result::Success]
         def alt_map(_ = nil, &) = self
+
+        # Conditionally composes the result with the next effect.
+        #
+        # The condition is called with the wrapped value and must return
+        # a Result. Only when it's a Success holding a truthy value the
+        # factory is invoked (exactly once) to produce the next Result.
+        # Otherwise the factory is never called: a Failure from the
+        # condition is returned as is, and a falsy verdict completes
+        # the composition with the fallback value, so no branch is
+        # created in vain.
+        #
+        # @example
+        #   Dry::Monads.Success(2).bind_if(-> v { Dry::Monads.Success(v.even?) }, :skipped) { |v|
+        #     Dry::Monads.Success(v * 10)
+        #   } # => Success(20)
+        #
+        # @param condition [#call] decides whether the composition continues
+        # @param fallback [Object] completion value used when the condition
+        #                          rejects continuation
+        # @param factory [Proc] produces the next Result, called at most once
+        # @return [Result::Success, Result::Failure]
+        # @raise [TypeError] if the condition or the factory doesn't return a Result
+        def bind_if(condition, fallback = Unit, &factory)
+          raise ArgumentError, "bind_if requires a factory block" unless factory
+
+          decision = condition.(@value)
+
+          case decision
+          when Failure
+            decision
+          when Success
+            if decision.value!
+              nxt = factory.(@value)
+              unless nxt.is_a?(Result)
+                raise TypeError, "factory must return a Result, got #{nxt.inspect}"
+              end
+
+              nxt
+            else
+              Success.new(fallback)
+            end
+          else
+            raise TypeError, "condition must return a Result, got #{decision.inspect}"
+          end
+        end
       end
 
       # Represents a value of a failed operation.
@@ -271,6 +316,11 @@ module Dry
           f = Undefined.default(proc, block)
           self.class.new(f.(failure), RightBiased::Left.trace_caller)
         end
+
+        # Ignores the condition and the factory, returns self.
+        #
+        # @return [Result::Failure]
+        def bind_if(...) = self
       end
 
       # A module that can be included for easier access to Result monads.

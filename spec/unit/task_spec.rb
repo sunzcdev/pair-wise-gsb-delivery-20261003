@@ -70,6 +70,112 @@ RSpec.describe(Dry::Monads::Task) do
     end
   end
 
+  describe "#bind_if" do
+    it "calls the factory only after the condition task completes, exactly once" do
+      condition_gate = Concurrent::Event.new
+      condition_calls = 0
+      factory_calls = 0
+
+      condition = ->(v) {
+        condition_calls += 1
+        task {
+          condition_gate.wait
+          v > 0
+        }
+      }
+      chain = task { 2 }.bind_if(condition, :skipped) { |v|
+        factory_calls += 1
+        task { v * 10 }
+      }
+
+      1000.times { condition_calls == 1 ? break : sleep(0.005) }
+
+      expect(condition_calls).to be(1)
+      expect(factory_calls).to be(0)
+      expect(chain).not_to be_complete
+
+      condition_gate.set
+
+      expect(chain.value!).to be(20)
+      expect(chain.value!).to be(20)
+      expect(condition_calls).to be(1)
+      expect(factory_calls).to be(1)
+    end
+
+    it "completes with the fallback value without calling the factory" do
+      factory_calls = 0
+      chain = task { 3 }.bind_if(-> v { task { v.even? } }, :skipped) { |_|
+        factory_calls += 1
+        task { :unreachable }
+      }
+
+      expect(chain.value!).to be(:skipped)
+      expect(factory_calls).to be(0)
+    end
+
+    it "uses Unit as the default fallback" do
+      chain = task { 3 }.bind_if(-> _ { task { false } }) { task { :unreachable } }
+
+      expect(chain.value!).to be(unit)
+    end
+
+    it "rejects when the condition task fails without calling the factory" do
+      factory_calls = 0
+      chain = task { 1 }.bind_if(-> _ { described_class.failed(RuntimeError.new("closed")) }) { |_|
+        factory_calls += 1
+        task { :unreachable }
+      }
+
+      expect { chain.value! }.to raise_error(RuntimeError, "closed")
+      expect(factory_calls).to be(0)
+    end
+
+    it "rejects without calling the condition or the factory when the upstream task fails" do
+      condition_calls = 0
+      factory_calls = 0
+      chain = task { 1 / 0 }.bind_if(-> _ { condition_calls += 1; task { true } }) { |_|
+        factory_calls += 1
+        task { :unreachable }
+      }
+
+      expect { chain.value! }.to raise_error(ZeroDivisionError)
+      expect(condition_calls).to be(0)
+      expect(factory_calls).to be(0)
+    end
+
+    it "rejects when the factory raises" do
+      chain = task { 1 }.bind_if(-> _ { task { true } }) { raise ArgumentError, "boom" }
+
+      expect { chain.value! }.to raise_error(ArgumentError, "boom")
+    end
+
+    it "propagates rejection of the task returned by the factory" do
+      chain = task { 1 }.bind_if(-> _ { task { true } }) { |_|
+        task { 1 / 0 }
+      }
+
+      expect { chain.value! }.to raise_error(ZeroDivisionError)
+    end
+
+    it "rejects with a TypeError when the condition doesn't return a Task" do
+      chain = task { 1 }.bind_if(-> _ { true }) { task { :unreachable } }
+
+      expect { chain.value! }.to raise_error(TypeError, /condition must return a Task/)
+    end
+
+    it "rejects with a TypeError when the factory doesn't return a Task" do
+      chain = task { 1 }.bind_if(-> _ { task { true } }) { :not_a_task }
+
+      expect { chain.value! }.to raise_error(TypeError, /factory must return a Task/)
+    end
+
+    it "requires a factory block" do
+      expect {
+        task { 1 }.bind_if(-> _ { task { true } })
+      }.to raise_error(ArgumentError, /factory block/)
+    end
+  end
+
   describe "#to_result" do
     it "transforms a successful execution to Result" do
       expect(subject.to_result).to eql(success[1])

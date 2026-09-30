@@ -121,6 +121,75 @@ module Dry
       end
       deprecate :then, :bind
 
+      # Conditionally composes the task with the next effect.
+      #
+      # Once the current task completes successfully, the condition is
+      # called with its value and must return a Task. Only when that
+      # task fulfills with a truthy value the factory is invoked
+      # (exactly once) to produce the next task. This defers creating
+      # the next effect — which may perform real side effects — until
+      # it's known to be needed. A falsy verdict completes the
+      # composition with the fallback value instead, and a rejected
+      # condition rejects the resulting task, in both cases the
+      # factory is never called.
+      #
+      # @example
+      #   Task.pure(2).bind_if(-> v { Task.pure(v.even?) }, :skipped) { |v| Task { v * 10 } }
+      #   # => Task(value=20)
+      #
+      # @param condition [#call] receives the task value and returns a Task
+      #                          whose fulfillment value decides whether
+      #                          the composition continues
+      # @param fallback [Object] value the resulting task fulfills with
+      #                          when the condition rejects continuation
+      # @param factory [Proc] produces the next task, called at most once
+      # @return [Task]
+      def bind_if(condition, fallback = Unit, &factory)
+        raise ArgumentError, "bind_if requires a factory block" unless factory
+
+        child = Promise.new(
+          parent: promise,
+          executor: Concurrent::ImmediateExecutor.new
+        )
+
+        promise.on_error { |reason| child.on_reject(reason) }
+        promise.on_success do |value|
+          begin
+            decision = condition.(value)
+            unless decision.is_a?(Task)
+              raise TypeError, "condition must return a Task, got #{decision.inspect}"
+            end
+
+            inner = decision.promise
+            inner.execute
+            inner.on_error { |reason| child.on_reject(reason) }
+            inner.on_success do |verdict|
+              if verdict
+                begin
+                  nxt = factory.(value)
+                  unless nxt.is_a?(Task)
+                    raise TypeError, "factory must return a Task, got #{nxt.inspect}"
+                  end
+
+                  nxt_promise = nxt.promise
+                  nxt_promise.execute
+                  nxt_promise.on_error { |reason| child.on_reject(reason) }
+                  nxt_promise.on_success { |v| child.on_fulfill(v) }
+                rescue StandardError => exception
+                  child.on_reject(exception)
+                end
+              else
+                child.on_fulfill(fallback)
+              end
+            end
+          rescue StandardError => exception
+            child.on_reject(exception)
+          end
+        end
+
+        self.class.new(child)
+      end
+
       # @return [String]
       def to_s
         state = case promise.state
