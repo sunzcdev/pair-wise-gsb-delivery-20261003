@@ -127,6 +127,29 @@ Or with 2 separate +eager_graph+ queries:
   # LEFT OUTER JOIN lyrics AS lyric ON (lyric.id = tracks.lyric_id)
   # WHERE (tracks.album_id IN (...));
 
+=== Using an Identity Map When Eager Loading
+
+By default, if the same database record is loaded via multiple association
+paths in the same query, separate model instances are created for each path.
+If you want all such positions to reference the same model instance, you can
+use +with_identity_map+ to enable an identity map for the query:
+
+  Album.with_identity_map.eager(:artist, tracks: :artist).all
+
+With the identity map enabled, for each album returned, the album's artist
+and each track's artist will be the same object if they are for the same
+artist.
+
+The identity map is keyed on the model class and primary key values
+(including composite primary keys), and only lasts for the duration of a
+single query, so no cached objects are retained after the query finishes.
+Records that do not have all primary key columns selected are not added to
+the identity map, and records loaded later do not overwrite column values or
+associations already loaded for the same record.
+
++with_identity_map+ works with both +eager+ and +eager_graph+, including
+combinations of the two.
+
 == Sequel::Model Association Loading Options
 
 There are a bunch of advanced association options that are available to

@@ -184,7 +184,7 @@ module Sequel
 
         # Set the retrieved_with and retrieved_by attributes for each of the associated objects
         # created by the eager graph loader with the appropriate class dataset and array of objects.
-        def _eager_graph_build_associations(_, egl)
+        def _eager_graph_build_associations(_, egl, identity_map=nil)
           objects = super
 
           master = egl.master

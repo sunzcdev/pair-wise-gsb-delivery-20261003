@@ -1,5 +1,7 @@
 === master
 
+* Add Dataset#with_identity_map for using an identity map when eager loading, so the same record loaded via multiple association paths uses the same model instance
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)

@@ -106,7 +106,7 @@ module Sequel
         # After building objects from the rows, if eager_graph_eager has been
         # called on the datasets, for each dependency chain specified, eagerly
         # load the appropriate associations.
-        def eager_graph_build_associations(rows)
+        def eager_graph_build_associations(rows, identity_map=nil)
           objects = super
 
           if eager_data = @opts[:eager_graph_eager]

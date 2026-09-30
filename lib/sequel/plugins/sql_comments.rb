@@ -172,7 +172,7 @@ module Sequel
 
         # Add the association name as part of the eager load data, so
         # perform_eager_load has access to it.
-        def prepare_eager_load(a, reflections, eager_assoc)
+        def prepare_eager_load(a, reflections, eager_assoc, identity_map=nil)
           res = super
           
           reflections.each do |r|
