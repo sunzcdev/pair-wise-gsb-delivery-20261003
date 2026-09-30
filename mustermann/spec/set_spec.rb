@@ -37,6 +37,54 @@ describe Mustermann::Set do
       it('supports range access')                 { expect(m[0..1]).to eq ['foo', 'bar'] }
     end
 
+    # ── capture byte spans ──────────────────────────────────────────────────
+
+    context 'capture spans' do
+      let(:path) { '/%E4%B8%AD%E6%96%87/a%2Fb/%E4%B8%AD%E6%96%87' }
+
+      it 'reports byte spans and raw text for every occurrence' do
+        set.add('/:x/:y/:x', :handler)
+        m = set.match(path)
+        expect(m.capture_occurrences.map(&:name)).to eq %w[x y x]
+        expect(m.capture_occurrences.map(&:span)).to eq [[1, 19], [20, 25], [26, 44]]
+        raw = m.capture_occurrences.map { |c| path.byteslice(c.start, c.length) }
+        expect(raw).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+        expect(m.capture_occurrences.map(&:bytes)).to eq raw
+        expect(m.raw_params).to eq('x' => ['%E4%B8%AD%E6%96%87', '%E4%B8%AD%E6%96%87'], 'y' => 'a%2Fb')
+        expect(m.params).to eq('x' => ['中文', '中文'], 'y' => 'a/b')
+      end
+
+      it 'keeps spans relative to the full string when peeking' do
+        set.add('/:x/:y/:x', :handler)
+        m = set.peek_match(path + '/extra')
+        expect(m.to_s).to eq path
+        expect(m.post_match).to eq '/extra'
+        expect(m.capture_occurrences.map(&:span)).to eq [[1, 19], [20, 25], [26, 44]]
+        raw = m.capture_occurrences.map { |c| m.string.byteslice(c.start, c.length) }
+        expect(raw).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+      end
+
+      it 'tells an absent optional segment from an empty capture' do
+        set.add('/:a(/:b)?/:z', :opt)
+        absent = set.match('/foo/bar')
+        b = absent.capture_occurrences.find { |c| c.name == 'b' }
+        expect(b.present?).to be false
+        expect(b.bytes).to be_nil
+        present = set.match('/foo/mid/bar').capture_occurrences.find { |c| c.name == 'b' }
+        expect(present.present?).to be true
+        expect(present.bytes).to eq 'mid'
+      end
+
+      it 'records multiple splat occurrences separately' do
+        set.add('/*/*', :two)
+        m = set.match('/foo/bar')
+        expect(m.capture_occurrences.map { |c| [c.name, c.span, c.bytes] }).to eq [
+          ['splat', [1, 4], 'foo'], ['splat', [5, 8], 'bar']
+        ]
+        expect(m.raw_params).to eq('splat' => ['foo', 'bar'])
+      end
+    end
+
     # ── values ──────────────────────────────────────────────────────────────
 
     context 'values' do
@@ -580,6 +628,57 @@ describe Mustermann::Set do
       set = described_class.new(use_trie: false, use_cache: true)
       set.add('/:name', :handler)
       expect(set.peek_match('/foo/extra').value).to eq :handler
+    end
+  end
+
+  # ── backend parity for capture spans ─────────────────────────────────────
+
+  describe 'capture span backend parity' do
+    let(:path) { '/%E4%B8%AD%E6%96%87/a%2Fb/%E4%B8%AD%E6%96%87' }
+
+    shared_examples 'identical spans' do |pattern_string|
+      let(:plain) { Mustermann.new(pattern_string) }
+      let(:linear) { described_class.new(use_trie: false, use_cache: false).tap { |s| s.add(pattern_string, :v) } }
+      let(:trie)   { described_class.new(use_trie: true,  use_cache: false).tap { |s| s.add(pattern_string, :v) } }
+
+      it 'slices identical raw bytes from the original input' do
+        expected = plain.match(path).capture_occurrences.map do |c|
+          path.byteslice(c.start, c.length)
+        end
+        [linear, trie].each do |set|
+          match = set.match(path)
+          slices = match.capture_occurrences.map { |c| path.byteslice(c.start, c.length) }
+          expect(slices).to eq expected
+          expect(match.capture_occurrences.map(&:span)).to eq plain.match(path).capture_occurrences.map(&:span)
+        end
+      end
+    end
+
+    include_examples 'identical spans', '/:x/:y/:x'
+
+    it 'also agrees for peek matches' do
+      pattern_string = '/:x/:y/:x'
+      input  = path + '/tail'
+      plain  = Mustermann.new(pattern_string).peek_match(input)
+      linear = described_class.new(use_trie: false, use_cache: false).tap { |s| s.add(pattern_string, :v) }.peek_match(input)
+      trie   = described_class.new(use_trie: true,  use_cache: false).tap { |s| s.add(pattern_string, :v) }.peek_match(input)
+      [plain, linear, trie].each do |match|
+        expect(match.capture_occurrences.map { |c| input.byteslice(c.start, c.length) }).to eq(
+          ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+        )
+      end
+    end
+
+    it 'agrees on byte spans for raw multibyte input with multibyte static segments' do
+      pattern_string = '/静/:name/尾'
+      input = '/静/中文/尾'
+      linear = described_class.new(use_trie: false, use_cache: false).tap { |s| s.add(pattern_string, :v) }.match(input)
+      trie   = described_class.new(use_trie: true,  use_cache: false).tap { |s| s.add(pattern_string, :v) }.match(input)
+      [linear, trie].each do |match|
+        expect(match.params).to eq('name' => '中文')
+        expect(match.capture_occurrences.map(&:span)).to eq [[5, 11]]
+        expect(match.capture_occurrences.map { |c| input.byteslice(c.start, c.length) }).to eq ['中文']
+      end
     end
   end
 

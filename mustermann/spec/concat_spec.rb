@@ -114,6 +114,19 @@ describe Mustermann::Concat do
     example { pattern.peek_match("/foo")              .should be_nil }
   end
 
+  describe 'capture spans' do
+    subject(:pattern) { Mustermann.new("/:a") + Mustermann.new("/:b", type: :rails, uri_decode: false) }
+
+    example 'offsets are relative to the full input, including when peeking' do
+      path  = '/%E4%B8%AD%E6%96%87/a%2Fb/tail'
+      match = pattern.peek_match(path)
+      expect(match.to_s).to eq '/%E4%B8%AD%E6%96%87/a%2Fb'
+      expect(match.capture_occurrences.map(&:span)).to eq [[1, 19], [20, 25]]
+      raw = match.capture_occurrences.map { |c| path.byteslice(c.start, c.length) }
+      expect(raw).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb']
+    end
+  end
+
   describe :peek_size do
     example { pattern.peek_size("/foo/bar/baz")  .should be == 8 }
     example { pattern.peek_size("/foo")          .should be_nil }

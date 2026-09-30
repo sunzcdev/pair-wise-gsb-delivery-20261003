@@ -87,7 +87,20 @@ module Mustermann
 
     def build_match(regexp, string)
       return unless match = regexp.match(string)
-      Match.new(self, match, params: build_params(match))
+      params = build_params(match)
+      repeated = !@simple_captures && match.regexp.named_captures.any? { |_, positions| positions.size > 1 }
+      if repeated
+        Match.new(self, match, params:, captures: match.captures, named_captures: group_named_captures(match))
+      else
+        Match.new(self, match, params:)
+      end
+    end
+
+    def group_named_captures(match)
+      match.regexp.named_captures.each_with_object({}) do |(name, positions), hash|
+        values = positions.map { |pos| match[pos] }
+        hash[name] = positions.size > 1 ? values : values.first
+      end
     end
 
     def build_params(match)
@@ -96,10 +109,20 @@ module Mustermann
         return params if params.empty? || identity_params?(params)
         params.each_with_object({}) { |(k, v), h| h[k] = map_param(k, v) }
       else
-        match.regexp.named_captures.to_h do |name, positions|
-          value = positions.size < 2 && !always_array?(name) ? map_param(name, match[name]) :
-            positions.flat_map { |pos| map_param(name, match[pos]) }
-          [name, value]
+        group_names = Array.new(match.regexp.named_captures.values.sum { |positions| positions.size })
+        match.regexp.named_captures.each do |name, positions|
+          positions.each { |pos| group_names[pos - 1] = name }
+        end
+        group_names.each_with_index.each_with_object({}) do |(name, index), hash|
+          value = map_param(name, match[index + 1])
+          if always_array?(name)
+            (hash[name] ||= []).concat(Array(value))
+          elsif hash.key?(name)
+            existing = hash[name]
+            hash[name] = existing.is_a?(Array) ? existing << value : [existing, value]
+          else
+            hash[name] = value
+          end
         end
       end
     end

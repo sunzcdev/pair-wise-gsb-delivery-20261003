@@ -92,4 +92,80 @@ describe Mustermann::Match do
       expect { Mustermann::Match.new(pattern, 42) }.to raise_error(ArgumentError, /second argument/)
     end
   end
+
+  describe 'capture spans' do
+    let(:pattern) { Mustermann::Sinatra.new('/:x/:y/:x') }
+    let(:path)    { '/%E4%B8%AD%E6%96%87/a%2Fb/%E4%B8%AD%E6%96%87' }
+    subject(:m)   { pattern.match(path) }
+
+    it 'exposes one occurrence per group, in left-to-right order' do
+      expect(m.capture_occurrences.map(&:name)).to eq %w[x y x]
+    end
+
+    it 'reports half-open byte spans relative to the original string' do
+      expect(m.capture_occurrences.map(&:span)).to eq [[1, 19], [20, 25], [26, 44]]
+      expect(m.capture_occurrences.map(&:range)).to eq [1...19, 20...25, 26...44]
+    end
+
+    it 'slices the exact raw bytes back out of the original string' do
+      raw = m.capture_occurrences.map { |c| path.byteslice(c.start, c.length) }
+      expect(raw).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+    end
+
+    it 'offers raw text on the occurrence itself' do
+      expect(m.capture_occurrences.map(&:bytes)).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+    end
+
+    it 'keeps raw text undecoded while params stay decoded' do
+      expect(m.params).to eq('x' => ['中文', '中文'], 'y' => 'a/b')
+      expect(m.raw_params).to eq('x' => ['%E4%B8%AD%E6%96%87', '%E4%B8%AD%E6%96%87'], 'y' => 'a%2Fb')
+    end
+
+    it 'distinguishes the two occurrences even with identical content' do
+      match = pattern.match('/a%2Fb/c/a%2Fb')
+      expect(match.capture_occurrences.map(&:span)).to eq [[1, 6], [7, 8], [9, 14]]
+      expect(match.capture('x').map(&:bytes)).to eq ['a%2Fb', 'a%2Fb']
+      expect(match.capture('y').bytes).to eq 'c'
+    end
+
+    it 'looks up occurrences by integer index' do
+      expect(m.capture(0).name).to eq 'x'
+      expect(m.capture(2).bytes).to eq '%E4%B8%AD%E6%96%87'
+    end
+
+    it 'marks an absent optional capture as not present' do
+      match = Mustermann::Sinatra.new('/:a(/:b)?/:z').match('/foo/bar')
+      absent = match.capture_occurrences.find { |c| c.name == 'b' }
+      expect(absent.present?).to be false
+      expect(absent.span).to eq [nil, nil]
+      expect(absent.bytes).to be_nil
+      expect(absent.range).to be_nil
+      present = match.capture_occurrences.find { |c| c.name == 'z' }
+      expect(present.present?).to be true
+    end
+
+    it 'marks an empty-but-present splat capture as present and empty' do
+      match = Mustermann::Sinatra.new('/:a/*splat').match('/foo/')
+      splat = match.capture_occurrences.last
+      expect(splat.name).to eq 'splat'
+      expect(splat.present?).to be true
+      expect(splat.empty?).to be true
+      expect(splat.bytes).to eq ''
+      expect(splat.span).to eq [5, 5]
+      expect(match.raw_params['splat']).to eq ['']
+    end
+
+    it 'reports offsets relative to the full string when peeking' do
+      peek = pattern.peek_match(path + '/extra')
+      expect(peek.to_s).to eq path
+      expect(peek.post_match).to eq '/extra'
+      expect(peek.capture_occurrences.map(&:span)).to eq [[1, 19], [20, 25], [26, 44]]
+      raw = peek.capture_occurrences.map { |c| peek.string.byteslice(c.start, c.length) }
+      expect(raw).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+    end
+
+    it 'exposes raw captures in left-to-right order' do
+      expect(m.raw_captures).to eq ['%E4%B8%AD%E6%96%87', 'a%2Fb', '%E4%B8%AD%E6%96%87']
+    end
+  end
 end

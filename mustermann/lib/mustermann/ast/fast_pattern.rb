@@ -38,9 +38,13 @@ module Mustermann
       def params(string = nil)
         return super unless @fast_match
         return unless md = @regexp.match(string)
-        result = md.named_captures
-        result.transform_values! { |v| v.include?('%') ? unescape(v) : v } if string.include?('%')
-        result
+        if md.regexp.named_captures.any? { |_, positions| positions.size > 1 }
+          super
+        else
+          result = md.named_captures
+          result.transform_values! { |v| v&.include?('%') ? unescape(v) : v } if string.include?('%')
+          result
+        end
       end
 
       private
@@ -48,9 +52,15 @@ module Mustermann
       def build_match(regexp, string)
         return super unless @fast_match
         return unless match = regexp.match(string)
-        params = match.named_captures
-        params.transform_values! { |v| v.include?('%') ? unescape(v) : v } if string.include?('%')
-        Match.new(self, match, params: params)
+        repeated = match.regexp.named_captures.any? { |_, positions| positions.size > 1 }
+        if repeated
+          params = build_params(match)
+          Match.new(self, match, params:, captures: match.captures, named_captures: group_named_captures(match))
+        else
+          params = match.named_captures
+          params.transform_values! { |v| v&.include?('%') ? unescape(v) : v } if string.include?('%')
+          Match.new(self, match, params: params)
+        end
       end
 
       def simple_pattern?

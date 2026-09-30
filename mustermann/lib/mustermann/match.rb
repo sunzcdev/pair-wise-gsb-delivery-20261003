@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require 'mustermann/capture'
 
 module Mustermann
   # The return value of {Mustermann::Pattern#match}, {Mustermann::Pattern#peek_match}, {Mustermann::Set#match}, and similar methods.
@@ -18,6 +19,12 @@ module Mustermann
 
     # @return [Hash] the named captures hash, usually identical to {#params}
     attr_reader :named_captures
+
+    # @return [Array<Mustermann::Capture>] information about every capture
+    #   group in left-to-right order. Includes entries for captures that did not
+    #   participate in the match (e.g. absent optional segments) and entries for
+    #   repeated group names. Offsets are byte offsets relative to {#string}.
+    attr_reader :capture_occurrences
 
     # @return [String] the post match string
     attr_reader :post_match
@@ -45,7 +52,8 @@ module Mustermann
     # @option options [Regexp] :regexp the regular expression that produced the match
     # @option options [String] :post_match the post match string
     # @option options [String] :pre_match the pre match string
-    def initialize(pattern_or_match, string_or_match = nil, matched: nil, params: nil, post_match: nil, pre_match: nil, captures: nil, named_captures: nil, regexp: nil)
+    # @option options [Array<Mustermann::Capture>] :capture_occurrences per-capture byte spans in the original string
+    def initialize(pattern_or_match, string_or_match = nil, matched: nil, params: nil, post_match: nil, pre_match: nil, captures: nil, named_captures: nil, regexp: nil, capture_occurrences: nil)
       case pattern_or_match
       when Mustermann::Match, MatchData then match = pattern_or_match
       when Mustermann::Pattern          then pattern = pattern_or_match
@@ -68,6 +76,11 @@ module Mustermann
       @named_captures = named_captures || match&.named_captures || @params
       @matched        = matched        || match&.to_s           || @string
 
+      @capture_occurrences = capture_occurrences ||
+        (match.respond_to?(:capture_occurrences) ? match.capture_occurrences : nil) ||
+        (match.is_a?(MatchData) ? build_occurrences(match) : nil) ||
+        EMPTY_ARRAY
+
       unless @regexp = regexp
         @regexp = match.regexp if match.respond_to?(:regexp)
         @regexp ||= pattern.respond_to?(:regexp) ? pattern.regexp : nil
@@ -76,6 +89,52 @@ module Mustermann
 
     # @return [Array<String>] the names of the named captures
     def names = named_captures.keys
+
+    # The raw, URI-encoded capture values in left-to-right order.
+    # @return [Array<String, nil>] same order as {#capture_occurrences}
+    def raw_captures
+      capture_occurrences.map(&:bytes)
+    end
+
+    # Raw capture values grouped by name, without URI decoding and without type
+    # conversion. Names repeating in the pattern yield arrays, just like in
+    # {#params}; splat captures are always arrays as well. Absent optional
+    # segments are nil.
+    # @return [Hash{String => String, Array<String>, nil}]
+    def raw_params
+      @raw_params ||= capture_occurrences.each_with_object({}) do |capture, hash|
+        value = capture.bytes
+        if hash.key?(capture.name)
+          existing = hash[capture.name]
+          hash[capture.name] = existing.is_a?(Array) ? existing << value : [existing, value]
+        elsif %w[splat captures].include?(capture.name)
+          hash[capture.name] = [value]
+        else
+          hash[capture.name] = value
+        end
+      end
+    end
+
+    # Accesses the raw capture information for a given capture name.
+    #
+    # @overload capture(name)
+    #   @param name [String, Symbol] capture name
+    #   @return [Mustermann::Capture, nil] the single occurrence, or nil if the
+    #     name did not occur in the pattern
+    #
+    # @overload capture(index)
+    #   @param index [Integer] zero-based occurrence index
+    #   @return [Mustermann::Capture, nil]
+    def capture(name_or_index)
+      case name_or_index
+      when String, Symbol
+        list = capture_occurrences.select { |c| c.name == name_or_index.to_s }
+        list.size > 1 ? list : list.first
+      when Integer
+        capture_occurrences[name_or_index]
+      else raise ArgumentError, "name must be a String, Symbol, or Integer, not #{name_or_index.class}"
+      end
+    end
 
     # @overload [](key)
     #   Access named captures by key.
@@ -149,6 +208,23 @@ module Mustermann
           q.text("#{key}:")
           q.pp value
         end
+      end
+    end
+
+    private
+
+    # Builds per-capture spans directly from MatchData offsets.
+    # Offsets are relative to the string passed to the regular expression;
+    # callers matching substrings (e.g. Concat) remap them afterwards.
+    def build_occurrences(match_data)
+      regexp = match_data.regexp
+      groups = Array.new(regexp.named_captures.values.sum { |positions| positions.size })
+      regexp.named_captures.each do |name, positions|
+        positions.each { |position| groups[position - 1] = name }
+      end
+      groups.map.with_index(1) do |name, position|
+        start, stop = match_data.byteoffset(position)
+        Capture.new(name, start, stop, match_data.string)
       end
     end
   end

@@ -6,6 +6,10 @@ Mustermann follows [Semantic Versioning 2.0](http://semver.org/). Anything docum
 
 ### Mustermann 4.0.1
 
+#### New features
+
+* `Mustermann::Match` now exposes per-capture information through `#capture_occurrences` (and the `Mustermann::Capture` objects it contains), `#raw_captures`, `#raw_params`, and `#capture`. Each capture reports its half-open byte span in the originally passed string and the raw, URI-encoded text, so absent optional segments, empty-but-present captures (e.g. empty splats), repeated capture names, and multiple splats can be told apart. Spans are relative to the full input for `peek_match` and across `Concat` patterns, and are identical whether the match came from a pattern or from either `Mustermann::Set` matching backend.
+
 #### Performance improvements
 
 * Reduce memory usage by deduplicating internal data structures. This is especially effective when using large `Mustermann::Set` objects. [#159](https://github.com/sinatra/mustermann/issues/159) [#160](https://github.com/sinatra/mustermann/pull/160) [@byroot](https://github.com/byroot)
