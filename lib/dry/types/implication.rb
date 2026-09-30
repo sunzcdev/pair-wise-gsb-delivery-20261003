@@ -15,9 +15,9 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
+      def call_unsafe(input, options = EMPTY_HASH)
         if left.try(input).success?
-          right.call_unsafe(input)
+          right.call_unsafe(input, options)
         else
           input
         end
@@ -28,9 +28,9 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &)
+      def call_safe(input, options = EMPTY_HASH, &)
         if left.try(input).success?
-          right.call_safe(input, &)
+          right.call_safe(input, options, &)
         else
           input
         end

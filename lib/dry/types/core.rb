@@ -2,6 +2,9 @@
 
 module Dry
   module Types
+    # @api private
+    SHARED_OPTIONS = {shared: true}.freeze
+
     # Primitives with {Kernel} coercion methods
     KERNEL_COERCIBLE = {
       string: String,

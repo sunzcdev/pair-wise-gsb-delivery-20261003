@@ -38,10 +38,10 @@ module Dry
         end
 
         # @api private
-        def call_safe(input, &) = type.call_safe(input, &)
+        def call_safe(input, options = EMPTY_HASH, &) = type.call_safe(input, options, &)
 
         # @api private
-        def call_unsafe(input) = type.call_unsafe(input)
+        def call_unsafe(input, options = EMPTY_HASH) = type.call_unsafe(input, options)
 
         # @see Dry::Types::Nominal#try
         #

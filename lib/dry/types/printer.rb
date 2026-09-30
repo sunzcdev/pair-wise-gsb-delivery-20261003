@@ -22,6 +22,7 @@ module Dry
         Array => :visit_array,
         Array::Member => :visit_array_member,
         Lax => :visit_lax,
+        Shared => :visit_shared,
         Enum => :visit_enum,
         [Default, Default::Callable] => :visit_default,
         [
@@ -162,6 +163,12 @@ module Dry
       def visit_lax(lax)
         visit(lax.type) do |type|
           yield "Lax<#{type}>"
+        end
+      end
+
+      def visit_shared(shared)
+        visit(shared.type) do |type|
+          yield "Shared<#{type}>"
         end
       end
 

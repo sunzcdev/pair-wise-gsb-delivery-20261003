@@ -25,14 +25,14 @@ module Dry
       # @return [Dry::Monads::Maybe]
       #
       # @api private
-      def call_unsafe(input = Undefined)
+      def call_unsafe(input = Undefined, options = EMPTY_HASH)
         case input
         when ::Dry::Monads::Maybe
           input
         when Undefined
           None()
         else
-          Maybe(type.call_unsafe(input))
+          Maybe(type.call_unsafe(input, options))
         end
       end
 
@@ -41,14 +41,14 @@ module Dry
       # @return [Dry::Monads::Maybe]
       #
       # @api private
-      def call_safe(input = Undefined)
+      def call_safe(input = Undefined, options = EMPTY_HASH)
         case input
         when ::Dry::Monads::Maybe
           input
         when Undefined
           None()
         else
-          Maybe(type.call_safe(input) { |output = input| return yield(output) })
+          Maybe(type.call_safe(input, options) { |output = input| return yield(output) })
         end
       end
 

@@ -28,11 +28,11 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
+      def call_unsafe(input, options = EMPTY_HASH)
         result = rule.(input)
 
         if result.success?
-          type.call_unsafe(input)
+          type.call_unsafe(input, options)
         else
           raise ConstraintError.new(result, input)
         end
@@ -41,9 +41,9 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &)
+      def call_safe(input, options = EMPTY_HASH, &)
         if rule[input]
-          type.call_safe(input, &)
+          type.call_safe(input, options, &)
         else
           yield
         end

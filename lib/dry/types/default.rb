@@ -92,11 +92,11 @@ module Dry
       # @return [Object] value passed through {#type} or {#default} value
       #
       # @api private
-      def call_unsafe(input = Undefined)
+      def call_unsafe(input = Undefined, options = EMPTY_HASH)
         if input.equal?(Undefined)
           evaluate
         else
-          Undefined.default(type.call_unsafe(input)) { evaluate }
+          Undefined.default(type.call_unsafe(input, options)) { evaluate }
         end
       end
 
@@ -105,11 +105,11 @@ module Dry
       # @return [Object] value passed through {#type} or {#default} value
       #
       # @api private
-      def call_safe(input = Undefined, &)
+      def call_safe(input = Undefined, options = EMPTY_HASH, &)
         if input.equal?(Undefined)
           evaluate
         else
-          Undefined.default(type.call_safe(input, &)) { evaluate }
+          Undefined.default(type.call_safe(input, options, &)) { evaluate }
         end
       end
 

@@ -69,15 +69,17 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input)
+      def call_safe(input, options = EMPTY_HASH)
         coerced = fn.(input) { |output = input| return yield(output) }
-        type.call_safe(coerced) { |output = coerced| yield(output) }
+        type.call_safe(coerced, options) { |output = coerced| yield(output) }
       end
 
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input) = type.call_unsafe(fn.(input))
+      def call_unsafe(input, options = EMPTY_HASH)
+        type.call_unsafe(fn.(input), options)
+      end
 
       # @param [Object] input
       # @param [#call,nil] block

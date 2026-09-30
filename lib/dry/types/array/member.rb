@@ -26,13 +26,11 @@ module Dry
         # @return [Array]
         #
         # @api private
-        def call_unsafe(input)
+        def call_unsafe(input, options = EMPTY_HASH)
           if primitive?(input)
-            input.each_with_object([]) do |el, output|
-              coerced = member.call_unsafe(el)
+            return map_unsafe(input) unless options[:shared]
 
-              output << coerced unless Undefined.equal?(coerced)
-            end
+            map_unsafe_shared(input)
           else
             super
           end
@@ -42,20 +40,11 @@ module Dry
         # @return [Array]
         #
         # @api private
-        def call_safe(input)
+        def call_safe(input, options = EMPTY_HASH)
           if primitive?(input)
-            failed = false
+            return map_safe(input) { |*a| yield(*a) } unless options[:shared]
 
-            result = input.each_with_object([]) do |el, output|
-              coerced = member.call_safe(el) { |out = el|
-                failed = true
-                out
-              }
-
-              output << coerced unless Undefined.equal?(coerced)
-            end
-
-            failed ? yield(result) : result
+            map_safe_shared(input) { |*a| yield(*a) }
           else
             yield
           end
@@ -112,6 +101,94 @@ module Dry
 
         # @api private
         def constructor_type = ::Dry::Types::Array::Constructor
+
+        private
+
+        # Coerce every element into a freshly allocated array
+        #
+        # @api private
+        def map_unsafe(input)
+          input.each_with_object([]) do |el, output|
+            append_coerced(output, member.call_unsafe(el))
+          end
+        end
+
+        # Safe variant of {#map_unsafe}
+        #
+        # @api private
+        def map_safe(input)
+          failed = false
+
+          result = input.each_with_object([]) do |el, output|
+            coerced = member.call_safe(el) { |out = el|
+              failed = true
+              out
+            }
+
+            append_coerced(output, coerced)
+          end
+
+          failed ? yield(result) : result
+        end
+
+        # Coerce elements reusing the input array whenever every element
+        # keeps its identity, order and retention
+        #
+        # @api private
+        def map_unsafe_shared(input)
+          map_shared(input) { |el| member.call_unsafe(el, SHARED_OPTIONS) }
+        end
+
+        # Safe variant of {#map_unsafe_shared}
+        #
+        # @api private
+        def map_safe_shared(input)
+          failed = false
+
+          result = map_shared(input) do |el|
+            member.call_safe(el, SHARED_OPTIONS) { |out = el|
+              failed = true
+              out
+            }
+          end
+
+          failed ? yield(result) : result
+        end
+
+        # Coerce elements reusing the input array whenever every element
+        # keeps its identity, order and retention. Elements are coerced
+        # through the given block. The first element that is not identical
+        # (using {Object#equal?}, never `==`) to the original, or that is
+        # filtered out as Undefined, copies the prefix processed so far and
+        # continues building a new array.
+        #
+        # @api private
+        def map_shared(input)
+          shared = true
+          result = nil
+
+          input.each_with_index do |el, index|
+            coerced = yield(el)
+
+            next if shared && coerced.equal?(el)
+
+            if shared
+              result = input.first(index)
+              shared = false
+            end
+
+            append_coerced(result, coerced)
+          end
+
+          shared ? input : result
+        end
+
+        # Append a coerced value unless it was filtered out as Undefined
+        #
+        # @api private
+        def append_coerced(output, coerced)
+          output << coerced unless Undefined.equal?(coerced)
+        end
       end
     end
   end

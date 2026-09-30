@@ -8,12 +8,12 @@ module Dry
         # @return [Object]
         #
         # @api private
-        def call_safe(input, &) = fn.(input, type, &)
+        def call_safe(input, _options = EMPTY_HASH, &) = fn.(input, type, &)
 
         # @return [Object]
         #
         # @api private
-        def call_unsafe(input) = fn.(input, type)
+        def call_unsafe(input, _options = EMPTY_HASH) = fn.(input, type)
 
         # @param [Object] input
         # @param [#call,nil] block

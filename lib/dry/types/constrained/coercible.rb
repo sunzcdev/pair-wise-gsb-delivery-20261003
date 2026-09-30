@@ -10,8 +10,8 @@ module Dry
         # @return [Object]
         #
         # @api private
-        def call_unsafe(input)
-          coerced = type.call_unsafe(input)
+        def call_unsafe(input, options = EMPTY_HASH)
+          coerced = type.call_unsafe(input, options)
           result = rule.(coerced)
 
           if result.success?
@@ -24,8 +24,8 @@ module Dry
         # @return [Object]
         #
         # @api private
-        def call_safe(input)
-          coerced = type.call_safe(input) { return yield }
+        def call_safe(input, options = EMPTY_HASH)
+          coerced = type.call_safe(input, options) { return yield }
 
           if rule[coerced]
             coerced

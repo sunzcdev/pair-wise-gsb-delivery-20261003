@@ -36,12 +36,16 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input) = type.call_unsafe(map_value(input))
+      def call_unsafe(input, options = EMPTY_HASH)
+        type.call_unsafe(map_value(input), options)
+      end
 
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &) = type.call_safe(map_value(input), &)
+      def call_safe(input, options = EMPTY_HASH, &)
+        type.call_safe(map_value(input), options, &)
+      end
 
       # @see Dry::Types::Constrained#try
       #

@@ -36,6 +36,11 @@ module Dry
       end
       deprecate(:visit_safe, :visit_lax)
 
+      def visit_shared(node)
+        type, meta = node
+        visit(type).shared.meta(meta)
+      end
+
       def visit_nominal(node)
         type, options, meta =
           case node

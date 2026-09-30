@@ -40,11 +40,11 @@ module Dry
       #   @return [Object]
       #
       # @api public
-      def call(input = Undefined, &)
+      def call(input = Undefined, options = EMPTY_HASH, &)
         if block_given?
-          call_safe(input, &)
+          call_safe(input, options, &)
         else
-          call_unsafe(input)
+          call_unsafe(input, options)
         end
       end
       alias_method :[], :call

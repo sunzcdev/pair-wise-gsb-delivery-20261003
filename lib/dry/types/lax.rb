@@ -19,12 +19,20 @@ module Dry
       # @return [Object]
       #
       # @api public
-      def call(input, &)
-        type.call_safe(input) { |output = input| output }
+      def call(input, options = EMPTY_HASH, &)
+        type.call_safe(input, options) { |output = input| output }
       end
       alias_method :[], :call
-      alias_method :call_safe, :call
-      alias_method :call_unsafe, :call
+
+      # @api private
+      def call_safe(input, options = EMPTY_HASH, &)
+        type.call_safe(input, options) { |output = input| output }
+      end
+
+      # @api private
+      def call_unsafe(input, options = EMPTY_HASH)
+        type.call_safe(input, options) { |output = input| output }
+      end
 
       # @param [Object] input
       # @param [#call,nil] block

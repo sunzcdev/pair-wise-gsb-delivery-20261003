@@ -142,6 +142,17 @@ module Dry
       # @api public
       def lax = Lax.new(self)
 
+      # Turn a type into a structurally sharing type. Containers produced
+      # by hash schemas and typed arrays are reused (same object) whenever
+      # coercion leaves their keys, members, order and retention intact.
+      #
+      # Sharing relies on object identity, never on `==`.
+      #
+      # @return [Shared]
+      #
+      # @api public
+      def shared = Shared.new(self)
+
       # Define a constructor for the type
       #
       # @param [#call,nil] constructor

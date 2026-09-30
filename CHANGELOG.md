@@ -9,6 +9,13 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Add optional structural sharing via `Type#shared`. A `Dry::Types::Shared`
+  type reuses the original hash or array object when coercion leaves its
+  keys/elements, their identities, order and retention untouched, and only
+  allocates new containers along converted paths. Identity is checked with
+  `equal?` rather than `==`. Inserted defaults, discarded unknown keys and
+  filtered out `Undefined` elements all force a new container.
+
 ### Changed
 
 ### Deprecated

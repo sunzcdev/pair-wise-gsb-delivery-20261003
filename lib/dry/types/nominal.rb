@@ -74,14 +74,14 @@ module Dry
       # @return [BasicObject]
       #
       # @api private
-      def call_unsafe(input) = input
+      def call_unsafe(input, _options = EMPTY_HASH) = input
 
       # @param [BasicObject] input
       #
       # @return [BasicObject]
       #
       # @api private
-      def call_safe(input, &) = input
+      def call_safe(input, _options = EMPTY_HASH, &) = input
 
       # @param [Object] input
       #

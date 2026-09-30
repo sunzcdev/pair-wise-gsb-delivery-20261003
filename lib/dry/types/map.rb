@@ -47,7 +47,7 @@ module Dry
       # @return [Hash]
       #
       # @api private
-      def call_unsafe(hash)
+      def call_unsafe(hash, _options = EMPTY_HASH)
         try(hash) { |failure|
           raise MapError, failure.error.message
         }.input
@@ -58,7 +58,7 @@ module Dry
       # @return [Hash]
       #
       # @api private
-      def call_safe(hash) = try(hash) { return yield }.input
+      def call_safe(hash, _options = EMPTY_HASH) = try(hash) { return yield }.input
 
       # @param [Hash] hash
       #

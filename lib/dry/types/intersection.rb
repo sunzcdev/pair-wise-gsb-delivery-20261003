@@ -19,8 +19,11 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
-        merge_results(left.call_unsafe(input), right.call_unsafe(input))
+      def call_unsafe(input, options = EMPTY_HASH)
+        merge_results(
+          left.call_unsafe(input, options),
+          right.call_unsafe(input, options)
+        )
       end
 
       # @param [Object] input
@@ -28,7 +31,7 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &) = try_sides(input, &).input
+      def call_safe(input, _options = EMPTY_HASH, &) = try_sides(input, &).input
 
       # @param [Object] input
       #

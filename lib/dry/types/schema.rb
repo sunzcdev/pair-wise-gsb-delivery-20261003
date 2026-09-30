@@ -317,6 +317,28 @@ module Dry
       #
       # @return [Hash]
       def resolve_unsafe(hash, options = EMPTY_HASH)
+        return resolve_unsafe_shared(hash, options) if options[:shared]
+
+        resolve_unsafe_coerce(hash, options)
+      end
+
+      # Validate and coerce a hash. Call a block and halt on any error
+      #
+      # @api private
+      #
+      # @return [Hash]
+      def resolve_safe(hash, options = EMPTY_HASH, &block)
+        return resolve_safe_shared(hash, options, &block) if options[:shared]
+
+        resolve_safe_coerce(hash, options, &block)
+      end
+
+      # Validate and coerce a hash into a freshly allocated container
+      #
+      # @api private
+      #
+      # @return [Hash]
+      def resolve_unsafe_coerce(hash, options)
         result = {}
 
         hash.each do |key, value|
@@ -341,12 +363,13 @@ module Dry
         result
       end
 
-      # Validate and coerce a hash. Call a block and halt on any error
+      # Validate and coerce a hash into a freshly allocated container,
+      # halting by calling the block on any error
       #
       # @api private
       #
       # @return [Hash]
-      def resolve_safe(hash, options = EMPTY_HASH, &block)
+      def resolve_safe_coerce(hash, options, &block)
         result = {}
 
         hash.each do |key, value|
@@ -361,6 +384,129 @@ module Dry
         end
 
         resolve_missing_keys(result, options, &block) if result.size < keys.size
+
+        result
+      end
+
+      # Validate and coerce a hash reusing the original container whenever
+      # its keys, value identities, order and retention are unchanged
+      #
+      # @api private
+      #
+      # @return [Hash]
+      def resolve_unsafe_shared(hash, options)
+        resolve_shared(hash, options) do |type, value|
+          begin
+            type.call_unsafe(value, SHARED_OPTIONS)
+          rescue ConstraintError => exception
+            raise SchemaError.new(type.name, value, exception.result)
+          rescue CoercionError => exception
+            raise SchemaError.new(type.name, value, exception.message)
+          end
+        end
+      end
+
+      # Safe variant of {#resolve_unsafe_shared}
+      #
+      # @api private
+      #
+      # @return [Hash]
+      def resolve_safe_shared(hash, options, &block)
+        resolve_shared(hash, options, block) do |type, value|
+          type.call_safe(value, SHARED_OPTIONS, &block)
+        end
+      end
+
+      # Shared resolution shared by the safe and unsafe variants. Values
+      # are coerced through the given block. As long as every key maps to
+      # the same key object and every coerced value is identical (using
+      # {Object#equal?}, never `==`) to the original one, and no key is
+      # dropped or added, the input hash itself is returned. The first
+      # divergence copies the input into a new container and all further
+      # changes happen on the copy, so a failure never mutates the input.
+      #
+      # @api private
+      #
+      # @return [Hash]
+      def resolve_shared(hash, options, failure = nil)
+        shared = true
+        result = nil
+
+        hash.each_with_index do |(key, value), index|
+          k = @transform_key.(key)
+          type = @name_key_map[k]
+
+          if type
+            coerced = yield(type, value)
+
+            if shared && k.equal?(key) && coerced.equal?(value)
+              next
+            end
+
+            if shared
+              result = hash.first(index).to_h
+              shared = false
+            end
+
+            result[k] = coerced
+          elsif strict?
+            raise unexpected_keys(hash.keys)
+          else
+            if shared
+              result = hash.first(index).to_h
+              shared = false
+            end
+          end
+        end
+
+        return hash if shared && skip_missing_fully?(hash, options)
+
+        if shared
+          missing_result = shared_missing_result(hash, options, failure)
+
+          return missing_result unless missing_result.nil?
+
+          hash
+        else
+          resolve_missing_keys(result, options) if result.size < keys.size
+          result
+        end
+      end
+
+      # When missing keys are both allowed and left without defaults, a
+      # hash that has every present pair unchanged can be returned as-is
+      # even if it does not cover all schema keys
+      #
+      # @api private
+      def skip_missing_fully?(hash, options)
+        options.fetch(:skip_missing, false) &&
+          !options.fetch(:resolve_defaults, true) &&
+          hash.size < keys.size
+      end
+
+      # Resolve missing keys for a still-fully-shared hash. Returns nil
+      # when sharing is still possible (nothing was added). Otherwise it
+      # returns a fresh copy of the input with the missing defaults
+      # inserted. A missing required key raises (unsafe) or invokes the
+      # failure callback (safe), matching {#resolve_missing_keys}.
+      #
+      # @api private
+      def shared_missing_result(hash, options, failure)
+        skip_missing = options.fetch(:skip_missing, false)
+        resolve_defaults = options.fetch(:resolve_defaults, true)
+
+        result = nil
+
+        keys.each do |key|
+          next if hash.key?(key.name)
+
+          if key.default? && resolve_defaults
+            result ||= hash.dup
+            result[key.name] = key.call_unsafe(Undefined, SHARED_OPTIONS)
+          elsif key.required? && !skip_missing
+            failure ? failure.call : raise(missing_key(key.name))
+          end
+        end
 
         result
       end

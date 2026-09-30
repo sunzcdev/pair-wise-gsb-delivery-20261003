@@ -33,8 +33,8 @@ module Dry
       #   error from the right (last attempted) type for performance reasons.
       #
       # @api private
-      def call_unsafe(input)
-        left.call_safe(input) { right.call_unsafe(input) }
+      def call_unsafe(input, options = EMPTY_HASH)
+        left.call_safe(input, options) { right.call_unsafe(input, options) }
       end
 
       # @param [Object] input
@@ -42,8 +42,8 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &block)
-        left.call_safe(input) { right.call_safe(input, &block) }
+      def call_safe(input, options = EMPTY_HASH, &block)
+        left.call_safe(input, options) { right.call_safe(input, options, &block) }
       end
 
       # @param [Object] input
