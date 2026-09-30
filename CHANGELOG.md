@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## Unreleased
+* Add structured authentication challenges: strategies can declare `challenge(scheme, params)` (auth-params hash or token68), and the failure handling collects the challenges of all attempted strategies for the failing scope into a unified `WWW-Authenticate` header on 401 responses from the failure app. Invalid challenge data is rejected with `ArgumentError` when declared. Successful authentication, custom strategy responses and failure apps that set their own `WWW-Authenticate` header are left untouched.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)

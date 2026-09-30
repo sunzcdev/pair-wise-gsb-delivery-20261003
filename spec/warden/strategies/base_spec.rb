@@ -58,6 +58,50 @@ describe Warden::Strategies::Base do
     expect(strategy).not_to be_performed
   end
 
+  describe "challenges" do
+    it "should start with no challenges" do
+      RAS.add(:foobar) { def authenticate!; end }
+      expect(RAS[:foobar].new(env_with_params).challenges).to eq([])
+    end
+
+    it "should allow a strategy to declare challenges" do
+      RAS.add(:foobar) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          challenge('Bearer', 'token68==')
+          fail!
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      expect(strategy.challenges.map(&:to_s)).to eq(['Basic realm="My App"', 'Bearer token68=='])
+    end
+
+    it "should reject invalid challenge data as soon as it is declared" do
+      RAS.add(:foobar) do
+        def authenticate!
+          challenge('Basic', :realm => "bad\r\nrealm")
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      expect { strategy._run! }.to raise_error(ArgumentError)
+    end
+
+    it "should reset the challenges when the strategy is cleared" do
+      RAS.add(:foobar) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail!
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      expect(strategy.challenges).not_to be_empty
+      strategy.clear!
+      expect(strategy.challenges).to be_empty
+    end
+  end
+
   it "should set the scope when initialized with one" do
     RAS.add(:foobar) do
       def authenticate!; end

@@ -140,10 +140,29 @@ module Warden
         env["warden.options"] = options
 
         _run_callbacks(:before_failure, env, options)
-        config.failure_app.call(env).to_a
+        add_challenges_header(env, config.failure_app.call(env).to_a, options)
       else
         raise "No Failure App provided"
       end
     end # call_failure_app
+
+    # Builds a WWW-Authenticate header from the challenges declared by the
+    # strategies attempted for the failing scope and adds it to a 401
+    # response from the failure app. A failure app that sets its own
+    # WWW-Authenticate header, or answers with any other status, is left
+    # untouched.
+    # :api: private
+    def add_challenges_header(env, response, options)
+      status, headers, _body = response
+      return response unless status.to_i == 401
+      return response if headers.keys.any? { |key| key.to_s.downcase == 'www-authenticate' }
+
+      scope = options[:scope] || config.default_scope
+      challenges = env['warden'].challenges(scope)
+      return response if challenges.empty?
+
+      headers['WWW-Authenticate'] = challenges.map(&:to_s).join(', ')
+      response
+    end
   end
 end # Warden

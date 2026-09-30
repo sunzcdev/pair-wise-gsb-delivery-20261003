@@ -38,6 +38,10 @@ module Warden
       # :api: public
       attr_reader :env, :scope, :status
 
+      # The list of authentication challenges declared by this strategy
+      # :api: public
+      attr_reader :challenges
+
       include ::Warden::Mixins::Common
 
       # :api: private
@@ -46,6 +50,7 @@ module Warden
         @status, @headers = nil, {}
         @halted, @performed = false, false
         @result = nil
+        @challenges = []
       end
 
       # The method that is called from above. This method calls the underlying authenticate! method
@@ -66,6 +71,7 @@ module Warden
       # :api: private
       def clear!
         @performed = false
+        @challenges = []
       end
 
       # Acts as a guarding method for the strategy.
@@ -145,6 +151,32 @@ module Warden
       def fail(message = "Failed to Login")
         @message = message
         @result = :failure
+      end
+
+      # Declares an authentication challenge (RFC 7235) for this strategy.
+      # When authentication fails, the challenges of all attempted
+      # strategies for the failing scope are collected by the failure
+      # handling and sent to the client as WWW-Authenticate headers.
+      #
+      # Parameters:
+      #   scheme <String, Symbol> - the authentication scheme, e.g. "Basic"
+      #   params <Hash, String, nil> - either a hash of auth-params
+      #     (e.g. :realm => "My App"), a token68 string, or nothing
+      #
+      # Example:
+      #   def authenticate!
+      #     challenge('Basic', :realm => 'My App')
+      #     fail!
+      #   end
+      #
+      # Invalid schemes, token68 values or parameter names raise an
+      # ArgumentError immediately, before any response is generated.
+      #
+      # :api: public
+      def challenge(scheme, params = nil)
+        challenge = Warden::Challenge.new(scheme, params)
+        @challenges << challenge
+        challenge
       end
 
       # Causes the authentication to redirect.  A :warden symbol must be thrown to actually execute this redirect

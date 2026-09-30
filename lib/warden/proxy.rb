@@ -292,6 +292,20 @@ module Warden
       winning_strategy && winning_strategy.message
     end
 
+    # Collects the authentication challenges declared by the strategies
+    # that have already been performed for the given scope. Challenges
+    # from other scopes are never mixed in. This does not run any
+    # strategy, so collecting challenges never attempts a login.
+    #
+    # Example:
+    #   env['warden'].challenges            # challenges for the default scope
+    #   env['warden'].challenges(:admin)    # challenges for the :admin scope
+    #
+    # :api: public
+    def challenges(scope = @config.default_scope)
+      @strategies[scope].values.select(&:performed?).flat_map(&:challenges)
+    end
+
     # Provides a way to return a 401 without warden deferring to the failure app
     # The result is a direct passthrough of your own response
     # :api: public

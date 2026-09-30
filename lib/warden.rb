@@ -3,6 +3,7 @@
 require 'forwardable'
 
 require 'warden/mixins/common'
+require 'warden/challenge'
 require 'warden/proxy'
 require 'warden/manager'
 require 'warden/errors'

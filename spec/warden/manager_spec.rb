@@ -319,6 +319,186 @@ RSpec.describe Warden::Manager do
     end
   end # integrated strategies
 
+  describe "authentication challenges" do
+    before(:each) do
+      RAS = Warden::Strategies unless defined?(RAS)
+      Warden::Strategies.clear!
+    end
+
+    def app_authenticating(*strategies)
+      setup_rack do |env|
+        env['warden'].authenticate!(*strategies)
+        [200, {"Content-Type" => "text/plain"}, ["Welcome"]]
+      end
+    end
+
+    it "should send the challenges of all attempted strategies to the client" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail('no basic credentials')
+        end
+      end
+      RAS.add(:bearer) do
+        def authenticate!
+          challenge('Bearer', 'token68value==')
+          fail!
+        end
+      end
+      result = app_authenticating(:basic, :bearer).call(env_with_params)
+      expect(result[0]).to eq(401)
+      expect(result[1]['WWW-Authenticate']).to eq('Basic realm="My App", Bearer token68value==')
+    end
+
+    it "should keep challenge boundaries intact when parameters contain commas, quotes or backslashes" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'foo, bar')
+          fail
+        end
+      end
+      RAS.add(:newauth) do
+        def authenticate!
+          challenge('Newauth', :realm => 'apps', :title => 'Login to "my" \\ apps')
+          fail!
+        end
+      end
+      result = app_authenticating(:basic, :newauth).call(env_with_params)
+      expect(result[1]['WWW-Authenticate']).to eq(
+        'Basic realm="foo, bar", Newauth realm=apps, title="Login to \\"my\\" \\\\ apps"'
+      )
+    end
+
+    it "should add the challenges when a 401 is intercepted" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail!
+        end
+      end
+      app = lambda do |env|
+        env['warden'].authenticate(:basic)
+        [401, {"Content-Type" => "text/plain"}, ["Intercepted"]]
+      end
+      result = setup_rack(app).call(env_with_params)
+      expect(result[0]).to eq(401)
+      expect(result[1]['WWW-Authenticate']).to eq('Basic realm="My App"')
+    end
+
+    it "should not mix challenges from other scopes into the failing scope" do
+      RAS.add(:admin_basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'Admin')
+          fail!
+        end
+      end
+      RAS.add(:user_bearer) do
+        def authenticate!
+          challenge('Bearer')
+          fail!
+        end
+      end
+      app = lambda do |env|
+        env['warden'].authenticate(:admin_basic, :scope => :admin)
+        env['warden'].authenticate!(:user_bearer)
+      end
+      result = setup_rack(app).call(env_with_params)
+      expect(result[0]).to eq(401)
+      expect(result[1]['WWW-Authenticate']).to eq('Bearer')
+    end
+
+    it "should collect the challenges for the scope given to authenticate!" do
+      RAS.add(:admin_basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'Admin')
+          fail!
+        end
+      end
+      app = lambda do |env|
+        env['warden'].authenticate!(:admin_basic, :scope => :admin)
+      end
+      result = setup_rack(app).call(env_with_params)
+      expect(result[0]).to eq(401)
+      expect(result[1]['WWW-Authenticate']).to eq('Basic realm=Admin')
+    end
+
+    it "should not send challenges when authentication succeeds" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail('no basic credentials')
+        end
+      end
+      RAS.add(:winner) do
+        def authenticate!
+          success!("A User")
+        end
+      end
+      result = app_authenticating(:basic, :winner).call(env_with_params)
+      expect(result[0]).to eq(200)
+      expect(result[1]['WWW-Authenticate']).to be_nil
+    end
+
+    it "should leave a custom strategy response untouched" do
+      RAS.add(:custom) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          custom!([401, {"Content-Type" => "text/plain"}, ["Custom Failure"]])
+        end
+      end
+      result = app_authenticating(:custom).call(env_with_params)
+      expect(result[0]).to eq(401)
+      expect(result[2]).to eq(["Custom Failure"])
+      expect(result[1]['WWW-Authenticate']).to be_nil
+    end
+
+    it "should not override a WWW-Authenticate header set by the failure app" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail!
+        end
+      end
+      fail_app = lambda do |_env|
+        [401, {"WWW-Authenticate" => 'Custom realm="failure"'}, ["You Fail!"]]
+      end
+      result = app_authenticating_with_failure_app(:basic, fail_app).call(env_with_params)
+      expect(result[1]['WWW-Authenticate']).to eq('Custom realm="failure"')
+    end
+
+    it "should not add challenges to a non-401 failure app response" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail!
+        end
+      end
+      fail_app = lambda do |_env|
+        [200, {"Content-Type" => "text/html"}, ["<form>login</form>"]]
+      end
+      result = app_authenticating_with_failure_app(:basic, fail_app).call(env_with_params)
+      expect(result[0]).to eq(200)
+      expect(result[1]['WWW-Authenticate']).to be_nil
+    end
+
+    it "should reject invalid challenge data before the response is generated" do
+      RAS.add(:basic) do
+        def authenticate!
+          challenge('Basic', :realm => "bad\r\nrealm")
+          fail!
+        end
+      end
+      expect { app_authenticating(:basic).call(env_with_params) }.to raise_error(ArgumentError)
+    end
+
+    def app_authenticating_with_failure_app(strategy, fail_app)
+      setup_rack(lambda { |env|
+        env['warden'].authenticate!(strategy)
+        [200, {"Content-Type" => "text/plain"}, ["Welcome"]]
+      }, :failure_app => fail_app)
+    end
+  end
+
   it "should allow me to set a different default scope for warden" do
     Rack::Builder.new do
       use Warden::Manager, :default_scope => :default do |manager|

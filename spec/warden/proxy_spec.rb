@@ -1081,4 +1081,48 @@ describe "dynamic default_strategies" do
       expect(proxy).not_to be_asset_request
     end
   end
+
+  describe "#challenges" do
+    it "should not run any strategy when collecting challenges" do
+      app = lambda do |e|
+        e['warden'].challenges
+        e['warden'].challenges(:admin)
+        valid_response
+      end
+      setup_rack(app).call(@env)
+      expect(@env['warden.spec.strategies']).to be_nil
+    end
+
+    it "should collect the challenges of the strategies performed for a scope" do
+      Warden::Strategies.add(:challenging) do
+        def authenticate!
+          challenge('Basic', :realm => 'My App')
+          fail!
+        end
+      end
+      app = lambda do |e|
+        e['warden'].authenticate(:challenging)
+        valid_response
+      end
+      setup_rack(app).call(@env)
+      challenges = @env['warden'].challenges
+      expect(challenges.map(&:to_s)).to eq(['Basic realm="My App"'])
+    end
+
+    it "should not mix in challenges from other scopes" do
+      Warden::Strategies.add(:admin_challenging) do
+        def authenticate!
+          challenge('Basic', :realm => 'Admin')
+          fail!
+        end
+      end
+      app = lambda do |e|
+        e['warden'].authenticate(:admin_challenging, :scope => :admin)
+        valid_response
+      end
+      setup_rack(app).call(@env)
+      expect(@env['warden'].challenges.map(&:to_s)).to eq([])
+      expect(@env['warden'].challenges(:admin).map(&:to_s)).to eq(['Basic realm=Admin'])
+    end
+  end
 end
