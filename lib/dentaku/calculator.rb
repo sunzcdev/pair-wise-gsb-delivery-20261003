@@ -1,10 +1,12 @@
 require 'dentaku/bulk_expression_solver'
+require 'dentaku/compiled_expression'
 require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
 require 'dentaku/parser'
 require 'dentaku/string_casing'
 require 'dentaku/token'
+require 'digest'
 
 module Dentaku
   class Calculator
@@ -131,22 +133,75 @@ module Dentaku
     end
 
     def ast(expression)
+      return expression.node if expression.is_a?(CompiledExpression)
       return expression if expression.is_a?(AST::Node)
       return expression.map { |e| ast(e) } if expression.is_a? Array
 
-      @ast_cache.fetch(expression) {
-        options = {
-          aliases: aliases,
-          case_sensitive: case_sensitive,
-          function_registry: @function_registry,
-          raw_date_literals: raw_date_literals
-        }
+      cached = @ast_cache[expression]
+      # pre-warmed or externally managed entries carry no compile identity,
+      # so they are trusted as-is
+      return cached if cached.is_a?(AST::Node)
 
-        tokens = tokenizer.tokenize(expression, options)
-        Parser.new(tokens, options).parse.tap do |node|
-          @ast_cache[expression] = node if cache_ast?
-        end
-      }
+      identity = nil
+      if cached.is_a?(Hash)
+        identity = compile_identity
+        node = cached[identity]
+        return node if node
+      end
+
+      parse_expression(expression).tap do |node|
+        next unless cache_ast?
+
+        # one slot per compile identity: calculators that share an external
+        # cache but register different definitions never see each other's
+        # ASTs, so results cannot depend on which of them evaluated first.
+        # Only the expression and the identity key the cache -- never the
+        # data being evaluated.
+        identity ||= compile_identity
+        slot = cached.is_a?(Hash) ? cached : {}
+        slot[identity] = node
+        @ast_cache[expression] = slot
+      end
+    end
+
+    # Compile an expression once and choose how the result treats functions
+    # that are (re)registered afterwards:
+    #
+    # functions: :pinned (default) -- the compiled AST keeps calling the
+    #   definitions captured at compile time.
+    # functions: :latest -- each use checks the registry generation and
+    #   recompiles (re-validating argument counts and declared return
+    #   types) when any function was re-registered, an instance function to
+    #   override a global one was added, or the aliases changed.
+    def compile(expression, functions: :pinned)
+      unless expression.is_a?(String)
+        raise ::ArgumentError, "can only compile String expressions"
+      end
+
+      unless %i[pinned latest].include?(functions)
+        raise ::ArgumentError, "functions must be :pinned or :latest"
+      end
+
+      CompiledExpression.new(self, expression, ast(expression), functions)
+    end
+
+    # identity of everything that shapes a compiled AST: the effective
+    # function registry (instance functions layered over the global
+    # defaults), the aliases, and the parsing options. Two calculators
+    # share AST cache entries only when their identities match.
+    def compile_identity
+      [
+        @function_registry.fingerprint,
+        aliases_fingerprint,
+        case_sensitive,
+        raw_date_literals
+      ]
+    end
+
+    # monotonic generation of the effective function registry, including
+    # the global defaults this calculator falls back to
+    def function_registry_generation
+      @function_registry.generation
     end
 
     def load_cache(ast_cache)
@@ -236,6 +291,25 @@ module Dentaku
 
     def cache_dependency_order?
       @cache_dependency_order.nil? ? Dentaku.cache_dependency_order? : @cache_dependency_order
+    end
+
+    private def parse_expression(expression)
+      options = {
+        aliases: aliases,
+        case_sensitive: case_sensitive,
+        function_registry: @function_registry,
+        raw_date_literals: raw_date_literals
+      }
+
+      tokens = tokenizer.tokenize(expression, options)
+      Parser.new(tokens, options).parse
+    end
+
+    private def aliases_fingerprint
+      canonical = aliases.map { |key, values|
+        "#{key}=#{Array(values).map(&:to_s).sort.join(',')}"
+      }.sort.join(';')
+      Digest::SHA256.hexdigest(canonical)
     end
   end
 end

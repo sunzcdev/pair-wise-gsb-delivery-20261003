@@ -1,6 +1,36 @@
+require 'digest'
+
 module Dentaku
   module AST
     class FunctionRegistry < Hash
+      def initialize
+        super
+        @generation = 0
+      end
+
+      # monotonic stamp of the effective registry: own registrations plus
+      # the global default registry this one falls back to, so a global
+      # registration also invalidates instance-level compiled results
+      def generation
+        default.equal?(self) ? @generation : @generation + default.generation
+      end
+
+      # content identity of the effective registry: every function name
+      # resolvable through this registry (instance entries layered over the
+      # global defaults) mapped to the exact class implementing it, so
+      # re-registration, instance overrides of global functions, and two
+      # calculators with same-named but distinct implementations all
+      # produce different fingerprints
+      def fingerprint
+        current = generation
+        if @fingerprint.nil? || @fingerprint_generation != current
+          entries = effective_entries.map { |name, function| "#{name}:#{function.object_id}" }
+          @fingerprint = Digest::SHA256.hexdigest(entries.sort.join(';'))
+          @fingerprint_generation = current
+        end
+        @fingerprint
+      end
+
       def get(name)
         name = function_name(name)
         return self[name] if has_key?(name)
@@ -98,10 +128,13 @@ module Dentaku
         function.volatile = volatile
 
         self[function_name(name)] = function
+        @generation += 1
+        function
       end
 
       def register_class(name, function_class)
         self[function_name(name)] = function_class
+        @generation += 1
       end
 
       def default
@@ -110,6 +143,12 @@ module Dentaku
 
       def self.default
         Dentaku::AST::Function.registry
+      end
+
+      protected
+
+      def effective_entries
+        default.equal?(self) ? self : default.effective_entries.merge(self)
       end
 
       private

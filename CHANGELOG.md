@@ -1,5 +1,25 @@
 # Change Log
 
+## [Unreleased]
+- re-registering a function at runtime no longer leaves the behavior of
+  cached ASTs implicit. `Calculator#compile` returns a
+  `Dentaku::CompiledExpression` that records the function-registry
+  generation it was compiled against, and the caller chooses the contract:
+  `functions: :pinned` (the default) keeps calling the definitions
+  captured at compile time, while `functions: :latest` detects registry,
+  alias, and parsing-option changes before each use and recompiles from
+  source, re-validating argument counts and declared return types against
+  the current definitions. Instance functions overriding global ones and
+  alias changes both count as identity changes.
+- the AST cache is now keyed by expression plus compile identity (the
+  effective function registry -- instance functions layered over the
+  global defaults -- aliases, and parsing options), never by evaluation
+  data. Two calculators that share an external cache but register
+  different definitions under the same name each get their own cached
+  AST, so results cannot depend on which calculator evaluated first.
+  Pre-warmed caches that map expressions directly to nodes are still
+  honored as-is.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

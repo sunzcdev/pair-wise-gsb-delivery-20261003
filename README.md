@@ -402,6 +402,43 @@ The predicate itself is then evaluated exactly once per `evaluate!` call,
 at evaluation time.  In `add_functions`, pass volatility as a fifth tuple
 element: `[:user_level, :numeric, -> { ... }, nil, true]`.
 
+FUNCTION REDEFINITION AND COMPILED EXPRESSIONS
+----------------------------------------------
+
+Registering a function under an already-used name replaces the definition
+for everything parsed afterwards, but ASTs that were parsed earlier still
+hold the previous definition.  When functions can be (re)registered at
+runtime, use `Calculator#compile` to make the choice explicit for each
+expression:
+
+```ruby
+> c = Dentaku::Calculator.new
+> c.add_function(:rate, :numeric, -> { 1 })
+> pinned = c.compile('rate() * amount')                 # default
+> latest = c.compile('rate() * amount', functions: :latest)
+> c.add_function(:rate, :numeric, -> { 2 })
+> c.evaluate!(pinned, amount: 10)
+#=> 10
+> c.evaluate!(latest, amount: 10)
+#=> 20
+```
+
+A pinned expression keeps calling the definitions captured at compile
+time.  A latest expression compares the current compile identity -- the
+effective function registry (instance functions layered over the global
+defaults), the aliases, and the parsing options -- before each use, and
+recompiles from source when anything changed, so argument counts and
+declared return types are validated against the current definitions
+before the new AST runs.  `CompiledExpression#registry_generation`
+reports the registry generation the expression was last compiled against,
+and `#stale?` reports whether the identity no longer matches.
+
+The same identity keys the AST cache: entries are stored per expression
+and compile identity, never per evaluation data, so two calculators that
+share an external cache but register different definitions under the same
+name each get their own AST -- results cannot depend on which calculator
+evaluated first.
+
 FUNCTION ALIASES
 ----------------
 
