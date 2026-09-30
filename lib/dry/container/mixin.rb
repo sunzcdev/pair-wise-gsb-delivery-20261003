@@ -160,6 +160,52 @@ module Dry
               "can't modify frozen #{self.class} (when attempting to register '#{key}')"
       end
 
+      # Register a multi-binding with the container: an ordered collection of
+      # named, tagged members that can be resolved together (as a collection,
+      # optionally filtered by tags) or individually by name
+      #
+      # @example
+      #
+      #   container.register_many(:event_handlers) do |handlers|
+      #     handlers.add(:email, -> { EmailHandler.new }, tags: [:notifications], order: 10)
+      #     handlers.add(:sms, -> { SmsHandler.new }, tags: [:notifications], order: 20)
+      #   end
+      #
+      #   container.resolve_many(:event_handlers, tags: [:notifications])
+      #   container.resolve_member(:event_handlers, :email)
+      #
+      # @param [Mixed] key
+      #   The key to register the multi-binding with (used to resolve)
+      # @yield [Dry::Container::Item::Multi]
+      #   The multi-binding to add members to
+      #
+      # @raise [Dry::Container::Error]
+      #   If no block is given
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def register_many(key, &block)
+        unless block
+          raise Error, "register_many requires a block to add members to the multi-binding"
+        end
+
+        multi = ::Dry::Container::Item::Multi.new(key)
+
+        if block.arity.zero?
+          multi.instance_eval(&block)
+        else
+          block.call(multi)
+        end
+
+        config.registry.register_multi(_container, key, multi)
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} (when attempting to register '#{key}')"
+      end
+
       # Resolve an item from the container
       #
       # @param [Mixed] key
@@ -173,6 +219,39 @@ module Dry
       # @api public
       def resolve(key, &block)
         config.resolver.call(_container, key, &block)
+      end
+
+      # Resolve the collection of members of a multi-binding
+      #
+      # Members are returned in their stable order (by their `:order` option,
+      # with registration order as a tie-breaker). Only the members matching
+      # the given tags are resolved, so factories of members filtered out are
+      # never executed.
+      #
+      # @param [Mixed] key
+      #   The key the multi-binding is registered with
+      # @param [Array, nil] tags
+      #   When given, only members carrying all of the tags are resolved
+      #
+      # @return [Array]
+      #
+      # @api public
+      def resolve_many(key, tags: nil)
+        config.resolver.resolve_many(_container, key, tags: tags)
+      end
+
+      # Resolve a single member of a multi-binding by its name
+      #
+      # @param [Mixed] key
+      #   The key the multi-binding is registered with
+      # @param [Mixed] name
+      #   The member name
+      #
+      # @return [Mixed]
+      #
+      # @api public
+      def resolve_member(key, name)
+        config.resolver.resolve_member(_container, key, name)
       end
 
       # Resolve an item from the container

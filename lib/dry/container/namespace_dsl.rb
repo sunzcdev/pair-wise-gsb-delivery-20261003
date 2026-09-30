@@ -37,6 +37,10 @@ module Dry
         super(namespaced(key), *args, &block)
       end
 
+      def register_many(key, &block)
+        super(namespaced(key), &block)
+      end
+
       def namespace(namespace, &block)
         super(namespaced(namespace), &block)
       end
@@ -49,6 +53,14 @@ module Dry
 
       def resolve(key)
         super(namespaced(key))
+      end
+
+      def resolve_many(key, tags: nil)
+        super(namespaced(key), tags: tags)
+      end
+
+      def resolve_member(key, name)
+        super(namespaced(key), name)
       end
 
       private
