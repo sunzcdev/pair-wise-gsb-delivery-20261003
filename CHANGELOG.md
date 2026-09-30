@@ -8,6 +8,8 @@
 
 ### New features
 
+- `GraphQL::Language::StructuralFingerprint.generate`: conservative structural fingerprint and canonicalized document for persisted query registration (consistent variable/fragment renames and argument/input object field reordering are equivalent; aliases, selection order, list order, directive order, and custom scalar literal syntax are preserved)
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)
