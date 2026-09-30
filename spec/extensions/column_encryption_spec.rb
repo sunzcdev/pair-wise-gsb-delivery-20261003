@@ -577,3 +577,239 @@ describe "column_encryption plugin" do
     end.must_raise Sequel::Error
   end
 end if RUBY_VERSION >= '2.3' && (begin; require 'sequel/plugins/column_encryption'; true; rescue LoadError; false end)
+
+describe "column_encryption plugin with context-bound columns" do
+  def have_matching_search(ds, obj)
+    ds.sql.gsub("\\_", "_").include?("'#{obj[:enc][0, 48]}%'")
+  end
+
+  before do
+    @db = Sequel.mock(:numrows=>1)
+    @model = Class.new(Sequel::Model)
+    def @model.name; "CeTest"; end
+    @model.set_dataset @db[:ce_test]
+    @model.columns :id, :not_enc, :enc, :enc2
+    @model.plugin :column_encryption do |enc|
+      enc.key 0, "0"*32
+
+      enc.column :enc, :context=>:not_enc
+      enc.column :enc2, :context=>:not_enc
+    end
+    @obj = @model.new(:not_enc=>'123', :enc=>'Abc', :enc2=>'Def')
+    @obj.id = 1
+    @obj.valid?
+    @db.sqls
+  end
+
+  it "should store and read context-bound encrypted columns" do
+    @obj.enc.must_equal 'Abc'
+    @obj.enc2.must_equal 'Def'
+    @obj[:enc].start_with?('AwAA').must_equal true
+    @obj[:enc2].start_with?('AwAA').must_equal true
+    @obj[:enc].wont_equal @obj[:enc2]
+
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    obj.enc.must_equal 'Abc'
+    obj.enc2.must_equal 'Def'
+  end
+
+  it "should not decrypt ciphertext moved to a different record" do
+    other = @model.new(:not_enc=>'456', :enc=>'Ghi', :enc2=>'Jkl')
+    other.valid?
+
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>other[:enc], :enc2=>other[:enc2])
+    proc{obj.enc}.must_raise Sequel::Error
+    proc{obj.enc2}.must_raise Sequel::Error
+
+    obj = @model.load(:id=>2, :not_enc=>'456', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    proc{obj.enc}.must_raise Sequel::Error
+    proc{obj.enc2}.must_raise Sequel::Error
+  end
+
+  it "should not decrypt ciphertext moved to a different column of the same record" do
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc2], :enc2=>@obj[:enc])
+    proc{obj.enc}.must_raise Sequel::Error
+    proc{obj.enc2}.must_raise Sequel::Error
+  end
+
+  it "should not decrypt ciphertext moved to a different model" do
+    model2 = Class.new(Sequel::Model)
+    def model2.name; "OtherCeTest"; end
+    model2.set_dataset @db[:ce_test]
+    model2.columns :id, :not_enc, :enc
+    model2.plugin :column_encryption do |enc|
+      enc.key 0, "0"*32
+
+      enc.column :enc, :context=>:not_enc
+    end
+
+    obj = model2.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc])
+    proc{obj.enc}.must_raise Sequel::Error
+  end
+
+  it "should raise an error when writing without a record identifier" do
+    obj = @model.new(:enc=>'Abc', :enc2=>'Def')
+    proc{obj.valid?}.must_raise Sequel::Error
+    proc{obj.save}.must_raise Sequel::Error
+
+    obj = @model.new(:not_enc=>'', :enc=>'Abc')
+    proc{obj.valid?}.must_raise Sequel::Error
+  end
+
+  it "should raise an error when reading without a record identifier" do
+    obj = @model.load(:id=>1, :not_enc=>nil, :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    proc{obj.enc}.must_raise Sequel::Error
+  end
+
+  it "should require explicit reencryption when the record identifier changes" do
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    obj.not_enc = '456'
+    proc{obj.enc}.must_raise Sequel::Error
+
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    plaintext = obj.enc
+    obj.not_enc = '456'
+    obj.enc = plaintext
+    obj.valid?
+    obj.enc.must_equal 'Abc'
+    obj[:enc].wont_equal @obj[:enc]
+
+    obj2 = @model.load(:id=>1, :not_enc=>'456', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    obj2.enc.must_equal 'Abc'
+  end
+
+  it "should not read ciphertext in the previous format by default" do
+    legacy_model = Class.new(Sequel::Model)
+    legacy_model.set_dataset @db[:ce_test]
+    legacy_model.columns :id, :enc
+    legacy_model.plugin :column_encryption do |enc|
+      enc.key 0, "0"*32
+
+      enc.column :enc
+    end
+    legacy_obj = legacy_model.new(:enc=>'Abc')
+    legacy_obj.valid?
+    legacy_obj[:enc].start_with?('AAAA').must_equal true
+
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>legacy_obj[:enc], :enc2=>@obj[:enc2])
+    proc{obj.enc}.must_raise Sequel::Error
+  end
+
+  it "should support an explicit migration strategy for existing data" do
+    legacy_model = Class.new(Sequel::Model)
+    legacy_model.set_dataset @db[:ce_test]
+    legacy_model.columns :id, :enc
+    legacy_model.plugin :column_encryption do |enc|
+      enc.key 0, "0"*32
+
+      enc.column :enc
+    end
+    legacy_obj = legacy_model.new(:enc=>'Abc')
+    legacy_obj.valid?
+
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc, :allow_unbound=>true
+    end
+
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>legacy_obj[:enc], :enc2=>@obj[:enc2])
+    obj.enc.must_equal 'Abc'
+
+    @model.needing_reencryption.sql.must_include "< 'AwAA'"
+
+    obj.reencrypt.must_be_same_as obj
+    obj[:enc].start_with?('AwAA').must_equal true
+    obj.enc.must_equal 'Abc'
+
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc
+    end
+    obj = @model.load(:id=>1, :not_enc=>'123', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    obj.enc.must_equal 'Abc'
+  end
+
+  it "should not fall back to the previous format when verification fails" do
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc, :allow_unbound=>true
+    end
+
+    # Ciphertext in the context-bound format that fails verification must
+    # raise an error, not fall back to the previous format.
+    obj = @model.load(:id=>1, :not_enc=>'456', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+    proc{obj.enc}.must_raise Sequel::Error
+  end
+
+  it "should support searching context-bound encrypted columns without exposing plaintext" do
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc, :searchable=>true
+    end
+    obj = @model.new(:not_enc=>'123', :enc=>'Abc')
+    obj.valid?
+    obj[:enc].start_with?('BAAA').must_equal true
+
+    have_matching_search(@model.with_encrypted_value(:enc, 'Abc', '123'), obj).must_equal true
+    @model.with_encrypted_value(:enc, 'Abc', '123').sql.include?('Abc').must_equal false
+    have_matching_search(@model.with_encrypted_value(:enc, 'Abc', '456'), obj).must_equal false
+    have_matching_search(@model.with_encrypted_value(:enc, 'Abd', '123'), obj).must_equal false
+
+    proc{@model.with_encrypted_value(:enc, 'Abc')}.must_raise Sequel::Error
+  end
+
+  it "should support case insensitive searching of context-bound encrypted columns" do
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc, :searchable=>:case_insensitive
+    end
+    obj = @model.new(:not_enc=>'123', :enc=>'Abc')
+    obj.valid?
+    obj[:enc].start_with?('BQAA').must_equal true
+
+    have_matching_search(@model.with_encrypted_value(:enc, 'abc', '123'), obj).must_equal true
+    have_matching_search(@model.with_encrypted_value(:enc, 'abc', '456'), obj).must_equal false
+    have_matching_search(@model.with_encrypted_value(:enc, 'abd', '123'), obj).must_equal false
+  end
+
+  it "should support a callable for the record identifier" do
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>lambda{|obj| "id-#{obj.id}"}
+    end
+    obj = @model.new(:not_enc=>'123', :enc=>'Abc')
+    obj.id = 1
+    obj.valid?
+    obj[:enc].start_with?('AwAA').must_equal true
+
+    loaded = @model.load(:id=>1, :not_enc=>'123', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    loaded.enc.must_equal 'Abc'
+
+    moved = @model.load(:id=>2, :not_enc=>'123', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    proc{moved.enc}.must_raise Sequel::Error
+  end
+
+  it "should support context-bound encrypted columns with a serialization format" do
+    require 'json'
+    @model.plugin :column_encryption do |enc|
+      enc.column :enc, :context=>:not_enc, :format=>:json
+    end
+    obj = @model.new(:not_enc=>'123', :enc=>{'a'=>1})
+    obj.valid?
+    obj[:enc].start_with?('AwAA').must_equal true
+
+    loaded = @model.load(:id=>1, :not_enc=>'123', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    loaded.enc.must_equal('a'=>1)
+
+    moved = @model.load(:id=>1, :not_enc=>'456', :enc=>obj[:enc], :enc2=>@obj[:enc2])
+    proc{moved.enc}.must_raise Sequel::Error
+  end
+
+  it "should validate context-related column options" do
+    proc do
+      @model.plugin :column_encryption do |enc|
+        enc.column :enc, :context=>1
+      end
+    end.must_raise Sequel::Error
+
+    proc do
+      @model.plugin :column_encryption do |enc|
+        enc.column :enc, :allow_unbound=>true
+      end
+    end.must_raise Sequel::Error
+  end
+end if RUBY_VERSION >= '2.3' && (begin; require 'sequel/plugins/column_encryption'; true; rescue LoadError; false end)
