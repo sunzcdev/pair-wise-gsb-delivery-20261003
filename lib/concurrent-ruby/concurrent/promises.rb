@@ -498,6 +498,34 @@ module Concurrent
 
     private_constant :InternalStates
 
+    # Handle to a callback registered with
+    # {AbstractEventFuture#add_removable_callback}. Calling it detaches the callback,
+    # abandoning it before it is delivered unless it was delivered already.
+    # @!visibility private
+    class DetachedCallbackHandle < Synchronization::Object
+      safe_initialization!
+
+      def self.already_delivered
+        @already_delivered ||= begin
+          instance = allocate
+          instance.singleton_class.send(:define_method, :call) { false }
+          instance
+        end
+      end
+
+      def initialize(stack, node)
+        super()
+        @Stack = stack
+        @Node  = node
+      end
+
+      # @return [true, false] true if the callback was detached, false if it was delivered
+      def call
+        @Node.value = nil
+        true
+      end
+    end
+
     # @!macro promises.shortcut.event-future
     #   @see Event#$0
     #   @see Future#$0
@@ -798,11 +826,46 @@ module Concurrent
       end
 
       def call_callbacks(state)
-        method, args = @Callbacks.pop
-        while method
+        while (entry = pop_callback)
+          method, args = entry
           call_callback method, state, args
-          method, args = @Callbacks.pop
         end
+      end
+
+      # Pops entries skipping registrations which were detached (their value nil-ified).
+      def pop_callback
+        loop do
+          head = @Callbacks.peek
+          return nil if @Callbacks.empty? head
+          next unless @Callbacks.compare_and_pop head
+          value = head.value
+          return value unless value.nil?
+        end
+      end
+
+      # Registers a callback which may be detached before the receiver is resolved.
+      # Detaching nils the entry on the callback stack, so neither the callback nor
+      # its arguments are retained and the continuation is never invoked. If the
+      # receiver is resolved concurrently the callback is delivered instead and
+      # the returned handle becomes inert.
+      #
+      # @!visibility private
+      # @return [#call] call to detach the registration; returns true if detached,
+      #   false if it was already delivered
+      def add_removable_callback(method, *args)
+        entry  = [method, args]
+        state  = internal_state
+        if state.resolved?
+          call_callback method, state, args
+          return DetachedCallbackHandle.already_delivered
+        end
+
+        node  = @Callbacks.push_node entry
+        state = internal_state
+        # it was resolved in the meanwhile, the callback will be or was delivered
+        return DetachedCallbackHandle.already_delivered if state.resolved?
+
+        DetachedCallbackHandle.new(@Callbacks, node)
       end
 
       def with_async(executor, *args, &block)
@@ -817,6 +880,11 @@ module Concurrent
 
       def callback_notify_blocked(state, promise, index)
         promise.on_blocker_resolution self, index
+      end
+
+      # Used by the edge branch-cancellation mechanism.
+      def callback_notify_branch(state, node, index)
+        node.on_input_resolution self, index
       end
     end
 

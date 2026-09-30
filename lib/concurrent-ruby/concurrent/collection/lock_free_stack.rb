@@ -80,6 +80,17 @@ module Concurrent
       head
     end
 
+    # @param [Object] value
+    # @return [Node] the pushed node, its {Node#value=} can be used to abandon the entry
+    #   before it is popped
+    def push_node(value)
+      while true
+        current_head = head
+        node = Node[value, current_head]
+        return node if compare_and_set_head current_head, node
+      end
+    end
+
     # @param [Node] head
     # @return [true, false]
     def compare_and_pop(head)
