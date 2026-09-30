@@ -2,3 +2,4 @@
 
 require 'addressable/uri'
 require 'addressable/template'
+require 'addressable/equivalence'
