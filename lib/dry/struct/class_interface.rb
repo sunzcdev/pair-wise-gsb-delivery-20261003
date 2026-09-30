@@ -84,10 +84,22 @@ module Dry
       #   ruby.celebrities[1].name #=> 'Aaron Patterson'
       #   ruby.celebrities[1].pseudonym #=> 'tenderlove'
       def attribute(name, type = Undefined, &)
-        attributes(name => build_type(name, type, &))
+        chomped_name = name.to_s.chomp("?").to_sym
+        location = AttributeFragment.user_location
+        built_type = build_type(name, type, location:, &)
+        attributes(name => built_type)
+        register_attribute_origin(
+          chomped_name,
+          AttributeFragment::Origin.new(
+            self,
+            chomped_name,
+            location
+          )
+        )
+        self
       end
 
-      # Add atributes from another struct
+      # Add attributes from another struct or an attribute fragment.
       #
       # @example
       #   class Address < Dry::Struct
@@ -110,16 +122,37 @@ module Dry
       #     end
       #   end
       #
-      # @param struct [Dry::Struct]
-      def attributes_from(struct)
-        extracted_schema = struct.schema.keys.to_h do |key|
-          if key.required?
-            [key.name, key.type]
-          else
-            [:"#{key.name}?", key.type]
-          end
-        end
-        attributes(extracted_schema)
+      # When importing from an {AttributeFragment} the selection can be
+      # narrowed with `only:`/`except:`, attributes can be renamed with
+      # `rename:` or nested under a single attribute with `namespace:`.
+      #
+      # Importing the same original definition twice (even through different
+      # paths) is deduplicated. Same-named attributes coming from distinct
+      # definitions raise {AttributeConflictError} unless handled explicitly.
+      #
+      # @example selecting and renaming fragment attributes
+      #   audit = Dry::Struct.attribute_fragment(:audit) do
+      #     attribute :created_at, Types::Time
+      #     attribute :updated_at, Types::Time
+      #   end
+      #
+      #   class Event < Dry::Struct
+      #     attributes_from audit, only: [:created_at], rename: {created_at: :at}
+      #   end
+      #
+      # @example namespacing
+      #   class Event < Dry::Struct
+      #     attributes_from address, namespace: :address
+      #   end
+      #
+      # @param source [Dry::Struct, Dry::Struct::AttributeFragment]
+      # @param options [Hash] see {AttributeFragment.import_entries}
+      # @raise [AttributeConflictError] when same-named attributes come from
+      #   distinct definitions
+      def attributes_from(source, **options)
+        entries = AttributeFragment.import_entries(source, **options)
+        apply_imported_entries(entries)
+        self
       end
 
       # Adds an omittable (key is not required on initialization) attribute for this {Struct}
@@ -233,6 +266,158 @@ module Dry
         end
       end
       private :check_schema_duplication
+
+      # Origins of attributes defined directly on this class (not inherited).
+      #
+      # @return [Hash{Symbol => Dry::Struct::AttributeFragment::Origin}]
+      # @api private
+      def own_attribute_origins
+        @own_attribute_origins ||= {}
+      end
+
+      # Origin of an attribute if it was defined directly on this class.
+      #
+      # @param name [Symbol] chomped attribute name
+      # @return [Dry::Struct::AttributeFragment::Origin, nil]
+      # @api private
+      def own_attribute_origin(name)
+        own_attribute_origins[name]
+      end
+
+      # User-facing location of the block that built this nested struct class.
+      #
+      # @return [String, nil]
+      # @api private
+      def attribute_location
+        @attribute_location
+      end
+
+      # @api private
+      def register_attribute_origin(name, origin)
+        own_attribute_origins[name] = origin
+      end
+
+      # Origins of all attributes, own definitions taking precedence over
+      # inherited ones. Once a subclass fixes an origin, later changes to a
+      # parent class never rewrite it.
+      #
+      # @return [Hash{Symbol => Dry::Struct::AttributeFragment::Origin}]
+      def attribute_origins
+        if superclass.respond_to?(:attribute_origins)
+          superclass.attribute_origins.merge(own_attribute_origins)
+        else
+          own_attribute_origins.dup
+        end
+      end
+
+      # Apply entries produced by {AttributeFragment.import_entries} to this
+      # struct, deduplicating same-origin definitions and rejecting same-named
+      # attributes that come from distinct definitions.
+      #
+      # @param entries [Array<AttributeFragment::Entry>]
+      # @api private
+      def apply_imported_entries(entries)
+        merge_entries_into(self, entries)
+
+        self
+      end
+      private :apply_imported_entries
+
+      # @api private
+      def merge_entries_into(target, entries)
+        schema_additions = {}
+        batch_origins = {}
+        grouped = {}
+
+        entries.each do |entry|
+          if entry.leaf?
+            merge_leaf_entry(target, entry, batch_origins, schema_additions)
+          else
+            (grouped[entry.first_namespace] ||= []) << entry.descend
+          end
+        end
+
+        grouped.each do |namespace_name, nested_entries|
+          nested_type = resolve_namespace_type(target, namespace_name, nested_entries)
+          schema_additions[namespace_name] = nested_type unless target.has_attribute?(namespace_name)
+          merge_entries_into(nested_type, nested_entries)
+        end
+
+        unless schema_additions.empty?
+          target.attributes(schema_additions)
+          propagate_imported_origins(target, batch_origins)
+        end
+      end
+      private :merge_entries_into
+
+      # Mirror schema propagation performed by {#attributes}: a parent
+      # gaining imported attributes exposes their origins to subclasses that
+      # have not fixed an origin of their own.
+      #
+      # @api private
+      def propagate_imported_origins(target, origins)
+        target.subclasses.each do |subclass|
+          origins.each do |name, origin|
+            unless subclass.own_attribute_origin(name)
+              subclass.register_attribute_origin(name, origin)
+            end
+          end
+          propagate_imported_origins(subclass, origins)
+        end
+      end
+      private :propagate_imported_origins
+
+      # @api private
+      def merge_leaf_entry(target, entry, batch_origins, schema_additions)
+        name = entry.chomped_name
+        key_name = entry.key.required? ? name : :"#{name}?"
+        existing_origin = batch_origins[name] || target.attribute_origins[name]
+
+        if existing_origin
+          unless existing_origin.eql?(entry.origin)
+            raise AttributeConflictError.build(
+              attribute: name,
+              definitions: [existing_origin, entry.origin]
+            )
+          end
+
+          return
+        end
+
+        batch_origins[name] = entry.origin
+        schema_additions[key_name] = entry.key.type
+        target.register_attribute_origin(name, entry.origin)
+      end
+      private :merge_leaf_entry
+
+      # @api private
+      def resolve_namespace_type(target, namespace_name, entries)
+        if target.has_attribute?(namespace_name)
+          nested_type = target.schema.key(namespace_name).type
+
+          unless struct?(nested_type)
+            raise AttributeConflictError.build(
+              attribute: namespace_name,
+              definitions: [
+                AttributeFragment::Origin.new(target, namespace_name, nil),
+                deepest_origin(entries)
+              ]
+            )
+          end
+
+          nested_type
+        else
+          nested_type = target.send(:build_type, namespace_name) {}
+          nested_type
+        end
+      end
+      private :resolve_namespace_type
+
+      # @api private
+      def deepest_origin(entries)
+        entries.min_by { |entry| entry.path.length }.origin
+      end
+      private :deepest_origin
 
       # @param [Hash{Symbol => Object},Dry::Struct] attributes
       # @raise [Struct::Error] if the given attributes don't conform {#schema}
@@ -388,6 +573,32 @@ module Dry
         abstract_class self
       end
 
+      # Define a reusable attribute fragment.
+      #
+      # The block uses the same DSL as a struct body (`attribute`,
+      # `attribute?` and `attributes_from`) but the result is not a struct
+      # itself and can be imported into any number of event classes with
+      # `attributes_from`.
+      #
+      # @example
+      #   audit = Dry::Struct.attribute_fragment(:audit) do
+      #     attribute :created_at, Types::Time
+      #     attribute? :updated_at, Types::Time
+      #   end
+      #
+      #   class Event < Dry::Struct
+      #     attributes_from audit, rename: {created_at: :at}
+      #   end
+      #
+      # @param name [Symbol, String, nil] label used in conflict diagnostics
+      # @yield fragment definition
+      # @return [Dry::Struct::AttributeFragment]
+      def attribute_fragment(name = nil, &block)
+        raise ::ArgumentError, "a block is required to define an attribute fragment" unless block
+
+        AttributeFragment.new(name).define(&block)
+      end
+
       # Dump to the AST
       #
       # @return [Array]
@@ -427,7 +638,7 @@ module Dry
       # Constructs a type
       #
       # @return [Dry::Types::Type, Dry::Struct]
-      def build_type(name, type = Undefined, &)
+      def build_type(name, type = Undefined, location: Undefined, &)
         type_object =
           if type.is_a?(::String)
             Types[type]
@@ -441,7 +652,7 @@ module Dry
           end
 
         if block_given?
-          struct_builder.(name, type_object, &)
+          struct_builder.(name, type_object, location:, &)
         else
           type_object
         end

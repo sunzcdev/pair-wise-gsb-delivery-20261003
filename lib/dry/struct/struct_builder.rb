@@ -14,8 +14,10 @@ module Dry
       # @param [Symbol|String] attr_name the name of the nested type
       # @param [Dry::Struct,Dry::Types::Type::Array,Undefined] type the superclass
       #                                                        of the nested struct
+      # @param location [String, Dry::Core::Constants::Undefined] user-facing
+      #   definition location, recorded on the new class for diagnostics
       # @yield the body of the nested struct
-      def call(attr_name, type, &block)
+      def call(attr_name, type, location: Undefined, &block)
         const_name = const_name(type, attr_name)
         check_name(const_name)
 
@@ -28,6 +30,10 @@ module Dry
           end
 
           class_exec(&block)
+        end
+
+        unless Undefined.equal?(location)
+          new_type.instance_variable_set(:@attribute_location, location)
         end
 
         struct.const_set(const_name, new_type)

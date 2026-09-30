@@ -9,6 +9,13 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Reusable attribute fragments: `Dry::Struct.attribute_fragment` defines a named
+  group of attributes that can be imported with `attributes_from`. Imports
+  support `only:`, `except:`, `rename:` and `namespace:`. Every attribute keeps
+  its origin, so the same definition reached through two import paths is
+  imported once, while same-named attributes coming from distinct definitions
+  raise `Dry::Struct::AttributeConflictError` pointing at both definitions.
+
 ### Changed
 
 ### Deprecated
