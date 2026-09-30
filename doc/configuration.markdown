@@ -107,6 +107,33 @@ a refresh (e.g., clicking the "Refresh" button).
 
 *IMPORTANT: Enabling this option globally allows all clients to break your cache.*
 
+### `post_cache`
+
+A boolean specifying whether successful `POST` responses may be published into
+the cache so that later `GET` or `HEAD` requests for the same resource can be
+served from them (see [RFC 9111 §9.3](https://www.rfc-editor.org/rfc/rfc9111#section-9.3)).
+This option is disabled by default (`rack-cache.post_cache` is `false`).
+
+When enabled, the representation carried by a `POST` response is published
+only when *all* of the following hold:
+
+* the response status is `200`;
+* the response carries explicit freshness information (a
+  `cache-control: max-age`/`s-maxage`/`r-maxage` directive or an `Expires`
+  header) and is still fresh — the `default_ttl` option does not apply;
+* the response includes a `Content-Location` header identifying exactly the
+  request target URI (scheme, host, port, path, and query must all match — a
+  merely same-origin URI with a different path does not match); and
+* the response is otherwise cacheable, i.e. the usual protections for
+  `private`/`no-store` responses and requests carrying `Authorization` or
+  other private headers still apply.
+
+Enabling this option never changes write semantics: every `POST` request is
+always forwarded to the backend and is never answered from a cached entry.
+The entry previously stored for the request URI is invalidated before the new
+representation is published; if the `POST` fails, no new entry is stored and
+the previous one remains invalidated.
+
 ### `cache_key`
 
 A custom cache key generator, which can be anything that responds to :call.

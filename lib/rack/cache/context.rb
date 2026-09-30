@@ -1,3 +1,4 @@
+require 'uri'
 require 'rack/cache/options'
 require 'rack/cache/request'
 require 'rack/cache/response'
@@ -71,6 +72,8 @@ module Rack::Cache
         else
           if @request.options?
             pass
+          elsif post_cache? && @request.post?
+            post
           else
             invalidate
           end
@@ -158,6 +161,35 @@ module Rack::Cache
     else
       record :invalidate
       pass
+    end
+
+    # Handle a POST request when response publishing is enabled via the
+    # post_cache option. The POST is always forwarded to the backend; the
+    # cache is never used to skip the write. Any entry previously stored for
+    # the request URI is invalidated first, and the new representation is
+    # published only when the response satisfies all caching conditions.
+    def post
+      begin
+        metastore.invalidate(@request, entitystore)
+      rescue => e
+        log_error(e)
+      else
+        record :invalidate
+      end
+
+      response = forward
+
+      # As with GET/HEAD responses, mark the response private when private
+      # request headers were sent unless the response is explicitly public.
+      # A default TTL is never assigned: POST responses must carry explicit
+      # freshness information of their own to be published.
+      if private_request? && !response.cache_control.public?
+        response.private = true
+      end
+
+      store(response) if post_response_cacheable?(response)
+
+      response
     end
 
     # Try to serve the response from cache. When a matching cache entry is
@@ -299,6 +331,51 @@ module Rack::Cache
     def strip_ignore_headers(response)
       stripped_values = ignore_headers.map { |name| response.headers.delete(name) }
       record :ignore if stripped_values.any?
+    end
+
+    # Determine whether a POST response may be published to satisfy later
+    # GET/HEAD requests. All of the following must hold:
+    #
+    # * status is 200 (first version intentionally supports no other codes);
+    # * the response is otherwise cacheable, so the existing protections for
+    #   private/no-store responses and private request headers still apply;
+    # * the response has explicit freshness information and is fresh; and
+    # * the response carries a Content-Location header identifying exactly
+    #   the request target URI.
+    def post_response_cacheable?(response)
+      response.status == 200 &&
+        response.cacheable? &&
+        explicit_freshness?(response) &&
+        same_target_content_location?(response)
+    end
+
+    # True when the response declares its own freshness lifetime via a
+    # Cache-Control age directive or an Expires header and is currently fresh.
+    # A default TTL assigned by the cache never qualifies.
+    def explicit_freshness?(response)
+      cc = response.cache_control
+      explicitly_declared =
+        cc.key?('max-age') || cc.key?('s-maxage') || cc.key?('r-maxage') ||
+        !response.headers['expires'].nil?
+      explicitly_declared && response.fresh?
+    end
+
+    # True when the response's Content-Location header, resolved against the
+    # request URI, identifies exactly the request target. A same-origin URI
+    # with a different path or query does not match.
+    def same_target_content_location?(response)
+      value = response.headers['content-location']
+      return false if value.nil? || value.strip.empty?
+
+      request_uri = @request.url
+      target = URI.join(request_uri, value)
+      current = URI.parse(request_uri)
+
+      [:scheme, :host, :port, :path, :query].all? do |component|
+        target.send(component) == current.send(component)
+      end
+    rescue URI::Error
+      false
     end
 
     def log_error(exception)

@@ -900,6 +900,396 @@ describe Rack::Cache::Context do
     cache.trace.must_include :store
   end
 
+  describe 'with post_cache enabled' do
+    POST_CACHE_OPTION = { 'rack-cache.post_cache' => true }
+
+    def post_response_headers(overrides={})
+      {
+        'cache-control' => 'public, max-age=500',
+        'content-location' => 'http://example.org/'
+      }.merge(overrides)
+    end
+
+    it 'is disabled by default and does not publish POST responses' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          post_response_headers.each { |k,v| res[k] = v }
+          res.body = ['posted representation']
+        end
+      end
+
+      post '/'
+      assert app.called?
+      response.status.must_equal 200
+      cache.trace.must_include :invalidate
+      cache.trace.wont_include :store
+
+      get '/'
+      assert app.called?
+      cache.trace.must_include :miss
+    end
+
+    it 'publishes a 200 POST response with freshness and same-target Content-Location' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          post_response_headers.each { |k,v| res[k] = v }
+          res.body = ['posted representation']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      assert app.called?
+      response.status.must_equal 200
+      response.body.must_equal 'posted representation'
+      cache.trace.must_include :invalidate
+      cache.trace.must_include :store
+
+      app.reset!
+      get '/'
+      refute app.called?
+      response.status.must_equal 200
+      response.body.must_equal 'posted representation'
+      cache.trace.must_include :fresh
+
+      head '/'
+      refute app.called?
+      response.status.must_equal 200
+    end
+
+    it 'accepts a relative Content-Location resolving to the request target' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = '/items/42'
+          res.body = ['posted representation']
+        end
+      end
+
+      post '/items/42', POST_CACHE_OPTION
+      cache.trace.must_include :store
+
+      app.reset!
+      get '/items/42'
+      refute app.called?
+      response.body.must_equal 'posted representation'
+      cache.trace.must_include :fresh
+    end
+
+    it 'always forwards POST requests to the backend and never serves them from cache' do
+      calls = 0
+      respond_with do |req,res|
+        if req.post?
+          calls += 1
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ["posted representation #{calls}"]
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      assert app.called?
+      response.body.must_equal 'posted representation 1'
+
+      app.reset!
+      post '/', POST_CACHE_OPTION
+      assert app.called?
+      response.body.must_equal 'posted representation 2'
+      cache.trace.wont_include :fresh
+      cache.trace.must_include :invalidate
+      cache.trace.must_include :store
+      calls.must_equal 2
+    end
+
+    it 'invalidates before publishing so a failed second POST leaves no fresh GET entry' do
+      calls = 0
+      respond_with do |req,res|
+        case req.request_method
+        when 'POST'
+          calls += 1
+          if calls == 1
+            res.status = 200
+            res['cache-control'] = 'public, max-age=500'
+            res['content-location'] = 'http://example.org/'
+            res.body = ['first representation']
+          else
+            res.status = 500
+            res.headers.delete('cache-control')
+            res.body = ['second post failed']
+          end
+        when 'GET'
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['fresh from origin']
+        end
+      end
+
+      # first POST succeeds and publishes its representation
+      post '/', POST_CACHE_OPTION
+      response.status.must_equal 200
+      response.body.must_equal 'first representation'
+      cache.trace.must_include :store
+
+      # the published entry is fresh for GET
+      app.reset!
+      get '/'
+      refute app.called?
+      response.body.must_equal 'first representation'
+      cache.trace.must_include :fresh
+
+      # second POST fails: still forwarded, old entry invalidated, nothing published
+      post '/', POST_CACHE_OPTION
+      assert app.called?
+      response.status.must_equal 500
+      cache.trace.must_include :invalidate
+      cache.trace.wont_include :store
+
+      # the old representation must no longer be served fresh
+      get '/'
+      assert app.called?
+      response.body.must_equal 'fresh from origin'
+      cache.trace.wont_include :fresh
+    end
+
+    it 'invalidates the old entry even when the new POST response is not published' do
+      respond_with do |req,res|
+        case req.request_method
+        when 'GET'
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['original']
+        when 'POST'
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          # content-location points at a different path
+          res['content-location'] = 'http://example.org/somewhere-else'
+          res.body = ['posted']
+        end
+      end
+
+      get '/'
+      cache.trace.must_include :store
+
+      app.reset!
+      post '/', POST_CACHE_OPTION
+      cache.trace.must_include :invalidate
+      cache.trace.wont_include :store
+
+      get '/'
+      assert app.called?
+      cache.trace.wont_include :fresh
+    end
+
+    it 'does not publish without a Content-Location header' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+
+      get '/'
+      assert app.called?
+      cache.trace.must_include :miss
+    end
+
+    it 'does not publish when Content-Location is same-origin but a different path' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = '/other'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not publish when Content-Location differs only by query string' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/?other=1'
+          res.body = ['posted']
+        end
+      end
+
+      post '/?a=1', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'publishes when Content-Location includes the identical query string' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/?a=1'
+          res.body = ['posted']
+        end
+      end
+
+      post '/?a=1', POST_CACHE_OPTION
+      cache.trace.must_include :store
+    end
+
+    it 'does not publish without explicit freshness information' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['etag'] = '"FOO"'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not apply default_ttl to POST responses' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['etag'] = '"FOO"'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION.merge('rack-cache.default_ttl' => 10)
+      cache.trace.wont_include :store
+    end
+
+    it 'publishes freshness declared by an Expires header' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['content-location'] = 'http://example.org/'
+          res['expires'] = (Time.now + 500).httpdate
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.must_include :store
+    end
+
+    it 'does not publish a response with max-age=0' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=0'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not publish non-200 responses' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 202
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['accepted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not publish private responses' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'private, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not publish no-store responses' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'no-store, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION
+      cache.trace.wont_include :store
+    end
+
+    it 'does not publish POST responses to requests carrying Authorization unless public' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION.merge('HTTP_AUTHORIZATION' => 'basic foobarbaz')
+      cache.trace.wont_include :store
+      response.headers['cache-control'].must_include 'private'
+    end
+
+    it 'publishes an explicitly public POST response even with Authorization' do
+      respond_with do |req,res|
+        if req.post?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['posted']
+        end
+      end
+
+      post '/', POST_CACHE_OPTION.merge('HTTP_AUTHORIZATION' => 'basic foobarbaz')
+      cache.trace.must_include :store
+    end
+
+    it 'never publishes PUT or DELETE responses even with post_cache enabled' do
+      respond_with do |req,res|
+        res.status = 200
+        res['cache-control'] = 'public, max-age=500'
+        res['content-location'] = 'http://example.org/'
+        res.body = ['written']
+      end
+
+      put_response = request 'put', '/', POST_CACHE_OPTION
+      assert app.called?
+      put_response.body.must_equal 'written'
+      cache.trace.must_include :invalidate
+      cache.trace.must_include :pass
+      cache.trace.wont_include :store
+
+      request 'delete', '/', POST_CACHE_OPTION
+      cache.trace.must_include :pass
+      cache.trace.wont_include :store
+    end
+  end
+
   describe 'with responses that include a Vary header' do
     before do
       count = 0

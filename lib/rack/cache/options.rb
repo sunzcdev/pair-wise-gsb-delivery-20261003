@@ -103,6 +103,27 @@ module Rack::Cache
     # cache-control "max-age=0" directive in the request. Disabled by default.
     option_accessor :allow_revalidate
 
+    # Specifies whether the cache may publish (store) the response to a
+    # successful POST request so that it can satisfy later GET or HEAD
+    # requests for the same resource. This is enabled only when all of the
+    # following hold (see RFC 9111 9.3 and RFC 9110 10.2.5):
+    #
+    # * the POST response has a 200 status code,
+    # * the response carries explicit freshness information
+    #   (Cache-Control max-age/s-maxage/r-maxage or an Expires header),
+    # * the response includes a Content-Location header identifying exactly
+    #   the request's target URI (same scheme, host, port, path, and query;
+    #   a merely same-origin URI with a different path never matches), and
+    # * the response is otherwise cacheable (no private/no-store directive,
+    #   no private request headers such as Authorization, etc.).
+    #
+    # Enabling this never changes write semantics: every POST request is
+    # always forwarded to the backend. Invalidation of the previously stored
+    # entry happens before the new representation is published.
+    #
+    # Default: false
+    option_accessor :post_cache
+
     # Specifies whether the underlying entity store's native expiration should
     # be used.
     option_accessor :use_native_ttl
@@ -152,6 +173,7 @@ module Rack::Cache
         'rack-cache.private_headers'  => ['Authorization', 'Cookie'],
         'rack-cache.allow_reload'     => false,
         'rack-cache.allow_revalidate' => false,
+        'rack-cache.post_cache'       => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
       }
