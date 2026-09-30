@@ -37,6 +37,10 @@ module Dry
         super(namespaced(key), *args, &block)
       end
 
+      def register_alias(key, target)
+        super(namespaced(key), target)
+      end
+
       def namespace(namespace, &block)
         super(namespaced(namespace), &block)
       end

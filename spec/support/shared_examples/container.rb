@@ -592,6 +592,302 @@ RSpec.shared_examples "a container" do
         expect(container.resolve("one.two.three")).to eq(3)
       end
     end
+
+    describe "aliases" do
+      describe "#register_alias" do
+        it "resolves the same value as the target key" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          expect(container["archive.storage"]).to eql("value")
+          expect(container["storage"]).to eql("value")
+        end
+
+        it "accepts symbols like a regular registration" do
+          container.register(:storage, "value")
+          container.register_alias(:archive_storage, :storage)
+
+          expect(container[:archive_storage]).to eql("value")
+        end
+
+        it "returns the container" do
+          container.register("storage", "value")
+
+          expect(container.register_alias("archive.storage", "storage")).to be(container)
+        end
+
+        it "does not register a second factory under the alias key" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          expect(container._container["archive.storage"]).to be_a(Dry::Container::Alias)
+        end
+
+        it "raises when the alias key is already taken" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          expect {
+            container.register_alias("archive.storage", "storage")
+          }.to raise_error(Dry::Container::Error, /already an item registered/)
+        end
+
+        it "allows aliases to point at aliases" do
+          container.register("storage", "value")
+          container.register_alias("a", "storage")
+          container.register_alias("b", "a")
+          container.register_alias("c", "b")
+
+          expect(container["c"]).to eql("value")
+          expect(container["b"]).to eql("value")
+        end
+
+        it "resolves the target lazily so it can be registered later" do
+          container.register_alias("archive.storage", "storage")
+          container.register("storage", "value")
+
+          expect(container["archive.storage"]).to eql("value")
+        end
+
+        it "shares the terminal object and its memoized state" do
+          resolved_times = 0
+          container.register("storage", -> { resolved_times += 1 }, memoize: true)
+          container.register_alias("a", "storage")
+          container.register_alias("b", "a")
+
+          expect(container["storage"]).to be(container["a"])
+          expect(container["a"]).to be(container["b"])
+          expect(resolved_times).to be(1)
+        end
+
+        it "reports the whole key chain when the terminal key is missing" do
+          container.register_alias("a", "b")
+          container.register_alias("b", "missing")
+
+          expect { container["a"] }.to raise_error(
+            Dry::Container::Error, "alias target not found: a -> b -> missing"
+          )
+        end
+
+        it "reports the whole key chain for a direct alias to a missing key" do
+          container.register_alias("a", "missing")
+
+          expect { container["a"] }.to raise_error(
+            Dry::Container::Error, "alias target not found: a -> missing"
+          )
+        end
+
+        it "keeps the regular KeyError behaviour for an unregistered key" do
+          expect { container["missing"] }.to raise_error(KeyError)
+        end
+
+        it "still invokes the fallback block for an unregistered key" do
+          expect(container.resolve("missing") { :fallback }).to be(:fallback)
+        end
+
+        it "does not invoke the fallback when an alias target is missing" do
+          container.register_alias("a", "missing")
+
+          expect {
+            container.resolve("a") { :fallback }
+          }.to raise_error(Dry::Container::Error, /a -> missing/)
+        end
+
+        it "detects a circular alias chain without recursing forever" do
+          container.register_alias("x", "y")
+          container.register_alias("y", "z")
+          container.register_alias("z", "x")
+
+          expect { container["x"] }.to raise_error(
+            Dry::Container::Error, "circular alias chain detected: x -> y -> z -> x"
+          )
+        end
+
+        it "detects a self-referencing alias" do
+          container.register_alias("x", "x")
+
+          expect { container["x"] }.to raise_error(
+            Dry::Container::Error, "circular alias chain detected: x -> x"
+          )
+        end
+
+        it "is visible through key?, keys and each" do
+          container.register("storage", 7)
+          container.register_alias("a", "storage")
+
+          expect(container.key?("a")).to be(true)
+          expect(container.keys).to match_array(%w[storage a])
+
+          pairs = {}
+          container.each { |key, value| pairs[key] = value }
+
+          expect(pairs).to eq("storage" => 7, "a" => 7)
+        end
+      end
+
+      describe "#decorate with aliases" do
+        it "decorates the terminal registration through the original key" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+          container.decorate("storage") { |value| "<#{value}>" }
+
+          expect(container["storage"]).to eql("<value>")
+          expect(container["archive.storage"]).to eql("<value>")
+        end
+
+        it "decorates the terminal when invoked through an alias" do
+          container.register("storage", "value")
+          container.register_alias("a", "storage")
+          container.register_alias("b", "a")
+          container.decorate("b") { |value| "{#{value}}" }
+
+          expect(container["storage"]).to eql("{value}")
+          expect(container["a"]).to eql("{value}")
+          expect(container["b"]).to eql("{value}")
+        end
+
+        it "shares the memoized cached object when decorating after resolving" do
+          resolved_times = 0
+          container.register("storage", -> { resolved_times += 1 }, memoize: true)
+          container.register_alias("a", "storage")
+
+          container["storage"]
+          container["a"]
+
+          container.decorate("a") { |value| "decorated:#{resolved_times}:#{value}" }
+
+          expect(container["storage"]).to eql("decorated:1:1")
+          expect(container["a"]).to eql("decorated:1:1")
+          expect(container["storage"]).to be(container["a"])
+          expect(resolved_times).to be(1)
+        end
+
+        context "with alias_entry: true" do
+          it "decorates only the alias entry" do
+            container.register("storage", "value")
+            container.register_alias("a", "storage")
+            container.register_alias("b", "storage")
+            container.decorate("a", alias_entry: true) { |value| "[#{value}]" }
+
+            expect(container["a"]).to eql("[value]")
+            expect(container["storage"]).to eql("value")
+            expect(container["b"]).to eql("value")
+          end
+
+          it "shares the terminal object while keeping it undecorated" do
+            object = Object.new
+            container.register("storage", -> { object }, memoize: true)
+            container.register_alias("a", "storage")
+            container.decorate("a", alias_entry: true) { |value| [:decorated, value] }
+
+            expect(container["a"]).to eq([:decorated, object])
+            expect(container["storage"]).to be(object)
+          end
+
+          it "memoizes the decorated value on the alias entry only" do
+            container.register("storage", -> { Object.new }, memoize: true)
+            container.register_alias("a", "storage")
+            container.decorate("a", alias_entry: true) { |value| [:decorated, value] }
+
+            expect(container["a"]).to be(container["a"])
+            expect(container["storage"]).to be(container["storage"])
+          end
+
+          it "keeps the decorator lazy for non-memoized callables" do
+            built = 0
+            container.register("storage", -> { built += 1 })
+            container.register_alias("a", "storage")
+            container.decorate("a", alias_entry: true) { |value| "decorated:#{value}" }
+
+            expect(built).to be(0)
+            expect(container["a"]).to eql("decorated:1")
+            expect(built).to be(1)
+            expect(container["storage"]).to eql(2)
+          end
+        end
+
+        it "raises when the alias chain ends at a missing key" do
+          container.register_alias("a", "b")
+          container.register_alias("b", "missing")
+
+          expect {
+            container.decorate("a") { |value| value }
+          }.to raise_error(Dry::Container::Error, /a -> b -> missing/)
+        end
+      end
+
+      describe "namespaces" do
+        it "registers a namespaced alias pointing at an absolute key" do
+          container.register("storage", "value")
+          container.namespace("archive") do
+            register_alias("storage", "storage")
+          end
+
+          expect(container["archive.storage"]).to eql("value")
+        end
+
+        it "resolves aliases defined inside imported namespaces" do
+          container.register("storage", "value")
+
+          ns = Dry::Container::Namespace.new("archive") do
+            register_alias("storage", "storage")
+          end
+
+          container.import(ns)
+
+          expect(container["archive.storage"]).to eql("value")
+        end
+      end
+
+      describe "copying a container" do
+        it "keeps alias chains working after dup" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          expect(container.dup["archive.storage"]).to eql("value")
+        end
+
+        it "does not share keys registered on the copy" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          container.dup.register("other", "other")
+
+          expect(container.key?("other")).to be(false)
+        end
+
+        it "does not share keys registered on a clone" do
+          container.register("storage", "value")
+          container.register_alias("archive.storage", "storage")
+
+          container.clone.register("other", "other")
+
+          expect(container.key?("other")).to be(false)
+        end
+
+        it "shares memoized state between alias and terminal on the copy" do
+          container.register("storage", -> { Object.new }, memoize: true)
+          container.register_alias("a", "storage")
+
+          copy = container.dup
+
+          expect(copy["a"]).to be(copy["storage"])
+        end
+      end
+
+      describe "#merge" do
+        it "copies real alias entries into the other container" do
+          container.register("storage", "value")
+          container.register_alias("a", "storage")
+
+          other = Dry::Container.new
+          other.merge(container)
+
+          expect(other["a"]).to eql("value")
+          expect(other._container["a"]).to be_a(Dry::Container::Alias)
+        end
+      end
+    end
   end
 
   describe "stubbing" do

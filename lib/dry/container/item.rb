@@ -41,7 +41,7 @@ module Dry
       # @private
       def map(func)
         if callable?
-          self.class.new(-> { func.(item.call) }, options)
+          self.class.new(-> { func.(call) }, options)
         else
           self.class.new(func.(item), options)
         end

@@ -160,6 +160,34 @@ module Dry
               "can't modify frozen #{self.class} (when attempting to register '#{key}')"
       end
 
+      # Register an alias pointing at another key. The target key may itself
+      # be an alias; the whole chain always resolves to the same terminal
+      # registration, sharing its object and memoization state.
+      #
+      # The target does not need to be registered yet: alias chains are
+      # resolved lazily on the first {#resolve}.
+      #
+      # @param [Mixed] key
+      #   The key to register the alias with (used to resolve)
+      # @param [Mixed] target
+      #   The key the alias points at (may itself be an alias)
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @raise [Dry::Container::Error]
+      #   If an item is already registered with the given key, or if the
+      #   alias chain is circular or ends at an unregistered key
+      #
+      # @api public
+      def register_alias(key, target)
+        config.registry.register_alias(_container, key, target)
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} (when attempting to register '#{key}')"
+      end
+
       # Resolve an item from the container
       #
       # @param [Mixed] key
@@ -264,12 +292,22 @@ module Dry
 
       # Decorates an item from the container with specified decorator
       #
+      # When the key is an alias, the terminal registration is decorated by
+      # default, so every name pointing at it (including other aliases) gets
+      # the decorated object and shares its memoized state. Pass
+      # <tt>alias_entry: true</tt> to decorate only this alias entry: the
+      # original key and every other alias are left untouched.
+      #
+      # @param [Boolean] alias_entry
+      #   When true, decorate only the given alias entry instead of the
+      #   terminal registration
+      #
       # @return [Dry::Container::Mixin] self
       #
       # @api public
-      def decorate(key, with: nil, &block)
+      def decorate(key, with: nil, alias_entry: false, &block)
         key = key.to_s
-        original = _container.delete(key) do
+        original = _container.fetch(key) do
           raise Error, "Nothing registered with the key #{key.inspect}"
         end
 
@@ -281,8 +319,27 @@ module Dry
           decorator = with || block
         end
 
-        _container[key] = original.map(decorator)
+        if original.is_a?(Alias) && alias_entry
+          decorate_alias_entry(key, decorator)
+        else
+          terminal_key, terminal = resolve_terminal(key)
+          _container[terminal_key] = terminal.map(decorator)
+        end
+
         self
+      end
+
+      # @private
+      def resolve_terminal(key)
+        config.resolver.resolve_alias_chain_with_key(_container, key.to_s) do |missing|
+          raise Error, "Nothing registered with the key #{missing.inspect}"
+        end
+      end
+
+      # @private
+      def decorate_alias_entry(key, decorator)
+        _, terminal = resolve_terminal(key)
+        _container[key] = terminal.map(decorator)
       end
 
       # Evaluate block and register items in namespace
