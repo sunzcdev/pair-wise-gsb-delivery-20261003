@@ -251,6 +251,39 @@ vehicle.fire_events!(:ignite, :enable_alarm)    # => StateMachines:InvalidParall
 
 State machines can coordinate with each other using state guards, allowing transitions to depend on the state of other state machines within the same object. This enables complex system modeling where components are interdependent.
 
+## Hierarchical States
+
+States can declare an explicit parent with `:parent`. Parent states provide shared behavior and transitions, but persistence always uses the current leaf state, so flat state machines and existing stored values remain compatible.
+
+```ruby
+class Order
+  state_machine initial: :payment_pending do
+    state :processing
+    state :payment_pending, parent: :processing
+    state :payment_complete, parent: :processing
+
+    state :processing do
+      on_enter { |_order, transition| Rails.logger.info("enter #{transition.to_name}") }
+      on_exit { |_order, transition| Rails.logger.info("exit #{transition.from_name}") }
+
+      event :cancel do
+        transition all => :cancelled
+      end
+    end
+
+    event :pay do
+      transition payment_pending: :payment_complete
+    end
+
+    event :cancel do
+      transition payment_complete: :refunding
+    end
+  end
+end
+```
+
+For an event, transitions defined on the current leaf state are checked first. If none applies, lookup continues through that leaf's explicit parent chain and finally to transitions defined at machine scope. When a transition runs, exit actions execute from the deepest source state up to the lowest common ancestor, and entry actions execute from that ancestor down to the target leaf. That ancestor is neither exited nor entered again.
+
 ## State Guard Options
 
 ### Single State Guards

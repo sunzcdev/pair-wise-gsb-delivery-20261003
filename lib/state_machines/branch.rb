@@ -27,6 +27,12 @@ module StateMachines
     # The requirement for verifying the event being matched
     attr_reader :event_requirement
 
+    # The state machine that owns this branch
+    attr_accessor :machine
+
+    # The state in whose context this branch was explicitly defined
+    attr_reader :defined_in
+
     # One or more requirements for verifying the states being matched.  All
     # requirements contain a mapping of {:from => matcher, :to => matcher}.
     attr_reader :state_requirements
@@ -39,6 +45,8 @@ module StateMachines
 
     # Creates a new branch
     def initialize(options = {}) # :nodoc:
+      @machine = options.delete(:machine)
+
       # Build conditionals
       @if_condition = options.delete(:if)
       @unless_condition = options.delete(:unless)
@@ -59,6 +67,7 @@ module StateMachines
 
       # Build event requirement
       @event_requirement = build_matcher(options, :on, :except_on)
+      @defined_in = options.delete(:defined_in)
 
       if (options.keys - %i[from to on except_from except_to except_on]).empty?
         # Explicit from/to requirements specified
@@ -163,12 +172,12 @@ module StateMachines
 
       if options.include?(whitelist_option)
         value = options[whitelist_option]
-        value.is_a?(Matcher) ? value : WhitelistMatcher.new(options[whitelist_option])
+        value.is_a?(Matcher) ? value : WhitelistMatcher.new(value, @machine)
       elsif options.include?(blacklist_option)
         value = options[blacklist_option]
         raise ArgumentError, ":#{blacklist_option} option cannot use matchers; use :#{whitelist_option} instead" if value.is_a?(Matcher)
 
-        BlacklistMatcher.new(value)
+        BlacklistMatcher.new(value, @machine)
       else
         AllMatcher.instance
       end

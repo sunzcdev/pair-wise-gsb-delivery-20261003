@@ -12,6 +12,8 @@ module StateMachines
   # StateMachines::Machine#state for more information about how state-driven
   # behavior can be utilized.
   class State
+    include EvalHelpers
+
     # The state machine for which this state is defined
     attr_reader :machine
 
@@ -40,6 +42,14 @@ module StateMachines
     # state
     attr_accessor :matcher
 
+    # The explicit parent state name, if this state is nested
+    attr_reader :parent_name
+
+    attr_writer :parent_name
+
+    # The explicit child states defined beneath this state
+    attr_reader :children
+
     # Creates a new state within the context of the given machine.
     #
     # Configuration options:
@@ -53,17 +63,18 @@ module StateMachines
     #   (e.g. :value => lambda {Time.now}, :if => lambda {|state| !state.nil?}).
     #   By default, the configured value is matched.
     # * <tt>:human_name</tt> - The human-readable version of this state's name
-    def initialize(machine, name, options = nil, initial: false, value: :__not_provided__, cache: nil, if: nil, human_name: nil, **extra_options) # :nodoc:
+    def initialize(machine, name, options = nil, initial: false, value: :__not_provided__, cache: nil, if: nil, human_name: nil, parent: nil, **extra_options) # :nodoc:
       # Handle both old hash style and new kwargs style for backward compatibility
       case options
       in Hash
         # Old style: initialize(machine, name, {initial: true, value: 'foo'})
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :initial, :value, :cache, :if, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :initial, :value, :cache, :if, :human_name, :parent)
         initial = options.fetch(:initial, false)
         value = options.include?(:value) ? options[:value] : :__not_provided__
         cache = options[:cache]
         if_condition = options[:if]
         human_name = options[:human_name]
+        parent = options[:parent]
       in nil
         # New style: initialize(machine, name, initial: true, value: 'foo')
         StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :initial, :value, :cache, :if, :human_name) unless extra_options.empty?
@@ -81,6 +92,11 @@ module StateMachines
       @cache = cache
       @matcher = if_condition
       @initial = initial == true
+      @parent_name = parent
+      @parent = nil
+      @children = []
+      @enter_callbacks = []
+      @exit_callbacks = []
       @context = StateContext.new(self)
 
       return unless name
@@ -108,11 +124,71 @@ module StateMachines
     def initialize_copy(orig) # :nodoc:
       super
       @context = StateContext.new(self)
+      @parent = nil
+      @children = []
+      @enter_callbacks = orig.instance_variable_get(:@enter_callbacks).dup
+      @exit_callbacks = orig.instance_variable_get(:@exit_callbacks).dup
     end
 
     def machine=(machine)
       @machine = machine
       @context = StateContext.new(self)
+    end
+
+    # The parent state in the explicitly configured state hierarchy
+    def parent
+      @parent
+    end
+
+    # Whether this state has child states
+    def composite?
+      children.any?
+    end
+
+    # Whether this state can be persisted as the active state
+    def leaf?
+      !composite?
+    end
+
+    # All parent states, ordered from the nearest parent to the root
+    def ancestors
+      parent ? [parent, *parent.ancestors] : []
+    end
+
+    # The state and all of its ancestors, ordered from the root to this state
+    def path
+      [*ancestors.reverse, self]
+    end
+
+    # Registers a callback to run when this state is entered
+    def on_enter(*callbacks, &block)
+      callbacks << block if block
+      raise ArgumentError, 'State enter callback must be specified' if callbacks.empty?
+
+      @enter_callbacks.concat(callbacks)
+    end
+    alias enter on_enter
+
+    # Registers a callback to run when this state is exited
+    def on_exit(*callbacks, &block)
+      callbacks << block if block
+      raise ArgumentError, 'State exit callback must be specified' if callbacks.empty?
+
+      @exit_callbacks.concat(callbacks)
+    end
+    alias exit on_exit
+
+    def run_enter_callbacks(object, transition)
+      @enter_callbacks.each { |callback| evaluate_method(object, callback, transition) }
+    end
+
+    def run_exit_callbacks(object, transition)
+      @exit_callbacks.each { |callback| evaluate_method(object, callback, transition) }
+    end
+
+    def reset_hierarchy
+      @parent = nil
+      @children = []
     end
 
     # Determines whether there are any states that can be transitioned to from
@@ -245,7 +321,7 @@ module StateMachines
       options = { method_name: method }.merge(options)
       state = machine.states.match!(object)
 
-      if state == self && object.respond_to?(method)
+      if machine.states.match!(object).path.include?(self)
         object.send(method, *args, &)
       elsif (method_missing = options[:method_missing])
         # Dispatch to the superclass since the object either isn't in this state
@@ -278,6 +354,13 @@ module StateMachines
     end
 
     private
+
+    attr_reader :enter_callbacks, :exit_callbacks
+
+    def parent=(state)
+      @parent = state
+      state.children << self unless state.nil? || state.children.include?(self)
+    end
 
     # Should the value be cached after it's evaluated for the first time?
     def cache_value?

@@ -127,6 +127,7 @@ module StateMachines
       raise ArgumentError, 'Type must be :before, :after, :around, or :failure' unless %i[before after around failure].include?(type)
 
       options = args.last.is_a?(Hash) ? args.pop : {}
+      machine = options.delete(:machine)
       @methods = args
       @methods.concat(Array(options.delete(:do)))
       @methods << block if block_given?
@@ -141,7 +142,7 @@ module StateMachines
       end
 
       @terminator = options.delete(:terminator)
-      @branch = Branch.new(options)
+      @branch = Branch.new(options.merge(machine: machine))
     end
 
     # Gets a list of the states known to this callback by looking at the

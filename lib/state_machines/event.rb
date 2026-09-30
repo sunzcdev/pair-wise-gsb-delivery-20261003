@@ -9,6 +9,9 @@ module StateMachines
   class Event
     include MatcherHelpers
 
+    NO_MATCH = :__state_machines_no_match__
+    private_constant :NO_MATCH
+
     # The state machine for which this event is defined
     attr_accessor :machine
 
@@ -106,7 +109,9 @@ module StateMachines
       # requirements
       StateMachines::OptionsValidator.assert_valid_keys!(options, :from, :to, :except_from, :except_to, :if, :unless, :if_state, :unless_state, :if_all_states, :unless_all_states, :if_any_state, :unless_any_state) if (options.keys - %i[from to on except_from except_to except_on if unless if_state unless_state if_all_states unless_all_states if_any_state unless_any_state]).empty?
 
-      branches << branch = Branch.new(options.merge(on: name))
+      defined_in = options.delete(:defined_in)
+
+      branches << branch = Branch.new(options.merge(on: name, machine: machine, defined_in: defined_in))
       @known_states |= branch.known_states
       branch
     end
@@ -137,25 +142,26 @@ module StateMachines
     # Event arguments are passed to guard conditions if they accept multiple parameters.
     def transition_for(object, requirements = {}, *event_args)
       StateMachines::OptionsValidator.assert_valid_keys!(requirements, :from, :to, :guard)
-      requirements[:from] = machine.states.match!(object).name unless (custom_from_state = requirements.include?(:from))
+      custom_from_state = requirements.include?(:from)
+      from_state = custom_from_state ? machine.states.fetch(requirements[:from]) : machine.states.match!(object)
+      from = from_state.name
 
-      branches.each do |branch|
-        next unless (match = branch.match(object, requirements, event_args))
+      lookup_scopes_for(from_state).each do |scope|
+        scoped_branches = branches.select { |branch| branch.defined_in == scope }
+        structural_requirements = requirements.merge(from: from, guard: false)
+        structural_branch = scoped_branches.find do |branch|
+          branch.match(object, structural_requirements, [])
+        end
+        next unless structural_branch
 
-        # Branch allows for the transition to occur
-        from = requirements[:from]
-        to = if match[:to].is_a?(LoopbackMatcher)
-               from
-             else
-               values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
+        scoped_branches.each do |branch|
+          next unless (match = branch.match(object, requirements.merge(from: from), event_args))
 
-               match[:to].filter(values).first
-             end
+          to = target_state(from, requirements, match)
+          return Transition.new(object, machine, name, from, to, !custom_from_state) unless to == NO_MATCH
+        end
 
-        return Transition.new(object, machine, name, from, to, !custom_from_state)
       end
-
-      # No transition matched
       nil
     end
 
@@ -218,6 +224,28 @@ module StateMachines
     end
 
     protected
+
+    def lookup_scopes_for(state)
+      state.path.map(&:name).reverse + [nil]
+    end
+
+    def target_state(from, requirements, match)
+      return from if match[:to].is_a?(LoopbackMatcher)
+
+      values = if requirements.include?(:to)
+                 [requirements[:to]].flatten
+               else
+                 machine.states.any?(&:composite?) ? machine.states.select(&:leaf?).map(&:name) : ([from] | machine.states.map(&:name))
+               end
+
+      filtered = match[:to].filter(values)
+      return NO_MATCH if filtered.empty?
+
+      to = filtered.first
+      return NO_MATCH if machine.states[to]&.composite?
+
+      to
+    end
 
     # Add the various instance methods that can transition the object using
     # the current event

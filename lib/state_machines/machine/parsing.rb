@@ -29,7 +29,7 @@ module StateMachines
 
       # Adds a new transition callback of the given type.
       def add_callback(type, options, &)
-        callbacks[type == :around ? :before : type] << callback = Callback.new(type, options, &)
+        callbacks[type == :around ? :before : type] << callback = Callback.new(type, options.merge(machine: self), &)
         add_states(callback.known_states)
         callback
       end

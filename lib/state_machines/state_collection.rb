@@ -7,6 +7,23 @@ module StateMachines
       super(machine, index: %i[name qualified_name value])
     end
 
+    def <<(state) # :nodoc:
+      result = super
+      link_hierarchy(state)
+      result
+    end
+
+    def machine=(machine) # :nodoc:
+      super
+      rebuild_hierarchy
+    end
+
+    def update(node)
+      result = super
+      link_hierarchy(node) if node.is_a?(State)
+      result
+    end
+
     # Determines whether the given object is in a specific state.  If the
     # object's current value doesn't match the state, then this will return
     # false, otherwise true.  If the given state is unknown, then an IndexError
@@ -27,7 +44,9 @@ module StateMachines
     #   states.matches?(vehicle, :idling)   # => false
     #   states.matches?(vehicle, :invalid)  # => IndexError: :invalid is an invalid key for :name index
     def matches?(object, name)
-      fetch(name).matches?(machine.read(object, :state))
+      state = fetch(name)
+      value = machine.read(object, :state)
+      state.matches?(value) || match(object)&.path&.include?(state) == true
     end
 
     # Determines the current state of the given object as configured by this
@@ -104,6 +123,23 @@ module StateMachines
     end
 
     private
+
+    def link_hierarchy(state)
+      return unless state.name
+
+      if state.parent_name && (parent = self[state.parent_name])
+        state.send(:parent=, parent)
+      end
+
+      select { |other| other.parent_name == state.name }.each do |child|
+        child.send(:parent=, state)
+      end
+    end
+
+    def rebuild_hierarchy
+      each(&:reset_hierarchy)
+      each { |state| link_hierarchy(state) }
+    end
 
     # Gets the value for the given attribute on the node
     def value(node, attribute)

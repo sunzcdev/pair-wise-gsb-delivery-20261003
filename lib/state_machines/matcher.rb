@@ -55,6 +55,11 @@ module StateMachines
 
   # Matches a specific set of values
   class WhitelistMatcher < Matcher
+    def initialize(values, machine = nil)
+      super(values)
+      @machine = machine
+    end
+
     # Checks whether the given value exists within the whitelist configured
     # for this matcher.
     #
@@ -64,17 +69,42 @@ module StateMachines
     #   matcher.matches?(:parked)       # => true
     #   matcher.matches?(:first_gear)   # => false
     def matches?(value, _context = {})
-      values.include?(value)
+      values.include?(value) || contains?(value)
     end
 
     # A human-readable description of this matcher
     def description
       values.length == 1 ? values.first.inspect : values.inspect
     end
+
+    def filter(values)
+      return super unless @machine&.states&.any?(&:parent_name)
+
+      values.select { |value| matches?(value) }
+    end
+
+    private
+
+    def contains?(value)
+      return false unless @machine&.states&.any?(&:parent_name)
+
+      ancestor_names = values
+      current = @machine.states[value]
+      ancestor_names.any? do |name|
+        ancestor = @machine.states[name]
+        ancestor && current && current.path.include?(ancestor)
+      end
+    end
+
   end
 
   # Matches everything but a specific set of values
   class BlacklistMatcher < Matcher
+    def initialize(values, machine = nil)
+      super(values)
+      @machine = machine
+    end
+
     # Checks whether the given value exists outside the blacklist configured
     # for this matcher.
     #
@@ -84,19 +114,35 @@ module StateMachines
     #   matcher.matches?(:parked)       # => false
     #   matcher.matches?(:first_gear)   # => true
     def matches?(value, _context = {})
-      !values.include?(value)
+      !values.include?(value) && !contains?(value)
     end
 
     # Finds all values that are *not* within the blacklist configured for this
     # matcher
     def filter(values)
-      values - self.values
+      filtered = values - self.values
+      return filtered unless @machine&.states&.any?(&:parent_name)
+
+      filtered.reject { |value| contains?(value) }
     end
 
     # A human-readable description of this matcher
     def description
       "all - #{values.length == 1 ? values.first.inspect : values.inspect}"
     end
+
+    private
+
+    def contains?(value)
+      return false unless @machine&.states&.any?(&:parent_name)
+
+      current = @machine.states[value]
+      values.any? do |name|
+        ancestor = @machine.states[name]
+        ancestor && current && current.path.include?(ancestor)
+      end
+    end
+
   end
 
   # Matches a loopback of two values within a context.  Since there is no

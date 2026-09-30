@@ -122,6 +122,14 @@ module StateMachines
       from_name == to_name
     end
 
+    def exit_states
+      hierarchy_paths[:exit]
+    end
+
+    def entry_states
+      hierarchy_paths[:entry]
+    end
+
     # Is this transition existing for a short period only?  If this is set, it
     # indicates that the transition (or the event backing it) should not be
     # written to the object if it fails.
@@ -543,12 +551,21 @@ module StateMachines
       else
         # No more callbacks, execute the action block if at the end
         if block_given?
-          action = { success: true }.merge(yield)
-          @result = action[:result]
-          @success = action[:success]
+          run_exit_callbacks
+          begin
+            action = { success: true }.merge(yield)
+            @result = action[:result]
+            @success = action[:success]
+            run_entry_callbacks if @success
+          rescue StandardError
+            @success = false
+            raise
+          end
         else
           # No action block provided, default to success
+          run_exit_callbacks
           @success = true
+          run_entry_callbacks
         end
 
         @before_run = true
@@ -593,6 +610,30 @@ module StateMachines
     #   transition.context    # => {:on => :ignite, :from => :parked, :to => :idling}
     def context
       @context ||= { on: event, from: from_name, to: to_name }
+    end
+
+    def run_exit_callbacks
+      exit_states.each { |state| state.run_exit_callbacks(object, self) }
+    end
+
+    def run_entry_callbacks
+      entry_states.each { |state| state.run_enter_callbacks(object, self) }
+    end
+
+    def hierarchy_paths
+      @hierarchy_paths ||=
+        begin
+          from_path = @from_state.path
+          to_path = @to_state.path
+          common_depth = (0...[from_path.length, to_path.length].min).detect do |index|
+            from_path[index] != to_path[index]
+          end || [from_path.length, to_path.length].min
+
+          {
+            exit: from_path[common_depth..].reverse,
+            entry: to_path[common_depth..]
+          }
+        end
     end
   end
 end

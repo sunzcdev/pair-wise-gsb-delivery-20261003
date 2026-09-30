@@ -54,6 +54,8 @@ module StateMachines
         # Evaluate DSL
         instance_eval(&) if block_given?
 
+        validate_state_hierarchy
+
         # Configure async mode if requested, after owner_class is set and DSL is evaluated
         configure_async_mode!(true) if @async_requested
 

@@ -69,7 +69,10 @@ module StateMachines
 
       state_name = state.name
       machine_name = machine.name
-      @condition = ->(object) { object.class.state_machine(machine_name).states.matches?(object, state_name) }
+      @condition = ->(object) do
+        state_machine = object.class.state_machine(machine_name)
+        state_machine.states.matches?(object, state_name)
+      end
     end
 
     # Creates a new transition that determines what to change the current state
@@ -93,8 +96,33 @@ module StateMachines
       raise ArgumentError, 'Must specify :on event' unless options[:on]
       raise ArgumentError, 'Must specify either :to or :from state' unless !options[:to] ^ !options[:from]
 
-      machine.transition(options.merge(options[:to] ? { from: state.name } : { to: state.name }))
+      machine.transition(options.merge(options[:to] ? { from: state.name } : { to: state.name }, defined_in: state.name))
     end
+
+    def event(*names, &block)
+      branches = []
+      current_state_context = self
+      events = Array(machine.event(*names))
+      events.each do |event|
+        event_context = Object.new
+        event_context.define_singleton_method(:transition) do |options|
+          branches << current_state_context.machine.transition(options.merge(on: event.name, defined_in: current_state_context.state.name))
+        end
+        event_context.instance_exec(&block)
+      end
+      branches.length == 1 ? branches.first : branches
+    end
+    alias on event
+
+    def on_enter(*callbacks, &block)
+      state.on_enter(*callbacks, &block)
+    end
+    alias enter on_enter
+
+    def on_exit(*callbacks, &block)
+      state.on_exit(*callbacks, &block)
+    end
+    alias exit on_exit
 
     # Hooks in condition-merging to methods that don't exist in this module
     def method_missing(*args, &)

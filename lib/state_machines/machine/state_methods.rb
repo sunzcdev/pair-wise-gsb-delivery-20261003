@@ -336,7 +336,7 @@ module StateMachines
       # options hash which contains at least <tt>:if</tt> condition support.
       def state(*names, &)
         options = names.last.is_a?(Hash) ? names.pop : {}
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name, :parent)
 
         # Store the context so that it can be used for / matched against any state
         # that gets added
@@ -361,7 +361,9 @@ module StateMachines
             state.human_name = options[:human_name] if options.include?(:human_name)
             state.cache = options[:cache] if options.include?(:cache)
             state.matcher = options[:if] if options.include?(:if)
+            state.parent_name = options[:parent] if options.include?(:parent)
           end
+          states.each { |state| self.states.update(state) } if options.include?(:parent)
         end
 
         states.length == 1 ? states.first : states
@@ -386,6 +388,25 @@ module StateMachines
       end
 
       protected
+
+      def validate_state_hierarchy
+        states.each do |state|
+          next unless state.name
+
+          if state.parent_name && !states[state.parent_name]
+            raise ArgumentError, "#{state.parent_name.inspect} is not a known parent state for #{state.name.inspect}"
+          end
+
+          path = state.path
+          next unless path.map(&:name).length != path.map(&:name).uniq.length
+
+          raise ArgumentError, "Cycle detected in state hierarchy for #{state.name.inspect}"
+        end
+
+        initial = instance_variable_get(:@initial_state)
+        return if dynamic_initial_state?
+        raise ArgumentError, "#{initial.inspect} cannot be an initial state because it has child states" if initial && states[initial]&.composite?
+      end
 
       # Determines if the machine's attribute needs to be initialized.  This
       # will only be true if the machine's attribute is blank.
