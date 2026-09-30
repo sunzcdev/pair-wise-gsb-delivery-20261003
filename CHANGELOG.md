@@ -1,6 +1,19 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+### Changed
+- Declare the full set of CORS decision dependencies in the `Vary` header so
+  shared caches do not serve one request type's response to another.
+  Preflight responses now vary on `Origin`, `Access-Control-Request-Method`
+  and `Access-Control-Request-Headers` (plus any resource `:vary` headers),
+  for both allowed and denied results.
+
+### Fixed
+- Merge downstream `Vary` values case insensitively and accept Array values.
+- Respect an existing downstream `Vary: *` instead of appending to it.
+- Avoid mutating frozen downstream response headers.
+
 ## 3.0.0 - 2025-05-16
 ### Changed
 - Update Rack dependency to >= 3.0.14

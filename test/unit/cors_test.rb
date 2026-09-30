@@ -56,6 +56,86 @@ class FakeProxy
   end
 end
 
+class DownstreamVary
+  def initialize(app, options = {})
+    @app = app
+    @vary = options[:vary]
+    @frozen = options[:frozen]
+  end
+
+  def call(env)
+    status, headers, body = @app.call(env)
+    headers['vary'] = @vary unless @vary.nil?
+    headers.freeze if @frozen
+    [status, headers, body]
+  end
+end
+
+# Minimal shared cache that honors the Vary response header. It is just
+# sophisticated enough to verify that CORS responses declare every request
+# header that participates in the allow/deny decision.
+class VaryAwareCache
+  VARY_REQUEST_HEADERS = {
+    'Origin' => 'HTTP_ORIGIN',
+    'Access-Control-Request-Method' => 'HTTP_ACCESS_CONTROL_REQUEST_METHOD',
+    'Access-Control-Request-Headers' => 'HTTP_ACCESS_CONTROL_REQUEST_HEADERS'
+  }.freeze
+
+  # Shared caches outlive a single request, so the store lives on the class.
+  class << self
+    attr_accessor :shared_store
+  end
+
+  def self.reset!
+    self.shared_store = []
+  end
+
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    key = [env['REQUEST_METHOD'], env['PATH_INFO']]
+    request_headers = extract_headers(env)
+    store = VaryAwareCache.shared_store ||= []
+
+    cached = store.detect do |entry|
+      next false unless entry[:key] == key
+
+      # An empty Vary list means the stored response advertises no request
+      # dependencies, so it is reused for every request with the same key.
+      next true if entry[:vary].empty?
+
+      entry[:vary].all? { |name| entry[:request][name] == request_headers[name] }
+    end
+    return [cached[:status], cached[:headers].dup, []] if cached
+
+    status, headers, _body = @app.call(env)
+    vary = headers['vary']
+    vary_names = vary ? vary.to_s.split(/,\s*/) : []
+
+    unless vary_names.include?('*')
+      store << {
+        key: key,
+        vary: vary_names,
+        request: request_headers,
+        status: status,
+        headers: headers.dup
+      }
+    end
+
+    [status, headers, []]
+  end
+
+  private
+
+  def extract_headers(env)
+    VARY_REQUEST_HEADERS.each_with_object({}) do |(name, env_key), headers|
+      headers[name] = env[env_key]
+    end
+  end
+end
+
 Rack::MockResponse.infect_an_assertion :assert_cors_success, :must_render_cors_success, :only_one_argument
 Rack::MockResponse.infect_an_assertion :assert_not_cors_success, :wont_render_cors_success, :only_one_argument
 
@@ -162,6 +242,102 @@ describe Rack::Cors do
     it 'should add to them' do
       successful_cors_request '/vary_test'
       _(last_response.headers['Vary']).must_equal 'Origin, User-Agent, Host'
+    end
+  end
+
+  describe 'when merging downstream Vary headers' do
+    attr_reader :app
+
+    def build_app(vary:, frozen: false)
+      downstream_vary = vary
+      downstream_frozen = frozen
+      Rack::Builder.new do
+        use Rack::Cors do
+          allow do
+            origins '*'
+            resource '/', vary: 'Host'
+          end
+        end
+        use DownstreamVary, vary: downstream_vary, frozen: downstream_frozen
+        map('/') do
+          run ->(_env) { [200, { 'content-type' => 'text/html' }, ['success']] }
+        end
+      end
+    end
+
+    it 'merges field names case insensitively' do
+      @app = build_app(vary: 'ORIGIN, User-Agent')
+      successful_cors_request '/'
+      _(last_response.headers['Vary']).must_equal 'ORIGIN, User-Agent, Host'
+    end
+
+    it 'handles a downstream Vary given as an array' do
+      @app = build_app(vary: %w[ORIGIN User-Agent])
+      successful_cors_request '/'
+      _(last_response.headers['Vary']).must_equal 'ORIGIN, User-Agent, Host'
+    end
+
+    it 'respects an existing wildcard Vary' do
+      @app = build_app(vary: '*')
+      successful_cors_request '/'
+      _(last_response.headers['Vary']).must_equal '*'
+    end
+
+    it 'does not error on frozen downstream headers' do
+      @app = build_app(vary: 'Origin', frozen: true)
+      successful_cors_request '/'
+      _(last_response.headers['Vary']).must_equal 'Origin, Host'
+    end
+  end
+
+  describe 'in front of a Vary-aware shared cache' do
+    def app
+      @cached_app ||= build_cached_app
+    end
+
+    def build_cached_app
+      Rack::Builder.new do
+        use VaryAwareCache
+        use Rack::Cors do
+          allow do
+            origins 'localhost:3000'
+            resource '/single_header', headers: 'x-domain-token', methods: :get
+          end
+        end
+        run ->(_env) { [200, {}, ['success']] }
+      end
+    end
+
+    it 'does not serve an allowed preflight after the decision inputs change' do
+      VaryAwareCache.reset!
+      preflight_request('http://localhost:3000', '/single_header', method: :get,
+                        headers: 'X-Domain-Token')
+      _(last_response).must_render_cors_success
+
+      preflight_request('http://localhost:3000', '/single_header', method: :post,
+                        headers: 'X-Domain-Token')
+      _(last_response).wont_render_cors_success
+
+      preflight_request('http://localhost:3000', '/single_header', method: :get,
+                        headers: 'X-Evil')
+      _(last_response).wont_render_cors_success
+
+      preflight_request('http://evil.example', '/single_header', method: :get,
+                        headers: 'X-Domain-Token')
+      _(last_response).wont_render_cors_success
+
+      preflight_request('http://localhost:3000', '/single_header', method: :get,
+                        headers: 'X-Domain-Token')
+      _(last_response).must_render_cors_success
+    end
+
+    it 'does not serve an allowed actual request to a different Origin' do
+      VaryAwareCache.reset!
+      successful_cors_request '/single_header', origin: 'http://localhost:3000'
+
+      header 'Origin', 'http://evil.example'
+      get '/single_header'
+      _(last_response).wont_render_cors_success
     end
   end
 
@@ -292,6 +468,61 @@ describe Rack::Cors do
   end
 
   describe 'preflight requests' do
+    it 'declares Vary on Origin, requested method and requested headers for an allowed preflight' do
+      preflight_request('http://localhost:3000', '/')
+      _(last_response).must_render_cors_success
+      _(last_response.headers['Vary']).must_equal(
+        'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+      )
+    end
+
+    it 'declares the CORS Vary dependencies for a denied method preflight' do
+      preflight_request('http://localhost:3000', '/get-only', method: :post)
+      _(last_response).wont_render_cors_success
+      _(last_response.headers['Vary']).must_equal(
+        'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+      )
+    end
+
+    it 'declares the CORS Vary dependencies for a denied header preflight' do
+      preflight_request('http://localhost:3000', '/single_header', headers: 'Fooey')
+      _(last_response).wont_render_cors_success
+      _(last_response.headers['Vary']).must_equal(
+        'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+      )
+    end
+
+    it 'declares the CORS Vary dependencies for a denied origin preflight' do
+      preflight_request('http://allyourdataarebelongtous.com', '/')
+      _(last_response).wont_render_cors_success
+      _(last_response.headers['Vary']).must_equal(
+        'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+      )
+    end
+
+    describe 'with resource specific vary headers' do
+      let(:app) do
+        Rack::Builder.new do
+          use Rack::Cors do
+            allow do
+              origins 'localhost:3000'
+              resource '/', methods: :get, vary: %w[Host X-Tenant]
+            end
+          end
+          map('/') do
+            run ->(_env) { [200, { 'content-type' => 'text/html' }, ['success']] }
+          end
+        end
+      end
+
+      it 'adds the dynamic conditions to the preflight Vary dependencies' do
+        preflight_request('http://localhost:3000', '/')
+        _(last_response.headers['Vary']).must_equal(
+          'Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Host, X-Tenant'
+        )
+      end
+    end
+
     it 'should fail if origin is invalid' do
       preflight_request('http://allyourdataarebelongtous.com', '/')
       _(last_response).wont_render_cors_success

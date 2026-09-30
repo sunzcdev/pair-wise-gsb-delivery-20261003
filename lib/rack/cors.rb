@@ -25,6 +25,13 @@ module Rack
     OPTIONS     = 'OPTIONS'
 
     DEFAULT_VARY_HEADERS = ['Origin'].freeze
+    PREFLIGHT_VARY_HEADERS = [
+      'Origin',
+      'Access-Control-Request-Method',
+      'Access-Control-Request-Headers'
+    ].freeze
+
+    VARY_WILDCARD = '*'
 
     def initialize(app, opts = {}, &block)
       @app = app
@@ -86,6 +93,7 @@ module Rack
             "Preflight Headers:\n" +
               headers.collect { |kv| "  #{kv.join(': ')}" }.join("\n")
           end
+          headers = apply_vary_headers(headers, cors_vary_headers(resource_for_path(path), true))
           return [200, headers, []]
         else
           add_headers = process_cors(env, path)
@@ -99,7 +107,8 @@ module Rack
       # in rails 4.1.6)
       vary_resource = resource_for_path(path)
 
-      status, headers, body = @app.call env
+      status, downstream_headers, body = @app.call env
+      headers = downstream_headers.dup
 
       if add_headers
         headers = add_headers.merge(headers)
@@ -114,13 +123,7 @@ module Rack
       # response to be different depending on the Origin header value.
       # Better explained here: http://www.fastly.com/blog/best-practices-for-using-the-vary-header/
       if vary_resource
-        vary = headers['vary']
-        cors_vary_headers = if vary_resource.vary_headers&.any?
-                              vary_resource.vary_headers
-                            else
-                              DEFAULT_VARY_HEADERS
-                            end
-        headers['vary'] = ((vary ? [vary].flatten.map { |v| v.split(/,\s*/) }.flatten : []) + cors_vary_headers).uniq.join(', ')
+        headers = apply_vary_headers(headers, cors_vary_headers(vary_resource, false))
       end
 
       result = env[ENV_KEY]
@@ -130,6 +133,39 @@ module Rack
     end
 
     protected
+
+    # Merge the CORS decision dependencies into the response's Vary header so
+    # caches key on every request header that can influence the decision.
+    #
+    # * a downstream "*" is authoritative and is left untouched
+    # * field names are compared case insensitively
+    # * downstream Vary may be a String or an Array of strings
+    # * headers are duplicated first so frozen downstream headers are safe
+    def apply_vary_headers(headers, cors_vary_headers)
+      headers = headers.dup
+
+      downstream = headers['vary']
+      downstream_fields = [downstream].flatten.compact.flat_map do |value|
+        value.to_s.split(/,\s*/)
+      end
+
+      return headers if downstream_fields.map(&:strip).include?(VARY_WILDCARD)
+
+      vary_fields = downstream_fields + cors_vary_headers
+      vary_fields = vary_fields.uniq { |field| field.to_s.strip.downcase }
+
+      headers['vary'] = vary_fields.join(', ')
+      headers
+    end
+
+    # Request headers that actually participate in the CORS decision for the
+    # matched resource. Preflight decisions additionally depend on the
+    # requested method and requested headers.
+    def cors_vary_headers(resource, preflight)
+      base = preflight ? PREFLIGHT_VARY_HEADERS : DEFAULT_VARY_HEADERS
+      custom = resource&.vary_headers || []
+      (base + custom).uniq { |field| field.to_s.strip.downcase }
+    end
 
     def debug(env, message = nil, &block)
       (@logger || select_logger(env)).debug(message, &block) if debug?
