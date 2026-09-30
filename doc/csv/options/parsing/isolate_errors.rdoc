@@ -1,0 +1,66 @@
+====== Option +isolate_errors+
+
+Specifies whether malformed records are to be isolated instead of
+aborting the whole parse.  Default value is +false+ (strict mode):
+the first malformed record raises CSV::MalformedCSVError, exactly as
+without this option.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:isolate_errors) # => false
+
+When +true+, parsing continues.  Good records are yielded as usual.
+Each malformed record that can be isolated at a boundary confirmed by
+the parser state is yielded as a CSV::MalformedRecord event,
+interleaved with the good records in input order.  A
+CSV::MalformedRecord is not a row: it is not passed through field
+converters and is never added to a CSV::Table.
+
+A CSV::MalformedRecord exposes:
+
+- #lineno: the 1-based record number the malformed record would have
+  had; records recovered after the event continue from the next number.
+- #byte_range: +[start_byte, end_byte]+ (end exclusive) of the record's
+  original bytes in the input.
+- #raw: the original bytes of the malformed record, including its row
+  separator.
+- #error: the CSV::MalformedCSVError describing the failure.
+
+Example:
+  str = "a,b\n\"closed\"tail,y\nzz,ww\n"
+  CSV.new(str, isolate_errors: true).each do |record|
+    if record.is_a?(CSV::MalformedRecord)
+      warn "skipping bad record #{record.lineno}: #{record.error.message}"
+      warn record.raw
+    else
+      p record
+    end
+  end
+
+Output:
+  ["a", "b"]
+  skipping bad record 2: Any value after quoted field isn't allowed in line 2.
+  "closed"tail,y
+  ["zz", "ww"]
+
+Recovery never relies on simply jumping to the next newline.  A record
+boundary is only accepted at a row separator reached while the parser is
+outside a quoted field that opened at a legitimate field start.  If a
+quoted field is never closed (or no later boundary can be confirmed),
+CSV raises CSV::UnrecoverableCSVError and parsing stops.  Records
+already yielded are retained, and the exception carries #lineno,
+#byte_range, and #raw for the unparseable tail.
+
+Example:
+  str = "a,b\n\"never closes\nc,d\n"
+  begin
+    CSV.new(str, isolate_errors: true).each {|row| p row }
+  rescue CSV::UnrecoverableCSVError => error
+    puts error.message    # => Unclosed quoted field in line 2.
+    p error.raw           # => "\"never closes\nc,d\n"
+  end
+
+Output:
+  ["a", "b"]
+
+Records accepted through +liberal_parsing+ are ordinary records, never
+CSV::MalformedRecord events.

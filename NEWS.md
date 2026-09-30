@@ -1,5 +1,18 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added `isolate_errors:` parsing option. When `true`, records that can
+    be isolated at a parser-confirmed boundary are yielded as
+    `CSV::MalformedRecord` events (with `lineno`, `byte_range`, `raw`, and
+    `error`) interleaved with good records instead of aborting the parse.
+    When a quoted field never closes and no later boundary is confirmable,
+    `CSV::UnrecoverableCSVError` is raised and parsing stops. The default
+    strict behavior is unchanged, and `liberal_parsing` results are never
+    reported as isolation events.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

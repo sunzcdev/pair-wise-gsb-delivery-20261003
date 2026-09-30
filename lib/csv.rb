@@ -329,6 +329,7 @@ require_relative "csv/writer"
 #     skip_blanks:        false,
 #     skip_lines:         nil,
 #     liberal_parsing:    false,
+#     isolate_errors:     false,
 #     nil_value:          nil,
 #     empty_value:        "",
 #     strip:              false,
@@ -363,6 +364,8 @@ require_relative "csv/writer"
 #   then an +ArgumentError+ exception will be raised.
 # - +liberal_parsing+: Specifies whether \CSV should attempt to parse
 #   non-compliant data.
+# - +isolate_errors+: Specifies whether malformed records are to be yielded
+#   as CSV::MalformedRecord events instead of aborting the whole parse.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
 #
@@ -391,6 +394,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/parsing/strip.rdoc
 #
 # :include: ../doc/csv/options/parsing/liberal_parsing.rdoc
+#
+# :include: ../doc/csv/options/parsing/isolate_errors.rdoc
 #
 # :include: ../doc/csv/options/parsing/nil_value.rdoc
 #
@@ -868,6 +873,97 @@ class CSV
   end
 
   #
+  # A structured event yielded in place of a row when parsing with
+  # <tt>isolate_errors: true</tt> and a malformed record can be isolated at a
+  # boundary confirmed by the parser state.
+  #
+  # The malformed record is *not* a row: it does not pass through field
+  # converters and is never included in a CSV::Table.  It is yielded
+  # interleaved with the good records, in input order, so callers can repair
+  # or log it without losing the records that follow it.
+  #
+  # Attributes:
+  #
+  # <b><tt>lineno</tt></b>:: The 1-based record number that the malformed
+  #                          record would have had.  Records recovered after
+  #                          the event continue from the following number.
+  # <b><tt>byte_range</tt></b>:: A two-element +Array+ of the 0-based
+  #                          start byte offset and exclusive end byte offset
+  #                          of the raw malformed record (including its row
+  #                          separator) in the original input.
+  # <b><tt>raw</tt></b>::    The original bytes (a +String+) spanning
+  #                          <tt>byte_range</tt>, byte-for-byte.
+  # <b><tt>error</tt></b>::  The CSV::MalformedCSVError describing why the
+  #                          record failed.
+  #
+  class MalformedRecord
+    # Creates a new event for the record at 1-based +line_number+ whose
+    # original bytes are +raw+ (spanning +byte_range+) and that failed with
+    # +error+.
+    def initialize(line_number, byte_range, raw, error)
+      @line_number = line_number
+      @byte_range = byte_range
+      @raw = raw
+      @error = error
+    end
+
+    # The 1-based record number of the malformed record.
+    attr_reader :line_number
+    alias_method :lineno, :line_number
+
+    # The +[start_byte, end_byte]+ offsets (end exclusive) of #raw in the
+    # original input.
+    attr_reader :byte_range
+
+    # The original bytes of the malformed record.
+    attr_reader :raw
+
+    # The CSV::MalformedCSVError that explains the failure.
+    attr_reader :error
+
+    # This object never represents a successfully parsed row.
+    def malformed?
+      true
+    end
+
+    def inspect
+      "#<#{self.class.name} lineno: #{line_number} " \
+        "byte_range: #{byte_range.inspect} " \
+        "error: #{error.message.inspect} raw: #{raw.inspect}>"
+    end
+  end
+
+  #
+  # Raised while parsing with <tt>isolate_errors: true</tt> when a malformed
+  # record cannot be isolated because the parser is unable to confirm any
+  # later record boundary (for example, a quoted field whose closing quote
+  # never appears).  Parsing stops; records yielded before the failure are
+  # already delivered.
+  #
+  # The exception carries the same attributes as a CSV::MalformedRecord
+  # (#lineno, #byte_range, #raw, #error) for the unparseable tail.
+  #
+  class UnrecoverableCSVError < MalformedCSVError
+    # The original bytes from the start of the unparseable record up to the
+    # point where parsing had to stop.
+    attr_reader :raw
+    # The +[start_byte, end_byte]+ offsets (end exclusive) of #raw in the
+    # original input.
+    attr_reader :byte_range
+    # The underlying CSV::MalformedCSVError.
+    attr_reader :error
+
+    def initialize(message, line_number, byte_range: nil, raw: nil)
+      @byte_range = byte_range
+      @raw = raw
+      @error = MalformedCSVError.new(message, line_number)
+      # Skip MalformedCSVError's formatting: #error already carries it.
+      RuntimeError.instance_method(:initialize).bind_call(self, @error.message)
+      @line_number = line_number
+    end
+  end
+
+  #
   # A FieldInfo Struct contains details about a field's position in the data
   # source it was read from.  CSV will pass this Struct to some blocks that make
   # decisions based on field structure.  See CSV.convert_fields() for an
@@ -967,6 +1063,7 @@ class CSV
     skip_blanks:        false,
     skip_lines:         nil,
     liberal_parsing:    false,
+    isolate_errors:     false,
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
@@ -2047,6 +2144,7 @@ class CSV
                  force_quotes: false,
                  skip_lines: nil,
                  liberal_parsing: false,
+                 isolate_errors: false,
                  internal_encoding: nil,
                  external_encoding: nil,
                  encoding: nil,
@@ -2104,6 +2202,7 @@ class CSV
       skip_blanks: skip_blanks,
       skip_lines: skip_lines,
       liberal_parsing: liberal_parsing,
+      isolate_errors: isolate_errors,
       encoding: @encoding,
       nil_value: nil_value,
       empty_value: empty_value,
@@ -2314,6 +2413,17 @@ class CSV
   #   CSV.new('').liberal_parsing? # => false
   def liberal_parsing?
     parser.liberal_parsing?
+  end
+
+  # :call-seq:
+  #   csv.isolate_errors? -> true or false
+  #
+  # Returns the value that determines whether malformed records are isolated;
+  # used for parsing; see {Option +isolate_errors+}
+  # [#class-CSV-label-Option+isolate_errors]:
+  #   CSV.new('').isolate_errors? # => false
+  def isolate_errors?
+    parser.isolate_errors?
   end
 
   # :call-seq:
