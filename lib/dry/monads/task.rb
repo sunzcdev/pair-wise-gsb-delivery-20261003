@@ -13,6 +13,41 @@ module Dry
       # @api private
       class Promise < ::Concurrent::Promise
         public :on_fulfill, :on_reject
+
+        # Settles the promise as fulfilled with the given value.
+        # Only the very first transition (from {#resolve} or {#reject})
+        # takes effect, any later calls are no-ops.
+        #
+        # @param value [Object]
+        # @return [Boolean] true if the call settled the promise
+        # @api private
+        def resolve(value)
+          settle { complete(true, value, nil) }
+        end
+
+        # Settles the promise as rejected with the given reason.
+        # Only the very first transition (from {#resolve} or {#reject})
+        # takes effect, any later calls are no-ops.
+        #
+        # @param reason [Exception]
+        # @return [Boolean] true if the call settled the promise
+        # @api private
+        def reject(reason)
+          settle { complete(false, nil, reason) }
+        end
+
+        private
+
+        # Claims the terminal transition atomically so that concurrent
+        # (or duplicate) resolve/reject calls can't overwrite each other.
+        #
+        # @return [Boolean]
+        def settle
+          return false unless compare_and_set_state(:processing, :unscheduled, :pending)
+
+          yield
+          true
+        end
       end
       private_constant :Promise
 
@@ -74,6 +109,115 @@ module Dry
         # @param exc [Exception]
         # @return [Task]
         def failed(exc) = new(Promise.reject(exc))
+
+        # Adapts a legacy callback-based API (one success and one error
+        # callback) to a Task.
+        #
+        # The block is called right away with two callables, +resolve+ and
+        # +reject+. Whichever of them receives the first terminal result
+        # settles the returned task: a synchronous callback, a success
+        # followed by an exception from registration, and two threads
+        # racing with different results are all handled the same way —
+        # the first terminal state wins, the rest are ignored.
+        #
+        # The block is expected to return an unsubscribe handle: any object
+        # responding to +#call+ (or +nil+ when nothing has to be undone).
+        # The handle is invoked exactly once, after the task is settled,
+        # regardless of whether the terminal callback was fired before or
+        # after the handle itself was returned.
+        #
+        # If the registration block raises before any terminal result
+        # arrives the task fails with the exception, so waiters never hang.
+        # If it raises after the terminal result has already arrived the
+        # final state wins and the exception is swallowed.
+        #
+        # @example bridging a client with +on_success+/+on_error+
+        #   Task.from_callbacks do |resolve, reject|
+        #     client.request(on_success: resolve, on_error: reject)
+        #   end
+        #
+        # @yieldparam resolve [#call] completes the task successfully
+        # @yieldparam reject [#call] fails the task with an exception
+        # @return [Task]
+        def from_callbacks
+          unless block_given?
+            raise ArgumentError, "a block registering the callbacks is required"
+          end
+
+          promise = Promise.new
+
+          # Join-style barrier over two events: "terminal state reached"
+          # (fired from any thread, possibly synchronously) and
+          # "unsubscribe handle returned" (may happen afterwards). Exactly
+          # the side that observes both events invokes the handle, so a
+          # handle delivered late is never missed and it runs once at most.
+          mutex = Mutex.new
+          settled = false
+          handle = nil
+          handle_available = false
+
+          invoke = lambda { |candidate|
+            return unless candidate.respond_to?(:call)
+
+            begin
+              candidate.call
+            rescue StandardError
+              # Cleaning up must not crash the thread delivering the result.
+            end
+          }
+
+          promise.add_observer do
+            candidate = mutex.synchronize do
+              settled = true
+              handle_available ? handle : nil
+            end
+            invoke.call(candidate)
+          end
+
+          resolve = lambda { |value = Unit| promise.resolve(value) }
+          reject = lambda { |reason = nil| promise.reject(coerce_reason(reason)) }
+
+          returned =
+            begin
+              yield(resolve, reject)
+            rescue StandardError => exception
+              # Capture registration failures as the terminal state so
+              # waiters never hang. If a terminal result has already arrived
+              # it wins (the rejection is a no-op) and the exception is
+              # swallowed.
+              promise.reject(exception)
+              nil
+            end
+
+          unless returned.nil? || returned.respond_to?(:call)
+            raise ArgumentError,
+                  "the registration block must return an unsubscribe " \
+                  "handle responding to #call or nil, #{returned.inspect} given"
+          end
+
+          candidate = mutex.synchronize do
+            handle = returned
+            handle_available = true
+            settled ? returned : nil
+          end
+          invoke.call(candidate)
+
+          new(promise)
+        end
+
+        private
+
+        # Ensures a rejected task always carries a real exception so that
+        # {Task#value!} can raise it.
+        #
+        # @param reason [Object]
+        # @return [Exception]
+        def coerce_reason(reason)
+          return reason if reason.is_a?(Exception)
+          return RuntimeError.new(reason) if reason.is_a?(String)
+
+          RuntimeError.new(reason.inspect)
+        end
       end
 
       include ConversionStubs[:to_maybe, :to_result]
