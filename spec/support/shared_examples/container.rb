@@ -70,7 +70,7 @@ RSpec.shared_examples "a container" do
 
         subject! { container.resolve(key) }
 
-        it { expect(custom_resolver).to have_received(:call).with(container._container, key) }
+        it { expect(custom_resolver).to have_received(:call).with(container._container, key, nil) }
         it { is_expected.to eq(item) }
       end
     end

@@ -31,9 +31,11 @@ module Dry
         # Returns the result of item call using a syncronized mutex
         #
         # @return [Dry::Container::Item::Base]
-        def call
+        def call(context = nil)
+          return @memoized_item if defined?(@memoized_item)
+
           memoize_mutex.synchronize do
-            @memoized_item ||= item.call
+            @memoized_item ||= item.call(context)
           end
         end
 

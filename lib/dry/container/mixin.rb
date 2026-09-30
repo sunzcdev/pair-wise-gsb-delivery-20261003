@@ -172,7 +172,7 @@ module Dry
       #
       # @api public
       def resolve(key, &block)
-        config.resolver.call(_container, key, &block)
+        config.resolver.call(_container, key, nil, &block)
       end
 
       # Resolve an item from the container

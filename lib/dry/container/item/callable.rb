@@ -13,7 +13,7 @@ module Dry
         # Returns the result of item call or item
         #
         # @return [Mixed]
-        def call
+        def call(_context = nil)
           callable? ? item.call : item
         end
       end

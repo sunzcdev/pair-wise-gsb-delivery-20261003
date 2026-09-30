@@ -22,8 +22,26 @@ module Dry
       end
 
       # @api abstract
-      def call
+      def call(_context = nil)
         raise NotImplementedError
+      end
+
+      # Keys of dependencies that must be resolved before this item
+      #
+      # @return [Array<String>]
+      #
+      # @api private
+      def dependencies
+        Array(options[:deps]).map(&:to_s)
+      end
+
+      # Keys of dependencies handed over as lazy references
+      #
+      # @return [Array<String>]
+      #
+      # @api private
+      def lazy_dependencies
+        Array(options[:lazy_deps]).map(&:to_s)
       end
 
       # @private
@@ -41,7 +59,7 @@ module Dry
       # @private
       def map(func)
         if callable?
-          self.class.new(-> { func.(item.call) }, options)
+          self.class.new(->(context = nil) { func.(item.call(context)) }, options)
         else
           self.class.new(func.(item), options)
         end
