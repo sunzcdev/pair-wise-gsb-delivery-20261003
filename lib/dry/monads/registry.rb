@@ -7,10 +7,11 @@ module Dry
   module Monads
     @registry = {}
     @constructors = nil
-    @constants = {
-      do: "Do::All",
-      lazy: "Lazy",
-      list: "List",
+      @constants = {
+        do: "Do::All",
+        lazy: "Lazy",
+        lazy_list: "LazyList",
+        list: "List",
       maybe: "Maybe",
       task: "Task",
       try: "Try",
