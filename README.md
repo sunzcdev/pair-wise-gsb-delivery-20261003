@@ -556,6 +556,57 @@ By default, `iat` verification allows no clock drift. To allow drift between the
 decoded_token = JWT.decode(token, hmac_secret, true, { verify_iat: { leeway: 30 }, algorithm: 'HS256' })
 ```
 
+### Verification clock and time constraints
+
+All time based claim checks (`exp`, `nbf` and `iat`) observe the current time exactly once per verification round through an injectable clock. The clock is any object responding to `#call` and returning a `Time`; a fixed `Time` can also be passed directly, which makes verification deterministic and easy to test.
+
+```ruby
+# A custom clock, for example one synchronized with an external time source
+JWT.decode(token, hmac_secret, true, { clock: -> { Time.now }, algorithm: 'HS256' })
+
+# A fixed observation time
+JWT.decode(token, hmac_secret, true, { clock: Time.at(1_609_459_200), algorithm: 'HS256' })
+```
+
+The clock can also be configured globally:
+
+```ruby
+JWT.configure do |config|
+  config.decode.clock = -> { Time.now }
+end
+```
+
+The `verify_time_constraints` option validates the relations between the time claims. Independently of any leeway, the claims MUST follow the order `iat <= nbf <= exp`; a leeway only models clock skew against the verifier and can never make a token with reversed claims valid. A maximum token lifetime (`exp - iat`, in seconds) can be enforced as well:
+
+```ruby
+JWT.decode(token, hmac_secret, true, {
+  algorithm: 'HS256',
+  verify_iat: true,
+  verify_time_constraints: { max_token_lifetime: 3600 }
+})
+
+# The maximum lifetime can also be enabled on its own
+JWT.decode(token, hmac_secret, true, {
+  algorithm: 'HS256',
+  verify_iat: true,
+  max_token_lifetime: 3600
+})
+```
+
+The same options are available for standalone claim verification:
+
+```ruby
+JWT::Claims.verify_payload!(
+  { 'iat' => 100, 'nbf' => 100, 'exp' => 200 },
+  :time_constraints,
+  clock: Time.now
+)
+JWT::Claims.verify_payload!(
+  { 'iat' => 100, 'exp' => 200 },
+  time_constraints: { max_token_lifetime: 100 }
+)
+```
+
 ### Subject Claim
 
 From [Oauth JSON Web Token 4.1.2. "sub" (Subject) Claim](https://tools.ietf.org/html/rfc7519#section-4.1.2):

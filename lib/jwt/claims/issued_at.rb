@@ -14,15 +14,17 @@ module JWT
       # Verifies the issued at claim ('iat') in the JWT token.
       #
       # @param context [Object] the context containing the JWT payload.
-      # @param _args [Hash] additional arguments (not used).
+      # @param time [Time] the fixed observation time for the verification round.
       # @raise [JWT::InvalidIatError] if the issued at claim is invalid.
       # @return [nil]
-      def verify!(context:, **_args)
+      def verify!(context:, time: nil, **_args)
         return unless context.payload.is_a?(Hash)
         return unless context.payload.key?('iat')
 
         iat = context.payload['iat']
-        raise(JWT::InvalidIatError, 'Invalid iat') if !iat.is_a?(::Numeric) || iat.to_f > (Time.now.to_f + leeway)
+        observed_at = (time || ::Time.now).to_f
+
+        raise(JWT::InvalidIatError, 'Invalid iat') if !iat.is_a?(::Numeric) || iat.to_f > (observed_at + leeway)
       end
 
       private

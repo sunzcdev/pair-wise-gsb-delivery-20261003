@@ -55,6 +55,11 @@ module JWT
   # The InvalidIatError class is raised when the JWT issued at (iat) claim is invalid.
   class InvalidIatError < ClaimValidationError; end
 
+  # The InvalidTimeConstraintsError class is raised when the relations between
+  # the time based claims (iat, nbf, exp) are invalid or the maximum token
+  # lifetime is exceeded.
+  class InvalidTimeConstraintsError < ClaimValidationError; end
+
   # The InvalidAudError class is raised when the JWT audience (aud) claim is invalid.
   class InvalidAudError < ClaimValidationError; end
 

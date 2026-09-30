@@ -108,11 +108,13 @@ module JWT
     #
     # @param signature [Hash] the parameters for signature verification (see {#verify_signature!}).
     # @param claims [Array<Symbol>, Hash] the claims to verify (see {#verify_claims!}).
+    # @param clock [#call, Time, Numeric] an injectable clock observed once while verifying the claims.
     # @return [nil]
     # @raise [JWT::Error] if the signature or claim verification fails.
-    def verify!(signature:, claims: nil)
+    def verify!(signature:, claims: nil, clock: nil)
       verify_signature!(**signature)
-      claims.is_a?(Array) ? verify_claims!(*claims) : verify_claims!(claims)
+      normalized_claims = claims.is_a?(Array) ? claims : claims_options([claims])
+      verify_claims!(*normalized_claims, clock: clock)
       nil
     end
 
@@ -121,10 +123,11 @@ module JWT
 
     # @param signature [Hash] the parameters for signature verification (see {#verify_signature!}).
     # @param claims [Array<Symbol>, Hash] the claims to verify (see {#verify_claims!}).
+    # @param clock [#call, Time, Numeric] an injectable clock observed once while verifying the claims.
     # @return [Boolean] true if the signature and claims are valid, false otherwise.
-    def valid?(signature:, claims: nil)
-      valid_signature?(**signature) &&
-        (claims.is_a?(Array) ? valid_claims?(*claims) : valid_claims?(claims))
+    def valid?(signature:, claims: nil, clock: nil)
+      normalized_claims = claims.is_a?(Array) ? claims : claims_options([claims])
+      valid_signature?(**signature) && valid_claims?(*normalized_claims, clock: clock)
     end
 
     # Verifies the signature of the JWT token.
@@ -163,10 +166,11 @@ module JWT
 
     # Verifies the claims of the token.
     # @param options [Array<Symbol>, Hash] the claims to verify. By default, it checks the 'exp' claim.
+    # @param clock [#call, Time, Numeric] an injectable clock observed once for the whole verification round.
     # @raise [JWT::ClaimValidationError] if the claims are invalid.
     # @raise [JWT::MalformedTokenError] if the payload cannot be decoded, which happens before any claim is validated.
-    def verify_claims!(*options)
-      Claims::Verifier.verify!(ClaimsContext.new(self), *claims_options(options)).tap do
+    def verify_claims!(*options, clock: nil, **other)
+      Claims::Verifier.verify!(ClaimsContext.new(self), *claim_option_list(options, other), clock: clock).tap do
         @claims_verified = true
       end
     rescue StandardError
@@ -177,20 +181,26 @@ module JWT
     # Returns the errors of the claims of the token.
     # @param options [Array<Symbol>, Hash] the claims to verify. By default, it checks the 'exp' claim.
     # @return [Array<Symbol>] the errors of the claims.
-    def claim_errors(*options)
-      Claims::Verifier.errors(ClaimsContext.new(self), *claims_options(options))
+    def claim_errors(*options, clock: nil, **other)
+      Claims::Verifier.errors(ClaimsContext.new(self), *claim_option_list(options, other), clock: clock)
     end
 
     # Returns whether the claims of the token are valid.
     # @param options [Array<Symbol>, Hash] the claims to verify. By default, it checks the 'exp' claim.
+    # @param clock [#call, Time, Numeric] an injectable clock observed once for the whole verification round.
     # @return [Boolean] whether the claims are valid.
-    def valid_claims?(*options)
-      claim_errors(*claims_options(options)).empty?.tap { |verified| @claims_verified = verified }
+    def valid_claims?(*options, clock: nil, **other)
+      claim_errors(*options, **other, clock: clock).empty?.tap { |verified| @claims_verified = verified }
     end
 
     alias to_s jwt
 
     private
+
+    def claim_option_list(options, keywords)
+      options << keywords unless keywords.empty?
+      claims_options(options)
+    end
 
     def claims_options(options)
       return DEFAULT_CLAIMS if options.first.nil?

@@ -105,23 +105,28 @@ module JWT
 
     # Verifies the claims of the token.
     # @param options [Array<Symbol>, Hash] the claims to verify.
+    # @param clock [#call, Time, Numeric] an injectable clock observed once for the whole verification round.
     # @raise [JWT::ClaimValidationError] if the claims are invalid.
-    def verify_claims!(*options)
-      Claims::Verifier.verify!(self, *options)
+    def verify_claims!(*options, clock: nil, **other)
+      options << other unless other.empty?
+      Claims::Verifier.verify!(self, *options, clock: clock)
     end
 
     # Returns the errors of the claims of the token.
     # @param options [Array<Symbol>, Hash] the claims to verify.
     # @return [Array<Symbol>] the errors of the claims.
-    def claim_errors(*options)
-      Claims::Verifier.errors(self, *options)
+    def claim_errors(*options, clock: nil, **other)
+      options << other unless other.empty?
+      Claims::Verifier.errors(self, *options, clock: clock)
     end
 
     # Returns whether the claims of the token are valid.
     # @param options [Array<Symbol>, Hash] the claims to verify.
+    # @param clock [#call, Time, Numeric] an injectable clock observed once for the whole verification round.
     # @return [Boolean] whether the claims are valid.
-    def valid_claims?(*options)
-      claim_errors(*options).empty?
+    def valid_claims?(*options, clock: nil, **other)
+      options << other unless other.empty?
+      claim_errors(*options, clock: clock).empty?
     end
 
     # Returns the JWT token as a string.

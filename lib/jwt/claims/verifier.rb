@@ -9,6 +9,12 @@ module JWT
         nbf: ->(options) { Claims::NotBefore.new(leeway: options.dig(:nbf, :leeway)) },
         iss: ->(options) { Claims::Issuer.new(issuers: options[:iss]) },
         iat: ->(options) { Claims::IssuedAt.new(leeway: options.dig(:iat, :leeway)) },
+        time_constraints: ->(options) do
+          config = options[:time_constraints]
+          Claims::TimeConstraints.new(
+            max_token_lifetime: config.is_a?(::Hash) ? config[:max_token_lifetime] : nil
+          )
+        end,
         jti: ->(options) { Claims::JwtId.new(validator: options[:jti]) },
         aud: ->(options) { Claims::Audience.new(expected_audience: options[:aud]) },
         sub: ->(options) { Claims::Subject.new(expected_subject: options[:sub]) },
@@ -21,18 +27,20 @@ module JWT
 
       class << self
         # @api private
-        def verify!(context, *options)
+        def verify!(context, *options, clock: nil)
+          time = Claims::Clock.resolve(clock)
           iterate_verifiers(*options) do |verifier, verifier_options|
-            verify_one!(context, verifier, verifier_options)
+            verify_one!(context, verifier, verifier_options, time)
           end
           nil
         end
 
         # @api private
-        def errors(context, *options)
+        def errors(context, *options, clock: nil)
+          time = Claims::Clock.resolve(clock)
           errors = []
           iterate_verifiers(*options) do |verifier, verifier_options|
-            verify_one!(context, verifier, verifier_options)
+            verify_one!(context, verifier, verifier_options, time)
           rescue ::JWT::ClaimValidationError, ::JWT::MalformedTokenError => e
             # A payload that cannot be decoded has no valid claims either, so the
             # predicate API reports it instead of raising.
@@ -53,9 +61,9 @@ module JWT
           end
         end
 
-        def verify_one!(context, verifier, options)
+        def verify_one!(context, verifier, options, time)
           verifier_builder = VERIFIERS.fetch(verifier) { raise ArgumentError, "#{verifier} not a valid claim verifier" }
-          verifier_builder.call(options || {}).verify!(context: context)
+          verifier_builder.call(options || {}).verify!(context: context, time: time)
         end
       end
     end

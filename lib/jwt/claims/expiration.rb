@@ -14,14 +14,17 @@ module JWT
       # Verifies the expiration claim ('exp') in the JWT token.
       #
       # @param context [Object] the context containing the JWT payload.
-      # @param _args [Hash] additional arguments (not used).
+      # @param time [Time] the fixed observation time for the verification round.
       # @raise [JWT::ExpiredSignature] if the token has expired.
       # @return [nil]
-      def verify!(context:, **_args)
+      def verify!(context:, time: nil, **_args)
         return unless context.payload.is_a?(Hash)
         return unless context.payload.key?('exp')
 
-        raise JWT::ExpiredSignature, 'Signature has expired' if context.payload['exp'].to_i <= (Time.now.to_i - leeway)
+        observed_at = (time || ::Time.now).to_f
+        # RFC 7519: the token must not be accepted on or after 'exp', so the
+        # boundary itself is expired. Leeway extends the accepted window.
+        raise JWT::ExpiredSignature, 'Signature has expired' if context.payload['exp'].to_f <= (observed_at - leeway)
       end
 
       private

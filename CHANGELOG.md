@@ -6,7 +6,7 @@
 
 **Features:**
 
-- Your contribution here
+- Injectable verification clock observed once per claims verification round; adds the `clock` decode option and configuration, `max_token_lifetime`, and `verify_time_constraints` to enforce the `iat <= nbf <= exp` ordering without involving leeway.
 
 **Fixes and enhancements:**
 

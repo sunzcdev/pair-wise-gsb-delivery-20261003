@@ -16,6 +16,12 @@ module JWT
         verify_not_before: ->(options) { Claims::NotBefore.new(leeway: options[:nbf_leeway] || options[:leeway]) },
         verify_iss: ->(options) { options[:iss] && Claims::Issuer.new(issuers: options[:iss]) },
         verify_iat: ->(options) { Claims::IssuedAt.new(leeway: options[:verify_iat].is_a?(Hash) ? options[:verify_iat][:leeway] : nil) },
+        verify_time_constraints: ->(options) do
+          config = options[:verify_time_constraints]
+          from_config = config.is_a?(::Hash) ? config[:max_token_lifetime] : nil
+          max_token_lifetime = from_config || options[:max_token_lifetime]
+          Claims::TimeConstraints.new(max_token_lifetime: max_token_lifetime)
+        end,
         verify_jti: ->(options) { Claims::JwtId.new(validator: options[:verify_jti]) },
         verify_aud: ->(options) { options[:aud] && Claims::Audience.new(expected_audience: options[:aud]) },
         verify_sub: ->(options) { options[:sub] && Claims::Subject.new(expected_subject: options[:sub]) },
@@ -27,12 +33,19 @@ module JWT
       class << self
         # @api private
         def verify!(payload, options)
+          time = Claims::Clock.resolve(options[:clock])
           VERIFIERS.each do |key, verifier_builder|
-            next unless options[key] || options[key.to_s]
+            next unless enabled?(key, options)
 
-            verifier_builder&.call(options)&.verify!(context: VerificationContext.new(payload: payload))
+            verifier_builder&.call(options)&.verify!(context: VerificationContext.new(payload: payload), time: time)
           end
           nil
+        end
+
+        def enabled?(key, options)
+          return true if key == :verify_time_constraints && options[:max_token_lifetime]
+
+          options[key] || options[key.to_s]
         end
       end
     end

@@ -17,9 +17,10 @@ module JWT
       # Verifies the numeric claims in the JWT context.
       #
       # @param context [Object] the context containing the JWT payload.
+      # @param _args [Hash] additional arguments (not used).
       # @raise [JWT::InvalidClaimError] if any numeric claim is invalid.
       # @return [nil]
-      def verify!(context:)
+      def verify!(context:, **_args)
         validate_numeric_claims(context.payload)
       end
 
