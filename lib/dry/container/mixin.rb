@@ -137,6 +137,15 @@ module Dry
       #   The item to register with the container (if no block given)
       # @param [Hash] options
       #   Options to pass to the registry when registering the item
+      # @option options [Array<Symbol,String>, Array<Array>, Hash] :depends_on
+      #   Eager dependencies. Each one is resolved (recursively, depth first)
+      #   and validated before the factory runs, then passed to it as a
+      #   keyword argument matching the declared name.
+      # @option options [Array<Symbol,String>, Array<Array>, Hash] :lazy_depends_on
+      #   Lazy dependencies. The factory receives a zero-argument callable per
+      #   dependency that resolves the target on demand. This allows
+      #   dependencies to be registered later and cycles broken by a lazy
+      #   edge, while cycles made only of eager dependencies are rejected.
       # @yield
       #   If a block is given, contents will be ignored and the block
       #   will be registered instead

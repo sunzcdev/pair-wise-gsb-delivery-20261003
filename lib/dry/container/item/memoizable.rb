@@ -31,9 +31,11 @@ module Dry
         # Returns the result of item call using a syncronized mutex
         #
         # @return [Dry::Container::Item::Base]
-        def call
+        def call(**dependencies)
           memoize_mutex.synchronize do
-            @memoized_item ||= item.call
+            return @memoized_item if defined?(@memoized_item)
+
+            @memoized_item = item.call(**dependencies)
           end
         end
 

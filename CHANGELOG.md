@@ -5,6 +5,7 @@
 
 ### Added
 
+- Support explicit `depends_on`/`lazy_depends_on` dependency declarations with eager chain validation, circular dependency errors and reachable-only activation
 - Add a warning about deprecation of the gem (via #89) (@solnic)
 
 

@@ -13,8 +13,8 @@ module Dry
         # Returns the result of item call or item
         #
         # @return [Mixed]
-        def call
-          callable? ? item.call : item
+        def call(**dependencies)
+          callable? ? item.call(**dependencies) : item
         end
       end
     end
