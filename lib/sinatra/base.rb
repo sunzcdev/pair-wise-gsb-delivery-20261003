@@ -1570,6 +1570,49 @@ module Sinatra
         end
       end
 
+      # Like `register`, but atomic: each extension runs against a staged
+      # (throwaway) copy of the application definition. The declarations the
+      # extension makes -- routes, helpers, filters and settings -- are only
+      # published to this class once every extension has registered
+      # successfully. If an extension raises an error while registering, all
+      # declarations it made are withdrawn and this class is left untouched.
+      #
+      # Only declarations made through the staged application definition are
+      # rolled back. Side effects an extension performs on its own (modifying
+      # global state, writing to files, mutating objects it captured, ...) are
+      # outside the scope of the rollback and will persist even when
+      # registration fails.
+      #
+      # Registering the same extension re-entrantly -- an extension that
+      # atomically registers itself while its own atomic registration is
+      # still in progress -- is detected and raises an error.
+      def register_atomically(*extensions, &block)
+        extensions << Module.new(&block) if block_given?
+        extensions.each do |extension|
+          next unless atomic_registration_in_progress?(extension)
+
+          raise "re-entrant atomic registration of #{extension} detected"
+        end
+
+        in_progress = (@atomic_registrations ||= [])
+        in_progress.concat(extensions)
+        begin
+          staged = Class.new(self)
+          staged.extend(AtomicRegistrationStaging)
+          extensions.each do |extension|
+            staged.extend(extension)
+            extension.registered(staged) if extension.respond_to?(:registered)
+          end
+        ensure
+          extensions.each { |extension| in_progress.delete(extension) }
+        end
+
+        @extensions += extensions
+        extensions.each { |extension| extend extension }
+        staged.publish_staged_declarations(self)
+        self
+      end
+
       def development?; environment == :development end
       def production?;  environment == :production  end
       def test?;        environment == :test        end
@@ -1892,6 +1935,18 @@ module Sinatra
         super
       end
 
+      # Whether an atomic registration of the given extension is currently
+      # in progress on this class or any of its superclasses (a staged
+      # application definition is a subclass of the class it stages for).
+      def atomic_registration_in_progress?(extension)
+        if instance_variable_defined?(:@atomic_registrations) && @atomic_registrations.include?(extension)
+          true
+        else
+          superclass.respond_to?(:atomic_registration_in_progress?, true) &&
+            superclass.send(:atomic_registration_in_progress?, extension)
+        end
+      end
+
       @@mutex = Mutex.new
       def synchronize(&block)
         if lock?
@@ -1913,6 +1968,75 @@ module Sinatra
           .reject { |file, *_| callers_to_ignore.any? { |pattern| file =~ pattern } }
       end
     end
+
+    # Staging area used by `register_atomically`. A staged application
+    # definition is an anonymous subclass of the class being registered on,
+    # extended with this module. Declarations an extension makes are recorded
+    # (and applied to the throwaway subclass, so the extension can read its
+    # own writes) and are replayed on the real class only once registration
+    # succeeded; when the extension fails, the subclass is simply discarded
+    # and no declaration leaks into the application.
+    module AtomicRegistrationStaging # :nodoc:
+      def self.extended(staged)
+        staged.instance_variable_set(:@staged_declarations, [])
+      end
+
+      def staged_declarations
+        @staged_declarations
+      end
+
+      def route(verb, path, options = {}, &block)
+        staged_declarations << [:route, [verb, path, options], nil, block]
+        super
+      end
+
+      def add_filter(type, path = /.*/, **options, &block)
+        staged_declarations << [:add_filter, [type, path], options, block]
+        super
+      end
+
+      def set(*args, &block)
+        staged_declarations << [:set, args, nil, block]
+        super
+      end
+
+      def helpers(*extensions, &block)
+        staged_declarations << [:helpers, extensions, nil, block]
+        super
+      end
+
+      def error(*codes, &block)
+        staged_declarations << [:error, codes, nil, block]
+        super
+      end
+
+      def use(middleware, *args, &block)
+        staged_declarations << [:use, [middleware, *args], nil, block]
+        super
+      end
+      ruby2_keywords(:use) if respond_to?(:ruby2_keywords, true)
+
+      # Nested registrations are replayed on the real class at publish time;
+      # they must not run against the staging class.
+      def register(*extensions, &block)
+        staged_declarations << [:register, extensions, nil, block]
+      end
+
+      # Extension hooks (like `route_added`) only fire when the recorded
+      # declarations are published to the real class, not while staging.
+      def invoke_hook(name, *args); end
+
+      def publish_staged_declarations(target)
+        staged_declarations.each do |kind, args, kwargs, block|
+          if kwargs.nil?
+            target.send(kind, *args, &block)
+          else
+            target.send(kind, *args, **kwargs, &block)
+          end
+        end
+      end
+    end
+    private_constant :AtomicRegistrationStaging
 
     # Force data to specified encoding. It defaults to settings.default_encoding
     # which is UTF-8 by default
@@ -2093,6 +2217,12 @@ module Sinatra
       Delegator.delegate(*added_methods)
       super(*extensions, &block)
     end
+
+    def self.register_atomically(*extensions, &block) # :nodoc:
+      added_methods = extensions.flat_map(&:public_instance_methods)
+      Delegator.delegate(*added_methods)
+      super
+    end
   end
 
   # Sinatra delegation mixin. Mixing this module into an object causes all
@@ -2117,7 +2247,8 @@ module Sinatra
     delegate :get, :patch, :put, :post, :delete, :head, :options, :link, :unlink,
              :template, :layout, :before, :after, :error, :not_found, :configure,
              :set, :mime_type, :enable, :disable, :use, :development?, :test?,
-             :production?, :helpers, :settings, :register, :on_start, :on_stop
+             :production?, :helpers, :settings, :register, :register_atomically,
+             :on_start, :on_stop
 
     class << self
       attr_accessor :target
@@ -2159,6 +2290,12 @@ module Sinatra
   # Extend the top-level DSL with the modules provided.
   def self.register(*extensions, &block)
     Delegator.target.register(*extensions, &block)
+  end
+
+  # Extend the top-level DSL with the modules provided, atomically. See
+  # Sinatra::Base.register_atomically.
+  def self.register_atomically(*extensions, &block)
+    Delegator.target.register_atomically(*extensions, &block)
   end
 
   # Include the helper modules provided in Sinatra's request context.

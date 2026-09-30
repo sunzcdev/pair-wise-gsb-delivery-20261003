@@ -95,4 +95,129 @@ class ExtensionsTest < Minitest::Test
     assert_equal 'bizzle!', BizzleApp.bizzle_option
     assert_equal 'bizzle!', BizzleApp.bizzle
   end
+
+  module AtomicHelpers
+    def atomic_helper
+      'atomic!'
+    end
+  end
+
+  module WellBehavedExtension
+    def self.registered(base)
+      base.set :well_behaved_option, 'well behaved'
+      base.get('/well-behaved') { 'hi' }
+      base.before('/well-behaved') { pass }
+      base.helpers AtomicHelpers
+    end
+  end
+
+  module ExplodingExtension
+    def self.registered(base)
+      base.set :exploding_option, 'exploding'
+      base.get('/exploding') { 'boom' }
+      base.before('/exploding') { pass }
+      base.helpers do
+        def exploding_helper
+          'boom'
+        end
+      end
+      raise 'registration failed'
+    end
+  end
+
+  it 'publishes routes, helpers, filters and settings on successful atomic registration' do
+    app = Class.new(Sinatra::Base)
+    app.register_atomically WellBehavedExtension
+    assert_equal 'well behaved', app.well_behaved_option
+    assert_equal 1, app.routes['GET'].length
+    assert_equal 1, app.filters[:before].length
+    assert app.method_defined?(:atomic_helper)
+    assert_includes app.extensions, WellBehavedExtension
+  end
+
+  it 'withdraws all declarations when an extension raises at the end of registration' do
+    app = Class.new(Sinatra::Base)
+    assert_raises(RuntimeError) { app.register_atomically ExplodingExtension }
+    assert !app.respond_to?(:exploding_option)
+    assert !app.method_defined?(:exploding_helper)
+    assert_equal [], app.routes['GET'] || []
+    assert_equal [], app.filters[:before]
+    assert !app.extensions.include?(ExplodingExtension)
+  end
+
+  it 'leaves pre-existing declarations untouched when atomic registration fails' do
+    app = Class.new(Sinatra::Base)
+    app.set :pre_existing, 'untouched'
+    app.get('/pre-existing') { 'hi' }
+    assert_raises(RuntimeError) { app.register_atomically ExplodingExtension }
+    assert_equal 'untouched', app.pre_existing
+    assert_equal 1, app.routes['GET'].length
+  end
+
+  it 'does not roll back side effects an extension performs on its own' do
+    side_effects = []
+    extension = Module.new do
+      define_singleton_method(:registered) do |base|
+        side_effects << :ran
+        base.get('/doomed') { 'boom' }
+        raise 'registration failed'
+      end
+    end
+    app = Class.new(Sinatra::Base)
+    assert_raises(RuntimeError) { app.register_atomically extension }
+    assert_equal [:ran], side_effects
+    assert_equal [], app.routes['GET'] || []
+  end
+
+  it 'allows registering an extension again after a failed atomic registration' do
+    attempts = 0
+    extension = Module.new do
+      define_singleton_method(:registered) do |base|
+        attempts += 1
+        raise 'registration failed' if attempts == 1
+
+        base.set :retried_option, 'retried'
+      end
+    end
+    app = Class.new(Sinatra::Base)
+    assert_raises(RuntimeError) { app.register_atomically extension }
+    app.register_atomically extension
+    assert_equal 'retried', app.retried_option
+  end
+
+  module ReentrantExtension
+    def self.registered(base)
+      base.register_atomically self
+    end
+  end
+
+  it 'detects re-entrant atomic registration of the same extension' do
+    app = Class.new(Sinatra::Base)
+    error = assert_raises(RuntimeError) { app.register_atomically ReentrantExtension }
+    assert_match(/re-entrant/, error.message)
+  end
+
+  it 'does not modify the parent class when a subclass registers atomically' do
+    parent = Class.new(Sinatra::Base)
+    child = Class.new(parent)
+    child.register_atomically WellBehavedExtension
+    assert_equal 'well behaved', child.well_behaved_option
+    assert_equal 1, child.routes['GET'].length
+    assert child.method_defined?(:atomic_helper)
+    assert !parent.respond_to?(:well_behaved_option)
+    assert_equal [], parent.routes['GET'] || []
+    assert_equal [], parent.filters[:before]
+    assert !parent.method_defined?(:atomic_helper)
+    assert !parent.extensions.include?(WellBehavedExtension)
+  end
+
+  it 'does not modify the parent class when atomic registration on a subclass fails' do
+    parent = Class.new(Sinatra::Base)
+    child = Class.new(parent)
+    assert_raises(RuntimeError) { child.register_atomically ExplodingExtension }
+    assert !parent.respond_to?(:exploding_option)
+    assert !parent.method_defined?(:exploding_helper)
+    assert_equal [], parent.routes['GET'] || []
+    assert_equal [], parent.filters[:before]
+  end
 end
