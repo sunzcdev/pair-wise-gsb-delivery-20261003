@@ -20,6 +20,7 @@
 require "addressable/version"
 require "addressable/idna"
 require "public_suffix"
+require "set"
 
 ##
 # Addressable is a library for processing links and URIs.
@@ -2600,3 +2601,5 @@ module Addressable
     private_constant :NONE
   end
 end
+
+require "addressable/uri/equivalence"
