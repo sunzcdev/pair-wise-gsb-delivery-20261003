@@ -79,6 +79,47 @@ class CSV
       end
     end
 
+    def convert_with_field_states(fields, field_states, headers, lineno,
+                                  quoted_fields=NO_QUOTED_FIELDS)
+      converted_fields = []
+      converted_states = []
+
+      fields.each.with_index do |original_field, index|
+        field = original_field
+        if field.nil?
+          field = @nil_value
+        elsif field.is_a?(String) and field.empty?
+          field = @empty_value unless @empty_value_is_empty_string
+        end
+        @converters.each do |converter|
+          break if field.nil? and @accept_nil
+          if converter.arity == 1
+            field = converter[field]
+          else
+            if headers
+              header = headers[index]
+            else
+              header = nil
+            end
+            quoted = quoted_fields[index]
+            field = converter[field, FieldInfo.new(index, lineno, header, quoted)]
+          end
+          break unless field.is_a?(String)
+        end
+
+        converted_fields << field
+        converted_states << field_states[index]
+      end
+
+      converted_fields.each_with_index do |field, index|
+        if field.nil? and converted_states[index] == :field
+          converted_states[index] = :converted_nil
+        end
+      end
+
+      [converted_fields, converted_states]
+    end
+
     private
     def need_static_convert?
       not (@nil_value.nil? and @empty_value_is_empty_string)

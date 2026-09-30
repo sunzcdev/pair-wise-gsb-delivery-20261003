@@ -29,8 +29,10 @@ class CSV
     # Adds a new row
     #
     def <<(row)
+      field_states = nil
       case row
       when Row
+        field_states = row.field_states if @options[:field_presence]
         row = row.fields
       when Hash
         row = @headers.collect {|header| row[header]}
@@ -39,6 +41,13 @@ class CSV
       @headers ||= row if @use_headers
       @lineno += 1
 
+      if field_states
+        while row.last.nil? && field_states.last == :missing
+          row.pop
+          field_states.pop
+        end
+      end
+
       if @fields_converter
         row = @fields_converter.convert(row, nil, lineno)
       end
@@ -46,7 +55,7 @@ class CSV
       i = -1
       converted_row = row.collect do |field|
         i += 1
-        quote(field, i)
+        quote(field, i, field_states&.[](i))
       end
       line = converted_row.join(@column_separator) + @row_separator
       if @output_encoding
@@ -186,13 +195,15 @@ class CSV
         encoded_quote_character
     end
 
-    def quote(field, i)
+    def quote(field, i, field_state = nil)
       if @force_quotes
         quote_field(field)
       elsif @force_quotes_fields and @force_quotes_fields[i]
         quote_field(field)
       else
-        if field.nil?  # represent +nil+ fields as empty unquoted fields
+        if field_state == :quoted_empty
+          quote_field(String(field))
+        elsif field.nil?  # represent +nil+ fields as empty unquoted fields
           ""
         else
           field = String(field)  # Stringify fields

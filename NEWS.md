@@ -1,5 +1,14 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added the `:field_presence` option and `CSV::Row` field state APIs.
+    Parsed rows can distinguish missing trailing columns from unquoted
+    empty fields, quoted empty strings, and non-empty fields converted
+    to `nil`.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

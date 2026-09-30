@@ -319,6 +319,7 @@ require_relative "csv/writer"
 #     col_sep:            ",",
 #     row_sep:            :auto,
 #     quote_char:         '"',
+#     field_presence:     false,
 #     # For parsing.
 #     field_size_limit:   nil,
 #     converters:         nil,
@@ -365,6 +366,7 @@ require_relative "csv/writer"
 #   non-compliant data.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +field_presence+: Specifies whether field presence and original state are retained.
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -396,6 +398,8 @@ require_relative "csv/writer"
 #
 # :include: ../doc/csv/options/parsing/empty_value.rdoc
 #
+# :include: ../doc/csv/options/common/field_presence.rdoc
+#
 # ==== Options for Generating
 #
 # Options for generating, described in detail below, include:
@@ -408,6 +412,7 @@ require_relative "csv/writer"
 # - +write_converters+: Specifies the field converters to be used in writing.
 # - +write_nil_value+: Specifies the object that is to be substituted for each +nil+-valued field.
 # - +write_empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +field_presence+: Specifies whether retained field presence affects writing.
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -426,6 +431,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/generating/write_nil_value.rdoc
 #
 # :include: ../doc/csv/options/generating/write_empty_value.rdoc
+#
+# :include: ../doc/csv/options/common/field_presence.rdoc
 #
 # === \CSV with Headers
 #
@@ -956,6 +963,7 @@ class CSV
     col_sep:            ",",
     row_sep:            :auto,
     quote_char:         '"',
+    field_presence:     false,
     # For parsing.
     field_size_limit:   nil,
     max_field_size:     nil,
@@ -2035,6 +2043,7 @@ class CSV
                  col_sep: ",",
                  row_sep: :auto,
                  quote_char: '"',
+                 field_presence: false,
                  field_size_limit: nil,
                  max_field_size: nil,
                  converters: nil,
@@ -2108,6 +2117,7 @@ class CSV
       nil_value: nil_value,
       empty_value: empty_value,
       strip: strip,
+      field_presence: field_presence,
     }
     @parser = nil
 
@@ -2121,6 +2131,7 @@ class CSV
       row_separator: row_sep,
       quote_character: quote_char,
       quote_empty: quote_empty,
+      field_presence: field_presence,
     }
 
     @writer = nil
@@ -2304,6 +2315,14 @@ class CSV
   #   CSV.new('').force_quotes? # => false
   def force_quotes?
     @writer_options[:force_quotes]
+  end
+
+  # :call-seq:
+  #   csv.field_presence? -> true or false
+  #
+  # Returns whether field presence and original state are retained.
+  def field_presence?
+    @parser_options[:field_presence]
   end
 
   # :call-seq:

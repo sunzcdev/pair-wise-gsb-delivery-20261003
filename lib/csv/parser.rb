@@ -488,6 +488,7 @@ class CSV
         @backslash_quote = false
       end
       @unconverted_fields = @options[:unconverted_fields]
+      @field_presence = @options[:field_presence]
       @max_field_size = @options[:max_field_size]
       @skip_blanks = @options[:skip_blanks]
       @fields_converter = @options[:fields_converter]
@@ -1062,7 +1063,7 @@ class CSV
             quoted_fields << @quoted_column_value
             emit_row(row, quoted_fields, &block)
             row = []
-            quoted_fields.clear
+            quoted_fields = []
           end
           skip_needless_lines
           start_row
@@ -1275,14 +1276,19 @@ class CSV
         if @headers.nil?
           @headers = adjust_headers(row, quoted_fields)
           return unless @return_headers
-          row = Row.new(@headers, row, true)
-        else
           row = Row.new(@headers,
-                        @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields))
+                        row,
+                        true,
+                        field_states: raw_field_states(row, quoted_fields))
+        else
+          converted_fields, field_states =
+            convert_fields_with_states(raw_row, quoted_fields)
+          row = Row.new(@headers, converted_fields, false,
+                        field_states: field_states)
         end
       else
         # convert fields, if needed...
-        row = @fields_converter.convert(raw_row, nil, @lineno, quoted_fields)
+        row, = convert_fields_with_states(raw_row, quoted_fields)
       end
 
       # inject unconverted fields and accessor, if requested...
@@ -1291,6 +1297,37 @@ class CSV
       end
 
       yield(row)
+    end
+
+    def convert_fields_with_states(raw_row, quoted_fields)
+      field_states = raw_field_states(raw_row, quoted_fields)
+      if @field_presence
+        @fields_converter.convert_with_field_states(raw_row,
+                                                    field_states,
+                                                    @headers,
+                                                    @lineno,
+                                                    quoted_fields)
+      else
+        [@fields_converter.convert(raw_row,
+                                   @headers,
+                                   @lineno,
+                                   quoted_fields),
+         false]
+      end
+    end
+
+    def raw_field_states(raw_row, quoted_fields)
+      return false unless @field_presence
+
+      raw_row.each_with_index.map do |field, index|
+        if field.nil?
+          :unquoted_empty
+        elsif field.is_a?(String) && field.empty?
+          :quoted_empty
+        else
+          :field
+        end
+      end
     end
 
     # This method injects an instance variable <tt>unconverted_fields</tt> into

@@ -78,8 +78,12 @@ class CSV
   #   row # => #<CSV::Row "Name":"bar" "Value":1>
   #
   class Row
+    # Logical +index+, actual source +position+, and original +state+
+    # of a field.
+    FieldPresence = Struct.new(:index, :position, :state)
+
     # :call-seq:
-    #   CSV::Row.new(headers, fields, header_row = false) -> csv_row
+    #   CSV::Row.new(headers, fields, header_row = false, field_states: nil) -> csv_row
     #
     # Returns the new \CSV::Row instance constructed from
     # arguments +headers+ and +fields+; both should be Arrays;
@@ -102,7 +106,12 @@ class CSV
     #   row # => #<CSV::Row "Name":"foo" "Value":0>
     #   row.field_row? # => false
     #   row.header_row? # => true
-    def initialize(headers, fields, header_row = false)
+    #
+    # The optional +field_states+ keyword records each field's original
+    # state. Directly created rows infer +:missing+ for fields added by
+    # padding. Provided values infer +:field+, +:unquoted_empty+ for
+    # +nil+, and +:quoted_empty+ for an empty String.
+    def initialize(headers, fields, header_row = false, field_states: nil)
       @header_row = header_row
       headers.each { |h| h.freeze if h.is_a? String }
 
@@ -112,6 +121,7 @@ class CSV
       else
         fields.zip(headers).each(&:reverse!)
       end
+      @field_states = build_field_states(fields, field_states)
     end
 
     # Internal data format used to compare equality.
@@ -130,7 +140,69 @@ class CSV
     def initialize_copy(other)
       super_return_value = super
       @row = @row.collect(&:dup)
+      @field_states = @field_states.dup if @field_states
       super_return_value
+    end
+
+    # :call-seq:
+    #   row.field_states -> array_of_states or nil
+    #
+    # Returns one state for each logical field in this row.
+    def field_states
+      @field_states&.dup
+    end
+
+    # :call-seq:
+    #   row.field_state(index) -> symbol or nil
+    #   row.field_state(header, offset = 0) -> symbol or nil
+    #
+    # Returns the original state of the field selected by index or header.
+    def field_state(header_or_index, minimum_index = 0)
+      index = logical_field_index(header_or_index, minimum_index)
+      index.nil? ? nil : @field_states&.[](index)
+    end
+    alias_method :raw_field_state, :field_state
+    alias_method :original_field_state, :field_state
+
+    # :call-seq:
+    #   row.field_position(index) -> integer or nil
+    #   row.field_position(header, offset = 0) -> integer or nil
+    #
+    # Returns the actual parsed position, or nil when the field is missing.
+    def field_position(header_or_index, minimum_index = 0)
+      index = logical_field_index(header_or_index, minimum_index)
+      return nil if index.nil?
+      return nil if @field_states && @field_states[index] == :missing
+      index
+    end
+    alias_method :actual_index, :field_position
+    alias_method :actual_position, :field_position
+
+    # :call-seq:
+    #   row.field_presence(index) -> field_presence or nil
+    #   row.field_presence(header, offset = 0) -> field_presence or nil
+    #
+    # Returns logical index, actual position, and original state.
+    # A missing padded field has a logical index but a +nil+ position.
+    def field_presence(header_or_index, minimum_index = 0)
+      logical_index = logical_field_index(header_or_index, minimum_index)
+      return nil if logical_index.nil?
+
+      actual_index = field_position(header_or_index, minimum_index)
+      FieldPresence.new(logical_index,
+                        actual_index,
+                        @field_states&.[](logical_index))
+    end
+    alias_method :field_info, :field_presence
+
+    # :call-seq:
+    #   row.field_present?(index) -> true or false
+    #   row.field_present?(header, offset = 0) -> true or false
+    #
+    # Returns whether a field was provided in the source row.
+    def field_present?(header_or_index, minimum_index = 0)
+      state = field_state(header_or_index, minimum_index)
+      state.nil? ? has_key?(header_or_index) : state != :missing
     end
 
     # :call-seq:
@@ -341,10 +413,20 @@ class CSV
 
       if args.first.is_a? Integer
         if @row[args.first].nil?  # extending past the end with index
+          old_size = @row.size
           @row[args.first] = [nil, value]
           @row.map! { |pair| pair.nil? ? [nil, nil] : pair }
+          if @field_states
+            @row.each_index do |index|
+              next if index < old_size
+              @field_states[index] = index == args.first ? assigned_field_state(value) : :missing
+            end
+          end
         else                      # normal index assignment
-          @row[args.first][1] = value
+          index = args.first
+          index += size if index.negative?
+          @row[index][1] = value
+          @field_states[index] = assigned_field_state(value) if @field_states
         end
       else
         index = index(*args)
@@ -352,6 +434,7 @@ class CSV
           self << [args.first, value]
         else                      # normal header assignment
           @row[index][1] = value
+          @field_states[index] = assigned_field_state(value) if @field_states
         end
       end
     end
@@ -389,10 +472,15 @@ class CSV
     def <<(arg)
       if arg.is_a?(Array) and arg.size == 2  # appending a header and name
         @row << arg
+        @field_states << assigned_field_state(arg.last) if @field_states
       elsif arg.is_a?(Hash)                  # append header and name pairs
-        arg.each { |pair| @row << pair }
+        arg.each do |pair|
+          @row << pair
+          @field_states << assigned_field_state(pair.last) if @field_states
+        end
       else                                   # append field value
         @row << [nil, arg]
+        @field_states << assigned_field_state(arg) if @field_states
       end
 
       self  # for chaining
@@ -450,9 +538,13 @@ class CSV
     #   row.delete('NAME', 1) # => []
     def delete(header_or_index, minimum_index = 0)
       if header_or_index.is_a? Integer                 # by index
-        @row.delete_at(header_or_index)
+        pair = @row.delete_at(header_or_index)
+        @field_states&.delete_at(header_or_index)
+        pair
       elsif i = index(header_or_index, minimum_index)  # by header
-        @row.delete_at(i)
+        pair = @row.delete_at(i)
+        @field_states&.delete_at(i)
+        pair
       else
         [ ]
       end
@@ -476,7 +568,16 @@ class CSV
     def delete_if(&block)
       return enum_for(__method__) { size } unless block_given?
 
-      @row.delete_if(&block)
+      if @field_states
+        kept = []
+        @row.each_with_index do |pair, index|
+          kept << index unless block.call(pair.first, pair.last)
+        end
+        @row = kept.map { |index| @row[index] }
+        @field_states = kept.map { |index| @field_states[index] }
+      else
+        @row.delete_if(&block)
+      end
 
       self  # for chaining
     end
@@ -716,6 +817,9 @@ class CSV
     #   row = table[0]
     #   row.to_csv # => "foo,0\n"
     def to_csv(**options)
+      preserve_field_presence =
+        @field_states && options.fetch(:field_presence, false)
+      return CSV.generate_line(self, **options) if preserve_field_presence
       fields.to_csv(**options)
     end
     alias_method :to_s, :to_csv
@@ -775,6 +879,50 @@ class CSV
           e = Encoding::Converter.asciicompat_encoding(s.encoding)
           e ? s.encode(e) : s.force_encoding("ASCII-8BIT")
         end.join('')
+      end
+    end
+
+    private
+    def build_field_states(fields, field_states)
+      return nil if field_states == false
+
+      if field_states.nil?
+        return Array.new(@row.size) do |index|
+          index < fields.size ? assigned_field_state(fields[index]) : :missing
+        end
+      end
+
+      states = Array.try_convert(field_states)
+      if states.nil?
+        raise ArgumentError, "field_states must be an Array"
+      end
+      Array.new(@row.size) do |index|
+        index < states.size ? states[index] : :missing
+      end
+    end
+
+    def assigned_field_state(value)
+      if value.nil?
+        :unquoted_empty
+      elsif value.is_a?(String) && value.empty?
+        :quoted_empty
+      else
+        :field
+      end
+    end
+
+    def logical_field_index(header_or_index, minimum_index = 0)
+      if header_or_index.is_a?(Integer)
+        index = header_or_index
+        index += size if index.negative?
+        return nil if index.negative? or index >= size or index < minimum_index
+        index
+      else
+        @row.each_with_index do |pair, index|
+          next if index < minimum_index
+          return index if pair.first == header_or_index
+        end
+        nil
       end
     end
   end

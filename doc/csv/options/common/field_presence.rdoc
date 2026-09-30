@@ -1,0 +1,19 @@
+====== Option +field_presence+
+
+Specifies whether +CSV::Row+ retains field presence and original state.
+
+The default value is +false+:
+
+  CSV::DEFAULT_OPTIONS.fetch(:field_presence) # => false
+
+When +true+, a row distinguishes a missing trailing column from an
+unquoted empty field and a quoted empty field. A field that was present
+with non-empty input but converted to +nil+ has the state
++:converted_nil+.
+
+  csv = CSV.new("a,b,c\nx,,\"\"", headers: true, field_presence: true)
+  row = csv.first
+  row.field_states # => [:field, :unquoted_empty, :quoted_empty]
+
+When a row with retained state is generated with +field_presence+,
+missing trailing fields are not written as trailing separators.
