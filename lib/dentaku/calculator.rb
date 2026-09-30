@@ -3,6 +3,8 @@ require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
 require 'dentaku/parser'
+require 'dentaku/partial_evaluation'
+require 'dentaku/partial_evaluator'
 require 'dentaku/string_casing'
 require 'dentaku/token'
 
@@ -91,6 +93,22 @@ module Dentaku
 
     private def evaluate_array!(expression, data = {}, &block)
       expression.map { |e| evaluate!(e, data, &block) }
+    end
+
+    # evaluates everything the provided data already determines and returns
+    # a PartialEvaluation: the residual expression (re-evaluable once the
+    # rest of the data arrives), the identifiers still missing, and any
+    # evaluation errors found in the determined parts. Unknown identifiers,
+    # explicit nils, and errors are reported separately
+    def evaluate_partial(expression, data = {})
+      context = evaluation_context(data, :permissive)
+      return expression.map { |e| evaluate_partial(e, data) } if expression.is_a?(Array)
+
+      store(context) do
+        evaluator = PartialEvaluator.new(memory)
+        residual = evaluator.evaluate(ast(expression))
+        PartialEvaluation.new(residual, memory.dup, evaluator.errors)
+      end
     end
 
     def solve!(expression_hash)

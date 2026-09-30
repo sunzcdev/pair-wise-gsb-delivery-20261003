@@ -252,6 +252,33 @@ calc.dependencies("annual_income / 5")
 #=> [:annual_income]
 ```
 
+#### Calculator.evaluate_partial
+When not all inputs are available yet (e.g. a form that is still being
+filled in), `evaluate_partial` evaluates everything the provided data
+already determines and returns a `Dentaku::PartialEvaluation` describing
+what is left:
+
+```ruby
+calc = Dentaku::Calculator.new
+result = calc.evaluate_partial("price * quantity + 10", price: 5)
+
+result.complete?  #=> false
+result.expression #=> "5 * quantity + 10" (residual formula, precedence preserved)
+result.missing    #=> ["quantity"]        (inputs still needed)
+result.errors     #=> []                  (errors in already-determined parts)
+
+# once the remaining data arrives, the residual finishes the calculation:
+calc.evaluate(result.expression, quantity: 4) #=> 30
+```
+
+Unknown identifiers, explicit `nil` values, and evaluation errors are
+reported separately: an identifier passed as `nil` is a determined value
+(it folds to `NULL` and never appears in `missing`), while a determined
+but invalid operation (like `1 / 0`) is reported in `errors`. Only
+determined, side-effect-free parts are folded: volatile functions are
+never called, and unselected `IF` branches or short-circuited operands
+are left untouched.
+
 #### Calculator.solve! / Calculator.solve
 Have Dentaku figure out the order in which your formulas need to be evaluated.
 

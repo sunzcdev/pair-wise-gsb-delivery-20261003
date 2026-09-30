@@ -103,7 +103,12 @@ module Dentaku
     end
 
     def visit_array(node)
-      @output << node.value.to_s
+      @output << "{"
+      node.elements.each_with_index do |element, index|
+        element.accept(self)
+        @output << ", " unless index >= node.elements.length - 1
+      end
+      @output << "}"
     end
 
     def to_s
