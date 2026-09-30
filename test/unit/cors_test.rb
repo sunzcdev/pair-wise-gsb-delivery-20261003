@@ -521,6 +521,106 @@ describe Rack::Cors do
     end
   end
 
+  describe 'with structured origin rules' do
+    let(:app) do
+      Rack::Builder.new do
+        use Rack::Cors do
+          allow do
+            origins Rack::Cors::OriginRule.exact('example.com', schemes: %w[https])
+            resource '/exact', headers: :any, methods: :any
+          end
+
+          allow do
+            origins Rack::Cors::OriginRule.subdomains('example.com', schemes: %w[https])
+            resource '/subdomains', headers: :any, methods: :any
+          end
+
+          allow do
+            origins Rack::Cors::OriginRule.null
+            resource '/null-origin', headers: :any, methods: :any
+          end
+        end
+        map('/') do
+          run ->(_env) { [200, { 'content-type' => 'text/html' }, ['success']] }
+        end
+      end
+    end
+
+    it 'should allow the exact host' do
+      successful_cors_request '/exact', origin: 'https://example.com'
+      _(last_response.headers['Access-Control-Allow-Origin']).must_equal 'https://example.com'
+    end
+
+    it 'should allow the default port written explicitly' do
+      successful_cors_request '/exact', origin: 'https://example.com:443'
+    end
+
+    it 'should not allow a non-default port' do
+      cors_request '/exact', origin: 'https://example.com:8443'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow look-alike domains' do
+      cors_request '/exact', origin: 'https://evil-example.com'
+      _(last_response).wont_render_cors_success
+
+      cors_request '/exact', origin: 'https://example.com.evil'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow a subdomain on an exact host rule' do
+      cors_request '/exact', origin: 'https://app.example.com'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow origins with a path, userinfo, or multiple origins' do
+      cors_request '/exact', origin: 'https://example.com/path'
+      _(last_response).wont_render_cors_success
+
+      cors_request '/exact', origin: 'https://user@example.com'
+      _(last_response).wont_render_cors_success
+
+      cors_request '/exact', origin: 'https://example.com https://evil.com'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should allow subdomains but not the root domain' do
+      successful_cors_request '/subdomains', origin: 'https://app.example.com'
+
+      cors_request '/subdomains', origin: 'https://example.com'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow look-alike domains on a subdomain rule' do
+      cors_request '/subdomains', origin: 'https://evil-example.com'
+      _(last_response).wont_render_cors_success
+
+      cors_request '/subdomains', origin: 'https://example.com.evil'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should apply the same rules to preflight requests' do
+      preflight_request('https://app.example.com', '/subdomains', method: :put)
+      _(last_response).must_render_cors_success
+
+      preflight_request('https://example.com', '/subdomains', method: :put)
+      _(last_response).wont_render_cors_success
+
+      preflight_request('https://evil-example.com', '/exact', method: :put)
+      _(last_response).wont_render_cors_success
+
+      preflight_request('https://example.com/path', '/exact', method: :put)
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should only allow the null origin when declared explicitly' do
+      successful_cors_request '/null-origin', origin: 'null'
+
+      cors_request '/exact', origin: 'null'
+      _(last_response).wont_render_cors_success
+    end
+  end
+
   protected
 
   def cors_request(*args)

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'logger'
+require_relative 'cors/origin_rule'
 require_relative 'cors/resources'
 require_relative 'cors/resource'
 require_relative 'cors/result'

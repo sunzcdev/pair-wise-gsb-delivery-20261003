@@ -1,6 +1,10 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+### Added
+- Add `Rack::Cors::OriginRule` for structured origin allow-listing by scheme, host, and port, with exact host and full-label subdomain matching, default port handling per scheme, and explicit opt-in for the `null` origin
+
 ## 3.0.0 - 2025-05-16
 ### Changed
 - Update Rack dependency to >= 3.0.14

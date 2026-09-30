@@ -87,6 +87,18 @@ Origins can be specified as a string, a regular expression, or as '\*' to allow 
 
 **\*SECURITY NOTE:** Be careful when using regular expressions to not accidentally be too inclusive.  For example, the expression `/https:\/\/example\.com/` will match the domain *example.com.randomdomainname.co.uk*.  It is recommended that any regular expression be enclosed with start & end string anchors, like `\Ahttps:\/\/example\.com\z`.
 
+Origins can also be specified as structured rules via `Rack::Cors::OriginRule`, which match the scheme, host, and port explicitly instead of relying on a regular expression:
+
+```ruby
+  origins Rack::Cors::OriginRule.exact('example.com', schemes: %w[https]),
+          Rack::Cors::OriginRule.subdomains('example.com', schemes: %w[https]),
+          Rack::Cors::OriginRule.null
+```
+
+* **exact** matches only the given host. **subdomains** matches full domain labels below the given host (e.g. `app.example.com`), but not the root domain itself unless `include_root: true` is passed; look-alike domains such as `evil-example.com` or `example.com.evil` never match.
+* An origin without an explicit port is matched against the default port of its scheme, so `https://example.com` and `https://example.com:443` are equivalent. Custom ports can be allowed with the `ports:` option.
+* The `Origin` header must contain a single, well-formed origin: values with a path, userinfo, or multiple origins never match. The `null` origin only matches when declared explicitly with `OriginRule.null`.
+
 Additionally, origins can be specified dynamically via a block of the following form:
 ```ruby
   origins { |source, env| true || false }
