@@ -9,6 +9,22 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `lossless.integer`, `lossless.float`, and `lossless.decimal` types (plus
+  `optional.lossless.*`) for coercing `Integer`, `Float`, `BigDecimal`, and
+  decimal strings without ever changing the mathematical value. The
+  representation may change (e.g. `"3"` → `3`), but `3.7` is never truncated
+  to `3` and a large integer never silently changes when converted to `Float`.
+  Non-finite values (`NaN`, `Infinity`) are rejected from any source and
+  negative zero is normalized to positive zero. Decimal literals that are not
+  exactly representable as binary64 (e.g. `"3.14"`) are rejected by
+  `lossless.float` while accepted by `lossless.decimal`, which keeps the exact
+  decimal value. The guarantee holds when the types are used inside arrays,
+  schemas, sums, constraints, and when extra constructors are attached: the
+  lossless validation is always applied to the final output, so an outer
+  constructor cannot degrade a validated value. The existing `coercible.*`,
+  `params.*`, and `json.*` types are unchanged. See
+  `Dry::Types::Coercions::Lossless` for the full rule set.
+
 ### Changed
 
 ### Deprecated

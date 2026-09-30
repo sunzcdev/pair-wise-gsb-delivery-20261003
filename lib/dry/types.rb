@@ -44,7 +44,7 @@ module Dry
           "#{root}/dry/types/{#{%w[
             compat constraints core
             errors extensions inflector
-            module json params
+            module json lossless params
             printer version
           ].join(",")}}.rb"
         )
@@ -255,5 +255,6 @@ module Dry
 end
 
 require "dry/types/core" # load built-in types
+require "dry/types/lossless" # load lossless numeric coercions
 require "dry/types/extensions"
 require "dry/types/printer"
