@@ -27,6 +27,11 @@ module TZInfo
       @linked_timezone.periods_for_local(local_time)
     end
 
+    # (see Timezone#periods_for_local_batch)
+    def periods_for_local_batch(local_times)
+      @linked_timezone.periods_for_local_batch(local_times)
+    end
+
     # (see Timezone#transitions_up_to)
     def transitions_up_to(to, from = nil)
       @linked_timezone.transitions_up_to(to, from)

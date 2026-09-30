@@ -32,6 +32,79 @@ module TZInfo
   class UnknownTimezone < StandardError
   end
 
+  # Represents the outcome of resolving a single local time with
+  # {Timezone#periods_for_local_batch}.
+  #
+  # A local time either:
+  #
+  # * maps to a single {TimezonePeriod} ({#unique?} returns `true`),
+  # * is ambiguous and maps to more than one {TimezonePeriod} ({#ambiguous?}
+  #   returns `true`, for example when daylight savings time ends),
+  # * is invalid and maps to no {TimezonePeriod} ({#none?} returns `true`, for
+  #   example when daylight savings time begins), or
+  # * could not be interpreted as a local time ({#invalid?} returns `true`).
+  #
+  # Unlike the single item {Timezone#periods_for_local} and
+  # {Timezone#period_for_local} methods, ambiguous and invalid local times do
+  # not result in exceptions.
+  class LocalPeriodsResult
+    # @return [Array<TimezonePeriod>] the {TimezonePeriod TimezonePeriods} that
+    #   could be observed for the local time, ordered by increasing UTC start
+    #   date. The {TimezonePeriod TimezonePeriods} are empty for a local time
+    #   that is invalid or that could not be interpreted.
+    attr_reader :periods
+
+    # Initializes a new {LocalPeriodsResult}.
+    #
+    # @param periods [Array<TimezonePeriod>] the {TimezonePeriod
+    #   TimezonePeriods} that could be observed for the local time.
+    # @param error [Exception, nil] the {Exception} that was raised while
+    #   interpreting the local time, or `nil` if it was interpreted
+    #   successfully.
+    def initialize(periods, error = nil)
+      @periods = periods
+      @error = error
+    end
+
+    # @return [Boolean] `true` if the local time could not be interpreted
+    #   (for example it was `nil` or an unsupported type), otherwise `false`.
+    def invalid?
+      !!@error
+    end
+
+    # @return [Boolean] `true` if the local time maps to exactly one
+    #   {TimezonePeriod}, otherwise `false`.
+    def unique?
+      !@error && @periods.length == 1
+    end
+
+    # @return [Boolean] `true` if the local time is ambiguous and maps to more
+    #   than one {TimezonePeriod}, otherwise `false`.
+    def ambiguous?
+      !@error && @periods.length > 1
+    end
+
+    # @return [Boolean] `true` if the local time is valid but maps to no
+    #   {TimezonePeriod TimezonePeriods} (a gap, for example when daylight
+    #   savings time begins), otherwise `false`.
+    def none?
+      !@error && @periods.empty?
+    end
+
+    # @return [TimezonePeriod, nil] the single {TimezonePeriod} if {#unique?}
+    #   returns `true`, otherwise `nil`.
+    def period
+      @periods.first if unique?
+    end
+
+    # @return [Exception, nil] the {Exception} that was raised while
+    #   interpreting the local time, or `nil` if it was interpreted
+    #   successfully.
+    def error
+      @error
+    end
+  end
+
   # The {Timezone} class represents a time zone. It provides a factory method,
   # {get}, to retrieve {Timezone} instances by their identifier.
   #
@@ -341,6 +414,44 @@ module TZInfo
     # @raise [ArgumentError] if `local_time` is `nil`.
     def periods_for_local(local_time)
       raise_unknown_timezone
+    end
+
+    # Returns an {LocalPeriodsResult} for each of the given local times,
+    # preserving the order in which the local times were supplied.
+    #
+    # The UTC offset of each local time is ignored (each is treated as a time
+    # in the time zone represented by `self`).
+    #
+    # The returned `Array` always has the same number of elements as
+    # `local_times` and is in the same order, so duplicates remain at separate
+    # positions. Each result distinguishes a local time that maps to a single
+    # {TimezonePeriod} ({LocalPeriodsResult#unique?}), more than one
+    # {LocalPeriodsResult#ambiguous?} (for example, when daylight savings time
+    # ends) or none ({LocalPeriodsResult#none?}, for example, when daylight
+    # savings time begins).
+    #
+    # A local time that cannot be interpreted (such as `nil` or an unsupported
+    # type) does not prevent the remaining local times from being resolved.
+    # Instead, an {LocalPeriodsResult} with {LocalPeriodsResult#invalid?}
+    # returning `true` is returned at the corresponding position.
+    #
+    # Unlike {periods_for_local}, this method never raises an
+    # {AmbiguousTime} or {PeriodNotFound} exception.
+    #
+    # @param local_times [Enumerable<Object>] local `Time`, `DateTime` or
+    #   {Timestamp} instances in any order.
+    # @return [Array<LocalPeriodsResult>] an {LocalPeriodsResult} for each
+    #   local time, in the same order as `local_times`.
+    def periods_for_local_batch(local_times)
+      raise ArgumentError, 'local_times must be specified' unless local_times
+
+      local_times.map do |local_time|
+        begin
+          LocalPeriodsResult.new(periods_for_local(local_time))
+        rescue ArgumentError => e
+          LocalPeriodsResult.new([], e)
+        end
+      end
     end
 
     # Returns an `Array` of {TimezoneTransition} instances representing the

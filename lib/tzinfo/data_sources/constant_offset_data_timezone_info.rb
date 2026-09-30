@@ -36,6 +36,13 @@ module TZInfo
         [constant_period]
       end
 
+      # @param local_timestamps [Enumerable<Timestamp>] ignored.
+      # @return [Array<Array<TimezonePeriod>>] an `Array` containing a single
+      #   unbounded {TimezonePeriod} for each of the given local timestamps.
+      def periods_for_local_batch(local_timestamps)
+        local_timestamps.map { [constant_period] }
+      end
+
       # @param to_timestamp [Timestamp] ignored.
       # @param from_timestamp [Timestamp] ignored.
       # @return [Array] an empty `Array`, since there are no transitions in time

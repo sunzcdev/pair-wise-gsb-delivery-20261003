@@ -35,6 +35,23 @@ module TZInfo
         raise_not_implemented('periods_for_local')
       end
 
+      # Returns an `Array` containing one `Array` of {TimezonePeriod
+      # TimezonePeriods} for each of the given local timestamps. The results
+      # are returned in the same order as the given local timestamps.
+      #
+      # @param local_timestamps [Enumerable<Timestamp>] local {Timestamp
+      #   Timestamp} instances, each with an unspecified
+      #   {Timestamp#utc_offset utc_offset}.
+      # @return [Array<Array<TimezonePeriod>>] an `Array` containing the
+      #   {TimezonePeriod TimezonePeriods} that could be observed at each of
+      #   the local timestamps specified by `local_timestamps`.
+      # @raise [ArgumentError] may be raised if an element of
+      #   `local_timestamps` is `nil`, or has a specified
+      #   {Timestamp#utc_offset utc_offset}.
+      def periods_for_local_batch(local_timestamps)
+        raise_not_implemented('periods_for_local_batch')
+      end
+
       # Returns an `Array` of {TimezoneTransition} instances representing the
       # times where the UTC offset of the time zone changes.
       #

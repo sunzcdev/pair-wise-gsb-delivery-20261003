@@ -47,6 +47,31 @@ module DataSources
       assert_equal([OffsetTimezonePeriod.new(o)], i.periods_for_local(Timestamp.for(Time.utc(2017,1,1,0,0,0), :ignore)))
     end
 
+    def test_periods_for_local_batch
+      o = TimezoneOffset.new(-17900, 0, 'TESTLMT')
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', o)
+
+      timestamps = [
+        Timestamp.for(Time.utc(2017,1,1,0,0,0,Rational(1,2)), :ignore),
+        Timestamp.for(Time.utc(1900,1,1,0,0,0), :ignore),
+        Timestamp.for(Time.utc(2017,1,1,0,0,0,Rational(1,2)), :ignore),
+        Timestamp.for(Time.utc(2100,1,1,0,0,0), :ignore)
+      ]
+
+      result = i.periods_for_local_batch(timestamps)
+
+      expected = [OffsetTimezonePeriod.new(o)]
+      assert_equal([expected, expected, expected, expected], result)
+      assert_equal(4, result.length)
+    end
+
+    def test_periods_for_local_batch_empty
+      o = TimezoneOffset.new(-17900, 0, 'TESTLMT')
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', o)
+
+      assert_equal([], i.periods_for_local_batch([]))
+    end
+
     def test_transitions_up_to
       i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', TimezoneOffset.new(-17900, 0, 'TESTLMT'))
 

@@ -12,6 +12,7 @@ class TCLinkedTimezone < Minitest::Test
     attr_reader :transitions_up_to_result
     attr_reader :time
     attr_reader :local_time
+    attr_reader :local_times
     attr_reader :to
     attr_reader :from
 
@@ -40,6 +41,12 @@ class TCLinkedTimezone < Minitest::Test
       raise ArgumentError, 'linked zone exception: nil' unless local_time
       @local_time = local_time
       @periods_for_local_result
+    end
+
+    def periods_for_local_batch(local_times)
+      raise ArgumentError, 'linked zone exception: nil batch' unless local_times
+      @local_times = local_times
+      local_times.map {|t| t ? TZInfo::LocalPeriodsResult.new(@periods_for_local_result) : TZInfo::LocalPeriodsResult.new([], ArgumentError.new('linked zone exception: nil')) }
     end
 
     def transitions_up_to(to, from = nil)
@@ -123,6 +130,36 @@ class TCLinkedTimezone < Minitest::Test
 
       error = assert_raises(ArgumentError) { tz.periods_for_local(nil) }
       assert_equal('linked zone exception: nil', error.message)
+    end
+  end
+
+  def test_periods_for_local_batch
+    stub_timezone_get do |linked_tz|
+      tz = LinkedTimezone.new(DataSources::LinkedTimezoneInfo.new('Test/Zone', 'Test/Linked'))
+      local_times = [Time.utc(2006, 6, 27, 23, 12, 28), Time.utc(2010, 1, 1, 0, 0, 0)]
+
+      results = tz.periods_for_local_batch(local_times)
+
+      assert_same(local_times, linked_tz.local_times)
+      assert_equal(2, results.length)
+      assert(results.all? {|r| r.periods == linked_tz.periods_for_local_result})
+    end
+  end
+
+  def test_periods_for_local_batch_empty
+    stub_timezone_get do |linked_tz|
+      tz = LinkedTimezone.new(DataSources::LinkedTimezoneInfo.new('Test/Zone', 'Test/Linked'))
+      assert_equal([], tz.periods_for_local_batch([]))
+      assert_equal([], linked_tz.local_times)
+    end
+  end
+
+  def test_periods_for_local_batch_nil
+    stub_timezone_get do
+      tz = LinkedTimezone.new(DataSources::LinkedTimezoneInfo.new('Test/Zone', 'Test/Linked'))
+
+      error = assert_raises(ArgumentError) { tz.periods_for_local_batch(nil) }
+      assert_equal('linked zone exception: nil batch', error.message)
     end
   end
 

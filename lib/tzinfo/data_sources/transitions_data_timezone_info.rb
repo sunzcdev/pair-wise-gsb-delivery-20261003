@@ -73,38 +73,66 @@ module TZInfo
 
         local_timestamp_value = local_timestamp.value
         latest_possible_utc_value = local_timestamp_value + 86400
-        earliest_possible_utc_value = local_timestamp_value - 86400
 
         # Find the index of the first transition that occurs after a latest
         # possible UTC representation of the local timestamp and then search
         # backwards until an earliest possible UTC representation.
-
         index = find_minimum_transition {|t| t.timestamp_value >= latest_possible_utc_value }
 
         # No transitions after latest_possible_utc_value, set to max index + 1
         # to search backwards including the period after the last transition
         index = @transitions.length unless index
 
-        result = []
+        periods_for_local_value(local_timestamp_value, index)
+      end
 
-        index.downto(0) do |i|
-          start_transition = i > 0 ? @transitions[i - 1] : nil
-          end_transition = @transitions[i]
-          offset = start_transition ? start_transition.offset : end_transition.previous_offset
-          utc_timestamp_value = local_timestamp_value - offset.observed_utc_offset
+      # Returns an `Array` containing one `Array` of {TimezonePeriod
+      # TimezonePeriods} for each of the given local timestamps. Each inner
+      # `Array` is ordered by increasing UTC start date and is empty if no
+      # periods are found for the corresponding local timestamp.
+      #
+      # The results are returned in the same order as the given
+      # `local_timestamps`, so each result appears at the index of the local
+      # timestamp it corresponds to. The local timestamps may be supplied in
+      # any order and may contain duplicates.
+      #
+      # The transition list is traversed once across all the local timestamps
+      # rather than separately for each one.
+      #
+      # @param local_timestamps [Enumerable<Timestamp>] local {Timestamp
+      #   Timestamp} instances, each with an unspecified {Timestamp#utc_offset
+      #   utc_offset}.
+      # @return [Array<Array<TimezonePeriod>>] an `Array` containing the
+      #   {TimezonePeriod TimezonePeriods} that could be observed at each local
+      #   timestamp specified by `local_timestamps`.
+      # @raise [ArgumentError] may be raised if an element of
+      #   `local_timestamps` is `nil`, or has a specified
+      #   {Timestamp#utc_offset utc_offset}.
+      def periods_for_local_batch(local_timestamps)
+        # Validate each local timestamp and pair its value with its original
+        # index. The pairs are sorted by value for a single, shared traversal
+        # of the transition list. The original indices are used to return the
+        # results in input order.
+        ordered = local_timestamps.each_with_index.map do |local_timestamp, original_index|
+          raise ArgumentError, 'local_timestamp must be specified' unless local_timestamp
+          raise ArgumentError, 'local_timestamp must have an unspecified utc_offset' if local_timestamp.utc_offset
+          [local_timestamp.value, original_index]
+        end
+        ordered.sort_by!(&:first)
 
-          # It is not necessary to compare the sub-seconds because a timestamp
-          # is in the period if is >= the start transition (sub-seconds would
-          # make == become >) and if it is < the end transition (which
-          # sub-seconds cannot affect).
-          if (!start_transition || utc_timestamp_value >= start_transition.timestamp_value) && (!end_transition || utc_timestamp_value < end_transition.timestamp_value)
-            result << TransitionsTimezonePeriod.new(start_transition, end_transition)
-          elsif end_transition && end_transition.timestamp_value < earliest_possible_utc_value
-            break
-          end
+        results = Array.new(ordered.length)
+
+        # Cursor over the transition list. Since local timestamp values are
+        # processed in ascending order, this only ever advances, so the
+        # transitions are traversed once in total.
+        index = 0
+
+        ordered.each do |local_timestamp_value, original_index|
+          index = advance_minimum_transition_for_local(local_timestamp_value, index)
+          results[original_index] = periods_for_local_value(local_timestamp_value, index)
         end
 
-        result.reverse!
+        results
       end
 
       # (see DataTimezoneInfo#transitions_up_to)
@@ -137,6 +165,65 @@ module TZInfo
       end
 
       private
+
+      # Finds the {TimezonePeriod TimezonePeriods} that could be observed for a
+      # local timestamp with the given value, searching backwards from the
+      # transition at the given index.
+      #
+      # @param local_timestamp_value [Integer] the value of the local
+      #   timestamp.
+      # @param index [Integer] the index of the first transition that occurs at
+      #   or after the local timestamp's latest possible UTC representation, or
+      #   the length of {#transitions} if no such transition exists.
+      # @return [Array<TimezonePeriod>] the {TimezonePeriod TimezonePeriods}
+      #   that could be observed at the local timestamp, ordered by increasing
+      #   UTC start date.
+      def periods_for_local_value(local_timestamp_value, index)
+        earliest_possible_utc_value = local_timestamp_value - 86400
+
+        result = []
+
+        index.downto(0) do |i|
+          start_transition = i > 0 ? @transitions[i - 1] : nil
+          end_transition = @transitions[i]
+          offset = start_transition ? start_transition.offset : end_transition.previous_offset
+          utc_timestamp_value = local_timestamp_value - offset.observed_utc_offset
+
+          # It is not necessary to compare the sub-seconds because a timestamp
+          # is in the period if is >= the start transition (sub-seconds would
+          # make == become >) and if it is < the end transition (which
+          # sub-seconds cannot affect).
+          if (!start_transition || utc_timestamp_value >= start_transition.timestamp_value) && (!end_transition || utc_timestamp_value < end_transition.timestamp_value)
+            result << TransitionsTimezonePeriod.new(start_transition, end_transition)
+          elsif end_transition && end_transition.timestamp_value < earliest_possible_utc_value
+            break
+          end
+        end
+
+        result.reverse!
+      end
+
+      # Advances the cursor over the transition list when processing local
+      # timestamps in ascending order. Returns the index of the first
+      # transition that occurs at or after the local timestamp's latest
+      # possible UTC representation, or the length of {#transitions} if no such
+      # transition exists.
+      #
+      # @param local_timestamp_value [Integer] the value of the local
+      #   timestamp.
+      # @param index [Integer] a lower bound for the returned index, based on
+      #   the local timestamp processed previously (0 for the first local
+      #   timestamp).
+      # @return [Integer] the index to start searching backwards from.
+      def advance_minimum_transition_for_local(local_timestamp_value, index)
+        latest_possible_utc_value = local_timestamp_value + 86400
+
+        while index < @transitions.length && @transitions[index].timestamp_value < latest_possible_utc_value
+          index += 1
+        end
+
+        index
+      end
 
       # Array#bsearch_index was added in Ruby 2.3.0. Use bsearch_index to find
       # transitions if it is available, otherwise use a Ruby implementation.
