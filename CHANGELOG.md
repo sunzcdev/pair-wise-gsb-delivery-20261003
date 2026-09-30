@@ -8,6 +8,8 @@
 
 ### New features
 
+- Static validation: add resumable `GraphQL::StaticValidation::ValidationSession` (via `Validator#validation_session`) for interleaving query validation in an event loop. Sessions are driven by a per-`advance` work budget measured in AST-node rule checks and per-definition post-visit checks (not wall-clock time); they report `:pending`, `:complete` or `:cancelled`, keep fragment-dependency, field-merge and variable state between advances, produce errors in the same order as uninterrupted validation, isolate interleaved sessions, and stop rule callbacks on cancel without treating partial results as valid.
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

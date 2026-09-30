@@ -69,6 +69,26 @@ module GraphQL
         query.current_trace.end_validate(query, validate, errors)
       end
 
+      # Begin a pausable validation session for `query`.
+      #
+      # The session doesn't run any rule until {ValidationSession#advance} is
+      # called with a work budget, so several sessions can be interleaved from
+      # an event loop. Use this when {#validate} would hold the thread for too
+      # long on a large document.
+      #
+      # @param query [GraphQL::Query]
+      # @param validate [Boolean] when false, the session is immediately complete with no errors
+      # @param max_errors [Integer] Maximum number of errors before the run aborts
+      # @return [GraphQL::StaticValidation::ValidationSession]
+      def validation_session(query, validate: true, max_errors: nil)
+        GraphQL::StaticValidation::ValidationSession.new(
+          query: query,
+          rules: @rules,
+          validate: validate,
+          max_errors: max_errors,
+        )
+      end
+
       # Invoked when static validation times out.
       # @param query [GraphQL::Query]
       # @param context [GraphQL::StaticValidation::ValidationContext]

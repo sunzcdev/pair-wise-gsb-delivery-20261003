@@ -24,14 +24,13 @@ module GraphQL
 
       def on_document_children(document_node)
         document_node.children.each do |child_node|
-          visit_method = child_node.visit_method
-          public_send(visit_method, child_node, document_node)
+          visit_child_node(child_node, document_node)
         end
       end
 
       def on_field_children(new_node)
         new_node.arguments.each do |arg_node| # rubocop:disable Development/ContextIsPassedCop
-          on_argument(arg_node, new_node)
+          visit_child_node(arg_node, new_node)
         end
         visit_directives(new_node)
         visit_selections(new_node)
@@ -39,7 +38,7 @@ module GraphQL
 
       def visit_directives(new_node)
         new_node.directives.each do |dir_node|
-          on_directive(dir_node, new_node)
+          visit_child_node(dir_node, new_node)
         end
       end
 
@@ -47,11 +46,11 @@ module GraphQL
         new_node.selections.each do |selection|
           case selection
           when GraphQL::Language::Nodes::Field
-            on_field(selection, new_node)
+            visit_child_node(selection, new_node)
           when GraphQL::Language::Nodes::InlineFragment
-            on_inline_fragment(selection, new_node)
+            visit_child_node(selection, new_node)
           when GraphQL::Language::Nodes::FragmentSpread
-            on_fragment_spread(selection, new_node)
+            visit_child_node(selection, new_node)
           else
             raise ArgumentError, "Invariant: unexpected field selection #{selection.class} (#{selection.inspect})"
           end
@@ -67,7 +66,7 @@ module GraphQL
 
       def on_operation_definition_children(new_node)
         new_node.variables.each do |arg_node|
-          on_variable_definition(arg_node, new_node)
+          visit_child_node(arg_node, new_node)
         end
         visit_directives(new_node)
         visit_selections(new_node)
@@ -77,17 +76,28 @@ module GraphQL
         new_node.children.each do |value_node|
           case value_node
           when Language::Nodes::VariableIdentifier
-            on_variable_identifier(value_node, new_node)
+            visit_child_node(value_node, new_node)
           when Language::Nodes::InputObject
-            on_input_object(value_node, new_node)
+            visit_child_node(value_node, new_node)
           when Language::Nodes::Enum
-            on_enum(value_node, new_node)
+            visit_child_node(value_node, new_node)
           when Language::Nodes::NullValue
-            on_null_value(value_node, new_node)
+            visit_child_node(value_node, new_node)
           else
             raise ArgumentError, "Invariant: unexpected argument value node #{value_node.class} (#{value_node.inspect})"
           end
         end
+      end
+
+      # Dispatch a single child node's visit hook.
+      #
+      # Every check performed against the document (one hook entry per AST node,
+      # including all of its included rule callbacks) is reached through this
+      # method, so it's the place where a unit of validation work is accounted
+      # for. Subclasses may wrap it (for example to pause when a work budget is
+      # exhausted), but the order and the hook being called stay identical.
+      def visit_child_node(child_node, parent_node)
+        public_send(child_node.visit_method, child_node, parent_node)
       end
 
       # rubocop:disable Development/NoEvalCop This eval takes static inputs at load-time
@@ -114,7 +124,7 @@ module GraphQL
               elsif children_of_type
                 children_of_type.map do |child_accessor, child_class|
                   "node.#{child_accessor}.each do |child_node|
-                    #{child_class.visit_method}(child_node, node)
+                    visit_child_node(child_node, node)
                   end"
                 end.join("\n")
               else

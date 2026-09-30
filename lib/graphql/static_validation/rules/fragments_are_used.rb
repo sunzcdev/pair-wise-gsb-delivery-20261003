@@ -6,6 +6,7 @@ module GraphQL
         super
         dependency_map = context.dependencies
         dependency_map.unmet_dependencies.each do |op_defn, spreads|
+          context.charge_work
           spreads.each do |fragment_spread|
             add_error(GraphQL::StaticValidation::FragmentsAreUsedError.new(
               "Fragment #{fragment_spread.name} was used, but not defined",
@@ -17,6 +18,7 @@ module GraphQL
         end
 
         dependency_map.unused_dependencies.each do |fragment|
+          context.charge_work
           if fragment && !fragment.name.nil?
             add_error(GraphQL::StaticValidation::FragmentsAreUsedError.new(
               "Fragment #{fragment.name} was defined, but not used",

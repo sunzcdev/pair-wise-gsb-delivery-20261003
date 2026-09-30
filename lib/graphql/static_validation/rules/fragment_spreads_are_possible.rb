@@ -25,6 +25,7 @@ module GraphQL
       def on_document(node, parent)
         super
         @spreads_to_validate.each do |frag_spread|
+          context.charge_work
           frag_node = context.fragments[frag_spread.node.name]
           if frag_node
             fragment_child_name = frag_node.type.name

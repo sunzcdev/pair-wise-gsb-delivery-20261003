@@ -212,6 +212,17 @@ module GraphQL
 
       private
 
+      # Account for the rule work done at this node (all of its on_* hook
+      # callbacks count as one documented unit), then run the hook. When a
+      # session's budget is exhausted, its work gate suspends here -- after the
+      # previous node was fully handled and before any callback of this node
+      # runs -- so resuming produces exactly the same checks, in the same
+      # order, as an uninterrupted visit.
+      def visit_child_node(child_node, parent_node)
+        @context.charge_work
+        super
+      end
+
       def add_error(error, path: nil)
         if @context.too_many_errors?
           throw :too_many_validation_errors

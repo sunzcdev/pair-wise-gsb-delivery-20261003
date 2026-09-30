@@ -85,3 +85,26 @@ end
 ```
 
 **Note:** This configuration uses Ruby's built-in `Timeout` API, which can interrupt IO calls mid-flight, resulting in [very weird bugs](https://www.mikeperham.com/2015/05/08/timeout-rubys-most-dangerous-api/). None of GraphQL-Ruby's validators make IO calls but if you want to use this configuration and you have custom static validators that make IO calls, open an issue to discuss implementing this in an IO-safe way.
+
+## Pausable validation (interleaving many queries)
+
+In an event loop that takes turns handling several queries, an uninterrupted `Validator#validate` call holds the thread until the whole document is validated (or the timeout fires). For these cases, use {{ "GraphQL::StaticValidation::Validator#validation_session" | api_doc }}, which returns a resumable {{ "GraphQL::StaticValidation::ValidationSession" | api_doc }} driven by a **work budget** instead of elapsed time:
+
+```ruby
+session = schema.static_validator.validation_session(query)
+
+until session.status != :pending
+  # Run at most 200 units of rule work, then return control:
+  result = session.advance(200)
+  # result[:status] is :pending, :complete or :cancelled
+end
+
+# Only a completed, error-free session means the whole query is valid!
+if session.complete? && session.errors.empty?
+  # run the query
+end
+```
+
+The budget counts concrete checks that the document requires (it does not merely sample the clock at the end of the document): entering the rule hook of one AST node costs 1 unit, and each per-fragment/per-operation check in the post-visit passes (dependency resolution, spread scopes, variable usage, duplicate names, ...) costs 1 unit. A session only suspends *between* these units, so splitting validation into arbitrarily small `advance` calls produces exactly the same errors in the same order as one uninterrupted validation. Intermediate state (fragment dependencies, field-merge bookkeeping, merged fields, variable tracking) is kept on the session and resumed later.
+
+Sessions are independent — two sessions interleaved from the same loop never share visitor/rule state. A session may also be stopped permanently with `session.cancel`; after that no rule callbacks run again and its partial results are never treated as a valid query.

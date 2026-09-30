@@ -81,6 +81,7 @@ module GraphQL
         operation_definitions = @variable_usages_for_context.select { |key, value| key.is_a?(GraphQL::Language::Nodes::OperationDefinition) }
 
         operation_definitions.each do |node, node_variables|
+          context.charge_work
           follow_spreads(node, node_variables, @spreads_for_context, fragment_definitions, [])
           create_errors(node_variables)
         end

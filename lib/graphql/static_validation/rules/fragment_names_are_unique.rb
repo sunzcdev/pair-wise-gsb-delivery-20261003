@@ -16,6 +16,7 @@ module GraphQL
       def on_document(_n, _p)
         super
         @fragments_by_name.each do |name, fragments|
+          context.charge_work
           if fragments.length > 1
             add_error(GraphQL::StaticValidation::FragmentNamesAreUniqueError.new(
               %|Fragment name "#{name}" must be unique|,

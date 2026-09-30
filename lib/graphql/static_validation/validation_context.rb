@@ -13,12 +13,18 @@ module GraphQL
 
       attr_reader :query, :errors, :visitor,
         :on_dependency_resolve_handlers,
-        :max_errors, :types, :schema
+        :max_errors, :types, :schema, :work_gate
 
 
       def_delegators :@query, :document, :fragments, :operations
 
-      def initialize(query, visitor_class, max_errors)
+      # @param work_gate [#charge_work(units)] Object accounting for validation
+      #   work as the document is checked. It's invoked before each documented
+      #   unit of rule work (each AST node hook entry and each fragment
+      #   dependency resolution step). A pausable session uses it to suspend
+      #   when its work budget is exhausted; ordinary validation uses a no-op
+      #   gate.
+      def initialize(query, visitor_class, max_errors, work_gate: NullWorkGate)
         @query = query
         @types = query.types # TODO update migrated callers to use this accessor
         @schema = query.schema
@@ -26,7 +32,20 @@ module GraphQL
         @errors = []
         @max_errors = max_errors || Float::INFINITY
         @on_dependency_resolve_handlers = []
+        @work_gate = work_gate
         @visitor = visitor_class.new(document, self)
+      end
+
+      # Account for `units` units of rule work. See {#work_gate}.
+      def charge_work(units = 1)
+        @work_gate.charge_work(units)
+      end
+
+      # The default work gate: validation runs straight through without pausing.
+      module NullWorkGate
+        def self.charge_work(_units = 1)
+          nil
+        end
       end
 
       # TODO stop using def_delegators because of Array allocations

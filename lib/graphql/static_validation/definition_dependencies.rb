@@ -129,6 +129,11 @@ module GraphQL
         independent_fragment_nodes = @defdep_fragment_definitions.values.flatten - @defdep_immediate_dependencies.keys
         visited_fragment_names = Set.new
         while fragment_node = independent_fragment_nodes.pop
+          # Resolving one independent fragment (registering the definitions and
+          # spreads that depend on it) is one documented unit of work. A
+          # session may pause between any two resolutions, then resume with all
+          # the intermediate dependency state intact.
+          context.charge_work
           if visited_fragment_names.add?(fragment_node.name)
             # this is a new fragment name
           else
@@ -179,6 +184,9 @@ module GraphQL
         # (eg, spreads with no corresponding definition)
         # then they're still in there
         @defdep_immediate_dependencies.each do |defn_node, deps|
+          # One documented unit of work per definition scanned here,
+          # so a session can pause during this post-visit pass too.
+          context.charge_work
           deps.each do |spread|
             if !@defdep_fragment_definitions.key?(spread.name)
               dependency_map.unmet_dependencies[@defdep_node_paths[defn_node]] << @defdep_node_paths[spread]

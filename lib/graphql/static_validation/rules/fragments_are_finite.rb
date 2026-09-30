@@ -6,6 +6,7 @@ module GraphQL
         super
         dependency_map = context.dependencies
         dependency_map.cyclical_definitions.each do |defn|
+          context.charge_work
           if defn.node.is_a?(GraphQL::Language::Nodes::FragmentDefinition)
             add_error(GraphQL::StaticValidation::FragmentsAreFiniteError.new(
               "Fragment #{defn.name} contains an infinite loop",
