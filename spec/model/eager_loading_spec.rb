@@ -1520,6 +1520,117 @@ describe Sequel::Model, "#eager" do
   end
 end
 
+describe Sequel::Model, "query-level identity map" do
+  before do
+    @db = Sequel.mock
+
+    class ::IMAlbum < Sequel::Model(@db[:albums]); end
+    @Album = ::IMAlbum
+    @Album.columns :id, :band_id, :band_a, :band_b, :manager_id
+    @Album.set_primary_key :id
+
+    class ::IMBand < Sequel::Model(@db[:bands]); end
+    @Band = ::IMBand
+    @Band.columns :a, :b, :name
+    @Band.set_primary_key [:a, :b]
+
+    class ::IMManager < Sequel::Model(@db[:managers]); end
+    @Manager = ::IMManager
+    @Manager.columns :id
+    @Manager.set_primary_key :id
+
+    @Album.one_to_many :aliases, :class=>@Album, :key=>:id, :primary_key=>:id
+    @Album.many_to_one :band, :class=>@Band, :key=>[:band_a, :band_b], :primary_key=>[:a, :b]
+    @Album.many_to_one :manager, :class=>@Manager, :key=>:manager_id
+    @Album.many_to_one :partial_band, :class=>@Band, :key=>[:band_a, :band_b], :primary_key=>[:a, :b], :select=>[:a, :b]
+    @Album.many_to_one :composite_band, :class=>@Band, :key=>[:band_a, :band_b], :primary_key=>[:a, :b]
+    @Album.many_to_one :missing_key_band, :class=>@Band, :key=>[:band_a, :band_b], :primary_key=>[:a, :b], :select=>[:name]
+
+    @Album.dataset = @Album.dataset.with_fetch(proc do |sql|
+      case sql
+      when /albums/
+        [
+          {:id=>1, :band_id=>10, :band_a=>20, :band_b=>30, :manager_id=>nil, :a=>20, :b=>30, :name=>"Full", :aliases_id=>1, :aliases_id_0=>1},
+          {:id=>1, :band_id=>10, :band_a=>20, :band_b=>30, :manager_id=>nil, :a=>20, :b=>30, :name=>"Full", :aliases_id=>1, :aliases_id_0=>1},
+        ]
+      else
+        sql =~ /SELECT name FROM bands/ ? [{:name=>"Partial"}] : []
+      end
+    end)
+    @Band.dataset = @Band.dataset.with_fetch(proc do |sql|
+      if sql =~ /SELECT a, b FROM bands/
+        [{:a=>20, :b=>30}]
+      elsif sql =~ /SELECT name FROM bands/
+        [{:name=>"Partial"}]
+      else
+        [{:a=>20, :b=>30, :name=>"Full"}]
+      end
+    end)
+    @db.sqls
+  end
+
+  after do
+    [:IMAlbum, :IMBand, :IMManager].each{|name| Object.send(:remove_const, name)}
+  end
+
+  it "uses one object for duplicate identities from eager_graph and eager" do
+    albums = @Album.
+      eager_graph(:band, :aliases, :manager).
+      add_graph_aliases(:band_a=>[:albums, :band_a], :band_b=>[:albums, :band_b]).
+      eager(:partial_band, :composite_band, :missing_key_band).
+      eager_identity_map.
+      all
+
+    album = albums.first
+    album.object_id.must_equal albums.last.object_id
+    album.band.object_id.must_equal album.partial_band.object_id
+    album.object_id.must_equal album.aliases.first.object_id
+    album.band.name.must_equal "Full"
+    album.manager.must_be_nil
+
+    album.composite_band.object_id.must_equal album.band.object_id
+    album.composite_band.name.must_equal "Full"
+    album.missing_key_band.object_id.wont_equal album.band.object_id
+    album.band.name.must_equal "Full"
+
+    albums = @Album.
+      eager_graph(:band, :aliases, :manager).
+      add_graph_aliases(:band_a=>[:albums, :band_a], :band_b=>[:albums, :band_b]).
+      eager(:partial_band, :composite_band, :missing_key_band).
+      eager_identity_map.
+      all
+
+    albums.first.object_id.wont_equal album.object_id
+    albums.first.band.object_id.wont_equal album.band.object_id
+  end
+
+  it "does not merge rows that omit a complete primary key" do
+    no_pk = Class.new(Sequel::Model(@db[:no_pks]))
+    no_pk.columns :other_id, :name
+    no_pk.no_primary_key
+    no_pk.dataset = no_pk.dataset.with_fetch([
+      {:other_id=>1, :name=>"A"},
+      {:other_id=>1, :name=>"A"},
+    ])
+
+    records = no_pk.eager_identity_map.all
+    records.first.object_id.wont_equal records.last.object_id
+  end
+
+  it "does not merge projections that omit one part of a composite primary key" do
+    partial_pk = Class.new(Sequel::Model(@db[:partial_pks]))
+    partial_pk.columns :a, :b, :name
+    partial_pk.set_primary_key [:a, :b]
+    partial_pk.dataset = partial_pk.dataset.with_fetch([
+      {:a=>1, :name=>"First"},
+      {:a=>1, :name=>"Second"},
+    ])
+
+    records = partial_pk.eager_identity_map.all
+    records.first.object_id.wont_equal records.last.object_id
+  end
+end
+
 describe Sequel::Model, "#eager_graph" do
   before(:all) do
     class ::GraphAlbum < Sequel::Model(:albums)
@@ -2827,4 +2938,3 @@ describe "Sequel::Models with double underscores in table names" do
     foos.first.foos.must_equal [@Foo.load(:id=>1, :foo_id=>1)]
   end
 end
-

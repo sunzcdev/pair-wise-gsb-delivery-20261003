@@ -278,7 +278,7 @@ module Sequel
 
           if eo[:no_results]
             no_results = true
-          elsif eo[:eager_block] || eo[:loader] == false || !use_placeholder_loader?
+          elsif eo[:eager_block] || eo[:loader] == false || eo[:identity_map] || !use_placeholder_loader?
             ds = eager_loading_dataset(eo)
 
             strategy = ds.opts[:eager_limit_strategy] || strategy
@@ -314,6 +314,7 @@ module Sequel
           elsif strategy == :union
             objects = []
             ds = associated_dataset
+            ds = ds.clone(:identity_map=>eo[:identity_map]) if eo[:identity_map]
             loader = union_eager_loader
             joiner = " UNION ALL "
             ids.each_slice(subqueries_per_union).each do |slice|
@@ -597,7 +598,7 @@ module Sequel
           end
         end
         
-        private
+          private
 
         # If the key exists in the reflection hash, return it.
         # If the key doesn't exist and association reflections are uncached, then yield to get the value.
@@ -673,6 +674,7 @@ module Sequel
         # given the hash passed to the eager loader.
         def eager_loading_dataset(eo=OPTS)
           ds = eo[:dataset] || associated_eager_dataset
+          ds = ds.clone(:identity_map=>eo[:identity_map]) if eo[:identity_map]
           ds = eager_loading_set_predicate_condition(ds, eo)
           if associations = eo[:associations]
             ds = ds.eager(associations)
@@ -692,6 +694,7 @@ module Sequel
             raise(Error, "cannot eagerly load a #{self[:type]} association that uses :eager_graph") if eager_loading_use_associated_key?
             ds = ds.eager_graph(self[:eager_graph])
           end
+          ds = ds.clone(:identity_map=>eo[:identity_map]) if eo[:identity_map]
           ds
         end
 
@@ -1792,6 +1795,14 @@ module Sequel
         # Array of all association reflections for this model class
         def all_association_reflections
           association_reflections.values
+        end
+
+        def eager_identity_map
+          dataset.eager_identity_map
+        end
+
+        def identity_map
+          dataset.identity_map
         end
         
         # Associates a related model with the current model. The following types are
@@ -3140,6 +3151,58 @@ module Sequel
       #
       #   Artist.eager(albums: {proc{|ds| ds.where{year > 1990}}=>{tracks: :genre}})
       module DatasetMethods
+        # Query-scoped identity map for model records loaded by a single dataset query.
+        class EagerIdentityMap
+          def initialize
+            @records = {}
+          end
+
+          def clear
+            @records.clear
+          end
+
+          def call(_model, row_proc, values)
+            object = row_proc.call(values)
+
+            if object.is_a?(Model) && (key = identity_key(object))
+              records = records_for(object.model)
+              if existing = records[key]
+                fill_missing_values(existing, object.values)
+                existing
+              else
+                records[key] = object
+              end
+            else
+              object
+            end
+          end
+
+        private
+
+          def identity_key(object)
+            primary_key = object.model.primary_key
+
+            if primary_key.is_a?(Array)
+              key = primary_key.map{|column| object.values[column]}
+              key unless key.empty? || key.any?(&:nil?)
+            elsif primary_key
+              key = object.values[primary_key]
+              key unless key.nil?
+            end
+          end
+
+          def fill_missing_values(object, values)
+            object_values = object.values
+            values.each do |column, value|
+              object_values[column] = value unless object_values.key?(column)
+            end
+          end
+
+          def records_for(model)
+            @records[model] ||= {}
+          end
+        end
+
         %w'inner left right full'.each do |type|
           class_eval(<<-END, __FILE__, __LINE__+1)
             def association_#{type}_join(*associations)
@@ -3358,6 +3421,48 @@ module Sequel
           association_opts = eager_options_for_associations(associations)
           opts = opts ? opts.merge(association_opts) : association_opts
           clone(:eager=>opts.freeze)
+        end
+
+        # Return a clone of the dataset that uses a query-level identity map for
+        # the duration of #all. Records with the same model and full primary key
+        # are represented by a single object, and later projections only fill
+        # columns that are not already present.
+        def eager_identity_map
+          clone(:eager_identity_map=>true)
+        end
+        alias_method :identity_map, :eager_identity_map
+
+        def all(&block)
+          if identity_map = @opts[:identity_map]
+            return _all(block){|array| each{|record| array << record}}
+          end
+
+          if @opts[:eager_identity_map]
+            identity_map = EagerIdentityMap.new
+            begin
+              return clone(:identity_map=>identity_map).all(&block)
+            ensure
+              identity_map.clear
+            end
+          end
+
+          super
+        end
+
+        def each(&block)
+          if (identity_map = @opts[:identity_map]) && row_proc && !@opts[:eager_graph]
+            return fetch_rows(select_sql){|row| yield identity_map.call(model, row_proc, row)}
+          end
+
+          super
+        end
+
+        def with_sql_each(sql)
+          if (identity_map = @opts[:identity_map]) && row_proc && !@opts[:eager_graph]
+            return _with_sql_dataset.fetch_rows(sql){|row| yield identity_map.call(model, row_proc, row)}
+          end
+
+          super
         end
 
         # The secondary eager loading method.  Loads all associations in a single query. This
@@ -3642,7 +3747,7 @@ module Sequel
         # Replace the array of plain hashes with an array of model objects will all eager_graphed
         # associations set in the associations cache for each object.
         def eager_graph_build_associations(hashes)
-          hashes.replace(_eager_graph_build_associations(hashes, eager_graph_loader))
+          hashes.replace(_eager_graph_build_associations(hashes, eager_graph_loader(@opts[:identity_map])))
         end
       
         private
@@ -3766,11 +3871,11 @@ module Sequel
         end
       
         # The EagerGraphLoader instance used for converting eager_graph results.
-        def eager_graph_loader
+        def eager_graph_loader(identity_map=nil)
           unless egl = cache_get(:_model_eager_graph_loader)
             egl = cache_set(:_model_eager_graph_loader, EagerGraphLoader.new(self))
           end
-          egl.dup
+          identity_map ? egl.dup.with_identity_map(identity_map) : egl.dup
         end
 
         # Eagerly load all specified associations.
@@ -3835,7 +3940,7 @@ module Sequel
               eager_block, associations = pr_assoc
             end
 
-            eager_load_data[r[:eager_loader]] = {:key_hash=>key_hash, :rows=>a, :associations=>associations, :self=>self, :eager_block=>eager_block, :id_map=>id_map}
+            eager_load_data[r[:eager_loader]] = {:key_hash=>key_hash, :rows=>a, :associations=>associations, :self=>self, :eager_block=>eager_block, :id_map=>id_map, :identity_map=>@opts[:identity_map]}
           end
 
           eager_load_data
@@ -3906,7 +4011,7 @@ module Sequel
         alias one_to_one_association_filter_expression one_to_many_association_filter_expression
 
         def non_sql_option?(key)
-          super || key == :eager || key == :eager_graph
+          super || key == :eager || key == :eager_graph || key == :identity_map || key == :eager_identity_map
         end
 
         # Build associations from the graph if #eager_graph was used, 
@@ -3958,6 +4063,9 @@ module Sequel
         
         # Hash with table alias symbol keys and callable values used to create model instances
         attr_reader :row_procs
+
+        # The query-level identity map to use when creating model instances
+        attr_reader :identity_map
         
         # Hash with table alias symbol keys and true/false values, where true means the
         # association represented by the table alias uses an array of values instead of
@@ -3965,7 +4073,8 @@ module Sequel
         attr_reader :type_map
 
         # Initialize all of the data structures used during loading.
-        def initialize(dataset)
+        def initialize(dataset, identity_map=nil)
+          @identity_map = identity_map
           opts = dataset.opts
           eager_graph = opts[:eager_graph]
           @master =  eager_graph[:master]
@@ -4093,7 +4202,7 @@ module Sequel
               key = hkey(master_hfor(h))
             end
             unless primary_record = rm[key]
-              primary_record = rm[key] = rp.call(master_hfor(h))
+              primary_record = rm[key] = call_row_proc(rp, master_hfor(h))
               # Only add it to the list of records to return if it is a new record
               records.push(primary_record)
             end
@@ -4103,15 +4212,29 @@ module Sequel
       
           # Remove duplicate records from all associations if this graph could possibly be a cartesian product
           # Run after_load procs if there are any
-          post_process(records, dm) if @unique || !after_load_map.empty? || !limit_map.empty?
+          post_process(records, dm) if @unique || identity_map || !after_load_map.empty? || !limit_map.empty?
 
           records_map.each_value(&:freeze)
-          freeze
+          freeze unless identity_map
 
           records
         end
+
+        def with_identity_map(new_identity_map)
+          loader = dup
+          loader.send(:initialize_identity_map, new_identity_map)
+          loader
+        end
       
         private
+
+        def initialize_identity_map(new_identity_map)
+          @identity_map = new_identity_map
+        end
+
+        def call_row_proc(row_proc, values)
+          identity_map ? identity_map.call(row_proc, row_proc, values) : row_proc.call(values)
+        end
 
         # Recursive method that creates associated model objects and associates them to the current model object.
         def _load(dependency_map, current, h)
@@ -4134,12 +4257,12 @@ module Sequel
             # object if any are dependencies for multiple objects,
             # to prevent duplicate objects from showing up in the case
             # the normal duplicate removal code is not being used.
-            if !@unique && !deps.empty? && deps.any?{|dep_key,_| @ta_map[dep_key][2]}
+            if !identity_map && !@unique && !deps.empty? && deps.any?{|dep_key,_| @ta_map[dep_key][2]}
               key = [current.object_id, key]
             end
 
             unless rec = rm[key]
-              rec = rm[key] = rp.call(hfor(ta, h))
+              rec = rm[key] = call_row_proc(rp, hfor(ta, h))
             end
 
             if tm

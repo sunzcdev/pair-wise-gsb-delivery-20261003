@@ -127,6 +127,23 @@ Or with 2 separate +eager_graph+ queries:
   # LEFT OUTER JOIN lyrics AS lyric ON (lyric.id = tracks.lyric_id)
   # WHERE (tracks.album_id IN (...));
 
+=== Query-level identity map
+
+When mixing +eager+ and +eager_graph+, the same database record can appear at
+multiple association paths. By default each path has its own model object.
+Call +eager_identity_map+ to make all paths in a single query materialization
+share one object when they have the same model class and full primary key:
+
+  Album.eager_graph(:artist).
+    eager(:favorite_artist).
+    eager_identity_map.
+    all
+
+Records without a complete primary key are not merged. Later partial
+projections only add columns that are missing; they do not replace values that
+were already loaded. The identity map is query-scoped and is not retained after
++all+ returns.
+
 == Sequel::Model Association Loading Options
 
 There are a bunch of advanced association options that are available to
