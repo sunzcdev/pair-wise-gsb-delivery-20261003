@@ -122,6 +122,16 @@ tz.local_to_utc(Time.new(2018, 2, 1, 7, 30, 0, '+01:00'))
 # => 2018-02-01 12:30:00 UTC
 ```
 
+A half-open local time interval can be converted to the set of half-open UTC
+intervals that represent it with `local_to_utc_ranges`. The result may be
+empty during a forward transition and may contain more than one interval
+during a backward transition:
+
+```ruby
+tz.local_to_utc_ranges(Time.utc(2018, 3, 11, 0, 0, 0), Time.utc(2018, 3, 11, 5, 0, 0))
+# => [2018-03-11 05:00:00 UTC...2018-03-11 09:00:00 UTC]
+```
+
 Information about the time zone can be obtained from returned local times:
 
 ```ruby

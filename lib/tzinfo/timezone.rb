@@ -656,6 +656,100 @@ module TZInfo
       end
     end
 
+    # Converts a half-open local time interval to the set of half-open UTC
+    # intervals that represent it.
+    #
+    # The UTC offset of the `local_start` and `local_end` parameters is ignored
+    # (they are treated as times in the time zone represented by `self`). The
+    # interval starts at `local_start` (inclusive) and ends at `local_end`
+    # (exclusive).
+    #
+    # The result may contain:
+    #
+    # * one interval when local time in the zone observes a single offset;
+    # * no intervals when the supplied local interval only contains invalid
+    #   local times (for example, the hour skipped when daylight savings time
+    #   begins);
+    # * more than one interval when the supplied local interval contains
+    #   repeated local times (for example, the hour repeated when daylight
+    #   savings time ends).
+    #
+    # Adjacent UTC intervals are merged. Sub-second precision is preserved.
+    #
+    # A half-open `Range` may be passed instead of two separate arguments.
+    #
+    # @param local_start [Object] a `Time`, `DateTime` or {Timestamp}
+    #   specifying the inclusive local start of the interval.
+    # @param local_end [Object] a `Time`, `DateTime` or {Timestamp} specifying
+    #   the exclusive local end of the interval.
+    # @return [Array<Range>] the UTC intervals covered by the local interval,
+    #   ordered from earliest to latest. Each range is half-open and contains
+    #   objects of the same type as `local_start`.
+    # @raise [ArgumentError] if either local boundary is `nil`.
+    # @raise [ArgumentError] if the end is earlier than the start.
+    # @raise [ArgumentError] if a `Range` is supplied that is not half-open.
+    def local_to_utc_ranges(local_start, local_end = nil)
+      raise ArgumentError, 'local_start must be specified' unless local_start
+
+      if local_start.kind_of?(Range)
+        raise ArgumentError, 'local range must be half-open (use ... rather than ..)' unless local_start.exclude_end?
+        local_end = local_start.end
+        local_start = local_start.begin
+      end
+
+      raise ArgumentError, 'local_end must be specified' unless local_end
+
+      start_timestamp = Timestamp.for(local_start, :ignore)
+      end_timestamp = Timestamp.for(local_end, :ignore)
+
+      raise ArgumentError, 'local_end must be greater than or equal to local_start' if end_timestamp < start_timestamp
+      return [] if end_timestamp == start_timestamp
+
+      start_seconds = timestamp_seconds(start_timestamp)
+      end_seconds = timestamp_seconds(end_timestamp)
+
+      # Observed UTC offsets are limited to the range -86400...86400 seconds.
+      # Searching one day either side ensures that any transition whose local
+      # boundary can intersect the interval is included.
+      search_start = utc_timestamp_for_seconds(start_seconds - 86400)
+      search_end = utc_timestamp_for_seconds(end_seconds + 86400)
+      transitions = transitions_up_to(search_end, search_start)
+
+      periods = [period_for(search_start)]
+
+      transitions.each do |transition|
+        before = transition.at.add_and_set_utc_offset(-1, :utc)
+        periods << period_for(before)
+        periods << period_for(transition.at)
+      end
+
+      ranges = periods.uniq.map do |period|
+        offset = period.observed_utc_offset
+
+        period_start = period.start_transition && timestamp_seconds(period.start_transition.at) + offset
+        period_end = period.end_transition && timestamp_seconds(period.end_transition.at) + offset
+
+        intersection_start = period_start ? [start_seconds, period_start].max : start_seconds
+        intersection_end = period_end ? [end_seconds, period_end].min : end_seconds
+
+        next nil unless intersection_start < intersection_end
+
+        Range.new(
+          utc_timestamp_for_seconds(intersection_start - offset),
+          utc_timestamp_for_seconds(intersection_end - offset),
+          true
+        )
+      end.compact
+
+      merge_utc_ranges(ranges).map do |range|
+        Range.new(
+          convert_local_boundary_type(local_start, range.first),
+          convert_local_boundary_type(local_start, range.last),
+          true
+        )
+      end
+    end
+
     # Creates a `Time` object based on the given (Gregorian calendar) date and
     # time parameters. The parameters are interpreted as a local time in the
     # time zone. The result has the appropriate `utc_offset`, `zone` and
@@ -1155,6 +1249,48 @@ module TZInfo
     # @raise [UnknownTimezone] always.
     def raise_unknown_timezone
       raise UnknownTimezone, 'TZInfo::Timezone should not be constructed directly (use TZInfo::Timezone.get instead)'
+    end
+
+    # @param timestamp [Timestamp] a {Timestamp}.
+    # @return [Rational] the complete number of seconds represented by
+    #   `timestamp`, including the sub-second component.
+    def timestamp_seconds(timestamp)
+      Rational(timestamp.value) + timestamp.sub_second
+    end
+
+    # @param seconds [Rational] a number of seconds since the Unix epoch.
+    # @return [Timestamp] a UTC {Timestamp} representing `seconds`.
+    def utc_timestamp_for_seconds(seconds)
+      value = seconds.floor
+      sub_second = seconds - value
+      sub_second = 0 if sub_second == 0
+      Timestamp.utc(value, sub_second)
+    end
+
+    # Converts a UTC {Timestamp} back to the time representation used for the
+    # supplied local boundary.
+    #
+    # @param local_boundary [Object] the original local boundary.
+    # @param utc_timestamp [Timestamp] a UTC {Timestamp}.
+    # @return [Object] a UTC time of the same representation as
+    #   `local_boundary`.
+    def convert_local_boundary_type(local_boundary, utc_timestamp)
+      Timestamp.for(local_boundary, :ignore) { utc_timestamp }
+    end
+
+    # Merges ordered, half-open UTC ranges when they overlap or are adjacent.
+    #
+    # @param ranges [Array<Range>] half-open UTC ranges.
+    # @return [Array<Range>] the merged ranges.
+    def merge_utc_ranges(ranges)
+      ranges.sort_by(&:first).each_with_object([]) do |range, merged|
+        if merged.any? && merged.last.last >= range.first
+          previous = merged.pop
+          merged << Range.new(previous.first, [previous.last, range.last].max, true)
+        else
+          merged << range
+        end
+      end
     end
   end
 end
