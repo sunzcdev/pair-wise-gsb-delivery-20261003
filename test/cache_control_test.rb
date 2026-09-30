@@ -153,4 +153,24 @@ describe Rack::Cache::CacheControl do
     cache_control = Rack::Cache::CacheControl.new('max-age=600')
     refute cache_control.no_cache?
   end
+
+  it 'exposes stale-if-error grace seconds as an Integer' do
+    cache_control = Rack::Cache::CacheControl.new('max-age=100, stale-if-error=60')
+    cache_control.stale_if_error.must_equal 60
+  end
+
+  it 'returns nil for stale-if-error when the directive is absent' do
+    cache_control = Rack::Cache::CacheControl.new('max-age=100')
+    assert_nil cache_control.stale_if_error
+  end
+
+  it 'returns nil for a valueless stale-if-error directive' do
+    cache_control = Rack::Cache::CacheControl.new('stale-if-error')
+    assert_nil cache_control.stale_if_error
+  end
+
+  it 'returns nil for a non-positive stale-if-error value' do
+    cache_control = Rack::Cache::CacheControl.new('stale-if-error=0')
+    assert_nil cache_control.stale_if_error
+  end
 end

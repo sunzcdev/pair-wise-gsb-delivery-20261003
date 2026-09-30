@@ -125,7 +125,20 @@ module Rack::Cache
     # the TTL of the response should not be overriden to be greater than the
     # value provided by the origin.
     def must_revalidate?
-      cache_control.must_revalidate || cache_control.proxy_revalidate
+      cache_control.must_revalidate? || cache_control.proxy_revalidate?
+    end
+
+    # The number of seconds after the response becomes stale during which
+    # the stale response may be served when revalidation fails with an error
+    # (the cache-control/stale-if-error directive, RFC 5861). Returns nil
+    # when the response does not declare a grace window.
+    def stale_if_error
+      cache_control.stale_if_error
+    end
+
+    # Whether the response declares a stale-if-error grace window.
+    def stale_if_error?
+      !stale_if_error.nil?
     end
 
     # Mark the response stale by setting the Age header to be equal to the

@@ -1,3 +1,13 @@
+## Unreleased
+
+ * Add an independently enableable stale-if-error mode (RFC 5861): a stale
+   entry is served within the response-declared grace window only when
+   revalidation hits a configured transport exception or 5xx status. The
+   eligible exceptions and statuses are configurable. Past the window, on
+   must-revalidate/no-store entries, on client no-cache requests, or on
+   non-configured errors (e.g. programming bugs), the failure is propagated
+   as-is. The existing fault_tolerant mode is unchanged.
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

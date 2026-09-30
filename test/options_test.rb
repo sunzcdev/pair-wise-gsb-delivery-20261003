@@ -76,4 +76,19 @@ describe Rack::Cache::Options do
     assert @options.respond_to? :verbose?
     refute @options.verbose.nil?
   end
+
+  it 'disables stale-if-error mode by default' do
+    refute @options.stale_if_error
+  end
+
+  it 'defaults stale_if_error_exceptions to a list of transport errors' do
+    exceptions = @options.stale_if_error_exceptions
+    exceptions.must_include Timeout::Error
+    exceptions.must_include Errno::ECONNREFUSED
+    exceptions.wont_include RuntimeError
+  end
+
+  it 'defaults stale_if_error_statuses to the common 5xx faults' do
+    @options.stale_if_error_statuses.must_equal [500, 502, 503, 504]
+  end
 end

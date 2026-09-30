@@ -38,6 +38,37 @@ describe Rack::Cache::Response do
     end
   end
 
+  describe '#stale_if_error' do
+    it 'returns the declared grace seconds' do
+      @res.headers['cache-control'] = 'max-age=100, stale-if-error=60'
+      @res.stale_if_error.must_equal 60
+      assert @res.stale_if_error?
+    end
+
+    it 'returns nil when no grace window is declared' do
+      @res.headers['cache-control'] = 'max-age=100'
+      assert_nil @res.stale_if_error
+      refute @res.stale_if_error?
+    end
+  end
+
+  describe '#must_revalidate?' do
+    it 'is true with must-revalidate' do
+      @res.headers['cache-control'] = 'max-age=100, must-revalidate'
+      assert @res.must_revalidate?
+    end
+
+    it 'is true with proxy-revalidate' do
+      @res.headers['cache-control'] = 'max-age=100, proxy-revalidate'
+      assert @res.must_revalidate?
+    end
+
+    it 'is false without a revalidation directive' do
+      @res.headers['cache-control'] = 'max-age=100'
+      refute @res.must_revalidate?
+    end
+  end
+
   describe '#validateable?' do
     it 'is true when last-modified header present' do
       @res = Rack::Cache::Response.new(200, {'last-modified' => @one_hour_ago.httpdate}, [])

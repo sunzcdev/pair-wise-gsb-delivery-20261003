@@ -181,6 +181,18 @@ module Rack
         self['proxy-revalidate']
       end
 
+      # The number of seconds after the response becomes stale during which
+      # the cache may serve the stale entry when an error is encountered
+      # while revalidating with the origin (see RFC 5861). Returns nil when
+      # the directive is absent, has no value, or carries a non-numeric
+      # value.
+      def stale_if_error
+        value = self['stale-if-error']
+        return if value.nil? || value == true
+        seconds = value.to_i
+        seconds if seconds > 0 && /\A\s*\d+\s*\z/.match?(value)
+      end
+
       def to_s
         bools, vals = [], []
         each do |key,value|

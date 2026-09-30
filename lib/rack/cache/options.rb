@@ -1,5 +1,7 @@
 require 'rack/cache/key'
 require 'rack/cache/storage'
+require 'socket'
+require 'timeout'
 
 module Rack::Cache
 
@@ -111,6 +113,33 @@ module Rack::Cache
     # the attempt to revalidate the cache entry raises an exception.
     option_accessor :fault_tolerant
 
+    # Specifies whether RFC 5861 stale-if-error behavior is enabled. When
+    # true, a stale entry may be served only within the grace window (in
+    # seconds) declared by the response's cache-control stale-if-error
+    # directive and only when revalidation hits a configured fault: one of
+    # the exceptions in #stale_if_error_exceptions or one of the statuses
+    # in #stale_if_error_statuses. Outside the window, or for an
+    # unconfigured fault (e.g. an application programming error), the
+    # failure is propagated as-is. Unlike #fault_tolerant, this mode has a
+    # hard deadline and never swallows arbitrary exceptions.
+    option_accessor :stale_if_error
+
+    # Exception classes (or a Proc) that count as transport faults for the
+    # stale-if-error mode. When given a Proc, it is called with the
+    # exception and must return truthy for the fault to be eligible.
+    #
+    # Default: connection/timeout style errors raised by the transport;
+    # generic application errors such as RuntimeError are intentionally not
+    # included.
+    option_accessor :stale_if_error_exceptions
+
+    # Response status codes (or a Proc) that count as origin faults for the
+    # stale-if-error mode. When given a Proc, it is called with the status
+    # code and must return truthy for the status to be eligible.
+    #
+    # Default: 500, 502, 503, and 504.
+    option_accessor :stale_if_error_statuses
+
     # The underlying options Hash. During initialization (or outside of a
     # request), this is a default values Hash. During a request, this is the
     # Rack environment Hash. The default values Hash is merged in underneath
@@ -154,6 +183,20 @@ module Rack::Cache
         'rack-cache.allow_revalidate' => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
+        'rack-cache.stale_if_error'   => false,
+        'rack-cache.stale_if_error_exceptions' =>
+          [
+            Errno::ECONNREFUSED,
+            Errno::ECONNRESET,
+            Errno::EHOSTUNREACH,
+            Errno::ENETUNREACH,
+            Errno::ETIMEDOUT,
+            Errno::EPIPE,
+            IOError,
+            SocketError,
+            Timeout::Error,
+          ],
+        'rack-cache.stale_if_error_statuses' => [500, 502, 503, 504],
       }
       self.options = options
     end

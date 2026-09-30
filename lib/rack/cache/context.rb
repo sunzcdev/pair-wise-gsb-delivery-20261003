@@ -166,6 +166,10 @@ module Rack::Cache
     # to #validate the entry with the backend using conditional GET.
     # If validation raises an exception and fault tolerant caching is enabled,
     # serve the stale cache entry.
+    # When stale-if-error caching is enabled and the entry declares a
+    # stale-if-error grace window, the stale entry is served only for a
+    # configured transport exception or 5xx status occurring within that
+    # window; all other failures are propagated.
     # When no matching cache entry is found, trigger miss processing.
     def lookup
       if @request.no_cache? && allow_reload?
@@ -185,7 +189,9 @@ module Rack::Cache
             entry
           else
             record :stale
-            if fault_tolerant?
+            if stale_if_error? && entry.stale_if_error?
+              validate_with_stale_if_error(entry)
+            elsif fault_tolerant?
               validate_with_stale_cache_failover(entry)
             else
               validate(entry)
@@ -207,6 +213,71 @@ module Rack::Cache
       entry.headers['age'] = age
       record "Fail-over to stale cache data with age #{age} due to #{e.class.name}: #{e}"
       entry
+    end
+
+    # Serves the stale entry when revalidation hits a configured fault
+    # (a transport exception or a configured 5xx status) within the
+    # stale-if-error grace window declared by the entry. Any other failure
+    # and every failure past the window is propagated honestly.
+    def validate_with_stale_if_error(entry)
+      response = validate(entry)
+
+      if stale_if_error_status?(response.status) &&
+         stale_if_error_allowed?(entry)
+        response.body.close if response.body.respond_to?(:close)
+        serve_stale_if_error(entry, "status #{response.status}")
+      else
+        response
+      end
+    rescue => e
+      raise unless stale_if_error_exception?(e) && stale_if_error_allowed?(entry)
+      serve_stale_if_error(entry, "#{e.class.name}: #{e}")
+    end
+
+    # Whether the entry is still within its declared stale-if-error window
+    # and no directive forbids serving it without revalidation.
+    def stale_if_error_allowed?(entry)
+      grace = entry.stale_if_error
+      return false if grace.nil?
+      return false if entry.cache_control.no_store?
+      return false if entry.must_revalidate?
+      return false if @request.no_cache?
+      return false if @request.cache_control.max_age &&
+                      @request.cache_control.max_age < entry.age
+      entry.age < entry.max_age + grace
+    end
+
+    # Whether the exception is configured as an eligible transport fault.
+    # Only the configured exception classes match; arbitrary Ruby errors
+    # (e.g. RuntimeError / programming bugs) propagate.
+    def stale_if_error_exception?(exception)
+      configured = stale_if_error_exceptions
+      if configured.respond_to?(:call)
+        configured.call(exception)
+      else
+        Array(configured).any? { |klass| exception.is_a?(klass) }
+      end
+    end
+
+    # Whether the response status is configured as an eligible origin fault.
+    def stale_if_error_status?(status)
+      configured = stale_if_error_statuses
+      if configured.respond_to?(:call)
+        configured.call(status)
+      else
+        Array(configured).include?(status)
+      end
+    end
+
+    # Return a copy of the stale entry, marked with its current age and an
+    # RFC 7234 warning so the stale origin is visible to clients.
+    def serve_stale_if_error(entry, reason)
+      response = entry.dup
+      response.headers['age'] = entry.age.to_s
+      response.headers['warning'] = '110 - "Response is stale"'
+      record :stale_if_error
+      record "Served stale cache (age #{entry.age}) due to #{reason}"
+      response
     end
 
     # Validate that the cache entry is fresh. The original request is used

@@ -1030,4 +1030,267 @@ describe Rack::Cache::Context do
     assert response.ok?
     logger.logged_level.must_equal "info"
   end
+
+  describe 'stale-if-error' do
+    FRESHNESS = 100
+    GRACE = 60
+
+    # [clock offset, what the revalidation attempt does]
+    CLOCKS = {
+      'before expiry'    => FRESHNESS / 2,
+      'within grace'     => FRESHNESS + GRACE / 2,
+      'past the window'  => FRESHNESS + GRACE + 1,
+    }.freeze
+
+    FAULTS = {
+      'a connection failure' => :connection,
+      'a 500 status'         => 500,
+      'a program error'      => RuntimeError.new('boom'),
+    }.freeze
+
+    # Build an app that stores a 200 with a fixed Date, then reacts to the
+    # second request according to +fault+: raises a transport exception,
+    # answers with a status code, or raises a generic programming error.
+    def stale_if_error_app(fault, directives)
+      origin = Time.now
+      state = { calls: 0 }
+      @app = lambda do |env|
+        state[:calls] += 1
+        if state[:calls] == 2
+          case fault
+          when :connection
+            raise Errno::ECONNREFUSED, 'Connection refused'
+          when Integer
+            return [fault, { 'content-type' => 'text/plain' }, ['Origin Error']]
+          when Exception
+            raise fault
+          end
+        end
+        [200, {
+          'content-type'   => 'text/plain',
+          'date'           => origin.httpdate,
+          'cache-control'  => directives,
+          'etag'           => '"v1"',
+          'last-modified'  => origin.httpdate,
+        }, ['Hello World']]
+      end
+      [origin, state]
+    end
+
+    def enable_stale_if_error(extra = {})
+      { 'rack-cache.stale_if_error' => true }.merge(extra)
+    end
+
+    # Prime the cache at +origin+ and perform the second request with the
+    # clock advanced to +offset+ seconds. Returns the raised error (if any)
+    # together with the call counter.
+    def second_request_at(origin, state, offset)
+      get '/'
+      assert response.ok?
+      cache.trace.must_include :store
+
+      error = nil
+      Time.stub :now, origin + offset do
+        begin
+          get '/', enable_stale_if_error
+        rescue => e
+          error = e
+        end
+      end
+      [error, state[:calls]]
+    end
+
+    directives = "max-age=#{FRESHNESS}, stale-if-error=#{GRACE}"
+
+    CLOCKS.each do |clock_name, offset|
+      FAULTS.each do |fault_name, fault|
+        it "serves the right result #{clock_name} on #{fault_name} " +
+           'when stale-if-error is enabled' do
+          origin, state = stale_if_error_app(fault, directives)
+          error, calls = second_request_at(origin, state, offset)
+
+          case clock_name
+          when 'before expiry'
+            # Fresh entries are served without touching the origin, so the
+            # fault is never produced.
+            assert_nil error
+            calls.must_equal 1
+            assert response.ok?
+            response.body.must_equal 'Hello World'
+            cache.trace.must_include :fresh
+            cache.trace.wont_include :stale_if_error
+          when 'within grace'
+            case fault
+            when :connection, 500
+              assert_nil error
+              calls.must_equal 2
+              assert response.ok?
+              response.status.must_equal 200
+              response.body.must_equal 'Hello World'
+              cache.trace.must_include :stale_if_error
+              response.headers['warning'].must_include '110'
+            when Exception
+              error.must_be_instance_of RuntimeError
+              cache.trace.wont_include :stale_if_error
+            end
+          when 'past the window'
+            case fault
+            when :connection
+              error.must_be_kind_of SystemCallError
+              cache.trace.wont_include :stale_if_error
+            when 500
+              assert_nil error
+              response.status.must_equal 500
+              response.body.must_equal 'Origin Error'
+              cache.trace.wont_include :stale_if_error
+            when Exception
+              error.must_be_instance_of RuntimeError
+              cache.trace.wont_include :stale_if_error
+            end
+          end
+        end
+      end
+    end
+
+    it 'does not serve stale when the response declares no grace window' do
+      origin, state = stale_if_error_app(:connection, "max-age=#{FRESHNESS}")
+      error, = second_request_at(origin, state, FRESHNESS + 1)
+      error.must_be_kind_of SystemCallError
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'does not serve stale when stale-if-error mode is disabled' do
+      origin = Time.now
+      calls = 0
+      respond_with do |req, res|
+        calls += 1
+        raise Errno::ECONNREFUSED if calls == 2
+        res['date'] = origin.httpdate
+        res['cache-control'] = directives
+        res['etag'] = '"v1"'
+      end
+
+      get '/'
+      error = nil
+      Time.stub :now, origin + FRESHNESS + 1 do
+        begin
+          get '/'
+        rescue => e
+          error = e
+        end
+      end
+      error.must_be_kind_of SystemCallError
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'refuses stale-if-error downgrade on must-revalidate entries even ' +
+       'within the grace window' do
+      origin, state = stale_if_error_app(
+        :connection,
+        "max-age=#{FRESHNESS}, must-revalidate, stale-if-error=#{GRACE}"
+      )
+      error, = second_request_at(origin, state, FRESHNESS + 1)
+      error.must_be_kind_of SystemCallError
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'honors a request no-cache directive over stale-if-error' do
+      origin, calls = stale_if_error_app(:connection, directives)
+      get '/'
+      assert response.ok?
+
+      error = nil
+      Time.stub :now, origin + FRESHNESS + 1 do
+        begin
+          get '/', enable_stale_if_error('HTTP_CACHE_CONTROL' => 'no-cache')
+        rescue => e
+          error = e
+        end
+      end
+      error.must_be_kind_of SystemCallError
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'only downgrades exceptions configured as transport faults' do
+      origin, calls = stale_if_error_app(:connection, directives)
+      get '/'
+
+      error = nil
+      Time.stub :now, origin + FRESHNESS + 1 do
+        begin
+          get '/', enable_stale_if_error(
+            'rack-cache.stale_if_error_exceptions' => [Timeout::Error]
+          )
+        rescue => e
+          error = e
+        end
+      end
+      error.must_be_kind_of SystemCallError
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'accepts a proc for matching transport exceptions' do
+      origin, calls = stale_if_error_app(:connection, directives)
+      get '/'
+
+      Time.stub :now, origin + FRESHNESS + 1 do
+        get '/', enable_stale_if_error(
+          'rack-cache.stale_if_error_exceptions' =>
+            proc { |e| e.is_a?(SystemCallError) }
+        )
+      end
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale_if_error
+    end
+
+    it 'only downgrades configured fault statuses' do
+      origin, calls = stale_if_error_app(503, directives)
+      get '/'
+
+      Time.stub :now, origin + FRESHNESS + 1 do
+        get '/', enable_stale_if_error(
+          'rack-cache.stale_if_error_statuses' => [500, 502]
+        )
+      end
+      response.status.must_equal 503
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'accepts a proc for matching fault statuses' do
+      origin, calls = stale_if_error_app(503, directives)
+      get '/'
+
+      Time.stub :now, origin + FRESHNESS + 1 do
+        get '/', enable_stale_if_error(
+          'rack-cache.stale_if_error_statuses' =>
+            proc { |status| status >= 500 }
+        )
+      end
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale_if_error
+    end
+
+    it 'keeps fault_tolerant behavior independent of stale-if-error' do
+      origin = Time.now
+      calls = 0
+      respond_with do |req, res|
+        calls += 1
+        raise RuntimeError, 'still swallowed' if calls == 2
+        res['date'] = origin.httpdate
+        res['cache-control'] = directives
+        res['etag'] = '"v1"'
+      end
+
+      get '/'
+      Time.stub :now, origin + FRESHNESS + GRACE + 1000 do
+        get '/', 'rack-cache.fault_tolerant' => true
+      end
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :connnection_failed
+      cache.trace.wont_include :stale_if_error
+    end
+  end
 end
