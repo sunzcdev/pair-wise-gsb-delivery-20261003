@@ -137,6 +137,18 @@ RSpec.describe(Dry::Monads::Result) do
       end
     end
 
+    describe "#select" do
+      it "returns self without calling the factory" do
+        factory = -> { raise "must not be called" }
+
+        expect(subject.select(factory)).to be(subject)
+      end
+
+      it "never calls a block factory" do
+        expect(subject.select { raise "must not be called" }).to be(subject)
+      end
+    end
+
     describe "#or_fmap" do
       it "accepts value as an alternative" do
         expect(subject.or_fmap("baz")).to be(subject)
@@ -414,6 +426,42 @@ RSpec.describe(Dry::Monads::Result) do
         end
 
         expect(expr_result).to eql("baz")
+      end
+    end
+
+    describe "#select" do
+      it "calls the factory exactly once with the failure value" do
+        calls = 0
+        factory = lambda do |value|
+          calls += 1
+          failure[["handled", value]]
+        end
+
+        expect(subject.select(factory)).to eql(failure[["handled", "bar"]])
+        expect(calls).to be(1)
+      end
+
+      it "accepts a block factory" do
+        expect(subject.select { |value| success[value.upcase] }).to eql(success["BAR"])
+      end
+
+      it "keeps a failure returned by the factory" do
+        expect(subject.select { |value| failure[value] }).to eql(failure["bar"])
+      end
+
+      it "lets errors raised by the factory propagate" do
+        expect { subject.select { raise "boom" } }.to raise_error(RuntimeError, "boom")
+      end
+
+      it "raises a TypeError when the factory returns a non-Result" do
+        expect { subject.select { "not a result" } }.to raise_error(
+          TypeError, /expected a Result/
+        )
+      end
+
+      it "does not wrap the result again" do
+        continuation = success["baz"]
+        expect(subject.select { continuation }).to be(continuation)
       end
     end
 

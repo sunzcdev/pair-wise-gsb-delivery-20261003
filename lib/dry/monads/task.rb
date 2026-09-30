@@ -169,6 +169,47 @@ module Dry
         self.class.new(child)
       end
 
+      # Selectively continues the computation. The factory is invoked
+      # exactly once only when the underlying computation rejects, in which
+      # case it receives the reason and must return another Task. When the
+      # computation fulfils, the factory is never called so its branches stay
+      # uncreated and the fulfilled value passes through unchanged.
+      #
+      # Any error raised by the factory or a value that is not a Task makes
+      # the returned task reject with that error.
+      #
+      # @example
+      #   Task { raise :not_found }.select { |reason| Task { handle(reason) } }
+      #
+      # @param factory [#call] continuation factory
+      # @return [Task]
+      def select(factory = Undefined, &block)
+        continuation = Undefined.default(factory, block)
+
+        child = Promise.new(
+          parent: promise,
+          executor: Concurrent::ImmediateExecutor.new
+        )
+
+        promise.on_error do |reason|
+          begin
+            inner = continuation.(reason)
+
+            unless inner.is_a?(Task)
+              raise TypeError,
+                    "Cannot select #{inner.inspect}, expected a Task"
+            end
+
+            follow(inner, child)
+          rescue StandardError => exception
+            child.on_reject(exception)
+          end
+        end
+        promise.on_success { child.on_fulfill(_1) }
+
+        self.class.new(child)
+      end
+
       # Extracts the resulting value if the computation was successful
       # otherwise yields the block and returns its result.
       #
@@ -230,6 +271,19 @@ module Dry
       def discard = fmap { Unit }
 
       private
+
+      # Executes the inner task and forwards its outcome to the child promise.
+      #
+      # @param inner [Task]
+      # @param child [Promise]
+      # @return [void]
+      # @api private
+      def follow(inner, child)
+        promise = inner.promise
+        promise.execute
+        promise.on_success { child.on_fulfill(_1) }
+        promise.on_error { child.on_reject(_1) }
+      end
 
       # @api private
       def curry(value)

@@ -157,6 +157,70 @@ RSpec.describe(Dry::Monads::Task) do
     end
   end
 
+  describe "#select" do
+    let(:error) { StandardError.new("boom") }
+
+    it "passes the value through without calling the factory" do
+      calls = 0
+      selected = task.pure(1).select { calls += 1 }
+
+      expect(selected.wait.value!).to be(1)
+      expect(calls).to be(0)
+    end
+
+    it "calls the factory exactly once with the rejection reason" do
+      calls = 0
+      selected = task.failed(error).select do |reason|
+        calls += 1
+        task.pure(["handled", reason.message])
+      end
+
+      expect(selected.wait.value!).to eql(["handled", "boom"])
+      expect(calls).to be(1)
+    end
+
+    it "propagates a rejection of the continuation" do
+      selected = task.failed(error).select { task.failed(RuntimeError.new("inner")) }
+
+      expect { selected.wait.value! }.to raise_error(RuntimeError, "inner")
+    end
+
+    it "does not call the factory before the condition rejects" do
+      condition = Concurrent::Promise.new { raise error }
+      calls = 0
+      selected = described_class.new(condition).select do |reason|
+        calls += 1
+        task.pure(reason.message)
+      end
+
+      expect(calls).to be(0)
+      expect(selected).not_to be_complete
+
+      condition.execute
+
+      expect(selected.wait.value!).to eql("boom")
+      expect(calls).to be(1)
+    end
+
+    it "rejects when the factory raises" do
+      selected = task.failed(error).select { raise "kaboom" }
+
+      expect { selected.wait.value! }.to raise_error(RuntimeError, "kaboom")
+    end
+
+    it "rejects with a TypeError when the factory returns a non-Task" do
+      selected = task.failed(error).select { 42 }
+
+      expect { selected.wait.value! }.to raise_error(TypeError, /expected a Task/)
+    end
+
+    it "accepts a callable instead of a block" do
+      factory = ->(reason) { task.pure(reason.message) }
+
+      expect(task.failed(error).select(factory).wait.value!).to eql("boom")
+    end
+  end
+
   describe "#or_fmap" do
     it "runs a block on failure" do
       m = task { 1 / 0 }.or_fmap { :success }.to_result

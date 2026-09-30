@@ -85,6 +85,12 @@ module Dry
         # Returns true
         def success? = true
 
+        # Runs no continuation: the condition is already fulfilled.
+        # The given factory is never called so all of its branches stay uncreated.
+        #
+        # @return [Result::Success]
+        def select(_ = Undefined, &) = self
+
         # Does the same thing as #bind except it also wraps the value
         # in an instance of Result::Success monad. This allows for easier
         # chaining of calls.
@@ -186,6 +192,31 @@ module Dry
 
         # Returns false
         def success? = false
+
+        # Calls the continuation factory exactly once with the failure value
+        # and returns the result. The factory must return another Result,
+        # otherwise a TypeError is raised.
+        #
+        # Unlike {#or}, the continuation is created lazily so that calling
+        # the factory with a side-effect-free argument leaves all branches
+        # uncreated for a fulfilled condition, see {Success#select}.
+        #
+        # @example
+        #   Dry::Monads.Failure(:not_found).select { |reason| Failure(reason) }
+        #   # => Failure(:not_found)
+        #
+        # @param factory [#call] continuation factory
+        # @return [Result]
+        def select(factory = Undefined, &block)
+          continuation = Undefined.default(factory, block).(failure)
+
+          unless continuation.is_a?(Result)
+            raise TypeError,
+                  "Cannot select #{continuation.inspect}, expected a Result"
+          end
+
+          continuation
+        end
 
         # If a block is given passes internal value to it and returns the result,
         # otherwise simply returns the first argument.

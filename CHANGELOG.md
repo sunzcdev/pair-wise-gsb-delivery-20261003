@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Conditional effect composition with `Result#select` and `Task#select`. The continuation factory is called exactly once only when the condition needs to continue (`Failure`/rejected task); a fulfilled condition (`Success`/fulfilled task) passes its value through without calling the factory, so unselected branches are never created. A factory returning the wrong monad type raises `TypeError` (Result) or rejects the resulting task (Task).
+
 ### Changed
 
 ### Deprecated
