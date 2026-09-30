@@ -23,6 +23,7 @@ module Dry
         Array::Member => :visit_array_member,
         Lax => :visit_lax,
         Enum => :visit_enum,
+        Union => :visit_union,
         [Default, Default::Callable] => :visit_default,
         [
           Sum,
@@ -136,6 +137,16 @@ module Dry
               yield "Enum<#{type} mapping={#{mapping_str}}#{opts}>"
             end
           end
+        end
+      end
+
+      def visit_union(union)
+        mapping = union.mapping.map { |label, type|
+          visit(type) { |printed| "#{label.inspect} => #{printed}" }
+        }.join(", ")
+
+        visit_options(EMPTY_HASH, union.meta) do |opts|
+          yield "Union<#{union.tag.inspect} {#{mapping}}#{opts}>"
         end
       end
 

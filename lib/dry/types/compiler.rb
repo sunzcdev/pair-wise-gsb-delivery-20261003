@@ -109,6 +109,14 @@ module Dry
         Enum.new(visit(type), mapping: mapping)
       end
 
+      def visit_union(node)
+        tag, mapping, meta = node
+        mapping = mapping.each_with_object({}) do |(label, type_ast), branches|
+          branches[label] = visit(type_ast)
+        end
+        Union.new(mapping, tag: tag).meta(meta)
+      end
+
       def visit_map(node)
         key_type, value_type, meta = node
         registry["nominal.hash"].map(visit(key_type), visit(value_type)).meta(meta)

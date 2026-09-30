@@ -144,6 +144,14 @@ module Dry
           end
         end
 
+        # A tagged union is dispatched on a hash tag, hence its members are
+        # always hashes; the branch predicates are not expressed as a sum.
+        #
+        # @api private
+        def visit_union(_node)
+          HASH
+        end
+
         # @api private
         def visit_constrained(node)
           other, rules = node

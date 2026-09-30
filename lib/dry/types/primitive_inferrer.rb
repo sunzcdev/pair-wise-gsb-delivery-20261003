@@ -45,6 +45,13 @@ module Dry
         end
 
         # @api private
+        def visit_union(node)
+          _, mapping = node
+
+          mapping.map { |_, type| visit(type) }.flatten(1).uniq
+        end
+
+        # @api private
         def visit_constrained(node) = visit(node[0])
 
         # @api private

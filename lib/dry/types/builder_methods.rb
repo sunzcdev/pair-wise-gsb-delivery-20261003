@@ -118,6 +118,24 @@ module Dry
         Nominal(::Hash).map(key_type, value_type)
       end
 
+      # Build a tagged (discriminated) union type. The input is dispatched to
+      # exactly one branch based on the value of the +tag+ field.
+      #
+      # @example
+      #   Command = Types.Union(
+      #     :type,
+      #     "create" => Create,
+      #     "cancel" => Cancel
+      #   )
+      #
+      # @param [Symbol] tag Name of the field holding the discriminator value
+      # @param [Hash{Object => Dry::Types::Type}] mapping tag value to branch
+      #
+      # @return [Dry::Types::Union]
+      #
+      # @see Dry::Types::Union
+      def Union(tag, mapping) = Union.new(mapping, tag: tag)
+
       # Builds a constrained nominal type accepting any value that
       # responds to given methods
       #

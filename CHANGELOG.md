@@ -9,6 +9,19 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `Dry::Types::Union`, a tagged (discriminated) union type built with
+  `Types.Union(:tag, "a" => TypeA, "b" => TypeB)`. The input is dispatched to
+  exactly one branch based on the raw value of the tag field. A missing tag,
+  an unknown tag and a non-hash input raise the dedicated
+  `MissingUnionTagError`, `UnknownUnionTagError` and `InvalidUnionInputError`
+  errors. Once a branch is selected its coercion failure no longer falls
+  through to other branches and constructors/defaults of branches that were
+  not selected never run. Both symbol and string tag keys are accepted and
+  resolve to the same branch (symbol wins when both are present), with tag
+  reading always preceding branch key transformations. The type has a
+  `:union` AST node and round-trips through the compiler, including when
+  nested inside arrays and schemas.
+
 ### Changed
 
 ### Deprecated

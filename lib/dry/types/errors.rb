@@ -109,6 +109,66 @@ module Dry
       end
     end
 
+    # Base class for errors raised while reading the discriminator tag of a
+    # {Union} type. Subclasses are raised before any branch type is applied,
+    # so a tag error can always be told apart from a branch coercion error.
+    class UnionTagError < CoercionError
+      # @return [Symbol]
+      attr_reader :tag
+
+      # @param [Symbol] tag Name of the field used for dispatching
+      # @param [Object] input
+      # @param [String] message
+      def initialize(tag, input, message)
+        @tag = tag
+        super(message)
+      end
+    end
+
+    # Raised when the input is not a hash and thus cannot carry a tag
+    class InvalidUnionInputError < UnionTagError
+      # @param [Symbol] tag Name of the field used for dispatching
+      # @param [Object] input
+      def initialize(tag, input)
+        super(
+          tag,
+          input,
+          "#{input.inspect} (#{input.class}) cannot be dispatched by " \
+          "#{tag.inspect}: a Hash is required"
+        )
+      end
+    end
+
+    # Raised when neither the symbol nor the string version of the tag
+    # field is present in the input hash
+    class MissingUnionTagError < UnionTagError
+      # @param [Symbol] tag Name of the field used for dispatching
+      # @param [Object] input
+      def initialize(tag, input)
+        super(tag, input, "#{tag.inspect} is missing in #{input.inspect}")
+      end
+    end
+
+    # Raised when the tag value does not match any of the declared branches
+    class UnknownUnionTagError < UnionTagError
+      # @return [Object]
+      attr_reader :value
+
+      # @param [Symbol] tag Name of the field used for dispatching
+      # @param [Object] value Value found at the tag field
+      # @param [Object] input
+      # @param [Array<Object>] tags Known tag values
+      def initialize(tag, value, input, tags)
+        @value = value
+        super(
+          tag,
+          input,
+          "#{value.inspect} is not a known tag for #{tag.inspect}, " \
+          "expected one of #{tags.inspect}"
+        )
+      end
+    end
+
     class ConstraintError < CoercionError
       # @return [String, #to_s]
       attr_reader :result
