@@ -32,6 +32,10 @@ type defaultPolicy[V any] struct {
 	done     chan struct{}
 	isClosed bool
 	metrics  *Metrics
+	// keyHashID identifies the user-facing key hash function. It is embedded
+	// in exported admission snapshots and checked on restore so that counters
+	// keyed by hashed keys are never applied to a cache with a different hash.
+	keyHashID uint64
 }
 
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
@@ -209,6 +213,39 @@ func (p *defaultPolicy[V]) Clear() {
 	p.admit.clear()
 	p.evict.clear()
 	p.Unlock()
+}
+
+// ExportAdmissionPolicyState returns a serializable snapshot of only the
+// TinyLFU admission policy (frequency counters, count-min seeds, doorkeeper
+// bloom filter and reset bookkeeping). It does not export cache entries, key
+// costs, or capacity usage.
+//
+// The returned state is captured under the policy lock as a single coherent
+// copy, so its internal structures can never be torn even while other
+// goroutines update the counters. A concurrent increment may or may not be
+// reflected in the snapshot, and keys still waiting in the asynchronous get
+// buffers are not counted yet; call Cache.Wait() first to drain them if a
+// precise cut-over point is required.
+func (p *defaultPolicy[V]) ExportAdmissionPolicyState() *AdmissionPolicyState {
+	p.Lock()
+	defer p.Unlock()
+	return p.exportAdmissionLocked()
+}
+
+// RestoreAdmissionPolicyState replaces only the TinyLFU admission policy state
+// from a snapshot. It never creates cache entries and never changes the
+// sampled-LFU key costs or used cost.
+//
+// The snapshot is rejected (and the current policy left untouched) when its
+// version is unsupported, its KeyHashID differs from this cache's, or its
+// dimensions do not match this policy's NumCounters (there is no implicit
+// resampling). Ristretto does not resize or resample frequency counters, so a
+// snapshot must be restored into a cache configured with the same NumCounters
+// as the exporting cache.
+func (p *defaultPolicy[V]) RestoreAdmissionPolicyState(state *AdmissionPolicyState) error {
+	p.Lock()
+	defer p.Unlock()
+	return p.restoreAdmissionLocked(state)
 }
 
 func (p *defaultPolicy[V]) Close() {

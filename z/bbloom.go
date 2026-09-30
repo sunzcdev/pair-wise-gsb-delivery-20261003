@@ -23,6 +23,7 @@ package z
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
 	"unsafe"
@@ -138,6 +139,12 @@ func (bl *Bloom) TotalSize() int {
 	return len(bl.bitset)*8 + 5*8
 }
 
+// SizeExp returns the base-2 exponent of the bit set length.
+func (bl *Bloom) SizeExp() uint64 { return bl.sizeExp }
+
+// SetLocs returns the number of hash locations probed per key.
+func (bl *Bloom) SetLocs() uint64 { return bl.setLocs }
+
 // Size makes Bloom filter with as bitset of size sz.
 func (bl *Bloom) Size(sz uint64) {
 	bl.bitset = make([]uint64, sz>>6)
@@ -207,4 +214,65 @@ func (bl Bloom) JSONMarshal() []byte {
 		log.Fatal("json.Marshal failed: ", err)
 	}
 	return data
+}
+
+// BloomSnapshot is a self-contained, serializable copy of a Bloom filter. It
+// captures the bit set together with the geometry needed to interpret it
+// (SizeExp and SetLocs), so it can be restored in another process without
+// knowing the original construction parameters.
+type BloomSnapshot struct {
+	// Bits is the raw bit set, packed one bit per position (8 bits per byte).
+	Bits []byte
+	// SizeExp is the base-2 exponent of the bit set length: the filter indexes
+	// 1<<SizeExp bits.
+	SizeExp uint64
+	// SetLocs is the number of hash locations probed per key.
+	SetLocs uint64
+}
+
+// Snapshot returns a deep copy of the bloom filter's state. The returned
+// snapshot is safe to serialize and mutate independently of the filter.
+func (bl *Bloom) Snapshot() BloomSnapshot {
+	bits := make([]byte, len(bl.bitset)<<3)
+	if len(bl.bitset) > 0 {
+		for i := range bits {
+			bits[i] = *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(&bl.bitset[0])) +
+				uintptr(i)))
+		}
+	}
+	return BloomSnapshot{
+		Bits:    bits,
+		SizeExp: bl.sizeExp,
+		SetLocs: bl.setLocs,
+	}
+}
+
+// RestoreBloom builds a Bloom filter from a snapshot previously produced by
+// Snapshot. It returns an error if the snapshot geometry is invalid or
+// inconsistent with the captured bit set, instead of silently resizing.
+func RestoreBloom(snap BloomSnapshot) (*Bloom, error) {
+	if snap.SizeExp < 9 {
+		return nil, errors.New("bloom: size exponent too small")
+	}
+	if snap.SizeExp > 63 {
+		return nil, errors.New("bloom: size exponent too large")
+	}
+	if snap.SetLocs == 0 {
+		return nil, errors.New("bloom: number of hash locations must be positive")
+	}
+	if want := uint64(1) << (snap.SizeExp - 3); uint64(len(snap.Bits)) != want {
+		return nil, errors.New("bloom: bitset length does not match size exponent")
+	}
+	size := uint64(1) << snap.SizeExp
+	bl := &Bloom{
+		sizeExp: snap.SizeExp,
+		size:    size - 1,
+		setLocs: snap.SetLocs,
+		shift:   64 - snap.SizeExp,
+	}
+	bl.Size(size)
+	for i, b := range snap.Bits {
+		*(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(&bl.bitset[0])) + uintptr(i))) = b
+	}
+	return bl, nil
 }

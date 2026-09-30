@@ -76,6 +76,42 @@ func TestM_JSON(t *testing.T) {
 	require.Equal(t, shallBe, cnt2)
 }
 
+func TestBloomSnapshotRestore(t *testing.T) {
+	orig := NewBloomFilter(float64(n*10), float64(7))
+	keys := make(map[uint64]bool, 1024)
+	for i := 0; i < 1024; i++ {
+		h := uint64(i*2654435761) ^ uint64(i)
+		keys[h] = true
+		orig.Add(h)
+	}
+
+	snap := orig.Snapshot()
+	require.Equal(t, orig.SizeExp(), snap.SizeExp)
+	require.Equal(t, orig.SetLocs(), snap.SetLocs)
+
+	restored, err := RestoreBloom(snap)
+	require.NoError(t, err)
+
+	for h := range keys {
+		require.True(t, restored.Has(h), "restored filter lost key %d", h)
+	}
+
+	// Mutating the snapshot must not affect the restored filter.
+	snap.Bits[0] ^= 0xff
+	for h := range keys {
+		require.True(t, restored.Has(h))
+	}
+}
+
+func TestBloomRestoreRejects(t *testing.T) {
+	_, err := RestoreBloom(BloomSnapshot{Bits: make([]byte, 64), SizeExp: 8, SetLocs: 7})
+	require.Error(t, err)
+	_, err = RestoreBloom(BloomSnapshot{Bits: make([]byte, 128), SizeExp: 10, SetLocs: 0})
+	require.Error(t, err)
+	_, err = RestoreBloom(BloomSnapshot{Bits: make([]byte, 127), SizeExp: 10, SetLocs: 7})
+	require.Error(t, err)
+}
+
 func BenchmarkM_New(b *testing.B) {
 	for r := 0; r < b.N; r++ {
 		_ = NewBloomFilter(float64(n*10), float64(7))

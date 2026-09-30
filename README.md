@@ -93,6 +93,43 @@ func main() {
 }
 ```
 
+## Persisting the admission policy
+
+Cache values live in memory, but the TinyLFU admission policy's "heat" memory
+need not be lost on restart. `ExportAdmissionPolicyState` returns a
+self-describing, serializable snapshot of only the admission policy (the
+count-min sketch counters, its hash seeds, the bloom doorkeeper and reset
+bookkeeping). It never contains cache entries, keys or costs, and restoring it
+neither creates items nor changes cost accounting.
+
+```go
+state := cache.ExportAdmissionPolicyState()
+data, _ := json.Marshal(state) // or gob, msgpack, etc.
+
+// ... after restart, on a cache configured with the same NumCounters ...
+var restored ristretto.AdmissionPolicyState
+_ = json.Unmarshal(data, &restored)
+if err := newCache.RestoreAdmissionPolicyState(&restored); err != nil {
+    // unsupported version, mismatched size, or different hash identity
+}
+```
+
+The snapshot records everything needed to interpret the counts: a format
+`Version`, the sketch/doorkeeper dimensions (`NumCounters`, `ResetAt`, bloom
+geometry), the internal count-min `Seeds`, and a `KeyHashID` identifying the
+user-facing key-hash function. When you supply a custom `KeyToHash`, set a
+stable, distinct `Config.KeyHashID` on every process that exports or restores
+the state (the built-in integer hashing uses the zero ID). A snapshot whose
+version, size or hash identity does not match the receiving cache is rejected
+with an error and leaves its current state untouched; counters are never
+silently resampled or resized.
+
+The snapshot is a coherent point-in-time copy taken under the policy lock, so
+its structures are never torn. A counter update racing the export may or may
+not be included, and keys still buffered in the asynchronous Get pipeline are
+not counted yet; call `Wait()` before exporting if you need a precise cut-over
+point.
+
 ## Benchmarks
 
 The benchmarks can be found in

@@ -7,6 +7,16 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Added
+
+- Add `Cache.ExportAdmissionPolicyState()` and `Cache.RestoreAdmissionPolicyState()`
+  (and matching methods on the internal policy) to persist and restore only the
+  TinyLFU admission policy state across restarts. The self-describing snapshot
+  carries the format version, sketch/doorkeeper dimensions, count-min hash
+  seeds and an optional `Config.KeyHashID` so the counters can always be
+  interpreted correctly; it never contains cache entries or costs. Restores
+  with incompatible sizes/versions/hash identity are rejected.
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed

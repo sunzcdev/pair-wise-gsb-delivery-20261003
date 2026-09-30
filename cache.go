@@ -59,6 +59,9 @@ type Cache[K Key, V any] struct {
 	// Each key will be hashed using the provided function. If keyToHash value
 	// is not set, the default keyToHash function is used.
 	keyToHash func(K) (uint64, uint64)
+	// keyHashID is the identity tag of keyToHash, embedded in exported
+	// admission policy snapshots and verified on restore.
+	keyHashID uint64
 	// stop is used to stop the processItems goroutine.
 	stop chan struct{}
 	done chan struct{}
@@ -159,6 +162,23 @@ type Config[K Key, V any] struct {
 	// just return the first uint64 and return 0 for the second uint64.
 	KeyToHash func(key K) (uint64, uint64)
 
+	// KeyHashID is an application-defined identity tag for the KeyToHash
+	// function. It is recorded in the exported admission policy state and
+	// checked when that state is restored, guarding against replaying
+	// frequency counters that were computed with a different hash function.
+	//
+	// When KeyToHash is left unset (Ristretto's built-in hashing) the zero
+	// value is correct for the supported integer key types, whose hashes are
+	// the keys themselves and therefore stable across restarts. The built-in
+	// string/[]byte hashes are randomized per process, so for cross-process
+	// persistence of those key types supply a deterministic custom KeyToHash.
+	// If you provide a custom KeyToHash, assign a distinct, stable non-zero
+	// KeyHashID (and keep it identical on every process that exports or
+	// restores the admission state with that hash function). Restoring a
+	// snapshot with a different KeyHashID returns an error instead of
+	// attributing frequency counts to the wrong keys.
+	KeyHashID uint64
+
 	// Cost evaluates a value and outputs a corresponding cost. This function is ran
 	// after Set is called for a new item or an item is updated with a cost param of 0.
 	//
@@ -226,6 +246,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 		getBuf:             newRingBuffer(policy, config.BufferItems),
 		setBuf:             make(chan *Item[V], setBufSize),
 		keyToHash:          config.KeyToHash,
+		keyHashID:          config.KeyHashID,
 		stop:               make(chan struct{}),
 		done:               make(chan struct{}),
 		cost:               config.Cost,
@@ -253,6 +274,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	if cache.keyToHash == nil {
 		cache.keyToHash = z.KeyToHash[K]
 	}
+	cache.cachePolicy.keyHashID = config.KeyHashID
 
 	if config.Metrics {
 		cache.collectMetrics()
@@ -505,6 +527,49 @@ func (c *Cache[K, V]) RemainingCost() int64 {
 		return 0
 	}
 	return c.cachePolicy.Cap()
+}
+
+// ExportAdmissionPolicyState returns a serializable snapshot of only the
+// TinyLFU admission policy: the frequency counters, their hash seeds, the
+// doorkeeper bloom filter, reset bookkeeping and the hash identity. It never
+// exports cache entries, key costs, or capacity usage, so the snapshot cannot
+// be used to reconstruct (or alter) the cached data.
+//
+// This lets a restarted process retain the TinyLFU "heat" memory even though
+// the cache values themselves are cold. The snapshot is a coherent, deep
+// copy: it is taken under the policy lock, so it never contains torn internal
+// structures. A counter update racing the export may or may not be included,
+// and keys still queued in the asynchronous Get buffers are not counted yet;
+// call Wait() first to drain them if an exact cut-over point is needed.
+func (c *Cache[K, V]) ExportAdmissionPolicyState() *AdmissionPolicyState {
+	if c == nil || c.isClosed.Load() {
+		return nil
+	}
+	return c.cachePolicy.ExportAdmissionPolicyState()
+}
+
+// RestoreAdmissionPolicyState replaces only the TinyLFU admission policy state
+// from a snapshot produced by ExportAdmissionPolicyState. It never inserts
+// cache entries and never changes any key cost or the used cost, so admission
+// of subsequent requests behaves as if the frequency history had been
+// observed by this cache.
+//
+// The snapshot is rejected, with the current admission memory left untouched,
+// when:
+//   - its Version is unsupported by this build;
+//   - its KeyHashID differs from this cache's Config.KeyHashID;
+//   - its dimensions do not match this cache's NumCounters (the frequency
+//     sketch is never implicitly resampled, so export and restore must use the
+//     same NumCounters);
+//   - the state is otherwise malformed.
+func (c *Cache[K, V]) RestoreAdmissionPolicyState(state *AdmissionPolicyState) error {
+	if c == nil {
+		return errors.New("ristretto: nil cache")
+	}
+	if c.isClosed.Load() {
+		return errors.New("ristretto: cache is closed")
+	}
+	return c.cachePolicy.RestoreAdmissionPolicyState(state)
 }
 
 // processItems is ran by goroutines processing the Set buffer.
