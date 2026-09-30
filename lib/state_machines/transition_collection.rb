@@ -159,9 +159,12 @@ module StateMachines
     end
 
     # Transitions the current value of the object's states to those specified by
-    # each transition
+    # each transition.  Hierarchical exit callbacks run before the new state
+    # values are written, and hierarchical enter callbacks run immediately after.
     def persist
+      each(&:run_exit_callbacks)
       each(&:persist)
+      each(&:run_enter_callbacks)
     end
 
     # Runs the actions for each transition.  If a block is given method, then it

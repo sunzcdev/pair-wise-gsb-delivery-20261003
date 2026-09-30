@@ -126,6 +126,13 @@ module StateMachines
     # Finds and builds the next transition that can be performed on the given
     # object.  If no transitions can be made, then this will return nil.
     #
+    # Branches are matched against the object's current state first.  If no
+    # branch matches and the current state is part of a hierarchy, matching
+    # is retried against each ancestor state in turn (nearest parent first),
+    # so transitions defined on a parent state apply to all of its children.
+    # The resulting transition always starts from the object's actual (leaf)
+    # state.
+    #
     # Valid requirement options:
     # * <tt>:from</tt> - One or more states being transitioned from.  If none
     #   are specified, then this will be the object's current state.
@@ -139,20 +146,29 @@ module StateMachines
       StateMachines::OptionsValidator.assert_valid_keys!(requirements, :from, :to, :guard)
       requirements[:from] = machine.states.match!(object).name unless (custom_from_state = requirements.include?(:from))
 
-      branches.each do |branch|
-        next unless (match = branch.match(object, requirements, event_args))
+      # Try the current (leaf) state first, then fall back to each ancestor
+      from_state = machine.states[requirements[:from]]
+      from_candidates = from_state ? [from_state.name, *from_state.ancestors.map(&:name)] : [requirements[:from]]
 
-        # Branch allows for the transition to occur
-        from = requirements[:from]
-        to = if match[:to].is_a?(LoopbackMatcher)
-               from
-             else
-               values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
+      from_candidates.each do |from_candidate|
+        candidate_requirements = requirements.merge(from: from_candidate)
 
-               match[:to].filter(values).first
-             end
+        branches.each do |branch|
+          next unless (match = branch.match(object, candidate_requirements, event_args))
 
-        return Transition.new(object, machine, name, from, to, !custom_from_state)
+          # Branch allows for the transition to occur.  The transition always
+          # starts from the object's actual state, not the ancestor that matched.
+          from = requirements[:from]
+          to = if match[:to].is_a?(LoopbackMatcher)
+                 from
+               else
+                 values = requirements.include?(:to) ? [requirements[:to]].flatten : [from] | machine.states.map { |state| state.name }
+
+                 match[:to].filter(values).first
+               end
+
+          return Transition.new(object, machine, name, from, to, !custom_from_state)
+        end
       end
 
       # No transition matched

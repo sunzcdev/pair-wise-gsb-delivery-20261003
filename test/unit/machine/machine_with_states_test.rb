@@ -42,7 +42,7 @@ class MachineWithStatesTest < StateMachinesTest
 
   def test_should_raise_exception_if_invalid_option_specified
     exception = assert_raises(ArgumentError) { @machine.state(:first_gear, invalid: true) }
-    assert_equal 'Unknown key: :invalid. Valid keys are: :value, :cache, :if, :human_name', exception.message
+    assert_equal 'Unknown key: :invalid. Valid keys are: :value, :cache, :if, :human_name, :parent', exception.message
   end
 
   def test_should_raise_exception_if_conflicting_type_used_for_name

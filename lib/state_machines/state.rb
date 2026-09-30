@@ -36,6 +36,16 @@ module StateMachines
     attr_accessor :initial
     alias initial? initial
 
+    # The name of the parent state in the hierarchy, if any.  States without
+    # a parent are root states.
+    attr_reader :parent_name
+
+    # The callbacks to invoke when an object enters this state
+    attr_reader :enter_callbacks
+
+    # The callbacks to invoke when an object exits this state
+    attr_reader :exit_callbacks
+
     # A custom lambda block for determining whether a given value matches this
     # state
     attr_accessor :matcher
@@ -45,6 +55,8 @@ module StateMachines
     # Configuration options:
     # * <tt>:initial</tt> - Whether this state is the beginning state for the
     #   machine. Default is false.
+    # * <tt>:parent</tt> - The name of the parent state in the hierarchy.
+    #   Default is nil (a root state).
     # * <tt>:value</tt> - The value to store when an object transitions to this
     #   state.  Default is the name (stringified).
     # * <tt>:cache</tt> - If a dynamic value (via a lambda block) is being used,
@@ -53,20 +65,21 @@ module StateMachines
     #   (e.g. :value => lambda {Time.now}, :if => lambda {|state| !state.nil?}).
     #   By default, the configured value is matched.
     # * <tt>:human_name</tt> - The human-readable version of this state's name
-    def initialize(machine, name, options = nil, initial: false, value: :__not_provided__, cache: nil, if: nil, human_name: nil, **extra_options) # :nodoc:
+    def initialize(machine, name, options = nil, initial: false, value: :__not_provided__, cache: nil, if: nil, human_name: nil, parent: nil, **extra_options) # :nodoc:
       # Handle both old hash style and new kwargs style for backward compatibility
       case options
       in Hash
         # Old style: initialize(machine, name, {initial: true, value: 'foo'})
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :initial, :value, :cache, :if, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :initial, :value, :cache, :if, :human_name, :parent)
         initial = options.fetch(:initial, false)
         value = options.include?(:value) ? options[:value] : :__not_provided__
         cache = options[:cache]
         if_condition = options[:if]
         human_name = options[:human_name]
+        parent = options[:parent]
       in nil
         # New style: initialize(machine, name, initial: true, value: 'foo')
-        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :initial, :value, :cache, :if, :human_name) unless extra_options.empty?
+        StateMachines::OptionsValidator.assert_valid_keys!(extra_options, :initial, :value, :cache, :if, :human_name, :parent) unless extra_options.empty?
         if_condition = binding.local_variable_get(:if) # 'if' is a keyword, need special handling
       else
         # Handle unexpected options
@@ -81,6 +94,9 @@ module StateMachines
       @cache = cache
       @matcher = if_condition
       @initial = initial == true
+      @enter_callbacks = []
+      @exit_callbacks = []
+      self.parent_name = parent
       @context = StateContext.new(self)
 
       return unless name
@@ -107,6 +123,8 @@ module StateMachines
     # across different machines.
     def initialize_copy(orig) # :nodoc:
       super
+      @enter_callbacks = @enter_callbacks.dup
+      @exit_callbacks = @exit_callbacks.dup
       @context = StateContext.new(self)
     end
 
@@ -127,6 +145,76 @@ module StateMachines
           end
         end
       end
+    end
+
+    # Sets the parent state for this state within the machine's hierarchy.
+    # The parent is referenced by name and resolved lazily against the
+    # machine's known states, so it may be defined before or after this state.
+    def parent_name=(name)
+      raise ArgumentError, "State #{self.name.inspect} cannot be its own parent" if name && name == self.name
+
+      @parent_name = name
+    end
+
+    # The parent state of this state in the hierarchy, or nil if this is a
+    # root state.  The parent is looked up by name in the machine's states.
+    def parent
+      parent_name ? machine.states[parent_name] : nil
+    end
+
+    # Whether this state has no parent state
+    def root?
+      parent.nil?
+    end
+
+    # The states that declare this state as their parent
+    def children
+      machine.states.select { |state| state.parent_name == name }
+    end
+
+    # Whether this state has no child states.  Only leaf states are stored
+    # in the machine's attribute when an object transitions.
+    def leaf?
+      children.empty?
+    end
+
+    # The chain of ancestor states for this state, ordered from the nearest
+    # parent up to the root of the hierarchy.  Empty for root states.
+    def ancestors
+      visited = { name => true }
+      ancestors = []
+      current = self
+      while (current = current.parent)
+        raise ArgumentError, "Cyclic parent hierarchy detected for state #{name.inspect}" if visited[current.name]
+
+        visited[current.name] = true
+        ancestors << current
+      end
+      ancestors
+    end
+
+    # Registers a callback to invoke when an object enters this state.  The
+    # callback can be a method name on the object or a block that receives
+    # the object and the transition being performed.
+    #
+    # Enter callbacks run hierarchically: when transitioning into a nested
+    # state, the callbacks of each entered ancestor run first, from the
+    # outermost entered state down to this state.
+    def on_enter(method = nil, &block)
+      @enter_callbacks << (method || block)
+      self
+    end
+
+    # Registers a callback to invoke when an object exits this state.  The
+    # callback can be a method name on the object or a block that receives
+    # the object and the transition being performed.
+    #
+    # Exit callbacks run hierarchically: when transitioning out of a nested
+    # state, the callbacks of each exited state run first, from the current
+    # leaf state up to the outermost exited state.
+    def on_exit(method = nil, &block)
+      @exit_callbacks << (method || block)
+      self
     end
 
     # Transforms the state name into a more human-readable format, such as

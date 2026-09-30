@@ -317,6 +317,48 @@ class StarshipBridge
 end
 ```
 
+## Hierarchical States
+
+States can declare a parent state, letting child states share the behavior of
+their ancestors.  The hierarchy is a real parent/child relationship between
+state objects -- not a naming convention.
+
+```ruby
+class Order
+  state_machine initial: :pending do
+    state :processing
+    state :validating, parent: :processing
+    state :saving, parent: :processing
+
+    on_enter(:processing) { |order| order.start_processing }
+    on_exit(:processing)  { |order| order.finish_processing }
+
+    # Defined once on the parent; fires from :validating and :saving
+    event :cancel do
+      transition processing: :cancelled
+    end
+
+    event :advance do
+      transition validating: :saving
+    end
+  end
+end
+```
+
+When an event is fired, branches matching the current leaf state are
+considered first; if none match, each ancestor state is tried in turn.  The
+transition always starts from the object's actual leaf state.
+
+On a transition, exit callbacks run from the current leaf state up to (but
+not including) the nearest common ancestor of the from/to states, and enter
+callbacks run from just below that ancestor down to the target state.
+Common ancestors are never re-triggered, so moving between siblings (e.g.
+`:validating` to `:saving`) does not run the `:processing` callbacks.
+
+Only a single, definite state value -- the leaf state transitioned to -- is
+written to the attribute, so persistence is unchanged.  Flat state machines
+without parents behave exactly as before.
+
 ## Error Handling
 
 A state guard must be a non-empty Hash of state machine name => state name; anything else raises

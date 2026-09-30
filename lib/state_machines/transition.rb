@@ -122,6 +122,45 @@ module StateMachines
       from_name == to_name
     end
 
+    # The chain of states exited by this transition, ordered from the current
+    # leaf state up to (but not including) the nearest ancestor shared with
+    # the target state.  For flat state machines this is simply the from
+    # state; for loopbacks it is empty.
+    def exit_states
+      from_lineage = [@from_state, *@from_state.ancestors]
+      to_lineage = [@to_state, *@to_state.ancestors]
+      from_lineage - to_lineage
+    end
+
+    # The chain of states entered by this transition, ordered from just below
+    # the nearest ancestor shared with the source state down to the target
+    # leaf state.  For flat state machines this is simply the to state; for
+    # loopbacks it is empty.
+    def enter_states
+      from_lineage = [@from_state, *@from_state.ancestors]
+      to_lineage = [@to_state, *@to_state.ancestors]
+      (to_lineage - from_lineage).reverse
+    end
+
+    # Runs the exit callbacks of each state in #exit_states, from the current
+    # leaf state up to the outermost exited state.  States that are common
+    # ancestors of the from/to states are not exited and do not run.
+    def run_exit_callbacks
+      exit_states.each do |state|
+        state.exit_callbacks.each { |callback| run_state_callback(callback) }
+      end
+    end
+
+    # Runs the enter callbacks of each state in #enter_states, from the
+    # outermost entered state down to the target leaf state.  States that are
+    # common ancestors of the from/to states are not re-entered and do not
+    # run.
+    def run_enter_callbacks
+      enter_states.each do |state|
+        state.enter_callbacks.each { |callback| run_state_callback(callback) }
+      end
+    end
+
     # Is this transition existing for a short period only?  If this is set, it
     # indicates that the transition (or the event backing it) should not be
     # written to the object if it fails.
@@ -593,6 +632,12 @@ module StateMachines
     #   transition.context    # => {:on => :ignite, :from => :parked, :to => :idling}
     def context
       @context ||= { on: event, from: from_name, to: to_name }
+    end
+
+    # Invokes a single state enter/exit callback.  Blocks receive the object
+    # and this transition; symbols are invoked as methods on the object.
+    def run_state_callback(callback)
+      callback.is_a?(Proc) ? callback.call(object, self) : object.send(callback)
     end
   end
 end

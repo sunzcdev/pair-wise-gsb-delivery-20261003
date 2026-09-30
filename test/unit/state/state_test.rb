@@ -10,7 +10,7 @@ class StateTest < StateMachinesTest
 
   def test_should_raise_exception_if_invalid_option_specified
     exception = assert_raises(ArgumentError) { StateMachines::State.new(@machine, :parked, invalid: true) }
-    assert_equal 'Unknown key: :invalid. Valid keys are: :initial, :value, :cache, :if, :human_name', exception.message
+    assert_equal 'Unknown key: :invalid. Valid keys are: :initial, :value, :cache, :if, :human_name, :parent', exception.message
   end
 
   def test_should_allow_changing_machine

@@ -70,6 +70,12 @@ module StateMachines
       # Customizes the definition of one or more states in the machine.
       #
       # Configuration options:
+      # * <tt>:parent</tt> - The name of the parent state in the hierarchy.
+      #   Child states inherit the event transitions defined on their
+      #   ancestors: when an event is fired, branches matching the current
+      #   leaf state are considered first, then branches matching each
+      #   ancestor in turn.  Only the value of the state actually
+      #   transitioned to (typically a leaf) is written to the attribute.
       # * <tt>:value</tt> - The actual value to store when an object transitions
       #   to the state.  Default is the name (stringified).
       # * <tt>:cache</tt> - If a dynamic value (via a lambda block) is being used,
@@ -336,7 +342,7 @@ module StateMachines
       # options hash which contains at least <tt>:if</tt> condition support.
       def state(*names, &)
         options = names.last.is_a?(Hash) ? names.pop : {}
-        StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name)
+        StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name, :parent)
 
         # Store the context so that it can be used for / matched against any state
         # that gets added
@@ -351,8 +357,13 @@ module StateMachines
         else
           states = add_states(names)
 
+          # Ensure the parent state is tracked by the machine
+          add_states([options[:parent]]) if options.include?(:parent)
+
           # Update the configuration for the state(s)
           states.each do |state|
+            state.parent_name = options[:parent] if options.include?(:parent)
+
             if options.include?(:value)
               state.value = options[:value]
               self.states.update(state)
@@ -368,6 +379,54 @@ module StateMachines
       end
 
       alias other_states state
+
+      # Registers a callback to invoke when an object enters one of the given
+      # states.  Enter callbacks run hierarchically on transitions: only the
+      # states actually entered (those below the nearest common ancestor of
+      # the from/to states) run their callbacks, ordered from the outermost
+      # entered state down to the target state.
+      #
+      # For example,
+      #
+      #   class Order
+      #     state_machine initial: :pending do
+      #       state :processing
+      #       state :validating, parent: :processing
+      #
+      #       on_enter :processing do |order|
+      #         order.start_processing
+      #       end
+      #     end
+      #   end
+      def on_enter(*state_names, &block)
+        raise ArgumentError, 'on_enter requires a block' unless block
+
+        add_states(state_names).each { |state| state.on_enter(&block) }
+      end
+
+      # Registers a callback to invoke when an object exits one of the given
+      # states.  Exit callbacks run hierarchically on transitions: only the
+      # states actually exited (those below the nearest common ancestor of
+      # the from/to states) run their callbacks, ordered from the current
+      # leaf state up to the outermost exited state.
+      #
+      # For example,
+      #
+      #   class Order
+      #     state_machine initial: :pending do
+      #       state :processing
+      #       state :validating, parent: :processing
+      #
+      #       on_exit :processing do |order|
+      #         order.finish_processing
+      #       end
+      #     end
+      #   end
+      def on_exit(*state_names, &block)
+        raise ArgumentError, 'on_exit requires a block' unless block
+
+        add_states(state_names).each { |state| state.on_exit(&block) }
+      end
 
       # Gets the current value stored in the given object's attribute.
       def read(object, attribute, ivar = false)
