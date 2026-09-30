@@ -23,16 +23,24 @@ module Dry
       # @return [Mixed]
       #
       # @api public
-      def call(container, key)
-        item = container.fetch(key.to_s) do
-          if block_given?
-            return yield(key)
-          else
-            raise KeyError.new(%(key not found: "#{key}"), key: key.to_s, receiver: container)
-          end
-        end
+      def call(container, key, &block)
+        resolve(container, key, nil, &block)
+      end
 
-        item.call
+      # Resolve an item through an explicit scope
+      #
+      # @param [Concurrent::Hash] container
+      #   The container
+      # @param [Dry::Container::Scope] scope
+      #   The scope to resolve through
+      # @param [Mixed] key
+      #   The key for the item you wish to resolve
+      #
+      # @return [Mixed]
+      #
+      # @api public
+      def call_in_scope(container, scope, key, &block)
+        resolve(container, key, scope, &block)
       end
 
       # Check whether an items is registered under the given key
@@ -81,7 +89,66 @@ module Dry
       #       to iterate over not just the registered keys, but to see what was
       #       registered would be very helpful. This is a step toward doing that.
       def each(container, &block)
-        container.map { |key, value| [key, value.call] }.each(&block)
+        container.map { |key, _value| [key, call(container, key)] }.each(&block)
+      end
+
+      private
+
+      # @api private
+      def resolve(container, key, explicit_scope)
+        string_key = key.to_s
+
+        item = container.fetch(string_key) do
+          if block_given?
+            return yield(key)
+          else
+            raise KeyError.new(%(key not found: "#{key}"), key: string_key, receiver: container)
+          end
+        end
+
+        construct_item(container, item, string_key, explicit_scope)
+      end
+
+      # @api private
+      def construct_item(container, item, key, explicit_scope)
+        scope_stack = ScopeState.scope_stack(container)
+        ambient_scope = scope_stack.last
+        scope = explicit_scope || ambient_scope
+
+        if scope && !scope.active_for_container?(container)
+          raise ::Dry::Container::Error,
+                "scope belongs to a different container and cannot resolve #{key.inspect}"
+        end
+
+        if item.scope? && scope.nil?
+          raise ::Dry::Container::NoActiveScopeError,
+                %(cannot resolve scope-level item "#{key}" outside of an active scope)
+        end
+
+        frames = ScopeState.frames
+        frame = ScopeState::ResolutionFrame.new(
+          container: container,
+          key: key,
+          lifetime: item.lifetime,
+          scope: scope
+        )
+
+        if item.scope? && frames.any? { |active_frame| active_frame.lifetime == :application }
+          raise_captive_dependency(frames, frame)
+        end
+
+        ScopeState.construct(frame) { item.call }
+      end
+
+      # @api private
+      def raise_captive_dependency(frames, frame)
+        chain = frames.map(&:key).append(frame.key)
+
+        raise ::Dry::Container::CaptiveDependencyError,
+              "application-level item \"#{frames.first.key}\" captures scope-level " \
+              "dependency \"#{frame.key}\"; scope-level objects only live for one " \
+              "scope and must not be held as long-lived dependencies " \
+              "(construction chain: #{chain.join(" -> ")})"
       end
     end
   end

@@ -2,6 +2,9 @@
 
 require "concurrent/hash"
 
+require "dry/container/scope_state"
+require "dry/container/scope"
+
 module Dry
   class Container
     # @api public
@@ -173,6 +176,47 @@ module Dry
       # @api public
       def resolve(key, &block)
         config.resolver.call(_container, key, &block)
+      end
+
+      # Open a new scope, yield it, and close it when the block finishes.
+      #
+      # While the block is running the scope is the ambient scope on the
+      # current thread, so plain +#resolve+ calls return scope-level values.
+      # The scope is always closed, even if the block raises.
+      #
+      # @param [Mixed] name
+      #   Optional label for the scope (used in error messages)
+      #
+      # @yieldparam [Dry::Container::Scope] scope
+      #
+      # @return [Mixed] the block's result
+      #
+      # @api public
+      def with_scope(name = nil)
+        scope = enter_scope(name)
+
+        begin
+          yield scope
+        ensure
+          scope.close!
+        end
+      end
+
+      # Open a new scope without closing it automatically
+      #
+      # The caller is responsible for closing the returned scope with
+      # {Dry::Container::Scope#close!}.
+      #
+      # @param [Mixed] name
+      #   Optional label for the scope (used in error messages)
+      #
+      # @return [Dry::Container::Scope]
+      #
+      # @api public
+      def enter_scope(name = nil)
+        ::Dry::Container::Scope.new(self, name).tap do |scope|
+          ScopeState.scope_stack(_container).push(scope)
+        end
       end
 
       # Resolve an item from the container

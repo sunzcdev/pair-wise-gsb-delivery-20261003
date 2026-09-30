@@ -36,6 +36,28 @@ module Dry
         options[:call]
       end
 
+      # @return [Symbol] the lifetime of the item (+:application+, +:scope+
+      #   or +:resolution+)
+      #
+      # @api private
+      def lifetime
+        options.fetch(:lifetime, :resolution)
+      end
+
+      # Whether the resolved value is cached for the whole application
+      #
+      # @api private
+      def application?
+        lifetime == :application
+      end
+
+      # Whether the resolved value belongs to a scope
+      #
+      # @api private
+      def scope?
+        lifetime == :scope
+      end
+
       # Build a new item with transformation applied
       #
       # @private
