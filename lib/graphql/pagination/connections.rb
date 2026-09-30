@@ -133,6 +133,9 @@ module GraphQL
       def add_default
         add(Array, Pagination::ArrayConnection)
 
+        # Forward-only pagination over single-pass enumerators (e.g. streaming exports).
+        add(Enumerator, Pagination::EnumeratorConnection)
+
         if defined?(ActiveRecord::Relation)
           add(ActiveRecord::Relation, Pagination::ActiveRecordRelationConnection)
         end

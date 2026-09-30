@@ -49,6 +49,7 @@ The methods you must implement are:
 How to implement these methods (efficiently!) depends on your backend and how you communicate with it. For inspiration, you can see the built-in connections:
 
 - {{ "GraphQL::Pagination::ArrayConnection" | api_doc }}
+- {{ "GraphQL::Pagination::EnumeratorConnection" | api_doc }} — forward-only pagination over single-pass enumerables (it never converts the enumerator to an array)
 - {{ "GraphQL::Pagination::ActiveRecordRelationConnection" | api_doc }}
 - {{ "GraphQL::Pagination::SequelDatasetConnection" | api_doc }}
 - {{ "GraphQL::Pagination::MongoidRelationConnection" | api_doc }}
