@@ -2599,4 +2599,6 @@ module Addressable
 
     private_constant :NONE
   end
+
+  require "addressable/uri/mount_map"
 end
