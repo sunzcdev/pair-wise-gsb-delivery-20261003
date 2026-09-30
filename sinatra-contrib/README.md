@@ -51,6 +51,11 @@ Currently included:
 
 * [`sinatra/required_params`][sinatra-required-params]: Ensure if required query parameters exist
 
+* [`sinatra/param_sources`][sinatra-param-sources]: Keep route captures,
+  query string and request body parameters in separate source trees with
+  raw key paths, and declare which sources (plus cross-source conflict
+  policies) are allowed for specific parameters.
+
 ### Custom Extensions
 
 These extensions may add additional dependencies and enhance the behavior of the
@@ -169,6 +174,7 @@ For more info check the [official docs](http://www.sinatrarb.com/contrib/) and
 [sinatra-extension]: http://www.sinatrarb.com/contrib/extension
 [sinatra-test-helpers]: https://github.com/sinatra/sinatra/blob/main/sinatra-contrib/lib/sinatra/test_helpers.rb
 [sinatra-required-params]: http://www.sinatrarb.com/contrib/required_params
+[sinatra-param-sources]: http://www.sinatrarb.com/contrib/param_sources
 [sinatra-custom-logger]: http://www.sinatrarb.com/contrib/custom_logger
 [sinatra-multi-route]: http://www.sinatrarb.com/contrib/multi_route
 [sinatra-json]: http://www.sinatrarb.com/contrib/json
@@ -177,4 +183,3 @@ For more info check the [official docs](http://www.sinatrarb.com/contrib/) and
 [sinatra-link-header]: http://www.sinatrarb.com/contrib/link_header
 [sinatra-capture]: http://www.sinatrarb.com/contrib/capture
 [sinatra-engine-tracking]: https://github.com/sinatra/sinatra/blob/main/sinatra-contrib/lib/sinatra/engine_tracking.rb
-

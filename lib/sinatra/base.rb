@@ -719,6 +719,14 @@ module Sinatra
     ensure
       @params = original if original
     end
+
+    # Parameter source tracking hooks. They are no-ops by default and get
+    # overridden by Sinatra::ParamSources when the extension is registered.
+    def capture_param_sources!(_params); end
+    def reset_param_sources!; end
+    def enforce_param_sources!; end
+    def restore_param_sources!(_params); end
+    def stash_param_sources!(_params); end
   end
 
   # Template rendering methods. Each method takes the name of a template
@@ -1107,25 +1115,37 @@ module Sinatra
       force_encoding(params)
       @params = @params.merge(params) { |_k, v1, v2| v2 || v1 } if params.any?
 
+      source_params = params
+
       regexp_exists = pattern.is_a?(Mustermann::Regular) || (pattern.respond_to?(:patterns) && pattern.patterns.any? { |subpattern| subpattern.is_a?(Mustermann::Regular) })
       if regexp_exists
         captures           = pattern.match(route).captures.map { |c| URI_INSTANCE.unescape(c) if c }
         values            += captures
-        @params[:captures] = force_encoding(captures) unless captures.nil? || captures.empty?
+        unless captures.nil? || captures.empty?
+          @params[:captures] = force_encoding(captures)
+          source_params     = params.merge('captures' => captures)
+        end
       else
         values += params.values.flatten
       end
 
+      capture_param_sources!(source_params)
+
       catch(:pass) do
         conditions.each { |c| throw :pass if c.bind(self).call == false }
+        enforce_param_sources!
         block ? block[self, values] : yield(self, values)
       end
     rescue StandardError
       @env['sinatra.error.params'] = @params
+      stash_param_sources!(source_params) if params.any?
       raise
     ensure
       params ||= {}
-      params.each { |k, _| @params.delete(k) } unless @env['sinatra.error.params']
+      unless @env['sinatra.error.params']
+        params.each { |k, _| @params.delete(k) }
+        reset_param_sources!
+      end
     end
 
     # No matching route was found or all routes passed. The default
@@ -1208,9 +1228,12 @@ module Sinatra
     def handle_exception!(boom)
       error_params = @env['sinatra.error.params']
 
-      @params = @params.merge(error_params) if error_params
-
       @env['sinatra.error'] = boom
+
+      if error_params
+        @params = @params.merge(error_params)
+        restore_param_sources!(error_params)
+      end
 
       http_status = if boom.is_a? Sinatra::Error
                       if boom.respond_to? :http_status
@@ -2117,7 +2140,8 @@ module Sinatra
     delegate :get, :patch, :put, :post, :delete, :head, :options, :link, :unlink,
              :template, :layout, :before, :after, :error, :not_found, :configure,
              :set, :mime_type, :enable, :disable, :use, :development?, :test?,
-             :production?, :helpers, :settings, :register, :on_start, :on_stop
+             :production?, :helpers, :settings, :register, :on_start, :on_stop,
+             :param_source, :param_conflict_policy
 
     class << self
       attr_accessor :target
@@ -2171,3 +2195,5 @@ module Sinatra
     Delegator.target.use(*args, &block)
   end
 end
+
+require_relative 'param_sources'

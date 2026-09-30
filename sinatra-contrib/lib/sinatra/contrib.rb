@@ -12,6 +12,7 @@ module Sinatra
       register :ConfigFile, 'sinatra/config_file'
       register :MultiRoute, 'sinatra/multi_route'
       register :Namespace, 'sinatra/namespace'
+      register :ParamSources, 'sinatra/param_sources'
       register :RespondWith, 'sinatra/respond_with'
 
       helpers :Capture, 'sinatra/capture'
