@@ -70,6 +70,28 @@ File.open('/path/to/data.json', 'r', encoding:'UTF-8') do |file|
 end
 ```
 
+## Compile-time Type Checking
+
+When the rough shape of the input data is known, expressions can be checked against it before runtime. The checker infers the output type of a query and reports the function type errors it can *prove*; anything it cannot prove is left to the existing runtime checks.
+
+```ruby
+shape = JMESPath::Types.object(
+  'name'  => :string,
+  'email' => [:maybe, :string],        # optional field: string | null
+  'tags'  => [:string],                # array of strings
+  'score' => [:or, :number, :null],    # union
+)
+
+result = JMESPath.check_types('abs(email)', shape)
+result.ok?         #=> false
+result.errors.first.message
+#=> "function abs() expects argument 1 to be number, got string | null"
+result.errors.first.node    #=> "abs(email)"
+result.output_type          #=> number
+```
+
+Shapes support optional object keys (`'key?' => ...` or `[:maybe, t]`), array element types (`[t]`), null and unions (`[:or, a, b]`). Filter conditions such as ``[?score != `null`]`` narrow the element type for the rest of the projection. This is intentionally not a JSON Schema engine: undeclared things are `any` and never produce errors. See `examples/type_check_demo.rb` for a side-by-side comparison with actual runtime behavior.
+
 ## Links of Interest
 
 * [Release Notes](https://github.com/trevorrowe/jmespath.rb/releases)

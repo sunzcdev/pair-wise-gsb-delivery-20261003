@@ -1,6 +1,13 @@
 Unreleased Changes
 ------------------
 
+* Feature - Add `JMESPath.check_types` / `JMESPath.assert_types!`: compile
+  an expression against a lightweight input shape (`JMESPath::Types`) to
+  catch provable function type errors before runtime. Supports optional
+  object keys, array element types, null and union types, infers query
+  output types, and narrows types through filter conditions. Unprovable
+  cases still defer to the existing runtime checks.
+
 1.6.2 (2022-11-25)
 ------------------
 
