@@ -1392,3 +1392,285 @@ describe Addressable::Template::MatchData do
     end
   end
 end
+
+describe Addressable::Template::Binding do
+  let(:template) do
+    Addressable::Template.new("http://example.com/{one}/{two}/{three}")
+  end
+
+  describe Addressable::Template, "#bind" do
+    it "returns a Binding" do
+      expect(template.bind("one" => "1")).to be_a(
+        Addressable::Template::Binding
+      )
+    end
+
+    it "accepts symbol keys" do
+      binding = template.bind(:one => "1")
+      expect(binding.bound?(:one)).to eq(true)
+    end
+
+    it "does not modify the template" do
+      template.bind("one" => "1")
+      expect(template.pattern).to eq(
+        "http://example.com/{one}/{two}/{three}"
+      )
+    end
+  end
+
+  describe "#variables" do
+    it "lists the template variables in pattern order" do
+      expect(template.bind({}).variables).to eq(["one", "two", "three"])
+    end
+
+    it "is aliased as keys and names" do
+      binding = template.bind({})
+      expect(binding.keys).to eq(binding.variables)
+      expect(binding.names).to eq(binding.variables)
+    end
+  end
+
+  describe "#missing_variables" do
+    it "lists the variables that have not been bound" do
+      binding = template.bind("one" => "1")
+      expect(binding.missing_variables).to eq(["two", "three"])
+    end
+
+    it "treats an explicitly bound nil as present" do
+      binding = template.bind("one" => nil)
+      expect(binding.missing_variables).to eq(["two", "three"])
+    end
+  end
+
+  describe "#bound?" do
+    let(:binding) { template.bind("one" => "1") }
+
+    it "returns true for variables with a value" do
+      expect(binding.bound?("one")).to eq(true)
+    end
+
+    it "returns true when the value is nil" do
+      expect(template.bind("one" => nil).bound?("one")).to eq(true)
+    end
+
+    it "returns false for unbound variables" do
+      expect(binding.bound?("two")).to eq(false)
+    end
+
+    it "accepts symbol names" do
+      expect(binding.bound?(:one)).to eq(true)
+    end
+  end
+
+  describe "#complete?" do
+    it "is false while variables are missing" do
+      expect(template.bind("one" => "1").complete?).to eq(false)
+    end
+
+    it "is true once every variable has been bound" do
+      binding = template.bind("one" => "1").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.complete?).to eq(true)
+    end
+
+    it "is aliased as ready?" do
+      expect(template.bind({}).ready?).to eq(false)
+    end
+  end
+
+  describe "#mapping" do
+    it "returns the accumulated values" do
+      binding = template.bind("one" => "1").bind("two" => "2")
+      expect(binding.mapping).to eq("one" => "1", "two" => "2")
+    end
+
+    it "returns a frozen copy" do
+      binding = template.bind("one" => "1")
+      expect(binding.mapping).to be_frozen
+      expect { binding.mapping["two"] = "2" }.to raise_error(
+        FrozenError
+      )
+    end
+  end
+
+  describe "#bind" do
+    it "accumulates values across batches" do
+      binding = template.bind("one" => "1").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.mapping).to eq(
+        "one" => "1", "two" => "2", "three" => "3"
+      )
+    end
+
+    it "does not modify the receiver" do
+      binding = template.bind("one" => "1")
+      binding.bind("two" => "2")
+      expect(binding.bound?("two")).to eq(false)
+    end
+
+    it "rejects re-binding a variable to a different value" do
+      binding = template.bind("one" => "1")
+      expect { binding.bind("one" => "2") }.to raise_error(
+        Addressable::Template::InvalidTemplateValueError
+      )
+    end
+
+    it "leaves the receiver usable after a rejected re-binding" do
+      binding = template.bind("one" => "1")
+      begin
+        binding.bind("one" => "2")
+      rescue Addressable::Template::InvalidTemplateValueError
+      end
+      completed = binding.bind("two" => "2").bind("three" => "3")
+      expect(completed.expand.to_str).to eq(
+        "http://example.com/1/2/3"
+      )
+    end
+
+    it "allows re-binding to the same value" do
+      binding = template.bind("one" => "1").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.bind("one" => "1").expand.to_str).to eq(
+        "http://example.com/1/2/3"
+      )
+    end
+
+    it "rejects replacing a bound nil with another value" do
+      binding = template.bind("one" => nil)
+      expect { binding.bind("one" => "1") }.to raise_error(
+        Addressable::Template::InvalidTemplateValueError
+      )
+    end
+
+    it "leaves the original template free to bind another dataset" do
+      template.bind("one" => "1")
+      other = template.bind("one" => "a").
+        bind("two" => "b").
+        bind("three" => "c")
+      expect(other.expand.to_str).to eq(
+        "http://example.com/a/b/c"
+      )
+    end
+
+    it "ignores variables that are not used by the template" do
+      binding = template.bind("one" => "1", "unknown" => "x").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.expand.to_str).to eq(
+        "http://example.com/1/2/3"
+      )
+    end
+  end
+
+  describe "#expand" do
+    it "produces the same URI as a one-shot expand" do
+      binding = template.bind("one" => "1").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.expand).to be_a(Addressable::URI)
+      expect(binding.expand.to_str).to eq(
+        template.expand("one" => "1", "two" => "2", "three" => "3").to_str
+      )
+    end
+
+    it "is aliased as to_uri" do
+      binding = template.bind("one" => "1").
+        bind("two" => "2").
+        bind("three" => "3")
+      expect(binding.to_uri.to_str).to eq(binding.expand.to_str)
+    end
+
+    it "raises before all variables are bound" do
+      expect { template.bind("one" => "1").expand }.to raise_error(
+        Addressable::Template::InvalidTemplateValueError, /two/
+      )
+    end
+
+    it "forwards the processor and normalize_values options" do
+      processor = Object.new
+      def processor.validate(name, value)
+        value !~ /!/
+      end
+      binding = template.bind({"one" => "a!"}, processor, false).
+        bind("two" => "b").
+        bind("three" => "c")
+      expect { binding.expand }.to raise_error(
+        Addressable::Template::InvalidTemplateValueError
+      )
+    end
+  end
+
+  # The key guarantee of incremental binding: no matter the order in
+  # which a shared expression receives its variables, separators,
+  # leaders, positions and encodings must match a one-shot expand.
+  describe "byte-equivalence with one-shot expand" do
+    CASES = [
+      ["{x,y,z}",          { "x" => "a/b", "y" => ["p", "q"], "z" => nil }],
+      ["{+x,y,z}",         { "x" => "a/b?c", "y" => "d,e", "z" => "r@f" }],
+      ["{#x,y,z}",         {
+        "x" => "/a/b", "y" => ["m", "n"], "z" => "k l"
+      }],
+      ["{.x,y,z}",         {
+        "x" => "aa", "y" => ["bb", "cc"], "z" => nil
+      }],
+      ["{/x,y*,z}",        {
+        "x" => "a", "y" => ["b", "c"], "z" => "d"
+      }],
+      ["{;x,y,z}",         { "x" => "a", "y" => nil, "z" => "c" }],
+      ["{?x,y*,z}",        {
+        "x" => nil, "y" => ["1", "2"], "z" => "3"
+      }],
+      ["{&x,y,z*}",        {
+        "x" => "a", "y" => nil, "z" => { "k" => "v", "r" => "s" }
+      }],
+      ["search{?q,lang*}", {
+        "q" => "hello world", "lang" => ["en", "fr"]
+      }],
+      ["{+path,query*}",   {
+        "path" => "/foo/bar", "query" => { "a" => "1", "b" => "2" }
+      }],
+      ["{x:3,y*,z}",       {
+        "x" => "abcdef", "y" => ["u v", "w"], "z" => nil
+      }],
+      ["http://ex.com/{a}{+b}/", { "a" => "x", "b" => "/y/z" }]
+    ]
+
+    CASES.each do |pattern, mapping|
+      context pattern.inspect do
+        let(:expected) do
+          Addressable::Template.new(pattern).expand(mapping).to_str
+        end
+
+        it "matches when bound all at once" do
+          got = Addressable::Template.new(pattern).bind(mapping).expand
+          expect(got.to_str).to eq(expected)
+        end
+
+        mapping.keys.permutation.each do |order|
+          it "matches when bound in order #{order.inspect}" do
+            binding = Addressable::Template.new(pattern)
+            order.each do |key|
+              binding = binding.bind(key => mapping[key])
+            end
+            expect(binding.expand.to_str).to eq(expected)
+          end
+        end
+      end
+    end
+
+    it "keeps bound nil in its query position for every binding order" do
+      pattern = "http://example.com/{?one,two,three}/"
+      mapping = { "one" => nil, "two" => "2", "three" => nil }
+      expected = Addressable::Template.new(pattern).expand(mapping).to_str
+      expect(expected).to eq("http://example.com/?two=2/")
+      mapping.keys.permutation.each do |order|
+        binding = Addressable::Template.new(pattern)
+        order.each { |key| binding = binding.bind(key => mapping[key]) }
+        expect(binding.expand.to_str).to eq(expected)
+      end
+    end
+  end
+end

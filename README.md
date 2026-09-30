@@ -71,6 +71,14 @@ template = Addressable::Template.new("http://example.com/{?one,two,three}")
 template.partial_expand({"one" => "1", "three" => 3}).pattern
 #=> "http://example.com/?one=1{&two}&three=3"
 
+# Values may instead be supplied in batches; the final URI is identical to
+# a single expand call, regardless of the binding order.
+binding = template.bind({"one" => "1"})
+binding = binding.bind({"two" => "2"})
+binding = binding.bind({"three" => 3})
+binding.expand
+#=> #<Addressable::URI:0x... URI:http://example.com/?one=1&two=2&three=3>
+
 template = Addressable::Template.new(
   "http://{host}{/segments*}/{?one,two,bogus}{#fragment}"
 )

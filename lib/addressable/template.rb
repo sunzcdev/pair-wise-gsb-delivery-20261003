@@ -228,6 +228,145 @@ module Addressable
     end
 
     ##
+    # Represents a URI template in the process of having its variables
+    # bound. A Binding accumulates variable values across multiple batches
+    # without rewriting the template pattern, so operators and variable
+    # positions are evaluated only once, against the complete mapping.
+    #
+    # Binding objects are immutable: {#bind} always returns a new Binding
+    # rather than modifying the receiver.
+    #
+    # @see Addressable::Template#bind
+    class Binding
+      ##
+      # Creates a new Binding. Bindings should be created with
+      # {Addressable::Template#bind} rather than instantiated directly.
+      #
+      # @param [Addressable::Template] template
+      #   The template being bound.
+      # @param [Hash] mapping
+      #   The variable values supplied in this batch.
+      # @param [#validate, #transform] processor
+      #   An optional processor object, forwarded to the final expansion.
+      # @param [Boolean] normalize_values
+      #   Optional flag to enable/disable unicode normalization.
+      def initialize(template, mapping, processor=nil, normalize_values=true)
+        @template = template
+        @processor = processor
+        @normalize_values = normalize_values
+        @mapping = template.send(:normalize_keys, mapping)
+      end
+
+      ##
+      # @return [Addressable::Template] The template this binding is for.
+      attr_reader :template
+
+      ##
+      # @return [Hash]
+      #   A frozen copy of the values accumulated by this binding so far.
+      def mapping
+        @mapping.dup.freeze
+      end
+
+      ##
+      # @return [Array<String>]
+      #   The template's variables, in the order they appear in the pattern.
+      def variables
+        template.variables
+      end
+      alias_method :keys, :variables
+      alias_method :names, :variables
+
+      ##
+      # @return [Array<String>]
+      #   The template variables that have not yet been bound.
+      def missing_variables
+        template.variables.reject { |name| @mapping.key?(name) }
+      end
+
+      ##
+      # @param [String, Symbol] name The name of a template variable.
+      #
+      # @return [Boolean]
+      #   <tt>true</tt> if the variable has been given a value, including an
+      #   explicit <tt>nil</tt>; <tt>false</tt> otherwise.
+      def bound?(name)
+        name = name.to_str if name.respond_to?(:to_str)
+        name = name.to_s if name.is_a?(Symbol)
+        @mapping.key?(name)
+      end
+
+      ##
+      # @return [Boolean]
+      #   <tt>true</tt> when every template variable has been bound.
+      def complete?
+        missing_variables.empty?
+      end
+      alias_method :ready?, :complete?
+
+      ##
+      # Binds additional variables, returning a new Binding that retains
+      # both the previously bound values and the newly supplied ones.
+      #
+      # Supplying a different value for a variable that has already been
+      # bound raises an {InvalidTemplateValueError}; the receiver is left
+      # unchanged. Re-supplying the same value is permitted and has no
+      # effect.
+      #
+      # @param [Hash] mapping The variable values supplied in this batch.
+      #
+      # @return [Addressable::Template::Binding] A new, updated binding.
+      #
+      # @raise [InvalidTemplateValueError]
+      #   If a variable is re-bound to a different value.
+      def bind(mapping)
+        mapping = @template.send(:normalize_keys, mapping)
+        conflicts = mapping.select do |name, value|
+          @mapping.key?(name) && @mapping[name] != value
+        end
+        unless conflicts.empty?
+          name = conflicts.keys.first
+          raise InvalidTemplateValueError,
+            "Variable #{name.inspect} has already been bound to a " +
+            "different value."
+        end
+        self.class.new(
+          @template, @mapping.merge(mapping), @processor, @normalize_values
+        )
+      end
+
+      ##
+      # Expands the template using the accumulated values. All of the
+      # template's variables must have been bound first; the resulting URI
+      # is byte-identical to expanding the original template once with the
+      # complete mapping.
+      #
+      # @return [Addressable::URI] The expanded URI.
+      #
+      # @raise [InvalidTemplateValueError]
+      #   If one or more template variables have not been bound.
+      def expand
+        unless complete?
+          raise InvalidTemplateValueError,
+            "Cannot expand; missing variables: " +
+            "#{missing_variables.map(&:inspect).join(", ")}."
+        end
+        @template.expand(@mapping, @processor, @normalize_values)
+      end
+      alias_method :to_uri, :expand
+
+      ##
+      # @return [String] A description of the binding's current state.
+      def inspect
+        sprintf(
+          "#<%s:%#0x TEMPLATE:%s BOUND:%s MISSING:%s>",
+          self.class.to_s, self.object_id, self.template.pattern.inspect,
+          @mapping.keys.inspect, self.missing_variables.inspect
+        )
+      end
+    end
+
+    ##
     # Creates a new <tt>Addressable::Template</tt> object.
     #
     # @param [#to_str] pattern The URI Template pattern.
@@ -597,6 +736,48 @@ module Addressable
         transform_capture(mapping, capture, processor, normalize_values)
       end
       return Addressable::URI.parse(result)
+    end
+
+    ##
+    # Creates a stateful, partial binding of the URI template. Unlike
+    # {#partial_expand}, which returns a new, rewritten template pattern,
+    # the returned {Addressable::Template::Binding} object remembers which
+    # variables have already been supplied, and allows the remaining
+    # variables to be supplied in later batches. Once all of the template's
+    # variables have been bound, the URI may be produced with
+    # {Addressable::Template::Binding#expand}.
+    #
+    # The expansion is deferred until every variable is available, so the
+    # final result is byte-identical to calling {#expand} once with the
+    # complete mapping. In particular, splitting the variables across
+    # batches never changes the separators or positions used by query
+    # operators, list explosions, reserved character expansions, or
+    # variables explicitly bound to <tt>nil</tt>.
+    #
+    # Binding a variable that was already bound to a different value raises
+    # an {InvalidTemplateValueError}; the original Template, and any Binding
+    # derived from it, remain usable and may be bound with a different set
+    # of data.
+    #
+    # @param [Hash] mapping A partial mapping of template variables.
+    # @param [#validate, #transform] processor
+    #   An optional processor object, forwarded to the final expansion.
+    # @param [Boolean] normalize_values
+    #   Optional flag to enable/disable unicode normalization. Default: true
+    #
+    # @return [Addressable::Template::Binding] The new binding.
+    #
+    # @example
+    #   template = Addressable::Template.new(
+    #     "http://example.com/{?one,two,three}/"
+    #   )
+    #   binding = template.binding({"one" => "1"})
+    #   binding = binding.bind({"two" => "2"})
+    #   binding = binding.bind({"three" => "3"})
+    #   binding.expand.to_str
+    #   #=> "http://example.com/?one=1&two=2&three=3/"
+    def bind(mapping, processor=nil, normalize_values=true)
+      Binding.new(self, mapping, processor, normalize_values)
     end
 
     ##
