@@ -670,4 +670,379 @@ describe "hmac_paths plugin" do
     body('/namespace/2/widget/1').must_equal "/0e1e748860d4fd17fe9b7c8259b1e26996502c38e465f802c2c9a0a13000087c/n/widget/1"
     body('/all/widget/get/foo/bar/1/1').must_equal "/widget/c14c78a81d34d766cf334a3ddbb7a6b231bc2092ef50a77ded0028586027b14e/mpn/1?foo=bar"
   end
+
+  it "supports a two level authorization chain that narrows path, method, and expiry" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        root = hmac_authorize('/files', until: Time.utc(2100))
+        level1 = root.delegate('/files/a', method: :get, until: Time.utc(2099))
+        level2 = level1.delegate('/files/a/b', method: :get, until: Time.utc(2098))
+        level2.to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+    path.must_match %r"\A/hc1[A-Za-z0-9_\-=]*/files/a/b\z"
+    body(path).must_equal 'BUSINESS/a/b'
+
+    # A narrower leaf still allows paths below the leaf prefix.
+    parent = path.sub(%r"/files/a/b\z", '')
+    body("#{parent}/files/a/b/c.txt").must_equal 'BUSINESS/a/b/c.txt'
+  end
+
+  it "supports a root level authorization used directly" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        hmac_authorize('/files').to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+    body(path).must_equal 'BUSINESS'
+    body("#{path}/anything").must_equal 'BUSINESS/anything'
+  end
+
+  it "does not execute the business route when any parent record is modified" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        root = hmac_authorize('/files', until: Time.utc(2100))
+        level1 = root.delegate('/files/a', method: :get, until: Time.utc(2099))
+        level2 = level1.delegate('/files/a/b', method: :get, until: Time.utc(2098))
+        level2.to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+
+    # Tamper with the chain segment (changes the root record signature).
+    segment = path.split('/')[1]
+    tampered_segment = segment.dup
+    tampered_segment[8] = tampered_segment[8] == 'A' ? 'B' : 'A'
+    status(path.sub(segment, tampered_segment)).must_equal 404
+
+    # Truncating the chain (removing the leaf level) invalidates the signature.
+    # The chain cannot be cut to a shorter, more powerful prefix.
+    envelope = segment.sub(/\Ahc1/, '')
+    fields = Roda::RodaPlugins::HmacPaths.hmac_path_chain_unbase64(envelope).split("\x1e")
+    version, global_flags, _depth, signature, *records = fields
+    truncated_envelope = Roda::RodaPlugins::HmacPaths.hmac_path_chain_base64(
+      [version, global_flags, '2', signature, *records.first(2)].join("\x1e"))
+    status(path.sub(segment, "hc1#{truncated_envelope}")).must_equal 404
+  end
+
+  it "does not allow a sub-authorization to relax the parent expiry" do
+    hmac_paths_app do |r|
+      r.get 'bad' do
+        begin
+          root = hmac_authorize('/files', until: Time.utc(2099))
+          root.delegate('/files/a', until: Time.utc(2100))
+          'ALLOWED'
+        rescue Roda::RodaError
+          'REJECTED'
+        end
+      end
+    end
+
+    body('/bad').must_equal 'REJECTED'
+  end
+
+  it "does not accept an expired chain even when the leaf expiry was not narrowed" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        root = hmac_authorize('/files', until: Time.utc(2099))
+        level1 = root.delegate('/files/a', method: :get, until: Time.utc(2098))
+        level1.to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+    body(path).must_equal 'BUSINESS/a'
+
+    # A short lived chain is rejected after its expiry.
+    hmac_paths_app do |r|
+      r.get 'short' do
+        hmac_authorize('/files', seconds: 1).to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+    short_path = body('/short')
+    sleep 2
+    status(short_path).must_equal 404
+  end
+
+  it "does not allow a sub-authorization to remove the parent method restriction" do
+    hmac_paths_app do |r|
+      r.get 'bad' do
+        begin
+          root = hmac_authorize('/files', method: :get)
+          root.delegate('/files/a')
+          'ALLOWED'
+        rescue Roda::RodaError
+          'REJECTED'
+        end
+      end
+
+      r.get 'chain' do
+        root = hmac_authorize('/files', method: :get)
+        root.delegate('/files/a', method: :get).to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    body('/bad').must_equal 'REJECTED'
+    path = body('/chain')
+    body(path).must_equal 'BUSINESS/a'
+    status(path, 'REQUEST_METHOD' => 'POST').must_equal 404
+  end
+
+  it "does not execute the business route across a path prefix boundary" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        root = hmac_authorize('/files/a')
+        root.to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+
+    # Sibling directory and prefix lookalike are outside the boundary.
+    status("#{path}/../b").must_equal 404
+    status(path.sub(%r"/files/a\z", '/files/ab')).must_equal 404
+    status(path.sub(%r"/files/a\z", '/files/a/../b')).must_equal 404
+    status(path.sub(%r"/files/a\z", '/files/a/%2e%2e/b')).must_equal 404
+
+    # Encoded slash cannot widen the boundary, it is a single segment name.
+    status(path.sub(%r"/files/a\z", '/files/a%2f..%2fb')).must_equal 404
+
+    # The delegated subtree itself remains reachable.
+    body(path).must_equal 'BUSINESS/a'
+    body("#{path}/c").must_equal 'BUSINESS/a/c'
+  end
+
+  it "raises when to_path target is outside the authorized prefix" do
+    hmac_paths_app do |r|
+      root = hmac_authorize('/files/a')
+      root.to_path('/files/b')
+    end
+    proc{body}.must_raise Roda::RodaError
+  end
+
+  it "rejects malformed and non-canonical chain segments" do
+    hmac_paths_app do |r|
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    status('/hc1/files/a').must_equal 404
+    status('/hc1!!!/files/a').must_equal 404
+    status("/hc1#{'A' * 20}/files/a").must_equal 404
+  end
+
+  it "limits the maximum chain length at issue and verification time" do
+    hmac_paths_app do |r|
+      r.get 'deep' do
+        auth = hmac_authorize('/files')
+        begin
+          8.times do |i|
+            auth = auth.delegate("/files/#{i}")
+          end
+          'ALLOWED'
+        rescue Roda::RodaError
+          "REJECTED"
+        end
+      end
+    end
+    body('/deep').must_equal 'REJECTED'
+
+    # An oversized depth in the envelope is rejected before signature work.
+    hmac_paths_app do |r|
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+    record = Roda::RodaPlugins::HmacPaths.hmac_path_chain_base64(
+      Roda::RodaPlugins::HmacPaths.hmac_path_chain_record(1,
+        {prefix: '/files',
+         prefix_segments: Roda::RodaPlugins::HmacPaths.hmac_path_chain_segments('/files')}))
+    envelope = Roda::RodaPlugins::HmacPaths.hmac_path_chain_base64(
+      ["1", "", "99", "a" * 64, record].join("\x1e"))
+    status("/hc1#{envelope}/files").must_equal 404
+  end
+
+  it "supports a custom :max_chain_length plugin option" do
+    app(:bare) do
+      plugin :hmac_paths, secret: '1' * 32, max_chain_length: 2
+      route do |r|
+        r.get 'deep' do
+          auth = hmac_authorize('/files')
+          begin
+            2.times do |i|
+              auth = auth.delegate("/files/#{i}")
+            end
+            'ALLOWED'
+          rescue Roda::RodaError
+            "REJECTED#{auth.depth}"
+          end
+        end
+      end
+    end
+    body('/deep').must_equal 'REJECTED2'
+  end
+
+  it "requires :max_chain_length to be a positive integer" do
+    proc{app.plugin :hmac_paths, secret: '1' * 32, max_chain_length: 0}.must_raise Roda::RodaError
+    proc{app.plugin :hmac_paths, secret: '1' * 32, max_chain_length: '3'}.must_raise Roda::RodaError
+  end
+
+  it "preserves namespace isolation for authorization chains" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        ns = r.GET['ns']
+        root = hmac_authorize('/files', namespace: ns)
+        root.delegate('/files/a', namespace: ns, method: :get, params: {q: 1}).to_path
+      end
+
+      ns = r.GET['ns']
+      env['QUERY_STRING'] = env['QUERY_STRING'].to_s.sub(/(?:^|&)ns=\d+/, '').sub(/\A&/, '')
+      r.hmac_path(namespace: ns) do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path1 = body('/chain', 'QUERY_STRING' => 'ns=1')
+    path2 = body('/chain', 'QUERY_STRING' => 'ns=2')
+    body(path1, 'QUERY_STRING' => 'ns=1&q=1').must_equal 'BUSINESS/a'
+    body(path2, 'QUERY_STRING' => 'ns=2&q=1').must_equal 'BUSINESS/a'
+    status(path1, 'QUERY_STRING' => 'ns=2&q=1').must_equal 404
+    status(path2, 'QUERY_STRING' => 'ns=1&q=1').must_equal 404
+    status(path1, 'QUERY_STRING' => 'ns=1').must_equal 404
+    status(path1, 'QUERY_STRING' => 'ns=1&q=2').must_equal 404
+  end
+
+  it "does not allow a sub-authorization to change namespace" do
+    hmac_paths_app do |r|
+      begin
+        root = hmac_authorize('/files', namespace: '1')
+        root.delegate('/files/a', namespace: '2')
+        'ALLOWED'
+      rescue Roda::RodaError
+        'REJECTED'
+      end
+    end
+    body.must_equal 'REJECTED'
+  end
+
+  it "supports authorization chains below a non-root r.hmac_path" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        root = hmac_authorize('/a', root: '/widget')
+        root.delegate('/a/b', root: '/widget', method: :get).to_path
+      end
+
+      r.on 'widget' do
+        r.hmac_path do
+          r.remaining_path
+        end
+      end
+    end
+
+    path = body('/chain')
+    body(path).must_equal '/a/b'
+    status(path.sub('/widget/', '/gidget/')).must_equal 404
+  end
+
+  it "requires hmac_authorize path to be a string starting with /" do
+    hmac_paths_app{|r| hmac_authorize(1)}
+    proc{body}.must_raise Roda::RodaError
+    hmac_paths_app{|r| hmac_authorize('files')}
+    proc{body}.must_raise Roda::RodaError
+  end
+
+  it "requires hmac_authorize root to be empty or a string starting with /" do
+    hmac_paths_app{|r| hmac_authorize('/files', root: 1)}
+    proc{body}.must_raise Roda::RodaError
+    hmac_paths_app{|r| hmac_authorize('/files', root: 'widget')}
+    proc{body}.must_raise Roda::RodaError
+  end
+
+  it "does not allow a sub-authorization to change root" do
+    hmac_paths_app do |r|
+      begin
+        root = hmac_authorize('/a', root: '/widget')
+        root.delegate('/a/b', root: '/gidget')
+        'ALLOWED'
+      rescue Roda::RodaError
+        'REJECTED'
+      end
+    end
+    body.must_equal 'REJECTED'
+  end
+
+  it "handles secret rotation for authorization chains" do
+    hmac_paths_app do |r|
+      r.get 'chain' do
+        hmac_authorize('/files').to_path
+      end
+
+      r.hmac_path do
+        r.on 'files' do
+          "BUSINESS#{r.remaining_path}"
+        end
+      end
+    end
+
+    path = body('/chain')
+    body(path).must_equal 'BUSINESS'
+    app.plugin :hmac_paths, secret: '2' * 32
+    status(path).must_equal 404
+    app.plugin :hmac_paths, secret: '2' * 32, old_secret: '1' * 32
+    body(path).must_equal 'BUSINESS'
+  end
 end
