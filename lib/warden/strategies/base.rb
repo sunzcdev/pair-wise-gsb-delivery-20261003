@@ -46,6 +46,7 @@ module Warden
         @status, @headers = nil, {}
         @halted, @performed = false, false
         @result = nil
+        @challenges = []
       end
 
       # The method that is called from above. This method calls the underlying authenticate! method
@@ -175,6 +176,39 @@ module Warden
         halt!
         @custom_response = response
         @result = :custom
+      end
+
+      # Declare a structured authentication challenge for this strategy.
+      # When authentication fails, the failure handling collects the
+      # challenges declared by every strategy that ran for the scope and
+      # renders them together into a single WWW-Authenticate header, so a
+      # client can see every authentication option instead of only the
+      # headers of the last strategy that ran.
+      #
+      # Parameters:
+      #   scheme  - The authentication scheme, e.g. "Basic", "Bearer"
+      #   params  - A Hash of auth-param name/value pairs, e.g. :realm => "api"
+      #   token68 - A token68 credentials string (mutually exclusive with params)
+      #
+      # The data is validated immediately; an ArgumentError is raised for
+      # anything that cannot be represented as a well-formed challenge,
+      # before any response is generated.
+      #
+      # Example:
+      #   challenge!("Basic", :realm => "api")
+      #   challenge!("Bearer", {}, "some-token68")
+      #
+      # :api: public
+      def challenge!(scheme, params = {}, token68 = nil)
+        challenge = Warden::Challenge.new(scheme, params, token68)
+        @challenges << challenge
+        challenge
+      end
+
+      # The challenges declared by this strategy.
+      # :api: public
+      def challenges
+        @challenges.dup
       end
 
     end # Base

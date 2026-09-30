@@ -140,10 +140,39 @@ module Warden
         env["warden.options"] = options
 
         _run_callbacks(:before_failure, env, options)
-        config.failure_app.call(env).to_a
+        response = config.failure_app.call(env).to_a
+        append_authentication_challenges(env, response, options)
       else
         raise "No Failure App provided"
       end
     end # call_failure_app
+
+    # Builds a WWW-Authenticate header from the challenges declared by the
+    # strategies that ran for the failed scope, and appends it to the
+    # failure response. The original response is preserved unless every
+    # one of the following rules holds:
+    #
+    # * the failure response has a 401 status
+    # * the failure app did not set its own WWW-Authenticate header
+    # * authentication did not succeed (e.g. :warden thrown after a success)
+    # * at least one strategy declared a challenge for the scope
+    #
+    # :api: private
+    def append_authentication_challenges(env, response, options)
+      status, headers, _body = response
+      return response unless status.to_i == 401
+      return response if headers.keys.any? { |k| k.to_s.downcase == 'www-authenticate' }
+
+      proxy = env['warden']
+      return response if proxy.nil?
+      return response if proxy.winning_strategy && proxy.winning_strategy.successful?
+
+      scope = options[:scope] || config.default_scope
+      challenges = proxy.challenges(scope)
+      return response if challenges.empty?
+
+      headers['WWW-Authenticate'] = challenges.map(&:to_s).join(', ')
+      response
+    end
   end
 end # Warden

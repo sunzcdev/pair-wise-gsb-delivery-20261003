@@ -309,6 +309,20 @@ module Warden
       end
     end
 
+    # Returns the authentication challenges declared by the strategies that
+    # have already run for the given scope. Collecting challenges never
+    # runs any strategy (it does not attempt to log in) and never mixes in
+    # challenges declared for other scopes.
+    #
+    # Parameters:
+    #   scope - the scope to collect challenges for. Defaults to default_scope
+    #
+    # :api: public
+    def challenges(scope = @config.default_scope)
+      return [] unless @strategies.key?(scope)
+      @strategies[scope].values.flat_map(&:challenges)
+    end
+
     # Check to see if this is an asset request
     # :api: public
     def asset_request?
