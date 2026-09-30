@@ -355,6 +355,29 @@ module Addressable
     end
 
     ##
+    # Constructs a `mailto` URI from structured components, following
+    # <a href="https://www.rfc-editor.org/rfc/rfc6068">RFC 6068</a>.
+    #
+    # @option [String, Array<String>] to
+    #   One or more recipient addresses. Recipient order is preserved.
+    # @option [Array<Array(String, String)>, Hash] headers
+    #   Header field name/value pairs. An array of pairs preserves order
+    #   and repeated field names.
+    #
+    # @return [Addressable::URI] The constructed `mailto` URI.
+    #
+    # @example
+    #   Addressable::URI.mailto(
+    #     :to => ["user+tag@example.com", "other@example.com"],
+    #     :headers => [["subject", "Hello"]]
+    #   ).to_s
+    #   #=> "mailto:user+tag@example.com,other@example.com?subject=Hello"
+    def self.mailto(options = {})
+      require "addressable/mailto" unless defined?(::Addressable::Mailto)
+      ::Addressable::Mailto.new(options).to_uri
+    end
+
+    ##
     # Tables used to optimize encoding operations in `self.encode_component`
     # and `self.normalize_component`
     SEQUENCE_ENCODING_TABLE = (0..255).map do |byte|
@@ -1764,6 +1787,29 @@ module Addressable
         end
       end
       self.query = buffer.chop
+    end
+
+    ##
+    # Returns a structured view of a `mailto` URI, following
+    # <a href="https://www.rfc-editor.org/rfc/rfc6068">RFC 6068</a>.
+    #
+    # Recipient order and repeated header fields are preserved, `+`
+    # characters are left untouched, and percent-encoded commas do not
+    # delimit a second recipient.
+    #
+    # @return [Addressable::Mailto] The structured `mailto` view.
+    #
+    # @example
+    #   uri = Addressable::URI.parse(
+    #     "mailto:a@example.com,b@example.com?subject=Hello&body=Hi%0D%0AThere"
+    #   )
+    #   uri.mailto.to
+    #   #=> ["a@example.com", "b@example.com"]
+    #   uri.mailto.body
+    #   #=> "Hi\r\nThere"
+    def mailto
+      require "addressable/mailto" unless defined?(::Addressable::Mailto)
+      ::Addressable::Mailto.parse(self)
     end
 
     ##
