@@ -492,7 +492,8 @@ RSpec.describe Warden::Proxy do
     end
 
     it "should cache unfound user" do
-      expect_any_instance_of(Warden::SessionSerializer).to receive(:fetch).once
+      missing = Warden::SessionRestoreResult.new(:missing)
+      expect_any_instance_of(Warden::SessionSerializer).to receive(:restore).once.and_return(missing)
       app = lambda do |env|
         expect(env['warden'].user).to be_nil
         expect(env['warden'].user).to be_nil
@@ -516,7 +517,8 @@ RSpec.describe Warden::Proxy do
       end
 
       it "should cache found user" do
-        expect_any_instance_of(Warden::SessionSerializer).to receive(:fetch).once.and_return "A Previous User"
+        found = Warden::SessionRestoreResult.new(:restored, :user => "A Previous User")
+        expect_any_instance_of(Warden::SessionSerializer).to receive(:restore).once.and_return(found)
         app = lambda do |env|
           expect(env['warden'].user).to eq("A Previous User")
           expect(env['warden'].user).to eq("A Previous User")
@@ -561,6 +563,182 @@ RSpec.describe Warden::Proxy do
           end
           setup_rack(app).call(@env)
         end
+      end
+    end
+
+    describe "identity store availability" do
+      # A fake identity store with two phases. Keys map to users while the
+      # store is up; while +down?+ is true every lookup raises
+      # IdentityStoreUnavailable, simulating a transient outage without
+      # deleting any identity.
+      let(:store) do
+        Class.new do
+          attr_accessor :down, :users, :lookups
+          def initialize
+            @down = false
+            @users = { "alice" => "ALICE USER" }
+            @lookups = 0
+          end
+
+          def find(key)
+            @lookups += 1
+            raise Warden::IdentityStoreUnavailable.new("store down", :key => key) if @down
+            @users[key]
+          end
+        end.new
+      end
+
+      def build_app
+        fake = store
+        setup_rack(lambda do |env|
+          if env['warden'].user
+            [200, {"Content-Type" => "text/plain"}, ["OK"]]
+          else
+            [401, {"Content-Type" => "text/plain"}, ["You Fail"]]
+          end
+        end, :configurator => proc do
+          Warden::Manager.serialize_from_session { |key| fake.find(key) }
+        end)
+      end
+
+      after(:each) do
+        Warden::Manager.serialize_from_session { |k| k }
+      end
+
+      def logged_in_session(app)
+        env = env_with_params("/")
+        env['rack.session'] = { "warden.user.default.key" => "alice" }
+        app.call(env)
+        env
+      end
+
+      it "keeps the session and reports the outage when the store is temporarily unavailable" do
+        app = build_app
+        store.down = true
+        env = logged_in_session(app)
+
+        expect(env['rack.session']['warden.user.default.key']).to eq("alice")
+        expect(env['warden']).to be_session_unavailable
+        expect(env['warden'].session_restore_result).to be_unavailable
+      end
+
+      it "lets the preserved session keep working once the store recovers on a later request" do
+        app = build_app
+
+        # Phase 1: the store is down. The user is not available, but the
+        # session value survives.
+        store.down = true
+        env = logged_in_session(app)
+        expect(env['warden']).to be_session_unavailable
+
+        # Phase 2: the store recovers and a fresh request restores the user
+        # from the untouched session.
+        store.down = false
+        next_env = env_with_params("/")
+        next_env['rack.session'] = env['rack.session']
+        status, _headers, _body = app.call(next_env)
+        expect(status).to eq(200)
+        expect(next_env['warden'].user).to eq("ALICE USER")
+      end
+
+      it "does not fall back to other strategies while the store is unavailable" do
+        fake = store
+        app = setup_rack(lambda do |env|
+          env['warden'].authenticate(:pass)
+          valid_response
+        end, :default_strategies => [:pass], :configurator => proc do
+          Warden::Manager.serialize_from_session { |key| fake.find(key) }
+        end)
+
+        store.down = true
+        env = env_with_params("/")
+        env['rack.session'] = { "warden.user.default.key" => "alice" }
+        env['warden.spec.strategies'] = []
+        app.call(env)
+
+        expect(env['warden.spec.strategies']).not_to include(:pass)
+        expect(env['warden'].user).to be_nil
+        expect(env['warden']).to be_session_unavailable
+      end
+
+      it "can explicitly re-restore within the same request after the store recovers" do
+        app = build_app
+        store.down = true
+        env = logged_in_session(app)
+        expect(env['warden'].user).to be_nil
+
+        store.down = false
+        result = env['warden'].user(:restore => true)
+        expect(result).to eq("ALICE USER")
+        expect(env['warden'].user).to eq("ALICE USER")
+      end
+
+      it "reuses the cached unavailable result until an explicit restore is requested" do
+        app = build_app
+        store.down = true
+        env = logged_in_session(app)
+        expect(store.lookups).to eq(1)
+        env['warden'].user
+        env['warden'].user
+        expect(store.lookups).to eq(1)
+
+        env['warden'].restore_session!
+        expect(store.lookups).to eq(2)
+      end
+
+      it "does not fire after_failed_fetch during an outage" do
+        fired = false
+        Warden::Manager.after_failed_fetch { fired = true }
+        app = build_app
+        store.down = true
+        logged_in_session(app)
+        expect(fired).to eq(false)
+      ensure
+        Warden::Manager._after_failed_fetch.pop
+      end
+
+      it "deletes the session and does not ressurect a genuinely deleted identity on retry" do
+        app = build_app
+
+        # The identity really disappears: the store returns nil and the
+        # session key is removed.
+        store.users.delete("alice")
+        env = env_with_params("/")
+        env['rack.session'] = { "warden.user.default.key" => "alice" }
+        status, _headers, _body = app.call(env)
+        expect(status).to eq(401)
+        expect(env['rack.session']).not_to have_key("warden.user.default.key")
+        expect(env['warden']).not_to be_session_unavailable
+        expect(env['warden'].session_restore_result).to be_missing
+
+        # Even if a same-named record reappears in the store later, there is
+        # no preserved session key for the retry mechanism to bring back.
+        store.users["alice"] = "ALICE USER"
+        env['warden'].user(:restore => true)
+        expect(env['rack.session']).not_to have_key("warden.user.default.key")
+        expect(env['warden'].user).to be_nil
+      end
+
+      it "marks the failure entry point options during an outage" do
+        fake = store
+        seen_options = nil
+        failure = lambda do |env|
+          seen_options = env['warden.options']
+          [401, {"Content-Type" => "text/plain"}, ["You Fail!"]]
+        end
+        app = setup_rack(lambda do |env|
+          env['warden'].authenticate!
+          valid_response
+        end, :failure_app => failure, :configurator => proc do
+          Warden::Manager.serialize_from_session { |key| fake.find(key) }
+        end)
+
+        store.down = true
+        env = env_with_params("/")
+        env['rack.session'] = { "warden.user.default.key" => "alice" }
+        app.call(env)
+
+        expect(seen_options[:reason]).to eq(:identity_store_unavailable)
       end
     end
   end

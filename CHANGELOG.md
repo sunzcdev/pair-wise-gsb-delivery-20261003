@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## Unreleased
+* Distinguish a temporarily unavailable identity store from a deleted identity when restoring a session.
+  * Add `Warden::IdentityStoreUnavailable`, which a `serialize_from_session` block can raise when the backing store cannot be reached.
+  * `Warden::SessionSerializer#restore` now returns a tri-state `Warden::SessionRestoreResult` (`:restored`, `:missing`, `:unavailable`). Only `:missing` deletes the stored session value; `:unavailable` preserves the original value. `#fetch` keeps its user/nil API.
+  * `Warden::Proxy` caches the restore result per scope, exposes `session_unavailable?` / `session_restore_result`, and allows an explicit retry via `restore_session!` or `user(:restore => true)`.
+  * During an outage Warden no longer falls back to other authentication strategies, does not run `after_failed_fetch`, and marks the failure entry point with `:reason => :identity_store_unavailable`.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)
