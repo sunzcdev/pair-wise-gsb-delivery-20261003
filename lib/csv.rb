@@ -100,6 +100,7 @@ require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
 require_relative "csv/writer"
+require_relative "csv/external_sort"
 
 # == \CSV
 #
