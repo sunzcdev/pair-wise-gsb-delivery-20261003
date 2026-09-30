@@ -1,3 +1,5 @@
+require 'socket'
+require 'timeout'
 require 'rack/cache/key'
 require 'rack/cache/storage'
 
@@ -111,6 +113,27 @@ module Rack::Cache
     # the attempt to revalidate the cache entry raises an exception.
     option_accessor :fault_tolerant
 
+    # Specifies whether stale-if-error behavior is enabled. When enabled,
+    # a stale cache entry is served only while the response's age is within
+    # the freshness lifetime extended by the response's own
+    # "stale-if-error" cache-control directive (RFC 5861). Once the grace
+    # window has elapsed, the error is reported truthfully.
+    #
+    # Unlike the fault_tolerant option, only exceptions listed in
+    # stale_if_error_exceptions and response statuses listed in
+    # stale_if_error_statuses trigger a fail-over.
+    option_accessor :stale_if_error
+
+    # The set of Exception classes considered transport failures eligible
+    # for stale-if-error fail-over. Program errors (e.g. RuntimeError raised
+    # by application code) are not rescued unless explicitly listed.
+    option_accessor :stale_if_error_exceptions
+
+    # The set of HTTP response status codes considered origin failures
+    # eligible for stale-if-error fail-over. Defaults to the 5xx statuses
+    # permitted by RFC 5861 (500, 502, 503, 504).
+    option_accessor :stale_if_error_statuses
+
     # The underlying options Hash. During initialization (or outside of a
     # request), this is a default values Hash. During a request, this is the
     # Rack environment Hash. The default values Hash is merged in underneath
@@ -140,6 +163,19 @@ module Rack::Cache
     end
 
   private
+    def default_stale_if_error_exceptions
+      %w[
+        Errno::ECONNREFUSED
+        Errno::ECONNRESET
+        Errno::EHOSTUNREACH
+        Errno::ETIMEDOUT
+        IOError
+        SocketError
+        SystemCallError
+        Timeout::Error
+      ].map { |name| Object.const_get(name) rescue nil }.compact
+    end
+
     def initialize_options(options={})
       @default_options = {
         'rack-cache.cache_key'        => Key,
@@ -154,6 +190,9 @@ module Rack::Cache
         'rack-cache.allow_revalidate' => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
+        'rack-cache.stale_if_error'            => false,
+        'rack-cache.stale_if_error_exceptions' => default_stale_if_error_exceptions,
+        'rack-cache.stale_if_error_statuses'   => [500, 502, 503, 504],
       }
       self.options = options
     end

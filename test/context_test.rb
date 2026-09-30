@@ -1030,4 +1030,231 @@ describe Rack::Cache::Context do
     assert response.ok?
     logger.logged_level.must_equal "info"
   end
+
+  class StaleIfErrorBug < StandardError; end
+
+  describe 'stale-if-error' do
+    STALE_IF_ERROR_OPTIONS = {
+      'rack-cache.stale_if_error' => true,
+      'rack-cache.allow_revalidate' => true,
+    }
+
+    def prime_stale_if_error_entry(cache_control=nil, store_expected: true)
+      respond_with 200 do |req, res|
+        res['cache-control'] =
+          cache_control || 'max-age=100, stale-if-error=50'
+        res['etag'] = '1'
+        res.body = ['Hello World']
+      end
+      get '/'
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :store if store_expected
+    end
+
+    def use_failing_backend(failure)
+      switch_backend do |req, res|
+        case failure
+        when :connection
+          raise Timeout::Error, 'Connection failed'
+        when :status_500
+          res.status = 500
+          res.body = ['Internal Server Error']
+        when :program_bug
+          raise StaleIfErrorBug, 'boom'
+        end
+      end
+    end
+
+    def request_at(age_seconds, options={})
+      Time.stub(:now, Time.now + age_seconds) do
+        get '/', STALE_IF_ERROR_OPTIONS.
+          merge('HTTP_CACHE_CONTROL' => 'max-age=0').
+          merge(options)
+      end
+    end
+
+    # Rebuild the cache prototype so the given backend is used, while the
+    # heap storage (and therefore the primed entry) is preserved.
+    def switch_backend(&block)
+      app = CacheContextHelpers::FakeApp.new(200, {}, ['Hello World'], block)
+      @cache_prototype = nil
+      @app = app
+    end
+
+    # rows: [clock position, failure kind, expected source/status]
+    [
+      [50,   :connection,   :stale],
+      [120,  :connection,   :stale],
+      [151,  :connection,   :raised],
+      [50,   :status_500,   :stale],
+      [120,  :status_500,   :stale],
+      [151,  :status_500,   500],
+      [50,   :program_bug,  :raised],
+      [120,  :program_bug,  :raised],
+      [151,  :program_bug,  :raised],
+    ].each do |age, failure, expected|
+      position =
+        case age
+        when 50 then 'before expiry'
+        when 120 then 'within the grace window'
+        else 'just beyond the grace window'
+        end
+
+      it "handles #{failure.to_s.tr('_', ' ')} #{position} (age #{age})" do
+        prime_stale_if_error_entry
+        use_failing_backend(failure)
+
+        if expected == :raised
+          raised = failure == :connection ? Timeout::Error : StaleIfErrorBug
+          assert_raises(raised) do
+            request_at(age)
+          end
+          responses.first.body.must_equal 'Hello World'
+          cache.trace.must_include :stale
+          cache.trace.wont_include :stale_if_error
+        elsif expected == :stale
+          request_at(age)
+          assert response.ok?
+          response.status.must_equal 200
+          response.body.must_equal 'Hello World'
+          cache.trace.must_include :stale
+          cache.trace.must_include :stale_if_error
+          cache.trace.wont_include :store
+          response.headers['age'].to_i.must_be :>=, age
+        else
+          request_at(age)
+          response.status.must_equal expected
+          response.body.must_equal 'Internal Server Error'
+          cache.trace.must_include :invalid
+          cache.trace.wont_include :stale_if_error
+        end
+      end
+    end
+
+    it 'does not fail over at the exact grace window boundary' do
+      prime_stale_if_error_entry
+      use_failing_backend(:connection)
+      assert_raises(Timeout::Error) { request_at(150) }
+    end
+
+    it 'is disabled by default even when the response declares the directive' do
+      prime_stale_if_error_entry
+      use_failing_backend(:status_500)
+      get '/',
+        'rack-cache.allow_revalidate' => true,
+        'HTTP_CACHE_CONTROL' => 'max-age=0'
+      response.status.must_equal 500
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'can be enabled without fault_tolerant' do
+      prime_stale_if_error_entry
+      use_failing_backend(:connection)
+      request_at(120, 'rack-cache.fault_tolerant' => false)
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale_if_error
+      cache.trace.wont_include :connnection_failed
+    end
+
+    it 'ignores the directive beyond the window even with fault_tolerant off' do
+      prime_stale_if_error_entry
+      use_failing_backend(:status_500)
+      request_at(151, 'rack-cache.fault_tolerant' => false)
+      response.status.must_equal 500
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'honors configured statuses instead of the defaults' do
+      prime_stale_if_error_entry
+      use_failing_backend(:status_500)
+      request_at(120,
+        'rack-cache.stale_if_error_statuses' => [503])
+      response.status.must_equal 500
+      cache.trace.wont_include :stale_if_error
+    end
+
+    it 'fails over for 500 when configured' do
+      prime_stale_if_error_entry
+      use_failing_backend(:status_500)
+      request_at(120,
+        'rack-cache.stale_if_error_statuses' => [500, 503])
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale_if_error
+    end
+
+    it 'only rescues configured transport exceptions' do
+      prime_stale_if_error_entry
+      use_failing_backend(:program_bug)
+      assert_raises(StaleIfErrorBug) do
+        request_at(120,
+          'rack-cache.stale_if_error_exceptions' => [Timeout::Error])
+      end
+    end
+
+    it 'fails over for configured custom transport exceptions' do
+      prime_stale_if_error_entry
+      use_failing_backend(:program_bug)
+      request_at(120,
+        'rack-cache.stale_if_error_exceptions' => [StaleIfErrorBug])
+      assert response.ok?
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale_if_error
+    end
+
+    it 'never rescues program errors, even inside the grace window' do
+      prime_stale_if_error_entry
+      use_failing_backend(:program_bug)
+      assert_raises(StaleIfErrorBug) { request_at(120) }
+    end
+
+    it 'does not relax must-revalidate' do
+      prime_stale_if_error_entry(
+        'max-age=100, must-revalidate, stale-if-error=50')
+      use_failing_backend(:connection)
+      assert_raises(Timeout::Error) { request_at(120) }
+    end
+
+    it 'does not relax proxy-revalidate' do
+      prime_stale_if_error_entry(
+        'max-age=100, proxy-revalidate, stale-if-error=50')
+      use_failing_backend(:connection)
+      assert_raises(Timeout::Error) { request_at(120) }
+    end
+
+    it 'does not relax no-cache' do
+      prime_stale_if_error_entry(
+        'max-age=100, no-cache, stale-if-error=50')
+      use_failing_backend(:connection)
+      assert_raises(Timeout::Error) { request_at(120) }
+    end
+
+    it 'does not store or serve no-store responses' do
+      prime_stale_if_error_entry(
+        'max-age=100, no-store, stale-if-error=50',
+        store_expected: false)
+      cache.trace.wont_include :store
+      use_failing_backend(:connection)
+      assert_raises(Timeout::Error) { request_at(120) }
+    end
+
+    it 'reports a non-failure response truthfully within the window' do
+      count = 0
+      respond_with 200 do |req, res|
+        count += 1
+        res['cache-control'] = 'max-age=100, stale-if-error=50'
+        res['etag'] = count.to_s
+        res.body = (count == 1) ? ['Hello World'] : ['Goodbye World']
+      end
+      get '/'
+      request_at(120)
+      assert response.ok?
+      response.body.must_equal 'Goodbye World'
+      cache.trace.must_include :invalid
+      cache.trace.must_include :store
+      cache.trace.wont_include :stale_if_error
+    end
+
+  end
 end

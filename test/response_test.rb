@@ -212,4 +212,75 @@ describe Rack::Cache::Response do
       @res.expires.must_be_nil
     end
   end
+
+  describe '#stale_if_error' do
+    it 'returns nil when the directive is absent' do
+      @res.headers['cache-control'] = 'max-age=100'
+      @res.stale_if_error.must_be_nil
+    end
+
+    it 'returns the declared grace in seconds' do
+      @res.headers['cache-control'] = 'max-age=100, stale-if-error=50'
+      @res.stale_if_error.must_equal 50
+    end
+  end
+
+  describe '#stale_if_error_allowed?' do
+    def entry(age, control)
+      response = Rack::Cache::Response.new(
+        200,
+        { 'date' => @now.httpdate, 'cache-control' => control },
+        [])
+      response.headers['age'] = age.to_s
+      response
+    end
+
+    it 'is false when the directive is absent' do
+      refute entry(120, 'max-age=100').stale_if_error_allowed?
+    end
+
+    it 'is true while a fresh entry is within the freshness lifetime' do
+      assert entry(50, 'max-age=100, stale-if-error=50').stale_if_error_allowed?
+    end
+
+    it 'is true while a stale entry is inside the grace window' do
+      assert entry(120, 'max-age=100, stale-if-error=50').stale_if_error_allowed?
+    end
+
+    it 'is false exactly at the end of the grace window' do
+      refute entry(150, 'max-age=100, stale-if-error=50').stale_if_error_allowed?
+    end
+
+    it 'is false just beyond the grace window' do
+      refute entry(151, 'max-age=100, stale-if-error=50').stale_if_error_allowed?
+    end
+
+    it 'is false when the grace is zero' do
+      refute entry(120, 'max-age=100, stale-if-error=0').stale_if_error_allowed?
+    end
+
+    it 'is false with the must-revalidate directive' do
+      refute entry(120,
+        'max-age=100, must-revalidate, stale-if-error=50').
+        stale_if_error_allowed?
+    end
+
+    it 'is false with the proxy-revalidate directive' do
+      refute entry(120,
+        'max-age=100, proxy-revalidate, stale-if-error=50').
+        stale_if_error_allowed?
+    end
+
+    it 'is false with the no-cache directive' do
+      refute entry(120,
+        'max-age=100, no-cache, stale-if-error=50').
+        stale_if_error_allowed?
+    end
+
+    it 'is false with the no-store directive' do
+      refute entry(120,
+        'max-age=100, no-store, stale-if-error=50').
+        stale_if_error_allowed?
+    end
+  end
 end

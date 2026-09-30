@@ -146,3 +146,34 @@ need to fetch metadata and check timestamps.
 Boolean specifying whether fault tolerant caching is enabled. When this option
 is enabled (`rack-cache.fault_tolerant`is `true`), stale cached results can be
 returned if the downstream service is unavailable.
+
+### `stale_if_error`
+
+Boolean specifying whether [RFC 5861](https://tools.ietf.org/html/rfc5861)
+stale-if-error behavior is enabled (`rack-cache.stale_if_error` is `true`).
+Unlike `fault_tolerant`, serving a stale response is bounded by the
+`stale-if-error` grace period declared by the origin in the response's
+`cache-control` header: the stale entry is used only while its age is less
+than its freshness lifetime plus the declared grace seconds. Once the window
+has elapsed, the transport exception is re-raised or the failure response is
+returned to the client truthfully.
+
+Only failures configured with the `stale_if_error_exceptions` and
+`stale_if_error_statuses` options trigger fail-over; arbitrary Ruby errors
+raised by the application are never swallowed. The extension never relaxes
+the `no-store`, `no-cache`, `must-revalidate`, or `proxy-revalidate`
+directives.
+
+### `stale_if_error_exceptions`
+
+An Array of Exception classes considered transport failures eligible for
+stale-if-error fail-over. Defaults to common connection/timeout errors:
+`Errno::ECONNREFUSED`, `Errno::ECONNRESET`, `Errno::EHOSTUNREACH`,
+`Errno::ETIMEDOUT`, `IOError`, `SocketError`, `SystemCallError`, and
+`Timeout::Error`. Program errors must be listed explicitly to be rescued.
+
+### `stale_if_error_statuses`
+
+An Array of HTTP status codes considered origin failures eligible for
+stale-if-error fail-over. Defaults to the statuses permitted by RFC 5861:
+`[500, 502, 503, 504]`.

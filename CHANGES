@@ -1,3 +1,9 @@
+## Unreleased
+
+ * Add a stale_if_error option to serve stale entries within the
+   response-declared RFC 5861 grace window on configurable transport
+   exceptions and 5xx statuses
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

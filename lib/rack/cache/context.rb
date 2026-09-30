@@ -166,6 +166,9 @@ module Rack::Cache
     # to #validate the entry with the backend using conditional GET.
     # If validation raises an exception and fault tolerant caching is enabled,
     # serve the stale cache entry.
+    # When stale-if-error is enabled, the stale entry is served on a
+    # configured transport exception or failure status only while the entry's
+    # age is within the response-declared stale-if-error window.
     # When no matching cache entry is found, trigger miss processing.
     def lookup
       if @request.no_cache? && allow_reload?
@@ -185,7 +188,9 @@ module Rack::Cache
             entry
           else
             record :stale
-            if fault_tolerant?
+            if stale_if_error?
+              validate_with_stale_if_error(entry)
+            elsif fault_tolerant?
               validate_with_stale_cache_failover(entry)
             else
               validate(entry)
@@ -196,6 +201,47 @@ module Rack::Cache
           fetch
         end
       end
+    end
+
+    # Serve the stale cache entry when revalidation fails within the
+    # response-declared stale-if-error window. Only configured transport
+    # exceptions and configured failure statuses are degraded; anything
+    # else (including an elapsed grace window) is reported truthfully.
+    def validate_with_stale_if_error(entry)
+      unless entry.stale_if_error_allowed?
+        return validate(entry)
+      end
+
+      begin
+        response = validate(entry)
+      rescue => e
+        raise unless stale_if_error_exception?(e)
+        serve_stale_if_error(entry, e)
+      else
+        if stale_if_error_status?(response.status)
+          response.body.close if response.body.respond_to?(:close)
+          serve_stale_if_error(entry, response.status)
+        else
+          response
+        end
+      end
+    end
+
+    def stale_if_error_exception?(exception)
+      stale_if_error_exceptions.any? { |klass| exception.is_a?(klass) }
+    end
+
+    def stale_if_error_status?(status)
+      stale_if_error_statuses.include?(status)
+    end
+
+    def serve_stale_if_error(entry, reason)
+      record :stale_if_error
+      age = entry.age
+      entry.headers['age'] = age.to_s
+      log_info("stale-if-error: serving stale entry with age #{age} " \
+               "due to #{reason}")
+      entry
     end
 
     # Returns stale cache on exception.

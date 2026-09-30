@@ -125,13 +125,32 @@ module Rack::Cache
     # the TTL of the response should not be overriden to be greater than the
     # value provided by the origin.
     def must_revalidate?
-      cache_control.must_revalidate || cache_control.proxy_revalidate
+      cache_control.must_revalidate? || cache_control.proxy_revalidate?
     end
 
     # Mark the response stale by setting the Age header to be equal to the
     # maximum age of the response.
     def expire!
       headers['age'] = max_age.to_s if fresh?
+    end
+
+    # The number of seconds past its freshness lifetime during which this
+    # entry may be served when revalidation encounters an error, as
+    # declared by the stale-if-error cache-control directive (RFC 5861).
+    # Returns nil when the directive is absent.
+    def stale_if_error
+      cache_control.stale_if_error
+    end
+
+    # Whether this entry may be served past its freshness lifetime when an
+    # error is encountered. The stale-if-error extension never relaxes the
+    # no-store, no-cache, must-revalidate, or proxy-revalidate directives.
+    def stale_if_error_allowed?
+      grace = stale_if_error
+      return false if grace.nil? || grace <= 0
+      return false if cache_control.no_store? || cache_control.no_cache?
+      return false if must_revalidate?
+      age < max_age + grace if max_age
     end
 
     # The date, as specified by the Date header. When no Date header is present
