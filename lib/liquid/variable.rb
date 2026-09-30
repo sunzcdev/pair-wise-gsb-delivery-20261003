@@ -61,6 +61,7 @@ module Liquid
           @filters << lax_parse_filter_expressions(filtername, filterargs)
         end
       end
+      validate_filter_signatures
     end
 
     def strict_parse(markup)
@@ -76,6 +77,7 @@ module Liquid
         @filters << lax_parse_filter_expressions(filtername, filterargs)
       end
       p.consume(:end_of_string)
+      validate_filter_signatures
     end
 
     def strict2_parse(markup)
@@ -87,6 +89,7 @@ module Liquid
       @name = parse_context.safe_parse_expression(p)
       @filters << strict2_parse_filter_expressions(p) while p.consume?(:pipe)
       p.consume(:end_of_string)
+      validate_filter_signatures
     end
 
     def parse_filterargs(p)
@@ -191,6 +194,28 @@ module Liquid
 
     def end_of_arguments?(p)
       p.look(:pipe) || p.look(:end_of_string)
+    end
+
+    def validate_filter_signatures
+      @filters.each do |filter|
+        filter_name = filter.first
+        filter_args = filter[1]
+        filter_kwargs = filter[2]
+        signature = parse_context.environment.filter_signature(filter_name)
+        next unless signature
+
+        normalized_kwargs = signature.validate(
+          filter_name,
+          filter_args.length,
+          filter_kwargs || Const::EMPTY_HASH,
+        )
+
+        if filter_kwargs.nil?
+          filter << normalized_kwargs unless normalized_kwargs.empty?
+        else
+          filter[2] = normalized_kwargs
+        end
+      end
     end
 
     def evaluate_filter_expressions(context, filter_args, filter_kwargs)

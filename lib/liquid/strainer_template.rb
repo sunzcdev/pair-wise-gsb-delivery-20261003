@@ -25,6 +25,7 @@ module Liquid
         include(filter)
 
         filter_methods.merge(filter.public_instance_methods.map(&:to_s))
+        add_filter_aliases(filter)
       end
 
       def invokable?(method)
@@ -34,6 +35,11 @@ module Liquid
       def inherited(subclass)
         super
         subclass.instance_variable_set(:@filter_methods, @filter_methods.dup)
+        subclass.instance_variable_set(:@filter_aliases, @filter_aliases&.dup)
+      end
+
+      def filter_alias(method)
+        filter_aliases[method.to_s]
       end
 
       def filter_method_names
@@ -44,6 +50,19 @@ module Liquid
 
       def filter_methods
         @filter_methods ||= Set.new
+      end
+
+      def filter_aliases
+        @filter_aliases ||= {}
+      end
+
+      def add_filter_aliases(filter)
+        methods = filter.public_instance_methods
+        methods.each do |method_name|
+          method = filter.instance_method(method_name)
+          original_name = method.original_name.to_s
+          filter_aliases[method_name.to_s] = original_name if method_name.to_s != original_name
+        end
       end
     end
 

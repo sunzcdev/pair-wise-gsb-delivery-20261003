@@ -14,6 +14,8 @@ module Liquid
       return strict2_parse_with_error_context(markup) if strict2_mode?
 
       strict_parse_with_error_context(markup)
+    rescue FilterSignatureError
+      raise
     rescue SyntaxError => e
       case parse_context.error_mode
       when :rigid
@@ -26,7 +28,7 @@ module Liquid
       when :warn
         parse_context.warnings << e
       end
-      lax_parse(markup)
+      lax_parse_with_filter_signature_error_context(markup)
     end
 
     def parse_with_selected_parser(markup)
@@ -34,13 +36,15 @@ module Liquid
       when :rigid   then rigid_warn && strict2_parse_with_error_context(markup)
       when :strict2 then strict2_parse_with_error_context(markup)
       when :strict  then strict_parse_with_error_context(markup)
-      when :lax     then lax_parse(markup)
+      when :lax     then lax_parse_with_filter_signature_error_context(markup)
       when :warn
         begin
           strict2_parse_with_error_context(markup)
+        rescue FilterSignatureError
+          raise
         rescue SyntaxError => e
           parse_context.warnings << e
-          lax_parse(markup)
+          lax_parse_with_filter_signature_error_context(markup)
         end
       end
     end
@@ -66,6 +70,14 @@ module Liquid
     def strict_parse_with_error_context(markup)
       strict_parse(markup)
     rescue SyntaxError => e
+      e.line_number    = line_number
+      e.markup_context = markup_context(markup)
+      raise e
+    end
+
+    def lax_parse_with_filter_signature_error_context(markup)
+      lax_parse(markup)
+    rescue FilterSignatureError => e
       e.line_number    = line_number
       e.markup_context = markup_context(markup)
       raise e

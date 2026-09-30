@@ -54,6 +54,7 @@ require "liquid/deprecations"
 require "liquid/const"
 require 'liquid/standardfilters'
 require 'liquid/file_system'
+require 'liquid/filter_signature'
 require 'liquid/parser_switching'
 require 'liquid/tag'
 require 'liquid/block'

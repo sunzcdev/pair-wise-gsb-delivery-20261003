@@ -93,6 +93,30 @@ LIQUID
 
 By using Environments, you ensure that custom tags and filters are only available in the contexts where they are needed, making your Liquid templates more robust and easier to manage. For smaller projects, a global environment is available via `Liquid::Environment.default`.
 
+### Filter signatures
+
+Filters can optionally declare a signature so invalid calls are raised while a template is parsed instead of failing when a notification is rendered:
+
+```ruby
+environment = Liquid::Environment.build do |env|
+  env.register_filter(NotificationFilters)
+  env.register_filter_signature(
+    :localize,
+    positional_arguments: 1,
+    named_arguments: {
+      'locale' => Liquid::FilterSignature::REQUIRED,
+      'format' => 'long',
+    },
+    aliases: [:l],
+  )
+end
+
+# Raises Liquid::FilterSignatureError during parsing.
+Liquid::Template.parse("{{ value | localize }}", environment: environment)
+```
+
+Use an integer for an exact positional argument count, a range, or `[minimum, maximum]` for bounded counts. Filters without signatures keep their existing behavior. Signatures are stored on the registering environment, including separate environments that expose the same filter name with different signatures.
+
 ### Error Modes
 
 Setting the error mode of Liquid lets you specify how strictly you want your templates to be interpreted.

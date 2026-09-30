@@ -45,6 +45,7 @@ module Liquid
   FileSystemError       = Class.new(Error)
   StandardError         = Class.new(Error)
   SyntaxError           = Class.new(Error)
+  FilterSignatureError  = Class.new(SyntaxError)
   StackLevelError       = Class.new(Error)
   MemoryError           = Class.new(Error)
   ZeroDivisionError     = Class.new(Error)

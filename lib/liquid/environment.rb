@@ -83,6 +83,7 @@ module Liquid
       @file_system = BlankFileSystem.new
       @default_resource_limits = Const::EMPTY_HASH
       @strainer_template_class_cache = {}
+      @filter_signatures = {}
     end
 
     # Registers a new tag with the environment.
@@ -101,6 +102,28 @@ module Liquid
     def register_filter(filter)
       @strainer_template_class_cache.clear
       @strainer_template.add_filter(filter)
+    end
+
+    # Registers a signature for a filter. Filters without signatures retain their
+    # existing parse-time behavior.
+    def register_filter_signature(
+      filter_name,
+      positional_arguments: nil,
+      named_arguments: nil,
+      aliases: nil
+    )
+      signature = FilterSignature.new(
+        positional_arguments: positional_arguments,
+        named_arguments: named_arguments,
+        aliases: aliases,
+      )
+
+      names = [filter_name, *signature.aliases].map(&:to_s)
+      @filter_signatures.delete_if do |name, old_signature|
+        names.include?(name) || (old_signature.aliases & names).any?
+      end
+      names.each { |name| @filter_signatures[name] = signature }
+      signature
     end
 
     # Registers multiple filters with this environment.
@@ -141,12 +164,26 @@ module Liquid
       @strainer_template.filter_method_names
     end
 
+    # @api private
+    def filter_signature(filter_name)
+      name = filter_name.to_s
+      signature = @filter_signatures[name]
+      signature ||= @filter_signatures[@strainer_template.filter_alias(name)]
+
+      signature if signature && @strainer_template.invokable?(name)
+    end
+
     # Returns the tag class for the given tag name.
     #
     # @param name [String] The name of the tag.
     # @return [Liquid::Tag] The tag class.
     def tag_for_name(name)
       @tags[name]
+    end
+
+    def initialize_copy(source)
+      super
+      @filter_signatures = source.instance_variable_get(:@filter_signatures).dup
     end
 
     def freeze
