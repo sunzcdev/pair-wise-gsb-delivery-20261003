@@ -37,6 +37,20 @@ module Dry
           end
         end
 
+        # Resolve within the given context so that the construction chain is
+        # tracked while the factory runs
+        #
+        # @api private
+        def resolve(context = nil, key = nil)
+          if context.nil?
+            call
+          else
+            memoize_mutex.synchronize do
+              @memoized_item ||= context.construct(self, key)
+            end
+          end
+        end
+
         private
 
         # @private

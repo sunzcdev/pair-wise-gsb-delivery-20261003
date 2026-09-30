@@ -16,6 +16,11 @@ module Dry
         def call
           callable? ? item.call : item
         end
+
+        # @api private
+        def resolve(context = nil, key = nil)
+          context.nil? ? call : context.construct(self, key)
+        end
       end
     end
   end

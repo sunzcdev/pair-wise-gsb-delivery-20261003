@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 require "dry/container/error"
+require "dry/container/scope"
+require "dry/container/scope_manager"
+require "dry/container/resolution_context"
 require "dry/container/namespace"
 require "dry/container/registry"
 require "dry/container/resolver"

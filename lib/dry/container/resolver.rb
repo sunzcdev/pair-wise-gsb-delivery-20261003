@@ -12,6 +12,8 @@ module Dry
       #   The container
       # @param [Mixed] key
       #   The key for the item you wish to resolve
+      # @param [Dry::Container::ResolutionContext, nil] context
+      #   The active resolution context carrying scope information
       # @yield
       #   Fallback block to call when a key is missing. Its result will be returned
       # @yieldparam [Mixed] key Missing key
@@ -23,7 +25,7 @@ module Dry
       # @return [Mixed]
       #
       # @api public
-      def call(container, key)
+      def call(container, key, context = nil)
         item = container.fetch(key.to_s) do
           if block_given?
             return yield(key)
@@ -32,7 +34,7 @@ module Dry
           end
         end
 
-        item.call
+        context.nil? ? item.call : context.resolve(item, key.to_s)
       end
 
       # Check whether an items is registered under the given key
@@ -80,8 +82,10 @@ module Dry
       # @note In discussions with other developers, it was felt that being able
       #       to iterate over not just the registered keys, but to see what was
       #       registered would be very helpful. This is a step toward doing that.
-      def each(container, &block)
-        container.map { |key, value| [key, value.call] }.each(&block)
+      def each(container, context = nil, &block)
+        container.map { |key, value|
+          context.nil? ? [key, value.call] : [key, context.resolve(value, key)]
+        }.each(&block)
       end
     end
   end

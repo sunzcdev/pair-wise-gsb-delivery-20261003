@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "concurrent/hash"
+require "dry/container/scope_manager"
 
 module Dry
   class Container
@@ -97,6 +98,9 @@ module Dry
         hooks_mod = ::Module.new do
           def inherited(subclass)
             subclass.instance_variable_set(:@_container, @_container.dup)
+            subclass.instance_variable_set(
+              :@_scope_manager, ::Dry::Container::ScopeManager.new
+            )
             super
           end
         end
@@ -106,6 +110,7 @@ module Dry
           extend hooks_mod
 
           @_container = ::Concurrent::Hash.new
+          @_scope_manager = ::Dry::Container::ScopeManager.new
         end
       end
 
@@ -113,6 +118,7 @@ module Dry
       module Initializer
         def initialize(*args, &block)
           @_container = ::Concurrent::Hash.new
+          @_scope_manager = ::Dry::Container::ScopeManager.new
           super
         end
       end
@@ -172,7 +178,50 @@ module Dry
       #
       # @api public
       def resolve(key, &block)
-        config.resolver.call(_container, key, &block)
+        config.resolver.call(_container, key, _scope_manager.context, &block)
+      end
+
+      # Open an explicit scope without activating it
+      #
+      # The returned scope can be activated and closed explicitly, which
+      # allows scopes belonging to the same fiber to be interleaved.
+      #
+      # @example
+      #
+      #   request_scope = container.open_scope(:request)
+      #   request_scope.activate
+      #   container[:current_user]
+      #   request_scope.close!
+      #
+      # @param [Symbol, String, nil] name
+      #   Optional name used in error messages
+      #
+      # @return [Dry::Container::Scope]
+      #
+      # @api public
+      def open_scope(name = nil)
+        _scope_manager.open_scope(name)
+      end
+
+      # Open a nested scope, run the block inside of it and close it afterwards
+      #
+      # @param [Symbol, String, nil] name
+      #   Optional name used in error messages
+      #
+      # @return [Mixed] the block result
+      #
+      # @api public
+      def with_scope(name = nil, &block)
+        _scope_manager.with_scope(name, &block)
+      end
+
+      # The scope currently active on this fiber, if any
+      #
+      # @return [Dry::Container::Scope, nil]
+      #
+      # @api public
+      def current_scope
+        _scope_manager.current_scope
       end
 
       # Resolve an item from the container
@@ -259,7 +308,7 @@ module Dry
       #       over not just the registered keys, but to see what was registered would be
       #       very helpful. This is a step toward doing that.
       def each(&block)
-        config.resolver.each(_container, &block)
+        config.resolver.each(_container, _scope_manager.context, &block)
       end
 
       # Decorates an item from the container with specified decorator
@@ -332,10 +381,16 @@ module Dry
         @_container
       end
 
+      # @private no, really
+      def _scope_manager
+        @_scope_manager
+      end
+
       # @api public
       def dup
         copy = super
         copy.instance_variable_set(:@_container, _container.dup)
+        copy.instance_variable_set(:@_scope_manager, ::Dry::Container::ScopeManager.new)
         copy
       end
 
@@ -344,6 +399,7 @@ module Dry
         copy = super
         unless copy.frozen?
           copy.instance_variable_set(:@_container, _container.dup)
+          copy.instance_variable_set(:@_scope_manager, ::Dry::Container::ScopeManager.new)
         end
         copy
       end
