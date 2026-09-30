@@ -90,14 +90,43 @@ module Dry
         #     failure('please provide a valid street address') if valid_street?(values[:street])
         #   end
         #
+        # @example using a name and explicit dependencies
+        #   rule(:account_id, name: :account_available) do
+        #     key.failure('is not available') unless account_available?(value)
+        #   end
+        #
+        #   rule(:account_id, name: :within_quota, depends_on: :account_available) do
+        #     key.failure('quota exceeded') if quota_exceeded?(value)
+        #   end
+        #
+        # Dependencies must refer to rules that were already defined (via their
+        # `name:`). Unknown dependencies and dependency cycles are reported
+        # immediately, when the rule is defined.
+        #
+        # @param [Array<Symbol, String, Hash>] keys
+        # @param [Hash] options
+        # @option options [Symbol] :name Optional rule name, used as a dependency target
+        # @option options [Symbol, Array<Symbol>] :depends_on Names of rules that must
+        #   pass before this rule runs
+        #
         # @return [Rule]
         #
         # @api public
-        def rule(*keys, &block)
+        def rule(*keys, **options, &block)
+          name = options.delete(:name)
+          depends_on = options.delete(:depends_on)
+          keys << options unless options.empty?
+
           ensure_valid_keys(*keys) if __schema__
 
-          Rule.new(keys: keys, block: block).tap do |rule|
+          Rule.new(
+            keys: keys,
+            block: block,
+            name: name,
+            depends_on: Array(depends_on)
+          ).tap do |rule|
             rules << rule
+            validate_rule_dependencies!
           end
         end
 
@@ -191,6 +220,55 @@ module Dry
         # @api private
         def key_map
           __schema__.key_map
+        end
+
+        # Check rule dependencies for unknown names and cycles
+        #
+        # This runs every time a rule is defined so that misconfigured
+        # contracts fail fast, at definition time
+        #
+        # @api private
+        def validate_rule_dependencies!
+          named = rules.each_with_object({}) { |rule, map|
+            map[rule.name] = rule if rule.name
+          }
+
+          rules.each do |rule|
+            rule.depends_on.each do |dependency|
+              next if named.key?(dependency)
+
+              raise UnknownRuleDependencyError, <<~STR.strip
+                #{name}.rule #{rule_label(rule)} depends on an unknown rule #{dependency.inspect}
+              STR
+            end
+          end
+
+          detect_rule_dependency_cycle!(named)
+        end
+
+        # @api private
+        def detect_rule_dependency_cycle!(named)
+          states = {}
+
+          visit = lambda do |rule, path|
+            case states[rule]
+            when :done then next
+            when :visiting
+              cycle = (path + [rule]).map { |r| rule_label(r) }.join(" -> ")
+              raise CyclicRuleDependencyError, "#{name}.rule dependency cycle detected: #{cycle}"
+            end
+
+            states[rule] = :visiting
+            rule.depends_on.each { |dependency| visit.call(named[dependency], path + [rule]) }
+            states[rule] = :done
+          end
+
+          rules.each { |rule| visit.call(rule, []) }
+        end
+
+        # @api private
+        def rule_label(rule)
+          rule.name ? rule.name.inspect : rule.keys.inspect
         end
 
         # @api private

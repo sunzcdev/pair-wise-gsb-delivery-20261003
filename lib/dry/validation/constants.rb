@@ -26,6 +26,12 @@ module Dry
     # Error raised when `rule` specifies one or more keys that the schema doesn't specify
     InvalidKeysError = ::Class.new(::StandardError)
 
+    # Error raised when a rule depends on a rule name that was not defined
+    UnknownRuleDependencyError = ::Class.new(::StandardError)
+
+    # Error raised when rule dependencies form a cycle
+    CyclicRuleDependencyError = ::Class.new(::StandardError)
+
     # Error raised when a localized message was not found
     MissingMessageError = ::Class.new(::StandardError)
 

@@ -98,7 +98,17 @@ module Dry
         end
 
         Result.new(schema.(input), context_map) do |result|
-          rules.each do |rule|
+          outcomes = {}
+
+          ordered_rules.each do |rule|
+            blocker = failed_dependency(rule, outcomes)
+
+            if blocker
+              outcomes[rule] = :skipped
+              result.add_skipped_rule(rule.name, skip_reason(blocker, outcomes)) if rule.name
+              next
+            end
+
             next if rule.keys.any? { |key| error?(result, key) }
 
             rule_result = rule.(self, result)
@@ -106,6 +116,8 @@ module Dry
             rule_result.failures.each do |failure|
               result.add_error(message_resolver.(**failure))
             end
+
+            outcomes[rule] = rule_result.failures.empty? ? :passed : :failed
           end
         end
       end
@@ -144,6 +156,64 @@ module Dry
               (other = Schema::Path[err.path]).same_root?(curr_path) && other == curr_path
             }
           }
+      end
+
+      # Rules in dependency order
+      #
+      # A stable topological sort: rules whose dependencies are already
+      # scheduled come first, ties are broken by definition order
+      #
+      # @return [Array<Rule>]
+      #
+      # @api private
+      def ordered_rules
+        @ordered_rules ||= begin
+          remaining = rules.dup
+          scheduled = {}
+          ordered = []
+
+          until remaining.empty?
+            ready = remaining.find { |rule|
+              rule.depends_on.all? { |dependency| scheduled[named_rules[dependency]] }
+            }
+
+            # validated at definition time, so this should never happen
+            raise CyclicRuleDependencyError, self.class.name unless ready
+
+            remaining.delete_at(remaining.index(ready))
+            scheduled[ready] = true
+            ordered << ready
+          end
+
+          ordered
+        end
+      end
+
+      # @return [Hash{Symbol => Rule}] Named rules, last definition wins
+      #
+      # @api private
+      def named_rules
+        @named_rules ||= rules.each_with_object({}) { |rule, map|
+          map[rule.name] = rule if rule.name
+        }
+      end
+
+      # Return the name of the first dependency that failed or was skipped
+      #
+      # @return [Symbol, nil]
+      #
+      # @api private
+      def failed_dependency(rule, outcomes)
+        rule.depends_on.find { |dependency|
+          dependency_rule = named_rules[dependency]
+          dependency_rule && %i[failed skipped].include?(outcomes[dependency_rule])
+        }
+      end
+
+      # @api private
+      def skip_reason(dependency, outcomes)
+        state = outcomes[named_rules[dependency]]
+        "dependency #{dependency.inspect} #{state == :skipped ? 'was skipped' : 'failed'}"
       end
 
       # Get a registered macro
