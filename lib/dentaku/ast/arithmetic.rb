@@ -260,6 +260,22 @@ module Dentaku
         cast(left.value(context)) * 0.01
       end
 
+      def partial(evaluator, guarded)
+        reduced = evaluator.reduce(left, guarded: guarded)
+        if evaluator.constant?(reduced)
+          rebuilt = evaluator.rebuild(self.class, reduced)
+          return self if rebuilt.nil?
+          value = evaluator.evaluate_node(rebuilt)
+          return rebuilt if evaluator.error_result?(value)
+
+          return evaluator.constant_for(value)
+        end
+
+        return self if reduced.equal?(left)
+
+        evaluator.rebuild(self.class, reduced) || self
+      end
+
       def operator
         :%
       end

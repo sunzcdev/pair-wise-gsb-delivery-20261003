@@ -3,6 +3,8 @@ require_relative "./node"
 module Dentaku
   module AST
     class Grouping < Node
+      attr_reader :node
+
       def initialize(node)
         @node = node
       end
@@ -17,6 +19,10 @@ module Dentaku
 
       def dependencies(context = {})
         @node.dependencies(context)
+      end
+
+      def accept(visitor)
+        visitor.visit_grouping(self)
       end
 
       private

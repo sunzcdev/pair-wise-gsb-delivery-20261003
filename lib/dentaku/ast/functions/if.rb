@@ -31,6 +31,27 @@ module Dentaku
         :condition
       end
 
+      def partial(evaluator, guarded)
+        # the predicate is always required, so it may be folded normally
+        reduced_predicate = evaluator.reduce(predicate, guarded: guarded)
+
+        if evaluator.constant?(reduced_predicate)
+          chosen = reduced_predicate.value ? left : right
+          return evaluator.embed(evaluator.reduce(chosen, guarded: guarded))
+        end
+
+        # predicate not known: neither branch is guaranteed to run, so
+        # both are kept and reduced without invoking any functions
+        reduced_left = evaluator.reduce(left, guarded: true)
+        reduced_right = evaluator.reduce(right, guarded: true)
+
+        return self if reduced_predicate.equal?(predicate) &&
+                       reduced_left.equal?(left) &&
+                       reduced_right.equal?(right)
+
+        evaluator.rebuild(self.class, reduced_predicate, reduced_left, reduced_right) || self
+      end
+
       def type
         left.type
       end

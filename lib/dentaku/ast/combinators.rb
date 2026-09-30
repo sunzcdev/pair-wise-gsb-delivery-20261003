@@ -55,6 +55,42 @@ module Dentaku
         right_value
       end
 
+      def partial(evaluator, guarded)
+        reduced_left = evaluator.reduce(left, guarded: guarded)
+
+        if evaluator.constant?(reduced_left)
+          left_value = evaluator.evaluate_node(reduced_left)
+
+          unless evaluator.error_result?(left_value)
+            # short circuit: the right operand is never evaluated
+            return evaluator.constant_for(left_value) if decisive?(left_value)
+
+            reduced_right = evaluator.reduce(right, guarded: guarded)
+
+            if evaluator.constant?(reduced_right)
+              rebuilt = evaluator.rebuild(self.class, reduced_left, reduced_right)
+              return self if rebuilt.nil?
+
+              value = evaluator.evaluate_node(rebuilt)
+              return evaluator.error_result?(value) ? self : evaluator.constant_for(value)
+            end
+
+            return (evaluator.rebuild(self.class, reduced_left, reduced_right) || self) if
+              !reduced_left.equal?(left) || !reduced_right.equal?(right)
+
+            return self
+          end
+        end
+
+        # left is undecided: the right side may or may not run, so it is
+        # simplified without calling any functions
+        reduced_right = evaluator.reduce(right, guarded: true)
+
+        return self if reduced_left.equal?(left) && reduced_right.equal?(right)
+
+        evaluator.rebuild(self.class, reduced_left, reduced_right) || self
+      end
+
       private
 
       # static dependency check: this runs at parse time, and evaluating

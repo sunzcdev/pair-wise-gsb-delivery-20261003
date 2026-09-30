@@ -30,6 +30,27 @@ module Dentaku
         visitor.visit_operation(self)
       end
 
+      def partial(evaluator, guarded)
+        reduced_left = evaluator.reduce(left, guarded: guarded)
+        reduced_right = evaluator.reduce(right, guarded: guarded)
+
+        if evaluator.constant?(reduced_left) && evaluator.constant?(reduced_right)
+          rebuilt = evaluator.rebuild(self.class, reduced_left, reduced_right)
+          return self if rebuilt.nil?
+
+          # arithmetic on already-folded constants is a local,
+          # side-effect-free computation, even inside a guarded subtree
+          value = evaluator.evaluate_node(rebuilt)
+          return rebuilt if evaluator.error_result?(value)
+
+          return evaluator.constant_for(value)
+        end
+
+        return self if reduced_left.equal?(left) && reduced_right.equal?(right)
+
+        evaluator.rebuild(self.class, reduced_left, reduced_right) || self
+      end
+
       def display_operator
         operator.to_s
       end

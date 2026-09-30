@@ -84,6 +84,15 @@ class TestVisitor
   def visit_nil(node)
     mark_visited(node)
   end
+
+  def visit_constant(node)
+    mark_visited(node)
+  end
+
+  def visit_grouping(node)
+    mark_visited(node)
+    node.node.accept(self)
+  end
 end
 
 describe TestVisitor do
@@ -93,6 +102,7 @@ describe TestVisitor do
       :Bitwise,
       :Combinator,
       :Comparator,
+      :Constant,
       :Function,
       :FunctionRegistry,
       :Grouping,

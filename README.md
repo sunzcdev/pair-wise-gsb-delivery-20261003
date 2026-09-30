@@ -282,6 +282,48 @@ be evaluated (e.g. raise `ZeroDivisionError`).  The non-bang `solve` method will
 find as many solutions as possible and return the symbol `:undefined` for the
 problem formulas.
 
+PARTIAL EVALUATION
+---------------------------------
+
+When some inputs have not been provided yet (for example while a rule is still
+being edited), `partially_evaluate` computes every part of the expression that
+can already be determined and leaves a residual expression referencing the
+inputs that are still missing.
+
+```ruby
+calc = Dentaku::Calculator.new
+result = calc.partially_evaluate("1 + 2 + x")
+result.resolvable?        #=> false
+result.missing_variables  #=> ["x"]
+result.errors             #=> []
+result.to_s               #=> "3 + x"
+
+# supply the missing input later and continue from the residual expression
+calc.evaluate!(result.to_s, x: 10)   #=> 13
+
+# once every input is present the residual is a single constant
+calc.partially_evaluate("2 * (3 + 4)").value   #=> 14
+```
+
+Three different situations are reported separately:
+
+* an identifier that was never supplied stays a variable in the residual and is
+  listed in `missing_variables`
+* an identifier explicitly supplied as `nil` is treated as a real value
+  (`NULL`), exactly like a complete evaluation
+* a subtree that fails while being folded (e.g. division by zero) is left in
+  the residual and the exception is collected in `errors`
+
+Folding is conservative. Volatile functions are never invoked during partial
+evaluation, and an unselected `IF` branch or a short-circuited `AND`/`OR`
+operand is never executed just to simplify it. As a result the residual never
+triggers more function calls than a complete evaluation of the same data, and
+it keeps the original operator precedence so it can be re-parsed after the
+remaining inputs are supplied.
+
+`partially_evaluate` also accepts an array of expressions and is exposed at the
+module level as `Dentaku.partially_evaluate(expression, data)`.
+
 INLINE COMMENTS
 ---------------------------------
 

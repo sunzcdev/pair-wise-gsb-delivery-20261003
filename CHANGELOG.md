@@ -1,5 +1,18 @@
 # Change Log
 
+## [Unreleased]
+- add `Calculator#partially_evaluate` (and `Dentaku.partially_evaluate`) for
+  partial evaluation against an incomplete context. It returns a
+  `Dentaku::PartialEvaluation` holding the residual expression (parts that
+  could already be computed are folded into constants), the inputs that are
+  still missing, and any evaluation errors. An identifier that was not
+  supplied is kept distinct from an explicitly supplied `nil` and from an
+  erroring subtree. Only deterministic, side-effect-free subtrees are folded:
+  volatile functions are never called, unselected `IF` branches and
+  short-circuited `AND`/`OR` operands are never executed, and the residual
+  preserves operator precedence so it can be evaluated again once the
+  remaining inputs are provided.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

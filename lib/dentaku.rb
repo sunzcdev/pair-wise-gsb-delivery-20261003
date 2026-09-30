@@ -17,6 +17,10 @@ module Dentaku
     calculator.value.evaluate!(expression, data, &block)
   end
 
+  def self.partially_evaluate(expression, data = {})
+    calculator.value.partially_evaluate(expression, data)
+  end
+
   def self.enable_caching!
     enable_ast_cache!
     enable_dependency_order_cache!

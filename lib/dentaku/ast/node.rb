@@ -23,6 +23,17 @@ module Dentaku
         []
       end
 
+      # Partial evaluation hook. By default a node cannot be simplified,
+      # so it is returned as-is; node classes that can fold override this.
+      # +evaluator+ is the Dentaku::PartialEvaluator driving the walk and
+      # +guarded+ is true while reducing a branch the full evaluation
+      # would not necessarily execute (unselected IF branch, right-hand
+      # side of a short-circuit combinator), where function calls are
+      # forbidden.
+      def partial(evaluator, guarded)
+        self
+      end
+
       # whether this subtree may be evaluated during dependency resolution
       # without running volatile user code; a property of the parsed AST,
       # computed once and memoized

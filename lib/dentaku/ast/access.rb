@@ -51,6 +51,24 @@ module Dentaku
         visitor.visit_access(self)
       end
 
+      def partial(evaluator, guarded)
+        reduced_structure = evaluator.reduce(@structure, guarded: guarded)
+        reduced_index = evaluator.reduce(@index, guarded: guarded)
+
+        if evaluator.constant?(reduced_structure) && evaluator.constant?(reduced_index)
+          rebuilt = evaluator.rebuild(self.class, reduced_structure, reduced_index)
+          return self if rebuilt.nil?
+          value = evaluator.evaluate_node(rebuilt)
+          return rebuilt if evaluator.error_result?(value)
+
+          return evaluator.constant_for(value)
+        end
+
+        return self if reduced_structure.equal?(@structure) && reduced_index.equal?(@index)
+
+        evaluator.rebuild(self.class, reduced_structure, reduced_index) || self
+      end
+
       private
 
       def compute_pure?

@@ -34,6 +34,21 @@ module Dentaku
         visitor.visit_array(self)
       end
 
+      def partial(evaluator, guarded)
+        reduced_elements = @elements.map { |element| evaluator.reduce(element, guarded: guarded) }
+
+        if reduced_elements.all? { |element| evaluator.constant?(element) }
+          rebuilt = evaluator.rebuild(self.class, *reduced_elements)
+          return self if rebuilt.nil?
+
+          return evaluator.constant_for(rebuilt.value)
+        end
+
+        return self if reduced_elements.each_with_index.all? { |element, i| element.equal?(@elements[i]) }
+
+        evaluator.rebuild(self.class, *reduced_elements) || self
+      end
+
       private
 
       def compute_pure?

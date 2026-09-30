@@ -102,12 +102,50 @@ module Dentaku
       @output << "NULL"
     end
 
+    def visit_constant(node)
+      @output << print_value(node.value)
+    end
+
+    def visit_grouping(node)
+      @output << "("
+      node.node.accept(self)
+      @output << ")"
+    end
+
     def visit_array(node)
       @output << node.value.to_s
     end
 
     def to_s
       @output
+    end
+
+    private
+
+    # Render a folded Ruby value so the residual expression stays a valid
+    # Dentaku expression with the original precedence.
+    def print_value(value)
+      case value
+      when true then "true"
+      when false then "false"
+      when nil then "NULL"
+      when ::String then %Q{"#{value.gsub('"', '\"')}"}
+      when ::Float then value.to_s("F")
+      when ::Date, ::Time, ::DateTime then datetime_literal(value)
+      when ::Array then "{#{value.map { |v| print_value(v) }.join(', ')}}"
+      else value.to_s
+      end
+    end
+
+    def datetime_literal(value)
+      date_only = value.class == ::Date ||
+                  (value.respond_to?(:hour) && value.hour.zero? &&
+                   value.min.zero? && value.sec.zero?)
+      if date_only
+        value.strftime('%Y-%m-%d')
+      else
+        value.strftime('%Y-%m-%d %H:%M:%S')
+      end
     end
   end
 end

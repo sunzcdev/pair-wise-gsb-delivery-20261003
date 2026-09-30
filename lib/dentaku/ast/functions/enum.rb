@@ -22,12 +22,34 @@ module Dentaku
         item_identifier = @args[1].identifier
         expression      = @args[2]
 
-        collection_deps = collection.dependencies(context)
-        expression_deps = (expression&.dependencies(context) || []).reject do |i|
+        deps = collection.dependencies(context)
+        deps += (expression&.dependencies(context) || []).reject do |i|
           i == item_identifier || i.start_with?("#{item_identifier}.")
         end
+        deps.uniq
+      end
 
-        collection_deps + expression_deps
+      def partial(evaluator, guarded)
+        # The body runs once per collection element and binds the item
+        # identifier, so it is never structurally folded.
+        return self if guarded
+
+        context = evaluator.context
+        external_deps = dependencies(AST::Node::STATIC_CONTEXT).reject { |name| context.key?(name) }
+
+        if external_deps.empty?
+          value = evaluator.evaluate_node(self)
+          return self if evaluator.error_result?(value)
+
+          return evaluator.constant_for(value)
+        end
+
+        collection = @args[0]
+        reduced_collection = evaluator.reduce(collection, guarded: false)
+
+        return self if reduced_collection.equal?(collection)
+
+        evaluator.rebuild(self.class, reduced_collection, @args[1], @args[2]) || self
       end
 
       def validate_identifier(arg, message = "#{name}() requires second argument to be an identifier")

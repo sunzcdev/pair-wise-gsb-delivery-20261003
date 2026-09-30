@@ -34,6 +34,15 @@ module Dentaku
         visitor.visit_case_conditional(self)
       end
 
+      def partial(evaluator, guarded)
+        reduced_when = evaluator.reduce(@when, guarded: true)
+        reduced_then = evaluator.reduce(@then, guarded: true)
+
+        return self if reduced_when.equal?(@when) && reduced_then.equal?(@then)
+
+        evaluator.rebuild(self.class, reduced_when, reduced_then) || self
+      end
+
       private
 
       def compute_pure?

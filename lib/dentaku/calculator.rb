@@ -2,6 +2,8 @@ require 'dentaku/bulk_expression_solver'
 require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
+require 'dentaku/partial_evaluation'
+require 'dentaku/partial_evaluator'
 require 'dentaku/parser'
 require 'dentaku/string_casing'
 require 'dentaku/token'
@@ -91,6 +93,25 @@ module Dentaku
 
     private def evaluate_array!(expression, data = {}, &block)
       expression.map { |e| evaluate!(e, data, &block) }
+    end
+
+    # Partially evaluate an expression against a possibly incomplete
+    # context. Returns a Dentaku::PartialEvaluation holding the residual
+    # expression (the already computed parts folded into constants), the
+    # inputs that are still missing and any evaluation errors.
+    #
+    # Unknown identifiers, explicitly supplied nil values and errors are
+    # reported separately. Folding never invokes a volatile function and
+    # never executes an unselected IF branch or a short-circuited
+    # operand, so the residual cannot have triggered more function calls
+    # than a complete evaluation of the same data.
+    def partially_evaluate(expression, data = {})
+      context = evaluation_context(data, :strict)
+      return expression.map { |e| partially_evaluate(e, context) } if expression.is_a?(Array)
+
+      store(context) do
+        PartialEvaluator.new(memory).evaluate(ast(expression))
+      end
     end
 
     def solve!(expression_hash)

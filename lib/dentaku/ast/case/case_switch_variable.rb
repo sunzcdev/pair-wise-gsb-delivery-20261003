@@ -31,6 +31,11 @@ module Dentaku
         visitor.visit_switch(self)
       end
 
+      def partial(evaluator, guarded)
+        reduced = evaluator.reduce(@node, guarded: guarded)
+        reduced.equal?(@node) ? self : (evaluator.rebuild(self.class, reduced) || self)
+      end
+
       private
 
       def compute_pure?

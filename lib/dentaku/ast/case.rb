@@ -84,6 +84,88 @@ module Dentaku
         visitor.visit_case(self)
       end
 
+      def partial(evaluator, guarded)
+        # volatile/impure guards mean the CASE cannot be pruned at all;
+        # the guarded walk still folds pure arithmetic but calls nothing
+        return partial_guarded(evaluator) if guarded || !prunable?
+
+        reduced_switch = evaluator.reduce(switch, guarded: false)
+
+        if evaluator.constant?(reduced_switch.node)
+          switch_value = evaluator.evaluate_node(reduced_switch.node)
+
+          unless evaluator.error_result?(switch_value)
+            matched_then, error_hit = prune_conditions(evaluator, switch_value)
+            return evaluator.embed(evaluator.reduce(matched_then.node, guarded: false)) if matched_then
+            return self if error_hit
+
+            if @else && @conditions.all? { |condition| evaluator.constant?(condition.when.node) }
+              return evaluator.embed(evaluator.reduce(@else.node, guarded: false))
+            end
+          end
+        end
+
+        partial_rebuild(reduced_switch, evaluator)
+      rescue ::StandardError => e
+        evaluator.record_error(e)
+        self
+      end
+
+      # evaluates when-clauses in order, mirroring a complete evaluation,
+      # so a failing guard aborts pruning instead of being skipped
+      def prune_conditions(evaluator, switch_value)
+        @conditions.each do |condition|
+          when_node = condition.when.node
+          return [nil, true] unless evaluator.constant?(when_node)
+
+          when_value = evaluator.evaluate_node(when_node)
+          return [nil, true] if evaluator.error_result?(when_value)
+
+          return [condition.then, false] if when_value == switch_value
+        end
+
+        [nil, false]
+      end
+
+      def partial_guarded(evaluator)
+        reduced_switch = evaluator.reduce(switch, guarded: true)
+        reduced_conditions = @conditions.map { |condition| evaluator.reduce(condition, guarded: true) }
+        reduced_else = @else && evaluator.reduce(@else, guarded: true)
+
+        unchanged = reduced_switch.equal?(switch) &&
+                    reduced_conditions.each_with_index.all? { |c, i| c.equal?(@conditions[i]) } &&
+                    (!@else || reduced_else.equal?(@else))
+        return self if unchanged
+
+        build_case(reduced_switch, reduced_conditions, reduced_else || @else)
+      end
+
+      def partial_rebuild(reduced_switch, evaluator)
+        # guards beyond the switch are only reduced without invoking
+        # anything: they only execute when earlier clauses do not match
+        reduced_conditions = @conditions.map { |condition| evaluator.reduce(condition, guarded: true) }
+        reduced_else = @else && evaluator.reduce(@else, guarded: true)
+
+        unchanged = reduced_switch.equal?(switch) &&
+                    reduced_conditions.each_with_index.all? { |c, i| c.equal?(@conditions[i]) } &&
+                    (!@else || reduced_else.equal?(@else))
+        return self if unchanged
+
+        build_case(reduced_switch, reduced_conditions, reduced_else || @else)
+      end
+
+      def build_case(reduced_switch, reduced_conditions, reduced_else)
+        nodes = [reduced_switch] + reduced_conditions
+        nodes << reduced_else if reduced_else
+        # can't pass a failure signal through the splat easily; on a
+        # constructor error keep the original node untouched
+        begin
+          self.class.new(*nodes)
+        rescue ::StandardError
+          self
+        end
+      end
+
       private
 
       # pruning evaluates the switch and each when-clause until one matches;

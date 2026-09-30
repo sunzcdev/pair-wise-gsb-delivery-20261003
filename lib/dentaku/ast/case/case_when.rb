@@ -35,6 +35,11 @@ module Dentaku
         'WHEN'
       end
 
+      def partial(evaluator, guarded)
+        reduced = evaluator.reduce(@node, guarded: true)
+        reduced.equal?(@node) ? self : (evaluator.rebuild(self.class, reduced) || self)
+      end
+
       private
 
       # bypasses Operation's binary initialize, so left/right are unset
