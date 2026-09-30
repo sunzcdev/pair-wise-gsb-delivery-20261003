@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `Validated` values can now carry an explicit error merge rule built with `Validated.rule`. The rule, rather than an overloaded `+` operator, decides how errors accumulate. It is preserved by `#apply`, `#alt_map`, and `List<Validated>#traverse`, and combining values built with different explicit rules raises `Dry::Monads::ValidatedRuleMismatchError`. Use `rule.invalid(error)` / `rule.valid(value)` to construct values carrying the rule. Code that doesn't configure a rule keeps accumulating errors with `+` exactly as before.
+
 ### Changed
 
 ### Deprecated

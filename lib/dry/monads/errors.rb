@@ -28,5 +28,21 @@ module Dry
         )
       end
     end
+
+    # Raised when two Validated values carrying distinct explicit
+    # error merge rules are combined.
+    class ValidatedRuleMismatchError < ::StandardError
+      attr_reader :left_rule, :right_rule
+
+      def initialize(left_rule, right_rule)
+        @left_rule = left_rule
+        @right_rule = right_rule
+
+        super(
+          "Cannot combine Validated values with different error merge rules: " \
+          "#{left_rule.inspect} vs #{right_rule.inspect}"
+        )
+      end
+    end
   end
 end
