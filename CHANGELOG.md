@@ -6,6 +6,7 @@
 ### Added
 
 - Add a warning about deprecation of the gem (via #89) (@solnic)
+- Add multibindings: `#bind` registers named members with tags and a stable order, `#resolve_all` resolves an ordered, filterable set and members remain resolvable individually; sets merged into namespaces share their cached members
 
 
 [Compare v0.11.0...master](https://github.com/dry-rb/dry-container/compare/v0.11.0...master)

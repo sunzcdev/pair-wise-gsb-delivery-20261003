@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "dry/container/collection"
+
 module Dry
   class Container
     # Default resolver for resolving items from container
@@ -33,6 +35,40 @@ module Dry
         end
 
         item.call
+      end
+
+      # Resolve a multibinding collection into an ordered array of members
+      #
+      # @param [Concurrent::Hash] container
+      #   The container
+      # @param [Mixed] tag
+      #   The collection key to resolve
+      # @param [Array<Mixed>] tags
+      #   Extra tags to filter members by (resolved together with +tag+)
+      # @yield [Dry::Container::Member]
+      #   Optional filter evaluated against member metadata before calling, so
+      #   factories of members that do not match never run
+      #
+      # @raise [KeyError]
+      #   If the given tag is not a registered collection
+      #
+      # @return [Array<Mixed>]
+      #
+      # @api public
+      def resolve_all(container, tag, tags = [], &filter)
+        key = tag.to_s
+
+        collection = container.fetch(key) do
+          raise KeyError.new(
+            %(collection not found: "#{key}"), key: key, receiver: container
+          )
+        end
+
+        unless collection.is_a?(::Dry::Container::Collection)
+          raise Error, "item registered with #{key.inspect} is not a collection"
+        end
+
+        collection.call(tags.map(&:to_s), &filter)
       end
 
       # Check whether an items is registered under the given key

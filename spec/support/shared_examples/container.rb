@@ -702,4 +702,354 @@ RSpec.shared_examples "a container" do
       expect(container.resolve("missing") { :fallback }).to be(:fallback)
     end
   end
+
+  describe "multibindings" do
+    describe "#bind" do
+      it "resolves the whole collection and individual members" do
+        container.bind(:handlers, :a) { "a" }
+        container.bind(:handlers, :b) { "b" }
+
+        expect(container.resolve_all(:handlers)).to eq(%w[a b])
+        expect(container.resolve("handlers.a")).to eq("a")
+        expect(container.resolve("handlers.b")).to eq("b")
+        expect(container[:"handlers.b"]).to eq("b")
+      end
+
+      it "keeps member keys out of #keys" do
+        container.bind(:handlers, :a) { "a" }
+
+        expect(container.keys).to eq(["handlers", "handlers.a"])
+      end
+
+      it "orders members by explicit :order first and registration order after" do
+        container.bind(:handlers, :late, -> { "late" }, order: 10)
+        container.bind(:handlers, :early, -> { "early" }, order: 1)
+        container.bind(:handlers, :default, -> { "default" })
+        container.bind(:handlers, :also_default, -> { "also_default" })
+
+        expect(container.resolve_all(:handlers)).to eq(
+          %w[early late default also_default]
+        )
+      end
+
+      it "does not depend on hash iteration order" do
+        10.times do |index|
+          container.bind(:handlers, "m#{index}") { index }
+        end
+
+        expect(container.resolve_all(:handlers)).to eq((0..9).to_a)
+      end
+
+      it "resolves repeatedly in the same order" do
+        container.bind(:handlers, :b) { "b" }
+        container.bind(:handlers, :a) { "a" }
+
+        expect(container.resolve_all(:handlers)).to eq(%w[b a])
+        expect(container.resolve_all(:handlers)).to eq(%w[b a])
+      end
+
+      it "raises on duplicate names and reports both sources" do
+        container.bind(:handlers, :shared, -> { }, source: "module-a")
+
+        expect {
+          container.bind(:handlers, :shared, -> { }, source: "module-b")
+        }.to raise_error(
+          Dry::Container::Error,
+          /member named "shared".*collection "handlers".*"module-a".*"module-b"/m
+        )
+      end
+
+      it "defaults the source in the conflict message" do
+        container.bind(:handlers, :shared) { }
+
+        expect {
+          container.bind(:handlers, :shared) { }
+        }.to raise_error(Dry::Container::Error, /"container"/)
+      end
+
+      it "refuses to bind onto a regular item" do
+        container.register(:handlers, "plain")
+
+        expect {
+          container.bind(:handlers, :a) { }
+        }.to raise_error(Dry::Container::Error, /already used by a regular item/)
+      end
+
+      it "refuses to register a regular item over a collection" do
+        container.bind(:handlers, :a) { }
+
+        expect {
+          container.register(:handlers, "plain")
+        }.to raise_error(Dry::Container::Error)
+      end
+
+      it "refuses to register a regular item over a member key" do
+        container.bind(:handlers, :a) { }
+
+        expect {
+          container.register("handlers.a", "plain")
+        }.to raise_error(Dry::Container::Error)
+      end
+
+      context "callable and memoize per member" do
+        it "keeps a proc as-is with call: false" do
+          container.bind(:handlers, :a, -> { "a" }, call: false)
+
+          expect(container.resolve("handlers.a").call).to eq("a")
+        end
+
+        it "memoizes members independently" do
+          container.bind(:handlers, :memo, -> { Object.new }, memoize: true)
+          container.bind(:handlers, :plain, -> { Object.new })
+
+          expect(container.resolve("handlers.memo")).to be(container.resolve("handlers.memo"))
+          expect(container.resolve("handlers.plain")).to_not be(
+            container.resolve("handlers.plain")
+          )
+        end
+
+        it "rejects memoize for non-callables per member" do
+          expect {
+            container.bind(:handlers, :a, "value", memoize: true)
+          }.to raise_error(Dry::Container::Error)
+        end
+      end
+    end
+
+    describe "#resolve_all" do
+      it "raises KeyError for an unknown collection" do
+        expect { container.resolve_all(:missing) }.to raise_error(KeyError) do |error|
+          expect(error.key).to eq("missing")
+        end
+      end
+
+      it "raises when the key points at a regular item" do
+        container.register(:handlers, "plain")
+
+        expect {
+          container.resolve_all(:handlers)
+        }.to raise_error(Dry::Container::Error, /not a collection/)
+      end
+
+      context "tag filtering" do
+        before do
+          container.bind(:handlers, :a, -> { "a" }, tags: :async)
+          container.bind(:handlers, :b, -> { "b" }, tags: %i[async retries])
+          container.bind(:handlers, :c, -> { "c" }, tags: :sync)
+        end
+
+        it "returns members matching any of the given tags in collection order" do
+          expect(container.resolve_all(:handlers, :async)).to eq(%w[a b])
+          expect(container.resolve_all(:handlers, :sync)).to eq(%w[c])
+          expect(container.resolve_all(:handlers, :retries, :sync)).to eq(%w[b c])
+        end
+
+        it "does not execute factories of filtered-out members" do
+          executed = []
+          container.bind(:handlers, :never, -> { executed << :never }, tags: :never)
+
+          result = container.resolve_all(:handlers, :sync)
+
+          expect(result).to eq(%w[c])
+          expect(executed).to be_empty
+        end
+      end
+
+      context "block filtering" do
+        it "filters by member metadata without calling unselected factories" do
+          executed = []
+          container.bind(:handlers, :yes, -> { executed << :yes; "yes" }, order: 1)
+          container.bind(:handlers, :no, -> { executed << :no; "no" }, order: 2)
+
+          result = container.resolve_all(:handlers) { |member| member.order == 1 }
+
+          expect(result).to eq(%w[yes])
+          expect(executed).to eq([:yes])
+        end
+
+        it "exposes name, tags and order to the filter" do
+          container.bind(:handlers, :a, -> { "a" }, order: 1, tags: :special)
+          container.bind(:handlers, :b, -> { "b" }, order: 2)
+
+          seen = nil
+          container.resolve_all(:handlers) { |member|
+            seen ||= {name: member.name, tags: member.tags, order: member.order}
+            true
+          }
+
+          expect(seen).to include(name: "a", order: 1)
+          expect(seen[:tags]).to include("special", "a")
+        end
+      end
+
+      context "shared memoization" do
+        it "shares the same cached member between set and single resolution" do
+          container.bind(:handlers, :a, -> { Object.new }, memoize: true)
+
+          from_set = container.resolve_all(:handlers).first
+          from_single = container.resolve("handlers.a")
+
+          expect(from_set).to be(from_single)
+        end
+
+        it "shares cache between single and set resolution regardless of order" do
+          container.bind(:handlers, :a, -> { Object.new }, memoize: true)
+
+          from_single = container.resolve("handlers.a")
+          from_set = container.resolve_all(:handlers).first
+
+          expect(from_single).to be(from_set)
+        end
+      end
+    end
+
+    describe "#merge" do
+      it "unions members of the same collection" do
+        other = Dry::Container.new
+        container.bind(:handlers, :a) { "a" }
+        other.bind(:handlers, :b) { "b" }
+
+        container.merge(other)
+
+        expect(container.resolve_all(:handlers)).to eq(%w[a b])
+        expect(container.resolve("handlers.b")).to eq("b")
+      end
+
+      it "reports both sources when merged member names collide" do
+        other = Dry::Container.new
+        container.bind(:handlers, :a, -> { }, source: "left")
+        other.bind(:handlers, :a, -> { }, source: "right")
+
+        expect {
+          container.merge(other)
+        }.to raise_error(Dry::Container::Error, /"left".*"right"/m)
+      end
+
+      it "preserves deterministic ordering across the union" do
+        other = Dry::Container.new
+        container.bind(:handlers, :a, -> { "a" }, order: 2)
+        other.bind(:handlers, :b, -> { "b" }, order: 1)
+
+        container.merge(other)
+
+        expect(container.resolve_all(:handlers)).to eq(%w[b a])
+      end
+
+      it "shares the cached member between set and single resolution after merge" do
+        other = Dry::Container.new
+        container.bind(:handlers, :a, -> { Object.new }, memoize: true)
+        other.bind(:handlers, :b, -> { Object.new }, memoize: true)
+
+        container.merge(other)
+
+        expect(container.resolve("handlers.a")).to be(
+          container.resolve_all(:handlers).first
+        )
+        expect(container.resolve("handlers.b")).to be(
+          container.resolve_all(:handlers).last
+        )
+      end
+
+      it "keeps collection filtering lazy after merge" do
+        other = Dry::Container.new
+        executed = []
+        container.bind(:handlers, :a, -> { executed << :a; "a" }, tags: :keep)
+        other.bind(:handlers, :b, -> { executed << :b; "b" }, tags: :drop)
+
+        container.merge(other)
+
+        expect(container.resolve_all(:handlers, :keep)).to eq(%w[a])
+        expect(executed).to eq([:a])
+      end
+
+      context "into a namespace" do
+        let(:other) do
+          Dry::Container.new.tap { |c|
+            c.bind(:handlers, :a, -> { Object.new }, memoize: true, tags: :special)
+          }
+        end
+
+        before { container.merge(other, namespace: "events") }
+
+        it "prefixes the collection tag" do
+          expect(container.resolve_all("events.handlers").size).to be(1)
+          expect(container.resolve_all("events.handlers", :special)).to_not be_empty
+        end
+
+        it "resolves individual members under the namespace" do
+          expect(container.resolve("events.handlers.a")).to be_a(Object)
+        end
+
+        it "shares one cached member between both resolutions" do
+          from_set = container.resolve_all("events.handlers").first
+          from_single = container.resolve("events.handlers.a")
+
+          expect(from_set).to be(from_single)
+        end
+
+        it "does not leave the unprefixed keys behind" do
+          expect(container.key?("handlers")).to be(false)
+          expect(container.key?("handlers.a")).to be(false)
+        end
+      end
+    end
+
+    describe "namespace" do
+      it "binds and resolves inside a namespace" do
+        container.namespace("events") do
+          bind(:handlers, :a) { "a" }
+          bind(:handlers, :b) { "b" }
+        end
+
+        expect(container.resolve_all("events.handlers")).to eq(%w[a b])
+        expect(container.resolve("events.handlers.a")).to eq("a")
+      end
+
+      it "supports nested namespaces" do
+        container.namespace("events") do
+          namespace("ingest") do
+            bind(:handlers, :a) { "a" }
+          end
+        end
+
+        expect(container.resolve_all("events.ingest.handlers")).to eq(%w[a])
+        expect(container.resolve("events.ingest.handlers.a")).to eq("a")
+      end
+
+      it "keeps member names stable across a namespace merge" do
+        other = Dry::Container.new
+        other.namespace("events") do
+          bind(:handlers, :a) { "a" }
+        end
+
+        container.merge(other)
+
+        expect(container.resolve_all("events.handlers")).to eq(%w[a])
+        expect(container.resolve("events.handlers.a")).to eq("a")
+      end
+    end
+
+    describe "#freeze" do
+      it "forbids binding after freezing" do
+        container.bind(:handlers, :a) { "a" }
+        container.freeze
+
+        expect {
+          container.bind(:handlers, :b) { "b" }
+        }.to raise_error(FrozenError, /attempting to bind 'b' to 'handlers'/)
+      end
+    end
+
+    describe "#dup and #clone" do
+      it "does not share multibindings with the copy" do
+        container.bind(:handlers, :a) { "a" }
+
+        copy = container.dup
+        copy.bind(:handlers, :b) { "b" }
+
+        expect(container.resolve_all(:handlers)).to eq(%w[a])
+        expect(copy.resolve_all(:handlers)).to eq(%w[a b])
+      end
+    end
+  end
 end

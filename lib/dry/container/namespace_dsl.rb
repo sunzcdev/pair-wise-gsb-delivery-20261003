@@ -37,6 +37,10 @@ module Dry
         super(namespaced(key), *args, &block)
       end
 
+      def bind(tag, name, *args, &block)
+        super(namespaced(tag), name, *args, &block)
+      end
+
       def namespace(namespace, &block)
         super(namespaced(namespace), &block)
       end
@@ -49,6 +53,10 @@ module Dry
 
       def resolve(key)
         super(namespaced(key))
+      end
+
+      def resolve_all(tag, *args, &block)
+        super(namespaced(tag), *args, &block)
       end
 
       private

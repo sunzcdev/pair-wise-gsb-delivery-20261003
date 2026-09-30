@@ -2,6 +2,9 @@
 
 require "concurrent/hash"
 
+require "dry/container/collection"
+require "dry/container/member"
+
 module Dry
   class Container
     # @api public
@@ -160,6 +163,47 @@ module Dry
               "can't modify frozen #{self.class} (when attempting to register '#{key}')"
       end
 
+      # Bind a named member of a multibinding collection
+      #
+      # @param [Mixed] tag
+      #   The collection key the member belongs to; used to resolve the set
+      # @param [Mixed] name
+      #   Stable name of the member within the collection
+      # @param [Mixed] contents
+      #   The item to register (if no block given)
+      # @param [Hash] options
+      #   Options to pass to the registry when registering the member
+      # @option options [Symbol, Array] :tags
+      #   Additional tags the member can be filtered by
+      # @option options [Integer] :order
+      #   Explicit weight used to order the set
+      # @option options [String] :source
+      #   Origin of the binding, used in name-conflict errors
+      # @yield
+      #   If a block is given, contents will be ignored and the block is used
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def bind(tag, name, contents = nil, options = EMPTY_HASH, &block)
+        if block_given?
+          item = block
+          options = contents if contents.is_a?(::Hash)
+        else
+          item = contents
+        end
+
+        options = options.merge(namespace_separator: config.namespace_separator)
+
+        config.registry.bind(_container, tag, name, item, options)
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} " \
+              "(when attempting to bind '#{name}' to '#{tag}')"
+      end
+
       # Resolve an item from the container
       #
       # @param [Mixed] key
@@ -173,6 +217,23 @@ module Dry
       # @api public
       def resolve(key, &block)
         config.resolver.call(_container, key, &block)
+      end
+
+      # Resolve a multibinding collection into an ordered array of members
+      #
+      # @param [Mixed] tag
+      #   The collection key to resolve
+      # @param [Array<Mixed>] tags
+      #   Extra tags to filter the members by
+      # @yield [Dry::Container::Member]
+      #   Optional filter evaluated against member metadata before calling, so
+      #   factories of unselected members never run
+      #
+      # @return [Array<Mixed>]
+      #
+      # @api public
+      def resolve_all(tag, *tags, &filter)
+        config.resolver.resolve_all(_container, tag, tags, &filter)
       end
 
       # Resolve an item from the container
@@ -199,18 +260,70 @@ module Dry
       #
       # @api public
       def merge(other, namespace: nil, &block)
-        if namespace
-          _container.merge!(
-            other._container.each_with_object(::Concurrent::Hash.new) { |(key, item), hsh|
-              hsh[PREFIX_NAMESPACE.call(namespace, key, config)] = item
-            },
-            &block
+        target = _container
+        separator = config.namespace_separator
+
+        collections, others = other._container.partition { |_, entry|
+          entry.is_a?(::Dry::Container::Collection)
+        }
+
+        others.each do |key, entry|
+          next if entry.is_a?(::Dry::Container::Member)
+
+          prefixed_key = namespace ? PREFIX_NAMESPACE.call(namespace, key, config) : key
+          merge_item(target, prefixed_key, entry, &block)
+        end
+
+        collections.each do |key, collection|
+          prefixed_key = namespace ? PREFIX_NAMESPACE.call(namespace, key, config) : key
+          merge_collection(
+            target, prefixed_key, collection, namespace: namespace, separator: separator
           )
-        else
-          _container.merge!(other._container, &block)
         end
 
         self
+      end
+
+      # @api private
+      def merge_collection(target, key, collection, namespace:, separator:)
+        existing = target[key]
+
+        incoming =
+          if namespace
+            collection.prefix(namespace, separator)
+          else
+            collection
+          end
+
+        if existing.nil?
+          target[key] = incoming
+          owner = incoming
+        elsif existing.is_a?(::Dry::Container::Collection)
+          incoming.members.each { |member| existing.add(member) }
+          owner = existing
+        else
+          raise Error,
+                "Cannot merge collection #{key.inspect}: the key is already used " \
+                "by a regular item"
+        end
+
+        owner.members.each do |member|
+          member_key = [key, member.name].join(separator)
+          target[member_key] = owner.member(member.name)
+        end
+      end
+
+      # @api private
+      def merge_item(target, key, item)
+        if target.key?(key)
+          if block_given?
+            target[key] = yield(key, target[key], item)
+          else
+            raise Error, "There is already an item registered with the key #{key.inspect}"
+          end
+        else
+          target[key] = item
+        end
       end
 
       # Check whether an item is registered under the given key
@@ -335,7 +448,7 @@ module Dry
       # @api public
       def dup
         copy = super
-        copy.instance_variable_set(:@_container, _container.dup)
+        copy.instance_variable_set(:@_container, copied_container)
         copy
       end
 
@@ -343,9 +456,43 @@ module Dry
       def clone
         copy = super
         unless copy.frozen?
-          copy.instance_variable_set(:@_container, _container.dup)
+          copy.instance_variable_set(:@_container, copied_container)
         end
         copy
+      end
+
+      private
+
+      # Build an independent copy of the underlying storage. Collections and
+      # their members are mutable and shared between several keys, so a shallow
+      # hash copy would let duplicates and mutations leak across containers.
+      #
+      # @api private
+      def copied_container
+        copied = ::Concurrent::Hash.new
+        collections = {}
+
+        _container.each do |key, entry|
+          case entry
+          when ::Dry::Container::Collection
+            duplicate = entry.dup
+            collections[key] = duplicate
+            copied[key] = duplicate
+          when ::Dry::Container::Member
+            next
+          else
+            copied[key] = entry
+          end
+        end
+
+        collections.each do |tag, collection|
+          collection.members.each do |member|
+            copied[[tag, member.name].join(config.namespace_separator)] =
+              collection.member(member.name)
+          end
+        end
+
+        copied
       end
     end
     # rubocop:enable Metrics/ModuleLength
