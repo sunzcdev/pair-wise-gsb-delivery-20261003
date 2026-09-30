@@ -379,6 +379,10 @@ module Warden
     def _fetch_strategy(name, scope)
       @strategies[scope][name] ||= if klass = Warden::Strategies[name]
         klass.new(@env, scope)
+      elsif group = Warden::Strategies._all_of(name)
+        Warden::Strategies::AllOf.new(@env, scope, name, group) do |member_name|
+          _fetch_strategy(member_name, scope)
+        end
       elsif @config.silence_missing_strategies?
         nil
       else

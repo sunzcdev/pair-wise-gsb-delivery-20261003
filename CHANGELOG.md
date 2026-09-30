@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## Unreleased
+
+* Add optional all-of strategy groups: all member strategies must succeed and authenticate the same subject (compared by an application provided block) before the user is set into the scope
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)
