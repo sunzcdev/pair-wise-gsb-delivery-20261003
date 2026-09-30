@@ -2,6 +2,7 @@
 require "graphql/language/block_string"
 require "graphql/language/comment"
 require "graphql/language/printer"
+require "graphql/language/structural_fingerprint"
 require "graphql/language/sanitized_printer"
 require "graphql/language/document_from_schema_definition"
 require "graphql/language/generation"
