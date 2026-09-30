@@ -30,7 +30,11 @@ module JMESPath
     def initialize(options = {})
       @lexer = options[:lexer] || Lexer.new
       @disable_visit_errors = options[:disable_visit_errors]
+      @options = options
     end
+
+    # @api private
+    attr_reader :options
 
     # @param [String<JMESPath>] expression
     def parse(expression)

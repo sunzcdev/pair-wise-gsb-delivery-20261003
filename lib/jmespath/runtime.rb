@@ -57,7 +57,20 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # @param [String<JMESPath>] expression
+    # @param [Hash] data
+    # @return [JMESPath::SearchResult] Returns the matched values together with
+    #   the provenance (JSON Pointers) of each result value.
+    def search_with_sources(expression, data)
+      parsed_expression = @parser.parse(expression)
+      SourceVisitor.new(parser_options).visit(parsed_expression, data)
+    end
+
     private
+
+    def parser_options
+      @parser.respond_to?(:options) ? @parser.options : {}
+    end
 
     def default_parser(options)
       if options[:cache_expressions] == false

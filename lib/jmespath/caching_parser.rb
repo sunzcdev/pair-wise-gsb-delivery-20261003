@@ -9,6 +9,11 @@ module JMESPath
       @cache = {}
     end
 
+    # @api private
+    def options
+      @parser.respond_to?(:options) ? @parser.options : {}
+    end
+
     def parse(expression)
       if cached = @cache[expression]
         cached

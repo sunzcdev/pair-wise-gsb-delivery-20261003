@@ -43,6 +43,43 @@ JMESPath.search('foo.bar', { abc: "mno" })
 
 **[See the JMESPath specification for a full list of supported search expressions.](http://jmespath.org/specification.html)**
 
+## Searching With Sources
+
+When you need to know where every returned value came from (for example when
+debugging a configuration document), call `JMESPath.search_with_sources`. It
+returns a `JMESPath::SearchResult` with the same `value` that `search` would
+return plus a `sources` tree that mirrors the result shape.
+
+Each leaf is either:
+
+* `JMESPath::Sources::Origin` - the value was copied from the original
+  document; its `pointer` is an RFC 6901 JSON Pointer into the input.
+* `JMESPath::Sources::Derived` - the value was computed by the expression;
+  `inputs` lists the JSON Pointers of the direct inputs.
+
+Positions are propagated structurally, so filtering, slices, `[]` flatten and
+`sort_by` reordering keep pointing at the original location of each value;
+result array indices never replace source array indices. Equal values that
+appear more than once are tracked independently rather than located by value.
+
+```ruby
+result = JMESPath.search_with_sources(
+  'people[?age > `20`] | sort_by(@, &age) | [*].name',
+  { "people" => [
+    { "name" => "Zoe",  "age" => 40 },
+    { "name" => "Amy",  "age" => 30 }
+  ]}
+)
+result.value
+#=> ["Amy", "Zoe"]
+result.sources['sources']
+#=> [#<JMESPath::Sources::Origin pointer="/people/1/name">,
+#    #<JMESPath::Sources::Origin pointer="/people/0/name">]
+
+JMESPath.search_with_sources('length(people)', { "people" => [] }).sources
+#=> #<JMESPath::Sources::Derived inputs=["/people"]>
+```
+
 ## Indifferent Access
 
 The examples above show JMESPath expressions used to search over hashes with symbolized keys. You can use search also for hashes with string keys or Struct objects.
