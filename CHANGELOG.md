@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+- Add `Addressable::URI.constrained_resolve` and the bang variant
+  `Addressable::URI.constrained_resolve!` for resolving an externally
+  supplied reference against a base URI while enforcing an allowed origin
+  and an inclusive path directory boundary. Checks are performed on the
+  normalized, resolved components (origin per RFC 6454, including default
+  port elimination, and segment-wise path containment), so network-path
+  `//host` references, dot segments and percent-encoded traversal cannot be
+  smuggled past a raw string prefix check. Encoded separators such as
+  `%2F` are not decoded before comparison. Results are returned as an
+  `Addressable::URI::ConstrainedResolution` value object; rejections raise
+  `Addressable::URI::ConstraintViolation` with a specific reason.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

@@ -35,6 +35,116 @@ module Addressable
     end
 
     ##
+    # Raised by {Addressable::URI.constrained_resolve!} when a reference
+    # resolves outside of the caller supplied origin or directory boundary.
+    class ConstraintViolation < InvalidURIError
+      # @return [Symbol] A stable, machine readable reason code. Either
+      #   <code>:origin_not_allowed</code> or
+      #   <code>:path_outside_directory</code>.
+      attr_reader :reason
+
+      # @return [Addressable::URI] The normalized URI that was actually
+      #   judged when the violation was detected.
+      attr_reader :resolved_uri
+
+      # @api private
+      def initialize(message, reason, resolved_uri)
+        super(message)
+        @reason = reason
+        @resolved_uri = resolved_uri
+      end
+    end
+
+    ##
+    # The result of a constrained reference resolution, as returned by
+    # {Addressable::URI.constrained_resolve}.
+    #
+    # A resolution always carries the normalized URI that was actually
+    # judged, even when the reference is rejected. Callers must check
+    # {#allowed?} before using {#uri}; the object never implicitly behaves
+    # like a URI or String, so an unchecked result cannot be mistaken for a
+    # permitted one. {#to_s} serializes the same URI stored in {#uri}, so the
+    # reported value can never have two interpretations.
+    class ConstrainedResolution
+      # @return [Addressable::URI] The frozen, normalized resolved URI.
+      attr_reader :resolved_uri
+
+      # @return [Symbol, nil] A stable, machine readable reason code when the
+      #   reference is rejected (<code>:origin_not_allowed</code> or
+      #   <code>:path_outside_directory</code>), otherwise <code>nil</code>.
+      attr_reader :reason
+
+      # @return [String, nil] A human readable description of why the
+      #   reference was rejected, otherwise <code>nil</code>.
+      attr_reader :message
+      alias_method :violation_message, :message
+
+      # @api private
+      def initialize(resolved_uri, allowed, reason=nil, message=nil)
+        @resolved_uri = resolved_uri
+        @allowed = allowed
+        @reason = reason
+        @message = message
+      end
+
+      # Convenience alias for {#resolved_uri}.
+      #
+      # @return [Addressable::URI] The frozen, normalized resolved URI.
+      def uri
+        @resolved_uri
+      end
+
+      # @return [Boolean] <code>true</code> if the resolved URI shares an
+      #   allowed origin and stays within the directory boundary.
+      def allowed?
+        @allowed
+      end
+
+      # @return [Boolean] <code>true</code> if the resolved URI escapes the
+      #   allowed origin or directory boundary.
+      def rejected?
+        !@allowed
+      end
+
+      # @return [Symbol, nil] Alias for {#reason}.
+      def violation_reason
+        @reason
+      end
+
+      # Returns the resolved URI when the reference is allowed, otherwise
+      # raises {Addressable::URI::ConstraintViolation}.
+      #
+      # @return [Addressable::URI] The frozen, normalized resolved URI.
+      # @raise [Addressable::URI::ConstraintViolation]
+      #   If the reference is rejected.
+      def value!
+        unless @allowed
+          raise ConstraintViolation.new(
+            @message, @reason, @resolved_uri
+          )
+        end
+        @resolved_uri
+      end
+
+      # Serializes the judged URI. This is always the same value as
+      # <code>resolution.uri.to_s</code>, whether or not the reference was
+      # allowed.
+      #
+      # @return [String] The resolved URI as a String.
+      def to_s
+        @resolved_uri.to_s
+      end
+
+      # @return [String] A debugging representation of the resolution.
+      def inspect
+        sprintf(
+          "#<%s:%#0x allowed:%s URI:%s>",
+          self.class.to_s, self.object_id, @allowed, @resolved_uri.to_s
+        )
+      end
+    end
+
+    ##
     # Container for the character classes specified in
     # <a href="http://www.ietf.org/rfc/rfc3986.txt">RFC 3986</a>.
     #
@@ -352,6 +462,144 @@ module Addressable
         result.join!(uri)
       end
       return result
+    end
+
+    ##
+    # Resolves an externally supplied URI reference against a fixed base
+    # URI, but only accepts the result if it shares an allowed origin and
+    # stays within a fixed path directory.
+    #
+    # Unlike plain {Addressable::URI.join}, a reference such as
+    # <code>"../secret"</code> or <code>"//evil.example/x"</code> is resolved
+    # per
+    # <a href="https://www.rfc-editor.org/rfc/rfc3986#section-5">RFC 3986
+    # section 5</a> and then checked against the resolved components — never
+    # with a raw String prefix comparison.
+    #
+    # The checks are performed on the normalized, resolved URI:
+    # 1. Origin check (RFC 6454): the normalized scheme, host and port must
+    #    match one of <code>allowed_origins</code>. This rejects
+    #    <code>//host</code> network-path references and absolute
+    #    references that target another host, scheme or non-default port.
+    #    Default ports are eliminated, so <code>http://h:80</code> and
+    #    <code>http://h</code> share an origin.
+    # 2. Directory check: the normalized path must equal
+    #    <code>directory</code> or lie beneath it, compared segment by
+    #    segment. <code>/docs</code> and <code>/docs-old</code> are distinct
+    #    segments, so the latter is rejected.
+    #
+    # Percent encoding is handled at the component level: dot segments are
+    # detected after resolving and normalizing the path, while an encoded
+    # separator such as <code>%2F</code> remains data inside its segment and
+    # is never decoded into a slash before comparison. Encoded separators
+    # therefore cannot escape the directory boundary.
+    #
+    # Both empty references (<code>""</code>) and query-only references
+    # (<code>"?x=1"</code>) resolve to the base URI itself (or the base URI
+    # with its query replaced), which remains inside the boundary.
+    #
+    # @param [String, Addressable::URI, #to_str] base_uri
+    #   The fixed base URI. It must be absolute (scheme and host present)
+    #   and its path must be absolute.
+    # @param [String, Addressable::URI, #to_str] reference
+    #   The externally supplied, potentially relative reference.
+    # @param [String, Addressable::URI, #to_str, Array<String, Addressable::URI, #to_str>] allowed_origins
+    #   One or more allowed origins, e.g. <code>"http://example.com"</code>.
+    #   Only the scheme, host and port are considered; any path, query or
+    #   fragment in an allowed origin is ignored.
+    # @param [String, Addressable::URI, #to_str] directory
+    #   The inclusive path directory boundary, e.g. <code>"/docs"</code>.
+    #   If a URI is supplied, its normalized path is used.
+    #
+    # @return [Addressable::URI::ConstrainedResolution]
+    #   The resolution result. Inspect
+    #   {Addressable::URI::ConstrainedResolution#allowed?} before using
+    #   {Addressable::URI::ConstrainedResolution#uri}; a rejected result
+    #   still carries the judged URI in
+    #   {Addressable::URI::ConstrainedResolution#resolved_uri} along with a
+    #   specific {Addressable::URI::ConstrainedResolution#reason}.
+    #
+    # @raise [TypeError] If an argument cannot be converted to a URI.
+    # @raise [Addressable::URI::InvalidURIError]
+    #   If an argument cannot be parsed as a URI.
+    # @raise [ArgumentError] If the base URI is not absolute or the
+    #   directory boundary is not an absolute path.
+    #
+    # @example
+    #   result = Addressable::URI.constrained_resolve(
+    #     "http://example.com/docs/index.html",
+    #     "install.html",
+    #     "http://example.com",
+    #     "/docs"
+    #   )
+    #   result.allowed?       #=> true
+    #   result.uri.to_s       #=> "http://example.com/docs/install.html"
+    #
+    #   result = Addressable::URI.constrained_resolve(
+    #     "http://example.com/docs/index.html",
+    #     "../docs-old/x",
+    #     "http://example.com",
+    #     "/docs"
+    #   )
+    #   result.allowed?       #=> false
+    #   result.reason         #=> :path_outside_directory
+    #   result.uri.to_s       #=> "http://example.com/docs-old/x"
+    def self.constrained_resolve(base_uri, reference, allowed_origins, directory)
+      if base_uri.nil? || reference.nil? || allowed_origins.nil? ||
+          directory.nil?
+        raise TypeError, "Cannot resolve a URI relative to nil."
+      end
+      base = self.parse(base_uri)
+      unless base.scheme && base.host
+        raise ArgumentError,
+          "Base URI must be absolute (scheme and host required): " +
+          base.to_s.inspect
+      end
+
+      boundary_segments = constrained_boundary_segments(directory)
+
+      permitted_origins = Array(allowed_origins).map do |origin|
+        origin_tuple(self.parse(origin))
+      end.uniq
+
+      resolved = base.join(self.parse(reference)).normalize.freeze
+
+      unless permitted_origins.include?(origin_tuple(resolved))
+        serialized_origins = permitted_origins.map do |scheme, host, port|
+          port ? "#{scheme}://#{host}:#{port}" : "#{scheme}://#{host}"
+        end
+        return ConstrainedResolution.new(
+          resolved, false, :origin_not_allowed,
+          "Resolved URI origin #{resolved.origin.inspect} is not in the " +
+          "list of allowed origins #{serialized_origins.inspect}: " +
+          resolved.to_s.inspect
+        )
+      end
+
+      resolved_segments = path_segments(resolved.normalized_path)
+      unless segment_prefix?(boundary_segments, resolved_segments)
+        return ConstrainedResolution.new(
+          resolved, false, :path_outside_directory,
+          "Resolved URI path #{resolved.normalized_path.inspect} escapes " +
+          "the directory boundary #{segments_to_path(boundary_segments).inspect}: " +
+          resolved.to_s.inspect
+        )
+      end
+
+      ConstrainedResolution.new(resolved, true)
+    end
+
+    ##
+    # Exception raising form of {Addressable::URI.constrained_resolve}.
+    #
+    # @return [Addressable::URI] The frozen, normalized resolved URI.
+    #
+    # @raise [Addressable::URI::ConstraintViolation]
+    #   If the reference resolves outside the allowed origin or directory.
+    #
+    # @see Addressable::URI.constrained_resolve
+    def self.constrained_resolve!(*arguments)
+      constrained_resolve(*arguments).value!
     end
 
     ##
@@ -2469,6 +2717,82 @@ module Addressable
       end
 
       normalized_path
+    end
+
+    ##
+    # Builds a normalized origin tuple (scheme, host, port) for comparing
+    # origins per RFC 6454. Default ports are removed, and host case and
+    # IDNA differences are normalized.
+    #
+    # @param [Addressable::URI] uri The URI whose origin to extract.
+    #
+    # @return [Array(String, String, Integer, nil)] The normalized origin.
+    def self.origin_tuple(uri)
+      [
+        uri.normalized_scheme,
+        uri.normalized_host,
+        uri.normalized_port
+      ]
+    end
+
+    ##
+    # Computes the normalized, trailing-empty-free segment list of an
+    # absolute path directory boundary.
+    #
+    # @param [String, Addressable::URI, #to_str] directory
+    #   The directory boundary.
+    #
+    # @return [Array<String>] The normalized boundary path segments.
+    def self.constrained_boundary_segments(directory)
+      path = if directory.kind_of?(self)
+        directory.normalized_path
+      else
+        self.parse(directory).normalized_path
+      end
+      if path.nil? || path.empty? || path[0..0] != SLASH
+        raise ArgumentError,
+          "Directory boundary must be an absolute path: #{directory.inspect}"
+      end
+      path_segments(path)
+    end
+
+    ##
+    # Splits a normalized path on literal slash characters only. Percent
+    # encoded slashes (<code>%2F</code>) stay inside their segment, so they
+    # are never treated as separators.
+    #
+    # @param [String] path A normalized absolute path.
+    #
+    # @return [Array<String>] The meaningful path segments.
+    def self.path_segments(path)
+      segments = path.split(SLASH, -1)
+      segments.pop while segments.length > 1 && segments.last == EMPTY_STR
+      segments
+    end
+
+    ##
+    # Checks that <code>segments</code> equals or lies beneath
+    # <code>boundary</code>, one whole segment at a time. This ensures that
+    # <code>/docs</code> does not match <code>/docs-old</code>.
+    #
+    # @param [Array<String>] boundary The boundary segments.
+    # @param [Array<String>] segments The resolved path segments.
+    #
+    # @return [TrueClass, FalseClass]
+    def self.segment_prefix?(boundary, segments)
+      segments.length >= boundary.length &&
+        segments[0...boundary.length] == boundary
+    end
+
+    ##
+    # Serializes a segment list back into an absolute path String.
+    #
+    # @param [Array<String>] segments The path segments.
+    #
+    # @return [String] The absolute path.
+    def self.segments_to_path(segments)
+      return SLASH if segments == [EMPTY_STR]
+      segments.join(SLASH)
     end
 
     ##
