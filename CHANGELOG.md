@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+- add `Addressable::URI.constrained_join` (and an instance form) for
+  resolving relative references against a base URI while enforcing an
+  allowed origin and a path directory boundary. Returns a
+  `Addressable::URI::ConstrainedJoinResult` carrying the single
+  normalized resolved URI and a specific rejection reason
+  (`:invalid_base`, `:disallowed_origin`, or
+  `:path_outside_boundary`). Checks are performed on normalized
+  components: network-path references, dot segments (including
+  percent-encoded forms), default ports and percent-encoded separators
+  are handled without relying on raw string-prefix comparisons.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)
