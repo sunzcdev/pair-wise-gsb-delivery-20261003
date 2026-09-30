@@ -1287,6 +1287,36 @@ module Sinatra
       @env['rack.errors'].puts(msg)
     end
 
+    # Records declarations made through Sinatra's DSL while an extension is
+    # applied to a staging application by Base.register_atomically, so they
+    # can be replayed on the actual application once registration succeeds.
+    # @api private
+    module AtomicRegistrationRecorder
+      def route(verb, path, options = {}, &block)
+        super.tap { @declaration_log << [:route, [verb, path, options], block] }
+      end
+
+      def before(path = /.*/, **options, &block)
+        super.tap { @declaration_log << [:before, [path, options], block] }
+      end
+
+      def after(path = /.*/, **options, &block)
+        super.tap { @declaration_log << [:after, [path, options], block] }
+      end
+
+      def helpers(*extensions, &block)
+        super.tap { @declaration_log << [:helpers, extensions, block] }
+      end
+
+      def set(*args, &block)
+        super.tap { @declaration_log << [:set, args, block] }
+      end
+
+      # Extension hooks fire when the recorded declarations are replayed on
+      # the actual application, so they must not fire on the staging app.
+      def invoke_hook(name, *args); end
+    end
+
     class << self
       CALLERS_TO_IGNORE = [ # :nodoc:
         %r{/sinatra(/(base|main|show_exceptions))?\.rb$},   # all sinatra code
@@ -1567,6 +1597,70 @@ module Sinatra
         extensions.each do |extension|
           extend extension
           extension.registered(self) if extension.respond_to?(:registered)
+        end
+      end
+
+      # Like +register+, but atomic. The extension is first applied to a
+      # throwaway staging subclass of the application. Only when the
+      # extension's +registered+ hook completes successfully are the routes,
+      # helpers, filters and settings it declared published to the
+      # application. If the extension raises an error, all of those
+      # declarations are rolled back and the application is left unchanged.
+      #
+      # Note that only declarations made through Sinatra's DSL are
+      # transactional. Side effects of the extension itself (writing files,
+      # network calls, mutating global or external state, ...) are outside
+      # the scope of the rollback and persist even if registration fails.
+      #
+      # Registering the same extension reentrantly (e.g. an extension that
+      # calls +register_atomically+ with itself from its own +registered+
+      # hook) is detected and raises a RuntimeError.
+      def register_atomically(*extensions, &block)
+        extensions << Module.new(&block) if block_given?
+        in_progress = atomic_registrations_in_progress
+        extensions.each do |extension|
+          if in_progress.include?(extension)
+            raise "extension #{extension} is already being registered atomically"
+          end
+        end
+
+        log = []
+        staging = Class.new(self)
+        staging.instance_variable_set(:@atomic_registrations_in_progress, in_progress + extensions)
+        staging.instance_variable_set(:@declaration_log, log)
+        staging.extend(AtomicRegistrationRecorder)
+
+        # If this raises, the staging class is discarded and none of the
+        # declarations it recorded are published to this class.
+        staging.register(*extensions)
+
+        @extensions += extensions
+        extensions.each { |extension| extend extension }
+        log.each { |kind, args, block| publish_declaration(kind, args, block) }
+        self
+      end
+
+      # Extensions currently being registered atomically on this class or
+      # any of its superclasses. Used to detect reentrant registration.
+      # @api private
+      def atomic_registrations_in_progress
+        own = @atomic_registrations_in_progress || []
+        if superclass.respond_to?(:atomic_registrations_in_progress)
+          own + superclass.atomic_registrations_in_progress
+        else
+          own
+        end
+      end
+
+      # Replays a declaration recorded by AtomicRegistrationRecorder while
+      # an extension was applied to the staging application.
+      # @api private
+      def publish_declaration(kind, args, block)
+        case kind
+        when :route          then route(*args, &block)
+        when :before, :after then add_filter(kind, args[0], **args[1], &block)
+        when :helpers        then helpers(*args, &block)
+        when :set            then set(*args, &block)
         end
       end
 
@@ -2117,7 +2211,8 @@ module Sinatra
     delegate :get, :patch, :put, :post, :delete, :head, :options, :link, :unlink,
              :template, :layout, :before, :after, :error, :not_found, :configure,
              :set, :mime_type, :enable, :disable, :use, :development?, :test?,
-             :production?, :helpers, :settings, :register, :on_start, :on_stop
+             :production?, :helpers, :settings, :register, :register_atomically,
+             :on_start, :on_stop
 
     class << self
       attr_accessor :target
