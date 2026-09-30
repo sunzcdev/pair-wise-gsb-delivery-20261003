@@ -1607,6 +1607,114 @@ describe "Sequel.transaction" do
   end
 end
   
+describe "Database#transaction :statement_budget option" do
+  before do
+    @db = Sequel.mock
+  end
+
+  it "should allow statements up to the budget, and not count transaction control statements" do
+    @db.transaction(:statement_budget=>2) do
+      @db.get(1)
+      @db.get(2)
+    end
+    @db.sqls.must_equal ['BEGIN', 'SELECT 1 AS v LIMIT 1', 'SELECT 2 AS v LIMIT 1', 'COMMIT']
+  end
+
+  it "should raise StatementBudgetExceeded when the budget is exceeded, and still rollback the transaction" do
+    e = proc do
+      @db.transaction(:statement_budget=>1) do
+        @db.get(1)
+        @db.get(2)
+      end
+    end.must_raise(Sequel::StatementBudgetExceeded)
+    e.statements_used.must_equal 2
+    e.statement_budget.must_equal 1
+    e.message.must_include '2 statements used with a budget of 1'
+    e.message.must_match(/database_spec\.rb:\d+/)
+    @db.sqls.must_equal ['BEGIN', 'SELECT 1 AS v LIMIT 1', 'ROLLBACK']
+  end
+
+  it "should not include bind parameter values in the exception message" do
+    e = proc do
+      @db.transaction(:statement_budget=>0) do
+        @db.execute('SELECT * FROM items WHERE id = ?', :arguments=>['sensitive-value'])
+      end
+    end.must_raise(Sequel::StatementBudgetExceeded)
+    e.message.wont_include 'sensitive-value'
+    @db.sqls.must_equal ['BEGIN', 'ROLLBACK']
+  end
+
+  it "should share the budget with nested transactions, and not allow nested transactions to acquire a separate budget" do
+    proc do
+      @db.transaction(:statement_budget=>2) do
+        @db.get(1)
+        @db.transaction(:statement_budget=>100) do
+          @db.get(2)
+          @db.get(3)
+        end
+      end
+    end.must_raise(Sequel::StatementBudgetExceeded)
+    @db.sqls.must_equal ['BEGIN', 'SELECT 1 AS v LIMIT 1', 'SELECT 2 AS v LIMIT 1', 'ROLLBACK']
+  end
+
+  it "should share the budget with savepoints, and still allow savepoint cleanup to complete" do
+    proc do
+      @db.transaction(:statement_budget=>1) do
+        @db.transaction(:savepoint=>true, :statement_budget=>100) do
+          @db.get(1)
+          @db.get(2)
+        end
+      end
+    end.must_raise(Sequel::StatementBudgetExceeded)
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'SELECT 1 AS v LIMIT 1', 'ROLLBACK TO SAVEPOINT autopoint_1', 'ROLLBACK']
+  end
+
+  it "should allow releasing savepoints and committing after the budget is exhausted" do
+    @db.transaction(:statement_budget=>1) do
+      begin
+        @db.transaction(:savepoint=>true) do
+          @db.get(1)
+          @db.get(2)
+        end
+      rescue Sequel::StatementBudgetExceeded
+      end
+    end
+    @db.sqls.must_equal ['BEGIN', 'SAVEPOINT autopoint_1', 'SELECT 1 AS v LIMIT 1', 'ROLLBACK TO SAVEPOINT autopoint_1', 'COMMIT']
+  end
+
+  it "should count statements issued by internal transaction callbacks against the shared budget" do
+    e = proc do
+      @db.transaction(:statement_budget=>2) do
+        @db.get(1)
+        @db.transaction(:savepoint=>true, :rollback=>:always) do
+          @db.after_rollback(:savepoint=>true){@db.get(2); @db.get(3)}
+        end
+      end
+    end.must_raise(Sequel::StatementBudgetExceeded)
+    e.statements_used.must_equal 3
+    @db.sqls.must_equal ['BEGIN', 'SELECT 1 AS v LIMIT 1', 'SAVEPOINT autopoint_1', 'ROLLBACK TO SAVEPOINT autopoint_1', 'SELECT 2 AS v LIMIT 1', 'ROLLBACK']
+  end
+
+  it "should apply the budget separately to each top-level transaction" do
+    2.times do
+      @db.transaction(:statement_budget=>1){@db.get(1)}
+    end
+    @db.sqls.must_equal ['BEGIN', 'SELECT 1 AS v LIMIT 1', 'COMMIT', 'BEGIN', 'SELECT 1 AS v LIMIT 1', 'COMMIT']
+  end
+
+  it "should not affect statements executed outside transactions" do
+    @db.get(1)
+    @db.get(2)
+    @db.sqls.must_equal ['SELECT 1 AS v LIMIT 1', 'SELECT 2 AS v LIMIT 1']
+  end
+
+  it "should raise an Error for an invalid :statement_budget option" do
+    proc{@db.transaction(:statement_budget=>-1){}}.must_raise(Sequel::Error)
+    proc{@db.transaction(:statement_budget=>1.5){}}.must_raise(Sequel::Error)
+    @db.sqls.must_equal []
+  end
+end
+
 describe "Database#transaction with savepoints" do
   before do
     @db = Sequel.mock

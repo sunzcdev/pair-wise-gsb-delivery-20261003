@@ -35,18 +35,8 @@ module Sequel
     # Yield to the block, logging any errors at error level to all loggers,
     # and all other queries with the duration at warn or info level.
     def log_connection_yield(sql, conn, args=nil)
-      return yield if skip_logging?
-      sql = "#{connection_info(conn) if conn && log_connection_info}#{sql}#{"; #{args.inspect}" if args}"
-      timer = Sequel.start_timer
-
-      begin
-        yield
-      rescue => e
-        log_exception(e, sql)
-        raise
-      ensure
-        log_duration(Sequel.elapsed_seconds_since(timer), sql) unless e
-      end
+      check_statement_budget(conn)
+      _log_connection_yield(sql, conn, args){yield}
     end
 
     # Remove any existing loggers and just use the given logger:
@@ -69,11 +59,30 @@ module Sequel
     def connection_info(conn)
       "(conn: #{conn.__id__}) "
     end
+
+    # Log and execute the given SQL on the connection, without checking the
+    # transaction statement budget.  Used internally for transaction control
+    # statements, which must be allowed to complete even if the transaction's
+    # statement budget has been exhausted.
+    def _log_connection_yield(sql, conn, args=nil)
+      return yield if skip_logging?
+      sql = "#{connection_info(conn) if conn && log_connection_info}#{sql}#{"; #{args.inspect}" if args}"
+      timer = Sequel.start_timer
+
+      begin
+        yield
+      rescue => e
+        log_exception(e, sql)
+        raise
+      ensure
+        log_duration(Sequel.elapsed_seconds_since(timer), sql) unless e
+      end
+    end
     
     # Log the given SQL and then execute it on the connection, used by
     # the transaction code.
     def log_connection_execute(conn, sql)
-      log_connection_yield(sql, conn){conn.public_send(connection_execute_method, sql)}
+      _log_connection_yield(sql, conn){conn.public_send(connection_execute_method, sql)}
     end
 
     # Log message with message prefixed by duration at info level, or

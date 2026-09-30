@@ -127,4 +127,22 @@ module Sequel
   # and won't reraise it (unless a reraise is requested).
   Rollback = Class.new(Error)
   ).name
+
+  # Error raised when a transaction attempts to execute more statements
+  # than allowed by the transaction's statement budget.
+  class StatementBudgetExceeded < Error
+    # The number of statements used by the transaction when the budget
+    # was exhausted.
+    attr_reader :statements_used
+
+    # The transaction's statement budget.
+    attr_reader :statement_budget
+
+    # Set the exception message, statements used, and statement budget.
+    def initialize(message=nil, statements_used=nil, statement_budget=nil)
+      @statements_used = statements_used
+      @statement_budget = statement_budget
+      super(message)
+    end
+  end
 end

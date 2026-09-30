@@ -13,6 +13,10 @@ module Sequel
       :committed=>'READ COMMITTED'.freeze,
       :repeatable=>'REPEATABLE READ'.freeze,
       :serializable=>'SERIALIZABLE'.freeze}.freeze
+
+    # The root directory of the Sequel library, used to filter out internal
+    # caller locations when reporting statement budget violations.
+    SEQUEL_LIB_ROOT = (File.expand_path('../..', __FILE__) + '/').freeze
     
     # The default transaction isolation level for this database,
     # used for all future transactions.  For MSSQL, this should be set
@@ -168,6 +172,16 @@ module Sequel
     #               savepoint if it is inside a transaction.
     # :skip_transaction :: If set, do not actually open a transaction or savepoint,
     #                      just checkout a connection and yield it.
+    # :statement_budget :: The maximum number of statements that can be executed
+    #                      inside the transaction before a Sequel::StatementBudgetExceeded
+    #                      exception is raised.  Only statements actually sent to the
+    #                      database adapter are counted; transaction control statements
+    #                      (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE SAVEPOINT, etc.)
+    #                      are not counted, so transaction cleanup can always complete.
+    #                      The budget is owned by the outermost transaction; nested
+    #                      transactions and savepoints share the remaining budget and
+    #                      cannot acquire a separate budget.  Only respected when
+    #                      starting a new transaction.
     #
     # PostgreSQL specific options:
     #
@@ -178,6 +192,10 @@ module Sequel
     #                 and :remote_write (9.2+).
     def transaction(opts=OPTS, &block)
       opts = Hash[opts]
+      if (budget = opts[:statement_budget]) && (!budget.is_a?(Integer) || budget < 0)
+        raise Sequel::Error, ":statement_budget transaction option must be a non-negative integer"
+      end
+
       if retry_on = opts[:retry_on]
         tot_retries = opts.fetch(:num_retries, 5)
         num_retries = 0
@@ -314,6 +332,14 @@ module Sequel
         hash[:prepare] = prep
       end
 
+      # The statement budget is owned by the outermost transaction.  Nested
+      # transactions and savepoints share the remaining budget, and cannot
+      # acquire a separate budget.
+      if budget = opts[:statement_budget]
+        hash[:statement_budget] = budget
+        hash[:statements_used] = 0
+      end
+
       Sequel.synchronize{@transactions[conn] = hash}
     end    
 
@@ -407,6 +433,26 @@ module Sequel
     # SQL to COMMIT a transaction.
     def commit_transaction_sql
       'COMMIT'
+    end
+
+    # Check whether the connection is currently inside a transaction with a
+    # statement budget.  If so, count the current statement against the
+    # budget, raising a StatementBudgetExceeded exception if the statement
+    # would exceed the budget.  The exception message intentionally does not
+    # include the SQL or any bound argument values, to avoid leaking
+    # potentially sensitive information.
+    def check_statement_budget(conn)
+      return unless conn
+      return unless (t = _trans(conn)) && (budget = t[:statement_budget])
+
+      used = t[:statements_used] += 1
+      return if used <= budget
+
+      message = "transaction statement budget exceeded: #{used} statements used with a budget of #{budget}"
+      if location = statement_budget_trigger_location
+        message = "#{message}, triggered at #{location}"
+      end
+      raise StatementBudgetExceeded.new(message, used, budget)
     end
     
     # Method called on the connection object to execute SQL on the database,
@@ -519,6 +565,15 @@ module Sequel
     # SQL to set the transaction isolation level
     def set_transaction_isolation_sql(level)
       "SET TRANSACTION ISOLATION LEVEL #{TRANSACTION_ISOLATION_LEVELS[level]}"
+    end
+
+    # The first caller location outside of Sequel itself, used as the
+    # trigger location in StatementBudgetExceeded exceptions.
+    def statement_budget_trigger_location
+      caller_locations(2).find do |location|
+        path = location.absolute_path || location.path
+        !path || !path.start_with?(SEQUEL_LIB_ROOT)
+      end
     end
 
     # Current savepoint level.
