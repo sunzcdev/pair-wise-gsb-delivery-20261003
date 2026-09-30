@@ -41,6 +41,15 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// Observer, if non-nil, receives a structured audit event for each
+	// SMTP command completed on a connection. Unlike Debug, events never
+	// contain authentication credentials, SASL responses or message
+	// contents, so they are safe to forward to a logging platform.
+	Observer SessionObserver
+	// ObserverMaskAddresses enables masking of recipient addresses in
+	// observer events: the local part is replaced with "***".
+	ObserverMaskAddresses bool
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

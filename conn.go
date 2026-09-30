@@ -44,6 +44,15 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// State used to build observer events for the command currently
+	// being handled.
+	lastReplyCode int
+	txnSeq        uint64
+	txnID         uint64
+	obsTxnID      uint64
+	obsBodyBytes  int64
+	obsRcpts      []RecipientStatus
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -106,6 +115,17 @@ func (c *Conn) handle(cmd string, arg string) {
 	}
 
 	cmd = strings.ToUpper(cmd)
+
+	// Set up the observation state for this command. The event is
+	// emitted after the handler returns, so multi-line replies (EHLO)
+	// and multi-step exchanges (AUTH) produce a single event.
+	start := time.Now()
+	c.lastReplyCode = 0
+	c.obsTxnID = c.txnID
+	c.obsBodyBytes = 0
+	c.obsRcpts = nil
+	defer c.observeCommand(cmd, start)
+
 	switch cmd {
 	case "SEND", "SOML", "SAML", "EXPN", "HELP", "TURN":
 		// These commands are not implemented in any state
@@ -152,6 +172,47 @@ func (c *Conn) handle(cmd string, arg string) {
 
 func (c *Conn) Server() *Server {
 	return c.server
+}
+
+// observeCommand emits a structured audit event for a completed command.
+// It is called from the command dispatch path without any protocol-critical
+// locks held. Observer errors and panics are logged and never affect the
+// session.
+func (c *Conn) observeCommand(cmd string, start time.Time) {
+	obs := c.server.Observer
+	if obs == nil {
+		return
+	}
+
+	evt := &CommandEvent{
+		Command:       cmd,
+		TransactionID: c.obsTxnID,
+		Code:          c.lastReplyCode,
+		Duration:      time.Since(start),
+		BodyBytes:     c.obsBodyBytes,
+		Recipients:    c.obsRcpts,
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			c.server.ErrorLog.Printf("smtp: session observer panic: %v", r)
+		}
+	}()
+	if err := obs.ObserveCommand(evt); err != nil {
+		c.server.ErrorLog.Printf("smtp: session observer error: %v", err)
+	}
+}
+
+// observeRcpt records a per-recipient LMTP delivery status for the
+// observer event of the command currently being handled.
+func (c *Conn) observeRcpt(rcpt string, code int) {
+	if c.server.Observer == nil {
+		return
+	}
+	if c.server.ObserverMaskAddresses {
+		rcpt = maskAddress(rcpt)
+	}
+	c.obsRcpts = append(c.obsRcpts, RecipientStatus{Address: rcpt, Code: code})
 }
 
 func (c *Conn) Session() Session {
@@ -478,6 +539,9 @@ func (c *Conn) handleMail(arg string) {
 
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
 	c.fromReceived = true
+	c.txnSeq++
+	c.txnID = c.txnSeq
+	c.obsTxnID = c.txnID
 }
 
 // This regexp matches 'hexchar' token defined in
@@ -987,6 +1051,7 @@ func (c *Conn) handleData(arg string) {
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	c.obsBodyBytes = r.bytesRead
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1093,6 +1158,7 @@ func (c *Conn) handleBdat(arg string) {
 	}
 
 	c.bytesReceived += int64(size)
+	c.obsBodyBytes = c.bytesReceived
 
 	if last {
 		c.lineLimitReader.LineLimit = c.server.MaxLineLength
@@ -1106,6 +1172,7 @@ func (c *Conn) handleBdat(arg string) {
 			for i, rcpt := range c.recipients {
 				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
 				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+				c.observeRcpt(rcpt, code)
 			}
 		} else {
 			c.writeResponse(dataErrorToStatus(err))
@@ -1247,6 +1314,7 @@ func (c *Conn) handleDataLMTP() {
 	for i, rcpt := range c.recipients {
 		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+		c.observeRcpt(rcpt, code)
 	}
 
 	// If done gets false, the panic occurred in LMTPData and the connection
@@ -1254,6 +1322,7 @@ func (c *Conn) handleDataLMTP() {
 	if !<-done {
 		c.Close()
 	}
+	c.obsBodyBytes = r.bytesRead
 }
 
 func dataErrorToStatus(err error) (code int, enchCode EnhancedCode, msg string) {
@@ -1286,6 +1355,8 @@ func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
 	if c.server.WriteTimeout != 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.server.WriteTimeout))
 	}
+
+	c.lastReplyCode = code
 
 	// All responses must include an enhanced code, if it is missing - use
 	// a generic code X.0.0.
@@ -1352,4 +1423,5 @@ func (c *Conn) reset() {
 
 	c.fromReceived = false
 	c.recipients = nil
+	c.txnID = 0
 }
