@@ -52,6 +52,22 @@ module Warden
       self.class._run_callbacks(*args)
     end
 
+    # Prepares the user to serialize into the session for this Manager only.
+    # This is equivalent to calling serialize_into_session on the config
+    # yielded in the middleware block and does not affect other Managers.
+    # :api: public
+    def serialize_into_session(scope = nil, &block)
+      @config.serialize_into_session(scope, &block)
+    end
+
+    # Reconstitutes the user from the session for this Manager only.
+    # This is equivalent to calling serialize_from_session on the config
+    # yielded in the middleware block and does not affect other Managers.
+    # :api: public
+    def serialize_from_session(scope = nil, &block)
+      @config.serialize_from_session(scope, &block)
+    end
+
     class << self
       # Prepares the user to serialize into the session.
       # Any object that can be serialized into the session in some way can be used as a "user" object

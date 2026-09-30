@@ -48,7 +48,7 @@ module Warden
     # session.
     # :api: public
     def session_serializer
-      @session_serializer ||= Warden::SessionSerializer.new(@env)
+      @session_serializer ||= @config.session_serializer_class.new(@env)
     end
 
     # Clear the cache of performed strategies so far. Warden runs each
