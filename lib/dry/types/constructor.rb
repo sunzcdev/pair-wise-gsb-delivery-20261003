@@ -20,11 +20,24 @@ module Dry
       # @param [Builder, Object] input
       # @param [Hash] options
       # @param [#call, nil] block
+      # @option options [Boolean] :context Whether the constructor block
+      #   explicitly receives the context of a call
       #
       # @api public
-      def self.new(input, fn: Undefined, **options, &block)
+      def self.new(input, fn: Undefined, context: false, **options, &block)
         type = input.is_a?(Builder) ? input : Nominal.new(input)
-        super(type, **options, fn: Function[Undefined.default(fn, block)])
+        function = Undefined.default(fn, block)
+
+        function =
+          if context && !function.is_a?(Function)
+            Function[function, contextual: true]
+          elsif function.is_a?(Function)
+            function
+          else
+            Function[function]
+          end
+
+        super(type, **options, fn: function)
       end
 
       # @param [Builder, Object] input
@@ -32,8 +45,8 @@ module Dry
       # @param [#call, nil] block
       #
       # @api public
-      def self.[](type, fn:, **options)
-        function = Function[fn]
+      def self.[](type, fn:, context: false, **options)
+        function = context ? Function[fn, contextual: true] : Function[fn]
 
         if function.wrapper?
           wrapper_type.new(type, fn: function, **options)
@@ -69,43 +82,67 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input)
-        coerced = fn.(input) { |output = input| return yield(output) }
-        type.call_safe(coerced) { |output = coerced| yield(output) }
+      def call_safe(input, context = Undefined)
+        if fn.contextual?
+          coerced = fn.(input, context) { |output = input| return yield(output) }
+          type.call_safe(coerced, context) { |output = coerced| yield(output) }
+        else
+          coerced = fn.(input) { |output = input| return yield(output) }
+          type.call_safe(coerced) { |output = coerced| yield(output) }
+        end
       end
 
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input) = type.call_unsafe(fn.(input))
+      def call_unsafe(input, context = Undefined)
+        if fn.contextual?
+          type.call_unsafe(fn.(input, context), context)
+        else
+          type.call_unsafe(fn.(input))
+        end
+      end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       # @param [#call,nil] block
       #
       # @return [Logic::Result, Types::Result]
       # @return [Object] if block given and try fails
       #
       # @api public
-      def try(input, &)
-        value = fn.(input)
+      def try(input, context = Undefined, &)
+        value =
+          if fn.contextual?
+            fn.(input, context)
+          else
+            fn.(input)
+          end
       rescue CoercionError => exception
         failure = failure(input, exception)
         block_given? ? yield(failure) : failure
       else
-        type.try(value, &)
+        type.try(value, context, &)
       end
 
       # Build a new constructor by appending a block to the coercion function
       #
       # @param [#call, nil] new_fn
+      # @param [Boolean] context Whether the appended block receives the
+      #   per-call context
       # @param [Hash] options
       # @param [#call, nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def constructor(new_fn = nil, **options, &block)
-        next_fn = Function[new_fn || block]
+      def constructor(new_fn = nil, context: false, **options, &block)
+        next_fn =
+          if context
+            Function[new_fn || block, contextual: true]
+          else
+            Function[new_fn || block]
+          end
 
         if next_fn.wrapper?
           self.class.wrapper_type.new(with(**options), fn: next_fn)
@@ -128,25 +165,36 @@ module Dry
         [:constructor, [type.to_ast(meta: meta), fn.to_ast]]
       end
 
-      # Build a new constructor by prepending a block to the coercion function
+      # Build a new constructor by prepending a block to the coercion
+      # function
       #
       # @param [#call, nil] new_fn
+      # @param [Boolean] context Whether the prepended block receives the
+      #   per-call context
       # @param [Hash] options
       # @param [#call, nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def prepend(new_fn = nil, **options, &block)
-        with(**options, fn: fn << (new_fn || block))
+      def prepend(new_fn = nil, context: false, **options, &block)
+        added = Function[new_fn || block, contextual: true] if context
+        added ||= Function[new_fn || block]
+
+        with(**options, fn: fn << added)
       end
       alias_method :<<, :prepend
 
-      # Build a lax type
-      #
-      # @return [Lax]
-      # @api public
-      def lax = Lax.new(constructor_type[type.lax, **options])
+      # @api private
+      def lax
+        if fn.wrapper?
+          # Wrapper constructors handle type failures themselves, rebuilding
+          # one keeps that behavior without an outer Lax layer
+          constructor_type[type.lax, fn: fn, **options]
+        else
+          Lax.new(constructor_type[type.lax, fn: fn, **options])
+        end
+      end
 
       # Wrap the type with a proc
       #

@@ -36,17 +36,19 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input) = type.call_unsafe(map_value(input))
+      def call_unsafe(input, context = Undefined) =
+        type.call_unsafe(map_value(input), context)
 
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &) = type.call_safe(map_value(input), &)
+      def call_safe(input, context = Undefined, &) =
+        type.call_safe(map_value(input), context, &)
 
       # @see Dry::Types::Constrained#try
       #
       # @api public
-      def try(input, &) = super(map_value(input))
+      def try(input, context = Undefined, &) = super(map_value(input), context)
 
       # @api private
       def default(*)
@@ -115,7 +117,6 @@ module Dry
         else
           inverted_mapping.fetch(input, input)
         end
-      end
-    end
+      end    end
   end
 end

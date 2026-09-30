@@ -26,6 +26,7 @@ module Dry
       def optional? = primitive?(nil)
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
@@ -33,25 +34,29 @@ module Dry
       #   error from the right (last attempted) type for performance reasons.
       #
       # @api private
-      def call_unsafe(input)
-        left.call_safe(input) { right.call_unsafe(input) }
+      def call_unsafe(input, context = Undefined)
+        left.call_safe(input, context) { right.call_unsafe(input, context) }
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &block)
-        left.call_safe(input) { right.call_safe(input, &block) }
+      def call_safe(input, context = Undefined, &block)
+        left.call_safe(input, context) {
+          right.call_safe(input, context, &block)
+        }
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @api public
-      def try(input)
-        left.try(input) do
-          right.try(input) do |failure|
+      def try(input, context = Undefined)
+        left.try(input, context) do
+          right.try(input, context) do |failure|
             if block_given?
               yield(failure)
             else

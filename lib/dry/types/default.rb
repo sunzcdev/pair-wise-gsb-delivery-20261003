@@ -10,10 +10,17 @@ module Dry
       class Callable < Default
         include ::Dry::Equalizer(:type, inspect: false, immutable: true)
 
-        # Evaluates given callable
+        # Evaluates given callable. A callable accepting two arguments
+        # also receives the context of the current call.
+        #
+        # @param [Object] context per-call context
         # @return [Object]
-        def evaluate
-          value.call(type)
+        def evaluate(context = Undefined)
+          if @value.respond_to?(:arity) && @value.arity.equal?(2)
+            value.call(type, context)
+          else
+            value.call(type)
+          end
         end
 
         # @return [true]
@@ -31,7 +38,12 @@ module Dry
       # @return [Object]
       attr_reader :value
 
-      alias_method :evaluate, :value
+      # @param [Object] context per-call context, ignored for plain values
+      #
+      # @return [Object] the default value
+      def evaluate(_context = Undefined)
+        value
+      end
 
       # @param [Object, #call] value
       #
@@ -70,15 +82,16 @@ module Dry
       def default? = true
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Result::Success]
       #
       # @api public
-      def try(input = Undefined, &)
+      def try(input = Undefined, context = Undefined, &)
         if input.equal?(Undefined)
-          success(evaluate)
+          success(evaluate(context))
         else
-          type.try(input)
+          type.try(input, context)
         end
       end
 
@@ -88,28 +101,30 @@ module Dry
       def valid?(value = Undefined) = Undefined.equal?(value) || super
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object] value passed through {#type} or {#default} value
       #
       # @api private
-      def call_unsafe(input = Undefined)
+      def call_unsafe(input = Undefined, context = Undefined)
         if input.equal?(Undefined)
-          evaluate
+          evaluate(context)
         else
-          Undefined.default(type.call_unsafe(input)) { evaluate }
+          Undefined.default(type.call_unsafe(input, context)) { evaluate(context) }
         end
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object] value passed through {#type} or {#default} value
       #
       # @api private
-      def call_safe(input = Undefined, &)
+      def call_safe(input = Undefined, context = Undefined, &)
         if input.equal?(Undefined)
-          evaluate
+          evaluate(context)
         else
-          Undefined.default(type.call_safe(input, &)) { evaluate }
+          Undefined.default(type.call_safe(input, context, &)) { evaluate(context) }
         end
       end
 

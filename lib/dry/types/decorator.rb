@@ -18,13 +18,14 @@ module Dry
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       # @param [#call, nil] block
       #
       # @return [Result,Logic::Result]
       # @return [Object] if block given and try fails
       #
       # @api public
-      def try(input, &) = type.try(input, &)
+      def try(input, context = Undefined, &) = type.try(input, context, &)
 
       # @return [Boolean]
       #

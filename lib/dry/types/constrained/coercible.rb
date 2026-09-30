@@ -10,8 +10,8 @@ module Dry
         # @return [Object]
         #
         # @api private
-        def call_unsafe(input)
-          coerced = type.call_unsafe(input)
+        def call_unsafe(input, context = Undefined)
+          coerced = type.call_unsafe(input, context)
           result = rule.(coerced)
 
           if result.success?
@@ -24,8 +24,8 @@ module Dry
         # @return [Object]
         #
         # @api private
-        def call_safe(input)
-          coerced = type.call_safe(input) { return yield }
+        def call_safe(input, context = Undefined)
+          coerced = type.call_safe(input, context) { return yield }
 
           if rule[coerced]
             coerced
@@ -37,8 +37,8 @@ module Dry
         # @see Dry::Types::Constrained#try
         #
         # @api public
-        def try(input, &)
-          result = type.try(input)
+        def try(input, context = Undefined, &)
+          result = type.try(input, context)
 
           if result.success?
             validation = rule.(result.input)

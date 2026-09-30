@@ -21,44 +21,47 @@ module Dry
       include ::Dry::Monads[:maybe]
 
       # @param [Dry::Monads::Maybe, Object] input
+      # @param [Object] context per-call context
       #
       # @return [Dry::Monads::Maybe]
       #
       # @api private
-      def call_unsafe(input = Undefined)
+      def call_unsafe(input = Undefined, context = Undefined)
         case input
         when ::Dry::Monads::Maybe
           input
         when Undefined
           None()
         else
-          Maybe(type.call_unsafe(input))
+          Maybe(type.call_unsafe(input, context))
         end
       end
 
       # @param [Dry::Monads::Maybe, Object] input
+      # @param [Object] context per-call context
       #
       # @return [Dry::Monads::Maybe]
       #
       # @api private
-      def call_safe(input = Undefined)
+      def call_safe(input = Undefined, context = Undefined)
         case input
         when ::Dry::Monads::Maybe
           input
         when Undefined
           None()
         else
-          Maybe(type.call_safe(input) { |output = input| return yield(output) })
+          Maybe(type.call_safe(input, context) { |output = input| return yield(output) })
         end
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Result::Success]
       #
       # @api public
-      def try(input = Undefined, &)
-        result = type.try(input)
+      def try(input = Undefined, context = Undefined, &)
+        result = type.try(input, context)
 
         if result.success?
           Result::Success.new(Maybe(result.input))

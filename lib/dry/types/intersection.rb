@@ -15,26 +15,33 @@ module Dry
       def self.operator = :&
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
-        merge_results(left.call_unsafe(input), right.call_unsafe(input))
+      def call_unsafe(input, context = Undefined)
+        merge_results(
+          left.call_unsafe(input, context),
+          right.call_unsafe(input, context)
+        )
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &) = try_sides(input, &).input
+      def call_safe(input, context = Undefined, &) =
+        try_sides(input, context, &).input
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @api public
-      def try(input)
-        try_sides(input) do |failure|
+      def try(input, context = Undefined)
+        try_sides(input, context) do |failure|
           if block_given?
             yield(failure)
           else
@@ -55,11 +62,11 @@ module Dry
       private
 
       # @api private
-      def try_sides(input, &block)
+      def try_sides(input, context, &block)
         results = []
 
         [left, right].each do |side|
-          result = try_side(side, input, &block)
+          result = try_side(side, input, context, &block)
           return result if result.failure?
 
           results << result
@@ -69,10 +76,10 @@ module Dry
       end
 
       # @api private
-      def try_side(side, input)
+      def try_side(side, input, context)
         failure = nil
 
-        result = side.try(input) do |f|
+        result = side.try(input, context) do |f|
           failure = f
           yield(f)
         end

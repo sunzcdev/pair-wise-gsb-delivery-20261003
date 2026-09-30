@@ -146,13 +146,17 @@ module Dry
       #
       # @param [#call,nil] constructor
       # @param [Hash] options
+      # @param [Boolean] context Whether the constructor block explicitly
+      #   receives the per-call context as its second argument. When true,
+      #   the block is called as +fn(input, context)+ (or
+      #   +fn(input, type, context)+ for wrapper constructors)
       # @param [#call,nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def constructor(constructor = nil, **options, &block)
-        constructor_type[with(**options), fn: constructor || block]
+      def constructor(constructor = nil, context: false, **options, &block)
+        constructor_type[with(**options), fn: constructor || block, context: context]
       end
       alias_method :append, :constructor
       alias_method :prepend, :constructor

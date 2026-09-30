@@ -74,23 +74,26 @@ module Dry
       def optional? = false
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input) = raise ::NotImplementedError
+      def call_unsafe(input, context = Undefined) = raise ::NotImplementedError
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &) = raise ::NotImplementedError
+      def call_safe(input, context = Undefined, &) = raise ::NotImplementedError
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @api public
-      def try(input, &) = raise ::NotImplementedError
+      def try(input, context = Undefined, &) = raise ::NotImplementedError
 
       # @api private
       def success(input)

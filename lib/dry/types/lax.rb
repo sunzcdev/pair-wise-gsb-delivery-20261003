@@ -15,18 +15,20 @@ module Dry
       undef :options, :constructor, :<<, :>>, :prepend, :append
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api public
-      def call(input, &)
-        type.call_safe(input) { |output = input| output }
+      def call(input, context = Undefined, &)
+        type.call_safe(input, context) { |output = input| output }
       end
       alias_method :[], :call
       alias_method :call_safe, :call
       alias_method :call_unsafe, :call
 
       # @param [Object] input
+      # @param [Object] context per-call context
       # @param [#call,nil] block
       #
       # @yieldparam [Failure] failure
@@ -35,7 +37,7 @@ module Dry
       # @return [Result,Logic::Result]
       #
       # @api public
-      def try(input, &) = type.try(input, &)
+      def try(input, context = Undefined, &) = type.try(input, context, &)
 
       # @see Nominal#to_ast
       #

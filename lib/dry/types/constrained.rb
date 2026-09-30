@@ -28,11 +28,11 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
+      def call_unsafe(input, context = Undefined)
         result = rule.(input)
 
         if result.success?
-          type.call_unsafe(input)
+          type.call_unsafe(input, context)
         else
           raise ConstraintError.new(result, input)
         end
@@ -41,9 +41,9 @@ module Dry
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &)
+      def call_safe(input, context = Undefined, &)
         if rule[input]
-          type.call_safe(input, &)
+          type.call_safe(input, context, &)
         else
           yield
         end
@@ -53,22 +53,24 @@ module Dry
       # block given but returns a Result instance with metadata
       # about errors (if any).
       #
-      # @overload try(input)
+      # @overload try(input, context = Undefined)
       #   @param [Object] input
+      #   @param [Object] context per-call context
       #   @return [Logic::Result]
       #
-      # @overload try(input)
+      # @overload try(input, context = Undefined)
       #   @param [Object] input
+      #   @param [Object] context per-call context
       #   @yieldparam [Failure] failure
       #   @yieldreturn [Object]
       #   @return [Object]
       #
       # @api public
-      def try(input, &)
+      def try(input, context = Undefined, &)
         result = rule.(input)
 
         if result.success?
-          type.try(input, &)
+          type.try(input, context, &)
         else
           failure = failure(input, ConstraintError.new(result, input))
           block_given? ? yield(failure) : failure

@@ -11,37 +11,40 @@ module Dry
       def self.operator = :>
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_unsafe(input)
-        if left.try(input).success?
-          right.call_unsafe(input)
+      def call_unsafe(input, context = Undefined)
+        if left.try(input, context).success?
+          right.call_unsafe(input, context)
         else
           input
         end
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @return [Object]
       #
       # @api private
-      def call_safe(input, &)
-        if left.try(input).success?
-          right.call_safe(input, &)
+      def call_safe(input, context = Undefined, &)
+        if left.try(input, context).success?
+          right.call_safe(input, context, &)
         else
           input
         end
       end
 
       # @param [Object] input
+      # @param [Object] context per-call context
       #
       # @api public
-      def try(input, &)
-        if left.try(input).success?
-          right.try(input, &)
+      def try(input, context = Undefined, &)
+        if left.try(input, context).success?
+          right.try(input, context, &)
         else
           Result::Success.new(input)
         end

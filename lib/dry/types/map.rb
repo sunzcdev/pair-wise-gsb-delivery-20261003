@@ -43,30 +43,34 @@ module Dry
       def name = "Map"
 
       # @param [Hash] hash
+      # @param [Object] context per-call context
       #
       # @return [Hash]
       #
       # @api private
-      def call_unsafe(hash)
-        try(hash) { |failure|
+      def call_unsafe(hash, context = Undefined)
+        try(hash, context) { |failure|
           raise MapError, failure.error.message
         }.input
       end
 
       # @param [Hash] hash
+      # @param [Object] context per-call context
       #
       # @return [Hash]
       #
       # @api private
-      def call_safe(hash) = try(hash) { return yield }.input
+      def call_safe(hash, context = Undefined) =
+        try(hash, context) { return yield }.input
 
       # @param [Hash] hash
+      # @param [Object] context per-call context
       #
       # @return [Result]
       #
       # @api public
-      def try(hash)
-        result = coerce(hash)
+      def try(hash, context = Undefined)
+        result = coerce(hash, context)
         return result if result.success? || !block_given?
 
         yield(result)
@@ -93,14 +97,14 @@ module Dry
 
       # @api private
       # rubocop:disable Metrics/AbcSize
-      def coerce(input)
+      def coerce(input, context = Undefined)
         assert_primitive(input) do
           output = {}
           failures = []
 
           input.each do |k, v|
-            res_k = key_type.try(k)
-            res_v = value_type.try(v)
+            res_k = key_type.try(k, context)
+            res_v = value_type.try(v, context)
 
             if res_k.failure?
               failures << res_k.error

@@ -22,19 +22,20 @@ module Dry
         end
 
         # @param [Object] input
+        # @param [Object] context per-call context
         #
         # @return [Array]
         #
         # @api private
-        def call_unsafe(input)
+        def call_unsafe(input, context = Undefined)
           if primitive?(input)
             input.each_with_object([]) do |el, output|
-              coerced = member.call_unsafe(el)
+              coerced = member.call_unsafe(el, context)
 
               output << coerced unless Undefined.equal?(coerced)
             end
           else
-            super
+            super(input, context)
           end
         end
 
@@ -42,12 +43,12 @@ module Dry
         # @return [Array]
         #
         # @api private
-        def call_safe(input)
+        def call_safe(input, context = Undefined)
           if primitive?(input)
             failed = false
 
             result = input.each_with_object([]) do |el, output|
-              coerced = member.call_safe(el) { |out = el|
+              coerced = member.call_safe(el, context) { |out = el|
                 failed = true
                 out
               }
@@ -62,6 +63,7 @@ module Dry
         end
 
         # @param [Array, Object] input
+        # @param [Object] context per-call context
         # @param [#call,nil] block
         #
         # @yieldparam [Failure] failure
@@ -70,11 +72,11 @@ module Dry
         # @return [Result,Logic::Result]
         #
         # @api public
-        def try(input, &block) # rubocop:disable Metrics/PerceivedComplexity
+        def try(input, context = Undefined, &block) # rubocop:disable Metrics/PerceivedComplexity
           if primitive?(input)
             output = []
 
-            result = input.map { |el| member.try(el) }
+            result = input.map { |el| member.try(el, context) }
             result.each do |r|
               output << r.input unless Undefined.equal?(r.input)
             end

@@ -38,15 +38,17 @@ module Dry
         end
 
         # @api private
-        def call_safe(input, &) = type.call_safe(input, &)
+        def call_safe(input, context = Undefined, &) =
+          type.call_safe(input, context, &)
 
         # @api private
-        def call_unsafe(input) = type.call_unsafe(input)
+        def call_unsafe(input, context = Undefined) =
+          type.call_unsafe(input, context)
 
         # @see Dry::Types::Nominal#try
         #
         # @api public
-        def try(input, &) = type.try(input, &)
+        def try(input, context = Undefined, &) = type.try(input, context, &)
 
         # Whether the key is required in schema input
         #

@@ -9,6 +9,16 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Per-call **context** for constructors. `type.call(input, context)` threads an
+  arbitrary context object through the whole coercion (nested schemas, arrays,
+  defaults, sums and other compositions). A constructor opts in with
+  `context: true` and receives the context as its second argument
+  (`fn.(input, context)`), or as its third argument for wrapper constructors
+  (`fn.(input, type, context)`). Constructors that only take a value keep
+  working exactly as before. The context is a call-stack argument, never stored
+  on the (frozen) type, so it cannot leak between calls—including concurrent or
+  Fiber-interleaved calls sharing the same type instances (@issue-511)
+
 ### Changed
 
 ### Deprecated

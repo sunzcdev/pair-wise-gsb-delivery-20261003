@@ -52,21 +52,23 @@ module Dry
       end
 
       # @param [Hash] hash
+      # @param [Object] context per-call context
       #
       # @return [Hash{Symbol => Object}]
       #
       # @api private
-      def call_unsafe(hash, options = EMPTY_HASH)
-        resolve_unsafe(coerce(hash), options)
+      def call_unsafe(hash, context = Undefined)
+        resolve_unsafe(coerce(hash), context, EMPTY_HASH)
       end
 
       # @param [Hash] hash
+      # @param [Object] context per-call context
       #
       # @return [Hash{Symbol => Object}]
       #
       # @api private
-      def call_safe(hash, options = EMPTY_HASH)
-        resolve_safe(coerce(hash) { return yield }, options) { return yield }
+      def call_safe(hash, context = Undefined)
+        resolve_safe(coerce(hash) { return yield }, context, EMPTY_HASH) { return yield }
       end
 
       # @param [Hash] hash
@@ -74,12 +76,15 @@ module Dry
       # @option options [Boolean] :skip_missing If true don't raise error if on missing keys
       # @option options [Boolean] :resolve_defaults If false default value
       #                                             won't be evaluated for missing key
+      # @param [Object] context per-call context
       # @return [Hash{Symbol => Object}]
       #
       # @api public
-      def apply(hash, options = EMPTY_HASH) = call_unsafe(hash, options)
+      def apply(hash, options = EMPTY_HASH, context = Undefined) =
+        resolve_unsafe(coerce(hash), context, options)
 
       # @param input [Hash] hash
+      # @param [Object] context per-call context
       #
       # @yieldparam [Failure] failure
       # @yieldreturn [Result]
@@ -90,7 +95,7 @@ module Dry
       # @api public
       # rubocop:disable Metrics/AbcSize
       # rubocop:disable Metrics/PerceivedComplexity
-      def try(input)
+      def try(input, context = Undefined)
         if primitive?(input)
           success = true
           output = {}
@@ -101,7 +106,7 @@ module Dry
             type = @name_key_map[k]
 
             if type
-              key_result = type.try(value)
+              key_result = type.try(value, context)
               result[k] = key_result
               output[k] = key_result.input
               success &&= key_result.success?
@@ -111,7 +116,7 @@ module Dry
           end
 
           if output.size < keys.size
-            resolve_missing_keys(output, options) do
+            resolve_missing_keys(output, context, options) do
               success = false
             end
           end
@@ -316,7 +321,7 @@ module Dry
       # @api private
       #
       # @return [Hash]
-      def resolve_unsafe(hash, options = EMPTY_HASH)
+      def resolve_unsafe(hash, context, options)
         result = {}
 
         hash.each do |key, value|
@@ -325,7 +330,7 @@ module Dry
 
           if type
             begin
-              result[k] = type.call_unsafe(value)
+              result[k] = type.call_unsafe(value, context)
             rescue ConstraintError => exception
               raise SchemaError.new(type.name, value, exception.result)
             rescue CoercionError => exception
@@ -336,7 +341,7 @@ module Dry
           end
         end
 
-        resolve_missing_keys(result, options) if result.size < keys.size
+        resolve_missing_keys(result, context, options) if result.size < keys.size
 
         result
       end
@@ -346,7 +351,7 @@ module Dry
       # @api private
       #
       # @return [Hash]
-      def resolve_safe(hash, options = EMPTY_HASH, &block)
+      def resolve_safe(hash, context, options, &block)
         result = {}
 
         hash.each do |key, value|
@@ -354,13 +359,13 @@ module Dry
           type = @name_key_map[k]
 
           if type
-            result[k] = type.call_safe(value, &block)
+            result[k] = type.call_safe(value, context, &block)
           elsif strict?
             yield
           end
         end
 
-        resolve_missing_keys(result, options, &block) if result.size < keys.size
+        resolve_missing_keys(result, context, options, &block) if result.size < keys.size
 
         result
       end
@@ -368,7 +373,7 @@ module Dry
       # Try to add missing keys to the hash
       #
       # @api private
-      def resolve_missing_keys(hash, options) # rubocop:disable Metrics/PerceivedComplexity
+      def resolve_missing_keys(hash, context, options) # rubocop:disable Metrics/PerceivedComplexity
         skip_missing = options.fetch(:skip_missing, false)
         resolve_defaults = options.fetch(:resolve_defaults, true)
 
@@ -376,7 +381,7 @@ module Dry
           next if hash.key?(key.name)
 
           if key.default? && resolve_defaults
-            hash[key.name] = key.call_unsafe(Undefined)
+            hash[key.name] = key.call_unsafe(Undefined, context)
           elsif key.required? && !skip_missing
             if block_given?
               return yield

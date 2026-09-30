@@ -69,21 +69,19 @@ module Dry
       # @api public
       def optional? = false
 
-      # @param [BasicObject] input
-      #
-      # @return [BasicObject]
-      #
       # @api private
-      def call_unsafe(input) = input
+      def call_unsafe(input, context = Undefined) = input
 
       # @param [BasicObject] input
+      # @param [Object] context per-call context, ignored by nominal types
       #
       # @return [BasicObject]
       #
       # @api private
-      def call_safe(input, &) = input
+      def call_safe(input, context = Undefined, &) = input
 
       # @param [Object] input
+      # @param [Object] context per-call context, ignored by nominal types
       #
       # @yieldparam [Failure] failure
       # @yieldreturn [Result]
@@ -92,7 +90,7 @@ module Dry
       # @return [nil] otherwise
       #
       # @api public
-      def try(input, &) = success(input)
+      def try(input, context = Undefined, &) = success(input)
 
       # @param (see Dry::Types::Success#initialize)
       #
