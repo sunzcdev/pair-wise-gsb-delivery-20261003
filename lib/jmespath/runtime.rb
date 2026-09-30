@@ -57,6 +57,22 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # Statically validate `expression` against a {Shape} and infer the output
+    # shape. Does not execute the query. See JMESPath.check.
+    #
+    # @return [StaticTypeChecker::Result]
+    def check(expression, input_shape)
+      StaticTypeChecker.new(input_shape, parser: plain_parser).check(expression)
+    end
+
+    # @raise [Errors::StaticTypeError]
+    # @return [StaticTypeChecker::Result]
+    def check!(expression, input_shape)
+      result = check(expression, input_shape)
+      raise Errors::StaticTypeError, result unless result.ok?
+      result
+    end
+
     private
 
     def default_parser(options)
@@ -65,6 +81,13 @@ module JMESPath
       else
         DEFAULT_PARSER.new(options)
       end
+    end
+
+    # Static analysis must walk the raw AST; the caching parser would hand
+    # back the same tree, which is fine, but a dedicated plain parser keeps
+    # checker state isolated from search caching.
+    def plain_parser
+      @plain_parser ||= Parser.new
     end
   end
 end

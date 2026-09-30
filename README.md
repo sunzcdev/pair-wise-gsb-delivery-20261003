@@ -43,6 +43,51 @@ JMESPath.search('foo.bar', { abc: "mno" })
 
 **[See the JMESPath specification for a full list of supported search expressions.](http://jmespath.org/specification.html)**
 
+## Compile-Time Shape Checking
+
+When the rough shape of the input document is known ahead of time, you can
+catch obvious function type errors *before* a query ever runs, and infer the
+shape of the result. This uses a lightweight shape description (optional
+fields, array element types, `null` and union types) rather than a full JSON
+Schema engine.
+
+```ruby
+shape = JMESPath::Shape.object(
+  people: JMESPath::Shape.array(
+    JMESPath::Shape.object(
+      id:   JMESPath::Shape.number,
+      name: JMESPath::Shape.string,
+      age:  JMESPath::Shape.optional(JMESPath::Shape.number)  # may be missing
+    )
+  )
+)
+
+result = JMESPath.check('people[*].age', shape)
+result.ok?            #=> true
+result.output_shape   #=> #<JMESPath::Shape array<number>>
+
+JMESPath.check('abs(people[0].name)', shape).ok?  #=> false (definite type error)
+```
+
+Only *definite* failures are reported as errors. Anything that could still
+succeed is accepted and listed as a deferred runtime check, so unknown data
+is never treated as an error:
+
+```ruby
+result = JMESPath.check('abs(people[0].age)', shape)
+result.ok?                       #=> true (age is number | null)
+result.runtime_checks.size       #=> 1 (kept for runtime)
+
+# Filter predicates narrow the surviving branch:
+JMESPath.check('map(&abs, people[?age != `null`].age)', shape).ok?  #=> true
+```
+
+Shapes can also be inferred from example values with
+`JMESPath::Shape.from_value` / `JMESPath::Shape.from_values`. Use
+`JMESPath.check!` to raise `JMESPath::Errors::StaticTypeError` instead of
+returning a result. See `examples/shape_check_demo.rb` for a runnable
+walkthrough contrasting compile-time errors with runtime checks.
+
 ## Indifferent Access
 
 The examples above show JMESPath expressions used to search over hashes with symbolized keys. You can use search also for hashes with string keys or Struct objects.
