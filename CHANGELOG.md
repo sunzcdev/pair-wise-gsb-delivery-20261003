@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `Dry::Struct.project` builds a new, independent struct type from a subtree of the source attributes. It reuses the original attribute types (preserving required/optional status, default values and key/type transformations) and can select fields of nested structs and arrays of structs. Unknown paths raise `Dry::Struct::UnknownProjectionPath`; descending into a non-struct attribute or projecting a nested struct down to zero fields raises `Dry::Struct::InvalidProjection`. The source class is never modified and default values of unselected attributes are not evaluated.
+
 ### Changed
 
 ### Deprecated

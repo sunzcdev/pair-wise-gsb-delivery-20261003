@@ -122,6 +122,48 @@ module Dry
         attributes(extracted_schema)
       end
 
+      # Build a new, independent struct type from a subtree of this struct's
+      # attributes. Reuses the original attribute types, so required/optional
+      # status, default values and key/type transformations are preserved.
+      #
+      # The source class is not modified. Default values of attributes that
+      # are not selected are never evaluated. Nested structs and arrays of
+      # structs can be projected by selecting only some of their fields.
+      #
+      # @param selection [Hash{Symbol, String => true, Hash}]
+      #   selected attributes; +true+ keeps the attribute (and, for nested
+      #   structs, all of its fields), a nested hash selects nested fields
+      # @yield optional block selecting attributes with a small DSL
+      #   (+attribute+/+field+/+attributes+)
+      #
+      # @return [Class] a new subclass of Dry::Struct
+      #
+      # @raise [UnknownProjectionPath] if a selected attribute doesn't exist
+      # @raise [InvalidProjection] if nested fields are selected from a
+      #   non-struct attribute, or if a nested struct is projected down to
+      #   zero attributes
+      #
+      # @example with a block
+      #   EventView = Event.project do
+      #     attribute :id
+      #     attribute :address do
+      #       attribute :city
+      #     end
+      #     attribute :friends do
+      #       attributes :name, :email
+      #     end
+      #   end
+      #
+      # @example with a hash
+      #   EventView = Event.project(
+      #     id: true,
+      #     address: { city: true },
+      #     friends: { name: true }
+      #   )
+      def project(selection = nil, &block)
+        Projection.call(self, Projection.tree(selection, &block))
+      end
+
       # Adds an omittable (key is not required on initialization) attribute for this {Struct}
       #
       # @example
