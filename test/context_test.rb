@@ -852,6 +852,242 @@ describe Rack::Cache::Context do
     response['content-length'].must_equal 'Hello World'.length.to_s
   end
 
+  describe 'with head_freshening enabled' do
+    before do
+      cache_config { |cache| cache.set 'rack-cache.head_freshening', true }
+    end
+
+    it 'revalidates a stale entry with a conditional HEAD and keeps the GET body' do
+      timestamp = Time.now.httpdate
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        res['last-modified'] = timestamp
+        res['cache-control'] = 'public'
+        res.body = ['Hello World']
+        if req.env['HTTP_IF_MODIFIED_SINCE'] == timestamp
+          res.status = 304
+          res.body = []
+        end
+      end
+
+      get '/'
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :miss
+
+      head '/', 'HTTP_CACHE_CONTROL' => 'max-age=0'
+      methods.last.must_equal 'HEAD'
+      methods.must_equal ['GET', 'HEAD']
+      response.status.must_equal 200
+      response.body.must_equal ''
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+      cache.trace.must_include :store
+      cache.trace.wont_include :invalid
+
+      # a following GET revalidates and is answered with the retained body;
+      # the only freshening request the origin saw was HEAD
+      get '/'
+      response.status.must_equal 200
+      response.body.must_equal 'Hello World'
+      response['content-length'].must_equal 'Hello World'.length.to_s
+      methods.must_equal ['GET', 'HEAD', 'GET']
+      cache.trace.must_include :valid
+    end
+
+    it 'freshens metadata from a compatible 200 HEAD response but retains the body' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        res['etag'] = '"v1"'
+        res['content-type'] = 'text/plain'
+        res['content-length'] = 'Hello World'.length.to_s
+        if req.request_method == 'HEAD'
+          # origin extends freshness via metadata only; body stays withheld
+          res['cache-control'] = 'max-age=1000'
+          res.body = []
+        else
+          res.body = ['Hello World']
+        end
+      end
+
+      get '/'
+      response.body.must_equal 'Hello World'
+      response['etag'].must_equal '"v1"'
+      response.headers.wont_include 'cache-control'
+
+      head '/', 'HTTP_CACHE_CONTROL' => 'max-age=0'
+      methods.last.must_equal 'HEAD'
+      response.status.must_equal 200
+      response.body.must_equal ''
+      response['etag'].must_equal '"v1"'
+      cache.trace.must_include :freshen
+      cache.trace.must_include :store
+      cache.trace.wont_include :invalid
+
+      # freshening made the entry fresh: no origin contact, body retained
+      get '/'
+      methods.last.must_equal 'HEAD'
+      methods.must_equal ['GET', 'HEAD']
+      response.status.must_equal 200
+      response.body.must_equal 'Hello World'
+      response['content-length'].must_equal 'Hello World'.length.to_s
+      response['etag'].must_equal '"v1"'
+      response['cache-control'].must_equal 'max-age=1000'
+      cache.trace.must_include :fresh
+    end
+
+    it 'does not treat an etag conflict as a validated entity and re-fetches on GET' do
+      count = 0
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        count += 1
+        res['content-length'] = 'Hello World'.length.to_s
+        case count
+        when 1
+          res['etag'] = '"v1"'
+          res.body = ['Hello World']
+        when 2
+          # conditional HEAD: origin indicates the entity changed
+          res['etag'] = '"v2"'
+          res.body = []
+        else
+          # conditional GET after the conflict
+          res['etag'] = '"v2"'
+          res.body = ['second response']
+        end
+      end
+
+      get '/'
+      response.body.must_equal 'Hello World'
+
+      head '/', 'HTTP_CACHE_CONTROL' => 'max-age=0'
+      methods.last.must_equal 'HEAD'
+      response.status.must_equal 200
+      response.body.must_equal ''
+      response['etag'].must_equal '"v2"'
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :store
+      cache.trace.wont_include :freshen
+
+      # the stale, unchanged entry must be re-fetched on the next GET
+      get '/'
+      methods.last.must_equal 'GET'
+      response.status.must_equal 200
+      response.body.must_equal 'second response'
+      cache.trace.must_include :stale
+      cache.trace.must_include :invalid
+      cache.trace.must_include :store
+    end
+
+    it 'does not freshen when content-length disagrees' do
+      count = 0
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        count += 1
+        res['etag'] = '"v1"'
+        if count == 1
+          res['content-length'] = 'Hello World'.length.to_s
+          res.body = ['Hello World']
+        elsif req.request_method == 'HEAD'
+          res['content-length'] = '99'
+          res.body = []
+        else
+          res['content-length'] = 'Hello World'.length.to_s
+          res.body = ['Hello World']
+        end
+      end
+
+      get '/'
+      head '/', 'HTTP_CACHE_CONTROL' => 'max-age=0'
+      methods.last.must_equal 'HEAD'
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :freshen
+      cache.trace.wont_include :store
+
+      get '/'
+      methods.last.must_equal 'GET'
+      response.body.must_equal 'Hello World'
+    end
+
+    it 'does not freshen old entries without validation information' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        res['cache-control'] = 'max-age=1000'
+        res['content-length'] = 'Hello World'.length.to_s
+        res.body = ['Hello World']
+      end
+
+      get '/'
+      response.body.must_equal 'Hello World'
+
+      # expire the fresh entry through the metastore, leaving it without
+      # validators (no etag / last-modified) to simulate a heuristic entry
+      request = Rack::Cache::Request.new(Rack::MockRequest.env_for('/'))
+      key = cache.metastore.cache_key(request)
+      entries = cache.metastore.send(:read, key)
+      entries.each { |_req, meta| meta['cache-control'] = 'max-age=0' }
+      cache.metastore.send(:write, key, entries)
+
+      head '/'
+      methods.last.must_equal 'HEAD'
+      response.status.must_equal 200
+      response.body.must_equal ''
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :store
+      cache.trace.wont_include :freshen
+
+      # nothing was freshened; a later GET revalidates with the origin
+      get '/'
+      response.body.must_equal 'Hello World'
+      methods.must_equal ['GET', 'HEAD', 'GET']
+      cache.trace.must_include :stale
+      cache.trace.must_include :invalid
+      cache.trace.must_include :store
+    end
+
+    it 'never creates an empty GET entry on a HEAD miss' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        res['cache-control'] = 'max-age=1000'
+        res['content-length'] = 'Hello World'.length.to_s
+        res.body = ['Hello World']
+      end
+
+      head '/'
+      methods.must_equal ['HEAD']
+      response.status.must_equal 200
+      response.body.must_equal ''
+      cache.trace.must_include :miss
+      cache.trace.wont_include :store
+
+      get '/'
+      methods.must_equal ['HEAD', 'GET']
+      response.status.must_equal 200
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :miss
+      cache.trace.must_include :store
+    end
+  end
+
+  it 'rewrites HEAD to GET when head_freshening is disabled' do
+    methods = []
+    respond_with do |req,res|
+      methods << req.request_method
+      res['cache-control'] = 'max-age=1000'
+      res.body = ['Hello World']
+    end
+
+    head '/'
+    methods.must_equal ['GET']
+    cache.trace.must_include :miss
+    cache.trace.must_include :store
+  end
+
   it 'invalidates cached responses on POST' do
     respond_with do |req,res|
       if req.request_method == 'GET'

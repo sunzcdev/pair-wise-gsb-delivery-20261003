@@ -212,19 +212,15 @@ module Rack::Cache
     # Validate that the cache entry is fresh. The original request is used
     # as a template for a conditional GET request with the backend.
     def validate(entry)
+      return validate_with_head(entry) if @request.head? && head_freshening?
+
       # send no head requests because we want content
       convert_head_to_get!
 
-      # add our cached last-modified validator to the environment
-      @env['HTTP_IF_MODIFIED_SINCE'] = entry.last_modified
-
-      # Add our cached etag validator to the environment.
+      # Add our cached validators to the environment.
       # We keep the etags from the client to handle the case when the client
       # has a different private valid entry which is not cached here.
-      cached_etags = entry.etag.to_s.split(/\s*,\s*/)
-      request_etags = @request.env['HTTP_IF_NONE_MATCH'].to_s.split(/\s*,\s*/)
-      etags = (cached_etags + request_etags).uniq
-      @env['HTTP_IF_NONE_MATCH'] = etags.empty? ? nil : etags.join(', ')
+      cached_etags, request_etags = apply_cached_validators!(entry)
 
       response = forward
 
@@ -235,12 +231,7 @@ module Rack::Cache
         etag = response.headers['etag']
         return response if etag && request_etags.include?(etag) && !cached_etags.include?(etag)
 
-        entry = entry.dup
-        entry.headers.delete('date')
-        %w[Date expires cache-control etag last-modified].each do |name|
-          next unless value = response.headers[name]
-          entry.headers[name] = value
-        end
+        entry = merge_not_modified(entry, response)
 
         # even though it's empty, be sure to close the response body from upstream
         # because middleware use close to signal end of response
@@ -256,13 +247,66 @@ module Rack::Cache
       response
     end
 
+    # Revalidate a cached GET representation with a conditional HEAD request.
+    # The backend always sees HEAD (it is never rewritten to GET) and its
+    # response is only used to update the cached metadata. The stored body is
+    # never replaced since a HEAD response carries no entity.
+    #
+    # See http://tools.ietf.org/html/rfc9111#section-4.3.4.
+    def validate_with_head(entry)
+      cached_etags, request_etags = apply_cached_validators!(entry)
+
+      response = forward
+
+      store_entry = false
+      if response.status == 304
+        record :valid
+
+        # Check if the response validated which is not cached here
+        etag = response.headers['etag']
+        return response if etag && request_etags.include?(etag) && !cached_etags.include?(etag)
+
+        entry = merge_not_modified(entry, response)
+
+        response.body.close if response.body.respond_to?(:close)
+
+        response = entry
+        store_entry = true
+      elsif response.status == 200
+        case head_representation_status(entry, response)
+        when :compatible
+          record :freshen
+
+          entry = merge_head_representation(entry, response)
+
+          response.body.close if response.body.respond_to?(:close)
+
+          response = entry
+          store_entry = true
+        else
+          # The validators disagree (:conflict) or there is not enough
+          # information to prove the entity is the same (:insufficient).
+          # Do not treat the HEAD response as a validated GET entity: the
+          # stale entry is left untouched and a later GET will re-fetch
+          # a complete representation.
+          record :invalid
+        end
+      else
+        record :invalid
+      end
+
+      store(response) if store_entry && response.cacheable?
+
+      response
+    end
+
     # The cache missed or a reload is required. Forward the request to the
     # backend and determine whether the response should be stored. This allows
     # conditional / validation requests through to the backend but performs no
     # caching of the response when the backend returns a 304.
     def fetch
       # send no head requests because we want content
-      convert_head_to_get!
+      convert_head_to_get! unless head_freshening?
 
       response = forward
 
@@ -278,7 +322,9 @@ module Rack::Cache
         response.ttl = default_ttl
       end
 
-      store(response) if response.cacheable?
+      # A HEAD response carries no body; never turn one into an empty cached
+      # GET representation when the request stayed HEAD.
+      store(response) if response.cacheable? && !(@request.head? && head_freshening?)
 
       response
     end
@@ -301,6 +347,116 @@ module Rack::Cache
       record :ignore if stripped_values.any?
     end
 
+    # Add the cached entry's validators to the request environment. Returns
+    # the list of cached etags and the etags sent by the client.
+    def apply_cached_validators!(entry)
+      # add our cached last-modified validator to the environment
+      @env['HTTP_IF_MODIFIED_SINCE'] = entry.last_modified
+
+      cached_etags = entry.etag.to_s.split(/\s*,\s*/)
+      request_etags = @request.env['HTTP_IF_NONE_MATCH'].to_s.split(/\s*,\s*/)
+      etags = (cached_etags + request_etags).uniq
+      @env['HTTP_IF_NONE_MATCH'] = etags.empty? ? nil : etags.join(', ')
+
+      [cached_etags, request_etags]
+    end
+
+    # Merge the metadata of a 304 Not Modified response into a copy of the
+    # stored entry, leaving its entity (body and body headers) untouched.
+    def merge_not_modified(entry, response)
+      entry = entry.dup
+      entry.headers.delete('date')
+      %w[Date expires cache-control etag last-modified].each do |name|
+        next unless value = response.headers[name]
+        entry.headers[name] = value
+      end
+      entry
+    end
+
+    # Metadata that may be copied from a successful HEAD response onto the
+    # stored GET representation because it does not describe the entity body.
+    HEAD_METADATA_HEADERS = %w[
+      date
+      expires
+      cache-control
+      etag
+      last-modified
+    ].freeze
+
+    # Body-related headers that may only be adopted when they agree with the
+    # representation already cached (they must describe the retained body).
+    HEAD_ENTITY_HEADERS = %w[
+      content-encoding
+      content-language
+      content-md5
+      content-type
+    ].freeze
+
+    # Determine whether the HEAD response represents the same entity as the
+    # stored GET entry:
+    #
+    # * :compatible when strong validators (strong etag or last-modified)
+    #   agree and the content-length, when known on both sides, matches.
+    # * :conflict when a validator or the content-length disagrees.
+    # * :insufficient when there is no validator on either representation or
+    #   the validator cannot be compared strongly.
+    def head_representation_status(entry, response)
+      entry_etag = strong_etag(entry.etag)
+      response_etag = strong_etag(response.etag)
+      if entry_etag && response_etag
+        return :conflict unless entry_etag == response_etag
+      elsif entry.last_modified && response.last_modified
+        return :conflict unless same_httpdate?(entry.last_modified, response.last_modified)
+      else
+        return :insufficient
+      end
+
+      entry_length = entry.headers['content-length']
+      response_length = response.headers['content-length']
+      if entry_length && response_length && entry_length != response_length
+        return :conflict
+      end
+
+      :compatible
+    end
+
+    # Copy updatable metadata from a compatible HEAD response onto the stored
+    # entry. The original body and its content-length are always preserved.
+    def merge_head_representation(entry, response)
+      entry = entry.dup
+      entry.headers.delete('date')
+
+      HEAD_METADATA_HEADERS.each do |name|
+        next unless value = response.headers[name]
+        entry.headers[name] = value
+      end
+
+      HEAD_ENTITY_HEADERS.each do |name|
+        next unless value = response.headers[name]
+        current = entry.headers[name]
+        entry.headers[name] = value if current.nil? || current == value
+      end
+
+      entry
+    end
+
+    # Return the etag when it is a strong validator (no "W/" prefix), nil
+    # otherwise. Weak validators only prove semantic equivalence and cannot
+    # establish that the entity bytes are unchanged.
+    def strong_etag(etag)
+      return nil unless etag
+      value = etag.strip
+      value.start_with?('W/') ? nil : value
+    end
+
+    # Compare two HTTP-date values by parsing them; unparseable values are
+    # only considered equal when their literal values match.
+    def same_httpdate?(first, second)
+      Time.httpdate(first) == Time.httpdate(second)
+    rescue ArgumentError
+      first == second
+    end
+
     def log_error(exception)
       message = "cache error: #{exception.message}\n#{exception.backtrace.join("\n")}\n"
       log(:error, message)
@@ -318,9 +474,11 @@ module Rack::Cache
       end
     end
 
-    # send no head requests because we want content
+    # Rewrite HEAD requests to GET because the content is needed, unless
+    # explicit HEAD freshening is enabled (the backend then keeps seeing
+    # HEAD).
     def convert_head_to_get!
-      if @env['REQUEST_METHOD'] == 'HEAD'
+      if @env['REQUEST_METHOD'] == 'HEAD' && !head_freshening?
         @env['REQUEST_METHOD'] = 'GET'
         @env['rack.methodoverride.original_method'] = 'HEAD'
       end

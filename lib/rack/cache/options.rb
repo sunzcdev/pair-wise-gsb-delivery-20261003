@@ -111,6 +111,19 @@ module Rack::Cache
     # the attempt to revalidate the cache entry raises an exception.
     option_accessor :fault_tolerant
 
+    # Specifies whether a stale cache entry may be revalidated by sending
+    # the origin a conditional HEAD request instead of rewriting the client's
+    # HEAD request to GET. Disabled by default.
+    #
+    # When enabled, the backend always sees HEAD. A 304 response, or a 200
+    # HEAD response whose strong validators and content-length match the
+    # stored representation, refreshes the cached metadata while the stored
+    # GET body is retained. Responses that conflict with the cached entry,
+    # or lack enough information to prove the entity is unchanged, are not
+    # treated as validated entities; a HEAD miss never creates an empty GET
+    # cache entry.
+    option_accessor :head_freshening
+
     # The underlying options Hash. During initialization (or outside of a
     # request), this is a default values Hash. During a request, this is the
     # Rack environment Hash. The default values Hash is merged in underneath
@@ -154,6 +167,7 @@ module Rack::Cache
         'rack-cache.allow_revalidate' => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
+        'rack-cache.head_freshening'  => false,
       }
       self.options = options
     end

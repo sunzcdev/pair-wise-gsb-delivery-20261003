@@ -146,3 +146,23 @@ need to fetch metadata and check timestamps.
 Boolean specifying whether fault tolerant caching is enabled. When this option
 is enabled (`rack-cache.fault_tolerant`is `true`), stale cached results can be
 returned if the downstream service is unavailable.
+
+### `head_freshening`
+
+Boolean specifying whether stale cache entries may be revalidated with a
+conditional `HEAD` request instead of rewriting the client's `HEAD` request to
+`GET`. Disabled by default.
+
+When this option is enabled (`rack-cache.head_freshening` is `true`), the
+backend always receives `HEAD`. A `304 Not Modified` response, or a `200`
+`HEAD` response whose strong validators (strong `ETag` or `Last-Modified`) and
+`Content-Length` match the stored representation, refreshes the cached
+metadata while the stored `GET` body is retained.
+
+When the validators or `Content-Length` disagree, the `HEAD` response is
+returned to the client but the cached entry is not considered validated; a
+later `GET` revalidates and re-fetches the full representation. When the
+origin response does not carry enough information to prove the entity is
+unchanged, the cache behaves conservatively and does not freshen the entry.
+A `HEAD` request with no matching cached entry never creates an empty cached
+`GET` response.

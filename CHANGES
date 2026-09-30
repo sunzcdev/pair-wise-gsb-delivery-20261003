@@ -1,3 +1,11 @@
+## Unreleased
+
+ * Add an opt-in `head_freshening` option to revalidate stale entries with
+   conditional HEAD requests (the backend keeps seeing HEAD). Compatible
+   responses update the cached metadata and retain the stored GET body;
+   conflicting or insufficiently validated responses are not treated as
+   validated entities, and HEAD misses never create an empty GET entry.
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers
