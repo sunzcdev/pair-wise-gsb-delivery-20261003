@@ -14,6 +14,8 @@ module Grape
           end
 
           def add(exposure, result)
+            return if result.equal?(Entity::PARTIAL_OMIT)
+
             # Save a result array in collections' array if it should be merged
             if result.is_a?(Array) && exposure.for_merge
               @output_collection << result

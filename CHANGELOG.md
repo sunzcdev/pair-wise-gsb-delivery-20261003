@@ -6,6 +6,7 @@
 
 #### Features
 
+* Add `Entity.represent_partial` and `#partial_serializable_hash` for collecting formatter failures while continuing representation, with per-field `on_format_error: :omit` and `:null` actions.
 * Your contribution here.
 
 

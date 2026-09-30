@@ -188,6 +188,8 @@ module Grape
     #   block to the expose call to achieve the same effect.
     # @option options :documentation Define documenation for an exposed
     #   field, typically the value is a hash with two fields, type and desc.
+    # @option options :on_format_error Set to `:omit` or `:null` with
+    #   `:format_with` to handle formatter exceptions in partial representations.
     # @option options :merge This option allows you to merge an exposed field to the root
     #
     # rubocop:disable Layout/LineLength
@@ -455,6 +457,33 @@ module Grape
       root_element ? { root_element => inner } : inner
     end
 
+    # Partially represent one or more objects, continuing after formatter failures
+    # that have an explicit `on_format_error` action.
+    #
+    # @param objects [Object or Array] one or more objects to represent
+    # @param options [Hash] options passed through to each entity representation
+    # @param context [PartialContext] shared collector for structured errors
+    # @return [PartialRepresentation] representation and formatter errors
+    def self.represent_partial(objects, options = {}, context = PartialContext.new)
+      @present_collection ||= nil
+      if objects.respond_to?(:to_ary) && !@present_collection
+        root_element = root_element(:collection_root)
+        inner = objects.to_ary.each_with_index.map do |object, index|
+          entity_options = options.reverse_merge(collection: true)
+          new(object, entity_options).partial_presented(context, index)
+        end
+      else
+        objects = { @collection_name => objects } if @present_collection
+        root_element = root_element(:root)
+        inner = new(objects, options).partial_presented(context)
+      end
+
+      root_element = options[:root] if options.key?(:root)
+      representation = finalize_partial_value(root_element ? { root_element => inner } : inner)
+
+      PartialRepresentation.new(representation: representation, errors: context.errors)
+    end
+
     # This method returns the entity's root or collection root node, or its parent's
     # @param root_type: either :collection_root or just :root
     def self.root_element(root_type)
@@ -473,6 +502,48 @@ module Grape
         self
       end
     end
+
+    def partial_presented(context, collection_index = nil)
+      return nil if object.nil?
+
+      partial_options = options.for_partial(context)
+      if collection_index.nil?
+        root_exposure.partial_serializable_value(self, partial_options)
+      else
+        partial_options.with_collection_index(collection_index) do
+          root_exposure.partial_serializable_value(self, partial_options)
+        end
+      end
+    end
+
+    # Build a partial serializable Hash and collect declared formatter failures.
+    #
+    # @param runtime_options [Hash] options merged with the entity options
+    # @param context [PartialContext] shared collector for structured errors
+    # @return [PartialRepresentation] representation and formatter errors
+    def partial_serializable_hash(runtime_options = {}, context = PartialContext.new)
+      return PartialRepresentation.new(representation: nil, errors: context.errors) if object.nil?
+
+      opts = options.merge(runtime_options || {}).for_partial(context)
+      representation = root_exposure.partial_serializable_value(self, opts)
+      PartialRepresentation.new(
+        representation: self.class.send(:finalize_partial_value, representation),
+        errors: context.errors
+      )
+    end
+
+    def self.finalize_partial_value(value)
+      return value unless value
+
+      if value.is_a?(Hash)
+        value.transform_values { |nested_value| finalize_partial_value(nested_value) }
+      elsif value.is_a?(Array)
+        value.map { |item| finalize_partial_value(item) }
+      else
+        value
+      end
+    end
+    private_class_method :finalize_partial_value
 
     # Prevent default serialization of :options or :delegator.
     def inspect
@@ -646,7 +717,10 @@ module Grape
       expose_nil
       override
       default
+      on_format_error
     ].to_set.freeze
+
+    VALID_FORMAT_ERROR_ACTIONS = %i[omit null].freeze
 
     # Merges the given options with current block options.
     #
@@ -686,6 +760,15 @@ module Grape
       end
 
       options[:using] = options.delete(:with) if options.key?(:with)
+
+      if options.key?(:on_format_error) && !VALID_FORMAT_ERROR_ACTIONS.include?(options[:on_format_error])
+        raise ArgumentError, ':on_format_error must be :omit or :null'
+      end
+
+      if options[:on_format_error] && !options[:format_with]
+        raise ArgumentError, ':on_format_error requires :format_with'
+      end
+
       options
     end
   end

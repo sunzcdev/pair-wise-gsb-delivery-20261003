@@ -27,6 +27,23 @@ module Grape
           using_class.represent(@subexposure.value(entity, options), new_options)
         end
 
+        def partial_serializable_value(entity, options)
+          return super unless options.partial?
+
+          new_options = options.for_nesting(key(entity))
+          value = @subexposure.valid_value(entity, options)
+
+          if value.is_a?(Array)
+            value.each_with_index.map do |item, index|
+              new_options.with_collection_index(index) do
+                using_class.represent_partial(item, new_options, options.partial_context).representation
+              end
+            end
+          else
+            using_class.represent_partial(value, new_options, options.partial_context).representation
+          end
+        end
+
         def valid?(entity)
           @subexposure.valid? entity
         end

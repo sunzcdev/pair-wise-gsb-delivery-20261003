@@ -26,6 +26,35 @@ module Grape
             entity.send(@format_with, entity.delegate_attribute(attribute))
           end
         end
+
+        def valid_value(entity, options)
+          return super unless options.partial? && @options[:on_format_error]
+          return unless valid?(entity)
+
+          value = entity.delegate_attribute(attribute)
+
+          begin
+            output = format_value(entity, value)
+          rescue StandardError => exception
+            failure = handle_partial_format_error(entity, options, exception)
+            return failure if @options[:on_format_error] == :omit
+
+            return nil
+          end
+
+          output.blank? && !@default_value.nil? ? @default_value : output
+        end
+
+        private
+
+        def format_value(entity, value)
+          formatter = entity.class.formatters[@format_with]
+          if formatter
+            entity.instance_exec(value, &formatter)
+          else
+            entity.send(@format_with, value)
+          end
+        end
       end
     end
   end

@@ -42,6 +42,14 @@ module Grape
           end
         end
 
+        def partial_serializable_value(entity, options)
+          return super unless options.partial?
+
+          map_entity_exposures(entity, options) do |exposure, nested_options|
+            exposure.partial_serializable_value(entity, nested_options)
+          end
+        end
+
         def valid_value_for(key, entity, options)
           new_options = nesting_options_for(options)
 

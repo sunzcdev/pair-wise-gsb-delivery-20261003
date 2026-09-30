@@ -418,6 +418,38 @@ module Entities
 end
 ```
 
+#### Partial Formatting Failures
+
+By default, a formatter exception is raised from both `represent` and `serializable_hash`.
+Use `represent_partial` when one non-critical field should not remove the whole API entity from
+the response. A formatter must explicitly choose whether a failed field is omitted or rendered
+as `null` with `on_format_error`.
+
+```ruby
+class StatusEntity < Grape::Entity
+  expose :id
+  expose :created_at, format_with: :iso_timestamp, on_format_error: :omit
+  expose :updated_at, format_with: :iso_timestamp, on_format_error: :null
+end
+
+result = StatusEntity.represent_partial(status)
+result.representation # => { id: 1, updated_at: nil }
+result.errors         # => [{ path: [:created_at], cause: #<StandardError ...> }]
+```
+
+Each error contains:
+
+- `path`: the external field path, using `as` aliases and integer positions for collection items
+- `cause`: the original exception raised by the formatter
+
+Nested collection errors therefore identify both the element position and field name, for example
+`[:items, 2, :created_at]`. Other fields and other collection elements are still represented.
+Normal `nil` values remain present as `null`, and fields hidden by conditions are omitted without
+adding errors.
+
+You can also call `#partial_serializable_hash` directly on an entity instance. The regular
+`#serializable_hash` method keeps its existing behavior and continues to raise formatter errors.
+
 #### Expose Nil
 
 By default, exposures that contain `nil` values will be represented in the resulting JSON as `null`.

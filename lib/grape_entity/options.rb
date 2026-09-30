@@ -92,6 +92,22 @@ module Grape
         result
       end
 
+      def for_partial(context)
+        merge(__grape_entity_partial__: true, __grape_entity_partial_context__: context)
+      end
+
+      def with_collection_index(index)
+        with_attr_path(index) { yield }
+      end
+
+      def partial?
+        opts_hash[:__grape_entity_partial__] == true
+      end
+
+      def partial_context
+        opts_hash[:__grape_entity_partial_context__]
+      end
+
       private
 
       def build_for_nesting(key)

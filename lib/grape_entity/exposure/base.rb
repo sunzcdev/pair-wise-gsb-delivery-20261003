@@ -72,17 +72,13 @@ module Grape
         def serializable_value(entity, options)
           partial_output = valid_value(entity, options)
 
-          if partial_output.respond_to?(:serializable_hash)
-            partial_output.serializable_hash
-          elsif partial_output.is_a?(Array) && partial_output.all? { |o| o.respond_to?(:serializable_hash) }
-            partial_output.map(&:serializable_hash)
-          elsif partial_output.is_a?(Hash)
-            partial_output.each do |key, value|
-              partial_output[key] = value.serializable_hash if value.respond_to?(:serializable_hash)
-            end
-          else
-            partial_output
-          end
+          serialize_value(partial_output)
+        end
+
+        def partial_serializable_value(entity, options)
+          return serializable_value(entity, options) unless options.partial?
+
+          serialize_value(valid_value(entity, options), options)
         end
 
         def valid_value(entity, options)
@@ -90,6 +86,18 @@ module Grape
 
           output = value(entity, options)
           output.blank? && !@default_value.nil? ? @default_value : output
+        end
+
+        def serialize_value(value, options = nil)
+          if value.respond_to?(:serializable_hash)
+            serialize_entity_value(value, options)
+          elsif value.is_a?(Array) && value.all? { |item| item.respond_to?(:serializable_hash) }
+            serialize_array_value(value, options)
+          elsif value.is_a?(Hash)
+            serialize_hash_value(value, options)
+          else
+            value
+          end
         end
 
         def should_return_key?(options)
@@ -129,9 +137,54 @@ module Grape
           @override
         end
 
-        protected
+      protected
 
         attr_reader :options
+
+      private
+
+        def handle_partial_format_error(entity, options, exception)
+          options.partial_context.add(partial_error_path(entity, options), exception)
+          Entity::PARTIAL_OMIT
+        end
+
+        def partial_error_path(entity, options)
+          (options.opts_hash[:attr_path] || [key(entity)]).map do |path_part|
+            path_part.respond_to?(:call) ? key(entity) : path_part
+          end
+        end
+
+        def serialize_entity_value(value, options)
+          return value.serializable_hash unless options&.partial?
+
+          nested_options = options.merge(attr_path: options.opts_hash[:attr_path]&.dup)
+          value.partial_serializable_hash(nested_options, options.partial_context).representation
+        end
+
+        def serialize_array_value(value, options)
+          return value.map(&:serializable_hash) unless options&.partial?
+
+          value.each_with_index.map do |item, index|
+            nested_options = options.merge(attr_path: options.opts_hash[:attr_path]&.dup)
+            nested_options.with_attr_path(index) do
+              item.partial_serializable_hash(nested_options, options.partial_context).representation
+            end
+          end
+        end
+
+        def serialize_hash_value(value, options)
+          value.each do |key, nested_value|
+            next unless nested_value.respond_to?(:serializable_hash)
+
+            value[key] =
+              if options&.partial?
+                nested_options = options.merge(attr_path: options.opts_hash[:attr_path]&.dup)
+                nested_value.partial_serializable_hash(nested_options, options.partial_context).representation
+              else
+                nested_value.serializable_hash
+              end
+          end
+        end
       end
     end
   end
