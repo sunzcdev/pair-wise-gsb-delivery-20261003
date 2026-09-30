@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- added `Addressable::URI#path_segments`/`#path_segments=` and
+  `Addressable::URI::PathSegment` for structured access to path segments
+  and their ordered matrix parameters; repeated parameter names are
+  preserved, flag parameters (`;name`) are distinguished from empty
+  values (`;name=`), and encoded `;`/`/` are treated as data
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

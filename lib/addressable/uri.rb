@@ -1601,6 +1601,49 @@ module Addressable
     end
 
     ##
+    # The path component parsed into structured segments. Each segment
+    # carries its own name and ordered matrix parameters, so parameters
+    # always stay attached to the segment they belong to.
+    #
+    # Segments are split on literal "/" characters in the encoded path
+    # only; an encoded slash (%2F) or semicolon (%3B) is data and never
+    # produces additional segments or parameters.
+    #
+    # For an absolute path, the first segment is an empty segment
+    # representing the leading slash, so that the segments can be
+    # serialized back to the original path without loss.
+    #
+    # The returned segments are copies; assign them back with
+    # <code>path_segments=</code> to modify the URI.
+    #
+    # @return [Array<Addressable::URI::PathSegment>] The path segments.
+    #
+    # @example
+    #   uri = Addressable::URI.parse("/books;lang=zh/42;rev=3")
+    #   segments = uri.path_segments
+    #   segments[1].name      # => "books"
+    #   segments[1]["lang"]   # => "zh"
+    #   segments[1]["lang"] = "en"
+    #   uri.path_segments = segments
+    #   uri.path              # => "/books;lang=en/42;rev=3"
+    def path_segments
+      self.path.to_s.split(SLASH, -1).map do |segment|
+        PathSegment.parse(segment)
+      end
+    end
+
+    ##
+    # Sets the path component from a list of structured segments. Each
+    # segment's matrix parameters are serialized along with the segment
+    # they belong to.
+    #
+    # @param [Array<Addressable::URI::PathSegment, #to_s>] new_segments
+    #   The new path segments.
+    def path_segments=(new_segments)
+      self.path = new_segments.map(&:to_s).join(SLASH)
+    end
+
+    ##
     # The query component for this URI.
     #
     # @return [String] The query component.
@@ -2600,3 +2643,5 @@ module Addressable
     private_constant :NONE
   end
 end
+
+require "addressable/path_segment"
