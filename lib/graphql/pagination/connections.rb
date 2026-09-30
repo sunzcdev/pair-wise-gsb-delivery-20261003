@@ -133,6 +133,12 @@ module GraphQL
       def add_default
         add(Array, Pagination::ArrayConnection)
 
+        # Single-pass, forward-only enumerables (e.g. streamed query results)
+        # are paginated without converting them to an array.
+        if defined?(Enumerator)
+          add(Enumerator, Pagination::EnumeratorConnection)
+        end
+
         if defined?(ActiveRecord::Relation)
           add(ActiveRecord::Relation, Pagination::ActiveRecordRelationConnection)
         end

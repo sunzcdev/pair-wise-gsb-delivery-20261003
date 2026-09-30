@@ -8,6 +8,8 @@
 
 ### New features
 
+- Pagination: add `GraphQL::Pagination::EnumeratorConnection` for single-pass, forward-only enumerables. It supports `first`/`after`/`pageInfo`, reads only one extra item to determine `hasNextPage` (never drains the enumeration), rejects `last`/`before` and malformed cursors up front, memoizes a single page, and honors the enumerable's resource-closing convention on early stop and errors.
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

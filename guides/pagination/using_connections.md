@@ -52,6 +52,32 @@ end
 
 The collection object (Array, Mongoid relation, Sequel dataset, ActiveRecord relation) will be automatically paginated with the provided arguments. Cursors will be generated based on the offset of nodes in the collection.
 
+### Single-pass enumerables
+
+Some collections can only be traversed once, from beginning to end — for example, a streamed export or a cursor-based query over an external API. Converting such a collection to an Array in order to paginate it would load every result into memory. For these cases, GraphQL-Ruby ships with {{ "GraphQL::Pagination::EnumeratorConnection" | api_doc }}, which is used automatically for plain Ruby `Enumerator`s:
+
+```ruby
+def items
+  # An Enumerator that yields results one at a time
+  ExportResults.new(after: nil).each_item
+end
+```
+
+It provides forward-only pagination with `first` and `after`:
+
+- at most one extra item is read to determine whether `pageInfo.hasNextPage` is true; iteration is stopped as soon as the page is served, so the collection is never drained;
+- `nodes`, `edges`, and `pageInfo` all reuse the same materialized page;
+- `last` and `before` are rejected because serving them would require rewinding or fully consuming the collection;
+- malformed cursors are rejected before the collection is touched.
+
+For any other single-pass, forward-only object that responds to `#each`, register the wrapper yourself:
+
+```ruby
+class MySchema < GraphQL::Schema
+  connections.add(MyStream, GraphQL::Pagination::EnumeratorConnection)
+end
+```
+
 ## Make Custom Connections
 
 If you want to paginate something that _isn't_ supported out-of-the-box, you can implement your own pagination wrapper and hook it up to GraphQL-Ruby. Read more in {% internal_link "Custom Connections", "/pagination/custom_connections" %}.
