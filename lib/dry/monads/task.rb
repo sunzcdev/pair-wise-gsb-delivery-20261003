@@ -74,6 +74,34 @@ module Dry
         # @param exc [Exception]
         # @return [Task]
         def failed(exc) = new(Promise.reject(exc))
+
+        # Runs a stack-safe tail-recursive loop. The block receives the
+        # state of the current iteration, runs asynchronously, and must
+        # return a {Task} wrapping either {Dry::Monads::Continue
+        # Continue}(new_state) or {Dry::Monads::Done Done}(final_value).
+        #
+        # Every iteration is scheduled on the task executor, so the chain
+        # neither grows the Ruby call stack nor blocks the calling thread:
+        # the method itself always returns immediately with a pending
+        # {Task}. A rejected task stops the loop and its error is propagated,
+        # never swallowed.
+        #
+        # @example
+        #   include Dry::Monads[:task, :tail_rec]
+        #
+        #   Task.tail_rec(first_page) do |page|
+        #     Task { fetch_page(page) }.fmap do |response|
+        #       response.last? ? Done(response.items) : Continue(response.next_page)
+        #     end
+        #   end
+        #
+        # @param state [Object] state of the first iteration
+        # @yield [Object] state of the current iteration
+        # @yieldreturn [Task] a task wrapping a Continue/Done marker
+        # @return [Task]
+        def tail_rec(state = Undefined, &block)
+          new(Promise.fulfill(Undefined.default(state, Unit))).tail_rec(&block)
+        end
       end
 
       include ConversionStubs[:to_maybe, :to_result]
@@ -120,6 +148,119 @@ module Dry
         self.class.new(promise.flat_map { block.(_1).promise })
       end
       deprecate :then, :bind
+
+      # Runs a stack-safe tail-recursive loop on top of this task.
+      # See {Task.tail_rec} for the block contract. The method returns
+      # immediately: iterations are driven asynchronously by the task
+      # executor without growing the call stack or blocking the caller.
+      #
+      # @yield [Object] state of the current iteration
+      # @yieldreturn [Task] a task wrapping a Continue/Done marker
+      # @return [Task]
+      def tail_rec(&block)
+        self.class.new(tail_rec_promise(promise, &block))
+      end
+
+      private
+
+      # Builds the final promise and drives iterations asynchronously.
+      #
+      # A single unscheduled root promise is reused as the result and the
+      # loop is a trampoline: a worker job runs steps inline while their
+      # promises are already resolved (the common, IO-free case), so a
+      # flat call stack never costs more than one executor hop per
+      # scheduled chunk. When a step is genuinely pending the worker
+      # parks and the promise's callbacks post the next job — no thread
+      # is ever blocked waiting. A rejected step or an error raised in a
+      # block rejects the final promise, following the usual Task
+      # semantics: failures stop the loop and are never swallowed.
+      #
+      # @param initial [Promise]
+      # @yield [Object]
+      # @return [Promise]
+      # @api private
+      def tail_rec_promise(initial, &block)
+        result = Promise.new
+        executor = Concurrent.global_io_executor
+
+        # Runs resolved steps inline until Done, a failure, or a pending
+        # promise is hit. +state+ is the pending input for the first step.
+        trampoline = lambda do |state|
+          loop do
+            next_task =
+              begin
+                block.(state)
+              rescue ::StandardError => exception
+                result.on_reject(exception)
+                return
+              end
+
+            unless next_task.is_a?(Task)
+              result.on_reject(TailRec::MarkerError.new(next_task))
+              return
+            end
+
+            step = next_task.promise
+            step.execute
+
+            if step.pending?
+              # Genuinely async step: park until it completes.
+              step.on_success { |marker| tail_rec_resume(result, marker, executor, &trampoline) }
+              step.on_error { |error| result.on_reject(error) }
+              return
+            elsif step.rejected?
+              result.on_reject(step.reason)
+              return
+            end
+
+            marker = step.value
+
+            case marker
+            when TailRec::Done
+              result.on_fulfill(marker.value!)
+              return
+            when TailRec::Continue
+              state = marker.value!
+            else
+              result.on_reject(TailRec::MarkerError.new(marker))
+              return
+            end
+          end
+        end
+
+        initial.execute
+
+        if initial.unscheduled? || initial.pending?
+          initial.on_success { |state| executor.post { trampoline.(state) } }
+          initial.on_error { |error| result.on_reject(error) }
+        elsif initial.rejected?
+          result.on_reject(initial.reason)
+        else
+          state = initial.value
+          executor.post { trampoline.(state) }
+        end
+
+        result
+      end
+
+      # Resumes a parked trampoline with a marker resolved off-thread.
+      # Done and marker errors finish the result; Continue schedules a
+      # fresh worker job so the call chain never nests.
+      #
+      # @return [void]
+      # @api private
+      def tail_rec_resume(result, marker, executor)
+        case marker
+        when TailRec::Done
+          result.on_fulfill(marker.value!)
+        when TailRec::Continue
+          executor.post { yield(marker.value!) }
+        else
+          result.on_reject(TailRec::MarkerError.new(marker))
+        end
+      end
+
+      public
 
       # @return [String]
       def to_s

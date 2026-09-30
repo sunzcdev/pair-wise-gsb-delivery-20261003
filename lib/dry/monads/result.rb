@@ -29,6 +29,25 @@ module Dry
         def pure(value = Undefined, &block)
           Success.new(Undefined.default(value, block))
         end
+
+        # Runs a stack-safe tail-recursive loop starting from +state+.
+        # See {RightBiased::Right#tail_rec} for the block contract.
+        #
+        # @example
+        #   include Dry::Monads[:result, :tail_rec]
+        #
+        #   Result.tail_rec(0) do |offset|
+        #     page = fetch_page(offset)
+        #     page.last? ? Success(Done(page.items)) : Success(Continue(offset + page.size))
+        #   end
+        #
+        # @param state [Object] state of the first iteration
+        # @yield [Object] state of the current iteration
+        # @yieldreturn [Result::Success, Result::Failure]
+        # @return [Result::Success, Result::Failure]
+        def tail_rec(state = Undefined, &block)
+          Success.new(Undefined.default(state, Unit)).tail_rec(&block)
+        end
       end
 
       # Returns self, added to keep the interface compatible with other monads.

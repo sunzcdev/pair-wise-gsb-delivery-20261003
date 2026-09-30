@@ -13,6 +13,7 @@ module Dry
       list: "List",
       maybe: "Maybe",
       task: "Task",
+      tail_rec: "TailRec",
       try: "Try",
       validated: "Validated",
       result: [

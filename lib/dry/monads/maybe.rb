@@ -37,6 +37,29 @@ module Dry
           Some.new(Undefined.default(value, block))
         end
 
+        # Runs a stack-safe tail-recursive loop starting from +state+.
+        # See {RightBiased::Right#tail_rec} for the block contract.
+        # A +nil+ initial state short-circuits to {None} without running
+        # the block, as with any {None} result.
+        #
+        # @example
+        #   include Dry::Monads[:maybe, :tail_rec]
+        #
+        #   Maybe.tail_rec(0) do |offset|
+        #     page = maybe_fetch_page(offset)
+        #     page.bind do |p|
+        #       p.last? ? Some(Done(p.items)) : Some(Continue(offset + p.size))
+        #     end
+        #   end
+        #
+        # @param state [Object] state of the first iteration
+        # @yield [Object] state of the current iteration
+        # @yieldreturn [Maybe::Some, Maybe::None]
+        # @return [Maybe::Some, Maybe::None]
+        def tail_rec(state = Undefined, &block)
+          coerce(Undefined.default(state, Unit)).tail_rec(&block)
+        end
+
         # Reutrns a Some wrapper converted to a block
         #
         # @return [Proc]

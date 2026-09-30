@@ -144,6 +144,29 @@ module Dry
         # @return [RightBiased::Right,RightBiased::Left]
         def flatten = bind(&:itself)
 
+        # Runs a stack-safe tail-recursive loop. The block receives the
+        # current state and must return the same monad wrapping either
+        # {Dry::Monads::Continue Continue}(new_state) or
+        # {Dry::Monads::Done Done}(final_value). Unlike a chain of
+        # {#bind} calls, iterations never grow the Ruby call stack.
+        #
+        # @example fetching pages until the last one
+        #   include Dry::Monads[:result, :tail_rec]
+        #
+        #   Success(0).tail_rec do |offset|
+        #     page = fetch_page(offset)
+        #     if page.last?
+        #       Success(Done(page.items))
+        #     else
+        #       Success(Continue(offset + page.size))
+        #     end
+        #   end
+        #
+        # @yield [Object] state of the current iteration
+        # @yieldreturn [RightBiased::Right, RightBiased::Left]
+        # @return [RightBiased::Right, RightBiased::Left]
+        def tail_rec(&block) = TailRec.run(self, &block)
+
         # Combines the wrapped value with another monadic value.
         # If both values are right-sided, yields a block and passes a tuple
         # of values there. If no block given, returns a tuple of values wrapped with
@@ -314,6 +337,12 @@ module Dry
         #
         # @return [RightBiased::Left]
         def flatten = self
+
+        # Short-circuits a tail-recursive loop: the block is never called
+        # and self is returned unchanged.
+        #
+        # @return [RightBiased::Left]
+        def tail_rec(&) = self
 
         # Returns self back. It exists to keep the interface
         # identical to that of {RightBiased::Right}.

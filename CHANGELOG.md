@@ -9,6 +9,17 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Stack-safe tail recursion with `tail_rec`. A step returns the monad wrapping either `Continue(state)` or `Done(value)`; iterations run in a loop instead of nesting `bind` calls, so paginated sync and similar long-running chains keep a constant call stack. Available for `Result`, `Maybe` (both synchronous), and `Task` (fully asynchronous — the method returns immediately and never blocks the calling thread). `Failure`, `None`, and rejected/failed `Task`s stop the loop with their usual semantics; returning anything other than a wrapped marker raises `Dry::Monads::TailRec::MarkerError` (a `TypeError`).
+
+  ```ruby
+  include Dry::Monads[:result, :tail_rec]
+
+  Result.tail_rec(first_page) do |page|
+    response = fetch_page(page)
+    response.last_page? ? Success(Done(response.items)) : Success(Continue(response.next_page))
+  end
+  ```
+
 ### Changed
 
 ### Deprecated
