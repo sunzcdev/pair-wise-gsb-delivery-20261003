@@ -49,6 +49,7 @@ module Liquid
 
     def invoke(method, *args)
       if self.class.invokable?(method)
+        validate_filter_signature(method, args)
         send(method, *args)
       elsif @context.strict_filters
         raise Liquid::UndefinedFilter, "undefined filter #{method}"
@@ -57,6 +58,34 @@ module Liquid
       end
     rescue ::ArgumentError => e
       raise Liquid::ArgumentError, e.message, e.backtrace
+    end
+
+    private
+
+    # Validates dynamically invoked filters (e.g. through Context#invoke)
+    # against the signature registered on the context's environment, so that
+    # argument mismatches are attributed to the right filter even when the
+    # call does not come from a parsed template.
+    def validate_filter_signature(method, args)
+      return unless @context
+
+      signature = @context.environment&.filter_signature_for(method)
+      return unless signature
+
+      positional_count = args.size - 1 # the filtered input is not an argument
+      if !signature.keywords.empty? && args.last.is_a?(Hash)
+        # A trailing hash is treated as keyword arguments: unknown keys are
+        # always reported, but the positional count is checked leniently
+        # since the hash might also be a positional argument.
+        signature.validate_keywords!(args.last.keys, as: method, error_class: Liquid::ArgumentError)
+        return if signature.valid_positional?(positional_count - 1) || signature.valid_positional?(positional_count)
+
+        raise Liquid::ArgumentError, signature.positional_error_message(method, positional_count - 1)
+      end
+
+      return if signature.valid_positional?(positional_count)
+
+      raise Liquid::ArgumentError, signature.positional_error_message(method, positional_count)
     end
   end
 end

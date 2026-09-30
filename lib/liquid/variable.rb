@@ -101,7 +101,18 @@ module Liquid
       obj = context.evaluate(@name)
 
       @filters.each do |filter_name, filter_args, filter_kwargs|
-        filter_args = evaluate_filter_expressions(context, filter_args, filter_kwargs)
+        signature = context.environment.filter_signature_for(filter_name)
+        if signature
+          # Re-validate at render time: the template may have been parsed with
+          # a different environment than the one it renders in.
+          signature.validate!(
+            filter_args.size,
+            filter_kwargs ? filter_kwargs.keys : [],
+            as: filter_name,
+            error_class: ArgumentError,
+          )
+        end
+        filter_args = evaluate_filter_expressions(context, filter_args, filter_kwargs, signature)
         obj = context.invoke(filter_name, obj, *filter_args)
       end
 
@@ -148,6 +159,7 @@ module Liquid
           filter_args << parse_context.parse_expression(a)
         end
       end
+      validate_filter_signature(filter_name, filter_args, keyword_args)
       result = [filter_name, filter_args]
       result << keyword_args if keyword_args
       result
@@ -175,7 +187,23 @@ module Liquid
 
       result = [filtername, filter_args]
       result << keyword_args unless keyword_args.empty?
+      validate_filter_signature(filtername, filter_args, keyword_args.empty? ? nil : keyword_args)
       result
+    end
+
+    def validate_filter_signature(filter_name, filter_args, keyword_args)
+      signature = parse_context.environment.filter_signature_for(filter_name)
+      return unless signature
+
+      signature.validate!(
+        filter_args.size,
+        keyword_args ? keyword_args.keys : [],
+        as: filter_name,
+      )
+    rescue FilterSignatureError => e
+      e.line_number    ||= @line_number
+      e.markup_context ||= markup_context(@markup)
+      raise
     end
 
     def argument(p, positional_arguments, keyword_arguments)
@@ -193,14 +221,17 @@ module Liquid
       p.look(:pipe) || p.look(:end_of_string)
     end
 
-    def evaluate_filter_expressions(context, filter_args, filter_kwargs)
+    def evaluate_filter_expressions(context, filter_args, filter_kwargs, signature = nil)
       parsed_args = filter_args.map { |expr| context.evaluate(expr) }
       if filter_kwargs
         parsed_kwargs = {}
         filter_kwargs.each do |key, expr|
           parsed_kwargs[key] = context.evaluate(expr)
         end
+        parsed_kwargs = signature.apply_defaults(parsed_kwargs) if signature
         parsed_args << parsed_kwargs
+      elsif signature && (default_keywords = signature.default_keywords)
+        parsed_args << default_keywords
       end
       parsed_args
     end

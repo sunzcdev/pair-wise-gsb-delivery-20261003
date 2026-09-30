@@ -93,6 +93,29 @@ LIQUID
 
 By using Environments, you ensure that custom tags and filters are only available in the contexts where they are needed, making your Liquid templates more robust and easier to manage. For smaller projects, a global environment is available via `Liquid::Environment.default`.
 
+#### Filter signatures
+
+Custom filters often fail only when a notification or page is actually rendered, because a template passes the wrong arguments. Environments let you register a *signature* for a filter so that argument mismatches are reported at parse time whenever they can be determined:
+
+```ruby
+shop_environment = Liquid::Environment.build do |environment|
+  environment.register_filter(MoneyFilters)
+  environment.register_filter_signature("money",
+    positional: 0..1,                    # filtered input is not counted
+    keywords: { currency: "USD" },       # allowed keywords and their defaults
+    aliases: ["fmt_money"],              # alternative names resolving to this signature
+  )
+end
+
+Liquid::Template.parse("{{ 5 | money: 1, 2 }}", environment: shop_environment)
+# => Liquid::FilterSignatureError: wrong number of arguments for filter 'money' (given 2, expected 0..1)
+
+Liquid::Template.parse("{{ 5 | money: curency: 'EUR' }}", environment: shop_environment)
+# => Liquid::FilterSignatureError: unknown keyword :curency for filter 'money' (valid keywords: :currency)
+```
+
+Registered keyword defaults are applied at render time when the template does not provide them, so `{{ 5 | money }}` renders with `currency: "USD"` in the example above. Signatures live on the environment: filters without a registered signature keep their historical behavior, and two environments can register different signatures for the same filter name without affecting each other.
+
 ### Error Modes
 
 Setting the error mode of Liquid lets you specify how strictly you want your templates to be interpreted.

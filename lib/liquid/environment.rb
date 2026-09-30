@@ -83,6 +83,8 @@ module Liquid
       @file_system = BlankFileSystem.new
       @default_resource_limits = Const::EMPTY_HASH
       @strainer_template_class_cache = {}
+      @filter_signatures = {}
+      @filter_signature_aliases = {}
     end
 
     # Registers a new tag with the environment.
@@ -111,6 +113,44 @@ module Liquid
       @strainer_template_class_cache.clear
       filters.each { |f| @strainer_template.add_filter(f) }
       self
+    end
+
+    # Registers a signature for a filter, describing the arguments it accepts.
+    #
+    # Templates parsed within this environment report signature mismatches at
+    # parse time, and renders within this environment apply registered keyword
+    # defaults. Filters without a registered signature keep their historical
+    # behavior.
+    #
+    # @param name [String, Symbol] The name of the filter.
+    # @param positional [Integer, Range] The allowed number of positional
+    #   arguments (the filtered input itself is not counted). An Integer means
+    #   an exact count; an endless range such as `1..` means "at least".
+    # @param keywords [Hash] The allowed keyword arguments and their default
+    #   values. Defaults are applied at render time when the template does not
+    #   provide the keyword.
+    # @param aliases [Array<String, Symbol>] Alternative filter names that
+    #   resolve to this signature.
+    # @return [Liquid::FilterSignature] The registered signature.
+    def register_filter_signature(name, positional: 0..0, keywords: {}, aliases: [])
+      signature = FilterSignature.new(name, positional: positional, keywords: keywords, aliases: aliases)
+      @filter_signatures[signature.name] = signature
+      signature.aliases.each do |filter_alias|
+        @filter_signature_aliases[filter_alias] = signature.name
+      end
+      signature
+    end
+
+    # Returns the signature registered for the given filter name, resolving
+    # aliases, or nil when the filter has no signature. A signature registered
+    # under the exact name takes precedence over an alias.
+    #
+    # @param name [String, Symbol] The name of the filter as written in the
+    #   template.
+    # @return [Liquid::FilterSignature, nil] The signature, if any.
+    def filter_signature_for(name)
+      name = name.to_s
+      @filter_signatures[name] || @filter_signatures[@filter_signature_aliases[name]]
     end
 
     # Creates a new strainer instance with the given filters, caching the result
@@ -149,8 +189,17 @@ module Liquid
       @tags[name]
     end
 
+    # @api private
+    def initialize_copy(other)
+      super
+      @filter_signatures = @filter_signatures.dup
+      @filter_signature_aliases = @filter_signature_aliases.dup
+    end
+
     def freeze
       @tags.freeze
+      @filter_signatures.freeze
+      @filter_signature_aliases.freeze
       # TODO: freeze the tags, currently this is not possible because of liquid-c
       # @strainer_template.freeze
       super
