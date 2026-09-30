@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/sequence"
 
 module MultiJson
   include Options
@@ -122,6 +123,55 @@ module MultiJson
     current_adapter(options).dump(object, options)
   end
   alias_method :encode, :dump
+
+  # Reads an RFC 7464 JSON Text Sequence from a string or byte-oriented IO.
+  #
+  # With a block each parsed record is yielded as soon as it is complete, so
+  # sequences appended over time can be consumed without holding the whole
+  # stream in memory. Without a block an Enumerator is returned.
+  #
+  # <b>Options</b>
+  #
+  # <tt>:on_bad_record</tt> :: +:raise+ (default), +:skip+, or a callable
+  #   receiving a MultiJson::MalformedRecord describing the bad record and its
+  #   raw byte range.
+  # <tt>:max_record_bytes</tt> :: optional limit on a single record's payload
+  #   size; larger records are reported as MultiJson::RecordTooLarge.
+  def load_sequence(source, options = {})
+    reader = SequenceReader.new(source, **options)
+    return reader.each unless block_given?
+
+    reader.each { |value| yield value }
+  end
+  alias_method :decode_sequence, :load_sequence
+
+  # Dumps an enumerable of objects as an RFC 7464 JSON Text Sequence.
+  #
+  # Returns the framed sequence string. Use SequenceWriter with an IO to stream
+  # records instead of buffering them.
+  def dump_sequence(objects, options = {})
+    writer = SequenceWriter.new(**options)
+    objects.each { |object| writer.write(object) }
+    writer.string
+  end
+  alias_method :encode_sequence, :dump_sequence
+
+  # Streams an RFC 7464 JSON Text Sequence into the given IO.
+  #
+  # Pass an enumerable, or pass a block that receives the SequenceWriter for
+  # incremental writes.
+  def write_sequence(io, objects = nil, options = {})
+    writer = SequenceWriter.new(io, **options)
+    if block_given?
+      yield writer
+    else
+      raise ArgumentError, "an enumerable or a block is required" if objects.nil?
+
+      objects.each { |object| writer.write(object) }
+    end
+    writer.flush
+    io
+  end
 
   #  Executes passed block using specified adapter.
   def with_adapter(new_adapter)

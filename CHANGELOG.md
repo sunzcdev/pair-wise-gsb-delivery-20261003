@@ -1,3 +1,8 @@
+Unreleased
+----------
+
+* Add streaming RFC 7464 JSON Text Sequence reader/writer (`MultiJson.load_sequence`, `MultiJson.dump_sequence`, `MultiJson.write_sequence`, `MultiJson::SequenceReader`, `MultiJson::SequenceWriter`) with chunked one-byte input, per-record size limits, stop/skip error recovery with raw byte ranges, and truncation detection
+
 1.15.0
 ------
 
