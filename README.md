@@ -242,6 +242,31 @@ encoded_token.payload # => { 'exp'=>1234, 'jti'=>'1234", 'sub'=>'my-subject' }
 encoded_token.header # {'kid'=>'hmac', 'alg'=>'HS256'}
 ```
 
+### Strict parsing
+
+Use strict parsing at service entry points that receive tokens from external
+callers. It validates the complete compact structure before key lookup or
+signature verification:
+
+- exactly three segments are present
+- header, payload and signature use canonical unpadded Base64url
+- decoded segments do not exceed the size limit
+- JSON nesting does not exceed the depth limit
+- header and payload JSON objects contain no duplicate keys
+
+```ruby
+JWT.decode(token, nil, true, { algorithm: 'HS256', strict: true }) do |header, payload|
+  secrets[payload['iss']]
+end
+
+encoded_token = JWT::EncodedToken.new(token, strict: true)
+```
+
+Signature verification always uses the encoded header and payload segments
+received in the input; strict parsing does not canonicalize or replace the
+signing input. Malformed tokens are rejected before the key finder callback is
+called. The default parsing behavior remains unchanged when `strict` is not set.
+
 The `JWT::EncodedToken#verify!` method can be used to verify signature and claim verification in one go. The `exp` claim is verified by default.
 
 ```ruby

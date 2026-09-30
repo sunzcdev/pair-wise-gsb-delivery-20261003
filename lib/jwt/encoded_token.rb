@@ -25,15 +25,21 @@ module JWT
     # Initializes a new EncodedToken instance.
     #
     # @param jwt [String] the encoded JWT token.
+    # @param strict [Boolean] whether to validate the token structure eagerly.
     # @raise [ArgumentError] if the provided JWT is not a String.
-    def initialize(jwt)
+    def initialize(jwt, strict: false)
       raise ArgumentError, 'Provided JWT must be a String' unless jwt.is_a?(String)
 
       @jwt = jwt
+      @strict = strict
       @signature_verified = false
       @claims_verified    = false
 
-      @encoded_header, @encoded_payload, @encoded_signature = jwt.split('.')
+      if strict
+        parse_strict_token
+      else
+        @encoded_header, @encoded_payload, @encoded_signature = jwt.split('.')
+      end
     end
 
     # Returns the decoded signature of the JWT token.
@@ -89,7 +95,12 @@ module JWT
     # @param encoded_payload [String] the encoded payload.
     def encoded_payload=(encoded_payload)
       @encoded_payload = encoded_payload
-      @decoded_payload = nil
+      if strict?
+        parsed_payload = StrictTokenParser.parse_payload_segment(encoded_payload, header)
+        @decoded_payload = header['b64'] == false ? nil : parsed_payload
+      else
+        @decoded_payload = nil
+      end
       @signature_verified = @claims_verified = false
     end
 
@@ -191,6 +202,23 @@ module JWT
     alias to_s jwt
 
     private
+
+    attr_reader :strict
+
+    def strict?
+      strict == true
+    end
+
+    def parse_strict_token
+      parsed_token = StrictTokenParser.parse(jwt)
+
+      @encoded_header = parsed_token.encoded_header
+      @encoded_payload = parsed_token.encoded_payload
+      @encoded_signature = parsed_token.encoded_signature
+      @header = parsed_token.header
+      @decoded_payload = parsed_token.header['b64'] == false ? nil : parsed_token.payload
+      @signature = parsed_token.signature
+    end
 
     def claims_options(options)
       return DEFAULT_CLAIMS if options.first.nil?

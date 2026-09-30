@@ -22,9 +22,9 @@ module JWT
     def initialize(jwt, key, verify, options, &keyfinder)
       raise JWT::MalformedTokenError, 'Nil JSON web token' unless jwt
 
-      @token = EncodedToken.new(jwt)
-      @key = key
       @options = options
+      @token = EncodedToken.new(jwt, strict: strict?)
+      @key = key
       @verify = verify
       @keyfinder = keyfinder
     end
@@ -47,6 +47,10 @@ module JWT
     private
 
     attr_reader :token
+
+    def strict?
+      @options[:strict] == true || @options['strict'] == true
+    end
 
     def verify_signature
       return if none_algorithm?

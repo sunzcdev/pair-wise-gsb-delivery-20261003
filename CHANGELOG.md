@@ -6,7 +6,7 @@
 
 **Features:**
 
-- Your contribution here
+- Add an explicit strict token parsing mode for `JWT.decode` and `JWT::EncodedToken`
 
 **Fixes and enhancements:**
 
