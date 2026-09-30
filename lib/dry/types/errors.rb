@@ -109,6 +109,44 @@ module Dry
       end
     end
 
+    class TaggedUnionError < CoercionError
+      # @return [Symbol]
+      attr_reader :tag
+
+      # @param [Symbol] tag
+      # @param [String] message
+      def initialize(tag, message)
+        @tag = tag
+        super(message)
+      end
+    end
+
+    # Raised by {TaggedUnion} when the tag field is absent from the input
+    class MissingTagError < TaggedUnionError
+      # @param [Symbol] tag
+      def initialize(tag)
+        super(tag, "#{tag.inspect} tag is missing in Hash input")
+      end
+    end
+
+    # Raised by {TaggedUnion} when the tag value is not registered
+    class UnknownTagError < TaggedUnionError
+      # @return [Object]
+      attr_reader :value
+
+      # @param [Symbol] tag
+      # @param [Object] value
+      # @param [Array<Object>] known
+      def initialize(tag, value, known)
+        @value = value
+        super(
+          tag,
+          "#{value.inspect} is not a known #{tag.inspect} tag " \
+          "(known tags: #{known.map(&:inspect).join(", ")})"
+        )
+      end
+    end
+
     class ConstraintError < CoercionError
       # @return [String, #to_s]
       attr_reader :result

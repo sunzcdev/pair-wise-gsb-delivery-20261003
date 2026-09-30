@@ -23,6 +23,7 @@ module Dry
         Array::Member => :visit_array_member,
         Lax => :visit_lax,
         Enum => :visit_enum,
+        TaggedUnion => :visit_tagged_union,
         [Default, Default::Callable] => :visit_default,
         [
           Sum,
@@ -162,6 +163,16 @@ module Dry
       def visit_lax(lax)
         visit(lax.type) do |type|
           yield "Lax<#{type}>"
+        end
+      end
+
+      def visit_tagged_union(tagged_union)
+        members = tagged_union.mapping.map { |value, type|
+          visit(type) { |printed| "#{value.inspect}=>#{printed}" }
+        }.join(", ")
+
+        visit_options(EMPTY_HASH, tagged_union.meta) do |opts|
+          yield "TaggedUnion<tag=#{tagged_union.tag.inspect} {#{members}}#{opts}>"
         end
       end
 

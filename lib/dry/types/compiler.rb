@@ -63,6 +63,12 @@ module Dry
         types.map { |type| visit(type) }.reduce(:|).meta(meta)
       end
 
+      def visit_tagged_union(node)
+        tag, mapping, meta = node
+        types = mapping.to_h { |value, type_ast| [value, visit(type_ast)] }
+        Types::TaggedUnion.new(tag, types).meta(meta)
+      end
+
       def visit_array(node)
         member, meta = node
         member = visit(member) unless member.is_a?(::Class)

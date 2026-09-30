@@ -118,6 +118,33 @@ module Dry
         Nominal(::Hash).map(key_type, value_type)
       end
 
+      # Build a tagged union type dispatching to a member by a tag field
+      #
+      # @example
+      #   Event = Types.TaggedUnion(:kind,
+      #     "create" => Create,
+      #     "cancel" => Cancel
+      #   )
+      #
+      # @param [Symbol] tag Name of the field used to select a member
+      # @param [Hash{Object => Type}] mapping Tag value to member type
+      #
+      # @return [Dry::Types::TaggedUnion]
+      def TaggedUnion(tag, mapping)
+        resolved = mapping.to_h do |value, type|
+          member =
+            case type
+            when Type then type
+            when ::Class, ::String then Types[type]
+            else type
+            end
+
+          [value, member]
+        end
+
+        TaggedUnionType.new(tag, resolved)
+      end
+
       # Builds a constrained nominal type accepting any value that
       # responds to given methods
       #
