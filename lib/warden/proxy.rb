@@ -29,6 +29,7 @@ module Warden
       @env, @users, @winning_strategies, @locked = env, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
+      @winning_strategy_names, @auth_evidence = {}, {}
     end
 
     # Run the on_request callbacks
@@ -139,17 +140,90 @@ module Warden
     # This brings the user from the session, but does not run strategies before doing so.
     # If you want strategies to be run, please check authenticate?.
     #
+    # Beyond mere presence of a user, evidence requirements may be given.
+    # They never run strategies and never refresh the recorded authentication
+    # time; they only inspect the stored evidence:
+    #   env['warden'].authenticated?(:admin, :methods => [:otp], :max_age => 300)
+    #
     # Parameters:
-    #   scope - the scope to check for authentication. Defaults to default_scope
+    #   args - an optional scope symbol followed by an options hash
+    #   opts - :scope, :methods (one or more acceptable strategy names),
+    #          :method (alias for a single method), :max_age (seconds),
+    #          :clock (an object responding to #now, defaults to Time)
     #
     # Example:
     #   env['warden'].authenticated?(:admin)
     #
     # :api: public
-    def authenticated?(scope = @config.default_scope)
-      result = !!user(scope)
+    def authenticated?(*args)
+      scope, opts = _retrieve_check_scope_and_opts(args)
+      result = !!user(scope) && _evidence_satisfied?(scope, opts)
       yield if block_given? && result
       result
+    end
+
+    # Passive check for whether the scope's stored authentication evidence
+    # (method and completion time) satisfies the given requirements. Unlike
+    # authenticate?, this does not attempt to authenticate when the evidence
+    # is missing or stale, and it never refreshes the recorded time.
+    #
+    # Example:
+    #   env['warden'].reauthenticated?(:methods => :otp, :max_age => 300)
+    #
+    # :api: public
+    def reauthenticated?(*args)
+      scope, opts = _retrieve_check_scope_and_opts(args)
+      !!user(scope) && _evidence_satisfied?(scope, opts)
+    end
+    alias recently_authenticated? reauthenticated?
+
+    # Step-up entry point for sensitive actions. Returns the user only when
+    # the requested evidence (a specific method and/or a maximum age) is
+    # available; otherwise it throws a :warden symbol, just like
+    # authenticate!, so the request is halted and rendered through the
+    # failure app.
+    #
+    # When evidence is missing or stale, strategies listed in the call are
+    # attempted first (allowing a fresh strong authentication during the same
+    # request). A plain, still-valid login is left untouched: the user stays
+    # logged in, but this sensitive entry reports the requirements as
+    # unmet.
+    #
+    # Example:
+    #   env['warden'].authenticate_recently!(:otp, :max_age => 300)
+    #   env['warden'].authenticate_recently!(:methods => :otp, :max_age => 300)
+    #
+    # :api: public
+    def authenticate_recently!(*args)
+      user, opts = _perform_authentication(*args)
+      throw(:warden, opts) unless user
+      user
+    end
+    alias reauthenticate! authenticate_recently!
+
+    # Returns the recorded authentication evidence for a scope (method and
+    # completion time), or nil when the scope never authenticated through a
+    # strategy during this session. Restoring the user from the session does
+    # not create evidence.
+    #
+    # :api: public
+    def auth_evidence(scope = @config.default_scope)
+      @auth_evidence[scope] ||=
+        Warden::AuthEvidence.from_session(raw_auth_evidence[scope.to_s])
+    end
+
+    # @return [Symbol, nil] the strategy name that last authenticated the scope
+    # :api: public
+    def authentication_method(scope = @config.default_scope)
+      evidence = auth_evidence(scope)
+      evidence && evidence.method
+    end
+
+    # @return [Time, nil] when the scope last completed an authentication
+    # :api: public
+    def last_authentication_at(scope = @config.default_scope)
+      evidence = auth_evidence(scope)
+      evidence && Time.at(evidence.at)
     end
 
     # Same API as authenticated?, but returns false when authenticated.
@@ -174,6 +248,15 @@ module Warden
       opts = (@config[:scope_defaults][scope] || {}).merge(opts)
       opts[:event] ||= :set_user
       @users[scope] = user
+
+      # Only a genuine authentication carries evidence of how it happened.
+      # Fetching an existing user keeps the previously recorded evidence;
+      # any other manual assignment clears it unless a method is supplied.
+      if opts[:event] == :authentication
+        _record_auth_evidence(scope, opts[:method], opts)
+      elsif opts[:event] != :fetch
+        _clear_auth_evidence(scope)
+      end
 
       if opts[:store] != false && opts[:event] != :fetch
         options = env[ENV_SESSION_OPTIONS]
@@ -274,6 +357,7 @@ module Warden
         manager._run_callbacks(:before_logout, user, self, :scope => scope)
 
         raw_session.delete("warden.user.#{scope}.session") unless raw_session.nil?
+        _clear_auth_evidence(scope)
         session_serializer.delete(scope, user)
       end
 
@@ -330,16 +414,32 @@ module Warden
       user = nil
 
       # Look for an existing user in the session for this scope.
+      # If the evidence already satisfies the requested method/max-age
+      # requirements, the cached user is returned without running any
+      # strategy and without refreshing the recorded time.
+      existing = user(opts.merge(:scope => scope))
+      if existing
+        # No evidence requirements: the plain login is always usable.
+        return existing, opts if _no_evidence_requirements?(opts)
+        return existing, opts if _evidence_satisfied?(scope, opts)
+      end
+
       # If there was no user in the session, see if we can get one from the request.
-      return user, opts if user = user(opts.merge(:scope => scope))
       _run_strategies_for(scope, args)
 
       if winning_strategy && winning_strategy.successful?
         opts[:store] = opts.fetch(:store, winning_strategy.store?)
-        set_user(winning_strategy.user, opts.merge!(:event => :authentication))
+        candidate_method = @winning_strategy_names[scope]
+        if _candidate_method_allowed?(opts, candidate_method)
+          set_user(
+            winning_strategy.user,
+            opts.merge!(:event => :authentication,
+                        :method => candidate_method)
+          )
+        end
       end
 
-      [@users[scope], opts]
+      [_effective_user(scope, opts), opts]
     end
 
     def _retrieve_scope_and_opts(args) #:nodoc:
@@ -347,6 +447,17 @@ module Warden
       scope = opts[:scope] || @config.default_scope
       opts  = (@config[:scope_defaults][scope] || {}).merge(opts)
       [scope, opts]
+    end
+
+    # Like _retrieve_scope_and_opts, but also accepts a bare scope symbol as
+    # the first positional argument (the authenticated? style).
+    def _retrieve_check_scope_and_opts(args) #:nodoc:
+      if args.first.is_a?(Symbol)
+        scope_from_arg = args.shift
+        args << {} unless args.last.is_a?(Hash)
+        args.last[:scope] ||= scope_from_arg
+      end
+      _retrieve_scope_and_opts(args)
     end
 
     # Run the strategies for a given scope
@@ -366,11 +477,11 @@ module Warden
         strategy = _fetch_strategy(name, scope)
         next unless strategy && !strategy.performed? && strategy.valid?
         catch(:warden) do
-          _update_winning_strategy(strategy, scope)
+          _update_winning_strategy(strategy, scope, name)
         end
 
         strategy._run!
-        _update_winning_strategy(strategy, scope)
+        _update_winning_strategy(strategy, scope, name)
         break if strategy.halted?
       end
     end
@@ -387,8 +498,91 @@ module Warden
     end
 
     # Updates the winning strategy for a given scope
-    def _update_winning_strategy(strategy, scope)
+    def _update_winning_strategy(strategy, scope, name = nil)
       self.winning_strategy = @winning_strategies[scope] = strategy
+      @winning_strategy_names[scope] = name.to_sym if name
+    end
+
+    # Extracts evidence requirements from merged options.
+    # :api: private
+    def _auth_requirements(opts)
+      methods = opts[:methods] || opts[:method]
+      methods = Array(methods) unless methods.nil?
+      {
+        :methods => methods,
+        :max_age => opts[:max_age],
+        :clock   => opts[:clock] || @config[:clock] || Time
+      }
+    end
+
+    # True when the call imposes no method or freshness requirements.
+    # :api: private
+    def _no_evidence_requirements?(opts)
+      requirements = _auth_requirements(opts)
+      requirements[:methods].nil? && requirements[:max_age].nil?
+    end
+
+    # Whether a candidate strategy name is acceptable for the call. Age is
+    # intentionally not considered here: a fresh success always satisfies the
+    # age requirement, but a weak method can never stand in for a strong one.
+    # :api: private
+    def _candidate_method_allowed?(opts, method)
+      methods = _auth_requirements(opts)[:methods]
+      if methods
+        return false unless method && methods.map(&:to_sym).include?(method.to_sym)
+      end
+
+      # A success completed "now" is always fresh enough for any max age.
+      true
+    end
+
+    # The user a caller should observe: always present for a plain login,
+    # but hidden when step-up requirements are not satisfied.
+    # :api: private
+    def _effective_user(scope, opts)
+      return @users[scope] if _no_evidence_requirements?(opts)
+      _evidence_satisfied?(scope, opts) ? @users[scope] : nil
+    end
+
+    # Whether the stored evidence for a scope meets the requested method and
+    # age. No requirements means any evidence (or none) is acceptable.
+    # :api: private
+    def _evidence_satisfied?(scope, opts)
+      requirements = _auth_requirements(opts)
+      # No evidence requirements: an already logged-in user is enough, even
+      # for sessions that predate evidence tracking (plain :authenticated?).
+      return true if requirements[:methods].nil? && requirements[:max_age].nil?
+
+      evidence = auth_evidence(scope)
+      return false unless evidence
+
+      evidence.satisfies?(**requirements)
+    end
+
+    # Persists fresh authentication evidence for a scope.
+    # :api: private
+    def _record_auth_evidence(scope, method, opts = {})
+      return unless method
+
+      clock = (opts[:clock] || @config[:clock] || Time)
+      evidence = Warden::AuthEvidence.record(method, clock)
+      @auth_evidence[scope] = evidence
+      raw_auth_evidence[scope.to_s] = evidence.to_session unless opts[:store] == false
+      evidence
+    end
+
+    # Removes the stored authentication evidence for a scope.
+    # :api: private
+    def _clear_auth_evidence(scope)
+      @auth_evidence.delete(scope)
+      raw_auth_evidence.delete(scope.to_s) unless raw_session.nil?
+    end
+
+    # Hash of per-scope evidence held in the session.
+    # :api: private
+    def raw_auth_evidence
+      return {} if raw_session.nil?
+      raw_session[Warden::AuthEvidence::SESSION_KEY] ||= {}
     end
   end # Proxy
 

@@ -37,6 +37,23 @@ module Warden::Spec
       lambda{|e| [200, {"Content-Type" => "text/plain"}, ["You Win"]]}
     end
 
+    # A deterministic clock for tests so nothing has to wait for real time.
+    class FakeClock
+      def initialize(time = 1000)
+        @time = time
+      end
+
+      attr_accessor :time
+
+      def now
+        Time.at(@time)
+      end
+
+      def advance(seconds)
+        @time += seconds
+      end
+    end
+
     class Session
       attr_accessor :app
       def initialize(app,configs = {})

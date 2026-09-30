@@ -7,6 +7,7 @@ require 'warden/proxy'
 require 'warden/manager'
 require 'warden/errors'
 require 'warden/session_serializer'
+require 'warden/auth_evidence'
 require 'warden/strategies'
 require 'warden/strategies/base'
 

@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## Unreleased
+* Track authentication evidence per scope (method + completion time) for
+  reauthentication / step-up authentication. Restoring the user from the
+  session or repeatedly reading it never refreshes the recorded time; only a
+  successful strategy does.
+* Add `authenticated?`/`reauthenticated?` evidence checks and
+  `authenticate_recently!` entry point accepting `:methods`/`:method` and
+  `:max_age`. A failed step-up keeps the ordinary login but reports the
+  requirements as unmet at sensitive entry points.
+* Add `authentication_method`, `last_authentication_at` and `auth_evidence`
+  readers. The clock is injectable through the `:clock` option or manager
+  configuration.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)
