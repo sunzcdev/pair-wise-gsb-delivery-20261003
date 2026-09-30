@@ -1,5 +1,7 @@
 === master
 
+* Add statement_budget extension for limiting the number of business statements inside a transaction, shared by nested transactions and savepoints (jeremyevans)
+
 * Make create_table with :temp and :as options create temporary table on Microsoft SQL Server and DB2 (jeremyevans) (#2393)
 
 * Revert support for PostgreSQL 19 property graphs (jeremyevans)
