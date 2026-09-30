@@ -129,6 +129,9 @@ module GraphQL
         independent_fragment_nodes = @defdep_fragment_definitions.values.flatten - @defdep_immediate_dependencies.keys
         visited_fragment_names = Set.new
         while fragment_node = independent_fragment_nodes.pop
+          # One resolution step is one unit of checking work; keeps a session
+          # pausable while fragment dependencies are flattened after the visit.
+          context.consume_work(1)
           if visited_fragment_names.add?(fragment_node.name)
             # this is a new fragment name
           else
@@ -149,6 +152,8 @@ module GraphQL
             dependency_map.unused_dependencies << @defdep_node_paths[fragment_node]
           else
             fragment_usages.each do |definition_node|
+              # One dependent-resolution step is one unit of checking work.
+              context.consume_work(1)
               # Register the dependency AND second-order dependencies
               dependency_map[definition_node] << fragment_node
               dependency_map[definition_node].concat(dependency_map[fragment_node])

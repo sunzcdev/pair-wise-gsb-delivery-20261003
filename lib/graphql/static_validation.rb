@@ -14,3 +14,5 @@ end
 
 require "graphql/static_validation/all_rules"
 require "graphql/static_validation/interpreter_visitor"
+require "graphql/static_validation/pausable_base_visitor"
+require "graphql/static_validation/validation_session"

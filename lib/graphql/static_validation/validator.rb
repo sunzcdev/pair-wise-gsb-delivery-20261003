@@ -20,6 +20,30 @@ module GraphQL
         @rules = rules
       end
 
+      # Begin a pausable validation session for `query`.
+      #
+      # Instead of blocking the thread until the whole document is validated,
+      # the returned {ValidationSession} is advanced one work budget at a time
+      # by an event loop:
+      #
+      #   session = validator.validation_session(query)
+      #   result = session.advance(work_units: 50)
+      #   result.unfinished? # => more turns needed
+      #
+      # @param query [GraphQL::Query]
+      # @param validate [Boolean] when `false`, the session completes with no rules run
+      # @param rules [Array<#validate(context)>, nil] override this validator's ruleset for this session
+      # @param max_errors [Integer, nil] stop collecting errors after this many
+      # @return [GraphQL::StaticValidation::ValidationSession]
+      def validation_session(query, validate: true, rules: nil, max_errors: nil)
+        GraphQL::StaticValidation::ValidationSession.new(
+          query,
+          rules: rules || @rules,
+          validate: validate,
+          max_errors: max_errors,
+        )
+      end
+
       # Validate `query` against the schema. Returns an array of message hashes.
       # @param query [GraphQL::Query]
       # @param validate [Boolean]

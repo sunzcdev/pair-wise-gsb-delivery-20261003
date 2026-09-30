@@ -151,6 +151,9 @@ module GraphQL
         while sel_idx < sel_len
           sel = selections[sel_idx]
 
+          # Collecting one selection (possibly expanding a fragment) is one
+          # unit of checking work.
+          @context.consume_work(1)
           case sel
           when GraphQL::Language::Nodes::Field
             definition = @types.field(owner_type, sel.name)
@@ -234,6 +237,7 @@ module GraphQL
               while gi < unique_groups.size
                 gj = gi + 1
                 while gj < unique_groups.size
+                  @context.consume_work(1)
                   find_conflict(key, unique_groups[gi][0], unique_groups[gj][0])
                   gj += 1
                 end
@@ -253,6 +257,7 @@ module GraphQL
             while i < fields.size
               j = i + 1
               while j < fields.size
+                @context.consume_work(1)
                 find_conflict(key, fields[i], fields[j])
                 j += 1
               end
@@ -273,6 +278,7 @@ module GraphQL
         while i < representatives.size
           j = i + 1
           while j < representatives.size
+            @context.consume_work(1)
             find_conflict(response_key, representatives[i], representatives[j])
             j += 1
           end
@@ -471,6 +477,7 @@ module GraphQL
 
           fields_arr.each do |field|
             fields2_arr.each do |field2|
+              @context.consume_work(1)
               find_conflict(
                 key,
                 field,

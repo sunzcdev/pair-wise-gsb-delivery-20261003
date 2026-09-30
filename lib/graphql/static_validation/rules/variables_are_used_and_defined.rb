@@ -107,6 +107,8 @@ module GraphQL
 
           next if !def_node
           visited_fragments << spread_name
+          # Following one spread is one unit of checking work.
+          context.consume_work(1)
           variables.each do |name, child_usage|
             parent_usage = parent_variables[name]
             if child_usage.used?

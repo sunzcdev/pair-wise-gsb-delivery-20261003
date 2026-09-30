@@ -18,7 +18,10 @@ module GraphQL
 
       def_delegators :@query, :document, :fragments, :operations
 
-      def initialize(query, visitor_class, max_errors)
+      # @param session [GraphQL::StaticValidation::ValidationSession, nil] When this context
+      #   belongs to a {ValidationSession}, the session which charges work units and
+      #   enforces cancellation. `nil` for ordinary, non-pausable validation.
+      def initialize(query, visitor_class, max_errors, session: nil)
         @query = query
         @types = query.types # TODO update migrated callers to use this accessor
         @schema = query.schema
@@ -26,8 +29,12 @@ module GraphQL
         @errors = []
         @max_errors = max_errors || Float::INFINITY
         @on_dependency_resolve_handlers = []
+        @session = session
         @visitor = visitor_class.new(document, self)
       end
+
+      # @return [GraphQL::StaticValidation::ValidationSession, nil]
+      attr_reader :session
 
       # TODO stop using def_delegators because of Array allocations
       def_delegators :@visitor,
@@ -40,6 +47,29 @@ module GraphQL
 
       def validate_literal(ast_value, type)
         @literal_validator.validate(ast_value, type)
+      end
+
+      # Charge `work_units` units of validation work to the running
+      # {ValidationSession}, suspending the fiber driving the visit when the
+      # caller's budget for the current {ValidationSession#advance} call is spent
+      # (or when the session was cancelled).
+      #
+      # Every discrete piece of rule work (one AST node's hooks, one fragment
+      # dependency resolution step, one field-merge comparison, ...) calls this,
+      # so pausing is driven by the actual amount of checking done -- not by
+      # wall-clock time measured at the end of the document.
+      #
+      # No-op (aside from honoring cancellation) for ordinary, non-session validation.
+      # @return [void]
+      def consume_work(work_units = 1)
+        if @session
+          @session.consume_work(work_units)
+        end
+      end
+
+      # @return [Boolean] `true` when the owning {ValidationSession} was cancelled
+      def cancelled?
+        @session && @session.cancelled?
       end
 
       def too_many_errors?

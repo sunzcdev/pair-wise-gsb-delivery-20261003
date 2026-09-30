@@ -185,6 +185,32 @@ describe GraphQL::StaticValidation::Validator do
     end
   end
 
+  describe "pausable validation sessions" do
+    let(:query_string) { "{ cheese(id: 1) { id bogusField } }" }
+
+    it "returns an unfinished session which completes with the same errors as #validate" do
+      expected = errors
+      session = validator.validation_session(query)
+      assert session.unfinished?
+      result = nil
+      100.times do
+        result = session.advance(work_units: 1)
+        break if result.finished?
+      end
+      assert result.completed?
+      assert_equal expected, result.errors.map(&:to_h)
+    end
+
+    it "can be cancelled before completion" do
+      session = validator.validation_session(query)
+      session.advance(work_units: 0)
+      result = session.cancel
+      assert result.cancelled?
+      refute result.valid?
+      assert session.advance(work_units: 100).cancelled?
+    end
+  end
+
   describe "Custom ruleset" do
     let(:query_string) { "
         fragment Thing on Cheese {
