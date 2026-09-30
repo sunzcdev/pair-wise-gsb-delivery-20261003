@@ -203,6 +203,134 @@ describe Mustermann::Set do
       end
     end
 
+    # ── delete ──────────────────────────────────────────────────────────────
+
+    context 'delete' do
+      it 'deletes a pattern and all of its values' do
+        set.add('/foo', :a, :b)
+
+        expect(set.delete('/foo')).to eq [:a, :b]
+        expect(set.patterns).to be_empty
+        expect(set.match('/foo')).to be_nil
+        expect(set.match_all('/foo')).to eq []
+      end
+
+      it 'deletes only the association with the given value' do
+        set.add('/foo', :a, :b)
+
+        expect(set.delete('/foo', :a)).to eq :a
+        expect(set[Mustermann.new('/foo')]).to eq :b
+        expect(set.match('/foo').value).to eq :b
+        expect(set.match_all('/foo').map(&:value)).to eq [:b]
+      end
+
+      it 'deletes several associations at once' do
+        set.add('/foo', :a, :b, :c)
+
+        expect(set.delete('/foo', :a, :c, :missing)).to eq [:a, :c]
+        expect(set.match_all('/foo').map(&:value)).to eq [:b]
+      end
+
+      it 'deletes the implicit nil association explicitly' do
+        set.add('/foo')
+
+        expect(set.delete('/foo', nil)).to be_nil
+        expect(set.patterns).to be_empty
+        expect(set.match('/foo')).to be_nil
+      end
+
+      it 'returns nil when the pattern is missing' do
+        expect(set.delete('/missing')).to be_nil
+        expect(set.delete('/missing', :a)).to be_nil
+      end
+
+      it 'returns nil when the association is missing' do
+        set.add('/foo', :a)
+
+        expect(set.delete('/foo', :b)).to be_nil
+        expect(set.match_all('/foo').map(&:value)).to eq [:a]
+      end
+
+      it 'rejects non-AST patterns' do
+        pattern = Mustermann.new('/foo', type: :regular)
+        expect { set.delete(pattern) }.to raise_error(ArgumentError, /Non-AST/)
+      end
+
+      it 'still expands a value used by another pattern' do
+        set.add('/foo', :shared)
+        set.add('/bar', :shared)
+
+        set.delete('/foo', :shared)
+
+        expect(set.expand(:shared)).to eq '/bar'
+        expect(set.expander(:shared).patterns.map(&:to_s)).to eq ['/bar']
+      end
+
+      it 'keeps existing expander objects usable while changing their patterns' do
+        set.add('/foo', :shared)
+        set.add('/bar', :shared)
+        expander = set.expander(:shared)
+
+        set.delete('/foo', :shared)
+
+        expect(set.expander(:shared)).to equal expander
+        expect(expander.expand).to eq '/bar'
+      end
+
+      it 'keeps a pattern in the global expander when only one association is removed' do
+        set.add('/:foo', :a, :b)
+        set.expander
+
+        set.delete('/:foo', :a)
+
+        expect(set.expander.patterns.map(&:to_s)).to eq ['/:foo']
+        expect(set.expand(foo: 'x')).to eq '/x'
+      end
+
+      it 'does not expand a value after deleting its last association' do
+        set.add('/foo', :temporary)
+        set.expander(:temporary)
+
+        set.delete('/foo', :temporary)
+
+        expect { set.expand(:temporary) }.to raise_error(Mustermann::ExpandError)
+        expect(set.expander(:temporary).patterns).to be_empty
+      end
+
+      it 'does not expand a deleted pattern from the global expander' do
+        set.add('/foo')
+        set.add('/bar')
+        set.expander
+
+        set.delete('/foo')
+
+        expect(set.expander.patterns.map(&:to_s)).to eq ['/bar']
+        expect(set.expand).to eq '/bar'
+      end
+
+      it 'is equivalent to a set constructed from the remaining rules after repeated changes' do
+        set.add('/foo', :a)
+        set.add('/bar', :b)
+        set.add('/baz', :c)
+        set.delete('/foo', :a)
+        set.add('/foo', :a)
+        set.delete('/foo')
+        set.add('/foo', :d)
+        set.delete('/bar', :b)
+
+        equivalent = described_class.new(
+          { '/baz' => :c, '/foo' => :d },
+          use_trie: set.use_trie?,
+          use_cache: false
+        )
+
+        %w[/foo /bar /baz].each do |path|
+          expect(set.match_all(path).map(&:value)).to eq equivalent.match_all(path).map(&:value)
+        end
+        expect(set.patterns.map(&:to_s)).to eq ['/baz', '/foo']
+      end
+    end
+
     # ── patterns ─────────────────────────────────────────────────────────────
 
     context 'patterns' do
@@ -460,6 +588,15 @@ describe Mustermann::Set do
         expect { set.add(users & posts, :handler) }
           .to raise_error(ArgumentError, /Non-AST/)
       end
+
+      it 'deletes every component of a | composite' do
+        set.add(users | posts, :handler)
+
+        expect(set.delete(users | posts)).to eq [:handler, :handler]
+
+        expect(set.match('/users/42')).to be_nil
+        expect(set.match('/posts/42')).to be_nil
+      end
     end
 
     # ── initialization shortcuts ─────────────────────────────────────────────
@@ -580,6 +717,100 @@ describe Mustermann::Set do
       set = described_class.new(use_trie: false, use_cache: true)
       set.add('/:name', :handler)
       expect(set.peek_match('/foo/extra').value).to eq :handler
+    end
+
+    it 'invalidates cached matches when deleting an association' do
+      set = described_class.new(use_trie: false, use_cache: true)
+      set.add('/foo', :first, :second)
+      set.match_all('/foo')
+
+      set.delete('/foo', :first)
+
+      expect(set.match('/foo').value).to eq :second
+      expect(set.match_all('/foo').map(&:value)).to eq [:second]
+      expect(set.peek_match_all('/foo/bar').map(&:value)).to eq [:second]
+    end
+
+    it 'invalidates cached misses when deleting a pattern' do
+      set = described_class.new(use_trie: false, use_cache: true)
+      set.add('/bar')
+      set.match('/foo')
+      set.match_all('/foo')
+
+      set.add('/foo')
+      set.match('/foo')
+      set.delete('/foo')
+
+      expect(set.match('/foo')).to be_nil
+      expect(set.match_all('/foo')).to eq []
+    end
+  end
+
+  context 'deletion after switching to a trie' do
+    it 'removes patterns and associations with the trie active' do
+      set = described_class.new(use_trie: 2, use_cache: false)
+      set.add('/a', :a)
+      set.add('/b', :first, :second)
+      set.add('/c', :c)
+      expect(set.use_trie?).to be true
+
+      expect(set.delete('/b', :first)).to eq :first
+      expect(set.match('/b').value).to eq :second
+
+      expect(set.delete('/a')).to eq [:a]
+      expect(set.match('/a')).to be_nil
+      expect(set.match_all('/c').map(&:value)).to eq [:c]
+    end
+  end
+
+  context 'deletion with strict order' do
+    it 'orders remaining associations by their original insertion order' do
+      set = described_class.new(use_trie: false, use_cache: false, strict_order: true)
+      set.add('/:a', :first)
+      set.add('/b', :temporary)
+      set.add('/:c', :second)
+
+      set.delete('/b')
+
+      expect(set.match('/b').value).to eq :first
+      expect(set.match_all('/b').map(&:value)).to eq [:first, :second]
+    end
+
+    it 'does not let a re-added association keep its old strict position' do
+      set = described_class.new(use_trie: false, use_cache: false, strict_order: true)
+      set.add('/:a', :first)
+      set.add('/b', :temporary)
+      set.add('/:c', :second)
+
+      set.delete('/b')
+      set.add('/b', :last)
+
+      expect(set.match_all('/b').map(&:value)).to eq [:first, :second, :last]
+    end
+
+    it 'rebuilds strict order after deletion with a trie' do
+      set = described_class.new(use_trie: true, use_cache: false, strict_order: true)
+      set.add('/:a', :first)
+      set.add('/b', :temporary)
+      set.add('/:c', :second)
+
+      set.delete('/b')
+
+      expect(set.match('/b').value).to eq :first
+      expect(set.match_all('/b').map(&:value)).to eq [:first, :second]
+    end
+  end
+
+  context 'deletion on copied sets' do
+    it 'does not affect the original set' do
+      set = described_class.new(use_trie: false, use_cache: false)
+      set.add('/foo', :a, :b)
+      copy = set.dup
+
+      expect(copy.delete('/foo', :a)).to eq :a
+
+      expect(copy.match_all('/foo').map(&:value)).to eq [:b]
+      expect(set.match_all('/foo').map(&:value)).to eq [:a, :b]
     end
   end
 

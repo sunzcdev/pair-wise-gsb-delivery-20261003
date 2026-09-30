@@ -35,7 +35,7 @@ module Mustermann
   #     s.add('/posts/:id', :posts_show)
   #   end
   #
-  # @note Adding patterns via {#add}, {#update}, or {#[]=} is not thread-safe, but matching and expanding is.
+  # @note Adding or removing patterns via {#add}, {#update}, {#[]=}, or {#delete} is not thread-safe, but matching and expanding is.
   class Set
     # Pattern options forwarded to {Mustermann.new} when patterns are created from strings.
     # @return [Hash]
@@ -222,6 +222,57 @@ module Mustermann
     # @see #add
     alias []= add
 
+    # Removes a pattern or selected associations from the set.
+    #
+    # When no values are given, the pattern and all of its associated values
+    # are removed. When one or more values are given, only those associations
+    # are removed; the pattern is removed as well once its last association is
+    # gone.
+    #
+    # @example Remove a pattern and all values
+    #   set.delete('/users/:id')
+    #
+    # @example Remove one value from a pattern
+    #   set.delete('/users/:id', :admin)
+    #
+    # @param pattern [String, Pattern] the pattern to remove
+    # @param values [Array] associations to remove
+    # @return [Object, Array<Object>, nil] the removed association when one
+    #   value was requested, all removed values otherwise, or +nil+ when
+    #   nothing was removed
+    def delete(pattern, *values)
+      if pattern.is_a? Composite and pattern.operator == :|
+        removed = pattern.patterns.flat_map do |part|
+          result = delete(part, *values)
+          next [] if result.nil?
+          result.is_a?(Array) ? result : [result]
+        end
+        return values.empty? || removed.size > 1 ? removed : removed.first unless removed.empty?
+        nil
+      end
+
+      pattern = Mustermann.new(pattern, **options)
+      raise ArgumentError, "Non-AST patterns are not supported" unless pattern.respond_to? :to_ast
+      current = @mapping[pattern]
+      return nil unless current
+
+      if values.empty?
+        removed = current.dup.freeze
+        @mapping.delete(pattern)
+      else
+        removed = values.uniq.select { |value| current.include? value }
+        return nil if removed.empty?
+
+        current.filter! { |value| not removed.include? value }
+        @mapping.delete(pattern) if current.empty?
+      end
+
+      update_expanders(pattern, removed)
+      remove_reverse_associations(pattern, removed)
+      rebuild_matcher
+      values.empty? || removed.size > 1 ? removed : removed.first
+    end
+
     # Looks up a value by string or retrieves the first value for a known pattern object.
     #
     # When given a String, it is matched against the set and the associated value of the
@@ -265,7 +316,7 @@ module Mustermann
     #
     # @param string [String]
     # @return [Array<Set::Match>] all matches, or an empty array if none
-    def match_all(string) = @matcher&.match(string, all: true)
+    def match_all(string) = @matcher&.match(string, all: true) || EMPTY_ARRAY
 
     # Matches the beginning of the string against all patterns and returns every
     # prefix match, one per (pattern, value) pair. The unmatched remainder is
@@ -273,7 +324,7 @@ module Mustermann
     #
     # @param string [String]
     # @return [Array<Set::Match>] all prefix matches, or an empty array if none
-    def peek_match_all(string) = @matcher&.match(string, all: true, peek: true)
+    def peek_match_all(string) = @matcher&.match(string, all: true, peek: true) || EMPTY_ARRAY
 
     # Returns a new set that includes all patterns from the receiver plus those
     # from +mapping+. The receiver is not modified.
@@ -289,8 +340,7 @@ module Mustermann
         values.each { |value| (h[value] ||= []) << pattern }
       end
       @expanders = {}
-      @matcher   = nil
-      @mapping.each_key { |pattern| add_pattern(pattern) }
+      rebuild_matcher
     end
 
     # Adds all patterns from +mapping+ to the set in place and returns +self+.
@@ -331,7 +381,7 @@ module Mustermann
     def expander(value = self)
       @expanders[value] ||= begin
         patterns = value == self ? @mapping.keys : @reverse_mapping[value] || EMPTY_ARRAY
-        Mustermann::Expander.new(patterns, additional_values: @additional_values, **options)
+        Mustermann::Expander.new(*patterns, additional_values: @additional_values, **options)
       end
     end
 
@@ -439,9 +489,35 @@ module Mustermann
     def build_matcher
       factory = use_trie? ? Trie : Linear
       matcher = factory.new(self, @mapping.keys)
-      matcher = StrictOrder.new(matcher) if strict_order?
+      if strict_order?
+        matcher = StrictOrder.new(matcher)
+        @mapping.each do |pattern, values|
+          values.each { |value| matcher.track(pattern, value) }
+        end
+      end
       matcher = Cache.new(matcher) if use_cache?
       matcher
+    end
+
+    def rebuild_matcher
+      @matcher = @mapping.empty? ? nil : build_matcher
+    end
+
+    def remove_reverse_associations(pattern, values)
+      values.each do |value|
+        patterns = @reverse_mapping[value]
+        next unless patterns
+
+        patterns.delete(pattern)
+        @reverse_mapping.delete(value) if patterns.empty?
+      end
+    end
+
+    def update_expanders(pattern, values)
+      @expanders[self]&.delete(pattern) unless @mapping.key?(pattern)
+      values.each do |value|
+        @expanders[value]&.delete(pattern)
+      end
     end
   end
 end

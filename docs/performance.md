@@ -171,7 +171,7 @@ set = Mustermann::Set.new(use_cache: true)  # default
 set = Mustermann::Set.new(use_cache: false) # disable
 ```
 
-The cache is transparent: `set.match(string)` returns the same `Set::Match` object on repeated calls with the same string instance without re-running the trie or linear scan. Adding a new pattern clears the cache entirely.
+The cache is transparent: `set.match(string)` returns the same `Set::Match` object on repeated calls with the same string instance without re-running the trie or linear scan. Adding or removing a pattern clears the cache entirely.
 
 The cache is most valuable when the same path strings are looked up repeatedly in a long-running process (e.g. a Rack application handling many requests for the same resource). It has no benefit for one-shot scripts or benchmarks that generate unique strings for every call.
 
@@ -179,7 +179,7 @@ The cache is most valuable when the same path strings are looked up repeatedly i
 
 Matching and expansion on a set are **thread-safe** once the set has been built. The internal trie and cache are read-only after construction.
 
-**Adding patterns is not thread-safe.** The recommended practice is to populate the set (and the Router built on top of it) during application startup, before requests begin, and then treat it as read-only.
+**Adding and removing patterns is not thread-safe.** The recommended practice is to populate the set (and the Router built on top of it) during application startup, before requests begin, and then treat it as read-only.
 
 ## URL expansion
 

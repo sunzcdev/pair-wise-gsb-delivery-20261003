@@ -61,6 +61,35 @@ module Mustermann
 
     alias_method :<<, :add
 
+    # Remove patterns from expansion.
+    #
+    # @example
+    #   expander = Mustermann::Expander.new('/:a', '/:b')
+    #   expander.delete('/:a')
+    #
+    # @param patterns [Array<#to_str, Mustermann::Pattern, Mustermann::Expander>] patterns to remove
+    # @return [Mustermann::Expander] the expander
+    def delete(*patterns)
+      changed = false
+
+      patterns.each do |pattern|
+        if pattern.is_a? Expander
+          target_patterns = pattern.patterns
+          changed ||= target_patterns.any? { |target| @patterns.include? target }
+          delete(*target_patterns)
+          next
+        end
+
+        pattern = Mustermann.new(pattern, **@options)
+        raise NotImplementedError, "expanding not supported for #{pattern.class}" unless pattern.respond_to? :to_ast
+        deleted = @patterns.reject! { |stored| stored.eql? pattern }
+        changed ||= !deleted.nil?
+      end
+
+      reset_api_expander if changed
+      self
+    end
+
     # Register a block as simple hash transformation that runs before expanding the pattern.
     # @return [Mustermann::Expander] the expander
     #
@@ -226,6 +255,11 @@ module Mustermann
       caster.cast(values).delete_if { |k, v| v.nil? }
     end
 
-    private :with_rest, :slice, :append, :caster, :map_values, :split_values
+    def reset_api_expander
+      @api_expander = AST::Expander.new
+      @patterns.each { |pattern| @api_expander.add(pattern.to_ast) }
+    end
+
+    private :with_rest, :slice, :append, :caster, :map_values, :split_values, :reset_api_expander
   end
 end

@@ -420,6 +420,18 @@ set.add('/ping')
 set.match('/ping').value  # => nil
 ```
 
+Patterns and individual associations can be removed with `delete`:
+
+``` ruby
+set = Mustermann::Set.new
+set.add('/users/:id', :admin_handler, :user_handler)
+
+set.delete('/users/:id', :admin_handler) # removes one association
+set.delete('/users/:id')                 # removes the whole pattern
+```
+
+Deleting the last association for a value also removes it from matching, expansion, and any expander already retrieved from the set. `delete` returns the removed values, or `nil` if nothing matched the requested pattern and value.
+
 ### Peeking
 
 `peek_match` matches a prefix of the input rather than the full string. The unmatched remainder is available via `post_match`:

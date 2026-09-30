@@ -52,6 +52,38 @@ describe Mustermann::Expander do
     expander.expand(foo: 'bar').should be == '/bar'
   end
 
+  it 'removes patterns from expansion' do
+    expander = Mustermann::Expander.new('/foo', '/bar')
+    expander.delete('/foo')
+
+    expect(expander.patterns.map(&:to_s)).to eq ['/bar']
+    expect(expander.expand).to eq '/bar'
+  end
+
+  it 'raises when expanding an empty expander' do
+    expander = Mustermann::Expander.new('/foo')
+    expander.delete('/foo')
+
+    expect(expander.patterns).to be_empty
+    expect { expander.expand }.to raise_error(Mustermann::ExpandError)
+  end
+
+  it 'returns the expander when removing an unknown pattern' do
+    expander = Mustermann::Expander.new('/foo')
+
+    expect(expander.delete('/bar')).to equal expander
+    expect(expander.expand).to eq '/foo'
+  end
+
+  it 'removes patterns from another expander' do
+    inner = Mustermann::Expander.new('/foo', '/bar')
+    expander = Mustermann::Expander.new('/foo', '/bar', '/baz')
+
+    expect(expander.delete(inner)).to equal expander
+
+    expect(expander.patterns.map(&:to_s)).to eq ['/baz']
+  end
+
   describe :additional_values do
     context "illegal value" do
       example { expect { Mustermann::Expander.new(additional_values: :foo) }.to raise_error(ArgumentError) }
