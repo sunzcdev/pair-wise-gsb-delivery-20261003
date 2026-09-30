@@ -13,6 +13,16 @@ require 'warden/strategies/base'
 module Warden
   class NotAuthenticated < StandardError; end
 
+  # Raised by a session deserializer when the identity store backing a
+  # serialized session key is temporarily unavailable, so it is impossible
+  # to tell whether the identity still exists or not.
+  #
+  # This must not be confused with a "missing identity" (the deserializer
+  # returning nil): the latter means the account is gone and the session can
+  # be removed, while the former requires the session to be preserved so it
+  # can be restored on a later request.
+  class IdentityStoreTemporarilyUnavailable < StandardError; end
+
   module Test
     autoload :WardenHelpers,  'warden/test/warden_helpers'
     autoload :Helpers,        'warden/test/helpers'

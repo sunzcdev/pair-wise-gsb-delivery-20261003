@@ -492,7 +492,7 @@ RSpec.describe Warden::Proxy do
     end
 
     it "should cache unfound user" do
-      expect_any_instance_of(Warden::SessionSerializer).to receive(:fetch).once
+      expect_any_instance_of(Warden::SessionSerializer).to receive(:restore).once.and_call_original
       app = lambda do |env|
         expect(env['warden'].user).to be_nil
         expect(env['warden'].user).to be_nil
@@ -516,7 +516,8 @@ RSpec.describe Warden::Proxy do
       end
 
       it "should cache found user" do
-        expect_any_instance_of(Warden::SessionSerializer).to receive(:fetch).once.and_return "A Previous User"
+        restored = Warden::SessionSerializer::RestoreResult.new(:restored, "A Previous User")
+        expect_any_instance_of(Warden::SessionSerializer).to receive(:restore).once.and_return(restored)
         app = lambda do |env|
           expect(env['warden'].user).to eq("A Previous User")
           expect(env['warden'].user).to eq("A Previous User")

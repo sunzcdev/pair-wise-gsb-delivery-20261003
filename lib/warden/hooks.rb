@@ -120,6 +120,15 @@ module Warden
 
     # A callback that runs if no user could be fetched, meaning there is now no user logged in.
     #
+    # When a stored session could not be restored because the identity store
+    # was temporarily unavailable (the deserializer raised
+    # Warden::IdentityStoreTemporarilyUnavailable), the callback still runs
+    # but opts[:reason] is set to
+    # Warden::Proxy::IDENTITY_STORE_TEMPORARILY_UNAVAILABLE. In that case the
+    # session value is preserved and the request did not fall back to other
+    # strategies. When the identity is genuinely gone (or was never present)
+    # opts[:reason] is nil.
+    #
     # Parameters:
     # <options> Some options which specify when the callback should be executed
     #   scope  - Executes the callback only if it matches the scope(s) given

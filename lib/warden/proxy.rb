@@ -19,6 +19,12 @@ module Warden
     ENV_WARDEN_ERRORS = 'warden.errors'.freeze
     ENV_SESSION_OPTIONS = 'rack.session.options'.freeze
 
+    # Reason set on the thrown :warden options (and passed to failure hooks)
+    # when an existing session could not be restored because the identity
+    # store was temporarily unavailable.
+    # :api: public
+    IDENTITY_STORE_TEMPORARILY_UNAVAILABLE = :identity_store_temporarily_unavailable
+
     # :api: private
     def_delegators :winning_strategy, :headers, :status, :custom_response
 
@@ -29,6 +35,11 @@ module Warden
       @env, @users, @winning_strategies, @locked = env, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
+      # Caches the outcome of restoring the session for each scope so the
+      # identity store is only consulted once per request (unless an explicit
+      # re-restore is requested). Unlike @users it keeps the three distinct
+      # outcomes apart: restored, not found and temporarily unavailable.
+      @session_restore_results = {}
     end
 
     # Run the on_request callbacks
@@ -125,14 +136,32 @@ module Warden
     # The same as +authenticate+ except on failure it will throw a :warden symbol causing the request to be halted
     # and rendered through the +failure_app+
     #
+    # When an existing session could not be restored because the identity
+    # store is temporarily unavailable, no other authentication strategy is
+    # run. The thrown options carry a +:reason+ of
+    # IDENTITY_STORE_TEMPORARILY_UNAVAILABLE so the failure entry point can
+    # react differently (e.g. return a 503) instead of treating it as a
+    # regular missing login.
+    #
     # Example
     #   env['warden'].authenticate!(:password, :scope => :publisher) # throws if it cannot authenticate
     #
     # :api: public
     def authenticate!(*args)
       user, opts = _perform_authentication(*args)
-      throw(:warden, opts) unless user
-      user
+      if user
+        user
+      else
+        # Re-resolve the scope the same way _perform_authentication did: a
+        # positional-only call (e.g. authenticate!(:password)) carries no
+        # :scope key and falls back to the default scope.
+        scope = opts[:scope] || @config.default_scope
+        if identity_store_temporarily_unavailable?(scope)
+          opts[:scope] = scope
+          opts[:reason] = IDENTITY_STORE_TEMPORARILY_UNAVAILABLE
+        end
+        throw(:warden, opts)
+      end
     end
 
     # Check to see if there is an authenticated user for the given scope.
@@ -174,6 +203,13 @@ module Warden
       opts = (@config[:scope_defaults][scope] || {}).merge(opts)
       opts[:event] ||= :set_user
       @users[scope] = user
+      # A freshly persisted identity invalidates any previous restore outcome
+      # for this scope. A :fetch event does not write to the session, so the
+      # cached outcome (used by identity_store_temporarily_unavailable?) must
+      # be preserved.
+      if opts[:event] != :fetch && opts[:store] != false
+        @session_restore_results.delete(scope)
+      end
 
       if opts[:store] != false && opts[:event] != :fetch
         options = env[ENV_SESSION_OPTIONS]
@@ -221,13 +257,65 @@ module Warden
       if @users.has_key?(scope)
         @users[scope]
       else
-        unless user = session_serializer.fetch(scope)
+        result = restore_session(scope)
+
+        user = if result.restored?
+          set_user(result.user, opts.merge(:event => :fetch))
+        else
+          unless result.not_found?
+            # The identity store could not answer. The session value was kept
+            # by the serializer and no fallback strategy should be used;
+            # make the situation visible to after_failed_fetch hooks.
+            opts = opts.merge(:reason => IDENTITY_STORE_TEMPORARILY_UNAVAILABLE)
+          end
+
           run_callbacks = opts.fetch(:run_callbacks, true)
-          manager._run_callbacks(:after_failed_fetch, user, self, :scope => scope) if run_callbacks
+          manager._run_callbacks(:after_failed_fetch, nil, self, opts) if run_callbacks
+          nil
         end
 
-        @users[scope] = user ? set_user(user, opts.merge(:event => :fetch)) : nil
+        @users[scope] = user
       end
+    end
+
+    # Returns the outcome of the last session restore attempt for a scope as
+    # one of :restored, :not_found or :unavailable. The restore is performed
+    # lazily on the first call, matching +user+'s behaviour.
+    #
+    # Example:
+    #   env['warden'].session_restore_status(:admin) # => :unavailable
+    #
+    # :api: public
+    def session_restore_status(scope = @config.default_scope)
+      restore_session(scope).status
+    end
+
+    # Tells whether a stored session for the given scope could not be checked
+    # because the identity store was temporarily unavailable. The session is
+    # preserved in that case and the request should not fall back to other
+    # authentication strategies.
+    #
+    # :api: public
+    def identity_store_temporarily_unavailable?(scope = @config.default_scope)
+      session_restore_status(scope) == :unavailable
+    end
+
+    # Forces the session for +scope+ to be restored again, bypassing the
+    # per-request restore cache. Useful after an application decided the
+    # identity store is reachable again (or after a successful retry).
+    #
+    # Returns the restored user, or nil when the identity is missing or the
+    # store is still unavailable. Use +session_restore_status+ or
+    # +identity_store_temporarily_unavailable?+ to tell those apart.
+    #
+    # Example:
+    #   env['warden'].restore_user_from_session!(:admin)
+    #
+    # :api: public
+    def restore_user_from_session!(scope = @config.default_scope)
+      @session_restore_results.delete(scope)
+      @users.delete(scope)
+      user(scope)
     end
 
     # Provides a scoped session data for authenticated users.
@@ -271,6 +359,7 @@ module Warden
 
       scopes.each do |scope|
         user = @users.delete(scope)
+        @session_restore_results.delete(scope)
         manager._run_callbacks(:before_logout, user, self, :scope => scope)
 
         raw_session.delete("warden.user.#{scope}.session") unless raw_session.nil?
@@ -331,7 +420,12 @@ module Warden
 
       # Look for an existing user in the session for this scope.
       # If there was no user in the session, see if we can get one from the request.
+      # If the session could not be checked because the identity store is
+      # temporarily unavailable, do not silently fall back to another
+      # authentication strategy: the session is preserved and the failure
+      # entry point can recognize the situation.
       return user, opts if user = user(opts.merge(:scope => scope))
+      return user, opts if identity_store_temporarily_unavailable?(scope)
       _run_strategies_for(scope, args)
 
       if winning_strategy && winning_strategy.successful?
@@ -340,6 +434,13 @@ module Warden
       end
 
       [@users[scope], opts]
+    end
+
+    # Restores the session for a scope, caching the three possible outcomes
+    # so the identity store is consulted at most once per request and scope
+    # unless an explicit re-restore is requested.
+    def restore_session(scope)
+      @session_restore_results[scope] ||= session_serializer.restore(scope)
     end
 
     def _retrieve_scope_and_opts(args) #:nodoc:

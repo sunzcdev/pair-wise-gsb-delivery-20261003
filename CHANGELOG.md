@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## Unreleased
+* Distinguish a deleted identity from a temporarily unavailable identity store when restoring sessions. Deserializers can raise `Warden::IdentityStoreTemporarilyUnavailable`; the session value is then preserved, no other authentication strategy is tried, and the failure entry point receives a `:identity_store_temporarily_unavailable` reason. Added `SessionSerializer#restore` returning a three-outcome result (`:restored`, `:not_found`, `:unavailable`), `Warden::Proxy#session_restore_status`, `#identity_store_temporarily_unavailable?` and `#restore_user_from_session!` for explicit re-restoration.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)
