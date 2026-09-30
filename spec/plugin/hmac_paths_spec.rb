@@ -622,6 +622,335 @@ describe "hmac_paths plugin" do
     status(path).must_equal 404
   end
 
+  it "plugin requires :max_chain_length option be a positive integer if given" do
+    proc{app.plugin :hmac_paths, secret: '1'*32, max_chain_length: 0}.must_raise Roda::RodaError
+    proc{app.plugin :hmac_paths, secret: '1'*32, max_chain_length: -1}.must_raise Roda::RodaError
+    proc{app.plugin :hmac_paths, secret: '1'*32, max_chain_length: 1.5}.must_raise Roda::RodaError
+    proc{app.plugin :hmac_paths, secret: '1'*32, max_chain_length: '2'}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path derives narrower hmac paths, and r.hmac_path verifies the authorization chain" do
+    hmac_paths_app do |r|
+      r.get 'path' do
+        parent = hmac_path('/widget', until: Time.utc(2100))
+        child = hmac_derived_path(parent, '/widget/1', method: :get, until: Time.utc(2027))
+        grandchild = hmac_derived_path(child, '/widget/1/edit', method: :get, seconds: 3600)
+        [parent, child, grandchild].join("\n")
+      end
+
+      r.hmac_path do
+        r.get 'widget', Integer do |widget_id|
+          "widget #{widget_id}"
+        end
+
+        r.get 'widget', Integer, 'edit' do |widget_id|
+          "edit #{widget_id}"
+        end
+
+        r.get 'widget' do
+          'widgets'
+        end
+      end
+    end
+
+    parent, child, grandchild = body('/path').split("\n")
+
+    # Two levels of narrowing, each level of the chain routes normally
+    body(parent).must_equal 'widgets'
+    body(child).must_equal 'widget 1'
+    body(grandchild).must_equal 'edit 1'
+
+    # The derived paths are limited to GET requests
+    status(child, 'REQUEST_METHOD'=>'POST').must_equal 404
+    status(grandchild, 'REQUEST_METHOD'=>'POST').must_equal 404
+
+    # The derived paths are only valid for their own resources
+    status(child.sub('/widget/1', '/widget/2')).must_equal 404
+    status(grandchild.sub('/widget/1/edit', '/widget/2/edit')).must_equal 404
+  end
+
+  it "r.hmac_path does not yield if any link of the authorization chain is modified" do
+    hmac_paths_app do |r|
+      r.get 'path' do
+        parent = hmac_path('/widget', until: Time.utc(2100))
+        child = hmac_derived_path(parent, '/widget/1', method: :get, until: Time.utc(2027))
+        hmac_derived_path(child, '/widget/1/edit', method: :get, seconds: 3600)
+      end
+
+      r.hmac_path do
+        r.get 'widget', Integer, 'edit' do |widget_id|
+          "edit #{widget_id}"
+        end
+      end
+    end
+
+    path = body('/path')
+    body(path).must_equal 'edit 1'
+
+    # Modifying the hmac of the parent link
+    status(path.sub(/\A\/\h{64}/, "/#{'0'*64}")).must_equal 404
+    # Modifying the hmac of an intermediate link
+    status(path.sub(/\/\h{64}\/mtc\//, "/#{'0'*64}/mtc/")).must_equal 404
+    # Modifying the hmac of the final link
+    status(path.sub(/\/\h{64}\/mt\//, "/#{'0'*64}/mt/")).must_equal 404
+    # Modifying the path prefix authorized by the parent link
+    status(path.sub('/tc/4102444800/1/', '/tc/4102444800/2/')).must_equal 404
+    # Modifying the flags of a link
+    status(path.sub('/tc/', '/mc/')).must_equal 404
+    # Relaxing the expiration time of an intermediate link
+    status(path.sub('/mtc/1798761600/', '/mtc/4102444801/')).must_equal 404
+    # Crossing the path boundary of the final link
+    status(path.sub('/widget/1/edit', '/widget2')).must_equal 404
+    status(path.sub('/widget/1/edit', '/other/1/edit')).must_equal 404
+    # Removing a link from the chain
+    status(path.sub(%r{/\h{64}/mtc/1798761600/2}, '')).must_equal 404
+    # Truncating the chain
+    status(path.sub('/widget/1/edit', '')).must_equal 404
+  end
+
+  it "hmac_derived_path requires the derived path be a sub-path of the parent path" do
+    hmac_paths_app do |r|
+      r.on 'derive' do
+        hmac_derived_path(hmac_path('/widget', until: Time.utc(2100)), r.remaining_path)
+      end
+    end
+    body('/derive/widget/1')
+    body('/derive/widget')
+    proc{body('/derive/widget2')}.must_raise Roda::RodaError
+    proc{body('/derive/other')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path compares path segments after URL decoding" do
+    hmac_paths_app do |r|
+      r.on 'derive' do
+        hmac_derived_path(hmac_path('/widget/%31'), r.remaining_path)
+      end
+
+      r.on 'boundary' do
+        hmac_derived_path(hmac_path('/widget'), r.remaining_path)
+      end
+    end
+    # %31 decodes to 1, so /widget/1/edit is a sub-path of /widget/%31
+    body('/derive/widget/1/edit')
+    proc{body('/derive/widget/2')}.must_raise Roda::RodaError
+    # %32 decodes to 2, so /widget%32 is not a sub-path of /widget
+    proc{body('/boundary/widget%32')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path does not allow a later expiration time than the parent" do
+    hmac_paths_app do |r|
+      r.get 'until', Integer do |i|
+        hmac_derived_path(hmac_path('/widget', until: Time.utc(2027)), '/widget/1', until: Time.utc(2027) + i)
+      end
+
+      r.get 'seconds', Integer do |i|
+        hmac_derived_path(hmac_path('/widget', until: Time.utc(2027)), '/widget/1', seconds: i)
+      end
+
+      r.get 'inherit' do
+        hmac_derived_path(hmac_path('/widget', until: Time.utc(2100)), '/widget/1')
+      end
+
+      r.get 'expired' do
+        hmac_derived_path(hmac_path('/widget', until: Time.now - 10), '/widget/1')
+      end
+    end
+    body('/until/0')
+    proc{body('/until/1')}.must_raise Roda::RodaError
+    body('/seconds/60')
+    proc{body('/seconds/4102444800')}.must_raise Roda::RodaError
+    # Inherits the parent's expiration time if none is given
+    body('/inherit').must_include '/t/4102444800/widget/1'
+    # Cannot derive from an expired parent
+    proc{body('/expired')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path requires :method matching the parent when the parent is method-specific" do
+    hmac_paths_app do |r|
+      r.get 'path', String do |meth|
+        hmac_derived_path(hmac_path('/widget', method: :get), '/widget/1', method: meth)
+      end
+
+      r.get 'nomethod' do
+        hmac_derived_path(hmac_path('/widget', method: :get), '/widget/1')
+      end
+    end
+    body('/path/get')
+    proc{body('/path/post')}.must_raise Roda::RodaError
+    proc{body('/nomethod')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path keeps the parent query string when the parent is params-specific" do
+    hmac_paths_app do |r|
+      r.get 'path', String do |v|
+        hmac_derived_path(hmac_path('/widget', params: {foo: 'bar'}), '/widget/1', params: {foo: v})
+      end
+
+      r.get 'inherit' do
+        hmac_derived_path(hmac_path('/widget', params: {foo: 'bar'}), '/widget/1')
+      end
+
+      r.hmac_path do
+        r.get 'widget', Integer do |widget_id|
+          "widget #{widget_id}"
+        end
+      end
+    end
+    body('/path/bar')
+    proc{body('/path/baz')}.must_raise Roda::RodaError
+
+    path, qs = body('/inherit').split('?', 2)
+    body(path, 'QUERY_STRING'=>qs).must_equal 'widget 1'
+    status(path).must_equal 404
+    status(path, 'QUERY_STRING'=>'foo=baz').must_equal 404
+  end
+
+  it "hmac_derived_path keeps the namespace of the parent" do
+    hmac_paths_app do |r|
+      r.get 'path', String do |ns|
+        hmac_derived_path(hmac_path('/widget', namespace: ns), '/widget/1', namespace: ns)
+      end
+
+      r.get 'derive', String, String do |ns1, ns2|
+        hmac_derived_path(hmac_path('/widget', namespace: ns1), '/widget/1', namespace: ns2)
+      end
+
+      r.hmac_path(namespace: r.GET['ns']) do
+        r.get 'widget', Integer do |widget_id|
+          "widget #{widget_id}"
+        end
+      end
+    end
+    path1 = body('/path/1')
+    path2 = body('/path/2')
+    body(path1, 'QUERY_STRING'=>'ns=1').must_equal 'widget 1'
+    body(path2, 'QUERY_STRING'=>'ns=2').must_equal 'widget 1'
+    status(path1, 'QUERY_STRING'=>'ns=2').must_equal 404
+    status(path2, 'QUERY_STRING'=>'ns=1').must_equal 404
+    status(path1).must_equal 404
+    proc{body('/derive/1/2')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path works with the :root option" do
+    hmac_paths_app do |r|
+      r.get 'path' do
+        hmac_derived_path(hmac_path('/widget', root: '/prefix'), '/widget/1', root: '/prefix')
+      end
+
+      r.get 'derive', String do |root|
+        hmac_derived_path(hmac_path('/widget', root: '/prefix'), '/widget/1', root: root)
+      end
+
+      r.on 'prefix' do
+        r.hmac_path do
+          r.get 'widget', Integer do |widget_id|
+            "widget #{widget_id}"
+          end
+        end
+      end
+    end
+    path = body('/path')
+    path.must_match(/\A\/prefix\//)
+    body(path).must_equal 'widget 1'
+    proc{body('/derive/wrong')}.must_raise Roda::RodaError
+    proc{body('/derive/prefix2')}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path raises for invalid parent paths" do
+    hmac_paths_app do |r|
+      r.on 'derive' do
+        hmac_derived_path(r.remaining_path, '/widget/1')
+      end
+    end
+    proc{body('/derive/foo')}.must_raise Roda::RodaError
+    proc{body('/derive/widget')}.must_raise Roda::RodaError
+    proc{body("/derive/#{'0'*64}/0/widget")}.must_raise Roda::RodaError
+    proc{body("/derive/#{'0'*64}/c/1/widget")}.must_raise Roda::RodaError
+  end
+
+  it "hmac_derived_path and r.hmac_path enforce the :max_chain_length option" do
+    app(:bare) do
+      plugin :hmac_paths, secret: '1'*32, max_chain_length: 2
+
+      route do |r|
+        r.get 'path' do
+          child = hmac_derived_path(hmac_path('/widget'), '/widget/1')
+          hmac_derived_path(child, '/widget/1/edit')
+        end
+
+        r.get 'child' do
+          hmac_derived_path(hmac_path('/widget'), '/widget/1')
+        end
+
+        r.hmac_path do
+          r.get 'widget', Integer do |widget_id|
+            "widget #{widget_id}"
+          end
+        end
+      end
+    end
+    # Deriving a third link exceeds the maximum chain length of 2
+    proc{body('/path')}.must_raise Roda::RodaError
+    path = body('/child')
+    body(path).must_equal 'widget 1'
+  end
+
+  it "r.hmac_path does not yield for authorization chains longer than :max_chain_length" do
+    hmac_paths_app do |r|
+      r.get 'path' do
+        child = hmac_derived_path(hmac_path('/widget'), '/widget/1')
+        hmac_derived_path(child, '/widget/1/edit')
+      end
+
+      r.hmac_path do
+        r.get 'widget', Integer, 'edit' do |widget_id|
+          "edit #{widget_id}"
+        end
+      end
+    end
+    path = body('/path')
+    body(path).must_equal 'edit 1'
+    app.plugin :hmac_paths, secret: '1'*32, max_chain_length: 2
+    status(path).must_equal 404
+  end
+
+  it "r.hmac_path handles secret rotation for authorization chains using :old_secret option" do
+    hmac_paths_app do |r|
+      r.get 'path' do
+        hmac_derived_path(hmac_path('/widget'), '/widget/1')
+      end
+
+      r.hmac_path do
+        r.get 'widget', Integer do |widget_id|
+          "widget #{widget_id}"
+        end
+      end
+    end
+    path = body('/path')
+    body(path).must_equal 'widget 1'
+    app.plugin :hmac_paths, secret: '2'*32
+    status(path).must_equal 404
+    app.plugin :hmac_paths, secret: '2'*32, old_secret: '1'*32
+    body(path).must_equal 'widget 1'
+    app.plugin :hmac_paths, secret: '2'*32, old_secret: '3'*32
+    status(path).must_equal 404
+  end
+
+  it "derived hmac path example code in documation is accurate" do
+    app(:bare) do
+      plugin :hmac_paths, secret: 'some-secret-value-with-at-least-32-bytes'
+
+      route do |r|
+        r.get 'derive' do
+          parent = hmac_path('/widget/1', until: Time.utc(2100))
+          hmac_derived_path(parent, '/widget/1/edit', method: :get)
+        end
+      end
+    end
+
+    body('/derive').must_equal "/bcaf33f9a47bdca01bd16ec2c9525580c07ec2521c5878ece445a6a5067ccbd1/tc/4102444800/2/59872923d3b218611bc1056e149859087e54844662c95cba7e6f51e74c4a3a65/mt/4102444800/widget/1/edit"
+  end
+
   it "example code in documation is accurate" do
     app(:bare) do
       plugin :hmac_paths, secret: 'some-secret-value-with-at-least-32-bytes'

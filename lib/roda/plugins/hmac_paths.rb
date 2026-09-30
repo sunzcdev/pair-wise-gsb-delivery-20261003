@@ -205,12 +205,76 @@ class Roda
     #  r.hmac_path('/1', until: Time.utc(2100))
     #  HMAC_hex(HMAC_hex(secret, ''), '/t/4102444800/1')
     #
-    # If a +:namespace+ option is provided, the original secret used before the +:root+ option is
-    # an HMAC of the +:secret+ plugin option and the given namespace.
-    # 
-    #  r.hmac_path('/1', namespace: '2')
-    #  HMAC_hex(HMAC_hex(HMAC(secret, '2'), ''), '/n/1')
-    module HmacPaths
+# If a +:namespace+ option is provided, the original secret used before the +:root+ option is
+# an HMAC of the +:secret+ plugin option and the given namespace.
+# 
+#  r.hmac_path('/1', namespace: '2')
+#  HMAC_hex(HMAC_hex(HMAC(secret, '2'), ''), '/n/1')
+#
+# = Derived HMAC Paths (Authorization Chains)
+#
+# In addition to creating HMAC paths directly, the server can derive a new,
+# more restricted HMAC path from an existing one using +hmac_derived_path+.
+# This forms an authorization chain, where each derived path is signed by the
+# server and linked to the authorization of its parent:
+#
+#   parent = hmac_path('/widget', until: Time.utc(2100))
+#   child = hmac_derived_path(parent, '/widget/1', method: :get, until: Time.utc(2027))
+#   grandchild = hmac_derived_path(child, '/widget/1/edit', method: :get, seconds: 3600)
+#
+# A derived path can only narrow the authorization of its parent, never widen
+# it:
+#
+# * The path must be a sub-path of the parent's path.  Paths are compared per
+#   path segment, so <tt>/widget/1</tt> is allowed under <tt>/widget</tt>, but
+#   <tt>/widget2</tt> is not.  URL-encoded segments are decoded before
+#   comparison.
+# * If the parent path is limited to a request method, the derived path is
+#   limited to the same request method (the :method option must be provided
+#   and match the parent's method).
+# * If the parent path is limited to a query string, the derived path is
+#   limited to the same query string.
+# * If the parent path has an expiration time, the derived path cannot expire
+#   later (it inherits the parent's expiration time unless an earlier one is
+#   given).
+# * The derived path always uses the same namespace as the parent.
+#
+# +hmac_derived_path+ verifies the integrity of the parent path before
+# deriving, and raises a Roda::RodaError if the parent path is invalid or the
+# derived path would widen any authorization of the parent.
+#
+# Each derivation adds a link to the authorization chain.  The maximum chain
+# length is 4 by default, and can be changed with the :max_chain_length
+# plugin option:
+#
+#   plugin :hmac_paths, secret: 'some-secret-value-with-at-least-32-bytes',
+#                       max_chain_length: 8
+#
+# When matching a derived path, +r.hmac_path+ verifies the integrity of the
+# entire chain, and checks that each link in the chain does not widen the
+# authorization of the previous link.  Only if the entire chain is valid will
+# it yield to the block, with the remaining path being the resource path of
+# the final link in the chain.
+#
+# = HMAC Chain Construction
+#
+# A derived hmac path contains one or more intermediate chain links, followed
+# by a final link in the standard format described above.  Each intermediate
+# link authenticates its flags, its timestamp (if any), and a prefix of the
+# final resource path (given as a number of leading path segments, using the
+# +c+ flag).  The HMAC for each link is calculated using a secret derived
+# from the previous link's HMAC, so only the server (which knows the plugin
+# secret) can derive paths:
+#
+#  parent = hmac_path('/widget/1', until: Time.utc(2100))
+#  H1 = HMAC_hex(HMAC_hex(secret, ''), '/t/4102444800/widget/1')
+#
+#  child = hmac_derived_path(parent, '/widget/1/edit', method: :get)
+#  H1' = HMAC_hex(HMAC_hex(secret, ''), '/tc/4102444800/2/widget/1')
+#  H2 = HMAC_hex(HMAC_hex(HMAC_hex(secret, ''), H1'), 'GET:/mt/4102444800/widget/1/edit')
+#
+#  child # => "/#{H1'}/tc/4102444800/2/#{H2}/mt/4102444800/widget/1/edit"
+module HmacPaths
       def self.configure(app, opts=OPTS)
         hmac_secret = opts[:secret]
         unless hmac_secret.is_a?(String) && hmac_secret.bytesize >= 32
@@ -229,12 +293,20 @@ class Roda
         if opts[:namespace_session_key]
           app.opts[:hmac_paths_namespace_session_key] = opts[:namespace_session_key]
         end
+
+        max_chain_length = opts[:max_chain_length] || 4
+        unless max_chain_length.is_a?(Integer) && max_chain_length >= 1
+          raise RodaError, "hmac_paths plugin :max_chain_length option must be a positive integer if present"
+        end
+
+        app.opts[:hmac_paths_max_chain_length] = max_chain_length
       end
 
       module ClassMethods
         RodaPlugins.opt_attr_reader(self, :hmac_paths_secret)
         RodaPlugins.opt_attr_reader(self, :hmac_paths_old_secret)
         RodaPlugins.opt_attr_reader(self, :hmac_paths_namespace_session_key)
+        RodaPlugins.opt_attr_reader(self, :hmac_paths_max_chain_length)
       end
 
       module InstanceMethods
@@ -315,7 +387,313 @@ class Roda
           opts.fetch(:namespace){hmac_path_default_namespace}
         end
 
+        # Derive a new, more restricted hmac path from an existing hmac path,
+        # forming an authorization chain.  +parent+ should be a path string
+        # previously returned by +hmac_path+ or +hmac_derived_path+, and
+        # +path+ should be a sub-path of the parent's path.  Raises a
+        # Roda::RodaError if the parent path is not valid, or if the derived
+        # path would widen any authorization of the parent path.  Options:
+        #
+        # :method :: Limits the returned path to only be valid for the given
+        #            request method.  Required if the parent path is limited
+        #            to a request method, and must be the same method.
+        # :namespace :: Must match the namespace used when creating the parent
+        #               path, if any.
+        # :params :: Includes parameters in the query string of the returned
+        #            path.  If the parent path is limited to a query string,
+        #            this must result in the same query string (it defaults to
+        #            the parent's query string).
+        # :root :: The root used when creating the parent path.  Defaults to
+        #          the empty string.
+        # :seconds :: Make the given path valid for the given integer number
+        #             of seconds.  Cannot exceed the parent's expiration time.
+        # :until :: Make the given path valid until the given Time.  Cannot be
+        #           later than the parent's expiration time.
+        def hmac_derived_path(parent, path, opts=OPTS)
+          unless path.is_a?(String) && path.getbyte(0) == 47
+            raise RodaError, "path must be a string starting with /"
+          end
+
+          unless parent.is_a?(String) && parent.getbyte(0) == 47
+            raise RodaError, "parent must be a string starting with /"
+          end
+
+          root = opts[:root] || ''
+          unless root.is_a?(String) && ((root_byte = root.getbyte(0)) == 47 || root_byte == nil)
+            raise RodaError, "root must be empty string or string starting with /"
+          end
+
+          unless parent.start_with?("#{root}/")
+            raise RodaError, "parent path does not use the given root"
+          end
+
+          parent, parent_query = parent[root.length..-1].split('?', 2)
+
+          links, parent_resource = hmac_path_parse_chain(parent)
+
+          if links.length >= self.class.hmac_paths_max_chain_length
+            raise RodaError, "cannot derive hmac path: parent authorization chain already has maximum length"
+          end
+
+          parent_method = nil
+          if links.any?{|link| link[1].include?('m')}
+            unless parent_method = opts[:method]
+              raise RodaError, ":method option is required when deriving from a method-specific hmac path"
+            end
+            parent_method = parent_method.to_s.upcase
+          end
+
+          # Verify the integrity of the entire parent authorization chain
+          # before deriving from it.
+          secrets = hmac_path_chain_secrets(root, links, parent_resource, parent_method || 'GET', parent_query.to_s, opts)
+          unless secrets
+            raise RodaError, "parent is not a valid hmac path"
+          end
+
+          parent_until = links.map{|link| link[2]}.compact.min
+          parent_params = links.any?{|link| link[1].include?('p')}
+
+          # The child authorizations must not widen any parent authorization.
+          if parent_params
+            child_query = parent_query.to_s
+            if opts[:params] && Rack::Utils.build_query(opts[:params]) != child_query
+              raise RodaError, "derived hmac path cannot use different params than the parent"
+            end
+          elsif opts[:params]
+            child_query = Rack::Utils.build_query(opts[:params])
+          end
+
+          if parent_until
+            if opts[:until]
+              child_until = opts[:until].to_i
+            elsif opts[:seconds]
+              child_until = Time.now.to_i + opts[:seconds]
+            else
+              child_until = parent_until
+            end
+
+            if child_until > parent_until
+              raise RodaError, "derived hmac path cannot be valid longer than the parent"
+            end
+          elsif opts[:until]
+            child_until = opts[:until].to_i
+          elsif opts[:seconds]
+            child_until = Time.now.to_i + opts[:seconds]
+          end
+
+          unless hmac_path_subpath?(parent_resource, path)
+            raise RodaError, "derived hmac path must be a sub-path of the parent path"
+          end
+
+          child_method = parent_method || (opts[:method].to_s.upcase if opts[:method])
+
+          child_flags = String.new
+          child_path = path.dup
+
+          if child_method
+            child_flags << 'm'
+          end
+
+          if child_query
+            child_flags << 'p'
+            child_path << '?' << child_query
+          end
+
+          if child_until
+            child_flags << 't'
+            child_path = "/#{child_until}#{child_path}"
+          end
+
+          child_flags << '0' if child_flags.empty?
+
+          child_data = String.new
+          child_data << child_method << ':' if child_method
+          child_data << '/' << child_flags << child_path
+
+          # Convert the parent's final link into an intermediate chain link,
+          # authorizing a prefix of the child's resource path.
+          _, parent_flags, parent_ts, = links[-1]
+          parent_segments = hmac_path_segments(parent_resource)
+          parent_count = parent_segments.length
+          converted_flags = "#{parent_flags}c"
+          converted_data = hmac_path_chain_link_data(converted_flags, parent_ts, parent_count, parent_segments, nil, parent_method, parent_query.to_s)
+
+          parent_secret = secrets[-1]
+          converted_hmac = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, parent_secret, converted_data)
+          child_secret = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, parent_secret, converted_hmac)
+          child_hmac = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, child_secret, child_data)
+
+          segments = []
+          links[0..-2].each do |hmac, flags, ts, count|
+            segments << hmac << flags
+            segments << ts.to_s if ts
+            segments << count.to_s
+          end
+          segments << converted_hmac << converted_flags
+          segments << parent_ts.to_s if parent_ts
+          segments << parent_count.to_s
+          segments << child_hmac << child_flags
+
+          "#{root}/#{segments.join('/')}#{child_path}"
+        end
+
+        # Whether the given hmac path authorization chain is valid.  +links+
+        # is an array of +[hmac, flags, timestamp, count]+ entries, one per
+        # link in the chain, and +resource+ is the remaining path after the
+        # final link.  Checks the HMAC integrity of the entire chain, and
+        # that each link does not widen the authorization of the previous
+        # link.
+        def hmac_path_chain_valid?(root, links, resource, method, query, opts=OPTS)
+          !!hmac_path_chain_secrets(root, links, resource, method, query, opts)
+        end
+
         private
+
+        # Parse an hmac path chain (without the root) into an array of
+        # +[hmac, flags, timestamp, count]+ links and the remaining resource
+        # path.  Raises a Roda::RodaError if the path is not well formed.
+        def hmac_path_parse_chain(path)
+          segments = path.split('/')
+          segments.shift
+
+          links = []
+          index = 0
+          loop do
+            hmac = segments[index]
+            flags = segments[index + 1]
+            unless hmac && flags && hmac =~ /\A[0-9a-f]{64}\z/
+              raise RodaError, "parent is not a valid hmac path"
+            end
+            index += 2
+
+            ts = nil
+            if flags.include?('t')
+              ts = segments[index]
+              unless ts =~ /\A\d{1,100}\z/
+                raise RodaError, "parent is not a valid hmac path"
+              end
+              ts = ts.to_i
+              index += 1
+            end
+
+            if flags.include?('c')
+              count = segments[index]
+              unless count =~ /\A\d{1,3}\z/
+                raise RodaError, "parent is not a valid hmac path"
+              end
+              links << [hmac, flags, ts, count.to_i]
+              index += 1
+
+              if index >= segments.length
+                raise RodaError, "parent is not a valid hmac path"
+              end
+            else
+              links << [hmac, flags, ts, nil]
+              break
+            end
+          end
+
+          resource = index < segments.length ? "/#{segments[index..-1].join('/')}" : ''
+
+          [links, resource]
+        end
+
+        # If the given hmac path authorization chain is valid, return an array
+        # of the secrets used for each link in the chain.  Otherwise, return
+        # nil.  See hmac_path_chain_valid? for the arguments.
+        def hmac_path_chain_secrets(root, links, resource, method, query, opts=OPTS)
+          segments = hmac_path_segments(resource)
+
+          secrets = []
+          secret = nil
+          prev_flags = prev_ts = prev_count = nil
+
+          links.each_with_index do |(hmac, flags, ts, count), i|
+            # Do not allow expired links in the chain
+            return if ts && ts < Time.now.to_i
+
+            if count
+              # Each link cannot authorize a shorter path prefix than the
+              # previous link, and cannot authorize more path segments than
+              # the resource path contains.
+              return if prev_count && count < prev_count
+              return if count > segments.length
+            end
+
+            if prev_flags
+              # A link cannot widen the method, params, or expiration time
+              # authorizations of the previous link.
+              return if prev_flags.include?('m') && !flags.include?('m')
+              return if prev_flags.include?('p') && !flags.include?('p')
+              return if prev_ts && (ts.nil? || ts > prev_ts)
+            end
+
+            data = hmac_path_chain_link_data(flags, ts, count, segments, resource, method, query)
+
+            if i == 0
+              secret = hmac_path_hmac_secret(root, opts)
+              unless Rack::Utils.secure_compare(OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, data), hmac)
+                if (old_secret = self.class.hmac_paths_old_secret)
+                  opts = opts.dup
+                  opts[:secret] = old_secret
+                  secret = hmac_path_hmac_secret(root, opts)
+                  return unless Rack::Utils.secure_compare(OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, data), hmac)
+                else
+                  return
+                end
+              end
+            else
+              return unless Rack::Utils.secure_compare(OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, data), hmac)
+            end
+
+            secrets << secret
+            secret = OpenSSL::HMAC.hexdigest(OpenSSL::Digest::SHA256.new, secret, hmac)
+            prev_flags, prev_ts, prev_count = flags, ts, count
+          end
+
+          secrets
+        end
+
+        # The data authenticated by a single link in an hmac path
+        # authorization chain.  Intermediate links (with a count) authenticate
+        # a prefix of the resource path, while the final link authenticates
+        # the entire resource path.
+        def hmac_path_chain_link_data(flags, ts, count, segments, resource, method, query)
+          data = String.new
+          data << method << ':' if flags.include?('m')
+          data << '/' << flags
+          data << '/' << ts.to_s if ts
+
+          if count
+            data << '/' << count.to_s
+            data << '/' << segments.first(count).join('/') if count > 0
+          else
+            data << resource
+          end
+
+          data << '?' << query if flags.include?('p')
+          data
+        end
+
+        # The normalized segments of the given path, ignoring empty segments.
+        def hmac_path_segments(path)
+          segments = path.split('/')
+          segments.shift
+          segments.reject(&:empty?)
+        end
+
+        # Whether +child+ is a sub-path of +parent+, comparing per path
+        # segment (so that boundaries between segments are respected), after
+        # decoding any URL-encoded characters in each segment.
+        def hmac_path_subpath?(parent, child)
+          parent_segments = hmac_path_segments(parent)
+          child_segments = hmac_path_segments(child)
+          return false if child_segments.length < parent_segments.length
+
+          parent_segments.each_with_index.all? do |segment, i|
+            Rack::Utils.unescape_path(segment) == Rack::Utils.unescape_path(child_segments[i])
+          end
+        end
 
         # The secret used to calculate the HMAC in hmac_path. This is itself an HMAC, created
         # using the secret given in the plugin, for the given root and options.
@@ -359,6 +737,20 @@ class Roda
                   return
                 end
 
+                if flags.include?('c')
+                  # Authorization chain link.  Verify the integrity of the
+                  # entire chain, and only match if every link is valid and
+                  # does not widen the authorization of the previous link.
+                  if (resource = hmac_path_chain_resource(opts, mpath, submitted_hmac, flags))
+                    @remaining_path = resource
+                    always(&block)
+                  end
+
+                  # Return from method without matching
+                  @remaining_path = orig_path
+                  return
+                end
+
                 if flags.include?('m')
                   rpath = "#{env['REQUEST_METHOD'].to_s.upcase}:#{rpath}"
                 end
@@ -396,6 +788,53 @@ class Roda
         end
 
         private
+
+        # Parse and verify an hmac path authorization chain, where the first
+        # link's hmac and flags segments have already been matched.  If the
+        # entire chain is valid, return the resource path of the final link.
+        # Otherwise, return nil.
+        def hmac_path_chain_resource(opts, mpath, submitted_hmac, flags)
+          path = remaining_path
+          links = []
+          hmac = submitted_hmac
+
+          loop do
+            ts = count = nil
+
+            if flags.include?('t')
+              return unless (match = /\A\/(\d{1,100})(?=\/|\z)/.match(path))
+              ts = match[1].to_i
+              path = path[match[0].length..-1]
+            end
+
+            if flags.include?('c')
+              return unless (match = /\A\/(\d{1,3})(?=\/|\z)/.match(path))
+              count = match[1].to_i
+              path = path[match[0].length..-1]
+
+              return unless (match = /\A\/([0-9a-f]{64})(?=\/|\z)/.match(path))
+              next_hmac = match[1]
+              path = path[match[0].length..-1]
+
+              return unless (match = /\A\/([^\/]+)(?=\/|\z)/.match(path))
+              next_flags = match[1]
+              path = path[match[0].length..-1]
+            end
+
+            links << [hmac, flags, ts, count]
+
+            break unless count
+
+            hmac = next_hmac
+            flags = next_flags
+          end
+
+          return if links.length > roda_class.hmac_paths_max_chain_length
+
+          if scope.hmac_path_chain_valid?(mpath, links, path, env['REQUEST_METHOD'].to_s.upcase, env['QUERY_STRING'].to_s, opts)
+            path
+          end
+        end
 
         # Determine whether the provided hmac matches.
         def hmac_path_valid?(root, path, hmac, opts=OPTS)
