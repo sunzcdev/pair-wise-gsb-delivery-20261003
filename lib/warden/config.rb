@@ -32,13 +32,14 @@ module Warden
       end
     end
 
-    hash_accessor :failure_app, :default_scope, :intercept_401
+    hash_accessor :failure_app, :default_scope, :intercept_401, :clock
 
     def initialize(other={})
       merge!(other)
       self[:default_scope]      ||= :default
       self[:scope_defaults]     ||= {}
       self[:default_strategies] ||= {}
+      self[:clock]              ||= proc { Time.now }
       self[:intercept_401] = true unless key?(:intercept_401)
     end
 

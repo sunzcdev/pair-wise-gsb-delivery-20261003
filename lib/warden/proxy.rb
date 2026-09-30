@@ -29,6 +29,7 @@ module Warden
       @env, @users, @winning_strategies, @locked = env, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
+      @authentication_evidence = {}
     end
 
     # Run the on_request callbacks
@@ -160,6 +161,84 @@ module Warden
       result
     end
 
+    # Provides the authentication evidence recorded for a scope, or nil if
+    # the current user was not authenticated through a strategy during this
+    # session. The evidence is a Hash with the :method used to authenticate
+    # and the :authenticated_at time it completed, as reported by the
+    # configured clock.
+    #
+    # The evidence is recorded once, when authentication completes. Fetching
+    # the user from the session or reading the user again during the same
+    # request never refreshes it.
+    #
+    # Example:
+    #   env['warden'].authentication_evidence(:admin)
+    #   # => { :method => "password", :authenticated_at => 2026-09-30 09:12:00 +0800 }
+    #
+    # :api: public
+    def authentication_evidence(scope = @config.default_scope)
+      raw = _raw_authentication_evidence(scope)
+      return nil unless raw
+
+      evidence = { :authenticated_at => Time.at(raw['authenticated_at'].to_f) }
+      evidence[:method] = raw['method'] if raw['method']
+      evidence
+    end
+
+    # Checks whether the user for the given scope holds authentication
+    # evidence matching the given requirements. This brings the user from
+    # the session, but does not run strategies before doing so.
+    #
+    # Parameters:
+    #   argument - the scope to check, or an options Hash
+    #
+    # Options:
+    #   :scope  - the scope to check. Defaults to default_scope
+    #   :via    - the authentication method (or list of methods) that must
+    #             have been used, e.g. :password
+    #   :within - the maximum age of the authentication, in seconds
+    #
+    # Example:
+    #   env['warden'].fresh_authentication?
+    #   env['warden'].fresh_authentication?(:scope => :admin, :via => :password, :within => 300)
+    #
+    # :api: public
+    def fresh_authentication?(argument = {})
+      opts  = argument.is_a?(Hash) ? argument : { :scope => argument }
+      scope = (opts[:scope] ||= @config.default_scope)
+
+      return false unless user(scope)
+
+      raw = _raw_authentication_evidence(scope)
+      return false unless raw
+
+      if via = opts[:via]
+        return false unless Array(via).map(&:to_s).include?(raw['method'].to_s)
+      end
+
+      within = opts[:within]
+      return true if within.nil?
+
+      (_clock_now - raw['authenticated_at'].to_f) <= within.to_f
+    end
+
+    # The same as +fresh_authentication?+ except on failure it throws a
+    # :warden symbol causing the request to be halted and rendered through
+    # the +failure_app+. The current login is kept untouched, so less
+    # sensitive endpoints remain usable with the same session.
+    #
+    # Example:
+    #   env['warden'].require_fresh_authentication!(:via => :password, :within => 300)
+    #
+    # :api: public
+    def require_fresh_authentication!(argument = {})
+      opts  = argument.is_a?(Hash) ? argument.dup : { :scope => argument }
+      scope = (opts[:scope] ||= @config.default_scope)
+      return user(scope) if fresh_authentication?(opts)
+
+      throw(:warden, opts.merge(:message => "Authentication requirements not met"))
+    end
+
     # Manually set the user into the session and auth proxy
     #
     # Parameters:
@@ -174,6 +253,8 @@ module Warden
       opts = (@config[:scope_defaults][scope] || {}).merge(opts)
       opts[:event] ||= :set_user
       @users[scope] = user
+
+      _record_authentication_evidence(scope, opts) if opts[:event] == :authentication
 
       if opts[:store] != false && opts[:event] != :fetch
         options = env[ENV_SESSION_OPTIONS]
@@ -273,7 +354,9 @@ module Warden
         user = @users.delete(scope)
         manager._run_callbacks(:before_logout, user, self, :scope => scope)
 
+        @authentication_evidence.delete(scope)
         raw_session.delete("warden.user.#{scope}.session") unless raw_session.nil?
+        raw_session.delete("warden.user.#{scope}.authentication") unless raw_session.nil?
         session_serializer.delete(scope, user)
       end
 
@@ -336,6 +419,7 @@ module Warden
 
       if winning_strategy && winning_strategy.successful?
         opts[:store] = opts.fetch(:store, winning_strategy.store?)
+        opts[:authentication_method] ||= _winning_strategy_name(scope)
         set_user(winning_strategy.user, opts.merge!(:event => :authentication))
       end
 
@@ -389,6 +473,46 @@ module Warden
     # Updates the winning strategy for a given scope
     def _update_winning_strategy(strategy, scope)
       self.winning_strategy = @winning_strategies[scope] = strategy
+    end
+
+    # Current time as reported by the configured clock, in seconds since
+    # the epoch. The clock can be replaced through the :clock config
+    # option, which keeps tests from depending on the real time.
+    def _clock_now
+      @config[:clock].call.to_f
+    end
+
+    # Records the authentication evidence for a scope, both in the request
+    # cache and, when the user is stored, in the session so it survives
+    # being fetched again on later requests.
+    def _record_authentication_evidence(scope, opts) #:nodoc:
+      evidence = { 'authenticated_at' => _clock_now }
+      if method = (opts[:authentication_method] || _winning_strategy_name(scope))
+        evidence['method'] = method.to_s
+      end
+
+      @authentication_evidence[scope] = evidence
+      raw_session["warden.user.#{scope}.authentication"] = evidence if opts[:store] != false && raw_session
+      evidence
+    end
+
+    # Reads the raw evidence for a scope, preferring the request cache and
+    # falling back to the session. Never refreshes the recorded time.
+    def _raw_authentication_evidence(scope) #:nodoc:
+      return @authentication_evidence[scope] if @authentication_evidence.key?(scope)
+
+      evidence = raw_session && raw_session["warden.user.#{scope}.authentication"]
+      @authentication_evidence[scope] = evidence if evidence
+      evidence
+    end
+
+    # Finds the label of the winning strategy for a scope.
+    def _winning_strategy_name(scope) #:nodoc:
+      strategy = @winning_strategies[scope]
+      return nil unless strategy
+
+      @strategies[scope].each { |name, s| return name if s.equal?(strategy) }
+      nil
     end
   end # Proxy
 

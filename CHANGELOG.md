@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## Unreleased
+* Record per-scope authentication evidence (method and completion time) when
+  authentication succeeds, persisted in the session and never refreshed by
+  session fetches or repeated user reads
+* Add `Warden::Proxy#authentication_evidence`, `#fresh_authentication?` and
+  `#require_fresh_authentication!` to require a specific authentication
+  method (`:via`) and/or a maximum authentication age (`:within`) for
+  sensitive endpoints, without disturbing the current login on failure
+* Add injectable `:clock` config option so authentication age checks do not
+  depend on the real time
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)
