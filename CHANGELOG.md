@@ -1,5 +1,9 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::Phaser`, a reusable barrier with a variable number of parties which can register, arrive, deregister and await the end of a generation.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
