@@ -13,7 +13,13 @@ module Dentaku
       end
 
       def value(context = {})
-        collection = Array(@args[0].value(context))
+        collection = @args[0].value(context)
+        if Dentaku::Streaming.stream?(collection)
+          raise Dentaku::StreamNotSupportedError.new(
+            nil, operation: 'PLUCK', location: location
+          )
+        end
+        collection = Array(collection)
 
         unless collection.all? { |elem| elem.is_a?(Hash) }
           raise ArgumentError.for(:incompatible_type, actual: collection),

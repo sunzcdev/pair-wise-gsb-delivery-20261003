@@ -402,6 +402,65 @@ The predicate itself is then evaluated exactly once per `evaluate!` call,
 at evaluation time.  In `add_functions`, pass volatility as a fifth tuple
 element: `[:user_level, :numeric, -> { ... }, nil, true]`.
 
+STREAMING (RANGE-READABLE) INPUTS
+---------------------------------
+
+Some inputs are long sampled sequences that cannot reasonably be loaded into
+memory up front. Dentaku supports a length-aware, range-readable input
+protocol for them. A streaming input is any Ruby object (typically including
+`Dentaku::Streaming::Source`) that implements:
+
+* `stream_length` → number of samples as a non-negative Integer
+* `read_range(start_index, count)` → an Array of at most `count` samples
+  starting at the zero-based `start_index`; returning fewer samples is only
+  legal when the end of the sequence is reached
+
+Dentaku only ever calls those two methods. It never calls `to_a`, `each`, or
+`[]` on a streaming source, so the full sequence is never materialized.
+
+```ruby
+class SampledSeries
+  include Dentaku::Streaming::Source
+  def stream_length; @store.count; end
+  def read_range(start, count); @store.read_window(start, count); end
+end
+
+calculator = Dentaku::Calculator.new(stream_batch_size: 512)
+calculator.evaluate!('SUM(series) / COUNT(series)', series: SampledSeries.new)
+```
+
+### Supported operations
+
+Streaming inputs are consumed on demand by:
+
+* index access: `series[i]` (negative indices count from the end)
+* aggregates: `COUNT` (reads length only), `SUM`, `AVG`, `MIN`, `MAX`, `MUL`
+* short-circuiting set predicates: `ANY(...)`, `ALL(...)`
+* short-circuiting control flow around them: `IF`, `AND`, `OR`
+
+Operations without a streaming implementation — arithmetic, comparisons,
+bitwise operators, `MAP`, `FILTER`, `PLUCK`, `REDUCE`, `INTERCEPT`, scalar
+math/string functions, and externally registered lambdas — raise
+`Dentaku::StreamNotSupportedError` naming the operation and its formula
+position instead of silently loading the sequence.
+
+### Repeated reads and the access log
+
+Each `evaluate!` gets an isolated streaming session. Overlapping and repeated
+reads within one calculation are served from a per-session cache, so a given
+interval is fetched from the data source at most once; two separate
+calculations do not share a cache. The physical intervals actually requested
+are available afterwards via `calculator.last_stream_session.reads`, each
+record exposing `start_index`, `count`, `returned`, and `range`.
+
+### Read failures
+
+If `stream_length` or `read_range` raises (or violates the protocol), Dentaku
+raises a `Dentaku::StreamReadError` (or `Dentaku::StreamProtocolError`)
+carrying the data source, the requested interval, the consuming operation,
+and the formula location (line, column, and a source snippet). Invalid
+indices raise `Dentaku::StreamIndexError` with the index and sequence length.
+
 FUNCTION ALIASES
 ----------------
 

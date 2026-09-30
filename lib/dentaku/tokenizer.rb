@@ -15,6 +15,7 @@ module Dentaku
       @aliases = options.fetch(:aliases, global_aliases)
       input    = strip_comments(string.to_s.dup)
       input    = replace_aliases(input)
+      @offset  = 0
 
       scanner_options = {
         case_sensitive: options.fetch(:case_sensitive, false),
@@ -43,11 +44,16 @@ module Dentaku
 
     def scan(string, scanner)
       if tokens = scanner.scan(string, last_token)
+        token_offset = @offset
+        cursor = token_offset
         tokens.each do |token|
           if token.empty?
             fail! :unexpected_zero_width_match,
                   token_category: token.category, at: string
           end
+
+          token.instance_variable_set(:@offset, cursor)
+          cursor += token.length
 
           @nesting += 1 if LPAREN == token
           @nesting -= 1 if RPAREN == token
@@ -57,6 +63,7 @@ module Dentaku
         end
 
         match_length = tokens.map(&:length).reduce(:+)
+        @offset += match_length
         [true, string[match_length..-1]]
       else
         [false, string]
@@ -64,7 +71,11 @@ module Dentaku
     end
 
     def strip_comments(input)
-      input.gsub(/\/\*[^*]*\*+(?:[^*\/][^*]*\*+)*\//, '')
+      # blank out comment bodies instead of deleting them so that token
+      # offsets keep matching positions in the original formula
+      input.gsub(/\/\*[^*]*\*+(?:[^*\/][^*]*\*+)*\//) do |comment|
+        comment.gsub(/[^\n]/, ' ')
+      end
     end
 
     def replace_aliases(string)

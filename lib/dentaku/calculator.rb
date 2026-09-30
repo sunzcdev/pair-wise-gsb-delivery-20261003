@@ -3,6 +3,7 @@ require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
 require 'dentaku/parser'
+require 'dentaku/streaming'
 require 'dentaku/string_casing'
 require 'dentaku/token'
 
@@ -10,11 +11,13 @@ module Dentaku
   class Calculator
     include StringCasing
     attr_reader :result, :memory, :tokenizer, :case_sensitive,
-                :nested_data_support, :ast_cache, :raw_date_literals
+                :nested_data_support, :ast_cache, :raw_date_literals,
+                :last_stream_session
 
     def initialize(case_sensitive: false, aliases: nil, nested_data_support: true,
                    raw_date_literals: true, ast_cache: {},
-                   cache_ast: nil, cache_dependency_order: nil)
+                   cache_ast: nil, cache_dependency_order: nil,
+                   stream_batch_size: nil)
       clear
       @tokenizer = Tokenizer.new
       @case_sensitive = case_sensitive
@@ -24,9 +27,14 @@ module Dentaku
       @ast_cache = ast_cache
       @cache_ast = cache_ast
       @cache_dependency_order = cache_dependency_order
+      @stream_batch_size = stream_batch_size
       @disable_ast_cache = false
       @function_registry = Dentaku::AST::FunctionRegistry.new
     end
+
+    # Samples fetched per underlying read_range call during this calculator's
+    # evaluations; nil falls back to Dentaku::Streaming::DEFAULT_BATCH_SIZE.
+    attr_accessor :stream_batch_size
 
     # explicitly configured aliases win; otherwise the module-level default is
     # resolved lazily so it can be set after this calculator was created
@@ -76,7 +84,12 @@ module Dentaku
       context = evaluation_context(data, :strict)
       return evaluate_array!(expression, context, &block) if expression.is_a? Array
 
-      store(context) do
+      stream_session = Dentaku::Streaming::Session.new(
+        batch_size: stream_batch_size || Dentaku::Streaming::DEFAULT_BATCH_SIZE
+      )
+
+      store(context.merge(Dentaku::Streaming::SESSION_KEY => stream_session)) do
+        @last_stream_session = stream_session
         node = ast(expression)
         unbound = node.dependencies(memory)
 
@@ -139,7 +152,8 @@ module Dentaku
           aliases: aliases,
           case_sensitive: case_sensitive,
           function_registry: @function_registry,
-          raw_date_literals: raw_date_literals
+          raw_date_literals: raw_date_literals,
+          source: expression.is_a?(::String) ? expression : nil
         }
 
         tokens = tokenizer.tokenize(expression, options)

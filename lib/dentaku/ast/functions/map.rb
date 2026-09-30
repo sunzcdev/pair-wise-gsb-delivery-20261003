@@ -4,7 +4,13 @@ module Dentaku
   module AST
     class Map < Enum
       def value(context = {})
-        collection      = Array(@args[0].value(context))
+        collection      = @args[0].value(context)
+        if Dentaku::Streaming.stream?(collection)
+          raise Dentaku::StreamNotSupportedError.new(
+            nil, operation: 'MAP', location: location
+          )
+        end
+        collection      = Array(collection)
         item_identifier = @args[1].identifier
         expression      = @args[2]
 

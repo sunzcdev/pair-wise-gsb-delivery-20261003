@@ -1,4 +1,5 @@
 require_relative './operation'
+require_relative '../streaming'
 
 module Dentaku
   module AST
@@ -27,6 +28,11 @@ module Dentaku
       private
 
       def cast(val)
+        if Dentaku::Streaming.stream?(val)
+          raise Dentaku::StreamNotSupportedError.new(
+            nil, operation: "comparison (#{operator})", location: location
+          )
+        end
         return val unless val.is_a?(::String)
 
         Dentaku::NumericParser.parse_string(val) || val

@@ -1,5 +1,18 @@
 # Change Log
 
+## [Unreleased]
+- add a length-aware, range-readable input protocol (`Dentaku::Streaming`)
+  for sampled sequences too long to hold in memory. A streaming source
+  implements `stream_length` and `read_range(start, count)`; Dentaku never
+  calls `to_a`/`each`/`[]` on it. Index access, `COUNT`, `SUM`, `AVG`,
+  `MIN`, `MAX`, `MUL`, and the short-circuiting `ANY`/`ALL` (plus `IF`/`AND`/
+  `OR` around them) consume samples on demand; other operations raise
+  `Dentaku::StreamNotSupportedError` rather than materializing implicitly.
+  Each evaluation gets a cache-backed session with a recorded access log
+  (`Calculator#last_stream_session`), and read failures carry the data
+  interval, operation, and formula position (`StreamReadError`,
+  `StreamProtocolError`, `StreamIndexError`).
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

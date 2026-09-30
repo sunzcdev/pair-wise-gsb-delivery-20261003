@@ -1,11 +1,12 @@
 module Dentaku
   class Token
-    attr_reader :category, :raw_value, :value
+    attr_reader :category, :raw_value, :value, :offset
 
-    def initialize(category, value, raw_value = nil)
+    def initialize(category, value, raw_value = nil, offset: nil)
       @category  = category
       @value     = value
       @raw_value = raw_value
+      @offset    = offset
     end
 
     def to_s

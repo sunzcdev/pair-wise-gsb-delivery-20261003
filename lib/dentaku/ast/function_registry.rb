@@ -79,6 +79,14 @@ module Dentaku
 
           def value(context = {})
             args = @args.map { |a| a.value(context) }
+            stream_idx = args.index { |arg| Dentaku::Streaming.stream?(arg) }
+            if stream_idx
+              raise Dentaku::StreamNotSupportedError.new(
+                nil,
+                operation: (self.class.name || 'function').to_s.upcase,
+                location: location
+              )
+            end
             self.class.implementation.call(*args)
           end
 

@@ -205,4 +205,92 @@ module Dentaku
   class ZeroDivisionError < ::ZeroDivisionError
     include Error
   end
+
+  # Base class for errors raised while consuming values through the
+  # length-aware, range-readable input protocol (see Dentaku::Streaming).
+  class StreamError < BaseError
+    attr_reader :source, :operation, :range, :location
+
+    def initialize(message = nil, source: nil, operation: nil,
+                   range: nil, location: nil)
+      @source    = source
+      @operation = operation
+      @range     = range
+      @location  = location
+      super(message || default_stream_message)
+    end
+
+    private
+
+    def source_name
+      source.respond_to?(:stream_name) ? source.stream_name : source.class.name
+    end
+
+    def location_suffix
+      return "" unless location
+
+      " (formula position #{location.line}:#{location.column}" \
+        "#{location.near_source ? ", near '#{location.near_source}'" : ""})"
+    end
+
+    def default_stream_message
+      "stream error"
+    end
+  end
+
+  # A range-read data source rejected a requested interval, or returned
+  # data that does not honor the read-range contract.
+  class StreamReadError < StreamError
+    attr_reader :cause
+
+    def initialize(message = nil, cause: nil, **kwargs)
+      @cause = cause
+      super(message, **kwargs)
+    end
+
+    private
+
+    def default_stream_message
+      interval = range ? "[#{range.begin}..#{range.end - 1}]" : "unknown range"
+      detail = cause ? ": #{cause.message}" : ""
+      "failed to read #{interval} from streaming input '#{source_name}' " \
+        "for operation #{operation}#{detail}#{location_suffix}"
+    end
+  end
+
+  # A length/range-read value reached an operation that has no streaming
+  # implementation. Dentaku never silently materializes such a value.
+  class StreamNotSupportedError < StreamError
+    SUPPORTED_OPERATIONS = %i[count sum avg min max mul any all].freeze
+
+    private
+
+    def default_stream_message
+      "#{operation} does not support streaming inputs; supported operations " \
+        "are: index access and #{SUPPORTED_OPERATIONS.map(&:upcase).join(', ')}#{location_suffix}"
+    end
+  end
+
+  # An index used for streamed access is missing or out of bounds.
+  class StreamIndexError < StreamError
+    attr_reader :index, :length
+
+    def initialize(message = nil, index: nil, length: nil, **kwargs)
+      @index  = index
+      @length = length
+      super(message, **kwargs)
+    end
+
+    private
+
+    def default_stream_message
+      "stream index #{index.inspect} out of range for '#{source_name}' " \
+        "(length #{length})#{location_suffix}"
+    end
+  end
+
+  # A data source claims to implement the streaming protocol but violates
+  # its contract (bad return values, changing length, etc.).
+  class StreamProtocolError < StreamError
+  end
 end

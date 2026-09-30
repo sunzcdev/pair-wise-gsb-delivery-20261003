@@ -1,5 +1,6 @@
 require_relative './operation'
 require_relative '../date_arithmetic'
+require_relative '../streaming'
 require 'bigdecimal'
 require 'bigdecimal/util'
 
@@ -77,6 +78,11 @@ module Dentaku
       end
 
       def cast(val)
+        if Dentaku::Streaming.stream?(val)
+          raise Dentaku::StreamNotSupportedError.new(
+            nil, operation: "arithmetic (#{operator})", location: location
+          )
+        end
         validate_value(val)
         Dentaku::NumericParser.ensure_numeric(val) || val
       end

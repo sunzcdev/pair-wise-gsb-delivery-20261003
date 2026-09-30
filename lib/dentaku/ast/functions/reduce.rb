@@ -36,7 +36,13 @@ module Dentaku
       end
 
       def value(context = {})
-        collection      = Array(@args[0].value(context))
+        collection      = @args[0].value(context)
+        if Dentaku::Streaming.stream?(collection)
+          raise Dentaku::StreamNotSupportedError.new(
+            nil, operation: 'REDUCE', location: location
+          )
+        end
+        collection      = Array(collection)
         memo_identifier = @args[1].identifier
         item_identifier = @args[2].identifier
         expression      = @args[3]

@@ -42,6 +42,10 @@ module Dentaku
         identifier.to_s
       end
 
+      def stream_source_name
+        identifier
+      end
+
       private
 
       def dependencies_of(node, context)

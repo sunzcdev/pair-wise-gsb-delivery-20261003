@@ -1,4 +1,5 @@
 require_relative './operation'
+require_relative '../streaming'
 
 module Dentaku
   module AST
@@ -6,6 +7,14 @@ module Dentaku
       def value(context = {})
         left_value = left.value(context)
         right_value = right.value(context)
+
+        [left_value, right_value].each do |operand|
+          if Dentaku::Streaming.stream?(operand)
+            raise Dentaku::StreamNotSupportedError.new(
+              nil, operation: "bitwise (#{operator})", location: location
+            )
+          end
+        end
 
         left_value.public_send(operator, right_value)
       rescue NoMethodError

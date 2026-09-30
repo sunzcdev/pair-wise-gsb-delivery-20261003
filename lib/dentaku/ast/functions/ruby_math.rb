@@ -42,7 +42,15 @@ module Dentaku
       end
 
       def value(context = {})
-        args = @args.flatten.map { |a|Dentaku::NumericParser.ensure_numeric!(a.value(context)) }
+        args = @args.flatten.map do |a|
+          value = a.value(context)
+          if Dentaku::Streaming.stream?(value)
+            raise Dentaku::StreamNotSupportedError.new(
+              nil, operation: self.class.name.to_s.upcase, location: location
+            )
+          end
+          Dentaku::NumericParser.ensure_numeric!(value)
+        end
         self.class.call(*args)
       end
 

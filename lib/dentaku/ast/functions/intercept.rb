@@ -9,6 +9,11 @@ Dentaku::AST::Function.register(:intercept, :list, ->(*args) {
   end
 
   x_values, y_values = args
+  if Dentaku::Streaming.stream?(x_values) || Dentaku::Streaming.stream?(y_values)
+    raise Dentaku::StreamNotSupportedError.new(
+      nil, operation: 'INTERCEPT'
+    )
+  end
   if !x_values.is_a?(Array) || !y_values.is_a?(Array) || x_values.length != y_values.length
     raise Dentaku::ArgumentError.for(
         :invalid_value,

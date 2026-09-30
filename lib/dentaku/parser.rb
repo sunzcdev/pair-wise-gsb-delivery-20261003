@@ -35,19 +35,31 @@ module Dentaku
       @output            = []
       @operations        = options.fetch(:operations, [])
       @arities           = options.fetch(:arities, [])
+      @start_tokens      = []
       @function_registry = options.fetch(:function_registry, nil)
       @case_sensitive    = options.fetch(:case_sensitive, false)
+      @source            = options.fetch(:source, nil)
       @skip_indices      = []
     end
 
     def consume(count = 2)
       operation = operations.pop
+      start_token = @start_tokens.pop
       fail! :invalid_statement if operation.nil?
 
       output_size = output.length
       args_size = operation.arity || count
       min_size = operation.arity || operation.min_param_count || count
       max_size = operation.arity || operation.max_param_count || count
+
+      if args_size.zero? && operation.respond_to?(:allows_empty_call?) && operation.allows_empty_call?
+        # zero-argument function call that is legal to parse (e.g. COUNT())
+        # or whose arity is enforced at evaluation time (e.g. SUM())
+        node = operation.new
+        assign_location(node, start_token, [])
+        output.push node
+        return
+      end
 
       if output_size < min_size || args_size < min_size
         expected = min_size == max_size ? min_size : min_size..max_size
@@ -66,7 +78,9 @@ module Dentaku
       else
         fail! :invalid_statement if output_size < args_size
         args = Array.new(args_size) { output.pop }.reverse
-        output.push operation.new(*args)
+        node = operation.new(*args)
+        assign_location(node, start_token, args)
+        output.push node
       end
 
       if operation.respond_to?(:callback) && !operation.callback.nil?
@@ -77,6 +91,28 @@ module Dentaku
       raise Dentaku::ArgumentError.for(:invalid_value), e.message
     rescue NodeError => e
       raise ParseError.for(:node_invalid, operation: operation, operand: e.operand, expected: e.expected, actual: e.actual), e.message
+    end
+
+    def assign_location(node, start_token, args)
+      locations = args.grep(AST::Node).map(&:location)
+      locations << location_for(start_token) if start_token
+      node.location = AST::Location.span(*locations, source: @source)
+    end
+
+    def location_for(token)
+      return nil unless token && token.offset
+
+      AST::Location.new(token.offset, token.length, @source)
+    end
+
+    def push_operation(operation_class, token = nil)
+      operations.push(operation_class)
+      @start_tokens.push(token)
+    end
+
+    def pop_operation
+      @start_tokens.pop
+      operations.pop
     end
 
     def parse
@@ -118,15 +154,15 @@ module Dentaku
 
     def process_token(token, lookahead, index)
       case token.category
-      when :datetime      then output << AST::DateTime.new(token)
-      when :numeric       then output << AST::Numeric.new(token)
-      when :logical       then output << AST::Logical.new(token)
-      when :string        then output << AST::String.new(token)
-      when :identifier    then output << AST::Identifier.new(token, case_sensitive: case_sensitive)
+      when :datetime      then output << located(AST::DateTime.new(token), token)
+      when :numeric       then output << located(AST::Numeric.new(token), token)
+      when :logical       then output << located(AST::Logical.new(token), token)
+      when :string        then output << located(AST::String.new(token), token)
+      when :identifier    then output << located(AST::Identifier.new(token, case_sensitive: case_sensitive), token)
       when :operator, :comparator, :combinator
         handle_operator(token, lookahead)
       when :null
-        output << AST::Nil.new
+        output << located(AST::Nil.new, token)
       when :function
         handle_function(token)
       when :case
@@ -149,14 +185,14 @@ module Dentaku
       else
         consume while operations.last && operations.last < AST::Operation && op_class.precedence <= operations.last.precedence
       end
-      operations.push op_class
+      push_operation(op_class, token)
     end
 
     def handle_function(token)
       func = function(token)
       fail! :undefined_function, function_name: token.value if func.nil?
       arities.push 0
-      operations.push func
+      push_operation(func, token)
     end
 
     def handle_case(token)
@@ -167,14 +203,14 @@ module Dentaku
       case token.value
       when :open
         # Start a new CASE context.
-        operations.push AST::Case
+        push_operation(AST::Case, token)
         arities.push(0)
 
       when :close
         # Finalize any trailing THEN/ELSE expression still on the stack.
         if operations[token_index] == AST::CaseThen
           consume_until(AST::Case)
-          operations.push(AST::CaseConditional)
+          push_operation(AST::CaseConditional, token)
           consume(2)
           arities[-1] += 1
         elsif operations[token_index] == AST::CaseElse
@@ -182,13 +218,14 @@ module Dentaku
           arities[-1] += 1
         end
         fail! :unprocessed_token, token_name: token.value unless operations.last == AST::Case
+        @start_tokens.pop
         consume(arities.pop.succ)
 
       when :when
         if operations[token_index] == AST::CaseThen
           # Close out previous WHEN/THEN pair.
           consume_until([AST::CaseWhen, AST::Case])
-          operations.push(AST::CaseConditional)
+          push_operation(AST::CaseConditional, token)
           consume(2)
           arities[-1] += 1
         elsif operations[token_index].nil? ||
@@ -196,25 +233,25 @@ module Dentaku
           # First WHEN: fold any operators pending from an unparenthesized
           # switch expression, then finalize the switch variable.
           consume_until(AST::Case)
-          operations.push(AST::CaseSwitchVariable)
+          push_operation(AST::CaseSwitchVariable, nil)
           consume
         end
-        operations.push(AST::CaseWhen)
+        push_operation(AST::CaseWhen, token)
 
       when :then
         if operations[token_index] == AST::CaseWhen
           consume_until([AST::CaseThen, AST::Case])
         end
-        operations.push(AST::CaseThen)
+        push_operation(AST::CaseThen, token)
 
       when :else
         if operations[token_index] == AST::CaseThen
           consume_until(AST::Case)
-          operations.push(AST::CaseConditional)
+          push_operation(AST::CaseConditional, token)
           consume(2)
           arities[-1] += 1
         end
-        operations.push(AST::CaseElse)
+        push_operation(AST::CaseElse, token)
 
       else
         fail! :unknown_case_token, token_name: token.value
@@ -234,11 +271,12 @@ module Dentaku
     def handle_access(token)
       case token.value
       when :lbracket
-        operations.push AST::Access
+        push_operation(AST::Access, token)
 
       when :rbracket
         consume while operations.any? && operations.last != AST::Access
         fail! :unbalanced_bracket, token: token unless operations.last == AST::Access
+        @start_tokens.pop
         consume
       end
     end
@@ -246,12 +284,13 @@ module Dentaku
     def handle_array(token)
       case token.value
       when :array_start
-        operations.push AST::Array
+        push_operation(AST::Array, token)
         arities.push 0
 
       when :array_end
         consume while operations.any? && operations.last != AST::Array
         fail! :unbalanced_bracket, token: token unless operations.last == AST::Array
+        @start_tokens.pop
         consume(arities.pop.succ)
       end
     end
@@ -266,12 +305,12 @@ module Dentaku
           arities.pop
           consume(0)
         else
-          operations.push AST::Grouping
+          push_operation(AST::Grouping, token)
         end
 
       when :close
         consume while operations.any? && operations.last != AST::Grouping
-        lparen = operations.pop
+        lparen = pop_operation
         fail! :unbalanced_parenthesis, token: token unless lparen == AST::Grouping
         if operations.last && operations.last < AST::Function
           consume(arities.pop.succ)
@@ -289,6 +328,11 @@ module Dentaku
 
     def fail!(reason, **meta)
       raise ParseError.for(reason, **meta)
+    end
+
+    def located(node, token)
+      node.location = location_for(token)
+      node
     end
   end
 end

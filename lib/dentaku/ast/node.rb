@@ -7,6 +7,8 @@ module Dentaku
       STATIC_MODE_KEY = "__static_dependencies".freeze
       STATIC_CONTEXT = { STATIC_MODE_KEY => true }.freeze
 
+      attr_accessor :location
+
       def self.precedence
         0
       end
@@ -38,6 +40,12 @@ module Dentaku
 
       def name
         self.class.name.to_s.split("::").last.upcase
+      end
+
+      # Identifier name this node resolves to, if it is a plain identifier
+      # (used to attribute streaming reads to their data source).
+      def stream_source_name
+        nil
       end
 
       private
