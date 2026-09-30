@@ -789,6 +789,9 @@ class CSV
       end
       if @raw_headers
         @headers = adjust_headers(@raw_headers, quoted_fields)
+        # Explicitly supplied headers are known before any data is read, so
+        # name/occurrence selectors are validated up front.
+        @fields_converter.bind_headers(@headers)
       else
         @headers = nil
       end
@@ -1274,15 +1277,18 @@ class CSV
       if @use_headers
         if @headers.nil?
           @headers = adjust_headers(row, quoted_fields)
+          @fields_converter.bind_headers(@headers)
           return unless @return_headers
           row = Row.new(@headers, row, true)
         else
           row = Row.new(@headers,
                         @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields))
+          add_column_conversion_errors(row)
         end
       else
         # convert fields, if needed...
         row = @fields_converter.convert(raw_row, nil, @lineno, quoted_fields)
+        add_column_conversion_errors(row)
       end
 
       # inject unconverted fields and accessor, if requested...
@@ -1291,6 +1297,19 @@ class CSV
       end
 
       yield(row)
+    end
+
+    def add_column_conversion_errors(row)
+      errors = @fields_converter.column_errors
+      return if errors.nil? or errors.empty?
+      if row.is_a?(Row)
+        row.column_conversion_errors = errors
+      else
+        class << row
+          attr_reader :column_conversion_errors
+        end
+        row.instance_variable_set(:@column_conversion_errors, errors)
+      end
     end
 
     # This method injects an instance variable <tt>unconverted_fields</tt> into

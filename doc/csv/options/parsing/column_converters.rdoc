@@ -1,0 +1,73 @@
+== Option +column_converters+
+
+This option configures _declarative column conversions_: conversions that
+target a specific column (or set of columns), rather than every parsed
+field.  It is especially useful when several columns share the same header
+text, where a generic converter cannot tell them apart.
+
+The value is a \Hash.  Each key selects one or more columns, and each value
+is a converter chain for those columns:
+
+  csv = CSV.new(string, headers: true, column_converters: {
+    0               => :integer,
+    "price"         => :float,
+    ["amount", 1]   => original_currency_converter,
+    ["amount", 2]   => settlement_currency_converter,
+    {header: "tax", occurrence: 2} => [:float, round_converter],
+    1..3            => :integer,
+  })
+
+=== Selecting Columns
+
+A column selector may be:
+
+- An \Integer: the 0-based column index.  Negative indexes count from the
+  last column.
+- A \Range of Integers: every column index in the range.
+- A header name (\String or \Symbol): matched against the (converted)
+  headers.
+- An Array <tt>[header, occurrence]</tt>: selects the +occurrence+-th
+  (1-based) column with that header.  Required when the header text occurs
+  more than once.
+- A \Hash:
+  - <tt>{index: integer_or_range}</tt>.
+  - <tt>{header: name}</tt>, optionally with
+    <tt>occurrence: 1_based_integer</tt>.
+
+When a bare header name matches multiple columns, an
+CSV::AmbiguousColumnError is raised.  Selectors that don't match any column
+raise CSV::MissingColumnError.  Two selectors that resolve to the same
+column raise CSV::DuplicateColumnError.
+
+These checks run as soon as the header row has been read (or when the CSV
+object is built, when headers are provided explicitly), so configuration
+problems fail before any data rows are processed.  When headers are not
+used, index selectors are checked against the first data row and header
+name selectors raise CSV::MissingColumnError.
+
+=== Converter Chains
+
+Each chain value is a converter Proc, a registered converter name (such as
+<tt>:integer</tt> or <tt>:numeric</tt>), or an Array of them.  Converters
+follow the existing converter conventions: a 1-arity Proc receives just the
+field, while a 2-arity Proc receives the field and a CSV::FieldInfo.  As
+with ordinary +converters+, once a step returns a non-String the remaining
+steps in that column's chain are skipped.
+
+Ordinary +converters+ still run first, on every field; a column chain then
+runs only on the columns it selects.
+
+=== Handling Conversion Failures
+
+Use option +column_conversion_errors+ to choose what happens when a column
+converter raises:
+
+- <tt>:raise</tt> (the default): CSV::ColumnConversionError is raised.  Its
+  +failure+ attribute is a CSV::ColumnConversionFailure with the record
+  position (+lineno+, +record+), the column identity (+index+, +header+,
+  +occurrence+, +selector+), the original +field+, the failing +step+ and
+  +converter+, and the underlying +cause+.
+- <tt>:collect</tt>: parsing continues.  Failed cells keep their original
+  values and the failures are attached to the yielded row as
+  <tt>row.column_conversion_errors</tt> (an Array of
+  CSV::ColumnConversionFailure objects; +nil+ for rows with no failures).

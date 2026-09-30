@@ -118,6 +118,10 @@ class CSV
     attr_reader :row
     protected   :row
 
+    # Failures collected for this row when the +:column_conversion_errors+
+    # option is +:collect+; nil otherwise.
+    attr_accessor :column_conversion_errors
+
     ### Array Delegation ###
 
     extend Forwardable

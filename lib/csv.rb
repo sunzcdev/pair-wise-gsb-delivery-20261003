@@ -95,6 +95,7 @@ require "time"
 require "stringio"
 
 require_relative "csv/fields_converter"
+require_relative "csv/column_converter_plan"
 require_relative "csv/input_record_separator"
 require_relative "csv/parser"
 require_relative "csv/row"
@@ -365,6 +366,9 @@ require_relative "csv/writer"
 #   non-compliant data.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +column_converters+: Specifies declarative, per-column converter chains.
+# - +column_conversion_errors+: Specifies whether a failing column converter
+#   raises (+:raise+, the default) or is collected (+:collect+).
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -395,6 +399,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/parsing/nil_value.rdoc
 #
 # :include: ../doc/csv/options/parsing/empty_value.rdoc
+#
+# :include: ../doc/csv/options/parsing/column_converters.rdoc
 #
 # ==== Options for Generating
 #
@@ -970,6 +976,8 @@ class CSV
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
+    column_converters:          nil,
+    column_conversion_errors:   :raise,
     # For generating.
     write_headers:      nil,
     quote_empty:        true,
@@ -2053,6 +2061,8 @@ class CSV
                  nil_value: nil,
                  empty_value: "",
                  strip: false,
+                 column_converters: nil,
+                 column_conversion_errors: :raise,
                  quote_empty: true,
                  write_converters: nil,
                  write_nil_value: nil,
@@ -2089,6 +2099,16 @@ class CSV
     @initial_converters = converters
     @initial_header_converters = header_converters
     @initial_write_converters = write_converters
+    @initial_column_converters = column_converters
+    @column_conversion_errors = column_conversion_errors
+    unless [:raise, :collect].include?(@column_conversion_errors)
+      raise ArgumentError,
+            ":column_conversion_errors must be :raise or :collect: " \
+            "#{@column_conversion_errors.inspect}"
+    end
+    # Normalize the declarative plans up front so that invalid selectors,
+    # unknown converters, and empty chains fail before parsing begins.
+    parser_fields_converter unless @initial_column_converters.nil?
 
     if max_field_size.nil? and field_size_limit
       max_field_size = field_size_limit - 1
@@ -2903,6 +2923,8 @@ class CSV
   def build_parser_fields_converter
     specific_options = {
       builtin_converters_name: :Converters,
+      column_converters: @initial_column_converters,
+      column_conversion_errors: @column_conversion_errors,
     }
     options = @base_fields_converter_options.merge(specific_options)
     build_fields_converter(@initial_converters, options)
