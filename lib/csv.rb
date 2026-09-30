@@ -95,6 +95,7 @@ require "time"
 require "stringio"
 
 require_relative "csv/fields_converter"
+require_relative "csv/external_sort"
 require_relative "csv/input_record_separator"
 require_relative "csv/parser"
 require_relative "csv/row"
@@ -1391,6 +1392,80 @@ class CSV
       open(path_or_io, mode, **options) do |csv|
         csv.each(&block)
       end
+    end
+
+    #
+    # :call-seq:
+    #   sorted_foreach(path_or_io, key:, **options) {|row| ... }
+    #   sorted_foreach(path_or_io, key:, **options) -> enumerator
+    #   sorted_foreach(path_or_io, mode='r', key:, buffer_size:, max_open_files:, temp_dir:, **options) {|row| ... }
+    #
+    # Streams the rows read from +path_or_io+ in stable sorted order,
+    # without loading the whole source into memory.  This is useful for
+    # data that may be larger than the memory available to the process.
+    #
+    # The sort key is computed by the given +key+ object's +#call+,
+    # which receives each data row; keys are ordered with +<=>+.  Rows
+    # whose keys are equal keep their original input order, and that
+    # stability is preserved even when the data needs several rounds of
+    # merging.  When a block is given, the sorted rows are streamed to it;
+    # without a block an \Enumerator is returned:
+    #
+    #   require "stringio"
+    #   CSV.sorted_foreach(StringIO.new("2,b\n2,a\n1,c\n"),
+    #                      key: ->(row) { row[0] }) {|row| p row }
+    #
+    # Output:
+    #
+    #   ["1", "c"]
+    #   ["2", "b"]
+    #   ["2", "a"]
+    #
+    # Memory and open files are bounded:
+    # - +buffer_size+ is the maximum number of records sorted in memory
+    #   before a sorted chunk is spilled to a temporary file.
+    # - +max_open_files+ is the maximum number of spilled chunks opened
+    #   at the same time during one merge pass; when more chunks exist,
+    #   additional merge passes are performed.
+    # - +temp_dir+ is the directory used for temporary files; it defaults
+    #   to +Dir.tmpdir+ (only Ruby's standard library is used).
+    #
+    # The verbatim text of each record is spilled and re-parsed, so the
+    # header row, duplicated column names, nil/empty values and fields
+    # containing embedded newlines are preserved.  With parsing option
+    # <tt>headers: true</tt>, the header row is yielded first (as a
+    # header CSV::Row) and is not part of the sort; otherwise every
+    # yielded row is an \Array, as with CSV.foreach.
+    #
+    # All temporary files and file handles created for the sort are
+    # released when the method returns, including when the key
+    # extractor raises, reading or writing fails, or the consumer stops
+    # iterating early.
+    #
+    # With no block given, returns an \Enumerator.
+    def sorted_foreach(path_or_io,
+                       mode="r",
+                       key:,
+                       buffer_size: 10_000,
+                       max_open_files: 10,
+                       temp_dir: nil,
+                       **options,
+                       &block)
+      unless buffer_size.is_a?(Integer) and buffer_size >= 1
+        raise ArgumentError, "buffer_size must be a positive Integer"
+      end
+      unless max_open_files.is_a?(Integer) and max_open_files >= 2
+        raise ArgumentError, "max_open_files must be an Integer >= 2"
+      end
+      sorter = ExternalSort.new(path_or_io,
+                                mode,
+                                key,
+                                buffer_size: buffer_size,
+                                max_open_files: max_open_files,
+                                temp_dir: temp_dir,
+                                **options)
+      return sorter.each unless block_given?
+      sorter.each(&block)
     end
 
     #

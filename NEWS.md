@@ -1,5 +1,17 @@
 # News
 
+## Unreleased
+
+### Additions
+
+  * Added `CSV.sorted_foreach`, a streaming stable sort for CSV data
+    that may be larger than the available memory. It bounds the number
+    of records held in memory (`buffer_size`) and the number of runs
+    opened during merging (`max_open_files`), uses only the Ruby
+    standard library for temporary storage, preserves the input order of
+    equal keys through every merge pass, and releases its temporary
+    files and handles on error or early termination.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements
