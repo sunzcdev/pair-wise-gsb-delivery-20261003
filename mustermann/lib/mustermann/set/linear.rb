@@ -13,6 +13,10 @@ module Mustermann
         @patterns << pattern
       end
 
+      def untrack(...) = nil
+
+      def optimized? = false
+
       def match(string, all: false, peek: false)
         result = [] if all
         @patterns.each do |pattern|

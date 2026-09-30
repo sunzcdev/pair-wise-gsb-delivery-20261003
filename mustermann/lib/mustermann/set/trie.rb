@@ -76,6 +76,7 @@ module Mustermann
         @dynamic         = nil
         @static          = nil
         @stride          = nil
+        @optimized       = false
         @fast_static     = nil
         @byte_lookup     = nil
         @dynamic_entries = nil
@@ -203,6 +204,7 @@ module Mustermann
       end
 
       def add(pattern)
+        @optimized       = false
         @stride          = nil
         @fast_static     = nil
         @byte_lookup     = nil
@@ -210,10 +212,15 @@ module Mustermann
         Translator.new(pattern).translate(pattern.to_ast, self)
       end
 
+      def untrack(...) = nil
+
+      def optimized? = @optimized
+
       # Compacts the trie by replacing sequential single-char static lookups with a
       # single stride-length hash lookup. The stride is the minimum number of static
       # steps all paths from this node share before hitting a dynamic edge or branch.
       def optimize!
+        @optimized = true
         depth = min_static_depth
         if depth > 1
           @fast_static = build_stride_hash(depth)

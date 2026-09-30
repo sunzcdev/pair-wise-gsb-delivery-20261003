@@ -9,8 +9,9 @@ module Mustermann
         @count   = 0
       end
 
-      def add(...)  = @matcher.add(...)
-      def optimize! = @matcher.optimize!
+      def add(...)    = @matcher.add(...)
+      def optimize!   = @matcher.optimize!
+      def optimized?  = @matcher.optimized?
       
       def match(string, all: false, peek: false)
         possible = @matcher.match(string, all: true, peek: peek)
@@ -21,6 +22,11 @@ module Mustermann
       def track(pattern, value)
         @order[pattern] ||= {}
         @order[pattern][value] = @count += 1
+      end
+
+      def untrack(pattern, value)
+        @order[pattern]&.delete(value)
+        @order.delete(pattern) if @order[pattern]&.empty?
       end
     end
 

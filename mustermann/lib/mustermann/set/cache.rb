@@ -38,8 +38,18 @@ module Mustermann
         }
       end
 
+      def untrack(pattern, value)
+        @matcher.untrack(pattern, value)
+        reset_cache
+      end
+
       def optimize! = @matcher.optimize!
-      def track(...) = @matcher.track(...)
+      def optimized? = @matcher.optimized?
+
+      def track(...)
+        @matcher.track(...)
+        reset_cache
+      end
     end
 
     private_constant :Cache

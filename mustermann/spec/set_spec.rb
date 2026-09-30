@@ -203,6 +203,115 @@ describe Mustermann::Set do
       end
     end
 
+    # ── delete ─────────────────────────────────────────────────────────────
+
+    context 'delete' do
+      it 'removes a whole pattern and returns its values' do
+        set.add('/foo', :a)
+        set.add('/bar', :b)
+
+        expect(set.delete('/foo')).to eq [:a]
+        expect(set.match('/foo')).to be_nil
+        expect(set.match('/bar').value).to eq :b
+      end
+
+      it 'removes all values of a pattern with several values' do
+        set.add('/foo', :a, :b)
+
+        expect(set.delete('/foo')).to eq [:a, :b]
+        expect(set.match_all('/foo')).to eq []
+        expect(set.patterns.map(&:to_s)).to eq []
+      end
+
+      it 'removes only one association and keeps the other values' do
+        set.add('/foo', :a, :b, :c)
+
+        expect(set.delete('/foo', :b)).to eq :b
+        expect(set.match_all('/foo').map(&:value)).to eq [:a, :c]
+      end
+
+      it 'removes several associations' do
+        set.add('/foo', :a, :b, :c)
+
+        expect(set.delete('/foo', :a, :c)).to eq [:a, :c]
+        expect(set.match_all('/foo').map(&:value)).to eq [:b]
+      end
+
+      it 'removes the pattern when its last association is removed' do
+        set.add('/foo', :a)
+
+        expect(set.delete('/foo', :a)).to eq :a
+        expect(set.patterns).to eq []
+        expect(set.match('/foo')).to be_nil
+      end
+
+      it 'returns nil when the pattern is unknown' do
+        set.add('/foo', :a)
+
+        expect(set.delete('/bar')).to be_nil
+        expect(set.delete('/bar', :a)).to be_nil
+      end
+
+      it 'returns nil when an association is unknown and leaves the set unchanged' do
+        set.add('/foo', :a)
+
+        expect(set.delete('/foo', :b)).to be_nil
+        expect(set.match('/foo').value).to eq :a
+      end
+
+      it 'accepts an equivalent pattern object' do
+        set.add('/foo', :a)
+
+        expect(set.delete(Mustermann.new('/foo'), :a)).to eq :a
+        expect(set.match('/foo')).to be_nil
+      end
+
+      it 'keeps expansion available for a value shared by another pattern' do
+        set.add('/users/:id', :shared)
+        set.add('/profiles/:id', :shared)
+        set.expand(:shared, id: '1')
+
+        set.delete('/users/:id', :shared)
+
+        expect(set.expand(:shared, id: '2')).to eq '/profiles/2'
+      end
+
+      it 'does not expose an expansion after removing the last association' do
+        set.add('/users/:id', :only)
+        set.expand(:only, id: '1')
+
+        set.delete('/users/:id', :only)
+
+        expect { set.expand(:only, id: '2') }.to raise_error(Mustermann::ExpandError)
+      end
+
+      it 'does not expose a deleted pattern through the all-pattern expander' do
+        set.add('/users/:id', :a)
+        set.add('/profiles/:id', :b)
+        set.expand(id: '1')
+
+        set.delete('/users/:id')
+
+        expect(set.expand(id: '2')).to eq '/profiles/2'
+      end
+
+      it 'behaves like a set constructed from the remaining rules after re-adding' do
+        set.add('/:a', :first)
+        set.add('/b', :second)
+        set.add('/:c', :third)
+
+        set.delete('/:a', :first)
+        set.add('/:a', :first)
+
+        equivalent = described_class.new('/b' => :second, '/:c' => :third, '/:a' => :first,
+                                         use_trie:, use_cache: false)
+
+        expect(set.match_all('/b').map(&:value)).to eq equivalent.match_all('/b').map(&:value)
+        expect(set.match_all('/a').map(&:value)).to eq equivalent.match_all('/a').map(&:value)
+        expect(set.expand(a: 'x')).to eq equivalent.expand(a: 'x')
+      end
+    end
+
     # ── patterns ─────────────────────────────────────────────────────────────
 
     context 'patterns' do
@@ -551,6 +660,19 @@ describe Mustermann::Set do
       expect(set.match('/a').value).to eq :a
       expect(set.match('/c').value).to eq :c
     end
+
+    it 'removes patterns after switching to a trie' do
+      set = described_class.new(use_trie: 2, use_cache: false)
+      set.add('/a', :a)
+      set.add('/b', :b)
+      set.add('/c', :c)
+
+      expect(set.delete('/b')).to eq [:b]
+
+      expect(set.match('/b')).to be_nil
+      expect(set.match('/a').value).to eq :a
+      expect(set.match('/c').value).to eq :c
+    end
   end
 
   # ── caching ───────────────────────────────────────────────────────────────
@@ -570,6 +692,48 @@ describe Mustermann::Set do
       expect(set.match('/bar').value).to eq :second
     end
 
+    it 'invalidates cached matches when a whole pattern is deleted' do
+      set = described_class.new(use_trie: true, use_cache: true)
+      set.add('/foo', :first)
+      set.add('/bar', :second)
+      set.match('/foo')
+
+      expect(set.delete('/foo')).to eq [:first]
+
+      expect(set.match('/foo')).to be_nil
+      expect(set.match('/bar').value).to eq :second
+    end
+
+    it 'invalidates cached matches when one association is deleted' do
+      set = described_class.new(use_trie: true, use_cache: true)
+      set.add('/foo', :first, :second)
+      expect(set.match_all('/foo').map(&:value)).to eq [:first, :second]
+
+      expect(set.delete('/foo', :first)).to eq :first
+
+      expect(set.match_all('/foo').map(&:value)).to eq [:second]
+    end
+
+    it 'invalidates cached prefix matches when deleting' do
+      set = described_class.new(use_trie: true, use_cache: true)
+      set.add('/foo', :first)
+      expect(set.peek_match('/foo/extra').value).to eq :first
+
+      set.delete('/foo')
+
+      expect(set.peek_match('/foo/extra')).to be_nil
+    end
+
+    it 'invalidates cached negative results when the last association is deleted' do
+      set = described_class.new(use_trie: true, use_cache: true)
+      set.add('/foo', :first)
+      set.match('/bar')
+      set.delete('/foo')
+      set.add('/bar', :second)
+
+      expect(set.match('/bar').value).to eq :second
+    end
+
     it 'supports match_all with cache enabled' do
       set = described_class.new(use_trie: false, use_cache: true)
       set.add('/:name', :handler)
@@ -580,6 +744,49 @@ describe Mustermann::Set do
       set = described_class.new(use_trie: false, use_cache: true)
       set.add('/:name', :handler)
       expect(set.peek_match('/foo/extra').value).to eq :handler
+    end
+  end
+
+  context 'deletion with strict order' do
+    it 'keeps remaining associations in insertion order after deleting a whole pattern' do
+      set = described_class.new(use_trie: true, use_cache: true, strict_order: true)
+      set.add('/:a', :first)
+      set.add('/b', :second)
+      set.add('/:c', :third)
+
+      expect(set.match_all('/b').map(&:value)).to eq [:first, :second, :third]
+      expect(set.delete('/b')).to eq [:second]
+
+      expect(set.match_all('/b').map(&:value)).to eq [:first, :third]
+      expect(set.match('/b').value).to eq :first
+    end
+
+    it 'keeps remaining associations ordered when one value is removed' do
+      set = described_class.new(use_trie: false, use_cache: false, strict_order: true)
+      set.add('/:a', :first)
+      set.add('/b', :second)
+      set.add('/:c', :third)
+      set.add('/:a', :fourth)
+
+      expect(set.delete('/:a', :first)).to eq :first
+
+      expect(set.match_all('/b').map(&:value)).to eq [:second, :third, :fourth]
+    end
+  end
+
+  context 'deletion after dup' do
+    it 'does not change the original set or its cached expander' do
+      original = described_class.new(use_trie: true, use_cache: true, strict_order: true)
+      original.add('/foo', :shared)
+      original.add('/bar', :other)
+      original.expand
+
+      copy = original.dup
+      expect(copy.delete('/foo', :shared)).to eq :shared
+
+      expect(copy.match('/foo')).to be_nil
+      expect(original.match('/foo').value).to eq :shared
+      expect(original.expand).to eq '/foo'
     end
   end
 
