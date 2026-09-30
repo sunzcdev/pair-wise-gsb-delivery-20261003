@@ -84,6 +84,30 @@ module StateMachines
       end
     end
 
+    def initialize_copy(_orig)
+      super
+
+      @if_condition = copy_condition(@if_condition)
+      @unless_condition = copy_condition(@unless_condition)
+      @state_guards = @state_guards.transform_values(&:dup)
+      @event_requirement = copy_matcher(@event_requirement)
+      @state_requirements = @state_requirements.map do |requirement|
+        requirement.transform_values { |matcher| copy_matcher(matcher) }
+      end
+      @known_states = @known_states.dup
+    end
+
+    def freeze
+      [@if_condition, @unless_condition].each { |condition| Array(condition).freeze }
+      @state_guards.each_value(&:freeze)
+      @state_guards.freeze
+      [@event_requirement, *@state_requirements.flat_map(&:values)].each(&:freeze)
+      @state_requirements.each(&:freeze)
+      @state_requirements.freeze
+      @known_states.freeze
+      super
+    end
+
     # Determines whether the given object / query matches the requirements
     # configured for this branch.  In addition to matching the event, from state,
     # and to state, this will also check whether the configured :if/:unless
@@ -244,6 +268,14 @@ module StateMachines
           !conditions.all? { |machine, state| check_state(object, machine, state) }
         end
       end
+    end
+
+    def copy_condition(condition)
+      condition.is_a?(Array) ? condition.dup : condition
+    end
+
+    def copy_matcher(matcher)
+      matcher.is_a?(Singleton) ? matcher : matcher.dup
     end
 
     def check_state(object, machine_name, state_name)

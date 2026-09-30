@@ -209,6 +209,8 @@ module StateMachines
       # As can be seen, any number of transitions can be created using various
       # combinations of configuration options.
       def before_transition(*args, **options, &)
+        ensure_mutable!('callbacks')
+
         add_transition_callback(:before, args, options, &)
       end
 
@@ -218,6 +220,8 @@ module StateMachines
       # See +before_transition+ for a description of the possible configurations
       # for defining callbacks.
       def after_transition(*args, **options, &)
+        ensure_mutable!('callbacks')
+
         add_transition_callback(:after, args, options, &)
       end
 
@@ -277,6 +281,8 @@ module StateMachines
       # See +before_transition+ for a description of the possible configurations
       # for defining callbacks.
       def around_transition(*args, **options, &)
+        ensure_mutable!('callbacks')
+
         add_transition_callback(:around, args, options, &)
       end
 
@@ -309,6 +315,8 @@ module StateMachines
       #     end
       #   end
       def after_failure(*args, **options, &)
+        ensure_mutable!('callbacks')
+
         # Extract legacy positional arguments and merge with keyword options
         parsed_options = parse_callback_arguments(args, options)
         StateMachines::OptionsValidator.assert_valid_keys!(parsed_options, :on, :do, :if, :unless)

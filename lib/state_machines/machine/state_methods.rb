@@ -338,6 +338,14 @@ module StateMachines
         options = names.last.is_a?(Hash) ? names.pop : {}
         StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name)
 
+        if !block_given? && options.empty? && !names.first.is_a?(Matcher) &&
+           names.all? { |state_name| states[state_name] }
+          existing_states = names.map { |state_name| states[state_name] }
+          return existing_states.length == 1 ? existing_states.first : existing_states
+        end
+
+        ensure_mutable!('states')
+
         # Store the context so that it can be used for / matched against any state
         # that gets added
         @states.context(names, &) if block_given?

@@ -70,7 +70,7 @@ module StateMachines
     # * +after+
     # * +around+
     # * +failure+
-    attr_accessor :type
+    attr_reader :type
 
     # An optional block for determining whether to cancel the callback chain
     # based on the return value of the callback.  By default, the callback
@@ -142,6 +142,25 @@ module StateMachines
 
       @terminator = options.delete(:terminator)
       @branch = Branch.new(options)
+    end
+
+    def initialize_copy(_orig)
+      super
+      @methods = @methods.dup
+      @branch = @branch.dup
+    end
+
+    def freeze
+      @methods.freeze
+      @terminator.freeze if @terminator.is_a?(Proc)
+      @branch.freeze
+      super
+    end
+
+    def type=(type)
+      raise FrozenError, 'cannot modify callbacks of a sealed state machine' if frozen?
+
+      @type = type
     end
 
     # Gets a list of the states known to this callback by looking at the

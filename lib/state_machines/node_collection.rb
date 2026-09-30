@@ -57,6 +57,8 @@ module StateMachines
     # Changes the current machine associated with the collection.  In turn, this
     # will change the state machine associated with each node in the collection.
     def machine=(new_machine)
+      raise FrozenError, "cannot modify #{collection_part} of a sealed state machine" if frozen?
+
       @machine = new_machine
       each { |node| node.machine = new_machine }
     end
@@ -75,6 +77,8 @@ module StateMachines
     # which match the given set of nodes.  Matchers can be used so that the
     # context can get added once and evaluated after multiple adds.
     def context(nodes, &block)
+      raise_frozen_error if frozen?
+
       nodes = nodes.first.is_a?(Matcher) ? nodes.first : WhitelistMatcher.new(nodes)
       @contexts << context = { nodes: nodes, block: block }
 
@@ -88,6 +92,8 @@ module StateMachines
     # the configured indices.  This will also evaluate any existings contexts
     # that match the new node.
     def <<(node)
+      raise_frozen_error if frozen?
+
       @nodes << node
       @index_names.each { |name| add_to_index(name, value(node, name), node) }
       @contexts.each { |context| eval_context(context, node) }
@@ -103,7 +109,23 @@ module StateMachines
     # has changed since it was added to the collection, the old indexed keys
     # will be replaced with the updated ones.
     def update(node)
+      raise_frozen_error if frozen?
+
       @index_names.each { |name| update_index(name, node) }
+    end
+
+    def freeze
+      @nodes.freeze
+      @index_names.freeze
+      @indices.each_value(&:freeze)
+      @indices.freeze
+      @contexts.each do |context|
+        context[:nodes].freeze
+        context[:block].freeze if context[:block].is_a?(Proc)
+        context.freeze
+      end
+      @contexts.freeze
+      super
     end
 
     # Calls the block once for each element in self, passing that element as a
@@ -221,6 +243,14 @@ module StateMachines
     # evaluate the context if the node matches.
     def eval_context(context, node)
       node.context(&context[:block]) if context[:nodes].matches?(node.name)
+    end
+
+    def raise_frozen_error
+      raise FrozenError, "cannot modify #{collection_part} of a sealed state machine"
+    end
+
+    def collection_part
+      is_a?(StateCollection) ? 'states' : 'event branches'
     end
   end
 end

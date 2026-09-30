@@ -22,23 +22,66 @@ module StateMachines
     # namespace
     attr_reader :qualified_name
 
-    # The human-readable name for the state
-    attr_writer :human_name
-
     # The value that is written to a machine's attribute when an object
     # transitions into this state
-    attr_writer :value
+    # Set by #value= below
 
-    # Whether this state's value should be cached after being evaluated
-    attr_accessor :cache
+    # Whether this state's value should be cached after being evaluated.
+    # Set by #cache= below.
+    attr_reader :cache
 
-    # Whether or not this state is the initial state to use for new objects
-    attr_accessor :initial
+    # Whether or not this state is the initial state to use for new objects.
+    # Set by #initial= below.
+    attr_reader :initial
     alias initial? initial
 
     # A custom lambda block for determining whether a given value matches this
-    # state
-    attr_accessor :matcher
+    # state. Set by #matcher= below.
+    attr_reader :matcher
+
+    def human_name=(value)
+      raise_frozen_error('states') if frozen?
+
+      @human_name = value
+    end
+
+    def value=(value)
+      raise_frozen_error('states') if frozen?
+
+      @value = value
+    end
+
+    def cache=(value)
+      raise_frozen_error('states') if frozen?
+
+      @cache = value
+    end
+
+    def initial=(value)
+      raise_frozen_error('states') if frozen?
+
+      @initial = value
+    end
+
+    def matcher=(value)
+      raise_frozen_error('states') if frozen?
+
+      @matcher = value
+    end
+
+    def initialize_copy(_orig)
+      super
+      @context = StateContext.new(self)
+    end
+
+    def freeze
+      @human_name.freeze unless @human_name.is_a?(Proc)
+      freeze_configuration_value(@value)
+      @initial.freeze if @initial.respond_to?(:freeze)
+      @matcher.freeze if @matcher.is_a?(Matcher)
+      @context.freeze
+      super
+    end
 
     # Creates a new state within the context of the given machine.
     #
@@ -103,14 +146,9 @@ module StateMachines
       end
     end
 
-    # Creates a copy of this state, excluding the context to prevent conflicts
-    # across different machines.
-    def initialize_copy(orig) # :nodoc:
-      super
-      @context = StateContext.new(self)
-    end
-
     def machine=(machine)
+      raise_frozen_error('states') if frozen?
+
       @machine = machine
       @context = StateContext.new(self)
     end
@@ -203,6 +241,8 @@ module StateMachines
     # This can be called multiple times.  Each time a new context is created,
     # a new module will be included in the owner class.
     def context(&)
+      raise_frozen_error('states') if frozen?
+
       # Include the context
       context = @context
       machine.owner_class.class_eval { include context }
@@ -282,6 +322,20 @@ module StateMachines
     # Should the value be cached after it's evaluated for the first time?
     def cache_value?
       @cache
+    end
+
+    def freeze_configuration_value(value)
+      case value
+      when nil, Symbol, Numeric, TrueClass, FalseClass
+        value
+      when String, Array, Hash
+        value.freeze
+      end
+    end
+
+    def raise_frozen_error(part)
+      raise FrozenError,
+            "cannot modify #{part} of a sealed state machine"
     end
 
     # Adds a predicate method to the owner class so long as a name has

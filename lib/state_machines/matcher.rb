@@ -13,6 +13,16 @@ module StateMachines
       @values = values.is_a?(Array) ? values : [values]
     end
 
+    def initialize_copy(_orig)
+      super
+      @values = @values.dup
+    end
+
+    def freeze
+      @values.freeze
+      super
+    end
+
     # Generates a subset of values that exists in both the set of values being
     # filtered and the values configured for the matcher
     def filter(values)

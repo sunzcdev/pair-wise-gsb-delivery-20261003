@@ -27,7 +27,7 @@ module StateMachines
           # Only create a new copy if changes are being made to the machine in
           # a subclass
           if machine.owner_class != owner_class && (options.any? || block_given?)
-            machine = machine.clone
+            machine = machine.clone(freeze: false)
             machine.initial_state = options[:initial] if options.include?(:initial)
             machine.owner_class = owner_class
             # Configure async mode if requested in options

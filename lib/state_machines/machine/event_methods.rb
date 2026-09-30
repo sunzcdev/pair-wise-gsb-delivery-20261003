@@ -233,6 +233,14 @@ module StateMachines
         options = names.last.is_a?(Hash) ? names.pop : {}
         StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
 
+        if !block_given? && options.empty? && !names.first.is_a?(Matcher) &&
+           names.all? { |event_name| events[event_name] }
+          existing_events = names.map { |event_name| events[event_name] }
+          return existing_events.length == 1 ? existing_events.first : existing_events
+        end
+
+        ensure_mutable!('event branches')
+
         # Store the context so that it can be used for / matched against any event
         # that gets added
         @events.context(names, &) if block_given?
@@ -350,6 +358,8 @@ module StateMachines
       # result, if more than one transition applies to a given object, then the
       # first transition that matches will be performed.
       def transition(options)
+        ensure_mutable!('event branches')
+
         raise ArgumentError, 'Must specify :on event' unless options[:on]
 
         branches = []

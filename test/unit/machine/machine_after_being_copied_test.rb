@@ -54,11 +54,27 @@ class MachineAfterBeingCopiedTest < StateMachinesTest
     refute_same @copied_machine.callbacks[:before], @machine.callbacks[:before]
   end
 
+  def test_should_copy_each_before_callback
+    refute_same @copied_machine.callbacks[:before][0], @machine.callbacks[:before][0]
+  end
+
+  def test_should_copy_each_before_callback_branch
+    refute_same @copied_machine.callbacks[:before][0].branch, @machine.callbacks[:before][0].branch
+  end
+
   def test_should_not_have_the_same_after_callbacks
     refute_same @copied_machine.callbacks[:after], @machine.callbacks[:after]
   end
 
+  def test_should_copy_each_after_callback
+    refute_same @copied_machine.callbacks[:after][0], @machine.callbacks[:after][0]
+  end
+
   def test_should_not_have_the_same_failure_callbacks
     refute_same @copied_machine.callbacks[:failure], @machine.callbacks[:failure]
+  end
+
+  def test_should_copy_each_failure_callback
+    refute_same @copied_machine.callbacks[:failure][0], @machine.callbacks[:failure][0]
   end
 end

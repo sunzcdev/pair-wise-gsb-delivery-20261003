@@ -10,7 +10,7 @@ module StateMachines
     include MatcherHelpers
 
     # The state machine for which this event is defined
-    attr_accessor :machine
+    attr_reader :machine
 
     # The name of the event
     attr_reader :name
@@ -19,7 +19,7 @@ module StateMachines
     attr_reader :qualified_name
 
     # The human-readable name for the event
-    attr_writer :human_name
+    # Set by #human_name= below
 
     # The list of branches that determine what state this event transitions
     # objects to when fired
@@ -67,8 +67,27 @@ module StateMachines
     # branches to prevent conflicts across events within a class hierarchy.
     def initialize_copy(orig) # :nodoc:
       super
-      @branches = @branches.dup
+      @branches = @branches.map(&:dup)
       @known_states = @known_states.dup
+    end
+
+    def human_name=(value)
+      raise FrozenError, 'cannot modify event branches of a sealed state machine' if frozen?
+
+      @human_name = value
+    end
+
+    def machine=(machine)
+      raise FrozenError, 'cannot modify event branches of a sealed state machine' if frozen?
+
+      @machine = machine
+    end
+
+    def freeze
+      @branches.each(&:freeze)
+      @branches.freeze
+      @known_states.freeze
+      super
     end
 
     # Transforms the event name into a more human-readable format, such as
@@ -100,6 +119,8 @@ module StateMachines
     # See StateMachines::Machine#transition for a description of the possible
     # configurations for defining transitions.
     def transition(options)
+      raise FrozenError, 'cannot modify event branches of a sealed state machine' if frozen?
+
       raise ArgumentError, 'Must specify as least one transition requirement' if options.empty?
 
       # Only a certain subset of explicit options are allowed for transition
@@ -192,6 +213,8 @@ module StateMachines
     # where you either are re-using an existing state machine implementation
     # or are subclassing machines.
     def reset
+      raise FrozenError, 'cannot modify event branches of a sealed state machine' if frozen?
+
       @branches = []
       @known_states = []
     end
@@ -224,18 +247,18 @@ module StateMachines
     def add_actions
       # Checks whether the event can be fired on the current object
       machine.define_helper(:instance, "can_#{qualified_name}?") do |machine, object, *args, **kwargs|
-        machine.event(name).can_fire?(object, *args, **kwargs)
+        machine.events.fetch(qualified_name, :qualified_name).can_fire?(object, *args, **kwargs)
       end
 
       # Gets the next transition that would be performed if the event were
       # fired now
       machine.define_helper(:instance, "#{qualified_name}_transition") do |machine, object, *args, **kwargs|
-        machine.event(name).transition_for(object, *args, **kwargs)
+        machine.events.fetch(qualified_name, :qualified_name).transition_for(object, *args, **kwargs)
       end
 
       # Fires the event
       machine.define_helper(:instance, qualified_name) do |machine, object, *args, **kwargs|
-        machine.event(name).fire(object, *args, **kwargs)
+        machine.events.fetch(qualified_name, :qualified_name).fire(object, *args, **kwargs)
       end
 
       # Fires the event, raising an exception if it fails
