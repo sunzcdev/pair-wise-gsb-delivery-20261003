@@ -12,6 +12,7 @@ require 'concurrent/edge/lock_free_linked_set'
 require 'concurrent/edge/lock_free_queue'
 
 require 'concurrent/edge/cancellation'
+require 'concurrent/edge/branch_cancellation'
 require 'concurrent/edge/throttle'
 require 'concurrent/edge/channel'
 

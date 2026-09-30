@@ -342,6 +342,10 @@ module Concurrent
           raise NotImplementedError
         end
 
+        def cancelled?
+          false
+        end
+
         def to_sym
           raise NotImplementedError
         end
@@ -456,6 +460,38 @@ module Concurrent
       end
 
       # @!visibility private
+      class Cancelled < ResolvedWithResult
+        def initialize(reason = nil)
+          @Reason = reason || CancelledFutureError.new('future cancelled')
+        end
+
+        def cancelled?
+          true
+        end
+
+        def fulfilled?
+          false
+        end
+
+        def value
+          nil
+        end
+
+        def reason
+          @Reason
+        end
+
+        def to_sym
+          :cancelled
+        end
+
+        def apply(args, block)
+          # cancellations never run user continuations
+          raise self.reason
+        end
+      end
+
+      # @!visibility private
       class PartiallyRejected < ResolvedWithResult
         def initialize(value, reason)
           super()
@@ -556,6 +592,16 @@ module Concurrent
         internal_state.resolved?
       end
 
+      # Is it in cancelled state? Cancelled is a terminal state distinct from
+      # both fulfillment and rejection: user continuations ({#chain}, {Future#then},
+      # {Future#rescue}, {Future#on_fulfillment}, {Future#on_rejection}, ...) are
+      # not executed, but dependent combinator nodes are still notified so they
+      # can reach their own terminal state instead of waiting forever.
+      # @return [Boolean]
+      def cancelled?
+        internal_state.cancelled?
+      end
+
       # Propagates touch. Requests all the delayed futures, which it depends on, to be
       # executed. This method is called by any other method requiring resolved state, like {#wait}.
       # @return [self]
@@ -627,10 +673,41 @@ module Concurrent
       # @param [Resolvable] resolvable
       # @return [self]
       def chain_resolvable(resolvable)
-        on_resolution! { resolvable.resolve_with internal_state }
+        add_callback :callback_chain_resolvable, resolvable
       end
 
       alias_method :tangle, :chain_resolvable
+
+      # @!macro promises.shortcut.using
+      # @return [self]
+      def on_cancellation(*args, &callback)
+        on_cancellation_using @DefaultExecutor, *args, &callback
+      end
+
+      # Stores the callback to be executed synchronously on the cancelling thread
+      # when it is cancelled. Unlike {#on_rejection!} it is invoked for the
+      # distinct cancelled terminal state, and it is the only user-facing
+      # callback delivered for a cancelled future.
+      #
+      # @!macro promises.param.args
+      # @!macro promise.param.callback
+      # @return [self]
+      # @yield [reason, *args] to the callback.
+      def on_cancellation!(*args, &callback)
+        add_callback :callback_on_cancellation, args, callback
+      end
+
+      # Stores the callback to be executed asynchronously on executor after it is
+      # cancelled.
+      #
+      # @!macro promises.param.executor
+      # @!macro promises.param.args
+      # @!macro promise.param.callback
+      # @return [self]
+      # @yield [reason, *args] to the callback.
+      def on_cancellation_using(executor, *args, &callback)
+        add_callback :async_callback_on_cancellation, executor, args, callback
+      end
 
       # @!macro promises.shortcut.using
       # @return [self]
@@ -694,6 +771,58 @@ module Concurrent
           return rejected_resolution(raise_on_reassign, state)
         end
         self
+      end
+
+      # Publishes the cancelled terminal state. Only one terminal state is ever
+      # published: cancellation loses the race against fulfillment/rejection
+      # (and vice versa) silently, the method never raises on double resolution.
+      #
+      # @param [Object] reason of the cancellation
+      # @return [true, false] true if the receiver was cancelled by this call
+      # @!visibility private
+      def cancel_with(reason = nil)
+        state = InternalStates::Cancelled.new reason
+        if compare_and_set_internal_state(PENDING, state)
+          @Lock.synchronize { @Condition.broadcast } unless @Waiters.value == 0
+          call_callbacks state
+          # let the owning promise release references which only belonged to
+          # the now-detached branch (task closures, arguments)
+          @Promise.after_cancel
+          true
+        else
+          false
+        end
+      ensure
+        # The node is terminal: user callbacks belonging to this node were
+        # already drained above, and downstream nodes were notified. What may
+        # remain on the stack are late {#add_callback} racing registrations
+        # (already executed synchronously, not retained) so everything else
+        # can be dropped, breaking strong references held to arguments/tasks.
+        prune_cancelled_callbacks if internal_state.cancelled?
+      end
+
+      # User continuations registered on a cancelled future must not observe
+      # the cancellation as a regular resolution (then/rescue/chain callbacks
+      # and fulfillment/rejection callbacks are skipped), while wiring callbacks
+      # which notify blocked nodes, resolve tangled resolvables, or clear
+      # delayed-node references must still run so the graph keeps progressing.
+      CANCELLED_SKIPPED_CALLBACKS = [
+        :callback_on_resolution,
+        :async_callback_on_resolution,
+        :callback_on_fulfillment,
+        :async_callback_on_fulfillment,
+        :callback_on_rejection,
+        :async_callback_on_rejection,
+      ].freeze
+
+      # Removes all callbacks which only hold strong references belonging to a
+      # cancelled branch (user tasks, arguments, executors). Wiring callbacks
+      # are preserved and still invoked.
+      # @!visibility private
+      def prune_cancelled_callbacks
+        @Callbacks.clear_each do |method, args|
+          @Callbacks.push([method, args]) unless CANCELLED_SKIPPED_CALLBACKS.include? method
+        end
       end
 
       # For inspection.
@@ -794,6 +923,10 @@ module Concurrent
       end
 
       def call_callback(method, state, args)
+        # user continuations detach from a cancelled branch; only wiring
+        # callbacks (notify blocked nodes, tangle resolvables, clear delayed
+        # nodes and explicit cancellation observers) are delivered.
+        return if state.cancelled? && CANCELLED_SKIPPED_CALLBACKS.include?(method)
         self.send method, state, *args
       end
 
@@ -817,6 +950,29 @@ module Concurrent
 
       def callback_notify_blocked(state, promise, index)
         promise.on_blocker_resolution self, index
+      end
+
+      # Tangle must always publish a terminal state, even when the source is
+      # cancelled (otherwise the tangled node would wait forever). An event is
+      # resolved, a future adopts the cancelled state.
+      def callback_chain_resolvable(state, resolvable)
+        if state.cancelled? && Event === resolvable && !(Future === resolvable)
+          resolvable.resolve_with RESOLVED, false
+        elsif state.cancelled?
+          resolvable.resolve_with state, false
+        else
+          resolvable.resolve_with state
+        end
+      end
+
+      def async_callback_on_cancellation(state, executor, args, callback)
+        with_async(executor, state, args, callback) do |st, ar, cb|
+          callback_on_cancellation st, ar, cb
+        end
+      end
+
+      def callback_on_cancellation(state, args, callback)
+        callback.call(state.reason, *args) if state.cancelled?
       end
     end
 
@@ -928,7 +1084,24 @@ module Concurrent
       # @return [Boolean]
       def rejected?
         state = internal_state
-        state.resolved? && !state.fulfilled?
+        state.resolved? && !state.fulfilled? && !state.cancelled?
+      end
+
+      # Cancels a pending future, publishing the distinct `:cancelled` terminal
+      # state. Cancellation is cooperative w.r.t. work already executing: a
+      # running task is never killed ({Thread.kill} is never used). Instead, if
+      # the task completes first it wins the race and cancellation returns
+      # `false`; unstarted continuations detach without running.
+      #
+      # Cancellation and completion arriving simultaneously publish exactly one
+      # terminal state (an atomic compare-and-set decides the winner).
+      #
+      # @param [Object] reason optional cancellation reason, defaults to
+      #   {Concurrent::CancelledFutureError}
+      # @return [true, false] true if this call cancelled the future, false if
+      #   it already had a terminal state
+      def cancel(reason = nil)
+        cancel_with reason
       end
 
       # @!macro promises.warn.nil
@@ -1003,7 +1176,7 @@ module Concurrent
         end
       end
 
-      # Allows rejected Future to be risen with `raise` method.
+      # Allows rejected or cancelled Future to be risen with `raise` method.
       # If the reason is not an exception `Runtime.new(reason)` is returned.
       #
       # @example
@@ -1012,7 +1185,7 @@ module Concurrent
       # @raise [Concurrent::Error] when raising not rejected future
       # @return [Exception]
       def exception(*args)
-        raise Concurrent::Error, 'it is not rejected' unless rejected?
+        raise Concurrent::Error, 'it is not rejected or cancelled' unless rejected? || cancelled?
         raise ArgumentError unless args.size <= 1
         reason = Array(internal_state.reason).flatten.compact
         callsites = SET_BACKTRACE_LOCATIONS_SUPPORTED ? caller_locations : caller
@@ -1271,7 +1444,7 @@ module Concurrent
 
       def wait_until_resolved!(timeout = nil)
         result = wait_until_resolved(timeout)
-        raise self if rejected?
+        raise self if rejected? || cancelled?
         result
       end
 
@@ -1588,6 +1761,12 @@ module Concurrent
         nil
       end
 
+      # Hook invoked after the promise's future publishes the cancelled
+      # terminal state. Overridden by promises holding references to user tasks
+      # which will never run, so those references can be released.
+      def after_cancel
+      end
+
       private
 
       def resolve_with(new_state, raise_on_reassign = true)
@@ -1596,10 +1775,23 @@ module Concurrent
 
       # @return [Future]
       def evaluate_to(*args, block)
+        # The future may already have a terminal state when cancellation won the
+        # race while the task was queued or cooperatively running. Cancellation
+        # never kills executing code, the lost resolution is simply ignored.
+        return @Future if @Future.resolved?
         resolve_with Fulfilled.new(block.call(*args))
       rescue Exception => error
-        resolve_with Rejected.new(error)
-        raise error unless error.is_a?(StandardError)
+        if @Future.resolved?
+          # lost the race against cancellation/completion; do not overwrite the
+          # published terminal state
+          @Future
+        else
+          resolve_with Rejected.new(error)
+          # serious errors (SystemExit, Interrupt, ...) are also propagated to
+          # the executor which logs them, preserving the original behaviour
+          raise unless error.is_a?(StandardError)
+          @Future
+        end
       end
     end
 
@@ -1671,6 +1863,10 @@ module Concurrent
       end
 
       def on_blocker_resolution(future, index)
+        # A cancellation cascading through a branch may have published the
+        # terminal state already (via a different blocker, or directly). Never
+        # post work or resolve the node twice in that case.
+        return if @Future.internal_state.resolved?
         countdown  = process_on_blocker_resolution(future, index)
         resolvable = resolvable?(countdown, future, index)
 
@@ -1731,6 +1927,21 @@ module Concurrent
       def executor
         @Executor
       end
+
+      # A cancelled continuation never runs its task; drop the closure and the
+      # captured arguments so a detached branch does not keep them alive.
+      def after_cancel
+        release_task_reference
+      end
+
+      private
+
+      # Releases only task-owned references, keeping the (cheap, shared)
+      # executor which remains useful for inspection of resolved promises.
+      def release_task_reference
+        @Task = nil
+        @Args = nil
+      end
     end
 
     class ThenPromise < BlockedTaskPromise
@@ -1741,11 +1952,17 @@ module Concurrent
       end
 
       def on_resolvable(resolved_future, index)
-        if resolved_future.fulfilled?
+        if resolved_future.cancelled?
+          # unstarted continuation detaches: the task is neither posted nor
+          # retained, cancellation propagates downstream
+          after_cancel
+          resolve_with resolved_future.internal_state
+        elsif resolved_future.fulfilled?
           Concurrent.executor(@Executor).post(resolved_future, @Args, @Task) do |future, args, task|
             evaluate_to lambda { future.apply args, task }
           end
         else
+          after_cancel
           resolve_with resolved_future.internal_state
         end
       end
@@ -1764,6 +1981,9 @@ module Concurrent
             evaluate_to lambda { future.apply args, task }
           end
         else
+          # fulfilled and cancelled both skip the rescue task; cancellation
+          # keeps propagating as cancellation
+          after_cancel
           resolve_with resolved_future.internal_state
         end
       end
@@ -1773,7 +1993,11 @@ module Concurrent
       private
 
       def on_resolvable(resolved_future, index)
-        if Future === resolved_future
+        if resolved_future.respond_to?(:cancelled?) && resolved_future.cancelled?
+          # chain observes all terminal states except cancellation, which detaches
+          after_cancel
+          resolve_with resolved_future.internal_state
+        elsif Future === resolved_future
           Concurrent.executor(@Executor).post(resolved_future, @Args, @Task) do |future, args, task|
             evaluate_to(*future.result, *args, task)
           end
@@ -2018,16 +2242,22 @@ module Concurrent
 
       def on_resolvable(resolved_future, index)
         all_fulfilled = true
+        all_cancelled = true
         values        = ::Array.new(@Resolutions.size)
         reasons       = ::Array.new(@Resolutions.size)
 
         @Resolutions.each_with_index do |internal_state, i|
           fulfilled, values[i], reasons[i] = internal_state.result
-          all_fulfilled                    &&= fulfilled
+          all_fulfilled  &&= fulfilled
+          all_cancelled  &&= internal_state.cancelled?
         end
 
         if all_fulfilled
           resolve_with FulfilledArray.new(values)
+        elsif all_cancelled
+          # every input branch detached, the join node detaches as well instead
+          # of pretending a regular rejection
+          resolve_with InternalStates::Cancelled.new
         else
           resolve_with PartiallyRejected.new(values, reasons)
         end

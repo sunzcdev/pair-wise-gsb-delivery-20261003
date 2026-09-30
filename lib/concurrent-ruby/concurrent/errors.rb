@@ -8,6 +8,12 @@ module Concurrent
   # Raised when an asynchronous operation is cancelled before execution.
   CancelledOperationError = Class.new(Error)
 
+  # The terminal reason of a Future which was cancelled as part of an owned
+  # result branch. Unlike rejection, cancellation skips user continuations and
+  # callbacks ({Future#then}, {Future#rescue}, {Future#on_fulfillment}, ...)
+  # while still notifying dependent combinator nodes.
+  CancelledFutureError = Class.new(CancelledOperationError)
+
   # Raised when a lifecycle method (such as `stop`) is called in an improper
   # sequence or when the object is in an inappropriate state.
   LifecycleError = Class.new(Error)
