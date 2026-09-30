@@ -1,0 +1,35 @@
+====== Option +column_conversion_plan+
+
+Specifies a CSV::ColumnConversionPlan (or a specification to build one)
+declaring per-column conversion chains; used for parsing.
+See CSV::ColumnConversionPlan.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:column_conversion_plan) # => nil
+
+Unlike option +converters+, which applies to every field, a column
+conversion plan targets specific columns, selected by zero-based index or
+by header name plus a one-based occurrence number. This allows distinct
+conversions for columns that share the same header text:
+  str = "currency,amount,amount\nUSD,1,1.5\n"
+  # Without a plan
+  table = CSV.parse(str, headers: true)
+  table[0].fields # => ["USD", "1", "1.5"]
+  # With a plan: the first "amount" column is an Integer,
+  # the second one a Float
+  table = CSV.parse(str,
+                    headers: true,
+                    column_conversion_plan: {
+                      ["amount", 1] => :integer,
+                      ["amount", 2] => :float,
+                    })
+  table[0].fields # => ["USD", 1, 1.5]
+
+The plan is validated as soon as the header row has been read: missing
+columns, ambiguous header names and overlapping entries raise
+CSV::InvalidColumnConversionPlanError before any data row is processed.
+
+A failing converter raises CSV::ColumnConversionError (or collects it into
+CSV::ColumnConversionPlan#failures with <tt>on_error: :collect</tt>),
+reporting the record position, column identity, original value and the
+failing chain link.

@@ -95,6 +95,7 @@ require "time"
 require "stringio"
 
 require_relative "csv/fields_converter"
+require_relative "csv/column_conversion_plan"
 require_relative "csv/input_record_separator"
 require_relative "csv/parser"
 require_relative "csv/row"
@@ -322,6 +323,7 @@ require_relative "csv/writer"
 #     # For parsing.
 #     field_size_limit:   nil,
 #     converters:         nil,
+#     column_conversion_plan: nil,
 #     unconverted_fields: nil,
 #     headers:            false,
 #     return_headers:     false,
@@ -351,6 +353,8 @@ require_relative "csv/writer"
 #   Deprecated since 3.2.3. Use +max_field_size+ instead.
 # - +max_field_size+: Specifies the maximum field size allowed.
 # - +converters+: Specifies the field converters to be used.
+# - +column_conversion_plan+: Specifies per-column conversion chains
+#   targeting columns by index or by header name and occurrence.
 # - +unconverted_fields+: Specifies whether unconverted fields are to be available.
 # - +headers+: Specifies whether data contains headers,
 #   or specifies the headers themselves.
@@ -375,6 +379,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/parsing/field_size_limit.rdoc
 #
 # :include: ../doc/csv/options/parsing/converters.rdoc
+#
+# :include: ../doc/csv/options/parsing/column_conversion_plan.rdoc
 #
 # :include: ../doc/csv/options/parsing/unconverted_fields.rdoc
 #
@@ -960,6 +966,7 @@ class CSV
     field_size_limit:   nil,
     max_field_size:     nil,
     converters:         nil,
+    column_conversion_plan: nil,
     unconverted_fields: nil,
     headers:            false,
     return_headers:     false,
@@ -2038,6 +2045,7 @@ class CSV
                  field_size_limit: nil,
                  max_field_size: nil,
                  converters: nil,
+                 column_conversion_plan: nil,
                  unconverted_fields: nil,
                  headers: false,
                  return_headers: false,
@@ -2089,6 +2097,8 @@ class CSV
     @initial_converters = converters
     @initial_header_converters = header_converters
     @initial_write_converters = write_converters
+    @column_conversion_plan =
+      build_column_conversion_plan(column_conversion_plan)
 
     if max_field_size.nil? and field_size_limit
       max_field_size = field_size_limit - 1
@@ -2108,6 +2118,7 @@ class CSV
       nil_value: nil_value,
       empty_value: empty_value,
       strip: strip,
+      column_conversion_plan: @column_conversion_plan,
     }
     @parser = nil
 
@@ -2217,6 +2228,20 @@ class CSV
       name = Converters.rassoc(converter)
       name ? name.first : converter
     end
+  end
+
+  # :call-seq:
+  #   csv.column_conversion_plan -> csv_column_conversion_plan or nil
+  #
+  # Returns the CSV::ColumnConversionPlan in effect, if any;
+  # see CSV::ColumnConversionPlan:
+  #   CSV.new('').column_conversion_plan # => nil
+  #
+  # When the plan runs with <tt>on_error: :collect</tt>, conversion
+  # failures can be inspected through it:
+  #   csv.column_conversion_plan.failures # => []
+  def column_conversion_plan
+    @column_conversion_plan
   end
 
   # :call-seq:
@@ -2936,6 +2961,12 @@ class CSV
       fields_converter.add_converter(name, &converter)
     end
     fields_converter
+  end
+
+  def build_column_conversion_plan(spec)
+    return nil if spec.nil?
+    return spec if spec.is_a?(ColumnConversionPlan)
+    ColumnConversionPlan.new(spec)
   end
 
   def parser

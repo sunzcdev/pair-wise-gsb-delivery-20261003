@@ -492,6 +492,8 @@ class CSV
       @skip_blanks = @options[:skip_blanks]
       @fields_converter = @options[:fields_converter]
       @header_fields_converter = @options[:header_fields_converter]
+      @column_conversion_plan = @options[:column_conversion_plan]
+      @column_conversion_plan_bound = false
     end
 
     def prepare_quote_character
@@ -789,6 +791,7 @@ class CSV
       end
       if @raw_headers
         @headers = adjust_headers(@raw_headers, quoted_fields)
+        bind_column_conversion_plan
       else
         @headers = nil
       end
@@ -812,6 +815,22 @@ class CSV
       adjusted_headers = @header_fields_converter.convert(headers, nil, @lineno, quoted_fields)
       adjusted_headers.each {|h| h.freeze if h.is_a? String}
       adjusted_headers
+    end
+
+    # Validates the column conversion plan against the headers as soon as
+    # they are known, so that plan errors are reported before any data row
+    # is processed.
+    def bind_column_conversion_plan
+      return if @column_conversion_plan.nil?
+      return if @column_conversion_plan_bound
+      @column_conversion_plan.bind!(@headers)
+      @column_conversion_plan_bound = true
+    end
+
+    def convert_with_column_conversion_plan(fields, quoted_fields)
+      return fields if @column_conversion_plan.nil?
+      bind_column_conversion_plan
+      @column_conversion_plan.convert_fields(fields, @lineno, quoted_fields)
     end
 
     def prepare_parser
@@ -1274,15 +1293,20 @@ class CSV
       if @use_headers
         if @headers.nil?
           @headers = adjust_headers(row, quoted_fields)
+          bind_column_conversion_plan
           return unless @return_headers
           row = Row.new(@headers, row, true)
         else
-          row = Row.new(@headers,
-                        @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields))
+          converted = @fields_converter.convert(raw_row, @headers, @lineno,
+                                                quoted_fields)
+          converted = convert_with_column_conversion_plan(converted,
+                                                          quoted_fields)
+          row = Row.new(@headers, converted)
         end
       else
         # convert fields, if needed...
         row = @fields_converter.convert(raw_row, nil, @lineno, quoted_fields)
+        row = convert_with_column_conversion_plan(row, quoted_fields)
       end
 
       # inject unconverted fields and accessor, if requested...
