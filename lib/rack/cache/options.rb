@@ -111,6 +111,15 @@ module Rack::Cache
     # the attempt to revalidate the cache entry raises an exception.
     option_accessor :fault_tolerant
 
+    # Specifies whether a response to a POST request may be stored in the
+    # cache and used to satisfy subsequent GET/HEAD requests for the same
+    # URI, as permitted by RFC 7234 section 4.3.3. Only POST responses with
+    # a 200 status, explicit freshness information (max-age or Expires), and
+    # a Content-Location header identifying the same URI as the POST request
+    # are eligible. The POST request itself is always forwarded to the
+    # backend; it is never served from the cache. Disabled by default.
+    option_accessor :cache_post_responses
+
     # The underlying options Hash. During initialization (or outside of a
     # request), this is a default values Hash. During a request, this is the
     # Rack environment Hash. The default values Hash is merged in underneath
@@ -154,6 +163,7 @@ module Rack::Cache
         'rack-cache.allow_revalidate' => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
+        'rack-cache.cache_post_responses' => false,
       }
       self.options = options
     end

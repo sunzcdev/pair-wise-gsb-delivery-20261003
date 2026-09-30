@@ -146,3 +146,23 @@ need to fetch metadata and check timestamps.
 Boolean specifying whether fault tolerant caching is enabled. When this option
 is enabled (`rack-cache.fault_tolerant`is `true`), stale cached results can be
 returned if the downstream service is unavailable.
+
+### `cache_post_responses`
+
+Boolean specifying whether a response to a POST request may be stored and used
+to satisfy subsequent GET/HEAD requests for the same URI, as permitted by
+[RFC 7234 section 4.3.3](https://tools.ietf.org/html/rfc7234#section-4.3.3).
+Disabled by default.
+
+When this option is enabled (`rack-cache.cache_post_responses` is `true`), a
+POST response is stored only if it has a `200` status, explicit freshness
+information (`max-age` or `Expires`), and a `Content-Location` header that
+identifies the very same URI as the POST request (a mere same-origin URI with
+a different path does not qualify). The usual protections still apply:
+responses marked `private` or `no-store`, and responses to requests carrying
+`Authorization` or other configured private headers (unless explicitly
+`public`), are never stored.
+
+POST requests themselves are always forwarded to the origin; they are never
+served from the cache. The previously cached entry is invalidated before the
+new representation is published.

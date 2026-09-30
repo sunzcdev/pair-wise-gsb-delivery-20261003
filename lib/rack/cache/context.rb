@@ -1,3 +1,4 @@
+require 'uri'
 require 'rack/cache/options'
 require 'rack/cache/request'
 require 'rack/cache/response'
@@ -150,6 +151,13 @@ module Rack::Cache
 
     # Invalidate POST, PUT, DELETE and all methods not understood by this cache
     # See RFC2616 13.10
+    #
+    # The request is always forwarded to the backend; it is never served
+    # from the cache. When the cache_post_responses option is enabled, an
+    # eligible POST response is stored so that subsequent GET/HEAD requests
+    # for the same URI may be served from the cache (RFC 7234 4.3.3). The
+    # existing cache entry is invalidated before the new representation is
+    # published.
     def invalidate
       metastore.invalidate(@request, entitystore)
     rescue => e
@@ -157,7 +165,56 @@ module Rack::Cache
       pass
     else
       record :invalidate
-      pass
+      if @request.post? && cache_post_responses?
+        forward_and_store_post_response
+      else
+        pass
+      end
+    end
+
+    # Forward a POST request to the backend and store the response when it
+    # is eligible to satisfy subsequent GET/HEAD requests for the same URI.
+    # The POST itself is always passed through to the backend.
+    def forward_and_store_post_response
+      record :pass
+      response = forward
+
+      # Mark the response as explicitly private if any of the private
+      # request headers are present and the response was not explicitly
+      # declared public.
+      if private_request? && !response.cache_control.public?
+        response.private = true
+      end
+
+      store(response) if cacheable_post_response?(response)
+
+      response
+    end
+
+    # Determine whether a POST response may be stored and used to satisfy
+    # subsequent GET/HEAD requests for the same URI. This first version is
+    # intentionally strict: the response must have a 200 status, explicit
+    # freshness information, and a Content-Location header that identifies
+    # the very same URI as the POST request, in addition to the usual
+    # cacheability rules (no-store, private, etc.).
+    def cacheable_post_response?(response)
+      return false unless response.status == 200
+      return false unless response.fresh?
+      return false unless response.cacheable?
+      content_location_matches_request?(response)
+    end
+
+    # Determine whether the response's Content-Location header identifies
+    # the same URI as the current request. A Content-Location that merely
+    # shares the origin but points at a different path (or otherwise
+    # resolves to a different URI) does not match.
+    def content_location_matches_request?(response)
+      location = response.headers['content-location']
+      return false if location.nil? || location.empty?
+      request_uri = URI.parse(@request.url)
+      URI.join(request_uri.to_s, location) == request_uri
+    rescue URI::Error
+      false
     end
 
     # Try to serve the response from cache. When a matching cache entry is

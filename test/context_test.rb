@@ -900,6 +900,261 @@ describe Rack::Cache::Context do
     cache.trace.must_include :store
   end
 
+  describe 'POST response caching (cache_post_responses)' do
+    def postable_app(post_responder)
+      respond_with do |req, res|
+        if req.request_method == 'POST'
+          post_responder.call(res)
+        else
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['from get']
+        end
+      end
+    end
+
+    def cacheable_post_response(res)
+      res.status = 200
+      res['cache-control'] = 'public, max-age=500'
+      res['content-location'] = 'http://example.org/'
+      res.body = ['created']
+    end
+
+    it 'does not store POST responses by default' do
+      postable_app(method(:cacheable_post_response))
+
+      post '/'
+      assert app.called?
+      assert response.ok?
+      cache.trace.must_include :invalidate
+      cache.trace.must_include :pass
+      cache.trace.wont_include :store
+
+      get '/'
+      assert app.called?
+      cache.trace.must_include :miss
+    end
+
+    describe 'with the option enabled' do
+      before do
+        cache_config { |cache| cache.set :cache_post_responses, true }
+      end
+
+      it 'stores an eligible POST response and serves subsequent GET from cache' do
+        postable_app(method(:cacheable_post_response))
+
+        post '/'
+        assert app.called?
+        assert response.ok?
+        response.body.must_equal 'created'
+        cache.trace.must_include :invalidate
+        cache.trace.must_include :pass
+        cache.trace.must_include :store
+
+        get '/'
+        refute app.called?
+        assert response.ok?
+        response.body.must_equal 'created'
+        cache.trace.must_include :fresh
+      end
+
+      it 'stores a POST response with a relative Content-Location identifying the request URI' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = '/'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.must_include :store
+
+        get '/'
+        refute app.called?
+        response.body.must_equal 'created'
+        cache.trace.must_include :fresh
+      end
+
+      it 'serves subsequent HEAD requests from a stored POST response' do
+        postable_app(method(:cacheable_post_response))
+
+        post '/'
+        assert response.ok?
+        cache.trace.must_include :store
+
+        head '/'
+        refute app.called?
+        assert response.ok?
+        response.body.must_equal ''
+        cache.trace.must_include :fresh
+      end
+
+      it 'always forwards POST requests and does not publish a failed follow-up POST' do
+        post_count = 0
+        postable_app(lambda { |res|
+          post_count += 1
+          if post_count == 1
+            res.status = 200
+            res['cache-control'] = 'public, max-age=500'
+            res['content-location'] = 'http://example.org/'
+            res.body = ['created']
+          else
+            res.status = 500
+            res.headers.delete('cache-control')
+            res.body = ['boom']
+          end
+        })
+
+        post '/'
+        assert app.called?
+        assert response.ok?
+        cache.trace.must_include :store
+
+        get '/'
+        refute app.called?
+        response.body.must_equal 'created'
+        cache.trace.must_include :fresh
+
+        # the second POST fails upstream; it must still reach the backend
+        post '/'
+        assert app.called?
+        response.status.must_equal 500
+        response.body.must_equal 'boom'
+        cache.trace.must_include :invalidate
+        cache.trace.must_include :pass
+        cache.trace.wont_include :store
+
+        # the previously published representation was invalidated before the
+        # failed POST, so the next GET must go back to the origin
+        get '/'
+        assert app.called?
+        assert response.ok?
+        response.body.must_equal 'from get'
+        cache.trace.must_include :stale
+        cache.trace.wont_include :fresh
+      end
+
+      it 'does not store a POST response without a Content-Location header' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a POST response whose Content-Location is a different path on the same origin' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/other'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a POST response without explicit freshness' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['content-location'] = 'http://example.org/'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a non-200 POST response' do
+        postable_app(lambda { |res|
+          res.status = 201
+          res['cache-control'] = 'public, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['created']
+        })
+
+        post '/'
+        response.status.must_equal 201
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a POST response marked no-store' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'no-store, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a POST response marked private' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'private, max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['created']
+        })
+
+        post '/'
+        assert response.ok?
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+
+      it 'does not store a POST response to an authorized request unless explicitly public' do
+        postable_app(lambda { |res|
+          res.status = 200
+          res['cache-control'] = 'max-age=500'
+          res['content-location'] = 'http://example.org/'
+          res.body = ['created']
+        })
+
+        post '/', 'HTTP_AUTHORIZATION' => 'basic foobarbaz'
+        assert response.ok?
+        response.headers['cache-control'].must_include 'private'
+        cache.trace.wont_include :store
+
+        get '/'
+        assert app.called?
+        cache.trace.must_include :miss
+      end
+    end
+  end
+
   describe 'with responses that include a Vary header' do
     before do
       count = 0
