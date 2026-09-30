@@ -11,9 +11,10 @@ module IceCube
       true
     end
 
-    def next_time(t, _, closing_time, increment: true)
+    def next_time(t, _, closing_time, increment: true, skip_until: nil)
       unless closing_time && closing_time < t
-        time if time.to_i >= t.to_i
+        candidate = time if time.to_i >= t.to_i
+        candidate if candidate && (skip_until.nil? || candidate > skip_until)
       end
     end
 

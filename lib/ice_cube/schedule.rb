@@ -159,6 +159,17 @@ module IceCube
       enumerate_occurrences(start_time)
     end
 
+    # Emit an enumerator that can export and resume from a checkpoint
+    def occurrence_enumerator(opening_time = start_time, closing_time = nil, checkpoint: nil, spans: false)
+      OccurrenceIterator.new(
+        self,
+        opening_time,
+        closing_time,
+        checkpoint: checkpoint,
+        spans: spans
+      )
+    end
+
     # Iterate forever
     def each_occurrence(&block)
       enumerate_occurrences(start_time, &block).to_a
@@ -440,14 +451,20 @@ module IceCube
     end
 
     # Get the next time after (or including) a specific time
-    def next_time(time, closing_time)
+    def next_time(time, closing_time, after: nil)
       loop do
         # Probe all rules without consuming counts so we can pick the earliest
         # candidate, then charge counts only to rules that emitted that time.
         min_time = nil
         candidates = []
         recurrence_rules_with_implicit_start_occurrence.each do |rule|
-          candidate = rule.next_time(time, start_time, min_time || closing_time, increment: false)
+          candidate = rule.next_time(
+            time,
+            start_time,
+            min_time || closing_time,
+            increment: false,
+            skip_until: after
+          )
           next unless candidate
           candidates << [rule, candidate]
           min_time = candidate if min_time.nil? || candidate < min_time
@@ -455,10 +472,21 @@ module IceCube
           next
         end
         break unless min_time
+
         candidates.each do |rule, candidate|
-          rule.increment_uses if candidate == min_time && rule.respond_to?(:increment_uses)
+          emitted = after.nil? || min_time > after
+          rule.increment_uses if emitted && candidate == min_time && rule.respond_to?(:increment_uses)
         end
-        next (time = min_time + 1) if exception_time?(min_time)
+        exception_rules = []
+        @all_exception_rules.each do |rule|
+          exception_rules << rule if rule.on?(min_time, start_time)
+        rescue StopIteration
+          next
+        end
+        exception_rules.each do |rule|
+          rule.increment_uses if rule.respond_to?(:increment_uses)
+        end
+        next (time = min_time + 1) if exception_rules.any?
         break Occurrence.new(min_time, min_time + duration)
       end
     end

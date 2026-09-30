@@ -110,6 +110,17 @@ schedule.occurring_at?(start + 3600) # false
 schedule = IceCube::Schedule.new
 schedule.add_recurrence_rule IceCube::Rule.daily.until(Date.today + 30)
 schedule.each_occurrence { |t| puts t }
+
+# process a long sequence in batches and resume later
+enumerator = schedule.occurrence_enumerator(schedule.start_time, closing_time)
+occurrences = enumerator.take(100)
+checkpoint = enumerator.checkpoint_json
+
+# The resumed enumerator starts after the last emitted occurrence and keeps
+# COUNT usage for every rule. Checkpoints are JSON data and are invalid if the
+# schedule, boundaries, spans option, or checkpoint format change.
+resumed = IceCube::OccurrenceIterator.resume(schedule, checkpoint)
+more_occurrences = resumed.take(100)
 ```
 
 The reason that schedules have durations and not individual rules, is to

@@ -12,6 +12,9 @@ module IceCube
     def reset
     end
 
+    def restore_state(*)
+    end
+
     # Is this a terminating schedule?
     def terminating?
       until_time || occurrence_count
@@ -54,7 +57,7 @@ module IceCube
       raise MethodNotImplemented, "Expected to be overridden by subclasses"
     end
 
-    def next_time(time, schedule, closing_time, increment: true)
+    def next_time(time, schedule, closing_time, increment: true, skip_until: nil)
     end
 
     def on?(time, schedule)

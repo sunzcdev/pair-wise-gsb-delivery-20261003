@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [UNRELEASED]
 ### Added
 - Support for BYSETPOS with all rule frequencies (yearly, monthly, weekly, daily, hourly, minutely, secondly). ([#449](https://github.com/ice-cube-ruby/ice_cube/pull/449)) by [@nehresma](https://github.com/nehresma) and [@NicolasMarlier](https://github.com/NicolasMarlier)
+- Resumable occurrence iterators with JSON-safe checkpoints, per-rule COUNT state, schedule fingerprints, and boundary/format validation.
 
 ### Changed
 - Updated CI test matrix to support Rails 7.2, 8.0, 8.1 and Ruby 3.2, 3.3, 3.4, 4.0. ([#565](https://github.com/ice-cube-ruby/ice_cube/pull/565)) by [@nehresma](https://github.com/nehresma) and [@pacso](https://github.com/pacso)

@@ -37,6 +37,12 @@ module IceCube
       @uses = 0
     end
 
+    def restore_state(uses, next_time, schedule_start_time)
+      @uses = uses
+      @start_time = realign(schedule_start_time, schedule_start_time)
+      @time = next_time
+    end
+
     def base_interval_validation
       @validations[:interval].first
     end
@@ -48,11 +54,30 @@ module IceCube
     # Compute the next time after (or including) the specified time in respect
     # to the given start time
     # When increment is false, callers are probing for the next candidate and
-    # must not consume COUNT.
-    def next_time(time, start_time, closing_time, increment: true)
+    # must not consume COUNT. skip_until lets a resumed count rule preserve
+    # interval alignment while looking past already-emitted candidates.
+    def next_time(time, start_time, closing_time, increment: true, skip_until: nil)
       @time = time
-      @start_time ||= realign(time, start_time)
+      anchor_time = skip_until ? start_time : time
+      @start_time ||= realign(anchor_time, start_time)
       @time = @start_time if @time < @start_time
+
+      if skip_until
+        @probing_past = true
+        begin
+          loop do
+            return nil unless find_acceptable_time_before(closing_time)
+            break if @time > skip_until
+
+            @time += 1
+          end
+        ensure
+          @probing_past = false
+        end
+
+        return nil if occurrence_count && @uses >= occurrence_count
+        return @time unless increment
+      end
 
       return nil unless find_acceptable_time_before(closing_time)
 
@@ -181,7 +206,8 @@ module IceCube
     end
 
     def validation_names
-      VALIDATION_ORDER & @validations.keys
+      names = VALIDATION_ORDER & @validations.keys
+      @probing_past ? names - [:count] : names
     end
 
     def verify_alignment(value, freq, rule_part)
