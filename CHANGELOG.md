@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+- add `Addressable::URI::MountMap`, a bidirectional mapping between internal
+  absolute URIs and public gateway addresses. Mounts match on the full origin
+  plus path-segment-aligned prefixes (longest match wins), preserve the
+  remaining path, query and fragment, normalize default ports and percent
+  encoding, and never carry userinfo across. Ambiguous configurations (the
+  same public prefix served by two internal addresses, or nested mounts whose
+  public/internal layout does not mirror each other) raise
+  `AmbiguousMountError` at configuration time.
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)
