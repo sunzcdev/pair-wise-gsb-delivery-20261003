@@ -39,6 +39,10 @@ class CSV
     class UnexpectedError < StandardError
     end
 
+    # Matches every remaining byte, used to attach the unconfirmable tail
+    # of an unclosed quoted field to an unrecoverable isolation event.
+    REMAINING_PATTERN = /.*\z/m
+
     #
     # CSV::Scanner receives a CSV output, scans it and return the content.
     # It also controls the life cycle of the object with its methods +keep_start+,
@@ -401,6 +405,10 @@ class CSV
       @liberal_parsing
     end
 
+    def isolate_errors?
+      @isolate_errors
+    end
+
     def lineno
       @lineno
     end
@@ -422,7 +430,14 @@ class CSV
 
       begin
         @scanner ||= build_scanner
-        __send__(@parse_method, &block)
+        @parse_block = block
+        if @isolate_errors
+          catch(:stop_isolated_parsing) do
+            __send__(@parse_method, &block)
+          end
+        else
+          __send__(@parse_method, &block)
+        end
       rescue InvalidEncoding
         if @scanner
           ignore_broken_line
@@ -487,6 +502,7 @@ class CSV
         @liberal_parsing = false
         @backslash_quote = false
       end
+      @isolate_errors = @options[:isolate_errors]
       @unconverted_fields = @options[:unconverted_fields]
       @max_field_size = @options[:max_field_size]
       @skip_blanks = @options[:skip_blanks]
@@ -758,11 +774,27 @@ class CSV
       @lineno = 0
       @last_line = nil
       @scanner = nil
+      # Record isolation bookkeeping: number of source bytes already
+      # attributed to fully handled records, whether the current record
+      # keep is on the scanner's keep stack, and the byte offset at which
+      # the current record started.
+      @consumed_bytes = 0
+      @row_keep_active = false
+      @record_start_byte = 0
+      @malformed_continuation = nil
+      @parse_block = nil
     end
 
     def last_line
       if @scanner
-        @last_line ||= @scanner.keep_end
+        @last_line ||=
+          if @isolate_errors and @row_keep_active
+            # Ending and measuring the current row keep here must also
+            # account its bytes, otherwise later byte ranges drift.
+            pop_row_keep
+          else
+            @scanner.keep_end
+          end
       else
         @last_line
       end
@@ -919,7 +951,14 @@ class CSV
         line << @row_separator if parse_row_end
         if skip_line?(line)
           @lineno += 1
-          @scanner.keep_drop
+          if @isolate_errors
+            keep = @scanner.keep_end
+            # A skipped line between records (not nested inside the
+            # current record keep) advances the source offset.
+            @consumed_bytes += keep.bytesize unless @row_keep_active
+          else
+            @scanner.keep_drop
+          end
         else
           @scanner.keep_back
           return
@@ -978,10 +1017,16 @@ class CSV
 
     def parse_quotable_loose(&block)
       @scanner.keep_start
+      @row_keep_active = true if @isolate_errors
       @scanner.each_line(@row_separator) do |line|
         if @skip_lines and skip_line?(line)
-          @scanner.keep_drop
+          if @isolate_errors
+            drop_row_keep
+          else
+            @scanner.keep_drop
+          end
           @scanner.keep_start
+          @row_keep_active = true if @isolate_errors
           next
         end
         original_line = line
@@ -989,14 +1034,20 @@ class CSV
 
         if line.empty?
           if @skip_blanks
-            @scanner.keep_drop
+            if @isolate_errors
+              drop_row_keep
+            else
+              @scanner.keep_drop
+            end
             @scanner.keep_start
+            @row_keep_active = true if @isolate_errors
             next
           end
           row = []
           quoted_fields = FieldsConverter::NO_QUOTED_FIELDS
         elsif line.include?(@cr) or line.include?(@lf)
           @scanner.keep_back
+          @row_keep_active = false if @isolate_errors
           @parse_method = :parse_quotable_robust
           return parse_quotable_robust(&block)
         else
@@ -1021,6 +1072,7 @@ class CSV
                 row[i] = column[1..-2]
               else
                 @scanner.keep_back
+                @row_keep_active = false if @isolate_errors
                 @parse_method = :parse_quotable_robust
                 return parse_quotable_robust(&block)
               end
@@ -1029,12 +1081,21 @@ class CSV
             i += 1
           end
         end
-        @scanner.keep_drop
+        if @isolate_errors
+          drop_row_keep
+        else
+          @scanner.keep_drop
+        end
         @scanner.keep_start
+        @row_keep_active = true if @isolate_errors
         @last_line = original_line
         emit_row(row, quoted_fields, &block)
       end
-      @scanner.keep_drop
+      if @isolate_errors
+        drop_row_keep
+      else
+        @scanner.keep_drop
+      end
     end
 
     def parse_quotable_robust(&block)
@@ -1046,7 +1107,13 @@ class CSV
         @quoted_column_value = false
         @unquoted_column_value = false
         @scanner.scan_all(@strip_value) if @strip_value
+        @malformed_continuation = nil
         value = parse_column_value
+        if @malformed_continuation == :stop
+          # An unclosed quoted field was isolated from inside the column
+          # parser; nothing beyond it can be recovered.
+          throw :stop_isolated_parsing
+        end
         if value
           @scanner.scan_all(@strip_value) if @strip_value
           validate_field_size(value)
@@ -1073,6 +1140,7 @@ class CSV
           emit_row(row, quoted_fields, &block)
           break
         else
+          message = nil
           if @quoted_column_value
             if liberal_parsing? and (new_line = @scanner.check(@line_end))
               message =
@@ -1081,28 +1149,26 @@ class CSV
             else
               message = "Any value after quoted field isn't allowed"
             end
-            ignore_broken_line
-            raise MalformedCSVError.new(message, @lineno)
           elsif @unquoted_column_value and
                 (new_line = @scanner.scan(@line_end))
-            ignore_broken_line
             message = "Unquoted fields do not allow new line " +
                       "<#{new_line.inspect}>"
-            raise MalformedCSVError.new(message, @lineno)
           elsif @scanner.rest.start_with?(@quote_character)
-            ignore_broken_line
             message = "Illegal quoting"
-            raise MalformedCSVError.new(message, @lineno)
           elsif (new_line = @scanner.scan(@line_end))
-            ignore_broken_line
             message = "New line must be <#{@row_separator.inspect}> " +
                       "not <#{new_line.inspect}>"
-            raise MalformedCSVError.new(message, @lineno)
           else
-            ignore_broken_line
-            raise MalformedCSVError.new("TODO: Meaningful message",
-                                        @lineno)
+            message = "TODO: Meaningful message"
           end
+          # In strict mode this raises; in isolation mode it emits a
+          # recoverable event and returns (after confirming the next
+          # record boundary).
+          handle_malformed(message, false)
+          row = []
+          quoted_fields.clear
+          skip_needless_lines
+          start_row
         end
       end
     end
@@ -1191,9 +1257,8 @@ class CSV
 
           quotes = @scanner.scan_all(@quotes)
           unless quotes
-            ignore_broken_line
-            message = "Unclosed quoted field"
-            raise MalformedCSVError.new(message, @lineno)
+            handle_malformed("Unclosed quoted field", true)
+            return nil
           end
           n_quotes = quotes.size
           if n_quotes == 1
@@ -1258,13 +1323,120 @@ class CSV
       @lineno += 1
     end
 
+    #
+    # End the record keep of the previous record, attributing its exact
+    # byte span to the consumed-byte counter.  Used by the robust parser
+    # when <tt>isolate_errors?</tt> is enabled.
+    #
+    def pop_row_keep
+      keep = @row_keep_active ? @scanner.keep_end : "".b.force_encoding(@encoding)
+      @row_keep_active = false
+      @consumed_bytes += keep.bytesize
+      keep
+    end
+
+    # Like #pop_row_keep but the popped bytes are discarded (they are not
+    # the current record's source).
+    def drop_row_keep
+      pop_row_keep
+    end
+
     def start_row
-      if @last_line
-        @last_line = nil
+      if @isolate_errors
+        if @last_line
+          # The previous record's keep was already consumed by #last_line
+          # (and its bytes accounted there); just clear the cached line.
+          @last_line = nil
+        else
+          pop_row_keep
+        end
+        @record_start_byte = @consumed_bytes
+        @scanner.keep_start
+        @row_keep_active = true
       else
-        @scanner.keep_drop
+        if @last_line
+          @last_line = nil
+        else
+          @scanner.keep_drop
+        end
+        @scanner.keep_start
       end
-      @scanner.keep_start
+    end
+
+    #
+    # Central handler for malformed input.
+    #
+    # In strict mode (the default) it preserves the historical behavior:
+    # discard the rest of the physical line and raise
+    # CSV::MalformedCSVError.
+    #
+    # In record-isolation mode (<tt>isolate_errors: true</tt>) it emits a
+    # CSV::MalformedRecord event instead of raising.  Recovery only moves
+    # past boundaries the parser state can confirm:
+    #
+    # * When +unclosed_quote+ is true a quoted field was never terminated,
+    #   so every following byte may belong to it; no boundary beyond it is
+    #   confirmable.  The remainder of the source is attached to the event,
+    #   it is reported as unrecoverable and parsing stops.
+    # * Otherwise the scanner is known to be outside of any quoted field,
+    #   which makes the next row separator a confirmed boundary.  The bad
+    #   record (up to and including that separator) is isolated and parsing
+    #   resumes at the following record.
+    #
+    # Events are delivered to the block stored by #parse, which lets the
+    # check run even from nested helpers such as #parse_column_value.
+    #
+    def handle_malformed(message, unclosed_quote)
+      unless @isolate_errors
+        ignore_broken_line
+        raise MalformedCSVError.new(message, @lineno)
+      end
+
+      start_byte = @record_start_byte
+      if unclosed_quote
+        # No boundary beyond an unterminated quoted field can be proven.
+        raw = pop_row_keep
+        remainder = @scanner.scan_all(REMAINING_PATTERN)
+        remainder ||= "".b.force_encoding(@encoding)
+        unless remainder.empty?
+          raw = (raw + remainder)
+          @consumed_bytes += remainder.bytesize
+        end
+        line_number = @lineno + 1
+        event = MalformedRecord.new(line_number,
+                                    start_byte...(start_byte + raw.bytesize),
+                                    raw,
+                                    message,
+                                    false)
+        @parse_block.call(event)
+        # Signals the column-value caller (which is nested inside the
+        # robust loop) to unwind; the loop then throws up to #parse.
+        @malformed_continuation = :stop
+      else
+        raw = isolate_current_record
+        line_number = @lineno + 1
+        @lineno += 1
+        event = MalformedRecord.new(line_number,
+                                    start_byte...(start_byte + raw.bytesize),
+                                    raw,
+                                    message,
+                                    true)
+        @parse_block.call(event)
+      end
+    end
+
+    # Consume and return the exact bytes of the current record, up to and
+    # including the first row separator that is confirmed while not inside
+    # a quoted field.
+    def isolate_current_record
+      raw = pop_row_keep
+      rest_of_line = @scanner.scan_all(@not_line_end)
+      rest_of_line ||= "".b.force_encoding(@encoding)
+      line_ending = @scanner.scan_all(@line_end)
+      line_ending ||= "".b.force_encoding(@encoding)
+      raw = raw + rest_of_line + line_ending
+      @consumed_bytes += rest_of_line.bytesize + line_ending.bytesize
+      raw
     end
 
     def emit_row(row, quoted_fields=FieldsConverter::NO_QUOTED_FIELDS, &block)

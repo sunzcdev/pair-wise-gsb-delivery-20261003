@@ -329,6 +329,7 @@ require_relative "csv/writer"
 #     skip_blanks:        false,
 #     skip_lines:         nil,
 #     liberal_parsing:    false,
+#     isolate_errors:     false,
 #     nil_value:          nil,
 #     empty_value:        "",
 #     strip:              false,
@@ -363,6 +364,9 @@ require_relative "csv/writer"
 #   then an +ArgumentError+ exception will be raised.
 # - +liberal_parsing+: Specifies whether \CSV should attempt to parse
 #   non-compliant data.
+# - +isolate_errors+: Specifies whether malformed records are to be
+#   isolated and reported as CSV::MalformedRecord events instead of
+#   stopping the whole parse.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
 #
@@ -391,6 +395,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/parsing/strip.rdoc
 #
 # :include: ../doc/csv/options/parsing/liberal_parsing.rdoc
+#
+# :include: ../doc/csv/options/parsing/isolate_errors.rdoc
 #
 # :include: ../doc/csv/options/parsing/nil_value.rdoc
 #
@@ -868,6 +874,89 @@ class CSV
   end
 
   #
+  # A CSV::MalformedRecord is yielded (instead of raising) when parsing
+  # with <tt>isolate_errors: true</tt> and the parser encounters a record
+  # that cannot be parsed under the current (strict) grammar.
+  #
+  # It is a record-isolation event, not a parsed row: it is yielded in the
+  # same position the record would have occupied, followed by any records
+  # that could still be recovered afterwards.
+  #
+  # Attributes:
+  #
+  # <b><tt>line_number</tt></b> (alias <tt>lineno</tt>)::
+  #   The 1-based record number of the malformed record, counted
+  #   continuously with successfully recovered records (a multiline
+  #   quoted field still counts as a single record).
+  # <b><tt>byte_range</tt></b>::
+  #   The half-open byte +Range+ (<tt>start_byte...end_byte</tt>) the
+  #   malformed record occupied in the source, counting from byte 0.
+  #   It is based solely on byte boundaries the parser could confirm,
+  #   never on a newline inside an open quoted field.
+  # <b><tt>raw</tt></b>::
+  #   The original bytes of the malformed record, exactly as they
+  #   appeared in the source (including the row separator, when present).
+  # <b><tt>reason</tt></b>::
+  #   A human-readable String describing why the record was rejected.
+  # <b><tt>recoverable?</tt></b>::
+  #   +true+ when the parser confirmed a record boundary past the bad
+  #   record and continued; +false+ when no further boundary could be
+  #   confirmed (for example an unclosed quoted field). An
+  #   unrecoverable event is always the final thing yielded.
+  #
+  # Use +kind_of?+ (or +is_a?+) to tell these events apart from normal
+  # rows yielded by the same iteration:
+  #
+  #   CSV.foreach("suppliers.csv", isolate_errors: true) do |record|
+  #     if record.kind_of?(CSV::MalformedRecord)
+  #       warn "bad record ##{record.lineno} " \
+  #            "(bytes #{record.byte_range}): #{record.reason}"
+  #     else
+  #       import(record)
+  #     end
+  #   end
+  #
+  class MalformedRecord
+    # Creates a new isolation event.
+    def initialize(line_number, byte_range, raw, reason, recoverable)
+      @line_number = line_number
+      @byte_range = byte_range
+      @raw = raw
+      @reason = reason
+      @recoverable = recoverable
+    end
+
+    # The 1-based record number of the malformed record.
+    attr_reader :line_number
+    alias_method :lineno, :line_number
+
+    # The half-open byte Range of the malformed record in the source.
+    attr_reader :byte_range
+
+    # The original bytes of the malformed record.
+    attr_reader :raw
+
+    # A String describing why the record was rejected.
+    attr_reader :reason
+
+    # Returns +true+ if parsing continued past this record.
+    def recoverable?
+      @recoverable
+    end
+
+    # Returns +false+: this is an isolation event rather than a parsed row.
+    def valid?
+      false
+    end
+
+    def inspect
+      "#<#{self.class.name} line_number: #{line_number} " \
+        "byte_range: #{byte_range.inspect} " \
+        "recoverable: #{recoverable?} reason: #{reason.inspect}>"
+    end
+  end
+
+  #
   # A FieldInfo Struct contains details about a field's position in the data
   # source it was read from.  CSV will pass this Struct to some blocks that make
   # decisions based on field structure.  See CSV.convert_fields() for an
@@ -967,6 +1056,7 @@ class CSV
     skip_blanks:        false,
     skip_lines:         nil,
     liberal_parsing:    false,
+    isolate_errors:     false,
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
@@ -2047,6 +2137,7 @@ class CSV
                  force_quotes: false,
                  skip_lines: nil,
                  liberal_parsing: false,
+                 isolate_errors: false,
                  internal_encoding: nil,
                  external_encoding: nil,
                  encoding: nil,
@@ -2104,6 +2195,7 @@ class CSV
       skip_blanks: skip_blanks,
       skip_lines: skip_lines,
       liberal_parsing: liberal_parsing,
+      isolate_errors: isolate_errors,
       encoding: @encoding,
       nil_value: nil_value,
       empty_value: empty_value,
@@ -2314,6 +2406,16 @@ class CSV
   #   CSV.new('').liberal_parsing? # => false
   def liberal_parsing?
     parser.liberal_parsing?
+  end
+
+  # :call-seq:
+  #   csv.isolate_errors? -> true or false
+  #
+  # Returns whether malformed records are isolated into
+  # CSV::MalformedRecord events instead of raising an exception;
+  # see option +isolate_errors+.
+  def isolate_errors?
+    parser.isolate_errors?
   end
 
   # :call-seq:

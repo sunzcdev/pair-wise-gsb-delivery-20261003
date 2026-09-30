@@ -1,0 +1,47 @@
+====== Option +isolate_errors+
+
+Specifies the boolean value that determines whether malformed records
+are isolated and reported as events instead of raising
+CSV::MalformedCSVError and aborting the whole parse.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:isolate_errors) # => false
+
+When +false+ (the default, strict mode), the first malformed record
+raises CSV::MalformedCSVError.
+
+When +true+, valid records are yielded as usual and each malformed
+record is yielded as a CSV::MalformedRecord, in the position the record
+would have occupied.  Each event carries the 1-based record number,
+the half-open source byte range, the exact original bytes, and the
+failure reason.
+
+  data = "good,1\n" + "bad,\"q\"z\n" + "good,2\n"
+  CSV.parse(data, isolate_errors: true) do |record|
+    if record.is_a?(CSV::MalformedRecord)
+      p record.lineno       # => 2
+      p record.byte_range   # => 7...16
+      p record.raw          # => "bad,\"q\"z\n"
+      p record.reason       # => "Any value after quoted field isn't allowed"
+    else
+      p record
+    end
+  end
+
+Recovery only uses record boundaries the parser state can confirm.
+A field whose quote is never closed can swallow every following byte,
+so no safe boundary exists; that event is reported with
+<tt>recoverable?</tt> +false+ and parsing stops without returning any
+later data:
+
+  data = "good,1\n" + "oops,\"never closed\n" + "good,2\n"
+  CSV.parse(data, isolate_errors: true) do |record|
+    # The second yielded object is a CSV::MalformedRecord with
+    # recoverable? == false; "good,2" is not yielded because its
+    # record boundary cannot be confirmed.
+  end
+
+This option does not relax parsing: input that +liberal_parsing+
+accepts but strict mode rejects is still raised (or isolated) in the
+same way.  Tolerant results produced by +liberal_parsing+ are always
+yielded as normal records, never as CSV::MalformedRecord events.
