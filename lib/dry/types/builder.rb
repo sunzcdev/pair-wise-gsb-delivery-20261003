@@ -145,14 +145,17 @@ module Dry
       # Define a constructor for the type
       #
       # @param [#call,nil] constructor
+      # @param [Boolean] context whether the constructor receives the
+      #                          current call context (see CallContext)
+      #                          as its second argument
       # @param [Hash] options
       # @param [#call,nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def constructor(constructor = nil, **options, &block)
-        constructor_type[with(**options), fn: constructor || block]
+      def constructor(constructor = nil, context: false, **options, &block)
+        constructor_type[with(**options), fn: constructor || block, context: context]
       end
       alias_method :append, :constructor
       alias_method :prepend, :constructor

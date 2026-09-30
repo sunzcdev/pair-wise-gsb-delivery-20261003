@@ -128,12 +128,38 @@ module Dry
           def arity = 2
         end
 
+        # Coercion function explicitly declared to receive the current
+        # call context (see CallContext) as its second argument
+        #
+        # @api private
+        class WithContext < Function
+          # @return [Object]
+          def call(input, &)
+            @fn.(input, CallContext.current, &)
+          rescue ::NoMethodError, ::TypeError, ::ArgumentError => exception
+            CoercionError.handle(exception, &)
+          end
+
+          # @return [true]
+          def context? = true
+        end
+
         # Choose or build specialized invokation code for a callable
         #
         # @param [#call] fn
+        # @param [Boolean] context whether fn receives the call context
+        #                          as its second argument
         # @return [Function]
-        def self.[](fn)
+        def self.[](fn, context: false)
           raise ::ArgumentError, "Missing constructor block" if fn.nil?
+
+          if context
+            if fn.is_a?(Function)
+              raise ::ArgumentError, "Cannot attach call context to an already built Function"
+            end
+
+            return WithContext.new(fn)
+          end
 
           if fn.is_a?(Function)
             fn
@@ -176,6 +202,9 @@ module Dry
         def arity = 1
 
         def wrapper? = arity.equal?(2)
+
+        # @return [Boolean]
+        def context? = false
 
         # @return [Array]
         def to_ast

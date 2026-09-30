@@ -22,9 +22,9 @@ module Dry
       # @param [#call, nil] block
       #
       # @api public
-      def self.new(input, fn: Undefined, **options, &block)
+      def self.new(input, fn: Undefined, context: false, **options, &block)
         type = input.is_a?(Builder) ? input : Nominal.new(input)
-        super(type, **options, fn: Function[Undefined.default(fn, block)])
+        super(type, **options, fn: Function[Undefined.default(fn, block), context: context])
       end
 
       # @param [Builder, Object] input
@@ -32,8 +32,8 @@ module Dry
       # @param [#call, nil] block
       #
       # @api public
-      def self.[](type, fn:, **options)
-        function = Function[fn]
+      def self.[](type, fn:, context: false, **options)
+        function = Function[fn, context: context]
 
         if function.wrapper?
           wrapper_type.new(type, fn: function, **options)
@@ -98,14 +98,16 @@ module Dry
       # Build a new constructor by appending a block to the coercion function
       #
       # @param [#call, nil] new_fn
+      # @param [Boolean] context whether new_fn receives the call context
+      #                          as its second argument
       # @param [Hash] options
       # @param [#call, nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def constructor(new_fn = nil, **options, &block)
-        next_fn = Function[new_fn || block]
+      def constructor(new_fn = nil, context: false, **options, &block)
+        next_fn = Function[new_fn || block, context: context]
 
         if next_fn.wrapper?
           self.class.wrapper_type.new(with(**options), fn: next_fn)
@@ -131,14 +133,16 @@ module Dry
       # Build a new constructor by prepending a block to the coercion function
       #
       # @param [#call, nil] new_fn
+      # @param [Boolean] context whether new_fn receives the call context
+      #                          as its second argument
       # @param [Hash] options
       # @param [#call, nil] block
       #
       # @return [Constructor]
       #
       # @api public
-      def prepend(new_fn = nil, **options, &block)
-        with(**options, fn: fn << (new_fn || block))
+      def prepend(new_fn = nil, context: false, **options, &block)
+        with(**options, fn: fn << Function[new_fn || block, context: context])
       end
       alias_method :<<, :prepend
 

@@ -48,6 +48,24 @@ module Dry
         end
       end
       alias_method :[], :call
+
+      # Apply type to a value carrying a per-call context
+      #
+      # The context is visible to constructors declared with
+      # `context: true` (see {Builder#constructor}) for the duration of
+      # this call only. It propagates through nested schemas, arrays,
+      # defaults and sum branches without being stored on any type
+      # instance, and it is isolated between threads and fibers.
+      #
+      # @param [Object] input
+      # @param [Object] context
+      #
+      # @return [Object]
+      #
+      # @api public
+      def call_with_context(input = Undefined, context: nil, &block)
+        CallContext.with(context) { call(input, &block) }
+      end
     end
   end
 end
