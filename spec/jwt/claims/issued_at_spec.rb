@@ -124,4 +124,47 @@ RSpec.describe JWT::Claims::IssuedAt do
       verify!
     end
   end
+
+  describe 'injected observation time' do
+    let(:now) { 1_609_459_200.5 }
+    let(:options) { {} }
+
+    subject(:verify!) { described_class.new(**options).verify!(context: SpecSupport::Token.new(payload: payload), now: now) }
+
+    context 'when iat is exactly now with a fractional NumericDate' do
+      let(:payload) { { 'iat' => 1_609_459_200.5 } }
+
+      it 'passes validation' do
+        verify!
+      end
+    end
+
+    context 'when iat is at the leeway boundary' do
+      let(:payload) { { 'iat' => 1_609_459_200.75 } }
+      let(:options) { { leeway: 0.25 } }
+
+      it 'passes validation' do
+        verify!
+      end
+    end
+
+    context 'when iat is just past the leeway boundary' do
+      let(:payload) { { 'iat' => 1_609_459_200.76 } }
+      let(:options) { { leeway: 0.25 } }
+
+      it 'fails validation' do
+        expect { verify! }.to raise_error(JWT::InvalidIatError)
+      end
+    end
+
+    context 'when now is given as a Time' do
+      let(:payload) { { 'iat' => 1_609_459_200.5 } }
+
+      subject(:verify!) { described_class.new.verify!(context: SpecSupport::Token.new(payload: payload), now: Time.at(now)) }
+
+      it 'passes validation' do
+        verify!
+      end
+    end
+  end
 end

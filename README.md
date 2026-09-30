@@ -556,6 +556,76 @@ By default, `iat` verification allows no clock drift. To allow drift between the
 decoded_token = JWT.decode(token, hmac_secret, true, { verify_iat: { leeway: 30 }, algorithm: 'HS256' })
 ```
 
+### Time based claims and the verification clock
+
+The `iat`, `nbf` and `exp` verifications all need an observation time ("now").
+During one verification round the clock is observed exactly once and that
+single value is used by every time based check, so a token can never be
+accepted or rejected because the system clock moved between two reads.
+
+The clock can be injected with the `clock` option. It accepts a `Time`, a
+Numeric NumericDate (seconds since the epoch) or any object responding to
+`#call` that returns one of them:
+
+```ruby
+now = Time.at(1_609_459_200)
+JWT.decode(token, hmac_secret, true, { algorithm: 'HS256', clock: now })
+JWT.decode(token, hmac_secret, true, { algorithm: 'HS256', clock: -> { Time.now } })
+```
+
+The clock can also be configured globally:
+
+```ruby
+JWT.configure { |config| config.decode.clock = -> { Time.now } }
+```
+
+The standalone claim verifications and `JWT::EncodedToken` accept the same
+option:
+
+```ruby
+JWT::Claims.verify_payload!(payload, :exp, :nbf, :iat, clock: -> { Time.now })
+encoded_token.verify_claims!(:exp, :nbf, :iat, clock: -> { Time.now })
+```
+
+Leeway is applied to the comparisons against that single observation time:
+
+- `exp` is valid when `exp > now - exp_leeway` (an `exp` equal to `now` is already expired)
+- `nbf` is valid when `nbf <= now + nbf_leeway`
+- `iat` is valid when `iat <= now + iat_leeway`
+
+Fractional NumericDate values are compared with their full precision.
+
+#### Maximum token lifetime
+
+The maximum accepted age of a token, measured from its `iat` claim to the
+observation time, can be set with `max_token_age` (seconds). The boundary
+itself is accepted:
+
+```ruby
+JWT.decode(token, hmac_secret, true, { algorithm: 'HS256', max_token_age: 3600 })
+```
+
+The same limit is available through the standalone verifier, where the
+leeway extends the accepted lifetime:
+
+```ruby
+JWT::Claims.verify_payload!(payload, chronology: { max_age: 3600, leeway: 5 }, clock: -> { Time.now })
+```
+
+#### Order of `iat`, `nbf` and `exp`
+
+Enable `verify_chronology` to require that the time claims are in a sensible
+order: `iat <= nbf <= exp` (equality is allowed). An inversion is tolerated
+only while it is within the leeway (`chronology_leeway`, falling back to the
+global `leeway`); leeway can never make a genuinely reversed order valid.
+
+```ruby
+JWT.decode(token, hmac_secret, true,
+           { algorithm: 'HS256', verify_chronology: true, chronology_leeway: 1 })
+
+JWT::Claims.verify_payload!(payload, :chronology, chronology: { leeway: 1 })
+```
+
 ### Subject Claim
 
 From [Oauth JSON Web Token 4.1.2. "sub" (Subject) Claim](https://tools.ietf.org/html/rfc7519#section-4.1.2):

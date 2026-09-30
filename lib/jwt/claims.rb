@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require_relative 'claims/audience'
+require_relative 'claims/chronology'
+require_relative 'claims/clock'
 require_relative 'claims/crit'
 require_relative 'claims/decode_verifier'
 require_relative 'claims/expiration'

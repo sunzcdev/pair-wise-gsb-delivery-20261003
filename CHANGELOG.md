@@ -6,11 +6,12 @@
 
 **Features:**
 
-- Your contribution here
+- Support an injectable verification clock (`clock` decode option and global configuration), observed once per verification round
+- Enforce a maximum token lifetime with `max_token_age` and verify the order of the `iat`, `nbf` and `exp` claims with `verify_chronology`
 
 **Fixes and enhancements:**
 
-- Your contribution here
+- The `exp` and `nbf` checks compare fractional NumericDate values instead of truncating them to whole seconds
 
 ## [v3.3.0](https://github.com/jwt/ruby-jwt/tree/v3.3.0) (2026-09-11)
 

@@ -14,14 +14,16 @@ module JWT
       # Verifies the 'nbf' (Not Before) claim in the JWT token.
       #
       # @param context [Object] the context containing the JWT payload.
+      # @param now [Time, Numeric, nil] the single observation time of the current verification round.
       # @param _args [Hash] additional arguments (not used).
       # @raise [JWT::ImmatureSignature] if the 'nbf' claim has not been reached.
       # @return [nil]
-      def verify!(context:, **_args)
+      def verify!(context:, now: nil, **_args)
         return unless context.payload.is_a?(Hash)
         return unless context.payload.key?('nbf')
 
-        raise JWT::ImmatureSignature, 'Signature nbf has not been reached' if context.payload['nbf'].to_i > (Time.now.to_i + leeway)
+        observed_at = (now || Time.now).to_f
+        raise JWT::ImmatureSignature, 'Signature nbf has not been reached' if context.payload['nbf'].to_f > observed_at + leeway
       end
 
       private

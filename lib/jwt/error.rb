@@ -70,6 +70,14 @@ module JWT
   # The InvalidPayload class is raised when the JWT payload is invalid.
   class InvalidPayload < ClaimValidationError; end
 
+  # The InvalidChronologyError class is raised when the order of the JWT time
+  # claims ('iat', 'nbf' and 'exp') is invalid.
+  class InvalidChronologyError < ClaimValidationError; end
+
+  # The InvalidMaxAgeError class is raised when a JWT is older than the
+  # configured maximum token lifetime.
+  class InvalidMaxAgeError < ClaimValidationError; end
+
   # The MissingRequiredClaim class is raised when a required claim is missing from the JWT.
   class MissingRequiredClaim < ClaimValidationError; end
 

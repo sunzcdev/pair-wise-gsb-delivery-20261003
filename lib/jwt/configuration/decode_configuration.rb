@@ -12,6 +12,8 @@ module JWT
       #   @return [Boolean] whether to verify the issuer claim.
       # @!attribute [rw] verify_iat
       #   @return [Boolean, Hash] whether to verify the issued at claim. A hash can be given to configure the claim, currently only `leeway` is supported.
+      # @!attribute [rw] verify_chronology
+      #   @return [Boolean] whether to verify the order of the 'iat', 'nbf' and 'exp' claims.
       # @!attribute [rw] verify_jti
       #   @return [Boolean] whether to verify the JWT ID claim.
       # @!attribute [rw] verify_aud
@@ -20,6 +22,12 @@ module JWT
       #   @return [Boolean] whether to verify the subject claim.
       # @!attribute [rw] leeway
       #   @return [Integer] the leeway in seconds for time-based claims.
+      # @!attribute [rw] chronology_leeway
+      #   @return [Integer] the leeway in seconds tolerated between the 'iat', 'nbf' and 'exp' claims.
+      # @!attribute [rw] max_token_age
+      #   @return [Integer, nil] the maximum accepted age of a token in seconds, measured from 'iat' to the observation time.
+      # @!attribute [rw] clock
+      #   @return [Time, Numeric, #call, nil] the clock used when verifying time-based claims. Defaults to the system clock.
       # @!attribute [rw] algorithms
       #   @return [Array<String>] the list of acceptable algorithms.
       # @!attribute [rw] required_claims
@@ -31,10 +39,14 @@ module JWT
                     :verify_not_before,
                     :verify_iss,
                     :verify_iat,
+                    :verify_chronology,
                     :verify_jti,
                     :verify_aud,
                     :verify_sub,
                     :leeway,
+                    :chronology_leeway,
+                    :max_token_age,
+                    :clock,
                     :algorithms,
                     :required_claims,
                     :enforce_hmac_key_length
@@ -45,10 +57,14 @@ module JWT
         @verify_not_before = true
         @verify_iss = false
         @verify_iat = false
+        @verify_chronology = false
         @verify_jti = false
         @verify_aud = false
         @verify_sub = false
         @leeway = 0
+        @chronology_leeway = 0
+        @max_token_age = nil
+        @clock = nil
         @algorithms = ['HS256']
         @required_claims = []
         @enforce_hmac_key_length = false
@@ -61,10 +77,14 @@ module JWT
           verify_not_before: verify_not_before,
           verify_iss: verify_iss,
           verify_iat: verify_iat,
+          verify_chronology: verify_chronology,
           verify_jti: verify_jti,
           verify_aud: verify_aud,
           verify_sub: verify_sub,
           leeway: leeway,
+          chronology_leeway: chronology_leeway,
+          max_token_age: max_token_age,
+          clock: clock,
           algorithms: algorithms,
           required_claims: required_claims,
           enforce_hmac_key_length: enforce_hmac_key_length

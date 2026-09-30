@@ -14,14 +14,16 @@ module JWT
       # Verifies the expiration claim ('exp') in the JWT token.
       #
       # @param context [Object] the context containing the JWT payload.
+      # @param now [Time, Numeric, nil] the single observation time of the current verification round.
       # @param _args [Hash] additional arguments (not used).
       # @raise [JWT::ExpiredSignature] if the token has expired.
       # @return [nil]
-      def verify!(context:, **_args)
+      def verify!(context:, now: nil, **_args)
         return unless context.payload.is_a?(Hash)
         return unless context.payload.key?('exp')
 
-        raise JWT::ExpiredSignature, 'Signature has expired' if context.payload['exp'].to_i <= (Time.now.to_i - leeway)
+        observed_at = (now || Time.now).to_f
+        raise JWT::ExpiredSignature, 'Signature has expired' if context.payload['exp'].to_f <= observed_at - leeway
       end
 
       private
