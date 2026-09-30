@@ -5,6 +5,7 @@ require "dry/container/namespace"
 require "dry/container/registry"
 require "dry/container/resolver"
 require "dry/container/namespace_dsl"
+require "dry/container/dependency_state"
 require "dry/container/mixin"
 require "dry/container/version"
 

@@ -2,10 +2,15 @@
 - version: unreleased
   summary: 
   date: 
-  fixed: 
+  fixed:
   added:
+  - 'Add `#replace` for dependency-aware replacement of registrations: explicit
+    dependencies can be declared with `depends_on:`, replacing a key invalidates
+    memoized values of its transitive dependents while unrelated keys keep their
+    identity, resolutions racing a replacement never observe a half-old/half-new
+    set of dependencies, and a failed replacement leaves all registrations intact'
   - 'Add a warning about deprecation of the gem (via #89) (@solnic)'
-  changed: 
+  changed:
 - version: 0.11.0
   summary: 
   date: '2022-09-16'

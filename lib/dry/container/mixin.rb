@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "concurrent/hash"
+require "dry/container/dependency_state"
 
 module Dry
   class Container
@@ -97,6 +98,10 @@ module Dry
         hooks_mod = ::Module.new do
           def inherited(subclass)
             subclass.instance_variable_set(:@_container, @_container.dup)
+            subclass.instance_variable_set(
+              :@_dependency_state,
+              @_dependency_state.dup
+            )
             super
           end
         end
@@ -106,6 +111,7 @@ module Dry
           extend hooks_mod
 
           @_container = ::Concurrent::Hash.new
+          @_dependency_state = ::Dry::Container::DependencyState.new
         end
       end
 
@@ -113,6 +119,7 @@ module Dry
       module Initializer
         def initialize(*args, &block)
           @_container = ::Concurrent::Hash.new
+          @_dependency_state = ::Dry::Container::DependencyState.new
           super
         end
       end
@@ -152,7 +159,13 @@ module Dry
           item = contents
         end
 
+        key_s = key.to_s
+        options = options.dup
+
         config.registry.call(_container, key, item, options)
+
+        _dependency_state.publish_edges(key_s, Array(options[:depends_on]))
+        _dependency_state.bump(key_s)
 
         self
       rescue FrozenError
@@ -161,6 +174,11 @@ module Dry
       end
 
       # Resolve an item from the container
+      #
+      # The resolution is consistent: if one of the key's explicit
+      # dependencies is replaced while it is being constructed, the
+      # whole construction is retried, so a single resolution can never
+      # observe a half-old/half-new set of dependencies.
       #
       # @param [Mixed] key
       #   The key for the item you wish to resolve
@@ -172,7 +190,105 @@ module Dry
       #
       # @api public
       def resolve(key, &block)
-        config.resolver.call(_container, key, &block)
+        _dependency_state.resolve(self, key, &block)
+      end
+
+      # Replace a previously registered item, taking its explicit
+      # dependencies into account.
+      #
+      # Memoized values of the replaced key and of every key that
+      # (transitively) depends on it are invalidated: the next resolution
+      # rebuilds them. Keys unrelated to the replacement keep their
+      # identity. A factory already running against the old dependencies
+      # is allowed to finish, but its result is never published, and a
+      # resolution racing the replacement retries rather than observing a
+      # mix of old and new dependencies.
+      #
+      # If the replacement fails (unknown key or unknown declared
+      # dependency), all existing registrations are left untouched.
+      #
+      # @param [Mixed] key
+      #   The key to replace
+      # @param [Mixed] contents
+      #   The new item to register (if no block given)
+      # @param [Hash] options
+      #   Options for the new registration; +depends_on+ can be given to
+      #   declare which other keys this item depends on, and +memoize+
+      #   follows the same semantics as for {#register}
+      # @yield
+      #   If a block is given, contents will be ignored and the block
+      #   will be registered instead
+      #
+      # @raise [KeyError]
+      #   If no item is registered with the given key
+      # @raise [Dry::Container::Error]
+      #   If a declared dependency is not registered
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def replace(key, contents = nil, options = EMPTY_HASH, &block)
+        if block_given?
+          item = block
+          options = contents.is_a?(::Hash) ? contents.dup : {}
+        else
+          item = contents
+          options = options.dup
+        end
+
+        key_s = key.to_s
+
+        unless _container.key?(key_s)
+          raise ::Dry::Container::KeyError.new(
+            %(key not found: "#{key_s}"), key: key_s, receiver: _container
+          )
+        end
+
+        declared = options[:depends_on] ? Array(options[:depends_on]).map(&:to_s) : nil
+
+        # Validate everything before mutating anything: a failed
+        # replacement keeps the previous, working set of registrations
+        unless declared.nil?
+          unknown = declared.reject { |dep| _container.key?(dep) }
+          unless unknown.empty?
+            raise Error,
+                  "cannot replace #{key_s.inspect}: undeclared dependency key(s) " \
+                  "#{unknown.map(&:inspect).join(', ')} are not registered"
+          end
+        end
+
+        deps = declared || _dependency_state.dependencies(key_s)
+
+        # Dependency edges are container-managed metadata: keep the old
+        # ones unless the replacement explicitly declares a new set.
+        new_options = options.dup
+        new_options[:depends_on] = deps unless new_options.key?(:depends_on)
+
+        # Building the new item outside the transaction means a failing
+        # factory (e.g. memoize: true for a plain value) changes nothing
+        new_item = config.registry.factory.call(item, new_options)
+
+        _dependency_state.mutex.synchronize do
+          # Computed under the lock so two concurrent replacements cannot
+          # invalidate closures against a stale dependency graph
+          affected = _dependency_state.dependent_closure(key_s)
+
+          # Invalidate before swapping the slot: an in-flight builder of
+          # any affected key finishes, but its stale result is discarded
+          affected.each do |affected_key|
+            affected_item = _container[affected_key]
+            affected_item.invalidate! if affected_item.respond_to?(:invalidate!)
+          end
+
+          _container[key_s] = new_item
+          _dependency_state.publish_edges(key_s, deps)
+          _dependency_state.bump(key_s)
+          affected.each do |affected_key|
+            _dependency_state.bump(affected_key) unless affected_key == key_s
+          end
+        end
+
+        self
       end
 
       # Resolve an item from the container
@@ -332,10 +448,16 @@ module Dry
         @_container
       end
 
+      # @private
+      def _dependency_state
+        @_dependency_state ||= ::Dry::Container::DependencyState.new
+      end
+
       # @api public
       def dup
         copy = super
         copy.instance_variable_set(:@_container, _container.dup)
+        copy.instance_variable_set(:@_dependency_state, _dependency_state.dup)
         copy
       end
 
@@ -344,6 +466,7 @@ module Dry
         copy = super
         unless copy.frozen?
           copy.instance_variable_set(:@_container, _container.dup)
+          copy.instance_variable_set(:@_dependency_state, _dependency_state.dup)
         end
         copy
       end

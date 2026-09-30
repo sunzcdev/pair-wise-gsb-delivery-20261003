@@ -6,6 +6,37 @@ module Dry
     #
     # @api public
     class Resolver
+      # Fetch the registered item (without calling it) from the container
+      #
+      # Used by the dependency-aware resolution path so dependency
+      # versions can be pinned between lookup and invocation. A custom
+      # resolver that does not respond to this method simply opts out of
+      # that instrumentation.
+      #
+      # @param [Concurrent::Hash] container
+      #   The container
+      # @param [Mixed] key
+      #   The key for the item you wish to resolve
+      # @yield
+      #   Fallback block to call when a key is missing. Its result will be returned
+      # @yieldparam [Mixed] key Missing key
+      #
+      # @raise [KeyError]
+      #   If the given key is not registered with the container (and no block provided)
+      #
+      # @return [Dry::Container::Item, Mixed]
+      #
+      # @api public
+      def fetch(container, key)
+        container.fetch(key.to_s) do
+          if block_given?
+            return yield(key)
+          else
+            raise KeyError.new(%(key not found: "#{key}"), key: key.to_s, receiver: container)
+          end
+        end
+      end
+
       # Resolve an item from the container
       #
       # @param [Concurrent::Hash] container
@@ -24,15 +55,7 @@ module Dry
       #
       # @api public
       def call(container, key)
-        item = container.fetch(key.to_s) do
-          if block_given?
-            return yield(key)
-          else
-            raise KeyError.new(%(key not found: "#{key}"), key: key.to_s, receiver: container)
-          end
-        end
-
-        item.call
+        fetch(container, key).call
       end
 
       # Check whether an items is registered under the given key
