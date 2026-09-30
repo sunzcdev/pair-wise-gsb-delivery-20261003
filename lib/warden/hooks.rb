@@ -16,6 +16,22 @@ module Warden
       end
     end
 
+    # Runs the on_switch_user authorization callbacks for a switch and
+    # returns whether the application consents. Every callback whose
+    # conditions match must return a truthy value, and at least one callback
+    # must apply; an empty set of matching callbacks denies the switch.
+    # :api: private
+    def _switch_authorized?(*args) #:nodoc:
+      options = args.last # Last callback arg MUST be a Hash
+      matching = _on_switch_user.reject do |_callback, conditions|
+        conditions.find do |key, value|
+          value.is_a?(Array) ? !value.include?(options[key]) : (value != options[key])
+        end
+      end
+
+      !matching.empty? && matching.all? { |callback, _conditions| callback.call(*args) }
+    end
+
     # A callback hook set to run every time after a user is set.
     # This callback is triggered the first time one of those three events happens
     # during a request: :authentication, :fetch (from session) and :set_user (when manually set).
@@ -199,9 +215,106 @@ module Warden
       @_on_request ||= []
     end
 
+    # Authorization hook invoked for every +switch_user+ layer, including
+    # each nested layer. Switching is a temporary, non-persistent act on
+    # behalf of a real operator and is never an authentication, so consent
+    # cannot be inferred from the session.
+    #
+    # Every registered callback whose conditions match is invoked and each
+    # one _must_ return a truthy value for the switch to be authorized. If
+    # no callback applies, or any of them returns a falsey value,
+    # Warden::SwitchUserNotAuthorized is raised before the effective user is
+    # changed.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block which must return a truthy value to consent to the switch
+    #   Block Parameters: |operator, target_user, auth, opts|
+    #     operator    - The real authenticated user acting on behalf of target_user
+    #     target_user - The user that will become effective inside the block
+    #     auth        - The raw authentication proxy object
+    #     opts        - options passed into the switch_user call including :scope
+    #
+    # Example:
+    #   Warden::Manager.on_switch_user do |operator, target_user, auth, opts|
+    #     operator.support_agent? && target_user.active?
+    #   end
+    #
+    #   Warden::Manager.on_switch_user :scope => :admin do |operator, target_user, auth, opts|
+    #     operator.can_impersonate?(target_user)
+    #   end
+    #
+    # :api: public
+    def on_switch_user(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _on_switch_user.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for on_switch_user
+    # :api: private
+    def _on_switch_user
+      @_on_switch_user ||= []
+    end
+
+    # A callback that runs after a switch has been authorized and the target
+    # user has become the effective user for the scope, just before the
+    # switch_user block is yielded. It is distinct from after_set_user and
+    # after_authentication: a switch is never written to the session and is
+    # not a credential authentication.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block to contain logic for the callback
+    #   Block Parameters: |target_user, auth, opts|
+    #     target_user - The user now effective inside the block
+    #     auth        - The warden proxy object
+    #     opts        - options passed into the switch_user call including :scope
+    #
+    # :api: public
+    def before_switch_user(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _before_switch_user.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for before_switch_user
+    # :api: private
+    def _before_switch_user
+      @_before_switch_user ||= []
+    end
+
+    # A callback that runs once a switch_user layer has been left and the
+    # previously effective user has been restored. It always runs, even when
+    # the block raised or used a non-local return, and is distinct from
+    # before_logout: the temporary identity is discarded rather than logged
+    # out of the session.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block to contain logic for the callback
+    #   Block Parameters: |target_user, auth, opts|
+    #     target_user - The user that was effective inside the block
+    #     auth        - The warden proxy object
+    #     opts        - options passed into the switch_user call including :scope
+    #
+    # :api: public
+    def after_switch_user(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _after_switch_user.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for after_switch_user
+    # :api: private
+    def _after_switch_user
+      @_after_switch_user ||= []
+    end
+
     # Add prepend filters version
     %w(after_set_user after_authentication after_fetch on_request
-       before_failure before_logout).each do |filter|
+       before_failure before_logout
+       on_switch_user before_switch_user after_switch_user).each do |filter|
       class_eval <<-METHOD, __FILE__, __LINE__ + 1
         def prepend_#{filter}(options={}, &block)
           #{filter}(options, :unshift, &block)

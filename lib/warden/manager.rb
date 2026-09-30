@@ -52,6 +52,11 @@ module Warden
       self.class._run_callbacks(*args)
     end
 
+    # :api: private
+    def _switch_authorized?(*args) #:nodoc:
+      self.class._switch_authorized?(*args)
+    end
+
     class << self
       # Prepares the user to serialize into the session.
       # Any object that can be serialized into the session in some way can be used as a "user" object

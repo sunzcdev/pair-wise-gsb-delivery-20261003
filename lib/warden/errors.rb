@@ -1,6 +1,10 @@
 # encoding: utf-8
 # frozen_string_literal: true
 module Warden
+  # Raised when an application denies a temporary +switch_user+ request
+  # through its +on_switch_user+ authorization callbacks.
+  class SwitchUserNotAuthorized < StandardError; end
+
   class Proxy
     # Lifted from DataMapper's dm-validations plugin :)
     # @author Guy van den Berg

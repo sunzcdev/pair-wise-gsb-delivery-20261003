@@ -26,7 +26,7 @@ module Warden
     def_delegators :config, :default_strategies
 
     def initialize(env, manager) #:nodoc:
-      @env, @users, @winning_strategies, @locked = env, {}, {}, false
+      @env, @users, @switched_users, @winning_strategies, @locked = env, {}, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
     end
@@ -147,7 +147,7 @@ module Warden
     #
     # :api: public
     def authenticated?(scope = @config.default_scope)
-      result = !!user(scope)
+      result = !!real_user(scope)
       yield if block_given? && result
       result
     end
@@ -218,6 +218,9 @@ module Warden
       opts  = argument.is_a?(Hash) ? argument : { :scope => argument }
       scope = (opts[:scope] ||= @config.default_scope)
 
+      frames = @switched_users[scope]
+      return frames.last.last if frames && !frames.empty?
+
       if @users.has_key?(scope)
         @users[scope]
       else
@@ -228,6 +231,71 @@ module Warden
 
         @users[scope] = user ? set_user(user, opts.merge(:event => :fetch)) : nil
       end
+    end
+
+    # Temporarily act on behalf of another user for the duration of a block,
+    # without touching the persistent session. Inside the block +user+ returns
+    # the target user, while +real_user+ keeps returning the genuinely
+    # authenticated operator (use +switched?+ to tell them apart). Once the
+    # block finishes, raises or returns non-locally, the previous identity is
+    # restored for the scope.
+    #
+    # Every switch, including each nested switch, must be consented to by the
+    # application through +Warden::Manager.on_switch_user+ callbacks. If no
+    # callback applies, or any of them returns a falsey value,
+    # Warden::SwitchUserNotAuthorized is raised and the effective user is left
+    # untouched.
+    #
+    # Parameters:
+    #   target_user - An object setup to be serialized in and out of the session.
+    #   opts - An options hash. Use the :scope option to choose the scope.
+    #
+    # Example:
+    #   env['warden'].switch_user(customer, :scope => :user) do
+    #     env['warden'].user       #=> customer
+    #     env['warden'].real_user  #=> the signed-in support agent
+    #   end
+    #
+    # :api: public
+    def switch_user(target_user, opts = {})
+      raise ArgumentError, "switch_user requires a block" unless block_given?
+
+      scope = opts[:scope] || @config.default_scope
+      opts  = (@config[:scope_defaults][scope] || {}).merge(opts).merge(:scope => scope)
+
+      operator = user(scope)
+      unless manager._switch_authorized?(operator, target_user, self, opts)
+        raise SwitchUserNotAuthorized, "switch_user was not authorized for #{scope.inspect}"
+      end
+
+      begin
+        switched_users(scope).push([operator, target_user])
+        manager._run_callbacks(:before_switch_user, target_user, self, opts)
+        yield target_user
+      ensure
+        switched_users(scope).pop
+        manager._run_callbacks(:after_switch_user, target_user, self, opts)
+      end
+    end
+
+    # Returns true while the given scope's effective user has been set by an
+    # active +switch_user+ block rather than a real session.
+    #
+    # :api: public
+    def switched?(scope = @config.default_scope)
+      !switched_users(scope).empty?
+    end
+
+    # Returns the genuinely authenticated user for the scope, ignoring any
+    # temporary +switch_user+ layer. Equivalent to +user+ outside of a switch.
+    #
+    # :api: public
+    def real_user(argument = {})
+      opts  = argument.is_a?(Hash) ? argument : { :scope => argument }
+      scope = (opts[:scope] ||= @config.default_scope)
+
+      frames = @switched_users[scope]
+      frames && !frames.empty? ? frames.first.first : user(opts)
     end
 
     # Provides a scoped session data for authenticated users.
@@ -265,11 +333,18 @@ module Warden
     # :api: public
     def logout(*scopes)
       if scopes.empty?
-        scopes = @users.keys
+        scopes = @users.keys | @switched_users.keys
         reset_session = true
       end
 
       scopes.each do |scope|
+        if switched?(scope)
+          # Discard the temporary on-behalf layer first: it is not a real
+          # user, so no before_logout hook fires for it. Then log out the
+          # genuine operator that was being acted behind.
+          @switched_users.delete(scope)
+        end
+
         user = @users.delete(scope)
         manager._run_callbacks(:before_logout, user, self, :scope => scope)
 
@@ -328,6 +403,10 @@ module Warden
     def _perform_authentication(*args)
       scope, opts = _retrieve_scope_and_opts(args)
       user = nil
+
+      # Never run credential strategies while a temporary on-behalf user is
+      # effective: a switch must not be mistaken for an authentication.
+      return user, opts if switched?(scope)
 
       # Look for an existing user in the session for this scope.
       # If there was no user in the session, see if we can get one from the request.
@@ -389,6 +468,12 @@ module Warden
     # Updates the winning strategy for a given scope
     def _update_winning_strategy(strategy, scope)
       self.winning_strategy = @winning_strategies[scope] = strategy
+    end
+
+    # Per-scope stack of active +switch_user+ frames. Each frame is a
+    # [operator, target_user] pair, so nesting preserves the real operator.
+    def switched_users(scope)
+      @switched_users[scope] ||= []
     end
   end # Proxy
 
