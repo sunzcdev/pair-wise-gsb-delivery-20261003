@@ -1,5 +1,8 @@
 # CHANGELOG
 
+## Unreleased
+* Allow each Warden::Manager to configure its own default and scope specific session (de)serializers through the yielded Warden::Config. Class level Warden::Manager serializers remain as a fallback. Serializers are captured per request when the Warden::Proxy is built, so mounting several applications in one process no longer makes them share or mutate each other's serialization protocol.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)

@@ -29,6 +29,7 @@ module Warden
       @env, @users, @winning_strategies, @locked = env, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
+      @session_serializer_class = manager.build_session_serializer_class(@config[:serializers])
     end
 
     # Run the on_request callbacks
@@ -48,7 +49,7 @@ module Warden
     # session.
     # :api: public
     def session_serializer
-      @session_serializer ||= Warden::SessionSerializer.new(@env)
+      @session_serializer ||= @session_serializer_class.new(@env)
     end
 
     # Clear the cache of performed strategies so far. Warden runs each

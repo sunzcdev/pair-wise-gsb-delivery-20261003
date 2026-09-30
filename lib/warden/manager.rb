@@ -52,6 +52,37 @@ module Warden
       self.class._run_callbacks(*args)
     end
 
+    # Builds the SessionSerializer class used by the Proxy created for a single
+    # request. The returned class is an anonymous subclass of
+    # Warden::SessionSerializer, so defining methods on it never redefines a
+    # method another Manager (or another request) is relying on.
+    #
+    # The lookup order when storing or fetching a scope is:
+    #   1. the scope specific block configured on this Manager
+    #   2. the scope specific block configured at the class level
+    #      (Warden::Manager.serialize_into_session/:from_session with a scope)
+    #   3. the default block configured on this Manager
+    #   4. the default block configured at the class level
+    #      (Warden::Manager.serialize_into_session/:from_session)
+    #
+    # Because this class is built while the Proxy is initialized, configuring
+    # another Manager (or this one) afterwards cannot change the serialization
+    # protocol of an already created Proxy.
+    # :api: private
+    def build_session_serializer_class(serializers)
+      return Warden::SessionSerializer if serializers[:store].empty? && serializers[:fetch].empty?
+
+      Class.new(Warden::SessionSerializer) do
+        serializers[:store].each do |scope, block|
+          define_method(scope.nil? ? :serialize : "#{scope}_serialize", &block)
+        end
+
+        serializers[:fetch].each do |scope, block|
+          define_method(scope.nil? ? :deserialize : "#{scope}_deserialize", &block)
+        end
+      end
+    end
+
     class << self
       # Prepares the user to serialize into the session.
       # Any object that can be serialized into the session in some way can be used as a "user" object
@@ -59,6 +90,13 @@ module Warden
       # If possible store only a "key" of the user object that will allow you to reconstitute it.
       #
       # You can supply different methods of serialization for different scopes by passing a scope symbol
+      #
+      # These are process wide class level serializers. They are used as a
+      # fallback by every Warden::Manager that does not configure its own
+      # serializer for the default scope or the given scope. To run several
+      # independent applications in the same process, configure the
+      # serializers on the Warden::Config yielded to Warden::Manager.new
+      # instead.
       #
       # Example:
       #   Warden::Manager.serialize_into_session{ |user| user.id }
@@ -74,6 +112,13 @@ module Warden
       # Reconstitutes the user from the session.
       # Use the results of user_session_key to reconstitute the user from the session on requests after the initial login
       # You can supply different methods of de-serialization for different scopes by passing a scope symbol
+      #
+      # These are process wide class level deserializers. They are used as a
+      # fallback by every Warden::Manager that does not configure its own
+      # deserializer for the default scope or the given scope. To run several
+      # independent applications in the same process, configure the
+      # deserializers on the Warden::Config yielded to Warden::Manager.new
+      # instead.
       #
       # Example:
       #   Warden::Manager.serialize_from_session{ |id| User.get(id) }

@@ -39,6 +39,7 @@ module Warden
       self[:default_scope]      ||= :default
       self[:scope_defaults]     ||= {}
       self[:default_strategies] ||= {}
+      self[:serializers]        ||= { :store => {}, :fetch => {} }
       self[:intercept_401] = true unless key?(:intercept_401)
     end
 
@@ -46,6 +47,7 @@ module Warden
       super
       deep_dup(:scope_defaults, other)
       deep_dup(:default_strategies, other)
+      deep_dup(:serializers, other)
     end
 
     # Do not raise an error if a missing strategy is given.
@@ -90,16 +92,46 @@ module Warden
       Warden::Strategies
     end
 
-    # Hook from configuration to serialize_into_session.
+    # Prepares the user to serialize into the session for this Manager only.
+    # Unlike Warden::Manager.serialize_into_session, the given block is stored on
+    # this configuration and does not modify any other Manager mounted in the
+    # same process.
+    #
+    # Pass a scope symbol to register a scope specific serializer. A scope
+    # specific block registered on this Manager takes precedence over the
+    # default block of this Manager, which in turn takes precedence over the
+    # class level Warden::Manager serializers.
+    #
+    # Example:
+    #   Warden::Manager.new(app) do |config|
+    #     config.serialize_into_session { |user| user.id }
+    #     config.serialize_into_session(:admin) { |user| user.admin_id }
+    #   end
+    #
     # :api: public
-    def serialize_into_session(*args, &block)
-      Warden::Manager.serialize_into_session(*args, &block)
+    def serialize_into_session(scope = nil, &block)
+      self[:serializers][:store][scope] = block
     end
 
-    # Hook from configuration to serialize_from_session.
+    # Reconstitutes the user from the session for this Manager only.
+    # Unlike Warden::Manager.serialize_from_session, the given block is stored
+    # on this configuration and does not modify any other Manager mounted in
+    # the same process.
+    #
+    # Pass a scope symbol to register a scope specific deserializer. A scope
+    # specific block registered on this Manager takes precedence over the
+    # default block of this Manager, which in turn takes precedence over the
+    # class level Warden::Manager deserializers.
+    #
+    # Example:
+    #   Warden::Manager.new(app) do |config|
+    #     config.serialize_from_session { |id| User.get(id) }
+    #     config.serialize_from_session(:admin) { |id| AdminUser.get(id) }
+    #   end
+    #
     # :api: public
-    def serialize_from_session(*args, &block)
-      Warden::Manager.serialize_from_session(*args, &block)
+    def serialize_from_session(scope = nil, &block)
+      self[:serializers][:fetch][scope] = block
     end
 
   protected

@@ -44,4 +44,23 @@ RSpec.describe Warden::Config do
     expect(c.default_strategies(:scope => :foo)).to eq([:foo, :bar])
     expect(c.scope_defaults(:foo)).to eq(store: false)
   end
+
+  it "stores default and scope specific serializers separately" do
+    default = proc { |user| user }
+    admin = proc { |user| user }
+    @config.serialize_into_session(&default)
+    @config.serialize_into_session(:admin, &admin)
+
+    expect(@config[:serializers][:store][nil]).to eq(default)
+    expect(@config[:serializers][:store][:admin]).to eq(admin)
+  end
+
+  it "does not share serializer blocks when duplicated" do
+    @config.serialize_into_session { |user| user }
+    copy = @config.dup
+    copy.serialize_into_session { |user| user.id }
+
+    expect(copy[:serializers][:store]).not_to equal(@config[:serializers][:store])
+    expect(@config[:serializers][:store][nil]).not_to eq(copy[:serializers][:store][nil])
+  end
 end
