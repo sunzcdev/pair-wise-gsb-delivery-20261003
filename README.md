@@ -6,10 +6,6 @@
 
 A Racc based [TOML](https://github.com/toml-lang/toml) Ruby parser supporting the 1.0.0 version of the spec.
 
-## TODO
-
-* Dumper
-
 ## Installation
 
 Add this line to your application's Gemfile:
@@ -36,6 +32,19 @@ or
 
 ```ruby
 Tomlrb.load_file('my_file', symbolize_keys: true)
+```
+
+A Ruby data structure can also be serialized back to TOML with `Tomlrb.dump`.
+Hashes become tables, arrays of hashes become arrays of tables and every other
+array is emitted inline. Empty tables and arrays are preserved, integers and
+floats stay distinct, and keys containing dots, quotes or whitespace are
+quoted so they remain literal keys. `nil`, circular references and other values
+that cannot be represented raise a `Tomlrb::DumpError` mentioning their
+structure path.
+
+```ruby
+Tomlrb.dump({"server" => {"host" => "localhost", "ports" => [8001, 8002]}})
+# => "[server]\nhost = \"localhost\"\nports = [8001, 8002]\n"
 ```
 
 ## Benchmark

@@ -10,6 +10,7 @@ require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
 require 'tomlrb/handler'
+require 'tomlrb/dumper'
 
 module Tomlrb
   class ParseError < StandardError; end
@@ -45,5 +46,18 @@ module Tomlrb
     # locale encoding or the interpreter -E option.
     tmp = File.read(path, encoding: 'utf-8')
     Tomlrb.parse(tmp, **options)
+  end
+
+  # Serializes a Ruby data structure into a TOML 1.0 string
+  #
+  # Supported values are Hash, Array, String, Integer, Float, true/false,
+  # Time, Date, DateTime and Tomlrb::LocalDate/LocalTime/LocalDateTime.
+  # Empty hashes and arrays are preserved; Integer and Float stay distinct.
+  #
+  # @param data [Hash] the Ruby data structure to serialize
+  # @return [String] the TOML representation of the input
+  # @raise [DumpError] if a value, key or circular reference cannot be represented
+  def self.dump(data)
+    Dumper.dump(data)
   end
 end
