@@ -58,6 +58,84 @@ describe Warden::Strategies::Base do
     expect(strategy).not_to be_performed
   end
 
+  describe "clear!" do
+    it "resets every piece of per-run state so a new run starts from scratch" do
+      RAS.add(:foobar) do
+        def authenticate!
+          success!("Foo User", "Welcome")
+          headers("X-Foo" => "bar")
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params, :some_scope)
+      strategy._run!
+
+      expect(strategy).to be_performed
+      expect(strategy).to be_halted
+      expect(strategy.user).to eq("Foo User")
+      expect(strategy.message).to eq("Welcome")
+      expect(strategy.result).to eq(:success)
+      expect(strategy.headers).to eq("X-Foo" => "bar")
+
+      strategy.clear!
+
+      expect(strategy).not_to be_performed
+      expect(strategy).not_to be_halted
+      expect(strategy.user).to be_nil
+      expect(strategy.message).to be_nil
+      expect(strategy.result).to be_nil
+      expect(strategy.headers).to eq({})
+      expect(strategy.status).to be_nil
+      expect(strategy.custom_response).to be_nil
+      # Identity attributes are preserved so the same object can run again.
+      expect(strategy.scope).to eq(:some_scope)
+      expect(strategy.env).not_to be_nil
+    end
+
+    it "wipes the redirect status and headers before a new run" do
+      RAS.add(:foobar) do
+        def authenticate!
+          redirect!("/foo/bar", {:foo => "bar"})
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      expect(strategy.result).to eq(:redirect)
+      expect(strategy.status).to eq(302)
+      expect(strategy.headers["Location"]).to eq("/foo/bar?foo=bar")
+
+      strategy.clear!
+
+      expect(strategy.result).to be_nil
+      expect(strategy.status).to be_nil
+      expect(strategy.headers).to eq({})
+    end
+
+    it "wipes a custom response before a new run" do
+      RAS.add(:foobar) do
+        def authenticate!
+          custom!([521, {"foo" => "bar"}, ["BAD"]])
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      expect(strategy.result).to eq(:custom)
+      expect(strategy.custom_response).to eq([521, {"foo" => "bar"}, ["BAD"]])
+
+      strategy.clear!
+
+      expect(strategy.result).to be_nil
+      expect(strategy.custom_response).to be_nil
+    end
+
+    it "returns the strategy so it can be chained" do
+      RAS.add(:foobar) do
+        def authenticate!; end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      expect(strategy.clear!).to equal(strategy)
+    end
+  end
+
   it "should set the scope when initialized with one" do
     RAS.add(:foobar) do
       def authenticate!; end

@@ -339,6 +339,258 @@ RSpec.describe Warden::Proxy do
       setup_rack(app).call(@env)
     end
 
+    describe "strategy re-execution protocol" do
+      # A strategy whose outcome on each execution is taken from
+      # env['warden.spec.phase']. It records every execution so the real run
+      # count can be observed.
+      before(:each) do
+        Warden::Strategies.add(:phased) do
+          def authenticate!
+            request.env['warden.spec.runs'] ||= 0
+            request.env['warden.spec.runs'] += 1
+            case request.env['warden.spec.phase']
+            when :success  then success!("Round User")
+            when :failure  then fail!("Bad credentials this round")
+            when :redirect then redirect!("/sign_in_again")
+            when :custom   then custom!([418, {"X-Custom" => "teapot"}, ["teapot"]])
+            when :pass     then pass
+            end
+          end
+        end
+      end
+
+      it "runs the same strategy object success, then failure, then redirect with fresh state each round" do
+        winner_oids = []
+        app = lambda do |env|
+          warden = env['warden']
+
+          # Round 1: success
+          env['warden.spec.phase'] = :success
+          user = warden.authenticate(:phased)
+          expect(user).to eq("Round User")
+          expect(warden.winning_strategy.user).to eq("Round User")
+          expect(warden.result).to eq(:success)
+          expect(warden.message).to be_nil
+          expect(warden.headers).to eq({})
+          expect(warden.status).to be_nil
+          winner_oids << warden.winning_strategy.object_id
+
+          # New credentials for the same request: re-run the strategy.
+          env['warden.spec.phase'] = :failure
+          warden.clear_strategies_cache!(:phased)
+          # Clearing the winner forgets it straight away; no stale winner is
+          # reported before the new run happens.
+          expect(warden.winning_strategy).to be_nil
+          user = warden.authenticate(:phased)
+          expect(user).to be_nil
+          # The previous success must not linger anywhere.
+          expect(warden).not_to be_authenticated
+          expect(warden.winning_strategy.user).to be_nil
+          expect(warden.result).to eq(:failure)
+          expect(warden.message).to eq("Bad credentials this round")
+          expect(warden.headers).to eq({})
+          expect(warden.custom_response).to be_nil
+          expect(warden.winning_strategy.object_id).to eq(winner_oids.first)
+
+          # New credentials again: redirect.
+          env['warden.spec.phase'] = :redirect
+          warden.clear_strategies_cache!(:phased)
+          expect(warden.winning_strategy).to be_nil
+          warden.authenticate(:phased)
+          expect(warden.winning_strategy.user).to be_nil
+          expect(warden.result).to eq(:redirect)
+          expect(warden.message).to eq("You are being redirected to /sign_in_again")
+          expect(warden.status).to eq(302)
+          expect(warden.headers["Location"]).to eq("/sign_in_again")
+          # The failure message from round 2 must not linger either.
+          expect(warden.message).not_to eq("Bad credentials this round")
+
+          expect(env['warden.spec.runs']).to eq(3)
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not reuse a user stored by a previous round" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.phase'] = :success
+          expect(warden.authenticate(:phased)).to eq("Round User")
+          expect(warden).to be_authenticated
+
+          env['warden.spec.phase'] = :failure
+          warden.clear_strategies_cache!(:phased)
+          expect(warden.authenticate(:phased)).to be_nil
+          expect(warden).not_to be_authenticated
+
+          # Even asking for the user directly must not bring the old user back.
+          expect(env['rack.session']).not_to have_key("warden.user.default.key")
+          expect(env['warden.spec.runs']).to eq(2)
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "forgets a custom response produced by a previous round" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.phase'] = :custom
+          warden.authenticate(:phased)
+          expect(warden.result).to eq(:custom)
+          expect(warden.custom_response).to eq([418, {"X-Custom" => "teapot"}, ["teapot"]])
+          expect(warden.headers).to eq({})
+
+          env['warden.spec.phase'] = :failure
+          warden.clear_strategies_cache!(:phased)
+          warden.authenticate(:phased)
+          expect(warden.result).to eq(:failure)
+          expect(warden.custom_response).to be_nil
+          expect(warden.headers).to eq({})
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "reports no winner when the strategy of a new round is skipped" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.phase'] = :success
+          warden.authenticate(:phased)
+          expect(warden.result).to eq(:success)
+          expect(warden.user).to eq("Round User")
+
+          Warden::Strategies.update(:phased) do
+            def valid?; false; end
+          end
+          warden.clear_strategies_cache!(:phased)
+          warden.authenticate(:phased)
+
+          expect(warden.winning_strategy).to be_nil
+          expect(warden.result).to be_nil
+          expect(warden.message).to be_nil
+          expect(warden.user).to be_nil
+          expect(warden).not_to be_authenticated
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "reports no stale result when a halted winner is reset and the new run passes" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.phase'] = :failure
+          warden.authenticate(:phased)
+          expect(warden.winning_strategy).to be_halted
+          expect(warden.result).to eq(:failure)
+
+          env['warden.spec.phase'] = :pass
+          warden.clear_strategies_cache!(:phased)
+          expect(warden.winning_strategy).to be_nil
+          warden.authenticate(:phased)
+
+          # The strategy runs again but neither succeeds, fails nor redirects,
+          # so the failure from the previous round must not be reported.
+          expect(warden.winning_strategy).not_to be_halted
+          expect(warden.result).to be_nil
+          expect(warden.message).to be_nil
+          expect(warden.user).to be_nil
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not touch other scopes when clearing a given scope" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          # :admin scope has a failed (halted) winner of its own.
+          env['warden.spec.phase'] = :failure
+          env['warden'].authenticate(:phased, :scope => :admin)
+          admin_winner = warden.winning_strategies[:admin]
+
+          # Default scope succeeds.
+          env['warden.spec.phase'] = :success
+          warden.authenticate(:phased)
+          default_winner = warden.winning_strategy
+
+          # Clear the default scope only.
+          env['warden.spec.phase'] = :failure
+          warden.clear_strategies_cache!(:phased)
+          warden.authenticate(:phased)
+
+          # The :admin cache must be untouched.
+          expect(warden.winning_strategies[:admin]).to equal(admin_winner)
+          expect(admin_winner.result).to eq(:failure)
+          expect(admin_winner.message).to eq("Bad credentials this round")
+          expect(admin_winner).to be_performed
+          expect(admin_winner).to be_halted
+          expect(env['warden'].user(:admin)).to be_nil
+
+          # The proxy now reports the fresh default-scope failure.
+          expect(warden.winning_strategy).to equal(default_winner)
+          expect(warden.result).to eq(:failure)
+
+          # Re-running admin strategies must not execute anything again.
+          env['warden.spec.phase'] = :success
+          env['warden'].authenticate(:phased, :scope => :admin)
+          expect(admin_winner).to be_performed
+          expect(env['warden'].user(:admin)).to be_nil
+          expect(env['warden.spec.runs']).to eq(3)
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not touch other strategies when clearing a specific strategy" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          # Two soft-failing strategies: the last one to run is the winner.
+          Warden::Strategies.add(:soft_one) do
+            def authenticate!
+              request.env['warden.spec.strategies'] ||= []
+              request.env['warden.spec.strategies'] << :soft_one
+              fail("soft one failed")
+            end
+          end
+          Warden::Strategies.add(:soft_two) do
+            def authenticate!
+              request.env['warden.spec.strategies'] ||= []
+              request.env['warden.spec.strategies'] << :soft_two
+              fail("soft two failed")
+            end
+          end
+
+          env['warden'].authenticate(:soft_one, :soft_two, :scope => :failz)
+          expect(warden.message).to eq("soft two failed")
+          strategies = warden.instance_variable_get(:@strategies)[:failz]
+          cleared = strategies[:soft_one]
+          other   = strategies[:soft_two]
+
+          # Clear only :soft_one.
+          warden.clear_strategies_cache!(:soft_one, :scope => :failz)
+          env['warden'].authenticate(:soft_one, :soft_two, :scope => :failz)
+
+          # :soft_one runs again with a fresh round of state; :soft_two stays
+          # cached and is never run again.
+          expect(env['warden.spec.strategies']).to eq([:soft_one, :soft_two, :soft_one])
+          expect(cleared).to be_performed
+          expect(cleared.result).to eq(:failure)
+          expect(cleared.message).to eq("soft one failed")
+          expect(cleared).not_to be_halted
+          expect(other).to be_performed
+          expect(other.result).to eq(:failure)
+          expect(other.message).to eq("soft two failed")
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+    end
+
     it "should not store user if strategy isn't meant for permanent login" do
       session = Warden::SessionSerializer.new(@env)
       app = lambda do |env|

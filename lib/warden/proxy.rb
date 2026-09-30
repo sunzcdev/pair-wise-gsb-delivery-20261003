@@ -54,7 +54,18 @@ module Warden
     # Clear the cache of performed strategies so far. Warden runs each
     # strategy just once during the request lifecycle. You can clear the
     # strategies cache if you want to allow a strategy to be run more than
-    # once.
+    # once, for example after changing the credentials within the same
+    # request.
+    #
+    # Clearing resets the whole execution of the affected strategies: their
+    # performed/halted marks as well as the user, message, result and any
+    # response (headers, status, custom response) they produced belong to the
+    # next run from then on. The previously winning strategy is forgotten
+    # only when it is itself cleared, so a new skip or failure cannot leave
+    # a stale winner being reported.
+    #
+    # Only the given scope is ever affected; clearing a particular strategy
+    # leaves the other strategies' caches untouched.
     #
     # This method has the same API as authenticate, allowing you to clear
     # specific strategies for given scope:
@@ -77,9 +88,26 @@ module Warden
     def clear_strategies_cache!(*args)
       scope, _opts = _retrieve_scope_and_opts(args)
 
-      @winning_strategies.delete(scope)
+      previous_winner = @winning_strategies[scope]
+      cleared_winner = false
+
       @strategies[scope].each do |k, v|
-        v.clear! if args.empty? || args.include?(k)
+        next unless args.empty? || args.include?(k)
+        v.clear!
+        cleared_winner = true if v.equal?(previous_winner)
+      end
+
+      if cleared_winner
+        @winning_strategies.delete(scope)
+        # Forget the proxy-wide winner only when it was the one reset,
+        # otherwise another scope's winner must keep being reported.
+        self.winning_strategy = nil if winning_strategy.equal?(previous_winner)
+
+        # Drop any user resolved for this scope (both the one cached for the
+        # request and the one serialized into the session) so the strategies
+        # are actually re-run instead of short-circuited by the old user.
+        @users.delete(scope)
+        session_serializer.delete(scope, previous_winner.user)
       end
     end
 
