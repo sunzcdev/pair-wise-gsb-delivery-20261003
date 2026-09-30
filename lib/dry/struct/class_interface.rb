@@ -289,6 +289,18 @@ module Dry
         Constructor[self, fn: constructor || block]
       end
 
+      # Build instances of this struct incrementally, attribute by attribute
+      #
+      # @return [Dry::Struct::Builder]
+      # @example
+      #   builder = User.builder
+      #   builder.set(name: "Jane")
+      #   builder.set(age: 21)
+      #   builder.finish # => #<User name="Jane" age=21>
+      def builder
+        Builder.new(self)
+      end
+
       # @param [Hash{Symbol => Object},Dry::Struct] input
       # @yieldparam [Dry::Types::Result::Failure] failure
       # @yieldreturn [Dry::Types::Result]
