@@ -9,6 +9,7 @@ require 'warden/errors'
 require 'warden/session_serializer'
 require 'warden/strategies'
 require 'warden/strategies/base'
+require 'warden/strategies/all_of'
 
 module Warden
   class NotAuthenticated < StandardError; end
