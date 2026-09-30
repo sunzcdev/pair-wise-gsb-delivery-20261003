@@ -1,3 +1,12 @@
+Unreleased
+----------
+
+* Add `MultiJson.canonical_dump`, an adapter-independent RFC 8785 (JCS)
+  serializer with UTF-16 property sorting, RFC 8785 string escaping, and
+  ECMAScript number formatting. Integers outside the safe range
+  (±9007199254740991), non-finite floats, non-string keys, custom objects,
+  and invalid Unicode raise `MultiJson::CanonicalizationError`.
+
 1.15.0
 ------
 

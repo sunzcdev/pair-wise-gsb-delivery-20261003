@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/canonical"
 
 module MultiJson
   include Options
@@ -122,6 +123,16 @@ module MultiJson
     current_adapter(options).dump(object, options)
   end
   alias_method :encode, :dump
+
+  # Serializes a Ruby object as canonical JSON per RFC 8785 (JCS).
+  #
+  # Properties are sorted by UTF-16 code unit, strings and numbers follow
+  # the RFC's escaping and ECMAScript number rules, and no adapter options
+  # apply. See MultiJson::Canonical for the accepted input types; inputs that
+  # cannot be represented without loss raise MultiJson::CanonicalizationError.
+  def canonical_dump(object)
+    Canonical.dump(object)
+  end
 
   #  Executes passed block using specified adapter.
   def with_adapter(new_adapter)
