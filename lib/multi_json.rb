@@ -8,6 +8,8 @@ module MultiJson
   include Options
   extend self
 
+  autoload :JsonSeq, "multi_json/json_seq"
+
   def default_options=(value)
     Kernel.warn "MultiJson.default_options setter is deprecated\nUse MultiJson.load_options and MultiJson.dump_options instead"
 
@@ -122,6 +124,18 @@ module MultiJson
     current_adapter(options).dump(object, options)
   end
   alias_method :encode, :dump
+
+  # Builds an RFC 7464 JSON text sequence writer.
+  # @see JsonSeq::Writer
+  def json_seq_writer(io, **options)
+    JsonSeq::Writer.new(io, **options)
+  end
+
+  # Builds an RFC 7464 JSON text sequence reader.
+  # @see JsonSeq::Reader
+  def json_seq_reader(io, **options)
+    JsonSeq::Reader.new(io, **options)
+  end
 
   #  Executes passed block using specified adapter.
   def with_adapter(new_adapter)
