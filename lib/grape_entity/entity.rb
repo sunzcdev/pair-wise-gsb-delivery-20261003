@@ -144,6 +144,65 @@ module Grape
       super
     end
 
+    # Declares the attribute (or attributes) that uniquely identify the
+    # represented business object. It is used by graph representations
+    # (+represent(object, graph: true)+) to detect duplicate references:
+    # objects sharing the same identity are expanded exactly once and every
+    # other occurrence becomes a link.
+    #
+    # @example
+    #
+    #   class UserEntity < Grape::Entity
+    #     identity :id
+    #     expose :id, :name
+    #   end
+    def self.identity(*attributes)
+      @identity_attributes = attributes.flatten
+    end
+
+    # Overrides the link type used in graph representations. By default the
+    # type is derived from the entity class name.
+    def self.graph_type=(type)
+      @graph_type = type
+    end
+
+    def self.identity_attributes
+      if instance_variable_defined?(:@identity_attributes) && @identity_attributes
+        @identity_attributes
+      elsif superclass.respond_to?(:identity_attributes)
+        superclass.identity_attributes
+      else
+        []
+      end
+    end
+
+    def self.graph_type
+      if instance_variable_defined?(:@graph_type) && @graph_type
+        @graph_type
+      elsif name
+        name.demodulize.underscore.sub(/_entity\z/, '').pluralize.to_sym
+      else
+        :entity
+      end
+    end
+
+    # Builds the graph registry key for an object: [entity_class, *identity].
+    # Raises when the entity never declared an identity.
+    def self.graph_key(object)
+      attributes = identity_attributes
+      raise Graph::MissingIdentityError, "#{name || self} must declare an identity for graph representation" if attributes.empty?
+
+      delegator = Delegator.new(object)
+      values = attributes.map do |attribute|
+        if delegator.accepts_options?
+          delegator.delegate(attribute, **delegation_opts)
+        else
+          delegator.delegate(attribute)
+        end
+      end
+      [self, *values]
+    end
+
     # This method is the primary means by which you will declare what attributes
     # should be exposed by the entity.
     #
@@ -441,6 +500,8 @@ module Grape
     # @option options :except [Array] all the fields that should not be returned
     def self.represent(objects, options = {})
       @present_collection ||= nil
+      return graph_representation(objects, options) if options[:graph]
+
       if objects.respond_to?(:to_ary) && !@present_collection
         root_element = root_element(:collection_root)
         inner = objects.to_ary.map { |object| new(object, options.reverse_merge(collection: true)).presented }
@@ -452,6 +513,30 @@ module Grape
 
       root_element = options[:root] if options.key?(:root)
 
+      root_element ? { root_element => inner } : inner
+    end
+
+    # Builds a finite graph document: full payloads live in +data+ (and
+    # +included+ for first-seen association targets) and associations become
+    # +{ type:, id: }+ links. See Grape::Entity::Graph.
+    def self.graph_representation(objects, options = {})
+      graph = options[:graph] if options[:graph].is_a?(Graph)
+      graph ||= Graph.new
+      options = options.merge(graph: graph)
+
+      if @present_collection
+        objects = { @collection_name => objects }
+      end
+
+      if objects.respond_to?(:to_ary) && !@present_collection
+        inner = graph.render(objects.to_ary, self, options)
+        root_element = root_element(:collection_root)
+      else
+        inner = graph.render_one(objects, self, options)
+        root_element = root_element(:root)
+      end
+
+      root_element = options[:root] if options.key?(:root)
       root_element ? { root_element => inner } : inner
     end
 
@@ -519,6 +604,15 @@ module Grape
 
       opts = options.merge(runtime_options || {})
 
+      return opts[:graph].render_one(object, self.class, opts) if opts[:graph].is_a?(Graph)
+
+      root_exposure.serializable_value(self, opts)
+    end
+
+    # Renders this entity's own payload while the surrounding Graph handles
+    # associations. Field filters and conditions still run here.
+    def graph_payload(runtime_options = {})
+      opts = options.merge(runtime_options || {})
       root_exposure.serializable_value(self, opts)
     end
 
@@ -646,6 +740,7 @@ module Grape
       expose_nil
       override
       default
+      graph
     ].to_set.freeze
 
     # Merges the given options with current block options.
@@ -690,3 +785,5 @@ module Grape
     end
   end
 end
+
+require 'grape_entity/graph'

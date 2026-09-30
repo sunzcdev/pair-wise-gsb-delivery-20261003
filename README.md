@@ -16,6 +16,7 @@
       - [Safe Exposure](#safe-exposure)
       - [Nested Exposure](#nested-exposure)
       - [Collection Exposure](#collection-exposure)
+      - [Graph Representation](#graph-representation)
       - [Merge Fields](#merge-fields)
       - [Runtime Exposure](#runtime-exposure)
       - [Unexpose](#unexpose)
@@ -201,10 +202,53 @@ As example:
 ```ruby
 
  present_collection true, :collection_name  # `collection_name` is optional and defaults to `items`
- expose :collection_name, using: API::Entities::Items
+expose :collection_name, using: API::Entities::Items
 
 
 ```
+
+#### Graph Representation
+
+When entities reference each other (including bidirectional associations such
+as `A -> B -> A`), a fully nested representation loops forever, while simply
+truncating the nesting drops data. Pass `graph: true` to `represent` to render
+the object network as a finite document instead:
+
+* each entity declares its business identity with `identity`;
+* associations are rendered as `{ type:, id: }` links;
+* the first time an identity is reached, the full entity is expanded once and
+  collected in `included`;
+* the same business identity coming from different Ruby objects is expanded
+  only once; if two objects share an identity but produce different output a
+  `Grape::Entity::Graph::ConflictError` is raised rather than silently
+  choosing one of them.
+
+```ruby
+class UserEntity < Grape::Entity
+  identity :id
+
+  expose :id, :name
+  expose :manager, using: UserEntity
+end
+
+UserEntity.represent(user, graph: true)
+# {
+#   data: { id: 1, name: 'Ada', manager: { type: :users, id: 2 } },
+#   included: [
+#     { id: 2, name: 'Grace', manager: { type: :users, id: 1 } }
+#   ]
+# }
+```
+
+Collections work as well: every root object is expanded in `data`, and every
+other reachable identity appears once in `included`. A composite identity can
+be declared with several attributes (`identity :org_id, :user_id`), and the
+link type may be overridden with `self.graph_type = :members` (by default it
+is derived from the entity class name).
+
+Field filters (`:only`, `:except`) and conditions (`:if`, `:unless`) still
+apply to every expanded entity, and associations hidden by a condition are
+never evaluated, not even for deduplication.
 
 #### Merge Fields
 

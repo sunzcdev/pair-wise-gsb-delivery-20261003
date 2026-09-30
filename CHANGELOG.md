@@ -6,7 +6,7 @@
 
 #### Features
 
-* Your contribution here.
+* Added a graph representation mode (`represent(object, graph: true)`): entities declare an `identity`, associations render as `{ type:, id: }` links, first-seen entities are collected once in `included`, and same-identity objects with conflicting content raise `Grape::Entity::Graph::ConflictError`.
 
 
 ### 1.1.0 (2026-06-05)

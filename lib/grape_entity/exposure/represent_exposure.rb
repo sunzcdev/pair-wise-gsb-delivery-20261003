@@ -24,7 +24,13 @@ module Grape
 
         def value(entity, options)
           new_options = options.for_nesting(key(entity))
-          using_class.represent(@subexposure.value(entity, options), new_options)
+          value = @subexposure.value(entity, options)
+
+          if new_options[:graph].is_a?(Graph)
+            new_options[:graph].embed(value, using_class, new_options)
+          else
+            using_class.represent(value, new_options)
+          end
         end
 
         def valid?(entity)
