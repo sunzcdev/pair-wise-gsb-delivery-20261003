@@ -1,3 +1,9 @@
+### Unreleased
+
+* Add `precise_fractional_seconds` option to parse fractional seconds exactly
+  (via `Rational`, without binary floating point) for offset date-times,
+  local date-times and local times
+
 ### 2.0.4 - 2025-12-18
 
 * Update Racc to v1.8.1

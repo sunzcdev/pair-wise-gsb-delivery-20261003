@@ -7,6 +7,7 @@ class Tomlrb::Parser < Tomlrb::GeneratedParser
   def initialize(tokenizer, **options)
     @tokenizer = tokenizer
     @handler   = Tomlrb::Handler.new(**options)
+    @precise_fractional_seconds = options[:precise_fractional_seconds]
     super()
   end
 

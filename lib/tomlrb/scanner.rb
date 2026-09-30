@@ -78,7 +78,7 @@ module Tomlrb
     end
 
     def process_local_time
-      args = [@ss[0], @ss[1], @ss[2], @ss[3].to_f]
+      args = [@ss[0], @ss[1], @ss[2], @ss[3]]
       [:LOCAL_TIME, args]
     end
 

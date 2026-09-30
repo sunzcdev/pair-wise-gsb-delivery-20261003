@@ -1,10 +1,12 @@
 # frozen-string-literal: true
 
 require 'forwardable'
+require 'tomlrb/fractional_seconds'
 
 module Tomlrb
   class LocalDateTime
     extend Forwardable
+    include FractionalSeconds
 
     def_delegators :@time, :year, :month, :day, :hour, :min, :sec, :usec, :nsec
 
@@ -27,9 +29,7 @@ module Tomlrb
     end
 
     def to_s
-      frac = (@sec - sec)
-      frac_str = frac.zero? ? '' : frac.to_s[1..-1]
-      @time.strftime('%FT%T') << frac_str
+      @time.strftime('%FT%T') << fractional_second_string(@sec - sec)
     end
 
     def ==(other)

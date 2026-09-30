@@ -38,6 +38,14 @@ or
 Tomlrb.load_file('my_file', symbolize_keys: true)
 ```
 
+### Options
+
+* `symbolize_keys`: return keys as symbols instead of strings
+* `precise_fractional_seconds`: parse fractional seconds of datetimes and
+  times as exact decimal fractions (backed by `Rational`) instead of binary
+  floating point. This preserves precision beyond nanoseconds, so values such
+  as `23:59:59.999999999999` are never rounded up into the next second.
+
 ## Benchmark
 
 You can run the benchmark against the only other v0.5.0 compliant parser to my knowledge with `ruby benchmarks/bench.rb`.

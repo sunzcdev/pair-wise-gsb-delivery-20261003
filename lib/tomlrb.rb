@@ -6,6 +6,7 @@ require 'tomlrb/version'
 require 'tomlrb/local_date_time'
 require 'tomlrb/local_date'
 require 'tomlrb/local_time'
+require 'tomlrb/fractional_seconds'
 require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
@@ -19,6 +20,9 @@ module Tomlrb
   # @param string_or_io [String, StringIO] the content
   # @param options [Hash] the options hash
   # @option options [Boolean] :symbolize_keys (false) whether to return the keys as symbols or strings
+  # @option options [Boolean] :precise_fractional_seconds (false) whether to parse fractional seconds
+  #   as exact decimal fractions (Rational) instead of binary floating point, so values beyond
+  #   nanosecond precision are preserved without rounding
   # @return [Hash] the Ruby data structure represented by the input
   def self.parse(string_or_io, **options)
     io = string_or_io.is_a?(String) ? StringIO.new(string_or_io) : string_or_io
@@ -38,6 +42,7 @@ module Tomlrb
   # @param path [String] the path to the file
   # @param options [Hash] the options hash
   # @option options [Boolean] :symbolize_keys (false) whether to return the keys as symbols or strings
+  # @option options [Boolean] :precise_fractional_seconds (false) see {Tomlrb.parse}
   # @return [Hash] the Ruby data structure represented by the input
   def self.load_file(path, **options)
     # By default Ruby sets the external encoding of an IO object to the

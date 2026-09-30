@@ -206,7 +206,7 @@ rule
                  if hour.nil?
                    LocalDate.new(year, month, day)
                  else
-                   LocalDateTime.new(year, month, day, hour, min || 0, sec.to_f)
+                   LocalDateTime.new(year, month, day, hour, min || 0, sec_value(sec))
                  end
                else
                  # Patch for 24:00:00 which Ruby parses
@@ -214,13 +214,13 @@ rule
                    hour = (hour.to_i + 1).to_s
                  end
 
-                 time = Time.new(year, month, day, hour || 0, min || 0, sec.to_f, offset)
+                 time = Time.new(year, month, day, hour || 0, min || 0, sec_value(sec), offset)
                  # Should be out of parser.y?
                  raise ArgumentError, "Invalid Offset Date-Time: #{year}-#{month}-#{day}T#{hour}:#{min}:#{sec}#{offset}" unless min.to_i == time.min && hour.to_i == time.hour && day.to_i == time.day && month.to_i == time.month && year.to_i == time.year
                  time
                end
     }
-    | LOCAL_TIME { result = LocalTime.new(*val[0][1..-1]) }
+    | LOCAL_TIME { result = LocalTime.new(val[0][1], val[0][2], sec_value(val[0][3])) }
     ;
   string
     : STRING_MULTI { result = StringUtils.replace_escaped_chars(StringUtils.multiline_replacements(val[0])) }
@@ -228,3 +228,12 @@ rule
     | STRING_LITERAL_MULTI { result = StringUtils.strip_spaces(val[0]) }
     | STRING_LITERAL { result = val[0] }
     ;
+---- inner
+
+  def sec_value(sec)
+    if @precise_fractional_seconds
+      sec.nil? ? 0 : Rational(sec)
+    else
+      sec.to_f
+    end
+  end
