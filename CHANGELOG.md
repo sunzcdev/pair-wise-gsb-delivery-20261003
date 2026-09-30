@@ -9,6 +9,14 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Optional structural sharing mode for schemas. Pass `structural_sharing: true` to
+  `Schema#apply` (or `Schema#call_unsafe`/`Schema#call_safe`) to make container types
+  (`Schema` and `Array::Member`) return the original `Hash`/`Array` objects when
+  coercion didn't change keys, element identity, order or presence. Containers on
+  paths where any transformation happened (coerced values, transformed keys, dropped
+  unknown keys, filled-in defaults, filtered-out `Undefined` elements) are still
+  rebuilt.
+
 ### Changed
 
 ### Deprecated

@@ -28,11 +28,21 @@ module Dry
         # @api private
         def call_unsafe(input)
           if primitive?(input)
-            input.each_with_object([]) do |el, output|
+            sharing = StructuralSharing.enabled?
+            changed = false
+
+            output = input.each_with_object([]) do |el, memo|
               coerced = member.call_unsafe(el)
 
-              output << coerced unless Undefined.equal?(coerced)
+              if Undefined.equal?(coerced)
+                changed = true
+              else
+                changed = true unless coerced.equal?(el)
+                memo << coerced
+              end
             end
+
+            sharing && !changed ? input : output
           else
             super
           end
@@ -44,6 +54,8 @@ module Dry
         # @api private
         def call_safe(input)
           if primitive?(input)
+            sharing = StructuralSharing.enabled?
+            changed = false
             failed = false
 
             result = input.each_with_object([]) do |el, output|
@@ -52,10 +64,21 @@ module Dry
                 out
               }
 
-              output << coerced unless Undefined.equal?(coerced)
+              if Undefined.equal?(coerced)
+                changed = true
+              else
+                changed = true unless coerced.equal?(el)
+                output << coerced
+              end
             end
 
-            failed ? yield(result) : result
+            if failed
+              yield(result)
+            elsif sharing && !changed
+              input
+            else
+              result
+            end
           else
             yield
           end

@@ -52,21 +52,37 @@ module Dry
       end
 
       # @param [Hash] hash
+      # @option options [Boolean] :structural_sharing If true the input hash
+      #   (and nested containers) will be returned as-is when coercion didn't
+      #   change keys, element identity, order or presence
       #
       # @return [Hash{Symbol => Object}]
       #
       # @api private
       def call_unsafe(hash, options = EMPTY_HASH)
-        resolve_unsafe(coerce(hash), options)
+        if options[:structural_sharing]
+          StructuralSharing.within { resolve_unsafe(coerce(hash), options) }
+        else
+          resolve_unsafe(coerce(hash), options)
+        end
       end
 
       # @param [Hash] hash
+      # @option options [Boolean] :structural_sharing If true the input hash
+      #   (and nested containers) will be returned as-is when coercion didn't
+      #   change keys, element identity, order or presence
       #
       # @return [Hash{Symbol => Object}]
       #
       # @api private
       def call_safe(hash, options = EMPTY_HASH)
-        resolve_safe(coerce(hash) { return yield }, options) { return yield }
+        if options[:structural_sharing]
+          StructuralSharing.within do
+            resolve_safe(coerce(hash) { return yield }, options) { return yield }
+          end
+        else
+          resolve_safe(coerce(hash) { return yield }, options) { return yield }
+        end
       end
 
       # @param [Hash] hash
@@ -74,6 +90,10 @@ module Dry
       # @option options [Boolean] :skip_missing If true don't raise error if on missing keys
       # @option options [Boolean] :resolve_defaults If false default value
       #                                             won't be evaluated for missing key
+      # @option options [Boolean] :structural_sharing If true the input hash
+      #                                               (and nested containers) will be
+      #                                               returned as-is when coercion
+      #                                               didn't change anything
       # @return [Hash{Symbol => Object}]
       #
       # @api public
@@ -317,6 +337,8 @@ module Dry
       #
       # @return [Hash]
       def resolve_unsafe(hash, options = EMPTY_HASH)
+        sharing = StructuralSharing.enabled?
+        changed = false
         result = {}
 
         hash.each do |key, value|
@@ -325,20 +347,29 @@ module Dry
 
           if type
             begin
-              result[k] = type.call_unsafe(value)
+              coerced = type.call_unsafe(value)
             rescue ConstraintError => exception
               raise SchemaError.new(type.name, value, exception.result)
             rescue CoercionError => exception
               raise SchemaError.new(type.name, value, exception.message)
             end
+
+            changed = true unless k.equal?(key) && coerced.equal?(value)
+            result[k] = coerced
           elsif strict?
             raise unexpected_keys(hash.keys)
+          else
+            changed = true
           end
         end
 
-        resolve_missing_keys(result, options) if result.size < keys.size
+        if result.size < keys.size
+          size_before = result.size
+          resolve_missing_keys(result, options)
+          changed = true if result.size != size_before
+        end
 
-        result
+        sharing && !changed ? hash : result
       end
 
       # Validate and coerce a hash. Call a block and halt on any error
@@ -347,6 +378,8 @@ module Dry
       #
       # @return [Hash]
       def resolve_safe(hash, options = EMPTY_HASH, &block)
+        sharing = StructuralSharing.enabled?
+        changed = false
         result = {}
 
         hash.each do |key, value|
@@ -354,15 +387,23 @@ module Dry
           type = @name_key_map[k]
 
           if type
-            result[k] = type.call_safe(value, &block)
+            coerced = type.call_safe(value, &block)
+            changed = true unless k.equal?(key) && coerced.equal?(value)
+            result[k] = coerced
           elsif strict?
             yield
+          else
+            changed = true
           end
         end
 
-        resolve_missing_keys(result, options, &block) if result.size < keys.size
+        if result.size < keys.size
+          size_before = result.size
+          resolve_missing_keys(result, options, &block)
+          changed = true if result.size != size_before
+        end
 
-        result
+        sharing && !changed ? hash : result
       end
 
       # Try to add missing keys to the hash
