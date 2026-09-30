@@ -17,6 +17,7 @@ module Dry
         def inherited(klass)
           super
           klass.instance_variable_set("@config", config.dup)
+          validate_macro_calls!
         end
 
         # Configuration
@@ -135,6 +136,35 @@ module Dry
             .concat(superclass.respond_to?(:rules) ? superclass.rules : EMPTY_ARRAY)
         end
 
+        # Check rule macro calls against declared macro signatures
+        #
+        # This runs when the contract definition is completed: when the class
+        # is inherited and (once) when the class is instantiated. Macros are
+        # resolved against this class' own scope, so inherited rules are
+        # re-checked in subclasses that override macros. Macros without a
+        # declared signature are not checked.
+        #
+        # @return [self]
+        #
+        # @api private
+        def validate_macro_calls!
+          rules.each do |rule|
+            rule.macro_calls.each do |spec|
+              name, *args = spec.flatten(1)
+              validate_macro_call!(rule, name, args)
+            end
+          end
+          self
+        end
+
+        # @api private
+        def validate_macro_calls_once!
+          return if defined?(@__macro_calls_validated__) && @__macro_calls_validated__
+
+          validate_macro_calls!
+          @__macro_calls_validated__ = true
+        end
+
         # Return messages configured for this class
         #
         # @return [Dry::Schema::Messages]
@@ -145,6 +175,33 @@ module Dry
         end
 
         private
+
+        # @api private
+        def validate_macro_call!(rule, name, args)
+          macro = resolve_macro(name)
+          return unless macro&.signature
+
+          reason = macro.signature.error_for(args)
+          return unless reason
+
+          raise InvalidMacroCallError.new(
+            contract: self, rule: rule.keys, macro: name, reason: reason
+          )
+        end
+
+        # Resolve a macro the same way runtime expansion does: contract-local
+        # macros take precedence over globally registered ones
+        #
+        # @return [Macro, nil] nil when the macro is not registered (yet)
+        #
+        # @api private
+        def resolve_macro(name)
+          if macros.key?(name)
+            macros[name]
+          elsif Macros.container.key?(name)
+            Macros.container[name]
+          end
+        end
 
         # @api private
         def ensure_valid_keys(*keys)

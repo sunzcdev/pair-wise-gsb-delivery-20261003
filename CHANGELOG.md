@@ -7,6 +7,10 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Macros can now declare an optional signature (`register_macro(:name, signature: {required: 1, optional: 1, keywords: [:opt]})`). Macro calls are checked against declared signatures when a contract definition is completed (on inheritance and on first instantiation) and again when macros are expanded, raising `Dry::Validation::InvalidMacroCallError` that points out the contract, rule and macro involved. Macros can call other macros via `Evaluator#macro`; cyclic expansion is rejected with `Dry::Validation::MacroCycleError`. Macros without a signature keep the legacy behavior and are not checked.
+
 
 ## [1.11.1] - 2025-01-21
 

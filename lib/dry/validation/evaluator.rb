@@ -75,8 +75,46 @@ module Dry
         end
 
         macros.each do |args|
-          macro = macro(*args.flatten(1))
-          instance_exec(**macro.extract_block_options(_options.merge(macro: macro)), &macro.block)
+          macro(*args.flatten(1))
+        end
+      end
+
+      # Expand a registered macro within the current rule context
+      #
+      # Macros can call other macros. Nested calls are resolved against the
+      # contract's macro scope (contract-local macros take precedence over
+      # global ones), checked against declared signatures, and cyclic
+      # expansion is rejected before it recurses endlessly.
+      #
+      # @param [Symbol] name The name of the macro
+      # @param [Array] args The arguments for the macro
+      #
+      # @return [Object] The result of the macro block
+      #
+      # @api public
+      def macro(name, *args)
+        resolved = _contract.__send__(:macro, name, *args)
+
+        stack = (@__macro_expansion__ ||= [])
+
+        if stack.include?(resolved.name)
+          raise MacroCycleError.new(
+            contract: _contract.class, rule: keys, chain: [*stack, resolved.name]
+          )
+        end
+
+        if resolved.signature && (reason = resolved.signature.error_for(args))
+          raise InvalidMacroCallError.new(
+            contract: _contract.class, rule: keys, macro: resolved.name, reason: reason
+          )
+        end
+
+        stack.push(resolved.name)
+        begin
+          instance_exec(**resolved.extract_block_options(_options.merge(macro: resolved)),
+                        &resolved.block)
+        ensure
+          stack.pop
         end
       end
 

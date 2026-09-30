@@ -50,13 +50,24 @@ module Dry
         #     end
         #   end
         #
+        # @example with a signature declaration
+        #   class MyContract < Dry::Validation::Contract
+        #     register_macro(:min_size, signature: {required: 1}) do |macro:|
+        #       key.failure("must have at least #{macro.args[0]} items") if values[key_name].size < macro.args[0]
+        #     end
+        #   end
+        #
         # @param [Symbol] name The name of the macro
+        # @param [Hash, Macro::Signature, nil] signature Optional signature declaration
+        #   used to validate macro calls when a contract definition is completed
         #
         # @return [self]
         #
         # @api public
-        def register(name, *args, &block)
-          macro = Macro.new(name, args: args, block: block)
+        def register(name, *args, signature: nil, &block)
+          macro = Macro.new(
+            name, args: args, block: block, signature: Macro::Signature.build(signature)
+          )
           super(name, macro, call: false, &nil)
           self
         end

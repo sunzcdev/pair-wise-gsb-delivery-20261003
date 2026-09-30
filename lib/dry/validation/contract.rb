@@ -46,6 +46,18 @@ module Dry
       extend ::Dry::Initializer
       extend ClassInterface
 
+      # Check macro calls against declared signatures when the contract is
+      # instantiated, so definition-time mistakes are reported before the
+      # first validated request
+      #
+      # @api private
+      prepend(::Module.new do
+        def initialize(...)
+          self.class.validate_macro_calls_once!
+          super
+        end
+      end)
+
       config.messages.top_namespace = DEFAULT_ERRORS_NAMESPACE
       config.messages.load_paths << DEFAULT_ERRORS_PATH
 

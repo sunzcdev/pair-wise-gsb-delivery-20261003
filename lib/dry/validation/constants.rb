@@ -32,6 +32,39 @@ module Dry
     # Error raised when trying to define a schema in a contract class that already has a schema
     DuplicateSchemaError = ::Class.new(::StandardError)
 
+    # Error raised when a macro call doesn't match the macro's declared signature
+    #
+    # @see Macro::Signature
+    InvalidMacroCallError = ::Class.new(::StandardError) do
+      # @api private
+      def initialize(contract:, rule:, macro:, reason:)
+        super(
+          "#{MacroCallContext.(contract, rule)} calls macro #{macro.inspect} " \
+          "with invalid arguments: #{reason}"
+        )
+      end
+    end
+
+    # Error raised when macro expansion detects a cycle
+    MacroCycleError = ::Class.new(::StandardError) do
+      # @api private
+      def initialize(contract:, rule:, chain:)
+        super(
+          "#{MacroCallContext.(contract, rule)} expands macros cyclically: " \
+          "#{chain.map(&:inspect).join(' -> ')}"
+        )
+      end
+    end
+
+    # Builds a human-readable "Contract.rule(:key)" location for macro errors
+    #
+    # @api private
+    MacroCallContext = lambda do |contract, rule|
+      label = contract.respond_to?(:name) ? (contract.name || contract.inspect) : contract
+      keys = Array(rule).map(&:inspect).join(", ")
+      "#{label}.rule(#{keys})"
+    end
+
     # Error raised during initialization of a contract that has no schema defined
     SchemaMissingError = ::Class.new(::StandardError) do
       # @api private

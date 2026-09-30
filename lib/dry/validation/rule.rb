@@ -78,6 +78,7 @@ module Dry
       def each(*macros, &block)
         root = keys[0]
         macros = parse_macros(*macros)
+        @each_macros = macros
         @keys = []
 
         @block = proc do
@@ -123,6 +124,18 @@ module Dry
             macros << Array(spec)
           end
         end
+      end
+
+      # Return all macro call specs used by this rule
+      #
+      # This includes macros passed to `validate` as well as macros passed
+      # to `each`, so that contract classes can check every macro call
+      #
+      # @return [Array]
+      #
+      # @api private
+      def macro_calls
+        macros + (@each_macros || EMPTY_ARRAY)
       end
 
       def add_macro_from_hash(macros, spec)
