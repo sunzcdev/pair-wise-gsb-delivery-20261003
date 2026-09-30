@@ -36,12 +36,12 @@ module Rack
         @public_resources
       end
 
-      def allow_origin?(source, env = {})
+      def allow_origin?(source, env = {}, conditions = Rack::Cors::Conditions.new)
         return true if public_resources?
 
         !!@origins.detect do |origin|
           if origin.is_a?(Proc)
-            origin.call(source, env)
+            conditions.evaluate(origin, source, env)
           elsif origin.is_a?(Regexp)
             source =~ origin
           else
@@ -50,12 +50,16 @@ module Rack
         end
       end
 
-      def match_resource(path, env)
-        @resources.detect { |r| r.match?(path, env) }
+      def match_resource(path, env, conditions = Rack::Cors::Conditions.new)
+        @resources.detect { |r| r.match?(path, env, conditions) }
       end
 
       def resource_for_path(path)
         @resources.detect { |r| r.matches_path?(path) }
+      end
+
+      def resources_for_path(path)
+        @resources.select { |r| r.matches_path?(path) }
       end
     end
   end

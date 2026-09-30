@@ -8,6 +8,7 @@ module Rack
       CORS_SIMPLE_HEADERS = %w[accept accept-language content-language content-type].freeze
 
       attr_accessor :path, :methods, :headers, :expose, :max_age, :credentials, :pattern, :if_proc, :vary_headers
+      attr_reader :public_resource
 
       def initialize(public_resource, path, opts = {})
         raise CorsMisconfigurationError if public_resource && opts[:credentials] == true
@@ -40,8 +41,8 @@ module Rack
         pattern =~ path
       end
 
-      def match?(path, env)
-        matches_path?(path) && (if_proc.nil? || if_proc.call(env))
+      def match?(path, env, conditions = Rack::Cors::Conditions.new)
+        matches_path?(path) && (if_proc.nil? || conditions.evaluate(if_proc, env))
       end
 
       def process_preflight(env, result)
@@ -69,6 +70,17 @@ module Rack
         header_proc.call(h)
       end
 
+      def allow_headers?(request_headers)
+        headers = self.headers || []
+        return true if headers == :any
+
+        request_headers = request_headers.split(/,\s*/) if request_headers.is_a?(String)
+        request_headers.all? do |header|
+          header = header.downcase
+          CORS_SIMPLE_HEADERS.include?(header) || headers.include?(header)
+        end
+      end
+
       protected
 
       def public_resource?
@@ -85,17 +97,6 @@ module Rack
         h = to_headers(env)
         h.merge!('access-control-allow-headers' => env[Rack::Cors::HTTP_ACCESS_CONTROL_REQUEST_HEADERS]) if env[Rack::Cors::HTTP_ACCESS_CONTROL_REQUEST_HEADERS]
         h
-      end
-
-      def allow_headers?(request_headers)
-        headers = self.headers || []
-        return true if headers == :any
-
-        request_headers = request_headers.split(/,\s*/) if request_headers.is_a?(String)
-        request_headers.all? do |header|
-          header = header.downcase
-          CORS_SIMPLE_HEADERS.include?(header) || headers.include?(header)
-        end
       end
 
       def ensure_enum(var)

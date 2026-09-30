@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 require 'logger'
+require_relative 'cors/conditions'
 require_relative 'cors/resources'
 require_relative 'cors/resource'
+require_relative 'cors/combined_resource'
 require_relative 'cors/result'
 require_relative 'cors/version'
 
@@ -26,9 +28,14 @@ module Rack
 
     DEFAULT_VARY_HEADERS = ['Origin'].freeze
 
+    def self.intersection_mode?(mode)
+      mode.to_s == 'intersection'
+    end
+
     def initialize(app, opts = {}, &block)
       @app = app
       @debug_mode = !!opts[:debug]
+      @intersection_mode = self.class.intersection_mode?(opts[:mode] || opts[:matching_mode])
       @logger = @logger_proc = nil
 
       logger = opts[:logger]
@@ -51,6 +58,10 @@ module Rack
 
     def debug?
       @debug_mode
+    end
+
+    def intersection_mode?
+      @intersection_mode
     end
 
     def allow(&block)
@@ -97,7 +108,7 @@ module Rack
       # This call must be done BEFORE calling the app because for some reason
       # env[PATH_INFO] gets changed after that and it won't match. (At least
       # in rails 4.1.6)
-      vary_resource = resource_for_path(path)
+      vary_resource = env[ENV_KEY]&.resource || resource_for_path(path)
 
       status, headers, body = @app.call env
 
@@ -177,6 +188,7 @@ module Rack
         return {}
       end
 
+      result.resource = resource if intersection_mode?
       resource.process_preflight(env, result)
     end
 
@@ -184,9 +196,8 @@ module Rack
       resource, error = match_resource(path, env)
       if resource
         Result.hit(env)
-        cors = resource.to_headers(env)
-        cors
-
+        env[ENV_KEY].resource = resource if intersection_mode?
+        resource.to_headers(env)
       else
         Result.miss(env, error)
         nil
@@ -202,18 +213,52 @@ module Rack
     end
 
     def match_resource(path, env)
-      origin = env[HTTP_ORIGIN]
+      conditions = Conditions.new
+      return match_intersection_resource(path, env, conditions) if intersection_mode?
 
+      origin = env[HTTP_ORIGIN]
       origin_matched = false
+
       all_resources.each do |r|
-        next unless r.allow_origin?(origin, env)
+        next unless r.allow_origin?(origin, env, conditions)
 
         origin_matched = true
-        found = r.match_resource(path, env)
+        found = r.match_resource(path, env, conditions)
         return [found, nil] if found
       end
 
       [nil, origin_matched ? Result::MISS_NO_PATH : Result::MISS_NO_ORIGIN]
+    end
+
+    def match_intersection_resource(path, env, conditions)
+      origin = env[HTTP_ORIGIN]
+      matched_resources = []
+      path_matched = false
+      origin_denied = false
+
+      all_resources.each do |r|
+        path_resources = r.resources_for_path(path)
+        next if path_resources.empty?
+
+        path_matched = true
+        unless r.allow_origin?(origin, env, conditions)
+          origin_denied = true
+          next
+        end
+
+        found = path_resources.detect do |resource|
+          resource.if_proc.nil? || conditions.evaluate(resource.if_proc, env)
+        end
+        matched_resources << found if found
+      end
+
+      if !origin_denied && matched_resources.any?
+        [CombinedResource.new(matched_resources), nil]
+      elsif path_matched
+        [nil, Result::MISS_NO_PATH]
+      else
+        [nil, Result::MISS_NO_ORIGIN]
+      end
     end
   end
 end

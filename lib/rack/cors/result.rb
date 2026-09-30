@@ -12,7 +12,7 @@ module Rack
       MISS_DENY_METHOD = 'deny-method'
       MISS_DENY_HEADER = 'deny-header'
 
-      attr_accessor :preflight, :hit, :miss_reason
+      attr_accessor :preflight, :hit, :miss_reason, :resource
 
       def hit?
         !!hit
@@ -27,10 +27,11 @@ module Rack
         self.miss_reason = reason
       end
 
-      def self.hit(env)
+      def self.hit(env, resource = nil)
         r = Result.new
         r.preflight = false
         r.hit = true
+        r.resource = resource
         env[Rack::Cors::ENV_KEY] = r
       end
 

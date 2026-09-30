@@ -76,9 +76,30 @@ use Rack::Cors do
 end
 ```
 
+### Combining Policies
+
+By default, the first matching `allow` rule wins. When independent layers of rules must be enforced together, use `mode: :intersection`:
+
+```ruby
+use Rack::Cors, mode: :intersection do
+  allow do
+    origins '*'
+    resource '/api/*', methods: [:get, :post], headers: :any, max_age: 600
+  end
+
+  allow do
+    origins 'https://example.com'
+    resource '/api/*', methods: :get, headers: 'Authorization', credentials: true, max_age: 300
+  end
+end
+```
+
+For a request to be allowed, its origin, path conditions, preflight method, and preflight headers must be accepted by every applicable rule. The response combines only capabilities allowed by all rules: origins and credentials are tightened when a wildcard is involved, methods and exposed headers are intersected, and the smallest `max_age` is used. Declaration order does not affect the result.
+
 ### Configuration Reference
 
 #### Middleware Options
+* **mode** (`:first_match` (default) or `:intersection`): Selects how matching `allow` rules are combined. `:intersection` is useful when separate platform and business policies must all permit a request.
 * **debug** (boolean):  Enables debug logging and `X-Rack-CORS` HTTP headers for debugging.
 * **logger** (Object or Proc): Specify the logger to log to.  If a proc is provided, it will be called when a logger is needed.  This is helpful in cases where the logger is initialized after `Rack::Cors` is initially configured, like `Rails.logger`.
 
