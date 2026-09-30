@@ -20,6 +20,16 @@ module Dry
       #   @api private
       option :keys
 
+      # @!attribute [r] name
+      #   @return [Symbol, nil]
+      #   @api private
+      option :name, optional: true, default: proc { nil }
+
+      # @!attribute [r] depends_on
+      #   @return [Array<Symbol>]
+      #   @api private
+      option :depends_on, default: proc { EMPTY_ARRAY.dup }
+
       # @!attribute [r] macros
       #   @return [Array<Symbol>]
       #   @api private
@@ -106,7 +116,11 @@ module Dry
       #
       # @api public
       def inspect
-        %(#<#{self.class} keys=#{keys.inspect}>)
+        if name
+          %(#<#{self.class} name=#{name.inspect} keys=#{keys.inspect}>)
+        else
+          %(#<#{self.class} keys=#{keys.inspect}>)
+        end
       end
 
       # Parse function arguments into macros structure

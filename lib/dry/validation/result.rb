@@ -44,6 +44,16 @@ module Dry
       # @api private
       attr_reader :options
 
+      # Rules that were skipped because one of their dependencies did not pass
+      #
+      # Maps rule names to the reason they were skipped. Skipped rules are
+      # tracked separately from {#errors} and never appear there.
+      #
+      # @return [Hash{Symbol => String}]
+      #
+      # @api public
+      attr_reader :skipped_rules
+
       # Initialize a new result
       #
       # @api private
@@ -52,6 +62,7 @@ module Dry
         @context = context
         @options = options
         @errors = initialize_errors
+        @skipped_rules = {}
       end
 
       # Return values wrapper with the input processed by schema
@@ -148,6 +159,14 @@ module Dry
         self
       end
 
+      # Record a rule that was skipped along with the reason
+      #
+      # @api private
+      def skip_rule(name, reason)
+        @skipped_rules[name] = reason
+        self
+      end
+
       # Read a value under provided key
       #
       # @param [Symbol] key
@@ -194,6 +213,7 @@ module Dry
       def freeze
         values.freeze
         errors.freeze
+        skipped_rules.freeze
         super
       end
 

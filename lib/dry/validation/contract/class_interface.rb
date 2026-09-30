@@ -90,14 +90,64 @@ module Dry
         #     failure('please provide a valid street address') if valid_street?(values[:street])
         #   end
         #
+        # @example naming a rule and declaring dependencies on other rules
+        #   rule(:account, name: :account_active) do
+        #     key.failure('is not active') unless active?(values[:account])
+        #   end
+        #
+        #   rule(:account, name: :account_limit, depends_on: :account_active) do
+        #     key.failure('limit exceeded') if over_limit?(values[:account])
+        #   end
+        #
+        # @param [Symbol, nil] name Optional unique name used as a dependency target
+        # @param [Symbol, Array<Symbol>] depends_on Names of rules that must pass first
+        #
         # @return [Rule]
         #
         # @api public
-        def rule(*keys, &block)
-          ensure_valid_keys(*keys) if __schema__
+        def rule(*keys, **options, &block)
+          name = options.delete(:name)
+          depends_on = Array(options.delete(:depends_on) || EMPTY_ARRAY)
+          keys << options unless options.empty?
 
-          Rule.new(keys: keys, block: block).tap do |rule|
+          ensure_valid_keys(*keys) if __schema__
+          ensure_valid_rule_dependencies(name, depends_on)
+
+          Rule.new(keys: keys, name: name, depends_on: depends_on, block: block).tap do |rule|
             rules << rule
+            @rule_schedule = nil
+          end
+        end
+
+        # Return rules in a stable order that respects declared dependencies
+        #
+        # Rules are scheduled in definition order as long as their dependencies
+        # have been scheduled before them.
+        #
+        # @return [Array<Rule>]
+        #
+        # @api private
+        def rule_schedule
+          @rule_schedule ||= begin
+            scheduled = []
+            remaining = rules.dup
+
+            until remaining.empty?
+              scheduled_names = scheduled.filter_map(&:name)
+              ready_index = remaining.find_index { |rule|
+                (rule.depends_on - scheduled_names).empty?
+              }
+
+              if ready_index.nil?
+                raise RuleDependencyCycleError,
+                      "#{self}.rule dependencies form a cycle: " \
+                      "#{remaining.filter_map(&:name).inspect}"
+              end
+
+              scheduled << remaining.delete_at(ready_index)
+            end
+
+            scheduled
           end
         end
 
@@ -145,6 +195,28 @@ module Dry
         end
 
         private
+
+        # @api private
+        def ensure_valid_rule_dependencies(name, depends_on)
+          names = rules.filter_map(&:name)
+
+          if name && names.include?(name)
+            raise DuplicateRuleNameError,
+                  "#{self}.rule name #{name.inspect} is already used by another rule"
+          end
+
+          depends_on.each do |dependency|
+            if dependency == name
+              raise RuleDependencyCycleError,
+                    "#{self}.rule #{name.inspect} depends on itself"
+            end
+
+            next if names.include?(dependency)
+
+            raise UnknownRuleDependencyError,
+                  "#{self}.rule #{name.inspect} depends on an unknown rule #{dependency.inspect}"
+          end
+        end
 
         # @api private
         def ensure_valid_keys(*keys)

@@ -98,14 +98,35 @@ module Dry
         end
 
         Result.new(schema.(input), context_map) do |result|
-          rules.each do |rule|
-            next if rule.keys.any? { |key| error?(result, key) }
+          outcomes = {}
+
+          self.class.rule_schedule.each do |rule|
+            unmet_dependency = rule.depends_on.find { |name| outcomes[name] != :passed }
+
+            if unmet_dependency
+              result.skip_rule(
+                rule.name,
+                "dependency #{unmet_dependency.inspect} #{outcomes[unmet_dependency]}"
+              ) if rule.name
+
+              outcomes[rule.name] = :skipped if rule.name
+
+              next
+            end
+
+            if rule.keys.any? { |key| error?(result, key) }
+              outcomes[rule.name] = :skipped if rule.name
+
+              next
+            end
 
             rule_result = rule.(self, result)
 
             rule_result.failures.each do |failure|
               result.add_error(message_resolver.(**failure))
             end
+
+            outcomes[rule.name] = rule_result.failures.empty? ? :passed : :failed if rule.name
           end
         end
       end
