@@ -96,6 +96,7 @@ require "stringio"
 
 require_relative "csv/fields_converter"
 require_relative "csv/input_record_separator"
+require_relative "csv/multiset_diff"
 require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
