@@ -148,6 +148,43 @@ considered rough estimates, and you should measure with representative formulas
 from your application.  Also, if new formulas are constantly introduced to your
 application, AST caching will consume more memory with each new formula.
 
+REPLACING CUSTOM FUNCTIONS AT RUNTIME
+-------------------------------------
+
+When a custom function is (re-)registered while ASTs are already cached, the
+cached ASTs follow an explicit contract. Every compilation records the
+function registry generation at compile time, and the caller chooses one of
+two resolution modes:
+
+- `:pinned` (default) -- the compiled AST keeps calling the exact function
+  definitions it was compiled against, even if those functions are
+  re-registered later.
+- `:latest` -- whenever the registry generation has moved since compilation,
+  the expression is tokenized and parsed again before use. Arity, parameter,
+  and return types are re-validated against the new definitions (a mismatch
+  raises `Dentaku::ParseError`), and the AST calls the newest definitions.
+
+The mode can be set per calculator or per compilation:
+
+```ruby
+calculator = Dentaku::Calculator.new(cache_ast: true, function_resolution: :latest)
+
+compiled = calculator.compile('tax(total)')                 # calculator default
+compiled = calculator.compile('tax(total)', functions: :latest)
+compiled.registry_generation  # generation captured at compile time
+compiled.stale?               # true once any function is re-registered
+calculator.evaluate!(compiled, total: 100)
+```
+
+Alias changes and an instance function shadowing a global one both count as
+environment changes: they participate in the cache identity, so a cached AST
+is never reused across them without recompilation. Cache entries are keyed by
+the expression and the compile-time environment only -- never by evaluation
+data -- so two calculators can safely share one external cache
+(`ast_cache: shared_hash`) even when they register same-named functions with
+different implementations; each calculator's results depend solely on its own
+registry, not on which calculator evaluated a formula first.
+
 DEPENDENCY ANALYSIS AND SHORT-CIRCUITING
 ----------------------------------------
 

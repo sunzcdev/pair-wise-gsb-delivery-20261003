@@ -1,4 +1,5 @@
 require 'dentaku/bulk_expression_solver'
+require 'dentaku/compilation'
 require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
@@ -9,18 +10,24 @@ require 'dentaku/token'
 module Dentaku
   class Calculator
     include StringCasing
+
+    FUNCTION_RESOLUTION_MODES = [:pinned, :latest].freeze
+
     attr_reader :result, :memory, :tokenizer, :case_sensitive,
-                :nested_data_support, :ast_cache, :raw_date_literals
+                :nested_data_support, :ast_cache, :raw_date_literals,
+                :function_resolution
 
     def initialize(case_sensitive: false, aliases: nil, nested_data_support: true,
                    raw_date_literals: true, ast_cache: {},
-                   cache_ast: nil, cache_dependency_order: nil)
+                   cache_ast: nil, cache_dependency_order: nil,
+                   function_resolution: :pinned)
       clear
       @tokenizer = Tokenizer.new
       @case_sensitive = case_sensitive
       @aliases = aliases
       @nested_data_support = nested_data_support
       @raw_date_literals = raw_date_literals
+      @function_resolution = normalize_function_resolution(function_resolution)
       @ast_cache = ast_cache
       @cache_ast = cache_ast
       @cache_dependency_order = cache_dependency_order
@@ -132,21 +139,34 @@ module Dentaku
 
     def ast(expression)
       return expression if expression.is_a?(AST::Node)
+      return expression.node if expression.is_a?(Compilation)
       return expression.map { |e| ast(e) } if expression.is_a? Array
 
-      @ast_cache.fetch(expression) {
-        options = {
-          aliases: aliases,
-          case_sensitive: case_sensitive,
-          function_registry: @function_registry,
-          raw_date_literals: raw_date_literals
-        }
+      cached_ast(expression) || compile(expression).node
+    end
 
-        tokens = tokenizer.tokenize(expression, options)
-        Parser.new(tokens, options).parse.tap do |node|
-          @ast_cache[expression] = node if cache_ast?
-        end
-      }
+    # Compile +expression+ against the current function registry and return a
+    # Dentaku::Compilation. The +functions+ option selects which definitions
+    # the resulting AST calls when a custom function is re-registered later:
+    # :pinned keeps the original definitions, :latest re-validates against
+    # (and calls) the newest ones. Defaults to the calculator's
+    # +function_resolution+.
+    def compile(expression, functions: nil)
+      mode = normalize_function_resolution(functions || @function_resolution)
+      Compilation.new(self, expression, parse_expression(expression), mode).tap do |compilation|
+        cache_compilation(expression, compilation) if cache_ast?
+      end
+    end
+
+    # Generation of the function registries this calculator compiles against:
+    # [instance, global]. Bumped on every (re-)registration, including an
+    # instance function shadowing a global one, so a Dentaku::Compilation can
+    # tell whether the registry has moved since it was built.
+    def registry_generation
+      [
+        @function_registry.generation,
+        AST::FunctionRegistry.default.generation
+      ]
     end
 
     def load_cache(ast_cache)
@@ -236,6 +256,60 @@ module Dentaku
 
     def cache_dependency_order?
       @cache_dependency_order.nil? ? Dentaku.cache_dependency_order? : @cache_dependency_order
+    end
+
+    private def parse_expression(expression)
+      options = {
+        aliases: aliases,
+        case_sensitive: case_sensitive,
+        function_registry: @function_registry,
+        raw_date_literals: raw_date_literals
+      }
+
+      tokens = tokenizer.tokenize(expression, options)
+      Parser.new(tokens, options).parse
+    end
+
+    private def cached_ast(expression)
+      case entry = @ast_cache[expression]
+      when nil then nil
+      when AST::Node then entry # pre-warmed/legacy entries are trusted as-is
+      when Hash
+        compilation = entry[cache_environment]
+        compilation.node if compilation
+      end
+    end
+
+    private def cache_compilation(expression, compilation)
+      entry = @ast_cache[expression]
+      return if entry.is_a?(AST::Node) # a pre-warmed node stays authoritative
+
+      entry = @ast_cache[expression] = {} unless entry.is_a?(Hash)
+      entry[cache_environment] = compilation
+    end
+
+    # Identity of everything besides the expression text that determines how
+    # the expression compiles: which registries resolve its functions (so two
+    # calculators sharing a cache never see each other's same-named
+    # functions), the aliases applied during tokenization, and the tokenizer
+    # flags. Evaluation data is never part of the environment, so cached
+    # entries stay independent of the inputs of any single call.
+    private def cache_environment
+      [
+        @function_registry.object_id,
+        AST::FunctionRegistry.default.object_id,
+        aliases.map { |key, vals| [key.to_s, Array(vals).map(&:to_s).sort] }.sort,
+        case_sensitive,
+        raw_date_literals
+      ]
+    end
+
+    private def normalize_function_resolution(mode)
+      mode = mode.to_sym
+      return mode if FUNCTION_RESOLUTION_MODES.include?(mode)
+
+      raise ::ArgumentError,
+            "unknown function resolution mode: #{mode.inspect} (expected :pinned or :latest)"
     end
   end
 end

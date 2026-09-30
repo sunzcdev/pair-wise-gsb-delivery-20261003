@@ -1,6 +1,15 @@
 module Dentaku
   module AST
     class FunctionRegistry < Hash
+      # bumped on every (re-)registration so compiled expressions can tell
+      # whether the registry has moved since they were built
+      attr_reader :generation
+
+      def initialize
+        super
+        @generation = 0
+      end
+
       def get(name)
         name = function_name(name)
         return self[name] if has_key?(name)
@@ -98,10 +107,14 @@ module Dentaku
         function.volatile = volatile
 
         self[function_name(name)] = function
+        @generation += 1
+        function
       end
 
       def register_class(name, function_class)
         self[function_name(name)] = function_class
+        @generation += 1
+        function_class
       end
 
       def default

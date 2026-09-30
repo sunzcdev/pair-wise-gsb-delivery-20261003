@@ -1,5 +1,19 @@
 # Change Log
 
+## Unreleased
+- replacing a custom function at runtime now has an explicit contract for
+  already-cached ASTs. `Calculator#compile` returns a `Dentaku::Compilation`
+  that records the function registry generation at compile time, and the new
+  `function_resolution` calculator option (or `functions:` compile option)
+  selects the behavior: `:pinned` (default) keeps calling the original
+  definitions, while `:latest` re-tokenizes and re-parses the expression
+  whenever the registry generation has moved -- re-validating arity,
+  parameter, and return types against the new definitions. Alias changes and
+  instance functions shadowing global ones participate in the cache identity,
+  cache entries never store evaluation data, and calculators sharing an
+  external cache with same-named but different function implementations are
+  isolated from each other regardless of evaluation order.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized
