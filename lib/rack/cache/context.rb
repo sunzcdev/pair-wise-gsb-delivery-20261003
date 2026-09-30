@@ -210,10 +210,9 @@ module Rack::Cache
     end
 
     # Validate that the cache entry is fresh. The original request is used
-    # as a template for a conditional GET request with the backend.
+    # as a template for a conditional request with the backend.
     def validate(entry)
-      # send no head requests because we want content
-      convert_head_to_get!
+      head_revalidation = head_revalidation?
 
       # add our cached last-modified validator to the environment
       @env['HTTP_IF_MODIFIED_SINCE'] = entry.last_modified
@@ -226,29 +225,39 @@ module Rack::Cache
       etags = (cached_etags + request_etags).uniq
       @env['HTTP_IF_NONE_MATCH'] = etags.empty? ? nil : etags.join(', ')
 
+      unless head_revalidation
+        convert_head_to_get!
+      end
+
       response = forward
 
       if response.status == 304
-        record :valid
-
         # Check if the response validated which is not cached here
         etag = response.headers['etag']
-        return response if etag && request_etags.include?(etag) && !cached_etags.include?(etag)
-
-        entry = entry.dup
-        entry.headers.delete('date')
-        %w[Date expires cache-control etag last-modified].each do |name|
-          next unless value = response.headers[name]
-          entry.headers[name] = value
+        if etag && request_etags.include?(etag) && !cached_etags.include?(etag)
+          record :valid
+          return response
         end
 
-        # even though it's empty, be sure to close the response body from upstream
-        # because middleware use close to signal end of response
-        response.body.close if response.body.respond_to?(:close)
+        if head_revalidation && !head_304_response_compatible?(entry, response)
+          record :invalid
+          return response
+        end
 
-        response = entry
+        record :valid
+        response = update_validated_entry(entry, response)
       else
-        record :invalid
+        if head_revalidation
+          if response.status == 200 && head_response_compatible?(entry, response)
+            record :valid
+            response = update_validated_entry(entry, response)
+          else
+            record :invalid
+            return response
+          end
+        else
+          record :invalid
+        end
       end
 
       store(response) if response.cacheable?
@@ -261,9 +270,11 @@ module Rack::Cache
     # conditional / validation requests through to the backend but performs no
     # caching of the response when the backend returns a 304.
     def fetch
-      # send no head requests because we want content
-      convert_head_to_get!
+      if head_revalidation?
+        return forward
+      end
 
+      convert_head_to_get!
       response = forward
 
       # Mark the response as explicitly private if any of the private
@@ -318,12 +329,56 @@ module Rack::Cache
       end
     end
 
-    # send no head requests because we want content
+    # Convert HEAD to GET only when the response body must be fetched from
+    # the origin.
     def convert_head_to_get!
       if @env['REQUEST_METHOD'] == 'HEAD'
         @env['REQUEST_METHOD'] = 'GET'
         @env['rack.methodoverride.original_method'] = 'HEAD'
       end
+    end
+
+    def head_revalidation?
+      @request.head? && allow_head_revalidation?
+    end
+
+    def head_304_response_compatible?(entry, response)
+      entry.validateable? &&
+        !conflicting_header?(entry, response, 'etag') &&
+        !conflicting_header?(entry, response, 'last-modified') &&
+        !conflicting_header?(entry, response, 'content-length') &&
+        !conflicting_header?(entry, response, 'content-encoding') &&
+        !conflicting_header?(entry, response, 'content-type')
+    end
+
+    def head_response_compatible?(entry, response)
+      etag = strong_etag(response.headers['etag'])
+      etag && etag == strong_etag(entry.headers['etag']) &&
+        !conflicting_header?(entry, response, 'content-length') &&
+        !conflicting_header?(entry, response, 'content-encoding') &&
+        !conflicting_header?(entry, response, 'content-type')
+    end
+
+    def conflicting_header?(entry, response, name)
+      entry.headers[name] && response.headers[name] &&
+        entry.headers[name] != response.headers[name]
+    end
+
+    def strong_etag(value)
+      value if value && value.start_with?('"')
+    end
+
+    def update_validated_entry(entry, response)
+      entry = entry.dup
+      entry.headers.delete('date')
+      %w[Date expires cache-control etag last-modified vary].each do |name|
+        next unless value = response.headers[name]
+        entry.headers[name] = value
+      end
+
+      response.body.close if response.body.respond_to?(:close)
+
+      entry
     end
   end
 end

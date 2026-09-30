@@ -107,6 +107,24 @@ a refresh (e.g., clicking the "Refresh" button).
 
 *IMPORTANT: Enabling this option globally allows all clients to break your cache.*
 
+### `allow_head_revalidation`
+
+A boolean specifying whether stale cache entries may be refreshed with a
+conditional `HEAD` request. This option is disabled by default, preserving the
+historical behavior of converting stale `HEAD` requests into `GET` requests so
+the complete response can be fetched.
+
+When enabled, `HEAD` requests are forwarded to the origin as `HEAD`. A cached
+`GET` entry is updated only when the response proves that it represents the
+same entity. A `304` response must not change the entry's entity metadata, and
+a `200` response must include the same strong validator and a compatible
+`Content-Length` and content encoding. The stored response body is retained and
+used for later `GET` requests.
+
+Conflicting or insufficient validation information is never stored as an empty
+response. The following `GET` request revalidates or fetches the complete
+representation normally.
+
 ### `cache_key`
 
 A custom cache key generator, which can be anything that responds to :call.

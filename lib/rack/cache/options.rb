@@ -103,6 +103,10 @@ module Rack::Cache
     # cache-control "max-age=0" directive in the request. Disabled by default.
     option_accessor :allow_revalidate
 
+    # Specifies whether HEAD requests may revalidate stale GET entries
+    # without being converted to GET requests. Disabled by default.
+    option_accessor :allow_head_revalidation
+
     # Specifies whether the underlying entity store's native expiration should
     # be used.
     option_accessor :use_native_ttl
@@ -152,6 +156,7 @@ module Rack::Cache
         'rack-cache.private_headers'  => ['Authorization', 'Cookie'],
         'rack-cache.allow_reload'     => false,
         'rack-cache.allow_revalidate' => false,
+        'rack-cache.allow_head_revalidation'  => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
       }

@@ -1,6 +1,7 @@
 ## 1.13.0
 
  * Support lowercase Vary and Age headers
+ * Add opt-in allow_head_revalidation for HEAD cache freshening
 
 ## 1.12.0
 

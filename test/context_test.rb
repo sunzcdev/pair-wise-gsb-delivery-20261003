@@ -852,6 +852,238 @@ describe Rack::Cache::Context do
     response['content-length'].must_equal 'Hello World'.length.to_s
   end
 
+  it 'converts stale HEAD requests to GET unless HEAD revalidation is enabled' do
+    methods = []
+    respond_with do |req,res|
+      methods << req.request_method
+      if methods.length == 1
+        res['cache-control'] = 'max-age=0'
+        res['etag'] = '"v1"'
+        res.body = ['Hello World']
+      else
+        req.request_method.must_equal 'GET'
+        req.env['rack.methodoverride.original_method'].must_equal 'HEAD'
+        res['cache-control'] = 'max-age=0'
+        res['etag'] = '"v2"'
+        res.body = ['Changed!']
+      end
+    end
+
+    get '/'
+    head '/'
+
+    response.body.must_equal ''
+    cache.trace.must_include :invalid
+    methods.must_equal %w[GET GET]
+  end
+
+  describe 'with allow_head_revalidation enabled' do
+    def allow_head_revalidation
+      { 'rack-cache.allow_head_revalidation' => true }
+    end
+
+    it 'keeps stale HEAD revalidation as HEAD and preserves the GET body after 304' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v1"'
+          res['content-length'] = '11'
+          res.body = ['Hello World']
+        else
+          req.request_method.must_equal 'HEAD'
+          req.env.wont_include 'rack.methodoverride.original_method'
+          req.env['HTTP_IF_NONE_MATCH'].must_equal '"v1"'
+          res.status = 304
+          res['etag'] = '"v1"'
+          res['cache-control'] = 'max-age=200'
+          res.body = []
+        end
+      end
+
+      get '/'
+      response.body.must_equal 'Hello World'
+
+      head '/', allow_head_revalidation
+      response.status.must_equal 200
+      response.body.must_equal ''
+      response['cache-control'].must_equal 'max-age=200'
+      response['content-length'].must_equal '11'
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+      cache.trace.must_include :store
+
+      app.reset!
+      get '/'
+      refute app.called?
+      response.body.must_equal 'Hello World'
+      methods.must_equal %w[GET HEAD]
+    end
+
+    it 'updates metadata from compatible HEAD 200 responses and preserves the GET body' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v1"'
+          res['content-length'] = '11'
+          res.body = ['Hello World']
+        else
+          req.request_method.must_equal 'HEAD'
+          res.status = 200
+          res['cache-control'] = 'max-age=200'
+          res['etag'] = '"v1"'
+          res['content-length'] = '11'
+          res.body = []
+        end
+      end
+
+      get '/'
+      head '/', allow_head_revalidation
+
+      response.status.must_equal 200
+      response['cache-control'].must_equal 'max-age=200'
+      cache.trace.must_include :valid
+      cache.trace.must_include :store
+
+      app.reset!
+      get '/'
+      refute app.called?
+      response.body.must_equal 'Hello World'
+      methods.must_equal %w[GET HEAD]
+    end
+
+    it 'does not use a weak validator to freshen a HEAD 200 response' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = 'W/"v1"'
+          res['content-length'] = '11'
+          res.body = methods.count('GET') == 1 ? ['Hello World'] : ['Changed!']
+        else
+          res.status = 200
+          res['etag'] = 'W/"v1"'
+          res['content-length'] = '11'
+          res.body = []
+        end
+      end
+
+      get '/'
+      head '/', allow_head_revalidation
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :store
+
+      get '/'
+      response.body.must_equal 'Changed!'
+      methods.must_equal %w[GET HEAD GET]
+    end
+
+    it 'does not use a conflicting HEAD response as a validated complete entity' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        case [req.request_method, methods.count(req.request_method)]
+        when ['GET', 1]
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v1"'
+          res['content-length'] = '11'
+          res.body = ['Hello World']
+        when ['HEAD', 1]
+          res.status = 200
+          res['etag'] = '"v1"'
+          res['content-length'] = '99'
+          res.body = []
+        else
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v2"'
+          res['content-length'] = '8'
+          res.body = ['Changed!']
+        end
+      end
+
+      get '/'
+      head '/', allow_head_revalidation
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :store
+
+      get '/'
+      response.body.must_equal 'Changed!'
+      methods.must_equal %w[GET HEAD GET]
+    end
+
+    it 'does not create a GET entry when HEAD misses' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        if req.head?
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v1"'
+          res.body = []
+        else
+          res.status = 200
+          res['cache-control'] = 'max-age=0'
+          res['etag'] = '"v1"'
+          res.body = ['Hello World']
+        end
+      end
+
+      head '/', allow_head_revalidation
+      response.status.must_equal 200
+      cache.trace.must_equal [:miss]
+      cache.trace.wont_include :store
+
+      app.reset!
+      get '/'
+      assert app.called?
+      cache.trace.must_include :miss
+      response.body.must_equal 'Hello World'
+      methods.must_equal %w[HEAD GET]
+    end
+
+    it 'does not freshen a stale entry that lacks a strong validator' do
+      methods = []
+      respond_with do |req,res|
+        methods << req.request_method
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'max-age=100'
+          res['content-length'] = '11'
+          res.body = methods.count('GET') == 1 ? ['Hello World'] : ['Changed!']
+        else
+          res.status = 200
+          res['cache-control'] = 'max-age=200'
+          res['etag'] = '"v1"'
+          res['content-length'] = '11'
+          res.body = []
+        end
+      end
+
+      get '/'
+      hash = cache.metastore.to_hash
+      entries = Marshal.load(hash.values.first)
+      entries.first.last['cache-control'] = 'max-age=0'
+      hash[hash.keys.first] = Marshal.dump(entries)
+
+      head '/', allow_head_revalidation
+      cache.trace.must_include :invalid
+      cache.trace.wont_include :store
+
+      get '/'
+      response.body.must_equal 'Changed!'
+      methods.must_equal %w[GET HEAD GET]
+    end
+  end
+
   it 'invalidates cached responses on POST' do
     respond_with do |req,res|
       if req.request_method == 'GET'
