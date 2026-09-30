@@ -3,6 +3,8 @@ require 'concurrent/executor/single_thread_executor'
 require 'concurrent/executor/immediate_executor'
 require 'concurrent/executor/fixed_thread_pool'
 require 'concurrent/atomic/count_down_latch'
+require 'concurrent/atomic/event'
+require 'concurrent/atomic/atomic_boolean'
 
 require_relative 'concern/observable_shared'
 
@@ -1212,6 +1214,317 @@ module Concurrent
       end
 
       it_behaves_like :observable
+    end
+
+    context 'keyed latest dispatch (#send_latest)' do
+
+      specify 'returns a pending Receipt for every dispatch' do
+        subject = Agent.new(0)
+        receipt = subject.send_latest(:a) { 1 }
+        expect(receipt).to be_a Agent::Receipt
+        subject.await_for(1)
+        expect(receipt).to be_complete
+        expect(receipt).to be_fulfilled
+      end
+
+      specify 'the receipt is fulfilled with the resulting agent value' do
+        subject = Agent.new(0)
+        receipt = subject.send_latest(:a) { |v| v + 10 }
+        expect(receipt.wait(1)).to be true
+        expect(receipt.value).to eq 10
+        expect(subject.value).to eq 10
+      end
+
+      specify 'each dispatch returns its own distinct receipt' do
+        subject = Agent.new(0)
+        receipts = 3.times.map { |i| subject.send_latest(:a, i) { |v, i| v + i } }
+        subject.await_for(1)
+        expect(receipts.uniq.length).to eq 3
+      end
+
+      specify 'replaces only not-yet-started messages with the same key' do
+        subject  = Agent.new([])
+        started  = Concurrent::Event.new
+        releaser = Concurrent::CountDownLatch.new(1)
+
+        first = subject.send_latest_via(executor, :a, :first) do |list, p|
+          started.set
+          releaser.wait(5)
+          list + [p]
+        end
+        expect(started.wait(2)).to be true
+        second = subject.send_latest_via(executor, :a, :second) { |list, p| list + [p] }
+        third  = subject.send_latest_via(executor, :a, :third)  { |list, p| list + [p] }
+
+        expect(second).to be_superseded
+        expect(third.state).to eq :pending
+
+        releaser.count_down
+        subject.await_for(2)
+
+        expect(subject.value).to eq [:first, :third]
+        expect(first).to be_fulfilled
+        expect(second).to be_superseded
+        expect(second.reason).to be_a Agent::SupersededError
+        expect(third).to be_fulfilled
+        expect(third.value).to eq [:first, :third]
+      end
+
+      specify 'the replacement keeps the original position relative to other messages' do
+        order    = []
+        subject  = Agent.new(0)
+
+        # queue while a first action blocks: [a0(blocking), a1, b1, a2, b2]
+        started = Concurrent::Event.new
+        gate    = Concurrent::CountDownLatch.new(1)
+        a0 = subject.send_latest_via(executor, :a) { started.set; gate.wait(5); order << :a0; :a0 }
+        expect(started.wait(2)).to be true
+        a1 = subject.send_latest_via(executor, :a) { order << :a1; :a1 }
+        b1 = subject.send_latest_via(executor, :b) { order << :b1; :b1 }
+        a2 = subject.send_latest_via(executor, :a) { order << :a2; :a2 }
+        b2 = subject.send_latest_via(executor, :b) { order << :b2; :b2 }
+
+        # latest-write-wins per key, but the surviving message stays at the
+        # original queue position of its key (positions 1 and 2)
+        expect(a1).to be_superseded
+        expect(b1).to be_superseded
+        expect(a2.state).to eq :pending
+        expect(b2.state).to eq :pending
+
+        gate.count_down
+        expect(subject.await_for(5)).to be true
+
+        expect(order).to eq [:a0, :a2, :b2]
+        expect(a0.value).to eq :a0
+        expect(a2.value).to eq :a2
+        expect(b2.value).to eq :b2
+      end
+
+      specify 'different keys and plain messages do not interfere' do
+        executed = []
+        subject  = Agent.new(0)
+        started  = Concurrent::Event.new
+        gate     = Concurrent::CountDownLatch.new(1)
+        record   = ->(tag) { ->(value) { executed << tag; value } }
+
+        # hold the head so the rest queue up and can be coalesced
+        head = subject.send_via(executor) { started.set; gate.wait(5); executed << :head }
+        expect(started.wait(2)).to be true
+
+        # interleave two merge keys with ordinary (keyless) messages
+        x1    = subject.send_latest_via(executor, :x, &record.call(:x1))
+        y1    = subject.send_latest_via(executor, :y, &record.call(:y1))
+        plain = subject.send_via(executor, &record.call(:plain))
+        x2    = subject.send_latest_via(executor, :x, &record.call(:x2))
+        y2    = subject.send_latest_via(executor, :y, &record.call(:y2))
+        x3    = subject.send_latest_via(executor, :x, &record.call(:x3))
+
+        expect(x1).to be_superseded
+        expect(x2).to be_superseded
+        expect(y1).to be_superseded
+        expect(y2.state).to eq :pending
+        expect(x3.state).to eq :pending
+
+        gate.count_down
+        expect(subject.await_for(5)).to be true
+
+        # exactly the surviving payloads run, in queue order
+        expect(executed).to eq [:head, :x3, :y2, :plain]
+        expect(plain).to be true
+        expect(head).to be true
+        [y2, x3].each { |r| expect(r).to be_fulfilled }
+        expect(x1).to be_superseded
+        expect(x2).to be_superseded
+        expect(y1).to be_superseded
+      end
+
+      specify 'an action already executing is never modified' do
+        subject  = Agent.new(0)
+        started  = Concurrent::Event.new
+        releaser = Concurrent::CountDownLatch.new(1)
+
+        running = subject.send_latest(:a, 1) do |_, tag|
+          started.set
+          releaser.wait(5)
+          tag
+        end
+        expect(started.wait(2)).to be true
+        refresh = subject.send_latest(:a, 2) { |_, tag| tag }
+
+        releaser.count_down
+        subject.await_for(2)
+
+        expect(running).to be_fulfilled
+        expect(running.value).to eq 1
+        expect(refresh).to be_fulfilled
+        expect(refresh.value).to eq 2
+        expect(subject.value).to eq 2
+      end
+
+      specify 'passes extra arguments to the action' do
+        subject = Agent.new(0)
+        receipt = subject.send_latest_off(:a, 5, 7) { |v, x, y| v + x + y }
+        subject.await_for(1)
+        expect(receipt.value).to eq 12
+      end
+
+      specify 'raises ArgumentError when the merge key is nil' do
+        subject = Agent.new(0)
+        expect { subject.send_latest(nil) { 1 } }.to raise_error(ArgumentError)
+        expect { subject.send_latest_off(nil) { 1 } }.to raise_error(ArgumentError)
+        expect { subject.send_latest_via(immediate, nil) { 1 } }.to raise_error(ArgumentError)
+      end
+
+      specify 'raises ArgumentError when no action is given' do
+        subject = Agent.new(0)
+        expect { subject.send_latest(:a) }.to raise_error(ArgumentError)
+      end
+
+      specify '#value! raises the SupersededError of a superseded dispatch' do
+        subject  = Agent.new(0)
+        started  = Concurrent::Event.new
+        releaser = Concurrent::CountDownLatch.new(1)
+
+        subject.send_latest_via(executor, :a, :head) do
+          started.set
+          releaser.wait(5)
+          :head
+        end
+        expect(started.wait(2)).to be true
+        second = subject.send_latest_via(executor, :a, :second) { |_, p| p }
+        third  = subject.send_latest_via(executor, :a, :third)  { |_, p| p }
+
+        expect(second).to be_superseded
+
+        releaser.count_down
+        expect(third.value!(2)).to eq :third
+        expect { second.value! }.to raise_error(Agent::SupersededError)
+      end
+
+      context 'when the action raises in :fail mode' do
+
+        it 'rejects the receipt of the failing action with the error' do
+          boom    = StandardError.new('boom')
+          subject = Agent.new(0, error_mode: :fail)
+          receipt = subject.send_latest(:a) { raise boom }
+          expect(receipt.wait(1)).to be true
+          expect(receipt).to be_rejected
+          expect(receipt.reason).to eq boom
+          expect(subject).to be_failed
+        end
+
+        it 'rejects still-queued receipts and does not run their actions' do
+          ran     = Concurrent::AtomicBoolean.new(false)
+          subject = Agent.new(0, error_mode: :fail)
+
+          started  = Concurrent::Event.new
+          releaser = Concurrent::CountDownLatch.new(1)
+          failing  = subject.send_latest(:a) { started.set; releaser.wait(5); raise 'boom' }
+          pending  = subject.send_latest(:b) { ran.value = true; 42 }
+
+          expect(started.wait(2)).to be true
+          releaser.count_down
+
+          expect(pending.wait(1)).to be true
+          expect(failing).to be_rejected
+          expect(pending).to be_rejected
+          expect(pending.reason).to be_a StandardError
+          expect(ran.true?).to be false
+          expect(subject.value).to eq 0
+        end
+
+        it 'rejects new dispatches made while failed without blocking the caller' do
+          subject = Agent.new(0, error_mode: :fail)
+          subject.send_via(immediate) { raise 'boom' }
+          receipt = subject.send_latest(:a) { 42 }
+          expect(receipt).to be_complete
+          expect(receipt).to be_rejected
+          expect(receipt.reason).to be_a StandardError
+        end
+      end
+
+      context 'when the action raises in :continue mode' do
+
+        it 'rejects only the failing receipt and keeps processing' do
+          subject = Agent.new(0, error_mode: :continue)
+          bad  = subject.send_latest_via(immediate, :a) { raise 'boom' }
+          good = subject.send_latest_via(immediate, :a) { 42 }
+          expect(bad).to be_rejected
+          expect(good).to be_fulfilled
+          expect(good.value).to eq 42
+          expect(subject).to_not be_failed
+        end
+      end
+
+      context 'on restart' do
+
+        it 'settles held receipts as rejected when the queue is cleared' do
+          ran      = Concurrent::AtomicBoolean.new(false)
+          started  = Concurrent::Event.new
+          releaser = Concurrent::CountDownLatch.new(1)
+          subject  = Agent.new(0, error_mode: :fail)
+
+          subject.send_via(executor) { started.set; releaser.wait(5); raise 'boom' }
+          held = subject.send_latest(:a) { ran.value = true; 42 }
+          expect(started.wait(2)).to be true
+          releaser.count_down
+          expect(held.wait(1)).to be true
+          expect(held).to be_rejected
+          expect(subject).to be_failed
+
+          subject.restart(7, clear_actions: true)
+          subject.await_for(1)
+
+          expect(held).to be_rejected
+          expect(ran.true?).to be false
+          expect(subject.value).to eq 7
+        end
+
+        it 'keeps held receipts rejected when actions are retained and re-run' do
+          started  = Concurrent::Event.new
+          releaser = Concurrent::CountDownLatch.new(1)
+          subject  = Agent.new(0, error_mode: :fail)
+
+          subject.send_via(executor) { started.set; releaser.wait(5); raise 'boom' }
+          held = subject.send_latest(:a) { 42 }
+          expect(started.wait(2)).to be true
+          releaser.count_down
+          expect(held.wait(1)).to be true
+          expect(held).to be_rejected
+
+          subject.restart(7, clear_actions: false)
+          subject.await_for(1)
+
+          # the retained action still runs and updates the value ...
+          expect(subject.value).to eq 42
+          # ... but its receipt ended when the agent failed and is not reborn
+          expect(held).to be_rejected
+          expect(held.reason).to be_a StandardError
+        end
+
+        it 'a superseded receipt stays superseded across a retained restart' do
+          started  = Concurrent::Event.new
+          releaser = Concurrent::CountDownLatch.new(1)
+          subject  = Agent.new(0, error_mode: :fail)
+
+          subject.send_via(executor) { started.set; releaser.wait(5); raise 'boom' }
+          expect(started.wait(2)).to be true
+          held_old = subject.send_latest(:a, :old) { |_, p| p }
+          held_new = subject.send_latest(:a, :new) { |_, p| p }
+          expect(held_old).to be_superseded
+
+          releaser.count_down
+          expect(held_new.wait(1)).to be true
+          expect(held_new).to be_rejected
+
+          subject.restart(0, clear_actions: false)
+          subject.await_for(1)
+
+          expect(held_old).to be_superseded
+          expect(held_old.reason).to be_a Agent::SupersededError
+          expect(held_new).to be_rejected
+        end
+      end
     end
   end
 end

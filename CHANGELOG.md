@@ -1,5 +1,14 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::Agent` gains merge-keyed dispatch entry points `#send_latest`,
+  `#send_latest_off`, and `#send_latest_via`. A new dispatch replaces only the
+  still-pending (not yet executing) message with the same merge key, keeping
+  its queue position. Each dispatch returns an `Agent::Receipt`; replaced
+  dispatches are settled as `superseded`, and pending receipts are settled as
+  rejected when the Agent fails or is restarted with `:clear_actions`.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
