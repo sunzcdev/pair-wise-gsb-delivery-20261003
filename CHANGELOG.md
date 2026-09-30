@@ -1,3 +1,12 @@
+### Unreleased
+
+* Add `exact_fractional_seconds` (alias `exact`) parse option. When enabled,
+  fractional seconds are parsed with Integer/Rational arithmetic instead of
+  binary floats, so sub-nanosecond values (e.g. `23:59:59.999999999999`) keep
+  their exact value and never round into the next second. Covers Offset
+  Date-Time, Local Date-Time and Local Time; default return conventions are
+  unchanged.
+
 ### 2.0.4 - 2025-12-18
 
 * Update Racc to v1.8.1

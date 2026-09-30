@@ -202,7 +202,18 @@ rule
     | BOOLEAN { result = val[0] == 'true' ? true : false }
     | DATETIME {
       _str, year, month, day, hour, min, sec, offset = val[0]
-      result = if offset.nil?
+      sec = '00' if sec.nil?
+      result = if @exact_fractional_seconds
+                 if offset.nil?
+                   if hour.nil?
+                     LocalDate.new(year, month, day)
+                   else
+                     LocalDateTime.new(year, month, day, hour, min || '00', sec, exact: true)
+                   end
+                 else
+                   OffsetDateTime.new(year, month, day, hour || '00', min || '00', sec, offset)
+                 end
+               elsif offset.nil?
                  if hour.nil?
                    LocalDate.new(year, month, day)
                  else
@@ -220,7 +231,14 @@ rule
                  time
                end
     }
-    | LOCAL_TIME { result = LocalTime.new(*val[0][1..-1]) }
+    | LOCAL_TIME {
+      _str, hour, min, sec = val[0]
+      result = if @exact_fractional_seconds
+                 LocalTime.new(hour, min, sec, exact: true)
+               else
+                 LocalTime.new(hour, min, sec.to_f)
+               end
+    }
     ;
   string
     : STRING_MULTI { result = StringUtils.replace_escaped_chars(StringUtils.multiline_replacements(val[0])) }

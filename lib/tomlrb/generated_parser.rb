@@ -743,7 +743,18 @@ module_eval(<<'.,.,', 'parser.y', 201)
 module_eval(<<'.,.,', 'parser.y', 203)
   def _reduce_91(val, _values, result)
           _str, year, month, day, hour, min, sec, offset = val[0]
-      result = if offset.nil?
+      sec = '00' if sec.nil?
+      result = if @exact_fractional_seconds
+                 if offset.nil?
+                   if hour.nil?
+                     LocalDate.new(year, month, day)
+                   else
+                     LocalDateTime.new(year, month, day, hour, min || '00', sec, exact: true)
+                   end
+                 else
+                   OffsetDateTime.new(year, month, day, hour || '00', min || '00', sec, offset)
+                 end
+               elsif offset.nil?
                  if hour.nil?
                    LocalDate.new(year, month, day)
                  else
@@ -765,35 +776,41 @@ module_eval(<<'.,.,', 'parser.y', 203)
   end
 .,.,
 
-module_eval(<<'.,.,', 'parser.y', 222)
+module_eval(<<'.,.,', 'parser.y', 234)
   def _reduce_92(val, _values, result)
-     result = LocalTime.new(*val[0][1..-1])
+          _str, hour, min, sec = val[0]
+      result = if @exact_fractional_seconds
+                 LocalTime.new(hour, min, sec, exact: true)
+               else
+                 LocalTime.new(hour, min, sec.to_f)
+               end
+
     result
   end
 .,.,
 
-module_eval(<<'.,.,', 'parser.y', 225)
+module_eval(<<'.,.,', 'parser.y', 243)
   def _reduce_93(val, _values, result)
      result = StringUtils.replace_escaped_chars(StringUtils.multiline_replacements(val[0]))
     result
   end
 .,.,
 
-module_eval(<<'.,.,', 'parser.y', 226)
+module_eval(<<'.,.,', 'parser.y', 244)
   def _reduce_94(val, _values, result)
      result = StringUtils.replace_escaped_chars(val[0])
     result
   end
 .,.,
 
-module_eval(<<'.,.,', 'parser.y', 227)
+module_eval(<<'.,.,', 'parser.y', 245)
   def _reduce_95(val, _values, result)
      result = StringUtils.strip_spaces(val[0])
     result
   end
 .,.,
 
-module_eval(<<'.,.,', 'parser.y', 228)
+module_eval(<<'.,.,', 'parser.y', 246)
   def _reduce_96(val, _values, result)
      result = val[0]
     result

@@ -38,6 +38,28 @@ or
 Tomlrb.load_file('my_file', symbolize_keys: true)
 ```
 
+## Exact fractional seconds
+
+By default, fractional seconds are parsed through Ruby floats, which can drift
+for sub-nanosecond precision (for example `23:59:59.999999999999`). Pass
+`exact_fractional_seconds: true` (or `exact: true`) to keep the fraction exact
+using Integer/Rational arithmetic. The value is never carried over to the next
+second, and trailing zeroes are normalized away.
+
+```ruby
+Tomlrb.parse('a = 23:59:59.999999999999', exact_fractional_seconds: true)
+# Offset Date-Time values become Tomlrb::OffsetDateTime. Local Date-Time and
+# Local Time keep their own classes. All of #==, #to_s and #to_time express the
+# same exact value:
+v = Tomlrb.parse('a = 1979-05-27T07:32:00.999999999999-07:00', exact: true)['a']
+v.to_s      #=> "1979-05-27T07:32:00.999999999999-07:00"
+v.to_time   #=> 1979-05-27 07:32:00 999999999999/1000000000000 -0700 (Time)
+```
+
+Local types still never attach a date or the machine time zone; call
+`#to_time` explicitly to build a `Time`. The default return conventions are
+unchanged when the option is omitted.
+
 ## Benchmark
 
 You can run the benchmark against the only other v0.5.0 compliant parser to my knowledge with `ruby benchmarks/bench.rb`.
