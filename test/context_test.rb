@@ -1030,4 +1030,203 @@ describe Rack::Cache::Context do
     assert response.ok?
     logger.logged_level.must_equal "info"
   end
+
+  # A small binary body split into multiple chunks, as it would be
+  # stored in the entity store.
+  def chunked_binary_body
+    body = (0...64).map { |i| (i * 37 + 11) % 256 }.pack('C*')
+    [body, [body[0, 10], body[10, 25], body[35, 29]]]
+  end
+
+  def respond_with_chunked_binary(headers={})
+    body, chunks = chunked_binary_body
+    respond_with 200, {
+      'cache-control' => 'max-age=60',
+      'content-type' => 'application/octet-stream',
+      'etag' => '"v1"'
+    }.merge(headers), chunks
+    body
+  end
+
+  it 'serves a single byte range from a fresh cache entry' do
+    body = respond_with_chunked_binary
+    get '/'
+    assert response.ok?
+    cache.trace.must_include :store
+
+    get '/', 'HTTP_RANGE' => 'bytes=12-30'
+    refute app.called?
+    cache.trace.must_include :fresh
+    response.status.must_equal 206
+    response.headers['content-range'].must_equal 'bytes 12-30/64'
+    response.headers['content-length'].must_equal '19'
+    response.headers['accept-ranges'].must_equal 'bytes'
+    response.body.must_equal body[12..30]
+  end
+
+  it 'serves a byte range that spans body chunks' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=5-40'
+    refute app.called?
+    response.status.must_equal 206
+    response.headers['content-range'].must_equal 'bytes 5-40/64'
+    response.body.must_equal body[5..40]
+  end
+
+  it 'serves an open-ended byte range from a fresh cache entry' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=60-'
+    response.status.must_equal 206
+    response.headers['content-range'].must_equal 'bytes 60-63/64'
+    response.body.must_equal body[60..63]
+  end
+
+  it 'serves a suffix byte range from a fresh cache entry' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=-10'
+    response.status.must_equal 206
+    response.headers['content-range'].must_equal 'bytes 54-63/64'
+    response.headers['content-length'].must_equal '10'
+    response.body.must_equal body[54..63]
+  end
+
+  it 'clamps a suffix byte range larger than the representation' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=-1000'
+    response.status.must_equal 206
+    response.headers['content-range'].must_equal 'bytes 0-63/64'
+    response.body.must_equal body
+  end
+
+  it 'serves multiple byte ranges as a multipart/byteranges body' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-9, 50-63'
+    refute app.called?
+    response.status.must_equal 206
+    boundary = response.headers['content-type'][/boundary=(.+)\z/, 1]
+    refute_nil boundary
+    response.headers['content-type'].must_equal "multipart/byteranges; boundary=#{boundary}"
+
+    expected = +"".b
+    expected << "--#{boundary}\r\n"
+    expected << "content-type: application/octet-stream\r\n"
+    expected << "content-range: bytes 0-9/64\r\n\r\n"
+    expected << body[0..9]
+    expected << "\r\n--#{boundary}\r\n"
+    expected << "content-type: application/octet-stream\r\n"
+    expected << "content-range: bytes 50-63/64\r\n\r\n"
+    expected << body[50..63]
+    expected << "\r\n--#{boundary}--\r\n"
+
+    response.body.must_equal expected
+    response.headers['content-length'].to_i.must_equal response.body.bytesize
+  end
+
+  it 'replies 416 when no byte range is satisfiable' do
+    respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=1000-2000'
+    refute app.called?
+    response.status.must_equal 416
+    response.headers['content-range'].must_equal 'bytes */64'
+    response.headers['content-length'].must_equal '0'
+    response.body.must_equal ''
+  end
+
+  it 'ignores an unparsable range header and serves the full entry' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=banana'
+    response.status.must_equal 200
+    response.body.must_equal body
+
+    get '/', 'HTTP_RANGE' => 'items=0-10'
+    response.status.must_equal 200
+    response.body.must_equal body
+  end
+
+  it 'honors If-Range when the strong validator matches' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_RANGE' => '"v1"'
+    response.status.must_equal 206
+    response.body.must_equal body[0..3]
+  end
+
+  it 'serves the full entry when If-Range does not match' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_RANGE' => '"other"'
+    response.status.must_equal 200
+    response.body.must_equal body
+  end
+
+  it 'does not honor a weak entity tag in If-Range' do
+    body = respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_RANGE' => 'W/"v1"'
+    response.status.must_equal 200
+    response.body.must_equal body
+  end
+
+  it 'honors If-Range with a matching last-modified date' do
+    last_modified = (Time.now - 60).httpdate
+    body = respond_with_chunked_binary('last-modified' => last_modified)
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_RANGE' => last_modified
+    response.status.must_equal 206
+    response.body.must_equal body[0..3]
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_RANGE' => (Time.now - 3600).httpdate
+    response.status.must_equal 200
+    response.body.must_equal body
+  end
+
+  it 'ignores the range header on HEAD requests and sends no body' do
+    respond_with_chunked_binary
+    head '/'
+    assert response.ok?
+
+    head '/', 'HTTP_RANGE' => 'bytes=0-3'
+    refute app.called?
+    response.status.must_equal 200
+    response.headers.wont_include 'content-range'
+    response.headers['content-length'].must_equal '64'
+    response.body.must_equal ''
+  end
+
+  it 'evaluates conditional request headers before serving a range' do
+    respond_with_chunked_binary
+    get '/'
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3', 'HTTP_IF_NONE_MATCH' => '"v1"'
+    response.status.must_equal 304
+    response.body.must_equal ''
+  end
+
+  it 'forwards range requests to the backend when the entry is stale' do
+    body = respond_with_chunked_binary('cache-control' => 'max-age=0')
+    get '/'
+    assert response.ok?
+
+    get '/', 'HTTP_RANGE' => 'bytes=0-3'
+    assert app.called?
+    cache.trace.must_include :stale
+  end
 end

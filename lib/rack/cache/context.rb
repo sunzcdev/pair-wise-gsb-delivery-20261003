@@ -182,7 +182,7 @@ module Rack::Cache
           if fresh_enough?(entry)
             record :fresh
             entry.headers['age'] = entry.age.to_s
-            entry
+            range_response(entry) || entry
           else
             record :stale
             if fault_tolerant?
@@ -196,6 +196,157 @@ module Rack::Cache
           fetch
         end
       end
+    end
+
+    # Attempt to satisfy a Range request from a fresh, complete cache
+    # entry. Returns a 206 or 416 response when the request includes a
+    # Range header that can be handled locally, or nil when the full
+    # entry should be served instead (no Range header, unsplittable
+    # entry, or a failed If-Range precondition). HEAD requests ignore
+    # the Range header field per RFC 7233.
+    def range_response(entry)
+      return unless @request.get?
+      return unless entry.status == 200
+      header = @request.env['HTTP_RANGE']
+      return unless header
+      return unless size = entry.headers['content-length']
+      return unless if_range_satisfied?(entry)
+
+      size = size.to_i
+      ranges = parse_byte_ranges(header, size)
+      return if ranges.nil?
+      return range_not_satisfiable_response(entry, size) if ranges.empty?
+
+      if ranges.length == 1
+        single_range_response(entry, ranges.first, size)
+      else
+        multipart_range_response(entry, ranges, size)
+      end
+    end
+
+    # Determine whether the If-Range precondition holds for the cache
+    # entry. If-Range values are compared using the strong comparison
+    # function: entity tags never match weakly and a Last-Modified
+    # value must match exactly.
+    def if_range_satisfied?(entry)
+      value = @request.env['HTTP_IF_RANGE']
+      return true if value.nil? || value.strip.empty?
+      value = value.strip
+      if value.start_with?('"', 'W/"', 'w/"')
+        return false unless value.start_with?('"')
+        etag = entry.etag
+        !etag.nil? && !etag.start_with?('W/', 'w/') && etag == value
+      else
+        !entry.last_modified.nil? && entry.last_modified == value
+      end
+    end
+
+    # Parse a byte-range-spec header value into an Array of [first, last]
+    # byte positions (inclusive) against a representation of +size+
+    # bytes. Unsatisfiable ranges are dropped. Returns nil when the
+    # header cannot be understood, in which case it must be ignored.
+    def parse_byte_ranges(header, size)
+      return unless header =~ /\Abytes=(.+)\z/im
+      ranges = []
+      $1.split(/\s*,\s*/).each do |spec|
+        case spec
+        when /\A(\d+)-(\d*)\z/
+          first = $1.to_i
+          last = $2.empty? ? size - 1 : $2.to_i
+          next if first >= size
+          last = size - 1 if last >= size
+          ranges << [first, last] if first <= last
+        when /\A-(\d+)\z/
+          length = $1.to_i
+          next if length == 0
+          first = size - length
+          first = 0 if first < 0
+          ranges << [first, size - 1] if first <= size - 1
+        else
+          return
+        end
+      end
+      ranges
+    end
+
+    # Extract the byte +ranges+ (an Array of [first, last] pairs) from
+    # the response +body+ as it is stored in the entity store, without
+    # joining the entire body into a single string. Returns an Array of
+    # chunk Arrays, one per range, in the same order as +ranges+.
+    def slice_ranges(body, ranges)
+      pieces = ranges.map { [] }
+      offset = 0
+      body.each do |chunk|
+        chunk_start = offset
+        offset += chunk.bytesize
+        ranges.each_with_index do |(first, last), index|
+          next if last < chunk_start || first >= offset
+          from = first - chunk_start
+          from = 0 if from < 0
+          to = last - chunk_start
+          to = chunk.bytesize - 1 if to >= chunk.bytesize
+          pieces[index] << chunk.byteslice(from..to)
+        end
+      end
+      body.close if body.respond_to?(:close)
+      pieces
+    end
+
+    # Build a 206 Partial Content response for a single byte range.
+    def single_range_response(entry, range, size)
+      first, last = range
+      response = entry.dup
+      response.status = 206
+      response.body = slice_ranges(entry.body, [range]).first
+      response.headers['content-range'] = "bytes #{first}-#{last}/#{size}"
+      response.headers['content-length'] = (last - first + 1).to_s
+      response.headers['accept-ranges'] = 'bytes'
+      response
+    end
+
+    # Build a 206 Partial Content response carrying each byte range as a
+    # part of a multipart/byteranges body. The boundary, per-part
+    # content-range values, and the overall content-length are derived
+    # from the same part list so they stay consistent.
+    def multipart_range_response(entry, ranges, size)
+      boundary = "rack-cache-#{rand(1_000_000_000)}"
+      content_type = entry.headers['content-type']
+      slices = slice_ranges(entry.body, ranges)
+
+      body = []
+      ranges.each_with_index do |(first, last), index|
+        body << "--#{boundary}\r\n"
+        body << "content-type: #{content_type}\r\n" if content_type
+        body << "content-range: bytes #{first}-#{last}/#{size}\r\n"
+        body << "\r\n"
+        body.concat(slices[index])
+        body << "\r\n"
+      end
+      body << "--#{boundary}--\r\n"
+
+      length = 0
+      body.each { |part| length += part.bytesize }
+
+      response = entry.dup
+      response.status = 206
+      response.body = body
+      response.headers['content-type'] = "multipart/byteranges; boundary=#{boundary}"
+      response.headers['content-length'] = length.to_s
+      response.headers['accept-ranges'] = 'bytes'
+      response
+    end
+
+    # Build a 416 Range Not Satisfiable response describing the actual
+    # size of the stored representation.
+    def range_not_satisfiable_response(entry, size)
+      entry.body.close if entry.body.respond_to?(:close)
+      response = entry.dup
+      response.status = 416
+      response.body = []
+      response.headers['content-range'] = "bytes */#{size}"
+      response.headers['content-length'] = '0'
+      response.headers['accept-ranges'] = 'bytes'
+      response
     end
 
     # Returns stale cache on exception.
