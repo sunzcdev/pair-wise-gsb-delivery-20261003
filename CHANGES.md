@@ -1,5 +1,16 @@
 # Changes
 
+## Unreleased
+
+* Added `TZInfo::DataSourceComparer`, which compares the observance of a time
+  zone between two explicitly specified data sources over a UTC window. The
+  result lists the intervals over which the observed offset, daylight savings
+  status or abbreviation differ (merging adjacent identical intervals and
+  returning an empty result when there are no differences) and indicates
+  whether the target of a linked time zone has changed. The global default
+  data source is neither used nor modified.
+
+
 ## Version 2.0.6 - 28-Jan-2023
 
 * Eliminate `Object#untaint` deprecation warnings on JRuby 9.4.0.0. #145.

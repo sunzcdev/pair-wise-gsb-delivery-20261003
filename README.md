@@ -369,6 +369,39 @@ It is not intended to take or endorse any position on legal or territorial
 claims.
 
 
+## Comparing Data Sources
+
+The `TZInfo::DataSourceComparer` class can be used to compare the observance of
+a time zone between two data sources over a UTC window. For example, this can
+be used to determine on which dates the historical local times reported for a
+time zone will change when upgrading to a new version of the IANA Time Zone
+Database:
+
+```ruby
+old_data_source = TZInfo::DataSources::ZoneinfoDataSource.new('/usr/share/zoneinfo.old')
+new_data_source = TZInfo::DataSources::ZoneinfoDataSource.new('/usr/share/zoneinfo')
+
+comparer = TZInfo::DataSourceComparer.new(old_data_source, new_data_source)
+comparison = comparer.compare('America/New_York', Time.utc(2025, 1, 1), Time.utc(2027, 1, 1))
+
+comparison.differences.each do |difference|
+  puts "#{difference.starts_at} to #{difference.ends_at}: " \
+    "#{difference.first.abbreviation} (#{difference.first.observed_utc_offset}) becomes " \
+    "#{difference.second.abbreviation} (#{difference.second.observed_utc_offset})"
+end
+```
+
+The result contains the intervals over which the observed offset, daylight
+savings status or abbreviation differ. Adjacent intervals with identical
+differences are merged and an empty result is returned if there are no
+differences. If the time zone is a link to another zone, the result also
+indicates whether the link target differs between the two data sources.
+
+The two data sources are specified explicitly. The global default data source
+(as set by `TZInfo::DataSource.set`) is neither used nor modified, so
+comparisons will not affect other code running in the same process.
+
+
 ## Compatibility
 
 TZInfo v2.0.0 requires a minimum of Ruby MRI 1.9.3 or JRuby 1.7 (in 1.9 mode or
