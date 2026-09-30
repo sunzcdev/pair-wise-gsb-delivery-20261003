@@ -19,6 +19,7 @@
 
 require "addressable/version"
 require "addressable/idna"
+require "addressable/path_segment"
 require "public_suffix"
 
 ##
@@ -1598,6 +1599,48 @@ module Addressable
     def extname
       return nil unless self.path
       return File.extname(self.basename)
+    end
+
+    ##
+    # The path component parsed into an ordered list of structured
+    # segments. Each segment exposes its name and its ordered matrix
+    # parameters via <code>Addressable::URI::PathSegment</code>.
+    #
+    # For example, <code>"/books;lang=zh/42;rev=3"</code> yields three
+    # segments: an empty leading segment (representing the leading
+    # slash), a segment named <code>"books"</code> with the matrix
+    # parameter <code>["lang", "zh"]</code>, and a segment named
+    # <code>"42"</code> with the matrix parameter
+    # <code>["rev", "3"]</code>.
+    #
+    # The path is split on <code>/</code> and each segment on
+    # <code>;</code> without decoding first, so percent-encoded
+    # semicolons (<code>%3B</code>) and slashes (<code>%2F</code>) are
+    # treated as data and never cause additional splitting.
+    #
+    # The returned segments are detached copies; mutate them and assign
+    # them back with <code>path_segments=</code> to change the URI.
+    #
+    # @return [Array<Addressable::URI::PathSegment>] The path segments.
+    def path_segments
+      self.path.to_s.split(SLASH, -1).map do |segment|
+        PathSegment.parse(segment)
+      end
+    end
+
+    ##
+    # Sets the path component from a list of structured segments.
+    # Accepts <code>Addressable::URI::PathSegment</code> objects or
+    # encoded segment strings. Matrix parameters remain attached to
+    # the segment they belong to.
+    #
+    # @param [Array<Addressable::URI::PathSegment, String>] new_segments
+    #   The new path segments.
+    def path_segments=(new_segments)
+      segments = new_segments.map do |segment|
+        segment.kind_of?(PathSegment) ? segment : PathSegment.parse(segment)
+      end
+      self.path = segments.map(&:to_s).join(SLASH)
     end
 
     ##
