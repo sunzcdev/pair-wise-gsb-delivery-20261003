@@ -10,6 +10,7 @@ module Dry
     @constants = {
       do: "Do::All",
       lazy: "Lazy",
+      lazy_list: "LazyList",
       list: "List",
       maybe: "Maybe",
       task: "Task",

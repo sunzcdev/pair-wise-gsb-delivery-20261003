@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `LazyList`, a separate lazy list monad with fair `bind` and `apply` for infinite enumerations.
+
 ### Changed
 
 ### Deprecated
