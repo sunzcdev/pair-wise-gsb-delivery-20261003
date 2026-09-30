@@ -168,6 +168,40 @@ pattern = Mustermann.new('/<prefix>/<int:id>', type: :flask)
 pattern.params('/page/10') # => { "prefix" => "page", "id" => 10 }
 ```
 
+<a name="-capture-spans"></a>
+## Capture Spans
+
+While `params` gives you the *decoded* capture values, a `Mustermann::Match` also
+exposes where each capture came from in the original input via `Mustermann::Span`
+objects. Span offsets are half-open **byte** offsets relative to the string passed
+to `match`/`peek_match` (also through `Concat` and `Mustermann::Set` backends), and
+`raw` is the captured text *before* URI decoding.
+
+``` ruby
+require 'mustermann'
+
+pattern = Mustermann.new('/:city/:id/:id')
+match   = pattern.match('/%E4%B8%AD%E6%96%87/x%2Fy/x%2Fy')
+
+match.params['city']        # => "中文"      (decoded value)
+span = match.span(:city)
+span.raw                    # => "%E4%B8%AD%E6%96%87" (original bytes)
+span.begin_byte             # => 1
+span.end_byte               # => 19
+
+# Repeated capture names yield an array of spans, so two identical values can
+# still be told apart by their location.
+match.span(:id).map(&:raw)  # => ["x%2Fy", "x%2Fy"]
+match.span(:id).map { |s| s.begin_byte...s.end_byte } # => [20...25, 26...31]
+```
+
+An optional segment that does not participate in the match is represented by
+`nil` (and is absent from `named_spans`), whereas a capture matching the empty
+string has a zero-length span (`empty?` is true and `begin_byte == end_byte`).
+Use `spans` (positional, one entry per capture group) and `named_spans` (mapped
+by name) to access them. Offsets are read directly from the regular expression
+match, never inferred by searching for the decoded value in the input.
+
 <a name="-peeking"></a>
 ## Peeking
 

@@ -76,20 +76,26 @@ module Mustermann
     # @see Mustermann::Pattern#peek_match
     def peek_match(string)
       post_match      = string
+      base_byte       = 0
       params         = {}
       captures       = []
       named_captures = {}
+      spans          = []
+      named_spans    = {}
 
       patterns.each do |pattern|
         return unless part = pattern.peek_match(post_match)
         params.merge!(part.params)
         named_captures.merge!(part.named_captures)
         captures.concat(part.captures)
+        spans.concat(part.spans.map { |span| span&.shift(base_byte, string: string) })
+        merge_spans(named_spans, part.named_spans, base_byte, string)
         post_match = post_match[part.to_s.size..-1]
+        base_byte += part.to_s.bytesize
       end
 
       matched = string[0, string.size - post_match.size]
-      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:)
+      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:, spans:, named_spans:)
     end
 
     # @see Mustermann::Pattern#peek_params
@@ -143,5 +149,22 @@ module Mustermann
     end
 
     private :combined_ast, :pump
+
+    # Merges the named spans of a sub-match into the combined spans, shifting
+    # them onto the original input and turning repeated names into arrays, just
+    # like the params hash does.
+    def merge_spans(named_spans, part_spans, offset, string)
+      part_spans.each do |name, spans|
+        shifted = Array(spans).map { |span| span.shift(offset, string: string) }
+        shifted = shifted.first if shifted.size == 1 && !always_array?(name)
+        if named_spans.key?(name)
+          named_spans[name] = Array(named_spans[name]).concat(Array(shifted))
+        else
+          named_spans[name] = shifted
+        end
+      end
+    end
+
+    private :merge_spans
   end
 end

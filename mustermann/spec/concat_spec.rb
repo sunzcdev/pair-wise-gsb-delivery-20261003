@@ -114,6 +114,36 @@ describe Mustermann::Concat do
     example { pattern.peek_match("/foo")              .should be_nil }
   end
 
+  describe :spans do
+    let(:path) { '/%E4%B8%AD%E6%96%87/x%2Fy' }
+
+    example 'spans from both patterns are offset against the original input' do
+      result = pattern.match(path)
+      foo    = result.span(:foo)
+      bar    = result.span(:bar)
+      foo.raw.should be == '%E4%B8%AD%E6%96%87'
+      bar.raw.should be == 'x%2Fy'
+      path.byteslice(foo.begin_byte, foo.bytesize).should be == '%E4%B8%AD%E6%96%87'
+      path.byteslice(bar.begin_byte, bar.bytesize).should be == 'x%2Fy'
+    end
+
+    example 'peek spans also refer to the full original input' do
+      result = pattern.peek_match(path + '/rest')
+      result.span(:foo).begin_byte.should be == 1
+      result.span(:bar).begin_byte.should be == 20
+      result.span(:bar).raw.should be == 'x%2Fy'
+      result.post_match.should be == '/rest'
+    end
+
+    example 'combines spans of heterogeneous pattern types' do
+      concat = Mustermann.new('/:a', type: :sinatra) + Mustermann.new('/:b', type: :rails)
+      result = concat.match('/x/y')
+      result.span(:a).should be_a(Mustermann::Span)
+      result.span(:b).should be_a(Mustermann::Span)
+      result.spans.map(&:raw).should be == ['x', 'y']
+    end
+  end
+
   describe :peek_size do
     example { pattern.peek_size("/foo/bar/baz")  .should be == 8 }
     example { pattern.peek_size("/foo")          .should be_nil }

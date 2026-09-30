@@ -45,14 +45,6 @@ module Mustermann
 
       private
 
-      def build_match(regexp, string)
-        return super unless @fast_match
-        return unless match = regexp.match(string)
-        params = match.named_captures
-        params.transform_values! { |v| v.include?('%') ? unescape(v) : v } if string.include?('%')
-        Match.new(self, match, params: params)
-      end
-
       def simple_pattern?
         options[:capture].nil?  &&
           options[:except].nil? &&

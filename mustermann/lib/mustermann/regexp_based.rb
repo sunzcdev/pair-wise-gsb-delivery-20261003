@@ -87,7 +87,17 @@ module Mustermann
 
     def build_match(regexp, string)
       return unless match = regexp.match(string)
-      Match.new(self, match, params: build_params(match))
+      Match.new(self, match, params: build_params(match), spans: build_spans(match))
+    end
+
+    # Builds one {Mustermann::Span} per capture group, straight from the regexp's
+    # byte offsets. Non-participating (missing optional) groups stay nil, whereas
+    # a group matching the empty string yields a zero-length span.
+    def build_spans(match)
+      match.captures.each_index.map do |index|
+        start_byte, stop_byte = match.byteoffset(index + 1)
+        Mustermann::Span.new(match.string, start_byte, stop_byte) if start_byte
+      end
     end
 
     def build_params(match)

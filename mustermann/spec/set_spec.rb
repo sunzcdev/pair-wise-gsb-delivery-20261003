@@ -133,6 +133,87 @@ describe Mustermann::Set do
       end
     end
 
+    # ── capture spans ───────────────────────────────────────────────────────
+
+    context 'capture spans' do
+      let(:path) { '/%E4%B8%AD%E6%96%87/x%2Fy/x%2Fy' }
+
+      # Helper: bytes a span points at in the original input.
+      def bytes_for(path, span)
+        Array(span).map { |s| path.byteslice(s.begin_byte, s.bytesize) }
+      end
+
+      it 'locates percent-encoded multibyte and %2F captures by byte offsets' do
+        set.add('/:city/:id/:id', :route)
+        m = set.match(path)
+        expect(m.span(:city).raw).to eq '%E4%B8%AD%E6%96%87'
+        expect(bytes_for(path, m.span(:city))).to eq ['%E4%B8%AD%E6%96%87']
+        expect(m.span(:id).map(&:raw)).to eq ['x%2Fy', 'x%2Fy']
+        expect(bytes_for(path, m.span(:id))).to eq ['x%2Fy', 'x%2Fy']
+      end
+
+      it 'keeps the two equal captures at distinct byte ranges' do
+        set.add('/:city/:id/:id', :route)
+        m = set.match(path)
+        ranges = m.span(:id).map(&:byte_range)
+        expect(ranges.uniq.size).to eq 2
+        expect(ranges).to eq [20...25, 26...31]
+      end
+
+      it 'handles raw multibyte characters' do
+        set.add('/:city/:id/:id', :route)
+        raw_path = '/中文/a/a'
+        m = set.match(raw_path)
+        expect(m.span(:city).raw).to eq '中文'
+        expect(m.span(:city).byte_range).to eq (1...7)
+        expect(bytes_for(raw_path, m.span(:city))).to eq ['中文']
+        expect(m.span(:id).map(&:raw)).to eq ['a', 'a']
+      end
+
+      it 'marks absent optional segments as nil and empty captures as zero-length spans' do
+        set.add('/:a(.:ext)?/*rest', :route)
+
+        absent = set.match('/foo/x%2Fy')
+        expect(absent.span(:ext)).to be_nil
+        expect(absent.spans.map { |s| s && s.raw }).to eq ['foo', nil, 'x%2Fy']
+
+        present = set.match('/foo.png/x%2Fy')
+        expect(present.span(:ext).raw).to eq 'png'
+
+        empty = set.match('/foo/')
+        expect(empty.span(:rest)).not_to be_nil
+        expect(empty.span(:rest).empty?).to eq true
+      end
+
+      it 'captures multiple splats independently' do
+        set.add('/*a/*b', :route)
+        m = set.match('/x%2Fy/z')
+        expect(m.span(:a).raw).to eq 'x%2Fy'
+        expect(m.span(:b).raw).to eq 'z'
+        expect(bytes_for('/x%2Fy/z', m.span(:a))).to eq ['x%2Fy']
+      end
+
+      it 'reports spans relative to the original input when peeking' do
+        set.add('/:city/:id/:id', :route)
+        m = set.peek_match(path + '/tail')
+        expect(m.to_s).to eq path
+        expect(m.post_match).to eq '/tail'
+        expect(m.span(:city).byte_range).to eq (1...19)
+        expect(m.span(:id).map(&:byte_range)).to eq [20...25, 26...31]
+        expect(bytes_for(path + '/tail', m.span(:city))).to eq ['%E4%B8%AD%E6%96%87']
+      end
+
+      it 'slices the exact same original bytes as a direct pattern match' do
+        set.add('/:city/:id/:id', :route)
+        direct = Mustermann::Sinatra.new('/:city/:id/:id').match(path)
+        m      = set.match(path)
+        (direct.named_spans.keys | m.named_spans.keys).each do |name|
+          expect(bytes_for(path, m.named_spans[name])).to eq bytes_for(path, direct.named_spans[name])
+          expect(m.named_spans[name]).to eq direct.named_spans[name]
+        end
+      end
+    end
+
     # ── [] accessor ──────────────────────────────────────────────────────────
 
     context '[]' do
