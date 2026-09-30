@@ -1,6 +1,11 @@
 # Change Log
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+### Changed
+- Add `Vary: Origin, Access-Control-Request-Method, Access-Control-Request-Headers` (plus any resource `:vary` headers) to preflight responses for both allowed and rejected results, so caches cannot serve one kind of preflight result to a different kind of request.
+- Merge downstream `Vary` headers case-insensitively, accept array-valued headers, respect an existing `Vary: *`, and avoid raising on frozen response headers.
+
 ## 3.0.0 - 2025-05-16
 ### Changed
 - Update Rack dependency to >= 3.0.14

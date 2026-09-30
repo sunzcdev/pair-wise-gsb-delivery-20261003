@@ -150,6 +150,29 @@ describe Rack::Cors do
     _(last_response.headers['Vary']).must_equal 'Origin, Host'
   end
 
+  it 'should declare the preflight decision inputs in Vary on a hit' do
+    preflight_request('http://localhost:3000', '/')
+    _(last_response).must_render_cors_success
+    _(last_response.headers['Vary']).must_equal(
+      'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+    )
+  end
+
+  it 'should declare the preflight decision inputs in Vary on a miss' do
+    preflight_request('http://localhost:3000', '/get-only', method: :post)
+    _(last_response).wont_render_cors_success
+    _(last_response.headers['Vary']).must_equal(
+      'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'
+    )
+  end
+
+  it 'should include resource :vary headers in preflight Vary' do
+    preflight_request('http://localhost:3000', '/vary_test', method: :get)
+    _(last_response.headers['Vary']).must_equal(
+      'Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Host'
+    )
+  end
+
   it 'decode URL and resolve paths before resource matching' do
     header 'Origin', 'http://localhost:3000'
     get '/public/a/..%2F..%2Fprivate/stuff'
@@ -162,6 +185,39 @@ describe Rack::Cors do
     it 'should add to them' do
       successful_cors_request '/vary_test'
       _(last_response.headers['Vary']).must_equal 'Origin, User-Agent, Host'
+    end
+
+    it 'should handle array valued Vary headers' do
+      downstream = { 'vary' => %w[Origin User-Agent] }
+      merged = cors_middleware_for(downstream).send(
+        :apply_vary_headers, downstream, %w[Origin Host]
+      )
+      _(merged['vary']).must_equal 'Origin, User-Agent, Host'
+    end
+
+    it 'should merge Vary field names case-insensitively' do
+      downstream = { 'Vary' => 'origin, USER-AGENT' }
+      merged = cors_middleware_for(downstream).send(
+        :apply_vary_headers, downstream, %w[Origin Host]
+      )
+      _(merged['vary']).must_equal 'origin, USER-AGENT, Host'
+    end
+
+    it 'should respect an existing Vary wildcard' do
+      downstream = { 'vary' => '*' }
+      merged = cors_middleware_for(downstream).send(
+        :apply_vary_headers, downstream, %w[Origin Host]
+      )
+      _(merged['vary']).must_equal '*'
+    end
+
+    it 'should not raise on frozen downstream headers' do
+      downstream = { 'vary' => 'Origin, User-Agent' }.freeze
+      merged = cors_middleware_for(downstream).send(
+        :apply_vary_headers, downstream, %w[Origin Host]
+      )
+      _(merged['vary']).must_equal 'Origin, User-Agent, Host'
+      _(downstream.frozen?).must_equal true
     end
   end
 
@@ -536,6 +592,16 @@ describe Rack::Cors do
   def successful_cors_request(*args)
     cors_request(*args)
     _(last_response).must_render_cors_success
+  end
+
+  def cors_middleware_for(downstream_headers)
+    app = ->(_env) { [200, downstream_headers, ['success']] }
+    Rack::Cors.new(app) do
+      allow do
+        origins '*'
+        resource '/', vary: 'Host'
+      end
+    end
   end
 
   def preflight_request(origin, path, opts = {})

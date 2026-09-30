@@ -24,7 +24,19 @@ module Rack
 
     OPTIONS     = 'OPTIONS'
 
-    DEFAULT_VARY_HEADERS = ['Origin'].freeze
+    # Request headers that actually participate in the CORS decision.
+    # They must be listed on every response whose content may depend on
+    # them (both successful and rejected) so that caches do not serve a
+    # response generated for one kind of request to another.
+    DEFAULT_VARY_HEADERS           = ['Origin'].freeze
+    PREFLIGHT_EXTRA_VARY_HEADERS   = [
+      'Access-Control-Request-Method',
+      'Access-Control-Request-Headers'
+    ].freeze
+    DEFAULT_PREFLIGHT_VARY_HEADERS =
+      (DEFAULT_VARY_HEADERS + PREFLIGHT_EXTRA_VARY_HEADERS).freeze
+    VARY_HEADER = 'vary'
+    VARY_WILDCARD = '*'
 
     def initialize(app, opts = {}, &block)
       @app = app
@@ -79,13 +91,18 @@ module Rack
         end
 
         if env[REQUEST_METHOD] == OPTIONS && env[HTTP_ACCESS_CONTROL_REQUEST_METHOD]
-          return [400, {}, []] unless Rack::Utils.valid_path?(path)
+          unless Rack::Utils.valid_path?(path)
+            return [400, apply_vary_headers({}, DEFAULT_PREFLIGHT_VARY_HEADERS), []]
+          end
 
           headers = process_preflight(env, path)
           debug(env) do
             "Preflight Headers:\n" +
               headers.collect { |kv| "  #{kv.join(': ')}" }.join("\n")
           end
+          headers = apply_vary_headers(headers, vary_headers_for(resource_for_path(path), true))
+          result = env[ENV_KEY]
+          result.append_header(headers) if debug? && result
           return [200, headers, []]
         else
           add_headers = process_cors(env, path)
@@ -113,15 +130,7 @@ module Rack
       # Vary header should ALWAYS mention Origin if there's ANY chance for the
       # response to be different depending on the Origin header value.
       # Better explained here: http://www.fastly.com/blog/best-practices-for-using-the-vary-header/
-      if vary_resource
-        vary = headers['vary']
-        cors_vary_headers = if vary_resource.vary_headers&.any?
-                              vary_resource.vary_headers
-                            else
-                              DEFAULT_VARY_HEADERS
-                            end
-        headers['vary'] = ((vary ? [vary].flatten.map { |v| v.split(/,\s*/) }.flatten : []) + cors_vary_headers).uniq.join(', ')
-      end
+      headers = apply_vary_headers(headers, vary_headers_for(vary_resource, false)) if vary_resource
 
       result = env[ENV_KEY]
       result.append_header(headers) if debug? && result
@@ -130,6 +139,50 @@ module Rack
     end
 
     protected
+
+    def vary_headers_for(resource, preflight)
+      base = preflight ? DEFAULT_PREFLIGHT_VARY_HEADERS : DEFAULT_VARY_HEADERS
+      extra = resource&.vary_headers || []
+      (base + extra).uniq
+    end
+
+    # Merges the headers participating in the CORS decision into the response
+    # Vary header.
+    #
+    # Existing Vary values are preserved, field names are compared
+    # case-insensitively, array valued Vary headers are supported and an
+    # existing "*" short-circuits further additions (a Vary of "*" already
+    # matches every request). Frozen response headers are duplicated instead
+    # of mutated.
+    def apply_vary_headers(headers, cors_vary_headers)
+      existing_key = headers.keys.detect { |key| key.to_s.downcase == VARY_HEADER }
+      existing_vary = headers[existing_key] if existing_key
+      downstream = [existing_vary].flatten.compact
+                                   .flat_map { |value| value.to_s.split(/,\s*/) }
+                                   .reject(&:empty?)
+
+      merged = merge_vary_fields(downstream, [cors_vary_headers].flatten)
+
+      headers = headers.dup
+      headers.keys.each { |key| headers.delete(key) if key.to_s.downcase == VARY_HEADER }
+      headers[VARY_HEADER] = merged.join(', ')
+      headers
+    end
+
+    def merge_vary_fields(existing, additions)
+      seen = existing.map(&:downcase)
+      return [VARY_WILDCARD] if seen.include?(VARY_WILDCARD)
+
+      additions.each_with_object(existing.dup) do |field, result|
+        next if field == VARY_WILDCARD
+
+        name = field.to_s
+        next if name.empty? || seen.include?(name.downcase)
+
+        seen << name.downcase
+        result << name
+      end
+    end
 
     def debug(env, message = nil, &block)
       (@logger || select_logger(env)).debug(message, &block) if debug?
