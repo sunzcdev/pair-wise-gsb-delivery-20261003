@@ -122,6 +122,50 @@ module Dry
         attributes(extracted_schema)
       end
 
+      # Build a projected view of this struct: a new {Dry::Struct} subclass
+      # containing only the selected attributes. Nested structs and arrays of
+      # structs can be narrowed down with nested selections.
+      #
+      # Selected attributes keep their original types, so required/optional
+      # flags, default values and key transformations are preserved. The
+      # source class is left untouched, and default values of attributes
+      # that were not selected are never evaluated.
+      #
+      # A nested selection that ends up empty raises {EmptyProjectionError}.
+      # Unknown attribute names raise {UnknownAttributeError} pointing at
+      # the exact path. Projecting into an attribute that is neither a
+      # struct nor an array of structs raises {UnsupportedProjectionError}.
+      #
+      # @param [Array<Symbol, Hash>] spec attribute tree
+      # @return [Class] new {Dry::Struct} subclass
+      # @raise [UnknownAttributeError] when a path doesn't match any attribute
+      # @raise [EmptyProjectionError] when a nested selection is empty
+      # @raise [UnsupportedProjectionError] when a nested selection targets
+      #   a non-struct attribute
+      #
+      # @example
+      #   class Event < Dry::Struct
+      #     attribute :id, Types::Integer
+      #     attribute :secret, Types::String
+      #     attribute :address do
+      #       attribute :city, Types::String
+      #       attribute :zipcode, Types::String
+      #     end
+      #     attribute :guests, Types::Array.of(Dry::Struct) do
+      #       attribute :name, Types::String
+      #       attribute :email, Types::String
+      #     end
+      #   end
+      #
+      #   PublicEvent = Event.project(:id, address: [:city], guests: [:name])
+      #
+      #   PublicEvent.attribute_names # => [:id, :address, :guests]
+      #   PublicEvent.schema.key(:address).attribute_names # => [:city]
+      #   PublicEvent.schema.key(:guests).member.attribute_names # => [:name]
+      def project(*spec)
+        Projection.call(self, spec)
+      end
+
       # Adds an omittable (key is not required on initialization) attribute for this {Struct}
       #
       # @example

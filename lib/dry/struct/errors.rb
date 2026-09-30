@@ -28,5 +28,48 @@ module Dry
         super("Reference to struct class was garbage collected")
       end
     end
+
+    # Base class for projection (view building) errors
+    class ProjectionError < ::ArgumentError; end
+
+    # Raised when a projection path doesn't match any attribute
+    class UnknownAttributeError < ProjectionError
+      # @param [Class] source struct class being projected
+      # @param [Symbol] name unknown attribute name
+      # @param [Array<Symbol>] path path to the attribute within the tree
+      def initialize(source:, name:, path:)
+        full_path = (path + [name]).join(".")
+        available = source.attribute_names.map { |attr| ":#{attr}" }.join(", ")
+
+        super(
+          "Unknown attribute :#{name} at \"#{full_path}\" on #{source} " \
+          "(available attributes: #{available})"
+        )
+      end
+    end
+
+    # Raised when a nested projection selects nothing
+    class EmptyProjectionError < ProjectionError
+      # @param [Array<Symbol>] path path to the attribute with an empty selection
+      def initialize(path)
+        super(
+          "Empty projection at \"#{path.join('.')}\": select at least one " \
+          "nested attribute, or select :#{path.last} as a whole"
+        )
+      end
+    end
+
+    # Raised when projecting into a type that has no projectable attributes
+    class UnsupportedProjectionError < ProjectionError
+      # @param [Array<Symbol>] path path to the attribute
+      # @param [Object] type attribute type that cannot be projected
+      # @param [String, nil] reason optional explanation
+      def initialize(path, type, reason: nil)
+        super(
+          "Cannot project into \"#{path.join('.')}\": #{reason || "#{type} is not a struct " \
+          "or an array of structs"}"
+        )
+      end
+    end
   end
 end
