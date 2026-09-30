@@ -29,6 +29,7 @@ Addressable closely conforms to RFC 3986, RFC 3987, and RFC 6570 (level 4).
 
 - {Addressable::URI}
 - {Addressable::Template}
+- {Addressable::MailTo}
 
 ## Example usage
 
@@ -48,6 +49,26 @@ uri.normalize
 #=> #<Addressable::URI:0xc9a4c8 URI:http://www.xn--8ws00zhy3a.com/>
 ```
 
+## Mailto URIs
+
+For more details, see [RFC 6068](https://www.rfc-editor.org/rfc/rfc6068.txt).
+
+```ruby
+require "addressable/mailto"
+
+mail = Addressable::MailTo.new(
+  to: ["user+tag@example.com", "other@example.com"],
+  headers: [["subject", "Hello"], ["body", "line1\nline2"]]
+)
+mail.to_s
+#=> "mailto:user+tag@example.com,other@example.com?subject=Hello&body=line1%0D%0Aline2"
+
+mail = Addressable::MailTo.parse("mailto:user+tag@example.com?subject=a+b")
+mail.to
+#=> ["user+tag@example.com"]
+mail.subject
+#=> "a+b"
+```
 
 ## URI Templates
 

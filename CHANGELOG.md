@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- adds `Addressable::MailTo`, a structured view and builder for RFC 6068
+  `mailto:` URIs that preserves recipient order and duplicate header fields,
+  never decodes `+` as a space, and keeps encoded commas inside recipients
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)
