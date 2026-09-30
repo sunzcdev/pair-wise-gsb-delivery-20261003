@@ -55,6 +55,19 @@ module Concurrent
   #
   # Unlike in Clojure, `Agent` cannot participate in `Concurrent::TVar` transactions.
   #
+  # ## Coalescing Dispatches
+  #
+  # When dispatches of the same kind arrive faster than the Agent can process
+  # them - for example, frequent status refreshes of one object where only the
+  # latest state matters - the {#send_coalesced}, {#send_coalesced_off}, and
+  # {#send_coalesced_via} methods accept a `merge_key`. A pending dispatch is
+  # replaced, in place, by a later dispatch carrying the same key, so only the
+  # newest payload runs while the queued position (and its order relative to
+  # other messages) is preserved. A dispatch that has already started running
+  # is never modified. Each call returns its own {DispatchReceipt}; the receipt
+  # of the replaced dispatch settles as `:superseded` immediately rather than
+  # blocking forever.
+  #
   # ## Example
   #
   # ```
@@ -160,7 +173,7 @@ module Concurrent
     DEFAULT_VALIDATOR = ->(value) { true }
     private_constant :DEFAULT_VALIDATOR
 
-    Job = Struct.new(:action, :args, :executor, :caller)
+    Job = Struct.new(:action, :args, :executor, :caller, :receipt, :merge_key)
     private_constant :Job
 
     # Raised during action processing or any other time in an Agent's lifecycle.
@@ -177,6 +190,147 @@ module Concurrent
       def initialize(message = nil)
         message ||= 'invalid value'
         super(message)
+      end
+    end
+
+    # Raised (as the {DispatchReceipt#reason reason} of a receipt) when a
+    # pending action dispatch is replaced by a newer dispatch carrying the same
+    # merge key. The replaced action never executes and its receipt is completed
+    # immediately, rather than waiting forever.
+    class SupersededError < Error
+      def initialize(message = nil)
+        message ||= 'dispatch superseded by a newer dispatch with the same merge key'
+        super(message)
+      end
+    end
+
+    # Raised (as the {DispatchReceipt#reason reason} of a receipt) when the
+    # Agent enters failed mode, or when the pending queue is discarded by a
+    # {#restart} with `:clear_actions`, before the dispatch could execute.
+    class DiscardedError < Error
+      def initialize(message = nil)
+        message ||= 'dispatch discarded because the agent failed or its queue was cleared'
+        super(message)
+      end
+    end
+
+    # The lifecycle receipt returned by the coalescing dispatch methods
+    # ({Agent#send_coalesced}, {Agent#send_coalesced_off}, and
+    # {Agent#send_coalesced_via}).
+    #
+    # A receipt is a single-assignment, thread-safe handle. It starts in the
+    # `:pending` state and eventually settles into exactly one terminal state:
+    #
+    # * `:fulfilled` - the action executed and its returned value is available
+    #   via {#value}.
+    # * `:rejected` - the action raised or failed validation; {#reason} holds
+    #   the error.
+    # * `:superseded` - the still-pending action was replaced by a newer
+    #   dispatch with the same merge key and never executed; {#reason} is a
+    #   {SupersededError}.
+    # * `:discarded` - the still-pending action could not execute because the
+    #   Agent entered failed mode or because {Agent#restart} cleared the queue;
+    #   {#reason} is a {DiscardedError}.
+    #
+    # An action that has already started executing can never be superseded or
+    # discarded; only queued, unstarted dispatches can.
+    class DispatchReceipt < Synchronization::LockableObject
+      STATES = [:pending, :fulfilled, :rejected, :superseded, :discarded].freeze
+
+      # @!visibility private
+      def initialize(merge_key)
+        super()
+        @merge_key = merge_key
+        @state     = :pending
+        @value     = nil
+        @reason    = nil
+        @settled   = Concurrent::Event.new
+      end
+
+      # @return [Object] the merge key given to the coalescing dispatch
+      attr_reader :merge_key
+
+      # @return [Symbol] the current state of the receipt
+      def state
+        synchronize { @state }
+      end
+
+      # @return [Boolean] true while the dispatch is queued and not settled
+      def pending?
+        synchronize { @state == :pending }
+      end
+
+      # @return [Boolean] true if the action executed and its value was applied
+      def fulfilled?
+        synchronize { @state == :fulfilled }
+      end
+
+      # @return [Boolean] true if the action raised or failed validation
+      def rejected?
+        synchronize { @state == :rejected }
+      end
+
+      # @return [Boolean] true if a newer dispatch with the same merge key
+      #   replaced this one before it started
+      def superseded?
+        synchronize { @state == :superseded }
+      end
+
+      # @return [Boolean] true if the dispatch never ran because the Agent
+      #   failed or the queue was cleared
+      def discarded?
+        synchronize { @state == :discarded }
+      end
+
+      # @return [Boolean] true once the receipt has reached any terminal state
+      def complete?
+        synchronize { @state != :pending }
+      end
+
+      # The value returned by the executed action. Blocks until the receipt
+      # settles, then returns the value when `:fulfilled` and `nil` otherwise.
+      #
+      # @param [Float] timeout maximum seconds to wait, nil to wait forever
+      # @return [Object, nil] the action's return value when fulfilled
+      def value(timeout = nil)
+        @settled.wait(timeout)
+        synchronize { @value }
+      end
+
+      # The error which prevented fulfillment. Blocks until the receipt settles,
+      # then returns the error when `:rejected`, `:superseded`, or
+      # `:discarded` and `nil` when `:fulfilled`.
+      #
+      # @param [Float] timeout maximum seconds to wait, nil to wait forever
+      # @return [nil, Exception] the terminal error, if any
+      def reason(timeout = nil)
+        @settled.wait(timeout)
+        synchronize { @reason }
+      end
+
+      # Blocks until the receipt settles or the timeout elapses.
+      #
+      # @param [Float] timeout maximum seconds to wait, nil to wait forever
+      # @return [Boolean] true if the receipt settled before the timeout
+      def wait(timeout = nil)
+        @settled.wait(timeout)
+      end
+
+      # @!visibility private
+      # Settle the receipt. Called by the owning Agent; takes the receipt's own
+      # lock so state is visible across threads on every Ruby implementation.
+      # Lock ordering is always Agent lock -> receipt lock -> event lock, and
+      # no code path acquires them in the opposite order.
+      def ns_settle(state, value = nil, reason = nil)
+        raise ArgumentError.new("invalid state #{state}") unless STATES.include?(state)
+        synchronize do
+          return false unless @state == :pending
+          @state  = state
+          @value  = value
+          @reason = reason
+          @settled.set
+          true
+        end
       end
     end
 
@@ -321,6 +475,84 @@ module Concurrent
       true
     end
 
+    # @!macro agent_coalesced_send
+    #
+    #   Coalescing version of {#send}. The given `merge_key` identifies the
+    #   kind of dispatch, such as the object whose status is being refreshed.
+    #   If an earlier dispatch with the same key is still waiting in the queue,
+    #   it is replaced in place by this one: only the latest payload ever
+    #   executes, but the pending position - and therefore its order relative to
+    #   other, differently keyed dispatches - is preserved.
+    #
+    #   Only dispatches that have not started executing can be replaced. An
+    #   action already running is never modified. The replaced dispatch's
+    #   {DispatchReceipt} immediately becomes `:superseded`, so callers waiting
+    #   on it never block forever. Each dispatch returns its own receipt; the
+    #   receipt for this call is fulfilled with the action's return value when
+    #   it eventually executes.
+    #
+    #   Dispatches made without a merge key (plain {#send}/{#send_off}) never
+    #   replace and are never replaced.
+    #
+    #   @param [Object] merge_key the key identifying coalescible dispatches
+    #   @param [Array<Object>] args zero or more arguments to be passed to
+    #     the action
+    #
+    #   @yield [value, *args] process the old value and return the new value
+    #   @yieldreturn [Object] the new value of the Agent
+    #
+    #   @return [DispatchReceipt, false] the receipt for this particular
+    #     dispatch, or false if the Agent is {#failed?}
+    def send_coalesced(merge_key, *args, &action)
+      enqueue_coalesced_job(merge_key, action, args, Concurrent.global_fast_executor)
+    end
+
+    # Coalescing version of {#send!}.
+    #
+    # @!macro agent_coalesced_send
+    # @raise [Concurrent::Agent::Error] if the Agent is {#failed?}
+    def send_coalesced!(merge_key, *args, &action)
+      raise Error.new unless send_coalesced(merge_key, *args, &action)
+      true
+    end
+
+    # Coalescing version of {#send_off} (appropriate for actions that may
+    # block on IO).
+    #
+    # @!macro agent_coalesced_send
+    def send_coalesced_off(merge_key, *args, &action)
+      enqueue_coalesced_job(merge_key, action, args, Concurrent.global_io_executor)
+    end
+
+    # Coalescing version of {#send_off!}.
+    #
+    # @!macro agent_coalesced_send
+    # @raise [Concurrent::Agent::Error] if the Agent is {#failed?}
+    def send_coalesced_off!(merge_key, *args, &action)
+      raise Error.new unless send_coalesced_off(merge_key, *args, &action)
+      true
+    end
+
+    # Coalescing version of {#send_via}.
+    #
+    # @!macro agent_coalesced_send
+    # @param [Concurrent::ExecutorService] executor the executor on which the
+    #   action is to be dispatched
+    def send_coalesced_via(executor, merge_key, *args, &action)
+      enqueue_coalesced_job(merge_key, action, args, executor)
+    end
+
+    # Coalescing version of {#send_via!}.
+    #
+    # @!macro agent_coalesced_send
+    # @param [Concurrent::ExecutorService] executor the executor on which the
+    #   action is to be dispatched
+    # @raise [Concurrent::Agent::Error] if the Agent is {#failed?}
+    def send_coalesced_via!(executor, merge_key, *args, &action)
+      raise Error.new unless send_coalesced_via(executor, merge_key, *args, &action)
+      true
+    end
+
     # Dispatches an action to the Agent and returns immediately. Subsequently,
     # in a thread from a thread pool, the {#value} will be set to the return
     # value of the action. Appropriate for actions that may block on IO.
@@ -428,7 +660,10 @@ module Concurrent
         raise ValidationError unless ns_validate(new_value)
         @current.value = new_value
         @error.value   = nil
-        @queue.clear if clear_actions
+        if clear_actions
+          ns_discard_queued_receipts
+          @queue.clear
+        end
         ns_post_next_job unless @queue.empty?
       end
       true
@@ -503,6 +738,7 @@ module Concurrent
       @error         = Concurrent::AtomicReference.new(nil)
       @caller        = Concurrent::ThreadLocalVar.new(nil)
       @queue         = []
+      @current_job   = nil
 
       self.observers = Collection::CopyOnNotifyObserverSet.new
     end
@@ -511,6 +747,18 @@ module Concurrent
       raise ArgumentError.new('no action given') unless action
       job = Job.new(action, args, executor, @caller.value || Thread.current.object_id)
       synchronize { ns_enqueue_job(job) }
+    end
+
+    def enqueue_coalesced_job(merge_key, action, args, executor)
+      raise ArgumentError.new('no action given') unless action
+      receipt = DispatchReceipt.new(merge_key)
+      synchronize do
+        return false if failed?
+        job = Job.new(action, args, executor, @caller.value || Thread.current.object_id,
+                      receipt, merge_key)
+        ns_enqueue_coalesced_job(job)
+      end
+      receipt
     end
 
     def enqueue_await_job(latch)
@@ -536,49 +784,118 @@ module Concurrent
       true
     end
 
+    def ns_enqueue_coalesced_job(job)
+      # Replace an earlier queued job carrying the same merge key. The job
+      # currently executing (@current_job) can never be replaced, but a head
+      # job that has been posted to an executor without actually starting yet
+      # is still fair game: the worker reads @queue.first when it starts, so
+      # it will pick up the replacement. The replacement keeps the original
+      # position, preserving order relative to every other queued message.
+      # Await jobs and plain (unkeyed) jobs carry a nil merge key and are
+      # therefore never matched.
+      index = @queue.index do |queued|
+        queued.merge_key == job.merge_key && queued != @current_job
+      end
+
+      if index
+        old_job = @queue[index]
+        @queue[index] = job
+        old_job.receipt.ns_settle(:superseded, nil, SupersededError.new)
+      else
+        @queue.push(job)
+        # if this is the only job, post to executor
+        ns_post_next_job if @queue.length == 1
+      end
+      true
+    end
+
+    # Settle, as discarded, every still-pending receipt attached to queued
+    # jobs. Used when the Agent enters failed mode (the jobs are held until
+    # {#restart}) and when {#restart} clears the queue (the jobs are dropped).
+    def ns_discard_queued_receipts
+      @queue.each do |queued|
+        queued.receipt&.ns_settle(:discarded, nil, DiscardedError.new)
+      end
+    end
+
     def ns_post_next_job
       @queue.first.executor.post { execute_next_job }
     end
 
     def execute_next_job
-      job       = synchronize { @queue.first }
-      old_value = @current.value
-
-      @caller.value = job.caller # for nested actions
-      new_value     = job.action.call(old_value, *job.args)
-      @caller.value = nil
-
-      return if new_value == AWAIT_FLAG
-
-      if ns_validate(new_value)
-        @current.value = new_value
-        observers.notify_observers(Time.now, old_value, new_value)
-      else
-        handle_error(ValidationError.new)
+      # Claim the head job before running its action. Until this point the
+      # posted job has not started and may still be coalesced away.
+      job = synchronize do
+        claimed = @queue.first
+        @current_job = claimed
+        claimed
       end
-    rescue => error
-      handle_error(error)
-    ensure
+      return unless job
+
+      old_value = @current.value
+      @caller.value = job.caller # for nested actions
+      begin
+        new_value = job.action.call(old_value, *job.args)
+      rescue => error
+        finish_failed_job(job, error)
+        return
+      ensure
+        @caller.value = nil
+      end
+
+      if new_value == AWAIT_FLAG
+        finish_await_job(job)
+      elsif ns_validate(new_value)
+        finish_fulfilled_job(job, new_value, old_value)
+      else
+        finish_failed_job(job, ValidationError.new)
+      end
+    end
+
+    def finish_fulfilled_job(job, new_value, old_value)
       synchronize do
+        @current_job    = nil
+        @current.value  = new_value
+        job.receipt&.ns_settle(:fulfilled, new_value)
         @queue.shift
-        unless failed? || @queue.empty?
+        ns_post_next_job unless failed? || @queue.empty?
+      end
+      observers.notify_observers(Time.now, old_value, new_value)
+    end
+
+    def finish_await_job(job)
+      synchronize do
+        @current_job = nil
+        @queue.shift
+        ns_post_next_job unless failed? || @queue.empty?
+      end
+    end
+
+    def finish_failed_job(job, error)
+      synchronize do
+        @current_job = nil
+        job.receipt&.ns_settle(:rejected, nil, error)
+        @queue.shift
+
+        if @error_mode == :fail
+          # stop new jobs from posting; hold the remaining jobs but end their
+          # receipts so nobody waits on them forever
+          @error.value = error
+          ns_discard_queued_receipts
+        elsif !@queue.empty?
           ns_post_next_job
         end
       end
+
+      @error_handler.call(self, error)
+    rescue
+      # do nothing
     end
 
     def ns_validate(value)
       @validator.call(value)
     rescue
       false
-    end
-
-    def handle_error(error)
-      # stop new jobs from posting
-      @error.value = error if @error_mode == :fail
-      @error_handler.call(self, error)
-    rescue
-      # do nothing
     end
 
     def ns_find_last_job_for_thread

@@ -679,6 +679,429 @@ module Concurrent
       end
     end
 
+    context 'coalescing dispatches' do
+
+      let(:started) { Concurrent::Event.new }
+      let(:release) { Concurrent::Event.new }
+
+      # Pause the head action so that subsequent dispatches are guaranteed to
+      # queue up behind it.
+      def block_head(subject, payload = nil)
+        subject.send_coalesced_via(executor, :head) do |value|
+          started.set
+          release.wait
+          payload.nil? ? value : payload
+        end
+      end
+
+      after(:each) do
+        release.set
+      end
+
+      context 'DispatchReceipt' do
+
+        specify 'is returned by every coalescing entry point' do
+          subject = Agent.new(0)
+          expect(subject.send_coalesced(:a) { 1 }).to be_a Agent::DispatchReceipt
+          expect(subject.send_coalesced_off(:a) { 1 }).to be_a Agent::DispatchReceipt
+          expect(subject.send_coalesced_via(immediate, :a) { 1 }).to be_a Agent::DispatchReceipt
+        end
+
+        specify 'is pending at first and fulfilled after the action applies' do
+          subject = Agent.new(0)
+          receipt = subject.send_coalesced_via(executor, :a) { 42 }
+          expect(receipt).to be_pending
+          expect(receipt).to_not be_complete
+          expect(receipt.wait(1)).to be true
+          expect(receipt).to be_fulfilled
+          expect(receipt.state).to eq :fulfilled
+          expect(receipt.value(1)).to eq 42
+          expect(receipt.reason(1)).to be nil
+        end
+
+        specify 'is rejected with the error when the action raises' do
+          error   = StandardError.new('boom')
+          subject = Agent.new(0, error_mode: :continue)
+          receipt = subject.send_coalesced_via(immediate, :a) { raise error }
+          expect(receipt).to be_rejected
+          expect(receipt).to be_complete
+          expect(receipt.reason(1)).to eq error
+          expect(receipt.value(1)).to be nil
+        end
+
+        specify 'is rejected with a ValidationError when validation fails' do
+          subject = Agent.new(0, error_mode: :continue, validator: ->(_) { false })
+          receipt = subject.send_coalesced_via(immediate, :a) { 42 }
+          expect(receipt).to be_rejected
+          expect(receipt.reason(1)).to be_a Agent::ValidationError
+        end
+
+        specify 'exposes its merge key' do
+          subject = Agent.new(0)
+          receipt = subject.send_coalesced_via(immediate, :status_42) { 1 }
+          expect(receipt.merge_key).to eq :status_42
+        end
+
+        specify '#wait returns false on timeout and true once settled' do
+          subject = Agent.new(0)
+          block_head(subject)
+          started.wait(1)
+          receipt = subject.send_coalesced_via(executor, :a) { 1 }
+          expect(receipt.wait(0.05)).to be false
+          release.set
+          expect(receipt.wait(1)).to be true
+        end
+      end
+
+      context 'executor routing' do
+
+        it 'posts #send_coalesced to the global fast executor' do
+          subject = Agent.new(0)
+          expect(subject).to receive(:enqueue_coalesced_job)
+            .with(:a, anything, anything, Concurrent.global_fast_executor)
+            .and_call_original
+          subject.send_coalesced(:a) { nil }
+          subject.await_for(1)
+        end
+
+        it 'posts #send_coalesced_off to the global io executor' do
+          subject = Agent.new(0)
+          expect(subject).to receive(:enqueue_coalesced_job)
+            .with(:a, anything, anything, Concurrent.global_io_executor)
+            .and_call_original
+          subject.send_coalesced_off(:a) { nil }
+          subject.await_for(1)
+        end
+
+        it 'posts #send_coalesced_via to the given executor' do
+          expect(immediate).to receive(:post).with(any_args).and_call_original
+          subject = Agent.new(0)
+          subject.send_coalesced_via(immediate, :a) { nil }
+        end
+
+        it 'raises ArgumentError when no action is given' do
+          subject = Agent.new(0)
+          expect { subject.send_coalesced(:a) }.to raise_error(ArgumentError)
+        end
+      end
+
+      context 'bang variants' do
+
+        it 'returns true when enqueued' do
+          subject = Agent.new(0)
+          expect(subject.send_coalesced!(:a) { 1 }).to be true
+          expect(subject.send_coalesced_off!(:a) { 1 }).to be true
+          expect(subject.send_coalesced_via!(immediate, :a) { 1 }).to be true
+        end
+
+        it 'raises Agent::Error when failed' do
+          subject = Agent.new(0, error_mode: :fail)
+          allow(subject).to receive(:failed?).and_return(true)
+          expect { subject.send_coalesced!(:a) { 1 } }.to raise_error(Agent::Error)
+          expect { subject.send_coalesced_off!(:a) { 1 } }.to raise_error(Agent::Error)
+          expect { subject.send_coalesced_via!(immediate, :a) { 1 } }
+            .to raise_error(Agent::Error)
+        end
+
+        it 'returns false (no receipt) when failed' do
+          subject = Agent.new(0, error_mode: :fail)
+          allow(subject).to receive(:failed?).and_return(true)
+          expect(subject.send_coalesced(:a) { 1 }).to be false
+        end
+      end
+
+      context 'superseding' do
+
+        specify 'a newer dispatch with the same key replaces the pending one' do
+          subject = Agent.new(0)
+          block_head(subject, 100)
+          started.wait(1)
+
+          old = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+          new = subject.send_coalesced_via(executor, :a) { |v| v + 2 }
+
+          expect(old).to be_superseded
+          expect(old.reason(1)).to be_a Agent::SupersededError
+          expect(old).to be_complete
+          expect(new).to be_pending
+
+          release.set
+          expect(new.wait(1)).to be true
+          expect(new).to be_fulfilled
+          expect(new.value(1)).to eq 102
+          expect(subject.await_for(1)).to eq true
+          expect(subject.value).to eq 102
+        end
+
+        specify 'the superseded receipt never waits forever' do
+          subject = Agent.new(0)
+          block_head(subject)
+          started.wait(1)
+
+          old = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+          subject.send_coalesced_via(executor, :a) { |v| v + 2 }
+
+          # Blocks until settled (which is immediate on supersession).
+          expect { old.wait(2) }.to_not raise_error
+          expect(old.wait(0.1)).to be true
+          release.set
+        end
+
+        specify 'a chain of stale refreshes collapses to the latest payload' do
+          subject = Agent.new(0)
+          block_head(subject, 0)
+          started.wait(1)
+
+          stale = (1..10).map do |i|
+            subject.send_coalesced_via(executor, :status) { |v| "status-#{i}" }
+          end
+          latest = subject.send_coalesced_via(executor, :status) { |v| 'status-final' }
+
+          stale.each { |receipt| expect(receipt).to be_superseded }
+          expect(latest).to be_pending
+
+          release.set
+          expect(latest.wait(1)).to be true
+          expect(subject.await_for(1)).to eq true
+          expect(subject.value).to eq 'status-final'
+          expect(subject.instance_variable_get(:@queue)).to be_empty
+        end
+
+        specify 'different keys never supersede each other' do
+          subject = Agent.new(0)
+          block_head(subject, 0)
+          started.wait(1)
+
+          a = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+          b = subject.send_coalesced_via(executor, :b) { |v| v + 10 }
+          subject.send_coalesced_via(executor, :a) { |v| v + 2 }
+
+          expect(a).to be_superseded
+          expect(b).to be_pending
+
+          release.set
+          expect(b.wait(1)).to be true
+          expect(b.value(1)).to eq 12
+          expect(subject.await_for(1)).to eq true
+        end
+
+        specify 'plain (unkeyed) dispatches are neither replaced nor coalesced' do
+          subject = Agent.new(0)
+          block_head(subject, 0)
+          started.wait(1)
+
+          plain1 = subject.send_via(executor) { |v| v + 100 }
+          plain2 = subject.send_via(executor) { |v| v + 100 }
+          keyed  = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+          subject.send_coalesced_via(executor, :a) { |v| v + 2 }
+
+          expect(plain1).to be true
+          expect(plain2).to be true
+          expect(keyed).to be_superseded
+
+          release.set
+          expect(subject.await_for(1)).to eq true
+          expect(subject.value).to eq 202
+        end
+      end
+
+      context 'ordering and position preservation' do
+
+        specify 'the replacement keeps the original position relative to other messages' do
+          subject = Agent.new(0)
+          executed = []
+          block_head(subject, 0)
+          started.wait(1)
+
+          # queue after head: [a1, plain, b1]
+          a1 = subject.send_coalesced_via(executor, :a) { |v| executed << :a; v + 1 }
+          subject.send_via(executor) { |v| executed << :plain; v + 100 }
+          b1 = subject.send_coalesced_via(executor, :b) { |v| executed << :b; v + 1 }
+
+          # replace a1 in place and b1 in place, and add another plain at tail
+          a2 = subject.send_coalesced_via(executor, :a) { |v| executed << :a2; v + 2 }
+          b2 = subject.send_coalesced_via(executor, :b) { |v| executed << :b2; v + 20 }
+          subject.send_via(executor) { |v| executed << :tail; v + 1000 }
+
+          expect(a1).to be_superseded
+          expect(b1).to be_superseded
+          expect(a2).to be_pending
+          expect(b2).to be_pending
+
+          release.set
+          [a2, b2].each { |r| expect(r.wait(1)).to be true }
+          expect(subject.await_for(1)).to eq true
+
+          # effective execution: head, a2 (at a1's slot), plain, b2, tail
+          expect(executed).to eq [:a2, :plain, :b2, :tail]
+          expect(a2.value(1)).to eq 2
+          expect(b2.value(1)).to eq 122
+          expect(subject.value).to eq 1122
+        end
+
+        specify 'mixed two keys and plain messages run each payload exactly once' do
+          subject = Agent.new(0)
+          executed = []
+          block_head(subject, 0)
+          started.wait(1)
+
+          a1 = subject.send_coalesced_via(executor, :a) { |v| executed << 'a1'; v + 1 }
+          expect(subject.send_via(executor) { |v| executed << 'n1'; v + 100 }).to be true
+          b1 = subject.send_coalesced_via(executor, :b) { |v| executed << 'b1'; v + 1 }
+          a2 = subject.send_coalesced_via(executor, :a) { |v| executed << 'a2'; v + 2 }
+          expect(subject.send_via(executor) { |v| executed << 'n2'; v + 100 }).to be true
+          b2 = subject.send_coalesced_via(executor, :b) { |v| executed << 'b2'; v + 20 }
+          a3 = subject.send_coalesced_via(executor, :a) { |v| executed << 'a3'; v + 3 }
+
+          expect(a1.state).to eq :superseded
+          expect(a2.state).to eq :superseded
+          expect(b1.state).to eq :superseded
+          expect(a3).to be_pending
+          expect(b2).to be_pending
+
+          release.set
+          expect(subject.await_for(2)).to eq true
+
+          # only the survivors execute, in the preserved queue order
+          expect(executed).to eq ['a3', 'n1', 'b2', 'n2']
+
+          expect(a3).to be_fulfilled
+          expect(a3.value(1)).to eq 3
+          expect(b2).to be_fulfilled
+          expect(b2.value(1)).to eq 123
+          expect(a1).to be_superseded
+          expect(a2).to be_superseded
+          expect(b1).to be_superseded
+          # 0 + a3(3) + n1(100) + b2(20) + n2(100) = 223
+          expect(subject.value).to eq 223
+        end
+      end
+
+      context 'an action already executing' do
+
+        specify 'is never replaced, even with the same key' do
+          subject = Agent.new(0)
+          head = block_head(subject, 42)
+          started.wait(1)
+
+          # same key as the running head, but it must NOT supersede it
+          queued = subject.send_coalesced_via(executor, :head) { |v| v + 1 }
+
+          expect(head).to be_pending
+          expect(queued).to be_pending
+
+          release.set
+          expect(head.wait(1)).to be true
+          expect(queued.wait(1)).to be true
+          expect(head).to be_fulfilled
+          expect(head.value(1)).to eq 42
+          expect(queued.value(1)).to eq 43
+          expect(subject.value).to eq 43
+        end
+      end
+
+      context 'when the agent enters failed mode' do
+
+        specify 'pending receipts end as discarded' do
+          subject = Agent.new(0, error_mode: :fail)
+          start_failure = Concurrent::Event.new
+          release_failure = Concurrent::Event.new
+
+          subject.send_via(executor) do
+            start_failure.set
+            release_failure.wait
+            raise StandardError.new('boom')
+          end
+          start_failure.wait(1)
+
+          pending_a = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+          pending_b = subject.send_coalesced_via(executor, :b) { |v| v + 2 }
+
+          release_failure.set
+          expect(pending_a.wait(1)).to be true
+          expect(pending_b.wait(1)).to be true
+          expect(pending_a).to be_discarded
+          expect(pending_b).to be_discarded
+          expect(pending_a.reason(1)).to be_a Agent::DiscardedError
+          expect(subject).to be_failed
+        end
+
+        specify 'the running action receipt is rejected with the error' do
+          subject = Agent.new(0, error_mode: :fail)
+          error = StandardError.new('boom')
+          start_failure = Concurrent::Event.new
+          release_failure = Concurrent::Event.new
+
+          receipt = subject.send_coalesced_via(executor, :a) do
+            start_failure.set
+            release_failure.wait
+            raise error
+          end
+          start_failure.wait(1)
+          release_failure.set
+
+          expect(receipt.wait(1)).to be true
+          expect(receipt).to be_rejected
+          expect(receipt.reason(1)).to eq error
+        end
+
+        specify 'new coalescing dispatches are refused while failed' do
+          subject = Agent.new(0, error_mode: :fail)
+          subject.send_via(immediate) { raise StandardError }
+          expect(subject.send_coalesced_via(executor, :a) { 1 }).to be false
+        end
+      end
+
+      context 'restart' do
+
+        specify 'with clear_actions discards the held receipts' do
+          subject = Agent.new(0, error_mode: :fail)
+          start_failure = Concurrent::Event.new
+          release_failure = Concurrent::Event.new
+
+          subject.send_via(executor) do
+            start_failure.set
+            release_failure.wait
+            raise StandardError
+          end
+          start_failure.wait(1)
+          held = subject.send_coalesced_via(executor, :a) { |v| v + 1 }
+
+          release_failure.set
+          expect(held.wait(1)).to be true
+          expect(held).to be_discarded
+
+          subject.restart(42, clear_actions: true)
+          expect(subject.await_for(1)).to eq true
+          expect(subject.value).to eq 42
+          expect(held).to be_discarded
+        end
+
+        specify 'without clear_actions lets held jobs run but leaves receipts discarded' do
+          subject = Agent.new(0, error_mode: :fail)
+          start_failure = Concurrent::Event.new
+          release_failure = Concurrent::Event.new
+
+          subject.send_via(executor) do
+            start_failure.set
+            release_failure.wait
+            raise StandardError
+          end
+          start_failure.wait(1)
+          held = subject.send_coalesced_via(executor, :a) { |v| v + 7 }
+
+          release_failure.set
+          expect(held.wait(1)).to be true
+          expect(held).to be_discarded
+
+          subject.restart(0, clear_actions: false)
+          expect(subject.await_for(1)).to eq true
+          expect(subject.value).to eq 7
+          expect(held.state).to eq :discarded
+        end
+      end
+    end
+
     context '#restart' do
 
       context 'when #failed?' do
