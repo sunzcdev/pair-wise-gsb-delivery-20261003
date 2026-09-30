@@ -1,3 +1,15 @@
+## Unreleased
+
+- Add write-time capacity budget options `:max_cookies_per_site` and
+  `:max_total_bytes` to `HTTP::CookieJar::HashStore`.  When
+  configured, expired cookies are reclaimed first and then the least
+  recently accessed cookies are evicted in a stable order, cookies
+  are grouped into sites by their DomainName registered domain, and a
+  single cookie larger than the byte budget is rejected keeping any
+  old value.  Also add `HashStore#add_all` for atomic batch loading
+  that checks the whole change against the budget before committing.
+
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)
