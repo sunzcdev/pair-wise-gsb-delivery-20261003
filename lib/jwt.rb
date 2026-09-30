@@ -11,6 +11,7 @@ require 'jwt/jwk'
 require 'jwt/claims'
 require 'jwt/encoded_token'
 require 'jwt/token'
+require 'jwt/strict_token_parser'
 
 # JSON Web Token implementation
 #
@@ -41,6 +42,7 @@ module JWT
   # @param key [String] the key used to verify the JWT.
   # @param verify [Boolean] whether to verify the JWT signature.
   # @param options [Hash] additional options for decoding.
+  # @option options [Boolean] :strict reject malformed segments before key lookup.
   # @return [Array<Hash>] the decoded payload and headers.
   def decode(jwt, key = nil, verify = true, options = {}, &keyfinder) # rubocop:disable Style/OptionalBooleanParameter
     Decode.new(jwt, key, verify, configuration.decode.to_h.merge(options), &keyfinder).decode_segments

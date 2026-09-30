@@ -22,7 +22,8 @@ module JWT
     def initialize(jwt, key, verify, options, &keyfinder)
       raise JWT::MalformedTokenError, 'Nil JSON web token' unless jwt
 
-      @token = EncodedToken.new(jwt)
+      @strict = strict_option?(options)
+      @token = EncodedToken.new(jwt, strict: @strict)
       @key = key
       @options = options
       @verify = verify
@@ -47,6 +48,10 @@ module JWT
     private
 
     attr_reader :token
+
+    def strict?
+      @strict
+    end
 
     def verify_signature
       return if none_algorithm?
@@ -104,6 +109,8 @@ module JWT
     end
 
     def validate_segment_count!
+      return if strict?
+
       segment_count = token.jwt.count('.') + 1
       return if segment_count == 3
       return if !@verify && segment_count == 2 # If no verifying required, the signature is not needed
@@ -124,6 +131,10 @@ module JWT
 
     def alg_in_header
       token.header['alg']
+    end
+
+    def strict_option?(options)
+      options[:strict] == true || options['strict'] == true
     end
   end
 end

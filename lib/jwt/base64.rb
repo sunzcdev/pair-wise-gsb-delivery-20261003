@@ -22,6 +22,18 @@ module JWT
 
         raise Base64DecodeError, 'Invalid base64 encoding'
       end
+
+      # Decode a string with unpadded URL-safe Base64 complying with RFC 4648.
+      # @api private
+      def strict_url_decode(str)
+        valid_base64url = str.match?(/\A[A-Za-z0-9_-]*\z/) && (str.bytesize % 4) != 1
+        raise Base64DecodeError, 'Invalid base64 encoding' unless valid_base64url
+
+        decoded = url_decode(str)
+        return decoded if url_encode(decoded) == str
+
+        raise Base64DecodeError, 'Invalid base64 encoding'
+      end
     end
   end
 end

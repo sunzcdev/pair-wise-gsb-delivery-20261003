@@ -25,22 +25,26 @@ module JWT
     # Initializes a new EncodedToken instance.
     #
     # @param jwt [String] the encoded JWT token.
+    # @param strict [Boolean] whether to require canonical, bounded JWT syntax.
     # @raise [ArgumentError] if the provided JWT is not a String.
-    def initialize(jwt)
+    def initialize(jwt, strict: false)
       raise ArgumentError, 'Provided JWT must be a String' unless jwt.is_a?(String)
 
       @jwt = jwt
+      @strict = strict
       @signature_verified = false
       @claims_verified    = false
 
       @encoded_header, @encoded_payload, @encoded_signature = jwt.split('.')
+      validate_strict_segment_count! if strict?
+      parse_strict_token! if strict?
     end
 
     # Returns the decoded signature of the JWT token.
     #
     # @return [String] the decoded signature.
     def signature
-      @signature ||= ::JWT::Base64.url_decode(encoded_signature || '')
+      @signature ||= decode_base64(encoded_signature || '')
     end
 
     # Returns the encoded signature of the JWT token.
@@ -52,7 +56,7 @@ module JWT
     #
     # @return [Hash] the header.
     def header
-      @header ||= parse_and_decode(@encoded_header)
+      @header ||= (@strict_header || parse_and_decode(@encoded_header))
     end
 
     # Returns the encoded header of the JWT token.
@@ -90,7 +94,9 @@ module JWT
     def encoded_payload=(encoded_payload)
       @encoded_payload = encoded_payload
       @decoded_payload = nil
+      @strict_payload = nil
       @signature_verified = @claims_verified = false
+      parse_strict_payload! if strict?
     end
 
     # Returns the signing input of the JWT token.
@@ -214,7 +220,7 @@ module JWT
     end
 
     def parse_and_decode(segment)
-      parse(::JWT::Base64.url_decode(segment || ''))
+      parse(decode_base64(segment || ''))
     end
 
     def parse(segment)
@@ -223,8 +229,38 @@ module JWT
       raise JWT::MalformedTokenError, 'Invalid segment encoding'
     end
 
+    def decode_base64(segment)
+      strict? ? JWT::Base64.strict_url_decode(segment) : ::JWT::Base64.url_decode(segment)
+    end
+
+    def strict?
+      @strict
+    end
+
+    def parse_strict_token!
+      parsed_token = StrictTokenParser.parse(strict_segments)
+      @strict_header = parsed_token.header
+      @strict_payload = parsed_token.payload
+      @signature = parsed_token.signature
+    end
+
+    def parse_strict_payload!
+      parsed_token = StrictTokenParser.parse(strict_segments)
+      @strict_header = parsed_token.header
+      @strict_payload = parsed_token.payload
+    end
+
+    def strict_segments
+      [encoded_header, encoded_payload, encoded_signature]
+    end
+
+    def validate_strict_segment_count!
+      segments = jwt.split('.')
+      raise MalformedTokenError, 'Not enough or too many segments' unless segments.size == 3
+    end
+
     def decoded_payload
-      @decoded_payload ||= decode_payload
+      @strict_payload || @decoded_payload ||= decode_payload
     end
   end
 end

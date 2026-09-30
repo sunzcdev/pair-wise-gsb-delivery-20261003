@@ -51,6 +51,19 @@ For safe cryptographic signing, you need to specify the algorithm in the options
 
 See [JSON Web Algorithms (JWA) 3.1. "alg" (Algorithm) Header Parameter Values for JWS](https://tools.ietf.org/html/rfc7518#section-3.1)
 
+### Strict token parsing
+
+When accepting tokens from external clients, enable strict parsing before key lookup or signature verification. Strict mode rejects tokens with an unexpected number of segments, padded or otherwise non-canonical base64url, duplicate JSON object keys, decoded segments larger than 10 KiB, or JSON nested more deeply than 10 levels.
+
+The received segments remain byte-for-byte unchanged and are used as the signing input. The library never re-encodes a normalized token before verifying its signature.
+
+```ruby
+JWT.decode(token, hmac_secret, true, algorithm: 'HS256', strict: true)
+
+encoded_token = JWT::EncodedToken.new(token, strict: true)
+encoded_token.verify!(signature: { algorithm: 'HS256', key: hmac_secret })
+```
+
 ### **NONE**
 
 - none - unsigned token
