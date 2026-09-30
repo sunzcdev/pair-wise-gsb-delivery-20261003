@@ -39,11 +39,10 @@ class HTTP::CookieJar::YAMLSaver < HTTP::CookieJar::AbstractSaver
 
     case data
     when Array
-      data.each { |cookie|
-        jar.add(cookie)
-      }
+      jar.add_all(data)
     when Hash
       # backward compatibility with Mechanize::Cookie
+      cookies = []
       data.each { |domain, paths|
         paths.each { |path, names|
           names.each { |cookie_name, cookie_hash|
@@ -56,10 +55,11 @@ class HTTP::CookieJar::YAMLSaver < HTTP::CookieJar::AbstractSaver
                   hash[key.to_sym] = value
                 }
               })
-            jar.add(cookie)
+            cookies << cookie
           }
         }
       }
+      jar.add_all(cookies)
     else
       @logger.warn "incompatible YAML cookie data discarded" if @logger
       return

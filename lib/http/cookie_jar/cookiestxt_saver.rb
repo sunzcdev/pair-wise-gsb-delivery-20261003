@@ -29,9 +29,11 @@ class HTTP::CookieJar::CookiestxtSaver < HTTP::CookieJar::AbstractSaver
   end
 
   def load(io, jar)
+    cookies = []
     io.each_line { |line|
-      cookie = parse_record(line) and jar.add(cookie)
+      cookie = parse_record(line) and cookies << cookie
     }
+    jar.add_all(cookies)
   end
 
   private

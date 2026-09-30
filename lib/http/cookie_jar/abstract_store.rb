@@ -53,6 +53,16 @@ class HTTP::CookieJar::AbstractStore
     # self
   end
 
+  # Implements HTTP::CookieJar#add_all().  Stores that support
+  # capacity budgets should override this with an atomic version;
+  # the default simply adds the cookies one by one.
+  def add_all(cookies)
+    cookies.each { |cookie|
+      add(cookie)
+    }
+    true
+  end
+
   # Implements HTTP::CookieJar#delete().
   #
   # This is an abstract method that each subclass must override.

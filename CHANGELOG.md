@@ -1,3 +1,20 @@
+## Unreleased
+
+- `HTTP::CookieJar::HashStore` now enforces write-time capacity
+  budgets in addition to the periodic creation-time GC:
+  - New `:max_cookies_per_site` option caps the number of cookies
+    kept per registrable domain, derived from a cookie's DomainName
+    without any network lookup.
+  - New `:max_total_bytes` option caps the total number of bytes of
+    stored cookie name/value pairs.
+  - On a write, expired cookies are purged first and remaining
+    overflow is evicted in a stable least-recently-accessed order.
+  - Replacing an existing cookie no longer double counts it, a
+    single cookie over the byte budget keeps the replaced value, and
+    `HTTP::CookieJar#add_all` (also used by save-file loading)
+    validates the whole change before committing anything.
+  - A `:clock` option allows the current time to be controlled.
+
 ## 1.1.6 (2026-04-20)
 
 - Use `autoload` to avoid "circular require" warnings between `http/cookie` and `http/cookie_jar`. (#65)

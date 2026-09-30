@@ -96,6 +96,29 @@ class HTTP::CookieJar
   end
   alias << add
 
+  # Adds a collection of cookies to the jar atomically.  Every
+  # cookie must have domain and path attributes set, or ArgumentError
+  # is raised before the store is touched.
+  #
+  # Stores with capacity budgets (such as HashStore with
+  # :max_cookies_per_site or :max_total_bytes) first compute whether
+  # the whole change fits -- after purging expired cookies and
+  # least-recently-used eviction -- and commit it only then; if any
+  # cookie alone exceeds a budget, or the change cannot fit at all,
+  # no cookie is added and existing cookies (including one that a
+  # new cookie would otherwise replace) are left untouched.
+  def add_all(cookies)
+    cookies.each { |cookie|
+      begin
+        cookie.acceptable?
+      rescue RuntimeError => e
+        raise ArgumentError, e.message
+      end
+    }
+    @store.add_all(cookies)
+    self
+  end
+
   # Deletes a cookie that has the same name, domain and path as a
   # given cookie from the jar and returns self.
   #
