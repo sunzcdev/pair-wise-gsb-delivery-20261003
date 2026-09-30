@@ -9,6 +9,17 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Reusable attribute fragments via `Dry::Struct::Fragment`. Fragments can be
+  imported into structs (or other fragments) with `attributes_from`, selecting
+  (`only:`/`except:`), renaming (`rename:`) or nesting (`namespace:`) attributes
+  while preserving each attribute's origin (see `.attribute_source`). Reaching
+  the same definition through multiple import paths counts once; same-named
+  attributes from different definitions raise `Dry::Struct::AttributeConflictError`
+  pointing at both definitions — even when their types are identical — and must
+  be disambiguated explicitly (`rename:`, `except:` or `resolve:`). Resolutions
+  never relax requiredness, and attributes a parent class imports later do not
+  rewrite origins already settled in its subclasses
+
 ### Changed
 
 ### Deprecated

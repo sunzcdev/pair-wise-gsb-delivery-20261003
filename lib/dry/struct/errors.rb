@@ -14,6 +14,37 @@ module Dry
       end
     end
 
+    # Raised when an import brings in an attribute whose name is already
+    # taken by a definition from a *different* source. The error message
+    # points at both definitions so the conflict can be resolved explicitly
+    # (via `rename:`, `except:` or `resolve:`)
+    class AttributeConflictError < RepeatedAttributeError
+      # @return [Symbol] the conflicting attribute name
+      attr_reader :attribute
+
+      # @return [Array<Fragment::Source>] the two diverging definitions
+      attr_reader :sources
+
+      # @param [Symbol] attribute
+      # @param [Array<Fragment::Source>] sources
+      # @param [String, nil] message custom message, built from the sources by default
+      def initialize(attribute, sources, message: nil)
+        @attribute = attribute
+        @sources = sources
+        @message = message
+        super(attribute)
+      end
+
+      def message
+        @message || begin
+          first, second = @sources
+          "Attribute :#{@attribute} is defined by both #{first} and #{second}; " \
+            "disambiguate with `rename:` or `except:`, " \
+            "or pick a definition with `resolve:`"
+        end
+      end
+    end
+
     # Raised when a struct doesn't have an attribute
     class MissingAttributeError < ::KeyError
       def initialize(attribute:, klass:)
