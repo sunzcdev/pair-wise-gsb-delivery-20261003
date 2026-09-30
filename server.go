@@ -41,6 +41,22 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// Observer, if non-nil, receives a structured audit event after each
+	// SMTP command completes. Unlike Debug, events never contain command
+	// arguments, authentication responses, or message contents, so they are
+	// safe to forward to log aggregation platforms.
+	//
+	// The Observer is called from the connection's goroutine, but never
+	// while protocol-critical locks are held. Errors and panics are logged
+	// and otherwise ignored: they never turn a completed delivery into a
+	// failure.
+	Observer Observer
+
+	// ObserverAddressMask, if non-nil, is applied to addresses reported in
+	// observer events (e.g. LMTP per-recipient results). MaskAddress can be
+	// used as a reasonable default. If nil, addresses are reported as-is.
+	ObserverAddressMask func(addr string) string
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool

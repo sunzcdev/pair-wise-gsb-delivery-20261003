@@ -51,8 +51,9 @@ type dataReader struct {
 	r     *bufio.Reader
 	state int
 
-	limited bool
-	n       int64 // Maximum bytes remaining
+	limited   bool
+	n         int64 // Maximum bytes remaining
+	bytesRead int64 // Total bytes consumed so far
 }
 
 func newDataReader(c *Conn) *dataReader {
@@ -144,5 +145,6 @@ func (r *dataReader) Read(b []byte) (n int, err error) {
 	if r.limited {
 		r.n -= int64(n)
 	}
+	r.bytesRead += int64(n)
 	return
 }

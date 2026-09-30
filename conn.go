@@ -44,6 +44,13 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// State used to build observer events for the in-progress command.
+	txnSeq        int
+	txnID         int
+	lastReplyCode int
+	obsBodyBytes  int64
+	obsRecipients []RecipientResult
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -88,6 +95,18 @@ func (c *Conn) init() {
 
 // Commands are dispatched to the appropriate handler functions.
 func (c *Conn) handle(cmd string, arg string) {
+	if c.server.Observer != nil {
+		start := time.Now()
+		c.lastReplyCode = 0
+		c.obsBodyBytes = 0
+		c.obsRecipients = nil
+		// Registered before the panic-recovery defer below so it runs
+		// last and reports the final reply code even on panics.
+		defer func() {
+			c.emitCommandEvent(cmd, start)
+		}()
+	}
+
 	// If panic happens during command handling - send 421 response
 	// and close connection.
 	defer func() {
@@ -147,6 +166,41 @@ func (c *Conn) handle(cmd string, arg string) {
 	default:
 		msg := fmt.Sprintf("Syntax errors, %v command unrecognized", cmd)
 		c.protocolError(500, EnhancedCode{5, 5, 2}, msg)
+	}
+}
+
+// emitCommandEvent delivers a CommandEvent for the just-completed command to
+// the configured observer. It must not be called with Conn.locker held.
+func (c *Conn) emitCommandEvent(cmd string, start time.Time) {
+	if cmd == "" {
+		return
+	}
+
+	ev := CommandEvent{
+		Kind:          CommandKind(cmd),
+		TransactionID: c.txnID,
+		StatusCode:    c.lastReplyCode,
+		Duration:      time.Since(start),
+		BodyBytes:     c.obsBodyBytes,
+	}
+	if len(c.obsRecipients) > 0 {
+		ev.Recipients = c.obsRecipients
+		c.obsRecipients = nil
+		if mask := c.server.ObserverAddressMask; mask != nil {
+			for i := range ev.Recipients {
+				ev.Recipients[i].Address = mask(ev.Recipients[i].Address)
+			}
+		}
+	}
+
+	// Observer errors and panics must never affect message delivery.
+	defer func() {
+		if err := recover(); err != nil {
+			c.server.ErrorLog.Printf("smtp: observer panic: %v", err)
+		}
+	}()
+	if err := c.server.Observer.ObserveCommand(ev); err != nil {
+		c.server.ErrorLog.Printf("smtp: observer error: %v", err)
 	}
 }
 
@@ -475,6 +529,9 @@ func (c *Conn) handleMail(arg string) {
 		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
+
+	c.txnSeq++
+	c.txnID = c.txnSeq
 
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("Roger, accepting mail from <%v>", from))
 	c.fromReceived = true
@@ -987,6 +1044,8 @@ func (c *Conn) handleData(arg string) {
 	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
+	c.bytesReceived += r.bytesRead
+	c.obsBodyBytes = c.bytesReceived
 	c.writeResponse(code, enhancedCode, msg)
 }
 
@@ -1093,6 +1152,7 @@ func (c *Conn) handleBdat(arg string) {
 	}
 
 	c.bytesReceived += int64(size)
+	c.obsBodyBytes = c.bytesReceived
 
 	if last {
 		c.lineLimitReader.LineLimit = c.server.MaxLineLength
@@ -1106,6 +1166,12 @@ func (c *Conn) handleBdat(arg string) {
 			for i, rcpt := range c.recipients {
 				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
 				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+				if c.server.Observer != nil {
+					c.obsRecipients = append(c.obsRecipients, RecipientResult{
+						Address:    rcpt,
+						StatusCode: code,
+					})
+				}
 			}
 		} else {
 			c.writeResponse(dataErrorToStatus(err))
@@ -1247,6 +1313,12 @@ func (c *Conn) handleDataLMTP() {
 	for i, rcpt := range c.recipients {
 		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+		if c.server.Observer != nil {
+			c.obsRecipients = append(c.obsRecipients, RecipientResult{
+				Address:    rcpt,
+				StatusCode: code,
+			})
+		}
 	}
 
 	// If done gets false, the panic occurred in LMTPData and the connection
@@ -1254,6 +1326,9 @@ func (c *Conn) handleDataLMTP() {
 	if !<-done {
 		c.Close()
 	}
+
+	c.bytesReceived += r.bytesRead
+	c.obsBodyBytes = c.bytesReceived
 }
 
 func dataErrorToStatus(err error) (code int, enchCode EnhancedCode, msg string) {
@@ -1286,6 +1361,7 @@ func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
 	if c.server.WriteTimeout != 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.server.WriteTimeout))
 	}
+	c.lastReplyCode = code
 
 	// All responses must include an enhanced code, if it is missing - use
 	// a generic code X.0.0.
