@@ -1,5 +1,15 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::VersionedAtom`, an `Atom` that pairs its value with an
+  internal monotonic version. Reads return a `[value, version]` snapshot and
+  `compare_and_set` only commits when both match, so an A -> B -> A change can
+  no longer be overwritten by a stale snapshot whose value merely matches. The
+  version advances exactly once per successful commit; validation failures and
+  lost races leave it untouched, and `swap` retries and observer notifications
+  report the versions of the states actually committed.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
