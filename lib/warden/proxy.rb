@@ -29,6 +29,7 @@ module Warden
       @env, @users, @winning_strategies, @locked = env, {}, {}, false
       @manager, @config = manager, manager.config.dup
       @strategies = Hash.new { |h,k| h[k] = {} }
+      @acting = Hash.new { |h, scope| h[scope] = [] }
     end
 
     # Run the on_request callbacks
@@ -230,6 +231,89 @@ module Warden
       end
     end
 
+    # Temporarily act as another user for the duration of a block, without
+    # logging that user in. This is intended for delegated access, such as a
+    # support agent viewing a customer's account.
+    #
+    # Unlike +set_user+, the switch is held only in the per-request in-memory
+    # user cache: nothing is serialized into the session, the session is not
+    # renewed, and neither +:authentication+ nor +:set_user+ callbacks fire.
+    # Consequently a plain +authenticated?+ inside the block sees the target
+    # as the effective user, but the target is never treated as having
+    # completed credential authentication.
+    #
+    # Every switch must be consented to by a +before_act_as+ callback; if a
+    # callback raises (typically +Warden::ActAsDenied+) or throws
+    # +:warden+, the effective user is not changed and the block is not run.
+    #
+    # Switches may be nested, including for different scopes. Each level runs
+    # the authorization callback again. On block exit, return, raise or
+    # throw, the previously effective user is restored, so the temporary
+    # identity never leaks outside its block.
+    #
+    # Parameters:
+    #   target - The user to act as inside the block
+    #   opts   - An options hash. Use :scope to set the scope (default_scope
+    #            otherwise). The block is yielded the target and proxy.
+    #
+    # Example:
+    #   env['warden'].act_as(customer) do |target, auth|
+    #     auth.user            # => customer (effective)
+    #     auth.real_user       # => the logged-in support agent
+    #   end
+    #
+    # :api: public
+    def act_as(target, opts = {})
+      raise LocalJumpError, "a block is required for act_as" unless block_given?
+      scope = opts[:scope] || @config.default_scope
+      opts  = (@config[:scope_defaults][scope] || {}).merge(opts.merge(:scope => scope))
+
+      manager._run_callbacks(:before_act_as, target, self, opts)
+
+      previous = @users[scope]
+      @acting[scope].push(:target => target, :operator => real_user(scope))
+      @users[scope] = target
+
+      begin
+        manager._run_callbacks(:after_act_as, target, self, opts)
+        yield target, self
+      ensure
+        restore_acting_user(scope, previous, target, opts)
+      end
+    end
+
+    # Whether a temporary "act as" switch is currently in effect. Without a
+    # scope the default scope is checked; pass +nil+ to check any scope.
+    #
+    # :api: public
+    def acting?(scope = @config.default_scope)
+      if scope.nil?
+        @acting.any? { |_s, stack| !stack.empty? }
+      else
+        !@acting[scope].empty?
+      end
+    end
+
+    # The user temporarily being acted as for the given scope, or +nil+ when
+    # no switch is in effect. For nested switches this is the innermost
+    # (current) target.
+    #
+    # :api: public
+    def acting_user(scope = @config.default_scope)
+      frame = @acting[scope].last
+      frame && frame[:target]
+    end
+
+    # The real, authenticated operator regardless of any active "act as"
+    # switch. For nested switches this is the user logged in at the outermost
+    # level. Outside a switch it is simply the current user.
+    #
+    # :api: public
+    def real_user(scope = @config.default_scope)
+      frame = @acting[scope].first
+      frame ? frame[:operator] : user(scope)
+    end
+
     # Provides a scoped session data for authenticated users.
     # Warden manages clearing out this data when a user logs out
     #
@@ -324,6 +408,16 @@ module Warden
     end
 
     private
+
+    # Restores the user in effect before the current "act as" frame and
+    # tears the frame down. Robust against an out-of-band +logout+ (which may
+    # already have removed the effective user): the frame is always popped and
+    # the cache is only restored when it still holds this frame's target.
+    def restore_acting_user(scope, previous, target, opts)
+      @acting[scope].pop
+      @users[scope] = previous if @users[scope].equal?(target)
+      manager._run_callbacks(:after_stop_acting, target, self, opts)
+    end
 
     def _perform_authentication(*args)
       scope, opts = _retrieve_scope_and_opts(args)

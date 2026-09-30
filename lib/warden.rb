@@ -13,6 +13,11 @@ require 'warden/strategies/base'
 module Warden
   class NotAuthenticated < StandardError; end
 
+  # Raised when an application denies a temporary "act as" switch from
+  # inside a +before_act_as+ callback. The switch is aborted before the
+  # effective user is changed, so no temporary identity is installed.
+  class ActAsDenied < StandardError; end
+
   module Test
     autoload :WardenHelpers,  'warden/test/warden_helpers'
     autoload :Helpers,        'warden/test/helpers'

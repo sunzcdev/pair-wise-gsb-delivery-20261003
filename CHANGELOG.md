@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## Unreleased
+
+* Add `Warden::Proxy#act_as` for authorized, temporary "act as"/impersonation
+  switches that never touch the session or fire login callbacks. Supports
+  nesting and scopes, restores the real operator on any exit, and exposes
+  `real_user`, `acting?` and `acting_user`. Authorization runs through the new
+  `before_act_as` hook, with `after_act_as` and `after_stop_acting` callbacks;
+  raise `Warden::ActAsDenied` to refuse a switch.
+
 ## Version 1.2.9 / 2020-08-31
 * Avoid warning on uninitialized instance variable (#188)
 * Bump rack to 2.2.3 (#190)

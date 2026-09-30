@@ -174,6 +174,95 @@ module Warden
       @_before_logout ||= []
     end
 
+    # A callback that runs every time a temporary "act as" switch is
+    # requested through +Proxy#act_as+, before the effective user is
+    # swapped. It is the authorization seam for delegated access: the
+    # application must consent to the switch here. Every nesting level
+    # runs this callback again, so each layer is authorized on its own.
+    #
+    # To refuse the switch, raise +Warden::ActAsDenied+ (or any error)
+    # or +throw(:warden, ...)+. When refused, the effective user is left
+    # untouched, the block is not executed and no +after_act_as+ callback
+    # is run.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block containing the authorization logic
+    #   Block Parameters: |target, auth, opts|
+    #     target - The user that is requested to be acted as
+    #     auth   - The warden proxy object (auth.real_user is the real operator)
+    #     opts   - Options passed into act_as including :scope
+    #
+    # Example:
+    #   Warden::Manager.before_act_as do |target, auth, opts|
+    #     raise Warden::ActAsDenied unless auth.real_user(opts[:scope]).support_agent?
+    #   end
+    #
+    # :api: public
+    def before_act_as(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _before_act_as.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for before_act_as
+    # :api: private
+    def _before_act_as
+      @_before_act_as ||= []
+    end
+
+    # A callback that runs once an authorized temporary "act as" switch has
+    # installed the target user but before the +act_as+ block is executed.
+    # This hook only fires for delegated switches; it never fires for a real
+    # login or for a user fetched from the session.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block containing the logic to run after the switch
+    #   Block Parameters: |target, auth, opts|
+    #     target - The user now in effect
+    #     auth   - The warden proxy object (auth.real_user is the real operator)
+    #     opts   - Options passed into act_as including :scope
+    #
+    # :api: public
+    def after_act_as(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _after_act_as.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for after_act_as
+    # :api: private
+    def _after_act_as
+      @_after_act_as ||= []
+    end
+
+    # A callback that runs after the effective user of a temporary "act as"
+    # switch has been restored, regardless of whether the block returned
+    # normally or raised. It is the matching teardown hook for
+    # +after_act_as+ and is distinct from +before_logout+.
+    #
+    # Parameters:
+    # <options> Some options which specify when the callback should be executed
+    #   scope  - Executes the callback only if it matches the scope(s) given
+    # <block> A block containing the logic to run after restoring the user
+    #   Block Parameters: |target, auth, opts|
+    #     target - The user that was being acted as
+    #     auth   - The warden proxy object (restored to the real operator)
+    #     opts   - Options passed into act_as including :scope
+    #
+    # :api: public
+    def after_stop_acting(options = {}, method = :push, &block)
+      raise BlockNotGiven unless block_given?
+      _after_stop_acting.send(method, [block, options])
+    end
+
+    # Provides access to the callback array for after_stop_acting
+    # :api: private
+    def _after_stop_acting
+      @_after_stop_acting ||= []
+    end
+
     # A callback that runs on each request, just after the proxy is initialized
     #
     # Parameters:
@@ -201,7 +290,8 @@ module Warden
 
     # Add prepend filters version
     %w(after_set_user after_authentication after_fetch on_request
-       before_failure before_logout).each do |filter|
+       before_failure before_logout
+       before_act_as after_act_as after_stop_acting).each do |filter|
       class_eval <<-METHOD, __FILE__, __LINE__ + 1
         def prepend_#{filter}(options={}, &block)
           #{filter}(options, :unshift, &block)
