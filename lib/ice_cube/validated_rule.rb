@@ -65,6 +65,23 @@ module IceCube
       @uses += 1
     end
 
+    # Snapshot the mutable enumeration position so it can be exported in a
+    # checkpoint and restored later (see OccurrenceIterator). The returned
+    # values are plain primitives/Time, never rule objects.
+    def enumeration_state
+      {uses: @uses.to_i, start_time: @start_time}
+    end
+
+    # Restore an enumeration position previously captured with
+    # #enumeration_state. This must be called on a rule whose definition is
+    # identical to the one that produced the snapshot, which is verified by
+    # the caller via the rule signature.
+    def restore_enumeration_state(state)
+      @uses = state.fetch(:uses, 0).to_i
+      @start_time = state[:start_time]
+      @time = nil
+    end
+
     def realign(opening_time, start_time)
       start_time
     end

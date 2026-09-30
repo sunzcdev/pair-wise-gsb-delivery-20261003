@@ -112,6 +112,35 @@ schedule.add_recurrence_rule IceCube::Rule.daily.until(Date.today + 30)
 schedule.each_occurrence { |t| puts t }
 ```
 
+### Resumable iteration
+
+When a background scanner cannot enumerate every occurrence in one pass, use a
+resumable `OccurrenceIterator`. It emits occurrences one page at a time and can
+export a continuation checkpoint. Restore the checkpoint later to continue from
+the item *after* the last emitted one: the last item is never repeated and a
+rule's `count` budget is not consumed again.
+
+```ruby
+schedule = IceCube::Schedule.new(Time.now)
+schedule.add_recurrence_rule IceCube::Rule.daily.count(1000)
+
+iterator = schedule.occurrence_iterator
+page     = iterator.next_occurrences(100)
+checkpoint = iterator.checkpoint     # JSON-safe Hash, or iterator.to_json
+
+# ... persist the checkpoint, then in a later process:
+iterator = schedule.resume_occurrence_iterator(checkpoint)
+iterator.next_occurrences(100)       # continues from the 101st occurrence
+```
+
+The checkpoint only contains JSON-safe primitives (no `Marshal`, so it can
+never load arbitrary objects) and is bound to the schedule content (start/end
+time, rules and individual dates), the enumeration boundaries (opening/closing
+time and `:spans`) and a format version. If the caller changes any of those,
+resume raises `IceCube::InvalidCheckpoint`. Slicing the same sequence with any
+page sizes and concatenating the pages yields exactly the occurrences from a
+single enumeration, including overlapping rules and exception dates.
+
 The reason that schedules have durations and not individual rules, is to
 maintain compatibility with the ical
 RFC: http://www.kanzaki.com/docs/ical/rrule.html

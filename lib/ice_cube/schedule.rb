@@ -207,6 +207,20 @@ module IceCube
       enumerate_occurrences(from, nil, options)
     end
 
+    # A resumable occurrence iterator. Pages can be exported with
+    # OccurrenceIterator#checkpoint and resumed later without repeating the
+    # last emitted occurrence or re-consuming a rule's COUNT budget.
+    def occurrence_iterator(opening_time = start_time, closing_time = nil, options = {})
+      OccurrenceIterator.new(self, opening_time, closing_time, options)
+    end
+
+    # Resume an occurrence iterator from a checkpoint Hash or JSON String.
+    # Raises IceCube::InvalidCheckpoint if the schedule, its rules, the
+    # enumeration boundaries or the checkpoint version no longer match.
+    def resume_occurrence_iterator(checkpoint)
+      OccurrenceIterator.resume(self, checkpoint)
+    end
+
     # Occurrences between two times
     def occurrences_between(begin_time, closing_time, options = {})
       enumerate_occurrences(begin_time, closing_time, options).to_a
