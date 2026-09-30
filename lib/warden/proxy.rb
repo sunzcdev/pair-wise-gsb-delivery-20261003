@@ -56,6 +56,15 @@ module Warden
     # strategies cache if you want to allow a strategy to be run more than
     # once.
     #
+    # Clearing the cache starts a brand new authentication round for the
+    # affected scope: the user authenticated for this scope during the request
+    # (and its session key) is forgotten, the winning strategy pointers are
+    # reset and each cleared strategy loses the outcome of its previous run
+    # (its performed/halt flags, user, message, result and any response
+    # information such as status, headers or a custom response). Only the
+    # given scope and the named strategies are touched, so other scopes and
+    # strategies keep their cache.
+    #
     # This method has the same API as authenticate, allowing you to clear
     # specific strategies for given scope:
     #
@@ -77,9 +86,28 @@ module Warden
     def clear_strategies_cache!(*args)
       scope, _opts = _retrieve_scope_and_opts(args)
 
-      @winning_strategies.delete(scope)
-      @strategies[scope].each do |k, v|
-        v.clear! if args.empty? || args.include?(k)
+      if args.empty?
+        # A brand new round for this scope: forget every strategy, the winner
+        # and the authenticated user. Other scopes are left untouched.
+        winner = @winning_strategies.delete(scope)
+        @strategies[scope].each_value(&:clear!)
+        _clear_winning_strategy!(winner)
+        _clear_user!(scope)
+      else
+        args.each do |name|
+          strategy = @strategies[scope][name]
+          next unless strategy
+          strategy.clear!
+
+          # Only invalidate the round when the strategy being cleared is the
+          # one that currently owns it. A winner coming from another strategy
+          # must remain, along with the authenticated user.
+          if @winning_strategies[scope].equal?(strategy)
+            @winning_strategies[scope] = nil
+            _clear_winning_strategy!(strategy)
+            _clear_user!(scope)
+          end
+        end
       end
     end
 
@@ -389,6 +417,20 @@ module Warden
     # Updates the winning strategy for a given scope
     def _update_winning_strategy(strategy, scope)
       self.winning_strategy = @winning_strategies[scope] = strategy
+    end
+
+    # Drops the global winning strategy pointer when it currently points to
+    # the strategy that is being cleared, while leaving a pointer to another
+    # (untouched) scope or strategy alone.
+    def _clear_winning_strategy!(strategy)
+      self.winning_strategy = nil if strategy && winning_strategy.equal?(strategy)
+    end
+
+    # Forgets the user authenticated in this request for a scope, both from
+    # the in-request cache and the session, so the new round can take over.
+    def _clear_user!(scope)
+      @users.delete(scope)
+      session_serializer.delete(scope)
     end
   end # Proxy
 

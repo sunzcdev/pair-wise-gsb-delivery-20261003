@@ -350,6 +350,159 @@ RSpec.describe Warden::Proxy do
       end
       setup_rack(app).call(@env)
     end
+
+    describe "strategy re-execution protocol" do
+      it "runs a brand new round when the cache is cleared, using the same strategy object" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          # Round 1: success
+          env['warden.spec.switchable_mode'] = :success
+          warden.authenticate(:switchable)
+          strategy = warden.winning_strategy
+          expect(warden.user).to eq("Switchable User")
+          expect(warden.result).to eq(:success)
+          expect(warden.message).to eq("Welcome back")
+          expect(env['warden.spec.switchable_runs']).to eq(1)
+
+          # Updated credentials, clear cache. Round 2: failure
+          env['warden.spec.switchable_mode'] = :failure
+          warden.clear_strategies_cache!(:switchable)
+          warden.authenticate(:switchable)
+          expect(warden.winning_strategy).to equal(strategy) # same cached object
+          expect(warden.winning_strategy).to be_performed
+          expect(warden.user).to be_nil
+          expect(warden.result).to eq(:failure)
+          expect(warden.message).to eq("Credentials rejected")
+          expect(warden.headers).to eq({})
+          expect(env['warden.spec.switchable_runs']).to eq(2)
+
+          # Updated credentials again, clear cache. Round 3: redirect
+          env['warden.spec.switchable_mode'] = :redirect
+          warden.clear_strategies_cache!(:switchable)
+          warden.authenticate(:switchable)
+          expect(warden.winning_strategy).to equal(strategy)
+          expect(warden.user).to be_nil
+          expect(warden.result).to eq(:redirect)
+          expect(warden.status).to eq(302)
+          expect(warden.message).to eq("Please sign in again")
+          expect(warden.headers["Location"]).to eq("/sign-in")
+          expect(warden.headers).not_to have_key("X-Stale")
+          expect(env['warden.spec.switchable_runs']).to eq(3)
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not leave the user, message or custom response of a previous round" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.switchable_mode'] = :custom
+          warden.authenticate(:switchable)
+          expect(warden.result).to eq(:custom)
+          expect(warden.custom_response).to eq([418, {"X-Custom" => "yes"}, ["Teapot"]])
+
+          env['warden.spec.switchable_mode'] = :failure
+          warden.clear_strategies_cache!(:switchable)
+          warden.authenticate(:switchable)
+          expect(warden.user).to be_nil
+          expect(warden.result).to eq(:failure)
+          expect(warden.message).to eq("Credentials rejected")
+          expect(warden.custom_response).to be_nil
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not report the previous winner when the new strategy is skipped" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.switchable_mode'] = :success
+          warden.authenticate(:switchable)
+          expect(warden).to be_authenticated
+
+          warden.clear_strategies_cache!(:switchable)
+          result = warden.authenticate(:invalid)
+          expect(result).to be_nil
+          expect(warden.user).to be_nil
+          expect(warden.winning_strategy).to be_nil
+          expect(warden.result).to be_nil
+          expect(warden.message).to be_nil
+          # The skipped strategy must not have been executed
+          expect(env['warden.spec.switchable_runs']).to eq(1)
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not report the previous winner when the new strategy fails" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          env['warden.spec.switchable_mode'] = :success
+          warden.authenticate(:switchable)
+          expect(warden.result).to eq(:success)
+
+          env['warden.spec.switchable_mode'] = :failure
+          warden.clear_strategies_cache!(:switchable)
+          warden.authenticate(:switchable)
+          expect(warden.winning_strategy.result).to eq(:failure)
+          expect(warden.result).to eq(:failure)
+          expect(warden.message).to eq("Credentials rejected")
+          expect(warden.user).to be_nil
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not clear the cache of another scope" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          warden.authenticate(:pass, :scope => :foo)
+          expect(warden.user(:foo)).to eq("Valid User")
+          expect(env['warden.spec.strategies']).to eq([:pass])
+
+          # Clearing the default scope must not touch the :foo scope
+          warden.clear_strategies_cache!(:scope => :default)
+          expect(warden.user(:foo)).to eq("Valid User")
+          warden.authenticate(:pass, :scope => :foo)
+          expect(env['warden.spec.strategies']).to eq([:pass])
+          expect(warden.winning_strategies[:foo]).not_to be_nil
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+
+      it "does not clear the winner of another strategy in the same scope" do
+        app = lambda do |env|
+          warden = env['warden']
+
+          # :password passes (no credentials), then :pass succeeds and wins
+          warden.authenticate(:password, :pass)
+          expect(warden.user).to eq("Valid User")
+          expect(warden.winning_strategy).to be_a(Warden::Strategies[:pass])
+          expect(env['warden.spec.strategies']).to eq([:password, :pass])
+
+          # Clearing only :password must leave the :pass winner and its user
+          warden.clear_strategies_cache!(:password)
+          expect(warden.winning_strategy).to be_a(Warden::Strategies[:pass])
+          expect(warden.result).to eq(:success)
+          expect(warden.message).to be_nil
+          expect(warden.user).to eq("Valid User")
+
+          valid_response
+        end
+        setup_rack(app).call(@env)
+      end
+    end
   end
 
   describe "set user" do

@@ -62,10 +62,21 @@ module Warden
         @performed
       end
 
-      # Marks this strategy as not performed.
+      # Marks this strategy as not performed and forgets everything that a
+      # previous run produced (the user, message, result, halt flag as well as
+      # any response information such as status, headers or a custom response).
+      # This allows the very same strategy object to be executed again as part
+      # of a new round, without leftovers from the previous run leaking through.
       # :api: private
       def clear!
         @performed = false
+        @halted = false
+        @user = nil
+        @message = nil
+        @result = nil
+        @status = nil
+        @headers = {}
+        @custom_response = nil
       end
 
       # Acts as a guarding method for the strategy.

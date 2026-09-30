@@ -58,6 +58,73 @@ describe Warden::Strategies::Base do
     expect(strategy).not_to be_performed
   end
 
+  describe "#clear!" do
+    it "resets the halt flag, user, message and result of a previous run" do
+      RAS.add(:foobar) do
+        def authenticate!
+          success!("foo", "welcome")
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      expect(strategy).to be_halted
+      expect(strategy.user).to eq("foo")
+      expect(strategy.message).to eq("welcome")
+      expect(strategy.result).to eq(:success)
+
+      strategy.clear!
+      expect(strategy).not_to be_performed
+      expect(strategy).not_to be_halted
+      expect(strategy.user).to be_nil
+      expect(strategy.message).to be_nil
+      expect(strategy.result).to be_nil
+    end
+
+    it "resets status, headers and the custom response of a previous run" do
+      RAS.add(:redirector) do
+        def authenticate!
+          redirect!("/foo/bar")
+        end
+      end
+      RAS.add(:customizer) do
+        def authenticate!
+          custom!([521, {"foo" => "bar"}, ["BAD"]])
+        end
+      end
+
+      redirector = RAS[:redirector].new(env_with_params)
+      redirector._run!
+      expect(redirector.headers["Location"]).to eq("/foo/bar")
+      expect(redirector.status).to eq(302)
+      redirector.clear!
+      expect(redirector.headers).to eq({})
+      expect(redirector.status).to be_nil
+      expect(redirector.result).to be_nil
+
+      customizer = RAS[:customizer].new(env_with_params)
+      customizer._run!
+      expect(customizer.custom_response).to eq([521, {"foo" => "bar"}, ["BAD"]])
+      customizer.clear!
+      expect(customizer.custom_response).to be_nil
+      expect(customizer.result).to be_nil
+      expect(customizer).not_to be_halted
+    end
+
+    it "can be executed again after being cleared" do
+      RAS.add(:foobar) do
+        def authenticate!
+          success!("foo")
+        end
+      end
+      strategy = RAS[:foobar].new(env_with_params)
+      strategy._run!
+      strategy.clear!
+      strategy._run!
+      expect(strategy).to be_successful
+      expect(strategy.user).to eq("foo")
+    end
+  end
+
   it "should set the scope when initialized with one" do
     RAS.add(:foobar) do
       def authenticate!; end
