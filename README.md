@@ -71,6 +71,14 @@ template = Addressable::Template.new("http://example.com/{?one,two,three}")
 template.partial_expand({"one" => "1", "three" => 3}).pattern
 #=> "http://example.com/?one=1{&two}&three=3"
 
+# Bind values incrementally while retaining the binding state. The final
+# expansion is always performed against the original template in one pass,
+# so the binding order never changes separators or positions.
+binding = template.bind({"one" => "1"})
+binding = binding.bind({"two" => 2, "three" => 3})
+binding.expand.to_str
+#=> "http://example.com/?one=1&two=2&three=3"
+
 template = Addressable::Template.new(
   "http://{host}{/segments*}/{?one,two,bogus}{#fragment}"
 )

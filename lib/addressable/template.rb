@@ -93,6 +93,18 @@ module Addressable
     end
 
     ##
+    # Raised if a variable is bound to a value which differs from the one
+    # it was previously bound to.
+    class TemplateBindingConflictError < StandardError
+    end
+
+    ##
+    # Raised if a URI is generated before all of the template's variables
+    # have been bound.
+    class IncompleteBindingError < StandardError
+    end
+
+    ##
     # This class represents the data that is extracted when a Template
     # is matched against a URI.
     class MatchData
@@ -225,6 +237,168 @@ module Addressable
         ""
       end
       alias_method :post_match, :pre_match
+    end
+
+    ##
+    # Represents the state of a template which is in the process of having
+    # its variables bound.
+    #
+    # Unlike {Template#partial_expand}, which emits a brand new template
+    # string each time it is called, a Binding retains the variables that
+    # have already been supplied and allows more to be added later. The
+    # accumulated mapping is always expanded against the original template
+    # in a single pass, so the ordering of {#bind} calls can never change
+    # separators or positions within an expression (e.g. query operators,
+    # list explosion and reserved character expansion).
+    #
+    # Binding objects should not be instantiated directly; use
+    # {Template#bind} instead.
+    class Binding
+      ##
+      # Creates a new Binding. Binding objects should never be instantiated
+      # directly; use {Template#bind} instead.
+      #
+      # @param [Addressable::Template] template
+      #   The template that values will eventually be expanded against.
+      # @param [Hash] mapping
+      #   The variables that have been bound so far.
+      # @param [#validate, #transform] processor
+      #   An optional processor, passed through to {Template#expand}.
+      # @param [Boolean] normalize_values
+      #   Whether to perform unicode normalization on the values.
+      def initialize(template, mapping = nil, processor = nil,
+                     normalize_values = true)
+        @template = template
+        @mapping = mapping ? template.send(:normalize_keys, mapping) : {}
+        @processor = processor
+        @normalize_values = normalize_values
+      end
+
+      ##
+      # @return [Addressable::Template] The template being bound.
+      attr_reader :template
+
+      ##
+      # @return [Hash]
+      #   A copy of the variables that have been bound so far. The hash
+      #   includes variables explicitly bound to `nil`.
+      def mapping
+        @mapping.dup
+      end
+      alias_method :values, :mapping
+
+      ##
+      # @return [Array<String>] The variables which have been bound.
+      def bound_variables
+        @template.variables.select { |name| @mapping.key?(name) }
+      end
+
+      ##
+      # @return [Array<String>]
+      #   The template variables which have not yet been bound.
+      def missing_variables
+        @template.variables.reject { |name| @mapping.key?(name) }
+      end
+      alias_method :unbound_variables, :missing_variables
+
+      ##
+      # Determines whether the variable has been bound. A variable which has
+      # explicitly been bound to `nil` is considered bound.
+      #
+      # @param [String, Symbol] name The name of the variable.
+      #
+      # @return [Boolean] `true` if the variable has been bound.
+      def bound?(name)
+        @mapping.key?(name.to_s)
+      end
+
+      ##
+      # Retrieves the value a variable has been bound to.
+      #
+      # @param [String, Symbol] name The name of the variable.
+      #
+      # @return [Object] The bound value, which may be `nil`.
+      # @raise [KeyError] If the variable has not been bound.
+      def [](name)
+        name = name.to_s
+        unless @mapping.key?(name)
+          raise KeyError, "Variable not bound: #{name}"
+        end
+        @mapping[name]
+      end
+
+      ##
+      # @return [Boolean]
+      #   `true` once every variable in the template has been bound.
+      def complete?
+        @template.variables.all? { |name| @mapping.key?(name) }
+      end
+      alias_method :ready?, :complete?
+
+      ##
+      # Binds additional variables, returning a new Binding which retains
+      # both the previously accumulated state and the new values.
+      #
+      # Binding a variable that was already bound with the same value is a
+      # no-op. Attempting to bind it with a different value raises an
+      # {TemplateBindingConflictError}; the receiver is left unchanged, so
+      # the original template (and any previously created Binding) may be
+      # bound again with a different set of data.
+      #
+      # @param [Hash] mapping The additional variables to bind.
+      #
+      # @return [Addressable::Template::Binding]
+      #   A new Binding containing the accumulated state.
+      def bind(mapping)
+        mapping = @template.send(:normalize_keys, mapping)
+        conflicts = mapping.select { |name, value|
+          @mapping.key?(name) && @mapping[name] != value
+        }
+        unless conflicts.empty?
+          descriptions = conflicts.map { |name, value|
+            "`#{name}' was #{@mapping[name].inspect}, " \
+            "tried to bind #{value.inspect}"
+          }
+          raise TemplateBindingConflictError,
+            "Conflicting template binding: #{descriptions.join('; ')}"
+        end
+        self.class.new(
+          @template, @mapping.merge(mapping),
+          @processor, @normalize_values
+        )
+      end
+
+      ##
+      # Expands the template using all of the accumulated values.
+      #
+      # The accumulated mapping is expanded against the original template
+      # in a single pass, so the result is byte-identical to calling
+      # {Template#expand} once with the complete mapping, regardless of the
+      # order in which variables were bound.
+      #
+      # @return [Addressable::URI] The fully expanded URI.
+      #
+      # @raise [IncompleteBindingError]
+      #   If any template variables are still unbound.
+      def expand
+        unless complete?
+          raise IncompleteBindingError,
+            "Cannot expand: missing variables: " \
+            "#{missing_variables.join(', ')}"
+        end
+        @template.expand(
+          @mapping, @processor, @normalize_values
+        )
+      end
+      alias_method :to_uri, :expand
+
+      ##
+      # @return [String] A description of the Binding's state.
+      def inspect
+        sprintf("#<%s:%#0x TEMPLATE:%s BOUND:%s>",
+          self.class.to_s, self.object_id,
+          @template.pattern, bound_variables.inspect)
+      end
     end
 
     ##
@@ -530,6 +704,39 @@ module Addressable
         transform_partial_capture(mapping, capture, processor, normalize_values)
       end
       return Addressable::Template.new(result)
+    end
+
+    ##
+    # Begins a binding session for the template. Unlike {#partial_expand},
+    # which emits a new template string, the returned
+    # {Addressable::Template::Binding} object retains which variables have
+    # already been supplied and allows more values to be bound later.
+    #
+    # The accumulated values are always expanded against this original
+    # template in a single pass (see {Binding#expand}), so the order in
+    # which variables are bound can never change separators or positions
+    # within an expression.
+    #
+    # @param [Hash] mapping
+    #   An initial mapping of variables to bind. May be omitted or empty.
+    # @param [#validate, #transform] processor
+    #   An optional processor, passed through to {#expand}.
+    # @param [Boolean] normalize_values
+    #   Optional flag to enable/disable unicode normalization. Default: true
+    #
+    # @return [Addressable::Template::Binding]
+    #   A Binding holding the template and the supplied values.
+    #
+    # @example
+    #   template = Addressable::Template.new(
+    #     "http://example.com/{one}/{two}/"
+    #   )
+    #   binding = template.bind("one" => "a")
+    #   binding = binding.bind("two" => "b")
+    #   binding.expand.to_str
+    #   #=> "http://example.com/a/b/"
+    def bind(mapping=nil, processor=nil, normalize_values=true)
+      Binding.new(self, mapping, processor, normalize_values)
     end
 
     ##
