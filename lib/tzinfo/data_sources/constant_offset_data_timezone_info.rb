@@ -36,6 +36,18 @@ module TZInfo
         [constant_period]
       end
 
+      # (see DataTimezoneInfo#local_to_utc_intervals)
+      def local_to_utc_intervals(local_start_timestamp, local_end_timestamp)
+        raise ArgumentError, 'local_start_timestamp must be specified' unless local_start_timestamp
+        raise ArgumentError, 'local_start_timestamp must have an unspecified utc_offset' if local_start_timestamp.utc_offset
+        raise ArgumentError, 'local_end_timestamp must be specified' unless local_end_timestamp
+        raise ArgumentError, 'local_end_timestamp must have an unspecified utc_offset' if local_end_timestamp.utc_offset
+        raise ArgumentError, 'local_end_timestamp must be greater than or equal to local_start_timestamp' if local_end_timestamp < local_start_timestamp
+
+        offset = @constant_offset.observed_utc_offset
+        [utc_timestamp_range(local_start_timestamp, local_end_timestamp, offset)]
+      end
+
       # @param to_timestamp [Timestamp] ignored.
       # @param from_timestamp [Timestamp] ignored.
       # @return [Array] an empty `Array`, since there are no transitions in time
@@ -50,6 +62,24 @@ module TZInfo
       #   offset of this timezone.
       def constant_period
         OffsetTimezonePeriod.new(@constant_offset)
+      end
+
+      # @param local_start_timestamp [Timestamp] the inclusive local start.
+      # @param local_end_timestamp [Timestamp] the exclusive local end.
+      # @param offset [Integer] the observed UTC offset in seconds.
+      # @return [Range<Timestamp>] the equivalent half-open UTC interval.
+      def utc_timestamp_range(local_start_timestamp, local_end_timestamp, offset)
+        Range.new(
+          utc_timestamp(local_start_timestamp, offset),
+          utc_timestamp(local_end_timestamp, offset),
+          true)
+      end
+
+      # @param local_timestamp [Timestamp] a local timestamp.
+      # @param offset [Integer] the observed UTC offset in seconds.
+      # @return [Timestamp] the equivalent UTC timestamp.
+      def utc_timestamp(local_timestamp, offset)
+        Timestamp.utc(local_timestamp.value - offset, local_timestamp.sub_second)
       end
     end
   end

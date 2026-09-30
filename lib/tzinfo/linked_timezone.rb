@@ -27,6 +27,11 @@ module TZInfo
       @linked_timezone.periods_for_local(local_time)
     end
 
+    # (see Timezone#local_to_utc_intervals)
+    def local_to_utc_intervals(local_start_time, local_end_time)
+      @linked_timezone.local_to_utc_intervals(local_start_time, local_end_time)
+    end
+
     # (see Timezone#transitions_up_to)
     def transitions_up_to(to, from = nil)
       @linked_timezone.transitions_up_to(to, from)

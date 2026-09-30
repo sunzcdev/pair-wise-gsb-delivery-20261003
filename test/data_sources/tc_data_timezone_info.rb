@@ -54,6 +54,14 @@ module DataSources
       assert_equal('Subclasses must override transitions_up_to', error.message)
     end
 
+    def test_local_to_utc_intervals
+      ti = DataTimezoneInfo.new('Test/Zone')
+      start_timestamp = Timestamp.new(1480291200)
+      end_timestamp = Timestamp.new(1480294800)
+      error = assert_raises(NotImplementedError) { ti.local_to_utc_intervals(start_timestamp, end_timestamp) }
+      assert_equal('Subclasses must override local_to_utc_intervals', error.message)
+    end
+
     def test_inspect
       ti = DataTimezoneInfo.new('Test/Zone')
       assert_equal('#<TZInfo::DataSources::DataTimezoneInfo: Test/Zone>', ti.inspect)

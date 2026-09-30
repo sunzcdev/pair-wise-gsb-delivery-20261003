@@ -35,6 +35,25 @@ module TZInfo
         raise_not_implemented('periods_for_local')
       end
 
+      # Returns the UTC time ranges that map to local times within the
+      # specified half-open local interval. Each returned range is half-open
+      # (including its start and excluding its end) and uses UTC {Timestamp}
+      # instances for its boundaries.
+      #
+      # @param local_start_timestamp [Timestamp] the inclusive start of the
+      #   local interval - must have an unspecified {Timestamp#utc_offset
+      #   utc_offset}.
+      # @param local_end_timestamp [Timestamp] the exclusive end of the local
+      #   interval - must have an unspecified {Timestamp#utc_offset utc_offset}.
+      # @return [Array<Range<Timestamp>>] the UTC intervals that map to the
+      #   specified local interval.
+      # @raise [ArgumentError] may be raised if either timestamp is `nil`, has
+      #   a specified {Timestamp#utc_offset utc_offset}, or if the end
+      #   timestamp is before the start timestamp.
+      def local_to_utc_intervals(local_start_timestamp, local_end_timestamp)
+        raise_not_implemented('local_to_utc_intervals')
+      end
+
       # Returns an `Array` of {TimezoneTransition} instances representing the
       # times where the UTC offset of the time zone changes.
       #

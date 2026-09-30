@@ -656,6 +656,31 @@ module TZInfo
       end
     end
 
+    # Converts a half-open local interval (including the start and excluding
+    # the end) for the time zone to a set of half-open UTC intervals.
+    #
+    # The UTC offsets of the `local_start_time` and `local_end_time`
+    # parameters are ignored (they are treated as times in the time zone
+    # represented by `self`).
+    #
+    # An empty `Array` is returned when the interval is contained entirely
+    # within local times that are skipped when clocks are put forward. When
+    # clocks are put back, more than one interval may be returned. Adjacent
+    # intervals are merged into a single interval.
+    #
+    # @param local_start_time [Object] the inclusive local start as a `Time`,
+    #   `DateTime` or {Timestamp}.
+    # @param local_end_time [Object] the exclusive local end as a `Time`,
+    #   `DateTime` or {Timestamp}.
+    # @return [Array<Range>] an `Array` of half-open UTC ranges. Each boundary
+    #   is returned using the same type as `local_start_time`.
+    # @raise [ArgumentError] if either parameter is `nil` or unsupported.
+    # @raise [ArgumentError] if `local_end_time` is before
+    #   `local_start_time`.
+    def local_to_utc_intervals(local_start_time, local_end_time)
+      raise_unknown_timezone
+    end
+
     # Creates a `Time` object based on the given (Gregorian calendar) date and
     # time parameters. The parameters are interpreted as a local time in the
     # time zone. The result has the appropriate `utc_offset`, `zone` and

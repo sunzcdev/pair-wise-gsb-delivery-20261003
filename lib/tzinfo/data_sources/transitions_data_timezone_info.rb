@@ -107,6 +107,36 @@ module TZInfo
         result.reverse!
       end
 
+      # (see DataTimezoneInfo#local_to_utc_intervals)
+      def local_to_utc_intervals(local_start_timestamp, local_end_timestamp)
+        raise ArgumentError, 'local_start_timestamp must be specified' unless local_start_timestamp
+        raise ArgumentError, 'local_start_timestamp must have an unspecified utc_offset' if local_start_timestamp.utc_offset
+        raise ArgumentError, 'local_end_timestamp must be specified' unless local_end_timestamp
+        raise ArgumentError, 'local_end_timestamp must have an unspecified utc_offset' if local_end_timestamp.utc_offset
+        raise ArgumentError, 'local_end_timestamp must be greater than or equal to local_start_timestamp' if local_end_timestamp < local_start_timestamp
+
+        return [] if local_start_timestamp == local_end_timestamp
+
+        local_start_value = local_start_timestamp.value + local_start_timestamp.sub_second
+        local_end_value = local_end_timestamp.value + local_end_timestamp.sub_second
+
+        intervals = []
+
+        (@transitions.length - 1).times do |index|
+          start_transition = @transitions[index]
+          end_transition = @transitions[index + 1]
+          add_local_interval(intervals, start_transition.offset, start_transition.timestamp_value, end_transition.timestamp_value, local_start_value, local_end_value)
+        end
+
+        first_transition = @transitions.first
+        add_local_interval(intervals, first_transition.previous_offset, nil, first_transition.timestamp_value, local_start_value, local_end_value)
+
+        last_transition = @transitions.last
+        add_local_interval(intervals, last_transition.offset, last_transition.timestamp_value, nil, local_start_value, local_end_value)
+
+        merge_utc_intervals(intervals)
+      end
+
       # (see DataTimezoneInfo#transitions_up_to)
       def transitions_up_to(to_timestamp, from_timestamp = nil)
         raise ArgumentError, 'to_timestamp must be specified' unless to_timestamp
@@ -137,6 +167,62 @@ module TZInfo
       end
 
       private
+
+      # Converts the overlap between one timezone period and a local interval
+      # to a UTC interval.
+      #
+      # @param intervals [Array<Range<Timestamp>>] the result array.
+      # @param offset [TimezoneOffset] the offset observed by the period.
+      # @param utc_start_value [Integer] the UTC start of the period in seconds
+      #   or `nil` if unbounded.
+      # @param utc_end_value [Integer] the UTC end of the period in seconds or
+      #   `nil` if unbounded.
+      # @param local_start_value [Rational] the inclusive local interval start.
+      # @param local_end_value [Rational] the exclusive local interval end.
+      def add_local_interval(intervals, offset, utc_start_value, utc_end_value, local_start_value, local_end_value)
+        observed_offset = offset.observed_utc_offset
+        period_local_start_value = utc_start_value ? utc_start_value + observed_offset : nil
+        period_local_end_value = utc_end_value ? utc_end_value + observed_offset : nil
+
+        start_value = period_local_start_value.nil? ? local_start_value : [local_start_value, period_local_start_value].max
+        end_value = period_local_end_value.nil? ? local_end_value : [local_end_value, period_local_end_value].min
+        return if start_value >= end_value
+
+        intervals << Range.new(
+          utc_timestamp_for_value(start_value - observed_offset),
+          utc_timestamp_for_value(end_value - observed_offset),
+          true)
+      end
+
+      # Merges half-open UTC intervals that touch or overlap.
+      #
+      # @param intervals [Array<Range<Timestamp>>] intervals ordered by their
+      #   UTC start time.
+      # @return [Array<Range<Timestamp>>] the merged intervals.
+      def merge_utc_intervals(intervals)
+        intervals.sort_by! {|interval| interval.begin}
+
+        intervals.each_with_object([]) do |interval, result|
+          if result.empty?
+            result << interval
+          else
+            previous = result.last
+            if interval.begin > previous.end
+              result << interval
+            else
+              result[-1] = Range.new(previous.begin, previous.end > interval.end ? previous.end : interval.end, true)
+            end
+          end
+        end
+      end
+
+      # @param value [Rational] a UTC time in seconds since the epoch.
+      # @return [Timestamp] a UTC {Timestamp} preserving sub-second precision.
+      def utc_timestamp_for_value(value)
+        second_value = value.floor
+        sub_second = value - second_value
+        Timestamp.utc(second_value, sub_second == 0 ? 0 : sub_second)
+      end
 
       # Array#bsearch_index was added in Ruby 2.3.0. Use bsearch_index to find
       # transitions if it is available, otherwise use a Ruby implementation.
