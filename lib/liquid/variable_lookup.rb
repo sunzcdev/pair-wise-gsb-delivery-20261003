@@ -48,11 +48,32 @@ module Liquid
       name   = context.evaluate(@name)
       object = context.find_variable(name)
 
+      policy = context.drop_access_policy
+
       @lookups.each_index do |i|
         key = context.evaluate(@lookups[i])
 
         # Cast "key" to its liquid value to enable it to act as a primitive value
         key = Liquid::Utils.to_liquid_value(key)
+
+        child_rule = nil
+        if policy
+          # A render-scoped access policy narrows which properties may be
+          # read. The check runs before the property is fetched so a denied
+          # access never invokes the underlying method. Values fetched along
+          # the way stay constrained through Context#constrain_drop_access.
+          rule = policy.rule_for(object, context.drop_access_constraint(object))
+          unless policy.key_allowed?(rule, object, key)
+            return nil unless context.strict_variables
+
+            if object.is_a?(Liquid::Drop)
+              raise Liquid::UndefinedDropMethod, "undefined method #{key}"
+            else
+              raise Liquid::UndefinedVariable, "undefined variable #{key}"
+            end
+          end
+          child_rule = policy.child_rule(rule, object, key)
+        end
 
         # If object is a hash- or array-like object we look for the
         # presence of the key and if its available we return it
@@ -85,6 +106,8 @@ module Liquid
 
         # If we are dealing with a drop here we have to
         object.context = context if object.respond_to?(:context=)
+
+        context.constrain_drop_access(object, child_rule) if policy
       end
 
       object

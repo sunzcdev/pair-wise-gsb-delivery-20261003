@@ -15,7 +15,7 @@ module Liquid
   #   context['bob']  #=> nil  class Context
   class Context
     attr_reader :scopes, :errors, :registers, :environments, :resource_limits, :static_registers, :static_environments
-    attr_accessor :exception_renderer, :template_name, :partial, :global_filter, :strict_variables, :strict_filters, :environment
+    attr_accessor :exception_renderer, :template_name, :partial, :global_filter, :strict_variables, :strict_filters, :environment, :drop_access_policy
 
     # rubocop:disable Metrics/ParameterLists
     def self.build(environment: Environment.default, environments: {}, outer_scope: {}, registers: {}, rethrow_errors: false, resource_limits: nil, static_environments: {}, &block)
@@ -159,6 +159,8 @@ module Liquid
         subcontext.errors   = errors
         subcontext.warnings = warnings
         subcontext.disabled_tags = @disabled_tags
+        subcontext.drop_access_policy = @drop_access_policy
+        subcontext.drop_access_constraints = @drop_access_constraints
       end
     end
 
@@ -232,16 +234,59 @@ module Liquid
     end
 
     def lookup_and_evaluate(obj, key, raise_on_not_found: true)
+      rule = nil
+      if @drop_access_policy && obj.is_a?(Liquid::Drop)
+        rule = @drop_access_policy.rule_for(obj, drop_access_constraint(obj))
+        if rule && !rule.allows?(key.to_s)
+          if @strict_variables && raise_on_not_found
+            raise Liquid::UndefinedDropMethod, "undefined method #{key}"
+          end
+
+          return nil
+        end
+      end
+
       if @strict_variables && raise_on_not_found && obj.respond_to?(:key?) && !obj.key?(key)
         raise Liquid::UndefinedVariable, "undefined variable #{key}"
       end
 
       value = obj[key]
 
-      if value.is_a?(Proc) && obj.respond_to?(:[]=)
+      value = if value.is_a?(Proc) && obj.respond_to?(:[]=)
         obj[key] = value.arity == 0 ? value.call : value.call(self)
       else
         value
+      end
+
+      if rule && (child_rule = @drop_access_policy.child_rule(rule, obj, key))
+        constrain_drop_access(value, child_rule)
+      end
+
+      value
+    end
+
+    # Returns the access rule the active DropAccessPolicy imposed on +object+
+    # because of the restricted path through which it was reached, or nil when
+    # the object is unconstrained.
+    def drop_access_constraint(object)
+      @drop_access_constraints&.[](object)
+    end
+
+    # Remembers, for the rest of this render, that +object+ was reached
+    # through a restricted path and must stay constrained by +rule+, no matter
+    # which variable or statement it is accessed through next. Array elements
+    # inherit the constraint of the array.
+    def constrain_drop_access(object, rule)
+      return if rule.nil? || object.nil?
+
+      constraints = (@drop_access_constraints ||= {}.compare_by_identity)
+      if (existing = constraints[object])
+        rule = DropAccessPolicy::Rule.intersect(existing, rule)
+      end
+      constraints[object] = rule
+
+      if object.is_a?(Array)
+        object.each { |element| constrain_drop_access(element, rule) }
       end
     end
 
@@ -262,7 +307,7 @@ module Liquid
 
     protected
 
-    attr_writer :base_scope_depth, :warnings, :errors, :strainer, :filters, :disabled_tags
+    attr_writer :base_scope_depth, :warnings, :errors, :strainer, :filters, :disabled_tags, :drop_access_constraints
 
     private
 
