@@ -519,7 +519,55 @@ Expose documentation with the field. Gets bubbled up when used with Grape and va
 expose :text, documentation: { type: "String", desc: "Status update text." }
 ```
 
-### Options Hash
+#### Consistent Representations
+
+When a background thread can mutate the represented objects while an API response is being built, reading several getters one after another can splice a pre-update value and a post-update value into the same Hash (for example an old `total` together with the new `details`).
+
+`Grape::Entity.represent_consistently` prevents that. It builds the representation against a **version protocol** supplied by the application and only delivers the result when every selected object and association collection jointly stands on the versions it started with.
+
+Give represented objects (and, when you protect membership separately, association collection wrappers) a `representation_version` method, or include `Grape::Entity::VersionProtocol`:
+
+```ruby
+class Account
+  include Grape::Entity::VersionProtocol
+
+  attr_accessor :total
+
+  def deposit(amount)
+    changing { self.total += amount }
+  end
+end
+```
+
+The returned token must stay equal while the object is stable and is `nil` while a change is in progress. The token MUST be advanced for every change that affects the representation:
+
+1. an exposed attribute value changes;
+2. an association is replaced by another object, or the data exposed through it changes;
+3. collection membership changes (an element is added, removed, replaced or reordered);
+4. the object leaves or re-enters a stable state (`begin_change!` / `end_change!`).
+
+Call the consistent entry point instead of `represent`:
+
+```ruby
+AccountEntity.represent_consistently(account)
+```
+
+If a selected nested object or collection moves between two getters, the half-assembled Hash is discarded and `Grape::Entity::Consistency::InconsistentVersionError` is raised — an inconsistent Hash is never returned.
+
+Only fields declared with `reread: true` make such a conflict eligible for retry, and a conflict is retried only when **every** exposure involved allows rereading. The number of re-readings is bounded by `:max_rereads` (default `2`). Ordinary exceptions from getters are not treated as version contention and are never retried.
+
+```ruby
+class AccountEntity < Grape::Entity
+  expose :total, reread: true
+  expose :details, reread: true, using: DetailEntity
+end
+
+AccountEntity.represent_consistently(account, max_rereads: 3)
+```
+
+Objects and collections that do not implement `representation_version` are simply not protected, so the feature is opt in and incurs no cost otherwise.
+
+
 
 The option keys `:version` and `:collection` are always defined. The `:version` key is defined as `api.version`. The `:collection` key is boolean, and defined as `true` if the object presented is an array. The options also contain the runtime environment in `:env`, which includes request parameters in `options[:env]['grape.request.params']`.
 

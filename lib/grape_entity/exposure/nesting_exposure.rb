@@ -117,9 +117,23 @@ module Grape
           new_options = nesting_options_for(options)
           output = OutputBuilder.new(entity)
 
+          # Every nested entity selected by a consistent representation joins
+          # the version session here, before any of its getters are called.
+          session = new_options[:consistency_session]
+          session.register(entity.object) if session
+
           normalized_exposures(entity, new_options).each_with_object(output) do |exposure, out|
             exposure.with_attr_path(entity, new_options) do
-              result = yield(exposure, new_options)
+              result =
+                if session
+                  # Remember whether this getter may be re-read, then invoke
+                  # it. Nesting exposures read no attribute themselves.
+                  session.around_read(entity.object, exposure) do
+                    yield(exposure, new_options)
+                  end
+                else
+                  yield(exposure, new_options)
+                end
               out.add(exposure, result)
             end
           end

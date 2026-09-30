@@ -29,4 +29,6 @@ require 'bundler'
 
 Bundler.require :default, :test
 
+require 'grape_entity'
+
 RSpec.configure(&:raise_errors_for_deprecations!)

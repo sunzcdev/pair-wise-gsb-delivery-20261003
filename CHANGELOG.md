@@ -6,7 +6,7 @@
 
 #### Features
 
-* Your contribution here.
+* Add `Grape::Entity.represent_consistently`, an explicit consistency entry point backed by an application-supplied version protocol (`representation_version` / `Grape::Entity::VersionProtocol`). Represented objects and versioned association collections are captured before their getters run and jointly verified after the Hash is assembled; a selected nested object or collection changing mid-representation discards the half-old/half-new result with `Grape::Entity::Consistency::InconsistentVersionError`. Fields declared `reread: true` allow a bounded number of retries (`:max_rereads`, default 2); ordinary exceptions are never retried.
 
 
 ### 1.1.0 (2026-06-05)

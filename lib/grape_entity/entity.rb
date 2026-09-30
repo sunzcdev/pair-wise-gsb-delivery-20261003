@@ -190,6 +190,12 @@ module Grape
     #   field, typically the value is a hash with two fields, type and desc.
     # @option options :merge This option allows you to merge an exposed field to the root
     #
+    # @option options :reread When true the field (and the object or
+    #   collection it reads) may be re-read a bounded number of times by
+    #   .represent_consistently when it is observed changing while the
+    #   response is assembled. A conflict is retried only when EVERY exposure
+    #   involved allows rereading; ordinary exceptions are never retried.
+    #
     # rubocop:disable Layout/LineLength
     def self.expose(*args, &block)
       options = merge_options(args.last.is_a?(Hash) ? args.pop : {})
@@ -455,6 +461,55 @@ module Grape
       root_element ? { root_element => inner } : inner
     end
 
+    # Build a representation that is guaranteed to come from a set of
+    # versions that could all hold at once.
+    #
+    # Every represented object (and every versioned association collection)
+    # participates through the version protocol described by
+    # {Grape::Entity::Consistency}: its +representation_version+ is captured
+    # before its getters run and jointly re-checked after the whole Hash is
+    # assembled. If a *selected* nested object or collection changes while
+    # the output is being read, the partially assembled Hash is discarded and
+    # an {Grape::Entity::Consistency::InconsistentVersionError} is raised -
+    # it is never returned half old and half new.
+    #
+    # A conflict is retried only when every exposure involved was declared
+    # +reread: true+ (see .expose). The number of such re-readings is bounded
+    # by +:max_rereads+ (default 2); exhausting the budget re-raises the
+    # conflict. Ordinary exceptions raised by getters are NOT version
+    # contention and are never caught or re-run.
+    #
+    # @param objects [Object or Array] object(s) to represent, as for
+    #   .represent
+    # @param options [Hash] representation options, as for .represent
+    # @option options :max_rereads [Integer] maximum number of extra readings
+    #   allowed when a declared-reread participant moves (default 2)
+    # @return [Object] a serializable representation, shaped like
+    #   +represent(objects, serializable: true)+
+    def self.represent_consistently(objects, options = {})
+      options = options.symbolize_keys
+      max_rereads = options.delete(:max_rereads)
+      max_rereads = 2 if max_rereads.nil?
+
+      session = Consistency::Session.new
+
+      loop do
+        session.reset!
+        options[:consistency_session] = session
+
+        begin
+          output = represent(objects, options.merge(serializable: true))
+          session.commit!
+          return output
+        rescue Consistency::InconsistentVersionError => e
+          raise unless e.retriable?
+          raise if session.reread_count >= max_rereads
+
+          session.reread_count += 1
+        end
+      end
+    end
+
     # This method returns the entity's root or collection root node, or its parent's
     # @param root_type: either :collection_root or just :root
     def self.root_element(root_type)
@@ -518,6 +573,14 @@ module Grape
       return nil if object.nil?
 
       opts = options.merge(runtime_options || {})
+
+      # Root entity of a consistent representation: its version is captured
+      # before any getter runs and committed jointly with its associations
+      # after the whole Hash has been assembled (see
+      # .represent_consistently). Nested entities receive the same session
+      # through their options and register themselves while mapping.
+      session = opts[:consistency_session]
+      session.register(object) if session
 
       root_exposure.serializable_value(self, opts)
     end
@@ -646,6 +709,7 @@ module Grape
       expose_nil
       override
       default
+      reread
     ].to_set.freeze
 
     # Merges the given options with current block options.
