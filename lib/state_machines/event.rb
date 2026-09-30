@@ -77,6 +77,16 @@ module StateMachines
       @human_name.is_a?(Proc) ? @human_name.call(self, klass) : @human_name
     end
 
+    # Seals this event, preventing any further changes to its branches or
+    # configuration
+    def seal!
+      @branches.each(&:freeze)
+      @branches.freeze
+      @known_states.freeze
+      freeze
+      self
+    end
+
     # Evaluates the given block within the context of this event.  This simply
     # provides a DSL-like syntax for defining transitions.
     def context(&)
@@ -100,6 +110,8 @@ module StateMachines
     # See StateMachines::Machine#transition for a description of the possible
     # configurations for defining transitions.
     def transition(options)
+      raise StateMachines::MachineSealedError.new(machine, 'event branches') if machine.sealed?
+
       raise ArgumentError, 'Must specify as least one transition requirement' if options.empty?
 
       # Only a certain subset of explicit options are allowed for transition
@@ -192,6 +204,8 @@ module StateMachines
     # where you either are re-using an existing state machine implementation
     # or are subclassing machines.
     def reset
+      raise StateMachines::MachineSealedError.new(machine, 'event branches') if machine.sealed?
+
       @branches = []
       @known_states = []
     end

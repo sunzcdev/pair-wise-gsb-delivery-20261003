@@ -40,6 +40,7 @@ module StateMachines
         @initialize_state = options[:initialize]
         @action_hook_defined = false
         @async_requested = options[:async]
+        @sealed = false
 
         self.owner_class = owner_class
 
@@ -66,6 +67,9 @@ module StateMachines
       def initialize_copy(orig) # :nodoc:
         super
 
+        # Copies always start out unsealed so that subclasses can derive an
+        # editable machine from a sealed one
+        @sealed = false
         @events = @events.dup
         @events.machine = self
         @states = @states.dup
@@ -107,6 +111,8 @@ module StateMachines
       # of a state or a lambda block which determines the initial state at
       # creation time.
       def initial_state=(new_initial_state)
+        assert_not_sealed!('initial state')
+
         @initial_state = new_initial_state
         add_states([@initial_state]) unless dynamic_initial_state?
 

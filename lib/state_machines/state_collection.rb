@@ -105,6 +105,11 @@ module StateMachines
 
     private
 
+    # The label used to identify this collection in sealed modification errors
+    def sealed_part
+      'states'
+    end
+
     # Gets the value for the given attribute on the node
     def value(node, attribute)
       attribute == :value ? node.value(false) : super

@@ -115,6 +115,15 @@ module StateMachines
       @context = StateContext.new(self)
     end
 
+    # Seals this state, preventing any further changes to its configuration.
+    # Dynamic values that are configured to be cached are evaluated before
+    # freezing so that runtime behavior remains unchanged.
+    def seal!
+      value if @value.is_a?(Proc) && cache_value?
+      freeze
+      self
+    end
+
     # Determines whether there are any states that can be transitioned to from
     # this state.  If there are none, then this state is considered *final*.
     # Any objects in a final state will remain so forever given the current
@@ -203,6 +212,8 @@ module StateMachines
     # This can be called multiple times.  Each time a new context is created,
     # a new module will be included in the owner class.
     def context(&)
+      raise StateMachines::MachineSealedError.new(machine, 'states') if machine.sealed?
+
       # Include the context
       context = @context
       machine.owner_class.class_eval { include context }

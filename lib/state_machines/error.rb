@@ -112,4 +112,21 @@ module StateMachines
   # A method was called in an invalid state context
   class InvalidContext < Error
   end
+
+  # An attempt was made to modify a sealed state machine definition
+  class MachineSealedError < Error
+    # The machine that was attempted to be modified
+    attr_reader :machine
+
+    # The part of the machine definition that was attempted to be modified
+    # (e.g. "states", "events", "callbacks", "event branches", "initial state")
+    attr_reader :part
+
+    def initialize(machine, part) # :nodoc:
+      @machine = machine
+      @part = part
+
+      super(machine, "Cannot modify #{part} of sealed state machine #{machine.name.inspect} on #{machine.owner_class}")
+    end
+  end
 end

@@ -341,6 +341,54 @@ StarshipBridge.new.can_red_alert?
 # => ArgumentError: State 'nonexistent_state' is not defined in state machine 'shields'
 ```
 
+## Sealing Machine Definitions
+
+Once the application has booted, a state machine's definition can be sealed to prevent
+dynamic extensions from accidentally changing the rules of a running machine:
+
+```ruby
+class Vehicle
+  state_machine initial: :parked do
+    event :ignite do
+      transition parked: :idling
+    end
+  end
+end
+
+Vehicle.state_machine.seal!
+```
+
+Sealing covers states, events and their branches, transition callbacks, and the internal
+lookup indices. Any attempt to modify the definition afterwards raises
+`StateMachines::MachineSealedError`, identifying the part that was being modified:
+
+```ruby
+Vehicle.state_machine.state :stalled
+# => StateMachines::MachineSealedError: Cannot modify states of sealed state machine :state on Vehicle
+
+Vehicle.state_machine.before_transition { }
+# => StateMachines::MachineSealedError: Cannot modify callbacks of sealed state machine :state on Vehicle
+```
+
+Sealing only affects the machine's *definition*.  Objects using the machine are never
+frozen and keep transitioning as usual.
+
+Subclasses can still derive their own editable copy of the machine by explicitly
+redefining it (passing options or a block to `state_machine`).  The derived machine is a
+deep copy, so changes made in one subclass never leak into the sealed parent or into
+sibling subclasses:
+
+```ruby
+class Car < Vehicle
+  state_machine do
+    state :stalled
+  end
+end
+
+Vehicle.state_machine.sealed?  # => true
+Car.state_machine.sealed?      # => false
+```
+
 # Asynchronous State Machines
 
 State machines can operate asynchronously for high-performance applications. This is ideal for I/O-bound tasks, such as in web servers or other concurrent environments, where you don't want a long-running state transition (like one involving a network call) to block the entire thread.

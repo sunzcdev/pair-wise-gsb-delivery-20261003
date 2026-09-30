@@ -33,12 +33,14 @@ module StateMachines
       end
       @default_index = Array(options[:index]).first
       @contexts = []
+      @sealed = false
     end
 
     # Creates a copy of this collection such that modifications don't affect
     # the original collection
     def initialize_copy(orig) # :nodoc:
       super
+      @sealed = false
 
       nodes = @nodes
       contexts = @contexts
@@ -57,8 +59,32 @@ module StateMachines
     # Changes the current machine associated with the collection.  In turn, this
     # will change the state machine associated with each node in the collection.
     def machine=(new_machine)
+      assert_not_sealed!
+
       @machine = new_machine
       each { |node| node.machine = new_machine }
+    end
+
+    # Seals this collection, preventing any further modifications to its nodes,
+    # contexts, or indices.  Each node in the collection is sealed as well.
+    # Any attempt to modify the collection afterwards will raise a
+    # StateMachines::MachineSealedError.
+    def seal!
+      return self if sealed?
+
+      @nodes.each { |node| node.respond_to?(:seal!) ? node.seal! : node.freeze }
+      @nodes.freeze
+      @contexts.freeze
+      @indices.each_value(&:freeze)
+      @indices.freeze
+      @sealed = true
+      self
+    end
+
+    # Determines whether this collection has been sealed against further
+    # modification
+    def sealed?
+      @sealed
     end
 
     # Gets the number of nodes in this collection
@@ -75,6 +101,8 @@ module StateMachines
     # which match the given set of nodes.  Matchers can be used so that the
     # context can get added once and evaluated after multiple adds.
     def context(nodes, &block)
+      assert_not_sealed!
+
       nodes = nodes.first.is_a?(Matcher) ? nodes.first : WhitelistMatcher.new(nodes)
       @contexts << context = { nodes: nodes, block: block }
 
@@ -88,6 +116,8 @@ module StateMachines
     # the configured indices.  This will also evaluate any existings contexts
     # that match the new node.
     def <<(node)
+      assert_not_sealed!
+
       @nodes << node
       @index_names.each { |name| add_to_index(name, value(node, name), node) }
       @contexts.each { |context| eval_context(context, node) }
@@ -168,6 +198,17 @@ module StateMachines
     end
 
     protected
+
+    # The label used to identify this collection in sealed modification errors
+    def sealed_part
+      'nodes'
+    end
+
+    # Raises a StateMachines::MachineSealedError if this collection has been
+    # sealed against further modification
+    def assert_not_sealed!
+      raise StateMachines::MachineSealedError.new(machine, sealed_part) if sealed?
+    end
 
     # Gets the given index.  If the index does not exist, then an ArgumentError
     # is raised.

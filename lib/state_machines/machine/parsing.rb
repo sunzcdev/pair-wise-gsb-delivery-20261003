@@ -29,6 +29,8 @@ module StateMachines
 
       # Adds a new transition callback of the given type.
       def add_callback(type, options, &)
+        assert_not_sealed!('callbacks')
+
         callbacks[type == :around ? :before : type] << callback = Callback.new(type, options, &)
         add_states(callback.known_states)
         callback
@@ -45,6 +47,8 @@ module StateMachines
           end
 
           unless (state = states[new_state])
+            assert_not_sealed!('states')
+
             states << state = State.new(self, new_state)
 
             # Copy states over to sibling machines
@@ -66,6 +70,8 @@ module StateMachines
           end
 
           unless (event = events[new_event])
+            assert_not_sealed!('events')
+
             events << event = Event.new(self, new_event)
           end
 

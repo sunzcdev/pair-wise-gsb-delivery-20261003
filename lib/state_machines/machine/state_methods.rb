@@ -338,6 +338,10 @@ module StateMachines
         options = names.last.is_a?(Hash) ? names.pop : {}
         StateMachines::OptionsValidator.assert_valid_keys!(options, :value, :cache, :if, :human_name)
 
+        # Reconfiguring existing states is not allowed once sealed; adding
+        # new states is checked within add_states
+        assert_not_sealed!('states') if options.any?
+
         # Store the context so that it can be used for / matched against any state
         # that gets added
         @states.context(names, &) if block_given?

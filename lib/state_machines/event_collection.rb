@@ -142,6 +142,11 @@ module StateMachines
 
     private
 
+    # The label used to identify this collection in sealed modification errors
+    def sealed_part
+      'events'
+    end
+
     def match(requirements) # :nodoc:
       requirements && requirements[:on] ? [fetch(requirements.delete(:on))] : self
     end

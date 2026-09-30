@@ -233,6 +233,10 @@ module StateMachines
         options = names.last.is_a?(Hash) ? names.pop : {}
         StateMachines::OptionsValidator.assert_valid_keys!(options, :human_name)
 
+        # Reconfiguring existing events is not allowed once sealed; adding
+        # new events is checked within add_events
+        assert_not_sealed!('events') if options.any?
+
         # Store the context so that it can be used for / matched against any event
         # that gets added
         @events.context(names, &) if block_given?
