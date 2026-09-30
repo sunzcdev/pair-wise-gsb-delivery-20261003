@@ -282,6 +282,20 @@ module Dry
         struct
       end
 
+      # Builds a {StagedBuilder} for constructing a struct instance
+      # incrementally, attribute batch by attribute batch
+      #
+      # @return [StagedBuilder]
+      #
+      # @example
+      #   builder = User.builder
+      #   builder.assign(name: "Jane")
+      #   builder.assign(age: 21)
+      #   builder.finish # => #<User name="Jane" age=21>
+      def builder
+        StagedBuilder.new(self)
+      end
+
       # @param [#call,nil] constructor
       # @param [#call,nil] block
       # @return [Dry::Struct::Constructor]

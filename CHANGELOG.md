@@ -9,6 +9,12 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `Dry::Struct::StagedBuilder` for constructing structs incrementally: `User.builder`
+  returns a builder that validates each `assign`ed batch of attributes right away and
+  only checks completeness, resolves defaults, and instantiates the struct on `finish`.
+  Missing attributes in nested structs and struct arrays are reported with their full
+  path (e.g. `address.city`, `friends[0].name`)
+
 ### Changed
 
 ### Deprecated
