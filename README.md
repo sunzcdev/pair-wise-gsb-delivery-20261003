@@ -81,6 +81,47 @@ end
 #### Middleware Options
 * **debug** (boolean):  Enables debug logging and `X-Rack-CORS` HTTP headers for debugging.
 * **logger** (Object or Proc): Specify the logger to log to.  If a proc is provided, it will be called when a logger is needed.  This is helpful in cases where the logger is initialized after `Rack::Cors` is initially configured, like `Rails.logger`.
+* **mode** (`:first_match` or `:intersection`): Chooses how multiple `allow` blocks are combined. The default is `:first_match`, which uses the first block whose origin and resource match. Use `:intersection` when independent layers must all permit a request. In intersection mode, all blocks that match the request contribute an intersection of their allowed origins, methods, request headers, exposed headers, credentials, and `max_age` values. Origin/resource procs are evaluated at most once per request.
+
+### Intersection Mode
+
+Intersection mode is useful when a platform layer permits broad access and a business layer adds narrower restrictions:
+
+```ruby
+use Rack::Cors, mode: :intersection do
+  allow do
+    origins '*'
+    resource '/api/*',
+             methods: [:get, :post],
+             headers: :any,
+             expose: ['X-Request-Id'],
+             max_age: 600
+  end
+
+  allow do
+    origins 'https://business.example'
+    resource '/api/*',
+             methods: [:post],
+             headers: ['Authorization'],
+             expose: ['X-Request-Id', 'X-Business-Context'],
+             credentials: true,
+             max_age: 300
+  end
+end
+```
+
+For this request, the response can only contain capabilities allowed by both layers: `POST`, no request headers beyond the common set, `X-Request-Id` as an exposed header, and `max_age=300`. Because one layer uses a wildcard origin, credentials are not allowed and the concrete origin is reflected instead of combining `*` with `Access-Control-Allow-Credentials: true`. Reordering the two `allow` blocks produces the same result.
+
+An intersection group can also be declared explicitly inside an otherwise first-match configuration:
+
+```ruby
+use Rack::Cors do
+  intersection do
+    allow { origins '*'; resource '/api/*', methods: :post }
+    allow { origins 'https://business.example'; resource '/api/*', methods: %i[get post] }
+  end
+end
+```
 
 #### Origin
 Origins can be specified as a string, a regular expression, or as '\*' to allow all origins.

@@ -3,10 +3,106 @@
 require 'logger'
 require_relative 'cors/resources'
 require_relative 'cors/resource'
+require_relative 'cors/resource_intersection'
+require_relative 'cors/evaluation'
 require_relative 'cors/result'
 require_relative 'cors/version'
 
 module Rack
+  class RuleSet
+    MODE_FIRST_MATCH = :first_match
+    MODE_INTERSECTION = :intersection
+
+    attr_reader :resources, :mode
+
+    def initialize(mode = MODE_FIRST_MATCH)
+      @resources = []
+      @mode = mode
+    end
+
+    def add_resources(resources)
+      @resources << resources
+    end
+
+    def intersection?
+      mode == MODE_INTERSECTION
+    end
+
+    def allow(&block)
+      resources = cors::Resources.new
+      if block.arity == 1
+        block.call(resources)
+      else
+        resources.instance_eval(&block)
+      end
+      add_resources(resources)
+      resources
+    end
+
+    def match(path, env, evaluation)
+      if intersection?
+        match_intersection(path, env, evaluation)
+      else
+        match_first(path, env, evaluation)
+      end
+    end
+
+    def resource_for_path(path_info)
+      resources.each do |r|
+        found = r.resource_for_path(path_info)
+        return found if found
+      end
+      nil
+    end
+
+    private
+
+    def cors
+      Cors
+    end
+
+    def match_first(path, env, evaluation)
+      origin = env[cors::HTTP_ORIGIN]
+      resources.each do |r|
+        next unless r.allow_origin?(origin, env, evaluation)
+
+        found = r.match_resource(path, env, evaluation)
+        return [found, nil, true] if found
+      end
+
+      [nil, cors::Result::MISS_NO_PATH, origin_allowed?(origin, env, evaluation)]
+    end
+
+    def match_intersection(path, env, evaluation)
+      origin = env[cors::HTTP_ORIGIN]
+      origin_allowed = false
+      matched = []
+
+      resources.each do |r|
+        unless r.allow_origin?(origin, env, evaluation)
+          return [nil, cors::Result::MISS_NO_ORIGIN, origin_allowed]
+        end
+
+        origin_allowed = true
+        found = r.match_resource(path, env, evaluation)
+        return [nil, cors::Result::MISS_NO_PATH, true] unless found
+
+        matched << found
+      end
+
+      if origin_allowed && matched.any?
+        return [cors::ResourceIntersection.new(matched), nil, true]
+      end
+
+      error = origin_allowed ? cors::Result::MISS_NO_PATH : cors::Result::MISS_NO_ORIGIN
+      [nil, error, origin_allowed]
+    end
+
+    def origin_allowed?(origin, env, evaluation)
+      resources.any? { |r| r.allow_origin?(origin, env, evaluation) }
+    end
+  end
+
   class Cors
     HTTP_ORIGIN   = 'HTTP_ORIGIN'
     HTTP_X_ORIGIN = 'HTTP_X_ORIGIN'
@@ -29,6 +125,11 @@ module Rack
     def initialize(app, opts = {}, &block)
       @app = app
       @debug_mode = !!opts[:debug]
+      @default_mode = determine_mode(opts)
+      @rule_sets = [RuleSet.new(@default_mode)]
+      @default_rule_set = @rule_sets.first
+      @current_rule_set = @default_rule_set
+      @intersection_depth = 0
       @logger = @logger_proc = nil
 
       logger = opts[:logger]
@@ -54,14 +155,30 @@ module Rack
     end
 
     def allow(&block)
-      all_resources << (resources = Resources.new)
+      @current_rule_set.allow(&block)
+    end
 
+    def intersection(&block)
+      rule_set = RuleSet.new(RuleSet::MODE_INTERSECTION)
+      rule_sets << rule_set
+
+      previous_rule_set = @current_rule_set
+      @current_rule_set = rule_set
+      @intersection_depth += 1
       if block.arity == 1
-        block.call(resources)
+        block.call(self)
       else
-        resources.instance_eval(&block)
+        instance_eval(&block)
+      end
+    ensure
+      @intersection_depth -= 1
+      @current_rule_set = previous_rule_set
+      if @intersection_depth.zero? && previous_rule_set.equal?(@default_rule_set)
+        @current_rule_set = RuleSet.new(RuleSet::MODE_FIRST_MATCH)
+        rule_sets << @current_rule_set
       end
     end
+    alias intersect intersection
 
     def call(env)
       env[HTTP_ORIGIN] ||= env[HTTP_X_ORIGIN] if env[HTTP_X_ORIGIN]
@@ -164,29 +281,37 @@ module Rack
       path
     end
 
+    def rule_sets
+      @rule_sets ||= []
+    end
+
+    def determine_mode(opts)
+      mode = opts[:mode] || (opts[:intersection] ? RuleSet::MODE_INTERSECTION : nil)
+      mode.to_s == RuleSet::MODE_INTERSECTION.to_s ? RuleSet::MODE_INTERSECTION : RuleSet::MODE_FIRST_MATCH
+    end
+
     def all_resources
-      @all_resources ||= []
+      rule_sets.reject { |rule_set| rule_set.equal?(@default_rule_set) && rule_set.resources.empty? }
+               .flat_map(&:resources)
     end
 
     def process_preflight(env, path)
       result = Result.preflight(env)
 
-      resource, error = match_resource(path, env)
-      unless resource
+      policy, error = match_resource(path, env)
+      unless policy
         result.miss(error)
         return {}
       end
 
-      resource.process_preflight(env, result)
+      policy.process_preflight(env, result)
     end
 
     def process_cors(env, path)
-      resource, error = match_resource(path, env)
-      if resource
+      policy, error = match_resource(path, env)
+      if policy
         Result.hit(env)
-        cors = resource.to_headers(env)
-        cors
-
+        policy.to_headers(env)
       else
         Result.miss(env, error)
         nil
@@ -194,26 +319,29 @@ module Rack
     end
 
     def resource_for_path(path_info)
-      all_resources.each do |r|
-        found = r.resource_for_path(path_info)
+      rule_sets.each do |rule_set|
+        found = rule_set.resource_for_path(path_info)
         return found if found
       end
       nil
     end
 
     def match_resource(path, env)
-      origin = env[HTTP_ORIGIN]
-
+      evaluation = Evaluation.new
       origin_matched = false
-      all_resources.each do |r|
-        next unless r.allow_origin?(origin, env)
+      match_error = Result::MISS_NO_ORIGIN
 
-        origin_matched = true
-        found = r.match_resource(path, env)
+      rule_sets.each do |rule_set|
+        next if rule_set.resources.empty?
+
+        found, error, allowed = rule_set.match(path, env, evaluation)
         return [found, nil] if found
+
+        origin_matched ||= allowed
+        match_error = error
       end
 
-      [nil, origin_matched ? Result::MISS_NO_PATH : Result::MISS_NO_ORIGIN]
+      [nil, origin_matched ? Result::MISS_NO_PATH : match_error]
     end
   end
 end

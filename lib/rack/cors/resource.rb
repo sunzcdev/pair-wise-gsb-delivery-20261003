@@ -8,6 +8,8 @@ module Rack
       CORS_SIMPLE_HEADERS = %w[accept accept-language content-language content-type].freeze
 
       attr_accessor :path, :methods, :headers, :expose, :max_age, :credentials, :pattern, :if_proc, :vary_headers
+      attr_reader :public_resource
+      alias public_resource? public_resource
 
       def initialize(public_resource, path, opts = {})
         raise CorsMisconfigurationError if public_resource && opts[:credentials] == true
@@ -40,8 +42,13 @@ module Rack
         pattern =~ path
       end
 
-      def match?(path, env)
-        matches_path?(path) && (if_proc.nil? || if_proc.call(env))
+      def match?(path, env, evaluation = nil)
+        matches_path?(path) && matches_conditions?(env, evaluation)
+      end
+
+      def matches_conditions?(env, evaluation = nil)
+        if_proc.nil? ||
+          (evaluation ? evaluation.evaluate(if_proc, env) : if_proc.call(env))
       end
 
       def process_preflight(env, result)
@@ -49,10 +56,13 @@ module Rack
 
         request_method = env[Rack::Cors::HTTP_ACCESS_CONTROL_REQUEST_METHOD]
         result.miss(Result::MISS_NO_METHOD) && (return headers) if request_method.nil?
-        result.miss(Result::MISS_DENY_METHOD) && (return headers) unless methods.include?(request_method.downcase)
+        result.miss(Result::MISS_DENY_METHOD) && (return headers) unless allows_method?(request_method)
 
         request_headers = env[Rack::Cors::HTTP_ACCESS_CONTROL_REQUEST_HEADERS]
-        result.miss(Result::MISS_DENY_HEADER) && (return headers) if request_headers && !allow_headers?(request_headers)
+        if request_headers && !allow_headers?(request_headers)
+          result.miss(Result::MISS_DENY_HEADER)
+          return headers
+        end
 
         result.hit = true
         headers.merge(to_preflight_headers(env))
@@ -69,11 +79,20 @@ module Rack
         header_proc.call(h)
       end
 
-      protected
-
-      def public_resource?
-        @public_resource
+      def allows_method?(method)
+        methods.include?(method.downcase)
       end
+
+      def allows_header?(header)
+        allowed_headers = headers || []
+        return true if allowed_headers == :any
+
+        normalized_header = header.downcase
+        CORS_SIMPLE_HEADERS.include?(normalized_header) ||
+          allowed_headers.include?(normalized_header)
+      end
+
+      protected
 
       def origin_for_response_header(origin)
         return '*' if public_resource?
@@ -88,14 +107,8 @@ module Rack
       end
 
       def allow_headers?(request_headers)
-        headers = self.headers || []
-        return true if headers == :any
-
-        request_headers = request_headers.split(/,\s*/) if request_headers.is_a?(String)
-        request_headers.all? do |header|
-          header = header.downcase
-          CORS_SIMPLE_HEADERS.include?(header) || headers.include?(header)
-        end
+        request_headers = request_headers.split(/\s*,\s*/) if request_headers.is_a?(String)
+        request_headers.map(&:strip).reject(&:empty?).all? { |header| allows_header?(header) }
       end
 
       def ensure_enum(var)
