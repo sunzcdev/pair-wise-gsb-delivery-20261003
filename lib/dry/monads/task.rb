@@ -74,6 +74,49 @@ module Dry
         # @param exc [Exception]
         # @return [Task]
         def failed(exc) = new(Promise.reject(exc))
+
+        # Adapts a callback-based API (success/error callbacks, a.k.a. CPS)
+        # to a Task.
+        #
+        # @example wrapping a legacy client
+        #   Task.from_callbacks do |on_success, on_error|
+        #     handle = legacy_client.submit(on_success, on_error)
+        #     -> { handle.unsubscribe }
+        #   end
+        #
+        # The block is called right away with two callables. It must register
+        # them with the callback source and return an "unsubscribe" callable
+        # (or nil if unsubscription isn't supported). The unsubscriber is
+        # invoked exactly once, after the task reaches its first terminal
+        # state, even if the registration block returned the handle later
+        # than the callback (e.g. for synchronous callbacks).
+        #
+        # Resolution rules ("first terminal state wins"):
+        #
+        # 1. The first success or error signal completes the task, any later
+        #    signals (including ones delivered from another thread) are
+        #    ignored.
+        # 2. A signal delivered synchronously, while the registration block
+        #    is still running, still completes the task. If the block raises
+        #    afterwards the exception is swallowed because a terminal result
+        #    has already arrived.
+        # 3. If the block raises before any signal arrives the task fails
+        #    with that exception, so waiters are never left hanging.
+        # 4. Errors raised by the unsubscribe callable are swallowed, they
+        #    can't undo the terminal result.
+        #
+        # @yieldparam on_success [#call] completes the task with a value
+        # @yieldparam on_error [#call] fails the task with an Exception
+        # @yieldreturn [#call, nil] an unsubscribe handle, invoked once
+        # @return [Task]
+        # @api public
+        def from_callbacks(&register)
+          raise ArgumentError, "a block is required" unless block_given?
+
+          gate = CallbackGate.new
+          gate.start(&register)
+          new(gate.promise)
+        end
       end
 
       include ConversionStubs[:to_maybe, :to_result]
@@ -228,6 +271,165 @@ module Dry
       #
       # @return [Task]
       def discard = fmap { Unit }
+
+      # Maps the output of a callback-based source onto a single promise.
+      #
+      # Two things must each happen at most once, independently of each
+      # other: settling the promise and invoking the unsubscribe handle.
+      # The first terminal signal settles the promise at once so waiters
+      # can never hang, even if the registration block raises afterwards
+      # or never returns the handle. The unsubscribe, in contrast, has to
+      # wait for the handle, which can be produced later than the signal
+      # (synchronous callbacks).
+      #
+      # @api private
+      class CallbackGate
+        # @return [Task::Promise]
+        attr_reader :promise
+
+        def initialize
+          @mutex = ::Mutex.new
+          @promise = Promise.new(executor: Concurrent::ImmediateExecutor.new)
+          @settled = false
+          @unsubscriber = nil
+        end
+
+        # Runs the registration block. The block is expected to register
+        # the two given callables with the callback source and return an
+        # optional unsubscribe callable.
+        #
+        # @return [void]
+        def start
+          begin
+            unsubscriber = yield(method(:succeed), method(:fail))
+          rescue ::StandardError => exception
+            registration_failed(exception)
+            return
+          end
+
+          registered(unsubscriber)
+        end
+
+        # Completes the task with the given value. No-op if a terminal
+        # signal has already arrived.
+        #
+        # @param value [Object]
+        # @return [void]
+        def succeed(value)
+          signal(true, value, nil)
+        end
+
+        # Fails the task with the given reason. No-op if a terminal signal
+        # has already arrived. Non-exception reasons are wrapped.
+        #
+        # @param reason [Exception]
+        # @return [void]
+        def fail(reason)
+          unless reason.is_a?(::Exception)
+            reason = StandardError.new(reason.inspect)
+          end
+
+          signal(false, nil, reason)
+        end
+
+        private
+
+        # Handles the very first terminal signal.
+        #
+        # @return [void]
+        def signal(success, value, reason)
+          unsubscriber = @mutex.synchronize do
+            return if @settled
+
+            @settled = true
+            consume_unsubscriber
+          end
+
+          settle_promise(success, value, reason)
+          unsubscribe(unsubscriber)
+        end
+
+        # Handles the handle produced by a normally returned registration
+        # block. A non-callable value is only rejected if no result has
+        # arrived yet; otherwise the first terminal result wins and the bad
+        # handle is ignored.
+        #
+        # @return [void]
+        def registered(unsubscriber)
+          unless unsubscriber.nil? || unsubscriber.respond_to?(:call)
+            signal_first = @mutex.synchronize { @settled }
+            raise TypeError, "unsubscribe handle must respond to #call" unless signal_first
+
+            return
+          end
+
+          pending = @mutex.synchronize do
+            @unsubscriber = unsubscriber
+            if @settled
+              consume_unsubscriber
+            else
+              nil
+            end
+          end
+          unsubscribe(pending)
+        end
+
+        # Handles a registration block that raised. If no terminal signal
+        # has arrived yet the exception becomes the failure of the task;
+        # otherwise the "first terminal state wins" rule makes it
+        # irrelevant, so it is swallowed instead of leaking into whoever
+        # invoked the (possibly synchronous) callback chain.
+        #
+        # @return [void]
+        def registration_failed(exception)
+          unsubscriber, failure = @mutex.synchronize do
+            if @settled
+              [consume_unsubscriber, nil]
+            else
+              @settled = true
+              [nil, exception]
+            end
+          end
+
+          if failure
+            settle_promise(false, nil, failure)
+          else
+            unsubscribe(unsubscriber)
+          end
+        end
+
+        # Settles the pending promise. Called at most once.
+        #
+        # @return [void]
+        def settle_promise(success, value, reason)
+          if success
+            @promise.on_fulfill(value)
+          else
+            @promise.on_reject(reason)
+          end
+        end
+
+        # Takes the stored handle so it can be invoked exactly once. Must
+        # be called while holding the mutex.
+        #
+        # @return [#call, nil]
+        def consume_unsubscriber
+          handle = @unsubscriber
+          @unsubscriber = nil
+          handle
+        end
+
+        # Invokes the handle, swallowing its errors: a broken unsubscriber
+        # must not mask or undo the result.
+        #
+        # @return [void]
+        def unsubscribe(callable)
+          callable&.call
+          nil
+        rescue ::StandardError
+          nil
+        end
+      end
 
       private
 

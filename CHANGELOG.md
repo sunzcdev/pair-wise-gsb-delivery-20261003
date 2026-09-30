@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- `Dry::Monads::Task.from_callbacks` adapts legacy success/error callback APIs to a Task. The registration block returns an unsubscribe callable, which is invoked exactly once after the first terminal result; synchronous callbacks, registration errors and racing signals are handled safely ("first terminal state wins").
+
 ### Changed
 
 ### Deprecated
