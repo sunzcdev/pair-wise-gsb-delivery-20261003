@@ -80,6 +80,12 @@ module Dry
       #   @api private
       option :message_resolver, default: -> { Messages::Resolver.new(messages) }
 
+      # @api private
+      def initialize(...)
+        self.class.__validate_macros__
+        super
+      end
+
       # Apply the contract to an input
       #
       # @param [Hash] input The input to validate

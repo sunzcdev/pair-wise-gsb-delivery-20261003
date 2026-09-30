@@ -7,6 +7,13 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ## [Unreleased]
 
+### Added
+
+- Optional macro signatures via `register_macro(:name, signature: {...})` declaring required/optional positional arguments, keyword arguments and macro-to-macro expansions. Macro calls in rules are verified when the contract class is first instantiated, raising `Dry::Validation::InvalidMacroCallError` that points to the contract, rule and macro. Macros without a signature keep their previous behavior, and macros can now compose other macros via `Evaluator#run_macro`
+
+### Changed
+
+- Registering a macro with an already used name now replaces the previous macro, allowing subclasses to override inherited macros
 
 ## [1.11.1] - 2025-01-21
 

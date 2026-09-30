@@ -124,6 +124,24 @@ module Dry
           @__schema__ if defined?(@__schema__)
         end
 
+        # Verify macro calls in all rules against declared macro signatures
+        #
+        # This runs once, when the contract class is first instantiated, which
+        # is the point where its definition (including inherited rules and
+        # macros) is complete
+        #
+        # @raise [InvalidMacroCallError]
+        #
+        # @return [void]
+        #
+        # @api private
+        def __validate_macros__
+          return if instance_variable_defined?(:@__macros_validated__)
+
+          MacroValidator.new(self).validate!
+          @__macros_validated__ = true
+        end
+
         # Return rules defined in this class
         #
         # @return [Array<Rule>]

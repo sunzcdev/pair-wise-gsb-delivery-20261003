@@ -74,10 +74,27 @@ module Dry
           instance_exec(**exec_opts, &block)
         end
 
-        macros.each do |args|
-          macro = macro(*args.flatten(1))
-          instance_exec(**macro.extract_block_options(_options.merge(macro: macro)), &macro.block)
+        macros.each do |spec|
+          name, *args = spec.flatten(1)
+          run_macro(name, *args)
         end
+      end
+
+      # Run another macro within this evaluator
+      #
+      # This enables macro composition. Macros that expand into other macros
+      # should declare them via the `:macros` setting of their signature, so
+      # that the calls can be verified when the contract class is validated
+      #
+      # @param [Symbol] name The name of the macro
+      # @param [Array] args Arguments for the macro
+      #
+      # @see Macro::Signature
+      #
+      # @api public
+      def run_macro(name, *args)
+        macro = _contract.__send__(:macro, name, *args)
+        instance_exec(**macro.extract_block_options(_options.merge(macro: macro)), &macro.block)
       end
 
       # Get `Failures` object for the default or provided path

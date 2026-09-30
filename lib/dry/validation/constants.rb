@@ -32,6 +32,9 @@ module Dry
     # Error raised when trying to define a schema in a contract class that already has a schema
     DuplicateSchemaError = ::Class.new(::StandardError)
 
+    # Error raised when a macro call doesn't match the macro's declared signature
+    InvalidMacroCallError = ::Class.new(::StandardError)
+
     # Error raised during initialization of a contract that has no schema defined
     SchemaMissingError = ::Class.new(::StandardError) do
       # @api private

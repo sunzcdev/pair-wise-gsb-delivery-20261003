@@ -23,9 +23,14 @@ module Dry
       #   @api private
       option :block
 
+      # @!attribute [r] signature
+      #   @return [Macro::Signature, nil]
+      #   @api public
+      option :signature, optional: true
+
       # @api private
       def with(args)
-        self.class.new(name, args: args, block: block)
+        self.class.new(name, args: args, block: block, signature: signature)
       end
 
       # @api private
