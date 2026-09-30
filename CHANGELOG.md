@@ -7,6 +7,7 @@
 #### Features
 
 * Your contribution here.
+* Add graph representation mode: declare an entity `identity` and call `represent(object, graph: true)` to render identified entities as links with their full representations collected under `:included`, deduplicating by business identity and raising `Grape::Entity::Graph::ConflictError` on conflicting content.
 
 
 ### 1.1.0 (2026-06-05)

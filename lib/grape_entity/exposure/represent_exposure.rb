@@ -24,7 +24,14 @@ module Grape
 
         def value(entity, options)
           new_options = options.for_nesting(key(entity))
-          using_class.represent(@subexposure.value(entity, options), new_options)
+          subobject = @subexposure.value(entity, options)
+          registry = options[:graph_registry]
+
+          if registry && using_class.identity
+            registry.reference_for(using_class, subobject, new_options)
+          else
+            using_class.represent(subobject, new_options)
+          end
         end
 
         def valid?(entity)

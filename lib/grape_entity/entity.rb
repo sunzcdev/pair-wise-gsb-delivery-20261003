@@ -366,6 +366,36 @@ module Grape
       @root = singular
     end
 
+    # Declares the attribute(s) that make up the business identity of the
+    # exposed objects. The identity is used in graph representation mode
+    # (see Entity.represent with the :graph option) to detect that different
+    # Ruby objects denote the same entity: every occurrence after the first
+    # one is rendered as a link to the representation stored in the
+    # accompanying +included+ collection.
+    #
+    # @param keys [Array<Symbol>] the attribute(s) identifying the object
+    #
+    # @example Entity Definition
+    #
+    #   module API
+    #     module Entities
+    #       class User < Grape::Entity
+    #         identity :id
+    #         expose :id
+    #         expose :name
+    #       end
+    #     end
+    #   end
+    def self.identity(*keys)
+      if keys.any?
+        @identity_keys = keys.flatten.map(&:to_sym)
+      elsif instance_variable_defined?(:@identity_keys)
+        @identity_keys
+      elsif superclass.respond_to?(:identity)
+        superclass.identity
+      end
+    end
+
     # This allows you to present a collection of objects.
     #
     # @param present_collection   [true or false] when true all objects will be available as
@@ -439,7 +469,12 @@ module Grape
     #
     # @option options :only [Array] all the fields that should be returned
     # @option options :except [Array] all the fields that should not be returned
+    # @option options :graph [true or false] when true the objects are represented
+    #   as a graph: entities with a declared identity are rendered as links and
+    #   their full representations are collected under the :included key.
     def self.represent(objects, options = {})
+      return Graph.represent(self, objects, options) if options[:graph]
+
       @present_collection ||= nil
       if objects.respond_to?(:to_ary) && !@present_collection
         root_element = root_element(:collection_root)

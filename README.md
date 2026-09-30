@@ -367,6 +367,53 @@ data = Entity.represent(model, except: [:id, { user: [:id] }])
 data.as_json
 ```
 
+#### Representing Object Graphs
+
+Fully nesting associated entities loops forever when associations are cyclic
+(A references B, B references A) and duplicates objects that are reachable
+through more than one path. Declaring an `identity` for your entities enables
+graph representation mode via `graph: true`, which renders every occurrence of
+an identified entity as a link and collects the full representations in an
+accompanying `included` collection:
+
+```ruby
+class UserEntity < Grape::Entity
+  identity :id
+  expose :id
+  expose :name
+  expose :posts, using: PostEntity
+end
+
+class PostEntity < Grape::Entity
+  identity :id
+  expose :id
+  expose :title
+  expose :author, using: UserEntity
+end
+
+UserEntity.represent(user, graph: true)
+```
+
+This returns a finite structure even for cyclic graphs:
+
+```ruby
+{
+  data: { _ref: 'UserEntity:1' },
+  included: {
+    'UserEntity:1' => { id: 1, name: 'John', posts: [{ _ref: 'PostEntity:7' }] },
+    'PostEntity:7' => { id: 7, title: 'Hello', author: { _ref: 'UserEntity:1' } }
+  }
+}
+```
+
+Entities are deduplicated by their declared identity, not by Ruby object
+identity: two different objects with the same identity are expanded only once.
+If two objects share an identity but serialize to different content, a
+`Grape::Entity::Graph::ConflictError` is raised instead of silently picking
+one of them. Field filtering (`only:`/`except:`) and conditions (`if:`/
+`unless:`) still apply, and associations hidden by them are never read.
+Entities without a declared identity are represented inline as usual.
+
 #### Aliases
 
 Expose under a different name with `:as`.
