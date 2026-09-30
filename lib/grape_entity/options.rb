@@ -83,13 +83,15 @@ module Grape
       end
 
       def with_attr_path(part)
-        return yield unless part
-
         stack = (opts_hash[:attr_path] ||= [])
-        stack.push part
-        result = yield
-        stack.pop
-        result
+        return yield if part.nil?
+
+        stack.push(part)
+        begin
+          yield
+        ensure
+          stack.pop
+        end
       end
 
       private

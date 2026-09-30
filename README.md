@@ -162,6 +162,40 @@ Don't raise an exception and expose as nil, even if the :x cannot be evaluated.
 expose :ip, safe: true
 ```
 
+#### Partial Representation
+
+By default any exception raised while evaluating a field bubbles up and the whole
+representation is lost. Use `Entity.represent_partial` (or `#represent_partial` on
+an entity instance) to keep representing the remaining fields and elements:
+
+```ruby
+expose :id
+expose :name, on_error: :null   # a failing field is rendered as null (default)
+expose :email, on_error: :omit  # a failing field is left out of the output
+
+result = UserEntity.represent_partial(users)
+result.value  # the (possibly incomplete) serializable hash or array
+result.errors # structured list of Grape::Entity::PartialError
+```
+
+Each error carries:
+
+- `path` - the external path of the failed value, built from the `:as` aliases
+  and 0-based collection positions, e.g. `[:friends, 2, :name]`
+- `attribute` - the internal attribute name of the field
+- `exception` (aliased as `cause`) - the original exception, preserved as-is
+
+A global fallback can be passed at representation time:
+
+```ruby
+UserEntity.represent_partial(users, on_error: :omit)
+```
+
+Fields that are legitimately `nil` or hidden by an `:if`/`:unless` condition are
+not reported as errors. A failure while resolving the output path itself (e.g. a
+raising `:as` or `:attr_path` proc) is not swallowed: the original exception is
+raised as with the regular `serializable_hash`.
+
 #### Nested Exposure
 
 Supply a block to define a hash using nested exposures.

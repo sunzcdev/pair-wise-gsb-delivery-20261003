@@ -6,7 +6,7 @@
 
 #### Features
 
-* Your contribution here.
+* Add partial representations: `Grape::Entity.represent_partial` / `Entity#represent_partial` keep representing an entity when a non-critical field fails. Fields opt into `on_error: :null` (default) or `on_error: :omit`, and failures are returned as a structured `Grape::Entity::PartialError` list keyed by the external alias path (including 0-based collection positions) with the original exception preserved as `cause`. Normal `nil` values and conditionally hidden fields are not reported as errors, and plain `serializable_hash` keeps raising.
 
 
 ### 1.1.0 (2026-06-05)

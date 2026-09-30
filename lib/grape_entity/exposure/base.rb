@@ -24,6 +24,7 @@ module Grape
           @attr_path_proc = options[:attr_path]
           @documentation = options[:documentation]
           @override = options[:override]
+          @on_error = options[:on_error]
           @conditions = conditions
         end
 
@@ -123,6 +124,32 @@ module Grape
         def with_attr_path(entity, options, &block)
           path_part = attr_path(entity, options)
           options.with_attr_path(path_part, &block)
+        end
+
+        # External key of this exposure in the output. It is resolved
+        # outside of the failure rescue so that a raising +:as+ proc is
+        # never swallowed into an empty result.
+        def output_key(entity)
+          @key.respond_to?(:call) ? entity.exec_with_object(@options, &@key) : @key
+        end
+
+        # @param options [Options] representation options
+        # @return [:null, :omit] how to render a failed value
+        def on_error_strategy(options)
+          @on_error || options[:on_error] || :null
+        end
+
+        # Records +exception+ against the current external path. The
+        # stack already contains this exposure's external path part
+        # (its +:as+ alias by default).
+        #
+        # @return [:null, :omit] the strategy the caller must use for
+        #   the missing value
+        def record_partial_error(_entity, options, exception)
+          path = (options[:attr_path] || []).dup
+          strategy = on_error_strategy(options)
+          options[:partial_errors] << PartialError.new(path, @attribute, exception)
+          strategy
         end
 
         def override?

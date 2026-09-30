@@ -13,7 +13,7 @@ module Grape
             super
           end
 
-          def add(exposure, result)
+          def add(exposure, result, key = exposure.key(@entity))
             # Save a result array in collections' array if it should be merged
             if result.is_a?(Array) && exposure.for_merge
               @output_collection << result
@@ -24,7 +24,7 @@ module Grape
 
               @output_hash.merge! result, &merge_strategy(exposure.for_merge)
             else
-              @output_hash[exposure.key(@entity)] = result
+              @output_hash[key] = result
             end
           end
 

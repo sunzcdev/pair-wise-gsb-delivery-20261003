@@ -443,7 +443,7 @@ module Grape
       @present_collection ||= nil
       if objects.respond_to?(:to_ary) && !@present_collection
         root_element = root_element(:collection_root)
-        inner = objects.to_ary.map { |object| new(object, options.reverse_merge(collection: true)).presented }
+        inner = represent_collection(objects, options)
       else
         objects = { @collection_name => objects } if @present_collection
         root_element = root_element(:root)
@@ -453,6 +453,87 @@ module Grape
       root_element = options[:root] if options.key?(:root)
 
       root_element ? { root_element => inner } : inner
+    end
+
+    # Like {.represent}, but a failure while evaluating one field does
+    # not discard the whole representation. Failed fields are either
+    # rendered as +nil+ or omitted, depending on their +:on_error+
+    # configuration (+:null+ is the default). Every failure is collected
+    # in the returned {PartialResult}'s +errors+ list together with the
+    # external path (aliases and collection positions) and the original
+    # exception.
+    #
+    # Fields that are legitimately +nil+ or hidden by an +:if+/+:unless+
+    # condition are not reported as errors.
+    #
+    # @param objects [Object or Array]
+    # @param options [Hash]
+    # @option options :on_error [:null, :omit] fallback used for fields
+    #   without their own +:on_error+ setting
+    # @return [PartialResult]
+    def self.represent_partial(objects, options = {})
+      errors = []
+      partial_options = options.reverse_merge(partial: true, partial_errors: errors)
+
+      @present_collection ||= nil
+      if objects.respond_to?(:to_ary) && !@present_collection
+        root_element = root_element(:collection_root)
+        inner = represent_collection(objects, partial_options)
+      else
+        objects = { @collection_name => objects } if @present_collection
+        root_element = root_element(:root)
+        inner = new(objects, partial_options).presented
+      end
+
+      root_element = options[:root] if options.key?(:root)
+
+      value = root_element ? { root_element => inner } : inner
+      PartialResult.new(value, errors)
+    end
+
+    # @api private
+    def self.represent_collection(objects, options)
+      return represent_collection_partial(objects, options) if options[:partial_errors]
+
+      objects.to_ary.map do |object|
+        new(object, options.reverse_merge(collection: true)).presented
+      end
+    end
+
+    # @api private
+    def self.represent_collection_partial(objects, options)
+      strategy = options[:on_error] || :null
+
+      values = objects.to_ary.map.with_index do |object, index|
+        entity = new(object, options.reverse_merge(collection: true))
+        represent_partial_member(entity, index)
+      end
+
+      strategy == :omit ? values.reject { |value| value == :omitted } : values
+    end
+
+    # @api private
+    def self.represent_partial_member(entity, index)
+      entity.options.with_attr_path(index) do
+        begin
+          unwrap_partial_value(entity.presented)
+        rescue StandardError => e
+          strategy = entity.options[:on_error] || :null
+          entity.options[:partial_errors] << PartialError.new(
+            (entity.options[:attr_path] || []).dup, nil, e
+          )
+          strategy == :omit ? :omitted : nil
+        end
+      end
+    end
+
+    def self.unwrap_partial_value(value)
+      case value
+      when Grape::Entity::Exposure::NestingExposure::OutputBuilder
+        value.__getobj__
+      else
+        value
+      end
     end
 
     # This method returns the entity's root or collection root node, or its parent's
@@ -467,7 +548,7 @@ module Grape
     end
 
     def presented
-      if options[:serializable]
+      if options[:serializable] || options[:partial]
         serializable_hash
       else
         self
@@ -517,9 +598,34 @@ module Grape
     def serializable_hash(runtime_options = {})
       return nil if object.nil?
 
+      @delegated_attributes = nil
       opts = options.merge(runtime_options || {})
 
       root_exposure.serializable_value(self, opts)
+    end
+
+    # Partial variant of {#serializable_hash}: a failing field is
+    # represented as +nil+ or omitted (per its +:on_error+ option,
+    # defaulting to +:null+) instead of aborting the whole entity, and
+    # every failure is returned with the representation.
+    #
+    # Legitimately +nil+ values and fields hidden by +:if+/+:unless+
+    # conditions are never reported as errors.
+    #
+    # @param runtime_options [Hash]
+    # @option runtime_options :on_error [:null, :omit] fallback used for
+    #   fields without their own +:on_error+ setting
+    # @return [PartialResult]
+    def represent_partial(runtime_options = {})
+      return PartialResult.new(nil, []) if object.nil?
+
+      errors = []
+      opts = options
+             .merge(runtime_options || {})
+             .reverse_merge(partial: true, partial_errors: errors)
+
+      value = root_exposure.serializable_value(self, opts)
+      PartialResult.new(value, errors)
     end
 
     def exec_with_object(options, &block)
@@ -595,17 +701,22 @@ module Grape
     end
 
     def value_for(key, options = Options.new)
+      @delegated_attributes = nil
       root_exposure.valid_value_for(key, self, options)
     end
 
     def delegate_attribute(attribute)
-      if is_defined_in_entity?(attribute)
-        send(attribute)
-      elsif delegator.accepts_options?
-        delegator.delegate(attribute, **self.class.delegation_opts)
-      else
-        delegator.delegate(attribute)
-      end
+      @delegated_attributes ||= {}
+      return @delegated_attributes[attribute] if @delegated_attributes.key?(attribute)
+
+      @delegated_attributes[attribute] =
+        if is_defined_in_entity?(attribute)
+          send(attribute)
+        elsif delegator.accepts_options?
+          delegator.delegate(attribute, **self.class.delegation_opts)
+        else
+          delegator.delegate(attribute)
+        end
     end
 
     def is_defined_in_entity?(attribute)
@@ -646,6 +757,7 @@ module Grape
       expose_nil
       override
       default
+      on_error
     ].to_set.freeze
 
     # Merges the given options with current block options.
@@ -686,6 +798,9 @@ module Grape
       end
 
       options[:using] = options.delete(:with) if options.key?(:with)
+      if options.key?(:on_error) && !%i[null omit].include?(options[:on_error])
+        raise ArgumentError, ':on_error must be :null or :omit'
+      end
       options
     end
   end

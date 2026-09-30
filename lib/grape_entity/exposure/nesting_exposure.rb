@@ -113,16 +113,79 @@ module Grape
           end
         end
 
-        def map_entity_exposures(entity, options)
-          new_options = nesting_options_for(options)
+      def map_entity_exposures(entity, options)
+        new_options = nesting_options_for(options)
+
+        unless new_options[:partial_errors]
+          return map_full_entity_exposures(entity, new_options) { |*args| yield(*args) }
+        end
+
+        map_partial_entity_exposures(entity, new_options) { |*args| yield(*args) }
+      end
+
+        def map_full_entity_exposures(entity, options)
           output = OutputBuilder.new(entity)
 
-          normalized_exposures(entity, new_options).each_with_object(output) do |exposure, out|
-            exposure.with_attr_path(entity, new_options) do
-              result = yield(exposure, new_options)
+          normalized_exposures(entity, options).each_with_object(output) do |exposure, out|
+            exposure.with_attr_path(entity, options) do
+              result = yield(exposure, options)
               out.add(exposure, result)
             end
           end
+        end
+
+        def map_partial_entity_exposures(entity, options)
+          output = OutputBuilder.new(entity)
+
+          nested_exposures.each_with_object(output) do |exposure, out|
+            process_partial_exposure(exposure, entity, options, out) { yield(exposure, options) }
+          end
+        end
+
+        def process_partial_exposure(exposure, entity, options, output)
+          result = process_partial_exposure_at_path(exposure, entity, options) { yield }
+
+          return if result == :omitted || result == :error
+          return output.add(exposure, nil, result[1]) if result.first == :failed
+
+          output.add(exposure, result.first, result.last)
+        end
+
+        def process_partial_exposure_at_path(exposure, entity, options)
+          # The external path part is computed up front and pushed onto
+          # the stack outside of the value rescue: a failure here (e.g.
+          # a raising +:as+ or +:attr_path+ proc) surfaces as the
+          # original exception rather than being swallowed into an empty
+          # value or re-executing the failing proc.
+          path_part = exposure.attr_path(entity, options)
+
+          options.with_attr_path(path_part) do
+            should_expose = partial_should_expose?(exposure, entity, options)
+            next :error if should_expose == false || should_expose == :error
+
+            begin
+              value = yield
+              external_key = exposure.output_key(entity)
+            rescue StandardError => e
+              strategy = exposure.record_partial_error(entity, options, e)
+              next :omitted if strategy == :omit
+
+              # When the key is a proc the path part above is the raw
+              # proc; resolve it for the output without re-running the
+              # value getter a second time.
+              external_key = path_part.respond_to?(:call) ? exposure.output_key(entity) : path_part
+              next [:failed, external_key]
+            end
+
+            [value, external_key]
+          end
+        end
+
+        def partial_should_expose?(exposure, entity, options)
+          exposure.should_expose?(entity, options)
+        rescue StandardError => e
+          exposure.record_partial_error(entity, options, e)
+          :error
         end
       end
     end

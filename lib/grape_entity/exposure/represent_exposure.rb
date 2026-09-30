@@ -24,7 +24,13 @@ module Grape
 
         def value(entity, options)
           new_options = options.for_nesting(key(entity))
-          using_class.represent(@subexposure.value(entity, options), new_options)
+          objects = @subexposure.value(entity, options)
+
+          if new_options[:partial_errors] && objects.respond_to?(:to_ary)
+            represent_partial_collection(objects, new_options)
+          else
+            using_class.represent(objects, new_options)
+          end
         end
 
         def valid?(entity)
@@ -40,6 +46,23 @@ module Grape
         end
 
         private
+
+        def represent_partial_collection(objects, options)
+          strategy = @on_error || options[:on_error] || :null
+
+          values = objects.to_ary.map.with_index do |object, index|
+            options.with_attr_path(index) do
+              begin
+                using_class.unwrap_partial_value(using_class.new(object, options).presented)
+              rescue StandardError => e
+                options[:partial_errors] << PartialError.new((options[:attr_path] || []).dup, nil, e)
+                strategy == :omit ? :omitted : nil
+              end
+            end
+          end
+
+          strategy == :omit ? values.reject { |value| value == :omitted } : values
+        end
 
         def using_options_for(options)
           options.for_nesting(key)
