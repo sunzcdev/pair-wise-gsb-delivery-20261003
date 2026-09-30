@@ -18,6 +18,8 @@ module JMESPath
       def optimize
         self.class.new(@children.map(&:optimize))
       end
+
+      attr_reader :children
     end
   end
 end

@@ -13,6 +13,8 @@ module JMESPath
       def optimize
         self.class.new(@expression.optimize)
       end
+
+      attr_reader :expression
     end
   end
 end

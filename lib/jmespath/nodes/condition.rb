@@ -24,6 +24,8 @@ module JMESPath
           self.class.new(test, @child.optimize)
         end
       end
+
+      attr_reader :test, :child
     end
 
     class ComparatorCondition < Node
@@ -47,6 +49,10 @@ module JMESPath
           left_value.is_a?(type) && right_value.is_a?(type)
         end
       end
+
+      public
+
+      attr_reader :left, :right, :child
     end
 
     class EqCondition < ComparatorCondition

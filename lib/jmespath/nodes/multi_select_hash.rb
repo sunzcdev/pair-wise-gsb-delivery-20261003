@@ -21,6 +21,8 @@ module JMESPath
         self.class.new(@kv_pairs.map(&:optimize))
       end
 
+      attr_reader :kv_pairs
+
       class KeyValuePair
         attr_reader :key, :value
 

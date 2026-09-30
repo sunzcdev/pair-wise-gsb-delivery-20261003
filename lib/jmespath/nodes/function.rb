@@ -27,6 +27,10 @@ module JMESPath
         self.class.new(@children.map(&:optimize), @options)
       end
 
+      attr_reader :children
+
+      attr_reader :disable_visit_errors
+
       class FunctionName
         attr_reader :name
 

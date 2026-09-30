@@ -16,8 +16,6 @@ module JMESPath
         Chain.new(flatten).optimize
       end
 
-      protected
-
       attr_reader :left, :right
 
       def flatten
@@ -45,6 +43,8 @@ module JMESPath
           child.visit(v)
         end
       end
+
+      attr_reader :children
 
       def optimize
         children = @children.map(&:optimize)

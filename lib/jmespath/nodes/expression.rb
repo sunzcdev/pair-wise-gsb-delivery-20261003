@@ -20,6 +20,10 @@ module JMESPath
       def optimize
         self.class.new(@expression.optimize)
       end
+
+      def eval_located(interpreter, located)
+        interpreter.resolve(@expression, located)
+      end
     end
   end
 end

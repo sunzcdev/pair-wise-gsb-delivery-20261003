@@ -58,6 +58,46 @@ JMESPath.search('foo.bar', data)
 #=> "value"
 ```
 
+## Searching with Source Locations
+
+When you need to know where every value in the result came from in the
+original document (for example when reporting configuration errors), use
+`JMESPath.search_with_sources`. It returns a `JMESPath::SourcedResult`;
+`#value` is exactly what `JMESPath.search` would return, and `#locations`
+maps a JSON Pointer into the result to a `JMESPath::SourceLocation`.
+
+```ruby
+data = {
+  "people" => [
+    { "name" => "Arthur",   "age" => 21 },
+    { "name" => "Trillian", "age" => 31 },
+    { "name" => "Ford",     "age" => nil },
+    { "name" => "Zaphod",   "age" => 42 }
+  ]
+}
+
+result = JMESPath.search_with_sources('people[?age > `30`].name', data)
+result.value
+#=> ["Trillian", "Zaphod"]
+
+result.location_at(0).pointer   #=> "/people/1/name"
+result.location_at(1).pointer   #=> "/people/3/name"
+```
+
+* Values copied verbatim from the document are `sourced?` and carry the
+  JSON Pointer of the original value.
+* Values computed by the expression (projections, slices, `flatten`,
+  `sort_by`, functions, literals, comparisons, multi-selects, ...) are
+  `derived?`; `#inputs` lists the JSON Pointers of their direct inputs.
+  Inputs are tracked through the data flow, never inferred by comparing the
+  result back against the document, so duplicate values keep distinct
+  sources.
+* Elements a projection resolves to `null` are omitted, so result-array
+  indices never masquerade as source-array indices. `null` values kept by
+  multi-selects still point at their original positions.
+* Keys containing `/` or `~` are escaped as described by
+  [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901).
+
 ## JSON Documents
 
 If you have JSON documents on disk, or IO objects that contain JSON documents, you can pass them as the data argument.

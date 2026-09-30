@@ -19,6 +19,8 @@ module JMESPath
       def optimize
         self.class.new(@left.optimize, @right.optimize)
       end
+
+      attr_reader :left, :right
     end
   end
 end

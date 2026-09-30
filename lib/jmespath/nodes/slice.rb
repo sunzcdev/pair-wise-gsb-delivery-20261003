@@ -71,6 +71,10 @@ module JMESPath
       end
     end
 
+    class Slice
+      attr_reader :start, :stop, :step
+    end
+
     class SimpleSlice < Slice
       def initialize(start, stop)
         super(start, stop, 1)

@@ -32,6 +32,10 @@ module JMESPath
       def extract_targets(_left_value)
         nil
       end
+
+      public
+
+      attr_reader :target, :projection
     end
 
     module FastProjector

@@ -57,6 +57,14 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # @param [String<JMESPath>] expression
+    # @param [Hash] data
+    # @return [SourcedResult]
+    def search_with_sources(expression, data)
+      optimized_expression = @parser.parse(expression).optimize
+      Sourced::Interpreter.new(optimized_expression).evaluate(data)
+    end
+
     private
 
     def default_parser(options)

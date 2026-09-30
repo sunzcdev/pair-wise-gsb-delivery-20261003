@@ -23,6 +23,8 @@ module JMESPath
       def optimize
         self.class.new(@child.optimize)
       end
+
+      attr_reader :child
     end
   end
 end

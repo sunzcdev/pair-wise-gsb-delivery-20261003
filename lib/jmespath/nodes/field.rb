@@ -31,7 +31,7 @@ module JMESPath
         ChainedField.new([@key, *other.keys])
       end
 
-      protected
+      attr_reader :key
 
       def keys
         [@key]
@@ -66,8 +66,6 @@ module JMESPath
       def chain(other)
         ChainedField.new([*@keys, *other.keys])
       end
-
-      private
 
       attr_reader :keys
     end
