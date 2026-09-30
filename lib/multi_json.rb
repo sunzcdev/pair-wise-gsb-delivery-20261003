@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/canonical_dump"
 
 module MultiJson
   include Options
@@ -122,6 +123,17 @@ module MultiJson
     current_adapter(options).dump(object, options)
   end
   alias_method :encode, :dump
+
+  # Encodes a Ruby object as canonical JSON (RFC 8785, JCS).
+  #
+  # Unlike dump, this does not go through the current adapter and is
+  # not affected by dump_options, so the resulting bytes are stable
+  # and suitable for signature schemes. Values that have no exact
+  # canonical representation (out-of-range integers, NaN, Infinity,
+  # invalid Unicode, custom objects) raise CanonicalDumpError.
+  def canonical_dump(object)
+    CanonicalDump.dump(object)
+  end
 
   #  Executes passed block using specified adapter.
   def with_adapter(new_adapter)
