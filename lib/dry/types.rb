@@ -44,7 +44,7 @@ module Dry
           "#{root}/dry/types/{#{%w[
             compat constraints core
             errors extensions inflector
-            module json params
+            json lossless module params
             printer version
           ].join(",")}}.rb"
         )

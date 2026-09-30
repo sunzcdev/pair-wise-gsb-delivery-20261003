@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Explicit **lossless numeric types**: `lossless.integer`, `lossless.float`, and `lossless.decimal` (plus `optional.lossless.*`). They accept `Integer`, `Float`, `BigDecimal`, and common decimal strings, but reject any conversion that would change the mathematical value: fractions are never truncated (`"3.7"` never becomes `3`), integers that round or overflow when converted to Float are rejected, decimals without an exact binary64 representation (`"3.7"` -> Float) are rejected, and non-finite values (`NaN`/`Infinity`) together with negative zero are rejected. Float -> BigDecimal always materializes the exact binary64 value (unlike `Float#to_d`, which rounds). The guarantee composes through arrays, schemas, sums, constraints, and constructors. The existing `coercible.*`, `params.*`, and `json.*` types keep their current behavior. See `Dry::Types::Coercions::Lossless` for the full rule set.
+
 ### Changed
 
 ### Deprecated

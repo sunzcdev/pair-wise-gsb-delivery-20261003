@@ -104,3 +104,4 @@ end
 require "dry/types/coercions"
 require "dry/types/params"
 require "dry/types/json"
+require "dry/types/lossless"
