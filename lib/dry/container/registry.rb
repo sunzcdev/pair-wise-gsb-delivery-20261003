@@ -42,6 +42,32 @@ module Dry
         end
       end
 
+      # Register an alias entry pointing at another key
+      #
+      # @param [Concurrent::Hash] container
+      #   The container
+      # @param [Mixed] key
+      #   The key to register the alias under
+      # @param [Mixed] target
+      #   The key the alias points at (which may itself be an alias)
+      #
+      # @raise [Dry::Container::Error]
+      #   If a key (or another alias) is already registered with the key
+      #
+      # @return [Dry::Container::Alias]
+      #
+      # @api public
+      def register_alias(container, key, target)
+        key = key.to_s.dup.freeze
+        @_mutex.synchronize do
+          if container.key?(key)
+            raise Error, "There is already an item registered with the key #{key.inspect}"
+          end
+
+          container[key] = ::Dry::Container::Alias.new(target)
+        end
+      end
+
       def factory
         @factory ||= ::Dry::Container::Item::Factory.new
       end

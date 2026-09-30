@@ -160,6 +160,29 @@ module Dry
               "can't modify frozen #{self.class} (when attempting to register '#{key}')"
       end
 
+      # Register an alias: another name for the same registered item
+      #
+      # The target may itself be an alias, in which case resolution follows
+      # the whole chain. Every name shares the terminal registration, so the
+      # resolved object and its memoization state are shared.
+      #
+      # @param [Mixed] key
+      #   The key the alias is registered under
+      # @param [Mixed] target
+      #   The key the alias points at (which may itself be an alias)
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def register_alias(key, target)
+        config.registry.register_alias(_container, key, target)
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} (when attempting to register '#{key}')"
+      end
+
       # Resolve an item from the container
       #
       # @param [Mixed] key
@@ -202,7 +225,14 @@ module Dry
         if namespace
           _container.merge!(
             other._container.each_with_object(::Concurrent::Hash.new) { |(key, item), hsh|
-              hsh[PREFIX_NAMESPACE.call(namespace, key, config)] = item
+              prefixed_item =
+                if item.is_a?(::Dry::Container::Alias)
+                  item.namespaced(namespace, config.namespace_separator)
+                else
+                  item
+                end
+
+              hsh[PREFIX_NAMESPACE.call(namespace, key, config)] = prefixed_item
             },
             &block
           )
@@ -264,25 +294,94 @@ module Dry
 
       # Decorates an item from the container with specified decorator
       #
+      # This decorates the terminal registration reached from +key+ (itself
+      # or, for an alias, the item the chain ends at). Because the terminal
+      # is replaced, the decoration is visible through the original key and
+      # through every alias that shares the terminal.
+      #
+      # To decorate only resolution through a single alias entry without
+      # affecting the original key or other aliases, pass +alias_only: true+
+      # or use {#decorate_alias}.
+      #
       # @return [Dry::Container::Mixin] self
       #
       # @api public
-      def decorate(key, with: nil, &block)
+      def decorate(key, with: nil, alias_only: false, &block)
+        decorator = build_decorator(with, block)
+
+        if alias_only
+          decorate_alias_entry(key, decorator)
+        else
+          decorate_terminal(key, decorator)
+        end
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} (when attempting to decorate '#{key}')"
+      end
+
+      # Decorate only the given alias entry
+      #
+      # The terminal registration, its original key and every other alias
+      # pointing at it are left untouched; only resolution through this exact
+      # alias name is decorated.
+      #
+      # @param [Mixed] key
+      #   The alias key to decorate
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def decorate_alias(key, with: nil, &block)
+        decorate(key, with: with, alias_only: true, &block)
+      end
+
+      # Replace an alias entry with a copy carrying an alias-scoped decorator
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api private
+      def decorate_alias_entry(key, decorator)
         key = key.to_s
-        original = _container.delete(key) do
+        original = _container.fetch(key) do
           raise Error, "Nothing registered with the key #{key.inspect}"
         end
 
-        if with.is_a?(Class)
-          decorator = with.method(:new)
-        elsif block.nil? && !with.respond_to?(:call)
-          raise Error, "Decorator needs to be a Class, block, or respond to the `call` method"
-        else
-          decorator = with || block
+        unless original.is_a?(::Dry::Container::Alias)
+          raise Error, "Nothing registered as an alias with the key #{key.inspect}"
         end
 
-        _container[key] = original.map(decorator)
+        _container[key] = original.decorate(decorator)
         self
+      end
+
+      # Replace the terminal registration reached from +key+
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api private
+      def decorate_terminal(key, decorator)
+        item, terminal_key, _decorator_layers =
+          config.resolver.follow(_container, key) do |missing|
+            raise Error, "Nothing registered with the key #{missing.inspect}"
+          end
+
+        _container[terminal_key] = item.map(decorator)
+        self
+      end
+
+      # @return [#call]
+      #
+      # @api private
+      def build_decorator(with, block)
+        if with.is_a?(Class)
+          with.method(:new)
+        elsif block.nil? && (with.nil? || !with.respond_to?(:call))
+          raise Error, "Decorator needs to be a Class, block, or respond to the `call` method"
+        else
+          with || block
+        end
       end
 
       # Evaluate block and register items in namespace
