@@ -13,6 +13,13 @@ module Dry
       # @return [Hash] the options to memoize, call or no.
       attr_reader :options
 
+      # @return [Dry::Container::CacheState, nil] the cache state of the
+      #   container the item is registered with, used to detect replaced
+      #   dependencies
+      #
+      # @api private
+      attr_accessor :cache_state
+
       # @api abstract
       def initialize(item, options = {})
         @item = item
@@ -40,11 +47,14 @@ module Dry
       #
       # @private
       def map(func)
-        if callable?
-          self.class.new(-> { func.(item.call) }, options)
-        else
-          self.class.new(func.(item), options)
-        end
+        mapped =
+          if callable?
+            self.class.new(-> { func.(item.call) }, options)
+          else
+            self.class.new(func.(item), options)
+          end
+        mapped.cache_state = cache_state
+        mapped
       end
     end
   end

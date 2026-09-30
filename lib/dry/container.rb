@@ -2,6 +2,7 @@
 
 require "dry/container/error"
 require "dry/container/namespace"
+require "dry/container/cache_state"
 require "dry/container/registry"
 require "dry/container/resolver"
 require "dry/container/namespace_dsl"

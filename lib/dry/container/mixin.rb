@@ -2,6 +2,8 @@
 
 require "concurrent/hash"
 
+require "dry/container/cache_state"
+
 module Dry
   class Container
     # @api public
@@ -97,6 +99,7 @@ module Dry
         hooks_mod = ::Module.new do
           def inherited(subclass)
             subclass.instance_variable_set(:@_container, @_container.dup)
+            subclass.instance_variable_set(:@_cache_state, @_cache_state)
             super
           end
         end
@@ -106,6 +109,7 @@ module Dry
           extend hooks_mod
 
           @_container = ::Concurrent::Hash.new
+          @_cache_state = ::Dry::Container::CacheState.new
         end
       end
 
@@ -113,6 +117,7 @@ module Dry
       module Initializer
         def initialize(*args, &block)
           @_container = ::Concurrent::Hash.new
+          @_cache_state = ::Dry::Container::CacheState.new
           super
         end
       end
@@ -137,6 +142,9 @@ module Dry
       #   The item to register with the container (if no block given)
       # @param [Hash] options
       #   Options to pass to the registry when registering the item
+      # @option options [Array<String, Symbol>] :depends_on
+      #   Keys of other registered items this item depends on. Replacing one
+      #   of them (see #replace) invalidates this item's memoized value
       # @yield
       #   If a block is given, contents will be ignored and the block
       #   will be registered instead
@@ -153,6 +161,7 @@ module Dry
         end
 
         config.registry.call(_container, key, item, options)
+        _attach_cache_state(key)
 
         self
       rescue FrozenError
@@ -160,7 +169,70 @@ module Dry
               "can't modify frozen #{self.class} (when attempting to register '#{key}')"
       end
 
+      # Replace an already registered item with a new one
+      #
+      # Memoized items that declared the replaced key as a dependency (via
+      # the +:depends_on+ option, directly or transitively) are rebuilt on
+      # next resolution; unrelated memoized items keep their identity.
+      #
+      # The replacement is atomic: if the key is not registered or building
+      # the new item fails, the original registrations are left untouched.
+      #
+      # @example
+      #   container.register("client") { Client.new }
+      #   container.register("service", memoize: true, depends_on: %w[client]) {
+      #     Service.new(container.resolve("client"))
+      #   }
+      #
+      #   container.replace("client") { NewClient.new }
+      #   container.resolve("service") # => rebuilt with the new client
+      #
+      # @param [Mixed] key
+      #   The key of the registered item to replace
+      # @param [Mixed] contents
+      #   The item to register in its place (if no block given)
+      # @param [Hash] options
+      #   Options to pass to the registry when registering the new item
+      # @yield
+      #   If a block is given, contents will be ignored and the block
+      #   will be registered instead
+      #
+      # @return [Dry::Container::Mixin] self
+      #
+      # @api public
+      def replace(key, contents = nil, options = EMPTY_HASH, &block)
+        if block_given?
+          item = block
+          options = contents if contents.is_a?(::Hash)
+        else
+          item = contents
+        end
+
+        key = key.to_s
+
+        _cache_state.replace_lock.synchronize do
+          config.registry.replace(_container, key, item, options)
+          _attach_cache_state(key)
+
+          # Bump versions only after the new registration is in place, so a
+          # memoized item that is mid-construction never publishes a value
+          # built from pre-replacement dependencies as the new cached version
+          _transitive_dependents(key).each { |dependent| _cache_state.bump(dependent) }
+          _cache_state.bump(key)
+          _cache_state.increment_epoch
+        end
+
+        self
+      rescue FrozenError
+        raise FrozenError,
+              "can't modify frozen #{self.class} (when attempting to replace '#{key}')"
+      end
+
       # Resolve an item from the container
+      #
+      # If a replacement (see #replace) happens while the resolution is in
+      # flight, the resolution is retried so a single resolution never
+      # returns a mix of pre- and post-replacement values
       #
       # @param [Mixed] key
       #   The key for the item you wish to resolve
@@ -172,7 +244,13 @@ module Dry
       #
       # @api public
       def resolve(key, &block)
-        config.resolver.call(_container, key, &block)
+        return config.resolver.call(_container, key, &block) if block
+
+        loop do
+          epoch = _cache_state.epoch
+          result = config.resolver.call(_container, key)
+          return result if epoch == _cache_state.epoch
+        end
       end
 
       # Resolve an item from the container
@@ -330,6 +408,49 @@ module Dry
       # @private no, really
       def _container
         @_container
+      end
+
+      # @private no, really
+      def _cache_state
+        @_cache_state ||= ::Dry::Container::CacheState.new
+      end
+
+      # Attaches the container's cache state to the item stored under the
+      # given key, so memoized items can detect replaced dependencies
+      #
+      # @private
+      def _attach_cache_state(key)
+        item = _container[key.to_s]
+        item.cache_state = _cache_state if item.respond_to?(:cache_state=)
+        item
+      end
+
+      # Keys of all registered items that depend on the given key, directly
+      # or transitively, via their +:depends_on+ option
+      #
+      # @private
+      def _transitive_dependents(key)
+        key = key.to_s
+        dependents = []
+
+        loop do
+          changed = false
+
+          _container.each do |registered_key, item|
+            next if registered_key == key || dependents.include?(registered_key)
+
+            dependencies = Array(item.options[:depends_on]).map(&:to_s)
+
+            if dependencies.any? { |dependency| dependency == key || dependents.include?(dependency) }
+              dependents << registered_key
+              changed = true
+            end
+          end
+
+          break unless changed
+        end
+
+        dependents
       end
 
       # @api public
