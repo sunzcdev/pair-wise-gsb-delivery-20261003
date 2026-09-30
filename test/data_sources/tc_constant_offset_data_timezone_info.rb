@@ -47,6 +47,46 @@ module DataSources
       assert_equal([OffsetTimezonePeriod.new(o)], i.periods_for_local(Timestamp.for(Time.utc(2017,1,1,0,0,0), :ignore)))
     end
 
+    def test_periods_for_local_batch
+      o = TimezoneOffset.new(-17900, 0, 'TESTLMT')
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', o)
+
+      t1 = Timestamp.for(Time.utc(2017,1,1,0,0,0), :ignore)
+      t2 = Timestamp.for(Time.utc(2018,6,1,12,30,0), :ignore)
+
+      results = i.periods_for_local_batch([t1, t2, t1])
+
+      assert_equal(3, results.length)
+      expected = [OffsetTimezonePeriod.new(o)]
+      assert_equal([expected, expected, expected], results)
+    end
+
+    def test_periods_for_local_batch_invalid_entries_isolated
+      o = TimezoneOffset.new(-17900, 0, 'TESTLMT')
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', o)
+
+      t1 = Timestamp.for(Time.utc(2017,1,1,0,0,0), :ignore)
+      with_offset = Timestamp.for(Time.utc(2017,1,1,0,0,0))
+
+      results = i.periods_for_local_batch([nil, t1, with_offset])
+
+      assert_equal(3, results.length)
+      assert_kind_of(ArgumentError, results[0])
+      assert_equal([OffsetTimezonePeriod.new(o)], results[1])
+      assert_kind_of(ArgumentError, results[2])
+    end
+
+    def test_periods_for_local_batch_empty
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', TimezoneOffset.new(-17900, 0, 'TESTLMT'))
+      assert_equal([], i.periods_for_local_batch([]))
+    end
+
+    def test_periods_for_local_batch_nil
+      i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', TimezoneOffset.new(-17900, 0, 'TESTLMT'))
+      error = assert_raises(ArgumentError) { i.periods_for_local_batch(nil) }
+      assert_equal('local_timestamps must be specified', error.message)
+    end
+
     def test_transitions_up_to
       i = ConstantOffsetDataTimezoneInfo.new('Test/Zone', TimezoneOffset.new(-17900, 0, 'TESTLMT'))
 

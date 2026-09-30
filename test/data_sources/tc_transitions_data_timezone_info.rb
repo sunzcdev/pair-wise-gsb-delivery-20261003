@@ -227,6 +227,199 @@ module DataSources
       assert_equal('local_timestamp must be specified', error.message)
     end
 
+    # A {TransitionsDataTimezoneInfo} subclass that counts how many times the
+    # transition rules are traversed by a binary search. Used to verify that the
+    # batch method shares a single traversal rather than calling the single
+    # item method repeatedly.
+    class CountingTransitionsDataTimezoneInfo < TransitionsDataTimezoneInfo
+      attr_reader :find_minimum_transition_count
+
+      def initialize(identifier, transitions)
+        super
+        @find_minimum_transition_count = 0
+      end
+
+      protected
+
+      def find_minimum_transition(&block)
+        @find_minimum_transition_count += 1
+        super
+      end
+    end
+
+    def create_batch_info
+      o1 = TimezoneOffset.new(-17900,    0, 'TESTLMT')
+      o2 = TimezoneOffset.new(-18000, 3600, 'TESTD')
+      o3 = TimezoneOffset.new(-18000,    0, 'TESTS')
+
+      t1 = TimezoneTransition.new(o2, o1, Time.utc(2000, 4,2,1,0,0).to_i)
+      t2 = TimezoneTransition.new(o3, o2, Time.utc(2000,10,2,1,0,0).to_i)
+      t3 = TimezoneTransition.new(o2, o3, Time.utc(2001, 3,2,1,0,0).to_i)
+      t4 = TimezoneTransition.new(o3, o2, Time.utc(2001,10,2,1,0,0).to_i)
+      t5 = TimezoneTransition.new(o2, o3, Time.utc(2002, 3,2,1,0,0).to_i)
+      t6 = TimezoneTransition.new(o3, o2, Time.utc(2002,10,2,1,0,0).to_i)
+
+      [CountingTransitionsDataTimezoneInfo.new('Test/Zone', [t1,t2,t3,t4,t5,t6]), [t1,t2,t3,t4,t5,t6]]
+    end
+
+    def batch_local_timestamp(year, month, day, hour, minute, second, sub_second = 0)
+      Timestamp.for(Time.utc(year, month, day, hour, minute, second + sub_second), :ignore)
+    end
+
+    def test_periods_for_local_batch_matches_single
+      i, _ = create_batch_info
+
+      inputs = [
+        batch_local_timestamp(2000, 1, 1,10, 0, 0),  # unambiguous, before first transition
+        batch_local_timestamp(2000, 4, 1,20, 1,40),  # gap (does not exist)
+        batch_local_timestamp(2000, 4, 1,20,30, 0),  # gap (does not exist)
+        batch_local_timestamp(2000, 4, 1,21, 0, 0),  # unambiguous
+        batch_local_timestamp(2000,10, 1,20, 0, 0),  # ambiguous
+        batch_local_timestamp(2000,10, 1,20,59,59),  # ambiguous
+        batch_local_timestamp(2000,10, 1,21, 0, 0),  # unambiguous
+        batch_local_timestamp(2001, 3, 1,20, 0, 0),  # gap
+        batch_local_timestamp(2001, 3, 1,21, 0, 0),  # unambiguous
+        batch_local_timestamp(2001,10, 1,20, 0, 0),  # ambiguous
+        batch_local_timestamp(2002, 3, 1,20, 0, 0),  # gap
+        batch_local_timestamp(2002,10, 1,20, 0, 0),  # ambiguous
+        batch_local_timestamp(2040, 2, 1,20, 0, 0)   # unambiguous, after last transition
+      ]
+
+      # Arbitrary (descending) order, exercising the shared forward sweep.
+      ordered = inputs.reverse
+      results = i.periods_for_local_batch(ordered)
+
+      assert_equal(ordered.length, results.length)
+
+      results.each_with_index do |result, index|
+        assert_kind_of(Array, result)
+        assert_equal(i.periods_for_local(ordered[index]), result)
+      end
+    end
+
+    def test_periods_for_local_batch_sub_second_boundaries
+      i, _ = create_batch_info
+
+      inputs = [
+        batch_local_timestamp(2000,10,1,20, 0, 0, Rational(1,2)),
+        batch_local_timestamp(2000,10,1,20, 0, 0, Rational(1,1000)),
+        batch_local_timestamp(2000,10,1,20, 0, 0, Rational(999,1000)),
+        batch_local_timestamp(2000, 4,1,20, 1,39, Rational(999,1000)),
+        batch_local_timestamp(2000, 4,1,20, 1,40, 0),
+        batch_local_timestamp(2000, 4,1,20, 1,40, Rational(1,1000))
+      ]
+
+      results = i.periods_for_local_batch(inputs)
+      results.each_with_index do |result, index|
+        assert_equal(i.periods_for_local(inputs[index]), result)
+      end
+    end
+
+    def test_periods_for_local_batch_preserves_order_and_duplicates
+      i, _ = create_batch_info
+
+      gap     = batch_local_timestamp(2000, 4, 1,20,30, 0)
+      ambiguous = batch_local_timestamp(2000,10, 1,20, 0, 0)
+      normal  = batch_local_timestamp(2000, 7, 1,12, 0, 0)
+
+      inputs = [ambiguous, gap, ambiguous, normal, gap, ambiguous]
+      results = i.periods_for_local_batch(inputs)
+
+      assert_equal(inputs.length, results.length)
+
+      gap_result = results[1]
+      ambiguous_result = results[0]
+      normal_result = results[3]
+
+      assert_equal([], gap_result)
+      assert_equal(2, ambiguous_result.length)
+      assert_equal(1, normal_result.length)
+
+      # Duplicate entries are retained as independent positions with equal
+      # results.
+      assert_equal(ambiguous_result, results[2])
+      assert_equal(ambiguous_result, results[5])
+      assert_equal(gap_result, results[4])
+
+      refute_same(ambiguous_result, results[2])
+      refute_same(ambiguous_result, results[5])
+    end
+
+    def test_periods_for_local_batch_invalid_entries_do_not_discard_others
+      i, _ = create_batch_info
+
+      normal = batch_local_timestamp(2000, 7, 1,12, 0, 0)
+      with_offset = Timestamp.for(Time.utc(2000, 7, 1,12, 0, 0))
+
+      inputs = [nil, normal, nil, with_offset, normal]
+      results = i.periods_for_local_batch(inputs)
+
+      assert_equal(inputs.length, results.length)
+
+      assert_kind_of(ArgumentError, results[0])
+      assert_equal('local_timestamp must be specified', results[0].message)
+
+      assert_equal(i.periods_for_local(normal), results[1])
+
+      assert_kind_of(ArgumentError, results[2])
+      assert_equal('local_timestamp must be specified', results[2].message)
+
+      assert_kind_of(ArgumentError, results[3])
+      assert_equal('local_timestamp must have an unspecified utc_offset', results[3].message)
+
+      assert_equal(i.periods_for_local(normal), results[4])
+    end
+
+    def test_periods_for_local_batch_empty
+      i, _ = create_batch_info
+      assert_equal([], i.periods_for_local_batch([]))
+    end
+
+    def test_periods_for_local_batch_nil
+      i, _ = create_batch_info
+      error = assert_raises(ArgumentError) { i.periods_for_local_batch(nil) }
+      assert_equal('local_timestamps must be specified', error.message)
+    end
+
+    def test_periods_for_local_batch_only_invalid_entries
+      i, _ = create_batch_info
+      results = i.periods_for_local_batch([nil, nil])
+      assert_equal(2, results.length)
+      assert(results.all? {|r| r.is_a?(ArgumentError)})
+    end
+
+    def test_periods_for_local_batch_shares_single_rule_traversal
+      i, transitions = create_batch_info
+
+      inputs = [
+        batch_local_timestamp(2000, 1, 1,10, 0, 0),
+        batch_local_timestamp(2000, 4, 1,20,30, 0),
+        batch_local_timestamp(2000, 4, 1,21, 0, 0),
+        batch_local_timestamp(2000,10, 1,20, 0, 0),
+        batch_local_timestamp(2000,10, 1,21, 0, 0),
+        batch_local_timestamp(2001, 3, 1,20, 0, 0),
+        batch_local_timestamp(2001,10, 1,20, 0, 0),
+        batch_local_timestamp(2002, 3, 1,20, 0, 0),
+        batch_local_timestamp(2002,10, 1,20, 0, 0)
+      ]
+
+      # Arbitrary order plus duplicates.
+      batch_inputs = inputs.reverse + inputs.first(3)
+      i.periods_for_local_batch(batch_inputs)
+
+      # The whole batch (spanning many offset changes) must traverse the rules
+      # only once, regardless of how many entries are supplied.
+      assert_equal(1, i.find_minimum_transition_count)
+
+      # Repeatedly calling the single item method for the same entries must
+      # traverse the rules once per entry, demonstrating that the batch method
+      # is genuinely sharing the traversal and not looping the single item
+      # method.
+      looped = CountingTransitionsDataTimezoneInfo.new('Test/Zone', transitions)
+      batch_inputs.each {|t| looped.periods_for_local(t) }
+      assert_equal(batch_inputs.length, looped.find_minimum_transition_count)
+    end
+
     def test_transitions_up_to
       o1 = TimezoneOffset.new(-17900,    0, 'TESTLMT')
       o2 = TimezoneOffset.new(-18000, 3600, 'TESTD')

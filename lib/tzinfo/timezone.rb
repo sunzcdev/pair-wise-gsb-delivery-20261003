@@ -343,6 +343,47 @@ module TZInfo
       raise_unknown_timezone
     end
 
+    # Returns the sets of {TimezonePeriod}s that are valid for each of the
+    # given local times.
+    #
+    # This is the batch equivalent of {periods_for_local}. The local times may
+    # be supplied in any order and may be repeated. The result is an `Array`
+    # with one element for each entry of `local_times`, preserving the original
+    # order, with duplicate entries preserved as independent positions.
+    #
+    # Each result element is an `Array` of {TimezonePeriod}s:
+    #
+    # * an empty `Array` indicates that the local time does not exist (for
+    #   example, during the transition from standard time to daylight savings
+    #   time);
+    # * an `Array` containing a single {TimezonePeriod} indicates an
+    #   unambiguous local time;
+    # * an `Array` containing multiple {TimezonePeriod}s indicates an
+    #   ambiguous local time (for example, when daylight savings time ends).
+    #
+    # An invalid entry (for example `nil` or a value that cannot be converted
+    # to a {Timestamp}) does not prevent the other entries from being resolved.
+    # The corresponding result position contains the {ArgumentError} that
+    # {periods_for_local} would have raised when given that entry.
+    #
+    # For time zones defined by transitions, the transition rules are
+    # traversed only once for the whole batch (rather than repeating the
+    # {periods_for_local} lookup for each entry).
+    #
+    # The UTC offset of each `local_times` entry is ignored (it is treated as a
+    # time in the time zone represented by `self`).
+    #
+    # @param local_times [Enumerable<Object>] an `Enumerable` of `Time`,
+    #   `DateTime` or {Timestamp} instances.
+    # @return [Array<Array<TimezonePeriod>>] an `Array` containing the set of
+    #   {TimezonePeriod}s that are valid for each local time, in the same order
+    #   as `local_times`. Invalid entries are represented by the
+    #   {ArgumentError} that {periods_for_local} would have raised.
+    # @raise [ArgumentError] if `local_times` is `nil`.
+    def periods_for_local_batch(local_times)
+      raise_unknown_timezone
+    end
+
     # Returns an `Array` of {TimezoneTransition} instances representing the
     # times where the UTC offset of the timezone changes.
     #

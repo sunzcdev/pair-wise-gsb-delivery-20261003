@@ -19,6 +19,31 @@ module TZInfo
       info.periods_for_local(Timestamp.for(local_time, :ignore))
     end
 
+    # (see Timezone#periods_for_local_batch)
+    def periods_for_local_batch(local_times)
+      raise ArgumentError, 'local_times must be specified' unless local_times
+
+      results = []
+      valid = []
+
+      local_times.each_with_index do |local_time, index|
+        begin
+          raise ArgumentError, 'local_time must be specified' unless local_time
+          valid << [index, Timestamp.for(local_time, :ignore)]
+        rescue ArgumentError => e
+          results[index] = e
+        end
+      end
+
+      unless valid.empty?
+        info.periods_for_local_batch(valid.map {|_, timestamp| timestamp }).each_with_index do |result, i|
+          results[valid[i].first] = result
+        end
+      end
+
+      results
+    end
+
     # (see Timezone#transitions_up_to)
     def transitions_up_to(to, from = nil)
       raise ArgumentError, 'to must be specified' unless to

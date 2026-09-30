@@ -36,6 +36,35 @@ module TZInfo
         [constant_period]
       end
 
+      # Returns an `Array` containing the single unbounded {TimezonePeriod} for
+      # each of the local times specified by `local_timestamps`.
+      #
+      # Invalid entries do not prevent the remaining entries from being
+      # resolved: the corresponding result position contains the
+      # {ArgumentError} that would have been raised by {periods_for_local}.
+      #
+      # @param local_timestamps [Enumerable] an `Enumerable` of local times,
+      #   each represented as a {Timestamp} with an unspecified
+      #   {Timestamp#utc_offset utc_offset}.
+      # @return [Array<Array<TimezonePeriod>>] an `Array` containing a
+      #   single-element `Array` of the {TimezonePeriod} for each valid local
+      #   timestamp, or an {ArgumentError} for each invalid entry.
+      # @raise [ArgumentError] if `local_timestamps` is `nil`.
+      def periods_for_local_batch(local_timestamps)
+        raise ArgumentError, 'local_timestamps must be specified' unless local_timestamps
+
+        local_timestamps.map do |local_timestamp|
+          begin
+            raise ArgumentError, 'local_timestamp must be specified' unless local_timestamp
+            raise ArgumentError, 'local_timestamp must have an unspecified utc_offset' if local_timestamp.utc_offset
+          rescue ArgumentError => e
+            next e
+          end
+
+          [constant_period]
+        end
+      end
+
       # @param to_timestamp [Timestamp] ignored.
       # @param from_timestamp [Timestamp] ignored.
       # @return [Array] an empty `Array`, since there are no transitions in time

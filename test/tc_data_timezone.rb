@@ -11,6 +11,7 @@ class TCDataTimezone < Minitest::Test
     attr_reader :local_timestamp
     attr_reader :to_timestamp
     attr_reader :from_timestamp
+    attr_reader :batch_local_timestamps
 
     def initialize(identifier, period_for_result, periods_for_local_result, transitions_up_to_result)
       super(identifier)
@@ -33,6 +34,19 @@ class TCDataTimezone < Minitest::Test
 
       @local_timestamp = local_timestamp
       @periods_for_local_result
+    end
+
+    def periods_for_local_batch(local_timestamps)
+      raise ArgumentError, 'local_timestamps must be specified' unless local_timestamps
+
+      @batch_local_timestamps = []
+      local_timestamps.map do |local_timestamp|
+        raise ArgumentError, 'local_timestamp must be specified' unless local_timestamp
+        raise ArgumentError, 'local_timestamp must have an unspecified utc_offset' if local_timestamp.utc_offset
+
+        @batch_local_timestamps << local_timestamp
+        @periods_for_local_result
+      end
     end
 
     def transitions_up_to(to_timestamp, from_timestamp = nil)
@@ -192,6 +206,104 @@ class TCDataTimezone < Minitest::Test
 
     error = assert_raises(ArgumentError) { tz.periods_for_local(nil) }
     assert_match(/\blocal_time\b/, error.message)
+  end
+
+  def test_periods_for_local_batch
+    time_types_test(:unspecified_offset) do |h|
+      periods = [Object.new, Object.new]
+      tti = TestTimezoneInfo.new('Test/Zone', nil, periods, [])
+      tz = DataTimezone.new(tti)
+
+      t1 = h.time(2006, 6, 27, 22, 50, 12, Rational(1,10))
+      t2 = h.time(2006, 6, 27, 23, 50, 12, Rational(1,10))
+
+      results = tz.periods_for_local_batch([t1, t2])
+
+      assert_equal(2, results.length)
+      assert_same(periods, results[0])
+      assert_same(periods, results[1])
+
+      assert_equal([
+        Timestamp.create(2006, 6, 27, 22, 50, 12, Rational(1,10)),
+        Timestamp.create(2006, 6, 27, 23, 50, 12, Rational(1,10))
+      ], tti.batch_local_timestamps)
+    end
+  end
+
+  def test_periods_for_local_batch_utc_and_offset_ignored
+    time_types_test(:utc) do |h|
+      periods = [Object.new]
+      tti = TestTimezoneInfo.new('Test/Zone', nil, periods, [])
+      tz = DataTimezone.new(tti)
+
+      t_utc = h.time(2006, 6, 27, 22, 50, 12, Rational(1,10), :utc)
+      t_off = h.time(2006, 6, 27, 22, 50, 12, Rational(1,10), 3600)
+
+      results = tz.periods_for_local_batch([t_utc, t_off])
+
+      assert_equal(2, results.length)
+      assert(results.all? {|r| r.equal?(periods)})
+
+      # Both represent the same wall-clock time (22:50:12.1), so once offsets
+      # are ignored they are converted to the same unspecified Timestamp.
+      expected = Timestamp.create(2006, 6, 27, 22, 50, 12, Rational(1,10))
+      assert_equal([expected, expected], tti.batch_local_timestamps)
+    end
+  end
+
+  def test_periods_for_local_batch_preserves_order_and_duplicates
+    periods = [Object.new]
+    tti = TestTimezoneInfo.new('Test/Zone', nil, periods, [])
+    tz = DataTimezone.new(tti)
+
+    t = Time.utc(2006, 6, 27, 22, 50, 12)
+    results = tz.periods_for_local_batch([t, t, t])
+
+    assert_equal(3, results.length)
+    assert(results.all? {|r| r.equal?(periods)})
+    assert_equal(3, tti.batch_local_timestamps.length)
+  end
+
+  def test_periods_for_local_batch_invalid_entries_isolated
+    periods = [Object.new]
+    tti = TestTimezoneInfo.new('Test/Zone', nil, periods, [])
+    tz = DataTimezone.new(tti)
+
+    good = Time.utc(2006, 6, 27, 22, 50, 12)
+    unsupported = 42
+
+    results = tz.periods_for_local_batch([nil, good, unsupported, good])
+
+    assert_equal(4, results.length)
+
+    assert_kind_of(ArgumentError, results[0])
+    assert_match(/\blocal_time\b/, results[0].message)
+
+    assert_same(periods, results[1])
+
+    assert_kind_of(ArgumentError, results[2])
+    assert_match(/\bInteger\b/, results[2].message)
+
+    assert_same(periods, results[3])
+
+    # Only the valid entries are passed through to the shared batch info call.
+    assert_equal(2, tti.batch_local_timestamps.length)
+  end
+
+  def test_periods_for_local_batch_empty
+    tti = TestTimezoneInfo.new('Test/Zone', nil, [], [])
+    tz = DataTimezone.new(tti)
+
+    assert_equal([], tz.periods_for_local_batch([]))
+    assert_nil(tti.batch_local_timestamps)
+  end
+
+  def test_periods_for_local_batch_nil
+    tti = TestTimezoneInfo.new('Test/Zone', Object.new, [], [])
+    tz = DataTimezone.new(tti)
+
+    error = assert_raises(ArgumentError) { tz.periods_for_local_batch(nil) }
+    assert_equal('local_times must be specified', error.message)
   end
 
   def test_periods_for_local_unsupported
