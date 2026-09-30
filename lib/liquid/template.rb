@@ -137,6 +137,8 @@ module Liquid
     #  * <tt>filters</tt> : array with local filters
     #  * <tt>registers</tt> : hash with register variables. Those can be accessed from
     #    filters and tags and might be useful to integrate liquid more with its host application
+    #  * <tt>drop_access_policy</tt> : a <tt>Liquid::DropAccessPolicy</tt> restricting which
+    #    drop attributes are visible during this render
     #
     def render(*args)
       return '' if @root.nil?
@@ -244,6 +246,7 @@ module Liquid
       context.exception_renderer = options[:exception_renderer] if options[:exception_renderer]
       context.strict_variables   = options[:strict_variables] if options[:strict_variables]
       context.strict_filters     = options[:strict_filters] if options[:strict_filters]
+      context.drop_access_policy = options[:drop_access_policy] if options[:drop_access_policy]
     end
   end
 end

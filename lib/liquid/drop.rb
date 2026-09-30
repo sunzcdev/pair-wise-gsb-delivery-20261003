@@ -37,11 +37,27 @@ module Liquid
 
     # called by liquid to invoke a drop
     def invoke_drop(method_or_key)
-      if self.class.invokable?(method_or_key)
+      policy = @context&.drop_access_policy
+      node   = policy&.node_for(self)
+
+      if node && !node.key?(method_or_key.to_s)
+        # Denied by the render's access policy. Reject before any method is
+        # invoked, mirroring the strict/non-strict variable behavior.
+        return nil unless @context&.strict_variables
+        raise Liquid::UndefinedDropMethod, "undefined method #{method_or_key}"
+      end
+
+      result = if self.class.invokable?(method_or_key)
         send(method_or_key)
       else
         liquid_method_missing(method_or_key)
       end
+
+      if node && (sub_node = node[method_or_key.to_s])
+        result = policy.constrain_value(result, sub_node)
+      end
+
+      result
     end
 
     def key?(_name)
@@ -61,6 +77,19 @@ module Liquid
     end
 
     alias_method :[], :invoke_drop
+
+    # @private Called by Liquid::DropAccessPolicy to scope this drop to a
+    # rule node for the duration of a render.
+    def liquid_constrain_access(policy, node)
+      @liquid_access_scope = [policy, node]
+    end
+
+    # @private Returns the rule node this drop was scoped to by the given
+    # policy, or nil when it is not scoped under that policy.
+    def liquid_access_scope_for(policy)
+      scope = @liquid_access_scope
+      scope[1] if scope && scope[0].equal?(policy)
+    end
 
     # Check for method existence without invoking respond_to?, which creates symbols
     def self.invokable?(method_name)
