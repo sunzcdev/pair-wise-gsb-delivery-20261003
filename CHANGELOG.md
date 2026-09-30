@@ -8,6 +8,8 @@
 
 ### New features
 
+- `GraphQL::Analysis::FieldPresence`: symbolic, pre-execution analysis of whether a field at a response path is always present, never present, or depends on variables — understanding `@skip`, `@include`, variable defaults, fragments and type conditions, without invoking resolvers
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

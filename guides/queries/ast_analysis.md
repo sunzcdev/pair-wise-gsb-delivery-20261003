@@ -138,3 +138,33 @@ Analyzers are initialized with the _unit of analysis_, available as `subject`.
 When analyzers are hooked up to multiplexes, `query` is `nil`, but `multiplex` returns the subject of analysis. You can use `visitor.query` inside visit methods to reference the query that owns the current AST node.
 
 Note that some built-in analyzers (eg `AST::MaxQueryDepth`) support multiplexes even though `Query` is in their name.
+
+## Will a field appear in the response?
+
+Sometimes a service needs to know, _before execution_, whether a field can appear in a response. A naive scan for the field name gives the wrong answer whenever `@skip`, `@include`, fragment type conditions or variables are involved. {{ "GraphQL::Analysis::FieldPresence" | api_doc }} performs a symbolic analysis instead — no resolvers are called.
+
+```ruby
+result = GraphQL::Analysis::FieldPresence.analyze(
+  MySchema,
+  query_string_or_document_or_query,
+  %w[order auditTrail],
+)
+
+case result.verdict
+when :always_present
+  # selected for every variable assignment and every possible runtime type
+when :never_present
+  # no route selects it (absent, @skip(if: true), impossible type condition, ...)
+when :depends_on_variables
+  # reachable for some inputs; result.scenarios lists reviewable witnesses
+end
+```
+
+For `:depends_on_variables`, each `result.scenarios` entry contains:
+
+- `variables`: a concrete variable assignment that makes the field appear (variables whose declared default already satisfies the gate are omitted)
+- `type_candidates`: at each path depth, the concrete object types on which the field is selected along that route
+- `selection_trail`: the fields, fragment spreads, inline type conditions and directives (with line numbers) forming the route
+- `unknown_gates`: directives or conditions that couldn't be interpreted symbolically
+
+Custom directives are never assumed to behave like `@include`/`@skip`. A route through an unrecognized directive is reported with an entry in `unknown_gates` and can never establish `:always_present` on its own.
