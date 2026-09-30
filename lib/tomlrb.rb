@@ -10,6 +10,7 @@ require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
 require 'tomlrb/handler'
+require 'tomlrb/dumper'
 
 module Tomlrb
   class ParseError < StandardError; end
@@ -45,5 +46,14 @@ module Tomlrb
     # locale encoding or the interpreter -E option.
     tmp = File.read(path, encoding: 'utf-8')
     Tomlrb.parse(tmp, **options)
+  end
+
+  # Serializes a Ruby Hash into a TOML string
+  #
+  # @param hash [Hash] the Ruby data structure to serialize
+  # @return [String] the TOML representation of the input
+  # @raise [DumpError] when a value cannot be represented in TOML
+  def self.dump(hash)
+    Dumper.new(hash).to_toml
   end
 end
