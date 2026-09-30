@@ -1,0 +1,12 @@
+require_relative '../function'
+
+Dentaku::AST::Function.register(:mul, :numeric, ->(*args) {
+  if args.empty?
+    raise Dentaku::ArgumentError.for(
+        :too_few_arguments,
+        function_name: 'MUL', expected: 1.., actual: 0
+    )
+  end
+
+  args.flatten.map { |arg| Dentaku::NumericParser.ensure_numeric!(arg) }.reduce(1, :*)
+})

@@ -1,0 +1,60 @@
+# import all functions from Ruby's Math module
+require_relative '../function'
+
+module Dentaku
+  module AST
+    class RubyMath < Function
+      def self.[](method)
+        klass_name = method.to_s.capitalize
+        klass = const_set(klass_name , Class.new(self))
+        klass.implement(method)
+        const_get(klass_name)
+      end
+
+      def self.implement(method)
+        @name = method
+        @implementation = Math.method(method)
+      end
+
+      # Ruby documents Module#name as a String (or nil for anonymous
+      # classes), so expose one even though the function is registered
+      # under a Symbol
+      def self.name
+        @name.to_s
+      end
+
+      def self.arity
+        @implementation.arity < 0 ? nil : @implementation.arity
+      end
+
+      def self.min_param_count
+        @implementation.parameters.select { |type, _name| type == :req }.count
+      end
+
+      def self.max_param_count
+        @implementation.parameters.select { |type, _name| type == :rest }.any? ? Float::INFINITY : @implementation.parameters.count
+      end
+
+      def self.call(*args)
+        @implementation.call(*args)
+      rescue Math::DomainError => _e
+        raise Dentaku::MathDomainError.new(name, args)
+      end
+
+      def value(context = {})
+        args = @args.flatten.map { |a|Dentaku::NumericParser.ensure_numeric!(a.value(context)) }
+        self.class.call(*args)
+      end
+
+      ARRAY_RETURN_TYPES = [:frexp, :lgamma].freeze
+
+      def type
+        ARRAY_RETURN_TYPES.include?(@name) ? :array : :numeric
+      end
+    end
+  end
+end
+
+Math.methods(false).each do |method|
+  Dentaku::AST::Function.register_class(method, Dentaku::AST::RubyMath[method])
+end

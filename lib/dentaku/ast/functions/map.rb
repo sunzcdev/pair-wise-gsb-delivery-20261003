@@ -4,7 +4,8 @@ module Dentaku
   module AST
     class Map < Enum
       def value(context = {})
-        collection      = Array(@args[0].value(context))
+        collection      = collection_value(context)
+        reject_streaming!(collection, context)
         item_identifier = @args[1].identifier
         expression      = @args[2]
 

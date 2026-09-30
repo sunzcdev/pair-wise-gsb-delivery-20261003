@@ -1,13 +1,47 @@
-require_relative '../function'
+require 'bigdecimal'
+require_relative './aggregate'
 
-Dentaku::AST::Function.register(:avg, :numeric, ->(*args) {
-  flatten_args = args.flatten
-  if flatten_args.empty?
-    raise Dentaku::ArgumentError.for(
-        :too_few_arguments,
-        function_name: 'AVG', expected: 1.., actual: 0
-    )
+module Dentaku
+  module AST
+    class Avg < Aggregate
+      def self.min_param_count
+        0
+      end
+
+      private
+
+      def fold_values(values)
+        raise_too_few! if values.empty?
+
+        values.reduce(0, :+) / BigDecimal(values.length)
+      end
+
+      def fold(memo, value)
+        memo + value
+      end
+
+      def initial_value
+        0
+      end
+
+      def finalize_stream(memo, count)
+        raise_too_few! if count.zero?
+
+        memo / BigDecimal(count)
+      end
+
+      def raise_too_few!
+        raise Dentaku::ArgumentError.for(
+          :too_few_arguments,
+          function_name: 'AVG', expected: 1.., actual: 0
+        )
+      end
+
+      def raise_empty_args!
+        raise_too_few!
+      end
+    end
   end
+end
 
-  flatten_args.map { |arg| Dentaku::NumericParser.ensure_numeric!(arg) }.reduce(0, :+) / BigDecimal(flatten_args.length)
-})
+Dentaku::AST::Function.register_class(:avg, Dentaku::AST::Avg)

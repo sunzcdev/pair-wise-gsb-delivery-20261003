@@ -89,6 +89,7 @@ end
 describe TestVisitor do
   def generic_subclasses
     [
+      :Aggregate,
       :Arithmetic,
       :Bitwise,
       :Combinator,
@@ -117,6 +118,11 @@ describe TestVisitor do
     visit_nodes('ALL({1, 2, 3}, val, val % 2 == 0)')
     visit_nodes('ANY(vals, val, val > 1)')
     visit_nodes('COUNT({1, 2, 3})')
+    visit_nodes('SUM({1, 2})')
+    visit_nodes('AVG({1, 2})')
+    visit_nodes('MIN({1, 2})')
+    visit_nodes('MAX({1, 2})')
+    visit_nodes('MUL({1, 2})')
     visit_nodes('PLUCK(users, age)')
     visit_nodes('XOR(false, false)')
     visit_nodes('duration(1, day)')

@@ -3,6 +3,7 @@ require 'dentaku/dependency_resolver'
 require 'dentaku/exceptions'
 require 'dentaku/flat_hash'
 require 'dentaku/parser'
+require 'dentaku/streaming'
 require 'dentaku/string_casing'
 require 'dentaku/token'
 
@@ -76,6 +77,12 @@ module Dentaku
       context = evaluation_context(data, :strict)
       return evaluate_array!(expression, context, &block) if expression.is_a? Array
 
+      context = context.merge(
+        Dentaku::Streaming::CONTEXT_SESSION_KEY => Dentaku::Streaming::Session.new,
+        Dentaku::Streaming::CONTEXT_FORMULA_KEY =>
+          expression.is_a?(String) ? expression : expression.inspect
+      )
+
       store(context) do
         node = ast(expression)
         unbound = node.dependencies(memory)
@@ -85,7 +92,7 @@ module Dentaku
                 "no value provided for variables: #{unbound.uniq.join(', ')}"
         end
 
-        node.value(memory)
+        evaluate_node(node)
       end
     end
 
@@ -236,6 +243,17 @@ module Dentaku
 
     def cache_dependency_order?
       @cache_dependency_order.nil? ? Dentaku.cache_dependency_order? : @cache_dependency_order
+    end
+
+    private
+
+    def evaluate_node(node)
+      node.value(memory)
+    rescue Dentaku::StreamError => e
+      raise e if e.formula
+
+      e.formula = memory[Dentaku::Streaming::CONTEXT_FORMULA_KEY]
+      raise e
     end
   end
 end

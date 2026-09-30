@@ -1,5 +1,6 @@
 require_relative '../function'
 require_relative '../../exceptions'
+require_relative '../../streaming'
 
 module Dentaku
   module AST
@@ -36,18 +37,29 @@ module Dentaku
       end
 
       def value(context = {})
-        collection      = Array(@args[0].value(context))
+        raw_collection  = @args[0].value(context)
+        streaming       = Dentaku::Streaming.stream?(raw_collection)
+        collection      = streaming ? Dentaku::Streaming.wrap(raw_collection, context) : Array(raw_collection)
         memo_identifier = @args[1].identifier
         item_identifier = @args[2].identifier
         expression      = @args[3]
         initial_value   = @args[4] && @args[4].value(context)
 
-        collection.reduce(initial_value) do |memo, item|
+        fold = lambda do |memo, item|
           expression.value(
             context.merge(
               FlatHash.from_hash_with_intermediates(memo_identifier => memo, item_identifier => item)
             )
           )
+        end
+
+        begin
+          collection.reduce(initial_value, &fold)
+        rescue Dentaku::StreamError => e
+          raise e if e.formula
+
+          e.formula = Dentaku::Streaming.formula_location(context, self)
+          raise e
         end
       end
 

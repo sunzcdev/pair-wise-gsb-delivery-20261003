@@ -159,6 +159,7 @@ module Dentaku
       invalid_value
       too_few_arguments
       wrong_number_of_arguments
+      streaming_unsupported
     ].freeze
 
     def self.for(reason, **meta)
@@ -193,6 +194,9 @@ module Dentaku
         "#{meta[:function_name]}() has too few arguments (given #{meta[:actual]}, expected #{expected_count})"
       when :wrong_number_of_arguments
         "#{meta[:function_name]}() has the wrong number of arguments (given #{meta[:actual]}, expected #{expected_count})"
+      when :streaming_unsupported
+        "#{meta[:function_name]}() cannot consume a streaming sequence; " \
+          "supported operations are #{meta[:supported].join(', ')}"
       end
     end
 
@@ -204,5 +208,113 @@ module Dentaku
 
   class ZeroDivisionError < ::ZeroDivisionError
     include Error
+  end
+
+  # Base class for failures while reading a lazy, length-aware streaming
+  # sequence. Every instance carries the data range that was being read and
+  # the formula location that requested it.
+  class StreamError < BaseError
+    attr_reader :source_object, :range, :operation, :cause_error
+    attr_reader :formula
+
+    def initialize(source: nil, range: nil, operation: nil, formula: nil, cause_error: nil)
+      @source_object = source
+      @source = source_name(source)
+      @range = format_range(range)
+      @operation = operation
+      @cause_error = cause_error
+      @formula = formula
+      @mesg = build_message
+      super(@mesg)
+    end
+
+    def source
+      source_name(@source_object)
+    end
+
+    def formula=(formula)
+      @formula = formula
+      rebuild_message!
+    end
+
+    def message
+      @mesg
+    end
+
+    private
+
+    def source_name(source)
+      source.respond_to?(:dentaku_stream_name) ? source.dentaku_stream_name : source.class.name
+    end
+
+    def format_range(range)
+      return if range.nil?
+
+      if range.is_a?(Range)
+        "#{range.begin}..#{range.end}"
+      else
+        range.to_s
+      end
+    end
+
+    def context
+      details = []
+      details << "source #{@source}" if @source
+      details << "range #{@range}" if @range
+      details << "operation #{@operation}" if @operation
+      details << "formula #{@formula}" if @formula
+      details.empty? ? nil : "(#{details.join(', ')})"
+    end
+
+    def rebuild_message!
+      @mesg = build_message
+    end
+
+    def cause_description
+      return unless cause_error
+
+      cause_error.respond_to?(:message) ? cause_error.message : cause_error.to_s
+    end
+  end
+
+  # Raised when the backing data source fails while answering a window read.
+  class StreamReadError < StreamError
+    private
+
+    def build_message
+      message = "failed to read streaming sequence"
+      suffix = context
+      message = "#{message} #{suffix}" if suffix
+      message = "#{message}: #{cause_description}" if cause_error
+      message
+    end
+  end
+
+  # Raised when the backing data source fails while answering a length query.
+  class StreamLengthError < StreamError
+    private
+
+    def build_message
+      message = "failed to determine streaming sequence length"
+      suffix = context
+      message = "#{message} #{suffix}" if suffix
+      message = "#{message}: #{cause_description}" if cause_error
+      message
+    end
+  end
+
+  # Raised when a data source claiming to speak the streaming protocol
+  # answers a window read with a value that is not an array or with a size
+  # that does not match the requested range.
+  class StreamProtocolError < StreamError
+    private
+
+    def build_message
+      message = "streaming data source violated the protocol"
+      suffix = context
+      message = "#{message} #{suffix}" if suffix
+      message = "#{message}: #{cause_description}" if cause_error
+      message
+    end
   end
 end

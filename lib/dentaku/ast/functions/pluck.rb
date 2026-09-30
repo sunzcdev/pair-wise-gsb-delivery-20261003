@@ -13,7 +13,8 @@ module Dentaku
       end
 
       def value(context = {})
-        collection = Array(@args[0].value(context))
+        collection = collection_value(context)
+        reject_streaming!(collection, context)
 
         unless collection.all? { |elem| elem.is_a?(Hash) }
           raise ArgumentError.for(:incompatible_type, actual: collection),

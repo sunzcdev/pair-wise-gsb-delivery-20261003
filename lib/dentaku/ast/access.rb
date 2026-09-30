@@ -1,5 +1,6 @@
 require_relative "../exceptions"
 require_relative "./node"
+require_relative "../streaming"
 
 module Dentaku
   module AST
@@ -27,6 +28,10 @@ module Dentaku
         structure = @structure.value(context)
         index = @index.value(context)
 
+        if Dentaku::Streaming.stream?(structure)
+          return stream_access(structure, index, context)
+        end
+
         unless structure.respond_to?(:[]) && !structure.is_a?(::Numeric)
           raise Dentaku::ArgumentError.for(:incompatible_type, actual: structure),
                 "#{self.class} requires an indexable structure, but got #{structure.class}"
@@ -52,6 +57,31 @@ module Dentaku
       end
 
       private
+
+      def stream_access(structure, index, context)
+        unless index.nil? || index.is_a?(::Integer)
+          raise Dentaku::ArgumentError.for(
+            :incompatible_type,
+            actual: index, expected: Integer
+          ), "streaming sequences only support integer index access (got #{index.inspect}) " \
+             "at #{Dentaku::Streaming.formula_location(context, self)}"
+        end
+
+        sequence = Dentaku::Streaming.wrap(structure, context)
+        begin
+          sequence[index]
+        rescue Dentaku::StreamError => e
+          annotate_stream_error(e, context)
+        end
+      end
+
+      def annotate_stream_error(error, context)
+        raise error if error.formula
+
+        location = Dentaku::Streaming.formula_location(context, self)
+        error.formula = location
+        raise error
+      end
 
       def compute_pure?
         @structure.pure? && @index.pure?

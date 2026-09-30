@@ -1,5 +1,22 @@
 # Change Log
 
+## [Unreleased]
+- long sampled sequences can now be bound as streaming inputs instead of
+  in-memory arrays. A data source implements `dentaku_stream?`,
+  `dentaku_stream_length`, and windowed `dentaku_stream_read(range)` (plus
+  optional `dentaku_stream_name` and `dentaku_stream_window_size`);
+  `Dentaku::Streaming::Base` provides the same protocol with only `#length`
+  and `#read_window` to implement. Sequences are read in fixed-size windows
+  and never materialized implicitly. Integer indexing, `COUNT`, `SUM`,
+  `AVG`, `MIN`, `MAX`, `MUL`, `ANY`/`ALL` (short-circuiting, including
+  through `IF`/`CASE`/`AND`/`OR`), and `REDUCE` consume the stream; `MAP`,
+  `FILTER`, and `PLUCK` raise `Dentaku::ArgumentError` with reason
+  `:streaming_unsupported`. Repeated reads within one calculation share one
+  cached snapshot; each evaluation starts a fresh one. Read and length
+  failures raise `Dentaku::StreamReadError` / `Dentaku::StreamLengthError`
+  carrying the source, data range, and formula location, and protocol
+  violations raise `Dentaku::StreamProtocolError`.
+
 ## [v4.0.2] 2026-08-02
 - the 4.0.1 guard against arithmetic that rejects a well-typed operand only
   worked on Ruby 3.4+. Ruby 3.2 and 3.3 do not raise for an oversized

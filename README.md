@@ -218,6 +218,76 @@ String: `LEFT`, `RIGHT`, `MID`, `LEN`, `FIND`, `SUBSTITUTE`, `CONCAT`, `CONTAINS
 
 Collection: `MAP`, `FILTER`, `ALL`, `ANY`, `PLUCK`
 
+STREAMING INPUTS
+----------------
+
+Some inputs are long sampled sequences (sensor exports, paginated APIs,
+large files) that cannot be held in memory. Dentaku can consume such inputs
+through a small, length-aware protocol instead of an Array:
+
+```ruby
+class SensorFeed
+  def dentaku_stream?
+    true
+  end
+
+  def dentaku_stream_length
+    @row_count           # Integer, zero-based total sample count
+  end
+
+  # range is an inclusive, zero-based Range, always smaller than the
+  # whole sequence; return the samples it covers as an Array
+  def dentaku_stream_read(range)
+    @source.rows(offset: range.begin, limit: range.size)
+  end
+
+  # optional
+  def dentaku_stream_name
+    "sensor-a"           # used in error messages
+  end
+
+  # optional: preferred window size for dentaku_stream_read
+  def dentaku_stream_window_size
+    512
+  end
+end
+
+calc.store(samples: SensorFeed.new)
+calc.evaluate!("SUM(samples)")
+```
+
+Dentaku never reads the full sequence and never materializes one
+implicitly. The sequence is read in fixed-size windows, and windows fetched
+more than once during the same calculation are served from one cached
+snapshot, so repeated reads always agree even if the backing data changes
+mid-calculation. Each evaluation gets a fresh snapshot.
+
+Operations that stream:
+
+- integer index access: `samples[42]` (out of range and negative indexes
+  return `nil` without reading)
+- `COUNT` (uses the length only)
+- aggregates: `SUM`, `AVG`, `MIN`, `MAX`, `MUL`
+- predicates `ANY` and `ALL`, which stop reading as soon as the result is
+  decided (and short-circuit normally inside `IF`, `CASE`, `AND`, `OR`)
+- `REDUCE`, folded in read order
+
+`MAP`, `FILTER`, and `PLUCK` cannot produce their result without the whole
+sequence, so on a streaming input they raise
+`Dentaku::ArgumentError` (`reason == :streaming_unsupported`) listing the
+supported operations, instead of silently loading everything. Materialize
+the data yourself (e.g. with an explicit bounded query) if you need them.
+
+When a data source fails, Dentaku raises a `Dentaku::StreamReadError` or
+`Dentaku::StreamLengthError` carrying the source name, the data range being
+read, and the formula location; a source that answers a read with a
+wrong-sized or non-Array value raises `Dentaku::StreamProtocolError`. In
+permissive (`Calculator#evaluate`) mode a failed read yields `nil`.
+
+A convenience base class is available: subclass
+`Dentaku::Streaming::Base` and implement `#length` and
+`#read_window(range)`.
+
 RESOLVING DEPENDENCIES
 ----------------------
 
