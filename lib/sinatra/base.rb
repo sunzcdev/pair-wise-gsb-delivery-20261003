@@ -20,6 +20,7 @@ require 'uri'
 
 # other files we need
 require 'sinatra/indifferent_hash'
+require 'sinatra/param_sources'
 require 'sinatra/show_exceptions'
 require 'sinatra/version'
 
@@ -994,6 +995,7 @@ module Sinatra
     def call!(env) # :nodoc:
       @env      = env
       @params   = IndifferentHash.new
+      @param_sources = nil
       @request  = Request.new(env)
       @response = Response.new
       @pinned_response = nil
@@ -1021,6 +1023,13 @@ module Sinatra
     # Access settings defined with Base.set.
     def settings
       self.class.settings
+    end
+
+    # Provenance view of the request parameters: which values were captured
+    # by the route pattern, which came from the query string and which from
+    # the request body. See Sinatra::ParamSources.
+    def param_sources
+      @param_sources ||= ParamSources.new(@request)
     end
 
     # Exit the current block, halts any further processing
@@ -1116,6 +1125,11 @@ module Sinatra
         values += params.values.flatten
       end
 
+      route_params = params
+      route_params = params.merge('captures' => @params[:captures]) if regexp_exists && captures && !captures.empty?
+      param_sources.track_route(route_params)
+      enforce_param_policies!
+
       catch(:pass) do
         conditions.each { |c| throw :pass if c.bind(self).call == false }
         block ? block[self, values] : yield(self, values)
@@ -1126,6 +1140,7 @@ module Sinatra
     ensure
       params ||= {}
       params.each { |k, _| @params.delete(k) } unless @env['sinatra.error.params']
+      @param_sources&.clear_route
     end
 
     # No matching route was found or all routes passed. The default
@@ -1137,6 +1152,52 @@ module Sinatra
       raise NotFound unless @app
 
       forward
+    end
+
+    # Enforce the parameter policies declared with Base.param_policy against
+    # the current parameter sources. Runs before the route block, so a
+    # rejected request never reaches application code. Without policies the
+    # default params merge behavior is left untouched.
+    def enforce_param_policies!
+      policies = settings.param_policies
+      return if policies.nil? || policies.empty?
+
+      policies.each do |name, policy|
+        found = ParamSources::SOURCES.filter_map do |source|
+          value = param_sources.value_at(source, name)
+          [source, value] unless value.equal?(ParamSources::NOT_FOUND)
+        end
+
+        if (allowed = policy[:sources])
+          rejected = found.map(&:first) - allowed
+          halt 400, "parameter '#{name}' is not allowed from #{rejected.join('/')} source" unless rejected.empty?
+        end
+
+        values = found.map(&:last)
+        duplicates = param_sources.duplicates[name]
+        values << duplicates if duplicates && duplicates.uniq.size > 1
+        next unless ParamSources.conflict_kind(values)
+
+        strategy = policy[:on_conflict] || :reject
+        if ParamSources::SOURCES.include?(strategy)
+          preferred = found.assoc(strategy)
+          assign_param(name, preferred.last) if preferred
+        else
+          halt 400, "conflicting values for parameter '#{name}'"
+        end
+      end
+    end
+
+    # Write a value into params under a bracketed key path ("user[name]").
+    def assign_param(path, value)
+      segments = ParamSources.path_segments(path)
+      target = @params
+      segments[0..-2].each do |segment|
+        child = target[segment]
+        child = target[segment] = IndifferentHash.new unless child.is_a?(Hash)
+        target = child
+      end
+      target[segments.last] = value
     end
 
     # Attempt to serve static files from public directory. Throws :halt when
@@ -1511,6 +1572,32 @@ module Sinatra
       # block returns false.
       def condition(name = "#{caller.first[/`.*'/]} condition", &block)
         @conditions << generate_method(name, &block)
+      end
+
+      # Declare provenance rules for a request parameter. +sources+ lists
+      # the origins the parameter may come from (:route, :query, :body);
+      # a request providing it from anywhere else is rejected with 400
+      # before the route block runs. +on_conflict+ decides what happens
+      # when several allowed sources provide conflicting values (including
+      # scalar vs array/hash mismatches and repeated query keys): :reject
+      # answers 400, while :route, :query or :body pick that source's
+      # value for the merged params.
+      #
+      #   param_policy 'id', sources: [:route]
+      #   param_policy 'user[name]', sources: %i[route body], on_conflict: :body
+      def param_policy(name, sources: nil, on_conflict: :reject)
+        sources &&= Array(sources).map do |source|
+          source = source.to_sym
+          raise ArgumentError, "unknown parameter source: #{source.inspect}" unless ParamSources::SOURCES.include?(source)
+
+          source
+        end
+        on_conflict = on_conflict.to_sym
+        unless on_conflict == :reject || ParamSources::SOURCES.include?(on_conflict)
+          raise ArgumentError, "unknown conflict strategy: #{on_conflict.inspect}"
+        end
+
+        set :param_policies, param_policies.merge(name.to_s => { sources: sources, on_conflict: on_conflict })
       end
 
       def public=(value)
@@ -1951,6 +2038,7 @@ module Sinatra
     settings.add_charset << %r{^text/}
     set :mustermann_opts, {}
     set :default_content_type, 'text/html'
+    set :param_policies, {}
 
     # explicitly generating a session secret eagerly to play nice with preforking
     begin
@@ -2117,7 +2205,8 @@ module Sinatra
     delegate :get, :patch, :put, :post, :delete, :head, :options, :link, :unlink,
              :template, :layout, :before, :after, :error, :not_found, :configure,
              :set, :mime_type, :enable, :disable, :use, :development?, :test?,
-             :production?, :helpers, :settings, :register, :on_start, :on_stop
+             :production?, :helpers, :settings, :register, :on_start, :on_stop,
+             :param_policy
 
     class << self
       attr_accessor :target

@@ -39,6 +39,7 @@ like [rerun](https://github.com/alexch/rerun) or
 - [Sinatra](#sinatra)
   - [Table of Contents](#table-of-contents)
   - [Routes](#routes)
+    - [Parameter Sources and Policies](#parameter-sources-and-policies)
   - [Conditions](#conditions)
   - [Return Values](#return-values)
   - [Custom Route Matchers](#custom-route-matchers)
@@ -247,6 +248,54 @@ get '/posts' do
   # uses title and author variables; query is optional to the /posts route
 end
 ```
+
+### Parameter Sources and Policies
+
+The merged `params` hash does not reveal where a value came from: for
+`GET /users/7?id=9`, `params['id']` is `'7'`, but the query string still
+smuggled in a competing `id`. The `param_sources` helper keeps the three
+origins apart, preserving the tree structure and the original (bracketed)
+key paths of each:
+
+```ruby
+post '/users/:id' do
+  param_sources[:route]          # => { "id" => "7" }
+  param_sources[:query]          # => { "id" => "9" }
+  param_sources[:body]           # => { "user" => { "name" => "jo" } }
+  param_sources.paths(:body)     # => ["user[name]"]
+  param_sources.sources_for('user[name]') # => [:body]
+  param_sources.duplicates       # repeated query keys, e.g. { "tag" => ["a", "b"] }
+  param_sources.conflicts        # key paths provided by several sources
+                                 # with disagreeing values (scalar vs
+                                 # array/hash mismatches included)
+end
+```
+
+Applications can also declare which sources a parameter may come from and
+how cross-source conflicts are handled. Violations are rejected with a
+`400` response before the route block runs:
+
+```ruby
+class App < Sinatra::Base
+  # id may only come from the route; ?id=9 is rejected
+  param_policy 'id', sources: [:route]
+
+  # nested paths use bracket notation; conflicting values from allowed
+  # sources pick the body's value instead of rejecting
+  param_policy 'user[name]', sources: %i[route body], on_conflict: :body
+
+  post '/users/:id' do
+    # ...
+  end
+end
+```
+
+`on_conflict` accepts `:reject` (the default) or a source name (`:route`,
+`:query`, `:body`) whose value wins in the merged `params`. Conflicts are
+detected across sources as well as within the query string (repeated keys
+such as `tag=a&tag=b`), and a scalar competing with an array or hash for
+the same key always counts as a conflict. Without any `param_policy`
+declarations, `params` merging behaves exactly as before.
 
 By the way, unless you disable the path traversal attack protection (see
 [below](#configuring-attack-protection)), the request path might be modified before
