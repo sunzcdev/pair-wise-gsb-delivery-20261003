@@ -576,4 +576,192 @@ describe "column_encryption plugin" do
       end
     end.must_raise Sequel::Error
   end
+
+  describe "with :identifier option" do
+    before do
+      @db = Sequel.mock(:numrows=>1)
+      @model = Class.new(Sequel::Model)
+      @model.set_dataset @db[:ce_test]
+      @model.columns :id, :not_enc, :enc, :enc2
+      @model.plugin :column_encryption do |enc|
+        enc.key 0, "0"*32
+
+        enc.column :enc, :identifier=>:id
+        enc.column :enc2, :identifier=>:id
+      end
+      @obj = @model.new(:not_enc=>'123', :enc=>'Abc', :enc2=>'Def')
+      @obj.id = 1
+      @obj.valid?
+      @db.fetch = {:id=>1, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2]}
+      @obj.save
+      @db.sqls
+    end
+
+    it "should encrypt and decrypt columns bound to the record identifier" do
+      @obj.enc.must_equal 'Abc'
+      @obj.enc2.must_equal 'Def'
+      @obj[:enc].start_with?('BAAA').must_equal true
+      @obj[:enc2].start_with?('BAAA').must_equal true
+
+      obj = @model.first
+      obj.enc.must_equal 'Abc'
+      obj.enc2.must_equal 'Def'
+    end
+
+    it "should detect ciphertext moved between rows" do
+      obj2 = @model.new(:not_enc=>'234', :enc=>'Ghi', :enc2=>'Jkl')
+      obj2.id = 2
+      obj2.valid?
+
+      obj1 = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+      obj2 = @model.load(:id=>2, :not_enc=>'234', :enc=>obj2[:enc], :enc2=>obj2[:enc2])
+      obj1.enc.must_equal 'Abc'
+      obj2.enc.must_equal 'Ghi'
+
+      # ciphertext from row 2 placed in row 1
+      swapped = @model.load(:id=>1, :not_enc=>'123', :enc=>obj2[:enc], :enc2=>@obj[:enc2])
+      proc{swapped.enc}.must_raise Sequel::Error
+      swapped.enc2.must_equal 'Def'
+
+      # ciphertext from row 1 placed in row 2
+      swapped = @model.load(:id=>2, :not_enc=>'234', :enc=>obj2[:enc], :enc2=>@obj[:enc2])
+      proc{swapped.enc2}.must_raise Sequel::Error
+      swapped.enc.must_equal 'Ghi'
+    end
+
+    it "should detect ciphertext moved between columns in the same row" do
+      obj = @model.load(:id=>1, :not_enc=>'123', :enc=>@obj[:enc2], :enc2=>@obj[:enc])
+      proc{obj.enc}.must_raise Sequel::Error
+      proc{obj.enc2}.must_raise Sequel::Error
+    end
+
+    it "should raise an error before writing when the identifier is missing" do
+      obj = @model.new(:not_enc=>'123', :enc=>'Abc', :enc2=>'Def')
+      @db.sqls
+      proc{obj.save}.must_raise Sequel::Error
+      @db.sqls.must_equal []
+    end
+
+    it "should raise an error when decrypting without an identifier" do
+      obj = @model.load(:id=>nil, :not_enc=>'123', :enc=>@obj[:enc], :enc2=>@obj[:enc2])
+      proc{obj.enc}.must_raise Sequel::Error
+    end
+
+    it "should raise an error instead of falling back to another format when verification fails" do
+      enc = @obj[:enc].dup
+      enc[60] = (enc[60] == 'A' ? 'B' : 'A')
+      obj = @model.load(:id=>1, :not_enc=>'123', :enc=>enc, :enc2=>@obj[:enc2])
+      proc{obj.enc}.must_raise Sequel::Error
+    end
+
+    it "should raise an error when saving after changing the identifier without reencryption" do
+      obj = @model.first
+      obj.id = 2
+      proc{obj.save}.must_raise Sequel::Error
+    end
+
+    it "should support changing the identifier with explicit reencryption" do
+      obj = @model.first
+      obj.id = 2
+      obj.reencrypt.must_be_same_as obj
+      obj.enc.must_equal 'Abc'
+      obj.enc2.must_equal 'Def'
+
+      obj2 = @model.load(:id=>2, :not_enc=>'123', :enc=>obj[:enc], :enc2=>obj[:enc2])
+      obj2.enc.must_equal 'Abc'
+      obj2.enc2.must_equal 'Def'
+
+      # data is no longer bound to the previous identifier
+      obj3 = @model.load(:id=>1, :not_enc=>'123', :enc=>obj[:enc], :enc2=>obj[:enc2])
+      proc{obj3.enc}.must_raise Sequel::Error
+    end
+
+    it "should read data encrypted without an identifier and migrate it explicitly" do
+      model = Class.new(Sequel::Model)
+      model.set_dataset @db[:ce_test]
+      model.columns :id, :not_enc, :enc, :enc2
+      model.plugin :column_encryption do |enc|
+        enc.key 0, "0"*32
+
+        enc.column :enc
+        enc.column :enc2
+      end
+      obj = model.new(:not_enc=>'123', :enc=>'Abc', :enc2=>'Def')
+      obj.id = 1
+      obj.valid?
+      obj[:enc].start_with?('AAAA').must_equal true
+      enc_ciphertext = obj[:enc].dup
+      enc2_ciphertext = obj[:enc2].dup
+
+      model.plugin :column_encryption do |enc|
+        enc.column :enc, :identifier=>:id
+        enc.column :enc2, :identifier=>:id
+      end
+
+      # data encrypted without an identifier remains readable
+      obj = model.load(:id=>1, :not_enc=>'123', :enc=>enc_ciphertext, :enc2=>enc2_ciphertext)
+      obj.enc.must_equal 'Abc'
+      obj.enc2.must_equal 'Def'
+
+      # data in the old format is flagged for reencryption
+      model.needing_reencryption.sql.include?("< 'BAAA'").must_equal true
+
+      # explicit migration reencrypts in the context-bound format
+      obj.reencrypt.must_be_same_as obj
+      obj[:enc].start_with?('BAAA').must_equal true
+      obj[:enc2].start_with?('BAAA').must_equal true
+      obj.enc.must_equal 'Abc'
+      obj.enc2.must_equal 'Def'
+    end
+
+    it "should support searching columns bound to the record identifier" do
+      @model.plugin :column_encryption do |enc|
+        enc.column :enc, :identifier=>:id, :searchable=>true
+      end
+      @obj.reencrypt
+      @obj[:enc].start_with?('BQAA').must_equal true
+
+      have_matching_search(@model.with_encrypted_value(:enc, 'Abc', 1), @obj).must_equal true
+      have_matching_search(@model.with_encrypted_value(:enc, 'Abc', 2), @obj).must_equal false
+      have_matching_search(@model.with_encrypted_value(:enc, 'abc', 1), @obj).must_equal false
+      @model.with_encrypted_value(:enc, 'Abc', 1).sql.include?('Abc').must_equal false
+      proc{@model.with_encrypted_value(:enc, 'Abc')}.must_raise Sequel::Error
+    end
+
+    it "should support case insensitive searching columns bound to the record identifier" do
+      @model.plugin :column_encryption do |enc|
+        enc.column :enc, :identifier=>:id, :searchable=>:case_insensitive
+      end
+      @obj.reencrypt
+      @obj[:enc].start_with?('BgAA').must_equal true
+
+      have_matching_search(@model.with_encrypted_value(:enc, 'Abc', 1), @obj).must_equal true
+      have_matching_search(@model.with_encrypted_value(:enc, 'abc', 1), @obj).must_equal true
+      have_matching_search(@model.with_encrypted_value(:enc, 'abc', 2), @obj).must_equal false
+      have_matching_search(@model.with_encrypted_value(:enc, 'Abd', 1), @obj).must_equal false
+    end
+
+    it "should support columns bound to the record identifier with a serialization format" do
+      require 'json'
+      @model.plugin :column_encryption do |enc|
+        enc.column :enc, :identifier=>:id, :format=>:json
+      end
+      obj = @model.new(:not_enc=>'123', :enc=>{'a'=>1}, :enc2=>'Def')
+      obj.id = 1
+      obj.valid?
+      obj[:enc].start_with?('BAAA').must_equal true
+      @db.fetch = {:id=>1, :not_enc=>'123', :enc=>obj[:enc], :enc2=>obj[:enc2]}
+      obj = @model.first
+      obj.enc.must_equal({'a'=>1})
+      obj.enc2.must_equal 'Def'
+    end
+
+    it "should not allow column encryption configuration with invalid :identifier option" do
+      proc do
+        @model.plugin :column_encryption do |enc|
+          enc.column(:enc, :identifier=>Object.new)
+        end
+      end.must_raise Sequel::Error
+    end
+  end
 end if RUBY_VERSION >= '2.3' && (begin; require 'sequel/plugins/column_encryption'; true; rescue LoadError; false end)

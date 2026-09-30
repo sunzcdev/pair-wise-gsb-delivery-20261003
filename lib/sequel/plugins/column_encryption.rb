@@ -131,6 +131,11 @@ module Sequel
     #            encryption and deserialization after decryption.  Can be either a
     #            symbol registered with the serialization plugin or an array of two
     #            callables, the first for serialization and the second for deserialization.
+    # :identifier :: A column symbol for an immutable record identifier.  When given,
+    #                the encrypted data is bound to the model, column, and record
+    #                identifier, so ciphertext moved to another record or column will
+    #                fail decryption.  See the "Binding Encrypted Data to a Record"
+    #                section below.
     #
     # The +column+ method also supports a block for column-specific keys:
     #
@@ -164,6 +169,58 @@ module Sequel
     #     with_encrypted_value(:searchable_column_name, "will be")
     #     with_encrypted_value(:ci_searchable_column_name, "encrypted").
     #     first
+    #
+    # = Binding Encrypted Data to a Record
+    #
+    # By default, encrypted data is self-contained: valid ciphertext moved to another
+    # row or column will still decrypt correctly.  If you want to detect such movement,
+    # use the +:identifier+ column option with the symbol of a column containing an
+    # immutable identifier for the record:
+    #
+    #   ConfidentialModel.plugin :column_encryption do |enc|
+    #     enc.column :encrypted_column_name, identifier: :id
+    #   end
+    #
+    # With this, the model name, column name, and record identifier are used as
+    # additional authentication data when encrypting.  Ciphertext moved to a different
+    # row or a different column will fail decryption with a Sequel::Error.
+    #
+    # The identifier column must have a value before the record is saved.  If the
+    # identifier is missing, an error is raised before anything is written to the
+    # database.  Since the identifier must be present before saving, you generally
+    # cannot use a database-generated autoincrement primary key as the identifier
+    # unless you assign it yourself before saving.
+    #
+    # The identifier is treated as immutable.  If you change the identifier column
+    # for a persisted record, saving will raise an error.  To change the identifier,
+    # explicitly reencrypt the record, which reencrypts the context-bound columns
+    # using the new identifier:
+    #
+    #   obj.id = new_id
+    #   obj.reencrypt
+    #
+    # == Migrating Existing Data
+    #
+    # Data encrypted without an identifier uses a different format than data encrypted
+    # with an identifier, and the format is recorded in the encrypted data itself.
+    # When you add the +:identifier+ option to an existing column, data encrypted
+    # without an identifier is still decrypted correctly, but there is no automatic
+    # fallback: data encrypted with an identifier that fails verification raises an
+    # error rather than being retried without the identifier.
+    #
+    # Existing data is migrated explicitly, using the same approach as key rotation:
+    #
+    #   ConfidentialModel.needing_reencryption.all(&:reencrypt)
+    #
+    # == Searching
+    #
+    # Searchable columns bound to an identifier require the identifier when searching,
+    # since the search value is also bound to the identifier:
+    #
+    #   ConfidentialModel.with_encrypted_value(:encrypted_column_name, "value", 1)
+    #
+    # The search value is derived from the identifier and the search data using
+    # HMAC-SHA256, so it does not reveal the unencrypted data.
     #
     # = Encryption Key Rotation
     #
@@ -245,17 +302,23 @@ module Sequel
     #
     # column_value :: urlsafe_base64(flags + NUL + key_id + NUL + search_data + key_data +
     #                 cipher_iv + cipher_auth_tag + encrypted_data)
-    # flags :: 1 byte, the type of record (0: not searchable, 1: searchable, 2: lowercase searchable)
+    # flags :: 1 byte, the type of record (0: not searchable, 1: searchable, 2: lowercase searchable,
+    #          4: not searchable with context, 5: searchable with context,
+    #          6: lowercase searchable with context)
     # NUL :: 1 byte, ASCII NUL
     # key_id :: 1 byte, the key id, supporting 256 concurrently active keys (0 - 255)
-    # search_data :: 0 bytes if flags is 0, 32 bytes if flags is 1 or 2.
-    #                Format is HMAC-SHA256(key, unencrypted_data).
+    # search_data :: 0 bytes if flags is 0 or 4, 32 bytes otherwise.
+    #                Format is HMAC-SHA256(key, unencrypted_data) for flags 1 and 2,
+    #                and HMAC-SHA256(key, context + unencrypted_data) for flags 5 and 6.
     #                Ignored on decryption, only used for searching.
     # key_data :: 32 bytes random data used to construct cipher key
     # cipher_iv :: 12 bytes, AES-256-GCM cipher random initialization vector
     # cipher_auth_tag :: 16 bytes, AES-256-GCM cipher authentication tag
     # encrypted_data :: AES-256-GCM(HMAC-SHA256(key, key_data),
-    #                   padding_size + padding + unencrypted_data)
+    #                   padding_size + padding + unencrypted_data).
+    #                   For flags 4-6, the AES-256-GCM authentication data is the key's
+    #                   auth_data with the context appended.  The context is the model
+    #                   name, column name, and record identifier, separated by NUL bytes.
     # padding_size :: 1 byte, with the amount of padding (0-255 bytes of padding allowed)
     # padding :: number of bytes specified by padding size, ignored on decryption
     # unencrypted_data :: actual column value
@@ -350,6 +413,12 @@ module Sequel
         SEARCHABLE = 1
         LOWERCASE_SEARCHABLE = 2
 
+        # Flags for encrypted data bound to a context (model name, column name,
+        # and record identifier), used as additional authentication data.
+        CONTEXT_NOT_SEARCHABLE = 4
+        CONTEXT_SEARCHABLE = 5
+        CONTEXT_LOWERCASE_SEARCHABLE = 6
+
         # This is the default padding, but up to 2x the padding can be used for a record.
         DEFAULT_PADDING = 8
 
@@ -371,8 +440,12 @@ module Sequel
           freeze
         end
 
-        # Decrypt using any supported format and any available key.
-        def decrypt(data)
+        # Decrypt using any supported format and any available key.  If the data
+        # was encrypted with a context, the same context must be provided for
+        # decryption to succeed.  The format used is determined solely by the
+        # flags in the encrypted data; there is no fallback to another format
+        # if verification fails.
+        def decrypt(data, context=nil)
           begin
             data = urlsafe_decode64(data)
           rescue ArgumentError
@@ -391,13 +464,13 @@ module Sequel
           end
 
           case flags
-          when NOT_SEARCHABLE
+          when NOT_SEARCHABLE, CONTEXT_NOT_SEARCHABLE
             if data.bytesize < 65
               raise Error, "Decoded encrypted column smaller than minimum size"
             end
 
             data.slice!(0, 4)
-          when SEARCHABLE, LOWERCASE_SEARCHABLE
+          when SEARCHABLE, LOWERCASE_SEARCHABLE, CONTEXT_SEARCHABLE, CONTEXT_LOWERCASE_SEARCHABLE
             if data.bytesize < 97
               raise Error, "Decoded encrypted column smaller than minimum size"
             end
@@ -405,6 +478,14 @@ module Sequel
             data.slice!(0, 36)
           else
             raise Error, "Unable to decode encrypted column: invalid flags"
+          end
+
+          if flags >= CONTEXT_NOT_SEARCHABLE
+            unless context
+              raise Error, "Unable to decrypt encrypted column: missing context"
+            end
+
+            auth_data = "#{auth_data}#{context}"
           end
 
           key_part = data.slice!(0, 32)
@@ -444,6 +525,24 @@ module Sequel
           _encrypt(data, _search_prefix(data.downcase, LOWERCASE_SEARCHABLE, @key_id, @key))
         end
 
+        # Encrypt in not searchable format bound to the given context with the
+        # first configured encryption key.
+        def encrypt_with_context(data, context)
+          _encrypt(data, "#{CONTEXT_NOT_SEARCHABLE.chr}\0#{@key_id.chr}\0", context)
+        end
+
+        # Encrypt in searchable format bound to the given context with the first
+        # configured encryption key.
+        def searchable_encrypt_with_context(data, context)
+          _encrypt(data, _search_prefix(data, CONTEXT_SEARCHABLE, @key_id, @key, context), context)
+        end
+
+        # Encrypt in case insensitive searchable format bound to the given context
+        # with the first configured encryption key.
+        def case_insensitive_searchable_encrypt_with_context(data, context)
+          _encrypt(data, _search_prefix(data.downcase, CONTEXT_LOWERCASE_SEARCHABLE, @key_id, @key, context), context)
+        end
+
         # The prefix string of columns for the given search type and the first configured encryption key.
         # Used to find values that do not use this prefix in order to perform reencryption.
         def current_key_prefix(search_type)
@@ -467,6 +566,26 @@ module Sequel
         # transitioning between formats (used by the :search_both option when encrypting columns).
         def regular_and_lowercase_search_prefixes(data)
           search_prefixes(data) + lowercase_search_prefixes(data)
+        end
+
+        # The prefix values to search for the given data (an array of strings), assuming
+        # the column uses the searchable format bound to the given context.
+        def search_prefixes_with_context(data, context)
+          _search_prefixes(data, CONTEXT_SEARCHABLE, context)
+        end
+
+        # The prefix values to search for the given data (an array of strings), assuming
+        # the column uses the case insensitive searchable format bound to the given context.
+        def lowercase_search_prefixes_with_context(data, context)
+          _search_prefixes(data.downcase, CONTEXT_LOWERCASE_SEARCHABLE, context)
+        end
+
+        # The prefix values to search for the given data (an array of strings), assuming
+        # the column uses either the searchable or the case insensitive searchable format
+        # bound to the given context.  Should be used only when transitioning between
+        # formats (used by the :search_both option when encrypting columns).
+        def regular_and_lowercase_search_prefixes_with_context(data, context)
+          search_prefixes_with_context(data, context) + lowercase_search_prefixes_with_context(data, context)
         end
 
         private
@@ -495,26 +614,30 @@ module Sequel
 
         # An array of strings, one for each configured encryption key, to find encrypted values matching
         # the given data and search format.
-        def _search_prefixes(data, search_type)
+        def _search_prefixes(data, search_type, context=nil)
           @key_map.map do |key_id, (key, _)|
-            urlsafe_encode64(_search_prefix(data, search_type, key_id, key))
+            urlsafe_encode64(_search_prefix(data, search_type, key_id, key, context))
           end
         end
 
         # The prefix to use for searchable data, including the HMAC-SHA256(key, data).
-        def _search_prefix(data, search_type, key_id, key)
+        # If a context is given, the HMAC is computed over the context and data, so
+        # the search value is bound to the context and does not reveal the
+        # unencrypted data.
+        def _search_prefix(data, search_type, key_id, key, context=nil)
+          data = "#{context}#{data}" if context
           "#{search_type.chr}\0#{key_id.chr}\0#{OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, key, data)}"
         end
 
         # Encrypt the data using AES-256-GCM, with the given prefix.
-        def _encrypt(data, prefix)
+        def _encrypt(data, prefix, context=nil)
           padding = @padding
           random_data = SecureRandom.random_bytes(32)
           cipher = OpenSSL::Cipher.new("aes-256-gcm")
           cipher.encrypt
           cipher.key = OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, @key, random_data)
           cipher_iv = cipher.random_iv
-          cipher.auth_data = @auth_data
+          cipher.auth_data = context ? "#{@auth_data}#{context}" : @auth_data
 
           cipher_text = String.new
           data_size = data.bytesize
@@ -601,12 +724,14 @@ module Sequel
           end
 
           @column_encryption_metadata = Hash[@column_encryption_metadata || {}]
+          @column_encryption_identifier_columns = Hash[@column_encryption_identifier_columns || {}]
 
           dsl.columns.each do |column, opts, block|
             _encrypt_column(column, opts, &block)
           end
 
           @column_encryption_metadata.freeze
+          @column_encryption_identifier_columns.freeze
         end
       end
 
@@ -620,6 +745,10 @@ module Sequel
         # A hash with column symbol keys and ColumnEncryptionMetadata values for each
         # encrypted column.
         attr_reader :column_encryption_metadata
+
+        # A hash with encrypted column symbol keys and identifier column symbol
+        # values, for encrypted columns bound to a record identifier.
+        attr_reader :column_encryption_identifier_columns
 
         # The default Cryptor to use for encrypted columns.  This is only overridden if
         # per-column keys are used.
@@ -637,25 +766,50 @@ module Sequel
             column_encryption_cryptor
           end
 
+          if (identifier_column = opts[:identifier]) && !identifier_column.is_a?(Symbol)
+            raise Error, "invalid :identifier option for encrypted column: #{identifier_column.inspect} (must be a Symbol)"
+          end
+
           encrypt_method, search_prefixes_method, search_type = case searchable = opts[:searchable]
           when nil, false
-            [:encrypt, nil, Cryptor::NOT_SEARCHABLE] 
+            identifier_column ? [:encrypt_with_context, nil, Cryptor::CONTEXT_NOT_SEARCHABLE] : [:encrypt, nil, Cryptor::NOT_SEARCHABLE]
           when true
-            [:searchable_encrypt, :search_prefixes, Cryptor::SEARCHABLE] 
+            identifier_column ? [:searchable_encrypt_with_context, :search_prefixes_with_context, Cryptor::CONTEXT_SEARCHABLE] : [:searchable_encrypt, :search_prefixes, Cryptor::SEARCHABLE]
           when :case_insensitive
-            [:case_insensitive_searchable_encrypt, :lowercase_search_prefixes, Cryptor::LOWERCASE_SEARCHABLE] 
+            identifier_column ? [:case_insensitive_searchable_encrypt_with_context, :lowercase_search_prefixes_with_context, Cryptor::CONTEXT_LOWERCASE_SEARCHABLE] : [:case_insensitive_searchable_encrypt, :lowercase_search_prefixes, Cryptor::LOWERCASE_SEARCHABLE]
           else
             raise Error, "invalid :searchable option for encrypted column: #{searchable.inspect}"
           end
 
           if searchable && opts[:search_both]
-            search_prefixes_method = :regular_and_lowercase_search_prefixes
+            search_prefixes_method = identifier_column ? :regular_and_lowercase_search_prefixes_with_context : :regular_and_lowercase_search_prefixes
           end
 
           # Setup the callables used in the metadata.
-          encryptor = cryptor.method(encrypt_method)
-          decryptor = cryptor.method(:decrypt)
-          data_searcher = cryptor.method(search_prefixes_method) if search_prefixes_method
+          if identifier_column
+            # The context binds the encrypted data to the model, column, and
+            # record identifier.  The model name is captured when the column is
+            # configured, so subclasses use the same context.
+            context_prefix = "#{name}\0#{column}\0"
+            enc = cryptor.method(encrypt_method)
+            dec = cryptor.method(:decrypt)
+            encryptor = lambda do |data, identifier|
+              if identifier.nil?
+                raise Error, "cannot encrypt column #{column.inspect} without a value for identifier column #{identifier_column.inspect}"
+              end
+              enc.call(data, "#{context_prefix}#{identifier}")
+            end
+            decryptor = lambda{|data, identifier| dec.call(data, identifier && "#{context_prefix}#{identifier}")}
+            if search_prefixes_method
+              searcher = cryptor.method(search_prefixes_method)
+              data_searcher = lambda{|data, identifier| searcher.call(data, "#{context_prefix}#{identifier}")}
+            end
+          else
+            encryptor = cryptor.method(encrypt_method)
+            decryptor = cryptor.method(:decrypt)
+            data_searcher = cryptor.method(search_prefixes_method) if search_prefixes_method
+          end
+
           key_searcher = lambda{cryptor.current_key_prefix(search_type)}
 
           if format = opts[:format]
@@ -668,15 +822,17 @@ module Sequel
             # If a custom serialization format is used, override the
             # callables to handle serialization and deserialization.
             serializer, deserializer = format
-            enc, dec, data_s = encryptor, decryptor, data_searcher
-            encryptor = lambda do |data|
-              enc.call(serializer.call(data))
-            end
-            decryptor = lambda do |data|
-              deserializer.call(dec.call(data))
-            end
-            data_searcher = lambda do |data|
-              data_s.call(serializer.call(data))
+            enc2, dec2, data_s = encryptor, decryptor, data_searcher
+            if identifier_column
+              encryptor = lambda{|data, identifier| enc2.call(serializer.call(data), identifier)}
+              decryptor = lambda{|data, identifier| deserializer.call(dec2.call(data, identifier))}
+              if data_s
+                data_searcher = lambda{|data, identifier| data_s.call(serializer.call(data), identifier)}
+              end
+            else
+              encryptor = lambda{|data| enc2.call(serializer.call(data))}
+              decryptor = lambda{|data| deserializer.call(dec2.call(data))}
+              data_searcher = lambda{|data| data_s.call(serializer.call(data))}
             end
           end
 
@@ -685,6 +841,12 @@ module Sequel
           serialize_attributes([encryptor, decryptor], column)
 
           column_encryption_metadata[column] = ColumnEncryptionMetadata.new(encryptor, decryptor, data_searcher, key_searcher).freeze
+
+          if identifier_column
+            column_encryption_identifier_columns[column] = identifier_column
+          else
+            column_encryption_identifier_columns.delete(column)
+          end
 
           nil
         end
@@ -697,39 +859,161 @@ module Sequel
           :@column_encryption_cryptor=>nil,
           :@column_encryption_keys=>nil,
           :@column_encryption_metadata=>nil,
+          :@column_encryption_identifier_columns=>nil,
         )
       end
 
       module InstanceMethods
+        # Capture the record identifiers used by context-bound encrypted columns
+        # when loading the object from the database.
+        def initialize_from_db(values)
+          column_encryption_capture_identifiers(values)
+          super
+        end
+
         # Reencrypt the model if needed.  Looks at all of the models encrypted columns
         # and if any were encrypted with older keys or a different format, reencrypt
         # with the current key and format and save the object.  Returns the object
         # if reencryption was needed, or nil if reencryption was not needed.
+        #
+        # For encrypted columns bound to a record identifier, this is also how the
+        # identifier is changed: after changing the identifier column, call this
+        # method to explicitly reencrypt the columns with the new identifier.
         def reencrypt
           do_save = false
+          identifier_columns = model.send(:column_encryption_identifier_columns)
 
           model.send(:column_encryption_metadata).each do |column, metadata|
-            if (value = values[column]) && !value.start_with?(metadata.key_searcher.call)
+            next unless (value = values[column])
+
+            if (identifier_column = identifier_columns[column])
+              identifier = get_column_value(identifier_column)
+              tracked_identifier = column_encryption_tracked_identifiers[identifier_column]
+              if (!tracked_identifier.nil? && tracked_identifier != identifier) || !value.start_with?(metadata.key_searcher.call)
+                do_save = true
+                values[column] = metadata.encryptor.call(metadata.decryptor.call(value, tracked_identifier), identifier)
+              end
+            elsif !value.start_with?(metadata.key_searcher.call)
               do_save = true
               values[column] = metadata.encryptor.call(metadata.decryptor.call(value))
             end
           end
 
-          save if do_save
+          if do_save
+            identifier_columns.each_value do |identifier_column|
+              column_encryption_tracked_identifiers[identifier_column] = get_column_value(identifier_column)
+            end
+            save
+          end
+        end
+
+        # Check that the identifiers used by context-bound encrypted columns have
+        # not changed before validating (and before anything is written).
+        def before_validation
+          column_encryption_check_identifiers
+          super
+        end
+
+        # Check identifier changes before saving, so that records saved without
+        # validation are still checked.
+        def before_save
+          column_encryption_check_identifiers
+          super
+        end
+
+        private
+
+        # The record identifiers captured when the object was loaded from the
+        # database, or when context-bound encrypted columns were last encrypted.
+        def column_encryption_tracked_identifiers
+          @column_encryption_tracked_identifiers ||= {}
+        end
+
+        # Capture the current values of the identifier columns used by
+        # context-bound encrypted columns.
+        def column_encryption_capture_identifiers(values)
+          unless (identifier_columns = model.send(:column_encryption_identifier_columns)).empty?
+            tracked_identifiers = column_encryption_tracked_identifiers
+            identifier_columns.each_value do |identifier_column|
+              tracked_identifiers[identifier_column] = values[identifier_column]
+            end
+          end
+        end
+
+        # Raise an error if an identifier column used by a context-bound encrypted
+        # column has been changed since the object was loaded or the column was
+        # last encrypted.  Changing the identifier requires explicit reencryption
+        # using #reencrypt.
+        def column_encryption_check_identifiers
+          if (tracked_identifiers = @column_encryption_tracked_identifiers) && !tracked_identifiers.empty?
+            model.send(:column_encryption_identifier_columns).each_value do |identifier_column|
+              if !(tracked_identifier = tracked_identifiers[identifier_column]).nil? && tracked_identifier != get_column_value(identifier_column)
+                raise Error, "cannot save when identifier column #{identifier_column.inspect} has changed without reencryption (use reencrypt to change the identifier)"
+              end
+            end
+          end
+        end
+
+        # Update the tracked identifiers when refreshing the object.
+        def _refresh_set_values(hash)
+          column_encryption_capture_identifiers(hash)
+          super
+        end
+
+        # Copy the tracked identifiers when duping the object.
+        def initialize_copy(other)
+          super
+          if tracked_identifiers = other.instance_variable_get(:@column_encryption_tracked_identifiers)
+            @column_encryption_tracked_identifiers = Hash[tracked_identifiers]
+          end
+          self
+        end
+
+        # Encrypt context-bound columns using the current record identifier.
+        # Raises an error before anything is written if the identifier is missing.
+        def serialize_value(column, v)
+          if (identifier_column = model.send(:column_encryption_identifier_columns)[column]) && !v.nil?
+            identifier = get_column_value(identifier_column)
+            value = model.send(:column_encryption_metadata)[column].encryptor.call(v, identifier)
+            column_encryption_tracked_identifiers[identifier_column] = identifier
+            value
+          else
+            super
+          end
+        end
+
+        # Decrypt context-bound columns using the tracked record identifier.
+        def deserialize_value(column, v)
+          if (identifier_column = model.send(:column_encryption_identifier_columns)[column]) && !v.nil?
+            identifier = column_encryption_tracked_identifiers[identifier_column]
+            model.send(:column_encryption_metadata)[column].decryptor.call(v, identifier)
+          else
+            super
+          end
         end
       end
 
       module DatasetMethods
         # Filter the dataset to only match rows where the column contains an encrypted version
-        # of value.  Only works on searchable encrypted columns.
-        def with_encrypted_value(column, value)
+        # of value.  Only works on searchable encrypted columns.  For encrypted columns
+        # bound to a record identifier, the identifier of the record must be provided.
+        def with_encrypted_value(column, value, identifier=nil)
           metadata = model.send(:column_encryption_metadata)[column]
-          
+
           unless metadata && metadata.data_searcher
             raise Error, "lookup for encrypted column #{column.inspect} is not supported"
           end
 
-          prefixes = metadata.data_searcher.call(value)
+          prefixes = if model.send(:column_encryption_identifier_columns)[column]
+            if identifier.nil?
+              raise Error, "lookup for encrypted column #{column.inspect} requires an identifier"
+            end
+
+            metadata.data_searcher.call(value, identifier)
+          else
+            metadata.data_searcher.call(value)
+          end
+
           where(Sequel.|(*prefixes.map{|v| Sequel.like(column, "#{escape_like(v)}%")}))
         end
 
