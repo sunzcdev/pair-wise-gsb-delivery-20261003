@@ -71,9 +71,10 @@ module TZInfo
         raise_not_implemented('transitions_up_to')
       end
 
+      # @param data_source [DataSource] ignored for data time zones.
       # @return [DataTimezone] a new {DataTimezone} instance for the time zone
       #   represented by this {DataTimezoneInfo}.
-      def create_timezone
+      def create_timezone(data_source = nil)
         DataTimezone.new(self)
       end
 

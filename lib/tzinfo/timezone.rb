@@ -125,7 +125,7 @@ module TZInfo
       # @return [Timezone] the {Timezone} with the given `identifier`.
       # @raise [InvalidTimezoneIdentifier] if the `identifier` is not valid.
       def get(identifier)
-        data_source.get_timezone_info(identifier).create_timezone
+        get_with_data_source(identifier, data_source)
       end
 
       # Returns a proxy for the time zone with the given identifier. This allows
@@ -220,6 +220,24 @@ module TZInfo
         Country.all.map(&:zone_identifiers).flatten.uniq
       end
 
+      # Compares the observances of a time zone from two {DataSource}
+      # instances over a UTC window.
+      #
+      # @param identifier [String] an IANA Time Zone Database time zone
+      #   identifier.
+      # @param first_data_source [DataSource] the first {DataSource}.
+      # @param second_data_source [DataSource] the second {DataSource}.
+      # @param from [Object] the inclusive UTC start of the window as a `Time`,
+      #   `DateTime` or {Timestamp}.
+      # @param to [Object] the exclusive UTC end of the window as a `Time`,
+      #   `DateTime` or {Timestamp}.
+      # @return [Array<TimezoneComparison::Difference>] the intervals where the
+      #   observed UTC offset, daylight savings flag or abbreviation differ,
+      #   along with whether either link target differs.
+      def compare_data_sources(identifier, first_data_source, second_data_source, from, to)
+        TimezoneComparison.compare(identifier, first_data_source, second_data_source, from, to)
+      end
+
       private
 
       # @param [Enumerable<String>] identifiers an `Enumerable` of time zone
@@ -228,6 +246,35 @@ module TZInfo
       #   instances corresponding to the given identifiers.
       def get_proxies(identifiers)
         identifiers.collect {|identifier| get_proxy(identifier)}
+      end
+
+      # Creates a {Timezone} from {DataSources::TimezoneInfo}, retaining
+      # compatibility with custom info implementations that define a zero
+      # argument `create_timezone` method.
+      #
+      # @param info [DataSources::TimezoneInfo] the time zone info.
+      # @param data_source [DataSource] the data source used to resolve links.
+      # @return [Timezone] the new {Timezone} instance.
+      def create_timezone(info, data_source)
+        if info.method(:create_timezone).arity == 0
+          info.create_timezone
+        else
+          info.create_timezone(data_source)
+        end
+      end
+
+      # Returns a time zone from an explicitly supplied data source without
+      # consulting or changing the process-wide default data source.
+      #
+      # @param identifier [String] a time zone identifier.
+      # @param data_source [DataSource] the data source to use.
+      # @return [Timezone] the time zone.
+      def get_with_data_source(identifier, data_source)
+        unless data_source.kind_of?(DataSource)
+          raise ArgumentError, 'data_source must be a DataSource instance'
+        end
+
+        create_timezone(data_source.get_timezone_info(identifier), data_source)
       end
 
       # @return [DataSource] the current DataSource.

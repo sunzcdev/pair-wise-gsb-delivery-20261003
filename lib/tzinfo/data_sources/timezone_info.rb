@@ -26,9 +26,11 @@ module TZInfo
         "#<#{self.class}: #@identifier>"
       end
 
+      # @param data_source [DataSource] the {DataSource} to use when resolving
+      #   linked time zones.
       # @return [Timezone] a new {Timezone} instance for the time zone
       #   represented by this {TimezoneInfo}.
-      def create_timezone
+      def create_timezone(data_source = nil)
         raise_not_implemented('create_timezone')
       end
 

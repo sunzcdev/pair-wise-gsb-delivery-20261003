@@ -23,10 +23,16 @@ module TZInfo
         @link_to_identifier = link_to_identifier.freeze
       end
 
+      # @param data_source [DataSource] the {DataSource} to use when resolving
+      #   the linked time zone.
       # @return [LinkedTimezone] a new {LinkedTimezone} instance for the time
       #   zone represented by this {LinkedTimezoneInfo}.
-      def create_timezone
-        LinkedTimezone.new(self)
+      def create_timezone(data_source = nil)
+        if data_source
+          LinkedTimezone.new(self, data_source)
+        else
+          LinkedTimezone.new(self)
+        end
       end
     end
   end
