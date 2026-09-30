@@ -3,6 +3,7 @@
 require 'logger'
 require_relative 'cors/resources'
 require_relative 'cors/resource'
+require_relative 'cors/origin'
 require_relative 'cors/result'
 require_relative 'cors/version'
 

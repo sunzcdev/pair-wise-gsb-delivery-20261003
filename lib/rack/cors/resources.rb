@@ -16,7 +16,7 @@ module Rack
       def origins(*args, &blk)
         @origins = args.flatten.reject { |s| s == '' }.map do |n|
           case n
-          when Proc, Regexp, %r{^[a-z][a-z0-9.+-]*://}
+          when Proc, Regexp, Origin, %r{^[a-z][a-z0-9.+-]*://}
             n
           when '*'
             @public_resources = true
@@ -40,9 +40,12 @@ module Rack
         return true if public_resources?
 
         !!@origins.detect do |origin|
-          if origin.is_a?(Proc)
+          case origin
+          when Proc
             origin.call(source, env)
-          elsif origin.is_a?(Regexp)
+          when Origin
+            origin.matches?(source)
+          when Regexp
             source =~ origin
           else
             source == origin

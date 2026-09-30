@@ -57,6 +57,27 @@ describe Rack::Cors, 'DSL' do
     _(resources.first.allow_origin?('file://')).must_equal true
   end
 
+  it 'should support structured origin rules' do
+    cors = Rack::Cors.new(proc {}) do
+      allow do
+        origins Rack::Cors::Origin.new('https://example.com'),
+                Rack::Cors::Origin.new('https://*.example.org'),
+                Rack::Cors::Origin.null
+        resource '/', headers: :any
+      end
+    end
+    resources = cors.send :all_resources
+
+    _(resources.first.allow_origin?('https://example.com')).must_equal true
+    _(resources.first.allow_origin?('https://example.com:443')).must_equal true
+    _(resources.first.allow_origin?('https://sub.example.org')).must_equal true
+    _(resources.first.allow_origin?('null')).must_equal true
+    _(resources.first.allow_origin?('https://example.org')).wont_equal true
+    _(resources.first.allow_origin?('https://evil-example.com')).wont_equal true
+    _(resources.first.allow_origin?('https://example.com.evil')).wont_equal true
+    _(resources.first.allow_origin?('https://example.com/path')).wont_equal true
+  end
+
   it 'should default credentials option to false' do
     cors = Rack::Cors.new(proc {}) do
       allow do

@@ -208,6 +208,83 @@ describe Rack::Cors do
     _(last_response).wont_render_cors_success
   end
 
+  describe 'structured origin rules' do
+    it 'should allow the exact host' do
+      successful_cors_request '/structured-origin', origin: 'https://example.com'
+    end
+
+    it 'should allow the default port written out explicitly' do
+      successful_cors_request '/structured-origin', origin: 'https://example.com:443'
+    end
+
+    it 'should not allow a non-default port' do
+      cors_request '/structured-origin', origin: 'https://example.com:444'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow a host with a matching prefix' do
+      cors_request '/structured-origin', origin: 'https://evil-example.com'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow a host with a matching suffix' do
+      cors_request '/structured-origin', origin: 'https://example.com.evil'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow an origin with a path' do
+      cors_request '/structured-origin', origin: 'https://example.com/path'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow an origin with userinfo' do
+      cors_request '/structured-origin', origin: 'https://user@example.com'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow a list of origins' do
+      cors_request '/structured-origin', origin: 'https://example.com https://evil.net'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should allow a subdomain but not the root domain' do
+      successful_cors_request '/structured-subdomain', origin: 'https://sub.example.org'
+      successful_cors_request '/structured-subdomain', origin: 'https://a.b.example.org:443'
+
+      cors_request '/structured-subdomain', origin: 'https://example.org'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should not allow subdomain lookalikes' do
+      cors_request '/structured-subdomain', origin: 'https://evil-example.org'
+      _(last_response).wont_render_cors_success
+
+      cors_request '/structured-subdomain', origin: 'https://example.org.evil'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should allow the null origin only when declared' do
+      successful_cors_request '/null-origin', origin: 'null'
+
+      cors_request '/structured-origin', origin: 'null'
+      _(last_response).wont_render_cors_success
+    end
+
+    it 'should apply the same rules to preflight requests' do
+      preflight_request('https://example.com:443', '/structured-origin')
+      _(last_response).must_render_cors_success
+
+      preflight_request('https://evil-example.com', '/structured-origin')
+      _(last_response).wont_render_cors_success
+
+      preflight_request('https://example.org', '/structured-subdomain')
+      _(last_response).wont_render_cors_success
+
+      preflight_request('https://sub.example.org', '/structured-subdomain')
+      _(last_response).must_render_cors_success
+    end
+  end
+
   it 'should not allow credentials for public resources' do
     successful_cors_request '/public'
     _(last_response.headers['Access-Control-Allow-Credentials']).must_be_nil

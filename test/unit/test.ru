@@ -64,4 +64,19 @@ use Rack::Cors do
     origins ''
     resource '/blank-origin'
   end
+
+  allow do
+    origins Rack::Cors::Origin.new('https://example.com')
+    resource '/structured-origin'
+  end
+
+  allow do
+    origins Rack::Cors::Origin.new('https://*.example.org')
+    resource '/structured-subdomain'
+  end
+
+  allow do
+    origins Rack::Cors::Origin.null
+    resource '/null-origin'
+  end
 end
