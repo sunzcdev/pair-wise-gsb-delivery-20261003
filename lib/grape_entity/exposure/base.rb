@@ -9,6 +9,13 @@ module Grape
       class Base
         attr_reader :attribute, :is_safe, :documentation, :override, :conditions, :for_merge
 
+        # Whether this getter may be invoked again when its output was part of a
+        # pass that lost a version race. Only declared re-readable fields are
+        # ever touched on a retry.
+        def reread?
+          @reread == true
+        end
+
         def self.new(attribute, options, conditions, ...)
           super(attribute, options, conditions).tap { |e| e.setup(...) }
         end
@@ -24,6 +31,7 @@ module Grape
           @attr_path_proc = options[:attr_path]
           @documentation = options[:documentation]
           @override = options[:override]
+          @reread = options[:reread]
           @conditions = conditions
         end
 

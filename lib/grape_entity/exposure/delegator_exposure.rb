@@ -4,8 +4,8 @@ module Grape
   class Entity
     module Exposure
       class DelegatorExposure < Base
-        def value(entity, _options)
-          entity.delegate_attribute(attribute)
+        def value(entity, options)
+          entity.consistency_read(attribute, reread?, options)
         end
       end
     end

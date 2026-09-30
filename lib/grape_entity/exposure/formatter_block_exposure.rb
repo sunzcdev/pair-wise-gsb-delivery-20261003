@@ -19,7 +19,7 @@ module Grape
         end
 
         def value(entity, _options)
-          entity.exec_with_attribute(attribute, &@format_with)
+          entity.exec_with_attribute(attribute, reread: reread?, &@format_with)
         end
       end
     end

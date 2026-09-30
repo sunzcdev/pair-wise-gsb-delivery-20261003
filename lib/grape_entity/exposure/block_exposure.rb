@@ -7,6 +7,7 @@ module Grape
         attr_reader :block
 
         def value(entity, options)
+          entity.record_consistency_read(attribute, reread?, options)
           entity.exec_with_object(options, &@block)
         end
 

@@ -24,7 +24,15 @@ module Grape
 
         def value(entity, options)
           new_options = options.for_nesting(key(entity))
-          using_class.represent(@subexposure.value(entity, options), new_options)
+          represented_object = @subexposure.value(entity, options)
+
+          coordinator = options[:consistency_coordinator]
+          if represented_object.is_a?(Array)
+            parent_path = options.opts_hash[:attr_path] || []
+            coordinator&.register(represented_object, parent_path + [key(entity)])
+          end
+
+          using_class.represent(represented_object, new_options)
         end
 
         def valid?(entity)

@@ -21,9 +21,10 @@ module Grape
         def value(entity, _options)
           formatters = entity.class.formatters
           if formatters[@format_with]
-            entity.exec_with_attribute(attribute, &formatters[@format_with])
+            entity.exec_with_attribute(attribute, reread: reread?, &formatters[@format_with])
           else
-            entity.send(@format_with, entity.delegate_attribute(attribute))
+            attribute_value = entity.exec_with_attribute(attribute, reread: reread?)
+            entity.send(@format_with, attribute_value)
           end
         end
       end

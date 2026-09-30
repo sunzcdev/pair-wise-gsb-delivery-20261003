@@ -6,7 +6,7 @@
 
 #### Features
 
-* Your contribution here.
+* [#556](https://github.com/ruby-grape/grape-entity/pull/556): Add `Grape::Entity.represent_consistent`, an explicit consistency entry point backed by an application-provided representation version protocol (`Grape::Entity::Versioned`, `Grape::Entity::VersionedArray`); it rejects half-old/half-new hashes with `Grape::Entity::UnstableVersion`, and retries only `reread: true` fields a bounded number of times - [@GSB](https://github.com/ruby-grape).
 
 
 ### 1.1.0 (2026-06-05)

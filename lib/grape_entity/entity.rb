@@ -455,6 +455,68 @@ module Grape
       root_element ? { root_element => inner } : inner
     end
 
+    # Like {.represent}, but guarantees that the returned Hash (or Array of
+    # Hashes) is assembled from one jointly-valid set of representation
+    # versions.
+    #
+    # Objects and association collections participate when they implement the
+    # version protocol (see Grape::Entity::Versioned): each exposes a monotonic
+    # +representation_version+ and a +representation_mutating?+ flag. If a
+    # selected nested object or collection changes while it is being read, the
+    # pass is discarded and never returned as a half-old/half-new Hash.
+    #
+    # Only exposures declared with +reread: true+ may be invoked again on a
+    # retry, and the number of passes is bounded by +:max_attempts+. Ordinary
+    # exceptions propagate as usual; they are not treated as version
+    # contention.
+    #
+    # @option options :max_attempts [Integer] maximum number of passes (default 3)
+    # @option options :consistency_coordinator [Grape::Entity::ConsistencyCoordinator]
+    #   coordinator to reuse (e.g. for observing reads/attempts)
+    def self.represent_consistent(objects, options = {})
+      options = options.dup
+      coordinator = options.delete(:consistency_coordinator) || ConsistencyCoordinator.new
+      max_attempts = options.delete(:max_attempts) || 3
+
+      root_override = options[:root] if options.key?(:root)
+
+      attempts = 0
+      begin
+        coordinator.begin_attempt
+        attempts = coordinator.attempts
+
+        if objects.respond_to?(:to_ary) && !@present_collection
+          root_element = root_element(:collection_root)
+          coordinator.register(objects)
+          inner = objects.to_ary.map do |object|
+            render_options = options.reverse_merge(collection: true)
+                                  .merge(serializable: true,
+                                         consistency_coordinator: coordinator)
+            new(object, render_options).presented
+          end
+        else
+          wrapped = @present_collection ? { @collection_name => objects } : objects
+          root_element = root_element(:root)
+          coordinator.register(wrapped)
+          render_options = options.merge(serializable: true,
+                                         consistency_coordinator: coordinator)
+          inner = new(wrapped, render_options).presented
+        end
+
+        root_element = root_override unless root_override.nil?
+
+        coordinator.verify!
+        root_element ? { root_element => inner } : inner
+      rescue VersionConflict => e
+        raise UnstableVersion.new(
+          "representation stayed unstable across #{attempts} attempt(s): #{e.message}",
+          object: e.object, coordinator: coordinator
+        ) if attempts >= max_attempts
+
+        retry
+      end
+    end
+
     # This method returns the entity's root or collection root node, or its parent's
     # @param root_type: either :collection_root or just :root
     def self.root_element(root_type)
@@ -519,7 +581,30 @@ module Grape
 
       opts = options.merge(runtime_options || {})
 
+      consistency_coordinator(opts)&.register(object, opts.opts_hash[:attr_path])
+
       root_exposure.serializable_value(self, opts)
+    end
+
+    # @return [ConsistencyCoordinator, nil] the coordinator supervising this
+    #   representation, if consistency was requested through
+    #   {.represent_consistent}.
+    def consistency_coordinator(opts = options)
+      opts[:consistency_coordinator]
+    end
+
+    # Read an attribute while recording the getter invocation with the
+    # consistency coordinator. Non-versioned objects are read without
+    # bookkeeping.
+    def consistency_read(attribute, can_reread, opts = options)
+      record_consistency_read(attribute, can_reread, opts)
+      delegate_attribute(attribute)
+    end
+
+    # Record a getter invocation without invoking any accessor: used by block
+    # exposures whose value is computed by the block itself.
+    def record_consistency_read(attribute, can_reread, opts = options)
+      consistency_coordinator(opts)&.read(object, attribute, can_reread, opts.opts_hash[:attr_path])
     end
 
     def exec_with_object(options, &block)
@@ -590,8 +675,9 @@ module Grape
       params[0].first == :req && params[1].first == :rest
     end
 
-    def exec_with_attribute(attribute, &block)
-      instance_exec(delegate_attribute(attribute), &block)
+    def exec_with_attribute(attribute, reread: false, &block)
+      value = consistency_read(attribute, reread)
+      block ? instance_exec(value, &block) : value
     end
 
     def value_for(key, options = Options.new)
@@ -646,6 +732,7 @@ module Grape
       expose_nil
       override
       default
+      reread
     ].to_set.freeze
 
     # Merges the given options with current block options.

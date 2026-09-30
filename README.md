@@ -679,6 +679,88 @@ Also note that an `ArgumentError` is raised when unknown options are passed to e
 
 Use [Grape::Entity::Preloader](https://github.com/OuYangJinTing/grape-entity-preloader) to preload associations and callbacks and avoid N+1 operations.
 
+### Consistent Representation Against Concurrent Updates
+
+When a background thread mutates the objects behind an entity, an ordinary
+representation can splice values from two points in time — for example a
+total read *before* an update together with a detail collection read
+*after* it. `.represent_consistent` is an explicit entry point that rejects
+such half-old/half-new output: one response must come from a single,
+jointly-valid set of versions.
+
+The application provides a small **version protocol** on the represented
+objects and on association collections:
+
+* `representation_version` — a monotonically advancing value;
+* `representation_mutating?` — whether a change is currently in flight.
+
+`Grape::Entity::Versioned` is a reference implementation of the protocol, and
+`Grape::Entity::VersionedArray` is an Array whose own version advances on
+membership changes. Include/use them on your models:
+
+```ruby
+class Invoice
+  include Grape::Entity::Versioned
+
+  def initialize
+    representation_initialize
+    @lines = Grape::Entity::VersionedArray.new
+  end
+
+  attr_reader :total, :lines
+
+  # Every observable change MUST advance the version. Wrap multi-step updates
+  # so representation_mutating? is true for their whole duration.
+  def recalculate!(new_total, new_line)
+    representation_updating do
+      @total = new_total
+      @lines << new_line
+    end
+  end
+end
+```
+
+The rules for advancing a version are:
+
+* advance the object version when any exposed attribute changes;
+* advance the collection version when an exposed collection changes its
+  membership or order (`VersionedArray` does this for its mutating methods);
+* keep `representation_mutating?` true for the whole duration of a
+  multi-step change, so an in-progress state is never taken for a stable one.
+
+Render with `.represent_consistent`:
+
+```ruby
+InvoiceEntity.represent_consistent(invoice, max_attempts: 3)
+```
+
+Each pass captures the version token of every selected object or collection
+the first time it is read, and re-checks all tokens once the Hash is
+assembled. If a **selected** nested object or collection changed during the
+pass, the assembled Hash is discarded and `Grape::Entity::UnstableVersion`
+is raised instead of returning spliced data. Objects and collections that
+were not selected are not tracked and cannot trigger a rejection.
+
+A failed pass is retried, but only fields whose exposure is declared
+`reread: true` may be invoked again — ordinary getters are never silently
+called a second time:
+
+```ruby
+class InvoiceEntity < Grape::Entity
+  expose :total, reread: true
+  expose :lines, using: LineEntity, reread: true
+end
+```
+
+If a retry would require re-reading a field without `reread: true`, the pass
+is rejected immediately and no getter is touched twice. Retries are bounded
+by `:max_attempts` (default `3`). Ordinary exceptions are not version
+contention and propagate normally without retrying.
+
+You may pass your own `consistency_coordinator:` (a
+`Grape::Entity::ConsistencyCoordinator`) to observe `attempts` and the
+recorded `reads`.
+
 ## Installation
 
 Add this line to your application's Gemfile:
