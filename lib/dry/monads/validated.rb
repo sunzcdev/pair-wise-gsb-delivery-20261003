@@ -4,10 +4,17 @@ module Dry
   module Monads
     # Validated is similar to Result and represents an outcome of a validation.
     # The difference between Validated and Result is that the former implements
-    # `#apply` in a way that concatenates errors. This means that the error type
+    # `#apply` in a way that concatenates errors. By default the error type
     # has to have `+` implemented (be a semigroup). This plays nice with arrays and lists.
     # Also, List<Validated>#traverse implicitly uses a block that wraps errors with
     # a list so that you don't have to do it manually.
+    #
+    # Alternatively, an explicit error merge rule can be attached to Validated
+    # values. The rule is any callable accepting two accumulated errors and
+    # returning the combined one. The rule is preserved by `#apply`, `#alt_map`,
+    # and `List#traverse`, so it doesn't fall back to `+` after a transformation.
+    # Combining two Invalid values carrying different rules raises
+    # {MergeRuleMismatchError}.
     #
     # @example using with List
     #   List::Validated[Valid('London'), Invalid(:name_missing), Invalid(:email_missing)]
@@ -17,22 +24,29 @@ module Dry
     #   List::Validated[Valid('London'), Valid('John')]
     #   # => Valid(List['London', 'John'])
     #
+    # @example with a custom error merge rule
+    #   merge = ->(a, b) { a.merge(b) { |_key, errs_a, errs_b| errs_a + errs_b } }
+    #   Invalid({name: ["is missing"]}, merge)
+    #     .apply(Invalid({email: ["is missing"]}, merge))
+    #   # => Invalid({name: ["is missing"], email: ["is missing"]})
+    #
     class Validated
       include ConversionStubs[:to_maybe, :to_result]
 
       class << self
         # Wraps a value with `Valid`.
         #
-        # @overload pure(value)
+        # @overload pure(value, merge_rule = nil)
         #   @param value [Object] value to be wrapped with Valid
+        #   @param merge_rule [#call, nil] optional error merge rule
         #   @return [Validated::Valid]
         #
         # @overload pure(&block)
         #   @param block [Object] block to be wrapped with Valid
         #   @return [Validated::Valid]
         #
-        def pure(value = Undefined, &block)
-          Valid.new(Undefined.default(value, block))
+        def pure(value = Undefined, merge_rule = nil, &block)
+          Valid.new(Undefined.default(value, block), merge_rule)
         end
       end
 
@@ -52,12 +66,18 @@ module Dry
       # Valid result
       #
       class Valid < Validated
-        include Dry::Equalizer(:value!)
+        include Dry::Equalizer(:value!, :merge_rule)
 
-        def initialize(value)
+        # Error merge rule carried by the value, if any
+        #
+        # @return [#call, nil]
+        attr_reader :merge_rule
+
+        def initialize(value, merge_rule = nil)
           super()
 
           @value = value
+          @merge_rule = merge_rule
         end
 
         # Extracts the value
@@ -97,7 +117,7 @@ module Dry
         #
         def fmap(proc = Undefined, &block)
           f = Undefined.default(proc, block)
-          self.class.new(f.(value!))
+          self.class.new(f.(value!), merge_rule)
         end
 
         # Ignores values and returns self, see {Invalid#alt_map}
@@ -141,16 +161,26 @@ module Dry
         # @api public
         attr_reader :trace
 
-        include Dry::Equalizer(:error)
+        # Error merge rule carried by the value, if any
+        #
+        # @return [#call, nil]
+        attr_reader :merge_rule
 
-        def initialize(error, trace = RightBiased::Left.trace_caller)
+        include Dry::Equalizer(:error, :merge_rule)
+
+        def initialize(error, trace = RightBiased::Left.trace_caller, merge_rule = nil)
           super()
 
           @error = error
           @trace = trace
+          @merge_rule = merge_rule
         end
 
         # Collects errors (ignores valid results)
+        #
+        # Errors are combined with the merge rule carried by the values,
+        # if any, and with `+` otherwise. Combining two Invalid values with
+        # different merge rules raises {MergeRuleMismatchError}.
         #
         # @overload apply(val)
         #   @param val [Validated::Valid,Validated::Invalid]
@@ -161,10 +191,20 @@ module Dry
         #   @return [Validated::Invalid]
         #
         def apply(val = Undefined, &block)
-          Undefined
-            .default(val, &block)
-            .alt_map { @error + _1 }
-            .fmap { return self }
+          other = Undefined.default(val, &block)
+
+          if other.is_a?(Invalid)
+            rule = combine_merge_rule(other)
+            combined = rule ? rule.(error, other.error) : error + other.error
+
+            self.class.new(
+              combined,
+              RightBiased::Left.trace_caller,
+              rule
+            )
+          else
+            other.fmap { return self }
+          end
         end
 
         # Lifts a block/proc over Invalid
@@ -179,7 +219,7 @@ module Dry
         #
         def alt_map(proc = Undefined, &block)
           f = Undefined.default(proc, block)
-          self.class.new(f.(error), RightBiased::Left.trace_caller)
+          self.class.new(f.(error), RightBiased::Left.trace_caller, merge_rule)
         end
 
         # Ignores the passed argument and returns self
@@ -210,6 +250,26 @@ module Dry
         def ===(other)
           other.instance_of?(self.class) && error === other.error
         end
+
+        private
+
+        # Picks the merge rule to use when combining with another Invalid.
+        # A value without a rule adopts the other one's rule. Two different
+        # rules cannot be reconciled and raise an error.
+        #
+        # @param other [Validated::Invalid]
+        # @return [#call, nil]
+        def combine_merge_rule(other)
+          other_rule = other.merge_rule
+
+          if merge_rule.nil?
+            other_rule
+          elsif other_rule.nil? || other_rule == merge_rule
+            merge_rule
+          else
+            raise MergeRuleMismatchError.new(merge_rule, other_rule)
+          end
+        end
       end
 
       # Mixin with Validated constructors
@@ -228,36 +288,38 @@ module Dry
         module Constructors
           # Valid constructor
           #
-          # @overload Valid(value)
+          # @overload Valid(value, merge_rule = nil)
           #   @param value [Object]
+          #   @param merge_rule [#call, nil] optional error merge rule
           #   @return [Valdated::Valid]
           #
           # @overload Valid(&block)
           #   @param block [Proc]
           #   @return [Valdated::Valid]
           #
-          def Valid(value = Undefined, &block)
+          def Valid(value = Undefined, merge_rule = nil, &block)
             v = Undefined.default(value, block)
             raise ArgumentError, "No value given" if !value.nil? && v.nil?
 
-            Valid.new(v)
+            Valid.new(v, merge_rule)
           end
 
           # Invalid constructor
           #
-          # @overload Invalid(value)
+          # @overload Invalid(value, merge_rule = nil)
           #   @param value [Object]
+          #   @param merge_rule [#call, nil] optional error merge rule
           #   @return [Valdated::Invalid]
           #
           # @overload Invalid(&block)
           #   @param block [Proc]
           #   @return [Valdated::Invalid]
           #
-          def Invalid(value = Undefined, &block)
+          def Invalid(value = Undefined, merge_rule = nil, &block)
             v = Undefined.default(value, block)
             raise ArgumentError, "No value given" if !value.nil? && v.nil?
 
-            Invalid.new(v, RightBiased::Left.trace_caller)
+            Invalid.new(v, RightBiased::Left.trace_caller, merge_rule)
           end
         end
 

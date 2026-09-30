@@ -188,4 +188,160 @@ RSpec.describe(Dry::Monads::Validated) do
       )
     end
   end
+
+  describe "error merge rules" do
+    include Dry::Monads::Validated::Mixin
+
+    # Business error objects with a path and a severity.
+    # They deliberately don't implement +
+    field_error = Struct.new(:path, :severity)
+
+    # A merge rule that keeps duplicate paths and
+    # tallies severities separately
+    tally_merge = lambda do |left, right|
+      to_tally = nil
+      to_tally = lambda do |errors|
+        case errors
+        when Hash then errors
+        when field_error then to_tally.call([errors])
+        else
+          errors.to_ary.each_with_object({}) do |error, tally|
+            tally[error.path] ||= Hash.new(0)
+            tally[error.path][error.severity] += 1
+          end
+        end
+      end
+
+      to_tally.call(left).merge(to_tally.call(right)) do |_path, left_severities, right_severities|
+        left_severities.merge(right_severities) do |_severity, left_count, right_count|
+          left_count + right_count
+        end
+      end
+    end
+
+    name_error = field_error.new(:name, :error)
+    name_warning = field_error.new(:name, :warning)
+    email_error = field_error.new(:email, :error)
+    another_name_error = field_error.new(:name, :error)
+
+    # duplicate paths are kept, severities are counted separately
+    expected_tally = {
+      name: {error: 2, warning: 1},
+      email: {error: 1}
+    }
+
+    it "combines errors with the rule instead of +" do
+      merged = Invalid(name_error, tally_merge).apply(Invalid(name_warning, tally_merge))
+
+      expect(merged).to eql(Invalid({name: {error: 1, warning: 1}}, tally_merge))
+    end
+
+    it "attaches the rule via .pure" do
+      expect(validated.pure(1, tally_merge).merge_rule).to be(tally_merge)
+    end
+
+    it "keeps the rule after apply" do
+      merged = Invalid(name_error, tally_merge).apply(Invalid(email_error, tally_merge))
+
+      expect(merged.merge_rule).to be(tally_merge)
+    end
+
+    it "keeps the rule when a Valid function is applied to an Invalid" do
+      merged = Valid(-> x { x }).apply(Invalid(name_error, tally_merge))
+
+      expect(merged.merge_rule).to be(tally_merge)
+    end
+
+    it "keeps the rule after alt_map" do
+      expect(Invalid(name_error, tally_merge).alt_map { [_1] }.merge_rule).to be(tally_merge)
+    end
+
+    it "keeps the rule after fmap on Valid" do
+      expect(Valid(1, tally_merge).fmap { _1 + 1 }.merge_rule).to be(tally_merge)
+    end
+
+    it "adopts the rule from either side when the other one has none" do
+      expect(
+        Invalid(name_error, tally_merge).apply(Invalid(email_error)).merge_rule
+      ).to be(tally_merge)
+
+      expect(
+        Invalid(name_error).apply(Invalid(email_error, tally_merge)).merge_rule
+      ).to be(tally_merge)
+    end
+
+    it "uses the adopted rule for combining" do
+      merged = Invalid(name_error).apply(Invalid(email_error, tally_merge))
+
+      expect(merged.error).to eql(name: {error: 1}, email: {error: 1})
+    end
+
+    it "rejects combining results with different rules" do
+      other_rule = ->(a, _b) { a }
+
+      expect {
+        Invalid(name_error, tally_merge).apply(Invalid(email_error, other_rule))
+      }.to raise_error(Dry::Monads::MergeRuleMismatchError, /different error merge rules/)
+    end
+
+    it "produces the same result for sequential and grouped combination" do
+      sequential = Invalid(name_error, tally_merge)
+        .apply(Invalid(name_warning, tally_merge))
+        .apply(Invalid(email_error, tally_merge))
+        .apply(Invalid(another_name_error, tally_merge))
+
+      grouped = Invalid(name_error, tally_merge)
+        .apply(Invalid(name_warning, tally_merge))
+        .apply(
+          Invalid(email_error, tally_merge).apply(Invalid(another_name_error, tally_merge))
+        )
+
+      expect(sequential.error).to eql(expected_tally)
+      expect(grouped).to eql(sequential)
+    end
+
+    describe "List#traverse" do
+      list_validated = Dry::Monads::List::Validated
+
+      it "keeps the rule and combines errors with it" do
+        results = list_validated[
+          Invalid(name_error, tally_merge),
+          Invalid(name_warning, tally_merge),
+          Valid("ok"),
+          Invalid(email_error, tally_merge),
+          Invalid(another_name_error, tally_merge)
+        ]
+
+        traversed = results.traverse
+
+        expect(traversed.error).to eql(expected_tally)
+        expect(traversed.merge_rule).to be(tally_merge)
+      end
+
+      it "matches sequential combination" do
+        sequential = Invalid(name_error, tally_merge)
+          .apply(Invalid(name_warning, tally_merge))
+          .apply(Invalid(email_error, tally_merge))
+          .apply(Invalid(another_name_error, tally_merge))
+
+        traversed = list_validated[
+          Invalid(name_error, tally_merge),
+          Invalid(name_warning, tally_merge),
+          Invalid(email_error, tally_merge),
+          Invalid(another_name_error, tally_merge)
+        ].traverse
+
+        expect(traversed.error).to eql(sequential.error)
+      end
+
+      it "rejects mixed rules during traversal" do
+        results = list_validated[
+          Invalid(name_error, tally_merge),
+          Invalid(email_error, ->(a, _b) { a })
+        ]
+
+        expect { results.traverse }.to raise_error(Dry::Monads::MergeRuleMismatchError)
+      end
+    end
+  end
 end

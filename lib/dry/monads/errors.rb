@@ -19,6 +19,17 @@ module Dry
       end
     end
 
+    # Raised when two Validated values carrying different error merge rules
+    # are combined (e.g. via Validated#apply or List#traverse)
+    class MergeRuleMismatchError < ::StandardError
+      def initialize(left, right)
+        super(
+          "Cannot combine Validated results with different error merge rules: " \
+          "#{left.inspect} vs #{right.inspect}"
+        )
+      end
+    end
+
     # Improper use of None
     class ConstructorNotAppliedError < ::NoMethodError
       def initialize(method_name, constructor_name)

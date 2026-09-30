@@ -41,5 +41,30 @@ RSpec.describe(Dry::Monads::List) do
 
       expect(errors.traverse).to eql(Valid(list["john@doe.me", "John"]))
     end
+
+    it "traverses errors with a custom merge rule" do
+      merge = ->(a, b) { a.merge(b) { |_key, errs_a, errs_b| errs_a + errs_b } }
+
+      errors = list::Validated[
+        Invalid({name: ["is missing"]}, merge),
+        Valid(age: 29),
+        Invalid({email: ["is missing"]}, merge)
+      ]
+
+      expect(errors.traverse { |el| el }).to eql(
+        Invalid({name: ["is missing"], email: ["is missing"]}, merge)
+      )
+    end
+
+    it "rejects mixed merge rules during traversal" do
+      errors = list::Validated[
+        Invalid({name: ["is missing"]}, ->(a, b) { a.merge(b) }),
+        Invalid({email: ["is missing"]}, ->(a, _b) { a })
+      ]
+
+      expect { errors.traverse { |el| el } }.to raise_error(
+        Dry::Monads::MergeRuleMismatchError
+      )
+    end
   end
 end
