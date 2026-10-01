@@ -36,9 +36,14 @@
   replacement for any tag.
 - Simple but very fast and efficient
   [queries](https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#example-Decoder.Query).
+- [Decoder.DecodeTransactional] decodes atomically: the target is updated only when the whole
+  value decodes successfully, which is useful for configuration hot-reloading. On failure the
+  target (including maps, slices, and pointers shared between its fields) is left unchanged.
 
 [customencoder]: https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#CustomEncoder
 [customdecoder]: https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#CustomDecoder
+[decoder.decodetransactional]:
+  https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#Decoder.DecodeTransactional
 [encoder.setcustomstructtag]:
   https://pkg.go.dev/github.com/vmihailenco/msgpack/v5#Encoder.SetCustomStructTag
 [decoder.setcustomstructtag]:
