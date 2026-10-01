@@ -1204,6 +1204,12 @@ type DecMode interface {
 	// NewDecoder returns a new decoder that reads from r using dm DecMode.
 	NewDecoder(r io.Reader) *Decoder
 
+	// NewEventReader returns a new streaming reader that reads CBOR data
+	// items from r as a sequence of events using dm DecMode.  Unlike
+	// NewDecoder, it does not buffer a complete data item before returning,
+	// so containers and indefinite-length strings are exposed incrementally.
+	NewEventReader(r io.Reader) *EventReader
+
 	// DecOptions returns user specified options used to create this DecMode.
 	DecOptions() DecOptions
 }
@@ -1361,6 +1367,11 @@ func (dm *decMode) Wellformed(data []byte) error {
 // NewDecoder returns a new decoder that reads from r using dm DecMode.
 func (dm *decMode) NewDecoder(r io.Reader) *Decoder {
 	return &Decoder{r: r, d: decoder{dm: dm}}
+}
+
+// NewEventReader returns a new streaming reader that reads from r using dm DecMode.
+func (dm *decMode) NewEventReader(r io.Reader) *EventReader {
+	return &EventReader{r: r, dm: dm}
 }
 
 type decoder struct {
