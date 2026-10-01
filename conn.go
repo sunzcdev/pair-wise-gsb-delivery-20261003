@@ -89,6 +89,22 @@ var ErrCloseSent = errors.New("websocket: close sent")
 // read limit set for the connection.
 var ErrReadLimit = errors.New("websocket: read limit exceeded")
 
+// ErrMessageCanceled is returned when the application cancels delivery of the
+// current message through a CancellableReader. The error only ends the current
+// delivery; the connection is kept open and the next read resumes at the start
+// of the following message.
+var ErrMessageCanceled = errors.New("websocket: message read canceled")
+
+// ErrDrainLimit is returned when a canceled message cannot be drained within
+// the configured byte budget. The connection is closed in that case because
+// the start of the next message cannot be located safely.
+var ErrDrainLimit = errors.New("websocket: message drain byte limit exceeded")
+
+// ErrDrainTimeout is returned when a canceled message cannot be drained within
+// the configured time budget. The connection is closed in that case because
+// the start of the next message cannot be located safely.
+var ErrDrainTimeout = errors.New("websocket: message drain timeout")
+
 // netError satisfies the net Error interface.
 type netError struct {
 	msg       string
@@ -279,6 +295,13 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	// Cancellable read fields.
+	readDeadline time.Time // last value passed to SetReadDeadline.
+	cancelReader *CancellableReader
+
+	drainLimitBytes int64 // maximum wire payload bytes discarded by Cancel.
+	drainTimeout    time.Duration
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {
@@ -315,6 +338,8 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		drainLimitBytes:        defaultDrainLimitBytes,
+		drainTimeout:           defaultDrainTimeout,
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -1013,6 +1038,13 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 		c.reader = nil
 	}
 
+	if cr := c.cancelReader; cr != nil {
+		// A CancellableReader is being abandoned without an explicit
+		// Cancel. Retire it synchronously and let advanceFrame discard the
+		// remainder of the message below.
+		cr.retire()
+	}
+
 	c.messageReader = nil
 	c.readLength = 0
 
@@ -1036,6 +1068,74 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 	// Applications that do handle the error returned from this method spin in
 	// tight loop on connection failure. To help application developers detect
 	// this error, panic on repeated reads to the failed connection.
+	c.readErrCount++
+	if c.readErrCount >= 1000 {
+		panic("repeated read on failed websocket connection")
+	}
+
+	return noFrame, nil, c.readErr
+}
+
+// NextReaderCancellable is like NextReader, but the returned reader also
+// implements CancellableReader. The application can cancel delivery of the
+// current message by calling Cancel on the returned reader (or on the
+// io.Reader converted via AsCancellableReader).
+//
+// Cancel ends only the current delivery: the library drains the remainder of
+// the message within the budgets configured with SetCancelDrainLimit and
+// SetCancelDrainTimeout, while ping, pong and close frames interleaved with
+// the message continue to be processed. Once the drain completes, the
+// connection is positioned at the start of the next message and subsequent
+// calls to NextReader or NextReaderCancellable return that message.
+//
+// If the remainder of the message cannot be drained within the configured
+// budgets, Cancel closes the connection (after a best-effort close handshake)
+// and all subsequent reads return a non-nil error.
+//
+// Reads in progress in another goroutine return ErrMessageCanceled as soon as
+// Cancel interrupts them. There can still be at most one logical reader;
+// callers must not call NextReader concurrently with an ongoing message read.
+func (c *Conn) NextReaderCancellable() (messageType int, r io.Reader, err error) {
+	if cr := c.cancelReader; cr != nil {
+		if err := cr.await(); err != nil {
+			return noFrame, nil, c.readErr
+		}
+	}
+
+	// Close previous reader, only relevant for decompression.
+	if c.reader != nil {
+		c.reader.Close()
+		c.reader = nil
+	}
+
+	c.messageReader = nil
+	c.readLength = 0
+
+	for c.readErr == nil {
+		frameType, err := c.advanceFrame()
+		if err != nil {
+			c.readErr = err
+			break
+		}
+
+		if frameType == TextMessage || frameType == BinaryMessage {
+			c.messageReader = &messageReader{c}
+			c.reader = c.messageReader
+			var inner io.ReadCloser = c.messageReader
+			cr := &CancellableReader{
+				c:    c,
+				done: make(chan struct{}),
+			}
+			if c.readDecompress {
+				c.reader = c.newDecompressionReader(c.reader)
+				inner = c.reader
+			}
+			cr.r = inner
+			c.cancelReader = cr
+			return frameType, cr, nil
+		}
+	}
+
 	c.readErrCount++
 	if c.readErrCount >= 1000 {
 		panic("repeated read on failed websocket connection")
@@ -1114,6 +1214,7 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 // all future reads will return an error. A zero value for t means reads will
 // not time out.
 func (c *Conn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
 	return c.conn.SetReadDeadline(t)
 }
 

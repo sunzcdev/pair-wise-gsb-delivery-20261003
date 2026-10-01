@@ -133,6 +133,37 @@
 // The Close and WriteControl methods can be called concurrently with all other
 // methods.
 //
+// Canceling message reads
+//
+// Use NextReaderCancellable when an application may need to give up on a large
+// in-progress message while keeping the connection open for later messages.
+// The returned io.Reader also implements *CancellableReader; call its Cancel
+// method (or obtain it with AsCancellableReader) to end the current delivery:
+//
+//  _, r, _ := conn.NextReaderCancellable()
+//  if cr := websocket.AsCancellableReader(r); cr != nil {
+//      // ... stop consuming the message at some point ...
+//      if err := cr.Cancel(); err != nil {
+//          // The connection could not be recovered and is closed.
+//          return
+//      }
+//  }
+//  // NextReader / NextReaderCancellable now returns the following message.
+//
+// Cancel only abandons the current delivery. The library drains the rest of
+// that message within the budgets configured with SetCancelDrainLimit and
+// SetCancelDrainTimeout, continues to handle ping, pong and close frames that
+// are interleaved with fragmented messages, and discards any per-message
+// decompression state so it cannot leak into the next message. Reads blocked
+// in another goroutine return ErrMessageCanceled.
+//
+// If the start of the next message cannot be reached within the budgets,
+// Cancel sends a close frame (CloseMessageTooBig or CloseTryAgainLater),
+// closes the connection and returns ErrDrainLimit or ErrDrainTimeout; every
+// subsequent read fails with that error.
+//
+// Cancel may be called concurrently with a Read blocked on the connection.
+//
 // Origin Considerations
 //
 // Web browsers allow Javascript applications to open a WebSocket connection to
