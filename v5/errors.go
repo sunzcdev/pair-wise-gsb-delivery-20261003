@@ -36,3 +36,19 @@ func NewArraySizeError(l, s int) *ArraySizeError {
 func (a *ArraySizeError) Error() string {
 	return fmt.Sprintf("Unable to create array of size %d, limit is %d", a.size, a.limit)
 }
+
+// PolicyViolationError is returned by ApplyWithPolicy and
+// ApplyIndentWithPolicy when a patch operation violates the supplied
+// AccessPolicy. It reports the index of the offending operation and the
+// kind of access that was denied, but intentionally never includes any
+// document values, so protected field contents cannot leak through errors.
+type PolicyViolationError struct {
+	OpIndex    int
+	Permission Permission
+	Path       string
+}
+
+// Error implements the error interface.
+func (e *PolicyViolationError) Error() string {
+	return fmt.Sprintf("operation %d denied by policy: %s access to path %q is not allowed", e.OpIndex, e.Permission, e.Path)
+}

@@ -21,6 +21,7 @@ If you need version 4, use `go get -u gopkg.in/evanphx/json-patch.v4`
 # Use It!
 * [Create and apply a merge patch](#create-and-apply-a-merge-patch)
 * [Create and apply a JSON Patch](#create-and-apply-a-json-patch)
+* [Apply a JSON Patch with an access policy](#apply-a-json-patch-with-an-access-policy)
 * [Comparing JSON documents](#comparing-json-documents)
 * [Combine merge patches](#combine-merge-patches)
 
@@ -147,6 +148,42 @@ When ran, you get the following output:
 $ go run main.go
 Original document: {"name": "John", "age": 24, "height": 3.21}
 Modified document: {"age":24,"name":"Jane"}
+```
+
+## Apply a JSON Patch with an access policy
+When a patch comes from an untrusted caller, you can restrict which document
+paths it is allowed to read and to write by applying it with
+`jsonpatch.ApplyWithPolicy` (v5) instead of `jsonpatch.Apply`. The caller
+supplies an `AccessPolicy` with separate `Read` and `Write` path policies;
+each policy receives an RFC 6901 JSON pointer and reports whether access is
+allowed. A nil policy (or nil field) allows everything, so `Apply` keeps its
+existing behavior.
+
+Every operation is checked against the document as it evolves step by step:
+
+* replacing or removing a parent object also requires write access to any
+  protected children it would change,
+* `move` and `copy` require read access to the whole `from` subtree (and
+  `move` additionally requires write access to the removed source),
+* `test` requires read access to the compared value, since its result would
+  otherwise leak whether a protected value matches.
+
+When an operation is denied, a `*jsonpatch.PolicyViolationError` is returned
+reporting the operation index and the permission (`read` or `write`) that was
+refused. Document values are never included in the error, so protected field
+contents cannot leak through it.
+
+```go
+policy := &jsonpatch.AccessPolicy{
+	Read: func(path string) bool {
+		return path != "/customer/idCard"
+	},
+	Write: func(path string) bool {
+		return path == "/customer/phone" || path == "/customer/email"
+	},
+}
+
+modified, err := patch.ApplyWithPolicy(original, policy)
 ```
 
 ## Comparing JSON documents

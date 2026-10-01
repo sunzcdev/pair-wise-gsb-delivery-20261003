@@ -1219,6 +1219,12 @@ func (p Patch) ApplyIndent(doc []byte, indent string) ([]byte, error) {
 // ApplyIndentWithOptions mutates a JSON document according to the patch and the passed in ApplyOptions.
 // It returns the new document indented.
 func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyOptions) ([]byte, error) {
+	return p.applyIndent(doc, indent, options, nil)
+}
+
+// applyIndent applies the patch like ApplyIndentWithOptions, additionally
+// enforcing policy on every operation when policy is non-nil.
+func (p Patch) applyIndent(doc []byte, indent string, options *ApplyOptions, policy *AccessPolicy) ([]byte, error) {
 	if len(doc) == 0 {
 		return doc, nil
 	}
@@ -1252,7 +1258,20 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 
 	var accumulatedCopySize int64
 
-	for _, op := range p {
+	for i, op := range p {
+		var before interface{}
+
+		if policy != nil {
+			before, err = snapshotContainer(&pd, options)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := checkReadAccess(before, op, policy, i); err != nil {
+				return nil, err
+			}
+		}
+
 		switch op.Kind() {
 		case "add":
 			err = p.add(&pd, op, options)
@@ -1272,6 +1291,17 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 
 		if err != nil {
 			return nil, err
+		}
+
+		if policy != nil {
+			after, err := snapshotContainer(&pd, options)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := checkWriteAccess(before, after, policy, i); err != nil {
+				return nil, err
+			}
 		}
 	}
 
