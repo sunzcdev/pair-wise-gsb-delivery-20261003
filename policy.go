@@ -32,15 +32,31 @@ type defaultPolicy[V any] struct {
 	done     chan struct{}
 	isClosed bool
 	metrics  *Metrics
+	// tenants holds the quota state of every registered tenant. Index 0 is
+	// the implicit untenanted bucket and always exists.
+	tenants map[uint64]*tenantInfo
+	// keyTenant maps every key in the policy to its owning tenant.
+	keyTenant map[uint64]uint64
+	// totalReserved is the sum of all tenant reservations (<= maxCost).
+	totalReserved int64
+	// tenantItemsCh carries per-tenant access records.
+	tenantItemsCh chan tenantPush
 }
 
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	p := &defaultPolicy[V]{
-		admit:   newTinyLFU(numCounters),
-		evict:   newSampledLFU(maxCost),
-		itemsCh: make(chan []uint64, 3),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		admit:         newTinyLFU(numCounters),
+		evict:         newSampledLFU(maxCost),
+		itemsCh:       make(chan []uint64, 3),
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
+		tenants:       make(map[uint64]*tenantInfo),
+		keyTenant:     make(map[uint64]uint64),
+		tenantItemsCh: make(chan tenantPush, 64),
+	}
+	p.tenants[noTenant] = &tenantInfo{
+		keys: make(map[uint64]int64),
+		freq: p.admit,
 	}
 	go p.processItems()
 	return p
@@ -62,6 +78,23 @@ func (p *defaultPolicy[V]) processItems() {
 		case items := <-p.itemsCh:
 			p.Lock()
 			p.admit.Push(items)
+			// Attribute accesses to the owning tenant's sketch as well, so
+			// tenant-level hotness reflects actual usage.
+			for _, key := range items {
+				if tenant, ok := p.keyTenant[key]; ok && tenant != noTenant {
+					if t, found := p.tenants[tenant]; found {
+						t.freq.Increment(key)
+					}
+				}
+			}
+			p.Unlock()
+		case tp := <-p.tenantItemsCh:
+			p.Lock()
+			if t, ok := p.tenants[tp.tenant]; ok && tp.tenant != noTenant {
+				t.freq.Increment(tp.key)
+			} else {
+				p.admit.Increment(tp.key)
+			}
 			p.Unlock()
 		case <-p.stop:
 			p.done <- struct{}{}
@@ -89,10 +122,33 @@ func (p *defaultPolicy[V]) Push(keys []uint64) bool {
 	}
 }
 
+// PushTenant records an access to a key on behalf of a tenant, feeding the
+// tenant's own frequency sketch. It is lossy under contention, like Push.
+func (p *defaultPolicy[V]) PushTenant(tenant uint64, key uint64) bool {
+	if p.isClosed {
+		return false
+	}
+	select {
+	case p.tenantItemsCh <- tenantPush{tenant: tenant, key: key}:
+		return true
+	default:
+		return false
+	}
+}
+
 // Add decides whether the item with the given key and cost should be accepted by
 // the policy. It returns the list of victims that have been evicted and a boolean
 // indicating whether the incoming item should be accepted.
 func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
+	return p.add(noTenant, key, cost)
+}
+
+// add is the tenant-aware version of Add. Items of a tenant that is within
+// its reserved share may reclaim borrowed space unconditionally; items beyond
+// the share compete for borrowed space using the tenant's own access
+// frequency and can never evict entries protected by another tenant's
+// reservation.
+func (p *defaultPolicy[V]) add(tenant uint64, key uint64, cost int64) ([]*Item[V], bool) {
 	p.Lock()
 	defer p.Unlock()
 
@@ -102,10 +158,17 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	}
 
 	// No need to go any further if the item is already in the cache.
-	if has := p.evict.updateIfHas(key, cost); has {
+	if _, has := p.evict.keyCosts[key]; has {
+		p.updateExisting(tenant, key, cost)
 		// An update does not count as an addition, so return false.
 		return nil, false
 	}
+
+	tenant = p.canonicalTenant(tenant)
+	t := p.tenants[tenant]
+	// withinShare means the tenant is entitled to the space this item needs:
+	// borrowed space may be reclaimed to satisfy the reservation.
+	withinShare := tenant != noTenant && t.used+cost <= t.reserved
 
 	// If the execution reaches this point, the key doesn't exist in the cache.
 	// Calculate the remaining room in the cache (usually bytes).
@@ -114,12 +177,13 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 		// There's enough room in the cache to store the new item without
 		// overflowing. Do that now and stop here.
 		p.evict.add(key, cost)
+		p.tenantAdd(tenant, key, cost)
 		p.metrics.add(costAdd, key, uint64(cost))
 		return nil, true
 	}
 
 	// incHits is the hit count for the incoming item.
-	incHits := p.admit.Estimate(key)
+	incHits := p.estimateFor(tenant, key)
 	// sample is the eviction candidate pool to be filled via random sampling.
 	// TODO: perhaps we should use a min heap here. Right now our time
 	// complexity is N for finding the min. Min heap should bring it down to
@@ -131,26 +195,40 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	// Delete victims until there's enough space or a minKey is found that has
 	// more hits than incoming item.
 	for ; room < 0; room = p.evict.roomLeft(cost) {
-		// Fill up empty slots in sample.
-		sample = p.evict.fillSample(sample)
+		// Fill up empty slots in sample with reclaimable (borrowed or
+		// untenanted) entries only. Entries inside an owner's reserved share
+		// are never eviction candidates for other tenants.
+		sample = p.fillReclaimableSample(sample)
+		if len(sample) == 0 {
+			// The cache is full of entries protected by reservations. A
+			// borrower has nothing to compete for. (A tenant within its own
+			// share cannot reach this state because reservations sum to at
+			// most MaxCost, so there is always enough reclaimable space.)
+			p.metrics.add(rejectSets, key, 1)
+			return victims, false
+		}
 
 		// Find minimally used item in sample.
 		minKey, minHits, minId, minCost := uint64(0), int64(math.MaxInt64), 0, int64(0)
 		for i, pair := range sample {
-			// Look up hit count for sample key.
-			if hits := p.admit.Estimate(pair.key); hits < minHits {
+			// Look up hit count for sample key in its owner's sketch.
+			if hits := p.estimateFor(p.keyTenant[pair.key], pair.key); hits < minHits {
 				minKey, minHits, minId, minCost = pair.key, hits, i, pair.cost
 			}
 		}
 
 		// If the incoming item isn't worth keeping in the policy, reject.
-		if incHits < minHits {
+		// A tenant reclaiming its own reserved share skips the frequency
+		// comparison: reservation ownership beats borrower hotness.
+		if !withinShare && incHits < minHits {
 			p.metrics.add(rejectSets, key, 1)
 			return victims, false
 		}
 
 		// Delete the victim from metadata.
+		victimTenant := p.keyTenant[minKey]
 		p.evict.del(minKey)
+		p.tenantDel(minKey)
 
 		// Delete the victim from sample.
 		sample[minId] = sample[len(sample)-1]
@@ -160,10 +238,12 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 			Key:      minKey,
 			Conflict: 0,
 			Cost:     minCost,
+			tenant:   victimTenant,
 		})
 	}
 
 	p.evict.add(key, cost)
+	p.tenantAdd(tenant, key, cost)
 	p.metrics.add(costAdd, key, uint64(cost))
 	return victims, true
 }
@@ -178,6 +258,7 @@ func (p *defaultPolicy[V]) Has(key uint64) bool {
 func (p *defaultPolicy[V]) Del(key uint64) {
 	p.Lock()
 	p.evict.del(key)
+	p.tenantDel(key)
 	p.Unlock()
 }
 
@@ -189,8 +270,15 @@ func (p *defaultPolicy[V]) Cap() int64 {
 }
 
 func (p *defaultPolicy[V]) Update(key uint64, cost int64) {
+	p.update(noTenant, key, cost)
+}
+
+// update is the tenant-aware version of Update.
+func (p *defaultPolicy[V]) update(tenant uint64, key uint64, cost int64) {
 	p.Lock()
-	p.evict.updateIfHas(key, cost)
+	if _, ok := p.evict.keyCosts[key]; ok {
+		p.updateExisting(tenant, key, cost)
+	}
 	p.Unlock()
 }
 
@@ -208,6 +296,14 @@ func (p *defaultPolicy[V]) Clear() {
 	p.Lock()
 	p.admit.clear()
 	p.evict.clear()
+	for id, t := range p.tenants {
+		t.used = 0
+		t.keys = make(map[uint64]int64)
+		if id != noTenant {
+			t.freq.clear()
+		}
+	}
+	p.keyTenant = make(map[uint64]uint64)
 	p.Unlock()
 }
 
@@ -222,6 +318,7 @@ func (p *defaultPolicy[V]) Close() {
 	close(p.stop)
 	close(p.done)
 	close(p.itemsCh)
+	close(p.tenantItemsCh)
 	p.isClosed = true
 }
 

@@ -198,6 +198,7 @@ type Item[V any] struct {
 	Value      V
 	Cost       int64
 	Expiration time.Time
+	tenant     uint64
 	wait       chan struct{}
 }
 
@@ -294,6 +295,57 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	return value, ok
 }
 
+// GetForTenant works like Get but records the access against the given
+// tenant's own access-frequency sketch. A tenant's admission decisions are
+// based on its own access frequency, so callers sharing one cache across
+// tenants should prefer GetForTenant over Get.
+func (c *Cache[K, V]) GetForTenant(tenant uint64, key K) (V, bool) {
+	if c == nil || c.isClosed.Load() {
+		return zeroValue[V](), false
+	}
+	keyHash, conflictHash := c.keyToHash(key)
+
+	c.cachePolicy.PushTenant(tenant, keyHash)
+	value, ok := c.storedItems.Get(keyHash, conflictHash)
+	if ok {
+		c.Metrics.add(hit, keyHash, 1)
+	} else {
+		c.Metrics.add(miss, keyHash, 1)
+	}
+	return value, ok
+}
+
+// RegisterTenant reserves a cost share of the cache for the given tenant.
+// The reserved share is protected: other tenants may borrow it while it is
+// idle, but their borrowed entries are evicted (reclaimed) when the owner
+// needs its share back. The sum of all reservations may not exceed MaxCost.
+// Registering an already registered tenant updates its reservation.
+func (c *Cache[K, V]) RegisterTenant(tenant uint64, reservedCost int64) error {
+	if c == nil || c.isClosed.Load() {
+		return errors.New("cache is closed")
+	}
+	return c.cachePolicy.registerTenant(tenant, reservedCost)
+}
+
+// UnregisterTenant removes the tenant's reservation. The tenant's entries
+// stay in the cache but lose their protection: they become untenanted and
+// can be reclaimed or evicted like any other untenanted item.
+func (c *Cache[K, V]) UnregisterTenant(tenant uint64) {
+	if c == nil || c.isClosed.Load() {
+		return
+	}
+	c.cachePolicy.unregisterTenant(tenant)
+}
+
+// TenantStats returns a snapshot of the tenant's quota usage and whether the
+// tenant is currently registered.
+func (c *Cache[K, V]) TenantStats(tenant uint64) (TenantStats, bool) {
+	if c == nil {
+		return TenantStats{}, false
+	}
+	return c.cachePolicy.tenantStats(tenant)
+}
+
 // Set attempts to add the key-value item to the cache. If it returns false,
 // then the Set was dropped and the key-value item isn't added to the cache. If
 // it returns true, there's still a chance it could be dropped by the policy if
@@ -313,6 +365,13 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 	return c.SetWithTTL(key, value, cost, 0*time.Second)
 }
 
+// SetForTenant works like Set but attributes the item to the given tenant.
+// The tenant must have been registered with RegisterTenant to hold a
+// reservation; items of unregistered tenants are treated as untenanted.
+func (c *Cache[K, V]) SetForTenant(tenant uint64, key K, value V, cost int64) bool {
+	return c.SetForTenantWithTTL(tenant, key, value, cost, 0*time.Second)
+}
+
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
 // after the specified TTL (time to live) has passed. A zero value means the value never
 // expires, which is identical to calling Set. A negative value is a no-op and the value
@@ -320,6 +379,16 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.setWithTTL(noTenant, key, value, cost, ttl)
+}
+
+// SetForTenantWithTTL works like SetWithTTL but attributes the item to the
+// given tenant. See SetForTenant and SetWithTTL for more information.
+func (c *Cache[K, V]) SetForTenantWithTTL(tenant uint64, key K, value V, cost int64, ttl time.Duration) bool {
+	return c.setWithTTL(tenant, key, value, cost, ttl)
+}
+
+func (c *Cache[K, V]) setWithTTL(tenant uint64, key K, value V, cost int64, ttl time.Duration) bool {
 	if c == nil || c.isClosed.Load() {
 		return false
 	}
@@ -344,6 +413,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		tenant:     tenant,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -554,7 +624,7 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				victims, added := c.cachePolicy.add(i.tenant, i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)
@@ -568,7 +638,7 @@ func (c *Cache[K, V]) processItems() {
 				}
 
 			case itemUpdate:
-				c.cachePolicy.Update(i.Key, i.Cost)
+				c.cachePolicy.update(i.tenant, i.Key, i.Cost)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
