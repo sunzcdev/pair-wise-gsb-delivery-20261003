@@ -130,8 +130,8 @@
 // SetReadDeadline, ReadMessage, ReadJSON, SetPongHandler, SetPingHandler)
 // concurrently.
 //
-// The Close and WriteControl methods can be called concurrently with all other
-// methods.
+// The Close, WriteControl and WaitCloseHandshake methods can be called
+// concurrently with all other methods.
 //
 // Origin Considerations
 //

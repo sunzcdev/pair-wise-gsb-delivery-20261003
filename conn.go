@@ -6,6 +6,7 @@ package websocket
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -279,6 +280,17 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	// Close handshake tracking. The handshake completes when the application
+	// has sent a close message and the read loop has processed the peer's
+	// close message. The handshake has a single final result, recorded in
+	// closeResult when closeDone is closed.
+	closeMu       sync.Mutex
+	closeSent     bool
+	closeReceived bool
+	closeFinished bool
+	closeResult   error
+	closeDone     chan struct{}
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {
@@ -315,6 +327,7 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		closeDone:              make(chan struct{}),
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -400,6 +413,7 @@ func (c *Conn) write(frameType int, deadline time.Time, buf0, buf1 []byte) error
 	}
 	if frameType == CloseMessage {
 		_ = c.writeFatal(ErrCloseSent)
+		c.noteCloseSent()
 	}
 	return nil
 }
@@ -476,6 +490,7 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 	}
 	if messageType == CloseMessage {
 		_ = c.writeFatal(ErrCloseSent)
+		c.noteCloseSent()
 	}
 	return err
 }
@@ -977,6 +992,7 @@ func (c *Conn) advanceFrame() (int, error) {
 				return noFrame, c.handleProtocolError("invalid utf8 payload in close frame")
 			}
 		}
+		c.noteCloseReceived()
 		if err := c.handleClose(closeCode, closeText); err != nil {
 			return noFrame, err
 		}
@@ -1153,6 +1169,95 @@ func (c *Conn) SetCloseHandler(h func(code int, text string) error) {
 		}
 	}
 	c.handleClose = h
+}
+
+// WaitCloseHandshake waits for the close handshake with the peer to complete.
+// The handshake completes when the application has sent a close message to
+// the peer and the application's read loop has processed the peer's close
+// message.
+//
+// WaitCloseHandshake does not read from the connection. The application must
+// run a read loop (NextReader, ReadMessage or the message reader Read method)
+// to process the peer's close message. The read loop invokes the close
+// handler set with SetCloseHandler as usual when the peer's close message
+// arrives.
+//
+// A typical use in a connection shutdown sequence is to send a close message
+// and then wait for the peer to respond:
+//
+//	_ = c.WriteMessage(CloseMessage, FormatCloseMessage(CloseNormalClosure, ""))
+//	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//	defer cancel()
+//	_ = c.WaitCloseHandshake(ctx)
+//
+// If the context expires before the handshake completes, WaitCloseHandshake
+// closes the underlying network connection and returns the context's error.
+//
+// The handshake has a single final result: the first of handshake completion
+// or context expiration determines the result, and concurrent and subsequent
+// calls to WaitCloseHandshake return that same result.
+//
+// WaitCloseHandshake can be called concurrently with all other methods.
+func (c *Conn) WaitCloseHandshake(ctx context.Context) error {
+	select {
+	case <-c.closeDone:
+		return c.closeResult
+	default:
+	}
+
+	select {
+	case <-c.closeDone:
+		return c.closeResult
+	case <-ctx.Done():
+		result, finished := c.finishCloseHandshake(ctx.Err())
+		if finished {
+			// The peer did not respond in time. Release the connection.
+			_ = c.Close()
+		}
+		return result
+	}
+}
+
+// noteCloseSent records that the application sent a close message to the
+// peer.
+func (c *Conn) noteCloseSent() {
+	c.closeMu.Lock()
+	c.closeSent = true
+	c.completeCloseHandshakeLocked()
+	c.closeMu.Unlock()
+}
+
+// noteCloseReceived records that the application's read loop processed a
+// close message from the peer.
+func (c *Conn) noteCloseReceived() {
+	c.closeMu.Lock()
+	c.closeReceived = true
+	c.completeCloseHandshakeLocked()
+	c.closeMu.Unlock()
+}
+
+// completeCloseHandshakeLocked completes the close handshake successfully
+// when both sides have sent close messages. The caller must hold closeMu.
+func (c *Conn) completeCloseHandshakeLocked() {
+	if c.closeSent && c.closeReceived && !c.closeFinished {
+		c.closeFinished = true
+		close(c.closeDone)
+	}
+}
+
+// finishCloseHandshake records err as the final result of the close handshake
+// if the handshake is not already finished. It returns the final result of
+// the handshake and whether this call finished the handshake.
+func (c *Conn) finishCloseHandshake(err error) (error, bool) {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closeFinished {
+		return c.closeResult, false
+	}
+	c.closeFinished = true
+	c.closeResult = err
+	close(c.closeDone)
+	return err, true
 }
 
 // PingHandler returns the current ping handler
