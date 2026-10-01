@@ -1,3 +1,6 @@
+## Unreleased
+* [FEATURE] Add `adapt` organizer steps that remap an interactor's inputs and outputs through an isolated context.
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

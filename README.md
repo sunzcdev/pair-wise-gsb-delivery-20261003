@@ -470,6 +470,64 @@ end
 interactor should have a single purpose, there should be no need to clean up
 after any failed interactor.
 
+#### Adapting an Interactor
+
+Sometimes an existing interactor expects different context key names than the
+rest of an organizer's flow. Rather than changing the interactor, an
+organizer can declare an *adapted* step with `adapt`. Mapped inputs are
+copied from the organizer's context into an isolated context before the
+interactor runs, and mapped outputs are copied back only after the
+interactor succeeds. Keys that aren't mapped never cross that boundary.
+
+Both mappings use the interactor's key on the left and the organizer's key
+on the right.
+
+```ruby
+class CreateReceipt
+  include Interactor
+
+  def call
+    context.receipt = Receipt.create!(account: context.account)
+  end
+
+  def rollback
+    context.receipt.destroy
+  end
+end
+
+class ProcessPayment
+  include Interactor::Organizer
+
+  organize ChargeCard,
+    adapt(CreateReceipt,
+          inputs: { account: :payer },
+          outputs: { receipt: :payment_receipt })
+end
+
+result = ProcessPayment.call(payer: customer)
+result.payment_receipt # => the receipt created from `customer`
+```
+
+In this example, `CreateReceipt` sees `account` but never `payer`, and the
+organizer receives `payment_receipt` without its context being polluted by
+`receipt` or any other temporary keys.
+
+Mapped inputs must be present in the parent context before the step runs;
+an explicitly `nil` value is considered present. Mapped outputs must be
+present on the local context after the step runs. Missing inputs raise
+`Interactor::MissingInput` and missing outputs raise
+`Interactor::MissingOutput`. Every declared output is checked *before* any of
+them are written back, so a missing output can't leave the parent context
+half-populated. Declaring two outputs that target the same parent key is
+rejected before the interactor is invoked.
+
+Adapted steps keep the usual failure and rollback semantics: a failure
+stops the organizer and rolls back previously successful steps. When an
+adapted step is rolled back, the interactors that actually ran are rolled
+back against the isolated context they ran against. Calling the same
+interactor twice through `adapt` (with different mappings) creates two
+independent steps and two independent rollbacks.
+
 ## Testing Interactors
 
 When written correctly, an interactor is easy to test because it only *does* one

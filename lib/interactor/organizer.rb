@@ -1,3 +1,5 @@
+require "interactor/adapter"
+
 module Interactor
   # Public: Interactor::Organizer methods. Because Interactor::Organizer is a
   # module, custom Interactor::Organizer classes should include
@@ -46,6 +48,33 @@ module Interactor
       # Returns nothing.
       def organize(*interactors)
         @organized = interactors.flatten
+      end
+
+      # Public: Declare an Interactor to be invoked with its inputs and
+      # outputs remapped through an isolated Context. The resulting step is
+      # added alongside regular Interactors with #organize; the adapted
+      # Interactor itself does not need to change.
+      #
+      # interactor - The Interactor class to invoke.
+      # inputs      - A Hash mapping the Interactor's input keys to keys in
+      #               the Organizer's Context. (default: {})
+      # outputs     - A Hash mapping the Interactor's output keys to keys in
+      #               the Organizer's Context. (default: {})
+      #
+      # Examples
+      #
+      #   class MyOrganizer
+      #     include Interactor::Organizer
+      #
+      #     organize InteractorOne,
+      #       adapt(CreateReceipt,
+      #             inputs: { account: :payer },
+      #             outputs: { receipt: :payment_receipt })
+      #   end
+      #
+      # Returns an adapted Interactor class.
+      def adapt(interactor, inputs: {}, outputs: {})
+        Interactor::Adapter.build(interactor, inputs, outputs)
       end
 
       # Internal: An Array of declared Interactors to be invoked.
