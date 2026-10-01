@@ -4,11 +4,17 @@ require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
 require 'blueprinter/deprecation'
+require 'blueprinter/render_snapshot'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
   module Rendering
     include TypeHelpers
+
+    # @api private
+    # Options key used to propagate the active RenderSnapshot to nested
+    # (association) renders within a single top-level render.
+    SNAPSHOT_OPTIONS_KEY = :__blueprinter_render_snapshot__
 
     # Generates a JSON formatted String represantation of the provided object.
     #
@@ -23,6 +29,9 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions of every Blueprint used by this render, so
+    #   redefining a view mid-render does not affect the render in progress.
     #
     # @example Generating JSON with an extended view
     #   post = Post.all
@@ -48,6 +57,9 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions of every Blueprint used by this render, so
+    #   redefining a view mid-render does not affect the render in progress.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -73,6 +85,9 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions of every Blueprint used by this render, so
+    #   redefining a view mid-render does not affect the render in progress.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -92,7 +107,9 @@ module Blueprinter
     #   additional key value pairs will be exposed during serialization.
     # @return [Hash]
     def hashify(object, view_name:, local_options:)
-      raise Errors::UnknownView, "View '#{view_name}' is not defined" unless view_collection.view?(view_name)
+      snapshot = local_options[SNAPSHOT_OPTIONS_KEY]
+      view_defined = snapshot ? snapshot.view?(self, view_name) : view_collection.view?(view_name)
+      raise Errors::UnknownView, "View '#{view_name}' is not defined" unless view_defined
 
       object = Blueprinter.configuration.extensions.pre_render(object, self, view_name, local_options)
       prepare_data(object, view_name, local_options)
@@ -146,8 +163,10 @@ module Blueprinter
 
     def object_to_hash(object, view_name:, local_options:)
       result_hash = {}
+      snapshot = local_options[SNAPSHOT_OPTIONS_KEY]
+      fields = snapshot ? snapshot.fields_for(self, view_name) : view_collection.fields_for(view_name)
 
-      view_collection.fields_for(view_name).each do |field|
+      fields.each do |field|
         next if field.skip?(field.name, object, local_options)
 
         value = field.extract(object, local_options)
@@ -156,7 +175,8 @@ module Blueprinter
         result_hash[field.name] = value
       end
 
-      view_collection.transformers(view_name).each do |transformer|
+      transformers = snapshot ? snapshot.transformers_for(self, view_name) : view_collection.transformers(view_name)
+      transformers.each do |transformer|
         transformer.transform(result_hash, object, local_options)
       end
 
@@ -183,21 +203,32 @@ module Blueprinter
 
     def build_result(object:, options:)
       view_name = options[:view] || :default
+      snapshot = options[:snapshot] ? RenderSnapshot.new : nil
+      local_options = options.except(:view, :root, :meta, :snapshot)
 
-      prepared_object = hashify(
-        object,
-        view_name:,
-        local_options: options.except(:view, :root, :meta)
-      )
-      object_with_root = apply_root_key(
-        object: prepared_object,
-        root: options[:root]
-      )
-      add_metadata(
-        object: object_with_root,
-        metadata: options[:meta],
-        root: options[:root]
-      )
+      begin
+        if snapshot
+          snapshot.pin(self)
+          local_options = local_options.merge(SNAPSHOT_OPTIONS_KEY => snapshot)
+        end
+
+        prepared_object = hashify(
+          object,
+          view_name:,
+          local_options:
+        )
+        object_with_root = apply_root_key(
+          object: prepared_object,
+          root: options[:root]
+        )
+        add_metadata(
+          object: object_with_root,
+          metadata: options[:meta],
+          root: options[:root]
+        )
+      ensure
+        snapshot&.release!
+      end
     end
   end
 end

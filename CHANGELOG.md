@@ -1,5 +1,5 @@
 ## Unreleased
---
+- 🚀 [FEATURE] Adds optional render snapshot mode (`snapshot: true`) that pins each Blueprint's view definitions for the duration of a single top-level render, so redefining a view mid-render does not affect the render in progress.
 
 ## 1.3.0 - 2026/04/14
 - 🚀 [FEATURE] Adds support for `Symbol#to_proc` syntax in fields and identifiers. See [#546](https://github.com/procore-oss/blueprinter/pull/546). Thanks to [@tob1k](https://github.com/tob1k).

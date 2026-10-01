@@ -1224,6 +1224,34 @@ Output:
 
 </details>
 
+<details>
+<summary>Render Snapshot Mode</summary>
+
+By default, Blueprinter resolves each Blueprint's view definitions (fields,
+exclusions, included views and transformers) lazily while rendering. If a view
+is redefined while a collection is being rendered, later objects in that same
+render may be serialized with the new definitions.
+
+Pass `snapshot: true` to `render`, `render_as_hash` or `render_as_json` to pin
+the view definitions for the duration of a single top-level render:
+
+```ruby
+UserBlueprint.render_as_hash(users, snapshot: true)
+```
+
+The root Blueprint is pinned when the render starts. Nested or dynamically
+selected Blueprints (e.g. associations, including those selected with a Proc)
+are pinned the first time they are encountered during the render; every later
+encounter within the same render reuses the pinned definitions. Definition
+updates made during the render become visible to the next top-level render.
+
+The pinned state is released when the render finishes, even if it raises. Each
+top-level render owns its own snapshot, so concurrent renders never overwrite
+each other's pinned versions, and the objects being rendered are never frozen
+or otherwise modified.
+
+</details>
+
 ## Installation
 
 Add this line to your application's Gemfile:

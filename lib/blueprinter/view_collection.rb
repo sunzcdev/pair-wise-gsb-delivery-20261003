@@ -70,6 +70,16 @@ module Blueprinter
       @cache[:transformers][view_name]
     end
 
+    # Returns a frozen, point-in-time snapshot of the compiled view
+    # definitions (fields and transformers for every view). The snapshot is
+    # unaffected by later definition changes, which build a fresh cache.
+    # @return [Hash]
+    def snapshot
+      ensure_cached!
+
+      @cache
+    end
+
     # @param [String] view_name
     # @return [View]
     def [](view_name)
