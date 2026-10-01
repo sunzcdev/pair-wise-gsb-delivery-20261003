@@ -248,11 +248,39 @@ module RackCacheMetaStoreImplementation
         # fresh response
         response = mock_response(200, {'Expires' => (Time.now + 3600).httpdate, 'vary' => 'Bar'}, ['test'])
         @store.store(request, response, @entity_store)
-        
+
         @store.invalidate(request, @entity_store)
         @store.read(cache_key).each do |_, res|
           res.must_include 'x-status'
         end
+      end
+
+      it 'invalidates every request given to #invalidate' do
+        first  = mock_request('/first', {})
+        second = mock_request('/second', {})
+        third  = mock_request('/third', {})
+
+        [first, second, third].each do |request|
+          response = mock_response(200, {'cache-control' => 'max-age=420'}, ['test'])
+          @store.store(request, response, @entity_store)
+        end
+
+        @store.invalidate([first, third], @entity_store)
+
+        refute @store.lookup(first, @entity_store).fresh?
+        assert @store.lookup(second, @entity_store).fresh?
+        refute @store.lookup(third, @entity_store).fresh?
+      end
+
+      it 'invalidates duplicate requests only once' do
+        request = mock_request('/test', {})
+        response = mock_response(200, {'cache-control' => 'max-age=420'}, ['test'])
+        @store.store(request, response, @entity_store)
+
+        # a duplicate request target must touch the store a single time
+        @store.expects(:read).once.returns([])
+        @store.expects(:write).never
+        @store.invalidate([request, request], @entity_store)
       end
 
       it 'gracefully degrades if the cache store stops working' do

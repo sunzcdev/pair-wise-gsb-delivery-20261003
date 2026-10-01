@@ -1,3 +1,12 @@
+## Unreleased
+
+ * Invalidate unsafe-method responses after a successful response: only mark
+   the request target and parseable, same-origin Location / Content-Location
+   URLs stale (including their cached variants) once a non-error response is
+   received. Failed writes no longer invalidate existing cache entries;
+   cross-origin, malformed and duplicate addresses are ignored. Entries are
+   left revalidatable rather than deleted (RFC 9111 4.4)
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

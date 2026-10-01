@@ -900,6 +900,101 @@ describe Rack::Cache::Context do
     cache.trace.must_include :store
   end
 
+  describe 'post-response cache invalidation' do
+    def fresh_entry?(url)
+      request =
+        Rack::Cache::Request.new(Rack::MockRequest.env_for(url))
+      entry = cache.metastore.lookup(request, cache.entitystore)
+      !entry.nil? && entry.fresh?
+    end
+
+    def entry(url)
+      request =
+        Rack::Cache::Request.new(Rack::MockRequest.env_for(url))
+      cache.metastore.lookup(request, cache.entitystore)
+    end
+
+    before do
+      respond_with do |req, res|
+        if req.request_method == 'GET'
+          if req.env['HTTP_IF_NONE_MATCH'] == '"v1"'
+            res.status = 304
+            res['etag'] = '"v1"'
+            res['cache-control'] = 'public, max-age=500'
+            res.body = []
+          else
+            res.status = 200
+            res['cache-control'] = 'public, max-age=500'
+            res['etag'] = '"v1"'
+            res.body = ["body #{req.host} #{req.path}"]
+          end
+        elsif req.request_method == 'POST' && req.path == '/resource'
+          if req.host == 'alpha.example' && req.env['HTTP_X_OUTCOME'] == 'failure'
+            res.status = 500
+            res.body = ['error']
+          else
+            # a redirect-style successful write. Location names a relative
+            # same-origin resource; Content-Location names the same path on a
+            # different origin and must not be invalidated.
+            res.status = 303
+            res['location'] = '/related'
+            res['content-location'] = 'http://beta.example/resource'
+            res.body = []
+          end
+        end
+      end
+
+      # fill the cache: the same path on two different origins, plus the
+      # resource named by Location and an unrelated resource.
+      get 'http://alpha.example/resource'
+      get 'http://beta.example/resource'
+      get 'http://alpha.example/related'
+      get 'http://alpha.example/untouched'
+    end
+
+    it 'does not invalidate anything when the write fails' do
+      post 'http://alpha.example/resource', 'HTTP_X_OUTCOME' => 'failure'
+
+      assert response.server_error?
+      cache.trace.must_include :pass
+      cache.trace.wont_include :invalidate
+
+      fresh_entry?('http://alpha.example/resource').must_equal true
+      fresh_entry?('http://beta.example/resource').must_equal true
+      fresh_entry?('http://alpha.example/related').must_equal true
+      fresh_entry?('http://alpha.example/untouched').must_equal true
+    end
+
+    it 'invalidates the request target and same-origin header resources only on success' do
+      post 'http://alpha.example/resource'
+
+      assert response.redirect?
+      cache.trace.must_include :pass
+      cache.trace.must_include :invalidate
+
+      # exact set of invalidated entries:
+      fresh_entry?('http://alpha.example/resource').must_equal false
+      fresh_entry?('http://alpha.example/related').must_equal false
+      # cross-origin same-path resource named by Content-Location stays fresh
+      fresh_entry?('http://beta.example/resource').must_equal true
+      # nothing else was swept in
+      fresh_entry?('http://alpha.example/untouched').must_equal true
+
+      # invalidated entries keep their stored body / validator and are simply
+      # revalidated rather than unconditionally deleted
+      stale = entry('http://alpha.example/resource')
+      refute_nil stale
+      refute stale.fresh?
+      stale.etag.must_equal '"v1"'
+
+      get 'http://alpha.example/resource'
+      assert response.ok?
+      response.body.must_equal 'body alpha.example /resource'
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+    end
+  end
+
   describe 'with responses that include a Vary header' do
     before do
       count = 0
@@ -1029,5 +1124,64 @@ describe Rack::Cache::Context do
     get '/', 'rack.logger' => logger
     assert response.ok?
     logger.logged_level.must_equal "info"
+  end
+end
+
+describe 'Rack::Cache::Context post-response invalidation targets' do
+  before { setup_cache_context }
+  after  { teardown_cache_context }
+
+  def targets_for(uri, headers)
+    respond_with 200
+    # run a throwaway request to initialize the context for +uri+
+    request(:post, uri)
+    response = Rack::Cache::Response.new(303, headers, [])
+    @cache.send(:invalidation_targets, response)
+  end
+
+  def keys_for(uri, headers)
+    targets_for(uri, headers).map { |request| @cache.metastore.cache_key(request) }
+  end
+
+  it 'always includes the request target' do
+    keys_for('http://example.org/path?q=1', {}).
+      must_equal ['http://example.org/path?q=1']
+  end
+
+  it 'resolves relative references against the current request URL' do
+    keys_for('http://example.org/dir/page', 'location' => 'other?q=2').
+      must_equal ['http://example.org/dir/page', 'http://example.org/dir/other?q=2']
+  end
+
+  it 'accepts absolute same-origin references and normalizes default ports' do
+    keys_for('http://example.org:80/page', 'content-location' => 'http://example.org/other').
+      must_equal ['http://example.org/page', 'http://example.org/other']
+  end
+
+  it 'rejects cross-origin references from Location and Content-Location' do
+    keys = keys_for('http://example.org/page',
+      'location' => 'https://example.org/page',
+      'content-location' => 'http://example.org:8080/page')
+    keys.must_equal ['http://example.org/page']
+  end
+
+  it 'rejects malformed references and non-HTTP schemes without raising' do
+    keys = keys_for('http://example.org/page',
+      'location' => 'http://[bad',
+      'content-location' => 'ftp://example.org/page')
+    keys.must_equal ['http://example.org/page']
+  end
+
+  it 'does not expand the invalidation set with duplicate references' do
+    keys = keys_for('http://example.org/page',
+      'location' => '/page#frag',
+      'content-location' => 'http://example.org/page')
+    keys.must_equal ['http://example.org/page']
+  end
+
+  it 'distinguishes hosts that share the same path' do
+    keys = keys_for('http://alpha.example/resource',
+      'location' => 'http://beta.example/resource')
+    keys.must_equal ['http://alpha.example/resource']
   end
 end

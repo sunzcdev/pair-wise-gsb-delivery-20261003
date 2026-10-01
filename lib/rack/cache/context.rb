@@ -1,3 +1,4 @@
+require 'uri'
 require 'rack/cache/options'
 require 'rack/cache/request'
 require 'rack/cache/response'
@@ -148,16 +149,99 @@ module Rack::Cache
       forward
     end
 
-    # Invalidate POST, PUT, DELETE and all methods not understood by this cache
-    # See RFC2616 13.10
+    # Forward an unsafe request method (POST, PUT, DELETE, etc.) to the backend
+    # and, when the write succeeds, invalidate the request target together with
+    # the resources named by the response's Location and Content-Location
+    # headers. Invalidation takes place only after a non-error response is
+    # received, so a failed write never disturbs previously cached responses.
+    # See RFC 9111 section 4.4.
     def invalidate
-      metastore.invalidate(@request, entitystore)
+      response = pass
+      if response.status < 400
+        begin
+          targets = invalidation_targets(response)
+          metastore.invalidate(targets, entitystore) unless targets.empty?
+        rescue => e
+          log_error(e)
+        else
+          record :invalidate
+        end
+      end
+      response
+    end
+
+    # Build the list of Request objects whose cached responses must be
+    # invalidated after a successful unsafe request: the request target itself
+    # plus every parseable, same-origin absolute URL found in the Location and
+    # Content-Location response headers. Relative references are resolved
+    # against the current request URL. Cross-origin, malformed, and duplicate
+    # addresses are skipped so they never widen the invalidation scope.
+    def invalidation_targets(response)
+      targets = [@request]
+      seen = { metastore.cache_key(@request) => true }
+
+      %w[location content-location].each do |name|
+        next unless value = response.headers[name]
+        Array(value).each do |reference|
+          uri = resolve_invalidation_uri(reference.to_s)
+          next unless uri && same_origin?(uri)
+          request = request_for_uri(uri)
+          next unless request
+          key = metastore.cache_key(request)
+          next if seen.key?(key)
+          seen[key] = true
+          targets << request
+        end
+      end
+      targets
+    end
+
+    # Resolve a Location / Content-Location header value against the current
+    # request URL. Returns a URI::HTTP/URI::HTTPS, or nil when the value is
+    # malformed or uses an unsupported scheme.
+    def resolve_invalidation_uri(reference)
+      reference = reference.strip
+      return nil if reference.empty?
+      base_uri = URI.parse(@request.url)
+      uri = base_uri.merge(URI.parse(reference))
+      uri.is_a?(URI::HTTP) ? uri : nil
+    rescue URI::InvalidURIError, ArgumentError
+      nil
+    end
+
+    # Whether +uri+ identifies a resource on the same origin (scheme, host,
+    # and effective port) as the current request.
+    def same_origin?(uri)
+      base_uri = URI.parse(@request.url)
+      uri.scheme == base_uri.scheme &&
+        uri.host &&
+        uri.host.downcase == base_uri.host.downcase &&
+        default_port(uri) == default_port(base_uri)
+    end
+
+    def default_port(uri)
+      uri.port || uri.default_port
+    end
+
+    # Build a Request object for an absolute same-origin URI, suitable for
+    # deriving a cache key. Returns nil when the URI cannot be represented.
+    def request_for_uri(uri)
+      host = uri.host
+      host = "[#{host}]" if host.include?(':')
+      port_part = uri.port == uri.default_port ? nil : ":#{uri.port}"
+
+      env = @env.dup
+      env['REQUEST_METHOD'] = 'GET'
+      env['SCRIPT_NAME'] = ''
+      env['PATH_INFO'] = uri.path.to_s.empty? ? '/' : uri.path
+      env['QUERY_STRING'] = uri.query.to_s
+      env['SERVER_NAME'] = uri.host
+      env['SERVER_PORT'] = uri.port.to_s
+      env['HTTP_HOST'] = "#{host}#{port_part}"
+      Request.new(env)
     rescue => e
       log_error(e)
-      pass
-    else
-      record :invalidate
-      pass
+      nil
     end
 
     # Try to serve the response from cache. When a matching cache entry is

@@ -114,20 +114,38 @@ module Rack::Cache
       keygen.call(request)
     end
 
-    # Invalidate all cache entries that match the request.
-    def invalidate(request, entity_store)
+    # Invalidate all fresh cache entries that match the request(s). Entries are
+    # marked stale (rather than deleted) so that they can still be revalidated
+    # against the origin according to the cache's normal rules. A single Request
+    # or an Array of Request objects may be passed; each distinct request URL is
+    # invalidated, including all of its cached negotiated variants.
+    #
+    # See RFC 9111 section 4.4.
+    def invalidate(requests, entity_store)
+      requests = Array(requests)
       modified = false
-      key = cache_key(request)
-      entries =
-        read(key).map do |req, res|
-          response = restore_response(res)
-          if response.fresh?
-            response.expire!
-            modified = true
+      keys = []
+      requests.each do |request|
+        key = cache_key(request)
+        next if keys.include?(key)
+        keys << key
+
+        key_modified = false
+        entries =
+          read(key).map do |req, res|
+            response = restore_response(res)
+            if response.fresh?
+              response.expire!
+              key_modified = true
+            end
+            [req, persist_response(response)]
           end
-          [req, persist_response(response)]
+        if key_modified
+          write key, entries
+          modified = true
         end
-      write key, entries if modified
+      end
+      modified
     end
 
   private
