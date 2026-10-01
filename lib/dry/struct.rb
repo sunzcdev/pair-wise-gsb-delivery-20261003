@@ -118,6 +118,10 @@ module Dry
     defines :abstract_class
     abstract
 
+    # Sentinel used to explicitly remove an optional attribute in a path update
+    DELETE = PathUpdater::Delete
+    REMOVE = DELETE
+
     # @!attribute [Hash{Symbol => Object}] attributes
     attr_reader :attributes
     alias_method :__attributes__, :attributes
@@ -210,6 +214,101 @@ module Dry
       raise Error, "[#{self}.new] #{exception}"
     end
     alias_method :__new__, :new
+
+    # Returns a copy with one deeply nested value changed. Paths traverse
+    # struct attributes (symbols) and array positions (integers).
+    #
+    # Use {Dry::Struct::DELETE} as the value to remove an optional attribute.
+    # Assigning `nil` and leaving an attribute untouched remain distinct
+    # operations.
+    #
+    # @param [Array<Symbol, Integer>] path
+    # @param [Object] value
+    #
+    # @return [Struct]
+    def update_in(path, value)
+      apply_path_updates([[path, value]])
+    end
+    alias_method :put_in, :update_in
+    alias_method :set_in, :update_in
+    alias_method :update_at, :update_in
+
+    # Removes an optional attribute located at `path`.
+    #
+    # @param [Array<Symbol, Integer>] path
+    #
+    # @return [Struct]
+    #
+    # @raise [ArgumentError] when the path points to a required attribute or
+    #   an array index
+    def delete_in(path)
+      update_in(path, DELETE)
+    end
+    alias_method :remove_in, :delete_in
+    alias_method :delete, :delete_in
+    alias_method :remove, :delete_in
+
+    # Applies several path updates atomically.
+    #
+    # Changes can be passed as a path-keyed hash, an array of path/value
+    # pairs, or alternating path/value arguments.
+    #
+    # @overload update_paths(changes)
+    #   @param [Hash{Array<Symbol, Integer> => Object},
+    #     Array<Array>, nil] changes
+    # @overload update_paths(path, value, ...)
+    #   @param [Array<Symbol, Integer>] path
+    #   @param [Object] value
+    #
+    # @return [Struct]
+    #
+    # @raise [ArgumentError] when paths are invalid, overlap, or delete a
+    #   required attribute
+    # @raise [Dry::Struct::Error] when any replacement value fails its type
+    def update_paths(first = nil, *rest)
+      arguments = [first, *rest]
+
+      changes =
+        if rest.any?
+          unless arguments.length.even?
+            raise ::ArgumentError, "update_paths requires alternating path and value arguments"
+          end
+
+          arguments.each_slice(2).to_a
+        elsif first.nil?
+          []
+        elsif first.is_a?(::Hash)
+          first.to_a
+        elsif first.is_a?(::Array) && first.length == 2 && valid_path?(first[0])
+          [first]
+        elsif first.is_a?(::Array)
+          first
+        else
+          raise ::ArgumentError, "changes must be a hash or an array of path/value pairs"
+        end
+
+      unless changes.all? { |entry| entry.is_a?(::Array) && entry.length == 2 && valid_path?(entry[0]) }
+        raise ::ArgumentError, "changes must contain path/value pairs"
+      end
+
+      apply_path_updates(changes)
+    end
+    alias_method :patch, :update_paths
+    alias_method :deep_update, :update_paths
+
+    def valid_path?(path)
+      path.is_a?(::Array) && !path.empty? &&
+        path.all? { |segment| segment.is_a?(::Symbol) || segment.is_a?(::Integer) }
+    end
+    private :valid_path?
+
+    def apply_path_updates(changes)
+      PathUpdater.new(
+        self,
+        changes.map { |path, value| PathUpdater.change(path, value) }
+      ).call
+    end
+    private :apply_path_updates
 
     # @return [String]
     def inspect

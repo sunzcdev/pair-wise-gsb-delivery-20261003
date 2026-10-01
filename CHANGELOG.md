@@ -9,6 +9,11 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added immutable path-based updates for struct instances: `#update_in`,
+  `#delete_in`, and `#update_paths`. Paths can traverse struct attributes and
+  array indices; `Dry::Struct::DELETE` explicitly removes an optional
+  attribute.
+
 ### Changed
 
 ### Deprecated

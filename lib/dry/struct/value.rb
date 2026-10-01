@@ -30,6 +30,9 @@ module Dry
       # @return [Value]
       # @see https://github.com/dkubb/ice_nine
       def self.new(*) = ::IceNine.deep_freeze(super)
+
+      # @api private
+      def self.value_class? = true
     end
 
     deprecate_constant :Value
