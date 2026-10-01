@@ -8,7 +8,7 @@ module Dry
     class Setting
       include Dry::Equalizer(:name, :default, :constructor, :children, :options, inspect: false)
 
-      OPTIONS = %i[default reader constructor mutable cloneable settings config_class].freeze
+      OPTIONS = %i[default reader constructor mutable cloneable settings config_class env].freeze
 
       DEFAULT_CONSTRUCTOR = -> v { v }.freeze
 
@@ -66,6 +66,15 @@ module Dry
         mutable
       end
       alias_method :cloneable?, :mutable?
+
+      # Returns the env variable name declared for the setting, if any.
+      #
+      # @return [String, nil]
+      #
+      # @api public
+      def env_name
+        options[:env]
+      end
 
       # @api private
       def to_value

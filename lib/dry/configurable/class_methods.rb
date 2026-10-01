@@ -30,6 +30,8 @@ module Dry
       #   Default value for the setting
       # @param [#call] constructor
       #   Transformation given value will go through
+      # @param [String] env
+      #   Env variable name used when importing values via Config#import_env
       # @param [Boolean] reader
       #   Whether a reader accessor must be created
       # @yield

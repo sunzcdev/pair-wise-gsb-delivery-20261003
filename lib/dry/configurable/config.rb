@@ -100,6 +100,26 @@ module Dry
         self
       end
 
+      # Import values for settings declaring an `env:` name from the given env-like hash.
+      #
+      # Only declared env keys are read from the source; unknown keys are ignored. Keys missing
+      # from the source leave the current values untouched, while present keys (including empty
+      # strings) are passed through the setting's constructor as-is, with no type coercion.
+      #
+      # The import is atomic: if resolving any value fails, an {EnvImportError} is raised and
+      # the config is left unchanged. If multiple settings map to the same env key, an
+      # {EnvConflictError} is raised before any assignment takes place.
+      #
+      # @param source [Hash, #each] env-like key/value pairs, e.g. a Hash or ENV
+      # @param prefix [String, Symbol, nil] optional prefix prepended to each declared env name
+      #
+      # @return [Array<String>] the env keys used for the import (values not included)
+      #
+      # @api public
+      def import_env(source, prefix: nil)
+        EnvImporter.new(source, prefix: prefix).call(self)
+      end
+
       # Returns true if the value for the given key has been set on this config.
       #
       # For simple values, this returns true if the value has been explicitly assigned.
@@ -220,6 +240,14 @@ module Dry
       # @api private
       def pristine
         self.class.new(_settings)
+      end
+
+      # Writes an already-constructed value for the given setting name.
+      #
+      # @api private
+      def _write(name, value)
+        _configured.add(name)
+        _values[name] = value
       end
 
       private

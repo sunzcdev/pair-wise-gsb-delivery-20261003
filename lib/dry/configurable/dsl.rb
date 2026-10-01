@@ -43,6 +43,10 @@ module Dry
 
         ensure_valid_options(options)
 
+        if block && options[:env]
+          raise ArgumentError, "env: cannot be combined with nested settings"
+        end
+
         options = {default: default, config_class: config_class, **options}
 
         node = [:setting, [name.to_sym, options]]

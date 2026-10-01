@@ -9,6 +9,12 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added env import: settings can declare an `env:` name and `Config#import_env` (also available
+  as `#import_env` on configurable classes/instances) imports values from a given env-like hash,
+  with an optional `prefix:`. Missing keys keep current values, values are passed through
+  setting constructors as-is, imports are atomic, conflicting env keys raise
+  `EnvConflictError`, and the used env keys (without values) are returned.
+
 ### Changed
 
 ### Deprecated

@@ -14,6 +14,15 @@ module Dry
         self
       end
 
+      # Import settings from an env-like hash. See {Config#import_env}.
+      #
+      # @return [Array<String>] the env keys used for the import (values not included)
+      #
+      # @api public
+      def import_env(source, prefix: nil)
+        config.import_env(source, prefix: prefix)
+      end
+
       # Finalize and freeze configuration
       #
       # @return [Dry::Configurable::Config]
