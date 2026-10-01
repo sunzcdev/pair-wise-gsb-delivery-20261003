@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/selective_loader"
 
 module MultiJson
   include Options

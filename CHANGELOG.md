@@ -1,3 +1,12 @@
+Unreleased
+----------
+
+* Add `MultiJson.load_paths` for streaming, path-selective decoding of large
+  JSON documents served from chunked IO. Unselected values are never built
+  into Ruby objects or buffered, the whole document is still syntax
+  validated, overlapping paths are supported, missing paths and explicit
+  nulls are returned separately, and duplicate object keys are rejected.
+
 1.15.0
 ------
 
