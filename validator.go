@@ -25,6 +25,7 @@ type validate struct {
 	misc           []byte        // misc reusable
 	str1           string        // misc reusable
 	str2           string        // misc reusable
+	ruleFailure    *RuleFailure  // stashed by a rule registered via RegisterRule when it fails
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
@@ -403,6 +404,11 @@ OUTER:
 					}
 				}
 
+				// a rule registered via RegisterRule may have stashed a
+				// failure for this 'or' branch; discard it as the failure
+				// is reported for the whole 'or' expression instead
+				v.ruleFailure = nil
+
 				v.misc = append(v.misc, '|')
 				v.misc = append(v.misc, ct.tag...)
 
@@ -480,21 +486,26 @@ OUTER:
 					v.str2 = v.str1
 				}
 
-				v.errs = append(v.errs,
-					&fieldError{
-						v:              v.v,
-						tag:            ct.aliasTag,
-						actualTag:      ct.tag,
-						ns:             v.str1,
-						structNs:       v.str2,
-						fieldLen:       uint8(len(cf.altName)),
-						structfieldLen: uint8(len(cf.name)),
-						value:          getValue(current),
-						param:          ct.param,
-						kind:           kind,
-						typ:            typ,
-					},
-				)
+				fe := &fieldError{
+					v:              v.v,
+					tag:            ct.aliasTag,
+					actualTag:      ct.tag,
+					ns:             v.str1,
+					structNs:       v.str2,
+					fieldLen:       uint8(len(cf.altName)),
+					structfieldLen: uint8(len(cf.name)),
+					value:          getValue(current),
+					param:          ct.param,
+					kind:           kind,
+					typ:            typ,
+				}
+
+				// attach the logical rule failure stashed by a rule
+				// registered via RegisterRule, if any
+				fe.ruleFailure = v.ruleFailure
+				v.ruleFailure = nil
+
+				v.errs = append(v.errs, fe)
 
 				return
 			}

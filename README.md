@@ -284,6 +284,34 @@ validate := validator.New(validator.WithRequiredStructEnabled())
 | iscolor | hexcolor\|rgb\|rgba\|hsl\|hsla\|cmyk |
 | country_code | iso3166_1_alpha2\|iso3166_1_alpha3\|iso3166_1_alpha_numeric |
 
+Logical Rules (AND / OR / NOT)
+------
+
+For conditions the flat tag syntax cannot express, eg. "(A and B) or (C and not D)",
+rules can be composed explicitly and combined with any existing validation:
+
+```go
+rule := validator.Or(
+	validator.And(validator.Tag("gte=10"), validator.Tag("lte=20")),
+	validator.And(validator.Tag("eq=42"), validator.Not(validator.Tag("lt=0"))),
+)
+
+// validate a single value directly
+err := validate.ValidateRule(value, rule) // err is a *validator.RuleFailure
+
+// or register the rule as a reusable struct tag
+validate.RegisterRule("range_or_answer", rule)
+```
+
+Evaluation short-circuits in a fixed left-to-right order: `And` stops at the
+first failure, `Or` stops at the first success, and skipped branches are never
+executed. Failures are reported according to the logic: an `Or` failure lists
+its branches as alternatives (satisfying any one resolves it) rather than
+conditions that all must be fixed, and every failing node carries a `Path`
+(eg. `$.and[1].or[0]`) locating it within the rule tree. When a registered
+rule fails during struct validation, the `*validator.RuleFailure` is available
+via `validator.RuleFailureOf(fieldError)`.
+
 Benchmarks
 ------
 ###### Run on MacBook Pro Max M3

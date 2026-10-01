@@ -174,6 +174,7 @@ type fieldError struct {
 	param          string
 	kind           reflect.Kind
 	typ            reflect.Type
+	ruleFailure    *RuleFailure
 }
 
 // Tag returns the validation tag that failed.
