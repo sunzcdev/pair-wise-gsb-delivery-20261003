@@ -9,11 +9,14 @@ require 'tomlrb/local_time'
 require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
-require 'tomlrb/handler'
 
 module Tomlrb
   class ParseError < StandardError; end
+end
 
+require 'tomlrb/handler'
+
+module Tomlrb
   # Parses a valid TOML string into its Ruby data structure
   #
   # @param string_or_io [String, StringIO] the content

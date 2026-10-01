@@ -3,10 +3,9 @@ require 'minitest_helper'
 describe Tomlrb::Key do
   subject { Tomlrb::Keys.new }
 
-  it 'can define a super-table afterward' do
+  it 'cannot redefine a super-table already opened by a header' do
     subject.add_table_key %w[x y z w]
-    subject.add_table_key %w[x]
-    assert true
+    _{ subject.add_table_key %w[x] }.must_raise Tomlrb::Key::KeyConflict
   end
 
   it 'cannot define a table more than once' do
@@ -44,17 +43,38 @@ describe Tomlrb::Key do
     assert true
   end
 
-  it 'cannot define table key already defined as pair key' do
+  it 'can define a super-table already created by dotted keys' do
     subject.add_table_key %w[fruit]
     subject.add_pair_key %w[apple color], %w[fruit]
     subject.add_pair_key %w[apple taste sweet], %w[fruit]
-   _{ subject.add_table_key %w[fruit apple] }.must_raise Tomlrb::Key::KeyConflict
+    subject.add_table_key %w[fruit apple]
+    assert true
   end
 
-  it 'cannot define table key already defined as pair key' do
+  it 'can define a parent table after a dotted key chain' do
     subject.add_table_key %w[fruit]
     subject.add_pair_key %w[apple color], %w[fruit]
     subject.add_pair_key %w[apple taste sweet], %w[fruit]
-   _{ subject.add_table_key %w[fruit apple taste] }.must_raise Tomlrb::Key::KeyConflict
+    subject.add_table_key %w[fruit apple taste]
+    assert true
+  end
+
+  it 'reports both declarations when a value clashes with a table' do
+    subject.add_pair_key %w[fruit apple], []
+    error = assert_raises(Tomlrb::Key::KeyConflict) do
+      subject.add_table_key %w[fruit apple]
+    end
+    _(error).must_be_kind_of Tomlrb::ParseError
+    _(error.current.kind).must_equal :explicit_table
+    _(error.previous.kind).must_equal :value
+    _(error.key_path).must_equal 'apple'
+  end
+
+  it 'does not let same names in different array-of-tables instances clash' do
+    subject.add_table_key %w[products], true
+    subject.add_pair_key %w[name], %w[products]
+    subject.add_table_key %w[products], true
+    subject.add_pair_key %w[name], %w[products]
+    assert true
   end
 end

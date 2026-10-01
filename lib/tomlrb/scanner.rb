@@ -4,6 +4,9 @@ require 'strscan'
 
 module Tomlrb
   class Scanner
+    attr_reader :lineno
+    attr_reader :last_lineno
+
     COMMENT =
       /#[^\u0000-\u0008\u000A-\u001F\u007F]*/.freeze
     IDENTIFIER =
@@ -44,11 +47,15 @@ module Tomlrb
     def initialize(io)
       @ss = StringScanner.new(io.read)
       @eos = false
+      @lineno = 1
     end
 
     def next_token
+      @last_lineno = @lineno
       case
-      when @ss.scan(NEWLINE) then [:NEWLINE, nil]
+      when text = @ss.scan(NEWLINE)
+        @lineno += text.count("\n")
+        [:NEWLINE, nil]
       when @ss.scan(SPACED_ARRAY_OF_TABLES_START) then raise ParseError.new('Array of tables has spaces in starting brackets')
       when @ss.scan(SPACED_ARRAY_OF_TABLES_END) then raise ParseError.new('Array of tables has spaces in ending brackets')
       when @ss.scan(SPACED_ARRAY_OF_TABLES_BOTH) then raise ParseError.new('Array of tables has spaces in starting and ending brackets')
@@ -56,9 +63,13 @@ module Tomlrb
       when @ss.scan(COMMENT) then next_token
       when @ss.scan(DATETIME) then process_datetime
       when @ss.scan(LOCAL_TIME) then process_local_time
-      when text = @ss.scan(STRING_MULTI) then [:STRING_MULTI, text[3..-4]]
+      when text = @ss.scan(STRING_MULTI)
+        @lineno += text.count("\n")
+        [:STRING_MULTI, text[3..-4]]
       when text = @ss.scan(STRING_BASIC) then [:STRING_BASIC, text[1..-2]]
-      when text = @ss.scan(STRING_LITERAL_MULTI) then [:STRING_LITERAL_MULTI, text[3..-4]]
+      when text = @ss.scan(STRING_LITERAL_MULTI)
+        @lineno += text.count("\n")
+        [:STRING_LITERAL_MULTI, text[3..-4]]
       when text = @ss.scan(STRING_LITERAL) then [:STRING_LITERAL, text[1..-2]]
       when text = @ss.scan(FLOAT) then [:FLOAT, text]
       when text = @ss.scan(FLOAT_KEYWORD) then [:FLOAT_KEYWORD, text]
