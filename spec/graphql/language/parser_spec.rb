@@ -601,6 +601,170 @@ GRAPHQL
     end
   end
 
+  describe ".parse_with_diagnostics" do
+    def parse_diagnostics(str)
+      GraphQL.parse_with_diagnostics(str)
+    end
+
+    it "returns an unmarked document with no errors for valid input" do
+      doc = parse_diagnostics("query GetIt { a { b } }")
+      refute doc.malformed?
+      assert_empty doc.parse_errors
+      assert_equal 1, doc.definitions.size
+      refute doc.definitions.first.malformed?
+    end
+
+    it "still fast-fails on the first error through ordinary .parse" do
+      str = "query { a(x:) b(y:) }"
+      assert_raises(GraphQL::ParseError) { GraphQL.parse(str) }
+
+      doc = parse_diagnostics(str)
+      assert doc.malformed?
+      assert_equal 2, doc.parse_errors.size
+      assert_equal [1, 13], [doc.parse_errors[0].line, doc.parse_errors[0].col]
+      assert_equal [1, 19], [doc.parse_errors[1].line, doc.parse_errors[1].col]
+    end
+
+    it "reports two unrelated errors while keeping the recognizable structure" do
+      doc = parse_diagnostics(<<~GRAPHQL)
+        query Good { a b }
+        query Bad1 { x(y:) }
+        query Good2 { c }
+        query Bad2 { z(w: 1 }
+      GRAPHQL
+
+      assert_equal 2, doc.parse_errors.size
+      assert_equal [[2, 18], [4, 21]], doc.parse_errors.map { |e| [e.line, e.col] }
+
+      names = doc.definitions.map(&:name)
+      assert_equal ["Good", "Bad1", "Good2", "Bad2"], names
+      good, bad1, good2, bad2 = doc.definitions
+      refute good.malformed?
+      refute good2.malformed?
+      assert bad1.malformed?
+      assert bad2.malformed?
+      assert_equal ["a", "b"], good.selections.map(&:name)
+      assert_equal ["x"], bad1.selections.map(&:name)
+    end
+
+    it "keeps parsing sibling fields after an independent error" do
+      doc = parse_diagnostics("query { a(x:) b { y c } d(e:) }")
+
+      assert_equal 2, doc.parse_errors.size
+      assert_equal [[1, 13], [1, 29]], doc.parse_errors.map { |e| [e.line, e.col] }
+      operation = doc.definitions.first
+      assert operation.malformed?
+      assert_equal ["a", "b", "d"], operation.selections.map(&:name)
+      assert_equal ["y", "c"], operation.selections[1].selections.map(&:name)
+    end
+
+    it "reports a truncated document exactly once and preserves what was parsed" do
+      doc = parse_diagnostics("query Foo { a { b { c")
+
+      assert_equal 1, doc.parse_errors.size
+      error = doc.parse_errors.first
+      assert_equal 1, error.line
+      assert_includes error.message, "Expected RCURLY"
+
+      operation = doc.definitions.first
+      assert_equal "Foo", operation.name
+      assert_equal ["a"], operation.selections.map(&:name)
+      assert_equal ["b"], operation.selections.first.selections.map(&:name)
+      assert_equal ["c"], operation.selections.first.selections.first.selections.map(&:name)
+    end
+
+    it "does not treat brackets inside ordinary strings as recovery points" do
+      doc = parse_diagnostics('query { a(note: "中文 { 括号 } (嵌套)") b(c:) }')
+
+      assert_equal 1, doc.parse_errors.size
+      assert_equal [1, 39], [doc.parse_errors.first.line, doc.parse_errors.first.col]
+      operation = doc.definitions.first
+      assert_equal ["a", "b"], operation.selections.map(&:name)
+      assert_equal "中文 { 括号 } (嵌套)", operation.selections.first.arguments.first.value
+    end
+
+    it "does not treat brackets inside multiline block strings as recovery points" do
+      doc = parse_diagnostics(<<~GRAPHQL)
+        query Q {
+          first
+          bad {
+            note(text: """
+            第一行（中文括号 { } 和 ( )
+            第二行 }
+            """)
+          afterField { id }
+        }
+      GRAPHQL
+
+      assert_equal 1, doc.parse_errors.size
+      assert_includes doc.parse_errors.first.message, "Expected RCURLY"
+      operation = doc.definitions.first
+      assert_equal ["first", "bad"], operation.selections.map(&:name)
+      block_value = operation.selections[1].selections.first.arguments.first.value
+      assert_includes block_value, "第一行（中文括号 { } 和 ( )"
+      assert_includes block_value, "第二行 }"
+    end
+
+    it "does not fan a single missing delimiter out into many repeated diagnostics" do
+      # Every bracket here lives inside the string, so only the genuinely
+      # broken field may be reported once.
+      doc = parse_diagnostics('query { a(s: "(( )))) {{}}") b(c:) }')
+
+      assert_equal 1, doc.parse_errors.size
+      assert_equal ["a", "b"], doc.definitions.first.selections.map(&:name)
+    end
+
+    it "caps the number of diagnostics instead of cascading without bound" do
+      many_broken_defs = (1..150).map { |i| "query Q#{i} { a(x:) }" }.join("\n")
+      doc = parse_diagnostics(many_broken_defs)
+
+      assert_equal GraphQL::Language::Parser::DiagnosticParser::MAX_DIAGNOSTICS, doc.parse_errors.size
+    end
+
+    it "reports a dangling closing delimiter as an error" do
+      doc = parse_diagnostics("{ foo } }")
+      assert_equal 1, doc.parse_errors.size
+      assert doc.malformed?
+    end
+
+    it "reports a document containing only comments" do
+      doc = parse_diagnostics("# nothing here at all")
+      assert doc.malformed?
+      assert_equal 1, doc.parse_errors.size
+      assert_empty doc.definitions
+    end
+
+    it "recovers from a malformed string literal" do
+      doc = parse_diagnostics('query { a(x: "unterminated) b { id }')
+      assert doc.malformed?
+      assert_operator doc.parse_errors.size, :<=, 2
+    end
+
+    it "raises fatal errors that prevent any tokenization, like ordinary parse" do
+      assert_raises(GraphQL::ParseError) do
+        parse_diagnostics("{ foo(query: \"\xBF\") }")
+      end
+      assert_raises(GraphQL::ParseError) do
+        parse_diagnostics(nil)
+      end
+    end
+
+    it "flags partial documents so they cannot be executed" do
+      schema = Class.new(GraphQL::Schema) do
+        query(Class.new(GraphQL::Schema::Object) do
+          graphql_name "Query"
+          field :a, Integer, null: true
+        end)
+      end
+
+      malformed_doc = parse_diagnostics("query { a(x:) }")
+      assert malformed_doc.malformed?
+      query = GraphQL::Query.new(schema, document: malformed_doc)
+      result = query.result
+      assert result["errors"].any?
+    end
+  end
+
   describe ".parse_file" do
     it "assigns filename to all nodes" do
       example_filename = "spec/support/parser/filename_example.graphql"

@@ -467,6 +467,15 @@ module GraphQL
         nil
       end
 
+      if @document && @document.malformed?
+        # A partial AST produced by diagnostic parsing is never valid for execution.
+        first_error = @document.parse_errors && @document.parse_errors.first
+        parse_err = first_error || GraphQL::ParseError.new("Document contains syntax errors", nil, nil, query_string)
+        parse_error = parse_err
+        @schema.parse_error(parse_err, @context)
+        @document = nil
+      end
+
       @fragments = {}
       @operations = {}
       if @document

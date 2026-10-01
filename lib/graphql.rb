@@ -50,6 +50,24 @@ This is probably a bug in GraphQL-Ruby, please report this error on GitHub: http
     default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
   end
 
+  # Parse a query string or schema definition in diagnostic mode.
+  #
+  # Unlike {.parse}, which raises on the first syntax error, this keeps
+  # parsing and returns every independent error it can find, preserving the
+  # recognizable parts of the document in the AST. The returned document
+  # is marked {GraphQL::Language::Nodes::Document#malformed?} whenever any
+  # error is present and must not be executed; read the errors from
+  # {GraphQL::Language::Nodes::Document#parse_errors}.
+  # @param graphql_string [String] a GraphQL query string or schema definition
+  # @return [GraphQL::Language::Nodes::Document]
+  def self.parse_with_diagnostics(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
+    if default_parser.respond_to?(:parse_with_diagnostics)
+      default_parser.parse_with_diagnostics(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+    else
+      GraphQL::Language::Parser::DiagnosticParser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+    end
+  end
+
   # Read the contents of `filename` and parse them as GraphQL
   # @param filename [String] Path to a `.graphql` file containing IDL or query
   # @return [GraphQL::Language::Nodes::Document]

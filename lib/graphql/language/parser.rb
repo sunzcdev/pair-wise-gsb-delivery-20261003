@@ -38,6 +38,7 @@ module GraphQL
         @trace = trace
         @dedup_identifiers = false
         @lines_at = nil
+        @tolerant = false
       end
 
       def parse
@@ -76,6 +77,12 @@ module GraphQL
 
       private
 
+      # Raised internally by the diagnostic parser when too many errors were
+      # reported, so that recovery can't spiral into dozens of cascading
+      # diagnostics for one broken document.
+      class DiagnosticAbort < StandardError
+      end
+
       # @return [Array<Integer>] Positions of each line break in the original string
       def lines_at
         @lines_at ||= begin
@@ -106,15 +113,54 @@ module GraphQL
         any_tokens = advance_token
         defns = []
         if any_tokens
-          defns << definition
+          add_next_definition(defns)
         else
           # Only ignored characters is not a valid document
           raise GraphQL::ParseError.new("Unexpected end of document", nil, nil, @graphql_str)
         end
-        while !@lexer.finished?
-          defns << definition
+        if @tolerant
+          until @lexer.finished?
+            break unless add_next_definition(defns)
+          end
+        else
+          while !@lexer.finished?
+            add_next_definition(defns)
+          end
         end
-        Document.new(pos: 0, definitions: defns, filename: @filename, source: self)
+        build_document(defns)
+      rescue DiagnosticAbort
+        raise unless @tolerant
+        build_document(defns)
+      end
+
+      # @return [Boolean] false when parsing must stop (EOF in diagnostic mode)
+      def add_next_definition(definitions)
+        defn = nil
+        status = parse_recoverable(DEFINITION_STOPS, definition_start_only: true) do
+          defn = parse_document_definition
+        end
+      rescue DiagnosticAbort
+        return false
+      else
+        definitions << defn if defn
+        if defn.nil? && @tolerant
+          # The definition failed to parse and its error was already
+          # recorded; skip junk tokens up to the next definition boundary.
+          return false if @lexer.finished?
+          skip_to_next_definition
+          return false if @lexer.finished?
+        end
+        status != :eof
+      end
+
+      # Hook for the diagnostic parser to mark partial definitions
+      # and decide whether a recovered definition should be kept.
+      def parse_document_definition
+        definition
+      end
+
+      def build_document(definitions)
+        Document.new(pos: 0, definitions: definitions, filename: @filename, source: self)
       end
 
       def definition
@@ -158,27 +204,30 @@ module GraphQL
             expect_token(:LPAREN)
             defs = []
             while !at?(:RPAREN)
-              loc = pos
-              expect_token(:VAR_SIGN)
-              var_name = parse_name
-              expect_token(:COLON)
-              var_type = self.type || raise_parse_error("Missing type definition for variable: $#{var_name}")
-              default_value = if at?(:EQUALS)
-                advance_token
-                value
+              status = parse_recoverable([:RPAREN]) do
+                loc = pos
+                expect_token(:VAR_SIGN)
+                var_name = parse_name
+                expect_token(:COLON)
+                var_type = self.type || raise_parse_error("Missing type definition for variable: $#{var_name}")
+                default_value = if at?(:EQUALS)
+                  advance_token
+                  value
+                end
+
+                directives = parse_directives
+
+                defs << Nodes::VariableDefinition.new(
+                  pos: loc,
+                  name: var_name,
+                  type: var_type,
+                  default_value: default_value,
+                  directives: directives,
+                  filename: @filename,
+                  source: self
+                )
               end
-
-              directives = parse_directives
-
-              defs << Nodes::VariableDefinition.new(
-                pos: loc,
-                name: var_name,
-                type: var_type,
-                default_value: default_value,
-                directives: directives,
-                filename: @filename,
-                source: self
-              )
+              break if status != :continue
             end
             expect_token(:RPAREN)
             defs
@@ -247,21 +296,24 @@ module GraphQL
             if at?(:LCURLY)
               advance_token
               while !at?(:RCURLY)
-                if at?(:QUERY)
-                  advance_token
-                  expect_token(:COLON)
-                  query = parse_name
-                elsif at?(:MUTATION)
-                  advance_token
-                  expect_token(:COLON)
-                  mutation = parse_name
-                elsif at?(:SUBSCRIPTION)
-                  advance_token
-                  expect_token(:COLON)
-                  subscription = parse_name
-                else
-                  expect_one_of([:QUERY, :MUTATION, :SUBSCRIPTION])
+                status = parse_recoverable([:RCURLY]) do
+                  if at?(:QUERY)
+                    advance_token
+                    expect_token(:COLON)
+                    query = parse_name
+                  elsif at?(:MUTATION)
+                    advance_token
+                    expect_token(:COLON)
+                    mutation = parse_name
+                  elsif at?(:SUBSCRIPTION)
+                    advance_token
+                    expect_token(:COLON)
+                    subscription = parse_name
+                  else
+                    expect_one_of([:QUERY, :MUTATION, :SUBSCRIPTION])
+                  end
                 end
+                break if status != :continue
               end
               expect_token :RCURLY
             end
@@ -288,21 +340,24 @@ module GraphQL
             query = mutation = subscription = nil
             expect_token :LCURLY
             while !at?(:RCURLY)
-              if at?(:QUERY)
-                advance_token
-                expect_token(:COLON)
-                query = parse_name
-              elsif at?(:MUTATION)
-                advance_token
-                expect_token(:COLON)
-                mutation = parse_name
-              elsif at?(:SUBSCRIPTION)
-                advance_token
-                expect_token(:COLON)
-                subscription = parse_name
-              else
-                expect_one_of([:QUERY, :MUTATION, :SUBSCRIPTION])
+              status = parse_recoverable([:RCURLY]) do
+                if at?(:QUERY)
+                  advance_token
+                  expect_token(:COLON)
+                  query = parse_name
+                elsif at?(:MUTATION)
+                  advance_token
+                  expect_token(:COLON)
+                  mutation = parse_name
+                elsif at?(:SUBSCRIPTION)
+                  advance_token
+                  expect_token(:COLON)
+                  subscription = parse_name
+                else
+                  expect_one_of([:QUERY, :MUTATION, :SUBSCRIPTION])
+                end
               end
+              break if status != :continue
             end
             expect_token :RCURLY
             SchemaDefinition.new(pos: loc, definition_pos: defn_loc, query: query, mutation: mutation, subscription: subscription, directives: directives, filename: @filename, source: self)
@@ -373,7 +428,10 @@ module GraphQL
           expect_token :LCURLY
           list = []
           while !at?(:RCURLY)
-            list << parse_input_value_definition
+            item = nil
+            status = parse_recoverable([:RCURLY]) { item = parse_input_value_definition }
+            list << item if item
+            break if status != :continue
           end
           expect_token :RCURLY
           list
@@ -387,17 +445,22 @@ module GraphQL
           expect_token :LCURLY
           list = []
           while !at?(:RCURLY)
-            v_loc = pos
-            description = if at?(:STRING); string_value; end
-            defn_loc = pos
-            # Any identifier, but not true, false, or null
-            enum_value = if at?(:TRUE) || at?(:FALSE) || at?(:NULL)
-              expect_token(:IDENTIFIER)
-            else
-              parse_name
+            enum_defn = nil
+            status = parse_recoverable([:RCURLY]) do
+              v_loc = pos
+              description = if at?(:STRING); string_value; end
+              defn_loc = pos
+              # Any identifier, but not true, false, or null
+              enum_value = if at?(:TRUE) || at?(:FALSE) || at?(:NULL)
+                expect_token(:IDENTIFIER)
+              else
+                parse_name
+              end
+              v_directives = parse_directives
+              enum_defn = EnumValueDefinition.new(pos: v_loc, definition_pos: defn_loc, description: description, name: enum_value, directives: v_directives, filename: @filename, source: self)
             end
-            v_directives = parse_directives
-            list << EnumValueDefinition.new(pos: v_loc, definition_pos: defn_loc, description: description, name: enum_value, directives: v_directives, filename: @filename, source: self)
+            list << enum_defn if enum_defn
+            break if status != :continue
           end
           expect_token :RCURLY
           list
@@ -442,16 +505,21 @@ module GraphQL
         expect_token :LCURLY
         list = []
         while !at?(:RCURLY)
-          loc = pos
-          description = if at?(:STRING); string_value; end
-          defn_loc = pos
-          name = parse_name
-          arguments_definition = parse_argument_definitions
-          expect_token :COLON
-          type = self.type
-          directives = parse_directives
+          field_defn = nil
+          status = parse_recoverable([:RCURLY]) do
+            loc = pos
+            description = if at?(:STRING); string_value; end
+            defn_loc = pos
+            name = parse_name
+            arguments_definition = parse_argument_definitions
+            expect_token :COLON
+            type = self.type
+            directives = parse_directives
 
-          list << FieldDefinition.new(pos: loc, definition_pos: defn_loc, description: description, name: name, arguments: arguments_definition, type: type, directives: directives, filename: @filename, source: self)
+            field_defn = FieldDefinition.new(pos: loc, definition_pos: defn_loc, description: description, name: name, arguments: arguments_definition, type: type, directives: directives, filename: @filename, source: self)
+          end
+          list << field_defn if field_defn
+          break if status != :continue
         end
         expect_token :RCURLY
         list
@@ -462,7 +530,10 @@ module GraphQL
           advance_token
           list = []
           while !at?(:RPAREN)
-            list << parse_input_value_definition
+            item = nil
+            status = parse_recoverable([:RPAREN]) { item = parse_input_value_definition }
+            list << item if item
+            break if status != :continue
           end
           expect_token :RPAREN
           list
@@ -536,48 +607,53 @@ module GraphQL
         expect_token(:LCURLY)
         selections = []
         while @token_name != :RCURLY
-          selections << if at?(:ELLIPSIS)
-            loc = pos
-            advance_token
-            case token_name
-            when :ON, :DIR_SIGN, :LCURLY
-              if_type = if at?(:ON)
-                advance_token
-                parse_type_name
+          selection = nil
+          status = parse_recoverable([:RCURLY]) do
+            selection = if at?(:ELLIPSIS)
+              loc = pos
+              advance_token
+              case token_name
+              when :ON, :DIR_SIGN, :LCURLY
+                if_type = if at?(:ON)
+                  advance_token
+                  parse_type_name
+                else
+                  nil
+                end
+
+                directives = parse_directives
+
+                Nodes::InlineFragment.new(pos: loc, type: if_type, directives: directives, selections: selection_set, filename: @filename, source: self)
               else
-                nil
+                name = parse_name_without_on
+                directives = parse_directives
+
+                # Can this ever happen?
+                # expect_token(:IDENTIFIER) if at?(:ON)
+
+                FragmentSpread.new(pos: loc, name: name, directives: directives, filename: @filename, source: self)
+              end
+            else
+              loc = pos
+              name = parse_name
+
+              field_alias = nil
+
+              if at?(:COLON)
+                advance_token
+                field_alias = name
+                name = parse_name
               end
 
-              directives = parse_directives
+              arguments = at?(:LPAREN) ? parse_arguments : nil
+              directives = at?(:DIR_SIGN) ? parse_directives : nil
+              selection_set = at?(:LCURLY) ? self.selection_set : nil
 
-              Nodes::InlineFragment.new(pos: loc, type: if_type, directives: directives, selections: selection_set, filename: @filename, source: self)
-            else
-              name = parse_name_without_on
-              directives = parse_directives
-
-              # Can this ever happen?
-              # expect_token(:IDENTIFIER) if at?(:ON)
-
-              FragmentSpread.new(pos: loc, name: name, directives: directives, filename: @filename, source: self)
+              Nodes::Field.new(pos: loc, field_alias: field_alias, name: name, arguments: arguments, directives: directives, selections: selection_set, filename: @filename, source: self)
             end
-          else
-            loc = pos
-            name = parse_name
-
-            field_alias = nil
-
-            if at?(:COLON)
-              advance_token
-              field_alias = name
-              name = parse_name
-            end
-
-            arguments = at?(:LPAREN) ? parse_arguments : nil
-            directives = at?(:DIR_SIGN) ? parse_directives : nil
-            selection_set = at?(:LCURLY) ? self.selection_set : nil
-
-            Nodes::Field.new(pos: loc, field_alias: field_alias, name: name, arguments: arguments, directives: directives, selections: selection_set, filename: @filename, source: self)
           end
+          selections << selection if selection
+          break if status != :continue
         end
         expect_token(:RCURLY)
         selections
@@ -683,12 +759,17 @@ module GraphQL
           advance_token
           args = []
           while !at?(:RPAREN)
-            loc = pos
-            name = parse_name
-            expect_token(:COLON)
-            args << Nodes::Argument.new(pos: loc, name: name, value: value, filename: @filename, source: self)
+            argument = nil
+            status = parse_recoverable([:RPAREN]) do
+              loc = pos
+              name = parse_name
+              expect_token(:COLON)
+              argument = Nodes::Argument.new(pos: loc, name: name, value: value, filename: @filename, source: self)
+            end
+            args << argument if argument
+            break if status != :continue
           end
-          if args.empty?
+          if args.empty? && !@tolerant
             expect_token(:ARGUMENT_NAME) # At least one argument is required
           end
           expect_token(:RPAREN)
@@ -727,7 +808,10 @@ module GraphQL
           advance_token
           list = []
           while !at?(:RBRACKET)
-            list << value
+            item = nil
+            status = parse_recoverable([:RBRACKET]) { item = value }
+            list << item unless item.nil?
+            break if status != :continue
           end
           expect_token(:RBRACKET)
           list
@@ -736,10 +820,15 @@ module GraphQL
           advance_token
           args = []
           while !at?(:RCURLY)
-            loc = pos
-            n = parse_name
-            expect_token(:COLON)
-            args << Argument.new(pos: loc, name: n, value: value, filename: @filename, source: self)
+            input_arg = nil
+            status = parse_recoverable([:RCURLY]) do
+              loc = pos
+              n = parse_name
+              expect_token(:COLON)
+              input_arg = Argument.new(pos: loc, name: n, value: value, filename: @filename, source: self)
+            end
+            args << input_arg if input_arg
+            break if status != :continue
           end
           expect_token(:RCURLY)
           InputObject.new(pos: start, arguments: args, filename: @filename, source: self)
@@ -806,13 +895,164 @@ module GraphQL
 
       def expect_token(expected_token_name)
         unless @token_name == expected_token_name
-          raise_parse_error("Expected #{expected_token_name}, #{@token_name == false ? "not end of file" : "actual: #{@token_name} (#{debug_token_value.inspect})"}")
+          if @tolerant && @recovery_stops
+            stop_key = [@token_name, @lexer.pos]
+            if @recovery_stops.delete(stop_key)
+              # An inner recovery already reported why this closing token is
+              # here; consume it without adding a cascading diagnostic.
+              advance_token
+              return nil
+            end
+          end
+          message = "Expected #{expected_token_name}, #{@token_name == false ? "not end of file" : "actual: #{@token_name} (#{debug_token_value.inspect})"}"
+          if @tolerant && @token_name == false
+            # The document ended before this construct was closed: report it
+            # once and let the construct unwind with what was parsed so far.
+            advance_token
+            return handle_unexpected_eof(message)
+          end
+          raise_parse_error(message)
         end
         advance_token
       end
 
+      # Hook for the diagnostic parser to record an unexpected-EOF error and
+      # suppress any repeats (only the first missing delimiter is reported).
+      def handle_unexpected_eof(message)
+        raise_parse_error(message)
+      end
+
       def expect_one_of(token_names)
         raise_parse_error("Expected one of #{token_names.join(", ")}, actual: #{token_name || "NOTHING"} (#{debug_token_value.inspect})")
+      end
+
+      # Run one item in a repeating construct (`selection_set`, argument
+      # lists, variable definitions, ...).
+      #
+      # In a normal parse errors propagate immediately and fast-fail. In a
+      # diagnostic parse the error is handed to {#recover_from_parse_error},
+      # which resynchronizes the token stream at a bracket boundary, so that
+      # following, independent items can still be parsed.
+      #
+      # `stops` lists the tokens which close this construct. Recovery returns:
+      # - `:continue` when positioned at a fresh sibling item,
+      # - `:stop` when positioned at (or beyond) the construct's closing token,
+      # - `:eof` when the stream ended mid-construct.
+      def parse_recoverable(stops, definition_start_only: false)
+        unless @tolerant
+          # Ordinary parse: fast-fail exactly as before recovery existed.
+          yield
+          return :continue
+        end
+
+        # Diagnostic parse: one item may require a couple of resync attempts,
+        # but the position must always move forward: a token that can't start
+        # a valid item is dropped exactly once, so a missing delimiter can
+        # never fan out into dozens of repeated diagnostics.
+        last_pos = nil
+        loop do
+          yield
+          return :eof if @lexer.finished?
+          return :continue
+        rescue GraphQL::ParseError
+          return :eof if @lexer.finished?
+          result = recover_from_parse_error($!, stops, definition_start_only: definition_start_only)
+          return result unless result == :continue
+          return :eof if @lexer.finished?
+
+          if @lexer.pos == last_pos
+            # The same token keeps failing; skip it before trying again.
+            advance_token
+            return :eof if @lexer.finished?
+          end
+          last_pos = @lexer.pos
+        end
+      end
+
+      # Resynchronize after a syntax error.
+      #
+      # Recovery only considers delimiters outside every balanced pair.
+      # Delimiters never surface as tokens while inside a string or block
+      # string -- the lexer emits a single `:STRING` token for the whole
+      # literal -- so brackets in string contents can never be mistaken for
+      # recovery points.
+      def recover_from_parse_error(err, stops, definition_start_only: false)
+        depth = 0
+        loop do
+          tok = @token_name
+          return :eof if tok == false
+
+          if depth == 0 && stops.include?(tok)
+            # Positioned at the token that closes this construct.
+            (@recovery_stops ||= {})[[tok, @lexer.pos]] = true
+            return :stop
+          end
+
+          case tok
+          when :LCURLY, :LPAREN, :LBRACKET
+            depth += 1
+          when :RCURLY, :RPAREN, :RBRACKET
+            if depth == 0
+              if definition_start_only
+                # A dangling delimiter at document level is junk; skip it.
+                advance_token
+                next
+              else
+                # An unmatched closer: unwind to an outer construct, which
+                # will see its closing token or EOF and end exactly once.
+                (@recovery_stops ||= {})[[tok, @lexer.pos]] = true
+                return :stop
+              end
+            end
+            depth -= 1
+          end
+
+          if depth == 0 && (definition_start_only ? at_definition_start? : true)
+            return :continue
+          end
+
+          advance_token
+        end
+      end
+
+      # Tokens which may begin a top-level definition (including an optional
+      # description string before SDL definitions).
+      DEFINITION_START_TOKENS = [
+        :LCURLY,
+        :QUERY, :MUTATION, :SUBSCRIPTION,
+        :FRAGMENT,
+        :EXTEND,
+        :SCHEMA, :SCALAR, :TYPE, :INTERFACE, :UNION, :ENUM, :INPUT,
+        :DIRECTIVE,
+        :STRING,
+      ].freeze
+
+      # Document-level definitions have no enclosing delimiter.
+      DEFINITION_STOPS = [].freeze
+
+      def at_definition_start?
+        DEFINITION_START_TOKENS.include?(@token_name)
+      end
+
+      # After a failed top-level definition, advance until the next token that
+      # may start a definition. Balanced delimiter pairs are skipped whole and
+      # unmatched closers are consumed; string contents are never inspected
+      # (they arrive as single `:STRING` tokens).
+      def skip_to_next_definition
+        depth = 0
+        until @lexer.finished?
+          tok = @token_name
+          if depth == 0 && at_definition_start?
+            return
+          end
+          case tok
+          when :LCURLY, :LPAREN, :LBRACKET
+            depth += 1
+          when :RCURLY, :RPAREN, :RBRACKET
+            depth -= 1 if depth > 0
+          end
+          advance_token
+        end
       end
 
       def raise_parse_error(message)
@@ -846,6 +1086,112 @@ module GraphQL
         def initialize(*args, **kwargs)
           super
           @dedup_identifiers = true
+        end
+      end
+
+      # A resynchronizing parser.
+      #
+      # Unlike {Parser}, which fast-fails on the first syntax error, this
+      # parser keeps going: it records every independent error in
+      # {#parse_errors} and preserves as much of the surrounding document
+      # as possible. Documents returned from here are always flagged
+      # ({Nodes::Document#malformed?}) when any error was reported, so they
+      # can't accidentally be executed as if they were valid.
+      #
+      # Use {GraphQL.parse_with_diagnostics} rather than instantiating this
+      # class directly.
+      class DiagnosticParser < Parser
+        # Maximum number of diagnostics reported for one document. Past this,
+        # recovery aborts to avoid cascading into dozens of repeated errors.
+        MAX_DIAGNOSTICS = 100
+
+        def self.parse(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil)
+          self.new(graphql_str, filename: filename, trace: trace, max_tokens: max_tokens).parse_with_diagnostics
+        end
+
+        attr_reader :parse_errors
+
+        def initialize(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil)
+          super(graphql_str, filename: filename, trace: trace, max_tokens: max_tokens)
+          @tolerant = true
+          @parse_errors = []
+          @seen_positions = {}
+          @reported_eof = false
+        end
+
+        # @return [Nodes::Document] The recovered document; its
+        #   {Nodes::Document#parse_errors} contains all reported syntax errors.
+        def parse_with_diagnostics
+          document
+        rescue GraphQL::ParseError => err
+          record_error(err)
+          build_document([])
+        rescue DiagnosticAbort
+          build_document([])
+        end
+
+        private
+
+        def advance_token
+          super
+        rescue GraphQL::ParseError => err
+          record_error(err)
+          @lexer.advance_after_error
+          @token_name = @lexer.finished? ? false : @lexer.advance
+        end
+
+        def raise_parse_error(message)
+          super
+        rescue GraphQL::ParseError => parse_err
+          record_error(parse_err)
+          raise
+        end
+
+        def handle_unexpected_eof(message)
+          unless @reported_eof
+            @reported_eof = true
+            record_error(GraphQL::ParseError.new(
+              message,
+              @lexer.line_number,
+              @lexer.column_number,
+              @graphql_str,
+              filename: @filename,
+            ))
+          end
+          nil
+        end
+
+        def parse_document_definition
+          errors_before = @parse_errors.size
+          defn = definition
+          if @parse_errors.size > errors_before
+            # Keep the partial definition for tooling, but never let it be
+            # mistaken for a valid one.
+            defn.mark_malformed!
+          end
+          defn
+        rescue GraphQL::ParseError
+          nil
+        end
+
+        def build_document(definitions)
+          doc = super
+          doc.parse_errors = @parse_errors
+          doc.mark_malformed! unless @parse_errors.empty?
+          doc
+        end
+
+        def record_error(err)
+          # Secondary errors at the same position are cascades from one broken
+          # spot (e.g. a missing `)` first surfaces as a bad argument, then as
+          # a missing closer). Keep only the first diagnostic at each spot.
+          position_key = [err.line, err.col]
+          return if @seen_positions.key?(position_key)
+          @seen_positions[position_key] = true
+          @parse_errors << err
+          if @parse_errors.size >= MAX_DIAGNOSTICS
+            raise DiagnosticAbort, err.message
+          end
         end
       end
     end

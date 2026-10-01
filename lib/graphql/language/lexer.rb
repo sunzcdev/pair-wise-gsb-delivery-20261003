@@ -121,6 +121,25 @@ module GraphQL
         raise GraphQL::Error, "(token_value failed: #{err.class}: #{err.message})"
       end
 
+      # Move the scanner past a tokenization error so that tokenization can continue.
+      # Only called by the diagnostic parser, which has already recorded the error.
+      # @return [void]
+      def advance_after_error
+        if @string.getbyte(@scanner.pos) == QUOTE.ord
+          # A malformed string literal: drop the opening quote, then consume
+          # the rest of the physical line (ordinary strings may not span lines,
+          # and a broken block string is bounded by the following line break too).
+          @scanner.pos += 1
+          @scanner.skip(/[^\r\n]*/)
+        elsif @scanner.eos?
+          @finished = true
+        else
+          # Skip the single offending character and retry.
+          @scanner.pos += 1
+        end
+        nil
+      end
+
       def debug_token_value(token_name)
         if token_name && Lexer::Punctuation.const_defined?(token_name)
           Lexer::Punctuation.const_get(token_name)

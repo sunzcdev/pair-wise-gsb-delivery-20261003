@@ -33,6 +33,19 @@ module GraphQL
 
         attr_reader :filename
 
+        # True when this node was produced by a diagnostic parse and
+        # contains (or is adjacent to) a syntax error. Such partial ASTs
+        # must never be sent to the executor as if they formed a valid document.
+        def malformed?
+          @malformed == true
+        end
+
+        # @return [self]
+        def mark_malformed!
+          @malformed = true
+          self
+        end
+
         def line
           @line ||= @source&.line_at(@pos)
         end
@@ -617,6 +630,14 @@ module GraphQL
       class Document < AbstractNode
         scalar_methods false
         children_methods(definitions: nil)
+
+        # @return [Array<GraphQL::ParseError>] Syntax errors reported by a diagnostic parse (see {GraphQL.parse_with_diagnostics}). Empty for documents produced by the ordinary fast-fail parse.
+        attr_accessor :parse_errors
+
+        def malformed?
+          super || !(@parse_errors.nil? || @parse_errors.empty?)
+        end
+
         # @!attribute definitions
         #   @return [Array<OperationDefinition, FragmentDefinition>] top-level GraphQL units: operations or fragments
 
