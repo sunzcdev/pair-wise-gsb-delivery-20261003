@@ -37,15 +37,50 @@ module Interactor
       #     organize InteractorOne, InteractorTwo
       #   end
       #
-      #   class MySecondOrganizer
+    #   class MySecondOrganizer
+    #     include Interactor::Organizer
+    #
+    #     organize [InteractorThree, InteractorFour]
+    #   end
+    #
+    # Returns nothing.
+      def organize(*interactors)
+        @organized = (@organized || []).concat(interactors.flatten)
+      end
+
+      # Public: Declare an optional, recoverable subflow. The given
+      # Interactors are invoked as an isolated unit at this point in the
+      # Organizer's sequence. When the subflow calls "context.fail!", its
+      # steps are scoped-rolled-back, its top-level Context changes are
+      # discarded, and the block is evaluated with the failed Context in the
+      # Organizer instance's scope so the remaining organized Interactors still
+      # run. Any other exception propagates.
+      #
+      # See Interactor#attempt for the equivalent that can be called from
+      # inside an Interactor's "#call" method.
+      #
+      # interactors - Zero or more (or an Array of) Interactor classes.
+      # recovery    - An optional Symbol naming an instance method invoked with
+      #               the failed Context.
+      # block       - An optional block evaluated with the failed Context.
+      #
+      # Examples
+      #
+      #   class PlaceOrder
       #     include Interactor::Organizer
       #
-      #     organize [InteractorThree, InteractorFour]
+      #     organize CreateOrder, ChargeCard
+      #
+      #     attempt SendThankYou do |failure|
+      #       context.notice = failure.message
+      #     end
+      #
+      #     organize FinalizeOrder
       #   end
       #
       # Returns nothing.
-      def organize(*interactors)
-        @organized = interactors.flatten
+      def attempt(*interactors, recovery: nil, &block)
+        (@organized ||= []) << Attempt.new(interactors, recovery: recovery, &block)
       end
 
       # Internal: An Array of declared Interactors to be invoked.
@@ -76,7 +111,11 @@ module Interactor
       # Returns nothing.
       def call
         self.class.organized.each do |interactor|
-          interactor.call!(context)
+          if interactor.is_a?(Attempt)
+            interactor.run(context, self)
+          else
+            interactor.call!(context)
+          end
         end
       end
     end

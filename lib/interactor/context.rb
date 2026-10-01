@@ -158,8 +158,123 @@ module Interactor
     # Returns true if rolled back successfully or false if already rolled back.
     def rollback!
       return false if @rolled_back
-      _called.reverse_each(&:rollback)
-      @rolled_back = true
+      boundary = _subflow_boundaries.last
+
+      if failure? && boundary
+        return false if boundary[:rolled_back]
+        boundary[:rolled_back] = true
+        before = _top_level_keys
+        _called[boundary[:index]..].reverse_each(&:rollback)
+        after = _top_level_keys
+        after.each do |key, value|
+          boundary[:rollback_keys][key] = value unless before.key?(key)
+        end
+      else
+        _called.reverse_each(&:rollback)
+        @rolled_back = true
+      end
+    end
+
+    # Internal: Push a recoverable subflow boundary. The boundary records where
+    # the subflow's completed steps begin and what the Context's top-level keys
+    # looked like beforehand, so an explicit business failure can be scoped to
+    # just this subflow.
+    #
+    # Returns nothing.
+    def _enter_subflow
+      _subflow_boundaries << {
+        index: _called.length,
+        keys: _top_level_keys,
+        rollback_keys: {}
+      }
+    end
+
+    # Internal: Commit the innermost subflow boundary after a successful
+    # subflow. The subflow's completed steps stay tracked and its Context
+    # changes remain in place.
+    #
+    # Returns nothing.
+    def _commit_subflow
+      _subflow_boundaries.pop
+    end
+
+    # Internal: Abort the innermost subflow after an explicit business failure.
+    # The steps completed inside the subflow are rolled back (if they have not
+    # been already) and discarded, the Context's top-level keys are restored to
+    # their pre-subflow state, and the Context is marked successful again.
+    #
+    # Returns a failed Context describing the failure for the recovery block.
+    def _abort_subflow
+      boundary = _subflow_boundaries.pop
+      failure = _failure_snapshot
+
+      unless boundary[:rolled_back]
+        _called[boundary[:index]..].reverse_each(&:rollback)
+      end
+      @called = _called.first(boundary[:index])
+
+      _restore_keys(boundary[:keys])
+      boundary[:rollback_keys].each do |key, value|
+        self[key] = value
+      end
+      @failure = false
+
+      failure
+    end
+
+    # Internal: Pop the innermost subflow boundary after an ordinary exception.
+    # The exception is allowed to propagate and the whole Context has already
+    # been rolled back, so neither the completed steps nor the keys are kept.
+    #
+    # Returns nothing.
+    def _dissolve_subflow
+      _subflow_boundaries.pop
+    end
+
+    # Internal: Mark the Context as failed without raising Interactor::Failure.
+    # Used to build the isolated failure Context handed to a recovery block.
+    #
+    # Returns nothing.
+    def _mark_failed
+      @failure = true
+    end
+
+    # Internal: A shallow snapshot of the Context's current top-level keys and
+    # values. Values are shared rather than deep copied.
+    #
+    # Returns a Hash.
+    def _top_level_keys
+      to_h
+    end
+
+    # Internal: Build a failed Context that captures the top-level state at the
+    # moment of failure. The state is copied shallowly; values are shared.
+    #
+    # Returns an Interactor::Context.
+    def _failure_snapshot
+      Context.new(to_h).tap(&:_mark_failed)
+    end
+
+    # Internal: Restore the Context's top-level keys to the state captured by a
+    # boundary. Keys added by the subflow are removed, keys removed by the
+    # subflow are restored, and every remaining key is reset to its old value.
+    # Mutations inside the values themselves are not reverted.
+    #
+    # before - The Hash of top-level keys captured when the subflow began.
+    #
+    # Returns nothing.
+    def _restore_keys(before)
+      after = _top_level_keys
+
+      after.each_key { |key| delete_field(key) unless before.key?(key) }
+      before.each { |key, value| self[key] = value }
+    end
+
+    # Internal: The stack of active recoverable subflow boundaries.
+    #
+    # Returns an Array of boundary Hashes.
+    def _subflow_boundaries
+      @subflow_boundaries ||= []
     end
 
     # Internal: An Array of successfully called Interactor instances invoked

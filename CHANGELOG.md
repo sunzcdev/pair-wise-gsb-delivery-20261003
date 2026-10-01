@@ -1,3 +1,11 @@
+## Unreleased
+* [FEATURE] Add `attempt`, an explicit recoverable subflow entry point. A
+  successful subflow joins its steps and Context changes back into the outer
+  flow (still participating in later reverse rollback); a subflow that calls
+  `context.fail!` is scoped-rolled-back, has its top-level Context key changes
+  discarded, and hands the failed Context to a recovery block or method while
+  the outer flow continues. Ordinary exceptions still propagate.
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

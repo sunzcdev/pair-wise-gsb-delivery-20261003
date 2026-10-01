@@ -1,5 +1,6 @@
 require "interactor/context"
 require "interactor/error"
+require "interactor/attempt"
 require "interactor/hooks"
 require "interactor/organizer"
 
@@ -165,5 +166,39 @@ module Interactor
   #
   # Returns nothing.
   def rollback
+  end
+
+  # Public: Run an optional, recoverable subflow. The given Interactor classes
+  # are invoked in order against the current Context as an isolated unit.
+  #
+  # If the subflow succeeds, its completed steps and Context changes are joined
+  # back into the current Context. Should the outer flow fail later, those
+  # steps still take part in the normal reverse rollback.
+  #
+  # If the subflow fails by calling "context.fail!", only the steps completed
+  # after entering the subflow are rolled back, the subflow's top-level Context
+  # key additions, removals and reassignments are discarded, and the failed
+  # Context is passed to the recovery block (evaluated in the current
+  # interactor's scope). The current interactor then continues.
+  #
+  # Any other exception raised by the subflow is not treated as a business
+  # failure and propagates outward unchanged.
+  #
+  # interactors - Zero or more (or an Array of) Interactor classes.
+  # recovery    - An optional Symbol naming an instance method to invoke with
+  #               the failed Context.
+  # block       - An optional block evaluated with the failed Context.
+  #
+  # Examples
+  #
+  #   def call
+  #     attempt(SendReceipts) do |failure|
+  #       context.receipt_error = failure.message
+  #     end
+  #   end
+  #
+  # Returns the Context on success or the failed Context after recovery.
+  def attempt(*interactors, recovery: nil, &block)
+    Attempt.new(interactors, recovery: recovery, &block).run(context, self)
   end
 end

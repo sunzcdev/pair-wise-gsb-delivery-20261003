@@ -470,6 +470,77 @@ end
 interactor should have a single purpose, there should be no need to clean up
 after any failed interactor.
 
+#### Recoverable Subflows
+
+Sometimes an Organizer wants to try an optional supplement after producing its
+main result. If the supplement fails, the main work should not be undone.
+Running that supplement on the shared Context like any other organized
+interactor is not enough: its failure rolls back *every* step that ran before
+it.
+
+Use the `attempt` entry point to mark a subflow as optional and recoverable:
+
+```ruby
+class PlaceOrder
+  include Interactor::Organizer
+
+  organize CreateOrder, ChargeCard
+
+  attempt SendThankYou do |failure|
+    context.notice = failure.message
+  end
+
+  organize FinalizeOrder
+end
+```
+
+When `SendThankYou` succeeds, its completed steps and Context changes are
+joined back into the outer flow. If a later step fails, the successful
+`SendThankYou` steps still take part in the normal reverse rollback.
+
+When a step inside the subflow calls `context.fail!`:
+
+* only the steps completed after entering the subflow are rolled back,
+* the subflow's top-level Context key additions, removals and reassignments
+  are discarded,
+* the failed Context is passed to the recovery block (or a `recovery:` method),
+  and
+* the Organizer keeps going with `FinalizeOrder`.
+
+An ordinary exception (anything other than `context.fail!`) is *not* treated
+as a business failure. It propagates outward and triggers the normal rollback
+of the whole flow.
+
+The block is evaluated in the Organizer instance's scope, so the live outer
+Context remains available while recording the reason. A symbol naming an
+instance method may be used instead:
+
+```ruby
+attempt SendThankYou, recovery: :record_notice
+
+def record_notice(failure)
+  context.notice = failure.message
+end
+```
+
+Subflows may be nested. A failure in an inner subflow is first scoped to that
+subflow; only if an outer subflow itself fails are its committed steps
+reversed.
+
+`attempt` can also be called imperatively from any interactor's `call`:
+
+```ruby
+def call
+  attempt(SendReceipts) do |failure|
+    context.receipt_error = failure.message
+  end
+end
+```
+
+**NOTE:** Only top-level Context keys are restored. Interactor does not deep
+copy business objects and does not promise to undo arbitrary mutations made
+inside an object referenced by the Context.
+
 ## Testing Interactors
 
 When written correctly, an interactor is easy to test because it only *does* one
