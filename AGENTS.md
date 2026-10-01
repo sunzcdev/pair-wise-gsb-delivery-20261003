@@ -29,6 +29,7 @@ The server is configured via functional options (`With*` functions in `option.go
 - **AddressRewriter**: Transparently rewrite destination addresses.
 - **GPool**: Custom goroutine pool (default uses plain goroutines).
 - **Dial functions**: Custom dialers for outbound connections.
+- **Upstream chain** (`upstream.go`): `WithUpstreamChain` routes CONNECT through an ordered chain of upstream SOCKS5 proxies. Each hop has its own address/auth and is dialed inside the previous hop's tunnel. Name resolution is explicit per hop (`UpstreamHop.ResolveLocally`) and for the destination (`UpstreamChain.ResolveDestLocally`, default remote). Failures return `*ChainError` with hop index and phase, never passwords.
 - **Middleware**: Per-command middleware chains (Connect, Bind, Associate).
 - **User Handlers**: Override default handling for each command.
 
@@ -112,6 +113,7 @@ go mod verify
 ├── resolver.go        # NameResolver interface
 ├── ruleset.go         # RuleSet interface and PermitCommand
 ├── option.go          # Functional options for configuration
+├── upstream.go        # CONNECT upstream proxy chain (client-side chaining)
 ├── logger.go          # Logger interface
 ├── bufferpool/        # Buffer pool implementation
 ├── statute/           # Protocol constants, structs, parsers

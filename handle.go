@@ -54,7 +54,7 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 	ctx := context.Background()
 	// Resolve the address if we have a FQDN
 	dest := req.RawDestAddr
-	if dest.FQDN != "" {
+	if dest.FQDN != "" && sf.resolveDestLocally() {
 		ctx, dest.IP, err = sf.resolver.Resolve(ctx, dest.FQDN)
 		if err != nil {
 			if err := SendReply(write, statute.RepHostUnreachable, nil); err != nil {
@@ -124,6 +124,8 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 
 	if sf.dialWithRequest != nil {
 		target, err = sf.dialWithRequest(ctx, "tcp", request.DestAddr.String(), request)
+	} else if sf.upstream != nil {
+		target, err = sf.upstream.DialContext(ctx, "tcp", request.DestAddr.String())
 	} else {
 		dial := sf.dial
 		if dial == nil {
@@ -166,6 +168,13 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 		}
 	}
 	return nil
+}
+
+// resolveDestLocally reports whether destination host names are resolved
+// on this host. With an upstream chain the last hop resolves them unless
+// the chain explicitly opted into local destination resolution.
+func (sf *Server) resolveDestLocally() bool {
+	return sf.upstream == nil || sf.upstream.ResolveDestLocally
 }
 
 // handleBind is used to handle a connect command

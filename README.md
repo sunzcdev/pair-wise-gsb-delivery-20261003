@@ -28,6 +28,8 @@ The package has the following features:
 - Custom goroutine pool
 - buffer pool design and optional custom buffer pool
 - Custom logger
+- CONNECT upstream chain: dial through an ordered chain of SOCKS5 proxies,
+  each hop with its own address and auth material
 
 ### TODO
 
@@ -69,11 +71,38 @@ func main() {
 	)
 
 	// Create SOCKS5 proxy on localhost port 8000
-	if err := server.ListenAndServe("tcp", ":8000"); err != nil {
+if err := server.ListenAndServe("tcp", ":8000"); err != nil {
 		panic(err)
 	}
 }
 ```
+
+### Upstream chain
+
+CONNECT requests can be routed through an ordered chain of upstream SOCKS5
+proxies (e.g. to reach an isolated network). Every hop is dialed inside the
+tunnel established by the previous hops and uses its own address and auth
+material:
+
+```go
+chain := &socks5.UpstreamChain{
+	Hops: []socks5.UpstreamHop{
+		{Addr: "edge-proxy:1080"},
+		{Addr: "relay.isolated:1080", Username: "user", Password: "pass"},
+		{Addr: "exit.isolated:1080"},
+	},
+	// ResolveDestLocally stays false: destination names of the isolated
+	// network are resolved by the exit hop, never on this host.
+}
+server := socks5.NewServer(socks5.WithUpstreamChain(chain))
+```
+
+Name resolution is explicit: `UpstreamHop.ResolveLocally` decides whether a
+hop address is resolved on this host or by the previous hop, and
+`UpstreamChain.ResolveDestLocally` decides the same for the final
+destination. Failures are reported as `*socks5.ChainError` carrying the hop
+index and the failed phase (`resolve`/`dial`/`handshake`/`auth`/`connect`);
+passwords are never included in the error message.
 
 ### Reference
 - [rfc1928](https://www.ietf.org/rfc/rfc1928.txt) 
@@ -82,4 +111,3 @@ func main() {
 ## License
 
 This project is under MIT License. See the [LICENSE](LICENSE) file for the full license text.
-

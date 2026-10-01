@@ -97,6 +97,19 @@ func WithDialAndRequest(
 	}
 }
 
+// WithUpstreamChain routes CONNECT requests through an ordered chain of
+// upstream SOCKS5 proxies. Each hop is dialed inside the tunnel of the
+// previous hops and uses its own address and auth material.
+// It is used only when no dial function was set with WithDialAndRequest,
+// and it takes precedence over WithDial.
+// Unless the chain enables ResolveDestLocally, destination host names are
+// resolved by the last hop instead of this host.
+func WithUpstreamChain(chain *UpstreamChain) Option {
+	return func(s *Server) {
+		s.upstream = chain
+	}
+}
+
 // WithGPool can be provided to do custom goroutine pool.
 func WithGPool(pool GPool) Option {
 	return func(s *Server) {
