@@ -2,6 +2,8 @@ require "multi_json/options"
 require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
+require "multi_json/unsupported_option_error"
+require "multi_json/lexical_number"
 require "multi_json/options_cache"
 
 module MultiJson
@@ -98,11 +100,18 @@ module MultiJson
   # <b>Options</b>
   #
   # <tt>:symbolize_keys</tt> :: If true, will use symbols instead of strings for the keys.
+  # <tt>:preserve_numbers</tt> :: If true, JSON numbers are returned as {MultiJson::LexicalNumber}
+  #                               objects that keep the exact original spelling, so values outside
+  #                               Float precision and distinctions like 1.2300 vs 123e-2 survive.
+  #                               Adapters that cannot do this losslessly raise
+  #                               {MultiJson::UnsupportedOptionError} instead of rounding.
   # <tt>:adapter</tt> :: If set, the selected adapter will be used for this call.
   def load(string, options = {})
     adapter = current_adapter(options)
     begin
       adapter.load(string, options)
+    rescue UnsupportedOptionError
+      raise # an explicit refusal must never be masked as a parse failure
     rescue adapter::ParseError => e
       raise ParseError.build(e, string)
     end

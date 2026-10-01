@@ -19,14 +19,32 @@ module MultiJson
         string = string.read if string.respond_to?(:read)
         raise self::ParseError if blank?(string)
 
-        instance.load(string, cached_load_options(options))
+        merged = cached_load_options(options)
+        if merged[:preserve_numbers] && !supports?(:preserve_numbers)
+          raise UnsupportedOptionError.build(self, :preserve_numbers, unsupported_numbers_message)
+        end
+
+        instance.load(string, merged)
       end
 
       def dump(object, options = {})
         instance.dump(object, cached_dump_options(options))
       end
 
+      # Whether this backend can implement an option without breaking its
+      # contract. Subclasses override this for options they actually support.
+      def supports?(option)
+        case option
+        when :preserve_numbers then false
+        else true
+        end
+      end
+
       private
+
+      def unsupported_numbers_message
+        "Use the :json_gem, :json_pure or :ok_json adapter, or parse without :preserve_numbers"
+      end
 
       def blank?(input)
         input.nil? || /\A\s*\z/.match?(input)

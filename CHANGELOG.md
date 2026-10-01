@@ -1,3 +1,17 @@
+Unreleased
+----------
+
+* Add `preserve_numbers: true` to `MultiJson.load`. Numbers are returned as
+  `MultiJson::LexicalNumber` objects that keep the exact original spelling
+  (so `1.2300` and `123e-2` stay distinguishable and values beyond Float
+  precision are not rounded). Convert explicitly with `#to_i`, `#to_r` or
+  `#to_d` (BigDecimal); `#to_f` remains available but may round. Dumping such
+  an object writes a legal, unquoted number and rejects non-numeric text, so
+  injection is impossible. Supported losslessly by the `json_gem`,
+  `json_pure` and `ok_json` adapters. Backends that can only expose Float
+  values (`oj`, `yajl`, `gson`, `jr_jackson`) raise
+  `MultiJson::UnsupportedOptionError` rather than silently losing precision.
+
 1.15.0
 ------
 

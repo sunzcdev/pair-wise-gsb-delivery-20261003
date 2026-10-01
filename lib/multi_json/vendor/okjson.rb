@@ -38,9 +38,14 @@ module MultiJson
     #
     # String values in the resulting structure
     # will be UTF-8.
-    def decode(s)
+    #
+    # When +number+ responds to +call+, it is invoked with the exact original
+    # text of every number and its return value is used instead of the default
+    # Integer/Float. This is the lossless number hook used by the ok_json
+    # adapter; the text comes straight from the tokenizer.
+    def decode(s, number: nil)
       ts = lex(s)
-      v, ts = textparse(ts)
+      v, ts = textparse(ts, number)
       raise Error, "trailing garbage" unless ts.empty?
 
       v
@@ -86,13 +91,13 @@ module MultiJson
     # Returns the parsed value and any trailing tokens.
     # Note: this is almost the same as valparse,
     # except that it does not accept atomic values.
-    def textparse(ts)
+    def textparse(ts, number = nil)
       raise Error, "empty" if ts.length <= 0
 
       typ, _, val = ts[0]
       case typ
-      when "{" then objparse(ts)
-      when "[" then arrparse(ts)
+      when "{" then objparse(ts, number)
+      when "[" then arrparse(ts, number)
       else
         raise Error, "unexpected #{val.inspect}"
       end
@@ -100,14 +105,22 @@ module MultiJson
 
     # Parses a "value" in the sense of RFC 4627.
     # Returns the parsed value and any trailing tokens.
-    def valparse(ts)
+    def valparse(ts, number = nil)
       raise Error, "empty" if ts.length <= 0
 
       typ, _, val = ts[0]
       case typ
-      when "{" then objparse(ts)
-      when "[" then arrparse(ts)
-      when :val, :str then [val, ts[1..]]
+      when "{" then objparse(ts, number)
+      when "[" then arrparse(ts, number)
+      when :val
+        # For numbers the token's second slot is the exact source lexeme.
+        # Feeding that (rather than +val+) lets the callback bypass the
+        # default Integer/Float conversion entirely.
+        if number && val.is_a?(Numeric)
+          val = number.call(ts[0][1])
+        end
+        [val, ts[1..]]
+      when :str then [val, ts[1..]]
       else
         raise Error, "unexpected #{val.inspect}"
       end
@@ -115,13 +128,13 @@ module MultiJson
 
     # Parses an "object" in the sense of RFC 4627.
     # Returns the parsed value and any trailing tokens.
-    def objparse(ts)
+    def objparse(ts, number = nil)
       ts = eat("{", ts)
       obj = {}
 
       return obj, ts[1..] if ts[0][0] == "}"
 
-      k, v, ts = pairparse(ts)
+      k, v, ts = pairparse(ts, number)
       obj[k] = v
 
       return obj, ts[1..] if ts[0][0] == "}"
@@ -129,7 +142,7 @@ module MultiJson
       loop do
         ts = eat(",", ts)
 
-        k, v, ts = pairparse(ts)
+        k, v, ts = pairparse(ts, number)
         obj[k] = v
 
         return obj, ts[1..] if ts[0][0] == "}"
@@ -138,25 +151,25 @@ module MultiJson
 
     # Parses a "member" in the sense of RFC 4627.
     # Returns the parsed values and any trailing tokens.
-    def pairparse(ts)
+    def pairparse(ts, number = nil)
       (typ, _, k) = ts[0]
       ts = ts[1..]
       raise Error, "unexpected #{k.inspect}" if typ != :str
 
       ts = eat(":", ts)
-      v, ts = valparse(ts)
+      v, ts = valparse(ts, number)
       [k, v, ts]
     end
 
     # Parses an "array" in the sense of RFC 4627.
     # Returns the parsed value and any trailing tokens.
-    def arrparse(ts)
+    def arrparse(ts, number = nil)
       ts = eat("[", ts)
       arr = []
 
       return arr, ts[1..] if ts[0][0] == "]"
 
-      v, ts = valparse(ts)
+      v, ts = valparse(ts, number)
       arr << v
 
       return arr, ts[1..] if ts[0][0] == "]"
@@ -164,7 +177,7 @@ module MultiJson
       loop do
         ts = eat(",", ts)
 
-        v, ts = valparse(ts)
+        v, ts = valparse(ts, number)
         arr << v
 
         return arr, ts[1..] if ts[0][0] == "]"

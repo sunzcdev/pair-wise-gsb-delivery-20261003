@@ -239,5 +239,111 @@ shared_examples_for "an adapter" do |adapter|
     it "allows to load JSON with UTF-8 characters" do
       expect(MultiJson.load('{"color":"żółć"}')).to eq("color" => "żółć")
     end
+
+    describe ":preserve_numbers" do
+      let(:number) { MultiJson::LexicalNumber }
+
+      it "leaves ordinary parsing as Integer/Float when the option is off" do
+        expect(MultiJson.load("1.5")).to eq(1.5)
+        expect(MultiJson.load("1.5")).to be_a(Float)
+        expect(MultiJson.load("42")).to eq(42)
+        expect(MultiJson.load("42")).to be_a(Integer)
+      end
+
+      it "returns LexicalNumber objects carrying the exact original spelling" do
+        value = MultiJson.load("1.2300", preserve_numbers: true)
+        expect(value).to be_a(number)
+        expect(value.lexeme).to eq("1.2300")
+      end
+
+      it "keeps spellings that Float collapses into the same value" do
+        examples = {"1.2300" => "1.2300", "123e-2" => "123e-2", "1.23" => "1.23"}
+        parsed = examples.keys.map { |s| MultiJson.load(s, preserve_numbers: true) }
+        expect(parsed.map(&:lexeme)).to eq(examples.values)
+      end
+
+      it "preserves integers larger than Float can represent without rounding" do
+        value = MultiJson.load("9007199254740993", preserve_numbers: true)
+        expect(value).to be_a(number)
+        expect(value.to_i).to eq(9_007_199_254_740_993)
+        expect(value.to_f).to eq(9_007_199_254_740_992.0) # demonstrates Float is lossy
+        expect(value.lexeme).to eq("9007199254740993")
+      end
+
+      it "preserves an integral value reached through an exponent spelling" do
+        value = MultiJson.load("1e3", preserve_numbers: true)
+        expect(value).to be_a(number)
+        expect(value.to_i).to eq(1000)
+        expect(value.lexeme).to eq("1e3")
+      end
+
+      it "preserves very long fractional parts" do
+        text = "3.14159265358979323846264338327950288"
+        value = MultiJson.load(text, preserve_numbers: true)
+        expect(value.lexeme).to eq(text)
+        expect(value.to_d.to_s).to eq("0.314159265358979323846264338327950288e1")
+      end
+
+      it "walks nested objects and arrays" do
+        json = '{"a":[{"b":[1.10,2,1e3]}],"c":-0.0}'
+        result = MultiJson.load(json, preserve_numbers: true)
+        expect(result["a"][0]["b"][0]).to be_a(number)
+        expect(result["a"][0]["b"][0].lexeme).to eq("1.10")
+        expect(result["a"][0]["b"][1]).to be_a(number) # integers are preserved too
+        expect(result["a"][0]["b"][1].to_i).to eq(2)
+        expect(result["a"][0]["b"][2]).to be_a(number)
+        expect(result["a"][0]["b"][2].lexeme).to eq("1e3")
+        expect(result["c"].lexeme).to eq("-0.0")
+      end
+
+      it "keeps JSON strings as String, even when they look like numbers" do
+        result = MultiJson.load('{"n":1.20,"s":"1.20"}', preserve_numbers: true)
+        expect(result["n"]).to be_a(number)
+        expect(result["s"]).to be_a(String)
+        expect(result["s"]).to eq("1.20")
+        expect(result["n"]).not_to be_a(String)
+      end
+
+      it "decodes escape sequences in strings while preserving numbers" do
+        # JSON text whose string value contains an escaped quote, backslash,
+        # newline and tab; the number next to it must stay a LexicalNumber.
+        json = '{"s":"quote:\\" back:\\\\ nl:\n tab:\t","n":1.20}'
+        result = MultiJson.load(json, preserve_numbers: true)
+        expect(result["s"]).to eq("quote:\" back:\\ nl:\n tab:\t")
+        expect(result["n"].lexeme).to eq("1.20")
+      end
+
+      it "round-trips through dump as an unquoted legal number" do
+        json = '{"price":1.2300,"big":12345678901234567890.50}'
+        dumped = MultiJson.dump(MultiJson.load(json, preserve_numbers: true))
+        expect(dumped).to eq(json)
+        expect(dumped).not_to include('"1.2300"')
+        reparsed = MultiJson.load(dumped, preserve_numbers: true)
+        expect(reparsed["price"].lexeme).to eq("1.2300")
+      end
+
+      it "dumps a scalar number without quotes" do
+        expect(MultiJson.dump(number.new("1.2300"))).to eq("1.2300")
+      end
+
+      it "does not mutate the caller's options hash" do
+        options = {preserve_numbers: true}
+        MultiJson.load("1.20", options)
+        expect(options).to eq(preserve_numbers: true)
+      end
+
+      it "works together with symbolize_keys" do
+        result = MultiJson.load('{"a":1.20}', preserve_numbers: true, symbolize_keys: true)
+        expect(result[:a].lexeme).to eq("1.20")
+      end
+
+      %w[01 +1 .5 1. 1e NaN Infinity 0x10 1_000].each do |invalid|
+        it "rejects illegal number #{invalid.inspect}" do
+          expect {
+            MultiJson.load(invalid, preserve_numbers: true)
+          }.to raise_error(MultiJson::ParseError)
+        end
+      end
+    end
   end
 end
