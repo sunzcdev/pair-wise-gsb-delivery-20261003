@@ -1,3 +1,13 @@
+### Unreleased
+
+* Add `Tomlrb.each_event`, a chunked-IO streaming reader that yields
+  declarations, paths and completed values as structural events without
+  building the whole output Hash. It accepts arbitrary chunk boundaries
+  (including splits inside UTF-8 characters, escape sequences and multi-line
+  strings), supports one-byte `#getbyte` IOs, reports EOF-only errors
+  (unterminated strings/escapes/constructs and incomplete UTF-8) explicitly,
+  and retains only the duplicate-key trie and open-construct state.
+
 ### 2.0.4 - 2025-12-18
 
 * Update Racc to v1.8.1
