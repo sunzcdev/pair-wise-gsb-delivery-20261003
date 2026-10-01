@@ -54,7 +54,7 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 	ctx := context.Background()
 	// Resolve the address if we have a FQDN
 	dest := req.RawDestAddr
-	if dest.FQDN != "" {
+	if dest.FQDN != "" && !sf.chainResolvesTargetRemotely() {
 		ctx, dest.IP, err = sf.resolver.Resolve(ctx, dest.FQDN)
 		if err != nil {
 			if err := SendReply(write, statute.RepHostUnreachable, nil); err != nil {
@@ -116,13 +116,22 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 	return last(ctx, write, req)
 }
 
+// chainResolvesTargetRemotely reports whether a configured upstream chain
+// forwards the destination hostname to the last hop, in which case the
+// server must not resolve it locally.
+func (sf *Server) chainResolvesTargetRemotely() bool {
+	return sf.chain != nil && sf.chain.TargetResolve == ResolveRemote
+}
+
 // handleConnect is used to handle a connect command
 func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *Request) error {
 	// Attempt to connect
 	var target net.Conn
 	var err error
 
-	if sf.dialWithRequest != nil {
+	if sf.chain != nil {
+		target, err = sf.chain.dial(ctx, sf.resolver, request.DestAddr)
+	} else if sf.dialWithRequest != nil {
 		target, err = sf.dialWithRequest(ctx, "tcp", request.DestAddr.String(), request)
 	} else {
 		dial := sf.dial

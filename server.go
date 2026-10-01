@@ -53,6 +53,9 @@ type Server struct {
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	// Optional function for dialing out with the access of request detail.
 	dialWithRequest func(ctx context.Context, network, addr string, request *Request) (net.Conn, error)
+	// chain is the optional ordered upstream SOCKS5 proxy chain used for
+	// CONNECT requests. When set, it takes precedence over dial/dialWithRequest.
+	chain *Chain
 	// buffer pool
 	bufferPool bufferpool.BufPool
 	// goroutine pool

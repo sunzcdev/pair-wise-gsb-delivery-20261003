@@ -97,6 +97,20 @@ func WithDialAndRequest(
 	}
 }
 
+// WithConnectChain sets an ordered chain of upstream SOCKS5 proxies used for
+// CONNECT requests. Each hop has its own address, auth material and resolution
+// side; every hop is connected through the tunnel established by the previous
+// one. When set, the chain takes precedence over WithDial/WithDialAndRequest.
+func WithConnectChain(chain Chain) Option {
+	return func(s *Server) {
+		if len(chain.Hops) == 0 {
+			return
+		}
+		c := chain
+		s.chain = &c
+	}
+}
+
 // WithGPool can be provided to do custom goroutine pool.
 func WithGPool(pool GPool) Option {
 	return func(s *Server) {

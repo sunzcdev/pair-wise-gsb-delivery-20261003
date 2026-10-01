@@ -23,6 +23,8 @@ The package has the following features:
 - User/Password authentication optional user addr limit
 - Support for the CONNECT command
 - Support for the ASSOCIATE command
+- Chained upstream SOCKS5 proxies for CONNECT, with per-hop auth and
+  configurable local/remote name resolution
 - Rules to do granular filtering of commands
 - Custom DNS resolution
 - Custom goroutine pool
@@ -82,4 +84,3 @@ func main() {
 ## License
 
 This project is under MIT License. See the [LICENSE](LICENSE) file for the full license text.
-
