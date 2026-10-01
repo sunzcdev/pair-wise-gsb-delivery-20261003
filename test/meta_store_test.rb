@@ -183,7 +183,7 @@ module RackCacheMetaStoreImplementation
         store_simple_entry
         @entity_store.purge(@response.headers['x-content-digest'])
         mock = Minitest::Mock.new
-        mock.expect :call, nil, [@store.cache_key(@request)]
+        mock.expect :call, nil, [@store.cache_key(@request), @entity_store]
         @store.stub(:purge, mock) do
           @store.lookup(@request, @entity_store)
         end
@@ -196,7 +196,7 @@ module RackCacheMetaStoreImplementation
         meta_entry.grep(Array).flatten.each { |h| h.is_a?(Hash) && h.delete('x-content-digest') }
         @store.write(cache_key, meta_entry)
         mock = Minitest::Mock.new
-        mock.expect :call, nil, [@store.cache_key(@request)]
+        mock.expect :call, nil, [@store.cache_key(@request), nil]
         @store.stub(:purge, mock) do
           @store.lookup(@request, nil)
         end
@@ -207,7 +207,7 @@ module RackCacheMetaStoreImplementation
         store_simple_entry
         assert @response.headers['x-content-digest']
         @entity_store.purge(@response.headers['x-content-digest'])
-        def @store.purge(key); raise NotImplementedError; end
+        def @store.purge(key, entity_store=nil); raise NotImplementedError; end
         @store.lookup(@request, @entity_store).must_be_nil
         @store.lookup(@request, @entity_store).must_be_nil
       end

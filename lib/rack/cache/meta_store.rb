@@ -43,9 +43,11 @@ module Rack::Cache
         restore_response(res, body)
       else
         # the metastore referenced an entity that doesn't exist in
-        # the entitystore, purge the entry from the meta-store
+        # the entitystore, purge the entry from the meta-store. The Heap
+        # stores release the purged entries' body references at the same
+        # time.
         begin
-          purge(key)
+          purge(key, entity_store)
         rescue NotImplementedError
           @@warned_on_purge ||= begin
             warn "WARNING: Future releases may require purge implementation for #{self.class.name}"
@@ -90,8 +92,9 @@ module Rack::Cache
       # read existing cache entries, remove non-varying, and add this one to
       # the list
       vary = response.vary
+      existing = read(key)
       entries =
-        read(key).reject do |env, res|
+        existing.reject do |env, res|
           (vary == (res['vary'])) &&
             requests_match?(vary, env, stored_env)
         end
@@ -100,11 +103,12 @@ module Rack::Cache
       headers.delete('age')
 
       entries.unshift [stored_env, headers]
-      if request.env['rack-cache.use_native_ttl'] && response.fresh?
-        write key, entries, response.ttl
-      else
-        write key, entries
-      end
+
+      # Atomically commit the new entries and update body references. If the
+      # meta data cannot be written, any references that were claimed are
+      # released again so that no unreachable body is left behind.
+      commit_entries(key, existing, entries, entity_store,
+        request.env['rack-cache.use_native_ttl'] && response.fresh? ? response.ttl : nil)
       key
     end
 
@@ -115,22 +119,101 @@ module Rack::Cache
     end
 
     # Invalidate all cache entries that match the request.
+    #
+    # Invalidation only marks matching entries stale; entries and their
+    # referenced bodies remain in the stores, so no body references are
+    # released here.
     def invalidate(request, entity_store)
       modified = false
       key = cache_key(request)
-      entries =
-        read(key).map do |req, res|
-          response = restore_response(res)
-          if response.fresh?
-            response.expire!
-            modified = true
+      synchronize do
+        entries =
+          read(key).map do |req, res|
+            response = restore_response(res)
+            if response.fresh?
+              response.expire!
+              modified = true
+            end
+            [req, persist_response(response)]
           end
-          [req, persist_response(response)]
-        end
-      write key, entries if modified
+        write key, entries if modified
+      end
     end
 
   private
+
+    # Serialize a block that performs a read/modify/write cycle on the
+    # store. Concrete stores with native concurrency guarantees or mutexes
+    # override this; the default yields without locking.
+    def synchronize
+      yield
+    end
+
+    # Digest of the body referenced by a stored entry, if any.
+    def entry_entity_key(entry)
+      entry[1] && entry[1]['x-content-digest']
+    end
+
+    # Commit +new_entries+ for +key+ while keeping the paired entity store's
+    # reference counts consistent with the difference from +old_entries+:
+    #
+    # * bodies referenced by more entries than before are retained,
+    # * bodies referenced by fewer entries than before are released,
+    # * bodies shared by the same number of entries are left untouched.
+    #
+    # Reference updates are rolled back if the meta data write fails, so a
+    # failed write never leaks a body nor drops a still-referenced one. Any
+    # new entry whose body no longer exists is dropped before committing.
+    def commit_entries(key, old_entries, new_entries, entity_store, ttl=nil)
+      old_counts = Hash.new(0)
+      new_counts = Hash.new(0)
+      old_entries.each { |entry| (digest = entry_entity_key(entry)) && old_counts[digest] += 1 }
+      new_entries.each { |entry| (digest = entry_entity_key(entry)) && new_counts[digest] += 1 }
+
+      synchronize do
+        retained = []
+        released = []
+
+        begin
+          # Claim references added by this commit before writing. A store
+          # that rejects the claim (Heap returns false when the body has
+          # already been reclaimed) signals that the entry is dangling and
+          # must not be committed.
+          new_counts.each do |digest, count|
+            (count - old_counts[digest].to_i).times do
+              if entity_store.retain(digest)
+                retained << digest
+              else
+                new_entries.reject! { |entry| entry_entity_key(entry) == digest }
+                new_counts.delete(digest)
+              end
+            end
+          end
+
+          if ttl
+            write key, new_entries, ttl
+          else
+            write key, new_entries
+          end
+
+          # The new meta data is durable; drop references removed by this
+          # commit.
+          old_counts.each do |digest, count|
+            (count - new_counts[digest].to_i).times do
+              entity_store.release(digest)
+              released << digest
+            end
+          end
+        rescue
+          # Undo the reference changes so the counts still describe the
+          # previously committed entries.
+          retained.each { |digest| entity_store.release(digest) }
+          released.reverse_each { |digest| entity_store.retain(digest) }
+          raise
+        end
+      end
+      nil
+    end
 
     # Extract the environment Hash from +request+ while making any
     # necessary modifications in preparation for persistence. The Hash
@@ -181,8 +264,9 @@ module Rack::Cache
     end
 
     # Remove all cached entries at the key specified. No error is raised
-    # when the key does not exist.
-    def purge(key)
+    # when the key does not exist. When an entity store is provided, any
+    # body references held by the removed entries are released.
+    def purge(key, entity_store=nil)
       raise NotImplementedError
     end
 
@@ -200,6 +284,7 @@ module Rack::Cache
       def initialize(hash={}, options = {})
         @hash = hash
         @options = options
+        @mutex = Mutex.new
       end
 
       def read(key)
@@ -214,8 +299,18 @@ module Rack::Cache
         @hash[key] = Marshal.dump(entries)
       end
 
-      def purge(key)
-        @hash.delete(key)
+      # Delete all entries stored at +key+ and release the entity-store
+      # references they held so that now-unshared bodies are reclaimed.
+      def purge(key, entity_store=nil)
+        @mutex.synchronize do
+          entries = read(key)
+          @hash.delete(key)
+          if entity_store
+            entries.each do |_, res|
+              (digest = res['x-content-digest']) && entity_store.release(digest)
+            end
+          end
+        end
         nil
       end
 
@@ -225,6 +320,13 @@ module Rack::Cache
 
       def self.resolve(uri, options = {})
         new({}, options)
+      end
+
+      private
+
+      # Serialize read/modify/write cycles against the backing Hash.
+      def synchronize
+        @mutex.synchronize { yield }
       end
     end
 
@@ -259,7 +361,7 @@ module Rack::Cache
         end
       end
 
-      def purge(key)
+      def purge(key, entity_store=nil)
         path = key_path(key)
         File.unlink(path)
         nil
@@ -353,7 +455,7 @@ module Rack::Cache
         cache.set(key, entries, ttl)
       end
 
-      def purge(key)
+      def purge(key, entity_store=nil)
         cache.delete(hexdigest(key))
         nil
       end
@@ -388,7 +490,7 @@ module Rack::Cache
         cache.set(key, entries, ttl)
       end
 
-      def purge(key)
+      def purge(key, entity_store=nil)
         key = hexdigest(key)
         cache.delete(key)
         nil
@@ -423,7 +525,7 @@ module Rack::Cache
         cache.put(key, entries)
       end
 
-      def purge(key)
+      def purge(key, entity_store=nil)
         key = hexdigest(key)
         cache.delete(key)
         nil
