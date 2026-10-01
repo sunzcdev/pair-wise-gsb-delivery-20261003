@@ -46,6 +46,23 @@ public class JavaSemaphoreLibrary {
         }
 
         @JRubyMethod
+        public IRubyObject initialize(ThreadContext context, IRubyObject value, IRubyObject options) {
+            boolean fair;
+            if (options instanceof org.jruby.RubyHash) {
+                fair = ((org.jruby.RubyHash) options).get(context, runtime.newSymbol("fair")) == runtime.getTrue();
+            } else {
+                fair = options == runtime.getTrue();
+            }
+            this.semaphore = new JRubySemaphore(rubyFixnumInt(value, "count"), fair);
+            return context.nil;
+        }
+
+        @JRubyMethod(name = "fair?")
+        public IRubyObject fair(ThreadContext context) {
+            return getRuntime().newBoolean(this.semaphore.isFair());
+        }
+
+        @JRubyMethod
         public IRubyObject acquire(ThreadContext context, final Block block) throws InterruptedException {
             return this.acquire(context, 1, block);
         }

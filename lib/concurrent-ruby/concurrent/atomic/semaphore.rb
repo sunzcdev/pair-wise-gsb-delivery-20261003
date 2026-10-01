@@ -9,8 +9,21 @@ module Concurrent
   #   Create a new `Semaphore` with the initial `count`.
   #
   #   @param [Fixnum] count the initial count
+  #   @param [Hash, Boolean] fair when truthy (or `{ fair: true }`) the
+  #     semaphore is created in fair mode: requests are granted in FIFO order,
+  #     the whole requested number of permits is granted atomically (no
+  #     partial acquisition), and no request (including {#try_acquire}) can
+  #     overtake the head of the queue. When the head request times out or is
+  #     abandoned the following request is advanced immediately. Defaults to
+  #     `false` to preserve the original non-fair behavior.
   #
   #   @raise [ArgumentError] if `count` is not an integer
+
+  # @!macro semaphore_method_fair
+  #
+  #   Returns `true` if this semaphore was created in fair mode.
+  #
+  #   @return [Boolean]
 
   # @!macro semaphore_method_acquire
   #
@@ -71,8 +84,11 @@ module Concurrent
 
   # @!macro semaphore_public_api
   #
-  #   @!method initialize(count)
+  #   @!method initialize(count, fair = false)
   #     @!macro semaphore_method_initialize
+  #
+  #   @!method fair?
+  #     @!macro semaphore_method_fair
   #
   #   @!method acquire(permits = 1)
   #     @!macro semaphore_method_acquire
@@ -111,6 +127,15 @@ module Concurrent
   #   count of the number available and acts accordingly.
   #   Alternatively, permits may be acquired within a block, and automatically
   #   released after the block finishes executing.
+  #
+  #   A request may ask for several permits. In the default non-fair mode,
+  #   permits are granted as they become available, so a small later request
+  #   can repeatedly overtake an earlier request still waiting for a larger
+  #   number of permits (which may starve that heavy request). Construct the
+  #   semaphore with `fair: true` to obtain strict FIFO ordering: requests are
+  #   served strictly in enqueue order, each request receives all of its
+  #   permits atomically (never a partial allocation), and `try_acquire`
+  #   cannot bypass queued requests.
   #
   # @!macro semaphore_public_api
   # @example

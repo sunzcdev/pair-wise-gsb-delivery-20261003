@@ -1,5 +1,14 @@
 ## Current
 
+concurrent-ruby:
+
+* `Concurrent::Semaphore` now supports an explicit fair mode
+  (`Concurrent::Semaphore.new(count, true)`). In fair mode requests with
+  different permit weights are granted strictly in FIFO order, permits are
+  always acquired as a whole (no partial acquisition), `try_acquire` cannot
+  overtake already queued requests, and a timed-out or abandoned head request
+  promptly advances the next one. The default non-fair behavior is unchanged.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
