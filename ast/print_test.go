@@ -85,6 +85,9 @@ func TestPrint(t *testing.T) {
 		{`(-(1+1)) == 2`, `-(1 + 1) == 2`},
 		{`if true { 1 } else { 2 }`, `if true { 1 } else { 2 }`},
 		{`if true { 1 } else if false { 2 } else { 3 }`, `if true { 1 } else if false { 2 } else { 3 }`},
+		{`match a { B: 1, _: 2 }`, `match a { B: 1, _: 2 }`},
+		{`match a { B { x, y: z } if x > 1: z, _: 0 }`, `match a { B { x, y: z } if x > 1: z, _: 0 }`},
+		{`match a { B { c: D { e }, f: _ }: 1, _: 2 }`, `match a { B { c: D { e }, f: _ }: 1, _: 2 }`},
 	}
 
 	for _, tt := range tests {

@@ -282,6 +282,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.SequenceNode(n)
 	case *ast.ConditionalNode:
 		c.ConditionalNode(n)
+	case *ast.MatchNode:
+		c.MatchNode(n)
 	case *ast.ArrayNode:
 		c.ArrayNode(n)
 	case *ast.MapNode:
@@ -1289,6 +1291,108 @@ func (c *compiler) ConditionalNode(node *ast.ConditionalNode) {
 	c.compile(node.Exp2)
 
 	c.patchJump(end)
+}
+
+func (c *compiler) MatchNode(node *ast.MatchNode) {
+	// Evaluate the input expression once and store it in a hidden variable.
+	c.compile(node.Input)
+	inputIndex := c.addVariable("match")
+	c.emit(OpStore, inputIndex)
+
+	endJumps := make([]int, 0, len(node.Arms))
+	for _, arm := range node.Arms {
+		var failJumps []int
+		bindings := c.compileMatchPattern(arm.Pattern, inputIndex, &failJumps)
+		for _, b := range bindings {
+			c.beginScope(b.name, b.index)
+		}
+
+		if arm.Guard != nil {
+			c.compile(arm.Guard)
+			c.derefInNeeded(arm.Guard)
+			failJumps = append(failJumps, c.emit(OpJumpIfFalse, placeholder))
+			c.emit(OpPop)
+		}
+
+		c.compile(arm.Body)
+		endJumps = append(endJumps, c.emit(OpJump, placeholder))
+
+		// Branch variables go out of scope at the end of the arm.
+		for range bindings {
+			c.endScope()
+		}
+
+		// Every failed check of this arm lands here with exactly one value
+		// left on the stack; discard it and continue with the next arm.
+		for _, j := range failJumps {
+			c.patchJump(j)
+		}
+		if len(failJumps) > 0 {
+			c.emit(OpPop)
+		}
+	}
+
+	// No arm matched: the checker guarantees this is unreachable for
+	// exhaustive matches, but the input may hold a value of an unregistered
+	// or nil type at runtime.
+	c.emitLocation(node.Location(), OpPush, c.addConstant(fmt.Errorf("no matching variant in match expression")))
+	c.emitLocation(node.Location(), OpThrow, 0)
+
+	for _, j := range endJumps {
+		c.patchJump(j)
+	}
+}
+
+type matchBinding struct {
+	name  string
+	index int
+}
+
+// compileMatchPattern emits variant checks and field extractions for a
+// pattern matching the value stored in the variable srcIndex. Every failed
+// check jumps to a placeholder appended to failJumps, leaving exactly one
+// value on the stack. It returns the variables bound by the pattern.
+func (c *compiler) compileMatchPattern(pattern *ast.PatternNode, srcIndex int, failJumps *[]int) []matchBinding {
+	if pattern.Wildcard {
+		return nil
+	}
+	if pattern.VariantType == nil {
+		panic("match expression is not checked: use expr.Compile with expr.VariantSet() to register variants")
+	}
+
+	c.emitLocation(pattern.Location(), OpLoadVar, srcIndex)
+	c.emitLocation(pattern.Location(), OpMatchVariant, c.addConstant(pattern.VariantType))
+	j := c.emit(OpJumpIfFalse, placeholder)
+	*failJumps = append(*failJumps, j)
+	c.emit(OpPop)
+
+	var bindings []matchBinding
+	for _, field := range pattern.Fields {
+		switch {
+		case field.Pattern != nil && field.Pattern.Wildcard:
+			// A field matched against "_" is simply ignored.
+
+		case field.Pattern != nil:
+			// A nested variant pattern: extract the field into a hidden
+			// variable and match the nested pattern against it.
+			tmpIndex := c.addVariable("match_field")
+			c.emitLocation(field.Location(), OpLoadVar, srcIndex)
+			c.emitLocation(field.Location(), OpPush, c.addConstant(field.Name))
+			c.emitLocation(field.Location(), OpFetch, 0)
+			c.emitLocation(field.Location(), OpStore, tmpIndex)
+			bindings = append(bindings, c.compileMatchPattern(field.Pattern, tmpIndex, failJumps)...)
+
+		default:
+			// A field binding: extract the field into a named variable.
+			index := c.addVariable(field.Binding)
+			c.emitLocation(field.Location(), OpLoadVar, srcIndex)
+			c.emitLocation(field.Location(), OpPush, c.addConstant(field.Name))
+			c.emitLocation(field.Location(), OpFetch, 0)
+			c.emitLocation(field.Location(), OpStore, index)
+			bindings = append(bindings, matchBinding{field.Binding, index})
+		}
+	}
+	return bindings
 }
 
 func (c *compiler) ArrayNode(node *ast.ArrayNode) {

@@ -381,6 +381,9 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 		case OpOr:
 			code("OpOr")
 
+		case OpMatchVariant:
+			constant("OpMatchVariant")
+
 		case OpEnd:
 			code("OpEnd")
 

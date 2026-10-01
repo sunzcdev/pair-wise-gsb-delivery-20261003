@@ -132,3 +132,37 @@ The timezone is used for the following functions:
 date("2024-11-23 12:00:00") // parses the date in the specified timezone
 now() // returns the current time in the specified timezone
 ```
+
+## VariantSet
+
+The [`VariantSet`](https://pkg.go.dev/github.com/expr-lang/expr#VariantSet) option registers a closed set of
+variants for a base type (usually an interface type) so it can be used as the input of
+a [match expression](language-definition.md#match-expression). The first argument must be a nil pointer to the
+interface type; each variant is a zero value of a concrete type belonging to the set.
+
+```go
+type Status interface{ isStatus() }
+
+type Pending struct{}
+func (Pending) isStatus() {}
+
+type Paid struct{ Amount int }
+func (Paid) isStatus() {}
+
+program, err := expr.Compile(code,
+    expr.Env(env{}),
+    expr.VariantSet((*Status)(nil), Pending{}, Paid{}),
+)
+```
+
+The variant name used in match patterns defaults to the Go type name and can be overridden with
+[`expr.Variant()`](https://pkg.go.dev/github.com/expr-lang/expr#Variant):
+
+```go
+expr.VariantSet((*Status)(nil), expr.Variant("pending", Pending{}), Paid{})
+```
+
+The compiler uses the registered set to check that match expressions are exhaustive and that every arm is
+reachable. If `match` conflicts with a variable or function name in your environment, the `match` operator can
+be disabled with the [`DisableMatchOperator`](https://pkg.go.dev/github.com/expr-lang/expr#DisableMatchOperator)
+option.

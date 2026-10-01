@@ -66,8 +66,10 @@ func (p *Parser) Parse(input string, config *conf.Config) (*Tree, error) {
 	if p.lexer != nil {
 		if config != nil {
 			p.lexer.DisableIfOperator = config.DisableIfOperator
+			p.lexer.DisableMatchOperator = config.DisableMatchOperator
 		} else {
 			p.lexer.DisableIfOperator = false
+			p.lexer.DisableMatchOperator = false
 		}
 	}
 	source := file.NewSource(input)
@@ -230,6 +232,10 @@ func (p *Parser) parseExpression(precedence int) Node {
 		return p.parseConditionalIf()
 	}
 
+	if precedence == 0 && (p.config == nil || !p.config.DisableMatchOperator) && p.current.Is(Operator, "match") {
+		return p.parseMatch()
+	}
+
 	nodeLeft := p.parsePrimary()
 
 	prevOperator := ""
@@ -389,6 +395,172 @@ func (p *Parser) parseConditional(node Node) Node {
 		}
 	}
 	return node
+}
+
+func (p *Parser) parseMatch() Node {
+	token := p.current
+	p.expect(Operator, "match")
+	input := p.parseExpression(0)
+	p.expect(Bracket, "{")
+
+	arms := make([]*MatchArmNode, 0)
+	for !p.current.Is(Bracket, "}") && p.err == nil {
+		if len(arms) > 0 {
+			p.expect(Operator, ",")
+			// A trailing comma is allowed.
+			if p.current.Is(Bracket, "}") {
+				break
+			}
+		}
+		arm := p.parseMatchArm()
+		if arm == nil {
+			return nil
+		}
+		arms = append(arms, arm)
+	}
+	p.expect(Bracket, "}")
+
+	if len(arms) == 0 {
+		p.errorAt(token, "match expression requires at least one arm")
+		return nil
+	}
+
+	return p.createNode(&MatchNode{
+		Input: input,
+		Arms:  arms,
+	}, token.Location)
+}
+
+func (p *Parser) parseMatchArm() *MatchArmNode {
+	pattern := p.parsePattern()
+	if pattern == nil {
+		return nil
+	}
+
+	var guard Node
+	if p.current.Is(Operator, "if") {
+		p.next()
+		guard = p.parseExpression(0)
+	}
+
+	p.expect(Operator, ":")
+	body := p.parseExpression(0)
+	if p.err != nil {
+		return nil
+	}
+
+	arm := &MatchArmNode{
+		Pattern: pattern,
+		Guard:   guard,
+		Body:    body,
+	}
+	arm.SetLocation(pattern.Location())
+	return arm
+}
+
+func (p *Parser) parsePattern() *PatternNode {
+	token := p.current
+
+	if token.Is(Identifier, "_") {
+		p.next()
+		node := p.createNode(&PatternNode{Wildcard: true}, token.Location)
+		if node == nil {
+			return nil
+		}
+		return node.(*PatternNode)
+	}
+
+	if !token.Is(Identifier) {
+		p.error("expected variant name or _ in match pattern (unexpected token %v)", token)
+		return nil
+	}
+	p.next()
+
+	pattern := &PatternNode{Variant: token.Value}
+	if p.current.Is(Bracket, "{") {
+		p.parseVariantFields(pattern)
+	}
+	if p.err != nil {
+		return nil
+	}
+
+	node := p.createNode(pattern, token.Location)
+	if node == nil {
+		return nil
+	}
+	return node.(*PatternNode)
+}
+
+// parseVariantFields parses "{ field, name: binding, nested: Variant { ... } }"
+// into the given pattern. The opening bracket must be the current token.
+func (p *Parser) parseVariantFields(pattern *PatternNode) {
+	p.expect(Bracket, "{")
+	for !p.current.Is(Bracket, "}") && p.err == nil {
+		if len(pattern.Fields) > 0 {
+			p.expect(Operator, ",")
+			// A trailing comma is allowed.
+			if p.current.Is(Bracket, "}") {
+				break
+			}
+		}
+		field := p.parseFieldPattern()
+		if field == nil {
+			return
+		}
+		pattern.Fields = append(pattern.Fields, field)
+	}
+	p.expect(Bracket, "}")
+}
+
+func (p *Parser) parseFieldPattern() *FieldPatternNode {
+	token := p.current
+	if !token.Is(Identifier) || token.Value == "_" {
+		p.error("expected field name in match pattern (unexpected token %v)", token)
+		return nil
+	}
+	p.next()
+
+	field := &FieldPatternNode{
+		Name:    token.Value,
+		Binding: token.Value,
+	}
+
+	if p.current.Is(Operator, ":") {
+		p.next()
+		field.Binding = ""
+		switch {
+		case p.current.Is(Identifier, "_"):
+			wildcard := &PatternNode{Wildcard: true}
+			wildcard.SetLocation(p.current.Location)
+			field.Pattern = wildcard
+			p.next()
+		case p.current.Is(Identifier):
+			name := p.current
+			p.next()
+			if p.current.Is(Bracket, "{") {
+				// A nested variant pattern, like "reason: Fraud { code }".
+				nested := &PatternNode{Variant: name.Value}
+				p.parseVariantFields(nested)
+				if p.err != nil {
+					return nil
+				}
+				nested.SetLocation(name.Location)
+				field.Pattern = nested
+			} else {
+				// A binding with a different name, like "amount: total".
+				field.Binding = name.Value
+			}
+		default:
+			p.error("expected binding, variant pattern, or _ after : (unexpected token %v)", p.current)
+			return nil
+		}
+	}
+	if p.err != nil {
+		return nil
+	}
+
+	field.SetLocation(token.Location)
+	return field
 }
 
 func (p *Parser) parsePrimary() Node {

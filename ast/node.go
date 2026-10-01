@@ -249,3 +249,51 @@ type PairNode struct {
 	Key   Node // Key of the pair.
 	Value Node // Value of the pair.
 }
+
+// MatchNode represents a match expression.
+// Example:
+//
+//	match order.Status {
+//	    Pending: "waiting",
+//	    Paid { amount } if amount > 100: "big payment",
+//	    _: "other",
+//	}
+type MatchNode struct {
+	base
+	Input Node            // Input expression of the match. Like "order.Status" in the example above.
+	Arms  []*MatchArmNode // Arms of the match expression.
+}
+
+// MatchArmNode represents a single arm of a match expression.
+type MatchArmNode struct {
+	base
+	Pattern *PatternNode // Pattern of the arm. Like "Paid { amount }" in the example above.
+	Guard   Node         // Optional guard of the arm. Like "amount > 100" in the example above. Nil if no guard.
+	Body    Node         // Body of the arm, evaluated if the pattern matches and the guard holds.
+}
+
+// PatternNode represents a pattern of a match arm.
+// A pattern is either a wildcard "_" or a variant pattern like
+// "Paid" or "Paid { amount, reason: Fraud { code } }".
+type PatternNode struct {
+	base
+	Wildcard bool                // If true then the pattern is a wildcard "_" and matches any input.
+	Variant  string              // Name of the variant. Like "Paid" in "Paid { amount }". Empty if Wildcard.
+	Fields   []*FieldPatternNode // Field patterns of the variant pattern.
+
+	// VariantType is the concrete Go type of the variant. It is resolved
+	// by the checker from the variant set registered for the match input
+	// type and is used by the compiler to emit variant checks.
+	VariantType reflect.Type
+}
+
+// FieldPatternNode represents a single field pattern of a variant pattern.
+// Example:
+//
+//	Paid { amount, reason: Fraud { code }, note: _ }
+type FieldPatternNode struct {
+	base
+	Name    string       // Name of the field. Like "amount" in "Paid { amount }".
+	Binding string       // Name of the variable the field is bound to. Empty if Pattern is set.
+	Pattern *PatternNode // Nested pattern of the field. Nil if the field is bound to a variable.
+}

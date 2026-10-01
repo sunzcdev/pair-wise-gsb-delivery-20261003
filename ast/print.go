@@ -265,3 +265,42 @@ func (n *PairNode) String() string {
 	}
 	return fmt.Sprintf("(%s): %s", n.Key.String(), n.Value.String())
 }
+
+func (n *MatchNode) String() string {
+	arms := make([]string, len(n.Arms))
+	for i, arm := range n.Arms {
+		arms[i] = arm.String()
+	}
+	return fmt.Sprintf("match %s { %s }", n.Input.String(), strings.Join(arms, ", "))
+}
+
+func (n *MatchArmNode) String() string {
+	if n.Guard != nil {
+		return fmt.Sprintf("%s if %s: %s", n.Pattern.String(), n.Guard.String(), n.Body.String())
+	}
+	return fmt.Sprintf("%s: %s", n.Pattern.String(), n.Body.String())
+}
+
+func (n *PatternNode) String() string {
+	if n.Wildcard {
+		return "_"
+	}
+	if len(n.Fields) == 0 {
+		return n.Variant
+	}
+	fields := make([]string, len(n.Fields))
+	for i, field := range n.Fields {
+		fields[i] = field.String()
+	}
+	return fmt.Sprintf("%s { %s }", n.Variant, strings.Join(fields, ", "))
+}
+
+func (n *FieldPatternNode) String() string {
+	if n.Pattern != nil {
+		return fmt.Sprintf("%s: %s", n.Name, n.Pattern.String())
+	}
+	if n.Binding != n.Name {
+		return fmt.Sprintf("%s: %s", n.Name, n.Binding)
+	}
+	return n.Name
+}

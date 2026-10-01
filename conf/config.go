@@ -36,11 +36,19 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	// VariantSets holds closed variant sets registered for match expressions,
+	// keyed by the base type (usually an interface type) of the match input.
+	VariantSets map[reflect.Type]*VariantSet
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
 	// will not parse `if` statements.
 	DisableIfOperator bool
+	// DisableMatchOperator disables the built-in `match ... { }` operator syntax
+	// so that users can use `match` as an identifier or function name without
+	// conflicts. When enabled, the lexer treats `match` as an identifier and
+	// the parser will not parse match expressions.
+	DisableMatchOperator bool
 }
 
 // CreateNew creates new config with default values.
@@ -53,6 +61,7 @@ func CreateNew() *Config {
 		Functions:    make(map[string]*builtin.Function),
 		Builtins:     make(map[string]*builtin.Function),
 		Disabled:     make(map[string]bool),
+		VariantSets:  make(map[reflect.Type]*VariantSet),
 	}
 	for _, f := range builtin.Builtins {
 		c.Builtins[f.Name] = f

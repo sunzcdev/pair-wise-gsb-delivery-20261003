@@ -706,6 +706,79 @@ world`},
 			},
 		},
 		{
+			"match a { B: 1, _: 2 }",
+			&MatchNode{
+				Input: &IdentifierNode{Value: "a"},
+				Arms: []*MatchArmNode{
+					{
+						Pattern: &PatternNode{Variant: "B"},
+						Body:    &IntegerNode{Value: 1},
+					},
+					{
+						Pattern: &PatternNode{Wildcard: true},
+						Body:    &IntegerNode{Value: 2},
+					},
+				},
+			},
+		},
+		{
+			"match a { B { x, y: z } if x > 1: z, _: 0 }",
+			&MatchNode{
+				Input: &IdentifierNode{Value: "a"},
+				Arms: []*MatchArmNode{
+					{
+						Pattern: &PatternNode{
+							Variant: "B",
+							Fields: []*FieldPatternNode{
+								{Name: "x", Binding: "x"},
+								{Name: "y", Binding: "z"},
+							},
+						},
+						Guard: &BinaryNode{
+							Operator: ">",
+							Left:     &IdentifierNode{Value: "x"},
+							Right:    &IntegerNode{Value: 1},
+						},
+						Body: &IdentifierNode{Value: "z"},
+					},
+					{
+						Pattern: &PatternNode{Wildcard: true},
+						Body:    &IntegerNode{Value: 0},
+					},
+				},
+			},
+		},
+		{
+			"match a { B { c: D { e }, f: _ }: 1, _: 2 }",
+			&MatchNode{
+				Input: &IdentifierNode{Value: "a"},
+				Arms: []*MatchArmNode{
+					{
+						Pattern: &PatternNode{
+							Variant: "B",
+							Fields: []*FieldPatternNode{
+								{
+									Name: "c",
+									Pattern: &PatternNode{
+										Variant: "D",
+										Fields: []*FieldPatternNode{
+											{Name: "e", Binding: "e"},
+										},
+									},
+								},
+								{Name: "f", Pattern: &PatternNode{Wildcard: true}},
+							},
+						},
+						Body: &IntegerNode{Value: 1},
+					},
+					{
+						Pattern: &PatternNode{Wildcard: true},
+						Body:    &IntegerNode{Value: 2},
+					},
+				},
+			},
+		},
+		{
 			"1; (2; 3)",
 			&SequenceNode{
 				Nodes: []Node{
@@ -982,6 +1055,18 @@ func TestParse_error(t *testing.T) {
 		input string
 		err   string
 	}{
+		{`match a {}`, `match expression requires at least one arm (1:1)
+ | match a {}
+ | ^`},
+		{`match a { 1: 2 }`, `expected variant name or _ in match pattern (unexpected token Number("1")) (1:11)
+ | match a { 1: 2 }
+ | ..........^`},
+		{`match a { B }`, `unexpected token Bracket("}") (1:13)
+ | match a { B }
+ | ............^`},
+		{`match a { B { 1 }: 2, _: 3 }`, `expected field name in match pattern (unexpected token Number("1")) (1:15)
+ | match a { B { 1 }: 2, _: 3 }
+ | ..............^`},
 		{`foo.`, `unexpected end of expression (1:4)
  | foo.
  | ...^`},

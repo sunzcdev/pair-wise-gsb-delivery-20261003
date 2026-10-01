@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/expr-lang/expr/ast"
@@ -223,6 +224,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.sequenceNode(n)
 	case *ast.ConditionalNode:
 		nt = v.conditionalNode(n)
+	case *ast.MatchNode:
+		nt = v.matchNode(n)
 	case *ast.ArrayNode:
 		nt = v.arrayNode(n)
 	case *ast.MapNode:
@@ -1319,6 +1322,181 @@ func (v *Checker) conditionalNode(node *ast.ConditionalNode) Nature {
 		return t1
 	}
 	return Nature{}
+}
+
+func (v *Checker) matchNode(node *ast.MatchNode) Nature {
+	input := v.visit(node.Input)
+
+	if input.IsUnknown(&v.config.NtCache) || input.Type == nil {
+		return v.error(node.Input, "cannot use match on expression of unknown type")
+	}
+
+	set, ok := v.config.VariantSets[input.Type]
+	if !ok {
+		return v.error(node.Input, "no variant set registered for type %s", input.Type)
+	}
+
+	covered := make(map[string]bool, len(set.Variants))
+	wildcard := false
+	var result Nature
+	resultSet := false
+
+	for _, arm := range node.Arms {
+		pattern := arm.Pattern
+
+		bindings, irrefutable := v.checkMatchPattern(pattern, set, make(map[string]bool))
+
+		// A branch is unreachable if a previous unguarded branch already
+		// covers every input this branch's pattern can match. Branches with
+		// guards never cover anything, as a guard may fail at runtime.
+		if pattern.Wildcard {
+			if wildcard || len(covered) == len(set.Variants) {
+				v.error(pattern, "unreachable match arm: all variants are already covered by previous arms")
+			}
+		} else if wildcard || covered[pattern.Variant] {
+			v.error(pattern, "unreachable match arm: variant %s is already covered by a previous arm", pattern.Variant)
+		}
+
+		v.varScopes = append(v.varScopes, bindings...)
+		if arm.Guard != nil {
+			guard := v.visit(arm.Guard)
+			guard = guard.Deref(&v.config.NtCache)
+			if !guard.IsBool() && !guard.IsUnknown(&v.config.NtCache) {
+				v.error(arm.Guard, "non-bool expression (type %v) used as match guard", guard.String())
+			}
+		}
+		body := v.visit(arm.Body)
+		v.varScopes = v.varScopes[:len(v.varScopes)-len(bindings)]
+
+		if arm.Guard == nil {
+			if pattern.Wildcard {
+				wildcard = true
+			} else if irrefutable {
+				covered[pattern.Variant] = true
+			}
+		}
+
+		if !resultSet {
+			result = body
+			resultSet = true
+		} else if result.Nil && !body.Nil {
+			result = body
+		} else if !result.Nil && !body.Nil &&
+			!result.AssignableTo(body) && !body.AssignableTo(result) {
+			result = Nature{}
+		}
+	}
+
+	if !wildcard {
+		missing := make([]string, 0, len(set.Variants))
+		for _, variant := range set.Variants {
+			if !covered[variant.Name] {
+				missing = append(missing, variant.Name)
+			}
+		}
+		if len(missing) > 0 {
+			return v.error(node, "non-exhaustive match: missing variant(s) %s", strings.Join(missing, ", "))
+		}
+	}
+
+	return result
+}
+
+// checkMatchPattern resolves a match pattern against a variant set. It
+// validates the variant name and field patterns, resolves the concrete
+// variant type for the compiler, and returns the variables bound by the
+// pattern. It also reports whether the pattern is irrefutable, i.e. always
+// matches an input of the corresponding variant (no nested variant patterns).
+func (v *Checker) checkMatchPattern(pattern *ast.PatternNode, set *conf.VariantSet, seen map[string]bool) ([]varScope, bool) {
+	if pattern.Wildcard {
+		return nil, true
+	}
+
+	variant, ok := set.Variant(pattern.Variant)
+	if !ok {
+		v.error(pattern, "unknown variant %s (expected one of: %s)", pattern.Variant, set.String())
+		return nil, false
+	}
+	pattern.VariantType = variant.Type
+
+	if len(pattern.Fields) == 0 {
+		return nil, true
+	}
+
+	nt := v.config.NtCache.FromType(variant.Type)
+	nt = nt.Deref(&v.config.NtCache)
+	if nt.Kind != reflect.Struct {
+		v.error(pattern, "variant %s of type %s has no fields", pattern.Variant, variant.Type)
+		return nil, false
+	}
+
+	var bindings []varScope
+	irrefutable := true
+	fields := make(map[string]bool, len(pattern.Fields))
+
+	for _, field := range pattern.Fields {
+		if fields[field.Name] {
+			v.error(field, "duplicate field %s in match pattern", field.Name)
+			continue
+		}
+		fields[field.Name] = true
+
+		fn, ok := nt.FieldByName(&v.config.NtCache, field.Name)
+		if !ok {
+			v.error(field, "variant %s has no field %s", pattern.Variant, field.Name)
+			continue
+		}
+
+		switch {
+		case field.Pattern != nil && field.Pattern.Wildcard:
+			// A field matched against "_" is simply ignored.
+
+		case field.Pattern != nil:
+			// A nested variant pattern, like "reason: Fraud { code }".
+			irrefutable = false
+			bindings = append(bindings, v.checkNestedPattern(field, field.Pattern, fn, seen)...)
+
+		default:
+			// A form like "reason: Fraud" (without fields) is treated as a
+			// nested variant pattern if the name is a known variant of the
+			// field's type; otherwise it is a plain variable binding.
+			if subSet, ok := v.config.VariantSets[fn.Type]; ok {
+				if _, isVariant := subSet.Variant(field.Binding); isVariant {
+					nested := &ast.PatternNode{Variant: field.Binding}
+					nested.SetLocation(field.Location())
+					field.Binding = ""
+					field.Pattern = nested
+					irrefutable = false
+					bindings = append(bindings, v.checkNestedPattern(field, nested, fn, seen)...)
+					continue
+				}
+			}
+			name := field.Binding
+			if seen[name] {
+				v.error(field, "duplicate binding %s in match pattern", name)
+				continue
+			}
+			seen[name] = true
+			bindings = append(bindings, varScope{name, fn})
+		}
+	}
+
+	return bindings, irrefutable
+}
+
+// checkNestedPattern checks a nested variant pattern against the variant set
+// registered for the type of the given field.
+func (v *Checker) checkNestedPattern(field *ast.FieldPatternNode, pattern *ast.PatternNode, fn Nature, seen map[string]bool) []varScope {
+	if pattern.Wildcard {
+		return nil
+	}
+	subSet, ok := v.config.VariantSets[fn.Type]
+	if !ok {
+		v.error(pattern, "no variant set registered for type %s of field %s", fn.Type, field.Name)
+		return nil
+	}
+	bindings, _ := v.checkMatchPattern(pattern, subSet, seen)
+	return bindings
 }
 
 func (v *Checker) arrayNode(node *ast.ArrayNode) Nature {

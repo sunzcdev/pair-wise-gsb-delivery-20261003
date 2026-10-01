@@ -312,6 +312,63 @@ The `$env` can be used to check if a variable is defined:
 'foo' in $env
 ```
 
+## Match Expression
+
+The `match` expression selects a branch by matching an input value against a closed set of variants registered
+by the host with [expr.VariantSet()](configuration.md#variantset). Each variant is a concrete type of the input's
+interface type and may carry different fields.
+
+```expr
+match order.Status {
+    Pending: "waiting",
+    Paid { Amount }: "paid",
+    Refunded { Reason }: "refunded",
+}
+```
+
+Arms are tried in order and only the body of the first matching arm is evaluated. A pattern is either
+a variant name or a wildcard `_` that matches anything. A variant pattern may destructure fields of the variant;
+each field is bound to a variable that is visible only inside the arm:
+
+```expr
+match order.Status {
+    Paid { Amount }: Amount * 2,       // bind field Amount to variable Amount
+    Paid { Amount: total }: total * 2, // bind field Amount to variable total
+    Refunded { Reason: _ }: 0,         // ignore field Reason
+    _: 0,
+}
+```
+
+An arm may have an optional guard — an `if` expression evaluated after the pattern matches. The arm is selected
+only if the guard returns true:
+
+```expr
+match order.Status {
+    Paid { Amount } if Amount > 100: "big payment",
+    Paid { Amount }: "payment",
+    _: "other",
+}
+```
+
+Fields that are themselves of a variant type can be matched with nested patterns:
+
+```expr
+match order.Status {
+    Refunded { Reason: Fraud { Code } }: "fraud: " + Code,
+    Refunded { Reason: ChangedMind }: "changed mind",
+    _: "other",
+}
+```
+
+The compiler checks match expressions at compile time:
+
+- **Exhaustiveness**: all registered variants must be covered by an unguarded arm or a wildcard `_`. Arms with
+  guards do not count as coverage, as a guard may fail at runtime.
+- **Reachability**: an arm that can never match (for example, a duplicate of a previous unguarded arm or an arm
+  after a wildcard) is a compile error.
+
+Both kinds of errors point to the corresponding pattern in the source.
+
 ## Predicate
 
 The predicate is an expression. Predicates can be used in functions like `filter`, `all`, `any`, `one`, `none`, etc.

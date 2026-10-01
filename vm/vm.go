@@ -638,6 +638,14 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			b := vm.pop()
 			vm.push(a.(bool) || b.(bool))
 
+		case OpMatchVariant:
+			variant, ok := program.Constants[arg].(reflect.Type)
+			if !ok {
+				panic("OpMatchVariant argument must be a reflect.Type")
+			}
+			value := vm.pop()
+			vm.push(value != nil && reflect.TypeOf(value) == variant)
+
 		case OpEnd:
 			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
 			if len(vm.Scopes) > 0 {

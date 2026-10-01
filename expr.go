@@ -117,6 +117,81 @@ func DisableIfOperator() Option {
 	}
 }
 
+// DisableMatchOperator disables the `match ... { }` operator syntax so that
+// `match` can be used as an identifier or function name without conflicts.
+func DisableMatchOperator() Option {
+	return func(c *conf.Config) {
+		c.DisableMatchOperator = true
+	}
+}
+
+// VariantSet registers a closed set of variants for a base type (usually an
+// interface type) for use in match expressions. The first argument must be
+// a nil pointer to the base interface type, e.g. (*MyInterface)(nil). Each
+// variant is a zero value of a concrete type belonging to the set, e.g.
+// Pending{} or &Paid{}. The variant name used in match patterns defaults to
+// the Go type name and can be overridden with expr.Variant.
+//
+// The checker uses the registered set to verify that match expressions are
+// exhaustive and to resolve variant patterns.
+func VariantSet(of any, variants ...any) Option {
+	t := reflect.TypeOf(of)
+	if t == nil || t.Kind() != reflect.Ptr || t.Elem().Kind() != reflect.Interface {
+		panic("expr: VariantSet() first argument must be a nil pointer to an interface type, e.g. (*MyInterface)(nil)")
+	}
+	base := t.Elem()
+	if len(variants) == 0 {
+		panic("expr: VariantSet() requires at least one variant")
+	}
+
+	set := &conf.VariantSet{Type: base}
+	for _, v := range variants {
+		if named, ok := v.(conf.Variant); ok {
+			checkVariantType(base, named.Type)
+			set.AddVariant(named)
+			continue
+		}
+		vt := reflect.TypeOf(v)
+		if vt == nil {
+			panic("expr: VariantSet() variant must be a non-nil value, e.g. MyVariant{} or (*MyVariant)(nil)")
+		}
+		name := vt.Name()
+		if name == "" && vt.Kind() == reflect.Ptr {
+			name = vt.Elem().Name()
+		}
+		if name == "" {
+			panic(fmt.Sprintf("expr: VariantSet() cannot derive a variant name from type %v, use expr.Variant() to name it", vt))
+		}
+		checkVariantType(base, vt)
+		set.AddVariant(conf.Variant{Name: name, Type: vt})
+	}
+
+	return func(c *conf.Config) {
+		c.VariantSets[base] = set
+	}
+}
+
+// Variant names a variant of a variant set explicitly. It is used as an
+// argument to expr.VariantSet when the variant name should differ from the
+// Go type name.
+func Variant(name string, value any) conf.Variant {
+	t := reflect.TypeOf(value)
+	if t == nil {
+		panic(fmt.Sprintf("expr: Variant() value of %s must be non-nil, e.g. MyVariant{} or (*MyVariant)(nil)", name))
+	}
+	return conf.Variant{Name: name, Type: t}
+}
+
+func checkVariantType(base, t reflect.Type) {
+	if t.Implements(base) {
+		return
+	}
+	if t.Kind() != reflect.Ptr && reflect.PtrTo(t).Implements(base) {
+		return
+	}
+	panic(fmt.Sprintf("expr: variant type %v does not implement %v", t, base))
+}
+
 // WarnOnAny tells the compiler to warn if expression return any type.
 func WarnOnAny() Option {
 	return func(c *conf.Config) {

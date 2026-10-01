@@ -71,6 +71,14 @@ func Walk(node *Node, v Visitor) {
 	case *PairNode:
 		Walk(&n.Key, v)
 		Walk(&n.Value, v)
+	case *MatchNode:
+		Walk(&n.Input, v)
+		for _, arm := range n.Arms {
+			if arm.Guard != nil {
+				Walk(&arm.Guard, v)
+			}
+			Walk(&arm.Body, v)
+		}
 	default:
 		panic(fmt.Sprintf("undefined node type (%T)", node))
 	}

@@ -145,6 +145,12 @@ loop:
 				} else {
 					l.emit(Identifier)
 				}
+			case "match":
+				if !l.DisableMatchOperator {
+					l.emit(Operator)
+				} else {
+					l.emit(Identifier)
+				}
 			default:
 				l.emit(Identifier)
 			}

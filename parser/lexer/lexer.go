@@ -49,6 +49,10 @@ type Lexer struct {
 	// When true, keywords `if`/`else` are not treated as operators and
 	// will be emitted as identifiers instead (for compatibility with custom if()).
 	DisableIfOperator bool
+	// When true, the keyword `match` is not treated as an operator and
+	// will be emitted as an identifier instead (for compatibility with
+	// variables or functions named `match`).
+	DisableMatchOperator bool
 }
 
 func (l *Lexer) Reset(source file.Source) {
