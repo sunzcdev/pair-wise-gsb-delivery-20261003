@@ -42,6 +42,13 @@ module Rack::Cache
       storage.resolve_entitystore_uri(uri, @options)
     end
 
+    # The configured FragmentStore instance used by the explicit 206
+    # fragment storage mode.
+    def fragmentstore
+      uri = options['rack-cache.fragmentstore']
+      storage.resolve_fragmentstore_uri(uri, @options)
+    end
+
     # The Rack call interface. The receiver acts as a prototype and runs
     # each request in a dup object unless the +rack.run_once+ variable is
     # set in the environment.
@@ -251,7 +258,7 @@ module Rack::Cache
         record :invalid
       end
 
-      store(response) if response.cacheable?
+      cache_response(response)
 
       response
     end
@@ -278,9 +285,39 @@ module Rack::Cache
         response.ttl = default_ttl
       end
 
-      store(response) if response.cacheable?
+      cache_response(response)
 
       response
+    end
+
+    # Write the response to the cache. Successful 206 Partial Content
+    # responses are routed to the fragment store when the explicit
+    # fragment storage mode is enabled; only a response that has reached
+    # complete coverage is published there. Any other cacheable response
+    # is stored as a regular full entry.
+    def cache_response(response)
+      if fragment_caching? && response.status == 206
+        store_fragment(response)
+      elsif response.cacheable?
+        store(response)
+      end
+    end
+
+    # Accumulate a single 206 fragment. Incomplete accumulations produce
+    # no cache entry and the request therefore still falls back to the
+    # normal flow on subsequent requests until promotion occurs.
+    def store_fragment(response)
+      if response.cache_control.no_store? || response.cache_control.private?
+        record :fragment_uncacheable
+        return
+      end
+      result =
+        fragmentstore.store(@request, response, metastore, entitystore)
+      record(result)
+    rescue Rack::Cache::FragmentStore::InvalidFragment => e
+      record :fragment_invalid
+      log_info("fragment cache: #{e.message}") if verbose?
+      nil
     end
 
     # Write the response to the cache.

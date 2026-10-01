@@ -70,6 +70,24 @@ module Rack::Cache
     # recommended.
     option_accessor :entitystore
 
+    # Enable the explicit 206 Partial Content fragment storage mode. When
+    # enabled, successful single-part 206 responses that carry a strong
+    # ETag and announce a known complete length are accumulated in the
+    # fragment store. Once every byte of the representation is covered, a
+    # regular full cache entry is published. A normal GET is only served
+    # from the cache after that point; incomplete accumulations never
+    # satisfy requests and no gaps are fetched automatically.
+    #
+    # Default: false
+    option_accessor :fragment_caching
+
+    # A URI specifying the fragment-store implementation used by the 206
+    # fragment storage mode (see #fragment_caching). Only the 'heap:/'
+    # (in-memory) backend is currently provided.
+    #
+    # Default: 'heap:/'
+    option_accessor :fragmentstore
+
     # The number of seconds that a cache entry should be considered
     # "fresh" when no explicit freshness information is provided in
     # a response. Explicit cache-control or expires headers
@@ -147,6 +165,8 @@ module Rack::Cache
         'rack-cache.storage'          => Rack::Cache::Storage.instance,
         'rack-cache.metastore'        => 'heap:/',
         'rack-cache.entitystore'      => 'heap:/',
+        'rack-cache.fragment_caching' => false,
+        'rack-cache.fragmentstore'     => 'heap:/',
         'rack-cache.default_ttl'      => 0,
         'rack-cache.ignore_headers'   => ['set-cookie'],
         'rack-cache.private_headers'  => ['Authorization', 'Cookie'],

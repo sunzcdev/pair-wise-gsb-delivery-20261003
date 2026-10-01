@@ -31,6 +31,7 @@ module Rack::Cache
   autoload :Response,     'rack/cache/response'
   autoload :Context,      'rack/cache/context'
   autoload :Storage,      'rack/cache/storage'
+  autoload :FragmentStore, 'rack/cache/fragment_store'
   autoload :CacheControl, 'rack/cache/cache_control'
 
   # Create a new Rack::Cache middleware component that fetches resources from

@@ -1,17 +1,19 @@
 require 'uri'
 require 'rack/cache/meta_store'
 require 'rack/cache/entity_store'
+require 'rack/cache/fragment_store'
 
 module Rack::Cache
 
-  # Maintains a collection of MetaStore and EntityStore instances keyed by
-  # URI. A single instance of this class can be used across a single process
-  # to ensure that only a single instance of a backing store is created per
-  # unique storage URI.
+  # Maintains a collection of MetaStore, EntityStore, and FragmentStore
+  # instances keyed by URI. A single instance of this class can be used
+  # across a single process to ensure that only a single instance of a
+  # backing store is created per unique storage URI.
   class Storage
     def initialize
       @metastores = {}
       @entitystores = {}
+      @fragmentstores = {}
     end
 
     def resolve_metastore_uri(uri, options = {})
@@ -22,9 +24,14 @@ module Rack::Cache
       @entitystores[uri.to_s] ||= create_store(EntityStore, uri, options)
     end
 
+    def resolve_fragmentstore_uri(uri, options = {})
+      @fragmentstores[uri.to_s] ||= create_store(FragmentStore, uri, options)
+    end
+
     def clear
       @metastores.clear
       @entitystores.clear
+      @fragmentstores.clear
       nil
     end
 
