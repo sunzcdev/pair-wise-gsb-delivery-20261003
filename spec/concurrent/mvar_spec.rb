@@ -136,6 +136,263 @@ module Concurrent
 
     end
 
+    describe '.select' do
+
+      it 'raises when no MVar is given' do
+        expect { MVar.select }.to raise_error(ArgumentError)
+      end
+
+      it 'raises when an argument is not an MVar' do
+        expect { MVar.select(MVar.new, 14) }.to raise_error(ArgumentError)
+      end
+
+      it 'takes from a single full MVar and returns index and value' do
+        m = MVar.new(14)
+        expect(MVar.select(m)).to eq [0, 14]
+        expect(m).to be_empty
+      end
+
+      it 'waits for another thread to #put on a single empty MVar' do
+        m = MVar.new
+        producer = in_thread { sleep(0.1); m.put 14 }
+        expect(MVar.select(m)).to eq [0, 14]
+        expect(producer.join(5)).not_to be_nil
+      end
+
+      it 'takes from the earliest full slot when several are full' do
+        a = MVar.new(:a)
+        b = MVar.new(:b)
+        c = MVar.new(:c)
+
+        expect(MVar.select(a, b, c)).to eq [0, :a]
+        expect(a).to be_empty
+        expect(b).to be_full
+        expect(c).to be_full
+      end
+
+      it 'ignores leading empty slots and takes from the first full slot' do
+        a = MVar.new
+        b = MVar.new(:b)
+        c = MVar.new(:c)
+
+        expect(MVar.select(a, b, c)).to eq [1, :b]
+        expect(a).to be_empty
+        expect(b).to be_empty
+        expect(c).to be_full
+      end
+
+      it 'returns the correct index when a later slot becomes full first' do
+        a = MVar.new
+        b = MVar.new
+        c = MVar.new
+
+        producer = in_thread { sleep(0.05); c.put(:c) }
+
+        expect(MVar.select(a, b, c)).to eq [2, :c]
+        expect(producer.join(5)).not_to be_nil
+      end
+
+      it 'returns TIMEOUT when no slot becomes full' do
+        a = MVar.new
+        b = MVar.new
+        expect(MVar.select(a, b, timeout: 0.1)).to eq MVar::TIMEOUT
+      end
+
+      it 'does not leave a waiting registration behind after a timeout' do
+        m = MVar.new
+        expect(MVar.select(m, timeout: 0.05)).to eq MVar::TIMEOUT
+
+        # A registration that timed out must not consume values put later.
+        producer = in_thread { sleep(0.1); m.put(14) }
+        expect(m.take).to eq 14
+        expect(m).to be_empty
+        expect(producer.join(5)).not_to be_nil
+      end
+
+      it 'leaves values of non-winning full MVars untouched' do
+        a = MVar.new(:a)
+        b = MVar.new(:b)
+
+        expect(MVar.select(a, b)).to eq [0, :a]
+        expect(a.take(0.01)).to eq MVar::TIMEOUT
+        expect(b.take).to eq :b
+      end
+
+      it 'keeps every non-winning value available for ordinary takes' do
+        a = MVar.new
+        b = MVar.new
+        c = MVar.new
+
+        gate = Queue.new
+        producers = [
+          in_thread { gate.pop; a.put(:a) },
+          in_thread { gate.pop; b.put(:b) },
+          in_thread { gate.pop; c.put(:c) }
+        ]
+
+        result = nil
+        thread = in_thread { result = MVar.select(a, b, c) }
+        sleep 0.1
+        gate << nil << nil << nil
+
+        expect(thread.value).to eq(result)
+        index, value = result
+        expect(value).to eq [:a, :b, :c][index]
+
+        losers = [[:a, a], [:b, b], [:c, c]].reject { |name, _| name == value }
+        losers.each do |name, mvar|
+          expect(mvar.take).to eq name
+        end
+        [a, b, c].each { |mvar| expect(mvar).to be_empty }
+        producers.each { |producer| expect(producer.join(5)).not_to be_nil }
+      end
+
+      it 'consumes exactly one value when two producers put concurrently' do
+        50.times do
+          a = MVar.new
+          b = MVar.new
+          gate = Queue.new
+
+          producers = [
+            in_thread { gate.pop; a.put(:a) },
+            in_thread { gate.pop; b.put(:b) }
+          ]
+          selector = in_thread { gate.pop; MVar.select(a, b) }
+
+          sleep 0.05
+          gate << nil << nil << nil
+
+          index, value = selector.value
+          expect(index).to eq(value == :a ? 0 : 1)
+
+          expect(a.take).to eq(:a) if value == :b
+          expect(b.take).to eq(:b) if value == :a
+          expect(a).to be_empty
+          expect(b).to be_empty
+
+          producers.each { |thread| expect(thread.join(5)).not_to be_nil }
+        end
+      end
+
+      it 'has exactly one winner when a take competes with a selection' do
+        50.times do
+          m = MVar.new
+          winners = Queue.new
+
+          taker = in_thread { winners << [:take, m.take] }
+          selector = in_thread { winners << [:select, MVar.select(m).last] }
+
+          sleep 0.05
+          m.put(:x)
+
+          kind, value = winners.pop
+          expect(value).to eq :x
+          expect([:take, :select]).to include(kind)
+
+          # The loser is still blocked and is served by the next put.
+          m.put(:y)
+          loser_kind, loser_value = winners.pop
+          expect(loser_kind).to eq(kind == :take ? :select : :take)
+          expect(loser_value).to eq :y
+          taker.join
+          selector.join
+        end
+      end
+
+      it 'is deterministic when a timeout collides with a put' do
+        wins = 0
+        timeouts = 0
+
+        100.times do
+          m = MVar.new
+          producer = in_thread { sleep(0.02); m.put(7) }
+
+          result = MVar.select(m, timeout: 0.02)
+
+          if result == MVar::TIMEOUT
+            timeouts += 1
+            # Timed out selection must not steal the racing value.
+            expect(m.take).to eq 7
+          else
+            wins += 1
+            expect(result).to eq [0, 7]
+            expect(m).to be_empty
+          end
+
+          expect(producer.join(5)).not_to be_nil
+        end
+
+        expect(wins).to be > 0
+        expect(timeouts).to be > 0
+      end
+
+      it 'serves several selections with one value each' do
+        m = MVar.new
+        selectors = 10.times.map { in_thread { MVar.select(m) } }
+
+        sleep 0.1
+        10.times { |i| m.put(i) }
+
+        values = selectors.map(&:value).map(&:last)
+        expect(values.sort).to eq (0...10).to_a
+        expect(m).to be_empty
+      end
+
+      it 'delivers every value exactly once when two producers run concurrently' do
+        count = 200
+        a = MVar.new
+        b = MVar.new
+        received = Queue.new
+
+        consumers = 2.times.map do
+          in_thread do
+            loop do
+              result = MVar.select(a, b, timeout: 0.5)
+              break if received.length >= 2 * count
+              received << result unless result == MVar::TIMEOUT
+            end
+          end
+        end
+
+        producer_a = in_thread { count.times { |i| a.put([:a, i]) } }
+        producer_b = in_thread { count.times { |i| b.put([:b, i]) } }
+
+        producer_a.join
+        producer_b.join
+        consumers.each(&:join)
+
+        values = (2 * count).times.map { received.pop }
+        got_a = values.map(&:last).select { |name, _| name == :a }.map(&:last).sort
+        got_b = values.map(&:last).select { |name, _| name == :b }.map(&:last).sort
+        expect(got_a).to eq (0...count).to_a
+        expect(got_b).to eq (0...count).to_a
+        expect(a.try_take!).to eq MVar::EMPTY
+        expect(b.try_take!).to eq MVar::EMPTY
+      end
+
+      it 'applies dereferenceable options to the winning value' do
+        value = 'v'
+        m = MVar.new(value, dup_on_deref: true)
+        _, taken = MVar.select(m)
+        expect(taken).to eq 'v'
+        expect(taken).not_to be value
+      end
+
+    end
+
+    describe '.take_any' do
+
+      it 'is an alias of .select' do
+        m = MVar.new(14)
+        expect(MVar.take_any(m)).to eq [0, 14]
+      end
+
+      it 'supports a timeout' do
+        expect(MVar.take_any(MVar.new, timeout: 0.05)).to eq MVar::TIMEOUT
+      end
+
+    end
+
     describe '#empty?' do
 
       it 'returns true on an empty MVar' do

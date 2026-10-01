@@ -1,5 +1,13 @@
 ## Current
 
+concurrent-ruby:
+
+* Added `Concurrent::MVar.select` (alias `MVar.take_any`) which waits for any
+  of several `MVar`s to become full and atomically takes the value from
+  exactly one of them, returning `[index, value]` (or `MVar::TIMEOUT`). It
+  does not poll and does not start a thread per `MVar`; non-winning slots keep
+  their values and timed-out selections leave no residual registrations.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
