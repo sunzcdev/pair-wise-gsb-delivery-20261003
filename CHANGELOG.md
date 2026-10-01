@@ -8,6 +8,8 @@
 
 ### New features
 
+- Parser: add `GraphQL.parse_with_diagnostics`, a diagnostic parse mode that reports multiple syntax errors in one pass instead of failing at the first one. It recovers at definition and selection-set boundaries (respecting ordinary strings, block strings and nested selection sets) and marks unparseable AST sections with `GraphQL::Language::Nodes::UnrecoverableDefinition` / `UnrecoverableSelection`; the returned `Document#valid?` is false so such documents can't be executed. `GraphQL.parse` keeps its original fast-fail behavior.
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

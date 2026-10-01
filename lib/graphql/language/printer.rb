@@ -73,6 +73,14 @@ module GraphQL
         end
       end
 
+      def print_unrecoverable_definition(node)
+        print_string("# <unparseable definition> #{node.parse_error&.message}")
+      end
+
+      def print_unrecoverable_selection(node)
+        print_string("# <unparseable selection> #{node.parse_error&.message}")
+      end
+
       def print_argument(argument)
         print_string(argument.name)
         print_string(": ")
@@ -480,6 +488,10 @@ module GraphQL
         case node
         when Nodes::Document
           print_document(node)
+        when Nodes::UnrecoverableDefinition
+          print_unrecoverable_definition(node)
+        when Nodes::UnrecoverableSelection
+          print_unrecoverable_selection(node)
         when Nodes::Argument
           print_argument(node)
         when Nodes::Directive

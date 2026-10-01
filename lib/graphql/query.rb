@@ -470,12 +470,21 @@ module GraphQL
       @fragments = {}
       @operations = {}
       if @document
-        @document.definitions.each do |part|
-          case part
-          when GraphQL::Language::Nodes::FragmentDefinition
-            @fragments[part.name] = part
-          when GraphQL::Language::Nodes::OperationDefinition
-            @operations[part.name] = part
+        if !@document.valid?
+          # This document came from the diagnostic parser and contains
+          # unparseable sections -- it must never be executed.
+          parse_error = @document.parse_errors.first ||
+            GraphQL::ParseError.new("Document contains unparseable definitions", nil, nil, query_string)
+          @schema.parse_error(parse_error, @context)
+          @document = nil
+        else
+          @document.definitions.each do |part|
+            case part
+            when GraphQL::Language::Nodes::FragmentDefinition
+              @fragments[part.name] = part
+            when GraphQL::Language::Nodes::OperationDefinition
+              @operations[part.name] = part
+            end
           end
         end
       elsif parse_error

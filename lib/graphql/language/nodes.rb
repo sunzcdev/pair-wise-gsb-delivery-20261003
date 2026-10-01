@@ -620,9 +620,83 @@ module GraphQL
         # @!attribute definitions
         #   @return [Array<OperationDefinition, FragmentDefinition>] top-level GraphQL units: operations or fragments
 
+        # @return [Array<GraphQL::ParseError>] syntax errors recorded while parsing this document
+        #   (only populated by the diagnostic parser)
+        attr_writer :parse_errors
+
+        def parse_errors
+          @parse_errors || EMPTY_ERRORS
+        end
+
+        # True when this document was produced with every definition fully parsed.
+        # Documents returned from the diagnostic parser may contain
+        # {UnrecoverableDefinition}s, in which case this is `false`.
+        # @return [Boolean]
+        def valid?
+          parse_errors.empty? && definitions.none? { |defn| contains_unrecoverable_node?(defn) }
+        end
+
         def slice_definition(name)
           GraphQL::Language::DefinitionSlice.slice(self, name)
         end
+
+        private
+
+        def contains_unrecoverable_node?(node)
+          return true if node.is_a?(UnrecoverableDefinition) || node.is_a?(UnrecoverableSelection)
+          node.children.any? { |child| contains_unrecoverable_node?(child) }
+        end
+      end
+
+      EMPTY_ERRORS = [].freeze
+
+      # A placeholder for a definition (operation, fragment, or type system definition)
+      # that the diagnostic parser could not recover.
+      #
+      # Nodes of this kind are never produced by the normal fast-fail parser and
+      # they must never be executed: a document containing one is invalid
+      # ({Document#valid?} returns `false`).
+      class UnrecoverableDefinition < AbstractNode
+        # @return [String] the original source text that could not be parsed
+        attr_reader :source_text
+
+        # @return [GraphQL::ParseError] the error that interrupted parsing
+        attr_reader :parse_error
+
+        def initialize(pos: nil, filename: nil, source: nil, source_text: nil, parse_error: nil)
+          @pos = pos
+          @filename = filename
+          @source = source
+          @source_text = source_text
+          @parse_error = parse_error
+          @line = nil
+          @col = nil
+        end
+
+        self.children_method_name = :definitions
+      end
+
+      # A placeholder for a part of a selection set that the diagnostic parser
+      # could not recover. As with {UnrecoverableDefinition}, these nodes are
+      # only emitted by the diagnostic parser and make the document invalid.
+      class UnrecoverableSelection < AbstractNode
+        # @return [String] the original source text that could not be parsed
+        attr_reader :source_text
+
+        # @return [GraphQL::ParseError] the error that interrupted parsing
+        attr_reader :parse_error
+
+        def initialize(pos: nil, filename: nil, source: nil, source_text: nil, parse_error: nil)
+          @pos = pos
+          @filename = filename
+          @source = source
+          @source_text = source_text
+          @parse_error = parse_error
+          @line = nil
+          @col = nil
+        end
+
+        self.children_method_name = :selections
       end
 
       # A type name, used for variable definitions

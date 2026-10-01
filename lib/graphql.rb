@@ -50,6 +50,21 @@ This is probably a bug in GraphQL-Ruby, please report this error on GitHub: http
     default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
   end
 
+  # Turn a query string or schema definition into an AST, collecting all the
+  # syntax errors instead of stopping at the first one.
+  #
+  # Recoverable structure is preserved (parts that couldn't be parsed are
+  # replaced with {GraphQL::Language::Nodes::UnrecoverableDefinition} or
+  # {GraphQL::Language::Nodes::UnrecoverableSelection} nodes), but the returned
+  # document is marked invalid ({GraphQL::Language::Nodes::Document#valid?}
+  # returns `false`) and must not be executed.
+  #
+  # @param graphql_string [String] a GraphQL query string or schema definition
+  # @return [GraphQL::Language::Nodes::Document]
+  def self.parse_with_diagnostics(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
+    default_parser.parse_with_diagnostics(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+  end
+
   # Read the contents of `filename` and parse them as GraphQL
   # @param filename [String] Path to a `.graphql` file containing IDL or query
   # @return [GraphQL::Language::Nodes::Document]

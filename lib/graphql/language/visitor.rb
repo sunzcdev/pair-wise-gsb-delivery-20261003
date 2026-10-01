@@ -107,6 +107,8 @@ module GraphQL
             on_inline_fragment_with_modifications(selection, new_node)
           when GraphQL::Language::Nodes::FragmentSpread
             on_fragment_spread_with_modifications(selection, new_node)
+          when GraphQL::Language::Nodes::UnrecoverableSelection
+            on_unrecoverable_selection_with_modifications(selection, new_node)
           else
             raise ArgumentError, "Invariant: unexpected field selection #{selection.class} (#{selection.inspect})"
           end
@@ -254,6 +256,8 @@ module GraphQL
         Language::Nodes::UnionTypeExtension,
         Language::Nodes::VariableDefinition,
         Language::Nodes::VariableIdentifier,
+        Language::Nodes::UnrecoverableDefinition,
+        Language::Nodes::UnrecoverableSelection,
       ].each do |ast_node_class|
         make_visit_methods(ast_node_class)
       end
