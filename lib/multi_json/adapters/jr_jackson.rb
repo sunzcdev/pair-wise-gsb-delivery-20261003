@@ -8,6 +8,8 @@ module MultiJson
       ParseError = ::JrJackson::ParseError
 
       def load(string, options = {}) # :nodoc:
+        refuse_raw_numbers!(options)
+
         ::JrJackson::Json.load(string, options)
       end
 

@@ -1,3 +1,19 @@
+Unreleased
+------
+
+* Add `raw_numbers: true` load option. Numbers are returned as
+  `MultiJson::RawNumber` objects that preserve the original number text
+  (e.g. `1.2300` vs `123e-2`, or integers beyond Float precision) instead
+  of being converted to Integer/Float. `RawNumber` is neither a String nor
+  a Numeric; convert explicitly with `#to_i`, `#to_r` (exact `Rational`)
+  or `#to_d` (`BigDecimal`, requires the `bigdecimal` library). Dumping a
+  `RawNumber` writes the validated number literal bare, without string
+  quotes, and invalid literals are rejected at construction time so
+  arbitrary text cannot be injected. Only the OkJson adapter supports
+  lossless number parsing; all other adapters explicitly raise
+  `ArgumentError` when `raw_numbers: true` is requested rather than
+  silently losing precision.
+
 1.15.0
 ------
 

@@ -30,6 +30,8 @@ module MultiJson
       end
 
       def load(string, options = {})
+        refuse_raw_numbers!(options)
+
         options[:symbol_keys] = options[:symbolize_keys]
         ::Oj.load(string, options)
       end

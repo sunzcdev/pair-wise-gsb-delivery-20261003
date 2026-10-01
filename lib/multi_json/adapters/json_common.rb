@@ -6,6 +6,8 @@ module MultiJson
       defaults :load, create_additions: false, quirks_mode: true
 
       def load(string, options = {})
+        refuse_raw_numbers!(options)
+
         string = string.dup.force_encoding(::Encoding::ASCII_8BIT) if string.respond_to?(:force_encoding)
 
         options[:symbolize_names] = true if options.delete(:symbolize_keys)

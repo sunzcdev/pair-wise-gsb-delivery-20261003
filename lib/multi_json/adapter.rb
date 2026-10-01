@@ -46,5 +46,18 @@ module MultiJson
         end
       end
     end
+
+    private
+
+    # Explicitly refuses the :raw_numbers load option. Adapters that cannot
+    # preserve the original number text must call this instead of silently
+    # parsing numbers into Float/Integer and pretending precision was kept.
+    def refuse_raw_numbers!(options)
+      return unless options[:raw_numbers]
+
+      raise ArgumentError,
+        "#{self.class} cannot preserve number lexemes and refuses the :raw_numbers option; " \
+        "use MultiJson::Adapters::OkJson for lossless number parsing"
+    end
   end
 end

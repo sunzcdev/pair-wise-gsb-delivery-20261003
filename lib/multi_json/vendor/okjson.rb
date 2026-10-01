@@ -21,6 +21,7 @@
 # See https://github.com/kr/okjson for updates.
 
 require "stringio"
+require "multi_json/raw_number"
 
 module MultiJson
   # Some parts adapted from
@@ -38,8 +39,12 @@ module MultiJson
     #
     # String values in the resulting structure
     # will be UTF-8.
-    def decode(s)
-      ts = lex(s)
+    #
+    # When raw_numbers is true, numbers are returned as
+    # MultiJson::RawNumber objects that keep the original
+    # number text instead of being converted to Integer/Float.
+    def decode(s, raw_numbers: false)
+      ts = lex(s, raw_numbers)
       v, ts = textparse(ts)
       raise Error, "trailing garbage" unless ts.empty?
 
@@ -68,6 +73,7 @@ module MultiJson
       case x
       when Hash then objenc(x)
       when Array then arrenc(x)
+      when ::MultiJson::RawNumber then x.to_s
       when String then strenc(x)
       when Numeric then numenc(x)
       when true then "true"
@@ -179,10 +185,10 @@ module MultiJson
 
     # Scans s and returns a list of json tokens,
     # excluding white space (as defined in RFC 4627).
-    def lex(s)
+    def lex(s, raw_numbers = false)
       ts = []
       until s.empty?
-        typ, lexeme, val = tok(s)
+        typ, lexeme, val = tok(s, raw_numbers)
         raise Error, "invalid character at #{s[0, 10].inspect}" if typ.nil?
 
         ts << [typ, lexeme, val] if typ != :space
@@ -204,7 +210,7 @@ module MultiJson
     # The third element is the value of the
     # token for :val and :str, otherwise
     # it is the lexeme.
-    def tok(s)
+    def tok(s, raw_numbers = false)
       case s[0]
       when "{" then ["{", s[0, 1], s[0, 1]]
       when "}" then ["}", s[0, 1], s[0, 1]]
@@ -218,7 +224,7 @@ module MultiJson
       when '"' then strtok(s)
       when Spc, "\t", "\n", "\r" then [:space, s[0, 1], s[0, 1]]
       else
-        numtok(s)
+        numtok(s, raw_numbers)
       end
     end
 
@@ -228,10 +234,12 @@ module MultiJson
 
     def falsetok(s) = (s[0, 5] == "false") ? [:val, "false", false] : []
 
-    def numtok(s)
+    def numtok(s, raw_numbers = false)
       m = /(-?(?:[1-9][0-9]+|[0-9]))([.][0-9]+)?([eE][+-]?[0-9]+)?/.match(s)
       if m&.begin(0)&.zero?
-        if !m[2] && !m[3]
+        if raw_numbers
+          [:val, m[0], ::MultiJson::RawNumber.new(m[0])]
+        elsif !m[2] && !m[3]
           [:val, m[0], Integer(m[0])]
         elsif m[2]
           [:val, m[0], Float(m[0])]

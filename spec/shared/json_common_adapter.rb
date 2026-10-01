@@ -24,12 +24,24 @@ shared_examples_for "JSON-like adapter" do |adapter|
         MultiJson.dump(object, indent: "\t")
       end
     end
+
+    describe "with a MultiJson::RawNumber" do
+      it "dumps the number bare, without string quotes" do
+        number = MultiJson::RawNumber.new("1.2300")
+        expect(MultiJson.dump(number)).to eq("1.2300")
+        expect(MultiJson.dump({"n" => [number, "1.2300"]})).to eq('{"n":[1.2300,"1.2300"]}')
+      end
+    end
   end
 
   describe ".load" do
     it "passes :quirks_mode option" do
       expect(JSON).to receive(:parse).with("[123]", {quirks_mode: false, create_additions: false})
       MultiJson.load("[123]", quirks_mode: false)
+    end
+
+    it "refuses the :raw_numbers option instead of losing precision" do
+      expect { MultiJson.load("[1.2300]", raw_numbers: true) }.to raise_error(ArgumentError, /raw_numbers/)
     end
   end
 end

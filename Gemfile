@@ -3,6 +3,10 @@ source "https://rubygems.org"
 gem "json", "~> 2.0", require: false
 gem "json_pure", "~> 2.0", require: false
 
+# Optional at runtime (only MultiJson::RawNumber#to_d needs it),
+# required here so it can be loaded under `bundle exec` on Ruby >= 3.4.
+gem "bigdecimal", require: false
+
 gem "rake", ">= 13.1"
 gem "rspec", ">= 3.13"
 gem "rubocop", ">= 1.62.1"

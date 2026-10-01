@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/raw_number"
 
 module MultiJson
   include Options
@@ -98,6 +99,11 @@ module MultiJson
   # <b>Options</b>
   #
   # <tt>:symbolize_keys</tt> :: If true, will use symbols instead of strings for the keys.
+  # <tt>:raw_numbers</tt> :: If true, numbers are returned as MultiJson::RawNumber
+  #   objects that preserve the original number text (e.g. "1.2300" vs "123e-2")
+  #   instead of being converted to Integer/Float. Only adapters that can do this
+  #   losslessly support it (currently OkJson); every other adapter raises
+  #   ArgumentError rather than silently losing precision.
   # <tt>:adapter</tt> :: If set, the selected adapter will be used for this call.
   def load(string, options = {})
     adapter = current_adapter(options)

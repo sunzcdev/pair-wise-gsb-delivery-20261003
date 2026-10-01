@@ -9,6 +9,8 @@ module MultiJson
       ParseError = ::Gson::DecodeError
 
       def load(string, options = {})
+        refuse_raw_numbers!(options)
+
         ::Gson::Decoder.new(options).decode(string)
       end
 

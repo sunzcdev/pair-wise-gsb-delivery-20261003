@@ -8,6 +8,8 @@ module MultiJson
       ParseError = ::Yajl::ParseError
 
       def load(string, options = {})
+        refuse_raw_numbers!(options)
+
         ::Yajl::Parser.new(symbolize_keys: options[:symbolize_keys]).parse(string)
       end
 
