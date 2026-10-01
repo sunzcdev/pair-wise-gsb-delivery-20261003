@@ -1,5 +1,17 @@
 # Changes
 
+## Unreleased
+
+* Added `Timezone#add_seconds`, which moves a time by a number of elapsed
+  seconds (an absolute calculation), and `Timezone#add_local_days` and
+  `Timezone#add_local_months`, which move a time by whole local calendar days
+  or months (keeping the local wall clock time-of-day unchanged). The calendar
+  methods allow the handling of month-end overflow (`month_overflow:`),
+  non-existent local times (`gap:`) and ambiguous local times (`ambiguous:`)
+  to be selected. All three methods preserve the time zone information and
+  sub-second component of the result and never consult the system time zone.
+
+
 ## Version 2.0.6 - 28-Jan-2023
 
 * Eliminate `Object#untaint` deprecation warnings on JRuby 9.4.0.0. #145.
