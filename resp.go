@@ -1,7 +1,9 @@
 package redcon
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -18,19 +20,54 @@ const (
 	Bulk    = '$'
 	Array   = '*'
 	Error   = '-'
+	// RESP3 types
+	Map       = '%'
+	Set       = '~'
+	Boolean   = '#'
+	Double    = ','
+	BigNumber = '('
+	Verbatim  = '='
+	Push      = '>'
+	Attribute = '|'
 )
+
+// Limits used by the RESP reader to guard against abusive payloads.
+const (
+	// MaxRESPDepth is the maximum nesting depth of aggregate types.
+	MaxRESPDepth = 128
+	// MaxRESPElements is the maximum number of elements (or key/value
+	// pairs for maps and attributes) allowed in a single aggregate.
+	MaxRESPElements = 1 << 20
+	// MaxRESPBulkLength is the maximum length of a bulk or verbatim
+	// string payload.
+	MaxRESPBulkLength = 1 << 29
+)
+
+// ErrIncomplete is returned by ReadNextRESPEx when the provided bytes end
+// in the middle of a RESP value. More data is needed to complete the read.
+// Any other error indicates that the input is invalid.
+var ErrIncomplete = errors.New("redcon: incomplete resp")
 
 type RESP struct {
 	Type  Type
 	Raw   []byte
 	Data  []byte
 	Count int
+	// Attrs holds the RESP3 attributes that were attached to this value,
+	// in the order they appeared on the wire. It is nil for values that
+	// were not preceded by an attribute.
+	Attrs []RESP
 }
 
-// ForEach iterates over each Array element
+// ForEach iterates over each Array, Set, or Push element. For Map and
+// Attribute values it iterates over each key and value in sequence.
 func (r RESP) ForEach(iter func(resp RESP) bool) {
 	data := r.Data
-	for i := 0; i < r.Count; i++ {
+	count := r.Count
+	if r.Type == Map || r.Type == Attribute {
+		count *= 2
+	}
+	for i := 0; i < count; i++ {
 		n, resp := ReadNextRESP(data)
 		if !iter(resp) {
 			return
@@ -57,12 +94,12 @@ func (r RESP) Float() float64 {
 	return x
 }
 
-// Map returns a key/value map of an Array.
-// The receiver RESP must be an Array with an equal number of values, where
-// the value of the key is followed by the key.
+// Map returns a key/value map of an Array, Map, or Attribute.
+// The receiver RESP must be an Array, Map, or Attribute with an equal
+// number of values, where the value of the key is followed by the key.
 // Example: key1,value1,key2,value2,key3,value3
 func (r RESP) Map() map[string]RESP {
-	if r.Type != Array {
+	if r.Type != Array && r.Type != Map && r.Type != Attribute {
 		return nil
 	}
 	var n int
@@ -81,7 +118,7 @@ func (r RESP) Map() map[string]RESP {
 }
 
 func (r RESP) MapGet(key string) RESP {
-	if r.Type != Array {
+	if r.Type != Array && r.Type != Map && r.Type != Attribute {
 		return RESP{}
 	}
 	var val RESP
@@ -104,27 +141,45 @@ func (r RESP) Exists() bool {
 	return r.Type != 0
 }
 
-// ReadNextRESP returns the next resp in b and returns the number of bytes the
-// took up the result.
+// ReadNextRESP returns the next resp in b and returns the number of bytes
+// that took up the result. An empty RESP is returned when the data is
+// incomplete or invalid. Use ReadNextRESPEx to distinguish between the two.
 func ReadNextRESP(b []byte) (n int, resp RESP) {
+	n, resp, err := ReadNextRESPEx(b)
+	if err != nil {
+		return 0, RESP{}
+	}
+	return n, resp
+}
+
+// ReadNextRESPEx reads the next RESP value from b, returning the number of
+// bytes consumed along with the value. It returns ErrIncomplete when b does
+// not yet contain a full value, allowing callers to keep buffering data that
+// arrives in fragments. Any other error means the input is invalid.
+func ReadNextRESPEx(b []byte) (n int, resp RESP, err error) {
+	return readNextRESP(b, 0)
+}
+
+func readNextRESP(b []byte, depth int) (n int, resp RESP, err error) {
 	if len(b) == 0 {
-		return 0, RESP{} // no data to read
+		return 0, RESP{}, ErrIncomplete // no data to read
 	}
 	resp.Type = Type(b[0])
 	switch resp.Type {
-	case Integer, String, Bulk, Array, Error:
+	case Integer, String, Bulk, Array, Error,
+		Map, Set, Boolean, Double, BigNumber, Verbatim, Push, Attribute:
 	default:
-		return 0, RESP{} // invalid kind
+		return 0, RESP{}, &errProtocol{"invalid resp type"}
 	}
 	// read to end of line
 	i := 1
 	for ; ; i++ {
 		if i == len(b) {
-			return 0, RESP{} // not enough data
+			return 0, RESP{}, ErrIncomplete // not enough data
 		}
 		if b[i] == '\n' {
 			if b[i-1] != '\r' {
-				return 0, RESP{} //, missing CR character
+				return 0, RESP{}, &errProtocol{"missing CR character"}
 			}
 			i++
 			break
@@ -132,69 +187,149 @@ func ReadNextRESP(b []byte) (n int, resp RESP) {
 	}
 	resp.Raw = b[0:i]
 	resp.Data = b[1 : i-2]
-	if resp.Type == Integer {
+	switch resp.Type {
+	case Integer:
 		// Integer
-		if len(resp.Data) == 0 {
-			return 0, RESP{} //, invalid integer
+		if !validRESPInt(resp.Data) {
+			return 0, RESP{}, &errProtocol{"invalid integer"}
 		}
-		var j int
-		if resp.Data[0] == '-' {
-			if len(resp.Data) == 1 {
-				return 0, RESP{} //, invalid integer
-			}
-			j++
-		}
-		for ; j < len(resp.Data); j++ {
-			if resp.Data[j] < '0' || resp.Data[j] > '9' {
-				return 0, RESP{} // invalid integer
-			}
-		}
-		return len(resp.Raw), resp
-	}
-	if resp.Type == String || resp.Type == Error {
+		return len(resp.Raw), resp, nil
+	case String, Error:
 		// String, Error
-		return len(resp.Raw), resp
-	}
-	var err error
-	resp.Count, err = strconv.Atoi(string(resp.Data))
-	if resp.Type == Bulk {
-		// Bulk
-		if err != nil {
-			return 0, RESP{} // invalid number of bytes
+		return len(resp.Raw), resp, nil
+	case Boolean:
+		// Boolean (RESP3)
+		if len(resp.Data) != 1 || (resp.Data[0] != 't' && resp.Data[0] != 'f') {
+			return 0, RESP{}, &errProtocol{"invalid boolean"}
 		}
-		if resp.Count < 0 {
+		return len(resp.Raw), resp, nil
+	case Double:
+		// Double (RESP3)
+		if len(resp.Data) == 0 {
+			return 0, RESP{}, &errProtocol{"invalid double"}
+		}
+		if _, err := strconv.ParseFloat(string(resp.Data), 64); err != nil {
+			return 0, RESP{}, &errProtocol{"invalid double"}
+		}
+		return len(resp.Raw), resp, nil
+	case BigNumber:
+		// Big Number (RESP3)
+		data := resp.Data
+		if len(data) > 0 && data[0] == '+' {
+			data = data[1:]
+		}
+		if !validRESPInt(data) {
+			return 0, RESP{}, &errProtocol{"invalid big number"}
+		}
+		return len(resp.Raw), resp, nil
+	}
+	if resp.Type == Bulk || resp.Type == Verbatim {
+		// Bulk, Verbatim
+		count, err := strconv.Atoi(string(resp.Data))
+		if err != nil {
+			return 0, RESP{}, &errProtocol{"invalid number of bytes"}
+		}
+		if resp.Type == Bulk && count < 0 {
+			// null bulk string
 			resp.Data = nil
 			resp.Count = 0
-			return len(resp.Raw), resp
+			return len(resp.Raw), resp, nil
 		}
-		if len(b) < i+resp.Count+2 {
-			return 0, RESP{} // not enough data
+		if count < 0 {
+			return 0, RESP{}, &errProtocol{"invalid number of bytes"}
 		}
-		if b[i+resp.Count] != '\r' || b[i+resp.Count+1] != '\n' {
-			return 0, RESP{} // invalid end of line
+		if count > MaxRESPBulkLength {
+			return 0, RESP{}, &errProtocol{"bulk length exceeds limit"}
 		}
-		resp.Data = b[i : i+resp.Count]
-		resp.Raw = b[0 : i+resp.Count+2]
+		if len(b) < i+count+2 {
+			return 0, RESP{}, ErrIncomplete // not enough data
+		}
+		if b[i+count] != '\r' || b[i+count+1] != '\n' {
+			return 0, RESP{}, &errProtocol{"invalid end of line"}
+		}
+		resp.Data = b[i : i+count]
+		resp.Raw = b[0 : i+count+2]
 		resp.Count = 0
-		return len(resp.Raw), resp
+		if resp.Type == Verbatim {
+			// the payload must start with a three byte format and a colon
+			if count < 4 || resp.Data[3] != ':' {
+				return 0, RESP{}, &errProtocol{"invalid verbatim string"}
+			}
+		}
+		return len(resp.Raw), resp, nil
 	}
-	// Array
+	// Array, Map, Set, Push, Attribute
+	count, err := strconv.Atoi(string(resp.Data))
 	if err != nil {
-		return 0, RESP{} // invalid number of elements
+		return 0, RESP{}, &errProtocol{"invalid number of elements"}
+	}
+	resp.Count = count
+	if resp.Type == Array && count < 0 {
+		// null array (RESP2)
+		resp.Data = b[i:i]
+		return len(resp.Raw), resp, nil
+	}
+	if count < 0 {
+		return 0, RESP{}, &errProtocol{"invalid number of elements"}
+	}
+	elems := count
+	if resp.Type == Map || resp.Type == Attribute {
+		// maps and attributes carry key/value pairs
+		if count > MaxRESPElements/2 {
+			return 0, RESP{}, &errProtocol{"too many elements"}
+		}
+		elems = count * 2
+	}
+	if elems > MaxRESPElements {
+		return 0, RESP{}, &errProtocol{"too many elements"}
+	}
+	if depth >= MaxRESPDepth {
+		return 0, RESP{}, &errProtocol{"max resp depth exceeded"}
 	}
 	var tn int
 	sdata := b[i:]
-	for j := 0; j < resp.Count; j++ {
-		rn, rresp := ReadNextRESP(sdata)
-		if rresp.Type == 0 {
-			return 0, RESP{}
+	for j := 0; j < elems; j++ {
+		rn, _, err := readNextRESP(sdata, depth+1)
+		if err != nil {
+			return 0, RESP{}, err
 		}
 		tn += rn
 		sdata = sdata[rn:]
 	}
 	resp.Data = b[i : i+tn]
 	resp.Raw = b[0 : i+tn]
-	return len(resp.Raw), resp
+	if resp.Type == Attribute {
+		// An attribute is metadata for the value that follows it. Parse
+		// that value and attach the attribute to it so the relation is
+		// not lost.
+		rn, vresp, err := readNextRESP(sdata, depth+1)
+		if err != nil {
+			return 0, RESP{}, err
+		}
+		vresp.Attrs = append([]RESP{resp}, vresp.Attrs...)
+		vresp.Raw = b[0 : i+tn+rn]
+		return len(vresp.Raw), vresp, nil
+	}
+	return len(resp.Raw), resp, nil
+}
+
+func validRESPInt(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	var j int
+	if data[0] == '-' {
+		if len(data) == 1 {
+			return false
+		}
+		j++
+	}
+	for ; j < len(data); j++ {
+		if data[j] < '0' || data[j] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // Kind is the kind of command
@@ -504,6 +639,73 @@ func AppendTile38(b []byte, data []byte) []byte {
 // AppendNull appends a Redis protocol null to the input bytes.
 func AppendNull(b []byte) []byte {
 	return append(b, '$', '-', '1', '\r', '\n')
+}
+
+// AppendMap appends a RESP3 map header for n key/value pairs to the input
+// bytes. The pairs themselves must be appended afterwards.
+func AppendMap(b []byte, n int) []byte {
+	return appendPrefix(b, '%', int64(n))
+}
+
+// AppendSet appends a RESP3 set header for n elements to the input bytes.
+// The elements themselves must be appended afterwards.
+func AppendSet(b []byte, n int) []byte {
+	return appendPrefix(b, '~', int64(n))
+}
+
+// AppendPush appends a RESP3 push header for n elements to the input bytes.
+// The elements themselves must be appended afterwards.
+func AppendPush(b []byte, n int) []byte {
+	return appendPrefix(b, '>', int64(n))
+}
+
+// AppendAttribute appends a RESP3 attribute header for n key/value pairs to
+// the input bytes. The pairs, followed by the value the attribute describes,
+// must be appended afterwards.
+func AppendAttribute(b []byte, n int) []byte {
+	return appendPrefix(b, '|', int64(n))
+}
+
+// AppendBool appends a RESP3 boolean to the input bytes.
+func AppendBool(b []byte, v bool) []byte {
+	if v {
+		return append(b, '#', 't', '\r', '\n')
+	}
+	return append(b, '#', 'f', '\r', '\n')
+}
+
+// AppendDouble appends a RESP3 double to the input bytes.
+func AppendDouble(b []byte, f float64) []byte {
+	b = append(b, ',')
+	switch {
+	case math.IsInf(f, 1):
+		b = append(b, "inf"...)
+	case math.IsInf(f, -1):
+		b = append(b, "-inf"...)
+	case math.IsNaN(f):
+		b = append(b, "nan"...)
+	default:
+		b = strconv.AppendFloat(b, f, 'g', -1, 64)
+	}
+	return append(b, '\r', '\n')
+}
+
+// AppendBigNumber appends a RESP3 big number to the input bytes. The value
+// must be a valid base-10 integer with an optional leading sign.
+func AppendBigNumber(b []byte, s string) []byte {
+	b = append(b, '(')
+	b = append(b, s...)
+	return append(b, '\r', '\n')
+}
+
+// AppendVerbatim appends a RESP3 verbatim string to the input bytes. The
+// format must be exactly three bytes, such as "txt" or "mkd".
+func AppendVerbatim(b []byte, format string, data []byte) []byte {
+	b = appendPrefix(b, '=', int64(len(format)+1+len(data)))
+	b = append(b, format...)
+	b = append(b, ':')
+	b = append(b, data...)
+	return append(b, '\r', '\n')
 }
 
 // AppendBulkFloat appends a float64, as bulk bytes.

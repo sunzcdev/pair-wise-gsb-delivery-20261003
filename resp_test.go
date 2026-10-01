@@ -273,3 +273,286 @@ func TestArrayMap(t *testing.T) {
 		t.Fatalf("expected '%s', got '%s'", "val2", m["key2"].String())
 	}
 }
+
+// expectIncomplete feeds payload to ReadNextRESPEx one byte at a time and
+// expects ErrIncomplete until the final byte completes the value.
+func expectIncomplete(t *testing.T, payload []byte) RESP {
+	t.Helper()
+	for i := 1; i < len(payload); i++ {
+		n, resp, err := ReadNextRESPEx(payload[:i])
+		if err != ErrIncomplete {
+			t.Fatalf("expected ErrIncomplete at %d/%d bytes, got n=%d resp=%v err=%v",
+				i, len(payload), n, respVOut(resp), err)
+		}
+		if n != 0 || !isEmptyRESP(resp) {
+			t.Fatalf("expected empty resp at %d/%d bytes", i, len(payload))
+		}
+	}
+	n, resp, err := ReadNextRESPEx(payload)
+	if err != nil {
+		t.Fatalf("expected complete resp, got err=%v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("expected n=%d, got %d", len(payload), n)
+	}
+	if string(resp.Raw) != string(payload) {
+		t.Fatalf("expected raw '%q', got '%q'", payload, resp.Raw)
+	}
+	return resp
+}
+
+func expectInvalid(t *testing.T, payload string) {
+	t.Helper()
+	_, resp, err := ReadNextRESPEx([]byte(payload))
+	if err == nil || err == ErrIncomplete {
+		t.Fatalf("expected invalid error for '%q', got %v", payload, err)
+	}
+	if !isEmptyRESP(resp) {
+		t.Fatalf("expected empty resp for '%q'", payload)
+	}
+}
+
+func TestRESP3RoundTrip(t *testing.T) {
+	// boolean
+	if resp := expectIncomplete(t, AppendBool(nil, true)); resp.Type != Boolean ||
+		resp.String() != "t" {
+		t.Fatalf("bad boolean: %v", respVOut(resp))
+	}
+	if resp := expectIncomplete(t, AppendBool(nil, false)); resp.Type != Boolean ||
+		resp.String() != "f" {
+		t.Fatalf("bad boolean: %v", respVOut(resp))
+	}
+	// double
+	for _, f := range []float64{3.14, -1.5, 0, 1e20} {
+		resp := expectIncomplete(t, AppendDouble(nil, f))
+		if resp.Type != Double {
+			t.Fatalf("bad double type: %v", respVOut(resp))
+		}
+		if resp.Float() != f {
+			t.Fatalf("expected %v, got %v", f, resp.Float())
+		}
+	}
+	for _, s := range []string{"inf", "-inf", "nan"} {
+		resp := expectIncomplete(t, []byte(","+s+"\r\n"))
+		if resp.Type != Double || resp.String() != s {
+			t.Fatalf("bad double: %v", respVOut(resp))
+		}
+	}
+	// big number
+	big := "3492890328409238509324850943850943825024385"
+	resp := expectIncomplete(t, AppendBigNumber(nil, big))
+	if resp.Type != BigNumber || resp.String() != big {
+		t.Fatalf("bad big number: %v", respVOut(resp))
+	}
+	resp = expectIncomplete(t, AppendBigNumber(nil, "-"+big))
+	if resp.Type != BigNumber || resp.String() != "-"+big {
+		t.Fatalf("bad big number: %v", respVOut(resp))
+	}
+	// verbatim string
+	resp = expectIncomplete(t, AppendVerbatim(nil, "txt", []byte("hello world")))
+	if resp.Type != Verbatim || resp.String() != "txt:hello world" {
+		t.Fatalf("bad verbatim: %v", respVOut(resp))
+	}
+	// map
+	var dst []byte
+	dst = AppendMap(dst, 2)
+	dst = AppendBulkString(dst, "key1")
+	dst = AppendInt(dst, 1)
+	dst = AppendBulkString(dst, "key2")
+	dst = AppendBool(dst, true)
+	resp = expectIncomplete(t, dst)
+	if resp.Type != Map || resp.Count != 2 {
+		t.Fatalf("bad map: %v", respVOut(resp))
+	}
+	m := resp.Map()
+	if len(m) != 2 || m["key1"].Int() != 1 || m["key2"].String() != "t" {
+		t.Fatalf("bad map contents: %v", m)
+	}
+	if resp.MapGet("key2").String() != "t" {
+		t.Fatalf("bad map get")
+	}
+	// set
+	dst = nil
+	dst = AppendSet(dst, 3)
+	dst = AppendString(dst, "a")
+	dst = AppendString(dst, "b")
+	dst = AppendString(dst, "c")
+	resp = expectIncomplete(t, dst)
+	if resp.Type != Set || resp.Count != 3 {
+		t.Fatalf("bad set: %v", respVOut(resp))
+	}
+	var elems []string
+	resp.ForEach(func(r RESP) bool {
+		elems = append(elems, r.String())
+		return true
+	})
+	if len(elems) != 3 || elems[0] != "a" || elems[1] != "b" || elems[2] != "c" {
+		t.Fatalf("bad set elements: %v", elems)
+	}
+	// push
+	dst = nil
+	dst = AppendPush(dst, 2)
+	dst = AppendBulkString(dst, "message")
+	dst = AppendBulkString(dst, "hello")
+	resp = expectIncomplete(t, dst)
+	if resp.Type != Push || resp.Count != 2 {
+		t.Fatalf("bad push: %v", respVOut(resp))
+	}
+	// nested resp3 inside resp2 array
+	dst = nil
+	dst = AppendArray(dst, 2)
+	dst = AppendMap(dst, 1)
+	dst = AppendBulkString(dst, "k")
+	dst = AppendDouble(dst, 1.5)
+	dst = AppendSet(dst, 1)
+	dst = AppendBool(dst, false)
+	resp = expectIncomplete(t, dst)
+	if resp.Type != Array || resp.Count != 2 {
+		t.Fatalf("bad array: %v", respVOut(resp))
+	}
+	var kinds []Type
+	resp.ForEach(func(r RESP) bool {
+		kinds = append(kinds, r.Type)
+		return true
+	})
+	if len(kinds) != 2 || kinds[0] != Map || kinds[1] != Set {
+		t.Fatalf("bad nested kinds: %v", kinds)
+	}
+}
+
+func TestRESP3Attribute(t *testing.T) {
+	// attribute attached to a following value
+	var dst []byte
+	dst = AppendAttribute(dst, 1)
+	dst = AppendBulkString(dst, "ttl")
+	dst = AppendInt(dst, 3600)
+	dst = AppendBulkString(dst, "real value")
+	resp := expectIncomplete(t, dst)
+	if resp.Type != Bulk || resp.String() != "real value" {
+		t.Fatalf("bad attributed value: %v", respVOut(resp))
+	}
+	if len(resp.Attrs) != 1 {
+		t.Fatalf("expected 1 attribute, got %d", len(resp.Attrs))
+	}
+	attr := resp.Attrs[0]
+	if attr.Type != Attribute || attr.Count != 1 {
+		t.Fatalf("bad attribute: %v", respVOut(attr))
+	}
+	if attr.MapGet("ttl").Int() != 3600 {
+		t.Fatalf("bad attribute contents")
+	}
+	// two attributes keep wire order
+	dst = nil
+	dst = AppendAttribute(dst, 1)
+	dst = AppendBulkString(dst, "first")
+	dst = AppendInt(dst, 1)
+	dst = AppendAttribute(dst, 1)
+	dst = AppendBulkString(dst, "second")
+	dst = AppendInt(dst, 2)
+	dst = AppendString(dst, "OK")
+	resp = expectIncomplete(t, dst)
+	if resp.Type != String || len(resp.Attrs) != 2 {
+		t.Fatalf("bad attributed value: %v", respVOut(resp))
+	}
+	if resp.Attrs[0].MapGet("first").Int() != 1 ||
+		resp.Attrs[1].MapGet("second").Int() != 2 {
+		t.Fatalf("attributes out of order")
+	}
+	// attribute inside a container
+	dst = nil
+	dst = AppendArray(dst, 2)
+	dst = AppendAttribute(dst, 1)
+	dst = AppendBulkString(dst, "meta")
+	dst = AppendString(dst, "x")
+	dst = AppendInt(dst, 42)
+	dst = AppendInt(dst, 7)
+	resp = expectIncomplete(t, dst)
+	var first RESP
+	resp.ForEach(func(r RESP) bool {
+		first = r
+		return false
+	})
+	if first.Type != Integer || first.Int() != 42 || len(first.Attrs) != 1 {
+		t.Fatalf("bad attributed element: %v", respVOut(first))
+	}
+	// attribute without a following value is incomplete, not invalid
+	if _, _, err := ReadNextRESPEx([]byte("|1\r\n$4\r\nmeta\r\n")); err != ErrIncomplete {
+		t.Fatalf("expected ErrIncomplete, got %v", err)
+	}
+	if _, _, err := ReadNextRESPEx([]byte("|1\r\n$4\r\nmeta\r\n+ok\r\n")); err != ErrIncomplete {
+		t.Fatalf("expected ErrIncomplete, got %v", err)
+	}
+	if _, _, err := ReadNextRESPEx([]byte("|1\r\n$4\r\nmeta\r\n+ok\r\n:1\r\n")); err != nil {
+		t.Fatalf("expected valid read, got %v", err)
+	}
+}
+
+func TestRESP3Invalid(t *testing.T) {
+	expectInvalid(t, "#x\r\n")
+	expectInvalid(t, "#tt\r\n")
+	expectInvalid(t, "#\r\n")
+	expectInvalid(t, ",\r\n")
+	expectInvalid(t, ",abc\r\n")
+	expectInvalid(t, "(\r\n")
+	expectInvalid(t, "(-\r\n")
+	expectInvalid(t, "(12a3\r\n")
+	expectInvalid(t, "=3\r\nabc\r\n")
+	expectInvalid(t, "=4\r\nabcd\r\n")
+	expectInvalid(t, "=-1\r\n")
+	expectInvalid(t, "%-1\r\n")
+	expectInvalid(t, "%a\r\n")
+	expectInvalid(t, "~-1\r\n")
+	expectInvalid(t, ">-1\r\n")
+	expectInvalid(t, "|-1\r\n")
+	expectInvalid(t, "$99999999999999999999\r\n")
+	expectInvalid(t, "*99999999999999999999\r\n")
+	// still incomplete, not invalid
+	for _, s := range []string{"#t", ",1.5\r", "(123", "=15\r\ntxt:hello", "%1\r\n+k\r\n"} {
+		if _, _, err := ReadNextRESPEx([]byte(s)); err != ErrIncomplete {
+			t.Fatalf("expected ErrIncomplete for '%q', got %v", s, err)
+		}
+	}
+}
+
+func TestRESPLimits(t *testing.T) {
+	// nesting depth
+	var deep []byte
+	for i := 0; i < MaxRESPDepth; i++ {
+		deep = AppendArray(deep, 1)
+	}
+	deep = AppendInt(deep, 1)
+	if _, _, err := ReadNextRESPEx(deep); err != nil {
+		t.Fatalf("expected depth %d to parse, got %v", MaxRESPDepth, err)
+	}
+	deeper := append(AppendArray(nil, 1), deep...)
+	if _, _, err := ReadNextRESPEx(deeper); err == nil || err == ErrIncomplete {
+		t.Fatalf("expected depth limit error, got %v", err)
+	}
+	// attribute chains count towards depth
+	var chain []byte
+	for i := 0; i < MaxRESPDepth+1; i++ {
+		chain = AppendAttribute(chain, 0)
+	}
+	chain = AppendString(chain, "OK")
+	if _, _, err := ReadNextRESPEx(chain); err == nil || err == ErrIncomplete {
+		t.Fatalf("expected depth limit error, got %v", err)
+	}
+	// element count
+	tooMany := appendPrefix(nil, '*', MaxRESPElements+1)
+	if _, _, err := ReadNextRESPEx(tooMany); err == nil || err == ErrIncomplete {
+		t.Fatalf("expected element limit error, got %v", err)
+	}
+	tooMany = appendPrefix(nil, '%', MaxRESPElements/2+1)
+	if _, _, err := ReadNextRESPEx(tooMany); err == nil || err == ErrIncomplete {
+		t.Fatalf("expected element limit error, got %v", err)
+	}
+	// bulk length
+	tooBig := appendPrefix(nil, '$', MaxRESPBulkLength+1)
+	if _, _, err := ReadNextRESPEx(tooBig); err == nil || err == ErrIncomplete {
+		t.Fatalf("expected bulk limit error, got %v", err)
+	}
+	// a declared length within the limit is incomplete, not invalid
+	if _, _, err := ReadNextRESPEx(appendPrefix(nil, '$', MaxRESPBulkLength)); err != ErrIncomplete {
+		t.Fatalf("expected ErrIncomplete, got %v", err)
+	}
+}
