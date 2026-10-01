@@ -42,6 +42,10 @@ message types are supported:
 
 * 0x3 Go Away - Used to close a session.
 
+* 0x4 Message - Optional extension. Carries one complete short message
+  on the session-scoped message channel. With the SYN or ACK flag it is
+  used to negotiate the channel and carries no payload.
+
 ## Flag Field
 
 The flags field is used to provide additional information related
@@ -58,6 +62,9 @@ to the message type. The following flags are supported:
 
 * 0x8 RST - Reset a stream immediately. May be sent with a data or
   window update message.
+
+For Message frames only the SYN and ACK flags are defined, and only
+during negotiation. FIN and RST must not be used.
 
 ## StreamID Field
 
@@ -76,6 +83,9 @@ The meaning of the length field depends on the message type:
 * Window update - provides a delta update to the window size
 * Ping - Contains an opaque value, echoed back
 * Go Away - Contains an error code
+* Message - For data frames, the length of the message payload following
+  the header. For SYN/ACK negotiation frames, the maximum message size
+  the sender is willing to receive, with no payload following.
 
 # Message Flow
 
@@ -138,3 +148,52 @@ provide an error code:
 * 0x0 Normal termination
 * 0x1 Protocol error
 * 0x2 Internal error
+
+# Message Channel (Optional Extension)
+
+The message channel is an optional, session-scoped channel for short,
+independent messages, intended for data such as real-time location
+updates where stale values may be discarded. It shares the underlying
+connection with normal streams and does not change their reliable,
+ordered, stream semantics in any way.
+
+## Negotiation
+
+The channel must be enabled on both sides. When enabled, each side
+sends a Message frame with the SYN flag and StreamID 0 when the session
+starts. The Length field announces the maximum message size the sender
+is willing to receive; no payload follows. The receiver of a SYN
+replies with a Message frame carrying the ACK flag, again announcing
+its own maximum message size.
+
+Once a side has received the peer's SYN or ACK, the channel is ready.
+The effective maximum size for outgoing messages is the minimum of the
+locally configured and the peer-announced maximum.
+
+An implementation that does not enable the extension will reject the
+unknown frame type as a protocol error, so the extension must only be
+enabled when both peers support it.
+
+## Message delivery
+
+Each Message data frame (no flags, StreamID 0) carries exactly one
+complete message as its payload. A message is never split across
+frames, so a receiver always delivers a message in full or not at all;
+it cannot be divided across multiple application reads and a partial
+message is never delivered. Messages larger than the negotiated maximum
+are a protocol error.
+
+## Local drop semantics
+
+The underlying transport remains reliable: this extension does not
+provide unreliable network transport over TCP. The only place messages
+are dropped is the receiver's local, bounded queue. If the application
+does not read messages fast enough and the queue is full, the oldest
+queued message is dropped to make room for the newer one. The drop
+happens locally and is counted so the receiving application can observe
+it; the sender is never notified and never retransmits.
+
+Because every message payload is always drained from the wire in full,
+congestion of the message queue never blocks the receive loop: Ping,
+Window Update, and stream data frames continue to make progress while
+messages are being dropped.

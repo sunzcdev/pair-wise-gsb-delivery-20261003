@@ -17,6 +17,10 @@ Yamux features include:
   * Back-pressure to prevent overwhelming a receiver
 * Keep Alives
   * Enables persistent connections over a load balancer
+* Optional short-message channel
+  * Message-oriented delivery alongside streams, with negotiated
+    maximum message size and a bounded receive queue that drops
+    stale messages locally under congestion
 * Efficient
   * Enables thousands of logical streams with low overhead
 

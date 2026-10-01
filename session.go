@@ -65,6 +65,10 @@ type Session struct {
 	// acceptCh is used to pass ready streams to the client
 	acceptCh chan *Stream
 
+	// msgCh is the optional short-message channel, nil unless enabled
+	// in the Config
+	msgCh *MessageChannel
+
 	// sendCh is used to mark a stream as ready to send,
 	// or to send a header out directly.
 	sendCh chan *sendReady
@@ -118,8 +122,14 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	} else {
 		s.nextStreamID = 2
 	}
+	if config.EnableMessageChannel {
+		s.msgCh = newMessageChannel(s, config)
+	}
 	go s.recv()
 	go s.send()
+	if s.msgCh != nil {
+		go s.msgCh.sync()
+	}
 	if config.EnableKeepAlive {
 		go s.keepalive()
 	}
@@ -543,6 +553,7 @@ var (
 		typeWindowUpdate: (*Session).handleStreamMessage,
 		typePing:         (*Session).handlePing,
 		typeGoAway:       (*Session).handleGoAway,
+		typeMessage:      (*Session).handleMsgData,
 	}
 )
 
@@ -566,7 +577,7 @@ func (s *Session) recvLoop() error {
 		}
 
 		mt := hdr.MsgType()
-		if mt < typeData || mt > typeGoAway {
+		if mt >= uint8(len(handlers)) {
 			return ErrInvalidMsgType
 		}
 

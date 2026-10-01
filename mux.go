@@ -47,6 +47,26 @@ type Config struct {
 	// and send a RST to the remote side.
 	StreamCloseTimeout time.Duration
 
+	// EnableMessageChannel turns on the optional short-message channel.
+	// The channel shares the connection with normal streams but delivers
+	// short, independent messages with their own framing. It must be
+	// enabled on both sides of the session; support is negotiated when
+	// the session starts.
+	EnableMessageChannel bool
+
+	// MessageChannelQueueSize bounds how many received messages may be
+	// queued waiting for the application to read them. Once the queue is
+	// full, the oldest queued message is dropped locally to make room for
+	// newer ones. Only used if EnableMessageChannel is set.
+	MessageChannelQueueSize int
+
+	// MaxMessageSize is the maximum size in bytes of a single message
+	// that the local session is willing to receive. It is announced to
+	// the peer during negotiation; the effective limit for outgoing
+	// messages is the minimum of both sides. Only used if
+	// EnableMessageChannel is set.
+	MaxMessageSize uint32
+
 	// LogOutput is used to control the log destination. Either Logger or
 	// LogOutput can be set, not both.
 	LogOutput io.Writer
@@ -64,14 +84,16 @@ func (c *Config) Clone() *Config {
 // DefaultConfig is used to return a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		AcceptBacklog:          256,
-		EnableKeepAlive:        true,
-		KeepAliveInterval:      30 * time.Second,
-		ConnectionWriteTimeout: 10 * time.Second,
-		MaxStreamWindowSize:    initialStreamWindow,
-		StreamCloseTimeout:     5 * time.Minute,
-		StreamOpenTimeout:      75 * time.Second,
-		LogOutput:              os.Stderr,
+		AcceptBacklog:           256,
+		EnableKeepAlive:         true,
+		KeepAliveInterval:       30 * time.Second,
+		ConnectionWriteTimeout:  10 * time.Second,
+		MaxStreamWindowSize:     initialStreamWindow,
+		StreamCloseTimeout:      5 * time.Minute,
+		StreamOpenTimeout:       75 * time.Second,
+		MessageChannelQueueSize: defaultMessageQueueSize,
+		MaxMessageSize:          defaultMaxMessageSize,
+		LogOutput:               os.Stderr,
 	}
 }
 
@@ -85,6 +107,14 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.EnableMessageChannel {
+		if config.MessageChannelQueueSize <= 0 {
+			return fmt.Errorf("message channel queue size must be positive")
+		}
+		if config.MaxMessageSize == 0 || config.MaxMessageSize > maxMessageSizeLimit {
+			return fmt.Errorf("MaxMessageSize must be between 1 and %d", maxMessageSizeLimit)
+		}
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

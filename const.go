@@ -79,6 +79,14 @@ var (
 
 	// ErrKeepAliveTimeout is sent if a missed keepalive caused the stream close
 	ErrKeepAliveTimeout = fmt.Errorf("keepalive timeout")
+
+	// ErrMessageChannelDisabled is returned when the short-message channel
+	// is used but was not enabled in the Config
+	ErrMessageChannelDisabled = fmt.Errorf("message channel disabled")
+
+	// ErrMessageTooLarge is returned when a message exceeds the negotiated
+	// maximum message size of the message channel
+	ErrMessageTooLarge = fmt.Errorf("message exceeds maximum message size")
 )
 
 const (
@@ -104,6 +112,12 @@ const (
 	// GoAway is sent to terminate a session. The StreamID
 	// should be 0 and the length is an error code.
 	typeGoAway
+
+	// Message is used for the optional short-message channel. Each frame
+	// carries exactly one complete message as its payload. With the SYN or
+	// ACK flag it is used to negotiate the channel and carries no payload;
+	// the length field then announces the sender's maximum message size.
+	typeMessage
 )
 
 const (
@@ -126,6 +140,19 @@ const (
 const (
 	// initialStreamWindow is the initial stream window size
 	initialStreamWindow uint32 = 256 * 1024
+)
+
+const (
+	// defaultMessageQueueSize is the default bound on how many received
+	// messages may be queued waiting for the application to read them
+	defaultMessageQueueSize = 64
+
+	// defaultMaxMessageSize is the default maximum size of a single message
+	defaultMaxMessageSize uint32 = 16 * 1024
+
+	// maxMessageSizeLimit is the hard upper bound for the configurable
+	// maximum message size. The channel is meant for short messages.
+	maxMessageSizeLimit uint32 = 1 << 20
 )
 
 const (

@@ -24,6 +24,9 @@ func TestConst(t *testing.T) {
 	if typeGoAway != 3 {
 		t.Fatalf("bad: %v", typeGoAway)
 	}
+	if typeMessage != 4 {
+		t.Fatalf("bad: %v", typeMessage)
+	}
 
 	if flagSYN != 1 {
 		t.Fatalf("bad: %v", flagSYN)
