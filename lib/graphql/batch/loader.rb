@@ -37,7 +37,8 @@ module GraphQL::Batch
 
     attr_accessor :loader_key, :executor
 
-    def initialize
+    def initialize(max_batch_size: nil)
+      @max_batch_size = max_batch_size
       @loader_key = nil
       @executor = nil
       @queue = nil
@@ -61,16 +62,7 @@ module GraphQL::Batch
 
     def resolve # :nodoc:
       return if resolved?
-      load_keys = queue
-      @queue = nil
-
-      around_perform do
-        perform(load_keys)
-      end
-
-      check_for_broken_promises(load_keys)
-    rescue => err
-      reject_pending_promises(load_keys, err)
+      resolve_pending_keys until resolved?
     end
 
     # Interface to add custom code for purposes such as instrumenting the performance of the loader.
@@ -139,6 +131,32 @@ module GraphQL::Batch
       end
     end
 
+    def resolve_pending_keys
+      load_keys = queue
+      @queue = nil
+      key_groups(load_keys).each do |keys|
+        around_perform do
+          perform(keys)
+        end
+
+        check_for_broken_promises(keys)
+      rescue => err
+        reject_pending_promises(keys, err)
+      end
+    rescue => err
+      reject_pending_promises(load_keys, err)
+    end
+
+    def key_groups(load_keys)
+      return [load_keys] if @max_batch_size.nil?
+
+      unless @max_batch_size.is_a?(Integer) && @max_batch_size > 0
+        raise ArgumentError, 'max_batch_size must be a positive integer'
+      end
+
+      load_keys.each_slice(@max_batch_size).to_a
+    end
+
     def cache
       @cache ||= {}
     end
@@ -153,7 +171,8 @@ module GraphQL::Batch
 
     def reject_pending_promises(load_keys, err)
       load_keys.each do |key|
-        next unless promise_for(key).pending?
+        promise = promise_for(key)
+        next unless promise.pending? && promise.source == self
 
         reject(key, err)
       end

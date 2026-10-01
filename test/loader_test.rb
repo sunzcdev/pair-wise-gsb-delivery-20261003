@@ -63,6 +63,31 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     end
   end
 
+  class RecordingLoader < GraphQL::Batch::Loader
+    attr_reader :performed_keys
+
+    def initialize(max_batch_size: nil)
+      super
+      @performed_keys = []
+    end
+
+    def perform(keys)
+      @performed_keys << keys
+      keys.each { |key| fulfill(key, key) }
+    end
+  end
+
+  class SecondSliceFailureLoader < RecordingLoader
+    def perform(keys)
+      @performed_keys << keys
+
+      fulfill(keys.first, keys.first)
+      raise 'second slice failed' if @performed_keys.length == 2
+
+      keys.each { |key| fulfill(key, key) unless fulfilled?(key) }
+    end
+  end
+
   class KwargsGroupCountLoader < GraphQL::Batch::Loader
     def initialize(group, key: :id, preload: true, **conditions)
     end
@@ -119,6 +144,91 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
 
   def test_query_many
     assert_equal [:a, :b, :c], EchoLoader.load_many([:a, :b, :c]).sync
+  end
+
+  def test_max_batch_size_chunks_keys_in_enqueue_order
+    loader = RecordingLoader.for(max_batch_size: 2)
+    promises = [loader.load(1), loader.load(2), loader.load(3), loader.load(4), loader.load(5)]
+
+    assert_equal [1, 2, 3, 4, 5], loader.load_many([1, 2, 3, 4, 5]).sync
+    assert_equal [[1, 2], [3, 4], [5]], loader.performed_keys
+    assert_equal promises, promises.map { |promise| loader.load(promise.value) }
+  end
+
+  def test_max_batch_size_deduplicates_keys
+    loader = RecordingLoader.for(max_batch_size: 2)
+    first = loader.load(1)
+    second = loader.load(2)
+    duplicate_first = loader.load(1)
+    third = loader.load(3)
+    duplicate_second = loader.load(2)
+    results = loader.load_many([1, 2, 1, 3, 2])
+
+    assert_same first, duplicate_first
+    assert_same second, duplicate_second
+    assert_equal [1, 2, 1, 3, 2], results.sync
+    assert_same third, loader.load(3)
+    assert_equal [[1, 2], [3]], loader.performed_keys
+  end
+
+  def test_max_batch_size_uses_one_batch_by_default
+    loader = RecordingLoader.for
+
+    assert_equal [1, 2, 3], loader.load_many([1, 2, 3]).sync
+    assert_equal [[1, 2, 3]], loader.performed_keys
+  end
+
+  def test_max_batch_size_boundary_sizes
+    [1, 2, 3, 4, 5].each do |max_batch_size|
+      GraphQL::Batch::Executor.current = GraphQL::Batch::Executor.new
+      loader = RecordingLoader.for(max_batch_size: max_batch_size)
+
+      assert_equal [1, 2, 3, 4, 5], loader.load_many([1, 2, 3, 4, 5]).sync
+      assert_equal max_batch_size, loader.performed_keys.map(&:length).first
+      assert_equal 5, loader.performed_keys.flatten.length
+    end
+  end
+
+  def test_max_batch_size_queues_callback_loads_for_next_wave
+    loader = RecordingLoader.for(max_batch_size: 2)
+    first = loader.load(1)
+    second = loader.load(2)
+    third = loader.load(3)
+    fourth = loader.load(4)
+    first.then { loader.load(:callback) }
+
+    assert_equal [1, 2, 3, 4], Promise.all([first, second, third, fourth]).sync
+    assert_equal :callback, loader.load(:callback).sync
+    assert_equal [[1, 2], [3, 4], [:callback]], loader.performed_keys
+  end
+
+  def test_max_batch_size_continues_after_a_failed_slice
+    loader = SecondSliceFailureLoader.for(max_batch_size: 2)
+    first = loader.load(1)
+    second = loader.load(2)
+    third = loader.load(3)
+    fourth = loader.load(4)
+    fifth = loader.load(5)
+
+    assert_equal 1, first.sync
+    assert_equal 2, second.sync
+    assert_equal 3, third.sync
+    assert_equal 'second slice failed', fourth.reason.message
+    assert_equal 5, fifth.sync
+    assert_equal [[1, 2], [3, 4], [5]], loader.performed_keys
+  end
+
+  def test_max_batch_size_rejects_non_positive_sizes
+    [0, -1].each do |max_batch_size|
+      GraphQL::Batch::Executor.current = GraphQL::Batch::Executor.new
+      loader = RecordingLoader.for(max_batch_size: max_batch_size)
+      promise = loader.load(1)
+
+      promise.wait
+      assert_equal ArgumentError, promise.reason.class
+      assert_equal 'max_batch_size must be a positive integer', promise.reason.message
+      assert_equal [], loader.performed_keys
+    end
   end
 
   def test_empty_group_query

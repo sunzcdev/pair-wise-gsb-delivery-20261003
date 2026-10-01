@@ -48,6 +48,27 @@ class RecordLoader < GraphQL::Batch::Loader
 end
 ```
 
+To limit a `perform` call when a backend accepts at most a fixed number of
+keys, pass the optional `max_batch_size` to the loader:
+
+```ruby
+class LimitedRecordLoader < GraphQL::Batch::Loader
+  def initialize(max_batch_size:)
+    super(max_batch_size: max_batch_size)
+  end
+
+  def perform(ids)
+    # perform one backend request for at most max_batch_size ids
+  end
+end
+
+LimitedRecordLoader.for(max_batch_size: 50)
+```
+
+Keys are sent in enqueue order. Keys loaded from a promise completion callback
+wait for the next resolution wave and do not change slices that are already in
+progress.
+
 Use `GraphQL::Batch` as a plugin in your schema _after_ specifying the mutation
 so that `GraphQL::Batch` can extend the mutation fields to clear the cache after
 they are resolved.
