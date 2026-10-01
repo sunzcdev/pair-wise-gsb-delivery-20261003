@@ -51,12 +51,14 @@ func (p *sshFxpExtendedPacketPosixRename) getPath() string { return p.Oldpath }
 func (p *sshFxpExtendedPacketHardlink) getPath() string    { return p.Oldpath }
 
 // getHandle
-func (p *sshFxpFstatPacket) getHandle() string    { return p.Handle }
-func (p *sshFxpFsetstatPacket) getHandle() string { return p.Handle }
-func (p *sshFxpReadPacket) getHandle() string     { return p.Handle }
-func (p *sshFxpWritePacket) getHandle() string    { return p.Handle }
-func (p *sshFxpReaddirPacket) getHandle() string  { return p.Handle }
-func (p *sshFxpClosePacket) getHandle() string    { return p.Handle }
+func (p *sshFxpFstatPacket) getHandle() string     { return p.Handle }
+func (p *sshFxpFsetstatPacket) getHandle() string  { return p.Handle }
+func (p *sshFxpReadPacket) getHandle() string      { return p.Handle }
+func (p *sshFxpWritePacket) getHandle() string     { return p.Handle }
+func (p *sshFxpReaddirPacket) getHandle() string   { return p.Handle }
+func (p *sshFxpClosePacket) getHandle() string     { return p.Handle }
+func (p *sshFxpExtentsPacket) getHandle() string   { return p.Handle }
+func (p *sshFxpPunchHolePacket) getHandle() string { return p.Handle }
 
 // notReadOnly
 func (p *sshFxpWritePacket) notReadOnly()               {}
@@ -69,15 +71,17 @@ func (p *sshFxpRenamePacket) notReadOnly()              {}
 func (p *sshFxpSymlinkPacket) notReadOnly()             {}
 func (p *sshFxpExtendedPacketPosixRename) notReadOnly() {}
 func (p *sshFxpExtendedPacketHardlink) notReadOnly()    {}
+func (p *sshFxpPunchHolePacket) notReadOnly()           {}
 
 // some packets with ID are missing id()
-func (p *sshFxpDataPacket) id() uint32   { return p.ID }
-func (p *sshFxpStatusPacket) id() uint32 { return p.ID }
-func (p *sshFxpStatResponse) id() uint32 { return p.ID }
-func (p *sshFxpNamePacket) id() uint32   { return p.ID }
-func (p *sshFxpHandlePacket) id() uint32 { return p.ID }
-func (p *StatVFS) id() uint32            { return p.ID }
-func (p *sshFxVersionPacket) id() uint32 { return 0 }
+func (p *sshFxpDataPacket) id() uint32         { return p.ID }
+func (p *sshFxpStatusPacket) id() uint32       { return p.ID }
+func (p *sshFxpStatResponse) id() uint32       { return p.ID }
+func (p *sshFxpNamePacket) id() uint32         { return p.ID }
+func (p *sshFxpHandlePacket) id() uint32       { return p.ID }
+func (p *StatVFS) id() uint32                  { return p.ID }
+func (p *sshFxpExtentsReplyPacket) id() uint32 { return p.ID }
+func (p *sshFxVersionPacket) id() uint32       { return 0 }
 
 // take raw incoming packet data and build packet objects
 func makePacket(p rxPacket) (requestPacket, error) {

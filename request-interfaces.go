@@ -157,3 +157,25 @@ type ListerAt interface {
 type TransferError interface {
 	TransferError(err error)
 }
+
+// SparseDataReaderAt is an optional interface an open read handle may
+// implement to report which byte ranges carry allocated data and which are
+// holes. It backs the extents@sftp.pkg.github.com extended request.
+//
+// DataExtents returns the allocated, non-hole ranges overlapping
+// [off, off+length); a length of zero means "to end of file". A range filled
+// with allocated zeroes is still allocated and must be reported as data, so
+// that holes and genuine zero-filled data are not conflated.
+type SparseDataReaderAt interface {
+	io.ReaderAt
+	DataExtents(off, length int64) ([]DataExtent, error)
+}
+
+// SparseHoleWriterAt is an optional interface an open write handle may
+// implement to deallocate a byte range (turn it into a hole) without
+// changing the logical file length. It backs the
+// punch-hole@sftp.pkg.github.com extended request.
+type SparseHoleWriterAt interface {
+	io.WriterAt
+	PunchHole(off, length int64) error
+}

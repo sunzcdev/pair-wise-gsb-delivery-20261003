@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/pkg/sftp/internal/sparse"
 )
 
 const maxSymlinkFollows = 5
@@ -548,6 +550,12 @@ type memFile struct {
 	mu      sync.RWMutex
 	content []byte
 	err     error
+
+	// holes records explicitly deallocated (punched) byte ranges and is
+	// shared across every handle opened on this file. It lets the example
+	// backend distinguish genuine holes from allocated-but-zero data.
+	hmu   sync.RWMutex
+	holes []sparse.Extent
 }
 
 // These are helper functions, they must be called while holding the memFile.mu mutex

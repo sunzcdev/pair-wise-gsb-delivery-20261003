@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+
+	"github.com/pkg/sftp/internal/sparse"
 )
 
 const defaultMaxTxPacket uint32 = 1 << 15
@@ -29,6 +31,9 @@ type RequestServer struct {
 
 	startDirectory string
 	maxTxPacket    uint32
+
+	sparseCaps    sparse.Capability
+	sparseCapsSet bool
 
 	mu           sync.RWMutex
 	handleCount  int
@@ -231,7 +236,10 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 		var rpkt responsePacket
 		switch pkt := pkt.requestPacket.(type) {
 		case *sshFxInitPacket:
-			rpkt = &sshFxVersionPacket{Version: sftpProtocolVersion, Extensions: sftpExtensions}
+			rpkt = &sshFxVersionPacket{
+				Version:    sftpProtocolVersion,
+				Extensions: withSparseVersionExtension(sftpExtensions, rs.sparseCapabilities()),
+			}
 		case *sshFxpClosePacket:
 			handle := pkt.getHandle()
 			rpkt = statusFromError(pkt.ID, rs.closeRequest(handle))
@@ -305,6 +313,10 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpExtentsPacket:
+			rpkt = rs.handleExtents(pkt)
+		case *sshFxpPunchHolePacket:
+			rpkt = rs.handlePunchHole(pkt)
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)

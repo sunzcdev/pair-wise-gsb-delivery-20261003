@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pkg/sftp/internal/encoding/ssh/filexfer/openssh"
+	"github.com/pkg/sftp/internal/sparse"
 )
 
 var (
@@ -308,7 +309,8 @@ const sftpProtocolVersion = 3 // https://filezilla-project.org/specs/draft-ietf-
 
 func (c *Client) sendInit() error {
 	return c.clientConn.conn.sendPacket(&sshFxInitPacket{
-		Version: sftpProtocolVersion, // https://filezilla-project.org/specs/draft-ietf-secsh-filexfer-02.txt
+		Version:    sftpProtocolVersion, // https://filezilla-project.org/specs/draft-ietf-secsh-filexfer-02.txt
+		Extensions: withSparseExtension(nil, localSparseCapabilities()),
 	})
 }
 
@@ -359,6 +361,27 @@ func (c *Client) recvVersion() error {
 func (c *Client) HasExtension(name string) (string, bool) {
 	data, ok := c.ext[name]
 	return data, ok
+}
+
+// SparseCapabilities reports the sparse-transfer operations negotiated with
+// the server, as advertised in its SSH_FXP_VERSION response.
+//
+// The returned capability set is directional:
+//
+//   - sparse.CapExtents means the server can report data extents of files the
+//     client downloads.
+//   - sparse.CapPunch means the server can create holes in files the client
+//     uploads.
+//
+// This describes only the server side; the sparse upload/download helpers
+// additionally require the matching local capability (see SparseSupport) and
+// fall back to a dense transfer whenever either end is missing one.
+func (c *Client) SparseCapabilities() sparse.Capability {
+	data, ok := c.HasExtension(sparse.ExtensionName)
+	if !ok {
+		return 0
+	}
+	return sparse.ParseExtensionData(data)
 }
 
 // Walk returns a new Walker rooted at root.

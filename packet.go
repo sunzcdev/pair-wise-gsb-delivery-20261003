@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"reflect"
+
+	"github.com/pkg/sftp/internal/sparse"
 )
 
 var (
@@ -1343,6 +1345,28 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketHardlink{}
+	case sparse.ExtentsRequest:
+		ep := &sshFxpExtentsPacket{ID: p.ID}
+		body := b
+		if _, body, err = unmarshalStringSafe(body); err != nil {
+			return err
+		}
+		if err := ep.UnmarshalRequestBody(body); err != nil {
+			return err
+		}
+		p.SpecificPacket = ep
+		return nil
+	case sparse.PunchRequest:
+		ep := &sshFxpPunchHolePacket{ID: p.ID}
+		body := b
+		if _, body, err = unmarshalStringSafe(body); err != nil {
+			return err
+		}
+		if err := ep.UnmarshalRequestBody(body); err != nil {
+			return err
+		}
+		p.SpecificPacket = ep
+		return nil
 	default:
 		return fmt.Errorf("packet type %v: %w", p.SpecificPacket, errUnknownExtendedPacket)
 	}
