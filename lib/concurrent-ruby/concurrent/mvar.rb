@@ -46,6 +46,110 @@ module Concurrent
     # to produce a value.
     TIMEOUT = ::Object.new
 
+    # @!visibility private
+    #
+    # Book-keeping for one in-flight `MVar.select` call. A waiter is
+    # registered on every MVar taking part in the select; the first MVar
+    # that becomes full *claims* the waiter, but the value itself stays in
+    # the MVar until the selecting thread takes it. This two-phase scheme
+    # (claim, then consume) guarantees that a select consumes exactly one
+    # slot, that a racing `#take` can never leave a select stuck with a
+    # half-consumed value, and that a timed-out select leaves nothing
+    # behind that could steal future values.
+    class SelectWaiter
+      def initialize
+        @mutex     = Mutex.new
+        @condition = ConditionVariable.new
+        @ready     = nil # the MVar that claimed this waiter, if any
+      end
+
+      # Called by an MVar that just became full, while that MVar holds its
+      # own lock. The first claiming MVar wins; later claims are ignored.
+      def claim(mvar)
+        @mutex.synchronize do
+          @ready ||= mvar
+          @condition.signal
+        end
+      end
+
+      # Waits until some MVar claims this waiter or the deadline passes.
+      # Returns the claiming MVar (and clears the claim), or nil on
+      # timeout. The waiter's mutex is never held by the caller afterwards,
+      # so MVar locks may be acquired without risking lock-order inversion.
+      def wait(deadline)
+        @mutex.synchronize do
+          loop do
+            if @ready
+              ready  = @ready
+              @ready = nil
+              return ready
+            end
+            if deadline
+              remaining = deadline - Concurrent.monotonic_time
+              return nil if remaining <= 0.0
+              @condition.wait(@mutex, remaining)
+            else
+              @condition.wait(@mutex)
+            end
+          end
+        end
+      end
+    end
+
+    # Blocks until any one of the given `MVar`s becomes full, removes the
+    # value from exactly that one slot, and returns the winning slot's
+    # index (position in the argument list) together with the value.
+    #
+    # Only the winning slot is consumed: every other `MVar` keeps its
+    # value, which can still be retrieved with a normal `#take`. If
+    # several slots are full at the same time the earliest one in argument
+    # order wins; if several `#put`s race a blocked select, the first
+    # `put` to claim the select wins. In both cases there is exactly one
+    # winner. A select also competes fairly with ordinary `#take` calls:
+    # whichever acquires the value first gets it, the other keeps waiting.
+    #
+    # A `timeout` (in seconds) can be given to limit the time spent
+    # blocked, in which case `TIMEOUT` is returned if the time is
+    # exceeded. After a timeout no slot is consumed and no waiter
+    # registration is left behind, so values put later are never stolen
+    # by a dead select.
+    #
+    # @param [Array<MVar>] mvars the slots to select over
+    # @param [Numeric, nil] timeout maximum time to block, or nil to block forever
+    # @return [Array(Integer, Object)] the winning slot index and its value,
+    #   or `TIMEOUT`
+    def self.select(*mvars, timeout: nil)
+      mvars = mvars.flatten
+      raise ArgumentError, 'at least one MVar is required' if mvars.empty?
+
+      waiter   = SelectWaiter.new
+      deadline = timeout && Concurrent.monotonic_time + timeout
+
+      # Register on every MVar first, so no #put can slip through between
+      # the scan below and the wait.
+      mvars.each { |mvar| mvar.send(:register_select_waiter, waiter) }
+
+      begin
+        loop do
+          # Consume any full slot; the first full slot in argument order
+          # wins, giving deterministic single-winner semantics.
+          mvars.each_with_index do |mvar, index|
+            value = mvar.try_take!
+            return [index, value] unless value == EMPTY
+          end
+
+          # Sleep until some slot claims the waiter. The claim is only a
+          # wakeup: the value is consumed by the scan above, so a racing
+          # #take stealing it just sends us around the loop again.
+          return TIMEOUT unless waiter.wait(deadline)
+        end
+      ensure
+        # Whatever happened - win, timeout or exception - leave no
+        # registration behind that could observe (or steal) future values.
+        mvars.each { |mvar| mvar.send(:deregister_select_waiter, waiter) }
+      end
+    end
+
     # Create a new `MVar`, either empty or with an initial value.
     #
     # @param [Hash] opts the options controlling how the future will be processed
@@ -56,6 +160,7 @@ module Concurrent
       @mutex = Mutex.new
       @empty_condition = ConditionVariable.new
       @full_condition = ConditionVariable.new
+      @select_waiters = []
       set_deref_options(opts)
     end
 
@@ -107,7 +212,7 @@ module Concurrent
         # If we timed out we won't be empty
         if unlocked_empty?
           @value = value
-          @full_condition.signal
+          unlocked_notify_full
           apply_deref_options(value)
         else
           TIMEOUT
@@ -130,7 +235,7 @@ module Concurrent
         if unlocked_full?
           value = @value
           @value = yield value
-          @full_condition.signal
+          unlocked_notify_full
           apply_deref_options(value)
         else
           TIMEOUT
@@ -157,7 +262,7 @@ module Concurrent
       @mutex.synchronize do
         if unlocked_empty?
           @value = value
-          @full_condition.signal
+          unlocked_notify_full
           true
         else
           false
@@ -170,7 +275,7 @@ module Concurrent
       @mutex.synchronize do
         old_value = @value
         @value = value
-        @full_condition.signal
+        unlocked_notify_full
         apply_deref_options(old_value)
       end
     end
@@ -185,7 +290,7 @@ module Concurrent
         if unlocked_empty?
           @empty_condition.signal
         else
-          @full_condition.signal
+          unlocked_notify_full
         end
         apply_deref_options(value)
       end
@@ -208,6 +313,27 @@ module Concurrent
     end
 
     private
+
+    # @!visibility private
+    # Registers a SelectWaiter; called by MVar.select before it scans.
+    def register_select_waiter(waiter)
+      @mutex.synchronize { @select_waiters << waiter }
+    end
+
+    # @!visibility private
+    # Removes a SelectWaiter; called by MVar.select exactly once per select.
+    def deregister_select_waiter(waiter)
+      @mutex.synchronize { @select_waiters.delete(waiter) }
+    end
+
+    # Must be called with @mutex held, whenever the MVar becomes full.
+    # Wakes ordinary #take waiters and claims any registered select
+    # waiters. Lock ordering is always MVar's lock -> waiter's lock; a
+    # selecting thread never holds those locks in the opposite order.
+    def unlocked_notify_full
+      @full_condition.signal
+      @select_waiters.each { |waiter| waiter.claim(self) } unless @select_waiters.empty?
+    end
 
     def unlocked_empty?
       @value == EMPTY

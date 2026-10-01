@@ -218,6 +218,165 @@ module Concurrent
 
     end
 
+    describe '.select' do
+
+      it 'requires at least one MVar' do
+        expect { MVar.select }.to raise_error(ArgumentError)
+      end
+
+      it 'accepts an array of MVars as well as varargs' do
+        m1 = MVar.new(1)
+        m2 = MVar.new(2)
+        expect(MVar.select([m1, m2])).to eq [0, 1]
+      end
+
+      it 'returns the winning slot index and value from a full MVar' do
+        m1 = MVar.new
+        m2 = MVar.new(14)
+        expect(MVar.select(m1, m2)).to eq [1, 14]
+        expect(m2).to be_empty
+      end
+
+      it 'picks the earliest slot in argument order when several are full' do
+        m1 = MVar.new(1)
+        m2 = MVar.new(2)
+        m3 = MVar.new(3)
+        expect(MVar.select(m1, m2, m3)).to eq [0, 1]
+        # the losers keep their values
+        expect(m2.take).to eq 2
+        expect(m3.take).to eq 3
+      end
+
+      it 'blocks until another thread puts into any of the MVars' do
+        m1 = MVar.new
+        m2 = MVar.new
+
+        in_thread {
+          sleep(0.1)
+          m2.put 14
+        }
+
+        expect(MVar.select(m1, m2)).to eq [1, 14]
+      end
+
+      it 'consumes exactly one slot when two producers put simultaneously' do
+        200.times do
+          m1 = MVar.new
+          m2 = MVar.new
+
+          barrier = Queue.new
+          t1 = in_thread { barrier.pop; m1.put :one }
+          t2 = in_thread { barrier.pop; m2.put :two }
+          barrier << :go << :go
+
+          index, value = MVar.select(m1, m2)
+          expect([:one, :two]).to include(value)
+          expect([m1, m2][index].empty?).to be true
+
+          t1.join
+          t2.join
+
+          # exactly one slot was consumed; the loser's value is still there
+          loser = [m1, m2].find(&:full?)
+          expect([m1, m2].count(&:full?)).to eq 1
+          expect(loser.take).to eq(value == :one ? :two : :one)
+        end
+      end
+
+      it 'leaves every non-winning value available to a later #take' do
+        mvars = 5.times.map { |i| MVar.new(i) }
+        won = []
+        5.times do
+          index, value = MVar.select(*mvars)
+          won << value
+          expect(mvars[index]).to be_empty
+        end
+        expect(won.sort).to eq [0, 1, 2, 3, 4]
+      end
+
+      it 'competes with a normal #take so that exactly one of them wins' do
+        100.times do
+          m1 = MVar.new
+          m2 = MVar.new
+
+          taken = Queue.new
+          t = in_thread { taken << m1.take }
+
+          m1.put 1
+          m2.put 2
+
+          index, value = MVar.select(m1, m2, timeout: 5)
+          if index == 0
+            # the select won slot 0; the racing take gets slot 0's next value
+            expect(value).to eq 1
+            m1.put 3
+            expect(taken.pop).to eq 3
+            expect(m2.take).to eq 2
+          else
+            # the normal take won slot 0; the select must have taken slot 1
+            expect([index, value]).to eq [1, 2]
+            expect(taken.pop).to eq 1
+            expect(m1).to be_empty
+          end
+          t.join
+        end
+      end
+
+      it 'returns TIMEOUT when nothing is put in time' do
+        m1 = MVar.new
+        m2 = MVar.new
+        expect(MVar.select(m1, m2, timeout: 0.1)).to eq MVar::TIMEOUT
+        expect(m1).to be_empty
+        expect(m2).to be_empty
+      end
+
+      it 'leaves no waiter registration behind after a timeout' do
+        m1 = MVar.new
+        m2 = MVar.new
+        MVar.select(m1, m2, timeout: 0.05)
+
+        [m1, m2].each do |m|
+          waiters = m.instance_variable_get(:@select_waiters)
+          expect(waiters).to be_empty
+        end
+
+        # values put after the timeout are delivered to a normal #take,
+        # not stolen by the dead select
+        m1.put 1
+        m2.put 2
+        expect(m1.take).to eq 1
+        expect(m2.take).to eq 2
+      end
+
+      it 'wins deterministically when a put collides with the timeout' do
+        100.times do
+          m = MVar.new
+          result = nil
+          selector = in_thread { result = MVar.select(m, timeout: 0.05) }
+          sleep(0.05) # put lands exactly as the select times out
+          m.put 14
+          selector.join
+
+          if result == MVar::TIMEOUT
+            # the select lost the race: the value must remain for a #take
+            expect(m.take).to eq 14
+          else
+            # the select won: exactly one consumption happened
+            expect(result).to eq [0, 14]
+            expect(m).to be_empty
+          end
+        end
+      end
+
+      it 'supports an infinite wait when no timeout is given' do
+        m1 = MVar.new
+        m2 = MVar.new
+        in_thread { sleep(0.1); m1.put 14 }
+        expect(MVar.select(m1, m2)).to eq [0, 14]
+      end
+
+    end
+
     describe '#try_put!' do
 
       it 'returns true an empty MVar' do
