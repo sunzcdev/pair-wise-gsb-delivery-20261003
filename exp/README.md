@@ -4,6 +4,33 @@ Contains experimental utilities and APIs for Prometheus.
 
 Packages within this module are listed below.
 
+## Quantile
+
+NOTE: The `quantile` package is experimental and its API may change or be removed.
+
+Contains a mergeable quantile sketch with a bounded rank error, plus a
+`prometheus.Collector` that exposes it as a Summary metric. Unlike
+`prometheus.Summary`, workers can export their intermediate state as a
+versioned `Digest` and merge it centrally, making it suitable for
+aggregating quantiles across processes.
+
+```go
+    import (
+        "github.com/prometheus/client_golang/exp/quantile"
+    )
+    ...
+
+	c, err := quantile.New(quantile.Opts{
+		Name:       "request_duration_seconds",
+		BufferSize: 256,
+		MaxLevels:  32,
+	})
+	...
+	c.Observe(0.42)
+```
+
+For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/quantile).
+
 ## Remote
 
 This module contains production quality code with explicitly unstable API. Any code in this module can change its API or be removed; use with care.
