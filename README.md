@@ -12,6 +12,7 @@
     - [Defining Entities](#defining-entities)
       - [Basic Exposure](#basic-exposure)
       - [Exposing with a Presenter](#exposing-with-a-presenter)
+      - [Polymorphic Exposure](#polymorphic-exposure)
       - [Conditional Exposure](#conditional-exposure)
       - [Safe Exposure](#safe-exposure)
       - [Nested Exposure](#nested-exposure)
@@ -138,6 +139,46 @@ Presenter classes can also be specified in string format, which helps with circu
 
 ```ruby
 expose :replies, using: "API::Entities::Status", as: :responses
+```
+
+#### Polymorphic Exposure
+
+When an attribute contains different kinds of objects (for example a feed mixing
+articles and videos), a single `using` presenter is not enough. Use `:polymorphic`
+to declare a type-to-presenter mapping; each object - including every element of a
+collection - is dispatched individually to the presenter matching its actual class.
+
+```ruby
+class API::Entities::Feed < Grape::Entity
+  expose :items, polymorphic: {
+    Article => API::Entities::Article,
+    Video   => API::Entities::Video,
+    default: API::Entities::FallbackItem # optional fallback
+  }
+end
+```
+
+Dispatch rules:
+
+* `nil` is never dispatched and always represents as `nil`.
+* When several class rules match (through inheritance), the most specific class wins.
+* Module rules also match; when several modules match and none includes the others
+  (so no unique most specific rule exists), a
+  `Grape::Entity::PolymorphicMapping::AmbiguousPolymorphicMatch` error is raised
+  instead of guessing by registration order.
+* Objects of an unmapped type use the `:default` presenter when declared, otherwise
+  a `Grape::Entity::PolymorphicMapping::UnmappedPolymorphicType` error is raised.
+
+Presenter classes may be given as strings, which are constantized lazily.
+
+A mapping can be extended later with `extend_polymorphic`. Because exposures and
+their mappings are deep-duped on inheritance, rules added on a subclass never
+pollute the parent entity or sibling subclasses:
+
+```ruby
+class API::Entities::VideoFeed < API::Entities::Feed
+  extend_polymorphic :items, LiveStream => API::Entities::LiveStream
+end
 ```
 
 #### Conditional Exposure

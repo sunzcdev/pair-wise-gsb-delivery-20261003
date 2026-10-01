@@ -181,6 +181,13 @@ module Grape
     #   automatically be transformed into a representation that will receive the same
     #   options as the parent entity when called. Note that arrays are fine here and
     #   will automatically be detected and handled appropriately.
+    # @option options :polymorphic This option allows you to map an attribute to
+    #   different Grape Entities depending on the actual type of each object. Pass
+    #   a hash mapping classes or modules to Grape::Entity classes (or their constant
+    #   names), plus an optional +:default+ fallback entry. Each element of a
+    #   collection is dispatched individually, +nil+ always represents as +nil+,
+    #   the most specific matching class rule wins, ambiguous module rules raise
+    #   an error, and unmapped types without a +:default+ raise an error.
     # @option options :proc If you pass a Proc into this option, it will
     #   be used directly to determine the value for that attribute. It
     #   will be called with the represented object as well as the
@@ -244,6 +251,36 @@ module Grape
 
     def self.find_exposure(attribute)
       root_exposures.find_by(attribute)
+    end
+
+    # Extends the polymorphic mapping of an existing exposure with
+    # additional type-to-presenter rules. Rules added on an Entity
+    # subclass never affect the parent entity or sibling subclasses,
+    # because exposures (and their mappings) are deep-duped on inheritance.
+    #
+    # @example Extend a mapping in a subclass
+    #
+    #   class FeedEntity < Grape::Entity
+    #     expose :items, polymorphic: { Article => ArticleEntity, default: FallbackEntity }
+    #   end
+    #
+    #   class ExtendedFeedEntity < FeedEntity
+    #     extend_polymorphic :items, Video => VideoEntity
+    #   end
+    #
+    # @param attribute [Symbol] the name of the polymorphic exposure
+    # @param rules [Hash] mapping of classes/modules to presenters,
+    #   with an optional +:default+ fallback entry
+    def self.extend_polymorphic(attribute, rules)
+      exposure = find_exposure(attribute)
+      raise ArgumentError, "No exposure found for #{attribute.inspect}." unless exposure
+
+      unless exposure.respond_to?(:polymorphic_mapping)
+        raise ArgumentError, "Exposure #{attribute.inspect} is not polymorphic."
+      end
+
+      @documentation = nil
+      exposure.polymorphic_mapping.merge!(rules)
     end
 
     def self.unexpose(*attributes)
@@ -635,6 +672,7 @@ module Grape
       unless
       using
       with
+      polymorphic
       proc
       documentation
       format_with

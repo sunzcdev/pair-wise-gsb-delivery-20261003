@@ -1,7 +1,9 @@
 # frozen_string_literal: true
 
+require 'grape_entity/polymorphic_mapping'
 require 'grape_entity/exposure/base'
 require 'grape_entity/exposure/represent_exposure'
+require 'grape_entity/exposure/polymorphic_exposure'
 require 'grape_entity/exposure/block_exposure'
 require 'grape_entity/exposure/delegator_exposure'
 require 'grape_entity/exposure/formatter_exposure'
@@ -19,9 +21,14 @@ module Grape
 
           passed_proc = options[:proc]
           using_class = options[:using]
+          polymorphic = options[:polymorphic]
           format_with = options[:format_with]
 
-          if using_class
+          if polymorphic && using_class
+            raise ArgumentError, 'You may not use the :polymorphic option together with :using.'
+          elsif polymorphic
+            build_polymorphic_exposure(base_args, polymorphic, passed_proc)
+          elsif using_class
             build_class_exposure(base_args, using_class, passed_proc)
           elsif passed_proc
             build_block_exposure(base_args, passed_proc)
@@ -78,6 +85,19 @@ module Grape
             end
 
           RepresentExposure.new(*base_args, using_class, exposure)
+        end
+
+        def build_polymorphic_exposure(base_args, polymorphic, passed_proc)
+          exposure =
+            if passed_proc
+              build_block_exposure(base_args, passed_proc)
+            else
+              build_delegator_exposure(base_args)
+            end
+
+          mapping = polymorphic.is_a?(PolymorphicMapping) ? polymorphic : PolymorphicMapping.new(polymorphic)
+
+          PolymorphicExposure.new(*base_args, mapping, exposure)
         end
 
         def build_formatter_exposure(base_args, format_with)

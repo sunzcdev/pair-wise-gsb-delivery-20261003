@@ -7,6 +7,7 @@
 #### Features
 
 * Your contribution here.
+* Add declarative polymorphic exposures: `expose :items, polymorphic: { Article => ArticleEntity, default: FallbackEntity }` dispatches each object (and each collection element) to a presenter based on its actual type, with most-specific-class precedence, ambiguity detection for module rules, and inheritance-safe `extend_polymorphic` mappings.
 
 
 ### 1.1.0 (2026-06-05)
