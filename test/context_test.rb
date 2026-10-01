@@ -900,6 +900,222 @@ describe Rack::Cache::Context do
     cache.trace.must_include :store
   end
 
+  describe 'with post-response invalidation of Location and Content-Location targets' do
+    # Inspect the heap metastore directly so checking staleness does not
+    # disturb other entries.
+    def cached_response(absolute_uri)
+      store = cache.metastore
+      env = Rack::MockRequest.env_for(absolute_uri)
+      entries = store.read(store.cache_key(Rack::Cache::Request.new(env)))
+      return nil if entries.empty?
+      headers = entries.first.last
+      Rack::Cache::Response.new(headers['x-status'].to_i, headers, [])
+    end
+
+    def fresh_entry?(absolute_uri)
+      response = cached_response(absolute_uri)
+      !response.nil? && response.fresh?
+    end
+
+    def stale_entry?(absolute_uri)
+      response = cached_response(absolute_uri)
+      !response.nil? && !response.fresh?
+    end
+
+    it 'does not invalidate anything when the write fails' do
+      respond_with do |req, res|
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ['Hello World']
+        else
+          # a failed write that still points at cacheable resources
+          res.status = 500
+          res['Location'] = '/orders'
+          res['Content-Location'] = 'http://example.com/orders'
+          res.body = ['boom']
+        end
+      end
+
+      # two origins sharing the same path
+      get '/orders'
+      get 'http://example.com/orders'
+
+      # the failing write
+      post '/orders'
+      assert response.server_error?
+      cache.trace.must_include :pass
+      cache.trace.wont_include :invalidate
+
+      # nothing was invalidated on either origin
+      assert fresh_entry?('http://example.org/orders'),
+        'request target must stay fresh after a failed write'
+      assert fresh_entry?('http://example.com/orders'),
+        'header target on another origin must stay fresh after a failed write'
+
+      # the surviving entry is still served straight from cache
+      app.reset!
+      get '/orders'
+      refute app.called?
+    end
+
+    it 'invalidates exactly the request target and same-origin header targets' do
+      # Scripted responses for the sequence of unsafe requests below.
+      write_responses = [
+        # 1. a redirect-style success with a *relative* Location
+        [303, { 'Location' => 'orders/confirmed' }, []],
+        # 2. absolute same-origin Location + path-absolute relative Content-Location
+        [200, {
+          'Location' => 'http://example.org/orders/shipped',
+          'Content-Location' => '/orders/duplicate',
+          'cache-control' => 'no-store'
+        }, []],
+        # 3. cross-origin scheme Location and a malformed Content-Location
+        [303, {
+          'Location' => 'https://example.org/orders',
+          'Content-Location' => 'http://[not-a-host'
+        }, []],
+        # 4. cross-origin host Location plus a duplicate of the request target
+        [303, {
+          'Location' => 'http://other.example.org/other',
+          'Content-Location' => 'orders'
+        }, []]
+      ]
+
+      respond_with do |req, res|
+        if req.get?
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res.body = ["#{req.host}:#{req.path_info}"]
+        else
+          status, headers, body = write_responses.shift
+          res.status = status
+          headers.each { |name, value| res[name] = value }
+          res.body = body
+        end
+      end
+
+      # seed entries on two origins sharing identical paths
+      %w[/orders /orders/confirmed /orders/shipped /orders/duplicate
+         /other].each do |path|
+        get path
+        get "http://example.com#{path}"
+      end
+
+      # write #1: redirect with relative Location
+      post '/orders'
+      assert response.redirect?
+      cache.trace.must_include :invalidate
+      assert stale_entry?('http://example.org/orders'),
+        'request target must be invalidated'
+      assert stale_entry?('http://example.org/orders/confirmed'),
+        'relative Location must be resolved against the request and invalidated'
+      assert fresh_entry?('http://example.org/orders/shipped'),
+        'unreferenced same-origin paths must not be invalidated'
+      assert fresh_entry?('http://example.org/orders/duplicate'),
+        'unreferenced same-origin paths must not be invalidated'
+      assert fresh_entry?('http://example.org/other'),
+        'unrelated same-origin paths must not be invalidated'
+      assert fresh_entry?('http://example.com/orders'),
+        'cross-origin request-target path must not be invalidated'
+      assert fresh_entry?('http://example.com/orders/confirmed'),
+        'cross-origin Location path must not be invalidated'
+      assert fresh_entry?('http://example.com/orders/shipped'),
+        'cross-origin paths must not be invalidated'
+      assert fresh_entry?('http://example.com/orders/duplicate'),
+        'cross-origin paths must not be invalidated'
+      assert fresh_entry?('http://example.com/other'),
+        'unrelated cross-origin paths must not be invalidated'
+
+      # write #2: absolute same-origin Location + relative Content-Location
+      post '/orders'
+      cache.trace.must_include :invalidate
+      assert stale_entry?('http://example.org/orders/shipped'),
+        'absolute same-origin Location must be invalidated'
+      assert stale_entry?('http://example.org/orders/duplicate'),
+        'path-absolute Content-Location must be invalidated'
+      assert fresh_entry?('http://example.com/orders/shipped'),
+        'cross-origin absolute Location path must not be invalidated'
+      assert fresh_entry?('http://example.com/orders/duplicate'),
+        'cross-origin Content-Location path must not be invalidated'
+
+      # writes #3 and #4: cross-origin scheme/host, malformed and duplicate
+      # references must not widen the invalidated set at all
+      post '/orders'
+      cache.trace.must_include :invalidate
+      post '/orders'
+      cache.trace.must_include :invalidate
+      assert fresh_entry?('http://example.org/other'),
+        'cross-origin host reference must not invalidate'
+      assert fresh_entry?('http://example.com/other'),
+        'cross-origin scheme/malformed references must not invalidate'
+    end
+
+    it 'invalidates every negotiated variant stored under the target key' do
+      respond_with do |req, res|
+        if req.get?
+          res.status = 200
+          res['vary'] = 'accept'
+          res['cache-control'] = 'public, max-age=500'
+          res['content-type'] = req.env['HTTP_ACCEPT']
+          res.body = [req.env['HTTP_ACCEPT']]
+        else
+          res.status = 303
+          res['Location'] = '/orders'
+          res.body = []
+        end
+      end
+
+      get '/orders', 'HTTP_ACCEPT' => 'text/html'
+      get '/orders', 'HTTP_ACCEPT' => 'application/json'
+
+      post '/write'
+      cache.trace.must_include :invalidate
+
+      # both negotiated variants are now stale and hit the backend
+      %w[text/html application/json].each do |accept|
+        app.reset!
+        get '/orders', 'HTTP_ACCEPT' => accept
+        assert app.called?, "variant #{accept} must be invalidated"
+      end
+    end
+
+    it 'keeps the cached body so stale entries may be revalidated' do
+      respond_with do |req, res|
+        if req.post?
+          res.status = 303
+          res['Location'] = '/'
+          res.body = []
+        elsif req.env['HTTP_IF_NONE_MATCH'] == '"v1"'
+          res.status = 304
+          res['etag'] = '"v1"'
+          res.body = []
+        else
+          res.status = 200
+          res['cache-control'] = 'public, max-age=500'
+          res['etag'] = '"v1"'
+          res.body = ['Hello World']
+        end
+      end
+
+      get '/'
+
+      # redirect-style successful write pointing back at the cached entry
+      post '/orders'
+      assert response.redirect?
+      cache.trace.must_include :invalidate
+
+      # the entry is stale, but revalidation succeeds with 304 and the
+      # stored body is served again: invalidation does not delete bodies
+      get '/'
+      assert app.called?
+      response.status.must_equal 200
+      response.body.must_equal 'Hello World'
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+    end
+  end
+
   describe 'with responses that include a Vary header' do
     before do
       count = 0

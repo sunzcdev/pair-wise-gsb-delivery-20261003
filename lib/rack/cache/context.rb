@@ -148,16 +148,112 @@ module Rack::Cache
       forward
     end
 
-    # Invalidate POST, PUT, DELETE and all methods not understood by this cache
-    # See RFC2616 13.10
+    # Forward an unsafe request (POST, PUT, DELETE, ...) to the backend and
+    # invalidate affected cache entries after a non-error response is
+    # received. The request target is always invalidated; in addition,
+    # same-origin URIs referenced by the Location and Content-Location
+    # response headers are invalidated, per RFC 9111 section 4.4.
+    #
+    # Entries are marked stale rather than deleted, so they may still be
+    # revalidated according to the normal caching rules. A failed write
+    # (a 4xx/5xx response, or one that raises while forwarding) does not
+    # invalidate anything.
     def invalidate
-      metastore.invalidate(@request, entitystore)
-    rescue => e
-      log_error(e)
-      pass
-    else
-      record :invalidate
-      pass
+      response = pass
+
+      if response.status < 400
+        begin
+          invalidate_locations(response)
+        rescue => e
+          log_error(e)
+        else
+          record :invalidate
+        end
+      end
+
+      response
+    end
+
+    # Invalidate the request target along with every same-origin URI that
+    # can be parsed from the response's Location and Content-Location
+    # headers. Relative references are resolved against this request;
+    # cross-origin, malformed, and duplicate URIs do not widen the set.
+    def invalidate_locations(response)
+      store = metastore
+      requests = [@request]
+      invalidated_keys = [store.cache_key(@request)]
+
+      %w[location content-location].each do |header|
+        next unless value = response.headers[header]
+        next unless request_uri = parse_same_origin_uri(value)
+        target = request_for_uri(request_uri)
+        key = store.cache_key(target)
+        next if invalidated_keys.include?(key)
+        invalidated_keys << key
+        requests << target
+      end
+
+      requests.each do |target|
+        store.invalidate(target, entitystore)
+      end
+    end
+
+    # Parse +value+ as a URI reference resolved against the effective
+    # request URI (including its path and query), per RFC 3986 section 5.
+    # Returns nil when the reference is malformed or does not identify the
+    # same origin (scheme, host, and port) as the request.
+    def parse_same_origin_uri(value)
+      return nil if value.to_s.empty?
+      base = URI::Generic.build(
+        :scheme  => @request.scheme,
+        :host    => @request.host,
+        :port    => @request.port,
+        :path    => @request.script_name + @request.path_info,
+        :query   => @request.query_string.empty? ? nil : @request.query_string
+      )
+      uri = base + value.to_s
+      return nil unless uri.absolute? && uri.host
+      return nil unless uri.scheme == @request.scheme
+      return nil unless host_without_brackets(uri.host) ==
+                        host_without_brackets(@request.host)
+      return nil unless uri.port == @request.port
+      uri
+    rescue URI::Error, ArgumentError
+      nil
+    end
+
+    # Normalize a host for comparison: IPv6 hosts are bracketed in URIs
+    # (e.g. "[::1]") but reported without brackets by Rack::Request.
+    def host_without_brackets(host)
+      host.to_s.downcase.delete_prefix('[').delete_suffix(']')
+    end
+
+    # Build a Request object for the absolute, same-origin +uri+ so that
+    # the configured cache key generator produces the key under which the
+    # referenced response is cached. The cache key itself carries the
+    # script name, path, and query of the target; any mount prefix is
+    # therefore derived from the resolved URI rather than copied from the
+    # triggering request (whose Location may live outside the app).
+    def request_for_uri(uri)
+      env = @env.select { |key, _| key.start_with?('rack-cache.') }
+      env.update(
+        'rack.url_scheme' => uri.scheme,
+        'HTTP_HOST'       => host_header(uri),
+        'SCRIPT_NAME'     => '',
+        'PATH_INFO'       => uri.path.to_s.empty? ? '/' : uri.path,
+        'QUERY_STRING'    => uri.query.to_s,
+        'REQUEST_METHOD'  => 'GET'
+      )
+      Request.new(env)
+    end
+
+    def host_header(uri)
+      default_port = uri.scheme == 'https' ? 443 : 80
+      if uri.port == default_port
+        uri.host
+      else
+        "#{uri.host}:#{uri.port}"
+      end
     end
 
     # Try to serve the response from cache. When a matching cache entry is
