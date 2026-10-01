@@ -1,5 +1,12 @@
 # Changes
 
+## Unreleased
+
+* Added `TZInfo::DataSources::ZoneinfoWriter`, which writes TZif version 2
+  and 3 files (as described in RFC 9636) from explicitly specified offsets,
+  transitions and an optional POSIX-style TZ string footer.
+
+
 ## Version 2.0.6 - 28-Jan-2023
 
 * Eliminate `Object#untaint` deprecation warnings on JRuby 9.4.0.0. #145.
