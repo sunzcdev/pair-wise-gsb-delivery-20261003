@@ -53,48 +53,39 @@ module Mustermann
 
     # @see Mustermann::Pattern#===
     def ===(string)
-      peek_size(string) == string.size
+      !!split_match(string, full: true)
     end
 
     # @see Mustermann::Pattern#match
     def match(string)
-      peeked = peek_match(string)
-      peeked if peeked.to_s == string
+      split_match(string, full: true)
     end
 
     # @see Mustermann::Pattern#params
     def params(string)
-      params, size = peek_params(string)
-      params if size == string.size
+      split_match(string, full: true)&.params
     end
 
     # @see Mustermann::Pattern#peek_size
     def peek_size(string)
-      pump(string) { |p,s| p.peek_size(s) }
+      split_match(string)&.to_s&.size
     end
 
     # @see Mustermann::Pattern#peek_match
+    #
+    # The individual patterns are matched against the string in order.
+    # When an earlier pattern greedily consumes characters that a later
+    # pattern needs, shorter splits of the earlier pattern are tried.
+    # Among all viable splits, the one with the longest segments from
+    # left to right is chosen.
     def peek_match(string)
-      post_match      = string
-      params         = {}
-      captures       = []
-      named_captures = {}
-
-      patterns.each do |pattern|
-        return unless part = pattern.peek_match(post_match)
-        params.merge!(part.params)
-        named_captures.merge!(part.named_captures)
-        captures.concat(part.captures)
-        post_match = post_match[part.to_s.size..-1]
-      end
-
-      matched = string[0, string.size - post_match.size]
-      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:)
+      split_match(string)
     end
 
     # @see Mustermann::Pattern#peek_params
     def peek_params(string)
-      pump(string, inject_with: :merge, with_size: true) { |p, s| p.peek_params(s) }
+      match = split_match(string)
+      [match.params, match.to_s.size] if match
     end
 
     # (see Mustermann::Pattern#expand)
@@ -116,22 +107,63 @@ module Mustermann
       patterns.all? { |p| p.respond_to?(method) }
     end
 
-    # used to generate results for various methods by scanning through an input string
+    # Searches for a viable way of splitting the input between the patterns.
+    # Splits are explored from left to right, always trying the longest
+    # match for the current pattern first. This allows a pattern to back
+    # off when it greedily consumed characters that a later pattern needs,
+    # while empty matches are allowed to end the search.
+    #
+    # @param full [Boolean] require the whole string to be consumed
+    # @return [Mustermann::Match, nil] match built from one successful split,
+    #   so that its params and captures never mix in values from failed candidates
     # @!visibility private
-    def pump(string, inject_with: :+, initial: nil, with_size: false)
-      substring = string
-      results   = Array(initial)
+    def split_match(string, full: false)
+      search(string, 0, 0, [], full)
+    end
 
-      patterns.each do |pattern|
-        result, size = yield(pattern, substring)
-        return unless result
-        results << result
-        size    ||= result
-        substring = substring[size..-1]
+    # used by {#split_match} to recursively explore possible splits
+    # @!visibility private
+    def search(string, index, offset, parts, full)
+      pattern = patterns[index]
+
+      if pattern.nil?
+        return if full and offset < string.size
+        return build_match(string, offset, parts)
       end
 
-      results = results.inject(inject_with)
-      with_size ? [results, string.size - substring.size] : results
+      remaining = string[offset, string.size - offset]
+      return if remaining.nil?
+
+      # a prefix is a viable split point if the pattern matches it in
+      # full; they are checked longest first so that, among all viable
+      # splits, each segment is as long as the left-to-right order allows.
+      # the empty prefix is included so patterns that can match nothing
+      # may end the split.
+      remaining.size.downto(0) do |size|
+        next unless part = pattern.match(size.zero? ? EMPTY_STRING : remaining[0, size])
+        result = search(string, index + 1, offset + size, parts + [part], full)
+        return result if result
+      end
+
+      nil
+    end
+
+    # combines the matches of one successful split into a single match
+    # @!visibility private
+    def build_match(string, consumed, parts)
+      params         = {}
+      named_captures = {}
+      captures       = []
+
+      parts.each do |part|
+        params.merge!(part.params)
+        named_captures.merge!(part.named_captures)
+        captures.concat(part.captures)
+      end
+
+      matched    = string[0, consumed]
+      post_match = string[consumed, string.size - consumed]
+      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:)
     end
 
     # generates one big AST from all patterns
@@ -142,6 +174,6 @@ module Mustermann
       AST::Node[:root].new(payload)
     end
 
-    private :combined_ast, :pump
+    private :combined_ast, :split_match, :search, :build_match
   end
 end

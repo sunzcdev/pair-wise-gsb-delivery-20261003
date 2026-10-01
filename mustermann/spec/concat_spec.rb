@@ -132,4 +132,143 @@ describe Mustermann::Concat do
     it { should generate_template("/{foo}") }
     it { should generate_template("{bar}") }
   end
+
+  describe "backtracking" do
+    # a greedy prefix that can swallow multiple directory levels, a fixed
+    # middle segment and a fixed /manifest suffix
+    subject(:pattern) do
+      prefix   = Mustermann.new("/*rest")
+      middle   = Mustermann.new("/v2", type: :rails, uri_decode: false)
+      suffix   = Mustermann.new("/manifest")
+      prefix + middle + suffix
+    end
+
+    example { pattern.should be_a(Mustermann::Concat) }
+
+    example "gives characters swallowed by the first segment back to later segments" do
+      pattern.match("/api/v2/manifest").params.should be == { "rest" => "api" }
+      pattern.match("/api/project/v2/manifest").params.should be == { "rest" => "api/project" }
+    end
+
+    example "prefers the longest match for each segment from left to right" do
+      pattern.params("/api/v2/v2/manifest").should be == { "rest" => "api/v2" }
+    end
+
+    example "results of match, params and peek_match come from the same split" do
+      string   = "/api/v2/manifest"
+      match    = pattern.match(string)
+      peeked   = pattern.peek_match(string)
+      params, size = pattern.peek_params(string)
+
+      match.to_s.should     be == string
+      match.params.should   be == { "rest" => "api" }
+      peeked.to_s.should    be == string
+      peeked.params.should  be == match.params
+      params.should         be == match.params
+      size.should           be == string.size
+      pattern.peek_size(string).should be == string.size
+    end
+
+    example "only matches the prefix when peeking at a longer string" do
+      peeked = pattern.peek_match("/api/v2/manifest/extra")
+      peeked.to_s.should   be == "/api/v2/manifest"
+      peeked.params.should be == { "rest" => "api" }
+      pattern.should_not match("/api/v2/manifest/extra")
+      pattern.params("/api/v2/manifest/extra").should be_nil
+    end
+
+    example "returns nil when no split can satisfy all segments" do
+      pattern.match("/api/manifest").should be_nil
+      pattern.match("/api/v2").should be_nil
+      pattern.peek_match("/api").should be_nil
+      pattern.peek_size("/api").should be_nil
+      (pattern === "/api").should be false
+    end
+
+    example "does not mix captures from failed candidates into the result" do
+      match = pattern.match("/v2/v2/manifest")
+      match.params.should be == { "rest" => "v2" }
+    end
+  end
+
+  describe "backtracking with three greedy segments" do
+    subject(:pattern) do
+      Mustermann.new("/*a") +
+      Mustermann.new("/*b", type: :rails, uri_decode: false) +
+      Mustermann.new("/end")
+    end
+
+    example { pattern.class.should be == Mustermann::Concat }
+
+    example "finds a split satisfying all three segments" do
+      match = pattern.match("/x/y/end")
+      match.should be_a(Mustermann::Match)
+      match.params.should be == { "a" => "x", "b" => "y" }
+      pattern.params("/x/y/end").should be == { "a" => "x", "b" => "y" }
+    end
+
+    example "chooses segments longest from left to right" do
+      pattern.params("/x/y/z/end").should be == { "a" => "x/y", "b" => "z" }
+    end
+  end
+
+  describe "backtracking with empty matches" do
+    subject(:pattern) do
+      Mustermann::Concat.new("(/:a)?", "(/:b)?", "/manifest")
+    end
+
+    example "empty matches are allowed to end a segment" do
+      pattern.match("/manifest").params.should be == { "a" => nil, "b" => nil }
+      pattern.match("/x/manifest").params.should be == { "a" => "x", "b" => nil }
+      pattern.match("/x/y/manifest").params.should be == { "a" => "x", "b" => "y" }
+    end
+
+    example "longer matches are still preferred" do
+      pattern.params("/x/y/manifest").should be == { "a" => "x", "b" => "y" }
+      pattern.peek_size("/manifest").should be == "/manifest".size
+    end
+
+    example "an all-empty split matches the empty string" do
+      Mustermann::Concat.new("(/:a)?", "(/:b)?").match("").to_s.should be == ""
+    end
+  end
+
+  describe "backtracking with a suffix that never matches" do
+    subject(:pattern) { Mustermann.new("/*rest") + Mustermann.new(/(?!)/) }
+
+    example { pattern.class.should be == Mustermann::Concat }
+
+    it { should_not match("/anything") }
+    it { should_not match("") }
+
+    example { pattern.params("/anything").should be_nil }
+    example { pattern.peek_match("/anything").should be_nil }
+    example { pattern.peek_size("/anything").should be_nil }
+    example { pattern.peek_params("/anything").should be_nil }
+  end
+
+  describe "backtracking with percent encoding" do
+    subject(:pattern) do
+      Mustermann.new("/*rest") +
+      Mustermann.new("/manifest", type: :rails, uri_decode: false)
+    end
+
+    example "decodes captures of the successful split" do
+      pattern.match("/a%25b/manifest").params.should be == { "rest" => "a%b" }
+    end
+
+    example "keeps encoded separators within the first segment's capture" do
+      match = pattern.match("/a%2Fb/manifest")
+      match.params.should be == { "rest" => "a/b" }
+      match.to_s.should   be == "/a%2Fb/manifest"
+    end
+
+    example "peeking uses the same split and captures" do
+      string = "/a%20b/manifest/extra"
+      peeked = pattern.peek_match(string)
+      peeked.to_s.should   be == "/a%20b/manifest"
+      peeked.params.should be == { "rest" => "a b" }
+      pattern.peek_params(string).should be == [{ "rest" => "a b" }, "/a%20b/manifest".size]
+    end
+  end
 end
