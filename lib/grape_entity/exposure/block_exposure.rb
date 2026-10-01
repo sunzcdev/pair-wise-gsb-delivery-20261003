@@ -7,7 +7,7 @@ module Grape
         attr_reader :block
 
         def value(entity, options)
-          entity.exec_with_object(options, &@block)
+          entity.exec_exposure_value_block(options, @block)
         end
 
         def dup

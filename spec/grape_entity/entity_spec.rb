@@ -226,6 +226,161 @@ describe Grape::Entity do
         end
       end
 
+      context 'with one-time attribute readers' do
+        # Readers return the next value on every call and count their reads,
+        # simulating attributes backed by one-time data sources.
+        let(:model_class) do
+          Class.new do
+            attr_reader :reads
+
+            def initialize(values)
+              @values = values
+              @reads = Hash.new(0)
+            end
+
+            def respond_to_missing?(name, include_private = false)
+              @values.key?(name) || super
+            end
+
+            def method_missing(name, *args, &block)
+              return super unless @values.key?(name)
+
+              @reads[name] += 1
+              remaining = @values[name]
+              remaining.size > 1 ? remaining.shift : remaining.first
+            end
+          end
+        end
+
+        let(:model) { model_class.new(token: %w[first-token second-token], flag: [false, true], nothing: [nil]) }
+
+        context 'with expose_nil: false' do
+          it 'checks the condition and reads the value only once' do
+            subject.expose(:token, expose_nil: false)
+
+            expect(subject.represent(model).serializable_hash).to eq(token: 'first-token')
+            expect(model.reads[:token]).to eq 1
+          end
+
+          it 'treats false as an evaluated value' do
+            subject.expose(:flag, expose_nil: false)
+
+            expect(subject.represent(model).serializable_hash).to eq(flag: false)
+            expect(model.reads[:flag]).to eq 1
+          end
+
+          it 'treats nil as an evaluated value' do
+            subject.expose(:nothing, expose_nil: false)
+
+            expect(subject.represent(model).serializable_hash).to eq({})
+            expect(model.reads[:nothing]).to eq 1
+          end
+
+          it 'evaluates a block exposure only once' do
+            subject.expose(:token, expose_nil: false) { |object, _options| object.token }
+
+            expect(subject.represent(model).serializable_hash).to eq(token: 'first-token')
+            expect(model.reads[:token]).to eq 1
+          end
+
+          it 'reuses the evaluated value for formatting' do
+            subject.format_with(:upcase) { |value| value.to_s.upcase }
+            subject.expose(:token, format_with: :upcase, expose_nil: false)
+
+            expect(subject.represent(model).serializable_hash).to eq(token: 'FIRST-TOKEN')
+            expect(model.reads[:token]).to eq 1
+          end
+        end
+
+        context 'evaluation boundaries' do
+          before { subject.expose(:token, expose_nil: false) }
+
+          it 're-evaluates on every serializable_hash call' do
+            entity = subject.represent(model)
+
+            expect(entity.serializable_hash).to eq(token: 'first-token')
+            expect(entity.serializable_hash).to eq(token: 'second-token')
+            expect(model.reads[:token]).to eq 2
+          end
+
+          it 'discards the evaluated values after each call' do
+            entity = subject.represent(model)
+            entity.serializable_hash
+
+            expect(entity.instance_variable_get(:@exposure_value_cache)).to be_nil
+          end
+
+          it 're-evaluates when the same object is represented with different options' do
+            expect(subject.represent(model, only: [:token]).serializable_hash).to eq(token: 'first-token')
+            expect(subject.represent(model, except: [:flag]).serializable_hash).to eq(token: 'second-token')
+            expect(model.reads[:token]).to eq 2
+          end
+
+          it 'does not share evaluated values between independent representations' do
+            first = subject.represent(model).serializable_hash
+            second = subject.represent(model).serializable_hash
+
+            expect(first).to eq(token: 'first-token')
+            expect(second).to eq(token: 'second-token')
+            expect(model.reads[:token]).to eq 2
+          end
+        end
+
+        context 'with nested entities and field filtering' do
+          let(:child_model) { model_class.new(name: %w[child-name], secret: %w[child-secret]) }
+          let(:model) { model_class.new(child: [child_model], token: %w[first-token second-token]) }
+
+          let(:child_entity_class) do
+            Class.new(Grape::Entity) do
+              expose :name
+              expose :secret
+            end
+          end
+
+          before do
+            child_entity = child_entity_class
+            subject.expose(:child, using: child_entity)
+            subject.expose(:token, expose_nil: false)
+          end
+
+          it 'reads each selected attribute only once' do
+            output = subject.represent(model).serializable_hash
+
+            expect(output).to eq(child: { name: 'child-name', secret: 'child-secret' }, token: 'first-token')
+            expect(model.reads[:child]).to eq 1
+            expect(model.reads[:token]).to eq 1
+            expect(child_model.reads[:name]).to eq 1
+            expect(child_model.reads[:secret]).to eq 1
+          end
+
+          it 'never reads unselected fields' do
+            output = subject.represent(model, only: [:token]).serializable_hash
+
+            expect(output).to eq(token: 'first-token')
+            expect(model.reads[:child]).to eq 0
+            expect(child_model.reads[:name]).to eq 0
+            expect(child_model.reads[:secret]).to eq 0
+          end
+
+          it 'never reads unselected nested fields' do
+            output = subject.represent(model, only: [{ child: [:name] }]).serializable_hash
+
+            expect(output).to eq(child: { name: 'child-name' })
+            expect(child_model.reads[:name]).to eq 1
+            expect(child_model.reads[:secret]).to eq 0
+            expect(model.reads[:token]).to eq 0
+          end
+
+          it 'never reads excepted fields' do
+            output = subject.represent(model, except: [{ child: [:secret] }]).serializable_hash
+
+            expect(output).to eq(child: { name: 'child-name' }, token: 'first-token')
+            expect(child_model.reads[:secret]).to eq 0
+            expect(model.reads[:token]).to eq 1
+          end
+        end
+      end
+
       context 'with :default option' do
         let(:a) { nil }
         let(:b) { nil }
@@ -1337,7 +1492,8 @@ describe Grape::Entity do
 
         exposure = subject.find_exposure(:awesome_thing)
         expect(exposure.conditions[0].inversed?).to be true
-        expect(exposure.conditions[0].block.call(awesome_thing: nil)).to be true
+        entity = subject.new(awesome_thing: nil)
+        expect(entity.instance_exec(entity.object, {}, &exposure.conditions[0].block)).to be true
       end
 
       it 'overrides nested :expose_nil option' do
@@ -1350,7 +1506,8 @@ describe Grape::Entity do
 
         exposure = subject.find_exposure(:awesome_thing)
         expect(exposure.conditions[0].inversed?).to be true
-        expect(exposure.conditions[0].block.call(awesome_thing: nil)).to be true
+        entity = subject.new(awesome_thing: nil)
+        expect(entity.instance_exec(entity.object, {}, &exposure.conditions[0].block)).to be true
         # Conditions are only added for exposures that do not expose nil
         exposure = subject.find_exposure(:other_awesome_thing)
         expect(exposure.conditions[0]).to be_nil

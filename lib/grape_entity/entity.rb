@@ -519,7 +519,49 @@ module Grape
 
       opts = options.merge(runtime_options || {})
 
-      root_exposure.serializable_value(self, opts)
+      with_exposure_value_cache do
+        root_exposure.serializable_value(self, opts)
+      end
+    end
+
+    # Establishes a per-call evaluation boundary. All exposure reads made
+    # while the block runs (condition checks, value reads and formatting)
+    # share a single memoization cache, so an attribute reader that returns
+    # one-time data is evaluated at most once per serialization pass and
+    # every consumer observes the same result.
+    #
+    # The cache lives only for the duration of the block: it is never
+    # stored on the represented object, nor kept on the entity afterwards,
+    # so representing the same object again (with any options) always
+    # re-evaluates.
+    def with_exposure_value_cache
+      previous_cache = @exposure_value_cache
+      @exposure_value_cache = {}
+      yield
+    ensure
+      @exposure_value_cache = previous_cache
+    end
+
+    # Returns the memoized value for +key+ within the current evaluation
+    # boundary, computing and storing it on first access. +nil+ and +false+
+    # results count as evaluated and are cached as well. Outside of an
+    # evaluation boundary the block is always executed.
+    def exposure_value(key)
+      cache = @exposure_value_cache
+      return yield unless cache
+
+      if cache.key?(key)
+        cache[key]
+      else
+        cache[key] = yield
+      end
+    end
+
+    # Executes an exposure's value block at most once per evaluation
+    # boundary, so the expose_nil check, the value read and formatting
+    # all observe the same result.
+    def exec_exposure_value_block(options, block)
+      exposure_value([:block, block]) { exec_with_object(options, &block) }
     end
 
     def exec_with_object(options, &block)
@@ -595,16 +637,20 @@ module Grape
     end
 
     def value_for(key, options = Options.new)
-      root_exposure.valid_value_for(key, self, options)
+      with_exposure_value_cache do
+        root_exposure.valid_value_for(key, self, options)
+      end
     end
 
     def delegate_attribute(attribute)
-      if is_defined_in_entity?(attribute)
-        send(attribute)
-      elsif delegator.accepts_options?
-        delegator.delegate(attribute, **self.class.delegation_opts)
-      else
-        delegator.delegate(attribute)
+      exposure_value([:attribute, attribute]) do
+        if is_defined_in_entity?(attribute)
+          send(attribute)
+        elsif delegator.accepts_options?
+          delegator.delegate(attribute, **self.class.delegation_opts)
+        else
+          delegator.delegate(attribute)
+        end
       end
     end
 

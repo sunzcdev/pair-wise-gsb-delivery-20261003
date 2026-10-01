@@ -3,6 +3,7 @@
 #### Fixes
 
 * Your contribution here.
+* Evaluate each exposure at most once per `serializable_hash` call: the `expose_nil: false` check, the value read and formatting now share a per-call memoized result (including `nil` and `false`), so attributes backed by one-time data stay consistent within a serialization pass and are re-evaluated on every new representation.
 
 #### Features
 
