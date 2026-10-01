@@ -439,11 +439,22 @@ module Grape
     #
     # @option options :only [Array] all the fields that should be returned
     # @option options :except [Array] all the fields that should not be returned
+    # @option options :strict_conflicts [true or false] when true, every output key records
+    #   which exposure it came from and a collision between two exposures (direct, aliased
+    #   via :as, or produced via :merge) raises Grape::Entity::KeyConflictError with both
+    #   source paths instead of silently overwriting the first value.
+    # @option options :conflict_resolvers [Hash] per-key adjudicators used in strict conflict
+    #   mode, mapping an output key to a callable invoked as
+    #   `->(key, existing_value, incoming_value, sources) { ... }`. Only the listed keys are
+    #   adjudicated; blanket last-write-wins rules are not supported.
     def self.represent(objects, options = {})
       @present_collection ||= nil
       if objects.respond_to?(:to_ary) && !@present_collection
         root_element = root_element(:collection_root)
-        inner = objects.to_ary.map { |object| new(object, options.reverse_merge(collection: true)).presented }
+        inner = objects.to_ary.map.with_index do |object, index|
+          element_options = options.reverse_merge(collection: true).merge(collection_index: index)
+          new(object, element_options).presented
+        end
       else
         objects = { @collection_name => objects } if @present_collection
         root_element = root_element(:root)

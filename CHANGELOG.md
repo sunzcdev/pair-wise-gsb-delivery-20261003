@@ -7,6 +7,7 @@
 #### Features
 
 * Your contribution here.
+* Add optional strict conflict mode (`strict_conflicts: true`): records which exposure each output key comes from and raises `Grape::Entity::KeyConflictError` with both source paths when direct, aliased (`as:`) or merged (`merge:`) fields collide; per-key adjudicators can be declared via `conflict_resolvers` - [@claude](https://github.com/claude).
 
 
 ### 1.1.0 (2026-06-05)

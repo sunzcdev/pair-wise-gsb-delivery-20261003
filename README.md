@@ -17,6 +17,7 @@
       - [Nested Exposure](#nested-exposure)
       - [Collection Exposure](#collection-exposure)
       - [Merge Fields](#merge-fields)
+      - [Strict Conflict Mode](#strict-conflict-mode)
       - [Runtime Exposure](#runtime-exposure)
       - [Unexpose](#unexpose)
       - [Overriding exposures](#overriding-exposures)
@@ -239,6 +240,57 @@ Provide lambda to solve collisions:
 ```ruby
 expose :status, merge: ->(key, old_val, new_val) { old_val + new_val if old_val && new_val }
 ```
+
+#### Strict Conflict Mode
+
+When two exposures end up writing to the same output key — a direct field, an
+aliased field (`as:`), or a field merged into the root (`merge: true`) — the
+default behavior silently keeps the last written value (or, for colliding
+`merge: true` keys, fails with a cryptic `ArgumentError`), making it hard to
+tell which value was overwritten.
+
+Pass `strict_conflicts: true` at representation time to record which exposure
+each output key came from and raise `Grape::Entity::KeyConflictError` with both
+source paths on a collision:
+
+```ruby
+class UserEntity < Grape::Entity
+  expose :name
+  expose :title, as: :name
+  expose :extras, merge: true
+end
+
+UserEntity.represent(user, strict_conflicts: true)
+# Grape::Entity::KeyConflictError:
+#   Conflicting exposures for output key :name:
+#     - UserEntity.name
+#     - UserEntity.title (as: name)
+#   ...
+```
+
+Fields whose conditions (`if:`/`unless:`) do not hold never enter the output and
+therefore never count as conflicts. When representing collections, source paths
+carry the element index, e.g. `UserEntity.name[2]`.
+
+To resolve a conflict, declare an adjudicator for that specific key via
+`conflict_resolvers`. The callable receives the key, the existing value, the
+incoming value and both source paths; its return value is what gets output:
+
+```ruby
+UserEntity.represent(
+  user,
+  strict_conflicts: true,
+  conflict_resolvers: {
+    name: ->(key, existing, incoming, sources) { incoming }
+  }
+)
+```
+
+Adjudication is intentionally per key only: `conflict_resolvers` must be a Hash
+mapping output keys to callables. A blanket last-write-wins rule for the whole
+output is not supported — that is exactly the silent behavior strict mode exists
+to prevent. A `merge: ->(key, old_val, new_val) { ... }` callable on an exposure
+also counts as explicit adjudication for the keys it merges.
 
 #### Runtime Exposure
 

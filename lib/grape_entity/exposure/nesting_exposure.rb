@@ -115,7 +115,7 @@ module Grape
 
         def map_entity_exposures(entity, options)
           new_options = nesting_options_for(options)
-          output = OutputBuilder.new(entity)
+          output = OutputBuilder.new(entity, new_options)
 
           normalized_exposures(entity, new_options).each_with_object(output) do |exposure, out|
             exposure.with_attr_path(entity, new_options) do
