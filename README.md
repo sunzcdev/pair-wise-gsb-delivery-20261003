@@ -155,6 +155,31 @@ end
 
 Priming will add key/value to the loader cache only if it didn't exist before.
 
+### Clearing the Cache
+
+Within a single request, a mutation may change data that was already
+loaded through a loader. Use `clear` to invalidate a cached entry so
+that subsequent loads fetch fresh data:
+
+```ruby
+def rename_product(id:, title:)
+  product = Product.find(id)
+  product.update!(title: title)
+  RecordLoader.for(Product).clear(product.id)
+  RecordLoader.for(Product).load(product.id)
+end
+```
+
+`clear` only affects future loads. Promises that were already returned
+are still resolved by the batch they were queued in, even if that batch
+is still performing: a late `fulfill` or `reject` from the old batch is
+never attributed to a promise of the new generation. The key is
+normalized with `cache_key`, so load keys that map to the same cache key
+share the same invalidation.
+
+`prime` keeps its default of not overwriting an existing cache entry,
+including a still-pending promise. Call `clear` first when you want
+`prime` to replace an existing entry.
 
 ## Unit Testing
 

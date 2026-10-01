@@ -42,12 +42,18 @@ module GraphQL::Batch
       @executor = nil
       @queue = nil
       @cache = nil
+      @queued = nil
+      @resolving = nil
     end
 
     def load(key)
-      cache[cache_key(key)] ||= begin
+      cache_key = cache_key(key)
+      cache[cache_key] ||= begin
         queue << key
-        ::Promise.new.tap { |promise| promise.source = self }
+        ::Promise.new.tap do |promise|
+          promise.source = self
+          (queued[cache_key] ||= []) << promise
+        end
       end
     end
 
@@ -55,14 +61,34 @@ module GraphQL::Batch
       ::Promise.all(keys.map { |key| load(key) })
     end
 
+    # Clear the cached promise for +key+, so that subsequent calls to #load
+    # return a new promise and queue the key to be loaded again.
+    #
+    # Promises already returned by #load are not affected: they are still
+    # resolved by the batch they were queued in, even if that batch is
+    # currently performing. A late #fulfill or #reject from that batch is
+    # attributed to those promises only, never to the new generation.
+    #
+    # The key is normalized with #cache_key, so load keys that map to the
+    # same cache key share the same invalidation.
+    def clear(key)
+      cache.delete(cache_key(key))
+    end
+
+    # Prime the cache with a value for +key+, unless an entry already
+    # exists. An existing entry is never overwritten, even if it is a
+    # still-pending promise from a previous #load; call #clear first to
+    # replace an existing entry.
     def prime(key, value)
       cache[cache_key(key)] ||= ::Promise.resolve(value).tap { |p| p.source = self }
     end
 
     def resolve # :nodoc:
       return if resolved?
-      load_keys = queue
+      load_keys = queue.uniq
       @queue = nil
+      @resolving = @queued
+      @queued = nil
 
       around_perform do
         perform(load_keys)
@@ -108,15 +134,14 @@ module GraphQL::Batch
 
     # Returns true when the key has already been fulfilled, otherwise returns false
     def fulfilled?(key)
-      promise = promise_for(key)
       # When a promise is fulfilled through this class, it will either:
       #   become fulfilled, if fulfilled with a literal value
       #   become pending with a new source if fulfilled with a promise
       # Either of these is acceptable, promise.rb will automatically re-wait
       # on the new source promise as needed.
-      return true if promise.fulfilled?
-
-      promise.pending? && promise.source != self
+      promises_for(key).all? do |promise|
+        promise.fulfilled? || (promise.pending? && promise.source != self)
+      end
     end
 
     # Must override to load the keys and call #fulfill for each key
@@ -132,10 +157,10 @@ module GraphQL::Batch
     private
 
     def finish_resolve(key)
-      promise = promise_for(key)
-      return yield(promise) unless executor
+      promises = promises_for(key)
+      return promises.each { |promise| yield(promise) } unless executor
       executor.around_promise_callbacks do
-        yield promise
+        promises.each { |promise| yield promise }
       end
     end
 
@@ -147,13 +172,29 @@ module GraphQL::Batch
       @queue ||= []
     end
 
-    def promise_for(load_key)
-      cache.fetch(cache_key(load_key))
+    def queued
+      @queued ||= {}
+    end
+
+    # Promises that a #fulfill or #reject for +load_key+ should settle.
+    #
+    # While a batch is resolving, these are the promises that were queued
+    # for that batch, looked up by cache key. They may no longer be cached
+    # if #clear was called for the key (e.g. from within #perform), and a
+    # promise cached for a later generation must not be settled by this
+    # batch.
+    def promises_for(load_key)
+      cache_key = cache_key(load_key)
+      if @resolving && @resolving.key?(cache_key)
+        @resolving[cache_key]
+      else
+        [cache.fetch(cache_key)]
+      end
     end
 
     def reject_pending_promises(load_keys, err)
       load_keys.each do |key|
-        next unless promise_for(key).pending?
+        next unless promises_for(key).any?(&:pending?)
 
         reject(key, err)
       end
@@ -161,15 +202,16 @@ module GraphQL::Batch
 
     def check_for_broken_promises(load_keys)
       load_keys.each do |key|
-        promise = promise_for(key)
-        # When a promise is fulfilled through this class, it will either:
-        #   become not pending, if fulfilled with a literal value
-        #   become pending with a new source if fulfilled with a promise
-        # Either of these is acceptable, promise.rb will automatically re-wait
-        # on the new source promise as needed.
-        next unless promise.pending? && promise.source == self
+        promises_for(key).each do |promise|
+          # When a promise is fulfilled through this class, it will either:
+          #   become not pending, if fulfilled with a literal value
+          #   become pending with a new source if fulfilled with a promise
+          # Either of these is acceptable, promise.rb will automatically re-wait
+          # on the new source promise as needed.
+          next unless promise.pending? && promise.source == self
 
-        reject(key, ::Promise::BrokenError.new("#{self.class} didn't fulfill promise for key #{key.inspect}"))
+          reject(key, ::Promise::BrokenError.new("#{self.class} didn't fulfill promise for key #{key.inspect}"))
+        end
       end
     end
   end

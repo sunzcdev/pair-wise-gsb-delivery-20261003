@@ -341,6 +341,21 @@ class GraphQL::GraphQLTest < Minitest::Test
     assert_equal expected, result
   end
 
+  def test_mutation_clear_and_reload
+    query_string = <<-GRAPHQL
+      mutation {
+        incrementCounterAndReload
+      }
+    GRAPHQL
+    result = Schema.execute(query_string, context: { counter: [41] })
+    expected = {
+      "data" => {
+        "incrementCounterAndReload" => 42,
+      }
+    }
+    assert_equal expected, result
+  end
+
   def test_mutation_batch_subselection_execution
     query_string = <<-GRAPHQL
       mutation {

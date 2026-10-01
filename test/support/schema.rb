@@ -222,6 +222,19 @@ class CounterLoaderMutation < GraphQL::Schema::Mutation
   end
 end
 
+class IncrementCounterAndReloadMutation < GraphQL::Schema::Mutation
+  null false
+  payload_type Int
+
+  def resolve
+    CounterLoader.load(context[:counter]).then do |_stale_count|
+      context[:counter][0] += 1
+      CounterLoader.for.clear(context[:counter])
+      CounterLoader.load(context[:counter])
+    end
+  end
+end
+
 class NoOpMutation < GraphQL::Schema::Mutation
   null false
   payload_type QueryType
@@ -234,6 +247,7 @@ end
 class MutationType < BaseObject
   field :increment_counter, mutation: IncrementCounterMutation
   field :counter_loader, mutation: CounterLoaderMutation
+  field :increment_counter_and_reload, mutation: IncrementCounterAndReloadMutation
   field :no_op, mutation: NoOpMutation
 end
 

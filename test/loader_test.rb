@@ -79,6 +79,53 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     end
   end
 
+  # Fulfills each key with "<key>-<batch number>" and supports one-shot
+  # hooks that run inside #perform, before the keys are fulfilled. Hooks
+  # are instance_exec'd on the loader, so they can call #clear, #load,
+  # #fulfill and #reject to control how clearing interleaves with the
+  # resolution of a batch.
+  class ScriptedLoader < GraphQL::Batch::Loader
+    attr_reader :batches
+
+    def initialize
+      @batches = []
+      @during_perform = []
+    end
+
+    def during_perform(&block)
+      @during_perform << block
+    end
+
+    def perform(keys)
+      @batches << keys.dup
+      hook = @during_perform.shift
+      instance_exec(&hook) if hook
+      fulfill_keys(keys)
+    end
+
+    private
+
+    def fulfill_keys(keys)
+      keys.each { |key| fulfill(key, "#{key}-#{@batches.size}") }
+    end
+  end
+
+  class ScriptedCacheKeyLoader < ScriptedLoader
+    def cache_key(load_key)
+      load_key.to_s
+    end
+  end
+
+  class ExplodingOnceLoader < ScriptedLoader
+    private
+
+    def fulfill_keys(keys)
+      raise 'perform failed' if batches.size == 1
+
+      super
+    end
+  end
+
   def setup
     GraphQL::Batch::Executor.current = GraphQL::Batch::Executor.new
   end
@@ -275,5 +322,136 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     loader.prime(:a, :not_a)
 
     assert_equal :a, loader.load(:a).sync
+  end
+
+  def test_clear_returns_new_promise_and_reloads
+    loader = ScriptedLoader.for
+    promise1 = loader.load(:a)
+    assert_same promise1, loader.load(:a)
+    assert_equal "a-1", promise1.sync
+
+    loader.clear(:a)
+
+    promise2 = loader.load(:a)
+    refute_same promise1, promise2
+    assert_equal "a-2", promise2.sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_clear_without_matching_key_does_nothing
+    loader = ScriptedLoader.for
+    promise = loader.load(:a)
+
+    loader.clear(:b)
+
+    assert_same promise, loader.load(:a)
+    assert_equal "a-1", promise.sync
+    assert_equal [[:a]], loader.batches
+  end
+
+  def test_clear_uses_cache_key_normalization
+    loader = ScriptedCacheKeyLoader.for
+    assert_equal "a-1", loader.load(:a).sync
+
+    loader.clear("a") # different load key, same cache key
+
+    assert_equal "a-2", loader.load(:a).sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_clear_and_load_during_perform_attributes_results_to_the_right_generation
+    loader = ScriptedLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    loader.during_perform do
+      clear(:a)
+      new_promise = load(:a)
+    end
+
+    # The old batch's fulfill arrives after the clear, but still settles
+    # the promise it was queued for, not the new generation.
+    assert_equal "a-1", old_promise.sync
+    refute_same old_promise, new_promise
+    assert_equal "a-2", new_promise.sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_late_reject_from_old_batch_does_not_affect_new_generation
+    loader = ScriptedLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    error = StandardError.new("old batch failed")
+    loader.during_perform do
+      clear(:a)
+      new_promise = load(:a)
+      reject(:a, error)
+    end
+
+    err = assert_raises(StandardError) { old_promise.sync }
+    assert_equal "old batch failed", err.message
+    assert_equal "a-2", new_promise.sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_failed_perform_rejects_old_generation_only
+    loader = ExplodingOnceLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    loader.during_perform do
+      clear(:a)
+      new_promise = load(:a)
+    end
+
+    err = assert_raises(RuntimeError) { old_promise.sync }
+    assert_equal "perform failed", err.message
+    assert_equal "a-2", new_promise.sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_clear_before_resolve_settles_both_promises_in_one_batch
+    loader = ScriptedLoader.for
+    old_promise = loader.load(:a)
+    loader.clear(:a)
+    new_promise = loader.load(:a)
+
+    refute_same old_promise, new_promise
+    assert_equal "a-1", old_promise.sync
+    assert_equal "a-1", new_promise.sync
+    assert_equal [[:a]], loader.batches
+  end
+
+  def test_prime_after_clear_replaces_value
+    loader = EchoLoader.for
+    assert_equal :a, loader.load(:a).sync
+
+    loader.clear(:a)
+    loader.prime(:a, :primed)
+
+    assert_equal :primed, loader.load(:a).sync
+  end
+
+  def test_clear_invalidates_primed_value
+    loader = EchoLoader.for
+    loader.prime(:a, :primed)
+
+    loader.clear(:a)
+
+    assert_equal :a, loader.load(:a).sync
+  end
+
+  def test_prime_does_not_replace_pending_promise_until_cleared
+    loader = ScriptedLoader.for
+    pending_promise = loader.load(:a)
+
+    loader.prime(:a, :primed) # no-op: an entry already exists
+    assert_same pending_promise, loader.load(:a)
+
+    loader.clear(:a)
+    loader.prime(:a, :primed)
+    assert_equal :primed, loader.load(:a).sync
+
+    # The in-flight promise is still settled by its own batch.
+    assert_equal "a-1", pending_promise.sync
+    assert_equal [[:a]], loader.batches
   end
 end
