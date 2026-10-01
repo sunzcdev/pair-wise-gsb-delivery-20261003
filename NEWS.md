@@ -1,5 +1,18 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added `CSV.transpose`: transposes rows and columns of CSV data
+    without loading the whole source into memory. It reads the input
+    exactly once (so a non-rewindable IO is acceptable), spills fields
+    to standard-library temporary files beyond a bounded in-memory
+    field count, and keeps the number of simultaneously open temporary
+    files below a configurable limit even when the table is wider than
+    that limit. Ragged rows may either raise `CSV::UnevenRowError` or be
+    padded with an explicit field value.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

@@ -1,0 +1,90 @@
+== Recipes for Transposing CSV
+
+CSV.transpose transposes the rows and columns of CSV data: the field at
+<em>row i, column j</em> in the input is written to <em>row j, column
+i</em> in the output.
+
+It is intended for input that is too large to read into memory as a
+two-dimensional array. The input is read exactly once, fields are
+spilled to temporary files beyond a small in-memory budget, and the
+number of temporary files open at the same time stays below a
+configurable limit, no matter how many columns the data has.
+
+=== Simple transposition
+
+  require "csv"
+
+  input = "a,b,c\n1,2,3\n"
+  output = ""
+  CSV.transpose(input, output)
+  puts output
+
+Output:
+
+  a,1
+  b,2
+  c,3
+
+The first argument may be a String or any readable IO; it is consumed
+once, front to back, so a pipe or a stream that cannot be rewound works.
+The second argument may be a String (modified in place and returned), an
+IO, or omitted (the result is written to +$stdout+).
+
+=== Transposing from and to streams
+
+  File.open("wide.csv") do |input|
+    File.open("tall.csv", "w") do |output|
+      CSV.transpose(input, output)
+    end
+  end
+
+=== Bounding memory and open files
+
+Two independent limits bound the resources used:
+
+- <tt>:max_buffered_fields</tt>: how many parsed fields may be held in
+  memory before they are spilled to temporary files.
+- <tt>:max_open_files</tt>: how many temporary spill files may be open
+  at once. A table with more columns than this is handled by recycling
+  file handles; no column holds a permanent handle and no whole column
+  is buffered in memory.
+
+  CSV.transpose(input, output,
+                max_buffered_fields: 4096,
+                max_open_files: 4)
+
+=== Uneven rows
+
+By default, rows that do not all have the same number of fields cause
+CSV::UnevenRowError, because the shape of the result is ambiguous:
+
+  CSV.transpose("a,b,c\n1,2\n", output) # raises CSV::UnevenRowError
+
+Pass <tt>ragged_rows: :pad</tt> to pad short rows instead. The padding
+field is given by <tt>:pad_value</tt> (default +nil+, written as an
+empty field):
+
+  CSV.transpose("a,b,c\n1,2\n", output,
+                ragged_rows: :pad, pad_value: "")
+  puts output
+
+Output:
+
+  a,1
+  b,2
+  c,
+
+=== Parsing and generating options
+
+Parsing and generating options are accepted, and may be directed to the
+input or output side with +in_+/+out_+ prefixes, as with CSV.filter:
+
+  CSV.transpose(input, output,
+                in_col_sep: ";", out_col_sep: "|",
+                force_quotes: true)
+
+Headers are not inferred: every input record is treated as data, so the
++headers+ family of options is rejected.
+
+All temporary files are closed and removed before CSV.transpose
+returns, including when an exception is raised.

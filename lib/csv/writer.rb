@@ -58,6 +58,65 @@ class CSV
     end
 
     #
+    # Starts an output row without receiving all of its fields at once.
+    # Fields are appended one by one with #emit_streaming_field and the
+    # row is terminated by #end_streaming_row. This keeps callers that
+    # produce fields lazily (e.g. CSV.transpose) from materializing a
+    # whole row in memory.
+    #
+    # Note: Don't use this method directly. It is an internal API.
+    #
+    def begin_streaming_row
+      @lineno += 1
+      @streaming_field_index = 0
+      @streaming_row_started = false
+      self
+    end
+
+    #
+    # Appends a single field to the row started by #begin_streaming_row,
+    # including the column separator when needed. Quoting and write
+    # converters are applied exactly as they are by #<<.
+    #
+    # Note: Don't use this method directly. It is an internal API.
+    #
+    def emit_streaming_field(field)
+      if @streaming_row_started
+        @output << @column_separator
+      end
+      @streaming_row_started = true
+
+      if @fields_converter
+        field = @fields_converter.convert_field(field,
+                                                nil,
+                                                @lineno,
+                                                @streaming_field_index)
+      end
+
+      quoted_field = quote(field, @streaming_field_index)
+      if @output_encoding
+        quoted_field = quoted_field.encode(@output_encoding)
+      end
+      @output << quoted_field
+      @streaming_field_index += 1
+      self
+    end
+
+    #
+    # Terminates the row started by #begin_streaming_row.
+    #
+    # Note: Don't use this method directly. It is an internal API.
+    #
+    def end_streaming_row
+      row_separator = @row_separator
+      if @output_encoding
+        row_separator = row_separator.encode(@output_encoding)
+      end
+      @output << row_separator
+      self
+    end
+
+    #
     # Winds back to the beginning
     #
     def rewind

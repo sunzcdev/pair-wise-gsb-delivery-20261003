@@ -1300,7 +1300,124 @@ class CSV
       end
     end
 
+    # :call-seq:
+    #   CSV.transpose(in_string_or_io, out_string_or_io = nil, **options) -> string or nil
     #
+    # Transposes rows and columns of \CSV data: the field at +row i,
+    # column j+ in the input is written to +row j, column i+ in the
+    # output. Every input record is treated as data; headers are not
+    # inferred and the +headers+ option is not accepted.
+    #
+    # Unlike reading the whole source into an \Array and using
+    # <tt>Array#transpose</tt>, this method is designed for input that is
+    # too large to fit in memory:
+    #
+    # - The input is read exactly once, front to back, so a non-rewindable
+    #   \IO (a pipe, a socket, or any stream that can only be read once)
+    #   is acceptable.
+    # - Fields are buffered in memory only up to
+    #   <tt>:max_buffered_fields</tt>; beyond that they are spilled to
+    #   temporary files created with the standard-library \Tempfile.
+    # - At most <tt>:max_open_files</tt> temporary files are open at the
+    #   same time, no matter how many columns the input has. File handles
+    #   are recycled; no column keeps a permanent handle, and no whole
+    #   column is accumulated in memory.
+    #
+    # ==== Arguments
+    #
+    # - +in_string_or_io+: the \CSV source; a \String or an \IO stream.
+    # - +out_string_or_io+: the destination; a \String, an \IO stream, or
+    #   +nil+ (write to +$stdout+). When a \String is given it is modified
+    #   in place and also returned, like CSV.generate.
+    #
+    # ==== Resource options
+    #
+    # - <tt>:max_buffered_fields</tt> (Integer, default 8192): maximum
+    #   number of parsed fields held in memory at once. Must be >= 1.
+    # - <tt>:max_open_files</tt> (Integer, default 8): maximum number of
+    #   temporary spill files open simultaneously. Must be >= 1; a table
+    #   wider than this limit is handled by recycling handles.
+    # - <tt>:tmpdir</tt>: directory for temporary files; passed to
+    #   \Tempfile. Defaults to +Dir.tmpdir+.
+    #
+    # ==== Uneven rows
+    #
+    # By default rows of differing widths raise CSV::UnevenRowError:
+    #
+    #   CSV.transpose("a,b,c\n1,2\n") # raises CSV::UnevenRowError
+    #
+    # Pass <tt>ragged_rows: :pad</tt> to pad short rows instead. The
+    # padding field is given by <tt>:pad_value</tt> (default +nil+, which
+    # is written as an empty field):
+    #
+    #   CSV.transpose("a,b,c\n1,2\n", ragged_rows: :pad, pad_value: "")
+    #   # => "a,1\nb,2\nc,\n"
+    #
+    # ==== Parsing and generating options
+    #
+    # Any {option for parsing}[#class-CSV-label-Options+for+Parsing] or
+    # {option for generating}[#class-CSV-label-Options+for+Generating] is
+    # accepted. As with CSV.filter, an option may be directed to the input
+    # or the output side with an +input_+/+in_+ or +output_+/+out_+
+    # prefix. The +headers+, +write_headers+, +return_headers+, and
+    # +header_converters+ options are rejected: transposition operates on
+    # raw fields only.
+    #
+    # Quoting, embedded newlines, and empty fields are preserved:
+    #
+    #   source = "a,\"x,y\"\n,line2\n"
+    #   CSV.transpose(source, CSV.transpose(source)) == source
+    #   # => true
+    #
+    # All temporary files are closed and removed before the method
+    # returns, including when an exception is raised.
+    def transpose(input=nil, output=nil, **options)
+      transpose_options, options = extract_transpose_options(options)
+
+      in_options, out_options = Hash.new, {row_sep: InputRecordSeparator.value}
+      options.each do |key, value|
+        case key
+        when /\Ain(?:put)?_(.+)\Z/
+          in_options[$1.to_sym] = value
+        when /\Aout(?:put)?_(.+)\Z/
+          out_options[$1.to_sym] = value
+        else
+          in_options[key]  = value
+          out_options[key] = value
+        end
+      end
+
+      reject_headers_options(in_options, out_options)
+
+      return_string = output.is_a?(String)
+      if output.nil?
+        output_io = $stdout
+      elsif return_string
+        output_io = StringIO.new(output)
+        output_io.seek(0, IO::SEEK_END)
+        output_io.set_encoding(out_options[:encoding]) if out_options[:encoding]
+      else
+        output_io = output
+      end
+
+      input_csv = new(input || ARGF, **in_options)
+      # Build a second, write-oriented CSV for the destination so that
+      # output-side options (out_col_sep, write_converters, ...) apply.
+      # Its writer streams fields one at a time; it never reads.
+      output_csv = new(output_io, **out_options)
+      writer = output_csv.send(:writer)
+      transpose_options[:output_encoding] = output_csv.encoding
+      begin
+        Transposer.new(input_csv, writer, **transpose_options).transpose
+      ensure
+        input_csv.close
+        # Only the StringIO we wrapped around a destination String is
+        # ours to close; a caller-provided IO or StringIO is left open.
+        output_io.close if return_string
+      end
+      return_string ? output : nil
+    end
+
     # :call-seq:
     #   foreach(path_or_io, mode='r', **options) {|row| ... )
     #   foreach(path_or_io, mode='r', **options) -> new_enumerator
@@ -1958,6 +2075,42 @@ class CSV
 
     ON_WINDOWS = /mingw|mswin/.match?(RUBY_PLATFORM)
     private_constant :ON_WINDOWS
+
+    TRANSPOSE_OPTIONS = [:max_buffered_fields,
+                         :max_open_files,
+                         :ragged_rows,
+                         :pad_value,
+                         :tmpdir].freeze
+    private_constant :TRANSPOSE_OPTIONS
+
+    HEADER_OPTIONS = [:headers,
+                      :write_headers,
+                      :return_headers,
+                      :header_converters].freeze
+    private_constant :HEADER_OPTIONS
+
+    def extract_transpose_options(options)
+      transpose_options = {}
+      TRANSPOSE_OPTIONS.each do |key|
+        transpose_options[key] = options.delete(key) if options.key?(key)
+      end
+      [transpose_options, options]
+    end
+
+    def reject_headers_options(in_options, out_options)
+      HEADER_OPTIONS.each do |key|
+        if in_options.key?(key)
+          raise ArgumentError,
+                "CSV.transpose doesn't support :#{key} for input: " +
+                "all records are transposed as data"
+        end
+        if out_options.key?(key)
+          raise ArgumentError,
+                "CSV.transpose doesn't support :#{key} for output: " +
+                "all records are transposed as data"
+        end
+      end
+    end
 
     private
     def may_enable_bom_detection_automatically(path_or_io,
@@ -2987,3 +3140,4 @@ end
 require_relative "csv/version"
 require_relative "csv/core_ext/array"
 require_relative "csv/core_ext/string"
+require_relative "csv/transposer"

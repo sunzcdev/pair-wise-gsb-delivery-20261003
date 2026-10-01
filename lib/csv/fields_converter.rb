@@ -55,28 +55,36 @@ class CSV
       return fields unless need_convert?
 
       fields.collect.with_index do |field, index|
-        if field.nil?
-          field = @nil_value
-        elsif field.is_a?(String) and field.empty?
-          field = @empty_value unless @empty_value_is_empty_string
-        end
-        @converters.each do |converter|
-          break if field.nil? and @accept_nil
-          if converter.arity == 1  # straight field converter
-            field = converter[field]
-          else                     # FieldInfo converter
-            if headers
-              header = headers[index]
-            else
-              header = nil
-            end
-            quoted = quoted_fields[index]
-            field = converter[field, FieldInfo.new(index, lineno, header, quoted)]
-          end
-          break unless field.is_a?(String)  # short-circuit pipeline for speed
-        end
-        field  # final state of each field, converted or original
+        convert_field(field, headers, lineno, index, quoted_fields[index])
       end
+    end
+
+    #
+    # Converts a single field. Used both by #convert and by the writer's
+    # field-level streaming API so that a whole row does not need to be
+    # materialized before write converters are applied.
+    #
+    def convert_field(field, headers, lineno, index, quoted=nil)
+      if field.nil?
+        field = @nil_value
+      elsif field.is_a?(String) and field.empty?
+        field = @empty_value unless @empty_value_is_empty_string
+      end
+      @converters.each do |converter|
+        break if field.nil? and @accept_nil
+        if converter.arity == 1  # straight field converter
+          field = converter[field]
+        else                     # FieldInfo converter
+          if headers
+            header = headers[index]
+          else
+            header = nil
+          end
+          field = converter[field, FieldInfo.new(index, lineno, header, quoted)]
+        end
+        break unless field.is_a?(String)  # short-circuit pipeline for speed
+      end
+      field  # final state of field, converted or original
     end
 
     private
