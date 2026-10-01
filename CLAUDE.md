@@ -95,6 +95,7 @@ Available extensions:
 - `ClientDriverExtensionHasher` - Custom hash implementations
 - `ClientDriverExtensionAvailableSpace` - AVBL command support
 - `ClientDriverExtensionSite` - Custom SITE subcommands
+- `ClientDriverExtensionStrictRename` - Atomic, identity-verified RNFR/RNTO (see `Settings.StrictRename`)
 
 ## Coding Conventions
 

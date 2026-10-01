@@ -132,6 +132,41 @@ type ClientDriverExtensionAvailableSpace interface {
 	GetAvailableSpace(dirName string) (int64, error)
 }
 
+// StrictRenameRequirement defines how the server handles strict renames (RNFR/RNTO
+// with object identity verification) depending on the driver capabilities
+type StrictRenameRequirement int8
+
+const (
+	// StrictRenameDisabled keeps the legacy RNFR/RNTO behavior: the rename is
+	// performed by path only, so whatever object sits at the source path when
+	// RNTO is received gets renamed
+	StrictRenameDisabled StrictRenameRequirement = iota
+	// StrictRenameIfSupported uses strict rename when the driver implements
+	// ClientDriverExtensionStrictRename and falls back to the legacy behavior otherwise
+	StrictRenameIfSupported
+	// StrictRenameRequired rejects RNFR requests when the driver doesn't implement
+	// ClientDriverExtensionStrictRename
+	StrictRenameRequired
+)
+
+// ClientDriverExtensionStrictRename is an extension to implement to support strict
+// renames. Between RNFR and RNTO another connection can delete or replace the file
+// at the source path: with the legacy behavior the new object would be renamed
+// instead of the selected one. With this extension RNFR returns a token identifying
+// the selected object and RNTO atomically verifies and consumes it, so that only
+// the originally selected object is renamed: a matching path is not enough.
+type ClientDriverExtensionStrictRename interface {
+	// GetRenameToken returns an opaque token identifying the object currently
+	// available at name. The token must change if the object at name is deleted
+	// or replaced.
+	GetRenameToken(name string) (string, error)
+	// RenameWithToken atomically verifies that the object at "from" is still the
+	// one identified by the token returned by GetRenameToken, consumes the token
+	// and renames the object to "to". It must return an error wrapping
+	// ErrRenameTokenMismatch if the object at "from" is not the identified one.
+	RenameWithToken(from, to, token string) error
+}
+
 // AnswerCommand is a struct to answer a command to the client
 type AnswerCommand struct {
 	Code    int
@@ -385,4 +420,9 @@ type Settings struct {
 	// connected to, and clients and firewalls generally expect the data connection to come from
 	// that address. Only the address is taken from it, the port still follows ActiveTransferPortNon20.
 	ActiveTransferLocalIPResolver ActiveTransferLocalIPResolver
+	// StrictRename defines how RNFR/RNTO verify the identity of the renamed object.
+	// When enabled and supported by the driver (ClientDriverExtensionStrictRename),
+	// RNFR obtains an object identity token that RNTO atomically verifies and consumes,
+	// so a file replaced at the same path between the two commands is not renamed by mistake.
+	StrictRename StrictRenameRequirement
 }

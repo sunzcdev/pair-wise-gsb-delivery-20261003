@@ -361,23 +361,60 @@ func (c *clientHandler) handleDELE(param string) error {
 
 func (c *clientHandler) handleRNFR(param string) error {
 	path := c.absPath(param)
-	if _, err := c.driver.Stat(path); err == nil {
-		c.writeMessage(StatusFileActionPending, "Sure, give me a target")
-		c.ctxRnfr = path
-	} else {
+	if _, err := c.driver.Stat(path); err != nil {
 		c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Couldn't access %s: %v", path, err))
+
+		return nil
+	}
+
+	c.ctxRnfr = ""
+	c.ctxRnfrToken = ""
+	c.ctxRnfrStrict = false
+
+	if c.server.settings.StrictRename == StrictRenameDisabled || c.setupStrictRename(path) {
+		c.ctxRnfr = path
+		c.writeMessage(StatusFileActionPending, "Sure, give me a target")
 	}
 
 	return nil
+}
+
+// setupStrictRename obtains an identity token for the RNFR target. It returns
+// false (after replying to the client) when the strict rename cannot be set up.
+func (c *clientHandler) setupStrictRename(path string) bool {
+	ext, ok := c.driver.(ClientDriverExtensionStrictRename)
+	if !ok {
+		if c.server.settings.StrictRename == StrictRenameRequired {
+			c.writeMessage(StatusActionNotTaken, "Strict rename is required but not supported by the driver")
+
+			return false
+		}
+
+		return true
+	}
+
+	token, err := ext.GetRenameToken(path)
+	if err != nil {
+		c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Couldn't get a rename token for %s: %v", path, err))
+
+		return false
+	}
+
+	c.ctxRnfrToken = token
+	c.ctxRnfrStrict = true
+
+	return true
 }
 
 func (c *clientHandler) handleRNTO(param string) error {
 	dst := c.absPath(param)
 
 	if c.ctxRnfr != "" {
-		if err := c.driver.Rename(c.ctxRnfr, dst); err == nil {
+		if err := c.rename(c.ctxRnfr, dst); err == nil {
 			c.writeMessage(StatusFileOK, "Done !")
 			c.ctxRnfr = ""
+			c.ctxRnfrToken = ""
+			c.ctxRnfrStrict = false
 		} else {
 			c.writeMessage(getErrorCode(err, StatusActionNotTaken), fmt.Sprintf("Couldn't rename %s to %s: %s",
 				c.ctxRnfr, dst, err.Error()))
@@ -387,6 +424,16 @@ func (c *clientHandler) handleRNTO(param string) error {
 	}
 
 	return nil
+}
+
+func (c *clientHandler) rename(from, to string) error {
+	if c.ctxRnfrStrict {
+		if ext, ok := c.driver.(ClientDriverExtensionStrictRename); ok {
+			return ext.RenameWithToken(from, to, c.ctxRnfrToken)
+		}
+	}
+
+	return c.driver.Rename(from, to)
 }
 
 // properly handling the SIZE command when TYPE ASCII is used would

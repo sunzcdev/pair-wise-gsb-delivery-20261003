@@ -12,6 +12,10 @@ var (
 	// ErrFileNameNotAllowed defines the error mapped to the FTP 553 reply code.
 	// As for RFC 959 this error is checked for STOR, APPE, RNTO
 	ErrFileNameNotAllowed = errors.New("filename not allowed")
+	// ErrRenameTokenMismatch is returned by
+	// ClientDriverExtensionStrictRename.RenameWithToken when the object at the
+	// source path is not the one identified by the RNFR token anymore
+	ErrRenameTokenMismatch = errors.New("rename token mismatch")
 )
 
 func getErrorCode(err error, defaultCode int) int {

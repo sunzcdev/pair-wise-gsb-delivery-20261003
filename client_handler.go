@@ -99,6 +99,8 @@ type clientHandler struct {
 	clnt                string          // Identified client
 	command             string          // Command received on the connection
 	ctxRnfr             string          // Rename from
+	ctxRnfrToken        string          // Strict rename identity token
+	ctxRnfrStrict       bool            // Whether the pending rename is a strict one
 	logger              *slog.Logger    // Client handler logging
 	transferWg          sync.WaitGroup  // wait group for command that open a transfer connection
 	transfer            transferHandler // Transfer connection (passive or active)s

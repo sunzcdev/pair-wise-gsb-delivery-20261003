@@ -1,6 +1,7 @@
 package ftpserver
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -9,12 +10,15 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/secsy/goftp"
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -463,6 +467,262 @@ func TestRename(t *testing.T) {
 	rc, _, err := raw.SendCommand("RNTO file2")
 	require.NoError(t, err)
 	require.Equal(t, StatusBadCommandSequence, rc)
+}
+
+// strictRenameFs is a test ClientDriver implementing ClientDriverExtensionStrictRename.
+// It tracks a generation counter for each path: any operation creating, replacing
+// or deleting the object at a path bumps its generation, so a token obtained at
+// RNFR time identifies the exact object selected back then.
+type strictRenameFs struct {
+	afero.Fs
+	mu         sync.Mutex
+	generation uint64
+	objects    map[string]uint64 // cleaned path -> current object generation
+}
+
+func newStrictRenameFs(fs afero.Fs) *strictRenameFs {
+	return &strictRenameFs{Fs: fs, objects: make(map[string]uint64)}
+}
+
+// bump records that the object at name changed. The caller must hold the lock.
+func (fs *strictRenameFs) bump(name string) {
+	fs.generation++
+	fs.objects[path.Clean(name)] = fs.generation
+}
+
+// currentGeneration returns the generation of the object at name, assigning a
+// fresh one to never-seen paths. The caller must hold the lock.
+func (fs *strictRenameFs) currentGeneration(name string) uint64 {
+	name = path.Clean(name)
+	if gen, ok := fs.objects[name]; ok {
+		return gen
+	}
+
+	fs.bump(name)
+
+	return fs.generation
+}
+
+func (fs *strictRenameFs) bumpOnSuccess(name string, err error) error {
+	if err == nil {
+		fs.mu.Lock()
+		fs.bump(name)
+		fs.mu.Unlock()
+	}
+
+	return err
+}
+
+func (fs *strictRenameFs) Create(name string) (afero.File, error) {
+	file, err := fs.Fs.Create(name)
+
+	return file, fs.bumpOnSuccess(name, err)
+}
+
+func (fs *strictRenameFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	file, err := fs.Fs.OpenFile(name, flag, perm)
+	if flag&os.O_CREATE == 0 {
+		return file, err
+	}
+
+	return file, fs.bumpOnSuccess(name, err)
+}
+
+func (fs *strictRenameFs) Remove(name string) error {
+	return fs.bumpOnSuccess(name, fs.Fs.Remove(name))
+}
+
+func (fs *strictRenameFs) Rename(oldname, newname string) error {
+	if err := fs.Fs.Rename(oldname, newname); err != nil {
+		return err
+	}
+
+	fs.mu.Lock()
+	fs.bump(oldname)
+	fs.bump(newname)
+	fs.mu.Unlock()
+
+	return nil
+}
+
+// GetRenameToken implements ClientDriverExtensionStrictRename
+func (fs *strictRenameFs) GetRenameToken(name string) (string, error) {
+	if _, err := fs.Fs.Stat(name); err != nil {
+		return "", fmt.Errorf("couldn't stat %s: %w", name, err)
+	}
+
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	return strconv.FormatUint(fs.currentGeneration(name), 10), nil
+}
+
+// RenameWithToken implements ClientDriverExtensionStrictRename: the token
+// verification and the rename are performed atomically under the lock
+func (fs *strictRenameFs) RenameWithToken(from, to, token string) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	if strconv.FormatUint(fs.currentGeneration(from), 10) != token {
+		return fmt.Errorf("object at %s changed since RNFR: %w", from, ErrRenameTokenMismatch)
+	}
+
+	if err := fs.Fs.Rename(from, to); err != nil {
+		return fmt.Errorf("couldn't rename: %w", err)
+	}
+
+	fs.bump(from)
+	fs.bump(to)
+
+	return nil
+}
+
+func newStrictRenameTestServer(t *testing.T, requirement StrictRenameRequirement) *FtpServer {
+	t.Helper()
+
+	driver := &TestServerDriver{
+		Settings: &Settings{
+			DefaultTransferType: TransferTypeBinary,
+			StrictRename:        requirement,
+		},
+	}
+
+	var strictFs *strictRenameFs
+
+	driver.AuthProvider = func(user, pass string) (ClientDriver, error) {
+		if user != authUser || pass != authPass {
+			return nil, errBadUserNameOrPassword
+		}
+
+		if strictFs == nil {
+			strictFs = newStrictRenameFs(driver.fs)
+		}
+
+		return strictFs, nil
+	}
+
+	return NewTestServerWithTestDriver(t, driver)
+}
+
+func ftpDownloadString(t *testing.T, client *goftp.Client, filename string) string {
+	t.Helper()
+
+	var buf bytes.Buffer
+	require.NoError(t, client.Retrieve(filename, &buf))
+
+	return buf.String()
+}
+
+// TestStrictRename checks that a rename prepared with RNFR fails if another
+// session replaces the source object before RNTO: only the object selected by
+// RNFR may be renamed, a matching path is not enough.
+func TestStrictRename(t *testing.T) {
+	server := newStrictRenameTestServer(t, StrictRenameRequired)
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	clientA, err := goftp.DialConfig(conf, server.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientA.Close()) }()
+
+	clientB, err := goftp.DialConfig(conf, server.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientB.Close()) }()
+
+	// session A uploads the original object and selects it with RNFR
+	ftpUpload(t, clientA, strings.NewReader("original"), "file")
+
+	rawA, err := clientA.OpenRawConn()
+	require.NoError(t, err, "Couldn't open raw connection")
+
+	defer func() { require.NoError(t, rawA.Close()) }()
+
+	rc, _, err := rawA.SendCommand("RNFR file")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileActionPending, rc)
+
+	// session B replaces the object at the same path
+	require.NoError(t, clientB.Delete("file"))
+	ftpUpload(t, clientB, strings.NewReader("replacement"), "file")
+
+	// session A completes the rename: it must fail, the selected object is gone
+	rc, msg, err := rawA.SendCommand("RNTO target")
+	require.NoError(t, err)
+	require.Equal(t, StatusActionNotTaken, rc)
+	require.Contains(t, msg, ErrRenameTokenMismatch.Error())
+
+	// final state: the replacement object is untouched at the source path,
+	// the original object is gone and the target path was not created
+	require.Equal(t, "replacement", ftpDownloadString(t, clientB, "file"))
+
+	_, err = clientB.Stat("target")
+	require.Error(t, err, "the target path must not exist after the failed RNTO")
+
+	// a fresh strict rename of the replacement object succeeds
+	require.NoError(t, clientB.Rename("file", "target"))
+	require.Equal(t, "replacement", ftpDownloadString(t, clientB, "target"))
+
+	_, err = clientB.Stat("file")
+	require.Error(t, err, "the source path must be gone after the successful rename")
+}
+
+// TestStrictRenameDriverWithoutSupport checks the behavior when the driver
+// doesn't implement ClientDriverExtensionStrictRename: RNFR is rejected when
+// strict rename is required, and the legacy behavior is kept otherwise.
+func TestStrictRenameDriverWithoutSupport(t *testing.T) {
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	t.Run("required", func(t *testing.T) {
+		server := NewTestServerWithTestDriver(t, &TestServerDriver{
+			Settings: &Settings{
+				DefaultTransferType: TransferTypeBinary,
+				StrictRename:        StrictRenameRequired,
+			},
+		})
+
+		client, err := goftp.DialConfig(conf, server.Addr())
+		require.NoError(t, err, "Couldn't connect")
+
+		defer func() { panicOnError(client.Close()) }()
+
+		require.NoError(t, client.Store("file", strings.NewReader("content")))
+
+		raw, err := client.OpenRawConn()
+		require.NoError(t, err, "Couldn't open raw connection")
+
+		defer func() { require.NoError(t, raw.Close()) }()
+
+		rc, msg, err := raw.SendCommand("RNFR file")
+		require.NoError(t, err)
+		require.Equal(t, StatusActionNotTaken, rc)
+		require.Contains(t, msg, "not supported")
+	})
+
+	t.Run("fallback", func(t *testing.T) {
+		server := NewTestServerWithTestDriver(t, &TestServerDriver{
+			Settings: &Settings{
+				DefaultTransferType: TransferTypeBinary,
+				StrictRename:        StrictRenameIfSupported,
+			},
+		})
+
+		client, err := goftp.DialConfig(conf, server.Addr())
+		require.NoError(t, err, "Couldn't connect")
+
+		defer func() { panicOnError(client.Close()) }()
+
+		// the legacy path-based rename still works
+		ftpUpload(t, client, strings.NewReader("content"), "file")
+		require.NoError(t, client.Rename("file", "file2"))
+		require.Equal(t, "content", ftpDownloadString(t, client, "file2"))
+	})
 }
 
 func TestUploadErrorCodes(t *testing.T) {
