@@ -21,6 +21,7 @@ type Writer struct {
 	w  io.Writer
 	c  io.Closer
 	mw *textproto.MultipartWriter
+	cf *collisionFree
 }
 
 // createWriter creates a new Writer writing to w with the provided header.
@@ -89,11 +90,17 @@ func CreateWriter(w io.Writer, header Header) (*Writer, error) {
 
 // Write implements io.Writer.
 func (w *Writer) Write(b []byte) (int, error) {
+	if w.cf != nil {
+		return 0, errors.New("message: cannot write a raw multipart body in collision-free mode, use CreatePart")
+	}
 	return w.w.Write(b)
 }
 
 // Close implements io.Closer.
 func (w *Writer) Close() error {
+	if w.cf != nil {
+		return w.cf.finalize()
+	}
 	if w.c != nil {
 		return w.c.Close()
 	}
@@ -104,6 +111,9 @@ func (w *Writer) Close() error {
 // entity is not multipart, it fails. The body of the part should be written to
 // the returned io.WriteCloser.
 func (w *Writer) CreatePart(header Header) (*Writer, error) {
+	if w.cf != nil {
+		return w.cf.createPart(header)
+	}
 	if w.mw == nil {
 		return nil, errors.New("cannot create a part in a non-multipart message")
 	}
