@@ -47,6 +47,20 @@ type Config struct {
 	// and send a RST to the remote side.
 	StreamCloseTimeout time.Duration
 
+	// EnableShortMessages enables a session-scoped channel for complete,
+	// best-effort short messages. When a local queue is full, the oldest
+	// queued short message is dropped locally.
+	EnableShortMessages bool
+
+	// MaxShortMessageSize is the largest short message this side is willing
+	// to receive. A zero value uses the default when short messages are enabled.
+	MaxShortMessageSize uint32
+
+	// ShortMessageBacklog bounds both the number of messages waiting to be
+	// written and the number waiting to be delivered locally. A zero value
+	// uses the default when short messages are enabled.
+	ShortMessageBacklog int
+
 	// LogOutput is used to control the log destination. Either Logger or
 	// LogOutput can be set, not both.
 	LogOutput io.Writer
@@ -71,6 +85,8 @@ func DefaultConfig() *Config {
 		MaxStreamWindowSize:    initialStreamWindow,
 		StreamCloseTimeout:     5 * time.Minute,
 		StreamOpenTimeout:      75 * time.Second,
+		MaxShortMessageSize:    defaultMaxShortMessageSize,
+		ShortMessageBacklog:    defaultShortMessageBacklog,
 		LogOutput:              os.Stderr,
 	}
 }
@@ -85,6 +101,20 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.EnableShortMessages {
+		if config.MaxShortMessageSize == 0 {
+			config.MaxShortMessageSize = defaultMaxShortMessageSize
+		}
+		if config.ShortMessageBacklog == 0 {
+			config.ShortMessageBacklog = defaultShortMessageBacklog
+		}
+		if config.MaxShortMessageSize > maxNegotiatedShortMessageSize {
+			return fmt.Errorf("MaxShortMessageSize must not exceed %d", maxNegotiatedShortMessageSize)
+		}
+		if config.ShortMessageBacklog < 0 {
+			return fmt.Errorf("ShortMessageBacklog must be positive")
+		}
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

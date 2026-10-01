@@ -79,6 +79,14 @@ var (
 
 	// ErrKeepAliveTimeout is sent if a missed keepalive caused the stream close
 	ErrKeepAliveTimeout = fmt.Errorf("keepalive timeout")
+
+	// ErrShortMessagesUnsupported is returned when the peer did not enable
+	// short messages.
+	ErrShortMessagesUnsupported = fmt.Errorf("short messages unsupported")
+
+	// ErrShortMessageTooLarge is returned when a message exceeds the negotiated
+	// maximum length.
+	ErrShortMessageTooLarge = fmt.Errorf("short message too large")
 )
 
 const (
@@ -104,6 +112,13 @@ const (
 	// GoAway is sent to terminate a session. The StreamID
 	// should be 0 and the length is an error code.
 	typeGoAway
+
+	// typeShortCapabilities advertises the local short-message limits after
+	// extension support has been negotiated.
+	typeShortCapabilities
+
+	// typeShortMessage carries one complete short message.
+	typeShortMessage
 )
 
 const (
@@ -121,6 +136,9 @@ const (
 
 	// RST is used to hard close a given stream.
 	flagRST
+
+	// flagShortMessages marks a Ping as short-message capability negotiation.
+	flagShortMessages uint16 = 1 << 4
 )
 
 const (

@@ -17,6 +17,9 @@ Yamux features include:
   * Back-pressure to prevent overwhelming a receiver
 * Keep Alives
   * Enables persistent connections over a load balancer
+* Optional short messages
+  * Delivers complete, best-effort messages over bounded local queues
+  * Drops old queued messages locally without changing stream reliability
 * Efficient
   * Enables thousands of logical streams with low overhead
 
@@ -83,4 +86,3 @@ func server() {
 }
 
 ```
-

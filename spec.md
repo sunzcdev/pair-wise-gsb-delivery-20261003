@@ -42,6 +42,11 @@ message types are supported:
 
 * 0x3 Go Away - Used to close a session.
 
+* 0x4 Short Capabilities - Advertises the limits for the optional
+  short-message channel.
+
+* 0x5 Short Message - Carries exactly one complete short message.
+
 ## Flag Field
 
 The flags field is used to provide additional information related
@@ -58,6 +63,9 @@ to the message type. The following flags are supported:
 
 * 0x8 RST - Reset a stream immediately. May be sent with a data or
   window update message.
+
+* 0x10 Short Messages - Used on Ping messages to negotiate the optional
+  short-message channel.
 
 ## StreamID Field
 
@@ -76,6 +84,36 @@ The meaning of the length field depends on the message type:
 * Window update - provides a delta update to the window size
 * Ping - Contains an opaque value, echoed back
 * Go Away - Contains an error code
+* Short Capabilities - Contains a 32-bit maximum receive message size.
+* Short Message - provides the length of one complete message following the
+  header.
+
+# Short Messages
+
+Short messages are an optional session-scoped channel for small, current
+data such as position updates. They use StreamID 0 and are independent of
+stream flow control.
+
+Both sides enable the channel only after negotiation. Each side sends a Ping
+with the SYN and Short Messages flags using an otherwise normal Ping value.
+A supporting peer replies with the ACK and Short Messages flags and then sends
+a Short Capabilities frame. A peer without the extension replies with an
+ordinary Ping ACK, after which the sender leaves the channel disabled.
+
+Every Short Message frame contains one complete message. The receiver either
+delivers the complete payload to one application receive call or discards it
+locally. Messages are never split or partially delivered.
+
+Each side maintains bounded local send and receive queues. When either queue
+is full, the oldest queued local message is discarded to make room for the
+newer message. Discard counters are reported to the local caller. The
+underlying transport remains the assumed reliable byte stream; these drops
+describe only local queue overflow and do not introduce network loss.
+
+Regular stream, window update, Ping, and GoAway frames retain their existing
+reliable semantics. Regular frames are processed by the send loop ahead of
+queued short messages so short-message congestion cannot block control
+frames.
 
 # Message Flow
 

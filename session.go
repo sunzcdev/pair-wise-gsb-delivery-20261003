@@ -69,6 +69,19 @@ type Session struct {
 	// or to send a header out directly.
 	sendCh chan *sendReady
 
+	shortRecvCh    chan shortFrame
+	shortSendCh    chan shortFrame
+	shortSendLock  sync.Mutex
+	shortState     shortNegotiationState
+	shortStateLock sync.Mutex
+	remoteShortMax uint32
+	shortProbeID   uint32
+	shortRecvDrops uint64
+	shortSendDrops uint64
+	shortCapSent   int32
+	shortDoneCh    chan struct{}
+	shortClosed    bool
+
 	// recvDoneCh is closed when recv() exits to avoid a race
 	// between stream registration and stream shutdown
 	recvDoneCh chan struct{}
@@ -118,11 +131,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	} else {
 		s.nextStreamID = 2
 	}
+	s.initShortMessages()
 	go s.recv()
 	go s.send()
 	if config.EnableKeepAlive {
 		go s.keepalive()
 	}
+	s.startShortMessageProbe()
 	return s
 }
 
@@ -482,51 +497,78 @@ func (s *Session) sendLoop() error {
 	var bodyBuf bytes.Buffer
 	for {
 		bodyBuf.Reset()
+		var frame shortFrame
+		ready := (*sendReady)(nil)
 
 		select {
-		case ready := <-s.sendCh:
-			// Send a header if ready
-			if ready.Hdr != nil {
-				_, err := s.conn.Write(ready.Hdr)
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
+		case r := <-s.sendCh:
+			ready = r
+		default:
+			select {
+			case r := <-s.sendCh:
+				ready = r
+			case f := <-s.shortSendCh:
+				frame = f
+			case <-s.shutdownCh:
+				return nil
 			}
-
-			ready.mu.Lock()
-			if ready.Body != nil {
-				// Copy the body into the buffer to avoid
-				// holding a mutex lock during the write.
-				_, err := bodyBuf.Write(ready.Body)
-				if err != nil {
-					ready.Body = nil
-					ready.mu.Unlock()
-					s.logger.Printf("[ERR] yamux: Failed to copy body into buffer: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
-				ready.Body = nil
+		}
+		if ready != nil {
+			if err := s.writeReady(ready, &bodyBuf); err != nil {
+				return err
 			}
-			ready.mu.Unlock()
+			continue
+		}
 
-			if bodyBuf.Len() > 0 {
-				// Send data from a body if given
-				_, err := s.conn.Write(bodyBuf.Bytes())
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
-					return err
-				}
-			}
-
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
-		case <-s.shutdownCh:
-			return nil
+		bodyBuf.Write(frame.hdr)
+		bodyBuf.Write(frame.body)
+		if _, err := s.conn.Write(bodyBuf.Bytes()); err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write short message: %v", err)
+			return err
 		}
 	}
+}
+
+func (s *Session) writeReady(ready *sendReady, bodyBuf *bytes.Buffer) error {
+	// Send a header if ready
+	if ready.Hdr != nil {
+		_, err := s.conn.Write(ready.Hdr)
+		if err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+	}
+
+	ready.mu.Lock()
+	if ready.Body != nil {
+		// Copy the body into the buffer to avoid
+		// holding a mutex lock during the write.
+		_, err := bodyBuf.Write(ready.Body)
+		if err != nil {
+			ready.Body = nil
+			ready.mu.Unlock()
+			s.logger.Printf("[ERR] yamux: Failed to copy body into buffer: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+		ready.Body = nil
+	}
+	ready.mu.Unlock()
+
+	if bodyBuf.Len() > 0 {
+		// Send data from a body if given
+		_, err := s.conn.Write(bodyBuf.Bytes())
+		if err != nil {
+			s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+			asyncSendErr(ready.Err, err)
+			return err
+		}
+	}
+
+	// No error, successful send
+	asyncSendErr(ready.Err, nil)
+	return nil
 }
 
 // recv is a long running goroutine that accepts new data
@@ -539,10 +581,12 @@ func (s *Session) recv() {
 // Ensure that the index of the handler (typeData/typeWindowUpdate/etc) matches the message type
 var (
 	handlers = []func(*Session, header) error{
-		typeData:         (*Session).handleStreamMessage,
-		typeWindowUpdate: (*Session).handleStreamMessage,
-		typePing:         (*Session).handlePing,
-		typeGoAway:       (*Session).handleGoAway,
+		typeData:              (*Session).handleStreamMessage,
+		typeWindowUpdate:      (*Session).handleStreamMessage,
+		typePing:              (*Session).handlePing,
+		typeGoAway:            (*Session).handleGoAway,
+		typeShortCapabilities: (*Session).handleShortCapabilities,
+		typeShortMessage:      (*Session).handleShortMessage,
 	}
 )
 
@@ -566,7 +610,7 @@ func (s *Session) recvLoop() error {
 		}
 
 		mt := hdr.MsgType()
-		if mt < typeData || mt > typeGoAway {
+		if mt < typeData || mt > typeShortMessage {
 			return ErrInvalidMsgType
 		}
 
@@ -632,6 +676,20 @@ func (s *Session) handleStreamMessage(hdr header) error {
 func (s *Session) handlePing(hdr header) error {
 	flags := hdr.Flags()
 	pingID := hdr.Length()
+
+	if flags&flagShortMessages == flagShortMessages {
+		if flags&flagSYN == flagSYN {
+			s.handleShortProbe()
+		}
+		if flags&flagACK == flagACK {
+			s.handleShortProbeAck()
+		}
+		return nil
+	}
+	if s.config.EnableShortMessages && pingID == s.shortProbeID && flags&flagACK == flagACK {
+		s.finishShortNegotiation(shortUnsupported, 0)
+		return nil
+	}
 
 	// Check if this is a query, respond back in a separate context so we
 	// don't interfere with the receiving thread blocking for the write.
