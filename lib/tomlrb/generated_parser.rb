@@ -144,13 +144,13 @@ racc_reduce_table = [
   3, 30, :_reduce_17,
   1, 30, :_reduce_18,
   1, 30, :_reduce_19,
-  1, 33, :_reduce_none,
+  1, 33, :_reduce_20,
   1, 33, :_reduce_21,
-  1, 33, :_reduce_none,
-  1, 33, :_reduce_none,
-  1, 33, :_reduce_none,
-  1, 33, :_reduce_none,
-  1, 33, :_reduce_none,
+  1, 33, :_reduce_22,
+  1, 33, :_reduce_23,
+  1, 33, :_reduce_24,
+  1, 33, :_reduce_25,
+  1, 33, :_reduce_26,
   1, 33, :_reduce_27,
   1, 33, :_reduce_28,
   2, 28, :_reduce_none,
@@ -171,13 +171,13 @@ racc_reduce_table = [
   3, 42, :_reduce_44,
   1, 42, :_reduce_45,
   1, 42, :_reduce_46,
-  1, 41, :_reduce_none,
+  1, 41, :_reduce_47,
   1, 41, :_reduce_48,
-  1, 41, :_reduce_none,
-  1, 41, :_reduce_none,
-  1, 41, :_reduce_none,
-  1, 41, :_reduce_none,
-  1, 41, :_reduce_none,
+  1, 41, :_reduce_49,
+  1, 41, :_reduce_50,
+  1, 41, :_reduce_51,
+  1, 41, :_reduce_52,
+  1, 41, :_reduce_53,
   1, 41, :_reduce_54,
   1, 41, :_reduce_55,
   5, 43, :_reduce_none,
@@ -389,21 +389,21 @@ module_eval(<<'.,.,', 'parser.y', 26)
 
 module_eval(<<'.,.,', 'parser.y', 29)
   def _reduce_16(val, _values, result)
-     @handler.push(val[2])
+     @handler.push(key_part(val[2]))
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 30)
   def _reduce_17(val, _values, result)
-     val[2].split('.').each { |k| @handler.push(k) }
+     split_key_parts(val[2]).each { |k| @handler.push(k) }
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 32)
   def _reduce_18(val, _values, result)
-          keys = val[0].split('.')
+          keys = split_key_parts(val[0])
       @handler.start_(:table)
       keys.each { |key| @handler.push(key) }
 
@@ -413,40 +413,70 @@ module_eval(<<'.,.,', 'parser.y', 32)
 
 module_eval(<<'.,.,', 'parser.y', 36)
   def _reduce_19(val, _values, result)
-     @handler.push(val[0])
+     @handler.push(key_part(val[0]))
     result
   end
 .,.,
 
-# reduce 20 omitted
+module_eval(<<'.,.,', 'parser.y', 39)
+  def _reduce_20(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
 module_eval(<<'.,.,', 'parser.y', 40)
   def _reduce_21(val, _values, result)
-     result = StringUtils.replace_escaped_chars(val[0])
+     result = key_part(StringUtils.replace_escaped_chars(val[0]))
     result
   end
 .,.,
 
-# reduce 22 omitted
+module_eval(<<'.,.,', 'parser.y', 41)
+  def _reduce_22(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 23 omitted
+module_eval(<<'.,.,', 'parser.y', 42)
+  def _reduce_23(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 24 omitted
+module_eval(<<'.,.,', 'parser.y', 43)
+  def _reduce_24(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 25 omitted
+module_eval(<<'.,.,', 'parser.y', 44)
+  def _reduce_25(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 26 omitted
+module_eval(<<'.,.,', 'parser.y', 45)
+  def _reduce_26(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
 module_eval(<<'.,.,', 'parser.y', 46)
   def _reduce_27(val, _values, result)
-     result = val[0][0]
+     result = key_part(val[0][0])
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 47)
   def _reduce_28(val, _values, result)
-     result = val[0][0]
+     result = key_part(val[0][0])
     result
   end
 .,.,
@@ -488,7 +518,7 @@ module_eval(<<'.,.,', 'parser.y', 71)
 
 module_eval(<<'.,.,', 'parser.y', 77)
   def _reduce_37(val, _values, result)
-          @handler.push(val[2]) 
+          @handler.push(key_part(val[2])) 
 
     result
   end
@@ -496,14 +526,14 @@ module_eval(<<'.,.,', 'parser.y', 77)
 
 module_eval(<<'.,.,', 'parser.y', 79)
   def _reduce_38(val, _values, result)
-     val[2].split('.').each { |k| @handler.push(k) }
+     split_key_parts(val[2]).each { |k| @handler.push(k) }
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 81)
   def _reduce_39(val, _values, result)
-          keys = val[0].split('.')
+          keys = split_key_parts(val[0])
       @handler.start_(:inline_keys)
       keys.each { |key| @handler.push(key) }
 
@@ -514,7 +544,7 @@ module_eval(<<'.,.,', 'parser.y', 81)
 module_eval(<<'.,.,', 'parser.y', 86)
   def _reduce_40(val, _values, result)
           @handler.start_(:inline_keys) 
-      @handler.push(val[0]) 
+      @handler.push(key_part(val[0])) 
 
     result
   end
@@ -546,21 +576,21 @@ module_eval(<<'.,.,', 'parser.y', 99)
 
 module_eval(<<'.,.,', 'parser.y', 107)
   def _reduce_43(val, _values, result)
-     @handler.push(val[2])
+     @handler.push(key_part(val[2]))
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 108)
   def _reduce_44(val, _values, result)
-     val[2].split('.').each { |k| @handler.push(k) }
+     split_key_parts(val[2]).each { |k| @handler.push(k) }
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 110)
   def _reduce_45(val, _values, result)
-          keys = val[0].split('.')
+          keys = split_key_parts(val[0])
       @handler.start_(:keys)
       keys.each { |key| @handler.push(key) }
 
@@ -570,40 +600,70 @@ module_eval(<<'.,.,', 'parser.y', 110)
 
 module_eval(<<'.,.,', 'parser.y', 114)
   def _reduce_46(val, _values, result)
-     @handler.start_(:keys); @handler.push(val[0])
+     @handler.start_(:keys); @handler.push(key_part(val[0]))
     result
   end
 .,.,
 
-# reduce 47 omitted
+module_eval(<<'.,.,', 'parser.y', 117)
+  def _reduce_47(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
 module_eval(<<'.,.,', 'parser.y', 118)
   def _reduce_48(val, _values, result)
-     result = StringUtils.replace_escaped_chars(val[0])
+     result = key_part(StringUtils.replace_escaped_chars(val[0]))
     result
   end
 .,.,
 
-# reduce 49 omitted
+module_eval(<<'.,.,', 'parser.y', 119)
+  def _reduce_49(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 50 omitted
+module_eval(<<'.,.,', 'parser.y', 120)
+  def _reduce_50(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 51 omitted
+module_eval(<<'.,.,', 'parser.y', 121)
+  def _reduce_51(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 52 omitted
+module_eval(<<'.,.,', 'parser.y', 122)
+  def _reduce_52(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
-# reduce 53 omitted
+module_eval(<<'.,.,', 'parser.y', 123)
+  def _reduce_53(val, _values, result)
+     result = key_part(val[0])
+    result
+  end
+.,.,
 
 module_eval(<<'.,.,', 'parser.y', 124)
   def _reduce_54(val, _values, result)
-     result = val[0][0]
+     result = key_part(val[0][0])
     result
   end
 .,.,
 
 module_eval(<<'.,.,', 'parser.y', 125)
   def _reduce_55(val, _values, result)
-     result = val[0][0]
+     result = key_part(val[0][0])
     result
   end
 .,.,

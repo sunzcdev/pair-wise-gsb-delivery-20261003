@@ -3,6 +3,11 @@ require 'minitest_helper'
 describe Tomlrb::Key do
   subject { Tomlrb::Keys.new }
 
+  def part(name, line = nil, column = nil)
+    location = line.nil? ? nil : Tomlrb::Location.new(line, column)
+    Tomlrb::KeyPart.new(name, location)
+  end
+
   it 'can define a super-table afterward' do
     subject.add_table_key %w[x y z w]
     subject.add_table_key %w[x]
@@ -56,5 +61,50 @@ describe Tomlrb::Key do
     subject.add_pair_key %w[apple color], %w[fruit]
     subject.add_pair_key %w[apple taste sweet], %w[fruit]
    _{ subject.add_table_key %w[fruit apple taste] }.must_raise Tomlrb::Key::KeyConflict
+  end
+
+  it 'attaches the two sources of a duplicate pair declaration' do
+    subject.add_pair_key [part('a', 1, 1)], []
+    error = begin
+      subject.add_pair_key [part('a', 4, 1)], []
+      flunk 'expected KeyConflict'
+    rescue Tomlrb::Key::KeyConflict => conflict
+      conflict
+    end
+    _(error.key_name).must_equal 'a'
+    _(error.current.kind).must_equal :value
+    _(error.previous.kind).must_equal :value
+    _(error.current.location.line).must_equal 4
+    _(error.previous.location.line).must_equal 1
+  end
+
+  it 'reports an implicit parent table conflicting with a value' do
+    subject.add_pair_key [part('a', 1, 1), part('b', 1, 3)], []
+    error = begin
+      subject.add_pair_key [part('a', 2, 1), part('b', 2, 3), part('c', 2, 5)], []
+      flunk 'expected KeyConflict'
+    rescue Tomlrb::Key::KeyConflict => conflict
+      conflict
+    end
+    _(error.key_name).must_equal 'b'
+    _(error.current.kind).must_equal :implicit_table
+    _(error.previous.kind).must_equal :value
+  end
+
+  it 'isolates array-of-tables instances but flags duplicates inside one' do
+    subject.add_table_key [part('fruit', 1, 3)], true
+    subject.add_pair_key [part('name', 2, 1)], [part('fruit', 1, 3)]
+    subject.add_table_key [part('fruit', 3, 3)], true
+    subject.add_pair_key [part('name', 4, 1)], [part('fruit', 3, 3)]
+
+    error = begin
+      subject.add_pair_key [part('name', 5, 1)], [part('fruit', 3, 3)]
+      flunk 'expected KeyConflict'
+    rescue Tomlrb::Key::KeyConflict => conflict
+      conflict
+    end
+    _(error.key_name).must_equal 'name'
+    _(error.current.location.line).must_equal 5
+    _(error.previous.location.line).must_equal 4
   end
 end

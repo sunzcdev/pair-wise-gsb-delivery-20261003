@@ -19,13 +19,15 @@ module Tomlrb
         raise ParseError, 'Array needs a name'
       end
 
-      @current_table = identifiers.dup
-      @keys.add_table_key identifiers, is_array_of_tables
+      # TOML table headers always carry the full absolute path, so a new
+      # header replaces (rather than extends) the current table context.
+      @current_table = identifiers.map(&:dup)
+      @keys.add_table_key(@current_table.map(&:dup), is_array_of_tables)
       @current = @output
 
-      deal_with_array_of_tables(identifiers, is_array_of_tables) do |identifierz|
-        identifierz.each do |k|
-          k = k.to_sym if @symbolize_keys
+      name_identifiers = identifiers.map { |identifier| symbolize(identifier.name) }
+      deal_with_array_of_tables(name_identifiers, is_array_of_tables) do |table_names|
+        table_names.each do |k|
           if @current[k].is_a?(Array)
             @current = @current[k].last
           else
@@ -49,7 +51,6 @@ module Tomlrb
       yield(identifiers)
 
       if is_array_of_tables
-        last_identifier = last_identifier.to_sym if @symbolize_keys
         @current[last_identifier] ||= []
         raise ParseError, "Cannot use key #{last_identifier} for both table and array at once" unless @current[last_identifier].respond_to?(:<<)
         @current[last_identifier] << {}
@@ -58,10 +59,24 @@ module Tomlrb
     end
 
     def assign(k)
-      @keys.add_pair_key k, @current_table
+      terminal_kind = @stack.last.is_a?(InlineTable) ? :inline_table : :value
+      @keys.add_pair_key k, @current_table, terminal_kind
+
+      if @stack.last.is_a?(InlineTable)
+        inline = @stack.pop
+        inline.sources.each do |relative, source|
+          # Implicit parents are materialized while walking the terminal
+          # value entries, so only those terminals are declared.
+          next if source.kind == :implicit_table
+
+          @keys.declare_inline_entry(@current_table + k + parts_from_names(relative), source)
+        end
+        @stack.push(inline.to_h)
+      end
+
       current = @current
       while (key = k.shift)
-        key = key.to_sym if @symbolize_keys
+        key = symbolize(key.name)
         current = assign_key_path(current, key, k.empty?)
       end
     end
@@ -71,29 +86,52 @@ module Tomlrb
     end
 
     def push_inline(inline_arrays)
-      merged_inline = {}
-      keys = Keys.new
+      merged_inline = InlineTable.new
 
       inline_arrays.each do |inline_array|
-        current = merged_inline
-        value = inline_array.pop
-        keys.add_table_key inline_array, value.is_a?(Array)
+        key_parts = inline_array.dup
+        value = key_parts.pop
+        current = merged_inline.hash
 
-        inline_array.each_with_index do |inline_key, inline_index|
-          inline_key = inline_key.to_sym if @symbolize_keys
-          last_key = inline_index == inline_array.size - 1
+        nested = value.is_a?(InlineTable)
+        stored_value = nested ? value.to_h : value
+
+        key_parts.each_with_index do |part, index|
+          key = symbolize(part.name)
+          last_key = index == key_parts.size - 1
 
           if last_key
-            if current[inline_key].nil?
-              keys.add_pair_key [inline_key], []
-
-              current[inline_key] = value
-            else
-              raise Key::KeyConflict, "Inline key #{inline_key} is already used"
+            unless current[key].nil?
+              raise Key::KeyConflict.conflict(
+                part.name,
+                Source.new(nested ? :inline_table : :value, part.location),
+                merged_inline.source_for(key_parts.map(&:name))
+              )
+            end
+            current[key] = stored_value
+            merged_inline.add_source(
+              key_parts.map(&:name),
+              Source.new(nested ? :inline_table : :value, part.location)
+            )
+            if nested
+              value.sources.each do |relative, source|
+                merged_inline.add_source(key_parts[0...-1].map(&:name) + relative, source)
+              end
             end
           else
-            current[inline_key] ||= {}
-            current = current[inline_key]
+            if current.key?(key) && !current[key].is_a?(Hash)
+              raise Key::KeyConflict.conflict(
+                part.name,
+                Source.new(:implicit_table, part.location),
+                merged_inline.source_for(key_parts[0..index].map(&:name))
+              )
+            end
+            current[key] ||= {}
+            current = current[key]
+            merged_inline.add_source(
+              key_parts[0..index].map(&:name),
+              Source.new(:implicit_table, part.location)
+            )
           end
         end
       end
@@ -110,7 +148,7 @@ module Tomlrb
       while (value = @stack.pop) != [type]
         raise ParseError, 'Unclosed table' if @stack.empty?
 
-        array.unshift(value)
+        array.unshift(type == :array && value.is_a?(InlineTable) ? value.to_h : value)
       end
       array
     end
@@ -122,6 +160,14 @@ module Tomlrb
     end
 
     private
+
+    def symbolize(key)
+      @symbolize_keys ? key.to_sym : key
+    end
+
+    def parts_from_names(names)
+      names.map { |name| KeyPart.new(name, nil) }
+    end
 
     def assign_key_path(current, key, key_emptied)
       existed = current.key?(key)
@@ -139,89 +185,135 @@ module Tomlrb
     end
   end
 
+  # Carries the ordered source information of an inline table while it is
+  # being assembled, so entries can be registered against the global key tree
+  # once the assignment consuming the inline table is complete.
+  class InlineTable
+    attr_reader :hash, :sources
+
+    def initialize
+      @hash = {}
+      # Array of [path_names, Source], kept in declaration order.
+      @sources = []
+    end
+
+    def add_source(names, source)
+      @sources.reject! { |path, _| path == names }
+      @sources << [names, source]
+    end
+
+    def source_for(names)
+      found = @sources.assoc(names)
+      found && found[1]
+    end
+
+    def to_h
+      @hash
+    end
+  end
+
   class Keys
     def initialize
       @keys = {}
     end
 
     def add_table_key(keys, is_array_of_tables = false)
-      self << [keys, [], is_array_of_tables]
+      declare(keys, [], :explicit_table, is_array_of_tables, explicit_header: true)
     end
 
-    def add_pair_key(keys, context)
-      self << [context, keys, false]
+    def add_pair_key(keys, context, terminal_kind = :value)
+      declare(context, keys, terminal_kind, false, explicit_header: false)
     end
 
-    def <<(keys)
-      table_keys, pair_keys, is_array_of_tables = keys
-      current = @keys
-      current = append_table_keys(current, table_keys, pair_keys.empty?, is_array_of_tables)
-      append_pair_keys(current, pair_keys, table_keys.empty?, is_array_of_tables)
+    # Registers a flattened entry coming from a closed inline table.
+    def declare_inline_entry(parts, source)
+      declare([], parts, source.kind, false, source, from_inline: true)
     end
 
     private
 
-    def append_table_keys(current, table_keys, pair_keys_empty, is_array_of_tables)
-      table_keys.each_with_index do |key, index|
-        declared = (index == table_keys.length - 1) && pair_keys_empty
-        if index.zero?
-          current = find_or_create_first_table_key(current, key, declared, is_array_of_tables)
+    # +context+      : KeyParts of the enclosing table header (may be empty)
+    # +keys+         : KeyParts of the declared path relative to the context
+    # +terminal_kind+ only describes the last component of +keys+
+    def declare(context, keys, terminal_kind, is_array_of_tables, forced_source = nil,
+                explicit_header: false, from_inline: false)
+      path = normalize_parts(context) + normalize_parts(keys)
+      path.each_with_index.inject(@keys) do |nodes, (part, index)|
+        terminal = index == path.length - 1
+        kind = terminal ? terminal_kind : :implicit_table
+        source = forced_source if terminal && forced_source
+        source ||= Source.new(kind, part.location || Location.new(nil, nil))
+
+        node = nodes[part.name]
+        if node
+          node.declare(kind, source, terminal, is_array_of_tables, from_inline)
         else
-          current <<= [key, :table, declared, is_array_of_tables]
+          # An intermediate table component is later promotable to an
+          # explicit header only when it was created by another explicit
+          # header, or by a dotted key at the document root.
+          promotable_later =
+            if terminal
+              false
+            elsif explicit_header
+              true
+            else
+              # The first component of a dotted key at the document root is
+              # allowed to be defined as a super-table later on; components
+              # created inside an already open table are not.
+              context.empty? && index.zero?
+            end
+          node = Key.new(
+            part.name,
+            kind == :value ? :pair : :table,
+            terminal,
+            source,
+            kind,
+            promotable_later: promotable_later
+          )
+          node.clear_children if is_array_of_tables && terminal
+          nodes[part.name] = node
         end
-      end
-
-      current.clear_children if is_array_of_tables
-      current
-    end
-
-    def find_or_create_first_table_key(current, key, declared, is_array_of_tables)
-      existed = current[key]
-      if existed && existed.type == :pair
-        raise Key::KeyConflict, "Key #{key} is already used as #{existed.type} key"
-      end
-      if existed && existed.declared? && declared && ! is_array_of_tables
-        raise Key::KeyConflict, "Key #{key} is already used"
-      end
-      k = existed || Key.new(key, :table, declared)
-      k.declared = k.declared? || declared
-      current[key] = k
-      k
-    end
-
-    def append_pair_keys(current, pair_keys, table_keys_empty, is_array_of_tables)
-      pair_keys.each_with_index do |key, index|
-        declared = index == pair_keys.length - 1
-        if index.zero? && table_keys_empty
-          current = find_or_create_first_pair_key(current, key, declared, table_keys_empty)
-        else
-          key = current << [key, :pair, declared, is_array_of_tables]
-          current = key
-        end
+        node.children
       end
     end
 
-    def find_or_create_first_pair_key(current, key, declared, table_keys_empty)
-      existed = current[key]
-      if existed && (existed.type == :pair) && declared && table_keys_empty
-        raise Key::KeyConflict, "Key #{key} is already used"
+    def normalize_parts(parts)
+      parts.map do |part|
+        part.is_a?(KeyPart) ? part : KeyPart.new(part, nil)
       end
-      k = Key.new(key, :pair, declared)
-      current[key] = k
-      k
     end
   end
 
   class Key
-    class KeyConflict < ParseError; end
+    class KeyConflict < ParseError
+      attr_reader :key_name, :current, :previous
 
-    attr_reader :key, :type
-    attr_writer :declared
+      def self.conflict(key_name, current_source, previous_source)
+        new(build_message(key_name, current_source, previous_source), key_name, current_source, previous_source)
+      end
 
-    def initialize(key, type, declared = false)
+      def self.build_message(key_name, current_source, previous_source)
+        "Key #{key_name.inspect} is already used: " \
+          "redeclared as #{current_source}, but was previously declared as #{previous_source}"
+      end
+
+      def initialize(message, key_name = nil, current_source = nil, previous_source = nil)
+        super(message)
+        @key_name = key_name
+        @current = current_source
+        @previous = previous_source
+      end
+    end
+
+    attr_reader :key, :type, :source, :children, :kind
+
+    def initialize(key, type, declared = false, source = nil, kind = nil, promotable_later: false)
       @key = key
       @type = type
       @declared = declared
+      @source = source
+      @kind = kind
+      @promotable_later = promotable_later
       @children = {}
     end
 
@@ -229,51 +321,68 @@ module Tomlrb
       @declared
     end
 
-    def <<(key_type_declared)
-      key, type, declared, is_array_of_tables = key_type_declared
-      existed = @children[key]
-      validate_already_declared_as_different_key(type, declared, existed)
-      validate_already_declared_as_non_array_table(type, is_array_of_tables, declared, existed)
-      validate_path_already_created_as_different_type(type, declared, existed)
-      validate_path_already_declared_as_different_type(type, declared, existed)
-      validate_already_declared_as_same_key(declared, existed)
-      @children[key] = existed || self.class.new(key, type, declared)
-    end
-
     def clear_children
       @children.clear
     end
 
+    # Applies an incoming declaration to this node.
+    def declare(kind, source, terminal, is_array_of_tables, traversing_inline = false)
+      incoming_type = kind == :value ? :pair : :table
+
+      if terminal
+        declare_terminal(kind, incoming_type, source, is_array_of_tables)
+      else
+        # Parent components of inline-table entries are already established
+        # by other entries (or by the inline table value itself), so a
+        # shared implicit parent is merely traversed.
+        if traversing_inline && @type == :table
+          return
+        end
+
+        declare_intermediate(kind, source)
+      end
+    end
+
     private
 
-    def validate_already_declared_as_different_key(type, _declared, existed)
-      if existed && existed.declared? && existed.type != type
-        raise KeyConflict, "Key #{existed.key} is already used as #{existed.type} key"
-      end
+    def declare_intermediate(_kind, source)
+      # An existing value or closed inline table can never become a parent
+      # table for new keys; an existing (open) table can.
+      return if @type == :table && @kind != :inline_table
+
+      raise KeyConflict.conflict(@key, source, @source)
     end
 
-    def validate_already_declared_as_non_array_table(type, is_array_of_tables, declared, existed)
-      if declared && type == :table && existed && existed.declared? && !is_array_of_tables
-        raise KeyConflict, "Key #{existed.key} is already used"
+    def declare_terminal(kind, incoming_type, source, is_array_of_tables)
+      # A fresh array-of-tables instance reuses the same header node but
+      # starts a new subtree, so its own keys must not clash with previous
+      # instances.
+      if is_array_of_tables && @kind == :explicit_table && @type == :table
+        @source = source
+        clear_children
+        return
       end
-    end
 
-    def validate_path_already_created_as_different_type(type, declared, existed)
-      if declared && (type == :table) && existed && (existed.type == :pair) && !existed.declared?
-        raise KeyConflict, "Key #{existed.key} is already used as #{existed.type} key"
+      if incoming_type != @type
+        raise KeyConflict.conflict(@key, source, @source)
       end
-    end
 
-    def validate_path_already_declared_as_different_type(type, declared, existed)
-      if !declared && (type == :pair) && existed && (existed.type == :pair) && existed.declared?
-        raise KeyConflict, "Key #{key} is already used as #{type} key"
+      # Once closed, an inline table can neither be extended nor reused.
+      if @kind == :inline_table || kind == :inline_table
+        raise KeyConflict.conflict(@key, source, @source)
       end
-    end
 
-    def validate_already_declared_as_same_key(declared, existed)
-      if existed && !existed.declared? && declared
-        raise KeyConflict, "Key #{existed.key} is already used as #{existed.type} key"
+      # An implicit parent table created by a dotted key may be promoted to
+      # an explicit table header later on, but only while it is still
+      # implicit.
+      promotable = !@declared && @promotable_later && kind == :explicit_table
+      if @declared || !promotable
+        raise KeyConflict.conflict(@key, source, @source)
       end
+
+      @declared = true
+      @kind = kind
+      @source = source
     end
   end
 end

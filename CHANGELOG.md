@@ -1,3 +1,12 @@
+### Unreleased
+
+* Attach structured source information (line, column and declaration kind)
+  to key declarations. `Tomlrb::Key::KeyConflict` now exposes the current and
+  the previous declaration source, distinguishing values, explicit tables,
+  implicit parent tables and closed inline tables. Conflicts correctly follow
+  the parsed paths, so `a.b` and `"a.b"` are separate keys and identical keys
+  in different array-of-tables instances no longer clash.
+
 ### 2.0.4 - 2025-12-18
 
 * Update Racc to v1.8.1

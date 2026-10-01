@@ -44,30 +44,81 @@ module Tomlrb
     def initialize(io)
       @ss = StringScanner.new(io.read)
       @eos = false
+      @line = 1
+      @line_start_pos = 0
+      @location = Location.new(1, 1)
     end
 
+    attr_reader :location
+
     def next_token
+      start_pos = @ss.pos
+      start_line = @line
+      start_column = start_pos - @line_start_pos + 1
       case
-      when @ss.scan(NEWLINE) then [:NEWLINE, nil]
-      when @ss.scan(SPACED_ARRAY_OF_TABLES_START) then raise ParseError.new('Array of tables has spaces in starting brackets')
-      when @ss.scan(SPACED_ARRAY_OF_TABLES_END) then raise ParseError.new('Array of tables has spaces in ending brackets')
-      when @ss.scan(SPACED_ARRAY_OF_TABLES_BOTH) then raise ParseError.new('Array of tables has spaces in starting and ending brackets')
-      when @ss.scan(SPACE) then next_token
-      when @ss.scan(COMMENT) then next_token
-      when @ss.scan(DATETIME) then process_datetime
-      when @ss.scan(LOCAL_TIME) then process_local_time
-      when text = @ss.scan(STRING_MULTI) then [:STRING_MULTI, text[3..-4]]
-      when text = @ss.scan(STRING_BASIC) then [:STRING_BASIC, text[1..-2]]
-      when text = @ss.scan(STRING_LITERAL_MULTI) then [:STRING_LITERAL_MULTI, text[3..-4]]
-      when text = @ss.scan(STRING_LITERAL) then [:STRING_LITERAL, text[1..-2]]
-      when text = @ss.scan(FLOAT) then [:FLOAT, text]
-      when text = @ss.scan(FLOAT_KEYWORD) then [:FLOAT_KEYWORD, text]
-      when text = @ss.scan(INTEGER) then [:INTEGER, text]
-      when text = @ss.scan(NON_DEC_INTEGER) then [:NON_DEC_INTEGER, text]
-      when text = @ss.scan(BOOLEAN) then [:BOOLEAN, text]
-      when text = @ss.scan(IDENTIFIER) then [:IDENTIFIER, text]
-      when @ss.eos? then process_eos
-      else x = @ss.getch; [x, x]
+      when @ss.scan(NEWLINE)
+        update_location(@ss[0], start_pos)
+        [:NEWLINE, nil]
+      when @ss.scan(SPACED_ARRAY_OF_TABLES_START)
+        update_location(@ss[0], start_pos)
+        raise ParseError.new('Array of tables has spaces in starting brackets')
+      when @ss.scan(SPACED_ARRAY_OF_TABLES_END)
+        update_location(@ss[0], start_pos)
+        raise ParseError.new('Array of tables has spaces in ending brackets')
+      when @ss.scan(SPACED_ARRAY_OF_TABLES_BOTH)
+        update_location(@ss[0], start_pos)
+        raise ParseError.new('Array of tables has spaces in starting and ending brackets')
+      when @ss.scan(SPACE)
+        update_location(@ss[0], start_pos)
+        next_token
+      when @ss.scan(COMMENT)
+        update_location(@ss[0], start_pos)
+        next_token
+      when @ss.scan(DATETIME)
+        @location = Location.new(start_line, start_column)
+        process_datetime
+      when @ss.scan(LOCAL_TIME)
+        @location = Location.new(start_line, start_column)
+        process_local_time
+      when text = @ss.scan(STRING_MULTI)
+        @location = Location.new(start_line, start_column)
+        update_location(text, start_pos)
+        [:STRING_MULTI, text[3..-4]]
+      when text = @ss.scan(STRING_BASIC)
+        @location = Location.new(start_line, start_column)
+        [:STRING_BASIC, text[1..-2]]
+      when text = @ss.scan(STRING_LITERAL_MULTI)
+        @location = Location.new(start_line, start_column)
+        update_location(text, start_pos)
+        [:STRING_LITERAL_MULTI, text[3..-4]]
+      when text = @ss.scan(STRING_LITERAL)
+        @location = Location.new(start_line, start_column)
+        [:STRING_LITERAL, text[1..-2]]
+      when text = @ss.scan(FLOAT)
+        @location = Location.new(start_line, start_column)
+        [:FLOAT, text]
+      when text = @ss.scan(FLOAT_KEYWORD)
+        @location = Location.new(start_line, start_column)
+        [:FLOAT_KEYWORD, text]
+      when text = @ss.scan(INTEGER)
+        @location = Location.new(start_line, start_column)
+        [:INTEGER, text]
+      when text = @ss.scan(NON_DEC_INTEGER)
+        @location = Location.new(start_line, start_column)
+        [:NON_DEC_INTEGER, text]
+      when text = @ss.scan(BOOLEAN)
+        @location = Location.new(start_line, start_column)
+        [:BOOLEAN, text]
+      when text = @ss.scan(IDENTIFIER)
+        @location = Location.new(start_line, start_column)
+        [:IDENTIFIER, text]
+      when @ss.eos?
+        process_eos
+      else
+        x = @ss.getch
+        @location = Location.new(start_line, start_column)
+        update_location(x, start_pos)
+        [x, x]
       end
     end
 
@@ -87,6 +138,16 @@ module Tomlrb
 
       @eos = true
       [:EOS, nil]
+    end
+
+    private
+
+    def update_location(matched, start_pos)
+      newline_count = matched.count("\n")
+      unless newline_count.zero?
+        @line += newline_count
+        @line_start_pos = start_pos + matched.rindex("\n") + 1
+      end
     end
   end
 end

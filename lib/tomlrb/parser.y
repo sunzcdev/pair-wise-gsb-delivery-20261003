@@ -27,26 +27,26 @@ rule
     | ']' { array = @handler.end_(:table); @handler.set_context(array) }
     ;
   table_identifier
-    : table_identifier '.' table_identifier_component { @handler.push(val[2]) }
-    | table_identifier '.' FLOAT { val[2].split('.').each { |k| @handler.push(k) } }
+    : table_identifier '.' table_identifier_component { @handler.push(key_part(val[2])) }
+    | table_identifier '.' FLOAT { split_key_parts(val[2]).each { |k| @handler.push(k) } }
     | FLOAT {
-      keys = val[0].split('.')
+      keys = split_key_parts(val[0])
       @handler.start_(:table)
       keys.each { |key| @handler.push(key) }
     }
-    | table_identifier_component { @handler.push(val[0]) }
-    ;
+    | table_identifier_component { @handler.push(key_part(val[0])) }
+  ;
   table_identifier_component
-    : IDENTIFIER
-    | STRING_BASIC { result = StringUtils.replace_escaped_chars(val[0]) }
-    | STRING_LITERAL
-    | INTEGER
-    | NON_DEC_INTEGER
-    | FLOAT_KEYWORD
-    | BOOLEAN
-    | DATETIME { result = val[0][0] }
-    | LOCAL_TIME { result = val[0][0] }
-    ;
+    : IDENTIFIER { result = key_part(val[0]) }
+    | STRING_BASIC { result = key_part(StringUtils.replace_escaped_chars(val[0])) }
+    | STRING_LITERAL { result = key_part(val[0]) }
+    | INTEGER { result = key_part(val[0]) }
+    | NON_DEC_INTEGER { result = key_part(val[0]) }
+    | FLOAT_KEYWORD { result = key_part(val[0]) }
+    | BOOLEAN { result = key_part(val[0]) }
+    | DATETIME { result = key_part(val[0][0]) }
+    | LOCAL_TIME { result = key_part(val[0][0]) }
+  ;
   inline_table
     : inline_table_start inline_table_end
     | inline_table_start inline_continued inline_table_end
@@ -75,19 +75,19 @@ rule
     ;
   inline_assignment_key
     : inline_assignment_key '.' assignment_key_component { 
-      @handler.push(val[2]) 
+      @handler.push(key_part(val[2])) 
     }
-    | inline_assignment_key '.' FLOAT { val[2].split('.').each { |k| @handler.push(k) } }
+    | inline_assignment_key '.' FLOAT { split_key_parts(val[2]).each { |k| @handler.push(k) } }
     | FLOAT {
-      keys = val[0].split('.')
+      keys = split_key_parts(val[0])
       @handler.start_(:inline_keys)
       keys.each { |key| @handler.push(key) }
     }
     | assignment_key_component { 
       @handler.start_(:inline_keys) 
-      @handler.push(val[0]) 
+      @handler.push(key_part(val[0])) 
     }
-    ;
+  ;
   assignment
     : assignment_key '=' value EOS {
       keys = @handler.end_(:keys)
@@ -105,26 +105,26 @@ rule
     }
     ;
   assignment_key
-    : assignment_key '.' assignment_key_component { @handler.push(val[2]) }
-    | assignment_key '.' FLOAT { val[2].split('.').each { |k| @handler.push(k) } }
+    : assignment_key '.' assignment_key_component { @handler.push(key_part(val[2])) }
+    | assignment_key '.' FLOAT { split_key_parts(val[2]).each { |k| @handler.push(k) } }
     | FLOAT {
-      keys = val[0].split('.')
+      keys = split_key_parts(val[0])
       @handler.start_(:keys)
       keys.each { |key| @handler.push(key) }
     }
-    | assignment_key_component { @handler.start_(:keys); @handler.push(val[0]) }
-    ;
+    | assignment_key_component { @handler.start_(:keys); @handler.push(key_part(val[0])) }
+  ;
   assignment_key_component
-    : IDENTIFIER
-    | STRING_BASIC { result = StringUtils.replace_escaped_chars(val[0]) }
-    | STRING_LITERAL
-    | INTEGER
-    | NON_DEC_INTEGER
-    | FLOAT_KEYWORD
-    | BOOLEAN
-    | DATETIME { result = val[0][0] }
-    | LOCAL_TIME { result = val[0][0] }
-    ;
+    : IDENTIFIER { result = key_part(val[0]) }
+    | STRING_BASIC { result = key_part(StringUtils.replace_escaped_chars(val[0])) }
+    | STRING_LITERAL { result = key_part(val[0]) }
+    | INTEGER { result = key_part(val[0]) }
+    | NON_DEC_INTEGER { result = key_part(val[0]) }
+    | FLOAT_KEYWORD { result = key_part(val[0]) }
+    | BOOLEAN { result = key_part(val[0]) }
+    | DATETIME { result = key_part(val[0][0]) }
+    | LOCAL_TIME { result = key_part(val[0][0]) }
+  ;
   array
     : start_array array_first_value array_values comma end_array
     | start_array array_first_value array_values end_array
