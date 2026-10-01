@@ -45,6 +45,7 @@ module Rack
   autoload :NotFound,                   "rack/contrib/not_found"
   autoload :ResponseCache,              "rack/contrib/response_cache"
   autoload :RelativeRedirect,           "rack/contrib/relative_redirect"
+  autoload :RouteExceptions,            "rack/contrib/route_exceptions"
   autoload :StaticCache,                "rack/contrib/static_cache"
   autoload :TryStatic,                  "rack/contrib/try_static"
   autoload :Printout,                   "rack/contrib/printout"
