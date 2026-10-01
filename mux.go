@@ -33,6 +33,22 @@ type Config struct {
 	// window size that we allow for a stream.
 	MaxStreamWindowSize uint32
 
+	// MaxSessionWindowSize bounds the total receive memory the session is
+	// willing to commit across all streams. The commitment counts both data
+	// already received and buffered for an application, and receive credit
+	// that has been advertised to the peer (initial stream windows and window
+	// updates) but not yet consumed by application reads.
+	//
+	// MaxStreamWindowSize only bounds a single stream: a peer that keeps
+	// opening well-behaved streams could otherwise force the session to
+	// commit MaxStreamWindowSize bytes per stream. This limit is enforced
+	// while opening streams and growing windows, never by discarding data
+	// that arrived within advertised credit.
+	//
+	// A zero value disables the session level limit for backwards
+	// compatibility, leaving receive memory bounded only per stream.
+	MaxSessionWindowSize uint32
+
 	// StreamOpenTimeout is the maximum amount of time that a stream will
 	// be allowed to remain in pending state while waiting for an ack from the peer.
 	// Once the timeout is reached the session will be gracefully closed.
@@ -69,6 +85,7 @@ func DefaultConfig() *Config {
 		KeepAliveInterval:      30 * time.Second,
 		ConnectionWriteTimeout: 10 * time.Second,
 		MaxStreamWindowSize:    initialStreamWindow,
+		MaxSessionWindowSize:   0,
 		StreamCloseTimeout:     5 * time.Minute,
 		StreamOpenTimeout:      75 * time.Second,
 		LogOutput:              os.Stderr,
@@ -85,6 +102,9 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.MaxSessionWindowSize != 0 && config.MaxSessionWindowSize < initialStreamWindow {
+		return fmt.Errorf("MaxSessionWindowSize must be larger than %d", initialStreamWindow)
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

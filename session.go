@@ -57,6 +57,12 @@ type Session struct {
 	inflight   map[uint32]struct{}
 	streamLock sync.Mutex
 
+	// recvBudget bounds the total receive memory committed across every
+	// stream of the session. It accounts for buffered data and advertised
+	// but unconsumed receive credit. A nil/disabled budget imposes no
+	// session level limit.
+	recvBudget *recvBudget
+
 	// synCh acts like a semaphore. It is sized to the AcceptBacklog which
 	// is assumed to be symmetric between the client and server. This allows
 	// the client to avoid exceeding the backlog and instead blocks the open.
@@ -106,6 +112,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		pings:      make(map[uint32]chan struct{}),
 		streams:    make(map[uint32]*Stream),
 		inflight:   make(map[uint32]struct{}),
+		recvBudget: newRecvBudget(config.MaxSessionWindowSize),
 		synCh:      make(chan struct{}, config.AcceptBacklog),
 		acceptCh:   make(chan *Stream, config.AcceptBacklog),
 		sendCh:     make(chan *sendReady, 64),
@@ -175,10 +182,32 @@ func (s *Session) OpenStream() (*Stream, error) {
 		return nil, ErrSessionShutdown
 	}
 
+	// Reserve the initial receive window against the session budget before
+	// advertising it to the peer. This may block until streams close or the
+	// application drains existing streams. The reservation is made before
+	// stream registration so a failed open cannot leak committed credit.
+	if grant := s.recvBudget.tryAcquire(initialStreamWindow, s.shutdownCh); grant != initialStreamWindow {
+		select {
+		case <-s.synCh:
+		default:
+			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+		}
+		if grant > 0 {
+			s.recvBudget.release(grant)
+		}
+		return nil, ErrSessionShutdown
+	}
+
 GET_ID:
 	// Get an ID, and check for stream exhaustion
 	id := atomic.LoadUint32(&s.nextStreamID)
 	if id >= math.MaxUint32-1 {
+		select {
+		case <-s.synCh:
+		default:
+			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+		}
+		s.recvBudget.release(initialStreamWindow)
 		return nil, ErrStreamsExhausted
 	}
 	if !atomic.CompareAndSwapUint32(&s.nextStreamID, id, id+2) {
@@ -187,6 +216,7 @@ GET_ID:
 
 	// Register the stream
 	stream := newStream(s, id, streamInit)
+	stream.recvCommitted = initialStreamWindow
 	s.streamLock.Lock()
 	s.streams[id] = stream
 	s.inflight[id] = struct{}{}
@@ -203,6 +233,11 @@ GET_ID:
 		default:
 			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
 		}
+		s.streamLock.Lock()
+		delete(s.streams, id)
+		delete(s.inflight, id)
+		s.streamLock.Unlock()
+		stream.releaseRecvBudget()
 		return nil, err
 	}
 	return stream, nil
@@ -287,6 +322,7 @@ func (s *Session) Close() error {
 	s.shutdownErrLock.Unlock()
 
 	close(s.shutdownCh)
+	s.recvBudget.shutdown()
 
 	_ = s.conn.Close()
 	<-s.recvDoneCh
@@ -685,8 +721,24 @@ func (s *Session) incomingStream(id uint32) error {
 		return s.sendNoWait(hdr)
 	}
 
+	// Reject immediately if the session cannot commit the initial receive
+	// window. The receive loop must never block waiting for credit: doing so
+	// would stall every control frame (window updates, pings, FIN/RST) that
+	// is required to release budget. Resetting the stream is safe because no
+	// data has been accepted yet, and the peer may retry or use another stream.
+	if grant := s.recvBudget.tryAcquireNonBlocking(initialStreamWindow); grant != initialStreamWindow {
+		if grant > 0 {
+			s.recvBudget.release(grant)
+		}
+		s.logger.Printf("[WARN] yamux: session receive budget exhausted, resetting stream: %d", id)
+		hdr := header(make([]byte, headerSize))
+		hdr.encode(typeWindowUpdate, flagRST, id, 0)
+		return s.sendNoWait(hdr)
+	}
+
 	// Allocate a new stream
 	stream := newStream(s, id, streamSYNReceived)
+	stream.recvCommitted = initialStreamWindow
 
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
@@ -697,6 +749,7 @@ func (s *Session) incomingStream(id uint32) error {
 		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
+		stream.releaseRecvBudget()
 		return ErrDuplicateStream
 	}
 
@@ -711,6 +764,7 @@ func (s *Session) incomingStream(id uint32) error {
 		// Backlog exceeded! RST the stream
 		s.logger.Printf("[WARN] yamux: backlog exceeded, forcing connection reset")
 		delete(s.streams, id)
+		stream.releaseRecvBudget()
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typeWindowUpdate, flagRST, id, 0)
 		return s.sendNoWait(hdr)
@@ -722,6 +776,7 @@ func (s *Session) incomingStream(id uint32) error {
 // was not yet established, then this will give the credit back.
 func (s *Session) closeStream(id uint32) {
 	s.streamLock.Lock()
+	stream := s.streams[id]
 	if _, ok := s.inflight[id]; ok {
 		select {
 		case <-s.synCh:
@@ -731,6 +786,12 @@ func (s *Session) closeStream(id uint32) {
 	}
 	delete(s.streams, id)
 	s.streamLock.Unlock()
+
+	// Return all receive memory this stream still committed (buffered data
+	// plus advertised but unconsumed credit) so blocked opens can proceed.
+	if stream != nil {
+		stream.releaseRecvBudget()
+	}
 }
 
 // establishStream is used to mark a stream that was in the

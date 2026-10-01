@@ -42,6 +42,15 @@ type Stream struct {
 	recvBuf  *bytes.Buffer
 	recvLock sync.Mutex
 
+	// recvCommitted tracks receive memory committed for this stream against
+	// the session budget: bytes buffered in recvBuf plus receive credit
+	// advertised to the peer (recvWindow) that the peer may still consume.
+	// The field is accounted under the session budget lock, but updates are
+	// serialized by recvLock. releaseRecvBudget returns the outstanding
+	// commitment exactly once when the stream is torn down.
+	recvCommitted  uint32
+	budgetReleased bool
+
 	controlHdr     header
 	controlErr     chan error
 	controlHdrLock sync.Mutex
@@ -103,7 +112,9 @@ func (s *Stream) StreamID() uint32 {
 // them in order or along message boundaries, and may encounter deadlocks.
 func (s *Stream) Read(b []byte) (n int, err error) {
 	defer asyncNotify(s.recvNotifyCh)
+	var released uint32
 START:
+	released = 0
 
 	// If the stream is closed and there's no data buffered, return EOF
 	s.stateLock.Lock()
@@ -135,7 +146,18 @@ START:
 
 	// Read any bytes
 	n, _ = s.recvBuf.Read(b)
+	// Buffered data consumed by the application frees committed receive
+	// memory. Skip accounting once the stream's budget was already returned
+	// on teardown (checked under recvLock, which releaseRecvBudget also
+	// holds while setting budgetReleased).
+	if !s.budgetReleased {
+		s.recvCommitted -= uint32(n)
+		released = uint32(n)
+	}
 	s.recvLock.Unlock()
+	if released > 0 {
+		s.session.recvBudget.release(released)
+	}
 
 	// Send a window update potentially
 	err = s.sendWindowUpdate()
@@ -261,6 +283,11 @@ WAIT:
 func (s *Stream) sendFlags() uint16 {
 	s.stateLock.Lock()
 	defer s.stateLock.Unlock()
+	return s.sendFlagsLocked()
+}
+
+// sendFlagsLocked is sendFlags for callers that already hold stateLock.
+func (s *Stream) sendFlagsLocked() uint16 {
 	var flags uint16
 	switch s.state {
 	case streamInit:
@@ -276,30 +303,62 @@ func (s *Stream) sendFlags() uint16 {
 // sendWindowUpdate potentially sends a window update enabling
 // further writes to take place. Must be invoked with the lock.
 func (s *Stream) sendWindowUpdate() error {
-	s.controlHdrLock.Lock()
-	defer s.controlHdrLock.Unlock()
-
 	// Determine the delta update
 	max := s.session.config.MaxStreamWindowSize
-	var bufLen uint32
+	// Serialize window updates against stream teardown (which also runs under
+	// stateLock) and against buffer accounting (recvLock). The lock order is
+	// stateLock -> recvLock -> controlHdrLock, matching processFlags and
+	// releaseRecvBudget.
+	s.stateLock.Lock()
+	if s.state == streamClosed || s.state == streamReset {
+		s.stateLock.Unlock()
+		return nil
+	}
 	s.recvLock.Lock()
+
+	var bufLen uint32
 	if s.recvBuf != nil {
 		bufLen = uint32(s.recvBuf.Len())
 	}
-	delta := (max - bufLen) - s.recvWindow
+	want := (max - bufLen) - s.recvWindow
 
 	// Determine the flags if any
-	flags := s.sendFlags()
+	flags := s.sendFlagsLocked()
 
-	// Check if we can omit the update
-	if delta < (max/2) && flags == 0 {
+	// Check if we can omit the update. A frame carrying flags (SYN/ACK/FIN)
+	// must still be sent, so reserve at least the available credit for it.
+	if want < (max/2) && flags == 0 {
 		s.recvLock.Unlock()
+		s.stateLock.Unlock()
 		return nil
 	}
 
-	// Update our window
+	// Reserve the additional advertised credit against the session budget
+	// before announcing it. The grant can be smaller than requested when the
+	// session budget is constrained; that only shrinks this stream's window.
+	// A zero grant is only acceptable on a flagged frame (e.g. the opening
+	// SYN/ACK, which already committed the initial window).
+	delta := s.session.recvBudget.tryAcquireNonBlocking(want)
+	if delta == 0 && flags == 0 {
+		s.recvLock.Unlock()
+		s.stateLock.Unlock()
+		return nil
+	}
+
+	// Update our window and the stream's committed total.
 	s.recvWindow += delta
+	s.recvCommitted += delta
 	s.recvLock.Unlock()
+	s.stateLock.Unlock()
+
+	return s.sendWindowUpdateFrame(flags, delta)
+}
+
+// sendWindowUpdateFrame encodes and sends a window update frame with the given
+// flags and delta. The credit for delta must already have been reserved.
+func (s *Stream) sendWindowUpdateFrame(flags uint16, delta uint32) error {
+	s.controlHdrLock.Lock()
+	defer s.controlHdrLock.Unlock()
 
 	// Send the header
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, delta)
@@ -315,11 +374,13 @@ func (s *Stream) sendWindowUpdate() error {
 
 // sendClose is used to send a FIN
 func (s *Stream) sendClose() error {
+	s.stateLock.Lock()
+	flags := s.sendFlagsLocked()
+	flags |= flagFIN
+	s.stateLock.Unlock()
+
 	s.controlHdrLock.Lock()
 	defer s.controlHdrLock.Unlock()
-
-	flags := s.sendFlags()
-	flags |= flagFIN
 	s.controlHdr.encode(typeWindowUpdate, flags, s.id, 0)
 	if err := s.session.waitForSendErr(s.controlHdr, nil, s.controlErr); err != nil {
 		if errors.Is(err, ErrSessionShutdown) || errors.Is(err, ErrConnectionWriteTimeout) {
@@ -412,33 +473,64 @@ func (s *Stream) forceClose() {
 	s.state = streamClosed
 	s.stateLock.Unlock()
 	s.notifyWaiting()
+	s.releaseRecvBudget()
+}
+
+// releaseRecvBudget returns to the session all receive memory still committed
+// for this stream: data buffered for the application plus credit advertised to
+// the peer that can no longer arrive. It is idempotent and safe to call from
+// every teardown path (graceful close, RST, close timeout, session shutdown).
+func (s *Stream) releaseRecvBudget() {
+	s.stateLock.Lock()
+	if s.budgetReleased {
+		s.stateLock.Unlock()
+		return
+	}
+	s.budgetReleased = true
+	s.recvLock.Lock()
+	committed := s.recvCommitted
+	s.recvCommitted = 0
+	s.recvLock.Unlock()
+	s.stateLock.Unlock()
+
+	s.session.recvBudget.release(committed)
+}
+
+// releaseRecvWindowCredit returns the current receive window credit to the
+// session while leaving buffered data committed. It is used when the peer
+// announces a half or full close (FIN) and can no longer consume the
+// advertised credit. It must be called with stateLock held.
+func (s *Stream) releaseRecvWindowCredit() {
+	s.recvLock.Lock()
+	if s.budgetReleased {
+		s.recvLock.Unlock()
+		return
+	}
+	credit := s.recvWindow
+	s.recvWindow = 0
+	if credit <= s.recvCommitted {
+		s.recvCommitted -= credit
+	} else {
+		s.recvCommitted = 0
+	}
+	s.recvLock.Unlock()
+
+	s.session.recvBudget.release(credit)
 }
 
 // processFlags is used to update the state of the stream
 // based on set flags, if any. Lock must be held
 func (s *Stream) processFlags(flags uint16) error {
 	s.stateLock.Lock()
-	defer s.stateLock.Unlock()
-
-	// Close the stream without holding the state lock
 	closeStream := false
-	defer func() {
-		if closeStream {
-			if s.closeTimer != nil {
-				// Stop our close timeout timer since we gracefully closed
-				s.closeTimer.Stop()
-			}
-
-			s.session.closeStream(s.id)
-		}
-	}()
+	established := false
+	var retErr error
 
 	if flags&flagACK == flagACK {
 		if s.state == streamSYNSent {
 			s.state = streamEstablished
 		}
-		asyncNotify(s.establishCh)
-		s.session.establishStream(s.id)
+		established = true
 	}
 	if flags&flagFIN == flagFIN {
 		switch s.state {
@@ -447,23 +539,43 @@ func (s *Stream) processFlags(flags uint16) error {
 		case streamSYNReceived:
 			fallthrough
 		case streamEstablished:
+			// The peer will send no more data, so the receive window it
+			// could still have consumed can never be used. Return that
+			// credit; buffered data the application has not drained stays
+			// committed until read or the stream is fully torn down.
+			s.releaseRecvWindowCredit()
 			s.state = streamRemoteClose
-			s.notifyWaiting()
 		case streamLocalClose:
+			s.releaseRecvWindowCredit()
 			s.state = streamClosed
 			closeStream = true
-			s.notifyWaiting()
 		default:
 			s.session.logger.Printf("[ERR] yamux: unexpected FIN flag in state %d", s.state)
-			return ErrUnexpectedFlag
+			retErr = ErrUnexpectedFlag
 		}
 	}
 	if flags&flagRST == flagRST {
 		s.state = streamReset
 		closeStream = true
-		s.notifyWaiting()
 	}
-	return nil
+	s.stateLock.Unlock()
+
+	// Perform notifications and teardown without holding stateLock.
+	// Session.Close holds streamLock while forceClose takes stateLock, so
+	// taking streamLock (via closeStream) while holding stateLock would
+	// invert that order and deadlock.
+	s.notifyWaiting()
+	if established {
+		s.session.establishStream(s.id)
+	}
+	if closeStream {
+		if s.closeTimer != nil {
+			// Stop our close timeout timer since we gracefully closed
+			s.closeTimer.Stop()
+		}
+		s.session.closeStream(s.id)
+	}
+	return retErr
 }
 
 // notifyWaiting notifies all the waiting channels
@@ -523,6 +635,8 @@ func (s *Stream) readData(hdr header, flags uint16, conn io.Reader) error {
 
 	// Decrement the receive window
 	s.recvWindow -= uint32(copiedLength)
+	// The bytes move from advertised credit into buffered data; the total
+	// committed to the session budget is unchanged.
 	s.recvLock.Unlock()
 
 	// Unblock any readers

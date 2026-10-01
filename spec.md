@@ -129,6 +129,41 @@ larger window.
 Both sides should track the number of bytes sent in Data frames
 only, as only they are tracked as part of the window size.
 
+### Session receive budget
+
+The per-stream window only bounds a single stream. A peer that keeps
+opening well-behaved streams could otherwise force the receiver to
+commit `MaxStreamWindowSize` bytes of buffering per open stream.
+
+When `MaxSessionWindowSize` is configured (a non-zero value) the
+receiver additionally bounds the total receive memory it commits across
+all streams. The committed total counts:
+
+* Data already received and buffered for an application, and
+* receive credit advertised to the peer (the initial stream window plus
+  subsequent window updates) that has not yet been consumed by
+  application reads.
+
+The limit is enforced while opening streams and while advertising
+window growth, never by discarding data that arrived within credit that
+was already advertised.
+
+* An outgoing `Open` blocks until the receiver can reserve the new
+  stream's initial window, and is aborted if the session shuts down.
+* An incoming stream whose initial window cannot be funded is rejected
+  immediately with a RST. The receive loop never blocks waiting for
+  credit, so control frames (window updates, pings, FIN/RST) that
+  release budget keep being processed.
+* A window update advertises only the credit that is currently
+  affordable; a stream's window may therefore grow less than its
+  per-stream maximum while the session is constrained.
+
+Credit is returned as the application reads data (re-granted through
+later window updates), when a FIN makes the advertised window
+unusable, and when the stream is closed or reset. A zero
+`MaxSessionWindowSize` disables the session level limit, preserving the
+historical per-stream-only behavior.
+
 ## Session termination
 
 When a session is being terminated, the Go Away message should
