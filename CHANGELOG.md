@@ -1,5 +1,14 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `ThreadPoolExecutor#managed_block`, allowing a worker thread to declare
+  that it is temporarily blocking (for example while waiting on a task
+  submitted to the same pool). The pool compensates with up to
+  `max_compensation_threads` additional threads and reclaims them afterwards,
+  preventing same-pool parent/child task deadlocks without ever exceeding
+  `max_threads + max_compensation_threads` threads.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:

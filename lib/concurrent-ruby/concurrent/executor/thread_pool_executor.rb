@@ -32,6 +32,18 @@ module Concurrent
   #   Threads that are idle for too long will be garbage collected, down to the
   #   configured minimum options. Should a thread crash it, too, will be garbage collected.
   #
+  #   A task running on a worker thread sometimes has to wait for another task
+  #   submitted to the same pool (directly or indirectly). When every worker is
+  #   occupied by such a waiting task the pool deadlocks: the waited-upon task
+  #   can never start because no thread is available. A task can avoid this by
+  #   wrapping the blocking section in a {#managed_block} call. The pool is
+  #   then allowed to create a temporary compensation thread (up to
+  #   `max_compensation_threads`) so that other tasks keep running, and reclaims
+  #   the compensation thread once the blocking section returns. The normal
+  #   `max_threads` limit and the compensation limit are always observed
+  #   independently, so the pool never creates more than
+  #   `max_threads + max_compensation_threads` threads.
+  #
   #   `ThreadPoolExecutor` is based on the Java class of the same name. From
   #   the official Java documentation;
   #
@@ -75,6 +87,13 @@ module Concurrent
     #     `max_queue` or the executor has shut down
     #   @option opts [Boolean] :synchronous (DEFAULT_SYNCHRONOUS) whether or not a value of 0
     #     for :max_queue means the queue must perform direct hand-off rather than unbounded.
+    #   @option opts [Integer] :max_compensation_threads
+    #     (DEFAULT_MAX_COMPENSATION_THREADS) the maximum number of additional
+    #     threads the pool may create, on top of `max_threads`, to keep
+    #     executing tasks while a worker thread is blocked inside a
+    #     {#managed_block} call. Defaults to zero, which preserves the historic
+    #     sizing. The pool never creates more than
+    #     `max_threads + max_compensation_threads` threads in total.
     #   @raise [ArgumentError] if `:max_threads` is less than one
     #   @raise [ArgumentError] if `:min_threads` is less than zero
     #   @raise [ArgumentError] if `:fallback_policy` is not one of the values specified

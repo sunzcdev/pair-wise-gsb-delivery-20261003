@@ -28,6 +28,17 @@ module Concurrent
     # @!macro thread_pool_executor_constant_default_synchronous
     DEFAULT_SYNCHRONOUS = false
 
+    # Default maximum number of extra threads the pool may create to compensate
+    # for worker threads which are temporarily blocked inside a
+    # {#managed_block} call (e.g. waiting for a task submitted to the same
+    # pool). A value of zero preserves the historic sizing behaviour.
+    DEFAULT_MAX_COMPENSATION_THREADS = 0
+
+    # Thread local which records the pool owning the currently executing worker
+    # thread. Only genuine worker threads set it, so external threads can
+    # never claim a worker compensation slot.
+    WORKER_POOL_THREAD_KEY = :concurrent_worker_pool
+
     # @!macro thread_pool_executor_attr_reader_max_length
     attr_reader :max_length
 
@@ -42,6 +53,11 @@ module Concurrent
 
     # @!macro thread_pool_executor_attr_reader_synchronous
     attr_reader :synchronous
+
+    # The maximum number of additional (compensation) threads this pool may
+    # create on top of {#max_length} to keep executing tasks while some worker
+    # threads are blocked inside a {#managed_block} call.
+    attr_reader :max_compensation_length
 
     # @!macro thread_pool_executor_method_initialize
     def initialize(opts = {})
@@ -67,6 +83,41 @@ module Concurrent
     def active_count
       synchronize do
         @pool.length - @ready.length
+      end
+    end
+
+    # The number of worker threads currently blocked inside a {#managed_block}.
+    #
+    # @return [Integer]
+    def blocked_count
+      synchronize { @blocked_count }
+    end
+
+    # Declare that the calling worker thread is about to block (for example
+    # while waiting on a task that was submitted to the same pool). While the
+    # block runs, the pool may create up to {#max_compensation_length}
+    # additional threads so that other tasks keep executing, avoiding the
+    # classic deadlock of a pool waiting on tasks submitted to itself.
+    #
+    # The compensation accounting is restored when the block returns, whether
+    # normally or by raising an exception. Nested calls from the same worker
+    # are counted only once. Calls made by threads which are not workers of
+    # this pool (ordinary external threads) simply run the block and never
+    # create compensation threads.
+    #
+    # @yield runs while the pool considers the current worker blocked
+    # @return [Object] the value returned by the block
+    def managed_block
+      raise ArgumentError.new('no block given') unless block_given?
+
+      worker = synchronize { ns_current_worker }
+      return yield unless worker
+
+      begin
+        synchronize { ns_worker_blocks_begin(worker) }
+        yield
+      ensure
+        synchronize { ns_worker_blocks_end(worker) }
       end
     end
 
@@ -150,6 +201,8 @@ module Concurrent
       @max_queue       = opts.fetch(:max_queue, DEFAULT_MAX_QUEUE_SIZE).to_i
       @synchronous     = opts.fetch(:synchronous, DEFAULT_SYNCHRONOUS)
       @fallback_policy = opts.fetch(:fallback_policy, :abort)
+      @max_compensation_length =
+        opts.fetch(:max_compensation_threads, DEFAULT_MAX_COMPENSATION_THREADS).to_i
 
       raise ArgumentError.new("`synchronous` cannot be set unless `max_queue` is 0") if @synchronous && @max_queue > 0
       raise ArgumentError.new("#{@fallback_policy} is not a valid fallback policy") unless FALLBACK_POLICIES.include?(@fallback_policy)
@@ -157,6 +210,9 @@ module Concurrent
       raise ArgumentError.new("`max_threads` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if @max_length > DEFAULT_MAX_POOL_SIZE
       raise ArgumentError.new("`min_threads` cannot be less than #{DEFAULT_MIN_POOL_SIZE}") if @min_length < DEFAULT_MIN_POOL_SIZE
       raise ArgumentError.new("`min_threads` cannot be more than `max_threads`") if min_length > max_length
+      raise ArgumentError.new("`max_compensation_threads` cannot be less than #{DEFAULT_MAX_COMPENSATION_THREADS}") if @max_compensation_length < DEFAULT_MAX_COMPENSATION_THREADS
+      raise ArgumentError.new("`max_compensation_threads` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if @max_compensation_length > DEFAULT_MAX_POOL_SIZE
+      raise ArgumentError.new("`max_threads` and `max_compensation_threads` cannot sum to more than #{DEFAULT_MAX_POOL_SIZE}") if @max_length + @max_compensation_length > DEFAULT_MAX_POOL_SIZE
 
       @pool                 = [] # all workers
       @ready                = [] # used as a stash (most idle worker is at the start)
@@ -166,6 +222,8 @@ module Concurrent
       @completed_task_count = 0
       @largest_length       = 0
       @workers_counter      = 0
+      @blocked_count        = 0 # workers currently inside a managed_block
+      @stopping_count       = 0 # workers which were told to stop but still occupy @pool
       @ruby_pid             = $$ # detects if Ruby has forked
     end
 
@@ -255,12 +313,93 @@ module Concurrent
     #
     # @!visibility private
     def ns_add_busy_worker
-      return if @pool.size >= @max_length
+      return if ns_effective_worker_count >= ns_effective_max_length
 
       @workers_counter += 1
       @pool << (worker = Worker.new(self, @workers_counter))
       @largest_length = @pool.length if @pool.length > @largest_length
       worker
+    end
+
+    # number of workers which still occupy capacity, excluding the ones which
+    # have already been told to terminate
+    #
+    # @!visibility private
+    def ns_effective_worker_count
+      @pool.length - @stopping_count
+    end
+
+    # number of worker threads the pool may currently have alive. Each blocked
+    # worker (up to `max_compensation_length`) raises the ceiling by one so
+    # that a compensation thread can keep executing tasks.
+    #
+    # @!visibility private
+    def ns_effective_max_length
+      @max_length + [@blocked_count, @max_compensation_length].min
+    end
+
+    # @return [Worker, nil] the pool's worker running on the current thread or
+    #   `nil` when the current thread is not one of this pool's workers
+    #
+    # @!visibility private
+    def ns_current_worker
+      worker = Thread.current[WORKER_POOL_THREAD_KEY]
+      worker if worker.is_a?(Worker) && @pool.include?(worker)
+    end
+
+    # Marks a worker as blocked and, within the configured compensation
+    # ceiling, spawns an extra worker to preserve execution capacity.
+    #
+    # @!visibility private
+    def ns_worker_blocks_begin(worker)
+      return if worker.blocked? # nested declarations from the same worker count once
+      worker.blocked = true
+      @blocked_count += 1
+      return unless running? && ns_effective_worker_count < ns_effective_max_length
+
+      compensation = ns_add_busy_worker
+      if compensation
+        task_and_args = @queue.shift
+        if task_and_args
+          compensation << task_and_args
+        else
+          # register the fresh worker as available for work. It starts its
+          # life already waiting with a timeout, so a real idle timestamp is
+          # required (ns_ready_worker cannot be used on a worker which has not
+          # finished a task yet).
+          @ready.push([compensation, Concurrent.monotonic_time])
+        end
+      end
+    rescue ThreadError
+      # The operating system refused to create the compensation thread; the
+      # block still runs, the accounting is simply restored on exit.
+    end
+
+    # Marks a worker as unblocked and reclaims any compensation worker which
+    # is no longer justified by the effective ceiling.
+    #
+    # @!visibility private
+    def ns_worker_blocks_end(worker)
+      return unless worker.blocked?
+      worker.blocked = false
+      @blocked_count -= 1
+      ns_reap_excess_ready_workers if running?
+    end
+
+    # Stops ready workers which exceed the currently effective ceiling.
+    #
+    # @!visibility private
+    def ns_reap_excess_ready_workers
+      excess = ns_effective_worker_count - ns_effective_max_length
+      while excess > 0
+        entry = @ready.pop
+        break unless entry
+        ready_worker, = entry
+        ready_worker.mark_reaped
+        @stopping_count += 1
+        excess -= 1
+        ready_worker.stop
+      end
     end
 
     # handle ready worker, giving it new job or assigning back to @ready
@@ -274,7 +413,14 @@ module Concurrent
         # stop workers when !running?, do not return them to @ready
         if running?
           raise unless last_message
-          @ready.push([worker, last_message])
+          if ns_effective_worker_count > ns_effective_max_length
+            # a compensation thread no longer justified by a blocked worker
+            worker.mark_reaped
+            @stopping_count += 1
+            worker.stop
+          else
+            @ready.push([worker, last_message])
+          end
         else
           worker.stop
         end
@@ -286,6 +432,7 @@ module Concurrent
     # @!visibility private
     def ns_remove_busy_worker(worker)
       @pool.delete(worker)
+      @stopping_count -= 1 if worker.stopping?
       stopped_event.set if @pool.empty? && !running?
       true
     end
@@ -320,6 +467,8 @@ module Concurrent
         @completed_task_count = 0
         @largest_length       = 0
         @workers_counter      = 0
+        @blocked_count        = 0
+        @stopping_count       = 0
         @ruby_pid             = $$
       end
     end
@@ -328,11 +477,16 @@ module Concurrent
     class Worker
       include Concern::Logging
 
+      # Whether this worker is currently blocked inside a pool `managed_block`.
+      attr_accessor :blocked
+      alias_method :blocked?, :blocked
+
       def initialize(pool, id)
         # instance variables accessed only under pool's lock so no need to sync here again
         @queue  = Collection::TimeoutQueue.new
         @pool   = pool
-        @thread = create_worker @queue, pool, pool.idletime
+        @reaped = false
+        @thread = create_worker self, @queue, pool, pool.idletime
 
         if @thread.respond_to?(:name=)
           @thread.name = [pool.name, 'worker', id].compact.join('-')
@@ -351,10 +505,23 @@ module Concurrent
         @thread.kill
       end
 
+      # Marks this worker as a compensation thread which is being reclaimed
+      # because it is no longer justified by a blocked worker.
+      def mark_reaped
+        @reaped = true
+      end
+
+      # @return [true, false] whether this worker is being reclaimed as an
+      #   unneeded compensation thread
+      def stopping?
+        @reaped
+      end
+
       private
 
-      def create_worker(queue, pool, idletime)
-        Thread.new(queue, pool, idletime) do |my_queue, my_pool, my_idletime|
+      def create_worker(me, queue, pool, idletime)
+        Thread.new(me, queue, pool, idletime) do |myself, my_queue, my_pool, my_idletime|
+          Thread.current[WORKER_POOL_THREAD_KEY] = myself
           catch(:stop) do
             prunable = true
 
@@ -375,6 +542,8 @@ module Concurrent
               end
             end
           end
+        ensure
+          Thread.current[WORKER_POOL_THREAD_KEY] = nil
         end
       end
 
