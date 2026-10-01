@@ -99,6 +99,11 @@ type Client struct {
 	ctxCancel         context.CancelFunc
 	negotiatedVersion int
 
+	// negotiatedPluginVersions holds the version negotiated for each plugin
+	// name after Start(), populated only when per-plugin version negotiation
+	// was used.
+	negotiatedPluginVersions map[string]int
+
 	// clientWaitGroup is used to manage the lifecycle of the plugin management
 	// goroutines.
 	clientWaitGroup sync.WaitGroup
@@ -121,6 +126,14 @@ type Client struct {
 // This is only valid after Start() is called.
 func (c *Client) NegotiatedVersion() int {
 	return c.negotiatedVersion
+}
+
+// NegotiatedVersions returns the version negotiated for each plugin name.
+// Versions are negotiated independently per plugin when ClientConfig
+// PluginVersions are used. Optional plugins with no mutually supported version
+// are absent from the map. This is only valid after Start() is called.
+func (c *Client) NegotiatedVersions() map[string]int {
+	return c.negotiatedPluginVersions
 }
 
 // ID returns a unique ID for the running plugin. By default this is the process
@@ -151,6 +164,15 @@ type ClientConfig struct {
 	// These can be used to negotiate a compatible version between client and
 	// server. If this is set, Handshake.ProtocolVersion is not required.
 	VersionedPlugins map[int]PluginSet
+
+	// PluginVersions configures per-plugin version negotiation. Each plugin
+	// name can support multiple versions independently, so two services in the
+	// same plugin process can be upgraded on different cadences.
+	//
+	// A plugin marked Required must agree on a version with the server, or
+	// Client.Start fails. Optional plugins are omitted from the negotiated
+	// plugin set when no common version exists.
+	PluginVersions PluginVersions
 
 	// One of the following must be set, but not both.
 	//
@@ -630,6 +652,23 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		c.config.VersionedPlugins[version] = c.config.Plugins
 	}
 
+	// Flatten the per-plugin catalog into the global version groups so legacy
+	// global negotiation and the PLUGIN_PROTOCOL_VERSIONS list also cover
+	// those versions.
+	if c.config.PluginVersions != nil {
+		if err := validatePluginNames(c.config.PluginVersions); err != nil {
+			return nil, err
+		}
+		for v, set := range globalVersionGroups(c.config.PluginVersions) {
+			if c.config.VersionedPlugins[v] == nil {
+				c.config.VersionedPlugins[v] = make(PluginSet)
+			}
+			for name, p := range set {
+				c.config.VersionedPlugins[v][name] = p
+			}
+		}
+	}
+
 	var versionStrings []string
 	for v := range c.config.VersionedPlugins {
 		versionStrings = append(versionStrings, strconv.Itoa(v))
@@ -640,6 +679,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		fmt.Sprintf("PLUGIN_MIN_PORT=%d", c.config.MinPort),
 		fmt.Sprintf("PLUGIN_MAX_PORT=%d", c.config.MaxPort),
 		fmt.Sprintf("PLUGIN_PROTOCOL_VERSIONS=%s", strings.Join(versionStrings, ",")),
+	}
+	if c.config.PluginVersions != nil {
+		env = append(env, fmt.Sprintf("%s=%s", envPluginVersions,
+			encodePluginVersions(c.config.PluginVersions)))
 	}
 	if c.config.GRPCBrokerMultiplex {
 		env = append(env, fmt.Sprintf("%s=true", envMultiplexGRPC))
@@ -867,8 +910,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 			}
 		}
 
-		// Test the API version
-		version, pluginSet, err := c.checkProtoVersion(parts[1])
+		// Negotiate the API version. When the server replies with per-plugin
+		// versions the plugins for each name are chosen independently;
+		// otherwise the legacy global version in parts[1] is used.
+		version, pluginSet, negotiatedPlugins, err := c.negotiateHandshake(parts)
 		if err != nil {
 			return addr, err
 		}
@@ -878,7 +923,8 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		// implementation.
 		c.config.Plugins = pluginSet
 		c.negotiatedVersion = version
-		c.logger.Debug("using plugin", "version", version)
+		c.negotiatedPluginVersions = negotiatedPlugins
+		c.logger.Debug("using plugin", "version", version, "plugins", negotiatedPlugins)
 
 		network, address, err := runner.PluginToHost(parts[2], parts[3])
 		if err != nil {
@@ -1050,6 +1096,63 @@ func (c *Client) checkProtoVersion(protoVersion string) (int, PluginSet, error) 
 
 	return 0, nil, fmt.Errorf("incompatible API version with plugin. "+
 		"Plugin version: %d, Client versions: %d", serverVersion, clientVersions)
+}
+
+// negotiateHandshake resolves the global protocol version, the PluginSet to
+// dispense and the per-plugin negotiated versions from the server handshake
+// line.
+//
+// When the client advertised per-plugin versions and the server replies with
+// the negotiated segment (segment index 7), each plugin name is resolved to
+// the mutually supported version. If the server is old and omits the segment,
+// the global version negotiation is used predictably: required plugins that do
+// not offer the negotiated global version fail startup and optional ones are
+// dropped.
+func (c *Client) negotiateHandshake(parts []string) (int, PluginSet, map[string]int, error) {
+	version, pluginSet, err := c.checkProtoVersion(parts[1])
+	if err != nil {
+		return 0, nil, nil, err
+	}
+
+	if c.config.PluginVersions == nil {
+		return version, pluginSet, nil, nil
+	}
+
+	// Segment 7 is the negotiated per-plugin version list. New servers always
+	// send it to a client that advertised per-plugin versions; old servers do
+	// not understand the advertisement and leave it out.
+	if len(parts) > 7 && parts[7] != "" {
+		negotiated, err := parseNegotiatedPluginVersions(parts[7])
+		if err != nil {
+			return 0, nil, nil, err
+		}
+
+		// Fail startup when a required plugin was not negotiated.
+		for name, byVersion := range c.config.PluginVersions {
+			if _, ok := negotiated[name]; ok {
+				continue
+			}
+			if localRequired(byVersion) {
+				return 0, nil, nil, fmt.Errorf(
+					"required plugin %q could not be negotiated with the server", name)
+			}
+		}
+
+		return version, pluginSetFromNegotiated(c.config.PluginVersions, negotiated), negotiated, nil
+	}
+
+	// Legacy server: apply the single global version across the per-plugin
+	// catalog, dropping optional plugins that do not offer it.
+	legacySet, err := pluginSetForGlobalGroup(c.config.PluginVersions, version)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+
+	negotiated := make(map[string]int, len(legacySet))
+	for name := range legacySet {
+		negotiated[name] = version
+	}
+	return version, legacySet, negotiated, nil
 }
 
 // ReattachConfig returns the information that must be provided to NewClient

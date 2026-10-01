@@ -5,6 +5,7 @@ SECURITY:
 
 ENHANCEMENTS:
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
+* Added per-plugin version negotiation with `PluginVersions`: individual plugin names within one process can now negotiate the highest mutually supported version independently, and each plugin may be marked required (fails startup on no match) or optional (omitted on no match). The negotiation is negotiated via the `PLUGIN_PLUGIN_VERSIONS` environment variable and an additional handshake segment; clients and servers using only the legacy global `VersionedPlugins` continue to work unchanged.
 
 ## v1.7.0
 

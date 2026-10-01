@@ -75,6 +75,16 @@ type ServeConfig struct {
 	// server. If this is set, Handshake.ProtocolVersion is not required.
 	VersionedPlugins map[int]PluginSet
 
+	// PluginVersions configures per-plugin version negotiation. Each plugin
+	// name can offer multiple versions independently of the other plugins in
+	// this process, allowing services with different upgrade cadences to be
+	// negotiated separately.
+	//
+	// A plugin marked Required must agree on a version with the client during
+	// startup; otherwise serving fails. Optional plugins are simply omitted
+	// when no mutually supported version exists.
+	PluginVersions PluginVersions
+
 	// GRPCServer should be non-nil to enable serving the plugins over
 	// gRPC. This is a function to create the server when needed with the
 	// given server options. The server options populated by go-plugin will
@@ -221,6 +231,118 @@ func protocolVersion(opts *ServeConfig) (int, Protocol, PluginSet) {
 	return protoVersion, protoType, pluginSet
 }
 
+// negotiateServer selects the protocol version, transport and plugin set to
+// serve.
+//
+// When the client advertises per-plugin versions via PLUGIN_PLUGIN_VERSIONS,
+// each plugin name is negotiated independently and the negotiated map is
+// returned (non-nil, possibly empty) so the server can advertise it in the
+// handshake line. When the variable is absent, the legacy global version
+// negotiation is used and the negotiated map is nil.
+func negotiateServer(opts *ServeConfig) (int, Protocol, PluginSet, map[string]int, error) {
+	if opts.PluginVersions != nil {
+		if err := validatePluginNames(opts.PluginVersions); err != nil {
+			return 0, ProtocolNetRPC, nil, nil, err
+		}
+	}
+
+	// Merge the per-plugin catalog into the global version groups so that the
+	// existing global negotiation includes those versions.
+	if opts.PluginVersions != nil {
+		if opts.VersionedPlugins == nil {
+			opts.VersionedPlugins = make(map[int]PluginSet)
+		}
+		for v, set := range globalVersionGroups(opts.PluginVersions) {
+			if opts.VersionedPlugins[v] == nil {
+				opts.VersionedPlugins[v] = make(PluginSet)
+			}
+			for name, p := range set {
+				opts.VersionedPlugins[v][name] = p
+			}
+		}
+	}
+
+	// Per-plugin negotiation only happens when both sides opt in: the server
+	// must be configured with a PluginVersions catalog and the client must
+	// advertise one. An old-style server configured only with
+	// VersionedPlugins ignores the client advertisement and uses the global
+	// negotiation unchanged.
+	rawClientVersions := os.Getenv("PLUGIN_PLUGIN_VERSIONS")
+	if opts.PluginVersions == nil || rawClientVersions == "" {
+		// Legacy client (or legacy-style config): one global version only.
+		protoVersion, protoType, pluginSet := protocolVersion(opts)
+		return protoVersion, protoType, pluginSet, nil, nil
+	}
+
+	clientVersions, err := parsePluginVersionsEnv(rawClientVersions)
+	if err != nil {
+		return 0, ProtocolNetRPC, nil, nil, err
+	}
+
+	negotiated, err := negotiatePlugins(opts.PluginVersions, clientVersions)
+	if err != nil {
+		return 0, ProtocolNetRPC, nil, nil, err
+	}
+
+	pluginSet := pluginSetFromNegotiated(opts.PluginVersions, negotiated)
+	protoType := transportForPlugins(pluginSet)
+
+	// The global version in the handshake line remains available for legacy
+	// clients and reattach configs. Choose the highest global version that
+	// both sides support and that covers the negotiated plugins, so a client
+	// that also validates the global version accepts the result.
+	var clientGlobalVersions []int
+	if vs := os.Getenv("PLUGIN_PROTOCOL_VERSIONS"); vs != "" {
+		for _, s := range strings.Split(vs, ",") {
+			v, err := strconv.Atoi(s)
+			if err != nil {
+				continue
+			}
+			clientGlobalVersions = append(clientGlobalVersions, v)
+		}
+	}
+	protoVersion := highestMutualGroupVersion(pluginSet, opts.VersionedPlugins, clientGlobalVersions)
+	if protoVersion < 0 {
+		protoVersion, _, _ = protocolVersion(opts)
+	}
+
+	return protoVersion, protoType, pluginSet, negotiated, nil
+}
+
+// highestMutualGroupVersion returns the highest global protocol version that
+// both sides advertise and whose registered plugin set contains every
+// negotiated plugin. It returns -1 when no such group exists.
+func highestMutualGroupVersion(set PluginSet, groups map[int]PluginSet, clientVersions []int) int {
+	clientVersionSet := make(map[int]struct{}, len(clientVersions))
+	for _, v := range clientVersions {
+		clientVersionSet[v] = struct{}{}
+	}
+
+	var versions []int
+	for v := range groups {
+		versions = append(versions, v)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(versions)))
+
+	for _, v := range versions {
+		if _, ok := clientVersionSet[v]; !ok {
+			continue
+		}
+		group := groups[v]
+		covers := true
+		for name := range set {
+			if _, ok := group[name]; !ok {
+				covers = false
+				break
+			}
+		}
+		if covers {
+			return v
+		}
+	}
+	return -1
+}
+
 // Serve serves the plugins given by ServeConfig.
 //
 // Serve doesn't return until the plugin is done being executed. Any
@@ -266,9 +388,17 @@ func Serve(opts *ServeConfig) {
 		}
 	}
 
-	// negotiate the version and plugins
-	// start with default version in the handshake config
-	protoVersion, protoType, pluginSet := protocolVersion(opts)
+	// negotiate the version and plugins. When the client supports per-plugin
+	// version negotiation, versions are chosen independently per plugin name;
+	// otherwise the legacy single global version negotiation is used.
+	protoVersion, protoType, pluginSet, negotiatedPlugins, err := negotiateServer(opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plugin negotiation failed: %s\n", err)
+		if opts.Test == nil {
+			exitCode = 1
+		}
+		return
+	}
 
 	logger := opts.Logger
 	if logger == nil {
@@ -431,15 +561,17 @@ func Serve(opts *ServeConfig) {
 			protoType,
 			serverCert)
 
-		// Old clients will error with new plugins if we blindly append the
-		// seventh segment for gRPC broker multiplexing support, because old
-		// client code uses strings.SplitN(line, "|", 6), which means a seventh
-		// segment will get appended to the sixth segment as "sixthpart|true".
-		//
-		// If the environment variable is set, we assume the client is new enough
-		// to handle a seventh segment, as it should now use
-		// strings.Split(line, "|") and always handle each segment individually.
-		if os.Getenv(envMultiplexGRPC) != "" {
+		// A client that sent a per-plugin version catalog is known to parse
+		// every "|" segment with strings.Split(line, "|"), so the multiplexing
+		// flag and negotiated plugin versions can be appended at fixed
+		// positions. Older clients without that marker keep the legacy line:
+		// the seventh segment is only appended when gRPC multiplexing was
+		// explicitly requested, matching the historical behavior relied on by
+		// old client code that uses strings.SplitN(line, "|", 6).
+		if os.Getenv(envPluginVersions) != "" {
+			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
+			protocolLine += "|" + encodeNegotiatedPluginVersions(negotiatedPlugins)
+		} else if os.Getenv(envMultiplexGRPC) != "" {
 			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
 		}
 		fmt.Printf("%s\n", protocolLine)

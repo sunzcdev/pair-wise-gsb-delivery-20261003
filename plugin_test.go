@@ -725,6 +725,48 @@ func TestHelperProcess(*testing.T) {
 		}
 		fmt.Printf("%d|%d|tcp|:1234|%s||false\n", CoreProtocolVersion, testHandshake.ProtocolVersion, ProtocolGRPC)
 		<-make(chan int)
+	case "test-service-versions":
+		// Serves the "storage" and "auth" services, each at versions 1 and 2,
+		// using per-plugin version negotiation. Both services are required.
+		Serve(&ServeConfig{
+			HandshakeConfig: testVersionedHandshake,
+			PluginVersions:  requiredServerServiceVersions(),
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
+	case "test-service-versions-optional":
+		// Same catalog, but the "auth" service is optional on the server.
+		Serve(&ServeConfig{
+			HandshakeConfig: testVersionedHandshake,
+			PluginVersions:  optionalServerServiceVersions(),
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
+	case "test-service-versions-global":
+		// Legacy server that only advertises a single global protocol version
+		// (1), even though both services are available.
+		Serve(&ServeConfig{
+			HandshakeConfig: testVersionedHandshake,
+			VersionedPlugins: map[int]PluginSet{
+				1: legacyServicePluginMap(),
+			},
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
+	case "test-service-versions-legacy-client":
+		// Server configured with the new per-plugin catalog, serving a legacy
+		// client that does not send PLUGIN_PLUGIN_VERSIONS. It must fall back to
+		// the global version negotiation predictably.
+		Serve(&ServeConfig{
+			HandshakeConfig: testVersionedHandshake,
+			PluginVersions:  requiredServerServiceVersions(),
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %q\n", cmd)
 		os.Exit(2)

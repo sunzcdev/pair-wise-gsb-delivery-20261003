@@ -62,6 +62,15 @@ Where:
     also be "grpc". This is the protocol that the plugin wants to speak to
     the host process with.
 
+Per-plugin version negotiation adds two optional trailing segments that are
+only present when the host sent `PLUGIN_PLUGIN_VERSIONS`. Segment 6 is the
+server certificate slot (empty in plaintext mode), segment 7 is `true` when
+gRPC broker multiplexing is supported, and segment 8 is the negotiated
+`name=version` list, comma separated (for example `auth=2,storage=1`). Plugins
+present only as optional on one side are omitted; a required plugin without a
+common version prevents the plugin process from starting. Clients that do not
+send `PLUGIN_PLUGIN_VERSIONS` receive the legacy line above unchanged.
+
 ## Environment Variables
 
 When serving a plugin over TCP, the following environment variables can be
@@ -72,3 +81,12 @@ by the operating system.
  * `PLUGIN_MIN_PORT`: Specifies the minimum port value that will be assigned to the listener.
  
  * `PLUGIN_MAX_PORT`: Specifies the maximum port value that will be assigned to the listener.
+
+ * `PLUGIN_PROTOCOL_VERSIONS`: Comma separated list of global application
+   protocol versions supported by the host.
+
+ * `PLUGIN_PLUGIN_VERSIONS`: Per-plugin version catalog used when services in
+   one process upgrade independently. Each semicolon separated entry is
+   `name=<required-flag>:<version>,...` where the flag is `1` for a required
+   service and `0` for an optional one, for example
+   `auth=1:1,2;storage=1:1`.

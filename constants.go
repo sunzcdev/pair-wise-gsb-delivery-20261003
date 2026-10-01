@@ -13,4 +13,10 @@ const (
 	EnvUnixSocketGroup = "PLUGIN_UNIX_SOCKET_GROUP"
 
 	envMultiplexGRPC = "PLUGIN_MULTIPLEX_GRPC"
+
+	// envPluginVersions is set by the client when it supports per-plugin
+	// version negotiation. Its value advertises the client's per-plugin
+	// version catalog; its presence also tells the server that it may append
+	// the negotiated per-plugin versions to the handshake response line.
+	envPluginVersions = "PLUGIN_PLUGIN_VERSIONS"
 )
