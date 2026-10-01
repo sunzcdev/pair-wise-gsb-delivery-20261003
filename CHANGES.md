@@ -1,5 +1,25 @@
 # Changes
 
+## Unreleased
+
+* Added two time zone-aware arithmetic entry points to `TZInfo::Timezone` that
+  make the distinction between elapsed time and local calendar time explicit:
+  * `add_elapsed_seconds(time, seconds)` moves by an exact number of elapsed
+    seconds on the UTC timeline (e.g. "24 hours from now").
+  * `advance_local(time, months, days, options)` moves by local calendar
+    months and days, keeping the local time of day (e.g. "the same time
+    tomorrow"). Callers choose how to handle month-end overflow (`:clamp` or
+    `:raise`), local times that fall in a gap (`:raise`, `:before` or
+    `:after`) and local times that are ambiguous (`:raise`, `:before` or
+    `:after`).
+  * Both methods preserve the sub-second part of the input, return results
+    with the time zone offset attached and never consult the system time
+    zone.
+* Added the `TZInfo::InvalidLocalDate` exception, raised by
+  `Timezone#advance_local` when a month move targets a non-existent day with
+  `:month_overflow` set to `:raise`.
+
+
 ## Version 2.0.6 - 28-Jan-2023
 
 * Eliminate `Object#untaint` deprecation warnings on JRuby 9.4.0.0. #145.

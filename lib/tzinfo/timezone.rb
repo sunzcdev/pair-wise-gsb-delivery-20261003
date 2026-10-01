@@ -17,8 +17,16 @@ module TZInfo
   end
 
   # {PeriodNotFound} is raised to indicate that no {TimezonePeriod} matching a
-  # given time could be found.
+  # given time could be found. Such cases arise when a local time falls in the
+  # gap that occurs when the clocks are put forward for daylight savings time.
   class PeriodNotFound < StandardError
+  end
+
+  # {InvalidLocalDate} is raised by {Timezone#advance_local} when a local
+  # calendar month move targets a day that does not exist (for example,
+  # 30 February) and the `:month_overflow` option has been set to
+  # `:raise`.
+  class InvalidLocalDate < StandardError
   end
 
   # {InvalidTimezoneIdentifier} is raised by {Timezone.get} if the identifier
@@ -923,6 +931,191 @@ module TZInfo
       TimestampWithOffset.new(ts.value - utc_offset, sub_second, utc_offset).set_timezone_offset(timezone_offset)
     end
 
+    # Returns the result of adding a number of seconds of elapsed time to the
+    # given time.
+    #
+    # The addition is performed against the UTC timeline: the result is exactly
+    # `seconds` seconds later than `time`, regardless of any transitions the
+    # time zone may make in between. The local wall clock representation of the
+    # result can therefore land on a different hour, minute or even calendar day
+    # than a naive local addition would. This is the entry point to use for
+    # statements such as "24 hours from now".
+    #
+    # To move by local calendar units instead (for example, "the same time on
+    # the same day next month"), use {#advance_local}.
+    #
+    # `seconds` may be any `Numeric`. A negative value moves backwards in time.
+    # Any fractional part is combined with the sub-second part of `time` (using
+    # exact `Rational` arithmetic when `seconds` is a `Rational`), so sub-second
+    # precision is preserved.
+    #
+    # The result has the same type as `time` (`Time`, `DateTime` or
+    # {Timestamp}) and is returned as a local time for the time zone (with the
+    # appropriate {TimeWithOffset#timezone_offset timezone_offset},
+    # {DateTimeWithOffset#timezone_offset timezone_offset} or
+    # {TimestampWithOffset#timezone_offset timezone_offset}). The UTC offset
+    # recorded on the result is the offset observed by the time zone at the
+    # resulting instant, never that of the system time zone.
+    #
+    # @param time [Object] a `Time`, `DateTime` or {Timestamp}.
+    # @param seconds [Numeric] the number of elapsed seconds to add.
+    # @return [Object] the result as a {TimeWithOffset}, {DateTimeWithOffset} or
+    #   {TimestampWithOffset}.
+    # @raise [ArgumentError] if `time` is `nil`.
+    # @raise [ArgumentError] if `seconds` is not a `Numeric`.
+    # @raise [ArgumentError] if `time` is a {Timestamp} that does not have a
+    #   specified UTC offset.
+    def add_elapsed_seconds(time, seconds)
+      raise ArgumentError, 'time must be specified' unless time
+      raise ArgumentError, 'seconds must be a Numeric' unless seconds.kind_of?(Numeric)
+
+      Timestamp.for(time) do |ts|
+        whole = seconds.floor
+        sub_second = ts.sub_second + (seconds - whole)
+        whole += sub_second.floor
+        sub_second -= sub_second.floor
+
+        # sub_second is now in the range 0...1.
+        result = Timestamp.send(:new!, ts.value + whole, sub_second, ts.utc? ? :utc : ts.utc_offset)
+        to_local(result)
+      end
+    end
+
+    # Returns the result of advancing the given time by local calendar months
+    # and/or days.
+    #
+    # The local wall clock date and time (year, month, day, hour, minute,
+    # second and sub-second) are moved as calendar units, keeping the time of
+    # day. Because calendar units do not have a fixed length on the UTC
+    # timeline, the elapsed duration depends on the offsets in force at both
+    # ends. This is the entry point to use for statements such as "the same
+    # time tomorrow" or "one month from now".
+    #
+    # To add an exact duration instead, use {#add_elapsed_seconds}.
+    #
+    # The time of day (hour, minute, second and sub-second) is preserved
+    # exactly. Only local calendar data for the time zone represented by `self`
+    # is ever consulted; the system time zone is not used.
+    #
+    # Three kinds of irregularity can arise and must each be resolved
+    # explicitly:
+    #
+    # Month end overflow occurs when the target month does not contain the
+    # day number of the original date (for example, advancing 31 January by one
+    # month reaches 31 February). It is controlled by the `:month_overflow`
+    # option:
+    #
+    # - `:clamp` (the default) - move backwards to the last valid day of the
+    #   target month (28 or 29 February in the example).
+    # - `:raise` - raise an {InvalidLocalDate} exception.
+    #
+    # A gap occurs when the resulting local wall clock time does not exist,
+    # typically because the clocks are put forward for daylight savings time.
+    # It is controlled by the `:gap` option:
+    #
+    # - `:raise` (the default) - raise a {PeriodNotFound} exception.
+    # - `:before` - interpret the missing time using the offset that was in
+    #   force immediately before the transition (the instant just before the
+    #   clocks jump).
+    # - `:after` - interpret the missing time using the offset that comes into
+    #   force immediately after the transition (the instant just after the
+    #   clocks jump).
+    #
+    # An ambiguous result occurs when the resulting local wall clock time
+    # exists twice, typically because the clocks are put back at the end of
+    # daylight savings time. It is controlled by the `:ambiguous` option:
+    #
+    # - `:raise` (the default) - raise an {AmbiguousTime} exception.
+    # - `:before` - choose the earlier occurrence, using the offset that was in
+    #   force immediately before the transition.
+    # - `:after` - choose the later occurrence, using the offset that comes
+    #   into force immediately after the transition.
+    #
+    # The result has the same type as `time` (`Time`, `DateTime` or
+    # {Timestamp}) and is returned as a local time for the time zone, with the
+    # offset observed at the resulting instant and the sub-second part of
+    # `time` preserved.
+    #
+    # @param time [Object] a `Time`, `DateTime` or {Timestamp}.
+    # @param months [Integer] the number of local calendar months to advance
+    #   (may be negative).
+    # @param days [Integer] the number of local calendar days to advance after
+    #   the month move (may be negative).
+    # @param options [Hash] the resolution options.
+    # @option options [Symbol] :month_overflow (:clamp) either `:clamp` or
+    #   `:raise`.
+    # @option options [Symbol] :gap (:raise) either `:raise`, `:before` or
+    #   `:after`.
+    # @option options [Symbol] :ambiguous (:raise) either `:raise`, `:before`
+    #   or `:after`.
+    # @return [Object] the result as a {TimeWithOffset}, {DateTimeWithOffset} or
+    #   {TimestampWithOffset}.
+    # @raise [ArgumentError] if `time` is `nil`.
+    # @raise [ArgumentError] if `months` or `days` is not an `Integer`.
+    # @raise [ArgumentError] if any option has an invalid value or an unknown
+    #   option is supplied.
+    # @raise [ArgumentError] if `time` is a {Timestamp} that does not have a
+    #   specified UTC offset.
+    # @raise [InvalidLocalDate] if the target day does not exist in the target
+    #   month and `:month_overflow` is `:raise`.
+    # @raise [PeriodNotFound] if the result falls in a gap and `:gap` is
+    #   `:raise`.
+    # @raise [AmbiguousTime] if the result is ambiguous and `:ambiguous` is
+    #   `:raise`.
+    def advance_local(time, months = 0, days = 0, options = nil)
+      raise ArgumentError, 'time must be specified' unless time
+      raise ArgumentError, 'months must be an Integer' unless months.kind_of?(Integer)
+      raise ArgumentError, 'days must be an Integer' unless days.kind_of?(Integer)
+
+      options = {} if options.nil?
+      raise ArgumentError, 'options must be a Hash' unless options.kind_of?(Hash)
+      month_overflow = options.fetch(:month_overflow, :clamp)
+      unless month_overflow == :clamp || month_overflow == :raise
+        raise ArgumentError, ':month_overflow must be :clamp or :raise'
+      end
+
+      gap = options.fetch(:gap, :raise)
+      unless gap == :raise || gap == :before || gap == :after
+        raise ArgumentError, ':gap must be :raise, :before or :after'
+      end
+
+      ambiguous = options.fetch(:ambiguous, :raise)
+      unless ambiguous == :raise || ambiguous == :before || ambiguous == :after
+        raise ArgumentError, ':ambiguous must be :raise, :before or :after'
+      end
+
+      ignored = options.keys - [:month_overflow, :gap, :ambiguous]
+      unless ignored.empty?
+        raise ArgumentError, "unknown option#{ignored.length == 1 ? '' : 's'}: #{ignored.map(&:inspect).join(', ')}"
+      end
+
+      Timestamp.for(time) do |ts|
+        raise ArgumentError, 'time must have a specified utc_offset' unless ts.utc_offset
+
+        local_seconds, hour, minute, second, sub_second = local_civil(ts)
+
+        year, month, day = civil_from_days(local_seconds / 86400)
+
+        if months != 0
+          total_months = (year * 12) + (month - 1) + months
+          year = total_months / 12
+          month = (total_months % 12) + 1
+
+          length = month_length(year, month)
+          if day > length
+            raise InvalidLocalDate, "#{day} is not a valid day of #{year}-#{month}" if month_overflow == :raise
+            day = length
+          end
+        end
+
+        day += days
+
+        target_value = civil_to_seconds(year, month, day, hour, minute, second)
+        target = Timestamp.send(:new!, target_value, sub_second, nil)
+        resolve_local(target, gap, ambiguous)
+      end
+    end
+
     # Returns the unique offsets used by the time zone up to a given time (`to`)
     # as an `Array` of {TimezoneOffset} instances.
     #
@@ -1149,6 +1342,161 @@ module TZInfo
     end
 
     private
+
+    # Resolves an unspecified-offset {Timestamp} representing a local wall clock
+    # time in this time zone to an instant, returning the local result as a
+    # {TimestampWithOffset}.
+    #
+    # @param local_timestamp [Timestamp] a {Timestamp} without a specified UTC
+    #   offset representing the desired local wall clock time.
+    # @param gap [Symbol] how to resolve local times that do not exist
+    #   (`:raise`, `:before` or `:after`).
+    # @param ambiguous [Symbol] how to resolve local times that occur more than
+    #   once (`:raise`, `:before` or `:after`).
+    # @return [TimestampWithOffset] the resolved local time.
+    # @raise [PeriodNotFound] if `local_timestamp` falls in a gap and `gap` is
+    #   `:raise`.
+    # @raise [AmbiguousTime] if `local_timestamp` is ambiguous and `ambiguous`
+    #   is `:raise`.
+    def resolve_local(local_timestamp, gap, ambiguous)
+      periods = periods_for_local(local_timestamp)
+
+      if periods.size == 1
+        period = periods.first
+      elsif periods.empty?
+        if gap == :raise
+          raise PeriodNotFound, "#{local_timestamp.strftime('%Y-%m-%d %H:%M:%S')} is an invalid local time."
+        end
+
+        period = gap_period(local_timestamp, gap)
+      else
+        if ambiguous == :raise
+          raise AmbiguousTime, "#{local_timestamp.strftime('%Y-%m-%d %H:%M:%S')} is an ambiguous local time."
+        end
+
+        # The earlier occurrence (using the pre-transition offset) maps to the
+        # smaller UTC value.
+        period = ambiguous == :before ?
+          periods.min_by {|p| local_timestamp.value - p.observed_utc_offset} :
+          periods.max_by {|p| local_timestamp.value - p.observed_utc_offset}
+      end
+
+      utc_value = local_timestamp.value - period.observed_utc_offset
+      result = Timestamp.send(:new!, utc_value, local_timestamp.sub_second, period.observed_utc_offset)
+      TimestampWithOffset.set_timezone_offset(result, period_for(result.utc).offset)
+    end
+
+    # Finds the {TimezonePeriod} whose offset should be used to interpret a
+    # local wall clock time that falls in a gap.
+    #
+    # @param local_timestamp [Timestamp] a {Timestamp} without a specified UTC
+    #   offset that falls within a spring-forward gap.
+    # @param gap [Symbol] either `:before` (use the offset in force before the
+    #   jump) or `:after` (use the offset in force after the jump).
+    # @return [TimezonePeriod] the period providing the chosen offset.
+    def gap_period(local_timestamp, gap)
+      # Offsets are bounded to within a day of the local value, so any
+      # transition defining the gap starts within a day either side on the UTC
+      # timeline.
+      to = Timestamp.utc(local_timestamp.value + 86401)
+      from = Timestamp.utc(local_timestamp.value - 86401)
+      transitions = transitions_up_to(to, from)
+
+      transition = transitions.find do |t|
+        previous_offset = t.previous_offset.observed_utc_offset
+        offset = t.offset.observed_utc_offset
+        local_end = t.timestamp_value + previous_offset
+        local_start = t.timestamp_value + offset
+        local_timestamp.value >= local_end && local_timestamp.value < local_start
+      end
+
+      period_for(Timestamp.utc(transition.timestamp_value + (gap == :before ? -1 : 0)))
+    end
+
+    # Splits a {Timestamp} (with a specified offset) into the local whole
+    # seconds since 1970-01-01 00:00:00 (ignoring leap seconds), hour, minute,
+    # second and sub-second at the time of day.
+    #
+    # @param timestamp [Timestamp] a {Timestamp} with a specified UTC offset.
+    # @return [Array(Integer, Integer, Integer, Integer, Numeric)] the local
+    #   whole seconds value, hour, minute, second and sub-second.
+    def local_civil(timestamp)
+      offset = timestamp.utc? ? 0 : timestamp.utc_offset
+      local_seconds = timestamp.value + offset
+      day_seconds = local_seconds % 86400
+      hour, remaining = day_seconds.divmod(3600)
+      minute, second = remaining.divmod(60)
+      [local_seconds, hour, minute, second, timestamp.sub_second]
+    end
+
+    # Converts a proleptic Gregorian calendar day number (0 being
+    # 1970-01-01) to a year, month and day. Based on civil_from_days from
+    # https://howardhinnant.github.io/date_algorithms.html#civil_from_days,
+    # adapted for Ruby's floor division (the reference uses C/C++ truncation
+    # towards zero).
+    #
+    # @param days [Integer] the number of days since 1970-01-01.
+    # @return [Array(Integer, Integer, Integer)] the year, month (1-12) and day
+    #   of the month (1-31).
+    def civil_from_days(days)
+      z = days + 719468
+      era = z / 146097
+      doe = z - era * 146097
+      yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+      y = yoe + era * 400
+      doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+      mp = (5 * doy + 2) / 153
+      d = doy - (153 * mp + 2) / 5 + 1
+      m = mp + (mp < 10 ? 3 : -9)
+      [y + (m <= 2 ? 1 : 0), m, d]
+    end
+
+    # Returns the number of days in the given month of the given proleptic
+    # Gregorian calendar year.
+    #
+    # @param year [Integer] the year.
+    # @param month [Integer] the month (1-12).
+    # @return [Integer] the number of days in the month.
+    def month_length(year, month)
+      if month == 2
+        leap_year?(year) ? 29 : 28
+      else
+        [4, 6, 9, 11].include?(month) ? 30 : 31
+      end
+    end
+
+    # Determines whether the given proleptic Gregorian calendar year is a leap
+    # year.
+    #
+    # @param year [Integer] the year.
+    # @return [Boolean] `true` if `year` is a leap year, otherwise `false`.
+    def leap_year?(year)
+      (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    end
+
+    # Converts a proleptic Gregorian calendar date and time of day to the whole
+    # seconds since 1970-01-01 00:00:00 interpreted as an unzoned local wall
+    # clock time. Equivalent to {Timestamp.create} with an unspecified offset.
+    #
+    # @param year [Integer] the year.
+    # @param month [Integer] the month (1-12).
+    # @param day [Integer] the day of the month.
+    # @param hour [Integer] the hour (0-23).
+    # @param minute [Integer] the minute (0-59).
+    # @param second [Integer] the second (0-59).
+    # @return [Integer] the whole seconds value.
+    def civil_to_seconds(year, month, day, hour, minute, second)
+      # Based on days_from_civil from
+      # https://howardhinnant.github.io/date_algorithms.html#days_from_civil
+      after_february = month > 2
+      year -= 1 unless after_february
+      era = year / 400
+      year_of_era = year - era * 400
+      day_of_year = (153 * (month + (after_february ? -3 : 9)) + 2) / 5 + day - 1
+      day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+      days_since_epoch = era * 146097 + day_of_era - 719468
+      ((days_since_epoch * 24 + hour) * 60 + minute) * 60 + second
+    end
 
     # Raises an {UnknownTimezone} exception.
     #
