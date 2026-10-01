@@ -470,6 +470,62 @@ end
 interactor should have a single purpose, there should be no need to clean up
 after any failed interactor.
 
+#### Resumable Sub-Flows
+
+Sometimes an organizer builds core data and then wants to try an *optional*
+follow-up. If that follow-up fails, only the follow-up should be undone; the
+core work must remain and the flow should continue. Calling the follow-up
+directly does not give you this, because a failed context rolls back every
+interactor tracked so far.
+
+Use `context.attempt` to run an interactor as an explicit, resumable
+sub-flow. The sub-flow shares the same context, but a rollback boundary is
+recorded first:
+
+```ruby
+class PlaceOrder
+  include Interactor::Organizer
+
+  def call
+    CreateOrder.call!(context)
+    ChargeCard.call!(context)
+
+    # Optional: a receipt failure must not undo the order or the charge.
+    context.attempt(SendReceipt) do |failure|
+      context.receipt_error = failure.error
+      ReceiptFailureJob.perform_later(context.order.id)
+    end
+  end
+end
+```
+
+When the sub-flow **succeeds**, its output keys and its completed interactors
+join the outer flow. If the outer flow fails later on, those steps still take
+part in the normal reverse-order rollback.
+
+When the sub-flow calls `fail!`:
+
+- only the steps completed after entering the sub-flow are rolled back, in
+  reverse order;
+- the sub-flow's additions, removals, and overwrites of top-level context
+  keys are discarded, restoring them to their values at the boundary;
+- the context is marked successful again, and the block (if given) is called
+  with a snapshot of the failed context, from which the failure reason and
+  other data can be read;
+- the outer flow then continues.
+
+Without a block, the failure is simply contained and execution continues with
+the next line.
+
+`attempt` only contains business failures raised by `fail!` against the same
+context. Any other exception is an unexpected error and propagates normally,
+rolling back the flow as it unwinds; the recovery block is not invoked.
+
+Key restoration is intentionally **shallow**. Values are not deep-copied, so
+mutations made in place inside an object referenced by the context are not
+undone. Keep sub-flow side effects in top-level keys, or undo them explicitly
+with a `rollback` method.
+
 ## Testing Interactors
 
 When written correctly, an interactor is easy to test because it only *does* one

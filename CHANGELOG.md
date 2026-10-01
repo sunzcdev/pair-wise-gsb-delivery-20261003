@@ -1,3 +1,6 @@
+## Unreleased
+* [FEATURE] Add `Context#attempt` for resumable sub-flows: a business failure rolls back only the sub-flow's steps and top-level context keys and is handed to a recovery block, while successful sub-flows merge back into the outer flow.
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

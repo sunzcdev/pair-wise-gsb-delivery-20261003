@@ -147,7 +147,10 @@ module Interactor
       context.called!(self)
     end
   rescue
-    context.rollback!
+    # While a resumable sub-flow is active, its "attempt" owns the rollback
+    # decision for business failures; ordinary exceptions are rolled back once
+    # by the outermost unwind. Only roll back here at the top level.
+    context._rollback_all! if context._attempt_depth.zero?
     raise
   end
 
