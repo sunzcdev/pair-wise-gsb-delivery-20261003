@@ -17,15 +17,18 @@ module GraphQL
       NO_ARGS = GraphQL::EmptyObjects::EMPTY_HASH
       EXCLUSIVE_COMPARISON = 1
       NONEXCLUSIVE_COMPARISON = 2
+      EMPTY_SPREAD_CHAIN = [].freeze
+      EMPTY_RESPONSE_PATH = [].freeze
 
       class Field
-        attr_reader :node, :definition, :owner_type, :parents
+        attr_reader :node, :definition, :owner_type, :parents, :spread_chain
 
-        def initialize(node, definition, owner_type, parents)
+        def initialize(node, definition, owner_type, parents, spread_chain)
           @node = node
           @definition = definition
           @owner_type = owner_type
           @parents = parents
+          @spread_chain = spread_chain
         end
 
         def return_type
@@ -46,6 +49,9 @@ module GraphQL
         @conflict_count = 0
         @max_errors = context.max_errors
         @fragments = context.fragments
+        # Response-key path (aliases included) from the operation root to the
+        # selection set currently being analyzed. Used for conflict diagnostics.
+        @response_path = []
         # Track which sub-selection node pairs have been compared to prevent
         # infinite recursion with cyclic fragments
         @compared_sub_selections = {}.compare_by_identity
@@ -66,12 +72,17 @@ module GraphQL
       end
 
       def on_field(node, _parent)
-        if !node.selections.empty? && selections_may_conflict?(node.selections)
-          @conflicts = nil
-          conflicts_within_selection_set(node, type_definition)
-          @conflicts&.each_value { |error_type| error_type.each_value { |error| add_error(error) } }
+        @response_path.push(node.alias || node.name)
+        begin
+          if !node.selections.empty? && selections_may_conflict?(node.selections)
+            @conflicts = nil
+            conflicts_within_selection_set(node, type_definition)
+            @conflicts&.each_value { |error_type| error_type.each_value { |error| add_error(error) } }
+          end
+          super
+        ensure
+          @response_path.pop
         end
-        super
       end
 
       private
@@ -132,18 +143,18 @@ module GraphQL
         response_keys = collect_fields(node.selections, owner_type: parent_type, parents: [])
 
         # Find conflicts within each response key group
-        find_conflicts_within(response_keys)
+        find_conflicts_within(response_keys, @response_path)
       end
 
       # Collect all fields from selections, expanding fragment spreads inline.
       # Returns a Hash of { response_key => Field | [Field, ...] }
       def collect_fields(selections, owner_type:, parents:)
         response_keys = {}
-        collect_fields_inner(selections, owner_type: owner_type, parents: parents, response_keys: response_keys, visited_fragments: nil)
+        collect_fields_inner(selections, owner_type: owner_type, parents: parents, spreads: EMPTY_SPREAD_CHAIN, response_keys: response_keys, visited_fragments: nil)
         response_keys
       end
 
-      def collect_fields_inner(selections, owner_type:, parents:, response_keys:, visited_fragments:)
+      def collect_fields_inner(selections, owner_type:, parents:, spreads:, response_keys:, visited_fragments:)
         deferred_spreads = nil
         sel_idx = 0
         sel_len = selections.size
@@ -155,7 +166,7 @@ module GraphQL
           when GraphQL::Language::Nodes::Field
             definition = @types.field(owner_type, sel.name)
             key = sel.alias || sel.name
-            field = Field.new(sel, definition, owner_type, parents)
+            field = Field.new(sel, definition, owner_type, parents, spreads)
             existing = response_keys[key]
 
             if existing.nil?
@@ -171,7 +182,14 @@ module GraphQL
             if frag_type
               new_parents = parents.dup
               new_parents << frag_type
-              collect_fields_inner(sel.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments)
+              new_spreads = if sel.type
+                s = spreads.dup
+                s << [:inline_fragment, nil, sel.type.name]
+                s
+              else
+                spreads
+              end
+              collect_fields_inner(sel.selections, owner_type: frag_type, parents: new_parents, spreads: new_spreads, response_keys: response_keys, visited_fragments: visited_fragments)
             end
           when GraphQL::Language::Nodes::FragmentSpread
             (deferred_spreads ||= []) << sel
@@ -199,12 +217,14 @@ module GraphQL
 
             new_parents = parents.dup
             new_parents << frag_type
-            collect_fields_inner(frag.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments)
+            new_spreads = spreads.dup
+            new_spreads << [:fragment, sel.name, frag.type.name]
+            collect_fields_inner(frag.selections, owner_type: frag_type, parents: new_parents, spreads: new_spreads, response_keys: response_keys, visited_fragments: visited_fragments)
           end
         end
       end
 
-      def find_conflicts_within(response_keys)
+      def find_conflicts_within(response_keys, response_path)
         response_keys.each do |key, fields|
           next unless fields.is_a?(Array)
 
@@ -224,7 +244,7 @@ module GraphQL
             end
 
             if all_same
-              find_conflicts_between_selection_groups(key, fields)
+              find_conflicts_between_selection_groups(key, fields, response_path)
             else
               groups = fields.group_by { |f| field_signature(f) }
               unique_groups = groups.values
@@ -234,14 +254,14 @@ module GraphQL
               while gi < unique_groups.size
                 gj = gi + 1
                 while gj < unique_groups.size
-                  find_conflict(key, unique_groups[gi][0], unique_groups[gj][0])
+                  find_conflict(key, unique_groups[gi][0], unique_groups[gj][0], response_path: response_path)
                   gj += 1
                 end
 
                 # Within the same group, fields can only conflict on sub-selections.
                 group = unique_groups[gi]
                 if group.size >= 2
-                  find_conflicts_between_selection_groups(key, group)
+                  find_conflicts_between_selection_groups(key, group, response_path)
                 end
 
                 gi += 1
@@ -253,7 +273,7 @@ module GraphQL
             while i < fields.size
               j = i + 1
               while j < fields.size
-                find_conflict(key, fields[i], fields[j])
+                find_conflict(key, fields[i], fields[j], response_path: response_path)
                 j += 1
               end
               i += 1
@@ -262,7 +282,7 @@ module GraphQL
         end
       end
 
-      def find_conflicts_between_selection_groups(response_key, fields)
+      def find_conflicts_between_selection_groups(response_key, fields, response_path)
         fields_by_selection = {}
         fields.each do |field|
           fields_by_selection[field_selection_signature(field)] ||= field
@@ -273,7 +293,7 @@ module GraphQL
         while i < representatives.size
           j = i + 1
           while j < representatives.size
-            find_conflict(response_key, representatives[i], representatives[j])
+            find_conflict(response_key, representatives[i], representatives[j], response_path: response_path)
             j += 1
           end
           i += 1
@@ -306,7 +326,7 @@ module GraphQL
         end
       end
 
-      def find_conflict(response_key, field1, field2, mutually_exclusive: false)
+      def find_conflict(response_key, field1, field2, mutually_exclusive: false, response_path: EMPTY_RESPONSE_PATH)
         return if @conflict_count >= @max_errors
         return if field1.definition.nil? || field2.definition.nil?
 
@@ -321,6 +341,7 @@ module GraphQL
 
             conflict.add_conflict(node1, node1.name)
             conflict.add_conflict(node2, node2.name)
+            conflict.add_evidence(build_conflict_evidence(response_path, response_key, field1, node1.name, field2, node2.name, false))
 
             @conflict_count += 1
           end
@@ -330,6 +351,7 @@ module GraphQL
 
             conflict.add_conflict(node1, GraphQL::Language.serialize(serialize_field_args(node1)))
             conflict.add_conflict(node2, GraphQL::Language.serialize(serialize_field_args(node2)))
+            conflict.add_evidence(build_conflict_evidence(response_path, response_key, field1, GraphQL::Language.serialize(serialize_field_args(node1)), field2, GraphQL::Language.serialize(serialize_field_args(node2)), false))
 
             @conflict_count += 1
           end
@@ -379,6 +401,7 @@ module GraphQL
 
             conflict.add_conflict(node1, "`#{t1.to_type_signature}`")
             conflict.add_conflict(node2, "`#{t2.to_type_signature}`")
+            conflict.add_evidence(build_conflict_evidence(response_path, response_key, field1, "`#{t1.to_type_signature}`", field2, "`#{t2.to_type_signature}`", are_mutually_exclusive))
             @conflict_count += 1
           end
         end
@@ -387,6 +410,8 @@ module GraphQL
           field1,
           field2,
           mutually_exclusive: are_mutually_exclusive,
+          response_path: response_path,
+          response_key: response_key,
         )
       end
 
@@ -416,7 +441,7 @@ module GraphQL
 
       # When two fields with the same response key both have sub-selections,
       # we need to check those sub-selections against each other.
-      def find_conflicts_between_sub_selection_sets(field1, field2, mutually_exclusive:)
+      def find_conflicts_between_sub_selection_sets(field1, field2, mutually_exclusive:, response_path:, response_key:)
         return if field1.definition.nil? ||
           field2.definition.nil? ||
           (field1.node.selections.empty? && field2.node.selections.empty?)
@@ -443,7 +468,7 @@ module GraphQL
         response_keys1 = cached_sub_fields(node1, return_type1)
         response_keys2 = cached_sub_fields(node2, return_type2)
 
-        find_conflicts_between(response_keys1, response_keys2, mutually_exclusive: mutually_exclusive)
+        find_conflicts_between(response_keys1, response_keys2, mutually_exclusive: mutually_exclusive, response_path: response_path + [response_key])
       end
 
       def cached_sub_fields(node, return_type)
@@ -460,7 +485,7 @@ module GraphQL
         end
       end
 
-      def find_conflicts_between(response_keys, response_keys2, mutually_exclusive:)
+      def find_conflicts_between(response_keys, response_keys2, mutually_exclusive:, response_path:)
         response_keys.each do |key, fields|
           fields2 = response_keys2[key]
           next unless fields2
@@ -476,10 +501,86 @@ module GraphQL
                 field,
                 field2,
                 mutually_exclusive: mutually_exclusive,
+                response_path: response_path,
               )
             end
           end
         end
+      end
+
+      # Build a structured description of why two fields met at the same
+      # response position: the response path of the conflict, the fragment
+      # chain each side was reached through, and the concrete object types
+      # on which both sides can appear together.
+      def build_conflict_evidence(response_path, response_key, field1, detail1, field2, detail2, mutually_exclusive)
+        evidence = {
+          "responsePath" => response_path + [response_key],
+          "reachableOn" => reachable_object_type_names(field1, field2),
+          "sides" => [
+            conflict_side_evidence(field1, detail1),
+            conflict_side_evidence(field2, detail2),
+          ],
+        }
+
+        if mutually_exclusive
+          # Return type conflicts are reported even when the type conditions
+          # can never co-occur; say so explicitly instead of implying
+          # (with an empty `reachableOn`) that the evidence is missing.
+          evidence["mutuallyExclusive"] = true
+        end
+
+        evidence
+      end
+
+      def conflict_side_evidence(field, detail)
+        node = field.node
+        side = {
+          "field" => node.name,
+          "detail" => detail,
+          "location" => { "line" => node.line, "column" => node.col },
+        }
+
+        if (node_alias = node.alias)
+          side["alias"] = node_alias
+        end
+
+        spread_chain = field.spread_chain
+        if !spread_chain.empty?
+          side["via"] = spread_chain.map do |kind, name, type_name|
+            if kind == :fragment
+              { "kind" => "fragment", "name" => name, "typeCondition" => type_name }
+            else
+              { "kind" => "inlineFragment", "typeCondition" => type_name }
+            end
+          end
+        end
+
+        side
+      end
+
+      # The concrete object types on which both fields can be selected at the
+      # same time — the intersection of the possible types of each side's
+      # owner type and fragment type conditions (interfaces and unions
+      # included). Empty when the two sides are mutually exclusive.
+      def reachable_object_type_names(field1, field2)
+        shared = possible_object_types_for(field1) & possible_object_types_for(field2)
+        shared.map(&:graphql_name).sort
+      end
+
+      def possible_object_types_for(field)
+        possible = nil
+        owner_type = field.owner_type
+        if owner_type
+          possible = @types.possible_types(owner_type)
+        end
+
+        field.parents.each do |parent_type|
+          parent_possible = @types.possible_types(parent_type)
+          possible = possible ? (possible & parent_possible) : parent_possible
+          break if possible.empty?
+        end
+
+        possible || GraphQL::EmptyObjects::EMPTY_ARRAY
       end
 
       def field_groups_already_compared?(fields, fields2, mutually_exclusive)

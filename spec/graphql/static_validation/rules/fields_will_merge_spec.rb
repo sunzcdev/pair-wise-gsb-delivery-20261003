@@ -478,7 +478,21 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
             {"line"=>8, "column"=>11}
           ],
           "path"=>[],
-          "extensions"=>{"code"=>"fieldConflict", "fieldName"=>"x", "conflicts"=>"name or nickname"}
+          "extensions"=>{
+            "code"=>"fieldConflict",
+            "fieldName"=>"x",
+            "conflicts"=>"name or nickname",
+            "conflictEvidence"=>[
+              {
+                "responsePath"=>["dog", "x"],
+                "reachableOn"=>["Dog"],
+                "sides"=>[
+                  {"field"=>"name", "detail"=>"name", "location"=>{"line"=>4, "column"=>11}, "alias"=>"x"},
+                  {"field"=>"nickname", "detail"=>"nickname", "location"=>{"line"=>8, "column"=>11}, "alias"=>"x"}
+                ]
+              }
+            ]
+          }
         }
       ]
       assert_equal expected_errors, errors
@@ -605,7 +619,22 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
           "extensions"=>
           {"code"=>"fieldConflict",
            "fieldName"=>"name",
-           "conflicts"=>"name or __typename"}
+           "conflicts"=>"name or __typename",
+           "conflictEvidence"=>[
+             {"responsePath"=>["dog", "name"],
+              "reachableOn"=>["Dog"],
+              "sides"=>[
+                {"field"=>"name", "detail"=>"name", "location"=>{"line"=>4, "column"=>11}},
+                {"field"=>"__typename",
+                 "detail"=>"__typename",
+                 "location"=>{"line"=>14, "column"=>9},
+                 "alias"=>"name",
+                 "via"=>[
+                   {"kind"=>"fragment", "name"=>"D", "typeCondition"=>"Dog"},
+                   {"kind"=>"fragment", "name"=>"D2", "typeCondition"=>"Dog"}
+                 ]}
+              ]}
+           ]}
         }
       ], errors
     end
@@ -829,7 +858,18 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
           "extensions"=> {
             "code"=>"fieldConflict",
             "fieldName"=>"field",
-            "conflicts"=>"{categories:\"[A, B]\"} or {categories:\"[A, B, C]\"}"
+            "conflicts"=>"{categories:\"[A, B]\"} or {categories:\"[A, B, C]\"}",
+            "conflictEvidence"=>[
+              {"responsePath"=>["field"],
+               "reachableOn"=>["Query"],
+               "sides"=>[
+                 {"field"=>"field", "detail"=>"{categories:\"[A, B]\"}", "location"=>{"line"=>3, "column"=>11}},
+                 {"field"=>"field",
+                  "detail"=>"{categories:\"[A, B, C]\"}",
+                  "location"=>{"line"=>7, "column"=>11},
+                  "via"=>[{"kind"=>"fragment", "name"=>"Q", "typeCondition"=>"Query"}]}
+               ]}
+            ]
           }
         }
 
@@ -1262,7 +1302,22 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
         "extensions"=>
           {"code"=>"fieldConflict",
            "fieldName"=>"spots",
-           "conflicts"=>"`Boolean` or `Int`"}
+           "conflicts"=>"`Boolean` or `Int`",
+           "conflictEvidence"=>[
+             {"responsePath"=>["thing", "spots"],
+              "reachableOn"=>[],
+              "sides"=>[
+                {"field"=>"spots",
+                 "detail"=>"`Boolean`",
+                 "location"=>{"line"=>3, "column"=>26},
+                 "via"=>[{"kind"=>"inlineFragment", "typeCondition"=>"Dog"}]},
+                {"field"=>"spots",
+                 "detail"=>"`Int`",
+                 "location"=>{"line"=>4, "column"=>29},
+                 "via"=>[{"kind"=>"inlineFragment", "typeCondition"=>"Jaguar"}]}
+              ],
+              "mutuallyExclusive"=>true}
+           ]}
         }
       assert_equal [expected_error], res.map(&:to_h)
     end
@@ -1950,6 +2005,268 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
 
       res = DuplicateAliasesSchema.execute(query_str)
       assert_equal ["Field 'info' has a field conflict: name or id?"], res["errors"].map { |e| e["message"] }
+    end
+  end
+
+  describe "conflict evidence diagnostics" do
+    def conflict_evidence
+      errors.first.dig("extensions", "conflictEvidence")
+    end
+
+    describe "response path through nested selection sets" do
+      let(:query_string) {%|
+        {
+          dog {
+            toys {
+              x: name
+            }
+          }
+
+          dog {
+            toys {
+              x: size
+            }
+          }
+        }
+      |}
+
+      it "reports the full response path, both aliases, and the shared object type" do
+        assert_equal 1, conflict_evidence.size
+        entry = conflict_evidence.first
+
+        assert_equal ["dog", "toys", "x"], entry["responsePath"]
+        assert_equal ["Toy"], entry["reachableOn"]
+        refute entry.key?("mutuallyExclusive")
+        assert_equal %w[name size], entry["sides"].map { |s| s["field"] }
+        assert_equal ["x", "x"], entry["sides"].map { |s| s["alias"] }
+
+        # The type evidence must hold up against the schema itself:
+        toy_type = schema.types["Toy"]
+        assert_equal [toy_type], schema.possible_types(toy_type)
+      end
+    end
+
+    describe "fragment chains for both sides" do
+      let(:query_string) {%|
+        {
+          pet {
+            ...A
+            ...B
+          }
+        }
+
+        fragment A on Pet {
+          x: name
+        }
+
+        fragment B on Pet {
+          x: nickname
+        }
+      |}
+
+      it "names the fragment and type condition each side came through" do
+        entry = conflict_evidence.first
+
+        assert_equal ["pet", "x"], entry["responsePath"]
+        side1, side2 = entry["sides"]
+        assert_equal [{"kind" => "fragment", "name" => "A", "typeCondition" => "Pet"}], side1["via"]
+        assert_equal [{"kind" => "fragment", "name" => "B", "typeCondition" => "Pet"}], side2["via"]
+
+        # Both sides are reachable on every object type of `Pet`:
+        pet_type = schema.types["Pet"]
+        assert_equal schema.possible_types(pet_type).map(&:graphql_name).sort, entry["reachableOn"]
+        assert_equal ["Cat", "Dog"], entry["reachableOn"]
+      end
+    end
+
+    describe "mixed inline fragments and named fragments" do
+      let(:query_string) {%|
+        {
+          pet {
+            ... on Dog {
+              ...B
+            }
+            ... on Dog {
+              ...C
+            }
+          }
+        }
+
+        fragment B on Dog {
+          x: name
+        }
+
+        fragment C on Dog {
+          x: nickname
+        }
+      |}
+
+      it "includes inline fragment type conditions in the chain" do
+        entry = conflict_evidence.first
+        side1, side2 = entry["sides"]
+
+        assert_equal [
+          {"kind" => "inlineFragment", "typeCondition" => "Dog"},
+          {"kind" => "fragment", "name" => "B", "typeCondition" => "Dog"}
+        ], side1["via"]
+        assert_equal [
+          {"kind" => "inlineFragment", "typeCondition" => "Dog"},
+          {"kind" => "fragment", "name" => "C", "typeCondition" => "Dog"}
+        ], side2["via"]
+        assert_equal ["Dog"], entry["reachableOn"]
+      end
+    end
+
+    describe "overlapping interfaces (cross-implemented interfaces)" do
+      let(:query_string) {%|
+        {
+          pet {
+            ... on Pet {
+              name
+            }
+            ... on Mammal {
+              name: nickname
+            }
+          }
+        }
+      |}
+
+      it "reports the object types implementing both interfaces" do
+        entry = conflict_evidence.first
+
+        assert_equal ["pet", "name"], entry["responsePath"]
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Pet"}], entry["sides"][0]["via"]
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Mammal"}], entry["sides"][1]["via"]
+
+        # Cross-check: the reachable types are exactly the objects implementing
+        # both `Pet` and `Mammal` in this schema.
+        pet_type = schema.types["Pet"]
+        mammal_type = schema.types["Mammal"]
+        expected = (schema.possible_types(pet_type) & schema.possible_types(mammal_type)).map(&:graphql_name).sort
+        assert_equal expected, entry["reachableOn"]
+        assert_equal ["Cat", "Dog"], entry["reachableOn"]
+      end
+    end
+
+    describe "interface inheritance" do
+      let(:schema) {
+        GraphQL::Schema.from_definition(%|
+          interface Node {
+            id: ID
+          }
+
+          interface Resource implements Node {
+            id: ID
+            name: String
+          }
+
+          type Repository implements Node & Resource {
+            id: ID
+            name: String
+          }
+
+          type Query {
+            node: Node
+          }
+        |)
+      }
+
+      let(:query_string) {%|
+        {
+          node {
+            ... on Node {
+              info: id
+            }
+            ... on Resource {
+              info: name
+            }
+          }
+        }
+      |}
+
+      it "narrows reachable types through the interface hierarchy" do
+        entry = conflict_evidence.first
+
+        assert_equal ["node", "info"], entry["responsePath"]
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Node"}], entry["sides"][0]["via"]
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Resource"}], entry["sides"][1]["via"]
+
+        node_type = schema.types["Node"]
+        resource_type = schema.types["Resource"]
+        expected = (schema.possible_types(node_type) & schema.possible_types(resource_type)).map(&:graphql_name).sort
+        assert_equal expected, entry["reachableOn"]
+        assert_equal ["Repository"], entry["reachableOn"]
+      end
+    end
+
+    describe "mutually exclusive type conditions" do
+      let(:schema) {
+        s = GraphQL::Schema.from_definition(%|
+          type Query {
+            thing: Thing
+          }
+
+          interface Thing {
+            name: String
+          }
+
+          type Dog implements Thing {
+            name: String
+            spots: Boolean
+          }
+
+          type Jaguar implements Thing {
+            name: String
+            spots: Int
+          }
+        |)
+        s.allow_legacy_invalid_return_type_conflicts(false)
+        s
+      }
+
+      let(:query_string) {%|
+        {
+          thing {
+            ... on Dog { spots }
+            ... on Jaguar { spots }
+          }
+        }
+      |}
+
+      it "does not fabricate shared object types for the conflict" do
+        entry = conflict_evidence.first
+
+        assert_equal ["thing", "spots"], entry["responsePath"]
+        assert_equal [], entry["reachableOn"]
+        assert_equal true, entry["mutuallyExclusive"]
+        # The sides and their fragment chains are still reported honestly:
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Dog"}], entry["sides"][0]["via"]
+        assert_equal [{"kind" => "inlineFragment", "typeCondition" => "Jaguar"}], entry["sides"][1]["via"]
+
+        # Confirm in the schema that no object type implements both sides:
+        dog_type = schema.types["Dog"]
+        jaguar_type = schema.types["Jaguar"]
+        assert_empty schema.possible_types(dog_type) & schema.possible_types(jaguar_type)
+      end
+    end
+
+    describe "union members with diverging aliases" do
+      let(:query_string) {%|
+        {
+          animal {
+            ... on Dog {
+              sound: barkVolume
+            }
+            ... on Cat {
+              sound: meowVolume
+            }
+          }
+        }
+      |}
+
+      it "produces no error and therefore no evidence" do
+        assert_equal [], errors
+      end
     end
   end
 end
