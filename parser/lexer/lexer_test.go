@@ -237,6 +237,26 @@ func TestLex(t *testing.T) {
 			},
 		},
 		{
+			`a -> b, c-d`,
+			[]Token{
+				{Kind: Identifier, Value: "a"},
+				{Kind: Operator, Value: "->"},
+				{Kind: Identifier, Value: "b"},
+				{Kind: Operator, Value: ","},
+				{Kind: Identifier, Value: "c"},
+				{Kind: Operator, Value: "-"},
+				{Kind: Identifier, Value: "d"},
+				{Kind: EOF},
+			},
+		},
+		{
+			`match`,
+			[]Token{
+				{Kind: Operator, Value: "match"},
+				{Kind: EOF},
+			},
+		},
+		{
 			`#index #1 #`,
 			[]Token{
 				{Kind: Operator, Value: "#"},

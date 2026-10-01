@@ -71,9 +71,33 @@ func Walk(node *Node, v Visitor) {
 	case *PairNode:
 		Walk(&n.Key, v)
 		Walk(&n.Value, v)
+	case *MatchNode:
+		Walk(&n.Expr, v)
+		for i := range n.Cases {
+			c := n.Cases[i]
+			walkPattern(c.Pattern, v)
+			if c.Guard != nil {
+				Walk(&c.Guard, v)
+			}
+			Walk(&c.Body, v)
+		}
+	case *WildcardPatternNode:
+	case *BindingPatternNode:
+	case *NilPatternNode:
+	case *LiteralPatternNode:
+		Walk(&n.Value, v)
+	case *VariantPatternNode:
+		for i := range n.Fields {
+			walkPattern(n.Fields[i].Pattern, v)
+		}
 	default:
 		panic(fmt.Sprintf("undefined node type (%T)", node))
 	}
 
 	v.Visit(node)
+}
+
+func walkPattern(p PatternNode, v Visitor) {
+	var node Node = p
+	Walk(&node, v)
 }

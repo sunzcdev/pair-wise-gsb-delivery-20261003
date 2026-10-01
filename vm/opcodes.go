@@ -7,6 +7,7 @@ const (
 	OpPush
 	OpInt
 	OpPop
+	OpDup // Duplicates the top of the stack.
 	OpStore
 	OpLoadVar
 	OpLoadConst
@@ -86,5 +87,7 @@ const (
 	OpBegin
 	OpAnd
 	OpOr
-	OpEnd // This opcode must be at the end of this list.
+	OpVariant   // Pops a value and pushes whether it is an instance of a registered variant.
+	OpFailMatch // Pushes a panic string constant and throws it.
+	OpEnd       // This opcode must be at the end of this list.
 )

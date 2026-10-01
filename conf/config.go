@@ -7,6 +7,7 @@ import (
 	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/checker/nature"
+	"github.com/expr-lang/expr/variants"
 	"github.com/expr-lang/expr/vm/runtime"
 )
 
@@ -36,6 +37,7 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	Variants     *variants.Registry // Closed variant sets available to match expressions.
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser

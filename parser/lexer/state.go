@@ -52,7 +52,14 @@ func root(l *Lexer) stateFn {
 		l.emit(Bracket)
 	case strings.ContainsRune(")]}", r):
 		l.emit(Bracket)
-	case strings.ContainsRune(",;%+-^", r): // single rune operator
+	case r == '-':
+		if l.peek() == '>' {
+			l.next()
+			l.emitValue(Operator, "->")
+		} else {
+			l.emit(Operator)
+		}
+	case strings.ContainsRune(",;%+^", r): // single rune operator
 		l.emit(Operator)
 	case strings.ContainsRune("&!=*<>", r): // possible double rune operator
 		l.accept("&=*")
@@ -137,7 +144,7 @@ loop:
 			switch l.word() {
 			case "not":
 				return not
-			case "in", "or", "and", "matches", "contains", "startsWith", "endsWith", "let":
+			case "in", "or", "and", "matches", "contains", "startsWith", "endsWith", "let", "match":
 				l.emit(Operator)
 			case "if", "else":
 				if !l.DisableIfOperator {

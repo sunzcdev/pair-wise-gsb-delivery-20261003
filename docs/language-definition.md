@@ -346,6 +346,22 @@ filter(posts, {
 
 :::
 
+## Match
+
+The `match` expression matches a value against patterns and evaluates the body
+of the first matching branch. Branches support destructuring, nested patterns,
+variable bindings and optional boolean guards. The host registers closed
+variant sets (sum types) with `expr.Variants`.
+
+```expr
+match event {
+  Created{ID: id}  -> { id }
+  Paid{Amount: a} if a > 100 -> { "large" }
+  _                -> { "unknown" }
+}
+```
+
+See [Match Expressions](match.md) for the full reference.
 ## String Functions
 
 ### trim(str[, chars]) {#trim}

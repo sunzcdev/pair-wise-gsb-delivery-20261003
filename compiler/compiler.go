@@ -288,6 +288,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.MapNode(n)
 	case *ast.PairNode:
 		c.PairNode(n)
+	case *ast.MatchNode:
+		c.MatchNode(n)
 	default:
 		panic(fmt.Sprintf("undefined node type (%T)", node))
 	}

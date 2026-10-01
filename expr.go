@@ -15,6 +15,7 @@ import (
 	"github.com/expr-lang/expr/optimizer"
 	"github.com/expr-lang/expr/parser"
 	"github.com/expr-lang/expr/patcher"
+	"github.com/expr-lang/expr/variants"
 	"github.com/expr-lang/expr/vm"
 )
 
@@ -222,6 +223,15 @@ func Timezone(name string) Option {
 func MaxNodes(n uint) Option {
 	return func(c *conf.Config) {
 		c.MaxNodes = n
+	}
+}
+
+// Variants registers closed variant sets (sum types) which can be matched by
+// match expressions. The registration tells the compiler the exhaustive list
+// of variants and the fields carried by each variant.
+func Variants(registry *variants.Registry) Option {
+	return func(c *conf.Config) {
+		c.Variants = registry
 	}
 }
 

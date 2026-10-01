@@ -115,6 +115,9 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpPop:
 			vm.pop()
 
+		case OpDup:
+			vm.push(vm.current())
+
 		case OpStore:
 			vm.Variables[arg] = vm.pop()
 
@@ -645,6 +648,13 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			} else {
 				vm.currScope = nil
 			}
+
+		case OpVariant:
+			info := program.Constants[arg].(*runtime.VariantInfo)
+			vm.push(runtime.IsVariant(vm.pop(), info))
+
+		case OpFailMatch:
+			panic(program.Constants[arg].(string))
 
 		default:
 			panic(fmt.Sprintf("unknown bytecode %#x", op))

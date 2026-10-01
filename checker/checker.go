@@ -229,6 +229,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.mapNode(n)
 	case *ast.PairNode:
 		nt = v.pairNode(n)
+	case *ast.MatchNode:
+		nt = v.matchNode(n)
 	default:
 		panic(fmt.Sprintf("undefined node type (%T)", node))
 	}

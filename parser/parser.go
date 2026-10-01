@@ -230,6 +230,10 @@ func (p *Parser) parseExpression(precedence int) Node {
 		return p.parseConditionalIf()
 	}
 
+	if precedence == 0 && p.current.Is(Operator, "match") {
+		return p.parseMatch()
+	}
+
 	nodeLeft := p.parsePrimary()
 
 	prevOperator := ""
@@ -389,6 +393,162 @@ func (p *Parser) parseConditional(node Node) Node {
 		}
 	}
 	return node
+}
+
+func (p *Parser) parseMatch() Node {
+	keyword := p.current
+	p.next() // consume "match"
+
+	expr := p.parseExpression(0)
+	p.expect(Bracket, "{")
+
+	cases := []*MatchCase{}
+	for !p.current.Is(Bracket, "}") && p.err == nil {
+		pattern := p.parsePattern()
+		if pattern == nil {
+			return nil
+		}
+
+		var guard Node
+		if p.current.Is(Identifier, "if") || p.current.Is(Operator, "if") {
+			p.next()
+			guard = p.parseExpression(0)
+		}
+
+		p.expectArrow()
+		p.expect(Bracket, "{")
+		body := p.parseSequenceExpression()
+		p.expect(Bracket, "}")
+
+		matchCase := &MatchCase{
+			Pattern: pattern,
+			Guard:   guard,
+			Body:    body,
+		}
+		matchCase.SetLocation(pattern.Location())
+		cases = append(cases, matchCase)
+
+		// Optional trailing semicolon before the closing brace.
+		if p.current.Is(Operator, ";") {
+			p.next()
+		}
+	}
+	p.expect(Bracket, "}")
+
+	return p.createNode(&MatchNode{
+		Expr:  expr,
+		Cases: cases,
+	}, keyword.Location)
+}
+
+// expectArrow consumes the "->" arrow token.
+func (p *Parser) expectArrow() {
+	if p.current.Is(Operator, "->") {
+		p.next()
+		return
+	}
+	p.error("expected arrow \"->\" in match arm, got %v", p.current)
+}
+
+func (p *Parser) parsePattern() PatternNode {
+	token := p.current
+
+	switch {
+	case token.Is(Identifier, "_"):
+		p.next()
+		return p.createPattern(&WildcardPatternNode{}, token.Location)
+
+	case token.Is(Identifier, "nil"):
+		p.next()
+		return p.createPattern(&NilPatternNode{}, token.Location)
+
+	case token.Is(Identifier, "true"), token.Is(Identifier, "false"):
+		p.next()
+		value := p.createNode(&BoolNode{Value: token.Value == "true"}, token.Location)
+		return p.createPattern(&LiteralPatternNode{Value: value}, token.Location)
+
+	case token.Is(Number):
+		p.next()
+		number := strings.Replace(token.Value, "_", "", -1)
+		var value Node
+		if strings.ContainsAny(strings.ToLower(number), ".e") {
+			f, err := strconv.ParseFloat(number, 64)
+			if err != nil {
+				p.error("invalid float literal: %v", err)
+				return nil
+			}
+			value = p.createNode(&FloatNode{Value: f}, token.Location)
+		} else {
+			i, err := strconv.ParseInt(number, 0, 64)
+			if err != nil {
+				p.error("invalid integer literal: %v", err)
+				return nil
+			}
+			value = p.createNode(&IntegerNode{Value: int(i)}, token.Location)
+		}
+		return p.createPattern(&LiteralPatternNode{Value: value}, token.Location)
+
+	case token.Is(String):
+		p.next()
+		value := p.createNode(&StringNode{Value: token.Value}, token.Location)
+		return p.createPattern(&LiteralPatternNode{Value: value}, token.Location)
+
+	case token.Is(Identifier):
+		p.next()
+		name := token.Value
+
+		// Variant destructuring: Name{field: pattern, ...}.
+		if p.current.Is(Bracket, "{") {
+			brace := p.current
+			p.next()
+			fields := []*FieldPattern{}
+			for !p.current.Is(Bracket, "}") && p.err == nil {
+				if len(fields) > 0 {
+					p.expect(Operator, ",")
+					if p.current.Is(Bracket, "}") {
+						break
+					}
+				}
+				fieldToken := p.current
+				p.expect(Identifier)
+				p.expect(Operator, ":")
+				child := p.parsePattern()
+				if child == nil {
+					return nil
+				}
+				fp := &FieldPattern{
+					Name:    fieldToken.Value,
+					Pattern: child,
+				}
+				fp.SetLocation(fieldToken.Location)
+				fields = append(fields, fp)
+			}
+			p.expect(Bracket, "}")
+			return p.createPattern(&VariantPatternNode{
+				Name:   name,
+				Fields: fields,
+			}, brace.Location)
+		}
+
+		// Unit variant without braces, or a simple binding. The checker decides
+		// whether the identifier refers to a variant name or a binding.
+		return p.createPattern(&BindingPatternNode{Name: name}, token.Location)
+
+	default:
+		p.error("expected pattern, got %v", token)
+		return nil
+	}
+}
+
+func (p *Parser) createPattern(n PatternNode, loc file.Location) PatternNode {
+	if err := p.checkNodeLimit(); err != nil {
+		return nil
+	}
+	if n == nil || p.err != nil {
+		return nil
+	}
+	n.SetLocation(loc)
+	return n
 }
 
 func (p *Parser) parsePrimary() Node {

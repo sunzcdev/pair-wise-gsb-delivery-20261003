@@ -143,6 +143,9 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 		case OpPop:
 			code("OpPop")
 
+		case OpDup:
+			code("OpDup")
+
 		case OpStore:
 			argumentWithInfo("OpStore", "var")
 
@@ -380,6 +383,12 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 
 		case OpOr:
 			code("OpOr")
+
+		case OpVariant:
+			constant("OpVariant")
+
+		case OpFailMatch:
+			constant("OpFailMatch")
 
 		case OpEnd:
 			code("OpEnd")
