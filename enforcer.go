@@ -53,6 +53,12 @@ type Enforcer struct {
 	logger     log.Logger
 	detectors  []detector.Detector
 
+	delegationMu      sync.RWMutex
+	delegations       map[string]*Delegation
+	delegationObjFunc rbac.MatchingFunc
+	delegationActFunc rbac.MatchingFunc
+	delegationDomFunc rbac.MatchingFunc
+
 	enabled              bool
 	autoSave             bool
 	autoBuildRoleLinks   bool
@@ -204,7 +210,12 @@ func (e *Enforcer) initialize() {
 	e.autoNotifyWatcher = true
 	e.autoNotifyDispatcher = true
 	e.gFunctionCache = true
+	e.delegations = make(map[string]*Delegation)
+	e.delegationObjFunc = exactMatch
+	e.delegationActFunc = exactMatch
+	e.delegationDomFunc = exactMatch
 	e.initRmMap()
+	e.configureDelegationMatchersFromModel()
 
 	// Initialize detectors with default detector if not already set
 	if e.detectors == nil {
