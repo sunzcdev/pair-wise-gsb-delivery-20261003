@@ -741,6 +741,95 @@ func (w *Writer) WriteRaw(data []byte) {
 	w.b = append(w.b, data...)
 }
 
+// WriteBoolean writes a RESP3 boolean to the client.
+func (w *Writer) WriteBoolean(v bool) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendBoolean(w.b, v)
+}
+
+// WriteDouble writes a RESP3 double to the client.
+func (w *Writer) WriteDouble(f float64) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendDouble(w.b, f)
+}
+
+// WriteBigNumber writes a RESP3 big number to the client.
+func (w *Writer) WriteBigNumber(num []byte) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendBigNumber(w.b, num)
+}
+
+// WriteBigNumberString writes a RESP3 big number to the client.
+func (w *Writer) WriteBigNumberString(num string) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendBigNumberString(w.b, num)
+}
+
+// WriteVerbatim writes a RESP3 verbatim string to the client.
+func (w *Writer) WriteVerbatim(encoding string, data []byte) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendVerbatim(w.b, encoding, data)
+}
+
+// WriteMap writes a RESP3 map header declaring n key/value pairs.
+func (w *Writer) WriteMap(n int) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendMap(w.b, n)
+}
+
+// WriteSet writes a RESP3 set header declaring n elements.
+func (w *Writer) WriteSet(n int) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendSet(w.b, n)
+}
+
+// WritePush writes a RESP3 push frame header declaring n elements.
+func (w *Writer) WritePush(n int) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendPush(w.b, n)
+}
+
+// WriteAttribute writes a RESP3 attribute header declaring n key/value
+// pairs. The pairs and the augmented response must be written next.
+func (w *Writer) WriteAttribute(n int) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendAttribute(w.b, n)
+}
+
+// WriteRESPNull writes the RESP3 null value to the client.
+func (w *Writer) WriteRESPNull() {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendRESPNull(w.b)
+}
+
+// WriteBulkError writes a RESP3 bulk error to the client.
+func (w *Writer) WriteBulkError(msg []byte) {
+	if w.err != nil {
+		return
+	}
+	w.b = AppendBulkError(w.b, msg)
+}
+
 // WriteAny writes any type to client.
 //
 //	nil             -> null

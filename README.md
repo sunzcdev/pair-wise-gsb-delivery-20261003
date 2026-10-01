@@ -164,6 +164,56 @@ func main() {
 }
 ```
 
+RESP3 Support
+-------------
+
+The codec layer supports parsing and encoding [RESP3](https://github.com/redis/redis-specifications/blob/master/protocol/RESP3.md) types while keeping the original RESP2 representation and `ReadNextRESP` behavior unchanged.
+
+Additional message kinds:
+
+| Type        | Wire form            | Encoder                            |
+|-------------|----------------------|------------------------------------|
+| Null        | `_\r\n`              | `AppendRESPNull`                   |
+| Boolean     | `#t\r\n`/`#f\r\n`    | `AppendBoolean`                    |
+| Double      | `,1.5\r\n`           | `AppendDouble`/`AppendDoubleText`  |
+| Big number  | `(42\r\n`            | `AppendBigNumber`                  |
+| Verbatim    | `=15\r\ntxt:...`     | `AppendVerbatim`                  |
+| Map         | `%n\r\n`             | `AppendMap`                        |
+| Set         | `~n\r\n`             | `AppendSet`                        |
+| Push        | `>n\r\n`             | `AppendPush`                       |
+| Attribute   | `\|n\r\n`            | `AppendAttribute`                  |
+| Bulk error  | `!5\r\nhello\r\n`    | `AppendBulkError`                  |
+
+`ParseNextRESP` distinguishes incomplete input from invalid input by
+returning `ErrIncompleteRESP` or `ErrInvalidRESP`. The returned `RESP`
+exposes attribute frames on the new `Attributes` field (Raw still spans the
+attribute frames plus the augmented value), and provides `Bool`, `BigInt`,
+`VerbatimEncoding`, and `VerbatimValue` accessors.
+
+`RESPParser` parses bytes that arrive in arbitrary chunks, including one
+byte at a time:
+
+```go
+p := redcon.NewRESPParser()
+for {
+    n, _ := conn.Read(buf)
+    p.Feed(buf[:n])
+    for {
+        msg, err := p.Next()
+        if errors.Is(err, redcon.ErrIncompleteRESP) {
+            break
+        }
+        if errors.Is(err, redcon.ErrInvalidRESP) {
+            return err // fatal until p.Reset()
+        }
+        handle(msg)
+    }
+}
+```
+
+Decoding enforces a maximum nesting depth (64), a maximum per-container
+element count, and a maximum declared payload length.
+
 TLS Example
 -----------
 
