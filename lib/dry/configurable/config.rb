@@ -100,6 +100,36 @@ module Dry
         self
       end
 
+      # Update config with new values atomically.
+      #
+      # Unlike {#update}, which applies each value as it goes, this first validates the
+      # whole (possibly nested) hash — checking setting names, value shapes and running
+      # every constructor exactly once — and only then commits all the new values in a
+      # single pass. If any key is unknown, any nested value is not a hash, any involved
+      # config is frozen, or any constructor raises, the config (including its nested
+      # configs and its record of explicitly configured keys) is left completely
+      # untouched, and nested config instances already held by callers keep pointing to
+      # the same objects.
+      #
+      # Note that only the config's internal state is committed atomically: side effects
+      # performed by user-supplied constructors themselves are not rolled back.
+      #
+      # @param values [Hash, #to_hash] A hash with new values
+      #
+      # @return [Config]
+      #
+      # @api public
+      def update_atomically(values)
+        plan = {}.compare_by_identity
+        plan_update(values, plan)
+
+        plan.each do |config, new_values|
+          config.__send__(:commit_update, new_values)
+        end
+
+        self
+      end
+
       # Returns true if the value for the given key has been set on this config.
       #
       # For simple values, this returns true if the value has been explicitly assigned.
@@ -223,6 +253,55 @@ module Dry
       end
 
       private
+
+      # Walks the given values and stages every write in `plan` (a Hash of
+      # Config => {name => constructed value}), without touching any config's state.
+      # Raises before anything is committed if a key is unknown, a nested value has an
+      # invalid shape, a config to be written is frozen, or a constructor fails.
+      #
+      # @api private
+      def plan_update(values, plan)
+        values.each do |key, value|
+          name = key.to_sym
+
+          unless (setting = _settings[name])
+            raise ArgumentError, "+#{name}+ is not a setting name"
+          end
+
+          # Resolve the current value without memoizing it into _values (and without
+          # running constructors over defaults), so a failed update leaves no trace
+          # behind
+          current = _values.fetch(name) { setting.to_value if setting.children.any? }
+
+          if current.is_a?(Config)
+            unless value.respond_to?(:to_hash)
+              raise ArgumentError, "#{value.inspect} is not a valid setting value"
+            end
+
+            current.__send__(:plan_update, value.to_hash, plan)
+
+            # Ensure the (possibly freshly built) nested config is installed on commit
+            stage_update(plan, name, current)
+          else
+            stage_update(plan, name, setting.constructor.(value))
+          end
+        end
+      end
+
+      # @api private
+      def stage_update(plan, name, value)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        (plan[self] ||= {})[name] = value
+      end
+
+      # @api private
+      def commit_update(new_values)
+        new_values.each do |name, value|
+          _configured.add(name)
+          _values[name] = value
+        end
+      end
 
       def to_data_attrs
         _values.each_with_object({}) do |(name, value), hsh|

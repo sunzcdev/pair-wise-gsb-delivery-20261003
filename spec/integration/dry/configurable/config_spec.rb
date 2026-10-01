@@ -120,6 +120,174 @@ RSpec.describe Dry::Configurable::Config do
     end
   end
 
+  describe "#update_atomically" do
+    it "sets new config values in a flat config" do
+      klass.setting :db
+
+      config = klass.config.update_atomically(db: "sqlite")
+
+      expect(klass.config).to be(config)
+      expect(config.db).to eql("sqlite")
+      expect(config.configured?(:db)).to be true
+    end
+
+    it "sets new config values in a nested config" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pass, default: "secret"
+      end
+
+      klass.config.update_atomically(db: {user: "jane", pass: "supersecret"})
+
+      expect(klass.config.db.user).to eql("jane")
+      expect(klass.config.db.pass).to eql("supersecret")
+      expect(klass.config.db.configured?(:user)).to be true
+      expect(klass.config.db.configured?(:pass)).to be true
+    end
+
+    it "sets new config values in a two-level nested config" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pool do
+          setting :size, default: 5
+        end
+      end
+
+      klass.config.update_atomically(db: {user: "jane", pool: {size: 10}})
+
+      expect(klass.config.db.user).to eql("jane")
+      expect(klass.config.db.pool.size).to eql(10)
+      expect(klass.config.db.pool.configured?(:size)).to be true
+    end
+
+    it "runs each constructor exactly once" do
+      calls = []
+      klass.setting :user, constructor: ->(v) { calls << :user; v.upcase }
+      klass.setting :pass, constructor: ->(v) { calls << :pass; v.reverse }
+
+      klass.config.update_atomically(user: "jane", pass: "secret")
+
+      expect(calls).to eql(%i[user pass])
+      expect(klass.config.user).to eql("JANE")
+      expect(klass.config.pass).to eql("terces")
+    end
+
+    it "commits nothing when a later value's constructor raises" do
+      klass.setting :user, constructor: ->(v) { v.upcase }
+      klass.setting :pass, constructor: ->(_v) { raise "constructor boom" }
+
+      expect { klass.config.update_atomically(user: "jane", pass: "secret") }
+        .to raise_error("constructor boom")
+
+      expect(klass.config.configured?(:user)).to be false
+      expect(klass.config.configured?(:pass)).to be false
+      expect(klass.config._values).not_to have_key(:user)
+      expect(klass.config._values).not_to have_key(:pass)
+    end
+
+    it "commits nothing when a key is unknown" do
+      klass.setting :user, default: "root"
+
+      expect { klass.config.update_atomically(user: "jane", unknown: "x") }
+        .to raise_error(ArgumentError, /unknown/)
+
+      expect(klass.config.user).to eql("root")
+      expect(klass.config.configured?(:user)).to be false
+    end
+
+    it "commits nothing when a nested value is not a Hash" do
+      klass.setting :user, default: "root"
+      klass.setting :db do
+        setting :pass, default: "secret"
+      end
+
+      expect { klass.config.update_atomically(user: "jane", db: "string") }
+        .to raise_error(ArgumentError, '"string" is not a valid setting value')
+
+      expect(klass.config.user).to eql("root")
+      expect(klass.config.configured?(:user)).to be false
+      expect(klass.config.db.pass).to eql("secret")
+    end
+
+    it "commits nothing when a nested config is frozen" do
+      klass.setting :user, default: "root"
+      klass.setting :db do
+        setting :pass, default: "secret"
+      end
+
+      klass.config.db.freeze
+
+      expect { klass.config.update_atomically(user: "jane", db: {pass: "supersecret"}) }
+        .to raise_error(Dry::Configurable::FrozenConfigError)
+
+      expect(klass.config.user).to eql("root")
+      expect(klass.config.configured?(:user)).to be false
+      expect(klass.config.db.pass).to eql("secret")
+      expect(klass.config.db.configured?(:pass)).to be false
+    end
+
+    it "raises when the config itself is frozen" do
+      klass.setting :user, default: "root"
+      klass.config.freeze
+
+      expect { klass.config.update_atomically(user: "jane") }
+        .to raise_error(Dry::Configurable::FrozenConfigError)
+
+      expect(klass.config.user).to eql("root")
+    end
+
+    it "leaves mutable default values untouched on failure" do
+      klass.setting :list, default: []
+      klass.setting :pass, constructor: ->(_v) { raise "constructor boom" }
+
+      list = klass.config.list
+      list << "kept"
+
+      expect { klass.config.update_atomically(list: [1, 2], pass: "secret") }
+        .to raise_error("constructor boom")
+
+      expect(klass.config.list).to equal(list)
+      expect(klass.config.list).to eql(["kept"])
+    end
+
+    it "commits nothing when a constructor fails at the second nesting level" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pool do
+          setting :size, constructor: ->(_v) { raise "constructor boom" }
+        end
+      end
+
+      expect {
+        klass.config.update_atomically(db: {user: "jane", pool: {size: 10}})
+      }.to raise_error("constructor boom")
+
+      expect(klass.config.db.user).to eql("root")
+      expect(klass.config.db.configured?(:user)).to be false
+      expect(klass.config.db.pool.configured?(:size)).to be false
+    end
+
+    it "keeps previously held nested config references pointing to the same objects" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pass, default: "secret"
+      end
+
+      db = klass.config.db
+
+      expect { klass.config.update_atomically(db: {user: "jane", unknown: 1}) }
+        .to raise_error(ArgumentError, /unknown/)
+
+      expect(klass.config.db).to equal(db)
+      expect(db.user).to eql("root")
+
+      klass.config.update_atomically(db: {user: "jane"})
+
+      expect(klass.config.db).to equal(db)
+      expect(db.user).to eql("jane")
+    end
+  end
+
   describe "#to_h" do
     before do
       klass.setting :db do
