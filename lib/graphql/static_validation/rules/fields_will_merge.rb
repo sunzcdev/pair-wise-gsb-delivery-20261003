@@ -17,15 +17,18 @@ module GraphQL
       NO_ARGS = GraphQL::EmptyObjects::EMPTY_HASH
       EXCLUSIVE_COMPARISON = 1
       NONEXCLUSIVE_COMPARISON = 2
+      EMPTY_PATH = [].freeze
+      EMPTY_VIA = [].freeze
 
       class Field
-        attr_reader :node, :definition, :owner_type, :parents
+        attr_reader :node, :definition, :owner_type, :parents, :via
 
-        def initialize(node, definition, owner_type, parents)
+        def initialize(node, definition, owner_type, parents, via = EMPTY_VIA)
           @node = node
           @definition = definition
           @owner_type = owner_type
           @parents = parents
+          @via = via
         end
 
         def return_type
@@ -56,22 +59,49 @@ module GraphQL
         @mutually_exclusive_cache = {}.compare_by_identity
         # Cache collect_fields results for sub-selection comparison
         @sub_fields_cache = {}.compare_by_identity
+        # Response-key stack and fragment chain for the AST position currently
+        # being visited, used to build conflict diagnostics
+        @response_key_stack = []
+        @via_stack = []
       end
 
       def on_operation_definition(node, _parent)
         @conflicts = nil
-        conflicts_within_selection_set(node, type_definition)
+        conflicts_within_selection_set(node, type_definition, path: EMPTY_PATH, via: EMPTY_VIA)
         @conflicts&.each_value { |error_type| error_type.each_value { |error| add_error(error) } }
         super
       end
 
       def on_field(node, _parent)
+        @response_key_stack << (node.alias || node.name)
         if !node.selections.empty? && selections_may_conflict?(node.selections)
           @conflicts = nil
-          conflicts_within_selection_set(node, type_definition)
+          conflicts_within_selection_set(node, type_definition, path: @response_key_stack, via: @via_stack.dup)
           @conflicts&.each_value { |error_type| error_type.each_value { |error| add_error(error) } }
         end
         super
+      ensure
+        @response_key_stack.pop
+      end
+
+      def on_fragment_definition(node, _parent)
+        @via_stack << { "kind" => "FragmentSpread", "name" => node.name, "typeCondition" => node.type&.name }
+        super
+      ensure
+        @via_stack.pop
+      end
+
+      def on_inline_fragment(node, _parent)
+        if node.type
+          @via_stack << { "kind" => "InlineFragment", "typeCondition" => node.type.name }
+          begin
+            super
+          ensure
+            @via_stack.pop
+          end
+        else
+          super
+        end
       end
 
       private
@@ -124,26 +154,26 @@ module GraphQL
 
       # Core algorithm: collect ALL fields (expanding fragments inline) into a flat
       # map keyed by response key, then compare within each group.
-      def conflicts_within_selection_set(node, parent_type)
+      def conflicts_within_selection_set(node, parent_type, path:, via:)
         return if parent_type.nil?
         return if node.selections.empty?
 
         # Collect all fields from this selection set, expanding fragments transitively
-        response_keys = collect_fields(node.selections, owner_type: parent_type, parents: [])
+        response_keys = collect_fields(node.selections, owner_type: parent_type, parents: [], via: via)
 
         # Find conflicts within each response key group
-        find_conflicts_within(response_keys)
+        find_conflicts_within(response_keys, path)
       end
 
       # Collect all fields from selections, expanding fragment spreads inline.
       # Returns a Hash of { response_key => Field | [Field, ...] }
-      def collect_fields(selections, owner_type:, parents:)
+      def collect_fields(selections, owner_type:, parents:, via: EMPTY_VIA)
         response_keys = {}
-        collect_fields_inner(selections, owner_type: owner_type, parents: parents, response_keys: response_keys, visited_fragments: nil)
+        collect_fields_inner(selections, owner_type: owner_type, parents: parents, response_keys: response_keys, visited_fragments: nil, via: via)
         response_keys
       end
 
-      def collect_fields_inner(selections, owner_type:, parents:, response_keys:, visited_fragments:)
+      def collect_fields_inner(selections, owner_type:, parents:, response_keys:, visited_fragments:, via:)
         deferred_spreads = nil
         sel_idx = 0
         sel_len = selections.size
@@ -155,7 +185,7 @@ module GraphQL
           when GraphQL::Language::Nodes::Field
             definition = @types.field(owner_type, sel.name)
             key = sel.alias || sel.name
-            field = Field.new(sel, definition, owner_type, parents)
+            field = Field.new(sel, definition, owner_type, parents, via)
             existing = response_keys[key]
 
             if existing.nil?
@@ -171,7 +201,12 @@ module GraphQL
             if frag_type
               new_parents = parents.dup
               new_parents << frag_type
-              collect_fields_inner(sel.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments)
+              new_via = if sel.type
+                via + [{ "kind" => "InlineFragment", "typeCondition" => frag_type.graphql_name }]
+              else
+                via
+              end
+              collect_fields_inner(sel.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments, via: new_via)
             end
           when GraphQL::Language::Nodes::FragmentSpread
             (deferred_spreads ||= []) << sel
@@ -199,12 +234,13 @@ module GraphQL
 
             new_parents = parents.dup
             new_parents << frag_type
-            collect_fields_inner(frag.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments)
+            new_via = via + [{ "kind" => "FragmentSpread", "name" => frag.name, "typeCondition" => frag_type.graphql_name }]
+            collect_fields_inner(frag.selections, owner_type: frag_type, parents: new_parents, response_keys: response_keys, visited_fragments: visited_fragments, via: new_via)
           end
         end
       end
 
-      def find_conflicts_within(response_keys)
+      def find_conflicts_within(response_keys, path)
         response_keys.each do |key, fields|
           next unless fields.is_a?(Array)
 
@@ -224,7 +260,7 @@ module GraphQL
             end
 
             if all_same
-              find_conflicts_between_selection_groups(key, fields)
+              find_conflicts_between_selection_groups(key, fields, path)
             else
               groups = fields.group_by { |f| field_signature(f) }
               unique_groups = groups.values
@@ -234,14 +270,14 @@ module GraphQL
               while gi < unique_groups.size
                 gj = gi + 1
                 while gj < unique_groups.size
-                  find_conflict(key, unique_groups[gi][0], unique_groups[gj][0])
+                  find_conflict(key, unique_groups[gi][0], unique_groups[gj][0], path: path)
                   gj += 1
                 end
 
                 # Within the same group, fields can only conflict on sub-selections.
                 group = unique_groups[gi]
                 if group.size >= 2
-                  find_conflicts_between_selection_groups(key, group)
+                  find_conflicts_between_selection_groups(key, group, path)
                 end
 
                 gi += 1
@@ -253,7 +289,7 @@ module GraphQL
             while i < fields.size
               j = i + 1
               while j < fields.size
-                find_conflict(key, fields[i], fields[j])
+                find_conflict(key, fields[i], fields[j], path: path)
                 j += 1
               end
               i += 1
@@ -262,7 +298,7 @@ module GraphQL
         end
       end
 
-      def find_conflicts_between_selection_groups(response_key, fields)
+      def find_conflicts_between_selection_groups(response_key, fields, path)
         fields_by_selection = {}
         fields.each do |field|
           fields_by_selection[field_selection_signature(field)] ||= field
@@ -273,7 +309,7 @@ module GraphQL
         while i < representatives.size
           j = i + 1
           while j < representatives.size
-            find_conflict(response_key, representatives[i], representatives[j])
+            find_conflict(response_key, representatives[i], representatives[j], path: path)
             j += 1
           end
           i += 1
@@ -306,7 +342,7 @@ module GraphQL
         end
       end
 
-      def find_conflict(response_key, field1, field2, mutually_exclusive: false)
+      def find_conflict(response_key, field1, field2, mutually_exclusive: false, path: EMPTY_PATH, via_prefix1: EMPTY_VIA, via_prefix2: EMPTY_VIA)
         return if @conflict_count >= @max_errors
         return if field1.definition.nil? || field2.definition.nil?
 
@@ -318,18 +354,20 @@ module GraphQL
         if !are_mutually_exclusive
           if node1.name != node2.name
             conflict = conflicts[:field][response_key]
+            conflict_path = path + [response_key]
 
-            conflict.add_conflict(node1, node1.name)
-            conflict.add_conflict(node2, node2.name)
+            add_conflict_side(conflict, node1, node1.name, field1, via_prefix1, conflict_path)
+            add_conflict_side(conflict, node2, node2.name, field2, via_prefix2, conflict_path)
 
             @conflict_count += 1
           end
 
           if !same_arguments?(node1, node2)
             conflict = conflicts[:argument][response_key]
+            conflict_path = path + [response_key]
 
-            conflict.add_conflict(node1, GraphQL::Language.serialize(serialize_field_args(node1)))
-            conflict.add_conflict(node2, GraphQL::Language.serialize(serialize_field_args(node2)))
+            add_conflict_side(conflict, node1, GraphQL::Language.serialize(serialize_field_args(node1)), field1, via_prefix1, conflict_path)
+            add_conflict_side(conflict, node2, GraphQL::Language.serialize(serialize_field_args(node2)), field2, via_prefix2, conflict_path)
 
             @conflict_count += 1
           end
@@ -372,13 +410,14 @@ module GraphQL
 
           if return_error
             conflict = conflicts[:return_type][response_key]
+            conflict_path = path + [response_key]
 
             if message_override
               conflict.message = message_override
             end
 
-            conflict.add_conflict(node1, "`#{t1.to_type_signature}`")
-            conflict.add_conflict(node2, "`#{t2.to_type_signature}`")
+            add_conflict_side(conflict, node1, "`#{t1.to_type_signature}`", field1, via_prefix1, conflict_path)
+            add_conflict_side(conflict, node2, "`#{t2.to_type_signature}`", field2, via_prefix2, conflict_path)
             @conflict_count += 1
           end
         end
@@ -387,7 +426,63 @@ module GraphQL
           field1,
           field2,
           mutually_exclusive: are_mutually_exclusive,
+          path: path,
+          response_key: response_key,
+          via_prefix1: via_prefix1,
+          via_prefix2: via_prefix2,
         )
+      end
+
+      # Record one side of a conflict, with the diagnostic evidence for that
+      # side: where in the response it lands, which fragments it was reached
+      # through, and on which object types it may appear.
+      def add_conflict_side(conflict, node, conflict_str, field, via_prefix, conflict_path)
+        conflict.add_conflict(
+          node,
+          conflict_str,
+          path: conflict_path,
+          via: concat_via(via_prefix, field.via),
+          possible_types: possible_object_types(field),
+        )
+      end
+
+      def concat_via(prefix, via)
+        if prefix.empty?
+          via
+        elsif via.empty?
+          prefix
+        else
+          prefix + via
+        end
+      end
+
+      # The concrete object types on which this field occurrence may be
+      # selected: the intersection of the possible types of every type
+      # condition in its fragment chain. (An empty intersection means the
+      # type conditions are mutually exclusive -- callers must not treat
+      # that as evidence of a real overlap.)
+      def possible_object_types(field)
+        parents = field.parents
+        chain = parents.empty? ? [field.owner_type] : parents
+        names = nil
+        i = 0
+        len = chain.length
+
+        while i < len
+          type = chain[i]
+          i += 1
+          next if type.nil?
+
+          type_names = @types.possible_types(type).map(&:graphql_name)
+          if names.nil?
+            names = type_names
+          else
+            names &= type_names
+            break if names.empty?
+          end
+        end
+
+        names || []
       end
 
       def return_types_conflict?(type1, type2)
@@ -416,7 +511,7 @@ module GraphQL
 
       # When two fields with the same response key both have sub-selections,
       # we need to check those sub-selections against each other.
-      def find_conflicts_between_sub_selection_sets(field1, field2, mutually_exclusive:)
+      def find_conflicts_between_sub_selection_sets(field1, field2, mutually_exclusive:, path:, response_key:, via_prefix1:, via_prefix2:)
         return if field1.definition.nil? ||
           field2.definition.nil? ||
           (field1.node.selections.empty? && field2.node.selections.empty?)
@@ -443,7 +538,18 @@ module GraphQL
         response_keys1 = cached_sub_fields(node1, return_type1)
         response_keys2 = cached_sub_fields(node2, return_type2)
 
-        find_conflicts_between(response_keys1, response_keys2, mutually_exclusive: mutually_exclusive)
+        child_path = path + [response_key]
+        child_via_prefix1 = concat_via(via_prefix1, field1.via)
+        child_via_prefix2 = concat_via(via_prefix2, field2.via)
+
+        find_conflicts_between(
+          response_keys1,
+          response_keys2,
+          mutually_exclusive: mutually_exclusive,
+          path: child_path,
+          via_prefix1: child_via_prefix1,
+          via_prefix2: child_via_prefix2,
+        )
       end
 
       def cached_sub_fields(node, return_type)
@@ -460,7 +566,7 @@ module GraphQL
         end
       end
 
-      def find_conflicts_between(response_keys, response_keys2, mutually_exclusive:)
+      def find_conflicts_between(response_keys, response_keys2, mutually_exclusive:, path:, via_prefix1:, via_prefix2:)
         response_keys.each do |key, fields|
           fields2 = response_keys2[key]
           next unless fields2
@@ -476,6 +582,9 @@ module GraphQL
                 field,
                 field2,
                 mutually_exclusive: mutually_exclusive,
+                path: path,
+                via_prefix1: via_prefix1,
+                via_prefix2: via_prefix2,
               )
             end
           end

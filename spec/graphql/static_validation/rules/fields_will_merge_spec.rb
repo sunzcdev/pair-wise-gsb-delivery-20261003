@@ -478,7 +478,19 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
             {"line"=>8, "column"=>11}
           ],
           "path"=>[],
-          "extensions"=>{"code"=>"fieldConflict", "fieldName"=>"x", "conflicts"=>"name or nickname"}
+          "extensions"=>{
+            "code"=>"fieldConflict",
+            "fieldName"=>"x",
+            "conflicts"=>"name or nickname",
+            "diagnostics"=>{
+              "responsePath"=>["dog", "x"],
+              "sharedPossibleTypes"=>["Dog"],
+              "sides"=>[
+                {"field"=>"name", "alias"=>"x", "via"=>[], "possibleTypes"=>["Dog"]},
+                {"field"=>"nickname", "alias"=>"x", "via"=>[], "possibleTypes"=>["Dog"]}
+              ]
+            }
+          }
         }
       ]
       assert_equal expected_errors, errors
@@ -605,7 +617,21 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
           "extensions"=>
           {"code"=>"fieldConflict",
            "fieldName"=>"name",
-           "conflicts"=>"name or __typename"}
+           "conflicts"=>"name or __typename",
+           "diagnostics"=>{
+             "responsePath"=>["dog", "name"],
+             "sharedPossibleTypes"=>["Dog"],
+             "sides"=>[
+               {"field"=>"name", "via"=>[], "possibleTypes"=>["Dog"]},
+               {"field"=>"__typename",
+                "alias"=>"name",
+                "via"=>[
+                  {"kind"=>"FragmentSpread", "name"=>"D", "typeCondition"=>"Dog"},
+                  {"kind"=>"FragmentSpread", "name"=>"D2", "typeCondition"=>"Dog"}
+                ],
+                "possibleTypes"=>["Dog"]}
+             ]
+           }}
         }
       ], errors
     end
@@ -829,7 +855,17 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
           "extensions"=> {
             "code"=>"fieldConflict",
             "fieldName"=>"field",
-            "conflicts"=>"{categories:\"[A, B]\"} or {categories:\"[A, B, C]\"}"
+            "conflicts"=>"{categories:\"[A, B]\"} or {categories:\"[A, B, C]\"}",
+            "diagnostics"=>{
+              "responsePath"=>["field"],
+              "sharedPossibleTypes"=>["Query"],
+              "sides"=>[
+                {"field"=>"field", "via"=>[], "possibleTypes"=>["Query"]},
+                {"field"=>"field",
+                 "via"=>[{"kind"=>"FragmentSpread", "name"=>"Q", "typeCondition"=>"Query"}],
+                 "possibleTypes"=>["Query"]}
+              ]
+            }
           }
         }
 
@@ -1262,7 +1298,22 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
         "extensions"=>
           {"code"=>"fieldConflict",
            "fieldName"=>"spots",
-           "conflicts"=>"`Boolean` or `Int`"}
+           "conflicts"=>"`Boolean` or `Int`",
+           "diagnostics"=>{
+             "responsePath"=>["thing", "spots"],
+             # Dog and Jaguar are mutually exclusive, so there is no
+             # object type where both sides apply -- the evidence says so
+             # instead of inventing a shared type.
+             "sharedPossibleTypes"=>[],
+             "sides"=>[
+               {"field"=>"spots",
+                "via"=>[{"kind"=>"InlineFragment", "typeCondition"=>"Dog"}],
+                "possibleTypes"=>["Dog"]},
+               {"field"=>"spots",
+                "via"=>[{"kind"=>"InlineFragment", "typeCondition"=>"Jaguar"}],
+                "possibleTypes"=>["Jaguar"]}
+             ]
+           }}
         }
       assert_equal [expected_error], res.map(&:to_h)
     end
@@ -1950,6 +2001,278 @@ describe GraphQL::StaticValidation::FieldsWillMerge do
 
       res = DuplicateAliasesSchema.execute(query_str)
       assert_equal ["Field 'info' has a field conflict: name or id?"], res["errors"].map { |e| e["message"] }
+    end
+  end
+
+  describe "conflict diagnostics" do
+    def diagnostics_for(error_hash)
+      error_hash["extensions"]["diagnostics"]
+    end
+
+    describe "fragment chains, aliases, and response paths" do
+      let(:query_string) {%|
+        {
+          pet {
+            ...A
+            ...B
+            name
+          }
+        }
+
+        fragment A on Dog {
+          x: name
+        }
+
+        fragment B on Dog {
+          x: nickname
+          name: nickname
+        }
+      |}
+
+      it "reports the response path, fragment chain, and shared object types for each side" do
+        assert_equal [
+          "Field 'name' has a field conflict: name or nickname?",
+          "Field 'x' has a field conflict: name or nickname?"
+        ], error_messages
+
+        name_diag = diagnostics_for(errors[0])
+        assert_equal ["pet", "name"], name_diag["responsePath"]
+        assert_equal ["Dog"], name_diag["sharedPossibleTypes"]
+        assert_equal [
+          # The plain `name` field applies wherever `pet` does
+          {"field"=>"name", "via"=>[], "possibleTypes"=>["Dog", "Cat"]},
+          {"field"=>"nickname",
+           "alias"=>"name",
+           "via"=>[{"kind"=>"FragmentSpread", "name"=>"B", "typeCondition"=>"Dog"}],
+           "possibleTypes"=>["Dog"]}
+        ], name_diag["sides"]
+
+        x_diag = diagnostics_for(errors[1])
+        assert_equal ["pet", "x"], x_diag["responsePath"]
+        assert_equal ["Dog"], x_diag["sharedPossibleTypes"]
+        assert_equal [
+          {"field"=>"name",
+           "alias"=>"x",
+           "via"=>[{"kind"=>"FragmentSpread", "name"=>"A", "typeCondition"=>"Dog"}],
+           "possibleTypes"=>["Dog"]},
+          {"field"=>"nickname",
+           "alias"=>"x",
+           "via"=>[{"kind"=>"FragmentSpread", "name"=>"B", "typeCondition"=>"Dog"}],
+           "possibleTypes"=>["Dog"]}
+        ], x_diag["sides"]
+      end
+    end
+
+    describe "interface cross-inheritance" do
+      let(:query_string) {%|
+        {
+          pet {
+            ... on Pet {
+              name
+            }
+            ... on Mammal {
+              name: nickname
+            }
+          }
+        }
+      |}
+
+      it "lists every object type where both interfaces are satisfied at once" do
+        assert_equal ["Field 'name' has a field conflict: name or nickname?"], error_messages
+
+        diag = diagnostics_for(errors.first)
+        assert_equal ["pet", "name"], diag["responsePath"]
+        # Pet and Mammal don't inherit from each other, but Dog and Cat
+        # implement both -- that overlap is why the conflict is real.
+        assert_equal ["Dog", "Cat"], diag["sharedPossibleTypes"]
+        assert_equal [
+          {"field"=>"name",
+           "via"=>[{"kind"=>"InlineFragment", "typeCondition"=>"Pet"}],
+           "possibleTypes"=>["Dog", "Cat"]},
+          {"field"=>"nickname",
+           "alias"=>"name",
+           "via"=>[{"kind"=>"InlineFragment", "typeCondition"=>"Mammal"}],
+           "possibleTypes"=>["Dog", "Cat"]}
+        ], diag["sides"]
+      end
+    end
+
+    describe "nested type conditions within one fragment chain" do
+      # Both chains have the same depth so that `mutually_exclusive?`
+      # compares them position by position.
+      let(:query_string) {%|
+        {
+          pet {
+            ... on Mammal {
+              ... on Dog {
+                name
+              }
+            }
+            ... on Pet {
+              ... on Dog {
+                name: nickname
+              }
+            }
+          }
+        }
+      |}
+
+      it "intersects the type conditions along the chain" do
+        assert_equal ["Field 'name' has a field conflict: name or nickname?"], error_messages
+
+        diag = diagnostics_for(errors.first)
+        assert_equal ["Dog"], diag["sharedPossibleTypes"]
+        assert_equal [
+          {"field"=>"name",
+           "via"=>[
+             {"kind"=>"InlineFragment", "typeCondition"=>"Mammal"},
+             {"kind"=>"InlineFragment", "typeCondition"=>"Dog"}
+           ],
+           "possibleTypes"=>["Dog"]},
+          {"field"=>"nickname",
+           "alias"=>"name",
+           "via"=>[
+             {"kind"=>"InlineFragment", "typeCondition"=>"Pet"},
+             {"kind"=>"InlineFragment", "typeCondition"=>"Dog"}
+           ],
+           "possibleTypes"=>["Dog"]}
+        ], diag["sides"]
+      end
+    end
+
+    describe "mutually exclusive type conditions" do
+      let(:query_string) {%|
+        {
+          pet {
+            ... on Dog {
+              name
+            }
+            ... on Cat {
+              name: nickname
+            }
+          }
+        }
+      |}
+
+      it "reports no conflict and therefore no evidence" do
+        assert_equal [], errors
+      end
+
+      it "does not invent shared object types for return type conflicts on exclusive types" do
+        union_schema = GraphQL::Schema.from_definition <<~GRAPHQL
+          type Query { u: U }
+          union U = A | B
+          type A { f: [Int] }
+          type B { f: Int }
+        GRAPHQL
+        union_schema.allow_legacy_invalid_return_type_conflicts(false)
+
+        res = union_schema.validate("{ u { ... on A { f } ... on B { f } } }")
+        assert_equal ["Field 'f' has a return_type conflict: `[Int]` or `Int`?"], res.map(&:message)
+
+        diag = res.first.to_h["extensions"]["diagnostics"]
+        assert_equal ["u", "f"], diag["responsePath"]
+        # A and B can never be the same object, so the shared type list is
+        # empty rather than fabricated.
+        assert_equal [], diag["sharedPossibleTypes"]
+        assert_equal ["A"], diag["sides"][0]["possibleTypes"]
+        assert_equal ["B"], diag["sides"][1]["possibleTypes"]
+        assert_equal [{"kind"=>"InlineFragment", "typeCondition"=>"A"}], diag["sides"][0]["via"]
+        assert_equal [{"kind"=>"InlineFragment", "typeCondition"=>"B"}], diag["sides"][1]["via"]
+      end
+    end
+
+    describe "deeply nested selection sets" do
+      let(:query_string) {%|
+        {
+          dog {
+            toys {
+              x: name
+            }
+          }
+
+          dog {
+            toys {
+              x: size
+            }
+          }
+        }
+      |}
+
+      it "reports the full response path to the conflict" do
+        assert_equal ["Field 'x' has a field conflict: name or size?"], error_messages
+
+        diag = diagnostics_for(errors.first)
+        assert_equal ["dog", "toys", "x"], diag["responsePath"]
+        assert_equal ["Toy"], diag["sharedPossibleTypes"]
+        assert_equal ["name", "size"], diag["sides"].map { |s| s["field"] }
+        assert_equal [["Toy"], ["Toy"]], diag["sides"].map { |s| s["possibleTypes"] }
+      end
+    end
+
+    describe "conflict detected inside a fragment definition" do
+      let(:query_string) {%|
+        {
+          dog {
+            ...DogFields
+          }
+        }
+
+        fragment DogFields on Dog {
+          toys {
+            x: name
+            x: size
+          }
+        }
+      |}
+
+      it "includes the enclosing fragment in the chain and a fragment-relative response path" do
+        assert_equal ["Field 'x' has a field conflict: name or size?"], error_messages
+
+        diag = diagnostics_for(errors.first)
+        # The fragment may be spread at any number of response positions,
+        # so the path is relative to the fragment's own selection set.
+        assert_equal ["toys", "x"], diag["responsePath"]
+        expected_via = [{"kind"=>"FragmentSpread", "name"=>"DogFields", "typeCondition"=>"Dog"}]
+        assert_equal [expected_via, expected_via], diag["sides"].map { |s| s["via"] }
+        assert_equal ["Toy"], diag["sharedPossibleTypes"]
+      end
+    end
+
+    describe "triple-nested fragment chain" do
+      let(:query_string) {%|
+        {
+          dog {
+            name
+            ...A
+          }
+        }
+
+        fragment A on Dog {
+          ...B
+        }
+
+        fragment B on Dog {
+          ...C
+        }
+
+        fragment C on Dog {
+          name: __typename
+        }
+      |}
+
+      it "reports every fragment traversed to reach the conflicting field" do
+        assert_equal ["Field 'name' has a field conflict: name or __typename?"], error_messages
+
+        diag = diagnostics_for(errors.first)
+        assert_equal ["dog", "name"], diag["responsePath"]
+        assert_equal [], diag["sides"][0]["via"]
+        assert_equal [
+          {"kind"=>"FragmentSpread", "name"=>"A", "typeCondition"=>"Dog"},
+          {"kind"=>"FragmentSpread", "name"=>"B", "typeCondition"=>"Dog"},
+          {"kind"=>"FragmentSpread", "name"=>"C", "typeCondition"=>"Dog"}
+        ], diag["sides"][1]["via"]
+      end
     end
   end
 end
