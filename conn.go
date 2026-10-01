@@ -6,6 +6,7 @@ package websocket
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -277,6 +278,13 @@ type Conn struct {
 	readErrCount  int
 	messageReader *messageReader // the current low-level reader
 
+	// closeHandshakeDone is closed once when the peer's close frame is
+	// processed by the read loop. closeHandshakeOnce guarantees that a
+	// single handshake has exactly one final result, even if multiple
+	// close frames arrive.
+	closeHandshakeDone chan struct{}
+	closeHandshakeOnce sync.Once
+
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
 }
@@ -315,6 +323,7 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, 
 		writeBufSize:           writeBufferSize,
 		enableWriteCompression: true,
 		compressionLevel:       defaultCompressionLevel,
+		closeHandshakeDone:     make(chan struct{}),
 	}
 	c.SetCloseHandler(nil)
 	c.SetPingHandler(nil)
@@ -342,6 +351,53 @@ func (c *Conn) Subprotocol() string {
 // for a close message.
 func (c *Conn) Close() error {
 	return c.conn.Close()
+}
+
+// CloseHandshake sends a close message to the peer and waits for the peer's
+// close message, completing the closing handshake defined in RFC 6455,
+// section 7.1.2. It is intended for connection teardown paths that need to
+// know whether the peer responded to the close message.
+//
+// The method never reads from the connection. The application's read loop
+// (NextReader, ReadMessage or the message reader's Read method) must keep
+// running to process the peer's close message; that read loop is what
+// completes the handshake. The connection's close handler is invoked by the
+// read loop as usual.
+//
+// If the peer's close message was already received (the peer closed first,
+// or both endpoints closed at the same time), the method returns
+// immediately. A close message is sent only if none was sent before, so a
+// close message echoed by the close handler is not duplicated. A single
+// handshake has a single result: concurrent and repeated calls all resolve
+// from the same received close message.
+//
+// If ctx is done before the peer's close message arrives, the underlying
+// network connection is closed and ctx.Err() is returned.
+func (c *Conn) CloseHandshake(ctx context.Context, closeCode int, text string) error {
+	// Fast path: the peer's close message was already processed.
+	select {
+	case <-c.closeHandshakeDone:
+		return nil
+	default:
+	}
+
+	// ErrCloseSent means a close message was already sent, either by a
+	// previous call or by the close handler echoing the peer's close
+	// message. That is fine, the handshake only needs one close message
+	// from each side.
+	err := c.WriteControl(CloseMessage, FormatCloseMessage(closeCode, text), time.Now().Add(writeWait))
+	if err != nil && err != ErrCloseSent {
+		return err
+	}
+
+	select {
+	case <-c.closeHandshakeDone:
+		return nil
+	case <-ctx.Done():
+		// The peer did not respond in time. Release the connection.
+		_ = c.Close()
+		return ctx.Err()
+	}
 }
 
 // LocalAddr returns the local network address.
@@ -977,6 +1033,10 @@ func (c *Conn) advanceFrame() (int, error) {
 				return noFrame, c.handleProtocolError("invalid utf8 payload in close frame")
 			}
 		}
+		// The peer's close frame arrived. Signal waiters at most once so
+		// that a single handshake has a single result, then invoke the
+		// close handler (which echoes a close frame by default).
+		c.closeHandshakeOnce.Do(func() { close(c.closeHandshakeDone) })
 		if err := c.handleClose(closeCode, closeText); err != nil {
 			return noFrame, err
 		}
