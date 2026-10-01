@@ -92,6 +92,43 @@ module Addressable
     class TemplateOperatorAbortedError < StandardError
     end
 
+    class ReverseExpansionResult
+      NO_MATCH = :no_match
+      UNIQUE = :unique
+      AMBIGUOUS = :ambiguous
+
+      def initialize(status, binding = nil)
+        @status = status
+        @binding = binding && binding.dup.freeze
+      end
+
+      attr_reader :status, :binding
+      alias_method :mapping, :binding
+
+      def no_match?
+        status == NO_MATCH
+      end
+
+      def unique?
+        status == UNIQUE
+      end
+
+      def ambiguous?
+        status == AMBIGUOUS
+      end
+
+      def inspect
+        if binding
+          sprintf(
+            "#<%s:%#0x %s %s>",
+            self.class, object_id, status, binding.inspect
+          )
+        else
+          sprintf("#<%s:%#0x %s>", self.class, object_id, status)
+        end
+      end
+    end
+
     ##
     # This class represents the data that is extracted when a Template
     # is matched against a URI.
@@ -344,6 +381,29 @@ module Addressable
     def extract(uri, processor=nil)
       match_data = self.match(uri, processor)
       return (match_data ? match_data.mapping : nil)
+    end
+
+    # Reverses an expansion using explicit variable shape declarations.
+    #
+    # @param [Addressable::URI, #to_str] uri
+    #   The URI to extract from.
+    # @param [Hash] shapes
+    #   A mapping from variable names to +:string+, +:list+, +:hash+, or an
+    #   Array containing several of those values.
+    #
+    # @return [Addressable::Template::ReverseExpansionResult]
+    #   A result whose status is +:no_match+, +:unique+, or +:ambiguous+.
+    #   A unique result's binding can be expanded back to +uri+.
+    #
+    # @example
+    #   template = Addressable::Template.new("/{x}{/y*}")
+    #   result = template.reverse_expand("/a/b/c", "x" => :string, "y" => :list)
+    #   result.status
+    #   #=> :unique
+    #   result.binding
+    #   #=> {"x" => "a", "y" => ["b", "c"]}
+    def reverse_expand(uri, shapes={})
+      ReverseExpander.new(self, shapes).expand(uri)
     end
 
     ##
@@ -758,7 +818,9 @@ module Addressable
       return_value = varlist.split(',').inject([]) do |acc, varspec|
         _, name, modifier = *varspec.match(VARSPEC)
         value = mapping[name]
-        unless value == nil || value == {}
+        unless value == nil ||
+          (Hash === value && value.empty?) ||
+          (value.respond_to?(:to_ary) && value.to_ary.empty?)
           allow_reserved = %w(+ #).include?(operator)
           # Common primitives where the .to_s output is well-defined
           if Numeric === value || Symbol === value ||
@@ -841,7 +903,8 @@ module Addressable
               end
             end
           end
-          acc << [name, transformed_value]
+          encoded_pairs = value.kind_of?(Hash)
+          acc << [name, transformed_value, encoded_pairs]
         end
         acc
       end
@@ -865,8 +928,8 @@ module Addressable
       joiner = JOINERS.fetch(operator, ',')
       case operator
       when '&', '?'
-        leader + return_value.map{|k,v|
-          if v.is_a?(Array) && v.first =~ /=/
+        leader + return_value.map{|k,v,pairs|
+          if pairs && v.is_a?(Array)
             v.join(joiner)
           elsif v.is_a?(Array)
             v.map{|inner_value| "#{k}=#{inner_value}"}.join(joiner)
@@ -875,8 +938,8 @@ module Addressable
           end
         }.join(joiner)
       when ';'
-        return_value.map{|k,v|
-          if v.is_a?(Array) && v.first =~ /=/
+        return_value.map{|k,v,pairs|
+          if pairs && v.is_a?(Array)
             ';' + v.join(";")
           elsif v.is_a?(Array)
             ';' + v.map{|inner_value| "#{k}=#{inner_value}"}.join(";")
@@ -1046,6 +1109,757 @@ module Addressable
       # Ensure that the regular expression matches the whole URI.
       regexp_string = "\\A#{regexp_string}\\z"
       return expansions, Regexp.new(regexp_string)
+    end
+
+    class ReverseExpander
+      UNRESERVED = Addressable::URI::CharacterClasses::UNRESERVED
+      RESERVED =
+        Addressable::URI::CharacterClasses::RESERVED +
+        Addressable::URI::CharacterClasses::UNRESERVED
+      TOKEN = /(?:%[a-fA-F0-9]{2}|[^%]|%(?![a-fA-F0-9]{2}))/
+
+      def initialize(template, shapes)
+        @template = template
+        @shapes = normalize_shapes(shapes)
+      end
+
+      def expand(uri)
+        uri = Addressable::URI.parse(uri) unless uri.is_a?(Addressable::URI)
+        @target = uri.to_str.dup.force_encoding(Encoding::UTF_8)
+        states = [fresh_state]
+
+        template_segments.each_with_index do |(kind, payload), index|
+          states =
+            if kind == :literal
+              advance_literal(states, payload)
+            else
+              advance_expression(states, payload, template_segments, index)
+            end
+          states.uniq!
+          break if states.empty?
+        end
+
+        binding_states = states.select do |state|
+          state[:position] == @target.length &&
+            state[:prefixes].empty?
+        end
+        prefix_states = states.select do |state|
+          state[:position] == @target.length &&
+            !state[:prefixes].empty?
+        end.select do |state|
+          state[:prefixes].keys.all? do |name|
+            variable_occurrences[name] == 1
+          end
+        end
+        bindings = valid_bindings(binding_states)
+        has_prefix_match = bindings.empty? && !prefix_states.empty?
+        encoding_ambiguous = binding_states.any? do |state|
+          state[:encoding_ambiguous]
+        end
+        status, binding =
+          if bindings.length > 1
+            ReverseExpansionResult::AMBIGUOUS
+          elsif bindings.length == 1 && !has_prefix_match &&
+              !encoding_ambiguous
+            [ReverseExpansionResult::UNIQUE, bindings.first]
+          elsif bindings.length == 1 || has_prefix_match ||
+              encoding_ambiguous
+            ReverseExpansionResult::AMBIGUOUS
+          else
+            ReverseExpansionResult::NO_MATCH
+          end
+        ReverseExpansionResult.new(status, binding)
+      end
+
+      private
+
+      def normalize_shapes(shapes)
+        unless shapes.respond_to?(:each_pair)
+          raise TypeError, "Can't convert #{shapes.class} into Hash."
+        end
+
+        normalized = {}
+        shapes.each_pair do |name, shape|
+          name = name.to_s
+          unless @template.variables.include?(name)
+            raise ArgumentError, "Unknown variable: #{name}"
+          end
+          normalized[name] = Array(shape).map do |candidate|
+            candidate = candidate.to_s
+            unless %w[string list hash].include?(candidate)
+              raise ArgumentError, "Unknown shape: #{candidate}"
+            end
+            candidate
+          end.uniq
+        end
+        allowed_shapes.each do |name, allowed|
+          normalized[name] ||= ["string"]
+          compatible = normalized[name] & allowed
+          if compatible.empty?
+            raise ArgumentError,
+              "Shape #{normalized[name].inspect} is incompatible with #{name}."
+          end
+          normalized[name] = compatible
+        end
+        normalized
+      end
+
+      def allowed_shapes
+        allowed = {}
+        @template.pattern.scan(EXPRESSION) do
+          _, varlist = Regexp.last_match.captures
+          varlist.split(",").each do |varspec|
+            name, modifier = varspec.match(VARSPEC).captures
+            shapes =
+              if modifier =~ /\A:\d+\z/
+                ["string"]
+              elsif modifier == "*"
+                %w[list hash]
+              else
+                %w[string list hash]
+              end
+            allowed[name] =
+              if allowed.key?(name)
+                allowed[name] & shapes
+              else
+                shapes
+              end
+          end
+        end
+        allowed
+      end
+
+      def variable_occurrences
+        @variable_occurrences ||= begin
+          counts = Hash.new(0)
+          @template.pattern.scan(EXPRESSION) do
+            _, varlist = Regexp.last_match.captures
+            varlist.split(",").each do |varspec|
+              name, = varspec.match(VARSPEC).captures
+              counts[name] += 1
+            end
+          end
+          counts
+        end
+      end
+
+      def template_segments
+        @template_segments ||= begin
+          segments = []
+          position = 0
+          @template.pattern.scan(EXPRESSION) do
+            match = Regexp.last_match
+            if match.begin(0) > position
+              segments << [
+                :literal, @template.pattern[position...match.begin(0)]
+              ]
+            end
+            operator, varlist = match.captures
+            vars = varlist.split(",").map do |varspec|
+              name, modifier = varspec.match(VARSPEC).captures
+              {
+                :name => name,
+                :explode => modifier == "*",
+                :prefix => modifier =~ /\A:(\d+)\z/ ? $1.to_i : nil
+              }
+            end
+            segments << [
+              :expression, { :operator => operator, :vars => vars }
+            ]
+            position = match.end(0)
+          end
+          segments << [
+            :literal, @template.pattern[position..-1]
+          ] if position < @template.pattern.length
+          segments
+        end
+      end
+
+      def advance_literal(states, literal)
+        states.select do |state|
+          @target[state[:position], literal.length] == literal
+        end.map do |state|
+          state.merge(:position => state[:position] + literal.length)
+        end
+      end
+
+      def advance_expression(states, expression, segments, index)
+        operator = expression[:operator]
+        states.flat_map do |state|
+          stops = expression_stops(
+            segments, index, state[:position], expression[:operator]
+          )
+          stops.flat_map do |stop|
+            if %w[; ? &].include?(operator)
+              parse_form(expression, state, stop)
+            else
+              parse_path(expression, state, stop)
+            end
+          end
+        end
+      end
+
+      def expression_stops(segments, index, position, operator)
+        next_segment = segments[index + 1]
+        return [@target.length] unless next_segment
+        if next_segment.first == :literal
+          literal = next_segment.last
+          found = @target.index(literal, position)
+          found ? [found] : []
+        elsif next_segment.first == :expression
+          next_operator = next_segment.last[:operator]
+          next_leader = LEADERS.fetch(next_operator, "")
+          if !next_leader.empty?
+            stops = []
+            while (found = @target.index(next_leader, position))
+              stops << found
+              position = found + next_leader.length
+            end
+            stops
+          else
+            [position, @target.length].uniq
+          end
+        else
+          expression_stops(segments, index + 1, position, operator)
+        end
+      end
+
+      def parse_path(expression, state, stop)
+        results = []
+        parse_path_vars(
+          expression[:operator], expression[:vars], 0,
+          state[:position], state, stop
+        ) { |result| results << result }
+        results
+      end
+
+      def parse_path_vars(operator, vars, index, position, state, stop)
+        if index >= vars.length
+          if position == stop
+            state[:position] = position
+            yield state
+          end
+          return
+        end
+
+        if index > 0 || stop == @target.length ||
+            !LEADERS.fetch(operator, "").empty?
+          parse_path_vars(
+            operator, vars, index + 1, position, copy_state(state), stop
+          ) { |result| yield result }
+        end
+
+        starts = path_starts(operator, index, position)
+        starts.each do |start|
+          parse_path_value(operator, vars, index, start, stop, state) do |result|
+            yield result
+          end
+        end
+      end
+
+      def path_starts(operator, index, position)
+        if index.zero?
+          leader = LEADERS.fetch(operator, "")
+          if leader.empty?
+            [position]
+          elsif @target[position, leader.length] == leader
+            [position + leader.length]
+          else
+            []
+          end
+        else
+          joiner = JOINERS.fetch(operator, ",")
+          starts = []
+          if @target[position, joiner.length] == joiner
+            starts << position + joiner.length
+          end
+          if operator == "+" || operator == "#"
+            starts << position
+          end
+          starts
+        end
+      end
+
+      def parse_path_value(operator, vars, index, start, stop, state)
+        var = vars[index]
+        separator = var[:explode] ? JOINERS.fetch(operator, ",") : ","
+        endings = variable_endings(start, stop, separator)
+        endings.each do |ending|
+          body = @target[start...ending]
+          parse_body(var, operator, body) do |value, encoded_ambiguous|
+            assigned = assign_variable(state, var, value)
+            next unless assigned
+            assigned[:encoding_ambiguous] = true if encoded_ambiguous
+            parse_path_vars(
+              operator, vars, index + 1, ending, assigned, stop
+            ) { |result| yield result }
+          end
+        end
+      end
+
+      def variable_endings(start, stop, separator)
+        endings = [start, stop]
+        found = @target.index(separator, start)
+        endings << found if found && found < stop
+        endings.uniq
+      end
+
+      def each_path_ending(start, stop, separator)
+        position = start
+        while (found = @target.index(separator, position))
+          break if found >= stop
+          yield found
+          position = found + separator.length
+        end
+        yield stop
+      end
+
+      def parse_form(expression, state, stop)
+        results = []
+        parse_form_vars(
+          expression[:operator], expression[:vars], 0,
+          state[:position], state, stop
+        ) { |result| results << result }
+        results
+      end
+
+      def parse_form_vars(operator, vars, index, position, state, stop)
+        if index >= vars.length
+          if position == stop
+            state[:position] = position
+            yield state
+          end
+          return
+        end
+
+        var = vars[index]
+        parse_form_vars(
+          operator, vars, index + 1, position, copy_state(state), stop
+        ) { |result| yield result }
+
+        leader = form_leader(operator, index)
+        return unless @target[position, leader.length] == leader
+
+        body_start = position + leader.length
+        if var[:explode]
+          parse_form_exploded(
+            operator, vars, index, body_start, state, stop
+          ) { |result| yield result }
+          return
+        end
+
+        next_name = vars[index + 1] && vars[index + 1][:name]
+        ending =
+          if next_name
+            found =
+              if operator == ";"
+                @target.index(";" + next_name, body_start)
+              else
+                @target.index("&" + next_name, body_start)
+              end
+            found && found <= stop ? found : stop
+          else
+            stop
+          end
+        segment = @target[body_start...ending]
+        expected_name = var[:name]
+
+        if operator == ";"
+          if segment == expected_name
+            value = ""
+          elsif segment.start_with?(expected_name + "=")
+            content = segment[(expected_name.length + 1)..-1]
+            value = [:raw, content]
+          else
+              return
+          end
+        else
+          return unless segment.start_with?(expected_name + "=")
+          content = segment[(expected_name.length + 1)..-1]
+          value = [:raw, content]
+        end
+
+        parse_scalar_form_value(var, operator, value) do |parsed, ambiguous|
+          assigned = assign_variable(state, var, parsed)
+          next unless assigned
+          assigned[:encoding_ambiguous] = true if ambiguous
+          parse_form_vars(
+            operator, vars, index + 1, ending, assigned, stop
+          ) { |result| yield result }
+        end
+      end
+
+      def parse_scalar_form_value(var, operator, value)
+        shapes = compatible_shapes(var)
+        shapes.each do |shape|
+          if shape == "string"
+            value = value[1] if value.is_a?(Array)
+            decoded, ambiguous = decode_with_flag(value, false)
+            next if decoded.nil?
+            yield decoded, ambiguous
+          elsif shape == "list"
+            raw = value.is_a?(Array) ? value[1] : value
+            parts = raw.empty? ? [] : split(raw, ",", false)
+            yield parts, false if parts
+          elsif shape == "hash"
+            raw = value.is_a?(Array) ? value[1] : value
+            parsed = parse_non_exploded_hash(raw, false)
+            yield parsed, false if parsed
+          end
+        end
+      end
+
+      def form_leader(operator, index)
+        if index.zero?
+          LEADERS.fetch(operator, "")
+        else
+          JOINERS.fetch(operator, "&")
+        end
+      end
+
+      def parse_form_exploded(operator, vars, index, start, state, stop)
+        var = vars[index]
+        joiner = JOINERS.fetch(operator, "&")
+        each_form_segment(start, stop, joiner) do |parts, consumed|
+          parse_form_composite(var, parts) do |value, ambiguous|
+            assigned = assign_variable(state, var, value)
+            next unless assigned
+            assigned[:encoding_ambiguous] = true if ambiguous
+            parse_form_vars(
+              operator, vars, index + 1, consumed, assigned, stop
+            ) { |result| yield result }
+          end
+        end
+      end
+
+      def each_form_segment(start, stop, joiner)
+        starts = [start]
+        starts.concat(indexes_between(start, stop, joiner).map do |position|
+          position + joiner.length
+        end)
+
+        starts.each do |part_start|
+          boundaries = indexes_between(part_start, stop, joiner)
+          boundaries << stop
+          boundaries.uniq.each do |segment_stop|
+            parts = []
+            position = part_start
+            indexes_between(part_start, segment_stop, joiner).each do |boundary|
+              parts << @target[position...boundary]
+              position = boundary + joiner.length
+            end
+            parts << @target[position...segment_stop]
+            consumed = segment_stop
+            yield parts, consumed
+          end
+        end
+      end
+
+      def indexes_between(start, stop, separator)
+        indexes = []
+        position = start
+        while (found = @target.index(separator, position)) && found < stop
+          indexes << found
+          position = found + separator.length
+        end
+        indexes
+      end
+
+      def parse_form_composite(var, parts)
+        shapes = compatible_shapes(var)
+        shapes.each do |shape|
+          if shape == "list"
+            value = parse_form_list_parts(var, parts)
+            yield value, false
+          elsif shape == "hash"
+            value = parse_form_hash_parts(parts)
+            yield value, false
+          end
+        end
+      end
+
+      def parse_form_list_parts(var, parts)
+        prefix = var[:name] + "="
+        values = []
+        parts.each do |part|
+          return nil unless part.start_with?(prefix)
+          value = decode(part[prefix.length..-1], false)
+          return nil if value.nil?
+          values << value
+        end
+        values
+      end
+
+      def parse_form_hash_parts(parts)
+        value = {}
+        parts.each do |part|
+          key, separator, val = part.partition("=")
+          return nil if separator.empty?
+          key = decode(key, false)
+          val = decode(val, false)
+          return nil if key.nil? || val.nil? || value.key?(key)
+          value[key] = val
+        end
+        value.empty? ? nil : value
+      end
+
+      def parse_body(var, operator, body)
+        shapes = compatible_shapes(var)
+        shapes.each do |shape|
+          parse_typed_body(shape, var[:explode], operator, body) do |value, ambiguous|
+            yield value, ambiguous || false
+          end
+        end
+      end
+
+      def compatible_shapes(var)
+        shapes = @shapes.fetch(var[:name])
+        if var[:prefix]
+          shapes & ["string"]
+        elsif var[:explode]
+          shapes & %w[list hash]
+        else
+          shapes
+        end
+      end
+
+      def parse_typed_body(shape, explode, operator, body)
+        reserved = operator == "+" || operator == "#"
+        if shape == "string"
+          value, ambiguous = decode_with_flag(body, reserved)
+          yield value, ambiguous if value
+        elsif shape == "list"
+          separator = explode ? JOINERS.fetch(operator, ",") : ","
+          parts = split(body, separator, reserved)
+          yield parts, false if parts
+        elsif shape == "hash"
+          pair_separator = explode ? JOINERS.fetch(operator, ",") : ","
+          if explode
+            values = parse_exploded_hash(body, pair_separator, reserved)
+            values.each do |value|
+              yield value, values.length > 1
+            end
+          elsif reserved
+            values = parse_reserved_non_exploded_hash(body)
+            values.each do |value|
+              yield value, values.length > 1
+            end
+          else
+            value = parse_non_exploded_hash(body, false)
+            yield value, false
+          end
+        end
+      end
+
+      def parse_exploded_hash(body, pair_separator, reserved)
+        return [] if body.empty?
+        parse_exploded_hash_values(body, pair_separator, reserved)
+      end
+
+      def parse_exploded_hash_values(body, separator, reserved)
+        parse_exploded_hash_pairs(
+          body, 0, separator, reserved, {}
+        ).uniq.first(2)
+      end
+
+      def parse_exploded_hash_pairs(body, position, separator, reserved, seen)
+        return [seen.dup] if position >= body.length
+
+        equals = body.index("=", position)
+        first_separator = body.index(separator, position)
+        return [] if equals.nil?
+        return [] if first_separator && equals > first_separator
+
+        key = decode(body[position...equals], reserved)
+        return [] if key.nil? || seen.key?(key)
+
+        value_start = equals + 1
+        boundaries = [value_start, body.length]
+        search = value_start
+        while (found = body.index(separator, search))
+          boundaries << found
+          search = found + separator.length
+        end
+
+        values = []
+        boundaries.sort.uniq.each do |value_end|
+          value = decode(body[value_start...value_end], reserved)
+          next if value.nil?
+          next_seen = seen.merge(key => value)
+          if value_end == body.length
+            values << next_seen
+          elsif valid_exploded_hash_pair?(
+            body, value_end + separator.length, separator, reserved
+          )
+            values.concat(
+              parse_exploded_hash_pairs(
+                body, value_end + separator.length,
+                separator, reserved, next_seen
+              )
+            )
+          end
+        end
+        values.uniq.first(2)
+      end
+
+      def valid_exploded_hash_pair?(body, position, separator, reserved)
+        return false if position >= body.length
+        equals = body.index("=", position)
+        next_separator = body.index(separator, position)
+        return false if equals.nil?
+        return false if next_separator && equals > next_separator
+        key = decode(body[position...equals], reserved)
+        !key.nil?
+      end
+
+      def parse_non_exploded_hash(body, reserved)
+        tokens = split(body, ",", reserved)
+        return nil unless tokens && tokens.length.even? && !tokens.empty?
+        value = {}
+        tokens.each_slice(2) do |key, val|
+          return nil if value.key?(key)
+          value[key] = val
+        end
+        value
+      end
+
+      def parse_reserved_non_exploded_hash(body)
+        values = parse_reserved_hash_pairs(body, 0, {}).uniq
+        values.first(2)
+      end
+
+      def parse_reserved_hash_pairs(body, position, seen)
+        return [seen.dup] if position >= body.length
+
+        values = []
+        key_end = body.index(",", position)
+        key_end = body.length unless key_end
+        key = decode(body[position...key_end], true)
+        return values if key.nil? || seen.key?(key)
+
+        if key_end == body.length
+          next_seen = seen.merge(key => "")
+          values.concat(parse_reserved_hash_pairs(
+            body, body.length, next_seen
+          ))
+          return values.uniq.first(2)
+        end
+
+        value_start = key_end + 1
+        value_end = value_start
+        while value_end
+          value = decode(body[value_start...value_end], true)
+          next_seen = seen.merge(key => value)
+          if value_end == body.length
+            values.concat(parse_reserved_hash_pairs(
+              body, body.length, next_seen
+            ))
+          elsif body[value_end] == ","
+            values.concat(parse_reserved_hash_pairs(
+              body, value_end + 1, next_seen
+            ))
+          end
+          found = body.index(",", value_end + 1)
+          break unless found
+          value_end = found
+        end
+        values.uniq.first(2)
+      end
+
+      def decode(body, reserved)
+        value, = decode_with_flag(body, reserved)
+        value
+      end
+
+      def decode_with_flag(body, reserved)
+        character_class = reserved ? RESERVED : UNRESERVED
+        valid = true
+        encoded_reserved = false
+        body.scan(TOKEN) do
+          token = Regexp.last_match[0]
+          if token =~ /\A%[a-fA-F0-9]{2}\z/
+            decoded = Addressable::URI.unencode_component(token)
+            encoded_reserved = true if reserved &&
+              decoded =~ /\A[#{Addressable::URI::CharacterClasses::RESERVED}]\z/
+          elsif token !~ /\A[#{character_class}]\z/
+            valid = false
+          end
+        end
+        valid ?
+          [Addressable::URI.unencode_component(body), encoded_reserved] :
+          [nil, false]
+      end
+
+      def split(body, separator, reserved)
+        return [""] if body.empty?
+        positions = []
+        body.scan(TOKEN) do
+          token = Regexp.last_match[0]
+          if token == separator
+            positions << Regexp.last_match.begin(0)
+          end
+        end
+        return [body] if positions.empty?
+
+        parts = []
+        start = 0
+        positions.each do |boundary|
+          parts << body[start...boundary]
+          start = boundary + separator.length
+        end
+        parts << body[start..-1]
+        decoded = parts.map { |part| decode(part, reserved) }
+        decoded.any?(&:nil?) ? nil : decoded
+      end
+
+      def assign_variable(state, var, value)
+        name = var[:name]
+        candidate = copy_state(state)
+
+        if state[:values].key?(name)
+          return nil unless state[:values][name] == value
+        elsif state[:prefixes].key?(name)
+          return nil unless value.to_s.start_with?(state[:prefixes][name])
+          candidate[:values][name] = value
+        elsif var[:prefix] && value.to_s.length >= var[:prefix]
+          candidate[:prefixes][name] = value.to_s[0, var[:prefix]]
+        else
+          candidate[:values][name] = value
+        end
+        candidate
+      end
+
+      def copy_state(state)
+        {
+          :values => state[:values].dup,
+          :prefixes => state[:prefixes].dup,
+          :encoding_ambiguous => state[:encoding_ambiguous],
+          :position => state[:position]
+        }
+      end
+
+      def fresh_state
+        {
+          :values => {},
+          :prefixes => {},
+          :encoding_ambiguous => false,
+          :position => 0
+        }
+      end
+
+      def valid_bindings(states)
+        bindings = states.select { |state| state[:prefixes].empty? }.map do |state|
+          binding = {}
+          @template.variables.each do |name|
+            binding[name] = state[:values][name]
+          end
+          binding
+        end.uniq
+
+        bindings.select do |binding|
+          @template.expand(binding, nil, false).to_str == @target
+        end
+      end
     end
 
   end

@@ -701,6 +701,148 @@ describe Addressable::Template do
     end
   end
 
+  describe "#reverse_expand" do
+    def reverse(pattern, uri, shapes)
+      Addressable::Template.new(pattern).reverse_expand(uri, shapes)
+    end
+
+    it "returns no_match for text the template cannot produce" do
+      result = reverse("/{x}", "/a/b", "x" => :string)
+
+      expect(result).to be_no_match
+      expect(result).not_to be_unique
+      expect(result).not_to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "extracts strings, lists, and hashes according to declarations" do
+      template = Addressable::Template.new(
+        "http://example.com/{a}{/b*}{?c*}{#d}"
+      )
+      uri = "http://example.com/x/y/z?a=1&b=2#frag"
+      result = template.reverse_expand(
+        uri,
+        "a" => :string,
+        "b" => :list,
+        "c" => :hash,
+        "d" => :string
+      )
+
+      expect(result).to be_unique
+      expect(result.binding).to eq({
+        "a" => "x",
+        "b" => %w(y z),
+        "c" => { "a" => "1", "b" => "2" },
+        "d" => "frag"
+      })
+      expect(template.expand(result.binding, nil, false).to_str).to eq(uri)
+    end
+
+    it "requires repeated variables to have the same binding" do
+      expect(reverse("{x}-{x}", "a-a", "x" => :string)).to be_unique
+      result = reverse("{x}-{x}", "a-b", "x" => :string)
+      expect(result).to be_no_match
+    end
+
+    it "preserves empty values and empty collections" do
+      expect(reverse("{?x}", "?x=", "x" => :string).binding).to eq(
+        "x" => ""
+      )
+      expect(reverse("{;x}", ";x", "x" => :string).binding).to eq(
+        "x" => ""
+      )
+      expect(reverse("{x}", "a,,c", "x" => :list).binding).to eq(
+        "x" => ["a", "", "c"]
+      )
+      expect(reverse("{x}", "k,", "x" => :hash).binding).to eq(
+        "x" => { "k" => "" }
+      )
+    end
+
+    it "does not reconstruct the part removed by prefix truncation" do
+      result = reverse("{x:3}", "abc", "x" => :string)
+
+      expect(result).to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "reports ambiguity for encoded reserved expansion characters" do
+      template = Addressable::Template.new("{+x}")
+
+      expect(template.reverse_expand("a/b", "x" => :string)).to be_unique
+      result = template.reverse_expand("a%2Fb", "x" => :string)
+
+      expect(result).to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "treats an empty default expansion as absent, empty string, or empty list" do
+      result = reverse("{x}", "", "x" => [:string, :list])
+
+      expect(result).to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "recovers a short value even when the prefix modifier is present" do
+      result = reverse("{x:3}", "ab", "x" => :string)
+
+      expect(result).to be_unique
+      expect(result.binding).to eq("x" => "ab")
+      expect(Addressable::Template.new("{x:3}").expand(
+        result.binding, nil, false
+      ).to_str).to eq("ab")
+    end
+
+    it "reports ambiguity from two different shapes expanding alike" do
+      list_uri = Addressable::Template.new("{x}").expand(
+        { "x" => ["a", "b"] }, nil, false
+      ).to_str
+      hash_uri = Addressable::Template.new("{x}").expand(
+        { "x" => { "a" => "b" } }, nil, false
+      ).to_str
+
+      expect(list_uri).to eq(hash_uri)
+      expect(list_uri).to eq("a,b")
+
+      result = reverse("{x}", "a,b", "x" => [:list, :hash])
+
+      expect(result).to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "reports ambiguity when an exploded query key can be a later variable" do
+      template = Addressable::Template.new(
+        "http://example.com/{?h*,first}"
+      )
+      uri = "http://example.com/?a=1&first=2"
+      hash_binding = { "h" => { "a" => "1", "first" => "2" }, "first" => nil }
+      string_binding = { "h" => { "a" => "1" }, "first" => "2" }
+
+      expect(template.expand(hash_binding, nil, false).to_str).to eq(uri)
+      expect(template.expand(string_binding, nil, false).to_str).to eq(uri)
+
+      result = template.reverse_expand(
+        uri, "h" => :hash, "first" => :string
+      )
+      expect(result).to be_ambiguous
+      expect(result.binding).to be_nil
+    end
+
+    it "rejects shape declarations that modifiers cannot represent" do
+      template = Addressable::Template.new("{x:3}")
+      expect {
+        template.reverse_expand("abc", "x" => :list)
+      }.to raise_error(ArgumentError, /shape/i)
+    end
+
+    it "requires repeated variables to satisfy all modifiers" do
+      template = Addressable::Template.new("{x:3}{x*}")
+      expect {
+        template.reverse_expand("abca,b", "x" => :list)
+      }.to raise_error(ArgumentError, /incompatible/i)
+    end
+  end
+
   describe "Partial expand with symbols" do
     context "partial_expand with two simple values" do
       subject {

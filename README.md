@@ -86,6 +86,27 @@ template.extract(uri)
 #   "two" => "2",
 #   "fragment" => "foo"
 # }
+
+result = template.reverse_expand(uri, {
+  "host" => :string,
+  "segments" => :list,
+  "one" => :string,
+  "two" => :string,
+  "bogus" => :string,
+  "fragment" => :string
+})
+result.status
+#=> :unique
+result.binding
+#=>
+# {
+#   "host" => "example.com",
+#   "segments" => ["a", "b", "c"],
+#   "one" => "1",
+#   "two" => "2",
+#   "bogus" => nil,
+#   "fragment" => "foo"
+# }
 ```
 
 ## Install
