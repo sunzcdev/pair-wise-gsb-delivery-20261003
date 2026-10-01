@@ -250,14 +250,18 @@ func (db *DB) Load(rd io.Reader) error {
 // index represents a b-tree or r-tree index and also acts as the
 // b-tree/r-tree context for itself.
 type index struct {
-	btr     *btree.BTree                           // contains the items
-	rtr     *rtred.RTree                           // contains the items
-	name    string                                 // name of the index
-	pattern string                                 // a required key pattern
-	less    func(a, b string) bool                 // less comparison function
-	rect    func(item string) (min, max []float64) // rect from string function
-	db      *DB                                    // the origin database
-	opts    IndexOptions                           // index options
+	btr       *btree.BTree                           // contains the items
+	rtr       *rtred.RTree                           // contains the items
+	geo       bool                                   // true for geographic point indexes
+	gtr       *geoTree                               // geographic point KD-tree
+	geoBoxes  int64                                  // boxes expanded by last NearbyGeo (test hook)
+	geoLeaves int64                                  // leaves evaluated by last NearbyGeo (test hook)
+	name      string                                 // name of the index
+	pattern   string                                 // a required key pattern
+	less      func(a, b string) bool                 // less comparison function
+	rect      func(item string) (min, max []float64) // rect from string function
+	db        *DB                                    // the origin database
+	opts      IndexOptions                           // index options
 }
 
 // match matches the pattern to the key
@@ -285,6 +289,7 @@ func (idx *index) clearCopy() *index {
 		db:      idx.db,
 		less:    idx.less,
 		rect:    idx.rect,
+		geo:     idx.geo,
 		opts:    idx.opts,
 	}
 	// initialize with empty trees
@@ -294,7 +299,18 @@ func (idx *index) clearCopy() *index {
 	if nidx.rect != nil {
 		nidx.rtr = rtred.New(nidx)
 	}
+	if nidx.geo {
+		nidx.gtr = nidx.newGeoTree()
+	}
 	return nidx
+}
+
+// newGeoTree creates a geo KD-tree whose points are parsed through this
+// index's rect function.
+func (idx *index) newGeoTree() *geoTree {
+	return &geoTree{rect: func(item *dbItem) (min, max []float64) {
+		return idx.rect(item.val)
+	}}
 }
 
 // rebuild rebuilds the index
@@ -305,6 +321,9 @@ func (idx *index) rebuild() {
 	}
 	if idx.rect != nil {
 		idx.rtr = rtred.New(idx)
+	}
+	if idx.geo {
+		idx.gtr = idx.newGeoTree()
 	}
 	// iterate through all keys and fill the index
 	btreeAscend(idx.db.keys, func(item interface{}) bool {
@@ -318,6 +337,9 @@ func (idx *index) rebuild() {
 		}
 		if idx.rect != nil {
 			idx.rtr.Insert(dbi)
+		}
+		if idx.geo {
+			idx.gtr.insert(dbi)
 		}
 		return true
 	})
@@ -410,6 +432,37 @@ func (db *DB) ReplaceSpatialIndex(name, pattern string,
 	})
 }
 
+// CreateGeoIndex builds a new geographic point index and populates it with
+// items. See Tx.CreateGeoIndex for details on the expected point format and
+// coordinate ranges.
+func (db *DB) CreateGeoIndex(name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	return db.Update(func(tx *Tx) error {
+		return tx.CreateGeoIndex(name, pattern, rect)
+	})
+}
+
+// ReplaceGeoIndex builds a new geographic point index and populates it with
+// items. If a previous index with the same name exists, that index will be
+// deleted.
+func (db *DB) ReplaceGeoIndex(name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	return db.Update(func(tx *Tx) error {
+		err := tx.CreateGeoIndex(name, pattern, rect)
+		if err != nil {
+			if err == ErrIndexExists {
+				err := tx.DropIndex(name)
+				if err != nil {
+					return err
+				}
+				return tx.CreateGeoIndex(name, pattern, rect)
+			}
+			return err
+		}
+		return nil
+	})
+}
+
 // DropIndex removes an index.
 func (db *DB) DropIndex(name string) error {
 	return db.Update(func(tx *Tx) error {
@@ -485,6 +538,9 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 				// Remove it from the rtree index.
 				idx.rtr.Remove(pdbi)
 			}
+			if idx.gtr != nil {
+				idx.gtr.remove(pdbi)
+			}
 		}
 	}
 	if item.opts != nil && item.opts.ex {
@@ -500,6 +556,9 @@ func (db *DB) insertIntoDatabase(item *dbItem) *dbItem {
 		if idx.rtr != nil {
 			// Add new item to rtree index.
 			idx.rtr.Insert(item)
+		}
+		if idx.gtr != nil {
+			idx.gtr.insert(item)
 		}
 		// clear the index
 		idxs[i] = nil
@@ -536,6 +595,9 @@ func (db *DB) deleteFromDatabase(item *dbItem) *dbItem {
 			if idx.rtr != nil {
 				// Remove it from the rtree index.
 				idx.rtr.Remove(pdbi)
+			}
+			if idx.gtr != nil {
+				idx.gtr.remove(pdbi)
 			}
 		}
 	}
@@ -1996,6 +2058,64 @@ func (tx *Tx) Nearby(index, bounds string,
 	return nil
 }
 
+// NearbyGeo searches a geographic point index for the k points nearest to
+// the query point (lon, lat), ordered by great-circle distance on a sphere.
+//
+// The index must have been created with CreateGeoIndex. lon is a longitude
+// in degrees in [-180, 180] and lat is a latitude in degrees in [-90, 90].
+// Out-of-range coordinates return ErrInvalidCoordinates. k is the maximum
+// number of points to return; a k less than or equal to zero returns no
+// points. Distances are reported in unit (GeoMeters, GeoKilometers, or
+// GeoMiles).
+//
+// Results are ordered by distance ascending. Points at exactly the same
+// distance are ordered by key ascending, so the ordering is fully
+// deterministic.
+//
+// The search prunes KD-tree subtrees using a valid lower bound on the
+// spherical distance; it does not scan every item.
+func (tx *Tx) NearbyGeo(index string, lon, lat float64, k int,
+	unit GeoUnit, iterator func(key, value string, dist float64) bool) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	}
+	if index == "" {
+		return nil
+	}
+	idx := tx.db.idxs[index]
+	if idx == nil {
+		return ErrNotFound
+	}
+	if !idx.geo || idx.gtr == nil {
+		return ErrInvalidOperation
+	}
+	if !geoCoordValid(lon, lat) {
+		return ErrInvalidCoordinates
+	}
+	switch unit {
+	case GeoMeters, GeoKilometers, GeoMiles:
+	default:
+		return ErrInvalidOperation
+	}
+	if k <= 0 || iterator == nil {
+		return nil
+	}
+	q := &geoQuery{
+		tree:   idx.gtr,
+		lon:    lon,
+		lat:    lat,
+		unit:   unit,
+		radius: geoEarthRadius(unit),
+	}
+	q.q[0] = geoUnitVector(lon, lat)
+	q.q[1] = geoUnitVector(lon+360, lat)
+	q.q[2] = geoUnitVector(lon-360, lat)
+	q.knn(k, iterator)
+	idx.geoBoxes = int64(q.boxes)
+	idx.geoLeaves = int64(q.leaves)
+	return nil
+}
+
 // Intersects searches for rectangle items that intersect a target rect.
 // The specified index must have been created by AddIndex() and the target
 // is represented by the rect string. This string will be processed by the
@@ -2066,7 +2186,7 @@ type IndexOptions struct {
 // IndexString, IndexBinary, etc.
 func (tx *Tx) CreateIndex(name, pattern string,
 	less ...func(a, b string) bool) error {
-	return tx.createIndex(name, pattern, less, nil, nil)
+	return tx.createIndex(name, pattern, less, nil, nil, false)
 }
 
 // CreateIndexOptions is the same as CreateIndex except that it allows
@@ -2074,7 +2194,7 @@ func (tx *Tx) CreateIndex(name, pattern string,
 func (tx *Tx) CreateIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	less ...func(a, b string) bool) error {
-	return tx.createIndex(name, pattern, less, nil, opts)
+	return tx.createIndex(name, pattern, less, nil, opts, false)
 }
 
 // CreateSpatialIndex builds a new index and populates it with items.
@@ -2093,7 +2213,7 @@ func (tx *Tx) CreateIndexOptions(name, pattern string,
 // parameter.
 func (tx *Tx) CreateSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
-	return tx.createIndex(name, pattern, nil, rect, nil)
+	return tx.createIndex(name, pattern, nil, rect, nil, false)
 }
 
 // CreateSpatialIndexOptions is the same as CreateSpatialIndex except that
@@ -2101,7 +2221,31 @@ func (tx *Tx) CreateSpatialIndex(name, pattern string,
 func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	rect func(item string) (min, max []float64)) error {
-	return tx.createIndex(name, pattern, nil, rect, nil)
+	return tx.createIndex(name, pattern, nil, rect, nil, false)
+}
+
+// CreateGeoIndex builds a new geographic point index and populates it with
+// items.
+//
+// The index expects each matching item value to be a two-dimensional point
+// rect, "[lon lat],[lon lat]", where lon is a longitude in degrees in
+// [-180, 180] and lat is a latitude in degrees in [-90, 90]. Values that
+// are not valid points are ignored by this index. GeoIndexRect is a ready
+// to use rect function; a custom one may be supplied as long as it returns
+// point rects in the same coordinate system.
+//
+// Use NearbyGeo to return the k points nearest to a query point, ordered by
+// great-circle (spherical) distance. The index also keeps a standard
+// r-tree, so the existing Intersects and Nearby operations continue to work
+// with planar/rectangle semantics.
+//
+// An error will occur if an index with the same name already exists.
+func (tx *Tx) CreateGeoIndex(name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	if rect == nil {
+		rect = GeoIndexRect
+	}
+	return tx.createIndex(name, pattern, nil, rect, nil, true)
 }
 
 // createIndex is called by CreateIndex() and CreateSpatialIndex()
@@ -2109,6 +2253,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 	lessers []func(a, b string) bool,
 	rect func(item string) (min, max []float64),
 	opts *IndexOptions,
+	geo bool,
 ) error {
 	if tx.db == nil {
 		return ErrTxClosed
@@ -2164,6 +2309,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 		rect:    rect,
 		db:      tx.db,
 		opts:    sopts,
+		geo:     geo,
 	}
 	idx.rebuild()
 	// save the index

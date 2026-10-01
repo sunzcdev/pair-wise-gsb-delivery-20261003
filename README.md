@@ -19,6 +19,7 @@ Features
 - In-memory database for [fast reads and writes](#performance)
 - Embeddable with a [simple API](https://godoc.org/github.com/tidwall/buntdb)
 - [Spatial indexing](#spatial-indexes) for up to 20 dimensions; Useful for Geospatial data
+- Geographic point indexes with [spherical nearest-neighbor](#geographic-point-indexes-spherical-distance) search (great-circle distance)
 - Index fields inside [JSON](#json-indexes) documents
 - [Collate i18n Indexes](#collate-i18n-indexes) using the optional [collate package](https://github.com/tidwall/collate)
 - Create [custom indexes](#custom-indexes) for any data type
@@ -300,6 +301,50 @@ db.View(func(tx *buntdb.Tx) error {
 	return nil
 })
 ```
+
+### Geographic point indexes (spherical distance)
+
+The `Nearby` ordering above uses planar (flat) box distance on the
+longitude/latitude coordinates. That is not a true distance on the globe:
+points on opposite sides of the 180th meridian appear 360 degrees apart,
+and longitude distances are inflated away from the equator.
+
+For global nearest-neighbor queries on longitude/latitude points, use a
+geographic point index created with `CreateGeoIndex` and query it with
+`NearbyGeo`. Results are ordered by great-circle (spherical) distance:
+
+```go
+db.CreateGeoIndex("fleet", "fleet:*:pos", buntdb.GeoIndexRect)
+
+db.Update(func(tx *buntdb.Tx) error {
+	tx.Set("fleet:0:pos", buntdb.Point(-179.9, 0.0), nil)
+	tx.Set("fleet:1:pos", buntdb.Point(179.9, 0.0), nil)
+	return nil
+})
+
+db.View(func(tx *buntdb.Tx) error {
+	// The 10 nearest points to (lon=180, lat=0), distances in meters.
+	return tx.NearbyGeo("fleet", 180.0, 0.0, 10, buntdb.GeoMeters,
+		func(key, val string, dist float64) bool {
+			...
+			return true
+		})
+})
+```
+
+- Coordinates are in degrees: longitude `[-180, 180]`, latitude
+  `[-90, 90]`, in `(longitude, latitude)` order. Out-of-range query
+  coordinates return `ErrInvalidCoordinates`; values that are not valid
+  points are skipped by the index.
+- Distances are returned in `GeoMeters`, `GeoKilometers`, or `GeoMiles`.
+- Ties at exactly the same distance are ordered by key, ascending.
+- The search prunes subtrees with a valid spherical lower bound; it does
+  not scan the whole index. The existing `Intersects` and `Nearby`
+  rectangle queries are unaffected and continue to work on any-dimension
+  spatial indexes.
+
+`GeoDistance(lon1, lat1, lon2, lat2, unit)` computes a one-off
+great-circle distance between two points.
 
 ### Spatial bracket syntax
 
