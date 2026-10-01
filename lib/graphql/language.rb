@@ -12,6 +12,7 @@ require "graphql/language/parser"
 require "graphql/language/static_visitor"
 require "graphql/language/visitor"
 require "graphql/language/definition_slice"
+require "graphql/language/document_merge"
 require "strscan"
 
 module GraphQL
