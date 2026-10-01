@@ -7,6 +7,7 @@
 #### Features
 
 * Your contribution here.
+* Add optional strict key conflict mode (`strict_key_conflicts`) that tracks which exposure produced each output key and raises `Grape::Entity::KeyConflictError` with both source paths when exposures collide on the same JSON key, unless a per-key adjudicator was declared via `resolve_key_conflict`.
 
 
 ### 1.1.0 (2026-06-05)

@@ -41,6 +41,23 @@ module Grape
   #     end
   #   end
   class Entity
+    # Raised in strict key conflict mode when two exposures would write to
+    # the same output key and no per-key resolver has been declared.
+    # Carries the conflicting key and the source paths of both exposures.
+    class KeyConflictError < StandardError
+      attr_reader :key, :first_source, :second_source
+
+      def initialize(key, first_source, second_source)
+        @key = key
+        @first_source = first_source
+        @second_source = second_source
+        super(
+          "Exposure key conflict on `#{key}`: `#{first_source}` would be overwritten by `#{second_source}`. " \
+          "Declare an adjudicator with `resolve_key_conflict #{key.inspect}` or disable strict key conflict mode."
+        )
+      end
+    end
+
     attr_reader :object, :delegator, :options
 
     # The Entity DSL allows you to mix entity functionality into
@@ -104,6 +121,25 @@ module Grape
 
       attr_writer :root_exposure, :formatters
 
+      # When enabled, two exposures that end up writing to the same output
+      # key raise a KeyConflictError instead of silently overwriting each
+      # other, unless a resolver was declared for that key. Can be
+      # overridden per representation with the :strict_key_conflicts option.
+      def strict_key_conflicts?
+        @strict_key_conflicts ||= false
+      end
+
+      attr_writer :strict_key_conflicts
+
+      # Per-key adjudication functions declared via .resolve_key_conflict.
+      # Maps an output key to a callable receiving
+      # (existing_value, incoming_value, entity).
+      def key_conflict_resolvers
+        @key_conflict_resolvers ||= {}
+      end
+
+      attr_writer :key_conflict_resolvers
+
       # Returns all formatters that are registered for this and it's ancestors
       # @return [Hash] of formatters
       def formatters
@@ -140,6 +176,8 @@ module Grape
     def self.inherited(subclass)
       subclass.root_exposure = root_exposure.dup
       subclass.formatters = formatters.dup
+      subclass.key_conflict_resolvers = key_conflict_resolvers.dup
+      subclass.strict_key_conflicts = strict_key_conflicts?
 
       super
     end
@@ -322,6 +360,33 @@ module Grape
       formatters[name.to_sym] = block
     end
 
+    # Declares an adjudication function for a single output key, used when
+    # strict key conflict mode is enabled and two exposures would write to
+    # that key. The block receives the existing value, the incoming value
+    # and the entity instance, and its return value is used for the key.
+    # Resolvers are inherited by subclasses.
+    #
+    # @param key [Symbol, String] the output key to adjudicate
+    #
+    # @example Resolver declaration
+    #
+    #   class User < Grape::Entity
+    #     self.strict_key_conflicts = true
+    #
+    #     expose :name
+    #     expose :full_name, as: :name
+    #
+    #     resolve_key_conflict :name do |existing, incoming, _entity|
+    #       [existing, incoming].compact.join(' / ')
+    #     end
+    #   end
+    #
+    def self.resolve_key_conflict(key, &block)
+      raise ArgumentError, 'You must pass a block to resolve key conflicts' unless block_given?
+
+      key_conflict_resolvers[key.to_sym] = block
+    end
+
     # This allows you to set a root element name for your representation.
     #
     # @param plural   [String] the root key to use when representing
@@ -443,7 +508,9 @@ module Grape
       @present_collection ||= nil
       if objects.respond_to?(:to_ary) && !@present_collection
         root_element = root_element(:collection_root)
-        inner = objects.to_ary.map { |object| new(object, options.reverse_merge(collection: true)).presented }
+        inner = objects.to_ary.map.with_index do |object, index|
+          new(object, collection_options_for(options, index)).presented
+        end
       else
         objects = { @collection_name => objects } if @present_collection
         root_element = root_element(:root)
@@ -453,6 +520,15 @@ module Grape
       root_element = options[:root] if options.key?(:root)
 
       root_element ? { root_element => inner } : inner
+    end
+
+    # Options for a single element of a represented collection. In strict
+    # key conflict mode the element index is carried along so that conflict
+    # source paths can point at the exact collection element.
+    def self.collection_options_for(options, index)
+      element_options = options.reverse_merge(collection: true)
+      strict = options.key?(:strict_key_conflicts) ? options[:strict_key_conflicts] : strict_key_conflicts?
+      strict ? element_options.merge(collection_index: index) : element_options
     end
 
     # This method returns the entity's root or collection root node, or its parent's

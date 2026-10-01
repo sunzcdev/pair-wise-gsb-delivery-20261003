@@ -675,6 +675,40 @@ end
 
 Also note that an `ArgumentError` is raised when unknown options are passed to either `expose` or `with_options`.
 
+### Strict Key Conflict Mode
+
+By default, when two exposures end up writing to the same output key — for example a direct field, an aliased field (`as:`) and a field merged into the root (`merge: true`) — the last one silently wins and it is hard to tell which value was overwritten. Enabling strict key conflict mode makes such collisions explicit: every key that participates in the representation is recorded along with the source path of the exposure that produced it, and a collision raises a `Grape::Entity::KeyConflictError` naming both source paths.
+
+```ruby
+module API
+  module Entities
+    class User < Grape::Entity
+      self.strict_key_conflicts = true
+
+      expose :name
+      expose :full_name, as: :name
+      expose :extras, merge: true
+    end
+  end
+end
+```
+
+Strict mode can also be toggled per representation with the `:strict_key_conflicts` option:
+
+```ruby
+API::Entities::User.represent(user, strict_key_conflicts: true)
+```
+
+A conflicting key is only output once an adjudicator has been declared for that specific key. The block receives the existing value, the incoming value and the entity instance:
+
+```ruby
+resolve_key_conflict :name do |existing, incoming, _entity|
+  [existing, incoming].compact.join(' / ')
+end
+```
+
+Resolvers are per key — there is no blanket last-write-wins fallback in strict mode. Exposures whose conditions (`if:`/`unless:`) do not hold never count as conflicts, and when representing collections the source paths carry the element index (e.g. `[2].name`) so the exact element can be located. A callable `merge:` option remains valid as an explicit adjudication strategy for merged hashes.
+
 ### Preloading Associations
 
 Use [Grape::Entity::Preloader](https://github.com/OuYangJinTing/grape-entity-preloader) to preload associations and callbacks and avoid N+1 operations.
