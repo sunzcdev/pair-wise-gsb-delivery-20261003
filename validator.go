@@ -28,10 +28,22 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+
+	// Reference-graph traversal state. path is the per-call stack of object
+	// identities on the current DFS path and is intentionally not a global
+	// "visited" set: an object shared by multiple field paths (a diamond)
+	// must be validated under each path's own constraints. Only objects
+	// already present on the current path count as cycles.
+	path    []uintptr
+	depth   int
+	visited int
 }
 
-// parent and current will be the same the first run of validateStruct
-func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag) {
+// parent and current will be the same the first run of validateStruct.
+// edgeID is the identity of the reference through which current was reached,
+// computed before pointer/interface dereferencing; it is 0 when current was
+// reached by value.
+func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag, edgeID uintptr) {
 	cs, ok := v.v.structCache.Get(typ)
 	if !ok {
 		cs = v.v.extractStructCache(current, typ.Name())
@@ -43,6 +55,38 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 
 		structNs = append(structNs, cs.name...)
 		structNs = append(structNs, '.')
+	}
+
+	// Reference-graph guard. Identity tracking happens here, at the single
+	// point the executor descends into a struct, so diamond references are
+	// revisited independently per field path while real back-edges (cycles)
+	// are rejected or truncated according to the configured policy.
+	pushed := false
+	if edgeID != 0 {
+		if v.pathContainsIdentity(edgeID) {
+			// a real back-edge: nothing has been pushed for this value, so
+			// no cleanup is required.
+			if v.v.cyclePolicy == RejectCycles {
+				v.appendGraphError(cycleTag, ns, structNs, current.Kind(), typ)
+			}
+			return
+		}
+		v.path = append(v.path, edgeID)
+		pushed = true
+	}
+
+	v.depth++
+	if v.v.maxStructDepth > 0 && v.depth > v.v.maxStructDepth {
+		v.appendGraphError(maxDepthTag, ns, structNs, current.Kind(), typ)
+		v.exitStruct(pushed)
+		return
+	}
+
+	v.visited++
+	if v.v.maxTraversalNodes > 0 && v.visited > v.v.maxTraversalNodes {
+		v.appendGraphError(maxNodesTag, ns, structNs, current.Kind(), typ)
+		v.exitStruct(pushed)
+		return
 	}
 
 	// ct is nil on top level struct, and structs as fields that have no tag info
@@ -84,12 +128,19 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 
 		cs.fn(ctx, v)
 	}
+
+	v.exitStruct(pushed)
 }
 
 // traverseField validates any field, be it a struct or single field, ensures it's validity and passes it along to be validated via it's tag options
 func (v *validate) traverseField(ctx context.Context, parent reflect.Value, current reflect.Value, ns []byte, structNs []byte, cf *cField, ct *cTag) {
 	var typ reflect.Type
 	var kind reflect.Kind
+
+	// Capture reference identity before pointers and interfaces are unwrapped
+	// below. This is the identity pushed onto the per-path ancestor stack when
+	// traversal descends into current, which is what actually closes a cycle.
+	id := edgeIdentity(current)
 
 	current, kind, v.fldIsPointer = v.extractTypeInternal(current, false)
 
@@ -198,7 +249,7 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct, id)
 			}
 			return
 		}
@@ -220,7 +271,7 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct, id)
 			}
 			return
 

@@ -97,6 +97,13 @@ type Validate struct {
 	requiredStructEnabled  bool
 	privateFieldValidation bool
 	omitBlankFieldNames    bool
+
+	// Reference-graph traversal configuration.
+	// cyclePolicy selects cycle rejection versus truncation; defaults to
+	// RejectCycles. A zero limit means unlimited.
+	cyclePolicy       CyclePolicy
+	maxStructDepth    int
+	maxTraversalNodes int
 }
 
 // New returns a new instance of 'validate' with sane defaults.
@@ -370,7 +377,8 @@ func (v *Validate) StructCtx(ctx context.Context, s interface{}) (err error) {
 	vd.isPartial = false
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.resetGraphState()
+	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil, edgeIdentity(top))
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -416,7 +424,8 @@ func (v *Validate) StructFilteredCtx(ctx context.Context, s interface{}, fn Filt
 	vd.ffn = fn
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.resetGraphState()
+	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil, edgeIdentity(top))
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -502,7 +511,8 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 		}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.resetGraphState()
+	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil, edgeIdentity(top))
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -566,7 +576,8 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 		vd.includeExclude[string(vd.misc)] = struct{}{}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.resetGraphState()
+	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil, edgeIdentity(top))
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -620,6 +631,7 @@ func (v *Validate) VarCtx(ctx context.Context, field interface{}, tag string) (e
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
+	vd.resetGraphState()
 	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
 
 	if len(vd.errs) > 0 {
@@ -672,6 +684,7 @@ func (v *Validate) VarWithValueCtx(ctx context.Context, field interface{}, other
 	vd := v.pool.Get().(*validate)
 	vd.top = otherVal
 	vd.isPartial = false
+	vd.resetGraphState()
 	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
 
 	if len(vd.errs) > 0 {
@@ -730,6 +743,7 @@ func (v *Validate) VarWithKeyCtx(ctx context.Context, key string, field interfac
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
+	vd.resetGraphState()
 	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], cField, ctag)
 
 	if len(vd.errs) > 0 {

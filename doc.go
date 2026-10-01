@@ -86,6 +86,38 @@ The library also supports types like sql/driver.Valuer using
 RegisterCustomTypeFunc. See _examples/valuer/main.go and
 _examples/custom/main.go for both approaches.
 
+# Reference Graphs: Cycles, Diamonds and Work Limits
+
+Validated values are not always trees: a struct field may point back at one
+of its ancestors (a reference cycle) and two fields may point at the same
+object (a diamond reference). Traversal tracks the stack of reference
+identities on the current field path only, rather than keeping a global
+"visited" set. This means an object shared by several field paths is still
+validated independently under every path and that path's own constraints;
+only re-entering an object that is already on the active path is treated as a
+cycle.
+
+By default cycles are rejected: traversal of the back-edge stops and a
+ValidationError is reported at the path where the cycle was reached with the
+synthetic "cycle" tag, while all reachable acyclic content is still
+validated. TruncateCycles cuts the back-edge silently instead:
+
+	validate := validator.New(validator.WithCyclePolicy(validator.TruncateCycles))
+
+Two limits bound the work of a single validation call independently of
+cycles. A zero value (the default) means unlimited:
+
+	// max nesting depth of structs along one field path
+	validator.New(validator.WithMaxStructDepth(100))
+
+	// total number of structs visited during the whole call
+	validator.New(validator.WithMaxTraversalNodes(10000))
+
+Exceeding either limit stops the affected traversal and reports a
+ValidationError with the synthetic "maxdepth" or "maxnodes" tag at the path
+where the limit was hit. These tags are emitted by the traversal guard and
+are not tags that can be registered.
+
 # Cross-Field Validation
 
 Cross-Field Validation can be done via the following tags:
@@ -562,7 +594,6 @@ Kind of like an 'enum'.
 	Usage: noneof=red green
 	       noneof='red green' 'blue yellow'
 		   noneof=5 7 9
-
 
 # None Of Case Insensitive
 Works the same as noneof but is case insensitive and therefore only accepts strings.
