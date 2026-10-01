@@ -47,6 +47,7 @@ require_relative 'tzinfo/data_sources/country_info'
 
 require_relative 'tzinfo/data_sources/posix_time_zone_parser'
 require_relative 'tzinfo/data_sources/zoneinfo_reader'
+require_relative 'tzinfo/data_sources/zoneinfo_writer'
 
 require_relative 'tzinfo/data_source'
 require_relative 'tzinfo/data_sources/ruby_data_source'
