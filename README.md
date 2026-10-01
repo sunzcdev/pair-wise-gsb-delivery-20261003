@@ -282,6 +282,41 @@ the `Write()` could return an error.
 The `connection` will be `automatically closed` by the proxy library after the
 error handler call, so you don't have to worry about it.
 
+## Upstream failover with multiple proxy lines
+
+`UpstreamFailover` chains several upstream proxies. Each request starts on a
+preferred line and, while it is still safely replayable, fails over to backup
+lines. It works for both ordinary HTTP forwarding and `CONNECT` tunneling, and
+every line carries its own credentials.
+
+```go
+failover := goproxy.NewUpstreamFailover([]goproxy.UpstreamLine{
+    {Name: "primary", Addr: "10.0.0.1:8080", Username: "a", Password: "secret-a"},
+    {Name: "backup", Addr: "10.0.0.2:8080", Username: "b", Password: "secret-b"},
+})
+proxy := goproxy.NewProxyHttpServer()
+failover.Attach(proxy)
+http.ListenAndServe(":8080", proxy)
+```
+
+Per request, set the preferred line with the `X-Upstream-Preferred` header
+(comma-separated names, e.g. `backup,primary`); the header is consumed by this
+proxy and never forwarded.
+
+Failover is attempted only before the request is committed to a line:
+
+- connection refused/reset during dial or while sending the request head, and
+- upstream `407` observed before the request body (a
+  `Expect: 100-continue` gate is used for body-bearing requests)
+
+trigger a retry. Once any request-body byte has been written, once a body that
+cannot be replayed is in flight (a streamed body larger than
+`WithMaxBufferedBody`), or once a `CONNECT` tunnel has replied `200`, no second
+line is tried. When all attempts fail the client gets a `502` whose body lists
+the lines actually tried, without credentials. See
+[`examples/failoverproxy`](examples/failoverproxy/README.md) for a runnable
+configuration and the exact boundary rules.
+
 ## Project Status
 This project has been created `10 years` ago, and has reached a stage of
 `maturity`. It can be safely used in `production`, and many projects
