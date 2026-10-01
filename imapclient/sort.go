@@ -5,28 +5,30 @@ import (
 	"github.com/emersion/go-imap/v2/internal/imapwire"
 )
 
-type SortKey string
+// SortKey is a criterion used to sort messages.
+//
+// This is an alias for imap.SortKey.
+type SortKey = imap.SortKey
 
 const (
-	SortKeyArrival SortKey = "ARRIVAL"
-	SortKeyCc      SortKey = "CC"
-	SortKeyDate    SortKey = "DATE"
-	SortKeyFrom    SortKey = "FROM"
-	SortKeySize    SortKey = "SIZE"
-	SortKeySubject SortKey = "SUBJECT"
-	SortKeyTo      SortKey = "TO"
+	SortKeyArrival = imap.SortKeyArrival
+	SortKeyCc      = imap.SortKeyCc
+	SortKeyDate    = imap.SortKeyDate
+	SortKeyFrom    = imap.SortKeyFrom
+	SortKeySize    = imap.SortKeySize
+	SortKeySubject = imap.SortKeySubject
+	SortKeyTo      = imap.SortKeyTo
 )
 
-type SortCriterion struct {
-	Key     SortKey
-	Reverse bool
-}
+// SortCriterion is a sort key, optionally reversed.
+//
+// This is an alias for imap.SortCriterion.
+type SortCriterion = imap.SortCriterion
 
 // SortOptions contains options for the SORT command.
-type SortOptions struct {
-	SearchCriteria *imap.SearchCriteria
-	SortCriteria   []SortCriterion
-}
+//
+// This is an alias for imap.SortOptions.
+type SortOptions = imap.SortOptions
 
 func (c *Client) sort(numKind imapwire.NumKind, options *SortOptions) *SortCommand {
 	cmd := &SortCommand{}

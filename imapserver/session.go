@@ -92,6 +92,14 @@ type SessionMove interface {
 	Move(w *MoveWriter, numSet imap.NumSet, dest string) error
 }
 
+// SessionSort is an IMAP session which supports SORT.
+type SessionSort interface {
+	Session
+
+	// Selected state
+	Sort(numKind NumKind, options *imap.SortOptions) (*imap.SortData, error)
+}
+
 // SessionIMAP4rev2 is an IMAP session which supports IMAP4rev2.
 type SessionIMAP4rev2 interface {
 	Session
