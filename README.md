@@ -43,6 +43,42 @@ JMESPath.search('foo.bar', { abc: "mno" })
 
 **[See the JMESPath specification for a full list of supported search expressions.](http://jmespath.org/specification.html)**
 
+## Access Summaries
+
+Data-masking and auditing layers can ask, before running a query, which
+fields a JMESPath expression may read. `JMESPath.access_summary`
+statically analyzes the compiled expression without evaluating it
+against any data:
+
+```ruby
+summary = JMESPath.access_summary('users[?age > `20`].name')
+
+summary.required.map(&:to_s)
+#=> ["users (required, field, output)",
+#    "users (required, wildcard, output) - array projection reads every element of the array",
+#    "users[*].age (required, field, filter)"]
+
+summary.possible.map(&:to_s)
+#=> ["users[*].name (possible, field, output)"]
+```
+
+Each access entry distinguishes:
+
+* `:required` vs `:possible` certainty - whether the read happens on
+  every code path or is guarded by a data-dependent condition (filter
+  results, `&&`/`||` short-circuits).
+* `:field`, `:index`, `:wildcard`, and `:subtree` kinds - precise reads
+  versus ranges that fan out over every element, value, or key of a
+  container.
+* `:output`, `:filter`, `:sort_key`, and `:function` contexts - so
+  filter conditions and `sort_by`/`max_by`/`min_by` expression
+  references are not mistaken for result fields.
+
+When an access pattern cannot be determined precisely (slices, indices
+into projected lists, functions like `to_string` or `merge` that consume
+whole values, ...), the summary falls back to a conservative wider range
+and documents why in the entry's `:reason`.
+
 ## Indifferent Access
 
 The examples above show JMESPath expressions used to search over hashes with symbolized keys. You can use search also for hashes with string keys or Struct objects.

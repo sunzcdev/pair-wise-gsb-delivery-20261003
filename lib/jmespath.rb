@@ -4,6 +4,7 @@ require 'stringio'
 require 'pathname'
 
 module JMESPath
+  require 'jmespath/access_summary'
   require 'jmespath/caching_parser'
   require 'jmespath/errors'
   require 'jmespath/lexer'
@@ -29,6 +30,22 @@ module JMESPath
              else data
         end
       Runtime.new(runtime_options).search(expression, data)
+    end
+
+    # Statically analyzes a JMESPath expression and reports which data
+    # fields it may read. The expression is compiled but never evaluated
+    # against data. See {AccessSummary} for details.
+    #
+    #     summary = JMESPath.access_summary('users[?age > `20`].name')
+    #     summary.required.map(&:to_s)
+    #     #=> ["users (required, field, output)", ...]
+    #
+    # @param [String] expression A valid
+    #   [JMESPath](https://github.com/boto/jmespath) expression.
+    # @param [Hash] runtime_options Passed to {Runtime}.
+    # @return [AccessSummary::Summary]
+    def access_summary(expression, runtime_options = {})
+      Runtime.new(runtime_options).access_summary(expression)
     end
 
     # @api private

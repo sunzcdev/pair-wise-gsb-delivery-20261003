@@ -57,6 +57,19 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # Statically analyzes a JMESPath expression and reports which data
+    # fields it may read, without evaluating it against any data.
+    #
+    #     runtime = JMESPath::Runtime.new
+    #     runtime.access_summary('users[?age > `20`].name')
+    #     #=> #<JMESPath::AccessSummary::Summary ...>
+    #
+    # @param [String<JMESPath>] expression
+    # @return [AccessSummary::Summary]
+    def access_summary(expression)
+      AccessSummary.analyze(@parser.parse(expression).optimize)
+    end
+
     private
 
     def default_parser(options)
