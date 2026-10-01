@@ -21,6 +21,7 @@ The package has the following features:
 - Unit tests
 - "No Auth" mode
 - User/Password authentication optional user addr limit
+- GSS-API authentication (RFC 1961) with injectable mechanism engine and negotiated message protection
 - Support for the CONNECT command
 - Support for the ASSOCIATE command
 - Rules to do granular filtering of commands
@@ -82,4 +83,3 @@ func main() {
 ## License
 
 This project is under MIT License. See the [LICENSE](LICENSE) file for the full license text.
-

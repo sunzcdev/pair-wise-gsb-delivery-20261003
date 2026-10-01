@@ -12,7 +12,7 @@ This repository implements a SOCKS5 proxy server library in Go. It provides a fl
 
 - **Server** (`server.go`): Main entry point. Created via `NewServer` with functional options (`option.go`). Handles incoming connections, authentication, and request routing.
 - **Request Handling** (`handle.go`): Processes CONNECT, BIND, and ASSOCIATE commands. CONNECT proxies TCP traffic; ASSOCIATE handles UDP tunneling; BIND is not yet implemented (TODO).
-- **Authentication** (`auth.go`): Pluggable authenticators (`Authenticator` interface). Built-in `NoAuthAuthenticator` and `UserPassAuthenticator`. Credentials are validated via `CredentialStore` (`credentials.go`).
+- **Authentication** (`auth.go`): Pluggable authenticators (`Authenticator` interface). Built-in `NoAuthAuthenticator`, `UserPassAuthenticator` and `GSSAPIAuthenticator` (`gssapi.go`, RFC 1961). Credentials are validated via `CredentialStore` (`credentials.go`). GSS-API uses an injectable `GSSEngine` (per-connection acceptor context); after a successful handshake the negotiated protection level is enforced by wrapping the connection (`AuthContext.WrapConn`), so protected traffic never falls back to plaintext.
 - **Rules** (`ruleset.go`): `RuleSet` interface for allowing/denying commands. Default `PermitCommand` provides simple command-based filtering.
 - **Resolver** (`resolver.go`): `NameResolver` interface for custom DNS resolution. Default `DNSResolver` uses system DNS.
 - **Buffer Pool** (`bufferpool/pool.go`): `BufPool` interface for efficient buffer reuse. Default pool with 32KB buffers.
@@ -108,6 +108,7 @@ go mod verify
 ├── server.go          # Main server type and ListenAndServe
 ├── handle.go          # Request handling (CONNECT, BIND, ASSOCIATE)
 ├── auth.go            # Authenticator interface and implementations
+├── gssapi.go          # GSS-API authenticator (RFC 1961) and message protection
 ├── credentials.go     # CredentialStore interface
 ├── resolver.go        # NameResolver interface
 ├── ruleset.go         # RuleSet interface and PermitCommand

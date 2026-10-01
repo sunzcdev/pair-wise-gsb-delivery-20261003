@@ -151,6 +151,12 @@ func (sf *Server) ServeConn(conn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("failed to authenticate: %w", err)
 	}
+	// The authenticator may require the connection to be wrapped before
+	// any further traffic (e.g. GSS-API message protection, RFC 1961).
+	if authContext.WrapConn != nil {
+		conn = authContext.WrapConn(conn)
+		bufConn = bufio.NewReader(conn)
+	}
 
 	// The client request detail
 	request, err := ParseRequest(bufConn)

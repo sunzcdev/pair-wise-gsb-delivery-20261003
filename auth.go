@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"io"
+	"net"
 
 	"github.com/things-go/go-socks5/statute"
 )
@@ -15,6 +16,10 @@ type AuthContext struct {
 	// Keys depend on the used auth method.
 	// For UserPass auth contains username/password
 	Payload map[string]string
+	// WrapConn, when non-nil, is invoked by the server after a successful
+	// authentication to wrap the connection before any further traffic,
+	// e.g. GSS-API per-message protection (RFC 1961 section 5).
+	WrapConn func(conn net.Conn) net.Conn
 }
 
 // Authenticator provide auth
@@ -32,7 +37,7 @@ func (a NoAuthAuthenticator) GetCode() uint8 { return statute.MethodNoAuth }
 // Authenticate implement interface Authenticator
 func (a NoAuthAuthenticator) Authenticate(_ io.Reader, writer io.Writer, _ string) (*AuthContext, error) {
 	_, err := writer.Write([]byte{statute.VersionSocks5, statute.MethodNoAuth})
-	return &AuthContext{statute.MethodNoAuth, make(map[string]string)}, err
+	return &AuthContext{Method: statute.MethodNoAuth, Payload: make(map[string]string)}, err
 }
 
 // UserPassAuthenticator is used to handle username/password based
@@ -69,8 +74,8 @@ func (a UserPassAuthenticator) Authenticate(reader io.Reader, writer io.Writer, 
 	}
 	// Done
 	return &AuthContext{
-		statute.MethodUserPassAuth,
-		map[string]string{
+		Method: statute.MethodUserPassAuth,
+		Payload: map[string]string{
 			"username": string(nup.User),
 			"password": string(nup.Pass),
 		},

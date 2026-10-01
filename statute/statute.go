@@ -17,7 +17,7 @@ const (
 // method defined
 const (
 	MethodNoAuth       = byte(0x00)
-	MethodGSSAPI       = byte(0x01) // TODO: not support now
+	MethodGSSAPI       = byte(0x01)
 	MethodUserPassAuth = byte(0x02)
 	MethodNoAcceptable = byte(0xff)
 )
