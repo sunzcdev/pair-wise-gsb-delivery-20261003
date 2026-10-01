@@ -17,6 +17,8 @@ class CSV
       @output = output
       @options = options
       @lineno = 0
+      @start_of_row = true
+      @field_index = 0
       @fields_converter = nil
       prepare
       if @options[:write_headers] and @headers
@@ -39,21 +41,40 @@ class CSV
       @headers ||= row if @use_headers
       @lineno += 1
 
-      if @fields_converter
-        row = @fields_converter.convert(row, nil, lineno)
-      end
+      add_fields(row)
+      finish_row
 
-      i = -1
-      converted_row = row.collect do |field|
-        i += 1
-        quote(field, i)
-      end
-      line = converted_row.join(@column_separator) + @row_separator
-      if @output_encoding
-        line = line.encode(@output_encoding)
-      end
-      @output << line
+      self
+    end
 
+    #
+    # Writes the given +fields+ as part of the current row without
+    # terminating the row. Column separators are emitted between the
+    # chunks of the same row; the row separator is not. Call
+    # #finish_row to terminate the row.
+    #
+    # This is used for streaming a row that is assembled from
+    # multiple sources, so a whole row never needs to be buffered.
+    #
+    def add_fields(fields)
+      fields = prepare_fields(fields, @field_index)
+      @field_index += fields.size
+      line = fields.join(@column_separator)
+      unless @start_of_row
+        line = @column_separator + line
+      end
+      emit_line(line)
+      @start_of_row = false
+      self
+    end
+
+    #
+    # Terminates the current row by writing the row separator.
+    #
+    def finish_row
+      emit_line(@row_separator)
+      @start_of_row = true
+      @field_index = 0
       self
     end
 
@@ -63,6 +84,8 @@ class CSV
     def rewind
       @lineno = 0
       @headers = nil if @options[:headers].nil?
+      @start_of_row = true
+      @field_index = 0
     end
 
     private
@@ -184,6 +207,25 @@ class CSV
         field.gsub(encoded_quote_character,
                    encoded_quote_character * 2) +
         encoded_quote_character
+    end
+
+    def prepare_fields(row, offset = 0)
+      if @fields_converter
+        row = @fields_converter.convert(row, nil, lineno)
+      end
+
+      i = offset - 1
+      row.collect do |field|
+        i += 1
+        quote(field, i)
+      end
+    end
+
+    def emit_line(line)
+      if @output_encoding
+        line = line.encode(@output_encoding)
+      end
+      @output << line
     end
 
     def quote(field, i)

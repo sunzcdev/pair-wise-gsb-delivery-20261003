@@ -1,5 +1,19 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added `CSV.transpose` and `CSV#transpose` for external-memory
+    row/column transposition. The input is streamed once (a
+    forward-only IO works), temporary files hold column stripes, and
+    both buffered fields (`max_buffered_fields`) and simultaneously
+    open files (`max_open_files`) are bounded. Rows with differing
+    field counts are rejected with `CSV::RaggedRowError` by default or
+    padded with an explicit field value via `ragged_rows`.
+
+---
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

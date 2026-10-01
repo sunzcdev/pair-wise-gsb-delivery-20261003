@@ -1,0 +1,65 @@
+== Recipes for Transposing \CSV
+
+These recipes show how to transpose rows and columns of \CSV data.
+
+For other recipes, see {Recipes for CSV}[./recipes_rdoc.html].
+
+All code snippets on this page assume that the following has been executed:
+  require 'csv'
+
+Transposition treats every input record as data; no header is inferred.
+
+=== Contents
+
+- {Transposing}[#label-Transposing]
+  - {Recipe: Transpose a String}[#label-Recipe-3A+Transpose+a+String]
+  - {Recipe: Transpose a Large Stream}[#label-Recipe-3A+Transpose+a+Large+Stream]
+  - {Recipe: Handle Rows of Different Widths}[#label-Recipe-3A+Handle+Rows+of+Different+Widths]
+
+=== Transposing
+
+Transposing swaps rows and columns.
+
+===== Recipe: Transpose a String
+
+  input = "a,b,c\n1,2,3\n"
+  output = CSV.transpose(input)
+  puts output
+
+Output:
+
+  a,1
+  b,2
+  c,3
+
+Quoting, embedded newlines, and empty fields are preserved.
+
+===== Recipe: Transpose a Large Stream
+
+The input is read only once and need not fit in memory. Columns are
+spooled into temporary files in stripes. Bound buffered fields and
+simultaneously open files explicitly; tables wider than the open-file
+limit are supported because closed stripes are reopened as needed.
+
+  File.open('metrics.csv', 'rb') do |input|
+    File.open('metrics-by-column.csv', 'wb') do |output|
+      CSV.transpose(input, output,
+                    max_buffered_fields: 1024,
+                    max_open_files: 8)
+    end
+  end
+
+The same works with a forward-only IO (for example the read end of an
+IO.pipe). A transposed rectangular table can be transposed again to
+recover the original field matrix.
+
+===== Recipe: Handle Rows of Different Widths
+
+By default, rows with differing field counts raise
+CSV::RaggedRowError. Pass +ragged_rows:+ with an explicit pad value to
+fill holes of short rows instead:
+
+  CSV.transpose("a,b,c\n1,2\n", ragged_rows: "")
+  # => "a,1\nb,2\nc,\"\"\n"
+
+Use +nil+ to emit empty (unquoted) trailing fields.

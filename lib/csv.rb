@@ -99,6 +99,7 @@ require_relative "csv/input_record_separator"
 require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
+require_relative "csv/transposer"
 require_relative "csv/writer"
 
 # == \CSV
@@ -1302,6 +1303,118 @@ class CSV
 
     #
     # :call-seq:
+    #   transpose(in_string_or_io, out_string_or_io, **options) -> new_string_or_io
+    #   transpose(in_string_or_io, **options) -> new_string
+    #
+    # Transposes rows and columns of \CSV data: the input's rows
+    # become the output's columns and vice versa. Every input record
+    # is treated as data; headers are not inferred.
+    #
+    # The input is streamed once (a forward-only \IO works) and may be
+    # too large to load as a whole. Temporary files from the standard
+    # library are used to hold column stripes, with explicit bounds on
+    # buffered fields and simultaneously open files:
+    #
+    # - <tt>max_buffered_fields</tt>: stripe width; at most this many
+    #   fields of one row are buffered for a stripe, and output rows
+    #   are assembled using a buffer of at most one field. Default:
+    #   CSV::Transposer::DEFAULT_MAX_BUFFERED_FIELDS.
+    # - <tt>max_open_files</tt>: maximum number of temporary files open
+    #   at once. No column keeps a file handle permanently; closed
+    #   stripe files are reopened as needed, so tables wider than this
+    #   limit are supported. Default:
+    #   CSV::Transposer::DEFAULT_MAX_OPEN_FILES.
+    #
+    # Rows with differing field counts are handled with
+    # <tt>ragged_rows</tt>:
+    # - +:raise+ (the default) raises CSV::RaggedRowError.
+    # - Any other value is used as the explicit field value written
+    #   into holes of short rows (e.g. +nil+ or +""+), padding every
+    #   row to the widest row seen.
+    #
+    # As with CSV.filter, parsing and generating options may be split
+    # with +in_*+/+out_*+ prefixes (for example +in_col_sep+ and
+    # +out_row_sep+); an option without a prefix applies to both.
+    #
+    # When +out_string_or_io+ is omitted, a new \String is generated
+    # and returned. Otherwise the \CSV object writing to the given
+    # output is returned.
+    #
+    #   CSV.transpose("a,b,c\n1,2,3\n")
+    #   # => "a,1\nb,2\nc,3\n"
+    #
+    # Short rows padded with an explicit empty field:
+    #
+    #   CSV.transpose("a,b,c\n1,2\n", ragged_rows: "")
+    #   # => "a,1\nb,2\nc,\"\"\n"
+    #
+    def transpose(input=nil, output=nil, **options)
+      transpose_options, csv_options = extract_transpose_options(options)
+      in_options, out_options = split_inout_options(csv_options)
+      enforce_no_headers(in_options)
+
+      return_string = output.nil?
+      if return_string
+        output = +""
+        output.force_encoding(in_options[:encoding]) if in_options[:encoding]
+      end
+      input_csv = new(input || ARGF, **in_options)
+      output_csv = new(output, **out_options)
+
+      transpose_options[:return_string] = return_string
+      Transposer.new(input_csv, output_csv, **transpose_options).transpose
+    end
+
+    # Transposition treats every record as data and never infers a
+    # header row, so input-side header options are rejected.
+    def enforce_no_headers(in_options)
+      headers = in_options[:headers]
+      return if headers.nil? || headers == false
+      raise ArgumentError,
+            "CSV.transpose treats every record as data and does " \
+            "not accept headers: #{headers.inspect}"
+    end
+    private :enforce_no_headers
+
+    # Separates transposition-specific options from CSV parsing/
+    # generating options.
+    #
+    # :nodoc:
+    def extract_transpose_options(options)
+      keys = [:ragged_rows,
+              :max_buffered_fields,
+              :max_open_files,
+              :tmpdir,
+              :return_string]
+      transpose_options = {}
+      keys.each do |key|
+        transpose_options[key] = options.delete(key) if options.key?(key)
+      end
+      [transpose_options, options]
+    end
+
+    # Splits shared CSV options into input and output option hashes,
+    # following the +in_*+/+out_*+ convention used by CSV.filter.
+    #
+    # :nodoc:
+    def split_inout_options(options)
+      in_options, out_options = Hash.new, {row_sep: InputRecordSeparator.value}
+      options.each do |key, value|
+        case key
+        when /\Ain(?:put)?_(.+)\Z/
+          in_options[$1.to_sym] = value
+        when /\Aout(?:put)?_(.+)\Z/
+          out_options[$1.to_sym] = value
+        else
+          in_options[key]  = value
+          out_options[key] = value
+        end
+      end
+      [in_options, out_options]
+    end
+
+    #
+    # :call-seq:
     #   foreach(path_or_io, mode='r', **options) {|row| ... )
     #   foreach(path_or_io, mode='r', **options) -> new_enumerator
     #
@@ -2497,6 +2610,65 @@ class CSV
   end
   alias_method :add_row, :<<
   alias_method :puts,    :<<
+
+  # :call-seq:
+  #   csv.add_fields(fields) -> csv
+  #
+  # Writes +fields+ (an \Array) as the next chunk of the current
+  # output row without terminating it. A column separator is written
+  # before the chunk unless it starts a row. Finish the row with
+  # #finish_row.
+  #
+  # This streams a row assembled from several sources without
+  # buffering the whole row. Preformatted rows should use #<<.
+  def add_fields(fields)
+    writer.add_fields(fields)
+    self
+  end
+
+  # :call-seq:
+  #   csv.finish_row -> csv
+  #
+  # Writes the configured row separator, terminating the row started
+  # with #add_fields.
+  def finish_row
+    writer.finish_row
+    self
+  end
+
+  # :call-seq:
+  #   csv.transpose(other_csv_or_io = $stdout, **options) -> io_or_string
+  #
+  # Transposes the rows and columns read from +self+ (which must be
+  # readable once) and writes them to +other_csv_or_io+.
+  #
+  # See CSV.transpose for the semantics of +ragged_rows+,
+  # +max_buffered_fields+, and +max_open_files+. Output formatting
+  # options (for example +:out_col_sep+) may be passed as keywords.
+  #
+  # Returns the output CSV object, or its generated \String when it
+  # writes to a StringIO.
+  def transpose(output=nil, **options)
+    if @parser_options[:headers]
+      raise ArgumentError,
+            "CSV#transpose treats every record as data and does " \
+            "not accept a source CSV with headers enabled"
+    end
+    transpose_options, out_options =
+      self.class.extract_transpose_options(options)
+    _, out_options = self.class.split_inout_options(out_options)
+
+    return_string = output.nil?
+    if return_string
+      output = +""
+      encoding = out_options[:encoding] || @encoding
+      output.force_encoding(encoding) if encoding
+    end
+    output_csv = self.class.new(output, **out_options)
+    Transposer.new(self, output_csv,
+                   return_string: return_string,
+                   **transpose_options).transpose
+  end
 
   # :call-seq:
   #   convert(converter_name) -> array_of_procs
