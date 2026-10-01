@@ -342,6 +342,27 @@ const (
 	IPMatchDisabled
 )
 
+// TLSDataSessionRequirement is the enumerable that represents the policy
+// used to prove that a TLS-protected data connection belongs to the control
+// connection it was requested from, using TLS session resumption instead of
+// (or in addition to) a mere source IP check.
+type TLSDataSessionRequirement int8
+
+// Supported TLS data session requirements
+const (
+	// TLSDataSessionDisabled does not require the data connection to resume the
+	// control connection TLS session. This is the default and keeps the
+	// historical behavior.
+	TLSDataSessionDisabled TLSDataSessionRequirement = iota
+	// TLSDataSessionRequired requires every TLS-protected data connection
+	// (PROT P on an explicit FTPS control connection) to be established as a
+	// resumption of the control connection TLS session. A data connection that
+	// performs a full handshake, or that resumes another control connection's
+	// session (for example another user behind the same NAT/public IP), is
+	// rejected.
+	TLSDataSessionRequired
+)
+
 // Settings defines all the server settings
 type Settings struct {
 	Listener   net.Listener // (Optional) To provide an already initialized listener
@@ -379,6 +400,13 @@ type Settings struct {
 	ActiveConnectionsCheck DataConnectionRequirement
 	// PasvConnectionsCheck defines the security requirements for passive connections
 	PasvConnectionsCheck DataConnectionRequirement
+	// TLSDataSessionRequirement binds TLS-protected data connections to the
+	// control connection through TLS session resumption (RFC 5077 for TLS 1.2,
+	// PSK/resumption for TLS 1.3). It is only enforced on explicit FTPS servers
+	// (AUTH TLS/PROT P); implicit TLS servers are not affected. Clear data
+	// connections (PROT C) are not affected. The default
+	// TLSDataSessionDisabled keeps the historical, IP-only behavior.
+	TLSDataSessionRequirement TLSDataSessionRequirement
 	// ActiveTransferLocalIPResolver (Optional) selects the local IP address active mode (PORT, EPRT)
 	// data connections are dialed from. Without it the operating system picks the source address
 	// from its routing table, which on a multi homed host is not necessarily the address the client

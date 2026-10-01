@@ -3,6 +3,9 @@ package ftpserver
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -134,6 +137,52 @@ type FtpServer struct {
 	passiveListeners *passiveListenersManager
 	clientCounter    uint32     // Clients counter
 	driver           MainDriver // Driver to handle the client authentication and the file access driver selection
+	// sessionTicketAEAD authenticates the TLS session ticket envelopes used to
+	// bind data connections to their control connection. It is shared by all
+	// clients; the actual per-control-connection binding is stored inside the
+	// encrypted ticket.
+	sessionTicketAEAD     cipher.AEAD
+	sessionTicketAEADOnce sync.Once
+}
+
+// getSessionTicketAEAD lazily creates the server-wide AEAD used to protect
+// session ticket envelopes.
+func (server *FtpServer) getSessionTicketAEAD() (cipher.AEAD, error) {
+	var initErr error
+
+	server.sessionTicketAEADOnce.Do(func() {
+		key := make([]byte, 32) // AES-256
+		if _, err := io.ReadFull(rand.Reader, key); err != nil {
+			initErr = err
+
+			return
+		}
+
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			initErr = err
+
+			return
+		}
+
+		server.sessionTicketAEAD, err = cipher.NewGCM(block)
+		if err != nil {
+			initErr = err
+		}
+	})
+
+	return server.sessionTicketAEAD, initErr
+}
+
+// newControlDataSessionBinding creates the TLS session binding for one
+// explicit FTPS control connection.
+func (server *FtpServer) newControlDataSessionBinding() (*tlsSessionBinding, error) {
+	aead, err := server.getSessionTicketAEAD()
+	if err != nil {
+		return nil, err
+	}
+
+	return newTLSSessionBinding(aead)
 }
 
 func (server *FtpServer) getListener() net.Listener {

@@ -385,6 +385,16 @@ func (driver *TestServerDriver) GetSettings() (*Settings, error) {
 
 var errNoTLS = errors.New("TLS is not configured")
 
+// testSessionTicketKey is a fixed, non-secret key used by the test TLS
+// configurations so that session tickets survive across the different
+// tls.Config instances returned to control and data connections.
+var testSessionTicketKey = [32]byte{
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+	0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+}
+
 // GetTLSConfig fetches the TLS config
 func (driver *TestServerDriver) GetTLSConfig() (*tls.Config, error) {
 	if driver.TLS {
@@ -394,8 +404,12 @@ func (driver *TestServerDriver) GetTLSConfig() (*tls.Config, error) {
 		}
 
 		return &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{keypair},
+			MinVersion: tls.VersionTLS12,
+			// A fixed ticket key lets tickets minted on a control connection
+			// be resumed on data connections, which use independent
+			// tls.Config instances.
+			SessionTicketKey: testSessionTicketKey,
+			Certificates:     []tls.Certificate{keypair},
 		}, nil
 	}
 

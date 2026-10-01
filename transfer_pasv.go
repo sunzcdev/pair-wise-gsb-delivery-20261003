@@ -38,6 +38,8 @@ type passiveTransferHandler struct {
 	logger         *slog.Logger          // Logger
 	// data connection requirement checker
 	checkDataConn func(dataConnIP net.IP, channelType DataChannel) error
+	// checkDataTLS enforces the control/data TLS session binding policy
+	checkDataTLS func(conn net.Conn) (net.Conn, error)
 }
 
 type ipValidationError struct {
@@ -170,7 +172,7 @@ func (c *clientHandler) handlePASV(_ string) error {
 
 	if c.HasTLSForTransfers() || c.server.settings.TLSRequired == ImplicitEncryption {
 		if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
-			listener = tls.NewListener(listener, tlsConfig)
+			listener = tls.NewListener(listener, c.dataTLSConfig(tlsConfig))
 		} else {
 			c.writeMessage(StatusServiceNotAvailable, fmt.Sprintf("Cannot get a TLS config: %v", err))
 
@@ -190,6 +192,10 @@ func (c *clientHandler) handlePASV(_ string) error {
 		settings:       c.server.settings,
 		logger:         c.logger,
 		checkDataConn:  c.checkDataConnectionRequirement,
+		checkDataTLS: func(conn net.Conn) (net.Conn, error) {
+			return c.verifyDataTLSConnection(conn,
+				time.Duration(time.Second.Nanoseconds()*int64(c.server.settings.ConnectionTimeout)))
+		},
 	}
 
 	// We should rewrite this part
@@ -296,6 +302,15 @@ func (p *passiveTransferHandler) ConnectionWait(wait time.Duration) (net.Conn, e
 		p.logger.Warn("Could not validate passive data connection requirement", "err", err)
 
 		return nil, &ipValidationError{error: "data connection security requirements not met"}
+	}
+
+	if p.checkDataTLS != nil {
+		p.connection, err = p.checkDataTLS(p.connection)
+		if err != nil {
+			p.logger.Warn("Could not validate passive data connection TLS session", "err", err)
+
+			return nil, &ipValidationError{error: "data connection security requirements not met"}
+		}
 	}
 
 	return p.connection, nil

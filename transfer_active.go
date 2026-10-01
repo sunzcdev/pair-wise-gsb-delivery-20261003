@@ -54,6 +54,8 @@ func (c *clientHandler) handlePORT(param string) error {
 
 			return nil
 		}
+
+		tlsConfig = c.dataTLSConfig(tlsConfig)
 	}
 
 	var laddr net.IP
@@ -65,10 +67,11 @@ func (c *clientHandler) handlePORT(param string) error {
 	c.transferMu.Lock()
 
 	c.transfer = &activeTransferHandler{
-		raddr:     raddr,
-		laddr:     laddr,
-		settings:  c.server.settings,
-		tlsConfig: tlsConfig,
+		raddr:         raddr,
+		laddr:         laddr,
+		settings:      c.server.settings,
+		tlsConfig:     tlsConfig,
+		clientHandler: c,
 	}
 
 	c.transferMu.Unlock()
@@ -84,12 +87,13 @@ var _ transferHandler = (*activeTransferHandler)(nil)
 
 // Active connection
 type activeTransferHandler struct {
-	raddr     *net.TCPAddr // Remote address of the client
-	laddr     net.IP       // Local address to dial from, nil lets the operating system choose
-	conn      net.Conn     // Connection used to connect to him
-	settings  *Settings    // Settings
-	tlsConfig *tls.Config  // not nil if the active connection requires TLS
-	info      string       // transfer info
+	raddr         *net.TCPAddr   // Remote address of the client
+	laddr         net.IP         // Local address to dial from, nil lets the operating system choose
+	conn          net.Conn       // Connection used to connect to him
+	settings      *Settings      // Settings
+	tlsConfig     *tls.Config    // not nil if the active connection requires TLS
+	clientHandler *clientHandler // owner, used to enforce the TLS session binding policy
+	info          string         // transfer info
 }
 
 func (a *activeTransferHandler) GetInfo() string {
@@ -119,6 +123,13 @@ func (a *activeTransferHandler) Open() (net.Conn, error) {
 
 	if a.tlsConfig != nil {
 		conn = tls.Server(conn, a.tlsConfig)
+	}
+
+	if a.clientHandler != nil && a.tlsConfig != nil {
+		conn, err = a.clientHandler.verifyDataTLSConnection(conn, timeout)
+		if err != nil {
+			return nil, newNetworkError("data connection security requirements not met", err)
+		}
 	}
 
 	// keep connection as it will be closed by Close()

@@ -148,8 +148,35 @@ type Settings struct {
 	ActiveConnectionsCheck DataConnectionRequirement
 	// PasvConnectionsCheck defines the security requirements for passive connections
 	PasvConnectionsCheck DataConnectionRequirement
+	// TLSDataSessionRequirement binds TLS-protected data connections to the
+	// control connection through TLS session resumption (explicit FTPS only)
+	TLSDataSessionRequirement TLSDataSessionRequirement
 }
 ```
+
+#### Binding data connections to the control TLS session
+
+Matching the data connection source IP against the control connection IP
+(`ActiveConnectionsCheck`/`PasvConnectionsCheck`) cannot distinguish between
+several users hiding behind the same NAT/proxy public IP. Setting
+`TLSDataSessionRequirement` to `TLSDataSessionRequired` adds a cryptographic
+check for explicit FTPS (`AUTH TLS` + `PROT P`): every protected data
+connection must be established as a **TLS session resumption** of the current
+control connection. A data connection that performs a full handshake, or that
+resumes another control connection's session, is rejected (`425`). The
+ticket/PSK is bound to the control connection by the server, so it neither
+relies on the peer IP nor on client certificates.
+
+* TLS 1.2 uses the `SessionTicket` extension (RFC 5077); TLS 1.3 uses PSK
+  resumption (`pre_shared_key`, RFC 8446). In both versions each resumed
+  connection receives a fresh ticket, so ticket rotation keeps working.
+* Clients must reuse the same TLS session cache for control and data
+  connections.
+* The default `TLSDataSessionDisabled` keeps the historical behavior; clear
+  data connections (`PROT C`) and implicit TLS are not affected.
+
+See [specs/2026-10-01-data-connection-session-binding.md](specs/2026-10-01-data-connection-session-binding.md)
+for the full design.
 
 ### Extensions
 There are a few extensions to the base afero APIs so that you can perform some operations that aren't offered by afero.

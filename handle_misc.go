@@ -14,6 +14,18 @@ var errUnknownHash = errors.New("unknown hash algorithm")
 
 func (c *clientHandler) handleAUTH(_ string) error {
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
+		if c.tlsDataSessionReuseEnabled() {
+			binding, bindingErr := c.server.newControlDataSessionBinding()
+			if bindingErr != nil {
+				c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Cannot enable TLS session binding: %v", bindingErr))
+
+				return nil
+			}
+
+			c.controlDataSessionBinding = binding
+			tlsConfig = binding.buildSessionBoundTLSConfig(tlsConfig, false)
+		}
+
 		c.writeMessage(StatusAuthAccepted, "AUTH command ok. Expecting TLS Negotiation.")
 		c.conn = tls.Server(c.conn, tlsConfig)
 		c.reader = bufio.NewReaderSize(c.conn, maxCommandSize)
