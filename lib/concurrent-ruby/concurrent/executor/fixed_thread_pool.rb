@@ -19,6 +19,10 @@ module Concurrent
   # @!macro thread_pool_executor_constant_default_synchronous
   #   Default value of the :synchronous option.
 
+  # @!macro thread_pool_executor_constant_default_max_blocking_compensation
+  #   Default maximum number of additional threads the pool may start to
+  #   compensate for workers parked in a managed block.
+
   # @!macro thread_pool_executor_attr_reader_max_length
   #   The maximum number of threads that may be created in the pool.
   #   @return [Integer] The maximum number of threads that may be created in the pool.
@@ -50,6 +54,36 @@ module Concurrent
   # @!macro thread_pool_executor_attr_reader_synchronous
   #   Whether or not a value of 0 for :max_queue option means the queue must perform direct hand-off or rather unbounded queue.
   #   @return [true, false]
+
+  # @!macro thread_pool_executor_attr_reader_max_blocking_compensation
+  #   The maximum number of additional worker threads the pool is allowed to
+  #   create while workers are parked inside a {#managed_block}. This limit is
+  #   independent from `max_length`: the pool never creates more than
+  #   `max_length + max_blocking_compensation` threads.
+  #   @return [Integer] The maximum number of additional threads created to
+  #     compensate for blocked workers.
+
+  # @!macro thread_pool_executor_attr_reader_blocking_count
+  #   The number of pool worker threads currently parked inside a
+  #   {#managed_block}.
+  #   @return [Integer] The number of workers currently in a managed block.
+
+  # @!macro thread_pool_executor_method_managed_block
+  #   Declares that the current worker thread is about to block (for example
+  #   while waiting on a subtask submitted to the same pool). While the block
+  #   runs the pool may start one additional worker thread, up to
+  #   `max_blocking_compensation`, to preserve execution capacity and avoid the
+  #   deadlock of a full pool whose workers all wait on pending subtasks.
+  #
+  #   Only a thread owned by this pool is eligible for compensation; a call on
+  #   an external thread simply runs the block without reserving any worker
+  #   capacity. Nested declarations on the same worker are counted only once,
+  #   and the accounting is always restored when the block returns, even if it
+  #   raises an exception.
+  #
+  #   @yield the section which may block
+  #   @return [Object] the return value of the block
+  #   @raise [ArgumentError] if no block is given
 
   # @!macro thread_pool_executor_attr_reader_max_queue
   #   The maximum number of tasks that may be waiting in the work queue at any one time.
@@ -118,6 +152,15 @@ module Concurrent
   #   @!attribute [r] remaining_capacity
   #     @!macro thread_pool_executor_attr_reader_remaining_capacity
   #
+  #   @!attribute [r] max_blocking_compensation
+  #     @!macro thread_pool_executor_attr_reader_max_blocking_compensation
+  #
+  #   @!attribute [r] blocking_count
+  #     @!macro thread_pool_executor_attr_reader_blocking_count
+  #
+  #   @!method managed_block(&block)
+  #     @!macro thread_pool_executor_method_managed_block
+  #
   #   @!method can_overflow?
   #     @!macro executor_service_method_can_overflow_question
   #
@@ -140,6 +183,12 @@ module Concurrent
   #   * `max_queue`: The maximum number of tasks that may be waiting in the work queue at
   #     any one time. When the queue size reaches `max_queue` and no new threads can be created,
   #     subsequent tasks will be rejected in accordance with the configured `fallback_policy`.
+  #   * `max_blocking_compensation`: The maximum number of additional threads the pool may
+  #     create when one of its worker threads declares a managed block with
+  #     `#managed_block` (for example while waiting on a subtask posted to the same
+  #     pool). It is bounded independently from `max_threads`, so the total number of
+  #     threads never exceeds `max_threads + max_blocking_compensation`. Defaults to 0,
+  #     which disables compensation and preserves the traditional behavior.
   #   * `auto_terminate`: When true (default), the threads started will be marked as daemon.
   #   * `fallback_policy`: The policy defining how rejected tasks are handled.
   #

@@ -28,6 +28,9 @@ module Concurrent
     # @!macro thread_pool_executor_constant_default_synchronous
     DEFAULT_SYNCHRONOUS = false
 
+    # @!macro thread_pool_executor_constant_default_max_blocking_compensation
+    DEFAULT_MAX_BLOCKING_COMPENSATION = 0
+
     # @!macro thread_pool_executor_attr_reader_max_length
     attr_reader :max_length
 
@@ -42,6 +45,9 @@ module Concurrent
 
     # @!macro thread_pool_executor_attr_reader_synchronous
     attr_reader :synchronous
+
+    # @!macro thread_pool_executor_attr_reader_max_blocking_compensation
+    attr_reader :max_blocking_compensation
 
     # @!macro thread_pool_executor_method_initialize
     def initialize(opts = {})
@@ -67,6 +73,30 @@ module Concurrent
     def active_count
       synchronize do
         @pool.length - @ready.length
+      end
+    end
+
+    # @!macro thread_pool_executor_attr_reader_blocking_count
+    def blocking_count
+      synchronize { @blocking_count }
+    end
+
+    # @!macro thread_pool_executor_method_managed_block
+    def managed_block
+      raise ArgumentError.new('no block given') unless block_given?
+
+      # Only a thread actually owned by this pool may claim a compensation
+      # slot; a regular external (caller) thread can never forge one.
+      worker, nested = synchronize do
+        w = @worker_threads[Thread.current]
+        w ? [w, ns_enter_managed_block(w)] : [nil, nil]
+      end
+      begin
+        yield
+      ensure
+        # nested declarations count once, and the accounting is always
+        # restored, even when the block raises.
+        synchronize { ns_exit_managed_block(worker) } if worker && !nested
       end
     end
 
@@ -121,8 +151,8 @@ module Concurrent
     end
 
     # @!visibility private
-    def ready_worker(worker, last_message)
-      synchronize { ns_ready_worker worker, last_message }
+    def ready_worker(worker, last_message, success = true, work_signaled = false)
+      synchronize { ns_ready_worker worker, last_message, success, work_signaled }
     end
 
     # @!visibility private
@@ -150,6 +180,8 @@ module Concurrent
       @max_queue       = opts.fetch(:max_queue, DEFAULT_MAX_QUEUE_SIZE).to_i
       @synchronous     = opts.fetch(:synchronous, DEFAULT_SYNCHRONOUS)
       @fallback_policy = opts.fetch(:fallback_policy, :abort)
+      @max_blocking_compensation =
+        opts.fetch(:max_blocking_compensation, DEFAULT_MAX_BLOCKING_COMPENSATION).to_i
 
       raise ArgumentError.new("`synchronous` cannot be set unless `max_queue` is 0") if @synchronous && @max_queue > 0
       raise ArgumentError.new("#{@fallback_policy} is not a valid fallback policy") unless FALLBACK_POLICIES.include?(@fallback_policy)
@@ -157,15 +189,19 @@ module Concurrent
       raise ArgumentError.new("`max_threads` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if @max_length > DEFAULT_MAX_POOL_SIZE
       raise ArgumentError.new("`min_threads` cannot be less than #{DEFAULT_MIN_POOL_SIZE}") if @min_length < DEFAULT_MIN_POOL_SIZE
       raise ArgumentError.new("`min_threads` cannot be more than `max_threads`") if min_length > max_length
+      raise ArgumentError.new("`max_blocking_compensation` cannot be less than zero") if @max_blocking_compensation < DEFAULT_MAX_BLOCKING_COMPENSATION
+      raise ArgumentError.new("`max_blocking_compensation` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if @max_blocking_compensation > DEFAULT_MAX_POOL_SIZE
 
       @pool                 = [] # all workers
-      @ready                = [] # used as a stash (most idle worker is at the start)
+      @ready                = [] # idle workers: [worker, last_message]
       @queue                = [] # used as queue
       # @ready or @queue is empty at all times
       @scheduled_task_count = 0
       @completed_task_count = 0
       @largest_length       = 0
       @workers_counter      = 0
+      @blocking_count       = 0 # workers currently inside a managed block
+      @worker_threads       = {} # worker thread => Worker, for managed block checks
       @ruby_pid             = $$ # detects if Ruby has forked
     end
 
@@ -208,6 +244,8 @@ module Concurrent
       @pool.each(&:kill)
       @pool.clear
       @ready.clear
+      @worker_threads.clear
+      @blocking_count = 0
     end
 
     # tries to assign task to a worker, tries to get one from @ready or to create new one
@@ -215,8 +253,10 @@ module Concurrent
     #
     # @!visibility private
     def ns_assign_worker(*args, &task)
-      # keep growing if the pool is not at the minimum yet
-      worker, _ = (@ready.pop if @pool.size >= @min_length) || ns_add_busy_worker
+      # take an idle worker if one exists, preferring ordinary workers over
+      # idle compensation workers, otherwise grow the pool
+      worker, = ns_pop_ready_worker if @pool.size >= @min_length
+      worker ||= ns_add_busy_worker
       if worker
         worker << [task, args]
         true
@@ -228,6 +268,17 @@ module Concurrent
       return false
     end
 
+    # Pops an idle worker from @ready, preferring an ordinary worker over an
+    # idle compensation worker.
+    #
+    # @return [Array, nil] the popped `[worker, last_message]` entry
+    #
+    # @!visibility private
+    def ns_pop_ready_worker
+      index = @ready.index { |w, _| !w.compensating? } || @ready.index { |w, _| w.compensating? }
+      index ? @ready.delete_at(index) : nil
+    end
+
     # tries to enqueue task
     # @return [true, false] if enqueued
     #
@@ -237,6 +288,12 @@ module Concurrent
 
       if !ns_limited_queue? || @queue.size < @max_queue
         @queue << [task, args]
+        # An idle compensation worker cannot take already queued work on its
+        # own; signal it for this newly submitted task.
+        if entry = @ready.find { |w, _| w.compensating? }
+          @ready.delete(entry)
+          entry[0].signal_work
+        end
         true
       else
         false
@@ -255,19 +312,70 @@ module Concurrent
     #
     # @!visibility private
     def ns_add_busy_worker
-      return if @pool.size >= @max_length
+      return if @pool.size >= ns_effective_max_length
 
       @workers_counter += 1
       @pool << (worker = Worker.new(self, @workers_counter))
+      @worker_threads[worker.thread] = worker
       @largest_length = @pool.length if @pool.length > @largest_length
       worker
+    end
+
+    # maximum number of workers which may exist right now. Workers parked in a
+    # managed block temporarily surrender their execution slot, so the pool may
+    # compensate with an additional worker, up to `max_blocking_compensation`.
+    #
+    # @!visibility private
+    def ns_effective_max_length
+      @max_length + [@blocking_count, @max_blocking_compensation].min
+    end
+
+    # Marks a worker as blocked inside a managed block and spawns a single
+    # compensation worker (within the configured bounds) to preserve execution
+    # capacity while the parked worker waits.
+    #
+    # @return [true, false] true if this worker is already blocking, i.e. the
+    #   declaration was nested and must not change the accounting
+    #
+    # @!visibility private
+    def ns_enter_managed_block(worker)
+      return true if worker.blocking?
+      worker.blocking = true
+      @blocking_count += 1
+      # Only compensate when there is no idle worker which could pick up the
+      # work the blocked worker cannot do. The compensation worker starts
+      # idle and only drains queued tasks once explicitly signaled for newly
+      # submitted work, so it never steals tasks already waiting for an
+      # ordinary worker.
+      if @ready.empty?
+        compensation = ns_add_busy_worker
+        if compensation
+          compensation.compensating = true
+          if running?
+            @ready.push([compensation, Concurrent.monotonic_time])
+          else
+            compensation.stop
+          end
+        end
+      end
+      false
+    end
+
+    # @!visibility private
+    def ns_exit_managed_block(worker)
+      return unless worker.blocking?
+      worker.blocking = false
+      @blocking_count -= 1
     end
 
     # handle ready worker, giving it new job or assigning back to @ready
     #
     # @!visibility private
-    def ns_ready_worker(worker, last_message, success = true)
-      task_and_args = @queue.shift
+    def ns_ready_worker(worker, last_message, success = true, work_signaled = false)
+      # a compensation worker only drains the queue once it has been signaled
+      # for newly submitted work, so it never steals tasks already pending for
+      # an ordinary worker
+      task_and_args = @queue.shift if !worker.compensating? || work_signaled
       if task_and_args
         worker << task_and_args
       else
@@ -286,6 +394,11 @@ module Concurrent
     # @!visibility private
     def ns_remove_busy_worker(worker)
       @pool.delete(worker)
+      @worker_threads.delete(worker.thread)
+      if worker.blocking?
+        worker.blocking = false
+        @blocking_count -= 1
+      end
       stopped_event.set if @pool.empty? && !running?
       true
     end
@@ -304,7 +417,11 @@ module Concurrent
     # @!visibility private
     def ns_prunable_capacity
       if running?
-        [@pool.size - @min_length, @ready.size].min
+        # while workers are parked in managed blocks their compensation
+        # workers must be retained so the pool does not lose the capacity it
+        # promised while the blocking tasks wait
+        floor = [@min_length + @blocking_count, @pool.length].min
+        [@pool.length - floor, @ready.size].min
       else
         @pool.size
       end
@@ -320,6 +437,8 @@ module Concurrent
         @completed_task_count = 0
         @largest_length       = 0
         @workers_counter      = 0
+        @blocking_count       = 0
+        @worker_threads.clear
         @ruby_pid             = $$
       end
     end
@@ -328,11 +447,32 @@ module Concurrent
     class Worker
       include Concern::Logging
 
+      # the thread running this worker, accessed only under the pool's lock
+      attr_reader :thread
+
+      # whether the worker is currently parked inside a managed block,
+      # accessed only under the pool's lock
+      attr_accessor :blocking
+
+      # whether this worker exists only to compensate for a blocked worker,
+      # accessed only under the pool's lock
+      attr_accessor :compensating
+
+      def blocking?
+        @blocking
+      end
+
+      def compensating?
+        @compensating
+      end
+
       def initialize(pool, id)
         # instance variables accessed only under pool's lock so no need to sync here again
-        @queue  = Collection::TimeoutQueue.new
-        @pool   = pool
-        @thread = create_worker @queue, pool, pool.idletime
+        @queue        = Collection::TimeoutQueue.new
+        @pool         = pool
+        @blocking     = false
+        @compensating = false
+        @thread       = create_worker @queue, pool, pool.idletime
 
         if @thread.respond_to?(:name=)
           @thread.name = [pool.name, 'worker', id].compact.join('-')
@@ -345,6 +485,11 @@ module Concurrent
 
       def stop
         @queue << :stop
+      end
+
+      # Wakes an idle compensation worker so it may take newly submitted work.
+      def signal_work
+        @queue << :work
       end
 
       def kill
@@ -367,6 +512,11 @@ module Concurrent
               when :stop
                 my_pool.remove_worker(self)
                 throw :stop
+              when :work
+                # only an idle compensation worker receives this; it is now
+                # allowed to take a queued task. If there is none (the task
+                # was handled meanwhile) it simply stays parked.
+                my_pool.ready_worker(self, Concurrent.monotonic_time, true, true)
               else
                 task, args = message
                 run_task my_pool, task, args

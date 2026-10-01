@@ -25,6 +25,9 @@ if Concurrent.on_jruby?
       # @!macro thread_pool_executor_constant_default_synchronous
       DEFAULT_SYNCHRONOUS = false
 
+      # @!macro thread_pool_executor_constant_default_max_blocking_compensation
+      DEFAULT_MAX_BLOCKING_COMPENSATION = 0
+
       # @!macro thread_pool_executor_attr_reader_max_length
       attr_reader :max_length
 
@@ -33,6 +36,9 @@ if Concurrent.on_jruby?
 
       # @!macro thread_pool_executor_attr_reader_synchronous
       attr_reader :synchronous
+
+      # @!macro thread_pool_executor_attr_reader_max_blocking_compensation
+      attr_reader :max_blocking_compensation
 
       # @!macro thread_pool_executor_method_initialize
       def initialize(opts = {})
@@ -79,6 +85,24 @@ if Concurrent.on_jruby?
         @executor.getActiveCount
       end
 
+      # @!macro thread_pool_executor_attr_reader_blocking_count
+      #
+      # @note Managed block compensation is only provided by the pure-Ruby
+      #   pool implementation, so this always reports zero on the JVM.
+      def blocking_count
+        0
+      end
+
+      # @!macro thread_pool_executor_method_managed_block
+      #
+      # @note Managed block compensation is only provided by the pure-Ruby
+      #   pool implementation; on the JVM the block is executed without
+      #   reserving any additional worker capacity.
+      def managed_block
+        raise ArgumentError.new('no block given') unless block_given?
+        yield
+      end
+
       # @!macro thread_pool_executor_attr_reader_idletime
       def idletime
         @executor.getKeepAliveTime(java.util.concurrent.TimeUnit::SECONDS)
@@ -113,12 +137,16 @@ if Concurrent.on_jruby?
         @max_queue       = opts.fetch(:max_queue, DEFAULT_MAX_QUEUE_SIZE).to_i
         @synchronous     = opts.fetch(:synchronous, DEFAULT_SYNCHRONOUS)
         @fallback_policy = opts.fetch(:fallback_policy, :abort)
+        @max_blocking_compensation =
+          opts.fetch(:max_blocking_compensation, DEFAULT_MAX_BLOCKING_COMPENSATION).to_i
 
         raise ArgumentError.new("`synchronous` cannot be set unless `max_queue` is 0") if @synchronous && @max_queue > 0
         raise ArgumentError.new("`max_threads` cannot be less than #{DEFAULT_MIN_POOL_SIZE}") if max_length < DEFAULT_MIN_POOL_SIZE
         raise ArgumentError.new("`max_threads` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if max_length > DEFAULT_MAX_POOL_SIZE
         raise ArgumentError.new("`min_threads` cannot be less than #{DEFAULT_MIN_POOL_SIZE}") if min_length < DEFAULT_MIN_POOL_SIZE
         raise ArgumentError.new("`min_threads` cannot be more than `max_threads`") if min_length > max_length
+        raise ArgumentError.new("`max_blocking_compensation` cannot be less than zero") if @max_blocking_compensation < DEFAULT_MAX_BLOCKING_COMPENSATION
+        raise ArgumentError.new("`max_blocking_compensation` cannot be greater than #{DEFAULT_MAX_POOL_SIZE}") if @max_blocking_compensation > DEFAULT_MAX_POOL_SIZE
         raise ArgumentError.new("#{fallback_policy} is not a valid fallback policy") unless FALLBACK_POLICY_CLASSES.include?(@fallback_policy)
 
         if @max_queue == 0

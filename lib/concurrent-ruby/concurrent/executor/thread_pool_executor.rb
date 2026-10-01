@@ -75,6 +75,10 @@ module Concurrent
     #     `max_queue` or the executor has shut down
     #   @option opts [Boolean] :synchronous (DEFAULT_SYNCHRONOUS) whether or not a value of 0
     #     for :max_queue means the queue must perform direct hand-off rather than unbounded.
+    #   @option opts [Integer] :max_blocking_compensation
+    #     (DEFAULT_MAX_BLOCKING_COMPENSATION) the maximum number of additional
+    #     threads the pool may create, on top of `max_threads`, to compensate
+    #     for worker threads parked inside {#managed_block}
     #   @raise [ArgumentError] if `:max_threads` is less than one
     #   @raise [ArgumentError] if `:min_threads` is less than zero
     #   @raise [ArgumentError] if `:fallback_policy` is not one of the values specified
