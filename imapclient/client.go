@@ -984,6 +984,22 @@ func (c *Client) readResponseData(typ string) error {
 			return c.dec.Err()
 		}
 		return c.handleFetch(num)
+	case "UID":
+		// Unsolicited "UID FETCH" responses may be sent for non-selected
+		// mailboxes with NOTIFY (RFC 5465). The message is identified by the
+		// UID in the FETCH data items; the sequence number is unavailable for
+		// a mailbox the client hasn't selected.
+		var sub string
+		if !c.dec.ExpectSP() || !c.dec.ExpectAtom(&sub) {
+			return c.dec.Err()
+		}
+		if !strings.EqualFold(sub, "FETCH") {
+			return fmt.Errorf("unsupported UID response %q", sub)
+		}
+		if !c.dec.ExpectSP() {
+			return c.dec.Err()
+		}
+		return c.handleFetch(0)
 	case "EXPUNGE":
 		return c.handleExpunge(num)
 	case "SEARCH":

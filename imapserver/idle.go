@@ -32,7 +32,11 @@ func (c *Conn) handleIdle(dec *imapwire.Decoder) error {
 			}
 		}()
 		w := &UpdateWriter{conn: c, allowExpunge: true}
-		done <- c.session.Idle(w, stop)
+		if notifySession, ok := c.session.(SessionNotify); ok {
+			done <- notifySession.NotifyIdle(&NotifyWriter{conn: c}, w, stop)
+		} else {
+			done <- c.session.Idle(w, stop)
+		}
 	}()
 
 	c.setReadTimeout(idleReadTimeout)

@@ -18,13 +18,60 @@ type User struct {
 	mutex           sync.Mutex
 	mailboxes       map[string]*Mailbox
 	prevUidValidity uint32
+	notifySessions  map[*notifyState]struct{}
 }
 
 func NewUser(username, password string) *User {
 	return &User{
-		username:  username,
-		password:  password,
-		mailboxes: make(map[string]*Mailbox),
+		username:       username,
+		password:       password,
+		mailboxes:      make(map[string]*Mailbox),
+		notifySessions: make(map[*notifyState]struct{}),
+	}
+}
+
+func (u *User) registerLocked(state *notifyState) {
+	u.notifySessions[state] = struct{}{}
+}
+
+func (u *User) unregisterLocked(state *notifyState) {
+	delete(u.notifySessions, state)
+}
+
+// notifyChange dispatches a NOTIFY event to all sessions subscribed to the
+// mailbox, except source (the session which caused the change, if any). The
+// caller must not hold user.mutex or any notifyState lock.
+func (u *User) notifyChange(mbox *Mailbox, source *MailboxView, kind imap.NotifyEvent, uid imap.UID, flags []imap.Flag) {
+	mbox.mutex.Lock()
+	numMessages := uint32(len(mbox.l))
+	name := mbox.name
+	mbox.mutex.Unlock()
+
+	u.mutex.Lock()
+	states := make([]*notifyState, 0, len(u.notifySessions))
+	for state := range u.notifySessions {
+		states = append(states, state)
+	}
+	u.mutex.Unlock()
+
+	for _, state := range states {
+		// The selected mailbox is handled with the regular EXPUNGE/EXISTS/
+		// FETCH responses through the mailbox tracker.
+		if source != nil && state == source.notify {
+			continue
+		}
+
+		if _, ok := state.subscribe(name)[kind]; !ok {
+			continue
+		}
+
+		state.enqueue(notifyEvent{
+			mailbox:     mbox,
+			kind:        kind,
+			uid:         uid,
+			flags:       flags,
+			numMessages: numMessages,
+		})
 	}
 }
 
@@ -118,7 +165,7 @@ func (u *User) Append(mailbox string, r imap.LiteralReader, options *imap.Append
 			Text: "No such mailbox",
 		}
 	}
-	return mbox.appendLiteral(r, options)
+	return mbox.appendLiteral(r, options, nil)
 }
 
 func (u *User) Create(name string, options *imap.CreateOptions) error {
@@ -135,10 +182,8 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 		}
 	}
 
-	// UIDVALIDITY must change if a mailbox is deleted and re-created with the
-	// same name.
 	u.prevUidValidity++
-	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
+	u.mailboxes[name] = newUserMailbox(u, name, u.prevUidValidity)
 	return nil
 }
 

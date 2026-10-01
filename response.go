@@ -49,6 +49,9 @@ const (
 
 	// APPENDLIMIT
 	ResponseCodeTooBig ResponseCode = "TOOBIG"
+
+	// NOTIFY (RFC 5465)
+	ResponseCodeNotificationOverflow ResponseCode = "NOTIFICATIONOVERFLOW"
 )
 
 // StatusResponse is a generic status response.

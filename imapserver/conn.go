@@ -153,6 +153,9 @@ func (c *Conn) serve() {
 	if _, ok := c.session.(SessionUnauthenticate); !ok && caps.Has(imap.CapUnauthenticate) {
 		panic("imapserver: server advertises UNAUTHENTICATE but session doesn't support it")
 	}
+	if _, ok := c.session.(SessionNotify); !ok && caps.Has(imap.CapNotify) {
+		panic("imapserver: server advertises NOTIFY but session doesn't support it")
+	}
 
 	c.state = imap.ConnStateNotAuthenticated
 	statusType := imap.StatusResponseTypeOK
@@ -257,6 +260,8 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleNamespace(dec)
 	case "IDLE":
 		err = c.handleIdle(dec)
+	case "NOTIFY":
+		err = c.handleNotify(dec)
 	case "SELECT", "EXAMINE":
 		err = c.handleSelect(tag, dec, name == "EXAMINE")
 		sendOK = false
@@ -486,6 +491,9 @@ func (c *Conn) poll(cmd string) error {
 	}
 
 	w := &UpdateWriter{conn: c, allowExpunge: allowExpunge}
+	if sess, ok := c.session.(SessionNotify); ok {
+		return sess.NotifyPoll(&NotifyWriter{conn: c}, w, allowExpunge)
+	}
 	return c.session.Poll(w, allowExpunge)
 }
 

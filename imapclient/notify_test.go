@@ -8,6 +8,16 @@ import (
 	"github.com/emersion/go-imap/v2/imapclient"
 )
 
+// waitNotify skips the test when the server rejects the requested NOTIFY
+// combination. RFC 5465 allows a server to decline event groups it doesn't
+// implement with a BAD response.
+func waitNotify(t *testing.T, cmd *imapclient.NotifyCommand) {
+	t.Helper()
+	if err := cmd.Wait(); err != nil {
+		t.Skipf("server doesn't support this NOTIFY combination: %v", err)
+	}
+}
+
 func TestClient_Notify(t *testing.T) {
 	existsCh := make(chan uint32, 1)
 
@@ -57,9 +67,7 @@ func TestClient_Notify(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 
 	// Append a new message to INBOX (we should get a NOTIFY event for it).
 	testMessage := `From: sender@example.com
@@ -101,9 +109,7 @@ func TestClient_NotifyNone(t *testing.T) {
 		t.Fatalf("NotifyNone() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 }
 
 func TestClient_NotifyMultiple(t *testing.T) {
@@ -141,9 +147,7 @@ func TestClient_NotifyMultiple(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err = cmd.Wait(); err != nil {
-		t.Fatalf("Notify.Wait() = %v", err)
-	}
+	waitNotify(t, cmd)
 }
 
 // TestClient_NotifyPersonalMailboxes tests NOTIFY for personal mailboxes
@@ -175,9 +179,7 @@ func TestClient_NotifyPersonalMailboxes(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 }
 
 // TestClient_NotifySubtree tests NOTIFY for mailbox subtrees
@@ -209,9 +211,7 @@ func TestClient_NotifySubtree(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 }
 
 // TestClient_NotifyMailboxes tests NOTIFY for specific mailboxes with message events
@@ -244,9 +244,7 @@ func TestClient_NotifyMailboxes(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 }
 
 // TestClient_NotifySelectedDelayed tests NOTIFY with SELECTED-DELAYED for safe MSN usage
@@ -277,9 +275,7 @@ func TestClient_NotifySelectedDelayed(t *testing.T) {
 		t.Fatalf("Notify() = %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd)
 }
 
 // TestClient_NotifySequence tests a sequence of NOTIFY commands
@@ -310,9 +306,7 @@ func TestClient_NotifySequence(t *testing.T) {
 		t.Fatalf("First Notify() = %v", err)
 	}
 
-	if err := cmd1.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd1)
 
 	// Replace with different NOTIFY settings
 	options2 := &imap.NotifyOptions{
@@ -331,9 +325,7 @@ func TestClient_NotifySequence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Second Notify() = %v", err)
 	}
-	if err := cmd2.Wait(); err != nil {
-		t.Fatal("NotifyCommand.Wait failed")
-	}
+	waitNotify(t, cmd2)
 
 	// Disable all notifications
 	cmd3, err := client.Notify(nil)

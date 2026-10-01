@@ -15,6 +15,7 @@ import (
 // The same mailbox can be shared between multiple connections and multiple
 // users.
 type Mailbox struct {
+	user        *User
 	tracker     *imapserver.MailboxTracker
 	uidValidity uint32
 
@@ -29,11 +30,18 @@ type Mailbox struct {
 // NewMailbox creates a new mailbox.
 func NewMailbox(name string, uidValidity uint32) *Mailbox {
 	return &Mailbox{
+		user:        nil,
 		tracker:     imapserver.NewMailboxTracker(0),
 		uidValidity: uidValidity,
 		name:        name,
 		uidNext:     1,
 	}
+}
+
+func newUserMailbox(user *User, name string, uidValidity uint32) *Mailbox {
+	mbox := NewMailbox(name, uidValidity)
+	mbox.user = user
+	return mbox
 }
 
 func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
@@ -119,22 +127,22 @@ func (mbox *Mailbox) sizeLocked() int64 {
 	return size
 }
 
-func (mbox *Mailbox) appendLiteral(r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+func (mbox *Mailbox) appendLiteral(r imap.LiteralReader, options *imap.AppendOptions, source *MailboxView) (*imap.AppendData, error) {
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
 		return nil, err
 	}
-	return mbox.appendBytes(buf.Bytes(), options), nil
+	return mbox.appendBytes(buf.Bytes(), options, source), nil
 }
 
-func (mbox *Mailbox) copyMsg(msg *message) *imap.AppendData {
+func (mbox *Mailbox) copyMsg(msg *message, source *MailboxView) *imap.AppendData {
 	return mbox.appendBytes(msg.buf, &imap.AppendOptions{
 		Time:  msg.t,
 		Flags: msg.flagList(),
-	})
+	}, source)
 }
 
-func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.AppendData {
+func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions, source *MailboxView) *imap.AppendData {
 	msg := &message{
 		flags: make(map[imap.Flag]struct{}),
 		buf:   buf,
@@ -151,18 +159,21 @@ func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.
 	}
 
 	mbox.mutex.Lock()
-	defer mbox.mutex.Unlock()
-
 	msg.uid = mbox.uidNext
 	mbox.uidNext++
 
 	mbox.l = append(mbox.l, msg)
 	mbox.tracker.QueueNumMessages(uint32(len(mbox.l)))
 
-	return &imap.AppendData{
+	data := &imap.AppendData{
 		UIDValidity: mbox.uidValidity,
 		UID:         msg.uid,
 	}
+	mbox.mutex.Unlock()
+
+	mbox.user.notifyChange(mbox, source, imap.NotifyEventMessageNew, 0, nil)
+
+	return data
 }
 
 func (mbox *Mailbox) rename(newName string) {
@@ -229,7 +240,7 @@ func (mbox *Mailbox) flagsLocked() []imap.Flag {
 	return l
 }
 
-func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
+func (mbox *MailboxView) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
 	expunged := make(map[*message]struct{})
 	mbox.mutex.Lock()
 	for _, msg := range mbox.l {
@@ -240,20 +251,21 @@ func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) err
 			expunged[msg] = struct{}{}
 		}
 	}
-	mbox.mutex.Unlock()
 
 	if len(expunged) == 0 {
+		mbox.mutex.Unlock()
 		return nil
 	}
 
-	mbox.mutex.Lock()
-	mbox.expungeLocked(expunged)
+	mbox.expungeLocked(expunged, mbox)
 	mbox.mutex.Unlock()
+
+	mbox.user.notifyChange(mbox.Mailbox, mbox, imap.NotifyEventMessageExpunge, 0, nil)
 
 	return nil
 }
 
-func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []uint32) {
+func (mbox *MailboxView) expungeLocked(expunged map[*message]struct{}, source *MailboxView) (seqNums []uint32) {
 	// TODO: optimize
 
 	// Iterate in reverse order, to keep sequence numbers consistent
@@ -263,7 +275,7 @@ func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []ui
 		if _, ok := expunged[msg]; ok {
 			seqNum := uint32(i) + 1
 			seqNums = append(seqNums, seqNum)
-			mbox.tracker.QueueExpunge(seqNum)
+			mbox.Mailbox.tracker.QueueExpunge(seqNum)
 		} else {
 			filtered = append(filtered, msg)
 		}
@@ -283,10 +295,11 @@ func (mbox *Mailbox) expungeLocked(expunged map[*message]struct{}) (seqNums []ui
 // NewView creates a new view into this mailbox.
 //
 // Callers must call MailboxView.Close once they are done with the mailbox view.
-func (mbox *Mailbox) NewView() *MailboxView {
+func (mbox *Mailbox) NewView(notify *notifyState) *MailboxView {
 	return &MailboxView{
 		Mailbox: mbox,
 		tracker: mbox.tracker.NewSession(),
+		notify:  notify,
 	}
 }
 
@@ -301,6 +314,7 @@ func (mbox *Mailbox) NewView() *MailboxView {
 type MailboxView struct {
 	*Mailbox
 	tracker   *imapserver.SessionTracker
+	notify    *notifyState
 	searchRes imap.UIDSet
 }
 
@@ -319,6 +333,7 @@ func (mbox *MailboxView) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 	}
 
 	var err error
+	var seenChanges []flagChange
 	mbox.forEach(numSet, func(seqNum uint32, msg *message) {
 		if err != nil {
 			return
@@ -327,11 +342,15 @@ func (mbox *MailboxView) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 		if markSeen {
 			msg.flags[canonicalFlag(imap.FlagSeen)] = struct{}{}
 			mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), nil)
+			seenChanges = append(seenChanges, flagChange{uid: msg.uid, flags: msg.flagList()})
 		}
 
 		respWriter := w.CreateMessage(mbox.tracker.EncodeSeqNum(seqNum))
 		err = msg.fetch(respWriter, options)
 	})
+	for _, change := range seenChanges {
+		mbox.user.notifyChange(mbox.Mailbox, mbox, imap.NotifyEventFlagChange, change.uid, change.flags)
+	}
 	return err
 }
 
@@ -418,10 +437,15 @@ func (mbox *MailboxView) staticSearchCriteria(criteria *imap.SearchCriteria) {
 }
 
 func (mbox *MailboxView) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+	var changes []flagChange
 	mbox.forEach(numSet, func(seqNum uint32, msg *message) {
 		msg.store(flags)
 		mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), mbox.tracker)
+		changes = append(changes, flagChange{uid: msg.uid, flags: msg.flagList()})
 	})
+	for _, change := range changes {
+		mbox.user.notifyChange(mbox.Mailbox, mbox, imap.NotifyEventFlagChange, change.uid, change.flags)
+	}
 	if !flags.Silent {
 		return mbox.Fetch(w, numSet, &imap.FetchOptions{Flags: true})
 	}
