@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1061,6 +1063,355 @@ func TestNearby(t *testing.T) {
 	})
 	if len(keys) != N {
 		t.Fatalf("expected '%v', got '%v'", N, len(keys))
+	}
+}
+
+// testHaversine returns the great-circle distance in meters between two
+// lon/lat points using the haversine formula on a sphere with a radius
+// of 6371000 meters.
+func testHaversine(lon1, lat1, lon2, lat2 float64) float64 {
+	const R = 6371000.0
+	toRad := math.Pi / 180
+	dLat := (lat2 - lat1) * toRad
+	dLon := (lon2 - lon1) * toRad
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*toRad)*math.Cos(lat2*toRad)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+	return 2 * R * math.Asin(math.Sqrt(a))
+}
+
+type testGeoPoint struct {
+	key      string
+	lon, lat float64
+}
+
+// testGeoBruteForce returns the distances of all points to the target,
+// sorted from nearest to farthest, computed with a full scan.
+func testGeoBruteForce(points []testGeoPoint, lon, lat float64) []float64 {
+	dists := make([]float64, len(points))
+	for i, p := range points {
+		dists[i] = testHaversine(lon, lat, p.lon, p.lat)
+	}
+	sort.Float64s(dists)
+	return dists
+}
+
+// testGeoLoad creates an in-memory database with a geo index and fills
+// it with the provided points.
+func testGeoLoad(t *testing.T, points []testGeoPoint) *DB {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateGeoIndex("geo", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		for _, p := range points {
+			_, _, err := tx.Set(p.key, Point(p.lon, p.lat), nil)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// testGeoCompare runs a NearbyGeo search and compares the results with
+// a brute-force full scan of the points.
+func testGeoCompare(t *testing.T, db *DB, points []testGeoPoint,
+	lon, lat float64, k int) {
+	t.Helper()
+	coords := make(map[string]testGeoPoint)
+	for _, p := range points {
+		coords[p.key] = p
+	}
+	var keys []string
+	var dists []float64
+	err := db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("geo", Point(lon, lat),
+			func(key, value string, dist float64) bool {
+				keys = append(keys, key)
+				dists = append(dists, dist)
+				return len(keys) < k
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k > len(points) {
+		k = len(points)
+	}
+	if len(keys) != k {
+		t.Fatalf("expected '%v' results, got '%v'", k, len(keys))
+	}
+	expected := testGeoBruteForce(points, lon, lat)
+	for i := range dists {
+		// distances must be non-decreasing
+		if i > 0 && dists[i] < dists[i-1] {
+			t.Fatal("distances out of order")
+		}
+		// the reported distance must match the haversine distance
+		// of the returned point
+		p := coords[keys[i]]
+		d := testHaversine(lon, lat, p.lon, p.lat)
+		if math.Abs(dists[i]-d) > 0.001 {
+			t.Fatalf("point '%v': expected dist '%v', got '%v'",
+				keys[i], d, dists[i])
+		}
+		// the i-th result must be as near as the i-th nearest point
+		// of the brute-force full scan
+		if math.Abs(dists[i]-expected[i]) > 0.001 {
+			t.Fatalf("result %v: expected dist '%v', got '%v'",
+				i, expected[i], dists[i])
+		}
+	}
+}
+
+func TestGeoNearbyAntimeridian(t *testing.T) {
+	// points on both sides of the 180th meridian
+	points := []testGeoPoint{
+		{"west:1", 179.9, 0.1},
+		{"west:2", 179.5, -0.2},
+		{"west:3", 170.0, 0.0},
+		{"east:1", -179.9, -0.1},
+		{"east:2", -179.5, 0.2},
+		{"east:3", -170.0, 0.0},
+		{"far:1", 0.0, 0.0},
+		{"far:2", 90.0, 10.0},
+	}
+	db := testGeoLoad(t, points)
+	defer db.Close()
+	// query from both sides of the meridian
+	testGeoCompare(t, db, points, 180.0, 0.0, len(points))
+	testGeoCompare(t, db, points, -180.0, 0.0, len(points))
+	testGeoCompare(t, db, points, 179.8, 0.0, 4)
+	testGeoCompare(t, db, points, -179.8, 0.0, 4)
+	// the nearest point to [179.95, 0] must be across the meridian
+	var first string
+	err := db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("geo", Point(179.95, 0),
+			func(key, value string, dist float64) bool {
+				first = key
+				return false
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != "west:1" && first != "east:1" {
+		t.Fatalf("expected a point across the meridian, got '%v'", first)
+	}
+}
+
+func TestGeoNearbyPolar(t *testing.T) {
+	// points clustered around the poles with longitudes spread apart
+	var points []testGeoPoint
+	for i := 0; i < 36; i++ {
+		lon := float64(i)*10 - 180
+		points = append(points, testGeoPoint{
+			fmt.Sprintf("north:%d", i), lon, 89.0 + float64(i%10)*0.09,
+		})
+		points = append(points, testGeoPoint{
+			fmt.Sprintf("south:%d", i), lon, -89.0 - float64(i%10)*0.09,
+		})
+	}
+	points = append(points,
+		testGeoPoint{"north:pole", 0, 90},
+		testGeoPoint{"south:pole", 0, -90},
+		testGeoPoint{"equator", 0, 0},
+	)
+	db := testGeoLoad(t, points)
+	defer db.Close()
+	// query at and near the poles
+	testGeoCompare(t, db, points, 0, 90, len(points))
+	testGeoCompare(t, db, points, 120, 90, len(points))
+	testGeoCompare(t, db, points, -45, -90, len(points))
+	testGeoCompare(t, db, points, 30, 89.5, 10)
+	testGeoCompare(t, db, points, -150, -89.5, 10)
+}
+
+func TestGeoNearbyBruteForce(t *testing.T) {
+	rand.Seed(time.Now().UnixNano())
+	N := 1000
+	var points []testGeoPoint
+	for i := 0; i < N; i++ {
+		var lon, lat float64
+		switch i % 3 {
+		case 0:
+			// cluster around the 180th meridian
+			lon = 180 - rand.Float64()*20
+			if rand.Intn(2) == 0 {
+				lon = -lon
+			}
+			lat = rand.Float64()*40 - 20
+		case 1:
+			// cluster around the poles
+			lon = rand.Float64()*360 - 180
+			lat = 80 + rand.Float64()*10
+			if rand.Intn(2) == 0 {
+				lat = -lat
+			}
+		default:
+			// anywhere on the globe
+			lon = rand.Float64()*360 - 180
+			lat = rand.Float64()*180 - 90
+		}
+		points = append(points, testGeoPoint{
+			fmt.Sprintf("p:%d", i), lon, lat,
+		})
+	}
+	db := testGeoLoad(t, points)
+	defer db.Close()
+	queries := []testGeoPoint{
+		{"", 180, 0}, {"", -180, 0}, {"", 179, 45}, {"", -179, -45},
+		{"", 0, 90}, {"", 90, 90}, {"", 0, -90},
+		{"", 0, 0}, {"", -122.4194, 37.7749}, {"", 151.2093, -33.8688},
+	}
+	for _, q := range queries {
+		testGeoCompare(t, db, points, q.lon, q.lat, 10)
+		testGeoCompare(t, db, points, q.lon, q.lat, len(points))
+	}
+}
+
+func TestGeoIndexInvalidCoords(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateGeoIndex("geo", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		if _, _, err := tx.Set("valid:1", Point(10, 10), nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("valid:2", Point(-180, -90), nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("valid:3", Point(180, 90), nil); err != nil {
+			return err
+		}
+		// out of range coordinates are excluded from the index
+		if _, _, err := tx.Set("invalid:1", Point(181, 0), nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("invalid:2", Point(0, 91), nil); err != nil {
+			return err
+		}
+		if _, _, err := tx.Set("invalid:3", "[10 10 10]", nil); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	err = db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("geo", Point(0, 0),
+			func(key, value string, dist float64) bool {
+				keys = append(keys, key)
+				return true
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 {
+		t.Fatalf("expected '%v' results, got '%v'", 3, len(keys))
+	}
+	for _, key := range keys {
+		if !strings.HasPrefix(key, "valid:") {
+			t.Fatalf("unexpected key '%v'", key)
+		}
+	}
+	// an invalid target point returns no results
+	count := 0
+	err = db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("geo", Point(0, 100),
+			func(key, value string, dist float64) bool {
+				count++
+				return true
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no results, got '%v'", count)
+	}
+}
+
+func TestGeoIndexUnsupportedOps(t *testing.T) {
+	db, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.CreateGeoIndex("geo", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.CreateSpatialIndex("spat", "*", IndexRect); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		_, _, err := tx.Set("point:1", Point(10, 10), nil)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nearby and Intersects are not supported on geo indexes
+	count := 0
+	err = db.View(func(tx *Tx) error {
+		if err := tx.Nearby("geo", Point(0, 0),
+			func(key, value string, dist float64) bool {
+				count++
+				return true
+			}); err != nil {
+			return err
+		}
+		return tx.Intersects("geo", Rect([]float64{0, 0}, []float64{20, 20}),
+			func(key, value string) bool {
+				count++
+				return true
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no results, got '%v'", count)
+	}
+	// NearbyGeo is not supported on regular spatial indexes
+	err = db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("spat", Point(0, 0),
+			func(key, value string, dist float64) bool {
+				count++
+				return true
+			})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no results, got '%v'", count)
+	}
+	// NearbyGeo on a missing index returns ErrNotFound
+	err = db.View(func(tx *Tx) error {
+		return tx.NearbyGeo("missing", Point(0, 0),
+			func(key, value string, dist float64) bool {
+				return true
+			})
+	})
+	if err != ErrNotFound {
+		t.Fatalf("expected '%v', got '%v'", ErrNotFound, err)
 	}
 }
 

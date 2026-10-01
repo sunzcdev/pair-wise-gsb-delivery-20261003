@@ -301,6 +301,34 @@ db.View(func(tx *buntdb.Tx) error {
 })
 ```
 
+### Geospatial nearest neighbor
+
+The `Nearby` function uses planar distances, which does not work well for
+global-scale lon/lat points. For those, create a dedicated geo index with
+`CreateGeoIndex` and query it with `NearbyGeo`, which orders results by
+their spherical (great-circle) distance:
+
+```go
+db.CreateGeoIndex("cities", "city:*:pos", buntdb.IndexRect)
+
+db.View(func(tx *buntdb.Tx) error {
+	tx.NearbyGeo("cities", "[-122.4194 37.7749]", func(key, val string, dist float64) bool {
+		...
+		return true // return false to stop, e.g. for top-K queries
+	})
+	return nil
+})
+```
+
+Points are stored as `[lon lat]` strings. Longitudes must be in the range
+[-180, 180] and latitudes in [-90, 90]; items outside of these ranges are
+excluded from the index. The `dist` parameter is the great-circle distance
+in meters on a sphere with a radius of 6371000 meters. Items with equal
+distances may be returned in any order. The search correctly handles the
+180th meridian and the polar regions, and prunes branches of the R-tree
+using a valid lower bound, so top-K queries do not scan the entire index.
+The `Nearby` and `Intersects` functions are not supported on geo indexes.
+
 ### Spatial bracket syntax
 
 The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the built-in rectangles are processed. But, you are not limited to this syntax. Whatever Rect function you choose to use during `CreateSpatialIndex` will be used to process the parameter, in this case it's `IndexRect`.

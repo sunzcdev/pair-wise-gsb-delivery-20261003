@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"sort"
@@ -258,6 +259,7 @@ type index struct {
 	rect    func(item string) (min, max []float64) // rect from string function
 	db      *DB                                    // the origin database
 	opts    IndexOptions                           // index options
+	geo     bool                                   // index stores geospatial points
 }
 
 // match matches the pattern to the key
@@ -286,6 +288,7 @@ func (idx *index) clearCopy() *index {
 		less:    idx.less,
 		rect:    idx.rect,
 		opts:    idx.opts,
+		geo:     idx.geo,
 	}
 	// initialize with empty trees
 	if nidx.less != nil {
@@ -385,6 +388,18 @@ func (db *DB) CreateSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
 	return db.Update(func(tx *Tx) error {
 		return tx.CreateSpatialIndex(name, pattern, rect)
+	})
+}
+
+// CreateGeoIndex builds a new geospatial index and populates it with
+// items. The items are organized in an r-tree and can be retrieved
+// using the NearbyGeo method, which returns items ordered by their
+// spherical (great-circle) distance to a target point.
+// See Tx.CreateGeoIndex for more information.
+func (db *DB) CreateGeoIndex(name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	return db.Update(func(tx *Tx) error {
+		return tx.CreateGeoIndex(name, pattern, rect)
 	})
 }
 
@@ -1452,7 +1467,15 @@ func lessCtx(ctx interface{}) func(a, b interface{}) bool {
 func (dbi *dbItem) Rect(ctx interface{}) (min, max []float64) {
 	switch ctx := ctx.(type) {
 	case *index:
-		return ctx.rect(dbi.val)
+		min, max = ctx.rect(dbi.val)
+		if ctx.geo {
+			// Convert the 2D lon/lat point to a 3D ECEF point so that
+			// the r-tree can be used for spherical nearest neighbor
+			// searches. Invalid coordinates return nil slices, which
+			// excludes the item from the index.
+			return geoRectToECEF(min, max)
+		}
+		return min, max
 	}
 	return nil, nil
 }
@@ -1963,6 +1986,8 @@ func (r *rect) Rect(ctx interface{}) (min, max []float64) {
 // An invalid index will return an error.
 // The dist param is the distance of the bounding boxes. In the case of
 // simple 2D points, it's the distance of the two 2D points squared.
+// This method is not supported on indexes created with CreateGeoIndex.
+// Use NearbyGeo for those indexes.
 func (tx *Tx) Nearby(index, bounds string,
 	iterator func(key, value string, dist float64) bool) error {
 	if tx.db == nil {
@@ -1986,6 +2011,10 @@ func (tx *Tx) Nearby(index, bounds string,
 		// not an r-tree index. just return nil
 		return nil
 	}
+	if idx.geo {
+		// geo indexes are queried with NearbyGeo. just return nil
+		return nil
+	}
 	// execute the nearby search
 	var min, max []float64
 	if idx.rect != nil {
@@ -1996,11 +2025,72 @@ func (tx *Tx) Nearby(index, bounds string,
 	return nil
 }
 
+// NearbyGeo searches for items in a geo index that are nearby a target
+// point. All items belonging to the specified index will be returned in
+// order of nearest to farthest, using the spherical (great-circle)
+// distance. Returning false from the iterator stops the search, which
+// allows for efficient top-K queries that only visit a small portion of
+// the index.
+// The specified index must have been created with CreateGeoIndex,
+// otherwise nil is returned and the iterator is not called.
+// The bounds param is a 2D point string, such as "[-122.4194 37.7749]",
+// where the longitude is at index 0 and the latitude is at index 1,
+// both in degrees. Longitudes must be in the range [-180, 180] and
+// latitudes must be in the range [-90, 90]. If a rectangle is provided
+// instead of a point, the center of the rectangle is used. Invalid
+// coordinates result in no items being returned.
+// The dist param is the great-circle distance in meters between the
+// target point and the item, calculated on a sphere with a radius of
+// 6371000 meters. Items with equal distances may be returned in any
+// order.
+func (tx *Tx) NearbyGeo(index, bounds string,
+	iterator func(key, value string, dist float64) bool) error {
+	if tx.db == nil {
+		return ErrTxClosed
+	}
+	if index == "" {
+		// cannot search on keys tree. just return nil.
+		return nil
+	}
+	idx := tx.db.idxs[index]
+	if idx == nil {
+		// index was not found. return error
+		return ErrNotFound
+	}
+	if idx.rtr == nil || !idx.geo {
+		// not a geo index. just return nil
+		return nil
+	}
+	// convert the target point to 3D ECEF coordinates
+	var min, max []float64
+	if idx.rect != nil {
+		min, max = idx.rect(bounds)
+	}
+	point, ok := geoPointECEF(min, max)
+	if !ok {
+		// invalid target point. just return nil
+		return nil
+	}
+	// wrap a rtree specific iterator around the user-defined iterator.
+	// the rtree distance is the squared 3D Euclidean (chord) distance,
+	// which is converted back to a great-circle distance in meters.
+	iter := func(item rtred.Item, dist float64) bool {
+		dbi := item.(*dbItem)
+		return iterator(dbi.key, dbi.val, geoChordSqToMeters(dist))
+	}
+	// execute the nearby search in 3D ECEF space. the 3D box distance
+	// is a valid lower bound for the great-circle distance, so the
+	// r-tree KNN search prunes branches without scanning all items.
+	idx.rtr.KNN(&rect{point, point}, false, iter)
+	return nil
+}
+
 // Intersects searches for rectangle items that intersect a target rect.
 // The specified index must have been created by AddIndex() and the target
 // is represented by the rect string. This string will be processed by the
 // same bounds function that was passed to the CreateSpatialIndex() function.
 // An invalid index will return an error.
+// This method is not supported on indexes created with CreateGeoIndex.
 func (tx *Tx) Intersects(index, bounds string,
 	iterator func(key, value string) bool) error {
 	if tx.db == nil {
@@ -2022,6 +2112,10 @@ func (tx *Tx) Intersects(index, bounds string,
 	}
 	if idx.rtr == nil {
 		// not an r-tree index. just return nil
+		return nil
+	}
+	if idx.geo {
+		// geo indexes are queried with NearbyGeo. just return nil
 		return nil
 	}
 	// execute the search
@@ -2066,7 +2160,7 @@ type IndexOptions struct {
 // IndexString, IndexBinary, etc.
 func (tx *Tx) CreateIndex(name, pattern string,
 	less ...func(a, b string) bool) error {
-	return tx.createIndex(name, pattern, less, nil, nil)
+	return tx.createIndex(name, pattern, less, nil, nil, false)
 }
 
 // CreateIndexOptions is the same as CreateIndex except that it allows
@@ -2074,7 +2168,7 @@ func (tx *Tx) CreateIndex(name, pattern string,
 func (tx *Tx) CreateIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	less ...func(a, b string) bool) error {
-	return tx.createIndex(name, pattern, less, nil, opts)
+	return tx.createIndex(name, pattern, less, nil, opts, false)
 }
 
 // CreateSpatialIndex builds a new index and populates it with items.
@@ -2093,7 +2187,7 @@ func (tx *Tx) CreateIndexOptions(name, pattern string,
 // parameter.
 func (tx *Tx) CreateSpatialIndex(name, pattern string,
 	rect func(item string) (min, max []float64)) error {
-	return tx.createIndex(name, pattern, nil, rect, nil)
+	return tx.createIndex(name, pattern, nil, rect, nil, false)
 }
 
 // CreateSpatialIndexOptions is the same as CreateSpatialIndex except that
@@ -2101,7 +2195,29 @@ func (tx *Tx) CreateSpatialIndex(name, pattern string,
 func (tx *Tx) CreateSpatialIndexOptions(name, pattern string,
 	opts *IndexOptions,
 	rect func(item string) (min, max []float64)) error {
-	return tx.createIndex(name, pattern, nil, rect, nil)
+	return tx.createIndex(name, pattern, nil, rect, nil, false)
+}
+
+// CreateGeoIndex builds a new geospatial index and populates it with
+// items. The items are organized in an r-tree and can be retrieved
+// using the NearbyGeo method, which returns items ordered by their
+// spherical (great-circle) distance to a target point.
+// An error will occur if an index with the same name already exists.
+//
+// The rect function converts a string to a 2D point, where min and max
+// are two-element arrays holding the same value: the longitude at
+// index 0 and the latitude at index 1, both in degrees.
+// Longitudes must be in the range [-180, 180] and latitudes must be in
+// the range [-90, 90]. Items with coordinates outside of these ranges
+// (or with NaN/Inf values) are excluded from the index.
+// The IndexRect helper can be used for the rect parameter with point
+// strings such as "[-122.4194 37.7749]".
+//
+// The Nearby and Intersects methods are not supported on geo indexes.
+// Use NearbyGeo instead.
+func (tx *Tx) CreateGeoIndex(name, pattern string,
+	rect func(item string) (min, max []float64)) error {
+	return tx.createIndex(name, pattern, nil, rect, nil, true)
 }
 
 // createIndex is called by CreateIndex() and CreateSpatialIndex()
@@ -2109,6 +2225,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 	lessers []func(a, b string) bool,
 	rect func(item string) (min, max []float64),
 	opts *IndexOptions,
+	geo bool,
 ) error {
 	if tx.db == nil {
 		return ErrTxClosed
@@ -2164,6 +2281,7 @@ func (tx *Tx) createIndex(name string, pattern string,
 		rect:    rect,
 		db:      tx.db,
 		opts:    sopts,
+		geo:     geo,
 	}
 	idx.rebuild()
 	// save the index
@@ -2243,6 +2361,68 @@ func Point(coords ...float64) string {
 func IndexRect(a string) (min, max []float64) {
 	r := grect.Get(a)
 	return r.Min, r.Max
+}
+
+// earthRadius is the mean radius of the earth in meters. It is used as
+// the radius of the sphere for all great-circle distance calculations.
+const earthRadius = 6371000.0
+
+// geoValidCoord returns true if the longitude and latitude are within
+// their valid ranges, [-180, 180] and [-90, 90] respectively.
+func geoValidCoord(lon, lat float64) bool {
+	return lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90
+}
+
+// geoToECEF converts a lon/lat point in degrees to 3D ECEF (earth-centered,
+// earth-fixed) coordinates in meters on a sphere with radius earthRadius.
+func geoToECEF(lon, lat float64) (x, y, z float64) {
+	lonRad := lon * math.Pi / 180
+	latRad := lat * math.Pi / 180
+	x = earthRadius * math.Cos(latRad) * math.Cos(lonRad)
+	y = earthRadius * math.Cos(latRad) * math.Sin(lonRad)
+	z = earthRadius * math.Sin(latRad)
+	return x, y, z
+}
+
+// geoRectToECEF converts a 2D lon/lat rect, as returned by a geo index
+// rect function, to a 3D ECEF point rect. The center of the input rect
+// is used, which allows for both points and rectangles. Nil slices are
+// returned for anything other than a 2D rect with valid coordinates,
+// which excludes the item from the geo index.
+func geoRectToECEF(min, max []float64) ([]float64, []float64) {
+	point, ok := geoPointECEF(min, max)
+	if !ok {
+		return nil, nil
+	}
+	return point, point
+}
+
+// geoPointECEF converts a 2D lon/lat rect to a 3D ECEF point. The second
+// return value is false if the rect is not 2D or the coordinates are
+// outside of their valid ranges.
+func geoPointECEF(min, max []float64) ([]float64, bool) {
+	if len(min) != 2 || len(max) != 2 {
+		return nil, false
+	}
+	lon := (min[0] + max[0]) / 2
+	lat := (min[1] + max[1]) / 2
+	if !geoValidCoord(lon, lat) {
+		return nil, false
+	}
+	x, y, z := geoToECEF(lon, lat)
+	return []float64{x, y, z}, true
+}
+
+// geoChordSqToMeters converts a squared 3D Euclidean (chord) distance
+// between two points on the sphere to a great-circle distance in meters.
+func geoChordSqToMeters(chordSq float64) float64 {
+	chord := math.Sqrt(chordSq)
+	s := chord / (2 * earthRadius)
+	if s > 1 {
+		// guard against floating point rounding
+		s = 1
+	}
+	return 2 * earthRadius * math.Asin(s)
 }
 
 // IndexString is a helper function that return true if 'a' is less than 'b'.
