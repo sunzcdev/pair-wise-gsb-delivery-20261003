@@ -142,6 +142,29 @@ module TZInfo
         TimezoneProxy.new(identifier)
       end
 
+      # Returns an {OverriddenTimezone} overlay view of an existing time zone
+      # that applies one or more errata ({TimezoneOverride}) over bounded UTC
+      # time windows.
+      #
+      # Each override gives an inclusive UTC start time, an exclusive UTC end
+      # time and a {TimezoneOffset} describing the complete offset that applies
+      # within the window. Outside of the windows, the rules of the original
+      # time zone continue to apply. Windows may cut through the middle of an
+      # original period and may span multiple original transitions; when an
+      # override ends, the view reverts to the offset the underlying zone
+      # actually observes at that instant.
+      #
+      # Override windows must not overlap.
+      #
+      # @param base_timezone [Timezone] the existing {Timezone} to overlay.
+      # @param overrides [Array<TimezoneOverride>] the errata to apply.
+      # @param identifier [String] an optional identifier for the overlay view.
+      # @return [OverriddenTimezone] the overlay view.
+      # @raise [ArgumentError] if the override windows overlap.
+      def override(base_timezone, overrides, identifier = nil)
+        OverriddenTimezone.new(base_timezone, overrides, identifier)
+      end
+
       # Returns an `Array` of all the available time zones.
       #
       # {TimezoneProxy} instances are returned to avoid the overhead of loading
@@ -986,6 +1009,29 @@ module TZInfo
     # @return [String] the canonical identifier of this time zone.
     def canonical_identifier
       canonical_zone.identifier
+    end
+
+    # Returns an {OverriddenTimezone} overlay view of this time zone that
+    # applies one or more errata ({TimezoneOverride}) over bounded UTC time
+    # windows.
+    #
+    # Each override gives an inclusive UTC start time, an exclusive UTC end
+    # time and a {TimezoneOffset} describing the complete offset that applies
+    # within the window. Outside of the windows, the rules of this time zone
+    # continue to apply. Windows may cut through the middle of an original
+    # period and may span multiple original transitions; when an override ends,
+    # the view reverts to the offset this zone actually observes at that
+    # instant.
+    #
+    # Override windows must not overlap.
+    #
+    # @param overrides [Array<TimezoneOverride>] the errata to apply.
+    # @param identifier [String] an optional identifier for the overlay view.
+    #   Defaults to `"``<identifier>`` (overridden)"`.
+    # @return [OverriddenTimezone] the overlay view.
+    # @raise [ArgumentError] if the override windows overlap.
+    def with_overrides(overrides, identifier = nil)
+      OverriddenTimezone.new(self, overrides, identifier)
     end
 
     # @return [TimeWithOffset] the current local time in the time zone.
