@@ -1219,6 +1219,30 @@ func (p Patch) ApplyIndent(doc []byte, indent string) ([]byte, error) {
 // ApplyIndentWithOptions mutates a JSON document according to the patch and the passed in ApplyOptions.
 // It returns the new document indented.
 func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyOptions) ([]byte, error) {
+	return p.applyIndentWithPolicy(doc, indent, options, nil)
+}
+
+// ApplyWithPolicy mutates a JSON document according to the patch while
+// enforcing the given access policy, and returns the new document.
+//
+// Before each operation is executed, the paths it would read or write are
+// checked against the policy, taking the document state produced by all
+// preceding operations into account. The first operation that requires an
+// access the policy does not permit aborts the patch with a
+// *PolicyViolationError; the document is left unmodified in that case, since
+// the patched document is only returned on success.
+func (p Patch) ApplyWithPolicy(doc []byte, policy *AccessPolicy) ([]byte, error) {
+	return p.applyIndentWithPolicy(doc, "", NewApplyOptions(), policy)
+}
+
+// ApplyWithOptionsAndPolicy mutates a JSON document according to the patch
+// and the passed in ApplyOptions while enforcing the given access policy.
+// It returns the new document.
+func (p Patch) ApplyWithOptionsAndPolicy(doc []byte, options *ApplyOptions, policy *AccessPolicy) ([]byte, error) {
+	return p.applyIndentWithPolicy(doc, "", options, policy)
+}
+
+func (p Patch) applyIndentWithPolicy(doc []byte, indent string, options *ApplyOptions, policy *AccessPolicy) ([]byte, error) {
 	if len(doc) == 0 {
 		return doc, nil
 	}
@@ -1252,7 +1276,13 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 
 	var accumulatedCopySize int64
 
-	for _, op := range p {
+	for i, op := range p {
+		if policy != nil {
+			if err := checkPolicy(&pd, op, i, policy, options); err != nil {
+				return nil, err
+			}
+		}
+
 		switch op.Kind() {
 		case "add":
 			err = p.add(&pd, op, options)

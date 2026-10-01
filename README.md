@@ -56,6 +56,41 @@ that `add` operations produce all the `path` elements that are missing from the 
 Use `jsonpatch.NewApplyOptions` to create an instance of `jsonpatch.ApplyOptions`
 whose values are populated from the global configuration variables.
 
+## Restricting patches with an access policy
+
+`jsonpatch.ApplyWithPolicy` (and `jsonpatch.ApplyWithOptionsAndPolicy`) apply a
+JSON Patch while enforcing a caller-supplied `jsonpatch.AccessPolicy`, which
+decides which document paths the patch may read and may write:
+
+```go
+policy := &jsonpatch.AccessPolicy{
+    // The customer's idNumber may neither be modified nor read out,
+    // e.g. via a "copy" operation.
+    Read: func(path string) bool {
+        return path != "/customer/idNumber"
+    },
+    // Only contact details may be changed.
+    Write: func(path string) bool {
+        return strings.HasPrefix(path, "/customer/contact/")
+    },
+}
+
+patched, err := patch.ApplyWithPolicy(doc, policy)
+```
+
+Policies are evaluated against the document as it exists at each step of the
+patch. Writing to a path also requires write permission for every protected
+path currently below it, because replacing or removing a parent object affects
+its children. `move` requires read and write access to its source path, and
+`test` requires read access to the path it compares, since its result would
+otherwise reveal whether a restricted value matches.
+
+The first operation that requires an access the policy does not permit aborts
+the patch with a `*jsonpatch.PolicyViolationError`, which reports the operation
+index and the kind of access that was denied, but never any protected values.
+A nil policy permits everything, so `jsonpatch.Apply` keeps its existing
+behavior.
+
 ## Create and apply a merge patch
 Given both an original JSON document and a modified JSON document, you can create
 a [Merge Patch](https://tools.ietf.org/html/rfc7396) document. 
