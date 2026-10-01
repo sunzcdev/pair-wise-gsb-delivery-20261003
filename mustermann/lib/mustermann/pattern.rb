@@ -314,7 +314,20 @@ module Mustermann
     # @param [Mustermann::Pattern, String] other pattern to be appended
     # @return [Mustermann::Pattern] concatenated pattern
     def +(other)
-       Concat.new(self, other, type: :identity)
+      Concat.new(self, other, type: :identity)
+    end
+
+    # Statically analyzes how this pattern's language relates to another
+    # pattern's language (intersection and containment).
+    #
+    # @example
+    #   Mustermann.new('/users/:id').relation_to('/users/:name').intersect? # => true
+    #
+    # @param (see Mustermann.relation)
+    # @return [Mustermann::Relation::Result]
+    # @see Mustermann.relation
+    def relation_to(other)
+      Mustermann.relation(self, other)
     end
 
     # @example

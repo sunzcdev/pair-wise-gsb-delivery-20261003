@@ -2,6 +2,7 @@
 require 'mustermann/pattern'
 require 'mustermann/composite'
 require 'mustermann/concat'
+require 'mustermann/relation'
 require 'thread'
 
 # Namespace and main entry point for the Mustermann library.

@@ -28,6 +28,7 @@ pattern.params('/a/b.c') # => { "prefix" => "a", splat => ["b", "c"] }
 * **[Pattern Types](#-pattern-types):** Mustermann supports a wide variety of different pattern types, making it compatible with a large variety of existing software.
 * **[Fine Grained Control](#-available-options):** You can easily adjust matching behavior and add constraints to the placeholders and capture groups.
 * **[Binary Operators](#-binary-operators) and [Concatenation](#-concatenation):** Patterns can be combined into composite patterns using binary operators.
+* **[Pattern Relations](#-pattern-relations):** Statically checks whether two patterns can match the same requests and whether one is contained in the other.
 * **[Regexp Look Alike](#-regexp-look-alike):** Mustermann patterns can be used as a replacement for regular expressions.
 * **[Parameter Parsing](#-parameter-parsing):** Mustermann can parse matched parameters into a Sinatra-style "params" hash, including type casting.
 * **[Peeking](#-peeking):** Lets you check if the beginning of a string matches a pattern.
@@ -109,6 +110,53 @@ about.params("/main/about") # => {"prefix" => "main"}
 ```
 
 Patterns of different types can be mixed. The availability of `to_templates` and `expand` depends on the patterns being concatenated.
+
+<a name="-pattern-relations"></a>
+## Pattern Relations
+
+Before going live you may want to know whether two routes can ever receive the
+same request. Testing a finite batch of example URLs cannot prove that two
+patterns are disjoint, so Mustermann can instead analyze the *languages* of
+the patterns statically.
+
+``` ruby
+require 'mustermann'
+
+relation = Mustermann.relation('/users/:id', '/users/:name')
+relation.intersect? # => true
+relation.subset?    # => true
+relation.witness    # => "/users/example"
+
+Mustermann.relation('/:file.png', '/:file.jpg').disjoint? # => true
+```
+
+`intersect?` reports whether there is any request both patterns match, while
+`subset?` reports whether every request matched by the first pattern is also
+matched by the second. Whenever the answer is backed by an example, a concrete
+path is returned (`witness` for an intersection, `counterexample` when the
+first pattern is not contained in the second). Every such string is a real
+path you can hand back to the regular matching interface:
+
+``` ruby
+first  === relation.witness # => true
+second === relation.witness # => true
+```
+
+Literals, normal captures, splats, optional segments and unions of these
+structures are supported, and patterns are compared by the language their
+options produce (not by their source text), so differently encoded patterns
+are still compared correctly. When a pattern uses a construct Mustermann
+cannot analyze reliably (for example a custom `Regexp` constraint or the
+`except` option), the corresponding answers are `nil` and `reason` explains
+why instead of guessing:
+
+``` ruby
+relation = Mustermann.relation(Mustermann.new('/:id', capture: /\d+/), '/:name')
+relation.intersect? # => nil
+relation.subset?    # => nil
+relation.unknown?   # => true
+relation.reason     # => "custom Regexp constraint cannot be analyzed"
+```
 
 <a name="-regexp-look-alike"></a>
 ## Regexp Look Alike
