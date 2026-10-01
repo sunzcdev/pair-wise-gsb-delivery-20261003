@@ -158,6 +158,40 @@ Bad Validator definitions are not handled by the library. Example:
 
 	// this definition of min max will never succeed
 
+# Nested Logic Rules
+
+Flat tags express a sequence of AND validators separated by commas and a
+single level of OR alternatives separated by pipes. When a rule such as
+"satisfy A and B, or satisfy C but not D" cannot be expressed that way, build
+an explicit nested rule with And, Or and Not:
+
+	rule := validator.Or(
+		validator.And(validator.Tag("A"), validator.Tag("B")),
+		validator.And(validator.Tag("C"), validator.Not(validator.Tag("D"))),
+	)
+
+	err := validate.VarRule(value, rule)
+
+Tag wraps any existing tag expression unchanged, including built-in tags,
+aliases and custom registered validators. Custom functions are wrapped with
+FuncRule (or FuncCtxRule). Validate a struct field with StructRules and Field;
+cross-field tags such as eqfield resolve siblings normally:
+
+	err := validate.StructRules(myStruct,
+		validator.Field("Email", validator.Or(validator.Tag("email"), validator.Tag("is_admin"))),
+	)
+
+Rules evaluate strictly left-to-right with boolean short-circuiting: And stops
+at the first failing child and Or stops at the first succeeding child; children
+that are skipped never execute and so produce no side effects.
+
+Failures return a *LogicError that mirrors the rule tree. An Or failure lists
+each failed alternative as a choice ("satisfy one of") rather than as a list
+of conditions that all need fixing. Every node exposes a zero-based Path (for
+example "[1][0]"), and each underlying FieldError returned by
+LogicError.Flatten implements RulePathError to locate the rule node that
+produced it.
+
 # Using Validator Tags
 
 Baked In Cross-Field validation only compares fields on the same struct.
@@ -562,7 +596,6 @@ Kind of like an 'enum'.
 	Usage: noneof=red green
 	       noneof='red green' 'blue yellow'
 		   noneof=5 7 9
-
 
 # None Of Case Insensitive
 Works the same as noneof but is case insensitive and therefore only accepts strings.

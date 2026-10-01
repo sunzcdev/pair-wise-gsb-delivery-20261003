@@ -28,6 +28,8 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+	rulePath       string // current explicit nested Rule node path, empty during tag validation
+	ruleLabel      string // originating leaf rule name, empty during tag validation
 }
 
 // parent and current will be the same the first run of validateStruct
@@ -133,6 +135,8 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 						structfieldLen: uint8(len(cf.name)),
 						param:          ct.param,
 						kind:           kind,
+						rulePath:       v.rulePath,
+						ruleLabel:      v.ruleLabel,
 					},
 				)
 				return
@@ -158,6 +162,8 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 						param:          ct.param,
 						kind:           kind,
 						typ:            current.Type(),
+						rulePath:       v.rulePath,
+						ruleLabel:      v.ruleLabel,
 					},
 				)
 				return
@@ -198,7 +204,12 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
+				// Nested struct field errors are not produced by the enclosing
+				// explicit Rule node, so suspend the rule path while recursing.
+				rp, rl := v.rulePath, v.ruleLabel
+				v.rulePath, v.ruleLabel = "", ""
 				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.rulePath, v.ruleLabel = rp, rl
 			}
 			return
 		}
@@ -220,7 +231,10 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
+				rp, rl := v.rulePath, v.ruleLabel
+				v.rulePath, v.ruleLabel = "", ""
 				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.rulePath, v.ruleLabel = rp, rl
 			}
 			return
 
@@ -435,6 +449,8 @@ OUTER:
 								param:          ct.param,
 								kind:           kind,
 								typ:            typ,
+								rulePath:       v.rulePath,
+								ruleLabel:      v.ruleLabel,
 							},
 						)
 					} else {
@@ -453,6 +469,8 @@ OUTER:
 								param:          ct.param,
 								kind:           kind,
 								typ:            typ,
+								rulePath:       v.rulePath,
+								ruleLabel:      v.ruleLabel,
 							},
 						)
 					}
@@ -493,6 +511,8 @@ OUTER:
 						param:          ct.param,
 						kind:           kind,
 						typ:            typ,
+						rulePath:       v.rulePath,
+						ruleLabel:      v.ruleLabel,
 					},
 				)
 

@@ -174,6 +174,8 @@ type fieldError struct {
 	param          string
 	kind           reflect.Kind
 	typ            reflect.Type
+	rulePath       string // path of the originating node when produced by an explicit Rule, empty otherwise
+	ruleLabel      string // originating leaf rule name (tag expression or custom rule name)
 }
 
 // Tag returns the validation tag that failed.
@@ -270,4 +272,203 @@ func (fe *fieldError) Translate(ut ut.Translator) string {
 	}
 
 	return fn(ut, fe)
+}
+
+// RulePathError is an optional interface implemented by FieldErrors produced by
+// explicit nested Rules (see And, Or, Not, Tag and Func). It allows locating
+// the originating rule node of a leaf failure.
+//
+// The path uses zero-based bracket indexes describing the node's position in
+// the rule tree, for example "[0][1]" is the second child of the first child
+// of the root rule. FieldErrors produced by ordinary tag validation return an
+// empty path and do not implement this interface.
+type RulePathError interface {
+	// RulePath returns the originating node's zero-based path, for example
+	// "[1][0]". It is empty for the root rule itself.
+	RulePath() string
+
+	// RuleName returns the name of the originating leaf rule: the tag
+	// expression for Tag rules or the name supplied to Func/FuncCtxRule.
+	RuleName() string
+}
+
+// RulePath returns the path of the rule node that produced this error.
+func (fe *fieldError) RulePath() string {
+	return fe.rulePath
+}
+
+// RuleName returns the name of the leaf rule that produced this error.
+func (fe *fieldError) RuleName() string {
+	return fe.ruleLabel
+}
+
+var _ RulePathError = new(fieldError)
+
+// LogicError is returned when an explicit nested Rule (And, Or, Not or a leaf)
+// fails. It mirrors the rule tree structure, so failures can be explained in
+// logical terms:
+//   - A RuleAnd failure carries the single failing child in Children (later
+//     children were never evaluated).
+//   - A RuleOr failure carries one child per alternative in Children, each
+//     describing why that alternative failed. The alternatives are presented as
+//     choices ("satisfy one of"), not as conditions that all must be fixed.
+//   - A RuleNot failure has no children: it means the negated rule succeeded.
+//   - A RuleLeaf failure carries the underlying FieldErrors in Leaves.
+//
+// Every node exposes Path locating its position in the original rule tree.
+type LogicError struct {
+	// Op is the boolean operation that failed at this node.
+	Op RuleKind
+	// Path is this node's zero-based path in the rule tree (empty for root).
+	Path string
+	// Index is this node's position within its parent's children.
+	Index int
+	// Children holds the relevant child failure(s):
+	// one for And (the first failure) and Not carries none;
+	// all evaluated alternatives for Or.
+	Children []*LogicError
+	// Leaves holds the underlying field errors for a RuleLeaf failure.
+	Leaves []FieldError
+
+	ns       string
+	structNs string
+	field    string
+	value    interface{}
+	kind     reflect.Kind
+	typ      reflect.Type
+}
+
+// compile time interface checks
+var _ error = new(LogicError)
+
+// Namespace returns the namespace for the failing field, with the tag name
+// taking precedence over the field's actual name.
+func (le *LogicError) Namespace() string {
+	return le.ns
+}
+
+// StructNamespace returns the namespace for the failing field using the field's
+// actual name.
+func (le *LogicError) StructNamespace() string {
+	return le.structNs
+}
+
+// Field returns the failing field's name with the tag name taking precedence
+// over the field's actual name.
+func (le *LogicError) Field() string {
+	return le.field
+}
+
+// Value returns the actual field value that was validated.
+func (le *LogicError) Value() interface{} {
+	return le.value
+}
+
+// ValueKind returns the failing field's reflect Kind.
+func (le *LogicError) ValueKind() reflect.Kind {
+	return le.kind
+}
+
+// Type returns the failing field's reflect Type.
+func (le *LogicError) Type() reflect.Type {
+	return le.typ
+}
+
+// Flatten returns every underlying leaf FieldError contained within the failed
+// rule tree. Each FieldError implements RulePathError, locating the rule node
+// that produced it. It is useful for applications that render errors
+// themselves but still want access to the originating node.
+func (le *LogicError) Flatten() []FieldError {
+	if le == nil {
+		return nil
+	}
+
+	var errs []FieldError
+	le.collect(&errs)
+
+	return errs
+}
+
+func (le *LogicError) collect(errs *[]FieldError) {
+	if len(le.Leaves) > 0 {
+		*errs = append(*errs, le.Leaves...)
+	}
+
+	for _, child := range le.Children {
+		child.collect(errs)
+	}
+}
+
+// Error renders the logical failure tree as a human-readable explanation.
+// OR nodes are phrased as alternatives; AND nodes point at the first failing
+// branch; leaf nodes quote the underlying validator failure(s).
+func (le *LogicError) Error() string {
+	var b strings.Builder
+
+	le.write(&b, "")
+
+	return b.String()
+}
+
+func (le *LogicError) write(b *strings.Builder, indent string) {
+	prefix := le.ns
+	if prefix == "" {
+		prefix = le.field
+	}
+
+	node := le.nodeLabel()
+
+	if len(prefix) > 0 {
+		fmt.Fprintf(b, "%s%s: %s", indent, prefix, node)
+	} else {
+		fmt.Fprintf(b, "%s%s", indent, node)
+	}
+
+	switch le.Op {
+	case RuleLeaf:
+		for _, fe := range le.Leaves {
+			fmt.Fprintf(b, "; failed on rule %q (node %s)", leafRuleName(fe), le.pathOrRoot())
+		}
+	case RuleNot:
+		fmt.Fprintf(b, " (node %s); the negated rule succeeded", le.pathOrRoot())
+	case RuleAnd:
+		if len(le.Children) > 0 {
+			fmt.Fprint(b, "; first failing branch:")
+		}
+	case RuleOr:
+		fmt.Fprintf(b, " (node %s); satisfy one of the following alternatives:", le.pathOrRoot())
+	}
+
+	b.WriteByte('\n')
+
+	for _, child := range le.Children {
+		child.write(b, indent+"  ")
+	}
+}
+
+func (le *LogicError) nodeLabel() string {
+	switch le.Op {
+	case RuleAnd:
+		return "AND rule failed"
+	case RuleOr:
+		return "OR rule failed"
+	case RuleNot:
+		return "NOT rule failed"
+	default:
+		return "rule failed"
+	}
+}
+
+func (le *LogicError) pathOrRoot() string {
+	if le.Path == "" {
+		return "$"
+	}
+	return le.Path
+}
+
+func leafRuleName(fe FieldError) string {
+	if rp, ok := fe.(RulePathError); ok && rp.RuleName() != "" {
+		return rp.RuleName()
+	}
+	return fe.Tag()
 }
