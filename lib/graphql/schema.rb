@@ -950,6 +950,28 @@ module GraphQL
         end
       end
 
+      attr_writer :max_width
+
+      # Limit the number of distinct response keys that may appear in a single
+      # response object. Selections merged by response key (including through
+      # fragments) count once; mutually-exclusive abstract-type branches are
+      # measured at their reachable maximum.
+      #
+      # Set `count_introspection_fields: false` (via {#max_depth}) to exclude
+      # introspection fields from the count.
+      #
+      # @param new_max_width [Integer, nil]
+      # @return [Integer, nil]
+      def max_width(new_max_width = nil)
+        if new_max_width
+          @max_width = new_max_width
+        elsif defined?(@max_width)
+          @max_width
+        else
+          find_inherited_value(:max_width)
+        end
+      end
+
       def disable_introspection_entry_points
         @disable_introspection_entry_points = true
         # TODO: this clears the cache made in `def types`. But this is not a great solution.

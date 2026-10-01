@@ -34,6 +34,50 @@ You can use `nil` to disable the validation:
 MySchema.execute(query_string, max_depth: nil)
 ```
 
+## Prevent wide queries
+
+Depth limits how deeply nested a query is, but a shallow query can still build a very large response object by selecting thousands of keys — for example, by aliasing one field thousands of times. `max_width` limits the number of distinct response keys that may appear in any single response object:
+
+```ruby
+class MySchema < GraphQL::Schema
+  # ...
+  max_width 100
+end
+
+# Query-level override:
+MySchema.execute(query_string, max_width: 200)
+```
+
+The limit counts keys that could actually be present in a response object at the same time, not field nodes in the AST:
+
+- selections with the same response key (including selections repeated through fragment spreads) are merged and counted once;
+- on abstract types, mutually-exclusive `... on Type` branches are not summed — the reachable maximum is used instead;
+- fields and fragments removed by `@skip`/`@include` directives (when the variable value is known) are not counted.
+
+For example, these two queries have very different widths despite a similar number of field nodes:
+
+```graphql
+# width 1 — ten fragments, but all select the same `id` key
+{
+  item {
+    ...F1 ...F2 # ... ...F10
+  }
+}
+
+# width 10 — ten distinct response keys
+{
+  item {
+    a1: id a2: id # ... a10: id
+  }
+}
+```
+
+When a query exceeds the limit, the error reports the response path, measured width and object type, and execution is stopped before any resolvers run.
+
+As with depth and complexity, introspection fields are counted by default and can be excluded with `max_depth ..., count_introspection_fields: false`.
+
+You can also extend {{ "GraphQL::Analysis::QueryWidth" | api_doc }} to inspect the calculated width.
+
 To get a feeling for depth of queries in your system, you can extend {{ "GraphQL::Analysis::QueryDepth" | api_doc }}. Hook it up to log out values from each query:
 
 ```ruby

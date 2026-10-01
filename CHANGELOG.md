@@ -8,6 +8,8 @@
 
 ### New features
 
+- Support `max_width` to limit the number of distinct response keys a single response object may contain. Selections merged by response key (including via repeated fragments) count once, mutually-exclusive abstract-type branches are measured at their reachable maximum, and fields skipped by `@skip`/`@include` with known variables are ignored. Violations are detected during analysis (before resolvers run) and include the response path, width and object type.
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)
