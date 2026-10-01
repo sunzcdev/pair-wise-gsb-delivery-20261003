@@ -135,6 +135,8 @@ func (c *Conn) handle(cmd string, arg string) {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Session reset")
 	case "BDAT":
 		c.handleBdat(arg)
+	case "BURL":
+		c.handleBURL(arg)
 	case "DATA":
 		c.handleData(arg)
 	case "QUIT":
@@ -279,6 +281,9 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	}
 	if c.server.EnableBINARYMIME {
 		caps = append(caps, "BINARYMIME")
+	}
+	if _, ok := c.Session().(BURLSession); ok {
+		caps = append(caps, "BURL")
 	}
 	if c.server.EnableDSN {
 		caps = append(caps, "DSN")
@@ -1032,45 +1037,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.bdatStatus == nil && c.server.LMTP {
-		c.bdatStatus = c.createStatusCollector()
-	}
-
-	if c.bdatPipe == nil {
-		var r *io.PipeReader
-		r, c.bdatPipe = io.Pipe()
-
-		c.dataResult = make(chan error, 1)
-
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					c.handlePanic(err, c.bdatStatus)
-
-					c.dataResult <- errPanic
-					r.CloseWithError(errPanic)
-				}
-			}()
-
-			var err error
-			if !c.server.LMTP {
-				err = c.Session().Data(r)
-			} else {
-				lmtpSession, ok := c.Session().(LMTPSession)
-				if !ok {
-					err = c.Session().Data(r)
-					for _, rcpt := range c.recipients {
-						c.bdatStatus.SetStatus(rcpt, err)
-					}
-				} else {
-					err = lmtpSession.LMTPData(r, c.bdatStatus)
-				}
-			}
-
-			c.dataResult <- err
-			r.CloseWithError(err)
-		}()
-	}
+	c.startDataTransfer()
 
 	c.lineLimitReader.LineLimit = 0
 
@@ -1095,21 +1062,153 @@ func (c *Conn) handleBdat(arg string) {
 	c.bytesReceived += int64(size)
 
 	if last {
-		c.lineLimitReader.LineLimit = c.server.MaxLineLength
+		c.completeDataTransfer()
+	} else {
+		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Continue")
+	}
+}
 
-		c.bdatPipe.Close()
+// startDataTransfer begins streaming message content to the backend if it
+// was not started by a previous BDAT or BURL command.
+func (c *Conn) startDataTransfer() {
+	if c.bdatStatus == nil && c.server.LMTP {
+		c.bdatStatus = c.createStatusCollector()
+	}
 
-		err := <-c.dataResult
+	if c.bdatPipe != nil {
+		return
+	}
 
-		if c.server.LMTP {
-			c.bdatStatus.fillRemaining(err)
-			for i, rcpt := range c.recipients {
-				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
-				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+	var r *io.PipeReader
+	r, c.bdatPipe = io.Pipe()
+
+	c.dataResult = make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				c.handlePanic(err, c.bdatStatus)
+
+				c.dataResult <- errPanic
+				r.CloseWithError(errPanic)
 			}
+		}()
+
+		var err error
+		if !c.server.LMTP {
+			err = c.Session().Data(r)
 		} else {
-			c.writeResponse(dataErrorToStatus(err))
+			lmtpSession, ok := c.Session().(LMTPSession)
+			if !ok {
+				err = c.Session().Data(r)
+				for _, rcpt := range c.recipients {
+					c.bdatStatus.SetStatus(rcpt, err)
+				}
+			} else {
+				err = lmtpSession.LMTPData(r, c.bdatStatus)
+			}
 		}
+
+		c.dataResult <- err
+		r.CloseWithError(err)
+	}()
+}
+
+// completeDataTransfer finalizes the message transaction after the last
+// BDAT or BURL chunk (marked with LAST) has been streamed to the backend.
+func (c *Conn) completeDataTransfer() {
+	c.lineLimitReader.LineLimit = c.server.MaxLineLength
+
+	c.bdatPipe.Close()
+
+	err := <-c.dataResult
+
+	if c.server.LMTP {
+		c.bdatStatus.fillRemaining(err)
+		for i, rcpt := range c.recipients {
+			code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
+			c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+		}
+	} else {
+		c.writeResponse(dataErrorToStatus(err))
+	}
+
+	if err == errPanic {
+		c.Close()
+		return
+	}
+
+	c.reset()
+}
+
+// BURL (RFC 4468)
+func (c *Conn) handleBURL(arg string) {
+	burlSession, ok := c.Session().(BURLSession)
+	if !ok {
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "BURL is not supported")
+		return
+	}
+
+	if !c.fromReceived || len(c.recipients) == 0 {
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		return
+	}
+
+	args := strings.Fields(arg)
+	if len(args) == 0 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing URL argument")
+		return
+	}
+	if len(args) > 2 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Too many arguments")
+		return
+	}
+
+	last := false
+	if len(args) == 2 {
+		if !strings.EqualFold(args[1], "LAST") {
+			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BURL argument")
+			return
+		}
+		last = true
+	}
+
+	// The backend resolves the URL and authorizes access to it, the server
+	// itself never fetches arbitrary URLs.
+	rc, err := burlSession.FetchURL(args[0])
+	if err != nil {
+		// No message content was consumed, so the transaction is left
+		// intact: the client may retry with another BURL or BDAT command
+		// or abort it with RSET.
+		c.writeError(554, EnhancedCode{5, 3, 0}, err)
+		return
+	}
+	defer rc.Close()
+
+	c.startDataTransfer()
+
+	// Fetched content counts towards the same message size limit as
+	// content received via BDAT.
+	remaining := int64(-1)
+	if c.server.MaxMessageBytes != 0 {
+		remaining = c.server.MaxMessageBytes - c.bytesReceived
+	}
+	var src io.Reader = rc
+	if remaining >= 0 {
+		src = io.LimitReader(rc, remaining+1)
+	}
+	n, err := io.Copy(c.bdatPipe, src)
+	c.bytesReceived += n
+
+	if remaining >= 0 && n > remaining {
+		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
+		c.reset()
+		return
+	}
+	if err != nil {
+		// Partial content may have been passed to the backend already,
+		// abort the transaction to avoid committing a truncated message.
+		c.writeResponse(dataErrorToStatus(err))
 
 		if err == errPanic {
 			c.Close()
@@ -1117,6 +1216,11 @@ func (c *Conn) handleBdat(arg string) {
 		}
 
 		c.reset()
+		return
+	}
+
+	if last {
+		c.completeDataTransfer()
 	} else {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Continue")
 	}
