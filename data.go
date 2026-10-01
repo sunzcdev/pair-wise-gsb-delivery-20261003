@@ -135,6 +135,10 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		}
 	}
 
+	// Ensure one-time values that were flashed out (possibly by a different,
+	// concurrent request) cannot be resurrected by committing this copy.
+	s.stripConsumedFlashesLocked(sd)
+
 	b, err := s.Codec.Encode(sd.deadline, sd.values)
 	if err != nil {
 		return "", time.Time{}, err
@@ -169,11 +173,13 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	sd.status = Destroyed
 
 	// Reset everything else to defaults.
+	oldToken := sd.token
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
+	s.clearConsumedFlashesLocked(oldToken)
 
 	return nil
 }
@@ -317,6 +323,7 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
+	oldToken := sd.token
 	if sd.token != "" {
 		err := s.doStoreDelete(ctx, sd.token)
 		if err != nil {
@@ -332,6 +339,10 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.token = newToken
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
+
+	if oldToken != "" {
+		s.moveConsumedFlashesLocked(oldToken, newToken)
+	}
 
 	return nil
 }

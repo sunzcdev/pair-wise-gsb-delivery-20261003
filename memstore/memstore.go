@@ -1,6 +1,7 @@
 package memstore
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -70,6 +71,40 @@ func (m *MemStore) Commit(token string, b []byte, expiry time.Time) error {
 	}
 	m.mu.Unlock()
 
+	return nil
+}
+
+// Flash atomically retrieves the data for the given session token, invokes fn
+// with it, and stores the data returned by fn while preserving the existing
+// expiry. The entire read-modify-write is performed while holding the write
+// lock, so concurrent Flash, Find and Commit calls for the same token are
+// serialized and a one-time value can only ever be handed out once.
+func (m *MemStore) Flash(token string, fn func(b []byte, found bool) (newB []byte, err error)) error {
+	return m.flash(context.Background(), token, fn)
+}
+
+// FlashCtx is the same as Flash, except that it takes a context.Context.
+func (m *MemStore) FlashCtx(ctx context.Context, token string, fn func(b []byte, found bool) (newB []byte, err error)) error {
+	return m.flash(ctx, token, fn)
+}
+
+func (m *MemStore) flash(_ context.Context, token string, fn func(b []byte, found bool) (newB []byte, err error)) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	current, found := m.items[token]
+	if !found || time.Now().UnixNano() > current.expiration {
+		_, err := fn(nil, false)
+		return err
+	}
+
+	newB, err := fn(current.object, true)
+	if err != nil {
+		return err
+	}
+
+	current.object = newB
+	m.items[token] = current
 	return nil
 }
 

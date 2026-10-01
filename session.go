@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/scs/v2/memstore"
@@ -55,6 +56,14 @@ type SessionManager struct {
 	// context.Context. If you are setting this manually, please make sure it is
 	// a unique value for each SessionManager instance
 	ContextKey contextKey
+
+	// flashMu guards flashes.
+	flashMu sync.Mutex
+
+	// flashes records the keys that have been atomically flashed out of each
+	// session token, so that commits of stale in-memory session copies cannot
+	// write the one-time values back to the store.
+	flashes map[string]map[string]struct{}
 }
 
 // SessionCookie contains the configuration settings for session cookies.
