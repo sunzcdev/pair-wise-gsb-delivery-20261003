@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- adds Addressable::Template#unexpand, which reverses a template expansion
+  using declared variable shapes (`:string`, `:list`, `:map`) and reports
+  whether the URI has no binding, a unique binding or ambiguous bindings
+
 ## Addressable 2.9.0 <a name="v2.9.0">
 - fixes ReDoS vulnerability in Addressable::Template#match (fixes incomplete
   remediation in 2.8.10)

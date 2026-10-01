@@ -1392,3 +1392,190 @@ describe Addressable::Template::MatchData do
     end
   end
 end
+
+describe Addressable::Template, "#unexpand" do
+  it "reports :no_match when the URI does not match the template" do
+    template = Addressable::Template.new("http://example.com/{x}")
+    result = template.unexpand("http://other.example.com/value")
+    expect(result.status).to eq(:no_match)
+    expect(result).to be_no_match
+    expect(result).to_not be_unique
+    expect(result).to_not be_ambiguous
+    expect(result.bindings).to eq([])
+    expect(result.binding).to be_nil
+  end
+
+  it "rejects unknown variable shapes" do
+    template = Addressable::Template.new("http://example.com/{x}")
+    expect {
+      template.unexpand("http://example.com/a", {"x" => :set})
+    }.to raise_error(ArgumentError)
+  end
+
+  it "extracts a unique string binding by default" do
+    template = Addressable::Template.new("http://example.com/{?q}")
+    result = template.unexpand("http://example.com/?q=hello")
+    expect(result).to be_unique
+    expect(result.binding).to eq({"q" => "hello"})
+    expect(result.mapping).to eq({"q" => "hello"})
+  end
+
+  it "extracts lists with explode modifiers" do
+    template = Addressable::Template.new("http://example.com{/segments*}")
+    uri = "http://example.com/a/b/c"
+    result = template.unexpand(uri, {"segments" => :list})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"segments" => ["a", "b", "c"]})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "extracts lists without explode modifiers" do
+    template = Addressable::Template.new("http://example.com/{?ids}")
+    uri = "http://example.com/?ids=1,2,3"
+    result = template.unexpand(uri, {"ids" => :list})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"ids" => ["1", "2", "3"]})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "extracts maps with explode modifiers" do
+    template = Addressable::Template.new("http://example.com/{?coords*}")
+    uri = "http://example.com/?x=1&y=2"
+    result = template.unexpand(uri, {"coords" => :map})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"coords" => {"x" => "1", "y" => "2"}})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "extracts maps without explode modifiers" do
+    template = Addressable::Template.new("http://example.com/{;coords}")
+    uri = "http://example.com/;coords=x,1,y,2"
+    result = template.unexpand(uri, {"coords" => :map})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"coords" => {"x" => "1", "y" => "2"}})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "follows operator rules for empty values" do
+    template = Addressable::Template.new("http://example.com/{;x}")
+    result = template.unexpand("http://example.com/;x")
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => ""})
+
+    template = Addressable::Template.new("http://example.com/{?x,y}")
+    uri = "http://example.com/?x=&y=1"
+    result = template.unexpand(uri)
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => "", "y" => "1"})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "follows operator rules for empty explode list elements" do
+    template = Addressable::Template.new("http://example.com/{?list*}")
+    uri = "http://example.com/?list=a&list="
+    result = template.unexpand(uri, {"list" => :list})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"list" => ["a", ""]})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "omits undefined variables from the binding" do
+    template = Addressable::Template.new("http://example.com/{?x,y}")
+    uri = "http://example.com/?y=1"
+    result = template.unexpand(uri)
+    expect(result).to be_unique
+    expect(result.binding).to eq({"y" => "1"})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "requires repeated variables to be consistent" do
+    template = Addressable::Template.new("http://example.com/{x}/{x}")
+    result = template.unexpand("http://example.com/a/a")
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => "a"})
+
+    result = template.unexpand("http://example.com/a/b")
+    expect(result).to be_no_match
+  end
+
+  it "decodes percent-encoded values" do
+    template = Addressable::Template.new("http://example.com/{x}")
+    uri = "http://example.com/a%20b"
+    result = template.unexpand(uri)
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => "a b"})
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "does not fabricate the truncated remainder of prefix modifiers" do
+    template = Addressable::Template.new("http://example.com/{x:3}")
+    uri = "http://example.com/abc"
+    result = template.unexpand(uri)
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => "abc"})
+    expect(result.truncated_variables).to eq(["x"])
+    expect(template.expand(result.binding).to_str).to eq(uri)
+  end
+
+  it "does not flag values shorter than the prefix modifier as truncated" do
+    template = Addressable::Template.new("http://example.com/{x:3}")
+    result = template.unexpand("http://example.com/ab")
+    expect(result).to be_unique
+    expect(result.binding).to eq({"x" => "ab"})
+    expect(result.truncated_variables).to eq([])
+  end
+
+  it "rejects values longer than the prefix modifier" do
+    template = Addressable::Template.new("http://example.com/{x:3}")
+    result = template.unexpand("http://example.com/abcd")
+    expect(result).to be_no_match
+  end
+
+  it "detects ambiguity from structurally different expansions" do
+    template = Addressable::Template.new("http://example.com/{+a,b}")
+    first = {"a" => "x,y"}
+    second = {"a" => "x", "b" => "y"}
+    uri = template.expand(first).to_str
+    # Two structurally different mappings expand to the same text.
+    expect(template.expand(second).to_str).to eq(uri)
+
+    result = template.unexpand(uri)
+    expect(result.status).to eq(:ambiguous)
+    expect(result).to be_ambiguous
+    expect(result.binding).to be_nil
+    expect(result.bindings).to include(first)
+    expect(result.bindings).to include(second)
+    result.bindings.each do |binding|
+      expect(template.expand(binding).to_str).to eq(uri)
+    end
+  end
+
+  it "detects ambiguity between lists and strings" do
+    template = Addressable::Template.new("http://example.com/{+list}")
+    as_list = {"list" => ["a", "b"]}
+    as_string = {"list" => "a,b"}
+    uri = template.expand(as_list).to_str
+    expect(template.expand(as_string).to_str).to eq(uri)
+
+    result = template.unexpand(uri, {"list" => :list})
+    expect(result).to be_unique
+    expect(result.binding).to eq(as_list)
+
+    result = template.unexpand(uri)
+    expect(result).to be_unique
+    expect(result.binding).to eq(as_string)
+  end
+
+  it "detects ambiguity between exploded maps and lists" do
+    template = Addressable::Template.new("http://example.com/{?value*}")
+    uri = "http://example.com/?a=b"
+    result = template.unexpand(uri, {"value" => :map})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"value" => {"a" => "b"}})
+
+    result = template.unexpand("http://example.com/?value=a&value=b",
+                               {"value" => :list})
+    expect(result).to be_unique
+    expect(result.binding).to eq({"value" => ["a", "b"]})
+  end
+end

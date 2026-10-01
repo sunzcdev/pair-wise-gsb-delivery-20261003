@@ -60,6 +60,14 @@ module Addressable
     EXPRESSION =
       /\{([#{operator}])?(#{varspec}(?:,#{varspec})*)\}/
 
+    # Sentinel used to track variables that are undefined in a particular
+    # binding while reversing an expansion.
+    UNDEFINED_VALUE = Object.new
+    private_constant :UNDEFINED_VALUE
+
+    # Shapes that may be declared for variables when reversing an expansion.
+    VARIABLE_SHAPES = [:string, :list, :map].freeze
+    private_constant :VARIABLE_SHAPES
 
     LEADERS = {
       '?' => '?',
@@ -228,6 +236,126 @@ module Addressable
     end
 
     ##
+    # This class represents the result of reversing a template expansion
+    # with declared variable shapes.
+    #
+    # Unlike <tt>Addressable::Template#extract</tt>, which produces a single
+    # best-effort mapping, an <tt>UnexpandResult</tt> distinguishes between
+    # three outcomes:
+    #
+    # - <tt>:no_match</tt>: the URI cannot be produced by the template at all.
+    # - <tt>:unique</tt>: exactly one binding can produce the URI.
+    # - <tt>:ambiguous</tt>: more than one binding can produce the URI.
+    #
+    # @see Addressable::Template#unexpand
+    class UnexpandResult
+      # Status returned when the URI cannot be produced by the template.
+      NO_MATCH = :no_match
+      # Status returned when exactly one binding can produce the URI.
+      UNIQUE = :unique
+      # Status returned when more than one binding can produce the URI.
+      AMBIGUOUS = :ambiguous
+
+      ##
+      # Creates a new UnexpandResult object.
+      # UnexpandResult objects should never be instantiated directly.
+      #
+      # @param [Addressable::Template] template
+      #   The Template the URI was matched against.
+      # @param [Addressable::URI] uri
+      #   The URI that was matched against the template.
+      # @param [Array] bindings
+      #   The list of distinct bindings that expand to the URI.
+      # @param [Array] truncated_variables
+      #   The variables whose values may be prefixes of the original values
+      #   because a prefix modifier was used in the template.
+      def initialize(template, uri, bindings, truncated_variables)
+        @template = template
+        @uri = uri.dup.freeze
+        @bindings = bindings.map { |binding| binding.dup.freeze }.freeze
+        @truncated_variables = truncated_variables.dup.freeze
+      end
+
+      ##
+      # @return [Addressable::Template]
+      #   The Template used for the match.
+      attr_reader :template
+
+      ##
+      # @return [Addressable::URI]
+      #   The URI that was matched against the Template.
+      attr_reader :uri
+
+      ##
+      # @return [Array]
+      #   The list of distinct bindings that expand back to the URI.
+      #   Empty when the URI does not match the template. Bindings do not
+      #   include keys for variables that are undefined in the URI.
+      attr_reader :bindings
+
+      ##
+      # @return [Array]
+      #   The names of variables matched against a prefix modifier at its
+      #   maximum length. The values of these variables may be prefixes of
+      #   the values originally used to expand the template; the truncated
+      #   remainder cannot be recovered from the URI.
+      attr_reader :truncated_variables
+
+      ##
+      # @return [Symbol]
+      #   <tt>:no_match</tt>, <tt>:unique</tt> or <tt>:ambiguous</tt>.
+      def status
+        if @bindings.empty?
+          NO_MATCH
+        elsif @bindings.size == 1
+          UNIQUE
+        else
+          AMBIGUOUS
+        end
+      end
+
+      ##
+      # @return [TrueClass, FalseClass]
+      #   <code>true</code> if the URI cannot be produced by the template.
+      def no_match?
+        status == NO_MATCH
+      end
+
+      ##
+      # @return [TrueClass, FalseClass]
+      #   <code>true</code> if exactly one binding can produce the URI.
+      def unique?
+        status == UNIQUE
+      end
+
+      ##
+      # @return [TrueClass, FalseClass]
+      #   <code>true</code> if more than one binding can produce the URI.
+      def ambiguous?
+        status == AMBIGUOUS
+      end
+
+      ##
+      # @return [Hash, NilClass]
+      #   The single binding that expands back to the URI when the result
+      #   is unique, <tt>nil</tt> otherwise.
+      def binding
+        unique? ? @bindings.first : nil
+      end
+      alias_method :mapping, :binding
+
+      ##
+      # Returns a <tt>String</tt> representation of the UnexpandResult's
+      # state.
+      #
+      # @return [String] The UnexpandResult's state, as a <tt>String</tt>.
+      def inspect
+        sprintf("#<%s:%#0x STATUS:%s BINDINGS:%s>",
+          self.class.to_s, self.object_id, status, self.bindings.inspect)
+      end
+    end
+
+    ##
     # Creates a new <tt>Addressable::Template</tt> object.
     #
     # @param [#to_str] pattern The URI Template pattern.
@@ -248,6 +376,7 @@ module Addressable
       self.variables
       self.variable_defaults
       self.named_captures
+      unexpand_tokens
       super
     end
 
@@ -486,6 +615,85 @@ module Addressable
     end
 
     ##
+    # Reverses a template expansion, enumerating every binding of the
+    # template's variables that expands back to the given URI.
+    #
+    # Unlike <tt>#extract</tt>, this method does not rely on a single
+    # best-effort regular expression match. It parses the template into
+    # literals and expressions and searches for all variable bindings that
+    # are consistent with the template's operators, the declared variable
+    # shapes, and the URI. Variables that appear more than once in the
+    # template must be bound to the same value in every occurrence.
+    #
+    # @param [Addressable::URI, #to_str] uri
+    #   The URI to reverse the expansion for.
+    #
+    # @param [Hash] shapes
+    #   Declares the expected shape of individual variables. Keys are variable
+    #   names, values are one of <tt>:string</tt> (the default),
+    #   <tt>:list</tt> or <tt>:map</tt>. Variables without a declared shape
+    #   are treated as strings.
+    #
+    # @return [Addressable::Template::UnexpandResult]
+    #   The result of the reverse expansion. Its <tt>status</tt> is
+    #   <tt>:no_match</tt> when the URI cannot be produced by the template,
+    #   <tt>:unique</tt> when exactly one binding can produce it, and
+    #   <tt>:ambiguous</tt> when more than one binding can. Every returned
+    #   binding expands back to the original URI. Values of variables
+    #   matched against a prefix modifier at its maximum length may be
+    #   prefixes of the original values; such variables are listed in
+    #   <tt>truncated_variables</tt> and their truncated remainders are
+    #   never fabricated.
+    #
+    # @example
+    #   template = Addressable::Template.new(
+    #     "http://example.com/{/segments*}{?q}"
+    #   )
+    #   result = template.unexpand(
+    #     "http://example.com/a/b/c?q=hello",
+    #     {"segments" => :list}
+    #   )
+    #   result.status
+    #   #=> :unique
+    #   result.binding
+    #   #=> {"segments" => ["a", "b", "c"], "q" => "hello"}
+    #
+    #   template = Addressable::Template.new("http://example.com/{+a,b}")
+    #   result = template.unexpand("http://example.com/x,y")
+    #   result.status
+    #   #=> :ambiguous
+    #   result.bindings
+    #   #=> [{"b" => "x,y"}, {"a" => "x", "b" => "y"}, {"a" => "x,y"}]
+    def unexpand(uri, shapes = {})
+      uri = Addressable::URI.parse(uri) unless uri.is_a?(Addressable::URI)
+      shapes = normalize_variable_shapes(shapes)
+      solutions = []
+      match_unexpand_tokens(
+        unexpand_tokens, uri.to_str, 0, {}, [], solutions, shapes
+      )
+      bindings = []
+      truncated_variables = []
+      solutions.each do |env, truncated|
+        binding = {}
+        env.each do |name, value|
+          binding[name] = value unless value.equal?(UNDEFINED_VALUE)
+        end
+        next if bindings.include?(binding)
+        # Only keep bindings that expand back to the original URI.
+        begin
+          next unless expand(binding).to_str == uri.to_str
+        rescue StandardError
+          next
+        end
+        bindings << binding
+        truncated_variables |= truncated
+      end
+      return Addressable::Template::UnexpandResult.new(
+        self, uri, bindings, truncated_variables
+      )
+    end
+
+    ##
     # Expands a URI template into another URI template.
     #
     # @param [Hash] mapping The mapping that corresponds to the pattern.
@@ -667,6 +875,425 @@ module Addressable
       end
     end
 
+    ##
+    # Validates and normalizes the variable shape declarations used by
+    # <tt>#unexpand</tt>.
+    #
+    # @param [Hash] shapes The declared shapes, keyed by variable name.
+    #
+    # @return [Hash] A hash with string keys and shape symbols as values.
+    def normalize_variable_shapes(shapes)
+      shapes.inject({}) do |accu, (name, shape)|
+        shape = shape.to_sym
+        unless VARIABLE_SHAPES.include?(shape)
+          raise ArgumentError, "Unknown variable shape: #{shape.inspect}."
+        end
+        accu[name.to_s] = shape
+        accu
+      end
+    end
+
+    ##
+    # Splits the template pattern into a sequence of literal strings and
+    # expressions for <tt>#unexpand</tt>.
+    #
+    # @return [Array]
+    #   A list of <tt>[:literal, string]</tt> and
+    #   <tt>[:expression, operator, varspecs]</tt> tokens, where each varspec
+    #   is a hash with <tt>:name</tt> and <tt>:modifier</tt> keys.
+    def unexpand_tokens
+      @unexpand_tokens ||= begin
+        tokens = []
+        position = 0
+        pattern.scan(EXPRESSION) do
+          match = Regexp.last_match
+          literal = pattern[position...match.begin(0)]
+          tokens << [:literal, literal] unless literal.empty?
+          varspecs = match[2].split(',').map do |varspec|
+            _, name, modifier = *varspec.match(VARSPEC)
+            {:name => name, :modifier => modifier}
+          end
+          tokens << [:expression, match[1], varspecs]
+          position = match.end(0)
+        end
+        tail = pattern[position..-1]
+        tokens << [:literal, tail] unless tail.empty?
+        tokens
+      end
+    end
+
+    ##
+    # Recursively matches a token sequence against the URI string,
+    # collecting every consistent variable binding.
+    #
+    # @param [Array] tokens The remaining tokens to match.
+    # @param [String] string The URI string being matched.
+    # @param [Integer] position The current offset into the string.
+    # @param [Hash] env The bindings accumulated so far.
+    # @param [Array] truncated The truncated variables encountered so far.
+    # @param [Array] solutions The collector for [env, truncated] pairs.
+    # @param [Hash] shapes The declared variable shapes.
+    def match_unexpand_tokens(tokens, string, position, env, truncated,
+                              solutions, shapes)
+      if tokens.empty?
+        solutions << [env, truncated] if position == string.length
+        return
+      end
+      token = tokens.first
+      rest = tokens[1..-1]
+      if token[0] == :literal
+        literal = token[1]
+        if string[position, literal.length] == literal
+          match_unexpand_tokens(
+            rest, string, position + literal.length,
+            env, truncated, solutions, shapes
+          )
+        end
+      else
+        _, operator, varspecs = token
+        unexpand_expression_matches(
+          operator, varspecs, string, position, shapes
+        ).each do |new_position, assignments, truncated_names|
+          merged = merge_unexpand_assignments(env, assignments)
+          next unless merged
+          match_unexpand_tokens(
+            rest, string, new_position,
+            merged, truncated | truncated_names, solutions, shapes
+          )
+        end
+      end
+    end
+
+    ##
+    # Merges two partial bindings, requiring variables that appear in both
+    # to agree. Repeated occurrences of a variable in a template must be
+    # bound to the same value in every occurrence.
+    #
+    # @return [Hash, NilClass]
+    #   The merged bindings, or <tt>nil</tt> if they conflict.
+    def merge_unexpand_assignments(env, assignments)
+      merged = env.dup
+      assignments.each do |name, value|
+        if merged.has_key?(name)
+          return nil unless merged[name] == value
+        else
+          merged[name] = value
+        end
+      end
+      return merged
+    end
+
+    ##
+    # Enumerates every way a single expression can consume a prefix of the
+    # string at the given position.
+    #
+    # @return [Array]
+    #   A list of <tt>[new_position, assignments, truncated_names]</tt>
+    #   tuples. The assignments cover every variable of the expression,
+    #   using <tt>UNDEFINED_VALUE</tt> for undefined variables.
+    def unexpand_expression_matches(operator, varspecs, string, position,
+                                    shapes)
+      results = []
+      absent = {}
+      varspecs.each { |varspec| absent[varspec[:name]] = UNDEFINED_VALUE }
+      results << [position, absent, []]
+      leader = LEADERS.fetch(operator, '')
+      if string[position, leader.length] == leader
+        body_start = position + leader.length
+        (body_start..string.length).each do |body_end|
+          body = string[body_start...body_end]
+          parse_unexpand_body(operator, varspecs, body, shapes).each do
+              |assignments, truncated_names|
+            results << [body_end, assignments, truncated_names]
+          end
+        end
+      end
+      return results
+    end
+
+    ##
+    # Parses the body of an expression (the text after its leader) into
+    # every possible set of variable assignments.
+    #
+    # @return [Array] A list of <tt>[assignments, truncated_names]</tt>.
+    def parse_unexpand_body(operator, varspecs, body, shapes)
+      case operator
+      when ';', '?', '&'
+        pairs = body.empty? ? [] :
+          body.split(JOINERS[operator], -1).map { |pair| pair.split('=', 2) }
+        assign_unexpand_pairs(varspecs, pairs, shapes)
+      else
+        joiner = JOINERS.fetch(operator, ',')
+        chunks = body.empty? ? [""] : body.split(joiner, -1)
+        assign_unexpand_chunks(varspecs, chunks, operator, joiner, shapes)
+      end
+    end
+
+    ##
+    # Assigns consecutive runs of joiner-separated chunks to the varspecs
+    # of a value-oriented expression (no operator, or one of + # / .).
+    # Undefined variables consume no chunks, mirroring expansion, where
+    # undefined variables are skipped along with their separators.
+    #
+    # @return [Array] A list of <tt>[assignments, truncated_names]</tt>.
+    def assign_unexpand_chunks(varspecs, chunks, operator, joiner, shapes)
+      return chunks.empty? ? [[{}, []]] : [] if varspecs.empty?
+      varspec = varspecs.first
+      rest = varspecs[1..-1]
+      results = []
+      assign_unexpand_chunks(rest, chunks, operator, joiner, shapes).each do
+          |env, truncated|
+        results << [
+          {varspec[:name] => UNDEFINED_VALUE}.merge(env), truncated
+        ]
+      end
+      shape = shapes[varspec[:name]] || :string
+      (1..chunks.length).each do |count|
+        taken = chunks.first(count)
+        remaining = chunks[count..-1]
+        parsed = parse_unexpand_chunk_run(
+          varspec, taken, operator, joiner, shape
+        )
+        next unless parsed
+        value, truncated_name = parsed
+        assign_unexpand_chunks(rest, remaining, operator, joiner, shapes).
+          each do |env, truncated|
+            truncated = truncated + [varspec[:name]] if truncated_name
+            results << [{varspec[:name] => value}.merge(env), truncated]
+          end
+      end
+      return results
+    end
+
+    ##
+    # Interprets a run of chunks as the value of a single varspec,
+    # according to its declared shape, modifier and operator.
+    #
+    # @return [Array, NilClass]
+    #   A <tt>[value, truncated]</tt> tuple, or <tt>nil</tt> if the chunks
+    #   cannot represent a value of the declared shape.
+    def parse_unexpand_chunk_run(varspec, chunks, operator, joiner, shape)
+      modifier = varspec[:modifier]
+      if modifier =~ /^:(\d+)$/
+        # Prefix modifiers only apply to string values. The matched text
+        # may be a prefix of the original value; never invent the rest.
+        return nil unless shape == :string && chunks.length == 1
+        return nil unless unexpand_text_valid?(chunks.first, operator)
+        limit = $1.to_i
+        length = unexpand_encoded_length(chunks.first)
+        return nil if length > limit
+        return [
+          Addressable::URI.unencode_component(chunks.first),
+          length == limit
+        ]
+      end
+      case shape
+      when :string
+        if operator == '+' || operator == '#' || operator == '.'
+          # Reserved (and, for '.', the joiner itself) characters may
+          # appear unencoded in string values for these operators.
+          value = chunks.join(joiner)
+        else
+          return nil unless chunks.length == 1
+          value = chunks.first
+        end
+        return nil unless chunks.all? { |chunk|
+          unexpand_text_valid?(chunk, operator)
+        }
+        [Addressable::URI.unencode_component(value), false]
+      when :list
+        elements =
+          if varspec[:modifier] == '*' || joiner == ','
+            chunks
+          else
+            return nil unless chunks.length == 1
+            split_unexpand_list(chunks.first)
+          end
+        return nil unless elements.all? { |element|
+          unexpand_text_valid?(element, operator)
+        }
+        [elements.map { |e| Addressable::URI.unencode_component(e) }, false]
+      when :map
+        if varspec[:modifier] == '*'
+          result = {}
+          chunks.each do |chunk|
+            key, value = chunk.split('=', 2)
+            return nil unless unexpand_text_valid?(key, operator) &&
+              unexpand_text_valid?(value || '', operator)
+            result[Addressable::URI.unencode_component(key)] =
+              Addressable::URI.unencode_component(value || '')
+          end
+          [result, false]
+        else
+          items =
+            if joiner == ','
+              chunks
+            else
+              return nil unless chunks.length == 1
+              split_unexpand_list(chunks.first)
+            end
+          return nil if items.empty? || items.length.odd?
+          return nil unless items.all? { |item|
+            unexpand_text_valid?(item, operator)
+          }
+          result = {}
+          items.each_slice(2) do |key, value|
+            result[Addressable::URI.unencode_component(key)] =
+              Addressable::URI.unencode_component(value)
+          end
+          [result, false]
+        end
+      end
+    end
+
+    ##
+    # Assigns consecutive runs of name/value pairs to the varspecs of a
+    # parameter-oriented expression (; ? &). Undefined variables consume
+    # no pairs.
+    #
+    # @return [Array] A list of <tt>[assignments, truncated_names]</tt>.
+    def assign_unexpand_pairs(varspecs, pairs, shapes)
+      return pairs.empty? ? [[{}, []]] : [] if varspecs.empty?
+      varspec = varspecs.first
+      rest = varspecs[1..-1]
+      results = []
+      assign_unexpand_pairs(rest, pairs, shapes).each do |env, truncated|
+        results << [
+          {varspec[:name] => UNDEFINED_VALUE}.merge(env), truncated
+        ]
+      end
+      shape = shapes[varspec[:name]] || :string
+      (1..pairs.length).each do |count|
+        taken = pairs.first(count)
+        remaining = pairs[count..-1]
+        parsed = parse_unexpand_pair_run(varspec, taken, shape)
+        next unless parsed
+        value, truncated_name = parsed
+        assign_unexpand_pairs(rest, remaining, shapes).each do
+            |env, truncated|
+          truncated = truncated + [varspec[:name]] if truncated_name
+          results << [{varspec[:name] => value}.merge(env), truncated]
+        end
+      end
+      return results
+    end
+
+    ##
+    # Interprets a run of name/value pairs as the value of a single
+    # varspec of a parameter-oriented expression (; ? &).
+    #
+    # @return [Array, NilClass]
+    #   A <tt>[value, truncated]</tt> tuple, or <tt>nil</tt> if the pairs
+    #   cannot represent a value of the declared shape.
+    def parse_unexpand_pair_run(varspec, pairs, shape)
+      name = varspec[:name]
+      modifier = varspec[:modifier]
+      return nil unless pairs.all? { |key, value|
+        unexpand_text_valid?(key, nil)
+      }
+      if modifier =~ /^:(\d+)$/
+        # Prefix modifiers only apply to string values. The matched text
+        # may be a prefix of the original value; never invent the rest.
+        return nil unless shape == :string && pairs.length == 1
+        key, value = pairs.first
+        return nil unless Addressable::URI.unencode_component(key) == name
+        value ||= ''
+        return nil unless unexpand_text_valid?(value, nil)
+        limit = $1.to_i
+        length = unexpand_encoded_length(value)
+        return nil if length > limit
+        return [Addressable::URI.unencode_component(value), length == limit]
+      end
+      case shape
+      when :string
+        return nil unless pairs.length == 1
+        key, value = pairs.first
+        return nil unless Addressable::URI.unencode_component(key) == name
+        return nil unless unexpand_text_valid?(value || '', nil)
+        [Addressable::URI.unencode_component(value || ''), false]
+      when :list
+        if modifier == '*'
+          return nil unless pairs.all? { |key, _|
+            Addressable::URI.unencode_component(key) == name
+          }
+          return nil unless pairs.all? { |_, value|
+            unexpand_text_valid?(value || '', nil)
+          }
+          [
+            pairs.map { |_, value|
+              Addressable::URI.unencode_component(value || '')
+            },
+            false
+          ]
+        else
+          return nil unless pairs.length == 1
+          key, value = pairs.first
+          return nil unless Addressable::URI.unencode_component(key) == name
+          elements = split_unexpand_list(value || '')
+          return nil unless elements.all? { |element|
+            unexpand_text_valid?(element, nil)
+          }
+          [
+            elements.map { |e| Addressable::URI.unencode_component(e) },
+            false
+          ]
+        end
+      when :map
+        if modifier == '*'
+          result = {}
+          pairs.each do |key, value|
+            return nil unless unexpand_text_valid?(value || '', nil)
+            result[Addressable::URI.unencode_component(key)] =
+              Addressable::URI.unencode_component(value || '')
+          end
+          [result, false]
+        else
+          return nil unless pairs.length == 1
+          key, value = pairs.first
+          return nil unless Addressable::URI.unencode_component(key) == name
+          items = split_unexpand_list(value || '')
+          return nil if items.empty? || items.length.odd?
+          return nil unless items.all? { |item|
+            unexpand_text_valid?(item, nil)
+          }
+          result = {}
+          items.each_slice(2) do |item_key, item_value|
+            result[Addressable::URI.unencode_component(item_key)] =
+              Addressable::URI.unencode_component(item_value)
+          end
+          [result, false]
+        end
+      end
+    end
+
+    ##
+    # Splits a comma-separated value, keeping a single empty element for
+    # empty values (which represent a one-element list, not an empty one).
+    #
+    # @return [Array] The split elements.
+    def split_unexpand_list(value)
+      value.empty? ? [""] : value.split(',', -1)
+    end
+
+    ##
+    # Counts the characters of a percent-encoded string, treating each
+    # percent-encoded octet triplet as a single character. Used to apply
+    # prefix modifiers while reversing an expansion.
+    #
+    # @return [Integer] The number of encoded characters.
+    def unexpand_encoded_length(value)
+      value.gsub(/%[a-fA-F0-9]{2}/, "\0").length
+    end
+
+    ##
+    # Checks whether matched text only contains characters that the given
+    # operator would have left unencoded during expansion.
+    #
+    # @return [TrueClass, FalseClass]
+    def unexpand_text_valid?(text, operator)
+      allowed = (operator == '+' || operator == '#') ? RESERVED : UNRESERVED
+      !!(text =~ /\A(?:#{allowed})*\z/)
+    end
 
     ##
     # Loops through each capture and expands any values available in mapping
