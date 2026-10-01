@@ -89,7 +89,20 @@ type producer struct {
 	// producer id reload; this flag tells the retry that the reload is
 	// the abort and no EndTxn should be sent.
 	endUnconfirmed bool
-	tx890p2        atomic.Bool
+	// endUnconfirmedCommit, guarded by txnMu, records whether the
+	// unconfirmed end was a commit attempt. An unconfirmed abort that is
+	// healed by a producer id reload is definitely aborted (the reload
+	// fence-aborts anything still ongoing, and an abort never commits);
+	// an unconfirmed commit is not, because the commit may already have
+	// been applied broker-side.
+	endUnconfirmedCommit bool
+	// txnGen counts transaction begins and end attempts. EndTransaction
+	// stamps its result with the generation at the attempt so that
+	// VerifyTransactionEnd can refuse to verify an attempt the client
+	// has since moved past (a newer begin or end may have changed the
+	// broker-side state the verification would read).
+	txnGen  atomic.Uint64
+	tx890p2 atomic.Bool
 
 	// producedInTxn is set when a record is buffered within the current
 	// transaction and reset by BeginTransaction. EndTransaction consults

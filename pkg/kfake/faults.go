@@ -67,6 +67,16 @@ type Fault struct {
 	// observing fault does not see it, nor does an observing fault
 	// without TopLevel see a request a TopLevel fault answers.
 	Observe bool
+
+	// Drop processes the request normally but drops the response: the
+	// work is applied exactly as if the request succeeded, and the
+	// client is left waiting until its own timeout, unable to learn the
+	// outcome. This models a broker (or the network) losing a response
+	// after applying the request. Err is ignored.
+	//
+	// Like Observe, a drop fault is counted for Hits and Wait and does
+	// not alter what the handler does.
+	Drop bool
 }
 
 // FaultHandle refers to the faults installed by one Fault call.
@@ -87,6 +97,7 @@ type fault struct {
 	topLevel   bool
 	when       func(kmsg.Request) bool
 	observe    bool
+	drop       bool
 	err        *kerr.Error
 	hits       atomic.Int64
 
@@ -118,6 +129,7 @@ func (c *Cluster) Fault(faults ...Fault) *FaultHandle {
 			topLevel:   in.TopLevel,
 			when:       in.When,
 			observe:    in.Observe,
+			drop:       in.Drop,
 			err:        in.Err,
 			left:       in.Count,
 		}
@@ -278,7 +290,7 @@ func (fc *faultCheck) check(k faultKey) *kerr.Error {
 		if !fc.hit(f) {
 			continue
 		}
-		if f.observe {
+		if f.observe || f.drop {
 			continue // counted, but the entity is not faulted
 		}
 		return f.err
@@ -356,7 +368,7 @@ func (fc *faultCheck) topLevel(kreq kmsg.Request) kmsg.Response {
 		if !fc.hit(f) {
 			continue
 		}
-		if f.observe {
+		if f.observe || f.drop {
 			continue // counted, but the request is not answered
 		}
 		code.SetInt(int64(f.err.Code))
@@ -404,10 +416,17 @@ func (fc *faultCheck) hit(f *fault) bool {
 }
 
 // anyHit reports whether anything in this request was faulted. An observing
-// fault takes a unit like any other, but it answers nothing, so a site that
-// changes what it does once something was faulted must not see it.
+// or dropping fault takes a unit like any other, but it answers nothing, so
+// a site that changes what it does once something was faulted must not see
+// it.
 func (fc *faultCheck) anyHit() bool {
-	return fc != nil && slices.ContainsFunc(fc.hits, func(f *fault) bool { return !f.observe })
+	return fc != nil && slices.ContainsFunc(fc.hits, func(f *fault) bool { return !f.observe && !f.drop })
+}
+
+// dropped reports whether a drop fault matched this request: the request
+// was processed normally, but its response must not be written.
+func (fc *faultCheck) dropped() bool {
+	return fc != nil && slices.ContainsFunc(fc.hits, func(f *fault) bool { return f.drop })
 }
 
 // deny answers the error to fail the entity named by k with, either because

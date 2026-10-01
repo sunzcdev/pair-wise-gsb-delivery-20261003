@@ -1229,7 +1229,7 @@ func TestTxnAddOffsetsWithoutGroup(t *testing.T) {
 }
 
 // TestTxnDescribeTransactions verifies that DescribeTransactions
-// returns correct state for both ongoing and empty (completed)
+// returns correct state for ongoing, empty, and completed
 // transactions.
 func TestTxnDescribeTransactions(t *testing.T) {
 	t.Parallel()
@@ -1324,7 +1324,7 @@ func TestTxnDescribeTransactions(t *testing.T) {
 		t.Fatalf("end txn error: %v", kerr.ErrorForCode(endResp.ErrorCode))
 	}
 
-	// After commit: state should be Empty again, no partitions.
+	// After commit: state should be CompleteCommit, no partitions.
 	descResp, err = descReq.RequestWith(ctx, cl)
 	if err != nil {
 		t.Fatalf("describe after commit: %v", err)
@@ -1333,8 +1333,8 @@ func TestTxnDescribeTransactions(t *testing.T) {
 	if st.ErrorCode != 0 {
 		t.Fatalf("describe error: %v", kerr.ErrorForCode(st.ErrorCode))
 	}
-	if st.State != "Empty" {
-		t.Fatalf("expected Empty state after commit, got %q", st.State)
+	if st.State != "CompleteCommit" {
+		t.Fatalf("expected CompleteCommit state after commit, got %q", st.State)
 	}
 	if len(st.Topics) != 0 {
 		t.Fatalf("expected no topics after commit, got %d", len(st.Topics))

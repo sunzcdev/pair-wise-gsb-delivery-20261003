@@ -175,3 +175,40 @@ case handling, but it is _strongly_ recommended to use a 2.5+ cluster where
 `RequireStable` provides a proper server-side guarantee. The
 `RequireStableFetchOffsets` option is deprecated and is now a no-op; stable
 fetch offsets are always enabled.
+
+Knowing whether a transaction committed
+===
+
+`EndTransaction` returns only an error, and an error does not tell you the
+one thing you need to decide what to do next: did the transaction commit?
+A transport error or `UNKNOWN_SERVER_ERROR` means the broker may have
+applied your commit and the response was lost -- rerunning the work in a
+new transaction can duplicate it, while skipping the rerun can lose it.
+
+[`EndTransactionResult`][4] is the same call with a structured answer. Its
+`Outcome` is one of:
+
+* `TxnEndCommitted` -- the broker confirmed the commit; do not rerun.
+* `TxnEndAborted` -- nothing from the transaction will ever be committed
+  (the abort was confirmed, the end was definitively rejected, the
+  transaction was fence-aborted by a producer ID reload, or no transaction
+  ever began); rerunning is safe.
+* `TxnEndUnknown` -- the client cannot prove either. The client never
+  guesses: a commit whose response is lost stays unknown.
+
+The result also carries the evidence the outcome was derived from: whether
+the `EndTxn` request was sent, whether a response was received, whether the
+attempt was healed by a producer ID reload, and the producer ID/epoch the
+attempt used.
+
+If the outcome is unknown and the cluster supports KIP-664 (Kafka 2.8+),
+[`VerifyTransactionEnd`][5] can ask the transaction coordinator for the
+final state of the transactional ID. Verification never probes by
+re-sending records, and it only works before the client begins or ends
+another transaction (after that, the coordinator's state no longer
+necessarily reflects your attempt, and verification refuses rather than
+guesses). If the coordinator cannot confirm the outcome either, the
+outcome stays unknown -- there is no fabricated exactly-once guarantee.
+
+[4]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Client.EndTransactionResult
+[5]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Client.VerifyTransactionEnd

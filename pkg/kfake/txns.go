@@ -34,6 +34,9 @@ import (
 //   - inTx (bool): true = Ongoing, false = Empty/Complete
 //   - lastWasCommit (bool): whether the last completed transaction
 //     was commit or abort, for EndTxn retry detection
+//   - txCompleted (bool): whether any transaction has completed,
+//     letting DescribeTransactions report CompleteCommit /
+//     CompleteAbort instead of Empty
 
 type (
 	pids struct {
@@ -77,6 +80,12 @@ type (
 		// completed, we return success only if the retry matches
 		// (commit after commit, abort after abort).
 		lastWasCommit bool
+
+		// txCompleted is true once any transaction has completed
+		// (committed or aborted), making lastWasCommit meaningful and
+		// reported by DescribeTransactions as CompleteCommit /
+		// CompleteAbort instead of Empty.
+		txCompleted bool
 	}
 
 	// Independent dup-detection entry: stores (firstSeq, nextSeq,
@@ -863,6 +872,7 @@ func (pidinf *pidinfo) resetTx(wasCommit bool) {
 	pidinf.txStart = time.Time{}
 	pidinf.inTx = false
 	pidinf.lastWasCommit = wasCommit
+	pidinf.txCompleted = true
 	pidinf.lastActive = time.Now()
 	delete(pidinf.pids.txs, pidinf)
 }
@@ -980,7 +990,18 @@ func (pids *pids) doDescribeTransactions(creq *clientReq) kmsg.Response {
 				topicEntry.Partitions = append(topicEntry.Partitions, partition)
 			})
 		} else {
-			st.State = "Empty"
+			// A completed transaction keeps its final state until a
+			// new transaction begins, like the real coordinator's
+			// CompleteCommit / CompleteAbort.
+			if pidinf.txCompleted {
+				if pidinf.lastWasCommit {
+					st.State = "CompleteCommit"
+				} else {
+					st.State = "CompleteAbort"
+				}
+			} else {
+				st.State = "Empty"
+			}
 			st.StartTimestamp = -1
 		}
 

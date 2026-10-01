@@ -1593,6 +1593,7 @@ func (c *Cluster) loadPIDsLog(fsys fs, dir string) error {
 			if ok {
 				pidinf.epoch = entry.Epoch
 				pidinf.inTx = false
+				pidinf.txCompleted = true
 				if entry.Commit != nil {
 					pidinf.lastWasCommit = *entry.Commit
 				}
@@ -1602,6 +1603,8 @@ func (c *Cluster) loadPIDsLog(fsys fs, dir string) error {
 			if ok {
 				pidinf.epoch = entry.Epoch
 				pidinf.inTx = false
+				pidinf.txCompleted = true
+				pidinf.lastWasCommit = false
 			}
 		}
 	}

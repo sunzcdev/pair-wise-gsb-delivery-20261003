@@ -781,6 +781,20 @@ outer:
 			continue
 		}
 
+		if creq.faults.dropped() {
+			// A drop fault: the request was fully processed, only
+			// the response is lost. Unmute without writing, like
+			// acks=0 produce; the client waits until its own
+			// timeout, unable to learn the outcome.
+			select {
+			case creq.cc.respCh <- clientResp{corr: creq.corr, skip: true}:
+			case <-creq.cc.done:
+			case <-c.die:
+				return
+			}
+			continue
+		}
+
 		select {
 		case creq.cc.respCh <- clientResp{kresp: kresp, corr: creq.corr, err: err}:
 		case <-creq.cc.done:

@@ -24,6 +24,98 @@ const (
 	TryCommit TransactionEndTry = true
 )
 
+// TxnEndOutcome is the known final outcome of a transaction end attempt.
+type TxnEndOutcome int8
+
+const (
+	// TxnEndUnknown means the client cannot say whether the transaction
+	// committed or aborted. The transaction may have been applied
+	// broker-side; rerunning the work in a new transaction can duplicate
+	// it. VerifyTransactionEnd may be able to resolve the outcome; if it
+	// cannot, treat the records as potentially committed and potentially
+	// aborted -- there is no safe automatic choice.
+	TxnEndUnknown TxnEndOutcome = iota
+
+	// TxnEndCommitted means the transaction's records and offsets are
+	// committed. The broker confirmed the commit.
+	TxnEndCommitted
+
+	// TxnEndAborted means nothing from the transaction will ever be
+	// committed: the abort was confirmed, the transaction was
+	// fence-aborted by a producer id reload, the broker definitively
+	// refused the end, or no transaction ever began broker-side.
+	TxnEndAborted
+)
+
+func (o TxnEndOutcome) String() string {
+	switch o {
+	case TxnEndCommitted:
+		return "committed"
+	case TxnEndAborted:
+		return "aborted"
+	default:
+		return "unknown"
+	}
+}
+
+// TxnEndResult is the structured result of a single EndTransactionResult
+// call. Where EndTransaction collapses everything into an error, this
+// result separates what the caller needs to decide what to do next: the
+// known Outcome of the transaction, plus the evidence of how far the
+// attempt got on the wire that the outcome was derived from.
+type TxnEndResult struct {
+	// Outcome is the known final state of the transaction. It is
+	// TxnEndUnknown whenever the client cannot prove the outcome; the
+	// client never guesses.
+	Outcome TxnEndOutcome
+
+	// Err is the error EndTransaction would have returned for this
+	// attempt, nil if the attempt succeeded.
+	Err error
+
+	// RequestSent is true if an EndTxn request was handed to a broker
+	// connection. If false, the end was never attempted (the producer ID
+	// could not be loaded, or the commit was refused before sending) and
+	// the transaction may still be open; resolve it with the documented
+	// TryAbort retry rather than by verifying.
+	RequestSent bool
+
+	// ResponseReceived is true if the broker's answer to the EndTxn
+	// request came back (successfully or with an error code). A
+	// transport failure means the request may or may not have been
+	// applied; UNKNOWN_SERVER_ERROR means a response arrived but does
+	// not say whether the end was applied. Both leave the outcome
+	// unknown.
+	ResponseReceived bool
+
+	// HealedByReload is true if the attempt was resolved by reloading
+	// the producer ID rather than by an EndTxn response: the reload
+	// bumps the epoch and fence-aborts anything still ongoing
+	// broker-side. For an abort attempt this makes the outcome
+	// definitely aborted; for a commit attempt the commit may already
+	// have been applied before the reload, so the outcome stays unknown.
+	HealedByReload bool
+
+	// ProducerID and ProducerEpoch are the producer identity the end was
+	// attempted with, or -1 if no producer ID was loaded. They identify
+	// the attempt when verifying it against the transaction coordinator.
+	ProducerID    int64
+	ProducerEpoch int16
+
+	// gen is the client's transaction generation at the attempt;
+	// VerifyTransactionEnd refuses to verify an attempt the client has
+	// since moved past.
+	gen uint64
+}
+
+// String returns a short human-readable summary of the result.
+func (r TxnEndResult) String() string {
+	if r.Err != nil {
+		return fmt.Sprintf("%s (err: %v)", r.Outcome, r.Err)
+	}
+	return r.Outcome.String()
+}
+
 // GroupTransactSession abstracts away the proper way to begin and end a
 // transaction when consuming in a group, modifying records, and producing
 // (EOS).
@@ -576,6 +668,7 @@ func (cl *Client) BeginTransaction() error {
 	}
 
 	cl.producer.inTxn = true
+	cl.producer.txnGen.Add(1)
 	cl.producer.producedInTxn.Store(false)
 	cl.producer.clearRecreatedInTxn()
 	if !cl.producer.tx890p2.Load() && cl.supportsKIP890p2() {
@@ -744,25 +837,60 @@ func errRecreatedInTxn(topics []string) error {
 // EndTransaction request, making it impossible to know whether the commit or
 // abort was successful. It is recommended to not cancel the context.
 func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) error {
+	return cl.EndTransactionResult(ctx, commit).Err
+}
+
+// EndTransactionResult is EndTransaction with a structured result: rather
+// than only an error, it returns what the client can prove about the
+// transaction's final state, plus the evidence of how far the attempt got
+// on the wire.
+//
+// The returned Outcome answers the question an error alone cannot: is it
+// safe to rerun the work in a new transaction? TxnEndCommitted means the
+// records and offsets are committed -- do not rerun. TxnEndAborted means
+// nothing from this transaction will ever be committed -- rerunning is
+// safe. TxnEndUnknown means the client cannot prove either: the commit or
+// abort may have been applied broker-side (for example, the broker
+// received the commit but the response was lost). Rerunning unknown work
+// can duplicate it; not rerunning can lose it. If the cluster supports
+// KIP-664 (Kafka 2.8+), VerifyTransactionEnd can try to resolve an unknown
+// outcome by asking the transaction coordinator; it never probes by
+// re-sending records. If verification is impossible, the outcome stays
+// unknown -- the client does not fabricate an exactly-once guarantee.
+//
+// Everything documented on EndTransaction about flushing, retrying with
+// TryAbort, and context cancellation applies here as well.
+func (cl *Client) EndTransactionResult(ctx context.Context, commit TransactionEndTry) (res TxnEndResult) {
+	res.ProducerID = -1
+	res.ProducerEpoch = -1
+
 	cl.producer.txnMu.Lock()
 	defer cl.producer.txnMu.Unlock()
 
 	if !cl.producer.inTxn {
-		return nil
+		// No transaction is open: nothing this call could commit exists.
+		res.Outcome = TxnEndAborted
+		return res
 	}
 	if commit {
 		if topics := cl.producer.topicsRecreatedInTxn(); len(topics) > 0 {
-			return errRecreatedInTxn(topics)
+			// The commit is refused before anything is sent; the
+			// transaction is still open and must be aborted.
+			res.Err = errRecreatedInTxn(topics)
+			return res
 		}
 	}
 	cl.producer.inTxn = false
+	res.gen = cl.producer.txnGen.Add(1)
 
 	// If a prior EndTxn attempt's outcome was unconfirmed, this call is the
 	// documented TryAbort retry (state was restored so we could get here).
 	// Remember and clear; restored again below if this attempt also fails
 	// before confirming anything.
 	unconfirmed := cl.producer.endUnconfirmed
+	unconfirmedCommit := cl.producer.endUnconfirmedCommit
 	cl.producer.endUnconfirmed = false
+	cl.producer.endUnconfirmedCommit = false
 
 	cl.producer.producingTxn.Store(false) // forbid any new produces while ending txn
 
@@ -823,7 +951,10 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		// commit anyway.
 		if !cl.producer.tx890p2.Load() || !cl.producer.producedInTxn.Load() {
 			cl.cfg.logger.Log(LogLevelDebug, "no records were produced during the commit; thus no transaction was began; ending without doing anything")
-			return nil
+			// No transaction ever began broker-side, so nothing from it
+			// can ever be committed.
+			res.Outcome = TxnEndAborted
+			return res
 		}
 		cl.cfg.logger.Log(LogLevelInfo, "no produce succeeded in this transaction but produces were attempted; issuing an abort to clear any server-side partition registrations",
 			"transactional_id", *cl.cfg.txnID,
@@ -851,7 +982,12 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 			}
 			cl.producer.inTxn = true
 			cl.producer.endUnconfirmed = unconfirmed
-			return kerr.OperationNotAttempted
+			cl.producer.endUnconfirmedCommit = unconfirmedCommit
+			// The end was never attempted; the transaction is still
+			// open broker-side, so its outcome is unknown (and a prior
+			// unconfirmed attempt, if any, stays unconfirmed).
+			res.Err = kerr.OperationNotAttempted
+			return res
 		}
 
 		// If we recovered the producer ID, we return early, since
@@ -860,9 +996,16 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		// fail, but that is ok, we will just return error.
 		_, didRecover, _ := cl.maybeRecoverProducerID(ctx)
 		if didRecover {
-			return nil
+			// The reload fence-aborts anything still ongoing
+			// broker-side, and an abort attempt never sent a commit:
+			// nothing from this transaction can ever be committed.
+			res.Outcome = TxnEndAborted
+			res.HealedByReload = true
+			return res
 		}
 	}
+	res.ProducerID = id
+	res.ProducerEpoch = epoch
 
 	// This is the retry after an unconfirmed EndTxn outcome, and the
 	// producerID call above succeeded -- which, with the ID failed as
@@ -876,14 +1019,30 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 	// "success" here would lie to the caller.
 	if unconfirmed {
 		if commit {
-			return errors.New("cannot retry a commit whose outcome is unconfirmed: the transaction may already be aborted; retry with TryAbort")
+			res.Err = errors.New("cannot retry a commit whose outcome is unconfirmed: the transaction may already be aborted; retry with TryAbort")
+			res.HealedByReload = err == nil
+			return res
 		}
 		cl.cfg.logger.Log(LogLevelInfo, "aborting an unconfirmed transaction via producer id reload; the epoch bump fence-aborted anything still ongoing",
 			"transactional_id", *cl.cfg.txnID,
 			"id", id,
 			"epoch", epoch,
 		)
-		return nil
+		// err is nil if the producerID call above reloaded the id (the
+		// reload is the fence-abort); it is non-nil if the id failed
+		// unrecoverably, in which case the transaction is still
+		// uncommittable and dies by fencing or the transaction timeout.
+		res.HealedByReload = err == nil
+		if !unconfirmedCommit {
+			// The unconfirmed attempt was itself an abort: either it
+			// completed broker-side, or the reload just fence-aborted
+			// anything still ongoing. Either way the transaction can
+			// never be committed.
+			res.Outcome = TxnEndAborted
+		}
+		// A prior commit may already have been applied broker-side
+		// before the reload; its outcome stays unknown.
+		return res
 	}
 
 	cl.cfg.logger.Log(LogLevelInfo, "ending transaction",
@@ -893,6 +1052,7 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		"epoch", epoch,
 	)
 
+	res.RequestSent = true
 	err = cl.doWithConcurrentTransactions(ctx, "EndTxn", func() error {
 		req := kmsg.NewPtrEndTxnRequest()
 		req.TransactionalID = *cl.cfg.txnID
@@ -982,8 +1142,27 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 	if err != nil {
 		if ke, ok := errors.AsType[*kerr.Error](err); ok && !ke.Retriable && ke.Code != kerr.UnknownServerError.Code {
 			cl.failProducerID(id, epoch, err)
+			// A definitive broker rejection: the end was NOT applied,
+			// and with the producer ID now failed this transaction can
+			// never be committed by anyone (a new incarnation of the
+			// transactional ID fence-aborts it; otherwise the
+			// transaction timeout does). This includes
+			// TRANSACTION_ABORTABLE, which the coordinator returns
+			// only once the transaction is aborting.
+			res.Outcome = TxnEndAborted
+			res.ResponseReceived = true
+			// The TryAbort retry below heals via reload; with the
+			// outcome definitive, the retry must not treat the prior
+			// attempt as an unconfirmed commit.
+			cl.producer.endUnconfirmedCommit = false
 		} else {
 			cl.failProducerID(id, epoch, errReloadProducerID)
+			// Transport error, retriable error that outlived retries,
+			// or UNKNOWN_SERVER_ERROR: the request may or may not have
+			// been applied. A broker error code at least proves a
+			// response arrived; a transport error proves nothing.
+			_, res.ResponseReceived = errors.AsType[*kerr.Error](err)
+			cl.producer.endUnconfirmedCommit = bool(commit)
 		}
 		for _, rb := range addedSwapped {
 			rb.addedToTxn.Store(true)
@@ -993,9 +1172,90 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		}
 		cl.producer.inTxn = true
 		cl.producer.endUnconfirmed = true
+		res.Err = err
+		return res
 	}
 
-	return err
+	res.ResponseReceived = true
+	if commit {
+		res.Outcome = TxnEndCommitted
+	} else {
+		res.Outcome = TxnEndAborted
+	}
+	return res
+}
+
+// VerifyTransactionEnd tries to resolve the unknown outcome of a prior
+// EndTransactionResult by asking the transaction coordinator for the final
+// state of the transactional ID (KIP-664 DescribeTransactions, Kafka
+// 2.8+). It never probes by re-sending records or re-ending the
+// transaction: the only request it issues is DescribeTransactions.
+//
+// Verification is only meaningful for the client's most recent end
+// attempt, before any new transaction is begun or ended and before the
+// documented TryAbort retry heals the producer ID: once the client has
+// moved on, the coordinator's state no longer necessarily reflects the
+// attempt being verified, and this function returns an error with
+// TxnEndUnknown rather than guess. It also returns TxnEndUnknown --
+// without a false exactly-once guarantee -- whenever the coordinator
+// cannot confirm the outcome: the cluster predates KIP-664, the
+// transaction is still ongoing, the state belongs to a different producer
+// incarnation, or the request itself fails.
+//
+// A result whose Outcome is already certain is returned as-is.
+func (cl *Client) VerifyTransactionEnd(ctx context.Context, res TxnEndResult) (TxnEndOutcome, error) {
+	if res.Outcome != TxnEndUnknown {
+		return res.Outcome, nil
+	}
+	if cl.cfg.txnID == nil {
+		return TxnEndUnknown, errNotTransactional
+	}
+	if !res.RequestSent {
+		return TxnEndUnknown, errors.New("the transaction end was never sent to the broker; resolve the still-open transaction with the documented TryAbort retry instead of verifying")
+	}
+	if gen := cl.producer.txnGen.Load(); gen != res.gen {
+		return TxnEndUnknown, errors.New("the client has begun or ended another transaction since this attempt; the outcome can no longer be verified")
+	}
+	if !cl.supportsKeyVersion(int16(kmsg.DescribeTransactions), 0) {
+		return TxnEndUnknown, errors.New("the cluster does not support DescribeTransactions (KIP-664); the transaction outcome remains unknown")
+	}
+
+	req := kmsg.NewPtrDescribeTransactionsRequest()
+	req.TransactionalIDs = []string{*cl.cfg.txnID}
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return TxnEndUnknown, err
+	}
+	if len(resp.TransactionStates) != 1 {
+		return TxnEndUnknown, fmt.Errorf("DescribeTransactions returned %d transaction states, expected 1", len(resp.TransactionStates))
+	}
+	st := resp.TransactionStates[0]
+	if err := kerr.ErrorForCode(st.ErrorCode); err != nil {
+		return TxnEndUnknown, err
+	}
+
+	// The state must belong to the producer incarnation that made the
+	// attempt. Under KIP-890 part 2 the coordinator bumps the epoch as
+	// part of completing the end, so a completed transaction is reported
+	// at one epoch past the attempt.
+	if st.ProducerID != res.ProducerID {
+		return TxnEndUnknown, nil
+	}
+	epochMatch := st.ProducerEpoch == res.ProducerEpoch ||
+		cl.producer.tx890p2.Load() && st.ProducerEpoch == res.ProducerEpoch+1
+	if !epochMatch {
+		return TxnEndUnknown, nil
+	}
+	switch st.State {
+	case "CompleteCommit":
+		return TxnEndCommitted, nil
+	case "CompleteAbort":
+		return TxnEndAborted, nil
+	default:
+		// Ongoing, Empty, Dead, or an unrecognized state: the
+		// coordinator cannot confirm the outcome.
+		return TxnEndUnknown, nil
+	}
 }
 
 // This returns if it is necessary to recover the producer ID (it has an
