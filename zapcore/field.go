@@ -206,6 +206,10 @@ func (f Field) Equals(other Field) bool {
 }
 
 func addFields(enc ObjectEncoder, fields []Field) {
+	if redactor, ok := enc.(interface{ addLogFields([]Field) }); ok {
+		redactor.addLogFields(fields)
+		return
+	}
 	for i := range fields {
 		fields[i].AddTo(enc)
 	}
