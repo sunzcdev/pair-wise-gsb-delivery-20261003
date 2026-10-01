@@ -1,6 +1,12 @@
 # frozen_string_literal: true
 module Mustermann
   # Class for pattern objects that are a concatenation of other patterns.
+  #
+  # Matching is done by splitting the input string between the patterns.
+  # If a pattern further to the left consumes too much (or too little) for
+  # the remaining patterns to match, it backtracks and tries a different
+  # split. When multiple splits are possible, the first one found scanning
+  # from left to right wins, with each pattern preferring its longest match.
   # @see Mustermann::Pattern#+
   class Concat < Composite
     # Mixin for patterns to support native concatenation.
@@ -53,48 +59,35 @@ module Mustermann
 
     # @see Mustermann::Pattern#===
     def ===(string)
-      peek_size(string) == string.size
+      !!split(string, full: true)
     end
 
     # @see Mustermann::Pattern#match
     def match(string)
-      peeked = peek_match(string)
-      peeked if peeked.to_s == string
+      build_match(string, split(string, full: true))
     end
 
     # @see Mustermann::Pattern#params
     def params(string)
-      params, size = peek_params(string)
-      params if size == string.size
+      return unless parts = split(string, full: true)
+      parts.inject({}) { |params, part| params.merge!(part.params) }
     end
 
     # @see Mustermann::Pattern#peek_size
     def peek_size(string)
-      pump(string) { |p,s| p.peek_size(s) }
+      split(string)&.sum { |part| part.to_s.size }
     end
 
     # @see Mustermann::Pattern#peek_match
     def peek_match(string)
-      post_match      = string
-      params         = {}
-      captures       = []
-      named_captures = {}
-
-      patterns.each do |pattern|
-        return unless part = pattern.peek_match(post_match)
-        params.merge!(part.params)
-        named_captures.merge!(part.named_captures)
-        captures.concat(part.captures)
-        post_match = post_match[part.to_s.size..-1]
-      end
-
-      matched = string[0, string.size - post_match.size]
-      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:)
+      build_match(string, split(string))
     end
 
     # @see Mustermann::Pattern#peek_params
     def peek_params(string)
-      pump(string, inject_with: :merge, with_size: true) { |p, s| p.peek_params(s) }
+      return unless parts = split(string)
+      params = parts.inject({}) { |hash, part| hash.merge!(part.params) }
+      [params, parts.sum { |part| part.to_s.size }]
     end
 
     # (see Mustermann::Pattern#expand)
@@ -116,22 +109,65 @@ module Mustermann
       patterns.all? { |p| p.respond_to?(method) }
     end
 
-    # used to generate results for various methods by scanning through an input string
+    # Finds a way to split +string+ among the patterns, so that every pattern
+    # matches its share. Patterns further to the left try their longest match
+    # first, backtracking to shorter matches as long as some split exists that
+    # lets all following patterns match, too. With +full+, only splits
+    # consuming the entire string are considered successful.
+    #
+    # Returns an Array of Mustermann::Match objects (one per pattern) for the
+    # winning split, or nil if no split exists. Only the captures of the
+    # winning split are returned, failed candidates are discarded.
     # @!visibility private
-    def pump(string, inject_with: :+, initial: nil, with_size: false)
-      substring = string
-      results   = Array(initial)
+    def split(string, full: false)
+      split_from(0, string, full, [])
+    end
 
-      patterns.each do |pattern|
-        result, size = yield(pattern, substring)
-        return unless result
-        results << result
-        size    ||= result
-        substring = substring[size..-1]
+    # @!visibility private
+    def split_from(index, string, full, parts)
+      return parts if index == patterns.length && (!full || string.empty?)
+
+      if pattern = patterns[index]
+        each_match_size(pattern, string) do |size|
+          next unless part = pattern.match(string[0, size])
+          parts.push(part)
+          return parts if split_from(index + 1, string[size..-1], full, parts)
+          parts.pop
+        end
       end
 
-      results = results.inject(inject_with)
-      with_size ? [results, string.size - substring.size] : results
+      nil
+    end
+
+    # Yields every length at which +pattern+ matches the beginning of
+    # +string+, from longest to shortest. Also yields 0 if the pattern
+    # matches the empty string, so empty matches terminate the enumeration
+    # instead of causing an endless loop.
+    # @!visibility private
+    def each_match_size(pattern, string)
+      string.size.downto(0) do |size|
+        yield size if pattern === string[0, size]
+      end
+    end
+
+    # builds a single Match object from the matches of a successful split
+    # @!visibility private
+    def build_match(string, parts)
+      return unless parts
+
+      params         = {}
+      captures       = []
+      named_captures = {}
+
+      parts.each do |part|
+        params.merge!(part.params)
+        named_captures.merge!(part.named_captures)
+        captures.concat(part.captures)
+      end
+
+      matched    = string[0, parts.sum { |part| part.to_s.size }]
+      post_match = string[matched.size..-1]
+      Match.new(self, string, matched:, params:, captures:, named_captures:, post_match:)
     end
 
     # generates one big AST from all patterns
@@ -142,6 +178,6 @@ module Mustermann
       AST::Node[:root].new(payload)
     end
 
-    private :combined_ast, :pump
+    private :combined_ast, :split, :split_from, :each_match_size, :build_match
   end
 end
