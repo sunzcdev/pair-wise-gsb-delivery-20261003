@@ -167,6 +167,33 @@ describe 'ViewCollection' do
     end
   end
 
+  describe '#compile_structure' do
+    it 'returns a frozen snapshot of fields and transformers for every view' do
+      structure = view_collection.compile_structure
+
+      expect(structure).to be_frozen
+      expect(structure[:fields]).to be_frozen
+      expect(structure[:transformers]).to be_frozen
+      expect(structure[:fields][:view]).to be_frozen
+      expect(structure[:fields][:view]).to eq([default_field, view_field])
+      expect(structure[:fields].keys).to match_array(%i[identifier default view])
+    end
+
+    it 'compiles against the current definitions even when the cache is stale or unbuilt' do
+      structure_before = view_collection.compile_structure
+
+      view_collection.fields_for(:view)
+      view.exclude_field(:view_field)
+      view_collection.invalidate_cache!
+
+      structure_after = view_collection.compile_structure
+
+      expect(structure_before[:fields][:view]).to include(view_field)
+      expect(structure_after[:fields][:view]).not_to include(view_field)
+      expect(structure_before[:fields][:view]).not_to equal(structure_after[:fields][:view])
+    end
+  end
+
   describe 'cache lifecycle' do
     it 'caches fields_for results across calls' do
       first_call = view_collection.fields_for(:view)

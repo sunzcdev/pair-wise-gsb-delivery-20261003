@@ -61,6 +61,18 @@ module Blueprinter
       @cache[:fields][view_name]
     end
 
+    # Compiles and returns a frozen snapshot of the current structure for _all_ views:
+    # `{ fields: { view_name => [Field] }, transformers: { view_name => [Transformer] } }`.
+    #
+    # Unlike the lazily compiled cache, this always compiles against the view definitions as they
+    # exist right now, so it can be used to pin a Blueprint's structure for the duration of a
+    # single render even when the cache is stale or unbuilt.
+    #
+    # @return [Hash]
+    def compile_structure
+      @cache_mutex.synchronize { build_structure }
+    end
+
     # Returns an array of Transformer objects for the provided View.
     # @param [String] view_name
     # @return [Array<Transformer>]
@@ -96,18 +108,20 @@ module Blueprinter
 
       @cache_mutex.synchronize do
         # Re-check after acquiring the lock; another thread may have built the cache first.
-        return if @cache
-
-        fields = {}
-        transformers = {}
-
-        views.each_key do |view_name|
-          fields[view_name] = build_fields_for(view_name).freeze
-          transformers[view_name] = build_transformers(view_name).freeze
-        end
-
-        @cache = { fields: fields.freeze, transformers: transformers.freeze }.freeze
+        @cache ||= build_structure
       end
+    end
+
+    def build_structure
+      fields = {}
+      transformers = {}
+
+      views.each_key do |view_name|
+        fields[view_name] = build_fields_for(view_name).freeze
+        transformers[view_name] = build_transformers(view_name).freeze
+      end
+
+      { fields: fields.freeze, transformers: transformers.freeze }.freeze
     end
 
     def build_fields_for(view_name)

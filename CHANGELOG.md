@@ -1,4 +1,5 @@
 ## Unreleased
+- 🚀 [FEATURE] Adds an optional render snapshot mode (`snapshot: true`) that pins each Blueprint's fields, exclusions, included views, and transformer order for the duration of a single top-level render, preventing a collection render from mixing field sets when a Blueprint is redefined mid-render. Snapshot state is thread-local, released on abnormal exits, and never freezes or copies the caller's objects.
 --
 
 ## 1.3.0 - 2026/04/14

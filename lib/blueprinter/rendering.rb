@@ -4,11 +4,14 @@ require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
 require 'blueprinter/deprecation'
+require 'blueprinter/render_snapshot'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
   module Rendering
     include TypeHelpers
+
+    RENDER_OPTION_KEYS = %i[view root meta snapshot].freeze
 
     # Generates a JSON formatted String represantation of the provided object.
     #
@@ -23,6 +26,10 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions (fields, exclusions, included views, transformers) of every
+    #   Blueprint used by this render to their state at first encounter, so a single render of a
+    #   collection never mixes field sets even when a Blueprint is redefined mid-render.
     #
     # @example Generating JSON with an extended view
     #   post = Post.all
@@ -48,6 +55,10 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions (fields, exclusions, included views, transformers) of every
+    #   Blueprint used by this render to their state at first encounter, so a single render of a
+    #   collection never mixes field sets even when a Blueprint is redefined mid-render.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -73,6 +84,10 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Boolean] :snapshot Defaults to false.
+    #   Pin the view definitions (fields, exclusions, included views, transformers) of every
+    #   Blueprint used by this render to their state at first encounter, so a single render of a
+    #   collection never mixes field sets even when a Blueprint is redefined mid-render.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -94,8 +109,13 @@ module Blueprinter
     def hashify(object, view_name:, local_options:)
       raise Errors::UnknownView, "View '#{view_name}' is not defined" unless view_collection.view?(view_name)
 
+      # Pin this Blueprint on first encounter within an active snapshot render: the root Blueprint
+      # is pinned when the render starts, and nested/dynamically selected Blueprints are pinned when
+      # first reached.
+      structure = RenderSnapshot.current&.pin(view_collection)
+
       object = Blueprinter.configuration.extensions.pre_render(object, self, view_name, local_options)
-      prepare_data(object, view_name, local_options)
+      prepare_data(object, view_name, local_options, structure)
     end
 
     # @deprecated This method is no longer supported, and was not originally intended to be public. This will be removed
@@ -122,7 +142,7 @@ module Blueprinter
 
     attr_reader :blueprint, :options
 
-    def prepare_data(object, view_name, local_options)
+    def prepare_data(object, view_name, local_options, structure = nil)
       # Since we're currently providing the current view in the local_options hash when we extract fields, we can merge
       # it in ahead of time to avoid allocating a new hash for every field extraction.
       local_options_with_view = local_options.merge(view: view_name)
@@ -132,22 +152,26 @@ module Blueprinter
           object_to_hash(
             obj,
             view_name:,
-            local_options: local_options_with_view
+            local_options: local_options_with_view,
+            structure:
           )
         end
       else
         object_to_hash(
           object,
           view_name:,
-          local_options: local_options_with_view
+          local_options: local_options_with_view,
+          structure:
         )
       end
     end
 
-    def object_to_hash(object, view_name:, local_options:)
+    def object_to_hash(object, view_name:, local_options:, structure: nil)
       result_hash = {}
 
-      view_collection.fields_for(view_name).each do |field|
+      fields = structure&.dig(:fields, view_name) || view_collection.fields_for(view_name)
+
+      fields.each do |field|
         next if field.skip?(field.name, object, local_options)
 
         value = field.extract(object, local_options)
@@ -156,7 +180,9 @@ module Blueprinter
         result_hash[field.name] = value
       end
 
-      view_collection.transformers(view_name).each do |transformer|
+      transformers = structure&.dig(:transformers, view_name) || view_collection.transformers(view_name)
+
+      transformers.each do |transformer|
         transformer.transform(result_hash, object, local_options)
       end
 
@@ -183,12 +209,28 @@ module Blueprinter
 
     def build_result(object:, options:)
       view_name = options[:view] || :default
+      local_options = options.except(*RENDER_OPTION_KEYS)
 
-      prepared_object = hashify(
-        object,
-        view_name:,
-        local_options: options.except(:view, :root, :meta)
-      )
+      prepared_object =
+        if options[:snapshot]
+          RenderSnapshot.wrap do |snapshot|
+            # Pin the root Blueprint at the start of the render, before any object is serialized.
+            snapshot.pin(view_collection)
+
+            hashify(
+              object,
+              view_name:,
+              local_options:
+            )
+          end
+        else
+          hashify(
+            object,
+            view_name:,
+            local_options:
+          )
+        end
+
       object_with_root = apply_root_key(
         object: prepared_object,
         root: options[:root]

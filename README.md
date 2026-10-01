@@ -297,6 +297,35 @@ _NOTE:_ For meta attributes, a [root](#root) is mandatory.
 </details>
 
 <details>
+<summary>Render Snapshots</summary>
+<a name="render-snapshots"></a>
+
+Blueprints are usually defined once and rendered many times, but nothing prevents a Blueprint's
+views from being redefined at runtime (for example, inside a field block or another thread). If a
+definition changes while a single render is working its way through a collection, objects rendered
+before and after the change can be serialized against different sets of fields.
+
+Pass `snapshot: true` to pin the view definitions for the duration of one top-level render:
+
+```ruby
+UserBlueprint.render_as_hash(users, snapshot: true)
+```
+
+The root Blueprint is pinned when the render starts, and every nested or dynamically selected
+Blueprint is pinned the first time the render encounters it. A pin captures the fields, field
+exclusions, included views, and transformer order in effect at that moment, so every object in the
+render uses one consistent version of each Blueprint. The pinned data is Blueprinter's compiled
+structure only; the objects being serialized are never frozen or copied.
+
+Definition changes made during a snapshot render do not affect that render, but remain visible to
+the next top-level render. Snapshot state is kept in thread-local storage, so concurrent renders
+never overwrite one another's version selections, and the state is released if the render exits with
+an exception. The option works with `render`, `render_as_hash`, and `render_as_json`, and defaults
+to off.
+
+</details>
+
+<details>
 <summary>Exclude Fields</summary>
 
 
