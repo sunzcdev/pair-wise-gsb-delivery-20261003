@@ -210,6 +210,10 @@ func (n *SequenceNode) String() string {
 	return strings.Join(nodes, "; ")
 }
 
+func (n *FunctionDeclNode) String() string {
+	return fmt.Sprintf("fn %s(%s) { %s }", n.Name, strings.Join(n.Params, ", "), n.Body.String())
+}
+
 func (n *ConditionalNode) String() string {
 	if !n.Ternary {
 		cond := n.Cond.String()

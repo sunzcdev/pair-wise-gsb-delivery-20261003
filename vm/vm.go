@@ -49,6 +49,16 @@ type VM struct {
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+	frames       []frame // Call frames of local functions
+	locals       []any   // Local variables (parameters and let variables) of local functions
+	callBudget   int     // Remaining budget of non-tail calls to local functions
+}
+
+// frame is a call frame of a local function declared inside an expression.
+type frame struct {
+	returnIP   int // Instruction pointer to continue at after OpReturn
+	stackBase  int // Length of the stack when the function was called
+	localsBase int // Offset of the function's local variables in vm.locals
 }
 
 func (vm *VM) Run(program *Program, env any) (_ any, err error) {
@@ -78,6 +88,17 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	if vm.Scopes != nil {
 		clearSlice(vm.Scopes)
 		vm.Scopes = vm.Scopes[0:0]
+	}
+	if vm.frames != nil {
+		vm.frames = vm.frames[0:0]
+	}
+	if vm.locals != nil {
+		clearSlice(vm.locals)
+		vm.locals = vm.locals[0:0]
+	}
+	vm.callBudget = program.CallBudget
+	if vm.callBudget <= 0 {
+		vm.callBudget = conf.DefaultCallBudget
 	}
 	vm.scopePoolIdx = 0 // Reset pool index for reuse
 	vm.currScope = nil
@@ -644,6 +665,73 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 				vm.currScope = vm.Scopes[len(vm.Scopes)-1]
 			} else {
 				vm.currScope = nil
+			}
+
+		case OpCallLocal:
+			fn := program.LocalFunctions[arg]
+			if vm.callBudget <= 0 {
+				panic(fmt.Sprintf("call budget exceeded while calling function %q", fn.Name))
+			}
+			vm.callBudget--
+			base := len(vm.Stack) - fn.Arity
+			if base < 0 {
+				panic("stack underflow")
+			}
+			vm.frames = append(vm.frames, frame{
+				returnIP:   vm.ip,
+				stackBase:  base,
+				localsBase: len(vm.locals),
+			})
+			vm.locals = append(vm.locals, vm.Stack[base:]...)
+			vm.Stack = vm.Stack[:base]
+			vm.ip = fn.Entry
+
+		case OpTailCallLocal:
+			fn := program.LocalFunctions[arg]
+			if len(vm.frames) == 0 {
+				panic("tail call outside of a function")
+			}
+			f := vm.frames[len(vm.frames)-1]
+			base := len(vm.Stack) - fn.Arity
+			if base < f.stackBase {
+				panic("stack underflow")
+			}
+			vm.locals = append(vm.locals[:f.localsBase], vm.Stack[base:]...)
+			vm.Stack = vm.Stack[:f.stackBase]
+			vm.ip = fn.Entry
+
+		case OpReturn:
+			if len(vm.frames) == 0 {
+				panic("return outside of a function")
+			}
+			out := vm.pop()
+			f := vm.frames[len(vm.frames)-1]
+			vm.frames = vm.frames[:len(vm.frames)-1]
+			vm.Stack = vm.Stack[:f.stackBase]
+			vm.locals = vm.locals[:f.localsBase]
+			vm.push(out)
+			vm.ip = f.returnIP
+
+		case OpStoreLocal:
+			if len(vm.frames) == 0 {
+				panic("local variable outside of a function")
+			}
+			index := vm.frames[len(vm.frames)-1].localsBase + arg
+			value := vm.pop()
+			for len(vm.locals) <= index {
+				vm.locals = append(vm.locals, nil)
+			}
+			vm.locals[index] = value
+
+		case OpLoadLocal:
+			if len(vm.frames) == 0 {
+				panic("local variable outside of a function")
+			}
+			index := vm.frames[len(vm.frames)-1].localsBase + arg
+			if index >= len(vm.locals) {
+				vm.push(nil)
+			} else {
+				vm.push(vm.locals[index])
 			}
 
 		default:

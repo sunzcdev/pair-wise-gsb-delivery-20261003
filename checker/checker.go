@@ -54,8 +54,16 @@ type Checker struct {
 	config          *conf.Config
 	predicateScopes []predicateScope
 	varScopes       []varScope
+	fnScopes        [][]localFn
 	err             *file.Error
 	needsReset      bool
+}
+
+// localFn describes a function declared inside an expression via fn.
+type localFn struct {
+	name  string
+	arity int
+	decl  *ast.FunctionDeclNode
 }
 
 type predicateScope struct {
@@ -161,8 +169,10 @@ func (v *Checker) reset(config *conf.Config) {
 	if v.needsReset {
 		clearSlice(v.predicateScopes)
 		clearSlice(v.varScopes)
+		clearSlice(v.fnScopes)
 		v.predicateScopes = v.predicateScopes[:0]
 		v.varScopes = v.varScopes[:0]
+		v.fnScopes = v.fnScopes[:0]
 		v.err = nil
 	}
 	v.needsReset = true
@@ -221,6 +231,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.variableDeclaratorNode(n)
 	case *ast.SequenceNode:
 		nt = v.sequenceNode(n)
+	case *ast.FunctionDeclNode:
+		nt = v.functionDeclNode(n)
 	case *ast.ConditionalNode:
 		nt = v.conditionalNode(n)
 	case *ast.ArrayNode:
@@ -254,6 +266,10 @@ func (v *Checker) identifierNode(node *ast.IdentifierNode) Nature {
 	}
 	if node.Value == "$env" {
 		return Nature{}
+	}
+
+	if _, ok := v.lookupLocalFn(node.Value); ok {
+		return v.error(node, "cannot use function %v as a value", node.Value)
 	}
 
 	return v.ident(node, node.Value, v.config.Strict, true)
@@ -645,6 +661,19 @@ func (v *Checker) sliceNode(node *ast.SliceNode) Nature {
 }
 
 func (v *Checker) callNode(node *ast.CallNode) Nature {
+	// A call to a function declared inside the expression.
+	if ident, ok := node.Callee.(*ast.IdentifierNode); ok {
+		if fn, ok := v.localFnForCall(ident.Value); ok {
+			if len(node.Arguments) != fn.arity {
+				return v.error(node, "invalid number of arguments (expected %d, got %d)", fn.arity, len(node.Arguments))
+			}
+			for _, arg := range node.Arguments {
+				v.visit(arg)
+			}
+			return Nature{}
+		}
+	}
+
 	// Check if type was set on node (for example, by patcher)
 	// and use node type instead of function return type.
 	//
@@ -1282,11 +1311,100 @@ func (v *Checker) sequenceNode(node *ast.SequenceNode) Nature {
 	if len(node.Nodes) == 0 {
 		return v.error(node, "empty sequence expression")
 	}
+	var group []localFn
+	for _, child := range node.Nodes {
+		if decl, ok := child.(*ast.FunctionDeclNode); ok {
+			v.checkLocalFnDecl(decl, group)
+			group = append(group, localFn{decl.Name, len(decl.Params), decl})
+		}
+	}
+	if group != nil {
+		v.fnScopes = append(v.fnScopes, group)
+		defer func() {
+			v.fnScopes = v.fnScopes[:len(v.fnScopes)-1]
+		}()
+	}
 	var last Nature
 	for _, node := range node.Nodes {
 		last = v.visit(node)
 	}
 	return last
+}
+
+// checkLocalFnDecl validates a function declaration against already registered
+// names: environment members, host functions, builtins and sibling declarations.
+func (v *Checker) checkLocalFnDecl(decl *ast.FunctionDeclNode, group []localFn) {
+	if _, ok := v.config.Env.Get(&v.config.NtCache, decl.Name); ok {
+		v.error(decl, "cannot redeclare %v", decl.Name)
+	}
+	if _, ok := v.config.Functions[decl.Name]; ok {
+		v.error(decl, "cannot redeclare function %v", decl.Name)
+	}
+	if _, ok := v.config.Builtins[decl.Name]; ok {
+		v.error(decl, "cannot redeclare builtin %v", decl.Name)
+	}
+	for _, fn := range group {
+		if fn.name == decl.Name {
+			v.error(decl, "cannot redeclare function %v", decl.Name)
+		}
+	}
+	seen := make(map[string]struct{}, len(decl.Params))
+	for _, param := range decl.Params {
+		if _, ok := seen[param]; ok {
+			v.error(decl, "duplicate parameter %v", param)
+		}
+		seen[param] = struct{}{}
+	}
+}
+
+func (v *Checker) functionDeclNode(node *ast.FunctionDeclNode) Nature {
+	// Declarations which are direct children of a sequence are already
+	// registered by sequenceNode. Otherwise, register the declaration
+	// in its own scope, so the body can reference the function itself.
+	registered := false
+	if len(v.fnScopes) > 0 {
+		for _, fn := range v.fnScopes[len(v.fnScopes)-1] {
+			if fn.decl == node {
+				registered = true
+				break
+			}
+		}
+	}
+	if !registered {
+		v.checkLocalFnDecl(node, nil)
+		v.fnScopes = append(v.fnScopes, []localFn{{node.Name, len(node.Params), node}})
+		defer func() {
+			v.fnScopes = v.fnScopes[:len(v.fnScopes)-1]
+		}()
+	}
+	for _, param := range node.Params {
+		v.varScopes = append(v.varScopes, varScope{param, Nature{}})
+	}
+	v.visit(node.Body)
+	v.varScopes = v.varScopes[:len(v.varScopes)-len(node.Params)]
+	return v.config.NtCache.NatureOf(nil)
+}
+
+func (v *Checker) lookupLocalFn(name string) (localFn, bool) {
+	for i := len(v.fnScopes) - 1; i >= 0; i-- {
+		for _, fn := range v.fnScopes[i] {
+			if fn.name == name {
+				return fn, true
+			}
+		}
+	}
+	return localFn{}, false
+}
+
+// localFnForCall returns the local function with the given name, unless the
+// name is shadowed by a variable (variables take precedence over functions).
+func (v *Checker) localFnForCall(name string) (localFn, bool) {
+	for i := len(v.varScopes) - 1; i >= 0; i-- {
+		if v.varScopes[i].name == name {
+			return localFn{}, false
+		}
+	}
+	return v.lookupLocalFn(name)
 }
 
 func (v *Checker) conditionalNode(node *ast.ConditionalNode) Nature {

@@ -78,6 +78,19 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 		c.debugInfo,
 		span,
 	)
+	if config != nil {
+		program.CallBudget = config.CallBudget
+	}
+	if len(c.localFns) > 0 {
+		program.LocalFunctions = make([]LocalFunction, len(c.localFns))
+		for i, fn := range c.localFns {
+			program.LocalFunctions[i] = LocalFunction{
+				Name:  fn.name,
+				Arity: fn.arity,
+				Entry: fn.entry,
+			}
+		}
+	}
 	return
 }
 
@@ -97,11 +110,24 @@ type compiler struct {
 	spans          []*Span
 	chains         [][]int
 	arguments      []int
+	localFns       []localFunction
+	fnScopes       []map[string]int
+	inFunction     bool
+	fnLocals       int
+	tail           bool
+}
+
+// localFunction describes a function declared inside an expression.
+type localFunction struct {
+	name  string
+	arity int
+	entry int
 }
 
 type scope struct {
 	variableName string
 	index        int
+	local        bool
 }
 
 func (c *compiler) nodeParent() ast.Node {
@@ -214,6 +240,9 @@ func (c *compiler) calcBackwardJump(to int) int {
 }
 
 func (c *compiler) compile(node ast.Node) {
+	tail := c.tail
+	c.tail = false
+
 	c.nodes = append(c.nodes, node)
 	defer func() {
 		c.nodes = c.nodes[:len(c.nodes)-1]
@@ -269,7 +298,7 @@ func (c *compiler) compile(node ast.Node) {
 	case *ast.SliceNode:
 		c.SliceNode(n)
 	case *ast.CallNode:
-		c.CallNode(n)
+		c.CallNode(n, tail)
 	case *ast.BuiltinNode:
 		c.BuiltinNode(n)
 	case *ast.PredicateNode:
@@ -277,11 +306,13 @@ func (c *compiler) compile(node ast.Node) {
 	case *ast.PointerNode:
 		c.PointerNode(n)
 	case *ast.VariableDeclaratorNode:
-		c.VariableDeclaratorNode(n)
+		c.VariableDeclaratorNode(n, tail)
 	case *ast.SequenceNode:
-		c.SequenceNode(n)
+		c.SequenceNode(n, tail)
+	case *ast.FunctionDeclNode:
+		c.FunctionDeclNode(n)
 	case *ast.ConditionalNode:
-		c.ConditionalNode(n)
+		c.ConditionalNode(n, tail)
 	case *ast.ArrayNode:
 		c.ArrayNode(n)
 	case *ast.MapNode:
@@ -298,8 +329,12 @@ func (c *compiler) NilNode(_ *ast.NilNode) {
 }
 
 func (c *compiler) IdentifierNode(node *ast.IdentifierNode) {
-	if index, ok := c.lookupVariable(node.Value); ok {
-		c.emit(OpLoadVar, index)
+	if index, local, ok := c.lookupVariable(node.Value); ok {
+		if local {
+			c.emit(OpLoadLocal, index)
+		} else {
+			c.emit(OpLoadVar, index)
+		}
 		return
 	}
 	if node.Value == "$env" {
@@ -775,7 +810,27 @@ func (c *compiler) SliceNode(node *ast.SliceNode) {
 	c.emit(OpSlice)
 }
 
-func (c *compiler) CallNode(node *ast.CallNode) {
+func (c *compiler) CallNode(node *ast.CallNode, tail bool) {
+	if ident, ok := node.Callee.(*ast.IdentifierNode); ok {
+		if _, _, isVar := c.lookupVariable(ident.Value); !isVar {
+			if index, ok := c.lookupLocalFn(ident.Value); ok {
+				fn := c.localFns[index]
+				if len(node.Arguments) != fn.arity {
+					panic(fmt.Sprintf("invalid number of arguments (expected %d, got %d)", fn.arity, len(node.Arguments)))
+				}
+				for _, arg := range node.Arguments {
+					c.compile(arg)
+				}
+				if tail && c.inFunction {
+					c.emit(OpTailCallLocal, index)
+				} else {
+					c.emit(OpCallLocal, index)
+				}
+				return
+			}
+		}
+	}
+
 	fn := node.Callee.Type()
 	if fn.Kind() == reflect.Func {
 		fnInOffset := 0
@@ -1240,52 +1295,143 @@ func (c *compiler) PointerNode(node *ast.PointerNode) {
 	}
 }
 
-func (c *compiler) VariableDeclaratorNode(node *ast.VariableDeclaratorNode) {
+func (c *compiler) VariableDeclaratorNode(node *ast.VariableDeclaratorNode, tail bool) {
 	c.compile(node.Value)
+	if c.inFunction {
+		index := c.fnLocals
+		c.fnLocals++
+		c.emit(OpStoreLocal, index)
+		c.beginScope(node.Name, index, true)
+		c.tail = tail
+		c.compile(node.Expr)
+		c.endScope()
+		return
+	}
 	index := c.addVariable(node.Name)
 	c.emit(OpStore, index)
-	c.beginScope(node.Name, index)
+	c.beginScope(node.Name, index, false)
+	c.tail = tail
 	c.compile(node.Expr)
 	c.endScope()
 }
 
-func (c *compiler) SequenceNode(node *ast.SequenceNode) {
+func (c *compiler) SequenceNode(node *ast.SequenceNode, tail bool) {
+	var group map[string]int
+	for _, child := range node.Nodes {
+		if decl, ok := child.(*ast.FunctionDeclNode); ok {
+			if group == nil {
+				group = make(map[string]int)
+			}
+			if _, ok := group[decl.Name]; ok {
+				panic(fmt.Sprintf("cannot redeclare function %v", decl.Name))
+			}
+			group[decl.Name] = c.addLocalFunction(decl)
+		}
+	}
+	if group != nil {
+		c.fnScopes = append(c.fnScopes, group)
+		defer func() {
+			c.fnScopes = c.fnScopes[:len(c.fnScopes)-1]
+		}()
+	}
 	for i, n := range node.Nodes {
+		if i == len(node.Nodes)-1 {
+			c.tail = tail
+		}
 		c.compile(n)
+		if _, decl := n.(*ast.FunctionDeclNode); decl {
+			// Function declarations emit no value; nothing to pop.
+			continue
+		}
 		if i < len(node.Nodes)-1 {
 			c.emit(OpPop)
 		}
 	}
 }
 
-func (c *compiler) beginScope(name string, index int) {
-	c.scopes = append(c.scopes, scope{name, index})
+func (c *compiler) FunctionDeclNode(node *ast.FunctionDeclNode) {
+	index, ok := c.lookupLocalFn(node.Name)
+	if !ok {
+		// Declaration outside of a sequence: register it in its own scope,
+		// so the body can reference the function itself.
+		scope := map[string]int{node.Name: c.addLocalFunction(node)}
+		c.fnScopes = append(c.fnScopes, scope)
+		index = scope[node.Name]
+		defer func() {
+			c.fnScopes = c.fnScopes[:len(c.fnScopes)-1]
+		}()
+	}
+
+	jump := c.emit(OpJump, placeholder)
+	c.localFns[index].entry = len(c.bytecode)
+
+	prevInFunction := c.inFunction
+	prevFnLocals := c.fnLocals
+	prevScopes := len(c.scopes)
+	c.inFunction = true
+	c.fnLocals = 0
+	for _, param := range node.Params {
+		c.beginScope(param, c.fnLocals, true)
+		c.fnLocals++
+	}
+	c.tail = true
+	c.compile(node.Body)
+	c.emit(OpReturn)
+	c.inFunction = prevInFunction
+	c.fnLocals = prevFnLocals
+	c.scopes = c.scopes[:prevScopes]
+
+	c.patchJump(jump)
+}
+
+func (c *compiler) addLocalFunction(node *ast.FunctionDeclNode) int {
+	index := len(c.localFns)
+	c.localFns = append(c.localFns, localFunction{
+		name:  node.Name,
+		arity: len(node.Params),
+	})
+	return index
+}
+
+func (c *compiler) lookupLocalFn(name string) (int, bool) {
+	for i := len(c.fnScopes) - 1; i >= 0; i-- {
+		if index, ok := c.fnScopes[i][name]; ok {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+func (c *compiler) beginScope(name string, index int, local bool) {
+	c.scopes = append(c.scopes, scope{name, index, local})
 }
 
 func (c *compiler) endScope() {
 	c.scopes = c.scopes[:len(c.scopes)-1]
 }
 
-func (c *compiler) lookupVariable(name string) (int, bool) {
+func (c *compiler) lookupVariable(name string) (int, bool, bool) {
 	for i := len(c.scopes) - 1; i >= 0; i-- {
 		if c.scopes[i].variableName == name {
-			return c.scopes[i].index, true
+			return c.scopes[i].index, c.scopes[i].local, true
 		}
 	}
-	return 0, false
+	return 0, false, false
 }
 
-func (c *compiler) ConditionalNode(node *ast.ConditionalNode) {
+func (c *compiler) ConditionalNode(node *ast.ConditionalNode, tail bool) {
 	c.compile(node.Cond)
 	c.derefInNeeded(node.Cond)
 	otherwise := c.emit(OpJumpIfFalse, placeholder)
 
 	c.emit(OpPop)
+	c.tail = tail
 	c.compile(node.Exp1)
 	end := c.emit(OpJump, placeholder)
 
 	c.patchJump(otherwise)
 	c.emit(OpPop)
+	c.tail = tail
 	c.compile(node.Exp2)
 
 	c.patchJump(end)

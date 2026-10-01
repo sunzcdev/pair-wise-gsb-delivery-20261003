@@ -225,6 +225,15 @@ func MaxNodes(n uint) Option {
 	}
 }
 
+// CallBudget sets the maximum number of non-tail calls to functions declared
+// inside the expression via fn. By default, the budget is conf.DefaultCallBudget.
+// Tail calls are optimized and are not limited by the budget.
+func CallBudget(n int) Option {
+	return func(c *conf.Config) {
+		c.CallBudget = n
+	}
+}
+
 // Compile parses and compiles given input expression to bytecode program.
 func Compile(input string, ops ...Option) (*vm.Program, error) {
 	config := conf.CreateNew()

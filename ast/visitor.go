@@ -56,6 +56,8 @@ func Walk(node *Node, v Visitor) {
 		for i := range n.Nodes {
 			Walk(&n.Nodes[i], v)
 		}
+	case *FunctionDeclNode:
+		Walk(&n.Body, v)
 	case *ConditionalNode:
 		Walk(&n.Cond, v)
 		Walk(&n.Exp1, v)

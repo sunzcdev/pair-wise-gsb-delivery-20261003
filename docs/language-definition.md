@@ -312,6 +312,39 @@ The `$env` can be used to check if a variable is defined:
 'foo' in $env
 ```
 
+## Functions
+
+Named functions can be declared inside an expression with the `fn` keyword. A function declaration consists of
+a name, a list of parameters and a body in braces. Declarations are only allowed at the top level of an expression
+and must be followed by the expression itself.
+
+```expr
+fn add(a, b) { a + b }; add(1, 2)
+```
+
+Functions are lexically scoped: parameters and variables declared with `let` inside a body shadow outer names.
+Functions can call themselves and each other, so recursion and mutual recursion are supported. All functions
+declared in the same sequence are visible to each other, regardless of the declaration order.
+
+```expr
+fn even(n) { n == 0 ? true : odd(n - 1) };
+fn odd(n) { n == 0 ? false : even(n - 1) };
+even(10)
+```
+
+A function declared with `fn` cannot redefine an environment member, a host function or a builtin.
+
+Calls in tail position (the last expression of a body, or the last expression of a branch of a conditional
+in tail position) are optimized and do not grow the call stack, so tail recursion can handle very deep inputs.
+
+```expr
+fn loop(n, acc) { n == 0 ? acc : loop(n - 1, acc + n) }; loop(1000000, 0)
+```
+
+Non-tail calls are limited by a call budget (`conf.DefaultCallBudget`, configurable via `expr.CallBudget`).
+When the budget is exhausted, the evaluation stops with an error pointing to the call location, so a runaway
+recursion cannot exhaust the stack of the Go service.
+
 ## Predicate
 
 The predicate is an expression. Predicates can be used in functions like `filter`, `all`, `any`, `one`, `none`, etc.

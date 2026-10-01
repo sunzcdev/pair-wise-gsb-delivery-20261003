@@ -55,6 +55,7 @@ type Parser struct {
 	config           *conf.Config
 	depth            int  // predicate call depth
 	nodeCount        uint // tracks number of AST nodes created
+	fnAllowed        bool // allow fn declarations in the current sequence
 }
 
 func (p *Parser) Parse(input string, config *conf.Config) (*Tree, error) {
@@ -73,6 +74,7 @@ func (p *Parser) Parse(input string, config *conf.Config) (*Tree, error) {
 	source := file.NewSource(input)
 	p.lexer.Reset(source)
 	p.next()
+	p.fnAllowed = true
 	node := p.parseSequenceExpression()
 
 	if !p.current.Is(EOF) {
@@ -197,7 +199,7 @@ func (p *Parser) expect(kind Kind, values ...string) {
 // parse functions
 
 func (p *Parser) parseSequenceExpression() Node {
-	nodes := []Node{p.parseExpression(0)}
+	nodes := []Node{p.parseStatement()}
 
 	for p.current.Is(Operator, ";") && p.err == nil {
 		p.next()
@@ -205,7 +207,7 @@ func (p *Parser) parseSequenceExpression() Node {
 		if p.current.Is(EOF) {
 			break
 		}
-		nodes = append(nodes, p.parseExpression(0))
+		nodes = append(nodes, p.parseStatement())
 	}
 
 	if len(nodes) == 1 {
@@ -215,6 +217,64 @@ func (p *Parser) parseSequenceExpression() Node {
 	return p.createNode(&SequenceNode{
 		Nodes: nodes,
 	}, nodes[0].Location())
+}
+
+func (p *Parser) parseStatement() Node {
+	if p.current.Is(Identifier, "fn") {
+		// A function declaration is `fn name(params) { body }`. The `fn`
+		// keyword is contextual: unless an identifier follows, `fn` is
+		// treated as a regular identifier (e.g. an environment function).
+		fnToken := p.current
+		p.next()
+		if p.current.Is(Identifier) {
+			if !p.fnAllowed {
+				p.error("function declarations are only allowed at the top level of an expression")
+				return nil
+			}
+			return p.parseFunctionDeclaration()
+		}
+		p.hasStash = true
+		p.stashed = p.current
+		p.current = fnToken
+	}
+	return p.parseExpression(0)
+}
+
+func (p *Parser) parseFunctionDeclaration() Node {
+	name := p.current
+	p.expect(Identifier)
+	p.expect(Bracket, "(")
+	params := make([]string, 0)
+	for !p.current.Is(Bracket, ")") && p.err == nil {
+		if len(params) > 0 {
+			p.expect(Operator, ",")
+			if p.current.Is(Bracket, ")") {
+				break
+			}
+		}
+		param := p.current
+		p.expect(Identifier)
+		params = append(params, param.Value)
+	}
+	p.expect(Bracket, ")")
+	p.expect(Bracket, "{")
+	var body Node
+	p.withoutFnDecls(func() {
+		body = p.parseSequenceExpression()
+	})
+	p.expect(Bracket, "}")
+	return p.createNode(&FunctionDeclNode{
+		Name:   name.Value,
+		Params: params,
+		Body:   body,
+	}, name.Location)
+}
+
+func (p *Parser) withoutFnDecls(parse func()) {
+	fnAllowed := p.fnAllowed
+	p.fnAllowed = false
+	parse()
+	p.fnAllowed = fnAllowed
 }
 
 func (p *Parser) parseExpression(precedence int) Node {
@@ -342,7 +402,10 @@ func (p *Parser) parseConditionalIf() Node {
 	}
 	nodeCondition := p.parseExpression(0)
 	p.expect(Bracket, "{")
-	expr1 := p.parseSequenceExpression()
+	var expr1 Node
+	p.withoutFnDecls(func() {
+		expr1 = p.parseSequenceExpression()
+	})
 	p.expect(Bracket, "}")
 	p.expect(Operator, "else")
 
@@ -351,7 +414,9 @@ func (p *Parser) parseConditionalIf() Node {
 		expr2 = p.parseConditionalIf()
 	} else {
 		p.expect(Bracket, "{")
-		expr2 = p.parseSequenceExpression()
+		p.withoutFnDecls(func() {
+			expr2 = p.parseSequenceExpression()
+		})
 		p.expect(Bracket, "}")
 	}
 
@@ -411,7 +476,10 @@ func (p *Parser) parsePrimary() Node {
 
 	if token.Is(Bracket, "(") {
 		p.next()
-		expr := p.parseSequenceExpression()
+		var expr Node
+		p.withoutFnDecls(func() {
+			expr = p.parseSequenceExpression()
+		})
 		p.expect(Bracket, ")") // "an opened parenthesis is not properly closed"
 		return p.parsePostfixExpression(expr)
 	}
@@ -676,7 +744,9 @@ func (p *Parser) parsePredicate() Node {
 	p.depth++
 	var node Node
 	if withBrackets {
-		node = p.parseSequenceExpression()
+		p.withoutFnDecls(func() {
+			node = p.parseSequenceExpression()
+		})
 	} else {
 		node = p.parseExpression(0)
 		if p.current.Is(Operator, ";") {

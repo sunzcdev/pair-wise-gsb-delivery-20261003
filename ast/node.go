@@ -231,6 +231,17 @@ type SequenceNode struct {
 	Nodes []Node
 }
 
+// FunctionDeclNode represents a named function declaration.
+// Functions are declared at the top level of an expression and are visible
+// to all statements of the enclosing sequence, including bodies of sibling
+// functions (this allows recursion and mutual recursion).
+type FunctionDeclNode struct {
+	base
+	Name   string   // Name of the function. Like "foo" in "fn foo(x) { x }".
+	Params []string // Names of the parameters. Like ["x"] in "fn foo(x) { x }".
+	Body   Node     // Body of the function.
+}
+
 // ArrayNode represents an array.
 type ArrayNode struct {
 	base

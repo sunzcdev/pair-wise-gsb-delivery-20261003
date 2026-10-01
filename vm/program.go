@@ -21,6 +21,13 @@ type Program struct {
 	Arguments []int
 	Constants []any
 
+	// LocalFunctions contains functions declared inside the expression via fn.
+	LocalFunctions []LocalFunction
+
+	// CallBudget is the maximum number of non-tail calls to local functions.
+	// If zero, conf.DefaultCallBudget is used. Tail calls are not limited.
+	CallBudget int
+
 	source    file.Source
 	node      ast.Node
 	locations []file.Location
@@ -28,6 +35,13 @@ type Program struct {
 	functions []Function
 	debugInfo map[string]string
 	span      *Span
+}
+
+// LocalFunction describes a function declared inside an expression via fn.
+type LocalFunction struct {
+	Name  string // Name of the function.
+	Arity int    // Number of parameters.
+	Entry int    // Entry point (instruction pointer) of the function body.
 }
 
 // NewProgram returns a new Program. It's used by the compiler.
@@ -128,6 +142,13 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 		}
 		builtinArg := func(label string) {
 			_, _ = fmt.Fprintf(w, "%v\t%v\t<%v>\t%v\n", pp, label, arg, builtin.Builtins[arg].Name)
+		}
+		localFn := func(label string) {
+			var name any = "out of range"
+			if arg < len(program.LocalFunctions) {
+				name = program.LocalFunctions[arg].Name
+			}
+			_, _ = fmt.Fprintf(w, "%v\t%v\t<%v>\t%v\n", pp, label, arg, name)
 		}
 
 		switch op {
@@ -383,6 +404,21 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 
 		case OpEnd:
 			code("OpEnd")
+
+		case OpCallLocal:
+			localFn("OpCallLocal")
+
+		case OpTailCallLocal:
+			localFn("OpTailCallLocal")
+
+		case OpReturn:
+			code("OpReturn")
+
+		case OpStoreLocal:
+			argument("OpStoreLocal")
+
+		case OpLoadLocal:
+			argument("OpLoadLocal")
 
 		default:
 			_, _ = fmt.Fprintf(w, "%v\t%#x (unknown)\n", ip, op)

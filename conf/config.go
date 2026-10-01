@@ -16,6 +16,11 @@ var (
 
 	// DefaultMaxNodes represents default maximum allowed AST nodes by the compiler.
 	DefaultMaxNodes uint = 1e4
+
+	// DefaultCallBudget represents default maximum allowed number of non-tail
+	// calls to functions declared inside an expression via fn. Tail calls
+	// are not limited by the budget.
+	DefaultCallBudget = 10000
 )
 
 type FunctionsTable map[string]*builtin.Function
@@ -36,6 +41,10 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	// CallBudget is the maximum number of non-tail calls to functions
+	// declared inside an expression via fn. If zero, DefaultCallBudget
+	// is used. Tail calls are not limited by the budget.
+	CallBudget int
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
