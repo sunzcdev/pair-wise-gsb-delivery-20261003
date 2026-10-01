@@ -530,7 +530,11 @@ func (d *Decoder) Skip() error {
 	if err != nil {
 		return err
 	}
+	return d.skipValue(c)
+}
 
+// skipValue skips a value whose code has already been read.
+func (d *Decoder) skipValue(c byte) error {
 	if msgpcode.IsFixedNum(c) {
 		return nil
 	}
