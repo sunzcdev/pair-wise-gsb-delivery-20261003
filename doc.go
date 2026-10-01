@@ -133,6 +133,21 @@
 // The Close and WriteControl methods can be called concurrently with all other
 // methods.
 //
+// Interruptible reads
+//
+// NextReaderContext and ReadMessageContext behave like NextReader and
+// ReadMessage but take a context. Canceling the context before the start of a
+// message only interrupts the wait and leaves the connection positioned at the
+// next frame. Canceling while a message is being delivered ends that delivery;
+// the library then skips the remainder of the message in the background,
+// honoring interleaved ping, pong and close frames, within the byte and time
+// budgets configured with SetReadCancelBudget. The skipped message is never
+// delivered and the following read returns the next message. If the remainder
+// cannot be skipped within the budget, the connection is closed and the next
+// read returns a *DrainError explaining the cause; the connection must not be
+// used after that. As with the other read methods, at most one goroutine may
+// read at a time.
+//
 // Origin Considerations
 //
 // Web browsers allow Javascript applications to open a WebSocket connection to
