@@ -3,6 +3,7 @@ require "multi_json/version"
 require "multi_json/adapter_error"
 require "multi_json/parse_error"
 require "multi_json/options_cache"
+require "multi_json/path_selector"
 
 module MultiJson
   include Options
@@ -108,6 +109,31 @@ module MultiJson
     end
   end
   alias_method :decode, :load
+
+  # Selectively loads values at the given structural paths from a JSON
+  # document read from +io+.
+  #
+  # +paths+ is an Array of paths, where each path is an Array of String
+  # object keys and non-negative Integer array indexes. Several (possibly
+  # overlapping) paths can be selected in a single pass.
+  #
+  # The document is streamed from +io+ in chunks: unselected portions are
+  # validated but never turned into Ruby objects, and the input is never
+  # buffered in full. The entire document is validated, so syntax errors
+  # are reported even when they appear after every selected value.
+  #
+  # <b>Options</b>
+  #
+  # <tt>:adapter</tt> :: Required. The explicitly chosen existing adapter
+  #                      used to decode each selected value.
+  # <tt>:chunk_size</tt> :: How many bytes to read from +io+ at a time.
+  #
+  # Returns a MultiJson::PathSelector::Result. Paths that matched a JSON
+  # null appear in Result#values with a nil value; paths that never
+  # matched are listed separately in Result#missing.
+  def load_paths(io, paths, options = {})
+    PathSelector.load(io, paths, options)
+  end
 
   def current_adapter(options = {})
     if (new_adapter = options[:adapter])

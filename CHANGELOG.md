@@ -1,3 +1,9 @@
+Unreleased
+----------
+
+* Add `MultiJson.load_paths` / `MultiJson::PathSelector` for streaming, path-selective loading from a chunked IO
+* Fix `MultiJson::OptionsCache` raising `NoMethodError` when an adapter is used before any adapter was activated
+
 1.15.0
 ------
 
