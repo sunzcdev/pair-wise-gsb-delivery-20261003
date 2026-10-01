@@ -49,6 +49,89 @@ module Concurrent
     include Concern::Obligation
     include Concern::Observable
 
+    # A handle representing a single subscription created by {IVar#observe}.
+    #
+    # The handle can be used to cancel the delivery of the notification as
+    # long as the notification has not started yet. {#cancel} makes the
+    # outcome of the race explicit: it returns `true` when the cancellation
+    # won the race against the callback (the callback is guaranteed to never
+    # run) and `false` when the callback had already started, had already
+    # completed, or the subscription had already been cancelled.
+    #
+    # A subscription holds its observer only until it is cancelled or
+    # delivered; afterwards the `IVar` no longer references it.
+    class Subscription
+
+      # @!visibility private
+      def initialize(ivar, observer, func)
+        @ivar     = ivar
+        @observer = observer
+        @func     = func
+        @lock     = Mutex.new
+        @state    = :pending # one of :pending, :delivering, :delivered, :cancelled
+      end
+
+      # Attempt to cancel the subscription.
+      #
+      # When `true` is returned the cancellation happened before the
+      # notification callback started, so the callback is guaranteed to never
+      # be invoked and the subscription is removed from the `IVar` (it is no
+      # longer strongly referenced by the observer set). When `false` is
+      # returned the notification had already started (or finished), or the
+      # subscription had already been cancelled.
+      #
+      # @return [Boolean] true if cancelled before the notification started
+      def cancel
+        @lock.synchronize do
+          return false unless @state == :pending
+          @state = :cancelled
+        end
+        @ivar.send(:remove_subscription, self)
+        true
+      end
+
+      # @return [Boolean] true if the subscription was cancelled before delivery
+      def cancelled?
+        @lock.synchronize { @state == :cancelled }
+      end
+
+      # @return [Boolean] true if the notification callback has run to completion
+      def delivered?
+        @lock.synchronize { @state == :delivered }
+      end
+
+      # @return [Boolean] true if the notification has neither started nor been cancelled
+      def pending?
+        @lock.synchronize { @state == :pending }
+      end
+
+      # @!visibility private
+      #
+      # Atomically transitions from :pending to :delivering. Returns true when
+      # this call won the race against a concurrent #cancel, false otherwise.
+      def begin_delivery
+        @lock.synchronize do
+          if @state == :pending
+            @state = :delivering
+            true
+          else
+            false
+          end
+        end
+      end
+
+      # @!visibility private
+      def finish_delivery
+        @lock.synchronize { @state = :delivered }
+        nil
+      end
+
+      # @!visibility private
+      def deliver(time, value, reason)
+        @observer.send(@func, time, value, reason)
+      end
+    end
+
     # Create a new `IVar` in the `:pending` state with the (optional) initial value.
     #
     # @param [Object] value the initial value
@@ -97,6 +180,46 @@ module Concurrent
 
       observer.send(func, Time.now, self.value, reason) if direct_notification
       observer
+    end
+
+    # Add an observer on this object and return a {Subscription} handle that
+    # can be used to cancel the notification before it starts.
+    #
+    # Behaves like {#add_observer} with respect to the notification itself:
+    # the observer is called with the completion `Time`, the final `value`
+    # (or `nil` on rejection) and the final `reason` (or `nil` on
+    # fulfillment). When the `IVar` is already complete the observer is
+    # notified immediately, before this method returns, and the returned
+    # subscription is already delivered.
+    #
+    # Callbacks are never run while holding the internal lock, and an
+    # exception raised by one callback does not prevent the remaining
+    # observers from being notified.
+    #
+    # @param [Object] observer the object that will be notified of changes
+    # @param [Symbol] func symbol naming the method to call on notification
+    # @return [Subscription] a handle that can cancel the pending notification
+    def observe(observer = nil, func = :update, &block)
+      raise ArgumentError.new('cannot provide both an observer and a block') if observer && block
+
+      if block
+        observer = block
+        func = :call
+      end
+      raise ArgumentError.new('should pass observer as a first argument or block') if observer.nil?
+
+      subscription = Subscription.new(self, observer, func)
+      direct_notification = synchronize do
+        if event.set?
+          true
+        else
+          @subscriptions[subscription] = true
+          false
+        end
+      end
+
+      deliver_subscription(subscription) if direct_notification
+      subscription
     end
 
     # @!macro ivar_set_method
@@ -156,6 +279,7 @@ module Concurrent
       value = yield if block_given?
       init_obligation
       self.observers = Collection::CopyOnWriteObserverSet.new
+      @subscriptions = {}
       set_deref_options(opts)
 
       @state = :pending
@@ -189,6 +313,47 @@ module Concurrent
     # @!visibility private
     def notify_observers(value, reason)
       observers.notify_and_delete_observers{ [Time.now, value, reason] }
+      notify_subscriptions(value, reason)
+    end
+
+    # @!visibility private
+    #
+    # Collects the pending subscriptions under the lock, then delivers every
+    # notification outside of it. Each subscription is asked to begin its
+    # delivery individually so that a concurrent Subscription#cancel can
+    # still win the race and suppress its own callback.
+    def notify_subscriptions(value, reason)
+      pending = synchronize do
+        subscriptions = @subscriptions
+        @subscriptions = {}
+        subscriptions.keys
+      end
+      time = Time.now
+      pending.each { |subscription| deliver_subscription(subscription, time, value, reason) }
+    end
+
+    # @!visibility private
+    #
+    # Delivers a single subscription outside of any internal lock. Skips
+    # subscriptions whose cancellation won the race. An exception raised by
+    # the callback is swallowed so that the remaining observers are still
+    # notified.
+    def deliver_subscription(subscription, time = Time.now, value = self.value, reason = self.reason)
+      return false unless subscription.begin_delivery
+      begin
+        subscription.deliver(time, value, reason)
+      rescue StandardError
+        # a misbehaving observer must not prevent the others from being notified
+      ensure
+        subscription.finish_delivery
+      end
+      true
+    end
+
+    # @!visibility private
+    def remove_subscription(subscription)
+      synchronize { @subscriptions.delete(subscription) }
+      subscription
     end
 
     # @!visibility private
