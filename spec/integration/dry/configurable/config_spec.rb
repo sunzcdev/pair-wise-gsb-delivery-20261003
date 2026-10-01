@@ -120,6 +120,147 @@ RSpec.describe Dry::Configurable::Config do
     end
   end
 
+  describe "#update_atomically" do
+    it "sets new config values in a flat config" do
+      klass.setting :db
+
+      config = klass.config.update_atomically(db: "sqlite")
+
+      expect(klass.config).to be(config)
+      expect(config.db).to eql("sqlite")
+    end
+
+    it "sets new config values in a nested config" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pass, default: "secret"
+      end
+
+      klass.config.update_atomically(db: {user: "jane", pass: "supersecret"})
+
+      expect(klass.config.db.user).to eql("jane")
+      expect(klass.config.db.pass).to eql("supersecret")
+    end
+
+    it "sets new config values in a two-level nested config" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :connection do
+          setting :host, default: "localhost"
+          setting :port, default: 312
+        end
+      end
+
+      klass.config.update_atomically(db: {user: "jane", connection: {port: 8080}})
+
+      expect(klass.config.db.user).to eql("jane")
+      expect(klass.config.db.connection.host).to eql("localhost")
+      expect(klass.config.db.connection.port).to eql(8080)
+    end
+
+    it "marks keys as configured, consistent with item-by-item setting" do
+      klass.setting :db
+      klass.setting :user, default: "root"
+
+      klass.config.update_atomically(db: "sqlite")
+
+      expect(klass.config.configured?(:db)).to be true
+      expect(klass.config.configured?(:user)).to be false
+    end
+
+    it "runs constructors exactly once per value" do
+      calls = Hash.new(0)
+      klass.setting :user, constructor: ->(v) { calls[:user] += 1; v.upcase }
+      klass.setting :pass, constructor: ->(v) { calls[:pass] += 1; v.reverse }
+
+      klass.config.update_atomically(user: "jane", pass: "secret")
+
+      expect(calls).to eql(user: 1, pass: 1)
+      expect(klass.config.user).to eql("JANE")
+      expect(klass.config.pass).to eql("terces")
+    end
+
+    it "applies nothing when a later value fails" do
+      klass.setting :db
+      klass.setting :user, constructor: ->(_v) { raise "boom" }
+
+      expect { klass.config.update_atomically(db: "sqlite", user: "jane") }
+        .to raise_error(RuntimeError, "boom")
+
+      expect(klass.config._values).to be_empty
+      expect(klass.config.configured?(:db)).to be false
+      expect(klass.config.configured?(:user)).to be false
+    end
+
+    it "applies nothing when a key is unknown" do
+      klass.setting :db
+
+      expect { klass.config.update_atomically(db: "sqlite", username: "jane") }
+        .to raise_error(ArgumentError, "+username+ is not a setting name")
+
+      expect(klass.config.configured?(:db)).to be false
+    end
+
+    it "applies nothing when a nested value is not a Hash" do
+      klass.setting :db do
+        setting :user
+      end
+      klass.setting :env
+
+      expect { klass.config.update_atomically(env: "test", db: "string") }
+        .to raise_error(ArgumentError, '"string" is not a valid setting value')
+
+      expect(klass.config.configured?(:env)).to be false
+    end
+
+    it "applies nothing when a nested config is frozen" do
+      klass.setting :env
+      klass.setting :db do
+        setting :user, default: "root"
+      end
+
+      nested = klass.config.db
+      nested.finalize!
+
+      expect { klass.config.update_atomically(env: "test", db: {user: "jane"}) }
+        .to raise_error(Dry::Configurable::FrozenConfigError)
+
+      expect(klass.config.db.user).to eql("root")
+      expect(klass.config.db).to be(nested)
+      expect(klass.config.configured?(:env)).to be false
+    end
+
+    it "leaves nested config instances held by the caller untouched on failure" do
+      klass.setting :db do
+        setting :user, default: "root"
+        setting :pass, default: "secret"
+      end
+
+      nested = klass.config.db
+
+      expect {
+        klass.config.update_atomically(db: {user: "jane", unknown: "nope"})
+      }.to raise_error(ArgumentError, "+unknown+ is not a setting name")
+
+      expect(klass.config.db).to be(nested)
+      expect(nested.user).to eql("root")
+      expect(nested.configured?(:user)).to be false
+    end
+
+    it "does not mutate mutable defaults when the update fails" do
+      klass.setting :ports, default: [312], cloneable: true
+      klass.setting :db, constructor: ->(_v) { raise "boom" }
+
+      ports = klass.config.ports
+
+      expect { klass.config.update_atomically(ports: [8080], db: "sqlite") }
+        .to raise_error(RuntimeError, "boom")
+
+      expect(klass.config.ports).to be(ports)
+      expect(klass.config.ports).to eql([312])
+    end
+  end
+
   describe "#to_h" do
     before do
       klass.setting :db do

@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `Config#update_atomically`, which validates and converts all given (possibly nested) values before committing any of them. If a key is unknown, a value has an invalid shape, or a constructor raises, the config—including nested configs and their configured keys—is left completely unchanged. Each setting constructor is called exactly once per given value. Atomicity covers the config's internal state only; side effects of user-supplied constructors are not rolled back.
+
 ### Changed
 
 ### Deprecated

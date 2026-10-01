@@ -100,6 +100,29 @@ module Dry
         self
       end
 
+      # Update config with new values atomically
+      #
+      # Unlike {#update}, which applies each value as it is processed, this method first
+      # validates and converts all the given values. If any key is unknown, any value has an
+      # invalid shape, or any setting constructor raises, no changes are applied at all: the
+      # config (including nested configs and their configured keys) is left exactly as it was,
+      # and any previously fetched nested config instances still reflect the original values.
+      #
+      # Each setting constructor is called exactly once per given value.
+      #
+      # Note: atomicity covers the config's internal state only. Side effects performed by
+      # user-supplied constructors themselves cannot be rolled back.
+      #
+      # @param values [Hash, #to_hash] A hash with new values
+      #
+      # @return [Config]
+      #
+      # @api public
+      def update_atomically(values)
+        apply_update_plan(plan_update(values))
+        self
+      end
+
       # Returns true if the value for the given key has been set on this config.
       #
       # For simple values, this returns true if the value has been explicitly assigned.
@@ -223,6 +246,63 @@ module Dry
       end
 
       private
+
+      # Validates the given values and computes their constructed replacements without
+      # changing any state. Returns a plan of [assignments, nested_plans], where assignments
+      # are [name, constructed_value] pairs and nested_plans maps names to plans for nested
+      # configs. Raises (leaving the config untouched) if anything is invalid.
+      #
+      # @api private
+      def plan_update(values)
+        raise FrozenConfigError, "Cannot modify frozen config" if frozen?
+
+        assignments = []
+        nested_plans = {}
+
+        values.each do |key, value|
+          name = key.to_sym
+
+          unless (setting = _settings[name])
+            raise ArgumentError, "+#{name}+ is not a setting name"
+          end
+
+          # Avoid `setting.to_value` for leaf settings: it would needlessly run the
+          # constructor on the default value. Nested configs are only built when needed
+          # to plan a nested update, and building them runs no value constructors.
+          current = _values.fetch(name) {
+            setting.to_value if setting.children.any? || setting.default.is_a?(Config)
+          }
+
+          if current.is_a?(self.class)
+            unless value.respond_to?(:to_hash)
+              raise ArgumentError, "#{value.inspect} is not a valid setting value"
+            end
+
+            nested_plans[name] = current.__send__(:plan_update, value.to_hash)
+          else
+            assignments << [name, setting.constructor.(value)]
+          end
+        end
+
+        [assignments, nested_plans]
+      end
+
+      # Applies a plan built by #plan_update. Only called once the whole plan has been
+      # computed successfully, so it cannot fail due to invalid values.
+      #
+      # @api private
+      def apply_update_plan(plan)
+        assignments, nested_plans = plan
+
+        assignments.each do |name, value|
+          _configured.add(name)
+          _values[name] = value
+        end
+
+        nested_plans.each do |name, nested_plan|
+          self[name].__send__(:apply_update_plan, nested_plan)
+        end
+      end
 
       def to_data_attrs
         _values.each_with_object({}) do |(name, value), hsh|
