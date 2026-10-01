@@ -100,3 +100,28 @@ type AuthSession interface {
 	AuthMechanisms() []string
 	Auth(mech string) (sasl.Server, error)
 }
+
+// BURLSession is an add-on interface for Session. It provides support for the
+// BURL extension (RFC 6744).
+//
+// BURL allows a client to hand the server a reference (URL) to the message
+// contents instead of transmitting them over the SMTP connection. The server
+// itself performs no network access: BurlFetch is responsible for resolving
+// and authorizing the URL and for returning the referenced message data.
+//
+// The returned io.ReadCloser must produce exactly the number of octets the
+// client announced in the BURL command. If the URL cannot be resolved,
+// authorization is denied, or the data cannot be read, an error must be
+// returned. Returning an *SMTPError lets the backend choose the response code
+// (e.g. 550 5.7.1 for an authorization failure); otherwise a generic 451
+// response is sent.
+//
+// The ReadCloser is closed by the server once the referenced data has been
+// consumed or discarded.
+type BURLSession interface {
+	Session
+
+	// BurlFetch resolves and authorizes url and returns a reader over the
+	// referenced message data.
+	BurlFetch(url string) (io.ReadCloser, error)
+}

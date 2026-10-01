@@ -47,6 +47,15 @@ var ErrDataTooLarge = &SMTPError{
 	Message:      "Maximum message size exceeded",
 }
 
+// ErrBurlLengthMismatch is returned when the octets returned for a BURL
+// reference do not match the length announced by the client (RFC 6744,
+// section 4.6). The transaction is aborted and no message is delivered.
+var ErrBurlLengthMismatch = &SMTPError{
+	Code:         554,
+	EnhancedCode: EnhancedCode{5, 6, 0},
+	Message:      "BURL fetch returned a different number of octets than announced",
+}
+
 type dataReader struct {
 	r     *bufio.Reader
 	state int

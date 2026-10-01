@@ -135,6 +135,8 @@ func (c *Conn) handle(cmd string, arg string) {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Session reset")
 	case "BDAT":
 		c.handleBdat(arg)
+	case "BURL":
+		c.handleBurl(arg)
 	case "DATA":
 		c.handleData(arg)
 	case "QUIT":
@@ -307,6 +309,9 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		} else {
 			caps = append(caps, fmt.Sprintf("MT-PRIORITY %s", c.server.MtPriorityProfile))
 		}
+	}
+	if _, ok := c.Session().(BURLSession); ok {
+		caps = append(caps, "BURL")
 	}
 
 	args := []string{"Hello " + domain}
@@ -1032,45 +1037,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.bdatStatus == nil && c.server.LMTP {
-		c.bdatStatus = c.createStatusCollector()
-	}
-
-	if c.bdatPipe == nil {
-		var r *io.PipeReader
-		r, c.bdatPipe = io.Pipe()
-
-		c.dataResult = make(chan error, 1)
-
-		go func() {
-			defer func() {
-				if err := recover(); err != nil {
-					c.handlePanic(err, c.bdatStatus)
-
-					c.dataResult <- errPanic
-					r.CloseWithError(errPanic)
-				}
-			}()
-
-			var err error
-			if !c.server.LMTP {
-				err = c.Session().Data(r)
-			} else {
-				lmtpSession, ok := c.Session().(LMTPSession)
-				if !ok {
-					err = c.Session().Data(r)
-					for _, rcpt := range c.recipients {
-						c.bdatStatus.SetStatus(rcpt, err)
-					}
-				} else {
-					err = lmtpSession.LMTPData(r, c.bdatStatus)
-				}
-			}
-
-			c.dataResult <- err
-			r.CloseWithError(err)
-		}()
-	}
+	c.beginData()
 
 	c.lineLimitReader.LineLimit = 0
 
@@ -1081,13 +1048,7 @@ func (c *Conn) handleBdat(arg string) {
 		// the whole chunk.
 		io.Copy(ioutil.Discard, chunk)
 
-		c.writeResponse(dataErrorToStatus(err))
-
-		if err == errPanic {
-			c.Close()
-		}
-
-		c.reset()
+		c.abortData(err)
 		c.lineLimitReader.LineLimit = c.server.MaxLineLength
 		return
 	}
@@ -1096,30 +1057,215 @@ func (c *Conn) handleBdat(arg string) {
 
 	if last {
 		c.lineLimitReader.LineLimit = c.server.MaxLineLength
-
-		c.bdatPipe.Close()
-
-		err := <-c.dataResult
-
-		if c.server.LMTP {
-			c.bdatStatus.fillRemaining(err)
-			for i, rcpt := range c.recipients {
-				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
-				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
-			}
-		} else {
-			c.writeResponse(dataErrorToStatus(err))
-		}
-
-		if err == errPanic {
-			c.Close()
-			return
-		}
-
-		c.reset()
+		c.finishData()
 	} else {
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Continue")
 	}
+}
+
+// beginData lazily creates the pipe feeding the backend's Data/LMTPData and
+// starts the goroutine that runs the delivery logic. It is shared by BDAT
+// (RFC 3030) and BURL (RFC 6744) so that chunks and URL references can be
+// interleaved in any order.
+func (c *Conn) beginData() {
+	if c.bdatStatus == nil && c.server.LMTP {
+		c.bdatStatus = c.createStatusCollector()
+	}
+
+	if c.bdatPipe != nil {
+		return
+	}
+
+	var r *io.PipeReader
+	r, c.bdatPipe = io.Pipe()
+
+	c.dataResult = make(chan error, 1)
+
+	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				c.handlePanic(err, c.bdatStatus)
+
+				c.dataResult <- errPanic
+				r.CloseWithError(errPanic)
+			}
+		}()
+
+		var err error
+		if !c.server.LMTP {
+			err = c.Session().Data(r)
+		} else {
+			lmtpSession, ok := c.Session().(LMTPSession)
+			if !ok {
+				err = c.Session().Data(r)
+				for _, rcpt := range c.recipients {
+					c.bdatStatus.SetStatus(rcpt, err)
+				}
+			} else {
+				err = lmtpSession.LMTPData(r, c.bdatStatus)
+			}
+		}
+
+		c.dataResult <- err
+		r.CloseWithError(err)
+	}()
+}
+
+// finishData closes the sending side of the data pipe, waits for the delivery
+// logic to complete and writes the final message status response(s). On a
+// panic the connection is closed; otherwise the transaction is reset.
+func (c *Conn) finishData() {
+	c.bdatPipe.Close()
+
+	err := <-c.dataResult
+
+	if c.server.LMTP {
+		c.bdatStatus.fillRemaining(err)
+		for i, rcpt := range c.recipients {
+			code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
+			c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
+		}
+	} else {
+		c.writeResponse(dataErrorToStatus(err))
+	}
+
+	if err == errPanic {
+		c.Close()
+		return
+	}
+
+	c.reset()
+}
+
+// abortData reports err to the client and tears down the in-progress
+// transaction. The pipe is closed with err so the delivery goroutine unwinds
+// without ever receiving a complete message, guaranteeing that no partial
+// message is committed. The transaction is always reset (RFC 6744,
+// section 4.7).
+func (c *Conn) abortData(err error) {
+	c.bdatPipe.CloseWithError(err)
+	<-c.dataResult
+
+	c.writeResponse(dataErrorToStatus(err))
+
+	if err == errPanic {
+		c.Close()
+		return
+	}
+
+	c.reset()
+}
+
+// handleBurl implements the BURL command defined in RFC 6744. The server does
+// not fetch the URL itself: resolution and authorization is delegated to the
+// backend's BURLSession. Retrieved data is fed into the same stream as BDAT
+// chunks and counts towards the message size limit.
+func (c *Conn) handleBurl(arg string) {
+	burlSession, ok := c.Session().(BURLSession)
+	if !ok {
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "BURL not supported")
+		return
+	}
+
+	args := strings.Fields(arg)
+	if len(args) < 2 || len(args) > 3 {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing BURL parameters")
+		return
+	}
+
+	last := false
+	switch {
+	case len(args) == 3:
+		if !strings.EqualFold(args[2], "LAST") {
+			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BURL argument")
+			return
+		}
+		last = true
+	case len(args) == 2 && strings.EqualFold(args[1], "LAST"):
+		// "BURL <url> LAST" with an omitted length is invalid.
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Missing BURL length parameter")
+		return
+	}
+
+	url, err := parseBurlURL(args[0])
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed BURL URL parameter")
+		return
+	}
+
+	length, err := strconv.ParseUint(args[1], 10, 64)
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed BURL length parameter")
+		return
+	}
+
+	if !c.fromReceived || len(c.recipients) == 0 {
+		c.writeResponse(502, EnhancedCode{5, 5, 1}, "Missing RCPT TO command.")
+		return
+	}
+
+	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(length) > c.server.MaxMessageBytes {
+		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
+		c.reset()
+		return
+	}
+
+	body, err := burlSession.BurlFetch(url)
+	if err != nil {
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
+		c.reset()
+		return
+	}
+	defer body.Close()
+
+	c.beginData()
+
+	_, copyErr := io.CopyN(c.bdatPipe, body, int64(length))
+	switch {
+	case copyErr == nil:
+		// The reference must contain exactly the announced number of octets.
+		var extra [1]byte
+		m, _ := io.ReadFull(body, extra[:])
+		if m != 0 {
+			copyErr = ErrBurlLengthMismatch
+		}
+	case copyErr == io.EOF || copyErr == io.ErrUnexpectedEOF:
+		// The reference ended before length octets were produced.
+		copyErr = ErrBurlLengthMismatch
+	}
+
+	if copyErr != nil {
+		c.abortData(copyErr)
+		return
+	}
+
+	c.bytesReceived += int64(length)
+
+	if last {
+		c.finishData()
+	} else {
+		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Continue")
+	}
+}
+
+// parseBurlURL decodes an xtext-encoded (RFC 4954) angle-address-list URL
+// parameter: "<url>".
+func parseBurlURL(param string) (string, error) {
+	if len(param) < 2 || param[0] != '<' || param[len(param)-1] != '>' {
+		return "", errors.New("malformed BURL URL")
+	}
+
+	encoded := param[1 : len(param)-1]
+	if encoded == "" {
+		return "", errors.New("empty BURL URL")
+	}
+
+	url, err := decodeXtext(encoded)
+	if err != nil {
+		return "", err
+	}
+
+	return url, nil
 }
 
 // ErrDataReset is returned by Reader pased to Data function if client does not

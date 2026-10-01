@@ -12,6 +12,7 @@
 //   - DSN (RFC 3461, RFC 6533)
 //   - SMTPUTF8 (RFC 6531)
 //   - MT-PRIORITY (RFC 6710)
+//   - BURL (RFC 6744)
 //   - RRVS (RFC 7293)
 //   - REQUIRETLS (RFC 8689)
 //
