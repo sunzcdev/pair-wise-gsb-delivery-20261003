@@ -39,6 +39,18 @@ type sessionData struct {
 	status   Status
 	token    string
 	values   map[string]interface{}
+	// baseValues contains the values at the time the session data was loaded
+	// from a store which supports atomic merge commits. It is nil when the
+	// store does not support merge commits or when the session has not been
+	// persisted yet.
+	baseValues map[string]interface{}
+	// dirty tracks keys which have been modified (added, replaced or removed)
+	// in this request since the session data was loaded. When committing to a
+	// merge-capable store only the dirty keys are overlaid on the latest
+	// stored values, so that changes made by other requests are preserved and
+	// consumed flash values cannot be resurrected by a stale commit.
+	dirty    map[string]struct{}
+	clearAll bool
 	mu       sync.Mutex
 }
 
@@ -66,6 +78,26 @@ func minTime(a, b time.Time) time.Time {
 		return a
 	}
 	return b
+}
+
+func cloneValues(values map[string]interface{}) map[string]interface{} {
+	clone := make(map[string]interface{}, len(values))
+	for key, val := range values {
+		clone[key] = val
+	}
+	return clone
+}
+
+// markDirty records that key has been modified in this request since the
+// session was loaded. Callers must hold sd.mu.
+func (sd *sessionData) markDirty(key string) {
+	if sd.baseValues == nil {
+		return
+	}
+	if sd.dirty == nil {
+		sd.dirty = make(map[string]struct{})
+	}
+	sd.dirty[key] = struct{}{}
 }
 
 // Load retrieves the session data for the given token from the session store,
@@ -102,6 +134,13 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 
 	// By default, set the expiry time to the deadline.
 	sd.expiry = sd.deadline
+
+	// If the store supports atomic merge commits, retain a copy of the loaded
+	// values so that subsequent commits can overlay only this request's changes
+	// instead of blindly overwriting data changed by other requests.
+	if s.supportsMergeCommit() {
+		sd.baseValues = cloneValues(sd.values)
+	}
 
 	// If an idle timeout is being used, set the expiry to whichever comes first
 	// between the session deadline and idleTimeout expiry. We also set the status
@@ -140,7 +179,41 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		return "", time.Time{}, err
 	}
 
-	if err := s.doStoreCommit(ctx, sd.token, b, sd.expiry); err != nil {
+	// If the session was loaded from a store which supports atomic merge
+	// commits, perform a read-modify-write so that values changed by other
+	// requests (including flash values consumed by them) are not clobbered by
+	// this request's potentially stale copy.
+	if sd.baseValues != nil {
+		err = s.doStoreMergeCommit(ctx, sd.token, func(current []byte) ([]byte, error) {
+			if current == nil {
+				return b, nil
+			}
+
+			_, currentValues, err := s.Codec.Decode(current)
+			if err != nil {
+				return nil, err
+			}
+
+			if sd.clearAll {
+				currentValues = make(map[string]interface{})
+			}
+
+			for key := range sd.dirty {
+				val, exists := sd.values[key]
+				if exists {
+					currentValues[key] = val
+				} else {
+					delete(currentValues, key)
+				}
+			}
+
+			return s.Codec.Encode(sd.deadline, currentValues)
+		}, sd.expiry)
+	} else {
+		err = s.doStoreCommit(ctx, sd.token, b, sd.expiry)
+	}
+
+	if err != nil {
 		return "", time.Time{}, err
 	}
 
@@ -174,6 +247,9 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
+	sd.baseValues = nil
+	sd.dirty = nil
+	sd.clearAll = false
 
 	return nil
 }
@@ -187,7 +263,88 @@ func (s *SessionManager) Put(ctx context.Context, key string, val interface{}) {
 	sd.mu.Lock()
 	sd.values[key] = val
 	sd.status = Modified
+	sd.markDirty(key)
 	sd.mu.Unlock()
+}
+
+// Flash atomically consumes a one-time value ("flash" message) for the given
+// key from the session store. It is safe to call from multiple concurrent
+// requests sharing the same session: exactly one request will receive the
+// value, and committing the session from this request (or any other request
+// whose session copy was loaded earlier) will not write the consumed value
+// back.
+//
+// The found return value is false when no value exists for the key. The err
+// return value reports a system error communicating with the store, or
+// ErrFlashNotSupported when the configured store cannot perform atomic flash
+// operations; in that case no session data is modified.
+func (s *SessionManager) Flash(ctx context.Context, key string) (val interface{}, found bool, err error) {
+	sd := s.getSessionDataFromContext(ctx)
+
+	if !s.supportsFlash() || !s.supportsMergeCommit() {
+		return nil, false, ErrFlashNotSupported
+	}
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	// Sessions which have not yet been committed to a store cannot be seen by
+	// any other request, so a local one-time pop is sufficient.
+	if sd.token == "" {
+		val, exists := sd.values[key]
+		if !exists {
+			return nil, false, nil
+		}
+		delete(sd.values, key)
+		sd.markDirty(key)
+		sd.status = Modified
+		return val, true, nil
+	}
+
+	var flashed interface{}
+
+	ok, err := s.doStoreFlash(ctx, sd.token, key, func(b []byte) ([]byte, bool, error) {
+		if b == nil {
+			return nil, false, nil
+		}
+
+		deadline, values, err := s.Codec.Decode(b)
+		if err != nil {
+			return nil, false, err
+		}
+
+		val, exists := values[key]
+		if !exists {
+			return nil, false, nil
+		}
+
+		delete(values, key)
+		updated, err := s.Codec.Encode(deadline, values)
+		if err != nil {
+			return nil, false, err
+		}
+
+		flashed = val
+		return updated, true, nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	if ok {
+		val = flashed
+		found = true
+	}
+
+	// Always scrub the key from the local copy (whether or not it was present
+	// in the store) so that this request cannot later commit it back.
+	if _, exists := sd.values[key]; exists {
+		delete(sd.values, key)
+		sd.markDirty(key)
+		sd.status = Modified
+	}
+
+	return val, found, nil
 }
 
 // Get returns the value for a given key from the session data. The return
@@ -226,6 +383,7 @@ func (s *SessionManager) Pop(ctx context.Context, key string) interface{} {
 	}
 	delete(sd.values, key)
 	sd.status = Modified
+	sd.markDirty(key)
 
 	return val
 }
@@ -246,6 +404,7 @@ func (s *SessionManager) Remove(ctx context.Context, key string) {
 
 	delete(sd.values, key)
 	sd.status = Modified
+	sd.markDirty(key)
 }
 
 // Clear removes all data for the current session. The session token and
@@ -264,6 +423,8 @@ func (s *SessionManager) Clear(ctx context.Context) error {
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
+	sd.clearAll = true
+	sd.dirty = nil
 	sd.status = Modified
 	return nil
 }
@@ -333,6 +494,12 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
 
+	// The new token does not exist in the store, so the next commit should
+	// write the full session rather than perform a merge.
+	sd.baseValues = nil
+	sd.dirty = nil
+	sd.clearAll = false
+
 	return nil
 }
 
@@ -368,6 +535,7 @@ func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 
 	for k, v := range values {
 		sd.values[k] = v
+		sd.markDirty(k)
 	}
 
 	sd.status = Modified
@@ -751,4 +919,46 @@ func (s *SessionManager) doStoreAll(ctx context.Context) (map[string][]byte, err
 	}
 
 	panic(fmt.Sprintf("type %T does not support iteration", s.Store))
+}
+
+func (s *SessionManager) supportsFlash() bool {
+	if s.Store == nil {
+		return false
+	}
+	if _, ok := s.Store.(FlashCtxStore); ok {
+		return true
+	}
+	_, ok := s.Store.(FlashStore)
+	return ok
+}
+
+func (s *SessionManager) supportsMergeCommit() bool {
+	if s.Store == nil {
+		return false
+	}
+	if _, ok := s.Store.(MergeCommitCtxStore); ok {
+		return true
+	}
+	_, ok := s.Store.(MergeCommitStore)
+	return ok
+}
+
+func (s *SessionManager) doStoreFlash(ctx context.Context, token string, key string, fn FlashFunc) (ok bool, err error) {
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	if c, ok := s.Store.(FlashCtxStore); ok {
+		return c.FlashCtx(ctx, token, key, fn)
+	}
+	return s.Store.(FlashStore).Flash(token, key, fn)
+}
+
+func (s *SessionManager) doStoreMergeCommit(ctx context.Context, token string, fn MergeFunc, expiry time.Time) (err error) {
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	if c, ok := s.Store.(MergeCommitCtxStore); ok {
+		return c.MergeCommitCtx(ctx, token, fn, expiry)
+	}
+	return s.Store.(MergeCommitStore).MergeCommit(token, fn, expiry)
 }

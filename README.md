@@ -134,6 +134,20 @@ Data can be set using the [`Put()`](https://pkg.go.dev/github.com/alexedwards/sc
 
 The [`Pop()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Pop) method (and accompanying helpers for common data types) act like a one-time `Get()`, retrieving the data and removing it from the session in one step. These are useful if you want to implement 'flash' message functionality in your application, where messages are displayed to the user once only.
 
+Note that `Pop()` operates on the in-memory copy of the session data for the current request. If a client sends two concurrent requests which both call `Pop()` for the same key, both requests can retrieve the same value, because each pops it from its own copy of the session data. For a genuinely one-time value across concurrent requests use the [`Flash()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Flash) method instead. It atomically extracts the value from the session store so exactly one request observes the value, and a commit made by any other request (including one whose session copy was loaded earlier) will not write the consumed value back:
+
+```go
+notice, found, err := sessionManager.Flash(r.Context(), "notice")
+if err != nil {
+    return err
+}
+if found {
+    fmt.Fprint(w, notice) // Displays the message exactly once.
+}
+```
+
+The `found` return value is `false` when no value exists for the key, and `err` reports a system error. `Flash()` returns [`ErrFlashNotSupported`](https://pkg.go.dev/github.com/alexedwards/scs/v2#pkg-variables) when the configured session store cannot perform atomic flash operations; stores which do not support it do not pretend to provide the guarantee, so you can fall back to `Pop()` if best-effort, request-local behavior is acceptable.
+
 Some other useful functions are [`Exists()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Exists) (which returns a `bool` indicating whether or not a given key exists in the session data) and [`Keys()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Keys) (which returns a sorted slice of keys in the session data).
 
 Individual data items can be deleted from the session using the [`Remove()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Remove) method. Alternatively, all session data can be deleted by using the [`Destroy()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Destroy) method. After calling `Destroy()`, any further operations in the same request cycle will result in a new session being created --- with a new session token and a new lifetime.

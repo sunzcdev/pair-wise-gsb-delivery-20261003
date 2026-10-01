@@ -83,6 +83,61 @@ func (m *MemStore) Delete(token string) error {
 	return nil
 }
 
+// Flash atomically invokes fn for the session data associated with token and
+// persists the updated data returned by fn when the flash key was present. If
+// the session token does not exist or has expired, fn receives nil. The
+// session expiry time is unchanged.
+func (m *MemStore) Flash(token string, key string, fn func(b []byte) (updated []byte, ok bool, err error)) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var current []byte
+	existing, found := m.items[token]
+	if found && time.Now().UnixNano() <= existing.expiration {
+		current = existing.object
+	}
+
+	updated, ok, err := fn(current)
+	if err != nil {
+		return false, err
+	}
+
+	if ok {
+		m.items[token] = item{
+			object:     updated,
+			expiration: existing.expiration,
+		}
+	}
+
+	return ok, nil
+}
+
+// MergeCommit atomically invokes fn for the current session data associated
+// with token and persists the returned data with the given expiry. If the
+// session token does not exist or has expired, fn receives nil.
+func (m *MemStore) MergeCommit(token string, fn func(current []byte) (updated []byte, err error), expiry time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var current []byte
+	existing, found := m.items[token]
+	if found && time.Now().UnixNano() <= existing.expiration {
+		current = existing.object
+	}
+
+	updated, err := fn(current)
+	if err != nil {
+		return err
+	}
+
+	m.items[token] = item{
+		object:     updated,
+		expiration: expiry.UnixNano(),
+	}
+
+	return nil
+}
+
 // All returns a map containing the token and data for all active (i.e.
 // not expired) sessions.
 func (m *MemStore) All() (map[string][]byte, error) {
