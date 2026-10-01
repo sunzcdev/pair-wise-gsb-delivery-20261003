@@ -4,9 +4,9 @@ require 'tomlrb/generated_parser'
 
 class Tomlrb::Parser < Tomlrb::GeneratedParser
 
-  def initialize(tokenizer, **options)
+  def initialize(tokenizer, handler: nil, **options)
     @tokenizer = tokenizer
-    @handler   = Tomlrb::Handler.new(**options)
+    @handler   = handler || Tomlrb::Handler.new(**options)
     super()
   end
 

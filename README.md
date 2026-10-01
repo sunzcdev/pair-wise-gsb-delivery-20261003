@@ -38,6 +38,45 @@ or
 Tomlrb.load_file('my_file', symbolize_keys: true)
 ```
 
+## Streaming events
+
+`Tomlrb.parse` reads the whole input and builds the whole document as a
+nested `Hash`. When that is not desirable - for example when auditing a
+large configuration file value by value - `Tomlrb.each_event` reads from
+any IO-like object (anything responding to `read(n)`, in chunks of
+`chunk_size` bytes) and yields parse events instead:
+
+```ruby
+Tomlrb.each_event(File.open('my_file')) do |event|
+  case event
+  in [:table, path]            then # a [table] declaration
+  in [:array_of_tables, path]  then # a [[table]] declaration, opening a new element
+  in [:value, path, value]     then # a completed key/value pair
+  end
+end
+```
+
+Protocol notes:
+
+* There is intentionally no "table closed" event. A table declaration
+  only switches the context that following `:value` events belong to; it
+  does not mean the previously current table is finished forever. A
+  normal table may be declared *after* values under its path were
+  already emitted (`[a.b]` ... `[a]`), and an array of tables may gain a
+  new element (and new sub-tables) at any later `[[...]]` header.
+* Only explicit `[...]`/`[[...]]` headers produce declaration events.
+  Tables created implicitly on the way to a declared one do not.
+* Nested containers (arrays, inline tables) are delivered as a single
+  `:value` event once the container is complete.
+* A value is yielded exactly once and never retained by the parser: the
+  only state kept is what syntax and duplicate-declaration checks
+  require (key names, container kinds, the current table path), so
+  processed values can be garbage collected.
+* Chunk boundaries may fall anywhere, including inside a UTF-8
+  character, an escape sequence or a multi-line string. Errors that can
+  only be detected at end of input (unterminated string, truncated
+  UTF-8) are raised as `Tomlrb::ParseError` once the IO is exhausted.
+
 ## Benchmark
 
 You can run the benchmark against the only other v0.5.0 compliant parser to my knowledge with `ruby benchmarks/bench.rb`.
