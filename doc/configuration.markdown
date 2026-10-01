@@ -146,3 +146,29 @@ need to fetch metadata and check timestamps.
 Boolean specifying whether fault tolerant caching is enabled. When this option
 is enabled (`rack-cache.fault_tolerant`is `true`), stale cached results can be
 returned if the downstream service is unavailable.
+
+### `store_fragments`
+
+Boolean specifying whether successful `206 Partial Content` responses should
+be accumulated into complete cache entries. Defaults to `false`.
+
+Download clients frequently issue scattered `Range` requests for the same
+large file. When this option is enabled, each cacheable `206` response is
+retained in process-local memory and merged into a growing representation:
+
+* only single-range (`Content-Range: bytes START-END/TOTAL`) responses are
+  admitted — `multipart/byteranges` responses are skipped;
+* a strong `ETag` validator and a known complete length are required;
+* fragments are isolated by URI, `Vary`-negotiated variant and representation
+  version — fragments validated against one ETag can never fill another
+  version;
+* fragments may arrive out of order or be duplicated, and overlapping ranges
+  that carry identical bytes merge freely;
+* an assembly is only published when its fragments cover every byte. If
+  overlapping bytes disagree, the advertised total length changes, or the
+  response ends early, that fragment is rejected and no complete entry is
+  published.
+
+Until coverage is complete, ordinary `GET` requests follow the normal
+(miss/validate) path against the origin — missing ranges are never fetched
+automatically. The forwarded `206` response is never modified.

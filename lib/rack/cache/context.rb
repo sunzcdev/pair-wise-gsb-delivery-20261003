@@ -2,6 +2,7 @@ require 'rack/cache/options'
 require 'rack/cache/request'
 require 'rack/cache/response'
 require 'rack/cache/storage'
+require 'rack/cache/fragment_store'
 
 module Rack::Cache
   # Implements Rack's middleware interface and provides the context for all
@@ -20,6 +21,7 @@ module Rack::Cache
       @trace = []
       @env = nil
       @options = options
+      @fragment_store = FragmentStore.new
 
       initialize_options options
       yield self if block_given?
@@ -41,6 +43,11 @@ module Rack::Cache
       uri = options['rack-cache.entitystore']
       storage.resolve_entitystore_uri(uri, @options)
     end
+
+    # The process-local FragmentStore used to accumulate 206 responses when the
+    # store_fragments option is enabled. Shared by every request handled by
+    # this middleware instance (clones keep the same reference).
+    attr_reader :fragment_store
 
     # The Rack call interface. The receiver acts as a prototype and runs
     # each request in a dup object unless the +rack.run_once+ variable is
@@ -266,6 +273,14 @@ module Rack::Cache
 
       response = forward
 
+      # Accumulate cacheable 206 Partial Content responses into a fragment
+      # assembly. The 206 is always forwarded to the client; it is only
+      # published as a complete cache entry when the final fragment covers the
+      # whole representation.
+      if store_fragments? && response.status == 206
+        return store_fragment(response)
+      end
+
       # Mark the response as explicitly private if any of the private
       # request headers are present and the response was not explicitly
       # declared public.
@@ -288,11 +303,74 @@ module Rack::Cache
       strip_ignore_headers(response)
       metastore.store(@request, response, entitystore)
       response.headers['age'] = response.age.to_s
+      release_fragments(response)
     rescue => e
       log_error(e)
       nil
     else
       record :store
+    end
+
+    # Merge one 206 response into the fragment store. The response delivered
+    # to the client is never altered except that its (one-shot) body is
+    # restored from the slurped chunk. When this fragment completes the
+    # representation it is published via #promote_fragment; otherwise the
+    # ordinary miss flow applies - no gap requests are generated.
+    def store_fragment(response)
+      result = fragment_store.add_fragment(@request, response)
+      response.body = [result.chunk]
+      record :fragment_stored
+
+      if result.complete?
+        begin
+          promote_fragment(result)
+        rescue => e
+          log_error(e)
+        end
+      else
+        record :fragment_incomplete
+      end
+
+      response
+    rescue FragmentStore::InvalidFragment => e
+      # Restore the slurped body so the 206 response can still be forwarded.
+      response.body = [e.chunk] if e.chunk
+      record "fragment_rejected:#{e.reason}".to_sym
+      response
+    end
+
+    # Publish a completed fragment assembly as an ordinary 200 cache entry.
+    def promote_fragment(result)
+      representation = result.representation
+      promoted = Response.new(200, result.headers.dup, [representation.body])
+      promoted.headers.delete('content-range')
+      promoted.headers.delete('content-length')
+      promoted.headers['content-length'] = representation.total_length.to_s
+
+      if private_request? && !promoted.cache_control.public?
+        promoted.private = true
+      elsif default_ttl > 0 && promoted.ttl.nil? &&
+            !promoted.cache_control.must_revalidate?
+        promoted.ttl = default_ttl
+      end
+
+      if promoted.cacheable?
+        strip_ignore_headers(promoted)
+        metastore.store(@request, promoted, entitystore)
+        promoted.headers['age'] = promoted.age.to_s
+        fragment_store.release(@request, promoted.vary)
+        record :fragment_complete
+      else
+        record :fragment_unpromotable
+      end
+    end
+
+    # Remove any in-progress fragments superseded by a freshly stored complete
+    # response.
+    def release_fragments(response)
+      fragment_store.release(@request, response.vary)
+    rescue => e
+      log_error(e)
     end
 
     # Remove all ignored response headers before writing to the cache.

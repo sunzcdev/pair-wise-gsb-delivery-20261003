@@ -1,3 +1,8 @@
+## Unreleased
+
+ * Add a store_fragments option to accumulate 206 Partial Content responses
+   into complete cache entries
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

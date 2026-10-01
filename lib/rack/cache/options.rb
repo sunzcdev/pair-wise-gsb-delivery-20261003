@@ -111,6 +111,22 @@ module Rack::Cache
     # the attempt to revalidate the cache entry raises an exception.
     option_accessor :fault_tolerant
 
+    # Specifies whether successful 206 Partial Content responses should be
+    # accumulated into complete cache entries.
+    #
+    # Download clients frequently issue scattered Range requests for the same
+    # resource. When enabled, each cacheable 206 response carrying a strong
+    # ETag and a known complete length is stored by URI, Vary-negotiated
+    # variant and representation version. Fragments may arrive out of order or
+    # be duplicated; once they cover the entire representation the assembled
+    # response is promoted into the normal cache and can serve plain GET
+    # requests. Incomplete assemblies never satisfy requests (the request is
+    # forwarded to the origin) and gaps are never fetched automatically.
+    #
+    # Fragments are held in process-local memory for the lifetime of the
+    # process. Default: false
+    option_accessor :store_fragments
+
     # The underlying options Hash. During initialization (or outside of a
     # request), this is a default values Hash. During a request, this is the
     # Rack environment Hash. The default values Hash is merged in underneath
@@ -154,6 +170,7 @@ module Rack::Cache
         'rack-cache.allow_revalidate' => false,
         'rack-cache.use_native_ttl'   => false,
         'rack-cache.fault_tolerant'   => false,
+        'rack-cache.store_fragments'  => false,
       }
       self.options = options
     end
