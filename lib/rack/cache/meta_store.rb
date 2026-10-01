@@ -151,7 +151,27 @@ module Rack::Cache
     def persist_response(response)
       hash = response.headers.dup
       hash['x-status'] = response.status.to_s
+      exclude_private_fields(hash, response.cache_control)
       hash
+    end
+
+    # Remove headers named by a field-scoped Cache-Control "private" directive
+    # before the entry is written to the (shared) MetaStore. The original
+    # response handed to the current client is left untouched; only the
+    # persisted copy is filtered (RFC 7234 5.2.2.6 / RFC 2616 14.9.1).
+    def exclude_private_fields(hash, cache_control)
+      fields = cache_control.private_fields
+      case fields
+      when :all
+        # A response with a parameterless "private" directive is not stored
+        # at all, but filter defensively in case the store is reached.
+        hash.clear
+      when Array
+        fields.each do |name|
+          downcased = name.downcase
+          hash.delete_if { |key, _| key.downcase == downcased }
+        end
+      end
     end
 
     # Determine whether the two environment hashes are non-varying based on

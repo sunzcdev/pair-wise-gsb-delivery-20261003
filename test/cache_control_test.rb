@@ -153,4 +153,93 @@ describe Rack::Cache::CacheControl do
     cache_control = Rack::Cache::CacheControl.new('max-age=600')
     refute cache_control.no_cache?
   end
+
+  describe 'field-name lists (quoted-string)' do
+    it 'parses a single field name in the private directive' do
+      cc = Rack::Cache::CacheControl.new('max-age=100, private="Set-Cookie"')
+      cc.private_fields.must_equal ['Set-Cookie']
+      assert cc.private?
+    end
+
+    it 'parses several field names in the private directive' do
+      cc = Rack::Cache::CacheControl.new('private="Set-Cookie, X-Secret ,WWW-Authenticate"')
+      cc.private_fields.must_equal ['Set-Cookie', 'X-Secret', 'WWW-Authenticate']
+    end
+
+    it 'parses field names in the no-cache directive' do
+      cc = Rack::Cache::CacheControl.new('no-cache="set-cookie, location"')
+      cc.no_cache_fields.must_equal ['set-cookie', 'location']
+      assert cc.no_cache?
+    end
+
+    it 'returns :all for a parameterless private directive' do
+      Rack::Cache::CacheControl.new('private').private_fields.must_equal :all
+    end
+
+    it 'returns :all for a parameterless no-cache directive' do
+      Rack::Cache::CacheControl.new('no-cache').no_cache_fields.must_equal :all
+    end
+
+    it 'returns nil when the directive is absent' do
+      cc = Rack::Cache::CacheControl.new('max-age=100')
+      cc.private_fields.must_be_nil
+      cc.no_cache_fields.must_be_nil
+    end
+
+    it 'conservatively treats an unquoted field list as :all' do
+      cc = Rack::Cache::CacheControl.new('private=set-cookie')
+      cc.private_fields.must_equal :all
+    end
+
+    it 'conservatively treats an unterminated quoted string as :all' do
+      cc = Rack::Cache::CacheControl.new('max-age=100, no-cache="set-cookie')
+      cc.no_cache_fields.must_equal :all
+      cc['max-age'].must_equal '100'
+    end
+
+    it 'conservatively treats a malformed field name as :all' do
+      cc = Rack::Cache::CacheControl.new('no-cache="set cookie"')
+      cc.no_cache_fields.must_equal :all
+    end
+
+    it 'conservatively treats an empty field-name list as :all' do
+      Rack::Cache::CacheControl.new('private=""').private_fields.must_equal :all
+    end
+
+    it 'parses both directives with independent field lists' do
+      cc = Rack::Cache::CacheControl.new(
+        'private="set-cookie", no-cache="location"')
+      cc.private_fields.must_equal ['set-cookie']
+      cc.no_cache_fields.must_equal ['location']
+    end
+
+    it 'recognizes field-scoped directives independent of directive name case' do
+      cc = Rack::Cache::CacheControl.new('PRIVATE="Set-Cookie", NO-CACHE="Location"')
+      cc.private_fields.must_equal ['Set-Cookie']
+      cc.no_cache_fields.must_equal ['Location']
+    end
+
+    it 'still parses other directives around a quoted field list' do
+      cc = Rack::Cache::CacheControl.new(
+        'public, no-cache="set-cookie", max-age=60, must-revalidate')
+      cc['max-age'].must_equal '60'
+      assert cc.public?
+      assert cc.must_revalidate?
+      cc.no_cache_fields.must_equal ['set-cookie']
+    end
+
+    it 'does not split field names on commas inside quoted strings' do
+      cc = Rack::Cache::CacheControl.new(
+        'no-cache="set-cookie, x-one", private="x-two"')
+      cc.no_cache_fields.must_equal ['set-cookie', 'x-one']
+      cc.private_fields.must_equal ['x-two']
+    end
+
+    it 'round trips a field-list directive through #to_s' do
+      cc = Rack::Cache::CacheControl.new('max-age=600')
+      cc['private'] = '"set-cookie"'
+      regenerated = Rack::Cache::CacheControl.new(cc.to_s)
+      regenerated.private_fields.must_equal ['set-cookie']
+    end
+  end
 end

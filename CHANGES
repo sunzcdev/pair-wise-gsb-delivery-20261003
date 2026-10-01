@@ -1,3 +1,14 @@
+## Unreleased
+
+ * Honor field-level `private` and `no-cache` Cache-Control directives with
+   quoted-string field-name lists: fields named by `private` are not written
+   to the shared MetaStore, fields named by `no-cache` are omitted from
+   responses served without successful revalidation, while the remaining
+   parts of the response stay cacheable. Parameterless directives keep their
+   whole-response semantics, field names are matched case-insensitively, and
+   malformed field lists fall back to the conservative whole-response
+   behavior.
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

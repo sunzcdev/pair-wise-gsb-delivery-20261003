@@ -371,6 +371,62 @@ describe Rack::Cache::MetaStore do
     include RackCacheMetaStoreImplementation
   end
 
+  describe 'field-scoped Cache-Control directives' do
+    before do
+      @store = Rack::Cache::MetaStore::Heap.new
+      @entity_store = Rack::Cache::EntityStore::Heap.new
+    end
+
+    def stored_headers(cache_control, response_headers={})
+      request = Rack::Cache::Request.new(Rack::MockRequest.env_for('/'))
+      headers = {
+        'cache-control' => cache_control,
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      }.merge(response_headers)
+      response = Rack::Cache::Response.new(200, headers, ['hello'])
+      @store.store(request, response, @entity_store)
+      @store.read(@store.cache_key(request)).first.last
+    end
+
+    it 'omits fields named by private from the stored entry' do
+      headers = stored_headers('max-age=100, private="X-Secret"')
+      headers.wont_include 'x-secret'
+      headers['x-open'].must_equal 'OPEN'
+      headers['cache-control'].must_include 'private='
+    end
+
+    it 'matches private field names case-insensitively' do
+      headers = stored_headers('max-age=100, private="x-SECRET"')
+      headers.wont_include 'x-secret'
+    end
+
+    it 'keeps fields named by no-cache in the stored entry' do
+      headers = stored_headers('max-age=100, no-cache="X-Secret"')
+      headers['x-secret'].must_equal 'TOPSECRET'
+      headers['x-open'].must_equal 'OPEN'
+    end
+
+    it 'combines private and no-cache field lists independently' do
+      headers =
+        stored_headers('max-age=100, private="X-Secret", no-cache="X-Open"')
+      headers.wont_include 'x-secret'
+      headers.must_include 'x-open'
+    end
+
+    it 'does not mutate the response object used for storage' do
+      request = Rack::Cache::Request.new(Rack::MockRequest.env_for('/'))
+      response = Rack::Cache::Response.new(200,
+        {
+          'cache-control' => 'max-age=100, private="X-Secret"',
+          'x-secret' => 'TOPSECRET'
+        },
+        ['hello'])
+      @store.store(request, response, @entity_store)
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+    end
+  end
+
   describe 'Disk' do
     before do
       @temp_dir = create_temp_directory

@@ -179,8 +179,10 @@ module Rack::Cache
           return pass
         end
         if entry
-          if fresh_enough?(entry)
+          if fresh_enough?(entry) && !entry.requires_end_to_end_revalidation?
             record :fresh
+            entry = entry.dup
+            entry.exclude_unrevalidated_headers!
             entry.headers['age'] = entry.age.to_s
             entry
           else
@@ -203,6 +205,8 @@ module Rack::Cache
       validate(entry)
     rescue => e
       record :connnection_failed
+      entry = entry.dup
+      entry.exclude_unrevalidated_headers!
       age = entry.age.to_s
       entry.headers['age'] = age
       record "Fail-over to stale cache data with age #{age} due to #{e.class.name}: #{e}"

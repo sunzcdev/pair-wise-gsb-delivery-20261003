@@ -95,15 +95,42 @@ module Rack::Cache
     end
 
     # Determine if the response is worth caching under any circumstance. Responses
-    # marked "private" with an explicit cache-control directive are considered
-    # uncacheable
+    # marked "private" with no field-name list (i.e. the entire response is
+    # private) are considered uncacheable. A "private" directive that names
+    # individual fields only keeps those fields out of shared storage; the
+    # response itself remains cacheable (RFC 7234 5.2.2.6).
     #
     # Responses with neither a freshness lifetime (expires, max-age) nor cache
     # validator (last-modified, etag) are considered uncacheable.
     def cacheable?
       return false unless CACHEABLE_RESPONSE_CODES.include?(status)
-      return false if cache_control.no_store? || cache_control.private?
+      return false if cache_control.no_store?
+      return false if cache_control.private_fields == :all
       validateable? || fresh?
+    end
+
+    # Indicates whether the response may be served from cache without first
+    # successfully revalidating with the origin. A +no-cache+ directive without
+    # a field-name list requires end-to-end revalidation on every request; a
+    # +no-cache+ directive that names specific fields only restricts those
+    # fields (see #exclude_unrevalidated_headers!).
+    def requires_end_to_end_revalidation?
+      cache_control.no_cache_fields == :all
+    end
+
+    # Remove headers that must not be sent in a reply constructed from this
+    # stored response without successful revalidation with the origin, i.e.
+    # the fields named by a field-scoped +no-cache+ directive. This mutates
+    # the receiver and should be called on a copy that is separate from the
+    # entry kept in the MetaStore.
+    #
+    # A parameterless (or malformed) +no-cache+ directive names no fields:
+    # the whole-response revalidation requirement is enforced separately
+    # (see #requires_end_to_end_revalidation?), so nothing is removed here.
+    def exclude_unrevalidated_headers!
+      fields = cache_control.no_cache_fields
+      fields.each { |name| delete_header_case_insensitive(name) } if fields.is_a?(Array)
+      self
     end
 
     # Determine if the response includes headers that can be used to validate
@@ -262,6 +289,16 @@ module Rack::Cache
     def vary_header_names
       return [] unless vary = headers['vary']
       vary.split(/[\s,]+/)
+    end
+
+    private
+
+    # Delete a header by name regardless of the case used when it was stored.
+    # Required because header hashes restored from the (marshal based)
+    # MetaStore are plain, case-sensitive Hashes.
+    def delete_header_case_insensitive(name)
+      downcased = name.downcase
+      headers.delete_if { |key, _| key.downcase == downcased }
     end
 
   end

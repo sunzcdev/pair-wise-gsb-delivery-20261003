@@ -212,4 +212,78 @@ describe Rack::Cache::Response do
       @res.expires.must_be_nil
     end
   end
+
+  describe 'field-scoped cache-control directives' do
+    def fresh_response(control, headers={})
+      Rack::Cache::Response.new(200,
+        {'cache-control' => control, 'date' => @now.httpdate}.merge(headers),
+        [])
+    end
+
+    describe '#cacheable?' do
+      it 'is false for a parameterless private directive' do
+        refute fresh_response('max-age=100, private').cacheable?
+      end
+
+      it 'is true for a field-scoped private directive' do
+        assert fresh_response('max-age=100, private="set-cookie"').cacheable?
+      end
+
+      it 'is false for a malformed private field list (conservative)' do
+        refute fresh_response('max-age=100, private=set-cookie').cacheable?
+      end
+
+      it 'is true for a parameterless no-cache directive' do
+        assert fresh_response('max-age=100, no-cache').cacheable?
+      end
+    end
+
+    describe '#requires_end_to_end_revalidation?' do
+      it 'is true for a parameterless no-cache directive' do
+        assert fresh_response('no-cache').requires_end_to_end_revalidation?
+      end
+
+      it 'is false for a field-scoped no-cache directive' do
+        refute fresh_response('no-cache="set-cookie"').
+          requires_end_to_end_revalidation?
+      end
+
+      it 'is true for a malformed no-cache field list (conservative)' do
+        assert fresh_response('no-cache="bad field"').
+          requires_end_to_end_revalidation?
+      end
+    end
+
+    describe '#exclude_unrevalidated_headers!' do
+      it 'removes the named fields and keeps the others' do
+        res = fresh_response('max-age=100, no-cache="x-secret"',
+          'x-secret' => 'shh', 'x-open' => 'ok')
+        res.exclude_unrevalidated_headers!
+        res.headers.wont_include 'x-secret'
+        res.headers['x-open'].must_equal 'ok'
+      end
+
+      it 'matches field names case-insensitively' do
+        res = fresh_response('max-age=100, no-cache="X-Secret"',
+          'x-secret' => 'shh', 'X-SECRET' => 'shh2')
+        res.exclude_unrevalidated_headers!
+        res.headers.wont_include 'x-secret'
+      end
+
+      it 'does not name fields when the list is malformed (revalidation enforced elsewhere)' do
+        res = fresh_response('no-cache="bad field"',
+          'x-secret' => 'shh', 'x-open' => 'ok')
+        res.exclude_unrevalidated_headers!
+        res.headers['x-secret'].must_equal 'shh'
+        res.headers['x-open'].must_equal 'ok'
+        assert res.requires_end_to_end_revalidation?
+      end
+
+      it 'is a no-op without a no-cache directive' do
+        res = fresh_response('max-age=100', 'x-secret' => 'shh')
+        res.exclude_unrevalidated_headers!
+        res.headers['x-secret'].must_equal 'shh'
+      end
+    end
+  end
 end

@@ -9,8 +9,10 @@ and/or validation (`last-modified`, `etag`) information:
   * Freshness/expiration based caching
   * Validation (`if-modified-since` / `if-none-match`)
   * `vary` support
-  * `cache-control` `public`, `private`, `max-age`, `s-maxage`, `must-revalidate`,
-    and `proxy-revalidate`.
+  * `cache-control` `public`, `private`, `no-cache`, `no-store`, `max-age`,
+    `s-maxage`, `must-revalidate`, and `proxy-revalidate`. Field-level
+    `private="Header, ..."` and `no-cache="Header, ..."` directives are honored
+    for individual response headers.
   * Portable: 100% Ruby / works with any Rack-enabled framework
   * Disk, memcached, and heap memory storage backends
 

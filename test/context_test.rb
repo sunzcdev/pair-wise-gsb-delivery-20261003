@@ -1030,4 +1030,207 @@ describe Rack::Cache::Context do
     assert response.ok?
     logger.logged_level.must_equal "info"
   end
+
+  describe 'field-level private / no-cache cache-control directives' do
+    # Pull the persisted response headers straight out of the MetaStore so
+    # that sensitive values cannot hide behind output filtering only.
+    def stored_headers
+      hash = cache.metastore.to_hash
+      raise 'expected exactly one meta entry' unless hash.size == 1
+      entries = Marshal.load(hash.values.first)
+      raise 'expected one stored negotiation' unless entries.size == 1
+      entries.first.last
+    end
+
+    it 'keeps private-listed headers for the first caller but not in storage' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, private="X-Secret"',
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      get '/'
+
+      assert response.ok?
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      response.headers['x-open'].must_equal 'OPEN'
+      cache.trace.must_include :store
+
+      stored = stored_headers
+      stored.wont_include 'x-secret'
+      stored['x-open'].must_equal 'OPEN'
+    end
+
+    it 'omits private-listed headers from subsequent shared-cache hits' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, private="X-Secret"',
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      get '/'
+      get '/'
+
+      assert response.ok?
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-secret'
+      response.headers['x-open'].must_equal 'OPEN'
+    end
+
+    it 'stores no-cache-listed headers but strips them on un-revalidated hits' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, no-cache="X-Secret"',
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      get '/'
+
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      stored = stored_headers
+      stored['x-secret'].must_equal 'TOPSECRET'
+
+      get '/'
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-secret'
+      response.headers['x-open'].must_equal 'OPEN'
+    end
+
+    it 'restores no-cache-listed headers after successful revalidation (304)' do
+      count = 0
+      respond_with do |req, res|
+        count += 1
+        res['cache-control'] = 'no-cache="x-secret"'
+        res['last-modified'] = 'Mon, 01 Jan 2024 00:00:00 GMT'
+        res['x-secret'] = 'TOPSECRET'
+        res['x-open'] = 'OPEN'
+        res.status = 304 if count > 1
+        res.body = ['Hello World'] if count == 1
+      end
+
+      get '/'
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+
+      get '/'
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+      assert app.called?
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      response.headers['x-open'].must_equal 'OPEN'
+    end
+
+    it 'revalidates on every request with a parameterless no-cache directive' do
+      count = 0
+      respond_with 200 do |req, res|
+        count += 1
+        res['cache-control'] = 'max-age=10000, no-cache'
+        res['last-modified'] = 'Mon, 01 Jan 2024 00:00:00 GMT'
+        res['x-secret'] = "SECRET-#{count}"
+        res.body = ['Hello World'] if count == 1
+        res.status = 304 if count > 1
+      end
+
+      get '/'
+      response.headers['x-secret'].must_equal 'SECRET-1'
+      cache.trace.must_include :store
+
+      get '/'
+      cache.trace.wont_include :fresh
+      cache.trace.must_include :stale
+      cache.trace.must_include :valid
+      # the stored value survives, because revalidation succeeded
+      response.headers['x-secret'].must_equal 'SECRET-1'
+    end
+
+    it 'does not store anything for a parameterless private directive' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, private',
+        'x-secret' => 'TOPSECRET'
+      get '/'
+
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      cache.trace.wont_include :store
+      cache.metastore.to_hash.must_be :empty?
+    end
+
+    it 'applies private and no-cache field lists together' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, private="X-Secret", no-cache="X-Open"',
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      get '/'
+
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      response.headers['x-open'].must_equal 'OPEN'
+      stored = stored_headers
+      stored.wont_include 'x-secret'
+      stored['x-open'].must_equal 'OPEN'
+
+      get '/'
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-secret'
+      response.headers.wont_include 'x-open'
+    end
+
+    it 'matches directive field names case-insensitively' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, PRIVATE="X-SECRET", NO-CACHE="X-OPEN"',
+        'x-secret' => 'TOPSECRET',
+        'x-open' => 'OPEN'
+      get '/'
+
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      stored = stored_headers
+      stored.wont_include 'x-secret'
+      stored['x-open'].must_equal 'OPEN'
+
+      get '/'
+      response.headers.wont_include 'x-secret'
+      response.headers.wont_include 'x-open'
+    end
+
+    it 'treats a malformed private list conservatively (nothing stored)' do
+      respond_with 200,
+        'cache-control' => 'max-age=100, private=x-secret',
+        'x-secret' => 'TOPSECRET'
+      get '/'
+
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+      cache.trace.wont_include :store
+      cache.metastore.to_hash.must_be :empty?
+    end
+
+    it 'treats a malformed no-cache list conservatively (always revalidates)' do
+      count = 0
+      respond_with do |req, res|
+        count += 1
+        res['cache-control'] = 'max-age=10000, no-cache="x secret"'
+        res['last-modified'] = 'Mon, 01 Jan 2024 00:00:00 GMT'
+        res['x-secret'] = 'TOPSECRET'
+        res.body = ['Hello World'] if count == 1
+        res.status = 304 if count > 1
+      end
+
+      get '/'
+      get '/'
+      cache.trace.wont_include :fresh
+      cache.trace.must_include :valid
+      response.headers['x-secret'].must_equal 'TOPSECRET'
+    end
+
+    it 'strips no-cache fields from stale failover responses' do
+      count = 0
+      respond_with do |req, res|
+        count += 1
+        raise Timeout::Error, 'Connection failed' if count == 2
+        res['cache-control'] = 'max-age=10000, no-cache="x-secret"'
+        res['last-modified'] = 'Mon, 01 Jan 2024 00:00:00 GMT'
+        res['x-secret'] = 'TOPSECRET'
+        res['x-open'] = 'OPEN'
+        res.body = ['Hello World']
+      end
+
+      get '/'
+      get '/', 'rack-cache.allow_revalidate' => true,
+              'rack-cache.fault_tolerant' => true,
+              'HTTP_CACHE_CONTROL' => 'max-age=0'
+      cache.trace.must_include :connnection_failed
+      response.headers.wont_include 'x-secret'
+      response.headers['x-open'].must_equal 'OPEN'
+    end
+  end
 end

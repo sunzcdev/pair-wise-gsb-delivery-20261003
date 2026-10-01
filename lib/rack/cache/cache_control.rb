@@ -50,6 +50,34 @@ module Rack
         self['no-cache']
       end
 
+      # token = 1*tchar (RFC 7230 3.2.6); used to validate field names.
+      TOKEN = /\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
+
+      # The list of response header field-names named by the #private?
+      # directive. Returns:
+      #
+      # * nil when the directive is not present;
+      # * :all when the directive is present without a quoted field-name list
+      #   (i.e. the entire response is private);
+      # * an Array of field-name Strings when the directive carries a valid
+      #   quoted-string field-name list (RFC 7234 5.2.2.6 / RFC 2616 14.9.1).
+      #
+      # A field-name list that cannot be parsed as a valid quoted-string list
+      # is treated conservatively as :all, so a malformed directive never
+      # leaks more than the origin intended.
+      def private_fields
+        scoped_fields('private')
+      end
+
+      # The list of response header field-names named by the #no_cache?
+      # directive. See #private_fields for the meaning of the return values.
+      # Headers returned this way MUST NOT be sent in a reply constructed from
+      # the stored response without successful revalidation (RFC 7234
+      # 5.2.2.2 / RFC 2616 14.9.1).
+      def no_cache_fields
+        scoped_fields('no-cache')
+      end
+
       # Indicates that the response MUST NOT be stored under any circumstances.
       #
       # The purpose of the no-store directive is to prevent the
@@ -195,14 +223,101 @@ module Rack
 
     private
 
+      # Resolve the value of a field-scoped directive (+private+ or
+      # +no-cache+). Returns nil, :all, or an Array of field-name Strings;
+      # see #private_fields.
+      def scoped_fields(name)
+        return nil unless key?(name)
+        value = self[name]
+        return :all if value == true
+        parse_field_list(value)
+      end
+
+      # Parse a directive value that is required to be a quoted-string
+      # containing a comma-separated list of valid field names. Anything that
+      # does not conform is treated as a whole-response restriction (:all).
+      def parse_field_list(value)
+        return :all unless value.start_with?('"') && value.end_with?('"')
+
+        names = []
+        split_quoted_list(value[1...-1]) do |field|
+          return :all unless field =~ TOKEN
+          names << field
+        end
+        names
+      end
+
+      # Split the body of a quoted-string on commas while honoring backslash
+      # quoted-pairs. Whitespace around each element is trimmed; embedded
+      # quoted-pair escapes are unwrapped. Yields each field-name candidate.
+      def split_quoted_list(content)
+        field = ''.dup
+        escaped = false
+        content.each_char do |char|
+          if escaped
+            field << char
+            escaped = false
+          elsif char == '\\'
+            escaped = true
+          elsif char == ','
+            yield field.strip
+            field = ''.dup
+          else
+            field << char
+          end
+        end
+        yield field.strip
+        nil
+      end
+
       def parse(value)
         return if value.nil? || value.empty?
-        value.delete(' ').split(',').each do |part|
+        split_directives(value).each do |part|
           next if part.empty?
-          name, value = part.split('=', 2)
-          self[name.downcase] = (value || true) unless name.empty?
+          name, field_value = part.split('=', 2)
+          name = name.strip
+          next if name.empty?
+          field_value = strip_value(field_value) unless field_value.nil?
+          self[name.downcase] = (field_value || true)
         end
         self
+      end
+
+      # Split a Cache-Control header value into directives at commas that are
+      # not inside a quoted-string (RFC 7234 5.2).
+      def split_directives(value)
+        directives, part, in_quotes, escaped = [], ''.dup, false, false
+        value.each_char do |char|
+          if in_quotes
+            part << char
+            if escaped
+              escaped = false
+            elsif char == '\\'
+              escaped = true
+            elsif char == '"'
+              in_quotes = false
+            end
+          elsif char == '"'
+            part << char
+            in_quotes = true
+          elsif char == ','
+            directives << part
+            part = ''.dup
+          else
+            part << char
+          end
+        end
+        directives << part
+        directives
+      end
+
+      def strip_value(value)
+        value = value.strip
+        if value.start_with?('"')
+          value
+        else
+          value.delete(' ')
+        end
       end
     end
   end
