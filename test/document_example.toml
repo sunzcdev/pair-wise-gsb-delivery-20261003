@@ -1,0 +1,28 @@
+# 网关服务配置 —— 手工维护，请勿重排
+title = "gateway"      # 服务名
+version = 1
+
+[server]
+host = '0.0.0.0'       # 监听地址
+port = 0x1F90          # 8080，保持十六进制
+timeout  =  30         # 秒
+sankey = "keep.me"     # 哨兵：不得被改写
+net.ipv4 = "10.0.0.1"  # 点分键
+
+[database]
+url = "postgres://db.internal:5432/app"
+pool    =    5
+options = { retries = 3, ssl = true }  # 内联表，保持单行
+ports = [
+  5432,
+  5433, # 只读副本
+]
+
+[[servers]]
+name = "web-1"
+role = "primary"
+weight = 1_000         # 下划线分隔
+
+[[servers]]
+name = "web-2"         # 备用节点
+weight = 2_000

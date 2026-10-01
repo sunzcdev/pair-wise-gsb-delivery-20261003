@@ -10,6 +10,7 @@ require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
 require 'tomlrb/handler'
+require 'tomlrb/document'
 
 module Tomlrb
   class ParseError < StandardError; end

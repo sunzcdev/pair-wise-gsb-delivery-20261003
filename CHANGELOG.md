@@ -1,3 +1,10 @@
+### Unreleased
+
+* Add Tomlrb::Document, a structure-preserving editing API (set/rename/move
+  by path, array-of-tables instance addressing) that keeps comments,
+  whitespace, quoting and number formats of untouched regions byte-for-byte
+  and atomically rejects conflicting edits
+
 ### 2.0.4 - 2025-12-18
 
 * Update Racc to v1.8.1

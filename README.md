@@ -38,6 +38,39 @@ or
 Tomlrb.load_file('my_file', symbolize_keys: true)
 ```
 
+## Editing documents
+
+`Tomlrb::Document` edits TOML in place while preserving the original text:
+comments, whitespace, quoting style and number formats of untouched regions
+are kept byte-for-byte.
+
+```ruby
+doc = Tomlrb::Document.load_file('config.toml')
+
+doc.set('database.pool', 10)                 # replace a value in place
+doc.set('servers[1].weight', 2500)           # 2nd [[servers]] instance
+doc.rename('database.url', 'dsn')            # rename a key
+doc.move('server.timeout', 'database')       # move a key across tables
+doc.move('server.host', 'database', as: 'listen') # move and rename
+
+File.write('config.toml', doc.to_s)
+```
+
+* Paths are dot-separated strings (`'servers[1].host'`, quoting supported) or
+  arrays (`['servers', 1, 'host']`); integer segments address specific
+  `[[array-of-tables]]` instances.
+* `set` accepts strings, numbers, booleans, arrays, hashes (serialized as
+  inline tables) and date/time objects. Wrap a string in
+  `Tomlrb::Document::Raw` to insert TOML verbatim, e.g.
+  `doc.set('server.port', Tomlrb::Document::Raw.new('0x1F91'))`.
+* `move` inserts the pair right after the target table's header, so the
+  table-header scope and dotted-key interpretation of neighbouring keys are
+  never disturbed. Missing target tables are appended as new `[table]`
+  sections.
+* Every edit is validated against a full re-parse. Edits that would cause
+  duplicate declarations or type conflicts raise
+  `Tomlrb::Document::EditError` and leave the document unchanged.
+
 ## Benchmark
 
 You can run the benchmark against the only other v0.5.0 compliant parser to my knowledge with `ruby benchmarks/bench.rb`.
