@@ -98,6 +98,18 @@ type IndexSchema struct {
 
 	Unique  bool
 	Indexer Indexer
+
+	// Sortable enables efficient order-statistics queries (Rank and Select)
+	// on this index. It may only be set on an index backed by a
+	// SingleIndexer.
+	//
+	// Ordering is by the encoded index value; when several objects produce
+	// the same index value on a non-unique index they are ordered by their
+	// primary key, giving a total, stable order. Sortable indexes are kept in
+	// a persistent order-statistics tree, so Rank/Select run in expected
+	// O(log n) and remain consistent with the MVCC snapshot of the
+	// transaction that performs the query.
+	Sortable bool
 }
 
 func (s *IndexSchema) Validate() error {
@@ -112,6 +124,11 @@ func (s *IndexSchema) Validate() error {
 	case MultiIndexer:
 	default:
 		return fmt.Errorf("indexer for '%s' must be a SingleIndexer or MultiIndexer", s.Name)
+	}
+	if s.Sortable {
+		if _, ok := s.Indexer.(SingleIndexer); !ok {
+			return fmt.Errorf("sortable index '%s' must use a SingleIndexer", s.Name)
+		}
 	}
 	return nil
 }

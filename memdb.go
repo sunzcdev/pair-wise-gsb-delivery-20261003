@@ -107,6 +107,12 @@ func (db *MemDB) initialize() error {
 			index := iradix.New()
 			path := indexPath(tName, iName)
 			root, _, _ = root.Insert(path, index)
+
+			// Sortable indexes also start with an empty order-statistics tree so
+			// that readers never have to special-case a missing value.
+			if tableSchema.Indexes[iName].Sortable {
+				root, _, _ = root.Insert(orderIndexPath(tName, iName), &orderIndex{})
+			}
 		}
 	}
 	db.root = unsafe.Pointer(root)

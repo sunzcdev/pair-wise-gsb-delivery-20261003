@@ -40,7 +40,8 @@ type Txn struct {
 	// it is nil at transaction start then changes are not tracked.
 	changes Changes
 
-	modified map[tableIndex]*iradix.Txn
+	modified      map[tableIndex]*iradix.Txn
+	orderModified map[tableIndex]*orderTxn
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -121,6 +122,7 @@ func (txn *Txn) Abort() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.orderModified = nil
 	txn.changes = nil
 
 	// Release the writer lock since this is invalid
@@ -148,6 +150,11 @@ func (txn *Txn) Commit() {
 		txn.rootTxn.Insert(path, final)
 	}
 
+	// Commit each sortable order-statistics index as an immutable value.
+	for key, ot := range txn.orderModified {
+		txn.rootTxn.Insert(orderIndexPath(key.Table, key.Index), ot.commit())
+	}
+
 	// Update the root of the DB
 	newRoot := txn.rootTxn.CommitOnly()
 	atomic.StorePointer(&txn.db.root, unsafe.Pointer(newRoot))
@@ -164,6 +171,7 @@ func (txn *Txn) Commit() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.orderModified = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -290,6 +298,29 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 		for _, val := range vals {
 			indexTxn.Insert(val, obj)
 		}
+
+		// Maintain the order-statistics tree for sortable indexes. Sortable
+		// indexes are validated to be SingleIndexers, so vals holds exactly one
+		// composite key (primary key appended for non-unique indexes).
+		if indexSchema.Sortable {
+			ot := txn.writableOrder(table, name)
+
+			// Remove the previous key on an update; the new key is inserted
+			// below. This is done unconditionally because removing an absent
+			// key is a no-op.
+			if update {
+				if okExist, valExist, err := indexSchema.Indexer.(SingleIndexer).FromObject(existing); err == nil && okExist {
+					if !indexSchema.Unique {
+						valExist = append(valExist, idVal...)
+					}
+					ot.remove(valExist)
+				}
+			}
+
+			for _, val := range vals {
+				ot.insert(val, obj)
+			}
+		}
 	}
 	if txn.changes != nil {
 		txn.changes = append(txn.changes, Change{
@@ -363,6 +394,11 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 					val = append(val, idVal...)
 				}
 				indexTxn.Delete(val)
+
+				// Drop the entry from the order-statistics tree as well.
+				if indexSchema.Sortable {
+					txn.writableOrder(table, name).remove(val)
+				}
 			}
 		}
 	}
@@ -433,9 +469,6 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 		}
 		// Remove the object from all the indexes except the given prefix index
 		for name, indexSchema := range tableSchema.Indexes {
-			if name == deletePrefixIndex {
-				continue
-			}
 			indexTxn := txn.writableIndex(table, name)
 
 			// Handle the update by deleting from the index first
@@ -464,7 +497,19 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 					if !indexSchema.Unique {
 						val = append(val, idVal...)
 					}
-					indexTxn.Delete(val)
+					// The radix entries under the prefix index itself are
+					// removed by the subtree delete below; every other index
+					// is deleted entry-by-entry here.
+					if name != deletePrefixIndex {
+						indexTxn.Delete(val)
+					}
+
+					// Keep the order-statistics tree in sync for all sortable
+					// indexes, including the prefix index (whose tree is not
+					// affected by the radix DeletePrefix call).
+					if indexSchema.Sortable {
+						txn.writableOrder(table, name).remove(val)
+					}
 				}
 			}
 		}
@@ -1018,6 +1063,11 @@ func (txn *Txn) Snapshot() *Txn {
 		path := indexPath(key.Table, key.Index)
 		final := subTxn.CommitOnly()
 		snapshot.rootTxn.Insert(path, final)
+	}
+
+	// Commit pending order-statistics mutations into the snapshot.
+	for key, ot := range txn.orderModified {
+		snapshot.rootTxn.Insert(orderIndexPath(key.Table, key.Index), ot.commit())
 	}
 
 	return snapshot

@@ -27,6 +27,14 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Order Statistics (Rank / Select) - An index can be marked `Sortable`, which keeps a
+  persistent order-statistics tree alongside it. `Txn.Select` returns the object at a
+  given 1-based rank (e.g. the 100,000th player) and `Txn.Rank`/`Txn.RankObject` return
+  the rank of a value or object. Both run in expected O(log n) without scanning. Ties on
+  a non-unique index are broken by the primary key, giving a stable total order, and
+  results follow the transaction's MVCC snapshot so an open read transaction never sees
+  ranks drift while data is inserted, deleted or updated.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation
@@ -143,3 +151,59 @@ for obj := it.Next(); obj != nil; obj = it.Next() {
 //   Joe is aged 30
 //   Lucy is aged 35
 ```
+
+Leaderboards: Rank and Select
+=============================
+
+Mark an index `Sortable: true` to enable order-statistics queries. Non-unique
+indexes automatically break ties using the primary key, so the ordering is total
+and stable.
+
+```go
+type Player struct {
+	ID    string
+	Score int
+}
+
+schema := &memdb.DBSchema{
+	Tables: map[string]*memdb.TableSchema{
+		"player": {
+			Name: "player",
+			Indexes: map[string]*memdb.IndexSchema{
+				"id": {
+					Name:    "id",
+					Unique:  true,
+					Indexer: &memdb.StringFieldIndex{Field: "ID"},
+				},
+				"score": {
+					Name:     "score",
+					// Non-unique: equal scores are ordered by ID.
+					Sortable: true,
+					Indexer:  &memdb.IntFieldIndex{Field: "Score"},
+				},
+			},
+		},
+	},
+}
+
+db, _ := memdb.NewMemDB(schema)
+
+// A long-lived read transaction holds an MVCC snapshot.
+read := db.Txn(false)
+
+// Find the object at a specific rank (1-based), highest score first.
+obj, _ := read.Select("player", "score", memdb.Descending, 100000)
+
+// Reverse lookup: where does this object currently rank?
+rank, found, _ := read.RankObject("player", "score", memdb.Descending, obj)
+
+// Rank and Select are exact inverses on the same snapshot.
+again, _ := read.Select("player", "score", memdb.Descending, rank)
+// again == obj
+```
+
+Both `Select` and `RankObject` run in expected O(log n). They do not iterate
+over earlier entries, so locating the 100,000th row costs the same as locating
+the 1st. Because they read from the transaction snapshot, an open read
+transaction keeps returning identical ranks even while another goroutine
+inserts, deletes and updates scores.
