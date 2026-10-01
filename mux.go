@@ -33,6 +33,25 @@ type Config struct {
 	// window size that we allow for a stream.
 	MaxStreamWindowSize uint32
 
+	// MaxSessionWindowSize is used to control the maximum amount of receive
+	// memory that the session as a whole is willing to commit. It bounds the
+	// sum across every stream of the bytes already buffered plus the receive
+	// credit already advertised to the peer but not yet consumed. In other
+	// words it is a session-level receive window shared by all streams;
+	// MaxStreamWindowSize only bounds a single stream and cannot prevent a
+	// peer that keeps opening well-behaved streams from exhausting memory.
+	//
+	// Stream open and window expansion requests are held to this budget: an
+	// outbound OpenStream blocks until enough credit is available, while an
+	// inbound stream that cannot reserve its initial window is rejected with
+	// a RST. Window updates only grant the credit the session can afford, so
+	// data frames never have to be discarded as a protocol error once they
+	// legally arrive.
+	//
+	// A zero value disables the session window and leaves each stream limited
+	// only by MaxStreamWindowSize.
+	MaxSessionWindowSize uint32
+
 	// StreamOpenTimeout is the maximum amount of time that a stream will
 	// be allowed to remain in pending state while waiting for an ack from the peer.
 	// Once the timeout is reached the session will be gracefully closed.
@@ -85,6 +104,9 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamWindowSize < initialStreamWindow {
 		return fmt.Errorf("MaxStreamWindowSize must be larger than %d", initialStreamWindow)
+	}
+	if config.MaxSessionWindowSize != 0 && config.MaxSessionWindowSize < initialStreamWindow {
+		return fmt.Errorf("MaxSessionWindowSize must be larger than %d", initialStreamWindow)
 	}
 	if config.LogOutput != nil && config.Logger != nil {
 		return fmt.Errorf("both Logger and LogOutput may not be set, select one")

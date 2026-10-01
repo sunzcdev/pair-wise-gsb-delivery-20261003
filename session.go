@@ -74,6 +74,24 @@ type Session struct {
 	recvDoneCh chan struct{}
 	sendDoneCh chan struct{}
 
+	// recvWindowAvail is the amount of receive memory that has not yet been
+	// committed to any stream. Every committed byte is either buffered data
+	// waiting for an application Read or receive credit advertised to the
+	// peer in a window update and not yet consumed. The total of
+	// recvWindowAvail plus all per-stream committed bytes never exceeds
+	// config.MaxSessionWindowSize. A zero limit disables accounting.
+	recvWindowAvail    int64
+	recvWindowLock     sync.Mutex
+	recvWindowNotifyCh chan struct{}
+
+	// starvedStreams holds streams that wanted to expand their receive
+	// window but could not reserve enough session credit. The
+	// recvWindowManager re-attempts their window updates once credit is
+	// released, so streams are never permanently stalled while the
+	// application keeps reading.
+	starvedStreams  map[uint32]*Stream
+	starvedNotifyCh chan struct{}
+
 	// shutdown is used to safely close a session
 	shutdown        bool
 	shutdownErr     error
@@ -118,6 +136,13 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	} else {
 		s.nextStreamID = 2
 	}
+	if config.MaxSessionWindowSize > 0 {
+		s.recvWindowAvail = int64(config.MaxSessionWindowSize)
+		s.recvWindowNotifyCh = make(chan struct{}, 1)
+		s.starvedStreams = make(map[uint32]*Stream)
+		s.starvedNotifyCh = make(chan struct{}, 1)
+		go s.recvWindowManager()
+	}
 	go s.recv()
 	go s.send()
 	if config.EnableKeepAlive {
@@ -136,6 +161,161 @@ func (s *Session) IsClosed() bool {
 	}
 }
 
+// recvWindowLimited reports whether a session-level receive window caps
+// the total committed receive memory.
+func (s *Session) recvWindowLimited() bool {
+	return s.config.MaxSessionWindowSize > 0
+}
+
+// tryReserveRecv attempts to reserve up to want bytes of session receive
+// budget. It never blocks and returns the amount actually granted, which
+// may be smaller than want or zero.
+func (s *Session) tryReserveRecv(want uint32) uint32 {
+	if !s.recvWindowLimited() {
+		return want
+	}
+	s.recvWindowLock.Lock()
+	defer s.recvWindowLock.Unlock()
+	avail := s.recvWindowAvail
+	if avail <= 0 {
+		return 0
+	}
+	granted := want
+	if int64(granted) > avail {
+		granted = uint32(avail)
+	}
+	s.recvWindowAvail -= int64(granted)
+	return granted
+}
+
+// reserveRecv reserves exactly want bytes of session receive budget,
+// blocking until enough credit is released or the session shuts down. It
+// is used while opening an outbound stream, where blocking the caller is
+// preferable to rejecting the stream.
+func (s *Session) reserveRecv(want uint32) error {
+	if !s.recvWindowLimited() {
+		return nil
+	}
+	for {
+		s.recvWindowLock.Lock()
+		if int64(want) <= s.recvWindowAvail {
+			s.recvWindowAvail -= int64(want)
+			leftover := s.recvWindowAvail
+			s.recvWindowLock.Unlock()
+			// Pass the wakeup along so other waiters do not miss
+			// credit that remains after this reservation.
+			if leftover > 0 {
+				asyncNotify(s.recvWindowNotifyCh)
+			}
+			return nil
+		}
+		ch := s.recvWindowNotifyCh
+		s.recvWindowLock.Unlock()
+
+		select {
+		case <-ch:
+		case <-s.shutdownCh:
+			return ErrSessionShutdown
+		}
+	}
+}
+
+// releaseRecv returns amount bytes of receive credit to the session. It is
+// called when buffered data is consumed by the application or when a
+// stream releases its outstanding credit on close or reset.
+func (s *Session) releaseRecv(amount uint32) {
+	if !s.recvWindowLimited() || amount == 0 {
+		return
+	}
+	s.recvWindowLock.Lock()
+	s.recvWindowAvail += int64(amount)
+	if s.recvWindowAvail > int64(s.config.MaxSessionWindowSize) {
+		s.logger.Printf("[ERR] yamux: session receive window credit out of sync (avail=%d, max=%d)",
+			s.recvWindowAvail, s.config.MaxSessionWindowSize)
+		s.recvWindowAvail = int64(s.config.MaxSessionWindowSize)
+	}
+	s.recvWindowLock.Unlock()
+
+	asyncNotify(s.recvWindowNotifyCh)
+	asyncNotify(s.starvedNotifyCh)
+}
+
+// markStarved records a stream that could not expand its receive window
+// to its full credit because the session budget was exhausted. The
+// recvWindowManager re-attempts its window updates as credit frees up.
+func (s *Session) markStarved(stream *Stream) {
+	if !s.recvWindowLimited() {
+		return
+	}
+	s.recvWindowLock.Lock()
+	s.starvedStreams[stream.id] = stream
+	s.recvWindowLock.Unlock()
+	asyncNotify(s.starvedNotifyCh)
+}
+
+// unmarkStarved removes a stream from the starved set.
+func (s *Session) unmarkStarved(id uint32) {
+	if !s.recvWindowLimited() {
+		return
+	}
+	s.recvWindowLock.Lock()
+	delete(s.starvedStreams, id)
+	s.recvWindowLock.Unlock()
+}
+
+// recvWindowManager retries window updates for streams that were unable to
+// claim their full receive credit. Repeatedly retrying after each release
+// ensures a resumed reader drains the backlog instead of deadlocking.
+func (s *Session) recvWindowManager() {
+	for {
+		select {
+		case <-s.starvedNotifyCh:
+		case <-s.shutdownCh:
+			return
+		}
+
+		// Retry every starved stream. sendWindowUpdate unmarks streams
+		// that are satisfied or can no longer use more credit.
+		s.recvWindowLock.Lock()
+		streams := make([]*Stream, 0, len(s.starvedStreams))
+		for _, stream := range s.starvedStreams {
+			streams = append(streams, stream)
+		}
+		s.recvWindowLock.Unlock()
+
+		for _, stream := range streams {
+			if err := stream.sendWindowUpdate(); err != nil {
+				if s.IsClosed() {
+					return
+				}
+				// Transient send failure. The stream stays starved and
+				// the next credit release (or Read) retries it.
+			}
+		}
+
+		// Coalesce bursts. While streams remain starved wait for the next
+		// credit release instead of spinning; once none remain, drop any
+		// stale notification.
+		s.recvWindowLock.Lock()
+		starved := len(s.starvedStreams) > 0
+		if !starved {
+			select {
+			case <-s.starvedNotifyCh:
+			default:
+			}
+		}
+		ch := s.starvedNotifyCh
+		s.recvWindowLock.Unlock()
+		if starved {
+			select {
+			case <-ch:
+			case <-s.shutdownCh:
+				return
+			}
+		}
+	}
+}
+
 // CloseChan returns a read-only channel which is closed as
 // soon as the session is closed.
 func (s *Session) CloseChan() <-chan struct{} {
@@ -148,6 +328,35 @@ func (s *Session) NumStreams() int {
 	num := len(s.streams)
 	s.streamLock.Unlock()
 	return num
+}
+
+// committedRecvTotal returns the total receive memory committed across all
+// streams: bytes buffered for the application plus receive credit advertised
+// to the peer but not yet consumed.
+func (s *Session) committedRecvTotal() int64 {
+	if !s.recvWindowLimited() {
+		return 0
+	}
+	s.streamLock.Lock()
+	streams := make([]*Stream, 0, len(s.streams))
+	for _, stream := range s.streams {
+		streams = append(streams, stream)
+	}
+	s.streamLock.Unlock()
+
+	var total int64
+	for _, stream := range streams {
+		stream.recvLock.Lock()
+		if stream.sessionTracked {
+			var bufLen uint32
+			if stream.recvBuf != nil {
+				bufLen = uint32(stream.recvBuf.Len())
+			}
+			total += int64(stream.recvWindow + bufLen)
+		}
+		stream.recvLock.Unlock()
+	}
+	return total
 }
 
 // Open is used to create a new stream as a net.Conn
@@ -185,6 +394,20 @@ GET_ID:
 		goto GET_ID
 	}
 
+	// Reserve the initial receive window from the session budget before
+	// committing the stream. Blocking here bounds receive memory without
+	// forcing a protocol error on data frames later. Once the stream is
+	// created it owns this reservation, so every teardown path refunds it
+	// through closeStream/markDetached.
+	if err := s.reserveRecv(initialStreamWindow); err != nil {
+		select {
+		case <-s.synCh:
+		default:
+			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
+		}
+		return nil, err
+	}
+
 	// Register the stream
 	stream := newStream(s, id, streamInit)
 	s.streamLock.Lock()
@@ -198,11 +421,7 @@ GET_ID:
 
 	// Send the window update to create
 	if err := stream.sendWindowUpdate(); err != nil {
-		select {
-		case <-s.synCh:
-		default:
-			s.logger.Printf("[ERR] yamux: aborted stream open without inflight syn semaphore")
-		}
+		s.closeStream(id)
 		return nil, err
 	}
 	return stream, nil
@@ -245,6 +464,7 @@ func (s *Session) AcceptStream() (*Stream, error) {
 	select {
 	case stream := <-s.acceptCh:
 		if err := stream.sendWindowUpdate(); err != nil {
+			s.closeStream(stream.id)
 			return nil, err
 		}
 		return stream, nil
@@ -261,6 +481,7 @@ func (s *Session) AcceptStreamWithContext(ctx context.Context) (*Stream, error) 
 		return nil, ctx.Err()
 	case stream := <-s.acceptCh:
 		if err := stream.sendWindowUpdate(); err != nil {
+			s.closeStream(stream.id)
 			return nil, err
 		}
 		return stream, nil
@@ -685,32 +906,52 @@ func (s *Session) incomingStream(id uint32) error {
 		return s.sendNoWait(hdr)
 	}
 
-	// Allocate a new stream
-	stream := newStream(s, id, streamSYNReceived)
-
 	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
-
 	// Check if stream already exists
 	if _, ok := s.streams[id]; ok {
+		s.streamLock.Unlock()
 		s.logger.Printf("[ERR] yamux: duplicate stream declared")
 		if sendErr := s.sendNoWait(s.goAway(goAwayProtoErr)); sendErr != nil {
 			s.logger.Printf("[WARN] yamux: failed to send go away: %v", sendErr)
 		}
 		return ErrDuplicateStream
 	}
+	s.streamLock.Unlock()
 
+	// Reserve the initial receive window from the session budget. If the
+	// session cannot commit the initial window, reject the stream at open
+	// time with a RST. Any data that accompanied the SYN is then drained as
+	// belonging to a stream we never registered, rather than buffered in
+	// excess of the advertised window and later treated as a protocol
+	// error.
+	if s.recvWindowLimited() && s.tryReserveRecv(initialStreamWindow) < initialStreamWindow {
+		// tryReserveRecv granted nothing (it never grants a partial amount
+		// for a full initial window unless the whole window fit), so there
+		// is nothing to refund here.
+		s.logger.Printf("[WARN] yamux: session receive window exhausted, resetting new stream: %d", id)
+		hdr := header(make([]byte, headerSize))
+		hdr.encode(typeWindowUpdate, flagRST, id, 0)
+		return s.sendNoWait(hdr)
+	}
+
+	// Allocate a new stream
+	stream := newStream(s, id, streamSYNReceived)
+
+	s.streamLock.Lock()
 	// Register the stream
 	s.streams[id] = stream
 
 	// Check if we've exceeded the backlog
 	select {
 	case s.acceptCh <- stream:
+		s.streamLock.Unlock()
 		return nil
 	default:
 		// Backlog exceeded! RST the stream
 		s.logger.Printf("[WARN] yamux: backlog exceeded, forcing connection reset")
 		delete(s.streams, id)
+		s.streamLock.Unlock()
+		stream.markDetached(s)
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typeWindowUpdate, flagRST, id, 0)
 		return s.sendNoWait(hdr)
@@ -722,6 +963,7 @@ func (s *Session) incomingStream(id uint32) error {
 // was not yet established, then this will give the credit back.
 func (s *Session) closeStream(id uint32) {
 	s.streamLock.Lock()
+	stream := s.streams[id]
 	if _, ok := s.inflight[id]; ok {
 		select {
 		case <-s.synCh:
@@ -729,8 +971,20 @@ func (s *Session) closeStream(id uint32) {
 			s.logger.Printf("[ERR] yamux: SYN tracking out of sync")
 		}
 	}
+	if stream == nil {
+		s.streamLock.Unlock()
+		return
+	}
 	delete(s.streams, id)
 	s.streamLock.Unlock()
+
+	// Detach the stream from session accounting exactly once. A close may be
+	// reached from several paths (graceful FIN completion, RST, and the
+	// close timeout), so markDetached is the idempotent authority that
+	// returns the stream's committed receive memory (buffered data plus
+	// advertised but unused credit).
+	s.unmarkStarved(id)
+	stream.markDetached(s)
 }
 
 // establishStream is used to mark a stream that was in the

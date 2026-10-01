@@ -138,3 +138,34 @@ provide an error code:
 * 0x0 Normal termination
 * 0x1 Protocol error
 * 0x2 Internal error
+
+## Session receive window
+
+The per-stream window only bounds memory committed to a single stream.
+An implementation MAY additionally enforce a session-level receive
+window (`MaxSessionWindowSize`) that bounds, across every open stream,
+the sum of data already received and buffered for the application plus
+receive credit already advertised to the peer in window updates but not
+yet consumed by incoming data. This keeps the total receive memory of a
+connection bounded even when the peer opens many streams that each stay
+within their own window.
+
+Enforcement happens at stream-open and window-expansion time, never by
+discarding a data frame that was legal under the advertised windows:
+
+* An outbound open blocks until the stream's initial window can be
+  reserved from the session budget.
+* An inbound SYN whose initial window cannot be reserved is rejected
+  with a RST at open time; data accompanying the SYN is drained as
+  belonging to an unregistered stream.
+* Window updates only grant the delta the session can currently afford.
+  A stream whose full expansion cannot be granted yet is revisited as
+  credit is released, so a consumer that resumes reading does not
+  deadlock.
+
+Credit returns to the session when the application reads buffered data
+and when a stream is closed or reset (its buffered data is dropped and
+its outstanding advertised credit is reclaimed). Control frames (Ping,
+GoAway, RST, FIN) keep being processed while the data budget is
+exhausted. A zero `MaxSessionWindowSize` disables the session window and
+leaves each stream limited only by its per-stream maximum.
