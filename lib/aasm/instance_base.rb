@@ -88,6 +88,21 @@ module AASM
       end
     end
 
+    # Performs a single read-only availability check for the current state.
+    #
+    # The returned AASM::Availability combines allowed events, reachable
+    # states, candidate transitions and rejection reasons in one pass. Every
+    # guard is executed at most once during the check, even when it is shared
+    # across several candidate transitions or events, so the lists can never
+    # disagree. Guards skipped by short-circuit evaluation are reported as not
+    # run. No transition action or state callback is executed, and nothing is
+    # cached: call check again after the object's attributes change.
+    def check(*args)
+      AASM::Core::AvailabilityChecker.new(
+        @instance, @instance.class.aasm(@name).state_machine, *args
+      ).result
+    end
+
     def state_object_for_name(name)
       obj = @instance.class.aasm(@name).states.find {|s| s.name == name}
       raise AASM::UndefinedState, "State :#{name} doesn't exist" if obj.nil?

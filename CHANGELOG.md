@@ -1,6 +1,7 @@
 # CHANGELOG
 
 ## unreleased
+* Add a single read-only availability check `instance.aasm.check`, which returns allowed events, reachable states, candidate transitions and rejection reasons together. Each guard runs at most once per check (also when shared across candidates), unrun guards are reported as `:not_run`, and the result is never cached for later fires
 * typo fixes, thanks @kumar-mithlesh [#870](https://github.com/aasm/aasm/pull/870)
 
 ## 6.0.0 (5 July 2026)

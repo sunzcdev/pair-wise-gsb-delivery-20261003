@@ -7,6 +7,18 @@ module AASM::Core
     attr_reader :from, :to, :event, :opts, :failures
     alias_method :options, :opts
 
+    # Ordered :if guard chain used by the read-only availability check.
+    # Event-level guards are already prepended here by
+    # Event#attach_event_guards, so this list is exactly what
+    # Transition#allowed? evaluates first.
+    attr_reader :guards
+
+    # Ordered :unless guard chain used by the read-only availability check,
+    # evaluated after #guards and inverted.
+    def unless_guards
+      @unless
+    end
+
     def initialize(event, opts, &block)
       add_options_from_dsl(opts, [:on_transition, :guard, :after, :success], &block) if block
 

@@ -1269,6 +1269,49 @@ Job.aasm.states_for_select
 job.aasm.states({permitted: true}, guard_parameter).map(&:name)
 ```
 
+#### Single availability check
+
+`states(permitted: true)`, `events(permitted: true)` and `permitted_transitions`
+each evaluate guards on their own. With a guard that counts calls or reads
+external state the resulting lists can disagree, and the same guard may run
+several times. Use `aasm.check` to evaluate all candidate events and
+transitions once and get the allowed events, reachable states and rejection
+reasons in a single result:
+
+```ruby
+job.aasm.check
+
+job.aasm.check.allowed_events.map(&:name)   # events with at least one allowed transition
+#=> [:run]
+job.aasm.check.allowed_transitions          # {event:, state:} pairs, like permitted_transitions
+#=> [{ :event => :run, :state => :running }]
+job.aasm.check.allowed_states.map(&:name)   # states reachable through an allowed transition
+#=> [:running]
+job.aasm.check.may_fire?(:run)              # per-event answer from this check
+#=> true
+
+# why an event cannot fire
+job.aasm.check.rejections[:clean].each do |transition|
+  transition.to               # blocked target state
+  transition.blocked_by       # guards that failed, in evaluation order
+  transition.guards           # every guard: :passed, :failed or :not_run
+end
+```
+
+Within one check every guard is executed at most once: a guard shared by
+several candidate transitions or events is evaluated once and reused. Guard
+chains keep their existing order and short-circuit behaviour (`:if` guards
+first, then `:unless` guards), and a guard that was never run is reported as
+`:not_run` rather than assumed to have failed. The check is read-only: it
+never performs a transition or fires state callbacks.
+
+The result is only a snapshot for display. It is never cached or reused as
+authorization for a later `fire`; call `check` again after the object's
+attributes change.
+
+Named state machines are supported through their instance (`job.aasm(:move).check`),
+and guard arguments can be passed as usual: `job.aasm.check(guard_parameter)`.
+
 
 ### Warning output
 
