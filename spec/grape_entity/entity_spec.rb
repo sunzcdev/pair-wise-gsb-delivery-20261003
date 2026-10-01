@@ -159,6 +159,152 @@ describe Grape::Entity do
               subject.expose(:b)
               expect(subject.represent(model).serializable_hash).to eq(a: 'value', b: nil)
             end
+
+            changing_model_class = Class.new do
+              attr_reader :reads
+
+              def initialize(values)
+                @values = values
+                @reads = 0
+              end
+
+              def value
+                @reads += 1
+                @values.fetch(@reads - 1)
+              end
+            end
+
+            it 'reads a delegated value only once during a representation' do
+              model = changing_model_class.new([:first_read, :second_read])
+
+              subject.expose(:value, expose_nil: false)
+
+              expect(subject.represent(model, serializable: true)).to eq(value: :first_read)
+              expect(model.reads).to eq(1)
+            end
+
+            it 'caches false as an evaluated value' do
+              model = changing_model_class.new([false, :second_read])
+
+              subject.expose(:value, expose_nil: false)
+
+              expect(subject.represent(model, serializable: true)).to eq(value: false)
+              expect(model.reads).to eq(1)
+            end
+
+            it 'caches nil as an evaluated value' do
+              model = changing_model_class.new([nil, :second_read])
+
+              subject.expose(:value, expose_nil: false)
+
+              expect(subject.represent(model, serializable: true)).to eq({})
+              expect(model.reads).to eq(1)
+            end
+
+            it 'reuses the evaluated value when checking it and formatting it' do
+              subject.format_with(:upcase) { |value| value.to_s.upcase }
+              subject.expose(:value, expose_nil: false, format_with: :upcase)
+              model = changing_model_class.new(%w[first second])
+
+              expect(subject.represent(model, serializable: true)).to eq(value: 'FIRST')
+              expect(model.reads).to eq(1)
+            end
+
+            it 'does not reuse values across independent representations and options' do
+              changing_model = Class.new do
+                attr_reader :reads, :other_reads
+
+                def initialize(values)
+                  @values = values
+                  @reads = 0
+                  @other_reads = 0
+                end
+
+                def value
+                  @reads += 1
+                  @values.fetch(@reads - 1)
+                end
+
+                def other
+                  @other_reads += 1
+                  :other
+                end
+              end
+              model = changing_model.new(%i[first second third])
+              subject.expose(:value, expose_nil: false)
+              subject.expose(:other, expose_nil: false)
+              presenter = subject.new(model)
+
+              expect(presenter.serializable_hash(only: %i[value])).to eq(value: :first)
+              expect(presenter.serializable_hash(except: %i[other])).to eq(value: :second)
+              expect(subject.represent(model, only: %i[value], serializable: true)).to eq(value: :third)
+              expect(model.reads).to eq(3)
+              expect(model.other_reads).to be_zero
+            end
+
+            it 'does not read filtered fields, including fields of nested entities' do
+              child_model = Class.new do
+                attr_reader :selected_reads, :ignored_reads
+
+                def initialize
+                  @selected_reads = 0
+                  @ignored_reads = 0
+                end
+
+                def selected
+                  @selected_reads += 1
+                  raise 'selected was read more than once' if @selected_reads > 1
+
+                  :selected
+                end
+
+                def ignored
+                  @ignored_reads += 1
+                  raise 'ignored was read'
+                end
+              end.new
+
+              model = Class.new do
+                attr_reader :child_reads, :other_reads
+
+                def initialize(child)
+                  @child = child
+                  @child_reads = 0
+                  @other_reads = 0
+                end
+
+                def child
+                  @child_reads += 1
+                  raise 'child was read more than once' if @child_reads > 1
+
+                  @child
+                end
+
+                def other
+                  @other_reads += 1
+                  raise 'other was read'
+                end
+              end.new(child_model)
+
+              child_entity = Class.new(Grape::Entity) do
+                expose :selected, expose_nil: false
+                expose :ignored, expose_nil: false
+              end
+              subject.expose(:child, using: child_entity)
+              subject.expose(:other, expose_nil: false)
+
+              result = subject.represent(
+                model,
+                only: [:child, { child: [:selected] }],
+                serializable: true
+              )
+
+              expect(result).to eq(child: { selected: :selected })
+              expect(model.child_reads).to eq(1)
+              expect(model.other_reads).to be_zero
+              expect(child_model.selected_reads).to eq(1)
+              expect(child_model.ignored_reads).to be_zero
+            end
           end
         end
 

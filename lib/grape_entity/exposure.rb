@@ -47,26 +47,16 @@ module Grape
             options[:unless]
           ].compact.flatten.map { |cond| Condition.new_unless(cond) }
 
-          unless_conditions << expose_nil_condition(attribute, options) if options[:expose_nil] == false
+          if options[:expose_nil] == false
+            unless_conditions << Condition::ExposeNilCondition.new(
+              true,
+              attribute,
+              !options[:proc].nil?,
+              options[:proc]
+            )
+          end
 
           if_conditions + unless_conditions
-        end
-
-        def expose_nil_condition(attribute, options)
-          Condition.new_unless(
-            proc do |object, entity_options|
-              if options[:proc].nil?
-                delegator = Delegator.new(object)
-                if is_a?(Grape::Entity) && delegator.accepts_options?
-                  delegator.delegate(attribute, **self.class.delegation_opts).nil?
-                else
-                  delegator.delegate(attribute).nil?
-                end
-              else
-                exec_with_object(entity_options, &options[:proc]).nil?
-              end
-            end
-          )
         end
 
         def build_class_exposure(base_args, using_class, passed_proc)

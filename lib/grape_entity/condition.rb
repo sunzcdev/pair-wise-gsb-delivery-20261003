@@ -4,6 +4,7 @@ require 'grape_entity/condition/base'
 require 'grape_entity/condition/block_condition'
 require 'grape_entity/condition/hash_condition'
 require 'grape_entity/condition/symbol_condition'
+require 'grape_entity/condition/expose_nil_condition'
 
 module Grape
   class Entity

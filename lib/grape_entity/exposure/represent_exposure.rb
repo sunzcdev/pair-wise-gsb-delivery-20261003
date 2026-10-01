@@ -22,9 +22,13 @@ module Grape
             @subexposure == other.subexposure
         end
 
-        def value(entity, options)
+        def value_from_raw(raw_value, entity, options)
           new_options = options.for_nesting(key(entity))
-          using_class.represent(@subexposure.value(entity, options), new_options)
+          using_class.represent(raw_value, new_options)
+        end
+
+        def evaluate_raw_value(entity, options)
+          @subexposure.evaluated_raw_value(entity, options)
         end
 
         def valid?(entity)

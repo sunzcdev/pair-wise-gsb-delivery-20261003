@@ -8,6 +8,7 @@ module Grape
       extend Forwardable
 
       attr_reader :opts_hash
+      attr_accessor :evaluation_context
 
       def_delegators :opts_hash, :dig, :key?, :fetch, :[], :empty?
 
@@ -102,7 +103,7 @@ module Grape
             except: except_fields(key),
             attr_path: opts_hash[:attr_path]
           )
-        )
+        ).tap { |options| options.evaluation_context = evaluation_context }
       end
 
       def build_symbolized_hash(attribute, hash)

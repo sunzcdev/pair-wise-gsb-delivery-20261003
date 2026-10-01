@@ -18,8 +18,8 @@ module Grape
           super && @format_with == other.format_with
         end
 
-        def value(entity, _options)
-          entity.exec_with_attribute(attribute, &@format_with)
+        def value_from_raw(raw_value, entity, _options)
+          entity.instance_exec(raw_value, &@format_with)
         end
       end
     end

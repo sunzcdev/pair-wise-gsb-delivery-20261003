@@ -518,6 +518,7 @@ module Grape
       return nil if object.nil?
 
       opts = options.merge(runtime_options || {})
+      opts.evaluation_context = EvaluationContext.new
 
       root_exposure.serializable_value(self, opts)
     end

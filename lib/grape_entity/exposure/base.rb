@@ -65,8 +65,16 @@ module Grape
           end
         end
 
-        def value(_entity, _options)
-          raise NotImplementedError
+        def value(entity, options)
+          value_from_raw(evaluate_raw_value(entity, options), entity, options)
+        end
+
+        def value_from_raw(raw_value, _entity, _options)
+          raw_value
+        end
+
+        def evaluate_raw_value(entity, _options)
+          entity.delegate_attribute(attribute)
         end
 
         def serializable_value(entity, options)
@@ -88,8 +96,34 @@ module Grape
         def valid_value(entity, options)
           return unless valid?(entity)
 
-          output = value(entity, options)
+          output = evaluated_value(entity, options)
           output.blank? && !@default_value.nil? ? @default_value : output
+        end
+
+        def conditions_met?(entity, options)
+          context = evaluation_context_for(options)
+
+          if context
+            context.evaluating(self) do
+              @conditions.all? { |condition| condition.met? entity, options }
+            end
+          else
+            @conditions.all? { |condition| condition.met? entity, options }
+          end
+        end
+
+        def evaluated_value(entity, options)
+          context = evaluation_context_for(options)
+          context ? context.value(self, entity, options) : value(entity, options)
+        end
+
+        def evaluated_raw_value(entity, options)
+          context = evaluation_context_for(options)
+          context ? context.raw_value(self, entity, options) : evaluate_raw_value(entity, options)
+        end
+
+        def condition_raw_value(entity, options)
+          evaluated_raw_value(entity, options)
         end
 
         def should_return_key?(options)
@@ -98,10 +132,6 @@ module Grape
 
         def conditional?
           !@conditions.empty?
-        end
-
-        def conditions_met?(entity, options)
-          @conditions.all? { |condition| condition.met? entity, options }
         end
 
         def should_expose?(entity, options)
@@ -127,6 +157,10 @@ module Grape
 
         def override?
           @override
+        end
+
+        def evaluation_context_for(options)
+          options.evaluation_context if options.respond_to?(:evaluation_context)
         end
 
         protected

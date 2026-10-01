@@ -30,10 +30,18 @@ module Grape
           nested_exposures.all? { |e| e.valid?(entity) }
         end
 
-        def value(entity, options)
+        def value_from_raw(raw_value, _entity, _options)
+          raw_value
+        end
+
+        def evaluate_raw_value(entity, options)
           map_entity_exposures(entity, options) do |exposure, nested_options|
-            exposure.value(entity, nested_options)
+            exposure.evaluated_raw_value(entity, nested_options)
           end
+        end
+
+        def condition_raw_value(entity, options)
+          entity.delegate_attribute(attribute)
         end
 
         def serializable_value(entity, options)

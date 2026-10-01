@@ -6,7 +6,7 @@ module Grape
       class BlockExposure < Base
         attr_reader :block
 
-        def value(entity, options)
+        def evaluate_raw_value(entity, options)
           entity.exec_with_object(options, &@block)
         end
 
