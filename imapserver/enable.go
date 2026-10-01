@@ -28,6 +28,10 @@ func (c *Conn) handleEnable(dec *imapwire.Decoder) error {
 		switch req {
 		case imap.CapIMAP4rev2, imap.CapUTF8Accept:
 			enabled = append(enabled, req)
+		case imap.CapCondStore:
+			if c.condStoreSupported() {
+				enabled = append(enabled, req)
+			}
 		}
 	}
 

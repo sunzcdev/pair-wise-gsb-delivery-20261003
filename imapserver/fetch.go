@@ -75,12 +75,33 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 		}
 	}
 
+	if dec.SP() {
+		// Fetch modifiers, e.g. "(CHANGEDSINCE <mod-seq>)"
+		if !dec.ExpectSpecial('(') {
+			return dec.Err()
+		}
+		var name string
+		if !dec.ExpectAtom(&name) {
+			return dec.Err()
+		}
+		if strings.ToUpper(name) != "CHANGEDSINCE" {
+			return newClientBugError(fmt.Sprintf("Unknown FETCH modifier %q", name))
+		}
+		if !dec.ExpectSP() || !dec.ExpectModSeq(&options.ChangedSince) || !dec.ExpectSpecial(')') {
+			return dec.Err()
+		}
+	}
+
 	if !dec.ExpectCRLF() {
 		return dec.Err()
 	}
 
 	if err := c.checkState(imap.ConnStateSelected); err != nil {
 		return err
+	}
+
+	if (options.ModSeq || options.ChangedSince != 0) && !c.condStoreSupported() {
+		return newClientBugError("CONDSTORE is not supported")
 	}
 
 	if numKind == NumKindUID {
@@ -108,6 +129,8 @@ func handleFetchAtt(dec *imapwire.Decoder, attName string, options *imap.FetchOp
 		options.RFC822Size = true
 	case "UID":
 		options.UID = true
+	case "MODSEQ":
+		options.ModSeq = true
 	case "RFC822": // equivalent to BODY[]
 		bs := &imap.FetchItemBodySection{}
 		writerOptions.obsolete[bs] = attName
@@ -364,6 +387,12 @@ func (w *FetchResponseWriter) WriteFlags(flags []imap.Flag) {
 	w.enc.Atom("FLAGS").SP().List(len(flags), func(i int) {
 		w.enc.Flag(flags[i])
 	})
+}
+
+// WriteModSeq writes the message's mod-sequence.
+func (w *FetchResponseWriter) WriteModSeq(modSeq uint64) {
+	w.writeItemSep()
+	w.enc.Atom("MODSEQ").SP().Special('(').ModSeq(modSeq).Special(')')
 }
 
 // WriteRFC822Size writes the message's full size.

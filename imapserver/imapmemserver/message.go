@@ -22,7 +22,8 @@ type message struct {
 	t   time.Time
 
 	// mutable, protected by Mailbox.mutex
-	flags map[imap.Flag]struct{}
+	flags  map[imap.Flag]struct{}
+	modSeq uint64
 }
 
 func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.FetchOptions) error {
@@ -30,6 +31,9 @@ func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.Fetch
 
 	if options.Flags {
 		w.WriteFlags(msg.flagList())
+	}
+	if options.ModSeq {
+		w.WriteModSeq(msg.modSeq)
 	}
 	if options.InternalDate {
 		w.WriteInternalDate(msg.t)
@@ -95,22 +99,55 @@ func (msg *message) flagList() []imap.Flag {
 	return flags
 }
 
-func (msg *message) store(store *imap.StoreFlags) {
+// store applies a flag update to the message. It reports whether the flags
+// have actually changed.
+func (msg *message) store(store *imap.StoreFlags) bool {
 	switch store.Op {
 	case imap.StoreFlagsSet:
-		msg.flags = make(map[imap.Flag]struct{})
-		fallthrough
+		newFlags := make(map[imap.Flag]struct{}, len(store.Flags))
+		for _, flag := range store.Flags {
+			newFlags[canonicalFlag(flag)] = struct{}{}
+		}
+		if flagsEqual(msg.flags, newFlags) {
+			return false
+		}
+		msg.flags = newFlags
+		return true
 	case imap.StoreFlagsAdd:
+		changed := false
 		for _, flag := range store.Flags {
-			msg.flags[canonicalFlag(flag)] = struct{}{}
+			flag = canonicalFlag(flag)
+			if _, ok := msg.flags[flag]; !ok {
+				msg.flags[flag] = struct{}{}
+				changed = true
+			}
 		}
+		return changed
 	case imap.StoreFlagsDel:
+		changed := false
 		for _, flag := range store.Flags {
-			delete(msg.flags, canonicalFlag(flag))
+			flag = canonicalFlag(flag)
+			if _, ok := msg.flags[flag]; ok {
+				delete(msg.flags, flag)
+				changed = true
+			}
 		}
+		return changed
 	default:
 		panic(fmt.Errorf("unknown STORE flag operation: %v", store.Op))
 	}
+}
+
+func flagsEqual(a, b map[imap.Flag]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for flag := range a {
+		if _, ok := b[flag]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (msg *message) reader() *gomessage.Entity {
@@ -151,6 +188,9 @@ func (msg *message) search(seqNum uint32, criteria *imap.SearchCriteria) bool {
 		return false
 	}
 	if criteria.Smaller != 0 && int64(len(msg.buf)) >= criteria.Smaller {
+		return false
+	}
+	if criteria.ModSeq != nil && msg.modSeq < criteria.ModSeq.ModSeq {
 		return false
 	}
 

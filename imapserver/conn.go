@@ -611,12 +611,21 @@ func (w *UpdateWriter) WriteMailboxFlags(flags []imap.Flag) error {
 }
 
 // WriteMessageFlags writes a FETCH response with FLAGS.
-func (w *UpdateWriter) WriteMessageFlags(seqNum uint32, uid imap.UID, flags []imap.Flag) error {
+func (w *UpdateWriter) WriteMessageFlags(seqNum uint32, uid imap.UID, flags []imap.Flag, modSeq uint64) error {
 	fetchWriter := &FetchWriter{conn: w.conn}
 	respWriter := fetchWriter.CreateMessage(seqNum)
 	if uid != 0 {
 		respWriter.WriteUID(uid)
 	}
 	respWriter.WriteFlags(flags)
+	if modSeq != 0 {
+		respWriter.WriteModSeq(modSeq)
+	}
 	return respWriter.Close()
+}
+
+// condStoreSupported checks whether the session supports CONDSTORE.
+func (c *Conn) condStoreSupported() bool {
+	_, ok := c.session.(SessionCondStore)
+	return ok
 }

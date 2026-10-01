@@ -75,6 +75,10 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		return err
 	}
 
+	if criteria.ModSeq != nil && !c.condStoreSupported() {
+		return newClientBugError("CONDSTORE is not supported")
+	}
+
 	// If no return option is specified, ALL is assumed
 	if !options.ReturnMin && !options.ReturnMax && !options.ReturnAll && !options.ReturnCount {
 		options.ReturnAll = true
@@ -88,7 +92,7 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	if c.enabled.Has(imap.CapIMAP4rev2) || extended {
 		return c.writeESearch(tag, data, &options, numKind)
 	} else {
-		return c.writeSearch(data.All)
+		return c.writeSearch(data)
 	}
 }
 
@@ -117,11 +121,16 @@ func (c *Conn) writeESearch(tag string, data *imap.SearchData, options *imap.Sea
 	if options.ReturnCount {
 		enc.SP().Atom("COUNT").SP().Number(data.Count)
 	}
+	if data.ModSeq != 0 {
+		enc.SP().Atom("MODSEQ").SP().ModSeq(data.ModSeq)
+	}
 	return enc.CRLF()
 }
 
 func isNumSetEmpty(numSet imap.NumSet) bool {
 	switch numSet := numSet.(type) {
+	case nil:
+		return true
 	case imap.SeqSet:
 		return len(numSet) == 0
 	case imap.UIDSet:
@@ -131,13 +140,13 @@ func isNumSetEmpty(numSet imap.NumSet) bool {
 	}
 }
 
-func (c *Conn) writeSearch(numSet imap.NumSet) error {
+func (c *Conn) writeSearch(data *imap.SearchData) error {
 	enc := newResponseEncoder(c)
 	defer enc.end()
 
 	enc.Atom("*").SP().Atom("SEARCH")
 	var ok bool
-	switch numSet := numSet.(type) {
+	switch numSet := data.All.(type) {
 	case imap.SeqSet:
 		var nums []uint32
 		nums, ok = numSet.Nums()
@@ -153,6 +162,9 @@ func (c *Conn) writeSearch(numSet imap.NumSet) error {
 	}
 	if !ok {
 		return fmt.Errorf("imapserver: failed to enumerate message numbers in SEARCH response")
+	}
+	if data.ModSeq != 0 {
+		enc.SP().Special('(').Atom("MODSEQ").SP().ModSeq(data.ModSeq).Special(')')
 	}
 	return enc.CRLF()
 }
@@ -326,6 +338,32 @@ func readSearchKeyWithAtom(criteria *imap.SearchCriteria, dec *imapwire.Decoder,
 			return err
 		}
 		criteria.Or = append(criteria.Or, or)
+	case "MODSEQ":
+		// MODSEQ ["<entry-name>" <entry-type-req>] <mod-sequence-value>
+		if !dec.ExpectSP() {
+			return dec.Err()
+		}
+		modSeq := &imap.SearchCriteriaModSeq{}
+		var entryName string
+		if dec.Quoted(&entryName) {
+			var entryType string
+			if !dec.ExpectSP() || !dec.ExpectAtom(&entryType) || !dec.ExpectSP() {
+				return dec.Err()
+			}
+			switch entryType = strings.ToLower(entryType); entryType {
+			case string(imap.SearchCriteriaMetadataAll),
+				string(imap.SearchCriteriaMetadataPrivate),
+				string(imap.SearchCriteriaMetadataShared):
+				modSeq.MetadataName = entryName
+				modSeq.MetadataType = imap.SearchCriteriaMetadataType(entryType)
+			default:
+				return newClientBugError("unknown MODSEQ entry type")
+			}
+		}
+		if !dec.ExpectModSeq(&modSeq.ModSeq) {
+			return dec.Err()
+		}
+		criteria.ModSeq = modSeq
 	case "$":
 		criteria.UID = append(criteria.UID, imap.SearchRes())
 	default:

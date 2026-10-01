@@ -124,3 +124,17 @@ type SessionAppendLimit interface {
 	// this server in an APPEND command.
 	AppendLimit() uint32
 }
+
+// SessionCondStore is an IMAP session which supports CONDSTORE.
+type SessionCondStore interface {
+	Session
+
+	// Selected state
+
+	// StoreCondStore performs a conditional STORE. It behaves like Store,
+	// but only updates messages with a mod-sequence less than or equal to
+	// options.UnchangedSince. It returns the set of messages which failed
+	// the check and were left unmodified. The returned number set has the
+	// same kind (sequence numbers or UIDs) as numSet.
+	StoreCondStore(w *FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) (modified imap.NumSet, err error)
+}

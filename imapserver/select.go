@@ -2,6 +2,7 @@ package imapserver
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
@@ -9,12 +10,45 @@ import (
 
 func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) error {
 	var mailbox string
-	if !dec.ExpectSP() || !dec.ExpectMailbox(&mailbox) || !dec.ExpectCRLF() {
+	if !dec.ExpectSP() || !dec.ExpectMailbox(&mailbox) {
+		return dec.Err()
+	}
+
+	options := imap.SelectOptions{ReadOnly: readOnly}
+	if dec.SP() {
+		// Select parameters, e.g. "(CONDSTORE)"
+		if !dec.ExpectSpecial('(') {
+			return dec.Err()
+		}
+		for {
+			var name string
+			if !dec.ExpectAtom(&name) {
+				return dec.Err()
+			}
+			switch strings.ToUpper(name) {
+			case "CONDSTORE":
+				options.CondStore = true
+			default:
+				return newClientBugError(fmt.Sprintf("Unknown SELECT parameter %q", name))
+			}
+			if dec.Special(')') {
+				break
+			}
+			if !dec.ExpectSP() {
+				return dec.Err()
+			}
+		}
+	}
+	if !dec.ExpectCRLF() {
 		return dec.Err()
 	}
 
 	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
 		return err
+	}
+
+	if options.CondStore && !c.condStoreSupported() {
+		return newClientBugError("CONDSTORE is not supported")
 	}
 
 	if c.state == imap.ConnStateSelected {
@@ -32,7 +66,6 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		}
 	}
 
-	options := imap.SelectOptions{ReadOnly: readOnly}
 	data, err := c.session.Select(mailbox, &options)
 	if err != nil {
 		return err
@@ -56,6 +89,15 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 	}
 	if err := c.writeUIDNext(data.UIDNext); err != nil {
 		return err
+	}
+	if data.HighestModSeq != 0 {
+		if err := c.writeHighestModSeq(data.HighestModSeq); err != nil {
+			return err
+		}
+	} else if c.condStoreSupported() {
+		if err := c.writeNoModSeq(); err != nil {
+			return err
+		}
 	}
 	if err := c.writeFlags(data.Flags); err != nil {
 		return err
@@ -150,6 +192,24 @@ func (c *Conn) writeUIDNext(uidNext imap.UID) error {
 	enc.Atom("*").SP().Atom("OK").SP()
 	enc.Special('[').Atom("UIDNEXT").SP().UID(uidNext).Special(']')
 	enc.SP().Text("Predicted next UID")
+	return enc.CRLF()
+}
+
+func (c *Conn) writeHighestModSeq(modSeq uint64) error {
+	enc := newResponseEncoder(c)
+	defer enc.end()
+	enc.Atom("*").SP().Atom("OK").SP()
+	enc.Special('[').Atom("HIGHESTMODSEQ").SP().ModSeq(modSeq).Special(']')
+	enc.SP().Text("Highest mailbox mod-sequence")
+	return enc.CRLF()
+}
+
+func (c *Conn) writeNoModSeq() error {
+	enc := newResponseEncoder(c)
+	defer enc.end()
+	enc.Atom("*").SP().Atom("OK").SP()
+	enc.Special('[').Atom("NOMODSEQ").Special(']')
+	enc.SP().Text("Mailbox does not support mod-sequences")
 	return enc.CRLF()
 }
 
