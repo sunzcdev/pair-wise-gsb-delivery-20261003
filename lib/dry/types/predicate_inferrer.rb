@@ -113,6 +113,17 @@ module Dry
         def visit_array(_)
           ARRAY
         end
+        alias_method :visit_tuple, :visit_array
+
+        # @api private
+        def visit_slot(node)
+          visit(node[0])
+        end
+
+        # @api private
+        def visit_default(node)
+          visit(node[0])
+        end
 
         # @api private
         def visit_lax(node)

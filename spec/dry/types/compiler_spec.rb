@@ -347,6 +347,49 @@ RSpec.describe Dry::Types::Compiler, "#call" do
     expect(type.valid?(5 => "x")).to eql(false)
   end
 
+  context "tuples" do
+    it "builds a tuple" do
+      tuple = Dry::Types["nominal.array"].tuple(
+        Dry::Types["strict.symbol"],
+        Dry::Types["strict.integer"]
+      )
+
+      type = compiler.(tuple.to_ast)
+
+      expect(type).to eql(tuple)
+      expect(type.([:create, 1])).to eql([:create, 1])
+    end
+
+    it "builds a tuple with optional slots and a repeated tail" do
+      tuple = Dry::Types["nominal.array"].tuple(
+        Dry::Types["strict.symbol"],
+        Dry::Types["strict.integer"].omittable,
+        Dry::Types["coercible.string"].rest
+      )
+
+      type = compiler.(tuple.to_ast)
+
+      expect(type).to eql(tuple)
+      expect(type.([:create, 1, "a", "b"])).to eql([:create, 1, "a", "b"])
+      expect(type.([:create])).to eql([:create])
+    end
+
+    it "rejects too many elements in a compiled tuple" do
+      tuple = Dry::Types["nominal.array"].tuple(
+        Dry::Types["strict.symbol"],
+        Dry::Types["strict.integer"]
+      )
+
+      type = compiler.(tuple.to_ast)
+
+      expect {
+        type.([:create, 1, 2])
+      }.to raise_error(Dry::Types::TupleError) { |error|
+        expect(error.index).to be(2)
+      }
+    end
+  end
+
   context "constructors" do
     example "simple constructor" do
       fn = -> v { v.to_s }

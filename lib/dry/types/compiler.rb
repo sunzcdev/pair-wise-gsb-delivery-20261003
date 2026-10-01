@@ -69,6 +69,36 @@ module Dry
         registry["nominal.array"].of(member).meta(meta)
       end
 
+      def visit_tuple(node)
+        slots, meta = node
+        slots = slots.map { |slot| visit(slot) }
+        registry["nominal.array"].tuple(*slots).meta(meta)
+      end
+
+      def visit_slot(node)
+        type, options = node
+        Tuple::Slot.new(
+          visit(type),
+          optional: options.fetch(:optional, false),
+          rest: options.fetch(:rest, false)
+        )
+      end
+
+      def visit_default(node)
+        type, value = node
+        kind, *payload = value
+
+        default_value =
+          case kind
+          when :value
+            payload.fetch(0)
+          else
+            compile_fn(value)
+          end
+
+        visit(type).default(default_value)
+      end
+
       def visit_hash(node)
         opts, meta = node
         registry["nominal.hash"].with(**opts, meta: meta)

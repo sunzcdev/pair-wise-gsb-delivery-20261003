@@ -117,6 +117,20 @@ module Dry
       #
       # @api private
       def callable? = false
+
+      # @see Nominal#to_ast
+      #
+      # @api public
+      def to_ast(meta: true)
+        value_ast =
+          if callable?
+            Constructor::Function[value].to_ast
+          else
+            [:value, value]
+          end
+
+        [:default, [type.to_ast(meta: meta), value_ast]]
+      end
     end
   end
 end

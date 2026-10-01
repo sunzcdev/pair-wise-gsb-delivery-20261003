@@ -87,6 +87,26 @@ module Dry
     SchemaKeyError = ::Class.new(CoercionError)
     private_constant(:SchemaKeyError)
 
+    # Raised when a tuple declaration itself is ambiguous or otherwise invalid
+    class TupleDeclarationError < ::ArgumentError
+    end
+
+    # Raised when a value does not conform to a tuple type
+    class TupleError < CoercionError
+      # Index of the offending element in the original input,
+      # nil when the input is not an array at all
+      #
+      # @return [Integer,nil]
+      attr_reader :index
+
+      # @param [String] message
+      # @param [Integer,nil] index
+      def initialize(message, index: nil)
+        super(message)
+        @index = index
+      end
+    end
+
     class MissingKeyError < SchemaKeyError
       # @return [Symbol]
       attr_reader :key

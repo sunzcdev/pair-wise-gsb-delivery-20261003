@@ -292,4 +292,39 @@ RSpec.describe Dry::Types::Builder, "#default" do
       expect(type.meta(bar: :baz).meta).to eql(foo: :bar, bar: :baz)
     end
   end
+
+  describe "#to_ast" do
+    let(:compiler) { Dry::Types::Compiler.new(Dry::Types) }
+
+    context "with a static value" do
+      subject(:type) { Dry::Types["nominal.string"].default("foo") }
+
+      it "dumps a default node" do
+        expect(type.to_ast).to eql(
+          [:default, [[:nominal, [String, {}, {}]], [:value, "foo"]]]
+        )
+      end
+
+      it "round-trips through the compiler" do
+        expect(compiler.(type.to_ast)).to eql(type)
+        expect(compiler.(type.to_ast)[]).to eql("foo")
+      end
+    end
+
+    context "with a callable value" do
+      subject(:type) { Dry::Types["nominal.integer"].default(-> _ { 42 }) }
+
+      it "dumps the callable as a registered function id" do
+        kind, id = type.to_ast[1][1]
+
+        expect(kind).to be(:id)
+        expect(id).to be_a(::String)
+        expect(Dry::Types::FnContainer[id].call(type.type)).to be(42)
+      end
+
+      it "round-trips through the compiler" do
+        expect(compiler.(type.to_ast)[]).to be(42)
+      end
+    end
+  end
 end

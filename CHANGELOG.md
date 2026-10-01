@@ -9,6 +9,9 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Tuple types: arrays with per-position type declarations via `Array#tuple`. Positions can form a fixed required prefix, be followed by optional tail slots (`.omittable`, or slots carrying default values), and end with a separately declared repeated tail (`.rest`). Ambiguous declarations (a required slot after an optional one, a repeated tail that is not last, more than one repeated tail) raise `TupleDeclarationError` at declaration time. Missing positions are never coerced to `nil` and extra elements are never dropped silently; errors report the offending index in the original input. `#call`, the failure-block form, and `#try` all follow the same positional rules. Homogeneous `Array#of` types are unchanged.
+- `Default` types now serialize to the AST (`[:default, [...]]`) and compile back preserving both static and callable default values.
+
 ### Changed
 
 ### Deprecated

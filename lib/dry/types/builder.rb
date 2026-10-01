@@ -72,6 +72,28 @@ module Dry
         constrained_type.new(self, rule: Types.Rule(...))
       end
 
+      # Declare the type as an optional tail item of a tuple
+      #
+      # @see Dry::Types::Array#tuple
+      #
+      # @return [Dry::Types::Tuple::Slot]
+      #
+      # @api public
+      def omittable
+        Tuple::Slot.new(self, optional: true)
+      end
+
+      # Declare the type as a separately declared repeated tail of a tuple
+      #
+      # @see Dry::Types::Array#tuple
+      #
+      # @return [Dry::Types::Tuple::Slot]
+      #
+      # @api public
+      def rest
+        Tuple::Slot.new(self, rest: true)
+      end
+
       # Turn a type into a type with a default value
       #
       # @param [Object] input
