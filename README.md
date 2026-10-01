@@ -241,6 +241,47 @@ proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).HandleConnect(
 proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).Do(YourReqHandlerFunc())
 ```
 
+## Upstream proxy failover
+When two or more upstream proxy lines are available, `UpstreamFailover`
+sends each request to the preferred line and tries the next one only while
+the request is still safely replayable. It works for both regular HTTP
+forwarding and CONNECT tunnelling, and each line carries its own proxy
+credentials.
+
+```go
+fo := &goproxy.UpstreamFailover{
+    Lines: []*goproxy.UpstreamLine{
+        {Name: "primary", URL: "http://10.0.0.1:3128", Username: "u1", Password: "p1"},
+        {Name: "backup",  URL: "http://10.0.0.2:3128", Username: "u2", Password: "p2"},
+    },
+    // Optional: choose/reorder lines per request. nil uses Lines order.
+    SelectLine: func(req *http.Request) []string { return nil },
+    // Optional: replay otherwise non-seekable bodies up to this size.
+    BufferBody: 64 * 1024,
+}
+if err := proxy.EnableUpstreamFailover(fo); err != nil {
+    log.Fatal(err)
+}
+```
+
+Fallback boundaries:
+- Connection refused/reset/timeout (or TLS failure) to a line: the next line
+  is always tried, for forwarding and CONNECT alike.
+- `407 Proxy Authentication Required` from a line: the next line is tried
+  only if the request body can be replayed (no body, a `GetBody`, or
+  `BufferBody` capturing it).
+- A non-200 CONNECT answer other than 407, received before the tunnel opens,
+  always triggers a retry on the next line.
+- Once part of the request body has been written to an upstream proxy and the
+  connection breaks, or once a CONNECT tunnel has answered `200`, no other
+  line is used: the request may already be in flight.
+
+When every line fails, the error is `*goproxy.UpstreamFailoverError` (use
+`goproxy.AsUpstreamFailoverError`), listing each line actually attempted (with
+phase/status) and each line not tried. Credentials never appear in it.
+Per-line `Proxy-Authorization` is injected on that proxy hop only and is
+stripped before the request reaches the destination.
+
 ## Error handling
 ### Generic error
 If an error occurs while handling a request through the proxy, by default
