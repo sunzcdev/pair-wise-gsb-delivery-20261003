@@ -95,6 +95,10 @@ func (c *Conn) availableCaps() []imap.Cap {
 			imap.CapUnauthenticate,
 		})
 
+		if _, ok := c.session.(SessionSort); ok {
+			addAvailableCaps(&caps, available, []imap.Cap{imap.CapSort})
+		}
+
 		if appendLimitSession, ok := c.session.(SessionAppendLimit); ok {
 			limit := appendLimitSession.AppendLimit()
 			caps = append(caps, imap.Cap(fmt.Sprintf("APPENDLIMIT=%d", limit)))

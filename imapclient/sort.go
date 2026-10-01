@@ -5,27 +5,27 @@ import (
 	"github.com/emersion/go-imap/v2/internal/imapwire"
 )
 
-type SortKey string
+// SortKey is a sort key for the SORT command.
+type SortKey = imap.SortKey
 
+// Sort keys for the SORT command.
 const (
-	SortKeyArrival SortKey = "ARRIVAL"
-	SortKeyCc      SortKey = "CC"
-	SortKeyDate    SortKey = "DATE"
-	SortKeyFrom    SortKey = "FROM"
-	SortKeySize    SortKey = "SIZE"
-	SortKeySubject SortKey = "SUBJECT"
-	SortKeyTo      SortKey = "TO"
+	SortKeyArrival = imap.SortKeyArrival
+	SortKeyCc      = imap.SortKeyCc
+	SortKeyDate    = imap.SortKeyDate
+	SortKeyFrom    = imap.SortKeyFrom
+	SortKeySize    = imap.SortKeySize
+	SortKeySubject = imap.SortKeySubject
+	SortKeyTo      = imap.SortKeyTo
 )
 
-type SortCriterion struct {
-	Key     SortKey
-	Reverse bool
-}
+// SortCriterion is a single sort criterion for the SORT command.
+type SortCriterion = imap.SortCriterion
 
 // SortOptions contains options for the SORT command.
 type SortOptions struct {
 	SearchCriteria *imap.SearchCriteria
-	SortCriteria   []SortCriterion
+	SortCriteria   []imap.SortCriterion
 }
 
 func (c *Client) sort(numKind imapwire.NumKind, options *SortOptions) *SortCommand {
@@ -39,7 +39,11 @@ func (c *Client) sort(numKind imapwire.NumKind, options *SortOptions) *SortComma
 		enc.Atom(string(criterion.Key))
 	})
 	enc.SP().Atom("UTF-8").SP()
-	writeSearchKey(enc.Encoder, options.SearchCriteria)
+	if options.SearchCriteria != nil {
+		writeSearchKey(enc.Encoder, options.SearchCriteria)
+	} else {
+		enc.Atom("ALL")
+	}
 	enc.end()
 	return cmd
 }

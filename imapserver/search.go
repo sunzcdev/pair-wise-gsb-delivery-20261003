@@ -50,21 +50,8 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	}
 
 	var criteria imap.SearchCriteria
-	for {
-		var err error
-		if atom != "" {
-			err = readSearchKeyWithAtom(&criteria, dec, atom)
-			atom = ""
-		} else {
-			err = readSearchKey(&criteria, dec)
-		}
-		if err != nil {
-			return fmt.Errorf("in search-key: %w", err)
-		}
-
-		if !dec.SP() {
-			break
-		}
+	if err := readSearchCriteriaArgs(&criteria, dec, atom); err != nil {
+		return err
 	}
 
 	if !dec.ExpectCRLF() {
