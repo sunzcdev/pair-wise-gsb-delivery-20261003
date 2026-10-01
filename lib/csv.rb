@@ -365,6 +365,8 @@ require_relative "csv/writer"
 #   non-compliant data.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +field_presence+: Specifies whether field presence information is tracked while parsing,
+#   and honored while writing.
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -396,6 +398,8 @@ require_relative "csv/writer"
 #
 # :include: ../doc/csv/options/parsing/empty_value.rdoc
 #
+# :include: ../doc/csv/options/common/field_presence.rdoc
+#
 # ==== Options for Generating
 #
 # Options for generating, described in detail below, include:
@@ -408,6 +412,8 @@ require_relative "csv/writer"
 # - +write_converters+: Specifies the field converters to be used in writing.
 # - +write_nil_value+: Specifies the object that is to be substituted for each +nil+-valued field.
 # - +write_empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +field_presence+: Specifies whether field presence information is tracked while parsing,
+#   and honored while writing.
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -426,6 +432,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/generating/write_nil_value.rdoc
 #
 # :include: ../doc/csv/options/generating/write_empty_value.rdoc
+#
+# :include: ../doc/csv/options/common/field_presence.rdoc
 #
 # === \CSV with Headers
 #
@@ -970,6 +978,7 @@ class CSV
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
+    field_presence:     false,
     # For generating.
     write_headers:      nil,
     quote_empty:        true,
@@ -2053,6 +2062,7 @@ class CSV
                  nil_value: nil,
                  empty_value: "",
                  strip: false,
+                 field_presence: false,
                  quote_empty: true,
                  write_converters: nil,
                  write_nil_value: nil,
@@ -2108,6 +2118,7 @@ class CSV
       nil_value: nil_value,
       empty_value: empty_value,
       strip: strip,
+      field_presence: field_presence,
     }
     @parser = nil
 
@@ -2115,6 +2126,7 @@ class CSV
       encoding: @encoding,
       force_encoding: (not encoding.nil?),
       force_quotes: force_quotes,
+      field_presence: field_presence,
       headers: headers,
       write_headers: write_headers,
       column_separator: col_sep,

@@ -1007,7 +1007,7 @@ class CSV
       limit = @table.size + 1 + limit if limit < 0
       limit = 0 if limit < 0
       @table.first(limit).each do |row|
-        array.push(row.fields.to_csv(**options)) unless row.header_row?
+        array.push(row.to_csv(**options)) unless row.header_row?
       end
 
       array.join("")

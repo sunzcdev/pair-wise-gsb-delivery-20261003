@@ -17,6 +17,7 @@ class CSV
       @output = output
       @options = options
       @lineno = 0
+      @field_presence = options[:field_presence]
       @fields_converter = nil
       prepare
       if @options[:write_headers] and @headers
@@ -31,7 +32,7 @@ class CSV
     def <<(row)
       case row
       when Row
-        row = row.fields
+        row = @field_presence ? row.present_fields : row.fields
       when Hash
         row = @headers.collect {|header| row[header]}
       end

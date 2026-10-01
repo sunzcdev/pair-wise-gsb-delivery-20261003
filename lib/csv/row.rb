@@ -98,21 +98,35 @@ class CSV
     #
     # If the optional argument +header_row+ is given as +true+,
     # the created row is a header row:
-    #   row = CSV::Row.new(['Name', 'Value'], ['foo', 0], header_row = true)
-    #   row # => #<CSV::Row "Name":"foo" "Value":0>
-    #   row.field_row? # => false
-    #   row.header_row? # => true
-    def initialize(headers, fields, header_row = false)
-      @header_row = header_row
-      headers.each { |h| h.freeze if h.is_a? String }
+  #   row = CSV::Row.new(['Name', 'Value'], ['foo', 0], header_row = true)
+  #   row # => #<CSV::Row "Name":"foo" "Value":0>
+  #   row.field_row? # => false
+  #   row.header_row? # => true
+  #
+  # The optional keyword argument +field_info+ accepts an \Array of
+  # field state Symbols, one for each resulting header-value pair;
+  # see #field_state.  It is used internally by the \CSV parser when
+  # option +field_presence+ is enabled; see
+  # {Option +field_presence+}[../CSV.html#class-CSV-label-Option+field_presence].
+  def initialize(headers, fields, header_row = false, field_info: nil)
+    @header_row = header_row
+    headers.each { |h| h.freeze if h.is_a? String }
 
-      # handle extra headers or fields
-      @row = if headers.size >= fields.size
-        headers.zip(fields)
-      else
-        fields.zip(headers).each(&:reverse!)
-      end
+    # handle extra headers or fields
+    @row = if headers.size >= fields.size
+      headers.zip(fields)
+    else
+      fields.zip(headers).each(&:reverse!)
     end
+
+    if field_info
+      field_info = field_info.dup
+      if field_info.size < @row.size
+        field_info.fill(:missing, field_info.size...@row.size)
+      end
+      @field_info = field_info[0, @row.size]
+    end
+  end
 
     # Internal data format used to compare equality.
     attr_reader :row
@@ -127,9 +141,10 @@ class CSV
     #   row.initialize_copy(other_row) -> self
     #
     # Calls superclass method.
-    def initialize_copy(other)
+  def initialize_copy(other)
       super_return_value = super
       @row = @row.collect(&:dup)
+      @field_info = @field_info&.dup
       super_return_value
     end
 
@@ -343,8 +358,13 @@ class CSV
         if @row[args.first].nil?  # extending past the end with index
           @row[args.first] = [nil, value]
           @row.map! { |pair| pair.nil? ? [nil, nil] : pair }
+          if @field_info
+            @field_info[args.first] = :value
+            @field_info.map! { |state| state.nil? ? :missing : state }
+          end
         else                      # normal index assignment
           @row[args.first][1] = value
+          @field_info[args.first] = :value if @field_info
         end
       else
         index = index(*args)
@@ -352,6 +372,7 @@ class CSV
           self << [args.first, value]
         else                      # normal header assignment
           @row[index][1] = value
+          @field_info[index] = :value if @field_info
         end
       end
     end
@@ -389,10 +410,15 @@ class CSV
     def <<(arg)
       if arg.is_a?(Array) and arg.size == 2  # appending a header and name
         @row << arg
+        @field_info << :value if @field_info
       elsif arg.is_a?(Hash)                  # append header and name pairs
-        arg.each { |pair| @row << pair }
+        arg.each do |pair|
+          @row << pair
+          @field_info << :value if @field_info
+        end
       else                                   # append field value
         @row << [nil, arg]
+        @field_info << :value if @field_info
       end
 
       self  # for chaining
@@ -450,8 +476,10 @@ class CSV
     #   row.delete('NAME', 1) # => []
     def delete(header_or_index, minimum_index = 0)
       if header_or_index.is_a? Integer                 # by index
+        @field_info.delete_at(header_or_index) if @field_info
         @row.delete_at(header_or_index)
       elsif i = index(header_or_index, minimum_index)  # by header
+        @field_info.delete_at(i) if @field_info
         @row.delete_at(i)
       else
         [ ]
@@ -476,7 +504,20 @@ class CSV
     def delete_if(&block)
       return enum_for(__method__) { size } unless block_given?
 
-      @row.delete_if(&block)
+      if @field_info
+        new_row = []
+        new_field_info = []
+        @row.each_with_index do |pair, i|
+          unless block.call(pair)
+            new_row << pair
+            new_field_info << @field_info[i]
+          end
+        end
+        @row = new_row
+        @field_info = new_field_info
+      else
+        @row.delete_if(&block)
+      end
 
       self  # for chaining
     end
@@ -575,6 +616,117 @@ class CSV
       index = headers[minimum_index..-1].index(header)
       # return the index at the right offset, if we found one
       index.nil? ? nil : index + minimum_index
+    end
+
+    # :call-seq:
+    #   row.field_position(index) -> integer or nil
+    #   row.field_position(header) -> integer or nil
+    #
+    # Returns the actual \Integer position of the field for the given
+    # +index+ or +header+, or +nil+ if there is no such field.
+    #
+    # Unlike #index, which only accepts a header, this method also
+    # accepts an \Integer index (negative indexes count backward
+    # from the last column) and validates it against the row:
+    #   source = "Name,Value\nfoo,0\n"
+    #   row = CSV.parse(source, headers: true).first
+    #   row.field_position('Value') # => 1
+    #   row.field_position(0)       # => 0
+    #   row.field_position(-1)      # => 1
+    #   row.field_position(2)       # => nil
+    #   row.field_position('Nope')  # => nil
+    def field_position(header_or_index)
+      if header_or_index.is_a?(Integer)
+        position = header_or_index
+        position += @row.size if position < 0
+        (position >= 0 and position < @row.size) ? position : nil
+      else
+        index(header_or_index)
+      end
+    end
+
+    # :call-seq:
+    #   row.field_state(index) -> symbol or nil
+    #   row.field_state(header) -> symbol or nil
+    #
+    # Returns the raw state of the field for the given +index+ or +header+,
+    # or +nil+ if there is no such field or no field presence information
+    # is tracked for this row.
+    #
+    # Field presence information is tracked when the row is parsed with
+    # option +field_presence+; see
+    # {Option +field_presence+}[../CSV.html#class-CSV-label-Option+field_presence].
+    # The possible states are:
+    # - +:value+: the field was provided with a value
+    #   (or was assigned via #[], #[]=, #<< or #push).
+    # - +:empty+: the field was provided as an unquoted empty field;
+    #   its value is +nil+.
+    # - +:quoted_empty+: the field was provided as a quoted empty string
+    #   (<tt>""</tt>); its value is <tt>""</tt>.
+    # - +:nil_value+: the field was provided with a non-empty value,
+    #   but a converter turned it into +nil+.
+    # - +:missing+: the field was not provided at all; it is a trailing
+    #   column that was absent from the input (or a gap created by
+    #   extending the row with #[]=).
+    #
+    # Example:
+    #   source = "a,b,c\n1,2\n1,2,\n1,2,\"\"\n"
+    #   CSV.parse(source, headers: true, field_presence: true).each do |row|
+    #     p row.field_state('c')
+    #   end
+    # Output:
+    #   :missing
+    #   :empty
+    #   :quoted_empty
+    def field_state(header_or_index)
+      position = field_position(header_or_index)
+      return nil if position.nil?
+      @field_info ? @field_info[position] : nil
+    end
+
+    # :call-seq:
+    #   row.field_present?(index) -> true or false
+    #   row.field_present?(header) -> true or false
+    #
+    # Returns +true+ if the field for the given +index+ or +header+
+    # was actually provided, +false+ otherwise.
+    #
+    # A field is not present when it does not exist in the row at all,
+    # or when field presence information is tracked (see #field_state)
+    # and its state is +:missing+:
+    #   source = "a,b,c\n1,2\n"
+    #   row = CSV.parse(source, headers: true, field_presence: true).first
+    #   row.field_present?('b') # => true
+    #   row.field_present?('c') # => false
+    #   row.field_present?(5)   # => false
+    #
+    # When no field presence information is tracked, every existing
+    # field counts as present.
+    def field_present?(header_or_index)
+      position = field_position(header_or_index)
+      return false if position.nil?
+      return true unless @field_info
+      @field_info[position] != :missing
+    end
+
+    # :call-seq:
+    #   row.present_fields -> array_of_fields
+    #
+    # Returns the field values like #fields, except that trailing fields
+    # whose state is +:missing+ (see #field_state) are omitted, so that
+    # writing the row does not append trailing separators for columns
+    # that were never provided.
+    #
+    # Fields in the middle of the row are always kept, even when missing,
+    # to preserve the positions of the fields that follow them:
+    #   source = "a,b,c\n1,2\n"
+    #   row = CSV.parse(source, headers: true, field_presence: true).first
+    #   row.fields         # => ["1", "2", nil]
+    #   row.present_fields # => ["1", "2"]
+    def present_fields
+      return fields unless @field_info
+      last = @field_info.rindex { |state| state != :missing }
+      last ? fields[0..last] : []
     end
 
     # :call-seq:
@@ -715,8 +867,17 @@ class CSV
     #   table = CSV.parse(source, headers: true)
     #   row = table[0]
     #   row.to_csv # => "foo,0\n"
-    def to_csv(**options)
-      fields.to_csv(**options)
+    #
+    # With option +field_presence+ given as +true+, trailing fields whose
+    # state is +:missing+ (see #field_state) are omitted, so that a row
+    # that was parsed without trailing columns is written back without
+    # gaining trailing separators:
+    #   source = "Name,Value\nfoo\n"
+    #   row = CSV.parse(source, headers: true, field_presence: true).first
+    #   row.to_csv # => "foo,\n"
+    #   row.to_csv(field_presence: true) # => "foo\n"
+    def to_csv(field_presence: false, **options)
+      (field_presence ? present_fields : fields).to_csv(**options)
     end
     alias_method :to_s, :to_csv
 

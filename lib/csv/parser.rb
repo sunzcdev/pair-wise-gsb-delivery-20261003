@@ -490,6 +490,7 @@ class CSV
       @unconverted_fields = @options[:unconverted_fields]
       @max_field_size = @options[:max_field_size]
       @skip_blanks = @options[:skip_blanks]
+      @field_presence = @options[:field_presence]
       @fields_converter = @options[:fields_converter]
       @header_fields_converter = @options[:header_fields_converter]
     end
@@ -1277,8 +1278,13 @@ class CSV
           return unless @return_headers
           row = Row.new(@headers, row, true)
         else
-          row = Row.new(@headers,
-                        @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields))
+          converted_row = @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields)
+          if @field_presence
+            field_info = build_field_info(raw_row, converted_row, quoted_fields)
+            row = Row.new(@headers, converted_row, false, field_info: field_info)
+          else
+            row = Row.new(@headers, converted_row)
+          end
         end
       else
         # convert fields, if needed...
@@ -1291,6 +1297,30 @@ class CSV
       end
 
       yield(row)
+    end
+
+    # Builds the field state Array (see CSV::Row#field_state) for a parsed
+    # row, distinguishing missing trailing columns, unquoted empty fields,
+    # quoted empty strings, and non-empty values turned into nil by a
+    # converter.
+    def build_field_info(raw_row, converted_row, quoted_fields)
+      size = @headers.size
+      size = converted_row.size if converted_row.size > size
+      field_info = Array.new(size, :missing)
+      converted_row.each_with_index do |field, index|
+        raw_field = raw_row[index]
+        field_info[index] =
+          if raw_field.nil?
+            :empty
+          elsif raw_field.empty?
+            quoted_fields[index] ? :quoted_empty : :empty
+          elsif field.nil?
+            :nil_value
+          else
+            :value
+          end
+      end
+      field_info
     end
 
     # This method injects an instance variable <tt>unconverted_fields</tt> into

@@ -1,0 +1,47 @@
+====== Option +field_presence+
+
+Specifies whether field presence information is tracked while parsing,
+and honored while writing.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:field_presence) # => false
+
+This option is useful for incremental imports, where a column that was
+not provided at all must be treated differently from a column that was
+provided with an empty value.
+
+When parsing with +field_presence+ set to +true+, each emitted CSV::Row
+remembers the raw state of each field, which can be queried with
+CSV::Row#field_state and CSV::Row#field_present?:
+
+  source = "a,b,c\n1,2,3\n1,2\n1,2,\n1,2,\"\"\n"
+  CSV.parse(source, headers: true, field_presence: true).each do |row|
+    p [row['c'], row.field_state('c'), row.field_present?('c')]
+  end
+
+Output:
+  ["3", :value, true]
+  [nil, :missing, false]
+  [nil, :empty, true]
+  ["", :quoted_empty, true]
+
+A non-empty field that a converter turns into +nil+ gets state
++:nil_value+:
+
+  source = "a,b\n1,NULL\n"
+  converter = ->(field) { field == 'NULL' ? nil : field }
+  row = CSV.parse(source, headers: true, field_presence: true,
+                         converters: converter).first
+  row['b']             # => nil
+  row.field_state('b') # => :nil_value
+
+When writing with +field_presence+ set to +true+, trailing fields whose
+state is +:missing+ are omitted, so that an unmodified row does not gain
+trailing separators:
+
+  csv_string = CSV.generate(headers: true, field_presence: true) do |csv|
+    csv << row # ["1", nil] with state :missing for "b"
+  end
+  csv_string # => "1\n"
+
+See also CSV::Row#present_fields and CSV::Row#to_csv.
