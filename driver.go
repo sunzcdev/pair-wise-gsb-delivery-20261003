@@ -379,6 +379,15 @@ type Settings struct {
 	ActiveConnectionsCheck DataConnectionRequirement
 	// PasvConnectionsCheck defines the security requirements for passive connections
 	PasvConnectionsCheck DataConnectionRequirement
+	// RequireTLSDataSessionResumption requires protected explicit FTPS data connections
+	// to resume the TLS session associated with the current control connection.
+	// TLS 1.2 associates the channels by issuing a bound RFC 5077 session ticket
+	// after the full control handshake and accepting only that resumed ticket on
+	// the data handshake. TLS 1.3 uses the session's NewSessionTicket as a PSK
+	// identity; the data connection must present the same bound PSK and complete
+	// PSK-DHE resumption. The binding is the session itself, not a source IP or
+	// client certificate comparison.
+	RequireTLSDataSessionResumption bool
 	// ActiveTransferLocalIPResolver (Optional) selects the local IP address active mode (PORT, EPRT)
 	// data connections are dialed from. Without it the operating system picks the source address
 	// from its routing table, which on a multi homed host is not necessarily the address the client

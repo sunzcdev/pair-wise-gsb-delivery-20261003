@@ -15,10 +15,19 @@ var errUnknownHash = errors.New("unknown hash algorithm")
 func (c *clientHandler) handleAUTH(_ string) error {
 	if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
 		c.writeMessage(StatusAuthAccepted, "AUTH command ok. Expecting TLS Negotiation.")
-		c.conn = tls.Server(c.conn, tlsConfig)
+		tlsConfig, tlsBindingToken, tlsOriginalUnwrapSession, tlsDataBaseConfig := prepareControlTLSConfig(tlsConfig)
+		tlsConn := tls.Server(c.conn, tlsConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			c.writeMessage(StatusServiceNotAvailable, fmt.Sprintf("Cannot establish TLS: %v", err))
+
+			return nil
+		}
+
+		c.conn = tlsConn
 		c.reader = bufio.NewReaderSize(c.conn, maxCommandSize)
 		c.writer = bufio.NewWriter(c.conn)
 		c.setTLSForControl(true)
+		c.setTLSConfig(tlsConfig, tlsBindingToken, tlsOriginalUnwrapSession, tlsDataBaseConfig)
 	} else {
 		c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Cannot get a TLS config: %v", err))
 	}

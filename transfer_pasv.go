@@ -34,6 +34,7 @@ type passiveTransferHandler struct {
 	Port           int                   // TCP Port we are listening on
 	connection     net.Conn              // TCP Connection established
 	settings       *Settings             // Settings
+	tlsBinding     bool                  // Require TLS session binding
 	info           string                // transfer info
 	logger         *slog.Logger          // Logger
 	// data connection requirement checker
@@ -169,7 +170,7 @@ func (c *clientHandler) handlePASV(_ string) error {
 	}
 
 	if c.HasTLSForTransfers() || c.server.settings.TLSRequired == ImplicitEncryption {
-		if tlsConfig, err := c.server.driver.GetTLSConfig(); err == nil {
+		if tlsConfig, err := c.getTLSDataConfig(); err == nil {
 			listener = tls.NewListener(listener, tlsConfig)
 		} else {
 			c.writeMessage(StatusServiceNotAvailable, fmt.Sprintf("Cannot get a TLS config: %v", err))
@@ -188,6 +189,7 @@ func (c *clientHandler) handlePASV(_ string) error {
 		deadlineSetter: deadlineSetter,
 		Port:           exposedPort,
 		settings:       c.server.settings,
+		tlsBinding:     c.requiresTLSDataSessionBinding(),
 		logger:         c.logger,
 		checkDataConn:  c.checkDataConnectionRequirement,
 	}
@@ -282,6 +284,19 @@ func (p *passiveTransferHandler) ConnectionWait(wait time.Duration) (net.Conn, e
 	p.connection, err = p.listener.Accept()
 	if err != nil {
 		return nil, fmt.Errorf("failed to accept passive transfer connection: %w", err)
+	}
+
+	if p.tlsBinding {
+		tlsConn, ok := p.connection.(*tls.Conn)
+		if !ok {
+			return nil, &ipValidationError{error: "expected TLS data connection"}
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			p.logger.Warn("TLS handshake failure", "err", err)
+			_ = p.connection.Close()
+
+			return nil, fmt.Errorf("failed to establish secure passive connection: %w", err)
+		}
 	}
 
 	ipAddress, err := getIPFromRemoteAddr(p.connection.RemoteAddr())

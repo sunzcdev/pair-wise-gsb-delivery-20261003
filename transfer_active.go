@@ -1,6 +1,7 @@
 package ftpserver
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -48,7 +49,7 @@ func (c *clientHandler) handlePORT(param string) error {
 	var tlsConfig *tls.Config
 
 	if c.HasTLSForTransfers() || c.server.settings.TLSRequired == ImplicitEncryption {
-		tlsConfig, err = c.server.driver.GetTLSConfig()
+		tlsConfig, err = c.getTLSDataConfig()
 		if err != nil {
 			c.writeMessage(StatusServiceNotAvailable, fmt.Sprintf("Cannot get a TLS config for active connection: %v", err))
 
@@ -65,10 +66,11 @@ func (c *clientHandler) handlePORT(param string) error {
 	c.transferMu.Lock()
 
 	c.transfer = &activeTransferHandler{
-		raddr:     raddr,
-		laddr:     laddr,
-		settings:  c.server.settings,
-		tlsConfig: tlsConfig,
+		raddr:      raddr,
+		laddr:      laddr,
+		settings:   c.server.settings,
+		tlsConfig:  tlsConfig,
+		tlsBinding: c.requiresTLSDataSessionBinding(),
 	}
 
 	c.transferMu.Unlock()
@@ -84,12 +86,13 @@ var _ transferHandler = (*activeTransferHandler)(nil)
 
 // Active connection
 type activeTransferHandler struct {
-	raddr     *net.TCPAddr // Remote address of the client
-	laddr     net.IP       // Local address to dial from, nil lets the operating system choose
-	conn      net.Conn     // Connection used to connect to him
-	settings  *Settings    // Settings
-	tlsConfig *tls.Config  // not nil if the active connection requires TLS
-	info      string       // transfer info
+	raddr      *net.TCPAddr // Remote address of the client
+	laddr      net.IP       // Local address to dial from, nil lets the operating system choose
+	conn       net.Conn     // Connection used to connect to him
+	settings   *Settings    // Settings
+	tlsConfig  *tls.Config  // not nil if the active connection requires TLS
+	tlsBinding bool         // Require TLS session binding
+	info       string       // transfer info
 }
 
 func (a *activeTransferHandler) GetInfo() string {
@@ -118,7 +121,28 @@ func (a *activeTransferHandler) Open() (net.Conn, error) {
 	}
 
 	if a.tlsConfig != nil {
-		conn = tls.Server(conn, a.tlsConfig)
+		tlsConn := tls.Server(conn, a.tlsConfig)
+		if a.tlsBinding {
+			if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+				_ = conn.Close()
+
+				return nil, newNetworkError("could not establish secure active connection", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err = tlsConn.HandshakeContext(ctx)
+			cancel()
+			if err != nil {
+				_ = conn.Close()
+
+				return nil, newNetworkError("could not establish secure active connection", err)
+			}
+			if err := conn.SetDeadline(time.Time{}); err != nil {
+				_ = conn.Close()
+
+				return nil, newNetworkError("could not establish secure active connection", err)
+			}
+		}
+		conn = tlsConn
 	}
 
 	// keep connection as it will be closed by Close()
