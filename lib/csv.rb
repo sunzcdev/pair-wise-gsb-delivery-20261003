@@ -97,6 +97,7 @@ require "stringio"
 require_relative "csv/fields_converter"
 require_relative "csv/input_record_separator"
 require_relative "csv/parser"
+require_relative "csv/partition"
 require_relative "csv/row"
 require_relative "csv/table"
 require_relative "csv/writer"
@@ -1391,6 +1392,144 @@ class CSV
       open(path_or_io, mode, **options) do |csv|
         csv.each(&block)
       end
+    end
+
+    # :call-seq:
+    #   CSV.partitions(path_or_io, count, **options) -> CSV::PartitionPlan
+    #   CSV.partitions(path_or_io, partition_size: bytes, **options) -> CSV::PartitionPlan
+    #
+    # Scans a seekable UTF-8 CSV file once and plans +count+ (or
+    # approximately +partition_size+ byte) partitions that can be read
+    # independently.
+    #
+    # Partition boundaries always sit on record boundaries that are
+    # safe under the configured +col_sep+, +row_sep+ and +quote_char+:
+    # a partition never starts inside a quoted field, in the middle of
+    # CRLF, or in the middle of a multi-byte character.
+    #
+    # When +options+ includes <tt>headers: true</tt> (or provides header
+    # names), the first physical record is treated as a header.  Every
+    # partition exposes the header line and prepends it automatically
+    # when read, so all partitions parse identical column structure.
+    #
+    # The plan stores only byte ranges, starting record indexes and the
+    # header line; it never retains each row or field.
+    def partitions(path_or_io, count = nil, mode = "rb",
+                   partition_size: nil, **options)
+      if count.nil? && partition_size.nil?
+        raise ArgumentError,
+              "pass a partition count or :partition_size"
+      end
+      target_size = partition_size
+      target_count = count unless target_size
+
+      header_requested = options[:headers]
+      headers_present =
+        header_requested == true || header_requested.is_a?(String)
+
+      source, owned = partition_source(path_or_io, mode)
+      begin
+        size = source.size
+        encoding = partition_encoding(source, options)
+        row_separator = resolve_partition_row_separator(source, options)
+        header_line, header_bytes =
+          read_partition_header(source, row_separator, encoding,
+                                     headers_present)
+
+        liberal = options[:liberal_parsing]
+        backslash = liberal.is_a?(Hash) ? liberal[:backslash_quote] : false
+        scanner = PartitionScanner.new(
+          source,
+          column_separator: options[:col_sep] || DEFAULT_OPTIONS[:col_sep],
+          row_separator: row_separator,
+          quote_character: options.key?(:quote_char) ?
+                             options[:quote_char] :
+                             DEFAULT_OPTIONS[:quote_char],
+          liberal_parsing: !liberal.nil?,
+          backslash_quote: !!backslash,
+          strip: options[:strip],
+          start_offset: headers_present ? (header_bytes || 0) : 0)
+
+        partitioner = Partitioner.new(
+          source, size, scanner,
+          target_partitions: target_count || 1,
+          target_partition_size: target_size,
+          data_start: headers_present ? (header_bytes || 0) : 0)
+        ranges, _record_count = partitioner.plan
+
+        partitions = ranges.map.with_index do |(start_byte,
+                                                end_byte,
+                                                start_record), index|
+          Partition.new(nil, index, start_byte, end_byte, start_record)
+        end
+        plan = PartitionPlan.new(
+          path_or_io, partitions, header_line, headers_present,
+          options, row_separator, size, encoding)
+        partitions.each { |partition| partition.instance_variable_set(:@plan, plan) }
+        plan
+      ensure
+        source.close if owned && source && !source.closed?
+      end
+    end
+
+    private def partition_source(path_or_io, mode)
+      if path_or_io.is_a?(String)
+        [File.open(path_or_io, mode), true]
+      elsif path_or_io.respond_to?(:seek) &&
+            path_or_io.respond_to?(:size)
+        [path_or_io, false]
+      else
+        raise ArgumentError,
+              "CSV.partitions needs a seekable IO or a path"
+      end
+    end
+
+    private def partition_encoding(io, options)
+      name = options[:encoding]
+      name = name.split(":", 2).first if name.is_a?(String)
+      Encoding.find(name || "UTF-8")
+    end
+
+    private def resolve_partition_row_separator(io, options)
+      configured = options[:row_sep]
+      return configured.to_s unless configured.nil? || configured == :auto
+      io.seek(0)
+      cr = "\r".b
+      lf = "\n".b
+      separator = nil
+      sample_size = 32 * 1024
+      until separator
+        sample = io.read(sample_size)
+        break if sample.nil? || sample.empty?
+        lf_index = sample.index(lf)
+        cr_index = lf_index ? sample[0, lf_index].index(cr) :
+                               sample.index(cr)
+        if cr_index && lf_index
+          separator = cr_index + 1 == lf_index ? cr + lf :
+                      cr_index < lf_index ? cr : lf
+        elsif cr_index
+          separator = cr
+        elsif lf_index
+          separator = lf
+        end
+      end
+      separator ||= InputRecordSeparator.value
+      io.seek(0)
+      separator.b
+    end
+
+    private def read_partition_header(io, row_separator, encoding, present)
+      return [nil, 0] unless present
+      io.seek(0)
+      line = io.gets(row_separator)
+      if line.nil?
+        return [nil, 0]
+      end
+      header_bytes = io.pos
+      io.seek(0)
+      line = line.dup.force_encoding(encoding) if
+        line.encoding == Encoding::ASCII_8BIT
+      [line, header_bytes]
     end
 
     #

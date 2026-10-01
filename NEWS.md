@@ -1,5 +1,16 @@
 # News
 
+## 3.3.7 - 2026-10-02
+
+### News
+
+  * Added `CSV.partitions`: scans a seekable UTF-8 CSV file once and
+    plans safe byte ranges (partitions) that can be parsed independently
+    by multiple workers.  Partition boundaries never fall inside a
+    quoted field, the configured row separator or a multi-byte
+    character, and the planner keeps only partition metadata rather than
+    each row or field.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements
