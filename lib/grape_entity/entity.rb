@@ -181,6 +181,19 @@ module Grape
     #   automatically be transformed into a representation that will receive the same
     #   options as the parent entity when called. Note that arrays are fine here and
     #   will automatically be detected and handled appropriately.
+    #
+    #   A Hash of type => Entity may be passed instead to declare a polymorphic
+    #   mapping: each nested object (and each element of a nested collection) is
+    #   represented with the Entity registered for its actual type. Keys are
+    #   classes or modules matched with +===+; the most specific match wins and
+    #   two equally-specific matching module rules raise an
+    #   +AmbiguousPolymorphicMatch+ error. The special key +:default+ declares
+    #   the fallback Entity for objects that match no rule; without it an
+    #   unknown type raises +UnmappedPolymorphicType+. +nil+ is always
+    #   represented as +nil+.
+    #   When a subclass re-declares a polymorphic +using+ mapping for an
+    #   inherited attribute the new rules extend the inherited mapping instead
+    #   of replacing it, without affecting the parent Entity.
     # @option options :proc If you pass a Proc into this option, it will
     #   be used directly to determine the value for that attribute. It
     #   will be called with the represented object as well as the
@@ -224,7 +237,11 @@ module Grape
 
       exposure = Exposure.new(attribute, options)
 
-      exposure_list.delete_by(attribute) if exposure.override?
+      if exposure.override?
+        exposure_list.delete_by(attribute)
+      else
+        exposure = extend_inherited_polymorphic_exposure(exposure, exposure_list)
+      end
 
       exposure_list << exposure
 
@@ -234,6 +251,21 @@ module Grape
       nesting_stack << exposure
       block.call
       nesting_stack.pop
+    end
+
+    # When a subclass (re)declares a polymorphic +using+ mapping for an
+    # attribute it already inherits, extend the inherited mapping with the new
+    # rules rather than shadowing it.  A new PolymorphicMapping is created for
+    # the subclass exposure, so neither the parent mapping nor any
+    # configuration built from it is mutated.
+    def self.extend_inherited_polymorphic_exposure(exposure, exposure_list)
+      return exposure unless exposure.respond_to?(:polymorphic?) && exposure.polymorphic?
+
+      existing = exposure_list.find { |candidate| candidate.attribute == exposure.attribute }
+      return exposure unless existing&.respond_to?(:polymorphic?) && existing.polymorphic?
+
+      exposure_list.delete(existing)
+      existing.with_extra_rules(exposure.mapping.rules)
     end
 
     # Returns exposures that have been declared for this Entity on the top level.

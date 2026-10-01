@@ -2,6 +2,8 @@
 
 require 'grape_entity/exposure/base'
 require 'grape_entity/exposure/represent_exposure'
+require 'grape_entity/exposure/polymorphic_mapping'
+require 'grape_entity/exposure/polymorphic_represent_exposure'
 require 'grape_entity/exposure/block_exposure'
 require 'grape_entity/exposure/delegator_exposure'
 require 'grape_entity/exposure/formatter_exposure'
@@ -21,7 +23,10 @@ module Grape
           using_class = options[:using]
           format_with = options[:format_with]
 
-          if using_class
+          if using_class.is_a?(Hash) || using_class.is_a?(PolymorphicMapping)
+            mapping = PolymorphicMapping.coerce(using_class)
+            build_polymorphic_exposure(base_args, mapping, passed_proc)
+          elsif using_class
             build_class_exposure(base_args, using_class, passed_proc)
           elsif passed_proc
             build_block_exposure(base_args, passed_proc)
@@ -78,6 +83,17 @@ module Grape
             end
 
           RepresentExposure.new(*base_args, using_class, exposure)
+        end
+
+        def build_polymorphic_exposure(base_args, mapping, passed_proc)
+          exposure =
+            if passed_proc
+              build_block_exposure(base_args, passed_proc)
+            else
+              build_delegator_exposure(base_args)
+            end
+
+          PolymorphicRepresentExposure.new(*base_args, mapping, exposure)
         end
 
         def build_formatter_exposure(base_args, format_with)

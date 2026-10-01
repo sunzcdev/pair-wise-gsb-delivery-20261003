@@ -12,6 +12,7 @@
     - [Defining Entities](#defining-entities)
       - [Basic Exposure](#basic-exposure)
       - [Exposing with a Presenter](#exposing-with-a-presenter)
+      - [Polymorphic Exposure](#polymorphic-exposure)
       - [Conditional Exposure](#conditional-exposure)
       - [Safe Exposure](#safe-exposure)
       - [Nested Exposure](#nested-exposure)
@@ -139,6 +140,45 @@ Presenter classes can also be specified in string format, which helps with circu
 ```ruby
 expose :replies, using: "API::Entities::Status", as: :responses
 ```
+
+#### Polymorphic Exposure
+
+When a nested object (or every element of a nested collection) can be one of
+several types, pass a Hash mapping each type to the presenter that should
+represent it. Keys are classes or modules matched with `===`; among several
+matches the most specific one wins — a registered subclass beats its parent
+class, and a class always beats a matching module. If two unrelated module
+rules match the same object with no unique most specific rule, an
+`AmbiguousPolymorphicMatch` error is raised instead of guessing from
+registration order.
+
+```ruby
+class FeedEntity < Grape::Entity
+  expose :items, using: {
+    Photo => API::Entities::PhotoEntity,
+    Video => API::Entities::VideoEntity,
+    Sponsorable => API::Entities::SponsoredEntity
+  }
+end
+```
+
+Use the special `:default` key to declare an explicit fallback for objects
+that match no rule. Without it an unknown type raises
+`UnmappedPolymorphicType`; `nil` is always represented as `nil`.
+
+```ruby
+expose :items, using: {
+  Photo => API::Entities::PhotoEntity,
+  Video => API::Entities::VideoEntity,
+  default: API::Entities::FallbackEntity
+}
+```
+
+Each element of a collection is dispatched independently, so a single
+collection may mix types. When a subclass re-declares a polymorphic `using`
+mapping for an inherited attribute the new rules extend (rather than replace)
+the inherited mapping, without affecting the parent entity or any
+representation configuration already built from it.
 
 #### Conditional Exposure
 

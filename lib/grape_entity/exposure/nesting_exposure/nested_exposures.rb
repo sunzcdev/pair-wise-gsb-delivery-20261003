@@ -31,6 +31,11 @@ module Grape
             @exposures
           end
 
+          def delete(exposure)
+            reset_memoization!
+            @exposures.delete(exposure)
+          end
+
           def clear
             reset_memoization!
             @exposures.clear

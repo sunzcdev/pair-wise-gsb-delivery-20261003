@@ -6,6 +6,8 @@
 
 #### Features
 
+* Added declarative polymorphic presenter mappings: `expose :items, using: { SomeType => SomeEntity, ..., default: FallbackEntity }` dispatches each nested object (and each collection element) to the entity registered for its actual type, preferring the most specific match, raising `AmbiguousPolymorphicMatch` for equally-specific module rules and `UnmappedPolymorphicType` for unknown types without a `:default` fallback; subclass mappings extend inherited ones without polluting the parent.
+
 * Your contribution here.
 
 
