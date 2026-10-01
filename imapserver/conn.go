@@ -280,6 +280,8 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleMove(dec, numKind)
 	case "SEARCH", "UID SEARCH":
 		err = c.handleSearch(tag, dec, numKind)
+	case "THREAD", "UID THREAD":
+		err = c.handleThread(dec, numKind)
 	default:
 		if c.state == imap.ConnStateNotAuthenticated {
 			// Don't allow a single unknown command before authentication to
@@ -481,7 +483,7 @@ func (c *Conn) poll(cmd string) error {
 
 	allowExpunge := true
 	switch cmd {
-	case "FETCH", "STORE", "SEARCH":
+	case "FETCH", "STORE", "SEARCH", "THREAD":
 		allowExpunge = false
 	}
 

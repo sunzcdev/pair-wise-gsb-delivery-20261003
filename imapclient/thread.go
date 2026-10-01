@@ -61,10 +61,8 @@ func (cmd *ThreadCommand) Wait() ([]ThreadData, error) {
 	return cmd.data, err
 }
 
-type ThreadData struct {
-	Chain      []uint32
-	SubThreads []ThreadData
-}
+// ThreadData is a message thread tree returned by the THREAD command.
+type ThreadData = imap.ThreadData
 
 func readThreadList(dec *imapwire.Decoder) (*ThreadData, error) {
 	var data ThreadData

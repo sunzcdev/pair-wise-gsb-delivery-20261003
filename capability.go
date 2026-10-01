@@ -65,6 +65,7 @@ const (
 	CapSort             Cap = "SORT"               // RFC 5256
 	CapSortDisplay      Cap = "SORT=DISPLAY"       // RFC 5957
 	CapSpecialUse       Cap = "SPECIAL-USE"        // RFC 6154
+	CapThreadReferences Cap = "THREAD=REFERENCES"  // RFC 5256
 	CapUnauthenticate   Cap = "UNAUTHENTICATE"     // RFC 8437
 	CapURLPartial       Cap = "URL-PARTIAL"        // RFC 5550
 	CapURLAuth          Cap = "URLAUTH"            // RFC 4467
