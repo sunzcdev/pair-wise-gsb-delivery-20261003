@@ -1,3 +1,10 @@
+## Unreleased
+
+ * Reference managed Heap MetaStore/EntityStore: shared bodies are now
+   reclaimed when the last referencing cache entry is removed (not on
+   invalidation), with rollback-safe metadata writes and reader pins that
+   keep a handed-out body readable until it is closed
+
 ## 1.13.0
 
  * Support lowercase Vary and Age headers

@@ -44,27 +44,27 @@ module Rack::Cache
       else
         # the metastore referenced an entity that doesn't exist in
         # the entitystore, purge the entry from the meta-store
-        begin
-          purge(key)
-        rescue NotImplementedError
-          @@warned_on_purge ||= begin
-            warn "WARNING: Future releases may require purge implementation for #{self.class.name}"
-            true
-          end
-          nil
-        end
+        remove_entry(key, entity_store)
       end
     end
 
     # Write a cache entry to the store under the given key. Existing
     # entries are read and any that match the response are removed.
     # This method calls #write with the new list of cache entries.
+    #
+    # When paired with a reference managed EntityStore (the Heap backend),
+    # the body reference counts are adjusted around the meta write. Bodies
+    # only referenced by entries that disappear during this write are
+    # reclaimed after the meta write succeeds; if the meta write raises, all
+    # reference adjustments are rolled back and any orphaned body written
+    # during this call is purged, leaving no dangling references.
     def store(request, response, entity_store)
       key = cache_key(request)
       stored_env = persist_request(request)
 
       # write the response body to the entity store if this is the
       # original response.
+      newly_written = nil
       if response.headers['x-content-digest'].nil?
         if request.env['rack-cache.use_native_ttl'] && response.fresh?
           digest, size = entity_store.write(response.body, response.ttl)
@@ -73,6 +73,7 @@ module Rack::Cache
         end
         response.headers['x-content-digest'] = digest
         response.headers['content-length'] = size.to_s unless response.headers['Transfer-Encoding']
+        newly_written = digest
 
         # If the entitystore backend is a Noop, do not try to read the body from the backend, it always returns an empty array
         unless entity_store.is_a? Rack::Cache::EntityStore::Noop
@@ -83,15 +84,21 @@ module Rack::Cache
           # so we have to read it from the cache.
           # BUG: if the cache was unable to store a stream, the stream will be closed
           #      and rack will try to read it again, resulting in hard to track down exception
-          response.body = entity_store.open(digest) || response.body
+          #
+          # #copy (rather than #open) is used on purpose here: the entry about
+          # to be committed already references this entity, so the answer body
+          # must not also register an in-flight reader pin that would defer
+          # reclamation after the entry is later evicted.
+          response.body = entity_store.copy(digest) || response.body
         end
       end
 
       # read existing cache entries, remove non-varying, and add this one to
       # the list
       vary = response.vary
+      old_entries = read(key)
       entries =
-        read(key).reject do |env, res|
+        old_entries.reject do |env, res|
           (vary == (res['vary'])) &&
             requests_match?(vary, env, stored_env)
         end
@@ -100,10 +107,13 @@ module Rack::Cache
       headers.delete('age')
 
       entries.unshift [stored_env, headers]
-      if request.env['rack-cache.use_native_ttl'] && response.fresh?
-        write key, entries, response.ttl
-      else
-        write key, entries
+
+      reconcile_entity_refs(entity_store, old_entries, entries, newly_written) do
+        if request.env['rack-cache.use_native_ttl'] && response.fresh?
+          write key, entries, response.ttl
+        else
+          write key, entries
+        end
       end
       key
     end
@@ -162,6 +172,89 @@ module Rack::Cache
         key = "HTTP_#{header.upcase.tr('-', '_')}"
         env1[key] == env2[key]
       end
+    end
+
+    # Apply the difference between the digests referenced by +old_entries+
+    # and +new_entries+ to a reference managed +entity_store+: references
+    # gained by new entries are retained first, then the meta write (the
+    # supplied block) runs, and references lost by old entries are released
+    # only after it succeeds. This ordering guarantees that:
+    #
+    # * a metadata write failure rolls the counts back and never releases a
+    #   body still referenced by the stored metadata (a body written for the
+    #   failed entry is purged as an orphan);
+    # * replacing an entry with one that shares the same digest is a no-op
+    #   count-wise, so the shared body is never reclaimed prematurely;
+    # * invalidation (which merely marks an entry stale without changing its
+    #   digest) does not release anything.
+    def reconcile_entity_refs(entity_store, old_entries, new_entries, orphan = nil)
+      return yield unless entity_store.respond_to?(:reference_managed?) &&
+        entity_store.reference_managed?
+
+      old_counts = digest_counts(old_entries)
+      new_counts = digest_counts(new_entries)
+      retained, released = [], []
+
+      (new_counts.keys | old_counts.keys).each do |key|
+        delta = new_counts.fetch(key, 0) - old_counts.fetch(key, 0)
+        if delta > 0
+          retained.concat([key] * delta) if entity_store.retain(key)
+        elsif delta < 0
+          released.concat([key] * (-delta))
+        end
+      end
+
+      begin
+        yield
+      rescue Exception
+        # The meta write failed: undo every reference change and remove the
+        # body written solely for this entry so nothing leaks and no
+        # reference is left dangling against the rolled-back metadata.
+        retained.reverse_each { |key| entity_store.release(key) }
+        if orphan
+          entity_store.release(orphan)
+          entity_store.purge(orphan)
+        end
+        raise
+      end
+
+      released.each { |key| entity_store.release(key) }
+    end
+
+    # Count how many entries in +entries+ reference each content digest.
+    def digest_counts(entries)
+      counts = Hash.new(0)
+      entries.each do |_, res|
+        key = res['x-content-digest']
+        counts[key] += 1 if key
+      end
+      counts
+    end
+
+    # Remove all cache entries stored at +key+ and, for a reference managed
+    # entity store, drop the references they held. The meta entries are
+    # removed first (so a failure never leaves metadata pointing at a
+    # released body) and bodies whose last reference disappears here are
+    # reclaimed by the entity store.
+    def remove_entry(key, entity_store = nil)
+      entries = read(key)
+      begin
+        purge(key)
+      rescue NotImplementedError
+        @@warned_on_purge ||= begin
+          warn "WARNING: Future releases may require purge implementation for #{self.class.name}"
+          true
+        end
+        return nil
+      end
+
+      if entity_store && entity_store.respond_to?(:reference_managed?) &&
+          entity_store.reference_managed?
+        digest_counts(entries).each do |digest, count|
+          count.times { entity_store.release(digest) }
+        end
+      end
+      nil
     end
 
   protected
