@@ -117,6 +117,42 @@ module Mustermann
     @normalized_types[type] ||= type.to_s.gsub('-', '_').downcase
   end
 
+  # Statically analyzes the relationship between two path patterns.
+  #
+  # Decides, from the patterns themselves rather than a finite list of sample URLs,
+  # whether their languages intersect and whether the first is contained in the
+  # second. When the conclusion needs a concrete path (an intersection witness or a
+  # containment counterexample), the result contains one, and every path is checked
+  # against the patterns' real matching interface.
+  #
+  # Literal segments, ordinary captures, splats, optional segments and unions of all
+  # of these are supported, as are built-in typed capture converters. Custom
+  # constraints that cannot be analyzed reliably (arbitrary Regexps, unknown POSIX
+  # capture classes, shell/regular patterns, etc.) produce an unknown answer together
+  # with the reason instead of a potentially wrong conclusion.
+  #
+  # Patterns are compared by what they match, never by their source strings, so
+  # patterns written with different options or encodings are still compared
+  # correctly.
+  #
+  # @example
+  #   relation = Mustermann.relate('/users/:id', '/users/:name')
+  #   relation.intersect? # => true
+  #   relation.witness    # => "/users/a"
+  #   relation.subset?    # => false
+  #
+  # @param first [Mustermann::Pattern, String, Symbol, Regexp, #to_pattern]
+  # @param second [Mustermann::Pattern, String, Symbol, Regexp, #to_pattern]
+  # @param options [Hash] options passed to {Mustermann.new} for string inputs
+  # @return [Mustermann::Relation]
+  # @see Mustermann::Pattern#relation_to
+  def self.relate(first, second, **options)
+    require 'mustermann/relation'
+    first  = new(first, **options)  unless first.is_a?(Pattern)
+    second = new(second, **options) unless second.is_a?(Pattern)
+    Relation.new(first, second)
+  end
+
   # @!visibility private
   def self.dedup(object)
     return object.freeze unless @dedup

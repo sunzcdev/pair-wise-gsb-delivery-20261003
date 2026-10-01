@@ -192,6 +192,32 @@ module Mustermann
     # @return [Hash{String: String, Array<String>}, nil] Sinatra style params if pattern matches.
     def params(string = nil) = match(string)&.params
 
+    # Statically analyzes how this pattern relates to another pattern.
+    #
+    # Unlike testing a batch of concrete URLs, the analysis is performed on the
+    # patterns' languages, so a disjoint result is a proof that no request can match
+    # both, not an artifact of an incomplete sample.
+    #
+    # @example checking two routes before going live
+    #   users   = Mustermann.new('/users/:id')
+    #   profile = Mustermann.new('/users/:name')
+    #   relation = users.relation_to(profile)
+    #   relation.intersect?      # => true
+    #   relation.witness        # => "/users/a"  — verifiable via users === witness
+    #   relation.subset?        # => false
+    #
+    # @example unsupported custom constraints yield an unknown answer
+    #   relation = Mustermann.new('/:id', capture: /\d+/).relation_to('/:name')
+    #   relation.intersect?     # => nil
+    #   relation.reasons        # => ["right/left pattern: ..."]
+    #
+    # @param other [Mustermann::Pattern, String, Regexp, Symbol] the other pattern
+    # @return [Mustermann::Relation]
+    # @see Mustermann.relate
+    def relation_to(other)
+      Mustermann.relate(self, other)
+    end
+
     # @note This method is only implemented by certain subclasses.
     #
     # @example Expanding a pattern

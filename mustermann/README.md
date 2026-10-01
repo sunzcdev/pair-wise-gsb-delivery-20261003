@@ -44,6 +44,51 @@ These features are included in the library, but not loaded by default
 * **[Pattern Set](#-pattern-set):** A collection of patterns with associated values, designed for building routing tables that dispatch efficiently as the number of routes grows.
 * **Mustermann::Router:** A very basic rack router built on top of `Mustermann::Set` for demonstration purposes or small-footprint routing in Rack middleware. Simple and fast.
 
+<a name="-pattern-relationship-analysis"></a>
+## Pattern Relationship Analysis
+
+Before going live with a set of routes, you often want to know whether two rules
+can ever match the same request, and whether every request matched by one is also
+matched by the other. Testing a finite batch of example URLs cannot prove
+disjointness: two patterns that look overlapping in text may share no concrete
+path, and patterns that look disjoint may in fact collide.
+
+`Mustermann.relate` (and `Pattern#relation_to`) answers these questions from the
+patterns' languages directly, using a symbolic automaton rather than samples:
+
+``` ruby
+require 'mustermann'
+
+relation = Mustermann.relate('/users/:id', '/users/:name')
+relation.intersect?     # => true  — a request can match both
+relation.witness        # => "/users/a", verifiable via either pattern's #match
+relation.subset?        # => true  — every :id path is also a :name path
+
+Mustermann.relate('/users/:id', '/posts/:id').intersect? # => false (proven, not sampled)
+Mustermann.relate('/:x', '/a').subset?                   # => false
+Mustermann.relate('/:x', '/a').counterexample            # => a path matched by /:x but not /a
+```
+
+Literal segments, ordinary captures, splats, optional segments and unions of these
+are supported, together with built-in typed capture converters (Integer, UUID,
+etc.), URI encoding options and the `except:` option. Patterns are compared by
+what they match, never by their source text, so spelling or option differences do
+not affect the result. Every returned `witness` or `counterexample` is checked
+against the real pattern objects, so it can be handed straight back to `#match`
+or `#===`.
+
+Constructs that cannot be analyzed reliably — arbitrary `Regexp` capture
+constraints, `:shell` or `:regexp` patterns, and similar — produce an *unknown*
+answer (`nil`) together with an explanation instead of a potentially wrong
+conclusion:
+
+``` ruby
+relation = Mustermann.relate(Mustermann.new('/:id', capture: /\d+/), '/:name')
+relation.intersect?     # => nil
+relation.unknown?       # => true
+relation.reasons        # => ["left pattern: custom Regexp capture constraints ..."]
+```
+
 <a name="-pattern-types"></a>
 ## Pattern Types
 
