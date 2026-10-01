@@ -72,6 +72,8 @@ const (
 	clientCanHandleExpiredPasswords
 	clientSessionTrack
 	clientDeprecateEOF
+	clientOptionalResultsetMetadata
+	clientParameterCountAvailable
 )
 
 // https://mariadb.com/kb/en/connection/#capabilities
@@ -115,6 +117,12 @@ const (
 	comStmtReset
 	comSetOption
 	comStmtFetch
+)
+
+// COM_STMT_EXECUTE flags.
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+const (
+	stmtExecuteFlagParameterCount byte = 0x08
 )
 
 // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnType

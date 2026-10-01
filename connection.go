@@ -237,7 +237,7 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 		}
 
 		if columnCount > 0 {
-			if mc.extCapabilities&clientCacheMetadata != 0 {
+			if mc.canCacheMetadata() {
 				if stmt.columns, err = mc.readColumns(int(columnCount), nil); err != nil {
 					return nil, err
 				}

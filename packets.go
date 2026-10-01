@@ -288,6 +288,8 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 			clientLocalFiles |
 			clientPluginAuth |
 			clientMultiResults |
+			clientOptionalResultsetMetadata |
+			clientParameterCountAvailable |
 			clientConnectAttrs |
 			clientDeprecateEOF
 
@@ -314,6 +316,15 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 
 	// set MariaDB extended clientCacheMetadata capability if server support it
 	mc.extCapabilities = clientCacheMetadata & serverExtCapabilities
+}
+
+// canCacheMetadata reports whether the server supports omitting result set
+// column metadata for a subsequent execution of a prepared statement. MySQL 8
+// advertises the main capability CLIENT_OPTIONAL_RESULTSET_METADATA while
+// MariaDB advertises the extended capability CACHE_METADATA.
+func (mc *mysqlConn) canCacheMetadata() bool {
+	return mc.capabilities&clientOptionalResultsetMetadata != 0 ||
+		mc.extCapabilities&clientCacheMetadata != 0
 }
 
 // Client Authentication Packet
@@ -576,7 +587,7 @@ func (mc *okHandler) readResultSetHeaderPacket() (int, bool, error) {
 	// https://mariadb.com/kb/en/result-set-packets/#column-count-packet
 	num, _, len := readLengthEncodedInteger(data)
 
-	if mc.extCapabilities&clientCacheMetadata != 0 {
+	if mc.conn().canCacheMetadata() {
 		return int(num), data[len] == 0x01, nil
 	}
 	// ignore remaining data in the packet. see #1478.
@@ -925,6 +936,41 @@ func (mc *mysqlConn) skipEof() error {
 	return nil
 }
 
+// readMetadataEOF reads the packet that follows the column-count packet when
+// the server omits column definitions because the client can reuse cached
+// metadata.
+//
+// With CLIENT_OPTIONAL_RESULTSET_METADATA (MySQL 8.0.29+) the packet is an EOF
+// packet when CLIENT_DEPRECATE_EOF is not set, otherwise an OK packet with an
+// 0xfe header; either way it carries the server status.
+//
+// With MariaDB CACHE_METADATA the EOF packet is only sent when
+// CLIENT_DEPRECATE_EOF is not set, so its status is handled like skipEof().
+func (mc *mysqlConn) readMetadataEOF() error {
+	if mc.capabilities&clientOptionalResultsetMetadata == 0 {
+		return mc.skipEof()
+	}
+
+	data, err := mc.readPacket()
+	if err != nil {
+		return err
+	}
+	switch data[0] {
+	case iERR:
+		return mc.handleErrorPacket(data)
+	case iEOF:
+		if mc.capabilities&clientDeprecateEOF == 0 {
+			mc.status = readStatus(data[3:])
+		} else {
+			_, _, n := readLengthEncodedInteger(data[1:])   // affected rows
+			_, _, m := readLengthEncodedInteger(data[1+n:]) // last insert id
+			mc.status = readStatus(data[1+n+m:])
+		}
+		return nil
+	}
+	return ErrMalformPkt
+}
+
 func (mc *mysqlConn) skipColumns(n int) error {
 	if err := mc.skipPackets(n); err != nil {
 		return err
@@ -1065,7 +1111,11 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 		)
 	}
 
-	const minPktLen = 4 + 1 + 4 + 1 + 4
+	const (
+		headerLen      = 4 + 1 + 4 + 1 + 4
+		paramCountLen  = 1
+		executeDataOff = headerLen + paramCountLen
+	)
 	mc := stmt.mc
 
 	// Determine threshold dynamically to avoid packet size shortage.
@@ -1075,14 +1125,23 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	var err error
 	var longData []stmtLongData
 
-	if len(args) == 0 {
-		data, err = mc.buf.takeBuffer(minPktLen)
-	} else {
+	parameterCountAvailable := mc.capabilities&clientParameterCountAvailable != 0
+
+	if len(args) > 0 {
 		data, err = mc.buf.takeCompleteBuffer()
 		// In this case the len(data) == cap(data) which is used to optimise the flow below.
+	} else {
+		data, err = mc.buf.takeBuffer(headerLen + paramCountLen)
 	}
 	if err != nil {
 		return err
+	}
+	if len(args) == 0 {
+		initialLen := headerLen
+		if parameterCountAvailable {
+			initialLen += paramCountLen
+		}
+		data = data[:initialLen]
 	}
 
 	// command [1 byte]
@@ -1091,14 +1150,33 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// statement_id [4 bytes]
 	binary.LittleEndian.PutUint32(data[5:], stmt.id)
 
-	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
-	data[9] = 0x00
+	// flags [1 byte]
+	// Bit 0x08 asks the server to reuse the metadata cached by the client:
+	// full column definitions are only sent again when the result columns
+	// change. MySQL 8.0.29+ honors this bit when
+	// CLIENT_OPTIONAL_RESULTSET_METADATA was negotiated; servers that do not
+	// understand the bit ignore it.
+	var flags byte
+	if mc.canCacheMetadata() {
+		flags |= stmtExecuteFlagParameterCount
+	}
+	data[9] = flags
 
 	// iteration_count (uint32(1)) [4 bytes]
 	binary.LittleEndian.PutUint32(data[10:], 1)
 
+	// With CLIENT_PARAMETER_COUNT_AVAILABLE (negotiated together with
+	// CLIENT_OPTIONAL_RESULTSET_METADATA by MySQL 8.0.29+) the iteration
+	// count is followed by the number of parameter markers in the statement.
+	if parameterCountAvailable {
+		data[headerLen] = byte(stmt.paramCount)
+	}
+
 	if len(args) > 0 {
-		pos := minPktLen
+		pos := executeDataOff
+		if !parameterCountAvailable {
+			pos = headerLen
+		}
 
 		var nullMask []byte
 		if maskLen, typesLen := (len(args)+7)/8, 1+2*len(args); pos+maskLen+typesLen >= cap(data) {
@@ -1275,13 +1353,17 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 // mc.affectedRows and mc.insertIds.
 func (mc *okHandler) discardResults() error {
 	for mc.status&statusMoreResultsExists != 0 {
-		resLen, _, err := mc.readResultSetHeaderPacket()
+		resLen, metadataFollows, err := mc.readResultSetHeaderPacket()
 		if err != nil {
 			return err
 		}
 		if resLen > 0 {
 			// columns
-			if err := mc.conn().skipColumns(resLen); err != nil {
+			if metadataFollows {
+				if err := mc.conn().skipColumns(resLen); err != nil {
+					return err
+				}
+			} else if err := mc.conn().readMetadataEOF(); err != nil {
 				return err
 			}
 			// rows

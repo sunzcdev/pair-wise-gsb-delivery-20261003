@@ -71,14 +71,22 @@ func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 	}
 
 	if resLen > 0 {
-		// Columns
-		if metadataFollows && stmt.mc.extCapabilities&clientCacheMetadata != 0 {
-			// we can not skip column metadata because next stmt.Query() may use it.
-			if stmt.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
+		// Columns. Cache the received definitions so that a later execution
+		// which omits metadata can reuse them; when the server cannot omit
+		// metadata there is nothing to cache.
+		if metadataFollows {
+			if mc.canCacheMetadata() {
+				if stmt.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
+					return nil, err
+				}
+			} else if err = mc.skipColumns(resLen); err != nil {
 				return nil, err
 			}
 		} else {
-			if err = mc.skipColumns(resLen); err != nil {
+			if err = mc.readMetadataEOF(); err != nil {
+				return nil, err
+			}
+			if err = stmt.useCachedColumns(resLen); err != nil {
 				return nil, err
 			}
 		}
@@ -99,6 +107,23 @@ func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 
 func (stmt *mysqlStmt) Query(args []driver.Value) (driver.Rows, error) {
 	return stmt.query(args)
+}
+
+// useCachedColumns verifies that the definitions cached for this statement
+// can be used for a result set whose metadata the server omitted.
+//
+// The cache lives on the prepared statement, so it is naturally bound to the
+// server-side statement: re-preparing creates a new mysqlStmt with an empty
+// cache and a new statement id, and a recycled id can therefore never inherit
+// the previous statement's definitions. A column count that no longer matches
+// means the result shape changed, and the server must have sent definitions;
+// refusing stale definitions prevents decoding rows with the wrong layout.
+func (stmt *mysqlStmt) useCachedColumns(columnCount int) error {
+	if len(stmt.columns) != columnCount {
+		return fmt.Errorf("%w: cached columns=%d, server result columns=%d",
+			ErrNoCachedMetadata, len(stmt.columns), columnCount)
+	}
+	return nil
 }
 
 func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
@@ -124,17 +149,14 @@ func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
 
 	if resLen > 0 {
 		rows.mc = mc
-		if metadataFollows {
-			if rows.rs.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
-				return nil, err
-			}
-			stmt.columns = rows.rs.columns
-		} else {
-			if err = mc.skipEof(); err != nil {
-				return nil, err
-			}
-			rows.rs.columns = stmt.columns
+		// The first result set's definitions are cached on the statement so
+		// they survive until the server-side statement is closed or
+		// re-prepared.
+		rows.columnCache = [][]mysqlField{stmt.columns}
+		if err = rows.readResultColumns(resLen, metadataFollows); err != nil {
+			return nil, err
 		}
+		stmt.columns = rows.columnCache[0]
 	} else {
 		rows.rs.done = true
 

@@ -29,6 +29,10 @@ var (
 	ErrPktSyncMul        = errors.New("commands out of sync. Did you run multiple statements at once?")
 	ErrPktTooLarge       = errors.New("packet for query is too large. Try adjusting the `Config.MaxAllowedPacket`")
 	ErrBusyBuffer        = errors.New("busy buffer")
+	// ErrNoCachedMetadata is returned when the server omits result set
+	// column metadata for a prepared statement whose previous definitions are
+	// not available on the client.
+	ErrNoCachedMetadata = errors.New("server omitted result set metadata but no column definitions are cached for this prepared statement")
 
 	// errBadConnNoWrite is used for connection errors where nothing was sent to the database yet.
 	// If this happens first in a function starting a database interaction, it should be replaced by driver.ErrBadConn

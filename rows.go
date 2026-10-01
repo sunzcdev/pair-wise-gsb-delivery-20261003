@@ -11,6 +11,7 @@ package mysql
 import (
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"io"
 	"math"
 	"reflect"
@@ -23,9 +24,15 @@ type resultSet struct {
 }
 
 type mysqlRows struct {
-	mc     *mysqlConn
-	rs     resultSet
-	finish func()
+	mc             *mysqlConn
+	rs             resultSet
+	resultSetIndex int
+	// columnCache[0] is the cache of the first result set, which is the one
+	// stored on the prepared statement (mysqlStmt.columns) and shared across
+	// repeated executions. Subsequent entries cache later result sets of a
+	// multi-result statement.
+	columnCache [][]mysqlField
+	finish      func()
 }
 
 type binaryRows struct {
@@ -171,47 +178,48 @@ func (rows *mysqlRows) HasNextResultSet() (b bool) {
 	return rows.mc.status&statusMoreResultsExists != 0
 }
 
-func (rows *mysqlRows) nextResultSet() (int, error) {
+func (rows *mysqlRows) nextResultSet() (int, bool, error) {
 	if rows.mc == nil {
-		return 0, io.EOF
+		return 0, false, io.EOF
 	}
 	if err := rows.mc.error(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// Remove unread packets from stream
 	if !rows.rs.done {
 		if err := rows.mc.skipRows(); err != nil {
-			return 0, err
+			return 0, false, err
 		}
 		rows.rs.done = true
 	}
 
 	if !rows.HasNextResultSet() {
 		rows.mc = nil
-		return 0, io.EOF
+		return 0, false, io.EOF
 	}
 	rows.rs = resultSet{}
+	rows.resultSetIndex++
 	// rows.mc.affectedRows and rows.mc.insertIds accumulate on each call to
 	// nextResultSet.
-	resLen, _, err := rows.mc.resultUnchanged().readResultSetHeaderPacket()
+	resLen, metadataFollows, err := rows.mc.resultUnchanged().readResultSetHeaderPacket()
 	if err != nil {
 		// Clean up about multi-results flag
 		rows.rs.done = true
 		rows.mc.status = rows.mc.status & (^statusMoreResultsExists)
 	}
-	return resLen, err
+	return resLen, metadataFollows, err
 }
 
-func (rows *mysqlRows) nextNotEmptyResultSet() (int, error) {
+func (rows *mysqlRows) nextNotEmptyResultSet() (int, bool, error) {
 	for {
-		resLen, err := rows.nextResultSet()
+		resLen, metadataFollows, err := rows.nextResultSet()
 		if err != nil {
-			return 0, err
+			return 0, false, err
 		}
 
 		if resLen > 0 {
-			return resLen, nil
+			return resLen, metadataFollows, nil
 		}
 
 		rows.rs.done = true
@@ -219,13 +227,12 @@ func (rows *mysqlRows) nextNotEmptyResultSet() (int, error) {
 }
 
 func (rows *binaryRows) NextResultSet() error {
-	resLen, err := rows.nextNotEmptyResultSet()
+	resLen, metadataFollows, err := rows.nextNotEmptyResultSet()
 	if err != nil {
 		return err
 	}
 
-	rows.rs.columns, err = rows.mc.readColumns(resLen, nil)
-	return err
+	return rows.readResultColumns(resLen, metadataFollows)
 }
 
 func (rows *binaryRows) Next(dest []driver.Value) error {
@@ -245,13 +252,57 @@ func (rows *binaryRows) Next(dest []driver.Value) error {
 }
 
 func (rows *textRows) NextResultSet() (err error) {
-	resLen, err := rows.nextNotEmptyResultSet()
+	resLen, metadataFollows, err := rows.nextNotEmptyResultSet()
 	if err != nil {
 		return err
 	}
 
-	rows.rs.columns, err = rows.mc.readColumns(resLen, nil)
-	return err
+	return rows.readResultColumns(resLen, metadataFollows)
+}
+
+// readResultColumns resolves the column definitions for the current result
+// set. When the server omits them because the statement result shape is
+// unchanged, the definitions cached for this result-set position are reused.
+func (rows *mysqlRows) readResultColumns(count int, metadataFollows bool) error {
+	old := rows.cachedResultColumns()
+	if metadataFollows {
+		columns, err := rows.mc.readColumns(count, old)
+		if err != nil {
+			return err
+		}
+		rows.setCachedResultColumns(columns)
+		rows.rs.columns = columns
+		return nil
+	}
+
+	if err := rows.mc.readMetadataEOF(); err != nil {
+		return err
+	}
+	if len(old) != count {
+		return fmt.Errorf("%w: cached columns=%d, server result columns=%d",
+			ErrNoCachedMetadata, len(old), count)
+	}
+	rows.rs.columns = old
+	return nil
+}
+
+// cachedResultColumns returns the definitions cached for the result set at
+// the current position.
+func (rows *mysqlRows) cachedResultColumns() []mysqlField {
+	idx := rows.resultSetIndex
+	if idx < len(rows.columnCache) {
+		return rows.columnCache[idx]
+	}
+	return nil
+}
+
+// setCachedResultColumns stores the received definitions for the result set
+// at the current position.
+func (rows *mysqlRows) setCachedResultColumns(columns []mysqlField) {
+	for len(rows.columnCache) <= rows.resultSetIndex {
+		rows.columnCache = append(rows.columnCache, nil)
+	}
+	rows.columnCache[rows.resultSetIndex] = columns
 }
 
 func (rows *textRows) Next(dest []driver.Value) error {
