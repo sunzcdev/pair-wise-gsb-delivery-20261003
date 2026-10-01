@@ -28,5 +28,19 @@ module Dry
         super("Reference to struct class was garbage collected")
       end
     end
+
+    # Raised when a path given to {#update}, {#update_in} or {#delete_in}
+    # cannot be followed through the struct
+    class InvalidPathError < ::ArgumentError
+    end
+
+    # Raised when a batch of path updates contains both a path and one of its
+    # own subpaths (or the same path twice), making the result ambiguous
+    class AmbiguousPathError < ::ArgumentError
+    end
+
+    # Raised when trying to delete a required attribute
+    class RequiredAttributeError < ::ArgumentError
+    end
   end
 end

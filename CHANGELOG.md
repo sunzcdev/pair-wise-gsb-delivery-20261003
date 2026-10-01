@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Path-based updates on struct instances: `#update`, `#update_in` and `#delete_in` apply changes at nested paths (struct attributes and array indices) without flattening the struct to a hash. New values are checked against their attribute/member types, optional attributes can be explicitly removed with `Dry::Struct::DELETE`, overlapping paths in a single batch are rejected, and unmodified nested objects are shared with the original struct without being re-coerced.
+
 ### Changed
 
 ### Deprecated

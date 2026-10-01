@@ -211,6 +211,115 @@ module Dry
     end
     alias_method :__new__, :new
 
+    # Sentinel value for explicitly deleting an optional attribute
+    # in a path update
+    #
+    # @example
+    #   user.update_in(:address, :note, Dry::Struct::DELETE)
+    #   user.update([:address, :note] => Dry::Struct::DELETE)
+    #
+    # @see #update
+    # @see #delete_in
+    DELETE = ::Object.new
+
+    class << DELETE
+      # @return [String]
+      def inspect = "Dry::Struct::DELETE"
+
+      # @return [String]
+      def to_s = inspect
+    end
+
+    DELETE.freeze
+
+    # Create a copy of {Dry::Struct} with changes applied at the given paths.
+    #
+    # A path is an array of segments where a {Symbol} segment follows a struct
+    # attribute and an {Integer} segment follows an array index. Every new
+    # value is checked against (and coerced by) the type of the attribute or
+    # array member it is assigned to. If any value doesn't pass its type
+    # check, no changes are applied and an error is raised.
+    #
+    # Only the structs and arrays along the updated paths are recreated,
+    # every other (nested) value is shared with the original struct. Values
+    # that are not updated are never passed through type constructors again.
+    #
+    # Passing {DELETE} as a value removes the attribute at the path. Only
+    # omittable (optional) attributes can be deleted, see {RequiredAttributeError}.
+    # Assigning `nil` is different from deleting: it keeps the attribute and
+    # type-checks `nil` against the attribute type.
+    #
+    # A single batch cannot contain both a path and one of its own subpaths,
+    # such input is ambiguous and rejected with {AmbiguousPathError}.
+    #
+    # @param [Hash{Array<Symbol, Integer>, Symbol, Integer => Object}] updates
+    #   paths mapped to new values (or {DELETE})
+    #
+    # @return [Struct]
+    #
+    # @raise [InvalidPathError] when a path cannot be followed
+    # @raise [AmbiguousPathError] when paths overlap within a single update
+    # @raise [RequiredAttributeError] when trying to delete a required attribute
+    # @raise [Error] when a new value doesn't conform its type
+    #
+    # @example
+    #   class Order < Dry::Struct
+    #     attribute :id, Types::Integer
+    #     attribute :address do
+    #       attribute :city, Types::String
+    #       attribute? :note, Types::String
+    #     end
+    #     attribute :tags, Types::Array.of(Types::String)
+    #   end
+    #
+    #   order = Order.new(id: 1, address: {city: "Paris"}, tags: %w[gift])
+    #
+    #   order.update(
+    #     [:address, :city] => "Lyon",
+    #     [:address, :note] => Dry::Struct::DELETE,
+    #     [:tags, 0] => "urgent"
+    #   )
+    #     #=> #<Order id=1 address=#<Order::Address city="Lyon" note=nil> tags=["urgent"]>
+    def update(updates)
+      return self if updates.empty?
+
+      __apply_update__(__build_update_trie__(updates), EMPTY_ARRAY)
+    end
+
+    # Create a copy of {Dry::Struct} with a single path updated
+    #
+    # @param [Array<Symbol, Integer>] path segments leading to the updated value,
+    #   given either as separate arguments or as a single array
+    # @param [Object] value new value, or {DELETE} to remove an optional attribute
+    #
+    # @return [Struct]
+    #
+    # @example
+    #   order.update_in(:address, :city, "Lyon")
+    #   order.update_in([:tags, 0], "urgent")
+    #
+    # @see #update
+    def update_in(*path, value)
+      update(__update_path__(path) => value)
+    end
+
+    # Create a copy of {Dry::Struct} with the optional attribute
+    # at the given path removed
+    #
+    # @param [Array<Symbol, Integer>] path segments leading to the deleted attribute
+    #
+    # @return [Struct]
+    #
+    # @raise [RequiredAttributeError] when the attribute is required
+    #
+    # @example
+    #   order.delete_in(:address, :note)
+    #
+    # @see #update
+    def delete_in(*path)
+      update(__update_path__(path) => DELETE)
+    end
+
     # @return [String]
     def inspect
       klass = self.class
@@ -222,6 +331,179 @@ module Dry
     #
     # @api private
     def deconstruct_keys(_keys) = attributes
+
+    private
+
+    # @api private
+    def __update_path__(path)
+      path.size == 1 && path.first.is_a?(::Array) ? path.first : path
+    end
+
+    # Builds a tree of changes from a flat `{path => value}` mapping,
+    # rejecting empty, duplicated and overlapping paths
+    #
+    # @api private
+    def __build_update_trie__(updates)
+      updates.each_with_object(children: {}) do |(path, value), root|
+        segments = ::Kernel.Array(path)
+
+        if segments.empty?
+          raise InvalidPathError, "update path cannot be empty"
+        end
+
+        node = root
+
+        segments.each do |segment|
+          unless segment.is_a?(::Symbol) || segment.is_a?(::Integer)
+            raise InvalidPathError,
+                  "invalid path segment #{segment.inspect} in #{segments.inspect}: " \
+                  "path segments must be Symbols (struct attributes) " \
+                  "or Integers (array indices)"
+          end
+
+          if node.key?(:value)
+            raise AmbiguousPathError,
+                  "path #{segments.inspect} overlaps with a shorter path in the same update"
+          end
+
+          node = (node[:children][segment] ||= {children: {}})
+        end
+
+        if node.key?(:value) || !node[:children].empty?
+          raise AmbiguousPathError,
+                "path #{segments.inspect} overlaps with another path in the same update"
+        end
+
+        node[:value] = value
+      end
+    end
+
+    # Applies a subtree of changes to this struct, recreating only
+    # the attributes along the updated paths
+    #
+    # @api private
+    def __apply_update__(node, path)
+      new_attributes = __attributes__.dup
+
+      node[:children].each do |name, child|
+        unless name.is_a?(::Symbol)
+          raise InvalidPathError,
+                "invalid path #{(path + [name]).inspect}: " \
+                "#{name.inspect} is not an attribute of #{self.class}"
+        end
+
+        unless self.class.has_attribute?(name)
+          raise MissingAttributeError.new(attribute: name, klass: self.class)
+        end
+
+        key = self.class.schema.key(name)
+        current_path = path + [name]
+
+        if child.key?(:value)
+          if DELETE.equal?(child[:value])
+            if key.required?
+              raise RequiredAttributeError,
+                    "cannot delete required attribute #{name.inspect} of #{self.class} " \
+                    "(path #{current_path.inspect})"
+            end
+
+            new_attributes.delete(name)
+          else
+            new_attributes[name] = __coerce_update_value__(key.type, child[:value], current_path)
+          end
+        else
+          new_attributes[name] =
+            __descend_update__(__attributes__[name], key.type, child, current_path)
+        end
+      end
+
+      self.class.load(new_attributes)
+    end
+
+    # @api private
+    def __descend_update__(value, type, node, path)
+      case value
+      when Dry::Struct
+        value.__send__(:__apply_update__, node, path)
+      when ::Array
+        __apply_array_update__(value, type, node, path)
+      else
+        raise InvalidPathError,
+              "cannot follow path #{path.inspect}: " \
+              "#{value.inspect} is neither a Dry::Struct nor an Array"
+      end
+    end
+
+    # Applies a subtree of changes to an array, recreating it
+    # without expanding it beyond its current size
+    #
+    # @api private
+    def __apply_array_update__(array, type, node, path)
+      member_type = __array_member_type__(type)
+      new_array = nil
+
+      node[:children].each do |index, child|
+        current_path = path + [index]
+
+        unless index.is_a?(::Integer)
+          raise InvalidPathError,
+                "invalid path #{current_path.inspect}: " \
+                "array indices must be Integers, got #{index.inspect}"
+        end
+
+        unless index < array.size && index >= -array.size
+          raise InvalidPathError,
+                "invalid path #{current_path.inspect}: " \
+                "index #{index} is out of bounds for an array of size #{array.size}"
+        end
+
+        new_element =
+          if child.key?(:value)
+            if DELETE.equal?(child[:value])
+              raise InvalidPathError,
+                    "cannot delete array element at path #{current_path.inspect}: " \
+                    "only optional struct attributes can be deleted"
+            elsif member_type
+              __coerce_update_value__(member_type, child[:value], current_path)
+            else
+              child[:value]
+            end
+          else
+            __descend_update__(array[index], member_type, child, current_path)
+          end
+
+        new_array ||= array.dup
+        new_array[index] = new_element
+      end
+
+      new_array
+    end
+
+    # Type-checks (and coerces) a single new value without
+    # touching the rest of the struct
+    #
+    # @api private
+    def __coerce_update_value__(type, value, path)
+      type.call_unsafe(value)
+    rescue Types::CoercionError => exception
+      raise Error,
+            "[#{self.class}.update] invalid value #{value.inspect} " \
+            "at path #{path.inspect}: #{exception.message}"
+    end
+
+    # Extracts the member type of an array type, unwrapping
+    # constrained/constructor/optional decorations
+    #
+    # @api private
+    def __array_member_type__(type)
+      if type.is_a?(Types::Sum)
+        __array_member_type__(type.left) || __array_member_type__(type.right)
+      elsif type.respond_to?(:member)
+        type.member
+      elsif type.respond_to?(:type)
+        __array_member_type__(type.type)
+      end
+    end
   end
 end
 
