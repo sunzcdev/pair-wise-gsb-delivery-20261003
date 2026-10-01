@@ -1,5 +1,9 @@
 ## Current
 
+concurrent-ruby:
+
+* Add `Concurrent::IVar#subscribe` which returns a cancellable `Concurrent::IVar::Subscription` handle. The handle can withdraw a notification before its callback starts (`#cancel` returns whether it beat the callback), and observers are no longer retained by a pending `IVar` (nor after delivery or cancellation). Callbacks always run outside internal locks and an observer raising no longer prevents other observers from running.
+
 ## Release v1.3.8 (19 July 2026)
 
 concurrent-ruby:
