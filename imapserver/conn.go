@@ -46,6 +46,11 @@ type Conn struct {
 
 	state   imap.ConnState
 	session Session
+
+	// condStore indicates that CONDSTORE has been enabled for the currently
+	// selected mailbox, either via ENABLE CONDSTORE or a CONDSTORE SELECT
+	// parameter.
+	condStore bool
 }
 
 func newConn(c net.Conn, server *Server) *Conn {
@@ -152,6 +157,9 @@ func (c *Conn) serve() {
 	}
 	if _, ok := c.session.(SessionUnauthenticate); !ok && caps.Has(imap.CapUnauthenticate) {
 		panic("imapserver: server advertises UNAUTHENTICATE but session doesn't support it")
+	}
+	if _, ok := c.session.(SessionCondStore); !ok && caps.Has(imap.CapCondStore) {
+		panic("imapserver: server advertises CONDSTORE but session doesn't support it")
 	}
 
 	c.state = imap.ConnStateNotAuthenticated
@@ -272,7 +280,8 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 	case "UID EXPUNGE":
 		err = c.handleUIDExpunge(dec)
 	case "STORE", "UID STORE":
-		err = c.handleStore(dec, numKind)
+		err = c.handleStore(tag, dec, numKind)
+		sendOK = false
 	case "COPY", "UID COPY":
 		err = c.handleCopy(tag, dec, numKind)
 		sendOK = false
@@ -611,12 +620,15 @@ func (w *UpdateWriter) WriteMailboxFlags(flags []imap.Flag) error {
 }
 
 // WriteMessageFlags writes a FETCH response with FLAGS.
-func (w *UpdateWriter) WriteMessageFlags(seqNum uint32, uid imap.UID, flags []imap.Flag) error {
+func (w *UpdateWriter) WriteMessageFlags(seqNum uint32, uid imap.UID, flags []imap.Flag, modSeq uint64) error {
 	fetchWriter := &FetchWriter{conn: w.conn}
 	respWriter := fetchWriter.CreateMessage(seqNum)
 	if uid != 0 {
 		respWriter.WriteUID(uid)
 	}
 	respWriter.WriteFlags(flags)
+	if modSeq != 0 && w.conn.condStore {
+		respWriter.WriteModSeq(modSeq)
+	}
 	return respWriter.Close()
 }

@@ -25,8 +25,13 @@ func (c *Conn) handleEnable(dec *imapwire.Decoder) error {
 
 	var enabled []imap.Cap
 	for _, req := range requested {
+		if req == imap.CapCondStore {
+			if _, ok := c.session.(SessionCondStore); !ok {
+				continue
+			}
+		}
 		switch req {
-		case imap.CapIMAP4rev2, imap.CapUTF8Accept:
+		case imap.CapIMAP4rev2, imap.CapUTF8Accept, imap.CapCondStore:
 			enabled = append(enabled, req)
 		}
 	}
@@ -34,6 +39,13 @@ func (c *Conn) handleEnable(dec *imapwire.Decoder) error {
 	c.mutex.Lock()
 	for _, e := range enabled {
 		c.enabled[e] = struct{}{}
+	}
+	if c.state == imap.ConnStateSelected {
+		for _, e := range enabled {
+			if e == imap.CapCondStore {
+				c.condStore = true
+			}
+		}
 	}
 	c.mutex.Unlock()
 

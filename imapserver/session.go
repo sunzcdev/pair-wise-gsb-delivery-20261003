@@ -72,7 +72,7 @@ type Session interface {
 	Expunge(w *ExpungeWriter, uids *imap.UIDSet) error
 	Search(kind NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error)
 	Fetch(w *FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error
-	Store(w *FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error
+	Store(w *FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) (*imap.StoreResult, error)
 	Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error)
 }
 
@@ -97,6 +97,16 @@ type SessionIMAP4rev2 interface {
 	Session
 	SessionNamespace
 	SessionMove
+}
+
+// SessionCondStore is an IMAP session which supports the CONDSTORE extension.
+//
+// CONDSTORE is defined in RFC 7162.
+type SessionCondStore interface {
+	// Session is embedded; the Session.Fetch and Session.Store methods are
+	// used to implement the MODSEQ, CHANGEDSINCE and UNCHANGEDSINCE
+	// extensions.
+	Session
 }
 
 // SessionSASL is an IMAP session which supports its own set of SASL

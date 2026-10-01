@@ -2,6 +2,7 @@ package imapserver
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
@@ -9,7 +10,33 @@ import (
 
 func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) error {
 	var mailbox string
-	if !dec.ExpectSP() || !dec.ExpectMailbox(&mailbox) || !dec.ExpectCRLF() {
+	if !dec.ExpectSP() || !dec.ExpectMailbox(&mailbox) {
+		return dec.Err()
+	}
+
+	var condStoreParam bool
+	if dec.SP() && dec.Special('(') {
+		for {
+			var paramName string
+			if !dec.ExpectAtom(&paramName) {
+				return dec.Err()
+			}
+			switch strings.ToUpper(paramName) {
+			case "CONDSTORE":
+				condStoreParam = true
+			default:
+				return newClientBugError("Unknown SELECT parameter")
+			}
+			if dec.Special(')') {
+				break
+			}
+			if !dec.ExpectSP() {
+				return dec.Err()
+			}
+		}
+	}
+
+	if !dec.ExpectCRLF() {
 		return dec.Err()
 	}
 
@@ -22,6 +49,7 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 			return err
 		}
 		c.state = imap.ConnStateAuthenticated
+		c.condStore = false
 		err := c.writeStatusResp("", &imap.StatusResponse{
 			Type: imap.StatusResponseTypeOK,
 			Code: "CLOSED",
@@ -32,7 +60,8 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		}
 	}
 
-	options := imap.SelectOptions{ReadOnly: readOnly}
+	condStoreEnabled := c.enabled.Has(imap.CapCondStore)
+	options := imap.SelectOptions{ReadOnly: readOnly, CondStore: condStoreParam || condStoreEnabled}
 	data, err := c.session.Select(mailbox, &options)
 	if err != nil {
 		return err
@@ -68,8 +97,14 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 			return err
 		}
 	}
+	if data.HighestModSeq != 0 {
+		if err := c.writeHighestModSeq(data.HighestModSeq); err != nil {
+			return err
+		}
+	}
 
 	c.state = imap.ConnStateSelected
+	c.condStore = condStoreParam || condStoreEnabled
 	// TODO: forbid write commands in read-only mode
 
 	var (
@@ -111,6 +146,7 @@ func (c *Conn) handleUnselect(dec *imapwire.Decoder, expunge bool) error {
 	}
 
 	c.state = imap.ConnStateAuthenticated
+	c.condStore = false
 	return nil
 }
 
@@ -150,6 +186,15 @@ func (c *Conn) writeUIDNext(uidNext imap.UID) error {
 	enc.Atom("*").SP().Atom("OK").SP()
 	enc.Special('[').Atom("UIDNEXT").SP().UID(uidNext).Special(']')
 	enc.SP().Text("Predicted next UID")
+	return enc.CRLF()
+}
+
+func (c *Conn) writeHighestModSeq(highestModSeq uint64) error {
+	enc := newResponseEncoder(c)
+	defer enc.end()
+	enc.Atom("*").SP().Atom("OK").SP()
+	enc.Special('[').Atom("HIGHESTMODSEQ").SP().ModSeq(highestModSeq).Special(']')
+	enc.SP().Text("Highest modseq")
 	return enc.CRLF()
 }
 

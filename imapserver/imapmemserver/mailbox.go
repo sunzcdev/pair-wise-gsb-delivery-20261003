@@ -24,6 +24,9 @@ type Mailbox struct {
 	specialUse []imap.MailboxAttr
 	l          []*message
 	uidNext    imap.UID
+	// modSeq is the mailbox's highest modification sequence. Per RFC 7162
+	// section 3.1.2, it starts at 1 for newly created mailboxes.
+	modSeq uint64
 }
 
 // NewMailbox creates a new mailbox.
@@ -33,7 +36,15 @@ func NewMailbox(name string, uidValidity uint32) *Mailbox {
 		uidValidity: uidValidity,
 		name:        name,
 		uidNext:     1,
+		modSeq:      1,
 	}
+}
+
+// nextModSeqLocked advances and returns the mailbox modification sequence.
+// The caller must hold the mailbox mutex.
+func (mbox *Mailbox) nextModSeqLocked() uint64 {
+	mbox.modSeq++
+	return mbox.modSeq
 }
 
 func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
@@ -97,6 +108,9 @@ func (mbox *Mailbox) statusDataLocked(options *imap.StatusOptions) *imap.StatusD
 	if options.NumRecent {
 		num := uint32(0)
 		data.NumRecent = &num
+	}
+	if options.HighestModSeq {
+		data.HighestModSeq = mbox.modSeq
 	}
 	return &data
 }
@@ -196,6 +210,7 @@ func (mbox *Mailbox) selectDataLocked() *imap.SelectData {
 		FirstUnseenSeqNum: firstUnseenSeqNum,
 		UIDNext:           mbox.uidNext,
 		UIDValidity:       mbox.uidValidity,
+		HighestModSeq:     mbox.modSeq,
 	}
 }
 
@@ -324,9 +339,16 @@ func (mbox *MailboxView) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, op
 			return
 		}
 
+		if options.ChangedSince != 0 && msg.modSeq <= options.ChangedSince {
+			return
+		}
+
 		if markSeen {
-			msg.flags[canonicalFlag(imap.FlagSeen)] = struct{}{}
-			mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), nil)
+			storeFlags := &imap.StoreFlags{Op: imap.StoreFlagsAdd, Flags: []imap.Flag{imap.FlagSeen}}
+			if changed := msg.store(storeFlags); changed {
+				msg.modSeq = mbox.Mailbox.nextModSeqLocked()
+				mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), msg.modSeq, mbox.tracker)
+			}
 		}
 
 		respWriter := w.CreateMessage(mbox.tracker.EncodeSeqNum(seqNum))
@@ -387,6 +409,10 @@ func (mbox *MailboxView) Search(numKind imapserver.NumKind, criteria *imap.Searc
 		mbox.searchRes = uidSet
 	}
 
+	if criteria.ModSeq != nil {
+		data.ModSeq = mbox.modSeq
+	}
+
 	return &data, nil
 }
 
@@ -417,15 +443,89 @@ func (mbox *MailboxView) staticSearchCriteria(criteria *imap.SearchCriteria) {
 	}
 }
 
-func (mbox *MailboxView) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
+func (mbox *MailboxView) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) (*imap.StoreResult, error) {
+	_, isUID := numSet.(imap.UIDSet)
+
+	var (
+		modified       imap.NumSet
+		changedSeqSet  imap.SeqSet
+		changedUIDSet  imap.UIDSet
+		changedUpdates []trackerFetch
+		newModSeq      uint64
+	)
+
 	mbox.forEach(numSet, func(seqNum uint32, msg *message) {
-		msg.store(flags)
-		mbox.Mailbox.tracker.QueueMessageFlags(seqNum, msg.uid, msg.flagList(), mbox.tracker)
+		// UNCHANGEDSINCE: messages modified since the provided
+		// modification sequence must not be changed (RFC 7162
+		// section 3.1.3).
+		if options.UnchangedSince != 0 && msg.modSeq > options.UnchangedSince {
+			if isUID {
+				uidSet, _ := modified.(imap.UIDSet)
+				uidSet.AddNum(msg.uid)
+				modified = uidSet
+			} else {
+				clientSeqNum := mbox.tracker.EncodeSeqNum(seqNum)
+				if clientSeqNum != 0 {
+					seqSet, _ := modified.(imap.SeqSet)
+					seqSet.AddNum(clientSeqNum)
+					modified = seqSet
+				}
+			}
+			return
+		}
+
+		if !msg.store(flags) {
+			return
+		}
+
+		if newModSeq == 0 {
+			newModSeq = mbox.Mailbox.nextModSeqLocked()
+		}
+		msg.modSeq = newModSeq
+
+		if clientSeqNum := mbox.tracker.EncodeSeqNum(seqNum); clientSeqNum != 0 {
+			changedSeqSet.AddNum(clientSeqNum)
+		}
+		changedUIDSet.AddNum(msg.uid)
+		changedUpdates = append(changedUpdates, trackerFetch{
+			seqNum: seqNum,
+			uid:    msg.uid,
+			flags:  msg.flagList(),
+			modSeq: newModSeq,
+		})
 	})
-	if !flags.Silent {
-		return mbox.Fetch(w, numSet, &imap.FetchOptions{Flags: true})
+
+	result := &imap.StoreResult{Modified: modified}
+
+	if newModSeq != 0 {
+		// Notify other sessions. The current session receives the updated
+		// values through the FETCH responses below, if not silent.
+		for _, update := range changedUpdates {
+			mbox.Mailbox.tracker.QueueMessageFlags(update.seqNum, update.uid, update.flags, update.modSeq, mbox.tracker)
+		}
+		result.ModSeq = newModSeq
 	}
-	return nil
+
+	if !flags.Silent && len(changedUpdates) > 0 {
+		var changedSet imap.NumSet
+		if isUID {
+			changedSet = changedUIDSet
+		} else {
+			changedSet = changedSeqSet
+		}
+		if err := mbox.Fetch(w, changedSet, &imap.FetchOptions{Flags: true, ModSeq: true}); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+type trackerFetch struct {
+	seqNum uint32
+	uid    imap.UID
+	flags  []imap.Flag
+	modSeq uint64
 }
 
 func (mbox *MailboxView) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {

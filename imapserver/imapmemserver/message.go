@@ -23,6 +23,9 @@ type message struct {
 
 	// mutable, protected by Mailbox.mutex
 	flags map[imap.Flag]struct{}
+	// modSeq is the message's modification sequence. It's 0 if the message
+	// has never been modified since its arrival in the mailbox.
+	modSeq uint64
 }
 
 func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.FetchOptions) error {
@@ -30,6 +33,9 @@ func (msg *message) fetch(w *imapserver.FetchResponseWriter, options *imap.Fetch
 
 	if options.Flags {
 		w.WriteFlags(msg.flagList())
+	}
+	if options.ModSeq {
+		w.WriteModSeq(msg.modSeq)
 	}
 	if options.InternalDate {
 		w.WriteInternalDate(msg.t)
@@ -95,22 +101,49 @@ func (msg *message) flagList() []imap.Flag {
 	return flags
 }
 
-func (msg *message) store(store *imap.StoreFlags) {
+// store applies a flag operation to the message. It returns true if the flags
+// have actually been changed.
+func (msg *message) store(store *imap.StoreFlags) bool {
+	var newFlags map[imap.Flag]struct{}
+	changed := false
 	switch store.Op {
 	case imap.StoreFlagsSet:
-		msg.flags = make(map[imap.Flag]struct{})
+		newFlags = make(map[imap.Flag]struct{})
+		changed = len(msg.flags) != 0
 		fallthrough
 	case imap.StoreFlagsAdd:
+		if newFlags == nil {
+			newFlags = make(map[imap.Flag]struct{}, len(msg.flags))
+			for flag := range msg.flags {
+				newFlags[flag] = struct{}{}
+			}
+		}
 		for _, flag := range store.Flags {
-			msg.flags[canonicalFlag(flag)] = struct{}{}
+			canonical := canonicalFlag(flag)
+			if _, ok := newFlags[canonical]; !ok {
+				changed = true
+			}
+			newFlags[canonical] = struct{}{}
 		}
 	case imap.StoreFlagsDel:
+		newFlags = make(map[imap.Flag]struct{}, len(msg.flags))
+		for flag := range msg.flags {
+			newFlags[flag] = struct{}{}
+		}
 		for _, flag := range store.Flags {
-			delete(msg.flags, canonicalFlag(flag))
+			canonical := canonicalFlag(flag)
+			if _, ok := newFlags[canonical]; ok {
+				changed = true
+				delete(newFlags, canonical)
+			}
 		}
 	default:
 		panic(fmt.Errorf("unknown STORE flag operation: %v", store.Op))
 	}
+	if changed {
+		msg.flags = newFlags
+	}
+	return changed
 }
 
 func (msg *message) reader() *gomessage.Entity {
@@ -145,6 +178,10 @@ func (msg *message) search(seqNum uint32, criteria *imap.SearchCriteria) bool {
 		if _, ok := msg.flags[canonicalFlag(flag)]; ok {
 			return false
 		}
+	}
+
+	if criteria.ModSeq != nil && msg.modSeq < criteria.ModSeq.ModSeq {
+		return false
 	}
 
 	if criteria.Larger != 0 && int64(len(msg.buf)) <= criteria.Larger {

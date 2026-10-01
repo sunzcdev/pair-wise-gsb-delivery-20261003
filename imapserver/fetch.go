@@ -75,6 +75,32 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 		}
 	}
 
+	if dec.SP() {
+		if !dec.ExpectSpecial('(') {
+			return dec.Err()
+		}
+		for {
+			var modName string
+			if !dec.ExpectAtom(&modName) || !dec.ExpectSP() {
+				return dec.Err()
+			}
+			switch strings.ToUpper(modName) {
+			case "CHANGEDSINCE":
+				if !dec.ExpectModSeq(&options.ChangedSince) {
+					return dec.Err()
+				}
+			default:
+				return newClientBugError("Unknown FETCH modifier")
+			}
+			if dec.Special(')') {
+				break
+			}
+			if !dec.ExpectSP() {
+				return dec.Err()
+			}
+		}
+	}
+
 	if !dec.ExpectCRLF() {
 		return dec.Err()
 	}
@@ -85,6 +111,11 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 
 	if numKind == NumKindUID {
 		options.UID = true
+	}
+	if options.ChangedSince != 0 {
+		// RFC 7162 section 3.2.3: with CHANGEDSINCE, the server MUST
+		// include MODSEQ in FETCH responses.
+		options.ModSeq = true
 	}
 
 	w := &FetchWriter{conn: c, options: writerOptions}
@@ -108,6 +139,8 @@ func handleFetchAtt(dec *imapwire.Decoder, attName string, options *imap.FetchOp
 		options.RFC822Size = true
 	case "UID":
 		options.UID = true
+	case "MODSEQ":
+		options.ModSeq = true
 	case "RFC822": // equivalent to BODY[]
 		bs := &imap.FetchItemBodySection{}
 		writerOptions.obsolete[bs] = attName
@@ -364,6 +397,14 @@ func (w *FetchResponseWriter) WriteFlags(flags []imap.Flag) {
 	w.enc.Atom("FLAGS").SP().List(len(flags), func(i int) {
 		w.enc.Flag(flags[i])
 	})
+}
+
+// WriteModSeq writes the message's modification sequence.
+//
+// It requires CONDSTORE.
+func (w *FetchResponseWriter) WriteModSeq(modSeq uint64) {
+	w.writeItemSep()
+	w.enc.Atom("MODSEQ").SP().Special('(').ModSeq(modSeq).Special(')')
 }
 
 // WriteRFC822Size writes the message's full size.

@@ -80,19 +80,37 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		options.ReturnAll = true
 	}
 
+	// The MODSEQ search key requires the mailbox HIGHESTMODSEQ to be
+	// returned (RFC 7162 section 3.1.5).
+	withModSeq := criteria.ModSeq != nil
+
 	data, err := c.session.Search(numKind, &criteria, &options)
 	if err != nil {
 		return err
 	}
 
-	if c.enabled.Has(imap.CapIMAP4rev2) || extended {
-		return c.writeESearch(tag, data, &options, numKind)
+	// RFC 7162 carries the mailbox MODSEQ in a separate "* SEARCH MODSEQ"
+	// response for the classic format, but some clients only know how to
+	// read MODSEQ inside an ESEARCH response. Prefer ESEARCH whenever the
+	// client supports it (it's part of IMAP4rev2) or when the client used
+	// an extended SEARCH form.
+	withESearch := extended || c.enabled.Has(imap.CapESearch) || c.enabled.Has(imap.CapIMAP4rev2)
+	if withESearch {
+		return c.writeESearch(tag, data, &options, numKind, withModSeq)
 	} else {
-		return c.writeSearch(data.All)
+		if err := c.writeSearch(data.All); err != nil {
+			return err
+		}
+		if withModSeq && data.ModSeq != 0 {
+			if err := c.writeSearchModSeq(data.ModSeq); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 }
 
-func (c *Conn) writeESearch(tag string, data *imap.SearchData, options *imap.SearchOptions, numKind NumKind) error {
+func (c *Conn) writeESearch(tag string, data *imap.SearchData, options *imap.SearchOptions, numKind NumKind, withModSeq bool) error {
 	enc := newResponseEncoder(c)
 	defer enc.end()
 
@@ -117,6 +135,16 @@ func (c *Conn) writeESearch(tag string, data *imap.SearchData, options *imap.Sea
 	if options.ReturnCount {
 		enc.SP().Atom("COUNT").SP().Number(data.Count)
 	}
+	if withModSeq && data.ModSeq != 0 {
+		enc.SP().Atom("MODSEQ").SP().ModSeq(data.ModSeq)
+	}
+	return enc.CRLF()
+}
+
+func (c *Conn) writeSearchModSeq(modSeq uint64) error {
+	enc := newResponseEncoder(c)
+	defer enc.end()
+	enc.Atom("*").SP().Atom("SEARCH").SP().Atom("MODSEQ").SP().ModSeq(modSeq)
 	return enc.CRLF()
 }
 
@@ -326,6 +354,12 @@ func readSearchKeyWithAtom(criteria *imap.SearchCriteria, dec *imapwire.Decoder,
 			return err
 		}
 		criteria.Or = append(criteria.Or, or)
+	case "MODSEQ":
+		modSeq, err := readSearchModSeq(dec)
+		if err != nil {
+			return err
+		}
+		criteria.ModSeq = modSeq
 	case "$":
 		criteria.UID = append(criteria.UID, imap.SearchRes())
 	default:
@@ -344,4 +378,30 @@ func readSearchKeyWithAtom(criteria *imap.SearchCriteria, dec *imapwire.Decoder,
 
 func searchKeyFlag(key string) imap.Flag {
 	return imap.Flag("\\" + strings.Title(strings.ToLower(key)))
+}
+
+// readSearchModSeq reads the arguments of the MODSEQ search key (RFC 7162
+// section 3.4):
+//
+//	MODSEQ [entry-name SP entry-type-req SP] mod-sequence-valzer
+//
+// The opening SP has not been consumed yet. Because mod-sequence-valzer may
+// be "0" (which cannot be distinguished from the start of a quoted
+// entry-name), the extension is detected by peeking for a quote.
+func readSearchModSeq(dec *imapwire.Decoder) (*imap.SearchCriteriaModSeq, error) {
+	if !dec.ExpectSP() {
+		return nil, dec.Err()
+	}
+
+	var modSeq imap.SearchCriteriaModSeq
+	if dec.Quoted(&modSeq.MetadataName) {
+		var metadataType string
+		if !dec.ExpectSP() || !dec.ExpectAtom(&metadataType) || !dec.ExpectSP() || !dec.ExpectModSeq(&modSeq.ModSeq) {
+			return nil, dec.Err()
+		}
+		modSeq.MetadataType = imap.SearchCriteriaMetadataType(strings.ToLower(metadataType))
+	} else if !dec.ExpectModSeq(&modSeq.ModSeq) {
+		return nil, dec.Err()
+	}
+	return &modSeq, nil
 }
