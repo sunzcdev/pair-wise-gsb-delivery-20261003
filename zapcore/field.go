@@ -114,6 +114,10 @@ type Field struct {
 func (f Field) AddTo(enc ObjectEncoder) {
 	var err error
 
+	if preparer, ok := enc.(interface{ prepareField(Field) Field }); ok {
+		f = preparer.prepareField(f)
+	}
+
 	switch f.Type {
 	case ArrayMarshalerType:
 		err = enc.AddArray(f.Key, f.Interface.(ArrayMarshaler))
