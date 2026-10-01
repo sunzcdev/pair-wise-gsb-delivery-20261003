@@ -22,6 +22,7 @@ package zapcore_test
 
 import (
 	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -326,4 +327,119 @@ func TestSamplerWithZeroThereafter(t *testing.T) {
 
 	assert.Equal(t, 4, int(counter.logs.Load()),
 		"Unexpected number of logs")
+}
+
+func makeStringField(key, val string) Field {
+	return Field{Key: key, Type: StringType, String: val}
+}
+
+func TestFieldSampler(t *testing.T) {
+	core, logs := observer.New(DebugLevel)
+	sampler := NewFieldSamplerWithOptions(core, time.Minute, 2, 0, []string{"tenant"})
+
+	write := func(tenant string) {
+		ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+		if ce := sampler.Check(ent, nil); ce != nil {
+			ce.Write(makeStringField("tenant", tenant))
+		}
+	}
+
+	// Both tenants log the same message, but each gets its own sampling
+	// budget, so the noisy tenant can't starve the quiet one.
+	for i := 0; i < 10; i++ {
+		write("big")
+	}
+	for i := 0; i < 10; i++ {
+		write("small")
+	}
+
+	counts := make(map[string]int)
+	for _, ent := range logs.TakeAll() {
+		require.Equal(t, "boom", ent.Message)
+		require.Len(t, ent.Context, 1, "Unexpected number of fields.")
+		counts[ent.Context[0].String]++
+	}
+	assert.Equal(t, map[string]int{"big": 2, "small": 2}, counts,
+		"Each tenant should be sampled independently.")
+}
+
+func TestFieldSamplerWithFields(t *testing.T) {
+	core, logs := observer.New(DebugLevel)
+	sampler := NewFieldSamplerWithOptions(core, time.Minute, 1, 0, []string{"tenant", "op"})
+
+	// Fields bound with With and fields supplied at the log site together
+	// determine the sampling key.
+	tenantA := sampler.With([]Field{makeStringField("tenant", "a")})
+	tenantB := sampler.With([]Field{makeStringField("tenant", "b")})
+
+	write := func(core Core, op string) {
+		ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+		if ce := core.Check(ent, nil); ce != nil {
+			ce.Write(makeStringField("op", op))
+		}
+	}
+
+	for i := 0; i < 3; i++ {
+		write(tenantA, "read")
+	}
+	for i := 0; i < 3; i++ {
+		write(tenantA, "write")
+	}
+	for i := 0; i < 3; i++ {
+		write(tenantB, "read")
+	}
+
+	entries := logs.TakeAll()
+	require.Len(t, entries, 3, "Each distinct key should be sampled once.")
+	want := [][2]string{{"a", "read"}, {"a", "write"}, {"b", "read"}}
+	for i, ent := range entries {
+		require.Len(t, ent.Context, 2, "Unexpected number of fields.")
+		assert.Equal(t, want[i][0], ent.Context[0].String, "Unexpected tenant.")
+		assert.Equal(t, want[i][1], ent.Context[1].String, "Unexpected op.")
+	}
+}
+
+type countingObjMarshaler struct {
+	calls *atomic.Int64
+	id    string
+}
+
+func (m countingObjMarshaler) MarshalLogObject(enc ObjectEncoder) error {
+	m.calls.Add(1)
+	enc.AddString("id", m.id)
+	return nil
+}
+
+func TestFieldSamplerMarshalerEvaluation(t *testing.T) {
+	var keyCalls, expensiveCalls atomic.Int64
+
+	encCfg := EncoderConfig{
+		MessageKey:  "msg",
+		LevelKey:    "level",
+		EncodeLevel: LowercaseLevelEncoder,
+	}
+	core := NewCore(NewJSONEncoder(encCfg), AddSync(io.Discard), DebugLevel)
+	sampler := NewFieldSamplerWithOptions(core, time.Minute, 1, 0, []string{"tenant"})
+
+	const numEntries = 5
+	for i := 0; i < numEntries; i++ {
+		ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+		if ce := sampler.Check(ent, nil); ce != nil {
+			ce.Write(
+				Field{Key: "tenant", Type: ObjectMarshalerType, Interface: countingObjMarshaler{calls: &keyCalls, id: "a"}},
+				Field{Key: "expensive", Type: ObjectMarshalerType, Interface: countingObjMarshaler{calls: &expensiveCalls, id: "x"}},
+			)
+		}
+	}
+
+	// With first=1 and thereafter=0, one entry is sampled and the rest are
+	// dropped. The marshaler behind the key is evaluated exactly once per
+	// entry to compute the key, plus once more when the sampled entry is
+	// written out.
+	assert.Equal(t, int64(numEntries+1), keyCalls.Load(),
+		"Key marshaler should be evaluated at most once per entry for the key.")
+	// The expensive field doesn't participate in the key, so it's encoded
+	// only for the sampled entry and never for dropped entries.
+	assert.Equal(t, int64(1), expensiveCalls.Load(),
+		"Non-key fields must not be encoded for dropped entries.")
 }
