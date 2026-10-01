@@ -361,12 +361,35 @@ func (c *clientHandler) handleDELE(param string) error {
 
 func (c *clientHandler) handleRNFR(param string) error {
 	path := c.absPath(param)
-	if _, err := c.driver.Stat(path); err == nil {
-		c.writeMessage(StatusFileActionPending, "Sure, give me a target")
-		c.ctxRnfr = path
-	} else {
+	if _, err := c.driver.Stat(path); err != nil {
 		c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Couldn't access %s: %v", path, err))
+
+		return nil
 	}
+
+	c.ctxRnfr = path
+	c.ctxRnfrIdentity = ""
+
+	if c.server.settings.StrictRename != StrictRenameDisabled {
+		if strictRename, ok := c.driver.(ClientDriverExtensionStrictRename); ok {
+			identity, err := strictRename.Identity(path)
+			if err != nil {
+				c.ctxRnfr = ""
+				c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Couldn't identify %s: %v", path, err))
+
+				return nil
+			}
+
+			c.ctxRnfrIdentity = identity
+		} else if c.server.settings.StrictRename == StrictRenameRequired {
+			c.ctxRnfr = ""
+			c.writeMessage(StatusActionNotTaken, "The driver doesn't support strict renames")
+
+			return nil
+		}
+	}
+
+	c.writeMessage(StatusFileActionPending, "Sure, give me a target")
 
 	return nil
 }
@@ -374,16 +397,34 @@ func (c *clientHandler) handleRNFR(param string) error {
 func (c *clientHandler) handleRNTO(param string) error {
 	dst := c.absPath(param)
 
-	if c.ctxRnfr != "" {
-		if err := c.driver.Rename(c.ctxRnfr, dst); err == nil {
-			c.writeMessage(StatusFileOK, "Done !")
-			c.ctxRnfr = ""
-		} else {
-			c.writeMessage(getErrorCode(err, StatusActionNotTaken), fmt.Sprintf("Couldn't rename %s to %s: %s",
-				c.ctxRnfr, dst, err.Error()))
-		}
-	} else {
+	if c.ctxRnfr == "" {
 		c.writeMessage(StatusBadCommandSequence, "RNFR is expected before RNTO")
+
+		return nil
+	}
+
+	if strictRename, ok := c.driver.(ClientDriverExtensionStrictRename); ok && c.ctxRnfrIdentity != "" {
+		// strict rename: the identity token is consumed whatever the outcome is,
+		// a new RNFR is required to select the object again
+		err := strictRename.RenameIfIdentity(c.ctxRnfr, dst, c.ctxRnfrIdentity)
+		c.ctxRnfr = ""
+		c.ctxRnfrIdentity = ""
+
+		if err != nil {
+			c.writeMessage(getErrorCode(err, StatusActionNotTaken), fmt.Sprintf("Couldn't rename: %s", err.Error()))
+		} else {
+			c.writeMessage(StatusFileOK, "Done !")
+		}
+
+		return nil
+	}
+
+	if err := c.driver.Rename(c.ctxRnfr, dst); err == nil {
+		c.writeMessage(StatusFileOK, "Done !")
+		c.ctxRnfr = ""
+	} else {
+		c.writeMessage(getErrorCode(err, StatusActionNotTaken), fmt.Sprintf("Couldn't rename %s to %s: %s",
+			c.ctxRnfr, dst, err.Error()))
 	}
 
 	return nil

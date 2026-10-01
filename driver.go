@@ -126,6 +126,29 @@ type ClientDriverExtensionHasher interface {
 	ComputeHash(name string, algo HASHAlgo, startOffset, endOffset int64) (string, error)
 }
 
+// ClientDriverExtensionStrictRename is an extension to support strict renames.
+//
+// RNFR and RNTO are two separate commands and, between them, the object at the
+// source path can be deleted and replaced by another one, even by another
+// connection: renaming by path only is racy. A driver implementing this extension
+// provides an opaque identity token for the object selected by RNFR and atomically
+// verifies (and consumes) this token on RNTO, so that the renamed object is
+// guaranteed to be the one that was selected by RNFR.
+type ClientDriverExtensionStrictRename interface {
+	// Identity returns an opaque token identifying the object currently stored at
+	// the given path. The token must differ if the object at the path is replaced
+	// by another one: an identical path is not enough to consider two objects
+	// identical. Drivers can rely, for example, on a file ID/inode and a generation
+	// counter or on a content hash.
+	Identity(name string) (string, error)
+
+	// RenameIfIdentity atomically checks that the object at oldname still matches
+	// the identity token returned by a previous Identity call and, only in this
+	// case, renames it to newname. If the token doesn't match, no rename is
+	// performed and an error must be returned.
+	RenameIfIdentity(oldname, newname, identity string) error
+}
+
 // ClientDriverExtensionAvailableSpace is an extension to implement to support
 // the AVBL ftp command
 type ClientDriverExtensionAvailableSpace interface {
@@ -320,6 +343,23 @@ type PublicIPResolver func(ClientContext) (string, error)
 // connection to that client. A nil result leaves the choice to the operating system.
 type ActiveTransferLocalIPResolver func(ClientContext) net.IP
 
+// StrictRenameMode defines how the server handles strict (identity-verified) renames
+type StrictRenameMode int8
+
+// Supported strict rename modes
+const (
+	// StrictRenameDisabled disables strict renames: RNFR/RNTO use the legacy
+	// path-based behavior
+	StrictRenameDisabled StrictRenameMode = iota
+	// StrictRenameIfSupported uses identity-verified renames if the driver
+	// implements ClientDriverExtensionStrictRename and falls back to the legacy
+	// behavior otherwise
+	StrictRenameIfSupported
+	// StrictRenameRequired uses identity-verified renames and rejects RNFR if the
+	// driver doesn't implement ClientDriverExtensionStrictRename
+	StrictRenameRequired
+)
+
 // TLSRequirement is the enumerable that represents the supported TLS mode
 type TLSRequirement int8
 
@@ -379,6 +419,9 @@ type Settings struct {
 	ActiveConnectionsCheck DataConnectionRequirement
 	// PasvConnectionsCheck defines the security requirements for passive connections
 	PasvConnectionsCheck DataConnectionRequirement
+	// StrictRename defines how RNFR/RNTO verify that the renamed object is the one
+	// selected by RNFR. See StrictRenameMode for the supported values.
+	StrictRename StrictRenameMode
 	// ActiveTransferLocalIPResolver (Optional) selects the local IP address active mode (PORT, EPRT)
 	// data connections are dialed from. Without it the operating system picks the source address
 	// from its routing table, which on a multi homed host is not necessarily the address the client

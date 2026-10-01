@@ -1,10 +1,12 @@
 package ftpserver
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -12,9 +14,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/secsy/goftp"
+	"github.com/spf13/afero"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -463,6 +467,261 @@ func TestRename(t *testing.T) {
 	rc, _, err := raw.SendCommand("RNTO file2")
 	require.NoError(t, err)
 	require.Equal(t, StatusBadCommandSequence, rc)
+}
+
+// strictRenameTestDriver is a test ClientDriver implementing
+// ClientDriverExtensionStrictRename. The identity token is based on the file
+// content: replacing the object at a path changes its identity even if the
+// path remains the same.
+type strictRenameTestDriver struct {
+	afero.Fs
+	mu *sync.Mutex
+}
+
+var errIdentityMismatch = errors.New("object identity mismatch")
+
+func (d *strictRenameTestDriver) Identity(name string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.identity(name)
+}
+
+func (d *strictRenameTestDriver) identity(name string) (string, error) {
+	file, err := d.Fs.Open(name)
+	if err != nil {
+		return "", err
+	}
+
+	defer func() { _ = file.Close() }()
+
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func (d *strictRenameTestDriver) RenameIfIdentity(oldname, newname, identity string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	current, err := d.identity(oldname)
+	if err != nil {
+		return err
+	}
+
+	if current != identity {
+		return errIdentityMismatch
+	}
+
+	return d.Fs.Rename(oldname, newname)
+}
+
+// newStrictRenameTestServer creates a test server with the given strict rename
+// mode. If strictDriver is true the client drivers implement
+// ClientDriverExtensionStrictRename, otherwise the legacy TestClientDriver is used.
+func newStrictRenameTestServer(t *testing.T, mode StrictRenameMode, strictDriver bool) (*FtpServer, *TestServerDriver) {
+	t.Helper()
+
+	serverDriver := &TestServerDriver{Debug: false}
+	serverDriver.Settings = &Settings{
+		StrictRename: mode,
+	}
+
+	if strictDriver {
+		var mu sync.Mutex
+
+		serverDriver.AuthProvider = func(user, pass string) (ClientDriver, error) {
+			if user == authUser && pass == authPass {
+				return &strictRenameTestDriver{Fs: serverDriver.fs, mu: &mu}, nil
+			}
+
+			return nil, errBadUserNameOrPassword
+		}
+	}
+
+	return NewTestServerWithTestDriver(t, serverDriver), serverDriver
+}
+
+func TestStrictRenameReplacedSource(t *testing.T) {
+	s, serverDriver := newStrictRenameTestServer(t, StrictRenameRequired, true)
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	// session A selects the object to rename
+	clientA, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientA.Close()) }()
+
+	original := []byte("original object")
+	ftpUpload(t, clientA, bytes.NewReader(original), "file")
+
+	rawA, err := clientA.OpenRawConn()
+	require.NoError(t, err, "Couldn't open raw connection")
+
+	defer func() { require.NoError(t, rawA.Close()) }()
+
+	rc, _, err := rawA.SendCommand("RNFR file")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileActionPending, rc)
+
+	// session B replaces the source object with a different one at the same path
+	clientB, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientB.Close()) }()
+
+	require.NoError(t, clientB.Delete("file"))
+
+	replacement := []byte("replacement object")
+	ftpUpload(t, clientB, bytes.NewReader(replacement), "file")
+
+	// the rename must fail: the object at the path is not the selected one anymore
+	rc, _, err = rawA.SendCommand("RNTO renamed")
+	require.NoError(t, err)
+	require.Equal(t, StatusActionNotTaken, rc)
+
+	// the replacement object is still at the source path, untouched
+	content, err := afero.ReadFile(serverDriver.fs, "/file")
+	require.NoError(t, err)
+	require.Equal(t, replacement, content)
+
+	// the original object is gone (deleted by session B, not renamed) and the
+	// target path doesn't exist: "file" is the only remaining entry
+	entries, err := afero.ReadDir(serverDriver.fs, "/")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, "file", entries[0].Name())
+
+	// the identity token has been consumed: a new RNFR is required to retry
+	rc, _, err = rawA.SendCommand("RNTO renamed")
+	require.NoError(t, err)
+	require.Equal(t, StatusBadCommandSequence, rc)
+}
+
+func TestStrictRenameSuccess(t *testing.T) {
+	s, serverDriver := newStrictRenameTestServer(t, StrictRenameRequired, true)
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	client, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(client.Close()) }()
+
+	original := []byte("original object")
+	ftpUpload(t, client, bytes.NewReader(original), "file")
+
+	raw, err := client.OpenRawConn()
+	require.NoError(t, err, "Couldn't open raw connection")
+
+	defer func() { require.NoError(t, raw.Close()) }()
+
+	// without interference the strict rename succeeds
+	rc, _, err := raw.SendCommand("RNFR file")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileActionPending, rc)
+
+	rc, _, err = raw.SendCommand("RNTO renamed")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileOK, rc)
+
+	content, err := afero.ReadFile(serverDriver.fs, "/renamed")
+	require.NoError(t, err)
+	require.Equal(t, original, content)
+
+	_, err = serverDriver.fs.Stat("/file")
+	require.Error(t, err)
+
+	// the identity token has been consumed
+	rc, _, err = raw.SendCommand("RNTO renamed2")
+	require.NoError(t, err)
+	require.Equal(t, StatusBadCommandSequence, rc)
+}
+
+func TestStrictRenameRequiredUnsupportedDriver(t *testing.T) {
+	s, serverDriver := newStrictRenameTestServer(t, StrictRenameRequired, false)
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	client, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(client.Close()) }()
+
+	require.NoError(t, afero.WriteFile(serverDriver.fs, "/file", []byte("some content"), 0o600))
+
+	raw, err := client.OpenRawConn()
+	require.NoError(t, err, "Couldn't open raw connection")
+
+	defer func() { require.NoError(t, raw.Close()) }()
+
+	// the driver doesn't support strict renames: RNFR is rejected
+	rc, _, err := raw.SendCommand("RNFR file")
+	require.NoError(t, err)
+	require.Equal(t, StatusActionNotTaken, rc)
+
+	rc, _, err = raw.SendCommand("RNTO renamed")
+	require.NoError(t, err)
+	require.Equal(t, StatusBadCommandSequence, rc)
+}
+
+func TestStrictRenameFallbackToLegacy(t *testing.T) {
+	s, serverDriver := newStrictRenameTestServer(t, StrictRenameIfSupported, false)
+	conf := goftp.Config{
+		User:     authUser,
+		Password: authPass,
+	}
+
+	// session A selects the object to rename
+	clientA, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientA.Close()) }()
+
+	ftpUpload(t, clientA, bytes.NewReader([]byte("original object")), "file")
+
+	rawA, err := clientA.OpenRawConn()
+	require.NoError(t, err, "Couldn't open raw connection")
+
+	defer func() { require.NoError(t, rawA.Close()) }()
+
+	rc, _, err := rawA.SendCommand("RNFR file")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileActionPending, rc)
+
+	// session B replaces the source object with a different one at the same path
+	clientB, err := goftp.DialConfig(conf, s.Addr())
+	require.NoError(t, err, "Couldn't connect")
+
+	defer func() { panicOnError(clientB.Close()) }()
+
+	require.NoError(t, clientB.Delete("file"))
+
+	replacement := []byte("replacement object")
+	ftpUpload(t, clientB, bytes.NewReader(replacement), "file")
+
+	// the driver doesn't support strict renames and the legacy behavior is
+	// allowed: the rename is path-based and succeeds, moving the replacement object
+	rc, _, err = rawA.SendCommand("RNTO renamed")
+	require.NoError(t, err)
+	require.Equal(t, StatusFileOK, rc)
+
+	content, err := afero.ReadFile(serverDriver.fs, "/renamed")
+	require.NoError(t, err)
+	require.Equal(t, replacement, content)
+
+	_, err = serverDriver.fs.Stat("/file")
+	require.Error(t, err)
 }
 
 func TestUploadErrorCodes(t *testing.T) {
