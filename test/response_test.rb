@@ -38,6 +38,24 @@ describe Rack::Cache::Response do
     end
   end
 
+  describe '#cacheable?' do
+    it 'is false with a bare private directive' do
+      @res.headers['cache-control'] = 'private, max-age=60'
+      refute @res.cacheable?
+    end
+
+    it 'is true when the private directive names specific header fields' do
+      @res.headers['cache-control'] = 'private="x-secret", max-age=60'
+      assert @res.cacheable?
+    end
+
+    it 'is false when the private field list is malformed' do
+      @res.headers['cache-control'] = 'private="x-secret'
+      @res.headers['expires'] = @one_hour_later.httpdate
+      refute @res.cacheable?
+    end
+  end
+
   describe '#validateable?' do
     it 'is true when last-modified header present' do
       @res = Rack::Cache::Response.new(200, {'last-modified' => @one_hour_ago.httpdate}, [])

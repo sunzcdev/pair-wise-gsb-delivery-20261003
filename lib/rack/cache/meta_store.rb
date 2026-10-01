@@ -151,6 +151,13 @@ module Rack::Cache
     def persist_response(response)
       hash = response.headers.dup
       hash['x-status'] = response.status.to_s
+      # Header fields named by a qualified private directive are intended
+      # for a single user and must not be written to shared storage. The
+      # response object itself is left untouched so that the client
+      # responsible for this request still receives those headers.
+      if names = response.cache_control.private_field_names
+        names.each { |name| hash.delete(name) }
+      end
       hash
     end
 

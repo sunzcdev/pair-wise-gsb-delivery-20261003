@@ -127,13 +127,34 @@ module Rack::Cache
 
     # Whether the cache entry is "fresh enough" to satisfy the request.
     def fresh_enough?(entry)
-      if entry.fresh?
+      if entry.fresh? && !revalidation_required?(entry)
         if allow_revalidate? && max_age = @request.cache_control.max_age
           max_age > 0 && max_age >= entry.age
         else
           true
         end
       end
+    end
+
+    # A response stored with a bare (field-less) no-cache directive must
+    # not be used to satisfy a request without successful revalidation
+    # with the origin server, no matter how fresh it is. A no-cache
+    # directive that names specific header fields restricts only those
+    # fields; the rest of the response may be served when fresh.
+    def revalidation_required?(entry)
+      entry.cache_control.no_cache? &&
+        entry.cache_control.no_cache_field_names.nil?
+    end
+
+    # Remove headers named by a qualified no-cache directive from a cached
+    # response that is about to be served without successful revalidation.
+    # The stored entry is not modified; the response object passed in is
+    # a per-request copy restored from the metastore.
+    def strip_no_cache_fields(response)
+      if names = response.cache_control.no_cache_field_names
+        names.each { |name| response.headers.delete(name) }
+      end
+      response
     end
 
     # Delegate the request to the backend and create the response.
@@ -181,6 +202,7 @@ module Rack::Cache
         if entry
           if fresh_enough?(entry)
             record :fresh
+            strip_no_cache_fields(entry)
             entry.headers['age'] = entry.age.to_s
             entry
           else
@@ -203,6 +225,7 @@ module Rack::Cache
       validate(entry)
     rescue => e
       record :connnection_failed
+      strip_no_cache_fields(entry)
       age = entry.age.to_s
       entry.headers['age'] = age
       record "Fail-over to stale cache data with age #{age} due to #{e.class.name}: #{e}"
@@ -240,6 +263,16 @@ module Rack::Cache
         %w[Date expires cache-control etag last-modified].each do |name|
           next unless value = response.headers[name]
           entry.headers[name] = value
+        end
+
+        # A successful revalidation refreshes the header fields named by a
+        # qualified no-cache directive when the origin provides new values;
+        # the revalidated entry may include them again.
+        if names = entry.cache_control.no_cache_field_names
+          names.each do |name|
+            next unless value = response.headers[name]
+            entry.headers[name] = value
+          end
         end
 
         # even though it's empty, be sure to close the response body from upstream

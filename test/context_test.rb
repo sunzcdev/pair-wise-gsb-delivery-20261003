@@ -1030,4 +1030,201 @@ describe Rack::Cache::Context do
     assert response.ok?
     logger.logged_level.must_equal "info"
   end
+
+  describe 'field-level cache restrictions' do
+    # Return the response headers Hash persisted in the meta store for the
+    # most recently stored entry, or nil when nothing was stored.
+    def stored_response_headers
+      hash = cache.metastore.to_hash
+      return nil if hash.empty?
+      Marshal.load(hash.values.first).first[1]
+    end
+
+    it 'withholds private-listed headers from shared storage but not from the current client' do
+      respond_with 200,
+        'cache-control' => 'public, max-age=60, private="x-session-token"',
+        'x-session-token' => 'secret123',
+        'x-page' => 'shared'
+      get '/'
+
+      assert response.ok?
+      cache.trace.must_include :store
+      # the client responsible for this request still receives the header
+      response.headers['x-session-token'].must_equal 'secret123'
+
+      # the sensitive value must not be present in shared storage at all
+      stored = stored_response_headers
+      refute stored.nil?
+      stored.wont_include 'x-session-token'
+      stored['x-page'].must_equal 'shared'
+    end
+
+    it 'serves subsequent requests from cache without the private-listed headers' do
+      respond_with 200,
+        'cache-control' => 'public, max-age=60, private="x-session-token"',
+        'x-session-token' => 'secret123',
+        'x-page' => 'shared'
+      get '/'
+      get '/'
+
+      refute app.called?
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-session-token'
+      response.headers['x-page'].must_equal 'shared'
+      response.body.must_equal 'Hello World'
+    end
+
+    it 'matches private-listed field names case-insensitively' do
+      respond_with 200,
+        'cache-control' => 'public, max-age=60, private="X-Session-TOKEN"',
+        'x-session-token' => 'secret123'
+      get '/'
+
+      cache.trace.must_include :store
+      response.headers['x-session-token'].must_equal 'secret123'
+      stored_response_headers.wont_include 'x-session-token'
+    end
+
+    it 'stores no-cache-listed headers but withholds them from unrevalidated cache hits' do
+      respond_with 200,
+        'cache-control' => 'public, max-age=60, no-cache="x-user-id"',
+        'x-user-id' => 'alice',
+        'x-page' => 'shared'
+      get '/'
+
+      assert response.ok?
+      cache.trace.must_include :store
+      # the first client receives the header
+      response.headers['x-user-id'].must_equal 'alice'
+      # no-cache fields may be stored, unlike private fields
+      stored_response_headers['x-user-id'].must_equal 'alice'
+
+      get '/'
+
+      refute app.called?
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-user-id'
+      response.headers['x-page'].must_equal 'shared'
+    end
+
+    it 'serves stored no-cache-listed headers again after successful revalidation' do
+      respond_with 200,
+        'etag' => '"xyz"',
+        'cache-control' => 'max-age=0, no-cache="x-user-id"' do |req, res|
+        if req.env['HTTP_IF_NONE_MATCH'].to_s.include?('"xyz"')
+          res.status = 304
+          res.body = []
+        else
+          res['x-user-id'] = 'alice'
+        end
+      end
+
+      get '/'
+      cache.trace.must_include :store
+      response.headers['x-user-id'].must_equal 'alice'
+
+      get '/'
+      assert app.called?
+      cache.trace.must_include :valid
+      response.headers['x-user-id'].must_equal 'alice'
+    end
+
+    it 'updates no-cache-listed headers from the 304 response when provided' do
+      respond_with 200,
+        'etag' => '"xyz"',
+        'cache-control' => 'max-age=0, no-cache="x-user-id"' do |req, res|
+        if req.env['HTTP_IF_NONE_MATCH'].to_s.include?('"xyz"')
+          res.status = 304
+          res.body = []
+          res['x-user-id'] = 'bob'
+        else
+          res['x-user-id'] = 'alice'
+        end
+      end
+
+      get '/'
+      response.headers['x-user-id'].must_equal 'alice'
+
+      get '/'
+      cache.trace.must_include :valid
+      response.headers['x-user-id'].must_equal 'bob'
+    end
+
+    it 'requires revalidation before reusing responses with a bare no-cache directive' do
+      respond_with 200,
+        'etag' => '"xyz"',
+        'cache-control' => 'max-age=60, no-cache'
+      get '/'
+
+      cache.trace.must_include :store
+
+      get '/'
+
+      assert app.called?
+      cache.trace.must_include :stale
+      cache.trace.wont_include :fresh
+    end
+
+    it 'does not store responses with a bare private directive at all' do
+      respond_with 200,
+        'cache-control' => 'max-age=60, private',
+        'x-session-token' => 'secret123'
+      get '/'
+
+      cache.trace.wont_include :store
+      assert stored_response_headers.nil?
+      response.headers['x-session-token'].must_equal 'secret123'
+    end
+
+    it 'applies private and no-cache field lists together' do
+      respond_with 200,
+        'cache-control' => 'public, max-age=60, private="x-session-token", no-cache="x-user-id"',
+        'x-session-token' => 'secret123',
+        'x-user-id' => 'alice',
+        'x-page' => 'shared'
+      get '/'
+
+      cache.trace.must_include :store
+      response.headers['x-session-token'].must_equal 'secret123'
+      response.headers['x-user-id'].must_equal 'alice'
+
+      stored = stored_response_headers
+      stored.wont_include 'x-session-token'
+      stored['x-user-id'].must_equal 'alice'
+
+      get '/'
+
+      refute app.called?
+      cache.trace.must_include :fresh
+      response.headers.wont_include 'x-session-token'
+      response.headers.wont_include 'x-user-id'
+      response.headers['x-page'].must_equal 'shared'
+    end
+
+    it 'treats a malformed private field list as a restriction on the whole response' do
+      respond_with 200,
+        'cache-control' => 'max-age=60, private="x-session-token',
+        'x-session-token' => 'secret123'
+      get '/'
+
+      cache.trace.wont_include :store
+      assert stored_response_headers.nil?
+      response.headers['x-session-token'].must_equal 'secret123'
+    end
+
+    it 'treats a malformed no-cache field list as requiring revalidation of the whole response' do
+      respond_with 200,
+        'etag' => '"xyz"',
+        'cache-control' => 'max-age=60, no-cache="x-user-id'
+      get '/'
+
+      cache.trace.must_include :store
+
+      get '/'
+
+      assert app.called?
+      cache.trace.must_include :stale
+      cache.trace.wont_include :fresh
+    end
+  end
 end

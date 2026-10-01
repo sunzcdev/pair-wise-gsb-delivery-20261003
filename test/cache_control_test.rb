@@ -153,4 +153,84 @@ describe Rack::Cache::CacheControl do
     cache_control = Rack::Cache::CacheControl.new('max-age=600')
     refute cache_control.no_cache?
   end
+
+  it 'parses a quoted-string field list as a single directive value' do
+    cache_control =
+      Rack::Cache::CacheControl.new('private="Set-Cookie, X-Other", max-age=60')
+    cache_control['private'].must_equal '"Set-Cookie, X-Other"'
+    cache_control['max-age'].must_equal '60'
+  end
+
+  it 'parses multiple directives carrying quoted-string field lists' do
+    cache_control =
+      Rack::Cache::CacheControl.new('max-age=60, private="X-A", no-cache="X-B"')
+    cache_control['max-age'].must_equal '60'
+    cache_control.private_field_names.must_equal ['x-a']
+    cache_control.no_cache_field_names.must_equal ['x-b']
+  end
+
+  it 'round-trips quoted-string field lists through #to_s' do
+    cache_control = Rack::Cache::CacheControl.new('private="Set-Cookie"')
+    cache_control.to_s.must_equal 'private="Set-Cookie"'
+  end
+
+  it 'treats a malformed quoted-string as a valueless directive' do
+    cache_control = Rack::Cache::CacheControl.new('private="Set-Cookie')
+    cache_control['private'].must_equal true
+    cache_control.private_field_names.must_be_nil
+  end
+
+  describe '#private_field_names' do
+    it 'is a downcased array of field names for a qualified private directive' do
+      cache_control = Rack::Cache::CacheControl.new('private="Set-Cookie, X-Other"')
+      cache_control.private_field_names.must_equal ['set-cookie', 'x-other']
+    end
+
+    it 'is nil for a bare private directive' do
+      cache_control = Rack::Cache::CacheControl.new('private')
+      cache_control.private_field_names.must_be_nil
+    end
+
+    it 'is nil when no private directive is present' do
+      cache_control = Rack::Cache::CacheControl.new('public')
+      cache_control.private_field_names.must_be_nil
+    end
+
+    it 'is nil for an empty field list' do
+      cache_control = Rack::Cache::CacheControl.new('private=""')
+      cache_control.private_field_names.must_be_nil
+    end
+
+    it 'is nil when the list contains invalid field names' do
+      cache_control = Rack::Cache::CacheControl.new('private="not a token"')
+      cache_control.private_field_names.must_be_nil
+    end
+
+    it 'is nil for an unquoted field list' do
+      cache_control = Rack::Cache::CacheControl.new('private=Set-Cookie')
+      cache_control.private_field_names.must_be_nil
+    end
+  end
+
+  describe '#no_cache_field_names' do
+    it 'is a downcased array of field names for a qualified no-cache directive' do
+      cache_control = Rack::Cache::CacheControl.new('no-cache="X-User-Id"')
+      cache_control.no_cache_field_names.must_equal ['x-user-id']
+    end
+
+    it 'is nil for a bare no-cache directive' do
+      cache_control = Rack::Cache::CacheControl.new('no-cache')
+      cache_control.no_cache_field_names.must_be_nil
+    end
+
+    it 'is nil when no no-cache directive is present' do
+      cache_control = Rack::Cache::CacheControl.new('max-age=600')
+      cache_control.no_cache_field_names.must_be_nil
+    end
+
+    it 'is nil for a malformed quoted-string field list' do
+      cache_control = Rack::Cache::CacheControl.new('no-cache="X-User-Id')
+      cache_control.no_cache_field_names.must_be_nil
+    end
+  end
 end

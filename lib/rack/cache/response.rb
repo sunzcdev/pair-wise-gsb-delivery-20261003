@@ -96,13 +96,15 @@ module Rack::Cache
 
     # Determine if the response is worth caching under any circumstance. Responses
     # marked "private" with an explicit cache-control directive are considered
-    # uncacheable
+    # uncacheable, unless the directive names specific header fields, in which
+    # case only those fields are withheld from the shared cache.
     #
     # Responses with neither a freshness lifetime (expires, max-age) nor cache
     # validator (last-modified, etag) are considered uncacheable.
     def cacheable?
       return false unless CACHEABLE_RESPONSE_CODES.include?(status)
-      return false if cache_control.no_store? || cache_control.private?
+      return false if cache_control.no_store?
+      return false if cache_control.private? && cache_control.private_field_names.nil?
       validateable? || fresh?
     end
 

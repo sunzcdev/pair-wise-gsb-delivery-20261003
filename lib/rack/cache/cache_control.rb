@@ -33,6 +33,16 @@ module Rack
         self['private']
       end
 
+      # The list of header field names given as the quoted-string argument
+      # of the private directive (e.g., private="Set-Cookie, X-Other"),
+      # downcased, or nil when the directive carries no valid field-name
+      # list. When the private directive is present but this returns nil
+      # (bare directive or malformed list), the restriction conservatively
+      # applies to the entire response.
+      def private_field_names
+        field_names_for('private')
+      end
+
       # When set in a response, a cache MUST NOT use the response to satisfy a
       # subsequent request without successful revalidation with the origin
       # server. This allows an origin server to prevent caching even by caches
@@ -48,6 +58,16 @@ module Rack
       # an end-to-end reload, forcing each cache to update their cached copies.
       def no_cache?
         self['no-cache']
+      end
+
+      # The list of header field names given as the quoted-string argument
+      # of the no-cache directive (e.g., no-cache="X-User-Id"), downcased,
+      # or nil when the directive carries no valid field-name list. When
+      # the no-cache directive is present but this returns nil (bare
+      # directive or malformed list), the revalidation requirement
+      # conservatively applies to the entire response.
+      def no_cache_field_names
+        field_names_for('no-cache')
       end
 
       # Indicates that the response MUST NOT be stored under any circumstances.
@@ -195,14 +215,80 @@ module Rack
 
     private
 
+      # Matches a complete quoted-string, including escaped characters.
+      QUOTED_STRING = /\A"(?:\\.|[^"\\])*"\z/
+
+      # Matches a valid HTTP token, e.g., a header field name.
+      TOKEN = /\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
+
       def parse(value)
         return if value.nil? || value.empty?
-        value.delete(' ').split(',').each do |part|
+        split_directives(value).each do |part|
+          part = part.strip
           next if part.empty?
-          name, value = part.split('=', 2)
-          self[name.downcase] = (value || true) unless name.empty?
+          name, arg = part.split('=', 2)
+          name = name.strip.downcase
+          next if name.empty?
+          self[name] = arg.nil? ? true : parse_directive_value(arg.strip)
         end
         self
+      end
+
+      # Split the header value into directives on commas, ignoring commas
+      # that appear within a quoted-string (e.g., the field-name list of
+      # private="Set-Cookie, X-Other"). An unterminated quoted-string
+      # simply remains attached to its directive, where it is treated
+      # conservatively as a malformed value.
+      def split_directives(value)
+        parts = []
+        part = +''
+        in_quotes = false
+        escaped = false
+        value.each_char do |char|
+          if escaped
+            part << char
+            escaped = false
+          elsif in_quotes && char == '\\'
+            part << char
+            escaped = true
+          elsif char == '"'
+            part << char
+            in_quotes = !in_quotes
+          elsif char == ',' && !in_quotes
+            parts << part
+            part = +''
+          else
+            part << char
+          end
+        end
+        parts << part
+        parts
+      end
+
+      # Quoted-string values are preserved verbatim (quotes included) so
+      # that field-name lists can be told apart from plain tokens. A
+      # malformed quoted-string is treated conservatively as a valueless
+      # directive, i.e., one that applies to the entire message.
+      def parse_directive_value(value)
+        if value.start_with?('"')
+          value =~ QUOTED_STRING ? value : true
+        else
+          value
+        end
+      end
+
+      # Extract the downcased field names from the quoted-string argument
+      # of the named directive. Returns nil when the directive is absent,
+      # has no argument, or has an argument that is not a well-formed
+      # quoted-string list of valid field names; callers must treat a nil
+      # result for a present directive as a restriction on the entire
+      # message (conservative behavior).
+      def field_names_for(name)
+        value = self[name]
+        return nil unless value.is_a?(String) && value =~ QUOTED_STRING
+        names = value[1..-2].split(',').map { |field| field.strip.downcase }
+        return nil if names.empty? || names.any? { |field| field !~ TOKEN }
+        names
       end
     end
   end
