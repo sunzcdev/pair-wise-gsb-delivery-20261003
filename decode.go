@@ -73,6 +73,8 @@ type Decoder struct {
 	buf        []byte
 	rec        []byte
 	dict       []string
+	br         bytesReader
+	fr         frameReader
 	flags      uint32
 }
 
@@ -530,7 +532,11 @@ func (d *Decoder) Skip() error {
 	if err != nil {
 		return err
 	}
+	return d.skipValueCode(c)
+}
 
+// skipValueCode skips the value that starts with the already read code c.
+func (d *Decoder) skipValueCode(c byte) error {
 	if msgpcode.IsFixedNum(c) {
 		return nil
 	}

@@ -84,6 +84,41 @@ func ExampleMarshal() {
 }
 ```
 
+## Batch columnar decoding
+
+When an analytics job reads many MessagePack records but needs only a few
+fields per record, decoding each record into `map[string]interface{}` wastes
+allocations. `Decoder.DecodeColumns` (and the `UnmarshalColumns` convenience
+wrapper) projects a stream of records directly into typed column arrays:
+
+```go
+var (
+    ids    []int64
+    scores []float64
+)
+res, err := msgpack.UnmarshalColumns(data, []msgpack.ColSpec{
+    {Path: "id", Kind: msgpack.ColInt, Dst: &ids},
+    {Path: "attrs.score", Kind: msgpack.ColFloat, Dst: &scores, TrackNull: true},
+}, &msgpack.ColumnOptions{ErrorPolicy: msgpack.SkipBadRows, RowsHint: n})
+```
+
+- Paths are dotted map keys with optional array indexes (`items.0.id`);
+  unselected fields are structurally skipped.
+- Every record appends exactly one aligned slot to every column, so a bad row
+  never shifts later columns.
+- `Column.Present[i]` is true when the path exists; with `TrackNull`,
+  `Column.Null[i]` additionally marks an explicit MessagePack nil, so a
+  missing field (`Present=false`) is distinguishable from `nil`
+  (`Present=true, Null=true`).
+- `ColumnOptions.ErrorPolicy` selects between stopping at the first bad row
+  (`StopOnBadRow`) and collecting them in `ColumnResult.BadRows`
+  (`SkipBadRows`). In both cases `ColumnResult.ResumeOffset` is the byte
+  offset of the first record not consumed; feed `data[ResumeOffset:]` to a
+  fresh decoder to continue. Framing errors return a `FrameError` carrying
+  the same offset (MessagePack has no in-stream resync marker).
+- `MaxRows` caps a batch; call the decoder repeatedly to page through a
+  stream.
+
 ## See also
 
 - [Golang ORM](https://github.com/uptrace/bun) for PostgreSQL, MySQL, MSSQL, and SQLite
