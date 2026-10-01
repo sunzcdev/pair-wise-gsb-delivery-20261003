@@ -5,6 +5,7 @@
 package mqtt
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"io"
@@ -2151,6 +2152,188 @@ func TestPublishToClientServerTopicAlias(t *testing.T) {
 	copy(pk1, ret[:len(packets.TPacketData[packets.Publish].Get(packets.TPublishBasicMqtt5).RawBytes)])
 	copy(pk2, ret[len(packets.TPacketData[packets.Publish].Get(packets.TPublishBasicMqtt5).RawBytes):])
 	require.Equal(t, append(pk1, pk2...), ret)
+}
+
+func TestPublishToClientTopicAliasLRUReplacement(t *testing.T) {
+	s := newServer()
+	s.Options.Capabilities.TopicAliasReplacementPolicy = TopicAliasReplacementLRU
+	cl, r, w := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.Properties.Props.TopicAliasMaximum = 2 // client only permits two aliases
+	cl.State.TopicAliases.Outbound = NewOutboundTopicAliasesWithPolicy(2, s.Options.Capabilities.TopicAliasReplacementPolicy)
+	s.Clients.Add(cl)
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	received := make(chan packets.Packet, 64)
+	go func() {
+		br := bufio.NewReader(r)
+		for {
+			b, err := br.ReadByte()
+			if err != nil {
+				return
+			}
+			fh := new(packets.FixedHeader)
+			if err := fh.Decode(b); err != nil {
+				return
+			}
+			n, _, err := packets.DecodeLength(br)
+			if err != nil {
+				return
+			}
+			fh.Remaining = n
+			buf := make([]byte, fh.Remaining)
+			if _, err := io.ReadFull(br, buf); err != nil {
+				return
+			}
+			pk := packets.Packet{ProtocolVersion: 5, FixedHeader: *fh}
+			if fh.Type == packets.Publish {
+				if err := pk.PublishDecode(buf); err != nil {
+					return
+				}
+			}
+			received <- pk
+		}
+	}()
+
+	publish := func(topic string, qos byte) {
+		// wait for the pending-writes queue to drain so the deterministic
+		// packet sequence is not subject to queue-full drops
+		require.Eventually(t, func() bool {
+			return atomic.LoadInt32(&cl.State.outboundQty) == 0
+		}, time.Second*5, time.Millisecond)
+
+		pkx := packets.Packet{
+			FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: qos},
+			TopicName:       topic,
+			Payload:         []byte("payload"),
+			ProtocolVersion: 5,
+		}
+		_, err := s.publishToClient(cl, packets.Subscription{Filter: topic, Qos: qos}, pkx)
+		require.NoError(t, err)
+	}
+
+	// Three hotspot topic groups in sequence, with an unacknowledged qos1
+	// message to the first hotspot interleaved. All messages flow through the
+	// client's pending-writes queue.
+	publish("hot/a", 0)
+	publish("hot/a", 0)
+	publish("hot/a", 1) // qos1, left unacknowledged to force a retransmission later
+	publish("hot/b", 0)
+	publish("hot/b", 0)
+	publish("hot/b", 0)
+	publish("hot/c", 0) // alias space exhausted, least recently used alias is reallocated
+	publish("hot/c", 0)
+
+	got := make([]packets.Packet, 0, 8)
+	timeout := time.After(time.Second * 5)
+	for len(got) < 8 {
+		select {
+		case pk := <-received:
+			got = append(got, pk)
+		case <-timeout:
+			t.Fatalf("timed out waiting for published packets, got %d of 8", len(got))
+		}
+	}
+
+	// Resolve every packet the way a real client would, keeping a client-side
+	// alias dictionary which is only ever updated by mapping declarations
+	// (packets containing both an alias and the full topic name).
+	dict := map[uint16]string{}
+	resolved := make([]string, 0, len(got))
+	for _, pk := range got {
+		require.Equal(t, packets.Publish, pk.FixedHeader.Type)
+		topic := pk.TopicName
+		if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 {
+			if pk.TopicName != "" {
+				dict[pk.Properties.TopicAlias] = pk.TopicName // mapping declaration
+			} else {
+				var ok bool
+				topic, ok = dict[pk.Properties.TopicAlias]
+				require.True(t, ok, "alias-only packet for unknown alias %d", pk.Properties.TopicAlias)
+			}
+		}
+		resolved = append(resolved, topic)
+	}
+
+	// no packet may be decoded as a topic other than the one published
+	require.Equal(t, []string{"hot/a", "hot/a", "hot/a", "hot/b", "hot/b", "hot/b", "hot/c", "hot/c"}, resolved)
+
+	// the first packet for each hotspot must be a mapping declaration carrying
+	// the full topic name, and reallocation must reuse the evicted alias
+	require.Equal(t, "hot/a", got[0].TopicName)
+	require.Equal(t, uint16(1), got[0].Properties.TopicAlias)
+	require.Equal(t, "hot/b", got[3].TopicName)
+	require.Equal(t, uint16(2), got[3].Properties.TopicAlias)
+	require.Equal(t, "hot/c", got[6].TopicName)
+	require.Equal(t, uint16(1), got[6].Properties.TopicAlias) // hot/a's alias was least recently used
+	require.Equal(t, "", got[7].TopicName)
+	require.Equal(t, uint16(1), got[7].Properties.TopicAlias)
+
+	// the unacknowledged qos1 message to hot/a is still inflight
+	require.Equal(t, 1, cl.State.Inflight.Len())
+
+	// Force a retransmission after the alias was reallocated to hot/c. The
+	// retransmitted packet must carry the full topic name and no alias, so it
+	// can never be decoded as hot/c.
+	require.NoError(t, cl.ResendInflightMessages(true))
+
+	var dup packets.Packet
+	select {
+	case dup = <-received:
+	case <-time.After(time.Second * 5):
+		t.Fatal("timed out waiting for retransmitted packet")
+	}
+	require.True(t, dup.FixedHeader.Dup)
+	require.Equal(t, "hot/a", dup.TopicName)
+	require.False(t, dup.Properties.TopicAliasFlag)
+	require.Equal(t, uint16(0), dup.Properties.TopicAlias)
+}
+
+func TestInheritClientSessionDoesNotReuseTopicAliases(t *testing.T) {
+	s := newServer()
+
+	existing, _, _ := newTestClient()
+	existing.Net.Conn = nil
+	existing.ID = "mochi"
+	existing.Properties.ProtocolVersion = 5
+	existing.Properties.Props.TopicAliasMaximum = 2
+	existing.State.TopicAliases.Outbound = NewOutboundTopicAliasesWithPolicy(2, TopicAliasReplacementLRU)
+	s.Clients.Add(existing)
+
+	// publish a qos1 message which is stored inflight; the wire copy uses an
+	// alias, but the inflight copy must not depend on the connection's dictionary
+	pkx := packets.Packet{
+		FixedHeader:     packets.FixedHeader{Type: packets.Publish, Qos: 1},
+		TopicName:       "hot/a",
+		Payload:         []byte("payload"),
+		ProtocolVersion: 5,
+	}
+	_, err := s.publishToClient(existing, packets.Subscription{Filter: "hot/a", Qos: 1}, pkx)
+	require.ErrorIs(t, err, packets.CodeDisconnect) // no connection
+	require.Equal(t, 1, existing.State.Inflight.Len())
+	require.NotEqual(t, 0, len(existing.State.TopicAliases.Outbound.internal))
+
+	cl, _, _ := newTestClient()
+	cl.ParseConnect("tcp", packets.Packet{
+		ProtocolVersion: 5,
+		Connect:         packets.ConnectParams{ClientIdentifier: "mochi"},
+	})
+
+	present := s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "mochi"}}, cl)
+	require.True(t, present)
+
+	// the resumed connection must start with an empty outbound alias dictionary;
+	// aliases belong to the network connection, not the session
+	require.Equal(t, 0, len(cl.State.TopicAliases.Outbound.internal))
+
+	// inherited inflight messages must carry the full topic name and no topic
+	// alias, so resending them on the new connection cannot be misdecoded
+	for _, m := range cl.State.Inflight.GetAll(false) {
+		require.Equal(t, "hot/a", m.TopicName)
+		require.False(t, m.Properties.TopicAliasFlag)
+		require.Equal(t, uint16(0), m.Properties.TopicAlias)
+	}
 }
 
 func TestPublishToClientMqtt3RetainFalseLeverageNoConn(t *testing.T) {

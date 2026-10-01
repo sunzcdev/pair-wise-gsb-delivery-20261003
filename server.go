@@ -51,16 +51,17 @@ type Capabilities struct {
 	MaximumSessionExpiryInterval uint32          `yaml:"maximum_session_expiry_interval" json:"maximum_session_expiry_interval"` // maximum number of seconds to keep disconnected sessions
 	MaximumPacketSize            uint32          `yaml:"maximum_packet_size" json:"maximum_packet_size"`                         // maximum packet size, no limit if 0
 	maximumPacketID              uint32          // unexported, used for testing only
-	ReceiveMaximum               uint16          `yaml:"receive_maximum" json:"receive_maximum"`                   // maximum number of concurrent qos messages per client
-	MaximumInflight              uint16          `yaml:"maximum_inflight" json:"maximum_inflight"`                 // maximum number of qos > 0 messages can be stored, 0(=8192)-65535
-	TopicAliasMaximum            uint16          `yaml:"topic_alias_maximum" json:"topic_alias_maximum"`           // maximum topic alias value
-	SharedSubAvailable           byte            `yaml:"shared_sub_available" json:"shared_sub_available"`         // support of shared subscriptions
-	MinimumProtocolVersion       byte            `yaml:"minimum_protocol_version" json:"minimum_protocol_version"` // minimum supported mqtt version
-	Compatibilities              Compatibilities `yaml:"compatibilities" json:"compatibilities"`                   // version compatibilities the server provides
-	MaximumQos                   byte            `yaml:"maximum_qos" json:"maximum_qos"`                           // maximum qos value available to clients
-	RetainAvailable              byte            `yaml:"retain_available" json:"retain_available"`                 // support of retain messages
-	WildcardSubAvailable         byte            `yaml:"wildcard_sub_available" json:"wildcard_sub_available"`     // support of wildcard subscriptions
-	SubIDAvailable               byte            `yaml:"sub_id_available" json:"sub_id_available"`                 // support of subscription identifiers
+	ReceiveMaximum               uint16          `yaml:"receive_maximum" json:"receive_maximum"`                               // maximum number of concurrent qos messages per client
+	MaximumInflight              uint16          `yaml:"maximum_inflight" json:"maximum_inflight"`                             // maximum number of qos > 0 messages can be stored, 0(=8192)-65535
+	TopicAliasMaximum            uint16          `yaml:"topic_alias_maximum" json:"topic_alias_maximum"`                       // maximum topic alias value
+	TopicAliasReplacementPolicy  byte            `yaml:"topic_alias_replacement_policy" json:"topic_alias_replacement_policy"` // policy for reallocating exhausted outbound topic aliases (0=none, 1=lru)
+	SharedSubAvailable           byte            `yaml:"shared_sub_available" json:"shared_sub_available"`                     // support of shared subscriptions
+	MinimumProtocolVersion       byte            `yaml:"minimum_protocol_version" json:"minimum_protocol_version"`             // minimum supported mqtt version
+	Compatibilities              Compatibilities `yaml:"compatibilities" json:"compatibilities"`                               // version compatibilities the server provides
+	MaximumQos                   byte            `yaml:"maximum_qos" json:"maximum_qos"`                                       // maximum qos value available to clients
+	RetainAvailable              byte            `yaml:"retain_available" json:"retain_available"`                             // support of retain messages
+	WildcardSubAvailable         byte            `yaml:"wildcard_sub_available" json:"wildcard_sub_available"`                 // support of wildcard subscriptions
+	SubIDAvailable               byte            `yaml:"sub_id_available" json:"sub_id_available"`                             // support of subscription identifiers
 }
 
 // NewDefaultServerCapabilities defines the default features and capabilities provided by the server.
@@ -72,15 +73,16 @@ func NewDefaultServerCapabilities() *Capabilities {
 		MaximumSessionExpiryInterval: math.MaxUint32, // maximum number of seconds to keep disconnected sessions
 		MaximumPacketSize:            0,              // no maximum packet size
 		maximumPacketID:              math.MaxUint16,
-		ReceiveMaximum:               1024,           // maximum number of concurrent qos messages per client
-		MaximumInflight:              1024 * 8,       // maximum number of qos > 0 messages can be stored
-		TopicAliasMaximum:            math.MaxUint16, // maximum topic alias value
-		SharedSubAvailable:           1,              // shared subscriptions are available
-		MinimumProtocolVersion:       3,              // minimum supported mqtt version (3.0.0)
-		MaximumQos:                   2,              // maximum qos value available to clients
-		RetainAvailable:              1,              // retain messages is available
-		WildcardSubAvailable:         1,              // wildcard subscriptions are available
-		SubIDAvailable:               1,              // subscription identifiers are available
+		ReceiveMaximum:               1024,                      // maximum number of concurrent qos messages per client
+		MaximumInflight:              1024 * 8,                  // maximum number of qos > 0 messages can be stored
+		TopicAliasMaximum:            math.MaxUint16,            // maximum topic alias value
+		TopicAliasReplacementPolicy:  TopicAliasReplacementNone, // don't replace exhausted outbound topic aliases
+		SharedSubAvailable:           1,                         // shared subscriptions are available
+		MinimumProtocolVersion:       3,                         // minimum supported mqtt version (3.0.0)
+		MaximumQos:                   2,                         // maximum qos value available to clients
+		RetainAvailable:              1,                         // retain messages is available
+		WildcardSubAvailable:         1,                         // wildcard subscriptions are available
+		SubIDAvailable:               1,                         // subscription identifiers are available
 	}
 }
 
@@ -1080,15 +1082,23 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.PacketID = uint16(i) // [MQTT-2.2.1-4]
 		sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
 
-		if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
+		// Store the inflight packet with the full topic name and no topic alias, so
+		// retransmissions never rely on the connection's outbound alias dictionary,
+		// which may have reallocated the alias or belonged to a previous connection.
+		stored := out
+		stored.TopicName = pk.TopicName
+		stored.Properties.TopicAlias = 0
+		stored.Properties.TopicAliasFlag = false
+
+		if ok := cl.State.Inflight.Set(stored); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
 			atomic.AddInt64(&s.Info.Inflight, 1)
 			s.hooks.OnQosPublish(cl, out, out.Created, 0)
 			cl.State.Inflight.DecreaseSendQuota()
 		}
 
 		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
-			out.Expiry = -1
-			cl.State.Inflight.Set(out)
+			stored.Expiry = -1
+			cl.State.Inflight.Set(stored)
 			return out, nil
 		}
 	}

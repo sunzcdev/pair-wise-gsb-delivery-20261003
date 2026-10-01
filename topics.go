@@ -5,6 +5,7 @@
 package mqtt
 
 import (
+	"container/list"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,15 @@ import (
 var (
 	SharePrefix = "$SHARE" // the prefix indicating a share topic
 	SysPrefix   = "$SYS"   // the prefix indicating a system info topic
+)
+
+const (
+	// TopicAliasReplacementNone indicates that exhausted outbound topic aliases
+	// are never replaced, and new topics are sent in full.
+	TopicAliasReplacementNone byte = iota
+	// TopicAliasReplacementLRU indicates that when the outbound topic alias space
+	// is exhausted, the least recently used alias is reallocated to the new topic.
+	TopicAliasReplacementLRU
 )
 
 // TopicAliases contains inbound and outbound topic alias registrations.
@@ -67,15 +77,30 @@ func (a *InboundTopicAliases) Set(id uint16, topic string) string {
 type OutboundTopicAliases struct {
 	internal map[string]uint16
 	sync.RWMutex
-	cursor  uint32
-	maximum uint16
+	topics   map[uint16]string        // reverse lookup of alias to topic, used for replacement
+	lru      *list.List               // aliases ordered by most recent use, front is most recent
+	lruIndex map[uint16]*list.Element // index of aliases in the lru list
+	cursor   uint32
+	maximum  uint16
+	policy   byte // replacement policy used when the alias space is exhausted
 }
 
 // NewOutboundTopicAliases returns a pointer to OutboundTopicAliases.
 func NewOutboundTopicAliases(topicAliasMaximum uint16) *OutboundTopicAliases {
+	return NewOutboundTopicAliasesWithPolicy(topicAliasMaximum, TopicAliasReplacementNone)
+}
+
+// NewOutboundTopicAliasesWithPolicy returns a pointer to OutboundTopicAliases which
+// reallocates aliases to new topics using the given replacement policy when the
+// alias space is exhausted.
+func NewOutboundTopicAliasesWithPolicy(topicAliasMaximum uint16, policy byte) *OutboundTopicAliases {
 	return &OutboundTopicAliases{
 		maximum:  topicAliasMaximum,
+		policy:   policy,
 		internal: map[string]uint16{},
+		topics:   map[uint16]string{},
+		lru:      list.New(),
+		lruIndex: map[uint16]*list.Element{},
 	}
 }
 
@@ -90,18 +115,56 @@ func (a *OutboundTopicAliases) Set(topic string) (uint16, bool) {
 	}
 
 	if i, ok := a.internal[topic]; ok {
+		a.touch(i)
 		return i, true
 	}
 
 	i := atomic.LoadUint32(&a.cursor)
 	if i+1 > uint32(a.maximum) {
-		// if i+1 > math.MaxUint16 {
+		if a.policy == TopicAliasReplacementLRU {
+			return a.replaceLRU(topic), false
+		}
 		return 0, false
 	}
 
-	a.internal[topic] = uint16(i) + 1
+	alias := uint16(i) + 1
+	a.internal[topic] = alias
 	atomic.StoreUint32(&a.cursor, i+1)
-	return uint16(i) + 1, false
+	a.track(alias, topic)
+	return alias, false
+}
+
+// track records a new alias to topic mapping for replacement purposes.
+// Must be called under lock.
+func (a *OutboundTopicAliases) track(alias uint16, topic string) {
+	a.topics[alias] = topic
+	a.lruIndex[alias] = a.lru.PushFront(alias)
+}
+
+// touch marks an alias as most recently used.
+// Must be called under lock.
+func (a *OutboundTopicAliases) touch(alias uint16) {
+	if el, ok := a.lruIndex[alias]; ok {
+		a.lru.MoveToFront(el)
+	}
+}
+
+// replaceLRU reallocates the least recently used alias to a new topic, returning
+// the reallocated alias. The caller must ensure a mapping declaration containing
+// the full topic is sent to the client before any alias-only packet for the new
+// topic. Must be called under lock.
+func (a *OutboundTopicAliases) replaceLRU(topic string) uint16 {
+	el := a.lru.Back()
+	if el == nil {
+		return 0
+	}
+
+	alias := el.Value.(uint16)
+	delete(a.internal, a.topics[alias])
+	a.internal[topic] = alias
+	a.topics[alias] = topic
+	a.lru.MoveToFront(el)
+	return alias
 }
 
 // SharedSubscriptions contains a map of subscriptions to a shared filter,

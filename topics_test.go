@@ -847,6 +847,70 @@ func TestOutboundAliasesSetMaxZero(t *testing.T) {
 	require.Equal(t, uint16(0), n)
 }
 
+func TestNewOutboundTopicAliasesWithPolicy(t *testing.T) {
+	a := NewOutboundTopicAliasesWithPolicy(2, TopicAliasReplacementLRU)
+	require.NotNil(t, a)
+	require.NotNil(t, a.internal)
+	require.Equal(t, uint16(2), a.maximum)
+	require.Equal(t, TopicAliasReplacementLRU, a.policy)
+}
+
+func TestOutboundAliasesSetNoReplacementByDefault(t *testing.T) {
+	a := NewOutboundTopicAliases(1)
+	n, ok := a.Set("t1")
+	require.False(t, ok)
+	require.Equal(t, uint16(1), n)
+
+	// without a replacement policy, exhausted aliases are not reallocated
+	n, ok = a.Set("t2")
+	require.False(t, ok)
+	require.Equal(t, uint16(0), n)
+}
+
+func TestOutboundAliasesSetLRUReplacement(t *testing.T) {
+	a := NewOutboundTopicAliasesWithPolicy(2, TopicAliasReplacementLRU)
+
+	n, ok := a.Set("t1")
+	require.False(t, ok)
+	require.Equal(t, uint16(1), n)
+
+	n, ok = a.Set("t2")
+	require.False(t, ok)
+	require.Equal(t, uint16(2), n)
+
+	// touch t1 so t2 becomes the least recently used
+	n, ok = a.Set("t1")
+	require.True(t, ok)
+	require.Equal(t, uint16(1), n)
+
+	// t2 is evicted and its alias is reallocated to t3
+	n, ok = a.Set("t3")
+	require.False(t, ok)
+	require.Equal(t, uint16(2), n)
+	require.NotContains(t, a.internal, "t2")
+	require.Equal(t, "t3", a.topics[2])
+
+	// t1 still holds its alias
+	n, ok = a.Set("t1")
+	require.True(t, ok)
+	require.Equal(t, uint16(1), n)
+
+	// t3 is now least recently used and is evicted by t4
+	n, ok = a.Set("t4")
+	require.False(t, ok)
+	require.Equal(t, uint16(2), n)
+	require.NotContains(t, a.internal, "t3")
+
+	// t2 is treated as a new topic and evicts t1
+	n, ok = a.Set("t2")
+	require.False(t, ok)
+	require.Equal(t, uint16(1), n)
+	require.NotContains(t, a.internal, "t1")
+
+	require.Len(t, a.internal, 2)
+	require.Len(t, a.topics, 2)
+}
+
 func TestNewTopicAliases(t *testing.T) {
 	a := NewTopicAliases(5)
 	require.NotNil(t, a.Inbound)
