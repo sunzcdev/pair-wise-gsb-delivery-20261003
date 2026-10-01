@@ -11,6 +11,12 @@ module Dry
 
     FrozenConfigError = Class.new(Error)
 
+    # Raised when importing environment values into a config fails
+    EnvImportError = Class.new(Error)
+
+    # Raised when two settings declare the same environment key
+    DuplicateEnvKeyError = Class.new(EnvImportError)
+
     AlreadyIncludedError = Class.new(Error)
     deprecate_constant(
       :AlreadyIncludedError,

@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added an `env` option for settings and `Config#import_env`, which imports values from an arbitrary hash (e.g. `ENV.to_h`) into settings declared with `env` names. Supports an optional `prefix`, nested settings (parent names are used as segments), atomic imports with rollback on constructor/assignment failure, duplicate env key detection before any assignment, and a value-free report of the environment keys actually used.
+
 ### Changed
 
 ### Deprecated

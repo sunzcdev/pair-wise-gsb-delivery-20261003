@@ -100,6 +100,33 @@ module Dry
         self
       end
 
+      # Import values from an environment-like hash into the settings that declare an
+      # `env` name.
+      #
+      # Only settings declared with an `env` name are considered; every other entry in the
+      # hash is ignored. Values are passed to each setting's constructor as-is: no boolean,
+      # numeric, or list coercion is performed. Missing keys leave the setting untouched,
+      # while empty strings are imported like any other value.
+      #
+      # The import is atomic: all constructors run before any value is assigned, and if a
+      # transformation or an assignment fails, no setting is updated. Conflicting `env` names
+      # (two settings mapping to the same environment key) are reported before anything is
+      # assigned.
+      #
+      # @param values [Hash] a hash of environment values (e.g. `ENV.to_h`)
+      # @param prefix [String, Symbol, nil] optional prefix prepended to every env name,
+      #   joined with an underscore
+      #
+      # @return [Array<String>] the environment keys actually used to update settings
+      #
+      # @raise [DuplicateEnvKeyError] if two settings map to the same environment key
+      # @raise [EnvImportError] if a value cannot be transformed into or assigned to a setting
+      #
+      # @api public
+      def import_env(values, prefix: nil)
+        EnvImporter.call(self, values, prefix)
+      end
+
       # Returns true if the value for the given key has been set on this config.
       #
       # For simple values, this returns true if the value has been explicitly assigned.

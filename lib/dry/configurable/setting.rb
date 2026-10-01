@@ -8,7 +8,7 @@ module Dry
     class Setting
       include Dry::Equalizer(:name, :default, :constructor, :children, :options, inspect: false)
 
-      OPTIONS = %i[default reader constructor mutable cloneable settings config_class].freeze
+      OPTIONS = %i[default reader constructor mutable cloneable settings config_class env].freeze
 
       DEFAULT_CONSTRUCTOR = -> v { v }.freeze
 
@@ -25,6 +25,9 @@ module Dry
 
       # @api public
       attr_reader :constructor
+
+      # @api public
+      attr_reader :env
 
       # @api public
       attr_reader :children
@@ -45,6 +48,20 @@ module Dry
         children: EMPTY_ARRAY,
         **options
       )
+        env = options[:env]
+
+        unless env.nil? || env.is_a?(::String) || env.is_a?(::Symbol)
+          raise ArgumentError, "env for :#{name} must be a String or a Symbol"
+        end
+
+        env = env.to_s unless env.nil?
+
+        if env && env.strip.empty?
+          raise ArgumentError, "env for :#{name} must not be empty"
+        end
+
+        options[:env] = env
+
         @name = name
         @default = default
         @mutable = children.any? || options.fetch(:mutable) {
@@ -52,6 +69,7 @@ module Dry
           options.fetch(:cloneable) { Setting.mutable_value?(default) }
         }
         @constructor = constructor
+        @env = env
         @children = children
         @options = options
       end

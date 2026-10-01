@@ -91,4 +91,34 @@ RSpec.describe Dry::Configurable::DSL do
     expect(setting.children.to_a[0].children.to_a[0].name).to be(:user)
     expect(setting.children.to_a[0].children.to_a[1].name).to be(:pass)
   end
+
+  it "compiles a setting with an env name" do
+    setting = dsl.setting :dsn, default: "sqlite", env: "DATABASE_URL"
+
+    expect(setting.env).to eql("DATABASE_URL")
+  end
+
+  it "normalizes a symbol env name to a string" do
+    setting = dsl.setting :dsn, default: "sqlite", env: :DATABASE_URL
+
+    expect(setting.env).to eql("DATABASE_URL")
+  end
+
+  it "keeps the env name nil when no env name is given" do
+    setting = dsl.setting :dsn, default: "sqlite"
+
+    expect(setting.env).to be(nil)
+  end
+
+  it "rejects a non-string non-symbol env name" do
+    expect {
+      dsl.setting :dsn, default: "sqlite", env: 123
+    }.to raise_error(ArgumentError, "env for :dsn must be a String or a Symbol")
+  end
+
+  it "rejects an empty env name" do
+    expect {
+      dsl.setting :dsn, default: "sqlite", env: " "
+    }.to raise_error(ArgumentError, "env for :dsn must not be empty")
+  end
 end

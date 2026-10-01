@@ -30,6 +30,9 @@ module Dry
       #   Default value for the setting
       # @param [#call] constructor
       #   Transformation given value will go through
+      # @param [String, Symbol] env
+      #   Name of the environment key that maps to this setting, used by
+      #   {Dry::Configurable::Config#import_env}
       # @param [Boolean] reader
       #   Whether a reader accessor must be created
       # @yield
