@@ -63,6 +63,39 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     end
   end
 
+  class CountingLoader < GraphQL::Batch::Loader
+    attr_reader :batches
+    attr_accessor :before_fulfill
+
+    def initialize
+      @batches = []
+    end
+
+    def perform(keys)
+      @batches << keys
+      before_fulfill&.call(@batches.size)
+      keys.each { |key| fulfill(key, "load-#{key}-#{@batches.size}") }
+    end
+  end
+
+  class RejectingLoader < CountingLoader
+    def perform(keys)
+      @batches << keys
+      before_fulfill&.call(@batches.size)
+      if @batches.size == 1
+        keys.each { |key| reject(key, RuntimeError.new("reject-#{@batches.size}")) }
+      else
+        keys.each { |key| fulfill(key, "load-#{key}-#{@batches.size}") }
+      end
+    end
+  end
+
+  class NormalizedKeyLoader < CountingLoader
+    def cache_key(load_key)
+      load_key.to_s
+    end
+  end
+
   class KwargsGroupCountLoader < GraphQL::Batch::Loader
     def initialize(group, key: :id, preload: true, **conditions)
     end
@@ -275,5 +308,163 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     loader.prime(:a, :not_a)
 
     assert_equal :a, loader.load(:a).sync
+  end
+
+  def test_clear_forces_reload_of_resolved_key
+    loader = CountingLoader.for
+
+    assert_equal 'load-a-1', loader.load(:a).sync
+
+    loader.clear(:a)
+
+    assert_equal 'load-a-2', loader.load(:a).sync
+    assert_equal [[:a], [:a]], loader.batches
+  end
+
+  def test_clear_only_affects_subsequent_loads
+    loader = CountingLoader.for
+
+    assert_equal 'load-a-1', loader.load(:a).sync
+
+    loader.clear(:b)
+
+    assert_equal 'load-a-1', loader.load(:a).sync
+    assert_equal 1, loader.batches.size
+  end
+
+  def test_clear_normalizes_key_with_cache_key
+    loader = NormalizedKeyLoader.for
+
+    assert_equal 'load-a-1', loader.load('a').sync
+    assert_same loader.load('a'), loader.load(:a)
+
+    loader.clear(:a)
+
+    new_promise = loader.load('a')
+    assert_equal 'load-a-2', new_promise.sync
+    assert_equal 2, loader.batches.size
+  end
+
+  def test_clear_before_resolve_settles_both_generations_in_one_batch
+    loader = CountingLoader.for
+
+    old_promise = loader.load(:a)
+    loader.clear(:a)
+    new_promise = loader.load(:a)
+
+    refute_same old_promise, new_promise
+    assert_equal 'load-a-1', old_promise.sync
+    assert_equal 'load-a-1', new_promise.sync
+    assert_equal [[:a]], loader.batches
+    refute old_promise.pending?
+    refute new_promise.pending?
+  end
+
+  def test_clear_during_perform_keeps_late_fulfill_in_old_generation
+    loader = CountingLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    loader.before_fulfill = lambda do |call|
+      next unless call == 1
+
+      loader.clear(:a)
+      new_promise = loader.load(:a)
+    end
+
+    assert_equal 'load-a-1', old_promise.sync
+    refute_same old_promise, new_promise
+    assert new_promise.pending?
+
+    assert_equal 'load-a-2', new_promise.sync
+    assert_equal [[:a], [:a]], loader.batches
+    refute old_promise.pending?
+    refute new_promise.pending?
+  end
+
+  def test_clear_during_perform_keeps_late_reject_in_old_generation
+    loader = RejectingLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    loader.before_fulfill = lambda do |call|
+      next unless call == 1
+
+      loader.clear(:a)
+      new_promise = loader.load(:a)
+    end
+
+    old_promise.wait
+    assert old_promise.rejected?
+    assert_equal 'reject-1', old_promise.reason.message
+    assert new_promise.pending?
+
+    assert_equal 'load-a-2', new_promise.sync
+    assert_equal [[:a], [:a]], loader.batches
+    refute new_promise.pending?
+  end
+
+  def test_clear_during_perform_with_raising_perform_rejects_only_old_generation
+    loader = CountingLoader.for
+    old_promise = loader.load(:a)
+    new_promise = nil
+    loader.before_fulfill = lambda do |call|
+      next unless call == 1
+
+      loader.clear(:a)
+      new_promise = loader.load(:a)
+      raise 'perform boom'
+    end
+
+    old_promise.wait
+    assert old_promise.rejected?
+    assert_equal 'perform boom', old_promise.reason.message
+    assert new_promise.pending?
+
+    assert_equal 'load-a-2', new_promise.sync
+    refute new_promise.pending?
+  end
+
+  def test_prime_after_clear_supplies_new_generation
+    loader = CountingLoader.for
+
+    assert_equal 'load-a-1', loader.load(:a).sync
+
+    loader.clear(:a)
+    loader.prime(:a, :primed)
+
+    assert_equal :primed, loader.load(:a).sync
+    assert_equal 1, loader.batches.size
+  end
+
+  def test_prime_before_clear_is_invalidated
+    loader = CountingLoader.for
+
+    loader.prime(:a, :primed)
+    loader.clear(:a)
+
+    assert_equal 'load-a-1', loader.load(:a).sync
+  end
+
+  def test_prime_during_perform_after_clear_does_not_steal_old_batch
+    loader = CountingLoader.for
+    old_promise = loader.load(:a)
+    loader.before_fulfill = lambda do |call|
+      next unless call == 1
+
+      loader.clear(:a)
+      loader.prime(:a, :primed)
+    end
+
+    assert_equal 'load-a-1', old_promise.sync
+    assert_equal :primed, loader.load(:a).sync
+    assert_equal 1, loader.batches.size
+  end
+
+  def test_prime_with_pending_promise_is_a_no_op
+    loader = CountingLoader.for
+
+    promise = loader.load(:a)
+    loader.prime(:a, :primed)
+
+    assert_equal 'load-a-1', promise.sync
   end
 end

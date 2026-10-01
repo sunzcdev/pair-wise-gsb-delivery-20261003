@@ -155,6 +155,30 @@ end
 
 Priming will add key/value to the loader cache only if it didn't exist before.
 
+### Clearing the Cache
+
+Within a single GraphQL request you may read an object, mutate it, and then
+read it again. Use `clear` to invalidate a cached key so that subsequent
+loads fetch it fresh:
+
+```ruby
+def update_product(id:, attributes:)
+  product = Product.update(id, attributes)
+  RecordLoader.for(Product).clear(product.id)
+  product
+end
+```
+
+Clearing only affects loads started after the clear. Promises that were
+already returned by `load` are still settled by the batch they belong to,
+even if that batch fulfills or rejects the key after the clear; a late
+settlement from the previous batch never leaks into the reloaded promise.
+The key is normalized through the loader's `cache_key`, so any load key
+mapping to the same cache entry invalidates it.
+
+Since `prime` never overwrites an existing cache entry, call `clear` first
+when you want to replace a cached (or in-flight) value with a primed one.
+
 
 ## Unit Testing
 
