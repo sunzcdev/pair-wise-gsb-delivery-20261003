@@ -61,6 +61,10 @@ require_relative 'tzinfo/data_timezone'
 require_relative 'tzinfo/linked_timezone'
 require_relative 'tzinfo/timezone_proxy'
 
+require_relative 'tzinfo/timezone_correction'
+require_relative 'tzinfo/correction_builder'
+require_relative 'tzinfo/corrected_timezone'
+
 require_relative 'tzinfo/country'
 require_relative 'tzinfo/country_timezone'
 

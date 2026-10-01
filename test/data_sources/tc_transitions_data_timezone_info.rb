@@ -215,6 +215,44 @@ module DataSources
       assert_equal([TransitionsTimezonePeriod.new(t1, nil)], i.periods_for_local(Timestamp.for(Time.utc(2000,7, 1, 0, 0, 0), :ignore)))
     end
 
+    def test_periods_for_local_adjacent_periods_with_same_offset
+      # Adjacent periods can observe the same offset when transitions are
+      # synthesized to represent an overriding layer. Local time resolution
+      # must examine each period using its own offset and must not assume
+      # every transition changes the offset.
+      o0 = TimezoneOffset.new(-18000,    0, 'TEST0')
+      o1 = TimezoneOffset.new(-14400, 3600, 'TEST1')
+      o2 = TimezoneOffset.new(-14400, 3600, 'TEST2')
+      o3 = TimezoneOffset.new(-18000,    0, 'TEST3')
+
+      # TEST1 and TEST2 are adjacent periods observing the identical offset
+      # (-03:00). TEST2 then falls back to TEST3 (-04:00).
+      t1 = TimezoneTransition.new(o1, o0, Time.utc(2020, 7, 1, 0).to_i)
+      t2 = TimezoneTransition.new(o2, o1, Time.utc(2020, 7, 2, 0).to_i)
+      t3 = TimezoneTransition.new(o3, o2, Time.utc(2020, 7, 3, 6).to_i)
+
+      i = TransitionsDataTimezoneInfo.new('Test/Zone', [t1, t2, t3])
+
+      # Local 12:00 on 2020-07-01 (-03:00 => UTC 15:00) falls within the
+      # first equal-offset period (t1..t2).
+      local = Timestamp.for(Time.utc(2020, 7, 1, 12), :ignore)
+      assert_equal([TransitionsTimezonePeriod.new(t1, t2)], i.periods_for_local(local))
+
+      # Local 12:00 on 2020-07-02 (-03:00 => UTC 15:00) falls within the
+      # second equal-offset period (t2..t3). It must be found even though t2
+      # introduces no offset change.
+      local = Timestamp.for(Time.utc(2020, 7, 2, 12), :ignore)
+      assert_equal([TransitionsTimezonePeriod.new(t2, t3)], i.periods_for_local(local))
+
+      # At t3 (06:00 UTC) clocks fall back from -03:00 (local 03:00) to
+      # -04:00 (local 02:00). The local hour 02:00..03:00 is repeated: local
+      # 02:30 occurs at UTC 05:30 with TEST2 and again at UTC 06:30 with
+      # TEST3.
+      ambiguous = Timestamp.for(Time.utc(2020, 7, 3, 2, 30), :ignore)
+      periods = i.periods_for_local(ambiguous)
+      assert_equal([o2, o3], periods.map(&:offset))
+    end
+
     def test_periods_for_local_timestamp_with_specified_offset
       i = create_basic_info
       error = assert_raises(ArgumentError) { i.periods_for_local(Timestamp.for(Time.utc(2005,1,1,0,0,0))) }

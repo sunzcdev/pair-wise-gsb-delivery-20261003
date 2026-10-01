@@ -72,39 +72,51 @@ module TZInfo
         raise ArgumentError, 'local_timestamp must have an unspecified utc_offset' if local_timestamp.utc_offset
 
         local_timestamp_value = local_timestamp.value
+
+        # Every period covers a half-open interval of local wall clock time
+        # derived from its own observed offset: [start + offset, end +
+        # offset). Search the periods whose local intervals could contain the
+        # local timestamp. The observed offset of a time zone is always
+        # greater than -86400 and less than 86400 seconds, so a period whose
+        # transition is more than a day away from the local timestamp cannot
+        # contain it.
         latest_possible_utc_value = local_timestamp_value + 86400
         earliest_possible_utc_value = local_timestamp_value - 86400
 
-        # Find the index of the first transition that occurs after a latest
-        # possible UTC representation of the local timestamp and then search
-        # backwards until an earliest possible UTC representation.
-
-        index = find_minimum_transition {|t| t.timestamp_value >= latest_possible_utc_value }
-
-        # No transitions after latest_possible_utc_value, set to max index + 1
-        # to search backwards including the period after the last transition
-        index = @transitions.length unless index
+        # Find the index of the first transition that occurs at or after the
+        # earliest possible UTC representation of the local timestamp. That
+        # transition is the end boundary of the earliest period that needs to
+        # be examined (the period starting at the previous transition).
+        end_index = find_minimum_transition {|t| t.timestamp_value >= earliest_possible_utc_value }
+        end_index = @transitions.length unless end_index
 
         result = []
 
-        index.downto(0) do |i|
+        # A period is identified within the loop by the index of its end
+        # transition (`i`). Its start transition is the previous one
+        # (`i - 1`). The initial period (start transition nil) is examined
+        # when `i` is 0.
+        end_index.upto(@transitions.length) do |i|
           start_transition = i > 0 ? @transitions[i - 1] : nil
-          end_transition = @transitions[i]
-          offset = start_transition ? start_transition.offset : end_transition.previous_offset
-          utc_timestamp_value = local_timestamp_value - offset.observed_utc_offset
+          end_transition = i < @transitions.length ? @transitions[i] : nil
+          offset = start_transition ? start_transition.offset : @transitions.first.previous_offset
 
-          # It is not necessary to compare the sub-seconds because a timestamp
-          # is in the period if is >= the start transition (sub-seconds would
-          # make == become >) and if it is < the end transition (which
-          # sub-seconds cannot affect).
-          if (!start_transition || utc_timestamp_value >= start_transition.timestamp_value) && (!end_transition || utc_timestamp_value < end_transition.timestamp_value)
-            result << TransitionsTimezonePeriod.new(start_transition, end_transition)
-          elsif end_transition && end_transition.timestamp_value < earliest_possible_utc_value
-            break
-          end
+          local_start_value = start_transition ? start_transition.timestamp_value + offset.observed_utc_offset : nil
+          local_end_value = end_transition ? end_transition.timestamp_value + offset.observed_utc_offset : nil
+
+          # All subsequent periods begin later in UTC. Once a period's local
+          # start is already after the local timestamp and its UTC start is
+          # at or beyond the latest possible UTC representation, no later
+          # period can contain the timestamp.
+          break if start_transition && start_transition.timestamp_value >= latest_possible_utc_value && local_start_value > local_timestamp_value
+
+          next if local_start_value && local_timestamp_value < local_start_value
+          next if local_end_value && local_timestamp_value >= local_end_value
+
+          result << TransitionsTimezonePeriod.new(start_transition, end_transition)
         end
 
-        result.reverse!
+        result
       end
 
       # (see DataTimezoneInfo#transitions_up_to)

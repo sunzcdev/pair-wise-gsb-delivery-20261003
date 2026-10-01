@@ -371,6 +371,69 @@ module TZInfo
       raise_unknown_timezone
     end
 
+    # Returns a time zone that applies historical offset corrections
+    # (errata) to specified intervals of UTC time within this time zone.
+    #
+    # Outside the corrected intervals, the returned time zone continues to
+    # follow the rules of this time zone. After a correction ends, the offset
+    # that genuinely took effect at that instant in this time zone is
+    # rejoined, even when the correction spans multiple original transitions.
+    #
+    # Corrections may be supplied either as an `Array` of
+    # {TimezoneCorrection} instances or by passing a block. When a block is
+    # passed, a {CorrectionBuilder} is yielded and each correction is defined
+    # with {CorrectionBuilder#add}:
+    #
+    #     tz = TZInfo::Timezone.get('America/New_York')
+    #     corrected = tz.with_corrections do |c|
+    #       c.add(Time.utc(1946, 12, 31, 5), Time.utc(1947, 9, 28, 6),
+    #             TZInfo::TimezoneOffset.new(-5*3600, 3600, 'EWT'))
+    #
+    #       # Or with complete offset information directly:
+    #       c.add(Time.utc(1946, 12, 31, 5), Time.utc(1947, 9, 28, 6),
+    #             nil, -5*3600, 3600, 'EWT')
+    #     end
+    #
+    # Corrections intervals are half-open (`[start_at, end_at)`): the start
+    # time is included and the end time is excluded. Boundaries may fall in
+    # the middle of an original period.
+    #
+    # The returned object is a {CorrectedTimezone}. Its {#period_for},
+    # {#periods_for_local} and {#transitions_up_to} methods are mutually
+    # consistent, so local time resolution (including gaps and repeated
+    # hours introduced by the corrections) sees the overriding layer.
+    #
+    # @param corrections [Array<TimezoneCorrection>] an optional `Array` of
+    #   {TimezoneCorrection} instances to apply. Ignored when a block is
+    #   supplied.
+    # @param identifier [String] an optional identifier for the returned
+    #   {CorrectedTimezone}. If not specified, an identifier derived from
+    #   {identifier} is used.
+    # @yield [builder] yields a {CorrectionBuilder} that can be used to define
+    #   the corrections.
+    # @yieldparam builder [CorrectionBuilder] the {CorrectionBuilder} to use.
+    # @return [CorrectedTimezone] a view of this {Timezone} with the
+    #   corrections applied.
+    # @raise [ArgumentError] if neither corrections nor a block are supplied.
+    # @raise [ArgumentError] if both corrections and a block are supplied.
+    # @raise [ArgumentError] if an empty collection of corrections is given.
+    # @raise [ArgumentError] if an entry is not a {TimezoneCorrection}.
+    # @raise [ArgumentError] if two corrections overlap (touching
+    #   end-to-start boundaries are allowed).
+    def with_corrections(corrections = nil, identifier = nil, &block)
+      if block_given?
+        raise ArgumentError, 'corrections must not be passed with a block' if corrections
+        builder = CorrectionBuilder.new
+        yield builder
+        corrections = builder.corrections
+      else
+        raise ArgumentError, 'corrections must be specified' unless corrections
+        corrections = corrections.to_a
+      end
+
+      CorrectedTimezone.new(self, corrections, identifier)
+    end
+
     # Returns the canonical {Timezone} instance for this {Timezone}.
     #
     # The IANA Time Zone database contains two types of definition: Zones and

@@ -1,5 +1,25 @@
 # Changes
 
+## Unreleased
+
+* Added `Timezone#with_corrections` for constructing an overriding view of an
+  existing time zone that applies historical offset errata to specified
+  half-open intervals of UTC time. Each correction gives a start time, an end
+  time and complete offset information (base offset, standard time offset and
+  abbreviation). Outside the corrected intervals the original rules continue
+  to apply, rejoining the offset genuinely in effect when a correction ends
+  (even when the correction spans multiple original transitions). Corrections
+  that overlap each other are rejected with an `ArgumentError`.
+* Added the `TimezoneCorrection` and `CorrectionBuilder` classes used with
+  `Timezone#with_corrections`.
+* `period_for`, `periods_for_local` and `transitions_up_to` on the resulting
+  view are mutually consistent, including the gaps and repeated local hours
+  introduced by corrections.
+* Fixed `periods_for_local` on a data time zone so that local time is resolved
+  correctly when adjacent periods observe the same offset (permitting
+  transitions that delimit overriding ranges without an offset change).
+
+
 ## Version 2.0.6 - 28-Jan-2023
 
 * Eliminate `Object#untaint` deprecation warnings on JRuby 9.4.0.0. #145.
