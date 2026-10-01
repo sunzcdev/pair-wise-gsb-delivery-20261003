@@ -59,6 +59,18 @@ type Fault struct {
 	// faulted; you can use this for observing.
 	When func(kmsg.Request) bool
 
+	// DropResponse applies the request normally but never writes the
+	// response: the connection is closed instead, as if the broker did
+	// the work and then died mid-reply. The client sees a transport
+	// error for a request the broker may have applied, which is exactly
+	// the ambiguous outcome exactly-once callers must handle.
+	//
+	// A drop fault matches whole requests only: Keys, Nodes, and When
+	// select it; entity selectors (Topic, Group, TxnID, Resource, ...)
+	// do not. Err is ignored. A drop fault is skipped anywhere faults
+	// answer entities, so it never changes what the handler does.
+	DropResponse bool
+
 	// Observe counts matching requests rather than faulting them: the
 	// request proceeds as it would have while the fault is counted for
 	// Hits and Wait.
@@ -86,6 +98,7 @@ type fault struct {
 	resource   string
 	topLevel   bool
 	when       func(kmsg.Request) bool
+	dropResp   bool
 	observe    bool
 	err        *kerr.Error
 	hits       atomic.Int64
@@ -117,6 +130,7 @@ func (c *Cluster) Fault(faults ...Fault) *FaultHandle {
 			resource:   in.Resource,
 			topLevel:   in.TopLevel,
 			when:       in.When,
+			dropResp:   in.DropResponse,
 			observe:    in.Observe,
 			err:        in.Err,
 			left:       in.Count,
@@ -272,7 +286,7 @@ func (fc *faultCheck) check(k faultKey) *kerr.Error {
 	}
 	for _, f := range fc.fs {
 		// A TopLevel fault answers only in topLevel.
-		if f.topLevel || !f.matches(k) || !fc.when(f) {
+		if f.topLevel || f.dropResp || !f.matches(k) || !fc.when(f) {
 			continue
 		}
 		if !fc.hit(f) {
@@ -290,6 +304,26 @@ func (fc *faultCheck) check(k faultKey) *kerr.Error {
 // accepts every request its selectors matched.
 func (fc *faultCheck) when(f *fault) bool {
 	return f.when == nil || f.when(fc.kreq)
+}
+
+// drop reports whether this request's response should be dropped: a
+// DropResponse fault matches and takes a unit of its budget. The request
+// has already been handled; the caller drops the response and closes the
+// connection instead of replying.
+func (fc *faultCheck) drop() bool {
+	if fc == nil {
+		return false
+	}
+	for _, f := range fc.fs {
+		if !f.dropResp || f.observe || !fc.when(f) {
+			continue
+		}
+		if !fc.hit(f) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // afterApply is the requests a broker can answer REQUEST_TIMED_OUT after
@@ -345,7 +379,7 @@ func (fc *faultCheck) topLevel(kreq kmsg.Request) kmsg.Response {
 	}
 	for _, f := range fc.fs {
 		answers := f.topLevel || entityless[fc.key] && f.matches(faultKey{})
-		if !answers || !fc.when(f) {
+		if !answers || f.dropResp || !fc.when(f) {
 			continue
 		}
 		resp := kreq.ResponseKind()

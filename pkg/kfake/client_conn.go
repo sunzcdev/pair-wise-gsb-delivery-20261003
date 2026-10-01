@@ -53,6 +53,7 @@ type (
 		corr  int32
 		err   error
 		skip  bool // acks=0 produce: nothing to write, just unmute
+		drop  bool // a drop fault: close the connection without replying
 	}
 )
 
@@ -176,6 +177,15 @@ func (cc *clientConn) write() {
 		if resp.skip {
 			cc.unmute(true)
 			continue
+		}
+		if resp.drop {
+			// A DropResponse fault: the request was applied, but the
+			// client must never see the response. Closing the
+			// connection fails the in-flight request with a
+			// transport error, like a broker dying mid-reply.
+			cc.c.cfg.logger.Logf(LogLevelDebug, "client %s response dropped by fault, closing connection", who)
+			cc.unmute(false)
+			return
 		}
 		if err := resp.err; err != nil {
 			cc.c.cfg.logger.Logf(LogLevelInfo, "client %s request unable to be handled: %v", who, err)

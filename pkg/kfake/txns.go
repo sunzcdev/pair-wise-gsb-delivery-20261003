@@ -34,6 +34,10 @@ import (
 //   - inTx (bool): true = Ongoing, false = Empty/Complete
 //   - lastWasCommit (bool): whether the last completed transaction
 //     was commit or abort, for EndTxn retry detection
+//   - lastTxState (string): CompleteCommit / CompleteAbort of the last
+//     completed transaction, reported by DescribeTransactions until the
+//     transactional ID expires (kfake has no Dead state; expiry removes
+//     the ID entirely)
 
 type (
 	pids struct {
@@ -77,6 +81,11 @@ type (
 		// completed, we return success only if the retry matches
 		// (commit after commit, abort after abort).
 		lastWasCommit bool
+
+		// The DescribeTransactions state of the last completed
+		// transaction: "CompleteCommit" or "CompleteAbort". Empty
+		// until the first transaction completes.
+		lastTxState string
 	}
 
 	// Independent dup-detection entry: stores (firstSeq, nextSeq,
@@ -863,6 +872,11 @@ func (pidinf *pidinfo) resetTx(wasCommit bool) {
 	pidinf.txStart = time.Time{}
 	pidinf.inTx = false
 	pidinf.lastWasCommit = wasCommit
+	if wasCommit {
+		pidinf.lastTxState = "CompleteCommit"
+	} else {
+		pidinf.lastTxState = "CompleteAbort"
+	}
 	pidinf.lastActive = time.Now()
 	delete(pidinf.pids.txs, pidinf)
 }
@@ -979,6 +993,11 @@ func (pids *pids) doDescribeTransactions(creq *clientReq) kmsg.Response {
 				}
 				topicEntry.Partitions = append(topicEntry.Partitions, partition)
 			})
+		} else if pidinf.lastTxState != "" {
+			// The last transaction completed; its outcome stays
+			// visible until the transactional ID expires.
+			st.State = pidinf.lastTxState
+			st.StartTimestamp = -1
 		} else {
 			st.State = "Empty"
 			st.StartTimestamp = -1
@@ -1023,6 +1042,8 @@ func (pids *pids) doListTransactions(creq *clientReq) kmsg.Response {
 		state := "Empty"
 		if pidinf.inTx {
 			state = "Ongoing"
+		} else if pidinf.lastTxState != "" {
+			state = pidinf.lastTxState
 		}
 		if len(stateFilter) > 0 {
 			if _, ok := stateFilter[state]; !ok {

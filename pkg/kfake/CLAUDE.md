@@ -39,7 +39,7 @@ Assignors: uniform (default, maps to kgo sticky balancer) and range.
 ## Transactions
 
 - KIP-890: Produce v12+ implicitly adds partitions via `pids.get()` with a non-nil `pd`. EndTxn v5+ bumps the epoch after each transaction; an EndTxn retry with `epoch == serverEpoch-1` and `!inTx` returns success with the current epoch.
-- State is `inTx` + `lastWasCommit`, not a state machine: completion is synchronous, so there are no PREPARE/COMPLETE states.
+- State is `inTx` + `lastWasCommit` + `lastTxState`, not a state machine: completion is synchronous, so there are no PREPARE states. `lastTxState` (CompleteCommit / CompleteAbort) is what DescribeTransactions and ListTransactions report once a transaction completes, until the transactional ID expires.
 - All txn coordinator epoch errors use PRODUCER_FENCED; only the produce path uses INVALID_PRODUCER_EPOCH.
 - InitProducerID accepts epoch <= server epoch, so a stale epoch from a timeout bump recovers instead of retrying forever. Idempotent (nil txid) always gets a fresh PID.
 - KIP-447: OffsetFetch with `RequireStable=true` returns `UNSTABLE_OFFSET_COMMIT` when `pids.hasUnstableOffsets(group)`.

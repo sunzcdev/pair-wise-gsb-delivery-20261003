@@ -781,6 +781,19 @@ outer:
 			continue
 		}
 
+		if creq.faults.drop() {
+			// A DropResponse fault: the request was handled above,
+			// but the response is dropped and the connection closed
+			// rather than written.
+			select {
+			case creq.cc.respCh <- clientResp{corr: creq.corr, drop: true}:
+			case <-creq.cc.done:
+			case <-c.die:
+				return
+			}
+			continue
+		}
+
 		select {
 		case creq.cc.respCh <- clientResp{kresp: kresp, corr: creq.corr, err: err}:
 		case <-creq.cc.done:

@@ -24,6 +24,67 @@ const (
 	TryCommit TransactionEndTry = true
 )
 
+// TransactionEndState is the confirmed outcome of an attempt to end a
+// transaction.
+type TransactionEndState int8
+
+const (
+	// TransactionEndUnknown means the outcome of the end attempt could not
+	// be confirmed. The EndTxn request may or may not have been applied by
+	// the broker: a transport error after the request was written, or a
+	// retriable broker error that outlived retries, leaves the transaction
+	// either still open, committed, or aborted. Do not assume either
+	// outcome; verify with VerifyTransactionEnd or retry with TryAbort
+	// (which heals by reloading the producer ID, fence-aborting anything
+	// still ongoing broker-side).
+	TransactionEndUnknown TransactionEndState = iota
+
+	// TransactionEndCommitted means the transaction is known to be
+	// committed: the broker confirmed the commit, or the end was a no-op
+	// with nothing to commit.
+	TransactionEndCommitted
+
+	// TransactionEndAborted means the transaction is known to be aborted:
+	// the broker confirmed the abort, the end was a no-op with nothing to
+	// abort, or a producer ID reload fence-aborted anything still ongoing.
+	TransactionEndAborted
+)
+
+func (s TransactionEndState) String() string {
+	switch s {
+	case TransactionEndCommitted:
+		return "committed"
+	case TransactionEndAborted:
+		return "aborted"
+	default:
+		return "unknown"
+	}
+}
+
+// TransactionEndResult is the structured outcome of an attempt to end a
+// transaction, as returned by EndTransactionWithResult and
+// VerifyTransactionEnd.
+type TransactionEndResult struct {
+	// State is the confirmed outcome: committed, aborted, or unknown.
+	State TransactionEndState
+
+	// Err is the error the end attempt itself returned, if any. For an
+	// unknown state, this is the evidence of what went wrong in the send
+	// phase: a transport error (the request may have been applied), a
+	// retriable broker error that outlived retries, or a definitive
+	// broker rejection. It is nil when the end attempt succeeded.
+	Err error
+}
+
+// Committed returns whether the transaction is known to be committed.
+func (r TransactionEndResult) Committed() bool { return r.State == TransactionEndCommitted }
+
+// Aborted returns whether the transaction is known to be aborted.
+func (r TransactionEndResult) Aborted() bool { return r.State == TransactionEndAborted }
+
+// Unknown returns whether the outcome of the end attempt is unknown.
+func (r TransactionEndResult) Unknown() bool { return r.State == TransactionEndUnknown }
+
 // GroupTransactSession abstracts away the proper way to begin and end a
 // transaction when consuming in a group, modifying records, and producing
 // (EOS).
@@ -744,15 +805,40 @@ func errRecreatedInTxn(topics []string) error {
 // EndTransaction request, making it impossible to know whether the commit or
 // abort was successful. It is recommended to not cancel the context.
 func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) error {
+	return cl.endTransaction(ctx, commit).Err
+}
+
+// EndTransactionWithResult is EndTransaction with a structured outcome:
+// rather than only an error, it reports whether the transaction is known to
+// be committed, known to be aborted, or of unknown outcome. An error return
+// from EndTransaction maps to TransactionEndUnknown with the error preserved
+// as evidence of the send phase, with two documented exceptions where the
+// abort is confirmed internally (a producer ID reload that fence-aborts
+// anything still ongoing broker-side).
+//
+// On TransactionEndUnknown, do not guess: either call VerifyTransactionEnd
+// to ask the transaction coordinator for the final state, or retry
+// EndTransaction with TryAbort as documented on EndTransaction. The unknown
+// result never means "probably committed": the client does not resend your
+// records to probe the outcome, and neither should you.
+func (cl *Client) EndTransactionWithResult(ctx context.Context, commit TransactionEndTry) TransactionEndResult {
+	return cl.endTransaction(ctx, commit)
+}
+
+func (cl *Client) endTransaction(ctx context.Context, commit TransactionEndTry) TransactionEndResult {
 	cl.producer.txnMu.Lock()
 	defer cl.producer.txnMu.Unlock()
 
 	if !cl.producer.inTxn {
-		return nil
+		// Not in a transaction: the requested end is trivially satisfied.
+		if commit {
+			return TransactionEndResult{State: TransactionEndCommitted}
+		}
+		return TransactionEndResult{State: TransactionEndAborted}
 	}
 	if commit {
 		if topics := cl.producer.topicsRecreatedInTxn(); len(topics) > 0 {
-			return errRecreatedInTxn(topics)
+			return TransactionEndResult{State: TransactionEndUnknown, Err: errRecreatedInTxn(topics)}
 		}
 	}
 	cl.producer.inTxn = false
@@ -823,7 +909,10 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		// commit anyway.
 		if !cl.producer.tx890p2.Load() || !cl.producer.producedInTxn.Load() {
 			cl.cfg.logger.Log(LogLevelDebug, "no records were produced during the commit; thus no transaction was began; ending without doing anything")
-			return nil
+			if commit {
+				return TransactionEndResult{State: TransactionEndCommitted}
+			}
+			return TransactionEndResult{State: TransactionEndAborted}
 		}
 		cl.cfg.logger.Log(LogLevelInfo, "no produce succeeded in this transaction but produces were attempted; issuing an abort to clear any server-side partition registrations",
 			"transactional_id", *cl.cfg.txnID,
@@ -851,7 +940,9 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 			}
 			cl.producer.inTxn = true
 			cl.producer.endUnconfirmed = unconfirmed
-			return kerr.OperationNotAttempted
+			// Nothing was sent: the transaction is definitely still
+			// open broker-side, which is neither committed nor aborted.
+			return TransactionEndResult{State: TransactionEndUnknown, Err: kerr.OperationNotAttempted}
 		}
 
 		// If we recovered the producer ID, we return early, since
@@ -860,7 +951,9 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		// fail, but that is ok, we will just return error.
 		_, didRecover, _ := cl.maybeRecoverProducerID(ctx)
 		if didRecover {
-			return nil
+			// The reload bumped the epoch, fence-aborting anything
+			// still ongoing broker-side: the abort is confirmed.
+			return TransactionEndResult{State: TransactionEndAborted}
 		}
 	}
 
@@ -876,14 +969,14 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 	// "success" here would lie to the caller.
 	if unconfirmed {
 		if commit {
-			return errors.New("cannot retry a commit whose outcome is unconfirmed: the transaction may already be aborted; retry with TryAbort")
+			return TransactionEndResult{State: TransactionEndUnknown, Err: errors.New("cannot retry a commit whose outcome is unconfirmed: the transaction may already be aborted; retry with TryAbort")}
 		}
 		cl.cfg.logger.Log(LogLevelInfo, "aborting an unconfirmed transaction via producer id reload; the epoch bump fence-aborted anything still ongoing",
 			"transactional_id", *cl.cfg.txnID,
 			"id", id,
 			"epoch", epoch,
 		)
-		return nil
+		return TransactionEndResult{State: TransactionEndAborted}
 	}
 
 	cl.cfg.logger.Log(LogLevelInfo, "ending transaction",
@@ -993,9 +1086,83 @@ func (cl *Client) EndTransaction(ctx context.Context, commit TransactionEndTry) 
 		}
 		cl.producer.inTxn = true
 		cl.producer.endUnconfirmed = true
+		return TransactionEndResult{State: TransactionEndUnknown, Err: err}
 	}
 
-	return err
+	if commit {
+		return TransactionEndResult{State: TransactionEndCommitted}
+	}
+	return TransactionEndResult{State: TransactionEndAborted}
+}
+
+// VerifyTransactionEnd asks the transaction coordinator for the final state
+// of the latest transaction under this client's transactional ID, and
+// reports whether that transaction is known to be committed, known to be
+// aborted, or still of unknown outcome. This is a read-only check: it issues
+// a DescribeTransactions request and nothing else. It never resends records
+// or EndTxn to probe the outcome.
+//
+// Use this after EndTransactionWithResult returns TransactionEndUnknown to
+// learn what actually happened before deciding whether to rerun your
+// business logic. Call it before BeginTransaction: the coordinator only
+// tracks the latest transaction per transactional ID, so once a new
+// transaction begins, the prior one's outcome can no longer be queried.
+//
+// The broker's answer is mapped conservatively:
+//
+//   - CompleteCommit (or PrepareCommit, where the commit decision is already
+//     durable) maps to TransactionEndCommitted
+//   - CompleteAbort (or PrepareAbort) maps to TransactionEndAborted
+//   - anything else -- Empty, Ongoing, Dead, or an unrecognized state --
+//     stays TransactionEndUnknown: Empty in particular is ambiguous, since
+//     the coordinator forgets a completed transaction's outcome once the
+//     transactional ID expires
+//
+// An error is returned if the client has no transactional ID, if the
+// cluster does not support DescribeTransactions (Kafka 2.8+), or if the
+// request itself fails; the result's state is TransactionEndUnknown in all
+// of these cases. Verification is best-effort: when it cannot confirm an
+// outcome, the outcome stays unknown rather than guessing.
+func (cl *Client) VerifyTransactionEnd(ctx context.Context) (TransactionEndResult, error) {
+	if cl.cfg.txnID == nil {
+		return TransactionEndResult{}, errors.New("cannot verify a transaction end without a transactional ID")
+	}
+	if !cl.supportsKeyVersion(int16(kmsg.DescribeTransactions), 0) {
+		// The client may simply not have connected yet; ensure broker
+		// versions are loaded before concluding the cluster lacks
+		// support.
+		if err := cl.Ping(ctx); err != nil {
+			return TransactionEndResult{}, fmt.Errorf("cannot verify a transaction end: %w", err)
+		}
+		if !cl.supportsKeyVersion(int16(kmsg.DescribeTransactions), 0) {
+			return TransactionEndResult{}, errors.New("cannot verify a transaction end: the cluster does not support DescribeTransactions (Kafka 2.8+)")
+		}
+	}
+
+	req := kmsg.NewPtrDescribeTransactionsRequest()
+	req.TransactionalIDs = []string{*cl.cfg.txnID}
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		return TransactionEndResult{}, err
+	}
+	for i := range resp.TransactionStates {
+		st := &resp.TransactionStates[i]
+		if st.TransactionalID != *cl.cfg.txnID {
+			continue
+		}
+		if err := kerr.ErrorForCode(st.ErrorCode); err != nil {
+			return TransactionEndResult{}, err
+		}
+		switch st.State {
+		case "CompleteCommit", "PrepareCommit":
+			return TransactionEndResult{State: TransactionEndCommitted}, nil
+		case "CompleteAbort", "PrepareAbort":
+			return TransactionEndResult{State: TransactionEndAborted}, nil
+		default:
+			return TransactionEndResult{State: TransactionEndUnknown}, nil
+		}
+	}
+	return TransactionEndResult{State: TransactionEndUnknown}, nil
 }
 
 // This returns if it is necessary to recover the producer ID (it has an

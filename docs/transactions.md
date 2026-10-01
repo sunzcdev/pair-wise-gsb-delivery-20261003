@@ -24,6 +24,30 @@ _committing_ a record twice.
 
 [3]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#GroupTransactSession
 
+Knowing how a transaction ended
+===
+
+`EndTransaction` returning an error is ambiguous: if the EndTxn response is
+lost in transit, the broker may or may not have applied your commit. For
+deciding whether to rerun your business logic, an error alone is not enough.
+
+[`EndTransactionWithResult`][4] returns a structured `TransactionEndResult`
+that separates three outcomes: known committed, known aborted, and unknown.
+The result keeps the send-phase error as evidence. An unknown outcome is
+never a guess: the client does not resend your records to probe, and neither
+should you.
+
+Against Kafka 2.8+, [`VerifyTransactionEnd`][5] explicitly checks the
+outcome: it asks the transaction coordinator for the final state of your
+transactional ID's latest transaction (a read-only `DescribeTransactions`
+request) and reports committed, aborted, or -- when the coordinator cannot
+confirm either, for example once the transactional ID has expired -- still
+unknown. Call it before `BeginTransaction`, since the coordinator only
+tracks the latest transaction per transactional ID.
+
+[4]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Client.EndTransactionWithResult
+[5]: https://pkg.go.dev/github.com/twmb/franz-go/pkg/kgo#Client.VerifyTransactionEnd
+
 KIP-447?
 ===
 

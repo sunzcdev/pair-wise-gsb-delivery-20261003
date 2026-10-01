@@ -1324,7 +1324,8 @@ func TestTxnDescribeTransactions(t *testing.T) {
 		t.Fatalf("end txn error: %v", kerr.ErrorForCode(endResp.ErrorCode))
 	}
 
-	// After commit: state should be Empty again, no partitions.
+	// After commit: state is CompleteCommit (as on a real broker, until
+	// the transactional ID expires), no partitions.
 	descResp, err = descReq.RequestWith(ctx, cl)
 	if err != nil {
 		t.Fatalf("describe after commit: %v", err)
@@ -1333,8 +1334,8 @@ func TestTxnDescribeTransactions(t *testing.T) {
 	if st.ErrorCode != 0 {
 		t.Fatalf("describe error: %v", kerr.ErrorForCode(st.ErrorCode))
 	}
-	if st.State != "Empty" {
-		t.Fatalf("expected Empty state after commit, got %q", st.State)
+	if st.State != "CompleteCommit" {
+		t.Fatalf("expected CompleteCommit state after commit, got %q", st.State)
 	}
 	if len(st.Topics) != 0 {
 		t.Fatalf("expected no topics after commit, got %d", len(st.Topics))
