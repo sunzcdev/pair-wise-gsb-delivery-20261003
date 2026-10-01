@@ -1,0 +1,35 @@
+# Mixed configuration for the document editor tests.
+title = "scheduler"
+retries = 0x0A        # hex keeps its spelling
+ratio = 3.140
+
+[server]
+host = "127.0.0.1"
+port = 8080
+meta = { region = "cn", weight = 1.0, flags = ["a", 'b'] }
+
+[server.tls]
+enabled = true
+
+[pool]
+size = 4
+
+[extra]
+dotted.only = "once"
+
+[[targets]]
+name = "alpha"
+weight = 10
+labels = ["primary"]
+nested = { timeout = 5, retries = 2 }
+
+[[targets]]
+name = "beta"
+weight = 20
+
+  [targets.config]
+    mode = "canary"
+
+[[targets]]
+name = "gamma"
+weight = 30

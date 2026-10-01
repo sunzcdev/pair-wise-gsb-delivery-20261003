@@ -10,6 +10,11 @@ require 'tomlrb/string_utils'
 require 'tomlrb/scanner'
 require 'tomlrb/parser'
 require 'tomlrb/handler'
+require 'tomlrb/document_scanner'
+require 'tomlrb/document_parser'
+require 'tomlrb/toml_encoder'
+require 'tomlrb/piece_table'
+require 'tomlrb/document'
 
 module Tomlrb
   class ParseError < StandardError; end

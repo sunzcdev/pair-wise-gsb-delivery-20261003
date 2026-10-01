@@ -38,6 +38,50 @@ or
 Tomlrb.load_file('my_file', symbolize_keys: true)
 ```
 
+## Editing documents while preserving comments
+
+Re-emitting a parsed Hash loses comments, spacing and the original spelling
+of numbers and strings. `Tomlrb::Document` edits the source text instead,
+touching only the ranges involved in an edit: comments, blank lines,
+quoting and the spelling of untouched values are kept byte for byte.
+
+```ruby
+document = Tomlrb::Document.new(File.read('config.toml'))
+
+document.set(['server', 'port'], 9090)               # change a value
+document.rename(['server', 'port'], 'listen')         # rename a key
+document.move(['pool', 'size'], ['server', 'workers']) # move across tables
+
+# Array-of-tables instances are addressed with an integer segment.
+document.set(['targets', 0, 'name'], 'alpha-renamed')
+
+document.text # the edited document
+```
+
+Paths are arrays of strings (and integers for array-of-tables instances),
+or dot-separated strings for bare keys.
+
+Every edit is validated against the document structure and re-parsed
+afterwards. Edits that would create a duplicate declaration or a type
+conflict raise `Tomlrb::EditError` and leave the document untouched, so a
+sequence of edits never produces a half-written file.
+
+```ruby
+begin
+  document.rename(['server', 'host'], 'port') # 'port' already exists
+rescue Tomlrb::EditError => error
+  error.message # "server.port is already declared"
+end
+```
+
+To rewrite a file atomically, use `Document.open`:
+
+```ruby
+Tomlrb::Document.open('config.toml') do |document|
+  document.set(['server', 'port'], 9090)
+end # written only if every edit in the block succeeded
+```
+
 ## Benchmark
 
 You can run the benchmark against the only other v0.5.0 compliant parser to my knowledge with `ruby benchmarks/bench.rb`.
