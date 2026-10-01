@@ -62,6 +62,18 @@ module Dry
       def meta = errors.map(&:meta)
     end
 
+    class TupleError < CoercionError
+      # @return [Integer]
+      attr_reader :index
+
+      # @param [String] message
+      # @param [Integer, nil] index Original zero-based index in the input array
+      def initialize(message, index: nil)
+        @index = index
+        super(message)
+      end
+    end
+
     class SchemaError < CoercionError
       # @return [String, Symbol]
       attr_reader :key

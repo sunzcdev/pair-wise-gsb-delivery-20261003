@@ -25,6 +25,31 @@ module Dry
       # @return [Dry::Types::Array]
       def Array(type) = Strict(::Array).of(type)
 
+      # Build a tuple type, i.e. an array with a type declared per position
+      #
+      # @example fixed positions
+      #   Message = Types.Tuple(Types::String, Types::Integer)
+      #   Message.(["create", 42])
+      #
+      # @example optional trailing position and a repeated tail
+      #   Message = Types.Tuple(
+      #     Types::String,
+      #     Types::Integer,
+      #     Dry::Types::Tuple.optional(Types::String),
+      #     Dry::Types::Tuple.rest(Types::Any)
+      #   )
+      #
+      # @example with a block
+      #   Message = Types.Tuple do
+      #     required Types::String
+      #     optional Types::Integer
+      #   end
+      #
+      # @param types [Array<Dry::Types::Type, Dry::Types::Tuple::Position>]
+      #
+      # @return [Dry::Types::Tuple]
+      def Tuple(*types, &block) = Strict(::Array).tuple(*types, &block)
+
       # Build a hash schema
       #
       # @param [Hash{Symbol => Dry::Types::Type}] type_map

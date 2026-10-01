@@ -69,6 +69,46 @@ module Dry
         registry["nominal.array"].of(member).meta(meta)
       end
 
+      def visit_tuple(node)
+        positions, meta = node
+
+        fixed = []
+        rest = nil
+
+        positions.each do |position_node|
+          position = visit(position_node)
+
+          if position.is_a?(Tuple::Position::Rest)
+            rest = position
+          else
+            fixed << position
+          end
+        end
+
+        Tuple.new(
+          registry["nominal.array"].primitive,
+          positions: fixed,
+          rest: rest
+        ).meta(meta)
+      end
+
+      def visit_tuple_position(node)
+        Tuple::Position.new(visit(node.first))
+      end
+
+      def visit_tuple_optional(node)
+        Tuple::Position::Optional.new(visit(node.first))
+      end
+
+      def visit_tuple_rest(node)
+        Tuple::Position::Rest.new(visit(node.first))
+      end
+
+      def visit_default(node)
+        type, value = node
+        visit(type).default(value)
+      end
+
       def visit_hash(node)
         opts, meta = node
         registry["nominal.hash"].with(**opts, meta: meta)

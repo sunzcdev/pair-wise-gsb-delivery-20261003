@@ -115,6 +115,25 @@ module Dry
         end
 
         # @api private
+        alias_method :visit_tuple, :visit_array
+
+        # @api private
+        def visit_tuple_position(node)
+          visit(node.first)
+        end
+
+        # @api private
+        alias_method :visit_tuple_optional, :visit_tuple_position
+
+        # @api private
+        alias_method :visit_tuple_rest, :visit_tuple_position
+
+        # @api private
+        def visit_default(node)
+          visit(node.first)
+        end
+
+        # @api private
         def visit_lax(node)
           visit(node)
         end

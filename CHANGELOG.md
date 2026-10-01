@@ -9,6 +9,17 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Tuple types: arrays whose elements are validated position by position. Build
+  them with `Array#tuple` (or `Types.Tuple`). Positions are required by default;
+  trailing positions can be marked optional (`Dry::Types::Tuple.optional(type)`
+  or `optional type` in the block DSL) and a single repeating tail can be
+  declared separately (`Dry::Types::Tuple.rest(type)` or `rest type`). A
+  required position following an optional one is rejected at declaration time.
+  Missing values are never treated as `nil` and extra values are never dropped;
+  errors carry the original zero-based input index. `call`, `call` with a
+  failure block, and `try` all follow the same positional rules. Default values
+  are preserved through AST compilation.
+
 ### Changed
 
 ### Deprecated
