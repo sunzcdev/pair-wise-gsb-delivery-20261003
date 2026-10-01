@@ -101,6 +101,10 @@ func (c *Conn) availableCaps() []imap.Cap {
 		} else {
 			addAvailableCaps(&caps, available, []imap.Cap{imap.CapAppendLimit})
 		}
+
+		if _, ok := c.session.(SessionThread); ok {
+			caps = append(caps, imap.CapThreadReferences)
+		}
 	}
 	return caps
 }

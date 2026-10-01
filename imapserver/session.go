@@ -92,6 +92,15 @@ type SessionMove interface {
 	Move(w *MoveWriter, numSet imap.NumSet, dest string) error
 }
 
+// SessionThread is an IMAP session which supports the THREAD extension
+// (RFC 5256) with the REFERENCES algorithm.
+type SessionThread interface {
+	Session
+
+	// Selected state
+	Thread(numKind NumKind, algorithm imap.ThreadAlgorithm, criteria *imap.SearchCriteria) ([]imap.ThreadData, error)
+}
+
 // SessionIMAP4rev2 is an IMAP session which supports IMAP4rev2.
 type SessionIMAP4rev2 interface {
 	Session
