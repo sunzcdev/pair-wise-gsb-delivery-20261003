@@ -120,6 +120,16 @@ RSpec.describe Pundit::Authorization do
     it "raises an error with a invalid policy constructor" do
       expect { controller.authorize(wiki, :destroy?) }.to raise_error(Pundit::InvalidConstructorError)
     end
+
+    it "raises InvalidConstructorError for an explicit policy class with an incompatible constructor" do
+      expect { controller.authorize(post, :create?, policy_class: InvalidConstructorPolicy) }
+        .to raise_error(Pundit::InvalidConstructorError, /its signature is/)
+    end
+
+    it "propagates ArgumentError raised inside the policy constructor" do
+      expect { controller.authorize(ConstructorContainsArgumentError.new, :show?) }
+        .to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
+    end
   end
 
   describe "#skip_authorization" do
@@ -197,6 +207,11 @@ RSpec.describe Pundit::Authorization do
 
     it "raises an error with a invalid policy scope constructor" do
       expect { controller.policy_scope(Wiki) }.to raise_error(Pundit::InvalidConstructorError)
+    end
+
+    it "propagates ArgumentError raised inside the policy scope constructor" do
+      expect { controller.policy_scope(ConstructorContainsArgumentError) }
+        .to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
     end
 
     it "allows policy_scope to be injected" do

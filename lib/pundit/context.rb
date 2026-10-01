@@ -57,12 +57,13 @@ module Pundit
     # @param query [Symbol, String] the predicate method to check on the policy (e.g. `:show?`)
     # @param policy_class [Class] the policy class we want to force use of
     # @raise [NotAuthorizedError] if the given query method returned false
+    # @raise [InvalidConstructorError] if the policy constructor can't accept `(user, record)`
     # @return [Object] Always returns the passed object record
     # @since v2.3.2
     def authorize(possibly_namespaced_record, query:, policy_class:)
       record = pundit_model(possibly_namespaced_record)
       policy = if policy_class
-        policy_class.new(user, record)
+        instantiate_policy(policy_class, record)
       else
         policy!(possibly_namespaced_record)
       end
@@ -76,7 +77,7 @@ module Pundit
     #
     # @see https://github.com/varvet/pundit#policies
     # @param record [Object] the object we're retrieving the policy for
-    # @raise [InvalidConstructorError] if the policy constructor called incorrectly
+    # @raise [InvalidConstructorError] if the policy constructor can't accept `(user, record)`
     # @return [Object, nil] instance of policy class with query methods
     # @since v2.3.2
     def policy(record)
@@ -88,7 +89,7 @@ module Pundit
     # @see https://github.com/varvet/pundit#policies
     # @param record [Object] the object we're retrieving the policy for
     # @raise [NotDefinedError] if the policy cannot be found
-    # @raise [InvalidConstructorError] if the policy constructor called incorrectly
+    # @raise [InvalidConstructorError] if the policy constructor can't accept `(user, record)`
     # @return [Object] instance of policy class with query methods
     # @since v2.3.2
     def policy!(record)
@@ -103,20 +104,14 @@ module Pundit
     #
     # @see https://github.com/varvet/pundit#scopes
     # @param scope [Object] the object we're retrieving the policy scope for
-    # @raise [InvalidConstructorError] if the policy constructor called incorrectly
+    # @raise [InvalidConstructorError] if the policy scope constructor can't accept `(user, scope)`
     # @return [Scope{#resolve}, nil] instance of scope class which can resolve to a scope
     # @since v2.3.2
     def policy_scope(scope)
       policy_scope_class = policy_finder(scope).scope
       return unless policy_scope_class
 
-      begin
-        policy_scope = policy_scope_class.new(user, pundit_model(scope))
-      rescue ArgumentError
-        raise InvalidConstructorError, "Invalid #<#{policy_scope_class}> constructor is called"
-      end
-
-      policy_scope.resolve
+      instantiate_policy(policy_scope_class, pundit_model(scope)).resolve
     end
 
     # Retrieves the policy scope for the given record. Raises if not found.
@@ -124,19 +119,13 @@ module Pundit
     # @see https://github.com/varvet/pundit#scopes
     # @param scope [Object] the object we're retrieving the policy scope for
     # @raise [NotDefinedError] if the policy scope cannot be found
-    # @raise [InvalidConstructorError] if the policy constructor called incorrectly
+    # @raise [InvalidConstructorError] if the policy scope constructor can't accept `(user, scope)`
     # @return [Scope{#resolve}] instance of scope class which can resolve to a scope
     # @since v2.3.2
     def policy_scope!(scope)
       policy_scope_class = policy_finder(scope).scope!
 
-      begin
-        policy_scope = policy_scope_class.new(user, pundit_model(scope))
-      rescue ArgumentError
-        raise InvalidConstructorError, "Invalid #<#{policy_scope_class}> constructor is called"
-      end
-
-      policy_scope.resolve
+      instantiate_policy(policy_scope_class, pundit_model(scope)).resolve
     end
 
     # @!endgroup
@@ -153,20 +142,82 @@ module Pundit
     # @yieldparam [PolicyFinder] policy_finder
     # @yieldreturn [#new(user, model)]
     # @return [Policy, nil] an instantiated policy
-    # @raise [InvalidConstructorError] if policy can't be instantated
+    # @raise [InvalidConstructorError] if the policy constructor can't accept `(user, record)`
     # @since v2.3.2
     def cached_find(record)
       policy_cache.fetch(user: user, record: record) do
         klass = yield policy_finder(record)
         next unless klass
 
-        model = pundit_model(record)
+        instantiate_policy(klass, pundit_model(record))
+      end
+    end
 
-        begin
-          klass.new(user, model)
-        rescue ArgumentError
-          raise InvalidConstructorError, "Invalid #<#{klass}> constructor is called"
-        end
+    # Instantiates a policy or policy scope with the user and model.
+    #
+    # The constructor signature is checked upfront, so an `ArgumentError`
+    # raised *inside* the constructor (e.g. by application code) is not
+    # mistaken for a constructor mismatch and propagates with its original
+    # message and backtrace.
+    #
+    # @api private
+    # @param klass [Class] the policy or policy scope class
+    # @param model [Object] the record or scope passed to the constructor
+    # @return [Object] an instance of the given class
+    # @raise [InvalidConstructorError] if the constructor can't accept `(user, model)`
+    # @since v2.5.3
+    def instantiate_policy(klass, model)
+      raise InvalidConstructorError, invalid_constructor_message(klass) unless constructor_compatible?(klass)
+
+      klass.new(user, model)
+    end
+
+    # Checks whether the constructor can be called with two positional
+    # arguments (user and record) and no keywords.
+    #
+    # @api private
+    # @param klass [Class] the policy or policy scope class
+    # @return [Boolean]
+    # @since v2.5.3
+    def constructor_compatible?(klass)
+      types = klass.instance_method(:initialize).parameters.map(&:first)
+
+      return false if types.include?(:keyreq)
+
+      required = types.count(:req)
+      return false if required > 2
+
+      types.include?(:rest) || required + types.count(:opt) >= 2
+    end
+
+    # Builds a message describing how Pundit calls the constructor and what
+    # the constructor actually accepts.
+    #
+    # @api private
+    # @param klass [Class] the policy or policy scope class
+    # @return [String]
+    # @since v2.5.3
+    def invalid_constructor_message(klass)
+      signature = klass.instance_method(:initialize).parameters.map do |type, name|
+        format_parameter(type, name)
+      end.join(", ")
+
+      "Invalid #<#{klass}> constructor is called. " \
+        "Pundit calls it with (user, record), but its signature is (#{signature})"
+    end
+
+    # @api private
+    # @since v2.5.3
+    def format_parameter(type, name)
+      case type
+      when :req then name.to_s
+      when :opt then "#{name} = ?"
+      when :rest then name ? "*#{name}" : "*"
+      when :keyreq then "#{name}:"
+      when :key then "#{name}: ?"
+      when :keyrest then name ? "**#{name}" : "**"
+      when :nokey then "**nil"
+      when :block then name ? "&#{name}" : "&"
       end
     end
 

@@ -100,12 +100,24 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy constructor" do
       expect do
         Pundit.authorize(user, wiki, :update?)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called. Pundit calls it with (user, record), but its signature is ()")
+    end
+
+    it "raises the original ArgumentError when the policy constructor raises it internally" do
+      expect do
+        Pundit.authorize(user, ConstructorContainsArgumentError.new, :show?)
+      end.to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
     end
 
     context "when passed a policy class" do
       it "uses the passed policy class" do
         expect(Pundit.authorize(user, post, :create?, policy_class: PublicationPolicy)).to be_truthy
+      end
+
+      it "raises the original ArgumentError when the passed policy class constructor raises it internally" do
+        expect do
+          Pundit.authorize(user, post, :create?, policy_class: ConstructorContainsArgumentErrorPolicy)
+        end.to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
       end
 
       # This is documenting past behaviour.
@@ -175,13 +187,19 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy scope constructor" do
       expect do
         Pundit.policy_scope(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called. Pundit calls it with (user, record), but its signature is ()")
     end
 
     it "raises an original error with a policy scope that contains error" do
       expect do
         Pundit.policy_scope(user, DefaultScopeContainsError)
       end.to raise_error(RuntimeError, "This is an arbitrary error that should bubble up")
+    end
+
+    it "raises the original ArgumentError when the policy scope constructor raises it internally" do
+      expect do
+        Pundit.policy_scope(user, ConstructorContainsArgumentError)
+      end.to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
     end
   end
 
@@ -219,7 +237,7 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy scope constructor" do
       expect do
         Pundit.policy_scope(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called. Pundit calls it with (user, record), but its signature is ()")
     end
   end
 
@@ -293,7 +311,13 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy constructor" do
       expect do
         Pundit.policy(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called. Pundit calls it with (user, record), but its signature is ()")
+    end
+
+    it "raises the original ArgumentError when the policy constructor raises it internally" do
+      expect do
+        Pundit.policy(user, ConstructorContainsArgumentError.new)
+      end.to raise_error(ArgumentError, 'invalid value for Integer(): "not a number"')
     end
 
     it "returns an instantiated policy given an array of a symbol and an active model class" do
@@ -442,7 +466,7 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy constructor" do
       expect do
         Pundit.policy(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called. Pundit calls it with (user, record), but its signature is ()")
     end
   end
 
