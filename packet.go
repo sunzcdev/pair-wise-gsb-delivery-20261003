@@ -1343,6 +1343,10 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketHardlink{}
+	case extQueryAllocated:
+		p.SpecificPacket = &sshFxpQueryAllocatedServerPacket{}
+	case extAllocateRegions:
+		p.SpecificPacket = &sshFxpAllocateRegionsServerPacket{}
 	default:
 		return fmt.Errorf("packet type %v: %w", p.SpecificPacket, errUnknownExtendedPacket)
 	}

@@ -547,7 +547,163 @@ type memFile struct {
 
 	mu      sync.RWMutex
 	content []byte
-	err     error
+	// allocated records the backing regions of content. Gaps between these
+	// regions are holes and read back as zero bytes without being "allocated",
+	// while an explicitly written run of zero bytes stays allocated and must
+	// therefore still be transferred.
+	allocated []fileRangeMem
+	err       error
+}
+
+type fileRangeMem struct {
+	offset int64
+	length int64
+}
+
+// SparseCapabilities advertises full sparse support for the in-memory backend.
+func (fs *root) SparseCapabilities() SparseCaps {
+	return SparseCaps{Discover: true, Allocate: true}
+}
+
+// markAllocated records [offset, offset+length) as backed storage, merging it
+// with adjacent/overlapping existing regions. Must be called holding f.mu.
+func (f *memFile) markAllocated(offset, length int64) {
+	if length <= 0 {
+		return
+	}
+
+	start := offset
+	end := offset + length
+
+	var merged []fileRangeMem
+
+	for _, r := range f.allocated {
+		rEnd := r.offset + r.length
+
+		if rEnd < start {
+			merged = append(merged, r)
+			continue
+		}
+
+		if r.offset > end {
+			merged = append(merged, fileRangeMem{start, end - start})
+			start, end = r.offset, rEnd
+			continue
+		}
+
+		if r.offset < start {
+			start = r.offset
+		}
+
+		if rEnd > end {
+			end = rEnd
+		}
+	}
+
+	merged = append(merged, fileRangeMem{start, end - start})
+	f.allocated = merged
+}
+
+// isAllocated reports whether off falls inside a backed region. Must be
+// called holding f.mu.
+func (f *memFile) isAllocated(off int64) bool {
+	for _, r := range f.allocated {
+		if off >= r.offset && off < r.offset+r.length {
+			return true
+		}
+	}
+
+	return false
+}
+
+// QueryAllocatedRanges implements AllocatedRanger for protocol verification.
+// The returned nextOffset is the start of the following hole, or the logical
+// file size when no allocated data remains.
+func (f *memFile) QueryAllocatedRanges(offset uint64, count uint32) ([]FileRange, uint64, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if f.err != nil {
+		return nil, 0, f.err
+	}
+
+	size := f.size()
+
+	if int64(offset) >= size {
+		return nil, uint64(size), nil
+	}
+
+	var ranges []FileRange
+
+	cursor := int64(offset)
+
+	for _, r := range f.allocated {
+		rStart := r.offset
+		rEnd := r.offset + r.length
+
+		if rEnd <= cursor {
+			continue // region entirely before cursor
+		}
+
+		if rStart > cursor {
+			if len(ranges) > 0 {
+				// Gap before this region; stop here so the caller skips it.
+				return ranges, uint64(rStart), nil
+			}
+
+			// cursor sits inside a hole: jump to the start of this region.
+			cursor = rStart
+		}
+
+		if rEnd > size {
+			rEnd = size
+		}
+
+		ranges = append(ranges, FileRange{
+			Offset: uint64(cursor),
+			Length: uint64(rEnd - cursor),
+		})
+		cursor = rEnd
+
+		if uint32(len(ranges)) >= count {
+			break
+		}
+	}
+
+	if len(ranges) == 0 {
+		return nil, uint64(size), nil
+	}
+
+	// After the last returned range the next byte is a hole (or EOF).
+	lastEnd := int64(ranges[len(ranges)-1].End())
+	if lastEnd >= size {
+		return ranges, uint64(size), nil
+	}
+
+	return ranges, uint64(lastEnd), nil
+}
+
+// AllocateRegions implements RegionAllocator for protocol verification. It
+// marks exactly the given regions as backed storage; gaps remain holes.
+func (f *memFile) AllocateRegions(ranges []FileRange) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return f.err
+	}
+
+	for _, r := range ranges {
+		end := int64(r.Offset + r.Length)
+
+		if end > f.size() {
+			f.grow(end - f.size())
+		}
+
+		f.markAllocated(int64(r.Offset), int64(r.Length))
+	}
+
+	return nil
 }
 
 // These are helper functions, they must be called while holding the memFile.mu mutex
@@ -618,6 +774,9 @@ func (f *memFile) WriteAt(b []byte, off int64) (int, error) {
 		f.grow(grow)
 	}
 
+	// Every written byte — including explicit zero bytes — is backed storage.
+	f.markAllocated(off, int64(len(b)))
+
 	return copy(f.content[off:], b), nil
 }
 
@@ -635,6 +794,25 @@ func (f *memFile) Truncate(size int64) error {
 	} else {
 		f.grow(grow)
 	}
+
+	// Drop regions past the new size. Growing must not mark the extension as
+	// allocated: the new tail is a logical hole.
+	var clipped []fileRangeMem
+
+	for _, r := range f.allocated {
+		rEnd := r.offset + r.length
+		if r.offset >= size {
+			continue
+		}
+
+		if rEnd > size {
+			r.length = size - r.offset
+		}
+
+		clipped = append(clipped, r)
+	}
+
+	f.allocated = clipped
 
 	return nil
 }

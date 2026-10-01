@@ -90,6 +90,22 @@ func (s *state) getAllReaderWriters() (io.ReaderAt, io.WriterAt, WriterAtReaderA
 	return s.readerAt, s.writerAt, s.writerAtReaderAt
 }
 
+// fileBackend returns the concrete object returned by the handler for this
+// request, preferring the read/write handle. It is used to probe optional
+// interfaces such as AllocatedRanger and RegionAllocator.
+func (r *Request) fileBackend() any {
+	rd, wr, rw := r.getAllReaderWriters()
+
+	switch {
+	case rw != nil:
+		return rw
+	case wr != nil:
+		return wr
+	default:
+		return rd
+	}
+}
+
 // Returns current offset for file list
 func (s *state) lsNext() int64 {
 	s.mu.RLock()

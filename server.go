@@ -223,7 +223,7 @@ func handlePacket(s *Server, p orderedRequest) error {
 	case *sshFxInitPacket:
 		rpkt = &sshFxVersionPacket{
 			Version:    sftpProtocolVersion,
-			Extensions: sftpExtensions,
+			Extensions: s.versionExtensions(),
 		}
 	case *sshFxpStatPacket:
 		// stat the requested file

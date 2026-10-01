@@ -101,6 +101,17 @@ func NewRequestServer(rwc io.ReadWriteCloser, h Handlers, options ...RequestServ
 	return rs
 }
 
+// versionExtensions returns the extension list advertised in the
+// SSH_FXP_VERSION reply, combining the standard extensions with any
+// sparse-file capabilities the handlers implement.
+func (rs *RequestServer) versionExtensions() []sshExtensionPair {
+	extensions := make([]sshExtensionPair, 0, len(sftpExtensions)+1)
+	extensions = append(extensions, sftpExtensions...)
+	extensions = append(extensions, sparseExtensionPairs(sparseCapsFromHandlers(rs.Handlers))...)
+
+	return extensions
+}
+
 // New Open packet/Request
 func (rs *RequestServer) nextRequest(r *Request) string {
 	rs.mu.Lock()
@@ -231,7 +242,10 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 		var rpkt responsePacket
 		switch pkt := pkt.requestPacket.(type) {
 		case *sshFxInitPacket:
-			rpkt = &sshFxVersionPacket{Version: sftpProtocolVersion, Extensions: sftpExtensions}
+			rpkt = &sshFxVersionPacket{
+				Version:    sftpProtocolVersion,
+				Extensions: rs.versionExtensions(),
+			}
 		case *sshFxpClosePacket:
 			handle := pkt.getHandle()
 			rpkt = statusFromError(pkt.ID, rs.closeRequest(handle))
@@ -305,6 +319,20 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpQueryAllocatedServerPacket:
+			request, ok := rs.getRequest(pkt.Handle)
+			if !ok {
+				rpkt = statusFromError(pkt.ID, EBADF)
+			} else {
+				rpkt = respondQueryAllocated(pkt.ID, request.fileBackend(), pkt)
+			}
+		case *sshFxpAllocateRegionsServerPacket:
+			request, ok := rs.getRequest(pkt.Handle)
+			if !ok {
+				rpkt = statusFromError(pkt.ID, EBADF)
+			} else {
+				rpkt = respondAllocateRegions(pkt.ID, request.fileBackend(), pkt)
+			}
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)

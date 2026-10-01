@@ -309,6 +309,10 @@ const sftpProtocolVersion = 3 // https://filezilla-project.org/specs/draft-ietf-
 func (c *Client) sendInit() error {
 	return c.clientConn.conn.sendPacket(&sshFxInitPacket{
 		Version: sftpProtocolVersion, // https://filezilla-project.org/specs/draft-ietf-secsh-filexfer-02.txt
+		Extensions: []extensionPair{
+			// The client implements both sides of the sparse-file extension.
+			{Name: sparseFileExtension, Data: marshalSparseCaps(SparseCaps{Discover: true, Allocate: true})},
+		},
 	})
 }
 
