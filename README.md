@@ -93,6 +93,30 @@ for active record which handles edge cases like type casting ids
 and overriding GraphQL::Batch::Loader#cache_key to load associations
 on records with the same id.
 
+### Limiting Batch Size
+
+A backend may cap how many records can be requested at once. Define
+`max_batch_size` on a loader to split the accumulated keys into consecutive
+batches of at most that size, in the order they were enqueued. Each batch is
+passed to `perform` separately, so a failure only rejects the keys of that
+batch while the other batches proceed.
+
+```ruby
+class LimitedRecordLoader < GraphQL::Batch::Loader
+  max_batch_size 50
+
+  def perform(ids)
+    @model.where(id: ids).each { |record| fulfill(record.id, record) }
+    ids.each { |id| fulfill(id, nil) unless fulfilled?(id) }
+  end
+end
+```
+
+`max_batch_size` can also be overridden per loader instance by defining an
+instance method of the same name. When it is not set, every key is submitted
+to `perform` in a single call (the default behavior). The value must be a
+positive integer.
+
 ### Promises
 
 GraphQL::Batch::Loader#load returns a Promise using the [promise.rb gem](https://rubygems.org/gems/promise.rb) to provide a promise based API, so you can transform the query results using `.then`

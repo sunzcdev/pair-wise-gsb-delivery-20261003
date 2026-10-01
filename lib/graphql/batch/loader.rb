@@ -1,6 +1,23 @@
 module GraphQL::Batch
   class Loader
     class << self
+      # Maximum number of keys passed to a single {#perform} call. When more
+      # unique keys accumulate, they are split into consecutive batches of at
+      # most this size, in enqueue order. Defaults to +nil+, which keeps the
+      # behavior of submitting every key in one batch.
+      def max_batch_size(size = nil)
+        if size.nil?
+          if defined?(@max_batch_size)
+            @max_batch_size
+          elsif superclass&.respond_to?(:max_batch_size, true)
+            superclass.max_batch_size
+          end
+        else
+          validate_max_batch_size!(size)
+          @max_batch_size = size
+        end
+      end
+
       def for(*group_args, **group_kwargs)
         current_executor.loader(loader_key_for(*group_args, **group_kwargs)) do
           new(*group_args, **group_kwargs)
@@ -20,6 +37,12 @@ module GraphQL::Batch
       end
 
       private
+
+      def validate_max_batch_size!(size)
+        unless size.is_a?(Integer) && size > 0
+          raise ArgumentError, "max_batch_size must be a positive integer, got #{size.inspect}"
+        end
+      end
 
       def current_executor
         executor = Executor.current
@@ -64,11 +87,14 @@ module GraphQL::Batch
       load_keys = queue
       @queue = nil
 
-      around_perform do
-        perform(load_keys)
+      batch_size = validated_max_batch_size
+      if batch_size
+        load_keys.each_slice(batch_size) do |batch_keys|
+          resolve_batch(batch_keys)
+        end
+      else
+        resolve_batch(load_keys)
       end
-
-      check_for_broken_promises(load_keys)
     rescue => err
       reject_pending_promises(load_keys, err)
     end
@@ -89,6 +115,12 @@ module GraphQL::Batch
 
     def resolved?
       @queue.nil? || @queue.empty?
+    end
+
+    # Override per instance (or declare with {.max_batch_size}) to cap the
+    # number of keys handed to {#perform} in a single call.
+    def max_batch_size
+      self.class.max_batch_size
     end
 
     protected
@@ -139,6 +171,24 @@ module GraphQL::Batch
       end
     end
 
+    def validated_max_batch_size
+      size = max_batch_size
+      return nil if size.nil?
+
+      self.class.send(:validate_max_batch_size!, size)
+      size
+    end
+
+    def resolve_batch(load_keys)
+      around_perform do
+        perform(load_keys)
+      end
+
+      check_for_broken_promises(load_keys)
+    rescue => err
+      reject_pending_promises(load_keys, err)
+    end
+
     def cache
       @cache ||= {}
     end
@@ -153,7 +203,10 @@ module GraphQL::Batch
 
     def reject_pending_promises(load_keys, err)
       load_keys.each do |key|
-        next unless promise_for(key).pending?
+        promise = promise_for(key)
+        # A promise chained to another loader's promise is already considered
+        # complete and must not be rolled back.
+        next unless promise.pending? && promise.source == self
 
         reject(key, err)
       end
