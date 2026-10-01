@@ -2987,3 +2987,4 @@ end
 require_relative "csv/version"
 require_relative "csv/core_ext/array"
 require_relative "csv/core_ext/string"
+require_relative "csv/dialect"

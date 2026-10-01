@@ -1,5 +1,22 @@
 # News
 
+## Unreleased
+
+### Features
+
+  * Added `CSV.detect_dialect` for quote aware dialect sniffing. It
+    ranks caller supplied candidate column separators, quote characters
+    and row separator rules against a byte bounded sample, honoring
+    quoted and multiline fields. A sample ending in the middle of a
+    field is treated as truncated rather than malformed, and equally
+    valid dialects are reported as ambiguous instead of silently
+    choosing one.
+
+  * Added `CSV.parse_detected`, which detects the dialect and parses the
+    input from the first record even when the given IO can't be rewound;
+    the bytes consumed while sniffing are replayed. Raises
+    `CSV::AmbiguousDialectError` when detection is ambiguous.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements
