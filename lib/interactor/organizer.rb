@@ -45,7 +45,40 @@ module Interactor
       #
       # Returns nothing.
       def organize(*interactors)
-        @organized = interactors.flatten
+        organized.concat(interactors.flatten)
+      end
+
+      # Public: Declare an Interactor to be invoked as part of the
+      # Interactor::Organizer's invocation with its context keys adapted to
+      # the keys used by the organizer. The interactor is invoked against a
+      # local context built from the declared inputs, and on success the
+      # declared outputs are merged back into the organizer's context. The
+      # interactor class itself does not need to change.
+      #
+      # interactor_class - An Interactor class to be invoked with adapted
+      #                    context keys.
+      # inputs           - A Hash mapping each local context key expected by
+      #                    the interactor to the organizer context key
+      #                    providing its value. (default: {})
+      # outputs          - A Hash mapping each local context key produced by
+      #                    the interactor to the organizer context key
+      #                    receiving its value. (default: {})
+      #
+      # Examples
+      #
+      #   class MyOrganizer
+      #     include Interactor::Organizer
+      #
+      #     organize FetchAccount
+      #
+      #     adapt ReceivePayment,
+      #       inputs: {payer: :account},
+      #       outputs: {receipt: :payment_receipt}
+      #   end
+      #
+      # Returns nothing.
+      def adapt(interactor_class, inputs: {}, outputs: {})
+        organized << Adapter.new(interactor_class, inputs: inputs, outputs: outputs)
       end
 
       # Internal: An Array of declared Interactors to be invoked.
@@ -61,7 +94,8 @@ module Interactor
       #   MyOrganizer.organized
       #   # => [InteractorOne, InteractorTwo]
       #
-      # Returns an Array of Interactor classes or an empty Array.
+      # Returns an Array of Interactor classes and Interactor::Adapter
+      #   instances or an empty Array.
       def organized
         @organized ||= []
       end

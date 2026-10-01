@@ -1,3 +1,7 @@
+## Unreleased
+* [FEATURE] Add `Interactor::Organizer.adapt` to run an interactor against a local context with declared input/output key mappings
+* [ENHANCEMENT] `Interactor::Organizer.organize` now appends to the organized steps so it can be interleaved with `adapt`
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

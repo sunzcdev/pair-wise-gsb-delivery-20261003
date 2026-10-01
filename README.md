@@ -470,6 +470,45 @@ end
 interactor should have a single purpose, there should be no need to clean up
 after any failed interactor.
 
+#### Adapting Interactors
+
+Sometimes an interactor expects context keys that don't match the keys used
+by the organizer. Rather than changing the interactor, declare a step
+adapter with `adapt`, mapping the interactor's keys to the organizer's keys:
+
+```ruby
+class PlaceOrder
+  include Interactor::Organizer
+
+  organize CreateOrder
+
+  adapt ReceivePayment,
+    inputs: {payer: :account},
+    outputs: {receipt: :payment_receipt}
+end
+```
+
+Before invocation, the adapter copies each declared input from the
+organizer's context into a local context — here `account` becomes `payer` —
+and the interactor runs against that local context. On success, each declared
+output is merged back — here `receipt` becomes `payment_receipt`. Keys that
+are not declared never cross the boundary in either direction, so temporary
+values stay local to the adapted step.
+
+A few guarantees:
+
+* A declared input that is absent from the organizer's context raises
+  `Interactor::MissingInputError`. A key that is present with a `nil` value is
+  passed through as `nil`.
+* Declared outputs are all verified before any of them is merged. An absent
+  output raises `Interactor::MissingOutputError` and leaves the organizer's
+  context untouched.
+* Mapping two outputs to the same organizer key raises
+  `Interactor::DuplicateOutputError` when the adapter is declared.
+* Failure and rollback behave as usual: if the adapted interactor fails, the
+  organizer fails and rolls back, and a later rollback invokes `rollback` on
+  the actual interactor instance, which sees its local context.
+
 ## Testing Interactors
 
 When written correctly, an interactor is easy to test because it only *does* one

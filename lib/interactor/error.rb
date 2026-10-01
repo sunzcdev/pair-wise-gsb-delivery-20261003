@@ -28,4 +28,22 @@ module Interactor
       super
     end
   end
+
+  # Public: Error raised when an Interactor::Adapter cannot find a declared
+  # input key in the parent context. A key that is present with a nil value
+  # does not raise this error.
+  class MissingInputError < StandardError
+  end
+
+  # Public: Error raised when an Interactor::Adapter cannot find a declared
+  # output key in the interactor's local context after invocation. A key that
+  # is present with a nil value does not raise this error.
+  class MissingOutputError < StandardError
+  end
+
+  # Public: Error raised when an Interactor::Adapter is declared with more
+  # than one output mapped to the same parent context key. The error is
+  # raised when the adapter is declared, before any invocation.
+  class DuplicateOutputError < StandardError
+  end
 end

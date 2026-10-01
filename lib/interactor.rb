@@ -1,5 +1,6 @@
 require "interactor/context"
 require "interactor/error"
+require "interactor/adapter"
 require "interactor/hooks"
 require "interactor/organizer"
 
