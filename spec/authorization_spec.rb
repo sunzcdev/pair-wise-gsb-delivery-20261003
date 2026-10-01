@@ -120,6 +120,41 @@ RSpec.describe Pundit::Authorization do
     it "raises an error with a invalid policy constructor" do
       expect { controller.authorize(wiki, :destroy?) }.to raise_error(Pundit::InvalidConstructorError)
     end
+
+    it "lets an ArgumentError raised inside a valid policy constructor bubble up" do
+      expect do
+        controller.authorize(RaisesArgumentError.new, :show?)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error).not_to be_a(Pundit::InvalidConstructorError)
+        expect(error.backtrace.join("\n")).to include("raises_argument_error_policy.rb")
+      }
+    end
+
+    it "does not cache a policy whose constructor raised" do
+      RaisesArgumentErrorPolicy.attempts = 0
+
+      expect do
+        controller.authorize(RaisesArgumentError.new, :show?)
+      end.to raise_error(ArgumentError)
+
+      expect(controller.pundit_policies).to be_empty
+
+      expect do
+        controller.authorize(RaisesArgumentError.new, :show?)
+      end.to raise_error(ArgumentError)
+      expect(RaisesArgumentErrorPolicy.attempts).to eq(1)
+    end
+
+    it "does not call a mismatched explicit policy class constructor even once" do
+      BadArityPolicy.attempts = 0
+
+      expect do
+        controller.authorize(post, :show?, policy_class: BadArityPolicy)
+      end.to raise_error(Pundit::InvalidConstructorError, /#<BadArityPolicy>/)
+
+      expect(BadArityPolicy.attempts).to eq(0)
+      expect(controller.pundit_policies).to be_empty
+    end
   end
 
   describe "#skip_authorization" do
@@ -155,6 +190,22 @@ RSpec.describe Pundit::Authorization do
 
     it "raises an error with a invalid policy constructor" do
       expect { controller.policy(wiki) }.to raise_error(Pundit::InvalidConstructorError)
+    end
+
+    it "lets an ArgumentError raised inside a valid policy constructor bubble up" do
+      expect do
+        controller.policy(RaisesArgumentError.new)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error).not_to be_a(Pundit::InvalidConstructorError)
+      }
+    end
+
+    it "does not cache a policy whose constructor raised" do
+      expect do
+        controller.policy(RaisesArgumentError.new)
+      end.to raise_error(ArgumentError)
+
+      expect(controller.pundit_policies).to be_empty
     end
 
     it "allows policy to be injected" do
@@ -197,6 +248,20 @@ RSpec.describe Pundit::Authorization do
 
     it "raises an error with a invalid policy scope constructor" do
       expect { controller.policy_scope(Wiki) }.to raise_error(Pundit::InvalidConstructorError)
+    end
+
+    it "lets an ArgumentError raised inside a valid scope constructor bubble up" do
+      expect do
+        controller.policy_scope(RaisesArgumentError)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error).not_to be_a(Pundit::InvalidConstructorError)
+      }
+    end
+
+    it "raises an error with an invalid explicitly given scope constructor" do
+      expect do
+        controller.policy_scope(Post, policy_scope_class: WikiPolicy::Scope)
+      end.to raise_error(Pundit::InvalidConstructorError, /#<WikiPolicy::Scope>/)
     end
 
     it "allows policy_scope to be injected" do

@@ -175,7 +175,11 @@ module Pundit
     # @since v0.1.0
     def policy_scope(scope, policy_scope_class: nil)
       @_pundit_policy_scoped = true
-      policy_scope_class ? policy_scope_class.new(pundit_user, scope).resolve : pundit_policy_scope(scope)
+      if policy_scope_class
+        pundit.policy_scope!(scope, policy_scope_class: policy_scope_class)
+      else
+        pundit_policy_scope(scope)
+      end
     end
 
     # Allow this action not to perform policy scoping.

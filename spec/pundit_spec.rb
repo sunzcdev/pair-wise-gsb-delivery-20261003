@@ -100,7 +100,19 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy constructor" do
       expect do
         Pundit.authorize(user, wiki, :update?)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+      end.to raise_error(
+        Pundit::InvalidConstructorError,
+        "Invalid #<WikiPolicy> constructor is called: Pundit called WikiPolicy#initialize with 2 " \
+          "positional arguments and no keyword arguments, but the constructor accepts no parameters"
+      )
+    end
+
+    it "lets an ArgumentError raised inside a valid policy constructor bubble up" do
+      expect do
+        Pundit.authorize(user, RaisesArgumentError.new, :show?, policy_class: RaisesArgumentErrorPolicy)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error.backtrace.join("\n")).to include("raises_argument_error_policy.rb")
+      }
     end
 
     context "when passed a policy class" do
@@ -135,6 +147,16 @@ RSpec.describe Pundit do
         expect(custom_cache.to_h).to match({
           post => kind_of(PostPolicy)
         })
+      end
+
+      it "does not cache a policy whose constructor raised an ArgumentError" do
+        cache = {}
+
+        expect do
+          Pundit.authorize(user, RaisesArgumentError.new, :show?, cache: cache)
+        end.to raise_error(ArgumentError, /invalid value for Integer/)
+
+        expect(cache).to be_empty
       end
     end
   end
@@ -175,13 +197,25 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy scope constructor" do
       expect do
         Pundit.policy_scope(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called")
+      end.to raise_error(
+        Pundit::InvalidConstructorError,
+        "Invalid #<WikiPolicy::Scope> constructor is called: Pundit called WikiPolicy::Scope#initialize " \
+          "with 2 positional arguments and no keyword arguments, but the constructor accepts no parameters"
+      )
     end
 
     it "raises an original error with a policy scope that contains error" do
       expect do
         Pundit.policy_scope(user, DefaultScopeContainsError)
       end.to raise_error(RuntimeError, "This is an arbitrary error that should bubble up")
+    end
+
+    it "lets an ArgumentError raised inside a valid scope constructor bubble up" do
+      expect do
+        Pundit.policy_scope(user, RaisesArgumentError)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error.backtrace.join("\n")).to include("raises_argument_error_policy.rb")
+      }
     end
   end
 
@@ -218,8 +252,18 @@ RSpec.describe Pundit do
 
     it "raises an error with a invalid policy scope constructor" do
       expect do
-        Pundit.policy_scope(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy::Scope> constructor is called")
+        Pundit.policy_scope!(user, Wiki)
+      end.to raise_error(
+        Pundit::InvalidConstructorError,
+        "Invalid #<WikiPolicy::Scope> constructor is called: Pundit called WikiPolicy::Scope#initialize " \
+          "with 2 positional arguments and no keyword arguments, but the constructor accepts no parameters"
+      )
+    end
+
+    it "lets an ArgumentError raised inside a valid scope constructor bubble up" do
+      expect do
+        Pundit.policy_scope!(user, RaisesArgumentError)
+      end.to raise_error(ArgumentError, /invalid value for Integer/)
     end
   end
 
@@ -293,7 +337,26 @@ RSpec.describe Pundit do
     it "raises an error with a invalid policy constructor" do
       expect do
         Pundit.policy(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+      end.to raise_error(Pundit::InvalidConstructorError, /Invalid #<WikiPolicy> constructor is called/)
+    end
+
+    it "does not wrap an ArgumentError raised inside a valid policy constructor" do
+      expect do
+        Pundit.policy(user, RaisesArgumentError.new)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error).not_to be_a(Pundit::InvalidConstructorError)
+        expect(error.backtrace.join("\n")).to include("raises_argument_error_policy.rb")
+      }
+    end
+
+    it "does not call a mismatched constructor even once" do
+      BadArityPolicy.attempts = 0
+
+      expect do
+        Pundit.policy(user, BadArity.new)
+      end.to raise_error(Pundit::InvalidConstructorError)
+
+      expect(BadArityPolicy.attempts).to eq(0)
     end
 
     it "returns an instantiated policy given an array of a symbol and an active model class" do
@@ -441,8 +504,16 @@ RSpec.describe Pundit do
 
     it "raises an error with a invalid policy constructor" do
       expect do
-        Pundit.policy(user, Wiki)
-      end.to raise_error(Pundit::InvalidConstructorError, "Invalid #<WikiPolicy> constructor is called")
+        Pundit.policy!(user, Wiki)
+      end.to raise_error(Pundit::InvalidConstructorError, /Invalid #<WikiPolicy> constructor is called/)
+    end
+
+    it "does not wrap an ArgumentError raised inside a valid policy constructor" do
+      expect do
+        Pundit.policy!(user, RaisesArgumentError.new)
+      end.to raise_error(ArgumentError, /invalid value for Integer/) { |error|
+        expect(error).not_to be_a(Pundit::InvalidConstructorError)
+      }
     end
   end
 

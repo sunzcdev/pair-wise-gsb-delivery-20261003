@@ -10,6 +10,7 @@
 ### Fixed
 - Update for rspec 4 breaking changes [#873](https://github.com/varvet/pundit/issues/873)
 - `Pundit::PolicyFinder` no longer depends on `action_controller` having loaded `String#blank?` [#884](https://github.com/varvet/pundit/pull/884)
+- `InvalidConstructorError` is now only raised when the policy or policy scope constructor signature genuinely does not accept Pundit's `(user, record)` arguments. An `ArgumentError` raised from inside a correctly defined constructor (e.g. from `Integer("bad")`) now propagates with its original class, message and backtrace, and failed instantiations are never cached.
 
 ## 2.5.2 (2025-09-24)
 

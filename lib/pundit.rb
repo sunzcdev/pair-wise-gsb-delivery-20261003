@@ -4,6 +4,7 @@ require "active_support"
 
 require "pundit/version"
 require "pundit/error"
+require "pundit/constructor_signature"
 require "pundit/policy_finder"
 require "pundit/context"
 require "pundit/authorization"

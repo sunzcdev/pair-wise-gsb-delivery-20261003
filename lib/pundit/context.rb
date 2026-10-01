@@ -62,7 +62,7 @@ module Pundit
     def authorize(possibly_namespaced_record, query:, policy_class:)
       record = pundit_model(possibly_namespaced_record)
       policy = if policy_class
-        policy_class.new(user, record)
+        instantiate(policy_class, record)
       else
         policy!(possibly_namespaced_record)
       end
@@ -110,33 +110,22 @@ module Pundit
       policy_scope_class = policy_finder(scope).scope
       return unless policy_scope_class
 
-      begin
-        policy_scope = policy_scope_class.new(user, pundit_model(scope))
-      rescue ArgumentError
-        raise InvalidConstructorError, "Invalid #<#{policy_scope_class}> constructor is called"
-      end
-
-      policy_scope.resolve
+      instantiate(policy_scope_class, pundit_model(scope)).resolve
     end
 
     # Retrieves the policy scope for the given record. Raises if not found.
     #
     # @see https://github.com/varvet/pundit#scopes
     # @param scope [Object] the object we're retrieving the policy scope for
+    # @param policy_scope_class [Class] the policy scope class we want to force use of
     # @raise [NotDefinedError] if the policy scope cannot be found
     # @raise [InvalidConstructorError] if the policy constructor called incorrectly
     # @return [Scope{#resolve}] instance of scope class which can resolve to a scope
     # @since v2.3.2
-    def policy_scope!(scope)
-      policy_scope_class = policy_finder(scope).scope!
+    def policy_scope!(scope, policy_scope_class: nil)
+      policy_scope_class ||= policy_finder(scope).scope!
 
-      begin
-        policy_scope = policy_scope_class.new(user, pundit_model(scope))
-      rescue ArgumentError
-        raise InvalidConstructorError, "Invalid #<#{policy_scope_class}> constructor is called"
-      end
-
-      policy_scope.resolve
+      instantiate(policy_scope_class, pundit_model(scope)).resolve
     end
 
     # @!endgroup
@@ -162,12 +151,25 @@ module Pundit
 
         model = pundit_model(record)
 
-        begin
-          klass.new(user, model)
-        rescue ArgumentError
-          raise InvalidConstructorError, "Invalid #<#{klass}> constructor is called"
-        end
+        instantiate(klass, model)
       end
+    end
+
+    # Verifies that the constructor accepts Pundit's calling convention
+    # before invoking it. Any error raised from inside a correctly defined
+    # constructor is allowed to propagate untouched, preserving its class,
+    # message and backtrace.
+    #
+    # @api private
+    # @param klass [Class] the policy or scope class to instantiate
+    # @param record [Object] the record the policy is for
+    # @return [Object] the instantiated policy or scope
+    # @raise [InvalidConstructorError] if the constructor cannot be called
+    #   with `(user, record)`
+    # @since v2.5.3
+    def instantiate(klass, record)
+      ConstructorSignature.verify!(klass)
+      klass.new(user, record)
     end
 
     # Return a policy finder for the given record.
