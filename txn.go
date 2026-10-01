@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	iradix "github.com/hashicorp/go-immutable-radix"
+	iradix "github.com/hashicorp/go-memdb/internal/iradix"
 )
 
 const (
@@ -615,6 +615,102 @@ func (txn *Txn) First(table, index string, args ...interface{}) (interface{}, er
 func (txn *Txn) Last(table, index string, args ...interface{}) (interface{}, error) {
 	_, val, err := txn.LastWatch(table, index, args...)
 	return val, err
+}
+
+// Rank returns the 0-based rank of the given object within the ordering of
+// the named index. The rank is the number of index entries that sort before
+// the object, so the object with the smallest index value has rank 0.
+//
+// Entries with equal index values are ordered by their primary key, giving
+// every object a distinct, stable rank. The index does not need to be unique,
+// but it must be a SingleIndexer. If the object is not present in the index,
+// the rank it would occupy is returned.
+//
+// Rank runs in time proportional to the depth of the index, not the rank
+// itself, and is consistent with Select: Select(Rank(obj)) returns obj.
+//
+// Note that all values read in the transaction form a consistent snapshot
+// from the time when the transaction was created, so ranks observed within a
+// transaction never drift as other transactions commit writes.
+func (txn *Txn) Rank(table, index string, obj interface{}) (int, error) {
+	// Get the table schema
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return 0, fmt.Errorf("invalid table '%s'", table)
+	}
+
+	// Get the index schema
+	indexSchema, ok := tableSchema.Indexes[index]
+	if !ok {
+		return 0, fmt.Errorf("invalid index '%s'", index)
+	}
+
+	// Get the primary ID of the object, used to break ties between
+	// duplicate index values in non-unique indexes.
+	idSchema := tableSchema.Indexes[id]
+	idIndexer := idSchema.Indexer.(SingleIndexer)
+	ok, idVal, err := idIndexer.FromObject(obj)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build primary index: %v", err)
+	}
+	if !ok {
+		return 0, fmt.Errorf("object missing primary index")
+	}
+
+	// Build the index key for the object
+	indexer, ok := indexSchema.Indexer.(SingleIndexer)
+	if !ok {
+		return 0, fmt.Errorf("index '%s' does not support ranking multi-value indexes", index)
+	}
+	ok, val, err := indexer.FromObject(obj)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build index '%s': %v", index, err)
+	}
+	if !ok {
+		return 0, fmt.Errorf("missing value for index '%s'", index)
+	}
+
+	// Handle non-unique index by computing the unique index key, which
+	// appends the primary key exactly as Insert does.
+	if !indexSchema.Unique {
+		val = append(val, idVal...)
+	}
+
+	// Look up the rank within the index snapshot
+	indexTxn := txn.readableIndex(table, index)
+	return indexTxn.Root().Rank(val), nil
+}
+
+// Select returns the object stored at the given 0-based rank within the
+// ordering of the named index. Rank 0 is the object with the smallest index
+// value. Entries with equal index values are ordered by their primary key.
+//
+// Select runs in time proportional to the depth of the index, not the rank
+// itself, and is consistent with Rank: Select(Rank(obj)) returns obj.
+// ErrNotFound is returned if the rank is out of range.
+//
+// Note that all values read in the transaction form a consistent snapshot
+// from the time when the transaction was created, so entries observed within
+// a transaction never drift as other transactions commit writes.
+func (txn *Txn) Select(table, index string, rank int) (interface{}, error) {
+	// Get the table schema
+	tableSchema, ok := txn.db.schema.Tables[table]
+	if !ok {
+		return nil, fmt.Errorf("invalid table '%s'", table)
+	}
+
+	// Get the index schema
+	if _, ok := tableSchema.Indexes[index]; !ok {
+		return nil, fmt.Errorf("invalid index '%s'", index)
+	}
+
+	// Look up the entry at the given rank within the index snapshot
+	indexTxn := txn.readableIndex(table, index)
+	_, obj, ok := indexTxn.Root().Select(rank)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return obj, nil
 }
 
 // LongestPrefix is used to fetch the longest prefix match for the given

@@ -27,7 +27,15 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
-For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
+* Rank/Select - Indexes support order-statistics queries: `Txn.Rank` returns an
+  object's position in the index ordering (ties broken by primary key), and
+  `Txn.Select` returns the object at a given position. Both are answered in
+  time proportional to the index depth, not the position, and remain stable
+  within a read transaction.
+
+The underlying immutable radix tree is vendored in `internal/iradix`, a fork of
+[go-immutable-radix](https://github.com/hashicorp/go-immutable-radix) extended
+with subtree-size tracking to support Rank/Select.
 
 Documentation
 =============
