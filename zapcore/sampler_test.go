@@ -327,3 +327,183 @@ func TestSamplerWithZeroThereafter(t *testing.T) {
 	assert.Equal(t, 4, int(counter.logs.Load()),
 		"Unexpected number of logs")
 }
+
+func writeEntry(core Core, ent Entry, fields ...Field) {
+	if ce := core.Check(ent, nil); ce != nil {
+		ce.Write(fields...)
+	}
+}
+
+func makeStringField(key, val string) Field {
+	return Field{Key: key, Type: StringType, String: val}
+}
+
+func makeObjectField(key string, val ObjectMarshaler) Field {
+	return Field{Key: key, Type: ObjectMarshalerType, Interface: val}
+}
+
+func TestSamplerKeysWithBoundFields(t *testing.T) {
+	core, logs := observer.New(DebugLevel)
+	hook, dropped, sampled := makeSamplerCountingHook()
+	sampler := NewSamplerWithOptions(core, time.Minute, 2, 0,
+		SamplerKeys("tenant"),
+		SamplerHook(hook),
+	)
+
+	// Both tenants log the same message, but the big tenant shouts far
+	// more often. Keying on the tenant field keeps it from consuming the
+	// small tenant's sampling budget.
+	big := sampler.With([]Field{makeStringField("tenant", "big")})
+	small := sampler.With([]Field{makeStringField("tenant", "small")})
+
+	ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+	for i := 0; i < 100; i++ {
+		writeEntry(big, ent)
+	}
+	for i := 0; i < 5; i++ {
+		writeEntry(small, ent)
+	}
+
+	assert.Equal(t, 2, logs.FilterField(makeStringField("tenant", "big")).Len(),
+		"Unexpected number of logs for the big tenant.")
+	assert.Equal(t, 2, logs.FilterField(makeStringField("tenant", "small")).Len(),
+		"Unexpected number of logs for the small tenant.")
+	assert.Equal(t, int64(4), sampled.Load(), "Unexpected number of sampled logs.")
+	assert.Equal(t, int64(101), dropped.Load(), "Unexpected number of dropped logs.")
+}
+
+func TestSamplerKeysCallFields(t *testing.T) {
+	core, logs := observer.New(DebugLevel)
+	sampler := NewSamplerWithOptions(core, time.Minute, 1, 0, SamplerKeys("tenant"))
+
+	ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+	for i := 0; i < 10; i++ {
+		writeEntry(sampler, ent, makeStringField("tenant", "big"))
+	}
+	for i := 0; i < 10; i++ {
+		writeEntry(sampler, ent, makeStringField("tenant", "small"))
+	}
+
+	assert.Equal(t, 1, logs.FilterField(makeStringField("tenant", "big")).Len(),
+		"Unexpected number of logs for the big tenant.")
+	assert.Equal(t, 1, logs.FilterField(makeStringField("tenant", "small")).Len(),
+		"Unexpected number of logs for the small tenant.")
+}
+
+func TestSamplerKeysWithAndCallFields(t *testing.T) {
+	core, logs := observer.New(DebugLevel)
+	sampler := NewSamplerWithOptions(core, time.Minute, 1, 0,
+		SamplerKeys("tenant", "op"))
+
+	// Fields bound with With and fields passed to the logging call jointly
+	// determine the sampling key.
+	tenant := sampler.With([]Field{makeStringField("tenant", "a")})
+
+	ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+	for i := 0; i < 5; i++ {
+		writeEntry(tenant, ent, makeStringField("op", "read"))
+	}
+	for i := 0; i < 5; i++ {
+		writeEntry(tenant, ent, makeStringField("op", "write"))
+	}
+
+	assert.Equal(t, 1, logs.FilterField(makeStringField("op", "read")).Len(),
+		"Unexpected number of read logs.")
+	assert.Equal(t, 1, logs.FilterField(makeStringField("op", "write")).Len(),
+		"Unexpected number of write logs.")
+}
+
+// countingMarshaler is an ObjectMarshaler that records how many times it was
+// evaluated.
+type countingMarshaler struct {
+	calls *atomic.Int64
+	id    string
+}
+
+func (m countingMarshaler) MarshalLogObject(enc ObjectEncoder) error {
+	m.calls.Add(1)
+	enc.AddString("id", m.id)
+	return nil
+}
+
+// encodingCore encodes every field of every entry it writes, like a real
+// encoder-backed core would.
+type encodingCore struct {
+	LevelEnabler
+	writes atomic.Int64
+}
+
+func (c *encodingCore) With([]Field) Core { return c }
+func (c *encodingCore) Sync() error       { return nil }
+
+func (c *encodingCore) Check(ent Entry, ce *CheckedEntry) *CheckedEntry {
+	if c.Enabled(ent.Level) {
+		return ce.AddCore(ent, c)
+	}
+	return ce
+}
+
+func (c *encodingCore) Write(_ Entry, fields []Field) error {
+	enc := NewMapObjectEncoder()
+	for _, f := range fields {
+		f.AddTo(enc)
+	}
+	c.writes.Add(1)
+	return nil
+}
+
+func TestSamplerKeysDroppedEntriesSkipNonKeyFields(t *testing.T) {
+	var keyCalls, expensiveCalls atomic.Int64
+
+	core := &encodingCore{LevelEnabler: DebugLevel}
+	// Sample nothing: every entry is dropped after the key is computed.
+	sampler := NewSamplerWithOptions(core, time.Minute, 0, 0, SamplerKeys("tenant"))
+
+	ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+	for i := 0; i < 5; i++ {
+		writeEntry(sampler, ent,
+			makeObjectField("tenant", countingMarshaler{calls: &keyCalls, id: "a"}),
+			makeObjectField("expensive", countingMarshaler{calls: &expensiveCalls}),
+		)
+	}
+
+	assert.Equal(t, int64(5), keyCalls.Load(),
+		"Key marshaler should be evaluated exactly once per entry.")
+	assert.Equal(t, int64(0), expensiveCalls.Load(),
+		"Non-key marshaler should not be evaluated for dropped entries.")
+	assert.Equal(t, int64(0), core.writes.Load(),
+		"No entries should reach the wrapped core.")
+}
+
+func TestSamplerKeysWithMarshalerEvaluatedOnce(t *testing.T) {
+	var keyCalls atomic.Int64
+
+	core := &encodingCore{LevelEnabler: DebugLevel}
+	sampler := NewSamplerWithOptions(core, time.Minute, 1, 0, SamplerKeys("tenant"))
+	tenant := sampler.With([]Field{
+		makeObjectField("tenant", countingMarshaler{calls: &keyCalls, id: "a"}),
+	})
+
+	ent := Entry{Level: InfoLevel, Message: "boom", Time: time.Now()}
+	for i := 0; i < 10; i++ {
+		writeEntry(tenant, ent)
+	}
+
+	assert.Equal(t, int64(1), keyCalls.Load(),
+		"With-bound key marshaler should be evaluated exactly once.")
+	assert.Equal(t, int64(1), core.writes.Load(),
+		"Only the first entry should be sampled.")
+}
+
+func TestSamplerKeysUnknownLevels(t *testing.T) {
+	// Out-of-bounds levels bypass sampling, even with key fields configured.
+	core, logs := observer.New(DebugLevel)
+	sampler := NewSamplerWithOptions(core, time.Minute, 1, 0, SamplerKeys("tenant"))
+
+	ent := Entry{Level: FatalLevel + 1, Message: "boom", Time: time.Now()}
+	for i := 0; i < 5; i++ {
+		writeEntry(sampler, ent, makeStringField("tenant", "big"))
+	}
+
+	assert.Equal(t, 5, logs.Len(), "Unknown levels should not be sampled.")
+}

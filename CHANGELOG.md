@@ -3,6 +3,13 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+Enhancements:
+* Add `zapcore.SamplerKeys`, a `SamplerOption` that includes the values of
+  selected structured fields in the sampling key, so that entries with the
+  same message are sampled per field value (e.g., per tenant) instead of
+  sharing a single budget.
+
 ## 1.28.0 (27 Apr 2026)
 Enhancements:
 * [#1534][]: Add `zapcore.CheckPreWriteHook` and `CheckedEntry.Before` method for transforming entries before they are written to any Cores.
