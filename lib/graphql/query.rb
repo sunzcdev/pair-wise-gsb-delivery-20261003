@@ -132,8 +132,9 @@ module GraphQL
     # @param root_value [Object] the object used to resolve fields on the root type
     # @param max_depth [Numeric] the maximum number of nested selections allowed for this query (falls back to schema-level value)
     # @param max_complexity [Numeric] the maximum field complexity for this query (falls back to schema-level value)
+    # @param max_width [Numeric] the maximum number of distinct response keys a single response object may contain (falls back to schema-level value)
     # @param visibility_profile [Symbol] Another way to assign `context[:visibility_profile]`
-    def initialize(schema, query_string = nil, query: nil, document: nil, context: nil, variables: nil, multiplex: nil, validate: true, static_validator: nil, visibility_profile: nil, subscription_topic: nil, operation_name: nil, root_value: nil, max_depth: schema.max_depth, max_complexity: schema.max_complexity, warden: nil, use_visibility_profile: nil)
+    def initialize(schema, query_string = nil, query: nil, document: nil, context: nil, variables: nil, multiplex: nil, validate: true, static_validator: nil, visibility_profile: nil, subscription_topic: nil, operation_name: nil, root_value: nil, max_depth: schema.max_depth, max_complexity: schema.max_complexity, max_width: schema.max_width, warden: nil, use_visibility_profile: nil)
       # Even if `variables: nil` is passed, use an empty hash for simpler logic
       variables ||= {}
       @multiplex = multiplex
@@ -204,6 +205,7 @@ module GraphQL
       @validation_pipeline = nil
       @max_depth = max_depth
       @max_complexity = max_complexity
+      @max_width = max_width
 
       @result_values = nil
       @executed = false
@@ -367,7 +369,7 @@ module GraphQL
     end
 
     def_delegators :validation_pipeline, :validation_errors,
-                   :analyzers, :ast_analyzers, :max_depth, :max_complexity, :validate_timeout_remaining
+                   :analyzers, :ast_analyzers, :max_depth, :max_complexity, :max_width, :validate_timeout_remaining
 
     attr_accessor :analysis_errors
     def valid?
@@ -511,7 +513,8 @@ module GraphQL
         parse_error: parse_error,
         operation_name_error: operation_name_error,
         max_depth: @max_depth,
-        max_complexity: @max_complexity
+        max_complexity: @max_complexity,
+        max_width: @max_width
       )
     end
 

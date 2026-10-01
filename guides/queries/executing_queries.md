@@ -42,7 +42,7 @@ There are also several options you can use:
 - `operation_name:` picks a [named operation](https://graphql.org/learn/queries/#operation-type-and-name) from the incoming string to execute
 - `document:` accepts an already-parsed query (instead of a string), see {{ "GraphQL.parse" | api_doc }}
 - `validate:` may be `false` to skip static validation for this query
-- `max_depth:` and `max_complexity:` may override schema-level values
+- `max_depth:`, `max_complexity:`, and `max_width:` may override schema-level values
 
 Some of these options are described in more detail below, see {{ "GraphQL::Query#initialize" | api_doc }} for more information.
 

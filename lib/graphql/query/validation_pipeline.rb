@@ -14,9 +14,9 @@ module GraphQL
     #
     # @api private
     class ValidationPipeline
-      attr_reader :max_depth, :max_complexity, :validate_timeout_remaining
+      attr_reader :max_depth, :max_complexity, :max_width, :validate_timeout_remaining
 
-      def initialize(query:, parse_error:, operation_name_error:, max_depth:, max_complexity:)
+      def initialize(query:, parse_error:, operation_name_error:, max_depth:, max_complexity:, max_width:)
         @validation_errors = []
         @parse_error = parse_error
         @operation_name_error = operation_name_error
@@ -24,6 +24,7 @@ module GraphQL
         @schema = query.schema
         @max_depth = max_depth
         @max_complexity = max_complexity
+        @max_width = max_width
 
         @has_validated = false
       end
@@ -80,7 +81,8 @@ module GraphQL
             @query_analyzers = build_analyzers(
               @schema,
               @max_depth,
-              @max_complexity
+              @max_complexity,
+              @max_width
             )
           end
         end
@@ -93,10 +95,10 @@ module GraphQL
 
       # If there are max_* values, add them,
       # otherwise reuse the schema's list of analyzers.
-      def build_analyzers(schema, max_depth, max_complexity)
+      def build_analyzers(schema, max_depth, max_complexity, max_width)
         qa = schema.query_analyzers.dup
 
-        if max_depth || max_complexity
+        if max_depth || max_complexity || max_width
           # Depending on the analysis engine, we must use different analyzers
           # remove this once everything has switched over to AST analyzers
           if max_depth
@@ -104,6 +106,9 @@ module GraphQL
           end
           if max_complexity
             qa << GraphQL::Analysis::MaxQueryComplexity
+          end
+          if max_width
+            qa << GraphQL::Analysis::MaxQueryWidth
           end
           qa
         else

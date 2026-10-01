@@ -50,8 +50,65 @@ class MySchema < GraphQL::Schema
 end
 ```
 
-## Prevent complex queries
+## Prevent overly-wide queries
 
+A query doesn't have to be deeply nested to put a lot of work on the server: with aliases, a shallow query can request thousands of keys on a single response object. `max_width` limits the number of _distinct response keys_ that may appear in any one object of the response:
+
+```ruby
+# Schema-level:
+class MySchema < GraphQL::Schema
+  # ...
+  max_width 100
+end
+
+# Query-level, which overrides the schema-level setting:
+MySchema.execute(query_string, max_width: 100)
+```
+
+The limit counts keys that could really appear in the response at the same time, rather than field nodes in the AST:
+
+- Selections with the same response key are merged and counted once — including the same fragment spread many times. A query that repeats `...Fields` three thousand times but only selects `id` and `name` has width `2`.
+- On abstract types, mutually exclusive type branches (different members of a union, or non-overlapping object types) are considered separately, and only the _widest reachable_ branch counts.
+- Fields removed by `@skip`/`@include` using the query's known variables are not counted.
+
+So these two queries are treated very differently, even though each contains thousands of field nodes:
+
+```graphql
+# Narrow: the same two keys, repeated via many fragments -> width 2
+{
+  cheese(id: 1) {
+    ...F0 ...F1 ...   # each fragment selects { id name }
+  }
+}
+
+# Wide: thousands of genuinely different aliases -> width 3000
+{
+  c1: cheese(id: 1) { id }
+  c2: cheese(id: 2) { id }
+  # ...
+}
+```
+
+When a query exceeds the limit, the error reports the response path, the measured width, and the concrete object type at which the limit was exceeded. Like `max_depth`, validation happens during query analysis, before any resolvers run.
+
+To inspect widths without rejecting queries, extend {{ "GraphQL::Analysis::QueryWidth" | api_doc }}:
+
+```ruby
+class LogQueryWidth < GraphQL::Analysis::QueryWidth
+  def result
+    width = super
+    Rails.logger.info("[GraphQL Query Width] #{width}")
+  end
+end
+
+class MySchema < GraphQL::Schema
+  query_analyzer(LogQueryWidth)
+end
+```
+
+By default, **introspection fields are counted**. This shares the `max_depth ..., count_introspection_fields: false` configuration.
+
+## Prevent complex queries
 Fields have a "complexity" value which can be configured in their definition. It can be a constant (numeric) value, or a proc. If no `complexity` is defined for a field, it will default to a value of `1`. It can be defined as a keyword _or_ inside the configuration block. For example:
 
 ```ruby

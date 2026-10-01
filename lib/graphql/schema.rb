@@ -60,7 +60,8 @@ module GraphQL
   # The schema will traverse the tree of fields & types, using those as starting points.
   # Any undiscoverable types may be provided with the `types` configuration.
   #
-  # Schemas can restrict large incoming queries with `max_depth` and `max_complexity` configurations.
+  # Schemas can restrict large incoming queries with `max_depth`, `max_complexity`,
+  # and `max_width` configurations.
   # (These configurations can be overridden by specific calls to {Schema.execute})
   #
   # @example defining a schema
@@ -947,6 +948,17 @@ module GraphQL
           @count_introspection_fields
         else
           find_inherited_value(:count_introspection_fields, true)
+        end
+      end
+
+      attr_writer :max_width
+
+      # @return [Integer, nil] The maximum number of distinct response keys that may appear in a single response object
+      def max_width(new_max_width = NOT_CONFIGURED)
+        if NOT_CONFIGURED.equal?(new_max_width)
+          defined?(@max_width) ? @max_width : find_inherited_value(:max_width)
+        else
+          @max_width = new_max_width
         end
       end
 
