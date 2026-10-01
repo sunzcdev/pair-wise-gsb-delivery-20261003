@@ -2,6 +2,7 @@
 
 ## unreleased
 * typo fixes, thanks @kumar-mithlesh [#870](https://github.com/aasm/aasm/pull/870)
+* Add `aasm.availability`, a single-pass inspection returning permitted events, permitted transitions and rejection reasons, with each guard invoked at most once per inspection
 
 ## 6.0.0 (5 July 2026)
 * Let `whiny_persistence: true` be the default now [#378](https://github.com/aasm/aasm/pull/378)

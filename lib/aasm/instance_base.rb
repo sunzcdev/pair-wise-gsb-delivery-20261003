@@ -88,6 +88,64 @@ module AASM
       end
     end
 
+    # Inspect which events and transitions are currently allowed in a single
+    # pass. Unlike combining +events(permitted: true)+,
+    # +states(permitted: true)+ and +permitted_transitions+ (which re-run
+    # guards independently), every guard is evaluated at most once per call:
+    # a guard shared by several candidate transitions (including event level
+    # guards attached to every transition of an event) is invoked once and
+    # its result is reused for the remaining candidates.
+    #
+    # The returned AASM::Availability is a point-in-time snapshot. It never
+    # executes transitions or state callbacks, and it is not used as an
+    # authorization cache for later event calls: when the object changes,
+    # guards are evaluated again on the next call (or on the actual fire).
+    def availability(*args)
+      evaluator = AASM::Core::GuardEvaluator.new(@instance, @name, args)
+
+      allowed_events = []
+      allowed_transitions = []
+      rejections = []
+      candidates = []
+
+      events.each do |event|
+        event_allowed = false
+
+        event.transitions_from_state(current_state).each do |transition|
+          evaluation = evaluator.evaluate(transition)
+
+          candidate = {
+            :event => event.name,
+            :state => transition.to,
+            :transition => transition,
+            :allowed => evaluation[:allowed],
+            :checks => evaluation[:checks]
+          }
+          candidates << candidate
+
+          if evaluation[:allowed]
+            event_allowed = true
+            allowed_transitions << {
+              :event => event.name,
+              :state => transition.to,
+              :transition => transition
+            }
+          else
+            rejections << build_rejection(event, transition, evaluation)
+          end
+        end
+
+        allowed_events << event if event_allowed
+      end
+
+      AASM::Availability.new(
+        :events => allowed_events,
+        :transitions => allowed_transitions,
+        :rejections => rejections,
+        :candidates => candidates
+      )
+    end
+
     def state_object_for_name(name)
       obj = @instance.class.aasm(@name).states.find {|s| s.name == name}
       raise AASM::UndefinedState, "State :#{name} doesn't exist" if obj.nil?
@@ -131,6 +189,27 @@ module AASM
     end
 
     private
+
+    def build_rejection(event, transition, evaluation)
+      first_failure = evaluation[:checks].find do |check|
+        check[:status] != :skipped &&
+          (check[:branch] == :guard ? !check[:result] : !!check[:result])
+      end
+
+      {
+        :event => event.name,
+        :from => transition.from || current_state,
+        :state => transition.to,
+        :transition => transition,
+        :reason => first_failure ? failure_reason(first_failure) : nil,
+        :guard => first_failure ? first_failure[:subject] : nil,
+        :checks => evaluation[:checks]
+      }
+    end
+
+    def failure_reason(check)
+      AASM::Core::GuardEvaluator.failure_identifier(check[:subject])
+    end
 
     def event_method_name(event_name)
       config = @instance.class.aasm(@name).state_machine.config

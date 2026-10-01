@@ -1269,6 +1269,53 @@ Job.aasm.states_for_select
 job.aasm.states({permitted: true}, guard_parameter).map(&:name)
 ```
 
+#### Single availability inspection
+
+`events(permitted: true)`, `states(permitted: true)` and
+`permitted_transitions` each run the guards independently. When a guard keeps
+a counter or reads external state, the resulting lists can disagree and the
+guards run more than once. `availability` performs one inspection and returns
+the permitted events, permitted transitions and rejection reasons together:
+
+```ruby
+result = job.aasm.availability
+
+result.events               #=> [#<AASM::Core::Event @name=:run>]
+result.permitted_events     #=> [:run]
+result.permitted_transitions #=> [{ event: :run, state: :running }]
+result.transitions          #=> same hashes, plus the transition object
+
+# one entry per rejected candidate transition
+result.rejections.each do |rejection|
+  rejection[:event]  # :clean
+  rejection[:state]  # :cleaning
+  rejection[:reason] # :cleaning_needed? (the first failing guard)
+  rejection[:guard]  # the original guard subject (symbol, proc or class)
+  rejection[:checks] # ordered guard evaluation report
+end
+```
+
+Each entry in `checks` contains the guard `subject`, the `branch` (`:guard`
+or `:unless`), the raw `result` and one of the following statuses:
+
+* `:invoked` - the guard ran during this inspection
+* `:reused` - the guard already ran in this inspection (for example an event
+  level guard shared by several candidate transitions); its result was reused
+* `:skipped` - short-circuiting prevented the guard from running; the result
+  is `:not_evaluated`, never a fabricated `false`
+
+Guards run in definition order (`:guard`/`:guards`/`:if` first, then
+`:unless`), short-circuiting on the first failure. The inspection never fires
+transitions or state callbacks. Arguments are forwarded just like for the
+other query methods: `job.aasm.states({permitted: true}, argument)`,
+`job.aasm.availability(argument)`.
+
+The result is a point-in-time snapshot for display only. It is not cached and
+does not authorize a later `event`/`event!` call: after the object changes,
+call `availability` again (the actual event still re-runs the guards).
+Inspecting a named state machine works through
+`job.aasm(:machine_name).availability`.
+
 
 ### Warning output
 

@@ -7,6 +7,14 @@ module AASM::Core
     attr_reader :from, :to, :event, :opts, :failures
     alias_method :options, :opts
 
+    def guards
+      @guards
+    end
+
+    def unless_guards
+      @unless
+    end
+
     def initialize(event, opts, &block)
       add_options_from_dsl(opts, [:on_transition, :guard, :after, :success], &block) if block
 
