@@ -967,6 +967,42 @@ world`},
 				},
 			},
 		},
+		{
+			`fn f(x) { x + 1 }; f(2)`,
+			&FunctionDeclaratorNode{
+				Name:   "f",
+				Params: []string{"x"},
+				Body: &BinaryNode{
+					Operator: "+",
+					Left:     &IdentifierNode{Value: "x"},
+					Right:    &IntegerNode{Value: 1},
+				},
+				Expr: &CallNode{
+					Callee:    &IdentifierNode{Value: "f"},
+					Arguments: []Node{&IntegerNode{Value: 2}},
+				},
+			},
+		},
+		{
+			`fn f() { 1 }; fn g(a, b) { a }; g(f(), 2)`,
+			&FunctionDeclaratorNode{
+				Name:   "f",
+				Params: []string{},
+				Body:   &IntegerNode{Value: 1},
+				Expr: &FunctionDeclaratorNode{
+					Name:   "g",
+					Params: []string{"a", "b"},
+					Body:   &IdentifierNode{Value: "a"},
+					Expr: &CallNode{
+						Callee: &IdentifierNode{Value: "g"},
+						Arguments: []Node{
+							&CallNode{Callee: &IdentifierNode{Value: "f"}},
+							&IntegerNode{Value: 2},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

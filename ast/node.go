@@ -224,6 +224,22 @@ type VariableDeclaratorNode struct {
 	Expr  Node   // Expression of the variable. Like "foo + 1" in "let foo = 1; foo + 1".
 }
 
+// FunctionDeclaratorNode represents a local function declaration.
+// Example:
+//
+//	fn fee(x) { x * 2 }; fee(21)
+//
+// Consecutive function declarations form a single recursive group:
+// every function in the group can reference itself and the other
+// functions of the group (mutual recursion).
+type FunctionDeclaratorNode struct {
+	base
+	Name   string   // Name of the function. Like "fee" in "fn fee(x) { x * 2 }; fee(21)".
+	Params []string // Names of the parameters. Like ["x"] in "fn fee(x) { x * 2 }; fee(21)".
+	Body   Node     // Body of the function. Like "x * 2" in "fn fee(x) { x * 2 }; fee(21)".
+	Expr   Node     // Expression following the declaration. Like "fee(21)" in "fn fee(x) { x * 2 }; fee(21)".
+}
+
 // SequenceNode represents a sequence of nodes separated by semicolons.
 // All nodes are executed, only the last node will be returned.
 type SequenceNode struct {

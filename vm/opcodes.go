@@ -86,5 +86,10 @@ const (
 	OpBegin
 	OpAnd
 	OpOr
+	OpLoadLocal
+	OpStoreLocal
+	OpCallLocal
+	OpTailCallLocal
+	OpReturn
 	OpEnd // This opcode must be at the end of this list.
 )

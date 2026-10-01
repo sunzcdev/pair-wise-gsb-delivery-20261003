@@ -78,6 +78,12 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 		c.debugInfo,
 		span,
 	)
+	if len(c.localFunctions) > 0 {
+		program.LocalFunctions = c.localFunctions
+	}
+	if config != nil && config.CallBudget > 0 {
+		program.CallBudget = config.CallBudget
+	}
 	return
 }
 
@@ -97,11 +103,21 @@ type compiler struct {
 	spans          []*Span
 	chains         [][]int
 	arguments      []int
+	localFunctions []LocalFunction
+	fnScopes       []map[string]int
+	fnContexts     []fnContext
 }
 
 type scope struct {
 	variableName string
 	index        int
+	local        bool
+	fnDepth      int
+}
+
+// fnContext tracks compilation state of a single local function body.
+type fnContext struct {
+	nextVar int // Next frame-local variable slot (params come first).
 }
 
 func (c *compiler) nodeParent() ast.Node {
@@ -278,6 +294,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.PointerNode(n)
 	case *ast.VariableDeclaratorNode:
 		c.VariableDeclaratorNode(n)
+	case *ast.FunctionDeclaratorNode:
+		c.FunctionDeclaratorNode(n)
 	case *ast.SequenceNode:
 		c.SequenceNode(n)
 	case *ast.ConditionalNode:
@@ -298,9 +316,21 @@ func (c *compiler) NilNode(_ *ast.NilNode) {
 }
 
 func (c *compiler) IdentifierNode(node *ast.IdentifierNode) {
-	if index, ok := c.lookupVariable(node.Value); ok {
-		c.emit(OpLoadVar, index)
-		return
+	if s, ok := c.lookupVariable(node.Value); ok {
+		if s.local {
+			if s.fnDepth == len(c.fnContexts) {
+				c.emit(OpLoadLocal, s.index)
+				return
+			}
+			// The variable belongs to an enclosing function and cannot be
+			// captured; fall through to resolve it from the environment.
+		} else {
+			c.emit(OpLoadVar, s.index)
+			return
+		}
+	}
+	if _, ok := c.lookupFunction(node.Value); ok {
+		panic(fmt.Sprintf("local function %s can only be used as a callee of a direct call", node.Value))
 	}
 	if node.Value == "$env" {
 		c.emit(OpLoadEnv)
@@ -776,6 +806,15 @@ func (c *compiler) SliceNode(node *ast.SliceNode) {
 }
 
 func (c *compiler) CallNode(node *ast.CallNode) {
+	if ident, ok := node.Callee.(*ast.IdentifierNode); ok {
+		if index, ok := c.lookupFunction(ident.Value); ok {
+			for _, arg := range node.Arguments {
+				c.compile(arg)
+			}
+			c.emitLocation(node.Location(), OpCallLocal, index)
+			return
+		}
+	}
 	fn := node.Callee.Type()
 	if fn.Kind() == reflect.Func {
 		fnInOffset := 0
@@ -1242,11 +1281,153 @@ func (c *compiler) PointerNode(node *ast.PointerNode) {
 
 func (c *compiler) VariableDeclaratorNode(node *ast.VariableDeclaratorNode) {
 	c.compile(node.Value)
-	index := c.addVariable(node.Name)
-	c.emit(OpStore, index)
-	c.beginScope(node.Name, index)
+	var index int
+	local := len(c.fnContexts) > 0
+	if local {
+		ctx := &c.fnContexts[len(c.fnContexts)-1]
+		index = ctx.nextVar
+		ctx.nextVar++
+		c.emit(OpStoreLocal, index)
+	} else {
+		index = c.addVariable(node.Name)
+		c.emit(OpStore, index)
+	}
+	c.beginScope(node.Name, index, local, len(c.fnContexts))
 	c.compile(node.Expr)
 	c.endScope()
+}
+
+func (c *compiler) FunctionDeclaratorNode(node *ast.FunctionDeclaratorNode) {
+	// Collect the group of consecutive function declarations, so that every
+	// function in the group can reference itself and the other functions of
+	// the group (mutual recursion).
+	group := []*ast.FunctionDeclaratorNode{node}
+	for {
+		if next, ok := group[len(group)-1].Expr.(*ast.FunctionDeclaratorNode); ok {
+			group = append(group, next)
+		} else {
+			break
+		}
+	}
+
+	// Register all function names of the group before compiling any body.
+	fnScope := make(map[string]int, len(group))
+	for _, fn := range group {
+		if _, ok := c.lookupFunction(fn.Name); ok {
+			panic(fmt.Sprintf("cannot redeclare function %s", fn.Name))
+		}
+		if _, ok := fnScope[fn.Name]; ok {
+			panic(fmt.Sprintf("cannot redeclare function %s", fn.Name))
+		}
+		if _, ok := c.lookupVariable(fn.Name); ok {
+			panic(fmt.Sprintf("cannot redeclare variable %s", fn.Name))
+		}
+		if c.config != nil {
+			if _, ok := c.config.Functions[fn.Name]; ok {
+				panic(fmt.Sprintf("cannot redeclare function %s", fn.Name))
+			}
+			if _, ok := c.config.Builtins[fn.Name]; ok {
+				panic(fmt.Sprintf("cannot redeclare builtin %s", fn.Name))
+			}
+		}
+		index := len(c.localFunctions)
+		c.localFunctions = append(c.localFunctions, LocalFunction{
+			Name:  fn.Name,
+			Arity: len(fn.Params),
+		})
+		c.debugInfo[fmt.Sprintf("localfn_%d", index)] = fn.Name
+		fnScope[fn.Name] = index
+	}
+
+	// Jump over the function bodies; they are only reachable via calls.
+	end := c.emit(OpJump, placeholder)
+
+	c.fnScopes = append(c.fnScopes, fnScope)
+	for _, fn := range group {
+		index := fnScope[fn.Name]
+		c.localFunctions[index].Entry = len(c.bytecode)
+		c.fnContexts = append(c.fnContexts, fnContext{nextVar: len(fn.Params)})
+		for i, param := range fn.Params {
+			c.beginScope(param, i, true, len(c.fnContexts))
+		}
+		c.compileTail(fn.Body)
+		c.emit(OpReturn)
+		for range fn.Params {
+			c.endScope()
+		}
+		ctx := c.fnContexts[len(c.fnContexts)-1]
+		c.fnContexts = c.fnContexts[:len(c.fnContexts)-1]
+		c.localFunctions[index].Size = ctx.nextVar
+	}
+
+	c.patchJump(end)
+
+	c.compile(group[len(group)-1].Expr)
+	c.fnScopes = c.fnScopes[:len(c.fnScopes)-1]
+}
+
+// compileTail compiles a node in tail position of a local function body.
+// Calls to local functions in tail position are compiled to OpTailCallLocal,
+// which reuses the current call frame and therefore does not consume the
+// call budget, allowing arbitrarily deep tail recursion.
+func (c *compiler) compileTail(node ast.Node) {
+	switch n := node.(type) {
+	case *ast.ConditionalNode:
+		c.nodes = append(c.nodes, node)
+		defer func() {
+			c.nodes = c.nodes[:len(c.nodes)-1]
+		}()
+		c.compile(n.Cond)
+		c.derefInNeeded(n.Cond)
+		otherwise := c.emit(OpJumpIfFalse, placeholder)
+		c.emit(OpPop)
+		c.compileTail(n.Exp1)
+		end := c.emit(OpJump, placeholder)
+		c.patchJump(otherwise)
+		c.emit(OpPop)
+		c.compileTail(n.Exp2)
+		c.patchJump(end)
+	case *ast.SequenceNode:
+		for i, child := range n.Nodes {
+			if i == len(n.Nodes)-1 {
+				c.compileTail(child)
+			} else {
+				c.compile(child)
+				c.emit(OpPop)
+			}
+		}
+	case *ast.VariableDeclaratorNode:
+		c.compile(n.Value)
+		ctx := &c.fnContexts[len(c.fnContexts)-1]
+		index := ctx.nextVar
+		ctx.nextVar++
+		c.emit(OpStoreLocal, index)
+		c.beginScope(n.Name, index, true, len(c.fnContexts))
+		c.compileTail(n.Expr)
+		c.endScope()
+	case *ast.CallNode:
+		if ident, ok := n.Callee.(*ast.IdentifierNode); ok {
+			if index, ok := c.lookupFunction(ident.Value); ok {
+				for _, arg := range n.Arguments {
+					c.compile(arg)
+				}
+				c.emitLocation(n.Location(), OpTailCallLocal, index)
+				return
+			}
+		}
+		c.compile(node)
+	default:
+		c.compile(node)
+	}
+}
+
+func (c *compiler) lookupFunction(name string) (int, bool) {
+	for i := len(c.fnScopes) - 1; i >= 0; i-- {
+		if index, ok := c.fnScopes[i][name]; ok {
+			return index, true
+		}
+	}
+	return 0, false
 }
 
 func (c *compiler) SequenceNode(node *ast.SequenceNode) {
@@ -1258,21 +1439,21 @@ func (c *compiler) SequenceNode(node *ast.SequenceNode) {
 	}
 }
 
-func (c *compiler) beginScope(name string, index int) {
-	c.scopes = append(c.scopes, scope{name, index})
+func (c *compiler) beginScope(name string, index int, local bool, fnDepth int) {
+	c.scopes = append(c.scopes, scope{name, index, local, fnDepth})
 }
 
 func (c *compiler) endScope() {
 	c.scopes = c.scopes[:len(c.scopes)-1]
 }
 
-func (c *compiler) lookupVariable(name string) (int, bool) {
+func (c *compiler) lookupVariable(name string) (scope, bool) {
 	for i := len(c.scopes) - 1; i >= 0; i-- {
 		if c.scopes[i].variableName == name {
-			return c.scopes[i].index, true
+			return c.scopes[i], true
 		}
 	}
-	return 0, false
+	return scope{}, false
 }
 
 func (c *compiler) ConditionalNode(node *ast.ConditionalNode) {

@@ -85,6 +85,8 @@ func TestPrint(t *testing.T) {
 		{`(-(1+1)) == 2`, `-(1 + 1) == 2`},
 		{`if true { 1 } else { 2 }`, `if true { 1 } else { 2 }`},
 		{`if true { 1 } else if false { 2 } else { 3 }`, `if true { 1 } else if false { 2 } else { 3 }`},
+		{`fn f(x) { x + 1 }; f(2)`, `fn f(x) { x + 1 }; f(2)`},
+		{`fn f() { 1 }; fn g(a, b) { a }; g(f(), 2)`, `fn f() { 1 }; fn g(a, b) { a }; g(f(), 2)`},
 	}
 
 	for _, tt := range tests {

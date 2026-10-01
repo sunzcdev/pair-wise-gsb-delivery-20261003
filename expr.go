@@ -225,6 +225,16 @@ func MaxNodes(n uint) Option {
 	}
 }
 
+// CallBudget sets the maximum number of nested (non-tail) calls of local
+// functions declared via "fn" in the expression. Tail calls reuse the
+// current call frame and are not limited by the budget. By default, the
+// call budget is conf.DefaultCallBudget.
+func CallBudget(n uint) Option {
+	return func(c *conf.Config) {
+		c.CallBudget = n
+	}
+}
+
 // Compile parses and compiles given input expression to bytecode program.
 func Compile(input string, ops ...Option) (*vm.Program, error) {
 	config := conf.CreateNew()

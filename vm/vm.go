@@ -41,14 +41,30 @@ type VM struct {
 	Scopes       []*Scope
 	Variables    []any
 	MemoryBudget uint
+	// CallBudget limits the maximum number of nested (non-tail) calls of
+	// local functions declared via "fn". Tail calls do not consume the
+	// budget. If zero, the program's CallBudget is used; if that is also
+	// zero, conf.DefaultCallBudget is used.
+	CallBudget   uint
 	ip           int
 	memory       uint
+	frames       []frame
+	varBase      int
+	varsTop      int
 	debug        bool
 	step         chan struct{}
 	curr         chan int
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+}
+
+// frame is a call frame of a local function declared via "fn".
+type frame struct {
+	ip        int // Return address.
+	varBase   int // Base of the caller's local variables in vm.Variables.
+	varsTop   int // High-water mark of vm.Variables usage at the call site.
+	stackBase int // Length of vm.Stack at the call site.
 }
 
 func (vm *VM) Run(program *Program, env any) (_ any, err error) {
@@ -87,6 +103,18 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	if vm.MemoryBudget == 0 {
 		vm.MemoryBudget = conf.DefaultMemoryBudget
 	}
+	callBudget := vm.CallBudget
+	if callBudget == 0 {
+		callBudget = program.CallBudget
+	}
+	if callBudget == 0 {
+		callBudget = conf.DefaultCallBudget
+	}
+	if vm.frames != nil {
+		vm.frames = vm.frames[:0]
+	}
+	vm.varBase = 0
+	vm.varsTop = program.variables
 	vm.memory = 0
 	vm.ip = 0
 
@@ -638,6 +666,57 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			b := vm.pop()
 			vm.push(a.(bool) || b.(bool))
 
+		case OpLoadLocal:
+			vm.push(vm.Variables[vm.varBase+arg])
+
+		case OpStoreLocal:
+			vm.Variables[vm.varBase+arg] = vm.pop()
+
+		case OpCallLocal:
+			fn := program.LocalFunctions[arg]
+			if uint(len(vm.frames)) >= callBudget {
+				panic(fmt.Sprintf("call budget exceeded: cannot call %q (max %d nested calls)", fn.Name, callBudget))
+			}
+			base := vm.varsTop
+			vm.ensureVars(base + fn.Size)
+			copy(vm.Variables[base:base+fn.Arity], vm.Stack[len(vm.Stack)-fn.Arity:])
+			vm.Stack = vm.Stack[:len(vm.Stack)-fn.Arity]
+			vm.frames = append(vm.frames, frame{
+				ip:        vm.ip,
+				varBase:   vm.varBase,
+				varsTop:   vm.varsTop,
+				stackBase: len(vm.Stack),
+			})
+			vm.varBase = base
+			vm.varsTop = base + fn.Size
+			vm.ip = fn.Entry
+
+		case OpTailCallLocal:
+			fn := program.LocalFunctions[arg]
+			// The current frame is reused, so tail calls do not consume the
+			// call budget and can handle arbitrarily deep recursion.
+			if vm.varsTop < vm.varBase+fn.Size {
+				vm.varsTop = vm.varBase + fn.Size
+			}
+			vm.ensureVars(vm.varsTop)
+			copy(vm.Variables[vm.varBase:vm.varBase+fn.Arity], vm.Stack[len(vm.Stack)-fn.Arity:])
+			if len(vm.frames) > 0 {
+				vm.Stack = vm.Stack[:vm.frames[len(vm.frames)-1].stackBase]
+			} else {
+				vm.Stack = vm.Stack[:0]
+			}
+			vm.ip = fn.Entry
+
+		case OpReturn:
+			result := vm.pop()
+			f := vm.frames[len(vm.frames)-1]
+			vm.frames = vm.frames[:len(vm.frames)-1]
+			vm.varsTop = f.varsTop
+			vm.varBase = f.varBase
+			vm.Stack = vm.Stack[:f.stackBase]
+			vm.push(result)
+			vm.ip = f.ip
+
 		case OpEnd:
 			vm.Scopes = vm.Scopes[:len(vm.Scopes)-1]
 			if len(vm.Scopes) > 0 {
@@ -692,6 +771,16 @@ func (vm *VM) memGrow(size uint) {
 	if vm.memory >= vm.MemoryBudget {
 		panic("memory budget exceeded")
 	}
+}
+
+// ensureVars grows vm.Variables to hold at least n slots.
+func (vm *VM) ensureVars(n int) {
+	if len(vm.Variables) >= n {
+		return
+	}
+	variables := make([]any, n)
+	copy(variables, vm.Variables)
+	vm.Variables = variables
 }
 
 func (vm *VM) scope() *Scope {

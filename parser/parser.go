@@ -226,6 +226,20 @@ func (p *Parser) parseExpression(precedence int) Node {
 		return p.parseVariableDeclaration()
 	}
 
+	if precedence == 0 && p.current.Is(Identifier, "fn") {
+		// The "fn" keyword is contextual: it is a function declaration only
+		// if followed by an identifier, otherwise it is a plain identifier.
+		tokenBackup := p.current
+		p.next()
+		if p.current.Is(Identifier) && p.err == nil {
+			// The "fn" token is already consumed.
+			return p.parseFunctionDeclaration()
+		}
+		p.hasStash = true
+		p.stashed = p.current
+		p.current = tokenBackup
+	}
+
 	if precedence == 0 && (p.config == nil || !p.config.DisableIfOperator) && p.current.Is(Operator, "if") {
 		return p.parseConditionalIf()
 	}
@@ -333,6 +347,37 @@ func (p *Parser) parseVariableDeclaration() Node {
 		Value: value,
 		Expr:  node,
 	}, variableName.Location)
+}
+
+func (p *Parser) parseFunctionDeclaration() Node {
+	// The "fn" token is already consumed by parseExpression.
+	functionName := p.current
+	p.expect(Identifier)
+	p.expect(Bracket, "(")
+	params := make([]string, 0)
+	for !p.current.Is(Bracket, ")") && p.err == nil {
+		if len(params) > 0 {
+			p.expect(Operator, ",")
+			if p.current.Is(Bracket, ")") {
+				break
+			}
+		}
+		param := p.current
+		p.expect(Identifier)
+		params = append(params, param.Value)
+	}
+	p.expect(Bracket, ")")
+	p.expect(Bracket, "{")
+	body := p.parseSequenceExpression()
+	p.expect(Bracket, "}")
+	p.expect(Operator, ";")
+	node := p.parseSequenceExpression()
+	return p.createNode(&FunctionDeclaratorNode{
+		Name:   functionName.Value,
+		Params: params,
+		Body:   body,
+		Expr:   node,
+	}, functionName.Location)
 }
 
 func (p *Parser) parseConditionalIf() Node {

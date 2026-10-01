@@ -54,6 +54,8 @@ type Checker struct {
 	config          *conf.Config
 	predicateScopes []predicateScope
 	varScopes       []varScope
+	fnScopes        []fnScope
+	fnLevel         int
 	err             *file.Error
 	needsReset      bool
 }
@@ -64,6 +66,12 @@ type predicateScope struct {
 }
 
 type varScope struct {
+	name    string
+	nature  Nature
+	fnLevel int
+}
+
+type fnScope struct {
 	name   string
 	nature Nature
 }
@@ -161,8 +169,11 @@ func (v *Checker) reset(config *conf.Config) {
 	if v.needsReset {
 		clearSlice(v.predicateScopes)
 		clearSlice(v.varScopes)
+		clearSlice(v.fnScopes)
 		v.predicateScopes = v.predicateScopes[:0]
 		v.varScopes = v.varScopes[:0]
+		v.fnScopes = v.fnScopes[:0]
+		v.fnLevel = 0
 		v.err = nil
 	}
 	v.needsReset = true
@@ -219,6 +230,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.pointerNode(n)
 	case *ast.VariableDeclaratorNode:
 		nt = v.variableDeclaratorNode(n)
+	case *ast.FunctionDeclaratorNode:
+		nt = v.functionDeclaratorNode(n)
 	case *ast.SequenceNode:
 		nt = v.sequenceNode(n)
 	case *ast.ConditionalNode:
@@ -248,8 +261,18 @@ func (v *Checker) error(node ast.Node, format string, args ...any) Nature {
 
 func (v *Checker) identifierNode(node *ast.IdentifierNode) Nature {
 	for i := len(v.varScopes) - 1; i >= 0; i-- {
+		if v.varScopes[i].fnLevel != 0 && v.varScopes[i].fnLevel != v.fnLevel {
+			// Variables declared in an enclosing function body cannot be
+			// captured by a nested function declaration.
+			continue
+		}
 		if v.varScopes[i].name == node.Value {
 			return v.varScopes[i].nature
+		}
+	}
+	for i := len(v.fnScopes) - 1; i >= 0; i-- {
+		if v.fnScopes[i].name == node.Value {
+			return v.fnScopes[i].nature
 		}
 	}
 	if node.Value == "$env" {
@@ -760,7 +783,7 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection.String())
 		}
 
-		v.begin(collection, varScope{"index", v.config.NtCache.FromType(intType)})
+	v.begin(collection, varScope{name: "index", nature: v.config.NtCache.FromType(intType)})
 		predicate := v.visit(node.Arguments[1])
 		v.end()
 
@@ -928,7 +951,7 @@ func (v *Checker) builtinNode(node *ast.BuiltinNode) Nature {
 			return v.error(node.Arguments[0], "builtin %v takes only array (got %v)", node.Name, collection.String())
 		}
 
-		v.begin(collection, varScope{"index", v.config.NtCache.FromType(intType)}, varScope{"acc", Nature{}})
+	v.begin(collection, varScope{name: "index", nature: v.config.NtCache.FromType(intType)}, varScope{name: "acc", nature: Nature{}})
 		predicate := v.visit(node.Arguments[1])
 		v.end()
 
@@ -1271,10 +1294,79 @@ func (v *Checker) variableDeclaratorNode(node *ast.VariableDeclaratorNode) Natur
 			return v.error(node, "cannot redeclare variable %v", node.Name)
 		}
 	}
+	for i := len(v.fnScopes) - 1; i >= 0; i-- {
+		if v.fnScopes[i].name == node.Name {
+			return v.error(node, "cannot redeclare function %v", node.Name)
+		}
+	}
 	varNature := v.visit(node.Value)
-	v.varScopes = append(v.varScopes, varScope{node.Name, varNature})
+	v.varScopes = append(v.varScopes, varScope{name: node.Name, nature: varNature, fnLevel: v.fnLevel})
 	exprNature := v.visit(node.Expr)
 	v.varScopes = v.varScopes[:len(v.varScopes)-1]
+	return exprNature
+}
+
+func (v *Checker) functionDeclaratorNode(node *ast.FunctionDeclaratorNode) Nature {
+	// Collect the group of consecutive function declarations, so that every
+	// function in the group can reference itself and the other functions of
+	// the group (mutual recursion).
+	group := []*ast.FunctionDeclaratorNode{node}
+	for {
+		if next, ok := group[len(group)-1].Expr.(*ast.FunctionDeclaratorNode); ok {
+			group = append(group, next)
+		} else {
+			break
+		}
+	}
+
+	base := len(v.fnScopes)
+	for _, fn := range group {
+		if _, ok := v.config.Env.Get(&v.config.NtCache, fn.Name); ok {
+			return v.error(fn, "cannot redeclare %v", fn.Name)
+		}
+		if _, ok := v.config.Functions[fn.Name]; ok {
+			return v.error(fn, "cannot redeclare function %v", fn.Name)
+		}
+		if _, ok := v.config.Builtins[fn.Name]; ok {
+			return v.error(fn, "cannot redeclare builtin %v", fn.Name)
+		}
+		for i := len(v.varScopes) - 1; i >= 0; i-- {
+			if v.varScopes[i].name == fn.Name {
+				return v.error(fn, "cannot redeclare variable %v", fn.Name)
+			}
+		}
+		for i := len(v.fnScopes) - 1; i >= 0; i-- {
+			if v.fnScopes[i].name == fn.Name {
+				return v.error(fn, "cannot redeclare function %v", fn.Name)
+			}
+		}
+		params := make(map[string]bool, len(fn.Params))
+		for _, param := range fn.Params {
+			if params[param] {
+				return v.error(fn, "cannot redeclare parameter %v", param)
+			}
+			params[param] = true
+		}
+		in := make([]reflect.Type, len(fn.Params))
+		for i := range in {
+			in[i] = anyType
+		}
+		nt := v.config.NtCache.FromType(reflect.FuncOf(in, anyTypeSlice, false))
+		v.fnScopes = append(v.fnScopes, fnScope{name: fn.Name, nature: nt})
+	}
+
+	for _, fn := range group {
+		v.fnLevel++
+		for _, param := range fn.Params {
+			v.varScopes = append(v.varScopes, varScope{name: param, nature: Nature{}, fnLevel: v.fnLevel})
+		}
+		_ = v.visit(fn.Body)
+		v.varScopes = v.varScopes[:len(v.varScopes)-len(fn.Params)]
+		v.fnLevel--
+	}
+
+	exprNature := v.visit(group[len(group)-1].Expr)
+	v.fnScopes = v.fnScopes[:base]
 	return exprNature
 }
 

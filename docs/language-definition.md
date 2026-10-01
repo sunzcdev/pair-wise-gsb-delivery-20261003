@@ -295,6 +295,49 @@ let name = user.Name | lower() | split(" ");
 "Hello, " + name[0] + "!"
 ```
 
+## Functions
+
+Local functions can be declared with the `fn` keyword. A function declaration consists of a name,
+a list of parameters, and a body in braces. After the declaration, the function can be called in
+the rest of the expression.
+
+```expr
+fn fee(x) { x * 2 }; fee(21)
+```
+
+Functions are useful to reuse logic within a single expression, for example, tiered pricing:
+
+```expr
+fn tier(x) { x < 100 ? 0 : x < 1000 ? 1 : 2 };
+fn fee(x) { tier(x) * 10 + x };
+fee(50) + fee(500) + fee(5000)
+```
+
+Functions follow lexical scoping: a function can use variables declared with `let` at the top
+level of the expression, as well as other functions declared in the same scope. Consecutive
+function declarations form a group, so functions can call themselves and each other (mutual
+recursion):
+
+```expr
+fn even(n) { n == 0 ? true : odd(n - 1) };
+fn odd(n) { n == 0 ? false : even(n - 1) };
+even(10)
+```
+
+A call in tail position (the last expression of a function body, a branch of a conditional, or
+the last element of a sequence) is a tail call. Tail calls reuse the current call frame and can
+handle arbitrarily deep recursion:
+
+```expr
+fn sumTo(n, acc) { n == 0 ? acc : sumTo(n - 1, acc + n) };
+sumTo(1000000, 0)
+```
+
+Non-tail recursion is limited by a call budget (the maximum number of nested calls, see
+`expr.CallBudget` and `conf.DefaultCallBudget`). Exceeding the budget produces a runtime error
+pointing at the call site. Local functions cannot redeclare variables, other local functions,
+host functions, or builtins.
+
 ### $env
 
 The `$env` variable is a map of all variables passed to the expression.

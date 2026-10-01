@@ -202,6 +202,10 @@ func (n *VariableDeclaratorNode) String() string {
 	return fmt.Sprintf("let %s = %s; %s", n.Name, n.Value.String(), n.Expr.String())
 }
 
+func (n *FunctionDeclaratorNode) String() string {
+	return fmt.Sprintf("fn %s(%s) { %s }; %s", n.Name, strings.Join(n.Params, ", "), n.Body.String(), n.Expr.String())
+}
+
 func (n *SequenceNode) String() string {
 	nodes := make([]string, len(n.Nodes))
 	for i, node := range n.Nodes {

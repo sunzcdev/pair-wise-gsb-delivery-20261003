@@ -16,6 +16,10 @@ var (
 
 	// DefaultMaxNodes represents default maximum allowed AST nodes by the compiler.
 	DefaultMaxNodes uint = 1e4
+
+	// DefaultCallBudget represents default maximum number of nested (non-tail)
+	// calls of local functions declared via "fn".
+	DefaultCallBudget uint = 1024
 )
 
 type FunctionsTable map[string]*builtin.Function
@@ -30,6 +34,9 @@ type Config struct {
 	ShortCircuit bool
 	Profile      bool
 	MaxNodes     uint
+	// CallBudget limits the maximum number of nested (non-tail) calls of
+	// local functions declared via "fn". If zero, DefaultCallBudget is used.
+	CallBudget   uint
 	ConstFns     map[string]reflect.Value
 	Visitors     []ast.Visitor
 	Functions    FunctionsTable

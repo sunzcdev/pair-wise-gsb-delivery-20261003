@@ -132,3 +132,18 @@ The timezone is used for the following functions:
 date("2024-11-23 12:00:00") // parses the date in the specified timezone
 now() // returns the current time in the specified timezone
 ```
+
+## CallBudget
+
+Local functions declared with the `fn` keyword may call themselves recursively. To prevent
+unbounded recursion from exhausting resources, the number of nested (non-tail) calls is limited
+by a call budget: `conf.DefaultCallBudget` (1024) by default. The budget can be changed via the
+[`CallBudget`](https://pkg.go.dev/github.com/expr-lang/expr#CallBudget) option.
+
+```go
+program, err := expr.Compile(code, expr.CallBudget(100))
+```
+
+Calls in tail position reuse the current call frame and are not limited by the budget, so deep
+tail recursion is always allowed. When the budget is exceeded, the evaluation stops with a
+"call budget exceeded" error pointing at the call site.

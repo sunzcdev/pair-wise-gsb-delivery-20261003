@@ -21,13 +21,30 @@ type Program struct {
 	Arguments []int
 	Constants []any
 
-	source    file.Source
-	node      ast.Node
-	locations []file.Location
-	variables int
-	functions []Function
-	debugInfo map[string]string
-	span      *Span
+	// LocalFunctions holds metadata for functions declared inside the
+	// expression itself via "fn" declarations.
+	LocalFunctions []LocalFunction
+
+	// CallBudget limits the maximum number of nested (non-tail) calls of
+	// local functions. If zero, conf.DefaultCallBudget is used.
+	CallBudget uint
+
+	source       file.Source
+	node         ast.Node
+	locations    []file.Location
+	variables    int
+	functions    []Function
+	debugInfo    map[string]string
+	span         *Span
+}
+
+// LocalFunction describes a function declared inside an expression with
+// the "fn" keyword. Its body is compiled into the program's bytecode.
+type LocalFunction struct {
+	Name  string // Name of the function.
+	Entry int    // Bytecode offset of the function body.
+	Arity int    // Number of parameters.
+	Size  int    // Frame size: number of local variable slots (params + lets).
 }
 
 // NewProgram returns a new Program. It's used by the compiler.
@@ -380,6 +397,21 @@ func (program *Program) DisassembleWriter(w io.Writer) {
 
 		case OpOr:
 			code("OpOr")
+
+		case OpLoadLocal:
+			argument("OpLoadLocal")
+
+		case OpStoreLocal:
+			argument("OpStoreLocal")
+
+		case OpCallLocal:
+			argumentWithInfo("OpCallLocal", "localfn")
+
+		case OpTailCallLocal:
+			argumentWithInfo("OpTailCallLocal", "localfn")
+
+		case OpReturn:
+			code("OpReturn")
 
 		case OpEnd:
 			code("OpEnd")
