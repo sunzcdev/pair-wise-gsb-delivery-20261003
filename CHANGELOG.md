@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- New `TaskedResult` monad (`include Dry::Monads[:task_result]`), a composite of `Task` and `Result`. It collapses the two levels of `bind` needed to chain asynchronous computations returning `Task<Result>`: `bind`/`fmap` receive the unwrapped business value, `or`/`or_fmap` recover business `Failure`s, and `or_exception` recovers the Task error channel. The two channels never get mixed (`Success(nil)` is still a success), a `Failure` returned by a callback is routed through the failure channel (never hangs the waiter), and `to_task` restores the plain `Task<Result>` without copying the promise or changing its executor.
+
 ### Changed
 
 ### Deprecated

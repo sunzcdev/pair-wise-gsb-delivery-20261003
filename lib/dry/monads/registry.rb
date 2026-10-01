@@ -13,6 +13,7 @@ module Dry
       list: "List",
       maybe: "Maybe",
       task: "Task",
+      task_result: "TaskedResult",
       try: "Try",
       validated: "Validated",
       result: [
