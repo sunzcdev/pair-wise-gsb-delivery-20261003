@@ -70,6 +70,28 @@ File.open('/path/to/data.json', 'r', encoding:'UTF-8') do |file|
 end
 ```
 
+## Access Summaries
+
+`JMESPath.access_summary` statically analyzes an expression and reports which
+data fields it may read, without evaluating it against any data. This is
+useful for data masking layers that need to know the fields a query can touch
+before executing it.
+
+```ruby
+summary = JMESPath.access_summary('items[?price > `10`].name')
+summary.required_paths
+#=> ["items", "items[*]"]
+summary.possible_paths
+#=> ["items[*].name", "items[*].price"]
+summary.wildcard_ranges
+#=> accesses that read every key/index of a value, each with a reason
+```
+
+The summary covers every field reference in the expression, including filter
+conditions, `sort_by`/`map`/`min_by`/`max_by` expression references and
+multi-select structures. Positions that cannot be inferred precisely are
+reported as conservative ranges with a reason.
+
 ## Links of Interest
 
 * [Release Notes](https://github.com/trevorrowe/jmespath.rb/releases)
