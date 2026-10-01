@@ -93,6 +93,39 @@ func main() {
 }
 ```
 
+### Tenant cost quotas
+
+Ristretto supports per-tenant reserved cost shares so that one large tenant's
+hot data can't squeeze smaller tenants out of the cache:
+
+```go
+// Reserve shares of the cache's MaxCost for each tenant. The sum of all
+// reserved shares may not exceed MaxCost.
+if err := cache.RegisterTenant("big", 600); err != nil {
+  panic(err)
+}
+if err := cache.RegisterTenant("small", 400); err != nil {
+  panic(err)
+}
+
+// Sets and Gets are attributed to a tenant. Each tenant's access frequency
+// is tracked in its own sketch, so admission decisions for a tenant's items
+// are based on that tenant's own access stream.
+cache.SetFor("small", "key", "value", 10)
+cache.Wait()
+value, found := cache.GetFor("small", "key")
+```
+
+- A tenant's reserved share can be borrowed by other tenants while it is
+  idle, so free capacity is always fully usable.
+- When the owner needs its share back, the borrowed space is reclaimed by
+  evicting the borrowing tenants' coldest items first.
+- Tenants competing for unreserved capacity are judged by their own access
+  frequency; items within a tenant's reserved share are never evicted to
+  make room for another tenant.
+- `UnregisterTenant` evicts all of the tenant's items and releases its
+  reserved share. `TenantCost` reports a tenant's current usage.
+
 ## Benchmarks
 
 The benchmarks can be found in

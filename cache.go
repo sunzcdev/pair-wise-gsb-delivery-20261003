@@ -198,6 +198,9 @@ type Item[V any] struct {
 	Value      V
 	Cost       int64
 	Expiration time.Time
+	// Tenant is the id of the tenant this item belongs to. The empty string
+	// is the default, unreserved tenant.
+	Tenant     string
 	wait       chan struct{}
 }
 
@@ -313,6 +316,41 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 	return c.SetWithTTL(key, value, cost, 0*time.Second)
 }
 
+// SetFor works like Set but attributes the item to the given tenant. The
+// tenant must have been registered with RegisterTenant, otherwise SetFor
+// returns false. The item's cost counts against the tenant's reserved share;
+// idle reserved capacity of other tenants can be borrowed, and is reclaimed
+// when its owner needs it back.
+func (c *Cache[K, V]) SetFor(tenant string, key K, value V, cost int64) bool {
+	if c == nil || c.isClosed.Load() {
+		return false
+	}
+	if tenant != "" && !c.cachePolicy.HasTenant(tenant) {
+		return false
+	}
+	return c.setWithTenant(tenant, key, value, cost, 0*time.Second)
+}
+
+// GetFor works like Get but attributes the access to the given tenant, so
+// that the key's frequency is tracked in the tenant's own sketch and a large
+// tenant's access volume can't inflate the apparent hotness of another
+// tenant's items.
+func (c *Cache[K, V]) GetFor(tenant string, key K) (V, bool) {
+	if c == nil || c.isClosed.Load() {
+		return zeroValue[V](), false
+	}
+	keyHash, conflictHash := c.keyToHash(key)
+
+	c.cachePolicy.PushTenantKey(tenant, keyHash)
+	value, ok := c.storedItems.Get(keyHash, conflictHash)
+	if ok {
+		c.Metrics.add(hit, keyHash, 1)
+	} else {
+		c.Metrics.add(miss, keyHash, 1)
+	}
+	return value, ok
+}
+
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
 // after the specified TTL (time to live) has passed. A zero value means the value never
 // expires, which is identical to calling Set. A negative value is a no-op and the value
@@ -320,6 +358,11 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.setWithTenant("", key, value, cost, ttl)
+}
+
+// setWithTenant is the shared implementation of SetWithTTL and SetFor.
+func (c *Cache[K, V]) setWithTenant(tenant string, key K, value V, cost int64, ttl time.Duration) bool {
 	if c == nil || c.isClosed.Load() {
 		return false
 	}
@@ -344,6 +387,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		Tenant:     tenant,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -507,6 +551,41 @@ func (c *Cache[K, V]) RemainingCost() int64 {
 	return c.cachePolicy.Cap()
 }
 
+// RegisterTenant reserves a cost share for the given tenant. The sum of all
+// reserved shares may not exceed the cache's MaxCost. A tenant's reserved
+// share can be borrowed by other tenants while it is idle, and is reclaimed
+// (by evicting the borrowers) when the tenant needs it back, so a large
+// tenant can never squeeze a small tenant out of its reserved share.
+func (c *Cache[K, V]) RegisterTenant(tenant string, reservedCost int64) error {
+	if c == nil || c.isClosed.Load() {
+		return errors.New("cache is closed")
+	}
+	return c.cachePolicy.RegisterTenant(tenant, reservedCost)
+}
+
+// UnregisterTenant removes the tenant from the cache. All of the tenant's
+// items are evicted (triggering OnEvict) and its reserved share is released
+// for other tenants to use.
+func (c *Cache[K, V]) UnregisterTenant(tenant string) {
+	if c == nil || c.isClosed.Load() {
+		return
+	}
+	victims := c.cachePolicy.UnregisterTenant(tenant)
+	for _, victim := range victims {
+		victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
+		c.onEvict(victim)
+	}
+}
+
+// TenantCost returns the cost currently used by the tenant and whether the
+// tenant is registered.
+func (c *Cache[K, V]) TenantCost(tenant string) (int64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	return c.cachePolicy.TenantCost(tenant)
+}
+
 // processItems is ran by goroutines processing the Set buffer.
 func (c *Cache[K, V]) processItems() {
 	startTs := make(map[uint64]time.Time)
@@ -554,7 +633,7 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				victims, added := c.cachePolicy.AddForTenant(i.Tenant, i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)

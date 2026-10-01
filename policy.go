@@ -28,19 +28,32 @@ type defaultPolicy[V any] struct {
 	admit    *tinyLFU
 	evict    *sampledLFU
 	itemsCh  chan []uint64
+	// tenantCh carries Get accesses attributed to a specific tenant so that
+	// each tenant's access frequency is tracked in its own sketch.
+	tenantCh chan tenantKey
 	stop     chan struct{}
 	done     chan struct{}
 	isClosed bool
 	metrics  *Metrics
+	// numCounters sizes the per-tenant frequency sketches.
+	numCounters int64
+	// tenants is nil until the first tenant is registered. While nil the
+	// policy behaves exactly like a tenant-unaware cache.
+	tenants map[string]*tenantState
+	// keyTenant maps every key tracked by the policy to its owning tenant.
+	// It is only maintained while tenants is non-nil.
+	keyTenant map[uint64]string
 }
 
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	p := &defaultPolicy[V]{
-		admit:   newTinyLFU(numCounters),
-		evict:   newSampledLFU(maxCost),
-		itemsCh: make(chan []uint64, 3),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		admit:       newTinyLFU(numCounters),
+		evict:       newSampledLFU(maxCost),
+		itemsCh:     make(chan []uint64, 3),
+		tenantCh:    make(chan tenantKey, 64),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
+		numCounters: numCounters,
 	}
 	go p.processItems()
 	return p
@@ -62,6 +75,14 @@ func (p *defaultPolicy[V]) processItems() {
 		case items := <-p.itemsCh:
 			p.Lock()
 			p.admit.Push(items)
+			p.Unlock()
+		case tk := <-p.tenantCh:
+			p.Lock()
+			if ts, ok := p.tenants[tk.tenant]; ok {
+				ts.admit.Increment(tk.key)
+			} else {
+				p.admit.Increment(tk.key)
+			}
 			p.Unlock()
 		case <-p.stop:
 			p.done <- struct{}{}
@@ -93,9 +114,24 @@ func (p *defaultPolicy[V]) Push(keys []uint64) bool {
 // the policy. It returns the list of victims that have been evicted and a boolean
 // indicating whether the incoming item should be accepted.
 func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
+	return p.AddForTenant("", key, cost)
+}
+
+// AddForTenant behaves like Add but attributes the item to the given tenant.
+// The empty tenant is the default, unreserved tenant. When no tenant has been
+// registered on the policy, this is exactly equivalent to the original Add.
+func (p *defaultPolicy[V]) AddForTenant(tenant string, key uint64, cost int64) ([]*Item[V], bool) {
 	p.Lock()
 	defer p.Unlock()
+	if p.tenants != nil {
+		return p.addTenant(tenant, key, cost)
+	}
+	return p.add(key, cost)
+}
 
+// add is the original tenant-unaware admission algorithm. The caller must
+// hold the policy lock.
+func (p *defaultPolicy[V]) add(key uint64, cost int64) ([]*Item[V], bool) {
 	// Cannot add an item bigger than entire cache.
 	if cost > p.evict.getMaxCost() {
 		return nil, false
@@ -177,7 +213,11 @@ func (p *defaultPolicy[V]) Has(key uint64) bool {
 
 func (p *defaultPolicy[V]) Del(key uint64) {
 	p.Lock()
-	p.evict.del(key)
+	if p.tenants != nil {
+		p.delTenantKey(key)
+	} else {
+		p.evict.del(key)
+	}
 	p.Unlock()
 }
 
@@ -190,6 +230,16 @@ func (p *defaultPolicy[V]) Cap() int64 {
 
 func (p *defaultPolicy[V]) Update(key uint64, cost int64) {
 	p.Lock()
+	if p.tenants != nil {
+		if prev, found := p.evict.keyCosts[key]; found {
+			if ts, ok := p.keyTenant[key]; ok {
+				if ts := p.tenants[ts]; ts != nil {
+					ts.used += cost - prev
+					ts.keyCosts[key] = cost
+				}
+			}
+		}
+	}
 	p.evict.updateIfHas(key, cost)
 	p.Unlock()
 }
@@ -208,6 +258,18 @@ func (p *defaultPolicy[V]) Clear() {
 	p.Lock()
 	p.admit.clear()
 	p.evict.clear()
+	if p.tenants != nil {
+		// Tenant registrations survive a Clear, but all usage and frequency
+		// information is reset.
+		for _, ts := range p.tenants {
+			ts.used = 0
+			ts.keyCosts = make(map[uint64]int64)
+			if ts.admit != p.admit {
+				ts.admit.clear()
+			}
+		}
+		p.keyTenant = make(map[uint64]string)
+	}
 	p.Unlock()
 }
 
