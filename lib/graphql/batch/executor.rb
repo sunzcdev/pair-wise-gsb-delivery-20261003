@@ -1,7 +1,8 @@
 module GraphQL::Batch
   class Executor
     THREAD_KEY = :"#{name}.batched_queries"
-    private_constant :THREAD_KEY
+    PARENT_THREAD_KEY = :"#{name}.parent_batched_queries"
+    private_constant :THREAD_KEY, :PARENT_THREAD_KEY
 
     class << self
       def current
@@ -24,6 +25,26 @@ module GraphQL::Batch
         end
         return unless executor.decrement_level < 1
         self.current = nil
+      end
+
+      # Install a fresh executor, saving the current one (if any) so that it can
+      # be restored by .end_isolated_batch. The isolated executor has its own
+      # loader registry and load queue and starts at the first nesting level.
+      def start_isolated_batch(executor_class)
+        Thread.current[PARENT_THREAD_KEY] = [current, *Thread.current[PARENT_THREAD_KEY]]
+        self.current = executor_class.new
+        current.increment_level
+      end
+
+      def end_isolated_batch
+        parent_stack = Thread.current[PARENT_THREAD_KEY]
+        parent_executor = parent_stack&.first
+        unless current
+          raise NoExecutorError, 'Cannot end a batch without an Executor.'
+        end
+        rest = parent_stack ? parent_stack.drop(1) : []
+        Thread.current[PARENT_THREAD_KEY] = rest.empty? ? nil : rest
+        self.current = parent_executor
       end
     end
 

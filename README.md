@@ -140,6 +140,35 @@ def product(id:)
 end
 ```
 
+### Isolated Batches
+
+Nested calls to `GraphQL::Batch.batch` share the enclosing batch's executor,
+loader registry and load queue. Pass `isolated: true` to run a block with a
+fresh executor instead. Loads made inside the isolated block don't reuse (or
+prime) the outer loaders' caches, and the outer executor is restored when the
+block exits.
+
+```ruby
+GraphQL::Batch.batch do
+  # queued on the outer executor, paused for the duration of the isolated block
+  outer_promise = RecordLoader.for(Product).load(1)
+
+  GraphQL::Batch.batch(isolated: true) do
+    # independent registry and queue; runs its own batch query
+    RecordLoader.for(Product).load(1)
+  end
+
+  # the outer executor, its cache and queued request are resumed here
+  outer_promise
+end
+```
+
+If the isolated block returns a promise, it is fully resolved with the inner
+executor still active before the value is returned to the outer scope. If the
+block raises, the outer executor is restored and its queued requests are left
+untouched. Thread-local state means isolated batches remain independent across
+threads.
+
 ### Priming the Cache
 
 You can prime the loader cache with a specific value, which can be useful in certain situations.
