@@ -77,6 +77,16 @@ module JSONSchemer
   class InvalidFileURI < StandardError; end
   class InvalidEcmaRegexp < StandardError; end
 
+  class EvaluationBudgetExceeded < StandardError
+    attr_reader :instance_location, :keyword_location
+
+    def initialize(instance_location, keyword_location)
+      @instance_location = instance_location
+      @keyword_location = keyword_location
+      super("evaluation budget exceeded at instance location `#{instance_location}` (schema location `#{keyword_location}`)")
+    end
+  end
+
   VOCABULARIES = {
     'https://json-schema.org/draft/2020-12/vocab/core' => Draft202012::Vocab::CORE,
     'https://json-schema.org/draft/2020-12/vocab/applicator' => Draft202012::Vocab::APPLICATOR,

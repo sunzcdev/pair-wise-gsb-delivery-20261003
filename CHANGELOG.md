@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Optional per-call evaluation `budget` for `valid?`/`validate`: limits keyword evaluations, marks exhausted results as `incomplete`, and raises `JSONSchemer::EvaluationBudgetExceeded` from `valid?` when no conclusion was reached
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes

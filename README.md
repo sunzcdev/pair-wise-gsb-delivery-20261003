@@ -245,6 +245,39 @@ JSONSchemer.schema(
 )
 ```
 
+## Evaluation Budget
+
+`valid?` and `validate` accept an optional per-call `budget` that limits how much
+work a single validation may do. Evaluating one keyword against one instance
+location costs one unit (keywords entered through `$ref`/`$dynamicRef` count too;
+keywords skipped by short-circuiting don't). The budget and its state belong to
+that call only.
+
+When the budget runs out, evaluation stops immediately. Applicators like
+`anyOf`/`oneOf`/`not`/`if`/`then`/`else` and `unevaluatedProperties` never draw
+conclusions from partially evaluated subschemas, so an exhausted budget can never
+masquerade as a pass or as an ordinary validation error.
+
+```ruby
+schemer = JSONSchemer.schema({ 'type' => 'integer', 'minimum' => 11 })
+
+# completes within budget: normal output
+schemer.valid?(10, :budget => 2)
+# => false
+
+# budget exceeded: `validate` returns an explicitly incomplete result
+schemer.validate(10, :budget => 1)
+# => {"valid"=>false,
+#     "incomplete"=>true,
+#     "instanceLocation"=>"",
+#     "keywordLocation"=>"/minimum"}
+
+# budget exceeded: `valid?` raises instead of returning true/false
+schemer.valid?(10, :budget => 1)
+# => raises JSONSchemer::EvaluationBudgetExceeded
+#    (#instance_location and #keyword_location point at where evaluation stopped)
+```
+
 ## Global Configuration
 
 Configuration options can be set globally by modifying `JSONSchemer.configuration`. Global options are applied to any new schemas at creation time (global configuration changes are not reflected in existing schemas). They can be overridden with the regular keyword arguments described [above](#options).
