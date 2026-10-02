@@ -17,6 +17,9 @@
     when accessing multiple unrelated fields, since `fastjson` parses the input JSON only once.
   * Validates the parsed JSON unlike [jsonparser](https://github.com/buger/jsonparser)
     and [gjson](https://github.com/tidwall/gjson).
+  * Provides optional strict Unicode mode via `ParseStrict` and `ValidateStrict`
+    functions, which reject strings and object keys containing invalid UTF-8,
+    lone UTF-16 surrogates or mis-ordered surrogate pairs.
   * May quickly extract a part of the original JSON with `Value.Get(...).MarshalTo` and modify it
     with [Del](https://godoc.org/github.com/valyala/fastjson#Value.Del)
     and [Set](https://godoc.org/github.com/valyala/fastjson#Value.Set) functions.
