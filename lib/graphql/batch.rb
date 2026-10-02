@@ -5,6 +5,16 @@ module GraphQL
   module Batch
     BrokenPromiseError = ::Promise::BrokenError
     class NoExecutorError < StandardError; end
+    class KeyNotFoundError < StandardError; end
+
+    # Sentinel value used to report that a loader has no value for a key.
+    # Unlike `nil`, which is a valid loaded value, MISSING allows a fallback
+    # loader (see FallbackLoader) to be consulted for the key.
+    module MISSING
+      def self.inspect
+        "MISSING"
+      end
+    end
 
     def self.batch(executor_class: GraphQL::Batch::Executor)
       begin
@@ -38,5 +48,6 @@ end
 
 require_relative "batch/version"
 require_relative "batch/loader"
+require_relative "batch/fallback_loader"
 require_relative "batch/executor"
 require_relative "batch/setup_multiplex"

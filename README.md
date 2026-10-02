@@ -156,6 +156,52 @@ end
 Priming will add key/value to the loader cache only if it didn't exist before.
 
 
+### Composing Loaders with a Fallback
+
+Sometimes a value should be read from one source first and, when that source
+has no value for the key, from another source. For example, read a
+tenant-specific override before falling back to a public default.
+
+A loader reports a miss by fulfilling the key with
+`GraphQL::Batch::MISSING`. This sentinel is distinct from `nil`, which remains
+a valid loaded value:
+
+```ruby
+class TenantOverrideLoader < GraphQL::Batch::Loader
+  def perform(keys)
+    overrides = TenantConfig.where(key: keys).index_by(&:key)
+    keys.each do |key|
+      fulfill(key, overrides.key?(key) ? overrides[key].value : GraphQL::Batch::MISSING)
+    end
+  end
+end
+```
+
+Compose such a loader with a fallback via `#with_fallback`. All keys missing
+from the primary loader are sent to the fallback loader together in a single
+batch rather than one batch per key:
+
+```ruby
+def config_for(keys)
+  TenantOverrideLoader.for.with_fallback(PublicDefaultLoader.for).load_many(keys)
+end
+```
+
+If the primary loader raises or rejects, the fallback is not consulted and the
+error propagates. The composed loader keeps its own cache; fallback values are
+never written back into either underlying loader's cache.
+
+When a key is missing from both loaders, the promise is rejected with
+`GraphQL::Batch::KeyNotFoundError` by default. Pass `on_missing:` to change
+the final handling:
+
+```ruby
+loader.with_fallback(defaults, on_missing: :reject)         # default
+loader.with_fallback(defaults, on_missing: ->(key) { nil })  # callable receives the key
+loader.with_fallback(defaults, on_missing: 0)                # static value
+```
+
+
 ## Unit Testing
 
 Your loaders can be tested outside of a GraphQL query by doing the
