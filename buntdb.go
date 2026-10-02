@@ -60,7 +60,35 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrDiskFault is returned from write operations after the append-only
+	// file has suffered an I/O failure whose consequences cannot be undone
+	// automatically (a short write, a failed sync, or a failed shrink swap).
+	// While the database is in this state reads are still served, but every
+	// write fails with this error until either Recover is called or the
+	// database is closed and reopened. The concrete I/O error is wrapped and
+	// can be inspected with errors.Is / errors.As.
+	ErrDiskFault = errors.New("disk fault")
 )
+
+// diskFaultError wraps the underlying I/O error that forced the database
+// into the read-only disk-fault state.
+type diskFaultError struct {
+	cause error
+}
+
+func (e *diskFaultError) Error() string {
+	return fmt.Sprintf("buntdb: disk fault: %v; database is read-only "+
+		"until Recover is called or the database is reopened: %v",
+		e.cause, ErrDiskFault)
+}
+
+// Unwrap exposes the underlying I/O error.
+func (e *diskFaultError) Unwrap() error { return e.cause }
+
+// Is allows errors.Is(err, ErrDiskFault) to match, in addition to matching
+// the wrapped cause.
+func (e *diskFaultError) Is(target error) bool { return target == ErrDiskFault }
 
 const useAbsEx = true
 
@@ -68,7 +96,8 @@ const useAbsEx = true
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields
-	file      *os.File          // the underlying file
+	file      AOFile            // the underlying file
+	aofio     AOFIO             // the underlying filesystem
 	buf       []byte            // a buffer to write to
 	keys      *btree.BTree      // a tree of all item ordered by key
 	exps      *btree.BTree      // a tree of items ordered by expiration
@@ -76,10 +105,22 @@ type DB struct {
 	insIdxs   []*index          // a reuse buffer for gathering indexes
 	flushes   int               // a count of the number of disk flushes
 	closed    bool              // set when the database has been closed
+	diskErr   error             // set when an AOF I/O failure forces read-only
 	config    Config            // the database configuration
 	persist   bool              // do we write to disk
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+	path      string            // the database path
+}
+
+// DiskFault reports the I/O error that forced the database into the
+// read-only disk-fault state. It returns nil when the database is accepting
+// writes. After a fault the database stays readable but rejects all writes
+// until Recover is called or the database is closed and reopened.
+func (db *DB) DiskFault() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.diskErr
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -98,6 +139,57 @@ const (
 	// Slow. Very safe.
 	Always = 2
 )
+
+// AOFile is the I/O interface that the append-only database file must
+// implement. *os.File satisfies AOFile directly, but a custom implementation
+// can be supplied through the Config to wrap or fault-inject the disk
+// operations that the persistence layer depends on.
+type AOFile interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	io.Closer
+
+	// Sync flushes the file's data and metadata to stable storage.
+	Sync() error
+	// Truncate changes the size of the file.
+	Truncate(size int64) error
+	// Stat returns the file's FileInfo.
+	Stat() (os.FileInfo, error)
+	// Name returns the path used to open the file.
+	Name() string
+}
+
+// AOFIO is the filesystem factory used by the persistence layer to open and
+// rename the database file. Providing a custom implementation through the
+// Config allows callers to inject failures into the underlying disk I/O,
+// for example a short write, a failed sync, or a failed shrink swap.
+type AOFIO interface {
+	// OpenFile opens (creating if necessary) the database file read-write.
+	OpenFile(name string, flag int, perm os.FileMode) (AOFile, error)
+	// Create creates a new file for use as a temporary shrink target.
+	Create(name string) (AOFile, error)
+	// Open opens an existing file read-only, used to tail the AOF during a
+	// shrink.
+	Open(name string) (AOFile, error)
+	// Rename atomically replaces the destination with the source file.
+	Rename(oldpath, newpath string) error
+	// Remove removes a path, used to clean up a discarded shrink temp file.
+	Remove(name string) error
+}
+
+// osAOFIO is the default AOFIO implementation backed by the os package.
+type osAOFIO struct{}
+
+func (osAOFIO) OpenFile(name string, flag int, perm os.FileMode) (AOFile, error) {
+	return os.OpenFile(name, flag, perm)
+}
+func (osAOFIO) Create(name string) (AOFile, error) { return os.Create(name) }
+func (osAOFIO) Open(name string) (AOFile, error)   { return os.Open(name) }
+func (osAOFIO) Rename(oldpath, newpath string) error {
+	return renameFile(oldpath, newpath)
+}
+func (osAOFIO) Remove(name string) error { return os.RemoveAll(name) }
 
 // Config represents database configuration options. These
 // options are used to change various behaviors of the database.
@@ -132,6 +224,12 @@ type Config struct {
 	// deletion of the timeed-out item is the explicit responsibility of this
 	// callback.
 	OnExpiredSync func(key, value string, tx *Tx) error
+
+	// AOFIO optionally overrides the filesystem implementation used by the
+	// persistence layer. When nil the operating system filesystem is used.
+	// A custom implementation may wrap the operations to inject or
+	// observe I/O faults. It has no effect on the ":memory:" database.
+	AOFIO AOFIO
 }
 
 // exctx is a simple b-tree context for ordering by expiration.
@@ -142,23 +240,45 @@ type exctx struct {
 // Open opens a database at the provided path.
 // If the file does not exist then it will be created automatically.
 func Open(path string) (*DB, error) {
+	return OpenWithConfig(path, Config{SyncPolicy: EverySecond})
+}
+
+// OpenWithConfig opens a database at the provided path using the supplied
+// configuration. The zero value Config is augmented with the same defaults
+// used by Open, except that a SyncPolicy value other than Never, EverySecond
+// or Always results in ErrInvalidSyncPolicy. Config.AOFIO may provide a
+// custom filesystem implementation, which is useful for injecting or
+// observing I/O faults.
+func OpenWithConfig(path string, config Config) (*DB, error) {
+	switch config.SyncPolicy {
+	default:
+		return nil, ErrInvalidSyncPolicy
+	case Never, EverySecond, Always:
+	}
 	db := &DB{}
 	// initialize trees and indexes
 	db.keys = btreeNew(lessCtx(nil))
 	db.exps = btreeNew(lessCtx(&exctx{db}))
 	db.idxs = make(map[string]*index)
 	// initialize default configuration
-	db.config = Config{
-		SyncPolicy:           EverySecond,
-		AutoShrinkPercentage: 100,
-		AutoShrinkMinSize:    32 * 1024 * 1024,
+	db.config = config
+	if db.config.AutoShrinkPercentage == 0 {
+		db.config.AutoShrinkPercentage = 100
 	}
+	if db.config.AutoShrinkMinSize == 0 {
+		db.config.AutoShrinkMinSize = 32 * 1024 * 1024
+	}
+	if db.config.AOFIO == nil {
+		db.config.AOFIO = osAOFIO{}
+	}
+	db.aofio = db.config.AOFIO
+	db.path = path
 	// turn off persistence for pure in-memory
 	db.persist = path != ":memory:"
 	if db.persist {
 		var err error
 		// hardcoding 0666 as the default mode.
-		db.file, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
+		db.file, err = db.aofio.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
 		if err != nil {
 			return nil, err
 		}
@@ -184,9 +304,11 @@ func (db *DB) Close() error {
 	}
 	db.closed = true
 	if db.persist {
-		db.file.Sync() // do a sync but ignore the error
-		if err := db.file.Close(); err != nil {
-			return err
+		if db.file != nil {
+			db.file.Sync() // do a sync but ignore the error
+			if err := db.file.Close(); err != nil {
+				return err
+			}
 		}
 	}
 	// Let's release all references to nil. This will help both with debugging
@@ -560,7 +682,7 @@ func (db *DB) backgroundManager() {
 			if onExpired == nil {
 				onExpiredSync = db.config.OnExpiredSync
 			}
-			if db.persist && !db.config.AutoShrinkDisabled {
+			if db.persist && db.diskErr == nil && !db.config.AutoShrinkDisabled {
 				pos, err := db.file.Seek(0, 1)
 				if err != nil {
 					return err
@@ -615,10 +737,17 @@ func (db *DB) backgroundManager() {
 		func() {
 			db.mu.Lock()
 			defer db.mu.Unlock()
-			if db.persist && db.config.SyncPolicy == EverySecond &&
-				flushes != db.flushes {
-				_ = db.file.Sync()
-				flushes = db.flushes
+			if db.persist && db.diskErr == nil &&
+				db.config.SyncPolicy == EverySecond && flushes != db.flushes {
+				if err := db.file.Sync(); err != nil {
+					// A failed sync means that durability of previously
+					// written records is unknown. The database must stop
+					// accepting writes until the durable boundary is
+					// confirmed.
+					db.markDiskFault(err)
+				} else {
+					flushes = db.flushes
+				}
 			}
 		}()
 		if shrink {
@@ -650,6 +779,13 @@ func (db *DB) Shrink() error {
 		db.mu.Unlock()
 		return ErrShrinkInProcess
 	}
+	if db.diskErr != nil {
+		// A disk fault has already forced the database into the read-only
+		// state. The file must be recovered before a shrink is attempted.
+		err := db.diskErr
+		db.mu.Unlock()
+		return err
+	}
 	db.shrinking = true
 	defer func() {
 		db.mu.Lock()
@@ -662,17 +798,20 @@ func (db *DB) Shrink() error {
 	// finished writing all of the current items.
 	endpos, err := db.file.Seek(0, 2)
 	if err != nil {
+		db.markDiskFault(err)
+		err = db.diskErr
+		db.mu.Unlock()
 		return err
 	}
 	db.mu.Unlock()
 	time.Sleep(time.Second / 4) // wait just a bit before starting
-	f, err := os.Create(tmpname)
+	f, err := db.aofio.Create(tmpname)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		_ = f.Close()
-		_ = os.RemoveAll(tmpname)
+		_ = db.aofio.Remove(tmpname)
 	}()
 
 	// we are going to read items in as chunks as to not hold up the database
@@ -727,10 +866,15 @@ func (db *DB) Shrink() error {
 		if db.closed {
 			return ErrDatabaseClosed
 		}
+		// A fault may have been reported by concurrent transactions while
+		// the snapshot was being generated. Refuse to swap in that case.
+		if db.diskErr != nil {
+			return db.diskErr
+		}
 		// We are going to open a new version of the aof file so that we do
 		// not change the seek position of the previous. This may cause a
 		// problem in the future if we choose to use syscall file locking.
-		aof, err := os.Open(fname)
+		aof, err := db.aofio.Open(fname)
 		if err != nil {
 			return err
 		}
@@ -747,27 +891,65 @@ func (db *DB) Shrink() error {
 		if err := aof.Close(); err != nil {
 			return err
 		}
+		// Flush the compacted file to stable storage before it becomes the
+		// live AOF, so a crash after the swap cannot reveal an empty or
+		// partially written replacement.
+		if err := f.Sync(); err != nil {
+			return err
+		}
 		if err := f.Close(); err != nil {
 			return err
 		}
 		if err := db.file.Close(); err != nil {
-			return err
+			// The old handle is closed but the swap has not happened yet,
+			// so while the on-disk AOF is untouched the database no longer
+			// holds a writable handle. Enter the fault state.
+			db.markDiskFault(err)
+			return db.diskErr
 		}
-		// Any failures below here are really bad. So just panic.
-		if err := renameFile(tmpname, fname); err != nil {
-			panicErr(err)
+		// Replace the live AOF with the compacted file. A failed rename
+		// leaves the original AOF on disk but the database has no live
+		// handle; refuse further writes until the boundary is confirmed.
+		if err := db.aofio.Rename(tmpname, fname); err != nil {
+			// The original file was never replaced. Try to reopen it so
+			// that Recover can reconfirm the boundary without forcing a
+			// full process restart. If even that fails, only closing and
+			// reopening the database can clear the fault.
+			if rerr := db.reopenAOF(fname); rerr != nil {
+				db.markDiskFault(fmt.Errorf("rename failed: %w; reopen "+
+					"original failed: %v", err, rerr))
+			} else {
+				db.markDiskFault(err)
+			}
+			return db.diskErr
 		}
-		db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
-		if err != nil {
-			panicErr(err)
+		if err = db.reopenAOF(fname); err != nil {
+			db.markDiskFault(err)
+			return db.diskErr
 		}
 		pos, err := db.file.Seek(0, 2)
 		if err != nil {
-			return err
+			db.markDiskFault(err)
+			return db.diskErr
 		}
 		db.lastaofsz = int(pos)
 		return nil
 	}()
+}
+
+// reopenAOF opens the database file again read-write and positions the
+// offset at its end. The caller must hold db.mu.
+func (db *DB) reopenAOF(fname string) error {
+	f, err := db.aofio.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 2); err != nil {
+		_ = f.Close()
+		return err
+	}
+	db.file = f
+	return nil
 }
 
 func panicErr(err error) error {
@@ -969,26 +1151,11 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 // http://redis.io/topics/protocol. The only supported RESP commands are DEL and
 // SET.
 func (db *DB) load() error {
-	fi, err := db.file.Stat()
+	keys, exps, idxs, _, err := db.scanDurable()
 	if err != nil {
 		return err
 	}
-	n, err := db.readLoad(db.file, fi.ModTime())
-	if err != nil {
-		if err == io.ErrUnexpectedEOF {
-			// The db file has ended mid-command, which is allowed but the
-			// data file should be truncated to the end of the last valid
-			// command
-			if err := db.file.Truncate(n); err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
-	}
-	if _, err := db.file.Seek(n, 0); err != nil {
-		return err
-	}
+	db.keys, db.exps, db.idxs = keys, exps, idxs
 	var estaofsz int
 	db.keys.Walk(func(items []interface{}) {
 		for _, v := range items {
@@ -996,6 +1163,137 @@ func (db *DB) load() error {
 		}
 	})
 	db.lastaofsz += estaofsz
+	return nil
+}
+
+// scanDurable replays the AOF from the beginning into fresh trees, confirms
+// the byte offset of the last fully readable command, and truncates any
+// uncertain trailing bytes (such as a torn append) to that boundary. It
+// returns the rebuilt trees, the retained index definitions, and the number
+// of bytes that are known to hold valid commands. Indexes are rebuilt over
+// the recovered key set. The file offset is left at the durable boundary.
+func (db *DB) scanDurable() (
+	keys, exps *btree.BTree, idxs map[string]*index, n int64, err error,
+) {
+	fi, err := db.file.Stat()
+	if err != nil {
+		return nil, nil, nil, 0, err
+	}
+	// Replay into isolated trees so a failed scan leaves the live database
+	// untouched.
+	prevkeys, prevexps, previdxs := db.keys, db.exps, db.idxs
+	db.keys = btreeNew(lessCtx(nil))
+	db.exps = btreeNew(lessCtx(&exctx{db}))
+	db.idxs = make(map[string]*index)
+	defer func() {
+		if err != nil {
+			db.keys, db.exps, db.idxs = prevkeys, prevexps, previdxs
+		}
+	}()
+	if _, err = db.file.Seek(0, 0); err != nil {
+		return nil, nil, nil, 0, err
+	}
+	n, err = db.readLoad(db.file, fi.ModTime())
+	switch {
+	case err == nil:
+	case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+		// The file ended mid-command, which happens after a torn append.
+		// The bytes beyond the last fully valid command are of unknown
+		// durability and must be removed before appending can resume.
+		err = nil
+	default:
+		return nil, nil, nil, 0, err
+	}
+	if fi.Size() > n {
+		if err = db.file.Truncate(n); err != nil {
+			return nil, nil, nil, 0, err
+		}
+		// Make the truncation durable so a later crash cannot re-expose the
+		// uncertain tail.
+		if err = db.file.Sync(); err != nil {
+			return nil, nil, nil, 0, err
+		}
+	}
+	if _, err = db.file.Seek(n, 0); err != nil {
+		return nil, nil, nil, 0, err
+	}
+	// Preserve the index definitions (not their contents) and rebuild them
+	// over the recovered data.
+	recoveredIdxs := make(map[string]*index, len(previdxs))
+	for name, idx := range previdxs {
+		nidx := idx.clearCopy()
+		nidx.rebuild()
+		recoveredIdxs[name] = nidx
+	}
+	return db.keys, db.exps, recoveredIdxs, n, nil
+}
+
+// markDiskFault forces the database into the read-only disk-fault state with
+// the provided I/O error. Reads keep working, but every subsequent write
+// fails until Recover is called or the database is reopened. The caller must
+// hold db.mu.
+func (db *DB) markDiskFault(err error) {
+	if db.diskErr == nil && err != nil {
+		db.diskErr = &diskFaultError{cause: err}
+	}
+}
+
+// Recover confirms the durable boundary of the append-only file and, when
+// possible, clears the disk-fault state so that writes are accepted again.
+//
+// Recovery does not merely clear the stored error: the AOF is replayed from
+// the beginning and any trailing bytes that do not form a complete command
+// are truncated away and synced, because after a short write or a failed
+// sync it cannot be assumed that the current file end is a safe append
+// point. The in-memory database is reset to exactly the valid prefix, which
+// is the same result as closing and reopening the file.
+//
+// Recover returns nil when the fault has been cleared. If the underlying
+// I/O problem persists its error is returned and the database stays
+// read-only. It is safe to call Recover on a healthy database; in that case
+// it only replays and validates the AOF.
+func (db *DB) Recover() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	if !db.persist {
+		db.diskErr = nil
+		return nil
+	}
+	if db.file == nil {
+		// A failed shrink swap may have closed the live handle without
+		// replacing the on-disk file. Reopen it before scanning.
+		if db.path == "" {
+			return db.diskErr
+		}
+		f, rerr := db.aofio.OpenFile(db.path, os.O_CREATE|os.O_RDWR, 0666)
+		if rerr != nil {
+			db.markDiskFault(rerr)
+			return db.diskErr
+		}
+		db.file = f
+		if _, rerr = db.file.Seek(0, 2); rerr != nil {
+			db.markDiskFault(rerr)
+			return db.diskErr
+		}
+	}
+	keys, exps, idxs, _, err := db.scanDurable()
+	if err != nil {
+		db.markDiskFault(err)
+		return db.diskErr
+	}
+	db.keys, db.exps, db.idxs = keys, exps, idxs
+	db.lastaofsz = 0
+	keys.Walk(func(items []interface{}) {
+		for _, v := range items {
+			db.lastaofsz += v.(*dbItem).estAOFSetSize()
+		}
+	})
+	db.buf = db.buf[:0]
+	// The boundary has been confirmed and made durable; writes may resume.
+	db.diskErr = nil
 	return nil
 }
 
@@ -1137,6 +1435,13 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		return nil, ErrDatabaseClosed
 	}
 	if writable {
+		if db.diskErr != nil {
+			// The append-only file has suffered an I/O failure and the
+			// durable boundary has not been reconfirmed. Reads remain
+			// available, but writes are rejected until Recover or a reopen.
+			tx.unlock()
+			return nil, db.diskErr
+		}
 		// writable transactions have a writeContext object that
 		// contains information about changes to the database.
 		tx.wc = &txWriteContext{}
@@ -1225,34 +1530,44 @@ func (tx *Tx) Commit() error {
 			}
 		}
 		// Flushing the buffer only once per transaction.
-		// If this operation fails then the write did failed and we must
-		// rollback.
 		var n int
 		n, err = tx.db.file.Write(tx.db.buf)
 		if err != nil {
-			if n > 0 {
-				// There was a partial write to disk.
-				// We are possibly out of disk space.
-				// Delete the partially written bytes from the data file by
-				// seeking to the previously known position and performing
-				// a truncate operation.
-				// At this point a syscall failure is fatal and the process
-				// should be killed to avoid corrupting the file.
-				pos, err := tx.db.file.Seek(-int64(n), 1)
-				if err != nil {
-					panicErr(err)
-				}
-				if err := tx.db.file.Truncate(pos); err != nil {
-					panicErr(err)
-				}
-			}
+			// The append either failed outright or wrote only part of the
+			// record (a short write). The file tail may now contain a
+			// partial command whose durability is unknown, and any attempt
+			// to seek/truncate it back is itself disk I/O that cannot be
+			// trusted. We therefore do not repair-and-continue: the
+			// in-memory changes are rolled back and the database enters the
+			// read-only disk-fault state. Writes resume only after Recover
+			// (or a reopen) confirms the boundary of the last complete
+			// command and truncates the uncertain tail.
+			tx.db.markDiskFault(err)
+			err = tx.db.diskErr
 			tx.rollbackInner()
+		} else if n != len(tx.db.buf) {
+			// A nil error with a short count still leaves a torn record at
+			// the tail. Treat it the same as a short write.
+			tx.db.markDiskFault(io.ErrShortWrite)
+			err = tx.db.diskErr
+			tx.rollbackInner()
+		} else if tx.db.config.SyncPolicy == Always {
+			if serr := tx.db.file.Sync(); serr != nil {
+				// The bytes reached the kernel, but their durability cannot
+				// be guaranteed. We cannot roll them back from disk, so the
+				// committed changes are kept in memory (they match what may
+				// be on disk) and the database goes read-only. Recover
+				// confirms whether the record survived before reopening for
+				// writes.
+				tx.db.markDiskFault(serr)
+				err = tx.db.diskErr
+			}
 		}
-		if tx.db.config.SyncPolicy == Always {
-			_ = tx.db.file.Sync()
+		if err == nil {
+			// Increment the number of flushes. The background syncing uses
+			// this.
+			tx.db.flushes++
 		}
-		// Increment the number of flushes. The background syncing uses this.
-		tx.db.flushes++
 	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()

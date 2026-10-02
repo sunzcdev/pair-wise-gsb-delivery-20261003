@@ -558,6 +558,25 @@ The `Config.SyncPolicy` has the following options:
 - `EverySecond` - fsync every second, fast and safer, this is the default
 - `Always` - fsync after every write, very durable, slower
 
+### Disk faults and recovery
+
+A write to the append-only file can fail in ways whose effects are not automatically undone:
+
+- a **short write** leaves a partial command at the end of the file,
+- a **failed `Sync`** means the durability of previously written bytes is unknown,
+- a **failed shrink swap** leaves the on-disk state ambiguous.
+
+When this happens BuntDB does not keep appending to an uncertain tail. The database enters a **read-only disk-fault state**: reads continue to work, but every write (and every `Shrink`) returns `ErrDiskFault`, which wraps the underlying I/O error (`errors.Is(err, buntdb.ErrDiskFault)`). Use `db.DiskFault()` to inspect the fault at any time.
+
+Writes are re-enabled only after the durable boundary has been reconfirmed:
+
+- call `db.Recover()`, which replays the AOF, truncates and syncs any trailing bytes that do not form a complete command, and resets the in-memory database to that valid prefix; or
+- close and reopen the database, which performs the same boundary confirmation on open.
+
+### Injecting disk I/O
+
+Open the database with `OpenWithConfig` and provide `Config.AOFIO`, an interface with `OpenFile`, `Create`, `Open`, `Rename`, and `Remove` operations (`*os.File` satisfies the corresponding `AOFile` interface). Wrapping these operations lets tests simulate short writes, sync failures, and shrink-swap failures.
+
 ## Config
 
 Here are some configuration options that can be use to change various behaviors of the database.
