@@ -176,31 +176,35 @@ func (c *compiler) addVariable(name string) int {
 func (c *compiler) emitFunction(fn *builtin.Function, argsLen int) {
 	switch argsLen {
 	case 0:
-		c.emit(OpCall0, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall0, c.addFunction(fn))
 	case 1:
-		c.emit(OpCall1, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall1, c.addFunction(fn))
 	case 2:
-		c.emit(OpCall2, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall2, c.addFunction(fn))
 	case 3:
-		c.emit(OpCall3, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall3, c.addFunction(fn))
 	default:
-		c.emit(OpLoadFunc, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpLoadFunc, c.addFunction(fn))
 		c.emit(OpCallN, argsLen)
 	}
 }
 
 // addFunction adds builtin.Function.Func to the program.functions and returns its index.
-func (c *compiler) addFunction(name string, fn Function) int {
-	if fn == nil {
+// It also records the function's stable symbol (name) and its type signature
+// in the debug info, so a compiled program can be marshaled and later
+// re-bound to a host environment (see vm.Marshal and vm.Unmarshal).
+func (c *compiler) addFunction(fn *builtin.Function) int {
+	if fn == nil || fn.Func == nil {
 		panic("function is nil")
 	}
-	if p, ok := c.functionsIndex[name]; ok {
+	if p, ok := c.functionsIndex[fn.Name]; ok {
 		return p
 	}
 	p := len(c.functions)
-	c.functions = append(c.functions, fn)
-	c.functionsIndex[name] = p
-	c.debugInfo[fmt.Sprintf("func_%d", p)] = name
+	c.functions = append(c.functions, fn.Func)
+	c.functionsIndex[fn.Name] = p
+	c.debugInfo[fmt.Sprintf("func_%d", p)] = fn.Name
+	c.debugInfo[fmt.Sprintf("funcsig_%d", p)] = fn.Type().String()
 	return p
 }
 
