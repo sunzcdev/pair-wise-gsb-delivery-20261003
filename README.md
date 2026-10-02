@@ -59,6 +59,17 @@ use Rack::MailExceptions
 run theapp
 ```
 
+For full language-tag negotiation without changing `I18n.available_locales`:
+
+```ruby
+use Rack::Locale, %w(en zh-Hans zh-Hant), default_locale: 'en'
+```
+
+The middleware tries an exact match, then progressively shorter request tags,
+then wildcard ranges and the default locale. A `q=0` range is rejected and
+cannot be selected through wildcard or prefix fallback; rejecting the default
+locale results in a `406 Not Acceptable` response.
+
 #### Versioning
 
 This package is [semver compliant](https://semver.org); you should use a
