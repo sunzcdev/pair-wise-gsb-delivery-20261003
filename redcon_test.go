@@ -372,6 +372,244 @@ func TestConnImpl(t *testing.T) {
 	}
 }
 
+func TestStreamLargeArgumentPipeline(t *testing.T) {
+	addr := "127.0.0.1:16380"
+	payload := strings.Repeat("x", 4096)
+	var got []byte
+	s := NewStreamServer(addr, func(conn Conn, cmd *StreamCommand) {
+		if strings.ToLower(string(cmd.Args[0])) == "ping" {
+			conn.WriteString("PONG")
+			return
+		}
+		ok, err := cmd.NextLargeArg()
+		if err != nil || !ok || cmd.ArgIndex != 1 || cmd.ArgSize != int64(len(payload)) {
+			t.Errorf("NextLargeArg() = %v, %v; want true, nil", ok, err)
+			conn.Close()
+			return
+		}
+		got, err = io.ReadAll(cmd)
+		if err != nil {
+			t.Errorf("ReadAll: %v", err)
+			conn.Close()
+			return
+		}
+		rest, err := cmd.RemainingArgs()
+		if err != nil || len(rest) != 1 || string(rest[0]) != "tail" {
+			t.Errorf("RemainingArgs() = %q, %v", rest, err)
+			conn.Close()
+			return
+		}
+		conn.WriteString("OK")
+	}, nil, nil)
+	s.SetStreamLimits(64, 1024)
+	closed := make(chan error, 1)
+	go func() { closed <- s.ListenAndServe() }()
+
+	c := dialTestTCP(t, addr)
+	defer c.Close()
+	msg := fmt.Sprintf("*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$4\r\ntail\r\n*1\r\n$4\r\nPING\r\n",
+		len(payload), payload)
+	if _, err := io.WriteString(c, msg); err != nil {
+		t.Fatal(err)
+	}
+	var reply []byte
+	reply = readAvailable(t, c, len("+OK\r\n+PONG\r\n"), time.Second)
+	if string(reply) != "+OK\r\n+PONG\r\n" {
+		t.Fatalf("got %q", reply)
+	}
+	if string(got) != payload {
+		t.Fatalf("large payload mismatch")
+	}
+	s.Close()
+	<-closed
+}
+
+func dialTestTCP(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		c, err := net.Dial("tcp", addr)
+		if err == nil {
+			return c
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal(lastErr)
+	return nil
+}
+func TestStreamRejectPartialThenPipelineContinues(t *testing.T) {
+	addr := "127.0.0.1:16381"
+	payload := strings.Repeat("abcdefgh", 1024)
+	s := NewStreamServer(addr, func(conn Conn, cmd *StreamCommand) {
+		if strings.ToLower(string(cmd.Args[0])) == "ping" {
+			conn.WriteString("PONG")
+			return
+		}
+		ok, err := cmd.NextLargeArg()
+		if err != nil || !ok {
+			t.Errorf("NextLargeArg: %v %v", ok, err)
+			conn.Close()
+			return
+		}
+		part := make([]byte, 17)
+		if _, err := io.ReadFull(cmd, part); err != nil {
+			t.Errorf("ReadFull: %v", err)
+			conn.Close()
+			return
+		}
+		conn.WriteError("ERR rejected")
+		if err := cmd.Close(); err != nil {
+			t.Errorf("Close stream: %v", err)
+		}
+	}, nil, nil)
+	s.SetStreamLimits(64, 1024)
+	closed := make(chan error, 1)
+	go func() { closed <- s.ListenAndServe() }()
+
+	c := dialTestTCP(t, addr)
+	defer c.Close()
+	msg := fmt.Sprintf("*3\r\n$3\r\nPUT\r\n$%d\r\n%s\r\n$1\r\nz\r\n*1\r\n$4\r\nPING\r\n",
+		len(payload), payload)
+	if _, err := io.WriteString(c, msg); err != nil {
+		t.Fatal(err)
+	}
+	reply := readAvailable(t, c, len("-ERR rejected\r\n+PONG\r\n"), time.Second)
+	if string(reply) != "-ERR rejected\r\n+PONG\r\n" {
+		t.Fatalf("got %q", reply)
+	}
+	s.Close()
+	<-closed
+}
+
+func TestStreamShortReadAndLengthOverflowClose(t *testing.T) {
+	t.Run("short read", func(t *testing.T) {
+		testStreamConnectionCloses(t, "127.0.0.1:16382",
+			"*2\r\n$3\r\nSET\r\n$100\r\nshort\r\n", true)
+	})
+	t.Run("canceled read", func(t *testing.T) {
+		testStreamCanceledReadCloses(t, "127.0.0.1:16384")
+	})
+	t.Run("length overflow", func(t *testing.T) {
+		testStreamConnectionCloses(t, "127.0.0.1:16385",
+			"*2\r\n$3\r\nSET\r\n$999999999999999999999999\r\nx\r\n", false)
+	})
+}
+
+func testStreamCanceledReadCloses(t *testing.T, addr string) {
+	s := NewStreamServer(addr, func(conn Conn, cmd *StreamCommand) {
+		if _, err := cmd.NextLargeArg(); err != nil {
+			t.Errorf("NextLargeArg: %v", err)
+			return
+		}
+		conn.NetConn().SetReadDeadline(time.Now().Add(25 * time.Millisecond))
+		buf := make([]byte, 16)
+		if _, err := io.ReadFull(cmd, buf); err == nil {
+			t.Error("Read unexpectedly succeeded after deadline")
+		}
+	}, nil, nil)
+	s.SetStreamLimits(4, 1024)
+	closed := make(chan error, 1)
+	go func() { closed <- s.ListenAndServe() }()
+
+	c := dialTestTCP(t, addr)
+	defer c.Close()
+	if _, err := io.WriteString(c, "*2\r\n$3\r\nSET\r\n$100\r\nshort\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(time.Second))
+	buf := make([]byte, 16)
+	if _, err := c.Read(buf); err == nil {
+		t.Fatal("connection stayed open after canceled read")
+	}
+	s.Close()
+	<-closed
+}
+
+func readAvailable(t *testing.T, c net.Conn, want int, wait time.Duration) []byte {
+	t.Helper()
+	buf := make([]byte, 256)
+	var got []byte
+	deadline := time.Now().Add(wait)
+	for len(got) < want && time.Now().Before(deadline) {
+		c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, err := c.Read(buf)
+		got = append(got, buf[:n]...)
+		if err != nil {
+			timeout, ok := err.(net.Error)
+			if !ok || !timeout.Timeout() {
+				t.Fatal(err)
+			}
+		}
+	}
+	return got
+}
+
+func testStreamConnectionCloses(t *testing.T, addr, msg string, enterHandler bool) {
+	entered := make(chan struct{}, 1)
+	s := NewStreamServer(addr, func(conn Conn, cmd *StreamCommand) {
+		if strings.ToLower(string(cmd.Args[0])) == "ping" {
+			t.Errorf("PING executed after failed command")
+			conn.WriteString("PONG")
+			return
+		}
+		if _, err := cmd.NextLargeArg(); err != nil {
+			t.Errorf("NextLargeArg: %v", err)
+			return
+		}
+		entered <- struct{}{}
+		_, _ = io.Copy(io.Discard, cmd)
+		conn.WriteString("OK")
+	}, nil, nil)
+	s.SetStreamLimits(4, 1024)
+	closed := make(chan error, 1)
+	go func() { closed <- s.ListenAndServe() }()
+
+	c := dialTestTCP(t, addr)
+	defer c.Close()
+	if _, err := io.WriteString(c, msg); err != nil {
+		t.Fatal(err)
+	}
+	if enterHandler {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("handler did not enter")
+		}
+		if closer, ok := c.(interface{ CloseWrite() error }); ok {
+			if err := closer.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	buf := make([]byte, 16)
+	if n, err := c.Read(buf); err == nil {
+		if !enterHandler {
+			var reply []byte
+			reply = append(reply, buf[:n]...)
+			c.SetReadDeadline(time.Now().Add(time.Second))
+			for {
+				n2, err := c.Read(buf)
+				reply = append(reply, buf[:n2]...)
+				if err != nil {
+					if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+						t.Fatal("connection stayed open after protocol error")
+					}
+					break
+				}
+			}
+			if !strings.HasPrefix(string(reply), "-ERR Protocol error: invalid bulk length\r\n") {
+				t.Fatalf("got %q", reply)
+			}
+		} else {
+			t.Fatalf("connection stayed open, read %q", buf[:n])
+		}
+	}
+	s.Close()
+	<-closed
+}
+
 func TestWriteBulkFrom(t *testing.T) {
 	wbuf := &bytes.Buffer{}
 	wr := NewWriter(wbuf)

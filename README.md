@@ -20,6 +20,44 @@ Features
 
 *This library is also available for [Rust](https://github.com/tidwall/redcon.rs) and [C](https://github.com/tidwall/redcon.c).*
 
+Streaming bulk arguments
+------------------------
+
+Use `NewStreamServer` when a single RESP bulk argument can be larger than
+available memory. Small arguments remain available through `cmd.Args`; a large
+argument is exposed as an `io.Reader` with its declared length:
+
+```go
+srv := redcon.NewStreamServer(addr, func(conn redcon.Conn, cmd *redcon.StreamCommand) {
+    switch strings.ToLower(string(cmd.Args[0])) {
+    default:
+        conn.WriteError("ERR unknown command")
+    case "setbig":
+        ok, err := cmd.NextLargeArg()
+        if err != nil || !ok {
+            conn.WriteError("ERR invalid command")
+            return
+        }
+        if cmd.ArgSize > maxAllowed {
+            // Discard with bounded memory to continue the pipeline, or call
+            // conn.Close when the connection must terminate immediately.
+            conn.WriteError("ERR payload too large")
+            cmd.Close()
+            return
+        }
+        if _, err := io.Copy(storage, io.LimitReader(cmd, cmd.ArgSize)); err != nil {
+            conn.Close()
+            return
+        }
+        conn.WriteString("OK")
+    }
+}, nil, nil)
+```
+
+Short reads, malformed lengths, and length overflows close the connection
+rather than executing a partially received command. Existing `NewServer`
+handlers keep the original fully buffered behavior.
+
 Installing
 ----------
 
