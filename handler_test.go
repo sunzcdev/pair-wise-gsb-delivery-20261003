@@ -396,8 +396,8 @@ func TestWrongTokenFails(t *testing.T) {
 
 	vals := [][]string{
 		{"name", "Jolene"},
-		// this won't EVER be a valid value with the current scheme
-		{FormFieldName, "$#%^&"},
+		// a well-formed, but incorrect token
+		{FormFieldName, b64encode(maskToken(generateToken()))},
 	}
 
 	req, err := http.NewRequest("POST", "/", formBodyR(vals))

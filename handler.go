@@ -63,33 +63,15 @@ type CSRFHandler struct {
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
+
+	// The chain of extractors used to obtain the sent token,
+	// and the policy for tokens provided by multiple sources.
+	extractors     []TokenExtractor
+	conflictPolicy ConflictPolicy
 }
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, http.StatusText(FailureCode), FailureCode)
-}
-
-// Extracts the "sent" token from the request
-// and returns an unmasked version of it
-func extractToken(r *http.Request) []byte {
-	// Prefer the header over form value
-	sentToken := r.Header.Get(HeaderName)
-
-	// Then POST values
-	if len(sentToken) == 0 {
-		sentToken = r.PostFormValue(FormFieldName)
-	}
-
-	// If all else fails, try a multipart value.
-	// PostFormValue() will already have called ParseMultipartForm()
-	if len(sentToken) == 0 && r.MultipartForm != nil {
-		vals := r.MultipartForm.Value[FormFieldName]
-		if len(vals) != 0 {
-			sentToken = vals[0]
-		}
-	}
-
-	return b64decode(sentToken)
 }
 
 // Constructs a new CSRFHandler that calls
@@ -102,6 +84,8 @@ func New(handler http.Handler) *CSRFHandler {
 		failureHandler: http.HandlerFunc(defaultFailureHandler),
 		baseCookie:     baseCookie,
 		isTLS:          func(r *http.Request) bool { return true },
+		extractors:     defaultExtractors(),
+		conflictPolicy: ConflictFirstWins,
 	}
 
 	return csrf
@@ -159,9 +143,14 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Finally, we check the token itself.
-	sentToken := extractToken(r)
+	sentToken, err := h.extractToken(r)
+	if err != nil {
+		ctxSetReason(r, err)
+		h.handleFailure(w, r)
+		return
+	}
 
-	if !verifyToken(realToken, sentToken) {
+	if !verifyToken(realToken, b64decode(sentToken)) {
 		ctxSetReason(r, ErrBadToken)
 		h.handleFailure(w, r)
 		return
@@ -283,6 +272,38 @@ func (h *CSRFHandler) SetFailureHandler(handler http.Handler) {
 // This way you can specify the Domain, Path, HttpOnly, Secure, etc.
 func (h *CSRFHandler) SetBaseCookie(cookie http.Cookie) {
 	h.baseCookie = cookie
+}
+
+// SetTokenExtractors sets the chain of extractors used to obtain
+// the CSRF token sent with the request. Extractors are consulted
+// in order; see TokenExtractor for the exact semantics.
+//
+// The default chain is equivalent to
+//
+//	h.SetTokenExtractors(HeaderTokenExtractor(HeaderName), FormTokenExtractor(FormFieldName))
+//
+// which prefers the X-CSRF-Token header and falls back to the
+// csrf_token form field.
+//
+// For JSON APIs, a custom extractor can supply the token from an
+// application-defined location. For file uploads, use a header-only
+// chain, e.g.
+//
+//	h.SetTokenExtractors(HeaderTokenExtractor(HeaderName))
+//
+// so that the CSRF check never parses multipart data or consumes
+// the request body.
+//
+// Calling this with no extractors disables token extraction:
+// all unsafe, non-exempt requests will fail the CSRF check.
+func (h *CSRFHandler) SetTokenExtractors(extractors ...TokenExtractor) {
+	h.extractors = extractors
+}
+
+// SetConflictPolicy sets the policy used when more than one extractor
+// provides a token for the same request. The default is ConflictFirstWins.
+func (h *CSRFHandler) SetConflictPolicy(policy ConflictPolicy) {
+	h.conflictPolicy = policy
 }
 
 // SetIsTLSFunc sets a delegate function which determines, on a per-request basis, whether the request is made over a secure connection.

@@ -117,6 +117,37 @@ func HandleJson(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### Custom token extraction
+By default, the token is taken from the `X-CSRF-Token` header,
+falling back to the `csrf_token` form field (including multipart forms).
+You can replace this with a custom extractor chain, e.g. when a JSON API
+sends the token from an application-defined location:
+
+```go
+hand := nosurf.New(myHandler)
+hand.SetTokenExtractors(nosurf.HeaderTokenExtractor("X-API-Token"))
+```
+
+Each extractor reports one of three outcomes: the token was not provided
+(the next extractor is consulted), a token was provided, or the input was
+invalid. An invalid result fails the check immediately — the handler never
+falls back to another extractor that happens to carry a valid token.
+
+For file uploads, use a header-only chain so that the check never parses
+multipart data or consumes the request body:
+
+```go
+hand.SetTokenExtractors(nosurf.HeaderTokenExtractor(nosurf.HeaderName))
+```
+
+When multiple sources may provide a token at once, choose an explicit
+conflict policy: `ConflictFirstWins` (the default, header preferred over
+form) or `ConflictError` (fail with `ErrConflictingTokens`):
+
+```go
+hand.SetConflictPolicy(nosurf.ConflictError)
+```
+
 ### Contributing
 
 0. Find an issue that bugs you / open a new one.
