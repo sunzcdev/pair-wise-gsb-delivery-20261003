@@ -83,10 +83,29 @@ type GzipResponseWriter struct {
 
 	minSize int    // Specifies the minimum response size to gzip. If the response length is bigger than this value, it is compressed.
 	buf     []byte // Holds the first part of the write before reaching the minSize or the end of the write.
-	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
+
+	// encoding records the response encoding, once it has been decided.
+	// It starts as encodingUndecided and can only transition to
+	// encodingGzip or encodingPlain. The first Flush with a flushStrategy
+	// may force the decision; after that it never changes.
+	encoding encodingState
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+
+	// flushStrategy, if set, is consulted on the first Flush while the
+	// encoding is still undecided.
+	flushStrategy FlushStrategy
 }
+
+// encodingState records whether the buffered response is going to be gzip
+// compressed or passed through untouched.
+type encodingState uint8
+
+const (
+	encodingUndecided encodingState = iota
+	encodingGzip
+	encodingPlain
+)
 
 type GzipResponseWriterWithCloseNotify struct {
 	*GzipResponseWriter
@@ -103,9 +122,17 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 		return w.gw.Write(b)
 	}
 
-	// If we have already decided not to use GZIP, immediately passthrough.
-	if w.ignore {
+	// If the encoding has already been decided, route the write accordingly.
+	// It can never change after the first decision.
+	switch w.encoding {
+	case encodingPlain:
+		// Immediately passthru writes to the underlying ResponseWriter.
 		return w.ResponseWriter.Write(b)
+	case encodingGzip:
+		// Gzip was selected before any byte was buffered (e.g. by an empty
+		// write followed by a real one), so initialize the writer now.
+		w.init()
+		return w.gw.Write(b)
 	}
 
 	// Save the write into a buffer for later use in GZIP responseWriter (if content is long enough) or at close with regular responseWriter.
@@ -148,6 +175,8 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 
 // startGzip initializes a GZIP writer and writes the buffer.
 func (w *GzipResponseWriter) startGzip() error {
+	w.encoding = encodingGzip
+
 	// Set the GZIP header.
 	w.Header().Set(contentEncoding, "gzip")
 
@@ -169,12 +198,14 @@ func (w *GzipResponseWriter) startGzip() error {
 	if len(w.buf) > 0 {
 		// Initialize the GZIP response.
 		w.init()
-		n, err := w.gw.Write(w.buf)
+		buf := w.buf
+		w.buf = nil
+		n, err := w.gw.Write(buf)
 
 		// This should never happen (per io.Writer docs), but if the write didn't
 		// accept the entire buffer but returned no specific error, we have no clue
 		// what's going on, so abort just to be safe.
-		if err == nil && n < len(w.buf) {
+		if err == nil && n < len(buf) {
 			err = io.ErrShortWrite
 		}
 		return err
@@ -184,22 +215,24 @@ func (w *GzipResponseWriter) startGzip() error {
 
 // startPlain writes to sent bytes and buffer the underlying ResponseWriter without gzip.
 func (w *GzipResponseWriter) startPlain() error {
+	w.encoding = encodingPlain
+
 	if w.code != 0 {
 		w.ResponseWriter.WriteHeader(w.code)
 		// Ensure that no other WriteHeader's happen
 		w.code = 0
 	}
-	w.ignore = true
 	// If Write was never called then don't call Write on the underlying ResponseWriter.
 	if w.buf == nil {
 		return nil
 	}
-	n, err := w.ResponseWriter.Write(w.buf)
+	buf := w.buf
 	w.buf = nil
+	n, err := w.ResponseWriter.Write(buf)
 	// This should never happen (per io.Writer docs), but if the write didn't
 	// accept the entire buffer but returned no specific error, we have no clue
 	// what's going on, so abort just to be safe.
-	if err == nil && n < len(w.buf) {
+	if err == nil && n < len(buf) {
 		err = io.ErrShortWrite
 	}
 	return err
@@ -224,45 +257,144 @@ func (w *GzipResponseWriter) init() {
 
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
 func (w *GzipResponseWriter) Close() error {
-	if w.ignore {
+	switch w.encoding {
+	case encodingPlain:
 		return nil
-	}
-
-	if w.gw == nil {
-		// GZIP not triggered yet, write out regular response.
-		err := w.startPlain()
-		// Returns the error if any at write.
-		if err != nil {
-			err = fmt.Errorf("gziphandler: write to regular responseWriter at close gets error: %q", err.Error())
+	case encodingGzip:
+		// gw may be nil if gzip was selected through the write path with no
+		// buffered bytes; no gzip header was written, so there is no trailer
+		// to write and nothing to return to the pool.
+		if w.gw == nil {
+			return nil
 		}
+		err := w.gw.Close()
+		gzipWriterPools[w.index].Put(w.gw)
+		w.gw = nil
 		return err
 	}
 
-	err := w.gw.Close()
-	gzipWriterPools[w.index].Put(w.gw)
-	w.gw = nil
+	// GZIP not triggered yet, write out regular response.
+	err := w.startPlain()
+	// Returns the error if any at write.
+	if err != nil {
+		err = fmt.Errorf("gziphandler: write to regular responseWriter at close gets error: %q", err.Error())
+	}
 	return err
 }
 
-// Flush flushes the underlying *gzip.Writer and then the underlying
-// http.ResponseWriter if it is an http.Flusher. This makes GzipResponseWriter
-// an http.Flusher.
+// Flush flushes buffered data to the client. If a FlushStrategy is
+// configured and the encoding is still undecided, the first Flush gets to
+// finalize the encoding choice (see WithFlushStrategy). Afterwards it
+// flushes the underlying *gzip.Writer (when compressing), and then the
+// underlying http.ResponseWriter. This makes GzipResponseWriter an
+// http.Flusher.
+//
+// Use FlushError to observe failures while flushing.
 func (w *GzipResponseWriter) Flush() {
-	if w.gw == nil && !w.ignore {
-		// Only flush once startGzip or startPlain has been called.
-		//
-		// Flush is thus a no-op until we're certain whether a plain
-		// or gzipped response will be served.
-		return
+	_ = w.FlushError()
+}
+
+// FlushError behaves like Flush but returns an error, making the
+// GzipResponseWriter compatible with http.ResponseController.Flush on
+// Go 1.20 and newer. Errors from flushing the gzip writer or the underlying
+// ResponseWriter are returned to the caller.
+func (w *GzipResponseWriter) FlushError() error {
+	if w.encoding == encodingUndecided {
+		// Without a strategy, Flush remains a no-op until the write path or
+		// Close decides whether a plain or gzipped response is served.
+		if w.flushStrategy == nil {
+			return nil
+		}
+
+		switch w.flushStrategy(len(w.buf)) {
+		case FlushGzip:
+			// Gzip can only be selected while the response is still eligible
+			// for it; a preset Content-Encoding, a Content-Length below
+			// minSize or an unhandled Content-Type forces passthrough.
+			if w.gzipEligible() {
+				if err := w.commitGzip(); err != nil {
+					return err
+				}
+				break
+			}
+			fallthrough
+		case FlushIdentity:
+			if err := w.startPlain(); err != nil {
+				return err
+			}
+		default:
+			// FlushDefer: keep buffering and don't touch the underlying
+			// ResponseWriter yet.
+			return nil
+		}
 	}
 
 	if w.gw != nil {
-		w.gw.Flush()
+		if err := w.gw.Flush(); err != nil {
+			return err
+		}
 	}
 
-	if fw, ok := w.ResponseWriter.(http.Flusher); ok {
-		fw.Flush()
+	return w.flushUnderlying()
+}
+
+// gzipEligible reports whether the current response may still be gzip
+// compressed, mirroring the gating logic used by Write.
+func (w *GzipResponseWriter) gzipEligible() bool {
+	var (
+		cl, _ = strconv.Atoi(w.Header().Get(contentLength))
+		ct    = w.Header().Get(contentType)
+		ce    = w.Header().Get(contentEncoding)
+	)
+	if ce != "" {
+		return false
 	}
+	if cl != 0 && cl < w.minSize {
+		return false
+	}
+	if ct != "" && !handleContentType(w.contentTypes, ct) {
+		return false
+	}
+	return true
+}
+
+// commitGzip starts gzip compression unconditionally. Unlike startGzip
+// (used by the write path) it initializes the gzip writer even when nothing
+// has been buffered yet, so a zero-body first Flush still emits the gzip
+// header.
+func (w *GzipResponseWriter) commitGzip() error {
+	w.encoding = encodingGzip
+
+	w.Header().Set(contentEncoding, "gzip")
+
+	// if the Content-Length is already set, then calls to Write on gzip
+	// will fail to set the Content-Length header since its already set
+	// See: https://github.com/golang/go/issues/14975.
+	w.Header().Del(contentLength)
+
+	// Infer the Content-Type from the current buffer, just like Write does.
+	if w.Header().Get(contentType) == "" && len(w.buf) > 0 {
+		w.Header().Set(contentType, http.DetectContentType(w.buf))
+	}
+
+	// Write the saved status code before any body byte goes out.
+	if w.code != 0 {
+		w.ResponseWriter.WriteHeader(w.code)
+		w.code = 0
+	}
+
+	buf := w.buf
+	w.buf = nil
+	w.init()
+
+	if len(buf) == 0 {
+		return nil
+	}
+	n, err := w.gw.Write(buf)
+	if err == nil && n < len(buf) {
+		err = io.ErrShortWrite
+	}
+	return err
 }
 
 // Hijack implements http.Hijacker. If the underlying ResponseWriter is a
@@ -328,6 +460,7 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 					index:          index,
 					minSize:        c.minSize,
 					contentTypes:   c.contentTypes,
+					flushStrategy:  c.flushStrategy,
 				}
 				defer gw.Close()
 
@@ -376,9 +509,10 @@ func (pct parsedContentType) equals(mediaType string, params map[string]string) 
 
 // Used for functional configuration.
 type config struct {
-	minSize      int
-	level        int
-	contentTypes []parsedContentType
+	minSize       int
+	level         int
+	contentTypes  []parsedContentType
+	flushStrategy FlushStrategy
 }
 
 func (c *config) validate() error {
@@ -394,6 +528,54 @@ func (c *config) validate() error {
 }
 
 type option func(c *config)
+
+// FlushDecision is returned by a FlushStrategy to decide what happens on
+// the first Flush while the response encoding is still undecided.
+type FlushDecision uint8
+
+const (
+	// FlushDefer keeps buffering: the first Flush is a no-op and the
+	// encoding is decided later, exactly like the default behavior.
+	FlushDefer FlushDecision = iota
+
+	// FlushGzip commits to gzip on the first Flush. The currently buffered
+	// bytes are immediately emitted as gzip, even if the response is still
+	// smaller than MinSize. If the response is no longer eligible for gzip
+	// (a Content-Encoding is already set, the preset Content-Length is
+	// smaller than MinSize, or the Content-Type is not handled), the
+	// response is sent as plain instead.
+	FlushGzip
+
+	// FlushIdentity commits to passthrough (identity) on the first Flush.
+	// The currently buffered bytes are written to the underlying
+	// ResponseWriter without compression.
+	FlushIdentity
+)
+
+// FlushStrategy is consulted once, on the first Flush, while the response
+// encoding is still undecided. buffered is the number of bytes written so
+// far that are still held in the MinSize buffer (zero for a Flush that
+// happens before any Write). The returned decision commits the response to
+// gzip or identity encoding for its remainder; the encoding can never
+// change afterwards.
+type FlushStrategy func(buffered int) FlushDecision
+
+// FlushGzipImmediately is a FlushStrategy which commits to gzip on the
+// first Flush, no matter how little has been buffered.
+var FlushGzipImmediately FlushStrategy = func(int) FlushDecision { return FlushGzip }
+
+// FlushAsIdentity is a FlushStrategy which commits to passthrough on the
+// first Flush.
+var FlushAsIdentity FlushStrategy = func(int) FlushDecision { return FlushIdentity }
+
+// WithFlushStrategy configures the FlushStrategy used on the first Flush.
+// Without it, Flush stays a no-op until enough data has been written to
+// reach MinSize, preserving the default buffering behavior.
+func WithFlushStrategy(strategy FlushStrategy) option {
+	return func(c *config) {
+		c.flushStrategy = strategy
+	}
+}
 
 func MinSize(size int) option {
 	return func(c *config) {

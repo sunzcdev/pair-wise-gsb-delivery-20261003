@@ -1,8 +1,10 @@
 package gziphandler
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,10 +13,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
+
+// FlushError is the method picked up by http.ResponseController.Flush on
+// Go 1.20 and newer.
+var _ interface{ FlushError() error } = (*GzipResponseWriter)(nil)
 
 const (
 	smallTestBody = "aaabbcaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbcccaaabbbc"
@@ -429,6 +437,346 @@ func TestFlushBeforeWrite(t *testing.T) {
 	assert.NotEqual(t, b, w.Body.Bytes())
 }
 
+// newHeldGzipWriter builds a handler that parks after exposing its
+// GzipResponseWriter, so a test can drive Write/Flush/Close directly. The
+// returned channel must be closed at the end of the test to let the handler
+// (and its deferred Close) finish.
+func newHeldGzipWriter(t *testing.T, strategy FlushStrategy) (*GzipResponseWriter, *httptest.ResponseRecorder, chan<- struct{}) {
+	wrapper, err := GzipHandlerWithOpts(CompressionLevel(gzip.BestSpeed), MinSize(10000), WithFlushStrategy(strategy))
+	if err != nil {
+		t.Fatalf("GzipHandlerWithOpts: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set(acceptEncoding, "gzip")
+
+	done := make(chan struct{})
+	ready := make(chan *GzipResponseWriter)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ready <- w.(*GzipResponseWriter)
+		<-done
+	}))
+	go handler.ServeHTTP(rec, req)
+
+	return <-ready, rec, done
+}
+
+func decodeGzip(t *testing.T, b []byte) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	out, err := ioutil.ReadAll(gr)
+	if err != nil {
+		// A flushed-but-not-closed gzip stream is truncated; whatever was
+		// decoded up to the missing trailer is still valid output.
+		if err != io.ErrUnexpectedEOF && err != io.EOF {
+			t.Fatalf("reading gzip body: %v", err)
+		}
+	}
+	return out
+}
+
+func TestFirstFlushCommitsGzipBelowMinSize(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushGzipImmediately)
+	defer close(done)
+
+	first := []byte("first fragment")
+	if n, err := gw.Write(first); err != nil || n != len(first) {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	assert.Equal(t, encodingUndecided, gw.encoding, "still buffered until the first flush")
+	assert.False(t, rec.Flushed)
+
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingGzip, gw.encoding, "first flush commits gzip")
+	assert.True(t, rec.Flushed)
+	assert.Equal(t, "gzip", rec.Header().Get(contentEncoding))
+
+	// The whole current fragment is already observable after the first flush,
+	// and the buffer must not be written a second time later.
+	firstSeen := decodeGzip(t, append([]byte(nil), rec.Body.Bytes()...))
+	assert.Equal(t, first, firstSeen)
+
+	second := []byte("second fragment")
+	if _, err := gw.Write(second); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	assert.Equal(t, append(first, second...), decodeGzip(t, rec.Body.Bytes()))
+}
+
+func TestFirstFlushCommitsIdentity(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushAsIdentity)
+	defer close(done)
+
+	first := []byte("first fragment")
+	gw.Write(first)
+	assert.Equal(t, encodingUndecided, gw.encoding)
+
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingPlain, gw.encoding, "first flush commits passthrough")
+	assert.True(t, rec.Flushed)
+	assert.Equal(t, "", rec.Header().Get(contentEncoding))
+	assert.Equal(t, first, rec.Body.Bytes(), "buffered bytes handed out on first flush")
+
+	// Later writes can never switch back to gzip.
+	second := []byte("second fragment")
+	gw.Write(second)
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assert.Equal(t, "", rec.Header().Get(contentEncoding))
+	assert.Equal(t, append(first, second...), rec.Body.Bytes())
+}
+
+func TestZeroBodyFirstFlushGzip(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushGzipImmediately)
+	defer close(done)
+
+	gw.WriteHeader(http.StatusAccepted)
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingGzip, gw.encoding)
+	assert.Equal(t, http.StatusAccepted, rec.Code, "saved status is written")
+	assert.Equal(t, "gzip", rec.Header().Get(contentEncoding))
+	assert.True(t, rec.Flushed)
+
+	// The gzip stream already exists; a later write just extends it and Close
+	// emits exactly one gzip trailer.
+	if _, err := gw.Write([]byte("late body")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	out := decodeGzip(t, rec.Body.Bytes())
+	assert.Equal(t, []byte("late body"), out)
+
+	// Exactly one gzip member: a second member cannot start inside the body.
+	br := bytes.NewReader(rec.Body.Bytes())
+	gr1, err := gzip.NewReader(br)
+	if err != nil {
+		t.Fatalf("first gzip.NewReader: %v", err)
+	}
+	if _, err := ioutil.ReadAll(gr1); err != nil {
+		t.Fatalf("read first member: %v", err)
+	}
+	if _, err := gzip.NewReader(br); err == nil {
+		t.Fatal("expected no second gzip member, got one")
+	}
+}
+
+func TestZeroBodyFirstFlushIdentity(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushAsIdentity)
+	defer close(done)
+
+	gw.WriteHeader(http.StatusAccepted)
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingPlain, gw.encoding)
+	assert.Equal(t, http.StatusAccepted, rec.Code)
+	assert.Equal(t, "", rec.Header().Get(contentEncoding))
+	assert.Empty(t, rec.Body.Bytes())
+	assert.True(t, rec.Flushed)
+
+	gw.Write([]byte("plain late body"))
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assert.Equal(t, []byte("plain late body"), rec.Body.Bytes())
+}
+
+func TestFirstFlushGzipWithPresetContentLength(t *testing.T) {
+	// A preset Content-Length below MinSize means compression is ineligible,
+	// so the first flush is forced to passthrough and the Content-Length is
+	// preserved.
+	handler, err := GzipHandlerWithOpts(MinSize(10000), WithFlushStrategy(FlushGzipImmediately))
+	if err != nil {
+		t.Fatalf("GzipHandlerWithOpts: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set(acceptEncoding, "gzip")
+
+	h := handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := []byte("short")
+		w.Header().Set(contentLength, strconv.Itoa(len(body)))
+		w.Write(body)
+		w.(http.Flusher).Flush()
+	}))
+	h.ServeHTTP(rec, req)
+
+	assert.Equal(t, "", rec.Header().Get(contentEncoding))
+	assert.Equal(t, strconv.Itoa(len("short")), rec.Header().Get(contentLength))
+	assert.Equal(t, []byte("short"), rec.Body.Bytes())
+}
+
+func TestFirstFlushGzipLargeContentLength(t *testing.T) {
+	// A preset Content-Length at or above MinSize keeps gzip eligible, so
+	// the first flush emits the buffered prefix as gzip and drops CL.
+	gw, rec, done := newHeldGzipWriter(t, FlushGzipImmediately)
+	defer close(done)
+	gw.Header().Set(contentLength, "20000")
+	gw.Write([]byte("prefix"))
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingGzip, gw.encoding)
+	assert.Equal(t, "gzip", rec.Header().Get(contentEncoding))
+	assert.Equal(t, "", rec.Header().Get(contentLength))
+	assert.Equal(t, []byte("prefix"), decodeGzip(t, rec.Body.Bytes()))
+}
+
+func TestFirstFlushRespectsPresetContentEncoding(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushGzipImmediately)
+	defer close(done)
+	gw.Header().Set(contentEncoding, "gzip")
+	gw.Write([]byte("already-encoded"))
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingPlain, gw.encoding)
+	assert.Equal(t, "gzip", rec.Header().Get(contentEncoding), "existing encoding is untouched")
+	assert.Equal(t, []byte("already-encoded"), rec.Body.Bytes())
+}
+
+func TestFirstFlushRespectsContentTypeFilter(t *testing.T) {
+	wrapper, err := GzipHandlerWithOpts(
+		ContentTypes([]string{"application/json"}),
+		WithFlushStrategy(FlushGzipImmediately),
+	)
+	if err != nil {
+		t.Fatalf("GzipHandlerWithOpts: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set(acceptEncoding, "gzip")
+	wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(contentType, "text/plain")
+		w.Write([]byte("not json"))
+		w.(http.Flusher).Flush()
+	})).ServeHTTP(rec, req)
+
+	assert.Equal(t, "", rec.Header().Get(contentEncoding))
+	assert.Equal(t, []byte("not json"), rec.Body.Bytes())
+}
+
+func TestFlushWithoutStrategyStaysNoOp(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, nil)
+	defer close(done)
+	gw.WriteHeader(http.StatusTeapot)
+	gw.Write([]byte("buffered"))
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+
+	assert.Equal(t, encodingUndecided, gw.encoding)
+	assert.False(t, rec.Flushed)
+	assert.Equal(t, http.StatusOK, rec.Code, "nothing reaches the underlying writer yet")
+
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assert.Equal(t, http.StatusTeapot, rec.Code)
+	assert.Equal(t, []byte("buffered"), rec.Body.Bytes())
+}
+
+func TestFlushStrategyDeferKeepsBuffering(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, func(int) FlushDecision { return FlushDefer })
+	defer close(done)
+	gw.Write([]byte("buffered"))
+	gw.FlushError()
+
+	assert.Equal(t, encodingUndecided, gw.encoding)
+	assert.False(t, rec.Flushed)
+
+	// A later flush may still commit.
+	gw.flushStrategy = FlushGzipImmediately
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("second FlushError: %v", err)
+	}
+	assert.Equal(t, encodingGzip, gw.encoding)
+	assert.Equal(t, []byte("buffered"), decodeGzip(t, rec.Body.Bytes()))
+}
+
+func TestEncodingCannotChangeAfterFirstFlush(t *testing.T) {
+	gw, _, done := newHeldGzipWriter(t, FlushAsIdentity)
+	defer close(done)
+	gw.Write([]byte("x"))
+	gw.FlushError()
+
+	// Even swapping the strategy after the decision has no effect.
+	gw.flushStrategy = FlushGzipImmediately
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("FlushError: %v", err)
+	}
+	assert.Equal(t, encodingPlain, gw.encoding)
+	assert.Nil(t, gw.gw)
+}
+
+func TestSubsequentGzipFlushStreamsMoreData(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushGzipImmediately)
+	defer close(done)
+
+	gw.Write([]byte("one"))
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("first FlushError: %v", err)
+	}
+	firstLen := rec.Body.Len()
+
+	gw.Write([]byte("two"))
+	if err := gw.FlushError(); err != nil {
+		t.Fatalf("second FlushError: %v", err)
+	}
+	if rec.Body.Len() <= firstLen {
+		t.Fatalf("second flush should emit more gzip bytes: %d <= %d", rec.Body.Len(), firstLen)
+	}
+
+	if err := gw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	assert.Equal(t, []byte("onetwo"), decodeGzip(t, rec.Body.Bytes()))
+
+	// A second Close must not emit another gzip trailer.
+	if err := gw.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestLegacyFlushSwallowsErrors(t *testing.T) {
+	gw, rec, done := newHeldGzipWriter(t, FlushAsIdentity)
+	defer close(done)
+
+	failing := &failingFlushWriter{ResponseWriter: rec}
+	gw.ResponseWriter = failing
+	gw.Write([]byte("x"))
+
+	// The http.Flusher method does not return errors; it must not panic.
+	gw.Flush()
+	assert.Equal(t, 1, failing.flushed)
+}
+
 func TestImplementCloseNotifier(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.Header.Set(acceptEncoding, "gzip")
@@ -474,6 +822,22 @@ func (m *mockRWCloseNotify) Write([]byte) (int, error) {
 
 func (m *mockRWCloseNotify) WriteHeader(int) {
 	panic("implement me")
+}
+
+// failingFlushWriter fails every flush, and records whether flushing was
+// attempted at all.
+type failingFlushWriter struct {
+	http.ResponseWriter
+	flushed int
+}
+
+func (w *failingFlushWriter) Write(b []byte) (int, error) {
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *failingFlushWriter) FlushError() error {
+	w.flushed++
+	return errors.New("boom: flush failed")
 }
 
 func TestIgnoreSubsequentWriteHeader(t *testing.T) {
@@ -603,6 +967,182 @@ func TestContentTypes(t *testing.T) {
 		} else {
 			assert.NotEqual(t, "gzip", res.Header.Get("Content-Encoding"), tt.name)
 		}
+	}
+}
+
+// readAvailableChunks reads complete HTTP/1.1 chunked chunks from r until no
+// more data arrives within the idle timeout. It returns the concatenated
+// chunk payloads (without framing) and whether the stream ended (a
+// zero-length terminator chunk or EOF, as happens when the server closes
+// the connection).
+func readAvailableChunks(t *testing.T, conn net.Conn, r *bufio.Reader, idle time.Duration) ([]byte, bool) {
+	t.Helper()
+	var out []byte
+	for {
+		conn.SetReadDeadline(time.Now().Add(idle))
+		line, err := r.ReadString('\n')
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				return out, false
+			}
+			// EOF (possibly with a closed-connection error) means the
+			// server ended the stream.
+			if line == "" {
+				return out, true
+			}
+			t.Fatalf("reading chunk size line %q: %v", line, err)
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(line), 16, 64)
+		if err != nil {
+			t.Fatalf("parsing chunk size %q: %v", line, err)
+		}
+		if n == 0 {
+			io.ReadFull(r, make([]byte, 2))
+			return out, true
+		}
+		chunk := make([]byte, n)
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			t.Fatalf("reading %d byte chunk: %v", n, err)
+		}
+		io.ReadFull(r, make([]byte, 2))
+		out = append(out, chunk...)
+	}
+}
+
+// gunzipAvailable decompresses as much of a possibly truncated gzip stream
+// as it can, returning the decoded bytes.
+func gunzipAvailable(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	gr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("gzip.NewReader on first fragment: %v", err)
+	}
+	var out bytes.Buffer
+	_, _ = io.Copy(&out, gr)
+	return out.Bytes()
+}
+
+// TestStreamingFlushFirstFragment verifies against a real, chunk-reading
+// client that the first Flush hands out the entire currently buffered body
+// fragment even when it is far below MinSize: with the gzip strategy the
+// client gunzips exactly the first fragment, and with the identity strategy
+// the raw first chunk is the fragment itself.
+func TestStreamingFlushFirstFragment(t *testing.T) {
+	const minSize = 4096
+	frag1 := strings.Repeat("a", 100)
+	frag2 := strings.Repeat("b", 100)
+
+	for _, tc := range []struct {
+		name     string
+		strategy FlushStrategy
+		gzipped  bool
+	}{
+		{"gzip on first flush", FlushGzipImmediately, true},
+		{"identity on first flush", FlushAsIdentity, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proceed1 := make(chan struct{})
+
+			wrapper, err := GzipHandlerWithOpts(
+				CompressionLevel(gzip.BestSpeed),
+				MinSize(minSize),
+				WithFlushStrategy(tc.strategy),
+			)
+			if err != nil {
+				t.Fatalf("GzipHandlerWithOpts: %v", err)
+			}
+
+			handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+				flusher := w.(http.Flusher)
+
+				if _, err := io.WriteString(w, frag1); err != nil {
+					t.Errorf("write frag1: %v", err)
+				}
+				flusher.Flush()
+				<-proceed1
+
+				if _, err := io.WriteString(w, frag2); err != nil {
+					t.Errorf("write frag2: %v", err)
+				}
+				flusher.Flush()
+				// Return: the wrapper's deferred Close emits the gzip
+				// trailer (when compressing) and the server ends the
+				// chunked stream.
+			}))
+
+			// Use an unstarted server and Start it (rather than NewServer)
+			// to get a plaintext HTTP server we can speak to directly over
+			// a raw TCP connection.
+			srv := httptest.NewUnstartedServer(handler)
+			srv.Start()
+			defer srv.Close()
+
+			conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+
+			if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: example\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+
+			r := bufio.NewReader(conn)
+			reqForParse := &http.Request{Method: "GET", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1}
+			resp, err := http.ReadResponse(r, reqForParse)
+			if err != nil {
+				t.Fatalf("read response headers: %v", err)
+			}
+
+			assert.Equal(t, http.StatusAccepted, resp.StatusCode)
+			assert.Equal(t, []string{"chunked"}, resp.TransferEncoding)
+			if tc.gzipped {
+				assert.Equal(t, "gzip", resp.Header.Get("Content-Encoding"))
+			} else {
+				assert.Equal(t, "", resp.Header.Get("Content-Encoding"))
+			}
+
+			first, done := readAvailableChunks(t, conn, r, 250*time.Millisecond)
+			assert.False(t, done, "stream must stay open after the first flush")
+			if tc.gzipped {
+				assert.Equal(t, []byte(frag1), gunzipAvailable(t, first),
+					"first flush delivers the complete current fragment as gzip")
+			} else {
+				assert.Equal(t, []byte(frag1), first,
+					"first flush delivers the complete current fragment verbatim")
+			}
+
+			close(proceed1)
+			rest, done := readAvailableChunks(t, conn, r, 5*time.Second)
+			assert.True(t, done, "stream finishes after the handler returns")
+
+			if tc.gzipped {
+				fullRaw := append(append([]byte(nil), first...), rest...)
+				fullReader := bytes.NewReader(fullRaw)
+				gr, err := gzip.NewReader(fullReader)
+				if err != nil {
+					t.Fatalf("gzip.NewReader full body: %v", err)
+				}
+				decoded, err := ioutil.ReadAll(gr)
+				if err != nil {
+					t.Fatalf("read full body: %v", err)
+				}
+				assert.Equal(t, frag1+frag2, string(decoded))
+
+				// The second wire fragment must start right after the bytes
+				// that encoded the first fragment: decoding the first
+				// fragment must yield exactly frag1 with no prefix of frag2.
+				firstDecoded := gunzipAvailable(t, first)
+				assert.Equal(t, []byte(frag1), firstDecoded,
+					"the first fragment is complete and only frag1")
+				if _, err := gzip.NewReader(fullReader); err == nil {
+					t.Fatal("expected exactly one gzip member, found a second one")
+				}
+			} else {
+				assert.Equal(t, []byte(frag2), rest)
+			}
+		})
 	}
 }
 
