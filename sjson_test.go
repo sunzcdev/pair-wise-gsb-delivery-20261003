@@ -351,3 +351,91 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func testSplice(t *testing.T, expect, json, path string,
+	start, deleteCount int, values ...string) {
+	t.Helper()
+	json2, err := Splice(json, path, start, deleteCount, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json2 != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, json2)
+	}
+	bvalues := make([][]byte, len(values))
+	for i := range values {
+		bvalues[i] = []byte(values[i])
+	}
+	json3, err := SpliceBytes([]byte(json), path, start, deleteCount,
+		bvalues...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(json3) != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, string(json3))
+	}
+}
+
+func testSpliceError(t *testing.T, json, path string,
+	start, deleteCount int, values ...string) {
+	t.Helper()
+	json2, err := Splice(json, path, start, deleteCount, values...)
+	if err == nil {
+		t.Fatalf("expected error, got '%v'", json2)
+	}
+	if json2 != json {
+		t.Fatalf("input was modified on error: '%v'", json2)
+	}
+}
+
+func TestSplice(t *testing.T) {
+	// empty array
+	testSplice(t, `[1,2]`, `[]`, "", 0, 0, "1", "2")
+	testSplice(t, `{"a":[1]}`, `{"a":[]}`, "a", 0, 0, "1")
+	// delete all
+	testSplice(t, `[]`, `[1,2,3]`, "", 0, 3)
+	testSplice(t, `[]`, `[1,2,3]`, "", 0, 99)
+	// replace first element
+	testSplice(t, `[9,2,3]`, `[1,2,3]`, "", 0, 1, "9")
+	// tail insertion
+	testSplice(t, `[1,2,3,4]`, `[1,2,3]`, "", 3, 0, "4")
+	testSplice(t, `[1,2,3,4]`, `[1,2,3]`, "", 10, 0, "4")
+	// negative start
+	testSplice(t, `[1,2,9]`, `[1,2,3]`, "", -1, 1, "9")
+	testSplice(t, `[1,3]`, `[1,2,3]`, "", -2, 1)
+	testSplice(t, `[0,1,2,3]`, `[1,2,3]`, "", -99, 0, "0")
+	// middle insert and delete
+	testSplice(t, `[1,8,9,2,3]`, `[1,2,3]`, "", 1, 0, "8", "9")
+	testSplice(t, `[1,3]`, `[1,2,3]`, "", 1, 1)
+	testSplice(t, `[1,8,3]`, `[1,2,3]`, "", 1, 1, "8")
+	// delete range truncated at the tail
+	testSplice(t, `[1]`, `[1,2,3]`, "", 1, 99)
+	// nested path
+	testSplice(t, `{"a":{"b":[1,9,3]}}`, `{"a":{"b":[1,2,3]}}`, "a.b",
+		1, 1, "9")
+	// escaped key in path
+	testSplice(t, `{"app.token":[1,2,3]}`, `{"app.token":[1,2]}`,
+		`app\.token`, 2, 0, "3")
+	// surrounding whitespace is preserved
+	testSplice(t, `  [1,2]  `, `  [1,2,3]  `, "", 2, 1)
+	testSplice(t, "{\n  \"a\": [1, 2]\n}", "{\n  \"a\": [1, 2, 3]\n}",
+		"a", 2, 1)
+	// unreplaced elements keep their original raw form
+	testSplice(t, `[1.50e2,"A",4]`, `[1.50e2,"A",3]`,
+		"", 2, 1, "4")
+	testSplice(t, `[9,1.50e2,"A"]`, `[3.0,1.50e2,"A"]`,
+		"", 0, 1, "9")
+	// numeric keys of an object are not array indexes
+	testSplice(t, `{"0":[1,2,3,4]}`, `{"0":[1,2,3]}`, "0", 3, 0, "4")
+	testSplice(t, `{"list":[1],"0":"x"}`, `{"list":[1,2],"0":"x"}`,
+		"list", 1, 1)
+	testSpliceError(t, `{"0":1,"1":2}`, "0", 0, 1)
+	// errors leave the input unmodified
+	testSpliceError(t, `[1,2,3]`, "", 0, -1, "4")
+	testSpliceError(t, `[1,2,3]`, "", 0, 1, "4", "not json")
+	testSpliceError(t, `[1,2,3]`, "", 0, 1, "{")
+	testSpliceError(t, `{"a":1}`, "a", 0, 1)
+	testSpliceError(t, `[1,2,3]`, "missing", 0, 1)
+	// no-op
+	testSplice(t, `[1,2,3]`, `[1,2,3]`, "", 1, 0)
+}

@@ -213,6 +213,21 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Splice an array, removing one element and inserting two raw json values
+in its place:
+```go
+value, _ := sjson.Splice(`{"friends":["Andy","Carol","Tom"]}`, "friends", 1, 1, `"Sara"`, `"Bob"`)
+println(value)
+
+// Output:
+// {"friends":["Andy","Sara","Bob","Tom"]}
+```
+A negative start counts back from the end of the array, a start equal
+to the length of the array appends to the tail, and a delete range
+that extends past the end of the array is truncated. Each value must
+be valid json, otherwise an error is returned and the input is left
+unmodified.
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 

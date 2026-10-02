@@ -5,6 +5,7 @@ import (
 	jsongo "encoding/json"
 	"sort"
 	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/tidwall/gjson"
@@ -481,6 +482,143 @@ func SetRawBytes(json []byte, path string, value []byte) ([]byte, error) {
 }
 
 type dtype struct{}
+
+// Splice removes deleteCount elements from the array at the specified
+// path, starting at index start, and inserts the given raw json values
+// in their place.
+// A negative start counts back from the end of the array, and a start
+// equal to the length of the array appends to the tail.
+// If the delete range extends past the end of the array it is
+// truncated. A negative deleteCount returns an error.
+// Each value must be a valid json value; if any value is invalid an
+// error is returned and the input json is left unmodified.
+// Elements that are not replaced keep their original raw form.
+func Splice(json, path string, start, deleteCount int,
+	values ...string) (string, error) {
+	return splice(json, path, start, deleteCount, values)
+}
+
+// SpliceBytes removes deleteCount elements from the array at the
+// specified path and inserts the given raw json values in their place.
+// If working with bytes, this method preferred over
+// Splice(string(data), path, start, deleteCount, values...)
+func SpliceBytes(json []byte, path string, start, deleteCount int,
+	values ...[]byte) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	svals := make([]string, len(values))
+	for i := range values {
+		svals[i] = *(*string)(unsafe.Pointer(&values[i]))
+	}
+	res, err := splice(jstr, path, start, deleteCount, svals)
+	if err != nil {
+		return json, err
+	}
+	return []byte(res), nil
+}
+
+func splice(jstr, path string, start, deleteCount int,
+	values []string) (string, error) {
+	if deleteCount < 0 {
+		return jstr, &errorType{"delete count cannot be negative"}
+	}
+	for _, value := range values {
+		if !gjson.Valid(value) {
+			return jstr, &errorType{"invalid json value: " + value}
+		}
+	}
+	var res gjson.Result
+	if path == "" {
+		// target the root value, preserving surrounding whitespace
+		lo := 0
+		for lo < len(jstr) && jstr[lo] <= ' ' {
+			lo++
+		}
+		hi := len(jstr)
+		for hi > lo && jstr[hi-1] <= ' ' {
+			hi--
+		}
+		res = gjson.Parse(jstr[lo:hi])
+		res.Index = lo
+	} else {
+		var gpath string
+		r, simple := parsePath(path)
+		if simple {
+			gpath = r.gpart
+			for r.more {
+				r, simple = parsePath(r.path)
+				if !simple {
+					break
+				}
+				gpath += "." + r.gpart
+			}
+		}
+		if !simple {
+			gpath = path
+		}
+		res = gjson.Get(jstr, gpath)
+		if !res.Exists() {
+			return jstr, &errorType{"path does not exist: " + path}
+		}
+	}
+	if !res.IsArray() {
+		return jstr, &errorType{"path does not refer to an array: " + path}
+	}
+	raw := res.Raw
+	elems := res.Array()
+	n := len(elems)
+	if start < 0 {
+		start += n
+		if start < 0 {
+			start = 0
+		}
+	} else if start > n {
+		start = n
+	}
+	end := start + deleteCount
+	if end > n {
+		end = n
+	}
+	if start == end && len(values) == 0 {
+		return jstr, nil
+	}
+	// element indexes are absolute offsets into jstr
+	closeIdx := res.Index + len(raw) - 1 // index of the closing ']'
+	var leftEnd, rightStart int
+	if start < n {
+		leftEnd = elems[start].Index
+	} else {
+		leftEnd = closeIdx
+	}
+	if end < n {
+		rightStart = elems[end].Index
+	} else {
+		rightStart = closeIdx
+	}
+	left := jstr[:leftEnd]
+	right := jstr[rightStart:]
+	var mid string
+	if len(values) > 0 {
+		mid = strings.Join(values, ",")
+		if start > 0 && start == n {
+			// appending after the last element
+			mid = "," + mid
+		}
+		if end < n {
+			mid += ","
+		}
+	} else if start > 0 && end == n {
+		// pure deletion of the tail elements; strip the
+		// comma that followed the last remaining element
+		i := len(left) - 1
+		for i >= 0 && left[i] <= ' ' {
+			i--
+		}
+		if i >= 0 && left[i] == ',' {
+			left = left[:i]
+		}
+	}
+	return left + mid + right, nil
+}
 
 // Delete deletes a value from json for the specified path.
 func Delete(json, path string) (string, error) {
