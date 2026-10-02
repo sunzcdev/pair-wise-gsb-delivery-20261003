@@ -44,6 +44,14 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// Limiter accounting state. remoteIP is nil when the peer has no usable IP
+	// address (e.g. a Unix domain socket). limiterBegan reports whether a
+	// source IP slot is held; limiterUser is the non-empty username whose user
+	// slot is held after a successful transfer.
+	remoteIP     net.IP
+	limiterBegan bool
+	limiterUser  string
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -52,8 +60,24 @@ func newConn(c net.Conn, s *Server) *Conn {
 		conn:   c,
 	}
 
+	sc.remoteIP = remoteAddrIP(c.RemoteAddr())
 	sc.init()
 	return sc
+}
+
+// remoteAddrIP extracts the peer's IP address from a network address. It
+// returns nil for non-IP transports such as Unix domain sockets.
+func remoteAddrIP(addr net.Addr) net.IP {
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		return tcpAddr.IP
+	}
+	if ipAddr, ok := addr.(*net.IPAddr); ok {
+		return ipAddr.IP
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return net.ParseIP(host)
+	}
+	return nil
 }
 
 func (c *Conn) init() {
@@ -169,6 +193,12 @@ func (c *Conn) setSession(session Session) {
 func (c *Conn) Close() error {
 	c.locker.Lock()
 	defer c.locker.Unlock()
+
+	if c.server.Limiter != nil && c.limiterBegan {
+		c.server.Limiter.End(c.remoteIP, c.limiterUser)
+		c.limiterBegan = false
+		c.limiterUser = ""
+	}
 
 	if c.bdatPipe != nil {
 		c.bdatPipe.CloseWithError(ErrDataReset)
@@ -891,8 +921,29 @@ func (c *Conn) handleAuth(arg string) {
 		}
 	}
 
-	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
+	// Resolve the authenticated username before the quota transfer. Holding
+	// the connection lock also prevents Close from racing the transfer.
+	c.locker.Lock()
+	var username string
+	if usernameSession, ok := c.session.(UsernameSession); ok {
+		username = usernameSession.Username()
+	}
+	if c.server.Limiter != nil && c.limiterBegan && username != "" {
+		if err := c.server.Limiter.Authenticate(c.remoteIP, username); err != nil {
+			c.locker.Unlock()
+			if errors.Is(err, ErrUserLimitExceeded) {
+				c.writeResponse(454, EnhancedCode{4, 7, 0}, "Too many authenticated sessions, try again later")
+			} else {
+				c.writeResponse(451, EnhancedCode{4, 4, 5}, "Temporary authentication failure")
+			}
+			return
+		}
+		c.limiterUser = username
+	}
 	c.didAuth = true
+	c.locker.Unlock()
+
+	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 }
 
 func decodeSASLResponse(s string) ([]byte, error) {
@@ -939,6 +990,22 @@ func (c *Conn) handleStartTLS() {
 
 	c.conn = tlsConn
 	c.init()
+
+	// STARTTLS resets the authentication state (see below): an authenticated
+	// connection drops back into the source IP bucket. Do this before logging
+	// out the session so that either both counters move or neither does.
+	c.locker.Lock()
+	if c.server.Limiter != nil && c.limiterBegan && c.limiterUser != "" {
+		username := c.limiterUser
+		if err := c.server.Limiter.Deauthenticate(c.remoteIP, username); err != nil {
+			c.locker.Unlock()
+			c.writeResponse(421, EnhancedCode{4, 4, 5}, "Too busy. Try again later.")
+			c.Close()
+			return
+		}
+		c.limiterUser = ""
+	}
+	c.locker.Unlock()
 
 	// Reset all state and close the previous Session.
 	// This is different from just calling reset() since we want the Backend to

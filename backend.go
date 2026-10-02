@@ -100,3 +100,14 @@ type AuthSession interface {
 	AuthMechanisms() []string
 	Auth(mech string) (sasl.Server, error)
 }
+
+// UsernameSession is an optional add-on interface for Session. When
+// implemented, the username returned after a successful SASL exchange is used
+// by the Server's Limiter to account authenticated connections per user.
+type UsernameSession interface {
+	Session
+
+	// Username returns the authenticated username of the current session, or
+	// an empty string if the session is not authenticated.
+	Username() string
+}

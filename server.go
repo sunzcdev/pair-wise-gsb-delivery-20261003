@@ -41,6 +41,10 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// Limiter caps concurrent connections per source IP (unauthenticated) and
+	// per authenticated user. If nil, no limits are enforced.
+	Limiter Limiter
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool
@@ -171,6 +175,17 @@ func (s *Server) handleConn(c *Conn) error {
 		if err := tlsConn.Handshake(); err != nil {
 			return err
 		}
+	}
+
+	if s.Limiter != nil {
+		if err := s.Limiter.Begin(c.remoteIP); err != nil {
+			c.Reject()
+			if errors.Is(err, ErrSourceLimitExceeded) {
+				return nil
+			}
+			return err
+		}
+		c.limiterBegan = true
 	}
 
 	c.greet()
