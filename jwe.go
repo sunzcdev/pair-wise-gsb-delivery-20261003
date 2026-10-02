@@ -392,7 +392,15 @@ func (obj JSONWebEncryption) FullSerialize() string {
 	}
 
 	if obj.protected != nil {
-		raw.Protected = newBuffer(mustSerializeJSON(obj.protected))
+		// If the object was parsed, reuse the exact original protected header
+		// bytes. Re-serializing the parsed header could change the byte layout
+		// (e.g. key ordering), which would silently alter the authenticated
+		// data and invalidate the authentication tag.
+		if obj.original != nil && obj.original.Protected != nil {
+			raw.Protected = obj.original.Protected
+		} else {
+			raw.Protected = newBuffer(mustSerializeJSON(obj.protected))
+		}
 	}
 
 	return string(mustSerializeJSON(raw))

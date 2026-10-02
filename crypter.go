@@ -532,26 +532,54 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >3x the size of the compressed data, whichever is larger.
 func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Header, []byte, error) {
+	index, headers, _, plaintext, err := obj.recoverContentEncryptionKey(decryptionKey)
+	if err != nil {
+		return -1, Header{}, nil, err
+	}
+
+	plaintext, err = obj.decompress(plaintext)
+	if err != nil {
+		return -1, Header{}, nil, err
+	}
+
+	sanitized, err := headers.sanitized()
+	if err != nil {
+		return -1, Header{}, nil, fmt.Errorf("go-jose/go-jose: failed to sanitize header: %v", err)
+	}
+
+	return index, sanitized, plaintext, err
+}
+
+// recoverContentEncryptionKey authenticates and decrypts the object using
+// decryptionKey, returning the index of the recipient for which decryption
+// succeeded together with that recipient's merged headers, the recovered
+// content encryption key (CEK) and the still-compressed plaintext.
+//
+// The CEK is returned only for in-package use (e.g. re-wrapping a key to a new
+// recipient); it is never exposed through a public return value.
+func (obj JSONWebEncryption) recoverContentEncryptionKey(decryptionKey interface{}) (
+	int, rawHeader, []byte, []byte, error,
+) {
 	globalHeaders := obj.mergedHeaders(nil)
 
 	err := globalHeaders.checkNoCritical()
 	if err != nil {
-		return -1, Header{}, nil, err
+		return -1, rawHeader{}, nil, nil, err
 	}
 
 	key, err := tryJWKS(decryptionKey, obj.Header)
 	if err != nil {
-		return -1, Header{}, nil, err
+		return -1, rawHeader{}, nil, nil, err
 	}
 	decrypter, err := newDecrypter(key)
 	if err != nil {
-		return -1, Header{}, nil, err
+		return -1, rawHeader{}, nil, nil, err
 	}
 
 	encryption := globalHeaders.getEncryption()
 	cipher := getContentCipher(encryption)
 	if cipher == nil {
-		return -1, Header{}, nil, fmt.Errorf("go-jose/go-jose: unsupported enc value '%s'", string(encryption))
+		return -1, rawHeader{}, nil, nil, fmt.Errorf("go-jose/go-jose: unsupported enc value '%s'", string(encryption))
 	}
 
 	generator := randomKeyGenerator{
@@ -566,19 +594,18 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 
 	authData := obj.computeAuthData()
 
-	index := -1
-	var plaintext []byte
-	var headers rawHeader
-
 	if len(obj.recipients) == 0 {
-		return -1, Header{}, nil, errors.New("go-jose/go-jose: no recipients")
+		return -1, rawHeader{}, nil, nil, errors.New("go-jose/go-jose: no recipients")
 	}
+
+	index := -1
+	var plaintext, cek []byte
+	var headers rawHeader
 
 	// Loop sets `err` in the function scope; don't shadow it.
 	for i, recipient := range obj.recipients {
 		recipientHeaders := obj.mergedHeaders(&recipient)
 
-		var cek []byte
 		cek, err = decrypter.decryptKey(recipientHeaders, &recipient, generator)
 		if err != nil {
 			continue
@@ -599,21 +626,11 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 		break
 	}
 
-	if err != nil {
-		return -1, Header{}, nil, ErrCryptoFailure
+	if err != nil || index == -1 {
+		return -1, rawHeader{}, nil, nil, ErrCryptoFailure
 	}
 
-	plaintext, err = obj.decompress(plaintext)
-	if err != nil {
-		return -1, Header{}, nil, err
-	}
-
-	sanitized, err := headers.sanitized()
-	if err != nil {
-		return -1, Header{}, nil, fmt.Errorf("go-jose/go-jose: failed to sanitize header: %v", err)
-	}
-
-	return index, sanitized, plaintext, err
+	return index, headers, cek, plaintext, nil
 }
 
 // decompress decompresses plaintext using the protected "zip" header, if present.
