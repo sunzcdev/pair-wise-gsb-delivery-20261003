@@ -155,6 +155,29 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+## Size Budgets
+
+The parser can optionally enforce size limits, applied uniformly by all
+`ParseV*` entry points (v2/v3/v4, local and public). Encoded sections which
+are clearly too large are rejected before they are base64 decoded, and the
+exact decoded lengths are verified afterwards. Failures are returned as a
+`paseto.BudgetError`, which identifies which budget was exceeded (without
+echoing the offending token).
+
+```go
+parser := paseto.NewParser()
+parser.SetMaxTokenLength(4096)   // full token string, in bytes
+parser.SetMaxPayloadLength(1024) // decoded payload, in bytes
+parser.SetMaxFooterLength(256)   // decoded footer, in bytes
+```
+
+Note that the payload budget applies to the raw decoded payload, which
+carries cryptographic overhead (nonce, MAC/tag, or signature) in addition to
+the application claims. If you want to budget the application claims instead,
+add the relevant overhead constant to your claims budget first. For example,
+a claims budget of `n` bytes for a v4 local token corresponds to
+`parser.SetMaxPayloadLength(n + paseto.V4LocalPayloadOverhead)`.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.
