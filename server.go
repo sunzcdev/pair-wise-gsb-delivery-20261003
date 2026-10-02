@@ -68,9 +68,21 @@ type Upgrader struct {
 
 	// EnableCompression specify if the server should attempt to negotiate per
 	// message compression (RFC 7692). Setting this value to true does not
-	// guarantee that compression will be supported. Currently only "no context
-	// takeover" modes are supported.
+	// guarantee that compression will be supported.
 	EnableCompression bool
+
+	// EnableCompressionContextTakeover specifies if the server should attempt
+	// to negotiate per message compression (RFC 7692) with context takeover.
+	// When context takeover is negotiated for a direction of the connection,
+	// the compression dictionary is retained across messages in that
+	// direction, improving the compression ratio for streams of similar
+	// messages at the cost of additional memory for the lifetime of the
+	// connection. Context takeover is negotiated independently for each
+	// direction and is used for a direction only when the client also allows
+	// it (the client did not include the corresponding "no context takeover"
+	// parameter in its offer). This field is ignored when EnableCompression
+	// is false.
+	EnableCompressionContextTakeover bool
 }
 
 func (u *Upgrader) returnError(w http.ResponseWriter, r *http.Request, status int, reason string) (*Conn, error) {
@@ -162,12 +174,20 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	// Negotiate PMCE
 	var compress bool
+	serverNoContextTakeover := true
+	clientNoContextTakeover := true
 	if u.EnableCompression {
 		for _, ext := range parseExtensions(r.Header) {
 			if ext[""] != "permessage-deflate" {
 				continue
 			}
 			compress = true
+			if u.EnableCompressionContextTakeover {
+				// Use context takeover in a direction only when the
+				// client did not request otherwise in its offer.
+				_, serverNoContextTakeover = ext["server_no_context_takeover"]
+				_, clientNoContextTakeover = ext["client_no_context_takeover"]
+			}
 			break
 		}
 	}
@@ -214,8 +234,19 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 	c.subprotocol = subprotocol
 
 	if compress {
-		c.newCompressionWriter = compressNoContextTakeover
-		c.newDecompressionReader = decompressNoContextTakeover
+		// The "server_no_context_takeover" parameter applies to messages
+		// sent by this server and the "client_no_context_takeover"
+		// parameter applies to messages sent by the client.
+		if serverNoContextTakeover {
+			c.newCompressionWriter = compressNoContextTakeover
+		} else {
+			c.newCompressionWriter = compressContextTakeover()
+		}
+		if clientNoContextTakeover {
+			c.newDecompressionReader = decompressNoContextTakeover
+		} else {
+			c.newDecompressionReader = decompressContextTakeover()
+		}
 	}
 
 	// Use larger of hijacked buffer and connection write buffer for header.
@@ -234,7 +265,14 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		p = append(p, "\r\n"...)
 	}
 	if compress {
-		p = append(p, "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n"...)
+		p = append(p, "Sec-WebSocket-Extensions: permessage-deflate"...)
+		if serverNoContextTakeover {
+			p = append(p, "; server_no_context_takeover"...)
+		}
+		if clientNoContextTakeover {
+			p = append(p, "; client_no_context_takeover"...)
+		}
+		p = append(p, "\r\n"...)
 	}
 	for k, vs := range responseHeader {
 		if k == "Sec-Websocket-Protocol" {

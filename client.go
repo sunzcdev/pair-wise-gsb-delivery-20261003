@@ -117,9 +117,19 @@ type Dialer struct {
 
 	// EnableCompression specifies if the client should attempt to negotiate
 	// per message compression (RFC 7692). Setting this value to true does not
-	// guarantee that compression will be supported. Currently only "no context
-	// takeover" modes are supported.
+	// guarantee that compression will be supported.
 	EnableCompression bool
+
+	// EnableCompressionContextTakeover specifies if the client should attempt
+	// to negotiate per message compression (RFC 7692) with context takeover.
+	// When context takeover is negotiated for a direction of the connection,
+	// the compression dictionary is retained across messages in that
+	// direction, improving the compression ratio for streams of similar
+	// messages at the cost of additional memory for the lifetime of the
+	// connection. Context takeover is used for a direction only when the
+	// server also agrees to it in the handshake response. This field is
+	// ignored when EnableCompression is false.
+	EnableCompressionContextTakeover bool
 
 	// Jar specifies the cookie jar.
 	// If Jar is nil, cookies are not sent in requests and ignored
@@ -251,7 +261,13 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	if d.EnableCompression {
-		req.Header["Sec-WebSocket-Extensions"] = []string{"permessage-deflate; server_no_context_takeover; client_no_context_takeover"}
+		ext := "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+		if d.EnableCompressionContextTakeover {
+			// Offer permessage-deflate without the "no context takeover"
+			// parameters and let the server choose the modes.
+			ext = "permessage-deflate"
+		}
+		req.Header["Sec-WebSocket-Extensions"] = []string{ext}
 	}
 
 	if d.HandshakeTimeout != 0 {
@@ -376,11 +392,23 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		}
 		_, snct := ext["server_no_context_takeover"]
 		_, cnct := ext["client_no_context_takeover"]
-		if !snct || !cnct {
+		if !d.EnableCompressionContextTakeover && (!snct || !cnct) {
 			return nil, resp, errInvalidCompression
 		}
-		conn.newCompressionWriter = compressNoContextTakeover
-		conn.newDecompressionReader = decompressNoContextTakeover
+		// The "server_no_context_takeover" parameter applies to messages
+		// sent by the server (read by this client) and the
+		// "client_no_context_takeover" parameter applies to messages sent
+		// by this client.
+		if snct {
+			conn.newDecompressionReader = decompressNoContextTakeover
+		} else {
+			conn.newDecompressionReader = decompressContextTakeover()
+		}
+		if cnct {
+			conn.newCompressionWriter = compressNoContextTakeover
+		} else {
+			conn.newCompressionWriter = compressContextTakeover()
+		}
 		break
 	}
 

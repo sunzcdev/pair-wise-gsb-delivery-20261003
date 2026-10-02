@@ -218,10 +218,15 @@
 //
 //  conn.EnableWriteCompression(false)
 //
-// Currently this package does not support compression with "context takeover".
-// This means that messages must be compressed and decompressed in isolation,
-// without retaining sliding window or dictionary state across messages. For
-// more details refer to RFC 7692.
+// By default, messages are compressed and decompressed in isolation, without
+// retaining the sliding window (dictionary) across messages ("no context
+// takeover" in RFC 7692 terms). Setting the EnableCompressionContextTakeover
+// option to true in Dialer or Upgrader allows the peers to negotiate
+// retaining the dictionary across messages, which improves the compression
+// ratio for streams of similar messages at the cost of additional memory per
+// connection. Context takeover is negotiated independently for each
+// direction of the connection and is used for a direction only when both
+// peers agree to it in the handshake.
 //
 // Use of compression is experimental and may result in decreased performance.
 package websocket

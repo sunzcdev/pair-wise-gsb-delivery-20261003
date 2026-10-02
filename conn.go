@@ -1220,8 +1220,10 @@ func (c *Conn) EnableWriteCompression(enable bool) {
 
 // SetCompressionLevel sets the flate compression level for subsequent text and
 // binary messages. This function is a noop if compression was not negotiated
-// with the peer. See the compress/flate package for a description of
-// compression levels.
+// with the peer. If compression with context takeover was negotiated, then
+// levels below 7 are raised to 7 and the level of the first compressed
+// message is used for the lifetime of the connection. See the
+// compress/flate package for a description of compression levels.
 func (c *Conn) SetCompressionLevel(level int) error {
 	if !isValidCompressionLevel(level) {
 		return errors.New("websocket: invalid compression level")
