@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `Config#to_shareable_data`, returning a frozen, deeply-copied and Ractor-shareable `Data` snapshot of a finalized config. Mutable values (String, Array, Hash, Set, Time) are copied before being frozen, repeated references and container-carried cycles are preserved, and unsupported values (Hashes with a `default_proc`, IO, Proc, or other custom objects) are rejected with an error naming the config path. `Config#to_data` is unchanged and continues to capture values by reference.
+
 ### Changed
 
 ### Deprecated

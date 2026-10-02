@@ -11,6 +11,10 @@ module Dry
 
     FrozenConfigError = Class.new(Error)
 
+    # Raised when a config cannot be exported as a shareable snapshot due to a value that cannot
+    # be safely copied across Ractor boundaries.
+    UnsupportedValueError = Class.new(Error)
+
     AlreadyIncludedError = Class.new(Error)
     deprecate_constant(
       :AlreadyIncludedError,
