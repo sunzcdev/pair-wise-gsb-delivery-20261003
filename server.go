@@ -645,6 +645,11 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 		properties.AssignedClientID = cl.Properties.Props.AssignedClientID // [MQTT-3.1.3-7] [MQTT-3.2.2-16]
 	}
 
+	if cl.Properties.ProtocolVersion == 5 && cl.State.EnhancedAuth && cl.Properties.Props.AuthenticationMethod != "" {
+		properties.AuthenticationMethod = cl.Properties.Props.AuthenticationMethod // [MQTT-3.2.2.3.17]
+		properties.AuthenticationData = cl.Properties.Props.AuthenticationData     // [MQTT-3.2.2.3.18]
+	}
+
 	if cl.Properties.Props.SessionExpiryInterval > s.Options.Capabilities.MaximumSessionExpiryInterval {
 		properties.SessionExpiryInterval = s.Options.Capabilities.MaximumSessionExpiryInterval
 		properties.SessionExpiryIntervalFlag = true

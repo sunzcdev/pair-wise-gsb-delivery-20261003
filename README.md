@@ -227,6 +227,7 @@ Hooks are stackable - you can add multiple hooks to a server, and they will be r
 |----------------|--------------------------------------------------------------------------|----------------------------------------------------------------------------|
 | Access Control | [mochi-mqtt/server/hooks/auth . AllowHook](hooks/auth/allow_all.go)      | Allow access to all connecting clients and read/write to  all topics.      | 
 | Access Control | [mochi-mqtt/server/hooks/auth . Auth](hooks/auth/auth.go)                | Rule-based access control ledger.                                          | 
+| Access Control | [mochi-mqtt/server/hooks/auth/scram](hooks/auth/scram/hook.go)           | SCRAM-SHA-256 authentication over the MQTT v5 enhanced authentication exchange. |
 | Persistence    | [mochi-mqtt/server/hooks/storage/bolt](hooks/storage/bolt/bolt.go)       | Persistent storage using [BoltDB](https://dbdb.io/db/boltdb) (deprecated). | 
 | Persistence    | [mochi-mqtt/server/hooks/storage/badger](hooks/storage/badger/badger.go) | Persistent storage using [BadgerDB](https://github.com/dgraph-io/badger).  | 
 | Persistence    | [mochi-mqtt/server/hooks/storage/pebble](hooks/storage/pebble/pebble.go) | Persistent storage using [PebbleDB](https://github.com/cockroachdb/pebble).  | 
@@ -306,6 +307,22 @@ err := server.AddHook(new(auth.Hook), &auth.Options{
 })
 ```
 See [examples/auth/encoded/main.go](examples/auth/encoded/main.go) for more information.
+
+#### SCRAM-SHA-256 (MQTT v5 Enhanced Authentication)
+The SCRAM hook authenticates MQTT v5 clients using SCRAM-SHA-256 (RFC 5802/7677) over the enhanced authentication exchange. The server never stores or receives a plaintext password: the backend provides only the salt, iteration count, and derived verification credentials (`StoredKey`/`ServerKey`) per user. The client proves knowledge of its password, and the server returns a signature in the CONNACK authentication data which the client can verify. Channel binding (SCRAM-SHA-256-PLUS) is not supported.
+```go
+store := scram.NewMapStore()
+salt, _ := scram.GenerateSalt(16)
+store.Add("mochi", scram.DeriveCredentials([]byte("melon"), salt, 4096))
+
+err := server.AddHook(new(scram.Hook), &scram.Options{
+    Store:         store, // or any scram.CredentialStore backend
+    MaxRounds:     4,     // maximum messages per authentication exchange
+    MinIterations: 4096,  // minimum accepted PBKDF2 iteration cost
+    MaxIterations: 65536, // maximum accepted PBKDF2 iteration cost
+})
+```
+Clients connect with the `SCRAM-SHA-256` authentication method, carrying the SCRAM client-first-message in the CONNECT authentication data. See [hooks/auth/scram](hooks/auth/scram) for details.
 
 ### Persistent Storage 
 #### Redis
@@ -527,4 +544,3 @@ Please ensure to add a new `SPDX-FileContributor` line for each contributor to t
 ## Stargazers over time 🥰
 [![Stargazers over time](https://starchart.cc/mochi-mqtt/server.svg)](https://starchart.cc/mochi-mqtt/server)
 Are you using Mochi MQTT in a project? [Let us know!](https://github.com/mochi-mqtt/server/issues)
-

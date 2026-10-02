@@ -157,6 +157,7 @@ type ClientState struct {
 	outboundQty     int32                // number of messages currently in the outbound queue
 	Keepalive       uint16               // the number of seconds the connection can wait
 	ServerKeepalive bool                 // keepalive was set by the server
+	EnhancedAuth    bool                 // an enhanced authentication exchange was completed by a hook
 }
 
 // newClient returns a new instance of Client. This is almost exclusively used by Server
