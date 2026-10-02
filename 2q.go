@@ -18,6 +18,12 @@ const (
 	// Default2QGhostEntries is the default ratio of ghost
 	// entries kept to track entries recently evicted
 	Default2QGhostEntries = 0.50
+
+	// Default2QPromoteThreshold is the default number of hits an
+	// entry in the recent list needs before it is promoted to the
+	// frequent list. A threshold of 1 matches the classic 2Q behavior
+	// of promoting on the first hit.
+	Default2QPromoteThreshold = 1
 )
 
 // TwoQueueCache is a thread-safe fixed size 2Q cache.
@@ -35,6 +41,17 @@ type TwoQueueCache[K comparable, V any] struct {
 	recentRatio float64
 	ghostRatio  float64
 
+	promoteThreshold int
+
+	minRecentRatio  float64
+	maxRecentRatio  float64
+	adjustStepRatio float64
+
+	minRecentSize int
+	maxRecentSize int
+	adjustStep    int
+	recentHits    map[K]int
+
 	recent      simplelru.LRUCache[K, V]
 	frequent    simplelru.LRUCache[K, V]
 	recentEvict simplelru.LRUCache[K, struct{}]
@@ -50,6 +67,19 @@ func New2Q[K comparable, V any](size int) (*TwoQueueCache[K, V], error) {
 // New2QParams creates a new TwoQueueCache using the provided
 // parameter values.
 func New2QParams[K comparable, V any](size int, recentRatio, ghostRatio float64) (*TwoQueueCache[K, V], error) {
+	return New2QAdaptiveParams[K, V](size, recentRatio, ghostRatio,
+		Default2QPromoteThreshold, recentRatio, recentRatio, 0.0)
+}
+
+// New2QAdaptiveParams creates a new TwoQueueCache using the provided
+// parameter values. In addition to the classic 2Q parameters it takes
+// a promotion threshold: an entry in the recent list must be hit
+// promoteThreshold times before it is promoted to the frequent list.
+// The target size of the recent list is adaptive: every ghost hit
+// (re-adding a key tracked in the recentEvict list) grows the recent
+// target by adjustStep (expressed as a ratio of the total size),
+// bounded below by minRecentRatio and above by maxRecentRatio.
+func New2QAdaptiveParams[K comparable, V any](size int, recentRatio, ghostRatio float64, promoteThreshold int, minRecentRatio, maxRecentRatio, adjustStep float64) (*TwoQueueCache[K, V], error) {
 	if size <= 0 {
 		return nil, errors.New("invalid size")
 	}
@@ -59,9 +89,23 @@ func New2QParams[K comparable, V any](size int, recentRatio, ghostRatio float64)
 	if ghostRatio < 0.0 || ghostRatio > 1.0 {
 		return nil, errors.New("invalid ghost ratio")
 	}
+	if promoteThreshold < 1 {
+		return nil, errors.New("invalid promote threshold")
+	}
+	if minRecentRatio < 0.0 || minRecentRatio > 1.0 {
+		return nil, errors.New("invalid min recent ratio")
+	}
+	if maxRecentRatio < 0.0 || maxRecentRatio > 1.0 {
+		return nil, errors.New("invalid max recent ratio")
+	}
+	if minRecentRatio > maxRecentRatio {
+		return nil, errors.New("min recent ratio exceeds max recent ratio")
+	}
+	if adjustStep < 0.0 || adjustStep > 1.0 {
+		return nil, errors.New("invalid adjust step")
+	}
 
 	// Determine the sub-sizes
-	recentSize := int(float64(size) * recentRatio)
 	evictSize := int(float64(size) * ghostRatio)
 
 	// Allocate the LRUs
@@ -80,15 +124,35 @@ func New2QParams[K comparable, V any](size int, recentRatio, ghostRatio float64)
 
 	// Initialize the cache
 	c := &TwoQueueCache[K, V]{
-		size:        size,
-		recentSize:  recentSize,
-		recentRatio: recentRatio,
-		ghostRatio:  ghostRatio,
-		recent:      recent,
-		frequent:    frequent,
-		recentEvict: recentEvict,
+		size:             size,
+		recentRatio:      recentRatio,
+		ghostRatio:       ghostRatio,
+		promoteThreshold: promoteThreshold,
+		minRecentRatio:   minRecentRatio,
+		maxRecentRatio:   maxRecentRatio,
+		adjustStepRatio:  adjustStep,
+		recentHits:       make(map[K]int),
+		recent:           recent,
+		frequent:         frequent,
+		recentEvict:      recentEvict,
 	}
+	c.computeTargets(size)
 	return c, nil
+}
+
+// computeTargets derives the recent target size, its bounds and the
+// adjustment step (in entries) for the given total size.
+func (c *TwoQueueCache[K, V]) computeTargets(size int) {
+	c.minRecentSize = int(float64(size) * c.minRecentRatio)
+	c.maxRecentSize = int(float64(size) * c.maxRecentRatio)
+	c.adjustStep = int(float64(size) * c.adjustStepRatio)
+	c.recentSize = int(float64(size) * c.recentRatio)
+	if c.recentSize < c.minRecentSize {
+		c.recentSize = c.minRecentSize
+	}
+	if c.recentSize > c.maxRecentSize {
+		c.recentSize = c.maxRecentSize
+	}
 }
 
 // Get looks up a key's value from the cache.
@@ -101,9 +165,16 @@ func (c *TwoQueueCache[K, V]) Get(key K) (value V, ok bool) {
 		return val, ok
 	}
 
-	// If the value is contained in recent, then we
-	// promote it to frequent
+	// If the value is contained in recent, count the hit and
+	// promote it to frequent once the threshold is reached
 	if val, ok := c.recent.Peek(key); ok {
+		hits := c.recentHits[key] + 1
+		if hits < c.promoteThreshold {
+			c.recentHits[key] = hits
+			c.recent.Get(key)
+			return val, ok
+		}
+		delete(c.recentHits, key)
 		c.recent.Remove(key)
 		c.frequent.Add(key, val)
 		return val, ok
@@ -128,14 +199,22 @@ func (c *TwoQueueCache[K, V]) Add(key K, value V) {
 	// Check if the value is recently used, and promote
 	// the value into the frequent list
 	if c.recent.Contains(key) {
+		if c.promoteThreshold > 1 {
+			// Replace the value and reset the heat of the key,
+			// it must earn promotion with fresh hits
+			c.recent.Add(key, value)
+			c.recentHits[key] = 0
+			return
+		}
 		c.recent.Remove(key)
 		c.frequent.Add(key, value)
 		return
 	}
 
 	// If the value was recently evicted, add it to the
-	// frequently used list
+	// frequently used list, and grow the recent target
 	if c.recentEvict.Contains(key) {
+		c.adjustRecentTarget()
 		c.ensureSpace(true)
 		c.recentEvict.Remove(key)
 		c.frequent.Add(key, value)
@@ -145,6 +224,9 @@ func (c *TwoQueueCache[K, V]) Add(key K, value V) {
 	// Add to the recently seen list
 	c.ensureSpace(false)
 	c.recent.Add(key, value)
+	if c.promoteThreshold > 1 {
+		c.recentHits[key] = 0
+	}
 }
 
 // ensureSpace is used to ensure we have space in the cache
@@ -160,12 +242,28 @@ func (c *TwoQueueCache[K, V]) ensureSpace(recentEvict bool) {
 	// the target, evict from there
 	if recentLen > 0 && (recentLen > c.recentSize || (recentLen == c.recentSize && !recentEvict)) {
 		k, _, _ := c.recent.RemoveOldest()
+		delete(c.recentHits, k)
 		c.recentEvict.Add(k, struct{}{})
 		return
 	}
 
 	// Remove from the frequent list otherwise
 	c.frequent.RemoveOldest()
+}
+
+// adjustRecentTarget grows the target size of the recent list by the
+// configured step, bounded by the configured min and max sizes.
+func (c *TwoQueueCache[K, V]) adjustRecentTarget() {
+	if c.adjustStep <= 0 {
+		return
+	}
+	c.recentSize += c.adjustStep
+	if c.recentSize > c.maxRecentSize {
+		c.recentSize = c.maxRecentSize
+	}
+	if c.recentSize < c.minRecentSize {
+		c.recentSize = c.minRecentSize
+	}
 }
 
 // Len returns the number of items in the cache.
@@ -186,10 +284,9 @@ func (c *TwoQueueCache[K, V]) Resize(size int) (evicted int) {
 	defer c.lock.Unlock()
 
 	// Recalculate the sub-sizes
-	recentSize := int(float64(size) * c.recentRatio)
 	evictSize := int(float64(size) * c.ghostRatio)
 	c.size = size
-	c.recentSize = recentSize
+	c.computeTargets(size)
 
 	// ensureSpace
 	diff := c.recent.Len() + c.frequent.Len() - size
@@ -232,6 +329,7 @@ func (c *TwoQueueCache[K, V]) Values() []V {
 func (c *TwoQueueCache[K, V]) Remove(key K) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	delete(c.recentHits, key)
 	if c.frequent.Remove(key) {
 		return
 	}
@@ -250,6 +348,7 @@ func (c *TwoQueueCache[K, V]) Purge() {
 	c.recent.Purge()
 	c.frequent.Purge()
 	c.recentEvict.Purge()
+	c.recentHits = make(map[K]int)
 }
 
 // Contains is used to check if the cache contains a key

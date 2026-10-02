@@ -376,3 +376,270 @@ func Test2Q_Peek(t *testing.T) {
 		t.Errorf("should not have updated recent-ness of 1")
 	}
 }
+
+func Test2Q_AdaptiveParams_Validation(t *testing.T) {
+	cases := []struct {
+		name                       string
+		size                       int
+		recentRatio, ghostRatio    float64
+		threshold                  int
+		minRecent, maxRecent, step float64
+	}{
+		{"bad size", 0, 0.25, 0.5, 1, 0.25, 0.75, 0.25},
+		{"bad recent ratio", 8, -0.1, 0.5, 1, 0.25, 0.75, 0.25},
+		{"bad ghost ratio", 8, 0.25, 1.1, 1, 0.25, 0.75, 0.25},
+		{"bad threshold", 8, 0.25, 0.5, 0, 0.25, 0.75, 0.25},
+		{"bad min recent", 8, 0.25, 0.5, 1, -0.1, 0.75, 0.25},
+		{"bad max recent", 8, 0.25, 0.5, 1, 0.25, 1.1, 0.25},
+		{"min above max", 8, 0.25, 0.5, 1, 0.75, 0.25, 0.25},
+		{"bad step", 8, 0.25, 0.5, 1, 0.25, 0.75, -0.1},
+	}
+	for _, tc := range cases {
+		_, err := New2QAdaptiveParams[int, int](tc.size, tc.recentRatio,
+			tc.ghostRatio, tc.threshold, tc.minRecent, tc.maxRecent, tc.step)
+		if err == nil {
+			t.Fatalf("%s: expected error", tc.name)
+		}
+	}
+
+	// The initial recent target is clamped into the [min, max] bounds
+	l, err := New2QAdaptiveParams[int, int](8, 0.0, 0.5, 1, 0.25, 0.5, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if l.recentSize != 2 {
+		t.Fatalf("bad: %d", l.recentSize)
+	}
+	l, err = New2QAdaptiveParams[int, int](8, 1.0, 0.5, 1, 0.25, 0.5, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if l.recentSize != 4 {
+		t.Fatalf("bad: %d", l.recentSize)
+	}
+}
+
+func Test2Q_AdaptiveThreshold_Promote(t *testing.T) {
+	l, err := New2QAdaptiveParams[int, int](8, 0.25, 0.5, 2, 0.25, 0.75, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 1)
+	if _, ok := l.Get(1); !ok {
+		t.Fatalf("missing: 1")
+	}
+	if l.frequent.Contains(1) {
+		t.Fatalf("promoted before reaching the threshold")
+	}
+	if !l.recent.Contains(1) {
+		t.Fatalf("should still be recent")
+	}
+
+	if _, ok := l.Get(1); !ok {
+		t.Fatalf("missing: 1")
+	}
+	if !l.frequent.Contains(1) {
+		t.Fatalf("should be promoted at the threshold")
+	}
+	if l.recent.Contains(1) {
+		t.Fatalf("should have left recent")
+	}
+	if _, ok := l.recentHits[1]; ok {
+		t.Fatalf("heat should be cleared on promotion")
+	}
+}
+
+func Test2Q_AdaptiveThreshold_HeatHygiene(t *testing.T) {
+	l, err := New2QAdaptiveParams[int, int](16, 0.25, 0.5, 3, 0.25, 0.75, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	l.Add(1, 1)
+	l.Get(1)
+	l.Get(1)
+	if got := l.recentHits[1]; got != 2 {
+		t.Fatalf("bad: %d", got)
+	}
+
+	// Replacing the value resets the heat and keeps the key in recent
+	l.Add(1, 100)
+	if got := l.recentHits[1]; got != 0 {
+		t.Fatalf("bad: %d", got)
+	}
+	if !l.recent.Contains(1) || l.frequent.Contains(1) {
+		t.Fatalf("replaced key should stay in recent")
+	}
+	if v, ok := l.Peek(1); !ok || v != 100 {
+		t.Fatalf("bad: %v %v", v, ok)
+	}
+
+	// Promotion requires a fresh set of hits after the replace
+	l.Get(1)
+	l.Get(1)
+	if l.frequent.Contains(1) {
+		t.Fatalf("promoted before the fresh threshold")
+	}
+	l.Get(1)
+	if !l.frequent.Contains(1) {
+		t.Fatalf("should be promoted")
+	}
+
+	// Remove clears the heat of the key
+	l.Add(2, 2)
+	l.Get(2)
+	if got := l.recentHits[2]; got != 1 {
+		t.Fatalf("bad: %d", got)
+	}
+	l.Remove(2)
+	if _, ok := l.recentHits[2]; ok {
+		t.Fatalf("heat should be cleared on remove")
+	}
+
+	// Purge clears all heat
+	l.Add(3, 3)
+	l.Get(3)
+	l.Purge()
+	if len(l.recentHits) != 0 {
+		t.Fatalf("heat should be cleared on purge")
+	}
+}
+
+func Test2Q_AdaptiveThreshold_RatioBounds(t *testing.T) {
+	l, err := New2QAdaptiveParams[int, int](8, 0.25, 0.5, 1, 0.25, 0.5, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Overflow the cache to seed the ghost list
+	for i := 1; i <= 12; i++ {
+		l.Add(i, i)
+	}
+	if l.recentSize != 2 {
+		t.Fatalf("bad: %d", l.recentSize)
+	}
+
+	// Each ghost hit grows the recent target by one step (2 entries)
+	l.Add(1, 1)
+	if l.recentSize != 4 {
+		t.Fatalf("bad: %d", l.recentSize)
+	}
+
+	// The target is capped at the max ratio (0.5 * 8 = 4)
+	l.Add(2, 2)
+	if l.recentSize != 4 {
+		t.Fatalf("bad: %d", l.recentSize)
+	}
+	if n := l.recent.Len() + l.frequent.Len(); n > 8 {
+		t.Fatalf("over capacity: %d", n)
+	}
+}
+
+// Test2Q_AdaptiveThreshold_ScanComparison replays a fixed access sequence
+// mixing a cyclic hot set with one-time scans through the classic 2Q and
+// the adaptive 2Q, and compares the exact retained key sets.
+func Test2Q_AdaptiveThreshold_ScanComparison(t *testing.T) {
+	const size = 8
+
+	type op struct {
+		get bool
+		key int
+	}
+	var ops []op
+	add := func(k int) { ops = append(ops, op{false, k}) }
+	get := func(k int) { ops = append(ops, op{true, k}) }
+
+	// Cyclic hot set, each key seen three times up front
+	for _, k := range []int{1, 2, 3} {
+		add(k)
+		get(k)
+		get(k)
+	}
+	// First one-time scan
+	for k := 10; k <= 17; k++ {
+		add(k)
+	}
+	// Hot set re-access, then lukewarm keys seen exactly twice
+	for _, k := range []int{1, 2, 3} {
+		get(k)
+	}
+	for _, k := range []int{20, 21, 22} {
+		add(k)
+		get(k)
+	}
+	// Second one-time scan
+	for k := 30; k <= 37; k++ {
+		add(k)
+	}
+	// Re-request of a scanned-out lukewarm key (ghost hit)
+	add(22)
+	get(22)
+	// Final one-time scan
+	for k := 40; k <= 42; k++ {
+		add(k)
+	}
+
+	classic, err := New2QParams[int, int](size, Default2QRecentRatio, Default2QGhostEntries)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	adaptive, err := New2QAdaptiveParams[int, int](size, 0.25, 0.5, 2, 0.25, 0.75, 0.25)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Replay the same fixed sequence against both caches, checking
+	// capacity conservation after every single operation
+	for i, o := range ops {
+		for _, l := range []*TwoQueueCache[int, int]{classic, adaptive} {
+			if o.get {
+				l.Get(o.key)
+			} else {
+				l.Add(o.key, o.key)
+			}
+			if n := l.recent.Len() + l.frequent.Len(); n > size {
+				t.Fatalf("op %d: over capacity: %d", i, n)
+			}
+		}
+	}
+
+	keySet := func(l *TwoQueueCache[int, int]) map[int]bool {
+		out := make(map[int]bool)
+		for _, k := range l.Keys() {
+			out[k] = true
+		}
+		return out
+	}
+	check := func(name string, l *TwoQueueCache[int, int], want []int) {
+		if l.Len() != size {
+			t.Fatalf("%s: bad len: %d", name, l.Len())
+		}
+		got := keySet(l)
+		if len(got) != len(want) {
+			t.Fatalf("%s: bad keys: %v", name, got)
+		}
+		for _, k := range want {
+			if !got[k] {
+				t.Fatalf("%s: missing key %d in %v", name, k, got)
+			}
+		}
+	}
+
+	// The classic cache promotes the lukewarm keys 20,21,22 on their
+	// second touch, so they survive the scans in the frequent list
+	check("classic", classic, []int{1, 2, 3, 20, 21, 22, 41, 42})
+
+	// The adaptive cache requires a second hit before promoting, so the
+	// lukewarm keys are scanned out; 22 is recovered via the ghost list
+	// and the grown recent target retains more of the final scan
+	check("adaptive", adaptive, []int{1, 2, 3, 22, 37, 40, 41, 42})
+
+	// The ghost hit grew the recent target by exactly one step
+	if adaptive.recentSize != 4 {
+		t.Fatalf("bad: %d", adaptive.recentSize)
+	}
+	if classic.recentSize != 2 {
+		t.Fatalf("bad: %d", classic.recentSize)
+	}
+}
