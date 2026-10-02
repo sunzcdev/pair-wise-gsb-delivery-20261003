@@ -11,6 +11,10 @@ go-plugin is and _why_ you would want to use it. If not, please see the
 This shows how to write a plugin using a programming language other than
 Go.
 
+**[Business Errors](business-errors.md).**
+Describes stable, registered business errors, exported fields, causes,
+unknown types, and transport-specific encoding.
+
 **[Extensive Tutorial on Usage](https://github.com/hashicorp/go-plugin/blob/master/docs/extensive-go-plugin-tutorial.md).**
 A guide showing the usage and structure of go-plugin including a detailed
 walkthrough of setting up the plugins under the `examples` folder.

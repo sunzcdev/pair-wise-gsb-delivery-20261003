@@ -4,7 +4,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 
 	"github.com/hashicorp/go-plugin"
@@ -21,7 +23,14 @@ func (KV) Put(key string, value []byte) error {
 }
 
 func (KV) Get(key string) ([]byte, error) {
-	return os.ReadFile("kv_" + key)
+	value, err := os.ReadFile("kv_" + key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, shared.NewNotFoundError(key)
+	}
+	if err != nil {
+		return nil, shared.NewTemporarilyUnavailableError(1, "net-rpc-secret", err)
+	}
+	return value, nil
 }
 
 func main() {

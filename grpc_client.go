@@ -39,6 +39,7 @@ func dialGRPCConn(tls *tls.Config, dialer func(context.Context, string) (net.Con
 	opts = append(opts,
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(math.MaxInt32)))
+	opts = append(opts, grpc.WithChainUnaryInterceptor(unaryBusinessErrorClientInterceptor))
 
 	// Add our custom options if we have any
 	opts = append(opts, dialOpts...)

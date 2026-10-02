@@ -5,6 +5,8 @@ package shared
 
 import (
 	"net/rpc"
+
+	"github.com/hashicorp/go-plugin"
 )
 
 // RPCClient is an implementation of KV that talks over RPC.
@@ -24,7 +26,7 @@ func (m *RPCClient) Put(key string, value []byte) error {
 func (m *RPCClient) Get(key string) ([]byte, error) {
 	var resp []byte
 	err := m.client.Call("Plugin.Get", key, &resp)
-	return resp, err
+	return resp, plugin.DecodeRPCError(err)
 }
 
 // Here is the RPC server that RPCClient talks to, conforming to
@@ -41,5 +43,5 @@ func (m *RPCServer) Put(args map[string]interface{}, resp *interface{}) error {
 func (m *RPCServer) Get(key string, resp *[]byte) error {
 	v, err := m.Impl.Get(key)
 	*resp = v
-	return err
+	return plugin.EncodeRPCError(err)
 }

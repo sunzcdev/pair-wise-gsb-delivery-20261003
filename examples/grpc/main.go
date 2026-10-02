@@ -4,6 +4,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -56,7 +57,18 @@ func run() error {
 	case "get":
 		result, err := kv.Get(os.Args[1])
 		if err != nil {
-			return err
+			switch {
+			default:
+				var business *plugin.RemoteBusinessError
+				if errors.As(err, &business) {
+					return fmt.Errorf("unknown newer error type %q: %w", business.ID(), err)
+				}
+				return err
+			case shared.IsNotFound(err):
+				return fmt.Errorf("classified as not found: %w", err)
+			case shared.IsTemporarilyUnavailable(err):
+				return fmt.Errorf("classified as temporarily unavailable (retry without text matching): %w", err)
+			}
 		}
 
 		fmt.Println(string(result))

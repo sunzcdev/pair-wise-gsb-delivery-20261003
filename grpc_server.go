@@ -73,6 +73,7 @@ func (s *GRPCServer) Init() error {
 	if s.TLS != nil {
 		opts = append(opts, grpc.Creds(credentials.NewTLS(s.TLS)))
 	}
+	opts = append(opts, grpc.ChainUnaryInterceptor(unaryBusinessErrorServerInterceptor))
 	s.server = s.Server(opts)
 
 	// Register the health service
