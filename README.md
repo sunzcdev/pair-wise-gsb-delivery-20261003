@@ -1224,6 +1224,76 @@ Output:
 
 </details>
 
+## Flattened Rows (`render_rows`)
+
+For spreadsheet or CSV exports where one record can have many detail lines, `render_rows` returns ordered column names and positional rows. Exactly one collection association is expanded: each element becomes a row, and parent-level columns are repeated on every row generated from the same parent. This method only returns data — it does not write files.
+
+Column paths use Blueprint output aliases (including aliases set with `name:`). A path may be a Symbol, a dot-separated String, or an Array of aliases, and may cross ordinary (singular) object associations. Paths that start with the declared collection path read fields from the current collection element; a path ending exactly at the collection uses the element itself.
+
+```ruby
+class ProductBlueprint < Blueprinter::Base
+  field :name
+end
+
+class LineItemBlueprint < Blueprinter::Base
+  field :sku
+  field :price
+  association :product, blueprint: ProductBlueprint
+end
+
+class CustomerBlueprint < Blueprinter::Base
+  field :name
+end
+
+class OrderBlueprint < Blueprinter::Base
+  identifier :id
+  field :number
+  association :customer, blueprint: CustomerBlueprint
+  association :line_items, name: :items, blueprint: LineItemBlueprint
+end
+
+OrderBlueprint.render_rows(
+  orders,
+  columns: [
+    :id,
+    [:customer, :name],
+    'items.sku',
+    [:items, :price],
+    [:items, :product, :name]
+  ],
+  collection: :items
+)
+# => {
+#      columns: [:id, :name, :sku, :price, :name],
+#      rows: [
+#        [1, "Acme", "A-1", 9.99, "Widget"],
+#        [1, "Acme", "A-2", 19.99, "Gadget"],
+#        [2, "Beta", "B-1", 5.0, "Gizmo"]
+#      ]
+#    }
+```
+
+Fields remain subject to views, `:if`/`:unless` conditions, extractors, and transformers. A field hidden by a condition (or otherwise absent) is still represented by a blank cell so later columns never shift out of alignment. Each parent object is rendered once; parent columns are not re-extracted per detail row.
+
+```ruby
+OrderBlueprint.render_rows(orders, columns: [:id, :items], collection: :items, view: :export)
+```
+
+### Empty collections
+
+Use `on_empty` to control nil or empty collections:
+
+- `on_empty: :blank_row` (default; also accepts `:blank`, `:blank_detail`, `:empty`, or `true`) keeps one row per parent with the detail cells left blank.
+- `on_empty: :omit` (also accepts `:skip`, `:drop`, `:exclude`, or `false`) leaves the parent object out of the rows entirely.
+
+```ruby
+OrderBlueprint.render_rows(orders, columns: [:id, [:items, :sku]], collection: :items, on_empty: :omit)
+```
+
+### Path rules
+
+Only the single declared collection is expanded. A column path that crosses any other collection — or ends at a second collection association — raises `Blueprinter::Errors::InvalidRowPath` instead of silently producing a cartesian product. The declared collection must resolve to an array-like value (Arrays, ActiveRecord relations, and classes configured with `custom_array_like_classes`).
+
 ## Installation
 
 Add this line to your application's Gemfile:

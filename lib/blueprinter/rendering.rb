@@ -1,9 +1,11 @@
 # frozen_string_literal: true
 
 require 'blueprinter/errors/invalid_root'
+require 'blueprinter/errors/invalid_row_path'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
 require 'blueprinter/deprecation'
+require 'blueprinter/row_renderer'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
@@ -82,6 +84,84 @@ module Blueprinter
     # @return [Hash]
     def render_as_json(object, options = {})
       build_result(object:, options:).as_json
+    end
+
+    # Renders objects into flat, ordered rows suitable for spreadsheet or CSV
+    # export. Exactly one collection association is expanded: each of its
+    # elements occupies one row, while parent-level columns are repeated on
+    # every row generated from the same parent.
+    #
+    # Column paths use Blueprint output aliases and may cross ordinary
+    # (single) object associations. Paths beginning with the declared
+    # collection path read fields from the current collection element; all
+    # other paths read parent-level values.
+    #
+    # Fields remain subject to views, :if/:conditions, transformers, and
+    # extractors. Conditionally hidden fields render as blank cells rather
+    # shifting later columns. Each parent object is rendered once.
+    #
+    # This method only builds the data structure; it does not write files.
+    #
+    # @param object [Object, Enumerable] a single object or an array-like
+    #   collection of parent objects
+    # @param columns [Array<Symbol, String, Array>] ordered column paths,
+    #   e.g. `[:id, :customer_name, ['items', :sku'], 'items.price']`. May be
+    #   passed positionally or as the `columns:` keyword.
+    # @param collection [Symbol, String, Array] the single collection
+    #   association path to expand, e.g. `:items` or `:order.items`. May be
+    #   passed positionally or as the `collection:` keyword.
+    # @param options [Hash] rendering options
+    # @option options [Symbol] :view Defaults to :default. View used for both
+    #   parent objects and nested associations.
+    # @option options [Symbol, Boolean] :on_empty Defaults to :blank_row.
+    #   When the collection is nil or empty, :blank_row (also :blank,
+    #   :blank_detail, :empty, or +true+) keeps one row with blank detail
+    #   cells; :omit (also :skip, :drop, :exclude, or +false+) drops the
+    #   parent object entirely.
+    #
+    # @example Exporting orders with one row per line item
+    #   OrderBlueprint.render_rows(
+    #     orders,
+    #     columns: [[:id], [:customer, :name], [:items, :sku], [:items, :price]],
+    #     collection: :items
+    #   )
+    #   # => {
+    #   #      columns: [:id, :name, :sku, :price],
+    #   #      rows: [
+    #   #        [1, 'Acme', 'A-1', 9.99],
+    #   #        [1, 'Acme', 'A-2', 19.99],
+    #   #        [2, 'Beta', 'B-1', 5.00]
+    #   #      ]
+    #   #    }
+    #
+    # @return [Hash{columns: Array<Symbol>, rows: Array<Array>}]
+    # @raise [Blueprinter::Errors::InvalidRowPath] if a path crosses a second,
+    #   undeclared collection or cannot be resolved against the Blueprint
+    def render_rows(object, positional_columns = nil, positional_collection = nil,
+                    columns: positional_columns, collection: positional_collection, **options)
+      if columns.nil?
+        raise ArgumentError,
+              'render_rows requires ordered column paths, passed positionally or as `columns:`'
+      end
+      if collection.nil?
+        raise ArgumentError,
+              'render_rows requires exactly one collection to expand, passed positionally or as `collection:`'
+      end
+
+      on_empty = options.fetch(:on_empty, :blank_row)
+      view_name = options[:view] || :default
+      local_options = options.except(:view, :on_empty)
+
+      renderer = RowRenderer.new(
+        self,
+        columns:,
+        collection:,
+        view_name:,
+        local_options:,
+        on_empty:
+      )
+
+      { columns: renderer.column_names, rows: renderer.render(object) }
     end
 
     # Converts an object into a Hash representation based on provided view.

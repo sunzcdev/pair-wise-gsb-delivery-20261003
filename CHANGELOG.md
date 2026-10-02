@@ -1,4 +1,6 @@
 ## Unreleased
+
+- 🚀 [FEATURE] Adds `Blueprinter::Base.render_rows`, a file-writing-free entry point for flat, ordered spreadsheet/CSV rows. The caller declares ordered column paths (using output aliases, traversable through singular associations) and exactly one collection association to expand; each collection element becomes a row with parent columns repeated. Fields remain subject to views, conditions, and transformers; conditionally hidden fields render as blank cells; and a second, undeclared collection raises `Blueprinter::Errors::InvalidRowPath` rather than producing an implicit cartesian product. Nil/empty collections can either keep one blank-detail row (`on_empty: :blank_row`, default) or omit the parent (`on_empty: :omit`).
 --
 
 ## 1.3.0 - 2026/04/14
