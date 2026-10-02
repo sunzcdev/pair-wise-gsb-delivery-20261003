@@ -1,6 +1,7 @@
 package backoff
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"time"
@@ -52,6 +53,8 @@ type ExponentialBackOff struct {
 	MaxInterval         time.Duration
 
 	currentInterval time.Duration
+	randomSource    *rand.PCG
+	random          *rand.Rand
 }
 
 // Default values for ExponentialBackOff.
@@ -74,6 +77,9 @@ func NewExponentialBackOff() *ExponentialBackOff {
 
 // Reset the interval back to the initial retry interval and restarts the timer.
 // Reset must be called before using b.
+//
+// Reset does not reseed the random source: the randomization sequence
+// continues where it left off. To also capture the random state, use Snapshot.
 func (b *ExponentialBackOff) Reset() {
 	b.currentInterval = b.InitialInterval
 }
@@ -86,9 +92,114 @@ func (b *ExponentialBackOff) NextBackOff() time.Duration {
 		b.currentInterval = b.InitialInterval
 	}
 
-	next := getRandomValueFromInterval(b.RandomizationFactor, rand.Float64(), b.currentInterval)
+	next := getRandomValueFromInterval(b.RandomizationFactor, b.nextRandom(), b.currentInterval)
 	b.incrementCurrentInterval()
 	return next
+}
+
+// nextRandom returns the next random value in [0.0, 1.0) from the backoff's
+// own random source, lazily seeded on first use. A dedicated source (instead
+// of the global one) is what allows the random sequence to be captured and
+// restored via Snapshot and RestoreExponentialBackOff.
+func (b *ExponentialBackOff) nextRandom() float64 {
+	if b.random == nil {
+		b.randomSource = rand.NewPCG(rand.Uint64(), rand.Uint64())
+		b.random = rand.New(b.randomSource)
+	}
+	return b.random.Float64()
+}
+
+// ExponentialBackOffStateVersion is the version of the ExponentialBackOffState
+// snapshot format produced by Snapshot and accepted by
+// RestoreExponentialBackOff.
+const ExponentialBackOffStateVersion = 1
+
+// ExponentialBackOffState is a serializable snapshot of an ExponentialBackOff:
+// its parameters, its position in the exponential sequence, and the random
+// source state needed to reproduce the subsequent randomized intervals.
+//
+// The snapshot holds plain data only — no operation, error, or timer — so it
+// can be encoded with encoding/json, encoding/gob, or similar and stored
+// while a task processor is paused.
+type ExponentialBackOffState struct {
+	Version             int           `json:"version"`
+	InitialInterval     time.Duration `json:"initial_interval"`
+	RandomizationFactor float64       `json:"randomization_factor"`
+	Multiplier          float64       `json:"multiplier"`
+	MaxInterval         time.Duration `json:"max_interval"`
+	CurrentInterval     time.Duration `json:"current_interval"`
+	RandState           []byte        `json:"rand_state"`
+}
+
+// Snapshot captures the current state of b so that a paused retry loop can
+// later resume the exact same exponential and random sequence with
+// RestoreExponentialBackOff.
+func (b *ExponentialBackOff) Snapshot() ExponentialBackOffState {
+	if b.random == nil {
+		b.nextRandom() // seed the random source so its state can be captured
+	}
+	// rand.PCG.MarshalBinary never fails.
+	randState, _ := b.randomSource.MarshalBinary()
+
+	currentInterval := b.currentInterval
+	if currentInterval == 0 {
+		// Not started yet: NextBackOff would fall back to InitialInterval.
+		currentInterval = b.InitialInterval
+	}
+
+	return ExponentialBackOffState{
+		Version:             ExponentialBackOffStateVersion,
+		InitialInterval:     b.InitialInterval,
+		RandomizationFactor: b.RandomizationFactor,
+		Multiplier:          b.Multiplier,
+		MaxInterval:         b.MaxInterval,
+		CurrentInterval:     currentInterval,
+		RandState:           randState,
+	}
+}
+
+// RestoreExponentialBackOff rebuilds an ExponentialBackOff from a snapshot
+// previously taken with Snapshot, resuming the exponential sequence and the
+// randomized intervals exactly where they were captured. It returns an error
+// if the snapshot has an unsupported version or holds invalid values.
+//
+// Note that Retry calls Reset on its backoff policy before the first attempt,
+// which would discard the restored position. Pass WithBackOffReset(false) to
+// Retry when resuming from a restored snapshot.
+func RestoreExponentialBackOff(state ExponentialBackOffState) (*ExponentialBackOff, error) {
+	if state.Version != ExponentialBackOffStateVersion {
+		return nil, fmt.Errorf("backoff: unsupported state version %d", state.Version)
+	}
+	if state.InitialInterval <= 0 {
+		return nil, fmt.Errorf("backoff: invalid initial interval in state: %d", state.InitialInterval)
+	}
+	if state.MaxInterval <= 0 {
+		return nil, fmt.Errorf("backoff: invalid max interval in state: %d", state.MaxInterval)
+	}
+	if state.CurrentInterval <= 0 {
+		return nil, fmt.Errorf("backoff: invalid current interval in state: %d", state.CurrentInterval)
+	}
+	if math.IsNaN(state.RandomizationFactor) || state.RandomizationFactor < 0 || state.RandomizationFactor > 1 {
+		return nil, fmt.Errorf("backoff: invalid randomization factor in state: %v", state.RandomizationFactor)
+	}
+	if math.IsNaN(state.Multiplier) || math.IsInf(state.Multiplier, 0) || state.Multiplier < 1 {
+		return nil, fmt.Errorf("backoff: invalid multiplier in state: %v", state.Multiplier)
+	}
+
+	randomSource := &rand.PCG{}
+	if err := randomSource.UnmarshalBinary(state.RandState); err != nil {
+		return nil, fmt.Errorf("backoff: invalid random state: %w", err)
+	}
+
+	return &ExponentialBackOff{
+		InitialInterval:     state.InitialInterval,
+		RandomizationFactor: state.RandomizationFactor,
+		Multiplier:          state.Multiplier,
+		MaxInterval:         state.MaxInterval,
+		currentInterval:     state.CurrentInterval,
+		randomSource:        randomSource,
+		random:              rand.New(randomSource),
+	}, nil
 }
 
 // Increments the current interval by multiplying it with the multiplier.

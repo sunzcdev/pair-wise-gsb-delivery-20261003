@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `ExponentialBackOff.Snapshot` and `RestoreExponentialBackOff` export and restore the full state of the exponential policy — parameters, current interval, and random source state — via the versioned, serializable `ExponentialBackOffState`, so a paused retry loop can resume the exact same backoff sequence. Restore validates the version and rejects invalid values.
+- `WithBackOffReset(false)` keeps `Retry` from resetting a restored backoff policy before the first attempt; the default remains a reset to the initial state.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed

@@ -27,6 +27,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	ResetBackOff   bool          // Whether to Reset the backoff policy before the first attempt.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -41,6 +42,19 @@ type RetryOption func(*retryOptions)
 func WithBackOff(b BackOff) RetryOption {
 	return func(args *retryOptions) {
 		args.BackOff = b
+	}
+}
+
+// WithBackOffReset controls whether Retry calls Reset on the backoff policy
+// before the first attempt. The default is true, so a previously used policy
+// starts fresh.
+//
+// Pass false when the policy already holds the position to resume from — in
+// particular an ExponentialBackOff rebuilt with RestoreExponentialBackOff —
+// otherwise the restored state is silently reset to the initial interval.
+func WithBackOffReset(reset bool) RetryOption {
+	return func(args *retryOptions) {
+		args.ResetBackOff = reset
 	}
 }
 
@@ -117,6 +131,7 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		BackOff:        NewExponentialBackOff(),
 		Timer:          &defaultTimer{},
 		MaxElapsedTime: DefaultMaxElapsedTime,
+		ResetBackOff:   true,
 	}
 
 	// Apply user-provided options to the default settings.
@@ -127,7 +142,9 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 	defer args.Timer.Stop()
 
 	startedAt := time.Now()
-	args.BackOff.Reset()
+	if args.ResetBackOff {
+		args.BackOff.Reset()
+	}
 	for numTries := uint(1); ; numTries++ {
 		// Execute the operation.
 		res, err := operation()
