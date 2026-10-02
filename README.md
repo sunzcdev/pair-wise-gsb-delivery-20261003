@@ -241,7 +241,13 @@ JSONSchemer.schema(
   # validate `readOnly`/`writeOnly` keywords (https://spec.openapis.org/oas/v3.0.3#fixed-fields-19)
   # 'read'/'write'/nil
   # default: nil
-  access_mode: 'read'
+  access_mode: 'read',
+
+  # reject instances with keys that collide when stringified (e.g. `{ id: 1, 'id' => 2 }`)
+  # raises JSONSchemer::KeyCollision with the instance location and both original keys
+  # true/false
+  # default: false
+  strict_keys: true
 )
 ```
 

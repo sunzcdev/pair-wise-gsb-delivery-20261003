@@ -45,7 +45,7 @@ module JSONSchemer
 
     attr_accessor :base_uri, :meta_schema, :keywords, :keyword_order
     attr_reader :value, :parent, :root, :configuration, :parsed
-    def_delegators :@configuration, :vocabulary, :format, :formats, :content_encodings, :content_media_types, :before_property_validation, :after_property_validation, :insert_property_defaults
+    def_delegators :@configuration, :vocabulary, :format, :formats, :content_encodings, :content_media_types, :before_property_validation, :after_property_validation, :insert_property_defaults, :strict_keys
     def_delegator :@configuration, :keywords, :custom_keywords
 
     def initialize(
@@ -70,7 +70,8 @@ module JSONSchemer
       regexp_resolver: configuration.regexp_resolver,
       output_format: configuration.output_format,
       resolve_enumerators: configuration.resolve_enumerators,
-      access_mode: configuration.access_mode
+      access_mode: configuration.access_mode,
+      strict_keys: configuration.strict_keys
     )
       @value = deep_stringify_keys(value)
       @parent = parent
@@ -96,7 +97,8 @@ module JSONSchemer
         :regexp_resolver => regexp_resolver,
         :output_format => output_format,
         :resolve_enumerators => resolve_enumerators,
-        :access_mode => access_mode
+        :access_mode => access_mode,
+        :strict_keys => strict_keys
       )
       @parsed = parse
     end
@@ -108,9 +110,9 @@ module JSONSchemer
     def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
       instance_location = Location.root
       context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode)
-      result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
+      result = validate_instance(stringify_instance(instance, Location.root, strict_keys), instance_location, root_keyword_location, context)
       if insert_property_defaults && result.insert_property_defaults(context, &property_default_resolver)
-        result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
+        result = validate_instance(stringify_instance(instance, Location.root, strict_keys), instance_location, root_keyword_location, context)
       end
       output = result.output(output_format)
       resolve_enumerators!(output) if resolve_enumerators

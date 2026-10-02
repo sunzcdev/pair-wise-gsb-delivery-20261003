@@ -52,5 +52,30 @@ module JSONSchemer
         obj
       end
     end
+
+    def deep_stringify_keys_strict(obj, location = Location.root)
+      case obj
+      when Hash
+        original_keys = {}
+        obj.each_with_object({}) do |(key, value), out|
+          string_key = stringify(key)
+          if out.key?(string_key)
+            raise KeyCollision.new(Location.resolve(location), [original_keys.fetch(string_key), key])
+          end
+          original_keys[string_key] = key
+          out[string_key] = deep_stringify_keys_strict(value, Location.join(location, string_key))
+        end
+      when Array
+        obj.map.with_index do |item, index|
+          deep_stringify_keys_strict(item, Location.join(location, index.to_s))
+        end
+      else
+        obj
+      end
+    end
+
+    def stringify_instance(instance, location = Location.root, strict_keys = false)
+      strict_keys ? deep_stringify_keys_strict(instance, location) : deep_stringify_keys(instance)
+    end
   end
 end

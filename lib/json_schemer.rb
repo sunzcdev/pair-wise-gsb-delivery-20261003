@@ -77,6 +77,18 @@ module JSONSchemer
   class InvalidFileURI < StandardError; end
   class InvalidEcmaRegexp < StandardError; end
 
+  class KeyCollision < StandardError
+    attr_reader :instance_location, :keys
+
+    def initialize(instance_location, keys)
+      @instance_location = instance_location
+      @keys = keys.sort_by { |key| [key.class.name, key.to_s] }
+      location = instance_location.empty? ? 'root' : "`#{instance_location}`"
+      key_descriptions = @keys.map { |key| "#{key.inspect} (#{key.class})" }.join(' and ')
+      super("key collision at #{location}: #{key_descriptions} both resolve to `#{@keys.first.to_s}`")
+    end
+  end
+
   VOCABULARIES = {
     'https://json-schema.org/draft/2020-12/vocab/core' => Draft202012::Vocab::CORE,
     'https://json-schema.org/draft/2020-12/vocab/applicator' => Draft202012::Vocab::APPLICATOR,

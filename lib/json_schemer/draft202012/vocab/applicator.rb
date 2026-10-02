@@ -236,7 +236,7 @@ module JSONSchemer
                   hook.call(original_instance, property, subschema.value, schema.value)
                 end
               end
-              instance.replace(deep_stringify_keys(original_instance))
+              instance.replace(stringify_instance(original_instance, instance_location, root.strict_keys))
             end
 
             evaluated_keys = []
@@ -256,7 +256,7 @@ module JSONSchemer
                   hook.call(original_instance, property, subschema.value, schema.value)
                 end
               end
-              instance.replace(deep_stringify_keys(original_instance))
+              instance.replace(stringify_instance(original_instance, instance_location, root.strict_keys))
             end
 
             result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => evaluated_keys)
