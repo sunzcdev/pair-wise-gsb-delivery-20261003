@@ -13,8 +13,18 @@ module Blueprinter
       @options = options
     end
 
-    def extract(object, local_options)
-      extractor.extract(method, object, local_options, options)
+    def extract(object, local_options, projection = nil, projection_path = nil)
+      nested_projection = projection&.nested(name)
+
+      if nested_projection
+        nested_options = options.merge(
+          FieldProjection::OPTION_KEY => nested_projection,
+          FieldProjection::PATH_OPTION_KEY => projection_path ? "#{projection_path}.#{name}" : name.to_s
+        )
+        extractor.extract(method, object, local_options, nested_options)
+      else
+        extractor.extract(method, object, local_options, options)
+      end
     end
 
     def skip?(field_name, object, local_options)

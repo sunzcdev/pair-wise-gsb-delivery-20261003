@@ -358,6 +358,65 @@ end
 </details>
 
 <details>
+<summary>Field Projection</summary>
+
+
+Sometimes a given view contains more fields than a particular caller needs. Rather than
+defining a near-duplicate view, you can narrow the output for a single `render` with the
+`fields:` option. It is expressed using the **output field names**:
+
+```ruby
+UserBlueprint.render(user, fields: [:id, :first_name])
+# => {"id":1,"first_name":"John"}
+```
+
+You can also use a Hash. A value of `false` explicitly excludes a field:
+
+```ruby
+UserBlueprint.render_as_hash(user, fields: {id: true, first_name: true})
+```
+
+### Identifiers
+
+The identifier is kept by default, even when a projection is present. To omit it, pass
+`identifier: false` (or list the identifier with a `false` value):
+
+```ruby
+UserBlueprint.render(user, fields: [:first_name], identifier: false)
+# => {"first_name":"John"}
+```
+
+### Associations
+
+A nested projection can be supplied for an association using its output name. The nested
+identifier is likewise retained unless explicitly disabled:
+
+```ruby
+UserBlueprint.render(user, fields: [:id, projects: [:name]])
+# => {"id":1,"projects":[{"uuid":"...","name":"Beach Cleanup"}]}
+
+UserBlueprint.render(
+  user,
+  fields: {
+    identifier: false,
+    projects: { name: true, identifier: false }
+  }
+)
+# => {"projects":[{"name":"Beach Cleanup"}]}
+```
+
+Projections are intersected with the selected `view`. Fields that the view does not render
+(including fields removed by `:if` / `unless`) cannot be re-opened; requesting one raises
+`Blueprinter::Errors::InvalidProjection`. Nested fields may only be projected onto
+associations, and error messages include the full dotted path, e.g. `projects.owner.name`.
+
+Unselected fields are never extracted, and excluded associations are never read, so the
+projection also avoids unnecessary work. Projections apply only to the current render — they
+never mutate a Blueprint's shared view definitions.
+
+</details>
+
+<details>
 <summary>Associations</summary>
 
 

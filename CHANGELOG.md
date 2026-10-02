@@ -1,4 +1,5 @@
 ## Unreleased
+- 🚀 [FEATURE] Adds per-render field projection via the `fields:` option, including nested association projections and an `identifier: false` opt-out. The projection is intersected with the selected view and raises `Blueprinter::Errors::InvalidProjection` for unknown fields or nested projections on non-association fields. Unselected fields and excluded associations are never read.
 --
 
 ## 1.3.0 - 2026/04/14

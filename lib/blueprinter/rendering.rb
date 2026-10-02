@@ -3,6 +3,7 @@
 require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
+require 'blueprinter/field_projection'
 require 'blueprinter/deprecation'
 
 module Blueprinter
@@ -23,6 +24,13 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Array,Hash] :fields Defaults to nil.
+    #   A per-render field projection, expressed using output field names. Only the listed
+    #   fields are rendered; the projection is intersected with the selected view, so fields
+    #   excluded by the view (or by :if/:unless) cannot be re-opened. Nested projections may
+    #   be given for associations, e.g. `fields: [:id, owner: [:name]]`.
+    # @option options [Boolean] :identifier Defaults to true.
+    #   When a :fields projection is present, pass `false` to also omit the identifier.
     #
     # @example Generating JSON with an extended view
     #   post = Post.all
@@ -48,6 +56,13 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Array,Hash] :fields Defaults to nil.
+    #   A per-render field projection, expressed using output field names. Only the listed
+    #   fields are rendered; the projection is intersected with the selected view, so fields
+    #   excluded by the view (or by :if/:unless) cannot be re-opened. Nested projections may
+    #   be given for associations, e.g. `fields: [:id, owner: [:name]]`.
+    # @option options [Boolean] :identifier Defaults to true.
+    #   When a :fields projection is present, pass `false` to also omit the identifier.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -73,6 +88,13 @@ module Blueprinter
     # @option options [Any] :meta Defaults to nil.
     #   Render the json/hash with a meta attribute with provided value
     #   if both root and meta keys are provided in the options hash.
+    # @option options [Array,Hash] :fields Defaults to nil.
+    #   A per-render field projection, expressed using output field names. Only the listed
+    #   fields are rendered; the projection is intersected with the selected view, so fields
+    #   excluded by the view (or by :if/:unless) cannot be re-opened. Nested projections may
+    #   be given for associations, e.g. `fields: [:id, owner: [:name]]`.
+    # @option options [Boolean] :identifier Defaults to true.
+    #   When a :fields projection is present, pass `false` to also omit the identifier.
     #
     # @example Generating a hash with an extended view
     #   post = Post.all
@@ -90,12 +112,16 @@ module Blueprinter
     # @param view_name [Symbol] the view
     # @param local_options [Hash] the options hash which requires a :view. Any
     #   additional key value pairs will be exposed during serialization.
+    # @param projection [FieldProjection, nil] an optional per-render field projection
+    # @param projection_path [String, nil] dotted path used in projection error messages
     # @return [Hash]
-    def hashify(object, view_name:, local_options:)
+    def hashify(object, view_name:, local_options:, projection: nil, projection_path: nil)
       raise Errors::UnknownView, "View '#{view_name}' is not defined" unless view_collection.view?(view_name)
 
       object = Blueprinter.configuration.extensions.pre_render(object, self, view_name, local_options)
-      prepare_data(object, view_name, local_options)
+      projection = FieldProjection.build(projection)
+      projection&.validate!(view_collection.fields_for(view_name), projection_path)
+      prepare_data(object, view_name, local_options, projection, projection_path)
     end
 
     # @deprecated This method is no longer supported, and was not originally intended to be public. This will be removed
@@ -122,35 +148,45 @@ module Blueprinter
 
     attr_reader :blueprint, :options
 
-    def prepare_data(object, view_name, local_options)
+    def prepare_data(object, view_name, local_options, projection, projection_path = nil)
       # Since we're currently providing the current view in the local_options hash when we extract fields, we can merge
       # it in ahead of time to avoid allocating a new hash for every field extraction.
       local_options_with_view = local_options.merge(view: view_name)
+      identifier_names = projection ? view_collection.fields_for(:identifier).map(&:name) : []
 
       if array_like?(object)
         object.map do |obj|
           object_to_hash(
             obj,
             view_name:,
-            local_options: local_options_with_view
+            local_options: local_options_with_view,
+            projection:,
+            projection_path:,
+            identifier_names:
           )
         end
       else
         object_to_hash(
           object,
           view_name:,
-          local_options: local_options_with_view
+          local_options: local_options_with_view,
+          projection:,
+          projection_path:,
+          identifier_names:
         )
       end
     end
 
-    def object_to_hash(object, view_name:, local_options:)
+    def object_to_hash(object, view_name:, local_options:, projection: nil, projection_path: nil,
+                       identifier_names: [])
       result_hash = {}
 
       view_collection.fields_for(view_name).each do |field|
+        next if projected_out?(field, projection, identifier_names)
+
         next if field.skip?(field.name, object, local_options)
 
-        value = field.extract(object, local_options)
+        value = field.extract(object, local_options, projection, projection_path)
         next if value.nil? && field.options[:exclude_if_nil]
 
         result_hash[field.name] = value
@@ -161,6 +197,17 @@ module Blueprinter
       end
 
       result_hash
+    end
+
+    def projected_out?(field, projection, identifier_names)
+      return false unless projection
+      return true if projection.excluded?(field.name)
+
+      if identifier_names.include?(field.name)
+        !projection.include_identifiers
+      else
+        projection.active? && !projection.includes?(field.name)
+      end
     end
 
     def jsonify(data)
@@ -183,11 +230,16 @@ module Blueprinter
 
     def build_result(object:, options:)
       view_name = options[:view] || :default
+      projection = FieldProjection.build(options[:fields])
+      if projection && options.key?(:identifier)
+        projection.include_identifiers = options[:identifier]
+      end
 
       prepared_object = hashify(
         object,
         view_name:,
-        local_options: options.except(:view, :root, :meta)
+        local_options: options.except(:view, :root, :meta, :fields, :identifier),
+        projection:
       )
       object_with_root = apply_root_key(
         object: prepared_object,

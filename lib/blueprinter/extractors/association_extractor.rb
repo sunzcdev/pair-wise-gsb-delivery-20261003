@@ -2,6 +2,7 @@
 
 require 'blueprinter/extractor'
 require 'blueprinter/empty_types'
+require 'blueprinter/field_projection'
 
 module Blueprinter
   # @api private
@@ -13,13 +14,17 @@ module Blueprinter
     end
 
     def extract(association_name, object, local_options, options = {})
-      options_without_default = if options.key?(:default) || options.key?(:default_if)
-                                  options.except(:default, :default_if)
-                                else
-                                  options
-                                end
+      projection = options[FieldProjection::OPTION_KEY]
+      projection_path = options[FieldProjection::PATH_OPTION_KEY]
 
-      value = @extractor.extract(association_name, object, local_options, options_without_default)
+      extraction_options = options.except(
+        :default,
+        :default_if,
+        FieldProjection::OPTION_KEY,
+        FieldProjection::PATH_OPTION_KEY
+      )
+
+      value = @extractor.extract(association_name, object, local_options, extraction_options)
       return default_value(options) if use_default_value?(value, options[:default_if])
 
       # Merge in association options - supports both static Hash and dynamic Proc
@@ -27,7 +32,9 @@ module Blueprinter
 
       view = options[:view] || :default
       blueprint = association_blueprint(options[:blueprint], value)
-      blueprint.hashify(value, view_name: view, local_options:)
+      hashify_arguments = { view_name: view, local_options:, projection: }
+      hashify_arguments[:projection_path] = projection_path if projection
+      blueprint.hashify(value, **hashify_arguments)
     end
 
     private
