@@ -142,6 +142,36 @@ schemer.bundle
 #     "$defs"=>
 #      {"http://example.com/schema/one"=>{"type"=>"integer", "$id"=>"http://example.com/schema/one", "$schema"=>"https://json-schema.org/draft/2020-12/schema"},
 #       "http://example.com/schema/two"=>{"minimum"=>11, "$id"=>"http://example.com/schema/two", "$schema"=>"https://json-schema.org/draft/2020-12/schema"}}}
+# in-memory schema directory (batch registration with eager `$ref` checking)
+
+directory = JSONSchemer::SchemaDirectory.new
+directory.register(
+  'https://example.com/schemas/root.json' => {
+    '$id' => 'https://example.com/schemas/root.json',
+    'properties' => {
+      # forward reference: registered later in the same batch
+      'friend' => { '$ref' => 'circular.json' }
+    }
+  },
+  'https://example.com/schemas/circular.json' => {
+    '$id' => 'https://example.com/schemas/circular.json',
+    # legal circular reference back to root.json
+    'properties' => {
+      'parent' => { '$ref' => 'https://example.com/schemas/root.json' }
+    }
+  }
+)
+# root and nested `$id`/`$anchor`/`$dynamicAnchor` are indexed at
+# registration time and every static `$ref` is checked against the batch
+# plus the already registered documents; the batch is applied atomically
+# and registration, lookup and compilation never access the network
+
+directory.fetch('https://example.com/schemas/root.json')
+# => {"$id"=>"https://example.com/schemas/root.json", "properties"=>{...}}
+
+schemer = JSONSchemer.schema({ '$ref' => 'https://example.com/schemas/root.json' }, :ref_resolver => directory)
+schemer.valid?({ 'friend' => { 'parent' => {} } })
+# => true
 ```
 
 ## Options
