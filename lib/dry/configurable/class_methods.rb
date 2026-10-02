@@ -18,7 +18,10 @@ module Dry
         # Dry::Configurable is **included**, the class-level config method is undefined because it
         # resides at the instance-level instead (see `Configurable.included`).
         if respond_to?(:config)
-          subclass.instance_variable_set(:@__config__, config.dup_for_settings(new_settings))
+          subclass.instance_variable_set(
+            :@__config__,
+            config.dup_for_settings(new_settings, inherited: true)
+          )
         end
       end
 

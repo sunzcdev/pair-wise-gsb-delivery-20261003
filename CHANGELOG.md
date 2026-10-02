@@ -9,6 +9,8 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Added `Config#source`, returning a `Config::Source` for a setting path that reports its origin (`:default`, `:inherited`, or `:local`) and whether it was explicitly assigned. Assigning a value equal to the default remains an explicit assignment; reading (or in-place mutating) a mutable default is never an explicit assignment. Sources propagate through inheritance (parent values become `:inherited`, a subclass's own assignment flips them to `:local` without affecting the parent or siblings), `#dup` preserves them, `#pristine` resets them, and `#finalize!`/`#to_data` leave them untouched.
+
 ### Changed
 
 ### Deprecated

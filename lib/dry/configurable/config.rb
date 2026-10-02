@@ -19,10 +19,19 @@ module Dry
       protected :_configured
 
       # @api private
+      attr_reader :_explicit, :_sources
+      protected :_explicit, :_sources
+
+      # @api private
       def initialize(settings, values: {})
         @_settings = settings
         @_values = values
         @_configured = Set.new
+        # Setting names that were explicitly assigned through a writer. This is tracked
+        # separately from `_configured`, which is also populated when a mutable value is read.
+        @_explicit = Set.new
+        # Setting name => Source, for settings whose origin differs from the default
+        @_sources = {}
       end
 
       # @api private
@@ -30,11 +39,17 @@ module Dry
         super
         @_values = source.__send__(:dup_values)
         @_configured = source._configured.dup
+        @_explicit = source._explicit.dup
+        @_sources = source._sources.dup
       end
 
       # @api private
-      def dup_for_settings(settings)
-        dup.tap { |config| config.instance_variable_set(:@_settings, settings) }
+      def dup_for_settings(settings, inherited: false)
+        if inherited
+          __send__(:build_inherited_copy, settings)
+        else
+          dup.tap { |config| config.instance_variable_set(:@_settings, settings) }
+        end
       end
 
       # Get config value by a key
@@ -74,6 +89,8 @@ module Dry
         end
 
         _configured.add(name)
+        _explicit.add(name)
+        _sources[name] = Source[Source::LOCAL, true]
 
         _values[name] = setting.constructor.(value)
       end
@@ -108,6 +125,14 @@ module Dry
       # does not compare equally to its corresdponing default value. This relies on these objects
       # having functioning `#==` checks.
       #
+      # This is not the same as `source(...).explicit?`:
+      #
+      # - Explicitly assigning a value that compares equally to the default (for a cloneable
+      #   setting) keeps `explicit?` true but makes `configured?` false.
+      # - Mutating a cloneable default in place (e.g. `config.tags << :a`) makes `configured?`
+      #   true even though there was no explicit assignment, so `explicit?` stays false and the
+      #   source remains `:default`.
+      #
       # @return [Bool]
       #
       # @api public
@@ -117,6 +142,57 @@ module Dry
         end
 
         _configured.include?(key)
+      end
+
+      # Returns the {Source} of the value at the given setting path.
+      #
+      # The path may be given as a list of keys (`config.source(:db, :user)`) or a single
+      # dot-separated string (`config.source("db.user")`). Each step in a nested path is resolved
+      # against the corresponding nested config.
+      #
+      # The source only reports the origin category and whether the value was explicitly assigned;
+      # it never records file names or call stacks.
+      #
+      # @example
+      #
+      #   class App
+      #     extend Dry::Configurable
+      #
+      #     setting :timeout, default: 30
+      #   end
+      #
+      #   App.config.source(:timeout)
+      #   # => #<Dry::Configurable::Config::Source origin=:default explicit=false>
+      #
+      #   App.config.timeout = 30
+      #   App.config.source(:timeout)
+      #   # => #<Dry::Configurable::Config::Source origin=:local explicit=true>
+      #
+      # @param path [Array<String,Symbol>] one or more setting names forming a nested path
+      #
+      # @return [Source]
+      #
+      # @raise [ArgumentError] if any segment of the path is not a defined setting
+      #
+      # @api public
+      def source(*path)
+        path = path.flat_map { |segment| segment.to_s.split(".") }.map(&:to_sym) unless path.empty?
+
+        raise ArgumentError, "a setting path is required" if path.empty?
+
+        name = path.first
+        setting = _settings[name] or
+          raise ArgumentError, "+#{name}+ is not a setting name"
+
+        if path.size == 1
+          _source_for(name)
+        else
+          unless setting.children.any?
+            raise ArgumentError, "+#{name}+ is not a nested setting"
+          end
+
+          _nested_value(name).source(*path[1..])
+        end
       end
 
       # Returns the current config values.
@@ -217,12 +293,61 @@ module Dry
         freeze
       end
 
+      # Returns a fresh config built from the same settings, with all values reset to their
+      # defaults and every setting's {#source source} reset to `:default`/non-explicit. This
+      # means no value is treated as configured, locally assigned, or inherited.
+      #
+      # @return [Config]
+      #
       # @api private
       def pristine
         self.class.new(_settings)
       end
 
       private
+
+      def _source_for(name)
+        _sources.fetch(name) { Source[Source::DEFAULT, false] }
+      end
+
+      # Resolves a nested config without recording the access in `_configured`, so querying
+      # {#source} never changes the answer given by {#configured?}.
+      def _nested_value(name)
+        _values.fetch(name) { _settings[name].to_value }
+      end
+
+      # Builds the config handed to a subclass. Only values that were explicitly assigned or
+      # effectively configured (e.g. a mutated mutable default) are carried over, and each is
+      # marked as inherited. Read-only materialized values are left behind and re-derived from
+      # the subclass's own defaults.
+      def build_inherited_copy(settings)
+        dup.tap do |copy|
+          copy.instance_variable_set(:@_settings, settings)
+
+          values = {}
+          configured = Set.new
+          sources = {}
+
+          _values.each do |name, value|
+            next unless settings.key?(name)
+            next unless _explicit.include?(name) || configured?(name)
+
+            configured.add(name)
+            sources[name] = Source[Source::INHERITED, _explicit.include?(name)]
+
+            if value.is_a?(self.class)
+              values[name] = value.__send__(:build_inherited_copy, value._settings)
+            else
+              values[name] = copy._values[name]
+            end
+          end
+
+          copy.instance_variable_set(:@_values, values)
+          copy.instance_variable_set(:@_configured, configured)
+          copy.instance_variable_set(:@_explicit, Set.new)
+          copy.instance_variable_set(:@_sources, sources)
+        end
+      end
 
       def to_data_attrs
         _values.each_with_object({}) do |(name, value), hsh|
