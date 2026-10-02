@@ -209,3 +209,47 @@ func main() {
   req2.Header.Set("Authorization", cred.String())
 }
 ```
+
+## Verifying the Server (Authentication-Info)
+
+Some servers prove their identity by returning an `rspauth` value in the
+`Authentication-Info` header. Set `Verify` to check this proof against the
+request's nonce, nc, cnonce, URI and digest algorithm:
+
+``` go
+package main
+
+import (
+	"net/http"
+
+	"github.com/icholy/digest"
+)
+
+func main() {
+	client := &http.Client{
+		Transport: &digest.Transport{
+			Username: "foo",
+			Password: "bar",
+			Verify:   digest.VerifyStrict,
+		},
+	}
+	res, err := client.Get("http://localhost:8080/some_outdated_service")
+	if err != nil {
+		panic(err)
+	}
+	defer res.Body.Close()
+}
+```
+
+- `VerifyNone` (default) disables verification.
+- `VerifyCompat` verifies the proof when the server sends one, but accepts
+  responses without an `Authentication-Info` header. A missing proof is
+  tolerated, a wrong proof is not.
+- `VerifyStrict` requires a valid proof on every authenticated response.
+
+With `qop=auth` the proof is checked before the response is returned. With
+`qop=auth-int` the proof covers the response entity, so the body is verified
+as it's streamed: a mismatch surfaces as `digest.ErrResponseAuth` once the
+body is read to `EOF`, and closing the body early surfaces
+`digest.ErrResponseUnverified`. The body is never buffered — read it to
+completion to confirm the proof.

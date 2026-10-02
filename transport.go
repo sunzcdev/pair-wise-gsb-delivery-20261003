@@ -50,6 +50,12 @@ type Transport struct {
 	// unauthenticated request without draining the body. Applies only when uncached.
 	Probe bool
 
+	// Verify controls validation of the server's Authentication-Info rspauth
+	// proof. The zero value (VerifyNone) disables verification. Verification
+	// assumes the credentials were derived from the Transport's Username and
+	// Password.
+	Verify VerifyMode
+
 	// cache of challenges indexed by host
 	cache   map[string]*cchal
 	cacheMu sync.Mutex
@@ -120,9 +126,10 @@ func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
 }
 
 // prepare sets the Authorization header from a cached challenge if one exists.
-// It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// It returns the credentials used (nil when the request goes out
+// unauthenticated) and reports whether the caller should send a bodyless
+// probe first (Probe set, request has a body, no challenge cached yet).
+func (t *Transport) prepare(req *http.Request) (*Credentials, bool, error) {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
@@ -134,16 +141,16 @@ func (t *Transport) prepare(req *http.Request) (bool, error) {
 	if !ok {
 		// no cached challenge yet: probe bodyless first when configured
 		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+		return nil, t.Probe && bodied, nil
 	}
 	cred, err := t.digest(req, chal, count)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if cred != nil {
 		req.Header.Set("Authorization", cred.String())
 	}
-	return false, nil
+	return cred, false, nil
 }
 
 // RoundTrip will try to authorize the request using a cached challenge.
@@ -165,7 +172,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
+	cred, probe, err := t.prepare(first)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +189,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if res.StatusCode != http.StatusUnauthorized {
 		if !probe {
-			return res, nil
+			return t.verify(res, cred)
 		}
 		// a probe response isn't valid for the caller since the body was
 		// stripped; discard it and send the real request as-is
@@ -210,10 +217,15 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
+	cred, _, err = t.prepare(second)
+	if err != nil {
 		return nil, err
 	}
-	return tr.RoundTrip(second)
+	res, err = tr.RoundTrip(second)
+	if err != nil {
+		return res, err
+	}
+	return t.verify(res, cred)
 }
 
 // CloseIdleConnections delegates the call to the underlying transport.
