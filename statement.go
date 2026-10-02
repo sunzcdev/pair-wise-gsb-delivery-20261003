@@ -21,6 +21,12 @@ type mysqlStmt struct {
 	id         uint32
 	paramCount int
 	columns    []mysqlField
+
+	// cursor selects the cursor strategy requested when the statement is
+	// executed. maxPacketRows is the number of rows requested per batch when
+	// cursor is cursorTypeReadOnly. Both are fixed at prepare time.
+	cursor        cursorType
+	maxPacketRows uint32
 }
 
 func (stmt *mysqlStmt) Close() error {
@@ -56,7 +62,7 @@ func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(cursorTypeNone, args)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
@@ -105,8 +111,15 @@ func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
 	if stmt.mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
+
+	cursor := stmt.cursor
+	maxRows := uint32(0)
+	if cursor == cursorTypeReadOnly {
+		maxRows = stmt.maxPacketRows
+	}
+
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(cursor, args)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
@@ -124,16 +137,47 @@ func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
 
 	if resLen > 0 {
 		rows.mc = mc
-		if metadataFollows {
+		if cursor == cursorTypeReadOnly {
+			// With a server-side cursor the column definitions are always sent.
+			// With the classic protocol readColumns also consumes the trailing
+			// EOF carrying SERVER_STATUS_CURSOR_EXISTS. With CLIENT_DEPRECATE_EOF
+			// the marker is an 0xFE-headed OK packet that readColumns leaves in
+			// the stream, so consume it here. No rows arrive before the first
+			// COM_STMT_FETCH in either case.
 			if rows.rs.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
 				return nil, err
 			}
 			stmt.columns = rows.rs.columns
-		} else {
-			if err = mc.skipEof(); err != nil {
-				return nil, err
+			if mc.capabilities&clientDeprecateEOF != 0 {
+				marker, err := mc.readPacket()
+				if err != nil {
+					return nil, err
+				}
+				switch marker[0] {
+				case iEOF:
+					mc.status = readResultEndStatus(mc, marker)
+				case iERR:
+					return nil, mc.handleErrorPacket(marker)
+				default:
+					mc.cleanup()
+					return nil, ErrMalformPkt
+				}
 			}
-			rows.rs.columns = stmt.columns
+			rows.rs.cursorOpen = true
+			rows.stmtID = stmt.id
+			rows.maxPacketRows = maxRows
+		} else {
+			if metadataFollows {
+				if rows.rs.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
+					return nil, err
+				}
+				stmt.columns = rows.rs.columns
+			} else {
+				if err = mc.skipEof(); err != nil {
+					return nil, err
+				}
+				rows.rs.columns = stmt.columns
+			}
 		}
 	} else {
 		rows.rs.done = true

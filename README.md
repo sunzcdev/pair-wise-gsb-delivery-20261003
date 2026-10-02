@@ -281,6 +281,37 @@ Default:        false
 
 Toggles zlib compression. false by default.
 
+##### `cursors`
+
+```
+Type:           string
+Valid Values:   readOnly
+Default:        not set
+```
+
+When set to `readOnly`, prepared statements (`db.Prepare` / `Stmt.Query`) open a
+server-side read-only cursor instead of receiving the whole result set at once.
+Rows are then pulled from the server in batches with `COM_STMT_FETCH` while you
+iterate `Rows.Next`, which keeps memory bounded when a query returns many rows.
+Use [`fetchSize`](#fetchsize) to control the batch size.
+
+This applies only to server-side prepared statements; text queries and
+`interpolateParams=true` are unaffected. Closing `Rows` early (or returning the
+connection to the pool) drains and releases the cursor, so statements and
+connections stay reusable with no residual rows.
+
+##### `fetchSize`
+
+```
+Type:           integer
+Default:        128
+```
+
+Number of rows requested from the server in each `COM_STMT_FETCH` batch when
+[`cursors=readOnly`](#cursors) is enabled. It has no effect without a
+server-side cursor. A smaller value uses less memory but needs more round
+trips; a larger value does the opposite.
+
 ##### `interpolateParams`
 
 ```

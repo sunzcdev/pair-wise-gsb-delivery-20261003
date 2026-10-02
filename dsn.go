@@ -77,8 +77,10 @@ type Config struct {
 	// unexported fields. new options should be come here.
 	// boolean first. alphabetical order.
 
-	compress       bool // Enable zlib compression
-	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
+	compress       bool       // Enable zlib compression
+	cursors        cursorType // Enable server-side read-only cursors
+	fetchSize      int        // Number of rows per COM_STMT_FETCH batch
+	tinyInt1IsBool bool       // Treat signed TINYINT(1) as boolean
 
 	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
 	encodedAttributes string                               // Encoded connection attributes
@@ -269,6 +271,10 @@ func (cfg *Config) normalize() error {
 	}
 	cfg.encodedAttributes = encodeConnectionAttributes(cfg)
 
+	if cfg.cursors == cursorTypeReadOnly && cfg.fetchSize < 1 {
+		cfg.fetchSize = defaultFetchSize
+	}
+
 	return nil
 }
 
@@ -372,6 +378,14 @@ func (cfg *Config) FormatDSN() string {
 
 	if cfg.compress {
 		writeDSNParam(&buf, &hasParam, "compress", "true")
+	}
+
+	if cfg.cursors == cursorTypeReadOnly {
+		writeDSNParam(&buf, &hasParam, "cursors", "readOnly")
+
+		if cfg.fetchSize > 0 {
+			writeDSNParam(&buf, &hasParam, "fetchSize", strconv.Itoa(cfg.fetchSize))
+		}
 	}
 
 	if cfg.InterpolateParams {
@@ -629,6 +643,24 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			cfg.compress, isBool = readBool(value)
 			if !isBool {
 				return errors.New("invalid bool value: " + value)
+			}
+
+		// Enable server-side read-only cursors for prepared statements
+		case "cursors":
+			switch strings.ToLower(value) {
+			case "", "0", "false", "no", "none", "off":
+				cfg.cursors = cursorTypeNone
+			case "1", "true", "yes", "on", "readonly", "read_only", "read-only":
+				cfg.cursors = cursorTypeReadOnly
+			default:
+				return errors.New("invalid cursors value: " + value)
+			}
+
+		// Number of rows fetched per COM_STMT_FETCH when using a cursor
+		case "fetchSize":
+			cfg.fetchSize, err = strconv.Atoi(value)
+			if err != nil || cfg.fetchSize < 1 {
+				return fmt.Errorf("invalid fetchSize value: %q", value)
 			}
 
 		// Enable client side placeholder substitution

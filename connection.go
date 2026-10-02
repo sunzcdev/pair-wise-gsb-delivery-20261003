@@ -249,6 +249,9 @@ func (mc *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 		}
 	}
 
+	stmt.cursor = mc.cfg.cursors
+	stmt.maxPacketRows = uint32(mc.cfg.fetchSize)
+
 	return stmt, err
 }
 

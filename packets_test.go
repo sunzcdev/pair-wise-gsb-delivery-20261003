@@ -121,7 +121,7 @@ func TestWriteExecutePacketValidatesArgsBeforeWriting(t *testing.T) {
 	mc.maxAllowedPacket = 128
 	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
 
-	err := stmt.writeExecutePacket([]driver.Value{
+	err := stmt.writeExecutePacket(cursorTypeNone, []driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
 	})
@@ -144,7 +144,7 @@ func TestWriteExecutePacketValidatesSizeBeforeWriting(t *testing.T) {
 	mc.maxAllowedPacket = 16
 	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
 
-	err := stmt.writeExecutePacket([]driver.Value{
+	err := stmt.writeExecutePacket(cursorTypeNone, []driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		int64(1),
 	})
@@ -164,7 +164,7 @@ func TestWriteExecutePacketSendsLongDataBeforeExecute(t *testing.T) {
 	mc.maxAllowedPacket = 128
 	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
 
-	err := stmt.writeExecutePacket([]driver.Value{
+	err := stmt.writeExecutePacket(cursorTypeNone, []driver.Value{
 		bytes.Repeat([]byte{'a'}, 64),         // 64 'a' bytes as a []byte long-data parameter.
 		string(bytes.Repeat([]byte{'b'}, 64)), // 64 'b' bytes as a string long-data parameter.
 	})
@@ -200,7 +200,7 @@ func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
 		0x00, 0x00, // Zero warnings.
 	}}
 
-	err := stmt.writeExecutePacket([]driver.Value{
+	err := stmt.writeExecutePacket(cursorTypeNone, []driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes sent successfully as long data.
 		bytes.Repeat([]byte{'b'}, 64), // 64 'b' bytes whose long-data write fails.
 	})

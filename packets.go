@@ -632,6 +632,18 @@ func readStatus(b []byte) statusFlag {
 	return statusFlag(b[0]) | statusFlag(b[1])<<8
 }
 
+// readResultEndStatus extracts the server status flags from a result set
+// terminator: a classic EOF packet or an 0xFE-headed OK packet used with
+// CLIENT_DEPRECATE_EOF.
+func readResultEndStatus(mc *mysqlConn, data []byte) statusFlag {
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		return readStatus(data[3:])
+	}
+	_, _, n := readLengthEncodedInteger(data[1:])   // affected rows
+	_, _, m := readLengthEncodedInteger(data[1+n:]) // last insert id
+	return readStatus(data[1+n+m:])
+}
+
 // Returns an instance of okHandler for codepaths where mysqlConn.result doesn't
 // need to be cleared first (e.g. during authentication, or while additional
 // resultsets are being fetched.)
@@ -947,15 +959,7 @@ func (mc *mysqlConn) skipRows() error {
 			// text row packets may starts with LengthEncodedString.
 			// In such case, 0xFE can mean string larger than 0xffffff.
 			if len(data) <= 0xffffff {
-				if mc.capabilities&clientDeprecateEOF == 0 {
-					// EOF packet
-					mc.status = readStatus(data[3:])
-				} else {
-					// OK packet with an 0xFE header
-					_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
-					_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
-					mc.status = readStatus(data[1+n+m:])
-				}
+				mc.status = readResultEndStatus(mc, data)
 				return nil
 			}
 		}
@@ -1056,7 +1060,7 @@ type stmtLongData struct {
 
 // Execute Prepared Statement
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
-func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
+func (stmt *mysqlStmt) writeExecutePacket(cursor cursorType, args []driver.Value) error {
 	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
 			"argument count mismatch (got: %d; has: %d)",
@@ -1091,10 +1095,15 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// statement_id [4 bytes]
 	binary.LittleEndian.PutUint32(data[5:], stmt.id)
 
-	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
-	data[9] = 0x00
+	// flags [1 byte]
+	if cursor == cursorTypeReadOnly {
+		data[9] = comStmtCursorReadOnly
+	} else {
+		data[9] = comStmtCursorNone
+	}
 
-	// iteration_count (uint32(1)) [4 bytes]
+	// iteration_count [4 bytes]. Always 1; with a read-only cursor rows are
+	// pulled separately with COM_STMT_FETCH.
 	binary.LittleEndian.PutUint32(data[10:], 1)
 
 	if len(args) > 0 {
@@ -1271,6 +1280,28 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	return err
 }
 
+// Fetch rows from a server-side cursor opened by COM_STMT_EXECUTE.
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_fetch.html
+func (rows *binaryRows) writeFetchPacket() error {
+	mc := rows.mc
+
+	// 4 bytes packet header, 1 byte command, 4 bytes statement id,
+	// 4 bytes number of rows to fetch.
+	data, err := mc.buf.takeSmallBuffer(4 + 1 + 4 + 4)
+	if err != nil {
+		return err
+	}
+
+	data[4] = comStmtFetch
+	binary.LittleEndian.PutUint32(data[5:], rows.stmtID)
+	binary.LittleEndian.PutUint32(data[9:], rows.maxPacketRows)
+
+	mc.resetSequence()
+	err = mc.writePacket(data[:4+1+4+4])
+	mc.syncSequence()
+	return err
+}
+
 // For each remaining resultset in the stream, discards its rows and updates
 // mc.affectedRows and mc.insertIds.
 func (mc *okHandler) discardResults() error {
@@ -1304,15 +1335,8 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 	if data[0] != iOK {
 		// EOF/OK Packet
 		if data[0] == iEOF {
-			if rows.mc.capabilities&clientDeprecateEOF == 0 {
-				// EOF packet
-				rows.mc.status = readStatus(data[3:])
-			} else {
-				// OK Packet with an 0xFE header
-				_, _, n := readLengthEncodedInteger(data[1:])
-				_, _, m := readLengthEncodedInteger(data[1+n:])
-				rows.mc.status = readStatus(data[1+n+m:])
-			}
+			rows.mc.status = readResultEndStatus(rows.mc, data)
+
 			rows.rs.done = true
 			if !rows.HasNextResultSet() {
 				rows.mc = nil
@@ -1326,6 +1350,12 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 		return mc.handleErrorPacket(data)
 	}
 
+	return rows.decodeRow(data, dest)
+}
+
+// decodeRow decodes a single binary resultset row packet (whose first byte is
+// the 0x00 row marker) into dest.
+func (rows *binaryRows) decodeRow(data []byte, dest []driver.Value) (err error) {
 	// NULL-bitmap,  [(column-count + 7 + 2) / 8 bytes]
 	pos := 1 + (len(dest)+7+2)>>3
 	nullMask := data[1:pos]

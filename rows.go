@@ -20,6 +20,10 @@ type resultSet struct {
 	columns     []mysqlField
 	columnNames []string
 	done        bool
+
+	// cursorOpen is true while a server-side cursor is open for this result
+	// set. Rows arrive in batches instead of as a continuous stream.
+	cursorOpen bool
 }
 
 type mysqlRows struct {
@@ -30,6 +34,17 @@ type mysqlRows struct {
 
 type binaryRows struct {
 	mysqlRows
+
+	// stmtID identifies the prepared statement whose cursor is open. It is
+	// only valid when rs.cursorOpen is true.
+	stmtID uint32
+
+	// maxPacketRows is the number of rows requested in each COM_STMT_FETCH.
+	maxPacketRows uint32
+
+	// batchStarted is false until the first packet of the current
+	// COM_STMT_FETCH batch has been read.
+	batchStarted bool
 }
 
 type textRows struct {
@@ -164,6 +179,33 @@ func (rows *mysqlRows) Close() (err error) {
 	return err
 }
 
+// Close releases a server-side cursor when one is open; otherwise it falls
+// back to the streaming implementation.
+func (rows *binaryRows) Close() error {
+	if !rows.rs.cursorOpen {
+		return rows.mysqlRows.Close()
+	}
+
+	if f := rows.finish; f != nil {
+		f()
+		rows.finish = nil
+	}
+
+	mc := rows.mc
+	if mc == nil {
+		return nil
+	}
+	if err := mc.error(); err != nil {
+		return err
+	}
+
+	err := rows.closeCursor()
+
+	rows.rs.cursorOpen = false
+	rows.mc = nil
+	return err
+}
+
 func (rows *mysqlRows) HasNextResultSet() (b bool) {
 	if rows.mc == nil {
 		return false
@@ -234,6 +276,10 @@ func (rows *binaryRows) Next(dest []driver.Value) error {
 			return err
 		}
 
+		if rows.rs.cursorOpen {
+			return rows.nextCursorRow(dest)
+		}
+
 		// Fetch next row from stream
 		if err := rows.readRow(dest); err != nil {
 			return err
@@ -242,6 +288,112 @@ func (rows *binaryRows) Next(dest []driver.Value) error {
 		return nil
 	}
 	return io.EOF
+}
+
+// nextCursorRow serves rows out of server-side cursor batches. It reads raw
+// packets so the batch-terminating EOF can be distinguished from a row; when a
+// batch is exhausted it issues another COM_STMT_FETCH. The cursor is considered
+// finished when a batch EOF carries SERVER_STATUS_LAST_ROW_SENT.
+func (rows *binaryRows) nextCursorRow(dest []driver.Value) error {
+	mc := rows.mc
+
+	for {
+		if rows.rs.done {
+			return io.EOF
+		}
+
+		// Issue a fetch before the first packet of every batch.
+		if !rows.batchStarted {
+			if err := rows.writeFetchPacket(); err != nil {
+				return err
+			}
+			rows.batchStarted = true
+		}
+
+		data, err := mc.readPacket()
+		if err != nil {
+			return err
+		}
+
+		switch data[0] {
+		case iOK:
+			if err := rows.decodeRow(data, dest); err != nil {
+				return err
+			}
+			rows.convertTinyInt1ToBool(dest)
+			return nil
+
+		case iEOF:
+			rows.applyCursorEOF(data)
+			rows.batchStarted = false
+			if rows.rs.done {
+				return io.EOF
+			}
+			continue
+
+		case iERR:
+			rows.rs.done = true
+			rows.rs.cursorOpen = false
+			rows.mc = nil
+			return mc.handleErrorPacket(data)
+		}
+	}
+}
+
+// applyCursorEOF reads the status flags out of a COM_STMT_FETCH terminating EOF
+// packet (or 0xFE-headed OK packet) and marks the result set finished when the
+// server signals the last row.
+func (rows *binaryRows) applyCursorEOF(data []byte) {
+	rows.mc.status = readResultEndStatus(rows.mc, data)
+
+	if rows.mc.status&statusLastRowSent != 0 {
+		rows.rs.done = true
+		rows.rs.cursorOpen = false
+	}
+}
+
+// closeCursor drains a server-side cursor that still holds rows by fetching
+// and discarding the remaining batches. The cursor is closed server-side once
+// the final batch EOF carries SERVER_STATUS_LAST_ROW_SENT. It never leaves
+// unread packets on the stream.
+func (rows *binaryRows) closeCursor() error {
+	mc := rows.mc
+
+	for !rows.rs.done {
+		for {
+			// A batch terminating EOF may already be buffered (it can arrive in
+			// the same segment as the last rows). Read it before issuing the
+			// next fetch so the shared read/write buffer is not busy.
+			if !rows.batchStarted {
+				if err := rows.writeFetchPacket(); err != nil {
+					return err
+				}
+				rows.batchStarted = true
+			}
+
+			data, err := mc.readPacket()
+			if err != nil {
+				return err
+			}
+			switch data[0] {
+			case iEOF:
+				rows.applyCursorEOF(data)
+				rows.batchStarted = false
+			case iERR:
+				rows.rs.done = true
+				rows.rs.cursorOpen = false
+				return mc.handleErrorPacket(data)
+			}
+			if rows.rs.done {
+				break
+			}
+		}
+	}
+
+	rows.rs.cursorOpen = false
+
+	handleOk := mc.clearResult()
+	return handleOk.discardResults()
 }
 
 func (rows *textRows) NextResultSet() (err error) {

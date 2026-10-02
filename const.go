@@ -117,6 +117,17 @@ const (
 	comStmtFetch
 )
 
+// COM_STMT_EXECUTE cursor flags.
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+const (
+	comStmtCursorNone     byte = 0x00
+	comStmtCursorReadOnly byte = 0x01
+
+	// defaultFetchSize is the number of rows the server is asked to return in
+	// one batch when a read-only server-side cursor is enabled.
+	defaultFetchSize = 128
+)
+
 // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnType
 type fieldType byte
 
