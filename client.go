@@ -303,6 +303,24 @@ type Client struct {
 	// By default request write timeout is unlimited.
 	WriteTimeout time.Duration
 
+	// ExpectContinueTimeout is the maximum amount of time to wait for the
+	// server's 100 (Continue) response after sending the request headers
+	// when the request contains an "Expect: 100-continue" header and a body.
+	//
+	// If the server responds with a final (non-1xx) response while waiting,
+	// the request body isn't sent and the response is returned to the caller.
+	// The connection is closed in this case, since the server may still be
+	// waiting to read and discard the announced body.
+	// Interim responses other than 100 (Continue), e.g. 103 (Early Hints),
+	// don't authorize sending the body.
+	//
+	// If the timeout expires first, the request body is sent anyway,
+	// as permitted by RFC 9112, section 10.1.1.
+	//
+	// If zero, the request body is sent immediately together with the
+	// request headers, without waiting for the server's approval.
+	ExpectContinueTimeout time.Duration
+
 	// Maximum response body size.
 	//
 	// The client returns ErrBodyTooLarge if this limit is greater than 0
@@ -615,6 +633,7 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 		WriteBufferSize:               c.WriteBufferSize,
 		ReadTimeout:                   c.ReadTimeout,
 		WriteTimeout:                  c.WriteTimeout,
+		ExpectContinueTimeout:         c.ExpectContinueTimeout,
 		MaxResponseBodySize:           c.MaxResponseBodySize,
 		DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
 		DisablePathNormalizing:        c.DisablePathNormalizing,
@@ -929,6 +948,24 @@ type HostClient struct {
 	//
 	// By default request write timeout is unlimited.
 	WriteTimeout time.Duration
+
+	// ExpectContinueTimeout is the maximum amount of time to wait for the
+	// server's 100 (Continue) response after sending the request headers
+	// when the request contains an "Expect: 100-continue" header and a body.
+	//
+	// If the server responds with a final (non-1xx) response while waiting,
+	// the request body isn't sent and the response is returned to the caller.
+	// The connection is closed in this case, since the server may still be
+	// waiting to read and discard the announced body.
+	// Interim responses other than 100 (Continue), e.g. 103 (Early Hints),
+	// don't authorize sending the body.
+	//
+	// If the timeout expires first, the request body is sent anyway,
+	// as permitted by RFC 9112, section 10.1.1.
+	//
+	// If zero, the request body is sent immediately together with the
+	// request headers, without waiting for the server's approval.
+	ExpectContinueTimeout time.Duration
 
 	// Maximum response body size.
 	//
@@ -3439,39 +3476,12 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		resetConnection = true
 	}
 
-	bw := hc.AcquireWriter(conn)
-	err = req.Write(bw)
-
-	if resetConnection {
-		req.Header.ResetConnectionClose()
-	}
-
-	if err == nil {
-		err = bw.Flush()
-	}
-	hc.ReleaseWriter(bw)
-
-	// Return ErrTimeout on any timeout.
-	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
-		err = ErrTimeout
-	}
-
-	if err != nil {
-		hc.CloseConn(cc)
-		return true, err
-	}
-
 	readDeadline := deadline
 	if hc.ReadTimeout > 0 {
 		tmpReadDeadline := time.Now().Add(hc.ReadTimeout)
 		if readDeadline.IsZero() || tmpReadDeadline.Before(readDeadline) {
 			readDeadline = tmpReadDeadline
 		}
-	}
-
-	if err = conn.SetReadDeadline(readDeadline); err != nil {
-		hc.CloseConn(cc)
-		return true, err
 	}
 
 	if customSkipBody || req.Header.IsHead() {
@@ -3481,8 +3491,90 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		resp.Header.DisableNormalizing()
 	}
 
+	// RFC 9112, section 10.1.1 two-phase send: when the request asks for
+	// "Expect: 100-continue" and carries a body, only the headers are sent
+	// first. The body is sent after the server approves it with 100 (Continue),
+	// or after ExpectContinueTimeout expires. A final (non-1xx) response
+	// received while waiting is returned without sending the body.
+	expectContinue := hc.ExpectContinueTimeout > 0 && req.MayContinue() && req.hasBodyForWrite()
+
+	bw := hc.AcquireWriter(conn)
 	br := hc.AcquireReader(conn)
-	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+
+	if expectContinue {
+		err = req.writeHeader(bw)
+	} else {
+		err = req.Write(bw)
+	}
+
+	if resetConnection {
+		req.Header.ResetConnectionClose()
+	}
+
+	if err == nil {
+		err = bw.Flush()
+	}
+
+	// Return ErrTimeout on any timeout.
+	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
+		err = ErrTimeout
+	}
+
+	if err != nil {
+		hc.ReleaseWriter(bw)
+		hc.ReleaseReader(br)
+		hc.CloseConn(cc)
+		return true, err
+	}
+
+	responseHeaderRead := false
+	if expectContinue {
+		var sendBody bool
+		sendBody, responseHeaderRead, err = t.waitForContinue(hc, resp, conn, br, readDeadline)
+		if err == nil && sendBody {
+			// The wait consumed part of the write timeout:
+			// give the body write a fresh write deadline.
+			writeDeadline = deadline
+			if hc.WriteTimeout > 0 {
+				tmpWriteDeadline := time.Now().Add(hc.WriteTimeout)
+				if writeDeadline.IsZero() || tmpWriteDeadline.Before(writeDeadline) {
+					writeDeadline = tmpWriteDeadline
+				}
+			}
+			if err = conn.SetWriteDeadline(writeDeadline); err == nil {
+				err = req.writeBody(bw)
+			}
+			if err == nil {
+				err = bw.Flush()
+			}
+
+			// Return ErrTimeout on any timeout.
+			if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
+				err = ErrTimeout
+			}
+		}
+		if err != nil {
+			hc.ReleaseWriter(bw)
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			return true, err
+		}
+	}
+	hc.ReleaseWriter(bw)
+
+	if err = conn.SetReadDeadline(readDeadline); err != nil {
+		hc.ReleaseReader(br)
+		hc.CloseConn(cc)
+		return true, err
+	}
+
+	if responseHeaderRead {
+		// The final response headers were already read while waiting for
+		// 100 (Continue). Only the body and trailer are left to read.
+		err = resp.readBodyAndTrailer(br, hc.MaxResponseBodySize)
+	} else {
+		err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+	}
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
@@ -3491,7 +3583,13 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		return needRetry, err
 	}
 
-	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose()
+	// When the server sent a final response before the request body was sent,
+	// the connection can't be reused: the server may still be waiting to read
+	// and discard the announced body, so the next request on this connection
+	// would be misinterpreted as body bytes.
+	bodyUnsent := expectContinue && responseHeaderRead
+
+	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose() || bodyUnsent
 	if customStreamBody && resp.bodyStream != nil {
 		// releaseConn runs when the caller closes the body stream, so it has to
 		// re-check resp.ConnectionClose(): a caller may only decide that the
@@ -3529,4 +3627,51 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		hc.ReleaseConn(cc)
 	}
 	return false, nil
+}
+
+// waitForContinue waits up to hc.ExpectContinueTimeout for the server's
+// response to request headers sent with an "Expect: 100-continue" header.
+//
+// sendBody is true when the request body should be sent: either the server
+// approved it with 100 (Continue), or the wait timed out, in which case
+// RFC 9112, section 10.1.1 allows sending the body anyway.
+//
+// headerRead is true when a final (non-1xx) response was received while
+// waiting, e.g. 413 (Payload Too Large). Its headers are already parsed into
+// resp.Header and the request body must not be sent.
+//
+// Interim responses other than 100 (Continue), e.g. 103 (Early Hints), are
+// consumed and don't authorize sending the body.
+func (t *transport) waitForContinue(hc *HostClient, resp *Response, conn net.Conn, br *bufio.Reader, readDeadline time.Time) (sendBody, headerRead bool, err error) {
+	waitDeadline := time.Now().Add(hc.ExpectContinueTimeout)
+	if !readDeadline.IsZero() && readDeadline.Before(waitDeadline) {
+		waitDeadline = readDeadline
+	}
+	if err := conn.SetReadDeadline(waitDeadline); err != nil {
+		return false, false, err
+	}
+
+	resp.resetSkipHeader()
+	for n := 0; ; n++ {
+		if err := resp.Header.Read(br); err != nil {
+			if errors.Is(err, ErrTimeout) {
+				// The server didn't respond within ExpectContinueTimeout.
+				return true, false, nil
+			}
+			return false, false, err
+		}
+		switch statusCode := resp.Header.StatusCode(); {
+		case statusCode == StatusContinue:
+			return true, false, nil
+		case statusCode < 100 || statusCode > 199 || statusCode == StatusSwitchingProtocols:
+			// Final response: the server rejected the request or answered
+			// it without reading the body.
+			return false, true, nil
+		case n >= maxInterimResponses:
+			return false, false, errTooManyInterimResponses
+		}
+		// Other interim responses (e.g. 103 Early Hints) don't authorize
+		// sending the body: keep waiting for 100 (Continue) or a final
+		// response within the same deadline.
+	}
 }

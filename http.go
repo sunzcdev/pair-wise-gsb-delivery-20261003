@@ -76,6 +76,11 @@ type Request struct {
 	// by Request.CopyTo; it is scoped to the helper's synchronous Do call.
 	forceResponseBodyBuffering bool
 
+	// bodyForWrite caches the body prepared by writeHeader, so writeBody
+	// doesn't need to recompute it (e.g. re-marshal a multipart form).
+	// It is only set between writeHeader and writeBody calls.
+	bodyForWrite []byte
+
 	// Used by Server to indicate the request was received on a HTTPS endpoint.
 	// Client/HostClient shouldn't use this field but should depend on the uri.scheme instead.
 	isTLS bool
@@ -1330,6 +1335,7 @@ func (req *Request) Reset() {
 
 func (req *Request) resetSkipHeader() {
 	req.ResetBody()
+	req.bodyForWrite = nil
 	req.uri.Reset()
 	req.parsedURI = false
 	req.uriParseErr = nil
@@ -1684,6 +1690,13 @@ func (resp *Response) ReadLimitBody(r *bufio.Reader, maxBodySize int) error {
 		}
 	}
 
+	return resp.readBodyAndTrailer(r, maxBodySize)
+}
+
+// readBodyAndTrailer reads the response body and trailer for an already
+// parsed response header.
+func (resp *Response) readBodyAndTrailer(r *bufio.Reader, maxBodySize int) error {
+	var err error
 	if !resp.mustSkipBody() {
 		err = resp.ReadBody(r, maxBodySize)
 		if err != nil {
@@ -1830,6 +1843,20 @@ func (req *Request) onlyMultipartForm() bool {
 //
 // See also WriteTo.
 func (req *Request) Write(w *bufio.Writer) error {
+	if err := req.writeHeader(w); err != nil {
+		return err
+	}
+	return req.writeBody(w)
+}
+
+// writeHeader prepares the request and writes only the request line and
+// headers to w, including Content-Length or Transfer-Encoding for the body
+// that a subsequent writeBody call is going to send.
+//
+// writeHeader and writeBody allow two-phase Expect: 100-continue sends,
+// where the body is withheld until the server approves it.
+// Write is equivalent to calling writeHeader followed by writeBody.
+func (req *Request) writeHeader(w *bufio.Writer) error {
 	if len(req.Header.Host()) == 0 || req.parsedURI {
 		uri := req.URI()
 		host := uri.Host()
@@ -1864,7 +1891,7 @@ func (req *Request) Write(w *bufio.Writer) error {
 	}
 
 	if req.bodyStream != nil {
-		return req.writeBodyStream(w)
+		return req.writeBodyStreamHeader(w)
 	}
 
 	body := req.bodyBytes()
@@ -1881,6 +1908,7 @@ func (req *Request) Write(w *bufio.Writer) error {
 	if len(body) == 0 {
 		body = req.postArgs.QueryString()
 	}
+	req.bodyForWrite = body
 	if len(body) != 0 || !req.Header.ignoreBody() {
 		hasBody = true
 		req.Header.SetContentLength(len(body))
@@ -1890,26 +1918,45 @@ func (req *Request) Write(w *bufio.Writer) error {
 			req.Header.SetContentTypeBytes(strDefaultContentType)
 		}
 		req.Header.SetContentLength(-1)
-		if err = req.Header.Write(w); err != nil {
-			return err
-		}
-		if err = writeBufferedBodyChunked(w, body); err != nil {
+	}
+	return req.Header.Write(w)
+}
+
+// writeBody writes the request body prepared by a preceding writeHeader call.
+func (req *Request) writeBody(w *bufio.Writer) error {
+	if req.bodyStream != nil {
+		return req.writeBodyStreamBody(w)
+	}
+
+	body := req.bodyForWrite
+	req.bodyForWrite = nil
+
+	hasBody := len(body) != 0 || !req.Header.ignoreBody()
+	if hasBody && len(req.Header.trailer) > 0 && req.Header.IsHTTP11() {
+		if err := writeBufferedBodyChunked(w, body); err != nil {
 			return err
 		}
 		return req.Header.writeTrailer(w)
 	}
-	if err = req.Header.Write(w); err != nil {
+	if hasBody {
+		_, err := w.Write(body)
 		return err
 	}
-	if hasBody {
-		_, err = w.Write(body)
-	} else if len(body) > 0 {
+	if len(body) > 0 {
 		if req.secureErrorLogMessage {
 			return errors.New("non-zero body for non-post request")
 		}
 		return fmt.Errorf("non-zero body for non-post request: body=%q", body)
 	}
-	return err
+	return nil
+}
+
+// hasBodyForWrite reports whether Write would send a non-empty request body.
+func (req *Request) hasBodyForWrite() bool {
+	if req.bodyStream != nil {
+		return true
+	}
+	return len(req.bodyBytes()) != 0 || req.onlyMultipartForm() || req.postArgs.Len() > 0
 }
 
 // WriteGzip writes response with gzipped body to w.
@@ -2355,8 +2402,17 @@ func (resp *Response) Write(w *bufio.Writer) error {
 }
 
 func (req *Request) writeBodyStream(w *bufio.Writer) error {
-	var err error
+	if err := req.writeBodyStreamHeader(w); err != nil {
+		req.closeBodyStream() //nolint:errcheck
+		return err
+	}
+	return req.writeBodyStreamBody(w)
+}
 
+// writeBodyStreamHeader determines Content-Length for the body stream and
+// writes only the request header to w. writeBodyStreamBody must be called
+// afterwards to write and close the body stream.
+func (req *Request) writeBodyStreamHeader(w *bufio.Writer) error {
 	contentLength := req.Header.ContentLength()
 	if contentLength < 0 {
 		lrSize := limitedReaderSize(req.bodyStream)
@@ -2370,17 +2426,20 @@ func (req *Request) writeBodyStream(w *bufio.Writer) error {
 			}
 		}
 	}
-	if contentLength >= 0 {
-		if err = req.Header.Write(w); err == nil {
-			err = writeBodyFixedSize(w, req.bodyStream, int64(contentLength))
-		}
-	} else {
+	if contentLength < 0 {
 		req.Header.SetContentLength(-1)
-		err = req.Header.Write(w)
-		if err == nil {
-			err = writeBodyChunked(w, req.bodyStream)
-		}
-		if err == nil {
+	}
+	return req.Header.Write(w)
+}
+
+// writeBodyStreamBody writes the body stream prepared by
+// writeBodyStreamHeader and closes the stream.
+func (req *Request) writeBodyStreamBody(w *bufio.Writer) error {
+	var err error
+	if contentLength := req.Header.ContentLength(); contentLength >= 0 {
+		err = writeBodyFixedSize(w, req.bodyStream, int64(contentLength))
+	} else {
+		if err = writeBodyChunked(w, req.bodyStream); err == nil {
 			err = req.Header.writeTrailer(w)
 		}
 	}

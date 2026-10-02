@@ -5698,3 +5698,540 @@ func TestClientRetryIfErrUpstream(t *testing.T) {
 		}
 	})
 }
+
+// expectContinueCountingReader counts Read calls, so tests can verify
+// when the client actually started sending the request body.
+type expectContinueCountingReader struct {
+	r     io.Reader
+	reads int32
+}
+
+func (r *expectContinueCountingReader) Read(p []byte) (int, error) {
+	atomic.AddInt32(&r.reads, 1)
+	return r.r.Read(p)
+}
+
+func (r *expectContinueCountingReader) readCount() int {
+	return int(atomic.LoadInt32(&r.reads))
+}
+
+// expectContinueTestServer accepts a single connection and runs handler on it
+// in a goroutine. The handler error is reported through the returned channel.
+func expectContinueTestServer(t *testing.T, handler func(conn net.Conn, br *bufio.Reader) error) (addr string, errCh chan error, shutdown func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh = make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- fmt.Errorf("accept: %w", err)
+			return
+		}
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(testTimeout(10 * time.Second))); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- handler(conn, bufio.NewReader(conn))
+	}()
+	return ln.Addr().String(), errCh, func() { ln.Close() } //nolint:errcheck
+}
+
+// readExpectContinueRequestHeader reads only the request headers sent by the
+// client and returns the announced Content-Length.
+func readExpectContinueRequestHeader(br *bufio.Reader) (contentLength int, err error) {
+	var h RequestHeader
+	if err := h.Read(br); err != nil {
+		return 0, err
+	}
+	if got := string(h.peek(strExpect)); got != "100-continue" {
+		return 0, fmt.Errorf("unexpected Expect header: %q", got)
+	}
+	return h.ContentLength(), nil
+}
+
+func newExpectContinueRequest(addr string, bodyStream io.Reader, bodySize int) *Request {
+	req := AcquireRequest()
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://" + addr + "/upload")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBodyStream(bodyStream, bodySize)
+	return req
+}
+
+func checkExpectContinueServerErr(t *testing.T, errCh chan error) {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("server error: %v", err)
+		}
+	case <-time.After(testTimeout(10 * time.Second)):
+		t.Fatal("timed out waiting for the test server")
+	}
+}
+
+func TestClientExpectContinueRejected(t *testing.T) {
+	t.Parallel()
+
+	// The server rejects the request headers with 413 without reading the
+	// body and keeps the connection open. The client must not send the body
+	// and must close the connection, since the server may still be waiting
+	// to read and discard the announced body.
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		if _, err := readExpectContinueRequestHeader(br); err != nil {
+			return err
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n")); err != nil {
+			return err
+		}
+		// The client must close the connection instead of reusing it:
+		// the announced request body was never sent.
+		if _, err := br.ReadByte(); err != io.EOF {
+			return fmt.Errorf("expected client to close the connection, got err=%v", err)
+		}
+		return nil
+	})
+	defer shutdown()
+
+	body := []byte("this body must never be sent")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body)}
+
+	c := &Client{ExpectContinueTimeout: testTimeout(time.Second)}
+	req := newExpectContinueRequest(addr, cr, len(body))
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusRequestEntityTooLarge {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusRequestEntityTooLarge)
+	}
+	if n := cr.readCount(); n != 0 {
+		t.Fatalf("request body was read %d times on rejected request; expecting zero reads", n)
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueEarlyHintsThenContinue(t *testing.T) {
+	t.Parallel()
+
+	// 103 (Early Hints) must not be mistaken for permission to send the
+	// body. The upload starts only after 100 (Continue).
+	body := []byte("upload me after 100 continue")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body)}
+
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		contentLength, err := readExpectContinueRequestHeader(br)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n")); err != nil {
+			return err
+		}
+		// Give the client a chance to misbehave: 103 doesn't authorize
+		// sending the body.
+		time.Sleep(testTimeout(300 * time.Millisecond))
+		if n := cr.readCount(); n != 0 {
+			return fmt.Errorf("request body was read %d times after 103 Early Hints; expecting zero reads before 100 Continue", n)
+		}
+		if _, err := conn.Write(strResponseContinue); err != nil {
+			return err
+		}
+		uploaded, err := io.ReadAll(io.LimitReader(br, int64(contentLength)))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(uploaded, body) {
+			return fmt.Errorf("unexpected uploaded body: %q. Expecting %q", uploaded, body)
+		}
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		return err
+	})
+	defer shutdown()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(10 * time.Second),
+	}
+	req := newExpectContinueRequest(addr, cr, len(body))
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusOK)
+	}
+	if cr.readCount() == 0 {
+		t.Fatal("request body was never read after 100 Continue")
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueInterimResponseDoesNotAuthorizeBody(t *testing.T) {
+	t.Parallel()
+
+	// A 1xx response other than 100 (Continue) followed by a final response:
+	// the body must never be sent.
+	cr := &expectContinueCountingReader{r: bytes.NewReader([]byte("must not be sent"))}
+
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		if _, err := readExpectContinueRequestHeader(br); err != nil {
+			return err
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 103 Early Hints\r\n\r\n")); err != nil {
+			return err
+		}
+		time.Sleep(testTimeout(100 * time.Millisecond))
+		if _, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")); err != nil {
+			return err
+		}
+		// The body was never sent, so the client must close the connection
+		// instead of returning it to the pool.
+		if _, err := br.ReadByte(); err != io.EOF {
+			return fmt.Errorf("expected client to close the connection, got err=%v", err)
+		}
+		return nil
+	})
+	defer shutdown()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(10 * time.Second),
+	}
+	req := newExpectContinueRequest(addr, cr, 16)
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusOK)
+	}
+	if n := cr.readCount(); n != 0 {
+		t.Fatalf("request body was read %d times without 100 Continue; expecting zero reads", n)
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueTimeout(t *testing.T) {
+	t.Parallel()
+
+	// The server doesn't answer the Expect: 100-continue probe at all.
+	// After ExpectContinueTimeout the client sends the body anyway,
+	// as permitted by RFC 9112, section 10.1.1.
+	body := []byte("sent anyway after the expect-continue timeout")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body)}
+
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		contentLength, err := readExpectContinueRequestHeader(br)
+		if err != nil {
+			return err
+		}
+		// Don't send 100 (Continue): wait for the client to give up
+		// waiting and send the body.
+		uploaded, err := io.ReadAll(io.LimitReader(br, int64(contentLength)))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(uploaded, body) {
+			return fmt.Errorf("unexpected uploaded body: %q. Expecting %q", uploaded, body)
+		}
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		return err
+	})
+	defer shutdown()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(100 * time.Millisecond),
+	}
+	req := newExpectContinueRequest(addr, cr, len(body))
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusOK)
+	}
+	if cr.readCount() == 0 {
+		t.Fatal("request body was never read after ExpectContinueTimeout")
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueLateContinue(t *testing.T) {
+	t.Parallel()
+
+	// The server sends 100 (Continue) only after the client already gave up
+	// waiting and sent the body. The late 100 must be skipped as an interim
+	// response and the final 200 must be delivered.
+	body := []byte("body sent before the late 100 continue")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body)}
+
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		contentLength, err := readExpectContinueRequestHeader(br)
+		if err != nil {
+			return err
+		}
+		// Let the client's ExpectContinueTimeout expire first.
+		time.Sleep(testTimeout(300 * time.Millisecond))
+		if _, err := conn.Write(strResponseContinue); err != nil {
+			return err
+		}
+		uploaded, err := io.ReadAll(io.LimitReader(br, int64(contentLength)))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(uploaded, body) {
+			return fmt.Errorf("unexpected uploaded body: %q. Expecting %q", uploaded, body)
+		}
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		return err
+	})
+	defer shutdown()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(100 * time.Millisecond),
+	}
+	req := newExpectContinueRequest(addr, cr, len(body))
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusOK)
+	}
+	if body := resp.Body(); !bytes.Equal(body, []byte("ok")) {
+		t.Fatalf("unexpected response body: %q. Expecting %q", body, "ok")
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueConnectionClosed(t *testing.T) {
+	t.Parallel()
+
+	// The server closes the connection without answering the
+	// Expect: 100-continue probe. The client must return an error
+	// without reading the request body.
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		if _, err := readExpectContinueRequestHeader(br); err != nil {
+			return err
+		}
+		return nil // conn is closed by the deferred Close in expectContinueTestServer
+	})
+	defer shutdown()
+
+	body := []byte("this body must never be sent")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body)}
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(10 * time.Second),
+	}
+	req := newExpectContinueRequest(addr, cr, len(body))
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+
+	if err := c.Do(req, resp); err == nil {
+		t.Fatal("expecting error when the server closes the connection during the 100-continue wait")
+	}
+	if n := cr.readCount(); n != 0 {
+		t.Fatalf("request body was read %d times on closed connection; expecting zero reads", n)
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueInMemoryBody(t *testing.T) {
+	t.Parallel()
+
+	// Same two-phase send, but with a buffered (non-streaming) request body.
+	body := []byte("in-memory body sent after 100 continue")
+
+	addr, errCh, shutdown := expectContinueTestServer(t, func(conn net.Conn, br *bufio.Reader) error {
+		contentLength, err := readExpectContinueRequestHeader(br)
+		if err != nil {
+			return err
+		}
+		if contentLength != len(body) {
+			return fmt.Errorf("unexpected Content-Length: %d. Expecting %d", contentLength, len(body))
+		}
+		if _, err := conn.Write(strResponseContinue); err != nil {
+			return err
+		}
+		uploaded, err := io.ReadAll(io.LimitReader(br, int64(contentLength)))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(uploaded, body) {
+			return fmt.Errorf("unexpected uploaded body: %q. Expecting %q", uploaded, body)
+		}
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+		return err
+	})
+	defer shutdown()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(time.Second),
+	}
+	req := AcquireRequest()
+	resp := AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://" + addr + "/upload")
+	req.Header.Set(HeaderExpect, "100-continue")
+	req.SetBody(body)
+
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if statusCode := resp.StatusCode(); statusCode != StatusOK {
+		t.Fatalf("unexpected status code: %d. Expecting %d", statusCode, StatusOK)
+	}
+	checkExpectContinueServerErr(t, errCh)
+}
+
+func TestHostClientExpectContinueConnReuse(t *testing.T) {
+	t.Parallel()
+
+	// After a successful 100-continue exchange the connection stays healthy
+	// and is reused from the pool for the next request.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close() //nolint:errcheck
+	addr := ln.Addr().String()
+
+	var accepts int32
+	errCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			errCh <- fmt.Errorf("accept: %w", err)
+			return
+		}
+		atomic.AddInt32(&accepts, 1)
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(testTimeout(10 * time.Second))); err != nil {
+			errCh <- err
+			return
+		}
+		br := bufio.NewReader(conn)
+
+		// First request: Expect: 100-continue.
+		var h RequestHeader
+		if err := h.Read(br); err != nil {
+			errCh <- err
+			return
+		}
+		if got := string(h.peek(strExpect)); got != "100-continue" {
+			errCh <- fmt.Errorf("unexpected Expect header: %q", got)
+			return
+		}
+		if _, err := conn.Write(strResponseContinue); err != nil {
+			errCh <- err
+			return
+		}
+		body := make([]byte, h.ContentLength())
+		if _, err := io.ReadFull(br, body); err != nil {
+			errCh <- err
+			return
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")); err != nil {
+			errCh <- err
+			return
+		}
+
+		// Second request on the same (pooled) connection.
+		h.Reset()
+		if err := h.Read(br); err != nil {
+			errCh <- err
+			return
+		}
+		body = make([]byte, h.ContentLength())
+		if _, err := io.ReadFull(br, body); err != nil {
+			errCh <- err
+			return
+		}
+		if _, err := conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond")); err != nil {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	c := &HostClient{
+		Addr:                  addr,
+		ExpectContinueTimeout: testTimeout(time.Second),
+	}
+
+	body1 := []byte("first upload")
+	cr := &expectContinueCountingReader{r: bytes.NewReader(body1)}
+	req := newExpectContinueRequest(addr, cr, len(body1))
+	resp := AcquireResponse()
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if body := resp.Body(); !bytes.Equal(body, []byte("first")) {
+		t.Fatalf("unexpected response body: %q. Expecting %q", body, "first")
+	}
+	ReleaseRequest(req)
+	ReleaseResponse(resp)
+
+	req = AcquireRequest()
+	resp = AcquireResponse()
+	defer func() {
+		ReleaseRequest(req)
+		ReleaseResponse(resp)
+	}()
+	req.Header.SetMethod(MethodPost)
+	req.SetRequestURI("http://" + addr + "/upload")
+	req.SetBody([]byte("second upload"))
+	if err := c.Do(req, resp); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if body := resp.Body(); !bytes.Equal(body, []byte("second")) {
+		t.Fatalf("unexpected response body: %q. Expecting %q", body, "second")
+	}
+
+	checkExpectContinueServerErr(t, errCh)
+	if n := atomic.LoadInt32(&accepts); n != 1 {
+		t.Fatalf("server accepted %d connections; expecting connection pool reuse of a single connection", n)
+	}
+}
