@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 )
 
@@ -133,15 +132,24 @@ type Secure struct {
 	// Customize Secure with an Options struct.
 	opt Options
 
+	// defaultPolicy is the policy used when no PolicySet is configured, i.e.
+	// the classic single-Options behavior.
+	defaultPolicy *compiledPolicy
+
+	// policySet, when set, holds the published named policies. A request picks
+	// one name through policySelector and then pins the resolved policy for its
+	// whole processing.
+	policySet *PolicySet
+
+	// policySelector is invoked exactly once per request when policySet is set
+	// and must return the name of the policy to apply.
+	policySelector PolicySelector
+
 	// badHostHandler is the handler used when an incorrect host is passed in.
 	badHostHandler http.Handler
 
 	// badRequestHandler is the handler used when the AllowRequestFunc rejects a request.
 	badRequestHandler http.Handler
-
-	// cRegexAllowedHosts saves the compiled regular expressions of the AllowedHosts
-	// option for subsequent use in processRequest
-	cRegexAllowedHosts []*regexp.Regexp
 
 	// ctxSecureHeaderKey is the key used for context storage for request modification.
 	ctxSecureHeaderKey secureCtxKey
@@ -156,28 +164,21 @@ func New(options ...Options) *Secure {
 		o = options[0]
 	}
 
-	o.ContentSecurityPolicy = strings.ReplaceAll(o.ContentSecurityPolicy, "$NONCE", "'nonce-%[1]s'")
-	o.ContentSecurityPolicyReportOnly = strings.ReplaceAll(o.ContentSecurityPolicyReportOnly, "$NONCE", "'nonce-%[1]s'")
-
-	o.nonceEnabled = strings.Contains(o.ContentSecurityPolicy, "%[1]s") || strings.Contains(o.ContentSecurityPolicyReportOnly, "%[1]s")
-
 	s := &Secure{
 		opt:               o,
 		badHostHandler:    http.HandlerFunc(defaultBadHostHandler),
 		badRequestHandler: http.HandlerFunc(defaultBadRequestHandler),
 	}
 
-	if s.opt.AllowedHostsAreRegex {
-		// Test for invalid regular expressions in AllowedHosts
-		for _, allowedHost := range o.AllowedHosts {
-			regex, err := regexp.Compile(fmt.Sprintf("^%s$", allowedHost))
-			if err != nil {
-				panic(fmt.Sprintf("Error parsing AllowedHost: %s", err))
-			}
-
-			s.cRegexAllowedHosts = append(s.cRegexAllowedHosts, regex)
-		}
+	policy, err := compilePolicy(o, false)
+	if err != nil {
+		// Preserve the historical New() behavior of panicking on a bad
+		// AllowedHosts regular expression.
+		panic(err.Error())
 	}
+
+	s.defaultPolicy = policy
+	s.opt = policy.opt
 
 	s.ctxSecureHeaderKey = ctxDefaultSecureHeaderKey
 	if len(s.opt.SecureContextKey) > 0 {
@@ -195,6 +196,17 @@ func (s *Secure) SetBadHostHandler(handler http.Handler) {
 // SetBadRequestHandler sets the handler to call when the AllowRequestFunc rejects a request.
 func (s *Secure) SetBadRequestHandler(handler http.Handler) {
 	s.badRequestHandler = handler
+}
+
+// SetPolicySelector enables per-request named policy selection from a
+// pre-compiled PolicySet. The selector is called once per request and only its
+// returned name is used; host checks, HTTPS redirects and security headers all
+// follow the policy with that name. An unknown (or empty) name fails closed:
+// the request is rejected through the bad request handler rather than falling
+// back to any permissive default.
+func (s *Secure) SetPolicySelector(set *PolicySet, selector PolicySelector) {
+	s.policySet = set
+	s.policySelector = selector
 }
 
 // Handler implements the http.HandlerFunc for integration with the standard net/http lib.
@@ -300,15 +312,48 @@ func (s *Secure) ProcessNoModifyRequest(w http.ResponseWriter, r *http.Request) 
 
 // processRequest runs the actual checks on the request and returns an error if the middleware chain should stop.
 func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
+	// Select the policy for this request exactly once. Everything below,
+	// including the nonce setup, host checks, HTTPS redirects and security
+	// headers, uses the pinned policy.
+	policy := s.defaultPolicy
+
+	if s.policySet != nil {
+		if s.policySelector == nil {
+			s.badRequestHandler.ServeHTTP(w, r)
+
+			return nil, nil, fmt.Errorf("%w: no policy selector configured", ErrPolicyNotFound)
+		}
+
+		name := s.policySelector(r)
+
+		resolved, ok := s.policySet.lookup(name)
+		if !ok {
+			// Unknown policy names fail closed.
+			s.badRequestHandler.ServeHTTP(w, r)
+
+			return nil, nil, fmt.Errorf("%w: %q", ErrPolicyNotFound, name)
+		}
+
+		policy = resolved
+	}
+
+	return s.processWithPolicy(policy, w, r)
+}
+
+// processWithPolicy runs the host, HTTPS and header checks using the single
+// immutable policy already selected for the request.
+func (s *Secure) processWithPolicy(policy *compiledPolicy, w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
+	o := &policy.opt
+
 	// Setup nonce if required.
-	if s.opt.nonceEnabled {
+	if policy.nonceEnabled {
 		r = withCSPNonce(r, cspRandNonce())
 	}
 
 	// Resolve the host for the request, using proxy headers if present.
 	host := r.Host
 
-	for _, header := range s.opt.HostsProxyHeaders {
+	for _, header := range o.HostsProxyHeaders {
 		if h := r.Header.Get(header); h != "" {
 			host = h
 
@@ -317,11 +362,11 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// Allowed hosts check.
-	if len(s.opt.AllowedHosts) > 0 && !s.opt.IsDevelopment {
+	if len(o.AllowedHosts) > 0 && !o.IsDevelopment {
 		isGoodHost := false
 
-		if s.opt.AllowedHostsAreRegex {
-			for _, allowedHost := range s.cRegexAllowedHosts {
+		if o.AllowedHostsAreRegex {
+			for _, allowedHost := range policy.cRegexAllowedHosts {
 				if match := allowedHost.MatchString(host); match {
 					isGoodHost = true
 
@@ -329,7 +374,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 				}
 			}
 		} else {
-			for _, allowedHost := range s.opt.AllowedHosts {
+			for _, allowedHost := range o.AllowedHosts {
 				if strings.EqualFold(allowedHost, host) {
 					isGoodHost = true
 
@@ -346,24 +391,24 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// Determine if we are on HTTPS.
-	ssl := s.isSSL(r)
+	ssl := policy.isSSL(r)
 
 	// SSL check.
-	if s.opt.SSLRedirect && !ssl && !s.opt.IsDevelopment {
+	if o.SSLRedirect && !ssl && !o.IsDevelopment {
 		url := r.URL
 		url.Scheme = "https"
 		url.Host = host
 
-		if s.opt.SSLHostFunc != nil {
-			if h := (*s.opt.SSLHostFunc)(host); len(h) > 0 {
+		if o.SSLHostFunc != nil {
+			if h := (*o.SSLHostFunc)(host); len(h) > 0 {
 				url.Host = h
 			}
-		} else if len(s.opt.SSLHost) > 0 {
-			url.Host = s.opt.SSLHost
+		} else if len(o.SSLHost) > 0 {
+			url.Host = o.SSLHost
 		}
 
 		status := http.StatusMovedPermanently
-		if s.opt.SSLTemporaryRedirect {
+		if o.SSLTemporaryRedirect {
 			status = http.StatusTemporaryRedirect
 		}
 
@@ -372,15 +417,15 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		return nil, nil, fmt.Errorf("redirecting to HTTPS")
 	}
 
-	if s.opt.SSLForceHost {
+	if o.SSLForceHost {
 		tempSSLHost := host
 
-		if s.opt.SSLHostFunc != nil {
-			if h := (*s.opt.SSLHostFunc)(host); len(h) > 0 {
+		if o.SSLHostFunc != nil {
+			if h := (*o.SSLHostFunc)(host); len(h) > 0 {
 				tempSSLHost = h
 			}
-		} else if len(s.opt.SSLHost) > 0 {
-			tempSSLHost = s.opt.SSLHost
+		} else if len(o.SSLHost) > 0 {
+			tempSSLHost = o.SSLHost
 		}
 
 		if tempSSLHost != host {
@@ -389,7 +434,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 			url.Host = tempSSLHost
 
 			status := http.StatusMovedPermanently
-			if s.opt.SSLTemporaryRedirect {
+			if o.SSLTemporaryRedirect {
 				status = http.StatusTemporaryRedirect
 			}
 
@@ -400,7 +445,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// If the AllowRequestFunc is set, call it and exit early if needed.
-	if s.opt.AllowRequestFunc != nil && !s.opt.AllowRequestFunc(r) {
+	if o.AllowRequestFunc != nil && !o.AllowRequestFunc(r) {
 		s.badRequestHandler.ServeHTTP(w, r)
 
 		return nil, nil, fmt.Errorf("request not allowed")
@@ -411,88 +456,88 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 	// Strict Transport Security header. Only add header when we know it's an SSL connection.
 	// See https://tools.ietf.org/html/rfc6797#section-7.2 for details.
-	if s.opt.STSSeconds != 0 && (ssl || s.opt.ForceSTSHeader) && !s.opt.IsDevelopment {
+	if o.STSSeconds != 0 && (ssl || o.ForceSTSHeader) && !o.IsDevelopment {
 		stsSub := ""
-		if s.opt.STSIncludeSubdomains {
+		if o.STSIncludeSubdomains {
 			stsSub = stsSubdomainString
 		}
 
-		if s.opt.STSPreload {
+		if o.STSPreload {
 			stsSub += stsPreloadString
 		}
 
-		responseHeader.Set(stsHeader, fmt.Sprintf("max-age=%d%s", s.opt.STSSeconds, stsSub))
+		responseHeader.Set(stsHeader, fmt.Sprintf("max-age=%d%s", o.STSSeconds, stsSub))
 	}
 
 	// Frame Options header.
-	if len(s.opt.CustomFrameOptionsValue) > 0 {
-		responseHeader.Set(frameOptionsHeader, s.opt.CustomFrameOptionsValue)
-	} else if s.opt.FrameDeny {
+	if len(o.CustomFrameOptionsValue) > 0 {
+		responseHeader.Set(frameOptionsHeader, o.CustomFrameOptionsValue)
+	} else if o.FrameDeny {
 		responseHeader.Set(frameOptionsHeader, frameOptionsValue)
 	}
 
 	// Content Type Options header.
-	if s.opt.ContentTypeNosniff {
+	if o.ContentTypeNosniff {
 		responseHeader.Set(contentTypeHeader, contentTypeValue)
 	}
 
 	// XSS Protection header.
-	if len(s.opt.CustomBrowserXssValue) > 0 {
-		responseHeader.Set(xssProtectionHeader, s.opt.CustomBrowserXssValue)
-	} else if s.opt.BrowserXssFilter {
+	if len(o.CustomBrowserXssValue) > 0 {
+		responseHeader.Set(xssProtectionHeader, o.CustomBrowserXssValue)
+	} else if o.BrowserXssFilter {
 		responseHeader.Set(xssProtectionHeader, xssProtectionValue)
 	}
 
 	// Content Security Policy header.
-	if len(s.opt.ContentSecurityPolicy) > 0 {
-		if s.opt.nonceEnabled {
-			responseHeader.Set(cspHeader, fmt.Sprintf(s.opt.ContentSecurityPolicy, CSPNonce(r.Context())))
+	if len(o.ContentSecurityPolicy) > 0 {
+		if policy.nonceEnabled {
+			responseHeader.Set(cspHeader, fmt.Sprintf(o.ContentSecurityPolicy, CSPNonce(r.Context())))
 		} else {
-			responseHeader.Set(cspHeader, s.opt.ContentSecurityPolicy)
+			responseHeader.Set(cspHeader, o.ContentSecurityPolicy)
 		}
 	}
 
 	// Content Security Policy Report Only header.
-	if len(s.opt.ContentSecurityPolicyReportOnly) > 0 {
-		if s.opt.nonceEnabled {
-			responseHeader.Set(cspReportOnlyHeader, fmt.Sprintf(s.opt.ContentSecurityPolicyReportOnly, CSPNonce(r.Context())))
+	if len(o.ContentSecurityPolicyReportOnly) > 0 {
+		if policy.nonceEnabled {
+			responseHeader.Set(cspReportOnlyHeader, fmt.Sprintf(o.ContentSecurityPolicyReportOnly, CSPNonce(r.Context())))
 		} else {
-			responseHeader.Set(cspReportOnlyHeader, s.opt.ContentSecurityPolicyReportOnly)
+			responseHeader.Set(cspReportOnlyHeader, o.ContentSecurityPolicyReportOnly)
 		}
 	}
 
 	// Referrer Policy header.
-	if len(s.opt.ReferrerPolicy) > 0 {
-		responseHeader.Set(referrerPolicyHeader, s.opt.ReferrerPolicy)
+	if len(o.ReferrerPolicy) > 0 {
+		responseHeader.Set(referrerPolicyHeader, o.ReferrerPolicy)
 	}
 
 	// Feature Policy header.
-	if len(s.opt.FeaturePolicy) > 0 {
-		responseHeader.Set(featurePolicyHeader, s.opt.FeaturePolicy)
+	if len(o.FeaturePolicy) > 0 {
+		responseHeader.Set(featurePolicyHeader, o.FeaturePolicy)
 	}
 
 	// Permissions Policy header.
-	if len(s.opt.PermissionsPolicy) > 0 {
-		responseHeader.Set(permissionsPolicyHeader, s.opt.PermissionsPolicy)
+	if len(o.PermissionsPolicy) > 0 {
+		responseHeader.Set(permissionsPolicyHeader, o.PermissionsPolicy)
 	}
 
 	// Cross Origin Opener Policy header.
-	if len(s.opt.CrossOriginOpenerPolicy) > 0 {
-		responseHeader.Set(coopHeader, s.opt.CrossOriginOpenerPolicy)
+	if len(o.CrossOriginOpenerPolicy) > 0 {
+		responseHeader.Set(coopHeader, o.CrossOriginOpenerPolicy)
 	}
 
 	// Cross Origin Resource Policy header.
-	if len(s.opt.CrossOriginResourcePolicy) > 0 {
-		responseHeader.Set(corpHeader, s.opt.CrossOriginResourcePolicy)
+	if len(o.CrossOriginResourcePolicy) > 0 {
+		responseHeader.Set(corpHeader, o.CrossOriginResourcePolicy)
 	}
 
 	// Cross-Origin-Embedder-Policy header.
-	if len(s.opt.CrossOriginEmbedderPolicy) > 0 {
-		responseHeader.Set(coepHeader, s.opt.CrossOriginEmbedderPolicy)
+	if len(o.CrossOriginEmbedderPolicy) > 0 {
+		responseHeader.Set(coepHeader, o.CrossOriginEmbedderPolicy)
 	}
 
 	// X-DNS-Prefetch-Control header.
-	switch strings.ToLower(s.opt.XDNSPrefetchControl) {
+	switch strings.ToLower(o.XDNSPrefetchControl) {
 	case "on":
 		responseHeader.Set(dnsPreFetchControlHeader, "on")
 	case "off":
@@ -500,8 +545,8 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// X-Permitted-Cross-Domain-Policies header.
-	if len(s.opt.XPermittedCrossDomainPolicies) > 0 {
-		responseHeader.Set(permittedCrossDomainPolicies, s.opt.XPermittedCrossDomainPolicies)
+	if len(o.XPermittedCrossDomainPolicies) > 0 {
+		responseHeader.Set(permittedCrossDomainPolicies, o.XPermittedCrossDomainPolicies)
 	}
 
 	return responseHeader, r, nil
@@ -509,9 +554,14 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 // isSSL determine if we are on HTTPS.
 func (s *Secure) isSSL(r *http.Request) bool {
+	return s.defaultPolicy.isSSL(r)
+}
+
+// isSSL determine if we are on HTTPS under a specific policy.
+func (p *compiledPolicy) isSSL(r *http.Request) bool {
 	ssl := strings.EqualFold(r.URL.Scheme, "https") || r.TLS != nil
 	if !ssl {
-		for k, v := range s.opt.SSLProxyHeaders {
+		for k, v := range p.opt.SSLProxyHeaders {
 			if r.Header.Get(k) == v {
 				ssl = true
 

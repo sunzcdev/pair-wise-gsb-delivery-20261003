@@ -146,6 +146,39 @@ Call `secure.SetBadRequestHandler` to set your own custom handler.
 ### Allow Request Function
 Secure allows you to set a custom function (`func(r *http.Request) bool`) for the `AllowRequestFunc` option. You can use this function as a custom filter to allow the request to continue or simply reject it. This can be handy if you need to do any dynamic filtering on any of the request properties. It should be noted that this function will be called on every request, so be sure to make your checks quick and not relying on time consuming external calls (or you will be slowing down all requests). See above on how to set a custom handler for the rejected requests.
 
+### Named policies for multi-tenant services
+When different tenants need different security settings, pre-compile a named collection with `NewPolicySet` and attach a selector with `SetPolicySelector`. The selector is a cheap `func(r *http.Request) string` that returns a policy name and is called **exactly once per request**; the returned name pins an immutable policy used for the whole request — allowed host checks, the HTTPS redirect and every security header.
+
+~~~ go
+set, err := secure.NewPolicySet(map[string]secure.Options{
+    "standard": {
+        AllowedHosts:       []string{"app.example.com"},
+        SSLRedirect:        true,
+        ContentTypeNosniff: true,
+        FrameDeny:          true,
+    },
+    "legacy": {
+        AllowedHosts:         []string{`.*\.legacy\.example\.com`},
+        AllowedHostsAreRegex: true,
+        FrameDeny:            true,
+    },
+})
+if err != nil {
+    // The set is not published until every regexp compiles and every
+    // configured header value is legal.
+    log.Fatal(err)
+}
+
+s := secure.New()
+s.SetPolicySelector(set, func(r *http.Request) string {
+    return r.Header.Get("X-Tenant-Policy")
+})
+~~~
+
+Fail-closed behavior: if the selector returns a name that is not in the active set (including the empty string), the request is rejected through the bad request handler — it never falls back to a permissive default. Customize that response with `SetBadRequestHandler`.
+
+Hot updates: call `set.Replace(map[string]secure.Options{...})` to atomically publish a new version. If any policy in the candidate set is invalid, `Replace` returns an error and the previously published version keeps serving requests. `set.Version()` exposes the monotonically increasing version number, which is useful in tests to assert switch boundaries. Maps and slices passed to `NewPolicySet` and `Replace` are deep-copied, so mutating them afterwards cannot alter the policies in use.
+
 ### Redirecting HTTP to HTTPS
 If you want to redirect all HTTP requests to HTTPS, you can use the following example.
 
