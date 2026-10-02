@@ -41,6 +41,10 @@ const (
 	// created when a server is added, removed, promoted, etc. Only used
 	// when protocol version 1 or greater is in use.
 	LogConfiguration
+
+	// LogJointConfiguration establishes a joint configuration containing
+	// both the old and new voter sets.
+	LogJointConfiguration
 )
 
 // String returns LogType as a human readable string.
@@ -58,6 +62,8 @@ func (lt LogType) String() string {
 		return "LogBarrier"
 	case LogConfiguration:
 		return "LogConfiguration"
+	case LogJointConfiguration:
+		return "LogJointConfiguration"
 	default:
 		return fmt.Sprintf("%d", lt)
 	}

@@ -35,6 +35,11 @@ type SnapshotMeta struct {
 	Configuration      Configuration
 	ConfigurationIndex uint64
 
+	// JointConfiguration is present in version 2 snapshots while a committed
+	// joint-consensus configuration is active.
+	JointConfiguration      *JointConfiguration
+	JointConfigurationIndex uint64
+
 	// Size is the size of the snapshot in bytes.
 	Size int64
 }
@@ -65,6 +70,12 @@ type SnapshotSink interface {
 	io.WriteCloser
 	ID() string
 	Cancel() error
+}
+
+// JointConfigurationSink is implemented by sinks that can persist a
+// committed joint configuration alongside a version 2 snapshot.
+type JointConfigurationSink interface {
+	SetJointConfiguration(joint JointConfiguration, configurationIndex uint64)
 }
 
 // runSnapshots is a long running goroutine used to manage taking
@@ -162,15 +173,8 @@ func (r *Raft) takeSnapshot() (string, error) {
 	}
 	committed := configReq.configurations.committed
 	committedIndex := configReq.configurations.committedIndex
+	joint := configReq.configurations.committedJoint
 
-	// We don't support snapshots while there's a config change outstanding
-	// since the snapshot doesn't have a means to represent this state. This
-	// is a little weird because we need the FSM to apply an index that's
-	// past the configuration change, even though the FSM itself doesn't see
-	// the configuration changes. It should be ok in practice with normal
-	// application traffic flowing through the FSM. If there's none of that
-	// then it's not crucial that we snapshot, since there's not much going
-	// on Raft-wise.
 	if snapReq.index < committedIndex {
 		return "", fmt.Errorf("cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
 			committedIndex, snapReq.index)
@@ -179,10 +183,18 @@ func (r *Raft) takeSnapshot() (string, error) {
 	// Create a new snapshot.
 	r.logger.Info("starting snapshot up to", "index", snapReq.index)
 	start := time.Now()
-	version := getSnapshotVersion(r.protocolVersion)
+	version := getSnapshotVersion(r.protocolVersion, joint != nil)
 	sink, err := r.snapshots.Create(version, snapReq.index, snapReq.term, committed, committedIndex, r.trans)
 	if err != nil {
 		return "", fmt.Errorf("failed to create snapshot: %v", err)
+	}
+	if joint != nil {
+		if jointSink, ok := sink.(JointConfigurationSink); ok {
+			jointSink.SetJointConfiguration(joint.Clone(), committedIndex)
+		} else {
+			_ = sink.Cancel()
+			return "", fmt.Errorf("snapshot store does not support joint-consensus snapshots")
+		}
 	}
 	metrics.MeasureSince([]string{"raft", "snapshot", "create"}, start)
 
@@ -255,6 +267,9 @@ func (r *Raft) compactLogs(snapIdx uint64) error {
 
 	lastLogIdx, _ := r.getLastLog()
 	trailingLogs := r.config().TrailingLogs
+	if r.configurations.latestIndex > r.configurations.committedIndex {
+		snapIdx = min(snapIdx, r.configurations.latestIndex-1)
+	}
 
 	return r.compactLogsWithTrailing(snapIdx, lastLogIdx, trailingLogs)
 }

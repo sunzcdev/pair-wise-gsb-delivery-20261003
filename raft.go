@@ -30,6 +30,12 @@ var (
 	keyLastVoteCand = []byte("LastVoteCand")
 )
 
+// testBlockFinalConfigurationEntry, when non-nil and returning true, prevents
+// a leader from appending the final configuration entry after a joint
+// configuration commits. It is only used by tests to freeze the cluster in
+// the committed-joint phase.
+var testBlockFinalConfigurationEntry func() bool
+
 // getRPCHeader returns an initialized RPCHeader struct for the given
 // Raft instance. This structure is sent along with RPC requests and
 // responses.
@@ -73,7 +79,10 @@ func (r *Raft) checkRPCHeader(rpc RPC) error {
 
 // getSnapshotVersion returns the snapshot version that should be used when
 // creating snapshots, given the protocol version in use.
-func getSnapshotVersion(protocolVersion ProtocolVersion) SnapshotVersion {
+func getSnapshotVersion(protocolVersion ProtocolVersion, joint bool) SnapshotVersion {
+	if joint {
+		return 2
+	}
 	// Right now we only have two versions and they are backwards compatible
 	// so we don't need to look at the protocol version.
 	return 1
@@ -92,6 +101,7 @@ type leaderState struct {
 	commitCh                     chan struct{}
 	commitment                   *commitment
 	inflight                     *list.List // list of logFuture in log index order
+	membershipChange             *jointConfigurationChangeFuture
 	replState                    map[ServerID]*followerReplication
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
@@ -176,6 +186,10 @@ func (r *Raft) runFollower() {
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
+		case c := <-r.jointConfigurationChangeCh:
+			r.mainThreadSaturation.working()
+			c.respond(ErrNotLeader)
+
 		case a := <-r.applyCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
@@ -233,14 +247,14 @@ func (r *Raft) runFollower() {
 					didWarn = true
 				}
 			} else if r.configurations.latestIndex == r.configurations.committedIndex &&
-				!hasVote(r.configurations.latest, r.localID) {
+				!hasVote(r.activeConfiguration(), r.localID) {
 				if !didWarn {
 					r.logger.Warn("not part of stable configuration, aborting election")
 					didWarn = true
 				}
 			} else {
 				metrics.IncrCounter([]string{"raft", "transition", "heartbeat_timeout"}, 1)
-				if hasVote(r.configurations.latest, r.localID) {
+				if hasVote(r.activeConfiguration(), r.localID) {
 					r.logger.Warn("heartbeat timeout reached, starting election", "last-leader-addr", lastLeaderAddr, "last-leader-id", lastLeaderID)
 					r.setState(Candidate)
 					return
@@ -314,7 +328,10 @@ func (r *Raft) runCandidate() {
 	preVoteGrantedVotes := 0
 	preVoteRefusedVotes := 0
 	grantedVotes := 0
-	votesNeeded := r.quorumSize()
+	voteGroups := r.configurations.latestVoterGroups()
+	votesNeeded := jointQuorumSize(voteGroups)
+	voteTally := newJointVoteTally(voteGroups)
+	preVoteTally := newJointVoteTally(voteGroups)
 	r.logger.Debug("calculated votes needed", "needed", votesNeeded, "term", term)
 
 	for r.getState() == Candidate {
@@ -339,6 +356,9 @@ func (r *Raft) runCandidate() {
 			// Check if the preVote is granted
 			if preVote.Granted {
 				preVoteGrantedVotes++
+				if preVoteTally.grant(preVote.voterID) {
+					preVoteGrantedVotes = votesNeeded
+				}
 				r.logger.Debug("pre-vote granted", "from", preVote.voterID, "term", preVote.Term, "tally", preVoteGrantedVotes)
 			} else {
 				preVoteRefusedVotes++
@@ -374,6 +394,9 @@ func (r *Raft) runCandidate() {
 			// Check if the vote is granted
 			if vote.Granted {
 				grantedVotes++
+				if voteTally.grant(vote.voterID) {
+					grantedVotes = votesNeeded
+				}
 				r.logger.Debug("vote granted", "from", vote.voterID, "term", vote.Term, "tally", grantedVotes)
 			}
 
@@ -387,6 +410,10 @@ func (r *Raft) runCandidate() {
 		case c := <-r.configurationChangeCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
+			c.respond(ErrNotLeader)
+
+		case c := <-r.jointConfigurationChangeCh:
+			r.mainThreadSaturation.working()
 			c.respond(ErrNotLeader)
 
 		case a := <-r.applyCh:
@@ -456,8 +483,9 @@ func (r *Raft) getLeadershipTransferInProgress() bool {
 func (r *Raft) setupLeaderState() {
 	r.leaderState.commitCh = make(chan struct{}, 1)
 	r.leaderState.commitment = newCommitment(r.leaderState.commitCh,
-		r.configurations.latest,
+		r.activeConfiguration(),
 		r.getLastIndex()+1 /* first index that may be committed in this term */)
+	r.leaderState.commitment.setConfigurations(r.configurations.latestVoterGroups())
 	r.leaderState.inflight = list.New()
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
@@ -518,6 +546,11 @@ func (r *Raft) runLeader() {
 		// Respond to all inflight operations
 		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 			e.Value.(*logFuture).respond(ErrLeadershipLost)
+		}
+
+		if r.leaderState.membershipChange != nil {
+			r.leaderState.membershipChange.respond(ErrLeadershipLost)
+			r.leaderState.membershipChange = nil
 		}
 
 		// Respond to any pending verify requests
@@ -581,11 +614,12 @@ func (r *Raft) runLeader() {
 // it'll instruct the replication routines to try to replicate to the current
 // index. This must only be called from the main thread.
 func (r *Raft) startStopReplication() {
-	inConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))
+	configuration := r.activeConfiguration()
+	inConfig := make(map[ServerID]bool, len(configuration.Servers))
 	lastIdx := r.getLastIndex()
 
 	// Start replication goroutines that need starting
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range configuration.Servers {
 		if server.ID == r.localID {
 			continue
 		}
@@ -642,7 +676,7 @@ func (r *Raft) startStopReplication() {
 	}
 
 	// Update peers metric
-	metrics.SetGauge([]string{"raft", "peers"}, float32(len(r.configurations.latest.Servers)))
+	metrics.SetGauge([]string{"raft", "peers"}, float32(len(configuration.Servers)))
 }
 
 // configurationChangeChIfStable returns r.configurationChangeCh if it's safe
@@ -659,6 +693,14 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 	if r.configurations.latestIndex == r.configurations.committedIndex &&
 		r.getCommitIndex() >= r.leaderState.commitment.startIndex {
 		return r.configurationChangeCh
+	}
+	return nil
+}
+
+func (r *Raft) jointConfigurationChangeChIfStable() chan *jointConfigurationChangeFuture {
+	if !r.configurations.changeActive() &&
+		r.getCommitIndex() >= r.leaderState.commitment.startIndex {
+		return r.jointConfigurationChangeCh
 	}
 	return nil
 }
@@ -790,14 +832,44 @@ func (r *Raft) leaderLoop() {
 			commitIndex := r.leaderState.commitment.getCommitIndex()
 			r.setCommitIndex(commitIndex)
 
-			// New configuration has been committed, set it as the committed
-			// value.
-			if r.configurations.latestIndex > oldCommitIndex &&
+			if r.configurations.latestJoint != nil &&
+				r.configurations.latestIndex > oldCommitIndex &&
 				r.configurations.latestIndex <= commitIndex {
-				r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
-				if !hasVote(r.configurations.committed, r.localID) {
+				joint := r.configurations.latestJoint.Clone()
+				r.setCommittedConfiguration(mergeConfigurations(joint.Old, joint.New), r.configurations.latestIndex)
+				r.configurations.committedJoint = &joint
+				target := r.configurations.pendingTarget.Clone()
+				if len(target.Servers) == 0 {
+					target = joint.New.Clone()
+				}
+				r.configurations.pendingTarget = target
+				r.setMembershipChangeStatus(MembershipChangeJointCommitted, r.configurations.latestIndex, target, nil)
+				r.appendFinalConfigurationEntry()
+			} else if r.configurations.latestJoint == nil &&
+				r.configurations.latestIndex > oldCommitIndex &&
+				r.configurations.latestIndex <= commitIndex {
+				target := r.configurations.latest.Clone()
+				r.setCommittedConfiguration(target, r.configurations.latestIndex)
+				r.configurations.committedJoint = nil
+				r.configurations.pendingTarget = Configuration{}
+				r.setMembershipChangeStatus(MembershipChangeCommitted, r.configurations.latestIndex, target, nil)
+				if r.leaderState.membershipChange != nil {
+					r.leaderState.membershipChange.respond(nil)
+					r.leaderState.membershipChange = nil
+				}
+				if !hasVote(target, r.localID) {
 					stepDown = true
 				}
+			} else if r.configurations.committedJoint != nil &&
+				r.configurations.latestJoint == nil &&
+				r.configurations.latestIndex == r.configurations.committedIndex &&
+				commitIndex >= r.leaderState.commitment.startIndex {
+				r.appendFinalConfigurationEntry()
+			} else if r.configurations.committedJoint != nil {
+				// A committed joint configuration is still active while the
+				// final configuration entry remains unappended (for example,
+				// appending it was previously held back). Retry.
+				r.appendFinalConfigurationEntry()
 			}
 
 			start := time.Now()
@@ -848,10 +920,10 @@ func (r *Raft) leaderLoop() {
 
 		case v := <-r.verifyCh:
 			r.mainThreadSaturation.working()
-			if v.quorumSize == 0 {
+			if v.groups == nil {
 				// Just dispatched, start the verification
 				r.verifyLeader(v)
-			} else if v.votes < v.quorumSize {
+			} else if !v.reached() {
 				// Early return, means there must be a new leader
 				r.logger.Warn("new leader elected, stepping down")
 				r.setState(Follower)
@@ -898,6 +970,14 @@ func (r *Raft) leaderLoop() {
 				continue
 			}
 			r.appendConfigurationEntry(future)
+
+		case future := <-r.jointConfigurationChangeChIfStable():
+			r.mainThreadSaturation.working()
+			if r.getLeadershipTransferInProgress() {
+				future.respond(ErrLeadershipTransferInProgress)
+				continue
+			}
+			r.appendJointConfigurationEntry(future)
 
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
@@ -964,12 +1044,18 @@ func (r *Raft) leaderLoop() {
 // verifyLeader must be called from the main thread for safety.
 // Causes the followers to attempt an immediate heartbeat.
 func (r *Raft) verifyLeader(v *verifyFuture) {
-	// Current leader always votes for self
-	v.votes = 1
-
-	// Set the quorum size, hot-path for single node
-	v.quorumSize = r.quorumSize()
-	if v.quorumSize == 1 {
+	v.groups = make([]map[ServerID]struct{}, 0)
+	v.votes = make([]map[ServerID]struct{}, 0)
+	for _, group := range r.configurations.latestVoterGroups() {
+		ids := voterIDs(group)
+		v.groups = append(v.groups, ids)
+		vote := make(map[ServerID]struct{})
+		if _, ok := ids[r.localID]; ok {
+			vote[r.localID] = struct{}{}
+		}
+		v.votes = append(v.votes, vote)
+	}
+	if v.reached() {
 		v.respond(nil)
 		return
 	}
@@ -1037,6 +1123,7 @@ func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *foll
 func (r *Raft) checkLeaderLease() time.Duration {
 	// Track contacted nodes, we can always contact ourself
 	contacted := 0
+	contactedIDs := map[ServerID]bool{r.localID: true}
 
 	// Store lease timeout for this one check invocation as we need to refer to it
 	// in the loop and would be confusing if it ever becomes reloadable and
@@ -1046,7 +1133,7 @@ func (r *Raft) checkLeaderLease() time.Duration {
 	// Check each follower
 	var maxDiff time.Duration
 	now := time.Now()
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range r.activeConfiguration().Servers {
 		if server.Suffrage == Voter {
 			if server.ID == r.localID {
 				contacted++
@@ -1056,6 +1143,7 @@ func (r *Raft) checkLeaderLease() time.Duration {
 			diff := now.Sub(f.LastContact())
 			if diff <= leaseTimeout {
 				contacted++
+				contactedIDs[server.ID] = true
 				if diff > maxDiff {
 					maxDiff = diff
 				}
@@ -1072,8 +1160,7 @@ func (r *Raft) checkLeaderLease() time.Duration {
 	}
 
 	// Verify we can contact a quorum
-	quorum := r.quorumSize()
-	if contacted < quorum {
+	if !r.leaderState.commitment.contactQuorum(contactedIDs) {
 		r.logger.Warn("failed to contact quorum of nodes, stepping down")
 		r.setState(Follower)
 		metrics.IncrCounter([]string{"raft", "transition", "leader_lease_timeout"}, 1)
@@ -1085,13 +1172,28 @@ func (r *Raft) checkLeaderLease() time.Duration {
 // the main thread.
 // TODO: revisit usage
 func (r *Raft) quorumSize() int {
-	voters := 0
-	for _, server := range r.configurations.latest.Servers {
-		if server.Suffrage == Voter {
-			voters++
+	groups := r.configurations.latestVoterGroups()
+	if len(groups) == 1 {
+		voters := 0
+		for _, server := range groups[0].Servers {
+			if server.Suffrage == Voter {
+				voters++
+			}
 		}
+		return voters/2 + 1
 	}
-	return voters/2 + 1
+
+	quorum := 0
+	for _, group := range groups {
+		voters := 0
+		for _, server := range group.Servers {
+			if server.Suffrage == Voter {
+				voters++
+			}
+		}
+		quorum += voters/2 + 1
+	}
+	return quorum
 }
 
 // restoreUserSnapshot is used to manually consume an external snapshot, such
@@ -1202,7 +1304,7 @@ func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
 // configuration entry to the log. This must only be called from the
 // main thread.
 func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
-	configuration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)
+	configuration, err := nextConfiguration(r.activeConfiguration(), r.configurations.latestIndex, future.req)
 	if err != nil {
 		future.respond(err)
 		return
@@ -1237,6 +1339,66 @@ func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
 	index := future.Index()
 	r.setLatestConfiguration(configuration, index)
 	r.leaderState.commitment.setConfiguration(configuration)
+	r.startStopReplication()
+}
+
+func (r *Raft) appendJointConfigurationEntry(future *jointConfigurationChangeFuture) {
+	if r.configurations.changeActive() {
+		future.respond(ErrMembershipChangeInProgress)
+		return
+	}
+	if future.prevIndex != 0 && future.prevIndex != r.configurations.latestIndex {
+		future.respond(fmt.Errorf("configuration changed since %v (latest is %v)", future.prevIndex, r.configurations.latestIndex))
+		return
+	}
+
+	old := r.configurations.latest.Clone()
+	target := future.target.Clone()
+	joint := &JointConfiguration{Old: old, New: target}
+	jointLog := &logFuture{log: Log{
+		Type: LogJointConfiguration,
+		Data: EncodeJointConfiguration(*joint),
+	}}
+
+	r.leaderState.membershipChange = future
+	r.dispatchLogs([]*logFuture{jointLog})
+	if r.getState() != Leader {
+		return
+	}
+	r.configurations.pendingTarget = target
+	future.index = jointLog.Index()
+	r.setMembershipChangeStatus(MembershipChangeJoint, future.index, target, nil)
+	r.setLatestJointConfiguration(joint, jointLog.Index())
+	r.leaderState.commitment.setJointConfiguration(*joint)
+	r.startStopReplication()
+}
+
+func (r *Raft) appendFinalConfigurationEntry() {
+	if r.configurations.committedJoint == nil {
+		return
+	}
+	if testBlockFinalConfigurationEntry != nil && testBlockFinalConfigurationEntry() {
+		return
+	}
+
+	target := r.configurations.committedJoint.New.Clone()
+	future := &logFuture{log: Log{
+		Type: LogConfiguration,
+		Data: EncodeConfiguration(target),
+	}}
+	r.dispatchLogs([]*logFuture{future})
+	if r.getState() != Leader {
+		return
+	}
+	if future.log.Index == 0 {
+		return
+	}
+
+	r.setLatestConfiguration(target, future.log.Index)
+	r.configurations.latestJoint = nil
+	r.configurations.pendingTarget = target.Clone()
+	r.leaderState.commitment.setConfiguration(target)
+	r.setMembershipChangeStatus(MembershipChangeJointCommitted, future.log.Index, target, nil)
 	r.startStopReplication()
 }
 
@@ -1372,7 +1534,7 @@ func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
 	case LogCommand:
 		return &commitTuple{l, future}
 
-	case LogConfiguration:
+	case LogConfiguration, LogJointConfiguration:
 		// Only support this with the v2 configuration format
 		if r.protocolVersion > 2 {
 			return &commitTuple{l, future}
@@ -1545,7 +1707,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 					return
 				}
 				if entry.Index <= r.configurations.latestIndex {
-					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
+					r.restoreCommittedConfiguration()
 				}
 				newEntries = a.Entries[i:]
 				break
@@ -1591,7 +1753,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		idx := min(a.LeaderCommitIndex, r.getLastIndex())
 		r.setCommitIndex(idx)
 		if r.configurations.latestIndex <= idx {
-			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+			r.markLatestConfigurationCommitted()
 		}
 		r.processLogs(idx, nil)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
@@ -1607,9 +1769,39 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 // called from the main thread, or from NewRaft() before any threads have begun.
 func (r *Raft) processConfigurationLogEntry(entry *Log) error {
 	switch entry.Type {
-	case LogConfiguration:
+	case LogJointConfiguration:
+		joint, ok := DecodeJointConfiguration(entry.Data)
+		if !ok {
+			return fmt.Errorf("joint configuration entry at %d is missing joint state", entry.Index)
+		}
 		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
-		r.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)
+		r.configurations.committedJoint = nil
+		r.setLatestJointConfiguration(&joint, entry.Index)
+		r.configurations.pendingTarget = joint.New.Clone()
+		r.setMembershipChangeStatus(MembershipChangeJoint, entry.Index, joint.New.Clone(), nil)
+
+	case LogConfiguration:
+		_, joint := decodeEncodedConfiguration(entry.Data)
+		if joint != nil {
+			r.setCommittedJointConfiguration(joint, entry.Index)
+			r.setLatestJointConfiguration(joint, entry.Index)
+			r.configurations.pendingTarget = joint.New.Clone()
+			r.setMembershipChangeStatus(MembershipChangeJoint, entry.Index, joint.New.Clone(), nil)
+		} else if r.configurations.latestJoint != nil {
+			configuration := DecodeConfiguration(entry.Data)
+			if r.configurations.committedJoint != nil {
+				r.setCommittedConfiguration(configuration, entry.Index)
+				r.configurations.committedJoint = nil
+			}
+			r.setLatestConfiguration(configuration, entry.Index)
+			r.configurations.latestJoint = nil
+			r.configurations.pendingTarget = Configuration{}
+			r.setMembershipChangeStatus(MembershipChangeCommitted, entry.Index, configuration, nil)
+		} else {
+			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+			r.setLatestConfiguration(DecodeConfiguration(entry.Data), entry.Index)
+			r.configurations.pendingTarget = Configuration{}
+		}
 
 	case LogAddPeerDeprecated, LogRemovePeerDeprecated:
 		r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
@@ -1641,7 +1833,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// Version 0 servers will panic unless the peers is present. It's only
 	// used on them to produce a warning message.
 	if r.protocolVersion < 2 {
-		resp.Peers = encodePeers(r.configurations.latest, r.trans)
+		resp.Peers = encodePeers(r.activeConfiguration(), r.trans)
 	}
 
 	// Check if we have an existing leader [who's not the candidate] and also
@@ -1664,7 +1856,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		candidateID := ServerID(req.ID)
 		// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,
 		// Grant the vote
-		if len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {
+		if len(r.activeConfiguration().Servers) > 0 && !inConfiguration(r.activeConfiguration(), candidateID) {
 			r.logger.Warn("rejecting vote request since node is not in configuration",
 				"from", candidate)
 			return
@@ -1700,7 +1892,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	// More details about that in https://github.com/hashicorp/raft/pull/526
 	if len(req.ID) > 0 {
 		candidateID := ServerID(req.ID)
-		if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
+		if len(r.activeConfiguration().Servers) > 0 && !hasVote(r.activeConfiguration(), candidateID) {
 			r.logger.Warn("rejecting vote request since node is not a voter", "from", candidate)
 			return
 		}
@@ -1777,7 +1969,7 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 
 	// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,
 	// Grant the vote
-	if len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {
+	if len(r.activeConfiguration().Servers) > 0 && !inConfiguration(r.activeConfiguration(), candidateID) {
 		r.logger.Warn("rejecting pre-vote request since node is not in configuration",
 			"from", candidate)
 		return
@@ -1804,7 +1996,7 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 
 	// if we get a request for a pre-vote from a nonVoter  and the request term is higher, do not grant the Pre-Vote
 	// This could happen when a node, previously voter, is converted to non-voter
-	if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
+	if len(r.activeConfiguration().Servers) > 0 && !hasVote(r.activeConfiguration(), candidateID) {
 		r.logger.Warn("rejecting pre-vote request since node is not a voter", "from", candidate)
 		return
 	}
@@ -1880,9 +2072,18 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	// Create a new snapshot
 	var reqConfiguration Configuration
 	var reqConfigurationIndex uint64
+	var reqJointConfiguration *JointConfiguration
 	if req.SnapshotVersion > 0 {
 		reqConfiguration = DecodeConfiguration(req.Configuration)
 		reqConfigurationIndex = req.ConfigurationIndex
+		if req.SnapshotVersion >= 2 && len(req.JointConfiguration) > 0 {
+			joint, ok := DecodeJointConfiguration(req.JointConfiguration)
+			if !ok {
+				rpcErr = fmt.Errorf("snapshot is missing joint configuration")
+				return
+			}
+			reqJointConfiguration = &joint
+		}
 	} else {
 		reqConfiguration, rpcErr = decodePeers(req.Peers, r.trans)
 		if rpcErr != nil {
@@ -1891,13 +2092,25 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		}
 		reqConfigurationIndex = req.LastLogIndex
 	}
-	version := getSnapshotVersion(r.protocolVersion)
+	version := SnapshotVersion(1)
+	if reqJointConfiguration != nil {
+		version = 2
+	}
 	sink, err := r.snapshots.Create(version, req.LastLogIndex, req.LastLogTerm,
 		reqConfiguration, reqConfigurationIndex, r.trans)
 	if err != nil {
 		r.logger.Error("failed to create snapshot to install", "error", err)
 		rpcErr = fmt.Errorf("failed to create snapshot: %v", err)
 		return
+	}
+	if reqJointConfiguration != nil {
+		jointSink, ok := sink.(JointConfigurationSink)
+		if !ok {
+			_ = sink.Cancel()
+			rpcErr = fmt.Errorf("snapshot store does not support joint-consensus snapshots")
+			return
+		}
+		jointSink.SetJointConfiguration(*reqJointConfiguration, req.JointConfigurationIndex)
 	}
 
 	// Separately track the progress of streaming a snapshot over the network
@@ -1957,8 +2170,13 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	r.setLastSnapshot(req.LastLogIndex, req.LastLogTerm)
 
 	// Restore the peer set
-	r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
-	r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
+	if reqJointConfiguration != nil {
+		r.setCommittedJointConfiguration(reqJointConfiguration, req.JointConfigurationIndex)
+		r.restoreCommittedConfiguration()
+	} else {
+		r.setLatestConfiguration(reqConfiguration, reqConfigurationIndex)
+		r.setCommittedConfiguration(reqConfiguration, reqConfigurationIndex)
+	}
 
 	// Clear old logs if r.logs is a MonotonicLogStore. Otherwise compact the
 	// logs. In both cases, log any errors and continue.
@@ -1998,7 +2216,7 @@ type preVoteResult struct {
 // vote for ourself). This must only be called from the main thread.
 func (r *Raft) electSelf() <-chan *voteResult {
 	// Create a response channel
-	respCh := make(chan *voteResult, len(r.configurations.latest.Servers))
+	respCh := make(chan *voteResult, len(r.activeConfiguration().Servers))
 
 	// Increment the term
 	newTerm := r.getCurrentTerm() + 1
@@ -2035,7 +2253,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 	}
 
 	// For each peer, request a vote
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range r.activeConfiguration().Servers {
 		if server.Suffrage == Voter {
 			if server.ID == r.localID {
 				r.logger.Debug("voting for self", "term", req.Term, "id", r.localID)
@@ -2080,7 +2298,7 @@ func (r *Raft) preElectSelf() <-chan *preVoteResult {
 	}
 
 	// Create a response channel
-	respCh := make(chan *preVoteResult, len(r.configurations.latest.Servers))
+	respCh := make(chan *preVoteResult, len(r.activeConfiguration().Servers))
 
 	// Propose the next term without actually changing our state
 	newTerm := r.getCurrentTerm() + 1
@@ -2125,7 +2343,7 @@ func (r *Raft) preElectSelf() <-chan *preVoteResult {
 	}
 
 	// For each peer, request a vote
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range r.activeConfiguration().Servers {
 		if server.Suffrage == Voter {
 			if server.ID == r.localID {
 				r.logger.Debug("pre-voting for self", "term", req.Term, "id", r.localID)
@@ -2186,7 +2404,7 @@ func (r *Raft) setState(state RaftState) {
 func (r *Raft) pickServer() *Server {
 	var pick *Server
 	var current uint64
-	for _, server := range r.configurations.latest.Servers {
+	for _, server := range r.activeConfiguration().Servers {
 		if server.ID == r.localID || server.Suffrage != Voter {
 			continue
 		}
@@ -2241,6 +2459,77 @@ func (r *Raft) setLatestConfiguration(c Configuration, i uint64) {
 	r.configurations.latest = c
 	r.configurations.latestIndex = i
 	r.latestConfiguration.Store(c.Clone())
+}
+
+func (r *Raft) setLatestJointConfiguration(joint *JointConfiguration, i uint64) {
+	r.configurations.latest = mergeConfigurations(joint.Old, joint.New)
+	r.configurations.latestIndex = i
+	r.configurations.latestJoint = cloneJointConfiguration(joint)
+	r.latestConfiguration.Store(r.configurations.latest.Clone())
+}
+
+func (r *Raft) setCommittedJointConfiguration(joint *JointConfiguration, i uint64) {
+	r.setCommittedConfiguration(mergeConfigurations(joint.Old, joint.New), i)
+	r.configurations.committedJoint = cloneJointConfiguration(joint)
+}
+
+func (r *Raft) restoreCommittedConfiguration() {
+	r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
+	r.configurations.latestJoint = cloneJointConfiguration(r.configurations.committedJoint)
+	if r.configurations.committedJoint != nil {
+		r.configurations.pendingTarget = r.configurations.committedJoint.New.Clone()
+	}
+}
+
+func (r *Raft) markLatestConfigurationCommitted() {
+	if r.configurations.latestJoint != nil {
+		joint := r.configurations.latestJoint.Clone()
+		r.setCommittedJointConfiguration(&joint, r.configurations.latestIndex)
+		r.configurations.pendingTarget = joint.New.Clone()
+		r.setMembershipChangeStatus(MembershipChangeJointCommitted, r.configurations.latestIndex, joint.New.Clone(), nil)
+		return
+	}
+	if r.configurations.committedJoint != nil {
+		target := r.configurations.latest.Clone()
+		r.configurations.committedJoint = nil
+		r.configurations.pendingTarget = Configuration{}
+		r.setMembershipChangeStatus(MembershipChangeCommitted, r.configurations.latestIndex, target, nil)
+	}
+	r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
+}
+
+func (r *Raft) activeConfiguration() Configuration {
+	return r.configurations.effectiveConfiguration()
+}
+
+func (r *Raft) setMembershipChangeStatus(phase MembershipChangePhase, index uint64, target Configuration, err error) {
+	status := MembershipChangeStatus{
+		Phase:   phase,
+		Index:   index,
+		Target:  target.Clone(),
+		LastErr: err,
+	}
+	r.configurations.lastMembershipChange = status
+	r.membershipChangeStatus.Store(status)
+}
+
+func (r *Raft) refreshMembershipChangeStatusOnStart() {
+	switch {
+	case r.configurations.latestJoint != nil && r.configurations.committedJoint == nil:
+		r.setMembershipChangeStatus(MembershipChangeJoint, r.configurations.latestIndex, r.configurations.pendingTarget, nil)
+	case r.configurations.committedJoint != nil:
+		target := r.configurations.pendingTarget.Clone()
+		if len(target.Servers) == 0 {
+			target = r.configurations.committedJoint.New.Clone()
+		}
+		r.setMembershipChangeStatus(MembershipChangeJointCommitted, r.configurations.committedIndex, target, nil)
+	default:
+		if r.configurations.lastMembershipChange.Phase == MembershipChangeCommitted {
+			r.membershipChangeStatus.Store(r.configurations.lastMembershipChange)
+		} else {
+			r.membershipChangeStatus.Store(MembershipChangeStatus{Phase: MembershipChangeStable})
+		}
+	}
 }
 
 // setCommittedConfiguration stores the committed configuration.

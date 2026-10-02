@@ -106,7 +106,7 @@ func (s *followerReplication) notifyAll(leader bool) {
 
 	// Submit our votes
 	for v := range n {
-		v.vote(leader)
+		v.vote(s.peer.ID, leader)
 	}
 }
 
@@ -325,13 +325,17 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 		SnapshotVersion: meta.Version,
 		Term:            s.currentTerm,
 		// this is needed for retro compatibility, before RPCHeader.Addr was added
-		Leader:             r.trans.EncodePeer(r.localID, r.localAddr),
-		LastLogIndex:       meta.Index,
-		LastLogTerm:        meta.Term,
-		Peers:              meta.Peers,
-		Size:               meta.Size,
-		Configuration:      EncodeConfiguration(meta.Configuration),
-		ConfigurationIndex: meta.ConfigurationIndex,
+		Leader:                  r.trans.EncodePeer(r.localID, r.localAddr),
+		LastLogIndex:            meta.Index,
+		LastLogTerm:             meta.Term,
+		Peers:                   meta.Peers,
+		Size:                    meta.Size,
+		Configuration:           EncodeConfiguration(meta.Configuration),
+		ConfigurationIndex:      meta.ConfigurationIndex,
+		JointConfigurationIndex: meta.JointConfigurationIndex,
+	}
+	if meta.JointConfiguration != nil {
+		req.JointConfiguration = EncodeJointConfiguration(*meta.JointConfiguration)
 	}
 
 	s.peerLock.RLock()

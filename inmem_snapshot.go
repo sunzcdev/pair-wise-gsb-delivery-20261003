@@ -36,8 +36,7 @@ func NewInmemSnapshotStore() *InmemSnapshotStore {
 // Create replaces the stored snapshot with a new one using the given args
 func (m *InmemSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
-	// We only support version 1 snapshots at this time.
-	if version != 1 {
+	if version < 1 || version > 2 {
 		return nil, fmt.Errorf("unsupported snapshot version %d", version)
 	}
 
@@ -110,4 +109,9 @@ func (s *InmemSnapshotSink) ID() string {
 // Cancel returns successfully with a nil error
 func (s *InmemSnapshotSink) Cancel() error {
 	return nil
+}
+
+func (s *InmemSnapshotSink) SetJointConfiguration(joint JointConfiguration, configurationIndex uint64) {
+	s.meta.JointConfiguration = &joint
+	s.meta.JointConfigurationIndex = configurationIndex
 }

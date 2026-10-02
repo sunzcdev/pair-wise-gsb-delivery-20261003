@@ -75,10 +75,90 @@ type Configuration struct {
 	Servers []Server
 }
 
+// JointConfiguration contains the two voter sets that are active while a
+// joint-consensus membership change is in progress.
+type JointConfiguration struct {
+	Old Configuration
+	New Configuration
+}
+
+// Clone makes a deep copy of a JointConfiguration.
+func (c *JointConfiguration) Clone() (copy JointConfiguration) {
+	if c == nil {
+		return copy
+	}
+	copy.Old = c.Old.Clone()
+	copy.New = c.New.Clone()
+	return
+}
+
+func cloneJointConfiguration(c *JointConfiguration) *JointConfiguration {
+	if c == nil {
+		return nil
+	}
+	clone := c.Clone()
+	return &clone
+}
+
+// MembershipChangePhase describes the phase of the latest membership change.
+type MembershipChangePhase uint8
+
+const (
+	// MembershipChangeStable means that no joint-consensus change is active.
+	MembershipChangeStable MembershipChangePhase = iota
+	// MembershipChangeJoint means the joint configuration has been appended
+	// but not yet committed.
+	MembershipChangeJoint
+	// MembershipChangeJointCommitted means the joint configuration is
+	// committed and the final configuration is being committed.
+	MembershipChangeJointCommitted
+	// MembershipChangeCommitted means the final configuration has committed.
+	MembershipChangeCommitted
+)
+
+func (p MembershipChangePhase) String() string {
+	switch p {
+	case MembershipChangeStable:
+		return "stable"
+	case MembershipChangeJoint:
+		return "joint"
+	case MembershipChangeJointCommitted:
+		return "joint-committed"
+	case MembershipChangeCommitted:
+		return "committed"
+	default:
+		return "unknown"
+	}
+}
+
+// MembershipChangeStatus is a point-in-time view of a membership change.
+type MembershipChangeStatus struct {
+	Phase   MembershipChangePhase
+	Index   uint64
+	Target  Configuration
+	LastErr error
+}
+
+type encodedJointConfiguration struct {
+	Old Configuration
+	New Configuration
+}
+
 // Clone makes a deep copy of a Configuration.
 func (c *Configuration) Clone() (copy Configuration) {
 	copy.Servers = append(copy.Servers, c.Servers...)
 	return
+}
+
+func decodeEncodedConfiguration(buf []byte) (Configuration, *JointConfiguration) {
+	if joint, ok := DecodeJointConfiguration(buf); ok {
+		return mergeConfigurations(joint.Old, joint.New), &joint
+	}
+	var configuration Configuration
+	if err := decodeMsgPack(buf, &configuration); err != nil {
+		panic(fmt.Errorf("failed to decode configuration: %v", err))
+	}
+	return configuration, nil
 }
 
 // ConfigurationChangeCommand is the different ways to change the cluster
@@ -154,6 +234,16 @@ type configurations struct {
 	latest Configuration
 	// latestIndex is the log index where 'latest' was written.
 	latestIndex uint64
+	// committedJoint is non-nil while a committed joint configuration is
+	// active. It is cleared when the final configuration commits.
+	committedJoint *JointConfiguration
+	// latestJoint is non-nil once a joint configuration entry has been
+	// appended, even before it has committed.
+	latestJoint *JointConfiguration
+	// pendingTarget is the final configuration for an active change.
+	pendingTarget Configuration
+	// lastMembershipChange is the terminal status of the latest change.
+	lastMembershipChange MembershipChangeStatus
 }
 
 // Clone makes a deep copy of a configurations object.
@@ -162,7 +252,60 @@ func (c *configurations) Clone() (copy configurations) {
 	copy.committedIndex = c.committedIndex
 	copy.latest = c.latest.Clone()
 	copy.latestIndex = c.latestIndex
+	copy.committedJoint = cloneJointConfiguration(c.committedJoint)
+	copy.latestJoint = cloneJointConfiguration(c.latestJoint)
+	copy.pendingTarget = c.pendingTarget.Clone()
+	copy.lastMembershipChange = c.lastMembershipChange
 	return
+}
+
+func (c configurations) changeActive() bool {
+	return c.latestJoint != nil || c.committedJoint != nil || c.latestIndex != c.committedIndex
+}
+
+func (c configurations) effectiveConfiguration() Configuration {
+	if c.latestJoint != nil {
+		return mergeConfigurations(c.latestJoint.Old, c.latestJoint.New)
+	}
+	if c.committedJoint != nil {
+		return mergeConfigurations(c.committedJoint.Old, c.committedJoint.New)
+	}
+	return c.latest
+}
+
+func (c configurations) committedVoterGroups() []Configuration {
+	if c.committedJoint != nil {
+		return []Configuration{c.committedJoint.Old, c.committedJoint.New}
+	}
+	return []Configuration{c.committed}
+}
+
+func (c configurations) latestVoterGroups() []Configuration {
+	if c.latestJoint != nil {
+		return []Configuration{c.latestJoint.Old, c.latestJoint.New}
+	}
+	if c.committedJoint != nil {
+		return []Configuration{c.committedJoint.Old, c.committedJoint.New}
+	}
+	return []Configuration{c.latest}
+}
+
+func mergeConfigurations(configurations ...Configuration) Configuration {
+	var merged Configuration
+	seen := make(map[ServerID]int)
+	for _, configuration := range configurations {
+		for _, server := range configuration.Servers {
+			if index, ok := seen[server.ID]; ok {
+				if server.Suffrage == Voter || merged.Servers[index].Suffrage != Voter {
+					merged.Servers[index] = server
+				}
+				continue
+			}
+			seen[server.ID] = len(merged.Servers)
+			merged.Servers = append(merged.Servers, server)
+		}
+	}
+	return merged
 }
 
 // hasVote returns true if the server identified by 'id' is a Voter in the
@@ -174,6 +317,62 @@ func hasVote(configuration Configuration, id ServerID) bool {
 		}
 	}
 	return false
+}
+
+func jointQuorumSize(groups []Configuration) int {
+	if len(groups) <= 1 {
+		return len(voterIDs(groups[0]))/2 + 1
+	}
+	quorum := 0
+	for _, group := range groups {
+		quorum += len(voterIDs(group))/2 + 1
+	}
+	return quorum
+}
+
+func voterIDs(configuration Configuration) map[ServerID]struct{} {
+	ids := make(map[ServerID]struct{})
+	for _, server := range configuration.Servers {
+		if server.Suffrage == Voter {
+			ids[server.ID] = struct{}{}
+		}
+	}
+	return ids
+}
+
+type jointVoteTally struct {
+	groups []map[ServerID]struct{}
+	votes  []map[ServerID]struct{}
+}
+
+func newJointVoteTally(groups []Configuration) jointVoteTally {
+	tally := jointVoteTally{
+		groups: make([]map[ServerID]struct{}, len(groups)),
+		votes:  make([]map[ServerID]struct{}, len(groups)),
+	}
+	for i, group := range groups {
+		tally.groups[i] = voterIDs(group)
+		tally.votes[i] = make(map[ServerID]struct{})
+	}
+	return tally
+}
+
+func (t *jointVoteTally) grant(id ServerID) bool {
+	for i := range t.groups {
+		if _, member := t.groups[i][id]; member {
+			t.votes[i][id] = struct{}{}
+		}
+	}
+	return t.reached()
+}
+
+func (t *jointVoteTally) reached() bool {
+	for i, group := range t.groups {
+		if len(t.votes[i]) < len(group)/2+1 {
+			return false
+		}
+	}
+	return true
 }
 
 // inConfiguration returns true if the server identified by 'id' is in the
@@ -360,9 +559,25 @@ func EncodeConfiguration(configuration Configuration) []byte {
 // DecodeConfiguration deserializes a Configuration using MsgPack, or panics on
 // errors.
 func DecodeConfiguration(buf []byte) Configuration {
-	var configuration Configuration
-	if err := decodeMsgPack(buf, &configuration); err != nil {
-		panic(fmt.Errorf("failed to decode configuration: %v", err))
-	}
+	configuration, _ := decodeEncodedConfiguration(buf)
 	return configuration
+}
+
+func EncodeJointConfiguration(joint JointConfiguration) []byte {
+	buf, err := encodeMsgPack(encodedJointConfiguration{Old: joint.Old, New: joint.New})
+	if err != nil {
+		panic(fmt.Errorf("failed to encode joint configuration: %v", err))
+	}
+	return buf.Bytes()
+}
+
+func DecodeJointConfiguration(buf []byte) (JointConfiguration, bool) {
+	var encoded encodedJointConfiguration
+	if err := decodeMsgPack(buf, &encoded); err != nil {
+		return JointConfiguration{}, false
+	}
+	if len(encoded.Old.Servers) == 0 || len(encoded.New.Servers) == 0 {
+		return JointConfiguration{}, false
+	}
+	return JointConfiguration{Old: encoded.Old, New: encoded.New}, true
 }

@@ -117,6 +117,15 @@ func (r *Raft) runFSM() {
 			start := time.Now()
 			configStore.StoreConfiguration(req.log.Index, DecodeConfiguration(req.log.Data))
 			metrics.MeasureSince([]string{"raft", "fsm", "store_config"}, start)
+
+		case LogJointConfiguration:
+			if !configStoreEnabled {
+				return
+			}
+
+			if joint, ok := DecodeJointConfiguration(req.log.Data); ok {
+				configStore.StoreConfiguration(req.log.Index, mergeConfigurations(joint.Old, joint.New))
+			}
 		}
 
 		// Update the indexes

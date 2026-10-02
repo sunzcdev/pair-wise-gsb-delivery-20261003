@@ -131,7 +131,7 @@ const (
 	// SnapshotVersionMin is the minimum snapshot version
 	SnapshotVersionMin SnapshotVersion = 0
 	// SnapshotVersionMax is the maximum snapshot version
-	SnapshotVersionMax = 1
+	SnapshotVersionMax = 2
 )
 
 // Config provides any necessary configuration for the Raft server.

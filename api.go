@@ -77,6 +77,10 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrMembershipChangeInProgress is returned when a membership change is
+	// submitted while another one has not reached its final configuration.
+	ErrMembershipChangeInProgress = errors.New("membership change in progress")
 )
 
 // Raft implements a Raft node.
@@ -155,6 +159,9 @@ type Raft struct {
 	// Used to request the leader to make configuration changes.
 	configurationChangeCh chan *configurationChangeFuture
 
+	// Used to request a complete joint-consensus membership transition.
+	jointConfigurationChangeCh chan *jointConfigurationChangeFuture
+
 	// Tracks the latest configuration and latest committed configuration from
 	// the log/snapshot.
 	configurations configurations
@@ -162,6 +169,9 @@ type Raft struct {
 	// Holds a copy of the latest configuration which can be read independently
 	// of the main loop.
 	latestConfiguration atomic.Value
+
+	// Holds a copy of the current membership-change status for lock-free reads.
+	membershipChangeStatus atomic.Value
 
 	// RPC chan comes from the transport layer
 	rpcCh <-chan RPC
@@ -422,7 +432,7 @@ func RecoverCluster(conf *Config, fsm FSM, logs LogStore, stable StableStore,
 	if err != nil {
 		return fmt.Errorf("failed to snapshot FSM: %v", err)
 	}
-	version := getSnapshotVersion(conf.ProtocolVersion)
+	version := getSnapshotVersion(conf.ProtocolVersion, false)
 	sink, err := snaps.Create(version, lastIndex, lastTerm, configuration, 1, trans)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %v", err)
@@ -554,40 +564,42 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	_, transportSupportPreVote := trans.(WithPreVote)
 	// Create Raft struct.
 	r := &Raft{
-		protocolVersion:       protocolVersion,
-		applyCh:               applyCh,
-		fsm:                   fsm,
-		fsmMutateCh:           make(chan interface{}, 128),
-		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
-		leaderCh:              make(chan bool, 1),
-		localID:               localID,
-		localAddr:             localAddr,
-		logger:                logger,
-		logs:                  logs,
-		configurationChangeCh: make(chan *configurationChangeFuture),
-		configurations:        configurations{},
-		rpcCh:                 trans.Consumer(),
-		snapshots:             snaps,
-		userSnapshotCh:        make(chan *userSnapshotFuture),
-		userRestoreCh:         make(chan *userRestoreFuture),
-		shutdownCh:            make(chan struct{}),
-		stable:                stable,
-		trans:                 trans,
-		verifyCh:              make(chan *verifyFuture, 64),
-		configurationsCh:      make(chan *configurationsFuture, 8),
-		bootstrapCh:           make(chan *bootstrapFuture),
-		observers:             make(map[uint64]*Observer),
-		leadershipTransferCh:  make(chan *leadershipTransferFuture, 1),
-		leaderNotifyCh:        make(chan struct{}, 1),
-		followerNotifyCh:      make(chan struct{}, 1),
-		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
-		preVoteDisabled:       conf.PreVoteDisabled || !transportSupportPreVote,
-		noLegacyTelemetry:     conf.NoLegacyTelemetry,
-		RestoreCommittedLogs:  conf.RestoreCommittedLogs,
+		protocolVersion:            protocolVersion,
+		applyCh:                    applyCh,
+		fsm:                        fsm,
+		fsmMutateCh:                make(chan interface{}, 128),
+		fsmSnapshotCh:              make(chan *reqSnapshotFuture),
+		leaderCh:                   make(chan bool, 1),
+		localID:                    localID,
+		localAddr:                  localAddr,
+		logger:                     logger,
+		logs:                       logs,
+		configurationChangeCh:      make(chan *configurationChangeFuture),
+		jointConfigurationChangeCh: make(chan *jointConfigurationChangeFuture),
+		configurations:             configurations{},
+		rpcCh:                      trans.Consumer(),
+		snapshots:                  snaps,
+		userSnapshotCh:             make(chan *userSnapshotFuture),
+		userRestoreCh:              make(chan *userRestoreFuture),
+		shutdownCh:                 make(chan struct{}),
+		stable:                     stable,
+		trans:                      trans,
+		verifyCh:                   make(chan *verifyFuture, 64),
+		configurationsCh:           make(chan *configurationsFuture, 8),
+		bootstrapCh:                make(chan *bootstrapFuture),
+		observers:                  make(map[uint64]*Observer),
+		leadershipTransferCh:       make(chan *leadershipTransferFuture, 1),
+		leaderNotifyCh:             make(chan struct{}, 1),
+		followerNotifyCh:           make(chan struct{}, 1),
+		mainThreadSaturation:       newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
+		preVoteDisabled:            conf.PreVoteDisabled || !transportSupportPreVote,
+		noLegacyTelemetry:          conf.NoLegacyTelemetry,
+		RestoreCommittedLogs:       conf.RestoreCommittedLogs,
 	}
 	if !transportSupportPreVote && !conf.PreVoteDisabled {
 		r.logger.Warn("pre-vote is disabled because it is not supported by the Transport")
 	}
+	r.membershipChangeStatus.Store(MembershipChangeStatus{Phase: MembershipChangeStable})
 
 	r.conf.Store(*conf)
 
@@ -620,6 +632,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 			return nil, err
 		}
 	}
+	r.refreshMembershipChangeStatusOnStart()
 	r.logger.Info("initial configuration",
 		"index", r.configurations.latestIndex,
 		"servers", hclog.Fmt("%+v", r.configurations.latest.Servers))
@@ -674,8 +687,13 @@ func (r *Raft) restoreSnapshot() error {
 			}
 			index = snapshot.Index
 		}
-		r.setCommittedConfiguration(conf, index)
-		r.setLatestConfiguration(conf, index)
+		if snapshot.JointConfiguration != nil {
+			r.setCommittedJointConfiguration(snapshot.JointConfiguration, snapshot.JointConfigurationIndex)
+			r.restoreCommittedConfiguration()
+		} else {
+			r.setCommittedConfiguration(conf, index)
+			r.setLatestConfiguration(conf, index)
+		}
 
 		// Success!
 		return nil
@@ -948,6 +966,46 @@ func (r *Raft) GetConfiguration() ConfigurationFuture {
 	configReq.configurations = configurations{latest: r.getLatestConfiguration()}
 	configReq.respond(nil)
 	return configReq
+}
+
+// ChangeConfiguration atomically replaces the cluster's voting configuration.
+// Raft first commits a joint configuration requiring majorities from both
+// the current and target configurations, then commits the target
+// configuration. Only one membership change may be active at a time.
+func (r *Raft) ChangeConfiguration(target Configuration, prevIndex uint64, timeout time.Duration) IndexFuture {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+	if err := checkConfiguration(target); err != nil {
+		return errorFuture{err}
+	}
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+	future := &jointConfigurationChangeFuture{target: target.Clone(), prevIndex: prevIndex}
+	future.init()
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case r.jointConfigurationChangeCh <- future:
+		return future
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
+}
+
+// MembershipChangeStatus returns the phase and last result of the latest
+// membership change. Phase is MembershipChangeStable when no change is active.
+func (r *Raft) MembershipChangeStatus() MembershipChangeStatus {
+	switch status := r.membershipChangeStatus.Load().(type) {
+	case MembershipChangeStatus:
+		status.Target = status.Target.Clone()
+		return status
+	default:
+		return MembershipChangeStatus{Phase: MembershipChangeStable}
+	}
 }
 
 // AddPeer to the cluster configuration. Must be run on the leader, or it will fail.

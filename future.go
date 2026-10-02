@@ -138,6 +138,19 @@ type configurationChangeFuture struct {
 	req configurationChangeRequest
 }
 
+// jointConfigurationChangeFuture tracks an application-submitted transition
+// to a complete target configuration.
+type jointConfigurationChangeFuture struct {
+	deferError
+	target    Configuration
+	prevIndex uint64
+	index     uint64
+}
+
+func (f *jointConfigurationChangeFuture) Index() uint64 {
+	return f.index
+}
+
 // bootstrapFuture is used to attempt a live bootstrap of the cluster. See the
 // Raft object's BootstrapCluster member function for more details.
 type bootstrapFuture struct {
@@ -237,10 +250,19 @@ type restoreFuture struct {
 // the leader. This is to prevent a stale read.
 type verifyFuture struct {
 	deferError
-	notifyCh   chan *verifyFuture
-	quorumSize int
-	votes      int
-	voteLock   sync.Mutex
+	notifyCh chan *verifyFuture
+	groups   []map[ServerID]struct{}
+	votes    []map[ServerID]struct{}
+	voteLock sync.Mutex
+}
+
+func (v *verifyFuture) reached() bool {
+	for i := range v.groups {
+		if len(v.votes[i]) < len(v.groups[i])/2+1 {
+			return false
+		}
+	}
+	return true
 }
 
 // leadershipTransferFuture is used to track the progress of a leadership
@@ -271,7 +293,7 @@ func (c *configurationsFuture) Index() uint64 {
 
 // vote is used to respond to a verifyFuture.
 // This may block when responding on the notifyCh.
-func (v *verifyFuture) vote(leader bool) {
+func (v *verifyFuture) vote(id ServerID, leader bool) {
 	v.voteLock.Lock()
 	defer v.voteLock.Unlock()
 
@@ -281,11 +303,18 @@ func (v *verifyFuture) vote(leader bool) {
 	}
 
 	if leader {
-		v.votes++
-		if v.votes >= v.quorumSize {
-			v.notifyCh <- v
-			v.notifyCh = nil
+		quorum := len(v.groups) > 0
+		for i := range v.groups {
+			if _, member := v.groups[i][id]; member {
+				v.votes[i][id] = struct{}{}
+			}
 		}
+		quorum = v.reached()
+		if !quorum {
+			return
+		}
+		v.notifyCh <- v
+		v.notifyCh = nil
 	} else {
 		v.notifyCh <- v
 		v.notifyCh = nil

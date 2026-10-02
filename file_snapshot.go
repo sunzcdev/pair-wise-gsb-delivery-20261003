@@ -159,8 +159,7 @@ func snapshotName(term, index uint64) string {
 // Create is used to start a new snapshot
 func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
-	// We only support version 1 snapshots at this time.
-	if version != 1 {
+	if version < 1 || version > 2 {
 		return nil, fmt.Errorf("unsupported snapshot version %d", version)
 	}
 
@@ -385,6 +384,11 @@ func (f *FileSnapshotStore) ReapSnapshots() error {
 // after the snapshot is finalized.
 func (s *FileSnapshotSink) ID() string {
 	return s.meta.ID
+}
+
+func (s *FileSnapshotSink) SetJointConfiguration(joint JointConfiguration, configurationIndex uint64) {
+	s.meta.JointConfiguration = &joint
+	s.meta.JointConfigurationIndex = configurationIndex
 }
 
 // Write is used to append to the state file. We write to the
