@@ -12,6 +12,10 @@ module Project
       true
     end
 
+    def show?
+      true
+    end
+
     alias_method :comment, :record
   end
 end

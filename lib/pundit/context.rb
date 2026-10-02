@@ -35,6 +35,7 @@ module Pundit
     def initialize(user:, policy_cache: CacheStore::NullStore.instance)
       @user = user
       @policy_cache = policy_cache
+      @batch_policies = {}
     end
 
     # @api public
@@ -59,17 +60,60 @@ module Pundit
     # @raise [NotAuthorizedError] if the given query method returned false
     # @return [Object] Always returns the passed object record
     # @since v2.3.2
-    def authorize(possibly_namespaced_record, query:, policy_class:)
+    def authorize(possibly_namespaced_record, query:, policy_class: nil)
       record = pundit_model(possibly_namespaced_record)
-      policy = if policy_class
-        policy_class.new(user, record)
-      else
-        policy!(possibly_namespaced_record)
-      end
+      policy = policy_for(possibly_namespaced_record, policy_class)
 
       raise NotAuthorizedError, query: query, record: record, policy: policy unless policy.public_send(query)
 
       record
+    end
+
+    # Evaluates multiple policy queries for multiple records.
+    #
+    # Query results are only deduplicated within this call. Policy instances may
+    # be reused, but permissions are not cached between calls.
+    #
+    # @param records [Enumerable] records to check permissions for
+    # @param queries [Enumerable<Symbol, String>] predicate methods to check
+    # @param policy_class [Class] the policy class we want to force use of
+    # @raise [BatchAuthorizationError] if a query cannot be evaluated
+    # @return [Array<Array(Boolean)>] matrix of query results in the given order
+    # @since v2.6.0
+    def policy_permissions(records, queries, policy_class: nil)
+      query_names = queries.map { |query| query.to_sym }
+      results = {}
+
+      records.each.with_index.map do |record, record_index|
+        identity = batch_policy_identity(record, policy_class)
+
+        query_names.map do |query|
+          result_key = [identity, query]
+          next results[result_key] if results.key?(result_key)
+
+          policy = @batch_policies.fetch(identity) do
+            @batch_policies[identity] = find_batch_policy(record, policy_class, record_index, query)
+          end
+
+          unless policy.respond_to?(query)
+            raise BatchAuthorizationError.new(
+              record_index: record_index,
+              query: query,
+              record: pundit_model(record)
+            )
+          end
+
+          results[result_key] = begin
+            !!policy.public_send(query)
+          rescue StandardError
+            raise BatchAuthorizationError.new(
+              record_index: record_index,
+              query: query,
+              record: pundit_model(record)
+            )
+          end
+        end
+      end
     end
 
     # Retrieves the policy for the given record.
@@ -167,6 +211,44 @@ module Pundit
         rescue ArgumentError
           raise InvalidConstructorError, "Invalid #<#{klass}> constructor is called"
         end
+      end
+    end
+
+    def policy_for(record, policy_class)
+      if policy_class
+        instantiate_policy(record, policy_class)
+      else
+        policy!(record)
+      end
+    end
+
+    def instantiate_policy(record, policy_class)
+      policy_class.new(user, pundit_model(record))
+    rescue ArgumentError
+      raise InvalidConstructorError, "Invalid #<#{policy_class}> constructor is called"
+    end
+
+    def find_batch_policy(record, policy_class, record_index, query)
+      klass = policy_class || policy_finder(record).policy!
+
+      begin
+        klass.new(user, pundit_model(record))
+      rescue ArgumentError
+        raise InvalidConstructorError, "Invalid #<#{klass}> constructor is called"
+      end
+    rescue StandardError
+      raise BatchAuthorizationError.new(
+        record_index: record_index,
+        query: query,
+        record: pundit_model(record)
+      )
+    end
+
+    def batch_policy_identity(record, policy_class)
+      if record.is_a?(Array)
+        [policy_class, record[0...-1], pundit_model(record).object_id]
+      else
+        [policy_class, record.object_id]
       end
     end
 

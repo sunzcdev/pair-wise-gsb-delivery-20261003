@@ -165,6 +165,28 @@ RSpec.describe Pundit::Authorization do
     end
   end
 
+  describe "#policy_permissions" do
+    it "returns a permission matrix for the current user" do
+      post.archived = true
+
+      expect(controller.policy_permissions([post], %i[show? edit? archive?]))
+        .to eq([[true, true, false]])
+    end
+
+    it "uses an explicit policy class" do
+      expect(controller.policy_permissions([post], %i[create?], policy_class: PublicationPolicy))
+        .to eq([[true]])
+    end
+
+    it "wraps policy lookup errors with the record index and query" do
+      expect { controller.policy_permissions([post, article], %i[show?]) }
+        .to raise_error(Pundit::BatchAuthorizationError) do |error|
+          expect(error.record_index).to eq(1)
+          expect(error.query).to eq(:show?)
+        end
+    end
+  end
+
   describe "#pundit_policies" do
     it "returns the cache of policies" do
       expect(controller.pundit_policies).to eq({})

@@ -76,5 +76,18 @@ module Pundit
     def policy!(user, *args, **kwargs, &block)
       Context.new(user: user).policy!(*args, **kwargs, &block)
     end
+
+    # @see Pundit::Context#policy_permissions
+    # @since v2.6.0
+    def policy_permissions(user, records, queries, policy_class: nil, cache: nil)
+      context = if cache
+        policy_cache = CacheStore::LegacyStore.new(cache)
+        Context.new(user: user, policy_cache: policy_cache)
+      else
+        Context.new(user: user)
+      end
+
+      context.policy_permissions(records, queries, policy_class: policy_class)
+    end
   end
 end

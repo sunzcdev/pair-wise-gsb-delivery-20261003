@@ -51,6 +51,28 @@ module Pundit
     end
   end
 
+  # Error that will be raised when a batch permission query cannot be evaluated.
+  # @since v2.6.0
+  class BatchAuthorizationError < Error
+    # @return [Integer] zero-based index of the record in the batch
+    attr_reader :record_index
+    # @return [Symbol] name of the policy query that could not be evaluated
+    attr_reader :query
+    # @return [Object] record that was being checked with the policy
+    attr_reader :record
+
+    # @param record_index [Integer] zero-based index of the record in the batch
+    # @param query [Symbol, String] name of the policy query
+    # @param record [Object] record that was being checked with the policy
+    def initialize(record_index:, query:, record:)
+      @record_index = record_index
+      @query = query.to_sym
+      @record = record
+
+      super("unable to evaluate query `#{@query}` for record at index #{record_index}")
+    end
+  end
+
   # Error that will be raised if a policy or policy scope constructor is not called correctly.
   # @since v2.0.0
   class InvalidConstructorError < Error; end

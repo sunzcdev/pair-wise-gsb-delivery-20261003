@@ -194,6 +194,29 @@ conditionally showing links or buttons in the view:
   <%= link_to "Edit post", edit_post_path(@post) %>
 <% end %>
 ```
+
+For lists, use `policy_permissions` to evaluate several queries for several
+records. It returns an array in the same order as the records and queries:
+
+```ruby
+def index
+  @posts = policy_scope(Post)
+  @permissions = policy_permissions(@posts, %i[show? edit? archive?])
+end
+```
+
+```erb
+<% @posts.each_with_index do |post, index| %>
+  <% show, edit, archive = @permissions[index] %>
+<% end %>
+```
+
+Within one call, a permission is evaluated only once for each object and query.
+Duplicate records still retain every position in the returned matrix. A normal
+policy denial returns `false`; missing policies, missing query methods, and
+errors raised by the policy raise `Pundit::BatchAuthorizationError` with
+`record_index` and `query`.
+
 ## Headless policies
 
 Given there is a policy without a corresponding model / ruby class,

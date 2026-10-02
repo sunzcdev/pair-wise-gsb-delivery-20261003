@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `Pundit::Context#policy_permissions` for batch permission checks.
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
 
 ### Deprecated

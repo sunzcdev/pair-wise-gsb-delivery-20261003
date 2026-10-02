@@ -22,6 +22,10 @@ class PostPolicy < BasePolicy
     true
   end
 
+  def archive?
+    !post.archived
+  end
+
   def permitted_attributes
     if post.user == user
       %i[title votes]

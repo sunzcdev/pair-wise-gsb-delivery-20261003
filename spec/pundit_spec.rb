@@ -446,6 +446,24 @@ RSpec.describe Pundit do
     end
   end
 
+  describe ".policy_permissions" do
+    it "returns a permission matrix in the given order" do
+      expect(Pundit.policy_permissions(user, [post], %i[show? edit? archive?]))
+        .to eq([[true, true, true]])
+    end
+
+    it "accepts an explicit policy class and cache" do
+      cache = {}
+      post.archived = true
+
+      expect(Pundit.policy_permissions(user, [post], %i[archive?], cache: cache))
+        .to eq([[false]])
+      result = Pundit.policy_permissions(user, [post], %i[show?], cache: cache)
+
+      expect(result).to eq([[true]])
+    end
+  end
+
   describe ".included" do
     it "includes Authorization module" do
       klass = Class.new

@@ -17,6 +17,7 @@ module Pundit
       helper Helper if respond_to?(:helper)
       if respond_to?(:helper_method)
         helper_method :policy
+        helper_method :policy_permissions
         helper_method :pundit_policy_scope
         helper_method :pundit_user
       end
@@ -162,6 +163,18 @@ module Pundit
     # @since v0.1.0
     def policy(record)
       pundit.policy!(record)
+    end
+
+    # Retrieves permission values for multiple records and queries.
+    #
+    # @param records [Enumerable] the objects we're checking permissions for
+    # @param queries [Enumerable<Symbol, String>] the predicate methods to check
+    # @param policy_class [Class] the policy class we want to force use of
+    # @return [Array<Array(Boolean)>] matrix of query results
+    # @see Pundit::Context#policy_permissions
+    # @since v2.6.0
+    def policy_permissions(records, queries, policy_class: nil)
+      pundit.policy_permissions(records, queries, policy_class: policy_class)
     end
 
     # @!group Policy Scopes

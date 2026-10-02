@@ -1,8 +1,11 @@
 # frozen_string_literal: true
 
 class Post
+  attr_accessor :archived
+
   def initialize(user = nil)
     @user = user
+    @archived = false
   end
 
   attr_reader :user
