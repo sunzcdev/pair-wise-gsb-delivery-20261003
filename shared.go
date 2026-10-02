@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/go-jose/go-jose/v4/json"
 )
@@ -86,7 +87,41 @@ var (
 
 	// ErrNotPublic indicates a private key was passed where a public key was expected
 	ErrNotPublic = errors.New("go-jose/go-jose: public key was unexpectedly not public")
+
+	// ErrECDH1PUNotEnabled is returned when an experimental ECDH-1PU key
+	// management algorithm is used without first opting in via EnableECDH1PU.
+	ErrECDH1PUNotEnabled = errors.New("go-jose/go-jose: ECDH-1PU is experimental (draft-madden-jose-ecdh-1pu-04) and must be explicitly enabled with EnableECDH1PU")
 )
+
+// ecdh1puEnabled records whether the experimental ECDH-1PU key management
+// algorithms have been explicitly enabled via EnableECDH1PU.
+var ecdh1puEnabled atomic.Bool
+
+// EnableECDH1PU opts in to the experimental ECDH-1PU key management
+// algorithms (ECDH-1PU+A128KW, ECDH-1PU+A192KW, ECDH-1PU+A256KW) as described
+// in draft-madden-jose-ecdh-1pu-04 ("Public Key Authenticated Encryption for
+// JOSE: ECDH-1PU").
+//
+// These algorithms are defined by an Internet-Draft, not a published RFC.
+// They are experimental, may change incompatibly in the future, and are
+// therefore rejected during encryption and decryption unless this function
+// has been called. Enabling is process-global and cannot be undone.
+//
+// Callers remain responsible for authenticating the sender's static public
+// key out-of-band: see ECDH1PUDecryptionKey.
+func EnableECDH1PU() {
+	ecdh1puEnabled.Store(true)
+}
+
+// isECDH1PUAlgorithm reports whether alg is one of the experimental ECDH-1PU
+// key management algorithms.
+func isECDH1PUAlgorithm(alg KeyAlgorithm) bool {
+	switch alg {
+	case ECDH1PU_A128KW, ECDH1PU_A192KW, ECDH1PU_A256KW:
+		return true
+	}
+	return false
+}
 
 // Key management algorithms
 const (
@@ -102,6 +137,9 @@ const (
 	ECDH_ES_A128KW     = KeyAlgorithm("ECDH-ES+A128KW")     // ECDH-ES + AES key wrap (128)
 	ECDH_ES_A192KW     = KeyAlgorithm("ECDH-ES+A192KW")     // ECDH-ES + AES key wrap (192)
 	ECDH_ES_A256KW     = KeyAlgorithm("ECDH-ES+A256KW")     // ECDH-ES + AES key wrap (256)
+	ECDH1PU_A128KW     = KeyAlgorithm("ECDH-1PU+A128KW")    // ECDH-1PU + AES key wrap (128) (experimental, see EnableECDH1PU)
+	ECDH1PU_A192KW     = KeyAlgorithm("ECDH-1PU+A192KW")    // ECDH-1PU + AES key wrap (192) (experimental, see EnableECDH1PU)
+	ECDH1PU_A256KW     = KeyAlgorithm("ECDH-1PU+A256KW")    // ECDH-1PU + AES key wrap (256) (experimental, see EnableECDH1PU)
 	A128GCMKW          = KeyAlgorithm("A128GCMKW")          // AES-GCM key wrap (128)
 	A192GCMKW          = KeyAlgorithm("A192GCMKW")          // AES-GCM key wrap (192)
 	A256GCMKW          = KeyAlgorithm("A256GCMKW")          // AES-GCM key wrap (256)
@@ -158,12 +196,13 @@ const (
 	headerCompression = "zip"  // CompressionAlgorithm
 	headerCritical    = "crit" // []string
 
-	headerAPU = "apu" // *byteBuffer
-	headerAPV = "apv" // *byteBuffer
-	headerEPK = "epk" // *JSONWebKey
-	headerIV  = "iv"  // *byteBuffer
-	headerTag = "tag" // *byteBuffer
-	headerX5c = "x5c" // []*x509.Certificate
+	headerAPU  = "apu"  // *byteBuffer
+	headerAPV  = "apv"  // *byteBuffer
+	headerEPK  = "epk"  // *JSONWebKey
+	headerIV   = "iv"   // *byteBuffer
+	headerTag  = "tag"  // *byteBuffer
+	headerX5c  = "x5c"  // []*x509.Certificate
+	headerSKID = "skid" // string
 
 	headerJWK   = "jwk"   // *JSONWebKey
 	headerKeyID = "kid"   // string

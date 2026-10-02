@@ -119,6 +119,16 @@ func (eo *EncrypterOptions) WithType(typ ContentType) *EncrypterOptions {
 // PBES2-HS384+A192KW, and PBES2-HS512+A256KW. If they are not provided a safe
 // default of 100000 will be used for the count and a 128-bit random salt will
 // be generated.
+//
+// SenderKey, APU, and APV are only used with the experimental ECDH-1PU key
+// management algorithms (ECDH-1PU+A128KW, ECDH-1PU+A192KW, ECDH-1PU+A256KW;
+// see EnableECDH1PU) and are ignored by all other algorithms. SenderKey is
+// the sender's static private key and must be an *ecdsa.PrivateKey,
+// JSONWebKey, or *JSONWebKey on the same curve as the recipient's Key. If it
+// is a JSONWebKey with a KeyID, the key ID is sent as the "skid" header
+// parameter. APU and APV are the "apu" (PartyUInfo) and "apv" (PartyVInfo)
+// values fed into the key derivation and sent as header parameters; both
+// parties must agree on them out-of-band.
 type Recipient struct {
 	Algorithm KeyAlgorithm
 	// Key must have one of these types:
@@ -135,6 +145,27 @@ type Recipient struct {
 	KeyID      string
 	PBES2Count int
 	PBES2Salt  []byte
+	SenderKey  interface{}
+	APU, APV   []byte
+}
+
+// ECDH1PUDecryptionKey bundles the key material required to decrypt a JWE
+// that uses an experimental ECDH-1PU key management algorithm
+// (draft-madden-jose-ecdh-1pu-04; see EnableECDH1PU). It can be passed as the
+// decryption key to JSONWebEncryption.Decrypt and related functions.
+//
+// RecipientKey is the recipient's static private key (*ecdsa.PrivateKey,
+// JSONWebKey, or *JSONWebKey).
+//
+// SenderKey is the sender's static public key (*ecdsa.PublicKey, JSONWebKey,
+// or *JSONWebKey). It must have been authenticated out-of-band by the caller:
+// the message itself must never be trusted to identify the sender. In
+// particular, the "skid" header parameter of a message is never used to
+// select the sender key; it is only checked for consistency with SenderKey's
+// key ID, if one is known.
+type ECDH1PUDecryptionKey struct {
+	RecipientKey interface{}
+	SenderKey    interface{}
 }
 
 // NewEncrypter creates an appropriate encrypter based on the key type
@@ -257,6 +288,18 @@ func (ctx *genericEncrypter) addRecipient(recipient Recipient) (err error) {
 		return fmt.Errorf("go-jose/go-jose: key algorithm '%s' not supported in multi-recipient mode", recipient.Algorithm)
 	}
 
+	if isECDH1PUAlgorithm(recipient.Algorithm) {
+		recipientInfo, err = makeECDH1PURecipient(recipient)
+		if err != nil {
+			return err
+		}
+		if recipient.KeyID != "" {
+			recipientInfo.keyID = recipient.KeyID
+		}
+		ctx.recipients = append(ctx.recipients, recipientInfo)
+		return nil
+	}
+
 	recipientInfo, err = makeJWERecipient(recipient.Algorithm, recipient.Key)
 	if err != nil {
 		return err
@@ -302,6 +345,88 @@ func makeJWERecipient(alg KeyAlgorithm, encryptionKey interface{}) (recipientKey
 	return recipientKeyInfo{}, ErrUnsupportedKeyType
 }
 
+// makeECDH1PURecipient creates a recipientKeyInfo for one of the experimental
+// ECDH-1PU key management algorithms (draft-madden-jose-ecdh-1pu-04). The
+// feature must have been explicitly enabled via EnableECDH1PU.
+func makeECDH1PURecipient(recipient Recipient) (recipientKeyInfo, error) {
+	if !ecdh1puEnabled.Load() {
+		return recipientKeyInfo{}, ErrECDH1PUNotEnabled
+	}
+
+	recipientPub, _ := asECDSAPublicKey(recipient.Key)
+	if recipientPub == nil {
+		return recipientKeyInfo{}, ErrUnsupportedKeyType
+	}
+	if _, err := curveName(recipientPub.Curve); err != nil {
+		return recipientKeyInfo{}, err
+	}
+	if !recipientPub.Curve.IsOnCurve(recipientPub.X, recipientPub.Y) {
+		return recipientKeyInfo{}, errors.New("go-jose/go-jose: invalid public key")
+	}
+
+	senderPriv, _ := asECDSAPrivateKey(recipient.SenderKey)
+	if senderPriv == nil {
+		return recipientKeyInfo{}, errors.New("go-jose/go-jose: ECDH-1PU requires a sender private key (Recipient.SenderKey)")
+	}
+	if senderPriv.Curve != recipientPub.Curve {
+		return recipientKeyInfo{}, errors.New("go-jose/go-jose: sender and recipient keys are not on the same curve")
+	}
+
+	info := recipientKeyInfo{
+		keyAlg: recipient.Algorithm,
+		keyEncrypter: &ec1puEncrypter{
+			recipientPublicKey: recipientPub,
+			senderPrivateKey:   senderPriv,
+			senderKeyID:        keyIDFromJWK(recipient.SenderKey),
+			apuData:            recipient.APU,
+			apvData:            recipient.APV,
+		},
+	}
+	info.keyID = keyIDFromJWK(recipient.Key)
+	return info, nil
+}
+
+// asECDSAPublicKey extracts an ECDSA public key from a raw key or JWK.
+func asECDSAPublicKey(key interface{}) (*ecdsa.PublicKey, bool) {
+	switch k := key.(type) {
+	case *ecdsa.PublicKey:
+		return k, true
+	case JSONWebKey:
+		pub, ok := k.Key.(*ecdsa.PublicKey)
+		return pub, ok
+	case *JSONWebKey:
+		pub, ok := k.Key.(*ecdsa.PublicKey)
+		return pub, ok
+	}
+	return nil, false
+}
+
+// asECDSAPrivateKey extracts an ECDSA private key from a raw key or JWK.
+func asECDSAPrivateKey(key interface{}) (*ecdsa.PrivateKey, bool) {
+	switch k := key.(type) {
+	case *ecdsa.PrivateKey:
+		return k, true
+	case JSONWebKey:
+		priv, ok := k.Key.(*ecdsa.PrivateKey)
+		return priv, ok
+	case *JSONWebKey:
+		priv, ok := k.Key.(*ecdsa.PrivateKey)
+		return priv, ok
+	}
+	return nil, false
+}
+
+// keyIDFromJWK returns the key ID if the given key is a JWK with one.
+func keyIDFromJWK(key interface{}) string {
+	switch k := key.(type) {
+	case JSONWebKey:
+		return k.KeyID
+	case *JSONWebKey:
+		return k.KeyID
+	}
+	return ""
+}
+
 // newDecrypter creates an appropriate decrypter based on the key type
 func newDecrypter(decryptionKey interface{}) (keyDecrypter, error) {
 	switch decryptionKey := decryptionKey.(type) {
@@ -325,11 +450,49 @@ func newDecrypter(decryptionKey interface{}) (keyDecrypter, error) {
 		return newDecrypter(decryptionKey.Key)
 	case *JSONWebKey:
 		return newDecrypter(decryptionKey.Key)
+	case ECDH1PUDecryptionKey:
+		return newECDH1PUDecrypter(decryptionKey)
+	case *ECDH1PUDecryptionKey:
+		return newECDH1PUDecrypter(*decryptionKey)
 	case OpaqueKeyDecrypter:
 		return &opaqueKeyDecrypter{decrypter: decryptionKey}, nil
 	default:
 		return nil, ErrUnsupportedKeyType
 	}
+}
+
+// newECDH1PUDecrypter creates a keyDecrypter for the experimental ECDH-1PU
+// key management algorithms (draft-madden-jose-ecdh-1pu-04). The feature must
+// have been explicitly enabled via EnableECDH1PU.
+func newECDH1PUDecrypter(key ECDH1PUDecryptionKey) (keyDecrypter, error) {
+	if !ecdh1puEnabled.Load() {
+		return nil, ErrECDH1PUNotEnabled
+	}
+
+	recipientPriv, _ := asECDSAPrivateKey(key.RecipientKey)
+	if recipientPriv == nil {
+		return nil, ErrUnsupportedKeyType
+	}
+	if _, err := curveName(recipientPriv.Curve); err != nil {
+		return nil, err
+	}
+
+	senderPub, _ := asECDSAPublicKey(key.SenderKey)
+	if senderPub == nil {
+		return nil, ErrUnsupportedKeyType
+	}
+	if !senderPub.Curve.IsOnCurve(senderPub.X, senderPub.Y) {
+		return nil, errors.New("go-jose/go-jose: invalid sender public key")
+	}
+	if senderPub.Curve != recipientPriv.Curve {
+		return nil, errors.New("go-jose/go-jose: sender and recipient keys are not on the same curve")
+	}
+
+	return &ec1puDecrypter{
+		recipientPrivateKey: recipientPriv,
+		senderPublicKey:     senderPub,
+		senderKeyID:         keyIDFromJWK(key.SenderKey),
+	}, nil
 }
 
 // Implementation of encrypt method producing a JWE object.
@@ -449,6 +612,7 @@ func validateContentEncryptionKeySize(cek []byte, cipher contentCipher) error {
 //   - JSONWebKeySet
 //   - []byte (a symmetric key)
 //   - string (a symmetric key)
+//   - ECDH1PUDecryptionKey or *ECDH1PUDecryptionKey (experimental ECDH-1PU)
 //   - Any type that satisfies the OpaqueKeyDecrypter interface.
 //
 // Note that ed25519 is only available for signatures, not encryption, so is

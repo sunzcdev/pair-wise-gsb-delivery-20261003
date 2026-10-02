@@ -57,9 +57,18 @@ standard where possible. The Godoc reference has a list of constants.
 | AES-GCM key wrap       | A128GCMKW, A192GCMKW, A256GCMKW                |
 | ECDH-ES + AES key wrap | ECDH-ES+A128KW, ECDH-ES+A192KW, ECDH-ES+A256KW |
 | ECDH-ES (direct)       | ECDH-ES<sup>1</sup>                            |
+| ECDH-1PU + AES key wrap | ECDH-1PU+A128KW, ECDH-1PU+A192KW, ECDH-1PU+A256KW<sup>3</sup> |
 | Direct encryption      | dir<sup>1</sup>                                |
 
 <sup>1. Not supported in multi-recipient mode</sup>
+
+<sup>3. Experimental: implements the Internet-Draft
+[draft-madden-jose-ecdh-1pu-04](https://datatracker.ietf.org/doc/html/draft-madden-jose-ecdh-1pu-04),
+which is not a published RFC and may still change. These algorithms are
+rejected unless explicitly enabled via `EnableECDH1PU`. Recipients must
+authenticate the sender's static public key out-of-band and supply it via
+`ECDH1PUDecryptionKey`; the "skid" header of a message is never used to
+select the sender key.</sup>
 
 | Signing / MAC     | Algorithm identifier(s) |
 |:------------------|:------------------------|

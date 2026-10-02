@@ -246,7 +246,7 @@ func (parsed *rawJSONWebEncryption) sanitized(
 		}
 		err := validateAlgEnc(headers, keyEncryptionAlgorithms, contentEncryption)
 		if err != nil {
-			return nil, fmt.Errorf("go-jose/go-jose: recipient %d: %s", i, err)
+			return nil, fmt.Errorf("go-jose/go-jose: recipient %d: %w", i, err)
 		}
 
 	}
@@ -275,6 +275,9 @@ func (parsed *rawJSONWebEncryption) sanitized(
 func validateAlgEnc(headers rawHeader, keyAlgorithms []KeyAlgorithm, contentEncryption []ContentEncryption) error {
 	alg := headers.getAlgorithm()
 	enc := headers.getEncryption()
+	if isECDH1PUAlgorithm(alg) && !ecdh1puEnabled.Load() {
+		return ErrECDH1PUNotEnabled
+	}
 	if alg != "" && !containsKeyAlgorithm(keyAlgorithms, alg) {
 		return fmt.Errorf("unexpected key algorithm %q; expected %q", alg, keyAlgorithms)
 	}

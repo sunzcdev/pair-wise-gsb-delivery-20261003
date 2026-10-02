@@ -60,9 +60,25 @@ type ecKeyGenerator struct {
 	publicKey *ecdsa.PublicKey
 }
 
+// A key encrypter for ECDH-1PU (experimental, draft-madden-jose-ecdh-1pu-04)
+type ec1puEncrypter struct {
+	recipientPublicKey *ecdsa.PublicKey
+	senderPrivateKey   *ecdsa.PrivateKey
+	senderKeyID        string
+	apuData            []byte
+	apvData            []byte
+}
+
 // A generic EC-based decrypter/signer
 type ecDecrypterSigner struct {
 	privateKey *ecdsa.PrivateKey
+}
+
+// A key decrypter for ECDH-1PU (experimental, draft-madden-jose-ecdh-1pu-04)
+type ec1puDecrypter struct {
+	recipientPrivateKey *ecdsa.PrivateKey
+	senderPublicKey     *ecdsa.PublicKey
+	senderKeyID         string
 }
 
 type edDecrypterSigner struct {
@@ -388,6 +404,155 @@ func (ctx ecEncrypterVerifier) encryptKey(cek []byte, alg KeyAlgorithm) (recipie
 // Get key size for EC key generator
 func (ctx ecKeyGenerator) keySize() int {
 	return ctx.size
+}
+
+// ecdh1puKeySize returns the size in bytes of the key encryption key used
+// with the given ECDH-1PU algorithm.
+func ecdh1puKeySize(alg KeyAlgorithm) (int, error) {
+	switch alg {
+	case ECDH1PU_A128KW:
+		return 16, nil
+	case ECDH1PU_A192KW:
+		return 24, nil
+	case ECDH1PU_A256KW:
+		return 32, nil
+	}
+	return 0, ErrUnsupportedAlgorithm
+}
+
+// Encrypt the given payload and update the object, using ECDH-1PU key
+// agreement with key wrapping (experimental, draft-madden-jose-ecdh-1pu-04).
+func (ctx ec1puEncrypter) encryptKey(cek []byte, alg KeyAlgorithm) (recipientInfo, error) {
+	keySize, err := ecdh1puKeySize(alg)
+	if err != nil {
+		return recipientInfo{}, err
+	}
+
+	// Generate an ephemeral key pair on the recipient's curve.
+	ephemeral, err := ecdsa.GenerateKey(ctx.recipientPublicKey.Curve, randReader)
+	if err != nil {
+		return recipientInfo{}, err
+	}
+
+	// Ze is computed from the ephemeral key and the recipient's static key,
+	// Zs from the sender's static key and the recipient's static key.
+	kek := josecipher.DeriveECDH1PU(string(alg), ctx.apuData, ctx.apvData, ephemeral, ctx.recipientPublicKey, ctx.senderPrivateKey, ctx.recipientPublicKey, keySize)
+
+	block, err := aes.NewCipher(kek)
+	if err != nil {
+		return recipientInfo{}, err
+	}
+
+	jek, err := josecipher.KeyWrap(block, cek)
+	if err != nil {
+		return recipientInfo{}, err
+	}
+
+	b, err := json.Marshal(&JSONWebKey{
+		Key: &ephemeral.PublicKey,
+	})
+	if err != nil {
+		return recipientInfo{}, err
+	}
+
+	header := &rawHeader{
+		headerEPK: makeRawMessage(b),
+	}
+
+	if ctx.senderKeyID != "" {
+		err = header.set(headerSKID, ctx.senderKeyID)
+		if err != nil {
+			return recipientInfo{}, err
+		}
+	}
+	if len(ctx.apuData) > 0 {
+		err = header.set(headerAPU, newBuffer(ctx.apuData))
+		if err != nil {
+			return recipientInfo{}, err
+		}
+	}
+	if len(ctx.apvData) > 0 {
+		err = header.set(headerAPV, newBuffer(ctx.apvData))
+		if err != nil {
+			return recipientInfo{}, err
+		}
+	}
+
+	return recipientInfo{
+		encryptedKey: jek,
+		header:       header,
+	}, nil
+}
+
+// Decrypt the given payload and return the content encryption key, using
+// ECDH-1PU key agreement with key wrapping (experimental,
+// draft-madden-jose-ecdh-1pu-04). The sender's static public key must have
+// been authenticated out-of-band by the caller; the "skid" header is only
+// checked for consistency with it, never used to select a key.
+func (ctx ec1puDecrypter) decryptKey(headers rawHeader, recipient *recipientInfo, generator keyGenerator) ([]byte, error) {
+	if !ecdh1puEnabled.Load() {
+		return nil, ErrECDH1PUNotEnabled
+	}
+	if recipient == nil {
+		return nil, errors.New("go-jose/go-jose: missing recipient")
+	}
+
+	algorithm := headers.getAlgorithm()
+	keySize, err := ecdh1puKeySize(algorithm)
+	if err != nil {
+		return nil, err
+	}
+
+	epk, err := headers.getEPK()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid epk header")
+	}
+	if epk == nil {
+		return nil, errors.New("go-jose/go-jose: missing epk header")
+	}
+
+	publicKey, ok := epk.Key.(*ecdsa.PublicKey)
+	if publicKey == nil || !ok {
+		return nil, errors.New("go-jose/go-jose: invalid epk header")
+	}
+
+	if !ctx.recipientPrivateKey.Curve.IsOnCurve(publicKey.X, publicKey.Y) {
+		return nil, errors.New("go-jose/go-jose: invalid public key in epk header")
+	}
+
+	// The "skid" header is attacker-controlled and must never be used to
+	// select the sender key. If the caller supplied a key ID for the
+	// (already authenticated) sender key, only check consistency.
+	if ctx.senderKeyID != "" {
+		if skid := headers.getString(headerSKID); skid != "" && skid != ctx.senderKeyID {
+			return nil, errors.New("go-jose/go-jose: skid header does not match the sender key")
+		}
+	}
+
+	apuData, err := headers.getAPU()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid apu header")
+	}
+	apvData, err := headers.getAPV()
+	if err != nil {
+		return nil, errors.New("go-jose/go-jose: invalid apv header")
+	}
+
+	// Ze is computed from the recipient's static key and the ephemeral key,
+	// Zs from the recipient's static key and the sender's static key.
+	kek := josecipher.DeriveECDH1PU(string(algorithm), apuData.bytes(), apvData.bytes(), ctx.recipientPrivateKey, publicKey, ctx.recipientPrivateKey, ctx.senderPublicKey, keySize)
+
+	encryptedKey := recipient.encryptedKey
+	if len(encryptedKey) == 0 {
+		return nil, errors.New("go-jose/go-jose: missing JWE Encrypted Key")
+	}
+
+	block, err := aes.NewCipher(kek)
+	if err != nil {
+		return nil, err
+	}
+
+	return josecipher.KeyUnwrap(block, encryptedKey)
 }
 
 // Get a content encryption key for ECDH-ES

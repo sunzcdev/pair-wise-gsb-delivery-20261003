@@ -46,6 +46,22 @@ func DeriveECDHES(alg string, apuData, apvData []byte, priv *ecdsa.PrivateKey, p
 		panic("public key not on same curve as private key")
 	}
 
+	zBytes := deriveZ(priv, pub)
+
+	reader := NewConcatKDF(crypto.SHA256, zBytes, algID, ptyUInfo, ptyVInfo, supPubInfo, []byte{})
+	key := make([]byte, size)
+
+	// Read on the KDF will never fail
+	_, _ = reader.Read(key)
+
+	return key
+}
+
+// deriveZ computes the raw ECDH shared secret between the given private and
+// public key, left-padded with zero bytes to the full size of a coordinate on
+// the curve. Callers must ensure that the keys are valid and on the same
+// curve before calling this function.
+func deriveZ(priv *ecdsa.PrivateKey, pub *ecdsa.PublicKey) []byte {
 	z, _ := priv.Curve.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
 	zBytes := z.Bytes()
 
@@ -58,13 +74,7 @@ func DeriveECDHES(alg string, apuData, apvData []byte, priv *ecdsa.PrivateKey, p
 		zBytes = append(bytes.Repeat([]byte{0}, octSize-len(zBytes)), zBytes...)
 	}
 
-	reader := NewConcatKDF(crypto.SHA256, zBytes, algID, ptyUInfo, ptyVInfo, supPubInfo, []byte{})
-	key := make([]byte, size)
-
-	// Read on the KDF will never fail
-	_, _ = reader.Read(key)
-
-	return key
+	return zBytes
 }
 
 // dSize returns the size in octets for a coordinate on a elliptic curve.
