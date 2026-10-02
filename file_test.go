@@ -16,6 +16,8 @@ package ini
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"runtime"
 	"sort"
@@ -534,4 +536,146 @@ v = 3
 
 	require.NoError(t, f.Reload())
 	assert.Equal(t, []string{"1", "2", "3"}, f.Section("slice").Key("v").ValueWithShadows())
+}
+
+var errFlakyRead = errors.New("flaky reader: read failed midway")
+
+// flakyReadCloser serves data but can be told to fail with errFlakyRead after
+// serving failAfter bytes. Close resets the read offset so the source can be
+// re-read on the next reload, and may itself return a closeErr.
+type flakyReadCloser struct {
+	data      []byte
+	off       int
+	failAfter int // -1 disables the failure
+	closeErr  error
+}
+
+func (r *flakyReadCloser) Read(p []byte) (int, error) {
+	if r.failAfter >= 0 && r.off >= r.failAfter {
+		return 0, errFlakyRead
+	}
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func (r *flakyReadCloser) Close() error {
+	r.off = 0
+	return r.closeErr
+}
+
+func TestFile_ReloadTransactional(t *testing.T) {
+	t.Run("failed source keeps old config and retry leaves no partial keys", func(t *testing.T) {
+		flaky := &flakyReadCloser{
+			data:      []byte("[second]\nkey2 = val2\n"),
+			failAfter: -1,
+		}
+		f, err := LoadSources(LoadOptions{AllowShadows: true},
+			[]byte(`; section comment
+[first]
+# key comment
+key1 = val1
+sh = a
+sh = b
+`),
+			flaky,
+		)
+		require.NoError(t, err)
+		require.NotNil(t, f)
+
+		// The second source fails midway through the read, after the parser
+		// has already consumed a key that only exists in this attempt.
+		flaky.data = []byte("[second]\nghost = 1\nkey2 = val2-new\n")
+		flaky.failAfter = 10
+		err = f.ReloadTransactional()
+		require.Error(t, err)
+
+		reloadErr, ok := err.(ErrReloadSource)
+		require.True(t, ok, "expected ErrReloadSource, got %T", err)
+		assert.Equal(t, 1, reloadErr.Index)
+		assert.True(t, errors.Is(err, errFlakyRead))
+
+		// The old configuration is still fully queryable: sections, keys,
+		// comments and shadows are preserved.
+		sec := f.Section("first")
+		assert.Equal(t, "; section comment", sec.Comment)
+		key := sec.Key("key1")
+		assert.Equal(t, "# key comment", key.Comment)
+		assert.Equal(t, "val1", key.String())
+		assert.Equal(t, []string{"a", "b"}, sec.Key("sh").ValueWithShadows())
+		assert.Equal(t, "val2", f.Section("second").Key("key2").String())
+
+		// Keys parsed from the failed attempt must not linger.
+		_, err = f.Section("second").GetKey("ghost")
+		assert.Error(t, err)
+
+		// The source list is intact: a retry still reads both sources.
+		flaky.failAfter = -1
+		flaky.data = []byte(`[second]
+key2 = val2-updated
+`)
+		require.NoError(t, f.ReloadTransactional())
+		assert.Equal(t, "val1", f.Section("first").Key("key1").String())
+		assert.Equal(t, []string{"a", "b"}, f.Section("first").Key("sh").ValueWithShadows())
+		assert.Equal(t, "val2-updated", f.Section("second").Key("key2").String())
+
+		// No half-parsed keys from the failed round remain.
+		_, err = f.Section("second").GetKey("ghost")
+		assert.Error(t, err)
+	})
+
+	t.Run("reader close error rejects the reload", func(t *testing.T) {
+		closeErr := errors.New("close failed")
+		flaky := &flakyReadCloser{
+			data:      []byte("[second]\nkey2 = val2\n"),
+			failAfter: -1,
+			closeErr:  closeErr,
+		}
+		f, err := LoadSources(LoadOptions{}, []byte("[first]\nkey1 = val1\n"), flaky)
+		require.NoError(t, err) // The legacy Reload used by Load ignores close errors.
+
+		err = f.ReloadTransactional()
+		require.Error(t, err)
+		assert.True(t, IsErrReloadSource(err))
+		assert.True(t, errors.Is(err, closeErr))
+
+		// Old configuration is preserved.
+		assert.Equal(t, "val1", f.Section("first").Key("key1").String())
+
+		// Reload succeeds once the reader closes cleanly.
+		flaky.closeErr = nil
+		require.NoError(t, f.ReloadTransactional())
+		assert.Equal(t, "val2", f.Section("second").Key("key2").String())
+	})
+
+	t.Run("loose mode ignores nonexistent files", func(t *testing.T) {
+		f, err := LoadSources(LoadOptions{Loose: true},
+			[]byte("[first]\nkey1 = val1\n"),
+			"testdata/404-not-found.ini",
+		)
+		require.NoError(t, err)
+
+		require.NoError(t, f.ReloadTransactional())
+		assert.Equal(t, "val1", f.Section("first").Key("key1").String())
+	})
+
+	t.Run("short circuit stops after the first loaded source", func(t *testing.T) {
+		flaky := &flakyReadCloser{
+			data:      []byte("[second]\nkey2 = val2\n"),
+			failAfter: 0, // Would fail if it were ever read.
+		}
+		f, err := LoadSources(LoadOptions{ShortCircuit: true},
+			[]byte("[first]\nkey1 = val1\n"),
+			flaky,
+		)
+		require.NoError(t, err)
+
+		// The failing second source is never read.
+		require.NoError(t, f.ReloadTransactional())
+		assert.Equal(t, "val1", f.Section("first").Key("key1").String())
+		assert.False(t, f.HasSection("second"))
+	})
 }

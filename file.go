@@ -315,6 +315,69 @@ func (f *File) Reload() (err error) {
 	return nil
 }
 
+// reloadTransactional reads and parses a single data source into the file.
+// Unlike reload, it also reports errors returned by closing the reader:
+// a parse error takes precedence, otherwise a close error is returned.
+func (f *File) reloadTransactional(s dataSource) error {
+	r, err := s.ReadCloser()
+	if err != nil {
+		return err
+	}
+	parseErr := f.parse(r)
+	closeErr := r.Close()
+	if parseErr != nil {
+		return parseErr
+	}
+	return closeErr
+}
+
+// ReloadTransactional reloads and parses all data sources atomically: the
+// current configuration is replaced only after every source has been read,
+// parsed and closed without error. If any source fails, the receiver keeps
+// its previous sections, keys, comments, shadows and data sources untouched,
+// and the returned error is an ErrReloadSource identifying the failed source.
+//
+// The Loose and ShortCircuit load options keep their usual meaning: in loose
+// mode nonexistent files are ignored and contribute an empty default section,
+// and with short circuit enabled only the first successfully loaded source is
+// taken into account.
+//
+// Errors returned by closing a reader are treated as reload failures as well,
+// not only syntax errors: a source whose reader fails to close rejects the
+// whole reload and the previous configuration is preserved.
+func (f *File) ReloadTransactional() error {
+	fresh := newFile(f.dataSources, f.options)
+	for i, s := range f.dataSources {
+		if err := fresh.reloadTransactional(s); err != nil {
+			// In loose mode, we create an empty default section for nonexistent files.
+			if os.IsNotExist(err) && f.options.Loose {
+				_ = fresh.parse(bytes.NewBuffer(nil))
+				continue
+			}
+			return ErrReloadSource{Index: i, Err: err}
+		}
+		if f.options.ShortCircuit {
+			break
+		}
+	}
+
+	// All sources parsed successfully: adopt the freshly built state and
+	// re-parent its sections to this file.
+	if f.BlockMode {
+		f.lock.Lock()
+		defer f.lock.Unlock()
+	}
+	for _, secs := range fresh.sections {
+		for _, sec := range secs {
+			sec.f = f
+		}
+	}
+	f.sections = fresh.sections
+	f.sectionList = fresh.sectionList
+	f.sectionIndexes = fresh.sectionIndexes
+	return nil
+}
+
 // Append appends one or more data sources and reloads automatically.
 func (f *File) Append(source interface{}, others ...interface{}) error {
 	ds, err := parseDataSource(source)
