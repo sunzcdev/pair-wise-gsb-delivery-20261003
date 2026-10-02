@@ -377,29 +377,44 @@ func (c *Client) ReadDir(p string) ([]os.FileInfo, error) {
 // The passed context can be used to cancel the operation
 // returning all entries listed up to the cancellation.
 func (c *Client) ReadDirContext(ctx context.Context, p string) ([]os.FileInfo, error) {
+	var entries []os.FileInfo
+	err := c.readdirEntries(ctx, p, func(_ string, fi os.FileInfo) bool {
+		entries = append(entries, fi)
+		return true
+	})
+	return entries, err
+}
+
+// readdirEntries lists the directory p one READDIR batch at a time and invokes
+// fn for every entry. If fn returns false the listing stops immediately: no
+// further READDIR is sent and the directory handle is closed.
+//
+// Context cancellation stops the walk between batches; no further READDIR is
+// sent after ctx is cancelled. The directory handle is always CLOSED so the
+// server releases it.
+func (c *Client) readdirEntries(ctx context.Context, p string, fn func(name string, fi os.FileInfo) bool) error {
 	handle, err := c.opendir(ctx, p)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer c.close(handle) // this has to defer earlier than the lock below
-	var entries []os.FileInfo
-	var done = false
-	for !done {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		id := c.nextID()
 		typ, data, err1 := c.sendPacket(ctx, nil, &sshFxpReaddirPacket{
 			ID:     id,
 			Handle: handle,
 		})
 		if err1 != nil {
-			err = err1
-			done = true
-			break
+			return err1
 		}
 		switch typ {
 		case sshFxpName:
 			sid, data := unmarshalUint32(data)
 			if sid != id {
-				return nil, &unexpectedIDErr{id, sid}
+				return &unexpectedIDErr{id, sid}
 			}
 			count, data := unmarshalUint32(data)
 			for i := uint32(0); i < count; i++ {
@@ -407,27 +422,28 @@ func (c *Client) ReadDirContext(ctx context.Context, p string) ([]os.FileInfo, e
 				filename, data = unmarshalString(data)
 				_, data = unmarshalString(data) // discard longname
 				var attr *FileStat
+				var err error
 				attr, data, err = unmarshalAttrs(data)
 				if err != nil {
-					return nil, err
+					return err
 				}
 				if filename == "." || filename == ".." {
 					continue
 				}
-				entries = append(entries, fileInfoFromStat(attr, path.Base(filename)))
+				if !fn(path.Base(filename), fileInfoFromStat(attr, path.Base(filename))) {
+					return nil
+				}
 			}
 		case sshFxpStatus:
-			// TODO(dfc) scope warning!
 			err = normaliseError(unmarshalStatus(id, data))
-			done = true
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		default:
-			return nil, unimplementedPacketErr(typ)
+			return unimplementedPacketErr(typ)
 		}
 	}
-	if err == io.EOF {
-		err = nil
-	}
-	return entries, err
 }
 
 func (c *Client) opendir(ctx context.Context, path string) (string, error) {
@@ -467,8 +483,12 @@ func (c *Client) Stat(p string) (os.FileInfo, error) {
 // Lstat returns a FileInfo structure describing the file specified by path 'p'.
 // If 'p' is a symbolic link, the returned FileInfo structure describes the symbolic link.
 func (c *Client) Lstat(p string) (os.FileInfo, error) {
+	return c.lstat(context.Background(), p)
+}
+
+func (c *Client) lstat(ctx context.Context, p string) (os.FileInfo, error) {
 	id := c.nextID()
-	typ, data, err := c.sendPacket(context.Background(), nil, &sshFxpLstatPacket{
+	typ, data, err := c.sendPacket(ctx, nil, &sshFxpLstatPacket{
 		ID:   id,
 		Path: p,
 	})
@@ -496,8 +516,12 @@ func (c *Client) Lstat(p string) (os.FileInfo, error) {
 
 // ReadLink reads the target of a symbolic link.
 func (c *Client) ReadLink(p string) (string, error) {
+	return c.readLink(context.Background(), p)
+}
+
+func (c *Client) readLink(ctx context.Context, p string) (string, error) {
 	id := c.nextID()
-	typ, data, err := c.sendPacket(context.Background(), nil, &sshFxpReadlinkPacket{
+	typ, data, err := c.sendPacket(ctx, nil, &sshFxpReadlinkPacket{
 		ID:   id,
 		Path: p,
 	})
@@ -932,8 +956,12 @@ func (c *Client) PosixRename(oldname, newname string) error {
 // This is useful for converting path names containing ".." components,
 // or relative pathnames without a leading slash into absolute paths.
 func (c *Client) RealPath(path string) (string, error) {
+	return c.realPath(context.Background(), path)
+}
+
+func (c *Client) realPath(ctx context.Context, path string) (string, error) {
 	id := c.nextID()
-	typ, data, err := c.sendPacket(context.Background(), nil, &sshFxpRealpathPacket{
+	typ, data, err := c.sendPacket(ctx, nil, &sshFxpRealpathPacket{
 		ID:   id,
 		Path: path,
 	})

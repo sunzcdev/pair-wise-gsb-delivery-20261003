@@ -2,6 +2,7 @@ package sftp_test
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -162,4 +163,47 @@ func ExampleFile_ReadFrom_bufio() {
 	type writerOnly struct{ io.Writer }
 	bw := bufio.NewWriter(writerOnly{f}) // no ReadFrom()
 	bw.ReadFrom(data_source)
+}
+
+func ExampleClient_GlobStream() {
+	var client *sftp.Client
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Stream every compressed error log at any depth under remote logs/,
+	// without first walking or buffering the whole tree. Results are
+	// delivered one by one; breaking the loop stops further READDIR.
+	matches, err := client.GlobStream(ctx, "logs/**/error-*.gz")
+	if err != nil {
+		log.Fatal(err) // malformed pattern
+	}
+	for m, err := range matches {
+		if err != nil {
+			// One unreadable subtree is reported, then the walk continues.
+			log.Println("skip:", err)
+			continue
+		}
+		log.Println("archive:", m.Path, m.Info.Size())
+	}
+}
+
+func ExampleClient_GlobStream_followLinks() {
+	var client *sftp.Client
+
+	ctx := context.Background()
+
+	// Follow directory symlinks and suppress duplicates by file identity
+	// (symlink aliases), instead of by returned path. Link cycles are broken
+	// automatically; hard links cannot be detected over SFTP.
+	matches, err := client.GlobStream(ctx, "logs/**/error-*.gz",
+		sftp.GlobFollowDirectories(),
+		sftp.GlobDeduplicate(sftp.GlobDedupByFile),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for m := range matches {
+		log.Println("archive:", m.Path)
+	}
 }
