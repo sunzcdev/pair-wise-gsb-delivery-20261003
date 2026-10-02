@@ -9,11 +9,11 @@ module JSONSchemer
     hash[klass] = klass.name.rpartition('::').last.sub(/\A[[:alpha:]]/, &:downcase)
   end
 
-  Result = Struct.new(:source, :instance, :instance_location, :keyword_location, :valid, :nested, :type, :annotation, :details, :ignore_nested, :nested_key) do
-    def output(output_format)
+  Result = Struct.new(:source, :instance, :instance_location, :keyword_location, :valid, :nested, :type, :annotation, :details, :ignore_nested, :nested_key, :custom_keyword) do
+    def output(output_format, redactor = Redactor::NULL)
       case output_format
       when 'classic'
-        classic
+        classic(redactor)
       when 'flag'
         flag
       when 'basic'
@@ -91,8 +91,10 @@ module JSONSchemer
       out
     end
 
-    def to_classic
+    def to_classic(redactor = Redactor::NULL)
       schema = source.schema
+      instance_location_tokens = Hana::Pointer.parse(resolved_instance_location)
+      instance = redactor.redact_instance(self.instance, instance_location_tokens)
       out = {
         'data' => instance,
         'data_pointer' => resolved_instance_location,
@@ -104,7 +106,9 @@ module JSONSchemer
       out['error'] = error
       out['x-error'] = true if @x_error
       out['i18n'] = true if @i18n
-      out['details'] = details if details
+      if details
+        out['details'] = redactor.redact_details(details, instance_location_tokens, custom_keyword)
+      end
       out
     end
 
@@ -159,19 +163,19 @@ module JSONSchemer
       out
     end
 
-    def classic
+    def classic(redactor = Redactor::NULL)
       Enumerator.new do |yielder|
         unless valid
           results = [self]
           while result = results.pop
             if result.ignore_nested || !result.nested&.any?
-              yielder << result.to_classic
+              yielder << result.to_classic(redactor)
             else
               previous_results_size = results.size
               result.nested.reverse_each do |nested_result|
                 results << nested_result if nested_result.valid == valid
               end
-              yielder << result.to_classic if (results.size - previous_results_size) == 0
+              yielder << result.to_classic(redactor) if (results.size - previous_results_size) == 0
             end
           end
         end

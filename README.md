@@ -445,6 +445,33 @@ In the example above, custom error messsages are looked up using the following k
 8. `en.json_schemer.errors.required`
 9. `en.json_schemer.errors.*`
 
+### Redacting Sensitive Values
+
+Validation always runs against the real instance. Pass `sensitive_paths` (an array of exact [JSON Pointers](https://www.rfc-editor.org/rfc/rfc6901)) to replace instance values in the validation output with `[REDACTED]` without affecting the validation result. A pointer to an object or array hides its entire subtree; unmatched locations are left untouched.
+
+```ruby
+schemer = JSONSchemer.schema({
+  'type' => 'object',
+  'properties' => {
+    'password' => { 'type' => 'string' },
+    'a/b~c' => { 'properties' => { 'token' => { 'type' => 'string' } } }
+  }
+})
+
+schemer.validate(
+  { 'password' => 42, 'a/b~c' => { 'token' => 9, 'note' => 'ok' } },
+  :sensitive_paths => ['/password', '/a~1b~0c/token']
+).to_a
+# => [{"data"=>"[REDACTED]",
+#     "data_pointer"=>"/password",
+#     ...},
+#    {"data"=>"[REDACTED]",
+#     "data_pointer"=>"/a~1b~0c/token",
+#     ...}]
+```
+
+The original instance is never modified and output produced without `sensitive_paths` is unchanged. Locations, keywords, and the validity conclusion are preserved. Built-in error messages and `details` (such as `missing_keys`) never contain instance values and are not altered; custom `x-error`/I18n text is caller-provided and is not rewritten either.
+
 ## OpenAPI
 
 ```ruby

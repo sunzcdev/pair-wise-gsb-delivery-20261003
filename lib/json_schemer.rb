@@ -25,6 +25,7 @@ require 'json_schemer/errors'
 require 'json_schemer/cached_resolver'
 require 'json_schemer/ecma_regexp'
 require 'json_schemer/location'
+require 'json_schemer/redactor'
 require 'json_schemer/result'
 require 'json_schemer/output'
 require 'json_schemer/keyword'
@@ -71,6 +72,7 @@ module JSONSchemer
   class UnknownContentEncoding < StandardError; end
   class UnknownContentMediaType < StandardError; end
   class UnknownOutputFormat < StandardError; end
+  class InvalidSensitivePath < StandardError; end
   class InvalidRefResolution < StandardError; end
   class InvalidRefPointer < StandardError; end
   class InvalidRegexpResolution < StandardError; end

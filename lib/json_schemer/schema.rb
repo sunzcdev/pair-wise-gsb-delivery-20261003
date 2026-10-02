@@ -105,14 +105,15 @@ module JSONSchemer
       validate(instance, :output_format => 'flag', **options).fetch('valid')
     end
 
-    def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
+    def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode, sensitive_paths: nil)
       instance_location = Location.root
       context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode)
       result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
       if insert_property_defaults && result.insert_property_defaults(context, &property_default_resolver)
         result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
       end
-      output = result.output(output_format)
+      redactor = Redactor.build(sensitive_paths)
+      output = result.output(output_format, redactor)
       resolve_enumerators!(output) if resolve_enumerators
       output
     end
@@ -159,7 +160,7 @@ module JSONSchemer
                 valid &&= custom_keyword_valid
                 type = custom_keyword_result.is_a?(String) ? custom_keyword_result : custom_keyword
                 details = { 'keyword' => custom_keyword, 'result' => custom_keyword_result }
-                nested << result(instance, instance_location, keyword_location, custom_keyword_valid, :type => type, :details => details)
+                nested << result(instance, instance_location, keyword_location, custom_keyword_valid, :type => type, :details => details, :custom_keyword => true)
               end
             end
           end
