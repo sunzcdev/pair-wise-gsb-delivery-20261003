@@ -21,6 +21,25 @@ import (
 // Option for configuring config.
 type Option func(c *conf.Config)
 
+// Session is an incremental evaluation session.
+type Session = vm.Session
+
+// SessionOption configures an incremental Session.
+type SessionOption = vm.SessionOption
+
+// FieldChange describes one session environment update.
+type FieldChange = vm.FieldChange
+
+// ReusableFunction marks a deterministic host function as cacheable.
+func ReusableFunction(name string, fn vm.Function) SessionOption {
+	return vm.ReusableFunction(name, fn)
+}
+
+// NewSession creates an incremental evaluation session.
+func NewSession(program *vm.Program, env map[string]any, options ...SessionOption) (*Session, error) {
+	return vm.NewSession(program, env, options...)
+}
+
 // Env specifies expected input of env for type checks.
 // If struct is passed, all fields will be treated as variables,
 // as well as all fields of embedded structs and struct itself.

@@ -23,6 +23,30 @@ request.Time - resource.Age < duration("24h")
 all(tweets, len(.Content) <= 240)
 ```
 
+## Incremental Evaluation
+
+For a long rule that is re-evaluated after changing one input field, create a
+session from a program compiled with `expr.Optimize(false)`:
+
+```go
+program, err := expr.Compile(rule, expr.Optimize(false))
+
+session, err := expr.NewSession(program, env,
+    expr.ReusableFunction("riskScore", riskScore),
+)
+
+output, err := session.Submit(expr.FieldChange{
+    Path:  []any{"user", "age"},
+    Value: 32,
+})
+```
+
+The session records exact field paths, including concrete array indexes and the
+condition branches actually executed. When a branch switches, dependencies from
+the old branch no longer participate in the current evaluation. Host functions
+supplied to `expr.Function` remain ordinary calls; only functions registered
+with `ReusableFunction` are considered pure and cached.
+
 ## Features
 
 **Expr** is a safe, fast, and intuitive expression evaluator optimized for the Go language. 
