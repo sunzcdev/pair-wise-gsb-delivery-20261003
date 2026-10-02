@@ -67,6 +67,29 @@ Finally, we have convenience function to throw a quick response
 
 we close the body of the original response, and return a new 403 response with a short message.
 
+# Shared GET response cache
+
+Caching is off by default. Assign a CacheConfig to Proxy.Cache to enable a
+shared cache for GET responses implementing the relevant parts of RFC 9111:
+Cache-Control freshness, the Age header, ETag/Last-Modified revalidation
+and Vary. Storage is replaceable via the CacheStore interface and bounded
+in capacity (the default is an in-memory LRU store).
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.Cache = &goproxy.CacheConfig{
+		MaxResources: 256,
+		MaxBodyBytes: 4 << 20,
+	}
+
+The cache honours private/no-store, Authorization and cookie-bearing user
+state conservatively: authenticated responses are stored only when the
+origin explicitly marks them shareable (public/s-maxage/must-revalidate),
+and Vary variants are never merged. Concurrent requests for the same stale
+variant share one conditional revalidation; cancelling one caller never
+cancels the result awaited by the others. Range requests, CONNECT,
+upgraded connections, HEAD and other non-GET methods bypass the cache.
+HTTP/2 MITM streams are not served from the cache in this version.
+
 Example use cases:
 
 1. https://github.com/elazarl/goproxy/tree/master/examples/goproxy-avgsize

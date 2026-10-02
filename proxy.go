@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
 	"golang.org/x/net/http2"
 )
@@ -72,6 +73,13 @@ type ProxyHttpServer struct {
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+	// Cache optionally enables a shared GET response cache. It is disabled
+	// by default; assign a configured *CacheConfig to enable RFC 9111-style
+	// caching with bounded, replaceable storage.
+	Cache *CacheConfig
+	// cacheInstance and cacheOnce lazily build the coordinator from Cache.
+	cacheInstance *httpCache
+	cacheOnce     sync.Once
 }
 
 func hasPort(s string) bool {

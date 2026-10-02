@@ -37,6 +37,7 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true
+- Optional shared `GET response cache` (disabled by default) with `Cache-Control`/`Age` freshness, `ETag`/`Last-Modified` revalidation, `Vary` support, single-flight revalidation, and a bounded replaceable store
 
 ## Proxy modes
 1. Regular HTTP proxy
@@ -240,6 +241,45 @@ proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).HandleConnect(
 // an HTTP request using URL.Path (target path) as a condition.
 proxy.OnRequest(goproxy.UrlMatches(regexp.MustCompile(`.*gif$`))).Do(YourReqHandlerFunc())
 ```
+
+## Response cache
+
+The proxy ships with an opt-in shared cache for `GET` responses. It is
+disabled by default and implements the shared-cache parts of RFC 9111:
+
+- `Cache-Control` (`max-age`, `s-maxage`, `no-cache`, `no-store`,
+  `private`, `public`, `must-revalidate`, `proxy-revalidate`) and
+  `Expires` freshness
+- `Age` calculation on every cached response
+  - `ETag` / `Last-Modified` revalidation (`If-None-Match` /
+  `If-Modified-Since`), applying a `304 Not Modified` only to the matching
+  variant's metadata while reusing its body
+- `Vary`, keeping every variant (e.g. `en` vs `zh`) separate
+- single-flight revalidation: concurrent callers for one stale variant
+  share a single conditional request, and cancelling one caller never
+  cancels the result awaited by others
+- conservative handling of `Authorization`, `Set-Cookie`, `Cookie`,
+  `private` and `no-store`
+
+Plain `GET` 200 responses are cached. `Range` requests, `CONNECT`,
+upgraded connections (e.g. WebSockets), `HEAD` and other methods bypass
+the cache, as do client-supplied conditional requests and request
+`no-store`/`no-cache`. HTTP/2 MITM streams are not cached in this version.
+
+```go
+proxy := goproxy.NewProxyHttpServer()
+proxy.Cache = &goproxy.CacheConfig{
+	MaxResources:        256,           // bounded LRU capacity (default 100)
+	MaxBodyBytes:        8 << 20,       // only buffer bodies up to 8 MiB
+	RevalidationTimeout: 30 * time.Second,
+	// Clock is overridable (e.g. goproxy.NewManualClock(t)) for tests.
+	// Store is replaceable via the goproxy.CacheStore interface.
+}
+```
+
+Provide a custom `goproxy.CacheStore` (keyed by absolute URL, grouping all
+`Vary` variants in one `CachedResource`) to back the cache with Redis, a
+file, etc.
 
 ## Error handling
 ### Generic error

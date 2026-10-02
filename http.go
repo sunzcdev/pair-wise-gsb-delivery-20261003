@@ -17,15 +17,29 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	}
 	r, resp := proxy.filterRequest(r, ctx)
 
+	var cstate *cacheState
 	if resp == nil {
-		if !proxy.KeepHeader {
-			RemoveProxyHeaders(ctx, r)
+		if proxy.Cache != nil {
+			var cachedResp *http.Response
+			cachedResp, cstate = proxy.cacheImpl().beforeRoundTrip(ctx, r)
+			if cachedResp != nil {
+				resp = cachedResp
+				cstate.capturable = false
+			}
 		}
+		if resp == nil {
+			if !proxy.KeepHeader {
+				RemoveProxyHeaders(ctx, r)
+			}
 
-		var err error
-		resp, err = ctx.RoundTrip(r)
-		if err != nil {
-			ctx.Error = err
+			var err error
+			resp, err = ctx.RoundTrip(r)
+			if err != nil {
+				ctx.Error = err
+			}
+			if cstate != nil && resp != nil {
+				cstate.capturable = true
+			}
 		}
 	}
 
@@ -37,6 +51,15 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	}
 
 	resp = proxy.filterResponse(resp, ctx)
+
+	// A cache MISS whose body was not replaced by a response handler is
+	// buffered while streamed so it can be stored once the client read it.
+	if cstate != nil && cstate.capturable && !cstate.fromCache &&
+		resp != nil && resp.Body == origBody && origBody != nil &&
+		proxy.cacheImpl().requestCacheable(r) {
+		now := proxy.cacheImpl().clock.Now()
+		resp.Body = proxy.cacheImpl().captureBody(resp, origBody, r, now)
+	}
 
 	if resp == nil {
 		var errorString string
