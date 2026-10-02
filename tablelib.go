@@ -21,6 +21,9 @@ var tableFuncs = map[string]LGFunction{
 
 func tableSort(L *LState) int {
 	tbl := L.CheckTable(1)
+	if tbl.IsFrozen() {
+		L.RaiseError("attempt to modify a read-only table")
+	}
 	sorter := lValueArraySorter{L, nil, tbl.array}
 	if L.GetTop() != 1 {
 		sorter.Fn = L.CheckFunction(2)

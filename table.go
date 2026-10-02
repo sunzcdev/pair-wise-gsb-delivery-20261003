@@ -67,6 +67,7 @@ func (tb *LTable) Append(value LValue) {
 	if value == LNil {
 		return
 	}
+	tb.checkWritable()
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
@@ -85,6 +86,7 @@ func (tb *LTable) Append(value LValue) {
 
 // Insert inserts a given LValue at position `i` in this table.
 func (tb *LTable) Insert(i int, value LValue) {
+	tb.checkWritable()
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
@@ -117,6 +119,7 @@ func (tb *LTable) MaxN() int {
 
 // Remove removes from this table the element at a given position.
 func (tb *LTable) Remove(pos int) LValue {
+	tb.checkWritable()
 	if tb.array == nil {
 		return LNil
 	}
@@ -145,6 +148,7 @@ func (tb *LTable) Remove(pos int) LValue {
 // It is recommended to use `RawSetString` or `RawSetInt` for performance
 // if you already know the given LValue is a string or number.
 func (tb *LTable) RawSet(key LValue, value LValue) {
+	tb.checkWritable()
 	switch v := key.(type) {
 	case LNumber:
 		if isArrayKey(v) {
@@ -176,6 +180,7 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 
 // RawSetInt sets a given LValue at a position `key` without the __newindex metamethod.
 func (tb *LTable) RawSetInt(key int, value LValue) {
+	tb.checkWritable()
 	if key < 1 || key >= MaxArrayIndex {
 		tb.RawSetH(LNumber(key), value)
 		return
@@ -200,6 +205,7 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 
 // RawSetString sets a given LValue to a given string index without the __newindex metamethod.
 func (tb *LTable) RawSetString(key string, value LValue) {
+	tb.checkWritable()
 	if tb.strdict == nil {
 		tb.strdict = make(map[string]LValue, defaultHashCap)
 	}
@@ -223,6 +229,7 @@ func (tb *LTable) RawSetString(key string, value LValue) {
 
 // RawSetH sets a given LValue to a given index without the __newindex metamethod.
 func (tb *LTable) RawSetH(key LValue, value LValue) {
+	tb.checkWritable()
 	if s, ok := key.(LString); ok {
 		tb.RawSetString(string(s), value)
 		return

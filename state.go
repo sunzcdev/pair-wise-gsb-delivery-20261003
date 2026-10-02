@@ -1340,6 +1340,9 @@ func (ls *LState) setField(obj LValue, key LValue, value LValue) {
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			if tb.frozen {
+				ls.RaiseError("attempt to modify a read-only table")
+			}
 			if tb.RawGet(key) != LNil {
 				ls.RawSet(tb, key, value)
 				return
@@ -1372,6 +1375,9 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 	for i := 0; i < MaxTableGetLoop; i++ {
 		tb, istable := curobj.(*LTable)
 		if istable {
+			if tb.frozen {
+				ls.RaiseError("attempt to modify a read-only table")
+			}
 			if tb.RawGetString(key) != LNil {
 				tb.RawSetString(key, value)
 				return
@@ -1918,10 +1924,16 @@ func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
 	} else if key == LNil {
 		ls.RaiseError("table index is nil")
 	}
+	if tb.frozen {
+		ls.RaiseError("attempt to modify a read-only table")
+	}
 	tb.RawSet(key, value)
 }
 
 func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
+	if tb.frozen {
+		ls.RaiseError("attempt to modify a read-only table")
+	}
 	tb.RawSetInt(key, value)
 }
 
@@ -2130,6 +2142,9 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 
 	switch v := obj.(type) {
 	case *LTable:
+		if v.frozen {
+			ls.RaiseError("attempt to modify a read-only table")
+		}
 		v.Metatable = mt
 	case *LUserData:
 		v.Metatable = mt

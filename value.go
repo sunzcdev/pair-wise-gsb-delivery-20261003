@@ -143,6 +143,7 @@ func (nm LNumber) Format(f fmt.State, c rune) {
 type LTable struct {
 	Metatable LValue
 
+	frozen  bool
 	array   []LValue
 	dict    map[LValue]LValue
 	strdict map[string]LValue
