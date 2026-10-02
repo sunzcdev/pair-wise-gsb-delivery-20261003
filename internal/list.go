@@ -24,6 +24,10 @@ type Entry[K comparable, V any] struct {
 	// The Value stored with this element.
 	Value V
 
+	// The Weight charged against a weighted cache's budget. Zero for
+	// caches that only bound the number of entries.
+	Weight int64
+
 	// The time this element would be cleaned up, optional
 	ExpiresAt time.Time
 
@@ -122,6 +126,15 @@ func (l *LruList[K, V]) move(e, at *Entry[K, V]) {
 func (l *LruList[K, V]) PushFront(k K, v V) *Entry[K, V] {
 	l.lazyInit()
 	return l.insertValue(k, v, time.Time{}, &l.root)
+}
+
+// PushFrontWeighted inserts a new element e with value v and weight w at the
+// front of list l and returns e.
+func (l *LruList[K, V]) PushFrontWeighted(k K, v V, w int64) *Entry[K, V] {
+	l.lazyInit()
+	e := l.insertValue(k, v, time.Time{}, &l.root)
+	e.Weight = w
+	return e
 }
 
 // PushFrontExpirable inserts a new expirable element e with Value v at the front of list l and returns e.

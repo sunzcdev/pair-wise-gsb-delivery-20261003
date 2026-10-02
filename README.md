@@ -31,6 +31,33 @@ func main() {
 }
 ```
 
+Weighted LRU cache example
+==========================
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/hashicorp/golang-lru/v2"
+)
+
+func main() {
+	// bound the cache by the total weight of its entries, not their count
+	l, _ := lru.NewWeighted[int, int](128)
+
+	// Add(key, value, weight). Returns whether the entry was stored and
+	// how many entries were evicted (oldest first) to fit the budget.
+	added, evicted := l.Add(1, 1, 100)
+	fmt.Println(added, evicted) // true 0
+
+	// a single value larger than the budget is rejected and nothing moves
+	added, _ = l.Add(2, 2, 200)
+	fmt.Println(added, l.Len(), l.Weight()) // false 1 100
+}
+```
+
 Expirable LRU cache example
 ===========================
 
