@@ -20,6 +20,7 @@
 package zapcore_test
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -126,6 +127,33 @@ func TestConsoleSeparator(t *testing.T) {
 		})
 
 	}
+}
+
+func TestConsoleIsolateFailedObject(t *testing.T) {
+	cfg := EncoderConfig{
+		MessageKey:          "M",
+		IsolateFailedFields: true,
+	}
+	enc := NewConsoleEncoder(cfg)
+
+	buf, err := enc.EncodeEntry(testEntry, []Field{
+		{
+			Key:  "failed",
+			Type: ObjectMarshalerType,
+			Interface: ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+				enc.AddString("partial", "not retained")
+				return errors.New("object failed")
+			}),
+		},
+	})
+	if !assert.NoError(t, err) {
+		return
+	}
+
+	assert.Contains(t, buf.String(), `"failed": null`)
+	assert.Contains(t, buf.String(), `"failedError": "object failed"`)
+	assert.NotContains(t, buf.String(), "not retained")
+	buf.Free()
 }
 
 func encoderTestEncoderConfig(separator string) EncoderConfig {

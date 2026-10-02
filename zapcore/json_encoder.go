@@ -46,6 +46,8 @@ func putJSONEncoder(enc *jsonEncoder) {
 	enc.buf = nil
 	enc.spaced = false
 	enc.openNamespaces = 0
+	enc.isolateFailedFields = false
+	enc.maxMarshalerBufferSize = 0
 	enc.reflectBuf = nil
 	enc.reflectEnc = nil
 	_jsonPool.Put(enc)
@@ -60,6 +62,9 @@ type jsonEncoder struct {
 	// for encoding generic values by reflection
 	reflectBuf *buffer.Buffer
 	reflectEnc ReflectedEncoder
+
+	isolateFailedFields    bool
+	maxMarshalerBufferSize int
 }
 
 // NewJSONEncoder creates a fast, low-allocation JSON encoder. The encoder
@@ -91,9 +96,11 @@ func newJSONEncoder(cfg EncoderConfig, spaced bool) *jsonEncoder {
 	}
 
 	return &jsonEncoder{
-		EncoderConfig: &cfg,
-		buf:           bufferpool.Get(),
-		spaced:        spaced,
+		EncoderConfig:          &cfg,
+		buf:                    bufferpool.Get(),
+		spaced:                 spaced,
+		isolateFailedFields:    cfg.IsolateFailedFields,
+		maxMarshalerBufferSize: cfg.MaxMarshalerBufferSize,
 	}
 }
 
@@ -208,6 +215,15 @@ func (enc *jsonEncoder) AddUint64(key string, val uint64) {
 }
 
 func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
+	if enc.isolateFailedFields {
+		return enc.appendBuffered('[', ']', func(child *jsonEncoder) error {
+			return arr.MarshalLogArray(child)
+		})
+	}
+	return enc.appendArray(arr)
+}
+
+func (enc *jsonEncoder) appendArray(arr ArrayMarshaler) error {
 	enc.addElementSeparator()
 	enc.buf.AppendByte('[')
 	err := arr.MarshalLogArray(enc)
@@ -216,6 +232,20 @@ func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
 }
 
 func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
+	if enc.isolateFailedFields {
+		return enc.appendBuffered('{', '}', func(child *jsonEncoder) error {
+			old := child.openNamespaces
+			child.openNamespaces = 0
+			err := obj.MarshalLogObject(child)
+			child.closeOpenNamespaces()
+			child.openNamespaces = old
+			return err
+		})
+	}
+	return enc.appendObject(obj)
+}
+
+func (enc *jsonEncoder) appendObject(obj ObjectMarshaler) error {
 	// Close ONLY new openNamespaces that are created during
 	// AppendObject().
 	old := enc.openNamespaces
@@ -227,6 +257,38 @@ func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
 	enc.closeOpenNamespaces()
 	enc.openNamespaces = old
 	return err
+}
+
+func (enc *jsonEncoder) appendBuffered(open, close byte, marshal func(*jsonEncoder) error) error {
+	child := enc.marshalingEncoder()
+	defer func() {
+		child.buf.Free()
+		putJSONEncoder(child)
+	}()
+
+	child.buf.AppendByte(open)
+	err := marshal(child)
+	child.buf.AppendByte(close)
+	if err == nil && enc.maxMarshalerBufferSize > 0 && child.buf.Len() > enc.maxMarshalerBufferSize {
+		err = ErrMarshalerBufferLimit
+	}
+
+	enc.addElementSeparator()
+	if err != nil {
+		enc.buf.AppendString("null")
+	} else {
+		enc.buf.Write(child.buf.Bytes())
+	}
+
+	return err
+}
+
+func (enc *jsonEncoder) marshalingEncoder() *jsonEncoder {
+	cfg := *enc.EncoderConfig
+	child := newJSONEncoder(cfg, enc.spaced)
+	child.isolateFailedFields = enc.isolateFailedFields
+	child.maxMarshalerBufferSize = enc.maxMarshalerBufferSize
+	return child
 }
 
 func (enc *jsonEncoder) AppendBool(val bool) {
@@ -354,6 +416,8 @@ func (enc *jsonEncoder) clone() *jsonEncoder {
 	clone.EncoderConfig = enc.EncoderConfig
 	clone.spaced = enc.spaced
 	clone.openNamespaces = enc.openNamespaces
+	clone.isolateFailedFields = enc.isolateFailedFields
+	clone.maxMarshalerBufferSize = enc.maxMarshalerBufferSize
 	clone.buf = bufferpool.Get()
 	return clone
 }

@@ -529,6 +529,250 @@ func assertOutput(t testing.TB, cfg EncoderConfig, expected string, f func(Encod
 	assert.Equal(t, expectedPrefix+expected, enc.buf.String(), "Unexpected encoder output after adding as a second field.")
 }
 
+func strictEncoderConfig() EncoderConfig {
+	cfg := _defaultEncoderConfig
+	cfg.IsolateFailedFields = true
+	return cfg
+}
+
+func TestJSONIsolateFailedObject(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	partialObject := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("partial", "not retained")
+		return errors.New("object failed")
+	})
+
+	enc.AddString("before", "kept")
+	field := Field{Key: "failed", Type: ObjectMarshalerType, Interface: partialObject}
+	field.AddTo(enc)
+	enc.AddString("after", "kept")
+
+	assert.JSONEq(t,
+		`{
+			"before":"kept",
+			"failed":null,
+			"failedError":"object failed",
+			"after":"kept"
+		}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONFailedObjectKeepsHistoricalOutputByDefault(t *testing.T) {
+	enc := NewJSONEncoder(_defaultEncoderConfig).(*jsonEncoder)
+
+	Field{
+		Key:  "failed",
+		Type: ObjectMarshalerType,
+		Interface: ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+			enc.AddString("partial", "retained historically")
+			return errors.New("object failed")
+		}),
+	}.AddTo(enc)
+
+	assert.JSONEq(t,
+		`{"failed":{"partial":"retained historically"},"failedError":"object failed"}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONIsolateFailedNestedObject(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	nestedFailure := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("partial", "not retained")
+		return errors.New("nested failed")
+	})
+	outer := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("before", "not retained")
+		return enc.AddObject("child", nestedFailure)
+	})
+
+	field := Field{Key: "outer", Type: ObjectMarshalerType, Interface: outer}
+	field.AddTo(enc)
+
+	assert.JSONEq(t,
+		`{"outer":null,"outerError":"nested failed"}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONStrictIsolatesNestedFailureWhenOuterIgnoresError(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	outer := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("before", "kept")
+		_ = enc.AddObject("child", ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+			enc.AddString("partial", "not retained")
+			return errors.New("child failed")
+		}))
+		enc.AddString("after", "kept")
+		return nil
+	})
+
+	require.NoError(t, enc.AddObject("outer", outer))
+	assert.JSONEq(t,
+		`{"outer":{"before":"kept","child":null,"after":"kept"}}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONIsolateFailedNestedArray(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	outer := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		return enc.AddArray("items", ArrayMarshalerFunc(func(arr ArrayEncoder) error {
+			arr.AppendString("committed elsewhere, but not here")
+			return arr.AppendObject(ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+				enc.AddString("partial", "not retained")
+				return errors.New("array object failed")
+			}))
+		}))
+	})
+
+	field := Field{Key: "outer", Type: ObjectMarshalerType, Interface: outer}
+	field.AddTo(enc)
+
+	assert.JSONEq(t,
+		`{"outer":null,"outerError":"array object failed"}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONStrictBufferingPreservesSuccessfulNestedValues(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	success := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("before", "kept")
+		return enc.AddArray("items", ArrayMarshalerFunc(func(arr ArrayEncoder) error {
+			err := arr.AppendObject(ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+				enc.AddString("inside", "object")
+				return nil
+			}))
+			if err != nil {
+				return err
+			}
+			return arr.AppendArray(ArrayMarshalerFunc(func(arr ArrayEncoder) error {
+				arr.AppendBool(true)
+				return nil
+			}))
+		}))
+	})
+
+	require.NoError(t, enc.AddObject("success", success))
+	assert.JSONEq(t,
+		`{"success":{"before":"kept","items":[{"inside":"object"},[true]]}}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONIsolateFailedArray(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	arr := ArrayMarshalerFunc(func(arr ArrayEncoder) error {
+		arr.AppendString("partial")
+		return errors.New("array failed")
+	})
+
+	field := Field{Key: "items", Type: ArrayMarshalerType, Interface: arr}
+	field.AddTo(enc)
+
+	assert.JSONEq(t,
+		`{"items":null,"itemsError":"array failed"}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
+func TestJSONIsolateFailedObjectNamespace(t *testing.T) {
+	enc := NewJSONEncoder(strictEncoderConfig()).(*jsonEncoder)
+
+	enc.OpenNamespace("namespace")
+	enc.AddString("before", "kept")
+	Field{
+		Key:  "failed",
+		Type: ObjectMarshalerType,
+		Interface: ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+			enc.OpenNamespace("nested")
+			enc.AddString("partial", "not retained")
+			return errors.New("namespace object failed")
+		}),
+	}.AddTo(enc)
+	enc.AddString("after", "kept")
+
+	assert.JSONEq(t,
+		`{
+			"namespace":{
+				"before":"kept",
+				"failed":null,
+				"failedError":"namespace object failed",
+				"after":"kept"
+			}
+		}`,
+		`{`+enc.buf.String()+`}}`,
+	)
+}
+
+func TestJSONIsolateFailedFieldsDoesNotReuseAcrossEntries(t *testing.T) {
+	cfg := strictEncoderConfig()
+	cfg.MessageKey = "message"
+	enc := NewJSONEncoder(cfg)
+	entry := Entry{Level: InfoLevel, Message: "first"}
+
+	first, err := enc.EncodeEntry(entry, []Field{
+		{
+			Key:  "failed",
+			Type: ObjectMarshalerType,
+			Interface: ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+				enc.AddString("partial", "not retained")
+				return errors.New("failed once")
+			}),
+		},
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"message":"first","failed":null,"failedError":"failed once"}`,
+		first.String(),
+	)
+	first.Free()
+
+	second, err := enc.EncodeEntry(Entry{Level: InfoLevel, Message: "second"}, []Field{
+		{
+			Key:  "success",
+			Type: ObjectMarshalerType,
+			Interface: ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+				enc.AddString("ok", "true")
+				return nil
+			}),
+		},
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"message":"second","success":{"ok":"true"}}`,
+		second.String(),
+	)
+	assert.NotContains(t, second.String(), "failed")
+	second.Free()
+}
+
+func TestJSONMarshalerBufferLimit(t *testing.T) {
+	cfg := strictEncoderConfig()
+	cfg.MaxMarshalerBufferSize = 10
+	enc := NewJSONEncoder(cfg).(*jsonEncoder)
+
+	tooLarge := ObjectMarshalerFunc(func(enc ObjectEncoder) error {
+		enc.AddString("inner", "value")
+		return nil
+	})
+
+	err := enc.AddObject("failed", tooLarge)
+	assert.ErrorIs(t, err, ErrMarshalerBufferLimit)
+	assert.JSONEq(t,
+		`{"failed":null}`,
+		`{`+enc.buf.String()+`}`,
+	)
+}
+
 // Nested Array- and ObjectMarshalers.
 type turducken struct{}
 

@@ -22,6 +22,7 @@ package zapcore
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"time"
 
@@ -35,6 +36,10 @@ const DefaultLineEnding = "\n"
 
 // OmitKey defines the key to use when callers want to remove a key from log output.
 const OmitKey = ""
+
+// ErrMarshalerBufferLimit is returned when an object or array marshaler
+// produces output larger than EncoderConfig.MaxMarshalerBufferSize.
+var ErrMarshalerBufferLimit = errors.New("zapcore: marshaler output exceeds MaxMarshalerBufferSize")
 
 // A LevelEncoder serializes a Level to a primitive type.
 //
@@ -340,6 +345,20 @@ type EncoderConfig struct {
 	StacktraceKey  string `json:"stacktraceKey" yaml:"stacktraceKey"`
 	SkipLineEnding bool   `json:"skipLineEnding" yaml:"skipLineEnding"`
 	LineEnding     string `json:"lineEnding" yaml:"lineEnding"`
+	// IsolateFailedFields encodes object and array fields in a temporary
+	// buffer before committing them to the log. If a marshaler returns an
+	// error, the failed field is replaced with null and none of its partial
+	// output is retained. The marshaler's error is still returned, so Field
+	// encoding retains the usual "<key>Error" field.
+	//
+	// The zero value keeps the historical behavior of closing and retaining
+	// partially written objects or arrays.
+	IsolateFailedFields bool `json:"isolateFailedFields" yaml:"isolateFailedFields"`
+	// MaxMarshalerBufferSize limits the size in bytes of a temporarily
+	// buffered object or array when IsolateFailedFields is enabled. The limit
+	// is checked after each object or array is marshaled. A non-positive
+	// value means no limit.
+	MaxMarshalerBufferSize int `json:"maxMarshalerBufferSize" yaml:"maxMarshalerBufferSize"`
 	// Configure the primitive representations of common complex types. For
 	// example, some users may want all time.Times serialized as floating-point
 	// seconds since epoch, while others may prefer ISO8601 strings.
