@@ -52,5 +52,20 @@ module JSONSchemer
         obj
       end
     end
+
+    def deep_copy(obj)
+      case obj
+      when Hash
+        obj.each_with_object({}) do |(key, value), out|
+          out[key] = deep_copy(value)
+        end
+      when Array
+        obj.map { |item| deep_copy(item) }
+      when String
+        obj.dup
+      else
+        obj
+      end
+    end
   end
 end

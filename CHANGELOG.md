@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Add `preview_property_defaults` to preview default value insertions without modifying the instance
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes

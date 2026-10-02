@@ -179,6 +179,20 @@ module JSONSchemer
     end
 
     def insert_property_defaults(context)
+      inserted = false
+
+      property_default_candidates.each do |instance_location, properties|
+        original_instance = context.original_instance(instance_location)
+        properties.each do |property, results_with_tree_validity|
+          property_inserted = yield(original_instance, property, results_with_tree_validity)
+          inserted ||= (property_inserted != false)
+        end
+      end
+
+      inserted
+    end
+
+    def property_default_candidates
       instance_locations = {}
       instance_locations.compare_by_identity
 
@@ -203,17 +217,7 @@ module JSONSchemer
         end
       end
 
-      inserted = false
-
-      instance_locations.each do |instance_location, properties|
-        original_instance = context.original_instance(instance_location)
-        properties.each do |property, results_with_tree_validity|
-          property_inserted = yield(original_instance, property, results_with_tree_validity)
-          inserted ||= (property_inserted != false)
-        end
-      end
-
-      inserted
+      instance_locations
     end
 
   private

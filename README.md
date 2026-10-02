@@ -144,6 +144,47 @@ schemer.bundle
 #       "http://example.com/schema/two"=>{"minimum"=>11, "$id"=>"http://example.com/schema/two", "$schema"=>"https://json-schema.org/draft/2020-12/schema"}}}
 ```
 
+### Previewing Property Defaults
+
+`preview_property_defaults` shows which default values would be inserted by
+[`insert_property_defaults`](#options) without modifying the passed-in
+instance. It returns a copy of the instance with defaults applied, a list of
+insertions (instance JSON pointer, value, and the location of the schema that
+provided each default), and the validation result of the filled instance.
+Array and hash defaults are deep-copied, so the preview and the schema never
+share mutable values. When conditional subschemas (`allOf`/`anyOf`/`oneOf`)
+provide conflicting defaults that cannot be uniquely resolved, the property is
+listed under `ambiguous` instead of picking one.
+
+```ruby
+schemer = JSONSchemer.schema({
+  'properties' => {
+    'a' => { 'default' => 1 },
+    'b' => {
+      'properties' => {
+        'c' => { 'default' => 'x' }
+      }
+    }
+  }
+})
+
+data = { 'b' => {} }
+preview = schemer.preview_property_defaults(data)
+
+data
+# => {"b"=>{}}
+
+preview
+# => {"valid"=>true,
+#     "errors"=>[],
+#     "instance"=>{"a"=>1, "b"=>{"c"=>"x"}},
+#     "insertions"=>[
+#       {"instance_location"=>"/a", "value"=>1, "schema_location"=>"json-schemer://schema#/properties/a/default"},
+#       {"instance_location"=>"/b/c", "value"=>"x", "schema_location"=>"json-schemer://schema#/properties/b/properties/c/default"}
+#     ],
+#     "ambiguous"=>[]}
+```
+
 ## Options
 
 ```ruby

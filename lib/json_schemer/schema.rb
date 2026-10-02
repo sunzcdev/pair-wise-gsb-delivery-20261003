@@ -117,6 +117,55 @@ module JSONSchemer
       output
     end
 
+    def preview_property_defaults(instance, access_mode: @configuration.access_mode)
+      preview_instance = deep_copy(instance)
+      context = Context.new(preview_instance, [], nil, false, access_mode)
+      result = validate_instance(deep_stringify_keys(preview_instance), Location.root, root_keyword_location, context)
+
+      insertions = []
+      ambiguous = []
+
+      result.property_default_candidates.each do |instance_location, properties|
+        original_instance = context.original_instance(instance_location)
+        instance_pointer = Location.resolve(instance_location)
+        properties.each do |property, results_with_tree_validity|
+          results_with_tree_validity = results_with_tree_validity.select(&:last) unless results_with_tree_validity.size == 1
+          annotations = results_with_tree_validity.to_set { |default_result, _tree_valid| default_result.annotation }
+          property_pointer = "#{instance_pointer}/#{Location.escape_json_pointer_token(property)}"
+          if annotations.size == 1
+            value = deep_copy(annotations.first)
+            original_instance[insert_property_defaults == :symbol ? property.to_sym : property] = value
+            insertions << {
+              'instance_location' => property_pointer,
+              'value' => value,
+              'schema_location' => results_with_tree_validity.first.first.source.absolute_keyword_location
+            }
+          else
+            ambiguous << {
+              'instance_location' => property_pointer,
+              'candidates' => results_with_tree_validity.map do |default_result, _tree_valid|
+                {
+                  'value' => deep_copy(default_result.annotation),
+                  'schema_location' => default_result.source.absolute_keyword_location
+                }
+              end.uniq { |candidate| candidate['value'] }
+            }
+          end
+        end
+      end
+
+      context = Context.new(preview_instance, [], nil, false, access_mode)
+      result = validate_instance(deep_stringify_keys(preview_instance), Location.root, root_keyword_location, context)
+
+      {
+        'valid' => result.valid,
+        'errors' => result.output('classic').to_a,
+        'instance' => preview_instance,
+        'insertions' => insertions,
+        'ambiguous' => ambiguous
+      }
+    end
+
     def valid_schema?(**options)
       meta_schema.valid?(value, **options)
     end
