@@ -279,6 +279,13 @@ type Conn struct {
 
 	readDecompress         bool // whether last read frame had RSV1 set
 	newDecompressionReader func(io.Reader) io.ReadCloser
+
+	// Context takeover state (RFC 7692). These are set only for the
+	// directions that negotiated context takeover. The write compressor and
+	// read decompressor own per-connection DEFLATE state and must never be
+	// shared with or reset from another connection.
+	writeContextTakeover *contextTakeoverCompressor
+	readContextTakeover  *contextTakeoverDecompressor
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int, writeBufferPool BufferPool, br *bufio.Reader, writeBuf []byte) *Conn {

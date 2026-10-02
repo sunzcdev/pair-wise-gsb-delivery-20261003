@@ -118,8 +118,20 @@ type Dialer struct {
 	// EnableCompression specifies if the client should attempt to negotiate
 	// per message compression (RFC 7692). Setting this value to true does not
 	// guarantee that compression will be supported. Currently only "no context
-	// takeover" modes are supported.
+	// takeover" is negotiated unless EnableContextTakeover is also set.
 	EnableCompression bool
+
+	// EnableContextTakeover specifies whether the client offers context
+	// takeover for permessage-deflate (RFC 7692). It is ignored unless
+	// EnableCompression is true. When false (the default) the client sends
+	// "server_no_context_takeover; client_no_context_takeover" as before.
+	// When true the client omits both parameters and each direction keeps its
+	// DEFLATE dictionary only if the server's response agrees: the client
+	// retains its outgoing dictionary when the response omits
+	// client_no_context_takeover and expects the server to retain its
+	// dictionary when the response omits server_no_context_takeover. Context
+	// takeover is never enabled unless the server's response allows it.
+	EnableContextTakeover bool
 
 	// Jar specifies the cookie jar.
 	// If Jar is nil, cookies are not sent in requests and ignored
@@ -251,7 +263,11 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 	}
 
 	if d.EnableCompression {
-		req.Header["Sec-WebSocket-Extensions"] = []string{"permessage-deflate; server_no_context_takeover; client_no_context_takeover"}
+		if d.EnableContextTakeover {
+			req.Header["Sec-WebSocket-Extensions"] = []string{"permessage-deflate"}
+		} else {
+			req.Header["Sec-WebSocket-Extensions"] = []string{"permessage-deflate; server_no_context_takeover; client_no_context_takeover"}
+		}
 	}
 
 	if d.HandshakeTimeout != 0 {
@@ -376,11 +392,33 @@ func (d *Dialer) DialContext(ctx context.Context, urlStr string, requestHeader h
 		}
 		_, snct := ext["server_no_context_takeover"]
 		_, cnct := ext["client_no_context_takeover"]
-		if !snct || !cnct {
-			return nil, resp, errInvalidCompression
+
+		// RFC 7692 section 7.1.2: the server must not agree to context
+		// takeover in a direction for which the client requested no context
+		// takeover. When the client did not offer takeover at all it sends
+		// both parameters, so the response must contain both. When the
+		// client offers takeover, each direction is negotiated independently
+		// from the presence of the corresponding response parameter.
+		if !d.EnableContextTakeover {
+			if !snct || !cnct {
+				return nil, resp, errInvalidCompression
+			}
 		}
-		conn.newCompressionWriter = compressNoContextTakeover
-		conn.newDecompressionReader = decompressNoContextTakeover
+		// The "server" parameter governs the server -> client direction,
+		// which is the client's receive direction. The "client" parameter
+		// governs the client's send direction.
+		if snct {
+			conn.newDecompressionReader = decompressNoContextTakeover
+		} else {
+			conn.readContextTakeover = newContextTakeoverDecompressor()
+			conn.newDecompressionReader = conn.readContextTakeover.newReader
+		}
+		if cnct {
+			conn.newCompressionWriter = compressNoContextTakeover
+		} else {
+			conn.writeContextTakeover = newContextTakeoverCompressor()
+			conn.newCompressionWriter = conn.writeContextTakeover.newWriter
+		}
 		break
 	}
 
