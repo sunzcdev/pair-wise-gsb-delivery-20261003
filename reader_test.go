@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/mail"
 	"strings"
 	"testing"
+	"time"
 )
 
 const mboxWithOneMessage = `From herp.derp@example.com Thu Jan  1 00:00:01 2015
@@ -506,4 +508,293 @@ Bye.
 	// Output:
 	// Message from herp.derp@example.com (Herp Derp)
 	// Message from derp.herp@example.com (Derp Herp)
+}
+
+func TestNextMessageWithEnvelope(t *testing.T) {
+	b := bytes.NewBufferString(mboxWithThreeMessages)
+	m := NewReader(b)
+
+	wantFrom := []string{
+		"herp.derp@example.com",
+		"derp.herp@example.com",
+		"bernd.lauert@example.com",
+	}
+	wantDate := []time.Time{
+		time.Date(2015, 1, 1, 0, 0, 1, 0, time.UTC),
+		time.Date(2015, 1, 1, 0, 0, 1, 0, time.UTC),
+		time.Date(2015, 1, 3, 0, 0, 1, 0, time.UTC),
+	}
+	wantLine := []string{
+		"From herp.derp@example.com Thu Jan  1 00:00:01 2015",
+		"From derp.herp@example.com Thu Jan  1 00:00:01 2015",
+		"From bernd.lauert@example.com Thu Jan  3 00:00:01 2015",
+	}
+
+	for i := 0; i < 3; i++ {
+		env, r, err := m.NextMessageWithEnvelope()
+		if err != nil {
+			t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+		}
+		if env.From != wantFrom[i] {
+			t.Errorf("Message %d: expected From %q, got %q", i, wantFrom[i], env.From)
+		}
+		if !env.Date.Equal(wantDate[i]) {
+			t.Errorf("Message %d: expected Date %v, got %v", i, wantDate[i], env.Date)
+		}
+		if env.Line != wantLine[i] {
+			t.Errorf("Message %d: expected Line %q, got %q", i, wantLine[i], env.Line)
+		}
+		if r == nil {
+			t.Errorf("Message %d: expected non-nil message reader", i)
+		}
+	}
+
+	if _, _, err := m.NextMessageWithEnvelope(); err != io.EOF {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+}
+
+func TestNextMessageWithEnvelopeBody(t *testing.T) {
+	b := bytes.NewBufferString(mboxWithOneMessage)
+	m := NewReader(b)
+
+	env, r, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+
+	var text bytes.Buffer
+	if _, err := text.ReadFrom(r); err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+	if want := toCRLF(mboxFirstMessage); text.String() != want {
+		t.Errorf("Expected:\n %q\ngot\n%q", want, text.String())
+	}
+}
+
+func TestNextMessageWithEnvelopeLenientBadDate(t *testing.T) {
+	b := bytes.NewBufferString(`From herp.derp@example.com this is not a date
+From: herp.derp@example.com (Herp Derp)
+
+Body.
+`)
+	m := NewReader(b)
+
+	env, r, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+	if !env.Date.IsZero() {
+		t.Errorf("Expected zero Date, got %v", env.Date)
+	}
+	if env.Line != "From herp.derp@example.com this is not a date" {
+		t.Errorf("Unexpected Line: %q", env.Line)
+	}
+
+	body, err := ioutil.ReadAll(r)
+	if err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+	if !strings.Contains(string(body), "Body.") {
+		t.Errorf("Expected message body to be readable, got %q", body)
+	}
+}
+
+func TestNextMessageWithEnvelopeStrictBadDate(t *testing.T) {
+	mbox := `From herp.derp@example.com Thu Jan  1 00:00:01 2015
+From: herp.derp@example.com (Herp Derp)
+
+First.
+
+From derp.herp@example.com not a date
+From: derp.herp@example.com (Derp Herp)
+
+Second.
+`
+	b := bytes.NewBufferString(mbox)
+	m := NewReaderWithOptions(b, ReaderOptions{Strict: true})
+
+	env, _, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+
+	_, _, err = m.NextMessageWithEnvelope()
+	if err == nil {
+		t.Fatal("Expected error after NextMessageWithEnvelope()")
+	}
+	perr, ok := err.(*ParseError)
+	if !ok {
+		t.Fatalf("Expected *ParseError, got %T (%v)", err, err)
+	}
+	if perr.Message != 2 {
+		t.Errorf("Expected Message 2, got %d", perr.Message)
+	}
+	if perr.Line != "From derp.herp@example.com not a date" {
+		t.Errorf("Unexpected Line: %q", perr.Line)
+	}
+
+	// The error is sticky.
+	if _, _, err := m.NextMessageWithEnvelope(); err != perr {
+		t.Fatalf("Expected sticky error %v, got %v", perr, err)
+	}
+	if _, err := m.NextMessage(); err != perr {
+		t.Fatalf("Expected sticky error %v, got %v", perr, err)
+	}
+}
+
+func TestNextMessageWithEnvelopeEmptySender(t *testing.T) {
+	mbox := "From  Thu Jan  1 00:00:01 2015\n" +
+		"From: herp.derp@example.com (Herp Derp)\n" +
+		"\n" +
+		"Body.\n"
+	b := bytes.NewBufferString(mbox)
+	m := NewReader(b)
+
+	env, _, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "" {
+		t.Errorf("Expected empty From, got %q", env.From)
+	}
+	if want := time.Date(2015, 1, 1, 0, 0, 1, 0, time.UTC); !env.Date.Equal(want) {
+		t.Errorf("Expected Date %v, got %v", want, env.Date)
+	}
+}
+
+func TestNextMessageWithEnvelopeTrailingText(t *testing.T) {
+	mbox := "From herp.derp@example.com Thu Jan  1 00:00:01 2015 some trailing text\n" +
+		"From: herp.derp@example.com (Herp Derp)\n" +
+		"\n" +
+		"Body.\n"
+	b := bytes.NewBufferString(mbox)
+	m := NewReader(b)
+
+	env, _, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+	if want := time.Date(2015, 1, 1, 0, 0, 1, 0, time.UTC); !env.Date.Equal(want) {
+		t.Errorf("Expected Date %v, got %v", want, env.Date)
+	}
+	if !strings.HasSuffix(env.Line, " some trailing text") {
+		t.Errorf("Expected Line to preserve trailing text, got %q", env.Line)
+	}
+}
+
+func TestNextMessageWithEnvelopeLongSeparator(t *testing.T) {
+	longFrom := strings.Repeat("x", 10000) + "@example.com"
+	mbox := "From herp.derp@example.com Thu Jan  1 00:00:01 2015\n" +
+		"From: herp.derp@example.com (Herp Derp)\n" +
+		"\n" +
+		"First.\n" +
+		"\n" +
+		"From " + longFrom + " Thu Jan  2 00:00:01 2015\n" +
+		"From: derp.herp@example.com (Derp Herp)\n" +
+		"\n" +
+		"Second.\n"
+	b := bytes.NewBufferString(mbox)
+	m := NewReader(b)
+
+	env, _, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+
+	env, _, err = m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != longFrom {
+		t.Errorf("Expected From of length %d, got %d", len(longFrom), len(env.From))
+	}
+	if want := time.Date(2015, 1, 2, 0, 0, 1, 0, time.UTC); !env.Date.Equal(want) {
+		t.Errorf("Expected Date %v, got %v", want, env.Date)
+	}
+}
+
+func TestNextMessageWithEnvelopeSeparatorAtEOFWithoutNewline(t *testing.T) {
+	b := bytes.NewBufferString("From herp.derp@example.com Thu Jan  1 00:00:01 2015")
+	m := NewReader(b)
+
+	env, r, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "herp.derp@example.com" {
+		t.Errorf("Expected From %q, got %q", "herp.derp@example.com", env.From)
+	}
+
+	body, err := ioutil.ReadAll(r)
+	if err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+	if len(body) != 0 {
+		t.Errorf("Expected empty body, got %q", body)
+	}
+
+	if _, _, err := m.NextMessageWithEnvelope(); err != io.EOF {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+}
+
+func TestMixedEntryPoints(t *testing.T) {
+	b := bytes.NewBufferString(mboxWithThreeMessages)
+	m := NewReader(b)
+
+	// First message via NextMessage, read to completion.
+	r, err := m.NextMessage()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessage(): %v", err)
+	}
+	if _, err := io.Copy(ioutil.Discard, r); err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+
+	// Second message via NextMessageWithEnvelope, only partially read.
+	env, r, err := m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "derp.herp@example.com" {
+		t.Errorf("Expected From %q, got %q", "derp.herp@example.com", env.From)
+	}
+	p := make([]byte, 10)
+	if _, err := r.Read(p); err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+
+	// Third message via NextMessage again. The envelope of the previous
+	// call must belong to the second message even though it was not read
+	// to completion.
+	env, r, err = m.NextMessageWithEnvelope()
+	if err != nil {
+		t.Fatalf("Unexpected error after NextMessageWithEnvelope(): %v", err)
+	}
+	if env.From != "bernd.lauert@example.com" {
+		t.Errorf("Expected From %q, got %q", "bernd.lauert@example.com", env.From)
+	}
+	if _, err := io.Copy(ioutil.Discard, r); err != nil {
+		t.Fatalf("Unexpected error reading message body: %v", err)
+	}
+
+	if _, err := m.NextMessage(); err != io.EOF {
+		t.Fatalf("Unexpected error after NextMessage(): %v", err)
+	}
 }
