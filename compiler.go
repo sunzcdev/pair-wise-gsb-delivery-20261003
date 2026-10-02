@@ -30,6 +30,7 @@ type Code struct {
 	variables []string
 	codes     []*code
 	codeinfos []codeinfo
+	inputIter Iter
 }
 
 // Run runs the code with the variable values (which should be in the
@@ -43,12 +44,36 @@ func (c *Code) Run(v any, values ...any) Iter {
 
 // RunWithContext runs the code with context.
 func (c *Code) RunWithContext(ctx context.Context, v any, values ...any) Iter {
+	return c.RunInputWithContext(ctx, nil, v, values...)
+}
+
+// RunInput runs the code with the input iterator used by input(s)/0, the
+// query input and the variable values (which should be in the same order as
+// the given variables using [WithVariables]), and returns a result iterator.
+//
+// The input iterator is bound to this run: reusing the compiled [*Code] in
+// multiple runs, even concurrently, never consumes values from each other's
+// iterator. A non-nil inputIter takes precedence over the iterator given to
+// [WithInputIter] at compile time; pass nil to use the compile-time one.
+//
+// The returned iterator owns the given input iterator. When stopping the
+// iteration before the run terminates, call Close on the returned iterator
+// (it additionally implements [io.Closer]) to release the input source.
+// Closing is idempotent and is a no-op for iterators which do not implement
+// [io.Closer], and the compile-time input iterator is never closed.
+func (c *Code) RunInput(inputIter Iter, v any, values ...any) Iter {
+	return c.RunInputWithContext(context.Background(), inputIter, v, values...)
+}
+
+// RunInputWithContext runs the code with context. See [*Code.RunInput] for
+// the ownership of the input iterator.
+func (c *Code) RunInputWithContext(ctx context.Context, inputIter Iter, v any, values ...any) Iter {
 	if len(values) > len(c.variables) {
 		return NewIter(&tooManyVariableValuesError{})
 	} else if len(values) < len(c.variables) {
 		return NewIter(&expectedVariableError{c.variables[len(values)]})
 	}
-	return newEnv(ctx).execute(c, v, values...)
+	return newEnv(ctx, inputIter).execute(c, v, values...)
 }
 
 type scopeinfo struct {
@@ -115,6 +140,7 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 		variables: c.variables,
 		codes:     c.codes,
 		codeinfos: c.codeinfos,
+		inputIter: c.inputIter,
 	}, nil
 }
 
@@ -963,15 +989,8 @@ func (c *compiler) compileFunc(e *Func) error {
 				-1,
 			)
 		case "input":
-			if c.inputIter == nil {
-				return &inputNotAllowedError{}
-			}
-			return c.compileCallInternal(
-				[3]any{c.funcInput, 0, e.Name},
-				e.Args,
-				true,
-				-1,
-			)
+			c.append(&code{op: opinput})
+			return nil
 		case "modulemeta":
 			return c.compileCallInternal(
 				[3]any{c.funcModulemeta, 0, e.Name},
@@ -1200,14 +1219,6 @@ func (c *compiler) funcBuiltins(any, []any) any {
 		ys[i] = x.name + "/" + strconv.Itoa(x.arity)
 	}
 	return ys
-}
-
-func (c *compiler) funcInput(any, []any) any {
-	v, ok := c.inputIter.Next()
-	if !ok {
-		return errors.New("break")
-	}
-	return v
 }
 
 func (c *compiler) funcModulemeta(v any, _ []any) any {

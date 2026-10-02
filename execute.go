@@ -2,6 +2,7 @@ package gojq
 
 import (
 	"context"
+	"errors"
 	"math"
 	"reflect"
 	"slices"
@@ -11,6 +12,11 @@ import (
 func (env *env) execute(bc *Code, v any, vars ...any) Iter {
 	env.codes = bc.codes
 	env.codeinfos = bc.codeinfos
+	if env.inputIter == nil {
+		env.inputIter = bc.inputIter
+	} else {
+		env.inputOwned = true
+	}
 	env.push(v)
 	for i := len(vars) - 1; i >= 0; i-- {
 		env.push(vars[i])
@@ -326,6 +332,21 @@ loop:
 			if !env.paths.empty() && env.expdepth == 0 {
 				env.paths.push(xs[0])
 			}
+		case opinput:
+			if backtrack {
+				break loop
+			}
+			env.pop()
+			if env.inputIter == nil {
+				err = errors.New("break")
+				break loop
+			}
+			w, ok := env.inputIter.Next()
+			if !ok {
+				err = errors.New("break")
+				break loop
+			}
+			env.push(w)
 		case opexpbegin:
 			env.expdepth++
 		case opexpend:

@@ -319,11 +319,29 @@ func TestQueryRun_Input(t *testing.T) {
 		t.Fatal("should emit an error but got no output")
 	}
 	if err, ok := v.(error); ok {
-		if expected := "input(s)/0 is not allowed"; err.Error() != expected {
+		if expected := "break"; err.Error() != expected {
 			t.Errorf("expected: %v, got: %v", expected, err)
 		}
 	} else {
 		t.Errorf("should emit an error but got: %v", v)
+	}
+}
+
+func TestQueryRun_InputsWithoutInputIter(t *testing.T) {
+	query, err := gojq.Parse("[inputs]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := query.Run(nil)
+	v, ok := iter.Next()
+	if !ok {
+		t.Fatal("should emit a value but got no output")
+	}
+	if err, ok := v.(error); ok {
+		t.Fatalf("should not emit an error but got: %v", err)
+	}
+	if got, ok := v.([]any); !ok || len(got) != 0 {
+		t.Errorf("expected an empty array, got: %#v", v)
 	}
 }
 

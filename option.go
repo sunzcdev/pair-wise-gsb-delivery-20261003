@@ -89,6 +89,11 @@ func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []
 // to distinguish the query input and the values for input(s) functions. For
 // example, consider using inputs with --null-input. If you want to allow
 // input(s) functions, create an [Iter] and use WithInputIter option.
+//
+// The iterator is shared by every [*Code.Run] of the compiled code. To bind a
+// separate input source to each run, use [*Code.RunInput] (or
+// [*Code.RunInputWithContext]); a non-nil run-time iterator takes precedence
+// over this compile-time iterator.
 func WithInputIter(inputIter Iter) CompilerOption {
 	return func(c *compiler) {
 		c.inputIter = inputIter

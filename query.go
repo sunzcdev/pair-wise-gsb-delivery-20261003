@@ -41,11 +41,23 @@ func (e *Query) Run(v any) Iter {
 
 // RunWithContext runs the query with context.
 func (e *Query) RunWithContext(ctx context.Context, v any) Iter {
+	return e.RunInputWithContext(ctx, nil, v)
+}
+
+// RunInput runs the query with the input iterator used by input(s)/0 and the
+// query input. The query is compiled on every call; prefer [Compile] and
+// [*Code.RunInput] to reuse the compiled code across multiple runs.
+func (e *Query) RunInput(inputIter Iter, v any) Iter {
+	return e.RunInputWithContext(context.Background(), inputIter, v)
+}
+
+// RunInputWithContext runs the query with context. See [*Query.RunInput].
+func (e *Query) RunInputWithContext(ctx context.Context, inputIter Iter, v any) Iter {
 	code, err := Compile(e)
 	if err != nil {
 		return NewIter(err)
 	}
-	return code.RunWithContext(ctx, v)
+	return code.RunInputWithContext(ctx, inputIter, v)
 }
 
 func (e *Query) String() string {

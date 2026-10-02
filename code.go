@@ -34,6 +34,7 @@ const (
 	opscope
 	opret
 	opiter
+	opinput
 	opexpbegin
 	opexpend
 	oppathbegin
@@ -94,6 +95,8 @@ func (op opcode) String() string {
 		return "ret"
 	case opiter:
 		return "iter"
+	case opinput:
+		return "input"
 	case opexpbegin:
 		return "expbegin"
 	case opexpend:

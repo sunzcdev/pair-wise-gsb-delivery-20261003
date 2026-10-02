@@ -98,12 +98,6 @@ func (*lengthMismatchError) Error() string {
 	return "length mismatch"
 }
 
-type inputNotAllowedError struct{}
-
-func (*inputNotAllowedError) Error() string {
-	return "input(s)/0 is not allowed"
-}
-
 type funcNotFoundError struct {
 	f *Func
 }
