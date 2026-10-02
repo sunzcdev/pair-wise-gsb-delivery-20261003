@@ -63,6 +63,84 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     end
   end
 
+  class UnsafeKey
+    def inspect
+      raise 'inspect must not be used for cycle diagnostics'
+    end
+
+    def to_s
+      raise 'to_s must not be used for cycle diagnostics'
+    end
+  end
+
+  class TwoKeyCycleLoader < GraphQL::Batch::Loader
+    attr_reader :one, :two
+
+    def perform(keys)
+      keys.each do |key|
+        other = key.equal?(@one) ? @two : @one
+        fulfill(key, load(other).sync)
+      end
+    end
+
+    def prime_cycle
+      @one = UnsafeKey.new
+      @two = UnsafeKey.new
+      load(@one)
+      load(@two)
+    end
+  end
+
+  class CycleLoaderA < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each { |key| fulfill(key, CycleLoaderB.load(key).sync) }
+    end
+  end
+
+  class CycleLoaderB < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each { |key| fulfill(key, CycleLoaderC.load(key).sync) }
+    end
+  end
+
+  class CycleLoaderC < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each { |key| fulfill(key, CycleLoaderA.load(key).sync) }
+    end
+  end
+
+  class ReentrantLoader < GraphQL::Batch::Loader
+    def perform(keys)
+      if keys == [:a]
+        fulfill(:a, load(:b).sync)
+      else
+        keys.each { |key| fulfill(key, key) }
+      end
+    end
+  end
+
+  class DiamondSharedLoader < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each { |key| fulfill(key, key == :left ? 'left' : 'right') }
+    end
+  end
+
+  class DiamondRootLoader < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each do |key|
+        left = DiamondSharedLoader.load(:left)
+        right = DiamondSharedLoader.load(:right)
+        fulfill(key, Promise.all([left, right]).then { |values| values.join })
+      end
+    end
+  end
+
+  class FinishedKeyCycleLoader < GraphQL::Batch::Loader
+    def perform(keys)
+      keys.each { |key| fulfill(key, load(:finished).sync) if key == :new }
+    end
+  end
+
   class KwargsGroupCountLoader < GraphQL::Batch::Loader
     def initialize(group, key: :id, preload: true, **conditions)
     end
@@ -276,4 +354,83 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
 
     assert_equal :a, loader.load(:a).sync
   end
+
+  def test_two_key_cycle
+    loader = TwoKeyCycleLoader.for
+    loader.prime_cycle
+    one_promise = loader.load(loader.one)
+    two_promise = loader.load(loader.two)
+
+    error = assert_raises(GraphQL::Batch::DependencyCycleError) do
+      one_promise.sync
+    end
+
+    assert_equal 3, error.loaders.length
+    assert_equal loader, error.loaders[0]
+    assert_equal loader, error.loaders[1]
+    assert_equal loader, error.loaders[2]
+    assert_equal 3, error.keys.length
+    assert_equal true, error.keys.first.equal?(error.keys.last)
+    assert_equal true, loader.one.equal?(error.keys.first)
+    assert_equal true, loader.two.equal?(error.keys[1])
+    assert_match(Regexp.new(
+      'Loader dependency cycle: (?:GraphQL::Batch::LoaderTest::)?TwoKeyCycleLoader#[0-9a-f]+ ' \
+      '(?:GraphQL::Batch::LoaderTest::)?UnsafeKey#[0-9a-f]+ -> ' \
+      '(?:GraphQL::Batch::LoaderTest::)?TwoKeyCycleLoader#[0-9a-f]+ ' \
+      '(?:GraphQL::Batch::LoaderTest::)?UnsafeKey#[0-9a-f]+ -> ' \
+      '(?:GraphQL::Batch::LoaderTest::)?TwoKeyCycleLoader#[0-9a-f]+ ' \
+      '(?:GraphQL::Batch::LoaderTest::)?UnsafeKey#[0-9a-f]+'
+    ), error.message)
+    assert_equal true, one_promise.rejected?
+    assert_same error, one_promise.reason
+    assert_equal true, two_promise.rejected?
+    assert_same error, two_promise.reason
+    assert_equal false, GraphQL::Batch::Executor.current.loading
+  end
+
+  def test_three_loader_cycle
+    error = assert_raises(GraphQL::Batch::DependencyCycleError) do
+      CycleLoaderA.load(:x).sync
+    end
+
+    assert_equal [CycleLoaderA, CycleLoaderB, CycleLoaderC, CycleLoaderA], error.loaders.map(&:class)
+    assert_equal [:x, :x, :x, :x], error.keys
+    assert_match(Regexp.new(
+      '\ALoader dependency cycle: GraphQL::Batch::LoaderTest::CycleLoaderA#[0-9a-f]+ :x -> ' \
+      'GraphQL::Batch::LoaderTest::CycleLoaderB#[0-9a-f]+ :x -> ' \
+      'GraphQL::Batch::LoaderTest::CycleLoaderC#[0-9a-f]+ :x -> ' \
+      'GraphQL::Batch::LoaderTest::CycleLoaderA#[0-9a-f]+ :x\z'
+    ), error.message)
+  end
+
+  def test_legal_reentrant_loader
+    loader = ReentrantLoader.for
+
+    assert_equal :b, loader.load(:a).sync
+    assert_equal :b, loader.load(:b).sync
+  end
+
+  def test_diamond_shared_dependency
+    assert_equal 'leftright', DiamondRootLoader.load(:root).sync
+  end
+
+  def test_finished_key_does_not_create_cycle
+    loader = FinishedKeyCycleLoader.for
+    loader.prime(:finished, :ready)
+
+    assert_equal :ready, loader.load(:new).sync
+  end
+
+  def test_cycle_does_not_block_unrelated_request
+    loader = TwoKeyCycleLoader.for
+    loader.prime_cycle
+
+    assert_raises(GraphQL::Batch::DependencyCycleError) do
+      loader.load(loader.one).sync
+    end
+
+    assert_equal :ready, EchoLoader.load(:ready).sync
+    assert_equal false, GraphQL::Batch::Executor.current.loading
+  end
+
 end
