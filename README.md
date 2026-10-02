@@ -37,6 +37,32 @@ This implementation allows for creating HyperLogLog sketches with arbitrary prec
 
 Users can choose the precision that best fits their use case, balancing memory usage against estimation accuracy.
 
+## Custom Hash Functions and Hash Domains
+
+`Sketch.Insert` hashes with the package's MetroHash64 seed, and
+`Sketch.InsertHash` accepts any pre-hashed value without recording how it was
+produced. Callers that hash with their own algorithm, seed or domain can
+instead use `DomainSketch`, which tags a sketch with a `HashConfig`
+identifier (algorithm name, seed and an optional caller-defined domain label):
+
+```go
+config := hyperloglog.HashConfig{
+    Algorithm: "metro64",
+    Seed:      42,
+    Domain:    "events",
+    Hash:      func(e []byte) uint64 { return metro.Hash64(e, 42) },
+}
+sk, err := hyperloglog.NewDomainSketch(config)
+```
+
+`DomainSketch.Merge` refuses to combine sketches from different hash domains,
+so estimates can never mix values hashed under different configurations. The
+hash function is never serialized: `UnmarshalBinaryWithConfig` requires the
+caller to supply the matching `HashConfig` and rejects a mismatch with
+`ErrorDomainMismatch`. Bare `Sketch` binaries decoded through
+`UnmarshalLegacyBinary` carry an unspecified domain and do not merge with any
+named domain.
+
 ## Note
 A big thank you to Prof. Shigang Chen and his team at the University of Florida who are actively conducting research around "Big Network Data".
 
