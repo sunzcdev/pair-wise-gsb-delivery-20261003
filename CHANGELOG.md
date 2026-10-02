@@ -1,3 +1,6 @@
+## Unreleased
+* [FEATURE] Add `Interactor::Cancellation` signal to stop organizers at safe boundaries between steps
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

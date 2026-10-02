@@ -130,6 +130,47 @@ module Interactor
       raise Failure, self
     end
 
+    # Public: Whether the Interactor::Context has been cancelled. A context is
+    # flagged as cancelled when an Interactor::Organizer finds the
+    # Interactor::Cancellation signal cancelled at a safe boundary between
+    # steps. Cancellation is tracked separately from failure: a cancelled
+    # context is not failed and a failed context is not cancelled.
+    #
+    # Examples
+    #
+    #   context = Interactor::Context.new
+    #   # => #<Interactor::Context>
+    #   context.cancelled?
+    #   # => false
+    #
+    # Returns false by default or true if cancelled.
+    def cancelled?
+      @cancelled || false
+    end
+
+    # Public: The reason given when the Interactor::Cancellation signal was
+    # cancelled, or nil if the context was not cancelled or no reason was
+    # provided.
+    #
+    # Returns the cancellation reason or nil.
+    def cancellation_reason
+      @cancellation_reason
+    end
+
+    # Internal: Flag the Interactor::Context as cancelled, recording the
+    # reason given when the cancellation signal was cancelled. The
+    # "cancelled!" method is used internally by Interactor::Organizer when it
+    # detects a cancelled Interactor::Cancellation signal.
+    #
+    # reason - The reason given when the cancellation signal was cancelled.
+    #          (default: nil)
+    #
+    # Returns nothing.
+    def cancelled!(reason = nil)
+      @cancelled = true
+      @cancellation_reason = reason
+    end
+
     # Internal: Track that an Interactor has been called. The "called!" method
     # is used by the interactor being invoked with this context. After an
     # interactor is successfully called, the interactor instance is tracked in

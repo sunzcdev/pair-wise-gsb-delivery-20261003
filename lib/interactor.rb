@@ -1,4 +1,5 @@
 require "interactor/context"
+require "interactor/cancellation"
 require "interactor/error"
 require "interactor/hooks"
 require "interactor/organizer"
@@ -115,6 +116,10 @@ module Interactor
     run!
   rescue Failure => e
     if context.object_id != e.context.object_id
+      raise
+    end
+  rescue Cancelled => e
+    if e.context && context.object_id != e.context.object_id
       raise
     end
   end

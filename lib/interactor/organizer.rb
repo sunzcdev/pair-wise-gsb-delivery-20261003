@@ -73,11 +73,59 @@ module Interactor
       # expected not to define its own "#call" method in favor of this default
       # implementation.
       #
+      # If the context carries an Interactor::Cancellation signal (under the
+      # :cancellation key), the signal is checked at safe boundaries: before
+      # the first interactor, after each interactor completes normally and
+      # before the next interactor is invoked. A running interactor is never
+      # interrupted. When the signal is found cancelled, the completed
+      # interactor has already been tracked in the context, the context is
+      # flagged as cancelled and Interactor::Cancelled is raised so that the
+      # completed interactors are rolled back in the usual reverse order.
+      # Nested organizers share the same context and therefore the same
+      # signal.
+      #
       # Returns nothing.
       def call
+        signal = context.cancellation
         self.class.organized.each do |interactor|
-          interactor.call!(context)
+          check_cancellation(signal)
+          begin
+            interactor.call!(context)
+          rescue
+            record_cancellation(signal)
+            raise
+          end
+          check_cancellation(signal)
         end
+      end
+
+      private
+
+      # Internal: Flag the context as cancelled and raise
+      # Interactor::Cancelled if the given cancellation signal has been
+      # cancelled.
+      #
+      # signal - An Interactor::Cancellation signal or nil.
+      #
+      # Returns nothing.
+      # Raises Interactor::Cancelled if the signal is cancelled.
+      def check_cancellation(signal)
+        return unless signal && signal.cancelled?
+        record_cancellation(signal)
+        raise Cancelled.new(context, signal.reason)
+      end
+
+      # Internal: Flag the context as cancelled, preserving the cancellation
+      # reason, without raising. Used when an ordinary error is already
+      # propagating so that both the error and the cancellation reason are
+      # preserved.
+      #
+      # signal - An Interactor::Cancellation signal or nil.
+      #
+      # Returns nothing.
+      def record_cancellation(signal)
+        return unless signal && signal.cancelled?
+        context.cancelled!(signal.reason)
       end
     end
   end

@@ -470,6 +470,44 @@ end
 interactor should have a single purpose, there should be no need to clean up
 after any failed interactor.
 
+#### Cancellation
+
+Sometimes the caller of an organizer loses interest in the result — for
+example, when the requester of a background job goes away. You can pass an
+`Interactor::Cancellation` signal to an organizer to stop it at safe
+boundaries between steps:
+
+```ruby
+signal = Interactor::Cancellation.new
+
+Thread.new do
+  # Later, from anywhere:
+  signal.cancel!("requester gave up")
+end
+
+result = PlaceOrder.call(order_params: order_params, cancellation: signal)
+
+if result.cancelled?
+  logger.info("cancelled: #{result.cancellation_reason}")
+end
+```
+
+The organizer checks the signal before the first interactor, after each
+interactor completes and before the next interactor starts. A running
+interactor is never interrupted. When the signal is found cancelled, the
+interactors that already completed — including the one that just finished —
+are rolled back in the usual reverse order, and the context is flagged as
+cancelled.
+
+Cancellation is distinct from failure: a cancelled context is not failed, and
+`Interactor::Cancelled` (raised by `call!`) is not an `Interactor::Failure`.
+If an organized interactor raises an ordinary error while the signal is
+cancelled, the error still propagates and the cancellation reason is preserved
+on the context.
+
+Nested organizers receive the same context, so they share the same
+cancellation signal.
+
 ## Testing Interactors
 
 When written correctly, an interactor is easy to test because it only *does* one

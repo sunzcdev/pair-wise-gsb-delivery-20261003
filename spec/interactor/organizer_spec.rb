@@ -33,7 +33,7 @@ module Interactor
 
     describe "#call" do
       let(:instance) { organizer.new }
-      let(:context) { double(:context) }
+      let(:context) { double(:context, cancellation: nil) }
       let(:interactor2) { double(:interactor2) }
       let(:interactor3) { double(:interactor3) }
       let(:interactor4) { double(:interactor4) }
