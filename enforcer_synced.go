@@ -204,6 +204,20 @@ func (e *SyncedEnforcer) EnforceWithMatcher(matcher string, rvals ...interface{}
 	return e.Enforcer.EnforceWithMatcher(matcher, rvals...)
 }
 
+// Decide is the three-valued counterpart of Enforce, see Enforcer.Decide.
+func (e *SyncedEnforcer) Decide(rvals ...interface{}) (Decision, []string, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.Decide(rvals...)
+}
+
+// DecideWithMatcher is Decide with a custom matcher, see Enforcer.DecideWithMatcher.
+func (e *SyncedEnforcer) DecideWithMatcher(matcher string, rvals ...interface{}) (Decision, []string, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.DecideWithMatcher(matcher, rvals...)
+}
+
 // EnforceEx explain enforcement by informing matched rules.
 func (e *SyncedEnforcer) EnforceEx(rvals ...interface{}) (bool, []string, error) {
 	e.m.RLock()

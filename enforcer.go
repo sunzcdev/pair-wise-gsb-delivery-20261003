@@ -716,6 +716,138 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		return true, nil
 	}
 
+	prep, err := e.prepareEnforcement(matcher, nil, rvals)
+	if err != nil {
+		return false, err
+	}
+
+	parameters := prep.parameters
+
+	var policyEffects []effector.Effect
+	var matcherResults []float64
+
+	var effect effector.Effect
+	var explainIndex int
+
+	if policyLen := len(e.model["p"][prep.pType].Policy); policyLen != 0 && strings.Contains(prep.expString, prep.pType+"_") { //nolint:nestif // TODO: reduce function complexity
+		policyEffects = make([]effector.Effect, policyLen)
+		matcherResults = make([]float64, policyLen)
+
+		for policyIndex, pvals := range e.model["p"][prep.pType].Policy {
+			// log.LogPrint("Policy Rule: ", pvals)
+			if len(e.model["p"][prep.pType].Tokens) != len(pvals) {
+				return false, fmt.Errorf(
+					"invalid policy size: expected %d, got %d, pvals: %v",
+					len(e.model["p"][prep.pType].Tokens),
+					len(pvals),
+					pvals)
+			}
+
+			parameters.pVals = pvals
+
+			result, err := prep.expression.Eval(prep.evalParams)
+			// log.LogPrint("Result: ", result)
+			if err != nil {
+				return false, err
+			}
+
+			// set to no-match at first
+			matcherResults[policyIndex] = 0
+			switch result := result.(type) {
+			case bool:
+				if result {
+					matcherResults[policyIndex] = 1
+				}
+			case float64:
+				if result != 0 {
+					matcherResults[policyIndex] = 1
+				}
+			default:
+				return false, errors.New("matcher result should be bool, int or float")
+			}
+
+			if j, ok := parameters.pTokens[prep.pType+"_eft"]; ok {
+				eft := parameters.pVals[j]
+				switch eft {
+				case "allow":
+					policyEffects[policyIndex] = effector.Allow
+				case "deny":
+					policyEffects[policyIndex] = effector.Deny
+				default:
+					policyEffects[policyIndex] = effector.Indeterminate
+				}
+			} else {
+				policyEffects[policyIndex] = effector.Allow
+			}
+
+			// if e.model["e"]["e"].Value == "priority(p_eft) || deny" {
+			//	break
+			// }
+
+			effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][prep.eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
+			if err != nil {
+				return false, err
+			}
+			if effect != effector.Indeterminate {
+				break
+			}
+		}
+	} else {
+		if prep.hasEval && len(e.model["p"][prep.pType].Policy) == 0 {
+			return false, errors.New("please make sure rule exists in policy when using eval() in matcher")
+		}
+
+		policyEffects = make([]effector.Effect, 1)
+		matcherResults = make([]float64, 1)
+		matcherResults[0] = 1
+
+		parameters.pVals = make([]string, len(parameters.pTokens))
+
+		result, err := prep.expression.Eval(prep.evalParams)
+		if err != nil {
+			return false, err
+		}
+
+		if result.(bool) {
+			policyEffects[0] = effector.Allow
+		} else {
+			policyEffects[0] = effector.Indeterminate
+		}
+
+		effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][prep.eType].Value, policyEffects, matcherResults, 0, 1)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	if explains != nil {
+		if explainIndex != -1 && len(e.model["p"][prep.pType].Policy) > explainIndex {
+			*explains = e.model["p"][prep.pType].Policy[explainIndex]
+		}
+	}
+
+	// effect -> result
+	result := effect == effector.Allow
+
+	return result, nil
+}
+
+// preparedEnforcement holds the compiled matcher expression and the parameters
+// shared by enforce and decide.
+type preparedEnforcement struct {
+	expression *govaluate.EvaluableExpression
+	parameters *enforceParameters
+	evalParams govaluate.Parameters
+	expString  string
+	pType      string
+	eType      string
+	hasEval    bool
+}
+
+// prepareEnforcement compiles the matcher and builds the evaluation parameters.
+// If wrap is not nil, it wraps the enforceParameters (e.g. to track accesses to
+// missing request attributes) and the wrapped parameters are used for evaluation.
+func (e *Enforcer) prepareEnforcement(matcher string, wrap func(*enforceParameters) govaluate.Parameters, rvals []interface{}) (*preparedEnforcement, error) {
 	functions := e.fm.GetFunctions()
 	if _, ok := e.model["g"]; ok {
 		for key, ast := range e.model["g"] {
@@ -731,23 +863,17 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		}
 	}
 
-	var (
-		rType = "r"
-		pType = "p"
-		eType = "e"
-		mType = "m"
-	)
+	rType := "r"
+	pType := "p"
+	eType := "e"
+	mType := "m"
 	if len(rvals) != 0 {
-		switch rvals[0].(type) {
-		case EnforceContext:
-			enforceContext := rvals[0].(EnforceContext)
+		if enforceContext, ok := rvals[0].(EnforceContext); ok {
 			rType = enforceContext.RType
 			pType = enforceContext.PType
 			eType = enforceContext.EType
 			mType = enforceContext.MType
 			rvals = rvals[1:]
-		default:
-			break
 		}
 	}
 
@@ -776,10 +902,10 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 				// Only attempt JSON parsing for strings that look like JSON objects or arrays
 				if len(rval) > 0 && (rval[0] == '{' || rval[0] == '[') {
 					var mapValue map[string]interface{}
-					mapValue, err = util.JsonToMap(rval)
+					mapValue, err := util.JsonToMap(rval)
 					if err != nil {
 						// Return a clear error when JSON-like string fails to parse
-						return false, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
+						return nil, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
 					}
 					rvals[i] = mapValue
 				}
@@ -787,7 +913,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		}
 	}
 
-	parameters := enforceParameters{
+	parameters := &enforceParameters{
 		rTokens: rTokens,
 		rVals:   rvals,
 
@@ -795,130 +921,35 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	}
 
 	hasEval := util.HasEval(expString)
-	if hasEval {
-		functions["eval"] = generateEvalFunction(functions, &parameters)
+	var evalParams govaluate.Parameters = parameters
+	if wrap != nil {
+		evalParams = wrap(parameters)
 	}
-	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
+	if hasEval {
+		functions["eval"] = generateEvalFunction(functions, evalParams)
+	}
+	expression, err := e.getAndStoreMatcherExpression(hasEval, expString, functions)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"invalid request size: expected %d, got %d, rvals: %v",
 			len(e.model["r"][rType].Tokens),
 			len(rvals),
 			rvals)
 	}
 
-	var policyEffects []effector.Effect
-	var matcherResults []float64
-
-	var effect effector.Effect
-	var explainIndex int
-
-	if policyLen := len(e.model["p"][pType].Policy); policyLen != 0 && strings.Contains(expString, pType+"_") { //nolint:nestif // TODO: reduce function complexity
-		policyEffects = make([]effector.Effect, policyLen)
-		matcherResults = make([]float64, policyLen)
-
-		for policyIndex, pvals := range e.model["p"][pType].Policy {
-			// log.LogPrint("Policy Rule: ", pvals)
-			if len(e.model["p"][pType].Tokens) != len(pvals) {
-				return false, fmt.Errorf(
-					"invalid policy size: expected %d, got %d, pvals: %v",
-					len(e.model["p"][pType].Tokens),
-					len(pvals),
-					pvals)
-			}
-
-			parameters.pVals = pvals
-
-			result, err := expression.Eval(parameters)
-			// log.LogPrint("Result: ", result)
-			if err != nil {
-				return false, err
-			}
-
-			// set to no-match at first
-			matcherResults[policyIndex] = 0
-			switch result := result.(type) {
-			case bool:
-				if result {
-					matcherResults[policyIndex] = 1
-				}
-			case float64:
-				if result != 0 {
-					matcherResults[policyIndex] = 1
-				}
-			default:
-				return false, errors.New("matcher result should be bool, int or float")
-			}
-
-			if j, ok := parameters.pTokens[pType+"_eft"]; ok {
-				eft := parameters.pVals[j]
-				switch eft {
-				case "allow":
-					policyEffects[policyIndex] = effector.Allow
-				case "deny":
-					policyEffects[policyIndex] = effector.Deny
-				default:
-					policyEffects[policyIndex] = effector.Indeterminate
-				}
-			} else {
-				policyEffects[policyIndex] = effector.Allow
-			}
-
-			// if e.model["e"]["e"].Value == "priority(p_eft) || deny" {
-			//	break
-			// }
-
-			effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, policyIndex, policyLen)
-			if err != nil {
-				return false, err
-			}
-			if effect != effector.Indeterminate {
-				break
-			}
-		}
-	} else {
-		if hasEval && len(e.model["p"][pType].Policy) == 0 {
-			return false, errors.New("please make sure rule exists in policy when using eval() in matcher")
-		}
-
-		policyEffects = make([]effector.Effect, 1)
-		matcherResults = make([]float64, 1)
-		matcherResults[0] = 1
-
-		parameters.pVals = make([]string, len(parameters.pTokens))
-
-		result, err := expression.Eval(parameters)
-		if err != nil {
-			return false, err
-		}
-
-		if result.(bool) {
-			policyEffects[0] = effector.Allow
-		} else {
-			policyEffects[0] = effector.Indeterminate
-		}
-
-		effect, explainIndex, err = e.eft.MergeEffects(e.model["e"][eType].Value, policyEffects, matcherResults, 0, 1)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	if explains != nil {
-		if explainIndex != -1 && len(e.model["p"][pType].Policy) > explainIndex {
-			*explains = e.model["p"][pType].Policy[explainIndex]
-		}
-	}
-
-	// effect -> result
-	result := effect == effector.Allow
-
-	return result, nil
+	return &preparedEnforcement{
+		expression: expression,
+		parameters: parameters,
+		evalParams: evalParams,
+		expString:  expString,
+		pType:      pType,
+		eType:      eType,
+		hasEval:    hasEval,
+	}, nil
 }
 
 func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, functions map[string]govaluate.ExpressionFunction) (*govaluate.EvaluableExpression, error) {
@@ -1082,7 +1113,7 @@ func (p enforceParameters) Get(name string) (interface{}, error) {
 	}
 }
 
-func generateEvalFunction(functions map[string]govaluate.ExpressionFunction, parameters *enforceParameters) govaluate.ExpressionFunction {
+func generateEvalFunction(functions map[string]govaluate.ExpressionFunction, parameters govaluate.Parameters) govaluate.ExpressionFunction {
 	return func(args ...interface{}) (interface{}, error) {
 		if len(args) != 1 {
 			return nil, fmt.Errorf("function eval(subrule string) expected %d arguments, but got %d", 1, len(args))
