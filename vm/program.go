@@ -62,6 +62,17 @@ func (program *Program) Source() file.Source {
 	return program.source
 }
 
+// FunctionByName returns the registered (via expr.Function) function with the
+// given name, or nil if no such function was compiled into the program.
+func (program *Program) FunctionByName(name string) Function {
+	for i := 0; i < len(program.functions); i++ {
+		if program.debugInfo[fmt.Sprintf("func_%d", i)] == name {
+			return program.functions[i]
+		}
+	}
+	return nil
+}
+
 // Node returns origin ast.Node.
 func (program *Program) Node() ast.Node {
 	return program.node

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/batch"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/checker"
 	"github.com/expr-lang/expr/compiler"
@@ -263,6 +264,18 @@ func Compile(input string, ops ...Option) (*vm.Program, error) {
 // Run evaluates given bytecode program.
 func Run(program *vm.Program, env any) (any, error) {
 	return vm.Run(program, env)
+}
+
+// RunBatch evaluates the program for every row provided as columns and
+// returns the result and the error of each row. It is a convenience wrapper
+// around the github.com/expr-lang/expr/batch package.
+func RunBatch(program *vm.Program, columns []batch.Column, opts ...batch.Option) ([]any, []error, error) {
+	return batch.Run(program, columns, opts...)
+}
+
+// RunBatchMap is a convenience wrapper around batch.RunMap.
+func RunBatchMap(program *vm.Program, columns map[string]any, opts ...batch.Option) ([]any, []error, error) {
+	return batch.RunMap(program, columns, opts...)
 }
 
 // Eval parses, compiles and runs given input.
