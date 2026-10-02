@@ -56,7 +56,7 @@ module Pundit
     # @param possibly_namespaced_record [Object, Array] the object we're checking permissions of
     # @param query [Symbol, String] the predicate method to check on the policy (e.g. `:show?`)
     # @param policy_class [Class] the policy class we want to force use of
-    # @raise [NotAuthorizedError] if the given query method returned false
+    # @raise [NotAuthorizedError] if the given query method returned false or a denied {Decision}
     # @return [Object] Always returns the passed object record
     # @since v2.3.2
     def authorize(possibly_namespaced_record, query:, policy_class:)
@@ -67,7 +67,13 @@ module Pundit
         policy!(possibly_namespaced_record)
       end
 
-      raise NotAuthorizedError, query: query, record: record, policy: policy unless policy.public_send(query)
+      result = policy.public_send(query)
+      decision = result if result.is_a?(Decision)
+      allowed = decision ? decision.allowed? : result
+
+      unless allowed
+        raise NotAuthorizedError, query: query, record: record, policy: policy, decision: decision
+      end
 
       record
     end

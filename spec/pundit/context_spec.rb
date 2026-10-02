@@ -33,6 +33,61 @@ RSpec.describe Pundit::Context do
     it "raises when the policy cannot be found" do
       expect { authorize(article, query: :update?) }.to raise_error(Pundit::NotDefinedError)
     end
+
+    context "when the policy returns a Pundit::Decision" do
+      it "returns the record when the decision is allowed" do
+        expect(authorize(post, query: :show?, policy_class: DecisionPolicy)).to be(post)
+      end
+
+      it "raises when the decision is denied, even though it is a non-nil object" do
+        expect do
+          authorize(post, query: :update?, policy_class: DecisionPolicy)
+        end.to raise_error(Pundit::NotAuthorizedError)
+      end
+
+      it "exposes the decision on the error without leaking details into the message" do
+        expect do
+          authorize(post, query: :update?, policy_class: DecisionPolicy)
+        end.to raise_error(Pundit::NotAuthorizedError) do |error|
+          expect(error.query).to eq(:update?)
+          expect(error.record).to eq(post)
+          expect(error.policy).to be_a(DecisionPolicy)
+          expect(error.decision).to be_a(Pundit::Decision).and be_denied
+          expect(error.decision.code).to eq(:not_owner)
+          expect(error.message).not_to include(error.decision.details.to_s)
+          expect(error.message).to eq("not allowed to DecisionPolicy#update? this Post")
+        end
+      end
+
+      it "calls the policy query method only once" do
+        policy_class = Class.new(BasePolicy) do
+          @calls = 0
+
+          class << self
+            attr_accessor :calls
+          end
+
+          def update?
+            self.class.calls += 1
+            Pundit::Decision.deny
+          end
+        end
+
+        expect do
+          authorize(post, query: :update?, policy_class: policy_class)
+        end.to raise_error(Pundit::NotAuthorizedError)
+        expect(policy_class.calls).to eq(1)
+      end
+
+      it "treats a plain false from the same policy like before" do
+        expect do
+          authorize(post, query: :destroy?, policy_class: DecisionPolicy)
+        end.to raise_error(Pundit::NotAuthorizedError) do |error|
+          expect(error.decision).to be_nil
+          expect(error.message).to eq("not allowed to DecisionPolicy#destroy? this Post")
+        end
+      end
+    end
   end
 
   describe "#policy" do

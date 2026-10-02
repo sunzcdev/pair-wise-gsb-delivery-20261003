@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
+- Add `Pundit::Decision`, an explicit value object policy query methods may return instead of a boolean. Authorization and the RSpec `permit` matcher honor its allowed state, and denied decisions are exposed as `Pundit::NotAuthorizedError#decision` without leaking `details` into the error message.
 
 ### Deprecated
 - Rename `Pundit::Authorization#policies` to `#pundit_policies` to avoid clashing with controller actions named `policies`. The old `#policies` method is now deprecated. [#878](https://github.com/varvet/pundit/issues/878)

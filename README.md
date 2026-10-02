@@ -194,6 +194,39 @@ conditionally showing links or buttons in the view:
   <%= link_to "Edit post", edit_post_path(@post) %>
 <% end %>
 ```
+
+## Decisions with a reason
+
+Policy query methods usually return `true` or `false`, but they may also
+return a `Pundit::Decision` to explain the outcome to the caller. A decision
+carries an allowed state plus an optional machine-readable `code` and
+free-form `details`:
+
+```ruby
+class PostPolicy < ApplicationPolicy
+  def update?
+    return Pundit::Decision.allow if post.user == user
+
+    Pundit::Decision.deny(code: :not_owner, details: {owner_id: post.user_id})
+  end
+end
+```
+
+Pundit only looks at the decision's allowed state — a denied decision is
+never treated as allowed just because it is a non-`nil` object. When
+authorization fails, the decision is available on the raised error alongside
+`query`, `record` and `policy`:
+
+```ruby
+rescue_from Pundit::NotAuthorizedError do |error|
+  render json: {error: error.decision&.code}, status: :forbidden
+end
+```
+
+Note that `code` and `details` are never interpolated into the error message,
+so sensitive business data in `details` will not end up in your logs unless
+you log it yourself.
+
 ## Headless policies
 
 Given there is a policy without a corresponding model / ruby class,

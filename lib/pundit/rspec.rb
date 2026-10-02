@@ -37,14 +37,14 @@ module Pundit
       matcher :permit do |user, record|
         match_proc = lambda do |policy|
           @violating_permissions = permissions.find_all do |permission|
-            !policy.new(user, record).public_send(permission)
+            !granted?(policy, user, record, permission)
           end
           @violating_permissions.empty?
         end
 
         match_when_negated_proc = lambda do |policy|
           @violating_permissions = permissions.find_all do |permission|
-            policy.new(user, record).public_send(permission)
+            granted?(policy, user, record, permission)
           end
           @violating_permissions.empty?
         end
@@ -57,6 +57,11 @@ module Pundit
         failure_message_when_negated_proc = lambda do |policy|
           "Expected #{policy} not to grant #{permissions.to_sentence} on " \
           "#{record} but #{@violating_permissions.to_sentence} #{was_or_were} granted"
+        end
+
+        def granted?(policy, user, record, permission)
+          result = policy.new(user, record).public_send(permission)
+          result.is_a?(Pundit::Decision) ? result.allowed? : result
         end
 
         def was_or_were

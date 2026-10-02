@@ -94,6 +94,16 @@ RSpec.describe Pundit::Authorization do
       expect(controller.authorize(post, :create?, policy_class: PublicationPolicy)).to be_truthy
     end
 
+    it "authorizes based on the allowed state of a returned Pundit::Decision" do
+      expect(controller.authorize(post, :show?, policy_class: DecisionPolicy)).to eq(post)
+
+      expect do
+        controller.authorize(post, :update?, policy_class: DecisionPolicy)
+      end.to raise_error(Pundit::NotAuthorizedError) do |error|
+        expect(error.decision).to be_a(Pundit::Decision).and be_denied
+      end
+    end
+
     it "works with anonymous class policies" do
       expect(controller.authorize(article_tag, :show?)).to be_truthy
       expect { controller.authorize(article_tag, :destroy?) }.to raise_error(Pundit::NotAuthorizedError)

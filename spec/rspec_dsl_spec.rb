@@ -75,5 +75,33 @@ RSpec.describe "Pundit RSpec DSL", type: :policy do
         end
       end
     end
+
+    context "when the policy returns a Pundit::Decision" do
+      permissions :show? do
+        it "succeeds when the decision is allowed" do
+          expect(DecisionPolicy).to permit(user, post)
+        end
+      end
+
+      permissions :update? do
+        it "succeeds when negated and the decision is denied" do
+          expect(DecisionPolicy).not_to permit(user, post)
+        end
+
+        it "fails when the denied decision is expected to be permitted" do
+          expect do
+            expect(DecisionPolicy).to permit(user, post)
+          end.to raise_error(RSpec::Expectations::ExpectationNotMetError, <<~MSG.strip)
+            Expected DecisionPolicy to grant update? on Post but update? was not granted
+          MSG
+        end
+      end
+
+      permissions :destroy? do
+        it "treats a plain false like before" do
+          expect(DecisionPolicy).not_to permit(user, post)
+        end
+      end
+    end
   end
 end

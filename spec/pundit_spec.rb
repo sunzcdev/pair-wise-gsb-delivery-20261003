@@ -108,6 +108,17 @@ RSpec.describe Pundit do
         expect(Pundit.authorize(user, post, :create?, policy_class: PublicationPolicy)).to be_truthy
       end
 
+      it "authorizes based on the allowed state of a returned Pundit::Decision" do
+        expect(Pundit.authorize(user, post, :show?, policy_class: DecisionPolicy)).to eq(post)
+
+        expect do
+          Pundit.authorize(user, post, :update?, policy_class: DecisionPolicy)
+        end.to raise_error(Pundit::NotAuthorizedError) do |error|
+          expect(error.decision).to be_a(Pundit::Decision).and be_denied
+          expect(error.decision.code).to eq(:not_owner)
+        end
+      end
+
       # This is documenting past behaviour.
       it "doesn't cache the policy class" do
         cache = {}

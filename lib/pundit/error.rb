@@ -19,6 +19,11 @@ module Pundit
     # @see #initialize
     # @since v0.2.3
     attr_reader :policy
+    # The {Decision} returned by the policy, if any. Its `details` are never
+    # included in the error message.
+    # @see #initialize
+    # @since v2.6.0
+    attr_reader :decision
 
     # @since v1.0.0
     #
@@ -33,6 +38,7 @@ module Pundit
     #   @option options [Symbol] :query The name of the policy method that was checked.
     #   @option options [Object] :record The object that was being checked with the policy.
     #   @option options [Class] :policy The class of policy that was used for the check.
+    #   @option options [Pundit::Decision] :decision The decision returned by the policy, if any.
     def initialize(options = {})
       if options.is_a? String
         message = options
@@ -40,6 +46,7 @@ module Pundit
         @query = options[:query]
         @record = options[:record]
         @policy = options[:policy]
+        @decision = options[:decision]
 
         message = options.fetch(:message) do
           record_name = record.is_a?(Class) ? record.to_s : "this #{record.class}"
