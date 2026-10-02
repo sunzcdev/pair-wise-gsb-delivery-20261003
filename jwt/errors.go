@@ -51,3 +51,19 @@ var ErrIssuedInTheFuture = errors.New("go-jose/go-jose/jwt: validation field, to
 
 // ErrInvalidContentType indicates that token requires JWT cty header.
 var ErrInvalidContentType = errors.New("go-jose/go-jose/jwt: expected content type to be JWT (cty header)")
+
+// ErrInvalidType indicates that a token layer does not carry the typ header
+// required by the nested token policy.
+var ErrInvalidType = errors.New("go-jose/go-jose/jwt: unexpected typ header")
+
+// ErrInvalidNestedPolicy indicates that a nested token policy is inconsistent
+// or incomplete.
+var ErrInvalidNestedPolicy = errors.New("go-jose/go-jose/jwt: invalid nested token policy")
+
+// ErrUnexpectedLayer indicates that a token layer does not match the kind
+// (JWS or JWE) declared for it in the nested token policy.
+var ErrUnexpectedLayer = errors.New("go-jose/go-jose/jwt: unexpected token layer")
+
+// ErrNestedTooDeep indicates that a token is nested deeper than the declared
+// layer chain (and maximum depth) allows.
+var ErrNestedTooDeep = errors.New("go-jose/go-jose/jwt: token nested deeper than declared")
