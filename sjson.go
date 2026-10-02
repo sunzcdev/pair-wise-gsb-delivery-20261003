@@ -247,6 +247,270 @@ loop:
 
 var errNoChange = &errorType{"no change"}
 
+// appendDeleteRange removes the value occupying jstr[start:end]. Any comma
+// or object key that belongs to the value is stripped as well, while leading
+// and trailing whitespace that belongs to the surrounding document is left
+// untouched. buf is expected to already contain jstr[:start].
+//
+// The returned exidx value is the number of bytes following end (a leading
+// comma and any preceding whitespace) that must also be skipped.
+func appendDeleteRange(buf []byte, jstr string, start, end int) ([]byte, int) {
+	var delNextComma bool
+	buf, delNextComma = deleteTailItem(buf)
+	if !delNextComma {
+		return buf, 0
+	}
+	var exidx int
+	i, j := end, 0
+	for ; i < len(jstr); i, j = i+1, j+1 {
+		if jstr[i] <= ' ' {
+			continue
+		}
+		if jstr[i] == ',' {
+			exidx = j + 1
+		}
+		break
+	}
+	return buf, exidx
+}
+
+// deleteHit describes a single value matched by one of the delete paths.
+type deleteHit struct {
+	start int  // index of the raw value in the original json
+	end   int  // end index, exclusive
+	root  bool // the entire document is being deleted
+}
+
+// gjsonPath joins simple path parts into a path suitable for gjson.Get.
+func gjsonPath(parts []pathResult) string {
+	var b []byte
+	for i, part := range parts {
+		if i > 0 {
+			b = append(b, '.')
+		}
+		b = append(b, part.gpart...)
+	}
+	return string(b)
+}
+
+// skipLeadingWhitespace returns the index of the first non-whitespace byte.
+func skipLeadingWhitespace(s string) int {
+	i := 0
+	for i < len(s) && s[i] <= ' ' {
+		i++
+	}
+	return i
+}
+
+// rootHit reports whether res represents the entire json document. gjson uses
+// a zero index for both "unknown" and root values, and points at the first
+// non-whitespace byte otherwise, so the raw value is compared against the
+// document body.
+func rootHit(jstr string, res gjson.Result) bool {
+	if !res.Exists() || len(res.Indexes) != 0 || len(res.Raw) == 0 {
+		return false
+	}
+	start := skipLeadingWhitespace(jstr)
+	return res.Index == start && start+len(res.Raw) <= len(jstr) &&
+		jstr[start:start+len(res.Raw)] == res.Raw
+}
+
+// appendResultHits appends every value represented by res. Query results
+// (res.Indexes) are expanded into their individual values.
+func appendResultHits(hits []deleteHit, res gjson.Result) []deleteHit {
+	if len(res.Indexes) > 0 {
+		matched := make([]gjson.Result, 0, len(res.Indexes))
+		res.ForEach(func(_, vres gjson.Result) bool {
+			matched = append(matched, vres)
+			return true
+		})
+		if len(matched) != len(res.Indexes) {
+			return hits
+		}
+		for _, vres := range matched {
+			if vres.Index > 0 {
+				hits = append(hits, deleteHit{
+					vres.Index, vres.Index + len(vres.Raw), false,
+				})
+			}
+		}
+		return hits
+	}
+	if res.Index > 0 {
+		hits = append(hits, deleteHit{
+			res.Index, res.Index + len(res.Raw), false,
+		})
+	}
+	return hits
+}
+
+// collectDeleteHit evaluates path against the original jstr and appends any
+// matched values to hits. Every path is evaluated against the same original
+// json, so array indices always refer to the positions before any deletion.
+func collectDeleteHit(hits []deleteHit, jstr, path string) ([]deleteHit, error) {
+	if path == "" {
+		return hits, &errorType{"path cannot be empty"}
+	}
+
+	var minusOne bool
+	var parts []pathResult
+	r, simple := parsePath(path)
+	if simple {
+		parts = append(parts, r)
+		for r.more {
+			r, simple = parsePath(r.path)
+			if !simple {
+				break
+			}
+			parts = append(parts, r)
+		}
+		if simple {
+			last := parts[len(parts)-1]
+			if !last.force && last.part == "-1" && !last.more {
+				minusOne = true
+				parts = parts[:len(parts)-1]
+			}
+		}
+	}
+
+	var res gjson.Result
+	if !simple {
+		// complex path, such as a gjson query
+		res = gjson.Get(jstr, path)
+		if !res.Exists() {
+			return hits, nil
+		}
+		if rootHit(jstr, res) {
+			return append(hits, deleteHit{root: true}), nil
+		}
+		return appendResultHits(hits, res), nil
+	}
+
+	parent := gjson.Parse(jstr)
+	if len(parts) > 0 {
+		parent = gjson.Get(jstr, gjsonPath(parts))
+	}
+	if !parent.Exists() {
+		return hits, nil
+	}
+	if minusOne {
+		if !parent.IsArray() {
+			return hits, nil
+		}
+		items := parent.Array()
+		if len(items) == 0 || items[len(items)-1].Index == 0 {
+			return hits, nil
+		}
+		return appendResultHits(hits, items[len(items)-1]), nil
+	}
+	if len(parts) == 0 {
+		return append(hits, deleteHit{root: true}), nil
+	}
+	if rootHit(jstr, parent) {
+		return append(hits, deleteHit{root: true}), nil
+	}
+	return appendResultHits(hits, parent), nil
+}
+
+// mergeDeleteHits drops duplicate hits and hits that are already covered by an
+// ancestor hit, then sorts the remaining hits by start position.
+func mergeDeleteHits(hits []deleteHit) []deleteHit {
+	if len(hits) < 2 {
+		return hits
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].start != hits[j].start {
+			return hits[i].start < hits[j].start
+		}
+		return hits[i].end < hits[j].end
+	})
+	merged := hits[:0]
+	for _, hit := range hits {
+		if n := len(merged); n > 0 {
+			prev := merged[n-1]
+			if hit.start == prev.start && hit.end == prev.end {
+				continue // duplicate hit
+			}
+			if hit.start >= prev.start && hit.end <= prev.end {
+				continue // already covered by a parent hit
+			}
+		}
+		merged = append(merged, hit)
+	}
+	return merged
+}
+
+// deleteMany evaluates every path against the original json and then removes
+// all matched values in a single pass. The result never depends on the order
+// of the supplied paths.
+func deleteMany(jstr string, paths []string) ([]byte, error) {
+	var hits []deleteHit
+	for _, path := range paths {
+		var err error
+		hits, err = collectDeleteHit(hits, jstr, path)
+		if err != nil {
+			return []byte(jstr), err
+		}
+	}
+	for _, hit := range hits {
+		if hit.root {
+			return []byte{}, nil
+		}
+	}
+	hits = mergeDeleteHits(hits)
+	if len(hits) == 0 {
+		return []byte(jstr), nil
+	}
+
+	// Apply the hits right-to-left, exactly like a sequence of single Deletes
+	// performed in descending order. Earlier (lower-offset) hits are untouched
+	// when later ones are removed, so the original indices stay valid and all
+	// comma/key/whitespace handling is resolved against the document as it
+	// exists at that moment.
+	buf := []byte(jstr)
+	for i := len(hits) - 1; i >= 0; i-- {
+		hit := hits[i]
+		head := append([]byte(nil), buf[:hit.start]...)
+		head, exidx := appendDeleteRange(head, string(buf), hit.start, hit.end)
+		buf = append(head, buf[hit.end+exidx:]...)
+	}
+	return buf, nil
+}
+
+// DeleteMany deletes all of the values matched by paths from json.
+//
+// Every path is first evaluated against the original, unmodified json, and
+// only afterwards are the matches removed. This means that array indices
+// always refer to their original position: deleting "items.0" and "items.2"
+// removes the first and third items as they were before any deletion, and
+// the result is the same regardless of the order in which the paths are
+// given.
+//
+// Paths may be ordinary dot paths, "-1" for the last array element, or gjson
+// queries that match multiple values, such as "friends.#(age>30)#.name".
+// Duplicate matches are removed only once, a match nested inside an already
+// deleted parent is not handled separately, and deleting the root document
+// (for example with the path "@this") returns an empty string.
+//
+// Whitespace and formatting of the untouched parts of the document are
+// preserved.
+func DeleteMany(json string, paths ...string) (string, error) {
+	res, err := deleteMany(json, paths)
+	return string(res), err
+}
+
+// DeleteManyBytes deletes all of the values matched by paths from json.
+// If working with bytes, this method preferred over
+// DeleteMany(string(data), paths...).
+func DeleteManyBytes(json []byte, paths ...string) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	res, err := deleteMany(jstr, paths)
+	if err != nil {
+		return json, err
+	}
+	return res, nil
+}
+
 func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 	stringify, del bool) ([]byte, error) {
 	var err error
@@ -278,20 +542,8 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 		buf = append(buf, jstr[:res.Index]...)
 		var exidx int // additional forward stripping
 		if del {
-			var delNextComma bool
-			buf, delNextComma = deleteTailItem(buf)
-			if delNextComma {
-				i, j := res.Index+len(res.Raw), 0
-				for ; i < len(jstr); i, j = i+1, j+1 {
-					if jstr[i] <= ' ' {
-						continue
-					}
-					if jstr[i] == ',' {
-						exidx = j + 1
-					}
-					break
-				}
-			}
+			buf, exidx = appendDeleteRange(buf, jstr, res.Index,
+				res.Index+len(res.Raw))
 		} else {
 			if stringify {
 				buf = appendStringify(buf, raw)

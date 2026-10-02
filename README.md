@@ -213,6 +213,23 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Delete multiple values:
+```go
+value, _ := sjson.DeleteMany(`{"friends":["Andy","Carol","Sara"],"name":"Tom"}`,
+	"friends.0", "friends.2", "name")
+println(value)
+
+// Output:
+// {"friends":["Carol"]}
+```
+
+Every path is evaluated against the original json before anything is removed,
+so array indices always refer to their original position, the result does not
+depend on the order of the paths, and duplicate matches are deleted only once.
+Paths may also be [gjson](https://github.com/tidwall/gjson) queries that
+match several values. Deleting the root document (for example with the path
+`@this`) returns an empty string.
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
