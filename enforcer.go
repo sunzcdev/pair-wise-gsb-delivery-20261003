@@ -699,9 +699,8 @@ func (e *Enforcer) invalidateMatcherMap() {
 }
 
 // enforce use a custom matcher to decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (matcher, sub, obj, act), use model matcher by default when matcher is "".
-func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) { //nolint:funlen,cyclop,gocyclo // TODO: reduce function complexity
+func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interface{}) (ok bool, err error) {
 	logEntry := e.onLogBeforeEventInEnforce(rvals)
-
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
@@ -712,16 +711,36 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		e.onLogAfterEventInEnforce(logEntry, ok)
 	}()
 
-	if !e.enabled {
-		return true, nil
+	runtimeContext, err := e.prepareEnforce(matcher, rvals...)
+	if err != nil {
+		if e.logger != nil && logEntry != nil {
+			logEntry.Error = err
+		}
+		return false, err
 	}
+	ok, err = e.enforcePrepared(runtimeContext, explains)
+	if err != nil && e.logger != nil && logEntry != nil {
+		logEntry.Error = err
+	}
+	return ok, err
+}
 
+type enforceRuntimeContext struct {
+	rType string
+	pType string
+	eType string
+
+	expString     string
+	functions     map[string]govaluate.ExpressionFunction
+	parameters    enforceParameters
+	expression    *govaluate.EvaluableExpression
+	requestValues []interface{}
+}
+
+func (e *Enforcer) prepareEnforce(matcher string, rvals ...interface{}) (*enforceRuntimeContext, error) {
 	functions := e.fm.GetFunctions()
 	if _, ok := e.model["g"]; ok {
 		for key, ast := range e.model["g"] {
-			// g must be a normal role definition (ast.RM != nil)
-			//   or a conditional role definition (ast.CondRM != nil)
-			// ast.RM and ast.CondRM shouldn't be nil at the same time
 			if ast.RM != nil {
 				functions[key] = util.GenerateGFunction(ast.RM, e.gFunctionCache)
 			}
@@ -731,31 +750,19 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		}
 	}
 
-	var (
-		rType = "r"
-		pType = "p"
-		eType = "e"
-		mType = "m"
-	)
+	rType, pType, eType, mType := "r", "p", "e", "m"
 	if len(rvals) != 0 {
-		switch rvals[0].(type) {
-		case EnforceContext:
-			enforceContext := rvals[0].(EnforceContext)
+		if enforceContext, ok := rvals[0].(EnforceContext); ok {
 			rType = enforceContext.RType
 			pType = enforceContext.PType
 			eType = enforceContext.EType
 			mType = enforceContext.MType
 			rvals = rvals[1:]
-		default:
-			break
 		}
 	}
 
-	var expString string
-	if matcher == "" {
-		expString = e.model["m"][mType].Value
-	} else {
-		// For custom matchers provided at runtime, escape backslashes in string literals
+	expString := e.model["m"][mType].Value
+	if matcher != "" {
 		expString = util.EscapeStringLiterals(util.RemoveComments(util.EscapeAssertion(matcher)))
 	}
 
@@ -769,48 +776,59 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 	}
 
 	if e.acceptJsonRequest {
-		// try to parse all request values from json to map[string]interface{}
 		for i, rval := range rvals {
-			switch rval := rval.(type) {
-			case string:
-				// Only attempt JSON parsing for strings that look like JSON objects or arrays
-				if len(rval) > 0 && (rval[0] == '{' || rval[0] == '[') {
-					var mapValue map[string]interface{}
-					mapValue, err = util.JsonToMap(rval)
-					if err != nil {
-						// Return a clear error when JSON-like string fails to parse
-						return false, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
-					}
-					rvals[i] = mapValue
-				}
+			rval, ok := rval.(string)
+			if !ok || len(rval) == 0 || (rval[0] != '{' && rval[0] != '[') {
+				continue
 			}
+			mapValue, err := util.JsonToMap(rval)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse JSON parameter at index %d: %w", i, err)
+			}
+			rvals[i] = mapValue
 		}
 	}
 
-	parameters := enforceParameters{
-		rTokens: rTokens,
-		rVals:   rvals,
-
-		pTokens: pTokens,
-	}
-
+	parameters := enforceParameters{rTokens: rTokens, rVals: rvals, pTokens: pTokens}
 	hasEval := util.HasEval(expString)
 	if hasEval {
 		functions["eval"] = generateEvalFunction(functions, &parameters)
 	}
-	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, functions)
+	expression, err := e.getAndStoreMatcherExpression(hasEval, expString, functions)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
-		return false, fmt.Errorf(
+		return nil, fmt.Errorf(
 			"invalid request size: expected %d, got %d, rvals: %v",
 			len(e.model["r"][rType].Tokens),
 			len(rvals),
 			rvals)
 	}
+
+	return &enforceRuntimeContext{
+		rType:         rType,
+		pType:         pType,
+		eType:         eType,
+		expString:     expString,
+		functions:     functions,
+		parameters:    parameters,
+		expression:    expression,
+		requestValues: rvals,
+	}, nil
+}
+
+// enforcePrepared runs a prepared boolean enforcement request.
+func (e *Enforcer) enforcePrepared(runtimeContext *enforceRuntimeContext, explains *[]string) (bool, error) {
+	if !e.enabled {
+		return true, nil
+	}
+
+	pType, eType := runtimeContext.pType, runtimeContext.eType
+	expString := runtimeContext.expString
+	parameters := runtimeContext.parameters
+	expression := runtimeContext.expression
 
 	var policyEffects []effector.Effect
 	var matcherResults []float64
@@ -882,7 +900,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			}
 		}
 	} else {
-		if hasEval && len(e.model["p"][pType].Policy) == 0 {
+		if util.HasEval(expString) && len(e.model["p"][pType].Policy) == 0 {
 			return false, errors.New("please make sure rule exists in policy when using eval() in matcher")
 		}
 
