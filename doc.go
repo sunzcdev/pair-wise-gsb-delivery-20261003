@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2014, 2025
+// Copyright IBM Corp. 2014, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 // Package lru provides three different LRU caches of varying sophistication.
@@ -18,6 +18,10 @@
 // ARC has been patented by IBM, so do not use it if that is problematic for
 // your program. For this reason, it is in a separate go module contained within
 // this repository.
+//
+// WeightedCache is like Cache but bounds the sum of caller-provided,
+// non-negative entry weights instead of the number of entries. It is useful
+// when cached values vary widely in size.
 //
 // All caches in this package take locks while operating, and are therefore
 // thread-safe for consumers.

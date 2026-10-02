@@ -31,6 +31,37 @@ func main() {
 }
 ```
 
+Weighted LRU cache example
+==========================
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/hashicorp/golang-lru/v2"
+)
+
+func main() {
+	// The sum of entry weights may not exceed 256 bytes.
+	l, _ := lru.NewWeighted[int, []byte](256)
+
+	// Every value is added together with its non-negative weight.
+	l.Add(1, make([]byte, 200), 200)
+	l.Add(2, make([]byte, 100), 100) // evicts key 1 to fit the budget
+
+	// A single value heavier than the whole budget is rejected.
+	if l.Add(3, make([]byte, 257), 257) {
+		panic("entry should have been rejected")
+	}
+
+	fmt.Printf("Cache len: %d, weight: %d\n", l.Len(), l.Weight())
+	// Output:
+	// Cache len: 1, weight: 100
+}
+```
+
 Expirable LRU cache example
 ===========================
 

@@ -24,6 +24,10 @@ type Entry[K comparable, V any] struct {
 	// The Value stored with this element.
 	Value V
 
+	// The weight of this element, used by weight-budgeted caches. Entries
+	// managed by count-based caches always carry a zero weight.
+	Weight int64
+
 	// The time this element would be cleaned up, optional
 	ExpiresAt time.Time
 
