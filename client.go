@@ -302,6 +302,7 @@ type Client struct {
 	uid              string
 	session          string
 	user             string
+	deviceID         string
 	info             []byte
 	storage          map[string]any
 	// profile is the application context this connection belongs to, resolved at
@@ -342,6 +343,11 @@ type Client struct {
 	// keyed holds per-connection keyed subscription state (shared poll).
 	// nil until first keyed subscribe.
 	keyed *keyedState
+
+	// sessionOwnership holds the session lease state when session ownership
+	// takeover (Config.SessionOwnership) is active for this connection.
+	// Installed once during connectCmd, nil otherwise.
+	sessionOwnership *sessionOwnershipState
 }
 
 // ClientCloseFunc must be called on Transport handler close to clean up Client.
@@ -1626,6 +1632,12 @@ func (c *Client) close(disconnect Disconnect) error {
 	// Clean up any in-progress map subscriptions that aren't in channels yet.
 	c.cleanupMapSubscribingAll()
 
+	// Release the session lease (if any) and stop its renew loop. The release
+	// is generation-matched in the store, so a close arriving late — after
+	// another connection already took the session over — cannot disturb the
+	// new owner's lease.
+	c.stopSessionOwnership()
+
 	if disconnect.Code != DisconnectConnectionClosed.Code {
 		c.node.logger.log(newLogEntry(LogLevelDebug, "closing client connection", map[string]any{"client": c.uid, "user": user, "reason": disconnect.Reason}))
 	}
@@ -2317,6 +2329,10 @@ func (c *Client) handleSubscribe(req *protocol.SubscribeRequest, cmd *protocol.C
 		return c.logDisconnectBadRequest("channel required for subscribe")
 	}
 
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
+	}
+
 	// Shared poll check — must be before map routing.
 	var isSharedPoll bool
 	if c.node.config.SharedPoll.GetSharedPollChannelOptions != nil {
@@ -2582,6 +2598,10 @@ func (c *Client) handlePublish(req *protocol.PublishRequest, cmd *protocol.Comma
 		return ErrorNotAvailable
 	}
 
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
+	}
+
 	channel := req.Channel
 	data := req.Data
 
@@ -2641,6 +2661,10 @@ func (c *Client) handlePublish(req *protocol.PublishRequest, cmd *protocol.Comma
 func (c *Client) handleMapPublish(req *protocol.PublishRequest, cmd *protocol.Command, started time.Time, rw *replyWriter) error {
 	if c.eventHub.mapPublishHandler == nil {
 		return ErrorNotAvailable
+	}
+
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
 	}
 
 	channel := req.Channel
@@ -2711,6 +2735,10 @@ func (c *Client) handleMapPublish(req *protocol.PublishRequest, cmd *protocol.Co
 func (c *Client) handleMapRemove(req *protocol.PublishRequest, cmd *protocol.Command, started time.Time, rw *replyWriter) error {
 	if c.eventHub.mapRemoveHandler == nil {
 		return ErrorNotAvailable
+	}
+
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
 	}
 
 	channel := req.Channel
@@ -3266,6 +3294,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 
 	c.mu.Lock()
 	c.user = credentials.UserID
+	c.deviceID = credentials.DeviceID
 	c.info = credentials.Info
 	c.exp = min(credentials.ExpireAt, time.Now().Unix()+maxTTLSeconds)
 
@@ -3299,6 +3328,15 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		ttl = uint32(exp - now)
 	}
 	c.mu.RUnlock()
+
+	// Session ownership takeover: acquire the lease for the user ID + device
+	// ID pair before the connection becomes visible. The new generation
+	// supersedes any previous owner of the pair as soon as the store call
+	// returns; a store failure (including the acquire timeout) rejects the
+	// connect with a temporary error.
+	if err := c.acquireSessionOwnership(); err != nil {
+		return err
+	}
 
 	// Compression is negotiated here rather than earlier because it needs the
 	// resolved profile, and an application only sets that in OnConnecting.

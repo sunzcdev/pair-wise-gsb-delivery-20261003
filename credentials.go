@@ -17,6 +17,13 @@ type Credentials struct {
 	// In some cases having additional info can be an undesired overhead – but
 	// you are simply free to not use this field at all.
 	Info []byte
+	// DeviceID optionally identifies the device the connection belongs to.
+	// When Config.SessionOwnership is enabled, a non-empty DeviceID together
+	// with UserID defines the session ownership slot: connecting with the
+	// same user ID + device ID pair takes the session over from a previous
+	// connection. Leave empty for connections which must not participate in
+	// session takeover.
+	DeviceID string
 }
 
 // credentialsContextKeyType is special type to safely use context for setting

@@ -123,6 +123,16 @@ var (
 		Code:   3014,
 		Reason: "state invalidated",
 	}
+	// DisconnectSessionTakenOver may be issued when the connection's session
+	// (user ID + device ID) was taken over by a newer connection — for
+	// example when a mobile client reconnected after a network switch while
+	// its old socket was still lingering. The disconnected connection holds a
+	// stale session generation and can no longer perform protected
+	// operations.
+	DisconnectSessionTakenOver = Disconnect{
+		Code:   3015,
+		Reason: "session taken over",
+	}
 )
 
 // The codes below are built-in terminal codes.

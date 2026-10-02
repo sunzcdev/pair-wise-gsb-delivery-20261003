@@ -252,6 +252,69 @@ type Config struct {
 	// SharedPoll contains options for shared poll subscriptions.
 	// This is an EXPERIMENTAL API.
 	SharedPoll SharedPollConfig
+	// SessionOwnership contains options for session ownership takeover by
+	// user ID + device ID. This is an EXPERIMENTAL API.
+	SessionOwnership SessionOwnershipConfig
+}
+
+// SessionOwnershipConfig configures session ownership takeover. When
+// Store is set, a connection authenticated with a non-empty Credentials.UserID
+// and Credentials.DeviceID acquires a session lease for that user ID + device
+// ID pair during connect. The acquire atomically supersedes any previous
+// owner of the pair — on this or on another node sharing the same store —
+// and the connection receives a new generation. From that moment the previous
+// owner's generation is stale: its protected operations (subscribe, publish)
+// are fenced on the generation and start failing with ErrorSessionRevoked,
+// and the old connection is disconnected with DisconnectSessionTakenOver.
+// Closing the old socket may happen with a delay; the operation fencing does
+// not depend on it.
+//
+// This is an EXPERIMENTAL API.
+type SessionOwnershipConfig struct {
+	// Store is the SessionOwnershipStore keeping leases. Nil (the default)
+	// disables the feature entirely. Use a store shared by all nodes (see
+	// SharedSessionOwnershipStore for tests and single-process deployments)
+	// for the guarantees to hold across nodes.
+	Store SessionOwnershipStore
+	// LeaseTTL is the lease time-to-live. The connection renews its lease
+	// every RenewInterval; a crashed owner stops renewing and its lease
+	// expires after LeaseTTL. Zero value means 30 * time.Second.
+	LeaseTTL time.Duration
+	// RenewInterval is how often the lease is renewed.
+	// Zero value means LeaseTTL / 3.
+	RenewInterval time.Duration
+	// AcquireTimeout bounds every store call (acquire, renew, validate,
+	// release). A connect whose acquire does not complete within this
+	// timeout is rejected with a temporary ErrorInternal. A renew failure
+	// revokes and disconnects the connection. Zero value means
+	// 10 * time.Second.
+	AcquireTimeout time.Duration
+}
+
+const (
+	defaultSessionLeaseTTL       = 30 * time.Second
+	defaultSessionAcquireTimeout = 10 * time.Second
+)
+
+func (c SessionOwnershipConfig) leaseTTL() time.Duration {
+	if c.LeaseTTL > 0 {
+		return c.LeaseTTL
+	}
+	return defaultSessionLeaseTTL
+}
+
+func (c SessionOwnershipConfig) renewInterval() time.Duration {
+	if c.RenewInterval > 0 {
+		return c.RenewInterval
+	}
+	return c.leaseTTL() / 3
+}
+
+func (c SessionOwnershipConfig) acquireTimeout() time.Duration {
+	if c.AcquireTimeout > 0 {
+		return c.AcquireTimeout
+	}
+	return defaultSessionAcquireTimeout
 }
 
 type MapConfig struct {

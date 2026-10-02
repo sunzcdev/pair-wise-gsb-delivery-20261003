@@ -116,4 +116,11 @@ var (
 		Message:   "concurrent pagination",
 		Temporary: true,
 	}
+	// ErrorSessionRevoked means the connection's session (user ID + device ID)
+	// was taken over by a newer connection, so this connection's generation
+	// no longer entitles it to protected operations.
+	ErrorSessionRevoked = &Error{
+		Code:    114,
+		Message: "session revoked",
+	}
 )
