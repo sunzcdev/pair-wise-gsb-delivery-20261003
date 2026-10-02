@@ -156,6 +156,47 @@ end
 Priming will add key/value to the loader cache only if it didn't exist before.
 
 
+### Composing Loaders with a Fallback
+
+A loader can report a key as not found by fulfilling it with
+`GraphQL::Batch::Loader::Missing` (conveniently through `fulfill_missing`)
+rather than with `nil`. A legitimate value of `nil` still means "found".
+
+Use `#fallback` to compose such a loader with another loader: keys missing
+from the first loader are collected from the whole batch and sent to the
+fallback loader in a single batch instead of issuing one batch per key.
+
+```ruby
+class TenantOverrideLoader < GraphQL::Batch::Loader
+  def perform(keys)
+    overrides = TenantSetting.where(key: keys).index_by(&:key)
+    keys.each do |key|
+      if overrides.key?(key)
+        fulfill(key, overrides[key].value)
+      else
+        fulfill_missing(key)
+      end
+    end
+  end
+end
+
+def setting(key)
+  TenantOverrideLoader.for.fallback(DefaultSettingLoader.for).load(key)
+end
+```
+
+If the primary loader rejects or raises, the rejection is passed through and
+the fallback loader is not called. Keys still missing after the fallback
+loader resolves default to `nil`, or are handled by an optional block:
+
+```ruby
+loader.fallback(DefaultSettingLoader.for) { |key| raise "Missing setting #{key}" }
+```
+
+Fallback composition does not modify either loader's cache, and values from
+the fallback loader are not written back into the primary loader's cache.
+
+
 ## Unit Testing
 
 Your loaders can be tested outside of a GraphQL query by doing the

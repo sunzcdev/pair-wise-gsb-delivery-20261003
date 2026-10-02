@@ -1,5 +1,9 @@
 module GraphQL::Batch
   class Loader
+    # Sentinel value used by a loader to signal that a key was not found,
+    # as opposed to being found with a legitimate value of `nil`.
+    module Missing; end
+
     class << self
       def for(*group_args, **group_kwargs)
         current_executor.loader(loader_key_for(*group_args, **group_kwargs)) do
@@ -98,6 +102,13 @@ module GraphQL::Batch
       finish_resolve(key) do |promise|
         promise.fulfill(value)
       end
+    end
+
+    # Signal that the key was not found, for use in #perform. Unlike fulfilling
+    # with `nil`, this lets a composable fallback loader (see
+    # GraphQL::Batch::Fallback) know that it should try the fallback loader.
+    def fulfill_missing(key)
+      fulfill(key, Missing)
     end
 
     def reject(key, reason)
