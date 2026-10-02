@@ -105,23 +105,28 @@ module AASM
       end
     end
 
-    def may_fire_event?(name, *args)
-      if event = @instance.class.aasm(@name).state_machine.events[name]
-        !!event.may_fire?(@instance, *args)
-      else
-        false # unknown event
-      end
+    ruby2_keywords def may_fire_event?(name, *args)
+      event = @instance.class.aasm(@name).state_machine.events[name.to_sym]
+      return false unless event
+
+      to_state, arguments = event.resolve_to_state(@instance, args)
+      return false if to_state.nil?
+
+      !!event.may_fire?(@instance, to_state, *arguments)
     end
 
-    def fire(event_name, *args, &block)
+    ruby2_keywords def fire(event_name, *args, &block)
       event_exists?(event_name)
-      @instance.send(event_method_name(event_name), *args, &block)
+      event = @instance.class.aasm(@name).state_machine.events[event_name.to_sym]
+      event.resolve_to_state(@instance, args, validate: true)
+      invoke_event(event_method_name(event_name), *args, &block)
     end
 
-    def fire!(event_name, *args, &block)
+    ruby2_keywords def fire!(event_name, *args, &block)
       event_exists?(event_name, true)
-      bang_event_name = "#{event_method_name(event_name)}!".to_sym
-      @instance.send(bang_event_name, *args, &block)
+      event = @instance.class.aasm(@name).state_machine.events[event_name.to_sym]
+      event.resolve_to_state(@instance, args, validate: true)
+      invoke_event("#{event_method_name(event_name)}!", *args, &block)
     end
 
     def set_current_state_with_persistence(state)
@@ -131,6 +136,10 @@ module AASM
     end
 
     private
+
+    ruby2_keywords def invoke_event(method_name, *arguments, &block)
+      @instance.send(method_name, *arguments, &block)
+    end
 
     def event_method_name(event_name)
       config = @instance.class.aasm(@name).state_machine.config

@@ -73,7 +73,7 @@ module AASM
         ##
         # Parse arguments to separate keyword arguments from positional arguments
         def parse_arguments
-          if args.last.is_a?(Hash)
+          if args.last.is_a?(Hash) && (keyword_arguments? || Hash.ruby2_keywords_hash?(args.last))
             [args[0..-2], args.last]
           else
             [args, nil]

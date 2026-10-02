@@ -45,7 +45,7 @@ module AASM::Core
       name.to_s
     end
 
-    def fire_callbacks(action, record, *args)
+    ruby2_keywords def fire_callbacks(action, record, *args)
       action = @options[action]
       catch :halt_aasm_chain do
         action.is_a?(Array) ?

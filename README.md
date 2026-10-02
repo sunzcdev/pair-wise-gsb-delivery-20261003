@@ -239,6 +239,36 @@ the state machine will attempt to transition to that state. Add comma separated 
 In this case `set_process` won't be called, job will transition to running state and callback will receive
 `:defragmentation` as parameter
 
+When a business argument can itself be a reachable state, enable explicit target selection on the state machine.
+Positional and keyword business arguments are passed through unchanged, while the target state is passed separately.
+
+```ruby
+  class ImplicitJob
+    include AASM
+    aasm do
+      # :running is the target state
+      event :run do
+        transitions from: :sleeping, to: [:running, :cleaning]
+      end
+    end
+  end
+  ImplicitJob.new.run(:running, :defragmentation)
+
+  class ExplicitJob
+    include AASM
+    aasm explicit_to_state: true do
+      event :review do
+        # :pending is a business argument; :rejected is the target state
+        transitions from: :approved, to: [:pending, :rejected]
+      end
+    end
+  end
+  ExplicitJob.new.review(:pending, to_state: :rejected)
+```
+
+Without `to_state`, transitions are still checked and selected in their original order. An unreachable `to_state`
+fails before event guards or callbacks run.
+
 #### Error Handling
 In case of an error during the event processing the error is rescued and passed to `:error`
 callback, which can handle it or re-raise it for further propagation.

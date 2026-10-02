@@ -39,12 +39,12 @@ module AASM::Core
       orig.opts.each_pair { |name, setting| @opts[name] = setting.is_a?(Hash) || setting.is_a?(Array) ? setting.dup : setting }
     end
 
-    def allowed?(obj, *args)
+    ruby2_keywords def allowed?(obj, *args)
       invoke_callbacks_compatible_with_guard(@guards, obj, args, :guard => true) &&
       invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true)
     end
 
-    def execute(obj, *args)
+    ruby2_keywords def execute(obj, *args)
       invoke_callbacks_compatible_with_guard(event.state_machine.global_callbacks[:after_all_transitions], obj, args)
       invoke_callbacks_compatible_with_guard(@after, obj, args)
     end
@@ -57,7 +57,7 @@ module AASM::Core
       @from == value
     end
 
-    def invoke_success_callbacks(obj, *args)
+    ruby2_keywords def invoke_success_callbacks(obj, *args)
       _fire_callbacks(@success, obj, args)
     end
 

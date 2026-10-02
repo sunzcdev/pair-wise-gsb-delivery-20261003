@@ -51,6 +51,9 @@ module AASM
       # Set to true to namespace reader methods and constants
       configure :namespace, false
 
+      # Select event target states with the separate :to_state option
+      configure :explicit_to_state, false
+
       # Configure a logger, with default being a Logger to STDERR
       configure :logger, Logger.new(STDERR)
 

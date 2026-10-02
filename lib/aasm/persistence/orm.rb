@@ -119,33 +119,34 @@ module AASM
       end
 
       # Returns true if event was fired successfully and transaction completed.
-      def aasm_fire_event(state_machine_name, name, options, *args, &block)
+      ruby2_keywords def aasm_fire_event(state_machine_name, name, options, *args, &block)
         return super unless aasm_supports_transactions? && options[:persist]
 
         event = self.class.aasm(state_machine_name).state_machine.events[name]
-        event.fire_callbacks(:before_transaction, self, *args)
-        event.fire_global_callbacks(:before_all_transactions, self, *args)
+        _, callback_args = event.resolve_to_state(self, args, validate: true)
+        event.fire_callbacks(:before_transaction, self, *callback_args)
+        event.fire_global_callbacks(:before_all_transactions, self, *callback_args)
 
         begin
           success = if options[:persist] && use_transactions?(state_machine_name)
             aasm_transaction(requires_new?(state_machine_name), requires_lock?(state_machine_name)) do
-              super
+              super(state_machine_name, name, options, *callback_args, &block)
             end
           else
-            super
+            super(state_machine_name, name, options, *callback_args, &block)
           end
 
           if success && !(event.options.keys & [:after_commit, :after_all_commits]).empty?
             aasm_execute_after_commit do
-              event.fire_callbacks(:after_commit, self, *args)
-              event.fire_global_callbacks(:after_all_commits, self, *args)
+              event.fire_callbacks(:after_commit, self, *callback_args)
+              event.fire_global_callbacks(:after_all_commits, self, *callback_args)
             end
           end
 
           success
         ensure
-          event.fire_callbacks(:after_transaction, self, *args)
-          event.fire_global_callbacks(:after_all_transactions, self, *args)
+          event.fire_callbacks(:after_transaction, self, *callback_args)
+          event.fire_global_callbacks(:after_all_transactions, self, *callback_args)
         end
       end
 

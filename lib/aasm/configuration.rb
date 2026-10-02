@@ -38,6 +38,9 @@ module AASM
     # namespace reader methods and constants
     attr_accessor :namespace
 
+    # separate event target state selection from event arguments
+    attr_accessor :explicit_to_state
+
     # Configure a logger, with default being a Logger to STDERR
     attr_accessor :logger
 

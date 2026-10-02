@@ -67,17 +67,15 @@ module AASM::Core
       @transitions.select { |t| t.to == state }
     end
 
-    def fire_global_callbacks(callback_name, record, *args)
+    ruby2_keywords def fire_global_callbacks(callback_name, record, *args)
       invoke_callbacks(state_machine.global_callbacks[callback_name], record, args)
     end
 
-    def fire_callbacks(callback_name, record, *args)
-      # strip out the first element in args if it's a valid to_state
-      # #given where we're coming from, this condition implies args not empty
+    ruby2_keywords def fire_callbacks(callback_name, record, *args)
       invoke_callbacks(@options[callback_name], record, args)
     end
 
-    def fire_transition_callbacks(obj, *args)
+    ruby2_keywords def fire_transition_callbacks(obj, *args)
       from_state = obj.aasm(state_machine.name).current_state
       transition = @valid_transitions[obj.object_id][from_state]
       transition.invoke_success_callbacks(obj, *args) if transition
@@ -111,11 +109,65 @@ module AASM::Core
       transitions.flat_map(&:failures)
     end
 
+    def resolve_to_state(obj, args, validate: false)
+      arguments = args.dup
+      return resolve_legacy_to_state(obj, arguments) unless state_machine.config.explicit_to_state
+
+      to_state = ::AASM::NO_VALUE
+      explicit_target = false
+      keyword_arguments = arguments.last
+
+      if keyword_arguments.is_a?(Hash) && Hash.ruby2_keywords_hash?(keyword_arguments)
+        keyword_arguments = Hash.ruby2_keywords_hash(keyword_arguments.dup)
+        target_key = [:to_state, :to].find { |key| keyword_arguments.key?(key) }
+
+        if target_key
+          target = keyword_arguments.delete(target_key)
+          keyword_arguments.delete(:to_state)
+          keyword_arguments.delete(:to)
+          to_state = target.nil? ? nil : target.to_sym
+          explicit_target = true
+        end
+
+        if keyword_arguments.empty?
+          arguments.pop
+        else
+          arguments[-1] = keyword_arguments
+        end
+      end
+
+      if explicit_target && (to_state.nil? || !reachable_to_state?(obj, to_state))
+        raise AASM::InvalidTransition.new(obj, name, state_machine.name) if validate
+        return [nil, arguments]
+      end
+
+      [to_state, arguments]
+    end
+
+    def reachable_to_state?(obj, to_state)
+      current_state = obj.aasm(state_machine.name).current_state
+      transitions_from_state(current_state).flat_map { |transition| Array(transition.to) }.include?(to_state)
+    end
+
     def to_s
       name.to_s
     end
 
   private
+
+    def resolve_legacy_to_state(obj, arguments)
+      target = arguments.first
+      return [::AASM::NO_VALUE, arguments] unless target.respond_to?(:to_sym)
+
+      target = target.to_sym
+      return [::AASM::NO_VALUE, arguments] unless reachable_to_state?(obj, target)
+
+      [target, arguments[1..-1]]
+    end
+
+    def explicit_to_state?
+      state_machine.config.explicit_to_state
+    end
 
     def attach_event_guards(definitions)
       unless @guards.empty?
@@ -129,7 +181,7 @@ module AASM::Core
       definitions
     end
 
-    def _fire(obj, options={}, to_state=::AASM::NO_VALUE, *args)
+    ruby2_keywords def _fire(obj, options={}, to_state=::AASM::NO_VALUE, *args)
       result = options[:test_only] ? false : nil
       clear_failed_callbacks
       transitions = @transitions.select { |t| t.from == obj.aasm(state_machine.name).current_state || t.from == nil}
@@ -137,6 +189,13 @@ module AASM::Core
 
       if to_state == ::AASM::NO_VALUE
         to_state = nil
+      elsif explicit_to_state?
+        reachable_target = transitions.map(&:to).flatten.include?(to_state.to_sym)
+        return result if options[:test_only] && !reachable_target
+
+        unless reachable_target
+          raise AASM::InvalidTransition.new(obj, name, state_machine.name)
+        end
       elsif !(to_state.respond_to?(:to_sym) && transitions.map(&:to).flatten.include?(to_state.to_sym))
         # to_state is an argument
         args.unshift(to_state)
@@ -174,5 +233,7 @@ module AASM::Core
              .with_default_return_value(false)
              .invoke
     end
+
+    ruby2_keywords :may_fire?, :fire
   end
 end # AASM
