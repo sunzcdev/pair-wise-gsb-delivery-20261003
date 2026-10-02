@@ -19,4 +19,11 @@ module AASM
   class UndefinedState < RuntimeError; end
   class UndefinedEvent < UndefinedState; end
   class NoDirectAssignmentError < RuntimeError; end
+
+  # Raised on an invalid explicit timeout operation, such as retrying or
+  # cancelling an unknown/fired deadline, retrying before the deadline, or
+  # declaring an invalid timeout duration. A timeout event that is not defined
+  # is reported through an AASM::TimeoutResult when a deadline becomes due;
+  # advancing time itself never raises for a rejected transition.
+  class InvalidTimeoutOperation < RuntimeError; end
 end

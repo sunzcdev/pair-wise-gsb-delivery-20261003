@@ -1189,6 +1189,119 @@ Logging state change can be done using [paper_trail](https://github.com/paper-tr
 Example of implementation can be found here [https://github.com/nitsujri/aasm-papertrail-example](https://github.com/nitsujri/aasm-papertrail-example)
 
 
+### Timeouts
+
+A state can declare a monotonic `timeout`. When a task has stayed in that
+state for at least the declared duration, advancing the state machine attempts
+the state's timeout event (`expire` by default).
+
+AASM never spawns a thread and never starts a timer service. Timeouts are
+driven explicitly by the caller, which supplies the **current monotonic time**
+when advancing. This keeps time deterministic and testable with a manual
+clock.
+
+```ruby
+class Job
+  include AASM
+
+  aasm do
+    state :waiting, initial: true, timeout: 30, timeout_event: :expire
+    state :done
+
+    event :expire do
+      transitions from: :waiting, to: :done
+    end
+  end
+end
+
+job = Job.new
+
+# observational queries never trigger an event
+job.aasm.time_remaining(now)   # => seconds left, floored at 0; nil without a deadline
+job.aasm.timeouts_due?(now)    # => true/false
+
+# the only call that fires a timeout event; pass the current monotonic time
+result = job.aasm.time_out(now)
+```
+
+`timeout` is a duration measured on the same monotonic clock used for
+advancing. The timeout event defaults to `:expire` and can be overridden per
+state with `timeout_event:`. A timeout event goes through the normal event
+machinery, so transitions, guards and callbacks behave exactly like any other
+event. A zero duration (`timeout: 0`) is allowed for zero-wait states.
+
+#### Monotonic clock
+
+Deadlines are armed when a state is entered. Ordinarily triggered events read
+the object's monotonic clock hook, which defaults to the system monotonic
+clock. Override `aasm_monotonic_now` to use a manual clock (for example in
+tests):
+
+```ruby
+class Job
+  attr_accessor :clock
+  def aasm_monotonic_now
+    clock.now
+  end
+end
+```
+
+`time_out`, `retry_timeout`, `time_remaining` and `timeouts_due?` all accept
+an explicit `now` argument. When it is omitted the object's monotonic clock is
+used. While a timeout is being advanced, the supplied `now` is also used to
+arm any deadline created by the resulting transition, keeping a single advance
+on one time base.
+
+#### Results, rejection, retry and cancel
+
+Advancing returns an `AASM::TimeoutResult` (an array of results when more than
+one deadline was due), and never raises just because a guard rejected the
+transition:
+
+```ruby
+result = job.aasm.time_out(now)
+result.status     # :fired | :rejected | :error | :cancelled | :none
+result.fired?
+result.rejected?  # guards blocked it / no allowed transition
+result.error?     # a callback raised, or the timeout event is not defined
+result.retryable? # true for :rejected and :error
+result.from_state # :to_state, :event, :state, :token, :error
+
+# a failed deadline stays in place; retry it explicitly after fixing things
+job.aasm.retry_timeout(now)
+
+# or drop the deadline without leaving the current state
+job.aasm.cancel_timeout
+```
+
+Reading the remaining time or whether a timeout is due never fires anything.
+A failed deadline is not retried implicitly; the caller decides to retry or
+cancel.
+
+#### Deadline ownership
+
+A deadline belongs to one **successful entry** into a state:
+
+* Entering the initial state arms its deadline when the state is first
+  entered (lazily, on first state access, like the rest of AASM).
+* Leaving a state voids its deadline immediately.
+* Leaving and later returning to a state with the same name arms a brand new
+  deadline with a fresh token; an old due record can never trigger the new
+  entry.
+* A self-transition counts as leaving and re-entering, so it re-arms the
+  deadline.
+* Named state machines keep independent deadlines (use
+  `job.aasm(:machine).time_out(now)`).
+* A transition that fails (guard rejection or error) does not replace the
+  deadline, which still belongs to the state currently occupied.
+
+#### One advance, one snapshot
+
+A single `time_out` call only handles deadlines that were already due when
+the call started. If the timeout event enters another state with a zero
+waiting time, that new deadline is **not** handled until the next advance, so
+advancing can never spin inside one call.
+
 ### Inspection
 
 AASM supports query methods for states and events

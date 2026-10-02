@@ -2,6 +2,7 @@
 
 ## unreleased
 * typo fixes, thanks @kumar-mithlesh [#870](https://github.com/aasm/aasm/pull/870)
+* Add state timeouts for plain Ruby objects: declare a monotonic `timeout` (and optional `timeout_event`, default `:expire`) on a state, then drive it explicitly with `job.aasm.time_out(now)`. Deadlines belong to a single successful state entry, are voided on leave (including self-transitions) and re-armed on re-entry. Rejections/errors return an `AASM::TimeoutResult` and can be explicitly retried or cancelled; reading remaining time never fires. One advance only handles deadlines due when it started, so zero-wait target states are left for the next advance. No threads or timer service are created.
 
 ## 6.0.0 (5 July 2026)
 * Let `whiny_persistence: true` be the default now [#378](https://github.com/aasm/aasm/pull/378)

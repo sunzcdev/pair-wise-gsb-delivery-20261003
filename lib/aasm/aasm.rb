@@ -73,6 +73,14 @@ module AASM
     @aasm[name.to_sym] ||= AASM::InstanceBase.new(self, name.to_sym)
   end
 
+  # Default monotonic time source used to arm state timeouts. Override this
+  # method (for example with a manually advanced clock in tests) to anchor
+  # deadlines of ordinarily triggered events on a custom monotonic time.
+  # Advancing a timeout always takes the "now" explicitly passed by the caller.
+  def aasm_monotonic_now
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
+  end
+
   def initialize_dup(other)
     @aasm = Concurrent::Map.new
     super
@@ -164,6 +172,13 @@ private
     else
       aasm(state_machine_name).current_state = new_state_name
       yield if block_given?
+    end
+
+    if persist_successful
+      # A successful entry arms (or invalidates and re-arms) the timeout
+      # deadline. Done before any bound chained event so that the chained
+      # transition arms its own deadline on top of the correct state.
+      aasm(state_machine_name).state_entered(new_state_name, old_state.name)
     end
 
     binding_event = event.options[:binding_event]

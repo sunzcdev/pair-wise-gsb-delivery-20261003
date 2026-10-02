@@ -73,6 +73,22 @@ module AASM::Core
       [display_name, name.to_s]
     end
 
+    # Monotonic duration after which a deadline entered with this state is due,
+    # or nil when the state declares no timeout.
+    def timeout
+      @options[:timeout]
+    end
+
+    def timeout?
+      !timeout.nil?
+    end
+
+    # Event to attempt when the deadline is reached. Defaults to +:expire+,
+    # overridable per state through the +:timeout_event+ option.
+    def timeout_event
+      (@options[:timeout_event] || :expire).to_sym
+    end
+
   private
 
     def update(options = {})

@@ -89,6 +89,7 @@ module AASM
     # [1..] state
     def state(*args)
       names, options = interpret_state_args(args)
+      validate_timeout_options!(options)
       names.each do |name|
         @state_machine.add_state(name, klass, options)
 
@@ -104,6 +105,23 @@ module AASM
         unless klass.const_defined?(const_name)
           klass.const_set(const_name, name)
         end
+      end
+    end
+
+    # Validates the timeout declaration of a state. Event existence cannot be
+    # checked here because events may be defined after states, so it is checked
+    # lazily when a deadline becomes due.
+    def validate_timeout_options!(options)
+      return if options[:timeout].nil?
+
+      duration = options[:timeout]
+      unless duration.is_a?(Numeric)
+        raise ArgumentError,
+              "invalid timeout #{duration.inspect}: expected a monotonic Numeric duration"
+      end
+      if duration < 0
+        raise ArgumentError,
+              "invalid timeout #{duration.inspect}: expected a non-negative duration"
       end
     end
 

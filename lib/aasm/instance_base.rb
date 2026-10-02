@@ -23,6 +23,8 @@ module AASM
       self.current_state = state_name
       state_object.fire_callbacks(:after_enter, @instance)
 
+      state_entered(state_name)
+
       state_name
     end
 
@@ -113,15 +115,15 @@ module AASM
       end
     end
 
-    def fire(event_name, *args, &block)
+    def fire(event_name, *args, **kwargs, &block)
       event_exists?(event_name)
-      @instance.send(event_method_name(event_name), *args, &block)
+      @instance.send(event_method_name(event_name), *args, **kwargs, &block)
     end
 
-    def fire!(event_name, *args, &block)
+    def fire!(event_name, *args, **kwargs, &block)
       event_exists?(event_name, true)
       bang_event_name = "#{event_method_name(event_name)}!".to_sym
-      @instance.send(bang_event_name, *args, &block)
+      @instance.send(bang_event_name, *args, **kwargs, &block)
     end
 
     def set_current_state_with_persistence(state)
@@ -130,7 +132,180 @@ module AASM
       save_success
     end
 
+    # --- state timeouts -------------------------------------------------
+
+    # Monotonic schedule holding the deadline of the state currently occupied
+    # by this state machine instance.
+    def timeout_schedule
+      @timeout_schedule ||= AASM::Core::TimeoutSchedule.new
+    end
+
+    # Hook invoked exactly once for every successful state entry, including
+    # the initial state. The deadline is a property of this particular entry:
+    # entering a state voids the deadline of the state being left (also for
+    # self-transitions), and re-entering a state arms a brand new deadline with
+    # a fresh token.
+    def state_entered(state_name, _previous_state_name = nil)
+      new_state = state_object_for_name(state_name)
+      timeout_schedule.clear
+      return unless new_state.timeout?
+
+      timeout_schedule.arm(
+        state_name,
+        monotonic_now,
+        new_state.timeout,
+        new_state.timeout_event
+      )
+    end
+
+    # Advances the state machine against the caller supplied monotonic time.
+    #
+    # Only deadlines already due at +now+ when the call starts are handled;
+    # deadlines armed by the resulting transition (e.g. a zero-wait target
+    # state) are left for the next advance, so this never spins.
+    #
+    # Returns a single AASM::TimeoutResult (or one per due entry as an array in
+    # the general case). Reading time never triggers events; this is the only
+    # entry point that fires a timeout event.
+    def time_out(now = monotonic_now, *args, **kwargs)
+      # Entering the initial state for the first time arms its deadline using
+      # the object's own monotonic clock. Do this before taking the due
+      # snapshot, so an (even zero-wait) initial deadline is only due on a
+      # later advance rather than firing immediately.
+      ensure_initial_state_entered
+      due_entries = timeout_schedule.due(now)
+      return AASM::TimeoutResult.new(status: :none) if due_entries.empty?
+
+      results = due_entries.map { |entry| handle_due_entry(entry, now, *args, **kwargs) }
+      results.size == 1 ? results.first : results
+    end
+    alias_method :advance_timeouts, :time_out
+
+    # Explicitly retries the outstanding deadline after a previous rejection or
+    # error. Does nothing implicitly: a failed deadline is never re-fired just
+    # because time is read or advanced again.
+    def retry_timeout(now = monotonic_now, *args, **kwargs)
+      ensure_initial_state_entered
+      entry = timeout_schedule.entry
+      return AASM::TimeoutResult.new(status: :none) unless live?(entry)
+
+      unless entry.due?(now)
+        raise AASM::InvalidTimeoutOperation,
+              "cannot retry timeout for state ':#{entry.state}' before its deadline"
+      end
+
+      handle_due_entry(entry, now, *args, **kwargs)
+    end
+
+    # Voids the outstanding deadline without leaving the current state.
+    def cancel_timeout
+      ensure_initial_state_entered
+      entry = timeout_schedule.entry
+      return AASM::TimeoutResult.new(status: :none) unless live?(entry)
+
+      timeout_schedule.disarm(entry.token)
+      AASM::TimeoutResult.new(
+        status: :cancelled,
+        state: entry.state,
+        event: entry.event,
+        from_state: current_state,
+        token: entry.token
+      )
+    end
+
+    # Remaining monotonic time of the current deadline, floored at zero, or nil
+    # when the current state has no outstanding deadline. Purely observational:
+    # it never fires a timeout event.
+    def time_remaining(now = monotonic_now)
+      ensure_initial_state_entered
+      entry = timeout_schedule.entry
+      return nil unless live?(entry)
+
+      entry.remaining(now)
+    end
+
+    # Whether the current deadline is due at +now+. Purely observational.
+    def timeouts_due?(now = monotonic_now)
+      ensure_initial_state_entered
+      entry = timeout_schedule.entry
+      !!(entry && live?(entry) && entry.due?(now))
+    end
+
     private
+
+    def ensure_initial_state_entered
+      current_state
+    end
+
+    def monotonic_now
+      AASM::Core::MonotonicClock.now_or(@instance.aasm_monotonic_now)
+    end
+
+    def live?(entry)
+      !!entry && current_state == entry.state
+    end
+
+    def handle_due_entry(entry, now, *args, **kwargs)
+      from_state = current_state
+
+      # Defensive: only a deadline belonging to the state currently occupied
+      # can drive an event. A stale deadline is voided silently.
+      unless live?(entry)
+        timeout_schedule.disarm(entry.token)
+        return AASM::TimeoutResult.new(status: :none)
+      end
+
+      unless @instance.class.aasm(@name).state_machine.events[entry.event]
+        error = AASM::InvalidTimeoutOperation.new(
+          "Event ':#{entry.event}' declared as the timeout event for state ':#{entry.state}' doesn't exist"
+        )
+        return AASM::TimeoutResult.new(
+          status: :error,
+          state: entry.state,
+          event: entry.event,
+          from_state: from_state,
+          token: entry.token,
+          error: error
+        )
+      end
+
+      fired, error = AASM::Core::MonotonicClock.with_now(now) do
+        begin
+          [fire(entry.event, *args, **kwargs), nil]
+        rescue AASM::InvalidTransition => e
+          # No allowed transition (guards rejected or no transition from this
+          # state). This is a rejection, never an unexpected error.
+          [false, e]
+        rescue StandardError => e
+          [nil, e]
+        end
+      end
+
+      build_result(entry, from_state, fired, error)
+    end
+
+    def build_result(entry, from_state, fired, error)
+      status =
+        if error.is_a?(AASM::InvalidTransition)
+          :rejected
+        elsif error.nil? && fired
+          :fired
+        elsif error
+          :error
+        else
+          :rejected
+        end
+
+      AASM::TimeoutResult.new(
+        status: status,
+        state: entry.state,
+        event: entry.event,
+        from_state: from_state,
+        to_state: current_state,
+        token: entry.token,
+        error: error
+      )
+    end
 
     def event_method_name(event_name)
       config = @instance.class.aasm(@name).state_machine.config
