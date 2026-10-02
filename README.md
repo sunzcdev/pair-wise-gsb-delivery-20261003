@@ -1224,6 +1224,37 @@ Output:
 
 </details>
 
+<details>
+<summary>render_stream</summary>
+
+
+Streams a JSON array for an enumerable data source, returning a response body
+object that can be consumed chunk by chunk. Fields, views, associations and
+transformers behave exactly as they do in `render`.
+
+The source is not read until the body is consumed, and each element is
+serialized one at a time as the consumer advances, so single-pass enumerables
+(e.g. lazy relations or cursors) are supported. If the source responds to
+`close`, it is closed exactly once when iteration completes, when the consumer
+closes the body early, or when an error is raised partway through. If an error
+is raised after chunks have been emitted, it propagates to the consumer and no
+closing bracket is appended.
+
+The `:root` and `:meta` options are not supported by this entry point and raise
+`Blueprinter::Errors::UnsupportedStreamOption`.
+
+Usage:
+
+```ruby
+body = UserBlueprint.render_stream(User.find_each, view: :extended)
+body.each do |chunk|
+  response.stream.write(chunk)
+end
+body.close
+```
+
+</details>
+
 ## Installation
 
 Add this line to your application's Gemfile:

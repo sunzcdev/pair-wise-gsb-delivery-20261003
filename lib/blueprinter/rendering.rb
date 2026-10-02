@@ -3,7 +3,9 @@
 require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
+require 'blueprinter/errors/unsupported_stream_option'
 require 'blueprinter/deprecation'
+require 'blueprinter/streaming_body'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
@@ -82,6 +84,43 @@ module Blueprinter
     # @return [Hash]
     def render_as_json(object, options = {})
       build_result(object:, options:).as_json
+    end
+
+    # Generates a lazily-streamed JSON array response body for an enumerable
+    # data source, consumable chunk by chunk via #each.
+    #
+    # The source is not read until the returned body is consumed, and each
+    # element is serialized one at a time as the consumer advances. Fields,
+    # views, associations and transformers behave exactly as they do in
+    # `.render`. If the source responds to #close, it is closed exactly once
+    # when iteration completes, when the consumer closes the body early, or
+    # when an error is raised partway through.
+    #
+    # @param object [Enumerable] the enumerable data source to serialize.
+    # @param options [Hash] the options hash which requires a :view. Any
+    #   additional key value pairs will be exposed during serialization.
+    # @option options [Symbol] :view Defaults to :default.
+    #   The view name that corresponds to the group of
+    #   fields to be serialized.
+    #
+    # @example Streaming JSON chunks for a collection
+    #   body = UserBlueprint.render_stream(User.all, view: :extended)
+    #   body.each { |chunk| response.syswrite(chunk) }
+    #
+    # @return [Blueprinter::StreamingBody] a chunk-consumable response body
+    # @raise [Blueprinter::Errors::UnsupportedStreamOption] if :root or :meta
+    #   is given, since a streamed JSON array cannot carry them.
+    # @raise [Blueprinter::Errors::UnknownView] if the view is not defined.
+    def render_stream(object, options = {})
+      raise Errors::UnsupportedStreamOption if options[:root] || options[:meta]
+
+      view_name = options[:view] || :default
+      raise Errors::UnknownView, "View '#{view_name}' is not defined" unless view_collection.view?(view_name)
+
+      local_options = options.except(:view, :root, :meta)
+      StreamingBody.new(object) do |obj|
+        jsonify(hashify(obj, view_name:, local_options:))
+      end
     end
 
     # Converts an object into a Hash representation based on provided view.
