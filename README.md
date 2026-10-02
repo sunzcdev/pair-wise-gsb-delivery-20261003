@@ -213,6 +213,20 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Delete many values at once:
+```go
+value, _ := sjson.DeleteMany(`{"friends":["Andy","Carol","Sara"],"age":37}`,
+	"friends.0", "friends.2", "age")
+println(value)
+
+// Output:
+// {"friends":["Carol"]}
+```
+
+All paths are evaluated against the original json before anything is
+removed, so array indexes refer to positions in the original document and
+the result does not depend on the order of the paths.
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 

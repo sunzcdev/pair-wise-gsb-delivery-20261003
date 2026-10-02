@@ -133,6 +133,90 @@ func TestDelete(t *testing.T) {
 	testRaw(t, setDelete, `{"1":"2"}`, `{"1":"2"}`, `3`, nil)
 }
 
+func testDeleteMany(t *testing.T, expect, json string, paths ...string) {
+	t.Helper()
+	res, err := DeleteMany(json, paths...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, res)
+	}
+	resb, err := DeleteManyBytes([]byte(json), paths...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(resb) != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, string(resb))
+	}
+}
+
+func permutePaths(paths []string) [][]string {
+	if len(paths) <= 1 {
+		return [][]string{append([]string(nil), paths...)}
+	}
+	var res [][]string
+	for i := 0; i < len(paths); i++ {
+		rest := append(append([]string(nil), paths[:i]...), paths[i+1:]...)
+		for _, p := range permutePaths(rest) {
+			res = append(res, append([]string{paths[i]}, p...))
+		}
+	}
+	return res
+}
+
+func TestDeleteMany(t *testing.T) {
+	// array indexes refer to positions in the original document,
+	// they are not reinterpreted after each delete.
+	json := `{"children":["Sara","Alex","Jack","Tim"]}`
+	expect := `{"children":["Sara","Jack"]}`
+	for _, paths := range permutePaths([]string{"children.1", "children.3"}) {
+		testDeleteMany(t, expect, json, paths...)
+	}
+
+	// query paths that produce multiple array positions mixed with
+	// normal paths. the result must not depend on the path order.
+	json = `{"nums":[1,2,3,4],"name":"tom","age":37}`
+	expect = `{"nums":[2],"age":37}`
+	for _, paths := range permutePaths(
+		[]string{"nums.#(>2)#", "nums.0", "name"}) {
+		testDeleteMany(t, expect, json, paths...)
+	}
+
+	// duplicate hits are removed only once, and hits contained within
+	// a deleted parent are not processed separately.
+	testDeleteMany(t, `{"c":2}`, `{"a":{"b":1},"c":2}`, "a", "a.b", "a")
+	testDeleteMany(t, `{"a":{"b":1}}`, `{"a":{"b":1},"c":2}`, "c", "c")
+
+	// multipath hits mixed with a normal path to the same value.
+	json = `{"friends":[{"last":"Murphy","x":1},{"last":"Craig","y":2}]}`
+	expect = `{"friends":[{"x":1},{"y":2}]}`
+	for _, paths := range permutePaths(
+		[]string{"friends.#.last", "friends.0.last"}) {
+		testDeleteMany(t, expect, json, paths...)
+	}
+
+	// the -1 index refers to the last element of the original array.
+	testDeleteMany(t, `[2]`, `[1,2,3]`, "-1", "0")
+	testDeleteMany(t, `{"a":[]}`, `{"a":[1,2]}`, "a.0", "a.1")
+
+	// untouched regions keep their original formatting.
+	testDeleteMany(t, `{  "b": [ 1, 3 ] }`,
+		`{  "a": 1,  "b": [ 1, 2, 3 ] }`, "a", "b.1")
+
+	// no matches returns the original json.
+	testDeleteMany(t, `{"a":1}`, `{"a":1}`, "zzz")
+
+	// deleting the root node returns an empty string.
+	testDeleteMany(t, ``, `{"a":1}`, "@this")
+	testDeleteMany(t, ``, `{"a":1}`, "a", "@this")
+
+	// an empty path is an error.
+	if _, err := DeleteMany(`{"a":1}`, ""); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
 // TestRandomData is a fuzzing test that throws random data at SetRaw
 // function looking for panics.
 func TestRandomData(t *testing.T) {

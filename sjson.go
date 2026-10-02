@@ -502,6 +502,250 @@ func DeleteBytesOptions(json []byte, path string, options *Options) ([]byte, err
 	return SetBytesOptions(json, path, dtype{}, options)
 }
 
+// deleteHit represents the byte range of a json value in the original
+// document. The range covers only the value itself, not the member key
+// or the separating commas.
+type deleteHit struct {
+	start, end int
+}
+
+// deletePathHits evaluates path against jstr and returns the ranges of all
+// matching values. The ranges refer to positions in the original,
+// unmodified jstr. It returns root=true when the path matches the root
+// node. A path that matches nothing returns no hits and no error.
+func deletePathHits(jstr, path string) (hits []deleteHit, root bool,
+	err error) {
+	if path == "" {
+		return nil, false, &errorType{"path cannot be empty"}
+	}
+	var paths []pathResult
+	r, simple := parsePath(path)
+	if simple {
+		paths = append(paths, r)
+		for r.more {
+			r, simple = parsePath(r.path)
+			if !simple {
+				break
+			}
+			paths = append(paths, r)
+		}
+	}
+	if simple {
+		// walk the path one part at a time, tracking the absolute
+		// offset of the current json block in the original document.
+		cur := jstr
+		off := 0
+		for i := 0; i < len(paths); i++ {
+			var res gjson.Result
+			var found bool
+			if paths[i].part == "-1" && !paths[i].force {
+				res = gjson.Get(cur, "#")
+				if res.Int() > 0 {
+					res = gjson.Get(cur,
+						strconv.FormatInt(res.Int()-1, 10))
+					found = true
+				}
+			}
+			if !found {
+				res = gjson.Get(cur, paths[i].gpart)
+			}
+			if res.Index <= 0 {
+				// no match
+				return nil, false, nil
+			}
+			if i == len(paths)-1 {
+				start := off + res.Index
+				return []deleteHit{{start, start + len(res.Raw)}},
+					false, nil
+			}
+			cur = res.Raw
+			off += res.Index
+		}
+	}
+	res := gjson.Get(jstr, path)
+	if !res.Exists() {
+		return nil, false, nil
+	}
+	if res.Index != 0 {
+		return []deleteHit{{res.Index, res.Index + len(res.Raw)}},
+			false, nil
+	}
+	if len(res.Indexes) == 0 {
+		// the result has no position in the document. it's the root
+		// node when the raw value matches the entire document.
+		if trim(res.Raw) == trim(jstr) {
+			return nil, true, nil
+		}
+		return nil, false, nil
+	}
+	var i int
+	res.ForEach(func(_, vres gjson.Result) bool {
+		if i < len(res.Indexes) {
+			hits = append(hits, deleteHit{
+				res.Indexes[i], res.Indexes[i] + len(vres.Raw)})
+		}
+		i++
+		return true
+	})
+	if len(hits) != len(res.Indexes) {
+		return nil, false, nil
+	}
+	return hits, false, nil
+}
+
+// forwardCommaEnd returns end advanced past the comma that follows the
+// value at end, or end when there is no such comma.
+func forwardCommaEnd(jstr string, end int) int {
+	i := end
+	for i < len(jstr) && jstr[i] <= ' ' {
+		i++
+	}
+	if i < len(jstr) && jstr[i] == ',' {
+		return i + 1
+	}
+	return end
+}
+
+// deleteRange removes the value at [start,end) from jstr along with the
+// member key or separating comma that belongs to it.
+func deleteRange(jstr string, start, end int) string {
+	ds, de := start, end
+	i := start - 1
+	for i >= 0 && jstr[i] <= ' ' {
+		i--
+	}
+	if i >= 0 {
+		switch jstr[i] {
+		case ',':
+			// delete the comma that precedes the value
+			ds = i
+		case ':':
+			// object member, delete the key as well
+			i--
+			for i >= 0 && jstr[i] <= ' ' {
+				i--
+			}
+			if i >= 0 && jstr[i] == '"' {
+				// scan to the start of the key string
+				i--
+				for i >= 0 {
+					if jstr[i] == '"' {
+						bs := 0
+						for j := i - 1; j >= 0 && jstr[j] == '\\'; j-- {
+							bs++
+						}
+						if bs%2 == 0 {
+							break
+						}
+					}
+					i--
+				}
+			}
+			i--
+			for i >= 0 && jstr[i] <= ' ' {
+				i--
+			}
+			if i >= 0 && jstr[i] == ',' {
+				ds = i
+			} else {
+				ds = i + 1
+				de = forwardCommaEnd(jstr, end)
+			}
+		default:
+			// first element of an array
+			ds = i + 1
+			de = forwardCommaEnd(jstr, end)
+		}
+	}
+	return jstr[:ds] + jstr[de:]
+}
+
+// deleteHits removes the hits from jstr. The hits must reference positions
+// in the original jstr. Duplicate hits are removed only once and hits
+// contained within another hit are ignored.
+func deleteHits(jstr string, hits []deleteHit) string {
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].start != hits[j].start {
+			return hits[i].start < hits[j].start
+		}
+		return hits[i].end > hits[j].end
+	})
+	kept := hits[:0]
+	for _, h := range hits {
+		if len(kept) > 0 && h.end <= kept[len(kept)-1].end {
+			// duplicate of, or contained within, the previous hit
+			continue
+		}
+		kept = append(kept, h)
+	}
+	// delete from right to left so that the positions of the remaining
+	// hits stay valid, and untouched regions keep their original bytes.
+	res := jstr
+	for i := len(kept) - 1; i >= 0; i-- {
+		res = deleteRange(res, kept[i].start, kept[i].end)
+	}
+	return res
+}
+
+// DeleteMany deletes values from json for the specified paths.
+// All paths are evaluated against the original json before anything is
+// removed, so array indexes always refer to positions in the original
+// document and the result does not depend on the order of the paths.
+// Duplicate matches are removed only once, and matches contained within
+// another match are ignored. Regions that are not touched keep their
+// original formatting. A path that matches the root node deletes the
+// entire document and returns an empty string.
+func DeleteMany(json string, paths ...string) (string, error) {
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := DeleteManyBytes(jsonb, paths...)
+	return string(res), err
+}
+
+// DeleteManyBytes deletes values from json for the specified paths.
+// If working with bytes, this method preferred over
+// DeleteMany(string(data), paths...)
+func DeleteManyBytes(json []byte, paths ...string) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	var hits []deleteHit
+	var root bool
+	for _, path := range paths {
+		h, r, err := deletePathHits(jstr, path)
+		if err != nil {
+			return []byte(jstr), err
+		}
+		if r {
+			root = true
+			continue
+		}
+		hits = append(hits, h...)
+	}
+	if !root {
+		// a hit that spans the entire document deletes the root node
+		cs, ce := 0, len(jstr)
+		for cs < ce && jstr[cs] <= ' ' {
+			cs++
+		}
+		for ce > cs && jstr[ce-1] <= ' ' {
+			ce--
+		}
+		for _, h := range hits {
+			if h.start <= cs && h.end >= ce {
+				root = true
+				break
+			}
+		}
+	}
+	if root {
+		return []byte(""), nil
+	}
+	if len(hits) == 0 {
+		return json, nil
+	}
+	return []byte(deleteHits(jstr, hits)), nil
+}
+
 type stringHeader struct {
 	data unsafe.Pointer
 	len  int
