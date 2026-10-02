@@ -33,6 +33,16 @@ type ClientOptions struct {
 	WriteTimeout time.Duration
 	ActionMask   OptAction
 	ProtocolMask OptProtocol
+
+	// MaxPacketSize is the maximum accepted frame size in bytes, including
+	// the command byte. The same limit is applied to every inbound frame:
+	// option negotiation responses, action responses and replacement body
+	// chunks alike. A non-positive value means DefaultMaxPacketSize is used.
+	//
+	// This limit bounds frame reading only. The protocol-level maximum size
+	// of a single body chunk sent by the client (MaxBodyChunk) is enforced
+	// independently.
+	MaxPacketSize int
 }
 
 var defaultOptions = ClientOptions{
@@ -75,6 +85,7 @@ func (c *Client) Session() (*ClientSession, error) {
 	s := &ClientSession{
 		readTimeout:           c.opts.ReadTimeout,
 		writeTimeout:          c.opts.WriteTimeout,
+		maxPacketSize:         c.opts.MaxPacketSize,
 		clientProtocolVersion: 6,
 	}
 
@@ -111,6 +122,8 @@ type ClientSession struct {
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	// maxPacketSize bounds the size of every inbound frame.
+	maxPacketSize int
 	// Milter client version. Can be downgraded during negotiation
 	clientProtocolVersion uint32
 }
@@ -130,7 +143,7 @@ func (s *ClientSession) negotiate(actionMask OptAction, protoMask OptProtocol) e
 	if err := writePacket(s.conn, msg, s.writeTimeout); err != nil {
 		return fmt.Errorf("milter: negotiate: optneg write: %w", err)
 	}
-	msg, err := readPacket(s.conn, s.readTimeout)
+	msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize)
 	if err != nil {
 		return fmt.Errorf("milter: negotiate: optneg read: %w", err)
 	}
@@ -211,7 +224,7 @@ type Action struct {
 
 func (s *ClientSession) readAction() (*Action, error) {
 	for {
-		msg, err := readPacket(s.conn, s.readTimeout)
+		msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize)
 		if err != nil {
 			return nil, fmt.Errorf("action read: %w", err)
 		}
@@ -591,7 +604,7 @@ func parseModifyAct(msg *Message) (*ModifyAction, error) {
 
 func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action, err error) {
 	for {
-		msg, err := readPacket(s.conn, s.readTimeout)
+		msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize)
 		if err != nil {
 			return nil, nil, fmt.Errorf("action read: %w", err)
 		}

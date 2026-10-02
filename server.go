@@ -103,6 +103,15 @@ type Server struct {
 	Actions   OptAction
 	Protocol  OptProtocol
 
+	// MaxPacketSize is the maximum accepted frame size in bytes, including
+	// the command byte. The same limit is applied to every inbound frame:
+	// option negotiation, macro definitions and body chunks alike. A
+	// non-positive value means DefaultMaxPacketSize is used.
+	//
+	// This limit bounds frame reading only. The protocol-level maximum size
+	// of a single body chunk (MaxBodyChunk) is enforced independently.
+	MaxPacketSize int
+
 	// SymList is the list of macros that the milter wants to receive from
 	// the MTA for the selected protocol stages.
 	// [Server.Actions] must have the flag [OptSetSymList] set.
@@ -128,11 +137,12 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		session := milterSession{
-			server:   s,
-			actions:  s.Actions,
-			protocol: s.Protocol,
-			conn:     conn,
-			backend:  s.NewMilter(),
+			server:        s,
+			actions:       s.Actions,
+			protocol:      s.Protocol,
+			maxPacketSize: s.MaxPacketSize,
+			conn:          conn,
+			backend:       s.NewMilter(),
 		}
 		go session.HandleMilterCommands()
 	}
