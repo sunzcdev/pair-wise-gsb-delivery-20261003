@@ -1,7 +1,180 @@
 package lua
 
+import (
+	"math"
+	"sort"
+)
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
+
+// OrderedTableIterator iterates a table in a deterministic key order.
+//
+// The key set is captured when the iterator is created. Keys deleted while
+// iteration is in progress are skipped, while newly added keys are not visited.
+// Values are read from the table as each key is visited.
+type OrderedTableIterator struct {
+	table *LTable
+	keys  []LValue
+	index int
+}
+
+// OrderedIterator returns an iterator that visits number, string, and boolean
+// keys in a deterministic order. It panics if the table contains any other
+// key type.
+func (tb *LTable) OrderedIterator() *OrderedTableIterator {
+	return &OrderedTableIterator{table: tb, keys: tb.orderedKeys()}
+}
+
+// HasNext reports whether another live key remains in the snapshot.
+func (it *OrderedTableIterator) HasNext() bool {
+	for it.index < len(it.keys) && it.table.orderedValue(it.keys[it.index]) == LNil {
+		it.index++
+	}
+	return it.index < len(it.keys)
+}
+
+// Next returns the next live key and its current value.
+func (it *OrderedTableIterator) Next() (LValue, LValue) {
+	if !it.HasNext() {
+		return LNil, LNil
+	}
+	key := it.keys[it.index]
+	it.index++
+	return key, it.table.orderedValue(key)
+}
+
+// ForEachOrdered calls cb for every number, string, and boolean key in a
+// deterministic order. The key set is snapshotted before cb is called.
+func (tb *LTable) ForEachOrdered(cb func(LValue, LValue)) {
+	it := tb.OrderedIterator()
+	for key, value := it.Next(); key != LNil; key, value = it.Next() {
+		cb(key, value)
+	}
+}
+
+func (tb *LTable) orderedKeys() []LValue {
+	keys := make([]LValue, 0, len(tb.array)+len(tb.strdict)+len(tb.dict)+2)
+	seenNumberBits := map[uint64]bool{}
+	seenStrings := map[string]bool{}
+
+	for i, value := range tb.array {
+		if value != LNil {
+			key := LNumber(i + 1)
+			keys = append(keys, key)
+			seenNumberBits[math.Float64bits(float64(key))] = true
+		}
+	}
+
+	for key := range tb.strdict {
+		if tb.strdict[key] != LNil {
+			keys = append(keys, LString(key))
+			seenStrings[key] = true
+		}
+	}
+
+	for key, value := range tb.dict {
+		if value == LNil {
+			continue
+		}
+		switch key := key.(type) {
+		case LNumber:
+			keyBits := math.Float64bits(float64(key))
+			if seenNumberBits[keyBits] {
+				continue
+			}
+			if math.Signbit(float64(key)) && keyBits == math.Float64bits(0) {
+				key = 0
+			}
+			keys = append(keys, key)
+			seenNumberBits[keyBits] = true
+		case LString:
+			if seenStrings[string(key)] {
+				continue
+			}
+			keys = append(keys, key)
+			seenStrings[string(key)] = true
+		case LBool:
+			keys = append(keys, key)
+		default:
+			panic("ordered table iteration supports number, string, and boolean keys")
+		}
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		return orderedKeyLess(keys[i], keys[j])
+	})
+	return keys
+}
+
+func orderedKeyLess(left, right LValue) bool {
+	leftRank := orderedKeyTypeRank(left)
+	rightRank := orderedKeyTypeRank(right)
+	if leftRank != rightRank {
+		return leftRank < rightRank
+	}
+
+	switch left := left.(type) {
+	case LNumber:
+		rightNumber := right.(LNumber)
+		leftNaN := math.IsNaN(float64(left))
+		rightNaN := math.IsNaN(float64(rightNumber))
+		if leftNaN || rightNaN {
+			if leftNaN != rightNaN {
+				return leftNaN
+			}
+			return math.Float64bits(float64(left)) < math.Float64bits(float64(rightNumber))
+		}
+		return left < rightNumber
+	case LString:
+		return left < right.(LString)
+	case LBool:
+		return !bool(left) && bool(right.(LBool))
+	default:
+		panic("ordered table iteration supports number, string, and boolean keys")
+	}
+}
+
+func (tb *LTable) orderedValue(key LValue) LValue {
+	switch key := key.(type) {
+	case LNumber:
+		if isArrayKey(key) {
+			if value := tb.RawGetInt(int(key)); value != LNil {
+				return value
+			}
+		}
+		keyBits := math.Float64bits(float64(key))
+		for hashKey, value := range tb.dict {
+			if hashKey, ok := hashKey.(LNumber); ok && math.Float64bits(float64(hashKey)) == keyBits {
+				return value
+			}
+		}
+		return LNil
+	case LString:
+		if value, ok := tb.strdict[string(key)]; ok {
+			return value
+		}
+		if value, ok := tb.dict[key]; ok {
+			return value
+		}
+		return LNil
+	default:
+		return tb.RawGet(key)
+	}
+}
+
+func orderedKeyTypeRank(key LValue) int {
+	switch key.(type) {
+	case LNumber:
+		return 0
+	case LString:
+		return 1
+	case LBool:
+		return 2
+	default:
+		panic("ordered table iteration supports number, string, and boolean keys")
+	}
+}
 
 type lValueArraySorter struct {
 	L      *LState

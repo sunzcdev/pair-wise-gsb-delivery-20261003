@@ -1,8 +1,144 @@
 package lua
 
 import (
+	"math"
 	"testing"
 )
+
+func orderedTableEntries(tb *LTable) []string {
+	entries := []string{}
+	tb.ForEachOrdered(func(key, value LValue) {
+		entries = append(entries, key.String()+"="+value.String())
+	})
+	return entries
+}
+
+func buildOrderedTestTable(forward bool) *LTable {
+	tb := newLTable(0, 0)
+
+	setValues := func(values ...LValue) {
+		for i, value := range values {
+			if forward {
+				tb.RawSetH(LNumber(math.Float64frombits(0x7ff8000000000001+uint64(i))), value)
+			} else {
+				tb.RawSetH(LNumber(math.Float64frombits(0x7ff8000000000002-uint64(i))), value)
+			}
+		}
+	}
+	if forward {
+		tb.RawSet(LNumber(1), LString("one"))
+		tb.RawSet(LNumber(-1), LString("minus"))
+		tb.RawSet(LNumber(2.5), LString("decimal"))
+		tb.RawSet(LNumber(0), LString("zero"))
+		setValues(LString("n1"), LString("n2"))
+		tb.RawSetString("a", LString("lower"))
+		tb.RawSetString("A", LString("upper"))
+		tb.RawSetString("b", LString("bee"))
+		tb.RawSetH(LTrue, LString("tb"))
+		tb.RawSetH(LFalse, LString("fb"))
+	} else {
+		tb.RawSetH(LFalse, LString("fb"))
+		tb.RawSetH(LTrue, LString("tb"))
+		tb.RawSetString("b", LString("bee"))
+		tb.RawSetString("A", LString("upper"))
+		tb.RawSetString("a", LString("lower"))
+		setValues(LString("n2"), LString("n1"))
+		tb.RawSetH(LNumber(math.Copysign(0, -1)), LString("zero"))
+		tb.RawSet(LNumber(2.5), LString("decimal"))
+		tb.RawSet(LNumber(-1), LString("minus"))
+		tb.RawSet(LNumber(1), LString("one"))
+	}
+
+	return tb
+}
+
+func TestTableForEachOrdered(t *testing.T) {
+	expected := []string{
+		"NaN=n1",
+		"NaN=n2",
+		"-1=minus",
+		"0=zero",
+		"1=one",
+		"2.5=decimal",
+		"A=upper",
+		"a=lower",
+		"b=bee",
+		"false=fb",
+		"true=tb",
+	}
+
+	for i := 0; i < 20; i++ {
+		errorIfNotEqual(t, len(expected), len(orderedTableEntries(buildOrderedTestTable(true))))
+		errorIfNotEqual(t, len(expected), len(orderedTableEntries(buildOrderedTestTable(false))))
+
+		forward := orderedTableEntries(buildOrderedTestTable(true))
+		reverse := orderedTableEntries(buildOrderedTestTable(false))
+		for index := range expected {
+			errorIfNotEqual(t, expected[index], forward[index])
+			errorIfNotEqual(t, expected[index], reverse[index])
+		}
+	}
+}
+
+func TestTableOrderedIteratorUsesKeySnapshot(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.RawSetInt(1, LString("one"))
+	tb.RawSetInt(2, LString("two"))
+	tb.RawSetString("a", LString("a"))
+	tb.RawSetString("b", LString("b"))
+	tb.RawSetH(LTrue, LString("true"))
+	tb.RawSetH(LFalse, LString("false"))
+
+	entries := []string{}
+	tb.ForEachOrdered(func(key, value LValue) {
+		if key == LNumber(1) {
+			tb.RawSetInt(2, LNil)
+			tb.RawSetInt(2, LString("readded"))
+			tb.RawSetInt(3, LString("added"))
+			tb.RawSetString("b", LNil)
+			tb.RawSetH(LTrue, LString("changed"))
+		}
+		entries = append(entries, key.String()+"="+value.String())
+	})
+
+	expected := []string{
+		"1=one",
+		"2=readded",
+		"a=a",
+		"false=false",
+		"true=changed",
+	}
+	errorIfNotEqual(t, len(expected), len(entries))
+	for index := range expected {
+		errorIfNotEqual(t, expected[index], entries[index])
+	}
+}
+
+func TestTableOrderedIteratorSkipsDuplicateStorage(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.RawSetInt(1, LString("array"))
+	tb.dict = map[LValue]LValue{LNumber(1): LString("hash")}
+	tb.dict[LNumber(math.Copysign(0, -1))] = LString("zero-hash")
+	tb.RawSetH(LNumber(0), LString("zero"))
+	tb.dict[LString("duplicate")] = LString("dict-string")
+	tb.RawSetString("duplicate", LString("strdict-string"))
+
+	entries := orderedTableEntries(tb)
+	errorIfNotEqual(t, 3, len(entries))
+	errorIfNotEqual(t, "0=zero", entries[0])
+	errorIfNotEqual(t, "1=array", entries[1])
+	errorIfNotEqual(t, "duplicate=strdict-string", entries[2])
+}
+
+func TestTableOrderedIteratorRejectsReferenceKeys(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.RawSetH(newLTable(0, 0), LTrue)
+
+	defer func() {
+		errorIfFalse(t, recover() != nil, "ordered iteration should reject reference keys")
+	}()
+	tb.ForEachOrdered(func(LValue, LValue) {})
+}
 
 func TestTableNewLTable(t *testing.T) {
 	tbl := newLTable(-1, -2)

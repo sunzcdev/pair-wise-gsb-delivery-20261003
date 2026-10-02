@@ -1937,6 +1937,10 @@ func (ls *LState) ForEach(tb *LTable, cb func(LValue, LValue)) {
 	tb.ForEach(cb)
 }
 
+func (ls *LState) ForEachOrdered(tb *LTable, cb func(LValue, LValue)) {
+	tb.ForEachOrdered(cb)
+}
+
 func (ls *LState) GetGlobal(name string) LValue {
 	return ls.GetField(ls.Get(GlobalsIndex), name)
 }
