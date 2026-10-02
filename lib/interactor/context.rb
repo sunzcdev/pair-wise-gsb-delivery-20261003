@@ -162,6 +162,129 @@ module Interactor
       @rolled_back = true
     end
 
+    # Public: Register a callback to run only after the outermost interactor
+    # invocation that owns this Context has completed successfully. Callbacks
+    # run in the order in which they were registered.
+    #
+    # If the invocation fails or is rolled back, every registered callback is
+    # discarded and never run. A fresh business invocation started from within
+    # a callback gets its own boundary, so callbacks it registers are never
+    # appended back to the batch currently being drained.
+    #
+    # callback - An object responding to "call".
+    #
+    # Returns the callback.
+    # Raises Interactor::CommitRegistrationError if no interactor invocation
+    #   is in progress.
+    def after_commit(callback = nil, &block)
+      callback ||= block
+      boundary = _commit_boundary!
+      boundary[:callbacks] << callback
+      callback
+    end
+
+    # Internal: Open an after_commit boundary for an interactor invocation. If
+    # a boundary is already open for this Context (a nested organizer or an
+    # interactor called with the same context), the invocation joins it and
+    # returns the existing boundary. A fresh invocation started while the
+    # previous boundary is being drained opens a new, independent boundary.
+    #
+    # Returns an invocation frame Hash identifying the boundary and whether
+    # this invocation owns it.
+    def _begin_commit_boundary
+      last_frame = _commit_stack.last
+      if last_frame.nil? || last_frame[:boundary][:phase] == :commit
+        boundary = {callbacks: [], phase: :business}
+        owner = true
+      else
+        boundary = last_frame[:boundary]
+        owner = false
+      end
+
+      frame = {boundary: boundary, owner: owner}
+      _commit_stack.push(frame)
+      frame
+    end
+
+    # Internal: Whether this invocation opened the given boundary rather than
+    # joining one from an enclosing invocation. Only the owner drains or
+    # discards the boundary.
+    def _commit_boundary_owner?(frame)
+      frame[:owner]
+    end
+
+    # Internal: Remove an invocation frame from the stack after it has
+    # completed.
+    def _end_commit_frame!(frame)
+      _commit_stack.delete(frame)
+    end
+
+    # Internal: Discard every registered callback after a failed or rolled
+    # back invocation.
+    #
+    # Returns nothing.
+    def _discard_commit_boundary!(frame)
+      boundary = frame[:boundary]
+      boundary[:callbacks].clear
+      boundary[:phase] = :discarded
+    end
+
+    # Internal: Run every registered callback in registration order. Callback
+    # failures are collected rather than raised, so the remaining callbacks
+    # always run. A fresh invocation started during the drain gets its own
+    # boundary instead of mutating the one being drained.
+    #
+    # Returns the Interactor::CommitResult.
+    # Raises Interactor::CommitError if any callback failed.
+    def _commit!(frame)
+      boundary = frame[:boundary]
+      callbacks = boundary[:callbacks].dup
+      boundary[:phase] = :commit
+      succeeded = []
+      failures = []
+
+      callbacks.each do |callback|
+        begin
+          callback.call
+          succeeded << callback
+        rescue => error
+          failures << [callback, error]
+        end
+      end
+
+      boundary[:phase] = :committed
+
+      result = CommitResult.new(
+        callbacks: callbacks,
+        succeeded: succeeded,
+        failures: failures
+      )
+      raise CommitError.new(result, boundary) if result.failure?
+      result
+    end
+
+    # Internal: The boundary a callback registered from business code belongs
+    # to.
+    #
+    # Returns the boundary Hash.
+    # Raises Interactor::CommitRegistrationError if registration is attempted
+    #   outside of an interactor invocation or while a boundary is draining.
+    def _commit_boundary!
+      boundary = _commit_stack.last&.fetch(:boundary, nil)
+      if boundary.nil? || boundary[:phase] != :business
+        raise CommitRegistrationError,
+          "after_commit can only be registered during an interactor invocation"
+      end
+      boundary
+    end
+
+    # Internal: The stack of open after_commit boundaries.
+    #
+    # Returns an Array of boundary Hashes.
+    def _commit_stack
+      @commit_stack ||= []
+    end
+
     # Internal: An Array of successfully called Interactor instances invoked
     # against this Interactor::Context instance.
     #

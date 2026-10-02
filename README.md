@@ -120,6 +120,53 @@ end
 
 NB: After hooks are only run on success.  If the `fail!` method is called, the interactor's after hooks are not run.
 
+#### After Commit Hooks
+
+An after hook still runs *inside* the call chain, so a later step can fail and
+trigger a rollback. Notifications such as emails must not be sent until the
+whole chain has truly succeeded. Register an `after_commit` callback instead:
+it is deferred until the outermost interactor invocation sharing the context
+has exited successfully.
+
+```ruby
+class PlaceOrder
+  include Interactor
+
+  after_commit :send_confirmation
+
+  def call
+    # ... place the order ...
+    after_commit { OrderMetrics.increment(context.order) }
+  end
+
+  private
+
+  def send_confirmation
+    OrderMailer.confirmation(context.order).deliver_later
+  end
+end
+```
+
+Callbacks run in the order in which they were registered. When organizers are
+nested, every registration belongs to the same outer boundary: nothing runs
+until the outermost organizer succeeds, and if any step fails or is rolled
+back the whole batch is discarded.
+
+A new interactor call started from within a commit callback forms its own
+independent boundary, so its registrations are never appended back to the
+batch being drained.
+
+Once the commit phase begins, a failing callback does not trigger a business
+rollback. The remaining callbacks still run. With `call` the aggregated
+result is attached to the returned context as `after_commit_result`; `call!`
+raises an `Interactor::CommitError` whose `result` carries the same summary.
+
+```ruby
+result = PlaceOrder.call.after_commit_result
+result.success?             # => true or false
+result.failures             # => [[callback, exception], ...]
+```
+
 #### Around Hooks
 
 You can also define around hooks in the same way as before or after hooks, using

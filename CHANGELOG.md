@@ -1,3 +1,6 @@
+## Unreleased
+* [FEATURE] Add `after_commit` callbacks that run only after the outermost successful call on a Context, with rollback discard, independent nested boundaries, and aggregated commit failures.
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

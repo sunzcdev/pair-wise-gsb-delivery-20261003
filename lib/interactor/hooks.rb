@@ -127,6 +127,49 @@ module Interactor
         hooks.each { |hook| after_hooks.unshift(hook) }
       end
 
+      # Public: Declare callbacks to run after the outermost successful
+      # invocation of the context. Unlike "after" hooks, an after_commit
+      # callback is not run if the business invocation fails or is rolled back
+      # later in the chain, because it is deferred until the whole chain has
+      # succeeded.
+      #
+      # The method may be called multiple times; subsequent calls append
+      # declared callbacks to existing after_commit callbacks.
+      #
+      # hooks - Zero or more Symbol method names representing instance methods
+      #         to be called after commit.
+      # block - An optional block to be executed as a callback. If given, the
+      #         block is executed after methods corresponding to any given
+      #         Symbols.
+      #
+      # Examples
+      #
+      #   class MyInteractor
+      #     include Interactor
+      #
+      #     after_commit :send_welcome_email
+      #
+      #     after_commit do
+      #       Notifier.deliver(context.user)
+      #     end
+      #
+      #     def call
+      #       # ...
+      #     end
+      #
+      #     private
+      #
+      #     def send_welcome_email
+      #       Notifier.deliver(context.user)
+      #     end
+      #   end
+      #
+      # Returns nothing.
+      def after_commit(*hooks, &block)
+        hooks << block if block
+        hooks.each { |hook| after_commit_hooks.push(hook) }
+      end
+
       # Internal: An Array of declared hooks to run around Interactor
       # invocation. The hooks appear in the order in which they will be run.
       #
@@ -182,6 +225,26 @@ module Interactor
       # Returns an Array of Symbols and Procs.
       def after_hooks
         @after_hooks ||= []
+      end
+
+      # Internal: An Array of declared callbacks to run after the outermost
+      # successful invocation. The callbacks appear in the order in which they
+      # will be registered and run.
+      #
+      # Examples
+      #
+      #   class MyInteractor
+      #     include Interactor
+      #
+      #     after_commit :send_welcome_email, :log_event
+      #   end
+      #
+      #   MyInteractor.after_commit_hooks
+      #   # => [:send_welcome_email, :log_event]
+      #
+      # Returns an Array of Symbols and Procs.
+      def after_commit_hooks
+        @after_commit_hooks ||= []
       end
     end
 
