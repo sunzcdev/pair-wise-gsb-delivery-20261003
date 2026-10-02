@@ -9,9 +9,32 @@ import (
 type CompressedSet []byte
 
 // Iter returns an iterator that produces all KSUIDs in the set.
+//
+// The iterator is intended to be used on sets produced by Compress or
+// AppendCompressed; malformed data may cause it to panic. Use IterStrict to
+// iterate over data coming from an untrusted source.
 func (set CompressedSet) Iter() CompressedSetIter {
 	return CompressedSetIter{
 		content: []byte(set),
+	}
+}
+
+// IterStrict returns an iterator that produces all KSUIDs in the set, checking
+// every record for structural integrity as it is read. Corrupt data is
+// reported through the iterator's Err method instead of causing a panic.
+//
+// maxElements bounds the total number of KSUIDs that the iterator may produce;
+// a payload range is validated against the limit before it is expanded. A
+// value of zero disables the limit.
+//
+// The iterator only accepts canonical integer encodings: varints that could
+// be expressed with fewer bytes are rejected.
+func (set CompressedSet) IterStrict(maxElements uint64) CompressedSetStrictIter {
+	return CompressedSetStrictIter{
+		decoder: compressedSetDecoder{
+			content: []byte(set),
+		},
+		maxElements: maxElements,
 	}
 }
 
@@ -240,6 +263,8 @@ const (
 	timeDelta    = (1 << 6)
 	payloadDelta = (1 << 7)
 	payloadRange = (1 << 6) | (1 << 7)
+
+	tagMask = rawKSUID | timeDelta | payloadDelta | payloadRange
 )
 
 // CompressedSetIter is an iterator type returned by Set.Iter to produce the
