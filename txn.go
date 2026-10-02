@@ -22,6 +22,57 @@ var (
 	ErrNotFound = fmt.Errorf("not found")
 )
 
+// cloneObject runs the table's ObjectCloner for the given boundary ("insert"
+// or "read") and validates the result. Errors are wrapped with the table
+// name and boundary so the failing clone can be located.
+func cloneObject(table string, tableSchema *TableSchema, boundary string, obj interface{}) (interface{}, error) {
+	cloned, err := tableSchema.ObjectCloner(obj)
+	if err != nil {
+		return nil, fmt.Errorf("object cloner for table '%s' failed on %s: %w", table, boundary, err)
+	}
+	if cloned == nil {
+		return nil, fmt.Errorf("object cloner for table '%s' returned nil object on %s", table, boundary)
+	}
+	return cloned, nil
+}
+
+// cloneForRead clones an object that is about to cross the output boundary
+// if the table has an ObjectCloner, otherwise it returns obj unchanged.
+func (txn *Txn) cloneForRead(table string, obj interface{}) (interface{}, error) {
+	if obj == nil {
+		return nil, nil
+	}
+	tableSchema := txn.db.schema.Tables[table]
+	if tableSchema == nil || tableSchema.ObjectCloner == nil {
+		return obj, nil
+	}
+	return cloneObject(table, tableSchema, "read", obj)
+}
+
+// cloneResults replaces the results of iter with independent clones if the
+// table has an ObjectCloner, otherwise it returns iter unchanged. Cloning
+// is done eagerly so that a failing cloner is reported by the query call
+// itself rather than surfacing later as a missing iterator result.
+func (txn *Txn) cloneResults(table string, iter ResultIterator) (ResultIterator, error) {
+	tableSchema := txn.db.schema.Tables[table]
+	if tableSchema == nil || tableSchema.ObjectCloner == nil {
+		return iter, nil
+	}
+	var objs []interface{}
+	for {
+		obj := iter.Next()
+		if obj == nil {
+			break
+		}
+		cloned, err := cloneObject(table, tableSchema, "read", obj)
+		if err != nil {
+			return nil, err
+		}
+		objs = append(objs, cloned)
+	}
+	return &sliceIterator{objs: objs, watchCh: iter.WatchCh()}, nil
+}
+
 // tableIndex is a tuple of (Table, Index) used for lookups
 type tableIndex struct {
 	Table string
@@ -180,6 +231,10 @@ func (txn *Txn) Commit() {
 // When updating an object, the obj provided should be a copy rather
 // than a value updated in-place. Modifying values in-place that are already
 // inserted into MemDB is not supported behavior.
+//
+// If the table schema has an ObjectCloner, obj is cloned before it is
+// stored so the database owns an independent copy: the caller may modify
+// or reuse obj freely after Insert returns.
 func (txn *Txn) Insert(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot insert in read-only transaction")
@@ -200,6 +255,28 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	}
 	if !ok {
 		return fmt.Errorf("object missing primary index")
+	}
+
+	// If the table has an object cloner, take an independent copy of the
+	// object at the input boundary so that the database owns the stored
+	// object. The clone must preserve the primary index, otherwise the
+	// stored object would not be reachable under the caller's key.
+	if tableSchema.ObjectCloner != nil {
+		cloned, err := cloneObject(table, tableSchema, "insert", obj)
+		if err != nil {
+			return err
+		}
+		ok, clonedID, err := idIndexer.FromObject(cloned)
+		if err != nil {
+			return fmt.Errorf("failed to build primary index from cloned object: %v", err)
+		}
+		if !ok {
+			return fmt.Errorf("object cloner for table '%s' returned object missing primary index", table)
+		}
+		if !bytes.Equal(clonedID, idVal) {
+			return fmt.Errorf("object cloner for table '%s' returned object with mismatched primary index", table)
+		}
+		obj = cloned
 	}
 
 	// Lookup the object by ID first, to see if this is an update
@@ -547,6 +624,10 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 		if !ok {
 			return watch, nil, nil
 		}
+		obj, err = txn.cloneForRead(table, obj)
+		if err != nil {
+			return nil, nil, err
+		}
 		return watch, obj, nil
 	}
 
@@ -554,6 +635,10 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 	iter := indexTxn.Root().Iterator()
 	watch := iter.SeekPrefixWatch(val)
 	_, value, _ := iter.Next()
+	value, err = txn.cloneForRead(table, value)
+	if err != nil {
+		return nil, nil, err
+	}
 	return watch, value, nil
 }
 
@@ -587,6 +672,10 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 		if !ok {
 			return watch, nil, nil
 		}
+		obj, err = txn.cloneForRead(table, obj)
+		if err != nil {
+			return nil, nil, err
+		}
 		return watch, obj, nil
 	}
 
@@ -594,6 +683,10 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 	iter := indexTxn.Root().ReverseIterator()
 	watch := iter.SeekPrefixWatch(val)
 	_, value, _ := iter.Previous()
+	value, err = txn.cloneForRead(table, value)
+	if err != nil {
+		return nil, nil, err
+	}
 	return watch, value, nil
 }
 
@@ -648,7 +741,7 @@ func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interfa
 	// Find the longest prefix match with the given index.
 	indexTxn := txn.readableIndex(table, indexSchema.Name)
 	if _, value, ok := indexTxn.Root().LongestPrefix(val); ok {
-		return value, nil
+		return txn.cloneForRead(table, value)
 	}
 	return nil, nil
 }
@@ -755,7 +848,7 @@ func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, e
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
-	return iter, nil
+	return txn.cloneResults(table, iter)
 }
 
 // GetReverse is used to construct a Reverse ResultIterator over all the
@@ -780,7 +873,7 @@ func (txn *Txn) GetReverse(table, index string, args ...interface{}) (ResultIter
 		iter:    indexIter,
 		watchCh: watchCh,
 	}
-	return iter, nil
+	return txn.cloneResults(table, iter)
 }
 
 // LowerBound is used to construct a ResultIterator over all the the range of
@@ -809,7 +902,7 @@ func (txn *Txn) LowerBound(table, index string, args ...interface{}) (ResultIter
 	iter := &radixIterator{
 		iter: indexIter,
 	}
-	return iter, nil
+	return txn.cloneResults(table, iter)
 }
 
 // ReverseLowerBound is used to construct a Reverse ResultIterator over all the
@@ -835,7 +928,7 @@ func (txn *Txn) ReverseLowerBound(table, index string, args ...interface{}) (Res
 	iter := &radixReverseIterator{
 		iter: indexIter,
 	}
-	return iter, nil
+	return txn.cloneResults(table, iter)
 }
 
 // objectID is a tuple of table name and the raw internal id byte slice
@@ -998,6 +1091,28 @@ func (r *radixReverseIterator) Next() interface{} {
 
 func (r *radixReverseIterator) WatchCh() <-chan struct{} {
 	return r.watchCh
+}
+
+// sliceIterator is used to iterate over a pre-materialized slice of
+// results. It is used when a table has an ObjectCloner so that results
+// can be cloned eagerly at the query boundary.
+type sliceIterator struct {
+	objs    []interface{}
+	idx     int
+	watchCh <-chan struct{}
+}
+
+func (s *sliceIterator) WatchCh() <-chan struct{} {
+	return s.watchCh
+}
+
+func (s *sliceIterator) Next() interface{} {
+	if s.idx >= len(s.objs) {
+		return nil
+	}
+	obj := s.objs[s.idx]
+	s.idx++
+	return obj
 }
 
 // Snapshot creates a snapshot of the current state of the transaction.

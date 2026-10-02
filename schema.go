@@ -47,7 +47,29 @@ type TableSchema struct {
 	// is a unique name for the index and must match the Name in the
 	// IndexSchema.
 	Indexes map[string]*IndexSchema
+
+	// ObjectCloner is optional. When set, MemDB treats every object stored
+	// in the table as owned by the database: the object is cloned with this
+	// function at the input boundary (Insert) and again at the output
+	// boundary (First, Get, iterators, snapshots, etc.). This makes it safe
+	// for callers to modify an object after inserting it, and to modify any
+	// object returned by a query, without affecting the data or indexes
+	// stored in MemDB.
+	//
+	// The clone must be independent: mutating the original must not affect
+	// the clone and vice versa. The clone must also preserve the primary
+	// ("id") index value of the object, otherwise Insert fails with an
+	// error identifying the table.
+	//
+	// If ObjectCloner is nil, objects are stored by reference and must
+	// never be modified in-place after being inserted.
+	ObjectCloner ObjectCloneFunc
 }
+
+// ObjectCloneFunc returns an independent copy of the given object. It is
+// used by MemDB to take ownership of objects at the input and output
+// boundaries of a table. See TableSchema.ObjectCloner.
+type ObjectCloneFunc func(obj interface{}) (interface{}, error)
 
 // Validate is used to validate the table schema
 func (s *TableSchema) Validate() error {

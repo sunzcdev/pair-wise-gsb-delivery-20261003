@@ -26,6 +26,11 @@ import (
 // are stored directly in MemDB. It remains unsafe to modify inserted objects
 // even after they've been deleted from MemDB since there may still be older
 // snapshots of the DB being read from other goroutines.
+//
+// Tables may opt out of this contract by setting an ObjectCloner on their
+// TableSchema, in which case MemDB clones objects at the input and output
+// boundaries and callers retain ownership of the objects they pass in and
+// receive back. See TableSchema.ObjectCloner.
 type MemDB struct {
 	schema  *DBSchema
 	root    unsafe.Pointer // *iradix.Tree underneath
@@ -89,6 +94,11 @@ func (db *MemDB) Txn(write bool) *Txn {
 // If MemDB is storing reference-based values (pointers, maps, slices, etc.),
 // the Snapshot will not deep copy those values. Therefore, it is still unsafe
 // to modify any inserted values in either DB.
+//
+// For tables with an ObjectCloner the stored objects are owned by the
+// database and every read returns an independent clone, so snapshots of
+// those tables are safe to use without any in-place modification
+// restrictions on the caller.
 func (db *MemDB) Snapshot() *MemDB {
 	clone := &MemDB{
 		schema:  db.schema,

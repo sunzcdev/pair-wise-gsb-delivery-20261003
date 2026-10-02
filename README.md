@@ -29,6 +29,21 @@ The database provides the following:
 
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
+Object Ownership
+================
+
+By default objects inserted into MemDB are **not copied**: they must never be
+modified in-place after insertion, since they are stored directly and may
+still be referenced by older snapshots.
+
+Tables can instead opt into an explicit copy policy by setting
+`TableSchema.ObjectCloner`. When a cloner is provided, MemDB clones objects
+at the input boundary (`Insert`) and at the output boundary (`First`, `Get`,
+iterators, snapshots, etc.), so the database always owns the objects it
+stores and callers own the objects they pass in and receive back. This makes
+it safe to modify an object after inserting it, or to modify a query result,
+without corrupting the stored data or its indexes.
+
 Documentation
 =============
 
