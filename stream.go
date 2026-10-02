@@ -202,7 +202,7 @@ func (enc *Encoder) Encode(v any) error {
 
 	bp := getEncodeBuffer()
 
-	b, err := encode(*bp, enc.em, reflect.ValueOf(v))
+	b, err := encode(*bp, enc.em.encModeForValue(reflect.ValueOf(v)), reflect.ValueOf(v))
 	*bp = b[:0]
 
 	// Validate the encoded chunk against the indefinite-length data item using a byte-based check.

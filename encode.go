@@ -632,6 +632,11 @@ type EncOptions struct {
 
 	// ToIndefArrayStructTag specifies whether the `toindefarray` struct tag option is honored.
 	ToIndefArrayStructTag ToIndefArrayStructTagMode
+
+	// SharedRefs specifies whether Go pointer identity is preserved by using
+	// CBOR tag 28 (shareable) and tag 29 (sharedref). See SharedRefMode for
+	// details, including which Go types participate in shared references.
+	SharedRefs SharedRefMode
 }
 
 // CanonicalEncOptions returns EncOptions for "Canonical CBOR" encoding,
@@ -851,6 +856,9 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 	if opts.IndefLength == IndefLengthForbidden && opts.ToIndefArrayStructTag == ToIndefArrayStructTagAllowed {
 		return nil, errors.New("cbor: cannot set ToIndefArrayStructTag to ToIndefArrayStructTagAllowed when IndefLength is IndefLengthForbidden")
 	}
+	if !opts.SharedRefs.valid() {
+		return nil, errors.New("cbor: invalid SharedRefs " + strconv.Itoa(int(opts.SharedRefs)))
+	}
 	em := encMode{
 		sort:                      opts.Sort,
 		shortestFloat:             opts.ShortestFloat,
@@ -873,6 +881,7 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 		textMarshaler:             opts.TextMarshaler,
 		jsonMarshalerTranscoder:   opts.JSONMarshalerTranscoder,
 		toIndefArrayStructTag:     opts.ToIndefArrayStructTag,
+		sharedRefs:                opts.SharedRefs,
 	}
 	return &em, nil
 }
@@ -921,6 +930,13 @@ type encMode struct {
 	textMarshaler             TextMarshalerMode
 	jsonMarshalerTranscoder   Transcoder
 	toIndefArrayStructTag     ToIndefArrayStructTagMode
+	sharedRefs                SharedRefMode
+
+	// sharedRefState, if not nil, holds shared reference encoding state for
+	// the top-level data item currently being encoded. It is only set on a
+	// per-item shallow copy of the encMode created by encModeForValue, so
+	// the encMode itself remains immutable and safe for concurrency.
+	sharedRefState *sharedRefEncState
 }
 
 var defaultEncMode, _ = EncOptions{}.encMode()
@@ -1016,6 +1032,7 @@ func (em *encMode) EncOptions() EncOptions {
 		TextMarshaler:           em.textMarshaler,
 		JSONMarshalerTranscoder: em.jsonMarshalerTranscoder,
 		ToIndefArrayStructTag:   em.toIndefArrayStructTag,
+		SharedRefs:              em.sharedRefs,
 	}
 }
 
@@ -1041,7 +1058,7 @@ func (em *encMode) appendTagBytesSlow(dst []byte, v reflect.Value) []byte {
 func (em *encMode) Marshal(v any) ([]byte, error) {
 	bp := getEncodeBuffer()
 
-	b, err := encode(*bp, em, reflect.ValueOf(v))
+	b, err := encode(*bp, em.encModeForValue(reflect.ValueOf(v)), reflect.ValueOf(v))
 	*bp = b[:0]
 	if err != nil {
 		putEncodeBuffer(bp)
@@ -1066,7 +1083,7 @@ func (em *encMode) MarshalToBuffer(v any, buf *bytes.Buffer) error {
 	if buf == nil {
 		return errors.New("cbor: encoding buffer provided by user is nil")
 	}
-	b, err := encode(buf.AvailableBuffer(), em, reflect.ValueOf(v))
+	b, err := encode(buf.AvailableBuffer(), em.encModeForValue(reflect.ValueOf(v)), reflect.ValueOf(v))
 	if err != nil {
 		return err
 	}
@@ -2114,6 +2131,13 @@ func getEncodeIndirectValueFunc(t reflect.Type) encodeFunc {
 	}
 	return func(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
 		for v.Kind() == reflect.Pointer && !v.IsNil() {
+			if em.sharedRefState != nil && isShareablePtr(v) {
+				var done bool
+				if dst, v, done = em.sharedRefState.encodeSharedPtr(dst, v); done {
+					return dst, nil
+				}
+				continue
+			}
 			v = v.Elem()
 		}
 		if v.Kind() == reflect.Pointer && v.IsNil() {

@@ -912,6 +912,18 @@ type DecOptions struct {
 	// implement json.Unmarshaler but do not also implement cbor.Unmarshaler. If nil, decoding
 	// behavior is not influenced by whether or not a type implements json.Unmarshaler.
 	JSONUnmarshalerTranscoder Transcoder
+
+	// SharedRefs specifies whether CBOR tag 28 (shareable) and tag 29
+	// (sharedref) are decoded to restore Go pointer identity of shared nodes
+	// and cycles. See SharedRefMode for details.
+	SharedRefs SharedRefMode
+
+	// MaxSharedRefs specifies the max number of shared references (CBOR tag
+	// 28 shareable values) allowed per top-level data item when SharedRefs
+	// is SharedRefAuto. Default is 1024 and it can be set to
+	// [1, 2147483647]. Nesting depth of shareable values is limited by
+	// MaxNestedLevels.
+	MaxSharedRefs int
 }
 
 // DecMode returns DecMode with immutable options and no tags (safe for concurrency).
@@ -997,6 +1009,10 @@ const (
 	defaultMaxNestedLevels = 32
 	minMaxNestedLevels     = 4
 	maxMaxNestedLevels     = 65535
+
+	defaultMaxSharedRefs = 1024
+	minMaxSharedRefs     = 1
+	maxMaxSharedRefs     = 2147483647
 )
 
 var defaultSimpleValues = func() *SimpleValueRegistry {
@@ -1128,6 +1144,17 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		return nil, errors.New("cbor: invalid TextUnmarshaler " + strconv.Itoa(int(opts.TextUnmarshaler)))
 	}
 
+	if !opts.SharedRefs.valid() {
+		return nil, errors.New("cbor: invalid SharedRefs " + strconv.Itoa(int(opts.SharedRefs)))
+	}
+
+	if opts.MaxSharedRefs == 0 {
+		opts.MaxSharedRefs = defaultMaxSharedRefs
+	} else if opts.MaxSharedRefs < minMaxSharedRefs || opts.MaxSharedRefs > maxMaxSharedRefs {
+		return nil, errors.New("cbor: invalid MaxSharedRefs " + strconv.Itoa(opts.MaxSharedRefs) +
+			" (range is [" + strconv.Itoa(minMaxSharedRefs) + ", " + strconv.Itoa(maxMaxSharedRefs) + "])")
+	}
+
 	dm := decMode{
 		dupMapKey:                 opts.DupMapKey,
 		timeTag:                   opts.TimeTag,
@@ -1157,6 +1184,8 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
+		sharedRefs:                opts.SharedRefs,
+		maxSharedRefs:             opts.MaxSharedRefs,
 	}
 
 	return &dm, nil
@@ -1238,6 +1267,8 @@ type decMode struct {
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
+	sharedRefs                SharedRefMode
+	maxSharedRefs             int
 }
 
 var defaultDecMode, _ = DecOptions{}.decMode()
@@ -1280,6 +1311,8 @@ func (dm *decMode) DecOptions() DecOptions {
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
+		SharedRefs:                dm.sharedRefs,
+		MaxSharedRefs:             dm.maxSharedRefs,
 	}
 }
 
@@ -1378,6 +1411,12 @@ type decoder struct {
 	// encoding of the byte strings h'42' and h'43' would be controlled by tag 23 and 21,
 	// respectively.
 	expectedLaterEncodingTags []uint64
+
+	// sharedRefs stores values decoded from CBOR tag 28 (shareable) in the
+	// current top-level data item, indexed by reference number. It is reset
+	// for each top-level data item, so reference numbers never leak into the
+	// next top-level data item.
+	sharedRefs []reflect.Value
 }
 
 // value decodes CBOR data item into the value pointed to by v.
@@ -1437,6 +1476,17 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 					}
 				}
 			}
+		}
+	}
+
+	// Decode CBOR tag 28 (shareable) and tag 29 (sharedref) to restore
+	// pointer identity. This is done before creating new pointer values so
+	// that a sharedref doesn't allocate a value it won't use, and so that a
+	// shareable value's address is registered before its content (which may
+	// contain cyclic references to it) is decoded.
+	if d.dm.sharedRefs == SharedRefAuto && tInfo.spclType == specialTypeNone && d.nextCBORType() == cborTypeTag {
+		if handled, err := d.parseShareableToValue(v); handled {
+			return err
 		}
 	}
 
@@ -1957,6 +2007,14 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 		}
 	}
 	d.off = off
+
+	// Decode CBOR tag 28 (shareable) and tag 29 (sharedref) to restore
+	// identity of shared values decoded to type any.
+	if d.dm.sharedRefs == SharedRefAuto && d.nextCBORType() == cborTypeTag {
+		if iv, handled, err := d.parseShareable(); handled {
+			return iv, err
+		}
+	}
 
 	t := d.nextCBORType()
 	switch t {
@@ -3112,6 +3170,7 @@ func (d *decoder) reset(data []byte) {
 	d.data = data
 	d.off = 0
 	d.expectedLaterEncodingTags = d.expectedLaterEncodingTags[:0]
+	d.sharedRefs = d.sharedRefs[:0]
 }
 
 func (d *decoder) nextCBORType() cborType {

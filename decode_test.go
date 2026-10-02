@@ -5975,6 +5975,8 @@ func TestDecOptions(t *testing.T) {
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
+		SharedRefs:                SharedRefAuto,
+		MaxSharedRefs:             100,
 	}
 	ov := reflect.ValueOf(opts1)
 	for i := range ov.NumField() {

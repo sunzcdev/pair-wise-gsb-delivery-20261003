@@ -113,6 +113,8 @@ const (
 	tagNumExpectedLaterEncodingBase64URL = 21
 	tagNumExpectedLaterEncodingBase64    = 22
 	tagNumExpectedLaterEncodingBase16    = 23
+	tagNumShareable                      = 28
+	tagNumSharedRef                      = 29
 	tagNumSelfDescribedCBOR              = 55799
 )
 

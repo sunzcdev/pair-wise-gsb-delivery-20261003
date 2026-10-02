@@ -666,6 +666,30 @@ func Example_embeddedJSONTagForCBOR() {
 </details>
 
 
+### Shared References (CBOR Tags 28 and 29)
+
+Object graphs with shared nodes or cycles can't be represented as a tree: ordinary
+encoding would duplicate shared objects or recurse forever on cycles. Setting
+`EncOptions.SharedRefs` and `DecOptions.SharedRefs` to `cbor.SharedRefAuto` preserves
+Go pointer identity using CBOR tag 28 (shareable) and tag 29 (sharedref).
+
+Non-nil pointers to struct, array, slice, and map values participate in shared
+references. A pointer encoded more than once in the same top-level data item is
+encoded as tag 28 at its first occurrence and as tag 29 (enclosing its reference
+number) at each subsequent occurrence. Distinct pointers are never merged, even if
+the values they point to are equal. Reference numbers start at 0 for each top-level
+data item.
+
+```go
+em, _ := cbor.EncOptions{SharedRefs: cbor.SharedRefAuto}.EncMode()
+dm, _ := cbor.DecOptions{SharedRefs: cbor.SharedRefAuto}.DecMode()
+```
+
+When decoding, the number of shared references per top-level data item is limited by
+`DecOptions.MaxSharedRefs` (default 1024) and nesting depth is limited by
+`DecOptions.MaxNestedLevels`. Invalid reference numbers are rejected with
+`cbor.InvalidSharedRefError`.
+
 ### Functions and Interfaces
 
 <details><summary> 🔎&nbsp; Functions and interfaces at a glance</summary><p/>
