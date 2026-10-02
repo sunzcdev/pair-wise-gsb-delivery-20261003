@@ -90,18 +90,26 @@ var (
 
 // Key management algorithms
 const (
-	ED25519            = KeyAlgorithm("ED25519")
-	RSA1_5             = KeyAlgorithm("RSA1_5")             // RSA-PKCS1v1.5
-	RSA_OAEP           = KeyAlgorithm("RSA-OAEP")           // RSA-OAEP-SHA1
-	RSA_OAEP_256       = KeyAlgorithm("RSA-OAEP-256")       // RSA-OAEP-SHA256
-	A128KW             = KeyAlgorithm("A128KW")             // AES key wrap (128)
-	A192KW             = KeyAlgorithm("A192KW")             // AES key wrap (192)
-	A256KW             = KeyAlgorithm("A256KW")             // AES key wrap (256)
-	DIRECT             = KeyAlgorithm("dir")                // Direct encryption
-	ECDH_ES            = KeyAlgorithm("ECDH-ES")            // ECDH-ES
-	ECDH_ES_A128KW     = KeyAlgorithm("ECDH-ES+A128KW")     // ECDH-ES + AES key wrap (128)
-	ECDH_ES_A192KW     = KeyAlgorithm("ECDH-ES+A192KW")     // ECDH-ES + AES key wrap (192)
-	ECDH_ES_A256KW     = KeyAlgorithm("ECDH-ES+A256KW")     // ECDH-ES + AES key wrap (256)
+	ED25519        = KeyAlgorithm("ED25519")
+	RSA1_5         = KeyAlgorithm("RSA1_5")         // RSA-PKCS1v1.5
+	RSA_OAEP       = KeyAlgorithm("RSA-OAEP")       // RSA-OAEP-SHA1
+	RSA_OAEP_256   = KeyAlgorithm("RSA-OAEP-256")   // RSA-OAEP-SHA256
+	A128KW         = KeyAlgorithm("A128KW")         // AES key wrap (128)
+	A192KW         = KeyAlgorithm("A192KW")         // AES key wrap (192)
+	A256KW         = KeyAlgorithm("A256KW")         // AES key wrap (256)
+	DIRECT         = KeyAlgorithm("dir")            // Direct encryption
+	ECDH_ES        = KeyAlgorithm("ECDH-ES")        // ECDH-ES
+	ECDH_ES_A128KW = KeyAlgorithm("ECDH-ES+A128KW") // ECDH-ES + AES key wrap (128)
+	ECDH_ES_A192KW = KeyAlgorithm("ECDH-ES+A192KW") // ECDH-ES + AES key wrap (192)
+	ECDH_ES_A256KW = KeyAlgorithm("ECDH-ES+A256KW") // ECDH-ES + AES key wrap (256)
+	// ECDH1PU and ECDH1PU_A128KW/A192KW/A256KW are experimental ECDH-1PU
+	// algorithms per draft-madden-jose-ecdh-1pu-04. They are not enabled by
+	// default: the only way to produce or consume JWEs using them is the
+	// explicitly experimental ECDH-1PU API. See ecdh1pu.go.
+	ECDH1PU            = KeyAlgorithm("ECDH-1PU")           // EXPERIMENTAL ECDH-1PU (draft-04)
+	ECDH1PU_A128KW     = KeyAlgorithm("ECDH-1PU+A128KW")    // EXPERIMENTAL ECDH-1PU + AES key wrap (128)
+	ECDH1PU_A192KW     = KeyAlgorithm("ECDH-1PU+A192KW")    // EXPERIMENTAL ECDH-1PU + AES key wrap (192)
+	ECDH1PU_A256KW     = KeyAlgorithm("ECDH-1PU+A256KW")    // EXPERIMENTAL ECDH-1PU + AES key wrap (256)
 	A128GCMKW          = KeyAlgorithm("A128GCMKW")          // AES-GCM key wrap (128)
 	A192GCMKW          = KeyAlgorithm("A192GCMKW")          // AES-GCM key wrap (192)
 	A256GCMKW          = KeyAlgorithm("A256GCMKW")          // AES-GCM key wrap (256)
@@ -158,12 +166,13 @@ const (
 	headerCompression = "zip"  // CompressionAlgorithm
 	headerCritical    = "crit" // []string
 
-	headerAPU = "apu" // *byteBuffer
-	headerAPV = "apv" // *byteBuffer
-	headerEPK = "epk" // *JSONWebKey
-	headerIV  = "iv"  // *byteBuffer
-	headerTag = "tag" // *byteBuffer
-	headerX5c = "x5c" // []*x509.Certificate
+	headerAPU  = "apu"  // *byteBuffer
+	headerAPV  = "apv"  // *byteBuffer
+	headerEPK  = "epk"  // *JSONWebKey
+	headerSKID = "skid" // string (EXPERIMENTAL ECDH-1PU, draft-madden-jose-ecdh-1pu-04)
+	headerIV   = "iv"   // *byteBuffer
+	headerTag  = "tag"  // *byteBuffer
+	headerX5c  = "x5c"  // []*x509.Certificate
 
 	headerJWK   = "jwk"   // *JSONWebKey
 	headerKeyID = "kid"   // string

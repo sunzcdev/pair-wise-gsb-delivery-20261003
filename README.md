@@ -80,6 +80,35 @@ standard where possible. The Godoc reference has a list of constants.
 |:-------------------|--------------------------|
 | DEFLATE (RFC 1951) | DEF                      |
 
+#### Experimental: ECDH-1PU
+
+The library includes an **experimental**, strictly opt-in implementation of
+key agreement with ECDH One-Pass Unified Model (ECDH-1PU), targeting the
+fixed interoperability draft
+[draft-madden-jose-ecdh-1pu-04](https://www.ietf.org/archive/id/draft-madden-jose-ecdh-1pu-04.txt)
+("Public Key Authenticated Encryption for JOSE: ECDH-1PU"). That document is
+an individual Internet-Draft that expired and was **never published as an
+RFC**.
+
+ECDH-1PU authenticates the sender to the recipient. It is therefore not
+enabled through the standard API and never participates in ordinary
+algorithm selection:
+
+- Send with `jose.NewEncrypterECDH1PU`; the algorithm identifiers
+  `ECDH-1PU`, `ECDH-1PU+A128KW`, `ECDH-1PU+A192KW`, and `ECDH-1PU+A256KW` are
+  rejected by `jose.NewEncrypter`.
+- Receive with `(*JSONWebEncryption).DecryptECDH1PU`, supplying the
+  recipient private key and the **sender static public key approved by the
+  caller out of band**. Identity claims carried in the message (`jwk`,
+  `skid`, `kid`) are hints only and are never trusted to identify the
+  sender.
+- Only NIST curves P-256, P-384, and P-521 are enabled. In key-wrapping
+  mode only the AES-CBC-HMAC-SHA2 content encryption algorithms are
+  permitted (per Section 2.1 of the draft); direct key agreement allows any
+  supported content encryption algorithm.
+
+The experimental API and wire format may change or be removed.
+
 ### Supported key types
 
 See below for a table of supported key types. These are understood by the

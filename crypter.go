@@ -205,6 +205,11 @@ func NewEncrypter(enc ContentEncryption, rcpt Recipient, opts *EncrypterOptions)
 		encrypter.recipients = []recipientKeyInfo{recipientInfo}
 		return encrypter, nil
 	default:
+		if isECDH1PU(rcpt.Algorithm) {
+			// ECDH-1PU is experimental and opt-in only; it must not be
+			// selectable through the standard encrypter API.
+			return nil, errECDH1PUNotEnabled
+		}
 		// Can just add a standard recipient
 		encrypter.keyGenerator = randomKeyGenerator{
 			size: encrypter.cipher.keySize(),
@@ -255,6 +260,9 @@ func (ctx *genericEncrypter) addRecipient(recipient Recipient) (err error) {
 	switch recipient.Algorithm {
 	case DIRECT, ECDH_ES:
 		return fmt.Errorf("go-jose/go-jose: key algorithm '%s' not supported in multi-recipient mode", recipient.Algorithm)
+	}
+	if isECDH1PU(recipient.Algorithm) {
+		return errECDH1PUNotEnabled
 	}
 
 	recipientInfo, err = makeJWERecipient(recipient.Algorithm, recipient.Key)
@@ -467,6 +475,9 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 	if err != nil {
 		return nil, err
 	}
+	if isECDH1PU(headers.getAlgorithm()) {
+		return nil, errECDH1PUNotEnabled
+	}
 
 	key, err := tryJWKS(decryptionKey, obj.Header)
 	if err != nil {
@@ -537,6 +548,9 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 	err := globalHeaders.checkNoCritical()
 	if err != nil {
 		return -1, Header{}, nil, err
+	}
+	if isECDH1PU(globalHeaders.getAlgorithm()) {
+		return -1, Header{}, nil, errECDH1PUNotEnabled
 	}
 
 	key, err := tryJWKS(decryptionKey, obj.Header)

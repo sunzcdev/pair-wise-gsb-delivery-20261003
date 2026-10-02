@@ -17,7 +17,6 @@
 package josecipher
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -42,21 +41,7 @@ func DeriveECDHES(alg string, apuData, apvData []byte, priv *ecdsa.PrivateKey, p
 	supPubInfo := make([]byte, 4)
 	binary.BigEndian.PutUint32(supPubInfo, uint32(size)*8)
 
-	if !priv.PublicKey.Curve.IsOnCurve(pub.X, pub.Y) {
-		panic("public key not on same curve as private key")
-	}
-
-	z, _ := priv.Curve.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
-	zBytes := z.Bytes()
-
-	// Note that calling z.Bytes() on a big.Int may strip leading zero bytes from
-	// the returned byte array. This can lead to a problem where zBytes will be
-	// shorter than expected which breaks the key derivation. Therefore we must pad
-	// to the full length of the expected coordinate here before calling the KDF.
-	octSize := dSize(priv.Curve)
-	if len(zBytes) != octSize {
-		zBytes = append(bytes.Repeat([]byte{0}, octSize-len(zBytes)), zBytes...)
-	}
+	zBytes := ecdhSharedSecret(priv, pub)
 
 	reader := NewConcatKDF(crypto.SHA256, zBytes, algID, ptyUInfo, ptyVInfo, supPubInfo, []byte{})
 	key := make([]byte, size)
