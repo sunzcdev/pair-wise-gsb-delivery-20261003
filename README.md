@@ -205,6 +205,14 @@ JSONSchemer.schema(
   # default: false
   insert_property_defaults: true,
 
+  # reject instances containing object keys that collide when stringified
+  # (for example `{ id: 1, 'id' => 2 }`). When enabled, every object and array
+  # member is checked before format checks and custom keywords run. Errors
+  # include the JSON Pointer of the colliding object and the original keys.
+  # true/false
+  # default: false
+  strict_keys: true,
+
   # modify properties during validation. You can pass one Proc or a list of Procs to modify data.
   # Proc/[Proc]
   # default: nil

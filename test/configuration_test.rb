@@ -197,6 +197,18 @@ class ConfigurationTest < Minitest::Test
     )
   end
 
+  def test_strict_keys
+    run_configuration_test(
+      :strict_keys,
+      default: false,
+      test: true
+    ) do
+      schema = { 'properties' => { 'id' => {} } }
+      refute(JSONSchemer.schema(schema).valid?({ :id => 1, 'id' => 2 }))
+      assert(JSONSchemer.schema(schema, strict_keys: false).valid?({ :id => 1, 'id' => 2 }))
+    end
+  end
+
   def test_configuration_option_and_override
     configuration = JSONSchemer::Configuration.new
     configuration.format = false

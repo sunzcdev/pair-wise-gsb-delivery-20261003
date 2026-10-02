@@ -236,7 +236,14 @@ module JSONSchemer
                   hook.call(original_instance, property, subschema.value, schema.value)
                 end
               end
-              instance.replace(deep_stringify_keys(original_instance))
+              if root.strict_keys
+                collisions = []
+                stringified_instance = deep_stringify_keys_strict(original_instance, collisions)
+                raise_strict_key_collisions(instance_location, collisions) unless collisions.empty?
+                instance.replace(stringified_instance)
+              else
+                instance.replace(deep_stringify_keys(original_instance))
+              end
             end
 
             evaluated_keys = []
@@ -256,7 +263,14 @@ module JSONSchemer
                   hook.call(original_instance, property, subschema.value, schema.value)
                 end
               end
-              instance.replace(deep_stringify_keys(original_instance))
+              if root.strict_keys
+                collisions = []
+                stringified_instance = deep_stringify_keys_strict(original_instance, collisions)
+                raise_strict_key_collisions(instance_location, collisions) unless collisions.empty?
+                instance.replace(stringified_instance)
+              else
+                instance.replace(deep_stringify_keys(original_instance))
+              end
             end
 
             result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => evaluated_keys)

@@ -1,6 +1,30 @@
 # frozen_string_literal: true
 module JSONSchemer
   class Schema
+    # Pseudo-keyword used as the `source` of strict key collision results. It
+    # implements just enough of the keyword/result-source interface for errors
+    # and output units to render like any other validation result.
+    class StrictKeyCollision
+      include Output
+
+      attr_reader :schema, :keys
+
+      def initialize(schema, keys = nil)
+        @schema = schema
+        @keys = keys
+      end
+
+      def absolute_keyword_location
+        schema.absolute_keyword_location
+      end
+
+      def error(formatted_instance_location:, details:, **)
+        if keys
+          "object at #{formatted_instance_location} has colliding keys #{keys.join(' and ')} (they all stringify to #{details.fetch('string_key').inspect})"
+        end
+      end
+    end
+
     Context = Struct.new(:instance, :dynamic_scope, :adjacent_results, :short_circuit, :access_mode) do
       def original_instance(instance_location)
         Hana::Pointer.parse(Location.resolve(instance_location)).reduce(instance) do |obj, token|
@@ -45,7 +69,7 @@ module JSONSchemer
 
     attr_accessor :base_uri, :meta_schema, :keywords, :keyword_order
     attr_reader :value, :parent, :root, :configuration, :parsed
-    def_delegators :@configuration, :vocabulary, :format, :formats, :content_encodings, :content_media_types, :before_property_validation, :after_property_validation, :insert_property_defaults
+    def_delegators :@configuration, :vocabulary, :format, :formats, :content_encodings, :content_media_types, :before_property_validation, :after_property_validation, :insert_property_defaults, :strict_keys
     def_delegator :@configuration, :keywords, :custom_keywords
 
     def initialize(
@@ -70,7 +94,8 @@ module JSONSchemer
       regexp_resolver: configuration.regexp_resolver,
       output_format: configuration.output_format,
       resolve_enumerators: configuration.resolve_enumerators,
-      access_mode: configuration.access_mode
+      access_mode: configuration.access_mode,
+      strict_keys: configuration.strict_keys
     )
       @value = deep_stringify_keys(value)
       @parent = parent
@@ -96,7 +121,8 @@ module JSONSchemer
         :regexp_resolver => regexp_resolver,
         :output_format => output_format,
         :resolve_enumerators => resolve_enumerators,
-        :access_mode => access_mode
+        :access_mode => access_mode,
+        :strict_keys => strict_keys
       )
       @parsed = parse
     end
@@ -108,9 +134,17 @@ module JSONSchemer
     def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
       instance_location = Location.root
       context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode)
-      result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
+      result = begin
+        validate_instance(stringify_instance(instance, instance_location), instance_location, root_keyword_location, context)
+      rescue StrictKeyCollisionError => exception
+        strict_key_collision_result(instance, exception.collisions, instance_location, root_keyword_location)
+      end
       if insert_property_defaults && result.insert_property_defaults(context, &property_default_resolver)
-        result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
+        result = begin
+          validate_instance(stringify_instance(instance, instance_location), instance_location, root_keyword_location, context)
+        rescue StrictKeyCollisionError => exception
+          strict_key_collision_result(instance, exception.collisions, instance_location, root_keyword_location)
+        end
       end
       output = result.output(output_format)
       resolve_enumerators!(output) if resolve_enumerators
@@ -364,6 +398,47 @@ module JSONSchemer
     end
 
   private
+
+    def stringify_instance(instance, instance_location)
+      return deep_stringify_keys(instance) unless strict_keys
+
+      collisions = []
+      stringified_instance = deep_stringify_keys_strict(instance, collisions)
+      raise_strict_key_collisions(instance_location, collisions) unless collisions.empty?
+      stringified_instance
+    end
+
+    def strict_key_collision_result(instance, collisions, instance_location, keyword_location)
+      nested = collisions
+        .sort_by do |collision|
+          [
+            collision.fetch('tokens').map { |token| Location.escape_json_pointer_token(token.to_s) }.join('/'),
+            collision.fetch('string_key')
+          ]
+        end
+        .map do |collision|
+          collision_location = collision.fetch('tokens').reduce(instance_location) do |location, token|
+            Location.join(location, token.to_s)
+          end
+          Result.new(
+            StrictKeyCollision.new(root, collision.fetch('keys')),
+            collision.fetch('instance'),
+            collision_location,
+            keyword_location,
+            false,
+            nil,
+            'strict_key_collision',
+            nil,
+            {
+              'string_key' => collision.fetch('string_key'),
+              'colliding_keys' => collision.fetch('keys')
+            },
+            false,
+            'errors'
+          )
+        end
+      result(instance, instance_location, keyword_location, false, nested, :type => 'strict_key_collision')
+    end
 
     def parse
       @parsed = {}

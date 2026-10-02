@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Add `strict_keys` option to reject instances with object keys that collide when stringified (such as `{ id: 1, 'id' => 2 }`). Collisions are checked at every object and array level before format checks and custom keywords run, errors include the instance JSON Pointer and the original colliding keys, and the input is never mutated.
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes
