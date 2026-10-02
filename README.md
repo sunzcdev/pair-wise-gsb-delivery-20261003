@@ -37,6 +37,38 @@ the proxy CA certificate, to avoid any certificate issue in the clients.
 - Redirect normal HTTP traffic to a `custom handler`, when the target is a `relative path` (e.g. `/ping`)
 - You can choose the logger to use, by implementing the `Logger` interface
 - You can `disable` the HTTP request headers `canonicalization`, by setting `PreventCanonicalization` to true
+- Optional shared `GET` response cache (`Cache-Control`, `Age`, `ETag`/`Last-Modified` revalidation and `Vary`), disabled by default, with a replaceable bounded store and single-flight revalidation
+
+## Shared GET cache
+
+GoProxy ships an opt-in shared HTTP cache in `goproxy/httpcache`. It is
+disabled by default (`proxy.Cache == nil`); assign one to enable it for both
+plain-HTTP and MITM GET traffic:
+
+```go
+proxy := goproxy.NewProxyHttpServer()
+proxy.Cache = httpcache.NewHTTPCache(httpcache.Options{
+    MaxBytes: 32 << 20,
+})
+```
+
+The cache:
+
+- honors `Cache-Control` freshness (`max-age`, `must-revalidate`, `no-cache`,
+  `no-store`, `private`), `Expires`, recomputed `Age`, and revalidates stale
+  representations with `If-None-Match` / `If-Modified-Since`;
+- keeps `Vary` variants separate, updating only the matching variant's
+  metadata and body relationship when a `304` is received;
+- stores bodies content-addressed and reference counted in a bounded, LRU,
+  replaceable `Store` (implement `cache.Store` to plug another backend);
+- coalesces concurrent requests for the same stale representation onto a
+  single revalidation whose context is detached from any one caller, so
+  cancelling one client never cancels the others' result;
+- is deliberately conservative about `Authorization`, `private`,
+  `no-store`, and `Set-Cookie` responses.
+
+The first version does not cache `Range` requests, `CONNECT`, or upgraded
+(e.g. WebSocket) connections.
 
 ## Proxy modes
 1. Regular HTTP proxy

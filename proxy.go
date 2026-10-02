@@ -1,6 +1,7 @@
 package goproxy
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -72,6 +73,23 @@ type ProxyHttpServer struct {
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+	// Cache, when set, enables a shared, conservative GET cache. It is nil
+	// (disabled) by default. Construct one with goproxy/httpcache.New and
+	// (or httpcache.NewHTTPCache) and assign it here to cache plain-HTTP
+	// and MITM GET responses honoring Cache-Control, Age, ETag
+	// revalidation and Vary.
+	Cache HTTPCache
+}
+
+// HTTPCache is the interface a shared GET cache implements to intercept
+// upstream requests. The concrete implementation lives in
+// goproxy/httpcache; it is an interface here so the core package has no
+// dependency on it and the cache remains opt-in.
+type HTTPCache interface {
+	// RoundTrip serves req through the cache. When the cache cannot serve
+	// a response it must call fetch, whose context is owned by the cache
+	// during revalidation so concurrent waiters share one upstream call.
+	RoundTrip(req *http.Request, fetch func(ctx context.Context, forwarded *http.Request) (*http.Response, error)) (*http.Response, error)
 }
 
 func hasPort(s string) bool {

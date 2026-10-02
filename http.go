@@ -1,11 +1,18 @@
 package goproxy
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
 )
+
+// roundTripWithContext performs ctx's RoundTrip with an explicit context,
+// used by the shared cache so it owns the context of a revalidation.
+func roundTripWithContext(proxyCtx *ProxyCtx, req *http.Request, c context.Context) (*http.Response, error) {
+	return proxyCtx.RoundTrip(req.WithContext(c))
+}
 
 func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request) {
 	ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1), Proxy: proxy}
@@ -23,7 +30,13 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		}
 
 		var err error
-		resp, err = ctx.RoundTrip(r)
+		if proxy.Cache != nil {
+			resp, err = proxy.Cache.RoundTrip(r, func(c context.Context, forwarded *http.Request) (*http.Response, error) {
+				return roundTripWithContext(ctx, forwarded, c)
+			})
+		} else {
+			resp, err = ctx.RoundTrip(r)
+		}
 		if err != nil {
 			ctx.Error = err
 		}
