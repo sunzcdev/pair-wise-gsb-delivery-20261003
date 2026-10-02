@@ -2536,6 +2536,79 @@ func (lhs *Prefixes) Equal(rhs *Prefixes) bool {
 	return true
 }
 
+// typedef for identity gobgp:add-paths-diversity-mode.
+// Optional strategy to spread the Add-Path send-max slots of a
+// destination over distinct path sources.
+type AddPathsDiversityMode string
+
+const (
+	ADD_PATHS_DIVERSITY_MODE_NONE        AddPathsDiversityMode = "none"
+	ADD_PATHS_DIVERSITY_MODE_NEXTHOP     AddPathsDiversityMode = "nexthop"
+	ADD_PATHS_DIVERSITY_MODE_NEIGHBOR_AS AddPathsDiversityMode = "neighbor-as"
+)
+
+var AddPathsDiversityModeToIntMap = map[AddPathsDiversityMode]int{
+	ADD_PATHS_DIVERSITY_MODE_NONE:        0,
+	ADD_PATHS_DIVERSITY_MODE_NEXTHOP:     1,
+	ADD_PATHS_DIVERSITY_MODE_NEIGHBOR_AS: 2,
+}
+
+var IntToAddPathsDiversityModeMap = map[int]AddPathsDiversityMode{
+	0: ADD_PATHS_DIVERSITY_MODE_NONE,
+	1: ADD_PATHS_DIVERSITY_MODE_NEXTHOP,
+	2: ADD_PATHS_DIVERSITY_MODE_NEIGHBOR_AS,
+}
+
+func (v AddPathsDiversityMode) Validate() error {
+	if _, ok := AddPathsDiversityModeToIntMap[v]; !ok {
+		return fmt.Errorf("invalid AddPathsDiversityMode: %s", v)
+	}
+	return nil
+}
+
+func (v AddPathsDiversityMode) ToInt() int {
+	i, ok := AddPathsDiversityModeToIntMap[v]
+	if !ok {
+		return -1
+	}
+	return i
+}
+
+// typedef for identity gobgp:add-paths-diversity-fill-mode.
+// How to fill Add-Path send-max slots that remain unused because
+// there are not enough distinct diversity groups.
+type AddPathsDiversityFillMode string
+
+const (
+	ADD_PATHS_DIVERSITY_FILL_MODE_BEST_EFFORT AddPathsDiversityFillMode = "best-effort"
+	ADD_PATHS_DIVERSITY_FILL_MODE_STRICT      AddPathsDiversityFillMode = "strict"
+)
+
+var AddPathsDiversityFillModeToIntMap = map[AddPathsDiversityFillMode]int{
+	ADD_PATHS_DIVERSITY_FILL_MODE_BEST_EFFORT: 0,
+	ADD_PATHS_DIVERSITY_FILL_MODE_STRICT:      1,
+}
+
+var IntToAddPathsDiversityFillModeMap = map[int]AddPathsDiversityFillMode{
+	0: ADD_PATHS_DIVERSITY_FILL_MODE_BEST_EFFORT,
+	1: ADD_PATHS_DIVERSITY_FILL_MODE_STRICT,
+}
+
+func (v AddPathsDiversityFillMode) Validate() error {
+	if _, ok := AddPathsDiversityFillModeToIntMap[v]; !ok {
+		return fmt.Errorf("invalid AddPathsDiversityFillMode: %s", v)
+	}
+	return nil
+}
+
+func (v AddPathsDiversityFillMode) ToInt() int {
+	i, ok := AddPathsDiversityFillModeToIntMap[v]
+	if !ok {
+		return -1
+	}
+	return i
+}
+
 // struct for container bgp:state.
 // State information associated with ADD_PATHS.
 type AddPathsState struct {
@@ -2562,6 +2635,15 @@ type AddPathsConfig struct {
 	// The maximum number of paths to advertise to neighbors
 	// for a single NLRI.
 	SendMax uint8 `mapstructure:"send-max" json:"send-max,omitempty"`
+	// original -> gobgp:diversity-mode
+	// Optional strategy to spread the send-max slots over
+	// distinct path sources instead of strictly following the
+	// best-path order.
+	DiversityMode AddPathsDiversityMode `mapstructure:"diversity-mode" json:"diversity-mode,omitempty"`
+	// original -> gobgp:diversity-fill-mode
+	// How to fill send-max slots that remain unused because
+	// there are not enough distinct diversity groups.
+	DiversityFillMode AddPathsDiversityFillMode `mapstructure:"diversity-fill-mode" json:"diversity-fill-mode,omitempty"`
 }
 
 func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
@@ -2572,6 +2654,12 @@ func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
 		return false
 	}
 	if lhs.SendMax != rhs.SendMax {
+		return false
+	}
+	if lhs.DiversityMode != rhs.DiversityMode {
+		return false
+	}
+	if lhs.DiversityFillMode != rhs.DiversityFillMode {
 		return false
 	}
 	return true

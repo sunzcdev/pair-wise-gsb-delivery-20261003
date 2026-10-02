@@ -13,6 +13,7 @@ Assumed that you finished [Getting Started](getting-started.md).
 ## Contents
 
 - [Configuration](#configuration)
+- [Diversity Selection](#diversity-selection)
 - [Verification](#verification)
   - [Example Topology and Configuration](#example-topology-and-configuration)
   - [Advertise Multiple Paths](#advertise-multiple-paths)
@@ -53,6 +54,37 @@ unicast family.
       receive = true
       send-max = 8
 ```
+
+## Diversity Selection
+
+By default, the `send-max` slots of a prefix are filled strictly in
+best-path order, so all slots can end up being spent on paths from the same
+source. The optional diversity selection strategy instead prefers covering
+distinct path sources when the number of paths to send is limited.
+
+```toml
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "10.0.0.2"
+  [neighbors.add-paths.config]
+    send-max = 2
+    diversity-mode = "nexthop"
+    diversity-fill-mode = "best-effort"
+```
+
+- `diversity-mode`: how to spread the `send-max` slots over distinct path
+  sources. One of `none` (default, current behavior), `nexthop` (prefer
+  distinct next-hops) or `neighbor-as` (prefer distinct neighboring,
+  i.e. leftmost AS_PATH, autonomous systems).
+- `diversity-fill-mode`: how to fill slots that remain unused because there
+  are not enough distinct sources. `best-effort` (default) backfills them
+  with the best remaining candidates; `strict` leaves them empty.
+
+The diversity keys are computed from the paths as stored in the RIB, before
+outbound attribute rewriting (e.g. next-hop-self). Paths rejected by the
+export policy are never selected: diversity cannot override an explicit
+export deny. The selection is deterministic, so recomputing it over an
+unchanged RIB neither flaps path IDs nor generates spurious withdrawals.
 
 ## Verification
 

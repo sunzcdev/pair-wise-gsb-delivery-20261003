@@ -1425,10 +1425,75 @@ module gobgp {
         "add-paths configuration options related to a particular AFI-SAFI.";
       container config {
           uses bgp:bgp-neighbor-add-paths_config;
+          uses add-paths-diversity-config;
       }
       container state {
           uses bgp:bgp-neighbor-add-paths_config;
       }
+    }
+  }
+
+  typedef add-paths-diversity-mode {
+    type enumeration {
+      enum NONE {
+        value 0;
+        description
+          "Disable diversity-aware selection. The first send-max
+          candidates in best-path order are advertised.";
+      }
+      enum NEXTHOP {
+        value 1;
+        description
+          "Prefer candidates with distinct next-hops when distributing
+          the send-max slots.";
+      }
+      enum NEIGHBOR-AS {
+        value 2;
+        description
+          "Prefer candidates received from distinct neighboring
+          (leftmost AS_PATH) autonomous systems when distributing the
+          send-max slots.";
+      }
+    }
+    description
+      "Optional strategy to spread the Add-Path send-max slots of a
+      destination over distinct path sources.";
+  }
+
+  typedef add-paths-diversity-fill-mode {
+    type enumeration {
+      enum BEST-EFFORT {
+        value 0;
+        description
+          "Fill send-max slots that remain unused because there are not
+          enough distinct diversity groups with the best remaining
+          candidates.";
+      }
+      enum STRICT {
+        value 1;
+        description
+          "Leave send-max slots empty instead of selecting candidates
+          whose diversity key is already covered.";
+      }
+    }
+    description
+      "How to fill Add-Path send-max slots that remain unused because
+      there are not enough distinct diversity groups.";
+  }
+
+  grouping add-paths-diversity-config {
+    leaf diversity-mode {
+      type add-paths-diversity-mode;
+      description
+        "Optional strategy to spread the send-max slots over distinct
+        path sources instead of strictly following the best-path
+        order.";
+    }
+    leaf diversity-fill-mode {
+      type add-paths-diversity-fill-mode;
+      description
+        "How to fill send-max slots that remain unused because there
+        are not enough distinct diversity groups.";
     }
   }
 

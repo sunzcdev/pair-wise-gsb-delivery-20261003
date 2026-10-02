@@ -249,6 +249,31 @@ func (peer *peer) getAddPathSendMax(family bgp.Family) uint8 {
 	return 0
 }
 
+// getAddPathDiversity returns the diversity selection strategy configured
+// for the given address family. AddPathDiversityNone means the plain
+// send-max behavior: the first send-max candidates in best-path order win.
+func (peer *peer) getAddPathDiversity(family bgp.Family) (table.AddPathDiversityMode, table.AddPathDiversityFill) {
+	conf := peer.fsm.pConf.ReadOnly()
+	for _, a := range conf.AfiSafis {
+		if a.State.Family != family {
+			continue
+		}
+		mode := table.AddPathDiversityNone
+		switch a.AddPaths.Config.DiversityMode {
+		case oc.ADD_PATHS_DIVERSITY_MODE_NEXTHOP:
+			mode = table.AddPathDiversityNexthop
+		case oc.ADD_PATHS_DIVERSITY_MODE_NEIGHBOR_AS:
+			mode = table.AddPathDiversityNeighborAS
+		}
+		fill := table.AddPathDiversityFillBest
+		if a.AddPaths.Config.DiversityFillMode == oc.ADD_PATHS_DIVERSITY_FILL_MODE_STRICT {
+			fill = table.AddPathDiversityFillStrict
+		}
+		return mode, fill
+	}
+	return table.AddPathDiversityNone, table.AddPathDiversityFillBest
+}
+
 func (peer *peer) getRoutesCount(family bgp.Family, dstPrefix string) uint8 {
 	destLocalKey := table.NewPathDestLocalKey(family, dstPrefix)
 	if identifiers, ok := peer.sentPaths.Load(*destLocalKey); ok {
@@ -340,6 +365,19 @@ func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 	}
 	_, pathExist := identifiers.(pathIDSet)[peer.advertisedPathID(path)]
 	return pathExist
+}
+
+// getSentPathIDs returns a copy of the path identifiers currently advertised
+// to the peer for the given destination. Like the other sentPaths accessors,
+// it MUST be called under the propagate bucket lock for the prefix.
+func (peer *peer) getSentPathIDs(destLocalKey table.PathDestLocalKey) map[uint32]struct{} {
+	ids := make(map[uint32]struct{})
+	if identifiers, ok := peer.sentPaths.Load(destLocalKey); ok {
+		for id := range identifiers.(pathIDSet) {
+			ids[id] = struct{}{}
+		}
+	}
+	return ids
 }
 
 func (peer *peer) resetAdvertisedRoutes() {

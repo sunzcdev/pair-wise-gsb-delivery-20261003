@@ -1069,6 +1069,120 @@ func (s *BgpServer) getPossibleBest(peer *peer, family bgp.Family) []*table.Path
 	return peer.localRib.GetBestPathList(peer.TableID(), peer.AS(), []bgp.Family{family})
 }
 
+// selectAddPathsForPeer applies the export policy to the known paths of one
+// destination and picks the paths to advertise to the peer, honoring the
+// Add-Path send-max limit and the configured diversity strategy. The
+// diversity key is computed from the RIB paths, before outbound attribute
+// rewriting (e.g. next-hop-self) takes place, and policy-rejected paths are
+// never selected: diversity cannot override an explicit export policy.
+// Returns the outbound paths to advertise, the policy-compliant candidates
+// left out by the send-max limit, and the candidates rejected by the export
+// policy (both in their original RIB form).
+func (s *BgpServer) selectAddPathsForPeer(peer *peer, known []*table.Path, sendMax int, mode table.AddPathDiversityMode, fill table.AddPathDiversityFill) (selected, leftOut, rejected []*table.Path) {
+	candidates := make([]*table.Path, 0, len(known))
+	outbound := make([]*table.Path, 0, len(known))
+	for _, p := range known {
+		fp := s.filterpath(peer, p, nil)
+		if fp == nil {
+			rejected = append(rejected, p)
+			continue
+		}
+		candidates = append(candidates, p)
+		outbound = append(outbound, fp)
+	}
+	picked := make(map[int]struct{}, sendMax)
+	for _, i := range table.SelectAddPaths(candidates, sendMax, mode, fill) {
+		picked[i] = struct{}{}
+		selected = append(selected, outbound[i])
+	}
+	for i, p := range candidates {
+		if _, ok := picked[i]; !ok {
+			leftOut = append(leftOut, p)
+		}
+	}
+	return selected, leftOut, rejected
+}
+
+// recomputeDiverseAddPaths recomputes the set of paths advertised to an
+// Add-Path peer for the given destinations under the diversity selection
+// strategy and returns the delta to send: newly selected paths and
+// withdrawals of previously advertised paths that are no longer selected.
+// The selection is deterministic, so recomputing over an unchanged RIB
+// produces an empty delta: no path ID flapping and no spurious withdrawals.
+func (s *BgpServer) recomputeDiverseAddPaths(targetPeer *peer, rib *table.TableManager, dsts []*table.Update, family bgp.Family, mode table.AddPathDiversityMode, fill table.AddPathDiversityFill) []*table.Path {
+	sendMax := int(targetPeer.getAddPathSendMax(family))
+	bestList := make([]*table.Path, 0, len(dsts))
+	for _, dst := range dsts {
+		var probe *table.Path
+		if len(dst.KnownPathList) > 0 {
+			probe = dst.KnownPathList[0]
+		} else if withdrawn := dst.GetWithdrawnPath(); len(withdrawn) > 0 {
+			probe = withdrawn[0]
+		}
+		if probe == nil {
+			continue
+		}
+
+		var known []*table.Path
+		if dest := rib.GetDestination(probe); dest != nil {
+			known = dest.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
+		}
+		selected, leftOut, _ := s.selectAddPathsForPeer(targetPeer, known, sendMax, mode, fill)
+
+		selectedIDs := make(map[uint32]struct{}, len(selected))
+		for _, p := range selected {
+			selectedIDs[p.LocalID()] = struct{}{}
+		}
+		// Index the paths the withdrawals can be built from by the path ID
+		// they were advertised with.
+		byID := make(map[uint32]*table.Path, len(known))
+		for _, p := range known {
+			byID[p.LocalID()] = p
+		}
+		for _, p := range dst.GetWithdrawnPath() {
+			byID[p.LocalID()] = p
+		}
+
+		// The advertised set is tracked in the outbound (post filterpath)
+		// key space, which filteredPathForPeer reproduces.
+		destLocalKey := filteredPathForPeer(targetPeer, probe).GetDestLocalKey()
+		sentIDs := targetPeer.getSentPathIDs(destLocalKey)
+
+		delta := make([]*table.Path, 0, len(selected))
+		// Withdraw paths that were advertised but are no longer selected:
+		// either displaced by a more diverse candidate or gone from the RIB.
+		for id := range sentIDs {
+			if _, ok := selectedIDs[id]; ok {
+				continue
+			}
+			src, ok := byID[id]
+			if !ok {
+				continue
+			}
+			delta = append(delta, filteredPathForPeer(targetPeer, src).Clone(true))
+		}
+		// Advertise newly selected paths.
+		for _, p := range selected {
+			if _, ok := sentIDs[p.LocalID()]; !ok {
+				delta = append(delta, p)
+			}
+		}
+		targetPeer.updateRoutes(delta...)
+
+		for _, p := range leftOut {
+			targetPeer.setPathSendMaxFiltered(p)
+		}
+		for _, p := range selected {
+			targetPeer.unsetPathSendMaxFiltered(p)
+		}
+		for _, p := range dst.GetWithdrawnPath() {
+			targetPeer.unsetPathSendMaxFiltered(p)
+		}
+		bestList = append(bestList, delta...)
+	}
+	return bestList
+}
+
 func (s *BgpServer) getBestFromLocalCallback(peer *peer, rfList []bgp.Family, addEOR bool, routeRefresh bool, fn func([]*table.Path, []*table.Path)) {
 	if routeRefresh {
 		peer.routeRefreshInProgress.Lock()
@@ -1108,6 +1222,34 @@ func (s *BgpServer) getBestFromLocalCallbackLocked(peer *peer, rfList []bgp.Fami
 	}
 
 	for _, family := range peer.toGlobalFamilies(rfList) {
+		if mode, fill := peer.getAddPathDiversity(family); mode != table.AddPathDiversityNone && peer.isAddPathSendEnabled(family) {
+			// Diversity-aware Add-Path selection enforces the send-max
+			// limit per destination up front, spreading the slots over
+			// distinct path sources. The selection is deterministic, so
+			// recomputing it (e.g. on a soft reset) only sends the
+			// difference with what was already advertised.
+			tbl, ok := peer.localRib.GetTable(family)
+			if !ok {
+				continue
+			}
+			sendMax := int(peer.getAddPathSendMax(family))
+			for _, dst := range tbl.GetDestinations() {
+				known := dst.GetKnownPathList(peer.TableID(), peer.AS())
+				selected, leftOut, rejected := s.selectAddPathsForPeer(peer, known, sendMax, mode, fill)
+				pathList = append(pathList, selected...)
+				for _, p := range selected {
+					peer.unsetPathSendMaxFiltered(p)
+				}
+				for _, p := range leftOut {
+					peer.setPathSendMaxFiltered(p)
+					filtered = append(filtered, filteredPathForPeer(peer, p))
+				}
+				for _, p := range rejected {
+					filtered = append(filtered, filteredPathForPeer(peer, p))
+				}
+			}
+			continue
+		}
 		for _, path := range s.getPossibleBest(peer, family) {
 			if p := s.filterpath(peer, path, nil); p != nil {
 				pathList = append(pathList, p)
@@ -1523,7 +1665,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 			if targetPeer.isAddPathSendEnabled(f) {
 				// in case of multiple paths to the same destination, we need to
 				// filter the paths before counting the number of paths to be sent.
-				if newPath.IsWithdraw {
+				if mode, fill := targetPeer.getAddPathDiversity(f); mode != table.AddPathDiversityNone {
+					// Diversity-aware selection recomputes the advertised set
+					// of each affected destination from the current RIB and
+					// only sends the difference.
+					bestList = s.recomputeDiverseAddPaths(targetPeer, rib, dsts, f, mode, fill)
+				} else if newPath.IsWithdraw {
 					bestList = func() []*table.Path {
 						l := []*table.Path{}
 						for _, d := range dsts {

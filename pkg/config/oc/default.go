@@ -184,6 +184,8 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 			n.AfiSafis[i].AddPaths.State.Receive = n.AddPaths.Config.Receive
 			n.AfiSafis[i].AddPaths.Config.SendMax = n.AddPaths.Config.SendMax
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AddPaths.Config.SendMax
+			n.AfiSafis[i].AddPaths.Config.DiversityMode = n.AddPaths.Config.DiversityMode
+			n.AfiSafis[i].AddPaths.Config.DiversityFillMode = n.AddPaths.Config.DiversityFillMode
 		}
 	} else {
 		afs, err := extractArray(v.Get("neighbor.afi-safis"))
@@ -217,6 +219,16 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 				}
 			}
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AfiSafis[i].AddPaths.Config.SendMax
+			if !vv.IsSet("afi-safi.add-paths.config.diversity-mode") {
+				if n.AddPaths.Config.DiversityMode != "" {
+					n.AfiSafis[i].AddPaths.Config.DiversityMode = n.AddPaths.Config.DiversityMode
+				}
+			}
+			if !vv.IsSet("afi-safi.add-paths.config.diversity-fill-mode") {
+				if n.AddPaths.Config.DiversityFillMode != "" {
+					n.AfiSafis[i].AddPaths.Config.DiversityFillMode = n.AddPaths.Config.DiversityFillMode
+				}
+			}
 		}
 	}
 
