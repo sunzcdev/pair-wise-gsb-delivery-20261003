@@ -1253,22 +1253,7 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 	var accumulatedCopySize int64
 
 	for _, op := range p {
-		switch op.Kind() {
-		case "add":
-			err = p.add(&pd, op, options)
-		case "remove":
-			err = p.remove(&pd, op, options)
-		case "replace":
-			err = p.replace(&pd, op, options)
-		case "move":
-			err = p.move(&pd, op, options)
-		case "test":
-			err = p.test(&pd, op, options)
-		case "copy":
-			err = p.copy(&pd, op, &accumulatedCopySize, options)
-		default:
-			err = fmt.Errorf("Unexpected kind: %s", op.Kind())
-		}
+		err = p.applyOperation(&pd, op, &accumulatedCopySize, options)
 
 		if err != nil {
 			return nil, err
@@ -1287,6 +1272,26 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 	var buf bytes.Buffer
 	json.Indent(&buf, data, "", indent)
 	return buf.Bytes(), nil
+}
+
+// applyOperation applies a single patch operation to the document.
+func (p Patch) applyOperation(doc *container, op Operation, accumulatedCopySize *int64, options *ApplyOptions) error {
+	switch op.Kind() {
+	case "add":
+		return p.add(doc, op, options)
+	case "remove":
+		return p.remove(doc, op, options)
+	case "replace":
+		return p.replace(doc, op, options)
+	case "move":
+		return p.move(doc, op, options)
+	case "test":
+		return p.test(doc, op, options)
+	case "copy":
+		return p.copy(doc, op, accumulatedCopySize, options)
+	default:
+		return fmt.Errorf("Unexpected kind: %s", op.Kind())
+	}
 }
 
 // From http://tools.ietf.org/html/rfc6901#section-4 :
