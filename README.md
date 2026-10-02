@@ -634,6 +634,29 @@ policy_scope([:admin, Post])      # => will look for an Admin::PostPolicy::Scope
 policy_scope([:foo, :bar, Post])  # => will look for a Foo::Bar::PostPolicy::Scope
 ```
 
+### Namespace lookup chains
+
+When building a plugin or engine, pass `policy_namespaces` to `Pundit::Context`
+to prefer policies in the plugin while falling back to the host application:
+
+```ruby
+context = Pundit::Context.new(
+  user: current_user,
+  policy_namespaces: [MyPlugin, nil]
+)
+
+context.policy(post) # MyPlugin::PostPolicy if it exists, otherwise PostPolicy
+```
+
+Each entry can be a `Module`, symbol, string, or `nil`. Pundit moves to the next
+entry only when the candidate policy class does not exist. Once a candidate is
+found, a failed constructor, missing query method, or authorization denial uses
+that policy and does not continue the chain. Policy scopes are also taken from
+the selected policy; a missing `Scope` does not fall back to another namespace.
+
+`record.policy_class` and an explicitly passed `policy_class` still take
+precedence over this chain.
+
 If you are using namespaced policies for something like Admin areas, we recommend defining a `pundit_namespace` hook in your `ApplicationController` and overriding it in namespaced controllers:
 
 ```ruby

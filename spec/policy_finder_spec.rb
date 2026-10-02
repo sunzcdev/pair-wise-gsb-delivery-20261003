@@ -7,6 +7,7 @@ RSpec.describe Pundit::PolicyFinder do
   let(:post) { Post.new(user) }
   let(:comment) { CommentFourFiveSix.new }
   let(:article) { Article.new }
+  let(:artificial_blog) { ArtificialBlog.new }
 
   describe "SUFFIX" do
     specify { expect(described_class::SUFFIX).to eq "Policy" }
@@ -34,6 +35,20 @@ RSpec.describe Pundit::PolicyFinder do
         object = described_class.new(post)
 
         expect(object.policy).to eq PostPolicy
+      end
+    end
+
+    context "with a namespace" do
+      it "returns the namespaced policy" do
+        object = described_class.new(post, namespace: :project)
+
+        expect(object.policy).to eq Project::PostPolicy
+      end
+
+      it "returns the explicit policy class" do
+        object = described_class.new(artificial_blog, namespace: :project)
+
+        expect(object.policy).to eq BlogPolicy
       end
     end
 

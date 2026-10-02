@@ -31,10 +31,12 @@ module Pundit
     # @see Pundit::Authorization#pundit
     # @param user later passed to policies and scopes
     # @param policy_cache [#fetch] cache store for policies (see e.g. {CacheStore::NullStore})
+    # @param policy_namespaces [Array<Module, Symbol, String, nil>] namespace chain used to find policies
     # @since v2.3.2
-    def initialize(user:, policy_cache: CacheStore::NullStore.instance)
+    def initialize(user:, policy_cache: CacheStore::NullStore.instance, policy_namespaces: nil)
       @user = user
       @policy_cache = policy_cache
+      @policy_namespaces = normalize_policy_namespaces(policy_namespaces)
     end
 
     # @api public
@@ -46,6 +48,11 @@ module Pundit
     # @see #initialize
     # @since v2.3.2
     attr_reader :policy_cache
+
+    # @api public
+    # @see #initialize
+    # @since v2.6.0
+    attr_reader :policy_namespaces
 
     # @!group Policies
 
@@ -107,7 +114,7 @@ module Pundit
     # @return [Scope{#resolve}, nil] instance of scope class which can resolve to a scope
     # @since v2.3.2
     def policy_scope(scope)
-      policy_scope_class = policy_finder(scope).scope
+      policy_scope_class = selected_policy_finder(scope)&.scope
       return unless policy_scope_class
 
       begin
@@ -128,7 +135,7 @@ module Pundit
     # @return [Scope{#resolve}] instance of scope class which can resolve to a scope
     # @since v2.3.2
     def policy_scope!(scope)
-      policy_scope_class = policy_finder(scope).scope!
+      policy_scope_class = select_policy_finder(scope).scope!
 
       begin
         policy_scope = policy_scope_class.new(user, pundit_model(scope))
@@ -156,8 +163,8 @@ module Pundit
     # @raise [InvalidConstructorError] if policy can't be instantated
     # @since v2.3.2
     def cached_find(record)
-      policy_cache.fetch(user: user, record: record) do
-        klass = yield policy_finder(record)
+      policy_cache.fetch(user: user, record: cache_record(record)) do
+        klass = yield select_policy_finder(record)
         next unless klass
 
         model = pundit_model(record)
@@ -175,8 +182,37 @@ module Pundit
     # @api private
     # @return [PolicyFinder]
     # @since v2.3.2
-    def policy_finder(record)
-      PolicyFinder.new(record)
+    def policy_finders(record)
+      policy_namespaces.map { |namespace| PolicyFinder.new(record, namespace: namespace) }
+    end
+
+    def selected_policy_finder(record)
+      policy_finders(record).find { |finder| finder.policy }
+    end
+
+    def select_policy_finder(record)
+      selected_policy_finder(record) || policy_finders(record).last
+    end
+
+    def cache_record(record)
+      return record if default_policy_namespaces?
+
+      [record, policy_namespaces]
+    end
+
+    def default_policy_namespaces?
+      policy_namespaces == [nil]
+    end
+
+    def normalize_policy_namespaces(namespaces)
+      case namespaces
+      when nil
+        [nil].freeze
+      when Array
+        (namespaces.empty? ? [nil] : namespaces).freeze
+      else
+        [namespaces].freeze
+      end
     end
 
     # Given a possibly namespaced record, return the actual record.

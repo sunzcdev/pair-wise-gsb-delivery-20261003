@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add configurable `policy_namespaces` lookup chain to `Pundit::Context`.
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
 
 ### Deprecated

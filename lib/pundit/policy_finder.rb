@@ -27,9 +27,11 @@ module Pundit
     attr_reader :object
 
     # @param object [any] the object to find policy and scope classes for
+    # @param namespace [Module, Symbol, String, nil] namespace to prefix inferred policy names with
     # @since v0.1.0
-    def initialize(object)
+    def initialize(object, namespace: nil)
       @object = object
+      @namespace = namespace
     end
 
     # @return [nil, Scope{#resolve}] scope class which can resolve to a scope
@@ -52,7 +54,7 @@ module Pundit
     #
     # @since v0.1.0
     def policy
-      klass = find(object)
+      klass = find(object, @namespace)
       klass.is_a?(String) ? klass.safe_constantize : klass
     end
 
@@ -61,7 +63,8 @@ module Pundit
     #
     # @since v0.1.0
     def scope!
-      scope or raise NotDefinedError, "unable to find scope `#{find(object)}::Scope` for `#{object.inspect}`"
+      scope or raise NotDefinedError,
+        "unable to find scope `#{find(object, @namespace)}::Scope` for `#{object.inspect}`"
     end
 
     # @return [Class] policy class with query methods
@@ -69,7 +72,7 @@ module Pundit
     #
     # @since v0.1.0
     def policy!
-      policy or raise NotDefinedError, "unable to find policy `#{find(object)}` for `#{object.inspect}`"
+      policy or raise NotDefinedError, "unable to find policy `#{find(object, @namespace)}` for `#{object.inspect}`"
     end
 
     # @return [String] the name of the key this object would have in a params hash
@@ -95,20 +98,31 @@ module Pundit
     #
     # @return [String, Class] the policy class, or its name.
     # @since v0.2.0
-    def find(subject)
+    def find(subject, namespace = @namespace)
       if subject.is_a?(Array)
         modules = subject.dup
         last = modules.pop
         context = modules.map { |x| find_class_name(x) }.join("::")
-        [context, find(last)].join("::")
+        candidate = find(last, nil)
+        return candidate if namespace.blank? && context.blank?
+        return candidate if candidate.is_a?(Class) && candidate.name.blank?
+
+        [namespace_name(namespace), context, candidate].reject(&:blank?).join("::")
       elsif subject.respond_to?(:policy_class)
         subject.policy_class
       elsif subject.class.respond_to?(:policy_class)
         subject.class.policy_class
       else
         klass = find_class_name(subject)
-        "#{klass}#{SUFFIX}"
+        [namespace_name(namespace), "#{klass}#{SUFFIX}"].reject(&:blank?).join("::")
       end
+    end
+
+    def namespace_name(namespace)
+      return if namespace.nil?
+      return namespace.name if namespace.is_a?(Module)
+
+      find_class_name(namespace).to_s
     end
 
     # Given an object, find its' class name.
@@ -127,8 +141,12 @@ module Pundit
         subject.class.model_name
       elsif subject.is_a?(Class)
         subject
+      elsif subject.is_a?(Module)
+        subject.name
       elsif subject.is_a?(Symbol)
         subject.to_s.camelize
+      elsif subject.is_a?(String)
+        subject.camelize
       else
         subject.class
       end
