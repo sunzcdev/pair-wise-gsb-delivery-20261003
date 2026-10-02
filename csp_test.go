@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/unrolled/secure/cspbuilder"
 )
 
 //nolint:gochecknoglobals
@@ -62,4 +64,48 @@ func TestWithCSPNonce(t *testing.T) {
 	nonce := "jdgKGHkbnd+/"
 
 	expect(t, CSPNonce(withCSPNonce(req, nonce).Context()), nonce)
+}
+
+func TestCSPPolicyBuilderSharedNonce(t *testing.T) {
+	enforcedPolicy, err := (&cspbuilder.PolicyBuilder{}).
+		Add(cspbuilder.DefaultSrc, "'self'").
+		Add(cspbuilder.ScriptSrc, "'self'", cspbuilder.Nonce).
+		Add(cspbuilder.StyleSrc, cspbuilder.Nonce).
+		Build()
+	expect(t, err, nil)
+
+	reportOnlyPolicy, err := (&cspbuilder.PolicyBuilder{}).
+		Add(cspbuilder.ScriptSrc, "'self'", cspbuilder.Nonce).
+		Add(cspbuilder.StyleSrc, "'self'").
+		Build()
+	expect(t, err, nil)
+
+	s := New(Options{
+		ContentSecurityPolicy:           enforcedPolicy,
+		ContentSecurityPolicyReportOnly: reportOnlyPolicy,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+
+	s.Handler(cspHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+
+	// The nonce generated for the request is shared by both policies.
+	nonce := res.Body.String()
+	_, decodeErr := base64.RawStdEncoding.DecodeString(nonce)
+	expect(t, decodeErr, nil)
+
+	enforcedHeader := res.Header().Get(cspHeader)
+	expect(t, enforcedHeader, fmt.Sprintf("default-src 'self'; script-src 'self' 'nonce-%[1]s'; style-src 'nonce-%[1]s'", nonce))
+
+	reportOnlyHeader := res.Header().Get(cspReportOnlyHeader)
+	expect(t, reportOnlyHeader, fmt.Sprintf("script-src 'self' 'nonce-%[1]s'; style-src 'self'", nonce))
+
+	// The nonce only expands in the slots that declared it.
+	expect(t, strings.Count(enforcedHeader, "'nonce-"), 2)
+	expect(t, strings.Count(reportOnlyHeader, "'nonce-"), 1)
+	expect(t, strings.Contains(enforcedHeader, "default-src 'nonce-"), false)
+	expect(t, strings.Contains(reportOnlyHeader, "style-src 'nonce-"), false)
 }
