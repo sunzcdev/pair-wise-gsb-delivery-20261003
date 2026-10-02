@@ -36,6 +36,30 @@ const (
 	DefaultMinSize = 1400
 )
 
+// FlushPolicy controls how the first Flush behaves while the response is
+// still smaller than MinSize (and therefore has not yet committed to either
+// gzip or plain encoding). Once the first Flush picks an encoding it cannot
+// be changed for the rest of the response.
+type FlushPolicy int
+
+const (
+	// FlushBuffered is the default. A Flush before the encoding is known is a
+	// no-op: bytes keep buffering until MinSize is reached (or Close emits the
+	// small response uncompressed).
+	FlushBuffered FlushPolicy = iota
+
+	// FlushAsGzip makes the first Flush commit to gzip immediately, handing the
+	// currently buffered bytes (possibly none) to the gzip writer and flushing
+	// them to the client. This enables streaming of responses that may stay
+	// under MinSize.
+	FlushAsGzip
+
+	// FlushAsPlain makes the first Flush commit to passthrough immediately:
+	// the buffered bytes are written uncompressed to the underlying
+	// ResponseWriter and the response is never gzipped.
+	FlushAsPlain
+)
+
 // gzipWriterPools stores a sync.Pool for each compression level for reuse of
 // gzip.Writers. Use poolIndex to covert a compression level to an index into
 // gzipWriterPools.
@@ -84,6 +108,11 @@ type GzipResponseWriter struct {
 	minSize int    // Specifies the minimum response size to gzip. If the response length is bigger than this value, it is compressed.
 	buf     []byte // Holds the first part of the write before reaching the minSize or the end of the write.
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
+	closed  bool   // If true, Close already ran, so further Flush/Close calls must do nothing.
+
+	// flushPolicy decides what happens when Flush is invoked before enough
+	// bytes have been buffered to pick an encoding.
+	flushPolicy FlushPolicy
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
 }
@@ -148,6 +177,29 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 
 // startGzip initializes a GZIP writer and writes the buffer.
 func (w *GzipResponseWriter) startGzip() error {
+	// When no bytes are buffered yet, don't initialize the gzip writer: on
+	// Close it would emit a gzip header (and trailer) even though the response
+	// has no body. The gzip response headers are still committed, so a
+	// HEAD-style response with a preset Content-Length advertises gzip.
+	if len(w.buf) == 0 {
+		w.commitGzipHeaders()
+		return nil
+	}
+	return w.beginGzip()
+}
+
+// forceGzip commits the response to gzip encoding immediately, even when the
+// buffer is empty (a zero-body flush) or still smaller than minSize. It is
+// only used by the streaming first-flush policy. Once this returns the
+// encoding can never switch back to plain, so the buffered bytes are handed
+// over to the gzip writer exactly once.
+func (w *GzipResponseWriter) forceGzip() error {
+	return w.beginGzip()
+}
+
+// commitGzipHeaders advertises gzip encoding, drops a preset Content-Length
+// (the compressed length differs) and flushes the saved status code.
+func (w *GzipResponseWriter) commitGzipHeaders() {
 	// Set the GZIP header.
 	w.Header().Set(contentEncoding, "gzip")
 
@@ -156,29 +208,44 @@ func (w *GzipResponseWriter) startGzip() error {
 	// See: https://github.com/golang/go/issues/14975.
 	w.Header().Del(contentLength)
 
-	// Write the header to gzip response.
+	// Write the status code to the underlying response, if one was saved.
 	if w.code != 0 {
 		w.ResponseWriter.WriteHeader(w.code)
-		// Ensure that no other WriteHeader's happen
+		// Ensure that no other WriteHeader's happen.
 		w.code = 0
 	}
+}
 
-	// Initialize and flush the buffer into the gzip response if there are any bytes.
-	// If there aren't any, we shouldn't initialize it yet because on Close it will
-	// write the gzip header even if nothing was ever written.
-	if len(w.buf) > 0 {
-		// Initialize the GZIP response.
+// beginGzip sets the gzip headers, commits the pending status code, obtains a
+// gzip writer and drains the buffer into it. The buffer is cleared only after
+// it has been fully written, so a failed write never silently drops bytes and
+// a retry never writes them twice.
+func (w *GzipResponseWriter) beginGzip() error {
+	w.commitGzipHeaders()
+
+	// Initialize the GZIP response, creating it lazily when the buffer is
+	// empty so a zero-body flush still emits a valid gzip stream header.
+	if w.gw == nil {
 		w.init()
-		n, err := w.gw.Write(w.buf)
+	}
 
-		// This should never happen (per io.Writer docs), but if the write didn't
-		// accept the entire buffer but returned no specific error, we have no clue
-		// what's going on, so abort just to be safe.
-		if err == nil && n < len(w.buf) {
-			err = io.ErrShortWrite
-		}
+	if len(w.buf) == 0 {
+		return nil
+	}
+
+	n, err := w.gw.Write(w.buf)
+	// This should never happen (per io.Writer docs), but if the write didn't
+	// accept the entire buffer but returned no specific error, we have no clue
+	// what's going on, so abort just to be safe.
+	if err == nil && n < len(w.buf) {
+		return io.ErrShortWrite
+	}
+	if err != nil {
 		return err
 	}
+
+	// Hand ownership of the bytes to the gzip writer; never write them again.
+	w.buf = nil
 	return nil
 }
 
@@ -224,6 +291,11 @@ func (w *GzipResponseWriter) init() {
 
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
 func (w *GzipResponseWriter) Close() error {
+	if w.closed {
+		return nil
+	}
+	w.closed = true
+
 	if w.ignore {
 		return nil
 	}
@@ -245,24 +317,83 @@ func (w *GzipResponseWriter) Close() error {
 }
 
 // Flush flushes the underlying *gzip.Writer and then the underlying
-// http.ResponseWriter if it is an http.Flusher. This makes GzipResponseWriter
-// an http.Flusher.
+// http.ResponseWriter. This makes GzipResponseWriter an http.Flusher.
+//
+// The first Flush, before enough bytes have been buffered to pick an
+// encoding, is governed by the handler's FlushPolicy. After that choice the
+// encoding is fixed for the lifetime of the response. Flush itself discards
+// errors; use FlushError (or an http.ResponseController) to observe them.
 func (w *GzipResponseWriter) Flush() {
+	_ = w.FlushError()
+}
+
+// FlushError flushes the underlying *gzip.Writer and then the underlying
+// http.ResponseWriter, returning any error. Implementing FlushError lets
+// http.ResponseController.Flush surface failures of the underlying flush
+// instead of silently dropping them.
+func (w *GzipResponseWriter) FlushError() error {
+	if w.closed {
+		return nil
+	}
+
+	// The encoding has not been chosen yet; the first Flush commits it.
 	if w.gw == nil && !w.ignore {
-		// Only flush once startGzip or startPlain has been called.
-		//
-		// Flush is thus a no-op until we're certain whether a plain
-		// or gzipped response will be served.
-		return
+		// FlushBuffered (the default): a Flush before the encoding is known is
+		// a no-op, including not flushing the underlying writer (which could
+		// prematurely commit a status code). Bytes keep buffering until
+		// MinSize is reached or Close runs.
+		if w.flushPolicy == FlushBuffered {
+			return nil
+		}
+		if err := w.commitFirstFlush(); err != nil {
+			return err
+		}
 	}
 
 	if w.gw != nil {
-		w.gw.Flush()
+		if err := w.gw.Flush(); err != nil {
+			return err
+		}
 	}
 
-	if fw, ok := w.ResponseWriter.(http.Flusher); ok {
-		fw.Flush()
+	// Prefer http.NewResponseController so an underlying Unwrap chain is
+	// honored, falling back to the legacy http.Flusher interface.
+	rc := http.NewResponseController(w.ResponseWriter)
+	if err := rc.Flush(); err != nil {
+		if err == http.ErrNotSupported {
+			if fw, ok := w.ResponseWriter.(http.Flusher); ok {
+				fw.Flush()
+				return nil
+			}
+		}
+		return err
 	}
+	return nil
+}
+
+// commitFirstFlush applies the configured FlushPolicy to the first Flush call,
+// deciding once and for all whether the response is gzipped or passed through.
+func (w *GzipResponseWriter) commitFirstFlush() error {
+	switch w.flushPolicy {
+	case FlushAsGzip:
+		// Never double-encode a response that already chose an encoding.
+		if ce := w.Header().Get(contentEncoding); ce != "" {
+			return w.startPlain()
+		}
+		return w.forceGzip()
+
+	case FlushAsPlain:
+		return w.startPlain()
+	}
+	// FlushBuffered is handled by the caller before reaching this point.
+	return nil
+}
+
+// Unwrap exposes the wrapped http.ResponseWriter so that
+// http.NewResponseController (and other interface-unwrapping helpers) can reach
+// optional interfaces such as FlusherWithError on the underlying connection.
+func (w *GzipResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // Hijack implements http.Hijacker. If the underlying ResponseWriter is a
@@ -327,6 +458,7 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 					ResponseWriter: w,
 					index:          index,
 					minSize:        c.minSize,
+					flushPolicy:    c.flushPolicy,
 					contentTypes:   c.contentTypes,
 				}
 				defer gw.Close()
@@ -379,6 +511,7 @@ type config struct {
 	minSize      int
 	level        int
 	contentTypes []parsedContentType
+	flushPolicy  FlushPolicy
 }
 
 func (c *config) validate() error {
@@ -388,6 +521,12 @@ func (c *config) validate() error {
 
 	if c.minSize < 0 {
 		return fmt.Errorf("minimum size must be more than zero")
+	}
+
+	switch c.flushPolicy {
+	case FlushBuffered, FlushAsGzip, FlushAsPlain:
+	default:
+		return fmt.Errorf("invalid flush policy requested: %d", c.flushPolicy)
 	}
 
 	return nil
@@ -404,6 +543,18 @@ func MinSize(size int) option {
 func CompressionLevel(level int) option {
 	return func(c *config) {
 		c.level = level
+	}
+}
+
+// StreamingFlush sets the FlushPolicy applied to the first Flush of a
+// response while it is still below MinSize. Use FlushAsGzip to start gzip
+// encoding on that first flush (streaming the current bytes immediately), or
+// FlushAsPlain to commit to an uncompressed passthrough response. The default
+// FlushBuffered keeps the historical behavior of buffering until the encoding
+// is determined. The choice made by the first flush is permanent.
+func StreamingFlush(policy FlushPolicy) option {
+	return func(c *config) {
+		c.flushPolicy = policy
 	}
 }
 
