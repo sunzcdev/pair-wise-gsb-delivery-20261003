@@ -48,3 +48,23 @@ func ExampleIPSet() {
 	//   10.128.0.0/9
 	//   fed0::400/120
 }
+
+func ExampleIPSet_SplitBalanced() {
+	var b netipx.IPSetBuilder
+	for _, addr := range []string{"192.0.2.1", "198.51.100.2", "203.0.113.3", "2001:db8::1", "2001:db8::2"} {
+		b.Add(netip.MustParseAddr(addr))
+	}
+	s, _ := b.IPSet()
+
+	for i, shard := range s.SplitBalanced(3) {
+		fmt.Printf("%d:", i+1)
+		for _, r := range shard.Ranges() {
+			fmt.Printf(" %s", r)
+		}
+		fmt.Println()
+	}
+	// Output:
+	// 1: 192.0.2.1-192.0.2.1 198.51.100.2-198.51.100.2
+	// 2: 203.0.113.3-203.0.113.3 2001:db8::1-2001:db8::1
+	// 3: 2001:db8::2-2001:db8::2
+}

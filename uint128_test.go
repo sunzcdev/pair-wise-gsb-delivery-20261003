@@ -44,6 +44,52 @@ func TestUint128AddSub(t *testing.T) {
 	}
 }
 
+func TestUint129Arithmetic(t *testing.T) {
+	max128 := uint128{hi: ^uint64(0), lo: ^uint64(0)}
+	total := u129From128(max128).addOne().add(u129From128(uint128{lo: 1 << 32}))
+	if total != (uint129{lo: uint128{lo: 1 << 32}, top: 1}) {
+		t.Fatalf("dual-family address count = %v; want 2^128+2^32", total)
+	}
+
+	tests := []struct {
+		name string
+		in   uint129
+		d    uint64
+		quot uint129
+		rem  uint64
+	}{
+		{
+			name: "small",
+			in:   uint129{lo: uint128{lo: 8}},
+			d:    3,
+			quot: uint129{lo: uint128{lo: 2}},
+			rem:  2,
+		},
+		{
+			name: "full family",
+			in:   u129From128(max128).addOne(),
+			d:    2,
+			quot: uint129{lo: uint128{hi: 1 << 63}},
+			rem:  0,
+		},
+		{
+			name: "dual-family total halved",
+			in:   total,
+			d:    2,
+			quot: uint129{lo: uint128{hi: 1 << 63, lo: 1 << 31}},
+			rem:  0,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotQuot, gotRem := tt.in.divmod(tt.d)
+			if gotQuot != tt.quot || gotRem != tt.rem {
+				t.Fatalf("divmod = (%v, %d); want (%v, %d)", gotQuot, gotRem, tt.quot, tt.rem)
+			}
+		})
+	}
+}
+
 func TestBitsSetFrom(t *testing.T) {
 	tests := []struct {
 		bit  uint8

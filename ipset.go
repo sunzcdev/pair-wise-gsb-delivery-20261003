@@ -339,6 +339,98 @@ func (s *IPSet) Ranges() []IPRange {
 	return append([]IPRange{}, s.rr...)
 }
 
+const maxSplitBalancedParts = 1_000_000
+
+// SplitBalanced divides s into parts ordered, non-overlapping IPSets.
+//
+// Each address in s occurs in exactly one result. The resulting sets are
+// ordered by address, so every address in an earlier result precedes every
+// address in a later result. Addresses are counted rather than CIDRs or
+// ranges, and the first results contain at most one more address than the
+// last results. When s contains fewer than parts addresses, the remaining
+// results are empty.
+//
+// SplitBalanced panics if parts is less than one or greater than
+// 1,000,000. It uses integer interval arithmetic and does not enumerate
+// addresses.
+func (s *IPSet) SplitBalanced(parts int) []*IPSet {
+	if parts < 1 || parts > maxSplitBalancedParts {
+		panic(fmt.Sprintf("netipx: parts must be between 1 and %d; got %d", maxSplitBalancedParts, parts))
+	}
+
+	var total uint129
+	for _, r := range s.rr {
+		total = total.add(rangeSize129(r))
+	}
+	base, remainder := total.divmod(uint64(parts))
+
+	resultRanges := make([][]IPRange, parts)
+	rangeIndex := 0
+	offset := uint129{}
+	shard := 0
+	shardSize := base
+	if shard < int(remainder) {
+		shardSize = shardSize.addOne()
+	}
+
+	for shard < parts {
+		if shardSize.isZero() {
+			shard++
+			if shard < parts {
+				shardSize = base
+				if shard < int(remainder) {
+					shardSize = shardSize.addOne()
+				}
+			}
+			continue
+		}
+
+		r := s.rr[rangeIndex]
+		available := rangeSize129(r).sub(offset)
+		take := available
+		if shardSize.cmp(available) < 0 {
+			take = shardSize
+		}
+
+		var from, to netip.Addr
+		if take.top == 1 {
+			from = r.from
+			to = r.to
+		} else {
+			from = ipAtOffset(r.from, offset.lo)
+			endOffset, _ := offset.lo.add(take.lo)
+			to = ipAtOffset(r.from, endOffset.subOne())
+		}
+		resultRanges[shard] = append(resultRanges[shard], IPRangeFrom(from, to))
+
+		shardSize = shardSize.sub(take)
+		offset = offset.add(take)
+		if offset.cmp(rangeSize129(r)) == 0 {
+			rangeIndex++
+			offset = uint129{}
+		}
+	}
+
+	sets := make([]*IPSet, parts)
+	for i, ranges := range resultRanges {
+		sets[i] = &IPSet{rr: ranges}
+	}
+	return sets
+}
+
+func rangeSize129(r IPRange) uint129 {
+	size, _ := u128From16(r.to.As16()).sub(u128From16(r.from.As16()))
+	return u129From128(size).addOne()
+}
+
+func ipAtOffset(base netip.Addr, offset uint128) netip.Addr {
+	value, _ := u128From16(base.As16()).add(offset)
+	if base.Is4() {
+		return value.IP4()
+	}
+	return value.IP6()
+}
+
 // Prefixes returns the minimum and sorted set of IP prefixes
 // that covers s.
 func (s *IPSet) Prefixes() []netip.Prefix {
