@@ -558,6 +558,30 @@ The `Config.SyncPolicy` has the following options:
 - `EverySecond` - fsync every second, fast and safer, this is the default
 - `Always` - fsync after every write, very durable, slower
 
+### Persistence failures and read-only recovery
+
+An AOF write is not always all-or-nothing. The kernel may accept only part
+of a record before returning an error (a short write), and `Sync` may fail
+after a record has been written. In either case the bytes at the tail of the
+file, or their durability, can no longer be trusted. A failed `Shrink` file
+swap is similar: it may be ambiguous whether the old file or the compacted
+one is now live.
+
+When any of these happens BuntDB does not keep appending to that uncertain
+tail. The database enters a restricted state: reads keep working, but write
+transactions fail with `ErrDatabaseReadOnly`, and `PersistError()` reports
+the underlying cause. Simply returning an error does not undo the bytes that
+already reached disk, so the state is kept until a trustworthy boundary is
+re-established.
+
+Call `Recover()` (in the same process) or close and reopen the database to
+return to service. Both paths open a fresh file handle, reparse the AOF to
+the end of the last *complete* record, truncate any partial tail, issue an
+`Sync`, and rebuild the in-memory dataset from exactly those confirmed
+bytes. Writes are re-enabled only once all of that succeeds; if the storage
+is still failing, `Recover()` returns the error and the database stays
+read-only.
+
 ## Config
 
 Here are some configuration options that can be use to change various behaviors of the database.

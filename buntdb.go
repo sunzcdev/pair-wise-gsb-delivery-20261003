@@ -60,15 +60,62 @@ var (
 
 	// ErrTxIterating is returned when Set or Delete are called while iterating.
 	ErrTxIterating = errors.New("tx is iterating")
+
+	// ErrDatabaseReadOnly is returned when a write is attempted while the
+	// database is in the restricted read-only state that follows an
+	// unrecoverable persistence failure, such as an AOF short write, a
+	// failed Sync, or a failed Shrink file swap. The database keeps serving
+	// reads but refuses writes until Recover confirms a usable on-disk
+	// boundary.
+	ErrDatabaseReadOnly = errors.New("database read-only due to persistence failure")
 )
 
 const useAbsEx = true
+
+// persistFile is the subset of the underlying file operations that the
+// persistence layer depends on. Routing every AOF operation through this
+// interface allows the storage backend, and in particular fault injection,
+// to be plugged in without the database reaching for *os.File directly.
+type persistFile interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	io.Closer
+	Name() string
+	Stat() (os.FileInfo, error)
+	Sync() error
+	Truncate(size int64) error
+}
+
+// fileRole identifies why the persistence layer is opening a file. It is
+// passed to the openFile hook so that callers injecting failures can target
+// a specific operation.
+type fileRole int
+
+const (
+	roleMain   fileRole = iota // the live AOF file opened by Open/Recover
+	roleTemp                   // the temporary file created by Shrink
+	roleRead                   // the read-only view of the AOF during Shrink
+	roleReopen                 // the live AOF re-opened after the Shrink swap
+)
+
+// openFile opens a file for use by the persistence layer. The default
+// implementation creates ordinary operating-system files; tests replace it
+// to inject I/O failures and observe partial writes.
+var openFile = func(path string, flag int, perm os.FileMode, role fileRole) (persistFile, error) {
+	return os.OpenFile(path, flag, perm)
+}
+
+// renameFileHook, when non-nil, replaces the file rename used during a
+// Shrink swap. Tests set it to force a failure precisely at the moment the
+// compacted file is moved into place.
+var renameFileHook func(src, dest string) error
 
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields
-	file      *os.File          // the underlying file
+	file      persistFile       // the underlying file
 	buf       []byte            // a buffer to write to
 	keys      *btree.BTree      // a tree of all item ordered by key
 	exps      *btree.BTree      // a tree of items ordered by expiration
@@ -78,8 +125,17 @@ type DB struct {
 	closed    bool              // set when the database has been closed
 	config    Config            // the database configuration
 	persist   bool              // do we write to disk
+	path      string            // the path of the underlying file
 	shrinking bool              // when an aof shrink is in-process.
 	lastaofsz int               // the size of the last shrink aof size
+	// degraded is set when the AOF state can no longer be trusted because a
+	// write, sync, or shrink swap failed. While degraded the database serves
+	// reads but rejects all writes with ErrDatabaseReadOnly. degradeErr
+	// records the original cause. The state only clears after Recover
+	// re-establishes a confirmed durable boundary; it is never enough to
+	// simply clear this flag and keep appending to an uncertain tail.
+	degraded   bool
+	degradeErr error
 }
 
 // SyncPolicy represents how often data is synced to disk.
@@ -156,18 +212,21 @@ func Open(path string) (*DB, error) {
 	// turn off persistence for pure in-memory
 	db.persist = path != ":memory:"
 	if db.persist {
+		db.path = path
 		var err error
 		// hardcoding 0666 as the default mode.
-		db.file, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
+		db.file, err = openFile(path, os.O_CREATE|os.O_RDWR, 0666, roleMain)
 		if err != nil {
 			return nil, err
 		}
 		// load the database from disk
-		if err := db.load(); err != nil {
+		estaofsz, err := db.loadFrom(db.file)
+		if err != nil {
 			// close on error, ignore close error
 			_ = db.file.Close()
 			return nil, err
 		}
+		db.lastaofsz += estaofsz
 	}
 	// start the background manager.
 	go db.backgroundManager()
@@ -183,7 +242,7 @@ func (db *DB) Close() error {
 		return ErrDatabaseClosed
 	}
 	db.closed = true
-	if db.persist {
+	if db.persist && db.file != nil {
 		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
 			return err
@@ -455,6 +514,98 @@ func (db *DB) SetConfig(config Config) error {
 	return nil
 }
 
+// markDegraded moves the database into the restricted read-only state after a
+// persistence failure. It must be called with db.mu held for writes. The
+// first cause is retained so callers can learn why writes were disabled.
+func (db *DB) markDegraded(err error) {
+	if db.degraded || err == nil {
+		return
+	}
+	db.degraded = true
+	db.degradeErr = err
+}
+
+// PersistError reports the failure that forced the database into its
+// restricted read-only state. It returns nil while the database is healthy.
+// While a non-nil error is returned, writes fail with ErrDatabaseReadOnly
+// and the database can only be returned to service through Recover (or by
+// closing and reopening it after the storage problem has been fixed).
+func (db *DB) PersistError() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	return db.degradeErr
+}
+
+// Recover attempts to return a degraded database to a writable state.
+//
+// A failed append, Sync, or Shrink may have left an unknown number of bytes
+// at the tail of the file whose durability and completeness cannot be
+// trusted. Recover therefore does not merely clear the error: it opens a
+// fresh file handle, reparses the AOF to locate the end of the last complete
+// record, truncates every byte beyond that confirmed boundary, and issues a
+// Sync. The in-memory dataset is rebuilt from exactly those confirmed bytes,
+// so memory and disk agree again. Only when all of that succeeds are writes
+// re-enabled. If the storage is still broken the database stays degraded and
+// the current error is returned.
+func (db *DB) Recover() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrDatabaseClosed
+	}
+	if !db.persist {
+		// Nothing on disk can become inconsistent for a pure in-memory
+		// database, so there is no degraded state to clear.
+		db.degraded = false
+		db.degradeErr = nil
+		return nil
+	}
+	if !db.degraded {
+		return nil
+	}
+	f, err := openFile(db.path, os.O_CREATE|os.O_RDWR, 0666, roleMain)
+	if err != nil {
+		return err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+		}
+	}()
+	// Rebuild the dataset strictly from the confirmed file contents and
+	// truncate a partial trailing record. This is the point at which the
+	// usable boundary is established rather than assumed. The existing trees
+	// are kept aside and only discarded once the rebuild proves durable.
+	savedKeys, savedExps, savedIdxs := db.keys, db.exps, db.idxs
+	db.keys = btreeNew(lessCtx(nil))
+	db.exps = btreeNew(lessCtx(&exctx{db}))
+	db.idxs = make(map[string]*index)
+	estaofsz, err := db.loadFrom(f)
+	if err != nil {
+		db.keys, db.exps, db.idxs = savedKeys, savedExps, savedIdxs
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		db.keys, db.exps, db.idxs = savedKeys, savedExps, savedIdxs
+		return err
+	}
+	// The boundary is confirmed durable and complete. Commit the new state.
+	if db.file != nil {
+		_ = db.file.Close()
+	}
+	db.file = f
+	db.lastaofsz = estaofsz
+	db.flushes = 0
+	db.degraded = false
+	db.degradeErr = nil
+	ok = true
+	return nil
+}
+
 // insertIntoDatabase performs inserts an item in to the database and updates
 // all indexes. If a previous item with the same key already exists, that item
 // will be replaced with the new one, and return the previous item.
@@ -563,7 +714,8 @@ func (db *DB) backgroundManager() {
 			if db.persist && !db.config.AutoShrinkDisabled {
 				pos, err := db.file.Seek(0, 1)
 				if err != nil {
-					return err
+					db.markDegraded(fmt.Errorf("buntdb: aof seek: %w", err))
+					return ErrDatabaseReadOnly
 				}
 				aofsz := int(pos)
 				if aofsz > db.config.AutoShrinkMinSize {
@@ -617,8 +769,14 @@ func (db *DB) backgroundManager() {
 			defer db.mu.Unlock()
 			if db.persist && db.config.SyncPolicy == EverySecond &&
 				flushes != db.flushes {
-				_ = db.file.Sync()
-				flushes = db.flushes
+				if err := db.file.Sync(); err != nil {
+					// Unsynced records may never reach stable storage. The
+					// tail is no longer provably durable, so stop accepting
+					// writes until Recover re-establishes a boundary.
+					db.markDegraded(fmt.Errorf("buntdb: aof sync: %w", err))
+				} else {
+					flushes = db.flushes
+				}
 			}
 		}()
 		if shrink {
@@ -645,6 +803,10 @@ func (db *DB) Shrink() error {
 		db.mu.Unlock()
 		return nil
 	}
+	if db.degraded {
+		db.mu.Unlock()
+		return ErrDatabaseReadOnly
+	}
 	if db.shrinking {
 		// The database is already in the process of shrinking.
 		db.mu.Unlock()
@@ -666,7 +828,7 @@ func (db *DB) Shrink() error {
 	}
 	db.mu.Unlock()
 	time.Sleep(time.Second / 4) // wait just a bit before starting
-	f, err := os.Create(tmpname)
+	f, err := openFile(tmpname, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666, roleTemp)
 	if err != nil {
 		return err
 	}
@@ -705,14 +867,23 @@ func (db *DB) Shrink() error {
 				},
 			)
 			if len(buf) > 0 {
-				if _, err := f.Write(buf); err != nil {
-					return err
+				// Treat a short write to the temporary file as a failure too:
+				// an incomplete snapshot must never be swapped into place.
+				var wn int
+				for len(buf[wn:]) > 0 {
+					n, werr := f.Write(buf[wn:])
+					wn += n
+					if werr != nil {
+						return werr
+					}
 				}
 				buf = buf[:0]
 			}
 			return nil
 		}()
 		if err != nil {
+			// The live AOF was never touched, so this is an ordinary abort:
+			// discard the temporary file and leave the database writable.
 			return err
 		}
 	}
@@ -727,47 +898,82 @@ func (db *DB) Shrink() error {
 		if db.closed {
 			return ErrDatabaseClosed
 		}
+		if db.degraded {
+			return ErrDatabaseReadOnly
+		}
 		// We are going to open a new version of the aof file so that we do
 		// not change the seek position of the previous. This may cause a
 		// problem in the future if we choose to use syscall file locking.
-		aof, err := os.Open(fname)
+		aof, err := openFile(fname, os.O_RDONLY, 0, roleRead)
 		if err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink open: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		defer func() { _ = aof.Close() }()
 		if _, err := aof.Seek(endpos, 0); err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink seek: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		// Just copy all of the new commands that have occurred since we
 		// started the shrink process.
 		if _, err := io.Copy(f, aof); err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink copy: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		// Close all files
 		if err := aof.Close(); err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink close: %w", err))
+			return ErrDatabaseReadOnly
+		}
+		// The compacted file must be durable before it is allowed to replace
+		// the live AOF.
+		if err := f.Sync(); err != nil {
+			db.markDegraded(fmt.Errorf("buntdb: shrink sync: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		if err := f.Close(); err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink close: %w", err))
+			return ErrDatabaseReadOnly
 		}
+		// From here on the live file handle is being replaced. A failure no
+		// longer leaves a self-evident state: the temporary and live file may
+		// differ and the rename may or may not have landed. Rather than guess
+		// which bytes back the path, the database enters the restricted
+		// read-only state and Recover reopens the file that actually exists
+		// and reconfirms its usable boundary.
 		if err := db.file.Close(); err != nil {
-			return err
+			db.file = nil
+			db.markDegraded(fmt.Errorf("buntdb: shrink close: %w", err))
+			return ErrDatabaseReadOnly
 		}
-		// Any failures below here are really bad. So just panic.
-		if err := renameFile(tmpname, fname); err != nil {
-			panicErr(err)
+		if err := renamePersistFile(tmpname, fname); err != nil {
+			db.file = nil
+			db.markDegraded(fmt.Errorf("buntdb: shrink rename: %w", err))
+			return ErrDatabaseReadOnly
 		}
-		db.file, err = os.OpenFile(fname, os.O_CREATE|os.O_RDWR, 0666)
+		db.file, err = openFile(fname, os.O_CREATE|os.O_RDWR, 0666, roleReopen)
 		if err != nil {
-			panicErr(err)
+			db.file = nil
+			db.markDegraded(fmt.Errorf("buntdb: shrink reopen: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		pos, err := db.file.Seek(0, 2)
 		if err != nil {
-			return err
+			db.markDegraded(fmt.Errorf("buntdb: shrink seek: %w", err))
+			return ErrDatabaseReadOnly
 		}
 		db.lastaofsz = int(pos)
 		return nil
 	}()
+}
+
+// renamePersistFile renames a persistence file. Tests replace the hook to
+// inject a failure at the Shrink file-switch step.
+func renamePersistFile(src, dest string) error {
+	if renameFileHook != nil {
+		return renameFileHook(src, dest)
+	}
+	return renameFile(src, dest)
 }
 
 func panicErr(err error) error {
@@ -963,31 +1169,38 @@ func (db *DB) readLoad(rd io.Reader, modTime time.Time) (n int64, err error) {
 	}
 }
 
-// load reads entries from the append only database file and fills the database.
+// loadFrom reads entries from the append only database file and fills the
+// database.
 // The file format uses the Redis append only file format, which is and a series
 // of RESP commands. For more information on RESP please read
 // http://redis.io/topics/protocol. The only supported RESP commands are DEL and
 // SET.
-func (db *DB) load() error {
-	fi, err := db.file.Stat()
+//
+// The file is truncated to the end of the last complete record, the file
+// offset is positioned at that confirmed boundary, and the estimated AOF
+// size of the loaded dataset is returned. Both Open and Recover rely on this
+// routine to establish the usable on-disk boundary before appending any new
+// data.
+func (db *DB) loadFrom(f persistFile) (int, error) {
+	fi, err := f.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	n, err := db.readLoad(db.file, fi.ModTime())
+	n, err := db.readLoad(f, fi.ModTime())
 	if err != nil {
 		if err == io.ErrUnexpectedEOF {
 			// The db file has ended mid-command, which is allowed but the
 			// data file should be truncated to the end of the last valid
 			// command
-			if err := db.file.Truncate(n); err != nil {
-				return err
+			if err := f.Truncate(n); err != nil {
+				return 0, err
 			}
 		} else {
-			return err
+			return 0, err
 		}
 	}
-	if _, err := db.file.Seek(n, 0); err != nil {
-		return err
+	if _, err := f.Seek(n, 0); err != nil {
+		return 0, err
 	}
 	var estaofsz int
 	db.keys.Walk(func(items []interface{}) {
@@ -995,8 +1208,7 @@ func (db *DB) load() error {
 			estaofsz += v.(*dbItem).estAOFSetSize()
 		}
 	})
-	db.lastaofsz += estaofsz
-	return nil
+	return estaofsz, nil
 }
 
 // managed calls a block of code that is fully contained in a transaction.
@@ -1136,6 +1348,13 @@ func (db *DB) Begin(writable bool) (*Tx, error) {
 		tx.unlock()
 		return nil, ErrDatabaseClosed
 	}
+	if writable && db.persist && db.degraded {
+		// A persistence failure has made the tail of the AOF untrusted.
+		// Keep serving reads but refuse writes until Recover confirms a
+		// durable boundary.
+		tx.unlock()
+		return nil, ErrDatabaseReadOnly
+	}
 	if writable {
 		// writable transactions have a writeContext object that
 		// contains information about changes to the database.
@@ -1225,34 +1444,36 @@ func (tx *Tx) Commit() error {
 			}
 		}
 		// Flushing the buffer only once per transaction.
-		// If this operation fails then the write did failed and we must
-		// rollback.
+		// Write is allowed to return a short count even without an error, so
+		// loop until every byte is accounted for.
 		var n int
-		n, err = tx.db.file.Write(tx.db.buf)
+		for len(tx.db.buf[n:]) > 0 && err == nil {
+			var wn int
+			wn, err = tx.db.file.Write(tx.db.buf[n:])
+			n += wn
+		}
 		if err != nil {
-			if n > 0 {
-				// There was a partial write to disk.
-				// We are possibly out of disk space.
-				// Delete the partially written bytes from the data file by
-				// seeking to the previously known position and performing
-				// a truncate operation.
-				// At this point a syscall failure is fatal and the process
-				// should be killed to avoid corrupting the file.
-				pos, err := tx.db.file.Seek(-int64(n), 1)
-				if err != nil {
-					panicErr(err)
-				}
-				if err := tx.db.file.Truncate(pos); err != nil {
-					panicErr(err)
+			// An unknown prefix of the record may already be on disk and
+			// its durability is in doubt. Undoing the in-memory change is not
+			// enough to make the file trustworthy again, so the database is
+			// forced into the restricted read-only state rather than kept
+			// open for writes against an uncertain tail.
+			tx.rollbackInner()
+			tx.db.markDegraded(fmt.Errorf("buntdb: aof write: %w", err))
+			err = ErrDatabaseReadOnly
+		} else {
+			// Every byte reached the kernel, but durability is only as good
+			// as the Sync. A Sync failure means the record cannot be counted
+			// as committed, which is equally fatal for continued appending.
+			if tx.db.config.SyncPolicy == Always {
+				if serr := tx.db.file.Sync(); serr != nil {
+					tx.db.markDegraded(fmt.Errorf("buntdb: aof sync: %w", serr))
+					err = ErrDatabaseReadOnly
 				}
 			}
-			tx.rollbackInner()
+			// Increment the number of flushes. The background syncing uses this.
+			tx.db.flushes++
 		}
-		if tx.db.config.SyncPolicy == Always {
-			_ = tx.db.file.Sync()
-		}
-		// Increment the number of flushes. The background syncing uses this.
-		tx.db.flushes++
 	}
 	// Unlock the database and allow for another writable transaction.
 	tx.unlock()
