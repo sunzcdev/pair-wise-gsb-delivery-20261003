@@ -70,7 +70,8 @@ module JSONSchemer
       regexp_resolver: configuration.regexp_resolver,
       output_format: configuration.output_format,
       resolve_enumerators: configuration.resolve_enumerators,
-      access_mode: configuration.access_mode
+      access_mode: configuration.access_mode,
+      property_consumption_report: configuration.property_consumption_report
     )
       @value = deep_stringify_keys(value)
       @parent = parent
@@ -96,7 +97,8 @@ module JSONSchemer
         :regexp_resolver => regexp_resolver,
         :output_format => output_format,
         :resolve_enumerators => resolve_enumerators,
-        :access_mode => access_mode
+        :access_mode => access_mode,
+        :property_consumption_report => property_consumption_report
       )
       @parsed = parse
     end
@@ -105,15 +107,23 @@ module JSONSchemer
       validate(instance, :output_format => 'flag', **options).fetch('valid')
     end
 
-    def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
+    def validate(
+      instance,
+      output_format: @configuration.output_format,
+      resolve_enumerators: @configuration.resolve_enumerators,
+      access_mode: @configuration.access_mode,
+      property_consumption_report: @configuration.property_consumption_report
+    )
       instance_location = Location.root
-      context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode)
+      short_circuit = !insert_property_defaults && output_format == 'flag' && !property_consumption_report
+      context = Context.new(instance, [], nil, short_circuit, access_mode)
       result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
       if insert_property_defaults && result.insert_property_defaults(context, &property_default_resolver)
         result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
       end
       output = result.output(output_format)
       resolve_enumerators!(output) if resolve_enumerators
+      attach_property_consumption_report(output, result) if property_consumption_report
       output
     end
 
@@ -427,6 +437,16 @@ module JSONSchemer
         output.map { |value| resolve_enumerators!(value) }
       else
         output
+      end
+    end
+
+    def attach_property_consumption_report(output, result)
+      report = result.property_consumption_report
+      case output
+      when Hash
+        output['propertyConsumptionReport'] = report
+      when Enumerator
+        output.define_singleton_method(:property_consumption_report) { report }
       end
     end
   end

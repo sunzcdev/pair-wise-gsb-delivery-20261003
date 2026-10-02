@@ -197,6 +197,14 @@ class ConfigurationTest < Minitest::Test
     )
   end
 
+  def test_property_consumption_report
+    run_configuration_test(
+      :property_consumption_report,
+      default: false,
+      test: true
+    )
+  end
+
   def test_configuration_option_and_override
     configuration = JSONSchemer::Configuration.new
     configuration.format = false

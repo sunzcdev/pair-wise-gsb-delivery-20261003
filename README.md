@@ -241,7 +241,19 @@ JSONSchemer.schema(
   # validate `readOnly`/`writeOnly` keywords (https://spec.openapis.org/oas/v3.0.3#fixed-fields-19)
   # 'read'/'write'/nil
   # default: nil
-  access_mode: 'read'
+  access_mode: 'read',
+
+  # include a per-object property consumption report in the validation output
+  # (`propertyConsumptionReport`). Each object location lists the properties
+  # evaluated by `properties`/`patternProperties`/`additionalProperties`
+  # (including through `$ref` and composition keywords), the schema locations
+  # that provided the constraint, and the remaining properties. The report
+  # follows the draft 2020-12 annotation collection rules used by
+  # `unevaluatedProperties`; only successful `anyOf`/`allOf`/`oneOf` branches
+  # and the selected `if`/`then`/`else` branch contribute.
+  # true/false
+  # default: false
+  property_consumption_report: true
 )
 ```
 

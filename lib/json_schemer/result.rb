@@ -216,7 +216,244 @@ module JSONSchemer
       inserted
     end
 
+    # Builds a per-object report of the properties that were "consumed" during
+    # validation, following the draft 2020-12 annotation collection rules used
+    # by `unevaluatedProperties`.
+    #
+    # The report is derived from the existing result tree only, so no keywords
+    # (including custom keywords and property hooks) are evaluated again.
+    def property_consumption_report
+      # An "object scope" is a Schema result that validates an object instance:
+      # the root and any schema applied through a declarative keyword
+      # (`properties`/`patternProperties`/`additionalProperties`/items
+      # variants/`contains`). `unevaluatedProperties` does not open a scope: its
+      # nested results validate individual remaining property values, not the
+      # object itself. Each scope consumes properties through its own adjacent
+      # keywords, following the draft 2020-12 annotation collection rules used
+      # by `unevaluatedProperties` (successful in-place applicator branches
+      # contribute, failed ones and `not` do not).
+      # A value schema reached through a different declarative path is a cousin
+      # scope at the same instance location and does not share annotations; when
+      # several scopes validate one location, the scope containing
+      # `unevaluatedProperties` is the adjudicator the report aligns with.
+      scopes = {}
+      scopes.compare_by_identity
+      scope_order = []
+
+      record_scope = lambda do |schema_result|
+        # A schema can validate several objects through a recursive `$ref`, so
+        # scope identity includes the instance location.
+        key = [schema_result.source, schema_result.instance_location]
+        unless scopes.key?(key)
+          scopes[key] = {
+            :schema_result => schema_result,
+            :location => schema_result.instance_location,
+            :instance => schema_result.instance,
+            :evaluated => {},
+            :consumed_keys => Set[],
+            :adjudicates => schema_adjudicates?(schema_result.source)
+          }
+          scope_order << key
+        end
+      end
+
+      discover = nil
+      discover = lambda do |result|
+        if result.source.is_a?(Schema)
+          if result.instance.is_a?(Hash)
+            record_scope.call(result)
+          end
+          result.nested&.each { |nested| discover.call(nested) }
+        else
+          declarative = declarative_keyword?(result.source)
+          result.nested&.each do |nested|
+            if nested.source.is_a?(Schema)
+              same_location = nested.instance_location == result.instance_location
+              if same_location
+                # In-place application (`$ref`, applicator branches): a failed
+                # branch contributes nothing.
+                discover.call(nested) if nested.valid
+              elsif declarative
+                discover.call(nested)
+              end
+            else
+              discover.call(nested)
+            end
+          end
+        end
+      end
+
+      discover.call(self)
+
+      scope_order.each do |key|
+        scope = scopes.fetch(key)
+        evaluated = scope[:evaluated]
+        consumed_keys = scope[:consumed_keys]
+        scope[:schema_result].nested&.each do |keyword_result|
+          # `evaluated` lists properties consumed by `properties`/
+          # `patternProperties`/`additionalProperties` (with sources).
+          # `consumed_keys` additionally accounts for nested in-place
+          # `unevaluatedProperties`; the scope's own `unevaluatedProperties`
+          # does not satisfy itself.
+          collect_property_annotations(keyword_result, evaluated, consumed_keys, false)
+        end
+      end
+
+      by_location = {}
+      by_location.compare_by_identity
+      location_order = []
+      scope_order.each do |key|
+        scope = scopes.fetch(key)
+        location = scope[:location]
+        if by_location.key?(location)
+          slot = by_location.fetch(location)
+          if scope[:adjudicates] && !slot[:adjudicates]
+            slot[:scopes] = [scope]
+            slot[:adjudicates] = true
+          elsif !slot[:adjudicates]
+            slot[:scopes] << scope
+          end
+        else
+          by_location[location] = { :scopes => [scope], :adjudicates => scope[:adjudicates] }
+          location_order << location
+        end
+      end
+
+      location_order.map do |location|
+        slot = by_location.fetch(location)
+        instance = slot[:scopes].first[:instance]
+        evaluated = {}
+        consumed_keys = Set[]
+        slot[:scopes].each do |scope|
+          scope[:evaluated].each do |property, sources|
+            merged = evaluated[property] ||= []
+            sources.each do |source|
+              already_present = merged.any? do |existing|
+                existing['absoluteKeywordLocation'] == source['absoluteKeywordLocation']
+              end
+              merged << source unless already_present
+            end
+          end
+          consumed_keys.merge(scope[:consumed_keys])
+        end
+        {
+          'instanceLocation' => Location.resolve(location),
+          'evaluatedProperties' => evaluated.keys.sort.map do |property|
+            { 'name' => property, 'sources' => evaluated.fetch(property) }
+          end,
+          'remainingProperties' => instance.keys.reject { |key| consumed_keys.include?(key) }.sort
+        }
+      end
+    end
   private
+
+    def declarative_keyword?(source)
+      declarative_scope_keyword_classes.any? { |klass| source.is_a?(klass) }
+    end
+
+    def schema_adjudicates?(schema)
+      schema.parsed.is_a?(Hash) &&
+        schema.parsed.keys.any? do |keyword|
+          schema.parsed.fetch(keyword).is_a?(Draft202012::Vocab::Unevaluated::UnevaluatedProperties)
+        end
+    end
+
+    def declarative_scope_keyword_classes
+      @declarative_scope_keyword_classes ||= [
+        Draft202012::Vocab::Applicator::Properties,
+        Draft202012::Vocab::Applicator::PatternProperties,
+        Draft202012::Vocab::Applicator::AdditionalProperties,
+        Draft202012::Vocab::Applicator::Items,
+        Draft202012::Vocab::Applicator::PrefixItems,
+        Draft202012::Vocab::Applicator::Contains,
+        Draft202012::Vocab::Unevaluated::UnevaluatedItems,
+        Draft201909::Vocab::Applicator::Items,
+        Draft201909::Vocab::Applicator::AdditionalItems,
+        Draft201909::Vocab::Applicator::UnevaluatedItems
+      ].freeze
+    end
+
+    # Collect property annotations within one object scope, mirroring
+    # `UnevaluatedProperties#collect_evaluated_keys`: an adjacent property
+    # keyword annotation is merged and the walk only descends into nested
+    # applicator (`allOf`/`anyOf`/...) branches that successfully validated the
+    # same instance location.
+    #
+    # `evaluated` records properties consumed by `properties`/
+    # `patternProperties`/`additionalProperties` together with their constraint
+    # source locations. `consumed_keys` is the full evaluated set used to derive
+    # `remainingProperties`, additionally including keys consumed by a nested
+    # in-place `unevaluatedProperties`. The scope's own `unevaluatedProperties`
+    # is excluded (`include_unevaluated` starts false) because it cannot satisfy
+    # itself.
+    def collect_property_annotations(result, evaluated, consumed_keys, include_unevaluated)
+      case result.source
+      when Draft202012::Vocab::Applicator::Properties
+        merge_properties_annotation(result, evaluated, consumed_keys)
+      when Draft202012::Vocab::Applicator::PatternProperties
+        merge_pattern_properties_annotation(result, evaluated, consumed_keys)
+      when Draft202012::Vocab::Applicator::AdditionalProperties
+        merge_additional_properties_annotation(result, evaluated, consumed_keys)
+      when Draft202012::Vocab::Unevaluated::UnevaluatedProperties
+        consumed_keys.merge(result.annotation) if include_unevaluated
+      end
+      result.nested&.each do |subresult|
+        if subresult.valid && subresult.instance_location == result.instance_location
+          collect_property_annotations(subresult, evaluated, consumed_keys, true)
+        end
+      end
+    end
+
+    def merge_properties_annotation(result, evaluated, consumed_keys)
+      consumed_keys.merge(result.annotation)
+      result.annotation&.each do |property|
+        source_result = result.nested&.find do |nested|
+          nested.source.is_a?(Schema) && nested.instance_location[:name] == property
+        end
+        add_evaluated_property(evaluated, property, source_result)
+      end
+    end
+
+    def merge_pattern_properties_annotation(result, evaluated, consumed_keys)
+      consumed_keys.merge(result.annotation)
+      result.annotation&.each do |property|
+        source_result = result.nested&.find do |nested|
+          nested.source.is_a?(Schema) &&
+            nested.instance_location[:name] == property &&
+            nested.keyword_location[:name] &&
+            Location.resolve(nested.keyword_location) == pattern_keyword_location(result, nested)
+        end
+        add_evaluated_property(evaluated, property, source_result)
+      end
+    end
+
+    def pattern_keyword_location(result, nested)
+      pattern = Location.escape_json_pointer_token(nested.keyword_location[:name])
+      "#{Location.resolve(result.keyword_location)}/#{pattern}"
+    end
+
+    def merge_additional_properties_annotation(result, evaluated, consumed_keys)
+      consumed_keys.merge(result.annotation)
+      result.annotation&.each do |property|
+        source_result = result.nested&.find do |nested|
+          nested.source.is_a?(Schema) && nested.instance_location[:name] == property
+        end
+        add_evaluated_property(evaluated, property, source_result || result)
+      end
+    end
+
+    def add_evaluated_property(evaluated, property, source_result)
+      source_result ||= self
+      sources = evaluated[property] ||= []
+      source = {
+        'keywordLocation' => Location.resolve(source_result.keyword_location),
+        'absoluteKeywordLocation' => source_result.source.absolute_keyword_location
+      }
+      already_present = sources.any? do |existing|
+        existing['absoluteKeywordLocation'] == source['absoluteKeywordLocation']
+      end
+      sources << source unless already_present
+    end
 
     def resolved_instance_location
       @resolved_instance_location ||= Location.resolve(instance_location)
