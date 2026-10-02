@@ -18,6 +18,48 @@ Features
 - Compatible pub/sub support
 - Multithreaded
 
+Streaming large arguments
+-------------------------
+
+By default an entire command (including every bulk argument) is buffered and
+passed to your handler as `Command.Args`. When a single argument can be many
+gigabytes, opt in to a stream handler with
+`server.SetStreamHandler(handler, maxBulk)`. Commands containing a bulk
+argument whose declared length is at least `maxBulk` are delivered to the
+stream handler; the large argument is read from the connection on demand
+instead of being loaded into memory. Smaller arguments stay available on
+`StreamCommand.Args`.
+
+```go
+srv := redcon.NewServerNetwork("tcp", ":6380", handler, nil, nil)
+srv.SetStreamHandler(redcon.StreamHandlerFunc(func(c redcon.Conn, cmd *redcon.StreamCommand) {
+    // cmd.Args holds the arguments before the large bulk; read the large
+    // one in fixed-size chunks without allocating its declared length.
+    buf := make([]byte, 64*1024)
+    for {
+        n, err := cmd.Read(buf)
+        // ... handle buf[:n] ...
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            // Short read / cancellation: close and return; the server
+            // tears the connection down rather than run a partial command.
+            c.Close()
+            return
+        }
+    }
+    more, err := cmd.Next() // trailing small args are buffered into Args
+    // ...
+    c.WriteString("OK")
+}), 1<<20) // stream bulks >= 1 MiB
+```
+
+If you reject an argument halfway, either call `cmd.Close()` to discard the
+rest of the command with a bounded buffer and keep serving the next command
+on the same connection, or call `c.Close()` to tear the connection down.
+Handlers that never opt in keep the original buffering behavior unchanged.
+
 *This library is also available for [Rust](https://github.com/tidwall/redcon.rs) and [C](https://github.com/tidwall/redcon.c).*
 
 Installing

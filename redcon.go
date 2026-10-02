@@ -3,6 +3,7 @@ package redcon
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -25,9 +26,16 @@ var (
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
+	errStreamNotFinished      = errors.New("stream command argument was not fully consumed")
+	errBulkLineTooLong        = &errProtocol{"bulk length line too long"}
 )
 
 const maxBufferCap = 262144
+
+// DefaultMaxStreamBulk is the default declared bulk size, in bytes, at or
+// above which a command is delivered to the opt-in stream handler instead of
+// being fully buffered into Command.Args.
+const DefaultMaxStreamBulk = 1 << 20
 
 type errProtocol struct {
 	msg string
@@ -420,7 +428,7 @@ func handle(s *Server, c *conn) {
 			if c.idleClose != 0 {
 				c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
 			}
-			cmds, err := c.rd.readCommands(nil)
+			cmds, scmd, err := c.rd.readCommands(nil, s.maxBulk)
 			if err != nil {
 				if err, ok := err.(*errProtocol); ok {
 					// All protocol errors should attempt a response to
@@ -430,25 +438,91 @@ func handle(s *Server, c *conn) {
 				}
 				return err
 			}
-			c.cmds = cmds
-			for len(c.cmds) > 0 {
-				cmd := c.cmds[0]
-				if len(c.cmds) == 1 {
-					c.cmds = nil
-				} else {
-					c.cmds = c.cmds[1:]
+			if scmd != nil {
+				// A command with a bulk argument at or above the stream
+				// threshold. The argument bytes have not been read yet, so
+				// the command is handed to the opt-in stream handler while
+				// the stream is still open.
+				if s.streamHandler == nil {
+					return errStreamNotFinished
 				}
-				s.handler(c, cmd)
-			}
-			if c.detached {
-				// client has been detached
-				return errDetached
-			}
-			if c.closed {
-				return nil
-			}
-			if err := c.wr.Flush(); err != nil {
-				return err
+				// Commands preceding the stream command in the same
+				// pipeline read are handled first.
+				c.cmds = cmds
+				for len(c.cmds) > 0 {
+					pcmd := c.cmds[0]
+					if len(c.cmds) == 1 {
+						c.cmds = nil
+					} else {
+						c.cmds = c.cmds[1:]
+					}
+					s.handler(c, pcmd)
+				}
+				if c.closed {
+					return nil
+				}
+				if c.detached {
+					// The stream was never entered because a preceding
+					// command detached the connection.
+					return errStreamNotFinished
+				}
+				scmd.conn = c
+				scmd.maxBulk = s.maxBulk
+				s.streamHandler.ServeRESPStream(c, scmd)
+				if c.closed {
+					return nil
+				}
+				if c.detached {
+					// A stream must be fully resolved before a detach.
+					if scmd.err != nil || scmd.phase != scmdDone {
+						return errStreamNotFinished
+					}
+					return errDetached
+				}
+				if scmd.err != nil || scmd.phase != scmdDone {
+					// The handler abandoned a half-read argument. There is
+					// no safe point to resume the protocol, so the
+					// connection is closed instead of executing a partial
+					// command.
+					// Best-effort bounded drain of what the handler did not
+					// consume, so a reply it wrote can still be delivered and
+					// the bytes are skipped with bounded memory. If the drain
+					// fails (short read, cancellation) the connection is
+					// simply closed.
+					if scmd.err == nil {
+						scmd.err = scmd.Close()
+					}
+					// Flush any reply the handler wrote before closing.
+					c.wr.Flush()
+					if scmd.err != nil {
+						return scmd.err
+					}
+					return errStreamNotFinished
+				}
+				if err := c.wr.Flush(); err != nil {
+					return err
+				}
+			} else {
+				c.cmds = cmds
+				for len(c.cmds) > 0 {
+					cmd := c.cmds[0]
+					if len(c.cmds) == 1 {
+						c.cmds = nil
+					} else {
+						c.cmds = c.cmds[1:]
+					}
+					s.handler(c, cmd)
+				}
+				if c.detached {
+					// client has been detached
+					return errDetached
+				}
+				if c.closed {
+					return nil
+				}
+				if err := c.wr.Flush(); err != nil {
+					return err
+				}
 			}
 		}
 	}()
@@ -568,18 +642,276 @@ type Command struct {
 	Args [][]byte
 }
 
+// StreamHandler responds to an RESP request that contains at least one bulk
+// argument whose declared length is at least the server's stream threshold.
+// Unlike the standard handler, the large argument is not buffered into
+// memory; it is read from the connection on demand through the provided
+// StreamCommand.
+//
+// The handler MUST fully consume every streamed argument by the time it
+// returns, either by reading exactly the declared number of bytes or by
+// calling StreamCommand.Close, which drains the remaining arguments with a
+// bounded buffer. If the handler returns while a stream is only partially
+// consumed without calling Close, the server performs a best-effort bounded
+// drain of the rest of the command and then closes the connection rather
+// than execute half a command or desynchronize the protocol stream. A
+// handler can also call Conn.Close directly to reject and tear down the
+// connection without draining.
+type StreamHandler interface {
+	ServeRESPStream(conn Conn, cmd *StreamCommand)
+}
+
+// StreamHandlerFunc is an adapter to allow the use of ordinary functions as
+// StreamHandlers.
+type StreamHandlerFunc func(conn Conn, cmd *StreamCommand)
+
+// ServeRESPStream calls f(conn, cmd).
+func (f StreamHandlerFunc) ServeRESPStream(conn Conn, cmd *StreamCommand) {
+	f(conn, cmd)
+}
+
+// Stream phases.
+const (
+	scmdStream = iota // positioned at the start of a streamed bulk body
+	scmdHeader        // body consumed; trailing header/next args pending
+	scmdDone          // entire command consumed
+	scmdFailed        // an unrecoverable read/protocol error occurred
+)
+
+// StreamCommand represents an RESP command whose large bulk arguments are
+// read from the connection on demand instead of being fully buffered.
+//
+// Args holds the fully-buffered arguments preceding the first streamed
+// argument; the streamed argument occupies a nil slot at StreamIndex. After
+// a successful Next call, smaller arguments following the streamed one are
+// appended to Args and the next large argument (if any) becomes the active
+// stream.
+type StreamCommand struct {
+	// Raw is the RESP header of the command, up to and including the
+	// length line of the first streamed argument.
+	Raw []byte
+	// Args are the command arguments. The streamed argument's slot is nil
+	// while it is being read.
+	Args [][]byte
+
+	conn    *conn
+	rd      *Reader
+	maxBulk int64
+	total   int // declared number of arguments in the array
+
+	argIndex int   // index in Args of the current streamed argument
+	size     int64 // declared size of the current streamed argument
+	remain   int64 // unread bytes of the current streamed argument
+	phase    int
+	err      error
+}
+
+// StreamIndex returns the index in Args of the argument being streamed.
+func (c *StreamCommand) StreamIndex() int { return c.argIndex }
+
+// StreamSize returns the declared size, in bytes, of the streamed argument.
+func (c *StreamCommand) StreamSize() int64 { return c.size }
+
+// Remain returns the number of bytes still unread in the streamed argument.
+func (c *StreamCommand) Remain() int64 { return c.remain }
+
+// Total returns the declared number of arguments in the command.
+func (c *StreamCommand) Total() int { return c.total }
+
+// Err returns the first error encountered while reading the streamed
+// command, if any.
+func (c *StreamCommand) Err() error { return c.err }
+
+// Read reads up to len(p) bytes of the current streamed bulk argument into p.
+// It follows io.Reader semantics: io.EOF is returned once the declared
+// number of bytes have all been read. Read never returns bytes belonging to
+// the trailing CRLF or to another command in the pipeline.
+func (c *StreamCommand) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if c.phase == scmdFailed {
+		return 0, c.err
+	}
+	if c.phase != scmdStream {
+		return 0, io.EOF
+	}
+	if c.remain == 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > c.remain {
+		p = p[:c.remain]
+	}
+	n, err := c.rd.readFull(p)
+	c.remain -= int64(n)
+	if err != nil {
+		c.fail(unwrapEOF(err))
+		return n, c.err
+	}
+	if c.remain == 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// ReadAll reads and returns all remaining bytes of the current streamed
+// argument. It is a convenience for arguments the caller is willing to hold
+// in memory; prefer Read for very large arguments.
+func (c *StreamCommand) ReadAll() ([]byte, error) {
+	if c.phase == scmdFailed {
+		return nil, c.err
+	}
+	if c.phase != scmdStream {
+		return nil, io.EOF
+	}
+	buf := make([]byte, c.remain)
+	if _, err := io.ReadFull(c, buf); err != nil {
+		return buf, err
+	}
+	return buf, nil
+}
+
+// Next consumes the trailing CRLF of the current streamed argument and reads
+// any remaining arguments. Arguments smaller than the stream threshold are
+// buffered and appended to Args. It reports whether another streamed
+// argument follows; when true the caller reads it with Read and calls Next
+// again.
+//
+// Next requires the current argument to be fully read (Remain returns zero);
+// use Read or Close to consume remaining bytes first.
+func (c *StreamCommand) Next() (more bool, err error) {
+	if c.phase == scmdFailed {
+		return false, c.err
+	}
+	if c.phase == scmdDone {
+		return false, nil
+	}
+	if c.remain != 0 {
+		err = errStreamNotFinished
+		c.fail(err)
+		return false, err
+	}
+	if c.phase == scmdStream {
+		if err := c.rd.expectCRLF(); err != nil {
+			c.fail(err)
+			return false, err
+		}
+		c.phase = scmdHeader
+	}
+	for c.argIndex+1 < c.total {
+		line, err := c.rd.readBulkHeader()
+		if err != nil {
+			c.fail(err)
+			return false, err
+		}
+		idx := c.argIndex + 1
+		if line.size >= c.maxBulk {
+			c.argIndex = idx
+			c.ensureSlot(idx)
+			c.size = line.size
+			c.remain = line.size
+			c.phase = scmdStream
+			return true, nil
+		}
+		arg := make([]byte, line.size)
+		if _, err := c.rd.readFull(arg); err != nil {
+			c.fail(unwrapEOF(err))
+			return false, c.err
+		}
+		if err := c.rd.expectCRLF(); err != nil {
+			c.fail(err)
+			return false, err
+		}
+		c.argIndex = idx
+		c.ensureSlot(idx)
+		c.Args[idx] = arg
+	}
+	c.phase = scmdDone
+	return false, nil
+}
+
+// Close finalizes the command. Any unread bytes of the streamed argument and
+// every remaining argument are discarded with a bounded buffer, without
+// allocating the declared length and without reading past the end of the
+// command. After a successful Close the server can safely process the next
+// command on the same connection.
+//
+// When discarding fails (for example on a short read) Close returns the
+// error and the server closes the connection. Close is safe at any point and
+// may be called repeatedly.
+func (c *StreamCommand) Close() error {
+	switch c.phase {
+	case scmdDone:
+		return nil
+	case scmdFailed:
+		return c.err
+	}
+	// Drain the active streamed argument, if it is still open.
+	if c.phase == scmdStream {
+		if c.remain > 0 {
+			if err := c.rd.discard(c.remain); err != nil {
+				c.fail(unwrapEOF(err))
+				return c.err
+			}
+			c.remain = 0
+		}
+		if err := c.rd.expectCRLF(); err != nil {
+			c.fail(err)
+			return err
+		}
+		c.phase = scmdHeader
+	}
+	// Drain the remaining arguments in bounded chunks.
+	for c.argIndex+1 < c.total {
+		line, err := c.rd.readBulkHeader()
+		if err != nil {
+			c.fail(err)
+			return err
+		}
+		if err := c.rd.discardBulk(line.size); err != nil {
+			c.fail(unwrapEOF(err))
+			return c.err
+		}
+		c.argIndex++
+	}
+	c.phase = scmdDone
+	return nil
+}
+
+func (c *StreamCommand) ensureSlot(idx int) {
+	for len(c.Args) <= idx {
+		c.Args = append(c.Args, nil)
+	}
+}
+
+func (c *StreamCommand) fail(err error) {
+	if c.phase != scmdFailed {
+		c.phase = scmdFailed
+		c.err = err
+	}
+}
+
+func unwrapEOF(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
 // Server defines a server for clients for managing client connections.
 type Server struct {
-	mu        sync.Mutex
-	net       string
-	laddr     string
-	handler   func(conn Conn, cmd Command)
-	accept    func(conn Conn) bool
-	closed    func(conn Conn, err error)
-	conns     map[*conn]bool
-	ln        net.Listener
-	done      bool
-	idleClose time.Duration
+	mu            sync.Mutex
+	net           string
+	laddr         string
+	handler       func(conn Conn, cmd Command)
+	streamHandler StreamHandler
+	maxBulk       int64
+	accept        func(conn Conn) bool
+	closed        func(conn Conn, err error)
+	conns         map[*conn]bool
+	ln            net.Listener
+	done          bool
+	idleClose     time.Duration
 
 	// AcceptError is an optional function used to handle Accept errors.
 	AcceptError func(err error)
@@ -783,7 +1115,7 @@ func parseInt(b []byte) (int, bool) {
 	return i, err == nil
 }
 
-func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
+func (rd *Reader) readCommands(leftover *int, maxBulk int64) ([]Command, *StreamCommand, error) {
 	var cmds []Command
 	b := rd.buf[rd.start:rd.end]
 	if rd.end-rd.start == 0 && len(rd.buf) > 4096 {
@@ -825,7 +1157,7 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 								}
 								if c == '"' || c == '\'' {
 									if i != 0 {
-										return nil, errUnbalancedQuotes
+										return nil, nil, errUnbalancedQuotes
 									}
 									quotech = c
 									quote = true
@@ -849,7 +1181,7 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 									cmd.Args = append(cmd.Args, nline)
 									line = line[i+1:]
 									if len(line) > 0 && line[0] != ' ' {
-										return nil, errUnbalancedQuotes
+										return nil, nil, errUnbalancedQuotes
 									}
 									continue outer
 								} else if c == '\\' {
@@ -860,7 +1192,7 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 							nline = append(nline, c)
 						}
 						if quote {
-							return nil, errUnbalancedQuotes
+							return nil, nil, errUnbalancedQuotes
 						}
 						if len(line) > 0 {
 							cmd.Args = append(cmd.Args, line)
@@ -893,11 +1225,14 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 			for i := 1; i < len(b); i++ {
 				if b[i] == '\n' {
 					if b[i-1] != '\r' {
-						return nil, errInvalidMultiBulkLength
+						return nil, nil, errInvalidMultiBulkLength
 					}
+					// The '*' case is only reached when b[0] is the array
+					// header, so the command starts at offset zero.
+					const cmdStart = 0
 					count, ok := parseInt(b[1 : i-1])
 					if !ok || count <= 0 {
-						return nil, errInvalidMultiBulkLength
+						return nil, nil, errInvalidMultiBulkLength
 					}
 					marks = marks[:0]
 					for j := 0; j < count; j++ {
@@ -905,30 +1240,66 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 						i++
 						if i < len(b) {
 							if b[i] != '$' {
-								return nil, &errProtocol{"expected '$', got '" +
+								return nil, nil, &errProtocol{"expected '$', got '" +
 									string(b[i]) + "'"}
 							}
 							si := i
 							for ; i < len(b); i++ {
 								if b[i] == '\n' {
 									if b[i-1] != '\r' {
-										return nil, errInvalidBulkLength
+										return nil, nil, errInvalidBulkLength
 									}
-									size, ok := parseInt(b[si+1 : i-1])
-									if !ok || size < 0 {
-										return nil, errInvalidBulkLength
+									size, perr := parseBulkSize(b[si+1 : i-1])
+									if perr != nil {
+										return nil, nil, perr
 									}
-									if i+size+2 >= len(b) {
+									if maxBulk > 0 && size >= maxBulk {
+										// Large argument: stop parsing here
+										// and expose a live stream.
+										prefix := b[cmdStart : i+1]
+										raw := prefix
+										args := make([][]byte, j)
+										for h := 0; h < len(marks); h += 2 {
+											args[h/2] = prefix[marks[h]:marks[h+1]]
+										}
+										if rd.rd != nil {
+											raw = append([]byte(nil), prefix...)
+											for k := range args {
+												args[k] = append([]byte(nil), args[k]...)
+											}
+										}
+										scmd := &StreamCommand{
+											rd:       rd,
+											Raw:      raw,
+											Args:     args,
+											total:    count,
+											argIndex: j,
+											size:     size,
+											remain:   size,
+											phase:    scmdStream,
+										}
+										// Position at the first body byte.
+										b = b[i+1:]
+										rd.start = rd.end - len(b)
+										return cmds, scmd, nil
+									}
+									n := int(size)
+									if int64(n) != size {
+										// Length overflows the platform's
+										// int and cannot be buffered.
+										return nil, nil, errInvalidBulkLength
+									}
+									if i+n+2 >= len(b) {
 										// not ready
 										break outer2
 									}
-									if b[i+size+2] != '\n' ||
-										b[i+size+1] != '\r' {
-										return nil, errInvalidBulkLength
+									if b[i+n+2] != '\n' ||
+										b[i+n+1] != '\r' {
+										return nil, nil, errInvalidBulkLength
 									}
 									i++
-									marks = append(marks, i, i+size)
-									i += size + 1
+									marks = append(marks, i, i+n)
+									i += n + 1
 									break
 								}
 							}
@@ -968,10 +1339,10 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 		*leftover = rd.end - rd.start
 	}
 	if len(cmds) > 0 {
-		return cmds, nil
+		return cmds, nil, nil
 	}
 	if rd.rd == nil {
-		return nil, errIncompleteCommand
+		return nil, nil, errIncompleteCommand
 	}
 	if rd.end == len(rd.buf) {
 		// at the end of the buffer.
@@ -987,10 +1358,10 @@ func (rd *Reader) readCommands(leftover *int) ([]Command, error) {
 	}
 	n, err := rd.rd.Read(rd.buf[rd.end:])
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	rd.end += n
-	return rd.readCommands(leftover)
+	return rd.readCommands(leftover, maxBulk)
 }
 
 // ReadCommands reads the next pipeline commands.
@@ -1001,7 +1372,7 @@ func (rd *Reader) ReadCommands() ([]Command, error) {
 			rd.cmds = nil
 			return cmds, nil
 		}
-		cmds, err := rd.readCommands(nil)
+		cmds, _, err := rd.readCommands(nil, 0)
 		if err != nil {
 			return []Command{}, err
 		}
@@ -1016,7 +1387,7 @@ func (rd *Reader) ReadCommand() (Command, error) {
 		rd.cmds = rd.cmds[1:]
 		return cmd, nil
 	}
-	cmds, err := rd.readCommands(nil)
+	cmds, _, err := rd.readCommands(nil, 0)
 	if err != nil {
 		return Command{}, err
 	}
@@ -1028,7 +1399,7 @@ func (rd *Reader) ReadCommand() (Command, error) {
 func Parse(raw []byte) (Command, error) {
 	rd := Reader{buf: raw, end: len(raw)}
 	var leftover int
-	cmds, err := rd.readCommands(&leftover)
+	cmds, _, err := rd.readCommands(&leftover, 0)
 	if err != nil {
 		return Command{}, err
 	}
@@ -1037,6 +1408,188 @@ func Parse(raw []byte) (Command, error) {
 	}
 	return cmds[0], nil
 
+}
+
+// streamChunkSize is the maximum number of bytes buffered while streaming a
+// single bulk argument. It bounds memory use regardless of the declared
+// length.
+const streamChunkSize = 1 << 16
+
+// maxBulkLine bounds the length of a "$<len>\r\n" header line so that a
+// malicious or corrupted length line cannot grow the buffer without limit.
+const maxBulkLine = 128
+
+// parseBulkSize parses the decimal payload length from a bulk header line
+// (the bytes between '$' and '\r'). Negative values are invalid, and values
+// that do not fit in int64 are reported as a protocol error.
+func parseBulkSize(b []byte) (int64, error) {
+	n, err := strconv.ParseInt(unsafe.String(unsafe.SliceData(b), len(b)), 10, 64)
+	if err != nil || n < 0 {
+		return 0, errInvalidBulkLength
+	}
+	return n, nil
+}
+
+// bulkHeader is a parsed "$<size>\r\n" line.
+type bulkHeader struct {
+	size int64
+}
+
+// readBulkHeader reads and parses the next bulk argument header.
+func (rd *Reader) readBulkHeader() (bulkHeader, error) {
+	line, err := rd.readLine()
+	if err != nil {
+		return bulkHeader{}, err
+	}
+	if len(line) == 0 || line[0] != '$' {
+		got := ""
+		if len(line) > 0 {
+			got = string(line[0])
+		}
+		return bulkHeader{}, &errProtocol{"expected '$', got '" + got + "'"}
+	}
+	size, err := parseBulkSize(line[1:])
+	if err != nil {
+		return bulkHeader{}, err
+	}
+	return bulkHeader{size: size}, nil
+}
+
+// readLine reads the next CR/LF terminated line (without the terminator),
+// growing the internal buffer by at most maxBulkLine bytes while doing so.
+func (rd *Reader) readLine() ([]byte, error) {
+	for {
+		b := rd.buf[rd.start:rd.end]
+		if i := bytes.IndexByte(b, '\n'); i >= 0 {
+			if i == 0 || b[i-1] != '\r' {
+				return nil, errInvalidBulkLength
+			}
+			line := b[:i-1]
+			rd.start += i + 1
+			return line, nil
+		}
+		if rd.end-rd.start >= maxBulkLine {
+			return nil, errBulkLineTooLong
+		}
+		if err := rd.fill(streamChunkSize); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// fill makes at least one more byte available to read, compacting and
+// growing the buffer as needed, never beyond max bytes of capacity.
+func (rd *Reader) fill(max int) error {
+	if rd.rd == nil {
+		return io.EOF
+	}
+	if rd.start > 0 {
+		copy(rd.buf, rd.buf[rd.start:rd.end])
+		rd.end -= rd.start
+		rd.start = 0
+	}
+	if rd.end == len(rd.buf) {
+		n := len(rd.buf) * 2
+		if n > max {
+			n = max
+		}
+		if n <= len(rd.buf) {
+			n = len(rd.buf) + 1
+			if n > max {
+				return errBulkLineTooLong
+			}
+		}
+		newbuf := make([]byte, n)
+		copy(newbuf, rd.buf[:rd.end])
+		rd.buf = newbuf
+	}
+	n, err := rd.rd.Read(rd.buf[rd.end:])
+	rd.end += n
+	if n > 0 {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return io.EOF
+}
+
+// readStream returns up to n bytes of the active bulk body without reading
+// past it. The returned slice aliases the internal buffer; bytes are
+// consumed from the stream.
+func (rd *Reader) readStream(n int64) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	b := rd.buf[rd.start:rd.end]
+	if len(b) == 0 {
+		if err := rd.fill(streamChunkSize); err != nil {
+			return nil, err
+		}
+		b = rd.buf[rd.start:rd.end]
+	}
+	if int64(len(b)) > n {
+		b = b[:n]
+	}
+	rd.start += len(b)
+	return b, nil
+}
+
+// readFull reads exactly len(p) bytes of the active bulk body.
+func (rd *Reader) readFull(p []byte) (int, error) {
+	off := 0
+	for off < len(p) {
+		chunk, err := rd.readStream(int64(len(p) - off))
+		if len(chunk) > 0 {
+			off += copy(p[off:], chunk)
+		}
+		if err != nil {
+			return off, err
+		}
+		if len(chunk) == 0 {
+			return off, io.EOF
+		}
+	}
+	return off, nil
+}
+
+// discard drops exactly n bytes of the active bulk body using bounded
+// memory. It never reads beyond the declared boundary.
+func (rd *Reader) discard(n int64) error {
+	for n > 0 {
+		chunk, err := rd.readStream(n)
+		if len(chunk) > 0 {
+			n -= int64(len(chunk))
+		}
+		if err != nil {
+			return err
+		}
+		if len(chunk) == 0 {
+			return io.EOF
+		}
+	}
+	return nil
+}
+
+// discardBulk drops a full bulk argument: its size-byte payload plus the
+// trailing CRLF. The terminator is verified to be CRLF.
+func (rd *Reader) discardBulk(size int64) error {
+	if err := rd.discard(size); err != nil {
+		return err
+	}
+	return rd.expectCRLF()
+}
+
+// expectCRLF consumes and verifies a two-byte CRLF sequence.
+func (rd *Reader) expectCRLF() error {
+	var crlf [2]byte
+	if _, err := rd.readFull(crlf[:]); err != nil {
+		return err
+	}
+	if crlf[0] != '\r' || crlf[1] != '\n' {
+		return errInvalidBulkLength
+	}
+	return nil
 }
 
 // A Handler responds to an RESP request.
@@ -1442,5 +1995,22 @@ func (ps *PubSub) unsubscribe(conn Conn, pattern, all bool, channel string) {
 func (s *Server) SetIdleClose(dur time.Duration) {
 	s.mu.Lock()
 	s.idleClose = dur
+	s.mu.Unlock()
+}
+
+// SetStreamHandler opts in to streaming command handling. Commands that
+// contain a bulk argument with a declared length of at least maxBulk bytes
+// are delivered to h instead of being fully buffered and passed to the
+// regular handler. A maxBulk value <= 0 uses DefaultMaxStreamBulk.
+//
+// The regular handler continues to handle all other commands unchanged,
+// including commands whose arguments are all smaller than maxBulk.
+func (s *Server) SetStreamHandler(h StreamHandler, maxBulk int64) {
+	if maxBulk <= 0 {
+		maxBulk = DefaultMaxStreamBulk
+	}
+	s.mu.Lock()
+	s.streamHandler = h
+	s.maxBulk = maxBulk
 	s.mu.Unlock()
 }
