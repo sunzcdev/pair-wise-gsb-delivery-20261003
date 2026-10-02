@@ -356,6 +356,36 @@ Progressive decoding is particularly useful for distributed storage systems, net
 
 While this can be used for regular reconstruction, typically that will be slightly faster and easier to use.
 
+# Error correction
+
+`Reconstruct` only handles *missing* shards and trusts the content of every shard that is present.
+When the storage layer can tell that a shard set is inconsistent (for example from a checksum)
+but not *which* shard is bad, use `CorrectErrors` from the optional `ErrorCorrection` interface:
+
+```Go
+enc, _ := reedsolomon.New(10, 4)
+ec := enc.(reedsolomon.ErrorCorrection)
+corrupted, err := ec.CorrectErrors(shards) // shards: nil = missing, non-nil = untrusted
+```
+
+`CorrectErrors` treats every non-empty shard as untrusted, locates corrupted shards,
+repairs them and fills in missing ones. It returns the indices of the corrupted shards it repaired.
+
+Guarantees and limits:
+
+* With `p` parity shards, recovery of the original data is **guaranteed** while
+  `2*e + s <= p`, where `e` is the number of corrupted shards and `s` the number of missing shards.
+* Beyond that bound, detection is not guaranteed: the call may return `ErrCannotCorrect`,
+  but may also return a consistent yet wrong result. A successful return - like a successful
+  `Verify` or any single re-encode comparison - is not a proof that the data is the original;
+  only the `2*e + s <= p` bound provides that guarantee.
+* Supported matrix: the **default Vandermonde-based matrix only**.
+  Encoders created `WithCauchyMatrix`, `WithPAR1Matrix`, `WithJerasureMatrix`,
+  `WithCustomMatrix`, `WithFastOneParityMatrix` or a leopard mode return `ErrNotSupported`.
+* On error the input shards are left unmodified.
+
+When intact shards are known to be trustworthy, `Reconstruct` remains the faster erasure-only path.
+
 # Streaming/Merging
 
 It might seem like a limitation that all data should be in memory, 
