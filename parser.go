@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Parser parses JSON.
@@ -15,11 +16,64 @@ import (
 // Parser cannot be used from concurrent goroutines.
 // Use per-goroutine parsers or ParserPool instead.
 type Parser struct {
+	// MaxDepth limits the maximum depth of nested JSON values.
+	//
+	// If zero, the default MaxDepth is used.
+	// If negative, the depth isn't limited.
+	MaxDepth int
+
+	// MaxNodes limits the total number of parsed JSON values (nodes),
+	// including the root value, array elements and object values.
+	// Object keys aren't counted as nodes; they count towards MaxStringBytes.
+	//
+	// If zero or negative, the number of nodes isn't limited.
+	MaxNodes int
+
+	// MaxStringBytes limits the total size in bytes of decoded JSON strings,
+	// including object keys. Escape sequences are counted after decoding,
+	// e.g. `\n` counts as a single byte.
+	//
+	// If zero or negative, the total string size isn't limited.
+	MaxStringBytes int
+
 	// b contains working copy of the string to be parsed.
 	b []byte
 
 	// c is a cache for json values.
 	c cache
+}
+
+// Names of the limits reported by LimitError.Limit.
+const (
+	// LimitDepth is the limit on the depth of nested JSON values.
+	LimitDepth = "depth"
+
+	// LimitNodes is the limit on the total number of parsed JSON values.
+	LimitNodes = "nodes"
+
+	// LimitStringBytes is the limit on the total size of decoded JSON strings.
+	LimitStringBytes = "string_bytes"
+)
+
+// LimitError is returned by Parser.Parse when a limit configured
+// on the Parser is exceeded during parsing.
+type LimitError struct {
+	// Limit is the name of the exceeded limit - one of LimitDepth,
+	// LimitNodes or LimitStringBytes.
+	Limit string
+
+	// Max is the configured limit value.
+	Max int
+
+	// Offset is the byte position in the original input at which
+	// the limit has been exceeded.
+	Offset int
+}
+
+// Error returns error message containing the exceeded limit
+// and the byte offset in the original input.
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("%s limit of %d exceeded at byte offset %d", e.Limit, e.Max, e.Offset)
 }
 
 // Parse parses s containing JSON.
@@ -28,13 +82,18 @@ type Parser struct {
 //
 // Use Scanner if a stream of JSON values must be parsed.
 func (p *Parser) Parse(s string) (*Value, error) {
-	s = skipWS(s)
-	p.b = append(p.b[:0], s...)
+	trimmed := skipWS(s)
+	p.b = append(p.b[:0], trimmed...)
 	p.c.reset()
+	p.c.maxDepth = p.MaxDepth
+	p.c.maxNodes = p.MaxNodes
+	p.c.maxStringBytes = p.MaxStringBytes
+	p.c.inputLen = len(p.b)
+	p.c.baseOffset = len(s) - len(trimmed)
 
 	v, tail, err := p.c.parseValue(b2s(p.b), 0)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
+		return nil, fmt.Errorf("cannot parse JSON: %w; unparsed tail: %q", err, startEndString(tail))
 	}
 	tail = skipWS(tail)
 	if len(tail) > 0 {
@@ -54,6 +113,23 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 
 type cache struct {
 	vs []Value
+
+	// Limits copied from the Parser before each parse.
+	// Zero values keep the default behavior.
+	maxDepth       int
+	maxNodes       int
+	maxStringBytes int
+
+	// Counters for the current parse. They are reset on each parse,
+	// so a failed parse doesn't leak counts into the next one.
+	nodes       int
+	stringBytes int
+
+	// inputLen is the length of the buffer passed to parseValue.
+	// baseOffset is the position of the buffer start in the original input.
+	// They are used for reporting byte offsets in LimitError.
+	inputLen   int
+	baseOffset int
 }
 
 func (c *cache) reset() {
@@ -62,6 +138,31 @@ func (c *cache) reset() {
 		vs[i].reset()
 	}
 	c.vs = vs[:0]
+	c.nodes = 0
+	c.stringBytes = 0
+}
+
+// offset returns the byte position of the given tail in the original input.
+func (c *cache) offset(tail string) int {
+	off := c.baseOffset + c.inputLen - len(tail)
+	if off < 0 {
+		off = 0
+	}
+	return off
+}
+
+// addStringBytes accounts for the decoded size of the given raw JSON string
+// and returns a LimitError if MaxStringBytes is exceeded.
+// tok must point at the string token in the parsed input.
+func (c *cache) addStringBytes(raw, tok string) error {
+	if c.maxStringBytes <= 0 {
+		return nil
+	}
+	c.stringBytes += unescapedLen(raw)
+	if c.stringBytes > c.maxStringBytes {
+		return &LimitError{Limit: LimitStringBytes, Max: c.maxStringBytes, Offset: c.offset(tok)}
+	}
+	return nil
 }
 
 func (c *cache) getValue() *Value {
@@ -106,21 +207,31 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 		return nil, s, fmt.Errorf("cannot parse empty string")
 	}
 	depth++
-	if depth > MaxDepth {
-		return nil, s, fmt.Errorf("too big depth for the nested JSON; it exceeds %d", MaxDepth)
+	maxDepth := c.maxDepth
+	if maxDepth == 0 {
+		maxDepth = MaxDepth
+	}
+	if maxDepth > 0 && depth > maxDepth {
+		return nil, s, &LimitError{Limit: LimitDepth, Max: maxDepth, Offset: c.offset(s)}
+	}
+	if c.maxNodes > 0 {
+		c.nodes++
+		if c.nodes > c.maxNodes {
+			return nil, s, &LimitError{Limit: LimitNodes, Max: c.maxNodes, Offset: c.offset(s)}
+		}
 	}
 
 	if s[0] == '{' {
 		v, tail, err := c.parseObject(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse object: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse object: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '[' {
 		v, tail, err := c.parseArray(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse array: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse array: %w", err)
 		}
 		return v, tail, nil
 	}
@@ -128,6 +239,9 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 		ss, tail, err := parseRawString(s[1:])
 		if err != nil {
 			return nil, tail, fmt.Errorf("cannot parse string: %s", err)
+		}
+		if err := c.addStringBytes(ss, s); err != nil {
+			return nil, s, err
 		}
 		v := c.getValue()
 		v.t = typeRawString
@@ -193,7 +307,7 @@ func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse array value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse array value: %w", err)
 		}
 		a.a = append(a.a, v)
 
@@ -238,9 +352,13 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		if len(s) == 0 || s[0] != '"' {
 			return nil, s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
+		keyTok := s
 		kv.k, s, err = parseRawKey(s[1:])
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
+		}
+		if err := c.addStringBytes(kv.k, keyTok); err != nil {
+			return nil, keyTok, err
 		}
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
@@ -252,7 +370,7 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		kv.v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object value: %w", err)
 		}
 		s = skipWS(s)
 		if len(s) == 0 {
@@ -373,6 +491,73 @@ func unescapeStringBestEffort(s string) string {
 		s = s[n+1:]
 	}
 	return b2s(b)
+}
+
+// unescapedLen returns the length of s after JSON unescaping.
+//
+// s must contain a raw JSON string without the surrounding quotes.
+// The result matches len(unescapeStringBestEffort(s)).
+func unescapedLen(s string) int {
+	n := strings.IndexByte(s, '\\')
+	if n < 0 {
+		// Fast path - nothing to unescape.
+		return len(s)
+	}
+
+	// Slow path - count the unescaped string length.
+	length := n
+	s = s[n+1:]
+	for len(s) > 0 {
+		ch := s[0]
+		s = s[1:]
+		switch ch {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			length++
+		case 'u':
+			if len(s) < 4 {
+				// Too short escape sequence. It is stored unchanged.
+				length += len("\\u")
+				break
+			}
+			xs := s[:4]
+			x, err := strconv.ParseUint(xs, 16, 16)
+			if err != nil {
+				// Invalid escape sequence. It is stored unchanged.
+				length += len("\\u")
+				break
+			}
+			s = s[4:]
+			if !utf16.IsSurrogate(rune(x)) {
+				length += utf8.RuneLen(rune(x))
+				break
+			}
+
+			// Surrogate.
+			if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+				length += len("\\u") + len(xs)
+				break
+			}
+			x1, err := strconv.ParseUint(s[2:6], 16, 16)
+			if err != nil {
+				length += len("\\u") + len(xs)
+				break
+			}
+			r := utf16.DecodeRune(rune(x), rune(x1))
+			length += utf8.RuneLen(r)
+			s = s[6:]
+		default:
+			// Unknown escape sequence. It is stored unchanged.
+			length += 2
+		}
+		n = strings.IndexByte(s, '\\')
+		if n < 0 {
+			length += len(s)
+			break
+		}
+		length += n
+		s = s[n+1:]
+	}
+	return length
 }
 
 // parseRawKey is similar to parseRawString, but is optimized

@@ -85,6 +85,24 @@ See also [examples](https://godoc.org/github.com/valyala/fastjson#pkg-examples).
   * `fastjson` requires up to `sizeof(Value) * len(inputJSON)` bytes of memory
     for parsing `inputJSON` string. Limit the maximum size of the `inputJSON`
     before parsing it in order to limit the maximum memory usage.
+  * `Parser` may be configured with limits on untrusted input - `MaxDepth`
+    for the maximum nesting depth, `MaxNodes` for the maximum number of JSON
+    values and `MaxStringBytes` for the maximum total size of decoded strings
+    (object keys included). The limits are enforced during parsing; exceeding
+    one returns a `LimitError` pointing at the exceeded limit and the byte
+    offset in the original input:
+
+```go
+        var p fastjson.Parser
+        p.MaxDepth = 10
+        p.MaxNodes = 1000
+        p.MaxStringBytes = 1 << 20
+        v, err := p.Parse(untrustedJSON)
+        var le *fastjson.LimitError
+        if errors.As(err, &le) {
+                log.Printf("input exceeds the %s limit at offset %d", le.Limit, le.Offset)
+        }
+```
 
 
 ## Performance optimization tips

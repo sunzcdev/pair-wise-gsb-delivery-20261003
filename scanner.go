@@ -65,6 +65,8 @@ func (sc *Scanner) Next() bool {
 	}
 
 	sc.c.reset()
+	sc.c.inputLen = len(sc.s)
+	sc.c.baseOffset = len(sc.b) - len(sc.s)
 	v, tail, err := sc.c.parseValue(sc.s, 0)
 	if err != nil {
 		sc.err = err
