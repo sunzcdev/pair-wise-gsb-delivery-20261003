@@ -2,11 +2,19 @@ package gojq
 
 import (
 	"context"
+	"errors"
 	"math"
 	"reflect"
 	"slices"
 	"strings"
 )
+
+// inputIterFunc is the sentinel value of an opcall operand for the input
+// built-in function. The iterator is resolved per run in the executing env,
+// so concurrent or sequential runs never share input values.
+type inputIterFuncType struct{}
+
+var inputIterFunc = inputIterFuncType{}
 
 func (env *env) execute(bc *Code, v any, vars ...any) Iter {
 	env.codes = bc.codes
@@ -17,6 +25,33 @@ func (env *env) execute(bc *Code, v any, vars ...any) Iter {
 	}
 	env.debugCodes()
 	return env
+}
+
+// readInput returns the next value of the input iterator bound to this run.
+// It returns a "break" error on EOF so that inputs terminates normally, while
+// any other error yielded by the iterator propagates as an error value,
+// following the jq semantics of input/inputs.
+func (env *env) readInput() any {
+	if env.inputIter == nil {
+		return &inputNotAllowedError{}
+	}
+	v, ok := env.inputIter.Next()
+	if !ok {
+		return errors.New("break")
+	}
+	return v
+}
+
+// Close releases the input iterator owned by the run, if any. The result
+// iterator is closed automatically when it is fully drained, but a caller that
+// stops a run early (for example on an error, halt, or context cancellation)
+// must call Close explicitly. It is safe to call Close multiple times.
+func (env *env) Close() error {
+	if env.closeInput == nil || env.inputClosed {
+		return nil
+	}
+	env.inputClosed = true
+	return env.closeInput.Close()
 }
 
 func (env *env) Next() (any, bool) {
@@ -182,7 +217,12 @@ loop:
 				for i := range argcnt {
 					args[i] = env.pop()
 				}
-				w := v[0].(func(any, []any) any)(x, args)
+				var w any
+				if _, ok := v[0].(inputIterFuncType); ok {
+					w = env.readInput()
+				} else {
+					w = v[0].(func(any, []any) any)(x, args)
+				}
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
@@ -356,6 +396,7 @@ loop:
 	if err != nil {
 		return err, true
 	}
+	env.Close()
 	return nil, false
 }
 

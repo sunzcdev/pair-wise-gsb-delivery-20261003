@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +31,7 @@ type Code struct {
 	variables []string
 	codes     []*code
 	codeinfos []codeinfo
+	inputIter Iter
 }
 
 // Run runs the code with the variable values (which should be in the
@@ -38,17 +40,62 @@ type Code struct {
 //
 // It is safe to call this method in goroutines, to reuse a compiled [*Code].
 func (c *Code) Run(v any, values ...any) Iter {
-	return c.RunWithContext(context.Background(), v, values...)
+	return c.RunWith(v, nil, values...)
 }
 
 // RunWithContext runs the code with context.
 func (c *Code) RunWithContext(ctx context.Context, v any, values ...any) Iter {
+	return c.RunWithWithContext(ctx, v, nil, values...)
+}
+
+// RunWith runs the code with the input iterator bound to the run, the variable
+// values (which should be in the same order as the given variables using
+// [WithVariables]) and returns a result iterator.
+//
+// Unlike the compile-time iterator configured by [WithInputIter], which is
+// shared across every [*Code.Run], the iterator passed here is owned by this
+// single run. Reusing a compiled [*Code] with a fresh iterator for each run
+// keeps input/inputs isolated between requests; one run never consumes values
+// bound to another run. The iterator is read lazily, only when the execution
+// actually calls input or inputs.
+//
+// A non-nil inputIter takes precedence over the iterator configured by
+// [WithInputIter]; passing nil falls back to the compile-time iterator.
+//
+// The returned iterator always implements [io.Closer]. When inputIter does
+// too, it is closed automatically once the result iterator is fully drained
+// (Next returns false). If the run is stopped early (including on an error,
+// halt or context cancellation), the caller is responsible for calling Close;
+// Close is idempotent. The compile-time iterator of [WithInputIter] is never
+// closed.
+//
+// It is safe to call this method in goroutines, to reuse a compiled [*Code].
+func (c *Code) RunWith(v any, inputIter Iter, values ...any) Iter {
+	return c.RunWithWithContext(context.Background(), v, inputIter, values...)
+}
+
+// RunWithWithContext runs the code with context. See [Code.RunWith] for the
+// ownership and closing contract of inputIter.
+func (c *Code) RunWithWithContext(
+	ctx context.Context, v any, inputIter Iter, values ...any,
+) Iter {
 	if len(values) > len(c.variables) {
 		return NewIter(&tooManyVariableValuesError{})
 	} else if len(values) < len(c.variables) {
 		return NewIter(&expectedVariableError{c.variables[len(values)]})
 	}
-	return newEnv(ctx).execute(c, v, values...)
+	ownsInput := inputIter != nil
+	if inputIter == nil {
+		inputIter = c.inputIter
+	}
+	env := newEnv(ctx)
+	env.inputIter = inputIter
+	if ownsInput {
+		if closer, ok := inputIter.(io.Closer); ok {
+			env.closeInput = closer
+		}
+	}
+	return env.execute(c, v, values...)
 }
 
 type scopeinfo struct {
@@ -115,6 +162,7 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 		variables: c.variables,
 		codes:     c.codes,
 		codeinfos: c.codeinfos,
+		inputIter: c.inputIter,
 	}, nil
 }
 
@@ -963,11 +1011,8 @@ func (c *compiler) compileFunc(e *Func) error {
 				-1,
 			)
 		case "input":
-			if c.inputIter == nil {
-				return &inputNotAllowedError{}
-			}
 			return c.compileCallInternal(
-				[3]any{c.funcInput, 0, e.Name},
+				[3]any{inputIterFunc, 0, e.Name},
 				e.Args,
 				true,
 				-1,
@@ -1200,14 +1245,6 @@ func (c *compiler) funcBuiltins(any, []any) any {
 		ys[i] = x.name + "/" + strconv.Itoa(x.arity)
 	}
 	return ys
-}
-
-func (c *compiler) funcInput(any, []any) any {
-	v, ok := c.inputIter.Next()
-	if !ok {
-		return errors.New("break")
-	}
-	return v
 }
 
 func (c *compiler) funcModulemeta(v any, _ []any) any {

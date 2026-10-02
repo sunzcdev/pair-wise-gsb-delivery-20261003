@@ -84,11 +84,21 @@ func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []
 	}
 }
 
-// WithInputIter is a compiler option for input iterator used by input(s)/0.
-// Note that input and inputs functions are not allowed by default. We have
-// to distinguish the query input and the values for input(s) functions. For
-// example, consider using inputs with --null-input. If you want to allow
-// input(s) functions, create an [Iter] and use WithInputIter option.
+// WithInputIter is a compiler option for the input iterator used by
+// input(s)/0. The iterator is shared across every [*Code.Run] of the compiled
+// code, so values consumed by one run are not available to the others. It is
+// never closed automatically.
+//
+// To bind an isolated input source to each run (so a single compiled code can
+// serve multiple requests without them consuming each other's data), use
+// [*Code.RunWith] or [*Code.RunWithWithContext] instead. An iterator passed
+// at run time takes precedence over this option; pass nil to fall back to the
+// iterator configured here.
+//
+// We have to distinguish the query input and the values for input(s)
+// functions. For example, consider using inputs with --null-input. When
+// neither this option nor a run-time iterator is provided, input and inputs
+// emit an error when executed.
 func WithInputIter(inputIter Iter) CompilerOption {
 	return func(c *compiler) {
 		c.inputIter = inputIter
