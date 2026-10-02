@@ -27,6 +27,58 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+Inter-table References
+======================
+
+A table may declare references (foreign keys) to unique indexes of other
+tables. Referential integrity is checked when the write transaction is
+committed, against the transaction's own pending view, so a child row may be
+inserted before its parent within the same transaction. `Commit` now returns
+an error (wrapping `ErrReferenceViolation`) when a reference cannot be
+satisfied; a failed commit publishes nothing, fires no watch notifications,
+and does not run deferred functions.
+
+Two delete actions are supported on each reference:
+
+* `restrict` (the default) prevents deleting a parent row that is still
+  referenced by a surviving child row.
+* `cascade` deletes the referencing child rows when the parent is deleted.
+  Cascades propagate transitively across chains and cycles, and each distinct
+  child row is deleted at most once even when reached through multiple paths.
+
+Reference columns reuse a table's existing single-value indexes; an
+`AllowMissing` index acts as a nullable foreign key. Tables that declare no
+references behave exactly as before.
+
+```go
+schema := &memdb.DBSchema{
+	Tables: map[string]*memdb.TableSchema{
+		"node": &memdb.TableSchema{
+			Name: "node",
+			Indexes: map[string]*memdb.IndexSchema{
+				"id":     {Name: "id", Unique: true, Indexer: &memdb.StringFieldIndex{Field: "ID"}},
+				"parent": {Name: "parent", Indexer: &memdb.StringFieldIndex{Field: "Parent"}, AllowMissing: true},
+			},
+			References: []*memdb.ReferenceSchema{
+				{
+					Name:         "node-parent",
+					LocalIndex:   "parent", // column in this table
+					ForeignTable: "node",   // referenced table
+					OnDelete:     memdb.ReferenceActionRestrict, // or ReferenceActionCascade
+				},
+			},
+		},
+	},
+}
+
+txn := db.Txn(true)
+txn.Insert("node", &Node{ID: "child", Parent: "parent"})
+txn.Insert("node", &Node{ID: "parent"})
+if err := txn.Commit(); err != nil {
+	// handle ErrReferenceViolation
+}
+```
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation

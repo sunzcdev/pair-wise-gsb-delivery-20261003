@@ -20,6 +20,13 @@ const (
 var (
 	// ErrNotFound is returned when the requested item is not found
 	ErrNotFound = fmt.Errorf("not found")
+
+	// ErrReferenceViolation is returned when a write transaction would
+	// leave a declared reference unsatisfied: either a child row references a
+	// parent that is absent, or a parent row referenced with the "restrict"
+	// delete action is being deleted. A failed commit makes no changes and no
+	// watch notifications are issued.
+	ErrReferenceViolation = fmt.Errorf("reference violation")
 )
 
 // tableIndex is a tuple of (Table, Index) used for lookups
@@ -41,6 +48,33 @@ type Txn struct {
 	changes Changes
 
 	modified map[tableIndex]*iradix.Txn
+
+	// mutated tracks the net effect of the transaction on every touched row,
+	// independent of whether change tracking was requested. It backs the
+	// commit-time reference validation and cascading deletes.
+	mutated map[objectID]*mutationState
+}
+
+// mutationState records the latest known state of a single row within a
+// write transaction.
+type mutationState struct {
+	// table the row belongs to.
+	table string
+
+	// original is the value the row had when the transaction first touched
+	// it (nil if it did not exist in the starting snapshot).
+	original interface{}
+
+	// latest value written by the transaction; nil if the row's net effect
+	// is a deletion.
+	latest interface{}
+
+	// present records whether latest currently exists in the pending view.
+	present bool
+
+	// existed records whether the row existed in the snapshot the
+	// transaction started from.
+	existed bool
 }
 
 // TrackChanges enables change tracking for the transaction. If called at any
@@ -104,6 +138,28 @@ func (txn *Txn) writableIndex(table, index string) *iradix.Txn {
 	return indexTxn
 }
 
+// trackMutation records the current net state of a row within the write
+// transaction. existed reflects whether the row was present in the snapshot
+// the transaction started from; original is the value read at the first
+// touch; present/latest reflect the pending state.
+func (txn *Txn) trackMutation(table string, idVal []byte, existed bool, original, latest interface{}, present bool) {
+	if txn.mutated == nil {
+		txn.mutated = make(map[objectID]*mutationState)
+	}
+	oid := objectID{Table: table, IndexVal: string(idVal)}
+	state, ok := txn.mutated[oid]
+	if !ok {
+		state = &mutationState{table: table, existed: existed, original: original}
+		txn.mutated[oid] = state
+	}
+	state.present = present
+	if present {
+		state.latest = latest
+	} else {
+		state.latest = nil
+	}
+}
+
 // Abort is used to cancel this transaction.
 // This is a noop for read transactions,
 // already aborted or commited transactions.
@@ -122,6 +178,7 @@ func (txn *Txn) Abort() {
 	txn.rootTxn = nil
 	txn.modified = nil
 	txn.changes = nil
+	txn.mutated = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -130,15 +187,30 @@ func (txn *Txn) Abort() {
 // Commit is used to finalize this transaction.
 // This is a noop for read transactions,
 // already aborted or committed transactions.
-func (txn *Txn) Commit() {
+//
+// If the table schema declares references, referential integrity is checked
+// against the transaction's pending view just before the commit becomes
+// visible. Cascade deletions are applied first, then any remaining reference
+// violation returns an error (wrapping ErrReferenceViolation). On failure the
+// transaction is aborted: no partial index changes are published, no watch
+// notifications fire, and deferred functions do not run.
+func (txn *Txn) Commit() error {
 	// Noop for a read transaction
 	if !txn.write {
-		return
+		return nil
 	}
 
 	// Check if already aborted or committed
 	if txn.rootTxn == nil {
-		return
+		return nil
+	}
+
+	// Enforce declared references against the pending view. This runs before
+	// any index is committed so that a failure leaves the database and all
+	// watchers completely untouched.
+	if err := txn.applyReferences(); err != nil {
+		txn.Abort()
+		return err
 	}
 
 	// Commit each sub-transaction scoped to (table, index)
@@ -164,6 +236,7 @@ func (txn *Txn) Commit() {
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.modified = nil
+	txn.mutated = nil
 
 	// Release the writer lock since this is invalid
 	txn.db.writer.Unlock()
@@ -173,6 +246,8 @@ func (txn *Txn) Commit() {
 		fn := txn.after[i-1]
 		fn()
 	}
+
+	return nil
 }
 
 // Insert is used to add or update an object into the given table.
@@ -299,6 +374,7 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 			primaryKey: idVal,
 		})
 	}
+	txn.trackMutation(table, idVal, update, existing, obj, true)
 	return nil
 }
 
@@ -374,6 +450,7 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 			primaryKey: idVal,
 		})
 	}
+	txn.trackMutation(table, idVal, true, existing, nil, false)
 	return nil
 }
 
@@ -431,6 +508,18 @@ func (txn *Txn) DeletePrefix(table string, prefix_index string, prefix string) (
 				})
 			}
 		}
+		// Determine whether the row existed in the starting snapshot and
+		// capture its original value, unless it was first inserted earlier
+		// in this same transaction.
+		var original interface{}
+		existed := true
+		if state, ok := txn.mutated[objectID{Table: table, IndexVal: string(idVal)}]; ok {
+			existed = state.existed
+			original = state.original
+		} else {
+			original = entry
+		}
+		txn.trackMutation(table, idVal, existed, original, nil, false)
 		// Remove the object from all the indexes except the given prefix index
 		for name, indexSchema := range tableSchema.Indexes {
 			if name == deletePrefixIndex {
