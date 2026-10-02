@@ -47,3 +47,29 @@ func IsErrEmptyKeyName(err error) bool {
 func (err ErrEmptyKeyName) Error() string {
 	return fmt.Sprintf("empty key name: %s", err.Line)
 }
+
+// ErrReloadSource indicates that a data source failed to load during a
+// transactional Reload. The previous configuration is left untouched when
+// this error is returned.
+type ErrReloadSource struct {
+	// Index is the position of the failing source in the file's data source list.
+	Index int
+	// Err is the underlying error occurred while opening, reading, parsing or
+	// closing the data source.
+	Err error
+}
+
+// IsErrReloadSource returns true if the given error is an instance of ErrReloadSource.
+func IsErrReloadSource(err error) bool {
+	_, ok := err.(ErrReloadSource)
+	return ok
+}
+
+func (err ErrReloadSource) Error() string {
+	return fmt.Sprintf("failed to reload data source #%d: %v", err.Index, err.Err)
+}
+
+// Unwrap returns the underlying error of the failing data source.
+func (err ErrReloadSource) Unwrap() error {
+	return err.Err
+}

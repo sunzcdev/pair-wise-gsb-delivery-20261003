@@ -292,22 +292,33 @@ func (f *File) reload(s dataSource) error {
 	if err != nil {
 		return err
 	}
-	defer r.Close()
 
-	return f.parse(r)
+	perr := f.parse(r)
+
+	// A source is only considered loaded when its reader also closes without
+	// error. A close failure may indicate truncated or incompletely consumed
+	// data, so it is reported the same way as a read or parse error instead of
+	// being silently ignored.
+	cerr := r.Close()
+	if perr != nil {
+		return perr
+	}
+	return cerr
 }
 
-// Reload reloads and parses all data sources.
-func (f *File) Reload() (err error) {
-	for _, s := range f.dataSources {
-		if err = f.reload(s); err != nil {
+// load reads and parses all data sources of the file in order.
+func (f *File) load() error {
+	for i, s := range f.dataSources {
+		if err := f.reload(s); err != nil {
 			// In loose mode, we create an empty default section for nonexistent files.
 			if os.IsNotExist(err) && f.options.Loose {
 				_ = f.parse(bytes.NewBuffer(nil))
 				continue
 			}
-			return err
+			return ErrReloadSource{Index: i, Err: err}
 		}
+		// In short-circuit mode, all remaining sources are ignored once the
+		// first source has been loaded successfully.
 		if f.options.ShortCircuit {
 			return nil
 		}
@@ -315,21 +326,74 @@ func (f *File) Reload() (err error) {
 	return nil
 }
 
+// Reload reloads and parses all data sources.
+//
+// The reload is transactional: every data source is read and parsed into a
+// detached in-memory copy first, and the current configuration (sections,
+// keys, comments, shadows) along with the data source list is only replaced
+// after all sources have been loaded successfully. When any source fails, an
+// ErrReloadSource is returned to identify the failing source, and the
+// previous configuration and data source list are left untouched, so the file
+// remains fully queryable and can be reloaded again.
+//
+// LoadOptions.Loose and LoadOptions.ShortCircuit keep their effects during
+// reload: Loose tolerates nonexistent files by parsing an empty default
+// section for them, and ShortCircuit stops after the first successfully
+// loaded source. Errors returned by closing a source reader are treated as
+// load failures of that source, not silently discarded.
+func (f *File) Reload() error {
+	return f.reloadSources(f.dataSources)
+}
+
+// reloadSources transactionally replaces the current configuration with the
+// content of the given data sources. The data source list of the file is only
+// replaced along with a successful reload.
+func (f *File) reloadSources(sources []dataSource) error {
+	// Parse into a detached file so a failure midway does not corrupt the
+	// current configuration. The detached file does not need locking.
+	nf := newFile(sources, f.options)
+	nf.BlockMode = false
+	nf.NameMapper = f.NameMapper
+	nf.ValueMapper = f.ValueMapper
+	if err := nf.load(); err != nil {
+		return err
+	}
+
+	if f.BlockMode {
+		f.lock.Lock()
+		defer f.lock.Unlock()
+	}
+
+	// Re-parent sections to this file before swapping the state.
+	for _, secs := range nf.sections {
+		for _, sec := range secs {
+			sec.f = f
+		}
+	}
+	f.sections = nf.sections
+	f.sectionList = nf.sectionList
+	f.sectionIndexes = nf.sectionIndexes
+	f.dataSources = sources
+	return nil
+}
+
 // Append appends one or more data sources and reloads automatically.
 func (f *File) Append(source interface{}, others ...interface{}) error {
+	sources := make([]dataSource, 0, len(f.dataSources)+len(others)+1)
+	sources = append(sources, f.dataSources...)
 	ds, err := parseDataSource(source)
 	if err != nil {
 		return err
 	}
-	f.dataSources = append(f.dataSources, ds)
+	sources = append(sources, ds)
 	for _, s := range others {
 		ds, err = parseDataSource(s)
 		if err != nil {
 			return err
 		}
-		f.dataSources = append(f.dataSources, ds)
+		sources = append(sources, ds)
 	}
-	return f.Reload()
+	return f.reloadSources(sources)
 }
 
 func (f *File) writeToBuffer(indent string) (*bytes.Buffer, error) {

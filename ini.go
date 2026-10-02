@@ -145,6 +145,12 @@ func LoadSources(opts LoadOptions, source interface{}, others ...interface{}) (_
 	}
 	f := newFile(sources, opts)
 	if err = f.Reload(); err != nil {
+		// Keep the historical error surface of Load: callers receive the
+		// underlying error of the failing source, while File.Reload reports
+		// the failing source itself via ErrReloadSource.
+		if rerr, ok := err.(ErrReloadSource); ok {
+			return nil, rerr.Err
+		}
 		return nil, err
 	}
 	return f, nil

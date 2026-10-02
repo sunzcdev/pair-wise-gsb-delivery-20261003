@@ -16,6 +16,8 @@ package ini
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"runtime"
 	"sort"
@@ -534,4 +536,99 @@ v = 3
 
 	require.NoError(t, f.Reload())
 	assert.Equal(t, []string{"1", "2", "3"}, f.Section("slice").Key("v").ValueWithShadows())
+}
+
+// flakyReadCloser simulates an unreliable data source that can fail with a
+// read error midway through the stream or with a close error.
+type flakyReadCloser struct {
+	data     []byte
+	offset   int
+	failAt   int // Read returns readErr once this offset is reached, -1 disables
+	readErr  error
+	closeErr error
+}
+
+func (r *flakyReadCloser) reset(data []byte, failAt int, readErr, closeErr error) {
+	r.data = data
+	r.offset = 0
+	r.failAt = failAt
+	r.readErr = readErr
+	r.closeErr = closeErr
+}
+
+func (r *flakyReadCloser) Read(p []byte) (int, error) {
+	if r.failAt >= 0 && r.offset >= r.failAt {
+		return 0, r.readErr
+	}
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	if r.failAt >= 0 && r.offset+n > r.failAt {
+		n = r.failAt - r.offset
+	}
+	r.offset += n
+	return n, nil
+}
+
+func (r *flakyReadCloser) Close() error {
+	return r.closeErr
+}
+
+func TestFile_Reload_Transactional(t *testing.T) {
+	flaky := &flakyReadCloser{}
+	flaky.reset([]byte("[second]\nkey2 = v2\n"), -1, nil, nil)
+
+	f, err := LoadSources(LoadOptions{AllowShadows: true},
+		[]byte("key1 = v1\nkey1 = v1-shadow\n; section comment\n[first]\n; key comment\na = 1\n"),
+		flaky,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, f)
+
+	// Sanity check: both sources are loaded.
+	assert.Equal(t, []string{"v1", "v1-shadow"}, f.Section("").Key("key1").ValueWithShadows())
+	assert.Equal(t, "v2", f.Section("second").Key("key2").String())
+
+	t.Run("failure midway keeps the old configuration", func(t *testing.T) {
+		// Make the second source fail midway through the stream.
+		flaky.reset([]byte("[second]\nkey2 = v2-new\npartial_key = oops\n"), 20, errors.New("read failed midway"), nil)
+
+		err := f.Reload()
+		require.Error(t, err)
+		require.True(t, IsErrReloadSource(err))
+		assert.Equal(t, 1, err.(ErrReloadSource).Index)
+		assert.Contains(t, err.Error(), "read failed midway")
+
+		// The old configuration must still be fully queryable.
+		assert.Equal(t, []string{"v1", "v1-shadow"}, f.Section("").Key("key1").ValueWithShadows())
+		assert.Contains(t, f.Section("first").Comment, "section comment")
+		assert.Equal(t, "1", f.Section("first").Key("a").String())
+		assert.Contains(t, f.Section("first").Key("a").Comment, "key comment")
+		assert.Equal(t, "v2", f.Section("second").Key("key2").String())
+
+		// Keys parsed before the failure must not leak into the live configuration.
+		assert.False(t, f.Section("second").HasKey("partial_key"))
+	})
+
+	t.Run("successful retry leaves no half-parsed keys", func(t *testing.T) {
+		flaky.reset([]byte("[second]\nkey2 = v2-new\n"), -1, nil, nil)
+		require.NoError(t, f.Reload())
+
+		assert.Equal(t, "v2-new", f.Section("second").Key("key2").String())
+		assert.False(t, f.Section("second").HasKey("partial_key"))
+		assert.Equal(t, []string{"v1", "v1-shadow"}, f.Section("").Key("key1").ValueWithShadows())
+	})
+
+	t.Run("close error fails the reload", func(t *testing.T) {
+		flaky.reset([]byte("[second]\nkey2 = v3\n"), -1, nil, errors.New("close failed"))
+
+		err := f.Reload()
+		require.Error(t, err)
+		require.True(t, IsErrReloadSource(err))
+		assert.Contains(t, err.Error(), "close failed")
+
+		// The old configuration must still be fully queryable.
+		assert.Equal(t, "v2-new", f.Section("second").Key("key2").String())
+	})
 }
