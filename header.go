@@ -97,6 +97,12 @@ func (h *Header) Text(k string) (string, error) {
 	return decodeHeader(h.Get(k))
 }
 
+// TextRecover parses a plaintext header field, recovering from malformed
+// encoded-words. See DecodeHeaderRecover.
+func (h *Header) TextRecover(k string) (string, []HeaderDiagnostic) {
+	return DecodeHeaderRecover(h.Get(k))
+}
+
 // SetText sets a plaintext header field.
 func (h *Header) SetText(k, v string) {
 	h.Set(k, encodeHeader(v))
