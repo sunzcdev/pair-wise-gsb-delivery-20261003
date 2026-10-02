@@ -6,12 +6,18 @@ module GraphQL
     BrokenPromiseError = ::Promise::BrokenError
     class NoExecutorError < StandardError; end
 
-    def self.batch(executor_class: GraphQL::Batch::Executor)
+    def self.batch(executor_class: GraphQL::Batch::Executor, isolated: false)
+      previous_executor = GraphQL::Batch::Executor.current if isolated
+      GraphQL::Batch::Executor.current = nil if isolated
       begin
         GraphQL::Batch::Executor.start_batch(executor_class)
         ::Promise.sync(yield)
       ensure
-        GraphQL::Batch::Executor.end_batch
+        begin
+          GraphQL::Batch::Executor.end_batch
+        ensure
+          GraphQL::Batch::Executor.current = previous_executor if isolated
+        end
       end
     end
 

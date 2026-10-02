@@ -174,6 +174,23 @@ def test_single_query
 end
 ```
 
+### Isolated batches
+
+Pass `isolated: true` to `GraphQL::Batch.batch` to run the block with a fresh
+executor, loader registry and queue, instead of reusing the loaders already
+cached by an enclosing batch. When the block exits, the previous executor is
+restored and its pending loads are left untouched.
+
+```ruby
+GraphQL::Batch.batch do
+  RecordLoader.for(Product).load(1) # uses the outer loader cache
+  GraphQL::Batch.batch(isolated: true) do
+    RecordLoader.for(Product).load(1) # loads again with a separate cache
+  end
+  RecordLoader.for(Product).load(1) # hits the outer loader cache again
+end
+```
+
 ## Development
 
 After checking out the repo, run `bin/setup` to install dependencies. Then, run `rake test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
