@@ -363,8 +363,10 @@ func TestMilterClient_AbortFlow(t *testing.T) {
 	if mm.HeloValue != "repeated_helo_host" {
 		t.Fatal("Wrong helo value:", mm.HeloValue)
 	}
-	if len(macros["tls_version"]) != 0 {
-		t.Fatal("Unexpected macro data:", macros)
+	// Abort resets only the current message, connection and HELO
+	// information (macros) is preserved.
+	if macros["tls_version"] != "very old" {
+		t.Fatal("Macro data lost after abort:", macros)
 	}
 }
 

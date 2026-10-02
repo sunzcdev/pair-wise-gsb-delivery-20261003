@@ -108,6 +108,15 @@ type Server struct {
 	// [Server.Actions] must have the flag [OptSetSymList] set.
 	SymList map[Stage][]string
 
+	// Strict enables strict verification of the message command sequence
+	// (MAIL, RCPT, HEADER, EOH, BODY, EOB). When enabled, commands that
+	// arrive out of order are rejected with a 451 error response and are
+	// not passed to the Milter callbacks. Phases disabled during protocol
+	// negotiation (e.g. OptNoHeaders) are allowed to be skipped, and Abort
+	// resets only the current message while connection and HELO
+	// information is preserved.
+	Strict bool
+
 	listeners []net.Listener
 	closed    bool
 }
@@ -133,6 +142,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			protocol: s.Protocol,
 			conn:     conn,
 			backend:  s.NewMilter(),
+			strict:   s.Strict,
 		}
 		go session.HandleMilterCommands()
 	}

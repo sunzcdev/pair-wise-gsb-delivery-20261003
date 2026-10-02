@@ -24,6 +24,16 @@ type milterSession struct {
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+	strict   bool
+	state    mailState
+}
+
+// resetMessage clears all per-message state so that the next message on the
+// same connection does not inherit anything from the previous one.
+// Connection and HELO information (macros) is preserved.
+func (m *milterSession) resetMessage() {
+	m.headers = nil
+	m.state = stateIdle
 }
 
 // ReadPacket reads incoming milter packet
@@ -97,13 +107,19 @@ func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
 
 // Process processes incoming milter commands
 func (m *milterSession) Process(msg *Message) (Response, error) {
+	if m.strict {
+		// In strict mode out-of-order commands are rejected with an error
+		// response and never reach the milter callbacks.
+		if resp := m.checkSequence(Code(msg.Code)); resp != nil {
+			return resp, nil
+		}
+	}
+
 	switch Code(msg.Code) {
 	case CodeAbort:
-		// abort current message and start over
-		defer func() {
-			m.headers = nil
-			m.macros = nil
-		}()
+		// abort current message and start over, connection and HELO
+		// information is preserved
+		defer m.resetMessage()
 		return nil, m.backend.Abort(newModifier(m))
 
 	case CodeBody:
@@ -163,7 +179,10 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 	case CodeEOB:
 		// call and return milter handler
-		return m.backend.Body(newModifier(m))
+		resp, err := m.backend.Body(newModifier(m))
+		// message is complete, do not let the next one inherit its state
+		m.resetMessage()
+		return resp, err
 
 	case CodeHelo:
 		// helo command
@@ -276,6 +295,7 @@ func (m *milterSession) HandleMilterCommands() {
 			if !resp.Continue() {
 				// prepare backend for next message
 				m.backend = m.server.NewMilter()
+				m.resetMessage()
 			}
 		}
 	}
