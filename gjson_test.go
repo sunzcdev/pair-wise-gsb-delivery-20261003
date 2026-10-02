@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2828,4 +2829,187 @@ func TestIntOverflow(t *testing.T) {
 	assert(t, Parse(`"-9223372036854775809.0"`).Int() == -9223372036854775808)
 	assert(t, Parse(`"-9223372036854775809.1"`).Int() == -9223372036854775808)
 	assert(t, Parse(`"-9223372036854775809.1"`).Int() == -9223372036854775808)
+}
+
+// TestEngineInterleavedIsolation proves that two engines can register the
+// same modifier name with different meanings, and that interleaved
+// registration, replacement, and deletion on one engine never affects the
+// other engine or the package-level API.
+func TestEngineInterleavedIsolation(t *testing.T) {
+	json := `{"name":"AbC"}`
+	upper := func(json, arg string) string { return strings.ToUpper(json) }
+	lower := func(json, arg string) string { return strings.ToLower(json) }
+
+	a := NewEngine(true)
+	b := NewEngine(true)
+
+	// Register "@normalize" on A and query it before B registers its own
+	// version: registration and execution are interleaved on purpose.
+	a.AddModifier("normalize", upper)
+	assert(t, a.Get(json, "name|@normalize").String() == "ABC")
+
+	// B registers its own "@normalize" with a different meaning.
+	b.AddModifier("normalize", lower)
+	assert(t, b.Get(json, "name|@normalize").String() == "abc")
+	// A is unaffected by B's registration.
+	assert(t, a.Get(json, "name|@normalize").String() == "ABC")
+
+	// Replacing on A does not affect B.
+	a.AddModifier("normalize", func(json, arg string) string {
+		return `"replaced"`
+	})
+	assert(t, a.Get(json, "name|@normalize").String() == "replaced")
+	assert(t, b.Get(json, "name|@normalize").String() == "abc")
+
+	// Deleting on A does not affect B.
+	a.DeleteModifier("normalize")
+	assert(t, !a.ModifierExists("normalize"))
+	assert(t, !a.Get(json, "name|@normalize").Exists())
+	assert(t, b.ModifierExists("normalize"))
+	assert(t, b.Get(json, "name|@normalize").String() == "abc")
+
+	// Neither registration leaked into the package-level registry.
+	assert(t, !ModifierExists("normalize", nil))
+	assert(t, !Get(json, "name|@normalize").Exists())
+
+	// Deleting on B does not affect the inherited built-ins of A.
+	b.DeleteModifier("normalize")
+	assert(t, a.Get(json, "@valid").Exists())
+	assert(t, b.Get(json, "@valid").Exists())
+}
+
+// TestEngineInheritBuiltins verifies that an engine can opt in or out of
+// the built-in modifier set, and that later package-level registrations
+// do not leak into existing engines.
+func TestEngineInheritBuiltins(t *testing.T) {
+	withBuiltins := NewEngine(true)
+	withoutBuiltins := NewEngine(false)
+
+	assert(t, withBuiltins.ModifierExists("valid"))
+	assert(t, withBuiltins.Get(`{"a":1}`, "@valid").Exists())
+	assert(t, withBuiltins.Get(`[3,2,1]`, "@reverse").String() == "[1,2,3]")
+
+	assert(t, !withoutBuiltins.ModifierExists("valid"))
+	assert(t, !withoutBuiltins.Get(`{"a":1}`, "@valid").Exists())
+
+	// A package-level registration made after the engines were created
+	// must not leak into either engine.
+	AddModifier("pkgonlynormalize", func(json, arg string) string {
+		return `"pkg"`
+	})
+	defer delete(modifiers, "pkgonlynormalize")
+	assert(t, Get(`"x"`, "@pkgonlynormalize").String() == "pkg")
+	assert(t, !withBuiltins.ModifierExists("pkgonlynormalize"))
+	assert(t, !withoutBuiltins.ModifierExists("pkgonlynormalize"))
+	assert(t, !withBuiltins.Get(`"x"`, "@pkgonlynormalize").Exists())
+}
+
+// TestEngineQueryPinsRegistry proves that every query pins a fixed
+// registration view: mutating the engine from inside a modifier while a
+// query is running does not affect the query already in progress.
+func TestEngineQueryPinsRegistry(t *testing.T) {
+	e := NewEngine(false)
+	e.AddModifier("normalize", func(json, arg string) string {
+		return `"A"`
+	})
+	// poison mutates the engine mid-query: it deletes "@normalize" and
+	// re-registers it with a different meaning.
+	e.AddModifier("poison", func(json, arg string) string {
+		e.DeleteModifier("normalize")
+		e.AddModifier("normalize", func(json, arg string) string {
+			return `"B"`
+		})
+		return json
+	})
+
+	// The running query keeps its pinned view, so the piped "@normalize"
+	// still resolves to the original "A" implementation.
+	assert(t, e.Get(`"x"`, "@poison|@normalize").String() == "A")
+
+	// Queries started after the mutation observe the new registry.
+	assert(t, e.Get(`"x"`, "@normalize").String() == "B")
+
+	// Deletion mid-query is equally invisible to the running query.
+	e.AddModifier("purge", func(json, arg string) string {
+		e.DeleteModifier("normalize")
+		return json
+	})
+	assert(t, e.Get(`"x"`, "@purge|@normalize").String() == "B")
+	assert(t, !e.ModifierExists("normalize"))
+	assert(t, !e.Get(`"x"`, "@normalize").Exists())
+}
+
+// TestEngineScopedRequery verifies that a modifier can re-query through
+// its own engine as the scoped entry point, and that the nested query
+// resolves modifiers in that engine's scope.
+func TestEngineScopedRequery(t *testing.T) {
+	a := NewEngine(false)
+	b := NewEngine(false)
+
+	a.AddModifier("normalize", func(json, arg string) string {
+		return strings.ToUpper(json)
+	})
+	b.AddModifier("normalize", func(json, arg string) string {
+		return strings.ToLower(json)
+	})
+
+	// "extract" re-queries the json through its own engine, so the nested
+	// path resolves "@normalize" with that engine's meaning.
+	extract := func(e *Engine) func(json, arg string) string {
+		return func(json, arg string) string {
+			return e.Get(json, arg).Raw
+		}
+	}
+	a.AddModifier("extract", extract(a))
+	b.AddModifier("extract", extract(b))
+
+	json := `{"user":{"name":"AbC"}}`
+	assert(t, a.Get(json, `@extract:user.name|@normalize`).Raw == `"ABC"`)
+	assert(t, b.Get(json, `@extract:user.name|@normalize`).Raw == `"abc"`)
+
+	// Replacing "@normalize" on A between queries changes A's next nested
+	// query but never B's.
+	a.AddModifier("normalize", func(json, arg string) string {
+		return `"replaced"`
+	})
+	assert(t, a.Get(json, `@extract:user.name|@normalize`).Raw == `"replaced"`)
+	assert(t, b.Get(json, `@extract:user.name|@normalize`).Raw == `"abc"`)
+}
+
+// TestEngineConcurrentUse hammers an engine with concurrent registration
+// and queries to prove the registry and its snapshots are race free.
+func TestEngineConcurrentUse(t *testing.T) {
+	e := NewEngine(true)
+	e.AddModifier("normalize", func(json, arg string) string {
+		return strings.ToUpper(json)
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			name := fmt.Sprintf("dynamic%d", i%2)
+			for j := 0; j < 200; j++ {
+				e.AddModifier(name, func(json, arg string) string {
+					return json
+				})
+				e.ModifierExists(name)
+				e.DeleteModifier(name)
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				res := e.Get(`{"name":"abc"}`, "name|@normalize")
+				if res.String() != "ABC" {
+					t.Errorf("expected ABC, got %q", res.String())
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }

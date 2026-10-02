@@ -12,6 +12,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -354,7 +355,12 @@ func (t Result) Map() map[string]Result {
 // Get searches result for the specified path.
 // The result should be a JSON array or object.
 func (t Result) Get(path string) Result {
-	r := Get(t.Raw, path)
+	return t.getWithModifiers(path, nil)
+}
+
+// getWithModifiers is like Get but uses the provided modifier set.
+func (t Result) getWithModifiers(path string, mods modifierMap) Result {
+	r := getWithModifiers(t.Raw, path, mods)
 	if r.Indexes != nil {
 		for i := 0; i < len(r.Indexes); i++ {
 			r.Indexes[i] += t.Index
@@ -804,7 +810,7 @@ type arrayPathResult struct {
 	}
 }
 
-func parseArrayPath(path string) (r arrayPathResult) {
+func parseArrayPath(path string, mods modifierMap) (r arrayPathResult) {
 	for i := 0; i < len(path); i++ {
 		if path[i] == '|' {
 			r.part = path[:i]
@@ -814,7 +820,7 @@ func parseArrayPath(path string) (r arrayPathResult) {
 		}
 		if path[i] == '.' {
 			r.part = path[:i]
-			if !r.arrch && i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+			if !r.arrch && i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 				r.pipe = path[i+1:]
 				r.piped = true
 			} else {
@@ -984,7 +990,7 @@ right:
 }
 
 // peek at the next byte and see if it's a '@', '[', or '{'.
-func isDotPiperChar(s string) bool {
+func isDotPiperChar(s string, mods modifierMap) bool {
 	if DisableModifiers {
 		return false
 	}
@@ -997,7 +1003,7 @@ func isDotPiperChar(s string) bool {
 				break
 			}
 		}
-		_, ok := modifiers[s[1:i]]
+		_, ok := mods.lookup(s[1:i])
 		return ok
 	}
 	return c == '[' || c == '{'
@@ -1012,7 +1018,7 @@ type objectPathResult struct {
 	more  bool
 }
 
-func parseObjectPath(path string) (r objectPathResult) {
+func parseObjectPath(path string, mods modifierMap) (r objectPathResult) {
 	for i := 0; i < len(path); i++ {
 		if path[i] == '|' {
 			r.part = path[:i]
@@ -1022,7 +1028,7 @@ func parseObjectPath(path string) (r objectPathResult) {
 		}
 		if path[i] == '.' {
 			r.part = path[:i]
-			if i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+			if i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 				r.pipe = path[i+1:]
 				r.piped = true
 			} else {
@@ -1052,7 +1058,7 @@ func parseObjectPath(path string) (r objectPathResult) {
 						continue
 					} else if path[i] == '.' {
 						r.part = string(epart)
-						if i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+						if i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 							r.pipe = path[i+1:]
 							r.piped = true
 						} else {
@@ -1229,7 +1235,7 @@ func parseSquash(json string, i int) (int, string) {
 func parseObject(c *parseContext, i int, path string) (int, bool) {
 	var pmatch, kesc, vesc, ok, hit bool
 	var key, val string
-	rp := parseObjectPath(path)
+	rp := parseObjectPath(path, c.mods)
 	if !rp.more && rp.piped {
 		c.pipe = rp.pipe
 		c.piped = true
@@ -1546,7 +1552,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 	var partidx int
 	var multires []byte
 	var queryIndexes []int
-	rp := parseArrayPath(path)
+	rp := parseArrayPath(path, c.mods)
 	if !rp.arrch {
 		n, ok := parseUint(rp.part)
 		if !ok {
@@ -1572,7 +1578,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 		parentIndex := tmp.value.Index
 		var res Result
 		if qval.Type == JSON {
-			res = qval.Get(rp.query.path)
+			res = qval.getWithModifiers(rp.query.path, c.mods)
 		} else {
 			if rp.query.path != "" {
 				return false
@@ -1587,7 +1593,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 					c.pipe = right
 					c.piped = true
 				}
-				res = qval.Get(rp.path)
+				res = qval.getWithModifiers(rp.path, c.mods)
 			} else {
 				res = qval
 			}
@@ -1773,7 +1779,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 							if idx < len(c.json) && c.json[idx] != ']' {
 								_, res, ok := parseAny(c.json, idx, true)
 								if ok {
-									res := res.Get(rp.alogkey)
+									res := res.getWithModifiers(rp.alogkey, c.mods)
 									if res.Exists() {
 										if k > 0 {
 											jsons = append(jsons, ',')
@@ -2125,6 +2131,7 @@ type parseContext struct {
 	piped bool
 	calcd bool
 	lines bool
+	mods  modifierMap
 }
 
 // Get searches json for the specified path.
@@ -2161,6 +2168,13 @@ type parseContext struct {
 // If you are consuming JSON from an unpredictable source then you may want to
 // use the Valid function first.
 func Get(json, path string) Result {
+	return getWithModifiers(json, path, nil)
+}
+
+// getWithModifiers is the internal query engine. When mods is nil the
+// package-level modifier set is used, otherwise the provided (pinned)
+// modifier set is used for the entire duration of the query.
+func getWithModifiers(json, path string, mods modifierMap) Result {
 	if len(path) > 1 {
 		if (path[0] == '@' && !DisableModifiers) || path[0] == '!' {
 			// possible modifier
@@ -2168,14 +2182,14 @@ func Get(json, path string) Result {
 			var npath string
 			var rjson string
 			if path[0] == '@' && !DisableModifiers {
-				npath, rjson, ok = execModifier(json, path)
+				npath, rjson, ok = execModifier(json, path, mods)
 			} else if path[0] == '!' {
 				npath, rjson, ok = execStatic(json, path)
 			}
 			if ok {
 				path = npath
 				if len(path) > 0 && (path[0] == '|' || path[0] == '.') {
-					res := Get(rjson, path[1:])
+					res := getWithModifiers(rjson, path[1:], mods)
 					res.Index = 0
 					res.Indexes = nil
 					return res
@@ -2195,7 +2209,7 @@ func Get(json, path string) Result {
 					b = append(b, kind)
 					var i int
 					for _, sub := range subs {
-						res := Get(json, sub.path)
+						res := getWithModifiers(json, sub.path, mods)
 						if res.Exists() {
 							if i > 0 {
 								b = append(b, ',')
@@ -2235,7 +2249,7 @@ func Get(json, path string) Result {
 					res.Raw = string(b)
 					res.Type = JSON
 					if len(path) > 0 {
-						res = res.Get(path[1:])
+						res = res.getWithModifiers(path[1:], mods)
 					}
 					res.Index = 0
 					return res
@@ -2244,7 +2258,7 @@ func Get(json, path string) Result {
 		}
 	}
 	var i int
-	var c = &parseContext{json: json}
+	var c = &parseContext{json: json, mods: mods}
 	if len(path) >= 2 && path[0] == '.' && path[1] == '.' {
 		c.lines = true
 		parseArray(c, 0, path[2:])
@@ -2263,7 +2277,7 @@ func Get(json, path string) Result {
 		}
 	}
 	if c.piped {
-		res := c.value.Get(c.pipe)
+		res := c.value.getWithModifiers(c.pipe, mods)
 		res.Index = 0
 		return res
 	}
@@ -2891,7 +2905,7 @@ func execStatic(json, path string) (pathOut, res string, ok bool) {
 
 // execModifier parses the path to find a matching modifier function.
 // The input expects that the path already starts with a '@'
-func execModifier(json, path string) (pathOut, res string, ok bool) {
+func execModifier(json, path string, mods modifierMap) (pathOut, res string, ok bool) {
 	name := path[1:]
 	var hasArgs bool
 	for i := 1; i < len(path); i++ {
@@ -2912,7 +2926,7 @@ func execModifier(json, path string) (pathOut, res string, ok bool) {
 			break
 		}
 	}
-	if fn, ok := modifiers[name]; ok {
+	if fn, ok := mods.lookup(name); ok {
 		var args string
 		if hasArgs {
 			var parsedArgs bool
@@ -2960,10 +2974,30 @@ func unwrap(json string) string {
 // DisableModifiers will disable the modifier syntax
 var DisableModifiers = false
 
+// modifierMap is a set of modifier functions keyed by name.
+// A nil modifierMap refers to the package-level modifier set.
+type modifierMap map[string]func(json, arg string) string
+
+// lookup returns the modifier function for name. When m is nil the
+// package-level modifier set is consulted, preserving the original
+// package-level behavior.
+func (m modifierMap) lookup(name string) (func(json, arg string) string, bool) {
+	if m == nil {
+		fn, ok := modifiers[name]
+		return fn, ok
+	}
+	fn, ok := m[name]
+	return fn, ok
+}
+
 var modifiers map[string]func(json, arg string) string
 
+// builtinModifiers holds the built-in modifier set. It is never mutated
+// after init, so that new Engine instances can inherit a pristine copy.
+var builtinModifiers map[string]func(json, arg string) string
+
 func init() {
-	modifiers = map[string]func(json, arg string) string{
+	builtinModifiers = map[string]func(json, arg string) string{
 		"pretty":  modPretty,
 		"ugly":    modUgly,
 		"reverse": modReverse,
@@ -2978,6 +3012,10 @@ func init() {
 		"group":   modGroup,
 		"dig":     modDig,
 	}
+	modifiers = make(map[string]func(json, arg string) string, len(builtinModifiers))
+	for name, fn := range builtinModifiers {
+		modifiers[name] = fn
+	}
 }
 
 // AddModifier binds a custom modifier command to the GJSON syntax.
@@ -2991,6 +3029,86 @@ func AddModifier(name string, fn func(json, arg string) string) {
 func ModifierExists(name string, fn func(json, arg string) string) bool {
 	_, ok := modifiers[name]
 	return ok
+}
+
+// Engine is an isolated query instance with its own modifier registry.
+//
+// Two services can each create an Engine and register the same modifier
+// name (for example "@normalize") with different meanings without
+// interfering with each other or with the package-level API.
+//
+// Every call to Get pins a snapshot of the engine's modifier registry for
+// the duration of that query, so registering, replacing, or deleting a
+// modifier never affects queries that have already started.
+//
+// An Engine is safe for concurrent use.
+type Engine struct {
+	mu   sync.RWMutex
+	mods map[string]func(json, arg string) string
+}
+
+// NewEngine returns a new query instance with its own modifier registry.
+// When inheritBuiltins is true the instance starts with a copy of the
+// built-in modifier set (@pretty, @reverse, @dig, ...), otherwise it
+// starts empty. The copy is made at creation time; later changes to the
+// package-level registry do not leak into the instance, and vice versa.
+func NewEngine(inheritBuiltins bool) *Engine {
+	e := &Engine{mods: make(map[string]func(json, arg string) string)}
+	if inheritBuiltins {
+		for name, fn := range builtinModifiers {
+			e.mods[name] = fn
+		}
+	}
+	return e
+}
+
+// AddModifier binds a custom modifier command to the engine, replacing
+// any modifier with the same name. It only affects this engine and only
+// queries that start after the call returns.
+func (e *Engine) AddModifier(name string, fn func(json, arg string) string) {
+	e.mu.Lock()
+	e.mods[name] = fn
+	e.mu.Unlock()
+}
+
+// DeleteModifier removes a modifier from the engine. It only affects this
+// engine and only queries that start after the call returns.
+func (e *Engine) DeleteModifier(name string) {
+	e.mu.Lock()
+	delete(e.mods, name)
+	e.mu.Unlock()
+}
+
+// ModifierExists returns true when the specified modifier exists on the
+// engine.
+func (e *Engine) ModifierExists(name string) bool {
+	e.mu.RLock()
+	_, ok := e.mods[name]
+	e.mu.RUnlock()
+	return ok
+}
+
+// Get searches json for the specified path using the engine's modifier
+// registry. The registry is snapshotted when the query starts, so the
+// query observes a fixed registration view even if the engine is mutated
+// concurrently.
+//
+// Get is also the scoped entry point for modifiers that need to run
+// nested queries: a modifier function can close over the engine and call
+// e.Get to re-query within the same scope.
+func (e *Engine) Get(json, path string) Result {
+	return getWithModifiers(json, path, e.snapshot())
+}
+
+// snapshot returns a pinned copy of the engine's modifier registry.
+func (e *Engine) snapshot() modifierMap {
+	e.mu.RLock()
+	mods := make(modifierMap, len(e.mods))
+	for name, fn := range e.mods {
+		mods[name] = fn
+	}
+	e.mu.RUnlock()
+	return mods
 }
 
 // cleanWS remove any non-whitespace from string

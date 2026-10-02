@@ -269,6 +269,25 @@ gjson.AddModifier("case", func(json, arg string) string {
 "children|@case:lower|@reverse"  >> ["jack","alex","sara"]
 ```
 
+### Isolated modifier registries
+
+When two services need the same modifier name with different meanings, use
+`NewEngine` to create isolated query instances instead of the package-level
+`AddModifier`. Each engine has its own modifier registry, optionally seeded
+with the built-in modifiers, and every query pins a snapshot of the registry
+so concurrent registration changes never affect queries already in progress.
+
+```go
+e := gjson.NewEngine(true) // inherit the built-in modifiers
+e.AddModifier("normalize", func(json, arg string) string {
+  return strings.ToUpper(json)
+})
+e.Get(json, "children|@normalize")
+```
+
+A modifier that needs to run nested queries can close over the engine and
+use `e.Get` as its scoped entry point.
+
 ## JSON Lines
 
 There's support for [JSON Lines](http://jsonlines.org/) using the `..` prefix, which treats a multilined document as an array. 
