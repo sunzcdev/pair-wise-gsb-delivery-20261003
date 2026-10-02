@@ -18,9 +18,13 @@ module Pundit
       #
       # @note `nil` results are not cached.
       # @since v2.3.2
-      def fetch(user:, record:)
+      def fetch(user:, record:, namespaces: nil)
         _ = user
-        @store[record] ||= yield
+        if namespaces.nil? || namespaces.empty?
+          @store[record] ||= yield
+        else
+          @store[[record, namespaces]] ||= yield
+        end
       end
     end
   end

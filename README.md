@@ -666,6 +666,33 @@ class Admin::PostController < AdminController
 end
 ```
 
+### Policy namespace lookup chains
+
+Plugins and engines can register their own policies without overriding the host
+application's policies by configuring a lookup chain on the context. Each
+namespace is searched in order, and the top-level namespace is always the
+final fallback:
+
+```ruby
+pundit = Pundit::Context.new(user: current_user, policy_namespaces: [MyPlugin, MyApp])
+
+pundit.authorize(post, query: :show?) # => tries MyPlugin::PostPolicy,
+                                      #    then MyApp::PostPolicy,
+                                      #    then PostPolicy
+```
+
+A namespace is only skipped when it does not define the policy class at all.
+Once a policy is found, any error it raises — a denied authorization, an
+invalid constructor, or a missing query method — is propagated as-is and the
+remaining namespaces are never consulted. Scopes are always resolved from the
+selected policy class, so a policy without a `Scope` never borrows one from
+another namespace. A `policy_class` defined by the record, or passed
+explicitly to `authorize`, still takes precedence over the chain.
+
+When combined with a `policy_cache`, policies are cached per namespace chain,
+so the same user and record never share a policy instance across contexts with
+different chains.
+
 ## Additional context
 
 Pundit strongly encourages you to model your application in such a way that the

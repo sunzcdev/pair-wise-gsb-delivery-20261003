@@ -31,10 +31,18 @@ module Pundit
     # @see Pundit::Authorization#pundit
     # @param user later passed to policies and scopes
     # @param policy_cache [#fetch] cache store for policies (see e.g. {CacheStore::NullStore})
+    # @param policy_namespaces [Array<Module, #to_s>] namespaces to search for
+    #   policy classes, in order, before falling back to the top-level
+    #   namespace. A namespace is only skipped when it does not define the
+    #   policy class; once a policy is found, any error it raises (e.g. an
+    #   invalid constructor or a failed authorization) is propagated as-is.
+    #   A `policy_class` defined by the record (or passed explicitly) always
+    #   takes precedence over the namespaces.
     # @since v2.3.2
-    def initialize(user:, policy_cache: CacheStore::NullStore.instance)
+    def initialize(user:, policy_cache: CacheStore::NullStore.instance, policy_namespaces: [])
       @user = user
       @policy_cache = policy_cache
+      @policy_namespaces = policy_namespaces
     end
 
     # @api public
@@ -46,6 +54,11 @@ module Pundit
     # @see #initialize
     # @since v2.3.2
     attr_reader :policy_cache
+
+    # @api private
+    # @see #initialize
+    # @since v2.6.0
+    attr_reader :policy_namespaces
 
     # @!group Policies
 
@@ -156,7 +169,10 @@ module Pundit
     # @raise [InvalidConstructorError] if policy can't be instantated
     # @since v2.3.2
     def cached_find(record)
-      policy_cache.fetch(user: user, record: record) do
+      cache_key = {user: user, record: record}
+      cache_key[:namespaces] = policy_namespaces unless policy_namespaces.empty?
+
+      policy_cache.fetch(**cache_key) do
         klass = yield policy_finder(record)
         next unless klass
 
@@ -176,7 +192,7 @@ module Pundit
     # @return [PolicyFinder]
     # @since v2.3.2
     def policy_finder(record)
-      PolicyFinder.new(record)
+      PolicyFinder.new(record, namespaces: policy_namespaces)
     end
 
     # Given a possibly namespaced record, return the actual record.

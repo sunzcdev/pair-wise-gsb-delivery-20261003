@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
+- Add `policy_namespaces` option to `Pundit::Context` to look up policies in an ordered chain of namespaces before falling back to the top-level namespace.
 
 ### Deprecated
 - Rename `Pundit::Authorization#policies` to `#pundit_policies` to avoid clashing with controller actions named `policies`. The old `#policies` method is now deprecated. [#878](https://github.com/varvet/pundit/issues/878)

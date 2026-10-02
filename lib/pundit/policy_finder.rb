@@ -26,10 +26,18 @@ module Pundit
     # @since v0.1.0
     attr_reader :object
 
+    # @see #initialize
+    # @since v2.6.0
+    attr_reader :namespaces
+
     # @param object [any] the object to find policy and scope classes for
+    # @param namespaces [Array<Module, #to_s>] namespaces to search for the
+    #   policy class, in order, before falling back to the top-level namespace.
+    #   Only used when the object does not define its own `policy_class`.
     # @since v0.1.0
-    def initialize(object)
+    def initialize(object, namespaces: [])
       @object = object
+      @namespaces = namespaces
     end
 
     # @return [nil, Scope{#resolve}] scope class which can resolve to a scope
@@ -53,7 +61,7 @@ module Pundit
     # @since v0.1.0
     def policy
       klass = find(object)
-      klass.is_a?(String) ? klass.safe_constantize : klass
+      klass.is_a?(String) ? find_in_namespaces(klass) : klass
     end
 
     # @return [Scope{#resolve}] scope class which can resolve to a scope
@@ -131,6 +139,45 @@ module Pundit
         subject.to_s.camelize
       else
         subject.class
+      end
+    end
+
+    # Given a policy class name, look it up in each namespace in order,
+    # falling back to the top-level namespace.
+    #
+    # Only the absence of a candidate moves the lookup on to the next
+    # namespace. Constants are resolved strictly within each namespace, so a
+    # top-level policy is never picked up through another namespace.
+    #
+    # @api private
+    # @param class_name [String] the policy class name to resolve
+    # @return [nil, Class] the policy class, if found
+    # @since v2.6.0
+    def find_in_namespaces(class_name)
+      namespaces.each do |namespace|
+        candidate = strict_constantize(namespace, class_name)
+        return candidate if candidate
+      end
+
+      class_name.safe_constantize
+    end
+
+    # Resolve a (possibly nested) class name strictly within a namespace,
+    # without falling back to ancestors or the top-level namespace.
+    #
+    # @api private
+    # @param namespace [Module, #to_s] the namespace to resolve within
+    # @param class_name [String] the class name to resolve
+    # @return [nil, Class] the resolved class, if defined in the namespace
+    # @since v2.6.0
+    def strict_constantize(namespace, class_name)
+      namespace = namespace.to_s.safe_constantize unless namespace.is_a?(Module)
+      return unless namespace
+
+      class_name.split("::").reduce(namespace) do |context, name|
+        return unless context.is_a?(Module) && name.match?(/\A[A-Z]\w*\z/) && context.const_defined?(name, false)
+
+        context.const_get(name, false)
       end
     end
   end
