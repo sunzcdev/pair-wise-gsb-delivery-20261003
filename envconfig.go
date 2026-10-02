@@ -212,7 +212,7 @@ func Process(prefix string, spec interface{}) error {
 			continue
 		}
 
-		err = processField(value, info.Field)
+		err = processField(value, info.Field, isTrue(info.Tags.Get("quoted")))
 		if err != nil {
 			return &ParseError{
 				KeyName:   info.Key,
@@ -234,7 +234,7 @@ func MustProcess(prefix string, spec interface{}) {
 	}
 }
 
-func processField(value string, field reflect.Value) error {
+func processField(value string, field reflect.Value, quotedCollection bool) error {
 	typ := field.Type()
 
 	decoder := decoderFrom(field)
@@ -306,10 +306,19 @@ func processField(value string, field reflect.Value) error {
 		if typ.Elem().Kind() == reflect.Uint8 {
 			sl = reflect.ValueOf([]byte(value))
 		} else if strings.TrimSpace(value) != "" {
-			vals := strings.Split(value, ",")
+			var vals []string
+			if quotedCollection {
+				var err error
+				vals, err = parseQuotedSlice(value)
+				if err != nil {
+					return err
+				}
+			} else {
+				vals = strings.Split(value, ",")
+			}
 			sl = reflect.MakeSlice(typ, len(vals), len(vals))
 			for i, val := range vals {
-				err := processField(val, sl.Index(i))
+				err := processField(val, sl.Index(i), quotedCollection)
 				if err != nil {
 					return err
 				}
@@ -319,23 +328,43 @@ func processField(value string, field reflect.Value) error {
 	case reflect.Map:
 		mp := reflect.MakeMap(typ)
 		if strings.TrimSpace(value) != "" {
-			pairs := strings.Split(value, ",")
-			for _, pair := range pairs {
-				kvpair := strings.Split(pair, ":")
-				if len(kvpair) != 2 {
-					return fmt.Errorf("invalid map item: %q", pair)
-				}
-				k := reflect.New(typ.Key()).Elem()
-				err := processField(kvpair[0], k)
+			if quotedCollection {
+				pairs, err := parseQuotedMap(value)
 				if err != nil {
 					return err
 				}
-				v := reflect.New(typ.Elem()).Elem()
-				err = processField(kvpair[1], v)
-				if err != nil {
-					return err
+				for _, pair := range pairs {
+					k := reflect.New(typ.Key()).Elem()
+					err := processField(pair[0], k, quotedCollection)
+					if err != nil {
+						return err
+					}
+					v := reflect.New(typ.Elem()).Elem()
+					err = processField(pair[1], v, quotedCollection)
+					if err != nil {
+						return err
+					}
+					mp.SetMapIndex(k, v)
 				}
-				mp.SetMapIndex(k, v)
+			} else {
+				pairs := strings.Split(value, ",")
+				for _, pair := range pairs {
+					kvpair := strings.Split(pair, ":")
+					if len(kvpair) != 2 {
+						return fmt.Errorf("invalid map item: %q", pair)
+					}
+					k := reflect.New(typ.Key()).Elem()
+					err := processField(kvpair[0], k, false)
+					if err != nil {
+						return err
+					}
+					v := reflect.New(typ.Elem()).Elem()
+					err = processField(kvpair[1], v, false)
+					if err != nil {
+						return err
+					}
+					mp.SetMapIndex(k, v)
+				}
 			}
 		}
 		field.Set(mp)

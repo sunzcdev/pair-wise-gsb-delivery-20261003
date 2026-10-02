@@ -164,6 +164,32 @@ envconfig supports these struct field types:
 
 Embedded structs using these fields are also supported.
 
+## Quoted Collection Items
+
+Slices and maps keep the comma and colon parsing described above by default.
+Add the `quoted:"true"` struct tag to a field to enable quoted collection items:
+
+```Go
+type Specification struct {
+    Users  []string          `envconfig:"MYAPP_USERS" quoted:"true"`
+    Colors map[string]string `envconfig:"MYAPP_COLORS" quoted:"true"`
+}
+```
+
+Quoted items can contain literal separators. Backslash can escape a quote,
+comma, or backslash; map keys can additionally escape a colon:
+
+```Bash
+export MYAPP_USERS='"Smith, Jane",Alice,Hello\"World'
+export MYAPP_COLORS='morning:"hello: world","red,primary":"#f00"'
+```
+
+For fields with `quoted:"true"`, an empty environment value produces an empty
+slice or map, while a single pair of quotes produces one empty string. Spaces
+outside quoted items are trimmed and spaces inside quotes are preserved.
+Duplicate map keys are processed in order and the last value wins. Unterminated
+quotes and invalid escape sequences report the one-based element position.
+
 ## Custom Decoders
 
 Any field whose type (or pointer-to-type) implements `envconfig.Decoder` can
