@@ -765,10 +765,10 @@ func (d *partialArray) remove(key string, options *ApplyOptions) error {
 	return nil
 }
 
-func (p Patch) add(doc *container, op Operation, options *ApplyOptions) error {
+func (p Patch) add(doc *container, op Operation, options *ApplyOptions) (Patch, error) {
 	path, err := op.Path()
 	if err != nil {
-		return fmt.Errorf("add operation failed to decode path: %w", ErrMissing)
+		return nil, fmt.Errorf("add operation failed to decode path: %w", ErrMissing)
 	}
 
 	// special case, adding to empty means replacing the container with the value given
@@ -790,34 +790,67 @@ func (p Patch) add(doc *container, op Operation, options *ApplyOptions) error {
 		err := json.UnmarshalValid(*val.raw, pd)
 
 		if err != nil {
-			return err
+			return nil, err
+		}
+
+		inv, err := replaceRootInverse(*doc, options)
+		if err != nil {
+			return nil, err
 		}
 
 		*doc = pd
 
-		return nil
+		return inv, nil
 	}
+
+	// Find the deepest prefix of the path that is missing before the patch
+	// runs. The entries created for it by EnsurePathExistsOnAdd have to be
+	// removed again by the inverse, whereas pre-existing containers must be
+	// left alone.
+	missingParentDepth := pathMissingDepth(doc, path, options)
 
 	if options.EnsurePathExistsOnAdd {
 		err = ensurePathExists(doc, path, options)
 
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	con, key := findObject(doc, path, options)
 
 	if con == nil {
-		return fmt.Errorf("add operation does not apply: doc is missing path: \"%s\": %w", path, ErrMissing)
+		return nil, fmt.Errorf("add operation does not apply: doc is missing path: \"%s\": %w", path, ErrMissing)
+	}
+
+	var inv Patch
+
+	switch c := con.(type) {
+	case *partialArray:
+		idx, perr := addIndex(c, key, options)
+		if perr != nil {
+			break
+		}
+
+		inv = Patch{removeInverseOp(withIndex(path, idx))}
+	case *partialDoc:
+		if old, ok := c.obj[key]; ok {
+			inv = Patch{replaceInverseOp(path, old, options)}
+		} else {
+			inv = Patch{removeInverseOp(path)}
+		}
 	}
 
 	err = con.add(key, op.value(), options)
 	if err != nil {
-		return fmt.Errorf("error in add for path: '%s': %w", path, err)
+		return nil, fmt.Errorf("error in add for path: '%s': %w", path, err)
 	}
 
-	return nil
+	if missingParentDepth > 0 {
+		inv = append(inv, inversePathCleanup(path, missingParentDepth)...)
+	}
+
+	return inv, nil
 }
 
 // Given a document and a path to a key, walk the path and create all missing elements
@@ -951,33 +984,63 @@ func validatePatch(p Patch) error {
 	return nil
 }
 
-func (p Patch) remove(doc *container, op Operation, options *ApplyOptions) error {
+func (p Patch) remove(doc *container, op Operation, options *ApplyOptions) (Patch, error) {
 	path, err := op.Path()
 	if err != nil {
-		return fmt.Errorf("remove operation failed to decode path: %w", ErrMissing)
+		return nil, fmt.Errorf("remove operation failed to decode path: %w", ErrMissing)
 	}
 
 	con, key := findObject(doc, path, options)
 
 	if con == nil {
 		if options.AllowMissingPathOnRemove {
-			return nil
+			return Patch{}, nil
 		}
-		return fmt.Errorf("remove operation does not apply: doc is missing path: \"%s\": %w", path, ErrMissing)
+		return nil, fmt.Errorf("remove operation does not apply: doc is missing path: \"%s\": %w", path, ErrMissing)
+	}
+
+	var inv Patch
+
+	if path == "" {
+		return nil, fmt.Errorf("remove operation does not apply: doc is missing path: %q: %w", path, ErrMissing)
+	}
+
+	switch c := con.(type) {
+	case *partialArray:
+		idx, ierr := existingIndex(len(c.nodes), key, options)
+		if ierr != nil {
+			if options.AllowMissingPathOnRemove {
+				return Patch{}, nil
+			}
+			return nil, fmt.Errorf("error in remove for path: '%s': %w", path, ierr)
+		}
+		inv = Patch{addInverseOp(withIndex(path, idx), c.nodes[idx], options)}
+	case *partialDoc:
+		old, ok := c.obj[key]
+		if !ok {
+			if options.AllowMissingPathOnRemove {
+				return Patch{}, nil
+			}
+			return nil, fmt.Errorf("remove operation does not apply: doc is missing path: \"%s\": %w", path, ErrMissing)
+		}
+		inv = Patch{addInverseOp(path, old, options)}
 	}
 
 	err = con.remove(key, options)
 	if err != nil {
-		return fmt.Errorf("error in remove for path: '%s': %w", path, err)
+		if options.AllowMissingPathOnRemove {
+			return Patch{}, nil
+		}
+		return nil, fmt.Errorf("error in remove for path: '%s': %w", path, err)
 	}
 
-	return nil
+	return inv, nil
 }
 
-func (p Patch) replace(doc *container, op Operation, options *ApplyOptions) error {
+func (p Patch) replace(doc *container, op Operation, options *ApplyOptions) (Patch, error) {
 	path, err := op.Path()
 	if err != nil {
-		return fmt.Errorf("replace operation failed to decode path: %w", err)
+		return nil, fmt.Errorf("replace operation failed to decode path: %w", err)
 	}
 
 	if path == "" {
@@ -986,11 +1049,16 @@ func (p Patch) replace(doc *container, op Operation, options *ApplyOptions) erro
 		if val.which == eRaw {
 			if !val.tryDoc() {
 				if !val.tryAry() {
-					return fmt.Errorf("replace operation value must be object or array: %w", err)
+					return nil, fmt.Errorf("replace operation value must be object or array: %w", err)
 				}
 			} else {
 				val.doc.opts = options
 			}
+		}
+
+		inv, invErr := replaceRootInverse(*doc, options)
+		if invErr != nil {
+			return nil, invErr
 		}
 
 		switch val.which {
@@ -999,80 +1067,151 @@ func (p Patch) replace(doc *container, op Operation, options *ApplyOptions) erro
 		case eDoc:
 			*doc = val.doc
 		case eRaw:
-			return fmt.Errorf("replace operation hit impossible case: %w", err)
+			return nil, fmt.Errorf("replace operation hit impossible case: %w", err)
 		}
 
-		return nil
+		return inv, nil
 	}
 
 	con, key := findObject(doc, path, options)
 
 	if con == nil {
-		return fmt.Errorf("replace operation does not apply: doc is missing path: %s: %w", path, ErrMissing)
+		return nil, fmt.Errorf("replace operation does not apply: doc is missing path: %s: %w", path, ErrMissing)
 	}
 
-	_, ok := con.get(key, options)
+	old, ok := con.get(key, options)
 	if ok != nil {
-		return fmt.Errorf("replace operation does not apply: doc is missing key: %s: %w", path, ErrMissing)
+		return nil, fmt.Errorf("replace operation does not apply: doc is missing key: %s: %w", path, ErrMissing)
+	}
+
+	var inv Patch
+	switch c := con.(type) {
+	case *partialArray:
+		idx, ierr := existingIndex(len(c.nodes), key, options)
+		if ierr != nil {
+			return nil, fmt.Errorf("error in replace for path: '%s': %w", path, ierr)
+		}
+		inv = Patch{replaceInverseOp(withIndex(path, idx), old, options)}
+	default:
+		inv = Patch{replaceInverseOp(path, old, options)}
 	}
 
 	err = con.set(key, op.value(), options)
 	if err != nil {
-		return fmt.Errorf("error in remove for path: '%s': %w", path, err)
+		return nil, fmt.Errorf("error in remove for path: '%s': %w", path, err)
 	}
 
-	return nil
+	return inv, nil
 }
 
-func (p Patch) move(doc *container, op Operation, options *ApplyOptions) error {
+func (p Patch) move(doc *container, op Operation, options *ApplyOptions) (Patch, error) {
 	from, err := op.From()
 	if err != nil {
-		return fmt.Errorf("move operation failed to decode from: %w", err)
+		return nil, fmt.Errorf("move operation failed to decode from: %w", err)
 	}
 
 	if from == "" {
-		return fmt.Errorf("unable to move entire document to another path: %w", ErrInvalid)
+		return nil, fmt.Errorf("unable to move entire document to another path: %w", ErrInvalid)
+	}
+
+	path, err := op.Path()
+	if err != nil {
+		return nil, fmt.Errorf("move operation failed to decode path: %w", err)
 	}
 
 	con, key := findObject(doc, from, options)
 
 	if con == nil {
-		return fmt.Errorf("move operation does not apply: doc is missing from path: %s: %w", from, ErrMissing)
+		return nil, fmt.Errorf("move operation does not apply: doc is missing from path: %s: %w", from, ErrMissing)
 	}
 
 	val, err := con.get(key, options)
 	if err != nil {
-		return fmt.Errorf("error in move for path: '%s': %w", key, err)
+		return nil, fmt.Errorf("error in move for path: '%s': %w", key, err)
+	}
+
+	valCopy, _, err := deepCopy(val, options)
+	if err != nil {
+		return nil, fmt.Errorf("error while performing deep copy: %w", err)
+	}
+
+	// Record how to undo the removal at "from" before the source node goes
+	// away. Array indices are resolved against the pre-move array length.
+	var undoSource Operation
+	if srcAry, ok := con.(*partialArray); ok {
+		idx, ierr := existingIndex(len(srcAry.nodes), key, options)
+		if ierr != nil {
+			return nil, fmt.Errorf("error in move for path: '%s': %w", from, ierr)
+		}
+		undoSource = addInverseOp(withIndex(from, idx), valCopy, options)
+	} else {
+		undoSource = addInverseOp(from, valCopy, options)
+	}
+
+	var oldDst *lazyNode
+	oldDstExists := false
+	dstIsObjectOverwrite := false
+	if preDstCon, preDstKey := findObject(doc, path, options); preDstCon != nil {
+		if dstDoc, ok := preDstCon.(*partialDoc); ok {
+			if v, exists := dstDoc.obj[preDstKey]; exists {
+				oldDst, oldDstExists = v, true
+				dstIsObjectOverwrite = true
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("move operation does not apply: doc is missing destination path: %s: %w", path, ErrMissing)
 	}
 
 	err = con.remove(key, options)
 	if err != nil {
-		return fmt.Errorf("error in move for path: '%s': %w", key, err)
+		return nil, fmt.Errorf("error in move for path: '%s': %w", key, err)
 	}
 
-	path, err := op.Path()
-	if err != nil {
-		return fmt.Errorf("move operation failed to decode path: %w", err)
-	}
-
+	// Re-resolve the destination after the removal: inside a single array the
+	// removal rebuilt the slice, so the previously materialized partialArray
+	// would point at a stale copy.
 	con, key = findObject(doc, path, options)
 
 	if con == nil {
-		return fmt.Errorf("move operation does not apply: doc is missing destination path: %s: %w", path, ErrMissing)
+		return nil, fmt.Errorf("move operation does not apply: doc is missing destination path: %s: %w", path, ErrMissing)
+	}
+
+	dstResolvedIndex := 0
+	dstIsArray := false
+	if dstAry, ok := con.(*partialArray); ok {
+		dstIsArray = true
+		idx, ierr := addIndex(dstAry, key, options)
+		if ierr != nil {
+			return nil, fmt.Errorf("error in move for path: '%s': %w", path, ierr)
+		}
+		dstResolvedIndex = idx
 	}
 
 	err = con.add(key, val, options)
 	if err != nil {
-		return fmt.Errorf("error in move for path: '%s': %w", path, err)
+		return nil, fmt.Errorf("error in move for path: '%s': %w", path, err)
 	}
 
-	return nil
+	// Undo the destination change first, then restore the source.
+	var undoDst Operation
+	if dstIsArray {
+		// Insertion never overwrites in an array: removing the moved node
+		// shifts the displaced element back into place. The index is the
+		// post-removal/pre-add resolution, which is where the value lands.
+		undoDst = removeInverseOp(withIndex(path, dstResolvedIndex))
+	} else if dstIsObjectOverwrite && oldDstExists {
+		undoDst = replaceInverseOp(path, oldDst, options)
+	} else {
+		undoDst = removeInverseOp(path)
+	}
+
+	return Patch{undoDst, undoSource}, nil
 }
 
-func (p Patch) test(doc *container, op Operation, options *ApplyOptions) error {
+func (p Patch) test(doc *container, op Operation, options *ApplyOptions) (Patch, error) {
 	path, err := op.Path()
 	if err != nil {
-		return fmt.Errorf("test operation failed to decode path: %w", err)
+		return nil, fmt.Errorf("test operation failed to decode path: %w", err)
 	}
 
 	if path == "" {
@@ -1088,85 +1227,101 @@ func (p Patch) test(doc *container, op Operation, options *ApplyOptions) error {
 		}
 
 		if self.equal(op.value()) {
-			return nil
+			return Patch{op}, nil
 		}
 
-		return fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
+		return nil, fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
 	}
 
 	con, key := findObject(doc, path, options)
 
 	if con == nil {
-		return fmt.Errorf("test operation does not apply: is missing path: %s: %w", path, ErrMissing)
+		return nil, fmt.Errorf("test operation does not apply: is missing path: %s: %w", path, ErrMissing)
 	}
 
 	val, err := con.get(key, options)
 	if err != nil && errors.Unwrap(err) != ErrMissing {
-		return fmt.Errorf("error in test for path: '%s': %w", path, err)
+		return nil, fmt.Errorf("error in test for path: '%s': %w", path, err)
 	}
 
 	ov := op.value()
 
 	if val == nil {
 		if ov.isNull() {
-			return nil
+			return Patch{op}, nil
 		}
-		return fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
+		return nil, fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
 	} else if ov.isNull() {
-		return fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
+		return nil, fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
 	}
 
 	if val.equal(op.value()) {
-		return nil
+		return Patch{op}, nil
 	}
 
-	return fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
+	return nil, fmt.Errorf("testing value %s failed: %w", path, ErrTestFailed)
 }
 
-func (p Patch) copy(doc *container, op Operation, accumulatedCopySize *int64, options *ApplyOptions) error {
+func (p Patch) copy(doc *container, op Operation, accumulatedCopySize *int64, options *ApplyOptions) (Patch, error) {
 	from, err := op.From()
 	if err != nil {
-		return fmt.Errorf("copy operation failed to decode from: %w", err)
+		return nil, fmt.Errorf("copy operation failed to decode from: %w", err)
 	}
 
 	con, key := findObject(doc, from, options)
 
 	if con == nil {
-		return fmt.Errorf("copy operation does not apply: doc is missing from path: \"%s\": %w", from, ErrMissing)
+		return nil, fmt.Errorf("copy operation does not apply: doc is missing from path: \"%s\": %w", from, ErrMissing)
 	}
 
 	val, err := con.get(key, options)
 	if err != nil {
-		return fmt.Errorf("error in copy for from: '%s': %w", from, err)
+		return nil, fmt.Errorf("error in copy for from: '%s': %w", from, err)
 	}
 
 	path, err := op.Path()
 	if err != nil {
-		return fmt.Errorf("copy operation failed to decode path: %w", ErrMissing)
+		return nil, fmt.Errorf("copy operation failed to decode path: %w", ErrMissing)
 	}
 
 	con, key = findObject(doc, path, options)
 
 	if con == nil {
-		return fmt.Errorf("copy operation does not apply: doc is missing destination path: %s: %w", path, ErrMissing)
+		return nil, fmt.Errorf("copy operation does not apply: doc is missing destination path: %s: %w", path, ErrMissing)
 	}
 
 	valCopy, sz, err := deepCopy(val, options)
 	if err != nil {
-		return fmt.Errorf("error while performing deep copy: %w", err)
+		return nil, fmt.Errorf("error while performing deep copy: %w", err)
 	}
 
 	(*accumulatedCopySize) += int64(sz)
 	if options.AccumulatedCopySizeLimit > 0 && *accumulatedCopySize > options.AccumulatedCopySizeLimit {
-		return NewAccumulatedCopySizeError(options.AccumulatedCopySizeLimit, *accumulatedCopySize)
+		return nil, NewAccumulatedCopySizeError(options.AccumulatedCopySizeLimit, *accumulatedCopySize)
+	}
+
+	var inv Patch
+	switch c := con.(type) {
+	case *partialArray:
+		idx, ierr := addIndex(c, key, options)
+		if ierr != nil {
+			return nil, fmt.Errorf("error while adding value during copy: %w", ierr)
+		}
+		inv = Patch{removeInverseOp(withIndex(path, idx))}
+	case *partialDoc:
+		if old, ok := c.obj[key]; ok {
+			inv = Patch{replaceInverseOp(path, old, options)}
+		} else {
+			inv = Patch{removeInverseOp(path)}
+		}
 	}
 
 	err = con.add(key, valCopy, options)
 	if err != nil {
-		return fmt.Errorf("error while adding value during copy: %w", err)
+		return nil, fmt.Errorf("error while adding value during copy: %w", err)
 	}
 
-	return nil
+	return inv, nil
 }
 
 // Equal indicates if 2 JSON documents have the same structural equality.
@@ -1207,7 +1362,8 @@ func (p Patch) Apply(doc []byte) ([]byte, error) {
 // ApplyWithOptions mutates a JSON document according to the patch and the passed in ApplyOptions.
 // It returns the new document.
 func (p Patch) ApplyWithOptions(doc []byte, options *ApplyOptions) ([]byte, error) {
-	return p.ApplyIndentWithOptions(doc, "", options)
+	data, _, err := p.applyCore(doc, options, false)
+	return data, err
 }
 
 // ApplyIndent mutates a JSON document according to the patch, and returns the new
@@ -1219,12 +1375,32 @@ func (p Patch) ApplyIndent(doc []byte, indent string) ([]byte, error) {
 // ApplyIndentWithOptions mutates a JSON document according to the patch and the passed in ApplyOptions.
 // It returns the new document indented.
 func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyOptions) ([]byte, error) {
+	data, _, err := p.applyCore(doc, options, indent != "")
+	if err != nil {
+		return nil, err
+	}
+
+	if indent == "" {
+		return data, nil
+	}
+
+	var buf bytes.Buffer
+	json.Indent(&buf, data, "", indent)
+	return buf.Bytes(), nil
+}
+
+// applyCore runs the patch against doc and returns the resulting document.
+// When recordInverse is true it additionally returns an inverse patch that,
+// applied to the result in order, restores the original document. A failed
+// operation never produces a partial inverse: the inverse is nil on error,
+// including when a "test" operation fails.
+func (p Patch) applyCore(doc []byte, options *ApplyOptions, recordInverse bool) ([]byte, Patch, error) {
 	if len(doc) == 0 {
-		return doc, nil
+		return doc, nil, nil
 	}
 
 	if !json.Valid(doc) {
-		return nil, ErrInvalid
+		return nil, nil, ErrInvalid
 	}
 
 	raw := json.RawMessage(doc)
@@ -1245,48 +1421,53 @@ func (p Patch) ApplyIndentWithOptions(doc []byte, indent string, options *ApplyO
 	err := unmarshal(doc, pd)
 
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	err = nil
-
 	var accumulatedCopySize int64
+	var inverse Patch
 
 	for _, op := range p {
+		var opInverse Patch
+
 		switch op.Kind() {
 		case "add":
-			err = p.add(&pd, op, options)
+			opInverse, err = p.add(&pd, op, options)
 		case "remove":
-			err = p.remove(&pd, op, options)
+			opInverse, err = p.remove(&pd, op, options)
 		case "replace":
-			err = p.replace(&pd, op, options)
+			opInverse, err = p.replace(&pd, op, options)
 		case "move":
-			err = p.move(&pd, op, options)
+			opInverse, err = p.move(&pd, op, options)
 		case "test":
-			err = p.test(&pd, op, options)
+			opInverse, err = p.test(&pd, op, options)
 		case "copy":
-			err = p.copy(&pd, op, &accumulatedCopySize, options)
+			opInverse, err = p.copy(&pd, op, &accumulatedCopySize, options)
 		default:
 			err = fmt.Errorf("Unexpected kind: %s", op.Kind())
 		}
 
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+
+		if recordInverse {
+			// Each operation's inverse is produced in application order; the
+			// overall inverse applies in reverse, so prepend.
+			inverse = prependOps(inverse, opInverse)
 		}
 	}
 
 	data, err := json.MarshalEscaped(pd, options.EscapeHTML)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	if indent == "" {
-		return data, nil
+	if recordInverse && inverse == nil {
+		inverse = Patch{}
 	}
 
-	var buf bytes.Buffer
-	json.Indent(&buf, data, "", indent)
-	return buf.Bytes(), nil
+	return data, inverse, nil
 }
 
 // From http://tools.ietf.org/html/rfc6901#section-4 :

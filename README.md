@@ -149,6 +149,40 @@ Original document: {"name": "John", "age": 24, "height": 3.21}
 Modified document: {"age":24,"name":"Jane"}
 ```
 
+## Undo a patch with an inverse patch
+`patch.ApplyWithInverse(doc)` applies the patch like `Apply`, but also returns
+an inverse `jsonpatch.Patch`. Applying that inverse to the modified document
+restores the original document, including cases a naive name-swap cannot
+handle: an `add` that overwrote an existing value becomes a `replace` with the
+old value, a `move` inside one array accounts for the index shift, and
+operations against the root pointer replace the whole document.
+
+```go
+original := []byte(`{"user": {"name": "John", "roles": ["admin"]}}`)
+
+patch, _ := jsonpatch.DecodePatch([]byte(`[
+	{"op": "replace", "path": "/user/name", "value": "Jane"}
+]`))
+
+modified, inverse, err := patch.ApplyWithInverse(original)
+if err != nil {
+	log.Fatal(err)
+}
+
+restored, err := inverse.Apply(modified)
+if err != nil {
+	log.Fatal(err)
+}
+// restored is semantically equal to original
+```
+
+A passing `test` operation is kept in the inverse as a guard that verifies the
+restored value. If any operation fails (a failed `test` included), the inverse
+is `nil` and the document is left unchanged, so a partial undo can never be
+mistaken for a complete one. `ApplyWithInverseAndOptions` and
+`ApplyIndentWithInverseAndOptions` accept the usual `ApplyOptions` and
+indentation.
+
 ## Comparing JSON documents
 Due to potential whitespace and ordering differences, one cannot simply compare
 JSON strings or byte-arrays directly. 
