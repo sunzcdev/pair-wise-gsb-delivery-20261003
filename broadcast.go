@@ -13,6 +13,14 @@ a message hits the retransmit limit, it is removed from the queue.
 Additionally, older entries can be invalidated by new messages that
 are contradictory. For example, if we send "{suspect M1 inc: 1},
 then a following {alive M1 inc: 2} will invalidate that message
+
+Membership change messages occupy the high priority broadcast class while
+application messages supplied via Delegate.GetBroadcasts occupy the lower
+priority class. The queue interleaves them with an anti-starvation policy so
+that sustained membership churn cannot permanently lock out application
+traffic. When a logical broadcast is replaced by a newer version, the
+replacement is enqueued anew with a fresh zeroed transmit count instead of
+inheriting the consumed retransmit budget of the invalidated message.
 */
 
 type memberlistBroadcast struct {
@@ -35,6 +43,12 @@ func (b *memberlistBroadcast) Invalidates(other Broadcast) bool {
 // memberlist.NamedBroadcast optional interface
 func (b *memberlistBroadcast) Name() string {
 	return b.node
+}
+
+// Priority marks membership change messages as the high priority class so
+// that bursts of them are served before application broadcasts.
+func (b *memberlistBroadcast) Priority() BroadcastPriority {
+	return PriorityMemberlist
 }
 
 func (b *memberlistBroadcast) Message() []byte {
@@ -78,31 +92,33 @@ func (m *Memberlist) queueBroadcast(node string, msg []byte, notify chan struct{
 // a maximum byte size, while imposing a per-broadcast overhead. This is used
 // to fill a UDP packet with piggybacked data
 func (m *Memberlist) getBroadcasts(overhead, limit int) [][]byte {
-	// Get memberlist messages first
-	toSend := m.broadcasts.GetBroadcasts(overhead, limit)
-
-	// Check if the user has anything to broadcast
 	d := m.config.Delegate
-	if d != nil {
-		// Determine the bytes used already
-		bytesUsed := 0
-		for _, msg := range toSend {
-			bytesUsed += len(msg) + overhead
-		}
-
-		// Check space remaining for user messages
-		avail := limit - bytesUsed
-		if avail > overhead+userMsgOverhead {
-			userMsgs := d.GetBroadcasts(overhead+userMsgOverhead, avail)
-
-			// Frame each user message
-			for _, msg := range userMsgs {
-				buf := make([]byte, 1, len(msg)+1)
-				buf[0] = byte(userMsg)
-				buf = append(buf, msg...)
-				toSend = append(toSend, buf)
-			}
-		}
+	if d == nil {
+		return m.broadcasts.GetBroadcasts(overhead, limit)
 	}
-	return toSend
+
+	// Application traffic is served from the lower priority class. The
+	// queue applies anti-starvation between membership changes and these
+	// messages; memberlist broadcasts still go first during a membership
+	// burst.
+	userFn := func(cbOverhead, cbLimit int) [][]byte {
+		// cbOverhead is the memberlist per-message overhead. The delegate
+		// must additionally account for the userMsg type byte, so it is
+		// asked with cbOverhead+1.
+		userMsgs := d.GetBroadcasts(cbOverhead+userMsgOverhead, cbLimit)
+
+		// Frame each returned message with its userMsg type byte. The
+		// resulting buffers are exactly what goes on the wire, so charging
+		// cbOverhead+len(framed) in the scheduler matches the true cost.
+		framed := make([][]byte, 0, len(userMsgs))
+		for _, msg := range userMsgs {
+			buf := make([]byte, 1, len(msg)+1)
+			buf[0] = byte(userMsg)
+			buf = append(buf, msg...)
+			framed = append(framed, buf)
+		}
+		return framed
+	}
+
+	return m.broadcasts.getBroadcasts(overhead, limit, userFn)
 }
