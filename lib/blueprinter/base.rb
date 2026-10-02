@@ -51,7 +51,8 @@ module Blueprinter
           name,
           extractor,
           self,
-          block:
+          block:,
+          identifier: true
         )
       end
 

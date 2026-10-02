@@ -185,6 +185,75 @@ Output:
 </details>
 
 <details>
+<summary>Field Projection</summary>
+
+Sometimes an endpoint only needs a subset of a view's fields (e.g. just `id`
+and `owner.name`), and creating a near-duplicate view for each case is
+tedious. `render`, `render_as_hash`, and `render_as_json` accept a `fields:`
+option that projects the output for that single render. Field names are
+**output names**, so a field renamed with the `name:` option is addressed by
+its rendered name.
+
+```ruby
+class UserBlueprint < Blueprinter::Base
+  identifier :id
+  field :first_name
+  field :last_name
+end
+
+UserBlueprint.render(user, fields: [:id, :first_name])
+# => {"id":1,"first_name":"Meg"}
+```
+
+Projections are intersected with the selected `view:`. Requesting a field
+that the view does not contain (including one removed with `exclude`) raises
+`Blueprinter::Errors::InvalidProjection`; a field hidden by its own `if`/
+`unless` condition is simply omitted. Unselected fields are never extracted,
+and unselected associations are never read.
+
+Nested projections are expressed with a Hash, keyed by the association's
+output name:
+
+```ruby
+class VehicleBlueprint < Blueprinter::Base
+  identifier :id
+  field :make
+  association :owner, blueprint: UserBlueprint
+end
+
+VehicleBlueprint.render(vehicle, fields: [:id, owner: [:first_name]])
+# => {"id":1,"owner":{"id":7,"first_name":"Meg"}}
+```
+
+Identifiers are kept at every level by default. Pass `identifier: false` to
+project them out too; the setting cascades into nested associations, but
+listing an identifier explicitly always keeps it:
+
+```ruby
+VehicleBlueprint.render_as_hash(vehicle, fields: [:id, owner: [:first_name]], identifier: false)
+# => {id: 1, owner: {first_name: "Meg"}}
+
+VehicleBlueprint.render_as_hash(vehicle, fields: [:id, owner: [:id, :first_name]], identifier: false)
+# => {id: 1, owner: {id: 7, first_name: "Meg"}}
+```
+
+Selecting an association without a nested spec (e.g. `fields: [:owner]`)
+renders the association in full, using its configured view. A nested spec
+applied to a scalar (non-association) field, or an unknown field at any
+depth, raises `Errors::InvalidProjection` with the full dotted path
+(e.g. `Unknown field 'owner.nope'`).
+
+Projections are per-render and never modify the Blueprint's views or their
+field cache, so the same Blueprint can safely be rendered with different
+projections in succession or concurrently.
+
+Custom association extractors can opt into receiving the nested projection by
+declaring `def self.accepts_projection?; true; end` and accepting a
+`projection:` keyword on `#extract`.
+
+</details>
+
+<details>
 <summary>Identifiers</summary>
 
 

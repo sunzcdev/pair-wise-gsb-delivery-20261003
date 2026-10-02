@@ -1,5 +1,5 @@
 ## Unreleased
---
+- 🚀 [FEATURE] Adds per-render field projection via the `fields:` option, including nested projections for associations (`fields: [:id, owner: [:name]]`) and an `identifier: false` option to also project out identifiers. Projections intersect with the selected view, never extract unselected fields or read excluded associations, and do not mutate Blueprint views or their cache.
 
 ## 1.3.0 - 2026/04/14
 - 🚀 [FEATURE] Adds support for `Symbol#to_proc` syntax in fields and identifiers. See [#546](https://github.com/procore-oss/blueprinter/pull/546). Thanks to [@tob1k](https://github.com/tob1k).

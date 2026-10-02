@@ -8,11 +8,15 @@ module Blueprinter
   class AssociationExtractor < Extractor
     include EmptyTypes
 
+    def self.accepts_projection?
+      true
+    end
+
     def initialize
       @extractor = Blueprinter.configuration.default_extractor
     end
 
-    def extract(association_name, object, local_options, options = {})
+    def extract(association_name, object, local_options, options = {}, projection: nil)
       options_without_default = if options.key?(:default) || options.key?(:default_if)
                                   options.except(:default, :default_if)
                                 else
@@ -27,7 +31,8 @@ module Blueprinter
 
       view = options[:view] || :default
       blueprint = association_blueprint(options[:blueprint], value)
-      blueprint.hashify(value, view_name: view, local_options:)
+      projection&.validate!(blueprint, view)
+      blueprint.hashify(value, view_name: view, local_options:, projection:)
     end
 
     private

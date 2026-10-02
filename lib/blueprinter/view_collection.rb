@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'set'
+
 require 'blueprinter/view'
 
 module Blueprinter
@@ -61,6 +63,16 @@ module Blueprinter
       @cache[:fields][view_name]
     end
 
+    # Returns a Set of output field names that have been explicitly excluded
+    # from the provided View through `exclude`/`excludes` or included views.
+    # @param [String] view_name
+    # @return [Set<Symbol>]
+    def excluded_field_names_for(view_name)
+      ensure_cached!
+
+      @cache[:excluded_fields][view_name]
+    end
+
     # Returns an array of Transformer objects for the provided View.
     # @param [String] view_name
     # @return [Array<Transformer>]
@@ -100,13 +112,19 @@ module Blueprinter
 
         fields = {}
         transformers = {}
+        excluded_fields = {}
 
         views.each_key do |view_name|
           fields[view_name] = build_fields_for(view_name).freeze
           transformers[view_name] = build_transformers(view_name).freeze
+          excluded_fields[view_name] = build_excluded_field_names_for(view_name).freeze
         end
 
-        @cache = { fields: fields.freeze, transformers: transformers.freeze }.freeze
+        @cache = {
+          fields: fields.freeze,
+          transformers: transformers.freeze,
+          excluded_fields: excluded_fields.freeze
+        }.freeze
       end
     end
 
@@ -119,6 +137,11 @@ module Blueprinter
       (identifier_fields + sorted_fields).tap do |fields_array|
         fields_array.reject! { |field| excluded_fields.include?(field.name) }
       end
+    end
+
+    def build_excluded_field_names_for(view_name)
+      _fields, excluded_fields = sortable_fields(view_name)
+      excluded_fields.keys.to_set
     end
 
     def build_transformers(view_name)

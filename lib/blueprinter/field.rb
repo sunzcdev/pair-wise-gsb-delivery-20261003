@@ -17,6 +17,18 @@ module Blueprinter
       extractor.extract(method, object, local_options, options)
     end
 
+    # Extracts the field value while forwarding a nested Projection. Only
+    # extractors that opt in via `.accepts_projection?` receive it, which
+    # preserves backwards compatibility with custom extractors whose `extract`
+    # implementations declare no keyword arguments.
+    def extract_with_projection(object, local_options, projection)
+      if extractor.class.accepts_projection?
+        extractor.extract(method, object, local_options, options, projection: projection)
+      else
+        extract(object, local_options)
+      end
+    end
+
     def skip?(field_name, object, local_options)
       return true if if_callable && !if_callable.call(field_name, object, local_options)
 

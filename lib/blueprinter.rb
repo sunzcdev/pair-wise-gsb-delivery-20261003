@@ -7,6 +7,7 @@ module Blueprinter
   autoload :Deprecation, 'blueprinter/deprecation'
   autoload :Errors, 'blueprinter/errors'
   autoload :Extension, 'blueprinter/extension'
+  autoload :Projection, 'blueprinter/projection'
   autoload :Transformer, 'blueprinter/transformer'
 
   class << self
