@@ -8,9 +8,36 @@ import (
 )
 
 type messageWriter struct {
-	w   io.Writer
+	w    io.Writer
+	mode Mode
+
+	// MBOXO: an incomplete line (no newline yet) is buffered here.
 	buf bytes.Buffer
+
+	// MBOXRD: streaming escaper state. The escaper only ever holds a
+	// single leading '>', at most headerLen-1 bytes of a tentative
+	// "From " match and an optional dangling CR, so the retained state
+	// is bounded even for arbitrarily long lines.
+	state   rdWriterState
+	hold    bool // a single leading '>' is held back
+	cr      bool // a dangling CR is waiting for the next byte
+	fromBuf [headerLen]byte
+	fromLen int
+	staged  []byte
 }
+
+type rdWriterState int
+
+const (
+	rdLineStart rdWriterState = iota
+	rdGT
+	rdFrom
+	rdBody
+)
+
+// mboxrdFlushSize bounds the bytes accumulated in the writer before they are
+// forwarded to the underlying writer.
+const mboxrdFlushSize = 4096
 
 func (mw *messageWriter) writeLine(l []byte) (int, error) {
 	if bytes.HasPrefix(l, header) {
@@ -22,7 +49,152 @@ func (mw *messageWriter) writeLine(l []byte) (int, error) {
 	return mw.w.Write(l)
 }
 
+// stage appends a byte to the staging buffer.
+func (mw *messageWriter) stage(b byte) {
+	mw.staged = append(mw.staged, b)
+}
+
+func (mw *messageWriter) stageBytes(b []byte) {
+	mw.staged = append(mw.staged, b...)
+}
+
+// releaseHold emits a held-back leading '>', if any.
+func (mw *messageWriter) releaseHold() {
+	if mw.hold {
+		mw.stage('>')
+		mw.hold = false
+	}
+}
+
+func (mw *messageWriter) flushStaged() error {
+	if len(mw.staged) == 0 {
+		return nil
+	}
+	if _, err := mw.w.Write(mw.staged); err != nil {
+		mw.staged = mw.staged[:0]
+		return err
+	}
+	mw.staged = mw.staged[:0]
+	return nil
+}
+
+// endLine emits any bytes held back from the current line followed by a LF.
+func (mw *messageWriter) endLine() {
+	mw.releaseHold()
+	if mw.fromLen > 0 {
+		mw.stageBytes(mw.fromBuf[:mw.fromLen])
+		mw.fromLen = 0
+	}
+	mw.stage('\n')
+	mw.state = rdLineStart
+}
+
+func (mw *messageWriter) writeMBOXRD(p []byte) (int, error) {
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+
+		if mw.cr {
+			if c == '\n' {
+				// CRLF is normalized to LF.
+				mw.cr = false
+				mw.endLine()
+				goto flush
+			}
+
+			// A bare CR is ordinary in-line content: it does not end
+			// the line, but it breaks any leading '>' run or tentative
+			// "From " match.
+			mw.cr = false
+			mw.releaseHold()
+			if mw.fromLen > 0 {
+				mw.stageBytes(mw.fromBuf[:mw.fromLen])
+				mw.fromLen = 0
+			}
+			mw.stage('\r')
+			mw.state = rdBody
+			mw.stage(c)
+			goto flush
+		}
+
+		switch c {
+		case '\r':
+			mw.cr = true
+			continue
+		case '\n':
+			mw.endLine()
+		default:
+			switch mw.state {
+			case rdLineStart:
+				switch c {
+				case '>':
+					mw.hold = true
+					mw.state = rdGT
+				case 'F':
+					mw.fromBuf[0] = 'F'
+					mw.fromLen = 1
+					mw.state = rdFrom
+				default:
+					mw.stage(c)
+					mw.state = rdBody
+				}
+			case rdGT:
+				switch c {
+				case '>':
+					// Emit the previously held '>' and hold the new
+					// one, so the leading run is never buffered as a
+					// whole.
+					mw.releaseHold()
+					mw.hold = true
+				case 'F':
+					mw.fromBuf[0] = 'F'
+					mw.fromLen = 1
+					mw.state = rdFrom
+				default:
+					mw.releaseHold()
+					mw.stage(c)
+					mw.state = rdBody
+				}
+			case rdFrom:
+				mw.fromBuf[mw.fromLen] = c
+				mw.fromLen++
+				switch {
+				case mw.fromLen == len(header) && bytes.Equal(mw.fromBuf[:], header):
+					// A leading '>' run followed by "From ": add one
+					// quoting layer. The extra '>' is inserted before
+					// the held byte, which is indistinguishable from
+					// inserting it at the run start.
+					mw.stage('>')
+					mw.releaseHold()
+					mw.stageBytes(header)
+					mw.fromLen = 0
+					mw.state = rdBody
+				case !bytes.HasPrefix(header, mw.fromBuf[:mw.fromLen]):
+					mw.releaseHold()
+					mw.stageBytes(mw.fromBuf[:mw.fromLen])
+					mw.fromLen = 0
+					mw.state = rdBody
+				}
+			case rdBody:
+				mw.stage(c)
+			}
+		}
+
+	flush:
+		if len(mw.staged) >= mboxrdFlushSize {
+			if err := mw.flushStaged(); err != nil {
+				return i + 1, err
+			}
+		}
+	}
+
+	return len(p), mw.flushStaged()
+}
+
 func (mw *messageWriter) Write(p []byte) (int, error) {
+	if mw.mode == MBOXRD {
+		return mw.writeMBOXRD(p)
+	}
+
 	// We will return the number of bytes *from p* that were written. Since
 	// we'll scan all the bytes already in the buffer before the write and
 	// those in p, we need to remember the initial buffer length.
@@ -72,6 +244,24 @@ func (mw *messageWriter) Write(p []byte) (int, error) {
 }
 
 func (mw *messageWriter) Close() error {
+	if mw.mode == MBOXRD {
+		mw.releaseHold()
+		if mw.fromLen > 0 {
+			mw.stageBytes(mw.fromBuf[:mw.fromLen])
+			mw.fromLen = 0
+		}
+		if mw.cr {
+			mw.stage('\r')
+			mw.cr = false
+		}
+		if err := mw.flushStaged(); err != nil {
+			return err
+		}
+
+		_, err := mw.w.Write([]byte("\n\n"))
+		return err
+	}
+
 	b := mw.buf.Bytes()
 	mw.buf.Reset()
 	if _, err := mw.writeLine(b); err != nil {
@@ -86,13 +276,20 @@ func (mw *messageWriter) Close() error {
 // end the stream.
 type Writer struct {
 	w      io.Writer
+	mode   Mode
 	last   *messageWriter
 	closed bool
 }
 
 // NewWriter creates a new Writer that writes messages to w.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{w: w}
+	return NewWriterMode(w, MBOXO)
+}
+
+// NewWriterMode creates a new Writer that writes messages to w using the
+// provided escaping mode.
+func NewWriterMode(w io.Writer, mode Mode) *Writer {
+	return &Writer{w: w, mode: mode}
 }
 
 // CreateMessage appends a message to the mbox stream. The message text
@@ -123,7 +320,7 @@ func (w *Writer) CreateMessage(from string, t time.Time) (io.Writer, error) {
 		return nil, err
 	}
 
-	w.last = &messageWriter{w: w.w}
+	w.last = &messageWriter{w: w.w, mode: w.mode}
 	return w.last, nil
 }
 
