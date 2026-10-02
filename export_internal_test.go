@@ -1,12 +1,17 @@
 package paseto
 
+import "aidanwoods.dev/go-result/result"
+
 // This file is only compiled during tests due to the _test suffix. It serves
 // the purpose of exporting some internal functions, which are used in
 // paseto_test.
 
 type Packet = packet
 
-var NewMessage = newMessage
+func NewMessage(protocol Protocol, token string) result.Result[message] {
+	return newMessage(protocol, Limits{}, token)
+}
+
 var NewPacket = newPacket
 
 var V2LocalDecrypt = v2LocalDecrypt

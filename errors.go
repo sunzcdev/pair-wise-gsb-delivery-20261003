@@ -1,6 +1,9 @@
 package paseto
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // Any cryptography issue (with the token) or formatting error.
 // This does not include cryptography errors with input key material, these will
@@ -10,6 +13,17 @@ type TokenError struct {
 }
 
 func newTokenError(e error) error {
+	return TokenError{e}
+}
+
+// singleTokenError ensures an error is a TokenError without nesting another
+// TokenError inside it.
+func singleTokenError(e error) error {
+	var inner TokenError
+	if errors.As(e, &inner) {
+		return inner
+	}
+
 	return TokenError{e}
 }
 
@@ -69,6 +83,10 @@ func errorMessageParts(given int) error {
 
 func errorMessageHeader(expected Protocol, givenHeader string) error {
 	return newTokenError(fmt.Errorf("message header `%s' is not valid, expected `%s'", givenHeader, expected.Header()))
+}
+
+func plainHeaderError(expected Protocol, givenHeader string) error {
+	return fmt.Errorf("message header `%s' is not valid, expected `%s'", givenHeader, expected.Header())
 }
 
 func errorMessageHeaderDecrypt(expected Protocol, givenHeader string) error {

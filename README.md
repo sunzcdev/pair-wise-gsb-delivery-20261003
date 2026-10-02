@@ -11,6 +11,7 @@ Paseto is everything you love about JOSE (JWT, JWE, JWS) without any of the
   * [Key Differences between Paseto and JWT](#key-differences-between-paseto-and-jwt)
 * [Installation](#installation)
 * [Overview of the Go library](#overview-of-the-go-library)
+* [Size Limits](#size-limits)
 * [Supported Paseto Versions](#supported-paseto-versions)
 
 # What is Paseto?
@@ -97,6 +98,72 @@ require.Equal(t,
     string(token.Footer()),
 )
 require.NoError(t, err)
+```
+
+# Size Limits
+
+Parsers can optionally reject oversized tokens before doing any expensive work.
+There are three independent budgets, each measured in bytes:
+
+```go
+type Limits struct {
+    Token   int // length of the complete encoded token string
+    Payload int // length of the decoded payload section
+    Footer  int // length of the decoded footer section
+}
+```
+
+A zero (or negative) value means that budget is unlimited, so the zero value
+`Limits{}` preserves the default behaviour of accepting tokens of any size.
+
+Limits are configured on the parser with `SetLimits` and are enforced by every
+parse entry point (`ParseV2Local`, `ParseV2Public`, `ParseV3Local`,
+`ParseV3Public`, `ParseV4Local`, and `ParseV4Public`), as well as
+`UnsafeParseFooter`:
+
+```go
+parser := paseto.NewParser()
+parser.SetLimits(paseto.Limits{
+    Token:   8 * 1024, // reject encoded tokens longer than 8 KiB
+    Payload: 6 * 1024, // reject decoded payloads longer than 6 KiB
+    Footer:  1 * 1024, // reject decoded footers longer than 1 KiB
+})
+```
+
+The token budget is checked first, against the complete encoded string. The
+payload and footer budgets are then screened using the encoded length (so
+clearly oversized input is discarded before base64 decoding) and verified again
+against the actual decoded length. Limits are always enforced before any
+signature verification or decryption, so an oversized token never incurs
+cryptographic cost, and parser rules are never invoked for it.
+
+The payload budget covers the full decoded cryptographic payload, which
+contains fixed overhead in addition to the application's claims JSON. The space
+left for claims is therefore the payload budget minus the following overhead:
+
+| Protocol    | Fixed payload overhead                                         |
+|-------------|----------------------------------------------------------------|
+| `v2.local`  | 40 bytes (24 byte nonce and 16 byte XChaCha20-Poly1305 tag)    |
+| `v2.public` | 64 bytes (Ed25519 signature)                                   |
+| `v3.local`  | 80 bytes (32 byte nonce and 48 byte HMAC-SHA-384 tag)          |
+| `v3.public` | 96 bytes (ECDSA signature over P-384)                          |
+| `v4.local`  | 64 bytes (32 byte nonce and 32 byte HMAC-SHA-512/256 tag)      |
+| `v4.public` | 64 bytes (Ed25519 signature)                                   |
+
+The footer budget is independent of this overhead; an absent or empty footer
+always satisfies it.
+
+An exceeded limit returns an error wrapping both `TokenError` and a
+`BudgetExceededError`. The `Budget` field identifies which budget was exceeded
+(`TokenBudget`, `PayloadBudget`, or `FooterBudget`), and the error never
+contains the original token:
+
+```go
+_, err := parser.ParseV4Local(key, tainted, nil)
+var budgetErr paseto.BudgetExceededError
+if errors.As(err, &budgetErr) {
+    // budgetErr.Budget identifies the exceeded budget
+}
 ```
 
 # Supported Claims Validators

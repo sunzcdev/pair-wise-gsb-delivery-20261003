@@ -15,26 +15,36 @@ type message struct {
 	footer   []byte
 }
 
-// NewMessage creates a new message from the given token, with an expected
-// protocol. If the given token does not match the given token, or if the
-// token cannot be parsed, will return an error instead.
-func newMessage(protocol Protocol, token string) result.Result[message] {
+// newMessage creates a new message from the given token, with an expected
+// protocol and size limits. If the token does not match the expected protocol,
+// exceeds a limit, or cannot be parsed, an error is returned instead.
+func newMessage(protocol Protocol, limits Limits, token string) result.Result[message] {
 	var parts deconstructedToken
-	if err := deconstructToken(token).Ok(&parts); err != nil {
-		return result.Err[message](err)
-	}
-
-	if parts.header != protocol.Header() {
-		return result.Err[message](errorMessageHeader(protocol, parts.header))
+	if err := limits.checkMessage(protocol, token).Ok(&parts); err != nil {
+		return result.Err[message](singleTokenError(err))
 	}
 
 	decoded := encoding.Decode(parts.encodedPayload)
-	p := result.FlatMap(decoded, protocol.newPayload)
-	footer := encoding.Decode(parts.encodedFooter)
+	checkedPayload := result.FlatMap(decoded, func(bytes []byte) result.Result[[]byte] {
+		if err := limits.enforceDecoded(PayloadBudget, limits.Payload, bytes); err != nil {
+			return result.Err[[]byte](err)
+		}
+
+		return result.Ok(bytes)
+	})
+	p := result.FlatMap(checkedPayload, protocol.newPayload)
+
+	footer := result.FlatMap(encoding.Decode(parts.encodedFooter), func(bytes []byte) result.Result[[]byte] {
+		if err := limits.enforceDecoded(FooterBudget, limits.Footer, bytes); err != nil {
+			return result.Err[[]byte](err)
+		}
+
+		return result.Ok(bytes)
+	})
 
 	msg := result.Map2(p, footer, newMessageFromPayloadAndFooter)
 
-	return msg.MapError(newTokenError)
+	return msg.MapError(singleTokenError)
 }
 
 // Header returns the header string for a Paseto message.
