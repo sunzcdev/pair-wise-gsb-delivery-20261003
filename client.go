@@ -303,6 +303,24 @@ type Client struct {
 	// By default request write timeout is unlimited.
 	WriteTimeout time.Duration
 
+	// ExpectContinueTimeout, if positive, enables two-phase sending for
+	// requests containing an 'Expect: 100-continue' header. The client sends
+	// only the request headers and waits up to this duration for the server
+	// to respond:
+	//
+	//   - A '100 Continue' response makes the client send the request body
+	//     and continue reading the final response.
+	//   - Any other final (non-1xx) response is returned immediately without
+	//     sending (or even reading) the request body.
+	//   - Any other 1xx response is ignored and the client keeps waiting.
+	//   - If the timeout elapses without a response, the client sends the
+	//     request body anyway, as recommended by RFC 9110.
+	//
+	// Requests without an 'Expect: 100-continue' header are unaffected.
+	// If zero or negative, Expect: 100-continue requests are sent in a single
+	// phase like any other request.
+	ExpectContinueTimeout time.Duration
+
 	// Maximum response body size.
 	//
 	// The client returns ErrBodyTooLarge if this limit is greater than 0
@@ -615,6 +633,7 @@ func (c *Client) hostClient(host []byte, isTLS bool) (*HostClient, error) {
 		WriteBufferSize:               c.WriteBufferSize,
 		ReadTimeout:                   c.ReadTimeout,
 		WriteTimeout:                  c.WriteTimeout,
+		ExpectContinueTimeout:         c.ExpectContinueTimeout,
 		MaxResponseBodySize:           c.MaxResponseBodySize,
 		DisableHeaderNamesNormalizing: c.DisableHeaderNamesNormalizing,
 		DisablePathNormalizing:        c.DisablePathNormalizing,
@@ -955,6 +974,24 @@ type HostClient struct {
 
 	// Connection pool strategy. Can be either LIFO or FIFO (default).
 	ConnPoolStrategy ConnPoolStrategyType
+
+	// ExpectContinueTimeout, if positive, enables two-phase sending for
+	// requests containing an 'Expect: 100-continue' header. The client sends
+	// only the request headers and waits up to this duration for the server
+	// to respond:
+	//
+	//   - A '100 Continue' response makes the client send the request body
+	//     and continue reading the final response.
+	//   - Any other final (non-1xx) response is returned immediately without
+	//     sending (or even reading) the request body.
+	//   - Any other 1xx response is ignored and the client keeps waiting.
+	//   - If the timeout elapses without a response, the client sends the
+	//     request body anyway, as recommended by RFC 9110.
+	//
+	// Requests without an 'Expect: 100-continue' header are unaffected.
+	// If zero or negative, Expect: 100-continue requests are sent in a single
+	// phase like any other request.
+	ExpectContinueTimeout time.Duration
 
 	connsCount int
 
@@ -3440,27 +3477,6 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	bw := hc.AcquireWriter(conn)
-	err = req.Write(bw)
-
-	if resetConnection {
-		req.Header.ResetConnectionClose()
-	}
-
-	if err == nil {
-		err = bw.Flush()
-	}
-	hc.ReleaseWriter(bw)
-
-	// Return ErrTimeout on any timeout.
-	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
-		err = ErrTimeout
-	}
-
-	if err != nil {
-		hc.CloseConn(cc)
-		return true, err
-	}
-
 	readDeadline := deadline
 	if hc.ReadTimeout > 0 {
 		tmpReadDeadline := time.Now().Add(hc.ReadTimeout)
@@ -3482,7 +3498,162 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	br := hc.AcquireReader(conn)
-	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+
+	// continueUsed reports whether the request headers were sent without the
+	// body while waiting for a '100 Continue' interim response.
+	continueUsed := hc.ExpectContinueTimeout > 0 && req.MayContinue() && req.hasRequestBody()
+
+	if continueUsed {
+		err = req.WriteHeader(bw)
+		if err == nil {
+			err = bw.Flush()
+		}
+	} else {
+		err = req.Write(bw)
+		if err == nil {
+			err = bw.Flush()
+		}
+	}
+
+	if resetConnection {
+		req.Header.ResetConnectionClose()
+	}
+
+	// Return ErrTimeout on any timeout.
+	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
+		err = ErrTimeout
+	}
+
+	if err != nil {
+		hc.ReleaseWriter(bw)
+		hc.ReleaseReader(br)
+		hc.CloseConn(cc)
+		return true, err
+	}
+
+	// headerAlreadyRead is true when the first response header was consumed
+	// during the Expect: 100-continue handshake below, so only the remaining
+	// interim responses and the final response body must be read.
+	headerAlreadyRead := false
+	// rejectedBeforeBody is true when the server answered the Expect
+	// handshake with a final response before the body was sent. The request
+	// body is still pending, so the connection cannot be safely reused.
+	rejectedBeforeBody := false
+	if continueUsed {
+		continueDeadline := time.Now().Add(hc.ExpectContinueTimeout)
+		if !readDeadline.IsZero() && readDeadline.Before(continueDeadline) {
+			continueDeadline = readDeadline
+		}
+		if err = conn.SetReadDeadline(continueDeadline); err != nil {
+			hc.ReleaseWriter(bw)
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			return true, err
+		}
+
+		sendBody := false
+		continueReadDeadlineSet := false
+		interimCount := 0
+		for {
+			if err = resp.Header.Read(br); err != nil {
+				if err == ErrTimeout {
+					// The server didn't respond to Expect within the deadline.
+					// Per RFC 9110 send the body anyway and then await the
+					// final response using the normal read deadline.
+					sendBody = true
+					if err = conn.SetReadDeadline(readDeadline); err != nil {
+						hc.ReleaseWriter(bw)
+						hc.ReleaseReader(br)
+						hc.CloseConn(cc)
+						return true, err
+					}
+					err = nil
+					continueReadDeadlineSet = true
+					break
+				}
+				// The connection was closed or broke before the server made a
+				// decision. Abort; buffered requests may be retried by the
+				// caller, while a body stream can't be replayed.
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				if err == io.EOF {
+					err = ErrConnectionClosed
+				}
+				return true, err
+			}
+
+			statusCode := resp.Header.StatusCode()
+			switch {
+			case statusCode == StatusContinue:
+				// Explicit permission to send the body.
+				sendBody = true
+			case statusCode >= 100 && statusCode < 200:
+				// Any other interim response (e.g. 103 Early Hints) is not
+				// permission to send the body; keep waiting.
+				interimCount++
+				if interimCount >= maxInterimResponses {
+					hc.ReleaseWriter(bw)
+					hc.ReleaseReader(br)
+					hc.CloseConn(cc)
+					return false, errTooManyInterimResponses
+				}
+				continue
+			default:
+				// A final response (often 413 Payload Too Large): return it
+				// directly. The request body was never read from its source.
+				headerAlreadyRead = true
+				rejectedBeforeBody = true
+				if req.IsBodyStream() {
+					_ = req.closeBodyStream()
+				}
+				if err = conn.SetReadDeadline(readDeadline); err != nil {
+					hc.ReleaseWriter(bw)
+					hc.ReleaseReader(br)
+					hc.CloseConn(cc)
+					return true, err
+				}
+			}
+			break
+		}
+
+		if sendBody {
+			if err = conn.SetWriteDeadline(writeDeadline); err != nil {
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return true, err
+			}
+			if err = req.WriteBody(bw); err == nil {
+				err = bw.Flush()
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				err = ErrTimeout
+			}
+			if err != nil {
+				hc.ReleaseWriter(bw)
+				hc.ReleaseReader(br)
+				hc.CloseConn(cc)
+				return true, err
+			}
+			if !continueReadDeadlineSet {
+				if err = conn.SetReadDeadline(readDeadline); err != nil {
+					hc.ReleaseWriter(bw)
+					hc.ReleaseReader(br)
+					hc.CloseConn(cc)
+					return true, err
+				}
+			}
+		}
+	}
+
+	hc.ReleaseWriter(bw)
+
+	if headerAlreadyRead {
+		err = resp.readAfterFirstHeader(br, hc.MaxResponseBodySize)
+	} else {
+		err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+	}
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
@@ -3491,7 +3662,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		return needRetry, err
 	}
 
-	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose()
+	closeConn := resetConnection || rejectedBeforeBody || req.ConnectionClose() || resp.ConnectionClose()
 	if customStreamBody && resp.bodyStream != nil {
 		// releaseConn runs when the caller closes the body stream, so it has to
 		// re-check resp.ConnectionClose(): a caller may only decide that the
