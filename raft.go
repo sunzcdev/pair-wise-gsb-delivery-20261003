@@ -157,6 +157,10 @@ func (r *Raft) run() {
 
 // runFollower runs the main loop while in the follower state.
 func (r *Raft) runFollower() {
+	// Start from a clean preference slate: rounds must never survive a
+	// transition into follower state (start-up, failed election, step-down).
+	r.resetPreference()
+
 	didWarn := false
 	leaderAddr, leaderID := r.LeaderWithID()
 	r.logger.Info("entering follower state", "follower", r, "leader-address", leaderAddr, "leader-id", leaderID)
@@ -210,6 +214,23 @@ func (r *Raft) runFollower() {
 
 		case <-r.followerNotifyCh:
 			heartbeatTimer = time.After(0)
+
+		case <-r.preferenceKickCh:
+			r.mainThreadSaturation.working()
+			// A lower-priority server is campaigning and this server
+			// outranks it: campaign immediately (pre-vote) so the preferred
+			// server can win within the bounded window. Only valid without a
+			// known leader.
+			if leaderAddr, _ := r.LeaderWithID(); leaderAddr == "" {
+				r.logger.Info("preference kick: starting pre-vote campaign ahead of a lower-priority candidate")
+				r.setLeader("", "")
+				r.setState(Candidate)
+				return
+			}
+
+		case s := <-r.preferenceSettleCh:
+			r.mainThreadSaturation.working()
+			r.settlePreference(s.term, s.generation)
 
 		case <-heartbeatTimer:
 			r.mainThreadSaturation.working()
@@ -288,6 +309,16 @@ func (r *Raft) runCandidate() {
 	r.logger.Info("entering candidate state", "node", r, "term", term)
 	metrics.IncrCounter([]string{"raft", "state", "candidate"}, 1)
 
+	// Ensure the bounded preference window exists for this election. If we are
+	// campaigning because a follower window already opened for this term (a
+	// preference kick), windowFor reuses it so the wait budget and observed
+	// priorities carry into our campaign; a candidate restart opens a new one.
+	if r.preferenceEnabled() && !r.candidateFromLeadershipTransfer.Load() {
+		r.windowFor(term)
+	} else {
+		r.resetPreference()
+	}
+
 	// Start vote for us, and set a timeout
 	var voteCh <-chan *voteResult
 	var prevoteCh <-chan *preVoteResult
@@ -297,6 +328,8 @@ func (r *Raft) runCandidate() {
 	if !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {
 		prevoteCh = r.preElectSelf()
 	} else {
+		// Pre-vote is disabled (or this is a leadership transfer). Only seed a
+		// transfers bypass preference (handled above).
 		voteCh = r.electSelf()
 	}
 
@@ -324,6 +357,9 @@ func (r *Raft) runCandidate() {
 		case rpc := <-r.rpcCh:
 			r.mainThreadSaturation.working()
 			r.processRPC(rpc)
+		case s := <-r.preferenceSettleCh:
+			r.mainThreadSaturation.working()
+			r.settlePreference(s.term, s.generation)
 		case preVote := <-prevoteCh:
 			// This a pre-vote case it should trigger a "real" election if the pre-vote is won.
 			r.mainThreadSaturation.working()
@@ -353,6 +389,9 @@ func (r *Raft) runCandidate() {
 				preVoteRefusedVotes = 0
 				electionTimer = randomTimeout(electionTimeout)
 				prevoteCh = nil
+				// The single election window already spans both phases, so no
+				// seeding is required: priorities observed during pre-vote are
+				// retained for the binding vote.
 				voteCh = r.electSelf()
 			}
 			// Check if we've lost the pre-vote and wait for the election to timeout so we can do another time of
@@ -469,6 +508,10 @@ func (r *Raft) setupLeaderState() {
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
+
+	// Leaders have no use for an election preference window; release anything
+	// deferred and stop timers.
+	r.resetPreference()
 
 	// Notify that we are the leader
 	overrideNotifyBool(r.leaderCh, true)
@@ -1466,9 +1509,15 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		NoRetryBackoff: false,
 	}
 	var rpcErr error
-	defer func() {
+	responded := false
+	respond := func() {
+		if responded {
+			return
+		}
+		responded = true
 		rpc.Respond(resp, rpcErr)
-	}()
+	}
+	defer respond()
 
 	// Ignore an older term
 	if a.Term < r.getCurrentTerm() {
@@ -1634,8 +1683,19 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		Granted:   false,
 	}
 	var rpcErr error
-	defer func() {
+	responded := false
+	outerSuppressed := false
+	respond := func() {
+		if responded {
+			return
+		}
+		responded = true
 		rpc.Respond(resp, rpcErr)
+	}
+	defer func() {
+		if !outerSuppressed {
+			respond()
+		}
 	}()
 
 	// Version 0 servers will panic unless the peers is present. It's only
@@ -1646,7 +1706,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 
 	// Check if we have an existing leader [who's not the candidate] and also
 	// check the LeadershipTransfer flag is set. Usually votes are rejected if
-	// there is a known leader. But if the leader initiated a leadership transfer,
+	// there is a leader. But if the leader initiated a leadership transfer,
 	// vote!
 	var candidate ServerAddress
 	var candidateBytes []byte
@@ -1678,19 +1738,10 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 
-	// Ignore an older term
-	if req.Term < r.getCurrentTerm() {
+	// Ignore an older term.
+	minComparableTerm := r.getCurrentTerm()
+	if req.Term < minComparableTerm {
 		return
-	}
-
-	// Increase the term if we see a newer one
-	if req.Term > r.getCurrentTerm() {
-		// Ensure transition to follower
-		r.logger.Debug("lost leadership because received a requestVote with a newer term")
-		r.setState(Follower)
-		r.setCurrentTerm(req.Term)
-
-		resp.Term = req.Term
 	}
 
 	// if we get a request for vote from a nonVoter  and the request term is higher,
@@ -1702,57 +1753,117 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		candidateID := ServerID(req.ID)
 		if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
 			r.logger.Warn("rejecting vote request since node is not a voter", "from", candidate)
+			if req.Term > r.getCurrentTerm() {
+				r.setState(Follower)
+				r.setCurrentTerm(req.Term)
+				resp.Term = req.Term
+			}
 			return
 		}
 	}
-	// Check if we have voted yet
-	lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
-	if err != nil && err.Error() != "not found" {
-		r.logger.Error("failed to get last vote term", "error", err)
-		return
-	}
-	lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
-	if err != nil && err.Error() != "not found" {
-		r.logger.Error("failed to get last vote candidate", "error", err)
-		return
-	}
 
-	// Check if we've voted in this election before
-	if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
-		r.logger.Info("duplicate requestVote for same term", "term", req.Term)
-		if bytes.Equal(lastVoteCandBytes, candidateBytes) {
-			r.logger.Warn("duplicate requestVote from", "candidate", candidate)
-			resp.Granted = true
+	// Log recency is evaluated before any preference and before we touch our
+	// term: a preferred candidate with a stale log must still be rejected.
+	logUpToDate := r.logAtLeastAsUpToDate(req.LastLogIndex, req.LastLogTerm)
+
+	// stepDownIfNewer converges on a higher term regardless of the vote
+	// decision.
+	stepDownIfNewer := func() {
+		if req.Term > r.getCurrentTerm() {
+			r.logger.Debug("lost leadership because received a requestVote with a newer term")
+			r.setState(Follower)
+			r.setCurrentTerm(req.Term)
+			resp.Term = req.Term
 		}
+	}
+
+	// grant performs the classic Raft vote bookkeeping. When candidate
+	// preference defers the decision this closure is invoked later, on the main
+	// goroutine, so every precondition is re-validated.
+	decisionSent := false
+	grant := func(grantVote bool) {
+		defer func() {
+			if !decisionSent {
+				decisionSent = true
+				respond()
+			}
+		}()
+		if !grantVote {
+			stepDownIfNewer()
+			return
+		}
+
+		// A leader may have appeared while we waited.
+		if leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != "" && leaderAddr != candidate && !req.LeadershipTransfer {
+			r.logger.Warn("rejecting deferred vote request since we have a leader",
+				"from", candidate, "leader", leaderAddr, "leader-id", string(leaderID))
+			stepDownIfNewer()
+			return
+		}
+		if req.Term < minComparableTerm {
+			return
+		}
+
+		// One vote per server per term: honour a vote already persisted,
+		// including a duplicate grant to the same candidate.
+		lastVoteTerm, err := r.stable.GetUint64(keyLastVoteTerm)
+		if err != nil && err.Error() != "not found" {
+			r.logger.Error("failed to get last vote term", "error", err)
+			return
+		}
+		lastVoteCandBytes, err := r.stable.Get(keyLastVoteCand)
+		if err != nil && err.Error() != "not found" {
+			r.logger.Error("failed to get last vote candidate", "error", err)
+			return
+		}
+		if lastVoteTerm == req.Term && lastVoteCandBytes != nil {
+			r.logger.Info("duplicate requestVote for same term", "term", req.Term)
+			if bytes.Equal(lastVoteCandBytes, candidateBytes) {
+				r.logger.Warn("duplicate requestVote from", "candidate", candidate)
+				resp.Granted = true
+			}
+			stepDownIfNewer()
+			return
+		}
+
+		if !r.logAtLeastAsUpToDate(req.LastLogIndex, req.LastLogTerm) {
+			r.logger.Warn("rejecting deferred vote request since our log is more up-to-date",
+				"candidate", candidate)
+			stepDownIfNewer()
+			return
+		}
+
+		stepDownIfNewer()
+
+		// Persist a vote for safety
+		if err := r.persistVote(req.Term, candidateBytes); err != nil {
+			r.logger.Error("failed to persist vote", "error", err)
+			return
+		}
+
+		resp.Granted = true
+		r.setLastContact()
+	}
+
+	if !logUpToDate {
+		r.logger.Warn("rejecting vote request since candidate log is not up-to-date",
+			"candidate", candidate)
+		stepDownIfNewer()
 		return
 	}
 
-	// Reject if their term is older
-	lastIdx, lastTerm := r.getLastEntry()
-	if lastTerm > req.LastLogTerm {
-		r.logger.Warn("rejecting vote request since our last term is greater",
-			"candidate", candidate,
-			"last-term", lastTerm,
-			"last-candidate-term", req.LastLogTerm)
-		return
+	// Apply the bounded candidate preference. When it answers immediately the
+	// ordinary grant path runs; otherwise grant is invoked later (or has
+	// already been invoked with a rejection).
+	switch r.considerElectionPreference(req.Term, req.Priority, false, req.LeadershipTransfer, grant) {
+	case preferenceAnswerNow:
+		grant(true)
+	case preferenceRejected:
+		// grant(false) already responded inline.
+	case preferenceDeferred:
+		// grant runs when the window closes and sends the single response.
+		outerSuppressed = true
 	}
-
-	if lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {
-		r.logger.Warn("rejecting vote request since our last index is greater",
-			"candidate", candidate,
-			"last-index", lastIdx,
-			"last-candidate-index", req.LastLogIndex)
-		return
-	}
-
-	// Persist a vote for safety
-	if err := r.persistVote(req.Term, candidateBytes); err != nil {
-		r.logger.Error("failed to persist vote", "error", err)
-		return
-	}
-
-	resp.Granted = true
-	r.setLastContact()
 }
 
 // requestPreVote is invoked when we get a request Pre-Vote RPC call.
@@ -1767,16 +1878,26 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 		Granted:   false,
 	}
 	var rpcErr error
-	defer func() {
+	responded := false
+	outerSuppressed := false
+	respond := func() {
+		if responded {
+			return
+		}
+		responded = true
 		rpc.Respond(resp, rpcErr)
+	}
+	defer func() {
+		if !outerSuppressed {
+			respond()
+		}
 	}()
 
-	// Check if we have an existing leader [who's not the candidate] and also
 	candidate := r.trans.DecodePeer(req.GetRPCHeader().Addr)
 	candidateID := ServerID(req.ID)
 
-	// if the Servers list is empty that mean the cluster is very likely trying to bootstrap,
-	// Grant the vote
+	// If the Servers list is empty the cluster is very likely bootstrapping;
+	// grant the vote.
 	if len(r.configurations.latest.Servers) > 0 && !inConfiguration(r.configurations.latest, candidateID) {
 		r.logger.Warn("rejecting pre-vote request since node is not in configuration",
 			"from", candidate)
@@ -1791,43 +1912,82 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 		return
 	}
 
-	// Ignore an older term
-	if req.Term < r.getCurrentTerm() {
+	// A pre-vote advertises the term the candidate *would* campaign in, which
+	// is its current term + 1. When we are ourselves campaigning at that
+	// prospective term our stored term is still one behind, so a same-round
+	// pre-vote must be comparable rather than rejected as "older".
+	minComparableTerm := r.getCurrentTerm()
+	if r.getState() == Candidate {
+		minComparableTerm = r.getCurrentTerm() + 1
+	}
+	if req.Term < minComparableTerm {
 		return
 	}
 
-	if req.Term > r.getCurrentTerm() {
-		// continue processing here to possibly grant the pre-vote as in a "real" vote this will transition us to follower
-		r.logger.Debug("received a requestPreVote with a newer term, grant the pre-vote")
-		resp.Term = req.Term
-	}
-
-	// if we get a request for a pre-vote from a nonVoter  and the request term is higher, do not grant the Pre-Vote
-	// This could happen when a node, previously voter, is converted to non-voter
+	// Do not grant a pre-vote to a non-voter.
 	if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
 		r.logger.Warn("rejecting pre-vote request since node is not a voter", "from", candidate)
 		return
 	}
 
-	// Reject if their term is older
-	lastIdx, lastTerm := r.getLastEntry()
-	if lastTerm > req.LastLogTerm {
-		r.logger.Warn("rejecting pre-vote request since our last term is greater",
-			"candidate", candidate,
-			"last-term", lastTerm,
-			"last-candidate-term", req.LastLogTerm)
+	logUpToDate := r.logAtLeastAsUpToDate(req.LastLogIndex, req.LastLogTerm)
+
+	// decide is either run immediately or deferred until the preference window
+	// closes. Pre-vote never changes our term or persists a vote, but the
+	// eligibility checks are re-run at settle time anyway.
+	decisionSent := false
+	decide := func(grant bool) {
+		defer func() {
+			if !decisionSent {
+				decisionSent = true
+				respond()
+			}
+		}()
+		if !grant {
+			return
+		}
+		if leaderAddr, leaderID := r.LeaderWithID(); leaderAddr != "" && leaderAddr != candidate {
+			r.logger.Warn("rejecting deferred pre-vote request since we have a leader",
+				"from", candidate, "leader", leaderAddr, "leader-id", string(leaderID))
+			return
+		}
+		if req.Term < minComparableTerm {
+			return
+		}
+		if len(r.configurations.latest.Servers) > 0 && !hasVote(r.configurations.latest, candidateID) {
+			return
+		}
+		if !r.logAtLeastAsUpToDate(req.LastLogIndex, req.LastLogTerm) {
+			return
+		}
+		if req.Term > r.getCurrentTerm() {
+			r.logger.Debug("received a requestPreVote with a newer term, grant the pre-vote")
+		}
+		resp.Term = req.Term
+		resp.Granted = true
+	}
+
+	if !logUpToDate {
+		r.logger.Warn("rejecting pre-vote request since candidate log is not up-to-date",
+			"candidate", candidate)
 		return
 	}
 
-	if lastTerm == req.LastLogTerm && lastIdx > req.LastLogIndex {
-		r.logger.Warn("rejecting pre-vote request since our last index is greater",
-			"candidate", candidate,
-			"last-index", lastIdx,
-			"last-candidate-index", req.LastLogIndex)
+	// Candidates answer immediately (never veto/defer an advisory
+	// pre-vote); followers apply the bounded preference. Transfers never use
+	// pre-vote.
+	if !r.preferenceEnabled() || r.getState() != Follower {
+		decide(true)
 		return
 	}
-
-	resp.Granted = true
+	switch r.considerElectionPreference(req.Term, req.Priority, true, false, decide) {
+	case preferenceAnswerNow:
+		decide(true)
+	case preferenceRejected:
+		// decide(false) already responded.
+	case preferenceDeferred:
+		outerSuppressed = true
+	}
 }
 
 // installSnapshot is invoked when we get a InstallSnapshot RPC call.
@@ -2014,6 +2174,7 @@ func (r *Raft) electSelf() <-chan *voteResult {
 		LastLogIndex:       lastIdx,
 		LastLogTerm:        lastTerm,
 		LeadershipTransfer: r.candidateFromLeadershipTransfer.Load(),
+		Priority:           r.candidatePriority,
 	}
 
 	// Construct a function to ask for a vote
@@ -2092,6 +2253,7 @@ func (r *Raft) preElectSelf() <-chan *preVoteResult {
 		Term:         newTerm,
 		LastLogIndex: lastIdx,
 		LastLogTerm:  lastTerm,
+		Priority:     r.candidatePriority,
 	}
 
 	// Construct a function to ask for a vote

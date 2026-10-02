@@ -92,6 +92,12 @@ type RequestVoteRequest struct {
 	// transfer. It is required for leadership transfer to work, because servers
 	// wouldn't vote otherwise if they are aware of an existing leader.
 	LeadershipTransfer bool
+
+	// Priority is the optional, locally configured CandidatePriority of the
+	// requesting server. It defaults to zero ("no preference"). Servers that
+	// do not know about this field decode it as zero and vote using plain Raft
+	// rules, which keeps rolling upgrades safe.
+	Priority int
 }
 
 // GetRPCHeader - See WithRPCHeader.
@@ -131,6 +137,10 @@ type RequestPreVoteRequest struct {
 	// Used to ensure safety
 	LastLogIndex uint64
 	LastLogTerm  uint64
+
+	// Priority is the optional, locally configured CandidatePriority of the
+	// requesting server. See RequestVoteRequest.Priority.
+	Priority int
 }
 
 // GetRPCHeader - See WithRPCHeader.

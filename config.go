@@ -235,6 +235,37 @@ type Config struct {
 	// PreVoteDisabled deactivate the pre-vote feature when set to true
 	PreVoteDisabled bool
 
+	// CandidatePriority expresses a local preference for this server to win
+	// leader elections. A value of zero (the default) means this server has no
+	// preference: it campaigns and votes as a plain Raft server.
+	//
+	// Priority is only a hint, not a guarantee. Safety always comes first: a
+	// candidate's log must be at least as up-to-date as the voter's, terms must
+	// increase, and one vote per server per term is still enforced. A majority
+	// of the cluster is always required to lead.
+	//
+	// The value is carried in RequestVote and RequestPreVote messages. During an
+	// election, voters that enable ElectionPreferenceTimeout withhold their vote
+	// for a bounded window so that a reachable, higher-priority server with an
+	// equally up-to-date log has time to campaign. Once the window elapses the
+	// election proceeds with ordinary Raft rules, so a high-priority server that
+	// is partitioned from the quorum cannot block availability.
+	//
+	// Servers that do not understand the field (older binaries) simply ignore
+	// it and vote according to standard Raft rules; clusters containing such
+	// servers transparently fall back to unprioritised elections.
+	CandidatePriority int
+
+	// ElectionPreferenceTimeout bounds how long a voter may wait for a
+	// reachable, higher-priority candidate before granting a vote. The feature
+	// is disabled when this is zero (the default), preserving the historical
+	// election behaviour exactly.
+	//
+	// When non-zero it MUST be strictly smaller than HeartbeatTimeout: the wait
+	// is a bounded preference window inside a single election, never a
+	// replacement for the election timeout.
+	ElectionPreferenceTimeout time.Duration
+
 	// NoLegacyTelemetry allows to skip the legacy metrics to avoid duplicates.
 	// legacy metrics are those that have `_peer_name` as metric suffix instead as labels.
 	// e.g: raft_replication_heartbeat_peer0
@@ -384,6 +415,20 @@ func ValidateConfig(config *Config) error {
 	}
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
+	}
+	if config.CandidatePriority < 0 {
+		return fmt.Errorf("CandidatePriority cannot be negative")
+	}
+	if config.ElectionPreferenceTimeout < 0 {
+		return fmt.Errorf("ElectionPreferenceTimeout cannot be negative")
+	}
+	// A preference window that is not strictly shorter than the heartbeat
+	// timeout could delay elections up to (and past) the point at which the
+	// cluster would normally move on, defeating the bounded-wait guarantee.
+	if config.ElectionPreferenceTimeout != 0 &&
+		config.ElectionPreferenceTimeout >= config.HeartbeatTimeout {
+		return fmt.Errorf("ElectionPreferenceTimeout (%s) must be smaller than HeartbeatTimeout (%s)",
+			config.ElectionPreferenceTimeout, config.HeartbeatTimeout)
 	}
 	return nil
 }

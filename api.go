@@ -230,6 +230,30 @@ type Raft struct {
 	// RestoreCommittedLogs is used to enable restore committed logs mode
 	// restore committed logs mode is disabled if set to false.
 	RestoreCommittedLogs bool
+
+	// candidatePriority is this server's configured election preference.
+	candidatePriority int
+
+	// electionPreferenceTimeout bounds how long this server waits for a
+	// reachable, higher-priority candidate before granting a vote.
+	electionPreferenceTimeout time.Duration
+
+	// preferenceWindow holds the bookkeeping for the current election's
+	// bounded preference wait. It is only ever touched by the main goroutine.
+	preferenceWindow electionWindow
+
+	// preferenceGeneration is a monotonic counter bumped each time a new round
+	// is started, used to discard timer callbacks from superseded rounds.
+	preferenceGeneration uint64
+
+	// preferenceKickCh is used to trigger an immediate pre-vote campaign when
+	// this server outranks a campaigning candidate. It is buffered so the
+	// signal is never lost and repeated kicks coalesce.
+	preferenceKickCh chan struct{}
+
+	// preferenceSettleCh is used by preference-window timers to schedule the
+	// closing of a round back onto the main goroutine.
+	preferenceSettleCh chan settleRequest
 }
 
 // BootstrapCluster initializes a server's storage with the given cluster
@@ -554,36 +578,40 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	_, transportSupportPreVote := trans.(WithPreVote)
 	// Create Raft struct.
 	r := &Raft{
-		protocolVersion:       protocolVersion,
-		applyCh:               applyCh,
-		fsm:                   fsm,
-		fsmMutateCh:           make(chan interface{}, 128),
-		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
-		leaderCh:              make(chan bool, 1),
-		localID:               localID,
-		localAddr:             localAddr,
-		logger:                logger,
-		logs:                  logs,
-		configurationChangeCh: make(chan *configurationChangeFuture),
-		configurations:        configurations{},
-		rpcCh:                 trans.Consumer(),
-		snapshots:             snaps,
-		userSnapshotCh:        make(chan *userSnapshotFuture),
-		userRestoreCh:         make(chan *userRestoreFuture),
-		shutdownCh:            make(chan struct{}),
-		stable:                stable,
-		trans:                 trans,
-		verifyCh:              make(chan *verifyFuture, 64),
-		configurationsCh:      make(chan *configurationsFuture, 8),
-		bootstrapCh:           make(chan *bootstrapFuture),
-		observers:             make(map[uint64]*Observer),
-		leadershipTransferCh:  make(chan *leadershipTransferFuture, 1),
-		leaderNotifyCh:        make(chan struct{}, 1),
-		followerNotifyCh:      make(chan struct{}, 1),
-		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
-		preVoteDisabled:       conf.PreVoteDisabled || !transportSupportPreVote,
-		noLegacyTelemetry:     conf.NoLegacyTelemetry,
-		RestoreCommittedLogs:  conf.RestoreCommittedLogs,
+		protocolVersion:           protocolVersion,
+		applyCh:                   applyCh,
+		fsm:                       fsm,
+		fsmMutateCh:               make(chan interface{}, 128),
+		fsmSnapshotCh:             make(chan *reqSnapshotFuture),
+		leaderCh:                  make(chan bool, 1),
+		localID:                   localID,
+		localAddr:                 localAddr,
+		logger:                    logger,
+		logs:                      logs,
+		configurationChangeCh:     make(chan *configurationChangeFuture),
+		configurations:            configurations{},
+		rpcCh:                     trans.Consumer(),
+		snapshots:                 snaps,
+		userSnapshotCh:            make(chan *userSnapshotFuture),
+		userRestoreCh:             make(chan *userRestoreFuture),
+		shutdownCh:                make(chan struct{}),
+		stable:                    stable,
+		trans:                     trans,
+		verifyCh:                  make(chan *verifyFuture, 64),
+		configurationsCh:          make(chan *configurationsFuture, 8),
+		bootstrapCh:               make(chan *bootstrapFuture),
+		observers:                 make(map[uint64]*Observer),
+		leadershipTransferCh:      make(chan *leadershipTransferFuture, 1),
+		leaderNotifyCh:            make(chan struct{}, 1),
+		followerNotifyCh:          make(chan struct{}, 1),
+		preferenceKickCh:          make(chan struct{}, 1),
+		preferenceSettleCh:        make(chan settleRequest, 4),
+		mainThreadSaturation:      newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
+		preVoteDisabled:           conf.PreVoteDisabled || !transportSupportPreVote,
+		noLegacyTelemetry:         conf.NoLegacyTelemetry,
+		RestoreCommittedLogs:      conf.RestoreCommittedLogs,
+		candidatePriority:         conf.CandidatePriority,
+		electionPreferenceTimeout: conf.ElectionPreferenceTimeout,
 	}
 	if !transportSupportPreVote && !conf.PreVoteDisabled {
 		r.logger.Warn("pre-vote is disabled because it is not supported by the Transport")
