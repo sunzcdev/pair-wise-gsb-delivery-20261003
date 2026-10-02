@@ -19,10 +19,20 @@ module Dry
       protected :_configured
 
       # @api private
+      attr_reader :_assigned
+      protected :_assigned
+
+      # @api private
+      attr_reader :_origins
+      protected :_origins
+
+      # @api private
       def initialize(settings, values: {})
         @_settings = settings
         @_values = values
         @_configured = Set.new
+        @_assigned = Set.new
+        @_origins = {}
       end
 
       # @api private
@@ -30,11 +40,16 @@ module Dry
         super
         @_values = source.__send__(:dup_values)
         @_configured = source._configured.dup
+        @_assigned = source._assigned.dup
+        @_origins = source._origins.dup
       end
 
       # @api private
       def dup_for_settings(settings)
-        dup.tap { |config| config.instance_variable_set(:@_settings, settings) }
+        dup.tap { |config|
+          config.instance_variable_set(:@_settings, settings)
+          config.__send__(:mark_inherited!)
+        }
       end
 
       # Get config value by a key
@@ -74,6 +89,9 @@ module Dry
         end
 
         _configured.add(name)
+
+        _assigned.add(name)
+        _origins[name] = :local
 
         _values[name] = setting.constructor.(value)
       end
@@ -117,6 +135,57 @@ module Dry
         end
 
         _configured.include?(key)
+      end
+
+      # Returns the {Source provenance} of the value at the given config path.
+      #
+      # Unlike {#configured?}, this answers "where did this value come from?" rather than "does
+      # the current value still look like the default?". The two can differ:
+      #
+      # - Explicitly assigning a value that happens to equal the default is reported here as
+      #   `local` and `assigned?`, while {#configured?} may report `false` for a mutable value
+      #   it compares against a fresh default.
+      # - Reading a mutable default (e.g. an `Array`) and then changing its contents in place is
+      #   not an assignment, so the origin stays `default` and `assigned?` stays `false`; the
+      #   change is surfaced via `Source#mutated?`.
+      #
+      # For a nested config path, the result aggregates the provenance of the whole group:
+      # the origin is the most specific category present (`local` over `inherited` over
+      # `default`), `assigned?` is true if any setting was assigned, and `mutated?` is true if
+      # any default-sourced mutable value was changed in place.
+      #
+      # @param path [Array<String,Symbol>] one or more nested setting names
+      #
+      # @return [Source]
+      #
+      # @raise [ArgumentError] if any segment of the path is not a defined setting
+      #
+      # @api public
+      def source(*path)
+        config = self
+
+        path.each_with_index do |segment, index|
+          name = segment.to_sym
+
+          unless (setting = config._settings[name])
+            raise ArgumentError, "+#{name}+ is not a setting name"
+          end
+
+          if index == path.length - 1
+            return config.__send__(:source_for, name)
+          end
+
+          unless setting.children.any?
+            raise ArgumentError, "+#{name}+ is not a nested setting"
+          end
+
+          nested = config._values[name]
+          nested = setting.to_value unless nested.is_a?(self.class)
+          config = nested
+        end
+
+        # No path given: aggregate provenance across the whole config
+        Config.aggregate_sources(self)
       end
 
       # Returns the current config values.
@@ -255,6 +324,68 @@ module Dry
         _values.each_with_object({}) { |(key, val), dup_hsh|
           dup_hsh[key] = _settings[key].cloneable? ? val.dup : val
         }
+      end
+
+      # Recursively re-label locally-assigned values as inherited. Used when deriving a subclass
+      # config from a superclass config (via {#dup_for_settings}).
+      def mark_inherited!
+        _assigned.each { |name| _origins[name] = :inherited }
+
+        _values.each_value do |value|
+          value.__send__(:mark_inherited!) if value.is_a?(self.class)
+        end
+      end
+
+      def source_for(name)
+        setting = _settings[name]
+
+        if setting.children.any?
+          nested = _values[name]
+          nested = setting.to_value unless nested.is_a?(self.class)
+          return Config.aggregate_sources(nested)
+        end
+
+        origin = _assigned.include?(name) ? _origins.fetch(name, :local) : :default
+
+        if origin.equal?(:default) &&
+           setting.cloneable? &&
+           _values.key?(name) &&
+           _values[name] != setting.to_value
+          Source.new(origin: :default, assigned: false, mutated: true)
+        else
+          Source.new(
+            origin: origin,
+            assigned: origin.equal?(:local) || origin.equal?(:inherited),
+            mutated: false
+          )
+        end
+      end
+
+      class << self
+        # Aggregate provenance across every setting in the given config (recursively for nested
+        # configs).
+        def aggregate_sources(config)
+          sources = config._settings.map { |setting|
+            config.__send__(:source_for, setting.name)
+          }
+
+          origins = sources.map(&:origin)
+
+          origin =
+            if origins.include?(:local)
+              :local
+            elsif origins.include?(:inherited)
+              :inherited
+            else
+              :default
+            end
+
+          Source.new(
+            origin: origin,
+            assigned: sources.any?(&:assigned?),
+            mutated: sources.any?(&:mutated?)
+          )
+        end
       end
     end
   end
