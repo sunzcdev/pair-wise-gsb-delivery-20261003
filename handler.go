@@ -63,6 +63,12 @@ type CSRFHandler struct {
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
+
+	// When true, the CSRF cookie (and the Vary: Cookie header) is only
+	// emitted when a downstream handler actually obtains a token through
+	// Token()/EnsureToken(). When false (the default), a cookie is issued up
+	// front on every request, which is the historical behavior.
+	cookieOnDemand bool
 }
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
@@ -123,7 +129,23 @@ func (h CSRFHandler) getCookieName() string {
 func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = addNosurfContext(r)
 	defer ctxClear(r)
-	w.Header().Add("Vary", "Cookie")
+
+	ctx := requestContext(r)
+	ctx.handler = h
+
+	// In on-demand mode wrap the writer so we can reliably tell whether the
+	// downstream handler has already committed the response before it tries
+	// to obtain a token.
+	var cw *committedWriter
+	if h.cookieOnDemand {
+		cw = &committedWriter{ResponseWriter: w}
+		w = cw
+	} else {
+		// Eager mode unconditionally emits a cookie, hence the response
+		// unconditionally varies on it.
+		w.Header().Add("Vary", "Cookie")
+	}
+	ctxConfigure(r, h.cookieOnDemand, cw)
 
 	var realToken []byte
 
@@ -132,16 +154,28 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		realToken = b64decode(tokenCookie.Value)
 	}
 
-	// If the length of the real token isn't what it should be,
-	// it has either been tampered with,
-	// or we're migrating onto a new algorithm for generating tokens,
-	// or it hasn't ever been set so far.
-	// In any case of those, we should regenerate it.
-	//
-	// As a consequence, CSRF check will fail when comparing the tokens later on,
-	// so we don't have to fail it just yet.
-	if len(realToken) != tokenLength {
+	if len(realToken) == tokenLength {
+		// Remember the real token for both verification and on-demand
+		// reuse without re-issuing an identical cookie.
+		ctx.realToken = realToken
+	}
+
+	if h.cookieOnDemand {
+		// Do not issue any cookie or Vary header yet. A real token is still
+		// needed for verifying unsafe methods and for the failure handler, so
+		// make sure one is resolvable without scheduling a cookie.
+		realToken = resolveOrGenerateToken(ctx)
+	} else if len(realToken) != tokenLength {
+		// If the length of the real token isn't what it should be,
+		// it has either been tampered with,
+		// or we're migrating onto a new algorithm for generating tokens,
+		// or it hasn't ever been set so far.
+		// In any case of those, we should regenerate it.
+		//
+		// As a consequence, CSRF check will fail when comparing the tokens
+		// later on, so we don't have to fail it just yet.
 		h.RegenerateToken(w, r)
+		realToken = requestContext(r).realToken
 	} else {
 		ctxSetToken(r, realToken)
 	}
@@ -153,6 +187,7 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.ensureSameOrigin(r); err != nil {
+		h.prepareFailure(ctx)
 		ctxSetReason(r, err)
 		h.handleFailure(w, r)
 		return
@@ -162,6 +197,7 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sentToken := extractToken(r)
 
 	if !verifyToken(realToken, sentToken) {
+		h.prepareFailure(ctx)
 		ctxSetReason(r, ErrBadToken)
 		h.handleFailure(w, r)
 		return
@@ -261,16 +297,44 @@ func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) st
 	return Token(r)
 }
 
-func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, token []byte) {
-	// ctxSetToken() does the masking for us
-	ctxSetToken(r, token)
+// prepareFailure makes sure a real token exists and is exposed (as a masked
+// value) before the failure reason is recorded. In eager mode the cookie is
+// already scheduled at this point; in on-demand mode no cookie is emitted
+// here, leaving the decision to the failure handler, which can call
+// Token()/EnsureToken() itself.
+func (h *CSRFHandler) prepareFailure(ctx *csrfContext) {
+	token := resolveOrGenerateToken(ctx)
+	if h.cookieOnDemand {
+		ctx.token = b64encode(maskToken(token))
+	}
+}
 
+func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, token []byte) {
 	cookie := h.baseCookie
 	cookie.Name = h.getCookieName()
 	cookie.Value = b64encode(token)
 
 	http.SetCookie(w, &cookie)
 
+	ctx := requestContext(r)
+	ctx.realToken = token
+	ctx.token = b64encode(maskToken(token))
+	ctx.issued = true
+}
+
+// setTokenCookieOn is the on-demand counterpart of setTokenCookie: it stores
+// the resolved token in the given context and schedules its cookie. It must
+// only be called once the response has been confirmed to be uncommitted.
+func (h *CSRFHandler) setTokenCookieOn(w http.ResponseWriter, ctx *csrfContext, token []byte) {
+	cookie := h.baseCookie
+	cookie.Name = h.getCookieName()
+	cookie.Value = b64encode(token)
+
+	http.SetCookie(w, &cookie)
+
+	ctx.realToken = token
+	ctx.token = b64encode(maskToken(token))
+	ctx.issued = true
 }
 
 // Sets the handler to call in case the CSRF check
@@ -283,6 +347,25 @@ func (h *CSRFHandler) SetFailureHandler(handler http.Handler) {
 // This way you can specify the Domain, Path, HttpOnly, Secure, etc.
 func (h *CSRFHandler) SetBaseCookie(cookie http.Cookie) {
 	h.baseCookie = cookie
+}
+
+// SetCookieOnDemand toggles on-demand CSRF cookie issuance.
+//
+// By default (onDemand == false) the handler issues a CSRF cookie and a
+// "Vary: Cookie" header on every request, including safe methods such as GET.
+//
+// When enabled, safe GET pages that never render a form no longer receive a
+// cookie: a token is generated or reused and its cookie is scheduled only
+// when a downstream handler actually obtains it via Token() or EnsureToken().
+// The "Vary: Cookie" header is likewise added only when a token is issued.
+//
+// Unsafe (non-GET/HEAD/OPTIONS/TRACE) methods are still fully verified. If a
+// handler commits the response (calls WriteHeader or writes the body) before
+// requesting the token, EnsureToken returns ErrResponseAlreadyCommitted and
+// Token returns an empty string, rather than handing out a token whose
+// cookie the browser could never receive.
+func (h *CSRFHandler) SetCookieOnDemand(onDemand bool) {
+	h.cookieOnDemand = onDemand
 }
 
 // SetIsTLSFunc sets a delegate function which determines, on a per-request basis, whether the request is made over a secure connection.

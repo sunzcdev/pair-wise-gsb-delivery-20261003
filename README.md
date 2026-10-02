@@ -117,6 +117,43 @@ func HandleJson(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### On-demand cookies
+
+By default nosurf sets the CSRF cookie (and a `Vary: Cookie` header) on every
+request, including plain `GET` pages that never render a form. If you prefer to
+send the cookie only when a token is actually used, enable on-demand issuance:
+
+```go
+h := nosurf.New(app)
+h.SetCookieOnDemand(true)
+```
+
+In this mode a token is generated (or the existing cookie's token reused) and
+its cookie is scheduled only when a downstream handler obtains the token via
+`nosurf.Token(r)` or `nosurf.EnsureToken(w, r)`. The `Vary: Cookie` header is
+added at the same time. Unsafe methods (`POST`, `PUT`, ...) are still fully
+verified.
+
+`EnsureToken` is the explicit, error-aware variant of `Token`. If the response
+has already been committed (the handler called `WriteHeader`, wrote the body or
+flushed) before the token is requested, no `Set-Cookie` header can reach the
+browser. Rather than returning a token that would never round-trip,
+`EnsureToken` returns `nosurf.ErrResponseAlreadyCommitted` (and `Token` returns
+an empty string):
+
+```go
+token, err := nosurf.EnsureToken(w, r)
+if errors.Is(err, nosurf.ErrResponseAlreadyCommitted) {
+    // The response headers are already gone; render the form on the next
+    // request instead of relying on a cookie the browser will not receive.
+}
+```
+
+Repeated calls to `Token`/`EnsureToken` within a single request always return
+the same token and schedule the cookie at most once. A custom failure handler
+can therefore decide explicitly whether to request a token while producing its
+error response.
+
 ### Contributing
 
 0. Find an issue that bugs you / open a new one.

@@ -17,6 +17,21 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+
+	// The unmasked real token, 32 bytes long if present.
+	// It is decoded from the incoming cookie or freshly generated.
+	realToken []byte
+	// Whether the handler runs in on-demand cookie mode.
+	onDemand bool
+	// The response writer associated with the request, wrapped so that
+	// on-demand issuance can detect an already committed response.
+	writer *committedWriter
+	// The handler serving the request, used to build the cookie on demand.
+	handler *CSRFHandler
+	// Whether a token has already been issued for this request,
+	// guaranteeing that repeated Token()/EnsureToken() calls are consistent
+	// and schedule the cookie at most once.
+	issued bool
 }
 
 var (
@@ -28,21 +43,41 @@ var (
 // the CSRF token for that request
 // or an empty string if the token does not exist.
 //
+// In on-demand cookie mode (see CSRFHandler.SetCookieOnDemand) calling Token
+// requests the token for the current request and schedules its cookie, unless
+// the response has already been committed, in which case Token returns "".
+// Use EnsureToken to distinguish that failure from an unset token.
+//
 // Note that the token won't be available after
 // CSRFHandler finishes
 // (that is, in another handler that wraps it,
 // or after the request has been served)
 func Token(req *http.Request) string {
 	cmMutex.RLock()
-	defer cmMutex.RUnlock()
-
 	ctx, ok := contextMap[req]
-
 	if !ok {
+		cmMutex.RUnlock()
 		return ""
 	}
 
-	return ctx.token
+	onDemand := ctx.onDemand
+	issued := ctx.issued
+	writer := ctx.writer
+	token := ctx.token
+	cmMutex.RUnlock()
+
+	if onDemand && !issued {
+		if writer == nil || writer.committed {
+			return ""
+		}
+		issuedToken, err := EnsureToken(writer, req)
+		if err != nil {
+			return ""
+		}
+		return issuedToken
+	}
+
+	return token
 }
 
 // Reason() takes an HTTP request and returns
@@ -98,4 +133,24 @@ func ctxClear(req *http.Request) {
 	defer cmMutex.Unlock()
 
 	delete(contextMap, req)
+}
+
+func requestContext(req *http.Request) *csrfContext {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	return contextMap[req]
+}
+
+func ctxConfigure(req *http.Request, onDemand bool, w *committedWriter) {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		ctx = new(csrfContext)
+		contextMap[req] = ctx
+	}
+	ctx.onDemand = onDemand
+	ctx.writer = w
 }
