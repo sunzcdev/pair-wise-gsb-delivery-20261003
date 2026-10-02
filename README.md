@@ -29,6 +29,9 @@ an exact URL, a glob, or a regular expression.
 * Allows specifying your own failure handler. 
 Want to present the hacker with an ASCII middle finger
 instead of the plain old `HTTP 400`? No problem.
+* Allows configuring how the sent token is extracted from the request
+via a chain of custom extractors, with an explicit conflict policy
+for requests that carry tokens in multiple places.
 * Uses masked tokens to mitigate the BREACH attack.
 * Has no dependencies outside the Go standard library.
 
@@ -115,6 +118,37 @@ func HandleJson(w http.ResponseWriter, r *http.Request) {
 	}
 	// do smth cool
 }
+```
+
+### Custom token extraction
+By default, the sent token is looked up in the `X-CSRF-Token` header first,
+falling back to the `csrf_token` form field (including multipart forms).
+
+If your API carries the token elsewhere (e.g. a custom header used by a JSON API),
+you can configure your own extractor chain:
+
+```go
+handler := nosurf.New(myHandler)
+handler.SetTokenExtractors(nosurf.HeaderTokenExtractor("X-API-Token"))
+```
+
+Each extractor distinguishes "token not provided", "token provided"
+and "input invalid". Invalid input fails the check immediately:
+the chain never falls back to a valid token from another source.
+
+For endpoints that accept large uploads, configure a header-only chain
+so the CSRF check never parses multipart data or consumes the request body:
+
+```go
+handler.SetTokenExtractors(nosurf.HeaderTokenExtractor(nosurf.HeaderName))
+```
+
+When multiple extractors may find a token, the default policy
+is `FirstExtractorWins`. To reject requests that carry differing tokens
+in multiple places, use:
+
+```go
+handler.SetTokenConflictPolicy(nosurf.FailOnConflict)
 ```
 
 ### Contributing
