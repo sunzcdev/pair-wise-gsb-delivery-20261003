@@ -100,7 +100,7 @@ module Dry
 
           input.each do |k, v|
             res_k = key_type.try(k)
-            res_v = value_type.try(v)
+            res_v = Recursive::Guard.at(k) { value_type.try(v) }
 
             if res_k.failure?
               failures << res_k.error

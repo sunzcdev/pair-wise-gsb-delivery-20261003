@@ -19,6 +19,7 @@ module Dry
         Schema => :visit_schema,
         Schema::Key => :visit_key,
         Map => :visit_map,
+        Recursive => :visit_recursive,
         Array => :visit_array,
         Array::Member => :visit_array_member,
         Lax => :visit_lax,
@@ -236,6 +237,12 @@ module Dry
               visit(key) { |type| type }
             }.join(" ") << "}>"
           end
+        end
+      end
+
+      def visit_recursive(type)
+        visit_options(EMPTY_HASH, type.meta) do |opts|
+          yield "Recursive<#{type.name.inspect}#{opts}>"
         end
       end
 

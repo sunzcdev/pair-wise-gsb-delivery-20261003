@@ -10,6 +10,7 @@ module Dry
 
       def initialize(registry)
         @registry = registry
+        @recursive_scopes = []
       end
 
       def call(ast) = visit(ast)
@@ -116,6 +117,36 @@ module Dry
 
       def visit_any(meta)
         registry["any"].meta(meta)
+      end
+
+      def visit_recursive(node)
+        name, meta = node
+        scope = @recursive_scopes.last
+
+        if scope.nil?
+          raise ::ArgumentError,
+            "Cannot compile recursive reference #{name.inspect} without its definitions. " \
+            "Compile a :recursive_definitions node instead"
+        end
+
+        scope.ref(name).meta(meta)
+      end
+
+      def visit_recursive_definitions(node)
+        definitions, = node
+        scope = Recursive::Scope.new
+
+        @recursive_scopes << scope
+
+        begin
+          definitions.each do |name, ast|
+            scope.define(name) { visit(ast) }
+          end
+        ensure
+          @recursive_scopes.pop
+        end
+
+        scope.finalize!
       end
 
       def compile_fn(fn)

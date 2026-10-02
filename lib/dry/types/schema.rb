@@ -101,7 +101,7 @@ module Dry
             type = @name_key_map[k]
 
             if type
-              key_result = type.try(value)
+              key_result = Recursive::Guard.at(k) { type.try(value) }
               result[k] = key_result
               output[k] = key_result.input
               success &&= key_result.success?
@@ -325,7 +325,9 @@ module Dry
 
           if type
             begin
-              result[k] = type.call_unsafe(value)
+              result[k] = Recursive::Guard.at(k) { type.call_unsafe(value) }
+            rescue RecursiveInputError
+              raise
             rescue ConstraintError => exception
               raise SchemaError.new(type.name, value, exception.result)
             rescue CoercionError => exception
@@ -354,7 +356,7 @@ module Dry
           type = @name_key_map[k]
 
           if type
-            result[k] = type.call_safe(value, &block)
+            result[k] = Recursive::Guard.at(k) { type.call_safe(value, &block) }
           elsif strict?
             yield
           end

@@ -12,12 +12,17 @@ module Dry
 
       # Whether a value is a valid member of the type
       #
+      # Self-referential (cyclic) values are not valid members of
+      # recursive types
+      #
       # @return [Boolean]
       #
       # @api private
       def valid?(input = Undefined)
         call_safe(input) { return false }
         true
+      rescue RecursiveInputError
+        false
       end
       # Anything can be coerced matches
       alias_method :===, :valid?

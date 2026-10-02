@@ -172,6 +172,46 @@ module Dry
       end
     end
 
+    # Define a group of named recursive types that can reference
+    # themselves and each other
+    #
+    # The scope is finalized before it is returned: all references
+    # must resolve to a definition and recursion must consume input
+    # (go through a hash schema, an array member or a map), otherwise
+    # a {RecursiveDefinitionError} is raised.
+    #
+    # @example Approval condition tree
+    #   conditions = Dry::Types.recursive do |t|
+    #     t.define(:leaf) do
+    #       Dry::Types["nominal.hash"].schema(
+    #         op: Dry::Types["strict.string"],
+    #         value: Dry::Types["strict.integer"]
+    #       )
+    #     end
+    #
+    #     t.define(:node) do
+    #       Dry::Types["nominal.hash"].schema(
+    #         op: Dry::Types["strict.string"].enum("and", "or"),
+    #         children: Dry::Types["nominal.array"].of(t.ref(:condition))
+    #       )
+    #     end
+    #
+    #     t.define(:condition) { t.ref(:leaf) | t.ref(:node) }
+    #   end
+    #
+    #   conditions[:condition].(op: "and", children: [{op: "eq", value: 1}])
+    #
+    # @yieldparam [Dry::Types::Recursive::Scope] scope
+    #
+    # @return [Dry::Types::Recursive::Scope]
+    #
+    # @api public
+    def self.recursive
+      scope = Recursive::Scope.new
+      yield scope
+      scope.finalize!
+    end
+
     # Add a new type builder method. This is a public API for defining custom
     # type constructors
     #

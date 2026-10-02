@@ -134,5 +134,53 @@ module Dry
       end
       alias_method :to_s, :message
     end
+
+    # Error raised when a recursive type definition is invalid
+    #
+    # @see Dry::Types.recursive
+    #
+    class RecursiveDefinitionError < ::StandardError; end
+
+    # Error raised when an input value refers to itself, directly or
+    # transitively, while a recursive type is being applied to it
+    #
+    class RecursiveInputError < CoercionError
+      # @return [Symbol] name of the recursive type that detected the cycle
+      attr_reader :name
+
+      # @return [Array<Symbol, Integer>] position of the self-referencing value
+      attr_reader :path
+
+      # @return [Array<Symbol, Integer>] position where the value was first seen
+      attr_reader :first_seen_path
+
+      # @api private
+      def initialize(name, path:, first_seen_path:)
+        @name = name
+        @path = path
+        @first_seen_path = first_seen_path
+
+        super(
+          "input refers to itself at #{self.class.format_path(path)} " \
+          "(recursive type #{name.inspect}, " \
+          "first seen at #{self.class.format_path(first_seen_path)})"
+        )
+      end
+
+      # @api private
+      def self.format_path(path)
+        return "(root)" if path.empty?
+
+        path.reduce(+"") do |output, segment|
+          case segment
+          when ::Integer
+            output << "[#{segment}]"
+          else
+            output << "." unless output.empty?
+            output << segment.to_s
+          end
+        end
+      end
+    end
   end
 end
