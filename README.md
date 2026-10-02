@@ -123,3 +123,42 @@ func handleOAuth2Callback(w http.ResponseWriter, r *http.Request) {
     }
 }
 ```
+
+## DPoP-bound access tokens
+
+Resource servers receiving OAuth 2.0 access tokens bound to a client-held key
+can verify the sender's Demonstrating Proof of Possession (DPoP) proof with
+the [`oidc/dpop`](https://pkg.go.dev/github.com/coreos/go-oidc/v3/oidc/dpop)
+package, an implementation of [RFC 9449](https://www.rfc-editor.org/rfc/rfc9449).
+It checks the proof signature, HTTP method and target URI, access-token hash,
+public-key thumbprint, issued-at time, and replay identifier, and supports the
+server nonce challenge.
+
+The access token is always validated separately; the verifier only receives
+the binding that resulted from that validation.
+
+```go
+verifier, err := dpop.NewVerifier(&dpop.Config{
+    // Back this with a shared, atomic check-and-set store (e.g. Redis SET NX)
+    // when running more than one resource-server instance.
+    ReplayStore: dpop.NewMemoryStore(),
+})
+if err != nil {
+    // handle error
+}
+
+// rawAccessToken has already been verified; extract its cnf.jkt binding.
+binding, err := dpop.BindingFromClaims(verifiedTokenClaims)
+if err != nil {
+    // handle error
+}
+
+proof, err := verifier.VerifyRequest(ctx, r, rawAccessToken, binding)
+if err != nil {
+    // handle error; *dpop.Error can write the RFC 9449 response directly.
+}
+_ = proof
+```
+
+See [`example/dpop`](./example/dpop) for a runnable end-to-end demonstration
+covering replay, method/URI mismatch, token mismatch, and the nonce flow.
