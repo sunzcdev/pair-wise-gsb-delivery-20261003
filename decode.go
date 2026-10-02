@@ -53,7 +53,16 @@ import (
 //	CBOR null and undefined values decode to nil.
 //	CBOR times (tag 0 and 1) decode to time.Time.
 //	CBOR bignums (tag 2 and 3) decode to big.Int.
+//	CBOR typed arrays (tags 64-82, 84-86, RFC 8746) decode to the
+//	corresponding named slice types (e.g. Uint16BigEndianSlice).
 //	CBOR tags with an unrecognized number decode to cbor.Tag
+//
+// To unmarshal a CBOR typed array (RFC 8746) into a Go slice, the slice
+// element type must match the tag's element type (e.g. []uint16 for tags 65
+// and 69).  The tag number determines how the byte string content is
+// interpreted.  Unnamed Go slices (e.g. []uint16) encode as CBOR arrays;
+// use the named slice types (e.g. Uint16BigEndianSlice) to encode typed
+// arrays with their tag numbers.
 //
 // To unmarshal a CBOR array into a slice, Unmarshal allocates a new slice
 // if the CBOR array is empty or slice capacity is less than CBOR array length.
@@ -98,7 +107,7 @@ import (
 // into any other Go type has no effect and returns no error.
 //
 // Unmarshal supports CBOR tag 55799 (self-describe CBOR), tag 0 and 1 (time),
-// and tag 2 and 3 (bignum).
+// tag 2 and 3 (bignum), and tags 64-82 and 84-86 (typed arrays, RFC 8746).
 //
 // Unmarshal returns ExtraneousDataError error (without decoding into v)
 // if there are any remaining bytes following the first valid CBOR data item.
@@ -1685,6 +1694,12 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 			}
 		}
 
+		if info := typedArrayInfoByTagNum(tagNum); info != nil {
+			// Typed array (tags 64-82, 84-86, RFC 8746) can be decoded to a
+			// slice with matching element type.
+			return d.parseTypedArrayToValue(info, v, tInfo)
+		}
+
 		return d.parseToValue(v, tInfo)
 
 	case cborTypeArray:
@@ -2144,6 +2159,16 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 				d.dm.byteStringExpectedFormat != ByteStringExpectedFormatNone {
 				return d.parseWithExpectedLaterEncodingTag(tagNum)
 			}
+		}
+
+		if info := typedArrayInfoByTagNum(tagNum); info != nil {
+			// Typed array (tags 64-82, 84-86, RFC 8746) decodes to the
+			// corresponding named slice type.
+			tv, err := d.parseTypedArray(info)
+			if err != nil {
+				return nil, err
+			}
+			return tv.Interface(), nil
 		}
 
 		if d.dm.tags != nil {

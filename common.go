@@ -116,6 +116,44 @@ const (
 	tagNumSelfDescribedCBOR              = 55799
 )
 
+// Tag numbers for typed arrays (RFC 8746).  Tags 83 and 87 (float128 arrays)
+// are not supported because Go has no native 128-bit floating-point type.
+const (
+	tagNumUint8ArrayBigEndian       = 64
+	tagNumUint16ArrayBigEndian      = 65
+	tagNumUint32ArrayBigEndian      = 66
+	tagNumUint64ArrayBigEndian      = 67
+	tagNumUint8ArrayLittleEndian    = 68
+	tagNumUint16ArrayLittleEndian   = 69
+	tagNumUint32ArrayLittleEndian   = 70
+	tagNumUint64ArrayLittleEndian   = 71
+	tagNumInt8ArrayBigEndian        = 72
+	tagNumInt16ArrayBigEndian       = 73
+	tagNumInt32ArrayBigEndian       = 74
+	tagNumInt64ArrayBigEndian       = 75
+	tagNumInt8ArrayLittleEndian     = 76
+	tagNumInt16ArrayLittleEndian    = 77
+	tagNumInt32ArrayLittleEndian    = 78
+	tagNumInt64ArrayLittleEndian    = 79
+	tagNumFloat16ArrayBigEndian     = 80
+	tagNumFloat32ArrayBigEndian     = 81
+	tagNumFloat64ArrayBigEndian     = 82
+	tagNumFloat128ArrayBigEndian    = 83 // unsupported
+	tagNumFloat16ArrayLittleEndian  = 84
+	tagNumFloat32ArrayLittleEndian  = 85
+	tagNumFloat64ArrayLittleEndian  = 86
+	tagNumFloat128ArrayLittleEndian = 87 // unsupported
+)
+
+// isSupportedTypedArrayTagNum returns true if tagNum is an RFC 8746 typed
+// array tag number supported by this codec (tags 64-82 and 84-86).
+func isSupportedTypedArrayTagNum(tagNum uint64) bool {
+	return tagNum >= tagNumUint8ArrayBigEndian &&
+		tagNum <= tagNumFloat64ArrayLittleEndian &&
+		tagNum != tagNumFloat128ArrayBigEndian &&
+		tagNum != tagNumFloat128ArrayLittleEndian
+}
+
 const (
 	cborBreakFlag = byte(0xff)
 )
@@ -139,6 +177,20 @@ const (
 // validBuiltinTag checks that supported built-in tag numbers are followed by expected content types.
 func validBuiltinTag(tagNum uint64, contentHead byte) error {
 	t := getType(contentHead)
+
+	if isSupportedTypedArrayTagNum(tagNum) {
+		// Tag content (typed array, RFC 8746) must be byte string type.
+		if t != cborTypeByteString {
+			return newInadmissibleTagContentTypeErrorf(
+				fmt.Sprintf(
+					"tag number %d must be followed by byte string, got %s",
+					tagNum,
+					t.String(),
+				))
+		}
+		return nil
+	}
+
 	switch tagNum {
 	case tagNumRFC3339Time:
 		// Tag content (date/time text string in RFC 3339 format) must be string type.

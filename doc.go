@@ -6,6 +6,10 @@ Package cbor is a modern CBOR codec (RFC 8949 & RFC 8742) with CBOR tags,
 Go struct tag options (toarray/keyasint/omitempty/omitzero), Core Deterministic Encoding,
 CTAP2, Canonical CBOR, float64->32->16, and duplicate map key detection.
 
+CBOR typed arrays (RFC 8746) are built-in: tags 64-82 and 84-86 decode to
+named slice types (e.g. Uint16BigEndianSlice) and those types encode back
+with their tag numbers.  Tags 83 and 87 (float128 arrays) are unsupported.
+
 Encoding options allow "preferred serialization" by encoding integers and floats
 to their smallest forms (e.g. float16) when values fit.
 

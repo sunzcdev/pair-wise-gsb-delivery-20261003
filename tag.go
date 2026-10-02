@@ -291,6 +291,9 @@ func newTagItem(opts TagOptions, contentType reflect.Type, num uint64, nestedNum
 	if num == 2 || num == 3 {
 		return nil, errors.New("cbor: cannot add tag number 2 or 3 to TagSet, it's built-in and supported automatically")
 	}
+	if isSupportedTypedArrayTagNum(num) {
+		return nil, fmt.Errorf("cbor: cannot add tag number %d to TagSet, it's built-in and supported automatically", num)
+	}
 	if num == tagNumSelfDescribedCBOR {
 		return nil, errors.New("cbor: cannot add tag number 55799 to TagSet, it's built-in and ignored automatically")
 	}
