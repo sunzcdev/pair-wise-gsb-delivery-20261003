@@ -2,6 +2,7 @@ package imapserver
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/internal/imapwire"
@@ -93,7 +94,20 @@ func (c *Conn) availableCaps() []imap.Cap {
 			imap.CapCreateSpecialUse,
 			imap.CapLiteralPlus,
 			imap.CapUnauthenticate,
+			imap.CapQuota,
+			imap.CapQuotaSet,
 		})
+
+		if available.Has(imap.CapQuota) {
+			// Advertise supported QUOTA resource types
+			resourceTypes := available.QuotaResourceTypes()
+			sort.Slice(resourceTypes, func(i, j int) bool {
+				return resourceTypes[i] < resourceTypes[j]
+			})
+			for _, resourceType := range resourceTypes {
+				caps = append(caps, imap.Cap("QUOTA=RES-"+string(resourceType)))
+			}
+		}
 
 		if appendLimitSession, ok := c.session.(SessionAppendLimit); ok {
 			limit := appendLimitSession.AppendLimit()

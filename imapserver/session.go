@@ -124,3 +124,20 @@ type SessionAppendLimit interface {
 	// this server in an APPEND command.
 	AppendLimit() uint32
 }
+
+// SessionQuota is an IMAP session which supports QUOTA.
+type SessionQuota interface {
+	Session
+
+	// Authenticated state
+	GetQuota(root string) (*QuotaData, error)
+	GetQuotaRoot(mailbox string) (*QuotaRootData, error)
+}
+
+// SessionQuotaSet is an IMAP session which supports SETQUOTA.
+type SessionQuotaSet interface {
+	SessionQuota
+
+	// Authenticated state
+	SetQuota(root string, resources map[imap.QuotaResourceType]int64) error
+}

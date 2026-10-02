@@ -115,8 +115,12 @@ func main() {
 			return memServer.NewSession(), nil, nil
 		},
 		Caps: imap.CapSet{
-			imap.CapIMAP4rev1: {},
-			imap.CapIMAP4rev2: {},
+			imap.CapIMAP4rev1:             {},
+			imap.CapIMAP4rev2:             {},
+			imap.CapQuota:                 {},
+			imap.CapQuotaSet:              {},
+			imap.Cap("QUOTA=RES-STORAGE"): {},
+			imap.Cap("QUOTA=RES-MESSAGE"): {},
 		},
 		TLSConfig:    tlsConfig,
 		InsecureAuth: insecureAuth,

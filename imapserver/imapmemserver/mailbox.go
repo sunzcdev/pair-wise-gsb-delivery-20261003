@@ -1,7 +1,6 @@
 package imapmemserver
 
 import (
-	"bytes"
 	"sort"
 	"sync"
 	"time"
@@ -17,6 +16,7 @@ import (
 type Mailbox struct {
 	tracker     *imapserver.MailboxTracker
 	uidValidity uint32
+	quotaRoot   *quotaRoot // may be nil
 
 	mutex      sync.Mutex
 	name       string
@@ -117,14 +117,6 @@ func (mbox *Mailbox) sizeLocked() int64 {
 		size += int64(len(msg.buf))
 	}
 	return size
-}
-
-func (mbox *Mailbox) appendLiteral(r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(r); err != nil {
-		return nil, err
-	}
-	return mbox.appendBytes(buf.Bytes(), options), nil
 }
 
 func (mbox *Mailbox) copyMsg(msg *message) *imap.AppendData {
@@ -230,8 +222,8 @@ func (mbox *Mailbox) flagsLocked() []imap.Flag {
 }
 
 func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
-	expunged := make(map[*message]struct{})
 	mbox.mutex.Lock()
+	expunged := make(map[*message]struct{})
 	for _, msg := range mbox.l {
 		if uids != nil && !uids.Contains(msg.uid) {
 			continue
@@ -240,15 +232,23 @@ func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) err
 			expunged[msg] = struct{}{}
 		}
 	}
-	mbox.mutex.Unlock()
 
 	if len(expunged) == 0 {
+		mbox.mutex.Unlock()
 		return nil
 	}
 
-	mbox.mutex.Lock()
+	var size int64
+	for msg := range expunged {
+		size += int64(len(msg.buf))
+	}
 	mbox.expungeLocked(expunged)
 	mbox.mutex.Unlock()
+
+	// Release the quota consumed by the expunged messages
+	if root := mbox.quotaRoot; root != nil {
+		root.release(size, int64(len(expunged)))
+	}
 
 	return nil
 }

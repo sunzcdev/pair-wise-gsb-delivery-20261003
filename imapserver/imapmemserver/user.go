@@ -1,6 +1,7 @@
 package imapmemserver
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"sort"
 	"strings"
@@ -14,9 +15,11 @@ const mailboxDelim rune = '/'
 
 type User struct {
 	username, password string
+	admin              bool
 
 	mutex           sync.Mutex
 	mailboxes       map[string]*Mailbox
+	quotaRoots      map[string]*quotaRoot
 	prevUidValidity uint32
 }
 
@@ -25,7 +28,20 @@ func NewUser(username, password string) *User {
 		username:  username,
 		password:  password,
 		mailboxes: make(map[string]*Mailbox),
+		quotaRoots: map[string]*quotaRoot{
+			// The empty quota root covers all of the user's mailboxes
+			"": newQuotaRoot(""),
+		},
 	}
+}
+
+// NewAdminUser creates a new user with administrative privileges.
+//
+// Only administrators can use the SETQUOTA command.
+func NewAdminUser(username, password string) *User {
+	u := NewUser(username, password)
+	u.admin = true
+	return u
 }
 
 func (u *User) Login(username, password string) error {
@@ -54,6 +70,12 @@ func (u *User) mailbox(name string) (*Mailbox, error) {
 	u.mutex.Lock()
 	defer u.mutex.Unlock()
 	return u.mailboxLocked(name)
+}
+
+func (u *User) quotaRoot(name string) *quotaRoot {
+	u.mutex.Lock()
+	defer u.mutex.Unlock()
+	return u.quotaRoots[name]
 }
 
 func (u *User) Status(name string, options *imap.StatusOptions) (*imap.StatusData, error) {
@@ -118,7 +140,21 @@ func (u *User) Append(mailbox string, r imap.LiteralReader, options *imap.Append
 			Text: "No such mailbox",
 		}
 	}
-	return mbox.appendLiteral(r, options)
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		return nil, err
+	}
+
+	// Reserve quota before storing the message. If the reservation fails,
+	// the message is rejected and no quota is consumed.
+	if root := mbox.quotaRoot; root != nil {
+		if err := root.consume(int64(buf.Len()), 1); err != nil {
+			return nil, err
+		}
+	}
+
+	return mbox.appendBytes(buf.Bytes(), options), nil
 }
 
 func (u *User) Create(name string, options *imap.CreateOptions) error {
@@ -138,19 +174,36 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 	// UIDVALIDITY must change if a mailbox is deleted and re-created with the
 	// same name.
 	u.prevUidValidity++
-	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
+	mbox := NewMailbox(name, u.prevUidValidity)
+	mbox.quotaRoot = u.quotaRoots[""]
+	u.mailboxes[name] = mbox
 	return nil
 }
 
 func (u *User) Delete(name string) error {
 	u.mutex.Lock()
-	defer u.mutex.Unlock()
 
-	if _, err := u.mailboxLocked(name); err != nil {
+	mbox, err := u.mailboxLocked(name)
+	if err != nil {
+		u.mutex.Unlock()
 		return err
 	}
 
 	delete(u.mailboxes, name)
+	u.mutex.Unlock()
+
+	// Release the quota consumed by the deleted mailbox
+	if root := mbox.quotaRoot; root != nil {
+		mbox.mutex.Lock()
+		var size int64
+		for _, msg := range mbox.l {
+			size += int64(len(msg.buf))
+		}
+		n := int64(len(mbox.l))
+		mbox.mutex.Unlock()
+		root.release(size, n)
+	}
+
 	return nil
 }
 
