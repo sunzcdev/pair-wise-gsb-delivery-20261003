@@ -44,9 +44,22 @@ func ScanTokens(data []byte, it func([]byte) bool) bool {
 // Note that appended options are all consist of subslices of data. That is,
 // mutation of data will mutate appended options.
 func ParseOptions(data []byte, options []Option) ([]Option, bool) {
+	options, d := parseOptions(data, false, options)
+	return options, d.OK()
+}
+
+// ParseOptionsDiag is a diagnostic version of ParseOptions. It behaves like
+// ParseOptions but returns a Diagnostic describing how parsing terminated:
+// whether it reached the end of data normally, was stopped early, or failed
+// on malformed input. See ScanOptionsDiag for details.
+func ParseOptionsDiag(data []byte, options []Option) ([]Option, Diagnostic) {
+	return parseOptions(data, true, options)
+}
+
+func parseOptions(data []byte, strict bool, options []Option) ([]Option, Diagnostic) {
 	var i int
 	index := -1
-	return options, ScanOptions(data, func(idx int, name, attr, val []byte) Control {
+	d := scanOptions(data, strict, func(idx int, name, attr, val []byte) Control {
 		if idx != index {
 			index = idx
 			i = len(options)
@@ -57,6 +70,7 @@ func ParseOptions(data []byte, options []Option) ([]Option, bool) {
 		}
 		return ControlContinue
 	})
+	return options, d
 }
 
 // SelectFlag encodes way of options selection.
@@ -193,6 +207,29 @@ const (
 //
 // It returns false if data is malformed.
 func ScanOptions(data []byte, it func(index int, option, attribute, value []byte) Control) bool {
+	return scanOptions(data, false, it).OK()
+}
+
+// ScanOptionsDiag is a diagnostic version of ScanOptions. It scans data
+// exactly like ScanOptions does, but instead of a boolean flag returns a
+// Diagnostic that distinguishes three outcomes: the whole input was scanned
+// (StatusOK), the callback stopped the scan early with ControlBreak
+// (StatusBreak), or the input is malformed (StatusError). On failure the
+// Diagnostic carries the error category, the byte offset of the offending
+// byte in the original data, and the index of the option and parameter
+// being parsed.
+//
+// Unlike ScanOptions it is strict about parameter values: a parameter name
+// followed by "=" but no value is reported as ErrMissingValue.
+//
+// The scan is streaming: tokens are reported through the callback as they
+// are scanned and no intermediate syntax tree is allocated, so the fast
+// path stays allocation free.
+func ScanOptionsDiag(data []byte, it func(index int, option, attribute, value []byte) Control) Diagnostic {
+	return scanOptions(data, true, it)
+}
+
+func scanOptions(data []byte, strict bool, it func(index int, option, attribute, value []byte) Control) (diag Diagnostic) {
 	lexer := &Scanner{data: data}
 
 	var ok bool
@@ -207,9 +244,21 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 
 	var (
 		index             int
+		paramIndex        = -1
 		key, param, value []byte
 		mustCall          bool
 	)
+
+	errorf := func(kind ErrorKind, offset int) Diagnostic {
+		return Diagnostic{
+			Status: StatusError,
+			Kind:   kind,
+			Offset: offset,
+			Index:  index,
+			Param:  paramIndex,
+		}
+	}
+
 	for lexer.Next() {
 		var (
 			call      bool
@@ -228,6 +277,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 				mustCall = true
 			case stateParamName:
 				param = v
+				paramIndex++
 				state = stateParamBeforeValue
 				mustCall = true
 			case stateParamValue:
@@ -235,12 +285,12 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 				state = stateParamBeforeName
 				call = true
 			default:
-				return false
+				return errorf(ErrUnexpectedToken, lexer.itemPos)
 			}
 
 		case ItemString:
 			if state != stateParamValue {
-				return false
+				return errorf(ErrUnexpectedToken, lexer.itemPos)
 			}
 			value = v
 			state = stateParamBeforeName
@@ -253,6 +303,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 
 			case isComma(v) && state == stateParamBeforeName:
 				state = stateKey
+				paramIndex = -1
 				// Make call only if we have not called this key yet.
 				call = mustCall
 				if !call {
@@ -266,6 +317,7 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 
 			case isComma(v) && state == stateParamBeforeValue:
 				state = stateKey
+				paramIndex = -1
 				growIndex = 1
 				call = true
 
@@ -279,23 +331,29 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 			case isEquality(v) && state == stateParamBeforeValue:
 				state = stateParamValue
 
+			case state == stateParamValue:
+				// A separator arrived where a parameter value was
+				// expected.
+				return errorf(ErrMissingValue, lexer.itemPos)
+
 			default:
-				return false
+				return errorf(ErrUnexpectedToken, lexer.itemPos)
 			}
 
 		default:
-			return false
+			return errorf(ErrUnexpectedToken, lexer.itemPos)
 		}
 
 		if call {
 			switch it(index, key, param, value) {
 			case ControlBreak:
 				// User want to stop to parsing parameters.
-				return true
+				return Diagnostic{Status: StatusBreak, Index: index, Param: paramIndex}
 
 			case ControlSkip:
 				// User want to skip current param.
 				state = stateKey
+				paramIndex = -1
 				lexer.SkipEscaped(',')
 
 			case ControlContinue:
@@ -312,12 +370,21 @@ func ScanOptions(data []byte, it func(index int, option, attribute, value []byte
 			index += growIndex
 		}
 	}
+	if lexer.err {
+		return errorf(lexer.errKind, lexer.errPos)
+	}
+	if strict && state == stateParamValue {
+		// Parameter name and equality sign without a value.
+		return errorf(ErrMissingValue, len(data))
+	}
 	if mustCall {
 		ok = true
 		it(index, key, param, value)
 	}
-
-	return ok && !lexer.err
+	if !ok {
+		return errorf(ErrUnexpectedEOF, len(data))
+	}
+	return Diagnostic{Status: StatusOK, Index: index, Param: paramIndex}
 }
 
 func isComma(b []byte) bool {

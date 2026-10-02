@@ -30,8 +30,11 @@ type Scanner struct {
 
 	itemType  ItemType
 	itemBytes []byte
+	itemPos   int
 
-	err bool
+	err     bool
+	errPos  int
+	errKind ErrorKind
 }
 
 // NewScanner creates new RFC2616 data scanner.
@@ -54,8 +57,7 @@ func (l *Scanner) Next() bool {
 		return l.fetchComment()
 
 	case '\\', ')': // unexpected chars;
-		l.err = true
-		return false
+		return l.setErr(ErrUnexpectedToken, l.pos)
 
 	default:
 		return l.fetchToken()
@@ -168,6 +170,14 @@ func (l *Scanner) nextChar() (byte, bool) {
 func (l *Scanner) resetItem() {
 	l.itemType = ItemUndef
 	l.itemBytes = nil
+	l.itemPos = -1
+}
+
+func (l *Scanner) setErr(kind ErrorKind, pos int) bool {
+	l.err = true
+	l.errKind = kind
+	l.errPos = pos
+	return false
 }
 
 func (l *Scanner) fetchOctet(c byte) bool {
@@ -181,6 +191,7 @@ func (l *Scanner) fetchOctet(c byte) bool {
 
 	l.itemType = ItemOctet
 	l.itemBytes = l.data[i:l.pos]
+	l.itemPos = i
 
 	return true
 }
@@ -188,44 +199,46 @@ func (l *Scanner) fetchOctet(c byte) bool {
 func (l *Scanner) fetchToken() bool {
 	n, t := ScanToken(l.data[l.pos:])
 	if n == -1 {
-		l.err = true
-		return false
+		return l.setErr(ErrUnexpectedToken, l.pos)
 	}
 
 	l.itemType = t
 	l.itemBytes = l.data[l.pos : l.pos+n]
+	l.itemPos = l.pos
 	l.pos += n
 
 	return true
 }
 
 func (l *Scanner) fetchQuotedString() (ok bool) {
+	start := l.pos
 	l.pos++
 
 	n := ScanUntil(l.data[l.pos:], '"')
 	if n == -1 {
-		l.err = true
-		return false
+		return l.setErr(ErrUnclosedQuote, start)
 	}
 
 	l.itemType = ItemString
 	l.itemBytes = RemoveByte(l.data[l.pos:l.pos+n], '\\')
+	l.itemPos = start
 	l.pos += n + 1
 
 	return true
 }
 
 func (l *Scanner) fetchComment() (ok bool) {
+	start := l.pos
 	l.pos++
 
 	n := ScanPairGreedy(l.data[l.pos:], '(', ')')
 	if n == -1 {
-		l.err = true
-		return false
+		return l.setErr(ErrUnclosedComment, start)
 	}
 
 	l.itemType = ItemComment
 	l.itemBytes = RemoveByte(l.data[l.pos:l.pos+n], '\\')
+	l.itemPos = start
 	l.pos += n + 1
 
 	return true
