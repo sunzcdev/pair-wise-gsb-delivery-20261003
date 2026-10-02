@@ -69,6 +69,27 @@ JSONSchemer.schema(
 data
 # => {"foo"=>"bar"}
 
+# preview default property values (without modifying the given data)
+
+JSONSchemer.schema(
+  {
+    'properties' => {
+      'foo' => {
+        'default' => 'bar'
+      }
+    }
+  }
+).preview_property_defaults({})
+# => {"valid"=>true,
+#     "data"=>{"foo"=>"bar"},
+#     "insertions"=>
+#      [{"pointer"=>"/foo",
+#        "value"=>"bar",
+#        "schema"=>"json-schemer://schema#/properties/foo/default",
+#        "schema_pointer"=>"/properties/foo/default"}],
+#     "ambiguities"=>[],
+#     "output"=>{...validation output for "data"...}}
+
 # schema files
 
 require 'pathname'

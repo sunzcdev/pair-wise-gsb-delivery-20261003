@@ -117,6 +117,62 @@ module JSONSchemer
       output
     end
 
+    def preview_property_defaults(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
+      preview_instance = deep_dup(instance)
+      instance_location = Location.root
+      context = Context.new(preview_instance, [], nil, false, access_mode)
+      result = validate_instance(deep_stringify_keys(preview_instance), instance_location, root_keyword_location, context)
+
+      insertions = []
+      ambiguities = []
+      inserted = false
+
+      result.each_property_default_candidate do |candidate_instance_location, property, results_with_tree_validity|
+        results_with_tree_validity = results_with_tree_validity.select(&:last) unless results_with_tree_validity.size == 1
+        pointer = "#{Location.resolve(candidate_instance_location)}/#{Location.escape_json_pointer_token(property)}"
+        annotations = results_with_tree_validity.to_set { |default_result, _tree_valid| default_result.annotation }
+        if annotations.size == 1
+          default_result = results_with_tree_validity.first.first
+          original_instance = context.original_instance(candidate_instance_location)
+          property_key = insert_property_defaults == :symbol ? property.to_sym : property
+          original_instance[property_key] = deep_dup(annotations.first)
+          insertions << {
+            'pointer' => pointer,
+            'value' => deep_dup(annotations.first),
+            'schema' => default_result.source.absolute_keyword_location,
+            'schema_pointer' => default_result.source.schema_pointer
+          }
+          inserted = true
+        else
+          ambiguities << {
+            'pointer' => pointer,
+            'candidates' => results_with_tree_validity.map do |default_result, _tree_valid|
+              {
+                'value' => deep_dup(default_result.annotation),
+                'schema' => default_result.source.absolute_keyword_location,
+                'schema_pointer' => default_result.source.schema_pointer
+              }
+            end
+          }
+        end
+      end
+
+      if inserted
+        result = validate_instance(deep_stringify_keys(preview_instance), instance_location, root_keyword_location, context)
+      end
+
+      output = result.output(output_format)
+      resolve_enumerators!(output) if resolve_enumerators
+
+      {
+        'valid' => result.valid,
+        'data' => preview_instance,
+        'insertions' => insertions,
+        'ambiguities' => ambiguities,
+        'output' => output
+      }
+    end
+
     def valid_schema?(**options)
       meta_schema.valid?(value, **options)
     end
@@ -427,6 +483,19 @@ module JSONSchemer
         output.map { |value| resolve_enumerators!(value) }
       else
         output
+      end
+    end
+
+    def deep_dup(obj)
+      case obj
+      when Hash
+        obj.each_with_object({}) { |(key, value), out| out[key] = deep_dup(value) }
+      when Array
+        obj.map { |item| deep_dup(item) }
+      when String
+        obj.dup
+      else
+        obj
       end
     end
   end
