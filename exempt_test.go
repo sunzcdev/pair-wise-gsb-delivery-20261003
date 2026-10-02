@@ -106,7 +106,7 @@ func TestExemptRegexpCall(t *testing.T) {
 	hand.ExemptRegexp(pattern)
 
 	// String() returns the original pattern
-	got := hand.exemptRegexps[0].String()
+	got := hand.exemptRules[0].Regexp.String()
 
 	if pattern != got {
 		t.Errorf("The compiled pattern has changed: expected %v, got %v",
@@ -118,7 +118,7 @@ func TestExemptRegexpCall(t *testing.T) {
 	re := regexp.MustCompile(pattern)
 	hand.ExemptRegexp(re)
 
-	gotRe := hand.exemptRegexps[0]
+	gotRe := hand.exemptRules[0].Regexp
 
 	if re != gotRe {
 		t.Errorf("The compiled pattern is not what we gave: expected %v, got %v",
@@ -164,7 +164,7 @@ func TestExemptRegexpsCall(t *testing.T) {
 	hand.ExemptRegexps(slice1...)
 
 	for i := range slice1 {
-		pat := hand.exemptRegexps[i].String()
+		pat := hand.exemptRules[i].Regexp.String()
 		got := slice1[i]
 		if pat != got {
 			t.Errorf("The compiled pattern has changed: expected %v, got %v", pat, got)
@@ -177,13 +177,13 @@ func TestExemptRegexpsCall(t *testing.T) {
 	hand.ExemptRegexps(slice2...)
 
 	pat := slice2[0].(string)
-	got := hand.exemptRegexps[0].String()
+	got := hand.exemptRules[0].Regexp.String()
 	if pat != got {
 		t.Errorf("The compiled pattern has changed: expected %v, got %v", pat, got)
 	}
 
 	pat = slice2[1].(*regexp.Regexp).String()
-	got = hand.exemptRegexps[1].String()
+	got = hand.exemptRules[1].Regexp.String()
 	if pat != got {
 		t.Errorf("The compiled pattern has changed: expected %v, got %v", pat, got)
 	}

@@ -1,3 +1,4 @@
+//go:build !go1.7
 // +build !go1.7
 
 package nosurf
@@ -17,6 +18,8 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// decision contains the final allow/deny rule and check stage.
+	decision Decision
 }
 
 var (
@@ -62,6 +65,21 @@ func Reason(req *http.Request) error {
 	return ctx.reason
 }
 
+// DecisionFor returns the CSRF decision recorded for the request while it is
+// being handled. It contains rule identifiers and stages, but no token or cookie
+// values.
+func DecisionFor(req *http.Request) Decision {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		return Decision{}
+	}
+
+	return ctx.decision
+}
+
 // Takes a raw token, masks it with a per-request key,
 // encodes in base64 and makes it available to the wrapped handler
 func ctxSetToken(req *http.Request, token []byte) *http.Request {
@@ -90,6 +108,20 @@ func ctxSetReason(req *http.Request, reason error) *http.Request {
 	}
 
 	ctx.reason = reason
+	return req
+}
+
+func ctxSetDecision(req *http.Request, decision Decision) *http.Request {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		ctx = new(csrfContext)
+		contextMap[req] = ctx
+	}
+
+	ctx.decision = decision
 	return req
 }
 

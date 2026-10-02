@@ -6,7 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"regexp"
+	"sync"
 )
 
 const (
@@ -48,18 +48,9 @@ type CSRFHandler struct {
 	// than a bunch of methods SetCookieExpiration(), etc.
 	baseCookie http.Cookie
 
-	// Slices of paths that are exempt from CSRF checks.
-	// All of those will be matched against Request.URL.Path,
-	// So they should take the leading slash into account
-	// Paths can be specified by...
-	// ...an exact path,
-	exemptPaths []string
-	// ...a regexp,
-	exemptRegexps []*regexp.Regexp
-	// ...or a glob (as used by path.Match()).
-	exemptGlobs []string
-	// ...or a custom matcher function
-	exemptFunc func(r *http.Request) bool
+	exemptRules     []ExemptRule
+	exemptRuleID    int
+	exemptRulesLock sync.RWMutex
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
@@ -112,7 +103,7 @@ func NewPure(handler http.Handler) http.Handler {
 	return New(handler)
 }
 
-func (h CSRFHandler) getCookieName() string {
+func (h *CSRFHandler) getCookieName() string {
 	if h.baseCookie.Name != "" {
 		return h.baseCookie.Name
 	}
@@ -125,12 +116,7 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer ctxClear(r)
 	w.Header().Add("Vary", "Cookie")
 
-	var realToken []byte
-
-	tokenCookie, err := r.Cookie(h.getCookieName())
-	if err == nil {
-		realToken = b64decode(tokenCookie.Value)
-	}
+	realToken := h.realRequestToken(r)
 
 	// If the length of the real token isn't what it should be,
 	// it has either been tampered with,
@@ -146,29 +132,54 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctxSetToken(r, realToken)
 	}
 
-	if sContains(safeMethods, r.Method) || h.IsExempt(r) {
-		// short-circuit with a success for safe methods
+	decision, reason := h.evaluateRequest(r)
+	ctxSetDecision(r, decision)
+
+	if decision.Allowed {
 		h.handleSuccess(w, r)
 		return
 	}
 
+	ctxSetReason(r, reason)
+	h.handleFailure(w, r)
+}
+
+// CheckRequest evaluates the request without generating a token or calling
+// the wrapped handler. It returns the final CSRF decision for the request.
+func (h *CSRFHandler) CheckRequest(r *http.Request) Decision {
+	decision, _ := h.evaluateRequest(r)
+	return decision
+}
+
+func (h *CSRFHandler) evaluateRequest(r *http.Request) (Decision, error) {
+	if sContains(safeMethods, r.Method) {
+		return Decision{Allowed: true, Stage: StageSafeMethod, RuleID: SafeMethodRuleID}, nil
+	}
+
+	exemption := h.MatchExemptRule(r)
+	if exemption.Matched {
+		return Decision{Allowed: true, Stage: StageExemption, RuleID: exemption.RuleID}, nil
+	}
+
 	if err := h.ensureSameOrigin(r); err != nil {
-		ctxSetReason(r, err)
-		h.handleFailure(w, r)
-		return
+		return Decision{Allowed: false, Stage: StageOrigin}, err
 	}
 
-	// Finally, we check the token itself.
 	sentToken := extractToken(r)
-
+	realToken := h.realRequestToken(r)
 	if !verifyToken(realToken, sentToken) {
-		ctxSetReason(r, ErrBadToken)
-		h.handleFailure(w, r)
-		return
+		return Decision{Allowed: false, Stage: StageToken}, ErrBadToken
 	}
 
-	// Everything else passed, handle the success.
-	h.handleSuccess(w, r)
+	return Decision{Allowed: true, Stage: StageToken, RuleID: TokenRuleID}, nil
+}
+
+func (h *CSRFHandler) realRequestToken(r *http.Request) []byte {
+	tokenCookie, err := r.Cookie(h.getCookieName())
+	if err != nil {
+		return nil
+	}
+	return b64decode(tokenCookie.Value)
 }
 
 // handleSuccess simply calls the successHandler.

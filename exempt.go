@@ -3,78 +3,99 @@ package nosurf
 import (
 	"fmt"
 	"net/http"
-	pathModule "path"
 	"regexp"
+	"sort"
 )
 
-// Checks if the given request is exempt from CSRF checks.
-// It checks the ExemptFunc first, then the exact paths,
-// then the globs and finally the regexps.
+// MatchExemptRule evaluates exemption matchers only. It does not generate a
+// token or invoke the wrapped success or failure handler.
+func (h *CSRFHandler) MatchExemptRule(r *http.Request) ExemptionDecision {
+	h.exemptRulesLock.RLock()
+	rules := make([]ExemptRule, len(h.exemptRules))
+	copy(rules, h.exemptRules)
+	h.exemptRulesLock.RUnlock()
+
+	for _, rule := range rules {
+		if ruleMatches(rule, r) {
+			return ExemptionDecision{Matched: true, RuleID: rule.ID}
+		}
+	}
+
+	return ExemptionDecision{}
+}
+
+// IsExempt reports whether the request matches any exemption rule.
 func (h *CSRFHandler) IsExempt(r *http.Request) bool {
-	if h.exemptFunc != nil && h.exemptFunc(r) {
-		return true
-	}
-
-	path := r.URL.Path
-	if sContains(h.exemptPaths, path) {
-		return true
-	}
-
-	// then the globs
-	for _, glob := range h.exemptGlobs {
-		matched, err := pathModule.Match(glob, path)
-		if matched && err == nil {
-			return true
-		}
-	}
-
-	// finally, the regexps
-	for _, re := range h.exemptRegexps {
-		if re.MatchString(path) {
-			return true
-		}
-	}
-
-	return false
+	return h.MatchExemptRule(r).Matched
 }
 
-// Exempts an exact path from CSRF checks
-// With this (and other Exempt* methods)
-// you should take note that Go's paths
-// include a leading slash.
+// AddExemptRule registers an exemption with a stable ID. Lower rule priorities
+// are evaluated first; registration order is used as a stable tie-breaker.
+// It returns an error when the ID is duplicated or the rule is invalid.
+func (h *CSRFHandler) AddExemptRule(rule ExemptRule) error {
+	rule, err := validateExemptRule(rule)
+	if err != nil {
+		return err
+	}
+
+	h.exemptRulesLock.Lock()
+	defer h.exemptRulesLock.Unlock()
+
+	for _, existing := range h.exemptRules {
+		if existing.ID == rule.ID {
+			return ErrDuplicateExemptRuleID
+		}
+	}
+
+	h.exemptRules = append(h.exemptRules, rule)
+	h.sortExemptRules()
+
+	return nil
+}
+
+func (h *CSRFHandler) sortExemptRules() {
+	sort.SliceStable(h.exemptRules, func(i, j int) bool {
+		return h.exemptRules[i].Priority < h.exemptRules[j].Priority
+	})
+}
+
+func (h *CSRFHandler) addLegacyExemptRule(kind string, rule ExemptRule) {
+	h.exemptRulesLock.Lock()
+	defer h.exemptRulesLock.Unlock()
+
+	h.exemptRuleID++
+	rule.ID = fmt.Sprintf("legacy:%s:%d", kind, h.exemptRuleID)
+	rule.Priority = defaultRulePriority(rule)
+	h.exemptRules = append(h.exemptRules, rule)
+	h.sortExemptRules()
+}
+
+// ExemptPath exempts an exact path from CSRF checks.
 func (h *CSRFHandler) ExemptPath(path string) {
-	h.exemptPaths = append(h.exemptPaths, path)
+	h.addLegacyExemptRule("path", ExemptRule{Path: path})
 }
 
-// A variadic argument version of ExemptPath()
+// ExemptPaths is a variadic version of ExemptPath.
 func (h *CSRFHandler) ExemptPaths(paths ...string) {
-	h.exemptPaths = append(h.exemptPaths, paths...)
+	for _, path := range paths {
+		h.ExemptPath(path)
+	}
 }
 
-// Exempts URLs that match the specified glob pattern
-// (as used by filepath.Match()) from CSRF checks
-//
-// Note that ExemptGlob() is unable to detect syntax errors,
-// because it doesn't have a path to check it against
-// and filepath.Match() doesn't report an error
-// if the path is empty.
-// If we find a way to check the syntax, ExemptGlob
-// MIGHT PANIC on a syntax error in the future.
-// ALWAYS check your globs for syntax errors.
+// ExemptGlob exempts URLs matching the specified glob pattern from CSRF checks.
 func (h *CSRFHandler) ExemptGlob(pattern string) {
-	h.exemptGlobs = append(h.exemptGlobs, pattern)
+	h.addLegacyExemptRule("glob", ExemptRule{Glob: pattern})
 }
 
-// A variadic argument version of ExemptGlob()
+// ExemptGlobs is a variadic version of ExemptGlob.
 func (h *CSRFHandler) ExemptGlobs(patterns ...string) {
-	h.exemptGlobs = append(h.exemptGlobs, patterns...)
+	for _, pattern := range patterns {
+		h.ExemptGlob(pattern)
+	}
 }
 
-// Accepts a regular expression string or a compiled *regexp.Regexp
-// and exempts URLs that match it from CSRF checks.
-//
-// If the given argument is neither of the accepted values,
-// or the given string fails to compile, ExemptRegexp() panics.
+// ExemptRegexp accepts a regular expression string or a compiled *regexp.Regexp
+// and exempts matching URLs. It panics for an invalid type or pattern.
 func (h *CSRFHandler) ExemptRegexp(re interface{}) {
 	var compiled *regexp.Regexp
 
@@ -84,20 +105,33 @@ func (h *CSRFHandler) ExemptRegexp(re interface{}) {
 	case *regexp.Regexp:
 		compiled = re
 	default:
-		err := fmt.Errorf("%T is not a valid type for ExemptRegexp()", re)
-		panic(err)
+		panic(fmt.Errorf("%T is not a valid type for ExemptRegexp()", re))
 	}
 
-	h.exemptRegexps = append(h.exemptRegexps, compiled)
+	h.addLegacyExemptRule("regexp", ExemptRule{Regexp: compiled})
 }
 
-// A variadic argument version of ExemptRegexp()
+// ExemptRegexps is a variadic version of ExemptRegexp.
 func (h *CSRFHandler) ExemptRegexps(res ...interface{}) {
-	for _, v := range res {
-		h.ExemptRegexp(v)
+	for _, re := range res {
+		h.ExemptRegexp(re)
 	}
 }
 
+// ExemptFunc exempts requests for which the supplied function returns true.
 func (h *CSRFHandler) ExemptFunc(fn func(r *http.Request) bool) {
-	h.exemptFunc = fn
+	h.exemptRulesLock.Lock()
+	defer h.exemptRulesLock.Unlock()
+
+	for i := range h.exemptRules {
+		if h.exemptRules[i].ID == "legacy:func" {
+			h.exemptRules[i].Func = fn
+			return
+		}
+	}
+
+	rule := ExemptRule{ID: "legacy:func", Func: fn}
+	rule.Priority = defaultRulePriority(rule)
+	h.exemptRules = append(h.exemptRules, rule)
+	h.sortExemptRules()
 }

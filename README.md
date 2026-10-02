@@ -25,7 +25,9 @@ on every non-safe (non-GET/HEAD/OPTIONS/TRACE) method.
 * Supports any `http.Handler` (frameworks, your own handlers, etc.)
 and acts like one itself.
 * Allows exempting specific endpoints from CSRF checks by
-an exact URL, a glob, or a regular expression.
+a stable rule ID, callback, exact URL, glob, or regular expression.
+* Records the allow/deny rule and check stage for each request without storing
+cookie or token values.
 * Allows specifying your own failure handler. 
 Want to present the hacker with an ASCII middle finger
 instead of the plain old `HTTP 400`? No problem.
@@ -97,6 +99,16 @@ verification by using one of the exemption methods:
 	func (h *CSRFHandler) ExemptRegexp(re interface{})
 	func (h *CSRFHandler) ExemptRegexps(res ...interface{})
 ```
+
+Rules with stable identifiers can be registered with
+`CSRFHandler.AddExemptRule`. Explicit rule priority determines the winner when
+more than one rule matches; registration order breaks equal-priority ties.
+`CSRFHandler.MatchExemptRule` evaluates only exemption matchers, while
+`CSRFHandler.CheckRequest` evaluates the complete CSRF decision without
+generating a token or calling a wrapped handler.
+`nosurf.DecisionFor(r)` returns the recorded decision from inside the
+success or failure handler. Its fields only contain an allow/deny conclusion,
+a stage, and a rule ID.
 
 Later on, the token **must** be verified by manually getting the token from the cookie
 and providing the token sent in body through: `VerifyToken(tkn, tkn2 string) bool`.
