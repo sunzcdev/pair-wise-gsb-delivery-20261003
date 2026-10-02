@@ -31,6 +31,41 @@ Want to present the hacker with an ASCII middle finger
 instead of the plain old `HTTP 400`? No problem.
 * Uses masked tokens to mitigate the BREACH attack.
 * Has no dependencies outside the Go standard library.
+* Supports on-demand cookie issuance, so plain GET pages that render no form
+do not send a CSRF cookie or a `Vary: Cookie` response header.
+
+### On-demand cookies
+
+By default, nosurf sets the CSRF cookie on every request.
+Most public GET pages never embed a token, so sending (and re-sending) the
+cookie on those responses is unnecessary.
+Enable on-demand mode to only issue the cookie when a handler actually
+obtains a token:
+
+```go
+h := nosurf.New(myHandler)
+h.SetCookieOnDemand(true)
+```
+
+In on-demand mode, obtain the token with `nosurf.GetToken(r)` instead of
+`nosurf.Token(r)`. The first call reuses a valid incoming cookie or generates
+a new token and schedules the `Set-Cookie` (and `Vary: Cookie`) headers;
+further calls within the same request return the same token.
+
+`GetToken` returns `nosurf.ErrResponseAlreadyCommitted` when called after the
+response headers have been written (e.g. after `WriteHeader`), because the
+browser could no longer receive the cookie:
+
+```go
+token, err := nosurf.GetToken(r)
+if errors.Is(err, nosurf.ErrResponseAlreadyCommitted) {
+    // The response was already written; no cookie can be delivered.
+}
+```
+
+CSRF validation for unsafe methods (`POST`, `PUT`, etc.) is unchanged in
+on-demand mode. A failure handler may call `GetToken` itself to explicitly
+issue a fresh token when rendering a form on the error page.
 
 ### Example
 ```go

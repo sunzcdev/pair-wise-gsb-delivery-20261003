@@ -1,3 +1,4 @@
+//go:build !go1.7
 // +build !go1.7
 
 package nosurf
@@ -17,6 +18,8 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// Per-request bookkeeping (present on every request served by CSRFHandler).
+	state *requestState
 }
 
 var (
@@ -28,16 +31,27 @@ var (
 // the CSRF token for that request
 // or an empty string if the token does not exist.
 //
+// In on-demand cookie mode (see CSRFHandler.SetCookieOnDemand), calling Token
+// triggers the on-demand issuance of the token (and its cookie) on the first
+// call; use GetToken() instead if you need to detect the failure case where
+// the response headers have already been written.
+//
 // Note that the token won't be available after
 // CSRFHandler finishes
 // (that is, in another handler that wraps it,
 // or after the request has been served)
 func Token(req *http.Request) string {
+	token, _ := getToken(req)
+	return token
+}
+
+// ctxTokenRaw returns the token already stored in the context
+// without triggering on-demand issuance.
+func ctxTokenRaw(req *http.Request) string {
 	cmMutex.RLock()
 	defer cmMutex.RUnlock()
 
 	ctx, ok := contextMap[req]
-
 	if !ok {
 		return ""
 	}
@@ -91,6 +105,56 @@ func ctxSetReason(req *http.Request, reason error) *http.Request {
 
 	ctx.reason = reason
 	return req
+}
+
+func ctxGetState(req *http.Request) *requestState {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		return nil
+	}
+
+	return ctx.state
+}
+
+func ctxSetState(req *http.Request, state *requestState) {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		ctx = new(csrfContext)
+		contextMap[req] = ctx
+	}
+
+	ctx.state = state
+}
+
+// ctxWriter returns the response writer associated with the request,
+// or nil when the request is not served by CSRFHandler.
+func ctxWriter(req *http.Request) http.ResponseWriter {
+	state := ctxGetState(req)
+	if state == nil {
+		return nil
+	}
+
+	return state.writer
+}
+
+// getToken returns the token for the request, triggering on-demand issuance
+// when configured and necessary.
+func getToken(req *http.Request) (string, error) {
+	cmMutex.RLock()
+	ctx, ok := contextMap[req]
+	cmMutex.RUnlock()
+
+	if !ok {
+		return "", ErrContextNotAvailable
+	}
+
+	return ctx.token, onDemandIssue(req)
 }
 
 func ctxClear(req *http.Request) {

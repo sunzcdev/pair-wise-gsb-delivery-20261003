@@ -36,6 +36,18 @@ var (
 
 	// Internal error. When this is raised, and the request is secure, we additionally check for Referer.
 	errNoOrigin = errors.New("Origin header was not present")
+
+	// ErrResponseAlreadyCommitted is returned by GetToken() in on-demand mode
+	// when the CSRF token is requested after the response headers have already
+	// been written (e.g. via ResponseWriter.WriteHeader()).
+	// In that case it is no longer possible to deliver a Set-Cookie header
+	// to the browser, so nosurf refuses to hand out a token that could not
+	// be paired with a cookie.
+	ErrResponseAlreadyCommitted = errors.New("CSRF token requested after the response headers were written")
+
+	// ErrContextNotAvailable is returned by GetToken() when it is called
+	// outside of a request handled by CSRFHandler.
+	ErrContextNotAvailable = errors.New("The request is not handled by CSRFHandler")
 )
 
 type CSRFHandler struct {
@@ -60,6 +72,10 @@ type CSRFHandler struct {
 	exemptGlobs []string
 	// ...or a custom matcher function
 	exemptFunc func(r *http.Request) bool
+
+	// When true, the CSRF cookie (and the Vary: Cookie header) is only issued
+	// once a handler actually obtains a token via GetToken().
+	onDemandCookie bool
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
@@ -123,7 +139,6 @@ func (h CSRFHandler) getCookieName() string {
 func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = addNosurfContext(r)
 	defer ctxClear(r)
-	w.Header().Add("Vary", "Cookie")
 
 	var realToken []byte
 
@@ -131,6 +146,42 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		realToken = b64decode(tokenCookie.Value)
 	}
+
+	if h.onDemandCookie {
+		ctxSetState(r, &requestState{
+			handler:   h,
+			writer:    newOnDemandResponseWriter(w),
+			realToken: realToken,
+			hasCookie: err == nil && len(realToken) == tokenLength,
+		})
+
+		if sContains(safeMethods, r.Method) || h.IsExempt(r) {
+			// short-circuit with a success for safe methods
+			h.handleSuccess(ctxWriter(r), r)
+			return
+		}
+
+		if err := h.ensureSameOrigin(r); err != nil {
+			ctxSetReason(r, err)
+			h.handleFailure(ctxWriter(r), r)
+			return
+		}
+
+		// Finally, we check the token itself.
+		sentToken := extractToken(r)
+
+		if !verifyToken(realToken, sentToken) {
+			ctxSetReason(r, ErrBadToken)
+			h.handleFailure(ctxWriter(r), r)
+			return
+		}
+
+		// Everything else passed, handle the success.
+		h.handleSuccess(ctxWriter(r), r)
+		return
+	}
+
+	addVaryCookie(w)
 
 	// If the length of the real token isn't what it should be,
 	// it has either been tampered with,
@@ -262,7 +313,6 @@ func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) st
 }
 
 func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, token []byte) {
-	// ctxSetToken() does the masking for us
 	ctxSetToken(r, token)
 
 	cookie := h.baseCookie
@@ -270,7 +320,87 @@ func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, tok
 	cookie.Value = b64encode(token)
 
 	http.SetCookie(w, &cookie)
+	addVaryCookie(w)
 
+	if state := ctxGetState(r); state != nil {
+		state.realToken = token
+		state.hasCookie = true
+	}
+}
+
+// addVaryCookie adds `Vary: Cookie` without adding duplicates.
+func addVaryCookie(w http.ResponseWriter) {
+	if !sContains(w.Header().Values("Vary"), "Cookie") {
+		w.Header().Add("Vary", "Cookie")
+	}
+}
+
+// SetCookieOnDemand enables on-demand CSRF cookie issuance.
+//
+// By default, nosurf sets the CSRF cookie (and a `Vary: Cookie` response
+// header) on every request, including plain GET requests that never render a
+// form. When on-demand mode is enabled, nosurf only generates or reuses a
+// token and schedules the corresponding cookie once a downstream handler
+// actually obtains the token with GetToken().
+//
+// CSRF checks for unsafe (non-GET/HEAD/OPTIONS/TRACE) methods remain
+// unaffected: the request token is still fully validated against the cookie.
+//
+// Callers must inspect the error returned by GetToken(): a token can not be
+// delivered after the response headers have been written, in which case
+// ErrResponseAlreadyCommitted is returned.
+func (h *CSRFHandler) SetCookieOnDemand(onDemand bool) {
+	h.onDemandCookie = onDemand
+}
+
+// GetToken returns the masked, base64-encoded CSRF token for the request,
+// suitable for embedding in forms or headers.
+//
+// In on-demand mode (see SetCookieOnDemand), the first call to GetToken()
+// either reuses the valid token from the incoming CSRF cookie or generates a
+// new one, and schedules the Set-Cookie header on the response. Repeated
+// calls within the same request return the exact same token.
+//
+// It returns ErrResponseAlreadyCommitted if the response headers have already
+// been written (e.g. the handler called WriteHeader() before GetToken()),
+// because the browser could no longer receive the accompanying cookie.
+// It returns ErrContextNotAvailable when called outside of a request served
+// by CSRFHandler.
+func GetToken(r *http.Request) (string, error) {
+	state := ctxGetState(r)
+	if state == nil || state.handler == nil || state.writer == nil {
+		return "", ErrContextNotAvailable
+	}
+
+	if token := ctxTokenRaw(r); token != "" {
+		return token, nil
+	}
+
+	if state.writer.Committed() {
+		return "", ErrResponseAlreadyCommitted
+	}
+
+	token := state.realToken
+	if !state.hasCookie || len(token) != tokenLength {
+		token = generateToken()
+	}
+
+	state.handler.setTokenCookie(state.writer, r, token)
+
+	return ctxTokenRaw(r), nil
+}
+
+// onDemandIssue implements the lazy behaviour of Token(): it triggers
+// on-demand issuance only when the handler is configured for it, returning nil
+// in eager mode (where the token is always set beforehand).
+func onDemandIssue(r *http.Request) error {
+	state := ctxGetState(r)
+	if state == nil || state.handler == nil || state.writer == nil {
+		return nil
+	}
+
+	_, err := GetToken(r)
+	return err
 }
 
 // Sets the handler to call in case the CSRF check
