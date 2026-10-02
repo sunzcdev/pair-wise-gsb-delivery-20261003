@@ -353,6 +353,21 @@ type EncoderConfig struct {
 	// Configure the encoder for interface{} type objects.
 	// If not provided, objects are encoded using json.Encoder
 	NewReflectedEncoder func(io.Writer) ReflectedEncoder `json:"-" yaml:"-"`
+	// DuplicateKeys controls what happens when the same key is added more than
+	// once within the same JSON object, for example when a field added with
+	// Logger.With shares its key with a field passed at the log call site.
+	//
+	// The zero value, AllowDuplicateKeys, preserves the historical behavior of
+	// writing every pair. Keys are only compared within the same object, so a
+	// key nested in a namespace or object never conflicts with the same key at
+	// another path.
+	//
+	// This option only affects the JSON encoder; the console encoder ignores
+	// it.
+	DuplicateKeys DuplicateKeyPolicy `json:"duplicateKeys,omitempty" yaml:"duplicateKeys,omitempty"`
+	// OnDuplicateKey is called for every repeated key when DuplicateKeys is
+	// ReportConflict. It is ignored for every other policy.
+	OnDuplicateKey DuplicateKeyFunc `json:"-" yaml:"-"`
 	// Configures the field separator used by the console encoder. Defaults
 	// to tab.
 	ConsoleSeparator string `json:"consoleSeparator" yaml:"consoleSeparator"`

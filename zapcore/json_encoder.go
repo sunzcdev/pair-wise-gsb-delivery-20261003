@@ -48,6 +48,7 @@ func putJSONEncoder(enc *jsonEncoder) {
 	enc.openNamespaces = 0
 	enc.reflectBuf = nil
 	enc.reflectEnc = nil
+	enc.dedup = nil
 	_jsonPool.Put(enc)
 }
 
@@ -60,6 +61,11 @@ type jsonEncoder struct {
 	// for encoding generic values by reflection
 	reflectBuf *buffer.Buffer
 	reflectEnc ReflectedEncoder
+
+	// dedup enforces EncoderConfig.DuplicateKeys. It is nil when the policy is
+	// AllowDuplicateKeys (the default), keeping the common path free of
+	// bookkeeping.
+	dedup *dedupState
 }
 
 // NewJSONEncoder creates a fast, low-allocation JSON encoder. The encoder
@@ -74,6 +80,10 @@ type jsonEncoder struct {
 // libraries will ignore duplicate key-value pairs (typically keeping the last
 // pair) when unmarshaling, but users should attempt to avoid adding duplicate
 // keys.
+//
+// To handle duplicates explicitly, configure EncoderConfig.DuplicateKeys to
+// keep the first or last value for a repeated key (within the same object
+// only) or to report each conflict through EncoderConfig.OnDuplicateKey.
 func NewJSONEncoder(cfg EncoderConfig) Encoder {
 	return newJSONEncoder(cfg, false)
 }
@@ -94,17 +104,26 @@ func newJSONEncoder(cfg EncoderConfig, spaced bool) *jsonEncoder {
 		EncoderConfig: &cfg,
 		buf:           bufferpool.Get(),
 		spaced:        spaced,
+		dedup:         newDedupFromConfig(&cfg),
 	}
 }
 
+func newDedupFromConfig(cfg *EncoderConfig) *dedupState {
+	if cfg.DuplicateKeys == AllowDuplicateKeys {
+		return nil
+	}
+	return newDedupState(cfg.DuplicateKeys, cfg.OnDuplicateKey)
+}
+
 func (enc *jsonEncoder) AddArray(key string, arr ArrayMarshaler) error {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return nil
+	}
 	return enc.AppendArray(arr)
 }
 
 func (enc *jsonEncoder) AddObject(key string, obj ObjectMarshaler) error {
-	enc.addKey(key)
-	return enc.AppendObject(obj)
+	return enc.appendObjectWithKey(key, obj)
 }
 
 func (enc *jsonEncoder) AddBinary(key string, val []byte) {
@@ -112,42 +131,58 @@ func (enc *jsonEncoder) AddBinary(key string, val []byte) {
 }
 
 func (enc *jsonEncoder) AddByteString(key string, val []byte) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendByteString(val)
 }
 
 func (enc *jsonEncoder) AddBool(key string, val bool) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendBool(val)
 }
 
 func (enc *jsonEncoder) AddComplex128(key string, val complex128) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendComplex128(val)
 }
 
 func (enc *jsonEncoder) AddComplex64(key string, val complex64) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendComplex64(val)
 }
 
 func (enc *jsonEncoder) AddDuration(key string, val time.Duration) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendDuration(val)
 }
 
 func (enc *jsonEncoder) AddFloat64(key string, val float64) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendFloat64(val)
 }
 
 func (enc *jsonEncoder) AddFloat32(key string, val float32) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendFloat32(val)
 }
 
 func (enc *jsonEncoder) AddInt64(key string, val int64) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendInt64(val)
 }
 
@@ -181,29 +216,50 @@ func (enc *jsonEncoder) AddReflected(key string, obj interface{}) error {
 	if err != nil {
 		return err
 	}
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return nil
+	}
 	_, err = enc.buf.Write(valueBytes)
 	return err
 }
 
 func (enc *jsonEncoder) OpenNamespace(key string) {
-	enc.addKey(key)
+	enc.addElementSeparator()
+	if d := enc.dedup; d != nil {
+		// Namespace keys are structural: close the previous field's segment
+		// at the namespace separator, but don't record the namespace key as a
+		// deduplicatable field.
+		d.closeOpenSegment(d.curScope(), enc.buf.Len())
+	}
+	enc.writeRawKey(key)
+	if d := enc.dedup; d != nil {
+		enc.buf.AppendByte('{')
+		d.pushScope(key, enc.buf.Len()-1)
+		enc.openNamespaces++
+		return
+	}
 	enc.buf.AppendByte('{')
 	enc.openNamespaces++
 }
 
 func (enc *jsonEncoder) AddString(key, val string) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendString(val)
 }
 
 func (enc *jsonEncoder) AddTime(key string, val time.Time) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendTime(val)
 }
 
 func (enc *jsonEncoder) AddUint64(key string, val uint64) {
-	enc.addKey(key)
+	if !enc.addKeyIfAllowed(key) {
+		return
+	}
 	enc.AppendUint64(val)
 }
 
@@ -215,17 +271,44 @@ func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
 	return err
 }
 
+// appendObjectWithKey writes an object field under the given key, opening a
+// dedup scope named after the key so fields inside the object never collide
+// with same-named keys elsewhere.
+func (enc *jsonEncoder) appendObjectWithKey(key string, obj ObjectMarshaler) error {
+	if !enc.addKeyIfAllowed(key) {
+		return nil
+	}
+	return enc.writeObjectBody(key, obj)
+}
+
 func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
-	// Close ONLY new openNamespaces that are created during
-	// AppendObject().
+	enc.addElementSeparator()
+	return enc.writeObjectBody("", obj)
+}
+
+// writeObjectBody writes "{ ...obj... }" for an object value. name is empty
+// for objects that are array elements (anonymous path); it is the field key
+// for object fields.
+func (enc *jsonEncoder) writeObjectBody(name string, obj ObjectMarshaler) error {
+	d := enc.dedup
+	enc.buf.AppendByte('{')
+	if d != nil {
+		d.pushScope(name, enc.buf.Len()-1)
+	}
+
+	// Close ONLY new openNamespaces that are created while marshaling the
+	// object, then close the object itself. The total number of '}' appended
+	// matches the open namespaces plus this object.
 	old := enc.openNamespaces
 	enc.openNamespaces = 0
-	enc.addElementSeparator()
-	enc.buf.AppendByte('{')
 	err := obj.MarshalLogObject(enc)
-	enc.buf.AppendByte('}')
 	enc.closeOpenNamespaces()
+	enc.buf.AppendByte('}')
 	enc.openNamespaces = old
+
+	if d != nil {
+		d.popScope(enc.buf.Len() - 1)
+	}
 	return err
 }
 
@@ -355,15 +438,26 @@ func (enc *jsonEncoder) clone() *jsonEncoder {
 	clone.spaced = enc.spaced
 	clone.openNamespaces = enc.openNamespaces
 	clone.buf = bufferpool.Get()
+	if enc.dedup != nil {
+		clone.dedup = enc.dedup.clone()
+	}
 	return clone
 }
 
 func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, error) {
 	final := enc.clone()
+	// The clone inherited enc's context bookkeeping at coordinates relative to
+	// enc.buf, which is a different buffer from final.buf. Rebuild fresh
+	// bookkeeping for the entry and import the context after the header is
+	// written, shifting every position to its final location.
+	final.dedup = newDedupFromConfig(final.EncoderConfig)
 	final.buf.AppendByte('{')
+	if final.dedup != nil {
+		final.dedup.scopes[0].braceAt = 0
+	}
 
 	if final.LevelKey != "" && final.EncodeLevel != nil {
-		final.addKey(final.LevelKey)
+		final.addHeaderKey(final.LevelKey)
 		cur := final.buf.Len()
 		final.EncodeLevel(ent.Level, final)
 		if cur == final.buf.Len() {
@@ -373,10 +467,11 @@ func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 		}
 	}
 	if final.TimeKey != "" && !ent.Time.IsZero() {
-		final.AddTime(final.TimeKey, ent.Time)
+		final.addHeaderKey(final.TimeKey)
+		final.AppendTime(ent.Time)
 	}
 	if ent.LoggerName != "" && final.NameKey != "" {
-		final.addKey(final.NameKey)
+		final.addHeaderKey(final.NameKey)
 		cur := final.buf.Len()
 		nameEncoder := final.EncodeName
 
@@ -395,7 +490,7 @@ func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 	}
 	if ent.Caller.Defined {
 		if final.CallerKey != "" {
-			final.addKey(final.CallerKey)
+			final.addHeaderKey(final.CallerKey)
 			cur := final.buf.Len()
 			final.EncodeCaller(ent.Caller, final)
 			if cur == final.buf.Len() {
@@ -405,29 +500,85 @@ func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, 
 			}
 		}
 		if final.FunctionKey != "" {
-			final.addKey(final.FunctionKey)
+			final.addHeaderKey(final.FunctionKey)
 			final.AppendString(ent.Caller.Function)
 		}
 	}
 	if final.MessageKey != "" {
-		final.addKey(enc.MessageKey)
+		final.addHeaderKey(enc.MessageKey)
 		final.AppendString(ent.Message)
 	}
 	if enc.buf.Len() > 0 {
 		final.addElementSeparator()
+		ctxStart := final.buf.Len()
 		final.buf.Write(enc.buf.Bytes())
+		if final.dedup != nil && enc.dedup != nil {
+			// Source coordinates are relative to enc.buf (origin 0); the
+			// copied bytes begin at ctxStart in final.buf.
+			final.dedup.importFrom(enc.dedup, ctxStart)
+			// Reopen any namespaces left dangling by the context so entry
+			// fields are marshaled into the correct object.
+			final.openNamespaces = enc.openNamespaces
+		}
 	}
 	addFields(final, fields)
 	final.closeOpenNamespaces()
 	if ent.Stack != "" && final.StacktraceKey != "" {
 		final.AddString(final.StacktraceKey, ent.Stack)
 	}
+	if final.dedup != nil {
+		final.dedup.closeOpenSegment(0, -1)
+	}
 	final.buf.AppendByte('}')
+	var dropped [][2]int
+	if final.dedup != nil {
+		final.dedup.setRootClose(final.buf.Len() - 1)
+		dropped = final.dedup.resolve(final.buf.Bytes())
+	}
 	final.buf.AppendString(final.LineEnding)
+
+	if len(dropped) > 0 {
+		final.compact(dropped)
+	}
 
 	ret := final.buf
 	putJSONEncoder(final)
 	return ret, nil
+}
+
+// addHeaderKey records a key supplied by the Entry itself (level, time, name,
+// caller, message). Header fields always precede accumulated context and call
+// fields, so they are never suppressed; the segment still participates in
+// duplicate detection.
+func (enc *jsonEncoder) addHeaderKey(key string) {
+	d := enc.dedup
+	if d != nil {
+		// Finalize the previous header field before the separator.
+		d.closeOpenSegment(d.curScope(), enc.buf.Len())
+	}
+	enc.addElementSeparator()
+	if d != nil {
+		d.registerHeaderKey(d.curScope(), key, enc.buf.Len())
+	}
+	enc.writeKey(key)
+}
+
+// compact rewrites the buffer, deleting the given sorted, non-overlapping
+// byte ranges (which include any trailing line ending).
+func (enc *jsonEncoder) compact(ranges [][2]int) {
+	src := enc.buf.Bytes()
+	out := bufferpool.Get()
+	pos := 0
+	for _, r := range ranges {
+		out.Write(src[pos:r[0]])
+		pos = r[1]
+	}
+	out.Write(src[pos:])
+	// Swap the pooled buffers; enc.buf is returned to the caller and freed by
+	// it, while the old backing buffer goes back to the pool.
+	old := enc.buf
+	enc.buf = out
+	old.Free()
 }
 
 func (enc *jsonEncoder) truncate() {
@@ -435,14 +586,70 @@ func (enc *jsonEncoder) truncate() {
 }
 
 func (enc *jsonEncoder) closeOpenNamespaces() {
+	d := enc.dedup
 	for i := 0; i < enc.openNamespaces; i++ {
 		enc.buf.AppendByte('}')
+		if d != nil {
+			d.closeTopNamespace(enc.buf.Len() - 1)
+		}
 	}
 	enc.openNamespaces = 0
 }
 
 func (enc *jsonEncoder) addKey(key string) {
 	enc.addElementSeparator()
+	enc.buf.AppendByte('"')
+	enc.safeAddString(key)
+	enc.buf.AppendByte('"')
+	enc.buf.AppendByte(':')
+	if enc.spaced {
+		enc.buf.AppendByte(' ')
+	}
+}
+
+// addKeyIfAllowed is the entry point for every Add* field. It records the
+// field with the duplicate-key policy and writes the key only when the field
+// is allowed. A false result means the caller must skip the value without
+// evaluating it.
+func (enc *jsonEncoder) addKeyIfAllowed(key string) bool {
+	d := enc.dedup
+	if d == nil {
+		enc.addKey(key)
+		return true
+	}
+	// Close the previous field before the separator is written so the segment
+	// ends exactly at the boundary; suppression then naturally leaves no
+	// dangling comma.
+	keyStart := enc.buf.Len()
+	if !d.beginField(key, keyStart) {
+		return false
+	}
+	enc.addElementSeparator()
+	seg := d.lastOpenSegment(d.curScope())
+	keyStart = enc.buf.Len()
+	seg.start = keyStart
+	enc.writeKey(key)
+	return true
+}
+
+// writeKey appends a quoted key and records the colon position on the open
+// segment.
+func (enc *jsonEncoder) writeKey(key string) {
+	enc.buf.AppendByte('"')
+	enc.safeAddString(key)
+	enc.buf.AppendByte('"')
+	if d := enc.dedup; d != nil {
+		d.markColon(d.curScope(), enc.buf.Len())
+	}
+	enc.buf.AppendByte(':')
+	if enc.spaced {
+		enc.buf.AppendByte(' ')
+	}
+}
+
+// writeRawKey appends a quoted key without any duplicate-key bookkeeping. It
+// is used for structural keys such as namespace keys.
+func (enc *jsonEncoder) writeRawKey(key string) {
 	enc.buf.AppendByte('"')
 	enc.safeAddString(key)
 	enc.buf.AppendByte('"')
