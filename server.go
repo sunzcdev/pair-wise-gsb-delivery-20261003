@@ -79,6 +79,17 @@ type Server struct {
 	// Default value of NONE to advertise no specific profile.
 	MtPriorityProfile PriorityProfile
 
+	// ConnLimiter, if non-nil, limits the number of concurrent
+	// connections: unauthenticated connections are limited per source IP
+	// address and authenticated connections are limited per user.
+	//
+	// Connections rejected by the limiter receive a 421 response before
+	// the greeting. If the per-user limit is reached when a connection
+	// authenticates, the AUTH command fails with a 454 response.
+	//
+	// See MemoryLimiter for a single-process in-memory implementation.
+	ConnLimiter ConnLimiter
+
 	// The server backend.
 	Backend Backend
 
@@ -171,6 +182,15 @@ func (s *Server) handleConn(c *Conn) error {
 		if err := tlsConn.Handshake(); err != nil {
 			return err
 		}
+	}
+
+	if s.ConnLimiter != nil {
+		lease, err := s.ConnLimiter.LimitConn(connRemoteIP(c.conn))
+		if err != nil {
+			c.Reject()
+			return nil
+		}
+		c.limitLease = lease
 	}
 
 	c.greet()

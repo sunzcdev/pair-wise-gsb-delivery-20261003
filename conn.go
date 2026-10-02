@@ -44,6 +44,11 @@ type Conn struct {
 	fromReceived bool
 	recipients   []string
 	didAuth      bool
+
+	// limitLease is set if Server.ConnLimiter admitted this connection.
+	// It is never unset once assigned: ConnLimitLease.Free is idempotent
+	// and may be called concurrently with command handling.
+	limitLease ConnLimitLease
 }
 
 func newConn(c net.Conn, s *Server) *Conn {
@@ -178,6 +183,10 @@ func (c *Conn) Close() error {
 	if c.session != nil {
 		c.session.Logout()
 		c.session = nil
+	}
+
+	if c.limitLease != nil {
+		c.limitLease.Free()
 	}
 
 	return c.conn.Close()
@@ -891,6 +900,20 @@ func (c *Conn) handleAuth(arg string) {
 		}
 	}
 
+	if c.limitLease != nil {
+		if identitySession, ok := c.Session().(AuthIdentitySession); ok {
+			if identity := identitySession.AuthIdentity(); identity != "" {
+				if err := c.limitLease.SetUser(identity); err != nil {
+					// The per-user connection limit is reached:
+					// the credentials were valid but the AUTH
+					// command cannot complete.
+					c.writeError(454, EnhancedCode{4, 7, 0}, err)
+					return
+				}
+			}
+		}
+	}
+
 	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 	c.didAuth = true
 }
@@ -950,6 +973,9 @@ func (c *Conn) handleStartTLS() {
 	}
 	c.helo = ""
 	c.didAuth = false
+	if c.limitLease != nil {
+		c.limitLease.UnsetUser()
+	}
 	c.reset()
 }
 
