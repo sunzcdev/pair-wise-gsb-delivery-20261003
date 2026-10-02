@@ -186,9 +186,23 @@ type reedSolomon struct {
 	o            options
 	mPoolSz      int
 	mPool        sync.Pool // Pool for temp matrices, etc
+	matrixKind   matrixKind
 }
 
 var _ = Extensions(&reedSolomon{})
+
+// matrixKind identifies how the encoding matrix was built. Error-and-erasure
+// decoding is only guaranteed for the standard systematic Vandermonde form.
+type matrixKind uint8
+
+const (
+	matrixStandard matrixKind = iota
+	matrixJerasure
+	matrixPAR1
+	matrixCauchy
+	matrixCustom
+	matrixXOR
+)
 
 func (r *reedSolomon) ShardSizeMultiple() int {
 	return 1
@@ -491,6 +505,7 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 	var err error
 	switch {
 	case r.o.customMatrix != nil:
+		r.matrixKind = matrixCustom
 		if len(r.o.customMatrix) < parityShards {
 			return nil, errors.New("coding matrix must contain at least parityShards rows")
 		}
@@ -507,14 +522,19 @@ func New(dataShards, parityShards int, opts ...Option) (Encoder, error) {
 			copy(r.m[dataShards+k], row)
 		}
 	case r.o.fastOneParity && parityShards == 1:
+		r.matrixKind = matrixXOR
 		r.m, err = buildXorMatrix(dataShards, r.totalShards)
 	case r.o.useCauchy:
+		r.matrixKind = matrixCauchy
 		r.m, err = buildMatrixCauchy(dataShards, r.totalShards)
 	case r.o.usePAR1Matrix:
+		r.matrixKind = matrixPAR1
 		r.m, err = buildMatrixPAR1(dataShards, r.totalShards)
 	case r.o.useJerasureMatrix:
+		r.matrixKind = matrixJerasure
 		r.m, err = buildMatrixJerasure(dataShards, r.totalShards)
 	default:
+		r.matrixKind = matrixStandard
 		r.m, err = buildMatrix(dataShards, r.totalShards)
 	}
 	if err != nil {

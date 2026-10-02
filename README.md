@@ -132,6 +132,48 @@ So to sum up reconstruction:
 For complete examples of an encoder and decoder see the 
 [examples folder](https://github.com/klauspost/reedsolomon/tree/master/examples).
 
+# Error and Erasure Correction
+
+`Reconstruct` only deals with shards known to be missing (erasures). When a
+storage layer can sometimes detect that a specific shard is gone but at other
+times only sees a parity mismatch without knowing which shard changed, use the
+optional `ErrorCorrection` interface:
+
+```Go
+    ec, err := rs.New(dataShards, parityShards)
+    // type assert:
+    decoder := ec.(rs.ErrorCorrection)
+
+    // nil/zero-length shards are known erasures; every non-nil shard is
+    // treated as potentially corrupt, never automatically trusted.
+    corrected, err := decoder.CorrectErrors(shards)
+```
+
+Let `e` be the number of missing shards and `v` the number of silently
+corrupted shards. With `p` parity shards, every corrupted shard is located and
+all original data is restored whenever
+
+```
+2*v + e <= p
+```
+
+except that, when shard `0` is itself one of the missing shards, the guaranteed
+bound is `2*v + e <= p - 1` (the standard Vandermonde matrix uses evaluation
+point 0). Outside the bound detection is not guaranteed and the method may
+return `ErrUncorrectable`; a successful re-encode check is necessary but is not
+proof that the reconstructed bytes equal the original data.
+
+Each candidate repair is accepted only after a full re-encode verifies the
+whole shard set, so a `nil` error means the set forms a valid codeword. The
+returned indices are the non-nil shards that were found corrupted and
+rewritten; merely-missing shards are not listed.
+
+This guarantee applies to the default systematic GF(256) Vandermonde matrix.
+Encoders built with `WithJerasureMatrix`, `WithPAR1Matrix`, `WithCauchyMatrix`,
+`WithCustomMatrix` or `WithFastOneParityMatrix`, and Leopard encoders, return
+`ErrNotSupported`. The erasure-only `Reconstruct` path is unchanged and remains
+the fast choice when all surviving shards are known to be valid.
+
 # Splitting/Joining Data
 
 You might have a large slice of data. 
