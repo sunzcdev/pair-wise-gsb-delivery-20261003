@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"io/ioutil"
+	"math"
 	"testing"
 	"unicode/utf8"
 
@@ -191,6 +192,223 @@ func TestMaxFrameSize(t *testing.T) {
 	}
 	if got, want := n, 0; got != want {
 		t.Errorf("Read() bytes returned = %v; want %v", got, want)
+	}
+}
+
+func TestMaxMessageSizeSingleFrame(t *testing.T) {
+	var buf bytes.Buffer
+	msg := []byte("single message")
+	ws.MustWriteFrame(&buf, ws.NewTextFrame(msg))
+	r := Reader{
+		Source:         &buf,
+		MaxMessageSize: int64(len(msg)) - 1,
+	}
+
+	if _, err := r.NextFrame(); err != ErrMessageTooLarge {
+		t.Fatalf("NextFrame() error = %v; want %v", err, ErrMessageTooLarge)
+	}
+	// The error must be reported before the offending frame body is read.
+	if bts, _ := ioutil.ReadAll(&buf); !bytes.Equal(bts, msg) {
+		t.Errorf("unconsumed bytes = %q; want %q", bts, msg)
+	}
+
+	// An exactly fitting message must be accepted.
+	buf.Reset()
+	ws.MustWriteFrame(&buf, ws.NewTextFrame(msg))
+	r = Reader{
+		Source:         &buf,
+		MaxMessageSize: int64(len(msg)),
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() error = %v; want nil", err)
+	}
+}
+
+func TestMaxMessageSizeFragmented(t *testing.T) {
+	var buf bytes.Buffer
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpText, false, []byte("foo")))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, false, []byte("bar")))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, true, []byte("baz")))
+
+	// Each frame is 3 bytes long, so MaxFrameSize does not trigger; only
+	// the aggregate message budget catches the 9 byte message.
+	r := Reader{
+		Source:         &buf,
+		MaxFrameSize:   3,
+		MaxMessageSize: 7,
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() error = %v; want nil", err)
+	}
+	bts, err := ioutil.ReadAll(&r)
+	if got, want := err, ErrMessageTooLarge; got != want {
+		t.Fatalf("ReadAll() error = %v; want %v", got, want)
+	}
+	if got, want := bts, []byte("foobar"); !bytes.Equal(got, want) {
+		t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+	}
+	// The offending frame payload must stay unread.
+	if rest, _ := ioutil.ReadAll(&buf); !bytes.Equal(rest, []byte("baz")) {
+		t.Errorf("unconsumed bytes = %q; want %q", rest, "baz")
+	}
+}
+
+func TestMaxMessageSizeControlFramesAndEmptyContinuation(t *testing.T) {
+	// Message body is "12" + "" + "34" = 4 bytes; ping/pong between the
+	// fragments carry 8 more bytes that must not share the message budget.
+	frames := []ws.Frame{
+		ws.NewFrame(ws.OpText, false, []byte("12")),
+		ws.NewPingFrame([]byte("ping")),
+		ws.NewFrame(ws.OpContinuation, false, nil),
+		ws.NewPongFrame([]byte("pong")),
+		ws.NewFrame(ws.OpContinuation, true, []byte("34")),
+	}
+
+	t.Run("within_limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, f := range frames {
+			ws.MustWriteFrame(&buf, f)
+		}
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 4,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatalf("NextFrame() error = %v; want nil", err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if err != nil {
+			t.Fatalf("ReadAll() error = %v; want nil", err)
+		}
+		if got, want := bts, []byte("1234"); !bytes.Equal(got, want) {
+			t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("over_limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		for _, f := range frames {
+			ws.MustWriteFrame(&buf, f)
+		}
+		// Empty continuation and 8 bytes of control frames must not make the
+		// 4 byte message fit into a 3 byte budget.
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 3,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatalf("NextFrame() error = %v; want nil", err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if got, want := err, ErrMessageTooLarge; got != want {
+			t.Fatalf("ReadAll() error = %v; want %v", got, want)
+		}
+		if got, want := bts, []byte("12"); !bytes.Equal(got, want) {
+			t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+		}
+		if rest, _ := ioutil.ReadAll(&buf); !bytes.Equal(rest, []byte("34")) {
+			t.Errorf("unconsumed bytes = %q; want %q", rest, "34")
+		}
+	})
+}
+
+func TestMaxMessageSizeDiscard(t *testing.T) {
+	var buf bytes.Buffer
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpText, false, []byte("abc")))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, true, []byte("defgh")))
+
+	r := Reader{
+		Source:         &buf,
+		MaxMessageSize: 4,
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() error = %v; want nil", err)
+	}
+	if err := r.Discard(); err != ErrMessageTooLarge {
+		t.Fatalf("Discard() error = %v; want %v", err, ErrMessageTooLarge)
+	}
+	// Discard() must not silently swallow the offending continuation body.
+	if rest, _ := ioutil.ReadAll(&buf); !bytes.Equal(rest, []byte("defgh")) {
+		t.Errorf("unconsumed bytes = %q; want %q", rest, "defgh")
+	}
+}
+
+func TestMaxMessageSizeZero(t *testing.T) {
+	var buf bytes.Buffer
+	payload := bytes.Repeat([]byte("x"), 4096)
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpText, false, payload[:1024]))
+	ws.MustWriteFrame(&buf, ws.NewPingFrame([]byte("ignored")))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, false, payload[1024:2048]))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, true, payload[2048:]))
+
+	r := Reader{
+		Source:         &buf,
+		MaxMessageSize: 0,
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() error = %v; want nil", err)
+	}
+	bts, err := ioutil.ReadAll(&r)
+	if err != nil {
+		t.Fatalf("ReadAll() error = %v; want nil", err)
+	}
+	if !bytes.Equal(bts, payload) {
+		t.Errorf("ReadAll() bytes len = %d; want %d", len(bts), len(payload))
+	}
+}
+
+func TestMaxMessageSizeOverflowSafe(t *testing.T) {
+	var buf bytes.Buffer
+	// Headers only: bodies of the huge frames are never allocated or read.
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpText, false, nil))
+	if err := ws.WriteHeader(&buf, ws.Header{
+		Fin:    false,
+		OpCode: ws.OpContinuation,
+		Length: math.MaxInt64,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, true, []byte("x")))
+
+	r := Reader{
+		Source:         &buf,
+		MaxMessageSize: math.MaxInt64,
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() #1 error = %v; want nil", err)
+	}
+	// First continuation exactly exhausts the budget without overflow.
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() #2 error = %v; want nil", err)
+	}
+	// One more byte over the exhausted budget must be detected without any
+	// integer wrap-around and before its body is consumed.
+	if _, err := r.NextFrame(); err != ErrMessageTooLarge {
+		t.Fatalf("NextFrame() #3 error = %v; want %v", err, ErrMessageTooLarge)
+	}
+	if rest, _ := ioutil.ReadAll(&buf); !bytes.Equal(rest, []byte("x")) {
+		t.Errorf("unconsumed bytes = %q; want %q", rest, "x")
+	}
+}
+
+func TestMaxMessageSizeInvalidUTF8(t *testing.T) {
+	var buf bytes.Buffer
+	// First byte of the two-byte rune "Ё", followed by an invalid byte.
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpText, false, []byte{0xc3}))
+	ws.MustWriteFrame(&buf, ws.NewFrame(ws.OpContinuation, true, []byte{0x00}))
+
+	r := Reader{
+		Source:         &buf,
+		CheckUTF8:      true,
+		MaxMessageSize: 1,
+	}
+	if _, err := r.NextFrame(); err != nil {
+		t.Fatalf("NextFrame() error = %v; want nil", err)
+	}
+	// The size limit must be enforced even though the completed message
+	// would also fail the UTF-8 check.
+	if _, err := ioutil.ReadAll(&r); err != ErrMessageTooLarge {
+		t.Fatalf("ReadAll() error = %v; want %v", err, ErrMessageTooLarge)
 	}
 }
 
