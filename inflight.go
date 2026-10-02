@@ -83,7 +83,10 @@ func (i *Inflight) GetAll(immediate bool) []packets.Packet {
 	}
 
 	sort.Slice(m, func(i, j int) bool {
-		return uint16(m[i].Created) < uint16(m[j].Created)
+		if m[i].Created == m[j].Created {
+			return m[i].PacketID < m[j].PacketID
+		}
+		return m[i].Created < m[j].Created
 	})
 
 	return m

@@ -7,6 +7,7 @@ package mqtt
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/require"
@@ -53,6 +54,61 @@ func TestInflightGetAllAndImmediate(t *testing.T) {
 		{PacketID: 3, Created: 3, Expiry: -1},
 		{PacketID: 4, Created: 4, Expiry: -1},
 	}, cl.State.Inflight.GetAll(true))
+}
+
+func TestInflightGetAllCreatedOverflow(t *testing.T) {
+	cl, _, _ := newTestClient()
+	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 65535})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: 65536})
+
+	require.Equal(t, []packets.Packet{
+		{PacketID: 1, Created: 65535},
+		{PacketID: 2, Created: 65536},
+	}, cl.State.Inflight.GetAll(false))
+}
+
+func TestInflightGetAllRealTimestamps(t *testing.T) {
+	cl, _, _ := newTestClient()
+	now := time.Now().Unix()
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: now + 2})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: now})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: now + 1})
+
+	require.Equal(t, []packets.Packet{
+		{PacketID: 1, Created: now},
+		{PacketID: 2, Created: now + 1},
+		{PacketID: 3, Created: now + 2},
+	}, cl.State.Inflight.GetAll(false))
+}
+
+func TestInflightGetAllSameTimestampStableOrder(t *testing.T) {
+	cl, _, _ := newTestClient()
+	now := time.Now().Unix()
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: now})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: now})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: now})
+
+	for i := 0; i < 10; i++ {
+		require.Equal(t, []packets.Packet{
+			{PacketID: 1, Created: now},
+			{PacketID: 2, Created: now},
+			{PacketID: 3, Created: now},
+		}, cl.State.Inflight.GetAll(false))
+	}
+}
+
+func TestInflightCloneGetAllOrder(t *testing.T) {
+	cl, _, _ := newTestClient()
+	cl.State.Inflight.Set(packets.Packet{PacketID: 1, Created: 65535})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 2, Created: 65536})
+	cl.State.Inflight.Set(packets.Packet{PacketID: 3, Created: 65536})
+
+	cloned := cl.State.Inflight.Clone()
+	require.Equal(t, []packets.Packet{
+		{PacketID: 1, Created: 65535},
+		{PacketID: 2, Created: 65536},
+		{PacketID: 3, Created: 65536},
+	}, cloned.GetAll(false))
 }
 
 func TestInflightLen(t *testing.T) {

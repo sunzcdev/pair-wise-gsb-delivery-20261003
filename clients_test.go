@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -425,6 +426,50 @@ func TestClientResendInflightMessagesWriteFailure(t *testing.T) {
 	require.Error(t, err)
 	require.ErrorIs(t, err, io.ErrClosedPipe)
 	require.Equal(t, 1, cl.State.Inflight.Len())
+}
+
+func TestClientResendInflightMessagesOrder(t *testing.T) {
+	cl, r, w := newTestClient()
+	now := time.Now().Unix()
+
+	newPublish := func(id uint16, created int64) packets.Packet {
+		return packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1},
+			TopicName:   "a/b/c",
+			Payload:     []byte("hello mochi"),
+			PacketID:    id,
+			Created:     created,
+		}
+	}
+
+	cl.State.Inflight.Set(newPublish(2, 65536)) // truncates to 0 as uint16
+	cl.State.Inflight.Set(newPublish(1, 65535))
+	cl.State.Inflight.Set(newPublish(4, now)) // same second as id 3
+	cl.State.Inflight.Set(newPublish(3, now))
+	require.Equal(t, 4, cl.State.Inflight.Len())
+
+	go func() {
+		err := cl.ResendInflightMessages(true)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	ids := []uint16{}
+	for len(buf) > 0 {
+		require.Equal(t, byte(packets.Publish<<4|1<<1|1<<3), buf[0]) // qos1 publish with dup set
+		remaining := int(buf[1])
+		require.LessOrEqual(t, 2+remaining, len(buf))
+		body := buf[2 : 2+remaining]
+		topicLen := int(binary.BigEndian.Uint16(body[0:2]))
+		ids = append(ids, binary.BigEndian.Uint16(body[2+topicLen:4+topicLen]))
+		buf = buf[2+remaining:]
+	}
+
+	require.Equal(t, []uint16{1, 2, 3, 4}, ids)
 }
 
 func TestClientResendInflightMessagesNoMessages(t *testing.T) {
