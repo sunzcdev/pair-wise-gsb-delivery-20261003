@@ -356,6 +356,37 @@ Progressive decoding is particularly useful for distributed storage systems, net
 
 While this can be used for regular reconstruction, typically that will be slightly faster and easier to use.
 
+# Partial Shard Recovery (ReaderAt/WriterAt)
+
+When only a small region of a single multi-gigabyte shard is corrupt, reading every other shard end-to-end to reconstruct it is wasteful.
+The optional `RangeRecovery` interface reconstructs an arbitrary byte range of one or more shards, touching only the bytes required.
+
+```Go
+enc, err := reedsolomon.New(dataShards, parityShards)
+// ...
+rr, ok := enc.(reedsolomon.RangeRecovery)
+if !ok {
+    // Encoder does not support range recovery (e.g. Leopard encoders).
+}
+
+total := dataShards + parityShards
+valid := make([]io.ReaderAt, total)     // non-nil entries: shards to read
+fill  := make([]io.WriterAt, total)     // non-nil entries: shards to repair
+// ...open your on-disk shards...
+
+// Recover 64 KiB at offset 1 GiB of the corrupt shard(s).
+err = rr.RecoverRange(valid, fill, 1<<30, 64<<10)
+```
+
+Properties:
+
+* **Minimal I/O**: reads cover only the smallest coding-aligned window containing `[offset, offset+length)`.
+  The classic 8-bit Reed-Solomon kernel works on individual bytes, so its alignment is 1 and no extra bytes are read.
+* **No outside writes**: although the aligned window may be decoded, bytes outside the requested range are never written to `fill`.
+* **Short sources**: a source shard shorter than the read window is treated as zero padded up to the common shard length.
+  Writes that would extend past the reconstructed shard end are clipped.
+* **Backing implementations**: the encoder returned by `New` implements `RangeRecovery`. Leopard GF/GF16 encoders do not; detect support with a type assertion.
+
 # Streaming/Merging
 
 It might seem like a limitation that all data should be in memory, 
