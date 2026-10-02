@@ -57,6 +57,10 @@ module GraphQL::Batch
       resolve(@loaders.shift.last)
     end
 
+    def requeue(loader)
+      @loaders[loader.loader_key] ||= loader
+    end
+
     def wait_all
       tick until @loaders.empty?
     end

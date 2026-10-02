@@ -47,7 +47,12 @@ module GraphQL::Batch
     def load(key)
       cache[cache_key(key)] ||= begin
         queue << key
-        ::Promise.new.tap { |promise| promise.source = self }
+        ::Promise.new.tap do |promise|
+          promise.extend(LoaderPromise)
+          promise.loader = self
+          promise.key = key
+          promise.source = self
+        end
       end
     end
 
@@ -64,11 +69,18 @@ module GraphQL::Batch
       load_keys = queue
       @queue = nil
 
-      around_perform do
-        perform(load_keys)
+      DependencyCycle.begin_resolve(load_keys.map { |key| promise_for(key) })
+      begin
+        around_perform do
+          perform(load_keys)
+        end
+      ensure
+        DependencyCycle.end_resolve
       end
 
       check_for_broken_promises(load_keys)
+    rescue DependencyCycleError
+      requeue_unresolved_promises(load_keys)
     rescue => err
       reject_pending_promises(load_keys, err)
     end
@@ -96,6 +108,7 @@ module GraphQL::Batch
     # Fulfill the key with provided value, for use in #perform
     def fulfill(key, value)
       finish_resolve(key) do |promise|
+        DependencyCycle.adding_dependency(promise, value)
         promise.fulfill(value)
       end
     end
@@ -130,6 +143,26 @@ module GraphQL::Batch
     end
 
     private
+
+    def reject_dependency_cycle(key, error)
+      return unless promise_for(key).pending?
+
+      finish_resolve(key) do |promise|
+        promise.reject(error)
+      end
+    end
+
+    def requeue_unresolved_promises(load_keys)
+      unresolved_keys = load_keys.select do |key|
+        promise = promise_for(key)
+        promise.pending? && promise.source.equal?(self)
+      end
+      return if unresolved_keys.empty?
+
+      @queue ||= []
+      @queue.concat(unresolved_keys)
+      executor.requeue(self) if executor
+    end
 
     def finish_resolve(key)
       promise = promise_for(key)
