@@ -19,6 +19,12 @@ import (
 // ErrInvalidSpecification indicates that a specification is of the wrong type.
 var ErrInvalidSpecification = errors.New("specification must be a struct pointer")
 
+// ErrRecursiveSpecification indicates that a specification contains a struct
+// type that refers back to itself along its nested fields (for example a
+// struct with a pointer field of its own type). Such types cannot be
+// populated because they describe an infinite nesting.
+var ErrRecursiveSpecification = errors.New("recursive specification")
+
 var gatherRegexp = regexp.MustCompile("([^A-Z]+|[A-Z]+[^A-Z]+|[A-Z]+)")
 var acronymRegexp = regexp.MustCompile("([A-Z]+)([A-Z][^A-Z]+)")
 
@@ -50,11 +56,21 @@ func (e *ParseError) Error() string {
 
 // varInfo maintains information about the configuration variable
 type varInfo struct {
-	Name  string
-	Alt   string
-	Key   string
-	Field reflect.Value
-	Tags  reflect.StructTag
+	Name string
+	Alt  string
+	Key  string
+	Tags reflect.StructTag
+	Type reflect.Type
+	Path []fieldStep
+}
+
+// fieldStep describes one traversal level from the specification root struct
+// to a leaf field. Index is the struct field index at that level; Hops is the
+// number of pointer dereferences performed on that field before reaching the
+// next struct (or the leaf value).
+type fieldStep struct {
+	Index int
+	Hops  int
 }
 
 // GatherInfo gathers information about the specified struct
@@ -68,85 +84,131 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 	if s.Kind() != reflect.Struct {
 		return nil, ErrInvalidSpecification
 	}
-	typeOfSpec := s.Type()
+	return gatherStructInfo(prefix, s.Type(), nil, map[reflect.Type]int{})
+}
 
-	// over allocate an info array, we will extend if needed later
-	infos := make([]varInfo, 0, s.NumField())
-	for i := 0; i < s.NumField(); i++ {
-		f := s.Field(i)
-		ftype := typeOfSpec.Field(i)
-		if !f.CanSet() || isTrue(ftype.Tag.Get("ignored")) {
+// gatherStructInfo walks a struct type without touching any values, so the
+// caller's specification is never modified. The seen depths track the active
+// type stack: a struct appearing twice along one ancestry is infinitely
+// recursive, while the same type appearing in sibling subtrees (a diamond)
+// is valid.
+func gatherStructInfo(prefix string, t reflect.Type, path []fieldStep, seen map[reflect.Type]int) ([]varInfo, error) {
+	if seen[t] > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrRecursiveSpecification, t.Name())
+	}
+	seen[t]++
+	defer func() { seen[t]-- }()
+
+	var infos []varInfo
+	for i := 0; i < t.NumField(); i++ {
+		ftype := t.Field(i)
+		if !ftype.IsExported() || isTrue(ftype.Tag.Get("ignored")) {
 			continue
 		}
 
-		for f.Kind() == reflect.Ptr {
-			if f.IsNil() {
-				if f.Type().Elem().Kind() != reflect.Struct {
-					// nil pointer to a non-struct: leave it alone
-					break
+		inner, hops := derefType(ftype.Type)
+		step := fieldStep{Index: i, Hops: hops}
+
+		if inner.Kind() == reflect.Struct && !implementsInterface(inner) {
+			innerPrefix := prefix
+			if !ftype.Anonymous {
+				innerPrefix = keyFor(ftype, prefix)
+			}
+
+			embeddedInfos, err := gatherStructInfo(innerPrefix, inner, appendPath(path, step), seen)
+			if err != nil {
+				return nil, err
+			}
+			infos = append(infos, embeddedInfos...)
+			continue
+		}
+
+		info := varInfo{
+			Name: ftype.Name,
+			Tags: ftype.Tag,
+			Alt:  strings.ToUpper(ftype.Tag.Get("envconfig")),
+			Path: appendPath(path, step),
+		}
+		if hops > 0 && inner.Kind() != reflect.Struct {
+			info.Type = ftype.Type
+		} else {
+			info.Type = inner
+		}
+		info.Key = keyFor(ftype, prefix)
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
+// derefType unwraps pointer layers, returning the pointed-to type and the
+// number of pointer dereferences performed.
+func derefType(t reflect.Type) (reflect.Type, int) {
+	hops := 0
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+		hops++
+	}
+	return t, hops
+}
+
+// keyFor computes the environment variable key for a struct field.
+func keyFor(ftype reflect.StructField, prefix string) string {
+	key := ftype.Name
+	if isTrue(ftype.Tag.Get("split_words")) {
+		words := gatherRegexp.FindAllStringSubmatch(ftype.Name, -1)
+		if len(words) > 0 {
+			var parts []string
+			for _, words := range words {
+				if m := acronymRegexp.FindStringSubmatch(words[0]); len(m) == 3 {
+					parts = append(parts, m[1], m[2])
+				} else {
+					parts = append(parts, words[0])
 				}
-				// nil pointer to struct: create a zero instance
+			}
+			key = strings.Join(parts, "_")
+		}
+	}
+	if alt := strings.ToUpper(ftype.Tag.Get("envconfig")); alt != "" {
+		key = alt
+	}
+	if prefix != "" {
+		key = fmt.Sprintf("%s_%s", prefix, key)
+	}
+	return strings.ToUpper(key)
+}
+
+// appendPath appends a step to a copy of path, so sibling fields never share
+// backing storage.
+func appendPath(path []fieldStep, step fieldStep) []fieldStep {
+	out := make([]fieldStep, 0, len(path)+1)
+	out = append(out, path...)
+	return append(out, step)
+}
+
+// field resolves the leaf field described by the path, lazily allocating
+// pointer-to-struct ancestors. Pointer layers leading to a non-struct leaf
+// are left untouched; processField materializes them when a value exists.
+func (i varInfo) field(root reflect.Value) reflect.Value {
+	f := root
+	for n, step := range i.Path {
+		f = f.Field(step.Index)
+		if n == len(i.Path)-1 && step.Hops > 0 {
+			t := f.Type()
+			for t.Kind() == reflect.Ptr {
+				t = t.Elem()
+			}
+			if t.Kind() != reflect.Struct {
+				return f
+			}
+		}
+		for h := 0; h < step.Hops; h++ {
+			if f.IsNil() {
 				f.Set(reflect.New(f.Type().Elem()))
 			}
 			f = f.Elem()
 		}
-
-		// Capture information about the config variable
-		info := varInfo{
-			Name:  ftype.Name,
-			Field: f,
-			Tags:  ftype.Tag,
-			Alt:   strings.ToUpper(ftype.Tag.Get("envconfig")),
-		}
-
-		// Default to the field name as the env var name (will be upcased)
-		info.Key = info.Name
-
-		// Best effort to un-pick camel casing as separate words
-		if isTrue(ftype.Tag.Get("split_words")) {
-			words := gatherRegexp.FindAllStringSubmatch(ftype.Name, -1)
-			if len(words) > 0 {
-				var name []string
-				for _, words := range words {
-					if m := acronymRegexp.FindStringSubmatch(words[0]); len(m) == 3 {
-						name = append(name, m[1], m[2])
-					} else {
-						name = append(name, words[0])
-					}
-				}
-
-				info.Key = strings.Join(name, "_")
-			}
-		}
-		if info.Alt != "" {
-			info.Key = info.Alt
-		}
-		if prefix != "" {
-			info.Key = fmt.Sprintf("%s_%s", prefix, info.Key)
-		}
-		info.Key = strings.ToUpper(info.Key)
-		infos = append(infos, info)
-
-		if f.Kind() == reflect.Struct {
-			// honor Decode if present
-			if decoderFrom(f) == nil && setterFrom(f) == nil && textUnmarshaler(f) == nil && binaryUnmarshaler(f) == nil {
-				innerPrefix := prefix
-				if !ftype.Anonymous {
-					innerPrefix = info.Key
-				}
-
-				embeddedPtr := f.Addr().Interface()
-				embeddedInfos, err := gatherInfo(innerPrefix, embeddedPtr)
-				if err != nil {
-					return nil, err
-				}
-				infos = append(infos[:len(infos)-1], embeddedInfos...)
-
-				continue
-			}
-		}
 	}
-	return infos, nil
+	return f
 }
 
 // CheckDisallowed checks that no environment variables with the prefix are set
@@ -183,6 +245,10 @@ func CheckDisallowed(prefix string, spec interface{}) error {
 // Process populates the specified struct based on environment variables
 func Process(prefix string, spec interface{}) error {
 	infos, err := gatherInfo(prefix, spec)
+	if err != nil {
+		return err
+	}
+	root := reflect.ValueOf(spec).Elem()
 
 	for _, info := range infos {
 
@@ -207,24 +273,28 @@ func Process(prefix string, spec interface{}) error {
 				if info.Alt != "" {
 					key = info.Alt
 				}
+				// A required descendant forces its pointer-to-struct
+				// ancestors to exist even though no value is supplied.
+				info.field(root)
 				return fmt.Errorf("required key %s missing value", key)
 			}
 			continue
 		}
 
-		err = processField(value, info.Field)
+		field := info.field(root)
+		err = processField(value, field)
 		if err != nil {
 			return &ParseError{
 				KeyName:   info.Key,
 				FieldName: info.Name,
-				TypeName:  info.Field.Type().String(),
+				TypeName:  info.Type.String(),
 				Value:     value,
 				Err:       err,
 			}
 		}
 	}
 
-	return err
+	return nil
 }
 
 // MustProcess is the same as Process but panics if an error occurs
@@ -236,6 +306,17 @@ func MustProcess(prefix string, spec interface{}) {
 
 func processField(value string, field reflect.Value) error {
 	typ := field.Type()
+
+	// Materialize pointer layers before honoring custom decoders: a type
+	// implementing Decoder on its pointer receiver would otherwise be
+	// unreachable through a nil pointer.
+	for typ.Kind() == reflect.Ptr {
+		if field.IsNil() {
+			field.Set(reflect.New(typ.Elem()))
+		}
+		field = field.Elem()
+		typ = field.Type()
+	}
 
 	decoder := decoderFrom(field)
 	if decoder != nil {
@@ -253,14 +334,6 @@ func processField(value string, field reflect.Value) error {
 
 	if b := binaryUnmarshaler(field); b != nil {
 		return b.UnmarshalBinary([]byte(value))
-	}
-
-	if typ.Kind() == reflect.Ptr {
-		typ = typ.Elem()
-		if field.IsNil() {
-			field.Set(reflect.New(typ))
-		}
-		field = field.Elem()
 	}
 
 	switch typ.Kind() {

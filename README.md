@@ -164,6 +164,30 @@ envconfig supports these struct field types:
 
 Embedded structs using these fields are also supported.
 
+## Optional Nested Structs
+
+Nested structs reached through pointers are allocated lazily. An object is
+only created when its subtree has an environment variable set or a value is
+supplied by a `default` tag; subtrees without any input stay `nil`:
+
+```Go
+type Service struct {
+	Addr string
+}
+
+type Specification struct {
+	HTTP *Service
+}
+```
+
+With no `MYAPP_HTTP_ADDR` (and no default), `s.HTTP` remains `nil`. When the
+variable (or a default) is present, the pointer chain is created only as far
+as needed; sibling optional subtrees are left untouched. A `required:"true"`
+field inside a pointer-to-struct subtree forces that subtree to exist.
+
+Struct types that recurse into themselves (for example a struct with a
+pointer field of its own type) cannot be scanned and produce an error.
+
 ## Custom Decoders
 
 Any field whose type (or pointer-to-type) implements `envconfig.Decoder` can
