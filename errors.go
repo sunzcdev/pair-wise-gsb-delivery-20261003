@@ -116,4 +116,13 @@ var (
 		Message:   "concurrent pagination",
 		Temporary: true,
 	}
+	// ErrorSessionTakenOver is returned to a protected operation (subscribe,
+	// publish) when the connection's session was taken over by a newer
+	// connection of the same user and device (see SessionOwnershipConfig):
+	// the connection's generation is not the current one in the ownership
+	// store anymore.
+	ErrorSessionTakenOver = &Error{
+		Code:    114,
+		Message: "session taken over",
+	}
 )

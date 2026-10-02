@@ -246,6 +246,15 @@ type Config struct {
 	// This is an EXPERIMENTAL API.
 	ClientTimerScheduler TimerScheduler
 
+	// SessionOwnership configures session takeover by user ID and device ID.
+	// When its Store is set, connections authenticated with a
+	// Credentials.DeviceID acquire a session ownership lease on connect and
+	// keep renewing it; a newer connection with the same user ID and device
+	// ID takes the session over with a higher generation, after which the
+	// previous connection can no longer execute protected operations
+	// (subscribe, publish) and is disconnected.
+	SessionOwnership SessionOwnershipConfig
+
 	// Map contains options for map subscriptions.
 	// This is an EXPERIMENTAL API.
 	Map MapConfig

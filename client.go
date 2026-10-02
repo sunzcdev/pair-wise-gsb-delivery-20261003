@@ -342,6 +342,25 @@ type Client struct {
 	// keyed holds per-connection keyed subscription state (shared poll).
 	// nil until first keyed subscribe.
 	keyed *keyedState
+
+	// ownership is non-nil when this connection holds a session ownership
+	// lease (SessionOwnership configured and Credentials.DeviceID set). It is
+	// assigned once during connectCmd, before the connection becomes
+	// authenticated, and never replaced afterwards.
+	ownership *clientSessionOwnership
+}
+
+// clientSessionOwnership tracks the session ownership lease a connection
+// acquired on connect (see SessionOwnershipConfig).
+type clientSessionOwnership struct {
+	key        string
+	generation uint64
+	done       chan struct{}
+	stopOnce   sync.Once
+}
+
+func (o *clientSessionOwnership) stop() {
+	o.stopOnce.Do(func() { close(o.done) })
 }
 
 // ClientCloseFunc must be called on Transport handler close to clean up Client.
@@ -753,6 +772,60 @@ func (c *Client) closeStale() {
 	if (!authenticated || unusable) && !closed {
 		_ = c.close(DisconnectStale)
 	}
+}
+
+// renewSessionOwnership keeps the session ownership lease of this connection
+// alive until the connection closes. A renewal failure is terminal for the
+// connection: ErrSessionOwnershipLost means the session was taken over by a
+// newer generation (or the lease expired), any other error means the ownership
+// store could not confirm the lease - in both cases the connection must not
+// keep acting for the (user ID, device ID) pair.
+func (c *Client) renewSessionOwnership(config SessionOwnershipConfig, ownership *clientSessionOwnership) {
+	ticker := time.NewTicker(config.renewInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ownership.done:
+			return
+		case <-ticker.C:
+		}
+		err := config.Store.Renew(c.ctx, ownership.key, c.uid, ownership.generation, config.leaseTTL())
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrSessionOwnershipLost) {
+			c.node.logger.log(newLogEntry(LogLevelInfo, "session ownership lost", map[string]any{"client": c.uid, "user": c.UserID()}))
+			c.spawnCloseUnlessClosing(DisconnectSessionTakenOver)
+		} else {
+			c.node.logger.log(newErrorLogEntry(err, "session ownership renew error", map[string]any{"client": c.uid, "user": c.UserID(), "error": err.Error()}))
+			c.spawnCloseUnlessClosing(DisconnectServerError)
+		}
+		return
+	}
+}
+
+// checkSessionOwnership verifies that this connection's generation is still
+// the current one in the ownership store. It guards protected operations
+// (subscribe, publish): after a takeover the old connection - which may still
+// be hanging on another node - must not act for the (user ID, device ID) pair
+// anymore. The check goes to the store on purpose: only the shared record
+// proves whether a takeover happened, a broadcast "kick" message cannot.
+func (c *Client) checkSessionOwnership() error {
+	c.mu.RLock()
+	ownership := c.ownership
+	c.mu.RUnlock()
+	if ownership == nil {
+		return nil
+	}
+	ok, err := c.node.config.SessionOwnership.Store.Validate(c.ctx, ownership.key, c.uid, ownership.generation)
+	if err != nil {
+		c.node.logger.log(newErrorLogEntry(err, "session ownership validate error", map[string]any{"client": c.uid, "user": c.UserID(), "error": err.Error()}))
+		return ErrorInternal
+	}
+	if !ok {
+		return ErrorSessionTakenOver
+	}
+	return nil
 }
 
 func (c *Client) writeEncodedPushData(data []byte, ch string, key string, frameType protocol.FrameType, batchConfig ChannelBatchConfig) error {
@@ -1626,6 +1699,20 @@ func (c *Client) close(disconnect Disconnect) error {
 	// Clean up any in-progress map subscriptions that aren't in channels yet.
 	c.cleanupMapSubscribingAll()
 
+	// Stop the session ownership renewal and give the lease up. The release is
+	// guarded by generation inside the store, so a close arriving late - after
+	// a newer connection already took the session over - is a no-op there and
+	// cannot remove the new owner's record.
+	if ownership := c.ownership; ownership != nil {
+		ownership.stop()
+		ownershipConfig := c.node.config.SessionOwnership
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), ownershipConfig.acquireTimeout())
+		if err := ownershipConfig.Store.Release(releaseCtx, ownership.key, c.uid, ownership.generation); err != nil {
+			c.node.logger.log(newErrorLogEntry(err, "session ownership release error", map[string]any{"client": c.uid, "user": user, "error": err.Error()}))
+		}
+		releaseCancel()
+	}
+
 	if disconnect.Code != DisconnectConnectionClosed.Code {
 		c.node.logger.log(newLogEntry(LogLevelDebug, "closing client connection", map[string]any{"client": c.uid, "user": user, "reason": disconnect.Reason}))
 	}
@@ -2317,6 +2404,10 @@ func (c *Client) handleSubscribe(req *protocol.SubscribeRequest, cmd *protocol.C
 		return c.logDisconnectBadRequest("channel required for subscribe")
 	}
 
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
+	}
+
 	// Shared poll check — must be before map routing.
 	var isSharedPoll bool
 	if c.node.config.SharedPoll.GetSharedPollChannelOptions != nil {
@@ -2580,6 +2671,10 @@ func (c *Client) getUnsubscribeCommandReply(res *protocol.UnsubscribeResult) (*p
 func (c *Client) handlePublish(req *protocol.PublishRequest, cmd *protocol.Command, started time.Time, rw *replyWriter) error {
 	if c.eventHub.publishHandler == nil {
 		return ErrorNotAvailable
+	}
+
+	if err := c.checkSessionOwnership(); err != nil {
+		return err
 	}
 
 	channel := req.Channel
@@ -3285,6 +3380,40 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 	if userConnectionLimit > 0 && user != "" && len(c.node.hub.UserConnections(user)) >= userConnectionLimit {
 		c.node.logger.log(newLogEntry(LogLevelInfo, "limit of connections for user reached", map[string]any{"user": user, "client": c.uid, "limit": userConnectionLimit}))
 		return DisconnectConnectionLimit
+	}
+
+	// Session takeover by user ID and device ID: acquire the ownership lease
+	// before the connection becomes visible. The store is the authority here -
+	// acquiring always takes the session over from a previous owner (possibly
+	// a half-open connection on another node), giving this connection a higher
+	// generation. The previous owner then loses its operation eligibility on
+	// its next generation check against the store.
+	ownershipConfig := config.SessionOwnership
+	if ownershipConfig.Store != nil && credentials.DeviceID != "" && user != "" {
+		ownershipKey := sessionOwnershipKey(user, credentials.DeviceID)
+		acquireCtx, acquireCancel := context.WithTimeout(c.ctx, ownershipConfig.acquireTimeout())
+		generation, err := ownershipConfig.Store.Acquire(acquireCtx, ownershipKey, c.uid, ownershipConfig.leaseTTL())
+		acquireCancel()
+		if err != nil {
+			c.node.logger.log(newLogEntry(LogLevelInfo, "session ownership acquire failed", map[string]any{"client": c.uid, "user": user, "error": err.Error()}))
+			return DisconnectSessionOwnershipUnavailable
+		}
+		ownership := &clientSessionOwnership{
+			key:        ownershipKey,
+			generation: generation,
+			done:       make(chan struct{}),
+		}
+		c.mu.Lock()
+		if c.status == statusClosed {
+			c.mu.Unlock()
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), ownershipConfig.acquireTimeout())
+			_ = ownershipConfig.Store.Release(releaseCtx, ownership.key, c.uid, ownership.generation)
+			releaseCancel()
+			return DisconnectConnectionClosed
+		}
+		c.ownership = ownership
+		c.mu.Unlock()
+		go c.renewSessionOwnership(ownershipConfig, ownership)
 	}
 
 	c.mu.RLock()

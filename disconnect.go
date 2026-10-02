@@ -123,6 +123,22 @@ var (
 		Code:   3014,
 		Reason: "state invalidated",
 	}
+	// DisconnectSessionTakenOver issued when the session of this connection
+	// was taken over by a newer connection of the same user and device (see
+	// SessionOwnershipConfig), i.e. the ownership lease of this connection's
+	// generation could not be confirmed anymore.
+	DisconnectSessionTakenOver = Disconnect{
+		Code:   3015,
+		Reason: "session taken over",
+	}
+	// DisconnectSessionOwnershipUnavailable issued when the node could not
+	// acquire the session ownership lease for a connecting client within the
+	// configured timeout (see SessionOwnershipConfig), e.g. due to an
+	// ownership store outage.
+	DisconnectSessionOwnershipUnavailable = Disconnect{
+		Code:   3016,
+		Reason: "session ownership unavailable",
+	}
 )
 
 // The codes below are built-in terminal codes.

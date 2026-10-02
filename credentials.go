@@ -7,6 +7,14 @@ type Credentials struct {
 	// UserID tells library an ID of current user. Leave this empty string
 	// if you need access from anonymous user.
 	UserID string
+	// DeviceID optionally identifies the device this connection comes from.
+	// When Node is configured with SessionOwnership, connections with the
+	// same UserID and DeviceID take over each other's session: the newer
+	// connection gets a higher generation and the previous connection loses
+	// its right to execute protected operations (subscribe, publish) and is
+	// disconnected. Leave empty to opt the connection out of session
+	// takeover.
+	DeviceID string
 	// ExpireAt allows setting time in future when connection must be validated.
 	// In this case Client.OnRefresh callback must be set by application. Zero
 	// value means no expiration.
