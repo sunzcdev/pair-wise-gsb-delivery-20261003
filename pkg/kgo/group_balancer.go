@@ -612,7 +612,9 @@ func (g *groupConsumer) balanceGroup(proto string, resp *kmsg.JoinGroupResponse)
 		case RangeBalancer().ProtocolName(),
 			RoundRobinBalancer().ProtocolName(),
 			StickyBalancer().ProtocolName(),
-			CooperativeStickyBalancer().ProtocolName():
+			CooperativeStickyBalancer().ProtocolName(),
+			WeightedStickyBalancer().ProtocolName(),
+			CooperativeWeightedStickyBalancer().ProtocolName():
 		default:
 			return nil, nil
 		}

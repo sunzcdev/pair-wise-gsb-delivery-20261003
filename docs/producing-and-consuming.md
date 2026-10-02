@@ -221,6 +221,31 @@ Cooperative rebalancing allows a client to continue fetching during rebalances,
 even during transactions. For transactions, a transact session will only be
 aborted if the member has partitions revoked.
 
+### The weighted sticky balancer
+
+The built-in sticky balancers split partitions evenly by *count*. In groups
+with mixed machine sizes, or topics whose partitions carry very different
+traffic, that is not fair: a small machine and a large machine each get the
+same number of partitions, and a hot partition costs far more than a quiet
+one. `WeightedStickyBalancer` and `CooperativeWeightedStickyBalancer` instead
+balance estimated processing cost against capacity:
+
+- each member declares a capacity weight with `WithWeight` (a 16-core machine
+  might use 16 against a 4-core machine's 4);
+- the leader estimates each partition's cost with `WithPartitionCost` (bytes in,
+  message rate, measured CPU, ...); a partition with no estimate costs one;
+- the plan minimizes the largest `sum(partition costs) / member weight`,
+  subject to subscriptions, and keeps the assignment sticky so steady-state
+  rebalances move the fewest partitions.
+
+The cooperative variant takes part in KIP-429 rebalancing: a partition that
+must move is revoked by its current owner first and is only handed to its new
+owner in the next round, so a still-owned partition is never given to a
+joining member immediately. Members whose weight cannot be decoded are treated
+as weight 1. See `examples/weighted_sticky_balancing` for a runnable
+walkthrough of mixed capacities, a hot partition, a member departure, and the
+two-round cooperative handover.
+
 ### Static membership
 
 Kafka 2.4.0 also introduced support for [KIP-345][22], the "static" member
