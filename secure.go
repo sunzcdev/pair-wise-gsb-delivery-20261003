@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 type secureCtxKey string
@@ -47,6 +49,10 @@ func defaultBadHostHandler(w http.ResponseWriter, _ *http.Request) {
 
 func defaultBadRequestHandler(w http.ResponseWriter, _ *http.Request) {
 	http.Error(w, "Bad Request", http.StatusBadRequest)
+}
+
+func defaultBadSSLHostHandler(w http.ResponseWriter, _ *http.Request) {
+	http.Error(w, "Bad SSL Host", http.StatusInternalServerError)
 }
 
 // Options is a struct for specifying configuration options for the secure.Secure middleware.
@@ -119,6 +125,10 @@ type Options struct {
 	// SSLHostFunc is a function pointer, the return value of the function is the host name that has same functionality as `SSHost`. Default is nil.
 	// If SSLHostFunc is nil, the `SSLHost` option will be used.
 	SSLHostFunc *SSLHostFunc `json:"-" toml:"-" yaml:"-"`
+	// SSLHostFuncAllowedHosts is a slice of host names that the host returned by `SSLHostFunc` is allowed to use. Default is an empty slice, which allows any host name.
+	SSLHostFuncAllowedHosts []string
+	// SSLHostFuncAllowedPorts is a slice of ports that the host returned by `SSLHostFunc` is allowed to use. Default is an empty slice, which allows any port.
+	SSLHostFuncAllowedPorts []string
 	// SSLProxyHeaders is set of header keys with associated values that would indicate a valid https request. Useful when using Nginx: `map[string]string{"X-Forwarded-Proto": "https"}`. Default is blank map.
 	SSLProxyHeaders map[string]string
 	// STSSeconds is the max-age of the Strict-Transport-Security header. Default is 0, which would NOT include the header.
@@ -138,6 +148,9 @@ type Secure struct {
 
 	// badRequestHandler is the handler used when the AllowRequestFunc rejects a request.
 	badRequestHandler http.Handler
+
+	// badSSLHostHandler is the handler used when the SSLHostFunc returns an invalid host.
+	badSSLHostHandler http.Handler
 
 	// cRegexAllowedHosts saves the compiled regular expressions of the AllowedHosts
 	// option for subsequent use in processRequest
@@ -165,6 +178,7 @@ func New(options ...Options) *Secure {
 		opt:               o,
 		badHostHandler:    http.HandlerFunc(defaultBadHostHandler),
 		badRequestHandler: http.HandlerFunc(defaultBadRequestHandler),
+		badSSLHostHandler: http.HandlerFunc(defaultBadSSLHostHandler),
 	}
 
 	if s.opt.AllowedHostsAreRegex {
@@ -195,6 +209,11 @@ func (s *Secure) SetBadHostHandler(handler http.Handler) {
 // SetBadRequestHandler sets the handler to call when the AllowRequestFunc rejects a request.
 func (s *Secure) SetBadRequestHandler(handler http.Handler) {
 	s.badRequestHandler = handler
+}
+
+// SetBadSSLHostHandler sets the handler to call when the SSLHostFunc returns an invalid host.
+func (s *Secure) SetBadSSLHostHandler(handler http.Handler) {
+	s.badSSLHostHandler = handler
 }
 
 // Handler implements the http.HandlerFunc for integration with the standard net/http lib.
@@ -350,16 +369,22 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 	// SSL check.
 	if s.opt.SSLRedirect && !ssl && !s.opt.IsDevelopment {
-		url := r.URL
-		url.Scheme = "https"
-		url.Host = host
+		redirectURL := *r.URL
+		redirectURL.Scheme = "https"
+		redirectURL.Host = host
 
 		if s.opt.SSLHostFunc != nil {
 			if h := (*s.opt.SSLHostFunc)(host); len(h) > 0 {
-				url.Host = h
+				if err := s.validateSSLHostFuncResult(h); err != nil {
+					s.badSSLHostHandler.ServeHTTP(w, r)
+
+					return nil, nil, err
+				}
+
+				redirectURL.Host = h
 			}
 		} else if len(s.opt.SSLHost) > 0 {
-			url.Host = s.opt.SSLHost
+			redirectURL.Host = s.opt.SSLHost
 		}
 
 		status := http.StatusMovedPermanently
@@ -367,7 +392,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 			status = http.StatusTemporaryRedirect
 		}
 
-		http.Redirect(w, r, url.String(), status)
+		http.Redirect(w, r, redirectURL.String(), status)
 
 		return nil, nil, fmt.Errorf("redirecting to HTTPS")
 	}
@@ -377,6 +402,12 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 
 		if s.opt.SSLHostFunc != nil {
 			if h := (*s.opt.SSLHostFunc)(host); len(h) > 0 {
+				if err := s.validateSSLHostFuncResult(h); err != nil {
+					s.badSSLHostHandler.ServeHTTP(w, r)
+
+					return nil, nil, err
+				}
+
 				tempSSLHost = h
 			}
 		} else if len(s.opt.SSLHost) > 0 {
@@ -384,16 +415,16 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		}
 
 		if tempSSLHost != host {
-			url := r.URL
-			url.Scheme = "https"
-			url.Host = tempSSLHost
+			redirectURL := *r.URL
+			redirectURL.Scheme = "https"
+			redirectURL.Host = tempSSLHost
 
 			status := http.StatusMovedPermanently
 			if s.opt.SSLTemporaryRedirect {
 				status = http.StatusTemporaryRedirect
 			}
 
-			http.Redirect(w, r, url.String(), status)
+			http.Redirect(w, r, redirectURL.String(), status)
 
 			return nil, nil, fmt.Errorf("redirecting to HTTPS")
 		}
@@ -521,6 +552,69 @@ func (s *Secure) isSSL(r *http.Request) bool {
 	}
 
 	return ssl
+}
+
+// validateSSLHostFuncResult validates the host returned by the SSLHostFunc
+// against the configured allowed hosts and ports. Hosts containing userinfo,
+// control characters, or a path, query, or fragment are always rejected.
+func (s *Secure) validateSSLHostFuncResult(host string) error {
+	for _, r := range host {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("ssl host func returned host containing a control character: %q", host)
+		}
+	}
+
+	u, err := url.Parse("https://" + host)
+	if err != nil {
+		return fmt.Errorf("ssl host func returned invalid host %q: %w", host, err)
+	}
+
+	if u.User != nil {
+		return fmt.Errorf("ssl host func returned host containing userinfo: %q", host)
+	}
+
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("ssl host func returned host containing a path, query, or fragment: %q", host)
+	}
+
+	hostname := u.Hostname()
+	if hostname == "" {
+		return fmt.Errorf("ssl host func returned invalid host: %q", host)
+	}
+
+	if port := u.Port(); port != "" && len(s.opt.SSLHostFuncAllowedPorts) > 0 {
+		isAllowedPort := false
+
+		for _, allowedPort := range s.opt.SSLHostFuncAllowedPorts {
+			if port == allowedPort {
+				isAllowedPort = true
+
+				break
+			}
+		}
+
+		if !isAllowedPort {
+			return fmt.Errorf("ssl host func returned host with disallowed port: %q", host)
+		}
+	}
+
+	if len(s.opt.SSLHostFuncAllowedHosts) > 0 {
+		isAllowedHost := false
+
+		for _, allowedHost := range s.opt.SSLHostFuncAllowedHosts {
+			if strings.EqualFold(allowedHost, hostname) {
+				isAllowedHost = true
+
+				break
+			}
+		}
+
+		if !isAllowedHost {
+			return fmt.Errorf("ssl host func returned disallowed host: %q", host)
+		}
+	}
+
+	return nil
 }
 
 // ModifyResponseHeaders modifies the Response.

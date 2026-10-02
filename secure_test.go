@@ -1479,3 +1479,343 @@ func expect(t *testing.T, a interface{}, b interface{}) {
 		t.Errorf("Expected [%v] (type %v) - Got [%v] (type %v)", b, reflect.TypeOf(b), a, reflect.TypeOf(a))
 	}
 }
+
+func TestSSLHostFuncRejectsUserinfo(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "user:pass@secure.example.com"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect: true,
+		SSLHostFunc: &sslHostFunc,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+	expect(t, res.Body.String(), "Bad SSL Host\n")
+	expect(t, res.Header().Get("Location"), "")
+}
+
+func TestSSLHostFuncRejectsControlCharacters(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "secure.example.com\r\nLocation: https://evil.example.com"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect: true,
+		SSLHostFunc: &sslHostFunc,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+	expect(t, res.Body.String(), "Bad SSL Host\n")
+	expect(t, res.Header().Get("Location"), "")
+}
+
+func TestSSLHostFuncRejectsPath(t *testing.T) {
+	for _, badHost := range []string{"secure.example.com/evil", "secure.example.com/", "secure.example.com?x=1", "secure.example.com#frag"} {
+		sslHostFunc := (func() SSLHostFunc {
+			return func(_ string) string {
+				return badHost
+			}
+		})()
+		s := New(Options{
+			SSLRedirect: true,
+			SSLHostFunc: &sslHostFunc,
+		})
+
+		res := httptest.NewRecorder()
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+		req.Host = exampleHost
+		req.URL.Scheme = httpSchema
+
+		s.Handler(myHandler).ServeHTTP(res, req)
+
+		expect(t, res.Code, http.StatusInternalServerError)
+		expect(t, res.Header().Get("Location"), "")
+	}
+}
+
+func TestSSLHostFuncAllowedPorts(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(host string) string {
+			if host == exampleHost {
+				return "secure.example.com:8443"
+			}
+
+			return "secure.example.com:9090"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect:             true,
+		SSLHostFunc:             &sslHostFunc,
+		SSLHostFuncAllowedPorts: []string{"8443"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://secure.example.com:8443/foo")
+
+	res = httptest.NewRecorder()
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "www.example.org"
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+	expect(t, res.Header().Get("Location"), "")
+}
+
+func TestSSLHostFuncAllowedHosts(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(host string) string {
+			if host == exampleHost {
+				return "secure.example.com"
+			}
+
+			return "evil.example.com"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect:             true,
+		SSLHostFunc:             &sslHostFunc,
+		SSLHostFuncAllowedHosts: []string{"secure.example.com"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://secure.example.com/foo")
+
+	res = httptest.NewRecorder()
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "www.example.org"
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+	expect(t, res.Header().Get("Location"), "")
+}
+
+func TestSSLHostFuncCustomBadSSLHostHandler(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "user@secure.example.com"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect: true,
+		SSLHostFunc: &sslHostFunc,
+	})
+	s.SetBadSSLHostHandler(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "custom ssl host error", http.StatusConflict)
+	}))
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusConflict)
+	expect(t, strings.TrimSpace(res.Body.String()), "custom ssl host error")
+}
+
+func TestSSLHostFuncEmptyKeepsOriginalBehavior(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return ""
+		}
+	})()
+	s := New(Options{
+		SSLRedirect:             true,
+		SSLHostFunc:             &sslHostFunc,
+		SSLHostFuncAllowedHosts: []string{"secure.example.com"},
+		SSLHostFuncAllowedPorts: []string{"8443"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://www.example.com/foo")
+}
+
+func TestSSLForceHostWithInvalidHostFunc(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "secure.example.com/evil"
+		}
+	})()
+	s := New(Options{
+		SSLForceHost: true,
+		SSLHostFunc:  &sslHostFunc,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpsSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+	expect(t, res.Body.String(), "Bad SSL Host\n")
+	expect(t, res.Header().Get("Location"), "")
+}
+
+func TestSSLForceHostWithValidHostFunc(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "secure.example.com:8443"
+		}
+	})()
+	s := New(Options{
+		SSLForceHost:            true,
+		SSLHostFunc:             &sslHostFunc,
+		SSLHostFuncAllowedPorts: []string{"8443"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpsSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://secure.example.com:8443/foo")
+}
+
+func TestSSLRedirectPreservesEscapedPathAndQuery(t *testing.T) {
+	s := New(Options{
+		SSLRedirect: true,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://www.example.com/foo%2Fbar?x=1%202", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://www.example.com/foo%2Fbar?x=1%202")
+}
+
+func TestSSLRedirectPreservesEmptyQueryMarker(t *testing.T) {
+	s := New(Options{
+		SSLRedirect: true,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://www.example.com/foo?", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://www.example.com/foo?")
+}
+
+func TestSSLRedirectWithIPv6Host(t *testing.T) {
+	s := New(Options{
+		SSLRedirect: true,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "[::1]:8080"
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://[::1]:8080/foo")
+}
+
+func TestSSLHostFuncWithIPv6Host(t *testing.T) {
+	sslHostFunc := (func() SSLHostFunc {
+		return func(_ string) string {
+			return "[::1]:8443"
+		}
+	})()
+	s := New(Options{
+		SSLRedirect:             true,
+		SSLHostFunc:             &sslHostFunc,
+		SSLHostFuncAllowedHosts: []string{"::1"},
+		SSLHostFuncAllowedPorts: []string{"8443"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "[::1]:8080"
+	req.URL.Scheme = httpSchema
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://[::1]:8443/foo")
+}
+
+func TestSSLRedirectDoesNotModifyRequest(t *testing.T) {
+	s := New(Options{
+		SSLRedirect: true,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://www.example.com/foo%2Fbar?x=1", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, req.URL.Scheme, httpSchema)
+	expect(t, req.URL.Host, exampleHost)
+	expect(t, req.URL.EscapedPath(), "/foo%2Fbar")
+}
+
+func TestSSLForceHostDoesNotModifyRequest(t *testing.T) {
+	s := New(Options{
+		SSLForceHost: true,
+		SSLHost:      "secure.example.com",
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://www.example.com/foo?x=1", nil)
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://secure.example.com/foo?x=1")
+	expect(t, req.URL.Scheme, httpSchema)
+	expect(t, req.URL.Host, exampleHost)
+}
