@@ -265,6 +265,29 @@ func Run(program *vm.Program, env any) (any, error) {
 	return vm.Run(program, env)
 }
 
+// RunBatch evaluates a compiled program once per row over column-oriented
+// input. Each key in columns names a variable (map envs) or a dot-joined
+// field path (struct envs); values are slices sharing one length.
+//
+// It returns one result per row. Rows that fail at runtime are reported in
+// BatchResult.Errors with RowError.Row set to that row's index in the input
+// columns. Boolean short-circuiting is applied independently per row, so a
+// decided row never evaluates the skipped branch (including divisions and host
+// functions). Programs outside the supported scalar subset transparently fall
+// back to per-row evaluation with identical semantics to Run.
+//
+// For programs compiled against a struct env, use RunBatchStruct.
+func RunBatch(program *vm.Program, columns vm.Columns) (*vm.BatchResult, error) {
+	return vm.RunBatch(program, columns)
+}
+
+// RunBatchStruct is RunBatch for programs compiled with Env against a struct.
+// prototype is a value (or pointer) of that struct type; per-row values come
+// from columns keyed by dot-joined field paths.
+func RunBatchStruct(program *vm.Program, prototype any, columns vm.Columns) (*vm.BatchResult, error) {
+	return vm.RunBatchStruct(program, prototype, columns)
+}
+
 // Eval parses, compiles and runs given input.
 func Eval(input string, env any) (any, error) {
 	if _, ok := env.(Option); ok {

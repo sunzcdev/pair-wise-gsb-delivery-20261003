@@ -174,3 +174,45 @@ For one-off expressions, you can use the `expr.Eval` function. It compiles and r
 output, err := expr.Eval(`2 + 2`, env)
 ```
 :::
+
+## Batch Evaluation
+
+When the same expression must be evaluated for many inputs (for example filtering
+tens of thousands of log lines), use the column-oriented batch API. Input is
+provided per field as a slice (a "column"), and the program is interpreted once
+for the whole batch instead of once per row:
+
+```go
+import "github.com/expr-lang/expr/vm"
+
+program, err := expr.Compile(`level == "error" && status >= 500`, expr.Env(env))
+
+result, err := expr.RunBatch(program, vm.Columns{
+    "level":  []string{"error", "info", "error"},
+    "status": []int{503, 200, 404},
+})
+
+// result.Values: [true false false]
+```
+
+`result.Values` has one entry per input row. A row that fails at runtime is left
+as `nil` there and reported in `result.Errors`, where `RowError.Row` is the index
+of the row in the original input columns.
+
+Boolean short-circuiting is applied independently per row: a row whose condition
+is already decided never evaluates the skipped branch (including divisions and
+host functions). Only the scalar subset of the language is executed column-wise;
+programs that use function calls, loops, closures, arrays/maps and similar
+constructs transparently fall back to per-row evaluation, with results, nil
+semantics and errors identical to `expr.Run`.
+
+For programs compiled against a struct env, call `expr.RunBatchStruct` with a
+prototype value of the env type and columns keyed by dot-joined field paths.
+
+For a hot loop over the same columns, reuse a single `vm.VM`; it caches the
+`[]any` views of typed columns, which removes most allocations:
+
+```go
+var v vm.VM
+result, err := v.RunBatch(program, columns)
+```

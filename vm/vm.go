@@ -41,6 +41,7 @@ type VM struct {
 	Scopes       []*Scope
 	Variables    []any
 	MemoryBudget uint
+	batchViews   map[string][]any
 	ip           int
 	memory       uint
 	debug        bool
