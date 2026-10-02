@@ -1,3 +1,4 @@
+//go:build !go1.7
 // +build !go1.7
 
 package nosurf
@@ -17,6 +18,8 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// the decision recorded for this request
+	decision *Decision
 }
 
 var (
@@ -62,6 +65,26 @@ func Reason(req *http.Request) error {
 	return ctx.reason
 }
 
+// GetDecision() takes an HTTP request and returns
+// the decision CSRFHandler recorded for it,
+// along with whether a decision was recorded at all.
+//
+// The decision only carries rule identifiers and the conclusion.
+// It never contains cookie or token values.
+//
+// Note that the same availability restrictions apply for GetDecision() as for Token().
+func GetDecision(req *http.Request) (Decision, bool) {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	ctx, ok := contextMap[req]
+	if !ok || ctx.decision == nil {
+		return Decision{}, false
+	}
+
+	return *ctx.decision, true
+}
+
 // Takes a raw token, masks it with a per-request key,
 // encodes in base64 and makes it available to the wrapped handler
 func ctxSetToken(req *http.Request, token []byte) *http.Request {
@@ -90,6 +113,20 @@ func ctxSetReason(req *http.Request, reason error) *http.Request {
 	}
 
 	ctx.reason = reason
+	return req
+}
+
+func ctxSetDecision(req *http.Request, decision *Decision) *http.Request {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		panic("Decision should never be set when there's no token" +
+			" (context) yet.")
+	}
+
+	ctx.decision = decision
 	return req
 }
 

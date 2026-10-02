@@ -1,3 +1,4 @@
+//go:build go1.7
 // +build go1.7
 
 package nosurf
@@ -16,6 +17,8 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// the decision recorded for this request
+	decision *Decision
 }
 
 // Token takes an HTTP request and returns
@@ -45,6 +48,23 @@ func Reason(req *http.Request) error {
 	return ctx.reason
 }
 
+// GetDecision takes an HTTP request and returns
+// the decision CSRFHandler recorded for it,
+// along with whether a decision was recorded at all.
+//
+// The decision only carries rule identifiers and the conclusion.
+// It never contains cookie or token values.
+//
+// Note that the same availability restrictions apply for GetDecision() as for Token().
+func GetDecision(req *http.Request) (Decision, bool) {
+	ctx, ok := req.Context().Value(nosurfKey).(*csrfContext)
+	if !ok || ctx.decision == nil {
+		return Decision{}, false
+	}
+
+	return *ctx.decision, true
+}
+
 func ctxClear(_ *http.Request) {
 }
 
@@ -60,4 +80,9 @@ func ctxSetReason(req *http.Request, reason error) {
 	}
 
 	ctx.reason = reason
+}
+
+func ctxSetDecision(req *http.Request, decision *Decision) {
+	ctx := req.Context().Value(nosurfKey).(*csrfContext)
+	ctx.decision = decision
 }

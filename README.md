@@ -101,6 +101,32 @@ verification by using one of the exemption methods:
 Later on, the token **must** be verified by manually getting the token from the cookie
 and providing the token sent in body through: `VerifyToken(tkn, tkn2 string) bool`.
 
+### Named exemption rules and decisions
+For finer control, exemptions can be registered as rules
+with a stable ID and an explicit priority via `AddExemptRule`.
+When several rules match the same request,
+the one with the lowest priority wins,
+with ties broken by registration order,
+so the outcome is always reproducible.
+
+```go
+err := h.AddExemptRule(nosurf.ExemptRule{
+	ID:       "webhook",
+	Kind:     nosurf.RuleExactPath,
+	Priority: 10,
+	Path:     "/hooks/github",
+})
+```
+
+For every request, `CSRFHandler` records a `Decision`
+explaining why it was allowed (safe method, a specific exemption rule,
+or a passed token check) or at which stage it was rejected.
+The decision only carries rule identifiers and the conclusion —
+never cookie or token values.
+Use `GetDecision(r)` inside the wrapped handlers to retrieve it,
+or `h.Check(r)` to only evaluate the matching conditions
+without generating tokens or calling the wrapped handlers.
+
 Example:
 ```go
 func HandleJson(w http.ResponseWriter, r *http.Request) {

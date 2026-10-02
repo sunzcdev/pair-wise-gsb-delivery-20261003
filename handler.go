@@ -61,6 +61,15 @@ type CSRFHandler struct {
 	// ...or a custom matcher function
 	exemptFunc func(r *http.Request) bool
 
+	// Exemption rules with stable IDs and explicit priorities.
+	// Kept sorted by ascending priority,
+	// with registration order as the tie-breaker.
+	// The legacy exempt* slices above are mirrored here
+	// with derived IDs and default priorities.
+	rules   []*exemptRule
+	ruleIDs map[string]struct{}
+	ruleSeq int
+
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
 }
@@ -146,14 +155,23 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctxSetToken(r, realToken)
 	}
 
-	if sContains(safeMethods, r.Method) || h.IsExempt(r) {
+	var decision Decision
+	if sContains(safeMethods, r.Method) {
 		// short-circuit with a success for safe methods
+		decision = Decision{Allowed: true, Stage: StageSafeMethod}
+	} else if id, ok := h.matchExempt(r); ok {
+		decision = Decision{Allowed: true, Stage: StageExemptRule, RuleID: id}
+	}
+
+	if decision.Allowed {
+		ctxSetDecision(r, &decision)
 		h.handleSuccess(w, r)
 		return
 	}
 
 	if err := h.ensureSameOrigin(r); err != nil {
 		ctxSetReason(r, err)
+		ctxSetDecision(r, &Decision{Stage: StageOrigin, Reason: err})
 		h.handleFailure(w, r)
 		return
 	}
@@ -163,11 +181,13 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if !verifyToken(realToken, sentToken) {
 		ctxSetReason(r, ErrBadToken)
+		ctxSetDecision(r, &Decision{Stage: StageToken, Reason: ErrBadToken})
 		h.handleFailure(w, r)
 		return
 	}
 
 	// Everything else passed, handle the success.
+	ctxSetDecision(r, &Decision{Allowed: true, Stage: StageToken})
 	h.handleSuccess(w, r)
 }
 
