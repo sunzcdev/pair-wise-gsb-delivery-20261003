@@ -33,6 +33,12 @@ import (
 // behavior.
 const DefaultLineEnding = "\n"
 
+// DefaultMaxStagedFieldBytes is the default bound on the staged
+// representation of a single object or array field when
+// EncoderConfig.StrictFieldIsolation is enabled and
+// EncoderConfig.MaxStagedFieldBytes is not set.
+const DefaultMaxStagedFieldBytes = 1 << 20 // 1 MiB
+
 // OmitKey defines the key to use when callers want to remove a key from log output.
 const OmitKey = ""
 
@@ -356,6 +362,26 @@ type EncoderConfig struct {
 	// Configures the field separator used by the console encoder. Defaults
 	// to tab.
 	ConsoleSeparator string `json:"consoleSeparator" yaml:"consoleSeparator"`
+	// StrictFieldIsolation controls how failures while marshaling
+	// ObjectMarshaler and ArrayMarshaler fields are handled.
+	//
+	// When false (the default), a marshaler that returns an error after
+	// writing some output leaves that partial output in place, preserving
+	// zap's historical behavior.
+	//
+	// When true, each object or array field is staged separately: if
+	// marshaling fails, the partially written value is discarded and
+	// replaced with an error placeholder, so downstream consumers never
+	// observe a partial business object. Other fields in the same log
+	// entry are unaffected, and the output remains valid JSON. This also
+	// applies to objects and arrays nested inside other marshalers.
+	StrictFieldIsolation bool `json:"strictFieldIsolation" yaml:"strictFieldIsolation"`
+	// MaxStagedFieldBytes bounds the size of a single field's staged
+	// representation while StrictFieldIsolation is enabled. A field whose
+	// staged representation exceeds the limit is discarded and replaced
+	// with an error placeholder, exactly as if marshaling had failed.
+	// Non-positive values use DefaultMaxStagedFieldBytes.
+	MaxStagedFieldBytes int `json:"maxStagedFieldBytes" yaml:"maxStagedFieldBytes"`
 }
 
 // ObjectEncoder is a strongly-typed, encoding-agnostic interface for adding a

@@ -22,6 +22,7 @@ package zapcore
 
 import (
 	"encoding/base64"
+	"fmt"
 	"math"
 	"time"
 	"unicode/utf8"
@@ -208,6 +209,17 @@ func (enc *jsonEncoder) AddUint64(key string, val uint64) {
 }
 
 func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
+	if enc.StrictFieldIsolation {
+		return enc.stagedValue(func() error {
+			enc.addElementSeparator()
+			enc.buf.AppendByte('[')
+			if err := arr.MarshalLogArray(enc); err != nil {
+				return err
+			}
+			enc.buf.AppendByte(']')
+			return nil
+		})
+	}
 	enc.addElementSeparator()
 	enc.buf.AppendByte('[')
 	err := arr.MarshalLogArray(enc)
@@ -220,6 +232,20 @@ func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
 	// AppendObject().
 	old := enc.openNamespaces
 	enc.openNamespaces = 0
+	if enc.StrictFieldIsolation {
+		err := enc.stagedValue(func() error {
+			enc.addElementSeparator()
+			enc.buf.AppendByte('{')
+			if err := obj.MarshalLogObject(enc); err != nil {
+				return err
+			}
+			enc.buf.AppendByte('}')
+			enc.closeOpenNamespaces()
+			return nil
+		})
+		enc.openNamespaces = old
+		return err
+	}
 	enc.addElementSeparator()
 	enc.buf.AppendByte('{')
 	err := obj.MarshalLogObject(enc)
@@ -227,6 +253,39 @@ func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
 	enc.closeOpenNamespaces()
 	enc.openNamespaces = old
 	return err
+}
+
+// stagedValue runs stage, which appends a single JSON value to the buffer,
+// and rolls the buffer back if staging fails or exceeds the configured
+// staging limit. On failure the partially written value is replaced with an
+// error placeholder, keeping the output valid JSON, and the error is
+// returned so that callers can still surface it (for example, via a
+// "${key}Error" field).
+func (enc *jsonEncoder) stagedValue(stage func() error) error {
+	start := enc.buf.Len()
+	openNamespaces := enc.openNamespaces
+
+	err := stage()
+	if err == nil {
+		if limit := enc.stagedFieldLimit(); enc.buf.Len()-start > limit {
+			err = fmt.Errorf("staged field exceeds %d-byte limit", limit)
+		}
+	}
+	if err == nil {
+		return nil
+	}
+
+	enc.buf.Truncate(start)
+	enc.openNamespaces = openNamespaces
+	enc.AppendString(fmt.Sprintf("<marshal failed: %v>", err))
+	return err
+}
+
+func (enc *jsonEncoder) stagedFieldLimit() int {
+	if enc.MaxStagedFieldBytes > 0 {
+		return enc.MaxStagedFieldBytes
+	}
+	return DefaultMaxStagedFieldBytes
 }
 
 func (enc *jsonEncoder) AppendBool(val bool) {

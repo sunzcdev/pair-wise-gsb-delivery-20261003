@@ -65,6 +65,26 @@ func TestBufferWrites(t *testing.T) {
 	}
 }
 
+func TestBufferTruncate(t *testing.T) {
+	buf := NewPool().Get()
+
+	buf.AppendString("hello world")
+	buf.Truncate(5)
+	assert.Equal(t, "hello", buf.String(), "Unexpected buffer contents after Truncate.")
+
+	buf.Truncate(100)
+	assert.Equal(t, "hello", buf.String(), "Truncate beyond length should be a no-op.")
+
+	buf.Truncate(-1)
+	assert.Equal(t, "hello", buf.String(), "Truncate with negative length should be a no-op.")
+
+	buf.AppendString("!")
+	assert.Equal(t, "hello!", buf.String(), "Truncated buffer should remain writable.")
+
+	buf.Truncate(0)
+	assert.Equal(t, "", buf.String(), "Truncate to zero should empty the buffer.")
+}
+
 func BenchmarkBuffers(b *testing.B) {
 	// Because we use the strconv.AppendFoo functions so liberally, we can't
 	// use the standard library's bytes.Buffer anyways (without incurring a

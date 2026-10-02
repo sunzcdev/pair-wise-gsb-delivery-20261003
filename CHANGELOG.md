@@ -3,6 +3,16 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+Enhancements:
+* Add `EncoderConfig.StrictFieldIsolation` and `EncoderConfig.MaxStagedFieldBytes`.
+  When enabled, an `ObjectMarshaler` or `ArrayMarshaler` that fails after
+  writing partial output has its entire value discarded and replaced with an
+  error placeholder, so downstream consumers never observe a partial business
+  object. Other fields in the same entry are unaffected and the output remains
+  valid JSON. Fields whose staged representation exceeds the staging limit are
+  replaced the same way. The default behavior is unchanged.
+
 ## 1.28.0 (27 Apr 2026)
 Enhancements:
 * [#1534][]: Add `zapcore.CheckPreWriteHook` and `CheckedEntry.Before` method for transforming entries before they are written to any Cores.

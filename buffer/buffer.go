@@ -105,6 +105,16 @@ func (b *Buffer) Reset() {
 	b.bs = b.bs[:0]
 }
 
+// Truncate discards all but the first n bytes of the buffer, keeping the
+// underlying storage for reuse. It is a no-op if n is negative or greater
+// than the buffer's current length.
+func (b *Buffer) Truncate(n int) {
+	if n < 0 || n > len(b.bs) {
+		return
+	}
+	b.bs = b.bs[:n]
+}
+
 // Write implements io.Writer.
 func (b *Buffer) Write(bs []byte) (int, error) {
 	b.bs = append(b.bs, bs...)
