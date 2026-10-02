@@ -1,12 +1,9 @@
 package sasl
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 )
 
 // The OAUTHBEARER mechanism name.
@@ -35,22 +32,8 @@ type oauthBearerClient struct {
 }
 
 func (a *oauthBearerClient) Start() (mech string, ir []byte, err error) {
-	var authzid string
-	if a.Username != "" {
-		authzid = "a=" + a.Username
-	}
-	str := "n," + authzid + ","
-
-	if a.Host != "" {
-		str += "\x01host=" + a.Host
-	}
-
-	if a.Port != 0 {
-		str += "\x01port=" + strconv.Itoa(a.Port)
-	}
-	str += "\x01auth=Bearer " + a.Token + "\x01\x01"
-	ir = []byte(str)
-	return OAuthBearer, ir, nil
+	ir, err = encodeOAuthBearerInitialResponse(a.OAuthBearerOptions)
+	return OAuthBearer, ir, err
 }
 
 func (a *oauthBearerClient) Next(challenge []byte) ([]byte, error) {
@@ -73,8 +56,14 @@ type OAuthBearerAuthenticator func(opts OAuthBearerOptions) *OAuthBearerError
 type oauthBearerServer struct {
 	done         bool
 	failErr      error
+	strict       bool
 	authenticate OAuthBearerAuthenticator
 }
+
+// ErrInvalidClientResponse is returned when the client fails to send the
+// single 0x01 confirmation defined by RFC 7628 section 3.2.2 after a
+// failure challenge.
+var ErrInvalidClientResponse = errors.New("sasl: invalid response")
 
 func (a *oauthBearerServer) fail(descr string) ([]byte, bool, error) {
 	blob, err := json.Marshal(OAuthBearerError{
@@ -96,9 +85,13 @@ func (a *oauthBearerServer) Next(response []byte) (challenge []byte, done bool, 
 		// Server libraries (go-smtp, go-imap) will not call Next on
 		// protocol-specific SASL cancel response ('*'). However, GS2 (and
 		// indirectly OAUTHBEARER) defines a protocol-independent way to do so
-		// using 0x01.
-		if len(response) != 1 && response[0] != 0x01 {
-			return nil, true, errors.New("sasl: invalid response")
+		// using a single 0x01 byte. RFC 7628 section 3.2.2: after a JSON
+		// error challenge the client MUST answer with exactly that one
+		// byte; nil, an empty slice or any longer input is invalid. The
+		// length is checked first so an empty slice cannot panic, and the
+		// authenticator is never invoked again.
+		if len(response) != 1 || response[0] != oauthBearerSep {
+			return nil, true, ErrInvalidClientResponse
 		}
 		return nil, true, a.failErr
 	}
@@ -115,69 +108,9 @@ func (a *oauthBearerServer) Next(response []byte) (challenge []byte, done bool, 
 
 	a.done = true
 
-	// Cut n,a=username,\x01host=...\x01auth=...
-	// into
-	//   n
-	//   a=username
-	//   \x01host=...\x01auth=...\x01\x01
-	parts := bytes.SplitN(response, []byte{','}, 3)
-	if len(parts) != 3 {
-		return a.fail("Invalid response")
-	}
-	flag := parts[0]
-	authzid := parts[1]
-	if !bytes.Equal(flag, []byte{'n'}) {
-		return a.fail("Invalid response, missing 'n' in gs2-cb-flag")
-	}
-	opts := OAuthBearerOptions{}
-	if len(authzid) > 0 {
-		if !bytes.HasPrefix(authzid, []byte("a=")) {
-			return a.fail("Invalid response, missing 'a=' in gs2-authzid")
-		}
-		opts.Username = string(bytes.TrimPrefix(authzid, []byte("a=")))
-	}
-
-	// Cut \x01host=...\x01auth=...\x01\x01
-	// into
-	//   *empty*
-	//   host=...
-	//   auth=...
-	//   *empty*
-	//
-	// Note that this code does not do a lot of checks to make sure the input
-	// follows the exact format specified by RFC.
-	params := bytes.Split(parts[2], []byte{0x01})
-	for _, p := range params {
-		// Skip empty fields (one at start and end).
-		if len(p) == 0 {
-			continue
-		}
-
-		pParts := bytes.SplitN(p, []byte{'='}, 2)
-		if len(pParts) != 2 {
-			return a.fail("Invalid response, missing '='")
-		}
-
-		switch string(pParts[0]) {
-		case "host":
-			opts.Host = string(pParts[1])
-		case "port":
-			port, err := strconv.ParseUint(string(pParts[1]), 10, 16)
-			if err != nil {
-				return a.fail("Invalid response, malformed 'port' value")
-			}
-			opts.Port = int(port)
-		case "auth":
-			const prefix = "bearer "
-			strValue := string(pParts[1])
-			// Token type is case-insensitive.
-			if !strings.HasPrefix(strings.ToLower(strValue), prefix) {
-				return a.fail("Unsupported token type")
-			}
-			opts.Token = strValue[len(prefix):]
-		default:
-			return a.fail("Invalid response, unknown parameter: " + string(pParts[0]))
-		}
+	opts, parseErr := parseOAuthBearerInitialResponse(response, a.strict)
+	if parseErr != nil {
+		return a.fail(parseErr.Error())
 	}
 
 	authzErr := a.authenticate(opts)
@@ -193,6 +126,21 @@ func (a *oauthBearerServer) Next(response []byte) (challenge []byte, done bool, 
 	return nil, true, nil
 }
 
+// NewOAuthBearerServer returns a server with the lenient, backwards
+// compatible client message parser: it accepts the historical field
+// layout and keeps accepting well-formed messages produced by older
+// clients.
 func NewOAuthBearerServer(auth OAuthBearerAuthenticator) Server {
 	return &oauthBearerServer{authenticate: auth}
+}
+
+// NewOAuthBearerServerStrict returns a server that strictly enforces
+// RFC 7628: the GS2 authzid MUST use the RFC 5801 =2C/=3D escaping,
+// parameter fields MUST be exactly bounded by 0x01 separators and end
+// with 0x01 0x01, the "auth" parameter is required, and duplicate
+// "host", "port" or "auth" parameters are rejected. Malformed messages
+// produce an "invalid_request" challenge without calling the
+// authenticator.
+func NewOAuthBearerServerStrict(auth OAuthBearerAuthenticator) Server {
+	return &oauthBearerServer{authenticate: auth, strict: true}
 }
