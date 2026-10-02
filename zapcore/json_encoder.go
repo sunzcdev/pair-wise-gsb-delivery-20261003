@@ -23,6 +23,7 @@ package zapcore
 import (
 	"encoding/base64"
 	"math"
+	"sort"
 	"time"
 	"unicode/utf8"
 
@@ -48,6 +49,9 @@ func putJSONEncoder(enc *jsonEncoder) {
 	enc.openNamespaces = 0
 	enc.reflectBuf = nil
 	enc.reflectEnc = nil
+	enc.duplicateKeys = nil
+	enc.pendingDeletions = nil
+	enc.contextCopied = false
 	_jsonPool.Put(enc)
 }
 
@@ -60,20 +64,18 @@ type jsonEncoder struct {
 	// for encoding generic values by reflection
 	reflectBuf *buffer.Buffer
 	reflectEnc ReflectedEncoder
+
+	duplicateKeys    *duplicateKeyTracker
+	pendingDeletions []keyRecord
+	contextCopied    bool
 }
 
 // NewJSONEncoder creates a fast, low-allocation JSON encoder. The encoder
 // appropriately escapes all field keys and values.
 //
-// Note that the encoder doesn't deduplicate keys, so it's possible to produce
-// a message like
-//
-//	{"foo":"bar","foo":"baz"}
-//
-// This is permitted by the JSON specification, but not encouraged. Many
-// libraries will ignore duplicate key-value pairs (typically keeping the last
-// pair) when unmarshaling, but users should attempt to avoid adding duplicate
-// keys.
+// By default, duplicate keys are written in encounter order. Set
+// EncoderConfig.DuplicateKeyPolicy to keep either the first or last value,
+// or to report the conflict.
 func NewJSONEncoder(cfg EncoderConfig) Encoder {
 	return newJSONEncoder(cfg, false)
 }
@@ -97,14 +99,103 @@ func newJSONEncoder(cfg EncoderConfig, spaced bool) *jsonEncoder {
 	}
 }
 
+func (enc *jsonEncoder) reportDuplicateKey(info DuplicateKeyInfo) {
+	if enc.OnDuplicateKey != nil {
+		enc.OnDuplicateKey(info)
+	}
+}
+
+func (enc *jsonEncoder) duplicateKeyPolicy() DuplicateKeyPolicy {
+	if enc.EncoderConfig == nil {
+		return ""
+	}
+	return enc.DuplicateKeyPolicy
+}
+
+func (enc *jsonEncoder) addKey(key string) bool {
+	if tracker := enc.duplicateKeys; tracker != nil {
+		if policy := enc.duplicateKeyPolicy(); policy != "" {
+			if !tracker.prepare(key, enc.buf.Len(), policy, enc.reportDuplicateKey) {
+				return false
+			}
+		} else {
+			enc.writeKey(key)
+			return true
+		}
+	} else if policy := enc.duplicateKeyPolicy(); policy != "" {
+		enc.duplicateKeys = newDuplicateKeyTracker()
+		if !enc.duplicateKeys.prepare(key, enc.buf.Len(), policy, enc.reportDuplicateKey) {
+			return false
+		}
+	} else {
+		enc.writeKey(key)
+		return true
+	}
+	enc.writeKey(key)
+	return true
+}
+
+func (enc *jsonEncoder) writeKey(key string) {
+	enc.addElementSeparator()
+	enc.buf.AppendByte('"')
+	enc.safeAddString(key)
+	enc.buf.AppendByte('"')
+	enc.buf.AppendByte(':')
+	if enc.spaced {
+		enc.buf.AppendByte(' ')
+	}
+}
+
+func (enc *jsonEncoder) finishKey() {
+	if tracker := enc.duplicateKeys; tracker != nil && enc.DuplicateKeyPolicy != "" {
+		tracker.finish(enc.buf.Len())
+	}
+}
+
+func (enc *jsonEncoder) replaceKey(key string) bool {
+	tracker := enc.duplicateKeys
+	if tracker == nil || enc.DuplicateKeyPolicy != DuplicateKeyKeepLast {
+		return false
+	}
+	record, ok := tracker.take(key)
+	if !ok {
+		return false
+	}
+	if record.inherited {
+		if !enc.contextCopied {
+			enc.pendingDeletions = append(enc.pendingDeletions, record)
+		} else {
+			start, end := tracker.remove(record, enc.buf.Bytes())
+			enc.buf.Delete(start, end)
+		}
+		return true
+	}
+	start, end := tracker.remove(record, enc.buf.Bytes())
+	enc.buf.Delete(start, end)
+	return true
+}
+
+func (enc *jsonEncoder) addMemberKey(key string) bool {
+	enc.replaceKey(key)
+	return enc.addKey(key)
+}
+
 func (enc *jsonEncoder) AddArray(key string, arr ArrayMarshaler) error {
-	enc.addKey(key)
-	return enc.AppendArray(arr)
+	if !enc.addMemberKey(key) {
+		return nil
+	}
+	err := enc.AppendArray(arr)
+	enc.finishKey()
+	return err
 }
 
 func (enc *jsonEncoder) AddObject(key string, obj ObjectMarshaler) error {
-	enc.addKey(key)
-	return enc.AppendObject(obj)
+	if !enc.addMemberKey(key) {
+		return nil
+	}
+	err := enc.AppendObject(obj)
+	enc.finishKey()
+	return err
 }
 
 func (enc *jsonEncoder) AddBinary(key string, val []byte) {
@@ -112,43 +203,59 @@ func (enc *jsonEncoder) AddBinary(key string, val []byte) {
 }
 
 func (enc *jsonEncoder) AddByteString(key string, val []byte) {
-	enc.addKey(key)
-	enc.AppendByteString(val)
+	if enc.addMemberKey(key) {
+		enc.AppendByteString(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddBool(key string, val bool) {
-	enc.addKey(key)
-	enc.AppendBool(val)
+	if enc.addMemberKey(key) {
+		enc.AppendBool(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddComplex128(key string, val complex128) {
-	enc.addKey(key)
-	enc.AppendComplex128(val)
+	if enc.addMemberKey(key) {
+		enc.AppendComplex128(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddComplex64(key string, val complex64) {
-	enc.addKey(key)
-	enc.AppendComplex64(val)
+	if enc.addMemberKey(key) {
+		enc.AppendComplex64(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddDuration(key string, val time.Duration) {
-	enc.addKey(key)
-	enc.AppendDuration(val)
+	if enc.addMemberKey(key) {
+		enc.AppendDuration(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddFloat64(key string, val float64) {
-	enc.addKey(key)
-	enc.AppendFloat64(val)
+	if enc.addMemberKey(key) {
+		enc.AppendFloat64(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddFloat32(key string, val float32) {
-	enc.addKey(key)
-	enc.AppendFloat32(val)
+	if enc.addMemberKey(key) {
+		enc.AppendFloat32(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddInt64(key string, val int64) {
-	enc.addKey(key)
-	enc.AppendInt64(val)
+	if enc.addMemberKey(key) {
+		enc.AppendInt64(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) resetReflectBuf() {
@@ -181,37 +288,57 @@ func (enc *jsonEncoder) AddReflected(key string, obj interface{}) error {
 	if err != nil {
 		return err
 	}
-	enc.addKey(key)
+	if !enc.addMemberKey(key) {
+		return nil
+	}
 	_, err = enc.buf.Write(valueBytes)
+	enc.finishKey()
 	return err
 }
 
 func (enc *jsonEncoder) OpenNamespace(key string) {
-	enc.addKey(key)
+	if !enc.addMemberKey(key) {
+		return
+	}
 	enc.buf.AppendByte('{')
 	enc.openNamespaces++
+	if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+		enc.duplicateKeys.openNamespace()
+	}
 }
 
 func (enc *jsonEncoder) AddString(key, val string) {
-	enc.addKey(key)
-	enc.AppendString(val)
+	if enc.addMemberKey(key) {
+		enc.AppendString(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddTime(key string, val time.Time) {
-	enc.addKey(key)
-	enc.AppendTime(val)
+	if enc.addMemberKey(key) {
+		enc.AppendTime(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AddUint64(key string, val uint64) {
-	enc.addKey(key)
-	enc.AppendUint64(val)
+	if enc.addMemberKey(key) {
+		enc.AppendUint64(val)
+		enc.finishKey()
+	}
 }
 
 func (enc *jsonEncoder) AppendArray(arr ArrayMarshaler) error {
 	enc.addElementSeparator()
 	enc.buf.AppendByte('[')
+	if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+		enc.duplicateKeys.openArray()
+	}
 	err := arr.MarshalLogArray(enc)
 	enc.buf.AppendByte(']')
+	if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+		enc.duplicateKeys.closeArray(enc.buf.Len())
+	}
 	return err
 }
 
@@ -222,8 +349,17 @@ func (enc *jsonEncoder) AppendObject(obj ObjectMarshaler) error {
 	enc.openNamespaces = 0
 	enc.addElementSeparator()
 	enc.buf.AppendByte('{')
+	if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+		if scopes := enc.duplicateKeys.scopes; len(scopes) > 0 && scopes[len(scopes)-1].array {
+			enc.duplicateKeys.arrayElement()
+		}
+		enc.duplicateKeys.openObject()
+	}
 	err := obj.MarshalLogObject(enc)
 	enc.buf.AppendByte('}')
+	if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+		enc.duplicateKeys.closeObject(enc.buf.Len())
+	}
 	enc.closeOpenNamespaces()
 	enc.openNamespaces = old
 	return err
@@ -355,68 +491,122 @@ func (enc *jsonEncoder) clone() *jsonEncoder {
 	clone.spaced = enc.spaced
 	clone.openNamespaces = enc.openNamespaces
 	clone.buf = bufferpool.Get()
+	clone.duplicateKeys = enc.duplicateKeys.clone()
+	clone.pendingDeletions = append([]keyRecord(nil), enc.pendingDeletions...)
 	return clone
+}
+
+func (enc *jsonEncoder) addEntryKey(key string, appendValue func()) {
+	if !enc.addMemberKey(key) {
+		return
+	}
+	appendValue()
+	enc.finishKey()
+}
+
+func (enc *jsonEncoder) writeInheritedContext(src []byte) {
+	if len(src) == 0 {
+		if enc.duplicateKeys != nil {
+			enc.duplicateKeys.attachEntryScopes()
+		}
+		return
+	}
+	if enc.duplicateKeyPolicy() == "" || enc.duplicateKeys == nil {
+		enc.addElementSeparator()
+		enc.buf.Write(src)
+		return
+	}
+	deletions := append([]keyRecord(nil), enc.pendingDeletions...)
+	sort.Slice(deletions, func(i, j int) bool {
+		return deletions[i].start > deletions[j].start
+	})
+	metadataLen := enc.buf.Len()
+	enc.addElementSeparator()
+	prefixLen := enc.buf.Len()
+	enc.duplicateKeys.shiftInherited(0, prefixLen)
+	enc.duplicateKeys.shiftPendingInherited(prefixLen)
+	enc.buf.Write(src)
+	enc.contextCopied = true
+	removed := 0
+	for _, record := range deletions {
+		from := prefixLen + record.start - removed
+		to := prefixLen + record.end - removed
+		for from > 0 && enc.buf.Bytes()[from-1] == ' ' {
+			from--
+		}
+		if from > 0 && enc.buf.Bytes()[from-1] == ',' {
+			from--
+		}
+		enc.buf.Delete(from, to)
+		enc.duplicateKeys.shiftInherited(to, from-to)
+		removed += to - from
+	}
+	if enc.buf.Len() <= prefixLen {
+		enc.buf.Delete(metadataLen, enc.buf.Len())
+	}
+	enc.duplicateKeys.attachEntryScopes()
 }
 
 func (enc *jsonEncoder) EncodeEntry(ent Entry, fields []Field) (*buffer.Buffer, error) {
 	final := enc.clone()
 	final.buf.AppendByte('{')
+	if final.duplicateKeys != nil && final.DuplicateKeyPolicy != "" {
+		final.duplicateKeys.beginEntry()
+	}
 
 	if final.LevelKey != "" && final.EncodeLevel != nil {
-		final.addKey(final.LevelKey)
-		cur := final.buf.Len()
-		final.EncodeLevel(ent.Level, final)
-		if cur == final.buf.Len() {
-			// User-supplied EncodeLevel was a no-op. Fall back to strings to keep
-			// output JSON valid.
-			final.AppendString(ent.Level.String())
-		}
+		final.addEntryKey(final.LevelKey, func() {
+			cur := final.buf.Len()
+			final.EncodeLevel(ent.Level, final)
+			if cur == final.buf.Len() {
+				// User-supplied EncodeLevel was a no-op. Fall back to strings to keep
+				// output JSON valid.
+				final.AppendString(ent.Level.String())
+			}
+		})
 	}
 	if final.TimeKey != "" && !ent.Time.IsZero() {
 		final.AddTime(final.TimeKey, ent.Time)
 	}
 	if ent.LoggerName != "" && final.NameKey != "" {
-		final.addKey(final.NameKey)
-		cur := final.buf.Len()
-		nameEncoder := final.EncodeName
+		final.addEntryKey(final.NameKey, func() {
+			cur := final.buf.Len()
+			nameEncoder := final.EncodeName
 
-		// if no name encoder provided, fall back to FullNameEncoder for backwards
-		// compatibility
-		if nameEncoder == nil {
-			nameEncoder = FullNameEncoder
-		}
+			// if no name encoder provided, fall back to FullNameEncoder for backwards
+			// compatibility
+			if nameEncoder == nil {
+				nameEncoder = FullNameEncoder
+			}
 
-		nameEncoder(ent.LoggerName, final)
-		if cur == final.buf.Len() {
-			// User-supplied EncodeName was a no-op. Fall back to strings to
-			// keep output JSON valid.
-			final.AppendString(ent.LoggerName)
-		}
+			nameEncoder(ent.LoggerName, final)
+			if cur == final.buf.Len() {
+				// User-supplied EncodeName was a no-op. Fall back to strings to
+				// keep output JSON valid.
+				final.AppendString(ent.LoggerName)
+			}
+		})
 	}
 	if ent.Caller.Defined {
 		if final.CallerKey != "" {
-			final.addKey(final.CallerKey)
-			cur := final.buf.Len()
-			final.EncodeCaller(ent.Caller, final)
-			if cur == final.buf.Len() {
-				// User-supplied EncodeCaller was a no-op. Fall back to strings to
-				// keep output JSON valid.
-				final.AppendString(ent.Caller.String())
-			}
+			final.addEntryKey(final.CallerKey, func() {
+				cur := final.buf.Len()
+				final.EncodeCaller(ent.Caller, final)
+				if cur == final.buf.Len() {
+					// User-supplied EncodeCaller was a no-op. Fall back to strings to
+					// keep output JSON valid.
+					final.AppendString(ent.Caller.String())
+				}
+			})
 		}
 		if final.FunctionKey != "" {
-			final.addKey(final.FunctionKey)
-			final.AppendString(ent.Caller.Function)
+			final.AddString(final.FunctionKey, ent.Caller.Function)
 		}
 	}
 	if final.MessageKey != "" {
-		final.addKey(enc.MessageKey)
-		final.AppendString(ent.Message)
+		final.AddString(final.MessageKey, ent.Message)
 	}
-	if enc.buf.Len() > 0 {
-		final.addElementSeparator()
-		final.buf.Write(enc.buf.Bytes())
-	}
+	final.writeInheritedContext(enc.buf.Bytes())
 	addFields(final, fields)
 	final.closeOpenNamespaces()
 	if ent.Stack != "" && final.StacktraceKey != "" {
@@ -437,19 +627,11 @@ func (enc *jsonEncoder) truncate() {
 func (enc *jsonEncoder) closeOpenNamespaces() {
 	for i := 0; i < enc.openNamespaces; i++ {
 		enc.buf.AppendByte('}')
+		if enc.duplicateKeys != nil && enc.DuplicateKeyPolicy != "" {
+			enc.duplicateKeys.closeNamespace(enc.buf.Len())
+		}
 	}
 	enc.openNamespaces = 0
-}
-
-func (enc *jsonEncoder) addKey(key string) {
-	enc.addElementSeparator()
-	enc.buf.AppendByte('"')
-	enc.safeAddString(key)
-	enc.buf.AppendByte('"')
-	enc.buf.AppendByte(':')
-	if enc.spaced {
-		enc.buf.AppendByte(' ')
-	}
 }
 
 func (enc *jsonEncoder) addElementSeparator() {

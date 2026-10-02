@@ -105,6 +105,12 @@ func (b *Buffer) Reset() {
 	b.bs = b.bs[:0]
 }
 
+// Delete removes the bytes between start and end.
+func (b *Buffer) Delete(start, end int) {
+	copy(b.bs[start:], b.bs[end:])
+	b.bs = b.bs[:len(b.bs)-(end-start)]
+}
+
 // Write implements io.Writer.
 func (b *Buffer) Write(bs []byte) (int, error) {
 	b.bs = append(b.bs, bs...)

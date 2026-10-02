@@ -356,6 +356,36 @@ type EncoderConfig struct {
 	// Configures the field separator used by the console encoder. Defaults
 	// to tab.
 	ConsoleSeparator string `json:"consoleSeparator" yaml:"consoleSeparator"`
+
+	// DuplicateKeyPolicy controls how the JSON encoder handles fields with the
+	// same key in the same object. The zero value preserves the historical
+	// behavior and writes both fields.
+	DuplicateKeyPolicy DuplicateKeyPolicy `json:"duplicateKeyPolicy,omitempty" yaml:"duplicateKeyPolicy,omitempty"`
+
+	// OnDuplicateKey is called when DuplicateKeyPolicy is set and a duplicate
+	// key is encountered.
+	OnDuplicateKey func(DuplicateKeyInfo) `json:"-" yaml:"-"`
+}
+
+// DuplicateKeyPolicy determines how the JSON encoder handles two fields with
+// the same key in the same JSON object.
+type DuplicateKeyPolicy string
+
+const (
+	// DuplicateKeyKeepFirst keeps the first value for a duplicate key.
+	DuplicateKeyKeepFirst DuplicateKeyPolicy = "first"
+	// DuplicateKeyKeepLast keeps the last value for a duplicate key.
+	DuplicateKeyKeepLast DuplicateKeyPolicy = "last"
+	// DuplicateKeyReport retains both values and reports the conflict.
+	DuplicateKeyReport DuplicateKeyPolicy = "report"
+)
+
+// DuplicateKeyInfo describes a duplicate key encountered while encoding JSON.
+type DuplicateKeyInfo struct {
+	// Path is the JSON-path-like location of the object containing the key.
+	Path string
+	// Key is the duplicate key.
+	Key string
 }
 
 // ObjectEncoder is a strongly-typed, encoding-agnostic interface for adding a
