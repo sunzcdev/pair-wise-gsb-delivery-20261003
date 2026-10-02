@@ -24,6 +24,7 @@ type Mailbox struct {
 	specialUse []imap.MailboxAttr
 	l          []*message
 	uidNext    imap.UID
+	quotaRoot  *quotaRoot
 }
 
 // NewMailbox creates a new mailbox.
@@ -34,6 +35,25 @@ func NewMailbox(name string, uidValidity uint32) *Mailbox {
 		name:        name,
 		uidNext:     1,
 	}
+}
+
+// lockMailboxes locks two distinct mailboxes in a deterministic order (by
+// mailbox name), regardless of the argument order.
+//
+// Any operation that touches two mailboxes at once (MOVE) must lock them via
+// this helper: otherwise two sessions moving in opposite directions could
+// each hold one mailbox and block forever waiting for the other.
+func lockMailboxes(a, b *Mailbox) {
+	if a == b {
+		a.mutex.Lock()
+		return
+	}
+	first, second := a, b
+	if first.name > second.name {
+		first, second = second, first
+	}
+	first.mutex.Lock()
+	second.mutex.Lock()
 }
 
 func (mbox *Mailbox) list(options *imap.ListOptions) *imap.ListData {
@@ -119,22 +139,67 @@ func (mbox *Mailbox) sizeLocked() int64 {
 	return size
 }
 
-func (mbox *Mailbox) appendLiteral(r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+func (mbox *Mailbox) appendLiteral(u *User, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
 	var buf bytes.Buffer
 	if _, err := buf.ReadFrom(r); err != nil {
 		return nil, err
 	}
+
+	// Reserve quota on the success boundary: only once the full payload has
+	// been read. The reservation is atomic with respect to other sessions,
+	// including those appending to a different mailbox sharing the root.
+	delta := quotaResourceDelta{
+		messages: 1,
+		storage:  storageUnits(int64(buf.Len())),
+	}
+	root := mbox.quotaRoot
+	if root == nil {
+		root = u.defaultQuotaRoot()
+		mbox.quotaRoot = root
+	}
+	if err := root.reserve(delta); err != nil {
+		return nil, err
+	}
+
 	return mbox.appendBytes(buf.Bytes(), options), nil
 }
 
-func (mbox *Mailbox) copyMsg(msg *message) *imap.AppendData {
-	return mbox.appendBytes(msg.buf, &imap.AppendOptions{
+// appendReserved appends an already-quota-accounted message.
+//
+// The caller is responsible for having reserved the corresponding quota on
+// the destination root (and for releasing it if the overall command fails).
+func (mbox *Mailbox) appendReserved(buf []byte, options *imap.AppendOptions) *imap.AppendData {
+	return mbox.appendBytes(buf, options)
+}
+
+// appendReservedLocked is appendReserved for callers already holding the
+// mailbox mutex.
+func (mbox *Mailbox) appendReservedLocked(buf []byte, options *imap.AppendOptions) *imap.AppendData {
+	return mbox.appendBytesLocked(buf, options)
+}
+
+func (mbox *Mailbox) copyMsgOptions(msg *message) *imap.AppendOptions {
+	return &imap.AppendOptions{
 		Time:  msg.t,
 		Flags: msg.flagList(),
-	})
+	}
+}
+
+// messageDelta returns the quota resources a single message consumes.
+func messageDelta(msg *message) quotaResourceDelta {
+	return quotaResourceDelta{
+		messages: 1,
+		storage:  storageUnits(int64(len(msg.buf))),
+	}
 }
 
 func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.AppendData {
+	mbox.mutex.Lock()
+	defer mbox.mutex.Unlock()
+	return mbox.appendBytesLocked(buf, options)
+}
+
+func (mbox *Mailbox) appendBytesLocked(buf []byte, options *imap.AppendOptions) *imap.AppendData {
 	msg := &message{
 		flags: make(map[imap.Flag]struct{}),
 		buf:   buf,
@@ -149,9 +214,6 @@ func (mbox *Mailbox) appendBytes(buf []byte, options *imap.AppendOptions) *imap.
 	for _, flag := range options.Flags {
 		msg.flags[canonicalFlag(flag)] = struct{}{}
 	}
-
-	mbox.mutex.Lock()
-	defer mbox.mutex.Unlock()
 
 	msg.uid = mbox.uidNext
 	mbox.uidNext++
@@ -246,9 +308,21 @@ func (mbox *Mailbox) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) err
 		return nil
 	}
 
+	var delta quotaResourceDelta
+	for msg := range expunged {
+		d := messageDelta(msg)
+		delta.messages += d.messages
+		delta.storage += d.storage
+	}
+
 	mbox.mutex.Lock()
 	mbox.expungeLocked(expunged)
 	mbox.mutex.Unlock()
+
+	// Only release quota once the messages have actually been removed.
+	if mbox.quotaRoot != nil {
+		mbox.quotaRoot.release(delta)
+	}
 
 	return nil
 }

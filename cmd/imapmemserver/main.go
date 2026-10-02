@@ -19,6 +19,7 @@ var (
 	tlsKey       string
 	username     string
 	password     string
+	adminListen  string
 	debug        bool
 	insecureAuth bool
 )
@@ -29,6 +30,7 @@ func main() {
 	flag.StringVar(&tlsKey, "tls-key", "", "TLS key")
 	flag.StringVar(&username, "username", "user", "Username")
 	flag.StringVar(&password, "password", "user", "Password")
+	flag.StringVar(&adminListen, "admin-listen", "", "separate listening address for the quota-administration service (empty to disable)")
 	flag.BoolVar(&debug, "debug", false, "Print all commands and responses")
 	flag.BoolVar(&insecureAuth, "insecure-auth", false, "Allow authentication without TLS")
 	flag.Parse()
@@ -104,24 +106,56 @@ func main() {
 
 		memServer.AddUser(user)
 	}
-
 	var debugWriter io.Writer
 	if debug {
 		debugWriter = os.Stdout
 	}
 
-	server := imapserver.New(&imapserver.Options{
-		NewSession: func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return memServer.NewSession(), nil, nil
-		},
-		Caps: imap.CapSet{
-			imap.CapIMAP4rev1: {},
-			imap.CapIMAP4rev2: {},
-		},
-		TLSConfig:    tlsConfig,
-		InsecureAuth: insecureAuth,
-		DebugWriter:  debugWriter,
-	})
+	caps := imap.CapSet{
+		imap.CapIMAP4rev1: {},
+		imap.CapIMAP4rev2: {},
+		imap.CapQuota:     {},
+	}
+
+	newServer := func(admin bool) *imapserver.Server {
+		var newSession func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error)
+		if admin {
+			newSession = func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+				return memServer.NewAdminSession(), nil, nil
+			}
+		} else {
+			newSession = func(conn *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+				return memServer.NewSession(), nil, nil
+			}
+		}
+		serverCaps := caps
+		if admin {
+			serverCaps = caps.Copy()
+			serverCaps[imap.CapQuotaSet] = struct{}{}
+		}
+		return imapserver.New(&imapserver.Options{
+			NewSession:   newSession,
+			Caps:         serverCaps,
+			TLSConfig:    tlsConfig,
+			InsecureAuth: insecureAuth,
+			DebugWriter:  debugWriter,
+		})
+	}
+
+	server := newServer(false)
+	if adminListen != "" {
+		adminLn, err := net.Listen("tcp", adminListen)
+		if err != nil {
+			log.Fatalf("Failed to listen on admin address: %v", err)
+		}
+		log.Printf("IMAP quota-administration server listening on %v", adminLn.Addr())
+		go func() {
+			if err := newServer(true).Serve(adminLn); err != nil {
+				log.Fatalf("admin Serve() = %v", err)
+			}
+		}()
+	}
+
 	if err := server.Serve(ln); err != nil {
 		log.Fatalf("Serve() = %v", err)
 	}

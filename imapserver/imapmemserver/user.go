@@ -18,13 +18,17 @@ type User struct {
 	mutex           sync.Mutex
 	mailboxes       map[string]*Mailbox
 	prevUidValidity uint32
+
+	quotaMutex sync.Mutex
+	quotaRoots map[string]*quotaRoot
 }
 
 func NewUser(username, password string) *User {
 	return &User{
-		username:  username,
-		password:  password,
-		mailboxes: make(map[string]*Mailbox),
+		username:   username,
+		password:   password,
+		mailboxes:  make(map[string]*Mailbox),
+		quotaRoots: make(map[string]*quotaRoot),
 	}
 }
 
@@ -118,7 +122,92 @@ func (u *User) Append(mailbox string, r imap.LiteralReader, options *imap.Append
 			Text: "No such mailbox",
 		}
 	}
-	return mbox.appendLiteral(r, options)
+	return mbox.appendLiteral(u, r, options)
+}
+
+// defaultQuotaRoot returns the quota root shared by every mailbox of the
+// user, creating it on first use.
+func (u *User) defaultQuotaRoot() *quotaRoot {
+	u.quotaMutex.Lock()
+	defer u.quotaMutex.Unlock()
+
+	root := u.quotaRoots[DefaultQuotaRoot]
+	if root == nil {
+		root = &quotaRoot{}
+		u.quotaRoots[DefaultQuotaRoot] = root
+	}
+	return root
+}
+
+// quotaRootByName returns the named quota root.
+func (u *User) quotaRootByName(name string) (*quotaRoot, error) {
+	u.quotaMutex.Lock()
+	defer u.quotaMutex.Unlock()
+
+	root := u.quotaRoots[name]
+	if root == nil {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNonExistent,
+			Text: "No such quota root",
+		}
+	}
+	return root, nil
+}
+
+// quotaResourceTypes returns the resource types enforced by the backend.
+func (u *User) quotaResourceTypes() []imap.QuotaResourceType {
+	return []imap.QuotaResourceType{imap.QuotaResourceStorage, imap.QuotaResourceMessage}
+}
+
+func (u *User) getQuota(rootName string) (*imapserver.QuotaData, error) {
+	root, err := u.quotaRootByName(rootName)
+	if err != nil {
+		return nil, err
+	}
+	return &imapserver.QuotaData{
+		Root:      rootName,
+		Resources: root.snapshot(),
+	}, nil
+}
+
+func (u *User) getQuotaRoot(mailbox string) ([]imapserver.QuotaData, error) {
+	if _, err := u.mailbox(mailbox); err != nil {
+		return nil, err
+	}
+	data, err := u.getQuota(DefaultQuotaRoot)
+	if err != nil {
+		return nil, err
+	}
+	return []imapserver.QuotaData{*data}, nil
+}
+
+// setQuota changes the limits of a quota root.
+//
+// This is an administrative operation.
+func (u *User) setQuota(rootName string, limits map[imap.QuotaResourceType]int64) error {
+	for typ := range limits {
+		switch typ {
+		case imap.QuotaResourceStorage, imap.QuotaResourceMessage:
+		default:
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeClientBug,
+				Text: "Unsupported quota resource type",
+			}
+		}
+	}
+
+	u.quotaMutex.Lock()
+	root := u.quotaRoots[rootName]
+	if root == nil {
+		root = &quotaRoot{}
+		u.quotaRoots[rootName] = root
+	}
+	u.quotaMutex.Unlock()
+
+	root.setLimits(limits)
+	return nil
 }
 
 func (u *User) Create(name string, options *imap.CreateOptions) error {
@@ -138,7 +227,9 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 	// UIDVALIDITY must change if a mailbox is deleted and re-created with the
 	// same name.
 	u.prevUidValidity++
-	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
+	mbox := NewMailbox(name, u.prevUidValidity)
+	mbox.quotaRoot = u.defaultQuotaRoot()
+	u.mailboxes[name] = mbox
 	return nil
 }
 

@@ -65,13 +65,47 @@ func (sess *UserSession) Copy(numSet imap.NumSet, destName string) (*imap.CopyDa
 		}
 	}
 
-	var sourceUIDs, destUIDs imap.UIDSet
+	// Compute the footprint first, without mutating anything.
+	var delta quotaResourceDelta
+	var msgs []*message
 	sess.mailbox.forEach(numSet, func(seqNum uint32, msg *message) {
-		appendData := dest.copyMsg(msg)
-		sourceUIDs.AddNum(msg.uid)
-		destUIDs.AddNum(appendData.UID)
+		d := messageDelta(msg)
+		delta.messages += d.messages
+		delta.storage += d.storage
+		msgs = append(msgs, msg)
 	})
 
+	if len(msgs) == 0 {
+		return &imap.CopyData{UIDValidity: dest.uidValidity}, nil
+	}
+
+	// Reserve the destination quota atomically before writing anything.
+	destRoot := dest.quotaRoot
+	if destRoot == nil {
+		destRoot = sess.user.defaultQuotaRoot()
+		dest.quotaRoot = destRoot
+	}
+	if err := destRoot.reserve(delta); err != nil {
+		return nil, err
+	}
+
+	// COPY is all-or-nothing: on a write failure, give the reservation back
+	// so that a failed operation never consumes quota.
+	success := false
+	defer func() {
+		if !success {
+			destRoot.release(delta)
+		}
+	}()
+
+	var sourceUIDs, destUIDs imap.UIDSet
+	for _, msg := range msgs {
+		appendData := dest.appendReserved(msg.buf, dest.copyMsgOptions(msg))
+		sourceUIDs.AddNum(msg.uid)
+		destUIDs.AddNum(appendData.UID)
+	}
+
+	success = true
 	return &imap.CopyData{
 		UIDValidity: dest.uidValidity,
 		SourceUIDs:  sourceUIDs,
@@ -94,18 +128,68 @@ func (sess *UserSession) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest
 		}
 	}
 
-	sess.mailbox.mutex.Lock()
-	defer sess.mailbox.mutex.Unlock()
+	srcRoot := sess.mailbox.quotaRoot
+	if srcRoot == nil {
+		srcRoot = sess.user.defaultQuotaRoot()
+		sess.mailbox.quotaRoot = srcRoot
+	}
+	destRoot := dest.quotaRoot
+	if destRoot == nil {
+		destRoot = sess.user.defaultQuotaRoot()
+		dest.quotaRoot = destRoot
+	}
 
-	var sourceUIDs, destUIDs imap.UIDSet
-	expunged := make(map[*message]struct{})
-	sess.mailbox.forEachLocked(numSet, func(seqNum uint32, msg *message) {
-		appendData := dest.copyMsg(msg)
-		sourceUIDs.AddNum(msg.uid)
-		destUIDs.AddNum(appendData.UID)
+	var (
+		delta    quotaResourceDelta
+		msgs     []*message
+		expunged = make(map[*message]struct{})
+	)
+	sess.mailbox.forEach(numSet, func(seqNum uint32, msg *message) {
+		d := messageDelta(msg)
+		delta.messages += d.messages
+		delta.storage += d.storage
+		msgs = append(msgs, msg)
 		expunged[msg] = struct{}{}
 	})
+
+	if len(msgs) == 0 {
+		return w.WriteCopyData(&imap.CopyData{UIDValidity: dest.uidValidity})
+	}
+
+	// Within the same quota root, a MOVE is a relocation: the source share is
+	// released as the destination share is consumed, so the messages are
+	// never counted twice. Across roots the destination share is reserved up
+	// front, atomically with respect to other sessions.
+	if err := moveReserve(srcRoot, destRoot, delta); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			moveRollback(srcRoot, destRoot, delta)
+		}
+	}()
+
+	// Lock both mailboxes for the relocation in a deterministic order so
+	// concurrent moves in opposite directions cannot deadlock. Holding both
+	// for the copy+expunge makes the move atomic with respect to other
+	// commands.
+	var sourceUIDs, destUIDs imap.UIDSet
+	lockMailboxes(dest, sess.mailbox.Mailbox)
+	defer dest.mutex.Unlock()
+	defer sess.mailbox.mutex.Unlock()
+	for _, msg := range msgs {
+		appendData := dest.appendReservedLocked(msg.buf, dest.copyMsgOptions(msg))
+		sourceUIDs.AddNum(msg.uid)
+		destUIDs.AddNum(appendData.UID)
+	}
 	seqNums := sess.mailbox.expungeLocked(expunged)
+
+	// The destination copy and the source removal are now both done: the
+	// move reached its success boundary, so the source share can be freed
+	// (no-op for a same-root move).
+	moveCommit(srcRoot, destRoot, delta)
+	committed = true
 
 	err = w.WriteCopyData(&imap.CopyData{
 		UIDValidity: dest.uidValidity,
@@ -138,3 +222,20 @@ func (sess *UserSession) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) 
 	}
 	return sess.mailbox.Idle(w, stop)
 }
+
+// QuotaResourceTypes implements imapserver.SessionQuota.
+func (sess *UserSession) QuotaResourceTypes() []imap.QuotaResourceType {
+	return sess.user.quotaResourceTypes()
+}
+
+// GetQuota implements imapserver.SessionQuota.
+func (sess *UserSession) GetQuota(root string) (*imapserver.QuotaData, error) {
+	return sess.user.getQuota(root)
+}
+
+// GetQuotaRoot implements imapserver.SessionQuota.
+func (sess *UserSession) GetQuotaRoot(mailbox string) ([]imapserver.QuotaData, error) {
+	return sess.user.getQuotaRoot(mailbox)
+}
+
+var _ imapserver.SessionQuota = (*UserSession)(nil)

@@ -27,6 +27,18 @@ func (s *Server) NewSession() imapserver.Session {
 	return &serverSession{server: s}
 }
 
+// NewAdminSession creates a new IMAP session with quota-administration
+// privileges.
+//
+// It authenticates against the same user accounts as NewSession: the
+// distinction is the privilege granted after authentication. A deployment
+// would expose NewAdminSession on a separate, access-controlled listener.
+// A user authenticated through such a session can issue SETQUOTA; the same
+// user on a regular session cannot.
+func (s *Server) NewAdminSession() imapserver.Session {
+	return &adminServerSession{server: s}
+}
+
 func (s *Server) user(username string) *User {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -57,5 +69,30 @@ func (sess *serverSession) Login(username, password string) error {
 		return err
 	}
 	sess.UserSession = NewUserSession(u)
+	return nil
+}
+
+type adminServerSession struct {
+	*AdminSession // may be nil
+
+	server *Server // immutable
+}
+
+func (sess *adminServerSession) Close() error {
+	if sess.AdminSession != nil {
+		return sess.AdminSession.Close()
+	}
+	return nil
+}
+
+func (sess *adminServerSession) Login(username, password string) error {
+	u := sess.server.user(username)
+	if u == nil {
+		return imapserver.ErrAuthFailed
+	}
+	if err := u.Login(username, password); err != nil {
+		return err
+	}
+	sess.AdminSession = &AdminSession{UserSession: NewUserSession(u)}
 	return nil
 }

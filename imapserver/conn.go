@@ -153,6 +153,12 @@ func (c *Conn) serve() {
 	if _, ok := c.session.(SessionUnauthenticate); !ok && caps.Has(imap.CapUnauthenticate) {
 		panic("imapserver: server advertises UNAUTHENTICATE but session doesn't support it")
 	}
+	if _, ok := c.session.(SessionQuota); !ok && caps.Has(imap.CapQuota) {
+		panic("imapserver: server advertises QUOTA but session doesn't support it")
+	}
+	if _, ok := c.session.(SessionQuotaSet); !ok && caps.Has(imap.CapQuotaSet) {
+		panic("imapserver: server advertises QUOTASET but session doesn't support it")
+	}
 
 	c.state = imap.ConnStateNotAuthenticated
 	statusType := imap.StatusResponseTypeOK
@@ -249,6 +255,12 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleUnsubscribe(dec)
 	case "STATUS":
 		err = c.handleStatus(dec)
+	case "GETQUOTA":
+		err = c.handleGetQuota(dec)
+	case "GETQUOTAROOT":
+		err = c.handleGetQuotaRoot(dec)
+	case "SETQUOTA":
+		err = c.handleSetQuota(dec)
 	case "LIST":
 		err = c.handleList(dec)
 	case "LSUB":
