@@ -3,14 +3,145 @@ package digest
 import (
 	"bytes"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"slices"
+	"strings"
 	"sync"
 )
 
 // cchal is a cached challenge and the number of times it's been used.
 type cchal struct {
-	c *Challenge
-	n int
+	c       *Challenge
+	n       int
+	origin  string
+	domains []string
+}
+
+// spaceKey identifies a Digest protection space.
+// A protection space is defined by the origin (scheme + host + port) the
+// challenge was received from and its realm, as specified by RFC 7616 3.2.
+type spaceKey struct {
+	origin string
+	realm  string
+}
+
+// originOf returns the scheme + host + port that defines the origin for url.
+// Default ports are omitted so that http://example.com and
+// http://example.com:80 are the same origin; different ports are not.
+func originOf(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port == "" {
+		return scheme + "://" + host
+	}
+	return scheme + "://" + net.JoinHostPort(host, port)
+}
+
+// newCchal caches a challenge received in response to req.
+//
+// Per RFC 7616 section 3.2, each URI in the challenge's domain directive
+// names a protection space on the server where the credentials may be used.
+// Relative URIs are resolved against the request that received the challenge.
+// Entries that resolve to a different origin are ignored: pre-sending
+// credentials to them would leak credentials to another protection space
+// (e.g. across a cross-origin redirect).
+//
+// A challenge without a domain directive applies to the entire origin.
+// RFC 7616 3.2: "If this directive is not present ... the protection space
+// consists of all URIs on the responding server." A directive whose entries
+// are all relative-to-nowhere or cross-origin, on the other hand, matches
+// nothing on this origin.
+func newCchal(req *http.Request, chal *Challenge) *cchal {
+	origin := originOf(req.URL)
+	cc := &cchal{c: chal, origin: origin}
+	if len(chal.Domain) > 0 {
+		// distinguish "directive present but nothing usable" from
+		// "directive absent" (origin-wide).
+		cc.domains = []string{}
+	}
+	seen := map[string]bool{}
+	for _, d := range chal.Domain {
+		ref, err := url.Parse(d)
+		if err != nil {
+			continue
+		}
+		u := req.URL.ResolveReference(ref)
+		// ignore domain entries that escape the original origin
+		if originOf(u) != origin {
+			continue
+		}
+		p := u.Path
+		if p == "" {
+			p = "/"
+		}
+		if !seen[p] {
+			seen[p] = true
+			cc.domains = append(cc.domains, p)
+		}
+	}
+	slices.Sort(cc.domains)
+	return cc
+}
+
+// matchesPath reports whether the domain path p covers the request path.
+// Matching is performed on path-segment boundaries: p = "/api" matches
+// "/api" and "/api/users", but not "/apix".
+func matchesPath(p, target string) bool {
+	if p == "/" || p == target || strings.HasPrefix(target, p+"/") {
+		return true
+	}
+	if strings.HasSuffix(p, "/") {
+		return strings.HasPrefix(target, p)
+	}
+	return false
+}
+
+// specificity ranks how specifically a cached challenge covers a request:
+// the longest matching domain path wins, measured by the number of its
+// non-empty path segments. An origin-wide space (no domain directive) has
+// specificity zero and is only selected when nothing more specific matches.
+func (cc *cchal) specificity(target string) (int, bool) {
+	if len(cc.domains) == 0 {
+		return 0, true
+	}
+	best := -1
+	for _, p := range cc.domains {
+		if !matchesPath(p, target) {
+			continue
+		}
+		if n := len(strings.FieldsFunc(strings.TrimPrefix(p, "/"), func(r rune) bool {
+			return r == '/'
+		})); n > best {
+			best = n
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	return best, true
+}
+
+// betterSpace reports whether candidate wins over current for a request.
+// The most specific matching path is chosen. Ties (same specificity and
+// matched-path length) are broken by realm, then origin, in ascending order
+// so selection is deterministic.
+func betterSpace(candSpec, curSpec int, candPathLen, curPathLen int, candKey, curKey spaceKey) bool {
+	if candSpec != curSpec {
+		return candSpec > curSpec
+	}
+	if candPathLen != curPathLen {
+		return candPathLen > curPathLen
+	}
+	if candKey.realm != curKey.realm {
+		return candKey.realm < curKey.realm
+	}
+	return candKey.origin < curKey.origin
 }
 
 // Transport implements http.RoundTripper
@@ -50,14 +181,18 @@ type Transport struct {
 	// unauthenticated request without draining the body. Applies only when uncached.
 	Probe bool
 
-	// cache of challenges indexed by host
-	cache   map[string]*cchal
+	// cache of challenges indexed by protection space (origin + realm)
+	cache   map[spaceKey]*cchal
 	cacheMu sync.Mutex
 }
 
-// save parses the digest challenge from the response
-// and adds it to the cache
-func (t *Transport) save(res *http.Response) error {
+// save parses the digest challenge from the response and stores it as a new
+// protection space. hadChallenge/failedKey identify the protection space
+// pre-sent on the failed request; it is invalidated when the response carries
+// no usable new challenge. The returned challenge is used for the in-flight
+// retry, even when the request path falls outside the challenge's domain
+// scope: that retry is a direct response to the challenge, not a pre-send.
+func (t *Transport) save(res *http.Response, failedKey spaceKey, hadChallenge bool) (*cchal, error) {
 	// save cookies
 	if t.Jar != nil {
 		t.Jar.SetCookies(res.Request.URL, res.Cookies())
@@ -71,20 +206,18 @@ func (t *Transport) save(res *http.Response) error {
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
 	if t.cache == nil {
-		t.cache = map[string]*cchal{}
+		t.cache = map[spaceKey]*cchal{}
 	}
-	// TODO: if the challenge contains a domain, we should be using that
-	//       to match against outgoing requests. We're currently ignoring
-	//       it and just matching the hostname. That being said, none of
-	//       the major browsers respect the domain either.
-	host := res.Request.URL.Hostname()
 	if err != nil {
-		// if save is being invoked, the existing cached challenge didn't work
-		delete(t.cache, host)
-		return err
+		// the pre-sent challenge didn't work; drop its protection space.
+		if hadChallenge {
+			delete(t.cache, failedKey)
+		}
+		return nil, err
 	}
-	t.cache[host] = &cchal{c: chal}
-	return nil
+	cc := newCchal(res.Request, chal)
+	t.cache[spaceKey{origin: cc.origin, realm: chal.Realm}] = cc
+	return cc, nil
 }
 
 // digest creates credentials from the cached challenge
@@ -103,47 +236,113 @@ func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Cred
 	return Digest(chal, opt)
 }
 
-// challenge returns a cached challenge and count for the provided request
-func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
-	t.cacheMu.Lock()
-	defer t.cacheMu.Unlock()
-	host := req.URL.Hostname()
-	cc, ok := t.cache[host]
+// lockedChallenge selects the most specific cached protection space covering
+// req. If NoReuse is set, the selected entry is consumed (deleted from the
+// cache) so it cannot be pre-sent again.
+func (t *Transport) lockedChallenge(req *http.Request) (*Challenge, int, spaceKey, bool) {
+	if t.cache == nil {
+		return nil, 0, spaceKey{}, false
+	}
+	origin := originOf(req.URL)
+	target := req.URL.Path
+	if target == "" {
+		target = "/"
+	}
+	type candidate struct {
+		key     spaceKey
+		cc      *cchal
+		spec    int
+		pathLen int
+	}
+	var best candidate
+	found := false
+	for key, cc := range t.cache {
+		// challenges are never pre-sent to another origin
+		if key.origin != origin {
+			continue
+		}
+		spec, ok := cc.specificity(target)
+		if !ok {
+			continue
+		}
+		pathLen := 0
+		for _, p := range cc.domains {
+			if matchesPath(p, target) && len(p) > pathLen {
+				pathLen = len(p)
+			}
+		}
+		if !found || betterSpace(spec, best.spec, pathLen, best.pathLen, key, best.key) {
+			best = candidate{key: key, cc: cc, spec: spec, pathLen: pathLen}
+			found = true
+		}
+	}
+	if !found {
+		return nil, 0, spaceKey{}, false
+	}
+	if t.NoReuse {
+		delete(t.cache, best.key)
+	}
+	best.cc.n++
+	return best.cc.c, best.cc.n, best.key, true
+}
+
+// lockedConsume returns the specific cached challenge for the provided
+// protection-space key, consuming it when NoReuse is set. It's used for the
+// in-flight retry directly against the just-received challenge.
+func (t *Transport) lockedConsume(key spaceKey) (*Challenge, int, bool) {
+	cc, ok := t.cache[key]
 	if !ok {
 		return nil, 0, false
 	}
 	if t.NoReuse {
-		delete(t.cache, host)
+		delete(t.cache, key)
 	}
 	cc.n++
 	return cc.c, cc.n, true
 }
 
-// prepare sets the Authorization header from a cached challenge if one exists.
-// It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// authorize builds credentials from cc and attaches them to req.
+func (t *Transport) authorize(req *http.Request, chal *Challenge, count int) error {
+	cred, err := t.digest(req, chal, count)
+	if err != nil {
+		return err
+	}
+	if cred != nil {
+		req.Header.Set("Authorization", cred.String())
+	}
+	return nil
+}
+
+// prepare sets the Authorization header from the best matching cached
+// protection space. It reports whether the caller should send a bodyless
+// probe first (Probe set, request with a body, no challenge cached yet), the
+// key of the selected protection space, and whether one was selected.
+func (t *Transport) prepare(req *http.Request) (probe bool, key spaceKey, ok bool, err error) {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
 			req.AddCookie(cookie)
 		}
 	}
-	// add auth
-	chal, count, ok := t.challenge(req)
+	// pre-send auth from the best matching cached protection space
+	t.cacheMu.Lock()
+	chal, count, key, ok := t.lockedChallenge(req)
+	t.cacheMu.Unlock()
 	if !ok {
 		// no cached challenge yet: probe bodyless first when configured
 		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+		return t.Probe && bodied, spaceKey{}, false, nil
 	}
-	cred, err := t.digest(req, chal, count)
-	if err != nil {
-		return false, err
+	return false, key, true, t.authorize(req, chal, count)
+}
+
+// addCookies attaches jar cookies for the request URL.
+func (t *Transport) addCookies(req *http.Request) {
+	if t.Jar != nil {
+		for _, cookie := range t.Jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
 	}
-	if cred != nil {
-		req.Header.Set("Authorization", cred.String())
-	}
-	return false, nil
 }
 
 // RoundTrip will try to authorize the request using a cached challenge.
@@ -165,7 +364,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
+	probe, failedKey, hadChallenge, err := t.prepare(first)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +397,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	_, _ = io.Copy(io.Discard, res.Body)
 	_ = res.Body.Close()
 	// save the challenge for future use
-	if err := t.save(res); err != nil {
+	cc, err := t.save(res, failedKey, hadChallenge)
+	if err != nil {
 		if err == ErrNoChallenge {
 			return res, nil
 		}
@@ -209,8 +409,21 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
+	t.addCookies(second)
+	// authenticate the retry directly against the challenge just received.
+	// It may be for a path outside the challenge's domain scope, but this
+	// request is what the challenge was issued in response to, so using it
+	// does not leak credentials anywhere new.
+	t.cacheMu.Lock()
+	retry, retryCount, found := t.lockedConsume(spaceKey{origin: cc.origin, realm: cc.c.Realm})
+	t.cacheMu.Unlock()
+	if !found {
+		// NoReuse consumed it during prepare, or another goroutine did:
+		// use the freshly learned challenge directly.
+		retry = cc.c
+		retryCount = 1
+	}
+	if err := t.authorize(second, retry, retryCount); err != nil {
 		return nil, err
 	}
 	return tr.RoundTrip(second)

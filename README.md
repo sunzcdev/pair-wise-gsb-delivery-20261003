@@ -131,6 +131,39 @@ func main() {
 ```
 
 
+## Protection Space Cache
+
+Learned challenges are cached per **protection space** and only pre-sent to
+requests they apply to. A protection space is identified by the request's
+origin (scheme + host + port) and the challenge's `realm`, following
+[RFC 7616](https://www.rfc-editor.org/rfc/rfc7616) §3.2. This means multiple
+services sharing a hostname on different ports, or multiple realms on the
+same origin, never share a `nonce`.
+
+The challenge's `domain` directive (RFC 7616 §3.2) scopes where credentials
+are pre-sent:
+
+- Each `domain` URI is matched against the request path on **path-segment
+  boundaries**. A domain of `/api` covers `/api` and `/api/users`, but **not**
+  `/apix`.
+- Relative `domain` URIs are resolved against the request that received the
+  challenge.
+- `domain` entries that resolve to a different origin are ignored, so a
+  cross-origin redirect never causes previously learned credentials to be
+  leaked to the new origin.
+- When several cached spaces cover a request, the one with the longest
+  matching domain path is used; ties are broken deterministically by realm,
+  then origin.
+
+When the `domain` directive is absent, RFC 7616 §3.2 says the protection
+space consists of *all* URIs on the responding server, so the challenge is
+pre-sent to every path on the same origin. A directive that is present but
+contains only cross-origin or otherwise unusable entries matches nothing.
+
+Regardless of `domain` scoping, the authenticated retry made in direct
+response to a `401` always uses the challenge that response carried — it is
+not a pre-send, so it cannot leak credentials anywhere new.
+
 ## Large Request Bodies (Probe)
 
 By default the first (unauthenticated) request already carries the body, because
@@ -209,3 +242,5 @@ func main() {
   req2.Header.Set("Authorization", cred.String())
 }
 ```
+
+
