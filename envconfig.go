@@ -19,6 +19,11 @@ import (
 // ErrInvalidSpecification indicates that a specification is of the wrong type.
 var ErrInvalidSpecification = errors.New("specification must be a struct pointer")
 
+// ErrRecursiveSpecification indicates that a specification references itself
+// through a nested pointer field. Such types cannot be expanded into a fixed
+// set of environment variables.
+var ErrRecursiveSpecification = errors.New("recursive specification: a nested pointer struct must not contain itself")
+
 var gatherRegexp = regexp.MustCompile("([^A-Z]+|[A-Z]+[^A-Z]+|[A-Z]+)")
 var acronymRegexp = regexp.MustCompile("([A-Z]+)([A-Z][^A-Z]+)")
 
@@ -50,14 +55,26 @@ func (e *ParseError) Error() string {
 
 // varInfo maintains information about the configuration variable
 type varInfo struct {
-	Name  string
-	Alt   string
-	Key   string
-	Field reflect.Value
-	Tags  reflect.StructTag
+	Name   string
+	Alt    string
+	Key    string
+	Tags   reflect.StructTag
+	Index  int
+	Owners []owner
+	Typ    reflect.Type
 }
 
-// GatherInfo gathers information about the specified struct
+// owner describes a single nested-struct hop that must be traversed to reach
+// a field. When Ptr is greater than zero the hop goes through one or more
+// pointers, which are only allocated lazily while processing.
+type owner struct {
+	Index int
+	Ptr   int
+}
+
+// gatherInfo gathers information about the specified struct without mutating
+// it. In particular it never allocates a nested pointer field; callers that
+// need to populate a leaf do so through ensureField.
 func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 	s := reflect.ValueOf(spec)
 
@@ -70,37 +87,28 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 	}
 	typeOfSpec := s.Type()
 
-	// over allocate an info array, we will extend if needed later
-	infos := make([]varInfo, 0, s.NumField())
-	for i := 0; i < s.NumField(); i++ {
-		f := s.Field(i)
-		ftype := typeOfSpec.Field(i)
-		if !f.CanSet() || isTrue(ftype.Tag.Get("ignored")) {
+	infos := make([]varInfo, 0, typeOfSpec.NumField())
+	if err := gatherFields(prefix, typeOfSpec, nil, nil, &infos); err != nil {
+		return nil, err
+	}
+	return infos, nil
+}
+
+// gatherFields walks the fields of a struct type, appending one varInfo per
+// leaf. ptrStack tracks pointer-to-struct types currently on the traversal
+// path so self-referential specifications are reported instead of looping
+// forever.
+func gatherFields(prefix string, t reflect.Type, owners []owner, ptrStack []reflect.Type, infos *[]varInfo) error {
+	for i := 0; i < t.NumField(); i++ {
+		ftype := t.Field(i)
+		if ftype.PkgPath != "" || isTrue(ftype.Tag.Get("ignored")) {
 			continue
 		}
 
-		for f.Kind() == reflect.Ptr {
-			if f.IsNil() {
-				if f.Type().Elem().Kind() != reflect.Struct {
-					// nil pointer to a non-struct: leave it alone
-					break
-				}
-				// nil pointer to struct: create a zero instance
-				f.Set(reflect.New(f.Type().Elem()))
-			}
-			f = f.Elem()
-		}
-
-		// Capture information about the config variable
-		info := varInfo{
-			Name:  ftype.Name,
-			Field: f,
-			Tags:  ftype.Tag,
-			Alt:   strings.ToUpper(ftype.Tag.Get("envconfig")),
-		}
+		alt := strings.ToUpper(ftype.Tag.Get("envconfig"))
 
 		// Default to the field name as the env var name (will be upcased)
-		info.Key = info.Name
+		key := ftype.Name
 
 		// Best effort to un-pick camel casing as separate words
 		if isTrue(ftype.Tag.Get("split_words")) {
@@ -115,38 +123,86 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 					}
 				}
 
-				info.Key = strings.Join(name, "_")
+				key = strings.Join(name, "_")
 			}
 		}
-		if info.Alt != "" {
-			info.Key = info.Alt
+		if alt != "" {
+			key = alt
 		}
 		if prefix != "" {
-			info.Key = fmt.Sprintf("%s_%s", prefix, info.Key)
+			key = fmt.Sprintf("%s_%s", prefix, key)
 		}
-		info.Key = strings.ToUpper(info.Key)
-		infos = append(infos, info)
+		key = strings.ToUpper(key)
 
-		if f.Kind() == reflect.Struct {
-			// honor Decode if present
-			if decoderFrom(f) == nil && setterFrom(f) == nil && textUnmarshaler(f) == nil && binaryUnmarshaler(f) == nil {
-				innerPrefix := prefix
-				if !ftype.Anonymous {
-					innerPrefix = info.Key
+		fieldType := ftype.Type
+		baseType := fieldType
+		ptrDepth := 0
+		for baseType.Kind() == reflect.Ptr {
+			baseType = baseType.Elem()
+			ptrDepth++
+		}
+
+		if baseType.Kind() == reflect.Struct && !implementsInterface(fieldType) {
+			// A self-referential pointer struct would be expanded forever;
+			// value-embedded structs cannot form a cycle in valid Go code.
+			var childStack []reflect.Type
+			if ptrDepth > 0 {
+				for _, seen := range ptrStack {
+					if seen == baseType {
+						return fmt.Errorf("%w: %s", ErrRecursiveSpecification, baseType)
+					}
 				}
-
-				embeddedPtr := f.Addr().Interface()
-				embeddedInfos, err := gatherInfo(innerPrefix, embeddedPtr)
-				if err != nil {
-					return nil, err
-				}
-				infos = append(infos[:len(infos)-1], embeddedInfos...)
-
-				continue
+				childStack = make([]reflect.Type, len(ptrStack)+1)
+				copy(childStack, ptrStack)
+				childStack[len(ptrStack)] = baseType
 			}
+
+			innerPrefix := prefix
+			if !ftype.Anonymous {
+				innerPrefix = key
+			}
+
+			nextOwners := make([]owner, len(owners), len(owners)+1)
+			copy(nextOwners, owners)
+			nextOwners = append(nextOwners, owner{Index: i, Ptr: ptrDepth})
+
+			if err := gatherFields(innerPrefix, baseType, nextOwners, childStack, infos); err != nil {
+				return err
+			}
+			continue
 		}
+
+		fieldOwners := make([]owner, len(owners))
+		copy(fieldOwners, owners)
+		*infos = append(*infos, varInfo{
+			Name:   ftype.Name,
+			Alt:    alt,
+			Key:    key,
+			Tags:   ftype.Tag,
+			Index:  i,
+			Owners: fieldOwners,
+			Typ:    fieldType,
+		})
 	}
-	return infos, nil
+	return nil
+}
+
+// ensureField resolves the addressable value backing a leaf, allocating each
+// pointer-to-struct ancestor on the path only when a value actually needs to
+// be stored. Sibling pointer subtrees that are not touched stay nil.
+func ensureField(spec interface{}, info varInfo) reflect.Value {
+	v := reflect.ValueOf(spec).Elem()
+	for _, o := range info.Owners {
+		f := v.Field(o.Index)
+		for d := 0; d < o.Ptr; d++ {
+			if f.IsNil() {
+				f.Set(reflect.New(f.Type().Elem()))
+			}
+			f = f.Elem()
+		}
+		v = f
+	}
+	return v.Field(info.Index)
 }
 
 // CheckDisallowed checks that no environment variables with the prefix are set
@@ -180,9 +236,37 @@ func CheckDisallowed(prefix string, spec interface{}) error {
 	return nil
 }
 
-// Process populates the specified struct based on environment variables
+// Config controls optional behavior of ProcessWith.
+type Config struct {
+	// LazyNestedPointers keeps nested pointer-to-struct fields nil unless a
+	// value actually needs to be stored in their subtree. A subtree is
+	// populated only when an environment variable is set for one of its
+	// leaves, when a leaf has an applicable default, or when a required leaf
+	// forces the ancestor objects into existence. Optional pointer subtrees
+	// that receive no value remain nil, so setting one sibling configuration
+	// does not allocate the others.
+	LazyNestedPointers bool
+}
+
+// Process populates the specified struct based on environment variables. It
+// behaves like ProcessWith with LazyNestedPointers enabled.
 func Process(prefix string, spec interface{}) error {
+	return ProcessWith(prefix, spec, Config{LazyNestedPointers: true})
+}
+
+// ProcessWith populates the specified struct based on environment variables,
+// honoring the supplied configuration.
+func ProcessWith(prefix string, spec interface{}, config Config) error {
 	infos, err := gatherInfo(prefix, spec)
+	if err != nil {
+		return err
+	}
+
+	if !config.LazyNestedPointers {
+		// Reproduce the historical behavior: eagerly instantiate every
+		// nested pointer-to-struct before looking at the environment.
+		allocateAll(infos, spec)
+	}
 
 	for _, info := range infos {
 
@@ -200,8 +284,10 @@ func Process(prefix string, spec interface{}) error {
 			value = def
 		}
 
+		hasValue := ok || def != ""
+
 		req := info.Tags.Get("required")
-		if !ok && def == "" {
+		if !hasValue {
 			if isTrue(req) {
 				key := info.Key
 				if info.Alt != "" {
@@ -212,12 +298,13 @@ func Process(prefix string, spec interface{}) error {
 			continue
 		}
 
-		err = processField(value, info.Field)
+		field := ensureField(spec, info)
+		err = processField(value, field)
 		if err != nil {
 			return &ParseError{
 				KeyName:   info.Key,
 				FieldName: info.Name,
-				TypeName:  info.Field.Type().String(),
+				TypeName:  field.Type().String(),
 				Value:     value,
 				Err:       err,
 			}
@@ -225,6 +312,42 @@ func Process(prefix string, spec interface{}) error {
 	}
 
 	return err
+}
+
+// allocateAll instantiates every pointer-to-struct ancestor across all
+// leaves, so the whole optional pointer tree exists even when no environment
+// variable targets it.
+func allocateAll(infos []varInfo, spec interface{}) {
+	v := reflect.ValueOf(spec).Elem()
+	for _, info := range infos {
+		cur := v
+		for _, o := range info.Owners {
+			f := cur.Field(o.Index)
+			for d := 0; d < o.Ptr; d++ {
+				if f.IsNil() {
+					f.Set(reflect.New(f.Type().Elem()))
+				}
+				f = f.Elem()
+			}
+			cur = f
+		}
+	}
+
+	// Historical gatherInfo also instantiated pointer leaves that point at a
+	// struct; custom-decoder struct pointers were left untouched and are
+	// handled by processField.
+	for _, info := range infos {
+		field := ensureField(spec, info)
+		for field.Kind() == reflect.Ptr {
+			if field.IsNil() {
+				if field.Type().Elem().Kind() != reflect.Struct {
+					break
+				}
+				field.Set(reflect.New(field.Type().Elem()))
+			}
+			field = field.Elem()
+		}
+	}
 }
 
 // MustProcess is the same as Process but panics if an error occurs
@@ -235,6 +358,13 @@ func MustProcess(prefix string, spec interface{}) {
 }
 
 func processField(value string, field reflect.Value) error {
+	// A nil pointer whose method set provides a decoder must be allocated
+	// first, otherwise invoking the pointer-receiver method dereferences nil.
+	for field.Kind() == reflect.Ptr && field.IsNil() && implementsInterface(field.Type()) {
+		field.Set(reflect.New(field.Type().Elem()))
+		field = field.Elem()
+	}
+
 	typ := field.Type()
 
 	decoder := decoderFrom(field)

@@ -148,6 +148,47 @@ type Specification struct {
 Envconfig won't process a field with the "ignored" tag set to "true", even if a corresponding
 environment variable is set.
 
+## Optional Nested Pointers
+
+Nested pointer-to-struct fields are allocated lazily. A pointer is only created
+when its subtree actually receives a value: when an environment variable is set
+for one of its leaves, when a leaf has an applicable `default`, or when a
+`required` leaf forces the ancestor objects into existence. Optional pointer
+subtrees that receive no value are left as `nil`, so populating one sibling
+configuration does not allocate the others.
+
+```Go
+type Config struct {
+    Database *DatabaseConfig
+    Cache    *CacheConfig
+}
+
+type DatabaseConfig struct {
+    Host string
+    Port int
+}
+
+type CacheConfig struct {
+    Addr string
+}
+```
+
+With only `MYAPP_CACHE_ADDR` set, `Config.Cache` is allocated while
+`Config.Database` stays `nil`. A `required` leaf that is missing still returns
+an error and never partially allocates its ancestors.
+
+The legacy behavior of eagerly allocating every nested pointer struct is
+available through `ProcessWith` with a `Config` that leaves
+`LazyNestedPointers` disabled:
+
+```Go
+envconfig.ProcessWith("myapp", &c, envconfig.Config{})
+```
+
+Recursive specifications (a nested pointer struct that contains itself,
+directly or indirectly) cannot be expanded into a fixed set of environment
+variables and are reported with `ErrRecursiveSpecification`.
+
 ## Supported Struct Field Types
 
 envconfig supports these struct field types:
