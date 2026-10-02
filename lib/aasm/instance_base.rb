@@ -15,6 +15,22 @@ module AASM
       @instance.aasm_write_state_without_persistence(state, @name)
     end
 
+    def with_event_context(event_name)
+      @event_context_depth ||= 0
+      outer_context = @event_context_depth.positive? ? [current_event, from_state, to_state] : nil
+      @event_context_depth += 1
+      self.current_event = event_name
+      self.from_state = current_state
+      self.to_state = nil
+
+      yield
+    ensure
+      @event_context_depth -= 1
+      if outer_context
+        self.current_event, self.from_state, self.to_state = outer_context
+      end
+    end
+
     def enter_initial_state
       state_name = determine_state_name(@instance.class.aasm(@name).initial_state)
       state_object = state_object_for_name(state_name)

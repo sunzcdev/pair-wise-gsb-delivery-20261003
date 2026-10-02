@@ -106,9 +106,11 @@ private
         if new_state_name = event.fire(self, {:may_fire => may_fire_to}, *args)
           aasm_fired(state_machine_name, event, old_state, new_state_name, options, *args, &block)
         else
+          aasm(state_machine_name).to_state = nil
           aasm_failed(state_machine_name, event_name, old_state, event.failed_callbacks)
         end
       else
+        aasm(state_machine_name).to_state = nil
         aasm_failed(state_machine_name, event_name, old_state, event.failed_callbacks)
       end
     rescue StandardError => e

@@ -125,13 +125,15 @@ module AASM
       end
 
       safely_define_method klass, "#{method_name}!", ->(*args, &block) do
-        aasm(aasm_name).current_event = :"#{name}!"
-        aasm_fire_event(aasm_name, event, {:persist => true}, *args, &block)
+        aasm(aasm_name).with_event_context(:"#{name}!") do
+          aasm_fire_event(aasm_name, event, {:persist => true}, *args, &block)
+        end
       end
 
       safely_define_method klass, method_name, ->(*args, &block) do
-        aasm(aasm_name).current_event = event
-        aasm_fire_event(aasm_name, event, {:persist => false}, *args, &block)
+        aasm(aasm_name).with_event_context(event) do
+          aasm_fire_event(aasm_name, event, {:persist => false}, *args, &block)
+        end
       end
 
       skip_instance_level_validation(event, name, aasm_name, klass)
@@ -263,12 +265,13 @@ module AASM
       method_name = namespace? ? "#{name}_#{namespace}" : name
       safely_define_method klass, "#{method_name}_without_validation!", ->(*args, &block) do
         original_config = AASM::StateMachineStore.fetch(self.class, true).machine(aasm_name).config.skip_validation_on_save
-        begin
-          AASM::StateMachineStore.fetch(self.class, true).machine(aasm_name).config.skip_validation_on_save = true unless original_config
-          aasm(aasm_name).current_event = :"#{name}!"
-          aasm_fire_event(aasm_name, event, {:persist => true}, *args, &block)
-        ensure
-          AASM::StateMachineStore.fetch(self.class, true).machine(aasm_name).config.skip_validation_on_save = original_config
+        aasm(aasm_name).with_event_context(:"#{name}!") do
+          begin
+            AASM::StateMachineStore.fetch(self.class, true).machine(aasm_name).config.skip_validation_on_save = true unless original_config
+            aasm_fire_event(aasm_name, event, {:persist => true}, *args, &block)
+          ensure
+            AASM::StateMachineStore.fetch(self.class, true).machine(aasm_name).config.skip_validation_on_save = original_config
+          end
         end
       end
     end
