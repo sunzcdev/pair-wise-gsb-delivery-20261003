@@ -282,6 +282,57 @@ func (r *Raft) liveBootstrap(configuration Configuration) error {
 	return r.processConfigurationLogEntry(&entry)
 }
 
+// candidatePriorityDelay returns how long this server should wait before
+// starting its candidacy, to give reachable higher-priority servers a chance
+// to campaign first. It returns 0 when priorities are not in use, when this
+// server is among the most preferred, or when this server is not a voter.
+// The delay is always strictly less than MaxCandidatePriorityWait. This must
+// only be called from the main thread.
+func (r *Raft) candidatePriorityDelay() time.Duration {
+	maxPriority := maxVoterPriority(r.configurations.latest)
+	myPriority, isVoter := voterPriority(r.configurations.latest, r.localID)
+	if !isVoter || maxPriority == 0 || myPriority >= maxPriority {
+		return 0
+	}
+	conf := r.config()
+	maxWait := conf.maxCandidatePriorityWait()
+	gap := uint64(maxPriority - myPriority)
+	return time.Duration(uint64(maxWait) * gap / uint64(maxPriority))
+}
+
+// shouldWithholdVote reports whether a vote (or pre-vote) for the given
+// candidate should be temporarily withheld because a higher-priority server
+// exists in the configuration and might still campaign. The withholding is
+// bounded by MaxCandidatePriorityWait: once that duration has elapsed since
+// the first withheld vote of this leaderless episode, votes are granted
+// normally again, so an unreachable preferred server cannot block elections.
+// This must only be called from the main thread, and only after all the
+// safety checks (term, one vote per term, log freshness) have passed, since
+// priority may only ever turn a grant into a temporary denial, never the
+// other way around.
+func (r *Raft) shouldWithholdVote(candidateID ServerID) bool {
+	maxPriority := maxVoterPriority(r.configurations.latest)
+	if maxPriority == 0 {
+		return false
+	}
+	candidatePriority, isVoter := voterPriority(r.configurations.latest, candidateID)
+	if !isVoter || candidatePriority >= maxPriority {
+		return false
+	}
+	conf := r.config()
+	maxWait := conf.maxCandidatePriorityWait()
+	now := time.Now()
+	if !r.priorityWaitStart.IsZero() {
+		// Once the bounded wait has expired, votes are granted normally
+		// until the window is reset by a granted vote or leader contact.
+		// It must not re-arm here: a granted pre-vote is immediately
+		// followed by the real vote request of the same candidacy.
+		return now.Sub(r.priorityWaitStart) < maxWait
+	}
+	r.priorityWaitStart = now
+	return true
+}
+
 // runCandidate runs the main loop while in the candidate state.
 func (r *Raft) runCandidate() {
 	term := r.getCurrentTerm() + 1
@@ -292,12 +343,31 @@ func (r *Raft) runCandidate() {
 	var voteCh <-chan *voteResult
 	var prevoteCh <-chan *preVoteResult
 
-	// check if pre-vote is active and that this is not a leader transfer.
-	// Leader transfer do not perform prevote by design
-	if !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {
-		prevoteCh = r.preElectSelf()
-	} else {
-		voteCh = r.electSelf()
+	startElection := func() {
+		// check if pre-vote is active and that this is not a leader transfer.
+		// Leader transfer do not perform prevote by design
+		if !r.preVoteDisabled && !r.candidateFromLeadershipTransfer.Load() {
+			prevoteCh = r.preElectSelf()
+		} else {
+			voteCh = r.electSelf()
+		}
+	}
+
+	// If candidate priorities are in use and a higher-priority server exists,
+	// briefly delay the start of our candidacy so that a reachable
+	// higher-priority server can campaign first. The delay is bounded by
+	// MaxCandidatePriorityWait, so a preferred server that is unreachable
+	// cannot block us for long. Candidacies triggered by a leadership
+	// transfer are never delayed.
+	var priorityDelayTimer <-chan time.Time
+	if !r.candidateFromLeadershipTransfer.Load() {
+		if delay := r.candidatePriorityDelay(); delay > 0 {
+			r.logger.Debug("delaying candidacy to give higher-priority servers a chance", "delay", delay)
+			priorityDelayTimer = time.After(delay)
+		}
+	}
+	if priorityDelayTimer == nil {
+		startElection()
 	}
 
 	// Make sure the leadership transfer flag is reset after each run. Having this
@@ -321,6 +391,14 @@ func (r *Raft) runCandidate() {
 		r.mainThreadSaturation.sleeping()
 
 		select {
+		case <-priorityDelayTimer:
+			r.mainThreadSaturation.working()
+			// Our bounded wait for a higher-priority server is over and
+			// none campaigned; start our own election now.
+			priorityDelayTimer = nil
+			electionTimer = randomTimeout(electionTimeout)
+			startElection()
+
 		case rpc := <-r.rpcCh:
 			r.mainThreadSaturation.working()
 			r.processRPC(rpc)
@@ -429,6 +507,15 @@ func (r *Raft) runCandidate() {
 
 		case <-electionTimer:
 			r.mainThreadSaturation.working()
+			if priorityDelayTimer != nil {
+				// The candidacy delay is additionally capped by the
+				// election timeout, so a low-priority server can never
+				// be kept from campaigning for longer than that.
+				priorityDelayTimer = nil
+				electionTimer = randomTimeout(electionTimeout)
+				startElection()
+				continue
+			}
 			// Election failed! Restart the election. We simply return,
 			// which will kick us back into runCandidate
 			r.logger.Warn("Election timeout reached, restarting election")
@@ -1599,6 +1686,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// Everything went well, set success
 	resp.Success = true
+	r.priorityWaitStart = time.Time{}
 	r.setLastContact()
 }
 
@@ -1745,6 +1833,17 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 		return
 	}
 
+	// Candidate priorities are a preference only: every safety check above
+	// (term, one vote per term, log freshness) takes precedence over them.
+	// If a higher-priority server might still campaign, temporarily withhold
+	// the vote, but never for longer than MaxCandidatePriorityWait. An
+	// explicit leadership transfer always takes precedence over priorities.
+	if !req.LeadershipTransfer && len(req.ID) > 0 && r.shouldWithholdVote(ServerID(req.ID)) {
+		r.logger.Warn("withholding vote to give a higher-priority server a chance to campaign",
+			"from", candidate)
+		return
+	}
+
 	// Persist a vote for safety
 	if err := r.persistVote(req.Term, candidateBytes); err != nil {
 		r.logger.Error("failed to persist vote", "error", err)
@@ -1752,6 +1851,7 @@ func (r *Raft) requestVote(rpc RPC, req *RequestVoteRequest) {
 	}
 
 	resp.Granted = true
+	r.priorityWaitStart = time.Time{}
 	r.setLastContact()
 }
 
@@ -1824,6 +1924,14 @@ func (r *Raft) requestPreVote(rpc RPC, req *RequestPreVoteRequest) {
 			"candidate", candidate,
 			"last-index", lastIdx,
 			"last-candidate-index", req.LastLogIndex)
+		return
+	}
+
+	// As with real votes, temporarily withhold the pre-vote from
+	// lower-priority candidates, bounded by MaxCandidatePriorityWait.
+	if r.shouldWithholdVote(candidateID) {
+		r.logger.Warn("withholding pre-vote to give a higher-priority server a chance to campaign",
+			"from", candidate)
 		return
 	}
 
@@ -1972,6 +2080,7 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 
 	r.logger.Info("Installed remote snapshot")
 	resp.Success = true
+	r.priorityWaitStart = time.Time{}
 	r.setLastContact()
 }
 
@@ -2181,11 +2290,16 @@ func (r *Raft) setState(state RaftState) {
 	}
 }
 
-// pickServer returns the follower that is most up to date and participating in quorum.
+// pickServer returns the follower that is the best leadership transfer target
+// and participating in quorum. It prefers voters with the highest candidate
+// priority and breaks ties by picking the most up to date one. The transfer
+// loop catches the target up before handing over, so preferring priority over
+// log position here is safe.
 // Because it accesses leaderstate, it should only be called from the leaderloop.
 func (r *Raft) pickServer() *Server {
 	var pick *Server
 	var current uint64
+	var pickPriority uint32
 	for _, server := range r.configurations.latest.Servers {
 		if server.ID == r.localID || server.Suffrage != Voter {
 			continue
@@ -2195,8 +2309,10 @@ func (r *Raft) pickServer() *Server {
 			continue
 		}
 		nextIdx := atomic.LoadUint64(&state.nextIndex)
-		if nextIdx > current {
+		if pick == nil || server.Priority > pickPriority ||
+			(server.Priority == pickPriority && nextIdx > current) {
 			current = nextIdx
+			pickPriority = server.Priority
 			tmp := server
 			pick = &tmp
 		}

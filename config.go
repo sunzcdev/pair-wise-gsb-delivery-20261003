@@ -235,6 +235,17 @@ type Config struct {
 	// PreVoteDisabled deactivate the pre-vote feature when set to true
 	PreVoteDisabled bool
 
+	// MaxCandidatePriorityWait bounds how long candidate priorities (see
+	// Server.Priority) are allowed to influence an election. When priorities
+	// are in use, lower-priority servers delay the start of their candidacy
+	// and voters temporarily withhold votes from lower-priority candidates,
+	// both in the hope that a reachable higher-priority server campaigns.
+	// Neither mechanism will ever delay an election by more than this
+	// duration, so an unreachable preferred server cannot block the cluster
+	// from electing someone else. The zero value defaults to ElectionTimeout.
+	// Negative values are invalid.
+	MaxCandidatePriorityWait time.Duration
+
 	// NoLegacyTelemetry allows to skip the legacy metrics to avoid duplicates.
 	// legacy metrics are those that have `_peer_name` as metric suffix instead as labels.
 	// e.g: raft_replication_heartbeat_peer0
@@ -385,5 +396,17 @@ func ValidateConfig(config *Config) error {
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
 	}
+	if config.MaxCandidatePriorityWait < 0 {
+		return fmt.Errorf("MaxCandidatePriorityWait cannot be negative")
+	}
 	return nil
+}
+
+// maxCandidatePriorityWait returns the effective bound on how long candidate
+// priorities may delay an election, applying the default if unset.
+func (config *Config) maxCandidatePriorityWait() time.Duration {
+	if config.MaxCandidatePriorityWait <= 0 {
+		return config.ElectionTimeout
+	}
+	return config.MaxCandidatePriorityWait
 }

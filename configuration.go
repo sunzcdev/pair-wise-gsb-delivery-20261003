@@ -65,6 +65,13 @@ type Server struct {
 	ID ServerID
 	// Address is its network address that a transport can contact.
 	Address ServerAddress
+	// Priority expresses how preferred this server is as a leader candidate,
+	// relative to the other servers in the configuration. Higher values are
+	// more preferred. The zero value means "no preference" and is what older
+	// servers that don't know about this field effectively use. Priority only
+	// ever influences the timing of elections; it never overrides the safety
+	// rules (term, log freshness, one vote per term, quorum).
+	Priority uint32
 }
 
 // Configuration tracks which servers are in the cluster, and whether they have
@@ -174,6 +181,30 @@ func hasVote(configuration Configuration, id ServerID) bool {
 		}
 	}
 	return false
+}
+
+// voterPriority returns the candidate priority of the server identified by
+// 'id' in the provided Configuration, and whether that server is a Voter.
+func voterPriority(configuration Configuration, id ServerID) (uint32, bool) {
+	for _, server := range configuration.Servers {
+		if server.ID == id {
+			return server.Priority, server.Suffrage == Voter
+		}
+	}
+	return 0, false
+}
+
+// maxVoterPriority returns the highest candidate priority among the Voters in
+// the provided Configuration, or 0 if there are no voters or priorities are
+// not in use.
+func maxVoterPriority(configuration Configuration) uint32 {
+	var max uint32
+	for _, server := range configuration.Servers {
+		if server.Suffrage == Voter && server.Priority > max {
+			max = server.Priority
+		}
+	}
+	return max
 }
 
 // inConfiguration returns true if the server identified by 'id' is in the

@@ -140,6 +140,13 @@ type Raft struct {
 	// on.
 	candidateFromLeadershipTransfer atomic.Bool
 
+	// priorityWaitStart records when this server first withheld a vote (or
+	// pre-vote) from a lower-priority candidate while waiting to see whether a
+	// higher-priority server campaigns. It bounds the wait via
+	// Config.MaxCandidatePriorityWait and is reset whenever a vote is granted
+	// or a leader makes contact. Only accessed from the main thread.
+	priorityWaitStart time.Time
+
 	// Stores our local server ID, used to avoid sending RPCs to ourself
 	localID ServerID
 

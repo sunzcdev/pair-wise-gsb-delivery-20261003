@@ -1,5 +1,12 @@
 # UNRELEASED
 
+FEATURES
+
+* Added optional candidate priorities (`Server.Priority`): reachable
+  higher-priority servers are preferred in elections via bounded candidacy
+  delays and vote withholding (`Config.MaxCandidatePriorityWait`), without
+  ever overriding term, log freshness, one-vote-per-term, or quorum rules.
+
 IMPROVEMENETS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)

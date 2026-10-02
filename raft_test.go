@@ -3351,9 +3351,9 @@ func TestRaft_runFollower_State_Transition(t *testing.T) {
 		fields        fields
 		expectedState RaftState
 	}{
-		{"NonVoter", fields{conf: DefaultConfig(), servers: []Server{{Nonvoter, "first", ""}}, serverID: "first"}, Follower},
-		{"Voter", fields{conf: DefaultConfig(), servers: []Server{{Voter, "first", ""}}, serverID: "first"}, Candidate},
-		{"Not in Config", fields{conf: DefaultConfig(), servers: []Server{{Voter, "second", ""}}, serverID: "first"}, Follower},
+		{"NonVoter", fields{conf: DefaultConfig(), servers: []Server{{Suffrage: Nonvoter, ID: "first"}}, serverID: "first"}, Follower},
+		{"Voter", fields{conf: DefaultConfig(), servers: []Server{{Suffrage: Voter, ID: "first"}}, serverID: "first"}, Candidate},
+		{"Not in Config", fields{conf: DefaultConfig(), servers: []Server{{Suffrage: Voter, ID: "second"}}, serverID: "first"}, Follower},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3396,7 +3396,7 @@ func TestRaft_runFollower_ReloadTimeoutConfigs(t *testing.T) {
 	conf.skipStartup = true
 
 	env := MakeRaft(t, conf, false)
-	servers := []Server{{Voter, "first", ""}}
+	servers := []Server{{Suffrage: Voter, ID: "first"}}
 	env.raft.setLatestConfiguration(Configuration{Servers: servers}, 1)
 	env.raft.setState(Follower)
 
