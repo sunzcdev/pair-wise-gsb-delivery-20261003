@@ -108,6 +108,13 @@ type Server struct {
 	// [Server.Actions] must have the flag [OptSetSymList] set.
 	SymList map[Stage][]string
 
+	// MaxPacketSize is the maximum accepted size of a packet from the MTA,
+	// including the command byte. The same limit applies to option
+	// negotiation, macros, commands and body chunks. If zero,
+	// DefaultMaxPacketSize is used. The business-level per-chunk body limit
+	// (MaxBodyChunk) is independent and remains in effect regardless.
+	MaxPacketSize uint32
+
 	listeners []net.Listener
 	closed    bool
 }
@@ -128,11 +135,12 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		session := milterSession{
-			server:   s,
-			actions:  s.Actions,
-			protocol: s.Protocol,
-			conn:     conn,
-			backend:  s.NewMilter(),
+			server:        s,
+			actions:       s.Actions,
+			protocol:      s.Protocol,
+			conn:          conn,
+			backend:       s.NewMilter(),
+			maxPacketSize: s.MaxPacketSize,
 		}
 		go session.HandleMilterCommands()
 	}

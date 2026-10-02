@@ -33,16 +33,23 @@ type ClientOptions struct {
 	WriteTimeout time.Duration
 	ActionMask   OptAction
 	ProtocolMask OptProtocol
+
+	// MaxPacketSize is the maximum accepted size of a packet read from the
+	// milter, including the command byte. The same limit applies to option
+	// negotiation responses, macros replies, action responses and body
+	// replacement packets. If zero, DefaultMaxPacketSize is used.
+	MaxPacketSize uint32
 }
 
 var defaultOptions = ClientOptions{
 	Dialer: &net.Dialer{
 		Timeout: 10 * time.Second,
 	},
-	ReadTimeout:  10 * time.Second,
-	WriteTimeout: 10 * time.Second,
-	ActionMask:   OptAddHeader | OptAddRcpt | OptChangeBody | OptChangeFrom | OptChangeHeader,
-	ProtocolMask: 0,
+	ReadTimeout:   10 * time.Second,
+	WriteTimeout:  10 * time.Second,
+	ActionMask:    OptAddHeader | OptAddRcpt | OptChangeBody | OptChangeFrom | OptChangeHeader,
+	ProtocolMask:  0,
+	MaxPacketSize: DefaultMaxPacketSize,
 }
 
 // NewDefaultClient creates a new Client object using default options.
@@ -75,6 +82,7 @@ func (c *Client) Session() (*ClientSession, error) {
 	s := &ClientSession{
 		readTimeout:           c.opts.ReadTimeout,
 		writeTimeout:          c.opts.WriteTimeout,
+		maxPacketSize:         c.opts.MaxPacketSize,
 		clientProtocolVersion: 6,
 	}
 
@@ -111,6 +119,9 @@ type ClientSession struct {
 
 	readTimeout  time.Duration
 	writeTimeout time.Duration
+	// maxPacketSize is the maximum size of a packet read from the milter,
+	// including the command byte.
+	maxPacketSize uint32
 	// Milter client version. Can be downgraded during negotiation
 	clientProtocolVersion uint32
 }
@@ -130,7 +141,7 @@ func (s *ClientSession) negotiate(actionMask OptAction, protoMask OptProtocol) e
 	if err := writePacket(s.conn, msg, s.writeTimeout); err != nil {
 		return fmt.Errorf("milter: negotiate: optneg write: %w", err)
 	}
-	msg, err := readPacket(s.conn, s.readTimeout)
+	msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize, DirectionMilter)
 	if err != nil {
 		return fmt.Errorf("milter: negotiate: optneg read: %w", err)
 	}
@@ -211,7 +222,7 @@ type Action struct {
 
 func (s *ClientSession) readAction() (*Action, error) {
 	for {
-		msg, err := readPacket(s.conn, s.readTimeout)
+		msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize, DirectionMilter)
 		if err != nil {
 			return nil, fmt.Errorf("action read: %w", err)
 		}
@@ -591,7 +602,7 @@ func parseModifyAct(msg *Message) (*ModifyAction, error) {
 
 func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action, err error) {
 	for {
-		msg, err := readPacket(s.conn, s.readTimeout)
+		msg, err := readPacket(s.conn, s.readTimeout, s.maxPacketSize, DirectionMilter)
 		if err != nil {
 			return nil, nil, fmt.Errorf("action read: %w", err)
 		}

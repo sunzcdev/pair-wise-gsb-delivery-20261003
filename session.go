@@ -24,38 +24,14 @@ type milterSession struct {
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+	// maxPacketSize is the packet size limit advertised by the server
+	// configuration.
+	maxPacketSize uint32
 }
 
 // ReadPacket reads incoming milter packet
 func (c *milterSession) ReadPacket() (*Message, error) {
-	return readPacket(c.conn, 0)
-}
-
-func readPacket(conn net.Conn, timeout time.Duration) (*Message, error) {
-	if timeout != 0 {
-		conn.SetReadDeadline(time.Now().Add(timeout))
-		defer conn.SetReadDeadline(time.Time{})
-	}
-
-	// read packet length
-	var length uint32
-	if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-		return nil, err
-	}
-
-	// read packet data
-	data := make([]byte, length)
-	if _, err := io.ReadFull(conn, data); err != nil {
-		return nil, err
-	}
-
-	// prepare response data
-	message := Message{
-		Code: data[0],
-		Data: data[1:],
-	}
-
-	return &message, nil
+	return readPacket(c.conn, 0, c.maxPacketSize, DirectionMTA)
 }
 
 // WritePacket sends a milter response packet to socket stream
@@ -113,6 +89,10 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 	case CodeConn:
 		// new connection, get hostname
 		hostname := readCString(msg.Data)
+		if len(msg.Data) < len(hostname)+2 {
+			log.Printf("Truncated CONNECT command: %d bytes", len(msg.Data))
+			return nil, errCloseSession
+		}
 		msg.Data = msg.Data[len(hostname)+1:]
 		// get protocol family
 		protocolFamily := msg.Data[0]
@@ -120,8 +100,9 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// get port
 		var port uint16
 		if protocolFamily == '4' || protocolFamily == '6' {
-			if len(msg.Data) < 2 {
-				return RespTempFail, nil
+			if len(msg.Data) < 2+1 {
+				log.Printf("Truncated CONNECT address: %d bytes", len(msg.Data))
+				return nil, errCloseSession
 			}
 			port = binary.BigEndian.Uint16(msg.Data)
 			msg.Data = msg.Data[2:]
@@ -147,7 +128,10 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		// define macros
 		m.macros = make(map[string]string)
 		// convert data to Go strings
-		data := decodeCStrings(msg.Data[1:])
+		var data []string
+		if len(msg.Data) >= 1 {
+			data = decodeCStrings(msg.Data[1:])
+		}
 		if len(data) != 0 {
 			if len(data)%2 == 1 {
 				data = append(data, "")
