@@ -4134,6 +4134,404 @@ func TestDecoder_MapFieldNameWithIgnoreUntaggedFields(t *testing.T) {
 	}
 }
 
+func TestDecoder_StrictNameMatchingExactTakesPrecedenceOverFallback(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host  string `mapstructure:"Host"`
+		Alias string
+	}
+
+	input := map[string]any{"Host": "exact"}
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName: func(mapKey, fieldName string) bool {
+			return fieldName == "Alias" && mapKey == "Host"
+		},
+		MapFieldName: func(name string) string { return name },
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	if err := decoder.Decode(input); err != nil {
+		t.Fatalf("Decode error for input %#v: %v", input, err)
+	}
+	if result.Host != "exact" || result.Alias != "" {
+		t.Fatalf("unexpected result for input %#v: %#v", input, result)
+	}
+}
+
+func TestDecoder_StrictNameMatchingExactBeatsSameFieldFallback(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host string
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName:       func(name string) string { return name },
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	if err := decoder.Decode(map[string]any{"Host": "exact", "host": "fallback"}); err != nil {
+		t.Fatalf("Decode error: %v", err)
+	}
+	if result.Host != "exact" {
+		t.Fatalf("expected exact key to win, got %q", result.Host)
+	}
+}
+
+func TestDecoder_StrictNameMatchingAmbiguousFallback(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host string
+	}
+
+	inputs := []map[string]any{
+		{"HOST": "upper", "host": "lower"},
+		{"host": "lower", "HOST": "upper"},
+	}
+	for _, typedInput := range inputs {
+		input := map[any]any{
+			"HOST": typedInput["HOST"],
+			"host": typedInput["host"],
+		}
+		var result Target
+		decoder, err := NewDecoder(&DecoderConfig{
+			Result:             &result,
+			StrictNameMatching: true,
+			MatchName:          strings.EqualFold,
+			MapFieldName:       func(name string) string { return name },
+		})
+		if err != nil {
+			t.Fatalf("NewDecoder error: %v", err)
+		}
+
+		err = decoder.Decode(input)
+		if err == nil {
+			t.Fatalf("expected ambiguity error for input %#v", input)
+		}
+
+		message := err.Error()
+		for _, want := range []string{
+			`ambiguous match for input key "HOST": Host`,
+			`ambiguous match for input key "host": Host`,
+		} {
+			if !strings.Contains(message, want) {
+				t.Fatalf("expected error to contain %q, got %q", want, message)
+			}
+		}
+		if result.Host != "" {
+			t.Fatalf("ambiguous fields must remain unset, got %#v", result)
+		}
+	}
+}
+
+func TestDecoder_StrictNameMatchingAmbiguousFallbackOrderIndependent(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host     string
+		HostName string
+	}
+
+	var firstMessage string
+	for iteration := 0; iteration < 20; iteration++ {
+		var result Target
+		decoder, err := NewDecoder(&DecoderConfig{
+			Result:             &result,
+			StrictNameMatching: true,
+			MatchName:          strings.EqualFold,
+			MapFieldName:       func(name string) string { return name },
+		})
+		if err != nil {
+			t.Fatalf("NewDecoder error: %v", err)
+		}
+
+		err = decoder.Decode(map[string]any{"HOST": iteration, "host": iteration})
+		if err == nil {
+			t.Fatal("expected ambiguity error")
+		}
+		if result.Host != "" || result.HostName != "" {
+			t.Fatalf("ambiguous fields must remain unset, got %#v", result)
+		}
+		if firstMessage == "" {
+			firstMessage = err.Error()
+			continue
+		}
+		if err.Error() != firstMessage {
+			t.Fatalf("error changed with map iteration order:\nfirst: %s\nnext:  %s", firstMessage, err.Error())
+		}
+	}
+}
+
+func TestDecoder_StrictNameMatchingAmbiguousSquashedFields(t *testing.T) {
+	t.Parallel()
+
+	type First struct {
+		Host string
+	}
+	type Second struct {
+		Host string
+	}
+	type Target struct {
+		First  `mapstructure:",squash"`
+		Second `mapstructure:",squash"`
+	}
+
+	inputs := []map[string]any{
+		{"HOST": "upper"},
+		{"host": "value"},
+	}
+	for _, input := range inputs {
+		expectedKey := "HOST"
+		if _, ok := input["host"]; ok {
+			expectedKey = "host"
+		}
+		var result Target
+		decoder, err := NewDecoder(&DecoderConfig{
+			Result:             &result,
+			ErrorUnused:        true,
+			RootName:           "root",
+			StrictNameMatching: true,
+			MatchName:          strings.EqualFold,
+			MapFieldName:       func(name string) string { return name },
+		})
+		if err != nil {
+			t.Fatalf("NewDecoder error: %v", err)
+		}
+
+		err = decoder.Decode(input)
+		if err == nil {
+			t.Fatalf("expected ambiguity error for input %#v", input)
+		}
+
+		message := err.Error()
+		for _, want := range []string{
+			`multiple fields map to external name "Host": First.Host, Second.Host`,
+			`ambiguous match for input key "root.` + expectedKey + `": First.Host, Second.Host`,
+		} {
+			if !strings.Contains(message, want) {
+				t.Fatalf("expected error to contain %q, got %q", want, message)
+			}
+		}
+		if strings.Contains(message, "has invalid keys") {
+			t.Fatalf("ambiguous keys should not also be reported as unused: %q", message)
+		}
+		if result.First.Host != "" || result.Second.Host != "" {
+			t.Fatalf("ambiguous fields must remain unset, got %#v", result)
+		}
+	}
+}
+
+func TestDecoder_StrictNameMatchingAmbiguousSquashedFieldsWithoutInput(t *testing.T) {
+	t.Parallel()
+
+	type First struct {
+		Host string
+	}
+	type Second struct {
+		Host string
+	}
+	type Target struct {
+		First  `mapstructure:",squash"`
+		Second `mapstructure:",squash"`
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		ErrorUnused:        true,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName:       func(name string) string { return name },
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	err = decoder.Decode(map[string]any{})
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	message := err.Error()
+	if !strings.Contains(message, `multiple fields map to external name "Host": First.Host, Second.Host`) {
+		t.Fatalf("unexpected error: %q", message)
+	}
+	if strings.Contains(message, "ambiguous match for input key") {
+		t.Fatalf("error should not contain input-key candidates without input: %q", message)
+	}
+	if strings.Contains(message, "invalid keys") {
+		t.Fatalf("ambiguity should not also produce invalid-key errors: %q", message)
+	}
+}
+
+func TestDecoder_StrictNameMatchingNestedAmbiguousSquashedFields(t *testing.T) {
+	t.Parallel()
+
+	type InnerA struct {
+		Host string
+	}
+	type InnerB struct {
+		Host string
+	}
+	type Middle struct {
+		InnerA `mapstructure:",squash"`
+		InnerB `mapstructure:",squash"`
+	}
+	type Target struct {
+		Middle `mapstructure:",squash"`
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName:       func(name string) string { return name },
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	err = decoder.Decode(map[string]any{"HOST": "value"})
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	for _, want := range []string{
+		`multiple fields map to external name "Host": Middle.InnerA.Host, Middle.InnerB.Host`,
+		`ambiguous match for input key "HOST": Middle.InnerA.Host, Middle.InnerB.Host`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected error to contain %q, got %q", want, err)
+		}
+	}
+}
+
+func TestDecoder_StrictNameMatchingTagPrecedence(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Explicit string `mapstructure:"host"`
+		Derived  string
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName: func(name string) string {
+			if name == "Derived" {
+				return "host"
+			}
+			return name
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	err = decoder.Decode(map[string]any{"host": "value"})
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	message := err.Error()
+	for _, want := range []string{
+		`multiple fields map to external name "host": Derived, Explicit`,
+		`ambiguous match for input key "host": Derived, Explicit`,
+	} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("expected error to contain %q, got %q", want, message)
+		}
+	}
+}
+
+func TestDecoder_StrictNameMatchingTagReplacesMapFieldName(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Tagged string `mapstructure:"host"`
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName: func(name string) string {
+			if name == "Tagged" {
+				return "never"
+			}
+			return name
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	if err := decoder.Decode(map[string]any{"host": "value"}); err != nil {
+		t.Fatalf("Decode error: %v", err)
+	}
+	if result.Tagged != "value" {
+		t.Fatalf("expected explicit tag name to be used, got %q", result.Tagged)
+	}
+}
+
+func TestDecoder_StrictNameMatchingIgnoresDashFields(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host   string
+		First  string `mapstructure:"-"`
+		Second string `mapstructure:"-"`
+	}
+
+	var result Target
+	decoder, err := NewDecoder(&DecoderConfig{
+		Result:             &result,
+		StrictNameMatching: true,
+		MatchName:          strings.EqualFold,
+		MapFieldName:       func(name string) string { return name },
+	})
+	if err != nil {
+		t.Fatalf("NewDecoder error: %v", err)
+	}
+
+	if err := decoder.Decode(map[string]any{"host": "value"}); err != nil {
+		t.Fatalf("Decode error: %v", err)
+	}
+	if result.Host != "value" || result.First != "" || result.Second != "" {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestDecoder_NameMatchingCompatibility(t *testing.T) {
+	t.Parallel()
+
+	type Target struct {
+		Host string
+	}
+
+	var result Target
+	if err := Decode(map[string]any{"HOST": "upper", "host": "lower"}, &result); err != nil {
+		t.Fatalf("Decode error: %v", err)
+	}
+	if result.Host != "upper" && result.Host != "lower" {
+		t.Fatalf("expected compatible fallback to populate one Host field, got %#v", result)
+	}
+}
+
 // Test types for Unmarshaler
 type PersonWithUnmarshaler struct {
 	Name string
