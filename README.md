@@ -545,6 +545,71 @@ _NOTE:_ `taskable.blueprint` should return a valid Blueprint class. Currently, `
 </details>
 
 <details>
+<summary>Rendering Rows For Exports</summary>
+
+
+When exporting data (for example to CSV), an object may have a collection association whose
+elements should each occupy their own row, while the parent columns are repeated onto every
+row. `render_rows` produces a flat table from a list of ordered column paths and a single
+collection association to expand. It returns the ordered column names and an array of rows;
+it never writes a file.
+
+```ruby
+class CustomerBlueprint < Blueprinter::Base
+  field :name
+end
+
+class ItemBlueprint < Blueprinter::Base
+  field :sku
+  field :quantity
+end
+
+class OrderBlueprint < Blueprinter::Base
+  field :number
+  association :customer, blueprint: CustomerBlueprint
+  association :items, blueprint: ItemBlueprint
+end
+
+OrderBlueprint.render_rows(
+  orders,
+  columns: [:number, :"customer.name", :"items.sku", :"items.quantity"],
+  collection: :items
+)
+# => {
+#      columns: ["number", "customer.name", "items.sku", "items.quantity"],
+#      rows: [
+#        ["O-1", "Acme", "A", 2],
+#        ["O-1", "Acme", "B", 1]
+#      ]
+#    }
+```
+
+Column paths use the rendered output aliases (the `name:` option), and may cross plain
+(single) object associations such as `customer.name`. The collection itself may also be
+reached through object associations, e.g. `collection: :"invoice.lines"`. Column values keep
+respecting views, `:if`/`:unless` conditions, and transformers; a hidden field produces a
+blank cell without shifting later columns. Parent fields are extracted once per object, not
+once per generated row.
+
+Paths may be given as dotted symbols/strings (`:"items.sku"`, `"items.sku"`) or arrays
+(`[:items, :sku]`). When `collection` is omitted, each object produces a single row.
+
+Because silently combining two independent collections would create a Cartesian product,
+exactly one collection may be expanded. A column path that crosses any other collection
+(either on the parent or inside the collection's elements) raises
+`Blueprinter::Errors::InvalidRowPath`. Unknown aliases raise the same error up front.
+
+Objects whose declared collection is `nil` or empty keep one row with blank collection-side
+cells by default. Pass `on_empty_collection: :omit` to leave those objects out entirely:
+
+```ruby
+OrderBlueprint.render_rows(orders, columns: columns, collection: :items,
+                           on_empty_collection: :omit)
+```
+
+</details>
+
+<details>
 <summary>Defining A Field Directly In The Blueprint</summary>
 
 

@@ -4,6 +4,7 @@ require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
 require 'blueprinter/deprecation'
+require 'blueprinter/row_renderer'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
@@ -82,6 +83,49 @@ module Blueprinter
     # @return [Hash]
     def render_as_json(object, options = {})
       build_result(object:, options:).as_json
+    end
+
+    # Renders the provided objects as a flat table suitable for exports such as CSV.
+    #
+    # Each rendered object contributes one row per element of a single, explicitly declared
+    # collection association. Parent columns are repeated onto every expanded row and their
+    # fields are extracted only once per object. Column paths use the output aliases (`:name`)
+    # of fields and associations and may cross plain (single) object associations.
+    #
+    # This method does not write any files; the caller is responsible for serializing the
+    # returned column names and rows.
+    #
+    # @param object [Object, Array] the object or objects to serialize.
+    # @param columns [Array<Symbol, String, Array>] ordered column paths. A path is a dot
+    #   separated list of output aliases, e.g. `:"customer.name"` or `:"items.sku"`. Array
+    #   paths such as `[:items, :sku]` are also accepted.
+    # @param collection [Symbol, String, Array, nil] output-alias path of the single collection
+    #   to expand. Paths crossing any other collection raise
+    #   {Blueprinter::Errors::InvalidRowPath}. When nil, each object renders as a single row.
+    # @param options [Hash]
+    # @option options [Symbol] :view Defaults to :default.
+    # @option options [Symbol] :on_empty_collection Defaults to :blank_row. Controls objects
+    #   whose declared collection is nil or empty:
+    #   - `:blank_row`: keep one row with blank collection-side cells.
+    #   - `:omit`: omit the object entirely.
+    #
+    # @example Exporting orders with one row per line item
+    #   OrderBlueprint.render_rows(
+    #     orders,
+    #     columns: [:number, :"customer.name", :"items.sku", :"items.quantity"],
+    #     collection: :items
+    #   )
+    #   # => { columns: ["number", "customer.name", "items.sku", "items.quantity"],
+    #          rows: [["O-1", "Acme", "A", 2], ["O-1", "Acme", "B", 1], ...] }
+    #
+    # @return [Hash{Symbol => Object}] `{ columns:, rows: }`
+    def render_rows(object, columns:, collection: nil, **options)
+      RowRenderer.new(
+        blueprint: self,
+        columns:,
+        collection:,
+        options:
+      ).render(object)
     end
 
     # Converts an object into a Hash representation based on provided view.
