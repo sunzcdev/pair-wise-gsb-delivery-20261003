@@ -1,4 +1,5 @@
 require "interactor/context"
+require "interactor/cancellation"
 require "interactor/error"
 require "interactor/hooks"
 require "interactor/organizer"
@@ -35,6 +36,7 @@ module Interactor
     # context - A Hash whose key/value pairs are used in initializing a new
     #           Interactor::Context object. An existing Interactor::Context may
     #           also be given. (default: {})
+    # cancellation - An optional cooperative Cancellation signal.
     #
     # Examples
     #
@@ -46,7 +48,11 @@ module Interactor
     #
     # Returns the resulting Interactor::Context after manipulation by the
     #   interactor.
-    def call(context = {})
+    def call(*args, **options)
+      context = args[0] || options
+      cancellation = options.delete(:cancellation) || args[1]
+      context = with_cancellation(context, cancellation) if cancellation
+
       new(context).tap(&:run).context
     end
 
@@ -57,6 +63,7 @@ module Interactor
     # context - A Hash whose key/value pairs are used in initializing a new
     #           Interactor::Context object. An existing Interactor::Context may
     #           also be given. (default: {})
+    # cancellation - An optional cooperative Cancellation signal.
     #
     # Examples
     #
@@ -72,8 +79,23 @@ module Interactor
     # Returns the resulting Interactor::Context after manipulation by the
     #   interactor.
     # Raises Interactor::Failure if the context is failed.
-    def call!(context = {})
+    def call!(*args, **options)
+      context = args[0] || options
+      cancellation = options.delete(:cancellation) || args[1]
+      context = with_cancellation(context, cancellation) if cancellation
+
       new(context).tap(&:run!).context
+    end
+
+    private
+
+    def with_cancellation(context, cancellation)
+      unless context.is_a?(Context)
+        context = Context.build(context)
+      end
+
+      context.cancellation = cancellation
+      context
     end
   end
 

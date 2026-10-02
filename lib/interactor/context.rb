@@ -60,6 +60,18 @@ module Interactor
       end
     end
 
+    def initialize(context = {})
+      if context.is_a?(Hash) && context.key?(:cancellation)
+        @cancellation = context[:cancellation]
+        context = context.reject { |key, _value| key == :cancellation }
+      end
+
+      super(context)
+    end
+
+    # Public: The cooperative Cancellation associated with the context, if any.
+    attr_accessor :cancellation
+
     # Public: Whether the Interactor::Context is successful. By default, a new
     # context is successful and only changes when explicitly failed.
     #
@@ -78,7 +90,20 @@ module Interactor
     #
     # Returns true by default or false if failed.
     def success?
-      !failure?
+      !failure? && !cancelled?
+    end
+
+    # Public: Whether the associated cancellation signal has been cancelled.
+    def cancelled?
+      cancellation&.cancelled? || false
+    end
+
+    # Public: Alias for American spelling.
+    alias_method :canceled?, :cancelled?
+
+    # Public: The reason recorded on the associated cancellation signal.
+    def cancellation_reason
+      cancellation&.reason
     end
 
     # Public: Whether the Interactor::Context has failed. By default, a new
@@ -182,6 +207,14 @@ module Interactor
       @called ||= []
     end
 
+    def _organizer_depth
+      @organizer_depth ||= 0
+    end
+
+    def _organizer_depth=(depth)
+      @organizer_depth = depth
+    end
+
     # Internal: Support for ruby 3.0 pattern matching
     #
     # Examples
@@ -205,7 +238,8 @@ module Interactor
     def deconstruct_keys(keys)
       to_h.merge(
         success: success?,
-        failure: failure?
+        failure: failure?,
+        cancelled: cancelled?
       )
     end
   end

@@ -74,6 +74,38 @@ context.fail!
 context.success? # => false
 ```
 
+#### Cancelling an Organizer
+
+An organizer can be given a cooperative cancellation signal. Cancellation is
+checked only at safe boundaries: before a step begins, after a step completes,
+and before the next step begins. A step that is already running is not
+interrupted.
+
+```ruby
+cancellation = Interactor::Cancellation.new
+PlaceOrder.call(order_params, cancellation: cancellation)
+```
+
+A running step may cancel the shared signal and provide a reason:
+
+```ruby
+context.cancellation.cancel("client disconnected")
+```
+
+Cancellation is separate from failure. A cancelled context is neither
+successful nor failed, retains its cancellation reason, and rolls back completed
+steps in reverse order.
+
+```ruby
+result.cancelled?         # => true
+result.failure?           # => false
+result.success?           # => false
+result.cancellation_reason # => "client disconnected"
+```
+
+Nested organizers share the same signal through the context. A fresh signal is
+required for a later call that should not start cancelled.
+
 #### Dealing with Failure
 
 `context.fail!` always throws an exception of type `Interactor::Failure`.

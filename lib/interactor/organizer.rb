@@ -76,8 +76,33 @@ module Interactor
       # Returns nothing.
       def call
         self.class.organized.each do |interactor|
+          return if context.cancelled?
           interactor.call!(context)
+          return if context.cancelled?
         end
+      end
+
+      def run!
+        cancelled = false
+        nested = context._organizer_depth.positive?
+        context._organizer_depth += 1
+
+        begin
+          run_around_hooks do
+            run_before_hooks
+            call
+            cancelled = context.cancelled?
+            context.called!(self) unless cancelled
+            run_after_hooks unless cancelled
+          end
+        rescue
+          context.rollback!
+          raise
+        ensure
+          context._organizer_depth -= 1
+        end
+
+        context.rollback! if cancelled && !nested
       end
     end
   end

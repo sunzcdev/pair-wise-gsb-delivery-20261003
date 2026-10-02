@@ -56,6 +56,41 @@ module Interactor
       end
     end
 
+    describe "#cancelled?" do
+      it "is false when no cancellation is present" do
+        context = Context.build
+
+        expect(context).not_to be_cancelled
+      end
+
+      it "is true when the cancellation is active" do
+        cancellation = Cancellation.cancel("abandoned")
+        context = Context.build(cancellation: cancellation)
+
+        expect(context).to be_cancelled
+        expect(context.cancellation_reason).to eq("abandoned")
+      end
+
+      it "keeps the signal out of business data" do
+        cancellation = Cancellation.new
+        context = Context.build(foo: "bar", cancellation: cancellation)
+
+        expect(context.to_h).to eq(foo: "bar")
+        expect(context.cancellation).to eq(cancellation)
+      end
+    end
+
+    describe "#success?" do
+      it "is false when cancelled but not failed" do
+        cancellation = Cancellation.cancel
+        context = Context.build(cancellation: cancellation)
+
+        expect(context).not_to be_success
+        expect(context).not_to be_failure
+        expect(context).to be_cancelled
+      end
+    end
+
     describe "#fail!" do
       let(:context) { Context.build(foo: "bar") }
 

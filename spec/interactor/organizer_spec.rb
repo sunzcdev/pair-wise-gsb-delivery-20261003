@@ -40,6 +40,7 @@ module Interactor
 
       before do
         allow(instance).to receive(:context) { context }
+        allow(context).to receive(:cancelled?) { false }
         allow(organizer).to receive(:organized) {
           [interactor2, interactor3, interactor4]
         }
@@ -49,6 +50,25 @@ module Interactor
         expect(interactor2).to receive(:call!).once.with(context).ordered
         expect(interactor3).to receive(:call!).once.with(context).ordered
         expect(interactor4).to receive(:call!).once.with(context).ordered
+
+        instance.call
+      end
+
+      it "checks cancellation before the first interactor" do
+        allow(context).to receive(:cancelled?) { true }
+
+        expect(interactor2).not_to receive(:call!)
+
+        instance.call
+      end
+
+      it "checks cancellation after a completed interactor" do
+        allow(interactor2).to receive(:call!) do
+          allow(context).to receive(:cancelled?) { true }
+        end
+
+        expect(interactor3).not_to receive(:call!)
+        expect(interactor4).not_to receive(:call!)
 
         instance.call
       end
