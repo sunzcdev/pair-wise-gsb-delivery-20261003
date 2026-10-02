@@ -80,16 +80,30 @@ func (s State) String() string {
 // This can be used, for example, to ignore context cancellations or
 // other errors that should not affect the circuit breaker state.
 // If IsExcluded is nil, no requests are excluded.
+//
+// Now returns the current time. If Now is nil, time.Now is used.
+// It can be overridden to drive the circuit breaker with a controllable clock.
+//
+// LeaseExpiryAsFailure determines how a leased permission obtained through
+// TwoStepCircuitBreaker.AllowWithLease is accounted for when its lease deadline
+// expires before the caller completes it.
+// If LeaseExpiryAsFailure is false, the expired permission is merely abandoned:
+// its half-open probe slot and request count are released without affecting the
+// other counters or the state.
+// If LeaseExpiryAsFailure is true, the expired permission is settled as a failure,
+// which can trip the breaker in the closed state and reopens it in the half-open state.
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	BucketPeriod  time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
-	IsExcluded    func(err error) bool
+	Name                 string
+	MaxRequests          uint32
+	Interval             time.Duration
+	BucketPeriod         time.Duration
+	Timeout              time.Duration
+	ReadyToTrip          func(counts Counts) bool
+	OnStateChange        func(name string, from State, to State)
+	IsSuccessful         func(err error) bool
+	IsExcluded           func(err error) bool
+	Now                  func() time.Time
+	LeaseExpiryAsFailure bool
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
@@ -104,12 +118,16 @@ type CircuitBreaker[T any] struct {
 	isExcluded    func(err error) bool
 	onStateChange func(name string, from State, to State)
 
+	now                  func() time.Time
+	leaseExpiryAsFailure bool
+
 	mutex      sync.Mutex
 	state      State
 	generation uint64
 	counts     *rollingCounts
 	start      time.Time
 	expiry     time.Time
+	leases     map[*lease]struct{}
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -166,7 +184,15 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 		cb.isExcluded = st.IsExcluded
 	}
 
-	cb.toNewGeneration(time.Now())
+	if st.Now == nil {
+		cb.now = time.Now
+	} else {
+		cb.now = st.Now
+	}
+	cb.leaseExpiryAsFailure = st.LeaseExpiryAsFailure
+	cb.leases = make(map[*lease]struct{})
+
+	cb.toNewGeneration(cb.now())
 
 	return cb
 }
@@ -196,7 +222,7 @@ func (cb *CircuitBreaker[T]) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.now()
 	state, _, _ := cb.currentState(now)
 	return state
 }
@@ -215,7 +241,7 @@ func (cb *CircuitBreaker[T]) Counts() Counts {
 // If a panic occurs in the request, the CircuitBreaker handles it as an error
 // and causes the same panic again.
 func (cb *CircuitBreaker[T]) Execute(req func() (T, error)) (T, error) {
-	generation, age, err := cb.beforeRequest()
+	permit, err := cb.acquireLease(0)
 	if err != nil {
 		var defaultValue T
 		return defaultValue, err
@@ -224,52 +250,115 @@ func (cb *CircuitBreaker[T]) Execute(req func() (T, error)) (T, error) {
 	defer func() {
 		e := recover()
 		if e != nil {
-			cb.afterRequest(generation, age, fmt.Errorf("%v", e))
+			cb.settleLease(permit, fmt.Errorf("%v", e))
 			panic(e)
 		}
 	}()
 
 	result, err := req()
-	cb.afterRequest(generation, age, err)
+	cb.settleLease(permit, err)
 	return result, err
 }
 
-func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
+// lease tracks a permission that has been granted to a request and that has
+// not been settled yet. It bounds the number of in-flight probes in the
+// half-open state and lets their slots be released when a deadline expires.
+type lease struct {
+	generation uint64
+	age        uint64
+	deadline   time.Time
+}
+
+// acquireLease checks whether a new request can proceed and, if so, registers
+// an in-flight lease for it. A non-positive ttl grants a lease without a deadline.
+func (cb *CircuitBreaker[T]) acquireLease(ttl time.Duration) (*lease, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.now()
 	state, generation, age := cb.currentState(now)
 
 	if state == StateOpen {
-		return generation, age, ErrOpenState
+		return nil, ErrOpenState
 	} else if state == StateHalfOpen && cb.counts.validRequests() >= cb.maxRequests {
-		return generation, age, ErrTooManyRequests
+		return nil, ErrTooManyRequests
 	}
 
+	permit := &lease{
+		generation: generation,
+		age:        age,
+	}
+	if ttl > 0 {
+		permit.deadline = now.Add(ttl)
+	}
+	cb.leases[permit] = struct{}{}
 	cb.counts.onRequest()
-	return generation, age, nil
+	return permit, nil
 }
 
-func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error) {
+// settleLease records the outcome of a leased request. It is a no-op when the
+// lease has already been settled or abandoned, has expired, or belongs to an
+// old generation, so a late callback can never affect the new generation.
+func (cb *CircuitBreaker[T]) settleLease(permit *lease, err error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.now()
 	state, generation, _ := cb.currentState(now)
-	if generation != previous {
+	if _, ok := cb.leases[permit]; !ok || generation != permit.generation {
 		return
 	}
+	delete(cb.leases, permit)
 
 	if cb.isExcluded(err) {
-		cb.onExclusion(age)
+		cb.onExclusion(permit.age)
 		return
 	}
 
 	if cb.isSuccessful(err) {
-		cb.onSuccess(state, age, now)
+		cb.onSuccess(state, permit.age, now)
 	} else {
-		cb.onFailure(state, age, now)
+		cb.onFailure(state, permit.age, now)
+	}
+}
+
+// abandonLease releases a leased request without recording an outcome. The
+// half-open probe slot is freed and the request count is rolled back.
+// It is a no-op for leases that no longer belong to the current generation.
+func (cb *CircuitBreaker[T]) abandonLease(permit *lease) {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	now := cb.now()
+	_, generation, _ := cb.currentState(now)
+	if _, ok := cb.leases[permit]; !ok || generation != permit.generation {
+		return
+	}
+
+	delete(cb.leases, permit)
+	cb.counts.abandonRequest(permit.age)
+}
+
+// sweepLeases drops leases from old generations and releases leases whose
+// deadline has passed. Expired leases are settled as a failure or merely
+// abandoned according to LeaseExpiryAsFailure.
+func (cb *CircuitBreaker[T]) sweepLeases(now time.Time) {
+	for permit := range cb.leases {
+		if permit.generation != cb.generation {
+			delete(cb.leases, permit)
+			continue
+		}
+
+		if permit.deadline.IsZero() || permit.deadline.After(now) {
+			continue
+		}
+
+		delete(cb.leases, permit)
+		if cb.leaseExpiryAsFailure {
+			cb.onFailure(cb.state, permit.age, now)
+		} else {
+			cb.counts.abandonRequest(permit.age)
+		}
 	}
 }
 
@@ -302,6 +391,8 @@ func (cb *CircuitBreaker[T]) onExclusion(age uint64) {
 }
 
 func (cb *CircuitBreaker[T]) currentState(now time.Time) (State, uint64, uint64) {
+	cb.sweepLeases(now)
+
 	switch cb.state {
 	case StateClosed:
 		if !cb.expiry.IsZero() && cb.expiry.Before(now) {
@@ -349,6 +440,7 @@ func (cb *CircuitBreaker[T]) toNewGeneration(now time.Time) {
 	cb.generation++
 	cb.start = now
 	cb.counts.clear()
+	clear(cb.leases)
 
 	var zero time.Time
 	switch cb.state {

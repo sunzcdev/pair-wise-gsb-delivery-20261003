@@ -17,6 +17,12 @@ func (c *Counts) onRequest() {
 	c.Requests++
 }
 
+func (c *Counts) abandonRequest() {
+	if c.Requests > 0 {
+		c.Requests--
+	}
+}
+
 func (c *Counts) onSuccess() {
 	c.TotalSuccesses++
 	c.ConsecutiveSuccesses++
@@ -79,6 +85,22 @@ func (rc *rollingCounts) current() uint64 {
 func (rc *rollingCounts) onRequest() {
 	rc.Counts.onRequest()
 	rc.buckets[rc.current()].onRequest()
+}
+
+func (rc *rollingCounts) abandonRequest(age uint64) {
+	rc.Counts.abandonRequest()
+
+	if len(rc.buckets) == 0 {
+		return
+	}
+
+	if age > rc.age {
+		return
+	}
+
+	if rc.age-age < uint64(len(rc.buckets)) {
+		rc.buckets[rc.index(age)].abandonRequest()
+	}
 }
 
 func (rc *rollingCounts) onSuccess(age uint64) {
