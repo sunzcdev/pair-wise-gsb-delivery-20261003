@@ -714,3 +714,75 @@ func TestRetryAfterNegativeDurationWaitsZero(t *testing.T) {
 		t.Errorf("waits = %v, want a single wait of 0", tm.starts)
 	}
 }
+
+// runFailures drives Retry through failures failed attempts, then succeeds, and
+// returns the backoff waits it scheduled.
+func runFailures(t *testing.T, b BackOff, failures int, opts ...RetryOption) []time.Duration {
+	t.Helper()
+	tm := &spyTimer{}
+	calls := 0
+	opts = append([]RetryOption{WithBackOff(b), withTimer(tm)}, opts...)
+	_, err := Retry(context.Background(), func() (int, error) {
+		calls++
+		if calls > failures {
+			return 1, nil
+		}
+		return 0, errors.New("boom")
+	}, opts...)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return tm.starts
+}
+
+func TestRetryContinuesRestoredBackOff(t *testing.T) {
+	// A task pauses after the second failure; resuming a restored copy of its
+	// backoff policy must schedule the same waits as resuming the original.
+	const failuresBeforeSnapshot = 2
+	const failuresAfterRestore = 3
+
+	continuous := NewExponentialBackOff()
+	runFailures(t, continuous, failuresBeforeSnapshot)
+	snapshot := continuous.Snapshot() // pause here
+	want := runFailures(t, continuous, failuresAfterRestore, WithBackOffReset(false))
+
+	restored := NewExponentialBackOff()
+	if err := restored.Restore(snapshot); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	got := runFailures(t, restored, failuresAfterRestore, WithBackOffReset(false))
+
+	if len(got) != len(want) {
+		t.Fatalf("restored waits = %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("wait %d after restore = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRetryResetsBackOffByDefault(t *testing.T) {
+	// Without WithBackOffReset(false), Retry resets the policy before the first
+	// attempt: a restored position is restarted, not continued.
+	paused := NewExponentialBackOff()
+	runFailures(t, paused, 2)
+	snapshot := paused.Snapshot()
+
+	restored := NewExponentialBackOff()
+	if err := restored.Restore(snapshot); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	runFailures(t, restored, 2)
+
+	// Two failures from a fresh start grow the interval exactly as far as a
+	// never-restored policy's, not further from the restored position.
+	fresh := NewExponentialBackOff()
+	fresh.Reset()
+	fresh.NextBackOff()
+	fresh.NextBackOff()
+	if restored.currentInterval != fresh.currentInterval {
+		t.Errorf("current interval after default reset = %v, want %v (restarted, not continued)",
+			restored.currentInterval, fresh.currentInterval)
+	}
+}
