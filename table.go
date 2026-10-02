@@ -1,7 +1,26 @@
 package lua
 
+import "errors"
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
+
+// errReadonlyTable is panicked when a mutating method is called directly on
+// a frozen LTable. Code paths reachable from Lua scripts are guarded earlier
+// and raise a catchable Lua error instead.
+var errReadonlyTable = errors.New("attempt to update a readonly table")
+
+// Readonly returns true if this table has been frozen by the Go host
+// (see LState.FreezeTable and LState.FreezeTableRecursive).
+func (tb *LTable) Readonly() bool {
+	return tb.readonly
+}
+
+func (tb *LTable) checkReadonly() {
+	if tb.readonly {
+		panic(errReadonlyTable)
+	}
+}
 
 type lValueArraySorter struct {
 	L      *LState
@@ -64,6 +83,7 @@ func (tb *LTable) Len() int {
 
 // Append appends a given LValue to this LTable.
 func (tb *LTable) Append(value LValue) {
+	tb.checkReadonly()
 	if value == LNil {
 		return
 	}
@@ -85,6 +105,7 @@ func (tb *LTable) Append(value LValue) {
 
 // Insert inserts a given LValue at position `i` in this table.
 func (tb *LTable) Insert(i int, value LValue) {
+	tb.checkReadonly()
 	if tb.array == nil {
 		tb.array = make([]LValue, 0, defaultArrayCap)
 	}
@@ -117,6 +138,7 @@ func (tb *LTable) MaxN() int {
 
 // Remove removes from this table the element at a given position.
 func (tb *LTable) Remove(pos int) LValue {
+	tb.checkReadonly()
 	if tb.array == nil {
 		return LNil
 	}
@@ -145,6 +167,7 @@ func (tb *LTable) Remove(pos int) LValue {
 // It is recommended to use `RawSetString` or `RawSetInt` for performance
 // if you already know the given LValue is a string or number.
 func (tb *LTable) RawSet(key LValue, value LValue) {
+	tb.checkReadonly()
 	switch v := key.(type) {
 	case LNumber:
 		if isArrayKey(v) {
@@ -176,6 +199,7 @@ func (tb *LTable) RawSet(key LValue, value LValue) {
 
 // RawSetInt sets a given LValue at a position `key` without the __newindex metamethod.
 func (tb *LTable) RawSetInt(key int, value LValue) {
+	tb.checkReadonly()
 	if key < 1 || key >= MaxArrayIndex {
 		tb.RawSetH(LNumber(key), value)
 		return
@@ -200,6 +224,7 @@ func (tb *LTable) RawSetInt(key int, value LValue) {
 
 // RawSetString sets a given LValue to a given string index without the __newindex metamethod.
 func (tb *LTable) RawSetString(key string, value LValue) {
+	tb.checkReadonly()
 	if tb.strdict == nil {
 		tb.strdict = make(map[string]LValue, defaultHashCap)
 	}
@@ -223,6 +248,7 @@ func (tb *LTable) RawSetString(key string, value LValue) {
 
 // RawSetH sets a given LValue to a given index without the __newindex metamethod.
 func (tb *LTable) RawSetH(key LValue, value LValue) {
+	tb.checkReadonly()
 	if s, ok := key.(LString); ok {
 		tb.RawSetString(string(s), value)
 		return

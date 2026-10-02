@@ -2,6 +2,7 @@ package lua
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1160,6 +1161,9 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 		tb, istable := curobj.(*LTable)
 		if istable {
 			if tb.RawGetString(key) != LNil {
+				if tb.Readonly() {
+					ls.RaiseError("attempt to update a readonly table")
+				}
 				tb.RawSetString(key, value)
 				return
 			}
@@ -1168,6 +1172,9 @@ func (ls *LState) setFieldString(obj LValue, key string, value LValue) {
 		if metaindex == LNil {
 			if !istable {
 				ls.RaiseError("attempt to index a non-table object(%v) with key '%s'", curobj.Type().String(), key)
+			}
+			if tb.Readonly() {
+				ls.RaiseError("attempt to update a readonly table")
 			}
 			tb.RawSetString(key, value)
 			return
@@ -1700,6 +1707,9 @@ func (ls *LState) GetTable(obj LValue, key LValue) LValue {
 }
 
 func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
+	if tb.Readonly() {
+		ls.RaiseError("attempt to update a readonly table")
+	}
 	if n, ok := key.(LNumber); ok && math.IsNaN(float64(n)) {
 		ls.RaiseError("table index is NaN")
 	} else if key == LNil {
@@ -1709,7 +1719,55 @@ func (ls *LState) RawSet(tb *LTable, key LValue, value LValue) {
 }
 
 func (ls *LState) RawSetInt(tb *LTable, key int, value LValue) {
+	if tb.Readonly() {
+		ls.RaiseError("attempt to update a readonly table")
+	}
 	tb.RawSetInt(key, value)
+}
+
+// FreezeTable marks the given table as readonly. Once frozen, any attempt to
+// modify the table's contents (Lua assignments, rawset, table.insert/remove,
+// RawSet and friends) raises an error, while reads and iteration keep working.
+// Only the given table is frozen; nested tables are left untouched.
+// Note that this does not make an LState safe for concurrent use by multiple
+// goroutines.
+func (ls *LState) FreezeTable(tb *LTable) {
+	tb.readonly = true
+}
+
+// FreezeTableRecursive marks the given table and every table reachable
+// through its values as readonly (see FreezeTable). Cycles and subtables
+// shared between several parents are supported; each table is visited once.
+// Non-table values are treated as opaque leaves and are always allowed.
+//
+// A table that carries a metatable is not supported by the recursive freeze:
+// if any table in the graph has a metatable, an error is returned and no
+// table in the graph is frozen (the operation is all-or-nothing).
+func (ls *LState) FreezeTableRecursive(tb *LTable) error {
+	seen := make(map[*LTable]struct{})
+	order := []*LTable{}
+	stack := []*LTable{tb}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if _, ok := seen[cur]; ok {
+			continue
+		}
+		seen[cur] = struct{}{}
+		if cur.Metatable != LNil {
+			return errors.New("lua: cannot freeze a table graph containing a table with a metatable")
+		}
+		order = append(order, cur)
+		cur.ForEach(func(_ LValue, value LValue) {
+			if sub, ok := value.(*LTable); ok {
+				stack = append(stack, sub)
+			}
+		})
+	}
+	for _, frozen := range order {
+		frozen.readonly = true
+	}
+	return nil
 }
 
 func (ls *LState) SetField(obj LValue, key string, value LValue) {

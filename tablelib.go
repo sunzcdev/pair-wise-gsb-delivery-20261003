@@ -21,6 +21,9 @@ var tableFuncs = map[string]LGFunction{
 
 func tableSort(L *LState) int {
 	tbl := L.CheckTable(1)
+	if tbl.Readonly() {
+		L.RaiseError("attempt to update a readonly table")
+	}
 	sorter := lValueArraySorter{L, nil, tbl.array}
 	if L.GetTop() != 1 {
 		sorter.Fn = L.CheckFunction(2)
@@ -41,6 +44,9 @@ func tableMaxN(L *LState) int {
 
 func tableRemove(L *LState) int {
 	tbl := L.CheckTable(1)
+	if tbl.Readonly() {
+		L.RaiseError("attempt to update a readonly table")
+	}
 	if L.GetTop() == 1 {
 		L.Push(tbl.Remove(-1))
 	} else {
@@ -84,6 +90,9 @@ func tableConcat(L *LState) int {
 
 func tableInsert(L *LState) int {
 	tbl := L.CheckTable(1)
+	if tbl.Readonly() {
+		L.RaiseError("attempt to update a readonly table")
+	}
 	nargs := L.GetTop()
 	if nargs == 1 {
 		L.RaiseError("wrong number of arguments")

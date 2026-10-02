@@ -2064,6 +2064,9 @@ func init() {
 			}
 			offset := (C - 1) * FieldsPerFlush
 			table := reg.Get(RA).(*LTable)
+			if table.Readonly() {
+				L.RaiseError("attempt to update a readonly table")
+			}
 			nelem := B
 			if B == 0 {
 				nelem = reg.Top() - RA - 1
