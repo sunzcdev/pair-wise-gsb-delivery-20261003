@@ -427,6 +427,69 @@ func TestClientResendInflightMessagesWriteFailure(t *testing.T) {
 	require.Equal(t, 1, cl.State.Inflight.Len())
 }
 
+func TestClientResendInflightMessagesOrder(t *testing.T) {
+	cl, r, w := newTestClient()
+
+	newPublish := func(id uint16, created int64) packets.Packet {
+		return packets.Packet{
+			FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 1},
+			TopicName:   "a/b/c",
+			Payload:     []byte("hello mochi"),
+			PacketID:    id,
+			Created:     created,
+		}
+	}
+
+	// Created=65536 truncates to 0 as uint16, so a truncated comparison
+	// would resend it before the older 65535 message.
+	cl.State.Inflight.Set(newPublish(2, 65536))
+	cl.State.Inflight.Set(newPublish(1, 65535))
+	// Messages created within the same second resend in a stable order.
+	cl.State.Inflight.Set(newPublish(4, 65536))
+	cl.State.Inflight.Set(newPublish(3, 65536))
+
+	// Simulate session takeover: recovery happens from a cloned queue.
+	cl.State.Inflight = cl.State.Inflight.Clone()
+
+	go func() {
+		err := cl.ResendInflightMessages(true)
+		require.NoError(t, err)
+		time.Sleep(time.Millisecond)
+		_ = w.Close()
+	}()
+
+	buf, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, []uint16{1, 2, 3, 4}, decodeResentPacketIDs(t, buf))
+}
+
+func decodeResentPacketIDs(t *testing.T, buf []byte) []uint16 {
+	t.Helper()
+
+	ids := []uint16{}
+	br := bytes.NewReader(buf)
+	for br.Len() > 0 {
+		hb, err := br.ReadByte()
+		require.NoError(t, err)
+
+		fh := new(packets.FixedHeader)
+		require.NoError(t, fh.Decode(hb))
+
+		remaining, _, err := packets.DecodeLength(br)
+		require.NoError(t, err)
+
+		body := make([]byte, remaining)
+		_, err = io.ReadFull(br, body)
+		require.NoError(t, err)
+
+		pk := packets.Packet{FixedHeader: *fh}
+		require.NoError(t, pk.PublishDecode(body))
+		ids = append(ids, pk.PacketID)
+	}
+
+	return ids
+}
+
 func TestClientResendInflightMessagesNoMessages(t *testing.T) {
 	cl, _, _ := newTestClient()
 	err := cl.ResendInflightMessages(true)
