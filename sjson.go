@@ -3,6 +3,7 @@ package sjson
 
 import (
 	jsongo "encoding/json"
+	"fmt"
 	"sort"
 	"strconv"
 	"unsafe"
@@ -427,19 +428,18 @@ func isOptimisticPath(path string) bool {
 //
 // A path is a series of keys separated by a dot.
 //
-//  {
-//    "name": {"first": "Tom", "last": "Anderson"},
-//    "age":37,
-//    "children": ["Sara","Alex","Jack"],
-//    "friends": [
-//      {"first": "James", "last": "Murphy"},
-//      {"first": "Roger", "last": "Craig"}
-//    ]
-//  }
-//  "name.last"          >> "Anderson"
-//  "age"                >> 37
-//  "children.1"         >> "Alex"
-//
+//	{
+//	  "name": {"first": "Tom", "last": "Anderson"},
+//	  "age":37,
+//	  "children": ["Sara","Alex","Jack"],
+//	  "friends": [
+//	    {"first": "James", "last": "Murphy"},
+//	    {"first": "Roger", "last": "Craig"}
+//	  ]
+//	}
+//	"name.last"          >> "Anderson"
+//	"age"                >> 37
+//	"children.1"         >> "Alex"
 func Set(json, path string, value interface{}) (string, error) {
 	return SetOptions(json, path, value, nil)
 }
@@ -744,4 +744,161 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 		return json, nil
 	}
 	return res, err
+}
+
+// Operation type values for use with UpdateOp.
+const (
+	// OpSet sets the marshaled value of OpValue at OpPath, like Set.
+	OpSet = "set"
+	// OpSetRaw sets the raw json in OpRaw at OpPath, like SetRaw.
+	OpSetRaw = "setRaw"
+	// OpDelete deletes the value at OpPath, like Delete.
+	OpDelete = "delete"
+	// OpCheck checks the value at OpPath against the current intermediate
+	// result of the batch, without modifying anything.
+	OpCheck = "check"
+)
+
+// UpdateOp is a single operation performed by Update.
+//
+// The Op field must be one of OpSet, OpSetRaw, OpDelete, or OpCheck.
+//
+// For OpSet, OpValue is marshaled to json and assigned to OpPath.
+// For OpSetRaw, OpRaw is used as a raw block of json.
+// For OpDelete, OpPath is removed from the document.
+//
+// For OpCheck the current intermediate result is inspected at OpPath:
+//
+//   - When OpMissing is true, the path must not exist.
+//   - Otherwise the path must exist and its raw json must equal OpRaw.
+//
+// A check treats a missing path and an explicit json null differently:
+// a null value is a present value whose raw form is "null".
+type UpdateOp struct {
+	Op      string
+	Path    string
+	Value   interface{}
+	Raw     string
+	Missing bool
+}
+
+// UpdateError reports that a batch update failed at a specific operation.
+// OpIndex is the zero-based index of the failed operation within the batch.
+type UpdateError struct {
+	OpIndex int
+	Op      UpdateOp
+	Err     error
+}
+
+func (err *UpdateError) Error() string {
+	return fmt.Sprintf("update operation %d (%s) failed: %v",
+		err.OpIndex, err.Op.Op, err.Err)
+}
+
+// Unwrap returns the underlying error.
+func (err *UpdateError) Unwrap() error {
+	return err.Err
+}
+
+// Update applies multiple set, setRaw, delete, and check operations to json
+// in the given order. The operations are delivered atomically: if any
+// operation fails, json is returned unchanged and an error carrying the
+// zero-based operation index is returned.
+func Update(json string, ops ...UpdateOp) (string, error) {
+	return UpdateOptions(json, nil, ops...)
+}
+
+// UpdateBytes is the []byte version of Update.
+func UpdateBytes(json []byte, ops ...UpdateOp) ([]byte, error) {
+	return UpdateBytesOptions(json, nil, ops...)
+}
+
+// UpdateOptions is the Options version of Update.
+func UpdateOptions(json string, opts *Options, ops ...UpdateOp) (string, error) {
+	if opts != nil && opts.ReplaceInPlace {
+		// it's not safe to replace bytes in-place for strings.
+		// copy the Options and set options.ReplaceInPlace to false.
+		nopts := *opts
+		opts = &nopts
+		opts.ReplaceInPlace = false
+	}
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := UpdateBytesOptions(jsonb, opts, ops...)
+	if err != nil {
+		return json, err
+	}
+	return string(res), nil
+}
+
+// UpdateBytesOptions applies a batch of operations to json in order.
+//
+// The input json is never mutated until every operation succeeds. Even with
+// ReplaceInPlace enabled, a failed batch leaves the original input bytes
+// untouched; a successful batch may reuse the input slice's backing array.
+func UpdateBytesOptions(json []byte, opts *Options, ops ...UpdateOp) ([]byte, error) {
+	// Never let an individual operation mutate the input in place while
+	// the batch may still fail. The fast allocation paths are still used;
+	// ReplaceInPlace is applied once, only after every operation succeeds.
+	var loopOpts *Options
+	if opts != nil {
+		nopts := *opts
+		nopts.ReplaceInPlace = false
+		loopOpts = &nopts
+	}
+	cur := json
+	for i := range ops {
+		op := ops[i]
+		var res []byte
+		var err error
+		switch op.Op {
+		case OpSet:
+			res, err = SetBytesOptions(cur, op.Path, op.Value, loopOpts)
+		case OpSetRaw:
+			res, err = SetRawBytesOptions(cur, op.Path, []byte(op.Raw), loopOpts)
+		case OpDelete:
+			res, err = DeleteBytesOptions(cur, op.Path, loopOpts)
+		case OpCheck:
+			err = checkUpdate(cur, op)
+			if err == nil {
+				continue
+			}
+		default:
+			err = &errorType{"unknown operation type '" + op.Op + "'"}
+		}
+		if err != nil {
+			return json, &UpdateError{OpIndex: i, Op: op, Err: err}
+		}
+		cur = res
+	}
+	if opts != nil && opts.ReplaceInPlace && opts.Optimistic &&
+		cap(json) >= len(cur) && len(cur) > 0 {
+		n := len(cur)
+		copy(json[:cap(json)], cur)
+		return json[:n], nil
+	}
+	return cur, nil
+}
+
+func checkUpdate(json []byte, op UpdateOp) error {
+	if op.Path == "" {
+		return &errorType{"path cannot be empty"}
+	}
+	res := gjson.GetBytes(json, op.Path)
+	exists := res.Exists()
+	if op.Missing {
+		if exists {
+			return &errorType{"path '" + op.Path + "' exists"}
+		}
+		return nil
+	}
+	if !exists {
+		return &errorType{"path '" + op.Path + "' does not exist"}
+	}
+	if res.Raw != op.Raw {
+		return &errorType{"check mismatch at '" + op.Path + "': expected " +
+			op.Raw + ", got " + res.Raw}
+	}
+	return nil
 }

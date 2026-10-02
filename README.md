@@ -213,6 +213,37 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Batch updates
+-------------
+Apply multiple `set`, `setRaw`, `delete`, and `check` operations in order
+with `Update`. Operations see the intermediate result of the ones before
+them, and the document is changed only when every operation succeeds.
+
+```go
+value, err := sjson.Update(`{"name":{"last":"Anderson"},"age":37}`,
+	sjson.UpdateOp{Op: sjson.OpSet, Path: "name.first", Value: "Sara"},
+	sjson.UpdateOp{Op: sjson.OpSetRaw, Path: "tags", Raw: `["go","json"]`},
+	sjson.UpdateOp{Op: sjson.OpCheck, Path: "age", Raw: "37"},
+	sjson.UpdateOp{Op: sjson.OpDelete, Path: "age"},
+)
+println(value)
+println(err)
+
+// Output:
+// {"name":{"last":"Anderson","first":"Sara"},"tags":["go","json"]}
+// <nil>
+```
+
+A check either requires a path to be missing (`Missing: true`) or requires
+the raw value at the path to equal `Raw`. A missing path and an explicit
+json `null` are not the same thing: `null` is a present value with raw form
+`null`.
+
+If any operation fails the input is returned unchanged, and the error is an
+`*sjson.UpdateError` whose `OpIndex` is the zero-based index of the failed
+operation. Even with `ReplaceInPlace` enabled, a failed batch never mutates
+the input bytes; a successful batch may still reuse the input slice.
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
