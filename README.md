@@ -35,6 +35,38 @@ This implementation allows for creating HyperLogLog sketches with arbitrary prec
 * Default (2^14 registers): 16 KB
 * Maximum (2^18 registers): 256 KB
 
+## Hash Domains
+
+Registers only make sense relative to the hash function that produced them.
+`Insert` pins that hash to MetroHash64 with seed 1337; callers that feed
+pre-hashed values with `InsertHash` and a custom algorithm or seed used to
+share a type that could not tell two hash domains apart, and merging such
+sketches silently mixed unrelated register values.
+
+`DomainSketch` wraps a `Sketch` with a `HashConfig`: an algorithm name, a
+seed, and a caller chosen domain tag. `NewDomainSketch` records the domain,
+`Merge` rejects sketches whose domain differs, and `MarshalBinary` writes the
+algorithm, seed and tag alongside the registers. The hash function itself is
+a pointer and is never serialized; the reading side reconstructs the sketch
+with `UnmarshalDomainBinary` and supplies the matching config:
+
+```go
+cfg := hyperloglog.MetroHashConfig(1337, "login-events")
+sk, _ := hyperloglog.NewDomainSketch(14, true, cfg)
+
+data, _ := sk.MarshalBinary()
+
+// On another process, with the same algorithm, seed and domain tag.
+restored, err := hyperloglog.UnmarshalDomainBinary(data, hyperloglog.MetroHashConfig(1337, "login-events"))
+```
+
+Callers with their own hash use `CustomHashConfig`. A non default config must
+carry a non empty domain tag. Plain binary written by older versions records
+no domain: load it with `LegacyDomainSketch`, which marks the data as an
+unspecified domain. Such sketches merge with each other but never with a
+declared domain, since an unknown hash cannot be assumed equal to a known
+one.
+
 Users can choose the precision that best fits their use case, balancing memory usage against estimation accuracy.
 
 ## Note

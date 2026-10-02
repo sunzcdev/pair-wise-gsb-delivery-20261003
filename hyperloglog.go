@@ -186,6 +186,12 @@ func (sk *Sketch) insert(i uint32, r uint8) { sk.regs[i] = max(r, sk.regs[i]) }
 func (sk *Sketch) Insert(e []byte) { sk.InsertHash(hash(e)) }
 
 // InsertHash adds a uniformly distributed 64-bit hash to sk.
+//
+// The raw Sketch records no hash domain: it cannot tell which algorithm, seed
+// or namespace a value came from, and Merge only compares precision. Callers
+// that use a custom hash or their own seed need DomainSketch, which attaches a
+// HashConfig, requires the domain to be declared, and rejects merges across
+// domains. Values inserted here stay unmarked.
 func (sk *Sketch) InsertHash(x uint64) {
 	if sk.p == 0 {
 		*sk = *New()

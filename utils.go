@@ -40,5 +40,5 @@ func bextr32(v uint32, start, length uint8) uint32 {
 }
 
 func hash(e []byte) uint64 {
-	return metro.Hash64(e, 1337)
+	return metro.Hash64(e, defaultHashSeed)
 }

@@ -113,3 +113,53 @@ func Example_insertHash() {
 	// Output:
 	// Estimated unique elements: 3
 }
+
+// Example_domainSketch shows keeping custom-hash data inside a declared hash
+// domain and checking the domain on merge, across a serialization boundary.
+func Example_domainSketch() {
+	cfg := MetroHashConfig(42, "logins")
+
+	first, err := NewDomainSketch(14, true, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for i := range 50 {
+		first.Insert(fmt.Appendf(nil, "user-%d", i))
+	}
+
+	data, err := first.MarshalBinary()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Another process supplies the matching config; the hash function itself
+	// is not part of the encoding.
+	restored, err := UnmarshalDomainBinary(data, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	second, err := NewDomainSketch(14, true, cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for i := range 50 {
+		second.Insert(fmt.Appendf(nil, "user-%d", i+25))
+	}
+
+	if err := second.Merge(restored); err != nil {
+		log.Fatal(err)
+	}
+
+	otherSeed, err := NewDomainSketch(14, true, MetroHashConfig(99, "logins"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = second.Merge(otherSeed)
+	fmt.Println(err != nil)
+	fmt.Printf("Merged estimate: %d\n", second.Estimate())
+
+	// Output:
+	// true
+	// Merged estimate: 75
+}
