@@ -27,15 +27,20 @@ You can configure `CircuitBreaker` using the struct `Settings`:
 
 ```go
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	BucketPeriod  time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
-	IsExcluded    func(err error) bool
+	Name                  string
+	MaxRequests           uint32
+	Interval              time.Duration
+	BucketPeriod          time.Duration
+	Timeout               time.Duration
+	ReadyToTrip           func(counts Counts) bool
+	OnStateChange         func(name string, from State, to State)
+	IsSuccessful          func(err error) bool
+	IsExcluded            func(err error) bool
+	Clock                 gobreaker.Clock
+	SlowCallThreshold     time.Duration
+	SlowCallRatio         float64
+	MinSampleRequests     uint32
+	SlowSuccessInHalfOpen bool
 }
 ```
 
@@ -76,7 +81,38 @@ type Settings struct {
   the request is neither counted as a success nor as a failure.
   This can be used, for example, to ignore context cancellations or
   other errors that should not affect the circuit breaker state.
+  Excluded requests are also excluded from the denominator of every ratio
+  decision (the failure ratio in `ReadyToTrip` and the slow-call ratio).
   If `IsExcluded` is nil, no requests are excluded.
+
+- `Clock` is the source of time used for bucket boundaries, the open-state
+  timeout and request latency. If `Clock` is nil, the system clock
+  (`time.Now`) is used. Request latency is the elapsed time between the
+  `Clock.Now` reading at request start and the one at request completion;
+  with the system clock these readings carry Go's monotonic clock, so
+  latency is unaffected by wall-clock adjustments. Each request is
+  attributed to the bucket that was current when it started, so requests
+  that complete in a later bucket (including across bucket boundaries)
+  remain consistent with the request slot reserved at start time.
+
+- `SlowCallThreshold` marks a request as slow when its latency is strictly
+  greater than the threshold. If `SlowCallThreshold` is less than or equal
+  to 0, slow-call detection is disabled.
+
+- `SlowCallRatio` and `MinSampleRequests` add an independent trip condition
+  in the closed state: after every non-excluded request completes, the
+  breaker opens when the number of admitted non-excluded requests
+  (`Requests - TotalExclusions`, the same denominator as the failure ratio)
+  is at least `MinSampleRequests` and the proportion of slow requests
+  (`TotalSlow / non-excluded requests`) is at least `SlowCallRatio`, a
+  value in the range (0, 1]. This is evaluated in addition to
+  `ReadyToTrip`; the existing error/success-rate decision is unchanged, and
+  either condition can open the breaker.
+
+- `SlowSuccessInHalfOpen` controls half-open behavior. By default a slow
+  success still counts toward the consecutive successes needed to close the
+  breaker. When true, a slow success in the half-open state re-opens the
+  breaker immediately, like a failure.
 
 The struct `Counts` holds the numbers of requests and their successes/failures/exclusions:
 
@@ -86,6 +122,7 @@ type Counts struct {
 	TotalSuccesses       uint32
 	TotalFailures        uint32
 	TotalExclusions      uint32
+	TotalSlow            uint32
 	ConsecutiveSuccesses uint32
 	ConsecutiveFailures  uint32
 }

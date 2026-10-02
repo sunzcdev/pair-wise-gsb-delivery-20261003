@@ -12,25 +12,25 @@ func TestCountsMethods(t *testing.T) {
 	counts.onRequest()
 	assert.Equal(t, Counts{Requests: 1}, counts)
 
-	counts.onSuccess()
+	counts.onSuccess(false)
 	assert.Equal(t, Counts{Requests: 1, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, counts)
 
 	counts.onRequest()
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, counts)
 
-	counts.onSuccess()
+	counts.onSuccess(false)
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 2, ConsecutiveSuccesses: 2}, counts)
 
 	counts.onRequest()
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 2, ConsecutiveSuccesses: 2}, counts)
 
-	counts.onFailure()
+	counts.onFailure(false)
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 2, TotalFailures: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, counts)
 
 	counts.onRequest()
 	assert.Equal(t, Counts{Requests: 4, TotalSuccesses: 2, TotalFailures: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, counts)
 
-	counts.onFailure()
+	counts.onFailure(false)
 	assert.Equal(t, Counts{Requests: 4, TotalSuccesses: 2, TotalFailures: 2, ConsecutiveSuccesses: 0, ConsecutiveFailures: 2}, counts)
 
 	counts.onRequest()
@@ -112,7 +112,7 @@ func TestRollingCountsMethods(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 1}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
 
-	rc.onSuccess(0)
+	rc.onSuccess(0, false)
 	assert.Equal(t, Counts{Requests: 1, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 1, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
@@ -122,7 +122,7 @@ func TestRollingCountsMethods(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
 
-	rc.onFailure(0)
+	rc.onFailure(0, false)
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
@@ -132,7 +132,7 @@ func TestRollingCountsMethods(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
 
-	rc.onSuccess(0)
+	rc.onSuccess(0, false)
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 2, TotalFailures: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 2, TotalFailures: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{}, rc.buckets[rc.index(1)])
@@ -158,7 +158,7 @@ func TestRollingCountsMethods(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 4, TotalSuccesses: 2, TotalFailures: 1, TotalExclusions: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{Requests: 1}, rc.buckets[rc.index(1)])
 
-	rc.onSuccess(1)
+	rc.onSuccess(1, false)
 	assert.Equal(t, Counts{Requests: 5, TotalSuccesses: 3, TotalFailures: 1, TotalExclusions: 1, ConsecutiveSuccesses: 2, ConsecutiveFailures: 0}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 4, TotalSuccesses: 2, TotalFailures: 1, TotalExclusions: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.buckets[rc.index(0)])
 	assert.Equal(t, Counts{Requests: 1, TotalSuccesses: 1, ConsecutiveSuccesses: 1}, rc.buckets[rc.index(1)])
@@ -180,9 +180,9 @@ func TestRollingCountsGrow(t *testing.T) {
 	rc := newRollingCounts(2)
 
 	rc.onRequest()
-	rc.onSuccess(0)
+	rc.onSuccess(0, false)
 	rc.onRequest()
-	rc.onFailure(0)
+	rc.onFailure(0, false)
 	rc.onRequest()
 	rc.onExclusion(0)
 
@@ -211,9 +211,9 @@ func TestRollingCountsGrow(t *testing.T) {
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
 
 	rc.onRequest()
-	rc.onSuccess(0)
+	rc.onSuccess(0, false)
 	rc.onRequest()
-	rc.onFailure(0)
+	rc.onFailure(0, false)
 	rc.onRequest()
 	rc.onExclusion(0)
 
@@ -223,9 +223,9 @@ func TestRollingCountsGrow(t *testing.T) {
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
 
 	rc.onRequest()
-	rc.onSuccess(3)
+	rc.onSuccess(3, false)
 	rc.onRequest()
-	rc.onFailure(3)
+	rc.onFailure(3, false)
 	rc.onRequest()
 	rc.onExclusion(3)
 
@@ -235,9 +235,9 @@ func TestRollingCountsGrow(t *testing.T) {
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
 
 	rc.onRequest()
-	rc.onSuccess(1)
+	rc.onSuccess(1, false)
 	rc.onRequest()
-	rc.onFailure(1)
+	rc.onFailure(1, false)
 	rc.onRequest()
 	rc.onExclusion(1)
 
@@ -247,9 +247,9 @@ func TestRollingCountsGrow(t *testing.T) {
 	assert.Equal(t, Counts{TotalSuccesses: 1, TotalFailures: 1, TotalExclusions: 1, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.bucketAt(1))
 
 	rc.onRequest()
-	rc.onSuccess(2)
+	rc.onSuccess(2, false)
 	rc.onRequest()
-	rc.onFailure(2)
+	rc.onFailure(2, false)
 	rc.onRequest()
 	rc.onExclusion(2)
 
@@ -277,7 +277,7 @@ func TestRollingCountsBucketAt(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 1}, rc.bucketAt(0))
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
 
-	rc.onFailure(0)
+	rc.onFailure(0, false)
 	assert.Equal(t, Counts{Requests: 1, TotalFailures: 1, ConsecutiveFailures: 1}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 1, TotalFailures: 1, ConsecutiveFailures: 1}, rc.bucketAt(0))
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
@@ -287,7 +287,7 @@ func TestRollingCountsBucketAt(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 2, TotalFailures: 1, ConsecutiveFailures: 1}, rc.bucketAt(2))
 	assert.Equal(t, Counts{}, rc.bucketAt(3))
 
-	rc.onSuccess(0)
+	rc.onSuccess(0, false)
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 2, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.bucketAt(-2))
 	assert.Equal(t, Counts{}, rc.bucketAt(-3))
@@ -297,7 +297,7 @@ func TestRollingCountsBucketAt(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 1, ConsecutiveSuccesses: 1, ConsecutiveFailures: 0}, rc.bucketAt(0))
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
 
-	rc.onFailure(0)
+	rc.onFailure(0, false)
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 2, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 2, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.bucketAt(0))
 	assert.Equal(t, Counts{}, rc.bucketAt(1))
@@ -313,7 +313,7 @@ func TestRollingCountsBucketAt(t *testing.T) {
 	assert.Equal(t, Counts{Requests: 1}, rc.bucketAt(0))
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 2, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.bucketAt(1))
 
-	rc.onFailure(1)
+	rc.onFailure(1, false)
 	assert.Equal(t, Counts{Requests: 4, TotalSuccesses: 1, TotalFailures: 3, ConsecutiveSuccesses: 0, ConsecutiveFailures: 2}, rc.Counts)
 	assert.Equal(t, Counts{Requests: 1, TotalFailures: 1, ConsecutiveFailures: 1}, rc.bucketAt(0))
 	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 1, TotalFailures: 2, ConsecutiveSuccesses: 0, ConsecutiveFailures: 1}, rc.bucketAt(1))

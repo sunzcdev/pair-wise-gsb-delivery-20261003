@@ -9,6 +9,7 @@ type Counts struct {
 	TotalSuccesses       uint32
 	TotalFailures        uint32
 	TotalExclusions      uint32
+	TotalSlow            uint32
 	ConsecutiveSuccesses uint32
 	ConsecutiveFailures  uint32
 }
@@ -17,22 +18,32 @@ func (c *Counts) onRequest() {
 	c.Requests++
 }
 
-func (c *Counts) onSuccess() {
+func (c *Counts) onSuccess(slow bool) {
 	c.TotalSuccesses++
 	c.ConsecutiveSuccesses++
 	c.ConsecutiveFailures = 0
+	if slow {
+		c.TotalSlow++
+	}
 }
 
-func (c *Counts) onFailure() {
+func (c *Counts) onFailure(slow bool) {
 	c.TotalFailures++
 	c.ConsecutiveFailures++
 	c.ConsecutiveSuccesses = 0
+	if slow {
+		c.TotalSlow++
+	}
 }
 
 func (c *Counts) onExclusion() {
 	c.TotalExclusions++
 }
 
+// validRequests returns the number of admitted requests that are not excluded.
+// IsExcluded requests are subtracted consistently here and in every ratio
+// decision (failure ratio as well as slow-call ratio), so they never enter
+// the denominator.
 func (c *Counts) validRequests() uint32 {
 	if c.Requests < c.TotalExclusions {
 		return 0
@@ -45,6 +56,7 @@ func (c *Counts) clear() {
 	c.TotalSuccesses = 0
 	c.TotalFailures = 0
 	c.TotalExclusions = 0
+	c.TotalSlow = 0
 	c.ConsecutiveSuccesses = 0
 	c.ConsecutiveFailures = 0
 }
@@ -81,25 +93,25 @@ func (rc *rollingCounts) onRequest() {
 	rc.buckets[rc.current()].onRequest()
 }
 
-func (rc *rollingCounts) onSuccess(age uint64) {
+func (rc *rollingCounts) onSuccess(age uint64, slow bool) {
 	if age > rc.age {
 		return
 	}
 
 	if rc.age-age < uint64(len(rc.buckets)) {
-		rc.Counts.onSuccess()
-		rc.buckets[rc.index(age)].onSuccess()
+		rc.Counts.onSuccess(slow)
+		rc.buckets[rc.index(age)].onSuccess(slow)
 	}
 }
 
-func (rc *rollingCounts) onFailure(age uint64) {
+func (rc *rollingCounts) onFailure(age uint64, slow bool) {
 	if age > rc.age {
 		return
 	}
 
 	if rc.age-age < uint64(len(rc.buckets)) {
-		rc.Counts.onFailure()
-		rc.buckets[rc.index(age)].onFailure()
+		rc.Counts.onFailure(slow)
+		rc.buckets[rc.index(age)].onFailure(slow)
 	}
 }
 
@@ -186,6 +198,12 @@ func (rc *rollingCounts) subtract(oldest uint64) {
 		rc.TotalFailures -= bucket.TotalFailures
 	} else {
 		rc.TotalFailures = 0
+	}
+
+	if rc.TotalSlow > bucket.TotalSlow {
+		rc.TotalSlow -= bucket.TotalSlow
+	} else {
+		rc.TotalSlow = 0
 	}
 
 	if rc.TotalExclusions > bucket.TotalExclusions {

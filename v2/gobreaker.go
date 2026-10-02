@@ -79,30 +79,77 @@ func (s State) String() string {
 // the request is neither counted as a success nor as a failure.
 // This can be used, for example, to ignore context cancellations or
 // other errors that should not affect the circuit breaker state.
+// Excluded requests are also excluded from the denominator of every ratio
+// decision (failure ratio and slow-call ratio): they increment Requests and
+// TotalExclusions only.
 // If IsExcluded is nil, no requests are excluded.
+//
+// Clock is the source of time used by the CircuitBreaker for bucket
+// boundaries, the open-state timeout and request latency.
+// If Clock is nil, the system clock (time.Now) is used.
+// Latency is measured by subtracting the request-start time from the
+// request-completion time; both values come from Clock and, with the system
+// clock, carry Go's monotonic reading.
+//
+// SlowCallThreshold marks a request as slow when its latency, measured from
+// request start to request completion, is strictly greater than the threshold.
+// Each request is attributed to the bucket that was current when the request
+// started, so a request that completes in a later bucket still lands in its
+// start bucket together with the Requests slot reserved for it.
+// If SlowCallThreshold is less than or equal to 0, slow-call detection is
+// disabled and the remaining slow-call settings are ignored.
+//
+// SlowCallRatio, together with MinSampleRequests, defines an additional
+// independent trip condition in the closed state: after every non-excluded
+// request completes, the breaker opens when the number of admitted
+// non-excluded requests (Requests minus TotalExclusions, the same
+// denominator used for the failure ratio) is at least MinSampleRequests and
+// the proportion of slow requests is at least
+// SlowCallRatio. SlowCallRatio is in the range (0, 1]; values outside that
+// range disable ratio-based tripping even when SlowCallThreshold is set
+// (slow requests are still counted in Counts.TotalSlow).
+// The existing error/success-rate decision (ReadyToTrip) is evaluated as
+// well and remains in force: the breaker opens when either condition fires.
+//
+// SlowSuccessInHalfOpen controls half-open behavior. By default a slow
+// successful request is treated as a success (it counts toward the
+// consecutive successes required to close the breaker). When true, a slow
+// successful request is treated like a failure in the half-open state and
+// immediately re-opens the breaker. Failures in the half-open state always
+// re-open the breaker regardless of this setting.
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	BucketPeriod  time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
-	IsExcluded    func(err error) bool
+	Name                  string
+	MaxRequests           uint32
+	Interval              time.Duration
+	BucketPeriod          time.Duration
+	Timeout               time.Duration
+	ReadyToTrip           func(counts Counts) bool
+	OnStateChange         func(name string, from State, to State)
+	IsSuccessful          func(err error) bool
+	IsExcluded            func(err error) bool
+	Clock                 Clock
+	SlowCallThreshold     time.Duration
+	SlowCallRatio         float64
+	MinSampleRequests     uint32
+	SlowSuccessInHalfOpen bool
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker[T any] struct {
-	name          string
-	maxRequests   uint32
-	interval      time.Duration
-	bucketPeriod  time.Duration
-	timeout       time.Duration
-	readyToTrip   func(counts Counts) bool
-	isSuccessful  func(err error) bool
-	isExcluded    func(err error) bool
-	onStateChange func(name string, from State, to State)
+	name                  string
+	maxRequests           uint32
+	interval              time.Duration
+	bucketPeriod          time.Duration
+	timeout               time.Duration
+	readyToTrip           func(counts Counts) bool
+	isSuccessful          func(err error) bool
+	isExcluded            func(err error) bool
+	onStateChange         func(name string, from State, to State)
+	clock                 Clock
+	slowCallThreshold     time.Duration
+	slowCallRatio         float64
+	minSampleRequests     uint32
+	slowSuccessInHalfOpen bool
 
 	mutex      sync.Mutex
 	state      State
@@ -118,6 +165,16 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
+	cb.slowCallThreshold = st.SlowCallThreshold
+	cb.slowCallRatio = st.SlowCallRatio
+	cb.minSampleRequests = st.MinSampleRequests
+	cb.slowSuccessInHalfOpen = st.SlowSuccessInHalfOpen
+
+	if st.Clock == nil {
+		cb.clock = defaultClock
+	} else {
+		cb.clock = st.Clock
+	}
 
 	if st.MaxRequests == 0 {
 		cb.maxRequests = 1
@@ -166,7 +223,7 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 		cb.isExcluded = st.IsExcluded
 	}
 
-	cb.toNewGeneration(time.Now())
+	cb.toNewGeneration(cb.clock.Now())
 
 	return cb
 }
@@ -186,6 +243,27 @@ func defaultIsExcluded(_ error) bool {
 	return false
 }
 
+func (cb *CircuitBreaker[T]) isSlow(latency time.Duration) bool {
+	return cb.slowCallThreshold > 0 && latency > cb.slowCallThreshold
+}
+
+// readyToTripOnSlow is the independent slow-call-ratio trip condition used
+// in the closed state, alongside ReadyToTrip. The denominator is
+// Requests minus TotalExclusions, identical to the denominator used for the
+// failure ratio, so IsExcluded requests are never counted.
+func (cb *CircuitBreaker[T]) readyToTripOnSlow(counts Counts) bool {
+	if cb.slowCallThreshold <= 0 || cb.slowCallRatio <= 0 || cb.slowCallRatio > 1 {
+		return false
+	}
+
+	numReqs := counts.validRequests()
+	if numReqs < cb.minSampleRequests {
+		return false
+	}
+
+	return float64(counts.TotalSlow)/float64(numReqs) >= cb.slowCallRatio
+}
+
 // Name returns the name of the CircuitBreaker.
 func (cb *CircuitBreaker[T]) Name() string {
 	return cb.name
@@ -196,7 +274,7 @@ func (cb *CircuitBreaker[T]) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock.Now()
 	state, _, _ := cb.currentState(now)
 	return state
 }
@@ -215,7 +293,7 @@ func (cb *CircuitBreaker[T]) Counts() Counts {
 // If a panic occurs in the request, the CircuitBreaker handles it as an error
 // and causes the same panic again.
 func (cb *CircuitBreaker[T]) Execute(req func() (T, error)) (T, error) {
-	generation, age, err := cb.beforeRequest()
+	generation, age, start, err := cb.beforeRequest()
 	if err != nil {
 		var defaultValue T
 		return defaultValue, err
@@ -224,38 +302,38 @@ func (cb *CircuitBreaker[T]) Execute(req func() (T, error)) (T, error) {
 	defer func() {
 		e := recover()
 		if e != nil {
-			cb.afterRequest(generation, age, fmt.Errorf("%v", e))
+			cb.afterRequest(generation, age, start, fmt.Errorf("%v", e))
 			panic(e)
 		}
 	}()
 
 	result, err := req()
-	cb.afterRequest(generation, age, err)
+	cb.afterRequest(generation, age, start, err)
 	return result, err
 }
 
-func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
+func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, time.Time, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock.Now()
 	state, generation, age := cb.currentState(now)
 
 	if state == StateOpen {
-		return generation, age, ErrOpenState
+		return generation, age, now, ErrOpenState
 	} else if state == StateHalfOpen && cb.counts.validRequests() >= cb.maxRequests {
-		return generation, age, ErrTooManyRequests
+		return generation, age, now, ErrTooManyRequests
 	}
 
 	cb.counts.onRequest()
-	return generation, age, nil
+	return generation, age, now, nil
 }
 
-func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error) {
+func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, start time.Time, err error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock.Now()
 	state, generation, _ := cb.currentState(now)
 	if generation != previous {
 		return
@@ -266,30 +344,39 @@ func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error
 		return
 	}
 
+	slow := cb.isSlow(now.Sub(start))
+
 	if cb.isSuccessful(err) {
-		cb.onSuccess(state, age, now)
+		cb.onSuccess(state, age, now, slow)
 	} else {
-		cb.onFailure(state, age, now)
+		cb.onFailure(state, age, now, slow)
 	}
 }
 
-func (cb *CircuitBreaker[T]) onSuccess(state State, age uint64, now time.Time) {
+func (cb *CircuitBreaker[T]) onSuccess(state State, age uint64, now time.Time, slow bool) {
 	switch state {
 	case StateClosed:
-		cb.counts.onSuccess(age)
+		cb.counts.onSuccess(age, slow)
+		if cb.readyToTripOnSlow(cb.counts.Counts) {
+			cb.setState(StateOpen, now)
+		}
 	case StateHalfOpen:
-		cb.counts.onSuccess(age)
+		if slow && cb.slowSuccessInHalfOpen {
+			cb.setState(StateOpen, now)
+			return
+		}
+		cb.counts.onSuccess(age, slow)
 		if cb.counts.ConsecutiveSuccesses >= cb.maxRequests {
 			cb.setState(StateClosed, now)
 		}
 	}
 }
 
-func (cb *CircuitBreaker[T]) onFailure(state State, age uint64, now time.Time) {
+func (cb *CircuitBreaker[T]) onFailure(state State, age uint64, now time.Time, slow bool) {
 	switch state {
 	case StateClosed:
-		cb.counts.onFailure(age)
-		if cb.readyToTrip(cb.counts.Counts) {
+		cb.counts.onFailure(age, slow)
+		if cb.readyToTrip(cb.counts.Counts) || cb.readyToTripOnSlow(cb.counts.Counts) {
 			cb.setState(StateOpen, now)
 		}
 	case StateHalfOpen:
