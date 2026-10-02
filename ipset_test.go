@@ -422,6 +422,216 @@ func TestIPSetRemoveFreePrefix(t *testing.T) {
 	}
 }
 
+func TestIPSetSplitBalanced(t *testing.T) {
+	maxV6 := mustIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+	halfV6 := mustIP("7fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+
+	tests := []struct {
+		name   string
+		ranges []IPRange
+		parts  int
+		want   [][]IPRange
+	}{
+		{
+			name: "five discrete addresses in three",
+			ranges: []IPRange{
+				IPRangeFrom(mustIP("192.0.2.1"), mustIP("192.0.2.1")),
+				IPRangeFrom(mustIP("192.0.2.2"), mustIP("192.0.2.2")),
+				IPRangeFrom(mustIP("192.0.2.3"), mustIP("192.0.2.3")),
+				IPRangeFrom(mustIP("192.0.2.4"), mustIP("192.0.2.4")),
+				IPRangeFrom(mustIP("192.0.2.5"), mustIP("192.0.2.5")),
+			},
+			parts: 3,
+			want: [][]IPRange{
+				{IPRangeFrom(mustIP("192.0.2.1"), mustIP("192.0.2.2"))},
+				{IPRangeFrom(mustIP("192.0.2.3"), mustIP("192.0.2.4"))},
+				{
+					IPRangeFrom(mustIP("192.0.2.5"), mustIP("192.0.2.5")),
+				},
+			},
+		},
+		{
+			name: "single address with empty shards",
+			ranges: []IPRange{
+				IPRangeFrom(mustIP("2001:db8::1"), mustIP("2001:db8::1")),
+			},
+			parts: 3,
+			want: [][]IPRange{
+				{IPRangeFrom(mustIP("2001:db8::1"), mustIP("2001:db8::1"))},
+				{},
+				{},
+			},
+		},
+		{
+			name: "cross family boundary",
+			ranges: []IPRange{
+				IPRangeFrom(mustIP("255.255.255.253"), mustIP("255.255.255.255")),
+				IPRangeFrom(mustIP("::1"), mustIP("::1")),
+			},
+			parts: 2,
+			want: [][]IPRange{
+				{
+					IPRangeFrom(mustIP("255.255.255.253"), mustIP("255.255.255.254")),
+				},
+				{
+					IPRangeFrom(mustIP("255.255.255.255"), mustIP("255.255.255.255")),
+					IPRangeFrom(mustIP("::1"), mustIP("::1")),
+				},
+			},
+		},
+		{
+			name: "ipv6 zero",
+			ranges: []IPRange{
+				RangeOfPrefix(mustIPPrefix("::/0")),
+			},
+			parts: 2,
+			want: [][]IPRange{
+				{IPRangeFrom(mustIP("::"), halfV6)},
+				{IPRangeFrom(halfV6.Next(), maxV6)},
+			},
+		},
+		{
+			name: "ipv6 zero in three",
+			ranges: []IPRange{
+				RangeOfPrefix(mustIPPrefix("::/0")),
+			},
+			parts: 3,
+			want: [][]IPRange{
+				{IPRangeFrom(mustIP("::"), mustIP("5555:5555:5555:5555:5555:5555:5555:5555"))},
+				{IPRangeFrom(mustIP("5555:5555:5555:5555:5555:5555:5555:5556"), mustIP("aaaa:aaaa:aaaa:aaaa:aaaa:aaaa:aaaa:aaaa"))},
+				{IPRangeFrom(mustIP("aaaa:aaaa:aaaa:aaaa:aaaa:aaaa:aaaa:aaab"), maxV6)},
+			},
+		},
+		{
+			name: "both families zero",
+			ranges: []IPRange{
+				RangeOfPrefix(mustIPPrefix("0.0.0.0/0")),
+				RangeOfPrefix(mustIPPrefix("::/0")),
+			},
+			parts: 2,
+			want: [][]IPRange{
+				{
+					RangeOfPrefix(mustIPPrefix("0.0.0.0/0")),
+					IPRangeFrom(mustIP("::"), mustIP("7fff:ffff:ffff:ffff:ffff:ffff:7fff:ffff")),
+				},
+				{
+					IPRangeFrom(mustIP("7fff:ffff:ffff:ffff:ffff:ffff:8000:0"), maxV6),
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var build IPSetBuilder
+			for _, r := range tt.ranges {
+				build.AddRange(r)
+			}
+			original := buildIPSet(&build)
+			originalCopy := &IPSet{rr: original.Ranges()}
+
+			got := original.SplitBalanced(tt.parts)
+			if len(got) != tt.parts {
+				t.Fatalf("got %d shards, want %d", len(got), tt.parts)
+			}
+
+			assertBalancedSplit(t, originalCopy, got)
+			if !original.Equal(originalCopy) {
+				t.Fatal("SplitBalanced modified the receiver")
+			}
+
+			for i := range got {
+				if !reflect.DeepEqual(got[i].Ranges(), tt.want[i]) {
+					t.Errorf("shard %d ranges = %v, want %v", i, got[i].Ranges(), tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func assertBalancedSplit(t *testing.T, original *IPSet, shards []*IPSet) {
+	t.Helper()
+
+	totalTop, totalHi, totalLo := ipSetSize192(original)
+	base, extra := div192(totalTop, totalHi, totalLo, uint64(len(shards)))
+	var union IPSetBuilder
+
+	for i, shard := range shards {
+		if shard == nil {
+			t.Errorf("shard %d is nil", i)
+			continue
+		}
+
+		wantSize := base
+		if uint64(i) < extra {
+			wantSize = wantSize.addOne()
+		}
+
+		shardTop, shardHi, shardLo := ipSetSize192(shard)
+		for _, r := range shard.rr {
+			if !r.IsValid() {
+				t.Errorf("shard %d contains invalid range %v", i, r)
+			}
+		}
+
+		if shardTop != 0 || shardHi != wantSize.hi || shardLo != wantSize.lo {
+			t.Errorf("shard %d size = %d:%016x%016x, want %016x%016x", i, shardTop, shardHi, shardLo, wantSize.hi, wantSize.lo)
+		}
+
+		for j := i + 1; j < len(shards); j++ {
+			if shard.Overlaps(shards[j]) {
+				t.Errorf("shards %d and %d overlap", i, j)
+			}
+		}
+		union.AddSet(shard)
+	}
+
+	if got, want := buildIPSet(&union), original; !got.Equal(want) {
+		t.Errorf("union = %v, want %v", got.Ranges(), want.Ranges())
+	}
+}
+
+func TestIPSetSplitBalancedSmallPartitions(t *testing.T) {
+	sets := [][]IPRange{
+		{},
+		{IPRangeFrom(mustIP("192.0.2.1"), mustIP("192.0.2.1"))},
+		{IPRangeFrom(mustIP("192.0.2.1"), mustIP("192.0.2.5"))},
+		{
+			IPRangeFrom(mustIP("192.0.2.1"), mustIP("192.0.2.3")),
+			IPRangeFrom(mustIP("2001:db8::1"), mustIP("2001:db8::3")),
+		},
+	}
+
+	for setIndex, ranges := range sets {
+		var build IPSetBuilder
+		for _, r := range ranges {
+			build.AddRange(r)
+		}
+		original := buildIPSet(&build)
+
+		for parts := 1; parts <= 8; parts++ {
+			t.Run(fmt.Sprintf("set%d/parts%d", setIndex, parts), func(t *testing.T) {
+				originalCopy := &IPSet{rr: original.Ranges()}
+				assertBalancedSplit(t, originalCopy, original.SplitBalanced(parts))
+			})
+		}
+	}
+}
+
+func TestIPSetSplitBalancedInvalid(t *testing.T) {
+	s := mustIPSet("+192.0.2.1-192.0.2.2")
+	for _, parts := range []int{0, -1, maxSplitBalancedParts + 1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("SplitBalanced(%d) did not panic", parts)
+				}
+			}()
+			s.SplitBalanced(parts)
+		}()
+	}
+}
+
 func mustIPSet(ranges ...string) *IPSet {
 	var ret IPSetBuilder
 	for _, r := range ranges {

@@ -78,6 +78,44 @@ func (u uint128) addOne() uint128 {
 	return uint128{u.hi + carry, lo}
 }
 
+func (u uint128) add(v uint128) uint128 {
+	lo, carry := bits.Add64(u.lo, v.lo, 0)
+	hi, _ := bits.Add64(u.hi, v.hi, carry)
+	return uint128{hi, lo}
+}
+
+func (u uint128) addCarry(v uint128) (uint128, uint64) {
+	lo, carry := bits.Add64(u.lo, v.lo, 0)
+	hi, carry := bits.Add64(u.hi, v.hi, carry)
+	return uint128{hi, lo}, carry
+}
+
+func (u uint128) sub(v uint128) uint128 {
+	lo, borrow := bits.Sub64(u.lo, v.lo, 0)
+	hi, _ := bits.Sub64(u.hi, v.hi, borrow)
+	return uint128{hi, lo}
+}
+
+func (u uint128) cmp(v uint128) int {
+	switch {
+	case u.hi < v.hi || (u.hi == v.hi && u.lo < v.lo):
+		return -1
+	case u.hi == v.hi && u.lo == v.lo:
+		return 0
+	default:
+		return 1
+	}
+}
+
+// div192 divides the 192-bit dividend a:b:c by d. The quotient must
+// fit in 128 bits.
+func div192(a, b, c uint64, d uint64) (uint128, uint64) {
+	_, rem := bits.Div64(0, a, d)
+	hi, rem := bits.Div64(rem, b, d)
+	lo, rem := bits.Div64(rem, c, d)
+	return uint128{hi, lo}, rem
+}
+
 func u64CommonPrefixLen(a, b uint64) uint8 {
 	return uint8(bits.LeadingZeros64(a ^ b))
 }

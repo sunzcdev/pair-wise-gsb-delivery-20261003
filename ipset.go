@@ -6,11 +6,14 @@ package netipx
 
 import (
 	"fmt"
+	"math/bits"
 	"net/netip"
 	"runtime"
 	"sort"
 	"strings"
 )
+
+const maxSplitBalancedParts = 1 << 20
 
 // IPSetBuilder builds an immutable IPSet.
 //
@@ -361,6 +364,113 @@ func (s *IPSet) Equal(o *IPSet) bool {
 		}
 	}
 	return true
+}
+
+// SplitBalanced divides s into parts ordered IPSets with counts that differ
+// by at most one address. The first results receive any extra addresses.
+//
+// Addresses retain their existing ascending order, so IPv4 addresses come
+// before IPv6 addresses and one result may contain addresses from both
+// families. Empty results are returned when parts exceeds the number of
+// addresses. SplitBalanced panics if parts is not positive or is greater than
+// 1,048,576.
+func (s *IPSet) SplitBalanced(parts int) []*IPSet {
+	if parts <= 0 {
+		panic("SplitBalanced: parts must be positive")
+	}
+	if parts > maxSplitBalancedParts {
+		panic("SplitBalanced: too many parts")
+	}
+	if s == nil {
+		s = &IPSet{}
+	}
+
+	results := make([]*IPSet, parts)
+	if parts == 1 {
+		results[0] = &IPSet{rr: append([]IPRange{}, s.rr...)}
+		return results
+	}
+
+	totalTop, totalHi, totalLo := ipSetSize192(s)
+	quota, extra := div192(totalTop, totalHi, totalLo, uint64(parts))
+
+	rangeIndex := 0
+	var cursor uint128
+	for shardIndex := 0; shardIndex < parts; shardIndex++ {
+		remaining := quota
+		if uint64(shardIndex) < extra {
+			remaining = remaining.addOne()
+		}
+
+		var ranges []IPRange
+		for remaining.cmp(uint128{}) > 0 && rangeIndex < len(s.rr) {
+			r := s.rr[rangeIndex]
+			from := u128From16(r.from.As16())
+			to := u128From16(r.to.As16())
+			if cursor.isZero() {
+				cursor = from
+			}
+
+			end := to
+			available, availableOverflow := to.sub(cursor).addOneCarry()
+			if availableOverflow != 0 || available.cmp(remaining) >= 0 {
+				end = cursor.add(remaining.subOne())
+			}
+
+			endAddr := end.addrInFamily(r.from)
+			ranges = append(ranges, IPRangeFrom(cursor.addrInFamily(r.from), endAddr))
+			remaining = remaining.sub(end.sub(cursor).addOne())
+
+			if end == to {
+				rangeIndex++
+				cursor = uint128{}
+			} else {
+				cursor = end.addOne()
+			}
+		}
+
+		results[shardIndex] = &IPSet{rr: ranges}
+	}
+
+	return results
+}
+
+func (u uint128) addrInFamily(family netip.Addr) netip.Addr {
+	if family.Is4() {
+		return u.IP4()
+	}
+	return u.IP6()
+}
+
+func ipRangeSize(r IPRange) (uint128, bool) {
+	from := u128From16(r.from.As16())
+	to := u128From16(r.to.As16())
+	size, carry := to.sub(from).addOneCarry()
+	if r.from.Is4() {
+		return uint128{0, size.lo}, false
+	}
+	return size, carry != 0
+}
+
+func (u uint128) addOneCarry() (uint128, uint64) {
+	return u.addCarry(uint128{0, 1})
+}
+
+func ipSetSize192(s *IPSet) (uint64, uint64, uint64) {
+	var top uint64
+	var total uint128
+	for _, r := range s.rr {
+		size, overflow := ipRangeSize(r)
+		if overflow {
+			top++
+			continue
+		}
+
+		var carry uint64
+		total, carry = total.addCarry(size)
+		top, _ = bits.Add64(top, 0, carry)
+	}
+	return top, total.hi, total.lo
 }
 
 // Contains reports whether ip is in s.
