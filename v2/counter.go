@@ -9,6 +9,7 @@ type Counts struct {
 	TotalSuccesses       uint32
 	TotalFailures        uint32
 	TotalExclusions      uint32
+	TotalSlowRequests    uint32
 	ConsecutiveSuccesses uint32
 	ConsecutiveFailures  uint32
 }
@@ -33,6 +34,10 @@ func (c *Counts) onExclusion() {
 	c.TotalExclusions++
 }
 
+func (c *Counts) onSlow() {
+	c.TotalSlowRequests++
+}
+
 func (c *Counts) validRequests() uint32 {
 	if c.Requests < c.TotalExclusions {
 		return 0
@@ -45,6 +50,7 @@ func (c *Counts) clear() {
 	c.TotalSuccesses = 0
 	c.TotalFailures = 0
 	c.TotalExclusions = 0
+	c.TotalSlowRequests = 0
 	c.ConsecutiveSuccesses = 0
 	c.ConsecutiveFailures = 0
 }
@@ -111,6 +117,17 @@ func (rc *rollingCounts) onExclusion(age uint64) {
 	if rc.age-age < uint64(len(rc.buckets)) {
 		rc.Counts.onExclusion()
 		rc.buckets[rc.index(age)].onExclusion()
+	}
+}
+
+func (rc *rollingCounts) onSlow(age uint64) {
+	if age > rc.age {
+		return
+	}
+
+	if rc.age-age < uint64(len(rc.buckets)) {
+		rc.Counts.onSlow()
+		rc.buckets[rc.index(age)].onSlow()
 	}
 }
 
@@ -192,6 +209,12 @@ func (rc *rollingCounts) subtract(oldest uint64) {
 		rc.TotalExclusions -= bucket.TotalExclusions
 	} else {
 		rc.TotalExclusions = 0
+	}
+
+	if rc.TotalSlowRequests > bucket.TotalSlowRequests {
+		rc.TotalSlowRequests -= bucket.TotalSlowRequests
+	} else {
+		rc.TotalSlowRequests = 0
 	}
 }
 

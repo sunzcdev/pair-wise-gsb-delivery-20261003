@@ -36,6 +36,10 @@ type Settings struct {
 	OnStateChange func(name string, from State, to State)
 	IsSuccessful  func(err error) bool
 	IsExcluded    func(err error) bool
+	SlowRequestThreshold             time.Duration
+	SlowRequestRatio                 float64
+	MinSlowRequests                  uint32
+	TreatSlowCallsAsFailuresWhenHalfOpen bool
 }
 ```
 
@@ -77,6 +81,32 @@ type Settings struct {
   This can be used, for example, to ignore context cancellations or
   other errors that should not affect the circuit breaker state.
   If `IsExcluded` is nil, no requests are excluded.
+  Excluded requests are excluded from every decision denominator
+  (both the error ratio in `ReadyToTrip` and the slow-call ratio below).
+
+- `SlowRequestThreshold`, when greater than 0, enables slow-call detection in
+  addition to the error-based `ReadyToTrip` decision. A successful,
+  non-excluded request whose elapsed time is greater than or equal to
+  `SlowRequestThreshold` is recorded as a slow request. Failed requests are not
+  counted as slow. Latency is measured with the monotonic clock
+  (`time.Since` the admission instant), so wall clock adjustments do not affect
+  it. Requests are attributed to the rolling bucket in which they *start*, not
+  the one in which they complete; a request that finishes in a later bucket is
+  still recorded in its start bucket while that bucket is inside the window.
+
+- `SlowRequestRatio` is the minimum fraction of slow requests over the valid
+  (non-excluded) requests that trips `CircuitBreaker` in the closed state, once
+  `MinSlowRequests` valid requests have been observed. Set it in the range
+  (0, 1]; slow-call tripping is disabled when it is 0.
+
+- `MinSlowRequests` is the minimum number of valid requests required before the
+  slow-call ratio is evaluated, so a handful of requests (fast or slow) cannot
+  trigger a trip. If `MinSlowRequests` is 0, it defaults to 5.
+
+- `TreatSlowCallsAsFailuresWhenHalfOpen` controls slow successes in the
+  half-open state. When false (the default), a slow success counts as an
+  ordinary success and still helps close the breaker. When true, a slow success
+  is treated as a failure and immediately reopens the breaker.
 
 The struct `Counts` holds the numbers of requests and their successes/failures/exclusions:
 
@@ -86,6 +116,7 @@ type Counts struct {
 	TotalSuccesses       uint32
 	TotalFailures        uint32
 	TotalExclusions      uint32
+	TotalSlowRequests    uint32
 	ConsecutiveSuccesses uint32
 	ConsecutiveFailures  uint32
 }
