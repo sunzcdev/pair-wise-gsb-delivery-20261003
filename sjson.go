@@ -745,3 +745,295 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 	}
 	return res, err
 }
+
+// Splice removes deleteCount elements from an array that is located at the
+// specified path, starting at start, and inserts the given values in their
+// place.
+//
+// A negative start counts back from the end of the array. A start that is
+// past the end of the array appends to the tail. A deleteCount that extends
+// past the end of the array is truncated. A negative deleteCount results in
+// an error.
+//
+// The values are marshaled with the same rules as Set.
+// The input json is never modified when any of the values cannot be
+// marshaled or when the path is invalid.
+func Splice(json, path string, start, deleteCount int,
+	values ...interface{}) (string, error) {
+	return SpliceOptions(json, path, start, deleteCount, nil, values...)
+}
+
+// SpliceOptions is the same as Splice, but with options.
+func SpliceOptions(json, path string, start, deleteCount int,
+	opts *Options, values ...interface{}) (string, error) {
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := SpliceBytesOptions(jsonb, path, start, deleteCount, opts,
+		values...)
+	return string(res), err
+}
+
+// SpliceBytes is the same as Splice, but with []byte.
+func SpliceBytes(json []byte, path string, start, deleteCount int,
+	values ...interface{}) ([]byte, error) {
+	return SpliceBytesOptions(json, path, start, deleteCount, nil, values...)
+}
+
+// SpliceBytesOptions is the same as SpliceOptions, but with []byte.
+func SpliceBytesOptions(json []byte, path string, start, deleteCount int,
+	opts *Options, values ...interface{}) ([]byte, error) {
+	raws := make([]string, len(values))
+	for i, value := range values {
+		b, merr := jsongo.Marshal(value)
+		if merr != nil {
+			return json, merr
+		}
+		raws[i] = *(*string)(unsafe.Pointer(&b))
+	}
+	return spliceRawBytes(json, path, start, deleteCount, raws)
+}
+
+// SpliceRaw is the same as Splice, except that the values are raw blocks of
+// json. Each value must be valid json or an error is returned and the input
+// is left unmodified.
+func SpliceRaw(json, path string, start, deleteCount int,
+	values ...string) (string, error) {
+	return SpliceRawOptions(json, path, start, deleteCount, nil, values...)
+}
+
+// SpliceRawOptions is the same as SpliceRaw, but with options.
+func SpliceRawOptions(json, path string, start, deleteCount int,
+	opts *Options, values ...string) (string, error) {
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := spliceRawBytes(jsonb, path, start, deleteCount, values)
+	return string(res), err
+}
+
+// SpliceRawBytes is the same as SpliceRaw, but with []byte.
+func SpliceRawBytes(json []byte, path string, start, deleteCount int,
+	values ...[]byte) ([]byte, error) {
+	return SpliceRawBytesOptions(json, path, start, deleteCount, nil,
+		values...)
+}
+
+// SpliceRawBytesOptions is the same as SpliceRawOptions, but with []byte.
+func SpliceRawBytesOptions(json []byte, path string, start,
+	deleteCount int, opts *Options, values ...[]byte) ([]byte, error) {
+	raws := make([]string, len(values))
+	for i, value := range values {
+		raws[i] = *(*string)(unsafe.Pointer(&value))
+	}
+	return spliceRawBytes(json, path, start, deleteCount, raws)
+}
+
+// spliceRawBytes performs a splice using pre-validated raw json values.
+func spliceRawBytes(json []byte, path string, start, deleteCount int,
+	raws []string) ([]byte, error) {
+	if deleteCount < 0 {
+		return json, &errorType{"delete count cannot be negative"}
+	}
+	// Validate every value before touching the input so that a single bad
+	// value leaves the json completely unmodified.
+	for _, raw := range raws {
+		if !gjson.Valid(raw) {
+			return json, &errorType{"invalid json value: " + raw}
+		}
+	}
+	var paths []pathResult
+	if path != "" {
+		r, simple := parsePath(path)
+		if simple {
+			paths = append(paths, r)
+			for r.more {
+				r, simple = parsePath(r.path)
+				if !simple {
+					break
+				}
+				paths = append(paths, r)
+			}
+		}
+		if !simple {
+			return json,
+				&errorType{"cannot splice array for a complex path"}
+		}
+	}
+	jstr := *(*string)(unsafe.Pointer(&json))
+	// Splice always targets an array, so an empty document is treated as
+	// an empty array.
+	isempty := true
+	for i := 0; i < len(jstr); i++ {
+		if jstr[i] > ' ' {
+			isempty = false
+			break
+		}
+	}
+	if isempty {
+		jstr = "[]"
+	}
+	if !gjson.Valid(jstr) {
+		return json, &errorType{"invalid json"}
+	}
+	res, err := splicePaths(nil, jstr, paths, raws, start, deleteCount)
+	if err != nil {
+		return json, err
+	}
+	return res, nil
+}
+
+// splicePaths walks the path and splices the array at the final part.
+func splicePaths(buf []byte, jstr string, paths []pathResult,
+	raws []string, start, deleteCount int) ([]byte, error) {
+	if len(paths) == 0 {
+		return appendSplice(buf, jstr, raws, start, deleteCount)
+	}
+	res := gjson.Get(jstr, paths[0].gpart)
+	if !res.Exists() {
+		return nil, &errorType{
+			"path not found: " + paths[0].part}
+	}
+	buf = append(buf, jstr[:res.Index]...)
+	var err error
+	buf, err = splicePaths(buf, res.Raw, paths[1:], raws, start,
+		deleteCount)
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf, jstr[res.Index+len(res.Raw):]...)
+	return buf, nil
+}
+
+// appendSplice splices the array at the root of jstr and appends it to buf.
+// All surrounding text, including whitespace, is preserved.
+func appendSplice(buf []byte, jstr string, raws []string,
+	start, deleteCount int) ([]byte, error) {
+	res := gjson.Parse(jstr)
+	token := trim(res.Raw)
+	if res.Type != gjson.JSON || len(token) == 0 || token[0] != '[' ||
+		!gjson.Valid(token) {
+		return nil, &errorType{"json must be an array"}
+	}
+
+	elems := res.Array()
+	n := len(elems)
+
+	index := start
+	if index < 0 {
+		index += n
+		if index < 0 {
+			index = 0
+		}
+	}
+	if index > n {
+		index = n
+	}
+	count := deleteCount
+	if count > n-index {
+		count = n - index
+	}
+	if count < 0 {
+		count = 0
+	}
+	tailCount := n - index - count
+
+	// Locate the raw text position where new elements are inserted.
+	var insPos int
+	if index == n {
+		// Insert directly before the closing bracket, skipping whitespace.
+		insPos = len(token) - 1
+		for insPos > 0 && token[insPos-1] <= ' ' {
+			insPos--
+		}
+	} else {
+		insPos = elems[index].Index - res.Index
+	}
+	delEnd := insPos
+	if count > 0 {
+		last := elems[index+count-1]
+		delEnd = last.Index - res.Index + len(last.Raw)
+	}
+
+	head := token[:insPos]
+	tail := token[delEnd:]
+
+	buf = append(buf, jstr[:res.Index]...)
+	switch {
+	case len(raws) == 0 && count > 0:
+		// Pure removal. Drop the separator that joined the deleted range.
+		if tailCount == 0 && index > 0 {
+			for len(head) > 0 && head[len(head)-1] <= ' ' {
+				head = head[:len(head)-1]
+			}
+			if len(head) > 0 && head[len(head)-1] == ',' {
+				head = head[:len(head)-1]
+			}
+		} else if tailCount > 0 {
+			for len(tail) > 0 && tail[0] <= ' ' {
+				tail = tail[1:]
+			}
+			if len(tail) > 0 && tail[0] == ',' {
+				tail = tail[1:]
+				for len(tail) > 0 && tail[0] <= ' ' {
+					tail = tail[1:]
+				}
+			}
+		}
+		buf = append(buf, head...)
+		buf = append(buf, tail...)
+	case len(raws) > 0 && count == 0 && index == n:
+		// Append at the tail, reusing the whitespace before the bracket.
+		buf = append(buf, head...)
+		if n > 0 {
+			buf = append(buf, ',')
+			buf = append(buf, token[insPos:len(token)-1]...)
+		}
+		for i, raw := range raws {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, raw...)
+		}
+		buf = append(buf, tail...)
+	case len(raws) > 0 && count == 0:
+		// Insert before survivors. Reuse the whitespace of the shifted
+		// separator so the original spacing style is kept on both sides.
+		var gap string
+		if index > 0 {
+			end := len(head)
+			start := end
+			for start > 0 && head[start-1] <= ' ' {
+				start--
+			}
+			gap = head[start:end]
+			head = head[:start]
+		}
+		buf = append(buf, head...)
+		buf = append(buf, gap...)
+		for i, raw := range raws {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, raw...)
+		}
+		if tailCount > 0 {
+			buf = append(buf, ',')
+			buf = append(buf, gap...)
+		}
+		buf = append(buf, tail...)
+	default:
+		// Replacement or no-op. The existing separators on either side of
+		// the removed range remain in place, so splice the values directly.
+		buf = append(buf, head...)
+		for i, raw := range raws {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = append(buf, raw...)
+		}
+		buf = append(buf, tail...)
+	}
+	buf = append(buf, jstr[res.Index+len(token):]...)
+	return buf, nil
+}

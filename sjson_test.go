@@ -351,3 +351,117 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func testSpliceRaw(t *testing.T, expect, json, path string,
+	start, deleteCount int, values ...string) {
+	t.Helper()
+	json2, err := SpliceRaw(json, path, start, deleteCount, values...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if json2 != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, json2)
+	}
+	bvalues := make([][]byte, len(values))
+	for i, value := range values {
+		bvalues[i] = []byte(value)
+	}
+	json3, err := SpliceRawBytes([]byte(json), path, start, deleteCount,
+		bvalues...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(json3) != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, string(json3))
+	}
+	if !gjson.Valid(json2) {
+		t.Fatalf("result is not valid json: '%v'", json2)
+	}
+}
+
+func TestSplice(t *testing.T) {
+	// Basic insertion, replacement and deletion.
+	testSpliceRaw(t, `[1,9,3]`, `[1,2,3]`, "", 1, 1, `9`)
+	testSpliceRaw(t, `[1,2,9,3]`, `[1,2,3]`, "", 2, 0, `9`)
+	testSpliceRaw(t, `[1,2,3,9]`, `[1,2,3]`, "", 3, 0, `9`)
+	testSpliceRaw(t, `[1,3]`, `[1,2,3]`, "", 1, 1)
+
+	// Multiple values.
+	testSpliceRaw(t, `[1,8,9,3]`, `[1,2,3]`, "", 1, 1, `8`, `9`)
+	testSpliceRaw(t, `[4,5,1,2,3]`, `[1,2,3]`, "", 0, 0, `4`, `5`)
+
+	// A negative start counts back from the end of the array.
+	testSpliceRaw(t, `[1,2,9,3]`, `[1,2,3]`, "", -1, 0, `9`)
+	testSpliceRaw(t, `[1,9,3]`, `[1,2,3]`, "", -2, 1, `9`)
+	testSpliceRaw(t, `[9,1]`, `[1]`, "", -99, 0, `9`)
+
+	// A start past the end appends to the tail.
+	testSpliceRaw(t, `[1,2,9]`, `[1,2]`, "", 99, 0, `9`)
+
+	// A delete count past the end is truncated.
+	testSpliceRaw(t, `[1]`, `[1,2,3]`, "", 1, 100)
+	testSpliceRaw(t, `[1,2,3]`, `[1,2,3]`, "", 99, 5)
+
+	// An empty array accepts inserted values.
+	testSpliceRaw(t, `[1,2]`, `[]`, "", 0, 0, `1`, `2`)
+
+	// Deleting every element leaves an empty array.
+	testSpliceRaw(t, `[]`, `[1,2,3]`, "", 0, 3)
+
+	// Replacing the first element.
+	testSpliceRaw(t, `[9,2,3]`, `[1,2,3]`, "", 0, 1, `9`)
+
+	// Surrounding whitespace outside of the json is preserved.
+	testSpliceRaw(t, `  [1,2,3]  `, `  [1,2]  `, "", 2, 0, `3`)
+	testSpliceRaw(t, "\n\t[1]\t\n", "\n\t[1,2]\t\n", "", 1, 1)
+
+	// Splicing a nested array keeps the outer whitespace.
+	testSpliceRaw(t, ` {"a":[1,2,3]} `, ` {"a":[1,2]} `, "a", 2, 0, `3`)
+
+	// Untouched elements keep their original number formatting and escapes.
+	testSpliceRaw(t, `[1E+20,"\u0041",9,0.500]`,
+		`[1E+20,"\u0041",0.500]`, "", 2, 0, `9`)
+	testSpliceRaw(t, `[1e2,"a\nb"]`, `[1e2,"a\nb",false]`, "", -1, 1)
+
+	// A numeric key of an object is not treated as an array index.
+	json := `{"1":"x"}`
+	if _, err := SpliceRaw(json, "1", 0, 0, `9`); err == nil {
+		t.Fatal("expected an error when splicing a non-array")
+	}
+	if _, err := Splice(json, "1", 0, 0, 9); err == nil {
+		t.Fatal("expected an error when splicing a non-array")
+	}
+
+	// A negative delete count is an error.
+	if _, err := SpliceRaw(`[1,2,3]`, "", 0, -1); err == nil {
+		t.Fatal("expected an error for a negative delete count")
+	}
+
+	// Each new value is validated up front. A single bad value leaves the
+	// input untouched.
+	json = `[1,2,3]`
+	if _, err := SpliceRaw(json, "", 0, 0, `{}`, `wat`); err == nil {
+		t.Fatal("expected an error for an invalid value")
+	}
+	if json != `[1,2,3]` {
+		t.Fatalf("input was modified: '%v'", json)
+	}
+	if _, err := Splice(json, "", 0, 0, make(chan int)); err == nil {
+		t.Fatal("expected a marshal error")
+	}
+
+	// An empty document is treated as an empty array.
+	testSpliceRaw(t, `[true]`, ``, "", 0, 0, `true`)
+
+	// Typed values are marshaled with the same rules as Set.
+	out, err := Splice(`{"a":[1,2]}`, "a", 2, 0, "hello", 3.5, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != `{"a":[1,2,"hello",3.5,true,null]}` {
+		t.Fatalf("unexpected result '%v'", out)
+	}
+
+	// A no-op splice returns the original text.
+	testSpliceRaw(t, `[1,2,3]`, `[1,2,3]`, "", 0, 0)
+}
