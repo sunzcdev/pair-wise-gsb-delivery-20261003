@@ -354,7 +354,13 @@ func (t Result) Map() map[string]Result {
 // Get searches result for the specified path.
 // The result should be a JSON array or object.
 func (t Result) Get(path string) Result {
-	r := Get(t.Raw, path)
+	return t.get(path, nil)
+}
+
+// get is like Get but resolves modifiers against the provided view.
+// A nil view uses the package-level modifier registry.
+func (t Result) get(path string, mods *modifierView) Result {
+	r := getWithMods(t.Raw, path, mods)
 	if r.Indexes != nil {
 		for i := 0; i < len(r.Indexes); i++ {
 			r.Indexes[i] += t.Index
@@ -804,7 +810,7 @@ type arrayPathResult struct {
 	}
 }
 
-func parseArrayPath(path string) (r arrayPathResult) {
+func parseArrayPath(path string, mods *modifierView) (r arrayPathResult) {
 	for i := 0; i < len(path); i++ {
 		if path[i] == '|' {
 			r.part = path[:i]
@@ -814,7 +820,7 @@ func parseArrayPath(path string) (r arrayPathResult) {
 		}
 		if path[i] == '.' {
 			r.part = path[:i]
-			if !r.arrch && i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+			if !r.arrch && i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 				r.pipe = path[i+1:]
 				r.piped = true
 			} else {
@@ -984,8 +990,8 @@ right:
 }
 
 // peek at the next byte and see if it's a '@', '[', or '{'.
-func isDotPiperChar(s string) bool {
-	if DisableModifiers {
+func isDotPiperChar(s string, mods *modifierView) bool {
+	if mods.modifiersDisabled() {
 		return false
 	}
 	c := s[0]
@@ -997,7 +1003,7 @@ func isDotPiperChar(s string) bool {
 				break
 			}
 		}
-		_, ok := modifiers[s[1:i]]
+		_, ok := mods.lookupModifier(s[1:i])
 		return ok
 	}
 	return c == '[' || c == '{'
@@ -1012,7 +1018,7 @@ type objectPathResult struct {
 	more  bool
 }
 
-func parseObjectPath(path string) (r objectPathResult) {
+func parseObjectPath(path string, mods *modifierView) (r objectPathResult) {
 	for i := 0; i < len(path); i++ {
 		if path[i] == '|' {
 			r.part = path[:i]
@@ -1022,7 +1028,7 @@ func parseObjectPath(path string) (r objectPathResult) {
 		}
 		if path[i] == '.' {
 			r.part = path[:i]
-			if i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+			if i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 				r.pipe = path[i+1:]
 				r.piped = true
 			} else {
@@ -1052,7 +1058,7 @@ func parseObjectPath(path string) (r objectPathResult) {
 						continue
 					} else if path[i] == '.' {
 						r.part = string(epart)
-						if i < len(path)-1 && isDotPiperChar(path[i+1:]) {
+						if i < len(path)-1 && isDotPiperChar(path[i+1:], mods) {
 							r.pipe = path[i+1:]
 							r.piped = true
 						} else {
@@ -1229,7 +1235,7 @@ func parseSquash(json string, i int) (int, string) {
 func parseObject(c *parseContext, i int, path string) (int, bool) {
 	var pmatch, kesc, vesc, ok, hit bool
 	var key, val string
-	rp := parseObjectPath(path)
+	rp := parseObjectPath(path, c.mods)
 	if !rp.more && rp.piped {
 		c.pipe = rp.pipe
 		c.piped = true
@@ -1546,7 +1552,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 	var partidx int
 	var multires []byte
 	var queryIndexes []int
-	rp := parseArrayPath(path)
+	rp := parseArrayPath(path, c.mods)
 	if !rp.arrch {
 		n, ok := parseUint(rp.part)
 		if !ok {
@@ -1572,7 +1578,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 		parentIndex := tmp.value.Index
 		var res Result
 		if qval.Type == JSON {
-			res = qval.Get(rp.query.path)
+			res = qval.get(rp.query.path, c.mods)
 		} else {
 			if rp.query.path != "" {
 				return false
@@ -1587,7 +1593,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 					c.pipe = right
 					c.piped = true
 				}
-				res = qval.Get(rp.path)
+				res = qval.get(rp.path, c.mods)
 			} else {
 				res = qval
 			}
@@ -1773,7 +1779,7 @@ func parseArray(c *parseContext, i int, path string) (int, bool) {
 							if idx < len(c.json) && c.json[idx] != ']' {
 								_, res, ok := parseAny(c.json, idx, true)
 								if ok {
-									res := res.Get(rp.alogkey)
+									res := res.get(rp.alogkey, c.mods)
 									if res.Exists() {
 										if k > 0 {
 											jsons = append(jsons, ',')
@@ -2125,6 +2131,7 @@ type parseContext struct {
 	piped bool
 	calcd bool
 	lines bool
+	mods  *modifierView
 }
 
 // Get searches json for the specified path.
@@ -2161,21 +2168,27 @@ type parseContext struct {
 // If you are consuming JSON from an unpredictable source then you may want to
 // use the Valid function first.
 func Get(json, path string) Result {
+	return getWithMods(json, path, nil)
+}
+
+// getWithMods is like Get but resolves modifiers against the provided view.
+// A nil view uses the package-level modifier registry.
+func getWithMods(json, path string, mods *modifierView) Result {
 	if len(path) > 1 {
-		if (path[0] == '@' && !DisableModifiers) || path[0] == '!' {
+		if (path[0] == '@' && !mods.modifiersDisabled()) || path[0] == '!' {
 			// possible modifier
 			var ok bool
 			var npath string
 			var rjson string
-			if path[0] == '@' && !DisableModifiers {
-				npath, rjson, ok = execModifier(json, path)
+			if path[0] == '@' && !mods.modifiersDisabled() {
+				npath, rjson, ok = execModifier(json, path, mods)
 			} else if path[0] == '!' {
 				npath, rjson, ok = execStatic(json, path)
 			}
 			if ok {
 				path = npath
 				if len(path) > 0 && (path[0] == '|' || path[0] == '.') {
-					res := Get(rjson, path[1:])
+					res := getWithMods(rjson, path[1:], mods)
 					res.Index = 0
 					res.Indexes = nil
 					return res
@@ -2195,7 +2208,7 @@ func Get(json, path string) Result {
 					b = append(b, kind)
 					var i int
 					for _, sub := range subs {
-						res := Get(json, sub.path)
+						res := getWithMods(json, sub.path, mods)
 						if res.Exists() {
 							if i > 0 {
 								b = append(b, ',')
@@ -2235,7 +2248,7 @@ func Get(json, path string) Result {
 					res.Raw = string(b)
 					res.Type = JSON
 					if len(path) > 0 {
-						res = res.Get(path[1:])
+						res = res.get(path[1:], mods)
 					}
 					res.Index = 0
 					return res
@@ -2244,7 +2257,7 @@ func Get(json, path string) Result {
 		}
 	}
 	var i int
-	var c = &parseContext{json: json}
+	var c = &parseContext{json: json, mods: mods}
 	if len(path) >= 2 && path[0] == '.' && path[1] == '.' {
 		c.lines = true
 		parseArray(c, 0, path[2:])
@@ -2263,7 +2276,7 @@ func Get(json, path string) Result {
 		}
 	}
 	if c.piped {
-		res := c.value.Get(c.pipe)
+		res := c.value.get(c.pipe, mods)
 		res.Index = 0
 		return res
 	}
@@ -2274,7 +2287,7 @@ func Get(json, path string) Result {
 // GetBytes searches json for the specified path.
 // If working with bytes, this method preferred over Get(string(data), path)
 func GetBytes(json []byte, path string) Result {
-	return getBytes(json, path)
+	return getBytes(json, path, nil)
 }
 
 // runeit returns the rune from the the \uXXXX
@@ -2891,7 +2904,7 @@ func execStatic(json, path string) (pathOut, res string, ok bool) {
 
 // execModifier parses the path to find a matching modifier function.
 // The input expects that the path already starts with a '@'
-func execModifier(json, path string) (pathOut, res string, ok bool) {
+func execModifier(json, path string, mods *modifierView) (pathOut, res string, ok bool) {
 	name := path[1:]
 	var hasArgs bool
 	for i := 1; i < len(path); i++ {
@@ -2912,7 +2925,7 @@ func execModifier(json, path string) (pathOut, res string, ok bool) {
 			break
 		}
 	}
-	if fn, ok := modifiers[name]; ok {
+	if fn, ok := mods.lookupModifier(name); ok {
 		var args string
 		if hasArgs {
 			var parsedArgs bool
@@ -2960,10 +2973,38 @@ func unwrap(json string) string {
 // DisableModifiers will disable the modifier syntax
 var DisableModifiers = false
 
+// modifierView is a pinned view of a modifier registry that is used for the
+// duration of a single query. A nil view resolves modifiers against the
+// package-level registry and the DisableModifiers flag.
+type modifierView struct {
+	fns      map[string]func(json, arg string) string
+	disabled bool
+}
+
+func (v *modifierView) modifiersDisabled() bool {
+	if v == nil {
+		return DisableModifiers
+	}
+	return v.disabled
+}
+
+func (v *modifierView) lookupModifier(name string) (func(json, arg string) string, bool) {
+	if v == nil {
+		fn, ok := modifiers[name]
+		return fn, ok
+	}
+	fn, ok := v.fns[name]
+	return fn, ok
+}
+
 var modifiers map[string]func(json, arg string) string
 
+// builtinModifiers is the default set of modifiers. It is used to initialize
+// the package-level registry and scopes created with NewScope(true).
+var builtinModifiers map[string]func(json, arg string) string
+
 func init() {
-	modifiers = map[string]func(json, arg string) string{
+	builtinModifiers = map[string]func(json, arg string) string{
 		"pretty":  modPretty,
 		"ugly":    modUgly,
 		"reverse": modReverse,
@@ -2977,6 +3018,10 @@ func init() {
 		"fromstr": modFromStr,
 		"group":   modGroup,
 		"dig":     modDig,
+	}
+	modifiers = make(map[string]func(json, arg string) string, len(builtinModifiers))
+	for name, fn := range builtinModifiers {
+		modifiers[name] = fn
 	}
 }
 
@@ -3343,11 +3388,11 @@ type sliceHeader struct {
 // getBytes casts the input json bytes to a string and safely returns the
 // results as uniquely allocated data. This operation is intended to minimize
 // copies and allocations for the large json string->[]byte.
-func getBytes(json []byte, path string) Result {
+func getBytes(json []byte, path string, mods *modifierView) Result {
 	var result Result
 	if json != nil {
 		// unsafe cast to string
-		result = Get(*(*string)(unsafe.Pointer(&json)), path)
+		result = getWithMods(*(*string)(unsafe.Pointer(&json)), path, mods)
 		// safely get the string headers
 		rawhi := *(*stringHeader)(unsafe.Pointer(&result.Raw))
 		strhi := *(*stringHeader)(unsafe.Pointer(&result.Str))

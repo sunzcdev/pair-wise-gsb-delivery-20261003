@@ -269,6 +269,30 @@ gjson.AddModifier("case", func(json, arg string) string {
 "children|@case:lower|@reverse"  >> ["jack","alex","sara"]
 ```
 
+### Scoped modifier registries
+
+The package-level `AddModifier` registers modifiers globally, which is fine
+for a single service but can collide when multiple modules want the same
+modifier name with different meanings. A `Scope` is an isolated query
+environment with its own modifier registry:
+
+```go
+scope := gjson.NewScope(true) // true inherits the built-in modifiers
+scope.AddModifier("normalize", func(json, arg string) string {
+  return `"` + strings.ToLower(gjson.Parse(json).String()) + `"`
+})
+scope.Get(json, "name.@normalize")
+```
+
+Each scope is independent: registering, replacing, or deleting a modifier on
+one scope never affects other scopes, the package-level registry, or queries
+that have already started. Every query pins a snapshot of the scope's
+registry for its duration, and a scope is safe for concurrent use.
+
+Custom modifiers that run nested queries should re-enter through the scope
+(e.g. `scope.Get`) so the nested query resolves modifiers against the same
+registry.
+
 ## JSON Lines
 
 There's support for [JSON Lines](http://jsonlines.org/) using the `..` prefix, which treats a multilined document as an array. 
