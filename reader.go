@@ -22,8 +22,27 @@ var ErrInvalidFormat = errors.New("invalid mbox format")
 type messageReader struct {
 	r                  *bufio.Reader
 	next               bytes.Buffer
+	format             Format
 	atEOF, atSeparator bool
 	atMiddleOfLine     bool
+}
+
+// unescapeLine removes one mbox quoting layer from the beginning of a line.
+// Recognition only happens at the start of a line.
+func unescapeLine(b []byte, format Format) []byte {
+	if format == Mboxrd {
+		// Any line starting with one or more ">" followed by "From " has one
+		// quoting layer (a single ">") removed.
+		if n := countPrefixByte(b, '>'); n > 0 && bytes.HasPrefix(b[n:], header) {
+			return b[1:]
+		}
+		return b
+	}
+
+	if bytes.HasPrefix(b, escapedHeader) {
+		return b[1:]
+	}
+	return b
 }
 
 func (mr *messageReader) Read(p []byte) (int, error) {
@@ -59,9 +78,7 @@ func (mr *messageReader) Read(p []byte) (int, error) {
 				mr.next.Write([]byte("\r\n"))
 			}
 
-			if bytes.HasPrefix(b, escapedHeader) {
-				b = b[1:]
-			}
+			b = unescapeLine(b, mr.format)
 		}
 
 		mr.next.Write(b)
@@ -76,14 +93,20 @@ func (mr *messageReader) Read(p []byte) (int, error) {
 
 // Reader reads an mbox archive.
 type Reader struct {
-	r  *bufio.Reader
-	mr *messageReader
+	r      *bufio.Reader
+	format Format
+	mr     *messageReader
+}
+
+// NewReaderFormat returns a new Reader for the given format.
+func NewReaderFormat(r io.Reader, format Format) *Reader {
+	return &Reader{r: bufio.NewReader(r), format: format}
 }
 
 // NewReader returns a new Reader to read messages from mbox file format data
 // provided by io.Reader r.
 func NewReader(r io.Reader) *Reader {
-	return &Reader{r: bufio.NewReader(r)}
+	return NewReaderFormat(r, Mboxo)
 }
 
 // NextMessage returns the next message text (containing both the header and the
@@ -122,6 +145,6 @@ func (r *Reader) NextMessage() (io.Reader, error) {
 			return nil, io.EOF
 		}
 	}
-	r.mr = &messageReader{r: r.r}
+	r.mr = &messageReader{r: r.r, format: r.format}
 	return r.mr, nil
 }
