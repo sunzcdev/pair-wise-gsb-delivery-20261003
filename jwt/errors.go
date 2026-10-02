@@ -51,3 +51,6 @@ var ErrIssuedInTheFuture = errors.New("go-jose/go-jose/jwt: validation field, to
 
 // ErrInvalidContentType indicates that token requires JWT cty header.
 var ErrInvalidContentType = errors.New("go-jose/go-jose/jwt: expected content type to be JWT (cty header)")
+
+// ErrInvalidVerificationChain indicates that a token verification chain is misconfigured.
+var ErrInvalidVerificationChain = errors.New("go-jose/go-jose/jwt: invalid verification chain")
