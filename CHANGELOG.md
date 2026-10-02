@@ -1,3 +1,6 @@
+## Unreleased
+* [FEATURE] Add `after_commit` callbacks run after the outermost invocation commits
+
 ## 3.2.0 / 2025-07-10
 * [BUGFIX] Raise failures from nested contexts [#170]
 * [FEATURE] Add `ostruct` dependency to gemspec.

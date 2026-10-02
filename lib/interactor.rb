@@ -135,20 +135,39 @@ module Interactor
   # within the context. If the context is failed or any error is raised, the
   # context is rolled back.
   #
+  # The outermost invocation for a context forms a commit boundary. When it
+  # exits successfully, any registered after_commit callbacks are run in
+  # registration order. If the invocation fails or is rolled back, the
+  # registered callbacks are discarded instead.
+  #
   # The "run!" method behaves identically to the "run" method with one notable
   # exception. If the context is failed during invocation of the interactor,
   # the Interactor::Failure is raised.
   #
   # Returns nothing.
   # Raises Interactor::Failure if the context is failed.
+  # Raises Interactor::AfterCommitError if any after_commit callbacks fail.
   def run!
-    with_hooks do
-      call
-      context.called!(self)
+    root = context._open_commit_boundary
+    begin
+      with_hooks do
+        call
+        context.called!(self)
+      end
+    rescue
+      context.rollback!
+      context._discard_after_commit_callbacks if root
+      raise
+    ensure
+      context._close_commit_boundary
     end
-  rescue
-    context.rollback!
-    raise
+    if root
+      if context.success?
+        context._drain_after_commit_callbacks
+      else
+        context._discard_after_commit_callbacks
+      end
+    end
   end
 
   # Public: Invoke an Interactor instance without any hooks, tracking, or
@@ -165,5 +184,29 @@ module Interactor
   #
   # Returns nothing.
   def rollback
+  end
+
+  # Public: Register a callback to be run after the outermost interactor
+  # invocation sharing this interactor's context completes successfully.
+  # Unlike an "after" hook, the callback is deferred until every interactor
+  # sharing the context has finished, so later steps can no longer fail or
+  # roll back the invocation. If the invocation fails or is rolled back, the
+  # callback is discarded without being run.
+  #
+  # block - A block to be called once the outermost invocation commits.
+  #
+  # Examples
+  #
+  #   class MyInteractor
+  #     include Interactor
+  #
+  #     def call
+  #       after_commit { Notifications.deliver(context.user) }
+  #     end
+  #   end
+  #
+  # Returns the Array of registered after_commit callbacks.
+  def after_commit(&block)
+    context.after_commit(&block)
   end
 end

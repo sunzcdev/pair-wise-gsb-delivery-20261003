@@ -28,4 +28,35 @@ module Interactor
       super
     end
   end
+
+  # Public: Error raised when one or more after_commit callbacks fail while
+  # being run after a successful interactor invocation. Callback failures do
+  # not roll back the interactor; instead all remaining callbacks are still
+  # run and every callback error is collected into this aggregate error.
+  class AfterCommitError < StandardError
+    # Internal: Gets the Array of errors raised by individual after_commit
+    # callbacks, in the order the callbacks were run.
+    attr_reader :errors
+
+    # Internal: Initialize an Interactor::AfterCommitError.
+    #
+    # errors - An Array of errors raised by after_commit callbacks.
+    #           (default: [])
+    #
+    # Examples
+    #
+    #   Interactor::AfterCommitError.new
+    #   # => #<Interactor::AfterCommitError: Interactor::AfterCommitError>
+    #
+    #   error = Interactor::AfterCommitError.new([RuntimeError.new("boom")])
+    #   # => #<Interactor::AfterCommitError: 1 after_commit callback(s) failed: boom>
+    #   error.errors
+    #   # => [#<RuntimeError: boom>]
+    #
+    # Returns the Interactor::AfterCommitError.
+    def initialize(errors = [])
+      @errors = errors
+      super("#{errors.size} after_commit callback(s) failed: #{errors.map(&:message).join(", ")}")
+    end
+  end
 end

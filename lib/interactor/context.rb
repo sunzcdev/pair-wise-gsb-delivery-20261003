@@ -142,6 +142,98 @@ module Interactor
       _called << interactor
     end
 
+    # Public: Register a callback to be run after the outermost interactor
+    # invocation sharing this context completes successfully. Callbacks are
+    # run in the order they are registered. If the invocation fails or is
+    # rolled back, all registered callbacks are discarded without being run.
+    #
+    # block - A block to be called once the outermost invocation commits.
+    #
+    # Examples
+    #
+    #   context = Interactor::Context.new
+    #   # => #<Interactor::Context>
+    #   context.after_commit { puts "committed" }
+    #   # => [#<Proc>]
+    #
+    # Returns the Array of registered after_commit callbacks.
+    def after_commit(&block)
+      _after_commit_callbacks << block
+    end
+
+    # Internal: An Array of callbacks registered to run after the outermost
+    # interactor invocation sharing this context commits.
+    #
+    # Examples
+    #
+    #   context = Interactor::Context.new
+    #   # => #<Interactor::Context>
+    #   context._after_commit_callbacks
+    #   # => []
+    #
+    # Returns an Array of Procs or an empty Array.
+    def _after_commit_callbacks
+      @_after_commit_callbacks ||= []
+    end
+
+    # Internal: Track entry into an interactor invocation using this context.
+    # The outermost invocation for the context forms the commit boundary:
+    # registered after_commit callbacks belong to it, even when registered by
+    # nested interactors sharing the context.
+    #
+    # Returns true if this invocation is the outermost one for the context.
+    def _open_commit_boundary
+      @_commit_boundary_depth = _commit_boundary_depth + 1
+      _commit_boundary_depth == 1
+    end
+
+    # Internal: Track exit from an interactor invocation using this context.
+    #
+    # Returns nothing.
+    def _close_commit_boundary
+      @_commit_boundary_depth = _commit_boundary_depth - 1
+    end
+
+    # Internal: The number of interactor invocations currently in flight for
+    # this context.
+    #
+    # Returns an Integer.
+    def _commit_boundary_depth
+      @_commit_boundary_depth ||= 0
+    end
+
+    # Internal: Discard all registered after_commit callbacks without running
+    # them. Used when the invocation owning the commit boundary fails or is
+    # rolled back, so no callbacks leak into a later invocation.
+    #
+    # Returns nothing.
+    def _discard_after_commit_callbacks
+      _after_commit_callbacks.clear
+    end
+
+    # Internal: Run all registered after_commit callbacks in registration
+    # order. Callbacks registered while draining (for example by a brand-new
+    # interactor invocation with its own commit boundary) are not appended to
+    # the batch currently being run. A failing callback does not stop the
+    # remaining callbacks from running.
+    #
+    # Raises Interactor::AfterCommitError aggregating any callback errors.
+    def _drain_after_commit_callbacks
+      errors = []
+      until _after_commit_callbacks.empty?
+        batch = _after_commit_callbacks
+        @_after_commit_callbacks = []
+        batch.each do |callback|
+          begin
+            callback.call
+          rescue => error
+            errors << error
+          end
+        end
+      end
+      raise AfterCommitError.new(errors) unless errors.empty?
+    end
+
     # Public: Roll back the Interactor::Context. Any interactors to which this
     # context has been passed and which have been successfully called are asked
     # to roll themselves back by invoking their "rollback" instance methods.

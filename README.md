@@ -120,6 +120,29 @@ end
 
 NB: After hooks are only run on success.  If the `fail!` method is called, the interactor's after hooks are not run.
 
+#### After Commit Callbacks
+
+An after hook still runs before the rest of an organizer's steps, so it is the
+wrong place for side effects like email notifications: a later step may still
+fail and roll the whole invocation back. Use `after_commit` inside `call` to
+defer a callback until the outermost interactor sharing the context has
+completed successfully:
+
+```ruby
+def call
+  context.user = User.create!(user_params)
+  after_commit { UserMailer.welcome(context.user).deliver_later }
+end
+```
+
+Callbacks registered by nested interactors or organizers join the same batch
+and run in registration order once the outermost call commits. If the
+invocation fails or is rolled back, the whole batch is discarded. A callback
+that starts a brand-new interactor call gets its own independent commit
+boundary. A failing callback does not roll the business call back and does not
+stop the remaining callbacks; any callback errors are aggregated and raised as
+an `Interactor::AfterCommitError` exposing them via `#errors`.
+
 #### Around Hooks
 
 You can also define around hooks in the same way as before or after hooks, using
