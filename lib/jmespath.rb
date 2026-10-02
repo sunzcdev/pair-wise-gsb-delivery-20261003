@@ -9,6 +9,7 @@ module JMESPath
   require 'jmespath/lexer'
   require 'jmespath/nodes'
   require 'jmespath/parser'
+  require 'jmespath/query_set'
   require 'jmespath/runtime'
   require 'jmespath/token'
   require 'jmespath/token_stream'

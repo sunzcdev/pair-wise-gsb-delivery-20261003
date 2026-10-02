@@ -36,6 +36,9 @@ module JMESPath
     end
 
     class Chain
+      # @api private
+      attr_reader :children
+
       def initialize(children)
         @children = children
       end
