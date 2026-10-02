@@ -799,6 +799,39 @@ module GraphQL
         end
       end
 
+      # A limit on how deeply input argument values may nest (lists and input
+      # objects), measured after variables and default values are applied.
+      # @return [nil, Integer]
+      def max_input_depth(new_max_input_depth = NOT_CONFIGURED)
+        if NOT_CONFIGURED.equal?(new_max_input_depth)
+          defined?(@max_input_depth) ? @max_input_depth : find_inherited_value(:max_input_depth)
+        else
+          @max_input_depth = new_max_input_depth
+        end
+      end
+
+      # A limit on the number of scalar values an input argument may contain,
+      # measured after variables and default values are applied.
+      # @return [nil, Integer]
+      def max_input_elements(new_max_input_elements = NOT_CONFIGURED)
+        if NOT_CONFIGURED.equal?(new_max_input_elements)
+          defined?(@max_input_elements) ? @max_input_elements : find_inherited_value(:max_input_elements)
+        else
+          @max_input_elements = new_max_input_elements
+        end
+      end
+
+      # A limit on the total number of bytes in String values of an input
+      # argument, measured after variables and default values are applied.
+      # @return [nil, Integer]
+      def max_input_string_bytes(new_max_input_string_bytes = NOT_CONFIGURED)
+        if NOT_CONFIGURED.equal?(new_max_input_string_bytes)
+          defined?(@max_input_string_bytes) ? @max_input_string_bytes : find_inherited_value(:max_input_string_bytes)
+        else
+          @max_input_string_bytes = new_max_input_string_bytes
+        end
+      end
+
       def default_page_size(new_default_page_size = nil)
         if new_default_page_size
           @default_page_size = new_default_page_size

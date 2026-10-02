@@ -8,6 +8,8 @@
 
 ### New features
 
+- Input value budgets: `max_input_depth`, `max_input_elements`, and `max_input_string_bytes` limit the size of argument values after variables and defaults are applied (variables used in several positions are counted per position; unexecuted operations don't count)
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

@@ -319,3 +319,56 @@ query {
   }
 }
 ```
+
+## Input value budgets
+
+`max_depth` and `max_complexity` constrain the _selection_ part of an operation, and `max_query_string_tokens` constrains query text length, but neither limits how much data a client can send in _arguments_. A very short query can still carry a huge payload through GraphQL variables, for example:
+
+```graphql
+query($tags: [String!]) {
+  createPost(tags: $tags) { id }
+}
+```
+
+To bound this, configure input value budgets:
+
+```ruby
+class MySchema < GraphQL::Schema
+  # Maximum nesting of lists and input objects in an argument value
+  max_input_depth 5
+
+  # Maximum number of scalar values (including enums and null) per argument
+  max_input_elements 1000
+
+  # Maximum total String byte length per argument
+  max_input_string_bytes 10_000
+end
+```
+
+Any limit may also be provided per query:
+
+```ruby
+GraphQL::Query.new(MySchema, query_string, variables: vars, max_input_elements: 5000)
+```
+
+### Counting rules
+
+Budgets are measured on the _resolved_ value actually used by each top-level field or directive argument position:
+
+- Literal values, provided variables, variable default values, and argument/input-object field default values all use the same rules.
+- When a variable is used in several argument positions, its value is counted once for each position (each position receives its own copy).
+- Only the selected operation is visited; arguments belonging to unexecuted operations do not consume budget.
+- String size is counted with `String#bytesize`, so multibyte content is measured in bytes.
+- Depth counts nesting levels of lists and input objects; a scalar at the top level has depth 1.
+- Elements counts scalar leaves; object keys and list containers themselves are not elements.
+
+Counting is purely structural: custom scalar `coerce_input` methods are not run an extra time for the budget, and the check happens during query analysis, before any field resolver begins. Errors are attached to the argument position whose value exceeds a limit:
+
+```ruby
+result = MySchema.execute(query_string, variables: vars)
+result.to_h["errors"]
+# [{
+#   "message" => "Input value has 1200 elements, which exceeds max input elements of 1000",
+#   "locations" => [{ "line" => 1, "column" => 31 }],
+# }]
+```

@@ -96,6 +96,15 @@ module GraphQL
       end
     end
 
+    # @return [nil, Numeric] per-query override for {Schema.max_input_depth}
+    attr_reader :max_input_depth
+
+    # @return [nil, Numeric] per-query override for {Schema.max_input_elements}
+    attr_reader :max_input_elements
+
+    # @return [nil, Numeric] per-query override for {Schema.max_input_string_bytes}
+    attr_reader :max_input_string_bytes
+
     attr_writer :query_string
 
     # @return [GraphQL::Language::Nodes::Document]
@@ -132,8 +141,11 @@ module GraphQL
     # @param root_value [Object] the object used to resolve fields on the root type
     # @param max_depth [Numeric] the maximum number of nested selections allowed for this query (falls back to schema-level value)
     # @param max_complexity [Numeric] the maximum field complexity for this query (falls back to schema-level value)
+    # @param max_input_depth [Numeric] the maximum nesting depth of input argument values (falls back to schema-level value)
+    # @param max_input_elements [Numeric] the maximum number of scalar values per input argument (falls back to schema-level value)
+    # @param max_input_string_bytes [Numeric] the maximum number of bytes in String values per input argument (falls back to schema-level value)
     # @param visibility_profile [Symbol] Another way to assign `context[:visibility_profile]`
-    def initialize(schema, query_string = nil, query: nil, document: nil, context: nil, variables: nil, multiplex: nil, validate: true, static_validator: nil, visibility_profile: nil, subscription_topic: nil, operation_name: nil, root_value: nil, max_depth: schema.max_depth, max_complexity: schema.max_complexity, warden: nil, use_visibility_profile: nil)
+    def initialize(schema, query_string = nil, query: nil, document: nil, context: nil, variables: nil, multiplex: nil, validate: true, static_validator: nil, visibility_profile: nil, subscription_topic: nil, operation_name: nil, root_value: nil, max_depth: schema.max_depth, max_complexity: schema.max_complexity, max_input_depth: schema.max_input_depth, max_input_elements: schema.max_input_elements, max_input_string_bytes: schema.max_input_string_bytes, warden: nil, use_visibility_profile: nil)
       # Even if `variables: nil` is passed, use an empty hash for simpler logic
       variables ||= {}
       @multiplex = multiplex
@@ -204,6 +216,9 @@ module GraphQL
       @validation_pipeline = nil
       @max_depth = max_depth
       @max_complexity = max_complexity
+      @max_input_depth = max_input_depth
+      @max_input_elements = max_input_elements
+      @max_input_string_bytes = max_input_string_bytes
 
       @result_values = nil
       @executed = false
@@ -511,7 +526,10 @@ module GraphQL
         parse_error: parse_error,
         operation_name_error: operation_name_error,
         max_depth: @max_depth,
-        max_complexity: @max_complexity
+        max_complexity: @max_complexity,
+        max_input_depth: @max_input_depth,
+        max_input_elements: @max_input_elements,
+        max_input_string_bytes: @max_input_string_bytes
       )
     end
 
