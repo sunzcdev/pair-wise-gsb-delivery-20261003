@@ -73,11 +73,25 @@ module AASM::Core
       [display_name, name.to_s]
     end
 
+    # how long (in seconds, relative to the state machine's timeout clock)
+    # one stay in this state may last before the expire event is attempted
+    def expires_after
+      @options[:expires_after]
+    end
+
+    # the event attempted when the stay in this state exceeds expires_after
+    def expire_event
+      @options[:on_expire]
+    end
+
   private
 
     def update(options = {})
       if options.key?(:display)
         @default_display_name = options.delete(:display)
+      end
+      if options.key?(:expires_after) != options.key?(:on_expire)
+        raise ArgumentError, "state :#{name} must declare :expires_after and :on_expire together"
       end
       @options = options
       self

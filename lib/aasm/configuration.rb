@@ -41,6 +41,10 @@ module AASM
     # Configure a logger, with default being a Logger to STDERR
     attr_accessor :logger
 
+    # callable returning the current monotonic time used for state timeouts
+    # (defaults to Process.clock_gettime(Process::CLOCK_MONOTONIC))
+    attr_accessor :timeout_clock
+
     class << self
       attr_accessor :hide_warnings
     end

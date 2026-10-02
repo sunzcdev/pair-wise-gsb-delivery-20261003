@@ -1,6 +1,7 @@
 require 'aasm/version'
 require 'aasm/errors'
 require 'aasm/configuration'
+require 'aasm/timeout'
 require 'aasm/base'
 require 'aasm/dsl_helper'
 require 'aasm/instance_base'

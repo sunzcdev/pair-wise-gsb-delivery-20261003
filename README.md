@@ -17,6 +17,7 @@
   - [Multiple state machines per class](#multiple-state-machines-per-class)
     - [Handling naming conflicts between multiple state machines](#handling-naming-conflicts-between-multiple-state-machines)
     - [Binding event](#binding-event)
+    - [State timeouts](#state-timeouts)
   - [Auto-generated Status Constants](#auto-generated-status-constants)
   - [Extending AASM](#extending-aasm)
   - [ActiveRecord](#activerecord)
@@ -632,6 +633,69 @@ example.ask
 example.aasm(:work).current_state #=> :processing
 example.aasm(:question).current_state #=> :asked
 ```
+
+### State timeouts
+
+A state can declare how long one stay in it may last. When the stay exceeds
+the declared duration, the given event is attempted. AASM itself never
+creates threads or timers: the caller drives advancement by passing the
+current monotonic time to `advance_timeouts`.
+
+```ruby
+class Job
+  include AASM
+
+  aasm do
+    state :waiting, initial: true, expires_after: 30, on_expire: :expire
+    state :expired
+
+    event :expire do
+      transitions from: :waiting, to: :expired
+    end
+  end
+end
+
+job = Job.new
+job.aasm.current_state           #=> :waiting (deadline armed on entry)
+job.aasm.timeout_remaining(now)  #=> seconds left, 0 when overdue, nil when
+                                 #   no timeout is armed; never fires anything
+job.aasm.advance_timeouts(now)   #=> [#<AASM::TimeoutResult status=:fired ...>]
+job.aasm.current_state           #=> :expired
+```
+
+`now` is any monotonic time in seconds. By default deadlines are armed with
+`Process.clock_gettime(Process::CLOCK_MONOTONIC)`; pass
+`aasm timeout_clock: -> { ... }` to use another (e.g. a manual) clock.
+`expires_after` accepts a number, a method name, or a proc evaluated on the
+record.
+
+Deadline ownership:
+
+- A deadline belongs to one successful entry into a state. It is armed when
+  the state is entered (including the initial state, when it is first
+  entered) and voided as soon as the state is left.
+- Leaving and re-entering the same state (including self transitions) arms a
+  brand new deadline; the old record can never fire the new stay.
+- A failed transition (guard rejection, exception, failed persistence) does
+  not arm, move, or clear the current deadline.
+- Deadlines are tracked per state machine, so named state machines
+  (`aasm(:review) ...`) each have their own, advanced via
+  `record.aasm(:review).advance_timeouts(now)`.
+
+Advancement semantics:
+
+- Expiry goes through the normal event machinery, including guards and
+  callbacks. One `advance_timeouts` call processes only the record that was
+  already expired when the call started; a state entered from a callback
+  during the pass (even a zero-wait one) is left for the next call, so
+  advancement never spins.
+- The result is explicit: `AASM::TimeoutResult` with `status` `:fired`,
+  `:rejected` (guard refused / invalid transition) or `:error` (exception,
+  available as `exception`). After a rejection or error the record stays
+  armed, so the caller can explicitly retry by calling `advance_timeouts`
+  again, or cancel with `aasm.cancel_timeout`. Nothing is ever re-triggered
+  implicitly: reading `timeout_remaining` or `timeout_expired?` is a pure
+  query.
 
 ### Auto-generated Status Constants
 

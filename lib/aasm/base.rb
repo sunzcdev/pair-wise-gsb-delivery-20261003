@@ -54,6 +54,10 @@ module AASM
       # Configure a logger, with default being a Logger to STDERR
       configure :logger, Logger.new(STDERR)
 
+      # clock used to arm state timeouts (see AASM::InstanceBase#advance_timeouts);
+      # nil means Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      configure :timeout_clock, nil
+
       # setup timestamp-setting callback if enabled
       setup_timestamps(@name)
 
