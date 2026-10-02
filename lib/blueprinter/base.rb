@@ -136,6 +136,13 @@ module Blueprinter
       # @option options [Hash, Proc] :options Additional options to merge into the
       #   options hash passed to the nested blueprint. Can be a static Hash or a Proc
       #   that receives the parent object and returns a Hash.
+      # @option options [#call] :preload Optional batch loader invoked once per
+      #   render scope with the unique objects (after view, exclusion, and
+      #   +:if+/+:unless+ filtering) that output this association. It must return
+      #   a Hash keyed by those objects; each value (including +nil+) is rendered
+      #   instead of reading the association per object. A missing key raises
+      #   Blueprinter::Errors::PreloadResult rather than falling back to
+      #   per-object extraction.
       # @yield [object, options] The object and the options passed to render are
       #   also yielded to the block.
       #

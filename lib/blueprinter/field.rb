@@ -14,13 +14,18 @@ module Blueprinter
     end
 
     def extract(object, local_options)
-      extractor.extract(method, object, local_options, options)
+      extractor.extract(method, object, local_options, field_options_for_extraction)
     end
 
     def skip?(field_name, object, local_options)
       return true if if_callable && !if_callable.call(field_name, object, local_options)
 
       unless_callable && unless_callable.call(field_name, object, local_options)
+    end
+
+    # @api private
+    def field_options_for_extraction
+      @_field_options ||= options.merge(__field__: self)
     end
 
     private

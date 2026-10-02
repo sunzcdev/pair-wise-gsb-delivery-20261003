@@ -443,6 +443,48 @@ class DriverBlueprint < Blueprinter::Base
 end
 ```
 
+#### Batch-preloading associations
+
+When rendering a collection, associations are normally read from each object
+one at a time. To avoid the resulting N+1 lookups, give an association a
+`preload` callable. It runs **once per render scope** and receives the unique
+objects in that scope which actually output the association (after the view,
+`exclude`, and the association's own `:if`/`:unless` conditions are applied).
+It must return a `Hash` keyed by those objects; the nested Blueprint then
+renders the preloaded values instead of reading the association per object.
+
+```ruby
+class UserBlueprint < Blueprinter::Base
+  identifier :id
+  field :name
+  association :company,
+              blueprint: CompanyBlueprint,
+              preload: ->(users) {
+                companies = Company.where(id: users.map(&:company_id)).index_by(&:id)
+                users.each_with_object({}) do |user, map|
+                  map[user] = companies[user.company_id]
+                end
+              }
+end
+```
+
+Notes:
+
+- The same object appearing multiple times in the rendered collection is
+  passed to the preloader only once, while every position is still rendered.
+- A `nil` value stored for an object means "empty association" and renders as
+  `nil` (subject to `:default`, `:default_if`, and `:exclude_if_nil`).
+- Omitting an object from the returned Hash raises
+  `Blueprinter::Errors::PreloadResult`; Blueprinter never silently falls back
+  to reading the association from the object. Returning anything other than a
+  `Hash` raises the same error.
+- Preloading is per render scope: a single-object render invokes the
+  preloader with a one-element array, and a nested association is preloaded
+  separately for each collection rendered by its parent Blueprint. Aliased
+  associations (distinct `:name`) each have their own preloader invocation.
+- `preload` is framework agnostic; the callable can read from Active Record,
+  another store, or an in-memory cache.
+
 </details>
 
 <details>

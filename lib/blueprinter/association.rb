@@ -2,6 +2,7 @@
 
 require 'blueprinter/field'
 require 'blueprinter/blueprint_validator'
+require 'blueprinter/association_preloader'
 require 'blueprinter/extractors/association_extractor'
 
 module Blueprinter
@@ -14,10 +15,17 @@ module Blueprinter
     # @param parent_blueprint [Blueprinter::Base] The blueprint that this association is being defined within
     # @param extractor [Blueprinter::Extractor] The extractor to use when retrieving the associated data
     # @param options [Hash]
+    # @option options [#call] :preload An optional callable that receives the
+    #   unique objects in the current render scope which actually output this
+    #   association (after view, exclusion and +:if+/+:unless+ filtering) and
+    #   returns a Hash keyed by those objects. The value for each object
+    #   (including +nil+, meaning an explicitly empty association) is then used
+    #   instead of extracting the association per object.
     #
     # @return [Blueprinter::Association]
     def initialize(method:, name:, blueprint:, view:, parent_blueprint:, extractor: AssociationExtractor.new, options: {})
       BlueprintValidator.validate!(blueprint)
+      validate_preload!(options[:preload])
 
       super(
         method,
@@ -30,6 +38,15 @@ module Blueprinter
           association: true
         )
       )
+    end
+
+    private
+
+    def validate_preload!(preload)
+      return if preload.nil?
+      return if preload.respond_to?(:call)
+
+      raise ArgumentError, "preload for association '#{name}' must respond to #call"
     end
   end
 end

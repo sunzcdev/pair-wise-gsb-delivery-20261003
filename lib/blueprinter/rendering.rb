@@ -3,6 +3,7 @@
 require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
+require 'blueprinter/association_preloader'
 require 'blueprinter/deprecation'
 
 module Blueprinter
@@ -128,29 +129,43 @@ module Blueprinter
       local_options_with_view = local_options.merge(view: view_name)
 
       if array_like?(object)
+        fields = view_collection.fields_for(view_name)
+        preload_context = AssociationPreloader.preload!(fields, object, local_options_with_view)
         object.map do |obj|
           object_to_hash(
             obj,
             view_name:,
-            local_options: local_options_with_view
+            fields:,
+            local_options: local_options_with_view,
+            preload_context:
           )
         end
       else
+        fields = view_collection.fields_for(view_name)
+        preload_context = AssociationPreloader.preload!(fields, [object], local_options_with_view)
         object_to_hash(
           object,
           view_name:,
-          local_options: local_options_with_view
+          fields:,
+          local_options: local_options_with_view,
+          preload_context:
         )
       end
     end
 
-    def object_to_hash(object, view_name:, local_options:)
+    def object_to_hash(object, view_name:, fields:, local_options:, preload_context: nil)
       result_hash = {}
 
-      view_collection.fields_for(view_name).each do |field|
+      fields.each do |field|
         next if field.skip?(field.name, object, local_options)
 
-        value = field.extract(object, local_options)
+        extraction_options = if field.options[:preload]
+                               local_options.merge(AssociationPreloader::CONTEXT_KEY => preload_context)
+                             else
+                               local_options
+                             end
+
+        value = extract_field(field, object, extraction_options)
         next if value.nil? && field.options[:exclude_if_nil]
 
         result_hash[field.name] = value
@@ -161,6 +176,10 @@ module Blueprinter
       end
 
       result_hash
+    end
+
+    def extract_field(field, object, local_options)
+      field.extractor.extract(field.method, object, local_options, field.field_options_for_extraction)
     end
 
     def jsonify(data)

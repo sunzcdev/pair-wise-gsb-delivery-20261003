@@ -1,5 +1,5 @@
 ## Unreleased
---
+- 🚀 [FEATURE] Adds an optional `preload` callable to associations for batch-loading associated data once per render scope. The callable receives the unique objects that actually output the association (after view, exclusion, and `:if`/`:unless` filtering) and must return a Hash keyed by those objects; missing entries raise `Blueprinter::Errors::PreloadResult` instead of falling back to per-object extraction.
 
 ## 1.3.0 - 2026/04/14
 - 🚀 [FEATURE] Adds support for `Symbol#to_proc` syntax in fields and identifiers. See [#546](https://github.com/procore-oss/blueprinter/pull/546). Thanks to [@tob1k](https://github.com/tob1k).

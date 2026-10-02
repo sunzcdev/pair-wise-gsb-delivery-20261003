@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'blueprinter/extractor'
+require 'blueprinter/association_preloader'
 require 'blueprinter/empty_types'
 
 module Blueprinter
@@ -19,11 +20,23 @@ module Blueprinter
                                   options
                                 end
 
-      value = @extractor.extract(association_name, object, local_options, options_without_default)
+      field = options[:__field__]
+      nested_local_options = strip_preload_context(local_options)
+
+      value = if field&.options&.key?(:preload)
+                AssociationPreloader.fetch(
+                  local_options[AssociationPreloader::CONTEXT_KEY],
+                  field,
+                  object
+                )
+              else
+                @extractor.extract(association_name, object, nested_local_options, options_without_default)
+              end
+
       return default_value(options) if use_default_value?(value, options[:default_if])
 
       # Merge in association options - supports both static Hash and dynamic Proc
-      local_options = merge_association_options(local_options, options[:options], object)
+      local_options = merge_association_options(nested_local_options, options[:options], object)
 
       view = options[:view] || :default
       blueprint = association_blueprint(options[:blueprint], value)
@@ -31,6 +44,12 @@ module Blueprinter
     end
 
     private
+
+    def strip_preload_context(local_options)
+      return local_options unless local_options.key?(AssociationPreloader::CONTEXT_KEY)
+
+      local_options.except(AssociationPreloader::CONTEXT_KEY)
+    end
 
     def merge_association_options(local_options, association_options, object)
       return local_options unless association_options
