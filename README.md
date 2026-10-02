@@ -95,6 +95,65 @@ include:
   default UDP dialer function.
 
 
+## Selecting an offset from multiple sources
+
+When responses have already been collected from several servers, the
+pure-computation `SelectClockOffset` function can be used to choose a single
+clock offset without querying the network or touching the system clock. Each
+input pairs a `Response` with a source ID.
+
+Every sample is first checked with `Response.Validate`. Each distinct source
+ID then casts at most one vote, using the first valid sample supplied for it;
+repeated samples from the same source are reported but never gain extra
+votes.
+
+Each voting source defines the closed synchronization interval
+`[ClockOffset - RootDistance, ClockOffset + RootDistance]`. Using the
+intersection algorithm from [RFC 5905 section
+12.1](https://tools.ietf.org/html/rfc5905#section-12), the lowest offset
+window covered by at least `MinSources` (by default a simple majority)
+distinct sources is selected. Sources covering the window are the
+"truechimers" and determine the suggested offset (the median of their clock
+offsets); the rest are "falsetickers".
+
+```go
+sources := []ntp.TimeSource{
+    {SourceID: "a.example", Response: responseA},
+    {SourceID: "b.example", Response: responseB},
+    {SourceID: "c.example", Response: responseC},
+}
+
+result, err := ntp.SelectClockOffset(sources, ntp.SelectOptions{})
+if errors.Is(err, ntp.ErrNoConsistentIntersection) {
+    // No majority of sources agrees; the sources' offsets are deliberately
+    // not averaged together. Inspect result.Sources for the reasons.
+} else if err != nil {
+    log.Fatal(err)
+}
+
+correctedNow := time.Now().Add(result.Offset)
+for _, s := range result.Sources {
+    if s.Included {
+        fmt.Printf("%s included: %s\n", s.SourceID, s.Reason)
+    } else {
+        fmt.Printf("%s excluded (%s): %s\n", s.SourceID, s.Reason, s.Detail)
+    }
+}
+```
+
+Deterministic rules apply to every edge case:
+* Intervals are closed, so two intervals that merely touch at an endpoint
+  intersect, producing a zero-width window.
+* If more than one window has quorum coverage, the lowest one wins.
+* When two offsets compare equal, the earlier input sample orders first.
+* The median of an even number of offsets is their midpoint, with a
+  half-nanosecond rounded toward zero.
+* A sample whose interval endpoints cannot be represented as a
+  `time.Duration` is excluded with an `overflow` reason rather than clamped.
+
+Set `MinSources` to require a specific number of agreeing distinct sources;
+the zero value requests a simple majority (`n/2 + 1`) of the valid sources.
+
 ## Logging responses
 
 To log an NTP query's response, use the response's `Log` function:
