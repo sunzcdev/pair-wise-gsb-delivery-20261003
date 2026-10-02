@@ -514,6 +514,7 @@ func (r *Raft) runLeader() {
 		for _, p := range r.leaderState.replState {
 			close(p.stopCh)
 		}
+		r.replWindows.Clear()
 
 		// Respond to all inflight operations
 		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
@@ -608,6 +609,10 @@ func (r *Raft) startStopReplication() {
 				notifyCh:            make(chan struct{}, 1),
 				stepDown:            r.leaderState.stepDown,
 			}
+			if wc := r.config().ReplicationWindow; wc != nil {
+				s.window = newAdaptiveWindow(server.ID, *wc)
+				r.replWindows.Store(server.ID, s.window)
+			}
 
 			r.leaderState.replState[server.ID] = s
 			r.goFunc(func() { r.replicate(s) })
@@ -638,6 +643,7 @@ func (r *Raft) startStopReplication() {
 		repl.stopCh <- lastIdx
 		close(repl.stopCh)
 		delete(r.leaderState.replState, serverID)
+		r.replWindows.Delete(serverID)
 		r.observe(PeerObservation{Peer: repl.peer, Removed: true})
 	}
 

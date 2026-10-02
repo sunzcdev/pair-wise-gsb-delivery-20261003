@@ -2,6 +2,7 @@
 
 IMPROVEMENETS
 
+* Added an optional adaptive per-follower replication window (`Config.ReplicationWindow`) that bounds in-flight pipelined AppendEntries requests and log bytes, adapting to connection latency and failures per follower. Window diagnostics are available via `Raft.ReplicationWindowDiagnostics` and `raft.replication.window*` metrics.
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
 
 # 1.7.0 (June 5th, 2024)

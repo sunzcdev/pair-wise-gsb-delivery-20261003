@@ -726,6 +726,11 @@ type MakeClusterOpts struct {
 	MonotonicLogs      bool
 	CommitTrackingLogs bool
 	PropagateError     bool // If true, return errors instead of calling t.Fatal
+
+	// WrapTransport, if set, is applied to each node's transport before the
+	// cluster is wired up. It allows tests to interpose a transport double
+	// (e.g. one that injects latency or loss) without changing the harness.
+	WrapTransport func(LoopbackTransport) LoopbackTransport
 }
 
 // makeCluster will return a cluster with the given config and number of peers.
@@ -786,7 +791,11 @@ func makeCluster(t *testing.T, opts *MakeClusterOpts) (*cluster, error) {
 		c.snaps = append(c.snaps, snap)
 
 		addr, trans := NewInmemTransport("")
-		c.trans = append(c.trans, trans)
+		var loopback LoopbackTransport = trans
+		if opts.WrapTransport != nil {
+			loopback = opts.WrapTransport(trans)
+		}
+		c.trans = append(c.trans, loopback)
 		localID := ServerID(fmt.Sprintf("server-%s", addr))
 		if opts.Conf.ProtocolVersion < 3 {
 			localID = ServerID(addr)

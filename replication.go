@@ -93,6 +93,12 @@ type followerReplication struct {
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
+
+	// window, when non-nil, bounds the number of in-flight AppendEntries
+	// requests and log bytes to this follower during pipeline replication
+	// and adapts the limit based on feedback from the current connection.
+	// It is nil unless Config.ReplicationWindow is set.
+	window *adaptiveWindow
 }
 
 // notifyAll is used to notify all the waiting verify futures
@@ -463,8 +469,16 @@ func (r *Raft) pipelineReplicate(s *followerReplication) error {
 	stopCh := make(chan struct{})
 	finishCh := make(chan struct{})
 
+	// Start a new window generation for this connection. Late completions
+	// from a previous connection carry an older generation and are ignored,
+	// so they cannot adjust the window for this connection.
+	var generation uint64
+	if s.window != nil {
+		generation = s.window.begin()
+	}
+
 	// Start a dedicated decoder
-	r.goFunc(func() { r.pipelineDecode(s, pipeline, stopCh, finishCh) })
+	r.goFunc(func() { r.pipelineDecode(s, pipeline, stopCh, finishCh, generation) })
 
 	// Start pipeline sends at the last good nextIndex
 	nextIndex := atomic.LoadUint64(&s.nextIndex)
@@ -478,12 +492,12 @@ SEND:
 		case maxIndex := <-s.stopCh:
 			// Make a best effort to replicate up to this index
 			if maxIndex > 0 {
-				r.pipelineSend(s, pipeline, &nextIndex, maxIndex)
+				r.pipelineSend(s, pipeline, &nextIndex, maxIndex, generation, finishCh)
 			}
 			break SEND
 		case deferErr := <-s.triggerDeferErrorCh:
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx, generation, finishCh)
 			if !shouldStop {
 				deferErr.respond(nil)
 			} else {
@@ -491,10 +505,10 @@ SEND:
 			}
 		case <-s.triggerCh:
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx, generation, finishCh)
 		case <-randomTimeout(r.config().CommitTimeout):
 			lastLogIdx, _ := r.getLastLog()
-			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx)
+			shouldStop = r.pipelineSend(s, pipeline, &nextIndex, lastLogIdx, generation, finishCh)
 		}
 	}
 
@@ -509,16 +523,28 @@ SEND:
 
 // pipelineSend is used to send data over a pipeline. It is a helper to
 // pipelineReplicate.
-func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64) (shouldStop bool) {
+func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *uint64, lastIndex uint64, generation uint64, finishCh <-chan struct{}) (shouldStop bool) {
 	// Create a new append request
 	req := new(AppendEntriesRequest)
 	if err := r.setupAppendEntries(s, req, *nextIdx, lastIndex); err != nil {
 		return true
 	}
 
+	// If an adaptive window is configured, wait until the request fits
+	// within the in-flight request and byte limits before sending. This is
+	// the back-pressure point that throttles a fast leader to a slow
+	// follower without affecting other followers.
+	bytes := entriesBytes(req.Entries)
+	if s.window != nil && !s.window.acquire(generation, bytes, finishCh, r.shutdownCh) {
+		return true
+	}
+
 	// Pipeline the append entries
 	if _, err := p.AppendEntries(req, new(AppendEntriesResponse)); err != nil {
 		r.logger.Error("failed to pipeline appendEntries", "peer", s.peer, "error", err)
+		if s.window != nil {
+			s.window.complete(generation, bytes, 0, true)
+		}
 		return true
 	}
 
@@ -531,7 +557,7 @@ func (r *Raft) pipelineSend(s *followerReplication, p AppendPipeline, nextIdx *u
 }
 
 // pipelineDecode is used to decode the responses of pipelined requests.
-func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}) {
+func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, finishCh chan struct{}, generation uint64) {
 	defer close(finishCh)
 	respCh := p.Consumer()
 	for {
@@ -544,6 +570,14 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 			req, resp := ready.Request(), ready.Response()
 			appendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)
 
+			// Release the window slot and feed the round trip time back
+			// into the adaptive window. Completions from a previous
+			// connection (stale generation) are ignored by the window.
+			readyErr := ready.Error()
+			if s.window != nil {
+				s.window.complete(generation, entriesBytes(req.Entries), time.Since(ready.Start()), readyErr != nil)
+			}
+
 			// Check for a newer term, stop running
 			if resp.Term > req.Term {
 				r.handleStaleTerm(s)
@@ -554,7 +588,7 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 			s.setLastContact()
 
 			// Abort pipeline if not successful
-			if !resp.Success {
+			if readyErr != nil || !resp.Success {
 				return
 			}
 

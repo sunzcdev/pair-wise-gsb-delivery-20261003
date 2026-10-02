@@ -253,8 +253,65 @@ type Config struct {
 	// interface. Otherwise, Raft will fail to start and return ErrIncompatibleLogStore.
 	RestoreCommittedLogs bool
 
+	// ReplicationWindow, when non-nil, enables an optional adaptive window
+	// for pipelined replication to each follower. The window bounds how many
+	// AppendEntries requests and how many log bytes may be in flight to a
+	// single follower at any time, and grows or shrinks based on feedback
+	// (round trip times and failures) observed on the current replication
+	// connection only. This lets a leader keep deep pipelines to fast,
+	// low-latency followers while automatically throttling slow or distant
+	// followers, without one follower's behavior affecting another's.
+	//
+	// When nil (the default), pipelined replication is unbounded, preserving
+	// the historical behavior.
+	ReplicationWindow *ReplicationWindowConfig
+
 	// skipStartup allows NewRaft() to bypass all background work goroutines
 	skipStartup bool
+}
+
+// ReplicationWindowConfig controls the adaptive per-follower replication
+// window used in pipeline replication mode. See Config.ReplicationWindow.
+// The zero value of each field selects a usable default.
+type ReplicationWindowConfig struct {
+	// InitialWindow is the maximum number of in-flight AppendEntries
+	// requests allowed to a follower when a pipeline connection starts.
+	// Defaults to 16.
+	InitialWindow uint64
+
+	// MinWindow is the smallest window the controller will shrink to under
+	// sustained congestion. It must be at least 1 so that replication always
+	// makes progress. Defaults to 1.
+	MinWindow uint64
+
+	// MaxWindow is the largest window the controller will grow to when the
+	// connection is healthy. Defaults to 64.
+	MaxWindow uint64
+
+	// MaxInflightBytes caps the total number of log entry bytes that may be
+	// in flight to a follower. A single request larger than the cap is still
+	// allowed when nothing else is in flight, so replication can never
+	// deadlock. Defaults to 8MiB.
+	MaxInflightBytes uint64
+}
+
+// withDefaults returns a copy of the config with all zero fields replaced by
+// their default values.
+func (wc *ReplicationWindowConfig) withDefaults() ReplicationWindowConfig {
+	out := *wc
+	if out.InitialWindow == 0 {
+		out.InitialWindow = defaultInitialWindow
+	}
+	if out.MinWindow == 0 {
+		out.MinWindow = defaultMinWindow
+	}
+	if out.MaxWindow == 0 {
+		out.MaxWindow = defaultMaxWindow
+	}
+	if out.MaxInflightBytes == 0 {
+		out.MaxInflightBytes = defaultMaxInflightBytes
+	}
+	return out
 }
 
 func (conf *Config) getOrCreateLogger() hclog.Logger {
@@ -384,6 +441,17 @@ func ValidateConfig(config *Config) error {
 	}
 	if config.ElectionTimeout < config.HeartbeatTimeout {
 		return fmt.Errorf("ElectionTimeout (%s) must be equal or greater than Heartbeat Timeout (%s)", config.ElectionTimeout, config.HeartbeatTimeout)
+	}
+	if config.ReplicationWindow != nil {
+		wc := config.ReplicationWindow.withDefaults()
+		if wc.InitialWindow < wc.MinWindow {
+			return fmt.Errorf("ReplicationWindow.InitialWindow (%d) cannot be smaller than MinWindow (%d)",
+				wc.InitialWindow, wc.MinWindow)
+		}
+		if wc.MaxWindow < wc.InitialWindow {
+			return fmt.Errorf("ReplicationWindow.MaxWindow (%d) cannot be smaller than InitialWindow (%d)",
+				wc.MaxWindow, wc.InitialWindow)
+		}
 	}
 	return nil
 }

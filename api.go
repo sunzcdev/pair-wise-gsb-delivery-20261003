@@ -122,6 +122,12 @@ type Raft struct {
 	lastContact     time.Time
 	lastContactLock sync.RWMutex
 
+	// replWindows tracks the adaptive replication windows of the followers
+	// this leader is currently replicating to, keyed by server ID. It is
+	// only populated while this server is leader and Config.ReplicationWindow
+	// is enabled, and is used to serve ReplicationWindowDiagnostics.
+	replWindows sync.Map
+
 	// leaderAddr is the current cluster leader Address
 	leaderAddr ServerAddress
 	// LeaderID is the current cluster leader ID
@@ -1268,6 +1274,21 @@ func (r *Raft) Stats() map[string]string {
 // CurrentTerm returns the current term.
 func (r *Raft) CurrentTerm() uint64 {
 	return r.getCurrentTerm()
+}
+
+// ReplicationWindowDiagnostics returns a snapshot of the adaptive
+// replication window for each follower this server is currently replicating
+// to. It returns an empty map unless Config.ReplicationWindow is enabled and
+// this server is the leader. The diagnostics describe how each follower's
+// window has grown, shrunk, and recovered over successive replication
+// connections.
+func (r *Raft) ReplicationWindowDiagnostics() map[ServerID]WindowDiagnostics {
+	out := make(map[ServerID]WindowDiagnostics)
+	r.replWindows.Range(func(key, value interface{}) bool {
+		out[key.(ServerID)] = value.(*adaptiveWindow).diagnostics()
+		return true
+	})
+	return out
 }
 
 // LastIndex returns the last index in stable storage,
