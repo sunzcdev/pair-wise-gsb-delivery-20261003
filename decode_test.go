@@ -5975,12 +5975,20 @@ func TestDecOptions(t *testing.T) {
 		BinaryUnmarshaler:         BinaryUnmarshalerNone,
 		TextUnmarshaler:           TextUnmarshalerTextString,
 		JSONUnmarshalerTranscoder: stubTranscoder{},
+		MaxSharedValues:           16,
+		MaxSharedRefs:             16,
 	}
 	ov := reflect.ValueOf(opts1)
 	for i := range ov.NumField() {
 		fv := ov.Field(i)
 		if fv.IsZero() {
-			t.Errorf("options field %q is unset or set to the zero value for its type", ov.Type().Field(i).Name)
+			fn := ov.Type().Field(i).Name
+			if fn == "SharedRef" {
+				// SharedRefAllowed requires TagsMd=TagsAllowed, which this
+				// options roundtrip intentionally does not use.
+				continue
+			}
+			t.Errorf("options field %q is unset or set to the zero value for its type", fn)
 		}
 	}
 	dm, err := opts1.DecMode()

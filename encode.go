@@ -632,6 +632,10 @@ type EncOptions struct {
 
 	// ToIndefArrayStructTag specifies whether the `toindefarray` struct tag option is honored.
 	ToIndefArrayStructTag ToIndefArrayStructTagMode
+
+	// SharedRef specifies whether to encode repeated occurrences of the same eligible Go
+	// pointer using CBOR tags 28 and 29.
+	SharedRef SharedRefMode
 }
 
 // CanonicalEncOptions returns EncOptions for "Canonical CBOR" encoding,
@@ -822,6 +826,12 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 	if opts.TagsMd == TagsForbidden && opts.TimeTag == EncTagRequired {
 		return nil, errors.New("cbor: cannot set TagsMd to TagsForbidden when TimeTag is EncTagRequired")
 	}
+	if opts.TagsMd == TagsForbidden && opts.SharedRef == SharedRefAllowed {
+		return nil, errors.New("cbor: cannot set TagsMd to TagsForbidden when SharedRef is SharedRefAllowed")
+	}
+	if opts.SharedRef == SharedRefAllowed && opts.Sort != SortNone {
+		return nil, errors.New("cbor: cannot set SharedRef to SharedRefAllowed with map sorting")
+	}
 	if !opts.OmitEmpty.valid() {
 		return nil, errors.New("cbor: invalid OmitEmpty " + strconv.Itoa(int(opts.OmitEmpty)))
 	}
@@ -848,6 +858,9 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 	if !opts.ToIndefArrayStructTag.valid() {
 		return nil, errors.New("cbor: invalid ToIndefArrayStructTag " + strconv.Itoa(int(opts.ToIndefArrayStructTag)))
 	}
+	if !opts.SharedRef.valid() {
+		return nil, errors.New("cbor: invalid SharedRef " + strconv.Itoa(int(opts.SharedRef)))
+	}
 	if opts.IndefLength == IndefLengthForbidden && opts.ToIndefArrayStructTag == ToIndefArrayStructTagAllowed {
 		return nil, errors.New("cbor: cannot set ToIndefArrayStructTag to ToIndefArrayStructTagAllowed when IndefLength is IndefLengthForbidden")
 	}
@@ -873,6 +886,7 @@ func (opts EncOptions) encMode() (*encMode, error) { //nolint:gocritic // ignore
 		textMarshaler:             opts.TextMarshaler,
 		jsonMarshalerTranscoder:   opts.JSONMarshalerTranscoder,
 		toIndefArrayStructTag:     opts.ToIndefArrayStructTag,
+		sharedRef:                 opts.SharedRef,
 	}
 	return &em, nil
 }
@@ -921,6 +935,8 @@ type encMode struct {
 	textMarshaler             TextMarshalerMode
 	jsonMarshalerTranscoder   Transcoder
 	toIndefArrayStructTag     ToIndefArrayStructTagMode
+	sharedRef                 SharedRefMode
+	shared                    *sharedEncodeState
 }
 
 var defaultEncMode, _ = EncOptions{}.encMode()
@@ -1016,6 +1032,7 @@ func (em *encMode) EncOptions() EncOptions {
 		TextMarshaler:           em.textMarshaler,
 		JSONMarshalerTranscoder: em.jsonMarshalerTranscoder,
 		ToIndefArrayStructTag:   em.toIndefArrayStructTag,
+		SharedRef:               em.sharedRef,
 	}
 }
 
@@ -1041,7 +1058,13 @@ func (em *encMode) appendTagBytesSlow(dst []byte, v reflect.Value) []byte {
 func (em *encMode) Marshal(v any) ([]byte, error) {
 	bp := getEncodeBuffer()
 
-	b, err := encode(*bp, em, reflect.ValueOf(v))
+	enc := em
+	if enc.sharedRef == SharedRefAllowed {
+		enc = new(encMode)
+		*enc = *em
+		enc.shared = &sharedEncodeState{}
+	}
+	b, err := encode(*bp, enc, reflect.ValueOf(v))
 	*bp = b[:0]
 	if err != nil {
 		putEncodeBuffer(bp)
@@ -1066,7 +1089,13 @@ func (em *encMode) MarshalToBuffer(v any, buf *bytes.Buffer) error {
 	if buf == nil {
 		return errors.New("cbor: encoding buffer provided by user is nil")
 	}
-	b, err := encode(buf.AvailableBuffer(), em, reflect.ValueOf(v))
+	enc := em
+	if enc.sharedRef == SharedRefAllowed {
+		enc = new(encMode)
+		*enc = *em
+		enc.shared = &sharedEncodeState{}
+	}
+	b, err := encode(buf.AvailableBuffer(), enc, reflect.ValueOf(v))
 	if err != nil {
 		return err
 	}
@@ -1333,12 +1362,17 @@ func (ae arrayEncodeFunc) encode(dst []byte, em *encMode, v reflect.Value) ([]by
 		dst = append(dst, cborNil)
 		return dst, nil
 	}
-	dst = em.appendTagBytes(dst, v)
+	var tagBytes []byte
+	if em.tags != nil {
+		tagBytes = em.appendTagBytes(nil, v)
+	}
 	alen := v.Len()
 	if alen == 0 {
+		dst = append(dst, tagBytes...)
 		dst = append(dst, byte(cborTypeArray))
 		return dst, nil
 	}
+	dst = append(dst, tagBytes...)
 	dst = appendHead(dst, byte(cborTypeArray), uint64(alen)) //nolint:gosec
 	for i := range alen {
 		var err error
@@ -1608,7 +1642,13 @@ func encodeInterface(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
 		dst = append(dst, cborNil)
 		return dst, nil
 	}
-	return encode(dst, em, v.Elem())
+	enc := em
+	if enc.sharedRef == SharedRefAllowed {
+		encCopy := *em
+		enc = &encCopy
+		enc.shared = nil
+	}
+	return encode(dst, enc, v.Elem())
 }
 
 func encodeTime(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
@@ -2113,6 +2153,7 @@ func getEncodeIndirectValueFunc(t reflect.Type) encodeFunc {
 		return nil
 	}
 	return func(dst []byte, em *encMode, v reflect.Value) ([]byte, error) {
+		original := v
 		for v.Kind() == reflect.Pointer && !v.IsNil() {
 			v = v.Elem()
 		}
@@ -2120,7 +2161,9 @@ func getEncodeIndirectValueFunc(t reflect.Type) encodeFunc {
 			dst = append(dst, cborNil)
 			return dst, nil
 		}
-		return f(dst, em, v)
+		return em.encodeShared(dst, original, func(dst []byte, em *encMode, _ reflect.Value) ([]byte, error) {
+			return f(dst, em, v)
+		})
 	}
 }
 

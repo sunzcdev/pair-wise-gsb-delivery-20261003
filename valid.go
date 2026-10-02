@@ -202,6 +202,14 @@ func (d *decoder) wellformedInternal(depth int, checkBuiltinTags bool) (int, err
 					Message:  "bignum",
 				}
 			}
+			if d.shared != nil {
+				if err = d.shared.countValidatedTag(tagNum); err != nil {
+					return 0, err
+				}
+				if tagNum == tagNumSharedRef && getType(d.data[d.off]) != cborTypePositiveInt {
+					return 0, &InvalidSharedRefError{reason: "tag 29 must be followed by an unsigned integer"}
+				}
+			}
 			if getType(d.data[d.off]) != cborTypeTag {
 				break
 			}

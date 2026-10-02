@@ -912,6 +912,17 @@ type DecOptions struct {
 	// implement json.Unmarshaler but do not also implement cbor.Unmarshaler. If nil, decoding
 	// behavior is not influenced by whether or not a type implements json.Unmarshaler.
 	JSONUnmarshalerTranscoder Transcoder
+
+	// SharedRef specifies whether to decode CBOR tags 28 and 29 and restore pointer identity.
+	SharedRef SharedRefMode
+
+	// MaxSharedValues specifies the max number of tag 28 values allowed in one top-level
+	// CBOR data item. Default is 131072 and it can be set to [16, 2147483647].
+	MaxSharedValues int
+
+	// MaxSharedRefs specifies the max number of tag 29 references allowed in one top-level
+	// CBOR data item. Default is 131072 and it can be set to [16, 2147483647].
+	MaxSharedRefs int
 }
 
 // DecMode returns DecMode with immutable options and no tags (safe for concurrency).
@@ -997,6 +1008,14 @@ const (
 	defaultMaxNestedLevels = 32
 	minMaxNestedLevels     = 4
 	maxMaxNestedLevels     = 65535
+
+	defaultMaxSharedValues = 131072
+	minMaxSharedValues     = 16
+	maxMaxSharedValues     = 2147483647
+
+	defaultMaxSharedRefs = 131072
+	minMaxSharedRefs     = 16
+	maxMaxSharedRefs     = 2147483647
 )
 
 var defaultSimpleValues = func() *SimpleValueRegistry {
@@ -1023,6 +1042,9 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 
 	if !opts.TagsMd.valid() {
 		return nil, errors.New("cbor: invalid TagsMd " + strconv.Itoa(int(opts.TagsMd)))
+	}
+	if opts.TagsMd == TagsForbidden && opts.SharedRef == SharedRefAllowed {
+		return nil, errors.New("cbor: cannot set TagsMd to TagsForbidden when SharedRef is SharedRefAllowed")
 	}
 
 	if !opts.IntDec.valid() {
@@ -1127,6 +1149,23 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 	if !opts.TextUnmarshaler.valid() {
 		return nil, errors.New("cbor: invalid TextUnmarshaler " + strconv.Itoa(int(opts.TextUnmarshaler)))
 	}
+	if !opts.SharedRef.valid() {
+		return nil, errors.New("cbor: invalid SharedRef " + strconv.Itoa(int(opts.SharedRef)))
+	}
+	if opts.MaxSharedValues == 0 {
+		opts.MaxSharedValues = defaultMaxSharedValues
+	} else if opts.MaxSharedValues < minMaxSharedValues || opts.MaxSharedValues > maxMaxSharedValues ||
+		(opts.SharedRef == SharedRefAllowed && uint64(opts.MaxSharedValues) > uint64(^uint(0)>>1)) {
+		return nil, errors.New("cbor: invalid MaxSharedValues " + strconv.Itoa(opts.MaxSharedValues) +
+			" (range is [" + strconv.Itoa(minMaxSharedValues) + ", " + strconv.Itoa(maxMaxSharedValues) + "])")
+	}
+	if opts.MaxSharedRefs == 0 {
+		opts.MaxSharedRefs = defaultMaxSharedRefs
+	} else if opts.MaxSharedRefs < minMaxSharedRefs || opts.MaxSharedRefs > maxMaxSharedRefs ||
+		(opts.SharedRef == SharedRefAllowed && uint64(opts.MaxSharedRefs) > uint64(^uint(0)>>1)) {
+		return nil, errors.New("cbor: invalid MaxSharedRefs " + strconv.Itoa(opts.MaxSharedRefs) +
+			" (range is [" + strconv.Itoa(minMaxSharedRefs) + ", " + strconv.Itoa(maxMaxSharedRefs) + "])")
+	}
 
 	dm := decMode{
 		dupMapKey:                 opts.DupMapKey,
@@ -1157,6 +1196,9 @@ func (opts DecOptions) decMode() (*decMode, error) { //nolint:gocritic // ignore
 		binaryUnmarshaler:         opts.BinaryUnmarshaler,
 		textUnmarshaler:           opts.TextUnmarshaler,
 		jsonUnmarshalerTranscoder: opts.JSONUnmarshalerTranscoder,
+		sharedRef:                 opts.SharedRef,
+		maxSharedValues:           opts.MaxSharedValues,
+		maxSharedRefs:             opts.MaxSharedRefs,
 	}
 
 	return &dm, nil
@@ -1238,6 +1280,9 @@ type decMode struct {
 	binaryUnmarshaler         BinaryUnmarshalerMode
 	textUnmarshaler           TextUnmarshalerMode
 	jsonUnmarshalerTranscoder Transcoder
+	sharedRef                 SharedRefMode
+	maxSharedValues           int
+	maxSharedRefs             int
 }
 
 var defaultDecMode, _ = DecOptions{}.decMode()
@@ -1280,6 +1325,9 @@ func (dm *decMode) DecOptions() DecOptions {
 		BinaryUnmarshaler:         dm.binaryUnmarshaler,
 		TextUnmarshaler:           dm.textUnmarshaler,
 		JSONUnmarshalerTranscoder: dm.jsonUnmarshalerTranscoder,
+		SharedRef:                 dm.sharedRef,
+		MaxSharedValues:           dm.maxSharedValues,
+		MaxSharedRefs:             dm.maxSharedRefs,
 	}
 }
 
@@ -1290,6 +1338,8 @@ func (dm *decMode) DecOptions() DecOptions {
 // See the documentation for Unmarshal for details.
 func (dm *decMode) Unmarshal(data []byte, v any) error {
 	d := decoder{data: data, dm: dm}
+	d.beginSharedDecoding()
+	defer d.resetSharedDecoding()
 
 	// Check well-formedness.
 	off := d.off                      // Save offset before data validation
@@ -1299,6 +1349,7 @@ func (dm *decMode) Unmarshal(data []byte, v any) error {
 		return err
 	}
 
+	d.beginSharedParse()
 	return d.value(v)
 }
 
@@ -1310,6 +1361,8 @@ func (dm *decMode) Unmarshal(data []byte, v any) error {
 // See the documentation for Unmarshal for details.
 func (dm *decMode) UnmarshalFirst(data []byte, v any) (rest []byte, err error) {
 	d := decoder{data: data, dm: dm}
+	d.beginSharedDecoding()
+	defer d.resetSharedDecoding()
 
 	// check well-formedness.
 	off := d.off                    // Save offset before data validation
@@ -1319,6 +1372,7 @@ func (dm *decMode) UnmarshalFirst(data []byte, v any) (rest []byte, err error) {
 	// If it is well-formed, parse the value. This is structured like this to allow
 	// better test coverage
 	if err == nil {
+		d.beginSharedParse()
 		err = d.value(v)
 	}
 
@@ -1355,6 +1409,8 @@ func (dm *decMode) Valid(data []byte) error {
 // an ExtraneousDataError is returned.
 func (dm *decMode) Wellformed(data []byte) error {
 	d := decoder{data: data, dm: dm}
+	d.beginSharedDecoding()
+	defer d.resetSharedDecoding()
 	return d.wellformed(false, false)
 }
 
@@ -1378,6 +1434,7 @@ type decoder struct {
 	// encoding of the byte strings h'42' and h'43' would be controlled by tag 23 and 21,
 	// respectively.
 	expectedLaterEncodingTags []uint64
+	shared                    *sharedDecodeState
 }
 
 // value decodes CBOR data item into the value pointed to by v.
@@ -1402,6 +1459,9 @@ func (d *decoder) value(v any) error {
 // parseToValue decodes CBOR data to value.  It assumes data is well-formed,
 // and does not perform bounds checking.
 func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolint:gocyclo
+	if handled, err := d.parseSharedValue(v); handled {
+		return err
+	}
 
 	// Decode CBOR nil or CBOR undefined to pointer value by setting pointer value to nil.
 	if d.nextCBORNil() && v.Kind() == reflect.Pointer {

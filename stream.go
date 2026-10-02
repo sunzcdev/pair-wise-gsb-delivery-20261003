@@ -28,6 +28,9 @@ func NewDecoder(r io.Reader) *Decoder {
 
 // Decode reads CBOR value and decodes it into the value pointed to by v.
 func (dec *Decoder) Decode(v any) error {
+	dec.d.beginSharedDecoding()
+	defer dec.d.resetSharedDecoding()
+
 	_, err := dec.readNext()
 	if err != nil {
 		// Return validation error or read error.
@@ -51,6 +54,7 @@ func (dec *Decoder) Decode(v any) error {
 // Skip skips to the next CBOR data item (if there is any),
 // otherwise it returns error such as io.EOF, io.UnexpectedEOF, etc.
 func (dec *Decoder) Skip() error {
+	dec.d.resetSharedDecoding()
 	n, err := dec.readNext()
 	if err != nil {
 		// Return validation error or read error.
@@ -84,6 +88,7 @@ func (dec *Decoder) readNext() (int, error) {
 		// Process any unread data in dec.buf.
 		if dec.off < len(dec.buf) {
 			dec.d.reset(dec.buf[dec.off:])
+			dec.d.beginSharedDecoding()
 			off := dec.off // Save offset before data validation
 			validErr = dec.d.wellformed(true, false)
 			dec.off = off // Restore offset
@@ -95,6 +100,7 @@ func (dec *Decoder) readNext() (int, error) {
 			if validErr != io.ErrUnexpectedEOF {
 				return 0, validErr
 			}
+			dec.d.resetSharedDecoding()
 
 			// Process last read error on io.ErrUnexpectedEOF.
 			if readErr != nil {
@@ -202,7 +208,13 @@ func (enc *Encoder) Encode(v any) error {
 
 	bp := getEncodeBuffer()
 
-	b, err := encode(*bp, enc.em, reflect.ValueOf(v))
+	em := enc.em
+	if em.sharedRef == SharedRefAllowed {
+		em = new(encMode)
+		*em = *enc.em
+		em.shared = &sharedEncodeState{}
+	}
+	b, err := encode(*bp, em, reflect.ValueOf(v))
 	*bp = b[:0]
 
 	// Validate the encoded chunk against the indefinite-length data item using a byte-based check.

@@ -5639,6 +5639,9 @@ func TestEncOptions(t *testing.T) {
 				// value used by IndefLength above.
 				continue
 			}
+			if fn == "SharedRef" {
+				continue
+			}
 			t.Errorf("options field %q is unset or set to the zero value for its type", fn)
 		}
 	}

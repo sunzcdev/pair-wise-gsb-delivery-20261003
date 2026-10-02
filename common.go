@@ -180,6 +180,16 @@ func validBuiltinTag(tagNum uint64, contentHead byte) error {
 		//   item, except for those contained in a nested data item tagged with an expected
 		//   conversion.
 		return nil
+
+	case tagNumSharedValue:
+		return nil
+
+	case tagNumSharedRef:
+		if t != cborTypePositiveInt {
+			return newInadmissibleTagContentTypeErrorf(
+				"tag number 29 must be followed by unsigned integer, got " + t.String())
+		}
+		return nil
 	}
 
 	return nil
