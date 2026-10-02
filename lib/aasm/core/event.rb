@@ -44,7 +44,14 @@ module AASM::Core
     # executes the transition guards to determine if a transition is even
     # an option given current conditions.
     def may_fire?(obj, to_state=::AASM::NO_VALUE, *args)
-      _fire(obj, {:test_only => true}, to_state, *args) # true indicates test firing
+      target = obj.respond_to?(:aasm) ? obj.aasm(state_machine.name) : nil
+      if target.respond_to?(:with_candidate_transition_context)
+        target.with_candidate_transition_context do
+          _fire(obj, {:test_only => true}, to_state, *args)
+        end
+      else
+        _fire(obj, {:test_only => true}, to_state, *args) # true indicates test firing
+      end
     end
 
     def fire(obj, options={}, to_state=::AASM::NO_VALUE, *args)
@@ -149,13 +156,12 @@ module AASM::Core
         next if to_state and !Array(transition.to).include?(to_state)
         if (options.key?(:may_fire) && transition.eql?(options[:may_fire])) ||
            (!options.key?(:may_fire) && transition.allowed?(obj, *args))
-
           if options[:test_only]
             result = transition
           else
             result = to_state || Array(transition.to).first
             Array(transition.to).each {|to| @valid_transitions[obj.object_id][to] = transition }
-            transition.execute(obj, *args)
+            transition.execute(obj, *args, selected_to: result)
           end
 
           break

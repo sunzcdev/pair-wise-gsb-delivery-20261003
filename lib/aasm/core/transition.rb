@@ -40,11 +40,18 @@ module AASM::Core
     end
 
     def allowed?(obj, *args)
-      invoke_callbacks_compatible_with_guard(@guards, obj, args, :guard => true) &&
-      invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true)
+      target = reset_context_target(obj)
+      result = invoke_callbacks_compatible_with_guard(@guards, obj, args, :guard => true) &&
+               invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true)
+      target&.reset_event_transition_context unless result
+      result
+    rescue StandardError
+      target&.reset_event_transition_context
+      raise
     end
 
-    def execute(obj, *args)
+    def execute(obj, *args, selected_to: nil)
+      set_transition_context(obj, selected_to)
       invoke_callbacks_compatible_with_guard(event.state_machine.global_callbacks[:after_all_transitions], obj, args)
       invoke_callbacks_compatible_with_guard(@after, obj, args)
     end
@@ -63,16 +70,34 @@ module AASM::Core
 
     private
 
-    def invoke_callbacks_compatible_with_guard(code, record, args, options={})
+    def invoke_callbacks_compatible_with_guard(code, record, args, options={}, selected_to=nil)
       if record.respond_to?(:aasm)
-        record.aasm(event.state_machine.name).from_state = @from if record.aasm(event.state_machine.name).respond_to?(:from_state=)
-        record.aasm(event.state_machine.name).to_state = @to if record.aasm(event.state_machine.name).respond_to?(:to_state=)
+        set_transition_context(record, selected_to || @to)
       end
 
       Invoker.new(code, record, args)
              .with_options(options)
              .with_failures(failures)
              .invoke
+    end
+
+    def set_transition_context(record, selected_to=nil)
+      return unless record.respond_to?(:aasm)
+
+      target = transition_context_target(record)
+      target.from_state = @from if target.respond_to?(:from_state=)
+      target.to_state = selected_to || @to if target.respond_to?(:to_state=)
+    end
+
+    def transition_context_target(record)
+      record.aasm(event.state_machine.name)
+    end
+
+    def reset_context_target(record)
+      return unless record.respond_to?(:aasm)
+
+      target = transition_context_target(record)
+      target.respond_to?(:reset_event_transition_context) ? target : nil
     end
 
     def _fire_callbacks(code, record, args)

@@ -1,7 +1,5 @@
 module AASM
   class InstanceBase
-    attr_accessor :from_state, :to_state, :current_event
-
     def initialize(instance, name=:default) # instance of the class including AASM, name of the state machine
       @instance = instance
       @name = name
@@ -130,7 +128,70 @@ module AASM
       save_success
     end
 
+    def current_event
+      event_context&.fetch(:event)
+    end
+
+    def from_state
+      event_context&.fetch(:from)
+    end
+
+    def to_state
+      event_context&.fetch(:to)
+    end
+
+    def current_event=(event)
+      event_contexts[-1][:event] = event
+    end
+
+    def from_state=(state)
+      event_contexts[-1][:from] = state
+    end
+
+    def to_state=(state)
+      event_contexts[-1][:to] = state
+    end
+
+    def with_event_context(event)
+      parent_context = event_context.dup
+      event_contexts.push(event: event, from: current_state, to: nil)
+      yield
+    ensure
+      completed_context = event_contexts.pop
+      if event_contexts.size == 1
+        event_context.replace(completed_context)
+      else
+        event_context.replace(parent_context)
+      end
+    end
+
+    def reset_event_transition_context
+      event_context[:from] = current_state
+      event_context[:to] = nil
+    end
+
+    def with_candidate_transition_context
+      had_contexts = !@event_contexts.nil?
+      previous_context = had_contexts ? event_context.dup : nil
+      yield
+    ensure
+      if had_contexts
+        event_context[:from] = previous_context[:from]
+        event_context[:to] = previous_context[:to]
+      else
+        @event_contexts = nil
+      end
+    end
+
     private
+
+    def event_context
+      @event_contexts&.last
+    end
+
+    def event_contexts
+      @event_contexts ||= [{ event: nil, from: nil, to: nil }]
+    end
 
     def event_method_name(event_name)
       config = @instance.class.aasm(@name).state_machine.config
