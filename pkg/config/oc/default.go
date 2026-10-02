@@ -184,6 +184,10 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 			n.AfiSafis[i].AddPaths.State.Receive = n.AddPaths.Config.Receive
 			n.AfiSafis[i].AddPaths.Config.SendMax = n.AddPaths.Config.SendMax
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AddPaths.Config.SendMax
+			n.AfiSafis[i].AddPaths.Config.SelectionDiversity = n.AddPaths.Config.SelectionDiversity
+			n.AfiSafis[i].AddPaths.State.SelectionDiversity = n.AddPaths.Config.SelectionDiversity
+			n.AfiSafis[i].AddPaths.Config.SelectionBackfill = n.AddPaths.Config.SelectionBackfill
+			n.AfiSafis[i].AddPaths.State.SelectionBackfill = n.AddPaths.Config.SelectionBackfill
 		}
 	} else {
 		afs, err := extractArray(v.Get("neighbor.afi-safis"))
@@ -217,6 +221,18 @@ func setDefaultNeighborConfigValuesWithViper(v *viper.Viper, n *Neighbor, g *Glo
 				}
 			}
 			n.AfiSafis[i].AddPaths.State.SendMax = n.AfiSafis[i].AddPaths.Config.SendMax
+			if !vv.IsSet("afi-safi.add-paths.config.selection-diversity") {
+				if n.AddPaths.Config.SelectionDiversity != "" {
+					n.AfiSafis[i].AddPaths.Config.SelectionDiversity = n.AddPaths.Config.SelectionDiversity
+				}
+			}
+			n.AfiSafis[i].AddPaths.State.SelectionDiversity = n.AfiSafis[i].AddPaths.Config.SelectionDiversity
+			if !vv.IsSet("afi-safi.add-paths.config.selection-backfill") {
+				if n.AddPaths.Config.SelectionBackfill != "" {
+					n.AfiSafis[i].AddPaths.Config.SelectionBackfill = n.AddPaths.Config.SelectionBackfill
+				}
+			}
+			n.AfiSafis[i].AddPaths.State.SelectionBackfill = n.AfiSafis[i].AddPaths.Config.SelectionBackfill
 		}
 	}
 

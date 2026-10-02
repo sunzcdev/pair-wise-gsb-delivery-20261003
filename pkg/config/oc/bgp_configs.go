@@ -2536,6 +2536,82 @@ func (lhs *Prefixes) Equal(rhs *Prefixes) bool {
 	return true
 }
 
+// typedef for identity gobgp:add-paths-selection-diversity.
+// Selects how add-paths advertisement slots are diversified when
+// send-max limits the number of paths advertised for an NLRI.
+type AddPathsSelectionDiversityType string
+
+const (
+	ADD_PATHS_SELECTION_DIVERSITY_NONE        AddPathsSelectionDiversityType = "none"
+	ADD_PATHS_SELECTION_DIVERSITY_NEXTHOP     AddPathsSelectionDiversityType = "nexthop"
+	ADD_PATHS_SELECTION_DIVERSITY_NEIGHBOR_AS AddPathsSelectionDiversityType = "neighbor-as"
+)
+
+var AddPathsSelectionDiversityTypeToIntMap = map[AddPathsSelectionDiversityType]int{
+	ADD_PATHS_SELECTION_DIVERSITY_NONE:        0,
+	ADD_PATHS_SELECTION_DIVERSITY_NEXTHOP:     1,
+	ADD_PATHS_SELECTION_DIVERSITY_NEIGHBOR_AS: 2,
+}
+
+var IntToAddPathsSelectionDiversityTypeMap = map[int]AddPathsSelectionDiversityType{
+	0: ADD_PATHS_SELECTION_DIVERSITY_NONE,
+	1: ADD_PATHS_SELECTION_DIVERSITY_NEXTHOP,
+	2: ADD_PATHS_SELECTION_DIVERSITY_NEIGHBOR_AS,
+}
+
+func (v AddPathsSelectionDiversityType) Validate() error {
+	if _, ok := AddPathsSelectionDiversityTypeToIntMap[v]; !ok {
+		return fmt.Errorf("invalid AddPathsSelectionDiversityType: %s", v)
+	}
+	return nil
+}
+
+func (v AddPathsSelectionDiversityType) ToInt() int {
+	i, ok := AddPathsSelectionDiversityTypeToIntMap[v]
+	if !ok {
+		return -1
+	}
+	return i
+}
+
+// typedef for identity gobgp:add-paths-selection-backfill.
+// Selects how remaining send-max slots are filled when there are
+// not enough diverse candidates for an NLRI.
+type AddPathsSelectionBackfillType string
+
+const (
+	// Fill the remaining slots with the best remaining paths,
+	// regardless of diversity.
+	ADD_PATHS_SELECTION_BACKFILL_BEST_PATH AddPathsSelectionBackfillType = "best-path"
+	// Leave the remaining slots unused.
+	ADD_PATHS_SELECTION_BACKFILL_NONE AddPathsSelectionBackfillType = "none"
+)
+
+var AddPathsSelectionBackfillTypeToIntMap = map[AddPathsSelectionBackfillType]int{
+	ADD_PATHS_SELECTION_BACKFILL_BEST_PATH: 0,
+	ADD_PATHS_SELECTION_BACKFILL_NONE:      1,
+}
+
+var IntToAddPathsSelectionBackfillTypeMap = map[int]AddPathsSelectionBackfillType{
+	0: ADD_PATHS_SELECTION_BACKFILL_BEST_PATH,
+	1: ADD_PATHS_SELECTION_BACKFILL_NONE,
+}
+
+func (v AddPathsSelectionBackfillType) Validate() error {
+	if _, ok := AddPathsSelectionBackfillTypeToIntMap[v]; !ok {
+		return fmt.Errorf("invalid AddPathsSelectionBackfillType: %s", v)
+	}
+	return nil
+}
+
+func (v AddPathsSelectionBackfillType) ToInt() int {
+	i, ok := AddPathsSelectionBackfillTypeToIntMap[v]
+	if !ok {
+		return -1
+	}
+	return i
+}
+
 // struct for container bgp:state.
 // State information associated with ADD_PATHS.
 type AddPathsState struct {
@@ -2548,6 +2624,14 @@ type AddPathsState struct {
 	// The maximum number of paths to advertise to neighbors
 	// for a single NLRI.
 	SendMax uint8 `mapstructure:"send-max" json:"send-max,omitempty"`
+	// original -> gobgp:selection-diversity
+	// Prefer paths with distinct next-hops or neighbor ASes when
+	// send-max limits the number of advertised paths.
+	SelectionDiversity AddPathsSelectionDiversityType `mapstructure:"selection-diversity" json:"selection-diversity,omitempty"`
+	// original -> gobgp:selection-backfill
+	// How to fill remaining send-max slots when there are not
+	// enough diverse candidates.
+	SelectionBackfill AddPathsSelectionBackfillType `mapstructure:"selection-backfill" json:"selection-backfill,omitempty"`
 }
 
 // struct for container bgp:config.
@@ -2562,6 +2646,14 @@ type AddPathsConfig struct {
 	// The maximum number of paths to advertise to neighbors
 	// for a single NLRI.
 	SendMax uint8 `mapstructure:"send-max" json:"send-max,omitempty"`
+	// original -> gobgp:selection-diversity
+	// Prefer paths with distinct next-hops or neighbor ASes when
+	// send-max limits the number of advertised paths.
+	SelectionDiversity AddPathsSelectionDiversityType `mapstructure:"selection-diversity" json:"selection-diversity,omitempty"`
+	// original -> gobgp:selection-backfill
+	// How to fill remaining send-max slots when there are not
+	// enough diverse candidates.
+	SelectionBackfill AddPathsSelectionBackfillType `mapstructure:"selection-backfill" json:"selection-backfill,omitempty"`
 }
 
 func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
@@ -2572,6 +2664,12 @@ func (lhs *AddPathsConfig) Equal(rhs *AddPathsConfig) bool {
 		return false
 	}
 	if lhs.SendMax != rhs.SendMax {
+		return false
+	}
+	if lhs.SelectionDiversity != rhs.SelectionDiversity {
+		return false
+	}
+	if lhs.SelectionBackfill != rhs.SelectionBackfill {
 		return false
 	}
 	return true

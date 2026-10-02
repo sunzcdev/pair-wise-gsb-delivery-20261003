@@ -1476,6 +1476,110 @@ func dstsToPaths(id string, as uint32, dsts []*table.Update, useMultiplePaths bo
 	return bestList, oldList, mpathList, multipathUpdate, multipathWithdraw
 }
 
+// addPathDiverseUpdates recomputes the set of paths advertised to targetPeer
+// for each destination in dsts using the configured add-paths diversity
+// selection, and returns the paths to send (advertisements and withdrawals).
+func (s *BgpServer) addPathDiverseUpdates(targetPeer *peer, family bgp.Family, dsts []*table.Update, diversity oc.AddPathsSelectionDiversityType, backfill oc.AddPathsSelectionBackfillType) []*table.Path {
+	sendMax := targetPeer.getAddPathSendMax(family)
+	l := make([]*table.Path, 0, len(dsts))
+	for _, dst := range dsts {
+		l = append(l, s.addPathDiverseDstUpdates(targetPeer, family, dst, sendMax, diversity, backfill)...)
+	}
+	targetPeer.updateRoutes(l...)
+	return l
+}
+
+// addPathDiverseDstUpdates computes the add-paths advertisement diff for a
+// single destination. The advertised set recorded in the peer's RIB-out
+// bookkeeping is the ground truth, so recomputing over an unchanged RIB
+// state produces no advertisements or withdrawals (no Path ID churn), and
+// withdrawals are only generated for paths that were actually advertised.
+func (s *BgpServer) addPathDiverseDstUpdates(targetPeer *peer, family bgp.Family, dst *table.Update, sendMax uint8, diversity oc.AddPathsSelectionDiversityType, backfill oc.AddPathsSelectionBackfillType) []*table.Path {
+	var prefix string
+	if len(dst.KnownPathList) > 0 {
+		prefix = dst.KnownPathList[0].GetPrefix()
+	} else if len(dst.OldKnownPathList) > 0 {
+		prefix = dst.OldKnownPathList[0].GetPrefix()
+	} else {
+		return nil
+	}
+	destKey := table.NewPathDestLocalKey(family, prefix)
+	var advertised pathIDSet
+	if ids, ok := targetPeer.sentPaths.Load(*destKey); ok {
+		advertised = ids.(pathIDSet)
+	}
+
+	// Eligible candidates are the RIB paths that pass the export policy, in
+	// the destination's known path list (best-to-worst) order. Diversity keys
+	// are derived from the pre-policy RIB paths so that outbound attribute
+	// rewriting (e.g. next-hop-self) does not collapse distinct sources into
+	// one key. Policy-rejected paths never become candidates, so diversity
+	// selection cannot override an explicit policy denial.
+	eligibleRib := make([]*table.Path, 0, len(dst.KnownPathList))
+	eligibleAdv := make([]*table.Path, 0, len(dst.KnownPathList))
+	for _, p := range dst.KnownPathList {
+		filtered := s.filterpath(targetPeer, p, nil)
+		if filtered == nil {
+			continue
+		}
+		eligibleRib = append(eligibleRib, p)
+		eligibleAdv = append(eligibleAdv, filtered)
+	}
+
+	// isChanged reports whether the path differs from the version the
+	// destination held before this update (e.g. an attribute change through
+	// an implicit withdrawal), in which case it must be re-advertised.
+	isChanged := func(p *table.Path) bool {
+		for _, old := range dst.OldKnownPathList {
+			if p.EqualBySourceAndPathID(old) {
+				return !p.Equal(old)
+			}
+		}
+		return true
+	}
+
+	selected := table.SelectAddPathsWithDiversity(eligibleRib, diversity, sendMax, backfill)
+	selectedIdx := make(map[int]struct{}, len(selected))
+	selectedIDs := make(map[uint32]struct{}, len(selected))
+	out := make([]*table.Path, 0, len(selected))
+	for _, idx := range selected {
+		selectedIdx[idx] = struct{}{}
+		advPath := eligibleAdv[idx]
+		id := advPath.LocalID()
+		selectedIDs[id] = struct{}{}
+		targetPeer.unsetPathSendMaxFiltered(advPath)
+		if _, ok := advertised[id]; !ok || isChanged(eligibleRib[idx]) {
+			out = append(out, advPath)
+		}
+	}
+	for i, advPath := range eligibleAdv {
+		if _, ok := selectedIdx[i]; !ok {
+			targetPeer.setPathSendMaxFiltered(advPath)
+		}
+	}
+
+	// Withdraw the paths that were advertised before but are not selected
+	// anymore. Iterating the old known path list keeps the withdrawal order
+	// deterministic and guarantees the path IDs match what was sent.
+	for _, old := range dst.OldKnownPathList {
+		id := old.LocalID()
+		if _, ok := advertised[id]; !ok {
+			continue
+		}
+		if _, ok := selectedIDs[id]; ok {
+			continue
+		}
+		targetPeer.unsetPathSendMaxFiltered(old)
+		out = append(out, old.Clone(true))
+	}
+	// Clean up the send-max bookkeeping for paths that left the RIB without
+	// ever being advertised to this peer.
+	for _, p := range dst.GetWithdrawnPath() {
+		targetPeer.unsetPathSendMaxFiltered(p)
+	}
+	return out
+}
+
 func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *peer, newPath *table.Path, dsts []*table.Update, needOld bool) {
 	if rib.DisableBestPathSelection() {
 		return
@@ -1523,7 +1627,13 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 			if targetPeer.isAddPathSendEnabled(f) {
 				// in case of multiple paths to the same destination, we need to
 				// filter the paths before counting the number of paths to be sent.
-				if newPath.IsWithdraw {
+				diversity, backfill := targetPeer.getAddPathSelection(f)
+				if diversity != "" && diversity != oc.ADD_PATHS_SELECTION_DIVERSITY_NONE && f != bgp.RF_RTC_UC {
+					// Diversity selection recomputes the whole advertised set
+					// for the destination from the current RIB state, so
+					// announcements and withdrawals are handled uniformly.
+					bestList = s.addPathDiverseUpdates(targetPeer, f, dsts, diversity, backfill)
+				} else if newPath.IsWithdraw {
 					bestList = func() []*table.Path {
 						l := []*table.Path{}
 						for _, d := range dsts {

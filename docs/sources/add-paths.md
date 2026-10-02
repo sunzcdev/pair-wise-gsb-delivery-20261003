@@ -54,6 +54,40 @@ unicast family.
       send-max = 8
 ```
 
+### Diversity Selection
+
+When `send-max` limits the number of paths advertised for a prefix, the
+optional diversity selection strategy prefers paths from distinct sources
+instead of spending all slots on paths from the same source. Two diversity
+modes are available:
+
+- `nexthop`: prefer paths with distinct next-hops.
+- `neighbor-as`: prefer paths whose AS_PATH starts with a distinct adjacent
+  AS.
+
+When there are not enough diverse candidates to fill all `send-max` slots,
+the `selection-backfill` option controls how the remaining slots are handled:
+
+- `best-path` (default): fill the remaining slots with the best remaining
+  paths, regardless of diversity.
+- `none`: leave the remaining slots unused.
+
+Paths rejected by the export policy are never selected, so diversity
+selection cannot override an explicit policy denial. The selection is
+recomputed deterministically from the current RIB state, so recomputation
+over an unchanged RIB does not change Path IDs or generate spurious
+withdrawals.
+
+```toml
+[[neighbors]]
+  [neighbors.config]
+    neighbor-address = "10.0.0.2"
+    [neighbors.add-paths.config]
+      send-max = 2
+      selection-diversity = "nexthop"
+      selection-backfill = "best-path"
+```
+
 ## Verification
 
 ### Example Topology and Configuration

@@ -249,6 +249,16 @@ func (peer *peer) getAddPathSendMax(family bgp.Family) uint8 {
 	return 0
 }
 
+func (peer *peer) getAddPathSelection(family bgp.Family) (oc.AddPathsSelectionDiversityType, oc.AddPathsSelectionBackfillType) {
+	conf := peer.fsm.pConf.ReadOnly()
+	for _, a := range conf.AfiSafis {
+		if a.State.Family == family {
+			return a.AddPaths.Config.SelectionDiversity, a.AddPaths.Config.SelectionBackfill
+		}
+	}
+	return oc.ADD_PATHS_SELECTION_DIVERSITY_NONE, oc.ADD_PATHS_SELECTION_BACKFILL_BEST_PATH
+}
+
 func (peer *peer) getRoutesCount(family bgp.Family, dstPrefix string) uint8 {
 	destLocalKey := table.NewPathDestLocalKey(family, dstPrefix)
 	if identifiers, ok := peer.sentPaths.Load(*destLocalKey); ok {
