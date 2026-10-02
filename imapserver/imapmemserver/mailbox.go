@@ -24,6 +24,12 @@ type Mailbox struct {
 	specialUse []imap.MailboxAttr
 	l          []*message
 	uidNext    imap.UID
+
+	// owner is the username which owns the mailbox (empty if unknown).
+	owner string
+	// acl maps identifiers to their right sets. Negative rights are stored
+	// under identifiers prefixed with "-" (RFC 4314 section 5.1).
+	acl map[imap.RightsIdentifier]imap.RightSet
 }
 
 // NewMailbox creates a new mailbox.

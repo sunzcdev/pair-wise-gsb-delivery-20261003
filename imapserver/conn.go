@@ -46,6 +46,10 @@ type Conn struct {
 
 	state   imap.ConnState
 	session Session
+
+	// selectedMailbox is the name of the mailbox the session is currently
+	// selected on, if any.
+	selectedMailbox string
 }
 
 func newConn(c net.Conn, server *Server) *Conn {
@@ -149,6 +153,9 @@ func (c *Conn) serve() {
 	}
 	if _, ok := c.session.(SessionMove); !ok && caps.Has(imap.CapMove) {
 		panic("imapserver: server advertises MOVE but session doesn't support it")
+	}
+	if _, ok := c.session.(SessionACL); !ok && caps.Has(imap.CapACL) {
+		panic("imapserver: server advertises ACL but session doesn't support it")
 	}
 	if _, ok := c.session.(SessionUnauthenticate); !ok && caps.Has(imap.CapUnauthenticate) {
 		panic("imapserver: server advertises UNAUTHENTICATE but session doesn't support it")
@@ -280,6 +287,16 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleMove(dec, numKind)
 	case "SEARCH", "UID SEARCH":
 		err = c.handleSearch(tag, dec, numKind)
+	case "GETACL":
+		err = c.handleGetACL(dec)
+	case "SETACL":
+		err = c.handleSetACL(dec)
+	case "DELETEACL":
+		err = c.handleDeleteACL(dec)
+	case "LISTRIGHTS":
+		err = c.handleListRights(dec)
+	case "MYRIGHTS":
+		err = c.handleMyRights(dec)
 	default:
 		if c.state == imap.ConnStateNotAuthenticated {
 			// Don't allow a single unknown command before authentication to
@@ -378,6 +395,9 @@ func (c *Conn) handleSubscribe(dec *imapwire.Decoder) error {
 	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
 		return err
 	}
+	if err := c.checkMailboxRights(name, imap.RightLookup); err != nil {
+		return err
+	}
 	return c.session.Subscribe(name)
 }
 
@@ -387,6 +407,9 @@ func (c *Conn) handleUnsubscribe(dec *imapwire.Decoder) error {
 		return dec.Err()
 	}
 	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
+		return err
+	}
+	if err := c.checkMailboxRights(name, imap.RightLookup); err != nil {
 		return err
 	}
 	return c.session.Unsubscribe(name)

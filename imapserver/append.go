@@ -89,6 +89,26 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 		return err
 	}
 
+	required := []imap.Right{imap.RightLookup, imap.RightInsert}
+	for _, flag := range options.Flags {
+		switch {
+		case flagIs(flag, imap.FlagSeen):
+			required = append(required, imap.RightSeen)
+		default:
+			required = append(required, imap.RightWrite)
+		}
+	}
+	if err := c.checkMailboxRights(mailbox, required...); err != nil {
+		if contErr := c.acceptLiteral(lit.Size(), nonSync); contErr != nil {
+			io.Copy(io.Discard, lit)
+			dec.CRLF()
+			return contErr
+		}
+		io.Copy(io.Discard, lit)
+		dec.CRLF()
+		return err
+	}
+
 	data, appendErr := c.session.Append(mailbox, lit, &options)
 	if _, discardErr := io.Copy(io.Discard, lit); discardErr != nil {
 		return err

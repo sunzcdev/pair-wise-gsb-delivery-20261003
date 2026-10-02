@@ -17,6 +17,14 @@ func (c *Conn) handleMove(dec *imapwire.Decoder, numKind NumKind) error {
 	if !ok {
 		return newClientBugError("MOVE is not supported")
 	}
+	// RFC 4314 section 5.2: MOVE is COPY plus EXPUNGE, so it needs "r" and
+	// "d" on the source mailbox and "i" on the destination mailbox.
+	if err := c.checkMailboxRights(c.selectedMailbox, imap.RightLookup, imap.RightRead, imap.RightDelete); err != nil {
+		return err
+	}
+	if err := c.checkMailboxRights(dest, imap.RightLookup, imap.RightInsert); err != nil {
+		return err
+	}
 	w := &MoveWriter{conn: c}
 	return session.Move(w, numSet, dest)
 }

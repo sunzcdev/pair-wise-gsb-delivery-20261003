@@ -18,6 +18,8 @@ type User struct {
 	mutex           sync.Mutex
 	mailboxes       map[string]*Mailbox
 	prevUidValidity uint32
+
+	server *Server
 }
 
 func NewUser(username, password string) *User {
@@ -41,13 +43,22 @@ func (u *User) Login(username, password string) error {
 func (u *User) mailboxLocked(name string) (*Mailbox, error) {
 	mbox := u.mailboxes[name]
 	if mbox == nil {
-		return nil, &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeNonExistent,
-			Text: "No such mailbox",
+		if u.server != nil {
+			if shared := u.server.sharedMailbox(name); shared != nil {
+				return shared, nil
+			}
 		}
+		return nil, mailboxNotFoundError()
 	}
 	return mbox, nil
+}
+
+func mailboxNotFoundError() error {
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeNonExistent,
+		Text: "No such mailbox",
+	}
 }
 
 func (u *User) mailbox(name string) (*Mailbox, error) {
@@ -89,10 +100,44 @@ func (u *User) List(w *imapserver.ListWriter, ref string, patterns []string, opt
 		if !match {
 			continue
 		}
+		mbox.mutex.Lock()
+		if !mbox.visibleLocked(u.username) {
+			mbox.mutex.Unlock()
+			continue
+		}
+		mbox.mutex.Unlock()
 
 		data := mbox.list(options)
 		if data != nil {
 			l = append(l, *data)
+		}
+	}
+
+	if u.server != nil {
+		for _, mbox := range u.server.sharedMailboxes() {
+			name := mbox.name
+			match := false
+			for _, pattern := range patterns {
+				if imapserver.MatchList(name, mailboxDelim, ref, pattern) {
+					match = true
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+
+			mbox.mutex.Lock()
+			visible := mbox.visibleLocked(u.username)
+			mbox.mutex.Unlock()
+			if !visible {
+				continue
+			}
+
+			data := mbox.list(options)
+			if data != nil {
+				l = append(l, *data)
+			}
 		}
 	}
 
@@ -138,7 +183,9 @@ func (u *User) Create(name string, options *imap.CreateOptions) error {
 	// UIDVALIDITY must change if a mailbox is deleted and re-created with the
 	// same name.
 	u.prevUidValidity++
-	u.mailboxes[name] = NewMailbox(name, u.prevUidValidity)
+	mbox := NewMailbox(name, u.prevUidValidity)
+	mbox.initACL(u.username)
+	u.mailboxes[name] = mbox
 	return nil
 }
 
@@ -148,6 +195,13 @@ func (u *User) Delete(name string) error {
 
 	if _, err := u.mailboxLocked(name); err != nil {
 		return err
+	}
+	if _, ok := u.mailboxes[name]; !ok {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "Permission denied",
+		}
 	}
 
 	delete(u.mailboxes, name)
@@ -163,6 +217,13 @@ func (u *User) Rename(oldName, newName string, options *imap.RenameOptions) erro
 	mbox, err := u.mailboxLocked(oldName)
 	if err != nil {
 		return err
+	}
+	if _, ok := u.mailboxes[oldName]; !ok {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeNoPerm,
+			Text: "Permission denied",
+		}
 	}
 
 	if u.mailboxes[newName] != nil {

@@ -24,6 +24,9 @@ func (c *Conn) expunge(uids *imap.UIDSet) error {
 	if err := c.checkState(imap.ConnStateSelected); err != nil {
 		return err
 	}
+	if err := c.checkMailboxRights(c.selectedMailbox, imap.RightLookup, imap.RightDelete); err != nil {
+		return err
+	}
 	w := &ExpungeWriter{conn: c}
 	return c.session.Expunge(w, uids)
 }

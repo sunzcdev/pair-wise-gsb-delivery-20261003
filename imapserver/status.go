@@ -40,6 +40,10 @@ func (c *Conn) handleStatus(dec *imapwire.Decoder) error {
 		return err
 	}
 
+	if err := c.checkMailboxRights(mailbox, imap.RightLookup); err != nil {
+		return err
+	}
+
 	data, err := c.session.Status(mailbox, &options)
 	if err != nil {
 		return err

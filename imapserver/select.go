@@ -32,6 +32,10 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		}
 	}
 
+	if err := c.checkMailboxRights(mailbox, imap.RightLookup, imap.RightRead); err != nil {
+		return err
+	}
+
 	options := imap.SelectOptions{ReadOnly: readOnly}
 	data, err := c.session.Select(mailbox, &options)
 	if err != nil {
@@ -70,6 +74,7 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 	}
 
 	c.state = imap.ConnStateSelected
+	c.selectedMailbox = mailbox
 	// TODO: forbid write commands in read-only mode
 
 	var (
@@ -100,6 +105,9 @@ func (c *Conn) handleUnselect(dec *imapwire.Decoder, expunge bool) error {
 	}
 
 	if expunge {
+		if err := c.checkMailboxRights(c.selectedMailbox, imap.RightLookup, imap.RightDelete); err != nil {
+			return err
+		}
 		w := &ExpungeWriter{}
 		if err := c.session.Expunge(w, nil); err != nil {
 			return err
@@ -111,6 +119,7 @@ func (c *Conn) handleUnselect(dec *imapwire.Decoder, expunge bool) error {
 	}
 
 	c.state = imap.ConnStateAuthenticated
+	c.selectedMailbox = ""
 	return nil
 }
 

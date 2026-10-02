@@ -80,6 +80,10 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		options.ReturnAll = true
 	}
 
+	if err := c.checkMailboxRights(c.selectedMailbox, imap.RightLookup, imap.RightRead); err != nil {
+		return err
+	}
+
 	data, err := c.session.Search(numKind, &criteria, &options)
 	if err != nil {
 		return err

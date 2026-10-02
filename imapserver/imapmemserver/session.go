@@ -19,7 +19,10 @@ type UserSession struct {
 	*mailbox // may be nil
 }
 
-var _ imapserver.SessionIMAP4rev2 = (*UserSession)(nil)
+var (
+	_ imapserver.SessionIMAP4rev2 = (*UserSession)(nil)
+	_ imapserver.SessionACL       = (*UserSession)(nil)
+)
 
 // NewUserSession creates a new user session.
 func NewUserSession(user *User) *UserSession {
@@ -137,4 +140,53 @@ func (sess *UserSession) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) 
 		return nil // TODO
 	}
 	return sess.mailbox.Idle(w, stop)
+}
+
+func (sess *UserSession) resolveMailbox(name string) (*Mailbox, error) {
+	return sess.user.mailbox(name)
+}
+
+// MyRights implements imapserver.SessionACL.
+func (sess *UserSession) MyRights(mailbox string) (imap.RightSet, error) {
+	mbox, err := sess.resolveMailbox(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	return mbox.myRights(sess.user.username)
+}
+
+// SetACL implements imapserver.SessionACL.
+func (sess *UserSession) SetACL(mailbox string, ri imap.RightsIdentifier, rm imap.RightModification, rs imap.RightSet) error {
+	mbox, err := sess.resolveMailbox(mailbox)
+	if err != nil {
+		return err
+	}
+	return mbox.setACL(sess.user.username, ri, rm, rs)
+}
+
+// DeleteACL implements imapserver.SessionACL.
+func (sess *UserSession) DeleteACL(mailbox string, ri imap.RightsIdentifier) error {
+	mbox, err := sess.resolveMailbox(mailbox)
+	if err != nil {
+		return err
+	}
+	return mbox.deleteACL(sess.user.username, ri)
+}
+
+// GetACL implements imapserver.SessionACL.
+func (sess *UserSession) GetACL(mailbox string) (*imap.ACLData, error) {
+	mbox, err := sess.resolveMailbox(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	return mbox.getACLData(sess.user.username)
+}
+
+// ListRights implements imapserver.SessionACL.
+func (sess *UserSession) ListRights(mailbox string, ri imap.RightsIdentifier) (*imap.ListRightsData, error) {
+	mbox, err := sess.resolveMailbox(mailbox)
+	if err != nil {
+		return nil, err
+	}
+	return mbox.listRights(sess.user.username, ri)
 }

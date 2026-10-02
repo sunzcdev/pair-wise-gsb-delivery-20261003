@@ -13,6 +13,14 @@ func (c *Conn) handleCopy(tag string, dec *imapwire.Decoder, numKind NumKind) er
 	if err := c.checkState(imap.ConnStateSelected); err != nil {
 		return err
 	}
+	// RFC 4314 section 5.2: COPY needs "r" on the source mailbox and "i" on
+	// the destination mailbox.
+	if err := c.checkMailboxRights(c.selectedMailbox, imap.RightLookup, imap.RightRead); err != nil {
+		return err
+	}
+	if err := c.checkMailboxRights(dest, imap.RightLookup, imap.RightInsert); err != nil {
+		return err
+	}
 	data, err := c.session.Copy(numSet, dest)
 	if err != nil {
 		return err

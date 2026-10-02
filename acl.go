@@ -102,3 +102,27 @@ func (rs1 RightSet) Equal(rs2 RightSet) bool {
 
 	return true
 }
+
+// Has checks whether the right set contains the provided right.
+func (rs RightSet) Has(right Right) bool {
+	return strings.ContainsRune(string(rs), rune(right))
+}
+
+// ACLData is the data returned by the GETACL command (RFC 4314 section 3.6).
+type ACLData struct {
+	Mailbox string
+	Rights  map[RightsIdentifier]RightSet
+}
+
+// ListRightsData is the data returned by the LISTRIGHTS command (RFC 4314
+// section 3.7).
+type ListRightsData struct {
+	Mailbox string
+	// Identifier is the identifier provided in the LISTRIGHTS command.
+	Identifier RightsIdentifier
+	// Required contains the rights that will always be granted to or removed
+	// from the identifier (e.g. the mailbox owner).
+	Required RightSet
+	// Optional contains sets of alternative rights.
+	Optional []RightSet
+}

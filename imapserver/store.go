@@ -68,6 +68,36 @@ func (c *Conn) handleStore(dec *imapwire.Decoder, numKind NumKind) error {
 		return err
 	}
 
+	// RFC 4314 section 5.2: the rights required for STORE depend on the
+	// flags being changed. Any flag other than \Seen and \Deleted requires
+	// "w"; \Seen alone requires "s", \Deleted alone requires "d". A STORE
+	// mixing the two requires both "s" and "d".
+	changeSeen, changeDeleted, changeOther := false, false, false
+	for _, flag := range flags {
+		switch {
+		case flagIs(flag, imap.FlagSeen):
+			changeSeen = true
+		case flagIs(flag, imap.FlagDeleted):
+			changeDeleted = true
+		default:
+			changeOther = true
+		}
+	}
+	required := []imap.Right{imap.RightLookup}
+	if changeOther {
+		required = append(required, imap.RightWrite)
+	} else {
+		if changeSeen {
+			required = append(required, imap.RightSeen)
+		}
+		if changeDeleted {
+			required = append(required, imap.RightDelete)
+		}
+	}
+	if err := c.checkMailboxRights(c.selectedMailbox, required...); err != nil {
+		return err
+	}
+
 	w := &FetchWriter{conn: c}
 	options := imap.StoreOptions{}
 	return c.session.Store(w, numSet, &imap.StoreFlags{

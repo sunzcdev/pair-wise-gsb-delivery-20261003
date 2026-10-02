@@ -92,6 +92,23 @@ type SessionMove interface {
 	Move(w *MoveWriter, numSet imap.NumSet, dest string) error
 }
 
+// SessionACL is an IMAP session which supports the ACL extension (RFC 4314).
+//
+// MyRights is used by the server to enforce access controls on mailbox
+// operations. The other methods implement the ACL commands; backends are
+// responsible for checking that the authenticated user is allowed to inspect
+// or modify the access control list.
+type SessionACL interface {
+	Session
+
+	// Authenticated state
+	MyRights(mailbox string) (imap.RightSet, error)
+	SetACL(mailbox string, ri imap.RightsIdentifier, rm imap.RightModification, rs imap.RightSet) error
+	DeleteACL(mailbox string, ri imap.RightsIdentifier) error
+	GetACL(mailbox string) (*imap.ACLData, error)
+	ListRights(mailbox string, ri imap.RightsIdentifier) (*imap.ListRightsData, error)
+}
+
 // SessionIMAP4rev2 is an IMAP session which supports IMAP4rev2.
 type SessionIMAP4rev2 interface {
 	Session

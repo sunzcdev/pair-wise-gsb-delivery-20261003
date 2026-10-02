@@ -87,6 +87,19 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 		options.UID = true
 	}
 
+	// RFC 4314: FETCH requires "r". Fetching message content without PEEK
+	// implicitly sets \Seen, which also requires the "s" right.
+	required := []imap.Right{imap.RightLookup, imap.RightRead}
+	for _, bs := range options.BodySection {
+		if !bs.Peek {
+			required = append(required, imap.RightSeen)
+			break
+		}
+	}
+	if err := c.checkMailboxRights(c.selectedMailbox, required...); err != nil {
+		return err
+	}
+
 	w := &FetchWriter{conn: c, options: writerOptions}
 	if err := c.session.Fetch(w, numSet, &options); err != nil {
 		return err
