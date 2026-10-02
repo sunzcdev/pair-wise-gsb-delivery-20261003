@@ -80,29 +80,40 @@ func (s State) String() string {
 // This can be used, for example, to ignore context cancellations or
 // other errors that should not affect the circuit breaker state.
 // If IsExcluded is nil, no requests are excluded.
+//
+// LeaseExpirationIsFailure determines how a lease obtained via
+// TwoStepCircuitBreaker.AllowWithLease is settled once it expires
+// without being completed or abandoned by the caller.
+// If LeaseExpirationIsFailure is true, an expired lease is counted as a failure.
+// Otherwise, an expired lease is simply abandoned: the request is excluded
+// from the counts and its half-open slot is released.
 type Settings struct {
-	Name          string
-	MaxRequests   uint32
-	Interval      time.Duration
-	BucketPeriod  time.Duration
-	Timeout       time.Duration
-	ReadyToTrip   func(counts Counts) bool
-	OnStateChange func(name string, from State, to State)
-	IsSuccessful  func(err error) bool
-	IsExcluded    func(err error) bool
+	Name                     string
+	MaxRequests              uint32
+	Interval                 time.Duration
+	BucketPeriod             time.Duration
+	Timeout                  time.Duration
+	ReadyToTrip              func(counts Counts) bool
+	OnStateChange            func(name string, from State, to State)
+	IsSuccessful             func(err error) bool
+	IsExcluded               func(err error) bool
+	LeaseExpirationIsFailure bool
 }
 
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker[T any] struct {
-	name          string
-	maxRequests   uint32
-	interval      time.Duration
-	bucketPeriod  time.Duration
-	timeout       time.Duration
-	readyToTrip   func(counts Counts) bool
-	isSuccessful  func(err error) bool
-	isExcluded    func(err error) bool
-	onStateChange func(name string, from State, to State)
+	name                     string
+	maxRequests              uint32
+	interval                 time.Duration
+	bucketPeriod             time.Duration
+	timeout                  time.Duration
+	readyToTrip              func(counts Counts) bool
+	isSuccessful             func(err error) bool
+	isExcluded               func(err error) bool
+	leaseExpirationIsFailure bool
+	onStateChange            func(name string, from State, to State)
+
+	clock func() time.Time
 
 	mutex      sync.Mutex
 	state      State
@@ -110,6 +121,7 @@ type CircuitBreaker[T any] struct {
 	counts     *rollingCounts
 	start      time.Time
 	expiry     time.Time
+	leases     map[*Lease[T]]struct{}
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -166,7 +178,11 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 		cb.isExcluded = st.IsExcluded
 	}
 
-	cb.toNewGeneration(time.Now())
+	cb.leaseExpirationIsFailure = st.LeaseExpirationIsFailure
+
+	cb.clock = time.Now
+
+	cb.toNewGeneration(cb.clock())
 
 	return cb
 }
@@ -196,7 +212,8 @@ func (cb *CircuitBreaker[T]) State() State {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock()
+	cb.expireLeases(now)
 	state, _, _ := cb.currentState(now)
 	return state
 }
@@ -205,6 +222,8 @@ func (cb *CircuitBreaker[T]) State() State {
 func (cb *CircuitBreaker[T]) Counts() Counts {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
+
+	cb.expireLeases(cb.clock())
 
 	return cb.counts.Counts
 }
@@ -238,7 +257,8 @@ func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock()
+	cb.expireLeases(now)
 	state, generation, age := cb.currentState(now)
 
 	if state == StateOpen {
@@ -255,7 +275,12 @@ func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
+	now := cb.clock()
+	cb.expireLeases(now)
+	cb.afterRequestLocked(previous, age, err, now)
+}
+
+func (cb *CircuitBreaker[T]) afterRequestLocked(previous uint64, age uint64, err error, now time.Time) {
 	state, generation, _ := cb.currentState(now)
 	if generation != previous {
 		return
