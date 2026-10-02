@@ -3,7 +3,10 @@
 require 'blueprinter/errors/invalid_root'
 require 'blueprinter/errors/meta_requires_root'
 require 'blueprinter/errors/unknown_view'
+require 'blueprinter/errors/streaming_root_unsupported'
+require 'blueprinter/errors/streaming_meta_unsupported'
 require 'blueprinter/deprecation'
+require 'blueprinter/streamed_json_body'
 
 module Blueprinter
   # Encapsulates the rendering logic for Blueprinter.
@@ -84,6 +87,32 @@ module Blueprinter
       build_result(object:, options:).as_json
     end
 
+    # Builds a chunked JSON array response body from a single-pass Enumerable
+    # data source. Unlike {#render}, the source is not read until the returned
+    # body is consumed, and each advance serializes only the next element.
+    #
+    # Fields, views, associations and transformers are rendered with the same
+    # rules as {#render}. This entry only emits a top-level JSON array, so
+    # :root and :meta are rejected before the source is ever read.
+    #
+    # @param enumerable [Enumerable] the data source, traversable once
+    # @param options [Hash] the same options as {#render}, except :root/:meta
+    # @option options [Symbol] :view Defaults to :default.
+    # @return [Blueprinter::StreamedJsonBody] consumable, chunked response body
+    # @raise [Blueprinter::Errors::StreamingRootUnsupported] if :root is given
+    # @raise [Blueprinter::Errors::StreamingMetaUnsupported] if :meta is given
+    #
+    # @example Streaming to a socket
+    #   body = PostBlueprint.render_as_stream(posts, view: :extended)
+    #   body.each { |chunk| socket.write(chunk) }
+    #
+    # @example As a Rack response body
+    #   [200, { 'Content-Type' => 'application/json' },
+    #    PostBlueprint.render_as_stream(posts)]
+    def render_as_stream(enumerable, options = {})
+      StreamedJsonBody.new(enumerable, self, options)
+    end
+
     # Converts an object into a Hash representation based on provided view.
     #
     # @param object [Object] the Object to convert into a Hash.
@@ -96,6 +125,25 @@ module Blueprinter
 
       object = Blueprinter.configuration.extensions.pre_render(object, self, view_name, local_options)
       prepare_data(object, view_name, local_options)
+    end
+
+    # @api private
+    #
+    # Runs render extensions once for a streamed collection, before any
+    # element is pulled from it.
+    def pre_render_collection(object, view_name, options)
+      local_options = options.except(:view, :root, :meta)
+      Blueprinter.configuration.extensions.pre_render(object, self, view_name, local_options)
+    end
+
+    # @api private
+    #
+    # Renders a single element of a streamed collection with the standard
+    # field, association and transformer rules.
+    def streamed_element_hash(object, options)
+      view_name = options[:view] || :default
+      local_options = options.merge(view: view_name)
+      object_to_hash(object, view_name:, local_options:)
     end
 
     # @deprecated This method is no longer supported, and was not originally intended to be public. This will be removed

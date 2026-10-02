@@ -1,4 +1,5 @@
 ## Unreleased
+- 🚀 [FEATURE] Adds `Blueprinter::Base.render_as_stream`, a streaming JSON array entry for single-pass `Enumerable` data sources. It returns a `Blueprinter::StreamedJsonBody` response body that serializes one element per chunk without mapping the full collection, reusing the existing field, view, association and transformer rules. `:root` and `:meta` are rejected up front, and sources responding to `#close` are closed exactly once on normal completion, early termination and mid-stream errors.
 --
 
 ## 1.3.0 - 2026/04/14

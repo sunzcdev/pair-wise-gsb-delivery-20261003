@@ -112,6 +112,48 @@ end
 </details>
 
 <details>
+<summary>Streaming collections</summary>
+
+
+When your data source can only be traversed once (for example a database
+cursor or any single-pass `Enumerable`), use `render_as_stream`. It returns a
+`Blueprinter::StreamedJsonBody` response body object that serializes one
+element at a time instead of mapping the whole collection into memory.
+
+```ruby
+body = UserBlueprint.render_as_stream(users_cursor, view: :extended)
+body.each { |chunk| socket.write(chunk) }
+```
+
+The source is not read until consumption starts, and every advance
+serializes only the element currently needed. The yielded chunks concatenate
+to the same JSON array that `render` would produce, so strings are escaped
+and elements are separated with commas (an empty source yields `[]`).
+
+The body follows the Rack response body protocol, so it can be handed
+directly to a web server and closed by it:
+
+```ruby
+status  = 200
+headers = { 'Content-Type' => 'application/json' }
+[status, headers, UserBlueprint.render_as_stream(users_cursor)]
+```
+
+If the source responds to `#close`, it is closed exactly once on normal
+completion, on early termination (`break` or an explicit `body.close`), and
+when an exception is raised mid-stream. After bytes have already been
+emitted, an exception is surfaced to the consumer and no closing `]` is
+appended, so the partial output cannot be mistaken for a complete array.
+
+Fields, views, associations and transformers follow the same rules as
+`render`. The `:root` and `:meta` options cannot be represented inside a
+top-level JSON array and are rejected with
+`Blueprinter::Errors::StreamingRootUnsupported` /
+`Blueprinter::Errors::StreamingMetaUnsupported` before the source is read.
+
+</details>
+
+<details>
 <summary>Renaming</summary>
 
 
