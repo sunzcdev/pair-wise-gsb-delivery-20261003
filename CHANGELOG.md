@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Add `JSONSchemer::SchemaDirectory`, an in-memory schema directory usable as a `ref_resolver` with atomic batch registration, `$id`/`$anchor`/`$dynamicAnchor` indexing, and eager static `$ref` validation
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes

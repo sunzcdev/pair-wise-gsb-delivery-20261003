@@ -144,6 +144,23 @@ schemer.bundle
 #       "http://example.com/schema/two"=>{"minimum"=>11, "$id"=>"http://example.com/schema/two", "$schema"=>"https://json-schema.org/draft/2020-12/schema"}}}
 ```
 
+### In-memory schema directories
+
+```ruby
+directory = JSONSchemer::SchemaDirectory.new
+directory.register(
+  'http://example.com/schema/one' => { 'type' => 'integer' },
+  'http://example.com/schema/two' => { '$ref' => 'one' }
+)
+# registration is atomic: the batch is indexed (root/nested `$id`, `$anchor`,
+# `$dynamicAnchor`) and every static `$ref` must resolve against the batch plus
+# the already registered documents, otherwise nothing is registered
+
+schemer = JSONSchemer.schema(schema, :ref_resolver => directory)
+directory.fetch(URI('http://example.com/schema/one'))
+# => {"type"=>"integer"}
+```
+
 ## Options
 
 ```ruby
