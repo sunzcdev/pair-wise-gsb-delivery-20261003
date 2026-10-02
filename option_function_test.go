@@ -1,6 +1,7 @@
 package gojq_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -71,4 +72,44 @@ func ExampleWithFunction() {
 	// 9
 	// 13.5
 	// 3e+40
+}
+
+func ExampleWithFunctionWithContext() {
+	query, err := gojq.Parse("map(f)")
+	if err != nil {
+		log.Fatalln(err)
+	}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithFunctionWithContext("f", 0, 0, func(ctx context.Context, v any, _ []any) any {
+			if x, ok := v.(int); ok {
+				// The function receives the context of the current run, so
+				// long-running functions can cooperatively respond to cancellation.
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				default:
+				}
+				return x * 2
+			}
+			return fmt.Errorf("f cannot be applied to: %v", v)
+		}),
+	)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	iter := code.RunWithContext(context.Background(), []any{1, 2, 3})
+	for {
+		v, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok := v.(error); ok {
+			log.Fatalln(err)
+		}
+		fmt.Println(v)
+	}
+
+	// Output:
+	// [2 4 6]
 }

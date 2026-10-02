@@ -1,9 +1,11 @@
 package gojq_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"testing"
 
@@ -918,5 +920,346 @@ func TestWithInputIter(t *testing.T) {
 	}
 	if expected := 10; n != expected {
 		t.Errorf("expected: %v, got: %v", expected, n)
+	}
+}
+
+func TestWithFunctionWithContext(t *testing.T) {
+	type ctxKey struct{}
+	query, err := gojq.Parse("f, f(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithFunctionWithContext("f", 0, 1, func(ctx context.Context, v any, xs []any) any {
+			if got := ctx.Value(ctxKey{}); got != "value" {
+				return fmt.Errorf("unexpected context value: %v", got)
+			}
+			if len(xs) == 1 {
+				return xs[0]
+			}
+			return v
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "value")
+	iter := code.RunWithContext(ctx, nil)
+	for n := 0; ; n++ {
+		v, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok := v.(error); ok {
+			t.Fatal(err)
+		}
+		if n == 1 {
+			if v != 1 {
+				t.Errorf("expected: %v, got: %v", 1, v)
+			}
+		} else if v != nil {
+			t.Errorf("expected: %v, got: %v", nil, v)
+		}
+	}
+}
+
+func TestWithFunctionWithContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithFunctionWithContext("f", 0, 0, func(ctx context.Context, v any, _ []any) any {
+			// Cooperatively respond to cancellation; no goroutine is needed.
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(ctx, nil)
+	v, ok := iter.Next()
+	if !ok {
+		t.Fatal("expected an error, got none")
+	}
+	if err, ok := v.(error); !ok || !errors.Is(err, context.Canceled) {
+		t.Errorf("expected: %v, got: %v", context.Canceled, v)
+	}
+}
+
+func TestWithFunctionWithContextMultipleArities(t *testing.T) {
+	query, err := gojq.Parse("f, f(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithFunction("f", 0, 0, func(any, []any) any {
+			return 0
+		}),
+		gojq.WithFunctionWithContext("f", 1, 1, func(ctx context.Context, _ any, xs []any) any {
+			if ctx == nil {
+				return fmt.Errorf("unexpected nil context")
+			}
+			return xs[0]
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(context.Background(), nil)
+	for n := 0; ; n++ {
+		v, ok := iter.Next()
+		if !ok {
+			if n != 2 {
+				t.Errorf("expected: %v, got: %v", 2, n)
+			}
+			break
+		}
+		if err, ok := v.(error); ok {
+			t.Fatal(err)
+		}
+		if v != n {
+			t.Errorf("expected: %v, got: %v", n, v)
+		}
+	}
+}
+
+type closeCountIter struct {
+	values []any
+	closed int
+}
+
+func (iter *closeCountIter) Next() (any, bool) {
+	if len(iter.values) == 0 {
+		return nil, false
+	}
+	v := iter.values[0]
+	iter.values = iter.values[1:]
+	return v, true
+}
+
+func (iter *closeCountIter) Close() error {
+	iter.closed++
+	return nil
+}
+
+func TestWithIterFunctionWithContextCloseOnExhaustion(t *testing.T) {
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iters := []*closeCountIter{}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithIterFunctionWithContext("f", 0, 0, func(context.Context, any, []any) gojq.Iter {
+			iter := &closeCountIter{values: []any{1, 2}}
+			iters = append(iters, iter)
+			return iter
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(context.Background(), nil)
+	n := 0
+	for {
+		v, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok := v.(error); ok {
+			t.Fatal(err)
+		}
+		n++
+	}
+	if n != 2 {
+		t.Errorf("expected: %v, got: %v", 2, n)
+	}
+	if len(iters) != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, len(iters))
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+}
+
+func TestWithIterFunctionWithContextCloseOnError(t *testing.T) {
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iters := []*closeCountIter{}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithIterFunctionWithContext("f", 0, 0, func(context.Context, any, []any) gojq.Iter {
+			iter := &closeCountIter{values: []any{1, errors.New("error"), 3}}
+			iters = append(iters, iter)
+			return iter
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(context.Background(), nil)
+	var gotErr error
+	for {
+		v, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok := v.(error); ok {
+			gotErr = err
+			break
+		}
+	}
+	if gotErr == nil || gotErr.Error() != "error" {
+		t.Errorf("expected an error, got: %v", gotErr)
+	}
+	if len(iters) != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, len(iters))
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+}
+
+func TestWithIterFunctionWithContextCloseOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iters := []*closeCountIter{}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithIterFunctionWithContext("f", 0, 0, func(context.Context, any, []any) gojq.Iter {
+			iter := &closeCountIter{values: []any{1, 2, 3}}
+			iters = append(iters, iter)
+			return iter
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(ctx, nil)
+	v, ok := iter.Next()
+	if !ok || v != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, v)
+	}
+	cancel()
+	v, ok = iter.Next()
+	if !ok {
+		t.Fatal("expected an error, got none")
+	}
+	if err, ok := v.(error); !ok || !errors.Is(err, context.Canceled) {
+		t.Errorf("expected: %v, got: %v", context.Canceled, v)
+	}
+	if len(iters) != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, len(iters))
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+}
+
+func TestWithIterFunctionWithContextCloseExplicitly(t *testing.T) {
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iters := []*closeCountIter{}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithIterFunctionWithContext("f", 0, 0, func(context.Context, any, []any) gojq.Iter {
+			iter := &closeCountIter{values: []any{1, 2, 3}}
+			iters = append(iters, iter)
+			return iter
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter := code.RunWithContext(context.Background(), nil)
+	v, ok := iter.Next()
+	if !ok || v != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, v)
+	}
+	closer, ok := iter.(io.Closer)
+	if !ok {
+		t.Fatal("result iterator does not implement io.Closer")
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(iters) != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, len(iters))
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+	if err := closer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+}
+
+func TestWithIterFunctionWithContextSharedCode(t *testing.T) {
+	type ctxKey struct{}
+	query, err := gojq.Parse("f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	iters := []*closeCountIter{}
+	code, err := gojq.Compile(
+		query,
+		gojq.WithIterFunctionWithContext("f", 0, 0, func(ctx context.Context, _ any, _ []any) gojq.Iter {
+			iter := &closeCountIter{values: []any{ctx.Value(ctxKey{})}}
+			iters = append(iters, iter)
+			return iter
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iter1 := code.RunWithContext(context.WithValue(context.Background(), ctxKey{}, 1), nil)
+	iter2 := code.RunWithContext(context.WithValue(context.Background(), ctxKey{}, 2), nil)
+	if v, ok := iter1.Next(); !ok || v != 1 {
+		t.Fatalf("expected: %v, got: %v", 1, v)
+	}
+	if v, ok := iter2.Next(); !ok || v != 2 {
+		t.Fatalf("expected: %v, got: %v", 2, v)
+	}
+	if err := iter1.(io.Closer).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(iters) != 2 {
+		t.Fatalf("expected: %v, got: %v", 2, len(iters))
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+	if closed := iters[1].closed; closed != 0 {
+		t.Errorf("expected: %v, got: %v", 0, closed)
+	}
+	for {
+		if _, ok := iter2.Next(); !ok {
+			break
+		}
+	}
+	if closed := iters[0].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
+	}
+	if closed := iters[1].closed; closed != 1 {
+		t.Errorf("expected: %v, got: %v", 1, closed)
 	}
 }

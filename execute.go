@@ -2,6 +2,8 @@ package gojq
 
 import (
 	"context"
+	"errors"
+	"io"
 	"math"
 	"reflect"
 	"slices"
@@ -32,7 +34,11 @@ loop:
 			select {
 			case <-env.ctx.Done():
 				pc, env.forks = len(env.codes), nil
-				return env.ctx.Err(), true
+				err = env.ctx.Err()
+				if cerr := env.closeClosers(); cerr != nil {
+					err = errors.Join(err, cerr)
+				}
+				return err, true
 			default:
 			}
 		}
@@ -182,7 +188,15 @@ loop:
 				for i := range argcnt {
 					args[i] = env.pop()
 				}
-				w := v[0].(func(any, []any) any)(x, args)
+				var w any
+				switch f := v[0].(type) {
+				case func(any, []any) any:
+					w = f(x, args)
+				case func(context.Context, any, []any) any:
+					w = f(env.ctx, x, args)
+				default:
+					panic(v)
+				}
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
@@ -300,6 +314,11 @@ loop:
 					return strings.Compare(x.path.(string), y.path.(string))
 				})
 			case Iter:
+				var closer io.Closer
+				if c, ok := v.(io.Closer); ok {
+					closer = c
+					env.addCloser(c)
+				}
 				if w, ok := v.Next(); ok {
 					env.push(v)
 					env.pushfork(pc)
@@ -310,6 +329,9 @@ loop:
 					}
 					env.push(w)
 					continue
+				}
+				if closer != nil {
+					err = env.closeCloser(closer)
 				}
 				break loop
 			default:
@@ -354,6 +376,12 @@ loop:
 		goto loop
 	}
 	if err != nil {
+		if cerr := env.closeClosers(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+		return err, true
+	}
+	if err := env.closeClosers(); err != nil {
 		return err, true
 	}
 	return nil, false

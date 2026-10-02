@@ -37,7 +37,7 @@ const (
 type function struct {
 	argcount int
 	iter     bool
-	callback func(any, []any) any
+	callback any // func(any, []any) any or func(context.Context, any, []any) any
 }
 
 func (fn function) accept(cnt int) bool {
@@ -841,7 +841,7 @@ func funcFormat(v, x any) any {
 	if f == nil {
 		return &formatNotFoundError{format}
 	}
-	return internalFuncs[f.Name].callback(v, nil)
+	return internalFuncs[f.Name].callback.(func(any, []any) any)(v, nil)
 }
 
 var htmlEscaper = strings.NewReplacer(
