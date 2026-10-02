@@ -148,6 +148,84 @@ type Specification struct {
 Envconfig won't process a field with the "ignored" tag set to "true", even if a corresponding
 environment variable is set.
 
+## Aliases and Deprecated Names
+
+When an environment variable is renamed (for example `OLD_TIMEOUT` to
+`REQUEST_TIMEOUT`), declare the old names with the `aliases` tag and mark
+them with the `deprecated` tag:
+
+```Go
+type Config struct {
+    RequestTimeout time.Duration `envconfig:"REQUEST_TIMEOUT"
+        aliases:"OLD_TIMEOUT,LEGACY_TIMEOUT"
+        deprecated:"renamed to REQUEST_TIMEOUT"`
+}
+```
+
+Aliases are looked up with the same prefix rules as the canonical key, so a
+nested `HTTP` struct's `APP_HTTP_OLD_TIMEOUT` can never populate the `RPC`
+component.
+
+When a deprecated alias supplies the value, envconfig:
+
+  * logs a single deprecation notice (also returned in the load report), and
+  * keeps loading so the compatibility window is non-breaking.
+
+If only some aliases are deprecated, list them in `deprecated_aliases`:
+
+```Go
+Value string `aliases:"OLD_VALUE,CURRENT_ALIAS" deprecated_aliases:"OLD_VALUE"`
+```
+
+### Conflicting Names
+
+If the canonical key and any alias are set to *different* values, envconfig
+returns an error by default so misconfiguration is detected loudly:
+
+```
+conflicting environment variables APP_REQUEST_TIMEOUT, APP_OLD_TIMEOUT for field RequestTimeout: values differ
+```
+
+To silently keep the canonical value instead, use either the global policy or
+the field tag:
+
+```Go
+envconfig.ProcessConfig("app", &cfg, envconfig.Config{
+    ConflictPolicy: envconfig.ConflictPriority,
+})
+
+type Config struct {
+    Timeout string `on_conflict:"priority"` // error (default) or priority
+}
+```
+
+Precedence is the canonical key first, then the aliases in declaration order.
+When every present name holds the *same* value, processing succeeds and only
+one deprecation notice is emitted.
+
+### Load Report
+
+`ProcessWithReport` (and `ProcessConfig`) return a `LoadReport` describing
+which name actually supplied each field:
+
+```Go
+report, err := envconfig.ProcessWithReport("app", &cfg)
+for _, f := range report.Fields {
+    log.Printf("%s loaded from %s (canonical %s)", f.Field, f.Source, f.Key)
+}
+// report.Warnings holds the de-duplicated deprecation notices.
+```
+
+### Usage
+
+The default table and list usage formats now include an `ALIASES` column and a
+`DEPRECATED` marker. Custom templates can use the `usage_aliases` and
+`usage_deprecated` functions:
+
+```
+{{usage_key .}} (aliases: {{usage_aliases .}}, deprecated: {{usage_deprecated .}})
+```
+
 ## Supported Struct Field Types
 
 envconfig supports these struct field types:

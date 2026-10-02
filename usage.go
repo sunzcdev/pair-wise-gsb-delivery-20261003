@@ -22,17 +22,19 @@ const (
 variables can be used:
 {{range .}}
 {{usage_key .}}
+  [aliases]    {{usage_aliases .}}
   [description] {{usage_description .}}
   [type]        {{usage_type .}}
   [default]     {{usage_default .}}
-  [required]    {{usage_required .}}{{end}}
+  [required]    {{usage_required .}}
+  [deprecated]  {{usage_deprecated .}}{{end}}
 `
 	// DefaultTableFormat constant to use to display usage in a tabular format
 	DefaultTableFormat = `This application is configured via the environment. The following environment
 variables can be used:
 
-KEY	TYPE	DEFAULT	REQUIRED	DESCRIPTION
-{{range .}}{{usage_key .}}	{{usage_type .}}	{{usage_default .}}	{{usage_required .}}	{{usage_description .}}
+KEY	ALIASES	TYPE	DEFAULT	REQUIRED	DEPRECATED	DESCRIPTION
+{{range .}}{{usage_key .}}	{{usage_aliases .}}	{{usage_type .}}	{{usage_default .}}	{{usage_required .}}	{{usage_deprecated .}}	{{usage_description .}}
 {{end}}`
 )
 
@@ -126,9 +128,19 @@ func Usagef(prefix string, spec interface{}, out io.Writer, format string) error
 	// Specify the default usage template functions
 	functions := template.FuncMap{
 		"usage_key":         func(v varInfo) string { return v.Key },
+		"usage_aliases":     func(v varInfo) string { return strings.Join(v.Aliases, ",") },
 		"usage_description": func(v varInfo) string { return v.Tags.Get("desc") },
 		"usage_type":        func(v varInfo) string { return toTypeDescription(v.Field.Type()) },
 		"usage_default":     func(v varInfo) string { return v.Tags.Get("default") },
+		"usage_deprecated": func(v varInfo) string {
+			if !v.Deprecated {
+				return ""
+			}
+			if v.DeprecationMsg != "" {
+				return "true (" + v.DeprecationMsg + ")"
+			}
+			return "true"
+		},
 		"usage_required": func(v varInfo) (string, error) {
 			req := v.Tags.Get("required")
 			if req != "" {

@@ -8,6 +8,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"reflect"
 	"regexp"
@@ -50,11 +51,85 @@ func (e *ParseError) Error() string {
 
 // varInfo maintains information about the configuration variable
 type varInfo struct {
-	Name  string
-	Alt   string
-	Key   string
-	Field reflect.Value
-	Tags  reflect.StructTag
+	Name           string
+	Alt            string
+	Key            string
+	Aliases        []string
+	Deprecated     bool
+	DeprecationMsg string
+	DeprecatedSet  map[string]bool
+	Conflict       string
+	Field          reflect.Value
+	Tags           reflect.StructTag
+}
+
+// ConflictPolicy determines how Process behaves when several known names
+// (the canonical key and any declared aliases) for the same field are set in
+// the environment with different values.
+type ConflictPolicy int
+
+const (
+	// ConflictError makes Process return an error when multiple names are set
+	// to different values. This is the default and safest choice.
+	ConflictError ConflictPolicy = iota
+	// ConflictPriority resolves the conflict by using the canonical key first,
+	// then the aliases in the order they were declared.
+	ConflictPriority
+)
+
+// String returns the string representation of a ConflictPolicy.
+func (p ConflictPolicy) String() string {
+	switch p {
+	case ConflictPriority:
+		return "priority"
+	default:
+		return "error"
+	}
+}
+
+// Config customizes how environment variables are processed.
+type Config struct {
+	// ConflictPolicy selects the behavior when the canonical key and one or
+	// more aliases are present with differing values. The field-level
+	// "on_conflict" tag takes precedence over this setting.
+	ConflictPolicy ConflictPolicy
+}
+
+// FieldLoad reports how a single struct field was populated.
+type FieldLoad struct {
+	// Field is the Go struct field name.
+	Field string
+	// Key is the canonical environment variable name, including any prefix.
+	Key string
+	// Aliases lists every alternate name, including any prefix.
+	Aliases []string
+	// Source is the environment variable name that actually supplied the
+	// value. It is empty when the value came from the default tag or nothing
+	// was configured.
+	Source string
+	// Value is the raw value that was applied.
+	Value string
+	// Default reports whether the value came from the "default" tag.
+	Default bool
+	// Deprecated reports whether the field declares deprecated aliases.
+	Deprecated bool
+	// Warnings contains the deprecation notices generated for this field.
+	Warnings []string
+}
+
+// LoadReport describes the result of processing the environment. One entry is
+// present for every field in the specification, in declaration order.
+type LoadReport struct {
+	// Fields holds the per-field loading information.
+	Fields []FieldLoad
+	// Warnings aggregates every deprecation notice, de-duplicated.
+	Warnings []string
+}
+
+type candidate struct {
+	name  string
+	value string
+	old   bool
 }
 
 // GatherInfo gathers information about the specified struct
@@ -121,10 +196,61 @@ func gatherInfo(prefix string, spec interface{}) ([]varInfo, error) {
 		if info.Alt != "" {
 			info.Key = info.Alt
 		}
+
+		for _, alias := range strings.Split(ftype.Tag.Get("aliases"), ",") {
+			alias = strings.TrimSpace(alias)
+			if alias == "" {
+				continue
+			}
+			aliasKey := alias
+			if prefix != "" {
+				aliasKey = fmt.Sprintf("%s_%s", prefix, alias)
+			}
+			if strings.ToUpper(aliasKey) == info.Key {
+				continue
+			}
+			duplicate := false
+			for _, existing := range info.Aliases {
+				if existing == strings.ToUpper(aliasKey) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				info.Aliases = append(info.Aliases, strings.ToUpper(aliasKey))
+			}
+		}
+
+		if msg := ftype.Tag.Get("deprecated"); msg != "" {
+			info.Deprecated = true
+			if msg != "true" {
+				info.DeprecationMsg = msg
+			}
+		}
+		info.DeprecatedSet = make(map[string]bool)
+		if info.Deprecated {
+			for _, alias := range info.Aliases {
+				info.DeprecatedSet[alias] = true
+			}
+		}
+		for _, name := range strings.Split(ftype.Tag.Get("deprecated_aliases"), ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			nameKey := name
+			if prefix != "" {
+				nameKey = fmt.Sprintf("%s_%s", prefix, name)
+			}
+			info.DeprecatedSet[strings.ToUpper(nameKey)] = true
+		}
+		info.Conflict = strings.ToLower(strings.TrimSpace(ftype.Tag.Get("on_conflict")))
+
 		if prefix != "" {
 			info.Key = fmt.Sprintf("%s_%s", prefix, info.Key)
 		}
 		info.Key = strings.ToUpper(info.Key)
+
 		infos = append(infos, info)
 
 		if f.Kind() == reflect.Struct {
@@ -161,6 +287,9 @@ func CheckDisallowed(prefix string, spec interface{}) error {
 	vars := make(map[string]struct{})
 	for _, info := range infos {
 		vars[info.Key] = struct{}{}
+		for _, alias := range info.Aliases {
+			vars[alias] = struct{}{}
+		}
 	}
 
 	if prefix != "" {
@@ -182,22 +311,131 @@ func CheckDisallowed(prefix string, spec interface{}) error {
 
 // Process populates the specified struct based on environment variables
 func Process(prefix string, spec interface{}) error {
+	_, err := (Config{}).process(prefix, spec)
+	return err
+}
+
+// ProcessWithReport is the same as Process but additionally returns a
+// LoadReport describing which environment variable supplied each field and
+// any deprecation warnings that were generated.
+func ProcessWithReport(prefix string, spec interface{}) (*LoadReport, error) {
+	return (Config{}).process(prefix, spec)
+}
+
+// ProcessConfig populates the specified struct using the supplied Config and
+// returns a LoadReport.
+func ProcessConfig(prefix string, spec interface{}, cfg Config) (*LoadReport, error) {
+	return cfg.process(prefix, spec)
+}
+
+func (cfg Config) process(prefix string, spec interface{}) (*LoadReport, error) {
 	infos, err := gatherInfo(prefix, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	report := &LoadReport{}
+	seenWarnings := make(map[string]struct{})
+	addWarning := func(fl *FieldLoad, msg string) {
+		fl.Warnings = append(fl.Warnings, msg)
+		if _, seen := seenWarnings[msg]; !seen {
+			seenWarnings[msg] = struct{}{}
+			report.Warnings = append(report.Warnings, msg)
+			log.Printf("envconfig: %s", msg)
+		}
+	}
 
 	for _, info := range infos {
+		fl := FieldLoad{
+			Field:      info.Name,
+			Key:        info.Key,
+			Aliases:    append([]string(nil), info.Aliases...),
+			Deprecated: len(info.DeprecatedSet) > 0,
+		}
 
-		// `os.Getenv` cannot differentiate between an explicitly set empty value
-		// and an unset value. `os.LookupEnv` is preferred to `syscall.Getenv`,
-		// but it is only available in go1.5 or newer. We're using Go build tags
-		// here to use os.LookupEnv for >=go1.5
-		value, ok := lookupEnv(info.Key)
-		if !ok && info.Alt != "" {
-			value, ok = lookupEnv(info.Alt)
+		candidates := make([]candidate, 0, len(info.Aliases)+2)
+		if value, ok := lookupEnv(info.Key); ok {
+			candidates = append(candidates, candidate{info.Key, value, false})
+		}
+		// Historical behavior: the value of the "envconfig" tag (Alt) was
+		// also looked up without the prefix when the prefixed key was unset.
+		if info.Alt != "" {
+			altKey := strings.ToUpper(info.Alt)
+			if _, present := lookupEnv(info.Key); !present {
+				if value, ok := lookupEnv(altKey); ok {
+					candidates = append(candidates, candidate{altKey, value, false})
+				}
+			}
+		}
+		for _, alias := range info.Aliases {
+			if value, ok := lookupEnv(alias); ok {
+				candidates = append(candidates, candidate{
+					name:  alias,
+					value: value,
+					old:   info.DeprecatedSet[alias],
+				})
+			}
+		}
+
+		policy := cfg.ConflictPolicy
+		switch info.Conflict {
+		case "error":
+			policy = ConflictError
+		case "priority":
+			policy = ConflictPriority
+		}
+
+		var (
+			value   string
+			ok      bool
+			source  string
+			usedOld []string
+		)
+
+		if len(candidates) > 0 {
+			chosen := candidates[0]
+			conflict := false
+			for _, candidate := range candidates[1:] {
+				if candidate.value != chosen.value {
+					conflict = true
+					break
+				}
+			}
+			if conflict && policy == ConflictError {
+				names := make([]string, len(candidates))
+				for i, candidate := range candidates {
+					names[i] = candidate.name
+				}
+				return nil, fmt.Errorf(
+					"conflicting environment variables %s for field %s: values differ",
+					strings.Join(names, ", "), info.Name)
+			}
+			value = chosen.value
+			ok = true
+			source = chosen.name
+			if chosen.old {
+				usedOld = append(usedOld, chosen.name)
+			}
+
+			if conflict {
+				addWarning(&fl, fmt.Sprintf(
+					"multiple environment variables set for field %s; using %s with priority %s",
+					info.Name, chosen.name, precedenceString(candidates)))
+			} else if len(candidates) > 1 {
+				// Same value supplied under several names: report a single
+				// deprecation notice covering every deprecated source.
+				for _, candidate := range candidates[1:] {
+					if candidate.old {
+						usedOld = append(usedOld, candidate.name)
+					}
+				}
+			}
 		}
 
 		def := info.Tags.Get("default")
 		if def != "" && !ok {
 			value = def
+			fl.Default = true
 		}
 
 		req := info.Tags.Get("required")
@@ -207,14 +445,32 @@ func Process(prefix string, spec interface{}) error {
 				if info.Alt != "" {
 					key = info.Alt
 				}
-				return fmt.Errorf("required key %s missing value", key)
+				return nil, fmt.Errorf("required key %s missing value", key)
 			}
+			report.Fields = append(report.Fields, fl)
 			continue
 		}
 
-		err = processField(value, info.Field)
-		if err != nil {
-			return &ParseError{
+		if ok {
+			fl.Source = source
+			fl.Value = value
+		} else {
+			fl.Value = value
+		}
+
+		if ok && len(usedOld) > 0 {
+			msg := fmt.Sprintf(
+				"%s is deprecated, use %s instead",
+				strings.Join(usedOld, ", "), info.Key)
+			if info.DeprecationMsg != "" {
+				msg = fmt.Sprintf("%s is deprecated: %s; use %s instead",
+					strings.Join(usedOld, ", "), info.DeprecationMsg, info.Key)
+			}
+			addWarning(&fl, msg)
+		}
+
+		if err := processField(value, info.Field); err != nil {
+			return nil, &ParseError{
 				KeyName:   info.Key,
 				FieldName: info.Name,
 				TypeName:  info.Field.Type().String(),
@@ -222,9 +478,19 @@ func Process(prefix string, spec interface{}) error {
 				Err:       err,
 			}
 		}
+
+		report.Fields = append(report.Fields, fl)
 	}
 
-	return err
+	return report, nil
+}
+
+func precedenceString(candidates []candidate) string {
+	names := make([]string, len(candidates))
+	for i, candidate := range candidates {
+		names[i] = candidate.name
+	}
+	return strings.Join(names, " > ")
 }
 
 // MustProcess is the same as Process but panics if an error occurs
