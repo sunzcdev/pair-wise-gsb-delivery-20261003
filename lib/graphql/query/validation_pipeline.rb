@@ -96,19 +96,17 @@ module GraphQL
       def build_analyzers(schema, max_depth, max_complexity)
         qa = schema.query_analyzers.dup
 
-        if max_depth || max_complexity
-          # Depending on the analysis engine, we must use different analyzers
-          # remove this once everything has switched over to AST analyzers
-          if max_depth
-            qa << GraphQL::Analysis::MaxQueryDepth
-          end
-          if max_complexity
-            qa << GraphQL::Analysis::MaxQueryComplexity
-          end
-          qa
-        else
-          qa
+        if max_depth
+          qa << GraphQL::Analysis::MaxQueryDepth
         end
+        if max_complexity
+          qa << GraphQL::Analysis::MaxQueryComplexity
+        end
+        if schema.max_input_value_depth || schema.max_input_value_count || schema.max_input_value_string_bytes
+          qa << GraphQL::Analysis::MaxInputValues
+        end
+
+        qa
       end
     end
   end

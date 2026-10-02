@@ -163,6 +163,27 @@ class Types::BaseField < GraphQL::Schema::Field
 end
 ```
 
+## Limit input value size
+
+Limiting the query string (or its depth and complexity) doesn't stop clients from sending huge _values_, for example a very short query with a giant array in `variables`. You can budget the argument values a query may use with three schema-level settings:
+
+```ruby
+class MySchema < GraphQL::Schema
+  max_input_value_depth 10            # no single argument value may be nested deeper than this
+  max_input_value_count 1_000         # total elements over all argument values used by the query
+  max_input_value_string_bytes 100_000 # total string bytes over all argument values used by the query
+end
+```
+
+The budgets are measured during query analysis, before any resolver runs, on the argument values that will actually be used by the selected operation:
+
+- Literal values, query variables and default values (including defaults nested inside input objects) are all measured by the same rules.
+- When the same variable is used at several argument positions, its value is measured once _per position_ and each use counts toward the budget, because each position is coerced separately at runtime.
+- Operations in the document that aren't selected for execution don't count, and neither do fields skipped by `@skip` or `@include`.
+- Measuring never coerces values, so custom scalar `coerce_input` implementations aren't run an extra time for this check.
+
+When a budget is exceeded, the error is attached to the argument position that used the offending value. Each value is measured as a tree of Ruby values: a scalar has depth `0` and each `Array` or `Hash` layer adds one; every value in the tree counts as one element (including arrays, hashes, and hash keys); and every `String` (including hash keys) contributes its `bytesize`.
+
 ## How complexity scoring works
 
 GraphQL Ruby's complexity scoring algorithm is biased towards selection fairness. While highly accurate, its results are not always intuitive. Here's an example query performed on the [Shopify Admin API](https://shopify.dev/docs/api/admin-graphql):

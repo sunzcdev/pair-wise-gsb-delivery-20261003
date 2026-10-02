@@ -950,6 +950,54 @@ module GraphQL
         end
       end
 
+      attr_writer :max_input_value_depth
+
+      # Limit the depth of any single argument value used by a query.
+      # Literal values, variables and default values are all measured by the
+      # same rules; see {GraphQL::Analysis::MaxInputValues}.
+      # @return [Integer, nil]
+      def max_input_value_depth(new_max_input_value_depth = NOT_CONFIGURED)
+        if new_max_input_value_depth != NOT_CONFIGURED
+          @max_input_value_depth = new_max_input_value_depth
+        elsif defined?(@max_input_value_depth)
+          @max_input_value_depth
+        else
+          find_inherited_value(:max_input_value_depth)
+        end
+      end
+
+      attr_writer :max_input_value_count
+
+      # Limit the total number of elements in all argument values used by a
+      # query. A variable used at several argument positions is counted once
+      # per position; see {GraphQL::Analysis::MaxInputValues}.
+      # @return [Integer, nil]
+      def max_input_value_count(new_max_input_value_count = NOT_CONFIGURED)
+        if new_max_input_value_count != NOT_CONFIGURED
+          @max_input_value_count = new_max_input_value_count
+        elsif defined?(@max_input_value_count)
+          @max_input_value_count
+        else
+          find_inherited_value(:max_input_value_count)
+        end
+      end
+
+      attr_writer :max_input_value_string_bytes
+
+      # Limit the total number of string bytes in all argument values used by
+      # a query. A variable used at several argument positions is counted once
+      # per position; see {GraphQL::Analysis::MaxInputValues}.
+      # @return [Integer, nil]
+      def max_input_value_string_bytes(new_max_input_value_string_bytes = NOT_CONFIGURED)
+        if new_max_input_value_string_bytes != NOT_CONFIGURED
+          @max_input_value_string_bytes = new_max_input_value_string_bytes
+        elsif defined?(@max_input_value_string_bytes)
+          @max_input_value_string_bytes
+        else
+          find_inherited_value(:max_input_value_string_bytes)
+        end
+      end
+
       def disable_introspection_entry_points
         @disable_introspection_entry_points = true
         # TODO: this clears the cache made in `def types`. But this is not a great solution.
