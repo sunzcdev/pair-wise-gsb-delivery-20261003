@@ -8,9 +8,26 @@ import (
 
 // Validate validates JSON s.
 func Validate(s string) error {
+	return validate(s, false)
+}
+
+// ValidateStrict is like Validate, but it also rejects strings with invalid
+// Unicode: invalid UTF-8, malformed \u escape sequences, unpaired surrogates
+// and surrogate pairs in the wrong order.
+func ValidateStrict(s string) error {
+	return validate(s, true)
+}
+
+func validate(s string, strict bool) error {
+	n := len(s)
 	s = skipWS(s)
 
-	tail, err := validateValue(s)
+	vd := validator{
+		strict:  strict,
+		base:    n - len(s),
+		fullLen: len(s),
+	}
+	tail, err := vd.validateValue(s)
 	if err != nil {
 		return fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
 	}
@@ -26,29 +43,59 @@ func ValidateBytes(b []byte) error {
 	return Validate(b2s(b))
 }
 
-func validateValue(s string) (string, error) {
+// ValidateBytesStrict is like ValidateBytes, but it also rejects strings
+// with invalid Unicode. See ValidateStrict for details.
+func ValidateBytesStrict(b []byte) error {
+	return ValidateStrict(b2s(b))
+}
+
+type validator struct {
+	// strict enables strict Unicode checks for strings.
+	strict bool
+
+	// base is the byte offset of the validated string in the original input
+	// (the number of leading whitespace bytes skipped before validation).
+	base int
+
+	// fullLen is the length of the string being validated.
+	// It is used for calculating byte offsets in the original input.
+	fullLen int
+}
+
+// pos returns the byte offset of s[0] in the original input,
+// where s is a suffix of the string being validated.
+func (vd *validator) pos(s string) int {
+	return vd.base + vd.fullLen - len(s)
+}
+
+func (vd *validator) validateValue(s string) (string, error) {
 	if len(s) == 0 {
 		return s, fmt.Errorf("cannot parse empty string")
 	}
 
 	if s[0] == '{' {
-		tail, err := validateObject(s[1:])
+		tail, err := vd.validateObject(s[1:])
 		if err != nil {
 			return tail, fmt.Errorf("cannot parse object: %s", err)
 		}
 		return tail, nil
 	}
 	if s[0] == '[' {
-		tail, err := validateArray(s[1:])
+		tail, err := vd.validateArray(s[1:])
 		if err != nil {
 			return tail, fmt.Errorf("cannot parse array: %s", err)
 		}
 		return tail, nil
 	}
 	if s[0] == '"' {
-		sv, tail, err := validateString(s[1:])
+		sv, raw, tail, err := vd.validateString(s[1:])
 		if err != nil {
 			return tail, fmt.Errorf("cannot parse string: %s", err)
+		}
+		if vd.strict {
+			if err := checkStringStrict(raw, vd.pos(s)+1); err != nil {
+				return s, fmt.Errorf("cannot parse string: %s", err)
+			}
 		}
 		// Scan the string for control chars.
 		for i := range len(sv) {
@@ -84,7 +131,7 @@ func validateValue(s string) (string, error) {
 	return tail, nil
 }
 
-func validateArray(s string) (string, error) {
+func (vd *validator) validateArray(s string) (string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return s, fmt.Errorf("missing ']'")
@@ -97,7 +144,7 @@ func validateArray(s string) (string, error) {
 		var err error
 
 		s = skipWS(s)
-		s, err = validateValue(s)
+		s, err = vd.validateValue(s)
 		if err != nil {
 			return s, fmt.Errorf("cannot parse array value: %s", err)
 		}
@@ -118,7 +165,7 @@ func validateArray(s string) (string, error) {
 	}
 }
 
-func validateObject(s string) (string, error) {
+func (vd *validator) validateObject(s string) (string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return s, fmt.Errorf("missing '}'")
@@ -136,10 +183,16 @@ func validateObject(s string) (string, error) {
 			return s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
 
-		var key string
-		key, s, err = validateKey(s[1:])
+		var key, keyRaw string
+		keyStr := s
+		key, keyRaw, s, err = vd.validateKey(s[1:])
 		if err != nil {
 			return s, fmt.Errorf("cannot parse object key: %s", err)
+		}
+		if vd.strict {
+			if err := checkStringStrict(keyRaw, vd.pos(keyStr)+1); err != nil {
+				return keyStr, fmt.Errorf("cannot parse object key: %s", err)
+			}
 		}
 		// Scan the key for control chars.
 		for i := range len(key) {
@@ -155,7 +208,7 @@ func validateObject(s string) (string, error) {
 
 		// Parse value
 		s = skipWS(s)
-		s, err = validateValue(s)
+		s, err = vd.validateValue(s)
 		if err != nil {
 			return s, fmt.Errorf("cannot parse object value: %s", err)
 		}
@@ -176,39 +229,45 @@ func validateObject(s string) (string, error) {
 
 // validateKey is similar to validateString, but is optimized
 // for typical object keys, which are quite small and have no escape sequences.
-func validateKey(s string) (string, string, error) {
+//
+// It returns the key for the control chars scan, the full raw key
+// for strict Unicode checks and the unparsed tail.
+func (vd *validator) validateKey(s string) (key, raw, tail string, err error) {
 	for i := range len(s) {
 		if s[i] == '"' {
 			// Fast path - the key doesn't contain escape sequences.
-			return s[:i], s[i+1:], nil
+			return s[:i], s[:i], s[i+1:], nil
 		}
 		if s[i] == '\\' {
 			// Slow path - the key contains escape sequences.
-			return validateString(s)
+			return vd.validateString(s)
 		}
 	}
-	return "", s, fmt.Errorf(`missing closing '"'`)
+	return "", "", s, fmt.Errorf(`missing closing '"'`)
 }
 
-func validateString(s string) (string, string, error) {
+// validateString returns the string for the control chars scan, the full
+// raw string for strict Unicode checks and the unparsed tail.
+func (vd *validator) validateString(s string) (sv, raw, tail string, err error) {
 	// Try fast path - a string without escape sequences.
 	if n := strings.IndexByte(s, '"'); n >= 0 && strings.IndexByte(s[:n], '\\') < 0 {
-		return s[:n], s[n+1:], nil
+		return s[:n], s[:n], s[n+1:], nil
 	}
 
 	// Slow path - escape sequences are present.
 	rs, tail, err := parseRawString(s)
 	if err != nil {
-		return rs, tail, err
+		return "", rs, tail, err
 	}
+	raw = rs
 	for {
 		n := strings.IndexByte(rs, '\\')
 		if n < 0 {
-			return rs, tail, nil
+			return rs, raw, tail, nil
 		}
 		n++
 		if n >= len(rs) {
-			return rs, tail, fmt.Errorf("BUG: parseRawString returned invalid string with trailing backslash: %q", rs)
+			return rs, raw, tail, fmt.Errorf("BUG: parseRawString returned invalid string with trailing backslash: %q", rs)
 		}
 		ch := rs[n]
 		rs = rs[n+1:]
@@ -218,16 +277,16 @@ func validateString(s string) (string, string, error) {
 			break
 		case 'u':
 			if len(rs) < 4 {
-				return rs, tail, fmt.Errorf(`too short escape sequence: \u%s`, rs)
+				return rs, raw, tail, fmt.Errorf(`too short escape sequence: \u%s`, rs)
 			}
 			xs := rs[:4]
 			_, err := strconv.ParseUint(xs, 16, 16)
 			if err != nil {
-				return rs, tail, fmt.Errorf(`invalid escape sequence \u%s: %s`, xs, err)
+				return rs, raw, tail, fmt.Errorf(`invalid escape sequence \u%s: %s`, xs, err)
 			}
 			rs = rs[4:]
 		default:
-			return rs, tail, fmt.Errorf(`unknown escape sequence \%c`, ch)
+			return rs, raw, tail, fmt.Errorf(`unknown escape sequence \%c`, ch)
 		}
 	}
 }

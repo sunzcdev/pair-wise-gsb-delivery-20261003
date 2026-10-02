@@ -137,6 +137,15 @@ func Parse(s string) (*Value, error) {
 	return p.Parse(s)
 }
 
+// ParseStrict is like Parse, but it rejects strings with invalid Unicode.
+// See Parser.ParseStrict for details.
+//
+// The function is slower than the Parser.ParseStrict for re-used Parser.
+func ParseStrict(s string) (*Value, error) {
+	var p Parser
+	return p.ParseStrict(s)
+}
+
 // MustParse parses json string s.
 //
 // The function panics if s cannot be parsed.
@@ -155,6 +164,15 @@ func MustParse(s string) *Value {
 func ParseBytes(b []byte) (*Value, error) {
 	var p Parser
 	return p.ParseBytes(b)
+}
+
+// ParseBytesStrict is like ParseBytes, but it rejects strings with invalid
+// Unicode. See Parser.ParseStrict for details.
+//
+// The function is slower than the Parser.ParseBytesStrict for re-used Parser.
+func ParseBytesStrict(b []byte) (*Value, error) {
+	var p Parser
+	return p.ParseBytesStrict(b)
 }
 
 // MustParseBytes parses b containing json.

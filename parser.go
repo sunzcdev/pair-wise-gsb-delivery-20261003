@@ -28,9 +28,28 @@ type Parser struct {
 //
 // Use Scanner if a stream of JSON values must be parsed.
 func (p *Parser) Parse(s string) (*Value, error) {
+	return p.parse(s, false)
+}
+
+// ParseStrict is like Parse, but it rejects strings with invalid Unicode:
+// invalid UTF-8, malformed \u escape sequences, unpaired surrogates
+// and surrogate pairs in the wrong order.
+//
+// The returned value is valid until the next call to Parse*.
+//
+// Use Scanner if a stream of JSON values must be parsed.
+func (p *Parser) ParseStrict(s string) (*Value, error) {
+	return p.parse(s, true)
+}
+
+func (p *Parser) parse(s string, strict bool) (*Value, error) {
+	n := len(s)
 	s = skipWS(s)
 	p.b = append(p.b[:0], s...)
 	p.c.reset()
+	p.c.strict = strict
+	p.c.base = n - len(s)
+	p.c.fullLen = len(s)
 
 	v, tail, err := p.c.parseValue(b2s(p.b), 0)
 	if err != nil {
@@ -52,8 +71,35 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 	return p.Parse(b2s(b))
 }
 
+// ParseBytesStrict is like ParseBytes, but it rejects strings with invalid
+// Unicode. See ParseStrict for details.
+//
+// The returned Value is valid until the next call to Parse*.
+//
+// Use Scanner if a stream of JSON values must be parsed.
+func (p *Parser) ParseBytesStrict(b []byte) (*Value, error) {
+	return p.ParseStrict(b2s(b))
+}
+
 type cache struct {
 	vs []Value
+
+	// strict enables strict Unicode checks for strings.
+	strict bool
+
+	// base is the byte offset of the parsed string in the original input
+	// (the number of leading whitespace bytes skipped before parsing).
+	base int
+
+	// fullLen is the length of the string being parsed.
+	// It is used for calculating byte offsets in the original input.
+	fullLen int
+}
+
+// pos returns the byte offset of s[0] in the original input,
+// where s is a suffix of the string being parsed.
+func (c *cache) pos(s string) int {
+	return c.base + c.fullLen - len(s)
 }
 
 func (c *cache) reset() {
@@ -128,6 +174,11 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 		ss, tail, err := parseRawString(s[1:])
 		if err != nil {
 			return nil, tail, fmt.Errorf("cannot parse string: %s", err)
+		}
+		if c.strict {
+			if err := checkStringStrict(ss, c.pos(s)+1); err != nil {
+				return nil, s, fmt.Errorf("cannot parse string: %s", err)
+			}
 		}
 		v := c.getValue()
 		v.t = typeRawString
@@ -238,9 +289,15 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		if len(s) == 0 || s[0] != '"' {
 			return nil, s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
+		key := s
 		kv.k, s, err = parseRawKey(s[1:])
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
+		}
+		if c.strict {
+			if err := checkStringStrict(kv.k, c.pos(key)+1); err != nil {
+				return nil, key, fmt.Errorf("cannot parse object key: %s", err)
+			}
 		}
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
