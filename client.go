@@ -927,6 +927,67 @@ func (c *Client) PosixRename(oldname, newname string) error {
 	}
 }
 
+// CopyData copies length bytes from src, starting at srcOffset, to dst,
+// starting at dstOffset, entirely on the server side, using the copy-data
+// extension: https://github.com/openssh/openssh-portable/blob/master/PROTOCOL
+//
+// Both files must be open on this client, src must be open for reading and
+// dst must be open for writing. If src and dst refer to the same file and
+// the ranges overlap, the copy is performed as if the source range had been
+// fully read before any byte is written.
+//
+// If the server does not advertise the copy-data extension, a *StatusError
+// with code sshFxOPUnsupported is returned.
+func (c *Client) CopyData(src *File, srcOffset int64, length int64, dst *File, dstOffset int64) error {
+	switch {
+	case src == nil || dst == nil:
+		return errors.New("sftp: copy-data requires non-nil source and destination files")
+	case src.c != c || dst.c != c:
+		return errors.New("sftp: copy-data requires both files to be open on the same client")
+	case srcOffset < 0 || length < 0 || dstOffset < 0:
+		return errors.New("sftp: copy-data requires non-negative offsets and length")
+	}
+
+	if data, ok := c.HasExtension(openssh.ExtensionCopyData().Name); !ok || data != "1" {
+		return &StatusError{
+			Code: sshFxOPUnsupported,
+			msg:  "copy-data not supported",
+		}
+	}
+
+	// Lock the files to get stable handles; avoid a recursive read-lock
+	// when source and destination are the same file.
+	src.mu.RLock()
+	if dst != src {
+		dst.mu.RLock()
+		defer dst.mu.RUnlock()
+	}
+	defer src.mu.RUnlock()
+
+	if src.handle == "" || dst.handle == "" {
+		return os.ErrClosed
+	}
+
+	id := c.nextID()
+	typ, data, err := c.sendPacket(context.Background(), nil, &sshFxpCopyDataPacket{
+		ID:          id,
+		ReadHandle:  src.handle,
+		ReadOffset:  uint64(srcOffset),
+		ReadLength:  uint64(length),
+		WriteHandle: dst.handle,
+		WriteOffset: uint64(dstOffset),
+	})
+
+	switch {
+	case err != nil:
+		return err
+	case typ == sshFxpStatus:
+		return normaliseError(unmarshalStatus(id, data))
+	default:
+		return &unexpectedPacketErr{want: sshFxpStatus, got: typ}
+	}
+}
+
 // RealPath can be used to have the server canonicalize any given path name to an absolute path.
 //
 // This is useful for converting path names containing ".." components,

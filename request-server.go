@@ -3,6 +3,7 @@ package sftp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"path"
 	"path/filepath"
@@ -142,6 +143,50 @@ func (rs *RequestServer) closeRequest(handle string) error {
 
 // Close the read/write/closer to trigger exiting the main server loop
 func (rs *RequestServer) Close() error { return rs.conn.Close() }
+
+// copyData implements the copy-data extension: it copies pkt.ReadLength
+// bytes from the open request identified by pkt.ReadHandle, starting at
+// pkt.ReadOffset, to the open request identified by pkt.WriteHandle,
+// starting at pkt.WriteOffset.
+//
+// If the destination's io.WriterAt implements DataCopier, the copy is
+// handed over to the backend; otherwise a generic bounded-buffer copy is
+// used, which is safe even when source and destination ranges of the same
+// file overlap.
+func (rs *RequestServer) copyData(pkt *sshFxpExtendedPacketCopyData) responsePacket {
+	srcReq, ok := rs.getRequest(pkt.ReadHandle)
+	if !ok {
+		return statusFromError(pkt.ID, EBADF)
+	}
+
+	dstReq, ok := rs.getRequest(pkt.WriteHandle)
+	if !ok {
+		return statusFromError(pkt.ID, EBADF)
+	}
+
+	src := srcReq.getReaderAt()
+	if src == nil {
+		src = srcReq.getWriterAtReaderAt()
+	}
+	if src == nil {
+		return statusFromError(pkt.ID, fmt.Errorf("handle %q is not open for reading", pkt.ReadHandle))
+	}
+
+	dst := dstReq.getWriterAt()
+	if dst == nil {
+		dst = dstReq.getWriterAtReaderAt()
+	}
+	if dst == nil {
+		return statusFromError(pkt.ID, fmt.Errorf("handle %q is not open for writing", pkt.WriteHandle))
+	}
+
+	sameFile := pkt.ReadHandle == pkt.WriteHandle ||
+		srcReq.Filepath == dstReq.Filepath ||
+		sameFileInfo(src, dst)
+
+	err := copyData(src, pkt.ReadOffset, pkt.ReadLength, dst, pkt.WriteOffset, sameFile)
+	return statusFromError(pkt.ID, err)
+}
 
 func (rs *RequestServer) serveLoop(pktChan chan<- orderedRequest) error {
 	defer close(pktChan) // shuts down sftpServerWorkers
@@ -305,6 +350,8 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpExtendedPacketCopyData:
+			rpkt = rs.copyData(pkt)
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)

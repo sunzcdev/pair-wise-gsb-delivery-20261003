@@ -1302,6 +1302,40 @@ func (p *sshFxpFsyncPacket) MarshalBinary() ([]byte, error) {
 	return b, nil
 }
 
+type sshFxpCopyDataPacket struct {
+	ID          uint32
+	ReadHandle  string
+	ReadOffset  uint64
+	ReadLength  uint64
+	WriteHandle string
+	WriteOffset uint64
+}
+
+func (p *sshFxpCopyDataPacket) id() uint32 { return p.ID }
+
+func (p *sshFxpCopyDataPacket) MarshalBinary() ([]byte, error) {
+	const ext = "copy-data"
+	l := 4 + 1 + 4 + // uint32(length) + byte(type) + uint32(id)
+		4 + len(ext) +
+		4 + len(p.ReadHandle) +
+		8 + // uint64(read-offset)
+		8 + // uint64(read-length)
+		4 + len(p.WriteHandle) +
+		8 // uint64(write-offset)
+
+	b := make([]byte, 4, l)
+	b = append(b, sshFxpExtended)
+	b = marshalUint32(b, p.ID)
+	b = marshalString(b, ext)
+	b = marshalString(b, p.ReadHandle)
+	b = marshalUint64(b, p.ReadOffset)
+	b = marshalUint64(b, p.ReadLength)
+	b = marshalString(b, p.WriteHandle)
+	b = marshalUint64(b, p.WriteOffset)
+
+	return b, nil
+}
+
 type sshFxpExtendedPacket struct {
 	ID              uint32
 	ExtendedRequest string
@@ -1343,6 +1377,8 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketHardlink{}
+	case "copy-data":
+		p.SpecificPacket = &sshFxpExtendedPacketCopyData{}
 	default:
 		return fmt.Errorf("packet type %v: %w", p.SpecificPacket, errUnknownExtendedPacket)
 	}
@@ -1424,5 +1460,57 @@ func (p *sshFxpExtendedPacketHardlink) UnmarshalBinary(b []byte) error {
 
 func (p *sshFxpExtendedPacketHardlink) respond(s *Server) responsePacket {
 	err := os.Link(s.toLocalPath(p.Oldpath), s.toLocalPath(p.Newpath))
+	return statusFromError(p.ID, err)
+}
+
+// sshFxpExtendedPacketCopyData implements the copy-data extension.
+//
+// See: https://github.com/openssh/openssh-portable/blob/master/PROTOCOL
+type sshFxpExtendedPacketCopyData struct {
+	ID              uint32
+	ExtendedRequest string
+	ReadHandle      string
+	ReadOffset      uint64
+	ReadLength      uint64
+	WriteHandle     string
+	WriteOffset     uint64
+}
+
+func (p *sshFxpExtendedPacketCopyData) id() uint32     { return p.ID }
+func (p *sshFxpExtendedPacketCopyData) readonly() bool { return false }
+func (p *sshFxpExtendedPacketCopyData) UnmarshalBinary(b []byte) error {
+	var err error
+	if p.ID, b, err = unmarshalUint32Safe(b); err != nil {
+		return err
+	} else if p.ExtendedRequest, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.ReadHandle, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.ReadOffset, b, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	} else if p.ReadLength, b, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	} else if p.WriteHandle, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.WriteOffset, _, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *sshFxpExtendedPacketCopyData) respond(s *Server) responsePacket {
+	src, ok := s.getHandle(p.ReadHandle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+
+	dst, ok := s.getHandle(p.WriteHandle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+
+	sameFile := p.ReadHandle == p.WriteHandle || sameFileInfo(src, dst)
+
+	err := copyData(src, p.ReadOffset, p.ReadLength, dst, p.WriteOffset, sameFile)
 	return statusFromError(p.ID, err)
 }

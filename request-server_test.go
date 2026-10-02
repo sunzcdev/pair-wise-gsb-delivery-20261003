@@ -2,6 +2,7 @@ package sftp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -1044,4 +1045,173 @@ func TestCleanPath(t *testing.T) {
 	assert.Equal(t, "/a/b/c",
 		cleanPath(bslash+"a"+bslash+bslash+"b"+bslash+bslash+"c"+bslash))
 	assert.Equal(t, "/C:/a", cleanPath("C:"+bslash+"a"))
+}
+
+// clientRequestServerNetPipePair returns a client connected to a
+// RequestServer over an in-memory pipe. Unlike clientRequestServerPair
+// it does not require a unix socket, so it also runs on Windows.
+func clientRequestServerNetPipePair(t *testing.T, handlers Handlers) (*Client, *RequestServer) {
+	t.Helper()
+
+	c1, c2 := net.Pipe()
+
+	svr := NewRequestServer(c1, handlers)
+	go func() {
+		svr.Serve()
+	}()
+
+	cli, err := NewClientPipe(c2, c2)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		// these must be closed in order, else client.Close will hang
+		svr.Close()
+		cli.Close()
+	})
+
+	return cli, svr
+}
+
+func TestRequestServerCopyData(t *testing.T) {
+	cli, _ := clientRequestServerNetPipePair(t, InMemHandler())
+
+	_, err := putTestFile(cli, "/foo", "hello world")
+	require.NoError(t, err)
+
+	src, err := cli.Open("/foo")
+	require.NoError(t, err)
+	defer src.Close()
+
+	dst, err := cli.Create("/bar")
+	require.NoError(t, err)
+
+	require.NoError(t, cli.CopyData(src, 6, 5, dst, 0))
+	require.NoError(t, dst.Close())
+
+	content, err := getTestFile(cli, "/bar")
+	require.NoError(t, err)
+	assert.Equal(t, "world", string(content))
+}
+
+func TestRequestServerCopyDataOverlap(t *testing.T) {
+	cli, _ := clientRequestServerNetPipePair(t, InMemHandler())
+
+	_, err := putTestFile(cli, "/foo", "0123456789")
+	require.NoError(t, err)
+
+	// two independent handles on the same file
+	src, err := cli.OpenFile("/foo", os.O_RDWR)
+	require.NoError(t, err)
+	defer src.Close()
+
+	dst, err := cli.OpenFile("/foo", os.O_RDWR)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	// copying [0,8) over [2,10) must behave like a memmove: writes must
+	// not clobber source data that has not been read yet
+	require.NoError(t, cli.CopyData(src, 0, 8, dst, 2))
+
+	content, err := getTestFile(cli, "/foo")
+	require.NoError(t, err)
+	assert.Equal(t, "0101234567", string(content))
+}
+
+func TestRequestServerCopyDataInvalidHandle(t *testing.T) {
+	cli, _ := clientRequestServerNetPipePair(t, InMemHandler())
+
+	_, err := putTestFile(cli, "/foo", "hello")
+	require.NoError(t, err)
+
+	src, err := cli.Open("/foo")
+	require.NoError(t, err)
+	defer src.Close()
+
+	dst, err := cli.Create("/bar")
+	require.NoError(t, err)
+	defer dst.Close()
+
+	// handles the server does not know are rejected
+	bogus := &File{c: cli, handle: "no-such-handle"}
+
+	err = cli.CopyData(bogus, 0, 5, dst, 0)
+	require.Error(t, err)
+	assert.IsType(t, &StatusError{}, err)
+
+	err = cli.CopyData(src, 0, 5, bogus, 0)
+	require.Error(t, err)
+	assert.IsType(t, &StatusError{}, err)
+
+	// dst is not open for reading and src is not open for writing
+	err = cli.CopyData(dst, 0, 5, src, 0)
+	require.Error(t, err)
+	assert.IsType(t, &StatusError{}, err)
+
+	// nothing was copied
+	content, err := getTestFile(cli, "/bar")
+	require.NoError(t, err)
+	assert.Empty(t, content)
+}
+
+// copyDataNativeHandler provides a native server-side copy through the
+// DataCopier interface on the io.WriterAt returned by Filewrite.
+type copyDataNativeHandler struct {
+	*root
+	calls int
+}
+
+func (h *copyDataNativeHandler) Filewrite(r *Request) (io.WriterAt, error) {
+	wr, err := h.root.Filewrite(r)
+	if err != nil {
+		return nil, err
+	}
+	return &copyDataNativeWriter{WriterAt: wr, calls: &h.calls}, nil
+}
+
+type copyDataNativeWriter struct {
+	io.WriterAt
+	calls *int
+}
+
+func (w *copyDataNativeWriter) CopyDataFrom(src io.ReaderAt, srcOffset, length, dstOffset int64) error {
+	*w.calls++
+
+	buf := make([]byte, length)
+	n, err := readAtFull(src, buf, srcOffset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return writeAtFull(w.WriterAt, buf[:n], dstOffset)
+}
+
+func TestRequestServerCopyDataNative(t *testing.T) {
+	mem := &root{
+		rootFile: &memFile{name: "/", modtime: time.Now(), isdir: true},
+		files:    make(map[string]*memFile),
+	}
+	handler := &copyDataNativeHandler{root: mem}
+
+	cli, _ := clientRequestServerNetPipePair(t, Handlers{mem, handler, mem, mem})
+
+	_, err := putTestFile(cli, "/foo", "hello world")
+	require.NoError(t, err)
+
+	src, err := cli.Open("/foo")
+	require.NoError(t, err)
+	defer src.Close()
+
+	// open the destination write-only, so that it is served by Filewrite,
+	// which provides the native copy
+	dst, err := cli.OpenFile("/bar", os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	require.NoError(t, err)
+
+	require.NoError(t, cli.CopyData(src, 0, 11, dst, 0))
+	require.NoError(t, dst.Close())
+
+	// the backend provided the copy natively, no fallback was used
+	assert.Equal(t, 1, handler.calls)
+
+	content, err := getTestFile(cli, "/bar")
+	require.NoError(t, err)
+	assert.Equal(t, "hello world", string(content))
 }

@@ -800,6 +800,157 @@ func TestClientPosixRename(t *testing.T) {
 	}
 }
 
+func TestClientCopyDataGo(t *testing.T) {
+	if !*testServerImpl {
+		t.Skipf("skipping without -testserver")
+	}
+
+	sftp, cmd := testClient(t, READWRITE, NODELAY)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	d, err := ioutil.TempDir("", "sftptest.copydata")
+	require.NoError(t, err)
+	defer os.RemoveAll(d)
+
+	// basic copy between two different files
+	srcPath := path.Join(d, "src")
+	dstPath := path.Join(d, "dst")
+
+	require.NoError(t, ioutil.WriteFile(srcPath, []byte("hello world, how are you?"), 0o644))
+	require.NoError(t, ioutil.WriteFile(dstPath, []byte("........................."), 0o644))
+
+	src, err := sftp.Open(srcPath)
+	require.NoError(t, err)
+	defer src.Close()
+
+	dst, err := sftp.OpenFile(dstPath, os.O_WRONLY)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	require.NoError(t, sftp.CopyData(src, 6, 5, dst, 3))
+
+	content, err := ioutil.ReadFile(dstPath)
+	require.NoError(t, err)
+	assert.Equal(t, "...world.................", string(content))
+
+	// copying a range of a file over itself, with overlapping ranges:
+	// the copy must behave like a memmove, writes must not clobber
+	// source data that has not been read yet
+	overlapPath := path.Join(d, "overlap")
+	require.NoError(t, ioutil.WriteFile(overlapPath, []byte("0123456789"), 0o644))
+
+	f, err := sftp.OpenFile(overlapPath, os.O_RDWR)
+	require.NoError(t, err)
+	defer f.Close()
+
+	require.NoError(t, sftp.CopyData(f, 0, 8, f, 2))
+
+	content, err = ioutil.ReadFile(overlapPath)
+	require.NoError(t, err)
+	assert.Equal(t, "0101234567", string(content))
+
+	// the same file opened through two distinct handles
+	require.NoError(t, ioutil.WriteFile(overlapPath, []byte("0123456789"), 0o644))
+
+	f1, err := sftp.OpenFile(overlapPath, os.O_RDWR)
+	require.NoError(t, err)
+	defer f1.Close()
+	f2, err := sftp.OpenFile(overlapPath, os.O_RDWR)
+	require.NoError(t, err)
+	defer f2.Close()
+
+	require.NoError(t, sftp.CopyData(f1, 0, 8, f2, 2))
+
+	content, err = ioutil.ReadFile(overlapPath)
+	require.NoError(t, err)
+	assert.Equal(t, "0101234567", string(content))
+
+	// negative offsets and lengths are rejected client-side
+	require.Error(t, sftp.CopyData(src, -1, 5, dst, 0))
+	require.Error(t, sftp.CopyData(src, 0, -5, dst, 0))
+	require.Error(t, sftp.CopyData(src, 0, 5, dst, -1))
+
+	// files opened on another client are rejected client-side
+	sftp2, cmd2 := testClient(t, READWRITE, NODELAY)
+	defer cmd2.Wait()
+	defer sftp2.Close()
+
+	other, err := sftp2.Open(srcPath)
+	require.NoError(t, err)
+	defer other.Close()
+
+	require.Error(t, sftp.CopyData(src, 0, 5, other, 0))
+
+	// a closed file cannot be used
+	closed, err := sftp.Open(srcPath)
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	require.ErrorIs(t, sftp.CopyData(closed, 0, 5, dst, 0), os.ErrClosed)
+
+	// a handle the server does not know is reported as a failure
+	bogus := &File{c: sftp, handle: "no-such-handle"}
+	err = sftp.CopyData(bogus, 0, 5, dst, 0)
+	require.Error(t, err)
+	statusErr, ok := err.(*StatusError)
+	require.True(t, ok)
+	assert.Equal(t, ErrSSHFxFailure, statusErr.FxCode())
+
+	err = sftp.CopyData(src, 0, 5, bogus, 0)
+	require.Error(t, err)
+	statusErr, ok = err.(*StatusError)
+	require.True(t, ok)
+	assert.Equal(t, ErrSSHFxFailure, statusErr.FxCode())
+}
+
+func TestClientCopyDataUnsupportedGo(t *testing.T) {
+	if !*testServerImpl {
+		t.Skipf("skipping without -testserver")
+	}
+
+	// run the server without the copy-data extension
+	oldExtensions := sftpExtensions
+	require.NoError(t, SetSFTPExtensions("hardlink@openssh.com", "posix-rename@openssh.com", "statvfs@openssh.com"))
+	defer func() { sftpExtensions = oldExtensions }()
+
+	sftp, cmd := testClient(t, READWRITE, NODELAY)
+	defer cmd.Wait()
+	defer sftp.Close()
+
+	_, ok := sftp.HasExtension("copy-data")
+	require.False(t, ok)
+
+	d, err := ioutil.TempDir("", "sftptest.copydata.unsupported")
+	require.NoError(t, err)
+	defer os.RemoveAll(d)
+
+	srcPath := path.Join(d, "src")
+	dstPath := path.Join(d, "dst")
+
+	require.NoError(t, ioutil.WriteFile(srcPath, []byte("hello"), 0o644))
+	require.NoError(t, ioutil.WriteFile(dstPath, []byte("....."), 0o644))
+
+	src, err := sftp.Open(srcPath)
+	require.NoError(t, err)
+	defer src.Close()
+
+	dst, err := sftp.OpenFile(dstPath, os.O_WRONLY)
+	require.NoError(t, err)
+	defer dst.Close()
+
+	// a server that does not advertise copy-data gets a clear unsupported error
+	err = sftp.CopyData(src, 0, 5, dst, 0)
+	require.Error(t, err)
+	statusErr, ok := err.(*StatusError)
+	require.True(t, ok)
+	assert.Equal(t, ErrSSHFxOpUnsupported, statusErr.FxCode())
+
+	// nothing was copied
+	content, err := ioutil.ReadFile(dstPath)
+	require.NoError(t, err)
+	assert.Equal(t, ".....", string(content))
+}
+
 func TestClientGetwd(t *testing.T) {
 	sftp, cmd := testClient(t, READONLY, NODELAY)
 	defer cmd.Wait()

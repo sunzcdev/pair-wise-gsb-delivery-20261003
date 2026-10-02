@@ -31,6 +31,9 @@ type FileReader interface {
 //
 // The request server code will call Close() on the returned io.WriterAt
 // object if an io.Closer type assertion succeeds.
+// If the returned io.WriterAt also implements [DataCopier], copy-data
+// extension requests targeting this file are served by that native copy
+// instead of the generic bounded-buffer fallback.
 // Note in cases of an error, the error text will be sent to the client.
 // Note when receiving an Append flag it is important to not open files using
 // O_APPEND if you plan to use WriteAt, as they conflict.
