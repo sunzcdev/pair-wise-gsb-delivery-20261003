@@ -148,6 +148,40 @@ type Specification struct {
 Envconfig won't process a field with the "ignored" tag set to "true", even if a corresponding
 environment variable is set.
 
+## Aliases and Deprecation
+
+When renaming an environment variable, the `aliases` and `deprecated` struct
+tags provide a compatibility window. Both take a comma-separated list of
+names; each name is combined with the same (possibly nested) prefix as the
+canonical key, so aliases of one component never match another component's
+variables:
+
+```Go
+type Specification struct {
+    // Reads MYAPP_REQUEST_TIMEOUT, falling back to MYAPP_OLD_TIMEOUT and
+    // MYAPP_LEGACY_TIMEOUT. MYAPP_OLD_TIMEOUT is deprecated.
+    RequestTimeout time.Duration `envconfig:"REQUEST_TIMEOUT" aliases:"OLD_TIMEOUT,LEGACY_TIMEOUT" deprecated:"OLD_TIMEOUT"`
+}
+```
+
+If several of these variables are set to different values, the canonical key
+wins, then aliases in declaration order. `ProcessWithReport` reports which
+variable actually supplied each value, and emits one deprecation warning per
+deprecated name that is set (identical values produce a single warning, not
+an error). Pass `WithConflictMode(ConflictError)` to turn conflicting values
+into an error instead:
+
+```Go
+report, err := envconfig.ProcessWithReport("myapp", &s, envconfig.WithConflictMode(envconfig.ConflictError))
+for _, w := range report.Warnings {
+    log.Println(w)
+}
+```
+
+Declared aliases are considered known variables by `CheckDisallowed`, and
+the default usage output lists them in the `ALIASES` and `DEPRECATED`
+columns.
+
 ## Supported Struct Field Types
 
 envconfig supports these struct field types:

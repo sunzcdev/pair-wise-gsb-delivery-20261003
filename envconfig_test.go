@@ -42,6 +42,7 @@ type Specification struct {
 	User                         string
 	TTL                          uint32
 	Timeout                      time.Duration
+	RequestTimeout               time.Duration `envconfig:"REQUEST_TIMEOUT" aliases:"OLD_TIMEOUT" deprecated:"OLD_TIMEOUT" desc:"request timeout"`
 	AdminUsers                   []string
 	MagicNumbers                 []int
 	EmptyNumbers                 []int
