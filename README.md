@@ -69,6 +69,8 @@ s := secure.New(secure.Options{
     SSLTemporaryRedirect: false, // If SSLTemporaryRedirect is true, then a 307 will be used while redirecting. Default is false (301).
     SSLHost: "ssl.example.com", // SSLHost is the host name that is used to redirect HTTP requests to HTTPS. Default is "", which indicates to use the same host.
     SSLHostFunc: nil, // SSLHostFunc is a function pointer, the return value of the function is the host name that has same functionality as `SSHost`. Default is nil. If SSLHostFunc is nil, the `SSLHost` option will be used.
+    AllowedSSLHosts: []string{"ssl.example.com"}, // AllowedSSLHosts is a list of host names (without ports) that SSLHostFunc is allowed to redirect to. Host names are compared case-insensitively and IPv6 addresses may be listed with or without brackets. Default is empty list, which allows any structurally valid host.
+    AllowedSSLPorts: []int{443, 8443}, // AllowedSSLPorts is a list of ports that an SSLHostFunc result carrying a port is allowed to use. Results without a port (redirecting to the default HTTPS port) are not restricted. Default is empty list, which allows any port.
     SSLProxyHeaders: map[string]string{"X-Forwarded-Proto": "https"}, // SSLProxyHeaders is set of header keys with associated values that would indicate a valid HTTPS request. Useful when using Nginx: `map[string]string{"X-Forwarded-Proto": "https"}`. Default is blank map.
     STSSeconds: 31536000, // STSSeconds is the max-age of the Strict-Transport-Security header. Default is 0, which would NOT include the header.
     STSIncludeSubdomains: true, // If STSIncludeSubdomains is set to true, the `includeSubdomains` will be appended to the Strict-Transport-Security header. Default is false.
@@ -142,6 +144,12 @@ The default bad request handler returns the following error:
 http.Error(w, "Bad Request", http.StatusBadRequest)
 ~~~
 Call `secure.SetBadRequestHandler` to set your own custom handler.
+
+The default bad SSL host handler (used when an `SSLHostFunc` result is rejected by `AllowedSSLHosts`/`AllowedSSLPorts` or is structurally invalid) returns the following error:
+~~~ go
+http.Error(w, "Bad SSL Host", http.StatusInternalServerError)
+~~~
+Call `secure.SetBadSSLHostHandler` to set your own custom handler. Note that the static `SSLHost` option and the original request host are trusted and are not validated; only non-empty `SSLHostFunc` results are checked.
 
 ### Allow Request Function
 Secure allows you to set a custom function (`func(r *http.Request) bool`) for the `AllowRequestFunc` option. You can use this function as a custom filter to allow the request to continue or simply reject it. This can be handy if you need to do any dynamic filtering on any of the request properties. It should be noted that this function will be called on every request, so be sure to make your checks quick and not relying on time consuming external calls (or you will be slowing down all requests). See above on how to set a custom handler for the rejected requests.
