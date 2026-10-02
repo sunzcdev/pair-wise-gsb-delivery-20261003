@@ -2,6 +2,8 @@
 module JMESPath
   module Nodes
     class And < Node
+      attr_reader :left, :right
+
       def initialize(left, right)
         @left = left
         @right = right

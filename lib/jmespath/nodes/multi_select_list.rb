@@ -7,6 +7,8 @@ module JMESPath
         @children = children
       end
 
+      attr_reader :children
+
       def visit(value)
         if value.nil?
           value

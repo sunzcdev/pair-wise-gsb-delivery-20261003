@@ -10,6 +10,8 @@ module JMESPath
         raise Errors::InvalidValueError, 'slice step cannot be 0' if @step == 0
       end
 
+      attr_reader :start, :stop, :step
+
       def visit(value)
         if (value = value.respond_to?(:to_str) ? value.to_str : value.respond_to?(:to_ary) ? value.to_ary : nil)
           start, stop, step = adjust_slice(value.size, @start, @stop, @step)

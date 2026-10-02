@@ -8,6 +8,8 @@ module JMESPath
         @projection = projection
       end
 
+      attr_reader :target, :projection
+
       def visit(value)
         if (targets = extract_targets(@target.visit(value)))
           list = []

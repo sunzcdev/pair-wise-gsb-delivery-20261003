@@ -7,6 +7,8 @@ module JMESPath
         @kv_pairs = kv_pairs
       end
 
+      attr_reader :kv_pairs
+
       def visit(value)
         if value.nil?
           nil

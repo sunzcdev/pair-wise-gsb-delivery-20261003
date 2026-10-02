@@ -57,6 +57,13 @@ module JMESPath
       optimized_expression.visit(data)
     end
 
+    # Builds a {QuerySet} that shares this runtime's (caching) parser.
+    #
+    # @see JMESPath.query_set
+    def query_set(queries = nil, **options, &block)
+      QuerySet.new(queries, parser: @parser, **options, &block)
+    end
+
     private
 
     def default_parser(options)

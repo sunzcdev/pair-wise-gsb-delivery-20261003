@@ -41,6 +41,75 @@ JMESPath.search('foo.bar', { abc: "mno" })
 #=> nil
 ```
 
+## Named Query Sets (fused multi-query extraction)
+
+When one response has to populate a dozen fields, it is common for many of
+those expressions to re-traverse the same large array (for example several
+`people[?...].field` filters with different predicates). Searching them one by
+one walks that array once per expression.
+
+A **named query set** compiles a collection of named expressions together. At
+compile time it identifies the AST prefixes the expressions share and builds a
+single fused plan that walks shared arrays once, branching out to the
+different predicates and continuation fields while it does so.
+
+```ruby
+qs = JMESPath.query_set(
+  adult_names:  "people[?age > `18`].name",
+  adult_emails: "people[?age > `18`].email",
+  seniors:      "people[?age > `65`].name",
+  ny_residents: "people[?city == 'NY'].name",
+  headcount:    "length(people)"
+)
+
+result = qs.search(data)
+result[:adult_names]   #=> [...]
+result[:seniors]       #=> [...]
+```
+
+Sharing is decided from the **parsed AST**, never by slicing expression
+strings, so semantically different prefixes are never conflated:
+
+* a pipe boundary (`a | b`) is kept distinct from a dotted boundary (`a.b`);
+* an expression reference (`&age` in `map(&age, people)`) is an opaque value and
+  is only shared with an identical reference, never fused into a plain prefix;
+* different filter predicates (`[?age > `18`]` vs `[?age > `65`]`) do not share
+  the filter step, though they still share every earlier prefix and the source
+  array is traversed only once.
+
+### Error policy
+
+When one of the queries raises at search time you can either fail the whole
+group or keep the results of the others:
+
+```ruby
+result = qs.search(data, on_error: :collect) # default is :raise
+result.successful?(:adult_names) #=> true
+result.errors[:bad_query]       #=> #<JMESPath::Errors::InvalidTypeError ...>
+result.keys                      #=> successful names only
+
+# :nil keeps the failed name with a nil value instead of omitting it
+qs.search(data, on_error: :nil)
+
+# an optional block receives every failure: |name, error|
+qs.search(data, on_error: :collect) { |name, error| warn "#{name}: #{error}" }
+```
+
+### Access counts (proof of the single traversal)
+
+`result.stats` compares the fused plan against running the same expressions
+one by one, using the same counters for both:
+
+```ruby
+result.stats.fused.array_iterations     #=> 4 (one walk shared by 4 queries)
+result.stats.separate.array_iterations  #=> 16 (four independent walks)
+result.stats.iterations_saved           #=> 12
+result.stats.visits_saved               #=> fewer AST node visits too
+```
+
+A runnable demonstration over a large array is provided at
+`benchmark/query_set.rb` (`ruby -Ilib benchmark/query_set.rb`).
+
 **[See the JMESPath specification for a full list of supported search expressions.](http://jmespath.org/specification.html)**
 
 ## Indifferent Access

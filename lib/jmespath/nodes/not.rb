@@ -2,6 +2,8 @@
 module JMESPath
   module Nodes
     class Not < Node
+      attr_reader :expression
+
       def initialize(expression)
         @expression = expression
       end

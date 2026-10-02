@@ -8,6 +8,8 @@ module JMESPath
         @child = child
       end
 
+      attr_reader :test, :child
+
       def visit(value)
         if JMESPath::Util.falsey?(@test.visit(value))
           nil

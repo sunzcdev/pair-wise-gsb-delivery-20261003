@@ -3,6 +3,8 @@ module JMESPath
   # @api private
   module Nodes
     class Or < Node
+      attr_reader :left, :right
+
       def initialize(left, right)
         @left = left
         @right = right

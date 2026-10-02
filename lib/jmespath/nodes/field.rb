@@ -8,6 +8,8 @@ module JMESPath
         @key_sym = key.respond_to?(:to_sym) ? key.to_sym : nil
       end
 
+      attr_reader :key
+
       def visit(value)
         if value.respond_to?(:to_ary) && @key.is_a?(Integer)
           value.to_ary[@key]

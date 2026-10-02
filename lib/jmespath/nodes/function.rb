@@ -11,6 +11,8 @@ module JMESPath
         @disable_visit_errors = @options[:disable_visit_errors]
       end
 
+      attr_reader :children
+
       def self.create(name, children, options = {})
         if (type = FUNCTIONS[name])
           type.new(children, options)

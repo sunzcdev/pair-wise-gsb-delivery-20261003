@@ -12,11 +12,16 @@ module JMESPath
         @right.visit(@left.visit(value))
       end
 
+      # Provenance of the join that produced this node. Distinguishes a
+      # dotted chain (`a.b`) from a pipe (`a | b`); used by the query-set
+      # fuser so the two boundaries are never merged by textual prefix.
+      def source_marker
+        :dot
+      end
+
       def optimize
         Chain.new(flatten).optimize
       end
-
-      protected
 
       attr_reader :left, :right
 

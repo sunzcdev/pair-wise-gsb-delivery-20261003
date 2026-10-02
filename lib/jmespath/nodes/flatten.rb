@@ -7,6 +7,8 @@ module JMESPath
         @child = child
       end
 
+      attr_reader :child
+
       def visit(value)
         value = @child.visit(value)
         if value.respond_to?(:to_ary)
