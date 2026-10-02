@@ -14,6 +14,9 @@ RSpec.describe "Pundit RSpec DSL", type: :policy do
   let(:other_user) { double }
   let(:post) { Post.new(user) }
   let(:policy) { PostPolicy }
+  let(:own_decision_post) { DecisionPost.new(user) }
+  let(:other_decision_post) { DecisionPost.new(other_user) }
+  let(:decision_policy) { DecisionPostPolicy }
 
   it "calls describe with the correct metadata and without :focus" do
     expected_metadata = {permissions: %i[item1 item2], caller: instance_of(Array)}
@@ -73,6 +76,40 @@ RSpec.describe "Pundit RSpec DSL", type: :policy do
             MSG
           end
         end
+      end
+    end
+
+    permissions :show? do
+      it "grants when the policy returns an allowed decision" do
+        expect(decision_policy).to permit(user, own_decision_post)
+      end
+    end
+
+    permissions :update? do
+      it "grants when the policy returns an allowed decision" do
+        expect(decision_policy).to permit(user, own_decision_post)
+      end
+
+      it "does not grant when the policy returns a denied decision" do
+        expect(decision_policy).not_to permit(user, other_decision_post)
+      end
+
+      it "treats a denied decision as a violation despite being truthy" do
+        expect do
+          expect(decision_policy).to permit(user, other_decision_post)
+        end.to raise_error(RSpec::Expectations::ExpectationNotMetError, /update\? was not granted/)
+      end
+    end
+
+    permissions :destroy? do
+      it "never grants a denied decision" do
+        expect(decision_policy).not_to permit(user, own_decision_post)
+      end
+    end
+
+    permissions :archive? do
+      it "keeps honoring plain false from the same policy" do
+        expect(decision_policy).not_to permit(user, own_decision_post)
       end
     end
   end

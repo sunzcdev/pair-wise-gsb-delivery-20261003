@@ -14,6 +14,7 @@ RSpec.describe Pundit::Authorization do
   let(:comment) { Comment.new }
   let(:article) { Article.new }
   let(:article_tag) { ArticleTag.new }
+  let(:decision_post) { DecisionPost.new(user) }
   let(:wiki) { Wiki.new }
 
   describe "#verify_authorized" do
@@ -119,6 +120,19 @@ RSpec.describe Pundit::Authorization do
 
     it "raises an error with a invalid policy constructor" do
       expect { controller.authorize(wiki, :destroy?) }.to raise_error(Pundit::InvalidConstructorError)
+    end
+
+    it "allows a policy that returns an allowed decision" do
+      expect(controller.authorize(decision_post, :show?)).to eq(decision_post)
+    end
+
+    it "denies a policy that returns a denied decision" do
+      expect { controller.authorize(decision_post, :destroy?) }
+        .to raise_error(Pundit::NotAuthorizedError) do |error|
+          expect(error.policy).to be_a(DecisionPostPolicy)
+          expect(error.decision).to have_attributes(allowed: false, code: :never_allowed)
+          expect(error.message).not_to include("do not log me")
+        end
     end
   end
 

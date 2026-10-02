@@ -562,6 +562,43 @@ en:
 
 This is an example. Pundit is agnostic as to how you implement your error messaging.
 
+## Returning decisions with a reason code
+
+Sometimes a plain `true` or `false` is not enough, and you want to explain
+*why* an action was denied. In that case a policy query may return a
+`Pundit::Decision` instead of a boolean.
+
+```ruby
+class PostPolicy < ApplicationPolicy
+  def update?
+    if post.user == user
+      Pundit::Decision.allow(code: :owner)
+    else
+      Pundit::Decision.deny(code: :not_owner, details: { owner_id: post.user.id })
+    end
+  end
+end
+```
+
+Pundit only consults the decision's `allowed?` state; a denied decision is
+itself a truthy object, but it still causes `authorize` to raise
+`Pundit::NotAuthorizedError`. Policies that return plain booleans keep working
+unchanged.
+
+The raised error exposes the decision, along with the `query`, `record` and
+`policy`.
+
+```ruby
+rescue_from Pundit::NotAuthorizedError do |exception|
+  exception.decision # => #<Pundit::Decision ...>
+  exception.decision&.code
+  exception.decision&.details
+end
+```
+
+The decision's `details` are deliberately not interpolated into the error
+message, so logging the exception will not accidentally expose business data.
+
 ## Manually retrieving policies and scopes
 
 Sometimes you want to retrieve a policy for a record outside the controller or

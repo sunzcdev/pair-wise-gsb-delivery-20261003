@@ -37,14 +37,14 @@ module Pundit
       matcher :permit do |user, record|
         match_proc = lambda do |policy|
           @violating_permissions = permissions.find_all do |permission|
-            !policy.new(user, record).public_send(permission)
+            !Pundit::Decision.allowed?(policy.new(user, record).public_send(permission))
           end
           @violating_permissions.empty?
         end
 
         match_when_negated_proc = lambda do |policy|
           @violating_permissions = permissions.find_all do |permission|
-            policy.new(user, record).public_send(permission)
+            Pundit::Decision.allowed?(policy.new(user, record).public_send(permission))
           end
           @violating_permissions.empty?
         end

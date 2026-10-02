@@ -12,6 +12,7 @@ RSpec.describe Pundit do
   let(:article) { Article.new }
   let(:artificial_blog) { ArtificialBlog.new }
   let(:article_tag) { ArticleTag.new }
+  let(:decision_post) { DecisionPost.new(user) }
   let(:comments_relation) { CommentsRelation.new(empty: false) }
   let(:empty_comments_relation) { CommentsRelation.new(empty: true) }
   let(:tag_four_five_six) { ProjectOneTwoThree::TagFourFiveSix.new(user) }
@@ -62,6 +63,39 @@ RSpec.describe Pundit do
         expect(error.policy).to be_a(PostPolicy)
       end
       # rubocop:enable Style/MultilineBlockChain
+    end
+
+    context "with a policy returning a Decision" do
+      it "returns the record when the decision is allowed" do
+        expect(Pundit.authorize(user, decision_post, :show?)).to eq(decision_post)
+      end
+
+      it "denies a denied decision even though it is truthy" do
+        denied_post = DecisionPost.new(double("other user"))
+
+        expect { Pundit.authorize(user, denied_post, :update?) }
+          .to raise_error(Pundit::NotAuthorizedError) do |error|
+            expect(error.query).to eq(:update?)
+            expect(error.record).to eq(denied_post)
+            expect(error.policy).to be_a(DecisionPostPolicy)
+            expect(error.decision).to have_attributes(
+              allowed: false,
+              code: :not_owner
+            )
+            expect(error.message).not_to include("owner_id")
+          end
+      end
+
+      it "honors an explicit policy class returning a decision" do
+        expect(Pundit.authorize(user, post, :show?, policy_class: DecisionPostPolicy)).to eq(post)
+      end
+
+      it "keeps the plain false behavior" do
+        expect { Pundit.authorize(user, decision_post, :archive?) }
+          .to raise_error(Pundit::NotAuthorizedError) do |error|
+            expect(error.decision).to be_nil
+          end
+      end
     end
 
     it "raises an error with the policy, query and record when the record is namespaced" do

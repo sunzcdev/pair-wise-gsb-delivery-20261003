@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
+- Policies may return a `Pundit::Decision` with `allowed`, `code` and `details` instead of a plain boolean. Authorization now keys off the decision's `allowed?` state rather than the object's truthiness, and a denied decision is exposed on the raised `Pundit::NotAuthorizedError` as `#decision`. The decision's `details` are not added to the error message.
 
 ### Deprecated
 - Rename `Pundit::Authorization#policies` to `#pundit_policies` to avoid clashing with controller actions named `policies`. The old `#policies` method is now deprecated. [#878](https://github.com/varvet/pundit/issues/878)
