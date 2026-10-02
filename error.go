@@ -18,6 +18,13 @@ var (
 	// ErrMaxElapsedTime is the cause when retrying stops because
 	// WithMaxElapsedTime was reached.
 	ErrMaxElapsedTime = errors.New("backoff: maximum elapsed time exceeded")
+
+	// ErrAttemptTimeout is the cause of the per-attempt context when
+	// WithAttemptTimeout ends an attempt. A single attempt timing out is
+	// retriable, so it surfaces as the terminal Cause only when another limit
+	// (WithMaxTries, WithMaxElapsedTime, the backoff policy) then stops the
+	// loop. When the parent context also ends, its cause takes precedence.
+	ErrAttemptTimeout = errors.New("backoff: attempt timed out")
 )
 
 // RetryError is the error returned by Retry for every failure. It records the

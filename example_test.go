@@ -116,6 +116,35 @@ func ExampleRetry_outcomes() {
 	// Output: ok
 }
 
+func ExampleRetryCtx() {
+	// RetryCtx hands the operation a fresh context per attempt. With
+	// WithAttemptTimeout, each attempt gets its own deadline: one slow attempt
+	// is retried, while the attempts stay bounded independently.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	var attempts int
+	result, err := backoff.RetryCtx(ctx, func(ctx context.Context) (string, error) {
+		attempts++
+		select {
+		case <-time.After(5 * time.Millisecond):
+			return "hello", nil
+		case <-ctx.Done():
+			return "", ctx.Err() // attempt timeout (or parent cancellation)
+		}
+	},
+		backoff.WithAttemptTimeout(time.Second),
+		backoff.WithMaxElapsedTime(0),
+	)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	fmt.Println(result, attempts)
+	// Output: hello 1
+}
+
 func ExampleTicker() {
 	// An operation that may fail.
 	operation := func() (string, error) {

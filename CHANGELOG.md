@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `RetryCtx` retries an `OperationCtx` that accepts a `context.Context`. Every attempt receives a fresh child context derived from the context passed to `RetryCtx`; the child is cancelled and its timer released as soon as that attempt returns (including on success), never held until the retry finishes.
+- `WithAttemptTimeout` bounds a single attempt independently. A timed-out attempt is retried per the backoff policy, while cancelling the parent context aborts the wait and stops further attempts. The attempt's context carries the `ErrAttemptTimeout` cause; when the parent ends at the same time, its cause takes precedence.
+- `ErrAttemptTimeout` sentinel for the per-attempt timeout cause.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed
