@@ -21,9 +21,155 @@ type milterSession struct {
 	actions  OptAction
 	protocol OptProtocol
 	conn     net.Conn
+	phase    messagePhase
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+	strict   bool
+}
+
+type messagePhase int
+
+const (
+	phaseReady messagePhase = iota
+	phaseMail
+	phaseRcpt
+	phaseHeader
+	phaseEOH
+	phaseBody
+	phaseComplete
+)
+
+// transitionMessageCommand validates and updates the per-message phase. It
+// returns a response for out-of-order commands and nil for commands that may
+// proceed to the business callback.
+func (m *milterSession) transitionMessageCommand(code Code) Response {
+	if !m.strict {
+		return nil
+	}
+
+	mailSkipped := m.protocol&OptNoMailFrom != 0
+	rcptSkipped := m.protocol&OptNoRcptTo != 0
+	eohSkipped := m.protocol&OptNoEOH != 0
+
+	switch code {
+	case CodeHelo:
+		if m.phase == phaseMail || m.phase == phaseRcpt || m.phase == phaseHeader ||
+			m.phase == phaseEOH || m.phase == phaseBody {
+			return RespTempFail
+		}
+		m.phase = phaseReady
+
+	case CodeMail:
+		if m.phase != phaseReady && m.phase != phaseComplete {
+			return RespTempFail
+		}
+		m.phase = phaseMail
+
+	case CodeRcpt:
+		switch m.phase {
+		case phaseRcpt:
+		case phaseMail:
+			m.phase = phaseRcpt
+		case phaseReady:
+			if !mailSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseRcpt
+		default:
+			return RespTempFail
+		}
+
+	case CodeHeader:
+		switch m.phase {
+		case phaseHeader:
+		case phaseMail:
+			if !rcptSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseHeader
+		case phaseRcpt:
+			m.phase = phaseHeader
+		case phaseReady:
+			if !mailSkipped || !rcptSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseHeader
+		default:
+			return RespTempFail
+		}
+
+	case CodeEOH:
+		switch m.phase {
+		case phaseHeader:
+			m.phase = phaseEOH
+		case phaseMail:
+			if rcptSkipped {
+				m.phase = phaseEOH
+			}
+		case phaseRcpt:
+			m.phase = phaseEOH
+		case phaseReady:
+			if !mailSkipped || !rcptSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseEOH
+		default:
+			return RespTempFail
+		}
+
+	case CodeBody:
+		switch m.phase {
+		case phaseBody:
+		case phaseEOH:
+			m.phase = phaseBody
+		case phaseHeader:
+			m.phase = phaseBody
+		case phaseMail:
+			if !rcptSkipped || !eohSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseBody
+		case phaseRcpt:
+			if !eohSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseBody
+		case phaseReady:
+			if !mailSkipped || !rcptSkipped || !eohSkipped {
+				return RespTempFail
+			}
+			m.phase = phaseBody
+		default:
+			return RespTempFail
+		}
+
+	case CodeEOB:
+		switch m.phase {
+		case phaseBody, phaseEOH:
+		case phaseHeader:
+		case phaseMail:
+			if !rcptSkipped || !eohSkipped {
+				return RespTempFail
+			}
+		case phaseRcpt:
+			if !eohSkipped {
+				return RespTempFail
+			}
+		case phaseReady:
+			if !mailSkipped || !rcptSkipped || !eohSkipped {
+				return RespTempFail
+			}
+		default:
+			return RespTempFail
+		}
+		m.phase = phaseComplete
+
+	case CodeAbort:
+		m.phase = phaseReady
+	}
+
+	return nil
 }
 
 // ReadPacket reads incoming milter packet
@@ -97,12 +243,17 @@ func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
 
 // Process processes incoming milter commands
 func (m *milterSession) Process(msg *Message) (Response, error) {
+	if resp := m.transitionMessageCommand(Code(msg.Code)); resp != nil {
+		return resp, nil
+	}
+
 	switch Code(msg.Code) {
 	case CodeAbort:
 		// abort current message and start over
 		defer func() {
 			m.headers = nil
 			m.macros = nil
+			m.phase = phaseReady
 		}()
 		return nil, m.backend.Abort(newModifier(m))
 
@@ -162,7 +313,11 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		return nil, nil
 
 	case CodeEOB:
-		// call and return milter handler
+		// Call the final handler, then keep the connection and HELO state for
+		// the next message while discarding this message's collected headers.
+		defer func() {
+			m.headers = nil
+		}()
 		return m.backend.Body(newModifier(m))
 
 	case CodeHelo:
@@ -272,11 +427,23 @@ func (m *milterSession) HandleMilterCommands() {
 				log.Printf("Error writing packet: %v", err)
 				return
 			}
-
 			if !resp.Continue() {
-				// prepare backend for next message
-				m.backend = m.server.NewMilter()
+				m.finishTerminalCommand(Code(msg.Code))
 			}
 		}
+	}
+}
+
+func (m *milterSession) finishTerminalCommand(code Code) {
+	if !m.strict {
+		return
+	}
+
+	switch code {
+	case CodeMail:
+		m.phase = phaseReady
+	case CodeHeader, CodeEOH, CodeBody:
+		m.phase = phaseReady
+		m.headers = nil
 	}
 }

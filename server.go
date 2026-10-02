@@ -103,6 +103,10 @@ type Server struct {
 	Actions   OptAction
 	Protocol  OptProtocol
 
+	// StrictStateMachine makes the server reject out-of-order message
+	// commands. Protocol stages disabled in Protocol may be omitted.
+	StrictStateMachine bool
+
 	// SymList is the list of macros that the milter wants to receive from
 	// the MTA for the selected protocol stages.
 	// [Server.Actions] must have the flag [OptSetSymList] set.
@@ -133,6 +137,7 @@ func (s *Server) Serve(ln net.Listener) error {
 			protocol: s.Protocol,
 			conn:     conn,
 			backend:  s.NewMilter(),
+			strict:   s.StrictStateMachine,
 		}
 		go session.HandleMilterCommands()
 	}
