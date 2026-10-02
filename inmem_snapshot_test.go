@@ -122,6 +122,49 @@ func TestInmemSS_CreateSnapshot(t *testing.T) {
 	}
 }
 
+func TestInmemSS_CreateJointSnapshot(t *testing.T) {
+	snap := NewInmemSnapshotStore()
+	_, trans := NewInmemTransport(NewInmemAddr())
+
+	old := makeConfiguration([]string{"old"})
+	next := makeConfiguration([]string{"old", "new"})
+	joint := jointConfigurationFrom(old, next)
+
+	sink, err := snap.CreateJointSnapshot(SnapshotVersionMax, 10, 3, old, 3, joint, 3, trans)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if _, err := sink.Write([]byte("joint state")); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("close snapshot: %v", err)
+	}
+
+	meta, source, err := snap.Open(sink.ID())
+	if err != nil {
+		t.Fatalf("open snapshot: %v", err)
+	}
+	defer source.Close()
+
+	data, err := io.ReadAll(source)
+	if err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if string(data) != "joint state" {
+		t.Fatalf("bad snapshot data: %q", string(data))
+	}
+	if meta.JointConfiguration == nil {
+		t.Fatalf("expected joint configuration metadata")
+	}
+	if got := len(meta.JointConfiguration.Old.Servers); got != 1 {
+		t.Fatalf("expected one old voter, got %d", got)
+	}
+	if got := len(meta.JointConfiguration.Next.Servers); got != 2 {
+		t.Fatalf("expected two next voters, got %d", got)
+	}
+}
+
 func TestInmemSS_OpenSnapshotTwice(t *testing.T) {
 	snap := NewInmemSnapshotStore()
 

@@ -60,6 +60,26 @@ type FileSnapshotSink struct {
 	closed bool
 }
 
+func snapshotMeta(version SnapshotVersion, id string, index, term uint64,
+	configuration Configuration, configurationIndex uint64, trans Transport,
+	joint *jointConfiguration, jointIndex uint64) SnapshotMeta {
+	meta := SnapshotMeta{
+		Version:            version,
+		ID:                 id,
+		Index:              index,
+		Term:               term,
+		Peers:              encodePeers(configuration, trans),
+		Configuration:      configuration,
+		ConfigurationIndex: configurationIndex,
+	}
+	if joint != nil {
+		jointCopy := *joint
+		meta.JointConfiguration = &jointCopy
+		meta.JointConfigurationIndex = jointIndex
+	}
+	return meta
+}
+
 // fileSnapshotMeta is stored on disk. We also put a CRC
 // on disk so that we can verify the snapshot.
 type fileSnapshotMeta struct {
@@ -159,6 +179,18 @@ func snapshotName(term, index uint64) string {
 // Create is used to start a new snapshot
 func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 	configuration Configuration, configurationIndex uint64, trans Transport) (SnapshotSink, error) {
+	return f.create(version, index, term, configuration, configurationIndex, nil, 0, trans)
+}
+
+func (f *FileSnapshotStore) CreateJointSnapshot(version SnapshotVersion, index, term uint64,
+	configuration Configuration, configurationIndex uint64, joint jointConfiguration,
+	jointIndex uint64, trans Transport) (SnapshotSink, error) {
+	return f.create(version, index, term, configuration, configurationIndex, &joint, jointIndex, trans)
+}
+
+func (f *FileSnapshotStore) create(version SnapshotVersion, index, term uint64,
+	configuration Configuration, configurationIndex uint64, joint *jointConfiguration,
+	jointIndex uint64, trans Transport) (SnapshotSink, error) {
 	// We only support version 1 snapshots at this time.
 	if version != 1 {
 		return nil, fmt.Errorf("unsupported snapshot version %d", version)
@@ -183,15 +215,8 @@ func (f *FileSnapshotStore) Create(version SnapshotVersion, index, term uint64,
 		parentDir: f.path,
 		noSync:    f.noSync,
 		meta: fileSnapshotMeta{
-			SnapshotMeta: SnapshotMeta{
-				Version:            version,
-				ID:                 name,
-				Index:              index,
-				Term:               term,
-				Peers:              encodePeers(configuration, trans),
-				Configuration:      configuration,
-				ConfigurationIndex: configurationIndex,
-			},
+			SnapshotMeta: snapshotMeta(version, name, index, term, configuration,
+				configurationIndex, trans, joint, jointIndex),
 			CRC: nil,
 		},
 	}

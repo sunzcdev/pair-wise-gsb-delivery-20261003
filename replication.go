@@ -106,7 +106,7 @@ func (s *followerReplication) notifyAll(leader bool) {
 
 	// Submit our votes
 	for v := range n {
-		v.vote(leader)
+		v.vote(s.peer.ID, leader)
 	}
 }
 
@@ -332,6 +332,10 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 		Size:               meta.Size,
 		Configuration:      EncodeConfiguration(meta.Configuration),
 		ConfigurationIndex: meta.ConfigurationIndex,
+	}
+	if meta.JointConfiguration != nil {
+		req.JointConfiguration = EncodeJointConfiguration(*meta.JointConfiguration)
+		req.JointConfigurationIndex = meta.JointConfigurationIndex
 	}
 
 	s.peerLock.RLock()

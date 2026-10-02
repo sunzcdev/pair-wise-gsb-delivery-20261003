@@ -35,6 +35,11 @@ type SnapshotMeta struct {
 	Configuration      Configuration
 	ConfigurationIndex uint64
 
+	// JointConfiguration and JointConfigurationIndex describe a committed joint
+	// configuration. They are zero when the snapshot does not include one.
+	JointConfiguration      *jointConfiguration
+	JointConfigurationIndex uint64
+
 	// Size is the size of the snapshot in bytes.
 	Size int64
 }
@@ -65,6 +70,13 @@ type SnapshotSink interface {
 	io.WriteCloser
 	ID() string
 	Cancel() error
+}
+
+// JointSnapshotStore is implemented by snapshot stores that can persist a
+// committed joint configuration alongside the regular snapshot metadata.
+type JointSnapshotStore interface {
+	CreateJointSnapshot(version SnapshotVersion, index, term uint64, configuration Configuration,
+		configurationIndex uint64, joint jointConfiguration, jointIndex uint64, trans Transport) (SnapshotSink, error)
 }
 
 // runSnapshots is a long running goroutine used to manage taking
@@ -162,6 +174,8 @@ func (r *Raft) takeSnapshot() (string, error) {
 	}
 	committed := configReq.configurations.committed
 	committedIndex := configReq.configurations.committedIndex
+	joint := configReq.configurations.committedJoint
+	jointIndex := configReq.configurations.committedJointIndex
 
 	// We don't support snapshots while there's a config change outstanding
 	// since the snapshot doesn't have a means to represent this state. This
@@ -175,12 +189,11 @@ func (r *Raft) takeSnapshot() (string, error) {
 		return "", fmt.Errorf("cannot take snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
 			committedIndex, snapReq.index)
 	}
-
 	// Create a new snapshot.
 	r.logger.Info("starting snapshot up to", "index", snapReq.index)
 	start := time.Now()
 	version := getSnapshotVersion(r.protocolVersion)
-	sink, err := r.snapshots.Create(version, snapReq.index, snapReq.term, committed, committedIndex, r.trans)
+	sink, err := r.createSnapshot(version, snapReq.index, snapReq.term, committed, committedIndex, joint, jointIndex)
 	if err != nil {
 		return "", fmt.Errorf("failed to create snapshot: %v", err)
 	}
@@ -209,6 +222,18 @@ func (r *Raft) takeSnapshot() (string, error) {
 
 	r.logger.Info("snapshot complete up to", "index", snapReq.index)
 	return sink.ID(), nil
+}
+
+func (r *Raft) createSnapshot(version SnapshotVersion, index, term uint64, configuration Configuration,
+	configurationIndex uint64, joint *jointConfiguration, jointIndex uint64) (SnapshotSink, error) {
+	if joint != nil {
+		if jointStore, ok := r.snapshots.(JointSnapshotStore); ok {
+			return jointStore.CreateJointSnapshot(version, index, term, configuration,
+				configurationIndex, *joint, jointIndex, r.trans)
+		}
+		return nil, fmt.Errorf("snapshot store does not support joint configuration snapshots")
+	}
+	return r.snapshots.Create(version, index, term, configuration, configurationIndex, r.trans)
 }
 
 // compactLogsWithTrailing takes the last inclusive index of a snapshot,

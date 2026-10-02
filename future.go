@@ -138,6 +138,18 @@ type configurationChangeFuture struct {
 	req configurationChangeRequest
 }
 
+type jointConfigurationChangeFuture struct {
+	*configurationChangeFuture
+	old  Configuration
+	next Configuration
+}
+
+type finalConfigurationFuture struct {
+	logFuture
+	configuration Configuration
+	change        *jointConfigurationChangeFuture
+}
+
 // bootstrapFuture is used to attempt a live bootstrap of the cluster. See the
 // Raft object's BootstrapCluster member function for more details.
 type bootstrapFuture struct {
@@ -151,9 +163,10 @@ type bootstrapFuture struct {
 // the log is considered committed.
 type logFuture struct {
 	deferError
-	log      Log
-	response interface{}
-	dispatch time.Time
+	log           Log
+	response      interface{}
+	dispatch      time.Time
+	deferResponse bool
 }
 
 func (l *logFuture) Response() interface{} {
@@ -237,10 +250,12 @@ type restoreFuture struct {
 // the leader. This is to prevent a stale read.
 type verifyFuture struct {
 	deferError
-	notifyCh   chan *verifyFuture
-	quorumSize int
-	votes      int
-	voteLock   sync.Mutex
+	notifyCh  chan *verifyFuture
+	quorums   []int
+	configs   []Configuration
+	voters    map[ServerID]bool
+	quorumMet bool
+	voteLock  sync.Mutex
 }
 
 // leadershipTransferFuture is used to track the progress of a leadership
@@ -271,7 +286,7 @@ func (c *configurationsFuture) Index() uint64 {
 
 // vote is used to respond to a verifyFuture.
 // This may block when responding on the notifyCh.
-func (v *verifyFuture) vote(leader bool) {
+func (v *verifyFuture) vote(id ServerID, leader bool) {
 	v.voteLock.Lock()
 	defer v.voteLock.Unlock()
 
@@ -281,8 +296,10 @@ func (v *verifyFuture) vote(leader bool) {
 	}
 
 	if leader {
-		v.votes++
-		if v.votes >= v.quorumSize {
+		v.voters[id] = true
+		quorumMet := v.hasQuorum()
+		v.quorumMet = quorumMet
+		if quorumMet {
 			v.notifyCh <- v
 			v.notifyCh = nil
 		}
@@ -290,6 +307,27 @@ func (v *verifyFuture) vote(leader bool) {
 		v.notifyCh <- v
 		v.notifyCh = nil
 	}
+}
+
+func (v *verifyFuture) hasQuorum() bool {
+	for i, configuration := range v.configs {
+		votes := 0
+		for _, server := range configuration.Servers {
+			if server.Suffrage == Voter && v.voters[server.ID] {
+				votes++
+			}
+		}
+		if votes < v.quorums[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (v *verifyFuture) hasMetQuorum() bool {
+	v.voteLock.Lock()
+	defer v.voteLock.Unlock()
+	return v.quorumMet
 }
 
 // appendFuture is used for waiting on a pipelined append

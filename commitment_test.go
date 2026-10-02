@@ -242,3 +242,51 @@ func TestCommitment_singleVoter(t *testing.T) {
 		t.Fatalf("expected commit notify")
 	}
 }
+
+func TestCommitment_jointRequiresBothMajorities(t *testing.T) {
+	commitCh := make(chan struct{}, 1)
+	oldConfiguration := makeConfiguration([]string{"o1", "o2", "o3", "o4", "o5"})
+	newConfiguration := makeConfiguration([]string{"o5", "n1", "n2", "n3", "n4"})
+	c := newJointCommitment(commitCh, jointConfigurationFrom(oldConfiguration, newConfiguration), 0)
+
+	for _, id := range []ServerID{"o1", "o2", "o3", "o5"} {
+		c.match(id, 10)
+	}
+	if c.getCommitIndex() != 0 {
+		t.Fatalf("old majority alone must not commit a joint entry: %d", c.getCommitIndex())
+	}
+
+	c.match("n1", 10)
+	if c.getCommitIndex() != 0 {
+		t.Fatalf("new minority must not commit a joint entry: %d", c.getCommitIndex())
+	}
+
+	c.match("n2", 10)
+	if c.getCommitIndex() != 10 {
+		t.Fatalf("expected both majorities to commit at 10, got %d", c.getCommitIndex())
+	}
+	if !drainNotifyCh(commitCh) {
+		t.Fatalf("expected commit notify")
+	}
+}
+
+func TestCommitment_jointSmallOverlap(t *testing.T) {
+	commitCh := make(chan struct{}, 1)
+	oldConfiguration := makeConfiguration([]string{"o1", "o2", "o3", "o4", "o5"})
+	newConfiguration := makeConfiguration([]string{"o5", "n1", "n2", "n3", "n4"})
+	c := newJointCommitment(commitCh, jointConfigurationFrom(oldConfiguration, newConfiguration), 0)
+
+	c.match("o5", 10)
+	for _, id := range []ServerID{"n1", "n2", "n3", "n4"} {
+		c.match(id, 10)
+	}
+	if c.getCommitIndex() != 0 {
+		t.Fatalf("new majority with only the overlap old voter must not commit: %d", c.getCommitIndex())
+	}
+
+	c.match("o1", 10)
+	c.match("o2", 10)
+	if c.getCommitIndex() != 10 {
+		t.Fatalf("expected old majority plus new majority to commit, got %d", c.getCommitIndex())
+	}
+}

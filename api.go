@@ -43,6 +43,10 @@ var (
 	// non-voter node.
 	ErrNotVoter = errors.New("node is not a voter")
 
+	// ErrMembershipChangeInProgress is returned when a second membership
+	// change is requested while a joint configuration change is active.
+	ErrMembershipChangeInProgress = errors.New("membership change already in progress")
+
 	// ErrLeadershipLost is returned when a leader fails to commit a log entry
 	// because it's been deposed in the process.
 	ErrLeadershipLost = errors.New("leadership lost while committing log")
@@ -162,6 +166,9 @@ type Raft struct {
 	// Holds a copy of the latest configuration which can be read independently
 	// of the main loop.
 	latestConfiguration atomic.Value
+
+	// Holds a copy of the current membership change status for lock-free reads.
+	membershipChangeStatus atomic.Value
 
 	// RPC chan comes from the transport layer
 	rpcCh <-chan RPC
@@ -590,6 +597,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 	}
 
 	r.conf.Store(*conf)
+	r.setMembershipChangeStatus(MembershipChangeStatus{Phase: MembershipChangeStable})
 
 	// Initialize as a follower.
 	r.setState(Follower)
@@ -620,6 +628,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 			return nil, err
 		}
 	}
+	r.updateMembershipChangeStatus()
 	r.logger.Info("initial configuration",
 		"index", r.configurations.latestIndex,
 		"servers", hclog.Fmt("%+v", r.configurations.latest.Servers))
@@ -676,6 +685,13 @@ func (r *Raft) restoreSnapshot() error {
 		}
 		r.setCommittedConfiguration(conf, index)
 		r.setLatestConfiguration(conf, index)
+		if snapshot.JointConfiguration != nil {
+			joint := *snapshot.JointConfiguration
+			r.configurations.committedJoint = &joint
+			r.configurations.committedJointIndex = snapshot.JointConfigurationIndex
+			r.configurations.latestJoint = &joint
+			r.configurations.latestJointIndex = snapshot.JointConfigurationIndex
+		}
 
 		// Success!
 		return nil
@@ -1002,6 +1018,25 @@ func (r *Raft) AddVoter(id ServerID, address ServerAddress, prevIndex uint64, ti
 		serverAddress: address,
 		prevIndex:     prevIndex,
 	}, timeout)
+}
+
+// ChangeMembership atomically replaces the active voter set using Raft joint
+// consensus. The returned future completes after the final configuration is
+// committed. At most one membership change may be in progress at a time.
+func (r *Raft) ChangeMembership(configuration Configuration) IndexFuture {
+	return r.requestConfigChange(configurationChangeRequest{
+		command: ChangeMembership,
+		joint:   configuration,
+	}, 0)
+}
+
+// GetMembershipChangeStatus returns the current joint membership change phase
+// and, when available, the old and target configurations.
+func (r *Raft) GetMembershipChangeStatus() MembershipChangeStatus {
+	if status, ok := r.membershipChangeStatus.Load().(MembershipChangeStatus); ok {
+		return status
+	}
+	return MembershipChangeStatus{Phase: MembershipChangeStable}
 }
 
 // AddNonvoter will add the given server to the cluster but won't assign it a

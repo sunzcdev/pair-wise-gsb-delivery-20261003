@@ -178,6 +178,11 @@ type InstallSnapshotRequest struct {
 	// Log index where 'Configuration' entry was originally written.
 	ConfigurationIndex uint64
 
+	// Joint membership configuration and its original log index. When present,
+	// Configuration is the old configuration committed during the joint phase.
+	JointConfiguration      []byte
+	JointConfigurationIndex uint64
+
 	// Size of the snapshot
 	Size int64
 }

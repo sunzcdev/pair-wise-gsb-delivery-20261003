@@ -34,6 +34,12 @@ func (d *DiscardSnapshotStore) Create(version SnapshotVersion, index, term uint6
 	return &DiscardSnapshotSink{}, nil
 }
 
+func (d *DiscardSnapshotStore) CreateJointSnapshot(version SnapshotVersion, index, term uint64,
+	configuration Configuration, configurationIndex uint64, joint jointConfiguration,
+	jointIndex uint64, trans Transport) (SnapshotSink, error) {
+	return &DiscardSnapshotSink{}, nil
+}
+
 // List returns successfully with a nil for []*SnapshotMeta.
 func (d *DiscardSnapshotStore) List() ([]*SnapshotMeta, error) {
 	return nil, nil
