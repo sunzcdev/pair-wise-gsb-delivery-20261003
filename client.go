@@ -927,6 +927,61 @@ func (c *Client) PosixRename(oldname, newname string) error {
 	}
 }
 
+// CopyData copies length bytes from the "from" file, starting at
+// "fromOffset", to the "to" file, starting at "toOffset".
+//
+// The copy is performed entirely on the server side using the "copy-data"
+// extension: no data is downloaded and then uploaded back. The "from" file
+// must be open for reading, the "to" file must be open for writing and both
+// files must belong to this client.
+//
+// If the server does not advertise the "copy-data" extension a
+// sshFxOPUnsupported error is returned.
+func (c *Client) CopyData(from *File, fromOffset uint64, to *File, toOffset uint64, length uint64) error {
+	if from == nil || to == nil {
+		return errors.New("sftp: copy-data: source and destination files must be non-nil")
+	}
+	if from.c != c || to.c != c {
+		return errors.New("sftp: copy-data: source and destination files must belong to the same client")
+	}
+
+	if data, ok := c.HasExtension("copy-data"); !ok || data != "1" {
+		return &StatusError{
+			Code: sshFxOPUnsupported,
+			msg:  "copy-data not supported",
+		}
+	}
+
+	fromHandle, err := from.currentHandle()
+	if err != nil {
+		return err
+	}
+	toHandle, err := to.currentHandle()
+	if err != nil {
+		return err
+	}
+
+	id := c.nextID()
+	typ, data, err := c.sendPacket(context.Background(), nil, &sshFxpExtendedPacketCopyData{
+		ID:              id,
+		ExtendedRequest: "copy-data",
+		CopyFromHandle:  fromHandle,
+		CopyFromOffset:  fromOffset,
+		CopyDataLength:  length,
+		CopyToHandle:    toHandle,
+		CopyToOffset:    toOffset,
+	})
+	if err != nil {
+		return err
+	}
+	switch typ {
+	case sshFxpStatus:
+		return normaliseError(unmarshalStatus(id, data))
+	default:
+		return unimplementedPacketErr(typ)
+	}
+}
+
 // RealPath can be used to have the server canonicalize any given path name to an absolute path.
 //
 // This is useful for converting path names containing ".." components,
@@ -1107,6 +1162,18 @@ func (f *File) Close() error {
 // Name returns the name of the file as presented to Open or Create.
 func (f *File) Name() string {
 	return f.path
+}
+
+// currentHandle returns the server-side handle of the file, or os.ErrClosed
+// if the file is not open.
+func (f *File) currentHandle() (string, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	if f.handle == "" {
+		return "", os.ErrClosed
+	}
+	return f.handle, nil
 }
 
 // Read reads up to len(b) bytes from the File. It returns the number of bytes

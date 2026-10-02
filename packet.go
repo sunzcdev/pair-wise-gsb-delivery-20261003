@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"reflect"
 )
@@ -1343,6 +1344,8 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketHardlink{}
+	case "copy-data":
+		p.SpecificPacket = &sshFxpExtendedPacketCopyData{}
 	default:
 		return fmt.Errorf("packet type %v: %w", p.SpecificPacket, errUnknownExtendedPacket)
 	}
@@ -1424,5 +1427,81 @@ func (p *sshFxpExtendedPacketHardlink) UnmarshalBinary(b []byte) error {
 
 func (p *sshFxpExtendedPacketHardlink) respond(s *Server) responsePacket {
 	err := os.Link(s.toLocalPath(p.Oldpath), s.toLocalPath(p.Newpath))
+	return statusFromError(p.ID, err)
+}
+
+// sshFxpExtendedPacketCopyData implements the "copy-data" extension as
+// described in https://github.com/openssh/openssh-portable/blob/master/PROTOCOL
+type sshFxpExtendedPacketCopyData struct {
+	ID              uint32
+	ExtendedRequest string
+	CopyFromHandle  string
+	CopyFromOffset  uint64
+	CopyDataLength  uint64
+	CopyToHandle    string
+	CopyToOffset    uint64
+}
+
+func (p *sshFxpExtendedPacketCopyData) id() uint32     { return p.ID }
+func (p *sshFxpExtendedPacketCopyData) readonly() bool { return false }
+
+func (p *sshFxpExtendedPacketCopyData) MarshalBinary() ([]byte, error) {
+	l := 4 + 1 + 4 + // uint32(length) + byte(type) + uint32(id)
+		4 + len(p.ExtendedRequest) +
+		4 + len(p.CopyFromHandle) + 8 + 8 +
+		4 + len(p.CopyToHandle) + 8
+
+	b := make([]byte, 4, l)
+	b = append(b, sshFxpExtended)
+	b = marshalUint32(b, p.ID)
+	b = marshalString(b, p.ExtendedRequest)
+	b = marshalString(b, p.CopyFromHandle)
+	b = marshalUint64(b, p.CopyFromOffset)
+	b = marshalUint64(b, p.CopyDataLength)
+	b = marshalString(b, p.CopyToHandle)
+	b = marshalUint64(b, p.CopyToOffset)
+
+	return b, nil
+}
+
+func (p *sshFxpExtendedPacketCopyData) UnmarshalBinary(b []byte) error {
+	var err error
+	if p.ID, b, err = unmarshalUint32Safe(b); err != nil {
+		return err
+	} else if p.ExtendedRequest, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.CopyFromHandle, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.CopyFromOffset, b, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	} else if p.CopyDataLength, b, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	} else if p.CopyToHandle, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.CopyToOffset, _, err = unmarshalUint64Safe(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *sshFxpExtendedPacketCopyData) respond(s *Server) responsePacket {
+	if !isExtensionEnabled("copy-data") {
+		return statusFromError(p.ID, ErrSSHFxOpUnsupported)
+	}
+
+	if p.CopyFromOffset > math.MaxInt64 || p.CopyToOffset > math.MaxInt64 {
+		return statusFromError(p.ID, errCopyDataOffsetOutOfRange)
+	}
+
+	src, ok := s.getHandle(p.CopyFromHandle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+	dst, ok := s.getHandle(p.CopyToHandle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+
+	err := copyData(dst, src, int64(p.CopyFromOffset), int64(p.CopyToOffset), p.CopyDataLength)
 	return statusFromError(p.ID, err)
 }

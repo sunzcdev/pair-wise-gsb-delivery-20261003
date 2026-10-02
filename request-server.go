@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -142,6 +143,50 @@ func (rs *RequestServer) closeRequest(handle string) error {
 
 // Close the read/write/closer to trigger exiting the main server loop
 func (rs *RequestServer) Close() error { return rs.conn.Close() }
+
+// copyData handles a "copy-data" extended request: it copies data between
+// two open handles, entirely on the server side.
+func (rs *RequestServer) copyData(pkt *sshFxpExtendedPacketCopyData) responsePacket {
+	if !isExtensionEnabled("copy-data") {
+		return statusFromError(pkt.ID, ErrSSHFxOpUnsupported)
+	}
+
+	if pkt.CopyFromOffset > math.MaxInt64 || pkt.CopyToOffset > math.MaxInt64 {
+		return statusFromError(pkt.ID, errCopyDataOffsetOutOfRange)
+	}
+
+	srcReq, ok := rs.getRequest(pkt.CopyFromHandle)
+	if !ok {
+		return statusFromError(pkt.ID, EBADF)
+	}
+	dstReq, ok := rs.getRequest(pkt.CopyToHandle)
+	if !ok {
+		return statusFromError(pkt.ID, EBADF)
+	}
+
+	var src io.ReaderAt
+	if rd := srcReq.getReaderAt(); rd != nil {
+		src = rd
+	} else if rw := srcReq.getWriterAtReaderAt(); rw != nil {
+		src = rw
+	}
+	if src == nil {
+		return statusFromError(pkt.ID, errors.New("copy-data: source handle is not open for reading"))
+	}
+
+	var dst io.WriterAt
+	if wr := dstReq.getWriterAt(); wr != nil {
+		dst = wr
+	} else if rw := dstReq.getWriterAtReaderAt(); rw != nil {
+		dst = rw
+	}
+	if dst == nil {
+		return statusFromError(pkt.ID, errors.New("copy-data: destination handle is not open for writing"))
+	}
+
+	err := copyData(dst, src, int64(pkt.CopyFromOffset), int64(pkt.CopyToOffset), pkt.CopyDataLength)
+	return statusFromError(pkt.ID, err)
+}
 
 func (rs *RequestServer) serveLoop(pktChan chan<- orderedRequest) error {
 	defer close(pktChan) // shuts down sftpServerWorkers
@@ -305,6 +350,8 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpExtendedPacketCopyData:
+			rpkt = rs.copyData(pkt)
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)

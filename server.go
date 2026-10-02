@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"io/ioutil"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -654,4 +655,143 @@ func statusFromError(id uint32, err error) *sshFxpStatusPacket {
 	}
 
 	return ret
+}
+
+// copyDataChunkSize bounds the memory used by the copy-data fallback loop.
+const copyDataChunkSize = 32 * 1024
+
+var errCopyDataOffsetOutOfRange = errors.New("copy-data: offset out of range")
+
+// copyData copies length bytes from src, starting at srcOffset, to dst,
+// starting at dstOffset. If dst implements CopyFromWriterAt the copy is
+// delegated to it, so backends can provide a native implementation (for
+// example copy_file_range(2) or reflinks). Otherwise a bounded-buffer
+// read/write loop is used.
+func copyData(dst io.WriterAt, src io.ReaderAt, srcOffset, dstOffset int64, length uint64) error {
+	if copier, ok := dst.(CopyFromWriterAt); ok {
+		_, err := copier.CopyFrom(src, srcOffset, dstOffset, length)
+		return err
+	}
+
+	return copyDataBuffered(dst, src, srcOffset, dstOffset, length, copyDataChunkSize)
+}
+
+// copyDataBuffered copies length bytes from src to dst using a buffer of at
+// most chunkSize bytes. When the source and destination ranges overlap and
+// the destination starts after the source, the copy runs backwards, so that
+// writes never clobber source data that has not been read yet.
+func copyDataBuffered(dst io.WriterAt, src io.ReaderAt, srcOffset, dstOffset int64, length uint64, chunkSize int) error {
+	if length == 0 {
+		return nil
+	}
+	if length > math.MaxInt64 {
+		return errCopyDataOffsetOutOfRange
+	}
+	if chunkSize <= 0 {
+		chunkSize = copyDataChunkSize
+	}
+
+	buf := make([]byte, min(uint64(chunkSize), length))
+
+	if dstOffset > srcOffset && uint64(dstOffset-srcOffset) < length {
+		return copyDataBackwards(dst, src, srcOffset, dstOffset, length, buf)
+	}
+
+	remaining := length
+	for remaining > 0 {
+		chunk := min(uint64(len(buf)), remaining)
+
+		n, err := readFullAt(src, buf[:chunk], srcOffset)
+		if n > 0 {
+			if werr := writeFullAt(dst, buf[:n], dstOffset); werr != nil {
+				return werr
+			}
+			srcOffset += int64(n)
+			dstOffset += int64(n)
+			remaining -= uint64(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// The source is shorter than the requested range:
+				// stop here, like OpenSSH does.
+				return nil
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
+// copyDataBackwards copies length bytes from src to dst chunk-wise, starting
+// from the end of the range. It is used when the destination range overlaps
+// the source range and starts after it.
+func copyDataBackwards(dst io.WriterAt, src io.ReaderAt, srcOffset, dstOffset int64, length uint64, buf []byte) error {
+	remaining := length
+	for remaining > 0 {
+		chunk := min(uint64(len(buf)), remaining)
+
+		readOffset := srcOffset + int64(remaining-chunk)
+		n, err := readFullAt(src, buf[:chunk], readOffset)
+		if n > 0 {
+			writeOffset := dstOffset + int64(remaining) - int64(n)
+			if werr := writeFullAt(dst, buf[:n], writeOffset); werr != nil {
+				return werr
+			}
+			remaining -= uint64(n)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				// The source is shorter than the requested range. A
+				// partial read at the top of the range just means the
+				// missing bytes do not exist: keep copying the lower
+				// chunks, otherwise we are done.
+				if n == 0 {
+					return nil
+				}
+				continue
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
+// readFullAt reads exactly len(buf) bytes from src starting at offset off.
+// It keeps reading across short reads that report a nil error and returns
+// io.EOF if the source ends before buf is filled.
+func readFullAt(src io.ReaderAt, buf []byte, off int64) (int, error) {
+	n := 0
+	for n < len(buf) {
+		m, err := src.ReadAt(buf[n:], off+int64(n))
+		n += m
+		if err != nil {
+			if errors.Is(err, io.EOF) && n == len(buf) {
+				return n, nil
+			}
+			return n, err
+		}
+		if m == 0 {
+			return n, io.ErrNoProgress
+		}
+	}
+	return n, nil
+}
+
+// writeFullAt writes all of buf to dst starting at offset off, keeping
+// writing across short writes that report a nil error.
+func writeFullAt(dst io.WriterAt, buf []byte, off int64) error {
+	for len(buf) > 0 {
+		m, err := dst.WriteAt(buf, off)
+		if err != nil {
+			return err
+		}
+		if m <= 0 {
+			return io.ErrShortWrite
+		}
+		buf = buf[m:]
+		off += int64(m)
+	}
+	return nil
 }

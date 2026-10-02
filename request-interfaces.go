@@ -157,3 +157,21 @@ type ListerAt interface {
 type TransferError interface {
 	TransferError(err error)
 }
+
+// CopyFromWriterAt is an optional interface that the io.WriterAt returned by
+// Filewrite or OpenFile can implement to provide a native server-side copy
+// for the "copy-data" extension, for example using copy_file_range(2) or
+// reflinks. If the destination writer does not implement this interface the
+// copy is performed with a bounded-buffer read/write fallback.
+//
+// The src argument is the io.ReaderAt returned by the source handle's
+// Fileread or OpenFile call, so implementations can type assert it to their
+// own concrete type. Implementations must correctly handle the case where
+// src refers to the same underlying file and the ranges overlap.
+type CopyFromWriterAt interface {
+	io.WriterAt
+
+	// CopyFrom copies length bytes from src, starting at srcOffset, to the
+	// writer, starting at dstOffset.
+	CopyFrom(src io.ReaderAt, srcOffset, dstOffset int64, length uint64) (int64, error)
+}

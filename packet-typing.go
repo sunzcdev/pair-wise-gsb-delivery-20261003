@@ -69,6 +69,7 @@ func (p *sshFxpRenamePacket) notReadOnly()              {}
 func (p *sshFxpSymlinkPacket) notReadOnly()             {}
 func (p *sshFxpExtendedPacketPosixRename) notReadOnly() {}
 func (p *sshFxpExtendedPacketHardlink) notReadOnly()    {}
+func (p *sshFxpExtendedPacketCopyData) notReadOnly()    {}
 
 // some packets with ID are missing id()
 func (p *sshFxpDataPacket) id() uint32   { return p.ID }

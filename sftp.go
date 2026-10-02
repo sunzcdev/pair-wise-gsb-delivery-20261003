@@ -89,6 +89,7 @@ var (
 		{"hardlink@openssh.com", "1"},
 		{"posix-rename@openssh.com", "1"},
 		{"statvfs@openssh.com", "2"},
+		{"copy-data", "1"},
 	}
 	sftpExtensions = supportedSFTPExtensions
 )
@@ -238,6 +239,17 @@ func getSupportedExtensionByName(extensionName string) (sshExtensionPair, error)
 		}
 	}
 	return sshExtensionPair{}, fmt.Errorf("unsupported extension: %s", extensionName)
+}
+
+// isExtensionEnabled reports whether the named extension is currently
+// enabled, i.e. advertised to clients and served by the server.
+func isExtensionEnabled(extensionName string) bool {
+	for _, extension := range sftpExtensions {
+		if extension.Name == extensionName {
+			return true
+		}
+	}
+	return false
 }
 
 // SetSFTPExtensions allows to customize the supported server extensions.

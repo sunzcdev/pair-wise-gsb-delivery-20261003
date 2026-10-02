@@ -46,6 +46,18 @@ with the data on the files and returns in a list (list of 1 for Stat and
 Readlink).
 
 
+## Optional interfaces
+
+### CopyFromWriterAt
+
+If the io.WriterAt returned by "Filewrite" or "OpenFile" implements the
+CopyFromWriterAt interface, "copy-data" extension requests are delegated to
+its CopyFrom method, so the backend can provide a native server-side copy
+(eg. copy_file_range(2) or reflinks). Otherwise the copy is performed with a
+bounded-buffer read/write fallback that correctly handles overlapping ranges
+within the same file.
+
+
 ## TODO
 
 - Add support for API users to see trace/debugging info of what is going on
