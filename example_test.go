@@ -2,6 +2,7 @@ package sftp_test
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -163,3 +164,35 @@ func ExampleFile_ReadFrom_bufio() {
 	bw := bufio.NewWriter(writerOnly{f}) // no ReadFrom()
 	bw.ReadFrom(data_source)
 }
+
+func ExampleClient_GlobStream() {
+	var client *sftp.Client
+
+	// Stream every compressed error log anywhere under logs, following
+	// directory symlinks and reporting each physical file only once. The
+	// traversal issues READDIR strictly on demand, so the remote tree does
+	// not have to fit in memory.
+	ctx := context.Background()
+	matches, err := client.GlobStream(
+		"logs/**/error-*.gz",
+		sftp.GlobWithContext(ctx),
+		sftp.FollowSymlinks(),
+		sftp.GlobDedupe(sftp.DedupeByFile),
+	)
+	if err != nil {
+		log.Fatal(err) // only ErrBadPattern is returned up front
+	}
+	defer matches.Close()
+
+	for matches.Next() {
+		m := matches.Match()
+		if err := archiveOne(m.Path); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if err := matches.Err(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func archiveOne(path string) error { return nil }
