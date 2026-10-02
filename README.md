@@ -35,6 +35,7 @@
   - [Log State Changes](#log-state-changes)
   - [Inspection](#inspection)
   - [Warning output](#warning-output)
+  - [Definition checking](#definition-checking)
   - [RubyMotion support](#rubymotion-support)
   - [Testing](#testing)
     - [RSpec](#rspec)
@@ -1286,6 +1287,28 @@ end
 ```
 
 You can hide warnings by setting `AASM::Configuration.hide_warnings = true`
+
+### Definition checking
+
+You can statically check state machine definitions, e.g. at application boot,
+without creating any records or running guards, callbacks or dynamic initial
+states:
+
+```ruby
+report = AASM::DefinitionChecker.check(Job)
+report.ok?      # => true if there are no errors
+report.errors   # transitions referencing undeclared states
+report.warnings # unreachable states, shadowed transitions, ...
+puts report.issues.map(&:to_s)
+```
+
+The checker reports transitions which reference undeclared states (errors),
+states that cannot be reached from the initial state, and transitions that can
+never fire because an earlier unconditional transition of the same event always
+matches first (both warnings). Conditional edges count as passable; if the
+initial state is computed dynamically, the reachability check is marked as
+inconclusive. Issues are ordered by machine name, event declaration order and
+transition order.
 
 ### RubyMotion support
 
