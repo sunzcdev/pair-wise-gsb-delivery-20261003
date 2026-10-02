@@ -1008,7 +1008,7 @@ func (c *compiler) compileFunc(e *Func) error {
 	}
 	if fn, ok := c.customFuncs[e.Name]; ok && fn.accept(len(e.Args)) {
 		if err := c.compileCallInternal(
-			[3]any{fn.callback, len(e.Args), e.Name},
+			[3]any{fn.ctxCallback, len(e.Args), e.Name},
 			e.Args,
 			true,
 			-1,

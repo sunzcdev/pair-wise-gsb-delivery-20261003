@@ -1,5 +1,7 @@
 package gojq
 
+import "io"
+
 // Iter is an interface for an iterator.
 type Iter interface {
 	Next() (any, bool)
@@ -46,4 +48,50 @@ func (iter *sliceIter[T]) Next() (any, bool) {
 	value := (*iter)[0]
 	*iter = (*iter)[1:]
 	return value, true
+}
+
+// closeIter wraps an [Iter] which implements [io.Closer], and ensures that
+// the Close method is called exactly once; when the iterator is exhausted,
+// yields an error, the run is canceled, or the iterator is abandoned by
+// the query. Each run tracks its own iterators, so concurrent runs of the
+// same [*Code] close their iterators independently.
+type closeIter struct {
+	iter   Iter
+	closer io.Closer
+	env    *env
+	closed bool
+}
+
+func (env *env) newCloseIter(iter Iter, closer io.Closer) Iter {
+	it := &closeIter{iter: iter, closer: closer, env: env}
+	if env.closers == nil {
+		env.closers = make(map[*closeIter]struct{})
+	}
+	env.closers[it] = struct{}{}
+	return it
+}
+
+func (iter *closeIter) Next() (any, bool) {
+	v, ok := iter.iter.Next()
+	if !ok {
+		iter.close()
+	} else if _, ok := v.(error); ok {
+		iter.close()
+	}
+	return v, ok
+}
+
+func (iter *closeIter) close() {
+	if iter.closed {
+		return
+	}
+	iter.closed = true
+	delete(iter.env.closers, iter)
+	iter.closer.Close()
+}
+
+func (env *env) closeIters() {
+	for iter := range env.closers {
+		iter.close()
+	}
 }

@@ -2,6 +2,8 @@ package gojq
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"slices"
@@ -32,6 +34,7 @@ loop:
 			select {
 			case <-env.ctx.Done():
 				pc, env.forks = len(env.codes), nil
+				env.closeIters()
 				return env.ctx.Err(), true
 			default:
 			}
@@ -182,7 +185,15 @@ loop:
 				for i := range argcnt {
 					args[i] = env.pop()
 				}
-				w := v[0].(func(any, []any) any)(x, args)
+				var w any
+				switch f := v[0].(type) {
+				case func(any, []any) any:
+					w = f(x, args)
+				case func(context.Context, any, []any) any:
+					w = f(env.ctx, x, args)
+				default:
+					panic(fmt.Sprintf("invalid function: %s/%d", v[2], argcnt))
+				}
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
@@ -261,6 +272,9 @@ loop:
 			}
 		case opiter:
 			if err != nil {
+				if iter, ok := env.stack.top().(*closeIter); ok {
+					iter.close()
+				}
 				break loop
 			}
 			backtrack = false
@@ -300,6 +314,9 @@ loop:
 					return strings.Compare(x.path.(string), y.path.(string))
 				})
 			case Iter:
+				if closer, ok := v.(io.Closer); ok {
+					v = env.newCloseIter(v, closer)
+				}
 				if w, ok := v.Next(); ok {
 					env.push(v)
 					env.pushfork(pc)
@@ -353,6 +370,7 @@ loop:
 		pc, backtrack = env.popfork(), true
 		goto loop
 	}
+	env.closeIters()
 	if err != nil {
 		return err, true
 	}

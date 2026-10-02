@@ -1,6 +1,9 @@
 package gojq
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // CompilerOption is a compiler option.
 type CompilerOption func(*compiler)
@@ -40,7 +43,11 @@ func WithVariables(variables []string) CompilerOption {
 // accept a filter for its argument, or call another built-in function, then
 // use LoadInitModules of the module loader.
 func WithFunction(name string, minarity, maxarity int, f func(any, []any) any) CompilerOption {
-	return withFunction(name, minarity, maxarity, false, f)
+	return withFunction(name, minarity, maxarity, false,
+		func(_ context.Context, v any, args []any) any {
+			return f(v, args)
+		},
+	)
 }
 
 // WithIterFunction is a compiler option for adding a custom iterator function.
@@ -48,15 +55,50 @@ func WithFunction(name string, minarity, maxarity int, f func(any, []any) any) C
 // returns an Iter to emit multiple values. You cannot define both iterator and
 // non-iterator functions of the same name (with possibly different arities).
 // See also [NewIter], which can be used to convert values or an error to an Iter.
+//
+// If the returned [Iter] also implements io.Closer, its Close method is
+// called exactly once when the iterator is exhausted, yields an error, the
+// run is canceled, or the iterator is abandoned by the query (for example,
+// by first or limit). The error returned by Close is discarded.
 func WithIterFunction(name string, minarity, maxarity int, f func(any, []any) Iter) CompilerOption {
 	return withFunction(name, minarity, maxarity, true,
-		func(v any, args []any) any {
+		func(_ context.Context, v any, args []any) any {
 			return f(v, args)
 		},
 	)
 }
 
-func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []any) any) CompilerOption {
+// WithContextFunction is a compiler option for adding a custom internal
+// function. This is like the [WithFunction] option, but the function
+// receives the context of the current run, the one passed to
+// [*Code.RunWithContext] or [Query.RunWithContext]. Long-running functions
+// can cooperatively respond to cancellation by watching the context. Note
+// that the runtime never interrupts the function forcibly; it does not
+// spawn a goroutine to abandon a blocked function, so a function which
+// ignores the context may still delay the cancellation of the run.
+func WithContextFunction(name string, minarity, maxarity int, f func(context.Context, any, []any) any) CompilerOption {
+	return withFunction(name, minarity, maxarity, false, f)
+}
+
+// WithContextIterFunction is a compiler option for adding a custom iterator
+// function. This is like the [WithIterFunction] option, but the function
+// receives the context of the current run, just like [WithContextFunction].
+//
+// If the returned [Iter] also implements io.Closer, its Close method is
+// called exactly once when the iterator is exhausted, yields an error, the
+// run is canceled, or the iterator is abandoned by the query (for example,
+// by first or limit). The error returned by Close is discarded. Each run
+// owns the iterators created for it, so iterators created by concurrent
+// runs of the same [*Code] are closed independently.
+func WithContextIterFunction(name string, minarity, maxarity int, f func(context.Context, any, []any) Iter) CompilerOption {
+	return withFunction(name, minarity, maxarity, true,
+		func(ctx context.Context, v any, args []any) any {
+			return f(ctx, v, args)
+		},
+	)
+}
+
+func withFunction(name string, minarity, maxarity int, iter bool, f func(context.Context, any, []any) any) CompilerOption {
 	if !(0 <= minarity && minarity <= maxarity && maxarity <= 30) {
 		panic(fmt.Sprintf("invalid arity for %q: %d, %d", name, minarity, maxarity))
 	}
@@ -70,16 +112,17 @@ func withFunction(name string, minarity, maxarity int, iter bool, f func(any, []
 				panic(fmt.Sprintf("cannot define both iterator and non-iterator functions for %q", name))
 			}
 			c.customFuncs[name] = function{
-				argcount | fn.argcount, iter,
-				func(x any, xs []any) any {
+				argcount: argcount | fn.argcount,
+				iter:     iter,
+				ctxCallback: func(ctx context.Context, x any, xs []any) any {
 					if argcount&(1<<len(xs)) != 0 {
-						return f(x, xs)
+						return f(ctx, x, xs)
 					}
-					return fn.callback(x, xs)
+					return fn.ctxCallback(ctx, x, xs)
 				},
 			}
 		} else {
-			c.customFuncs[name] = function{argcount, iter, f}
+			c.customFuncs[name] = function{argcount: argcount, iter: iter, ctxCallback: f}
 		}
 	}
 }

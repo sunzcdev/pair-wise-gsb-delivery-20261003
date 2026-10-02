@@ -1,6 +1,7 @@
 package gojq
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -35,9 +36,10 @@ const (
 )
 
 type function struct {
-	argcount int
-	iter     bool
-	callback func(any, []any) any
+	argcount    int
+	iter        bool
+	callback    func(any, []any) any
+	ctxCallback func(context.Context, any, []any) any
 }
 
 func (fn function) accept(cnt int) bool {
@@ -111,8 +113,8 @@ func init() {
 		"_less":          argFunc2(funcOpLt),
 		"_greatereq":     argFunc2(funcOpGe),
 		"_lesseq":        argFunc2(funcOpLe),
-		"flatten":        {argcount0 | argcount1, false, funcFlatten},
-		"_range":         {argcount3, true, funcRange},
+		"flatten":        {argcount0 | argcount1, false, funcFlatten, nil},
+		"_range":         {argcount3, true, funcRange, nil},
 		"min":            argFunc0(funcMin),
 		"_min_by":        argFunc1(funcMinBy),
 		"max":            argFunc0(funcMax),
@@ -202,9 +204,9 @@ func init() {
 		"now":            argFunc0(funcNow),
 		"_match":         argFunc3(nil),
 		"_captures":      argFunc0(funcCaptures),
-		"error":          {argcount0 | argcount1, false, funcError},
+		"error":          {argcount0 | argcount1, false, funcError, nil},
 		"halt":           argFunc0(funcHalt),
-		"halt_error":     {argcount0 | argcount1, false, funcHaltError},
+		"halt_error":     {argcount0 | argcount1, false, funcHaltError, nil},
 	}
 }
 
@@ -212,7 +214,7 @@ func argFunc0(f func(any) any) function {
 	return function{
 		argcount0, false, func(v any, _ []any) any {
 			return f(v)
-		},
+		}, nil,
 	}
 }
 
@@ -220,7 +222,7 @@ func argFunc1(f func(_, _ any) any) function {
 	return function{
 		argcount1, false, func(v any, args []any) any {
 			return f(v, args[0])
-		},
+		}, nil,
 	}
 }
 
@@ -228,7 +230,7 @@ func argFunc2(f func(_, _, _ any) any) function {
 	return function{
 		argcount2, false, func(v any, args []any) any {
 			return f(v, args[0], args[1])
-		},
+		}, nil,
 	}
 }
 
@@ -236,7 +238,7 @@ func argFunc3(f func(_, _, _, _ any) any) function {
 	return function{
 		argcount3, false, func(v any, args []any) any {
 			return f(v, args[0], args[1], args[2])
-		},
+		}, nil,
 	}
 }
 
