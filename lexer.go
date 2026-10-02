@@ -32,6 +32,39 @@ type Scanner struct {
 	itemBytes []byte
 
 	err bool
+
+	// itemPos is the offset, relative to data, of the first byte of the
+	// current token. Unlike the position inside itemBytes (which may be a
+	// de-quoted copy), it always maps onto the raw input.
+	itemPos int
+
+	// errKind and errPos describe the last lexing error: errPos is the raw
+	// byte offset of the offending construct.
+	errKind ScanError
+	errPos  int
+}
+
+// ScanError encodes the category of a scanner error.
+type ScanError byte
+
+const (
+	// ScanErrorNone reports that no error occurred.
+	ScanErrorNone ScanError = iota
+	// ScanErrorInvalidByte reports an octet that is neither token nor
+	// separator, or an unexpected "\" / ")" byte.
+	ScanErrorInvalidByte
+	// ScanErrorUnterminatedString reports a quoted-string without a closing
+	// quote.
+	ScanErrorUnterminatedString
+	// ScanErrorUnterminatedComment reports a comment with an unbalanced
+	// opening parenthesis.
+	ScanErrorUnterminatedComment
+)
+
+// Err reports the category of the last scanner error and the raw byte offset
+// of the offending construct.
+func (l *Scanner) Err() (kind ScanError, offset int) {
+	return l.errKind, l.errPos
 }
 
 // NewScanner creates new RFC2616 data scanner.
@@ -54,7 +87,7 @@ func (l *Scanner) Next() bool {
 		return l.fetchComment()
 
 	case '\\', ')': // unexpected chars;
-		l.err = true
+		l.fail(ScanErrorInvalidByte, l.pos)
 		return false
 
 	default:
@@ -170,6 +203,13 @@ func (l *Scanner) resetItem() {
 	l.itemBytes = nil
 }
 
+func (l *Scanner) fail(kind ScanError, offset int) bool {
+	l.err = true
+	l.errKind = kind
+	l.errPos = offset
+	return false
+}
+
 func (l *Scanner) fetchOctet(c byte) bool {
 	i := l.pos
 	if j := bytes.IndexByte(l.data[l.pos:], c); j == -1 {
@@ -181,6 +221,7 @@ func (l *Scanner) fetchOctet(c byte) bool {
 
 	l.itemType = ItemOctet
 	l.itemBytes = l.data[i:l.pos]
+	l.itemPos = i
 
 	return true
 }
@@ -188,44 +229,46 @@ func (l *Scanner) fetchOctet(c byte) bool {
 func (l *Scanner) fetchToken() bool {
 	n, t := ScanToken(l.data[l.pos:])
 	if n == -1 {
-		l.err = true
-		return false
+		return l.fail(ScanErrorInvalidByte, l.pos)
 	}
 
 	l.itemType = t
 	l.itemBytes = l.data[l.pos : l.pos+n]
+	l.itemPos = l.pos
 	l.pos += n
 
 	return true
 }
 
 func (l *Scanner) fetchQuotedString() (ok bool) {
+	start := l.pos
 	l.pos++
 
 	n := ScanUntil(l.data[l.pos:], '"')
 	if n == -1 {
-		l.err = true
-		return false
+		return l.fail(ScanErrorUnterminatedString, start)
 	}
 
 	l.itemType = ItemString
 	l.itemBytes = RemoveByte(l.data[l.pos:l.pos+n], '\\')
+	l.itemPos = start
 	l.pos += n + 1
 
 	return true
 }
 
 func (l *Scanner) fetchComment() (ok bool) {
+	start := l.pos
 	l.pos++
 
 	n := ScanPairGreedy(l.data[l.pos:], '(', ')')
 	if n == -1 {
-		l.err = true
-		return false
+		return l.fail(ScanErrorUnterminatedComment, start)
 	}
 
 	l.itemType = ItemComment
 	l.itemBytes = RemoveByte(l.data[l.pos:l.pos+n], '\\')
+	l.itemPos = start
 	l.pos += n + 1
 
 	return true

@@ -37,12 +37,28 @@ func ExampleParseOptions() {
 	// Output: [{foo [bar:1]} {baz []}] true
 }
 
-func ExampleParseOptionsLifetime() {
+func ExampleParseOptions_lifetime() {
 	data := []byte(`foo;bar=1,baz`)
 	options, ok := ParseOptions(data, nil)
 	copy(data, []byte(`xxx;yyy=0,zzz`))
 	fmt.Println(options, ok)
 	// Output: [{xxx [yyy:0]} {zzz []}] true
+}
+
+func ExampleScanOptionsDetailed() {
+	in := []byte(`foo;bar="unterminated`)
+	status, err := ScanOptionsDetailed(in, func(int, []byte, []byte, []byte) Control {
+		return ControlContinue
+	})
+	switch status {
+	case ParseComplete:
+		fmt.Println("complete")
+	case ParseStopped:
+		fmt.Println("stopped by caller")
+	case ParseMalformed:
+		fmt.Println(err.Kind, err.Offset, err.Option, err.Param)
+	}
+	// Output: unterminated quoted-string 8 0 1
 }
 
 var listCases = []struct {

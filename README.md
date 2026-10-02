@@ -57,6 +57,34 @@ of some key:
 
 For more usage examples please see [docs][godoc-url] or package tests.
 
+## Diagnostics
+
+`ParseOptions` and `ScanOptions` return a single boolean. When you need to know
+why parsing stopped use the diagnostic variants `ParseOptionsDetailed` and
+`ScanOptionsDetailed`. They report a `ParseStatus`:
+
+- `ParseComplete` — the whole input was parsed;
+- `ParseStopped` — the callback returned `ControlBreak`;
+- `ParseMalformed` — the input was corrupted, accompanied by an `OptionError`.
+
+`OptionError` contains the error category, the byte offset in the **original
+raw input** (never derived from a de-quoted token length), the current option
+ordinal and the current parameter ordinal:
+
+```go
+status, err := httphead.ScanOptionsDetailed(data, func(i int, name, attr, val []byte) httphead.Control {
+    return httphead.ControlContinue
+})
+if status == httphead.ParseMalformed {
+    log.Fatalf("%s at byte %d (option %d, parameter %d)",
+        err.Kind, err.Offset, err.Option, err.Param)
+}
+```
+
+The diagnostic scanner is streaming and allocation-free on the fast path — it
+does not build a syntax tree ahead of time; the `OptionError` is produced only
+at the point where parsing fails.
+
 [godoc-image]: https://godoc.org/github.com/gobwas/httphead?status.svg
 [godoc-url]: https://godoc.org/github.com/gobwas/httphead
 [travis-image]: https://travis-ci.org/gobwas/httphead.svg?branch=master
