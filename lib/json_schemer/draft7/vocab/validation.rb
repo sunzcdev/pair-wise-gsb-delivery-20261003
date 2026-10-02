@@ -27,11 +27,14 @@ module JSONSchemer
 
             offset = items.size
 
-            nested = instance.slice(offset..-1).map.with_index do |item, index|
-              parsed.validate_instance(item, join_location(instance_location, (offset + index).to_s), keyword_location, context)
+            nested = []
+            instance.slice(offset..-1).each_with_index do |item, index|
+              break if context.work_budget_exceeded?
+              nested << parsed.validate_instance(item, join_location(instance_location, (offset + index).to_s), keyword_location, context)
             end
 
-            result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => nested.any?)
+            result(instance, instance_location, keyword_location, nested.all?(&:valid) && !context.work_budget_exceeded?, nested,
+                   :annotation => nested.any?, :incomplete => context.work_budget_exceeded?)
           end
         end
 

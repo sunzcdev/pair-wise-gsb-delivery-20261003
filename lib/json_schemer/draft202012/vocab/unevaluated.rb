@@ -25,11 +25,14 @@ module JSONSchemer
               collect_unevaluated_items(adjacent_result, unevaluated_items)
             end
 
-            nested = unevaluated_items.map do |index|
-              parsed.validate_instance(instance.fetch(index), join_location(instance_location, index.to_s), keyword_location, context)
+            nested = []
+            unevaluated_items.sort.each do |index|
+              break if context.work_budget_exceeded?
+              nested << parsed.validate_instance(instance.fetch(index), join_location(instance_location, index.to_s), keyword_location, context)
             end
 
-            result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => nested.any?)
+            result(instance, instance_location, keyword_location, nested.all?(&:valid) && !context.work_budget_exceeded?, nested,
+                   :annotation => nested.any?, :incomplete => context.work_budget_exceeded?)
           end
 
         private
@@ -77,11 +80,14 @@ module JSONSchemer
               evaluated_keys.include?(key)
             end
 
-            nested = evaluated.map do |key, value|
-              parsed.validate_instance(value, join_location(instance_location, key), keyword_location, context)
+            nested = []
+            evaluated.each do |key, value|
+              break if context.work_budget_exceeded?
+              nested << parsed.validate_instance(value, join_location(instance_location, key), keyword_location, context)
             end
 
-            result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => evaluated.keys)
+            result(instance, instance_location, keyword_location, nested.all?(&:valid) && !context.work_budget_exceeded?, nested,
+                   :annotation => evaluated.keys, :incomplete => context.work_budget_exceeded?)
           end
 
         private

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 module JSONSchemer
   class Schema
-    Context = Struct.new(:instance, :dynamic_scope, :adjacent_results, :short_circuit, :access_mode) do
+    Context = Struct.new(:instance, :dynamic_scope, :adjacent_results, :short_circuit, :access_mode, :work_budget) do
       def original_instance(instance_location)
         Hana::Pointer.parse(Location.resolve(instance_location)).reduce(instance) do |obj, token|
           if obj.is_a?(Array)
@@ -12,6 +12,17 @@ module JSONSchemer
             obj.fetch(token)
           end
         end
+      end
+
+      # Charge one unit of work for evaluating the given keyword at the given
+      # instance location. Returns `false` (without evaluating the keyword)
+      # once the per-call budget is exhausted.
+      def charge_work(instance_location, keyword_location)
+        work_budget ? work_budget.charge(instance_location, keyword_location) : true
+      end
+
+      def work_budget_exceeded?
+        work_budget&.exceeded?
       end
     end
 
@@ -101,16 +112,39 @@ module JSONSchemer
       @parsed = parse
     end
 
-    def valid?(instance, **options)
-      validate(instance, :output_format => 'flag', **options).fetch('valid')
+    def valid?(instance, work_budget: nil, **options)
+      validate(instance, :output_format => 'flag', :work_budget => work_budget, **options).fetch('valid')
     end
 
-    def validate(instance, output_format: @configuration.output_format, resolve_enumerators: @configuration.resolve_enumerators, access_mode: @configuration.access_mode)
+    def validate(
+      instance,
+      output_format: @configuration.output_format,
+      resolve_enumerators: @configuration.resolve_enumerators,
+      access_mode: @configuration.access_mode,
+      work_budget: nil
+    )
       instance_location = Location.root
-      context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode)
+      budget = work_budget.nil? ? nil : WorkBudget.new(work_budget)
+      context = Context.new(instance, [], nil, (!insert_property_defaults && output_format == 'flag'), access_mode, budget)
       result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
       if insert_property_defaults && result.insert_property_defaults(context, &property_default_resolver)
         result = validate_instance(deep_stringify_keys(instance), instance_location, root_keyword_location, context)
+      end
+      if budget&.exceeded?
+        if output_format == 'flag'
+          raise BudgetExceeded.new(
+            :instance_location => budget.instance_location,
+            :keyword_location => budget.keyword_location,
+            :limit => budget.limit,
+            :used => budget.used
+          )
+        end
+        result.mark_incomplete!(
+          :instance_location => budget.instance_location,
+          :keyword_location => budget.keyword_location,
+          :limit => budget.limit,
+          :used => budget.used
+        )
       end
       output = result.output(output_format)
       resolve_enumerators!(output) if resolve_enumerators
@@ -139,33 +173,53 @@ module JSONSchemer
         return result(instance, instance_location, keyword_location, false) if value == false
         return result(instance, instance_location, keyword_location, true) if value == true || value.empty?
 
+        return result(instance, instance_location, keyword_location, true, nil, :incomplete => true) if context.work_budget_exceeded?
+
         valid = true
         nested = []
 
         parsed.each do |keyword, keyword_instance|
+          unless context.charge_work(instance_location, join_location(keyword_location, keyword))
+            return result(instance, instance_location, keyword_location, valid, nested, :incomplete => true)
+          end
           next unless keyword_result = keyword_instance.validate(instance, instance_location, join_location(keyword_location, keyword), context)
+          if context.work_budget_exceeded? && !keyword_result.incomplete
+            keyword_result.incomplete = true
+          end
           valid &&= keyword_result.valid
-          return result(instance, instance_location, keyword_location, false) if short_circuit && !valid
+          if short_circuit && !valid
+            # a definite failure is a conclusion regardless of remaining budget
+            return result(instance, instance_location, keyword_location, false, [keyword_result])
+          end
           nested << keyword_result
           adjacent_results[keyword_instance.class] = keyword_result
         end
 
-        if root.custom_keywords.any?
+        if root.custom_keywords.any? && !context.work_budget_exceeded?
           resolved_instance_location = Location.resolve(instance_location)
           root.custom_keywords.each do |custom_keyword, callable|
             if value.key?(custom_keyword)
+              unless context.charge_work(instance_location, join_location(keyword_location, custom_keyword))
+                return result(instance, instance_location, keyword_location, valid, nested, :incomplete => true)
+              end
               [*callable.call(instance, value, resolved_instance_location)].each do |custom_keyword_result|
                 custom_keyword_valid = custom_keyword_result == true
                 valid &&= custom_keyword_valid
                 type = custom_keyword_result.is_a?(String) ? custom_keyword_result : custom_keyword
                 details = { 'keyword' => custom_keyword, 'result' => custom_keyword_result }
-                nested << result(instance, instance_location, keyword_location, custom_keyword_valid, :type => type, :details => details)
+                nested << result(instance, instance_location, keyword_location, custom_keyword_valid, :type => type, :details => details,
+                                 :incomplete => context.work_budget_exceeded?)
               end
             end
           end
         end
 
-        result(instance, instance_location, keyword_location, valid, nested)
+        if short_circuit && context.work_budget_exceeded?
+          # never report a short-circuit pass as valid once the budget is exhausted
+          result(instance, instance_location, keyword_location, true, nested, :incomplete => true)
+        else
+          result(instance, instance_location, keyword_location, valid, nested, :incomplete => context.work_budget_exceeded?)
+        end
       ensure
         context.dynamic_scope.pop
         context.adjacent_results = original_adjacent_results

@@ -9,13 +9,15 @@ module JSONSchemer
           def validate(instance, instance_location, keyword_location, context)
             nested = []
             parsed.each_with_index do |subschema, index|
+              break if context.work_budget_exceeded?
               if ref_schema = subschema.parsed['$ref']&.ref_schema
                 next if skip_ref_once == ref_schema.absolute_keyword_location
                 ref_schema.parsed['discriminator']&.skip_ref_once = schema.absolute_keyword_location
               end
               nested << subschema.validate_instance(instance, instance_location, join_location(keyword_location, index.to_s), context)
             end
-            result(instance, instance_location, keyword_location, nested.all?(&:valid), nested)
+            result(instance, instance_location, keyword_location, nested.all?(&:valid) && !context.work_budget_exceeded?, nested,
+                   :incomplete => context.work_budget_exceeded?)
           ensure
             self.skip_ref_once = nil
           end
@@ -116,7 +118,8 @@ module JSONSchemer
 
             subschema_result = subschema.validate_instance(instance, instance_location, keyword_location, context)
 
-            result(instance, instance_location, keyword_location, subschema_result.valid, subschema_result.nested)
+            result(instance, instance_location, keyword_location, subschema_result.valid && !subschema_result.incomplete, subschema_result.nested,
+                   :incomplete => subschema_result.incomplete || context.work_budget_exceeded?)
           ensure
             self.skip_ref_once = nil
           end

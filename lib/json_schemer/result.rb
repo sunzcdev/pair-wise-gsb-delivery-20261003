@@ -9,7 +9,7 @@ module JSONSchemer
     hash[klass] = klass.name.rpartition('::').last.sub(/\A[[:alpha:]]/, &:downcase)
   end
 
-  Result = Struct.new(:source, :instance, :instance_location, :keyword_location, :valid, :nested, :type, :annotation, :details, :ignore_nested, :nested_key) do
+  Result = Struct.new(:source, :instance, :instance_location, :keyword_location, :valid, :nested, :type, :annotation, :details, :ignore_nested, :nested_key, :incomplete) do
     def output(output_format)
       case output_format
       when 'classic'
@@ -81,6 +81,15 @@ module JSONSchemer
         'absoluteKeywordLocation' => source.absolute_keyword_location,
         'instanceLocation' => resolved_instance_location
       }
+      out['incomplete'] = true if incomplete
+      if @budget_limit
+        out['budget'] = {
+          'limit' => @budget_limit,
+          'used' => @budget_used,
+          'instanceLocation' => @budget_instance_location,
+          'keywordLocation' => @budget_keyword_location
+        }
+      end
       if valid
         out['annotation'] = annotation if annotation
       else
@@ -106,6 +115,39 @@ module JSONSchemer
       out['i18n'] = true if @i18n
       out['details'] = details if details
       out
+    end
+
+    def incomplete_entry
+      {
+        'incomplete' => true,
+        'data_pointer' => @budget_instance_location,
+        'schema_pointer' => @budget_keyword_location,
+        'type' => 'work_budget_exceeded',
+        'error' => "work budget of #{@budget_limit} keyword evaluation(s) exhausted " \
+                   "at instance location `#{@budget_instance_location}` and schema location `#{@budget_keyword_location}`",
+        'details' => {
+          'limit' => @budget_limit,
+          'used' => @budget_used,
+          'instance_location' => @budget_instance_location,
+          'keyword_location' => @budget_keyword_location
+        }
+      }
+    end
+
+    # Marks the root result tree as incomplete once the work budget has been
+    # exhausted. Confirmed errors are preserved but the output is explicitly
+    # reported as non-exhaustive.
+    def mark_incomplete!(instance_location:, keyword_location:, limit:, used:)
+      @budget_instance_location = instance_location
+      @budget_keyword_location = keyword_location
+      @budget_limit = limit
+      @budget_used = used
+      self.valid = false
+      results = [self]
+      while result = results.pop
+        result.incomplete = true
+        results.concat(result.nested) if result.nested
+      end
     end
 
     def flag
@@ -161,6 +203,7 @@ module JSONSchemer
 
     def classic
       Enumerator.new do |yielder|
+        yielder << incomplete_entry if @budget_limit
         unless valid
           results = [self]
           while result = results.pop

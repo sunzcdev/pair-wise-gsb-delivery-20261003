@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Features
+
+- Optional per-validation `work_budget` that counts keyword evaluations, short-circuits with an explicit `incomplete` result (and stop instance/schema locations), and raises `JSONSchemer::BudgetExceeded` from `valid?`/flag output when no conclusion can be reached.
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes

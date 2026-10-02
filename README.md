@@ -259,6 +259,42 @@ end
 JSONSchemer.configuration.insert_property_defaults = true
 ```
 
+## Work Budget
+
+A single validation can be given an optional work budget. Work is counted in units where evaluating one keyword against one instance location costs one unit (keywords entered via `$ref` are also counted). Keyword evaluations that never run—for example because an earlier branch already failed—are not counted.
+
+The budget and all of its state belong to that single `valid?`/`validate` call; reusing a schema across calls never shares or carries over a budget.
+
+When the limit is reached, evaluation stops immediately. The result is reported as `incomplete` with the stopped instance and schema locations; it is never reported as valid and is not emitted as an ordinary validation error. With the `flag` output format (used by `valid?`), reaching the limit raises `JSONSchemer::BudgetExceeded` instead.
+
+```ruby
+schemer = JSONSchemer.schema({ 'anyOf' => [{ 'type' => 'integer' }, { 'type' => 'string' }] })
+
+schemer.valid?(1, :work_budget => 10)
+# => true
+
+begin
+  schemer.valid?(:nope, :work_budget => 2)
+rescue JSONSchemer::BudgetExceeded => error
+  error.instance_location # => ""
+  error.keyword_location  # => "/anyOf/1/type"
+  error.limit             # => 2
+  error.used              # => 2
+end
+
+# non-flag output is marked incomplete and keeps any already-confirmed errors
+output = schemer.validate(:nope, :work_budget => 2, :output_format => 'basic', :resolve_enumerators => true)
+output['valid']      # => false
+output['incomplete'] # => true
+output['budget']     # => {"limit"=>2, "used"=>2, "instanceLocation"=>"", "keywordLocation"=>"/anyOf/1/type"}
+
+# the classic output includes a non-exhaustive marker plus confirmed errors
+schemer.validate(:nope, :work_budget => 2).to_a
+# => [{"incomplete"=>true, "type"=>"work_budget_exceeded", ...}, { ...confirmed error... }]
+```
+
+Incomplete intermediate results never decide other branches: `anyOf`, `oneOf`, `not`, `if`/`then`/`else`, and `unevaluatedProperties` are only concluded from branches that were fully evaluated.
+
 ## Custom Error Messages
 
 Error messages can be customized using the `x-error` keyword and/or [I18n](https://github.com/ruby-i18n/i18n) translations. `x-error` takes precedence if both are defined.

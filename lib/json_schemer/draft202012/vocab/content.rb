@@ -43,7 +43,8 @@ module JSONSchemer
             parsed_instance = context.adjacent_results.fetch(ContentMediaType).annotation
             annotation = parsed.validate_instance(parsed_instance, instance_location, keyword_location, context)
 
-            result(instance, instance_location, keyword_location, true, :annotation => annotation.to_output_unit)
+            result(instance, instance_location, keyword_location, !context.work_budget_exceeded?,
+                   :annotation => annotation.to_output_unit, :incomplete => context.work_budget_exceeded?)
           end
         end
       end
