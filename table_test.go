@@ -1,6 +1,8 @@
 package lua
 
 import (
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -230,4 +232,155 @@ func TestTableForEach(t *testing.T) {
 			}
 		}
 	})
+}
+
+func orderedEntries(t *testing.T, tb *LTable) []string {
+	t.Helper()
+
+	iterator, err := NewOrderedIterator(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries := []string{}
+	for {
+		key, value, ok := iterator.Next()
+		if !ok {
+			return entries
+		}
+		entries = append(entries, key.String()+"="+value.String())
+	}
+}
+
+func TestTableOrderedForEach(t *testing.T) {
+	build := func(keys ...LValue) *LTable {
+		tb := newLTable(0, 0)
+		for _, key := range keys {
+			tb.RawSet(key, LString(key.String()+"-v"))
+		}
+		return tb
+	}
+
+	keys := []LValue{
+		LNumber(3), LString("banana"), LFalse, LNumber(-1), LNumber(2.5),
+		LNumber(1), LString("apple"), LTrue,
+		LNumber(2), LString("cherry"), LNumber(0), LNumber(-2),
+		LNumber(MaxArrayIndex + 1),
+	}
+	reversed := []LValue{
+		LNumber(MaxArrayIndex + 1), LNumber(-2), LNumber(0), LString("cherry"),
+		LNumber(2), LString("apple"), LTrue, LNumber(1),
+		LNumber(2.5), LNumber(-1), LFalse, LString("banana"), LNumber(3),
+	}
+
+	first := build(keys...)
+	second := build(reversed...)
+	expected := []string{
+		"-2=-2-v", "-1=-1-v", "0=0-v",
+		"1=1-v", "2=2-v", "2.5=2.5-v", "3=3-v",
+		"67108865=67108865-v",
+		"apple=apple-v", "banana=banana-v", "cherry=cherry-v",
+		"false=false-v", "true=true-v",
+	}
+
+	errorIfNotEqual(t, strings.Join(expected, ","), strings.Join(orderedEntries(t, first), ","))
+	errorIfNotEqual(t, strings.Join(expected, ","), strings.Join(orderedEntries(t, second), ","))
+}
+
+func TestTableOrderedIteratorSnapshot(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.RawSetInt(1, LString("one"))
+	tb.RawSetInt(2, LString("two"))
+	tb.RawSetString("a", LString("old"))
+
+	iterator, err := NewOrderedIterator(tb)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, value, ok := iterator.Next()
+	errorIfNotEqual(t, true, ok)
+	errorIfNotEqual(t, LNumber(1), key)
+	errorIfNotEqual(t, LString("one"), value)
+
+	tb.RawSetInt(2, LNil)
+	tb.RawSetInt(4, LString("four"))
+	tb.RawSetString("a", LString("new"))
+	tb.RawSetString("z", LString("new-key"))
+
+	key, value, ok = iterator.Next()
+	errorIfNotEqual(t, true, ok)
+	errorIfNotEqual(t, LString("a"), key)
+	errorIfNotEqual(t, LString("new"), value)
+
+	_, _, ok = iterator.Next()
+	errorIfNotEqual(t, false, ok)
+}
+
+func TestTableOrderedIteratorNoDuplicateLogicalKeys(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.array = []LValue{LString("array"), LNil}
+	tb.strdict = map[string]LValue{"s": LString("string")}
+	tb.dict = map[LValue]LValue{
+		LNumber(1): LString("hash"),
+		LNumber(2): LString("hole"),
+		LTrue:      LString("true"),
+	}
+	tb.RawSetH(LNumber(math.Copysign(0, -1)), LString("negative-zero"))
+	tb.RawSetH(LNumber(0), LString("zero"))
+
+	entries := orderedEntries(t, tb)
+	expected := []string{
+		"0=zero", "1=array", "2=hole", "s=string", "true=true",
+	}
+	errorIfNotEqual(t, strings.Join(expected, ","), strings.Join(entries, ","))
+}
+
+func TestTableOrderedIteratorSpecialKeys(t *testing.T) {
+	tb := newLTable(0, 0)
+	tb.RawSet(LNumber(math.Copysign(0, -1)), LString("negative-zero"))
+	tb.RawSet(LNumber(0), LString("zero"))
+
+	entries := orderedEntries(t, tb)
+	errorIfNotEqual(t, "0=zero", strings.Join(entries, ","))
+
+	tb = newLTable(0, 0)
+	tb.RawSet(LNumber(math.NaN()), LTrue)
+	_, err := NewOrderedIterator(tb)
+	if err == nil {
+		t.Fatal("expected NaN key to be rejected")
+	}
+
+	tb = newLTable(0, 0)
+	tb.RawSet(newLTable(0, 0), LTrue)
+	_, err = NewOrderedIterator(tb)
+	if err == nil {
+		t.Fatal("expected reference key to be rejected")
+	}
+}
+
+func TestTableOrderedIteratorStateEntry(t *testing.T) {
+	L := NewState(Options{})
+	tb := L.NewTable()
+	tb.RawSetString("b", LNumber(2))
+	tb.RawSetString("a", LNumber(1))
+
+	entries := []string{}
+	err := L.OrderedForEach(tb, func(key, value LValue) {
+		entries = append(entries, key.String()+"="+value.String())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errorIfNotEqual(t, "a=1,b=2", strings.Join(entries, ","))
+}
+
+func TestTableNextStillSupportsReferenceKeys(t *testing.T) {
+	tb := newLTable(0, 0)
+	referenceKey := newLTable(0, 0)
+	tb.RawSetH(referenceKey, LString("value"))
+
+	key, value := tb.Next(LNil)
+	errorIfNotEqual(t, referenceKey, key)
+	errorIfNotEqual(t, LString("value"), value)
 }

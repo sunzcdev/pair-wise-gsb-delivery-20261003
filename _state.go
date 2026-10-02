@@ -1724,6 +1724,14 @@ func (ls *LState) ForEach(tb *LTable, cb func(LValue, LValue)) {
 	tb.ForEach(cb)
 }
 
+func (ls *LState) OrderedForEach(tb *LTable, cb func(LValue, LValue)) error {
+	return tb.OrderedForEach(cb)
+}
+
+func (ls *LState) NewOrderedIterator(tb *LTable) (*OrderedIterator, error) {
+	return NewOrderedIterator(tb)
+}
+
 func (ls *LState) GetGlobal(name string) LValue {
 	return ls.GetField(ls.Get(GlobalsIndex), name)
 }

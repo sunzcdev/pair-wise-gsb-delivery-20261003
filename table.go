@@ -1,5 +1,11 @@
 package lua
 
+import (
+	"fmt"
+	"math"
+	"sort"
+)
+
 const defaultArrayCap = 32
 const defaultHashCap = 32
 
@@ -344,6 +350,164 @@ func (tb *LTable) ForEach(cb func(LValue, LValue)) {
 				cb(k, v)
 			}
 		}
+	}
+}
+
+// OrderedIterator iterates a table in deterministic key order.
+//
+// Keys are snapshotted when the iterator is created: deleting a key skips it,
+// while adding a key after creation does not visit it. Current values are read
+// from the table when Next is called.
+type OrderedIterator struct {
+	table *LTable
+	keys  []LValue
+	index int
+}
+
+// NewOrderedIterator returns an iterator over numeric, string, and boolean
+// keys. Numeric keys are ordered numerically, strings lexicographically, and
+// booleans as false followed by true. Other key types are rejected.
+func NewOrderedIterator(tb *LTable) (*OrderedIterator, error) {
+	numbers := make([]LNumber, 0)
+	strings := make([]string, 0)
+	booleans := make([]LBool, 0, 2)
+	seenNumbers := make(map[float64]struct{})
+	seenStrings := make(map[string]struct{})
+	seenBooleans := make(map[bool]struct{})
+
+	addNumber := func(key LNumber) error {
+		value := float64(key)
+		if math.IsNaN(value) {
+			return fmt.Errorf("ordered iteration does not support NaN keys")
+		}
+		if value == 0 {
+			value = math.Copysign(0, 1)
+		}
+		if _, ok := seenNumbers[value]; ok {
+			return nil
+		}
+		seenNumbers[value] = struct{}{}
+		numbers = append(numbers, LNumber(value))
+		return nil
+	}
+
+	addString := func(key LString) {
+		value := string(key)
+		if _, ok := seenStrings[value]; ok {
+			return
+		}
+		seenStrings[value] = struct{}{}
+		strings = append(strings, value)
+	}
+
+	addBool := func(key LBool) {
+		value := bool(key)
+		if _, ok := seenBooleans[value]; ok {
+			return
+		}
+		seenBooleans[value] = struct{}{}
+		booleans = append(booleans, LBool(value))
+	}
+
+	if tb.array != nil {
+		for i, value := range tb.array {
+			if value != LNil {
+				if err := addNumber(LNumber(i + 1)); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	if tb.strdict != nil {
+		for key, value := range tb.strdict {
+			if value != LNil {
+				addString(LString(key))
+			}
+		}
+	}
+
+	if tb.dict != nil {
+		for key, value := range tb.dict {
+			if value == LNil {
+				continue
+			}
+			switch key := key.(type) {
+			case LNumber:
+				if err := addNumber(key); err != nil {
+					return nil, err
+				}
+			case LString:
+				addString(key)
+			case LBool:
+				addBool(key)
+			default:
+				return nil, fmt.Errorf("ordered iteration does not support %s keys", key.Type())
+			}
+		}
+	}
+
+	sort.Slice(numbers, func(i, j int) bool {
+		return float64(numbers[i]) < float64(numbers[j])
+	})
+	sort.Strings(strings)
+	sort.Slice(booleans, func(i, j int) bool {
+		return !bool(booleans[i]) && bool(booleans[j])
+	})
+
+	keys := make([]LValue, 0, len(numbers)+len(strings)+len(booleans))
+	for _, key := range numbers {
+		keys = append(keys, key)
+	}
+	for _, key := range strings {
+		keys = append(keys, LString(key))
+	}
+	for _, key := range booleans {
+		keys = append(keys, key)
+	}
+
+	return &OrderedIterator{table: tb, keys: keys}, nil
+}
+
+// Next advances to the next key that still exists and returns its current
+// value. It returns false when iteration is complete.
+func (it *OrderedIterator) Next() (LValue, LValue, bool) {
+	for it.index < len(it.keys) {
+		key := it.keys[it.index]
+		it.index++
+		value := orderedValue(it.table, key)
+		if value != LNil {
+			return key, value, true
+		}
+	}
+	return LNil, LNil, false
+}
+
+func orderedValue(tb *LTable, key LValue) LValue {
+	if number, ok := key.(LNumber); ok && isArrayKey(number) {
+		index := int(number) - 1
+		if tb.array != nil && index >= 0 && index < len(tb.array) {
+			if value := tb.array[index]; value != LNil {
+				return value
+			}
+		}
+	}
+	return tb.RawGetH(key)
+}
+
+// OrderedForEach calls cb for every numeric, string, and boolean key in
+// deterministic key order.
+func (tb *LTable) OrderedForEach(cb func(LValue, LValue)) error {
+	iterator, err := NewOrderedIterator(tb)
+	if err != nil {
+		return err
+	}
+	for {
+		key, value, ok := iterator.Next()
+		if !ok {
+			return nil
+		}
+		cb(key, value)
 	}
 }
 
