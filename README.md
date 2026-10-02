@@ -80,6 +80,23 @@ Two independent limits cap how long `Retry` runs, and they behave differently:
 
 `WithMaxElapsedTime` defaults to 15 minutes, so **both limits are active unless you override it** — pass `backoff.WithMaxElapsedTime(0)` to rely solely on the context.
 
+### Context-aware operations and per-attempt timeouts
+
+`RetryContext` works like `Retry`, but the operation receives a context. Each attempt gets a **fresh child context** derived from the context passed to `RetryContext`; with `WithAttemptTimeout` that child also carries a deadline scoped to the single attempt.
+
+```go
+_, err := backoff.RetryContext(ctx, func(ctx context.Context) (string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req)
+	// inspect resp, return a value and error as usual
+}, backoff.WithAttemptTimeout(2*time.Second))
+```
+
+- The timeout **cancels the attempt's context only**: an operation that observes it (directly or through a context-aware callee) returns, typically with `context.DeadlineExceeded`, and the attempt is retried per the policy. It does not cancel the overall context.
+- Cancelling the overall context is different: it aborts the in-flight attempt **and** stops further attempts, reported with the context's cause.
+- Each child context and its timer are released **as soon as the attempt returns** — on success as well as failure — not when `RetryContext` finishes.
+- If a deadline and a successful return happen at essentially the same time, **success wins**: an attempt that returns a nil error is accepted even if its context is already done.
+
 ## Contributing
 
 * I would like to keep this library as small as possible.

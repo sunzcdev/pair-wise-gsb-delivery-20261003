@@ -14,6 +14,12 @@ const DefaultMaxElapsedTime = 15 * time.Minute
 // RetryAfterError to control the delay before the next attempt.
 type Operation[T any] func() (T, error)
 
+// OperationContext is the function RetryContext calls. It behaves like
+// Operation, but the ctx passed to each attempt is a fresh child context
+// derived from the RetryContext context. See WithAttemptTimeout and
+// RetryContext for how that context is bounded and released.
+type OperationContext[T any] func(ctx context.Context) (T, error)
+
 // Notify is called after a failed attempt that will be retried, with the
 // operation error and the backoff duration before the next attempt. It is
 // called once per retry, not for the final error that stops Retry (a permanent
@@ -27,6 +33,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	AttemptTimeout time.Duration // Per-attempt deadline used by RetryContext.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -97,6 +104,36 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 	}
 }
 
+// WithAttemptTimeout bounds each individual attempt in RetryContext. Every
+// attempt receives a fresh child context whose deadline is this duration after
+// the attempt starts; the child is derived from the RetryContext context, so
+// cancellation of the overall context always wins and the attempt never
+// outlives it.
+//
+// The timeout only cancels the context passed to the operation; it does not
+// kill the goroutine running it. An attempt that ignores its context is
+// allowed to finish, and what it returns is what RetryContext acts on, so a
+// well-behaved operation must select on ctx.Done (or pass ctx to a context-
+// aware callee) for the bound to take effect.
+//
+// An attempt whose context deadline fires is treated like any other failed
+// attempt: the operation returns (typically with context.DeadlineExceeded)
+// and RetryContext backs off and retries according to the policy and the
+// other limits. Cancelling the overall context is different — it aborts the
+// in-flight attempt and stops any further attempts, reported with the
+// overall context's Cause.
+//
+// Each child context (and its timer) is released as soon as its attempt
+// returns, whether the attempt succeeded or failed, never held until Retry
+// finishes. The default, 0, gives each attempt the overall context with no
+// per-attempt deadline. It applies only to RetryContext; Retry passes no
+// context to its operation.
+func WithAttemptTimeout(d time.Duration) RetryOption {
+	return func(args *retryOptions) {
+		args.AttemptTimeout = d
+	}
+}
+
 // Retry attempts the operation until it succeeds, returns a Permanent error,
 // or backoff completes. It ensures the operation is executed at least once.
 //
@@ -111,7 +148,41 @@ func WithMaxElapsedTime(d time.Duration) RetryOption {
 // context, so capture ctx inside the operation if you want cancellation to
 // abort an in-flight attempt. To bound only how long backoff keeps retrying,
 // without affecting in-flight attempts, use WithMaxElapsedTime instead.
+//
+// Use RetryContext to pass a context into the operation and bound each
+// attempt independently with WithAttemptTimeout.
 func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOption) (T, error) {
+	return RetryContext(ctx, func(context.Context) (T, error) {
+		return operation()
+	}, opts...)
+}
+
+// RetryContext is Retry for an operation that takes a context. On every
+// attempt the operation is called with a fresh child context derived from
+// ctx, so the operation (or a context-aware callee) can react to
+// cancellation. With WithAttemptTimeout the child also carries a deadline
+// scoped to that single attempt.
+//
+// The child context is cancelled and its timer released as soon as the
+// attempt returns, on success as well as failure; it is never kept alive
+// until the whole retry ends. Because RetryContext runs the operation
+// synchronously, a cancelled attempt cannot leave an old invocation running
+// in the background: RetryContext waits for the operation to actually return
+// before backing off or trying again.
+//
+// Cancellation of ctx aborts an in-flight attempt (through its child) and
+// stops further attempts and the backoff wait, reported with ctx's Cause.
+// A per-attempt timeout instead only fails that attempt; RetryContext
+// continues according to the backoff policy, WithMaxTries, and
+// WithMaxElapsedTime.
+//
+// Race between a deadline and a return: a successful attempt wins. If the
+// operation returns a nil error, RetryContext returns its result even if the
+// attempt's deadline, or ctx, was cancelled at essentially the same time.
+// The return value of a completed, synchronous call is the verdict; context
+// cancellation only decides what happens to an attempt that observes it and
+// comes back with an error.
+func RetryContext[T any](ctx context.Context, operation OperationContext[T], opts ...RetryOption) (T, error) {
 	// Initialize default retry options.
 	args := &retryOptions{
 		BackOff:        NewExponentialBackOff(),
@@ -129,8 +200,14 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 	startedAt := time.Now()
 	args.BackOff.Reset()
 	for numTries := uint(1); ; numTries++ {
-		// Execute the operation.
-		res, err := operation()
+		// Give every attempt a fresh child context derived from the overall
+		// context, so per-attempt cancellation and (with WithAttemptTimeout)
+		// the deadline timer never leak across attempts. The cancel runs as
+		// soon as this iteration's operation returns — success or failure —
+		// not when the whole retry ends.
+		attemptCtx, cancelAttempt := newAttemptContext(ctx, args.AttemptTimeout)
+		res, err := operation(attemptCtx)
+		cancelAttempt()
 		if err == nil {
 			return res, nil
 		}
@@ -198,4 +275,17 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			return res, &RetryError{LastErr: lastErr, Cause: context.Cause(ctx)}
 		}
 	}
+}
+
+// newAttemptContext derives the context for a single attempt from ctx. It is
+// always cancellable so the caller can release it immediately after the
+// attempt, and carries a per-attempt deadline when WithAttemptTimeout set a
+// positive duration. The returned cancel must be called when the attempt
+// returns; because ctx is the parent, cancelling ctx still aborts the
+// attempt even if the per-attempt deadline has not fired.
+func newAttemptContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return context.WithCancel(ctx)
 }

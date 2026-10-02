@@ -116,6 +116,35 @@ func ExampleRetry_outcomes() {
 	// Output: ok
 }
 
+func ExampleRetryContext() {
+	// RetryContext passes a fresh child context to every attempt. With
+	// WithAttemptTimeout, one slow attempt is cancelled and retried even while
+	// the overall context stays open; cancelling the overall context would
+	// instead abort the in-flight attempt and stop further retries.
+	var attempts int
+	result, err := backoff.RetryContext(context.Background(),
+		func(ctx context.Context) (string, error) {
+			attempts++
+			if attempts == 1 {
+				// First attempt ignores the work and waits for its deadline.
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			return "ok", nil
+		},
+		backoff.WithAttemptTimeout(time.Millisecond),
+		backoff.WithBackOff(backoff.NewConstantBackOff(time.Millisecond)),
+		backoff.WithMaxElapsedTime(0),
+	)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	fmt.Println(result, "after", attempts, "attempts")
+	// Output: ok after 2 attempts
+}
+
 func ExampleTicker() {
 	// An operation that may fail.
 	operation := func() (string, error) {

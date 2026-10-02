@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `OperationContext`, a context-accepting operation type, and `RetryContext`, which calls it. Each attempt receives a fresh child context derived from the context passed to `RetryContext`; the child is cancelled and its timer released as soon as the attempt returns (on success or failure), not when the whole retry ends.
+- `WithAttemptTimeout` bounds each attempt independently. An attempt whose deadline fires is retried according to the policy, while cancelling the overall context aborts the in-flight attempt and stops further attempts.
+- A completed successful attempt wins the race against a cancelled or expired context: `RetryContext` returns the result when the operation returns a nil error, even if the context is already done.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed
