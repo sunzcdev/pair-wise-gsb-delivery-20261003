@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add batch permission checks through `Pundit::Context#permissions`, `Pundit.permissions` and
+  `Pundit::Authorization#pundit_permissions`. They return an ordered records x queries matrix,
+  evaluate each distinct object identity and query only once per call, reuse policy instances within
+  a call without caching results between calls, and raise a `Pundit::BatchAuthorizationError`
+  (carrying the record index and query) for missing policies, missing query methods or errors raised
+  inside policies.
 - Add support for `params.expect` using `expected_parameters` and `expected_parameters_for`. [#855](https://github.com/varvet/pundit/pull/855)
 
 ### Deprecated

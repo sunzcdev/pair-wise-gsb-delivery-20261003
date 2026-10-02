@@ -76,5 +76,11 @@ module Pundit
     def policy!(user, *args, **kwargs, &block)
       Context.new(user: user).policy!(*args, **kwargs, &block)
     end
+
+    # @see Pundit::Context#permissions
+    # @since v2.6.0
+    def permissions(user, records, queries, policy_class: nil)
+      Context.new(user: user).permissions(records, queries, policy_class: policy_class)
+    end
   end
 end

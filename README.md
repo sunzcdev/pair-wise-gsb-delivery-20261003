@@ -580,6 +580,51 @@ Pundit.policy_scope(user, Post)
 The bang methods will raise an exception if the policy does not exist, whereas
 those without the bang will return nil.
 
+## Batch permission checks
+
+Index endpoints often render many records and need to know more than one
+permission for each of them. Use `pundit_permissions` to check several queries
+against several records in one call. It returns a matrix that keeps the order
+of the records and queries you pass in:
+
+``` ruby
+def index
+  @posts = policy_scope(Post)
+  @permissions = pundit_permissions(@posts, %i[show? edit? archive?])
+end
+```
+
+``` ruby
+@permissions
+#=> [[true, false, true],   # show?, edit?, archive? for the first post
+#    [true, true,  false]]  # ... and for the second
+```
+
+Repeated records keep their place in the matrix, but each object identity and
+query is only evaluated once. Two records that share an `id` - like two
+different Active Record instances - are still judged separately. Namespaced
+records and an explicit policy class take part in their own identities:
+
+``` ruby
+Pundit::Context.new(user: user).permissions(
+  [post, [:admin, post], other_post],
+  %i[show? edit?],
+  policy_class: nil
+)
+```
+
+Policy instances are reused between the queries of one record within a single
+call, but results are never cached between calls. This lets the underlying
+records change in between batches.
+
+A query returning false is a normal denial: it stays `false` in the matrix and
+does not interrupt the other checks. A missing policy, a missing query method
+or an error raised inside a policy is a programmer error instead, and raises a
+`Pundit::BatchAuthorizationError`. The error carries the zero-based record
+`index` and the `query` name so the offending check can be located. Fix the
+cause and call the batch again; an earlier failure does not leave any cached
+state behind.
+
 ## Customize Pundit user
 
 On occasion, your controller may be unable to access `current_user`, or the method that should be invoked by Pundit may not be `current_user`. To address this, you can define a method in your controller named `pundit_user`.

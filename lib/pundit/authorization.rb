@@ -164,6 +164,26 @@ module Pundit
       pundit.policy!(record)
     end
 
+    # Checks several queries for several records and returns their results as a
+    # matrix, preserving the order of the given records and queries.
+    #
+    # Useful in index actions that render one entry per record, where every
+    # entry needs to expose e.g. `show?`, `edit?` and `archive?`.
+    #
+    # @example
+    #   render json: posts, meta: pundit_permissions(posts, %i[show? edit? archive?])
+    #
+    # @param records [Array<Object, Array>] the records to check
+    # @param queries [Array<Symbol, String>] the query methods to check
+    # @param policy_class [Class] the policy class to force for every record
+    # @raise [Pundit::BatchAuthorizationError] if a policy or query is missing or a policy raises
+    # @return [Array<Array<Boolean>>] a records x queries matrix of booleans
+    # @see Pundit::Context#permissions
+    # @since v2.6.0
+    def pundit_permissions(records, queries, policy_class: nil)
+      pundit.permissions(records, queries, policy_class: policy_class)
+    end
+
     # @!group Policy Scopes
 
     # Retrieves the policy scope for the given record.

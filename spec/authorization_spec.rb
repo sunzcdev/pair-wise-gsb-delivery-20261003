@@ -165,6 +165,34 @@ RSpec.describe Pundit::Authorization do
     end
   end
 
+  describe "#pundit_permissions" do
+    let(:mine) { Document.new(id: 1, owner: user) }
+    let(:someone_elses) { Document.new(id: 2, owner: :someone_else) }
+
+    it "returns a matrix for the current user" do
+      expect(controller.pundit_permissions([mine, someone_elses], %i[show? edit? archive?]))
+        .to eq([
+          [true, true, true],
+          [true, false, false]
+        ])
+    end
+
+    it "accepts an explicit policy class" do
+      expect(controller.pundit_permissions([comment], %i[create?], policy_class: PublicationPolicy))
+        .to eq([[true]])
+    end
+
+    it "raises a batch error with the record index and query" do
+      expect do
+        controller.pundit_permissions([mine, article], %i[show?])
+      end.to raise_error(Pundit::BatchAuthorizationError) do |error|
+        expect(error.index).to eq(1)
+        expect(error.query).to eq(:show?)
+        expect(error.record).to eq(article)
+      end
+    end
+  end
+
   describe "#pundit_policies" do
     it "returns the cache of policies" do
       expect(controller.pundit_policies).to eq({})

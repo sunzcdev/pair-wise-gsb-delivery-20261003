@@ -95,6 +95,67 @@ module Pundit
       cached_find(record, &:policy!)
     end
 
+    # Checks several queries for several records in a single batch.
+    #
+    # Each record is checked against every query, and a matrix is returned
+    # that keeps the order of the given records and queries:
+    #
+    #   context.permissions([post, comment], [:show?, :edit?, :archive?])
+    #   # => [[true, false, true], [true, true, false]]
+    #
+    # Duplicate records keep their position in the matrix, but the policy
+    # query is only evaluated once per distinct object identity and query.
+    # Two records that share an `id` (or compare equal with `==`) but are
+    # distinct objects are evaluated separately. Namespaced records (passed as
+    # arrays) and records checked with an explicit `policy_class` take part in
+    # their own identities.
+    #
+    # Query results are never cached between calls, because the underlying
+    # records may have changed. Policy instances may be reused for the
+    # different queries of a single record within one call.
+    #
+    # A query returning falsey is a normal denial and stays `false` in the
+    # matrix without interrupting the other checks. Programmer errors, on the
+    # other hand - a policy that cannot be found, a missing query method or an
+    # error raised from inside a policy - raise a {BatchAuthorizationError}
+    # carrying the record index and query name.
+    #
+    # @param records [Array<Object, Array>] the records to check, possibly namespaced
+    # @param queries [Array<Symbol, String>] the predicate methods to check on each policy
+    # @param policy_class [Class, nil] the policy class to force for every record
+    # @raise [BatchAuthorizationError] if a policy is missing, a query is undefined or a policy raises
+    # @return [Array<Array<Boolean>>] a records x queries matrix of booleans
+    # @since v2.6.0
+    def permissions(records, queries, policy_class: nil)
+      query_names = queries.map { |query| query.to_sym }
+
+      # Identity => policy instance. A fresh map is used for every call, so
+      # neither policies nor their results leak across batches.
+      policies = {}
+      # [Identity, query] => boolean. De-duplicates repeated object/query pairs
+      # within this single call only.
+      results = {}
+
+      records.each_with_index.map do |record, index|
+        identity = batch_identity(record, policy_class)
+        policy = policies[identity] ||= begin
+          build_batch_policy(record, policy_class)
+        rescue Pundit::Error => error
+          raise batch_error(index: index, query: query_names.first, record: pundit_model(record), cause: error)
+        end
+
+        query_names.map do |query|
+          key = [identity, query]
+
+          results.fetch(key) do
+            results[key] = !!policy.public_send(query)
+          end
+        rescue StandardError => error
+          raise batch_error(index: index, query: query, record: pundit_model(record), cause: error)
+        end
+      end
+    end
+
     # @!endgroup
 
     # @!group Scopes
@@ -185,6 +246,50 @@ module Pundit
     # @since v2.3.2
     def pundit_model(record)
       record.is_a?(Array) ? record.last : record
+    end
+
+    # Builds the identity used to de-duplicate records within one call to
+    # {#permissions}. Identity is based on object identity rather than `==` or
+    # `hash`, so two distinct objects with the same id are treated separately,
+    # while the namespace and explicit policy class are part of the identity.
+    #
+    # @api private
+    # @since v2.6.0
+    def batch_identity(record, policy_class)
+      namespace, model =
+        if record.is_a?(Array)
+          [record[0...-1].map(&:object_id), pundit_model(record)]
+        else
+          [[], record]
+        end
+
+      [namespace, model.object_id, policy_class&.object_id]
+    end
+
+    # Instantiates the policy used for a record during a batch check.
+    #
+    # Unlike {#cached_find}, this never uses the request level policy cache and
+    # never stores the resulting policy, so batch results cannot be reused once
+    # a record's state has changed.
+    #
+    # @api private
+    # @since v2.6.0
+    def build_batch_policy(record, policy_class)
+      return policy_class.new(user, pundit_model(record)) if policy_class
+
+      klass = policy_finder(record).policy!
+
+      begin
+        klass.new(user, pundit_model(record))
+      rescue ArgumentError
+        raise InvalidConstructorError, "Invalid #<#{klass}> constructor is called"
+      end
+    end
+
+    # @api private
+    # @since v2.6.0
+    def batch_error(index:, query:, record:, cause:)
+      BatchAuthorizationError.new(index: index, query: query, record: record, cause: cause)
     end
   end
 end
