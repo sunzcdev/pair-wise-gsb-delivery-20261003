@@ -49,7 +49,10 @@ module Dry
       # @api private
       def call_unsafe(hash)
         try(hash) { |failure|
-          raise MapError, failure.error.message
+          error = failure.error
+          raise error if error.is_a?(Recursive::CyclicInputError)
+
+          raise MapError, error.message
         }.input
       end
 
@@ -99,14 +102,22 @@ module Dry
           failures = []
 
           input.each do |k, v|
-            res_k = key_type.try(k)
-            res_v = value_type.try(v)
+            res_k = Recursive.guard.descend(k) { key_type.try(k) }
+            res_v = Recursive.guard.descend(k) { value_type.try(v) }
 
             if res_k.failure?
+              if res_k.error.is_a?(Recursive::CyclicInputError)
+                return failure(input, res_k.error)
+              end
+
               failures << res_k.error
             elsif output.key?(res_k.input)
               failures << CoercionError.new("duplicate coerced hash key #{res_k.input.inspect}")
             elsif res_v.failure?
+              if res_v.error.is_a?(Recursive::CyclicInputError)
+                return failure(input, res_v.error)
+              end
+
               failures << res_v.error
             else
               output[res_k.input] = res_v.input

@@ -32,8 +32,14 @@ module Dry
           Implication,
           Implication::Constrained
         ] => :visit_composition,
+        Recursive::Scope => :visit_recursive,
+        Recursive::Reference => :visit_recursive_ref,
         Any.class => :visit_any
       }.flat_map { |k, v| Array(k).map { |kk| [kk, v] } }.to_h
+
+      # Thread-local key used to avoid printing the same named recursive
+      # body twice within a single {#call}.
+      RECURSIVE_SEEN_KEY = :"dry_types_printer_recursive_seen"
 
       def initialize
         @composition_printers = {}
@@ -42,7 +48,15 @@ module Dry
 
       def call(type)
         output = "".dup
-        visit(type) { |str| output << str }
+        previous = Thread.current[RECURSIVE_SEEN_KEY]
+        Thread.current[RECURSIVE_SEEN_KEY] = {}
+
+        begin
+          visit(type) { |str| output << str }
+        ensure
+          Thread.current[RECURSIVE_SEEN_KEY] = previous
+        end
+
         "#<Dry::Types[#{output}]>"
       end
 
@@ -60,6 +74,31 @@ module Dry
       end
 
       def visit_any(_) = yield "Any"
+
+      def visit_recursive(scope)
+        seen = Thread.current[RECURSIVE_SEEN_KEY] ||= {}
+
+        members = scope.definitions.names.map { |name|
+          if seen[name]
+            "#{name}: Recursive<#{name}>"
+          else
+            seen[name] = true
+            begin
+              body = scope.definitions.bodies[name]
+              printed = visit(body) { |str| str }
+              "#{name}: #{printed}"
+            ensure
+              seen.delete(name)
+            end
+          end
+        }.join("; ")
+
+        yield "Recursive(#{scope.root_name}){#{members}}>"
+      end
+
+      def visit_recursive_ref(reference)
+        yield "Recursive<#{reference.name}>"
+      end
 
       def visit_array(type)
         visit_options(EMPTY_HASH, type.meta) do |opts|

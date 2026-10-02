@@ -28,8 +28,8 @@ module Dry
         # @api private
         def call_unsafe(input)
           if primitive?(input)
-            input.each_with_object([]) do |el, output|
-              coerced = member.call_unsafe(el)
+            input.each_with_index.each_with_object([]) do |(el, index), output|
+              coerced = Recursive.guard.descend(index) { member.call_unsafe(el) }
 
               output << coerced unless Undefined.equal?(coerced)
             end
@@ -46,10 +46,12 @@ module Dry
           if primitive?(input)
             failed = false
 
-            result = input.each_with_object([]) do |el, output|
-              coerced = member.call_safe(el) { |out = el|
-                failed = true
-                out
+            result = input.each_with_index.each_with_object([]) do |(el, index), output|
+              coerced = Recursive.guard.descend(index) {
+                member.call_safe(el) { |out = el|
+                  failed = true
+                  out
+                }
               }
 
               output << coerced unless Undefined.equal?(coerced)
@@ -74,7 +76,9 @@ module Dry
           if primitive?(input)
             output = []
 
-            result = input.map { |el| member.try(el) }
+            result = input.each_with_index.map { |el, index|
+              Recursive.guard.descend(index) { member.try(el) }
+            }
             result.each do |r|
               output << r.input unless Undefined.equal?(r.input)
             end

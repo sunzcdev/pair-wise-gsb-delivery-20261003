@@ -40,12 +40,13 @@ module Dry
           "#{root}/dry-types.rb",
           "#{root}/dry/types/extensions",
           "#{root}/dry/types/printer",
+          "#{root}/dry/types/recursive",
           "#{root}/dry/types/spec/types.rb",
           "#{root}/dry/types/{#{%w[
             compat constraints core
             errors extensions inflector
             module json params
-            printer version
+            printer recursive version
           ].join(",")}}.rb"
         )
       end
@@ -255,5 +256,6 @@ module Dry
 end
 
 require "dry/types/core" # load built-in types
+require "dry/types/recursive"
 require "dry/types/extensions"
 require "dry/types/printer"

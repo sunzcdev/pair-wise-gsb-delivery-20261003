@@ -9,6 +9,15 @@ and this project adheres to [Break Versioning](https://www.taoensso.com/break-ve
 
 ### Added
 
+- Named recursive types via `Dry::Types.recursive(:name)` and
+  `Dry::Types::Recursive.define`. References are named and resolved lazily,
+  so self-references and groups of mutually referencing types can be
+  described without expanding the infinite schema. Unclosed references are
+  reported when the definition finishes. Cyclic *input* values raise a
+  `Recursive::CyclicInputError` carrying the exact position, definitions
+  that consume no input raise `Recursive::NonProductiveRecursionError`, and
+  AST export/rebuild (`:recursive` / `:recursive_ref`) always terminates.
+
 ### Changed
 
 ### Deprecated

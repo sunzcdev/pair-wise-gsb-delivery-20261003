@@ -92,37 +92,47 @@ module Dry
       # rubocop:disable Metrics/PerceivedComplexity
       def try(input)
         if primitive?(input)
-          success = true
           output = {}
           result = {}
+          cyclic_failure = nil
+          success = true
 
           input.each do |key, value|
             k = @transform_key.(key)
             type = @name_key_map[k]
 
             if type
-              key_result = type.try(value)
+              key_result = Recursive.guard.descend(k) { type.try(value) }
               result[k] = key_result
               output[k] = key_result.input
               success &&= key_result.success?
+
+              if key_result.failure? && key_result.error.is_a?(Recursive::CyclicInputError)
+                cyclic_failure = failure(output, key_result.error)
+                break
+              end
             elsif strict?
               success = false
             end
           end
 
-          if output.size < keys.size
-            resolve_missing_keys(output, options) do
-              success = false
-            end
-          end
-
-          success &&= primitive?(output)
-
-          if success
-            failure = nil
+          if cyclic_failure
+            failure = cyclic_failure
           else
-            error = CoercionError.new("#{input} doesn't conform schema", meta: result)
-            failure = failure(output, error)
+            if output.size < keys.size
+              resolve_missing_keys(output, options) do
+                success = false
+              end
+            end
+
+            success &&= primitive?(output)
+
+            if success
+              failure = nil
+            else
+              error = CoercionError.new("#{input} doesn't conform schema", meta: result)
+              failure = failure(output, error)
+            end
           end
         else
           failure = failure(input, CoercionError.new("#{input} must be a hash"))
@@ -325,7 +335,9 @@ module Dry
 
           if type
             begin
-              result[k] = type.call_unsafe(value)
+              result[k] = Recursive.guard.descend(k) { type.call_unsafe(value) }
+            rescue Recursive::CyclicInputError
+              raise
             rescue ConstraintError => exception
               raise SchemaError.new(type.name, value, exception.result)
             rescue CoercionError => exception
@@ -354,7 +366,9 @@ module Dry
           type = @name_key_map[k]
 
           if type
-            result[k] = type.call_safe(value, &block)
+            result[k] = Recursive.guard.descend(k) {
+              type.call_safe(value, &block)
+            }
           elsif strict?
             yield
           end

@@ -49,6 +49,16 @@ module Dry
 
         # @api private
         def visit_any(_) = ::Object
+
+        # @api private
+        def visit_recursive(node)
+          root_name, members, = node
+          body = members.assoc(root_name).last
+          visit(body)
+        end
+
+        # @api private
+        def visit_recursive_ref(_node) = ::Object
       end
 
       # @return [Compiler]

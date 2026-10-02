@@ -118,6 +118,49 @@ module Dry
         registry["any"].meta(meta)
       end
 
+      # Build a whole recursive group. Bodies are compiled in assignment
+      # order while references resolve lazily, so self and mutual references
+      # are reconstructed correctly.
+      def visit_recursive(node)
+        root_name, members, meta = node
+        definitions = Recursive::Definitions.new
+
+        # Pre-create references so compiled bodies can point at names whose
+        # bodies are compiled later (or at themselves).
+        members.each do |name, _|
+          definitions.reference!(name)
+        end
+
+        @recursive_definitions ||= []
+        @recursive_definitions << definitions
+
+        begin
+          members.each do |name, body_ast|
+            definitions.define!(name, visit(body_ast))
+          end
+
+          definitions.finalize!
+          definitions.scope(root_name).meta(meta)
+        ensure
+          @recursive_definitions.pop
+        end
+      end
+
+      def visit_recursive_ref(node)
+        name, meta = node
+        definitions =
+          if @recursive_definitions && !@recursive_definitions.empty?
+            @recursive_definitions.last
+          end
+
+        unless definitions
+          raise ::ArgumentError,
+            "recursive reference #{name.inspect} found outside of a recursive AST group"
+        end
+
+        definitions.reference!(name).meta(meta)
+      end
+
       def compile_fn(fn)
         type, *node = fn
 

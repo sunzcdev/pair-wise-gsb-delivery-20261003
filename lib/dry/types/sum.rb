@@ -34,7 +34,18 @@ module Dry
       #
       # @api private
       def call_unsafe(input)
-        left.call_safe(input) { right.call_unsafe(input) }
+        guard = Recursive.guard
+
+        if guard.active?
+          guard.attempt do |reject|
+            left.call_safe(input) {
+              reject.()
+              right.call_unsafe(input)
+            }
+          end
+        else
+          left.call_safe(input) { right.call_unsafe(input) }
+        end
       end
 
       # @param [Object] input
@@ -43,19 +54,47 @@ module Dry
       #
       # @api private
       def call_safe(input, &block)
-        left.call_safe(input) { right.call_safe(input, &block) }
+        guard = Recursive.guard
+
+        if guard.active?
+          guard.attempt do |reject|
+            left.call_safe(input) {
+              reject.()
+              right.call_safe(input, &block)
+            }
+          end
+        else
+          left.call_safe(input) { right.call_safe(input, &block) }
+        end
       end
 
       # @param [Object] input
       #
       # @api public
       def try(input)
-        left.try(input) do
-          right.try(input) do |failure|
-            if block_given?
-              yield(failure)
-            else
-              failure
+        guard = Recursive.guard
+
+        if guard.active?
+          guard.attempt do |reject|
+            left.try(input) do
+              reject.()
+              right.try(input) do |failure|
+                if block_given?
+                  yield(failure)
+                else
+                  failure
+                end
+              end
+            end
+          end
+        else
+          left.try(input) do
+            right.try(input) do |failure|
+              if block_given?
+                yield(failure)
+              else
+                failure
+              end
             end
           end
         end

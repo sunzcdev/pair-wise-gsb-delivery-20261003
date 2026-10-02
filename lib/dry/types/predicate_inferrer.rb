@@ -188,6 +188,20 @@ module Dry
           raise ::NotImplementedError, "map types are not supported yet"
         end
 
+        # Recursive types infer predicates from the root body; references on
+        # their own carry no predicate information (they must not be visited,
+        # otherwise inference would recurse forever).
+        #
+        # @api private
+        def visit_recursive(node)
+          root_name, members, = node
+          body = members.assoc(root_name).last
+          visit(body)
+        end
+
+        # @api private
+        def visit_recursive_ref(_node) = EMPTY_ARRAY
+
         private
 
         # @api private
