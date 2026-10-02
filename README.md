@@ -239,6 +239,44 @@ the state machine will attempt to transition to that state. Add comma separated 
 In this case `set_process` won't be called, job will transition to running state and callback will receive
 `:defragmentation` as parameter
 
+To separate destination states from business arguments, enable explicit parameters:
+
+```ruby
+  class DefaultReview
+    include AASM
+
+    aasm do
+      state :pending, initial: true
+      state :approved
+
+      event :review do
+        transitions from: :pending, to: :approved
+      end
+    end
+  end
+
+  class ExplicitReview
+    include AASM
+
+    aasm explicit_parameters: true do
+      state :pending, initial: true
+      state :approved
+
+      event :review do
+        transitions from: :pending, to: :approved
+      end
+    end
+  end
+
+  DefaultReview.new.review(:approved)       # :approved is the destination
+  ExplicitReview.new.review(:approved, to: :approved)
+  # => the first :approved is a business argument; to: selects the destination
+```
+
+Without `to:`, explicit mode still selects the first allowed transition in definition order.
+Specifying a destination that is not reachable from the current state fails before event guards
+and callbacks run.
+
 #### Error Handling
 In case of an error during the event processing the error is rescued and passed to `:error`
 callback, which can handle it or re-raise it for further propagation.

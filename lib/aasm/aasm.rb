@@ -84,6 +84,8 @@ private
   # element from args if it is a valid to_state for
   # the event given the from_state
   def process_args(event, from_state, *args)
+    return args if event.state_machine.config.explicit_parameters
+
     # If the first arg doesn't respond to to_sym then
     # it isn't a symbol or string so it can't be a state
     # name anyway
@@ -93,17 +95,42 @@ private
     end
     return args
   end
+  ruby2_keywords :process_args
 
   def aasm_fire_event(state_machine_name, event_name, options, *args, &block)
     event = self.class.aasm(state_machine_name).state_machine.events[event_name]
+    to_state = ::AASM::NO_VALUE
+
+    if event.state_machine.config.explicit_parameters
+      to_state, args = AASM::Core::Event.extract_to_state(args)
+      if to_state != ::AASM::NO_VALUE && !event.reachable_transition?(self, to_state)
+        old_state = aasm(state_machine_name).state_object_for_name(aasm(state_machine_name).current_state)
+        return aasm_failed(state_machine_name, event_name, old_state, event.failed_callbacks)
+      end
+    end
+
     begin
       old_state = aasm(state_machine_name).state_object_for_name(aasm(state_machine_name).current_state)
 
       fire_default_callbacks(event, *process_args(event, aasm(state_machine_name).current_state, *args))
 
-      if may_fire_to = event.may_fire?(self, *args)
+      may_fire_to =
+        if event.state_machine.config.explicit_parameters
+          event.may_fire_transition(self, to_state, *args)
+        else
+          event.may_fire?(self, *args)
+        end
+
+      if may_fire_to
         fire_exit_callbacks(old_state, *process_args(event, aasm(state_machine_name).current_state, *args))
-        if new_state_name = event.fire(self, {:may_fire => may_fire_to}, *args)
+        new_state_name =
+          if event.state_machine.config.explicit_parameters
+            event.fire_transition(self, {:may_fire => may_fire_to}, to_state, *args)
+          else
+            event.fire(self, {:may_fire => may_fire_to}, *args)
+          end
+
+        if new_state_name
           aasm_fired(state_machine_name, event, old_state, new_state_name, options, *args, &block)
         else
           aasm_failed(state_machine_name, event_name, old_state, event.failed_callbacks)
@@ -136,13 +163,15 @@ private
       *processed_args
     )
   end
+  ruby2_keywords :fire_default_callbacks
 
   def fire_exit_callbacks(old_state, *processed_args)
     old_state.fire_callbacks(:before_exit, self, *processed_args)
     old_state.fire_callbacks(:exit, self, *processed_args)
   end
+  ruby2_keywords :fire_exit_callbacks
 
-  def aasm_fired(state_machine_name, event, old_state, new_state_name, options, *args)
+  def aasm_fired(state_machine_name, event, old_state, new_state_name, options, *args, &block)
     persist = options[:persist]
 
     new_state = aasm(state_machine_name).state_object_for_name(new_state_name)
@@ -204,5 +233,8 @@ private
       false
     end
   end
+  ruby2_keywords :aasm_fired
+
+  ruby2_keywords :aasm_fire_event
 
 end

@@ -70,7 +70,7 @@ module AASM
 
         def invoke_with_fixed_arity
           req_args = args[0..(subject_arity - 1)]
-          if req_args[0].is_a?(Hash)
+          if req_args[0].is_a?(Hash) && Hash.ruby2_keywords_hash?(req_args[0])
             record.__send__(subject, **req_args[0])
           else
             record.__send__(subject, *req_args)

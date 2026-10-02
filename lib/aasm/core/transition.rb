@@ -40,14 +40,16 @@ module AASM::Core
     end
 
     def allowed?(obj, *args)
-      invoke_callbacks_compatible_with_guard(@guards, obj, args, :guard => true) &&
-      invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true)
+      invoke_callbacks_compatible_with_guard(@guards, obj, args, :guard => true, :keyword_arguments => keyword_arguments_flag?(args)) &&
+      invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true, :keyword_arguments => keyword_arguments_flag?(args))
     end
+    ruby2_keywords :allowed?
 
     def execute(obj, *args)
-      invoke_callbacks_compatible_with_guard(event.state_machine.global_callbacks[:after_all_transitions], obj, args)
-      invoke_callbacks_compatible_with_guard(@after, obj, args)
+      invoke_callbacks_compatible_with_guard(event.state_machine.global_callbacks[:after_all_transitions], obj, args, keyword_arguments: keyword_arguments_flag?(args))
+      invoke_callbacks_compatible_with_guard(@after, obj, args, keyword_arguments: keyword_arguments_flag?(args))
     end
+    ruby2_keywords :execute
 
     def ==(obj)
       @from == obj.from && @to == obj.to
@@ -58,8 +60,9 @@ module AASM::Core
     end
 
     def invoke_success_callbacks(obj, *args)
-      _fire_callbacks(@success, obj, args)
+      _fire_callbacks(@success, obj, args, keyword_arguments: keyword_arguments_flag?(args))
     end
+    ruby2_keywords :invoke_success_callbacks
 
     private
 
@@ -69,14 +72,17 @@ module AASM::Core
         record.aasm(event.state_machine.name).to_state = @to if record.aasm(event.state_machine.name).respond_to?(:to_state=)
       end
 
-      Invoker.new(code, record, args)
+      Invoker.new(code, record, args, keyword_arguments: options.fetch(:keyword_arguments, false))
              .with_options(options)
              .with_failures(failures)
              .invoke
     end
+    def _fire_callbacks(code, record, args, keyword_arguments: false)
+      Invoker.new(code, record, args, keyword_arguments: keyword_arguments).invoke
+    end
 
-    def _fire_callbacks(code, record, args)
-      Invoker.new(code, record, args).invoke
+    def keyword_arguments_flag?(args)
+      args.last.is_a?(Hash) && Hash.ruby2_keywords_hash?(args.last)
     end
 
   end

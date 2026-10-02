@@ -107,22 +107,32 @@ module AASM
 
     def may_fire_event?(name, *args)
       if event = @instance.class.aasm(@name).state_machine.events[name]
-        !!event.may_fire?(@instance, *args)
+        if explicit_parameters?
+          to_state, args = AASM::Core::Event.extract_to_state(args)
+          return false if to_state != ::AASM::NO_VALUE && !event.reachable_transition?(@instance, to_state)
+
+          !!event.may_fire_transition(@instance, to_state, *args)
+        else
+          !!event.may_fire?(@instance, *args)
+        end
       else
         false # unknown event
       end
     end
+    ruby2_keywords :may_fire_event?
 
     def fire(event_name, *args, &block)
       event_exists?(event_name)
       @instance.send(event_method_name(event_name), *args, &block)
     end
+    ruby2_keywords :fire
 
     def fire!(event_name, *args, &block)
       event_exists?(event_name, true)
       bang_event_name = "#{event_method_name(event_name)}!".to_sym
       @instance.send(bang_event_name, *args, &block)
     end
+    ruby2_keywords :fire!
 
     def set_current_state_with_persistence(state)
       save_success = @instance.aasm_write_state(state, @name)
@@ -148,6 +158,10 @@ module AASM
 
       event_error = bang ? "#{event_name}!" : event_name
       raise AASM::UndefinedEvent, "Event :#{event_error} doesn't exist" if event.nil?
+    end
+
+    def explicit_parameters?
+      @instance.class.aasm(@name).state_machine.config.explicit_parameters
     end
   end
 end

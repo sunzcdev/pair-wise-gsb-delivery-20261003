@@ -49,10 +49,11 @@ module AASM::Core
       action = @options[action]
       catch :halt_aasm_chain do
         action.is_a?(Array) ?
-                action.each {|a| _fire_callbacks(a, record, args)} :
-                _fire_callbacks(action, record, args)
+                action.each {|a| _fire_callbacks(a, record, args, keyword_arguments: keyword_arguments_flag?(args))} :
+                _fire_callbacks(action, record, args, keyword_arguments: keyword_arguments_flag?(args))
       end
     end
+    ruby2_keywords :fire_callbacks
 
     def display_name
       @display_name = begin
@@ -83,8 +84,12 @@ module AASM::Core
       self
     end
 
-    def _fire_callbacks(action, record, args)
-      Invoker.new(action, record, args).invoke
+    def _fire_callbacks(action, record, args, keyword_arguments: false)
+      Invoker.new(action, record, args, keyword_arguments: keyword_arguments).invoke
+    end
+
+    def keyword_arguments_flag?(args)
+      args.last.is_a?(Hash) && Hash.ruby2_keywords_hash?(args.last)
     end
 
   end

@@ -38,6 +38,14 @@ module AASM
     # namespace reader methods and constants
     attr_accessor :namespace
 
+    # separate the destination state from event arguments
+    attr_accessor :explicit_parameters
+    alias_method :explicit_to_state, :explicit_parameters
+
+    def explicit_to_state=(value)
+      self.explicit_parameters = value
+    end
+
     # Configure a logger, with default being a Logger to STDERR
     attr_accessor :logger
 

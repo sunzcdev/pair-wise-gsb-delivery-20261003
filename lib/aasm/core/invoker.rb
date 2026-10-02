@@ -21,10 +21,12 @@ module AASM
       # +record+  - invoking record
       # +args+    - arguments which will be passed to the callback
 
-      def initialize(subject, record, args)
+      def initialize(subject, record, args, keyword_arguments: nil)
         @subject = subject
         @record = record
+        @keyword_arguments = keyword_arguments.nil? ? legacy_keyword_arguments?(args) : keyword_arguments
         @args = args
+        @args = mark_keyword_arguments(args) if @keyword_arguments
         @options = {}
         @failures = []
         @default_return_value = DEFAULT_RETURN_VALUE
@@ -74,6 +76,19 @@ module AASM
         self
       end
 
+      def mark_keyword_arguments(args)
+        keyword_arguments = args.last
+        if keyword_arguments.is_a?(Hash) && !Hash.ruby2_keywords_hash?(keyword_arguments)
+          keyword_arguments = Hash.ruby2_keywords_hash(keyword_arguments)
+          return args[0..-2] + [keyword_arguments]
+        end
+        args
+      end
+
+      def legacy_keyword_arguments?(args)
+        args.last.is_a?(Hash) && !Hash.ruby2_keywords_hash?(args.last)
+      end
+
       ##
       # Find concrete invoker for specified subject and invoker it,
       # or return default value set by #DEFAULT_RETURN_VALUE or
@@ -101,7 +116,7 @@ module AASM
       end
 
       def sub_invoke(new_subject)
-        self.class.new(new_subject, record, args)
+        self.class.new(new_subject, record, args, keyword_arguments: @keyword_arguments)
             .with_failures(failures)
             .with_options(options)
             .invoke
@@ -109,19 +124,19 @@ module AASM
 
       def proc_invoker
         @proc_invoker ||= Invokers::ProcInvoker
-                          .new(subject, record, args)
+                          .new(subject, record, args, keyword_arguments: @keyword_arguments)
                           .with_failures(failures)
       end
 
       def class_invoker
         @class_invoker ||= Invokers::ClassInvoker
-                           .new(subject, record, args)
+                           .new(subject, record, args, keyword_arguments: @keyword_arguments)
                            .with_failures(failures)
       end
 
       def literal_invoker
         @literal_invoker ||= Invokers::LiteralInvoker
-                             .new(subject, record, args)
+                             .new(subject, record, args, keyword_arguments: @keyword_arguments)
                              .with_failures(failures)
       end
     end

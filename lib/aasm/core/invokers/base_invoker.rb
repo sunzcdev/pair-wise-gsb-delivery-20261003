@@ -20,10 +20,15 @@ module AASM
         # +record+  - invoking record
         # +args+    - arguments which will be passed to the callback
 
-        def initialize(subject, record, args)
+        def initialize(subject, record, args, keyword_arguments: nil)
           @subject = subject
           @record = record
-          @args = args
+          keyword_arguments = args.last.is_a?(Hash) && !Hash.ruby2_keywords_hash?(args.last) if keyword_arguments.nil?
+          @args = if keyword_arguments && args.last.is_a?(Hash) && !Hash.ruby2_keywords_hash?(args.last)
+                    args[0..-2] + [Hash.ruby2_keywords_hash(args.last)]
+                  else
+                    args
+                  end
           @result = false
           @failures = []
         end
@@ -73,7 +78,7 @@ module AASM
         ##
         # Parse arguments to separate keyword arguments from positional arguments
         def parse_arguments
-          if args.last.is_a?(Hash)
+          if args.last.is_a?(Hash) && Hash.ruby2_keywords_hash?(args.last)
             [args[0..-2], args.last]
           else
             [args, nil]

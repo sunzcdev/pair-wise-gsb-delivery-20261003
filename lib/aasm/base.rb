@@ -51,6 +51,10 @@ module AASM
       # Set to true to namespace reader methods and constants
       configure :namespace, false
 
+      # Set to true to require destination states to be passed as the :to option
+      configure :explicit_parameters, false
+      configure :explicit_to_state, false
+
       # Configure a logger, with default being a Logger to STDERR
       configure :logger, Logger.new(STDERR)
 
