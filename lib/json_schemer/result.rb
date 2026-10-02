@@ -10,18 +10,18 @@ module JSONSchemer
   end
 
   Result = Struct.new(:source, :instance, :instance_location, :keyword_location, :valid, :nested, :type, :annotation, :details, :ignore_nested, :nested_key) do
-    def output(output_format)
+    def output(output_format, redactor = nil)
       case output_format
       when 'classic'
-        classic
+        classic(redactor)
       when 'flag'
         flag
       when 'basic'
-        basic
+        basic(redactor)
       when 'detailed'
-        detailed
+        detailed(redactor)
       when 'verbose'
-        verbose
+        verbose(redactor)
       else
         raise UnknownOutputFormat, output_format
       end
@@ -74,7 +74,13 @@ module JSONSchemer
       )
     end
 
-    def to_output_unit
+    def output_error(redactor)
+      message = error
+      return message if @x_error || !redactor.leaked?(message)
+      source.error(:formatted_instance_location => formatted_instance_location, :details => details)
+    end
+
+    def to_output_unit(redactor = nil)
       out = {
         'valid' => valid,
         'keywordLocation' => resolved_keyword_location,
@@ -82,29 +88,30 @@ module JSONSchemer
         'instanceLocation' => resolved_instance_location
       }
       if valid
-        out['annotation'] = annotation if annotation
+        out['annotation'] = redactor.redact(annotation) if annotation && redactor
+        out['annotation'] = annotation if annotation && !redactor
       else
-        out['error'] = error
+        out['error'] = redactor ? output_error(redactor) : error
         out['x-error'] = true if @x_error
         out['i18n'] = true if @i18n
       end
       out
     end
 
-    def to_classic
+    def to_classic(redactor = nil)
       schema = source.schema
       out = {
-        'data' => instance,
+        'data' => redactor ? redactor.instance_at(resolved_instance_location) : instance,
         'data_pointer' => resolved_instance_location,
         'schema' => schema.value,
         'schema_pointer' => schema.schema_pointer,
         'root_schema' => schema.root.value,
         'type' => type || CLASSIC_ERROR_TYPES[source.class]
       }
-      out['error'] = error
+      out['error'] = redactor ? output_error(redactor) : error
       out['x-error'] = true if @x_error
       out['i18n'] = true if @i18n
-      out['details'] = details if details
+      out['details'] = redactor ? redactor.redact(details) : details if details
       out
     end
 
@@ -112,20 +119,20 @@ module JSONSchemer
       { 'valid' => valid }
     end
 
-    def basic
-      out = to_output_unit
+    def basic(redactor = nil)
+      out = to_output_unit(redactor)
       if nested&.any?
         out[nested_key] = Enumerator.new do |yielder|
           results = [self]
           while result = results.pop
             if result.ignore_nested || !result.nested&.any?
-              yielder << result.to_output_unit
+              yielder << result.to_output_unit(redactor)
             else
               previous_results_size = results.size
               result.nested.reverse_each do |nested_result|
                 results << nested_result if nested_result.valid == valid
               end
-              yielder << result.to_output_unit unless (results.size - previous_results_size) == 1
+              yielder << result.to_output_unit(redactor) unless (results.size - previous_results_size) == 1
             end
           end
         end
@@ -133,45 +140,45 @@ module JSONSchemer
       out
     end
 
-    def detailed
-      return to_output_unit if ignore_nested || !nested&.any?
+    def detailed(redactor = nil)
+      return to_output_unit(redactor) if ignore_nested || !nested&.any?
       matching_results = nested.select { |nested_result| nested_result.valid == valid }
       if matching_results.size == 1
-        matching_results.first.detailed
+        matching_results.first.detailed(redactor)
       else
-        out = to_output_unit
+        out = to_output_unit(redactor)
         if matching_results.any?
           out[nested_key] = Enumerator.new do |yielder|
-            matching_results.each { |nested_result| yielder << nested_result.detailed }
+            matching_results.each { |nested_result| yielder << nested_result.detailed(redactor) }
           end
         end
         out
       end
     end
 
-    def verbose
-      out = to_output_unit
+    def verbose(redactor = nil)
+      out = to_output_unit(redactor)
       if nested&.any?
         out[nested_key] = Enumerator.new do |yielder|
-          nested.each { |nested_result| yielder << nested_result.verbose }
+          nested.each { |nested_result| yielder << nested_result.verbose(redactor) }
         end
       end
       out
     end
 
-    def classic
+    def classic(redactor = nil)
       Enumerator.new do |yielder|
         unless valid
           results = [self]
           while result = results.pop
             if result.ignore_nested || !result.nested&.any?
-              yielder << result.to_classic
+              yielder << result.to_classic(redactor)
             else
               previous_results_size = results.size
               result.nested.reverse_each do |nested_result|
                 results << nested_result if nested_result.valid == valid
               end
-              yielder << result.to_classic if (results.size - previous_results_size) == 0
+              yielder << result.to_classic(redactor) if (results.size - previous_results_size) == 0
             end
           end
         end

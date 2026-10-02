@@ -144,6 +144,37 @@ schemer.bundle
 #       "http://example.com/schema/two"=>{"minimum"=>11, "$id"=>"http://example.com/schema/two", "$schema"=>"https://json-schema.org/draft/2020-12/schema"}}}
 ```
 
+### Redacting Sensitive Data
+
+`validate` accepts an optional `sensitive_paths` option. Each path is an exact [JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901) into the instance; the value at that location is replaced with `"[Redacted]"` in the output. Hiding an object or array hides its entire subtree. Validation always runs against the original instance — only the returned diagnostics are redacted, and the input is not modified. Error locations, keywords, and validity are preserved; instance values embedded in error messages or `details` are removed while `x-error` copy is left untouched.
+
+```ruby
+schemer = JSONSchemer.schema({
+  'type' => 'object',
+  'properties' => {
+    'password' => { 'minLength' => 10 },
+    'name' => { 'minLength' => 5 }
+  }
+})
+
+data = { 'password' => 'short', 'name' => 'ab' }
+
+schemer.validate(data, :sensitive_paths => ['/password']).to_a
+# => [{"data"=>"[Redacted]",
+#      "data_pointer"=>"/password",
+#      "schema"=>{"minLength"=>10},
+#      "schema_pointer"=>"/properties/password",
+#      "root_schema"=>{...},
+#      "type"=>"minLength",
+#      "error"=>"string length at `/password` is less than: 10"},
+#     {"data"=>"ab",
+#      "data_pointer"=>"/name",
+#      ...}]
+
+# keys containing `/` or `~` use JSON Pointer escaping (`~1` and `~0`)
+schemer.validate(data, :output_format => 'basic', :sensitive_paths => ['/a~1b~0c', '/tokens/0'])
+```
+
 ## Options
 
 ```ruby
