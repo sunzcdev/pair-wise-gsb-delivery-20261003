@@ -78,6 +78,7 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 		c.debugInfo,
 		span,
 	)
+	program.SetFunctionSymbols(c.functionNames, c.functionSigs, c.functionKinds)
 	return
 }
 
@@ -91,6 +92,9 @@ type compiler struct {
 	constants      []any
 	constantsIndex map[any]int
 	functions      []Function
+	functionNames  []string
+	functionSigs   []string
+	functionKinds  []byte
 	functionsIndex map[string]int
 	debugInfo      map[string]string
 	nodes          []ast.Node
@@ -173,24 +177,24 @@ func (c *compiler) addVariable(name string) int {
 }
 
 // emitFunction adds builtin.Function.Func to the program.functions and emits call opcode.
-func (c *compiler) emitFunction(fn *builtin.Function, argsLen int) {
+func (c *compiler) emitFunction(fn *builtin.Function, argsLen int, kind byte) {
 	switch argsLen {
 	case 0:
-		c.emit(OpCall0, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall0, c.addFunction(fn.Name, fn.Func, fn.Type().String(), kind))
 	case 1:
-		c.emit(OpCall1, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall1, c.addFunction(fn.Name, fn.Func, fn.Type().String(), kind))
 	case 2:
-		c.emit(OpCall2, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall2, c.addFunction(fn.Name, fn.Func, fn.Type().String(), kind))
 	case 3:
-		c.emit(OpCall3, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpCall3, c.addFunction(fn.Name, fn.Func, fn.Type().String(), kind))
 	default:
-		c.emit(OpLoadFunc, c.addFunction(fn.Name, fn.Func))
+		c.emit(OpLoadFunc, c.addFunction(fn.Name, fn.Func, fn.Type().String(), kind))
 		c.emit(OpCallN, argsLen)
 	}
 }
 
 // addFunction adds builtin.Function.Func to the program.functions and returns its index.
-func (c *compiler) addFunction(name string, fn Function) int {
+func (c *compiler) addFunction(name string, fn Function, signature string, kind byte) int {
 	if fn == nil {
 		panic("function is nil")
 	}
@@ -199,6 +203,9 @@ func (c *compiler) addFunction(name string, fn Function) int {
 	}
 	p := len(c.functions)
 	c.functions = append(c.functions, fn)
+	c.functionNames = append(c.functionNames, name)
+	c.functionSigs = append(c.functionSigs, signature)
+	c.functionKinds = append(c.functionKinds, kind)
 	c.functionsIndex[name] = p
 	c.debugInfo[fmt.Sprintf("func_%d", p)] = name
 	return p
@@ -815,7 +822,7 @@ func (c *compiler) CallNode(node *ast.CallNode) {
 	if ident, ok := node.Callee.(*ast.IdentifierNode); ok {
 		if c.config != nil {
 			if fn, ok := c.config.Functions[ident.Value]; ok {
-				c.emitFunction(fn, len(node.Arguments))
+				c.emitFunction(fn, len(node.Arguments), FunctionKindHost)
 				return
 			}
 		}
@@ -1172,7 +1179,7 @@ func (c *compiler) BuiltinNode(node *ast.BuiltinNode) {
 			c.debugInfo[fmt.Sprintf("const_%d", id)] = node.Name
 			c.emit(OpCallSafe, len(node.Arguments))
 		} else if f.Func != nil {
-			c.emitFunction(f, len(node.Arguments))
+			c.emitFunction(f, len(node.Arguments), FunctionKindBuiltin)
 		}
 		return
 	}

@@ -265,6 +265,31 @@ func Run(program *vm.Program, env any) (any, error) {
 	return vm.Run(program, env)
 }
 
+// HostFunc binds a stable function symbol to its implementation in another
+// process that loads a previously saved program. Signature is optional; when
+// set it must match the compile-time function signature (see expr.Function).
+type HostFunc = vm.HostFunc
+
+// Hosts maps stable function symbol names to their host implementations.
+type Hosts = vm.Hosts
+
+// SaveProgram serializes a compiled program into a stable, checksummed
+// artifact. Only bytecode, stable constants, type information and function
+// symbols are stored; Go pointers such as host functions are never written.
+func SaveProgram(program *vm.Program) ([]byte, error) {
+	return vm.SaveArtifact(program)
+}
+
+// LoadProgram reads an artifact, verifies its checksum, versions,
+// instructions, jump targets and stack usage, and binds host functions by
+// stable symbol name. env is optional; when provided its struct fields and
+// methods are re-checked against the indexes recorded at compile time.
+// A program is never returned when verification fails, no matter how
+// successfully it deserialized.
+func LoadProgram(data []byte, hosts Hosts, env any) (*vm.Program, error) {
+	return vm.LoadArtifact(data, hosts, env)
+}
+
 // Eval parses, compiles and runs given input.
 func Eval(input string, env any) (any, error) {
 	if _, ok := env.(Option); ok {

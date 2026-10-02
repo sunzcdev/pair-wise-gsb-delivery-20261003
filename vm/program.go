@@ -26,8 +26,14 @@ type Program struct {
 	locations []file.Location
 	variables int
 	functions []Function
-	debugInfo map[string]string
-	span      *Span
+	// functionNames and functionSigs are stable, pointer-free descriptions of
+	// the same entries as functions. They are populated by the compiler and by
+	// LoadArtifact; nil for programs built directly through NewProgram.
+	functionNames []string
+	functionSigs  []string
+	functionKinds []byte
+	debugInfo     map[string]string
+	span          *Span
 }
 
 // NewProgram returns a new Program. It's used by the compiler.
@@ -55,6 +61,73 @@ func NewProgram(
 		debugInfo: debugInfo,
 		span:      span,
 	}
+}
+
+// NewProgramFromArtifact rebuilds a Program from the stable pieces stored in a
+// serialized artifact (see SaveArtifact). It contains no Go pointers: callers
+// must bind host functions through LoadArtifact, which also re-validates the
+// whole program before it can be executed.
+func NewProgramFromArtifact(
+	source file.Source,
+	locations []file.Location,
+	variables int,
+	constants []any,
+	bytecode []Opcode,
+	arguments []int,
+	functions []Function,
+	functionNames []string,
+	functionSigs []string,
+	functionKinds []byte,
+	debugInfo map[string]string,
+) *Program {
+	return &Program{
+		source:        source,
+		locations:     locations,
+		variables:     variables,
+		Constants:     constants,
+		Bytecode:      bytecode,
+		Arguments:     arguments,
+		functions:     functions,
+		functionNames: functionNames,
+		functionSigs:  functionSigs,
+		functionKinds: functionKinds,
+		debugInfo:     debugInfo,
+	}
+}
+
+// Variables returns the number of variables slots used by the program.
+func (program *Program) Variables() int {
+	return program.variables
+}
+
+// Functions returns host functions bound to the program.
+func (program *Program) Functions() []Function {
+	return program.functions
+}
+
+// FunctionSymbolKind classifies a function slot.
+const (
+	// FunctionKindHost is a user-provided host function that must be
+	// re-supplied through LoadArtifact.
+	FunctionKindHost byte = 1
+	// FunctionKindBuiltin is a function provided by the builtin table of
+	// the runtime binary.
+	FunctionKindBuiltin byte = 2
+)
+
+// FunctionSymbols returns the stable symbol name, declared function type
+// signature and origin kind for each host function slot. Signature is empty
+// when the compiler did not have a declared static signature.
+func (program *Program) FunctionSymbols() (names, signatures []string, kinds []byte) {
+	return program.functionNames, program.functionSigs, program.functionKinds
+}
+
+// SetFunctionSymbols attaches stable symbol metadata to host function slots.
+// It is used by the compiler when building a program.
+func (program *Program) SetFunctionSymbols(names, signatures []string, kinds []byte) {
+	program.functionNames = names
+	program.functionSigs = signatures
+	program.functionKinds = kinds
 }
 
 // Source returns origin file.Source.
