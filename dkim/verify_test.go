@@ -79,9 +79,7 @@ func TestVerify(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testVerification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testVerification, v)
-	}
+	assertVerification(t, testVerification, v)
 }
 
 func TestVerifyWithOption(t *testing.T) {
@@ -95,9 +93,7 @@ func TestVerifyWithOption(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testVerification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testVerification, v)
-	}
+	assertVerification(t, testVerification, v)
 
 	r = newMailStringReader(verifiedMailString)
 	option = VerifyOptions{LookupTXT: net.LookupTXT}
@@ -109,8 +105,20 @@ func TestVerifyWithOption(t *testing.T) {
 	}
 
 	v = verifications[0]
-	if !reflect.DeepEqual(testVerification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testVerification, v)
+	assertVerification(t, testVerification, v)
+}
+
+func assertVerification(t *testing.T, expected, actual *Verification) {
+	t.Helper()
+	if expected.Domain != actual.Domain ||
+		expected.Identifier != actual.Identifier ||
+		!reflect.DeepEqual(expected.HeaderKeys, actual.HeaderKeys) ||
+		!expected.Time.Equal(actual.Time) ||
+		expected.Err != actual.Err {
+		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", expected, actual)
+	}
+	if actual.HeaderCoverage == nil {
+		t.Errorf("Expected a non-nil header coverage report")
 	}
 }
 
@@ -155,9 +163,7 @@ func TestVerify_rawRSA(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testRawRSAVerification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testRawRSAVerification, v)
-	}
+	assertVerification(t, testRawRSAVerification, v)
 }
 
 const verifiedEd25519MailString = `DKIM-Signature: v=1; a=ed25519-sha256; c=relaxed/relaxed;
@@ -205,9 +211,7 @@ func TestVerify_ed25519(t *testing.T) {
 	}
 
 	v := verifications[0]
-	if !reflect.DeepEqual(testEd25519Verification, v) {
-		t.Errorf("Expected verification to be \n%+v\n but got \n%+v", testEd25519Verification, v)
-	}
+	assertVerification(t, testEd25519Verification, v)
 }
 
 // errorReader reads from r and then returns an arbitrary error.

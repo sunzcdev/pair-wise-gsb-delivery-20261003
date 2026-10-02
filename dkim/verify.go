@@ -74,6 +74,16 @@ type Verification struct {
 	// The list of signed header fields.
 	HeaderKeys []string
 
+	// HeaderCoverage reports which header instances the signature actually
+	// protects, resolved from "h=" against the message headers. It is computed
+	// even when cryptographic verification fails.
+	HeaderCoverage *HeaderCoverage
+	// PolicyResult is the outcome of VerifyOptions.Policy against
+	// HeaderCoverage. It is nil when no policy is configured. A signature may
+	// have a nil Err (cryptographically valid) but a non-nil
+	// PolicyResult.Err, or vice versa: the two conclusions are independent.
+	PolicyResult *PolicyResult
+
 	// The time that this signature was created. If unknown, it's set to zero.
 	Time time.Time
 	// The expiration time. If the signature doesn't expire, it's set to zero.
@@ -99,6 +109,11 @@ type VerifyOptions struct {
 	// signatures are verified, the rest are ignored and ErrTooManySignatures
 	// is returned. If zero, there is no maximum.
 	MaxVerifications int
+	// Policy is an optional application-level policy checked against the
+	// headers actually covered by each signature. It does not affect
+	// cryptographic verification; failures are reported separately in
+	// Verification.PolicyResult.
+	Policy *Policy
 }
 
 // Verify checks if a message's signatures are valid. It returns one
@@ -137,7 +152,7 @@ func VerifyWithOptions(r io.Reader, options *VerifyOptions) ([]*Verification, er
 	var verifs []*Verification
 	if len(signatures) == 1 {
 		// If there is only one signature - just verify it.
-		v, err := verify(h, bufr, h[signatures[0].i], signatures[0].v, options)
+		v, err := verify(h, bufr, signatures[0].i, h[signatures[0].i], signatures[0].v, options)
 		if err != nil && !IsTempFail(err) && !IsPermFail(err) && !isFail(err) {
 			return nil, err
 		}
@@ -175,7 +190,7 @@ func parallelVerify(r io.Reader, h header, signatures []*signature, options *Ver
 		pipeWriters[i] = pw
 
 		go func() {
-			v, err := verify(h, pr, h[sig.i], sig.v, options)
+			v, err := verify(h, pr, sig.i, h[sig.i], sig.v, options)
 
 			// Make sure we consume the whole reader, otherwise io.Copy on
 			// other side can block forever.
@@ -209,7 +224,7 @@ func parallelVerify(r io.Reader, h header, signatures []*signature, options *Ver
 	return verifications, nil
 }
 
-func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOptions) (*Verification, error) {
+func verify(h header, r io.Reader, sigIndex int, sigField, sigValue string, options *VerifyOptions) (*Verification, error) {
 	verif := new(Verification)
 
 	params, err := parseHeaderParams(sigValue)
@@ -239,6 +254,8 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 	}
 
 	headerKeys := parseTagList(params["h"])
+	verif.HeaderCoverage = buildHeaderCoverage(h, headerKeys, sigIndex)
+
 	ok := false
 	for _, k := range headerKeys {
 		if strings.EqualFold(k, "from") {
@@ -250,6 +267,10 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 		return verif, permFailError("From field not signed")
 	}
 	verif.HeaderKeys = headerKeys
+
+	if options != nil && options.Policy != nil {
+		verif.PolicyResult = verif.HeaderCoverage.Evaluate(options.Policy)
+	}
 
 	if timeStr, ok := params["t"]; ok {
 		t, err := parseTime(timeStr)

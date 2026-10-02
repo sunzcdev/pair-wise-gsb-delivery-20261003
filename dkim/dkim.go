@@ -11,6 +11,14 @@
 // zone. See [RFC 6376 appendix C]. You can use the dkim-keygen tool included
 // in go-msgauth to generate the key and the TXT record.
 //
+// Does a passing signature guarantee that From or Subject is protected? No:
+// cryptographic verification only proves the signed data is unmodified. An
+// application that needs to know exactly which header instances are signed
+// (important when a header occurs more than once) can inspect
+// [Verification.HeaderCoverage], or supply a [Policy] via [VerifyOptions] and
+// read [Verification.PolicyResult]. The two conclusions are kept separate: a
+// signature can verify cryptographically yet fail the policy.
+//
 // [RFC 6376 appendix C]: https://tools.ietf.org/html/rfc6376#appendix-C
 package dkim
 

@@ -140,6 +140,18 @@ func sortParams(params map[string]string) ([]string, string, bool) {
 type headerPicker struct {
 	h      header
 	picked map[string]int
+	// picks records, for each Pick call in order, the resolved header field
+	// name (lower-cased) and the index of the header instance that was
+	// selected, or -1 when the reference resolved to a nonexistent instance
+	// (an oversigning slot).
+	picks []pick
+}
+
+// pick is a single reference from the signature's h= tag list to a header
+// instance (or to a nonexistent, oversigning slot).
+type pick struct {
+	key string
+	at  int
 }
 
 func newHeaderPicker(h header) *headerPicker {
@@ -163,10 +175,12 @@ func (p *headerPicker) Pick(key string) string {
 
 		if at == 0 {
 			p.picked[key]++
+			p.picks = append(p.picks, pick{key, i})
 			return kv
 		}
 		at--
 	}
 
+	p.picks = append(p.picks, pick{key, -1})
 	return ""
 }
