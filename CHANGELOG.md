@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+* Add `fetchSize` DSN option to use MySQL server-side read-only cursors for
+  prepared statements. When set to a positive value, result rows are fetched
+  in batches of `fetchSize` via `COM_STMT_FETCH` during `Rows.Next`, instead
+  of receiving the entire result set at once. Early `Rows.Close` drains the
+  current batch and closes the cursor (zero-row `COM_STMT_FETCH`) so the
+  statement and pooled connection carry no residual results.
+
 ## v1.10.1 (2026-09-02)
 
 * Fix `Config.FormatDSN()` dropping `Addr` when `Net` is empty.

@@ -56,7 +56,7 @@ func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(args, cursorTypeNoCursor)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
@@ -105,8 +105,12 @@ func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
 	if stmt.mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
+	cursor := cursorTypeNoCursor
+	if stmt.mc.cfg.FetchSize > 0 {
+		cursor = cursorTypeReadOnly
+	}
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(args, cursor)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
@@ -125,15 +129,42 @@ func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
 	if resLen > 0 {
 		rows.mc = mc
 		if metadataFollows {
-			if rows.rs.columns, err = mc.readColumns(resLen, stmt.columns); err != nil {
+			if rows.rs.columns, err = mc.readColumnDefinitions(resLen, stmt.columns); err != nil {
 				return nil, err
 			}
 			stmt.columns = rows.rs.columns
 		} else {
+			rows.rs.columns = stmt.columns
+		}
+
+		if cursor == cursorTypeReadOnly {
+			// The server always terminates the metadata with an indicator
+			// packet. Read it to learn whether a cursor was opened or the
+			// rows are being streamed directly.
+			cursorExists, ierr := mc.readCursorIndicator()
+			if ierr != nil {
+				return nil, ierr
+			}
+			if cursorExists {
+				rows.stmtID = stmt.id
+				rows.fetchSize = mc.cfg.FetchSize
+				rows.cursorOpen = true
+				rows.rowInBatch = 0
+				rows.batchRequested = false
+			} else {
+				// The server did not open a cursor (for example for a
+				// result without a row-producing statement); rows follow
+				// directly. Leave cursorOpen false to use the streaming
+				// path; readCursorIndicator already consumed the
+				// terminating EOF packet.
+			}
+		} else {
+			// No cursor requested: consume the optional trailing EOF packet
+			// after column definitions. Without CLIENT_DEPRECATE_EOF it is
+			// always present.
 			if err = mc.skipEof(); err != nil {
 				return nil, err
 			}
-			rows.rs.columns = stmt.columns
 		}
 	} else {
 		rows.rs.done = true

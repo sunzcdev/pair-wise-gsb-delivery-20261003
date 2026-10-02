@@ -281,6 +281,31 @@ Default:        false
 
 Toggles zlib compression. false by default.
 
+##### `fetchSize`
+
+```
+Type:           decimal number
+Default:        0
+```
+
+When `fetchSize` is greater than zero, prepared statements that produce a result set
+use a read-only **server-side cursor**. The server keeps the result on its side and
+the driver retrieves rows in batches of `fetchSize` with `COM_STMT_FETCH` as
+`Rows.Next` is called, instead of receiving the entire result set at once. This
+bounds the memory used for large query results.
+
+Set it to the number of rows to request per round trip, for example
+`fetchSize=1000`. The default `0` keeps the previous behavior (the whole result
+set is streamed without a cursor).
+
+If iteration stops before the end (for example via `Rows.Close` after a context
+cancellation), the driver drains the current batch and closes the cursor with a
+zero-row `COM_STMT_FETCH` so that no cursor or pending rows remain before the
+statement is reused or the connection is returned to the pool.
+
+This option requires a server that supports prepared-statement cursors
+(MySQL 5.7+/8.0 and compatible MariaDB servers).
+
 ##### `interpolateParams`
 
 ```

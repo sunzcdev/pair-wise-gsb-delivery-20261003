@@ -56,6 +56,7 @@ type Config struct {
 	ReadTimeout          time.Duration     // I/O read timeout
 	WriteTimeout         time.Duration     // I/O write timeout
 	Logger               Logger            // Logger
+	FetchSize            int               // FetchSize is the number of rows retrieved on each COM_STMT_FETCH when using server-side cursors
 	// DialFunc specifies the dial function for creating connections
 	DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
@@ -354,6 +355,10 @@ func (cfg *Config) FormatDSN() string {
 		writeDSNParam(&buf, &hasParam, "clientFoundRows", "true")
 	}
 
+	if cfg.FetchSize > 0 {
+		writeDSNParam(&buf, &hasParam, "fetchSize", strconv.Itoa(cfg.FetchSize))
+	}
+
 	if charsets := cfg.charsets; len(charsets) > 0 {
 		writeDSNParam(&buf, &hasParam, "charset", strings.Join(charsets, ","))
 	}
@@ -629,6 +634,16 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			cfg.compress, isBool = readBool(value)
 			if !isBool {
 				return errors.New("invalid bool value: " + value)
+			}
+
+		// Number of rows fetched at a time through a server-side cursor
+		case "fetchSize":
+			cfg.FetchSize, err = strconv.Atoi(value)
+			if err != nil {
+				return
+			}
+			if cfg.FetchSize < 0 {
+				return errors.New("invalid fetchSize value: " + value)
 			}
 
 		// Enable client side placeholder substitution

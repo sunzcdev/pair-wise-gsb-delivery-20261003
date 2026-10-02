@@ -117,6 +117,17 @@ const (
 	comStmtFetch
 )
 
+// COM_STMT_EXECUTE flags
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+type cursorType byte
+
+const (
+	cursorTypeNoCursor   cursorType = 0x00 // CURSOR_TYPE_NO_CURSOR
+	cursorTypeReadOnly   cursorType = 0x01 // CURSOR_TYPE_READ_ONLY
+	cursorTypeForUpdate  cursorType = 0x02 // CURSOR_TYPE_FOR_UPDATE
+	cursorTypeScrollable cursorType = 0x04 // CURSOR_TYPE_SCROLLABLE
+)
+
 // https://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnType
 type fieldType byte
 

@@ -37,6 +37,15 @@ type mockConn struct {
 	maxReads      int
 	maxWrites     int
 	writeErrors   map[int]error
+	// blockWrite, when set and returning a non-nil channel, makes that
+	// write number block until the channel is closed. Used to emulate an
+	// in-flight command during context cancellation.
+	blockWrite func(writeNo int) chan struct{}
+	// reply, when set, is invoked for every write. It may inspect the
+	// recorded commands and return bytes to queue as the server reply.
+	reply func(written []byte) []byte
+	// server, when set, is used with cursorServer.
+	server *cursorServer
 }
 
 func (m *mockConn) Read(b []byte) (n int, err error) {
@@ -59,6 +68,15 @@ func (m *mockConn) Write(b []byte) (n int, err error) {
 		return 0, errConnClosed
 	}
 
+	if m.blockWrite != nil {
+		if ch := m.blockWrite(m.writes + 1); ch != nil {
+			<-ch
+			if m.closed {
+				return 0, errConnClosed
+			}
+		}
+	}
+
 	m.writes++
 	if err := m.writeErrors[m.writes]; err != nil {
 		return 0, err
@@ -69,6 +87,15 @@ func (m *mockConn) Write(b []byte) (n int, err error) {
 
 	n = len(b)
 	m.written = append(m.written, b...)
+
+	if m.server != nil {
+		// Parse only the newly written packet(s), then queue a reply.
+		m.server.parseCommands(b)
+		if reply := m.server.replyFor(m.server.cmds[len(m.server.cmds)-1]); reply != nil {
+			m.data = append(m.data, reply...)
+		}
+		return
+	}
 
 	if n > 0 && len(m.queuedReplies) > 0 {
 		m.data = m.queuedReplies[0]
@@ -124,7 +151,7 @@ func TestWriteExecutePacketValidatesArgsBeforeWriting(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
-	})
+	}, cursorTypeNoCursor)
 	if err == nil {
 		t.Fatal("expected invalid time error")
 	}
@@ -147,7 +174,7 @@ func TestWriteExecutePacketValidatesSizeBeforeWriting(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		int64(1),
-	})
+	}, cursorTypeNoCursor)
 	if err != ErrPktTooLarge {
 		t.Fatalf("unexpected error: got %v, want %v", err, ErrPktTooLarge)
 	}
@@ -167,7 +194,7 @@ func TestWriteExecutePacketSendsLongDataBeforeExecute(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64),         // 64 'a' bytes as a []byte long-data parameter.
 		string(bytes.Repeat([]byte{'b'}, 64)), // 64 'b' bytes as a string long-data parameter.
-	})
+	}, cursorTypeNoCursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +230,7 @@ func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes sent successfully as long data.
 		bytes.Repeat([]byte{'b'}, 64), // 64 'b' bytes whose long-data write fails.
-	})
+	}, cursorTypeNoCursor)
 	if err != errBadConnNoWrite {
 		t.Fatalf("unexpected error: got %v, want %v", err, errBadConnNoWrite)
 	}

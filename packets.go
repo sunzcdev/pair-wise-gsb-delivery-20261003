@@ -702,6 +702,20 @@ func (mc *okHandler) handleOkPacket(data []byte) error {
 // Read Packets as Field Packets until EOF-Packet or an Error appears
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset_column_definition.html#sect_protocol_com_query_response_text_resultset_column_definition_41
 func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, error) {
+	columns, err := mc.readColumnDefinitions(count, old)
+	if err != nil {
+		return nil, err
+	}
+	// skip EOF packet if client does not support deprecateEOF
+	if err := mc.skipEof(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+// readColumnDefinitions reads count column definition packets without
+// consuming the trailing EOF packet.
+func (mc *mysqlConn) readColumnDefinitions(count int, old []mysqlField) ([]mysqlField, error) {
 	columns := make([]mysqlField, count)
 	if len(old) != count {
 		old = nil
@@ -795,11 +809,6 @@ func (mc *mysqlConn) readColumns(count int, old []mysqlField) ([]mysqlField, err
 
 		// Decimals [uint8]
 		columns[i].decimals = data[pos]
-	}
-
-	// skip EOF packet if client does not support deprecateEOF
-	if err := mc.skipEof(); err != nil {
-		return nil, err
 	}
 	return columns, nil
 }
@@ -923,6 +932,43 @@ func (mc *mysqlConn) skipEof() error {
 		}
 	}
 	return nil
+}
+
+// readCursorIndicator reads the EOF/OK packet that terminates a prepared
+// statement execute response when CURSOR_TYPE_READ_ONLY was requested.
+// Unlike an ordinary result set, this indicator is always sent, even when
+// CLIENT_DEPRECATE_EOF is negotiated. It reports whether the server actually
+// opened a cursor (SERVER_STATUS_CURSOR_EXISTS). When no cursor is open the
+// packet is the normal end-of-rows marker and any rows the server chose to
+// stream directly follow on the connection.
+func (mc *mysqlConn) readCursorIndicator() (bool, error) {
+	data, err := mc.readPacket()
+	if err != nil {
+		return false, err
+	}
+	if data[0] == iERR {
+		return false, mc.handleErrorPacket(data)
+	}
+	if data[0] != iEOF {
+		return false, ErrMalformPkt
+	}
+	mc.status = readResultSetRowStatus(mc, data)
+	return mc.status&statusCursorExists != 0, nil
+}
+
+// readResultSetRowStatus reads the server status out of a terminating packet
+// of a binary/text result set: either a legacy EOF packet or, when
+// clientDeprecateEOF is negotiated, an OK packet headed by 0xFE.
+func readResultSetRowStatus(mc *mysqlConn, data []byte) statusFlag {
+	if mc.capabilities&clientDeprecateEOF == 0 {
+		// EOF packet
+		// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_basic_eof_packet.html
+		return readStatus(data[3:])
+	}
+	// OK Packet with an 0xFE header
+	_, _, n := readLengthEncodedInteger(data[1:])   // affected_rows
+	_, _, m := readLengthEncodedInteger(data[1+n:]) // last_insert_id
+	return readStatus(data[1+n+m:])
 }
 
 func (mc *mysqlConn) skipColumns(n int) error {
@@ -1056,7 +1102,7 @@ type stmtLongData struct {
 
 // Execute Prepared Statement
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
-func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
+func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value, cursorType cursorType) error {
 	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
 			"argument count mismatch (got: %d; has: %d)",
@@ -1091,8 +1137,9 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// statement_id [4 bytes]
 	binary.LittleEndian.PutUint32(data[5:], stmt.id)
 
-	// flags (0: CURSOR_TYPE_NO_CURSOR) [1 byte]
-	data[9] = 0x00
+	// flags [1 byte]
+	// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+	data[9] = byte(cursorType)
 
 	// iteration_count (uint32(1)) [4 bytes]
 	binary.LittleEndian.PutUint32(data[10:], 1)
@@ -1271,6 +1318,57 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	return err
 }
 
+// writeStmtFetchPacket sends a COM_STMT_FETCH command requesting up to
+// numRows rows from the server-side cursor identified by stmtID.
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_fetch.html
+func (mc *mysqlConn) writeStmtFetchPacket(stmtID uint32, numRows int) error {
+	// 1 byte command, 4 bytes stmtID, 4 bytes numRows
+	data, err := mc.buf.takeSmallBuffer(4 + 1 + 4 + 4)
+	if err != nil {
+		return err
+	}
+
+	mc.resetSequence()
+
+	data[4] = comStmtFetch
+	binary.LittleEndian.PutUint32(data[5:], stmtID)
+	binary.LittleEndian.PutUint32(data[9:], uint32(numRows))
+
+	if err := mc.writePacket(data); err != nil {
+		return err
+	}
+	mc.syncSequence()
+	return nil
+}
+
+// readBatchTerminator reads the packet that terminates a COM_STMT_FETCH
+// batch (an EOF/OK packet). It reports whether the server marked the result
+// set complete with SERVER_STATUS_LAST_ROW_SENT.
+func (rows *binaryRows) readBatchTerminator() (bool, error) {
+	mc := rows.mc
+	data, err := mc.readPacket()
+	if err != nil {
+		return false, err
+	}
+
+	if data[0] == iERR {
+		rows.cursorOpen = false
+		rows.rs.done = true
+		rows.mc = nil
+		return false, mc.handleErrorPacket(data)
+	}
+
+	if data[0] != iEOF {
+		rows.cursorOpen = false
+		rows.rs.done = true
+		rows.mc = nil
+		return false, ErrMalformPkt
+	}
+
+	mc.status = readResultSetRowStatus(mc, data)
+	return mc.status&statusLastRowSent != 0, nil
+}
+
 // For each remaining resultset in the stream, discards its rows and updates
 // mc.affectedRows and mc.insertIds.
 func (mc *okHandler) discardResults() error {
@@ -1304,15 +1402,7 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 	if data[0] != iOK {
 		// EOF/OK Packet
 		if data[0] == iEOF {
-			if rows.mc.capabilities&clientDeprecateEOF == 0 {
-				// EOF packet
-				rows.mc.status = readStatus(data[3:])
-			} else {
-				// OK Packet with an 0xFE header
-				_, _, n := readLengthEncodedInteger(data[1:])
-				_, _, m := readLengthEncodedInteger(data[1+n:])
-				rows.mc.status = readStatus(data[1+n+m:])
-			}
+			rows.mc.status = readResultSetRowStatus(rows.mc, data)
 			rows.rs.done = true
 			if !rows.HasNextResultSet() {
 				rows.mc = nil
@@ -1325,6 +1415,13 @@ func (rows *binaryRows) readRow(dest []driver.Value) error {
 		// Error otherwise
 		return mc.handleErrorPacket(data)
 	}
+	return rows.parseRow(data, dest)
+}
+
+// parseRow decodes a single binary result set row packet (which starts with
+// the 0x00 packet header) into dest.
+func (rows *binaryRows) parseRow(data []byte, dest []driver.Value) error {
+	var err error
 
 	// NULL-bitmap,  [(column-count + 7 + 2) / 8 bytes]
 	pos := 1 + (len(dest)+7+2)>>3

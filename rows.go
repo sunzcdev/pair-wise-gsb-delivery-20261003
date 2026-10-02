@@ -26,6 +26,22 @@ type mysqlRows struct {
 	mc     *mysqlConn
 	rs     resultSet
 	finish func()
+
+	// Server-side cursor state. Only used by binaryRows when the statement
+	// was executed with CURSOR_TYPE_READ_ONLY.
+	stmtID    uint32
+	fetchSize int
+	// cursorOpen is true while a server-side cursor is open and the client
+	// may request more batches with COM_STMT_FETCH.
+	cursorOpen bool
+	// rowInBatch counts the binary row packets already consumed from the
+	// current batch. When it reaches fetchSize the next packet is the
+	// batch terminating EOF/OK packet.
+	rowInBatch int
+	// batchRequested tracks whether the current batch has been requested
+	// from the server. The first batch is not sent until the first call to
+	// Next.
+	batchRequested bool
 }
 
 type binaryRows struct {
@@ -151,7 +167,12 @@ func (rows *mysqlRows) Close() (err error) {
 
 	// Remove unread packets from stream
 	if !rows.rs.done {
-		err = mc.skipRows()
+		if rows.cursorOpen {
+			err = rows.closeCursor()
+			rows.cursorOpen = false
+		} else {
+			err = mc.skipRows()
+		}
 	}
 	if err == nil {
 		handleOk := mc.clearResult()
@@ -171,6 +192,74 @@ func (rows *mysqlRows) HasNextResultSet() (b bool) {
 	return rows.mc.status&statusMoreResultsExists != 0
 }
 
+// closeCursor releases a server-side cursor that is still open when the
+// caller stops iterating early. Per the protocol a COM_STMT_FETCH with
+// numRows = 0 asks the server to close the cursor, and the server replies
+// with the final EOF/OK packet carrying SERVER_STATUS_LAST_ROW_SENT. This
+// guarantees no cursor or pending rows remain associated with the connection
+// before it is reused or returned to the pool.
+func (rows *mysqlRows) closeCursor() error {
+	mc := rows.mc
+	if mc == nil {
+		return nil
+	}
+
+	// First drain the batch that is already in flight. After the
+	// rowInBatch row packets already consumed, this batch still contains
+	// fetchSize-rowInBatch row packets followed by one terminating
+	// EOF/OK packet. A short final batch ends earlier.
+	alreadyFinished := false
+	if rows.batchRequested {
+		// Read the rest of the in-flight batch (rows plus its terminator).
+		for {
+			data, err := mc.readPacket()
+			if err != nil {
+				return err
+			}
+			if data[0] != iOK {
+				if data[0] == iERR {
+					rows.mc = nil
+					return mc.handleErrorPacket(data)
+				}
+				mc.status = readResultSetRowStatus(mc, data)
+				if mc.status&statusLastRowSent != 0 {
+					alreadyFinished = true
+				}
+				break
+			}
+			rows.rowInBatch++
+		}
+	}
+
+	if alreadyFinished {
+		return nil
+	}
+
+	if err := mc.writeStmtFetchPacket(rows.stmtID, 0); err != nil {
+		return err
+	}
+
+	// The server closes the cursor and replies with the final EOF/OK
+	// packet carrying SERVER_STATUS_LAST_ROW_SENT.
+	for {
+		data, err := mc.readPacket()
+		if err != nil {
+			return err
+		}
+		switch data[0] {
+		case iERR:
+			rows.mc = nil
+			return mc.handleErrorPacket(data)
+		case iEOF:
+			mc.status = readResultSetRowStatus(mc, data)
+			if mc.status&statusLastRowSent != 0 {
+				return nil
+			}
+		}
+		// Any other packet is an unexpected trailing row; skip it.
+	}
+}
+
 func (rows *mysqlRows) nextResultSet() (int, error) {
 	if rows.mc == nil {
 		return 0, io.EOF
@@ -181,8 +270,15 @@ func (rows *mysqlRows) nextResultSet() (int, error) {
 
 	// Remove unread packets from stream
 	if !rows.rs.done {
-		if err := rows.mc.skipRows(); err != nil {
-			return 0, err
+		if rows.cursorOpen {
+			if err := rows.closeCursor(); err != nil {
+				return 0, err
+			}
+			rows.cursorOpen = false
+		} else {
+			if err := rows.mc.skipRows(); err != nil {
+				return 0, err
+			}
 		}
 		rows.rs.done = true
 	}
@@ -234,6 +330,70 @@ func (rows *binaryRows) Next(dest []driver.Value) error {
 			return err
 		}
 
+		// Server-side cursor: rows are fetched in batches with
+		// COM_STMT_FETCH. Each batch contains up to fetchSize rows
+		// followed by a terminating EOF/OK packet.
+		if rows.cursorOpen {
+			if !rows.batchRequested {
+				if err := rows.sendFetch(); err != nil {
+					return err
+				}
+				rows.batchRequested = true
+				rows.rowInBatch = 0
+			} else if rows.rowInBatch == rows.fetchSize {
+				// The previous batch's rows are all consumed; read its
+				// terminator and, unless the cursor is exhausted, request
+				// the following batch.
+				lastRow, err := rows.readBatchTerminator()
+				if err != nil {
+					return err
+				}
+				if lastRow {
+					rows.cursorOpen = false
+					rows.rs.done = true
+					if !rows.HasNextResultSet() {
+						rows.mc = nil
+					}
+					return io.EOF
+				}
+				if err := rows.sendFetch(); err != nil {
+					return err
+				}
+				rows.rowInBatch = 0
+			}
+
+			// Read the next packet. It is normally a binary row; if it is
+			// already the terminator, the batch contained fewer than
+			// fetchSize rows and this is the final packet.
+			data, err := mc.readPacket()
+			if err != nil {
+				return err
+			}
+			if data[0] == iEOF || data[0] == iERR {
+				lastRow, err := rows.handleBatchEnd(data)
+				if err != nil {
+					return err
+				}
+				if lastRow {
+					rows.cursorOpen = false
+					rows.rs.done = true
+					if !rows.HasNextResultSet() {
+						rows.mc = nil
+					}
+					return io.EOF
+				}
+				// Defensive: short batch without LAST_ROW_SENT is illegal
+				// for MySQL cursors; surface it rather than loop forever.
+				return ErrMalformPkt
+			}
+			if err := rows.parseRow(data, dest); err != nil {
+				return err
+			}
+			rows.rowInBatch++
+			rows.convertTinyInt1ToBool(dest)
+			return nil
+		}
+
 		// Fetch next row from stream
 		if err := rows.readRow(dest); err != nil {
 			return err
@@ -242,6 +402,28 @@ func (rows *binaryRows) Next(dest []driver.Value) error {
 		return nil
 	}
 	return io.EOF
+}
+
+// sendFetch sends COM_STMT_FETCH for the next batch.
+func (rows *binaryRows) sendFetch() error {
+	return rows.mc.writeStmtFetchPacket(rows.stmtID, rows.fetchSize)
+}
+
+// handleBatchEnd interprets a terminating or error packet that arrived
+// before fetchSize rows were consumed. It reports whether the cursor is
+// exhausted (SERVER_STATUS_LAST_ROW_SENT).
+func (rows *binaryRows) handleBatchEnd(data []byte) (bool, error) {
+	if data[0] == iERR {
+		mc := rows.mc
+		rows.cursorOpen = false
+		rows.rs.done = true
+		rows.mc = nil
+		return false, mc.handleErrorPacket(data)
+	}
+
+	mc := rows.mc
+	mc.status = readResultSetRowStatus(mc, data)
+	return mc.status&statusLastRowSent != 0, nil
 }
 
 func (rows *textRows) NextResultSet() (err error) {
