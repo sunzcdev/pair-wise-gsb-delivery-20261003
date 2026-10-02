@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"slices"
 )
 
@@ -142,6 +143,37 @@ func (sk *Sketch) mergeSparseSketch(other *Sketch) {
 	sk.maybeToNormal()
 }
 
+// MergeLowerPrecision adds other to sk like Merge, but tolerates different
+// precisions by folding the higher precision sketch down with DownPrecision
+// first, so the result always has the lower of the two precisions. Unlike
+// Merge it never returns ErrorPrecisionMismatch. Nil and zero-value sketches
+// are treated as empty, and a zero-value sk adopts other as in Merge.
+func (sk *Sketch) MergeLowerPrecision(other *Sketch) error {
+	if other == nil || other.p == 0 {
+		return nil
+	}
+	if sk.p == 0 {
+		*sk = *other.Clone()
+		return nil
+	}
+	if sk.p > other.p {
+		folded, err := sk.DownPrecision(other.p)
+		if err != nil {
+			return err
+		}
+		*sk = *folded
+		return sk.Merge(other)
+	}
+	if sk.p < other.p {
+		folded, err := other.DownPrecision(sk.p)
+		if err != nil {
+			return err
+		}
+		return sk.Merge(folded)
+	}
+	return sk.Merge(other)
+}
+
 func (sk *Sketch) mergeDenseSketch(other *Sketch) {
 	if sk.sparse() {
 		sk.toNormal()
@@ -181,6 +213,89 @@ func (sk *Sketch) toNormal() {
 }
 
 func (sk *Sketch) insert(i uint32, r uint8) { sk.regs[i] = max(r, sk.regs[i]) }
+
+// DownPrecision returns a new Sketch with the lower precision p, leaving sk
+// unchanged. Lowering precision folds every group of 2^(sk.p-p) registers
+// into one: the discarded low index bits are prepended to the register's
+// remaining hash bits, so they take part in the rho of the folded register
+// rather than being dropped by a plain maximum. Folding a sketch and
+// inserting the same hashes into a fresh sketch of precision p therefore
+// produce identical registers.
+//
+// Precision cannot be raised: a coarser sketch never recorded the bits a
+// finer one needs, so p > sk.p returns an error wrapping
+// ErrorInvalidPrecision, as does a p outside [4, 18]. p == sk.p returns a
+// Clone. A zero-value Sketch folds to an empty sparse Sketch of precision p.
+func (sk *Sketch) DownPrecision(p uint8) (*Sketch, error) {
+	if err := checkPrecision(p); err != nil {
+		return nil, err
+	}
+	if sk.p == 0 {
+		return newSketchNoError(p, true), nil
+	}
+	if p > sk.p {
+		return nil, fmt.Errorf("hyperloglog: cannot raise precision from %d to %d: %w", sk.p, p, ErrorInvalidPrecision)
+	}
+	if p == sk.p {
+		return sk.Clone(), nil
+	}
+	if sk.sparse() {
+		return sk.downPrecisionSparse(p), nil
+	}
+	return sk.downPrecisionDense(p), nil
+}
+
+// downPrecisionDense requires sk to be dense and p < sk.p.
+func (sk *Sketch) downPrecisionDense(p uint8) *Sketch {
+	np := sk.p - p
+	folded := newSketchNoError(p, false)
+	for i, r := range sk.regs {
+		if r == 0 {
+			continue
+		}
+		// The np low bits of the old index are the hash bits right after
+		// the new index: they become the most significant bits of the
+		// folded register's rho window.
+		discarded := uint32(i) & (1<<np - 1)
+		var rho uint8
+		if discarded == 0 {
+			rho = np + r
+		} else {
+			rho = np - uint8(bits.Len32(discarded)) + 1
+		}
+		folded.insert(uint32(i)>>np, rho)
+	}
+	return folded
+}
+
+// downPrecisionSparse requires sk to be sparse and p < sk.p.
+func (sk *Sketch) downPrecisionSparse(p uint8) *Sketch {
+	folded := newSketchNoError(p, true)
+	insert := func(k uint32) {
+		folded.InsertHash(sparseKeyHash(k, pp))
+	}
+	sk.tmpSet.ForEach(insert)
+	for iter := sk.sparseList.Iter(); iter.HasNext(); {
+		insert(iter.Next())
+	}
+	return folded
+}
+
+// sparseKeyHash returns a hash that encodes to k at (p, pp) for every
+// precision p <= pp: it carries the pp hash bits k records and, for a key
+// with an explicit rho, a single set bit at the position that rho pins down.
+// Re-encoding it at a coarser precision therefore yields exactly the key the
+// original hash would have produced there.
+func sparseKeyHash(k uint32, pp uint8) uint64 {
+	if k&1 == 0 {
+		return uint64(k>>1) << (64 - pp)
+	}
+	x := uint64(k>>7) << (64 - pp)
+	if zeros := uint8(bextr32(k, 1, 6)); zeros <= 64-pp {
+		x |= uint64(1) << (64 - pp - zeros)
+	}
+	return x
+}
 
 // Insert hashes e with the package's MetroHash64 seed and adds it to sk.
 func (sk *Sketch) Insert(e []byte) { sk.InsertHash(hash(e)) }
