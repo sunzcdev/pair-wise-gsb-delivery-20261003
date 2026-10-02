@@ -180,9 +180,21 @@ func validBuiltinTag(tagNum uint64, contentHead byte) error {
 		//   item, except for those contained in a nested data item tagged with an expected
 		//   conversion.
 		return nil
-	}
 
-	return nil
+	default:
+		if isTypedArrayTagNum(tagNum) {
+			// From RFC 8746: typed array tag content must be a byte string.
+			if t != cborTypeByteString {
+				return newInadmissibleTagContentTypeErrorf(
+					fmt.Sprintf(
+						"tag number %d (RFC 8746 typed array) must be followed by byte string, got %s",
+						tagNum,
+						t.String(),
+					))
+			}
+		}
+		return nil
+	}
 }
 
 // Transcoder is a scheme for transcoding a single CBOR encoded data item to or from a different

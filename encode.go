@@ -2011,6 +2011,11 @@ func newEncodeFunc(t reflect.Type) (ef encodeFunc, ief isEmptyFunc, izf isZeroFu
 
 	case typeByteString:
 		return encodeMarshalerType, isEmptyString, getIsZeroFunc(t)
+
+	case typeUint8Array, typeUint16Array, typeUint32Array, typeUint64Array,
+		typeInt8Array, typeInt16Array, typeInt32Array, typeInt64Array,
+		typeFloat16Array, typeFloat32Array, typeFloat64Array:
+		return encodeTypedArray, isEmptySlice, getIsZeroFunc(t)
 	}
 	if reflect.PointerTo(t).Implements(typeMarshaler) {
 		return encodeMarshalerType, alwaysNotEmpty, getIsZeroFunc(t)

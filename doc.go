@@ -4,7 +4,8 @@
 /*
 Package cbor is a modern CBOR codec (RFC 8949 & RFC 8742) with CBOR tags,
 Go struct tag options (toarray/keyasint/omitempty/omitzero), Core Deterministic Encoding,
-CTAP2, Canonical CBOR, float64->32->16, and duplicate map key detection.
+CTAP2, Canonical CBOR, float64->32->16, RFC 8746 typed arrays, and duplicate
+map key detection.
 
 Encoding options allow "preferred serialization" by encoding integers and floats
 to their smallest forms (e.g. float16) when values fit.
@@ -151,6 +152,24 @@ makes struct fields encode to elements of CBOR map with int keys.
 https://raw.githubusercontent.com/fxamacker/images/master/cbor/v2.0.0/cbor_easy_api.png
 
 Struct tag options are listed at https://github.com/fxamacker/cbor#struct-tags-1
+
+# Typed Arrays (RFC 8746)
+
+RFC 8746 typed arrays (CBOR tag numbers 64-87) are built-in: they decode
+directly to Go numeric slices without manually unpacking the byte string
+content.  Covered element widths are uint8/16/32/64, int8/16/32/64, and
+float16/32/64, in both big-endian and little-endian form (tags 83 and 87,
+float128, are not covered and remain unrecognized tags).
+
+Decoding a typed array tag to any produces one of the named slice types
+Uint8Array, Uint16Array, Uint32Array, Uint64Array, Int8Array, Int16Array,
+Int32Array, Int64Array, Float16Array, Float32Array, or Float64Array.
+Decoding to a Go slice or array with a matching element type (e.g. []uint16
+for tag 65 or 69) fills it directly.  Encoding one of the named slice types
+emits the corresponding big-endian typed array tag.
+
+Tag numbers 64-87 and the named slice types listed above cannot be
+registered in a TagSet; TagSet.Add returns an error for them.
 
 # Tests and Fuzzing
 

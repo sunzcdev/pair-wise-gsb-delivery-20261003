@@ -1683,6 +1683,15 @@ func (d *decoder) parseToValue(v reflect.Value, tInfo *typeInfo) error { //nolin
 			if d.dm.byteStringToString == ByteStringToStringAllowedWithExpectedLaterEncoding || d.dm.byteStringExpectedFormat != ByteStringExpectedFormatNone {
 				return d.parseToValueWithExpectedLaterEncodingTag(v, tInfo, tagNum)
 			}
+
+		default:
+			// RFC 8746 typed arrays (tags 64-87) decode directly to a Go slice
+			// or array with matching element type.  Unsupported tags in this
+			// range (83 and 87) and mismatched Go types fall through and are
+			// treated as unregistered tags.
+			if ta, ok := typedArrayTags[tagNum]; ok && ta.matchesType(tInfo) {
+				return d.parseTypedArrayToValue(v, tInfo, ta)
+			}
 		}
 
 		return d.parseToValue(v, tInfo)
@@ -2143,6 +2152,15 @@ func (d *decoder) parse(skipSelfDescribedTag bool) (any, error) { //nolint:gocyc
 			if d.dm.byteStringToString == ByteStringToStringAllowedWithExpectedLaterEncoding ||
 				d.dm.byteStringExpectedFormat != ByteStringExpectedFormatNone {
 				return d.parseWithExpectedLaterEncodingTag(tagNum)
+			}
+
+		default:
+			// RFC 8746 typed arrays (tags 64-87) decode to the named slice
+			// types defined in typedarray.go.  Unsupported tags in this range
+			// (83 and 87) fall through and are treated as unregistered tags.
+			if ta, ok := typedArrayTags[tagNum]; ok {
+				b, _ := d.parseByteString()
+				return decodeTypedArrayToAny(ta, b)
 			}
 		}
 

@@ -294,6 +294,12 @@ func newTagItem(opts TagOptions, contentType reflect.Type, num uint64, nestedNum
 	if num == tagNumSelfDescribedCBOR {
 		return nil, errors.New("cbor: cannot add tag number 55799 to TagSet, it's built-in and ignored automatically")
 	}
+	if isTypedArrayTagNum(num) {
+		return nil, fmt.Errorf("cbor: cannot add tag number %d to TagSet, tag numbers 64-87 (RFC 8746 typed arrays) are built-in and supported automatically", num)
+	}
+	if _, ok := typedArrayTagBySliceType[contentType]; ok {
+		return nil, errors.New("cbor: cannot add " + contentType.String() + " to TagSet, it's built-in and supported automatically")
+	}
 
 	te := tagItem{num: []uint64{num}, opts: opts, contentType: contentType}
 	te.num = append(te.num, nestedNum...)
