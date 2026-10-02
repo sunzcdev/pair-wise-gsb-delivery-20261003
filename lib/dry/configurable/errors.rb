@@ -11,6 +11,11 @@ module Dry
 
     FrozenConfigError = Class.new(Error)
 
+    # Raised when a config value cannot be included in a Ractor-shareable snapshot
+    #
+    # @api public
+    UnsupportedValueError = Class.new(Error)
+
     AlreadyIncludedError = Class.new(Error)
     deprecate_constant(
       :AlreadyIncludedError,

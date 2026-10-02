@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "pathname"
+require "set"
 
 RSpec.describe Dry::Configurable::Config do
   subject(:config) do
@@ -384,6 +385,250 @@ RSpec.describe Dry::Configurable::Config do
       klass.config.list << "added after finalize"
 
       expect(klass.config.to_data.list).to eq(["added after finalize"])
+    end
+  end
+
+  describe "#to_shareable_data" do
+    it "raises if the config is not finalized" do
+      klass.setting :db
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::FrozenConfigError,
+        /must be finalized/
+      )
+    end
+
+    it "returns a frozen, Ractor-shareable Data for every supported value type" do
+      klass.setting :db, default: "sqlite"
+      klass.setting :pool, default: 5
+      klass.setting :ratio, default: 1.5
+      klass.setting :kind, default: :primary
+      klass.setting :enabled, default: true
+      klass.setting :missing, default: nil
+      klass.setting :name, default: +"hello"
+      klass.setting :at, default: Time.at(1_700_000_000)
+      klass.setting :list, default: [1, 2]
+      klass.setting :opts, default: {host: "localhost"}
+      klass.setting :tags, default: Set.new([:a, :b])
+      klass.setting :nested do
+        setting :deep, default: {list: [1, {x: 2}]}
+      end
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      expect(data).to be_frozen
+      expect(data).to be_a(Data)
+      expect(Ractor.shareable?(data)).to be(true)
+      expect(data.name).to be_frozen
+      expect(data.at).to be_frozen
+      expect(data.list).to be_frozen
+      expect(data.opts).to be_frozen
+      expect(data.opts[:host]).to be_frozen
+      expect(data.tags).to be_frozen
+      expect(data.nested.deep[:list][1][:x]).to eq(2)
+      expect(data.nested.deep).to be_frozen
+    end
+
+    it "keeps the snapshot independent of later in-place mutation of the original values" do
+      original_list = [1, 2]
+      original_hash = {items: original_list}
+      klass.setting :list
+      klass.setting :options
+      klass.config.list = original_list
+      klass.config.options = original_hash
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      original_list << 3
+      original_hash[:later] = true
+
+      expect(data.list).to eq([1, 2])
+      expect(data.options).to eq(items: [1, 2])
+    end
+
+    it "is readable from inside a real Ractor" do
+      klass.setting :name, default: +"sqlite"
+      klass.setting :list, default: [1, 2, 3]
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      result = Ractor.new(data) { |snapshot|
+        [snapshot.name, snapshot.list.map { |n| n * 2 }]
+      }.take
+
+      expect(result).to eq(["sqlite", [2, 4, 6]])
+    end
+
+    it "preserves shared nodes without duplicating them" do
+      shared = ["shared"]
+      klass.setting :first
+      klass.setting :second
+      klass.config.first = {node: shared}
+      klass.config.second = [shared]
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      expect(data.first[:node]).to equal(data.second[0])
+    end
+
+    it "preserves cycles within arrays and hashes instead of recursing forever" do
+      cyclic_array = []
+      cyclic_hash = {back: cyclic_array}
+      cyclic_array << cyclic_hash
+      klass.setting :cycle
+      klass.config.cycle = cyclic_array
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      expect(Ractor.shareable?(data)).to be(true)
+      expect(data.cycle[0][:back]).to equal(data.cycle)
+    end
+
+    it "preserves cycles that pass through sets" do
+      cyclic_hash = {}
+      cyclic_set = Set.new([cyclic_hash])
+      cyclic_hash[:set] = cyclic_set
+      klass.setting :cycle
+      klass.config.cycle = cyclic_set
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      expect(Ractor.shareable?(data)).to be(true)
+      copied_hash = data.cycle.instance_variable_get(:@hash).keys.first
+      expect(copied_hash[:set]).to equal(data.cycle)
+    end
+
+    it "preserves a plain (non-proc) hash default" do
+      klass.setting :opts
+      klass.config.opts = Hash.new(42).tap { |h| h[:set] = 1 }
+      klass.finalize!
+
+      data = klass.config.to_shareable_data
+
+      expect(data.opts[:missing]).to eq(42)
+      expect(Ractor.shareable?(data)).to be(true)
+    end
+
+    it "rejects a hash with a default_proc with its config path" do
+      klass.setting :db do
+        setting :opts, default: Hash.new { |hash, key| hash[key] = key }
+      end
+      klass.finalize!
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::UnsupportedValueError,
+        /config\.db\.opts.*default_proc/
+      )
+    end
+
+    it "rejects procs with their config path" do
+      klass.setting :nested do
+        setting :callback, default: -> {}
+      end
+      klass.finalize!
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::UnsupportedValueError,
+        /config\.nested\.callback.*Proc/
+      )
+    end
+
+    it "rejects IOs with their config path" do
+      klass.setting :stream, default: STDOUT
+      klass.finalize!
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::UnsupportedValueError,
+        /config\.stream.*IO/
+      )
+    end
+
+    it "rejects unsupported custom objects with their config path" do
+      custom_class = Class.new
+      klass.setting :thing, default: custom_class.new
+      klass.finalize!
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::UnsupportedValueError,
+        /config\.thing.*unsupported/
+      )
+    end
+
+    it "rejects procs nested inside containers with the full path" do
+      klass.setting :list, default: [1, -> {}]
+      klass.finalize!
+
+      expect { klass.config.to_shareable_data }.to raise_error(
+        Dry::Configurable::UnsupportedValueError,
+        /config\.list\[1\].*Proc/
+      )
+    end
+
+    it "does not freeze or mutate any original values when export fails" do
+      original_list = [1, 2]
+      klass.setting :list
+      klass.setting :bad
+      klass.config.list = original_list
+      klass.config.bad = -> {}
+      klass.finalize!
+
+      expect {
+        begin
+          klass.config.to_shareable_data
+        rescue Dry::Configurable::UnsupportedValueError
+        end
+      }.to_not raise_error
+
+      expect(klass.config.list).not_to be_frozen
+      expect(klass.config.list).to eq([1, 2])
+      klass.config.list << 3
+      expect(klass.config.list).to eq([1, 2, 3])
+    end
+
+    it "does not run constructors again for already-resolved values" do
+      constructor_calls = 0
+      constructor = ->(value) {
+        constructor_calls += 1
+        value
+      }
+      klass.setting :list, default: [1, 2], constructor: constructor
+      klass.finalize!
+      calls_after_finalize = constructor_calls
+
+      klass.config.to_shareable_data
+
+      expect(constructor_calls).to eq(calls_after_finalize)
+    end
+
+    it "returns independent snapshots per call" do
+      klass.setting :list, default: [1]
+      klass.finalize!
+
+      first = klass.config.to_shareable_data
+      second = klass.config.to_shareable_data
+
+      expect(first).not_to equal(second)
+      expect(first.list).not_to equal(second.list)
+      expect(first).to eq(second)
+    end
+
+    it "leaves the regular #to_data reference-sharing semantics untouched" do
+      original_list = ["x"]
+      klass.setting :list
+      klass.config.list = original_list
+      klass.finalize!
+
+      data = klass.config.to_data
+      original_list << "y"
+
+      expect(data.list).to eq(["x", "y"])
+      expect(data.list).not_to be_frozen
     end
   end
 

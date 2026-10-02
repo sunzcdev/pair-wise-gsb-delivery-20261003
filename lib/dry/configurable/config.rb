@@ -195,6 +195,40 @@ module Dry
         _settings.data_class.new(**to_data_attrs)
       end
 
+      # Returns an independent, deeply frozen, Ractor-shareable {Data} snapshot of the config's
+      # resolved values.
+      #
+      # Unlike {#to_data}, which captures mutable values by reference, every mutable value
+      # (+String+, +Array+, +Hash+, +Set+, +Time+) is copied and frozen here. The snapshot is
+      # therefore safe to pass to a Ractor and remains unchanged if the original config's values
+      # are later mutated in place.
+      #
+      # Duplicate references and cycles within nested +Array+, +Hash+, and +Set+ containers are
+      # preserved in the copies; shared nodes are not duplicated. Cyclic nested configs cannot be
+      # represented as Data and are rejected.
+      #
+      # Only available on a finalized config. Constructors are not run again: values already
+      # resolved for the config are exported as-is.
+      #
+      # The original config is never modified: when export fails partway through, no value in the
+      # original config is frozen or otherwise changed.
+      #
+      # @return [Data]
+      #
+      # @raise [FrozenConfigError] if the config is not yet finalized
+      # @raise [UnsupportedValueError] if a value cannot be made Ractor-shareable, with the
+      #   offending config's path in the message
+      #
+      # @api public
+      def to_shareable_data
+        unless frozen?
+          raise FrozenConfigError,
+                "config must be finalized before #to_shareable_data can be called"
+        end
+
+        ShareableSnapshot.new.call(self)
+      end
+
       # @api public
       def finalize!(freeze_values: false)
         return self if frozen?
