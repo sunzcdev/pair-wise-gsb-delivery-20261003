@@ -85,6 +85,12 @@ See also [examples](https://godoc.org/github.com/valyala/fastjson#pkg-examples).
   * `fastjson` requires up to `sizeof(Value) * len(inputJSON)` bytes of memory
     for parsing `inputJSON` string. Limit the maximum size of the `inputJSON`
     before parsing it in order to limit the maximum memory usage.
+  * `Parser` may be configured with optional limits enforced on the fly during
+    parsing via `Parser.SetLimits`: the maximum nesting depth, the maximum
+    total number of JSON nodes and the maximum total number of decoded string
+    bytes (object keys are counted too). Parsing stops with a `LimitError`
+    as soon as a limit is exceeded. The error contains the kind of the exceeded
+    limit and the byte position in the input.
 
 
 ## Performance optimization tips

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Parser parses JSON.
@@ -20,6 +21,9 @@ type Parser struct {
 
 	// c is a cache for json values.
 	c cache
+
+	// limits contains optional limits enforced during parsing.
+	limits ParseLimits
 }
 
 // Parse parses s containing JSON.
@@ -28,19 +32,111 @@ type Parser struct {
 //
 // Use Scanner if a stream of JSON values must be parsed.
 func (p *Parser) Parse(s string) (*Value, error) {
-	s = skipWS(s)
 	p.b = append(p.b[:0], s...)
 	p.c.reset()
+	p.c.maxDepth = p.limits.MaxDepth
+	p.c.maxNodes = p.limits.MaxNodes
+	p.c.maxStringBytes = p.limits.MaxStringBytes
+	p.c.inputLen = len(p.b)
 
-	v, tail, err := p.c.parseValue(b2s(p.b), 0)
+	v, tail, err := p.c.parseValue(skipWS(b2s(p.b)), 0)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
+		return nil, fmt.Errorf("cannot parse JSON: %w; unparsed tail: %q", err, startEndString(tail))
 	}
 	tail = skipWS(tail)
 	if len(tail) > 0 {
 		return nil, fmt.Errorf("unexpected tail: %q", startEndString(tail))
 	}
 	return v, nil
+}
+
+// ParseLimits defines optional limits enforced by Parser during parsing.
+//
+// The limits are checked on the fly while parsing, so oversized input
+// is rejected as soon as a limit is exceeded instead of after the parse.
+//
+// The zero value keeps the default behavior: the nesting depth is limited
+// by MaxDepth, while the number of JSON nodes and the total size of decoded
+// strings are unlimited.
+type ParseLimits struct {
+	// MaxDepth is the maximum allowed depth for nested JSON objects and arrays.
+	//
+	// If MaxDepth <= 0, the default MaxDepth is used.
+	MaxDepth int
+
+	// MaxNodes is the maximum allowed total number of JSON values (nodes),
+	// including objects, arrays, strings, numbers, booleans and nulls.
+	// Object keys are not counted as nodes.
+	//
+	// If MaxNodes <= 0, the number of nodes is unlimited.
+	MaxNodes int
+
+	// MaxStringBytes is the maximum allowed total number of bytes in decoded
+	// (unescaped) strings. Object keys are counted too.
+	//
+	// If MaxStringBytes <= 0, the total size of strings is unlimited.
+	MaxStringBytes int
+}
+
+// SetLimits sets limits enforced by p during subsequent Parse* calls.
+//
+// Call SetLimits with zero ParseLimits in order to restore the default behavior.
+func (p *Parser) SetLimits(limits ParseLimits) {
+	p.limits = limits
+}
+
+// Limits returns the limits currently enforced by p.
+func (p *Parser) Limits() ParseLimits {
+	return p.limits
+}
+
+// LimitKind identifies the kind of a parse limit exceeded.
+type LimitKind int
+
+const (
+	// LimitKindDepth is the nesting depth limit.
+	LimitKindDepth LimitKind = iota + 1
+
+	// LimitKindNodes is the total JSON nodes limit.
+	LimitKindNodes
+
+	// LimitKindStringBytes is the total decoded string bytes limit.
+	LimitKindStringBytes
+)
+
+// String returns string representation of k.
+func (k LimitKind) String() string {
+	switch k {
+	case LimitKindDepth:
+		return "depth"
+	case LimitKindNodes:
+		return "nodes"
+	case LimitKindStringBytes:
+		return "string_bytes"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(k))
+	}
+}
+
+// LimitError is returned by Parser.Parse* when a limit configured
+// via Parser.SetLimits is exceeded.
+//
+// Use errors.As for obtaining the LimitError from the returned error.
+type LimitError struct {
+	// Kind is the kind of the exceeded limit.
+	Kind LimitKind
+
+	// Limit is the configured limit value.
+	Limit int
+
+	// Position is the byte offset in the parsed input at which
+	// the limit has been exceeded.
+	Position int
+}
+
+// Error implements the error interface.
+func (e *LimitError) Error() string {
+	return fmt.Sprintf("%s limit of %d exceeded at byte position %d", e.Kind, e.Limit, e.Position)
 }
 
 // ParseBytes parses b containing JSON.
@@ -54,6 +150,16 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 
 type cache struct {
 	vs []Value
+
+	// Limits enforced during parsing. Zero values mean default behavior.
+	maxDepth       int
+	maxNodes       int
+	maxStringBytes int
+
+	// Per-parse state.
+	inputLen int
+	nodes    int
+	strBytes int
 }
 
 func (c *cache) reset() {
@@ -62,6 +168,9 @@ func (c *cache) reset() {
 		vs[i].reset()
 	}
 	c.vs = vs[:0]
+
+	c.nodes = 0
+	c.strBytes = 0
 }
 
 func (c *cache) getValue() *Value {
@@ -106,28 +215,52 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 		return nil, s, fmt.Errorf("cannot parse empty string")
 	}
 	depth++
-	if depth > MaxDepth {
+	maxDepth := c.maxDepth
+	if maxDepth <= 0 {
+		maxDepth = MaxDepth
+	}
+	if depth > maxDepth {
+		if c.maxDepth > 0 {
+			return nil, s, &LimitError{
+				Kind:     LimitKindDepth,
+				Limit:    maxDepth,
+				Position: c.inputLen - len(s),
+			}
+		}
 		return nil, s, fmt.Errorf("too big depth for the nested JSON; it exceeds %d", MaxDepth)
+	}
+	if c.maxNodes > 0 {
+		c.nodes++
+		if c.nodes > c.maxNodes {
+			return nil, s, &LimitError{
+				Kind:     LimitKindNodes,
+				Limit:    c.maxNodes,
+				Position: c.inputLen - len(s),
+			}
+		}
 	}
 
 	if s[0] == '{' {
 		v, tail, err := c.parseObject(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse object: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse object: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '[' {
 		v, tail, err := c.parseArray(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse array: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse array: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '"' {
 		ss, tail, err := parseRawString(s[1:])
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse string: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse string: %w", err)
+		}
+		if err := c.addStringBytes(ss, c.inputLen-len(s)); err != nil {
+			return nil, tail, err
 		}
 		v := c.getValue()
 		v.t = typeRawString
@@ -162,12 +295,95 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 
 	ns, tail, err := parseRawNumber(s)
 	if err != nil {
-		return nil, tail, fmt.Errorf("cannot parse number: %s", err)
+		return nil, tail, fmt.Errorf("cannot parse number: %w", err)
 	}
 	v := c.getValue()
 	v.t = TypeNumber
 	v.s = ns
 	return v, tail, nil
+}
+
+// addStringBytes charges the decoded length of the raw string s
+// against the string bytes budget. pos is the byte offset of the string
+// token in the parsed input.
+func (c *cache) addStringBytes(s string, pos int) error {
+	if c.maxStringBytes <= 0 {
+		return nil
+	}
+	c.strBytes += decodedStringLen(s)
+	if c.strBytes > c.maxStringBytes {
+		return &LimitError{
+			Kind:     LimitKindStringBytes,
+			Limit:    c.maxStringBytes,
+			Position: pos,
+		}
+	}
+	return nil
+}
+
+// decodedStringLen returns the length of unescapeStringBestEffort(s)
+// without performing the actual unescaping.
+func decodedStringLen(s string) int {
+	n := strings.IndexByte(s, '\\')
+	if n < 0 {
+		// Fast path - nothing to unescape.
+		return len(s)
+	}
+
+	// Slow path - count unescaped string length.
+	l := n
+	s = s[n+1:]
+	for len(s) > 0 {
+		ch := s[0]
+		s = s[1:]
+		switch ch {
+		case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
+			l++
+		case 'u':
+			if len(s) < 4 {
+				// Too short escape sequence. It is stored unchanged.
+				l += 2
+				break
+			}
+			xs := s[:4]
+			x, err := strconv.ParseUint(xs, 16, 16)
+			if err != nil {
+				// Invalid escape sequence. It is stored unchanged.
+				l += 2
+				break
+			}
+			s = s[4:]
+			if !utf16.IsSurrogate(rune(x)) {
+				l += utf8.RuneLen(rune(x))
+				break
+			}
+
+			// Surrogate.
+			if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+				l += 2 + len(xs)
+				break
+			}
+			x1, err := strconv.ParseUint(s[2:6], 16, 16)
+			if err != nil {
+				l += 2 + len(xs)
+				break
+			}
+			r := utf16.DecodeRune(rune(x), rune(x1))
+			l += utf8.RuneLen(r)
+			s = s[6:]
+		default:
+			// Unknown escape sequence. It is stored unchanged.
+			l += 2
+		}
+		n = strings.IndexByte(s, '\\')
+		if n < 0 {
+			l += len(s)
+			break
+		}
+		l += n
+		s = s[n+1:]
+	}
+	return l
 }
 
 func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
@@ -193,7 +409,7 @@ func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse array value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse array value: %w", err)
 		}
 		a.a = append(a.a, v)
 
@@ -238,9 +454,13 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		if len(s) == 0 || s[0] != '"' {
 			return nil, s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
+		keyPos := c.inputLen - len(s)
 		kv.k, s, err = parseRawKey(s[1:])
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object key: %w", err)
+		}
+		if err := c.addStringBytes(kv.k, keyPos); err != nil {
+			return nil, s, err
 		}
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
@@ -252,7 +472,7 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		kv.v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object value: %w", err)
 		}
 		s = skipWS(s)
 		if len(s) == 0 {
