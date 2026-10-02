@@ -19,3 +19,7 @@ Finally run the examples using the Go tool and navigate to http://127.0.0.1:5556
 go run ./example/idtoken/app.go
 ```
 [google-developer-console]: https://console.developers.google.com/apis/dashboard
+
+The [`dpop`](./dpop) example is self-contained (no Google credentials needed):
+it demonstrates RFC 9449 proof-of-possession verification for a DPoP-bound
+access token, including replay, URI, token-digest and server-nonce checks.
