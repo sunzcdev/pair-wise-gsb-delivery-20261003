@@ -392,7 +392,16 @@ func (obj JSONWebEncryption) FullSerialize() string {
 	}
 
 	if obj.protected != nil {
-		raw.Protected = newBuffer(mustSerializeJSON(obj.protected))
+		// Preserve the exact base64url-encoded protected segment of a parsed
+		// object. Re-serializing the parsed header could change its byte
+		// representation (e.g. key ordering or whitespace), silently rewriting
+		// an authenticated field. Freshly produced objects keep the canonical
+		// serialization.
+		if obj.original != nil && obj.original.Protected != nil {
+			raw.Protected = obj.original.Protected
+		} else {
+			raw.Protected = newBuffer(mustSerializeJSON(obj.protected))
+		}
 	}
 
 	return string(mustSerializeJSON(raw))
