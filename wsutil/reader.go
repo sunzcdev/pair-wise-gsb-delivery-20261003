@@ -17,6 +17,10 @@ var ErrNoFrameAdvance = errors.New("no frame advance")
 // MaxFrameSize was being read.
 var ErrFrameTooLarge = errors.New("frame too large")
 
+// ErrMessageTooLarge indicates that a message of length higher than
+// MaxMessageSize was being read.
+var ErrMessageTooLarge = errors.New("message too large")
+
 // FrameHandlerFunc handles parsed frame header and its body represented by
 // io.Reader.
 //
@@ -54,15 +58,33 @@ type Reader struct {
 	// Not setting this field means there is no limit.
 	MaxFrameSize int64
 
+	// MaxMessageSize controls the maximum message size in bytes
+	// that can be read. A message exceeding that size will return
+	// a ErrMessageTooLarge to the application.
+	//
+	// The size is accumulated across all frames of a (possibly
+	// fragmented) message. Intermediate control frames (such as ping
+	// or pong) are handled separately and do not count towards the
+	// message size.
+	//
+	// Note that once ErrMessageTooLarge is returned, the Reader must
+	// not be used to read further messages: the exceeding frame's
+	// payload is left unread in the Source, so the connection should
+	// be closed.
+	//
+	// Not setting this field means there is no limit.
+	MaxMessageSize int64
+
 	OnContinuation FrameHandlerFunc
 	OnIntermediate FrameHandlerFunc
 
-	opCode ws.OpCode                  // Used to store message op code on fragmentation.
-	frame  io.Reader                  // Used to as frame reader.
-	raw    io.LimitedReader           // Used to discard frames without cipher.
-	utf8   UTF8Reader                 // Used to check UTF8 sequences if CheckUTF8 is true.
-	tmp    [ws.MaxHeaderSize - 2]byte // Used for reading headers.
-	cr     *CipherReader              // Used by NextFrame() to unmask frame payload.
+	opCode  ws.OpCode                  // Used to store message op code on fragmentation.
+	msgSize int64                      // Used to accumulate message size across frames.
+	frame   io.Reader                  // Used to as frame reader.
+	raw     io.LimitedReader           // Used to discard frames without cipher.
+	utf8    UTF8Reader                 // Used to check UTF8 sequences if CheckUTF8 is true.
+	tmp     [ws.MaxHeaderSize - 2]byte // Used for reading headers.
+	cr      *CipherReader              // Used by NextFrame() to unmask frame payload.
 }
 
 // NewReader creates new frame reader that reads from r keeping given state to
@@ -188,6 +210,22 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 
 	if n := r.MaxFrameSize; n > 0 && hdr.Length > n {
 		return hdr, ErrFrameTooLarge
+	}
+
+	// Control frames (such as ping or pong) may appear in between the
+	// fragments of a message. They are handled separately and do not
+	// count towards the message size limit.
+	if n := r.MaxMessageSize; n > 0 && !hdr.OpCode.IsControl() {
+		if !r.fragmented() {
+			// A new message begins; reset the accumulated size.
+			r.msgSize = 0
+		}
+		// Note that r.msgSize never exceeds n, thus the subtraction
+		// below can not overflow.
+		if hdr.Length > n-r.msgSize {
+			return hdr, ErrMessageTooLarge
+		}
+		r.msgSize += hdr.Length
 	}
 
 	// Save raw reader to use it on discarding frame without ciphering and

@@ -194,6 +194,224 @@ func TestMaxFrameSize(t *testing.T) {
 	}
 }
 
+func TestMaxMessageSize(t *testing.T) {
+	writeFrames := func(buf *bytes.Buffer, frames ...ws.Frame) {
+		t.Helper()
+		for _, f := range frames {
+			if err := ws.WriteFrame(buf, f); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("fragmented", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewFrame(ws.OpContinuation, false, []byte("bar")),
+			ws.NewFrame(ws.OpContinuation, true, []byte("baz")),
+		)
+
+		r := Reader{
+			Source: &buf,
+			// Every single frame is legal...
+			MaxFrameSize: 3,
+			// ...but the whole message is not.
+			MaxMessageSize: 8,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if got, want := err, ErrMessageTooLarge; got != want {
+			t.Errorf("ReadAll() error = %v; want %v", got, want)
+		}
+		if got, want := string(bts), "foobar"; got != want {
+			t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+		}
+		// The error must be reported before the exceeding frame's
+		// payload is read: "baz" must still be in the source.
+		if got, want := buf.String(), "baz"; got != want {
+			t.Errorf("unread source bytes = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("single frame", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf, ws.NewTextFrame([]byte("foobar")))
+
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 5,
+		}
+		if _, err := r.NextFrame(); err != ErrMessageTooLarge {
+			t.Errorf("NextFrame() error = %v; want %v", err, ErrMessageTooLarge)
+		}
+		if got, want := buf.String(), "foobar"; got != want {
+			t.Errorf("unread source bytes = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("intermediate control frames not counted", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewPingFrame([]byte("ping info")),
+			ws.NewPongFrame([]byte("pong info")),
+			ws.NewFrame(ws.OpContinuation, true, []byte("bar")),
+		)
+
+		r := Reader{
+			Source: &buf,
+			// Fits "foobar" exactly, but not the control payloads.
+			MaxMessageSize: 6,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if err != nil {
+			t.Errorf("unexpected ReadAll() error: %v", err)
+		}
+		if got, want := string(bts), "foobar"; got != want {
+			t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("empty continuation does not bypass", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewFrame(ws.OpContinuation, false, nil),
+			ws.NewFrame(ws.OpContinuation, false, nil),
+			ws.NewFrame(ws.OpContinuation, true, []byte("bar")),
+		)
+
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 5,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ioutil.ReadAll(&r); err != ErrMessageTooLarge {
+			t.Errorf("ReadAll() error = %v; want %v", err, ErrMessageTooLarge)
+		}
+	})
+
+	t.Run("empty continuation at the limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewFrame(ws.OpContinuation, false, nil),
+			ws.NewFrame(ws.OpContinuation, true, []byte("bar")),
+		)
+
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 6,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if err != nil {
+			t.Errorf("unexpected ReadAll() error: %v", err)
+		}
+		if got, want := string(bts), "foobar"; got != want {
+			t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("discard", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewFrame(ws.OpContinuation, true, []byte("barbaz")),
+		)
+
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 5,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Discard(); err != ErrMessageTooLarge {
+			t.Errorf("Discard() error = %v; want %v", err, ErrMessageTooLarge)
+		}
+	})
+
+	t.Run("utf8 check does not bypass", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, []byte("foo")),
+			ws.NewFrame(ws.OpContinuation, true, []byte("bar")),
+		)
+
+		r := Reader{
+			Source:         &buf,
+			CheckUTF8:      true,
+			MaxMessageSize: 5,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ioutil.ReadAll(&r); err != ErrMessageTooLarge {
+			t.Errorf("ReadAll() error = %v; want %v", err, ErrMessageTooLarge)
+		}
+	})
+
+	t.Run("budget resets between messages", func(t *testing.T) {
+		var buf bytes.Buffer
+		writeFrames(&buf,
+			ws.NewTextFrame([]byte("foobar")),
+			ws.NewFrame(ws.OpText, false, []byte("baz")),
+			ws.NewFrame(ws.OpContinuation, true, []byte("qux")),
+		)
+
+		r := Reader{
+			Source:         &buf,
+			MaxMessageSize: 6,
+		}
+		for _, want := range []string{"foobar", "bazqux"} {
+			if _, err := r.NextFrame(); err != nil {
+				t.Fatal(err)
+			}
+			bts, err := ioutil.ReadAll(&r)
+			if err != nil {
+				t.Fatalf("unexpected ReadAll() error: %v", err)
+			}
+			if got := string(bts); got != want {
+				t.Errorf("ReadAll() bytes = %q; want %q", got, want)
+			}
+		}
+	})
+
+	t.Run("zero means no limit", func(t *testing.T) {
+		var buf bytes.Buffer
+		msg := bytes.Repeat([]byte("a"), 1<<20)
+		writeFrames(&buf,
+			ws.NewFrame(ws.OpText, false, msg[:1<<19]),
+			ws.NewFrame(ws.OpContinuation, true, msg[1<<19:]),
+		)
+
+		r := Reader{
+			Source: &buf,
+		}
+		if _, err := r.NextFrame(); err != nil {
+			t.Fatal(err)
+		}
+		bts, err := ioutil.ReadAll(&r)
+		if err != nil {
+			t.Fatalf("unexpected ReadAll() error: %v", err)
+		}
+		if !bytes.Equal(bts, msg) {
+			t.Errorf("ReadAll() read %d bytes; want %d", len(bts), len(msg))
+		}
+	})
+}
+
 func TestReaderUTF8(t *testing.T) {
 	yo := []byte("Ё")
 	if !utf8.ValidString(string(yo)) {
