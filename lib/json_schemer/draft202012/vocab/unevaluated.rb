@@ -70,7 +70,9 @@ module JSONSchemer
             evaluated_keys = Set[]
 
             context.adjacent_results.each_value do |adjacent_result|
-              collect_evaluated_keys(adjacent_result, evaluated_keys)
+              PropertyAnnotations.each(adjacent_result) do |result|
+                evaluated_keys.merge(result.annotation)
+              end
             end
 
             evaluated = instance.reject do |key, _value|
@@ -82,20 +84,6 @@ module JSONSchemer
             end
 
             result(instance, instance_location, keyword_location, nested.all?(&:valid), nested, :annotation => evaluated.keys)
-          end
-
-        private
-
-          def collect_evaluated_keys(result, evaluated_keys)
-            case result.source
-            when Applicator::Properties, Applicator::PatternProperties, Applicator::AdditionalProperties, UnevaluatedProperties
-              evaluated_keys.merge(result.annotation)
-            end
-            result.nested&.each do |subresult|
-              if subresult.valid && subresult.instance_location == result.instance_location
-                collect_evaluated_keys(subresult, evaluated_keys)
-              end
-            end
           end
         end
       end

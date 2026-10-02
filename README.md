@@ -242,7 +242,59 @@ JSONSchemer.schema(
   # 'read'/'write'/nil
   # default: nil
   access_mode: 'read'
+
+  # return a per-object property consumption report alongside the validation result
+  # follows the draft 2020-12 evaluation annotation rules and matches the
+  # properties considered by `unevaluatedProperties`
+  # default: false
+  property_consumption_report: true
 )
+```
+
+## Property Consumption Report
+
+Pass `property_consumption_report: true` (to `JSONSchemer.schema` or `validate`) to receive a report of the object properties that were evaluated during validation. The regular error output is left untouched when the option is disabled (the default). When enabled, `validate` returns a hash with `valid`, the usual `errors` output (omitted for the `flag` output format), and `propertyConsumptionReport`.
+
+The report contains one entry per object instance location with:
+
+* `instanceLocation` — the JSON Pointer to the object
+* `evaluatedProperties` — each evaluated property mapped to a list of the constraints that applied to it, including each constraint's `keyword`, `keywordLocation`, `absoluteKeywordLocation`, and whether the constraint passed (`valid`)
+* `remainingProperties` — properties that were not successfully consumed by `properties`, `patternProperties`, or `additionalProperties` (exactly the properties an `unevaluatedProperties` keyword at that location would act on)
+
+Annotations are collected according to the draft 2020-12 rules: `$ref` and the composition keywords (`allOf`, `anyOf`, `oneOf`, `if`/`then`/`else`, `dependentSchemas`) only contribute properties from successful branches—an `anyOf` branch that looks applicable but fails as a whole is not counted, and `not` never contributes. The report is built from the validation result tree without executing keywords or property hooks again.
+
+```ruby
+schemer = JSONSchemer.schema(
+  {
+    'anyOf' => [
+      { 'properties' => { 'a' => {} } },
+      { 'properties' => { 'b' => {} } }
+    ],
+    'unevaluatedProperties' => false
+  }
+)
+
+schemer.validate({ 'a' => 1 }, :property_consumption_report => true)
+# {
+#   'valid' => true,
+#   'errors' => #<Enumerator: ...>,
+#   'propertyConsumptionReport' => [
+#     {
+#       'instanceLocation' => '',
+#       'evaluatedProperties' => {
+#         'a' => [
+#           {
+#             'keyword' => 'properties',
+#             'keywordLocation' => '/anyOf/0/properties/a',
+#             'absoluteKeywordLocation' => 'json-schemer://schema#/anyOf/0/properties/a',
+#             'valid' => true
+#           }
+#         ]
+#       },
+#       'remainingProperties' => []
+#     }
+#   ]
+# }
 ```
 
 ## Global Configuration

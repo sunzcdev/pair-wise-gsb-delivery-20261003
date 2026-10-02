@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Add an optional `property_consumption_report` validation option that reports evaluated properties, the schema locations that supplied the constraints, and remaining properties at each object location (following the draft 2020-12 evaluation annotation rules)
+
 ## [2.5.0] - 2025-12-08
 
 ### Bug Fixes
