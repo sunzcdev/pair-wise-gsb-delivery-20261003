@@ -4,13 +4,26 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 )
 
-// cchal is a cached challenge and the number of times it's been used.
-type cchal struct {
-	c *Challenge
-	n int
+// spaceKey identifies a digest protection space: an origin plus a realm.
+// The host always carries an explicit port (defaulting to 80/443), so
+// services on different ports of the same host never share a challenge.
+type spaceKey struct {
+	scheme string
+	host   string
+	realm  string
+}
+
+// space is a cached challenge, the number of times it's been used, and the
+// request paths it applies to. A nil paths slice means the whole origin.
+type space struct {
+	chal  *Challenge
+	n     int
+	paths []string
 }
 
 // Transport implements http.RoundTripper
@@ -50,9 +63,86 @@ type Transport struct {
 	// unauthenticated request without draining the body. Applies only when uncached.
 	Probe bool
 
-	// cache of challenges indexed by host
-	cache   map[string]*cchal
+	// cache of protection spaces indexed by origin and realm
+	cache   map[spaceKey]*space
 	cacheMu sync.Mutex
+}
+
+// originOf returns the canonical scheme and host:port pair for a URL.
+func originOf(u *url.URL) (scheme, host string) {
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	return strings.ToLower(u.Scheme), strings.ToLower(u.Hostname()) + ":" + port
+}
+
+// resolveDomain resolves the challenge's domain directive against the URL of
+// the request which received it. Entries which resolve outside the original
+// origin are ignored so credentials can never follow them off-site. It
+// returns nil when the directive is absent, empty, or contains no usable
+// same-origin entries — per RFC 7616 §3.3 the protection space then covers
+// every URI on the responding origin.
+func resolveDomain(base *url.URL, domain []string) []string {
+	if len(domain) == 0 {
+		return nil
+	}
+	bscheme, bhost := originOf(base)
+	var paths []string
+	for _, d := range domain {
+		ref, err := url.Parse(d)
+		if err != nil {
+			continue
+		}
+		u := base.ResolveReference(ref)
+		scheme, host := originOf(u)
+		if scheme != bscheme || host != bhost {
+			continue
+		}
+		path := u.Path
+		if path == "" {
+			path = "/"
+		}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+// matchPath reports whether the request path p falls inside the
+// protection-space path prefix. Matching is segment-aware: "/api" matches
+// "/api" and "/api/x" but not "/apix".
+func matchPath(prefix, p string) bool {
+	if prefix == "" || prefix == "/" {
+		return true
+	}
+	if p == prefix {
+		return true
+	}
+	if !strings.HasPrefix(p, prefix) {
+		return false
+	}
+	return prefix[len(prefix)-1] == '/' || p[len(prefix)] == '/'
+}
+
+// specificity returns the length of the space's longest path prefix matching
+// p, or -1 when the space does not cover p at all. A space covering the
+// whole origin (nil paths) matches with specificity 0.
+func (s *space) specificity(p string) int {
+	if s.paths == nil {
+		return 0
+	}
+	best := -1
+	for _, prefix := range s.paths {
+		if matchPath(prefix, p) && len(prefix) > best {
+			best = len(prefix)
+		}
+	}
+	return best
 }
 
 // save parses the digest challenge from the response
@@ -71,19 +161,24 @@ func (t *Transport) save(res *http.Response) error {
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
 	if t.cache == nil {
-		t.cache = map[string]*cchal{}
+		t.cache = map[spaceKey]*space{}
 	}
-	// TODO: if the challenge contains a domain, we should be using that
-	//       to match against outgoing requests. We're currently ignoring
-	//       it and just matching the hostname. That being said, none of
-	//       the major browsers respect the domain either.
-	host := res.Request.URL.Hostname()
+	scheme, host := originOf(res.Request.URL)
 	if err != nil {
-		// if save is being invoked, the existing cached challenge didn't work
-		delete(t.cache, host)
+		// if save is being invoked, the existing cached challenges for
+		// this origin didn't work
+		for key := range t.cache {
+			if key.scheme == scheme && key.host == host {
+				delete(t.cache, key)
+			}
+		}
 		return err
 	}
-	t.cache[host] = &cchal{c: chal}
+	key := spaceKey{scheme: scheme, host: host, realm: chal.Realm}
+	t.cache[key] = &space{
+		chal:  chal,
+		paths: resolveDomain(res.Request.URL, chal.Domain),
+	}
 	return nil
 }
 
@@ -107,16 +202,43 @@ func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Cred
 func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
-	host := req.URL.Hostname()
-	cc, ok := t.cache[host]
-	if !ok {
+	key, sp := t.lookup(req.URL)
+	if sp == nil {
 		return nil, 0, false
 	}
 	if t.NoReuse {
-		delete(t.cache, host)
+		delete(t.cache, key)
 	}
-	cc.n++
-	return cc.c, cc.n, true
+	sp.n++
+	return sp.chal, sp.n, true
+}
+
+// lookup finds the cached protection space covering u. When several spaces
+// match, the one with the most specific (longest) matching path prefix wins;
+// ties are broken by the lexical order of the realm so the choice is stable.
+// Callers must hold cacheMu.
+func (t *Transport) lookup(u *url.URL) (spaceKey, *space) {
+	scheme, host := originOf(u)
+	path := u.Path
+	if path == "" {
+		path = "/"
+	}
+	var best spaceKey
+	var sp *space
+	spec := -1
+	for key, s := range t.cache {
+		if key.scheme != scheme || key.host != host {
+			continue
+		}
+		spec2 := s.specificity(path)
+		if spec2 < 0 {
+			continue
+		}
+		if sp == nil || spec2 > spec || (spec2 == spec && key.realm < best.realm) {
+			best, sp, spec = key, s, spec2
+		}
+	}
+	return best, sp
 }
 
 // prepare sets the Authorization header from a cached challenge if one exists.

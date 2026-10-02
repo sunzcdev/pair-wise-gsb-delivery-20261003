@@ -4,6 +4,28 @@
 
 > This package provides a http.RoundTripper implementation which re-uses digest challenges
 
+## Protection Spaces
+
+Cached challenges are stored per digest *protection space* — an origin
+(`scheme://host:port`, so the same host on different ports never shares a
+nonce) combined with the challenge `realm`. Whether a cached challenge is
+pre-emptively sent with a request is decided by the challenge's `domain`
+directive:
+
+- `domain` entries may be absolute or relative URIs; relative entries are
+  resolved against the request which received the challenge.
+- Entries resolving outside the original origin are ignored, and credentials
+  are never pre-emptively sent to another origin (e.g. after a cross-origin
+  redirect).
+- Path matching is segment-aware: a domain of `/api` covers `/api` and
+  `/api/x`, but not `/apix`.
+- If `domain` is omitted, empty, or contains no usable same-origin entries,
+  the protection space covers every URI on the responding origin
+  ([RFC 7616 §3.3](https://www.rfc-editor.org/rfc/rfc7616#section-3.3)).
+- When several cached spaces match a request, the one with the most specific
+  (longest) matching path prefix wins; ties are broken by lexical realm
+  order, so the choice is stable.
+
 ``` go
 package main
 
