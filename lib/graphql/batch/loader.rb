@@ -19,6 +19,10 @@ module GraphQL::Batch
         self.for.load_many(keys)
       end
 
+      def load_many_settled(keys)
+        self.for.load_many_settled(keys)
+      end
+
       private
 
       def current_executor
@@ -53,6 +57,18 @@ module GraphQL::Batch
 
     def load_many(keys)
       ::Promise.all(keys.map { |key| load(key) })
+    end
+
+    # Like #load_many, but every key settles independently: the returned
+    # promise always fulfills with one SettledResult per input key, in
+    # order, so a single missing or failing key doesn't lose the rest.
+    def load_many_settled(keys)
+      ::Promise.all(keys.map do |key|
+        load(key).then(
+          ->(value) { SettledResult.fulfilled(value) },
+          ->(reason) { SettledResult.rejected(reason) },
+        )
+      end)
     end
 
     def prime(key, value)

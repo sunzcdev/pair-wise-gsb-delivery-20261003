@@ -37,6 +37,7 @@ module GraphQL
 end
 
 require_relative "batch/version"
+require_relative "batch/settled_result"
 require_relative "batch/loader"
 require_relative "batch/executor"
 require_relative "batch/setup_multiplex"

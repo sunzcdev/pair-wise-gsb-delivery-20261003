@@ -87,6 +87,20 @@ def products(ids:)
 end
 ```
 
+If one key failing shouldn't lose the results for the other keys, use
+`load_many_settled` instead. It returns a promise that always fulfills
+with one `GraphQL::Batch::SettledResult` per input key, in order, each
+explicitly `fulfilled?` (with `#value`, which may be `nil`) or
+`rejected?` (with `#reason`).
+
+```ruby
+def products(ids:)
+  RecordLoader.for(Product).load_many_settled(ids).then do |results|
+    results.map { |result| result.fulfilled? ? result.value : nil }
+  end
+end
+```
+
 Although this library doesn't have a dependency on active record,
 the [examples directory](examples) has record and association loaders
 for active record which handles edge cases like type casting ids
