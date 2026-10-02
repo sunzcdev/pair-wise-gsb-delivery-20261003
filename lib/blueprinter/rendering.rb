@@ -128,6 +128,8 @@ module Blueprinter
       local_options_with_view = local_options.merge(view: view_name)
 
       if array_like?(object)
+        local_options_with_view = preload_associations(object, view_name, local_options_with_view)
+
         object.map do |obj|
           object_to_hash(
             obj,
@@ -136,12 +138,36 @@ module Blueprinter
           )
         end
       else
+        local_options_with_view = preload_associations([object], view_name, local_options_with_view)
+
         object_to_hash(
           object,
           view_name:,
           local_options: local_options_with_view
         )
       end
+    end
+
+    # Runs the :preload callable of each association in the view exactly once per render, before any
+    # field is extracted. Only objects that will actually render the association (given the view and
+    # any :if/:unless conditions) are passed to the callable, and duplicate objects are only passed
+    # once. The returned Hash (keyed by object) is stored in local_options, scoped to this render,
+    # so nested renders build their own store.
+    def preload_associations(objects, view_name, local_options)
+      preloaded = nil
+
+      view_collection.fields_for(view_name).each do |field|
+        preload = field.options[:preload]
+        next unless preload
+
+        targets = objects.reject { |object| field.skip?(field.name, object, local_options) }
+        targets.uniq!(&:object_id)
+        next if targets.empty?
+
+        (preloaded ||= {})[field] = preload.call(targets)
+      end
+
+      preloaded ? local_options.merge(Association::PRELOAD_STORE_KEY => preloaded) : local_options
     end
 
     def object_to_hash(object, view_name:, local_options:)

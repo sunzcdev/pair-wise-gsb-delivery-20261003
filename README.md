@@ -446,6 +446,39 @@ end
 </details>
 
 <details>
+<summary>Preloading Associations</summary>
+
+
+When rendering a collection, an association is normally fetched once per object. To avoid that, an
+association can declare a `preload` callable that bulk-loads the data for the whole collection in a
+single query, before any field is rendered.
+
+The callable receives the objects from the collection that will actually render the association —
+objects filtered out by the view, `exclude`, or the association's `:if`/`:unless` conditions are not
+passed in, and duplicate objects are only passed once. It must return a Hash keyed by those objects.
+A `nil` value represents an empty association; if an object being rendered has no entry in the Hash,
+`Blueprinter::Errors::MissingPreloadResult` is raised (Blueprinter never falls back to per-object
+queries).
+
+```ruby
+class UserBlueprint < Blueprinter::Base
+  identifier :id
+  field :name
+
+  association :vehicles, blueprint: VehicleBlueprint, preload: ->(users) {
+    by_owner = Vehicle.where(owner_id: users.map(&:id)).group_by(&:owner_id)
+    users.to_h { |user| [user, by_owner[user.id]] }
+  }
+end
+```
+
+Preloading is scoped to a single render: single-object renders preload just that object, and nested
+preloaded associations are bulk-loaded within each parent association's render. The preloaded data
+is discarded after the render, even if rendering raises.
+
+</details>
+
+<details>
 <summary>Default Association/Field Option</summary>
 
 

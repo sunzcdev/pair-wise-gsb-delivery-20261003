@@ -136,6 +136,12 @@ module Blueprinter
       # @option options [Hash, Proc] :options Additional options to merge into the
       #   options hash passed to the nested blueprint. Can be a static Hash or a Proc
       #   that receives the parent object and returns a Hash.
+      # @option options [Proc] :preload A callable used to bulk-load the association
+      #   once per render instead of querying it per object. It receives the objects
+      #   from the collection that will actually render the association (after view,
+      #   exclusion and :if/:unless filtering, with duplicates removed) and must return
+      #   a Hash keyed by those objects. A nil value represents an empty association;
+      #   a missing entry raises Blueprinter::Errors::MissingPreloadResult.
       # @yield [object, options] The object and the options passed to render are
       #   also yielded to the block.
       #
@@ -161,6 +167,14 @@ module Blueprinter
       # @example Passing dynamic options based on the parent object.
       #   class UserBlueprint < Blueprinter::Base
       #     association :vehicles, blueprint: VehiclesBlueprint, options: ->(user) { { owner_name: user.name } }
+      #   end
+      #
+      # @example Preloading the association for the whole collection in one query.
+      #   class UserBlueprint < Blueprinter::Base
+      #     association :vehicles, blueprint: VehiclesBlueprint, preload: ->(users) {
+      #       by_owner = Vehicle.where(owner_id: users.map(&:id)).group_by(&:owner_id)
+      #       users.to_h { |user| [user, by_owner[user.id]] }
+      #     }
       #   end
       #
       # @return [Association] An object

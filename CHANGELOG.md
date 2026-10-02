@@ -1,5 +1,5 @@
 ## Unreleased
---
+- 🚀 [FEATURE] Adds a `:preload` option to associations, allowing an association to be bulk-loaded once per render via a callable that receives the objects needing the association and returns a Hash keyed by those objects.
 
 ## 1.3.0 - 2026/04/14
 - 🚀 [FEATURE] Adds support for `Symbol#to_proc` syntax in fields and identifiers. See [#546](https://github.com/procore-oss/blueprinter/pull/546). Thanks to [@tob1k](https://github.com/tob1k).
