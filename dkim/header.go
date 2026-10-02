@@ -149,7 +149,10 @@ func newHeaderPicker(h header) *headerPicker {
 	}
 }
 
-func (p *headerPicker) Pick(key string) string {
+// Pick returns the next header field with the given key, starting from the
+// bottom of the header, along with its index in the header. If there is no
+// such field, an empty string and -1 are returned.
+func (p *headerPicker) Pick(key string) (string, int) {
 	key = strings.ToLower(key)
 
 	at := p.picked[key]
@@ -163,10 +166,10 @@ func (p *headerPicker) Pick(key string) string {
 
 		if at == 0 {
 			p.picked[key]++
-			return kv
+			return kv, i
 		}
 		at--
 	}
 
-	return ""
+	return "", -1
 }

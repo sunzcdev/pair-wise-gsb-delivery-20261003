@@ -1,6 +1,7 @@
 package dkim
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -66,6 +67,14 @@ var testVerification = &Verification{
 	Domain:     "example.com",
 	Identifier: "joe@football.example.com",
 	HeaderKeys: []string{"Received", "From", "To", "Subject", "Date", "Message-ID"},
+	HeaderCoverage: []HeaderCoverage{
+		{Key: "Received", Index: 1},
+		{Key: "From", Index: 2},
+		{Key: "To", Index: 3},
+		{Key: "Subject", Index: 4},
+		{Key: "Date", Index: 5},
+		{Key: "Message-ID", Index: 6},
+	},
 }
 
 func TestVerify(t *testing.T) {
@@ -141,7 +150,15 @@ var testRawRSAVerification = &Verification{
 	Domain:     "example.com",
 	Identifier: "joe@football.example.com",
 	HeaderKeys: []string{"Received", "From", "To", "Subject", "Date", "Message-ID"},
-	Time:       time.Unix(1615825284, 0),
+	HeaderCoverage: []HeaderCoverage{
+		{Key: "Received", Index: 1},
+		{Key: "From", Index: 2},
+		{Key: "To", Index: 3},
+		{Key: "Subject", Index: 4},
+		{Key: "Date", Index: 5},
+		{Key: "Message-ID", Index: 6},
+	},
+	Time: time.Unix(1615825284, 0),
 }
 
 func TestVerify_rawRSA(t *testing.T) {
@@ -191,7 +208,17 @@ var testEd25519Verification = &Verification{
 	Domain:     "football.example.com",
 	Identifier: "@football.example.com",
 	HeaderKeys: []string{"from", "to", "subject", "date", "message-id", "from", "subject", "date"},
-	Time:       time.Unix(1528637909, 0),
+	HeaderCoverage: []HeaderCoverage{
+		{Key: "from", Index: 2},
+		{Key: "to", Index: 3},
+		{Key: "subject", Index: 4},
+		{Key: "date", Index: 5},
+		{Key: "message-id", Index: 6},
+		{Key: "from", Index: -1},
+		{Key: "subject", Index: -1},
+		{Key: "date", Index: -1},
+	},
+	Time: time.Unix(1528637909, 0),
 }
 
 func TestVerify_ed25519(t *testing.T) {
@@ -292,5 +319,162 @@ func TestVerify_tooManySignatures(t *testing.T) {
 	}
 	if len(verifs) != options.MaxVerifications {
 		t.Fatalf("Expected %v verifications, got %v", options.MaxVerifications, len(verifs))
+	}
+}
+
+const duplicateHeaderMailString = "From: Joe SixPack <joe@football.example.com>\r\n" +
+	"To: Suzie Q <suzie@shopping.example.net>\r\n" +
+	"Subject: Is dinner ready?\r\n" +
+	"X-Test: one\r\n" +
+	"X-Test: two\r\n" +
+	"Message-ID: <20030712040037.46341.5F8J@football.example.com>\r\n" +
+	"\r\n" +
+	mailBodyString
+
+func signDuplicateHeaderMail(t *testing.T, headerKeys []string) string {
+	t.Helper()
+
+	options := &SignOptions{
+		Domain:     "example.org",
+		Selector:   "brisbane",
+		Signer:     testPrivateKey,
+		HeaderKeys: headerKeys,
+	}
+
+	var b bytes.Buffer
+	if err := Sign(&b, strings.NewReader(duplicateHeaderMailString), options); err != nil {
+		t.Fatal("Expected no error while signing mail, got:", err)
+	}
+	return b.String()
+}
+
+func verifyOne(t *testing.T, mail string, options *VerifyOptions) *Verification {
+	t.Helper()
+
+	verifications, err := VerifyWithOptions(strings.NewReader(mail), options)
+	if err != nil {
+		t.Fatalf("Expected no error while verifying signature, got: %v", err)
+	}
+	if len(verifications) != 1 {
+		t.Fatalf("Expected exactly one verification, got %v", len(verifications))
+	}
+	return verifications[0]
+}
+
+// TestVerify_headerCoverage signs a message containing duplicate header
+// fields, then inserts a header field with the same name at various
+// positions and compares the verification and coverage results.
+func TestVerify_headerCoverage(t *testing.T) {
+	headerKeys := []string{"From", "To", "Subject", "X-Test", "X-Test"}
+	signed := signDuplicateHeaderMail(t, headerKeys)
+
+	wantCoverage := []HeaderCoverage{
+		{Key: "From", Index: 1},
+		{Key: "To", Index: 2},
+		{Key: "Subject", Index: 3},
+		{Key: "X-Test", Index: 5},
+		{Key: "X-Test", Index: 4},
+	}
+
+	// The untouched message verifies, and each h= entry covers an existing
+	// header field instance.
+	v := verifyOne(t, signed, nil)
+	if v.Err != nil {
+		t.Fatalf("Expected no error when verifying signature, got: %v", v.Err)
+	}
+	if !reflect.DeepEqual(wantCoverage, v.HeaderCoverage) {
+		t.Errorf("Expected header coverage to be \n%+v\n but got \n%+v", wantCoverage, v.HeaderCoverage)
+	}
+
+	// Prepending a header field with a signed name doesn't break the
+	// signature: the signature keeps covering the two bottom-most
+	// instances, and the injected instance is left uncovered. The
+	// cryptographic verification passes, but the application policy
+	// rejects the message: both conclusions are retained.
+	injectedTop := strings.Replace(signed, "\r\nFrom:", "\r\nX-Test: injected\r\nFrom:", 1)
+	options := &VerifyOptions{HeaderPolicy: RequireSignedHeaders("From", "Subject", "X-Test")}
+	v = verifyOne(t, injectedTop, options)
+	if v.Err != nil {
+		t.Errorf("Expected no error when verifying signature with prepended header, got: %v", v.Err)
+	}
+	if v.PolicyErr == nil {
+		t.Errorf("Expected policy error for signature with prepended header, got nil")
+	}
+	wantCoverage = []HeaderCoverage{
+		{Key: "From", Index: 2},
+		{Key: "To", Index: 3},
+		{Key: "Subject", Index: 4},
+		{Key: "X-Test", Index: 6},
+		{Key: "X-Test", Index: 5},
+	}
+	if !reflect.DeepEqual(wantCoverage, v.HeaderCoverage) {
+		t.Errorf("Expected header coverage to be \n%+v\n but got \n%+v", wantCoverage, v.HeaderCoverage)
+	}
+
+	// Appending a header field with a signed name breaks the signature,
+	// because the newly added instance is covered instead of the original
+	// top-most one.
+	injectedBottom := strings.Replace(signed, "\r\n\r\n", "\r\nX-Test: injected\r\n\r\n", 1)
+	v = verifyOne(t, injectedBottom, options)
+	if v.Err == nil {
+		t.Errorf("Expected error when verifying signature with appended header, got nil")
+	}
+	wantCoverage = []HeaderCoverage{
+		{Key: "From", Index: 1},
+		{Key: "To", Index: 2},
+		{Key: "Subject", Index: 3},
+		{Key: "X-Test", Index: 7},
+		{Key: "X-Test", Index: 5},
+	}
+	if !reflect.DeepEqual(wantCoverage, v.HeaderCoverage) {
+		t.Errorf("Expected header coverage to be \n%+v\n but got \n%+v", wantCoverage, v.HeaderCoverage)
+	}
+}
+
+// TestVerify_headerCoverageOversigned checks that oversigned header fields
+// are reported as covering absent header field instances, and that adding
+// an instance afterwards breaks the signature.
+func TestVerify_headerCoverageOversigned(t *testing.T) {
+	headerKeys := []string{"From", "To", "Subject", "X-Test", "X-Test", "X-Test"}
+	signed := signDuplicateHeaderMail(t, headerKeys)
+
+	// The third X-Test entry covers no existing instance: it's an
+	// oversigning slot preventing a X-Test header field from being added.
+	v := verifyOne(t, signed, nil)
+	if v.Err != nil {
+		t.Fatalf("Expected no error when verifying signature, got: %v", v.Err)
+	}
+	wantCoverage := []HeaderCoverage{
+		{Key: "From", Index: 1},
+		{Key: "To", Index: 2},
+		{Key: "Subject", Index: 3},
+		{Key: "X-Test", Index: 5},
+		{Key: "X-Test", Index: 4},
+		{Key: "X-Test", Index: -1},
+	}
+	if !reflect.DeepEqual(wantCoverage, v.HeaderCoverage) {
+		t.Errorf("Expected header coverage to be \n%+v\n but got \n%+v", wantCoverage, v.HeaderCoverage)
+	}
+	if v.HeaderCoverage[5].Present() {
+		t.Errorf("Expected oversigning slot to cover no existing header field")
+	}
+
+	// Adding a X-Test header field anywhere fills the oversigning slot and
+	// breaks the signature.
+	injectedTop := strings.Replace(signed, "\r\nFrom:", "\r\nX-Test: injected\r\nFrom:", 1)
+	v = verifyOne(t, injectedTop, nil)
+	if v.Err == nil {
+		t.Errorf("Expected error when verifying oversigned signature with prepended header, got nil")
+	}
+	wantCoverage = []HeaderCoverage{
+		{Key: "From", Index: 2},
+		{Key: "To", Index: 3},
+		{Key: "Subject", Index: 4},
+		{Key: "X-Test", Index: 6},
+		{Key: "X-Test", Index: 5},
+		{Key: "X-Test", Index: 1},
+	}
+	if !reflect.DeepEqual(wantCoverage, v.HeaderCoverage) {
+		t.Errorf("Expected header coverage to be \n%+v\n but got \n%+v", wantCoverage, v.HeaderCoverage)
 	}
 }

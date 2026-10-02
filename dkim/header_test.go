@@ -113,7 +113,7 @@ func TestHeaderPicker_Pick(t *testing.T) {
 		}
 		picker := newHeaderPicker(headers)
 		for i, k := range predefinedHeaders {
-			if headers[i] != picker.Pick(k) {
+			if kv, _ := picker.Pick(k); headers[i] != kv {
 				t.Errorf("Parameter %s not found in headers %s", k, headers)
 			}
 		}
@@ -129,7 +129,7 @@ func TestHeaderPicker_Pick(t *testing.T) {
 		var lh = len(headers) - 1
 		picker := newHeaderPicker(headers)
 		for i, k := range predefinedHeaders {
-			if headers[lh-i] != picker.Pick(k) {
+			if kv, _ := picker.Pick(k); headers[lh-i] != kv {
 				t.Errorf("Parameter %s not found in headers %s", k, headers)
 			}
 		}
@@ -139,10 +139,10 @@ func TestHeaderPicker_Pick(t *testing.T) {
 			"Message-ID: asdf",
 		}
 		picker := newHeaderPicker(headers)
-		if v := picker.Pick("Message-Id"); v != headers[0] {
+		if v, _ := picker.Pick("Message-Id"); v != headers[0] {
 			t.Errorf("Pick() = %q, want %q", v, headers[0])
 		}
-		if v := picker.Pick("Message-ID"); v != "" {
+		if v, _ := picker.Pick("Message-ID"); v != "" {
 			t.Errorf("Pick() = %q, want %q", v, "")
 		}
 	})

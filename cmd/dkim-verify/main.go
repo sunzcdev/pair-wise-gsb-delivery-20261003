@@ -19,5 +19,15 @@ func main() {
 		} else {
 			log.Printf("Invalid signature for %v: %v", v.Domain, v.Err)
 		}
+		for _, c := range v.HeaderCoverage {
+			if c.Present() {
+				log.Printf("Signed header field %q (instance at position %d)", c.Key, c.Index)
+			} else {
+				log.Printf("Oversigned header field %q (no matching instance)", c.Key)
+			}
+		}
+		if v.PolicyErr != nil {
+			log.Printf("Header policy not satisfied for %v: %v", v.Domain, v.PolicyErr)
+		}
 	}
 }

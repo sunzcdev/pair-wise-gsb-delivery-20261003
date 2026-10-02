@@ -61,6 +61,62 @@ var ErrTooManySignatures = errors.New("dkim: too many signatures")
 
 var requiredTags = []string{"v", "a", "b", "bh", "d", "h", "s"}
 
+// A HeaderCoverage describes how a single entry of a signature's h= tag
+// relates to the message header.
+type HeaderCoverage struct {
+	// Key is the header field name, as it appears in the h= tag.
+	Key string
+	// Index is the zero-based position of the covered header field instance
+	// in the message header. It is -1 if the entry doesn't cover any
+	// existing header field.
+	Index int
+}
+
+// Present reports whether the h= tag entry covers a header field instance
+// present in the message. If false, the entry is an oversigning slot: it
+// references a header field which doesn't exist yet, so that adding one
+// after signing breaks the signature.
+func (c HeaderCoverage) Present() bool {
+	return c.Index >= 0
+}
+
+// A HeaderPolicy checks whether the header fields covered by a signature
+// satisfy application-specific requirements.
+//
+// coverage contains one entry per entry of the signature's h= tag, in
+// order. headerKeys lists the names of all header fields present in the
+// message, in order: it allows the policy to detect header field instances
+// which are not covered by the signature.
+type HeaderPolicy func(coverage []HeaderCoverage, headerKeys []string) error
+
+// RequireSignedHeaders returns a HeaderPolicy which requires all instances
+// of each of the given header fields to be covered by the signature. In
+// particular, the policy fails if an instance of one of these header fields
+// has been added after signing (e.g. prepended by a mailing list or an
+// attacker).
+func RequireSignedHeaders(keys ...string) HeaderPolicy {
+	return func(coverage []HeaderCoverage, headerKeys []string) error {
+		for _, key := range keys {
+			present := 0
+			for _, k := range headerKeys {
+				if strings.EqualFold(k, key) {
+					present++
+				}
+			}
+			covered := 0
+			for _, c := range coverage {
+				if c.Present() && strings.EqualFold(c.Key, key) {
+					covered++
+				}
+			}
+			if covered < present {
+				return fmt.Errorf("dkim: %v header field not fully covered by signature", key)
+			}
+		}
+		return nil
+	}
+}
+
 // A Verification is produced by Verify when it checks if one signature is
 // valid. If the signature is valid, Err is nil.
 type Verification struct {
@@ -74,6 +130,13 @@ type Verification struct {
 	// The list of signed header fields.
 	HeaderKeys []string
 
+	// HeaderCoverage describes, for each entry of HeaderKeys, which header
+	// field instance of the message it covers. Entries with a negative
+	// index are oversigning slots: they don't cover any existing header
+	// field, but prevent a header field with the same name from being added
+	// after signing.
+	HeaderCoverage []HeaderCoverage
+
 	// The time that this signature was created. If unknown, it's set to zero.
 	Time time.Time
 	// The expiration time. If the signature doesn't expire, it's set to zero.
@@ -81,6 +144,12 @@ type Verification struct {
 
 	// Err is nil if the signature is valid.
 	Err error
+
+	// PolicyErr is the result of the VerifyOptions.HeaderPolicy check. It
+	// is independent of Err: a cryptographically valid signature may still
+	// fail the application policy, in which case Err is nil and PolicyErr
+	// is not. It is nil if no HeaderPolicy was supplied.
+	PolicyErr error
 }
 
 type signature struct {
@@ -99,6 +168,10 @@ type VerifyOptions struct {
 	// signatures are verified, the rest are ignored and ErrTooManySignatures
 	// is returned. If zero, there is no maximum.
 	MaxVerifications int
+	// HeaderPolicy, if non-nil, is called for each signature with its header
+	// coverage report. The returned error is stored in the verification's
+	// PolicyErr field, leaving the Err field untouched.
+	HeaderPolicy HeaderPolicy
 }
 
 // Verify checks if a message's signatures are valid. It returns one
@@ -251,6 +324,18 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 	}
 	verif.HeaderKeys = headerKeys
 
+	// Compute the header coverage report and check the application policy.
+	// This is done regardless of the cryptographic verification outcome, so
+	// that both conclusions are available to the caller.
+	verif.HeaderCoverage = computeHeaderCoverage(h, headerKeys)
+	if options != nil && options.HeaderPolicy != nil {
+		headerKeys := make([]string, len(h))
+		for i, kv := range h {
+			headerKeys[i], _ = parseHeaderField(kv)
+		}
+		verif.PolicyErr = options.HeaderPolicy(verif.HeaderCoverage, headerKeys)
+	}
+
 	if timeStr, ok := params["t"]; ok {
 		t, err := parseTime(timeStr)
 		if err != nil {
@@ -383,7 +468,7 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 	hasher.Reset()
 	picker := newHeaderPicker(h)
 	for _, key := range headerKeys {
-		kv := picker.Pick(key)
+		kv, _ := picker.Pick(key)
 		if kv == "" {
 			// The field MAY contain names of header fields that do not exist
 			// when signed; nonexistent header fields do not contribute to the
@@ -410,6 +495,19 @@ func verify(h header, r io.Reader, sigField, sigValue string, options *VerifyOpt
 	}
 
 	return verif, nil
+}
+
+// computeHeaderCoverage resolves each entry of a signature's h= tag against
+// the message header, using the same bottom-up instance matching as the
+// signature computation.
+func computeHeaderCoverage(h header, headerKeys []string) []HeaderCoverage {
+	picker := newHeaderPicker(h)
+	coverage := make([]HeaderCoverage, len(headerKeys))
+	for i, key := range headerKeys {
+		_, index := picker.Pick(key)
+		coverage[i] = HeaderCoverage{Key: key, Index: index}
+	}
+	return coverage
 }
 
 func parseTagList(s string) []string {

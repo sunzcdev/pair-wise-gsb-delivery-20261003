@@ -234,7 +234,7 @@ func NewSigner(options *SignOptions) (*Signer, error) {
 		hasher.Reset()
 		picker := newHeaderPicker(h)
 		for _, k := range headerKeys {
-			kv := picker.Pick(k)
+			kv, _ := picker.Pick(k)
 			if kv == "" {
 				// The Signer MAY include more instances of a header field name
 				// in "h=" than there are actual corresponding header fields so
