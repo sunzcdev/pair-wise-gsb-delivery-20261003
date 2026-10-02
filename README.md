@@ -164,6 +164,44 @@ envconfig supports these struct field types:
 
 Embedded structs using these fields are also supported.
 
+## Quoted Collection Syntax
+
+Slice and map values are split on commas by default, and map items on the
+first colon. This means an element cannot itself contain a comma or colon.
+Opting in with the `collection_syntax:"true"` struct tag enables an
+alternate, quoted syntax that keeps the legacy behaviour as the default for
+every service that does not use the tag:
+
+```Go
+type Specification struct {
+    Users []string          `envconfig:"MYAPP_USERS" collection_syntax:"true"`
+    Codes map[string]int   `envconfig:"MYAPP_CODES" collection_syntax:"true"`
+}
+```
+
+Rules:
+
+  * Elements may be wrapped in double quotes. Separators (`,` and, for maps,
+    `:`) and whitespace inside quotes are literal:
+    `MYAPP_USERS="smith, john",bob` parses to `["smith, john", "bob"]`.
+  * A backslash escapes the next character, so `\,`, `\:`, `\"` and `\\` can
+    be written without quotes. Two consecutive quotes (`""`) inside a quoted
+    element denote one literal double quote.
+  * An empty (or whitespace-only) value is an empty slice or map. A single
+    empty string element must be written explicitly as `""`.
+  * Leading and trailing whitespace around an unquoted element is ignored;
+    whitespace within quotes is preserved.
+  * Map items are split on the first unquoted, unescaped colon only; colons
+    that belong to the key or value are kept verbatim
+    (`url:http://example:8080`).
+  * Repeated map keys resolve to the last assigned value, matching native map
+    assignment semantics.
+  * Unclosed quotes and dangling escapes are rejected with the 1-based
+    position of the offending element or map item.
+
+After elements are extracted they go through the same type conversion and
+`Decoder`/`Setter` handling as every other field.
+
 ## Custom Decoders
 
 Any field whose type (or pointer-to-type) implements `envconfig.Decoder` can
