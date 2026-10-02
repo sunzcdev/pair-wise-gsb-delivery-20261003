@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -44,6 +45,12 @@ type Transport struct {
 
 	// NoReuse prevents the transport from reusing challenges.
 	NoReuse bool
+
+	// VerifyResponse enables validation of the server's rspauth proof in the
+	// Authentication-Info response header. The zero value (VerifyOff) keeps
+	// the legacy behavior. Use VerifyCompat to tolerate missing proofs or
+	// VerifyStrict to require them.
+	VerifyResponse VerifyMode
 
 	// Probe discovers the challenge with a bodyless request before streaming the
 	// body, so it's only sent once authenticated — for servers that reject the
@@ -120,9 +127,10 @@ func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
 }
 
 // prepare sets the Authorization header from a cached challenge if one exists.
-// It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// It returns the credentials attached to the request, and reports whether the
+// caller should send a bodyless probe first (Probe set, request has a body, no
+// challenge cached yet).
+func (t *Transport) prepare(req *http.Request) (*Credentials, bool, error) {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
@@ -134,16 +142,62 @@ func (t *Transport) prepare(req *http.Request) (bool, error) {
 	if !ok {
 		// no cached challenge yet: probe bodyless first when configured
 		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+		return nil, t.Probe && bodied, nil
 	}
 	cred, err := t.digest(req, chal, count)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if cred != nil {
 		req.Header.Set("Authorization", cred.String())
 	}
-	return false, nil
+	return cred, false, nil
+}
+
+// verify validates the rspauth proof in an authenticated response. For qop=auth
+// the proof is checked before the response is returned. For qop=auth-int the
+// body is wrapped so the entity digest is verified while it is streamed.
+func (t *Transport) verify(res *http.Response, cred *Credentials) error {
+	if t.VerifyResponse == VerifyOff || cred == nil {
+		return nil
+	}
+	// rspauth is only defined for the qop=auth and qop=auth-int variants.
+	if cred.QOP == "" {
+		return nil
+	}
+	info, err := findAuthenticationInfo(res.Header)
+	if err != nil {
+		return err
+	}
+	if info == nil || info.RspAuth == "" {
+		if t.VerifyResponse == VerifyStrict {
+			return ErrRspAuthMissing
+		}
+		return nil
+	}
+	// bind the proof to this request's nonce, nc, cnonce, URI, qop and algorithm
+	if info.Nonce != "" && info.Nonce != cred.Nonce ||
+		info.Cnonce != "" && info.Cnonce != cred.Cnonce ||
+		info.QOP != "" && info.QOP != cred.QOP ||
+		info.Nc != 0 && info.Nc != cred.Nc {
+		return ErrRspAuthMismatch
+	}
+	if strings.EqualFold(cred.QOP, "auth-int") {
+		h, err := newHash(cred.Algorithm)
+		if err != nil {
+			return err
+		}
+		res.Body = newVerifiedBody(res.Body, h, info.RspAuth, cred, t.Username, t.Password)
+		return nil
+	}
+	want, err := rspAuth(cred, t.Username, t.Password, "")
+	if err != nil {
+		return err
+	}
+	if !verifyRspAuth(want, info.RspAuth) {
+		return ErrRspAuthMismatch
+	}
+	return nil
 }
 
 // RoundTrip will try to authorize the request using a cached challenge.
@@ -165,7 +219,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
+	cred, probe, err := t.prepare(first)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +236,11 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if res.StatusCode != http.StatusUnauthorized {
 		if !probe {
+			if err := t.verify(res, cred); err != nil {
+				_, _ = io.Copy(io.Discard, res.Body)
+				_ = res.Body.Close()
+				return nil, err
+			}
 			return res, nil
 		}
 		// a probe response isn't valid for the caller since the body was
@@ -192,7 +251,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		return tr.RoundTrip(second)
+		res, err = tr.RoundTrip(second)
+		if err != nil {
+			return res, err
+		}
+		// this request carries no credentials, so its proof is not verified
+		return res, nil
 	}
 	// drain and close the first message body
 	_, _ = io.Copy(io.Discard, res.Body)
@@ -210,10 +274,20 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
+	cred, _, err = t.prepare(second)
+	if err != nil {
 		return nil, err
 	}
-	return tr.RoundTrip(second)
+	res, err = tr.RoundTrip(second)
+	if err != nil {
+		return res, err
+	}
+	if err := t.verify(res, cred); err != nil {
+		_, _ = io.Copy(io.Discard, res.Body)
+		_ = res.Body.Close()
+		return nil, err
+	}
+	return res, nil
 }
 
 // CloseIdleConnections delegates the call to the underlying transport.

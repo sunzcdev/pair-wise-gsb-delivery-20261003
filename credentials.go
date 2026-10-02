@@ -56,7 +56,7 @@ func ParseCredentials(s string) (*Credentials, error) {
 		case "qop":
 			c.QOP = p.Value
 		case "nc":
-			nc, err := strconv.ParseInt(p.Value, 16, 32)
+			nc, err := parseHexNc(p.Value)
 			if err != nil {
 				return nil, fmt.Errorf("digest: invalid nc: %w", err)
 			}
@@ -66,6 +66,15 @@ func ParseCredentials(s string) (*Credentials, error) {
 		}
 	}
 	return &c, nil
+}
+
+// parseHexNc parses the hexadecimal nonce count value.
+func parseHexNc(s string) (int, error) {
+	nc, err := strconv.ParseInt(s, 16, 32)
+	if err != nil {
+		return 0, err
+	}
+	return int(nc), nil
 }
 
 // String formats the credentials into the header format

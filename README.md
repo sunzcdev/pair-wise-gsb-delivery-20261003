@@ -180,6 +180,37 @@ usual.
 
 ## Low Level API
 
+## Verifying Server Responses
+
+Some servers prove their identity in the `Authentication-Info` response
+header using `rspauth`. By default the transport ignores that proof. Set
+`VerifyResponse` to opt in:
+
+``` go
+client := &http.Client{
+    Transport: &digest.Transport{
+        Username:       "foo",
+        Password:       "bar",
+        VerifyResponse: digest.VerifyStrict, // require a correct rspauth
+    },
+}
+```
+
+Two modes are available:
+
+- `digest.VerifyCompat` accepts responses without an `rspauth` proof, but
+  rejects responses whose proof is wrong (`digest.ErrRspAuthMismatch`).
+- `digest.VerifyStrict` requires the proof on every authenticated response;
+  a missing proof fails with `digest.ErrRspAuthMissing`.
+
+The proof is always bound to this request's `nonce`, `nc`, `cnonce`, `URI`,
+qop and digest algorithm. With `qop=auth` it is checked before the response
+is returned. With `qop=auth-int` the response body is wrapped and the entity
+digest is computed while streaming: the verdict arrives at `EOF`, so closing
+the body early reports `digest.ErrRspAuthMissing`; underlying read errors are
+passed through unchanged. The body is streamed through a single read and never
+buffered whole. `nextnonce` is ignored.
+
 ``` go
 func main() {
   // get the challenge from a 401 response
