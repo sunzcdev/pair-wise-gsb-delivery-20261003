@@ -242,6 +242,10 @@ const (
 	payloadRange = (1 << 6) | (1 << 7)
 )
 
+// recordMask selects the tag bits of a record header byte, the remaining bits
+// hold the length of the variable-length value carried by the record.
+const recordMask = rawKSUID | timeDelta | payloadDelta | payloadRange
+
 // CompressedSetIter is an iterator type returned by Set.Iter to produce the
 // list of KSUIDs stored in a set.
 //
@@ -285,9 +289,8 @@ func (it *CompressedSetIter) Next() bool {
 	b := it.content[it.offset]
 	it.offset++
 
-	const mask = rawKSUID | timeDelta | payloadDelta | payloadRange
-	tag := int(b) & mask
-	cnt := int(b) & ^mask
+	tag := int(b) & recordMask
+	cnt := int(b) & ^recordMask
 
 	switch tag {
 	case rawKSUID:
