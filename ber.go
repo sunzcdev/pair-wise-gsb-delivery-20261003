@@ -243,7 +243,21 @@ func printPacket(out io.Writer, p *Packet, indent int, printBytes bool) {
 
 // ReadPacket reads a single Packet from the reader.
 func ReadPacket(reader io.Reader) (*Packet, error) {
-	p, _, err := readPacket(reader, 0)
+	p, _, err := readPacket(reader, 0, defaultDecodeConfig())
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// ReadPacketWithOptions behaves like [ReadPacket] with the given decode
+// options, such as [WithIntegerMode] and [WithMaxIntegerBytes].
+func ReadPacketWithOptions(reader io.Reader, opts ...DecodeOption) (*Packet, error) {
+	cfg := defaultDecodeConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	p, _, err := readPacket(reader, 0, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +317,7 @@ func int64Length(i int64) (numBytes int) {
 // DecodePacket decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacket(data []byte) *Packet {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
+	p, _, err := readPacket(bytes.NewBuffer(data), 0, defaultDecodeConfig())
 	if err != nil {
 		return nil
 	}
@@ -314,7 +328,21 @@ func DecodePacket(data []byte) *Packet {
 // DecodePacketErr decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacketErr(data []byte) (*Packet, error) {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
+	p, _, err := readPacket(bytes.NewBuffer(data), 0, defaultDecodeConfig())
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// DecodePacketErrWithOptions behaves like [DecodePacketErr] with the given
+// decode options, such as [WithIntegerMode] and [WithMaxIntegerBytes].
+func DecodePacketErrWithOptions(data []byte, opts ...DecodeOption) (*Packet, error) {
+	cfg := defaultDecodeConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	p, _, err := readPacket(bytes.NewBuffer(data), 0, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +350,7 @@ func DecodePacketErr(data []byte) (*Packet, error) {
 }
 
 // readPacket reads a single Packet from the reader, returning the number of bytes read.
-func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
+func readPacket(reader io.Reader, depth int, cfg decodeConfig) (*Packet, int, error) {
 	if MaxNestingDepth > 0 && depth >= MaxNestingDepth {
 		return nil, 0, fmt.Errorf("nesting depth %d exceeds maximum %d", depth, MaxNestingDepth)
 	}
@@ -362,7 +390,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			}
 
 			// Read the next packet
-			child, r, err := readPacket(reader, depth+1)
+			child, r, err := readPacket(reader, depth+1, cfg)
 			if err != nil {
 				return nil, read, unexpectedEOF(err)
 			}
@@ -422,7 +450,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 
 			p.Value = val != 0
 		case TagInteger:
-			p.Value, err = ParseInt64(content)
+			p.Value, err = decodeIntegerContent(content, cfg)
 		case TagBitString:
 		case TagOctetString:
 			// the actual string encoding is not known here
@@ -440,7 +468,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 		case TagRealFloat:
 			p.Value, err = ParseReal(content)
 		case TagEnumerated:
-			p.Value, err = ParseInt64(content)
+			p.Value, err = decodeIntegerContent(content, cfg)
 		case TagEmbeddedPDV:
 		case TagUTF8String:
 			val := DecodeString(content)

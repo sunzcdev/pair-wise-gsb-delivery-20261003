@@ -10,6 +10,19 @@ All notable changes to this project are documented here. The format is based on
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
+- `NewBigInteger` / `NewBigIntegerErr`: construct an `INTEGER` from a
+  `*math/big.Int`, encoded as the minimal two's complement form (negative
+  values in two's complement, a leading `0x00` sign octet when the top bit is
+  set, zero as a single `0x00`). The constructor copies its input, so the
+  packet never shares mutable storage with the caller's `big.Int`.
+- `DecodePacketErrWithOptions` and `ReadPacketWithOptions`, with the
+  `WithIntegerMode` (`IntegerModeInt64` / `IntegerModeBig` / `IntegerModeAuto`)
+  and `WithMaxIntegerBytes` decode options. Big mode yields `*big.Int` for
+  every integer; auto mode yields `int64` when the value fits and `*big.Int`
+  otherwise. The integer-byte budget (default
+  `DefaultMaxIntegerBytes`, 4096 octets) bounds redundant sign-extension
+  octets, including in the default int64-compatible mode. Default decoding is
+  unchanged.
 
 ### Changed
 

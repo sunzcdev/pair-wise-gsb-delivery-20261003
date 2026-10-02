@@ -52,6 +52,28 @@ recursion.
 See the [reference documentation](https://pkg.go.dev/github.com/go-asn1-ber/asn1-ber)
 for the full API.
 
+## Large integers
+
+`INTEGER` values decode to `int64` by default, for backwards compatibility.
+Values wider than eight content octets are rejected in that mode. Build and
+decode arbitrary-precision integers with `math/big` instead:
+
+```go
+packet := ber.NewBigInteger(ber.ClassUniversal, ber.TypePrimitive, ber.TagInteger, bigInt, "")
+
+// Always decode integers as *big.Int ...
+p, err := ber.DecodePacketErrWithOptions(packet.Bytes(), ber.WithIntegerMode(ber.IntegerModeBig))
+
+// ... or keep int64 for values that fit and use *big.Int only for wider ones.
+p, err = ber.DecodePacketErrWithOptions(packet.Bytes(), ber.WithIntegerMode(ber.IntegerModeAuto))
+```
+
+Integers are encoded in the minimal two's-complement form. The constructor
+copies its input, so mutating the `big.Int` afterwards does not affect the
+packet. `WithMaxIntegerBytes` bounds how many content octets (including BER's
+redundant sign-extension octets) are accepted when decoding untrusted input;
+the default is `DefaultMaxIntegerBytes`.
+
 ## Development
 
 ```sh
