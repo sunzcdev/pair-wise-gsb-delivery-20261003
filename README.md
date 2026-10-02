@@ -211,6 +211,30 @@ opt := secure.Options{
 }
 ~~~
 
+### Named policy sets (multi-tenant)
+For services that need a different security policy per request (e.g. per tenant), `PolicyMux` holds a set of pre-compiled, named policies. A `PolicySelector` returns only the policy name; it is called exactly once per request, and the host checks, HTTPS redirects and security headers for that request all use the selected policy.
+
+~~~ go
+mux, err := secure.NewPolicyMux(
+	func(r *http.Request) string {
+		return r.Header.Get("X-Tenant") // selector returns only the policy name
+	},
+	map[string]secure.Options{
+		"tenant-a": {SSLRedirect: true, STSSeconds: 31536000},
+		"tenant-b": {ContentSecurityPolicy: "default-src 'self'"},
+	},
+)
+if err != nil {
+	log.Fatal(err)
+}
+
+app := mux.Handler(myHandler)
+~~~
+
+* Unknown policy names fail closed: the request is rejected and no permissive default is applied. Use `SetBadPolicyHandler` to customize the rejection response.
+* Every policy set is validated (regular expressions and header values) before it is published. `Update` swaps the active set atomically; an invalid update returns an error and keeps the previous version.
+* The supplied maps and slices are deep-copied, so mutating them later cannot alter the active set.
+
 ## Integration examples
 
 ### [chi](https://github.com/pressly/chi)
