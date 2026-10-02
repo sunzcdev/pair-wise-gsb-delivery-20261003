@@ -1,5 +1,34 @@
 module GraphQL::Batch
   class Loader
+    # Outcome of a single key in a #load_many_settled result sequence.
+    # A fulfilled result may hold a nil value; use #fulfilled?/#rejected?
+    # rather than inspecting the value to determine the outcome.
+    class SettledResult
+      attr_reader :value, :reason
+
+      def self.fulfilled(value)
+        new(true, value, nil)
+      end
+
+      def self.rejected(reason)
+        new(false, nil, reason)
+      end
+
+      def initialize(fulfilled, value, reason)
+        @fulfilled = fulfilled
+        @value = value
+        @reason = reason
+      end
+
+      def fulfilled?
+        @fulfilled
+      end
+
+      def rejected?
+        !@fulfilled
+      end
+    end
+
     class << self
       def for(*group_args, **group_kwargs)
         current_executor.loader(loader_key_for(*group_args, **group_kwargs)) do
@@ -17,6 +46,10 @@ module GraphQL::Batch
 
       def load_many(keys)
         self.for.load_many(keys)
+      end
+
+      def load_many_settled(keys)
+        self.for.load_many_settled(keys)
       end
 
       private
@@ -53,6 +86,20 @@ module GraphQL::Batch
 
     def load_many(keys)
       ::Promise.all(keys.map { |key| load(key) })
+    end
+
+    # Like #load_many, but the returned promise always fulfills with one
+    # SettledResult per input key, in input order, even when individual
+    # keys are rejected. Duplicate keys share the same underlying promise
+    # while each input position gets its own result.
+    def load_many_settled(keys)
+      settled = keys.map do |key|
+        load(key).then(
+          ->(value) { SettledResult.fulfilled(value) },
+          ->(reason) { SettledResult.rejected(reason) }
+        )
+      end
+      ::Promise.all(settled)
     end
 
     def prime(key, value)

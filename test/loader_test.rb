@@ -63,6 +63,21 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
     end
   end
 
+  class MemoryLoader < GraphQL::Batch::Loader
+    DATA = { a: 1, b: 2, nil_value: nil }
+
+    def perform(keys)
+      keys.each do |key|
+        if key == :rejected
+          reject(key, ArgumentError.new("bad key"))
+        elsif DATA.key?(key)
+          fulfill(key, DATA[key])
+        end
+        # Any other key is left pending, like a record missing from the store
+      end
+    end
+  end
+
   class KwargsGroupCountLoader < GraphQL::Batch::Loader
     def initialize(group, key: :id, preload: true, **conditions)
     end
@@ -119,6 +134,67 @@ class GraphQL::Batch::LoaderTest < Minitest::Test
 
   def test_query_many
     assert_equal [:a, :b, :c], EchoLoader.load_many([:a, :b, :c]).sync
+  end
+
+  def test_load_many_settled_with_mixed_results
+    results = MemoryLoader.load_many_settled([:a, :nil_value, :missing, :rejected, :a]).sync
+
+    assert_equal 5, results.size
+
+    assert results[0].fulfilled?
+    assert_equal 1, results[0].value
+
+    assert results[1].fulfilled?
+    assert_nil results[1].value
+
+    assert results[2].rejected?
+    assert_kind_of GraphQL::Batch::BrokenPromiseError, results[2].reason
+
+    assert results[3].rejected?
+    assert_kind_of ArgumentError, results[3].reason
+    assert_equal 'bad key', results[3].reason.message
+
+    assert results[4].fulfilled?
+    assert_equal 1, results[4].value
+  end
+
+  def test_load_many_settled_duplicate_keys_share_promise
+    loader = MemoryLoader.for
+    shared_promise = loader.load(:a)
+
+    results = loader.load_many_settled([:a, :a]).sync
+
+    assert_equal 1, shared_promise.sync
+    assert_equal 2, results.size
+    assert results.all?(&:fulfilled?)
+    assert_equal [1, 1], results.map(&:value)
+  end
+
+  def test_load_many_settled_with_empty_keys
+    assert_equal [], MemoryLoader.load_many_settled([]).sync
+  end
+
+  def test_load_many_settled_with_failing_perform
+    results = ExplodingLoader.load_many_settled([1, 2]).sync
+
+    assert_equal 2, results.size
+    assert results.all?(&:rejected?)
+    assert_equal ['perform failed', 'perform failed'], results.map { |result| result.reason.message }
+  end
+
+  def test_load_many_settled_query_in_callback
+    value = MemoryLoader.load_many_settled([:a]).then do |results|
+      EchoLoader.load(results.first.value + 1)
+    end.sync
+
+    assert_equal 2, value
+  end
+
+  def test_load_after_settled_failures_on_same_executor
+    results = ExplodingLoader.load_many_settled([1]).sync
+    assert results.first.rejected?
+
+    assert_equal :still_works, EchoLoader.load(:still_works).sync
   end
 
   def test_empty_group_query
