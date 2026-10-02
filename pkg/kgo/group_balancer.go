@@ -3,6 +3,7 @@ package kgo
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -1190,6 +1191,134 @@ func (s *stickyBalancer) Balance(b *ConsumerBalancer, topics map[string]int32) I
 // new strategy and things will work correctly. See KIP-429 for more details.
 func CooperativeStickyBalancer() GroupBalancer {
 	return &stickyBalancer{cooperative: true}
+}
+
+// StickyPartitionCost estimates how expensive one partition is to process.
+// A nil function uses a cost of one for every partition.
+type StickyPartitionCost func(topic string, partition int32) float64
+
+// WeightedStickyBalancer returns a sticky group balancer that balances
+// estimated partition processing cost by each member's capacity weight.
+//
+// Every process in the group constructs the balancer with its own positive
+// capacity weight. A weight of two means a member should receive roughly twice
+// as much processing cost as a weight of one. partitionCost is only used by the
+// group leader; return one for partitions whose cost is unknown.
+func WeightedStickyBalancer(capacityWeight float64, partitionCost StickyPartitionCost) (GroupBalancer, error) {
+	return newWeightedStickyBalancer(capacityWeight, partitionCost, false)
+}
+
+// CooperativeWeightedStickyBalancer is WeightedStickyBalancer with cooperative
+// rebalancing.
+func CooperativeWeightedStickyBalancer(capacityWeight float64, partitionCost StickyPartitionCost) (GroupBalancer, error) {
+	return newWeightedStickyBalancer(capacityWeight, partitionCost, true)
+}
+
+func newWeightedStickyBalancer(capacityWeight float64, partitionCost StickyPartitionCost, cooperative bool) (GroupBalancer, error) {
+	if capacityWeight <= 0 || math.IsNaN(capacityWeight) || math.IsInf(capacityWeight, 0) {
+		return nil, fmt.Errorf("invalid weighted sticky capacity weight %v", capacityWeight)
+	}
+	return &weightedStickyBalancer{
+		cooperative:   cooperative,
+		capacity:      capacityWeight,
+		partitionCost: partitionCost,
+	}, nil
+}
+
+type weightedStickyBalancer struct {
+	cooperative   bool
+	capacity      float64
+	partitionCost StickyPartitionCost
+}
+
+func (s *weightedStickyBalancer) ProtocolName() string {
+	if s.cooperative {
+		return "cooperative-weighted-sticky"
+	}
+	return "weighted-sticky"
+}
+
+func (s *weightedStickyBalancer) IsCooperative() bool { return s.cooperative }
+
+func (s *weightedStickyBalancer) JoinGroupMetadata(interests []string, currentAssignment map[string][]int32, generation int32) []byte {
+	meta := kmsg.NewConsumerMemberMetadata()
+	meta.Version = 3
+	meta.Topics = interests
+	meta.Generation = generation
+
+	current := make([]kmsg.StickyMemberMetadataCurrentAssignment, 0, len(currentAssignment))
+	for topic, partitions := range currentAssignment {
+		current = append(current, kmsg.StickyMemberMetadataCurrentAssignment{
+			Topic:      topic,
+			Partitions: partitions,
+		})
+		if s.cooperative {
+			owned := kmsg.NewConsumerMemberMetadataOwnedPartition()
+			owned.Topic = topic
+			owned.Partitions = partitions
+			meta.OwnedPartitions = append(meta.OwnedPartitions, owned)
+		}
+	}
+	sort.Slice(current, func(i, j int) bool { return current[i].Topic < current[j].Topic })
+	sort.Slice(meta.OwnedPartitions, func(i, j int) bool { return meta.OwnedPartitions[i].Topic < meta.OwnedPartitions[j].Topic })
+	meta.UserData = sticky.EncodeWeightedUserData(s.capacity, current, generation)
+	return meta.AppendTo(nil)
+}
+
+func (*weightedStickyBalancer) ParseSyncAssignment(assignment []byte) (map[string][]int32, error) {
+	return ParseConsumerSyncAssignment(assignment)
+}
+
+func (s *weightedStickyBalancer) MemberBalancer(members []kmsg.JoinGroupResponseMember) (GroupMemberBalancer, map[string]struct{}, error) {
+	b, err := NewConsumerBalancer(s, members)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var decodeErr error
+	b.EachMember(func(_ *kmsg.JoinGroupResponseMember, meta *kmsg.ConsumerMemberMetadata) {
+		if decodeErr == nil {
+			_, _, decodeErr = sticky.DecodeWeightedUserData(meta.UserData)
+		}
+	})
+	if decodeErr != nil {
+		return nil, nil, decodeErr
+	}
+	return b, b.MemberTopics(), nil
+}
+
+func (s *weightedStickyBalancer) Balance(b *ConsumerBalancer, topics map[string]int32) IntoSyncAssignment {
+	members := make([]sticky.WeightedMember, 0, len(b.Members()))
+	b.EachMember(func(member *kmsg.JoinGroupResponseMember, meta *kmsg.ConsumerMemberMetadata) {
+		weight, stickyMeta, err := sticky.DecodeWeightedUserData(meta.UserData)
+		if err != nil {
+			b.SetError(err)
+			return
+		}
+		members = append(members, sticky.WeightedMember{
+			ID:          member.MemberID,
+			Topics:      meta.Topics,
+			Weight:      weight,
+			Assignment:  stickyMeta.CurrentAssignment,
+			Owned:       meta.OwnedPartitions,
+			Generation:  meta.Generation,
+			Cooperative: s.cooperative,
+		})
+	})
+	if b.err != nil {
+		return nil
+	}
+
+	plan, err := sticky.WeightedBalance(members, topics, sticky.WeightedPartitionCost(s.partitionCost))
+	if err != nil {
+		b.SetError(err)
+		return nil
+	}
+	p := &BalancePlan{plan}
+	if s.cooperative {
+		p.AdjustCooperative(b)
+	}
+	return p
 }
 
 // AdjustCooperative performs the final adjustment to a plan for cooperative
