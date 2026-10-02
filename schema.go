@@ -43,10 +43,69 @@ type TableSchema struct {
 	// Name of the table. This must match the key in the Tables map in DBSchema.
 	Name string
 
+	// ObjectCopy, if non-nil, is invoked to copy objects as they cross the
+	// boundaries of the database: once on the way in (Insert) and once on
+	// the way out (First, Last, Get, iterators, etc.).
+	//
+	// The copy on the way in means the database stores an independent
+	// object, so callers may freely modify or reuse the object they passed
+	// to Insert without corrupting the database. The copy on the way out
+	// means callers own the object they receive and may modify it in-place
+	// without affecting the stored object or its index entries.
+	//
+	// If ObjectCopy is nil, objects are stored and returned as-is and the
+	// caller must not modify objects that have been inserted.
+	ObjectCopy ObjectCopyFunc
+
 	// Indexes is the set of indexes for querying this table. The key
 	// is a unique name for the index and must match the Name in the
 	// IndexSchema.
 	Indexes map[string]*IndexSchema
+}
+
+// ObjectCopyFunc is a function that returns an independent copy of an
+// object stored in a table. It is invoked by MemDB at the input and
+// output boundaries of a table when TableSchema.ObjectCopy is set.
+//
+// The returned object must be independent of the input object: mutating
+// either one must not affect the other. For objects containing reference
+// types (slices, maps, pointers) this typically requires a deep copy of
+// those fields.
+//
+// Returning an error or a nil object aborts the operation with an error
+// that identifies the table and the boundary at which the copy failed.
+type ObjectCopyFunc func(obj interface{}) (interface{}, error)
+
+// copyObjectIn copies an object crossing into the database. If no copy
+// function is configured the object is returned unchanged.
+func (s *TableSchema) copyObjectIn(obj interface{}) (interface{}, error) {
+	if s.ObjectCopy == nil {
+		return obj, nil
+	}
+	copied, err := s.ObjectCopy(obj)
+	if err != nil {
+		return nil, fmt.Errorf("table %q: failed to copy object on insert: %w", s.Name, err)
+	}
+	if copied == nil {
+		return nil, fmt.Errorf("table %q: object copy function returned nil on insert", s.Name)
+	}
+	return copied, nil
+}
+
+// copyObjectOut copies an object crossing out of the database. If no copy
+// function is configured the object is returned unchanged.
+func (s *TableSchema) copyObjectOut(obj interface{}) (interface{}, error) {
+	if s.ObjectCopy == nil {
+		return obj, nil
+	}
+	copied, err := s.ObjectCopy(obj)
+	if err != nil {
+		return nil, fmt.Errorf("table %q: failed to copy object on read: %w", s.Name, err)
+	}
+	if copied == nil {
+		return nil, fmt.Errorf("table %q: object copy function returned nil on read", s.Name)
+	}
+	return copied, nil
 }
 
 // Validate is used to validate the table schema

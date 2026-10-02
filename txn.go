@@ -177,9 +177,12 @@ func (txn *Txn) Commit() {
 
 // Insert is used to add or update an object into the given table.
 //
-// When updating an object, the obj provided should be a copy rather
-// than a value updated in-place. Modifying values in-place that are already
-// inserted into MemDB is not supported behavior.
+// If the table schema defines an ObjectCopy function, the object is copied
+// before it is stored and the indexes are built from the copy, so the
+// caller retains full ownership of the object passed in. Otherwise the
+// object is stored as-is: when updating an object, the obj provided should
+// be a copy rather than a value updated in-place. Modifying values
+// in-place that are already inserted into MemDB is not supported behavior.
 func (txn *Txn) Insert(table string, obj interface{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot insert in read-only transaction")
@@ -190,6 +193,16 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 	if !ok {
 		return fmt.Errorf("invalid table '%s'", table)
 	}
+
+	// Copy the object so that the database stores an independent object.
+	// The indexes are built from the copy so that the stored object and
+	// its index entries can never diverge, even if the caller modifies
+	// the original object after Insert returns.
+	copied, err := tableSchema.copyObjectIn(obj)
+	if err != nil {
+		return err
+	}
+	obj = copied
 
 	// Get the primary ID of the object
 	idSchema := tableSchema.Indexes[id]
@@ -547,6 +560,10 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 		if !ok {
 			return watch, nil, nil
 		}
+		obj, err = txn.db.schema.Tables[table].copyObjectOut(obj)
+		if err != nil {
+			return nil, nil, err
+		}
 		return watch, obj, nil
 	}
 
@@ -554,6 +571,12 @@ func (txn *Txn) FirstWatch(table, index string, args ...interface{}) (<-chan str
 	iter := indexTxn.Root().Iterator()
 	watch := iter.SeekPrefixWatch(val)
 	_, value, _ := iter.Next()
+	if value != nil {
+		value, err = txn.db.schema.Tables[table].copyObjectOut(value)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	return watch, value, nil
 }
 
@@ -587,6 +610,10 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 		if !ok {
 			return watch, nil, nil
 		}
+		obj, err = txn.db.schema.Tables[table].copyObjectOut(obj)
+		if err != nil {
+			return nil, nil, err
+		}
 		return watch, obj, nil
 	}
 
@@ -594,6 +621,12 @@ func (txn *Txn) LastWatch(table, index string, args ...interface{}) (<-chan stru
 	iter := indexTxn.Root().ReverseIterator()
 	watch := iter.SeekPrefixWatch(val)
 	_, value, _ := iter.Previous()
+	if value != nil {
+		value, err = txn.db.schema.Tables[table].copyObjectOut(value)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	return watch, value, nil
 }
 
@@ -648,6 +681,10 @@ func (txn *Txn) LongestPrefix(table, index string, args ...interface{}) (interfa
 	// Find the longest prefix match with the given index.
 	indexTxn := txn.readableIndex(table, indexSchema.Name)
 	if _, value, ok := indexTxn.Root().LongestPrefix(val); ok {
+		value, err = txn.db.schema.Tables[table].copyObjectOut(value)
+		if err != nil {
+			return nil, err
+		}
 		return value, nil
 	}
 	return nil, nil
@@ -752,8 +789,9 @@ func (txn *Txn) Get(table, index string, args ...interface{}) (ResultIterator, e
 
 	// Create an iterator
 	iter := &radixIterator{
-		iter:    indexIter,
-		watchCh: watchCh,
+		iter:        indexIter,
+		watchCh:     watchCh,
+		tableSchema: txn.db.schema.Tables[table],
 	}
 	return iter, nil
 }
@@ -777,8 +815,9 @@ func (txn *Txn) GetReverse(table, index string, args ...interface{}) (ResultIter
 
 	// Create an iterator
 	iter := &radixReverseIterator{
-		iter:    indexIter,
-		watchCh: watchCh,
+		iter:        indexIter,
+		watchCh:     watchCh,
+		tableSchema: txn.db.schema.Tables[table],
 	}
 	return iter, nil
 }
@@ -807,7 +846,8 @@ func (txn *Txn) LowerBound(table, index string, args ...interface{}) (ResultIter
 
 	// Create an iterator
 	iter := &radixIterator{
-		iter: indexIter,
+		iter:        indexIter,
+		tableSchema: txn.db.schema.Tables[table],
 	}
 	return iter, nil
 }
@@ -833,7 +873,8 @@ func (txn *Txn) ReverseLowerBound(table, index string, args ...interface{}) (Res
 
 	// Create an iterator
 	iter := &radixReverseIterator{
-		iter: indexIter,
+		iter:        indexIter,
+		tableSchema: txn.db.schema.Tables[table],
 	}
 	return iter, nil
 }
@@ -967,8 +1008,9 @@ func (txn *Txn) Defer(fn func()) {
 // This is much more efficient than a sliceIterator as we are not
 // materializing the entire view.
 type radixIterator struct {
-	iter    *iradix.Iterator
-	watchCh <-chan struct{}
+	iter        *iradix.Iterator
+	watchCh     <-chan struct{}
+	tableSchema *TableSchema
 }
 
 func (r *radixIterator) WatchCh() <-chan struct{} {
@@ -980,18 +1022,33 @@ func (r *radixIterator) Next() interface{} {
 	if !ok {
 		return nil
 	}
+	if r.tableSchema != nil {
+		copied, err := r.tableSchema.copyObjectOut(value)
+		if err != nil {
+			panic(err)
+		}
+		return copied
+	}
 	return value
 }
 
 type radixReverseIterator struct {
-	iter    *iradix.ReverseIterator
-	watchCh <-chan struct{}
+	iter        *iradix.ReverseIterator
+	watchCh     <-chan struct{}
+	tableSchema *TableSchema
 }
 
 func (r *radixReverseIterator) Next() interface{} {
 	_, value, ok := r.iter.Previous()
 	if !ok {
 		return nil
+	}
+	if r.tableSchema != nil {
+		copied, err := r.tableSchema.copyObjectOut(value)
+		if err != nil {
+			panic(err)
+		}
+		return copied
 	}
 	return value
 }
