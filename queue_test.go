@@ -15,7 +15,7 @@ func (q *TransmitLimitedQueue) orderedView() []*limitedBroadcast {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	out := make([]*limitedBroadcast, 0, q.lenLocked())
+	out := make([]*limitedBroadcast, 0, q.count)
 	q.walkReadOnlyLocked(true, func(cur *limitedBroadcast) bool {
 		out = append(out, cur)
 		return true

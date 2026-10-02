@@ -37,6 +37,13 @@ func (b *memberlistBroadcast) Name() string {
 	return b.node
 }
 
+// memberlist.PriorityBroadcast optional interface. Membership changes
+// (alive/suspect/dead/refute messages) are time-sensitive, so they are
+// queued ahead of ordinary traffic.
+func (b *memberlistBroadcast) BroadcastPriority() BroadcastPriority {
+	return BroadcastPriorityHigh
+}
+
 func (b *memberlistBroadcast) Message() []byte {
 	return b.msg
 }

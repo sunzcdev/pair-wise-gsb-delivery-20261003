@@ -24,10 +24,84 @@ type TransmitLimitedQueue struct {
 	// number of retransmissions attempted.
 	RetransmitMult int
 
-	mu    sync.Mutex
-	tq    *btree.BTree // stores *limitedBroadcast as btree.Item
-	tm    map[string]*limitedBroadcast
-	idGen int64
+	// StarvationLimit bounds how many consecutive GetBroadcasts calls may
+	// skip a non-empty lower-priority class in favor of higher-priority
+	// traffic before the lower-priority class is served first. Values less
+	// than 1 select DefaultStarvationLimit.
+	StarvationLimit int
+
+	mu      sync.Mutex
+	classes [numBroadcastPriorityClasses]priorityClassQueue
+	tm      map[string]*limitedBroadcast
+	idGen   int64
+	count   int
+}
+
+// BroadcastPriority identifies one of a small, fixed set of priority
+// classes. Lower values are served first by GetBroadcasts, subject to the
+// anti-starvation policy configured by StarvationLimit.
+type BroadcastPriority int
+
+const (
+	// BroadcastPriorityHigh is intended for cluster membership changes
+	// (alive/suspect/dead style messages) that should preempt ordinary
+	// traffic.
+	BroadcastPriorityHigh BroadcastPriority = iota
+	// BroadcastPriorityNormal is the default class for broadcasts that do
+	// not implement PriorityBroadcast.
+	BroadcastPriorityNormal
+	// BroadcastPriorityLow is intended for bulk application traffic that
+	// should yield to everything else.
+	BroadcastPriorityLow
+
+	// numBroadcastPriorityClasses is the fixed number of priority classes.
+	// Values outside [0, numBroadcastPriorityClasses) are clamped.
+	numBroadcastPriorityClasses
+)
+
+// DefaultBroadcastPriority is the class assigned to broadcasts that do not
+// implement PriorityBroadcast.
+const DefaultBroadcastPriority = BroadcastPriorityNormal
+
+// DefaultStarvationLimit is used when StarvationLimit is less than 1. A
+// lower-priority class that has been bypassed this many consecutive times
+// is served ahead of higher-priority classes on the next call.
+const DefaultStarvationLimit = 2
+
+// priorityClassQueue holds the per-class ordered queue plus the
+// anti-starvation bookkeeping for that class.
+type priorityClassQueue struct {
+	tq *btree.BTree // stores *limitedBroadcast as btree.Item
+
+	// bypassed counts consecutive GetBroadcasts calls in which this class
+	// had pending messages but higher-priority traffic was served instead.
+	bypassed int
+}
+
+// len returns the number of queued messages in this class.
+func (c *priorityClassQueue) len() int {
+	if c.tq == nil {
+		return 0
+	}
+	return c.tq.Len()
+}
+
+// transmitRange returns a pair of min/max values for transmit values
+// represented by the current class contents. Both values represent actual
+// transmit values on the interval [0, len).
+func (c *priorityClassQueue) transmitRange() (minTransmit, maxTransmit int) {
+	if c.len() == 0 {
+		return 0, 0
+	}
+	minItem, maxItem := c.tq.Min(), c.tq.Max()
+	if minItem == nil || maxItem == nil {
+		return 0, 0
+	}
+
+	min := minItem.(*limitedBroadcast).transmits
+	max := maxItem.(*limitedBroadcast).transmits
+
+	return min, max
 }
 
 type limitedBroadcast struct {
@@ -36,7 +110,8 @@ type limitedBroadcast struct {
 	id        int64 // btree-key[2]: unique incrementing id stamped at submission time
 	b         Broadcast
 
-	name string // set if Broadcast is a NamedBroadcast
+	priority BroadcastPriority // the class this broadcast is queued in
+	name     string            // set if Broadcast is a NamedBroadcast
 }
 
 // Less tests whether the current item is less than the given argument.
@@ -68,33 +143,48 @@ func (b *limitedBroadcast) Less(than btree.Item) bool {
 // natural order (by Less) when reverse=false and the opposite when true. You
 // must hold the mutex.
 //
+// Classes are visited in deterministic priority order (highest first); the
+// traversal never depends on map iteration order.
+//
 // This method panics if you attempt to mutate the item during traversal.  The
 // underlying btree should also not be mutated during traversal.
 func (q *TransmitLimitedQueue) walkReadOnlyLocked(reverse bool, f func(*limitedBroadcast) bool) {
-	if q.lenLocked() == 0 {
+	if q.count == 0 {
 		return
 	}
 
-	iter := func(item btree.Item) bool {
-		cur := item.(*limitedBroadcast)
-
-		prevTransmits := cur.transmits
-		prevMsgLen := cur.msgLen
-		prevID := cur.id
-
-		keepGoing := f(cur)
-
-		if prevTransmits != cur.transmits || prevMsgLen != cur.msgLen || prevID != cur.id {
-			panic("edited queue while walking read only")
+	for c := range q.classes {
+		class := &q.classes[c]
+		if class.len() == 0 {
+			continue
 		}
 
-		return keepGoing
-	}
+		keepGoing := true
+		iter := func(item btree.Item) bool {
+			cur := item.(*limitedBroadcast)
 
-	if reverse {
-		q.tq.Descend(iter) // end with transmit 0
-	} else {
-		q.tq.Ascend(iter) // start with transmit 0
+			prevTransmits := cur.transmits
+			prevMsgLen := cur.msgLen
+			prevID := cur.id
+
+			keepGoing = f(cur)
+
+			if prevTransmits != cur.transmits || prevMsgLen != cur.msgLen || prevID != cur.id {
+				panic("edited queue while walking read only")
+			}
+
+			return keepGoing
+		}
+
+		if reverse {
+			class.tq.Descend(iter) // end with transmit 0
+		} else {
+			class.tq.Ascend(iter) // start with transmit 0
+		}
+
+		if !keepGoing {
+			return
+		}
 	}
 }
 
@@ -149,6 +239,37 @@ type UniqueBroadcast interface {
 	UniqueBroadcast()
 }
 
+// PriorityBroadcast is an optional interface that a Broadcast can implement
+// to control which priority class it is queued in. Broadcasts that do not
+// implement it are assigned DefaultBroadcastPriority.
+//
+// Higher-priority classes are served first, but the anti-starvation policy
+// (see StarvationLimit) guarantees that lower-priority classes still make
+// progress under sustained higher-priority load.
+type PriorityBroadcast interface {
+	Broadcast
+	// BroadcastPriority returns the priority class for this broadcast.
+	// Values are clamped to [0, numBroadcastPriorityClasses).
+	BroadcastPriority() BroadcastPriority
+}
+
+// broadcastPriorityOf resolves the priority class for a broadcast, applying
+// the default and clamping out-of-range values.
+func broadcastPriorityOf(b Broadcast) BroadcastPriority {
+	pb, ok := b.(PriorityBroadcast)
+	if !ok {
+		return DefaultBroadcastPriority
+	}
+	p := pb.BroadcastPriority()
+	if p < 0 {
+		return 0
+	}
+	if p >= numBroadcastPriorityClasses {
+		return numBroadcastPriorityClasses - 1
+	}
+	return p
+}
+
 // QueueBroadcast is used to enqueue a broadcast
 func (q *TransmitLimitedQueue) QueueBroadcast(b Broadcast) {
 	q.queueBroadcast(b, 0)
@@ -157,8 +278,10 @@ func (q *TransmitLimitedQueue) QueueBroadcast(b Broadcast) {
 // lazyInit initializes internal data structures the first time they are
 // needed.  You must already hold the mutex.
 func (q *TransmitLimitedQueue) lazyInit() {
-	if q.tq == nil {
-		q.tq = btree.New(32)
+	for c := range q.classes {
+		if q.classes[c].tq == nil {
+			q.classes[c].tq = btree.New(32)
+		}
 	}
 	if q.tm == nil {
 		q.tm = make(map[string]*limitedBroadcast)
@@ -187,6 +310,7 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 		msgLen:    int64(len(b.Message())),
 		id:        id,
 		b:         b,
+		priority:  broadcastPriorityOf(b),
 	}
 	unique := false
 	if nb, ok := b.(NamedBroadcast); ok {
@@ -198,29 +322,38 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 	// Check if this message invalidates another.
 	if lb.name != "" {
 		if old, ok := q.tm[lb.name]; ok {
+			// The replacement is a new logical version of the broadcast:
+			// the old entry is dropped entirely so the new one starts with
+			// a fresh transmit budget rather than inheriting whatever the
+			// old version had already consumed.
 			old.b.Finished()
 			q.deleteItem(old)
 		}
 	} else if !unique {
 		// Slow path, hopefully nothing hot hits this.
 		var remove []*limitedBroadcast
-		q.tq.Ascend(func(item btree.Item) bool {
-			cur := item.(*limitedBroadcast)
-
-			// Special Broadcasts can only invalidate each other.
-			switch cur.b.(type) {
-			case NamedBroadcast:
-				// noop
-			case UniqueBroadcast:
-				// noop
-			default:
-				if b.Invalidates(cur.b) {
-					cur.b.Finished()
-					remove = append(remove, cur)
-				}
+		for c := range q.classes {
+			if q.classes[c].len() == 0 {
+				continue
 			}
-			return true
-		})
+			q.classes[c].tq.Ascend(func(item btree.Item) bool {
+				cur := item.(*limitedBroadcast)
+
+				// Special Broadcasts can only invalidate each other.
+				switch cur.b.(type) {
+				case NamedBroadcast:
+					// noop
+				case UniqueBroadcast:
+					// noop
+				default:
+					if b.Invalidates(cur.b) {
+						cur.b.Finished()
+						remove = append(remove, cur)
+					}
+				}
+				return true
+			})
+		}
 		for _, cur := range remove {
 			q.deleteItem(cur)
 		}
@@ -233,12 +366,19 @@ func (q *TransmitLimitedQueue) queueBroadcast(b Broadcast, initialTransmits int)
 // deleteItem removes the given item from the overall datastructure. You
 // must already hold the mutex.
 func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
-	_ = q.tq.Delete(cur)
+	class := &q.classes[cur.priority]
+	if class.tq != nil {
+		_ = class.tq.Delete(cur)
+		if class.tq.Len() == 0 {
+			class.bypassed = 0
+		}
+	}
 	if cur.name != "" {
 		delete(q.tm, cur.name)
 	}
+	q.count--
 
-	if q.tq.Len() == 0 {
+	if q.count == 0 {
 		// At idle there's no reason to let the id generator keep going
 		// indefinitely.
 		q.idGen = 0
@@ -248,28 +388,38 @@ func (q *TransmitLimitedQueue) deleteItem(cur *limitedBroadcast) {
 // addItem adds the given item into the overall datastructure. You must already
 // hold the mutex.
 func (q *TransmitLimitedQueue) addItem(cur *limitedBroadcast) {
-	_ = q.tq.ReplaceOrInsert(cur)
+	_ = q.classes[cur.priority].tq.ReplaceOrInsert(cur)
 	if cur.name != "" {
 		q.tm[cur.name] = cur
 	}
+	q.count++
 }
 
-// getTransmitRange returns a pair of min/max values for transmit values
-// represented by the current queue contents. Both values represent actual
-// transmit values on the interval [0, len). You must already hold the mutex.
-func (q *TransmitLimitedQueue) getTransmitRange() (minTransmit, maxTransmit int) {
-	if q.lenLocked() == 0 {
-		return 0, 0
-	}
-	minItem, maxItem := q.tq.Min(), q.tq.Max()
-	if minItem == nil || maxItem == nil {
-		return 0, 0
+// servingOrderLocked returns the deterministic order in which priority
+// classes are visited by GetBroadcasts. Classes are normally visited from
+// highest to lowest priority, except that any class that has been bypassed
+// at least StarvationLimit consecutive times is moved to the front (ties
+// broken by priority). The result depends only on per-class state, never on
+// map iteration order. You must hold the mutex.
+func (q *TransmitLimitedQueue) servingOrderLocked() []int {
+	limit := q.StarvationLimit
+	if limit < 1 {
+		limit = DefaultStarvationLimit
 	}
 
-	min := minItem.(*limitedBroadcast).transmits
-	max := maxItem.(*limitedBroadcast).transmits
-
-	return min, max
+	order := make([]int, 0, len(q.classes))
+	for pass := 0; pass < 2; pass++ {
+		for c := range q.classes {
+			if q.classes[c].len() == 0 {
+				continue
+			}
+			starved := q.classes[c].bypassed >= limit
+			if (pass == 0) == starved {
+				order = append(order, c)
+			}
+		}
+	}
+	return order
 }
 
 // GetBroadcasts is used to get a number of broadcasts, up to a byte limit
@@ -279,7 +429,7 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 	defer q.mu.Unlock()
 
 	// Fast path the default case
-	if q.lenLocked() == 0 {
+	if q.count == 0 {
 		return nil
 	}
 
@@ -288,14 +438,68 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 	var (
 		bytesUsed int
 		toSend    [][]byte
-		reinsert  []*limitedBroadcast
+		hadItems  [numBroadcastPriorityClasses]bool
+		served    [numBroadcastPriorityClasses]bool
+	)
+	for c := range q.classes {
+		hadItems[c] = q.classes[c].len() > 0
+	}
+
+	// Visit classes in deterministic priority order, except that classes
+	// that have been starved for too long jump the queue.
+	for _, classIdx := range q.servingOrderLocked() {
+		if limit-bytesUsed-overhead <= 0 {
+			break // bail out early
+		}
+		msgs := q.gatherClassLocked(&q.classes[classIdx], overhead, limit, &bytesUsed, transmitLimit)
+		if len(msgs) > 0 {
+			served[classIdx] = true
+			toSend = append(toSend, msgs...)
+		}
+	}
+
+	// Update the anti-starvation bookkeeping: a class that had messages
+	// pending but was skipped while a higher-priority class was served
+	// counts as bypassed.
+	for c := range q.classes {
+		class := &q.classes[c]
+		if served[c] || class.len() == 0 {
+			class.bypassed = 0
+			continue
+		}
+		if !hadItems[c] {
+			continue
+		}
+		for h := 0; h < c; h++ {
+			if served[h] {
+				class.bypassed++
+				break
+			}
+		}
+	}
+
+	return toSend
+}
+
+// gatherClassLocked selects messages from a single priority class, up to
+// the remaining byte budget. bytesUsed is shared with the caller so the
+// per-message overhead accounting matches across classes. You must hold the
+// mutex.
+func (q *TransmitLimitedQueue) gatherClassLocked(class *priorityClassQueue, overhead, limit int, bytesUsed *int, transmitLimit int) [][]byte {
+	if class.len() == 0 {
+		return nil
+	}
+
+	var (
+		toSend   [][]byte
+		reinsert []*limitedBroadcast
 	)
 
 	// Visit fresher items first, but only look at stuff that will fit.
 	// We'll go tier by tier, grabbing the largest items first.
-	minTr, maxTr := q.getTransmitRange()
+	minTr, maxTr := class.transmitRange()
 	for transmits := minTr; transmits <= maxTr; /*do not advance automatically*/ {
-		free := int64(limit - bytesUsed - overhead)
+		free := int64(limit - *bytesUsed - overhead)
 		if free <= 0 {
 			break // bail out early
 		}
@@ -314,7 +518,7 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 			id:        math.MaxInt64,
 		}
 		var keep *limitedBroadcast
-		q.tq.AscendRange(greaterOrEqual, lessThan, func(item btree.Item) bool {
+		class.tq.AscendRange(greaterOrEqual, lessThan, func(item btree.Item) bool {
 			cur := item.(*limitedBroadcast)
 			// Check if this is within our limits
 			if int64(len(cur.b.Message())) > free {
@@ -336,7 +540,7 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 		msg := keep.b.Message()
 
 		// Add to slice to send
-		bytesUsed += overhead + len(msg)
+		*bytesUsed += overhead + len(msg)
 		toSend = append(toSend, msg)
 
 		// Check if we should stop transmission
@@ -365,16 +569,7 @@ func (q *TransmitLimitedQueue) GetBroadcasts(overhead, limit int) [][]byte {
 func (q *TransmitLimitedQueue) NumQueued() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.lenLocked()
-}
-
-// lenLocked returns the length of the overall queue datastructure. You must
-// hold the mutex.
-func (q *TransmitLimitedQueue) lenLocked() int {
-	if q.tq == nil {
-		return 0
-	}
-	return q.tq.Len()
+	return q.count
 }
 
 // Reset clears all the queued messages. Should only be used for tests.
@@ -387,25 +582,32 @@ func (q *TransmitLimitedQueue) Reset() {
 		return true
 	})
 
-	q.tq = nil
+	q.classes = [numBroadcastPriorityClasses]priorityClassQueue{}
 	q.tm = nil
 	q.idGen = 0
+	q.count = 0
 }
 
 // Prune will retain the maxRetain latest messages, and the rest
 // will be discarded. This can be used to prevent unbounded queue sizes
+//
+// Messages are discarded from the lowest-priority class first; within a
+// class the oldest (most-transmitted) messages go first.
 func (q *TransmitLimitedQueue) Prune(maxRetain int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	// Do nothing if queue size is less than the limit
-	for q.tq.Len() > maxRetain {
-		item := q.tq.Max()
-		if item == nil {
-			break
+	for c := len(q.classes) - 1; c >= 0 && q.count > maxRetain; c-- {
+		class := &q.classes[c]
+		for q.count > maxRetain && class.len() > 0 {
+			item := class.tq.Max()
+			if item == nil {
+				break
+			}
+			cur := item.(*limitedBroadcast)
+			cur.b.Finished()
+			q.deleteItem(cur)
 		}
-		cur := item.(*limitedBroadcast)
-		cur.b.Finished()
-		q.deleteItem(cur)
 	}
 }
