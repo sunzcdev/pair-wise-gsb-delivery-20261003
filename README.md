@@ -95,6 +95,43 @@ include:
   default UDP dialer function.
 
 
+## Selecting time from multiple sources
+
+If you collect responses from several servers yourself, `SelectTime` combines
+them into a single suggested clock offset without making any network calls and
+without touching the system clock. Each response is paired with the identifier
+of its source:
+```go
+samples := []ntp.Sample{
+    {SourceID: "ntp1.example.com", Response: response1},
+    {SourceID: "ntp2.example.com", Response: response2},
+    {SourceID: "ntp3.example.com", Response: response3},
+}
+
+result, err := ntp.SelectTime(samples, ntp.SelectionOptions{})
+if errors.Is(err, ntp.ErrNoConsistentTimeSources) {
+    // Not enough sources agree; no offset is returned and no average is
+    // substituted for a consensus.
+}
+```
+
+Each validated response contributes the closed interval
+`[ClockOffset - RootDistance, ClockOffset + RootDistance]`. Responses are run
+through `Validate` first, and multiple samples from the same `SourceID` cast at
+most one vote: only the sample with the smallest `RootDistance` is kept. By
+default a strict majority of the distinct sources must agree; this may be
+overridden with `SelectionOptions.MinSources`.
+
+The result reports the suggested `Offset` (midpoint of the winning agreement
+interval), the `AgreementLow`/`AgreementHigh` bounds, the selected source IDs,
+and a `Decisions` entry for every submitted sample explaining why it was
+included or excluded. Boundaries are inclusive, so intervals touching at an
+endpoint are considered to agree; ties between equally supported candidate
+intervals are resolved deterministically (narrowest, then smallest lower bound,
+then lexicographically smallest source set), and duration arithmetic saturates
+instead of overflowing.
+
+
 ## Logging responses
 
 To log an NTP query's response, use the response's `Log` function:
