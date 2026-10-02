@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `math/big` support for `INTEGER`: `NewBigInteger` / `NewBigIntegerErr`
+  constructors (also accepted by `NewIntegerErr`), `ParseBigInt`, and the
+  `IntegerDecoding` package variable selecting the decode representation
+  (`IntegerDecodeInt64`, the default and historical behavior;
+  `IntegerDecodeBig`; or `IntegerDecodeAuto`, which yields `int64` when the
+  value fits and `*big.Int` otherwise). Decoded big integers are bounded by
+  the new `MaxIntegerBits` package variable (default 65536 bits, 0 for no
+  limit), which also rejects over-long sign-extension padding.
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.

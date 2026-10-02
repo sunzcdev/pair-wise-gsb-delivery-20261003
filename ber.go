@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"os"
 	"reflect"
 	"strconv"
@@ -422,7 +423,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 
 			p.Value = val != 0
 		case TagInteger:
-			p.Value, err = ParseInt64(content)
+			p.Value, err = decodeInteger(content)
 		case TagBitString:
 		case TagOctetString:
 			// the actual string encoding is not known here
@@ -667,9 +668,16 @@ func NewIntegerErr(classType Class, tagType Type, tag Tag, value interface{}, de
 		p.Data.Write(encodeInteger(int64(v)))
 	case uint8:
 		p.Data.Write(encodeInteger(int64(v)))
+	case *big.Int:
+		if v == nil {
+			return nil, errors.New("invalid nil *big.Int")
+		}
+		// Store a copy so the packet never shares mutable storage with the
+		// caller's big.Int.
+		p.Value = new(big.Int).Set(v)
+		p.Data.Write(encodeBigInteger(v))
 	default:
-		// TODO : add support for big.Int ?
-		return nil, fmt.Errorf("invalid type %T, expected {u|}int{64|32|16|8}", v)
+		return nil, fmt.Errorf("invalid type %T, expected {u|}int{64|32|16|8} or *big.Int", v)
 	}
 
 	return p, nil
