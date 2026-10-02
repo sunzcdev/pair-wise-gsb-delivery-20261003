@@ -34,6 +34,24 @@
 //	    Username string `mapstructure:"user"`
 //	}
 //
+// # Strict Name Matching
+//
+// By default, Decode keeps its historical behavior and uses the first
+// MatchName candidate found when multiple names are equivalent. Set
+// StrictNameMatching to require deterministic resolution.
+//
+// Each target field has one external name. An explicit tag value has
+// precedence over MapFieldName; without an explicit tag, MapFieldName
+// transforms the Go field name. Source keys are resolved by exact external
+// name first. MatchName is used only for keys and fields left unmatched by
+// exact resolution, and a fallback match is accepted only when it is unique
+// in both directions. An exact match therefore wins over every fallback
+// candidate for that field, including candidates matched by another key.
+//
+// Duplicate external names, including fields promoted by squash, are always
+// ambiguous in strict mode, even when no matching source key is present.
+// Ambiguity errors list every candidate with its complete field path.
+//
 // # Embedded Structs and Squashing
 //
 // Embedded structs are treated as if they're another field with that name.
@@ -351,6 +369,23 @@ type DecoderConfig struct {
 	// MatchName is used as a fallback comparison when the direct key lookup fails.
 	// See also MapFieldName for transforming field names before lookup.
 	MatchName func(mapKey, fieldName string) bool
+
+	// StrictNameMatching reports an error instead of choosing an arbitrary
+	// destination when strict name resolution is ambiguous. A key matches at
+	// most one field, and a field is populated by at most one key.
+	//
+	// For every field, the external name is determined in this order:
+	//   1. an explicit TagName value
+	//   2. the field name transformed by MapFieldName
+	//
+	// Input keys are then resolved in this order:
+	//   1. an exact match against an external name
+	//   2. a single MatchName match between remaining keys and remaining fields
+	//
+	// If two fields have the same external name, the conflict is reported even
+	// when no matching source key is present. A field with an exact match is
+	// removed from MatchName fallback resolution.
+	StrictNameMatching bool
 
 	// DecodeNil, if set to true, will cause the DecodeHook (if present) to run
 	// even if the input is nil. This can be used to provide default values.
@@ -1543,6 +1578,13 @@ func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
 	}
 }
 
+type decoderField struct {
+	field        reflect.StructField
+	val          reflect.Value
+	path         string
+	externalName string
+}
+
 func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) error {
 	dataValType := dataVal.Type()
 	if kind := dataValType.Key().Kind(); kind != reflect.String && kind != reflect.Interface {
@@ -1560,29 +1602,32 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	targetValKeysUnused := make(map[any]struct{})
 
 	var errs []error
+	errorName := name
+	if errorName == "" {
+		errorName = val.Type().String()
+	}
 
-	// This slice will keep track of all the structs we'll be decoding.
+	// This slice keeps track of all the structs we'll be decoding.
 	// There can be more than one struct if there are embedded structs
 	// that are squashed.
-	structs := make([]reflect.Value, 1, 5)
-	structs[0] = val
-
-	// Compile the list of all the fields that we're going to be decoding
-	// from all the structs.
-	type field struct {
-		field reflect.StructField
-		val   reflect.Value
+	type pendingStruct struct {
+		val  reflect.Value
+		path string
 	}
+
+	structs := make([]pendingStruct, 1, 5)
+	structs[0] = pendingStruct{val: val, path: name}
 
 	// remainField is set to a valid field set with the "remain" tag if
 	// we are keeping track of remaining values.
-	var remainField *field
+	var remainField *decoderField
 
-	fields := []field{}
+	fields := []decoderField{}
 	for len(structs) > 0 {
-		structVal := structs[0]
+		pending := structs[0]
 		structs = structs[1:]
 
+		structVal := pending.val
 		structType := structVal.Type()
 
 		for i := 0; i < structType.NumField(); i++ {
@@ -1615,28 +1660,33 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			}
 
 			if squash {
+				childPath := joinFieldPath(pending.path, fieldType.Name)
+				errorPath := name + "." + fieldType.Name
+				if d.config.StrictNameMatching {
+					errorPath = childPath
+				}
 				switch fieldVal.Kind() {
 				case reflect.Struct:
-					structs = append(structs, fieldVal)
+					structs = append(structs, pendingStruct{val: fieldVal, path: childPath})
 				case reflect.Interface:
 					if !fieldVal.IsNil() {
-						structs = append(structs, fieldVal.Elem().Elem())
+						structs = append(structs, pendingStruct{val: fieldVal.Elem().Elem(), path: childPath})
 					}
 				case reflect.Ptr:
 					if fieldVal.Type().Elem().Kind() == reflect.Struct {
 						if fieldVal.IsNil() {
 							fieldVal.Set(reflect.New(fieldVal.Type().Elem()))
 						}
-						structs = append(structs, fieldVal.Elem())
+						structs = append(structs, pendingStruct{val: fieldVal.Elem(), path: childPath})
 					} else {
 						errs = append(errs, newDecodeError(
-							name+"."+fieldType.Name,
+							errorPath,
 							fmt.Errorf("unsupported type for squashed pointer: %s", fieldVal.Type().Elem().Kind()),
 						))
 					}
 				default:
 					errs = append(errs, newDecodeError(
-						name+"."+fieldType.Name,
+						errorPath,
 						fmt.Errorf("unsupported type for squash: %s", fieldVal.Kind()),
 					))
 				}
@@ -1645,81 +1695,106 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 			// Build our field
 			if remain {
-				remainField = &field{fieldType, fieldVal}
+				remainField = &decoderField{field: fieldType, val: fieldVal, path: joinFieldPath(pending.path, fieldType.Name)}
 			} else {
 				// Normal struct field, store it away
-				fields = append(fields, field{fieldType, fieldVal})
+				fields = append(fields, decoderField{field: fieldType, val: fieldVal, path: joinFieldPath(pending.path, fieldType.Name)})
 			}
 		}
 	}
 
-	// for fieldType, field := range fields {
-	for _, f := range fields {
-		field, fieldValue := f.field, f.val
-		fieldName := field.Name
-
-		tagValue, _ := getTagValue(field, d.config.TagName)
-		if tagValue == "" && d.config.IgnoreUntaggedFields {
-			continue
-		}
-		tagValue = strings.SplitN(tagValue, ",", 2)[0]
-		if tagValue != "" {
-			fieldName = tagValue
-		} else {
-			fieldName = d.config.MapFieldName(fieldName)
-		}
-
-		rawMapKey := reflect.ValueOf(fieldName)
-		rawMapVal := dataVal.MapIndex(rawMapKey)
-		if !rawMapVal.IsValid() {
-			// Do a slower search by iterating over each key and
-			// doing case-insensitive search.
-			for dataValKey := range dataValKeys {
-				mK, ok := dataValKey.Interface().(string)
-				if !ok {
-					// Not a string key
-					continue
-				}
-
-				if d.config.MatchName(mK, fieldName) {
-					rawMapKey = dataValKey
-					rawMapVal = dataVal.MapIndex(dataValKey)
-					break
-				}
-			}
-
-			if !rawMapVal.IsValid() {
-				// There was no matching key in the map for the value in
-				// the struct. Remember it for potential errors and metadata.
-				if !(d.config.AllowUnsetPointer && fieldValue.Kind() == reflect.Ptr) {
-					targetValKeysUnused[fieldName] = struct{}{}
-				}
+	if d.config.StrictNameMatching {
+		resolvedFields := make([]decoderField, 0, len(fields))
+		for _, f := range fields {
+			if !f.val.CanSet() {
 				continue
 			}
+
+			tagValue, _ := getTagValue(f.field, d.config.TagName)
+			if tagValue == "" && d.config.IgnoreUntaggedFields {
+				continue
+			}
+
+			tagValue = strings.SplitN(tagValue, ",", 2)[0]
+			if tagValue != "" {
+				f.externalName = tagValue
+			} else {
+				f.externalName = d.config.MapFieldName(f.field.Name)
+			}
+			resolvedFields = append(resolvedFields, f)
 		}
 
-		if !fieldValue.IsValid() {
-			// This should never happen
-			panic("field is not valid")
-		}
+		errs = append(errs, d.decodeStrictStructFields(
+			name, errorName, dataVal, resolvedFields, dataValKeysUnused, targetValKeysUnused,
+		)...)
+	} else {
+		for _, f := range fields {
+			field, fieldValue := f.field, f.val
+			fieldName := field.Name
 
-		// If we can't set the field, then it is unexported or something,
-		// and we just continue onwards.
-		if !fieldValue.CanSet() {
-			continue
-		}
+			tagValue, _ := getTagValue(field, d.config.TagName)
+			if tagValue == "" && d.config.IgnoreUntaggedFields {
+				continue
+			}
+			tagValue = strings.SplitN(tagValue, ",", 2)[0]
+			if tagValue != "" {
+				fieldName = tagValue
+			} else {
+				fieldName = d.config.MapFieldName(fieldName)
+			}
 
-		// Delete the key we're using from the unused map so we stop tracking
-		delete(dataValKeysUnused, rawMapKey.Interface())
+			rawMapKey := reflect.ValueOf(fieldName)
+			rawMapVal := dataVal.MapIndex(rawMapKey)
+			if !rawMapVal.IsValid() {
+				// Do a slower search by iterating over each key and
+				// doing case-insensitive search.
+				for dataValKey := range dataValKeys {
+					mK, ok := dataValKey.Interface().(string)
+					if !ok {
+						// Not a string key
+						continue
+					}
 
-		// If the name is empty string, then we're at the root, and we
-		// don't dot-join the fields.
-		if name != "" {
-			fieldName = name + "." + fieldName
-		}
+					if d.config.MatchName(mK, fieldName) {
+						rawMapKey = dataValKey
+						rawMapVal = dataVal.MapIndex(dataValKey)
+						break
+					}
+				}
 
-		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
-			errs = append(errs, err)
+				if !rawMapVal.IsValid() {
+					// There was no matching key in the map for the value in
+					// the struct. Remember it for potential errors and metadata.
+					if !(d.config.AllowUnsetPointer && fieldValue.Kind() == reflect.Ptr) {
+						targetValKeysUnused[fieldName] = struct{}{}
+					}
+					continue
+				}
+			}
+
+			if !fieldValue.IsValid() {
+				// This should never happen
+				panic("field is not valid")
+			}
+
+			// If we can't set the field, then it is unexported or something,
+			// and we just continue onwards.
+			if !fieldValue.CanSet() {
+				continue
+			}
+
+			// Delete the key we're using from the unused map so we stop tracking
+			delete(dataValKeysUnused, rawMapKey.Interface())
+
+			// If the name is empty string, then we're at the root, and we
+			// don't dot-join the fields.
+			if name != "" {
+				fieldName = name + "." + fieldName
+			}
+
+			if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 
@@ -1751,10 +1826,6 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 		// Improve error message when name is empty by showing the target struct type
 		// in the case where it is empty for embedded structs.
-		errorName := name
-		if errorName == "" {
-			errorName = val.Type().String()
-		}
 		errs = append(errs, newDecodeError(
 			errorName,
 			fmt.Errorf("has invalid keys: %s", strings.Join(keys, ", ")),
@@ -1799,6 +1870,294 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	}
 
 	return nil
+}
+
+type strictSourceKey struct {
+	value reflect.Value
+	name  string
+}
+
+type strictKeyAmbiguity struct {
+	sourceKey strictSourceKey
+	fields    []int
+}
+
+type strictFieldAmbiguity struct {
+	fieldIndex int
+	sourceKeys []strictSourceKey
+}
+
+type strictNameAmbiguity struct {
+	externalName string
+	fieldIndexes []int
+	sourceKeys   []strictSourceKey
+}
+
+func (d *Decoder) decodeStrictStructFields(
+	name string,
+	errorName string,
+	dataVal reflect.Value,
+	fields []decoderField,
+	dataValKeysUnused map[any]struct{},
+	targetValKeysUnused map[any]struct{},
+) []error {
+	sourceKeys := make([]strictSourceKey, 0, dataVal.Len())
+	for _, key := range dataVal.MapKeys() {
+		switch key.Kind() {
+		case reflect.String:
+			sourceKeys = append(sourceKeys, strictSourceKey{value: key, name: key.String()})
+		case reflect.Interface:
+			if name, ok := key.Interface().(string); ok {
+				sourceKeys = append(sourceKeys, strictSourceKey{value: key, name: name})
+			}
+		}
+	}
+	sort.Slice(sourceKeys, func(i, j int) bool {
+		return sourceKeys[i].name < sourceKeys[j].name
+	})
+	sort.Slice(fields, func(i, j int) bool {
+		return fields[i].path < fields[j].path
+	})
+	if name == "" && errorName != "" {
+		for index := range fields {
+			fields[index].path = joinFieldPath(errorName, fields[index].path)
+		}
+	}
+
+	exactKeysByName := make(map[string][]strictSourceKey)
+	exactFieldsByName := make(map[string][]int)
+	for _, sourceKey := range sourceKeys {
+		exactKeysByName[sourceKey.name] = append(exactKeysByName[sourceKey.name], sourceKey)
+	}
+	for index, field := range fields {
+		exactFieldsByName[field.externalName] = append(exactFieldsByName[field.externalName], index)
+	}
+
+	externalNames := make([]string, 0, len(exactFieldsByName))
+	for externalName := range exactFieldsByName {
+		externalNames = append(externalNames, externalName)
+	}
+	sort.Strings(externalNames)
+
+	consumedKeyNames := make(map[string]struct{})
+	ambiguousFields := make(map[int]struct{})
+	exactFields := make(map[int]struct{})
+	tentativeKeysByField := make(map[int][]strictSourceKey)
+	var keyAmbiguities []strictKeyAmbiguity
+	var nameAmbiguities []strictNameAmbiguity
+	nameAmbiguityByName := make(map[string]int)
+
+	for _, externalName := range externalNames {
+		fieldIndexes := exactFieldsByName[externalName]
+		exactKeys := exactKeysByName[externalName]
+		if len(fieldIndexes) > 1 {
+			for _, index := range fieldIndexes {
+				ambiguousFields[index] = struct{}{}
+			}
+			for _, key := range exactKeys {
+				consumedKeyNames[key.name] = struct{}{}
+			}
+			nameAmbiguityByName[externalName] = len(nameAmbiguities)
+			nameAmbiguities = append(nameAmbiguities, strictNameAmbiguity{
+				externalName: externalName,
+				fieldIndexes: append([]int(nil), fieldIndexes...),
+				sourceKeys:   append([]strictSourceKey(nil), exactKeys...),
+			})
+			continue
+		}
+
+		if len(exactKeys) > 0 {
+			fieldIndex := fieldIndexes[0]
+			exactFields[fieldIndex] = struct{}{}
+			tentativeKeysByField[fieldIndex] = append(tentativeKeysByField[fieldIndex], exactKeys...)
+			for _, key := range exactKeys {
+				consumedKeyNames[key.name] = struct{}{}
+			}
+		}
+	}
+
+	for _, sourceKey := range sourceKeys {
+		if _, consumed := consumedKeyNames[sourceKey.name]; consumed {
+			continue
+		}
+
+		var fallbackCandidates []int
+		for index, field := range fields {
+			if _, exact := exactFields[index]; exact {
+				continue
+			}
+			if d.config.MatchName(sourceKey.name, field.externalName) {
+				fallbackCandidates = append(fallbackCandidates, index)
+			}
+		}
+
+		if len(fallbackCandidates) > 1 {
+			consumedKeyNames[sourceKey.name] = struct{}{}
+			allSameExternalName := true
+			externalName := fields[fallbackCandidates[0]].externalName
+			for _, index := range fallbackCandidates[1:] {
+				if fields[index].externalName != externalName {
+					allSameExternalName = false
+					break
+				}
+			}
+
+			if allSameExternalName {
+				if ambiguityIndex, ok := nameAmbiguityByName[externalName]; ok {
+					nameAmbiguities[ambiguityIndex].sourceKeys = append(
+						nameAmbiguities[ambiguityIndex].sourceKeys, sourceKey,
+					)
+				}
+			} else {
+				for _, index := range fallbackCandidates {
+					ambiguousFields[index] = struct{}{}
+				}
+				keyAmbiguities = append(keyAmbiguities, strictKeyAmbiguity{
+					sourceKey: sourceKey,
+					fields:    fallbackCandidates,
+				})
+			}
+		} else if len(fallbackCandidates) == 1 {
+			index := fallbackCandidates[0]
+			tentativeKeysByField[index] = append(tentativeKeysByField[index], sourceKey)
+		}
+	}
+
+	selectedKeyByField := make(map[int]strictSourceKey)
+	var fieldAmbiguities []strictFieldAmbiguity
+	for index, field := range fields {
+		if _, ambiguous := ambiguousFields[index]; ambiguous {
+			continue
+		}
+
+		keys := tentativeKeysByField[index]
+		sort.Slice(keys, func(i, j int) bool {
+			return keys[i].name < keys[j].name
+		})
+
+		switch len(keys) {
+		case 0:
+			if !(d.config.AllowUnsetPointer && field.val.Kind() == reflect.Ptr) {
+				targetValKeysUnused[field.externalName] = struct{}{}
+			}
+		case 1:
+			selectedKeyByField[index] = keys[0]
+		default:
+			ambiguousFields[index] = struct{}{}
+			for _, key := range keys {
+				consumedKeyNames[key.name] = struct{}{}
+			}
+			fieldAmbiguities = append(fieldAmbiguities, strictFieldAmbiguity{
+				fieldIndex: index,
+				sourceKeys: keys,
+			})
+		}
+	}
+
+	sort.Slice(nameAmbiguities, func(i, j int) bool {
+		return nameAmbiguities[i].externalName < nameAmbiguities[j].externalName
+	})
+	for index := range nameAmbiguities {
+		ambiguity := &nameAmbiguities[index]
+		sort.Slice(ambiguity.sourceKeys, func(i, j int) bool {
+			return ambiguity.sourceKeys[i].name < ambiguity.sourceKeys[j].name
+		})
+	}
+
+	for _, sourceKey := range sourceKeys {
+		if _, consumed := consumedKeyNames[sourceKey.name]; consumed {
+			delete(dataValKeysUnused, sourceKey.value.Interface())
+		}
+	}
+
+	var errs []error
+	for _, ambiguity := range nameAmbiguities {
+		candidates := make([]string, 0, len(ambiguity.fieldIndexes))
+		for _, index := range ambiguity.fieldIndexes {
+			candidates = append(candidates, formatStrictFieldCandidate(fields[index]))
+		}
+		sort.Strings(candidates)
+
+		var sourceKeyNames []string
+		for _, key := range ambiguity.sourceKeys {
+			sourceKeyNames = append(sourceKeyNames, quoteStrictName(key.name))
+		}
+		if len(sourceKeyNames) == 0 {
+			sourceKeyNames = append(sourceKeyNames, "(none present)")
+		}
+
+		errs = append(errs, newDecodeError(
+			errorName,
+			fmt.Errorf("external name %s is ambiguous: matches %s; source keys: %s",
+				quoteStrictName(ambiguity.externalName),
+				strings.Join(candidates, ", "),
+				strings.Join(sourceKeyNames, ", ")),
+		))
+	}
+
+	for _, ambiguity := range keyAmbiguities {
+		candidates := make([]string, 0, len(ambiguity.fields))
+		for _, index := range ambiguity.fields {
+			candidates = append(candidates, formatStrictFieldCandidate(fields[index]))
+		}
+		sort.Strings(candidates)
+
+		errs = append(errs, newDecodeError(
+			errorName,
+			fmt.Errorf("source key %s is ambiguous: matches %s",
+				quoteStrictName(ambiguity.sourceKey.name),
+				strings.Join(candidates, ", ")),
+		))
+	}
+
+	for _, ambiguity := range fieldAmbiguities {
+		keys := make([]string, 0, len(ambiguity.sourceKeys))
+		for _, key := range ambiguity.sourceKeys {
+			keys = append(keys, quoteStrictName(key.name))
+		}
+
+		errs = append(errs, newDecodeError(
+			errorName,
+			fmt.Errorf("%s is ambiguous: matched by source keys %s",
+				formatStrictFieldCandidate(fields[ambiguity.fieldIndex]),
+				strings.Join(keys, ", ")),
+		))
+	}
+
+	for index := range fields {
+		key, ok := selectedKeyByField[index]
+		if !ok {
+			continue
+		}
+
+		field := fields[index]
+		delete(dataValKeysUnused, key.value.Interface())
+
+		decodeName := field.externalName
+		if name != "" {
+			decodeName = name + "." + decodeName
+		}
+		if err := d.decode(decodeName, dataVal.MapIndex(key.value).Interface(), field.val); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errs
+}
+
+func formatStrictFieldCandidate(field decoderField) string {
+	return fmt.Sprintf("field '%s' (external name '%s')", field.path, field.externalName)
+}
+
+func quoteStrictName(name string) string {
+	return fmt.Sprintf("%q", name)
+}
+
+func joinFieldPath(path, field string) string {
+	if path == "" {
+		return field
+	}
+	return path + "." + field
 }
 
 func isEmptyValue(v reflect.Value) bool {
