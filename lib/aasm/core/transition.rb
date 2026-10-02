@@ -44,6 +44,13 @@ module AASM::Core
       invoke_callbacks_compatible_with_guard(@unless, obj, args, :unless => true)
     end
 
+    # Static, read-only view of whether this transition is conditional. A
+    # guarded transition may or may not be taken depending on runtime data,
+    # so static checks must never treat it as guaranteed or as a blocker.
+    def guarded?
+      !@guards.empty? || !@unless.empty?
+    end
+
     def execute(obj, *args)
       invoke_callbacks_compatible_with_guard(event.state_machine.global_callbacks[:after_all_transitions], obj, args)
       invoke_callbacks_compatible_with_guard(@after, obj, args)

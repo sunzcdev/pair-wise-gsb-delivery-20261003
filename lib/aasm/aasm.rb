@@ -62,6 +62,22 @@ module AASM
       @aasm[state_machine_name].instance_eval(&block) if block # new DSL
       @aasm[state_machine_name]
     end
+
+    # Read-only static analysis of the state machine definition. Without a
+    # machine name every machine of this class is checked, otherwise only the
+    # named machine. This never instantiates the class and never runs guards,
+    # dynamic initial states or callbacks.
+    #
+    #   Job.aasm_definition_check.ok?
+    #   report = Job.aasm_definition_check
+    #   report.errors.each { |issue| raise issue.message }
+    def aasm_definition_check(machine_name = nil)
+      if machine_name
+        AASM::DefinitionCheck.check(self, machine_name)
+      else
+        AASM::DefinitionCheck.check_all(self)
+      end
+    end
   end # ClassMethods
 
   # this is the entry point for all instance-level access to AASM

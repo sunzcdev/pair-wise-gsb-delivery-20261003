@@ -34,6 +34,7 @@
   - [Column name & migration](#column-name--migration)
   - [Log State Changes](#log-state-changes)
   - [Inspection](#inspection)
+  - [Definition checks](#definition-checks)
   - [Warning output](#warning-output)
   - [RubyMotion support](#rubymotion-support)
   - [Testing](#testing)
@@ -1268,6 +1269,73 @@ Job.aasm.states_for_select
 # show permitted states with guard parameter
 job.aasm.states({permitted: true}, guard_parameter).map(&:name)
 ```
+
+### Definition checks
+
+AASM ships with a read-only static checker for state machine definitions. It
+never instantiates your class and never runs guards, dynamic initial states
+or callbacks; it only reads the declared states, events and transitions. This
+makes it safe to run while your service boots, before any business object
+exists.
+
+```ruby
+class Job
+  include AASM
+
+  aasm do
+    state :sleeping, initial: true
+    state :running
+
+    event :run do
+      transitions from: :sleeping, to: :typo_state
+    end
+  end
+end
+
+# every machine defined on the class, ordered by machine name
+report = Job.aasm_definition_check
+
+# a single named machine
+report = Job.aasm_definition_check(:default)
+
+# equivalent direct calls
+AASM::DefinitionCheck.check(Job)
+AASM::DefinitionCheck.check_all(Job)
+```
+
+The returned report separates certain errors from reminders:
+
+- `errors` (definite failures) reference transitions that start from or target
+  an undeclared state, or an undeclared static initial state
+  (`unknown_from_state`, `unknown_to_state`, `unknown_initial_state`).
+- `warnings` cover states structurally unreachable from the initial state
+  (`unreachable_state`) and candidates fully shadowed by an earlier
+  unconditional transition within the same event (`shadowed_transition`).
+
+```ruby
+report.ok?            # true when there are no errors
+report.errors         # definite problems
+report.warnings       # reminders only
+report.to_s           # stable, human readable list
+
+report.errors.each do |issue|
+  # issue.machine, issue.event, issue.transition_index,
+  # issue.from, issue.to, issue.state, issue.code, issue.message
+end
+```
+
+Guarded transitions are edges that *may* be taken, so they count as paths for
+reachability and never act as blockers for later transitions. A terminal state
+without outgoing transitions is perfectly normal and is not reported.
+Transitions declared without a `:from` apply from every state and participate
+in the analysis.
+
+When the initial state is dynamic (a `Proc`) it cannot be determined
+statically; reachability is skipped and a `dynamic_initial_state` warning
+states that this particular check is insufficient.
+
+Results are ordered by machine name, then event declaration order and
+transition order, so output stays stable across runs.
 
 
 ### Warning output
