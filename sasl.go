@@ -43,3 +43,11 @@ type Server interface {
 	// authentication has failed, an error is returned.
 	Next(response []byte) (challenge []byte, done bool, err error)
 }
+
+// IdentityServer is a Server that exposes the final identity after the
+// authentication exchange has completed successfully.
+type IdentityServer interface {
+	Server
+
+	Identity() string
+}
