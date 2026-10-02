@@ -27,6 +27,14 @@ The database provides the following:
   results. This lets callers easily watch for changes in the database in a very general
   way.
 
+* Foreign Keys - Tables can declare references to other tables in the schema.
+  Referential integrity is validated when a write transaction is committed, so
+  child objects may be inserted before their parents within a single transaction.
+  Deletes support `Restrict` (the commit fails while children still reference the
+  object) and `Cascade` (referencing children are deleted recursively) actions.
+  Use `Txn.CommitWithError` to observe validation failures; a failed commit
+  leaves the database untouched and triggers no watch notifications.
+
 For the underlying immutable radix trees, see [go-immutable-radix](https://github.com/hashicorp/go-immutable-radix).
 
 Documentation

@@ -130,15 +130,39 @@ func (txn *Txn) Abort() {
 // Commit is used to finalize this transaction.
 // This is a noop for read transactions,
 // already aborted or committed transactions.
+//
+// If the schema declares foreign keys, referential integrity is validated
+// before committing. On a validation failure the transaction is aborted
+// instead of committed; use CommitWithError to observe the failure.
 func (txn *Txn) Commit() {
+	_ = txn.CommitWithError()
+}
+
+// CommitWithError is used to finalize this transaction, returning an error
+// if the transaction violates referential integrity declared by foreign
+// keys in the schema. Validation is deferred to commit time, so within a
+// single transaction child objects may be inserted before their parents.
+//
+// If validation fails, the transaction is aborted: no partial index
+// updates are applied to the database and no watch notifications are
+// triggered. This is a noop for read transactions, already aborted or
+// committed transactions.
+func (txn *Txn) CommitWithError() error {
 	// Noop for a read transaction
 	if !txn.write {
-		return
+		return nil
 	}
 
 	// Check if already aborted or committed
 	if txn.rootTxn == nil {
-		return
+		return nil
+	}
+
+	// Validate referential integrity before applying any changes so a
+	// failed commit leaves no partial state and triggers no notifications.
+	if err := txn.validateForeignKeys(); err != nil {
+		txn.Abort()
+		return err
 	}
 
 	// Commit each sub-transaction scoped to (table, index)
@@ -173,6 +197,93 @@ func (txn *Txn) Commit() {
 		fn := txn.after[i-1]
 		fn()
 	}
+	return nil
+}
+
+// validateForeignKeys checks referential integrity for all tables that
+// declare foreign keys. It is a no-op unless the transaction modified a
+// table that participates in a foreign key, either as a child or as a
+// referenced parent.
+func (txn *Txn) validateForeignKeys() error {
+	schema := txn.db.schema
+
+	// Collect the tables participating in any foreign key.
+	involved := make(map[string]struct{})
+	for name, tableSchema := range schema.Tables {
+		if len(tableSchema.ForeignKeys) == 0 {
+			continue
+		}
+		involved[name] = struct{}{}
+		for _, fk := range tableSchema.ForeignKeys {
+			involved[fk.Table] = struct{}{}
+		}
+	}
+	if len(involved) == 0 {
+		return nil
+	}
+
+	// Skip validation if no participating table was modified.
+	modified := false
+	for key := range txn.modified {
+		if _, ok := involved[key.Table]; ok {
+			modified = true
+			break
+		}
+	}
+	if !modified {
+		return nil
+	}
+
+	for tableName, tableSchema := range schema.Tables {
+		for _, fk := range tableSchema.ForeignKeys {
+			if err := txn.validateForeignKey(tableName, tableSchema, fk); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateForeignKey checks that every object in the child table resolves
+// its reference to an existing object in the parent table.
+func (txn *Txn) validateForeignKey(table string, tableSchema *TableSchema, fk *ForeignKeySchema) error {
+	indexSchema := tableSchema.Indexes[fk.Index]
+	indexer, ok := indexSchema.Indexer.(SingleIndexer)
+	if !ok {
+		return fmt.Errorf("foreign key index '%s' on table '%s' must be a SingleIndexer", fk.Index, table)
+	}
+
+	refIndex := fk.RefIndex
+	if refIndex == "" {
+		refIndex = id
+	}
+
+	// Scan every object in the child table using the transaction's view,
+	// which includes any uncommitted modifications.
+	idTxn := txn.readableIndex(table, id)
+	iter := idTxn.Root().Iterator()
+	for {
+		_, obj, more := iter.Next()
+		if !more {
+			break
+		}
+
+		ok, val, err := indexer.FromObject(obj)
+		if err != nil {
+			return fmt.Errorf("failed to build foreign key index '%s' on table '%s': %v", fk.Index, table, err)
+		}
+		if !ok {
+			// No reference value set, nothing to validate.
+			continue
+		}
+
+		refTxn := txn.readableIndex(fk.Table, refIndex)
+		if _, found := refTxn.Get(val); !found {
+			return fmt.Errorf("foreign key violation: table '%s' index '%s' references missing object in table '%s'",
+				table, fk.Index, fk.Table)
+		}
+	}
+	return nil
 }
 
 // Insert is used to add or update an object into the given table.
@@ -304,7 +415,22 @@ func (txn *Txn) Insert(table string, obj interface{}) error {
 
 // Delete is used to delete a single object from the given table.
 // This object must already exist in the table.
+//
+// If other tables declare foreign keys referencing this table with the
+// Cascade delete action, objects referencing the deleted object are
+// deleted recursively. Each object is processed at most once, so
+// reference cycles and diamonds are handled safely. References with the
+// Restrict action are not enforced here; they are validated at commit
+// time by CommitWithError.
 func (txn *Txn) Delete(table string, obj interface{}) error {
+	return txn.delete(table, obj, make(map[objectID]struct{}))
+}
+
+// delete removes a single object and cascades to referencing children.
+// The visited set tracks objects already processed within this delete
+// cascade so that objects reached through multiple paths (diamonds) or
+// reference cycles are only processed once.
+func (txn *Txn) delete(table string, obj interface{}, visited map[objectID]struct{}) error {
 	if !txn.write {
 		return fmt.Errorf("cannot delete in read-only transaction")
 	}
@@ -325,6 +451,13 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 	if !ok {
 		return fmt.Errorf("object missing primary index")
 	}
+
+	// Skip objects already processed by this cascade.
+	oid := objectID{Table: table, IndexVal: string(idVal)}
+	if _, ok := visited[oid]; ok {
+		return nil
+	}
+	visited[oid] = struct{}{}
 
 	// Lookup the object by ID first, check if we should continue
 	idTxn := txn.writableIndex(table, id)
@@ -373,6 +506,70 @@ func (txn *Txn) Delete(table string, obj interface{}) error {
 			After:      nil, // Now nil indicates deletion
 			primaryKey: idVal,
 		})
+	}
+
+	// Cascade the delete to objects referencing the deleted object.
+	if err := txn.cascadeDelete(table, existing, visited); err != nil {
+		return err
+	}
+	return nil
+}
+
+// cascadeDelete recursively deletes objects in other tables that reference
+// the deleted object via a foreign key with the Cascade delete action.
+func (txn *Txn) cascadeDelete(table string, obj interface{}, visited map[objectID]struct{}) error {
+	tableSchema := txn.db.schema.Tables[table]
+	for childName, childSchema := range txn.db.schema.Tables {
+		for _, fk := range childSchema.ForeignKeys {
+			if fk.Table != table || fk.OnDelete != Cascade {
+				continue
+			}
+
+			// Compute the referenced value from the deleted parent object.
+			refIndex := fk.RefIndex
+			if refIndex == "" {
+				refIndex = id
+			}
+			refIndexer, ok := tableSchema.Indexes[refIndex].Indexer.(SingleIndexer)
+			if !ok {
+				return fmt.Errorf("foreign key referenced index '%s' on table '%s' must be a SingleIndexer", refIndex, table)
+			}
+			ok, refVal, err := refIndexer.FromObject(obj)
+			if err != nil {
+				return fmt.Errorf("failed to build referenced index '%s' on table '%s': %v", refIndex, table, err)
+			}
+			if !ok {
+				continue
+			}
+
+			// Find the child objects referencing the deleted object. For a
+			// non-unique index the stored keys have the primary key appended,
+			// so a prefix seek on the reference value matches them exactly.
+			childIndexSchema := childSchema.Indexes[fk.Index]
+			childTxn := txn.readableIndex(childName, fk.Index)
+			var children []interface{}
+			if childIndexSchema.Unique {
+				if child, found := childTxn.Get(refVal); found {
+					children = append(children, child)
+				}
+			} else {
+				iter := childTxn.Root().Iterator()
+				iter.SeekPrefix(refVal)
+				for {
+					_, child, more := iter.Next()
+					if !more {
+						break
+					}
+					children = append(children, child)
+				}
+			}
+
+			for _, child := range children {
+				if err := txn.delete(childName, child, visited); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
