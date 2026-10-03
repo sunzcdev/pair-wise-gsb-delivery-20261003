@@ -14,6 +14,11 @@
 package config
 
 import (
+	"bytes"
+	"crypto"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -330,6 +335,7 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCT                          SCTConfig               `yaml:"sct,omitempty" json:"sct,omitzero"`
 }
 
 type GRPCProbe struct {
@@ -337,6 +343,7 @@ type GRPCProbe struct {
 	TLS                 bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig           config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked        bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCT                 SCTConfig        `yaml:"sct,omitempty" json:"sct,omitzero"`
 	IPProtocolFallback  bool             `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
 	PreferredIPProtocol string           `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
 	Metadata            metadata.MD      `yaml:"metadata,omitempty" json:"metadata,omitempty"`
@@ -369,6 +376,7 @@ type TCPProbe struct {
 	TLS                bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig          config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked       bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCT                SCTConfig        `yaml:"sct,omitempty" json:"sct,omitzero"`
 }
 
 type UnixProbe struct {
@@ -376,6 +384,7 @@ type UnixProbe struct {
 	TLS           bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig     config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked  bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCT           SCTConfig        `yaml:"sct,omitempty" json:"sct,omitzero"`
 }
 
 type ICMPProbe struct {
@@ -417,6 +426,112 @@ type WebsocketProbe struct {
 	QueryResponse      []QueryResponse         `yaml:"query_response,omitempty" json:"query_response,omitempty"`
 	IPProtocol         string                  `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
 	IPProtocolFallback bool                    `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
+}
+
+// SCTConfig configures Certificate Transparency Signed Certificate Timestamp
+// (SCT) verification, as defined in RFC 6962. SCT signatures are verified
+// locally against the configured CT log public keys; no inclusion proof is
+// fetched from the logs.
+type SCTConfig struct {
+	// Enabled turns on SCT verification.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// MinimumDistinctLogs requires at least this many SCTs with valid
+	// signatures from different configured CT logs.
+	MinimumDistinctLogs int `yaml:"minimum_distinct_logs,omitempty" json:"minimum_distinct_logs,omitempty"`
+	// Logs is the local CT log list used to verify SCT signatures.
+	Logs []CTLog `yaml:"logs,omitempty" json:"logs,omitempty"`
+	// LogListValidUntil marks the expiry timestamp of the configured log list.
+	// Once it has passed, SCT verification fails. Zero means the list never
+	// expires.
+	LogListValidUntil time.Time `yaml:"log_list_valid_until,omitempty" json:"log_list_valid_until,omitempty"`
+}
+
+// CTLog describes a single trusted Certificate Transparency log. The log ID is
+// derived from PublicKeyDER as SHA-256 of the DER-encoded SubjectPublicKeyInfo,
+// matching RFC 6962 section 3.2.
+type CTLog struct {
+	// PublicKeyDER is the PEM or raw DER encoded SubjectPublicKeyInfo of the
+	// log public key.
+	PublicKeyDER string `yaml:"public_key_der,omitempty" json:"public_key_der,omitempty"`
+	// ValidFrom/ValidUntil bound the period in which the log is considered to
+	// have been operating. SCTs whose timestamp falls outside this window are
+	// rejected. Zero values leave the corresponding bound open.
+	ValidFrom  time.Time `yaml:"valid_from,omitempty" json:"valid_from,omitempty"`
+	ValidUntil time.Time `yaml:"valid_until,omitempty" json:"valid_until,omitempty"`
+
+	id       []byte
+	publicKey crypto.PublicKey
+}
+
+// LogID returns the RFC 6962 log ID (SHA-256 of the DER-encoded
+// SubjectPublicKeyInfo). It is populated while the configuration is parsed.
+func (l *CTLog) LogID() []byte {
+	return l.id
+}
+
+// PublicKey returns the parsed log public key. It is populated while the
+// configuration is parsed.
+func (l *CTLog) PublicKey() crypto.PublicKey {
+	return l.publicKey
+}
+
+// Validate parses the log public keys and checks the SCT configuration.
+func (s *SCTConfig) Validate() error {
+	if !s.Enabled {
+		return nil
+	}
+	if s.MinimumDistinctLogs < 1 {
+		return errors.New("sct.minimum_distinct_logs must be at least 1 when sct verification is enabled")
+	}
+	if len(s.Logs) == 0 {
+		return errors.New("sct.logs must contain at least one log when sct verification is enabled")
+	}
+
+	seenIDs := map[string]struct{}{}
+	for i := range s.Logs {
+		log := &s.Logs[i]
+		der, err := decodePEMOrDER([]byte(log.PublicKeyDER), "PUBLIC KEY")
+		if err != nil {
+			return fmt.Errorf("sct.logs[%d]: %w", i, err)
+		}
+		spki, err := x509.ParsePKIXPublicKey(der)
+		if err != nil {
+			return fmt.Errorf("sct.logs[%d]: parsing log public key: %w", i, err)
+		}
+		idSum := sha256.Sum256(der)
+		log.id = idSum[:]
+		log.publicKey = spki
+		if _, exists := seenIDs[string(log.id)]; exists {
+			return fmt.Errorf("sct.logs[%d]: duplicate log with id %x", i, log.id)
+		}
+		seenIDs[string(log.id)] = struct{}{}
+
+		if !log.ValidFrom.IsZero() && !log.ValidUntil.IsZero() && log.ValidUntil.Before(log.ValidFrom) {
+			return fmt.Errorf("sct.logs[%d]: valid_until cannot be before valid_from", i)
+		}
+	}
+
+	if s.MinimumDistinctLogs > len(s.Logs) {
+		return fmt.Errorf("sct.minimum_distinct_logs (%d) cannot exceed the number of configured logs (%d)", s.MinimumDistinctLogs, len(s.Logs))
+	}
+	return nil
+}
+
+// decodePEMOrDER decodes a PEM block of the given type, accepting raw DER when
+// the input is not PEM encoded.
+func decodePEMOrDER(data []byte, pemType string) ([]byte, error) {
+	block, _ := pem.Decode(data)
+	if block != nil {
+		if block.Type != pemType {
+			return nil, fmt.Errorf("expected PEM block type %q, got %q", pemType, block.Type)
+		}
+		return block.Bytes, nil
+	}
+	der := bytes.TrimSpace(data)
+	if len(der) == 0 {
+		return nil, errors.New("empty key data")
+	}
+	return der, nil
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -504,7 +619,7 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 		}
 	}
 
-	return nil
+	return s.SCT.Validate()
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -517,7 +632,10 @@ func (s *GRPCProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS {
 		return errors.New("check_revoked cannot be used when tls is false")
 	}
-	return nil
+	if s.SCT.Enabled && !s.TLS {
+		return errors.New("sct verification cannot be used when tls is false")
+	}
+	return s.SCT.Validate()
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -554,7 +672,10 @@ func (s *TCPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
 	}
-	return nil
+	if s.SCT.Enabled && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("sct verification cannot be used when tls is false and no query_response step uses starttls")
+	}
+	return s.SCT.Validate()
 }
 
 // usesStartTLS reports whether any query_response step upgrades the connection to TLS.
@@ -577,7 +698,10 @@ func (s *UnixProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
 	}
-	return nil
+	if s.SCT.Enabled && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("sct verification cannot be used when tls is false and no query_response step uses starttls")
+	}
+	return s.SCT.Validate()
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
