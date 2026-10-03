@@ -64,6 +64,11 @@ type Options struct {
 	IsDevelopment bool
 	// nonceEnabled is used internally for dynamic nouces.
 	nonceEnabled bool
+	// If ReuseNonce is true and the incoming request context already holds a CSP nonce previously stored by this package
+	// (e.g. by an outer Secure middleware in a nested chain), that nonce is validated and reused instead of generating a new one.
+	// The nonce is only ever read from this package's internal context value, never from client-supplied headers.
+	// An invalid stored nonce results in an error. Default is false, which always generates a fresh nonce.
+	ReuseNonce bool
 	// If SSLRedirect is set to true, then only allow https requests. Default is false.
 	SSLRedirect bool
 	// If SSLForceHost is true and SSLHost is set, requests will be forced to use SSLHost even the ones that are already using SSL. Default is false.
@@ -302,7 +307,12 @@ func (s *Secure) ProcessNoModifyRequest(w http.ResponseWriter, r *http.Request) 
 func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
 	// Setup nonce if required.
 	if s.opt.nonceEnabled {
-		r = withCSPNonce(r, cspRandNonce())
+		var err error
+
+		r, err = s.nonceForRequest(r)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Resolve the host for the request, using proxy headers if present.
@@ -505,6 +515,24 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	return responseHeader, r, nil
+}
+
+// nonceForRequest returns the request carrying the CSP nonce to use for this request.
+// When ReuseNonce is enabled and the request context already holds a nonce stored by this
+// package, that nonce is validated and reused; an invalid nonce yields ErrInvalidCSPNonce.
+// Otherwise a new random nonce is generated exactly once.
+func (s *Secure) nonceForRequest(r *http.Request) (*http.Request, error) {
+	if s.opt.ReuseNonce {
+		if nonce := CSPNonce(r.Context()); nonce != "" {
+			if !isValidCSPNonce(nonce) {
+				return nil, ErrInvalidCSPNonce
+			}
+
+			return r, nil
+		}
+	}
+
+	return withCSPNonce(r, cspRandNonce()), nil
 }
 
 // isSSL determine if we are on HTTPS.

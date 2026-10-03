@@ -80,6 +80,7 @@ s := secure.New(secure.Options{
     BrowserXssFilter: true, // If BrowserXssFilter is true, adds the X-XSS-Protection header with the value `1; mode=block`. Default is false.
     CustomBrowserXssValue: "1; report=https://example.com/xss-report", // CustomBrowserXssValue allows the X-XSS-Protection header value to be set with a custom value. This overrides the BrowserXssFilter option. Default is "".
     ContentSecurityPolicy: "default-src 'self'", // ContentSecurityPolicy allows the Content-Security-Policy header value to be set with a custom value. Default is "". Passing a template string will replace `$NONCE` with a dynamic nonce value of 16 bytes for each request which can be later retrieved using the Nonce function.
+    ReuseNonce: false, // If ReuseNonce is true, a CSP nonce already stored in the request context by this package (e.g. by an outer Secure middleware) is validated and reused instead of generating a new one. Default is false.
     ReferrerPolicy: "same-origin", // ReferrerPolicy allows the Referrer-Policy header with the value to be set with a custom value. Default is "".
     FeaturePolicy: "vibrate 'none';", // Deprecated: this header has been renamed to PermissionsPolicy. FeaturePolicy allows the Feature-Policy header with the value to be set with a custom value. Default is "".
     PermissionsPolicy: "fullscreen=(), geolocation=()", // PermissionsPolicy allows the Permissions-Policy header with the value to be set with a custom value. Default is "".
