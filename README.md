@@ -24,6 +24,9 @@
     For instance, `fastjson` easily parses the following JSON array `[123, "foo", [456], {"k": "v"}, null]`.
   * `fastjson` preserves the original order of object items when calling
     [Object.Visit](https://godoc.org/github.com/valyala/fastjson#Object.Visit).
+  * Configurable duplicate object key handling via `Parser.DuplicateKeys`
+    (reject with both key positions, keep first, keep last). Unset, the
+    historical behavior of preserving every member is retained.
 
 
 ## Known limitations

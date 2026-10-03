@@ -28,6 +28,13 @@ type Scanner struct {
 
 	// c is used for caching JSON values.
 	c cache
+
+	// DuplicateKeys controls how objects containing two members with the
+	// same key are handled.
+	//
+	// The zero value (DuplicateKeyDefault) preserves all members, which is
+	// the historical behavior.
+	DuplicateKeys DuplicateKeyPolicy
 }
 
 // Init initializes sc with the given s.
@@ -65,7 +72,9 @@ func (sc *Scanner) Next() bool {
 	}
 
 	sc.c.reset()
-	v, tail, err := sc.c.parseValue(sc.s, 0)
+	sc.c.base = sc.s
+	sc.c.dupPolicy = sc.DuplicateKeys
+	v, tail, err := sc.c.parseValue(sc.s, 0, 0)
 	if err != nil {
 		sc.err = err
 		return false

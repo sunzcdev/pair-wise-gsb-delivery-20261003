@@ -20,6 +20,13 @@ type Parser struct {
 
 	// c is a cache for json values.
 	c cache
+
+	// DuplicateKeys controls how objects containing two members with the
+	// same key are handled.
+	//
+	// The zero value (DuplicateKeyDefault) preserves all members, which is
+	// the historical behavior.
+	DuplicateKeys DuplicateKeyPolicy
 }
 
 // Parse parses s containing JSON.
@@ -28,13 +35,15 @@ type Parser struct {
 //
 // Use Scanner if a stream of JSON values must be parsed.
 func (p *Parser) Parse(s string) (*Value, error) {
-	s = skipWS(s)
 	p.b = append(p.b[:0], s...)
 	p.c.reset()
+	p.c.base = b2s(p.b)
+	p.c.dupPolicy = p.DuplicateKeys
 
-	v, tail, err := p.c.parseValue(b2s(p.b), 0)
+	root := skipWS(p.c.base)
+	v, tail, err := p.c.parseValue(root, 0, len(p.c.base)-len(root))
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
+		return nil, fmt.Errorf("cannot parse JSON: %w; unparsed tail: %q", err, startEndString(tail))
 	}
 	tail = skipWS(tail)
 	if len(tail) > 0 {
@@ -54,6 +63,12 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 
 type cache struct {
 	vs []Value
+
+	// base contains the whole JSON document currently being parsed.
+	base string
+
+	// dupPolicy is the duplicate key policy for the current parse.
+	dupPolicy DuplicateKeyPolicy
 }
 
 func (c *cache) reset() {
@@ -101,7 +116,7 @@ type kv struct {
 // MaxDepth is the maximum depth for nested JSON.
 const MaxDepth = 300
 
-func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
+func (c *cache) parseValue(s string, depth, pos int) (*Value, string, error) {
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("cannot parse empty string")
 	}
@@ -111,16 +126,16 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 	}
 
 	if s[0] == '{' {
-		v, tail, err := c.parseObject(s[1:], depth)
+		v, tail, err := c.parseObject(s[1:], depth, pos+1)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse object: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse object: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '[' {
-		v, tail, err := c.parseArray(s[1:], depth)
+		v, tail, err := c.parseArray(s[1:], depth, pos+1)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse array: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse array: %w", err)
 		}
 		return v, tail, nil
 	}
@@ -170,7 +185,7 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 	return v, tail, nil
 }
 
-func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
+func (c *cache) parseArray(s string, depth, pos int) (*Value, string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("missing ']'")
@@ -191,9 +206,10 @@ func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
 		var err error
 
 		s = skipWS(s)
-		v, s, err = c.parseValue(s, depth)
+		pos = len(c.base) - len(s)
+		v, s, err = c.parseValue(s, depth, pos)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse array value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse array value: %w", err)
 		}
 		a.a = append(a.a, v)
 
@@ -213,7 +229,7 @@ func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
 	}
 }
 
-func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
+func (c *cache) parseObject(s string, depth, pos int) (*Value, string, error) {
 	s = skipWS(s)
 	if len(s) == 0 {
 		return nil, s, fmt.Errorf("missing '}'")
@@ -231,16 +247,23 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 	o.o.reset()
 	for {
 		var err error
-		kv := o.o.getKV()
 
 		// Parse key.
 		s = skipWS(s)
+		keyPos := len(c.base) - len(s)
 		if len(s) == 0 || s[0] != '"' {
 			return nil, s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
-		kv.k, s, err = parseRawKey(s[1:])
+		var rawKey string
+		rawKey, s, err = parseRawKey(s[1:])
 		if err != nil {
 			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
+		}
+		key := rawKey
+		if c.dupPolicy != DuplicateKeyDefault {
+			// Keys must be compared after unescaping, so that e.g. "name"
+			// and "\u006eame" are treated as the same key.
+			key = unescapeStringBestEffort(rawKey)
 		}
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
@@ -250,10 +273,58 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 
 		// Parse value
 		s = skipWS(s)
-		kv.v, s, err = c.parseValue(s, depth)
+		valuePos := len(c.base) - len(s)
+		var v *Value
+		v, s, err = c.parseValue(s, depth, valuePos)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object value: %w", err)
 		}
+
+		// Apply the duplicate key policy. Each object is resolved on its
+		// own, so members of nested or sibling objects never interfere.
+		existingIdx := -1
+		if c.dupPolicy != DuplicateKeyDefault {
+			kvs := o.o.kvs
+			for i := range kvs {
+				if kvs[i].k == key {
+					existingIdx = i
+					break
+				}
+			}
+		}
+		switch {
+		case c.dupPolicy == DuplicateKeyReject && existingIdx >= 0:
+			firstPos := o.o.keyPositions[existingIdx]
+			line, column := lineColumn(c.base, keyPos)
+			firstLine, firstColumn := lineColumn(c.base, firstPos)
+			return nil, s, &DuplicateKeyError{
+				Key:             key,
+				FirstOffset:     firstPos,
+				FirstLine:       firstLine,
+				FirstColumn:     firstColumn,
+				DuplicateOffset: keyPos,
+				DuplicateLine:   line,
+				DuplicateColumn: column,
+			}
+		case c.dupPolicy == DuplicateKeyKeepFirst && existingIdx >= 0:
+			// Drop the later member together with its value.
+		case c.dupPolicy == DuplicateKeyKeepLast && existingIdx >= 0:
+			// Drop the earlier member, then append the new member at the
+			// end so the surviving entry keeps the last position.
+			o.o.removeKV(existingIdx)
+			fallthrough
+		default:
+			entry := o.o.getKV()
+			entry.k = key
+			entry.v = v
+			if c.dupPolicy == DuplicateKeyReject {
+				o.o.keyPositions = append(o.o.keyPositions, keyPos)
+			}
+		}
+		if c.dupPolicy != DuplicateKeyDefault {
+			o.o.keysUnescaped = true
+		}
+
 		s = skipWS(s)
 		if len(s) == 0 {
 			return nil, s, fmt.Errorf("unexpected end of object")
@@ -455,6 +526,10 @@ func parseRawNumber(s string) (string, string, error) {
 type Object struct {
 	kvs           []kv
 	keysUnescaped bool
+
+	// keyPositions stores, for each member, the byte offset of the key's
+	// opening quote. It is only populated when duplicate keys are rejected.
+	keyPositions []int
 }
 
 func (o *Object) reset() {
@@ -462,7 +537,18 @@ func (o *Object) reset() {
 	clear(o.kvs)
 	o.kvs = o.kvs[:0]
 
+	o.keyPositions = o.keyPositions[:0]
+
 	o.keysUnescaped = false
+}
+
+// removeKV removes the member at the given index. keyPositions, when present,
+// is kept in sync.
+func (o *Object) removeKV(i int) {
+	o.kvs = append(o.kvs[:i], o.kvs[i+1:]...)
+	if len(o.keyPositions) > 0 {
+		o.keyPositions = append(o.keyPositions[:i], o.keyPositions[i+1:]...)
+	}
 }
 
 // MarshalTo appends marshaled o to dst and returns the result.
