@@ -213,6 +213,86 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Typed paths
+-----------
+
+The string based path is convenient, but sometimes the parts are already
+known values and you do not want to be surprised by dot syntax, numeric
+keys, or the `-1` append rule. The typed path API treats every segment
+literally:
+
+* `sjson.Key(name)` addresses an object property by its exact name. The
+  name is never parsed, so `"0"`, `"a.b"`, `"#"`, and `""` all match an
+  object property verbatim.
+* `sjson.Index(i)` addresses array element `i`, where `i` must be
+  non-negative (a negative value panics). It always means an array
+  position, even `0`.
+* `sjson.Append()` addresses the slot after the current last array
+  element. Setting grows the array by one; deleting removes the last
+  element.
+
+Each segment kind has a matching builder method on `sjson.Path` for
+chaining:
+
+```go
+path := sjson.Path{}.Key("users").Key("a.b").Index(2).Append()
+value, _ := sjson.SetPaths(json, path, "Sara")
+```
+
+`SetPaths`, `SetRawPaths`, `DeletePaths`, and their `*Bytes*` and
+`*Options` variants mirror the string based functions.
+
+Creating missing parents
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+When a parent container does not exist, its type is taken from the next
+segment:
+
+* a `Key` segment creates an object `{}`;
+* an `Index` or `Append` segment creates an array `[]`.
+
+```go
+value, _ := sjson.SetPaths(``, sjson.Path{}.Key("a").Index(0), 1)
+println(value)
+
+// Output:
+// {"a":[1]}
+```
+
+If an existing container has the wrong type for the next segment (a key
+on an array, or an index/append on an object), the operation returns an
+error. Descending through an existing scalar also returns an error; the
+old subtree is never replaced wholesale.
+
+Literal keys
+^^^^^^^^^^^^
+
+Names that need escaping in the string syntax are reached directly:
+
+```go
+sjson.SetPaths(json, sjson.Path{}.Key("0"), 1)     // object key "0"
+sjson.SetPaths(json, sjson.Path{}.Key("a.b"), 1)   // single key "a.b"
+sjson.SetPaths(json, sjson.Path{}.Key("#"), 1)     // object key "#"
+sjson.SetPaths(json, sjson.Path{}.Key(""), 1)      // empty-string key
+```
+
+Array padding and deletion
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+* Setting an `Index` past the current end pads the gap with `null`, so the
+  value lands exactly at the requested position:
+  `Index(4)` on `[1,2]` yields `[1,2,null,null,5]`.
+* Setting an `Append` always grows the array and never replaces the last
+  element.
+* Deleting an in-range `Index` removes that element and closes the gap.
+* Deleting a missing object key, an index at or past the array length, or
+  the last element of an empty array is a no-op that leaves the document
+  unchanged.
+
+The legacy string entry points (`Set`, `SetRaw`, `Delete`, and friends)
+keep their original semantics, including numeric text meaning an array
+position, `-1` meaning append, and colon/backslash escaping.
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
