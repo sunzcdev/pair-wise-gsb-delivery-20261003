@@ -1267,7 +1267,7 @@ func (b *BitSet) BinaryStorageSize() int {
 	return wordBytes + wordBytes*b.wordCount()
 }
 
-func readUint64Array(reader io.Reader, data []uint64) error {
+func readUint64Array(reader io.Reader, order binary.ByteOrder, data []uint64) error {
 	length := len(data)
 	bufferSize := 128
 	buffer := make([]byte, bufferSize*wordBytes)
@@ -1282,13 +1282,13 @@ func readUint64Array(reader io.Reader, data []uint64) error {
 			return err
 		}
 		for i := range chunk {
-			chunk[i] = uint64(binaryOrder.Uint64(buffer[8*i:]))
+			chunk[i] = uint64(order.Uint64(buffer[8*i:]))
 		}
 	}
 	return nil
 }
 
-func writeUint64Array(writer io.Writer, data []uint64) error {
+func writeUint64Array(writer io.Writer, order binary.ByteOrder, data []uint64) error {
 	bufferSize := 128
 	buffer := make([]byte, bufferSize*wordBytes)
 	for i := 0; i < len(data); i += bufferSize {
@@ -1299,7 +1299,7 @@ func writeUint64Array(writer io.Writer, data []uint64) error {
 		}
 		chunk := data[i:end]
 		for i, x := range chunk {
-			binaryOrder.PutUint64(buffer[8*i:], x)
+			order.PutUint64(buffer[8*i:], x)
 		}
 		_, err := writer.Write(buffer)
 		if err != nil {
@@ -1338,7 +1338,7 @@ func (b *BitSet) WriteTo(stream io.Writer) (int64, error) {
 		// return the number of bytes written.
 		return int64(0), err
 	}
-	err = writeUint64Array(stream, b.set[:b.wordCount()])
+	err = writeUint64Array(stream, binaryOrder, b.set[:b.wordCount()])
 	if err != nil {
 		// Upon failure, we do not guarantee that we
 		// return the number of bytes written.
@@ -1387,7 +1387,7 @@ func (b *BitSet) ReadFrom(stream io.Reader) (int64, error) {
 
 	b.length = newlength
 
-	err = readUint64Array(stream, b.set)
+	err = readUint64Array(stream, binaryOrder, b.set)
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF

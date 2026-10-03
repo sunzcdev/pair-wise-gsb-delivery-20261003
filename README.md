@@ -106,6 +106,37 @@ You can later deserialize the result as follows:
 The `ReadFrom` function attempts to read the data into the existing
 BitSet instance, to minimize memory allocations.
 
+### Explicit Codec (byte order and size limit)
+
+The package-level `LittleEndian()`/`BigEndian()` functions select the byte
+order through a global setting. To avoid touching that global state, create
+an independent `Codec` that fixes the byte order and an optional maximum
+logical length in bits:
+
+```Go
+	// Big endian, up to 10000 bits. A max of 0 removes the limit.
+	codec := bitset.NewCodec(binary.BigEndian, 10000)
+
+	// Slices
+	data, err := codec.Marshal(bs)
+	var decoded bitset.BitSet
+	err = codec.Unmarshal(data, &decoded)
+
+	// Streams
+	_, err = codec.Write(&buf, bs)
+	_, err = codec.Read(&buf, &decoded)
+```
+
+`Codec.Read` consumes exactly one BitSet: any bytes following it in the
+stream are left for the caller, so a single BitSet can be read from a
+concatenated data stream. Decoding is strict—a truncated payload, a
+declared length larger than the configured maximum, or non-zero padding
+("dirty") bits in the last word makes the whole decode fail and leaves the
+target BitSet unchanged. Codecs are immutable after creation and independent
+of the global configuration, so big-endian and little-endian codecs may be
+used concurrently. The existing `WriteTo`/`ReadFrom`/`MarshalBinary`/
+`UnmarshalBinary` interfaces remain unchanged.
+
 
 *Performance tip*: 
 When reading and writing to a file or a network connection, you may get better performance by 
