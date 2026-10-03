@@ -213,8 +213,8 @@ import (
 // data transformations. See "DecodeHook" in the DecoderConfig
 // struct.
 //
-// The type must be one of DecodeHookFuncType, DecodeHookFuncKind, or
-// DecodeHookFuncValue.
+// The type must be one of DecodeHookFuncType, DecodeHookFuncKind,
+// DecodeHookFuncValue, or DecodeHook2Func.
 // Values are a superset of Types (Values can return types), and Types are a
 // superset of Kinds (Types can return Kinds) and are generally a richer thing
 // to use, but Kinds are simpler if you only need those.
