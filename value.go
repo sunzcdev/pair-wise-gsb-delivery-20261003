@@ -190,6 +190,7 @@ type LState struct {
 	alloc        *allocator
 	currentFrame *callFrame
 	wrapped      bool
+	closed       bool
 	uvcache      *Upvalue
 	hasErrorFunc bool
 	mainLoop     func(*LState, *callFrame)

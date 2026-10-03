@@ -2,6 +2,7 @@ package lua
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -72,6 +73,17 @@ const (
 )
 
 /* }}} */
+
+// ErrThreadClosed is returned by Resume (and surfaced by coroutine.resume) when
+// the target coroutine has been closed with CloseThread and can no longer be
+// resumed. Test it with errors.Is to detect a closed coroutine specifically.
+var ErrThreadClosed = errors.New("attempt to resume a closed coroutine")
+
+// ErrCannotCloseRunningThread is returned by CloseThread when the target
+// coroutine is currently running. A running coroutine cannot have its stack
+// torn down from another goroutine; only suspended or finished coroutines can
+// be closed.
+var ErrCannotCloseRunningThread = errors.New("cannot close a running coroutine")
 
 /* P {{{ */
 
@@ -205,7 +217,11 @@ func (cs *fixedCallFrameStack) Pop() *callFrame {
 }
 
 func (cs *fixedCallFrameStack) FreeAll() {
-	// nothing to do for fixed callframestack
+	// drop references held by the call frames so they can be collected
+	for i := range cs.array {
+		cs.array[i] = callFrame{}
+	}
+	cs.sp = 0
 }
 
 // FramesPerSegment should be a power of 2 constant for performance reasons. It will allow the go compiler to change
@@ -272,6 +288,9 @@ func (cs *autoGrowingCallFrameStack) Clear() {
 
 func (cs *autoGrowingCallFrameStack) FreeAll() {
 	for i := segIdx(0); i <= cs.segIdx; i++ {
+		if cs.segments[i] != nil {
+			cs.segments[i].array = [FramesPerSegment]callFrame{}
+		}
 		freeCallFrameStackSegment(cs.segments[i])
 		cs.segments[i] = nil
 	}
@@ -1942,6 +1961,9 @@ func (ls *LState) Status(th *LState) string {
 }
 
 func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState, error, []LValue) {
+	if th.closed {
+		return ResumeError, ErrThreadClosed, nil
+	}
 	isstarted := th.isStarted()
 	if !isstarted {
 		base := 0
@@ -2007,6 +2029,67 @@ func (ls *LState) Yield(values ...LValue) int {
 		ls.Push(lv)
 	}
 	return -1
+}
+
+// CloseThread abandons the coroutine th and releases its stack.
+//
+// A coroutine that is suspended in a yield is torn down without running any
+// further Lua code. Open upvalues are closed first, so closures that escaped
+// to the outside keep reading the last values of the captured locals instead of
+// dangling into the freed registers, and the child context associated with th
+// is cancelled.
+//
+// The result is deterministic: closing a never started or already finished
+// coroutine succeeds, closing an already closed coroutine is a no-op that
+// returns nil, and closing a currently running coroutine (including one on the
+// active resume chain) fails with ErrCannotCloseRunningThread because its stack
+// cannot be unwound from another goroutine. After a successful close, Resume on
+// th returns ErrThreadClosed (and Lua side coroutine.resume surfaces the same
+// message).
+func (ls *LState) CloseThread(th *LState) error {
+	if th.closed {
+		return nil
+	}
+	// Refuse to unwind a stack that is still executing: th itself, or any
+	// ancestor that has resumed th and is therefore in the "normal" state.
+	for cur := ls.G.CurrentThread; cur != nil; cur = cur.Parent {
+		if cur == th {
+			return ErrCannotCloseRunningThread
+		}
+	}
+
+	// Close every open upvalue while the registers are still live, snapshotting
+	// the current locals into the closures and detaching them from the stack.
+	for uv := th.uvcache; uv != nil; uv = uv.next {
+		uv.Close()
+	}
+	th.uvcache = nil
+
+	// Cancel the child context before the stack goes away. A following Resume
+	// never executes th, but anything observing the context is released now.
+	if th.ctxCancelFn != nil {
+		th.ctxCancelFn()
+	}
+
+	// Release the stack and registers; after this point th is marked dead and
+	// closed, so every later operation short-circuits before touching them.
+	if th.stack != nil {
+		th.stack.FreeAll()
+		th.stack = nil
+	}
+	th.Dead = true
+	th.closed = true
+	th.currentFrame = nil
+	th.Parent = nil
+	if th.reg != nil {
+		for i := range th.reg.array {
+			th.reg.array[i] = nil
+		}
+		th.reg.array = nil
+		th.reg.top = 0
+		th.reg = nil
+	}
+	return nil
 }
 
 func (ls *LState) XMoveTo(other *LState, n int) {
