@@ -1,0 +1,227 @@
+1: Inline math
+//- - - - - - - - -//
+This is $x + y$ math.
+//- - - - - - - - -//
+<p>This is <code>x + y</code> math.</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+2: Price sentence with no closer stays literal
+//- - - - - - - - -//
+The price is $10 and $20 in total.
+//- - - - - - - - -//
+<p>The price is $10 and $20 in total.</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+3: A closer followed by a digit does not close math
+//- - - - - - - - -//
+It costs $x$5 only.
+//- - - - - - - - -//
+<p>It costs $x$5 only.</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+4: Prices stay literal across paragraphs while math still renders
+//- - - - - - - - -//
+The price is $10.
+
+Formula $a+b$ follows.
+//- - - - - - - - -//
+<p>The price is $10.</p>
+<p>Formula <code>a+b</code> follows.</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+5: Adjacent inline math expressions
+//- - - - - - - - -//
+$a$$b$
+//- - - - - - - - -//
+<p><code>a</code><code>b</code></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+6: Escaped dollar signs stay ordinary content
+//- - - - - - - - -//
+A \$ literal and $x$ and \$ not closed.
+//- - - - - - - - -//
+<p>A $ literal and <code>x</code> and $ not closed.</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+7: Backslashes inside math are preserved as raw bytes
+//- - - - - - - - -//
+$\frac{1}{2}$
+//- - - - - - - - -//
+<p><code>\frac{1}{2}</code></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+8: An escaped dollar inside math does not close it
+//- - - - - - - - -//
+$a \$ b$
+//- - - - - - - - -//
+<p><code>a \$ b</code></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+9: Dollars inside code spans stay ordinary content
+//- - - - - - - - -//
+code `$x$` span
+//- - - - - - - - -//
+<p>code <code>$x$</code> span</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+10: Opening delimiter followed by whitespace is literal
+//- - - - - - - - -//
+$ x$
+//- - - - - - - - -//
+<p>$ x$</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+11: Closing delimiter preceded by whitespace is literal
+//- - - - - - - - -//
+$x $
+//- - - - - - - - -//
+<p>$x $</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+12: Inline math may span ordinary line breaks
+//- - - - - - - - -//
+$a
+b$
+//- - - - - - - - -//
+<p><code>a
+b</code></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+13: Inline math does not span blank lines
+//- - - - - - - - -//
+$a
+
+b$
+//- - - - - - - - -//
+<p>$a</p>
+<p>b$</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+14: Unclosed inline math is rendered literally
+//- - - - - - - - -//
+unclosed $x + 1 end
+//- - - - - - - - -//
+<p>unclosed $x + 1 end</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+15: Display math block
+//- - - - - - - - -//
+$$
+x = y
+$$
+//- - - - - - - - -//
+<pre>x = y
+</pre>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+16: Display math block keeps the raw body bytes
+//- - - - - - - - -//
+$$
+\frac{1}{2}
+  a &= b \\
+$$
+//- - - - - - - - -//
+<pre>\frac{1}{2}
+  a &amp;= b \\
+</pre>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+17: Closing fence may be indented and carry trailing spaces
+//- - - - - - - - -//
+$$
+x
+   $$
+//- - - - - - - - -//
+<pre>x
+</pre>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+18: Fence with an info string is not a math block; a later bare fence interrupts
+//- - - - - - - - -//
+$$ latex
+x
+$$
+//- - - - - - - - -//
+<p>$$ latex
+x</p>
+<p>$$</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+19: Unclosed display math falls back to a paragraph
+//- - - - - - - - -//
+$$
+z = w
+//- - - - - - - - -//
+<p>$$
+z = w</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+20: Display math block inside a block quote
+//- - - - - - - - -//
+> $$
+> x = y
+> $$
+//- - - - - - - - -//
+<blockquote>
+<pre>x = y
+</pre>
+</blockquote>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+21: Display math block interrupting a paragraph
+//- - - - - - - - -//
+text
+$$
+x
+$$
+after
+//- - - - - - - - -//
+<p>text</p>
+<pre>x
+</pre>
+<p>after</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+22: Math inside emphasis and link labels
+//- - - - - - - - -//
+*$x$* and [$y$](#z)
+//- - - - - - - - -//
+<p><em><code>x</code></em> and <a href="#z"><code>y</code></a></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+23: Inline double dollars outside a block stay literal
+//- - - - - - - - -//
+$$x$$
+//- - - - - - - - -//
+<p>$<code>x</code>$</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+24: Fenced code block takes precedence over math
+//- - - - - - - - -//
+```
+$x$
+$$
+y
+$$
+```
+//- - - - - - - - -//
+<pre><code>$x$
+$$
+y
+$$
+</code></pre>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+25: HTML-like content inside math is escaped
+//- - - - - - - - -//
+$a < b && c > d$
+//- - - - - - - - -//
+<p><code>a &lt; b &amp;&amp; c &gt; d</code></p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//
+
+26: Empty math is not recognized
+//- - - - - - - - -//
+$$
+//- - - - - - - - -//
+<p>$$</p>
+//= = = = = = = = = = = = = = = = = = = = = = = =//

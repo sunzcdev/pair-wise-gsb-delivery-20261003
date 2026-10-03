@@ -413,6 +413,10 @@ Each extension is a pair of a parser extension and an HTML renderer extension.
 - `TypographerParser`
     - This extension substitutes punctuations with typographic entities like [smartypants](https://daringfireball.net/projects/smartypants/).
     - This extension only affects parsing (it emits already-substituted text), so it has no HTML renderer half.
+- `Math(Parser|HTMLRenderer)`
+    - Parses inline math (`$...$`) and display math blocks (`$$`), emitting dedicated `ast.InlineMath` and `ast.BlockMath` nodes.
+    - Math source is kept verbatim; no TeX engine is involved. Rendering the formula is left to downstream consumers.
+    - Disabled by default. See the [Math extension](#math-extension) section.
 
 ### Attributes
 The `parser.WithAttribute` option allows you to define attributes on some elements.
@@ -461,6 +465,54 @@ You can override alignment rendering method via options.
 | Functional option | Type | Description |
 | ----------------- | ---- | ----------- |
 | `extension.WithTableCellAlignMethod` | `extension.TableCellAlignMethod` | Option indicates how are table cells aligned. |
+
+### Math extension
+
+The Math extension recognizes inline math enclosed in single dollar signs and
+display math enclosed in double dollar sign fences. It emits dedicated AST
+nodes (`ast.InlineMath` and `ast.BlockMath`) whose values preserve the math
+source byte for byte. No TeX engine is embedded; rendering the formulas is
+the responsibility of downstream consumers.
+
+The extension is disabled by default and must be enabled explicitly:
+
+```go
+import (
+    "github.com/yuin/goldmark/v2/extension"
+    "github.com/yuin/goldmark/v2/parser"
+    "github.com/yuin/goldmark/v2/renderer/html"
+)
+
+p := parser.New(
+    parser.WithExtensions(extension.NewMathParser()),
+)
+r := html.New(
+    html.WithExtensions(extension.NewMathHTMLRenderer()),
+)
+```
+
+Inline syntax rules (`$...$`):
+
+- The opening `$` must not be followed by whitespace, and the closing `$`
+  must not be preceded by whitespace or followed by a digit. Sentences such
+  as `The price is $10 and $20` therefore remain plain text.
+- Escaped dollars (`\$`) and dollars inside code spans are treated as
+  ordinary content.
+- Expressions do not span blank lines; an expression without a valid
+  closing delimiter is rendered as its literal source.
+
+Display math is a block whose opening and closing lines contain only `$$`
+surrounded by indentation or whitespace; the body is stored verbatim and may
+span multiple lines, including inside block quotes and lists. An unclosed
+fence falls back to a normal paragraph.
+
+The HTML renderer only emits configurable wrapping tags and escapes the
+formula content, so math source is never executed as HTML:
+
+| Functional option | Type | Default | Description |
+| ------------------ | ---- | ------- | ----------- |
+| `extension.WithInlineMathTag` | `string` | `"code"` | Tag used for inline math. |
+| `extension.WithBlockMathTag` | `string` | `"pre"` | Tag used for display math. |
 
 ### Typographer extension
 
