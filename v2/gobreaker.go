@@ -235,10 +235,13 @@ func (cb *CircuitBreaker[T]) Execute(req func() (T, error)) (T, error) {
 }
 
 func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
+	return cb.beforeRequestAt(time.Now())
+}
+
+func (cb *CircuitBreaker[T]) beforeRequestAt(now time.Time) (uint64, uint64, error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
 	state, generation, age := cb.currentState(now)
 
 	if state == StateOpen {
@@ -252,10 +255,13 @@ func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
 }
 
 func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error) {
+	cb.afterRequestAt(previous, age, time.Now(), err)
+}
+
+func (cb *CircuitBreaker[T]) afterRequestAt(previous uint64, age uint64, now time.Time, err error) {
 	cb.mutex.Lock()
 	defer cb.mutex.Unlock()
 
-	now := time.Now()
 	state, generation, _ := cb.currentState(now)
 	if generation != previous {
 		return
@@ -271,6 +277,63 @@ func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error
 	} else {
 		cb.onFailure(state, age, now)
 	}
+}
+
+// replayRequest merges a request that was admitted and finished elsewhere into
+// the current local state. The admission and completion are replayed at the
+// timestamps at which they originally happened, so bucket rolls and state
+// transitions are deterministic. A request from a generation that is no longer
+// current is dropped, the same way afterRequest drops stale completions.
+// replayRequest returns true when the outcome belonged to the current
+// generation and was applied.
+func (cb *CircuitBreaker[T]) replayRequest(previous uint64, age uint64, admittedAt time.Time, finishedAt time.Time, err error) bool {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	cb.currentState(admittedAt)
+	if cb.generation != previous {
+		// The request was admitted in a generation that has since been
+		// superseded before it was even recorded; drop it entirely.
+		return false
+	}
+
+	// Mirror beforeRequest: count the admitted request before advancing time.
+	cb.counts.onRequest()
+
+	state, generation, _ := cb.currentState(finishedAt)
+	if generation != previous {
+		return false
+	}
+
+	if cb.isExcluded(err) {
+		cb.onExclusion(age)
+		return true
+	}
+
+	if cb.isSuccessful(err) {
+		cb.onSuccess(state, age, finishedAt)
+	} else {
+		cb.onFailure(state, age, finishedAt)
+	}
+	return true
+}
+
+// scratchBreaker builds a fresh, independent CircuitBreaker with the same
+// configuration as cb. DistributedCircuitBreaker uses it as a per-call scratch
+// area so concurrent optimistic calls cannot overwrite each other's local
+// state.
+func (cb *CircuitBreaker[T]) scratchBreaker() *CircuitBreaker[T] {
+	return NewCircuitBreaker[T](Settings{
+		Name:          cb.name,
+		MaxRequests:   cb.maxRequests,
+		Interval:      cb.interval,
+		BucketPeriod:  cb.bucketPeriod,
+		Timeout:       cb.timeout,
+		ReadyToTrip:   cb.readyToTrip,
+		OnStateChange: nil,
+		IsSuccessful:  cb.isSuccessful,
+		IsExcluded:    cb.isExcluded,
+	})
 }
 
 func (cb *CircuitBreaker[T]) onSuccess(state State, age uint64, now time.Time) {
