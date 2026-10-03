@@ -16,6 +16,13 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// whether a token cookie has already been written
+	// to the response during this request
+	cookieSet bool
+	// tracks the response writer used by CSRFHandler,
+	// so that token rotation can tell whether
+	// the response has already been committed
+	resp *responseTracker
 }
 
 // Token takes an HTTP request and returns
@@ -46,6 +53,11 @@ func Reason(req *http.Request) error {
 }
 
 func ctxClear(_ *http.Request) {
+}
+
+func ctxGet(req *http.Request) (*csrfContext, bool) {
+	ctx, ok := req.Context().Value(nosurfKey).(*csrfContext)
+	return ctx, ok
 }
 
 func ctxSetToken(req *http.Request, token []byte) {

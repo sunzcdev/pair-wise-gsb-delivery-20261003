@@ -17,6 +17,13 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// whether a token cookie has already been written
+	// to the response during this request
+	cookieSet bool
+	// tracks the response writer used by CSRFHandler,
+	// so that token rotation can tell whether
+	// the response has already been committed
+	resp *responseTracker
 }
 
 var (
@@ -98,4 +105,12 @@ func ctxClear(req *http.Request) {
 	defer cmMutex.Unlock()
 
 	delete(contextMap, req)
+}
+
+func ctxGet(req *http.Request) (*csrfContext, bool) {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	ctx, ok := contextMap[req]
+	return ctx, ok
 }

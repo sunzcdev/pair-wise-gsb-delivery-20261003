@@ -5,5 +5,9 @@ package nosurf
 import "net/http"
 
 func addNosurfContext(r *http.Request) *http.Request {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	contextMap[r] = new(csrfContext)
 	return r
 }

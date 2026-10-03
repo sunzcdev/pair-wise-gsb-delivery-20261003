@@ -117,6 +117,35 @@ func HandleJson(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### Rotating the token
+After events that change the user's authentication state or privilege level
+(e.g. login, logout, permission changes), the old CSRF token should be
+explicitly invalidated by rotating it:
+
+```go
+func HandleLogin(w http.ResponseWriter, r *http.Request) {
+	// ... authenticate the user ...
+	newToken, err := csrfHandler.RotateToken(w, r)
+	if err != nil {
+		// The request did not pass through the CSRFHandler (ErrNoContext)
+		// or the response has already been committed (ErrResponseCommitted).
+	}
+	// nosurf.Token(r) now returns newToken as well.
+}
+```
+
+`RotateToken` issues a new cookie, expiring any token cookie already sent
+during the same response, so that only the most recently rotated token
+remains valid. Forms rendered with the old token fail the CSRF check
+on subsequent requests, while forms using the new token pass.
+Rotating the token does not change the result of the CSRF check
+already performed for the current request.
+
+The older `RegenerateToken` entry point is kept for backward compatibility:
+it performs the same rotation, but ignores the errors above and returns
+an empty string when the rotation could not be performed.
+New code should prefer `RotateToken`.
+
 ### Contributing
 
 0. Find an issue that bugs you / open a new one.
