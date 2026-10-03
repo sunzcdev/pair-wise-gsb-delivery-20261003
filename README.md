@@ -336,6 +336,41 @@ name := gjson.Get(json, `programmers.#(lastName="Hunter").firstName`)
 println(name.String())  // prints "Elliotte"
 ```
 
+## Join two arrays
+
+The `Join` and `JoinArrays` functions perform a relational join between two
+JSON arrays. `Join` references both arrays in a single document by path, while
+`JoinArrays` joins two array documents directly. Each result exposes the
+matched `Left` and `Right` records.
+
+```go
+left  := `[{"id":1,"name":"a"},{"id":2,"name":"b"},{"id":3,"name":"c"}]`
+right := `[{"id":2,"v":"x"},{"id":3,"v":"y"}]`
+
+results := gjson.JoinArrays(left, right, gjson.JoinOptions{
+	Mode:     gjson.JoinLeft,   // or gjson.JoinInner
+	LeftKey:  "id",
+	RightKey: "id",
+})
+for _, r := range results {
+	println(r.Left.Raw, r.Right.Raw)
+}
+// {"id":1,"name":"a"} null
+// {"id":2,"name":"b"} {"id":2,"v":"x"}
+// {"id":3,"name":"c"} {"id":3,"v":"y"}
+```
+
+- Duplicate keys produce the full Cartesian product, ordered by left
+  appearance and then right appearance; trailing right rows never overwrite
+  earlier ones.
+- String and number keys never match each other.
+- Missing keys never match. Explicit `null` keys match only when `MatchNull`
+  is true.
+- In `JoinLeft`, each unmatched left record appears once with a `null` right
+  value.
+- Use `LeftPath`/`RightPath` with `Join` to locate the arrays inside one
+  document, and use nested key paths such as `"user.id"` when needed.
+
 ## Iterate through an object or array
 
 The `ForEach` function allows for quickly iterating through an object or array. 
