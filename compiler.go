@@ -177,7 +177,7 @@ func (c *compiler) compileImport(i *Import) error {
 	}
 	c.appendCodeInfo("module " + path)
 	if err = c.compileModule(q, alias); err != nil {
-		return err
+		return fmt.Errorf("module %q: %w", path, err)
 	}
 	c.appendCodeInfo("end of module " + path)
 	return nil
