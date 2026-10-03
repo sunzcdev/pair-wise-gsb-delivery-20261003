@@ -92,3 +92,26 @@ var errorKeyInvalid = fmt.Errorf("key was not valid")
 func errorDecrypt(err error) error {
 	return fmt.Errorf("the message could not be decrypted: %w", newTokenError(err))
 }
+
+// Errors relating to key set construction.
+var errorKeySetEmptyID = fmt.Errorf("key set entry must have a non-empty ID")
+
+func errorKeySetDuplicateID(id string) error {
+	return fmt.Errorf("key set already contains an entry with ID %q", id)
+}
+
+func errorKeySetTooMany(limit int) error {
+	return fmt.Errorf("key set cannot contain more than %d candidates", limit)
+}
+
+func errorKeySetEmptyWindow(id string) error {
+	return fmt.Errorf("key set entry %q has a window that expires at or before it begins", id)
+}
+
+// No key currently enabled by the set could verify the token. Deliberately
+// indistinguishable at the error level from other signature failures so that an
+// attacker cannot probe which keys exist or learn which windows are active.
+var errorNoKeyVerified = newTokenError(fmt.Errorf("no enabled v4.public key verified the token"))
+
+// A configuration (not token) error: the set has no enabled keys at parse time.
+var errorNoActiveKeys = fmt.Errorf("no v4.public keys are enabled at this time")

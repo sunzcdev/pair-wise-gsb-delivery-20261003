@@ -99,6 +99,54 @@ require.Equal(t,
 require.NoError(t, err)
 ```
 
+# Key rotation (multiple v4.public keys)
+
+When rotating signing keys you can publish a small `V4PublicKeySet`. Each entry
+has a stable ID, the public key, and an enable/disable window. During the
+overlap both keys verify; afterwards the retired key is ignored.
+
+The set is safe for concurrent use and can be updated with `Add`/`Remove` while
+parsing. A parse snapshots one version of the set and one current time, tries at
+most 8 enabled keys, and returns the ID of the key that actually verified the
+token.
+
+Any `"kid"` carried in the (still unverified) footer is used only as an
+untrusted routing hint to try that key first. An unknown ID never fetches keys
+from anywhere and never falls back to another protocol; only keys already in
+the set are ever tried.
+
+```go
+now := time.Now()
+
+keySet, err := paseto.NewV4PublicKeySet([]paseto.V4KeyEntry{
+	{
+		ID:  "old-key",
+		Key: oldPublicKey,
+		// enabled until one hour from now
+		Window: paseto.V4KeyWindow{Expires: now.Add(time.Hour)},
+	},
+	{
+		ID:  "new-key",
+		Key: newPublicKey,
+		// enabled from one hour ago
+		Window: paseto.V4KeyWindow{NotBefore: now.Add(-time.Hour)},
+	},
+})
+if err != nil {
+	// duplicate ID, empty ID, empty window, or too many candidates
+	log.Fatal(err)
+}
+
+parser := paseto.NewParser()
+token, keyID, err := parser.ParseV4PublicWithKeySet(keySet, signed, nil)
+if err != nil {
+	log.Fatal(err)
+}
+
+// keyID identifies the key whose signature actually verified
+fmt.Println("verified by:", keyID)
+```
+
 # Supported Claims Validators
 The following validators are supported:
 
