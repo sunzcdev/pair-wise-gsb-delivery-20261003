@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,6 +64,18 @@ func (d *decoder) reset() {
 	d.tableParentSlot = slotWriter{}
 	d.keyParts = d.keyParts[:0]
 	d.strict.Reset()
+
+	d.checkRequired = false
+	// Same reuse policy as arrayCounts: clear the slots instead of
+	// reallocating, with a safety valve for adversarial inputs.
+	if len(d.provided) > 1<<14 {
+		d.provided = nil
+	} else {
+		clear(d.provided)
+	}
+	d.recPath = d.recPath[:0]
+	d.tablePath = d.tablePath[:0]
+	d.requiredErrors = d.requiredErrors[:0]
 }
 
 // Unmarshal deserializes a TOML document into a Go value.
@@ -151,6 +164,10 @@ func (d *Decoder) EnableUnmarshalerInterface() *Decoder {
 // returns a toml.DecodeError, providing context about the issue. When using
 // strict mode and a field is missing, a `toml.StrictMissingError` is
 // returned. In any other case, this function returns a standard Go error.
+//
+// Fields tagged with the "required" option must be explicitly provided by
+// the document; missing ones are reported in a `toml.StrictMissingError`,
+// regardless of strict mode.
 //
 // # Type mapping
 //
@@ -287,6 +304,21 @@ type decoder struct {
 	// keyParts is the reusable buffer holding the decoded parts of the key of
 	// the current expression in the fused generic decode path.
 	keyParts [][]byte
+
+	// Required-field tracking. checkRequired is true when the target type
+	// tree contains at least one field tagged "required"; when false, none
+	// of the other fields are used and no tracking happens. provided holds
+	// the set of NUL-joined key paths the document explicitly assigned,
+	// with array indexes recorded as "\x01<N>" segments. recPath is the
+	// scratch buffer for the path of the expression being decoded;
+	// tablePath is the path of the current cached table target.
+	// requiredErrors accumulates the missing required fields found by the
+	// final walk of the target.
+	checkRequired  bool
+	provided       map[string]struct{}
+	recPath        []string
+	tablePath      []string
+	requiredErrors []decodeError
 }
 
 // slotWriter remembers how to store a value at some location of the target
@@ -425,6 +457,231 @@ func (d *decoder) resetChildArrayCounts(key []byte) {
 	}
 }
 
+// indexSegment returns the path segment recording that the document
+// provided the i-th element of a slice or array. The \x01 prefix cannot
+// appear in a TOML key, so index segments cannot collide with key names.
+func indexSegment(i int) string {
+	return "\x01" + strconv.Itoa(i)
+}
+
+// recordProvided marks the given path as explicitly provided by the
+// document. The path segments are the canonical names of the struct fields
+// (as computed by the struct plan), map keys, and index segments.
+func (d *decoder) recordProvided(path []string) {
+	if d.provided == nil {
+		d.provided = make(map[string]struct{}, 16)
+	}
+	d.provided[strings.Join(path, "\x00")] = struct{}{}
+}
+
+// pushTablePath extends the path of the current table target with the
+// given segment and marks the resulting prefix as provided.
+func (d *decoder) pushTablePath(seg string) {
+	if !d.checkRequired {
+		return
+	}
+	d.tablePath = append(d.tablePath, seg)
+	d.recordProvided(d.tablePath)
+}
+
+// isProvided reports whether the document explicitly provided the value at
+// the given path extended with seg.
+func (d *decoder) isProvided(path []string, seg string) bool {
+	n := len(seg)
+	for _, p := range path {
+		n += len(p) + 1
+	}
+	buf := make([]byte, 0, n)
+	for _, p := range path {
+		buf = append(buf, p...)
+		buf = append(buf, 0)
+	}
+	buf = append(buf, seg...)
+	_, ok := d.provided[string(buf)] // does not allocate
+	return ok
+}
+
+// requiredTypeCache memoizes typeHasRequired results.
+var requiredTypeCache sync.Map // reflect.Type -> bool
+
+// typeHasRequired reports whether a value of the given type can contain a
+// field tagged "required" anywhere in its tree.
+func typeHasRequired(t reflect.Type) bool {
+	if v, ok := requiredTypeCache.Load(t); ok {
+		return v.(bool)
+	}
+	b := computeHasRequired(t, map[reflect.Type]bool{t: true})
+	requiredTypeCache.Store(t, b)
+	return b
+}
+
+func computeHasRequired(t reflect.Type, visiting map[reflect.Type]bool) bool {
+	switch t.Kind() {
+	case reflect.Ptr, reflect.Slice, reflect.Array, reflect.Map:
+		e := t.Elem()
+		if visiting[e] {
+			return false
+		}
+		if v, ok := requiredTypeCache.Load(e); ok {
+			return v.(bool)
+		}
+		visiting[e] = true
+		b := computeHasRequired(e, visiting)
+		delete(visiting, e)
+		return b
+	case reflect.Struct:
+		plan := planForType(t)
+		if len(plan.required) > 0 {
+			return true
+		}
+		for _, f := range plan.fields {
+			if visiting[f.typ] {
+				continue
+			}
+			if v, ok := requiredTypeCache.Load(f.typ); ok {
+				if v.(bool) {
+					return true
+				}
+				continue
+			}
+			visiting[f.typ] = true
+			b := computeHasRequired(f.typ, visiting)
+			delete(visiting, f.typ)
+			if b {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// appendPath returns a copy of path extended with seg.
+func appendPath(path []string, seg string) []string {
+	p := make([]string, len(path)+1)
+	copy(p, path)
+	p[len(path)] = seg
+	return p
+}
+
+// walkRequired checks the decoded target against the set of paths the
+// document explicitly provided, and records an error for every required
+// field the document did not mention. Structs are only descended into when
+// the document provided them, so the inner fields of an absent optional
+// parent are not reported. Array-table elements (and array elements in
+// general) are checked independently: pre-existing elements the document
+// did not touch are skipped, so values already present in the target never
+// count as provided.
+func (d *decoder) walkRequired(v reflect.Value, path []string) {
+	if v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return
+		}
+		v = v.Elem()
+	}
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return
+		}
+		v = v.Elem()
+	}
+
+	switch v.Kind() {
+	case reflect.Struct:
+		// Types that decode themselves from a single value have no
+		// document-visible inner fields to check.
+		if d.unmarshalerInterface && hasUnmarshaler(v) {
+			return
+		}
+		if mayImplementTextUnmarshaler(v.Type()) &&
+			reflect.PtrTo(v.Type()).Implements(textUnmarshalerType) {
+			return
+		}
+		plan := planForType(v.Type())
+		for _, f := range plan.required {
+			if d.isProvided(path, f.name) {
+				continue
+			}
+			d.requiredErrors = append(d.requiredErrors, decodeError{
+				key:     requiredKey(path, f.name),
+				message: "missing required field",
+			})
+		}
+		for _, f := range plan.fields {
+			if !typeHasRequired(f.typ) || !d.isProvided(path, f.name) {
+				continue
+			}
+			fv, ok := fieldByIndexRead(v, f.index)
+			if !ok {
+				continue
+			}
+			d.walkRequired(fv, appendPath(path, f.name))
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			seg := indexSegment(i)
+			if !d.isProvided(path, seg) {
+				continue
+			}
+			d.walkRequired(v.Index(i), appendPath(path, seg))
+		}
+	case reflect.Map:
+		if v.Type().Key() != stringType {
+			return
+		}
+		// Iterate in sorted key order so that errors come out in a stable
+		// order.
+		keys := make([]string, 0, v.Len())
+		it := v.MapRange()
+		for it.Next() {
+			keys = append(keys, it.Key().String())
+		}
+		slices.Sort(keys)
+		for _, k := range keys {
+			if !d.isProvided(path, k) {
+				continue
+			}
+			d.walkRequired(v.MapIndex(d.stringMapKey(k)), appendPath(path, k))
+		}
+	}
+}
+
+// fieldByIndexRead returns the field of v at the given index path, without
+// allocating intermediate pointers. ok is false when a nil pointer on the
+// path makes the field unreachable.
+func fieldByIndexRead(v reflect.Value, index []int) (reflect.Value, bool) {
+	for i, x := range index {
+		if i > 0 {
+			for v.Kind() == reflect.Ptr {
+				if v.IsNil() {
+					return reflect.Value{}, false
+				}
+				v = v.Elem()
+			}
+		}
+		v = v.Field(x)
+	}
+	return v, true
+}
+
+// requiredKey builds the user-facing key of a missing required field:
+// index segments are rendered as "[N]" suffixes on the previous part, so
+// the key reads as a full field path (e.g. "items[1].name").
+func requiredKey(path []string, name string) Key {
+	key := make(Key, 0, len(path)+1)
+	for _, seg := range path {
+		if len(seg) > 0 && seg[0] == '\x01' {
+			if len(key) > 0 {
+				key[len(key)-1] += "[" + seg[1:] + "]"
+			} else {
+				key = append(key, "["+seg[1:]+"]")
+			}
+			continue
+		}
+		key = append(key, seg)
+	}
+	return append(key, name)
+}
+
 func (d *decoder) typeMismatchError(toml string, target reflect.Type, highlight []byte) error {
 	return &typeMismatchError{
 		toml:      toml,
@@ -501,6 +758,7 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 
 	d.captureIdx = -1
 	d.p.Reset(data)
+	d.checkRequired = typeHasRequired(root.Type())
 
 	// Fully generic targets (interface{} or map[string]interface{}) are
 	// decoded straight into native Go maps and slices, with no reflection on
@@ -562,7 +820,11 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	default:
 	}
 
-	return d.strict.Error(data)
+	if d.checkRequired {
+		d.walkRequired(root, nil)
+	}
+
+	return d.strict.Error(data, d.requiredErrors)
 }
 
 // setAnyKey assigns the value of a key-value into the native map m, following
@@ -724,6 +986,7 @@ func (d *decoder) handleTableExpression(expr *unstable.Node, root reflect.Value,
 	for i := 0; i <= len(d.tableKey); i++ {
 		d.segIdx = append(d.segIdx, -1)
 	}
+	d.tablePath = d.tablePath[:0]
 
 	return d.walkTable(root, expr, isArrayTable, first)
 }
@@ -806,6 +1069,7 @@ walk:
 			}
 			n := v.Len() - 1
 			d.segIdx[idx] = n
+			d.pushTablePath(indexSegment(n))
 			elem := v.Index(n)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -820,10 +1084,12 @@ walk:
 				return d.keyedError(expr, fmt.Errorf("cannot reach element %d of array of size %d", cnt-1, v.Len()))
 			}
 			d.segIdx[idx] = cnt - 1
+			d.pushTablePath(indexSegment(cnt - 1))
 			elem := v.Index(cnt - 1)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
 		case reflect.Map:
+			d.pushTablePath(name)
 			if v.IsNil() {
 				nm := reflect.MakeMap(v.Type())
 				d.storeSlot(&pf, nm)
@@ -946,6 +1212,7 @@ walk:
 				d.skipUntilTable = true
 				return nil
 			}
+			d.pushTablePath(f.name)
 			fv, err := fieldByIndexAlloc(v, f.index)
 			if err != nil {
 				return err
@@ -979,6 +1246,7 @@ walk:
 			d.storeSlot(&pf, sv)
 			d.setArrayCount(akey, len(slice))
 			d.segIdx[len(d.tableKey)] = len(slice) - 1
+			d.pushTablePath(indexSegment(len(slice) - 1))
 			d.tableTarget = reflect.ValueOf(m)
 			d.tableParentSlot = slotWriter{kind: 1, slot: sv.Index(len(slice) - 1)}
 			d.tableTargetValid = true
@@ -997,6 +1265,7 @@ walk:
 			n := v.Len() - 1
 			d.setArrayCount(akey, n+1)
 			d.segIdx[len(d.tableKey)] = n
+			d.pushTablePath(indexSegment(n))
 			elem := v.Index(n)
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
 				d.startCapture(len(d.tableKey), expr)
@@ -1015,6 +1284,7 @@ walk:
 			v.Index(cnt).Set(reflect.Zero(v.Type().Elem()))
 			d.setArrayCount(akey, cnt+1)
 			d.segIdx[len(d.tableKey)] = cnt
+			d.pushTablePath(indexSegment(cnt))
 			elem := v.Index(cnt)
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
 				d.startCapture(len(d.tableKey), expr)
@@ -1066,6 +1336,7 @@ walk:
 			}
 			n := v.Len() - 1
 			d.segIdx[len(d.tableKey)] = n
+			d.pushTablePath(indexSegment(n))
 			elem := v.Index(n)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -1373,7 +1644,11 @@ func (d *decoder) handleKeyValueExpression(expr *unstable.Node, root reflect.Val
 	useCache := d.tableTargetValid && len(d.tableKey) > 0
 	if useCache {
 		target = d.tableTarget
+		if d.checkRequired {
+			d.recPath = append(d.recPath[:0], d.tablePath...)
+		}
 	} else {
+		d.recPath = d.recPath[:0]
 		for _, name := range d.tableKey {
 			d.path = append(d.path, pathPart{name: name})
 		}
@@ -1475,7 +1750,18 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		default:
 			elem = reflect.New(elemType).Elem()
 		}
+		if d.checkRequired {
+			seg := name
+			if !fastKey {
+				seg = d.partString(&part)
+			}
+			d.recPath = append(d.recPath, seg)
+			d.recordProvided(d.recPath)
+		}
 		nv, err := d.descend(elem, path, idx+1, expr, value)
+		if d.checkRequired {
+			d.recPath = d.recPath[:len(d.recPath)-1]
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -1495,6 +1781,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 				d.strict.MissingField(expr)
 			}
 			return v, nil
+		}
+		if d.checkRequired {
+			d.recPath = append(d.recPath, f.name)
+			d.recordProvided(d.recPath)
 		}
 		fv, err := fieldByIndexAlloc(v, f.index)
 		if err != nil {
@@ -1523,6 +1813,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		if nv.IsValid() && fv.CanSet() {
 			fv.Set(nv)
 		}
+		if d.checkRequired {
+			d.recPath = d.recPath[:len(d.recPath)-1]
+		}
 		return v, nil
 	case reflect.Interface:
 		elem := elemOrNewMap(v)
@@ -1539,7 +1832,14 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			v = reflect.Append(v, reflect.New(v.Type().Elem()).Elem())
 		}
 		elem := v.Index(v.Len() - 1)
+		if d.checkRequired {
+			d.recPath = append(d.recPath, indexSegment(v.Len()-1))
+			d.recordProvided(d.recPath)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
+		if d.checkRequired {
+			d.recPath = d.recPath[:len(d.recPath)-1]
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -1562,7 +1862,14 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 				"cannot reach element %d of array of size %d", elemIdx, v.Len())
 		}
 		elem := v.Index(elemIdx)
+		if d.checkRequired {
+			d.recPath = append(d.recPath, indexSegment(elemIdx))
+			d.recordProvided(d.recPath)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
+		if d.checkRequired {
+			d.recPath = d.recPath[:len(d.recPath)-1]
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -2012,7 +2319,14 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				continue
 			}
 			elem := slice.Index(i)
+			if d.checkRequired {
+				d.recPath = append(d.recPath, indexSegment(i))
+				d.recordProvided(d.recPath)
+			}
 			nv, err := d.assignValue(elem, nil, n)
+			if d.checkRequired {
+				d.recPath = d.recPath[:len(d.recPath)-1]
+			}
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -2036,7 +2350,14 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				break
 			}
 			elem := v.Index(i)
+			if d.checkRequired {
+				d.recPath = append(d.recPath, indexSegment(i))
+				d.recordProvided(d.recPath)
+			}
 			nv, err := d.assignValue(elem, nil, n)
+			if d.checkRequired {
+				d.recPath = d.recPath[:len(d.recPath)-1]
+			}
 			if err != nil {
 				return reflect.Value{}, err
 			}
@@ -2221,11 +2542,23 @@ type structPlan struct {
 	byName       map[string]structField
 	byFold       map[string]structField
 	hasCollision bool
+
+	// fields holds all the fields of the struct in declaration order
+	// (embedded fields flattened), and required the subset of them tagged
+	// with the "required" option. They drive the required-field check
+	// performed after decoding.
+	fields   []structField
+	required []structField
 }
 
 type structField struct {
 	index     []int
 	fieldName string
+	// name is the canonical TOML key of the field: its tag name when set,
+	// the Go field name otherwise.
+	name     string
+	typ      reflect.Type
+	required bool
 }
 
 // foldBufSize bounds the stack buffer used to lowercase keys without
@@ -2358,6 +2691,7 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 		tag, tagged := f.Tag.Lookup("toml")
 		name := f.Name
 		explicitName := ""
+		required := false
 		if tagged {
 			// A tag of exactly "-" drops the field. "-," names it "-".
 			if tag == "-" {
@@ -2367,6 +2701,13 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 			explicitName = parts[0]
 			if explicitName != "" {
 				name = explicitName
+			}
+			if len(parts) > 1 {
+				for _, opt := range strings.Split(parts[1], ",") {
+					if opt == "required" {
+						required = true
+					}
+				}
 			}
 		}
 		if f.Anonymous {
@@ -2396,7 +2737,11 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 		index := make([]int, 0, len(prefix)+1)
 		index = append(index, prefix...)
 		index = append(index, i)
-		sf := structField{index: index, fieldName: f.Name}
+		sf := structField{index: index, fieldName: f.Name, name: name, typ: f.Type, required: required}
+		plan.fields = append(plan.fields, sf)
+		if required {
+			plan.required = append(plan.required, sf)
+		}
 		if _, ok := plan.byName[name]; !ok {
 			plan.byName[name] = sf
 		}

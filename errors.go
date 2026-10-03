@@ -23,11 +23,13 @@ type DecodeError struct {
 	human string
 }
 
-// StrictMissingError occurs in a TOML document that does not have a
-// corresponding field in the target value. It contains all the missing fields
-// in Errors.
+// StrictMissingError occurs when a TOML document contains keys that do not
+// have a corresponding field in the target value, or when the document does
+// not provide a field tagged with the "required" option. It contains all the
+// offending fields in Errors.
 //
-// Emitted by Decoder when DisallowUnknownFields() was called.
+// Unknown-field errors are only collected when DisallowUnknownFields() was
+// called; missing required fields are always reported.
 type StrictMissingError struct {
 	// One error per field that could not be found.
 	Errors []DecodeError

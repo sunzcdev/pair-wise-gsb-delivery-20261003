@@ -46,6 +46,27 @@ to check for typos. [See example in the documentation][strict].
 
 [strict]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#example-Decoder.DisallowUnknownFields
 
+### Required fields
+
+Struct fields tagged with the `required` option must be explicitly provided by
+the TOML document when decoding:
+
+```go
+type Config struct {
+	Name string `toml:"name,required"`
+}
+```
+
+The check is based on the presence of the key in the document, not on the
+decoded value: `false`, `0`, `""`, and empty arrays all count as provided, and
+values already present in the target before decoding do not. Nested structs
+and each element of an array table are checked independently, and missing
+fields are reported with their full path (e.g. `servers[1].host`). Inner
+fields of an optional parent that does not appear in the document are not
+reported. Missing required fields are returned as a
+`toml.StrictMissingError`, together with the unknown-field errors of strict
+mode when `Decoder.DisallowUnknownFields()` is used.
+
 ### Contextualized errors
 
 When most decoding errors occur, go-toml returns [`DecodeError`][decode-err],

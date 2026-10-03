@@ -67,16 +67,28 @@ func (s *strict) MissingField(node *unstable.Node) {
 }
 
 // Error returns the cumulated StrictMissingError for the document, or nil.
-func (s *strict) Error(document []byte) error {
-	if !s.Enabled || len(s.missing) == 0 {
+// Unknown-field errors collected by strict mode (in document order) are
+// followed by the missing required-field errors (in target order), so the
+// resulting list is stable.
+func (s *strict) Error(document []byte, required []decodeError) error {
+	missing := s.missing
+	if !s.Enabled {
+		missing = nil
+	}
+	if len(missing) == 0 && len(required) == 0 {
 		return nil
 	}
 
 	err := &StrictMissingError{
-		Errors: make([]DecodeError, 0, len(s.missing)),
+		Errors: make([]DecodeError, 0, len(missing)+len(required)),
 	}
 
-	for _, derr := range s.missing {
+	for _, derr := range missing {
+		highlight := document[derr.highlight.Offset : derr.highlight.Offset+derr.highlight.Length]
+		err.Errors = append(err.Errors, *newDecodeError(document, highlight, derr.key, derr.message))
+	}
+
+	for _, derr := range required {
 		highlight := document[derr.highlight.Offset : derr.highlight.Offset+derr.highlight.Length]
 		err.Errors = append(err.Errors, *newDecodeError(document, highlight, derr.key, derr.message))
 	}
