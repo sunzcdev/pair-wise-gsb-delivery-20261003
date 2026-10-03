@@ -266,6 +266,21 @@ to any key or table with `Comment`/`SetComment`. Only the bytes expressing an
 edit are rewritten, everything else is kept byte-for-byte. See
 https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable/edit.
 
+### Schema inference
+
+[`infer.Schema`][infer-schema] reads several example TOML documents and
+derives a JSON Schema 2020-12 structural contract: object `properties` and
+`required` (the intersection of keys present in every object sample, merging
+all array-table members), array `items` (empty arrays contribute no element
+evidence), scalar `type`s, and `anyOf` where shapes differ. TOML local date,
+local time, local date-time, and offset date-time are all emitted as strings
+with distinct `x-toml-type` annotations. The result is deterministic across
+sample order and deliberately omits business constraints — no min/max,
+patterns, defaults, or completeness claims. See
+https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable/infer.
+
+[infer-schema]: https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable/infer#Schema
+
 ## Benchmarks
 
 Execution time speedup compared to other Go TOML libraries:
