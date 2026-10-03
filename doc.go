@@ -38,6 +38,15 @@ the dispatcher. This is done until there are no more workers to remove. The
 minimum number of workers is always zero, because the time to start new workers
 is insignificant.
 
+Stats
+
+The Stats method returns a consistent snapshot of the pool's task and worker
+counters: tasks received, started, completed (including panicked), and dropped
+by Stop, along with the current queued, running, and worker counts. All state
+transitions are recorded by the dispatcher, so every snapshot satisfies the
+conservation relations documented on Stats, rather than being assembled from
+independent atomic reads.
+
 Usage note
 
 It is advisable to use different worker pools for tasks that are bound by

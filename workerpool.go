@@ -34,6 +34,7 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 		maxWorkers:  maxWorkers,
 		taskQueue:   make(chan func()),
 		workerQueue: make(chan func()),
+		doneChan:    make(chan bool, maxWorkers),
 		stopSignal:  make(chan struct{}),
 		stoppedChan: make(chan struct{}),
 	}
@@ -50,6 +51,7 @@ type WorkerPool struct {
 	maxWorkers   int
 	taskQueue    chan func()
 	workerQueue  chan func()
+	doneChan     chan bool
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
 	waitingQueue deque.Deque[func()]
@@ -58,11 +60,55 @@ type WorkerPool struct {
 	stopped      bool
 	waiting      atomic.Int32
 	wait         bool
+	statsMu      sync.Mutex
+	stats        Stats
 }
 
 // Size returns the maximum number of concurrent workers.
 func (p *WorkerPool) Size() int {
 	return p.maxWorkers
+}
+
+// Stats is a consistent snapshot of the worker pool's task and worker
+// counters. All task state transitions are recorded by the dispatcher
+// goroutine, so every snapshot satisfies the conservation relations:
+//
+//	Received == Started + Queued + Dropped
+//	Started  == Completed + Running
+//
+// at the moment the snapshot is taken.
+type Stats struct {
+	// Received is the total number of tasks accepted by the dispatcher.
+	// Tasks submitted concurrently with Stop that the dispatcher never
+	// received are not counted.
+	Received int
+	// Started is the total number of tasks handed to a worker.
+	Started int
+	// Completed is the total number of tasks that finished executing,
+	// including tasks that exited by panicking.
+	Completed int
+	// Panicked is the total number of tasks that exited by panicking. It
+	// is a subset of Completed.
+	Panicked int
+	// Dropped is the total number of queued tasks discarded by Stop.
+	Dropped int
+	// Queued is the number of tasks currently in the waiting queue.
+	Queued int
+	// Running is the number of tasks currently executing.
+	Running int
+	// Workers is the number of worker goroutines currently alive. Worker
+	// retirement (idle timeout or shutdown) changes this count without
+	// affecting the task counters.
+	Workers int
+}
+
+// Stats returns a consistent snapshot of the worker pool's counters. The
+// returned value is a copy and satisfies the conservation relations
+// documented on Stats.
+func (p *WorkerPool) Stats() Stats {
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
+	return p.stats
 }
 
 // Stop stops the worker pool and waits for only currently running tasks to
@@ -105,6 +151,9 @@ func (p *WorkerPool) Stopped() bool {
 // When there are tasks on the waiting queue, any additional new tasks are put
 // on the waiting queue. Tasks are removed from the waiting queue as workers
 // become available.
+//
+// If a task panics, the worker recovers the panic and records it in the
+// pool stats instead of crashing the program.
 //
 // As long as no new tasks arrive, one available worker is shutdown each time
 // period until there are no more idle workers. Since the time to start new
@@ -219,25 +268,43 @@ Loop:
 			// Got a task to do.
 			select {
 			case p.workerQueue <- task:
+				p.updateStats(func(s *Stats) {
+					s.Received++
+					s.Started++
+					s.Running++
+				})
 			default:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(task, p.workerQueue, p.doneChan, &wg)
 					workerCount++
+					p.updateStats(func(s *Stats) {
+						s.Received++
+						s.Started++
+						s.Running++
+						s.Workers++
+					})
 				} else {
 					// Enqueue task to be executed by next available worker.
 					p.waitingQueue.PushBack(task)
 					p.waiting.Store(int32(p.waitingQueue.Len()))
+					p.updateStats(func(s *Stats) {
+						s.Received++
+						s.Queued++
+					})
 				}
 			}
 			idle = false
+		case panicked := <-p.doneChan:
+			p.taskDone(panicked)
 		case <-idleTO:
 			// Timed out waiting for work to arrive. Kill a ready worker if
 			// pool has been idle for a whole timeout.
 			if idle && workerCount > 0 {
 				if p.killIdleWorker() {
 					workerCount--
+					p.updateStats(func(s *Stats) { s.Workers-- })
 				}
 			}
 			idle = true
@@ -248,23 +315,81 @@ Loop:
 	// If instructed to wait, then run tasks that are already queued.
 	if p.wait {
 		p.runQueuedTasks()
+	} else if p.waitingQueue.Len() != 0 {
+		// Queued tasks are abandoned, so record them as dropped.
+		dropped := p.waitingQueue.Len()
+		p.waiting.Store(0)
+		p.updateStats(func(s *Stats) {
+			s.Dropped += dropped
+			s.Queued -= dropped
+		})
 	}
 
 	// Stop all remaining workers as they become ready.
 	for workerCount > 0 {
-		p.workerQueue <- nil
-		workerCount--
+		select {
+		case p.workerQueue <- nil:
+			workerCount--
+			p.updateStats(func(s *Stats) { s.Workers-- })
+		case panicked := <-p.doneChan:
+			p.taskDone(panicked)
+		}
 	}
 	wg.Wait()
+	// All workers have exited, so every remaining completion report is
+	// buffered in doneChan. Drain the reports so that the final stats are
+	// complete before stoppedChan is closed.
+drain:
+	for {
+		select {
+		case panicked := <-p.doneChan:
+			p.taskDone(panicked)
+		default:
+			break drain
+		}
+	}
 }
 
-// worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
+// worker executes tasks and stops when it receives a nil task. After each
+// task, the worker reports to the dispatcher whether the task panicked, so
+// that the dispatcher can keep the pool stats consistent.
+func worker(task func(), workerQueue chan func(), doneChan chan bool, wg *sync.WaitGroup) {
 	for task != nil {
-		task()
+		doneChan <- runTask(task)
 		task = <-workerQueue
 	}
 	wg.Done()
+}
+
+// runTask runs a task, recovering from any panic, and reports whether the
+// task exited by panicking.
+func runTask(task func()) (panicked bool) {
+	defer func() {
+		panicked = recover() != nil
+	}()
+	task()
+	return false
+}
+
+// taskDone records the completion of a task in the pool stats. It is only
+// called by the dispatcher goroutine.
+func (p *WorkerPool) taskDone(panicked bool) {
+	p.updateStats(func(s *Stats) {
+		s.Completed++
+		s.Running--
+		if panicked {
+			s.Panicked++
+		}
+	})
+}
+
+// updateStats applies a mutation to the pool stats. All mutations are
+// performed by the dispatcher goroutine, so each locked update preserves
+// the conservation relations documented on Stats.
+func (p *WorkerPool) updateStats(f func(*Stats)) {
+	p.statsMu.Lock()
+	f(&p.stats)
+	p.statsMu.Unlock()
 }
 
 // stop tells the dispatcher to exit, and whether or not to complete queued
@@ -298,11 +423,23 @@ func (p *WorkerPool) processWaitingQueue() bool {
 			return false
 		}
 		p.waitingQueue.PushBack(task)
+		p.waiting.Store(int32(p.waitingQueue.Len()))
+		p.updateStats(func(s *Stats) {
+			s.Received++
+			s.Queued++
+		})
 	case p.workerQueue <- p.waitingQueue.Front():
 		// A worker was ready, so gave task to worker.
 		p.waitingQueue.PopFront()
+		p.waiting.Store(int32(p.waitingQueue.Len()))
+		p.updateStats(func(s *Stats) {
+			s.Queued--
+			s.Started++
+			s.Running++
+		})
+	case panicked := <-p.doneChan:
+		p.taskDone(panicked)
 	}
-	p.waiting.Store(int32(p.waitingQueue.Len()))
 	return true
 }
 
@@ -321,8 +458,18 @@ func (p *WorkerPool) killIdleWorker() bool {
 // workers until queue is empty.
 func (p *WorkerPool) runQueuedTasks() {
 	for p.waitingQueue.Len() != 0 {
-		// A worker is ready, so give task to worker.
-		p.workerQueue <- p.waitingQueue.PopFront()
-		p.waiting.Store(int32(p.waitingQueue.Len()))
+		select {
+		case p.workerQueue <- p.waitingQueue.Front():
+			// A worker is ready, so give task to worker.
+			p.waitingQueue.PopFront()
+			p.waiting.Store(int32(p.waitingQueue.Len()))
+			p.updateStats(func(s *Stats) {
+				s.Queued--
+				s.Started++
+				s.Running++
+			})
+		case panicked := <-p.doneChan:
+			p.taskDone(panicked)
+		}
 	}
 }

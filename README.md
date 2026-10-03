@@ -47,6 +47,10 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Stats
+
+`wp.Stats()` returns a consistent snapshot of the pool's counters: tasks received, started, completed (including panicked), and dropped by `Stop`, plus the current queued, running, and worker counts. Every snapshot satisfies `Received == Started + Queued + Dropped` and `Started == Completed + Running`.
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.

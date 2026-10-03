@@ -24,14 +24,16 @@ The whole pool lives in two files: `workerpool.go` (mechanics) and `options.go` 
 - `taskQueue` (unbuffered chan): where `Submit`/`Do` hand tasks to the dispatcher.
 - `workerQueue` (unbuffered chan): where the dispatcher hands tasks to workers. Sending `nil` on it kills a worker.
 - `waitingQueue` (`deque.Deque`, owned solely by the dispatcher): overflow buffer when all `maxWorkers` workers are busy. Its length is mirrored into the atomic `waiting` counter so `WaitingQueueSize()` is lock-free.
+- `doneChan` (buffered chan, cap `maxWorkers`): where workers report each task completion (and whether it panicked) back to the dispatcher. Every blocking select in the dispatcher must include a `doneChan` case, and the dispatcher drains it after all workers exit, or shutdown can deadlock.
 
-A single dispatcher goroutine (`dispatch`), started by `New`, is the only goroutine that touches `waitingQueue` and the worker count. It creates workers lazily up to `maxWorkers`, and while the waiting queue is non-empty it routes all traffic through `processWaitingQueue` to preserve task order. When the pool is idle for a full idle timeout (default 2s, configurable or disabled via `WithIdleTimeout`), it reaps one idle worker per timeout period.
+A single dispatcher goroutine (`dispatch`), started by `New`, is the only goroutine that touches `waitingQueue`, the worker count, and the `stats` counters (guarded by `statsMu` for `Stats()` readers). Because the dispatcher serializes every task state transition, each `Stats()` snapshot satisfies the conservation relations documented on the `Stats` type. It creates workers lazily up to `maxWorkers`, and while the waiting queue is non-empty it routes all traffic through `processWaitingQueue` to preserve task order. When the pool is idle for a full idle timeout (default 2s, configurable or disabled via `WithIdleTimeout`), it reaps one idle worker per timeout period.
 
 Non-obvious invariants to preserve when changing this code:
 
 - Task submission must never block, no matter how many tasks are queued.
 - `Do` detects a stopped pool by recovering from the panic caused by sending on the closed `taskQueue`; `Submit` panics on a stopped pool while `Do` returns `ErrStopped`.
 - `Stop` abandons queued tasks; `StopWait` drains them (`p.wait` flag read by the dispatcher after its loop exits). Both are safe to call multiple times via `stopOnce`, and both wait for `stoppedChan`.
+- A task that panics is recovered by its worker, counted as completed (and as panicked) in the stats, and the worker keeps running; worker retirements (idle timeout, shutdown) only change the worker count, never task counters.
 - `Pause` works by submitting `maxWorkers` blocking tasks that wait on the caller's Context or on `stopSignal`; `stopLock` orders Pause against Stop so a stop always unpauses workers before closing `taskQueue`.
 
 `pacer/` is a self-contained rate limiter for staggering goroutine start times. It is independent of the pool (its tests import workerpool, not the other way around).

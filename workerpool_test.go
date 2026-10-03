@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -676,6 +677,254 @@ func assertPanics(t *testing.T, name string, f func()) {
 	}()
 
 	f()
+}
+
+func TestStatsConservation(t *testing.T) {
+	const (
+		workers = 8
+		tasks   = 2000
+	)
+
+	wp := New(workers)
+
+	var mu sync.Mutex
+	executed := make(map[int]struct{}, tasks)
+	for i := 0; i < tasks; i++ {
+		wp.Submit(func() {
+			mu.Lock()
+			executed[i] = struct{}{}
+			mu.Unlock()
+		})
+	}
+
+	// Continuously read snapshots while tasks run. Every snapshot must
+	// satisfy the conservation relations, and cumulative counters must
+	// never decrease.
+	stopReading := make(chan struct{})
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		var prev Stats
+		for {
+			select {
+			case <-stopReading:
+				return
+			default:
+			}
+			s := wp.Stats()
+			if s.Received != s.Started+s.Queued+s.Dropped {
+				t.Errorf("conservation violated: Received=%d Started=%d Queued=%d Dropped=%d",
+					s.Received, s.Started, s.Queued, s.Dropped)
+				return
+			}
+			if s.Started != s.Completed+s.Running {
+				t.Errorf("conservation violated: Started=%d Completed=%d Running=%d",
+					s.Started, s.Completed, s.Running)
+				return
+			}
+			if s.Queued < 0 || s.Running < 0 || s.Running > workers ||
+				s.Workers < 0 || s.Workers > workers || s.Panicked > s.Completed {
+				t.Errorf("stats out of range: %+v", s)
+				return
+			}
+			if s.Received < prev.Received || s.Started < prev.Started ||
+				s.Completed < prev.Completed || s.Dropped < prev.Dropped {
+				t.Errorf("cumulative counter decreased: %+v -> %+v", prev, s)
+				return
+			}
+			prev = s
+		}
+	}()
+
+	wp.StopWait()
+	close(stopReading)
+	<-readDone
+
+	s := wp.Stats()
+	if s.Received != tasks || s.Started != tasks || s.Completed != tasks {
+		t.Errorf("expected %d received/started/completed, got %+v", tasks, s)
+	}
+	if s.Queued != 0 || s.Running != 0 || s.Dropped != 0 || s.Workers != 0 {
+		t.Errorf("expected no queued/running/dropped/workers, got %+v", s)
+	}
+	if len(executed) != tasks {
+		t.Fatal("expected", tasks, "executed tasks, got", len(executed))
+	}
+	for i := 0; i < tasks; i++ {
+		if _, ok := executed[i]; !ok {
+			t.Fatal("task", i, "did not execute")
+		}
+	}
+}
+
+func TestStatsStopDrop(t *testing.T) {
+	const (
+		workers = 2
+		tasks   = 20
+	)
+
+	wp := New(workers)
+	release := make(chan struct{})
+
+	var mu sync.Mutex
+	executed := make(map[int]struct{}, workers)
+	for i := 0; i < tasks; i++ {
+		wp.Submit(func() {
+			<-release
+			mu.Lock()
+			executed[i] = struct{}{}
+			mu.Unlock()
+		})
+	}
+
+	// Unblock the running tasks shortly after Stop is called.
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		close(release)
+	}()
+	wp.Stop()
+
+	s := wp.Stats()
+	if s.Received != tasks {
+		t.Error("expected", tasks, "received, got", s.Received)
+	}
+	if s.Started != workers || s.Completed != workers {
+		t.Errorf("expected %d started/completed, got %+v", workers, s)
+	}
+	if s.Dropped != tasks-workers {
+		t.Error("expected", tasks-workers, "dropped, got", s.Dropped)
+	}
+	if s.Queued != 0 || s.Running != 0 || s.Workers != 0 {
+		t.Errorf("expected no queued/running/workers, got %+v", s)
+	}
+	if s.Received != s.Started+s.Dropped {
+		t.Errorf("conservation violated: %+v", s)
+	}
+	if len(executed) != s.Completed {
+		t.Error("executed task count", len(executed), "does not match completed", s.Completed)
+	}
+}
+
+func TestStatsSubmitStopRace(t *testing.T) {
+	wp := New(4)
+
+	var mu sync.Mutex
+	executed := make(map[int]struct{})
+	var submitted atomic.Int32
+
+	const submitters = 8
+	var wg sync.WaitGroup
+	wg.Add(submitters)
+	for g := 0; g < submitters; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				id := g*100000 + i
+				if wp.Do(func() {
+					mu.Lock()
+					executed[id] = struct{}{}
+					mu.Unlock()
+				}) != nil {
+					// Pool stopped; task was not accepted.
+					return
+				}
+				submitted.Add(1)
+			}
+		}(g)
+	}
+
+	// Let some tasks get submitted, then stop the pool while submissions
+	// are still racing with the stop.
+	time.Sleep(10 * time.Millisecond)
+	wp.Stop()
+	wg.Wait()
+
+	s := wp.Stats()
+	// Every task accepted by the dispatcher must be accounted for: either
+	// it ran to completion or it was dropped from the waiting queue.
+	if s.Received != s.Started+s.Dropped || s.Queued != 0 || s.Running != 0 {
+		t.Errorf("conservation violated: %+v", s)
+	}
+	if s.Started != s.Completed {
+		t.Errorf("started %d != completed %d", s.Started, s.Completed)
+	}
+	// A successful Do means the dispatcher received the task, so the
+	// received count must match the number of accepted submissions.
+	if int32(s.Received) != submitted.Load() {
+		t.Errorf("received %d != submitted %d", s.Received, submitted.Load())
+	}
+	if len(executed) != s.Completed {
+		t.Error("executed task count", len(executed), "does not match completed", s.Completed)
+	}
+}
+
+func TestStatsPanic(t *testing.T) {
+	wp := New(2)
+
+	wp.Submit(func() {
+		panic("boom")
+	})
+
+	// The pool must keep working after a task panics.
+	done := make(chan struct{})
+	wp.Submit(func() {
+		close(done)
+	})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		wp.Stop()
+		t.Fatal("pool did not run tasks after a panic")
+	}
+
+	wp.StopWait()
+
+	s := wp.Stats()
+	if s.Received != 2 || s.Started != 2 || s.Completed != 2 {
+		t.Errorf("expected 2 received/started/completed, got %+v", s)
+	}
+	if s.Panicked != 1 {
+		t.Error("expected 1 panicked task, got", s.Panicked)
+	}
+	if s.Queued != 0 || s.Running != 0 || s.Workers != 0 {
+		t.Errorf("expected no queued/running/workers, got %+v", s)
+	}
+}
+
+func TestStatsWorkerRetire(t *testing.T) {
+	const idleTimeout = time.Second
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(max, WithIdleTimeout(idleTimeout))
+		defer wp.Stop()
+
+		// Start all workers with pause tasks, then release them.
+		ctx, cancel := context.WithCancel(context.Background())
+		wp.Pause(ctx)
+		cancel()
+		synctest.Wait()
+
+		s := wp.Stats()
+		if s.Workers != max {
+			t.Fatal("expected", max, "workers, got", s.Workers)
+		}
+		if s.Received != max || s.Started != max || s.Completed != max {
+			t.Fatalf("expected %d received/started/completed, got %+v", max, s)
+		}
+
+		// Idle workers retire one per timeout period (the first timeout
+		// only marks the pool idle). Retiring a worker must not change
+		// any task counter.
+		time.Sleep(idleTimeout*2 + idleTimeout/2)
+		synctest.Wait()
+		s = wp.Stats()
+		if s.Workers != max-1 {
+			t.Fatal("expected", max-1, "workers after idle timeout, got", s.Workers)
+		}
+		if s.Received != max || s.Started != max || s.Completed != max ||
+			s.Queued != 0 || s.Running != 0 || s.Dropped != 0 {
+			t.Fatalf("worker retirement changed task counters: %+v", s)
+		}
+	})
 }
 
 func anyReady(w *WorkerPool) bool {
