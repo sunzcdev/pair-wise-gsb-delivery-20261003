@@ -461,6 +461,7 @@ You can override alignment rendering method via options.
 | Functional option | Type | Description |
 | ----------------- | ---- | ----------- |
 | `extension.WithTableCellAlignMethod` | `extension.TableCellAlignMethod` | Option indicates how are table cells aligned. |
+| `extension.WithTableCellMerge` | parser option | Enables exact-cell `>` and `^` markers that merge with the left and upper cells. Merged regions must be rectangles and cannot cross the header/body boundary. |
 
 ### Typographer extension
 

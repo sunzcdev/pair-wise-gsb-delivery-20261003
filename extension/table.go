@@ -48,6 +48,27 @@ type tableHTMLRendererConfig struct {
 	TableCellAlignMethod TableCellAlignMethod
 }
 
+type tableParserConfig struct {
+	TableCellMerge bool
+}
+
+// TableParserOption is a functional option for the table parser extension.
+type TableParserOption interface {
+	applyTableParserOption(*tableParserConfig)
+}
+
+type withTableCellMerge struct{}
+
+func (o *withTableCellMerge) applyTableParserOption(c *tableParserConfig) {
+	c.TableCellMerge = true
+}
+
+// WithTableCellMerge enables cells containing exactly > or ^ to merge with
+// the cell on their left or above, respectively.
+func WithTableCellMerge() TableParserOption {
+	return &withTableCellMerge{}
+}
+
 // TableHTMLRendererOption is a functional option for the table HTML renderer extension.
 type TableHTMLRendererOption interface {
 	applyTableHTMLRendererOption(*tableHTMLRendererConfig)
@@ -114,12 +135,16 @@ func classifyTableDelim(col []byte) (alignment ast.Alignment, ok bool) {
 }
 
 type tableParagraphTransformer struct {
+	tableCellMerge bool
 }
 
 var defaultTableParagraphTransformer = &tableParagraphTransformer{}
 
-func newTableParagraphTransformer() parser.ParagraphTransformer {
-	return defaultTableParagraphTransformer
+func newTableParagraphTransformer(cfg tableParserConfig) parser.ParagraphTransformer {
+	if !cfg.TableCellMerge {
+		return defaultTableParagraphTransformer
+	}
+	return &tableParagraphTransformer{tableCellMerge: true}
 }
 
 func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.Reader, pc parser.Context) {
@@ -137,6 +162,13 @@ func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.
 		if header == nil || len(alignments) != header.ChildCount() {
 			return
 		}
+		bodyRows := make([]*ast.TableRow, 0, len(lines)-i-1)
+		for j := i + 1; j < len(lines); j++ {
+			bodyRows = append(bodyRows, b.parseRow(lines[j], alignments, false, reader, pc))
+		}
+		if b.tableCellMerge && !applyTableCellMerges(header, bodyRows, reader.Source()) {
+			continue
+		}
 		table := ast.NewTable()
 		table.SetPos(ppos)
 		tableHeader := ast.NewTableHeader()
@@ -149,13 +181,13 @@ func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.
 		}
 		table.AppendChild(tableHeader)
 		var body *ast.TableBody
-		for j := i + 1; j < len(lines); j++ {
+		for _, row := range bodyRows {
 			if body == nil {
 				body = ast.NewTableBody()
-				body.SetPos(lines[j].Start)
+				body.SetPos(row.Pos())
 				table.AppendChild(body)
 			}
-			body.AppendChild(b.parseRow(lines[j], alignments, false, reader, pc))
+			body.AppendChild(row)
 		}
 		node.SetSource(lines[:i-1])
 		node.Parent().InsertAfter(node, table)
@@ -234,6 +266,187 @@ func (b *tableParagraphTransformer) parseRow(segment text.Segment,
 		row.AppendChild(ast.NewTableCell(alignments[i]))
 	}
 	return row
+}
+
+func applyTableCellMerges(header *ast.TableRow, bodyRows []*ast.TableRow, source []byte) bool {
+	rows := make([]*ast.TableRow, 0, len(bodyRows)+1)
+	rows = append(rows, header)
+	rows = append(rows, bodyRows...)
+	columnCount := header.ChildCount()
+
+	grid := make([][]*ast.TableCell, len(rows))
+	markers := make([][]byte, len(rows))
+	for rowIndex := range rows {
+		grid[rowIndex] = make([]*ast.TableCell, 0, columnCount)
+		for cell := rows[rowIndex].FirstChild(); cell != nil; cell = cell.NextSibling() {
+			grid[rowIndex] = append(grid[rowIndex], cell.(*ast.TableCell))
+		}
+		if len(grid[rowIndex]) != columnCount {
+			return false
+		}
+		markers[rowIndex] = make([]byte, columnCount)
+		for columnIndex := 0; columnIndex < columnCount; columnIndex++ {
+			cell := grid[rowIndex][columnIndex]
+			marker := tableCellMergeMarker(cell, source)
+			if marker == 0 {
+				continue
+			}
+			if marker == '>' && columnIndex == 0 {
+				return false
+			}
+			if marker == '^' && rowIndex <= 1 {
+				return false
+			}
+			markers[rowIndex][columnIndex] = marker
+		}
+	}
+
+	parent := make([]int, len(rows)*columnCount)
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(id int) int {
+		for parent[id] != id {
+			parent[id] = parent[parent[id]]
+			id = parent[id]
+		}
+		return id
+	}
+	union := func(left, right int) {
+		leftRoot := find(left)
+		rightRoot := find(right)
+		if leftRoot != rightRoot {
+			parent[rightRoot] = leftRoot
+		}
+	}
+
+	for rowIndex, rowMarkers := range markers {
+		for columnIndex, marker := range rowMarkers {
+			id := rowIndex*columnCount + columnIndex
+			switch marker {
+			case '>':
+				union(id-1, id)
+			case '^':
+				union(id-columnCount, id)
+			}
+		}
+	}
+
+	type mergeGroup struct {
+		minRow    int
+		maxRow    int
+		minColumn int
+		maxColumn int
+		cells     []*ast.TableCell
+		markers   int
+	}
+	groups := map[int]*mergeGroup{}
+	for rowIndex := range rows {
+		for columnIndex := 0; columnIndex < columnCount; columnIndex++ {
+			cell := grid[rowIndex][columnIndex]
+			id := rowIndex*columnCount + columnIndex
+			root := find(id)
+			group := groups[root]
+			if group == nil {
+				group = &mergeGroup{
+					minRow:    rowIndex,
+					maxRow:    rowIndex,
+					minColumn: columnIndex,
+					maxColumn: columnIndex,
+				}
+				groups[root] = group
+			}
+			group.minRow = min(group.minRow, rowIndex)
+			group.maxRow = max(group.maxRow, rowIndex)
+			group.minColumn = min(group.minColumn, columnIndex)
+			group.maxColumn = max(group.maxColumn, columnIndex)
+			group.cells = append(group.cells, cell)
+			if markers[rowIndex][columnIndex] != 0 {
+				group.markers++
+			}
+		}
+	}
+
+	type tableCellMerge struct {
+		origin  *ast.TableCell
+		covered []*ast.TableCell
+		rowSpan int
+		colSpan int
+	}
+	validMerges := make([]tableCellMerge, 0, len(groups))
+	for _, group := range groups {
+		if group.markers == 0 {
+			continue
+		}
+		rowSpan := group.maxRow - group.minRow + 1
+		colSpan := group.maxColumn - group.minColumn + 1
+		if rowSpan*colSpan != len(group.cells) || group.markers != len(group.cells)-1 {
+			return false
+		}
+		origin := grid[group.minRow][group.minColumn]
+		if origin == nil || tableCellMergeMarker(origin, source) != 0 {
+			return false
+		}
+		covered := make([]*ast.TableCell, 0, len(group.cells)-1)
+		for rowIndex := group.minRow; rowIndex <= group.maxRow; rowIndex++ {
+			for columnIndex := group.minColumn; columnIndex <= group.maxColumn; columnIndex++ {
+				cell := grid[rowIndex][columnIndex]
+				if cell == origin {
+					continue
+				}
+				if markers[rowIndex][columnIndex] == 0 {
+					return false
+				}
+				covered = append(covered, cell)
+			}
+		}
+		validMerges = append(validMerges, tableCellMerge{
+			origin:  origin,
+			covered: covered,
+			rowSpan: rowSpan,
+			colSpan: colSpan,
+		})
+	}
+
+	for _, merge := range validMerges {
+		merge.origin.RowSpan = merge.rowSpan
+		merge.origin.ColSpan = merge.colSpan
+		for _, cell := range merge.covered {
+			cell.OriginCell = merge.origin
+			cell.SetSource(nil)
+		}
+	}
+
+	for _, row := range rows {
+		for cell := row.FirstChild(); cell != nil; cell = cell.NextSibling() {
+			tableCell := cell.(*ast.TableCell)
+			if tableCell.RowSpan == 0 {
+				tableCell.RowSpan = 1
+			}
+			if tableCell.ColSpan == 0 {
+				tableCell.ColSpan = 1
+			}
+		}
+	}
+	return true
+}
+
+func tableCellMergeMarker(cell *ast.TableCell, source []byte) byte {
+	segments := cell.Source()
+	if len(segments) != 1 {
+		return 0
+	}
+	content := bytes.TrimSpace(segments[0].Bytes(source))
+	if len(content) != 1 {
+		return 0
+	}
+	switch content[0] {
+	case '>', '^':
+		return content[0]
+	default:
+		return 0
+	}
 }
 
 func (b *tableParagraphTransformer) parseDelimiter(segment text.Segment, reader text.Reader) []ast.Alignment {
@@ -464,7 +677,16 @@ func (r *tableHTMLRendererExtension) renderTableCell(
 		tag = "th"
 	}
 	if entering {
+		if n.OriginCell != nil {
+			return gast.WalkSkipChildren, nil
+		}
 		_, _ = fmt.Fprintf(w, "<%s", tag)
+		if n.ColSpan > 1 {
+			_, _ = fmt.Fprintf(w, ` colspan="%d"`, n.ColSpan)
+		}
+		if n.RowSpan > 1 {
+			_, _ = fmt.Fprintf(w, ` rowspan="%d"`, n.RowSpan)
+		}
 		if n.Alignment != ast.AlignNone {
 			amethod := r.config.TableCellAlignMethod
 			if amethod == TableCellAlignDefault {
@@ -499,24 +721,29 @@ func (r *tableHTMLRendererExtension) renderTableCell(
 			}
 		}
 		_ = w.WriteByte('>')
-	} else {
+	} else if n.OriginCell == nil {
 		_, _ = fmt.Fprintf(w, "</%s>\n", tag)
 	}
 	return gast.WalkContinue, nil
 }
 
 type tableParserExtension struct {
+	config tableParserConfig
 }
 
 // NewTableParser returns a new parser.Extension for parsing GFM tables.
-func NewTableParser() parser.Extension {
-	return &tableParserExtension{}
+func NewTableParser(opts ...TableParserOption) parser.Extension {
+	var cfg tableParserConfig
+	for _, opt := range opts {
+		opt.applyTableParserOption(&cfg)
+	}
+	return &tableParserExtension{config: cfg}
 }
 
 func (e *tableParserExtension) ParserOptions(_ *parser.Config) []parser.Option {
 	return []parser.Option{
 		parser.WithParagraphTransformers(
-			util.Prioritized(newTableParagraphTransformer(), 200),
+			util.Prioritized(newTableParagraphTransformer(e.config), 200),
 		),
 		parser.WithASTTransformers(
 			util.Prioritized(defaultTableASTTransformer, 0),

@@ -114,13 +114,25 @@ func NewTableHeader() *TableHeader {
 type TableCell struct {
 	gast.BaseBlock
 	Alignment Alignment
+	// RowSpan is the number of logical rows occupied by the merge origin.
+	RowSpan int
+	// ColSpan is the number of logical columns occupied by the merge origin.
+	ColSpan int
+	// OriginCell points to the origin cell when this cell is covered by a merge.
+	OriginCell *TableCell
 }
 
 // Dump implements Node.Dump.
 func (n *TableCell) Dump(_ []byte) *gast.NodeDump {
-	return gast.NewNodeDump(n, map[string]any{
+	properties := map[string]any{
 		"Alignment": n.Alignment.String(),
-	})
+		"RowSpan":   n.RowSpan,
+		"ColSpan":   n.ColSpan,
+	}
+	if n.OriginCell != nil {
+		properties["OriginCell"] = n.OriginCell.Pos()
+	}
+	return gast.NewNodeDump(n, properties)
 }
 
 // KindTableCell is a NodeKind of the TableCell node.
