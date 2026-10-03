@@ -173,6 +173,25 @@
 //	    Public: "I made it through!"
 //	}
 //
+// # Field Masks
+//
+// DecoderConfig has a FieldMask option that restricts decoding to a set of
+// dot-separated field paths of the target structure. This is useful for
+// applying partial updates to an existing configuration object: only the
+// selected fields are decoded, everything else keeps its old value.
+//
+//	type Config struct {
+//	    Name   string `mapstructure:"name"`
+//	    Server Server `mapstructure:"server"`
+//	}
+//
+//	FieldMask: []string{"server.host"}
+//
+// Selecting a parent path ("server") includes its entire subtree; selecting
+// only leaf paths preserves the neighboring fields. Input for fields outside
+// the mask is not decoded and does not trigger the DecodeHook. Invalid mask
+// paths are reported by NewDecoder before any input is processed.
+//
 // # Custom Decoding with Unmarshaler
 //
 // Types can implement the Unmarshaler interface to control their own decoding. The interface
@@ -375,6 +394,47 @@ type DecoderConfig struct {
 	// interface. Types implementing Unmarshaler will be decoded using the
 	// standard struct decoding logic instead.
 	DisableUnmarshaler bool
+
+	// FieldMask, if non-empty, restricts decoding to the listed field
+	// paths of the target structure. This is useful for applying partial
+	// updates to an existing (pre-populated) configuration object: only
+	// the selected fields are touched, everything else keeps its old
+	// value.
+	//
+	// Paths are dot-separated field names as seen by the decoder: the
+	// tag value if a field has one, otherwise the field name transformed
+	// by MapFieldName. Selecting a parent path (e.g. "server") includes
+	// its entire subtree; selecting only leaf paths (e.g. "server.host")
+	// preserves the neighboring fields.
+	//
+	// Paths traverse struct fields and pointers to structs. Squashed
+	// (embedded) structs contribute their fields at the parent level, so
+	// their fields are addressed as if they were declared on the parent.
+	// Map, slice, array, and interface fields are leaves: selecting them
+	// includes the whole value, and paths extending into them are
+	// invalid.
+	//
+	// Invalid paths are reported by NewDecoder before any input is
+	// processed.
+	//
+	// Input keys that target fields excluded by the mask do not
+	// participate in decoding at all: they are not converted and the
+	// DecodeHook is not invoked for them. See FieldMaskErrorUnused for
+	// how ErrorUnused and Metadata.Unused treat such keys.
+	FieldMask []string
+
+	// FieldMaskErrorUnused controls how input keys for fields excluded
+	// by FieldMask are treated with respect to unused-key tracking.
+	//
+	// If false (the default), such keys are silently ignored: they do
+	// not trigger ErrorUnused errors and are not reported in
+	// Metadata.Unused.
+	//
+	// If true, they are treated like any other unused key: they trigger
+	// ErrorUnused errors and are reported in Metadata.Unused.
+	//
+	// This option has no effect unless FieldMask is set.
+	FieldMaskErrorUnused bool
 }
 
 // A Decoder takes a raw interface value and turns it into structured
@@ -386,6 +446,7 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+	fieldMask        *fieldMaskNode
 }
 
 // Metadata contains information about decoding a structure that
@@ -524,13 +585,27 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 		result.cachedDecodeHook = cachedDecodeHook(config.DecodeHook)
 	}
 
+	if len(config.FieldMask) > 0 {
+		mask, err := buildFieldMask(config.FieldMask)
+		if err != nil {
+			return nil, err
+		}
+		result.fieldMask = mask
+
+		// Validate the mask against the target type before any input
+		// is processed.
+		if err := result.validateFieldMask(); err != nil {
+			return nil, err
+		}
+	}
+
 	return result, nil
 }
 
 // Decode decodes the given raw interface to the target pointer specified
 // by the configuration.
 func (d *Decoder) Decode(input any) error {
-	err := d.decode(d.config.RootName, input, reflect.ValueOf(d.config.Result).Elem())
+	err := d.decode(d.config.RootName, input, reflect.ValueOf(d.config.Result).Elem(), d.fieldMask)
 
 	// Retain some of the original behavior when multiple errors ocurr
 	var joinedErr interface{ Unwrap() []error }
@@ -551,7 +626,10 @@ func isNil(input any) bool {
 }
 
 // Decodes an unknown data type into a specific reflection value.
-func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
+//
+// The mask restricts which fields are decoded when outVal is a struct
+// (or a pointer to one). A nil mask decodes everything.
+func (d *Decoder) decode(name string, input any, outVal reflect.Value, mask *fieldMaskNode) error {
 	var (
 		inputVal   = reflect.ValueOf(input)
 		outputKind = getKind(outVal)
@@ -641,11 +719,11 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 		case reflect.Complex64:
 			err = d.decodeComplex(name, input, outVal)
 		case reflect.Struct:
-			err = d.decodeStruct(name, input, outVal)
+			err = d.decodeStruct(name, input, outVal, mask)
 		case reflect.Map:
 			err = d.decodeMap(name, input, outVal)
 		case reflect.Ptr:
-			addMetaKey, err = d.decodePtr(name, input, outVal)
+			addMetaKey, err = d.decodePtr(name, input, outVal, mask)
 		case reflect.Slice:
 			err = d.decodeSlice(name, input, outVal)
 		case reflect.Array:
@@ -692,7 +770,7 @@ func (d *Decoder) decodeBasic(name string, data any, val reflect.Value) error {
 
 		// Decode. If we have an error then return. We also return right
 		// away if we're not a copy because that means we decoded directly.
-		if err := d.decode(name, data, elem); err != nil || !copied {
+		if err := d.decode(name, data, elem, nil); err != nil || !copied {
 			return err
 		}
 
@@ -1068,7 +1146,7 @@ func (d *Decoder) decodeMapFromSlice(name string, dataVal reflect.Value, val ref
 	for i := 0; i < dataVal.Len(); i++ {
 		err := d.decode(
 			name+"["+strconv.Itoa(i)+"]",
-			dataVal.Index(i).Interface(), val)
+			dataVal.Index(i).Interface(), val, nil)
 		if err != nil {
 			return err
 		}
@@ -1104,7 +1182,7 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 
 		// First decode the key into the proper type
 		currentKey := reflect.Indirect(reflect.New(valKeyType))
-		if err := d.decode(fieldName, k.Interface(), currentKey); err != nil {
+		if err := d.decode(fieldName, k.Interface(), currentKey, nil); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -1112,7 +1190,7 @@ func (d *Decoder) decodeMapFromMap(name string, dataVal reflect.Value, val refle
 		// Next decode the data into the proper type
 		v := dataVal.MapIndex(k).Interface()
 		currentVal := reflect.Indirect(reflect.New(valElemType))
-		if err := d.decode(fieldName, v, currentVal); err != nil {
+		if err := d.decode(fieldName, v, currentVal, nil); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -1239,7 +1317,7 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 			addrVal := reflect.New(vMap.Type())
 			reflect.Indirect(addrVal).Set(vMap)
 
-			err := d.decode(keyName, x.Interface(), reflect.Indirect(addrVal))
+			err := d.decode(keyName, x.Interface(), reflect.Indirect(addrVal), nil)
 			if err != nil {
 				return err
 			}
@@ -1275,7 +1353,7 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 				if v.Len() > 0 {
 					reflect.Indirect(addrVal).Set(vSlice)
 
-					err := d.decode(keyName, v.Interface(), reflect.Indirect(addrVal))
+					err := d.decode(keyName, v.Interface(), reflect.Indirect(addrVal), nil)
 					if err != nil {
 						return err
 					}
@@ -1303,7 +1381,7 @@ func (d *Decoder) decodeMapFromStruct(name string, dataVal reflect.Value, val re
 	return nil
 }
 
-func (d *Decoder) decodePtr(name string, data any, val reflect.Value) (bool, error) {
+func (d *Decoder) decodePtr(name string, data any, val reflect.Value, mask *fieldMaskNode) (bool, error) {
 	// If the input data is nil, then we want to just set the output
 	// pointer to be nil as well.
 	isNil := data == nil
@@ -1337,13 +1415,13 @@ func (d *Decoder) decodePtr(name string, data any, val reflect.Value) (bool, err
 			realVal = reflect.New(valElemType)
 		}
 
-		if err := d.decode(name, data, reflect.Indirect(realVal)); err != nil {
+		if err := d.decode(name, data, reflect.Indirect(realVal), mask); err != nil {
 			return false, err
 		}
 
 		val.Set(realVal)
 	} else {
-		if err := d.decode(name, data, reflect.Indirect(val)); err != nil {
+		if err := d.decode(name, data, reflect.Indirect(val), mask); err != nil {
 			return false, err
 		}
 	}
@@ -1427,7 +1505,7 @@ func (d *Decoder) decodeSlice(name string, data any, val reflect.Value) error {
 		currentField := valSlice.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
-		if err := d.decode(fieldName, currentData, currentField); err != nil {
+		if err := d.decode(fieldName, currentData, currentField, nil); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1488,7 +1566,7 @@ func (d *Decoder) decodeArray(name string, data any, val reflect.Value) error {
 		currentField := valArray.Index(i)
 
 		fieldName := name + "[" + strconv.Itoa(i) + "]"
-		if err := d.decode(fieldName, currentData, currentField); err != nil {
+		if err := d.decode(fieldName, currentData, currentField, nil); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1499,12 +1577,14 @@ func (d *Decoder) decodeArray(name string, data any, val reflect.Value) error {
 	return errors.Join(errs...)
 }
 
-func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
+func (d *Decoder) decodeStruct(name string, data any, val reflect.Value, mask *fieldMaskNode) error {
 	dataVal := reflect.Indirect(reflect.ValueOf(data))
 
 	// If the type of the value to write to and the data match directly,
 	// then we just set it directly instead of recursing into the structure.
-	if dataVal.Type() == val.Type() {
+	// A field mask requires recursing so that only the selected fields
+	// are written.
+	if dataVal.Type() == val.Type() && mask == nil {
 		val.Set(dataVal)
 		return nil
 	}
@@ -1512,7 +1592,7 @@ func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
 	dataValKind := dataVal.Kind()
 	switch dataValKind {
 	case reflect.Map:
-		return d.decodeStructFromMap(name, dataVal, val)
+		return d.decodeStructFromMap(name, dataVal, val, mask)
 
 	case reflect.Struct:
 		// Not the most efficient way to do this but we can optimize later if
@@ -1534,7 +1614,7 @@ func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
 			return err
 		}
 
-		result := d.decodeStructFromMap(name, reflect.Indirect(addrVal), val)
+		result := d.decodeStructFromMap(name, reflect.Indirect(addrVal), val, mask)
 		return result
 
 	default:
@@ -1543,7 +1623,7 @@ func (d *Decoder) decodeStruct(name string, data any, val reflect.Value) error {
 	}
 }
 
-func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) error {
+func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value, mask *fieldMaskNode) error {
 	dataValType := dataVal.Type()
 	if kind := dataValType.Key().Kind(); kind != reflect.String && kind != reflect.Interface {
 		return newDecodeError(name,
@@ -1669,6 +1749,27 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fieldName = d.config.MapFieldName(fieldName)
 		}
 
+		// If a field mask is active, fields outside the mask are
+		// skipped entirely: their input is not decoded and does not
+		// reach the DecodeHook.
+		var fieldMask *fieldMaskNode
+		if mask != nil {
+			child, ok := mask.children[fieldName]
+			if !ok {
+				if !d.config.FieldMaskErrorUnused {
+					// Silently drop the input key so it is not
+					// reported as unused.
+					d.deleteUnusedKey(dataVal, dataValKeys, dataValKeysUnused, fieldName)
+				}
+				continue
+			}
+			if !child.subtree {
+				// The field is only partially selected: keep
+				// filtering one level down.
+				fieldMask = child
+			}
+		}
+
 		rawMapKey := reflect.ValueOf(fieldName)
 		rawMapVal := dataVal.MapIndex(rawMapKey)
 		if !rawMapVal.IsValid() {
@@ -1718,7 +1819,7 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fieldName = name + "." + fieldName
 		}
 
-		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue); err != nil {
+		if err := d.decode(fieldName, rawMapVal.Interface(), fieldValue, fieldMask); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -1799,6 +1900,32 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	}
 
 	return nil
+}
+
+// deleteUnusedKey removes the map key matching fieldName (using the
+// same lookup rules as decoding) from the unused-key set, so the key is
+// neither reported by ErrorUnused nor tracked in Metadata.Unused.
+func (d *Decoder) deleteUnusedKey(dataVal reflect.Value, dataValKeys map[reflect.Value]struct{}, dataValKeysUnused map[any]struct{}, fieldName string) {
+	rawMapKey := reflect.ValueOf(fieldName)
+	if dataVal.MapIndex(rawMapKey).IsValid() {
+		delete(dataValKeysUnused, rawMapKey.Interface())
+		return
+	}
+
+	// Do a slower search by iterating over each key and doing a
+	// case-insensitive search.
+	for dataValKey := range dataValKeys {
+		mK, ok := dataValKey.Interface().(string)
+		if !ok {
+			// Not a string key
+			continue
+		}
+
+		if d.config.MatchName(mK, fieldName) {
+			delete(dataValKeysUnused, dataValKey.Interface())
+			return
+		}
+	}
 }
 
 func isEmptyValue(v reflect.Value) bool {
