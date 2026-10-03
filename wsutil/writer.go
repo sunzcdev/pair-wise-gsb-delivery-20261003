@@ -1,6 +1,7 @@
 package wsutil
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
@@ -23,6 +24,12 @@ var (
 	// no more data could be written to the underlying io.Writer because
 	// MaxControlFramePayloadSize limit is reached.
 	ErrControlOverflow = fmt.Errorf("control frame payload overflow")
+
+	// ErrAborted is returned by Writer operations after Abort() was called on
+	// a Writer that has already emitted at least one non-final fragment of the
+	// message. Such a message can not be rolled back on the wire, so the Writer
+	// becomes unusable until Reset() is called with a new destination.
+	ErrAborted = errors.New("writer aborted")
 )
 
 // Constants which are represent frame length ranges.
@@ -163,6 +170,12 @@ type Writer struct {
 	dirty bool
 	fseq  int
 	err   error
+
+	// emitted reports whether any bytes of the current message were attempted
+	// to be written to the destination (possibly partially). Unlike fseq it
+	// becomes true even when the destination write failed or was short,
+	// because the wire state can not be trusted in such case.
+	emitted bool
 }
 
 // NewWriter returns a new Writer whose buffer has the DefaultWriteBuffer size.
@@ -237,8 +250,51 @@ func (w *Writer) Reset(dest io.Writer, state ws.State, op ws.OpCode) {
 	w.n = 0
 	w.dirty = false
 	w.fseq = 0
+	w.emitted = false
+	w.err = nil
 	w.extensions = w.extensions[:0]
 	w.noFlush = false
+}
+
+// Abort discards the current message and prepares the Writer for the next
+// one.
+//
+// If no frame of the current message has been emitted yet, Abort drops the
+// buffered bytes and the Writer stays usable: the next Write() starts a fresh
+// message with the configured operation code.
+//
+// Once a non-final fragment has been flushed (via FlushFragment() or an
+// automatic flush inside Write()) the message can not be rolled back, because
+// the peer has already received a part of it. In this case Abort puts the
+// Writer into a terminal state: subsequent Write(), ReadFrom(), Flush() and
+// FlushFragment() calls return an error wrapping ErrAborted until the Writer
+// is explicitly Reset() to a new destination.
+//
+// After a successful (in-buffer) abort, negotiated extensions and other
+// Writer options are preserved. Reset() must be used to clear them.
+func (w *Writer) Abort() error {
+	w.n = 0
+	w.dirty = false
+	if !w.emitted {
+		// Nothing has reached the wire: it is safe to simply drop the
+		// buffered data and start the next message from scratch.
+		return nil
+	}
+
+	// At least one non-final fragment was already sent: the message is open on
+	// the peer side and could not be pretended as fully rolled back. Mark the
+	// Writer as unusable until Reset() is called.
+	if w.err != nil && errors.Is(w.err, ErrAborted) {
+		// Already in the terminal state: keep the error stable.
+		return w.err
+	}
+	err := fmt.Errorf("%w: non-final fragment was already sent", ErrAborted)
+	if w.err != nil {
+		err = fmt.Errorf("%w: %v", err, w.err)
+	}
+	w.err = err
+
+	return err
 }
 
 // ResetOp is an quick version of Reset().
@@ -249,6 +305,7 @@ func (w *Writer) ResetOp(op ws.OpCode) {
 	w.n = 0
 	w.dirty = false
 	w.fseq = 0
+	w.emitted = false
 }
 
 // SetExtensions adds xs as extensions to be used during writes.
@@ -284,6 +341,10 @@ func (w *Writer) Buffered() int {
 // with payload of N bytes will not fit into that buffer. Writer reserves some
 // space to fit WebSocket header data.
 func (w *Writer) Write(p []byte) (n int, err error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+
 	// Even empty p may make a sense.
 	w.dirty = true
 
@@ -339,6 +400,9 @@ func ceilPowerOfTwo(n int) int {
 // Grow grows Writer's internal buffer capacity to guarantee space for another
 // n bytes of _payload_ -- that is, frame header is not included in n.
 func (w *Writer) Grow(n int) {
+	if w.err != nil {
+		return
+	}
 	// NOTE: we must respect the possibility of header reserved bytes grow.
 	var (
 		size       = len(w.raw)
@@ -408,19 +472,33 @@ func (w *Writer) WriteThrough(p []byte) (n int, err error) {
 		frame.Payload = p
 	}
 
-	w.err = ws.WriteFrame(w.dest, frame)
-	if w.err == nil {
-		n = len(p)
+	b, err := ws.CompileFrame(frame)
+	if err != nil {
+		return 0, err
 	}
 
+	w.emitted = true
+	nn, err := w.dest.Write(b)
+	if err == nil && nn != len(b) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		n = len(p)
+		w.fseq++
+	}
+	w.err = err
+
 	w.dirty = true
-	w.fseq++
 
 	return n, w.err
 }
 
 // ReadFrom implements io.ReaderFrom.
 func (w *Writer) ReadFrom(src io.Reader) (n int64, err error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+
 	var nn int
 	for err == nil {
 		if w.Available() == 0 {
@@ -471,12 +549,16 @@ func (w *Writer) Flush() error {
 		return w.err
 	}
 
-	w.err = w.flushFragment(true)
+	if err := w.flushFragment(true); err != nil {
+		w.err = err
+		return err
+	}
 	w.n = 0
 	w.dirty = false
 	w.fseq = 0
+	w.emitted = false
 
-	return w.err
+	return nil
 }
 
 // FlushFragment writes any buffered data to the underlying io.Writer.
@@ -486,11 +568,14 @@ func (w *Writer) FlushFragment() error {
 		return w.err
 	}
 
-	w.err = w.flushFragment(false)
+	if err := w.flushFragment(false); err != nil {
+		w.err = err
+		return err
+	}
 	w.n = 0
 	w.fseq++
 
-	return w.err
+	return nil
 }
 
 func (w *Writer) flushFragment(fin bool) (err error) {
@@ -525,7 +610,11 @@ func (w *Writer) flushFragment(fin bool) (err error) {
 		// Must never be reached.
 		panic("dump header error: " + err.Error())
 	}
-	_, err = w.dest.Write(w.raw[skip : offset+w.n])
+	w.emitted = true
+	n, err := w.dest.Write(w.raw[skip : offset+w.n])
+	if err == nil && n != offset+w.n-skip {
+		err = io.ErrShortWrite
+	}
 	return err
 }
 

@@ -3,6 +3,7 @@ package wsutil
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -591,6 +592,371 @@ func TestWriterNoPreemtiveFlush(t *testing.T) {
 			n.n,
 		)
 	}
+}
+
+func TestWriterAbortBuffered(t *testing.T) {
+	// Truncation point #1: business fails before any frame reached the wire.
+	// Abort must drop buffered bytes, leave the destination untouched and
+	// allow the next message to start with the configured opcode. Extensions
+	// negotiated for the destination must still be applied.
+	var dest bytes.Buffer
+	w := NewWriterSize(&dest, ws.StateServerSide, ws.OpText, 16)
+	w.SetExtensions(SendExtensionFunc(func(h ws.Header) (ws.Header, error) {
+		h.Rsv = ws.Rsv(true, false, false)
+		return h, nil
+	}))
+
+	if _, err := w.Write([]byte("partial message")); err != nil {
+		t.Fatalf("unexpected Write() error: %v", err)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort() after buffered writes: %v", err)
+	}
+	if dest.Len() != 0 {
+		t.Fatalf("abort wrote %d bytes to the destination; want 0: %x", dest.Len(), dest.Bytes())
+	}
+	if n := w.Buffered(); n != 0 {
+		t.Errorf("writer keeps %d buffered bytes after abort; want 0", n)
+	}
+
+	// Next message must start with OpText (not OpContinuation), must not
+	// contain bytes from the aborted message and must preserve extensions.
+	if _, err := w.Write([]byte("next")); err != nil {
+		t.Fatalf("Write() after abort: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush() after abort: %v", err)
+	}
+
+	exp := ws.MustCompileFrame(ws.Frame{
+		Header: ws.Header{
+			Fin:    true,
+			OpCode: ws.OpText,
+			Length: 4,
+			Rsv:    ws.Rsv(true, false, false),
+		},
+		Payload: []byte("next"),
+	})
+	if act := dest.Bytes(); !bytes.Equal(act, exp) {
+		t.Errorf("output bytes after abort:\nact:\t%x\nexp:\t%x\n%s", act, exp, pretty(frames(t, act)...))
+	}
+}
+
+func TestWriterAbortBufferedMasked(t *testing.T) {
+	// Same as TestWriterAbortBuffered, but for the client side: masking state
+	// must be cleaned between the aborted and the next message, i.e. the next
+	// message must be masked with its own mask and must decrypt cleanly.
+	var dest bytes.Buffer
+	w := NewWriterSize(&dest, ws.StateClientSide, ws.OpBinary, 64)
+
+	if _, err := w.Write([]byte("aborted payload")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Abort(); err != nil {
+		t.Fatalf("Abort(): %v", err)
+	}
+
+	if _, err := w.Write([]byte("fresh")); err != nil {
+		t.Fatalf("Write() after abort: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush() after abort: %v", err)
+	}
+
+	f, err := ws.ReadFrame(&dest)
+	if err != nil {
+		t.Fatalf("read output frame: %v", err)
+	}
+	if !f.Header.Masked {
+		t.Errorf("frame after abort is not masked")
+	}
+	if f.Header.OpCode != ws.OpBinary {
+		t.Errorf("opcode after abort: %v; want %v", f.Header.OpCode, ws.OpBinary)
+	}
+	if act := omitMask(f); !bytes.Equal(act.Payload, []byte("fresh")) {
+		t.Errorf("payload after abort: %q; want %q", act.Payload, "fresh")
+	}
+}
+
+func TestWriterAbortFragmented(t *testing.T) {
+	// Truncation point #2: a non-final fragment was already flushed. The
+	// message can not be rolled back, so Abort must mark the Writer as
+	// unusable until an explicit Reset() to a new destination.
+	var dest bytes.Buffer
+	w := NewWriterSize(&dest, ws.StateServerSide, ws.OpText, 5)
+	w.SetExtensions(SendExtensionFunc(func(h ws.Header) (ws.Header, error) {
+		h.Rsv = ws.Rsv(true, false, false)
+		return h, nil
+	}))
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushFragment(); err != nil {
+		t.Fatalf("FlushFragment(): %v", err)
+	}
+
+	exp := ws.MustCompileFrame(ws.Frame{
+		Header: ws.Header{
+			Fin:    false,
+			OpCode: ws.OpText,
+			Length: 5,
+			Rsv:    ws.Rsv(true, false, false),
+		},
+		Payload: []byte("hello"),
+	})
+	if act := dest.Bytes(); !bytes.Equal(act, exp) {
+		t.Fatalf("output bytes before abort:\nact:\t%x\nexp:\t%x", act, exp)
+	}
+
+	abortErr := w.Abort()
+	if !errors.Is(abortErr, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want error wrapping ErrAborted", abortErr)
+	}
+
+	// Destination must keep exactly the emitted fragment: nothing more may be
+	// written on the aborted message.
+	if act := dest.Bytes(); !bytes.Equal(act, exp) {
+		t.Errorf("output bytes changed by abort:\nact:\t%x\nexp:\t%x", act, exp)
+	}
+
+	// All subsequent operations must fail with the same stable error.
+	if _, err := w.Write([]byte("x")); err != abortErr {
+		t.Errorf("Write() after abort: %v; want %v", err, abortErr)
+	}
+	if err := w.Flush(); err != abortErr {
+		t.Errorf("Flush() after abort: %v; want %v", err, abortErr)
+	}
+	if err := w.FlushFragment(); err != abortErr {
+		t.Errorf("FlushFragment() after abort: %v; want %v", err, abortErr)
+	}
+	if _, err := w.ReadFrom(bytes.NewReader([]byte("x"))); err != abortErr {
+		t.Errorf("ReadFrom() after abort: %v; want %v", err, abortErr)
+	}
+	if err := w.Abort(); err != abortErr {
+		t.Errorf("second Abort(): %v; want %v", err, abortErr)
+	}
+	if act := dest.Bytes(); !bytes.Equal(act, exp) {
+		t.Errorf("output bytes changed by failed operations:\nact:\t%x\nexp:\t%x", act, exp)
+	}
+
+	// Explicit Reset() to a new destination must clear the terminal state,
+	// the old opcode, negotiated extensions and any leftover buffer bytes.
+	var next bytes.Buffer
+	w.Reset(&next, ws.StateServerSide, ws.OpBinary)
+	if _, err := w.Write([]byte("ok")); err != nil {
+		t.Fatalf("Write() after Reset(): %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush() after Reset(): %v", err)
+	}
+	actFrames := frames(t, next.Bytes())
+	if len(actFrames) != 1 {
+		t.Fatalf("got %d frames after Reset(); want 1: %s", len(actFrames), pretty(actFrames...))
+	}
+	f := actFrames[0]
+	if f.Header.OpCode != ws.OpBinary || !f.Header.Fin {
+		t.Errorf("frame after Reset(): %#v; want single final binary frame", f.Header)
+	}
+	r1, r2, r3 := ws.RsvBits(f.Header.Rsv)
+	if r1 || r2 || r3 {
+		t.Errorf("extension bits leaked through Reset(): %v", f.Header.Rsv)
+	}
+	if !bytes.Equal(f.Payload, []byte("ok")) {
+		t.Errorf("payload after Reset(): %q; want %q", f.Payload, "ok")
+	}
+}
+
+func TestWriterAbortShortWrite(t *testing.T) {
+	// Truncation point #3: the underlying writer accepts only part of the
+	// frame (short write). The fragment is on the wire, but incomplete: the
+	// same terminal state as for an emitted fragment must be entered.
+	const limit = 6 // 2-byte header + 4 of 5 payload bytes.
+	lim := &limitWriter{limit: limit}
+	w := NewWriterSize(lim, ws.StateServerSide, ws.OpText, 16)
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	flushErr := w.FlushFragment()
+	if !errors.Is(flushErr, io.ErrShortWrite) {
+		t.Fatalf("FlushFragment() error: %v; want io.ErrShortWrite", flushErr)
+	}
+
+	exp := ws.MustCompileFrame(ws.Frame{
+		Header: ws.Header{
+			Fin:    false,
+			OpCode: ws.OpText,
+			Length: 5,
+		},
+		Payload: []byte("hello"),
+	})[:limit]
+	if act := lim.Bytes(); !bytes.Equal(act, exp) {
+		t.Errorf("actually written bytes:\nact:\t%x\nexp:\t%x", act, exp)
+	}
+
+	abortErr := w.Abort()
+	if !errors.Is(abortErr, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want error wrapping ErrAborted", abortErr)
+	}
+	if _, err := w.Write([]byte("x")); err != abortErr {
+		t.Errorf("Write() after abort: %v; want %v", err, abortErr)
+	}
+	if err := w.FlushFragment(); err != abortErr {
+		t.Errorf("FlushFragment() after abort: %v; want %v", err, abortErr)
+	}
+	if act := lim.Bytes(); !bytes.Equal(act, exp) {
+		t.Errorf("failed operations wrote extra bytes:\nact:\t%x\nexp:\t%x", act, exp)
+	}
+
+	var next bytes.Buffer
+	w.Reset(&next, ws.StateServerSide, ws.OpText)
+	if _, err := w.Write([]byte("recovered")); err != nil {
+		t.Fatalf("Write() after Reset(): %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("Flush() after Reset(): %v", err)
+	}
+	got := frames(t, next.Bytes())
+	if len(got) != 1 || !got[0].Header.Fin || string(got[0].Payload) != "recovered" {
+		t.Errorf("unexpected output after Reset(): %s", pretty(got...))
+	}
+}
+
+func TestWriterAbortAutoFlush(t *testing.T) {
+	// A fragment emitted by an automatic flush inside Write() must have the
+	// same effect as an explicit FlushFragment(): Abort enters the terminal
+	// state instead of pretending a rollback.
+	var dest bytes.Buffer
+	w := NewWriterSize(&dest, ws.StateServerSide, ws.OpText, 5)
+
+	if _, err := w.Write([]byte("hello, world!")); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	if err := w.Abort(); !errors.Is(err, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want ErrAborted", err)
+	}
+	if _, err := w.Write([]byte("x")); !errors.Is(err, ErrAborted) {
+		t.Errorf("Write() after abort: %v; want ErrAborted", err)
+	}
+
+	got := frames(t, dest.Bytes())
+	if len(got) != 1 || got[0].Header.Fin {
+		t.Fatalf("unexpected frames on the wire: %s", pretty(got...))
+	}
+	if got[0].Header.OpCode != ws.OpText || string(got[0].Payload) != "hello, world!" {
+		t.Errorf("unexpected first fragment: %s", pretty(got[0]))
+	}
+}
+
+func TestWriterAbortAutoFlushBuffered(t *testing.T) {
+	// Automatic flush of a non-empty buffer (not the direct WriteThrough
+	// path): the emitted non-final fragment must trigger the terminal state.
+	var dest bytes.Buffer
+	w := NewWriterSize(&dest, ws.StateServerSide, ws.OpText, 5)
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("abc")); err != nil {
+		t.Fatalf("Write() error: %v", err)
+	}
+	if err := w.Abort(); !errors.Is(err, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want ErrAborted", err)
+	}
+
+	got := frames(t, dest.Bytes())
+	if len(got) != 1 || got[0].Header.Fin {
+		t.Fatalf("unexpected frames on the wire: %s", pretty(got...))
+	}
+	if got[0].Header.OpCode != ws.OpText || string(got[0].Payload) != "hello" {
+		t.Errorf("unexpected first fragment: %s", pretty(got[0]))
+	}
+}
+
+func TestWriterAbortWriteThroughShortWrite(t *testing.T) {
+	// Large write on an empty Writer goes through WriteThrough(). A short
+	// write there must also be detected and force the terminal state.
+	const limit = 4 // cuts inside the 7-byte header of a 126+ payload frame.
+	lim := &limitWriter{limit: limit}
+	w := NewWriterSize(lim, ws.StateServerSide, ws.OpText, 16)
+
+	p := make([]byte, 200)
+	if _, err := w.Write(p); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("Write() error: %v; want io.ErrShortWrite", err)
+	}
+	if err := w.Abort(); !errors.Is(err, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want ErrAborted", err)
+	}
+	if _, err := w.Write([]byte("x")); !errors.Is(err, ErrAborted) {
+		t.Errorf("Write() after abort: %v; want ErrAborted", err)
+	}
+	if n := len(lim.Bytes()); n != limit {
+		t.Errorf("written %d bytes; want exactly %d", n, limit)
+	}
+}
+
+func TestWriterAbortPoolReuse(t *testing.T) {
+	// A hard-aborted Writer returned to the pool must come back fully
+	// operational: no terminal error, no stale destination or opcode.
+	//
+	// GetWriter()/PutWriter() rely on sync.Pool, whose per-P caches make
+	// immediate reuse nondeterministic; PutWriter() and GetWriter() both reset
+	// through the same code path exercised here.
+	var dest bytes.Buffer
+	w := GetWriter(&dest, ws.StateServerSide, ws.OpText, 256)
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushFragment(); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Abort(); !errors.Is(err, ErrAborted) {
+		t.Fatalf("Abort() error: %v; want ErrAborted", err)
+	}
+
+	PutWriter(w)
+
+	var next bytes.Buffer
+	w.Reset(&next, ws.StateServerSide, ws.OpBinary)
+	w2 := w
+	if _, err := w2.Write([]byte("pooled")); err != nil {
+		t.Fatalf("Write() on pooled writer: %v", err)
+	}
+	if err := w2.Flush(); err != nil {
+		t.Fatalf("Flush() on pooled writer: %v", err)
+	}
+	got := frames(t, next.Bytes())
+	if len(got) != 1 || !got[0].Header.Fin || got[0].Header.OpCode != ws.OpBinary {
+		t.Errorf("unexpected frames from pooled writer: %s", pretty(got...))
+	}
+	if string(got[0].Payload) != "pooled" {
+		t.Errorf("pooled writer payload: %q; want %q", got[0].Payload, "pooled")
+	}
+}
+
+// limitWriter accepts at most limit bytes in total. Once the limit is reached
+// it reports a short write without error, like an io.Writer on a broken
+// connection that accepts a partial frame.
+type limitWriter struct {
+	buf   []byte
+	limit int
+}
+
+func (w *limitWriter) Write(p []byte) (int, error) {
+	n := w.limit - len(w.buf)
+	if n <= 0 {
+		return 0, nil
+	}
+	if n > len(p) {
+		n = len(p)
+	}
+	w.buf = append(w.buf, p[:n]...)
+	return n, nil
+}
+
+func (w *limitWriter) Bytes() []byte {
+	return w.buf
 }
 
 type writeCounter struct {
