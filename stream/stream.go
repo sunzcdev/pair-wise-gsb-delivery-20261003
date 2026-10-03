@@ -39,6 +39,8 @@ type Stream struct {
 	pool             pool.Pool
 	callbackerHandle conc.WaitGroup
 	queue            chan callbackCh
+	inFlight         chan struct{}
+	maxInFlight      int
 
 	initOnce sync.Once
 }
@@ -61,6 +63,14 @@ type Callback func()
 // started.
 func (s *Stream) Go(f Task) {
 	s.init()
+
+	// Acquire a slot in the in-flight window before accepting the task.
+	// This happens on the submitting goroutine, so a worker running an
+	// earlier task never blocks waiting for window space and the window
+	// can always make progress.
+	if s.inFlight != nil {
+		s.inFlight <- struct{}{}
+	}
 
 	// Get a channel from the cache.
 	ch := getCh()
@@ -107,9 +117,29 @@ func (s *Stream) WithMaxGoroutines(n int) *Stream {
 	return s
 }
 
+// WithMaxInFlight limits the number of tasks that have been submitted but
+// whose callbacks have not yet been delivered. This bounds the memory held
+// by completed callbacks that are still waiting to be run in order, for
+// example when an early task is slow but later tasks finish quickly. The
+// limit is independent of the number of worker goroutines. Defaults to
+// unlimited. Panics if n < 1.
+func (s *Stream) WithMaxInFlight(n int) *Stream {
+	if s.queue != nil {
+		panic("stream can not be reconfigured after calling Go() for the first time")
+	}
+	if n < 1 {
+		panic("max in-flight tasks in a stream must be greater than zero")
+	}
+	s.maxInFlight = n
+	return s
+}
+
 func (s *Stream) init() {
 	s.initOnce.Do(func() {
 		s.queue = make(chan callbackCh, s.pool.MaxGoroutines()+1)
+		if s.maxInFlight > 0 {
+			s.inFlight = make(chan struct{}, s.maxInFlight)
+		}
 
 		// Start the callbacker.
 		s.callbackerHandle.Go(s.callbacker)
@@ -130,6 +160,13 @@ func (s *Stream) callbacker() {
 		// Execute the callback (with panic protection).
 		if callback != nil {
 			panicCatcher.Try(callback)
+		}
+
+		// Release the in-flight slot now that the callback has been
+		// delivered. This runs even if the callback panicked, since
+		// panicCatcher.Try recovers it.
+		if s.inFlight != nil {
+			<-s.inFlight
 		}
 
 		// Return the channel to the pool of unused channels.

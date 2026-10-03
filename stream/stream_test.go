@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sourcegraph/conc/panics"
 	"github.com/sourcegraph/conc/stream"
 
 	"github.com/stretchr/testify/require"
@@ -133,6 +134,113 @@ func TestStream(t *testing.T) {
 		}
 		require.Panics(t, s.Wait)
 	})
+
+	t.Run("max in-flight limits pending callbacks", func(t *testing.T) {
+		t.Parallel()
+		const maxInFlight = 3
+		s := stream.New().WithMaxGoroutines(10).WithMaxInFlight(maxInFlight)
+
+		var pending atomic.Int64
+		var maxPending atomic.Int64
+		track := func(delta int64) {
+			curr := pending.Add(delta)
+			if curr > maxPending.Load() {
+				maxPending.CompareAndSwap(maxPending.Load(), curr)
+			}
+		}
+
+		// The first task is slow, so later tasks finish long before
+		// their callbacks can be delivered.
+		s.Go(func() stream.Callback {
+			track(1)
+			time.Sleep(100 * time.Millisecond)
+			return func() { track(-1) }
+		})
+		// Later tasks complete immediately, returning large closures
+		// that would pile up in memory without an in-flight limit.
+		for i := 0; i < 100; i++ {
+			s.Go(func() stream.Callback {
+				track(1)
+				buf := make([]byte, 1<<20)
+				return func() {
+					track(-1)
+					_ = buf
+				}
+			})
+		}
+		s.Wait()
+		require.LessOrEqual(t, maxPending.Load(), int64(maxInFlight))
+		require.Equal(t, int64(0), pending.Load())
+	})
+
+	t.Run("max in-flight validation", func(t *testing.T) {
+		t.Parallel()
+		require.Panics(t, func() { stream.New().WithMaxInFlight(0) })
+		s := stream.New()
+		s.Go(func() stream.Callback { return func() {} })
+		require.Panics(t, func() { s.WithMaxInFlight(1) })
+		s.Wait()
+	})
+
+	t.Run("panic in task releases in-flight slots", func(t *testing.T) {
+		t.Parallel()
+		s := stream.New().WithMaxGoroutines(2).WithMaxInFlight(2)
+		s.Go(func() stream.Callback {
+			panic("something really bad happened in the task")
+		})
+		// If the panicking task did not release its in-flight slot,
+		// these submissions would deadlock.
+		for i := 0; i < 10; i++ {
+			s.Go(func() stream.Callback {
+				return func() {}
+			})
+		}
+		recovered := waitRecovered(s)
+		require.NotNil(t, recovered)
+		require.Equal(t, "something really bad happened in the task", rootValue(recovered))
+	})
+
+	t.Run("panic in callback releases in-flight slots", func(t *testing.T) {
+		t.Parallel()
+		s := stream.New().WithMaxGoroutines(2).WithMaxInFlight(2)
+		s.Go(func() stream.Callback {
+			return func() {
+				panic("something really bad happened in the callback")
+			}
+		})
+		// If the panicking callback did not release its in-flight slot,
+		// these submissions would deadlock.
+		for i := 0; i < 10; i++ {
+			s.Go(func() stream.Callback {
+				return func() {}
+			})
+		}
+		recovered := waitRecovered(s)
+		require.NotNil(t, recovered)
+		require.Equal(t, "something really bad happened in the callback", rootValue(recovered))
+	})
+}
+
+func waitRecovered(s *stream.Stream) (recovered *panics.Recovered) {
+	defer func() {
+		if r := recover(); r != nil {
+			recovered = r.(*panics.Recovered)
+		}
+	}()
+	s.Wait()
+	return nil
+}
+
+// rootValue unwraps nested panics.Recovered values down to the original
+// panic value.
+func rootValue(r *panics.Recovered) any {
+	for {
+		inner, ok := r.Value.(*panics.Recovered)
+		if !ok {
+			return r.Value
+		}
+		r = inner
+	}
 }
 
 func BenchmarkStream(b *testing.B) {
