@@ -569,3 +569,195 @@ func TestRollingWindowCircuitBreakerInParallel(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestUpdatePolicy(t *testing.T) {
+	customCB := newCustom(nil)
+
+	assert.Equal(t, Policy{
+		MaxRequests:  3,
+		Interval:     30 * time.Second,
+		BucketPeriod: 30 * time.Second,
+		Timeout:      90 * time.Second,
+	}, customCB.Policy())
+
+	newPolicy := Policy{
+		MaxRequests:  5,
+		Interval:     10 * time.Second,
+		BucketPeriod: 2 * time.Second,
+		Timeout:      30 * time.Second,
+	}
+	assert.Nil(t, customCB.UpdatePolicy(newPolicy, false))
+	assert.Equal(t, newPolicy, customCB.Policy())
+	assert.Equal(t, 5, len(customCB.counts.buckets))
+	assert.Equal(t, Counts{}, customCB.Counts())
+
+	// the new Timeout is in effect
+	for i := 0; i < 3; i++ {
+		assert.Nil(t, fail(customCB))
+	}
+	assert.Equal(t, StateOpen, customCB.State())
+	pseudoSleep(customCB, 25*time.Second)
+	assert.Equal(t, StateOpen, customCB.State())
+	pseudoSleep(customCB, 10*time.Second)
+	assert.Equal(t, StateHalfOpen, customCB.State())
+
+	// the new MaxRequests is in effect
+	for i := 0; i < 4; i++ {
+		assert.Nil(t, succeed(customCB))
+		assert.Equal(t, StateHalfOpen, customCB.State())
+	}
+	assert.Nil(t, succeed(customCB))
+	assert.Equal(t, StateClosed, customCB.State())
+}
+
+func TestUpdatePolicyInvalid(t *testing.T) {
+	rollingCB := newRollingWindow(nil)
+
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, fail(rollingCB))
+
+	policyBefore := rollingCB.Policy()
+	stateBefore := rollingCB.State()
+	countsBefore := rollingCB.Counts()
+	generationBefore := rollingCB.generation
+
+	invalidPolicies := []Policy{
+		{MaxRequests: 3, Interval: -time.Second, BucketPeriod: 3 * time.Second, Timeout: 90 * time.Second},
+		{MaxRequests: 3, Interval: 30 * time.Second, BucketPeriod: -time.Second, Timeout: 90 * time.Second},
+		{MaxRequests: 3, Interval: 30 * time.Second, BucketPeriod: 3 * time.Second, Timeout: -time.Second},
+		// a single invalid field rejects the whole group
+		{MaxRequests: 7, Interval: time.Minute, BucketPeriod: time.Second, Timeout: -time.Nanosecond},
+	}
+	for _, p := range invalidPolicies {
+		assert.NotNil(t, rollingCB.UpdatePolicy(p, false))
+		assert.Equal(t, policyBefore, rollingCB.Policy())
+		assert.Equal(t, stateBefore, rollingCB.State())
+		assert.Equal(t, countsBefore, rollingCB.Counts())
+		assert.Equal(t, generationBefore, rollingCB.generation)
+	}
+}
+
+func TestUpdatePolicyPreserveCounts(t *testing.T) {
+	// same layout: counts and buckets are kept as-is
+	rollingCB := newRollingWindow(nil)
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, fail(rollingCB))
+	countsBefore := rollingCB.Counts()
+	assert.Equal(t, Counts{Requests: 3, TotalSuccesses: 2, TotalFailures: 1, ConsecutiveFailures: 1}, countsBefore)
+
+	sameLayout := Policy{MaxRequests: 5, Interval: 30 * time.Second, BucketPeriod: 3 * time.Second, Timeout: time.Minute}
+	assert.Nil(t, rollingCB.UpdatePolicy(sameLayout, true))
+	assert.Equal(t, countsBefore, rollingCB.Counts())
+	assert.Equal(t, 10, len(rollingCB.counts.buckets))
+
+	// without preservation the counts are reset
+	assert.Nil(t, rollingCB.UpdatePolicy(sameLayout, false))
+	assert.Equal(t, Counts{}, rollingCB.Counts())
+
+	// layout change: counts are consolidated into the current bucket of the
+	// new layout instead of splicing the old buckets into it
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, succeed(rollingCB))
+	assert.Nil(t, fail(rollingCB))
+	countsBefore = rollingCB.Counts()
+
+	newLayout := Policy{MaxRequests: 5, Interval: 4 * time.Second, BucketPeriod: 2 * time.Second, Timeout: time.Minute}
+	assert.Nil(t, rollingCB.UpdatePolicy(newLayout, true))
+	assert.Equal(t, countsBefore, rollingCB.Counts())
+	assert.Equal(t, 2, len(rollingCB.counts.buckets))
+
+	var bucketSum Counts
+	for _, bucket := range rollingCB.counts.buckets {
+		bucketSum.Requests += bucket.Requests
+		bucketSum.TotalSuccesses += bucket.TotalSuccesses
+		bucketSum.TotalFailures += bucket.TotalFailures
+	}
+	assert.Equal(t, countsBefore.Requests, bucketSum.Requests)
+	assert.Equal(t, countsBefore.TotalSuccesses, bucketSum.TotalSuccesses)
+	assert.Equal(t, countsBefore.TotalFailures, bucketSum.TotalFailures)
+
+	// rolling past the consolidated bucket leaves consistent, empty counts
+	pseudoSleep(rollingCB, 4*time.Second)
+	assert.Equal(t, StateClosed, rollingCB.State())
+	assert.Equal(t, Counts{}, rollingCB.Counts())
+}
+
+func TestUpdatePolicyGeneration(t *testing.T) {
+	customCB := newCustom(nil)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := customCB.Execute(func() (bool, error) {
+			close(started)
+			<-release
+			return true, nil
+		})
+		done <- err
+	}()
+	<-started
+	assert.Equal(t, uint32(1), customCB.Counts().Requests)
+
+	// a request that begins before an update and finishes after it belongs
+	// to the old generation; its result is discarded
+	newPolicy := Policy{MaxRequests: 3, Interval: 30 * time.Second, Timeout: 90 * time.Second}
+	assert.Nil(t, customCB.UpdatePolicy(newPolicy, true))
+
+	close(release)
+	assert.Nil(t, <-done)
+	assert.Equal(t, Counts{Requests: 1}, customCB.Counts())
+}
+
+func TestUpdatePolicyInParallel(t *testing.T) {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	rollingCB := newRollingWindow(nil)
+
+	policies := []Policy{
+		{MaxRequests: 3, Interval: 30 * time.Second, BucketPeriod: 3 * time.Second, Timeout: 90 * time.Second},
+		{MaxRequests: 5, Interval: time.Second, BucketPeriod: 100 * time.Millisecond, Timeout: time.Second},
+		{MaxRequests: 2, Interval: 0, Timeout: 5 * time.Second},
+	}
+
+	var wg sync.WaitGroup
+
+	const numWorkers = 8
+	const numReqs = 500
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < numReqs; j++ {
+				if (i+j)%2 == 0 {
+					assert.Nil(t, succeed(rollingCB))
+				} else {
+					assert.Nil(t, exclude(rollingCB))
+				}
+			}
+		}(i)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < numReqs; i++ {
+			_ = rollingCB.Counts()
+			_ = rollingCB.Policy()
+			_ = rollingCB.State()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			assert.Nil(t, rollingCB.UpdatePolicy(policies[i%len(policies)], i%2 == 0))
+			assert.NotNil(t, rollingCB.UpdatePolicy(Policy{Timeout: -1}, false))
+		}
+	}()
+
+	wg.Wait()
+}

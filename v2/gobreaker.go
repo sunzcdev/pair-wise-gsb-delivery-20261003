@@ -92,6 +92,83 @@ type Settings struct {
 	IsExcluded    func(err error) bool
 }
 
+// Policy groups the mutable settings of a CircuitBreaker that can be
+// changed at runtime via UpdatePolicy.
+//
+// MaxRequests is the maximum number of requests allowed to pass through
+// when the CircuitBreaker is half-open. If MaxRequests is 0, only 1 request
+// is allowed.
+//
+// Interval is the cyclic period of the closed state
+// for the CircuitBreaker to clear the internal Counts.
+// If Interval is 0, the CircuitBreaker does not clear internal Counts during the closed state.
+//
+// BucketPeriod defines the time duration for each bucket in the rolling window strategy.
+// Interval is automatically adjusted to be a multiple of BucketPeriod.
+// If BucketPeriod is 0, the CircuitBreaker uses a fixed window strategy instead.
+//
+// Timeout is the period of the open state,
+// after which the state of the CircuitBreaker becomes half-open.
+// If Timeout is 0, the timeout value of the CircuitBreaker is set to 60 seconds.
+type Policy struct {
+	MaxRequests  uint32
+	Interval     time.Duration
+	BucketPeriod time.Duration
+	Timeout      time.Duration
+}
+
+// validate checks the policy as a whole before it is applied.
+func (p Policy) validate() error {
+	if p.Interval < 0 {
+		return fmt.Errorf("gobreaker: invalid policy: Interval must not be negative: %v", p.Interval)
+	}
+	if p.BucketPeriod < 0 {
+		return fmt.Errorf("gobreaker: invalid policy: BucketPeriod must not be negative: %v", p.BucketPeriod)
+	}
+	if p.Timeout < 0 {
+		return fmt.Errorf("gobreaker: invalid policy: Timeout must not be negative: %v", p.Timeout)
+	}
+	return nil
+}
+
+// normalizedPolicy is the effective form of a Policy after applying defaults.
+type normalizedPolicy struct {
+	maxRequests  uint32
+	interval     time.Duration
+	bucketPeriod time.Duration
+	timeout      time.Duration
+	numBuckets   int64
+}
+
+func (p Policy) normalize() normalizedPolicy {
+	np := normalizedPolicy{maxRequests: p.MaxRequests}
+	if np.maxRequests == 0 {
+		np.maxRequests = 1
+	}
+
+	switch {
+	case p.Interval <= 0:
+		np.interval = defaultInterval
+		np.bucketPeriod = np.interval
+		np.numBuckets = 1
+	case p.BucketPeriod <= 0:
+		np.interval = p.Interval
+		np.bucketPeriod = np.interval
+		np.numBuckets = 1
+	default:
+		np.interval = (p.Interval + p.BucketPeriod - 1) / p.BucketPeriod * p.BucketPeriod
+		np.bucketPeriod = p.BucketPeriod
+		np.numBuckets = int64(np.interval / np.bucketPeriod)
+	}
+
+	np.timeout = p.Timeout
+	if np.timeout <= 0 {
+		np.timeout = defaultTimeout
+	}
+
+	return np
+}
+
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker[T any] struct {
 	name          string
@@ -119,34 +196,17 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
 
-	if st.MaxRequests == 0 {
-		cb.maxRequests = 1
-	} else {
-		cb.maxRequests = st.MaxRequests
-	}
-
-	var numBuckets int64
-	if st.Interval <= 0 {
-		cb.interval = defaultInterval
-		cb.bucketPeriod = cb.interval
-		numBuckets = 1
-	} else if st.BucketPeriod <= 0 {
-		cb.interval = st.Interval
-		cb.bucketPeriod = cb.interval
-		numBuckets = 1
-	} else {
-		cb.interval = (st.Interval + st.BucketPeriod - 1) / st.BucketPeriod * st.BucketPeriod
-		cb.bucketPeriod = st.BucketPeriod
-		numBuckets = int64(cb.interval / cb.bucketPeriod)
-	}
-
-	cb.counts = newRollingCounts(numBuckets)
-
-	if st.Timeout <= 0 {
-		cb.timeout = defaultTimeout
-	} else {
-		cb.timeout = st.Timeout
-	}
+	np := Policy{
+		MaxRequests:  st.MaxRequests,
+		Interval:     st.Interval,
+		BucketPeriod: st.BucketPeriod,
+		Timeout:      st.Timeout,
+	}.normalize()
+	cb.maxRequests = np.maxRequests
+	cb.interval = np.interval
+	cb.bucketPeriod = np.bucketPeriod
+	cb.timeout = np.timeout
+	cb.counts = newRollingCounts(np.numBuckets)
 
 	if st.ReadyToTrip == nil {
 		cb.readyToTrip = defaultReadyToTrip
@@ -207,6 +267,86 @@ func (cb *CircuitBreaker[T]) Counts() Counts {
 	defer cb.mutex.Unlock()
 
 	return cb.counts.Counts
+}
+
+// Policy returns the effective policy currently applied to the CircuitBreaker.
+// The returned value is a copy; modifying it does not affect the CircuitBreaker.
+func (cb *CircuitBreaker[T]) Policy() Policy {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	return Policy{
+		MaxRequests:  cb.maxRequests,
+		Interval:     cb.interval,
+		BucketPeriod: cb.bucketPeriod,
+		Timeout:      cb.timeout,
+	}
+}
+
+// UpdatePolicy validates the given policy as a whole and, only if it is valid,
+// applies it atomically. If the policy is invalid, UpdatePolicy returns an
+// error and the CircuitBreaker is left completely unchanged.
+//
+// preserveCounts selects whether the counts accumulated in the closed state
+// are kept across the update. Counts are preserved only in the closed state;
+// in the half-open and open states they are always reset. When the window
+// layout (Interval/BucketPeriod) changes, preserved counts are consolidated
+// into the current bucket of the new layout; the old buckets are never
+// spliced into a layout they do not belong to.
+//
+// Generation rule: every successful update starts a new generation.
+// A request that begins before an update and finishes after it belongs to
+// the old generation, and its result is discarded.
+func (cb *CircuitBreaker[T]) UpdatePolicy(p Policy, preserveCounts bool) error {
+	if err := p.validate(); err != nil {
+		return err
+	}
+	np := p.normalize()
+
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	now := time.Now()
+	cb.currentState(now)
+
+	layoutChanged := np.bucketPeriod != cb.bucketPeriod ||
+		np.numBuckets != int64(len(cb.counts.buckets))
+
+	cb.maxRequests = np.maxRequests
+	cb.interval = np.interval
+	cb.bucketPeriod = np.bucketPeriod
+	cb.timeout = np.timeout
+
+	cb.generation++
+
+	if cb.state == StateClosed && preserveCounts {
+		if layoutChanged {
+			preserved := cb.counts.Counts
+			cb.counts = newRollingCounts(np.numBuckets)
+			cb.counts.Counts = preserved
+			cb.counts.buckets[cb.counts.current()] = preserved
+			cb.start = now
+		}
+	} else {
+		cb.counts = newRollingCounts(np.numBuckets)
+		cb.start = now
+	}
+
+	var zero time.Time
+	switch cb.state {
+	case StateClosed:
+		if cb.interval == 0 || len(cb.counts.buckets) >= 2 {
+			cb.expiry = zero
+		} else {
+			cb.expiry = cb.start.Add(cb.interval)
+		}
+	case StateOpen:
+		cb.expiry = now.Add(cb.timeout)
+	default: // StateHalfOpen
+		cb.expiry = zero
+	}
+
+	return nil
 }
 
 // Execute runs the given request if the CircuitBreaker accepts it.
