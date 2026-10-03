@@ -404,6 +404,226 @@ func appendRawPaths(buf []byte, jstr string, paths []pathResult, raw string,
 	}
 }
 
+// escapeSegmentKey escapes a literal object key so that it can be used as
+// a single-component gjson lookup path. Every character that is special
+// to the gjson path syntax is prefixed with a backslash, which makes the
+// resulting path match the key literally.
+func escapeSegmentKey(key string) string {
+	for i := 0; i < len(key); i++ {
+		switch key[i] {
+		case '.', '|', '*', '?', '\\', '@', '!', '#', '[', '{':
+			esc := make([]byte, 0, len(key)+8)
+			esc = append(esc, key[:i]...)
+			for ; i < len(key); i++ {
+				switch key[i] {
+				case '.', '|', '*', '?', '\\', '@', '!', '#', '[', '{':
+					esc = append(esc, '\\')
+				}
+				esc = append(esc, key[i])
+			}
+			return string(esc)
+		}
+	}
+	return key
+}
+
+// appendSegmentPaths is the typed-segment counterpart of appendRawPaths.
+// The paths are pre-encoded from Segment values: a Key segment sets the
+// force flag so that atoui and the "-1" checks never treat it as an array
+// position, an Index segment stores its canonical decimal form, and an
+// Append segment stores "-1". This encoding allows appendBuild to create
+// missing containers of the correct kind.
+//
+// Unlike appendRawPaths, an existing node that conflicts with the
+// container kind required by the current segment produces an error
+// instead of being coerced or replaced.
+func appendSegmentPaths(buf []byte, jstr string, paths []pathResult,
+	raw string, stringify, del bool) ([]byte, error) {
+	var err error
+	var res gjson.Result
+	var found bool
+	iskey := paths[0].force
+	isappend := !iskey && paths[0].part == "-1"
+	var jtype byte
+	for i := 0; i < len(jstr); i++ {
+		if jstr[i] > ' ' {
+			jtype = jstr[i]
+			break
+		}
+	}
+	switch jtype {
+	case 0:
+		// no value yet, a container is created below
+	case '{':
+		if !iskey {
+			return nil, &errorType{
+				"cannot address an array element on a json object"}
+		}
+	case '[':
+		if iskey {
+			return nil, &errorType{
+				"cannot address object key '" + paths[0].part +
+					"' on a json array"}
+		}
+	default:
+		return nil, &errorType{
+			"cannot address a path segment on a non-container json value"}
+	}
+	if del && isappend {
+		res = gjson.Get(jstr, "#")
+		if res.Int() > 0 {
+			res = gjson.Get(jstr, strconv.FormatInt(int64(res.Int()-1), 10))
+			found = true
+		}
+	}
+	if !found {
+		res = gjson.Get(jstr, paths[0].gpart)
+	}
+	if res.Index > 0 {
+		if len(paths) > 1 {
+			buf = append(buf, jstr[:res.Index]...)
+			buf, err = appendSegmentPaths(buf, res.Raw, paths[1:], raw,
+				stringify, del)
+			if err != nil {
+				return nil, err
+			}
+			buf = append(buf, jstr[res.Index+len(res.Raw):]...)
+			return buf, nil
+		}
+		buf = append(buf, jstr[:res.Index]...)
+		var exidx int // additional forward stripping
+		if del {
+			var delNextComma bool
+			buf, delNextComma = deleteTailItem(buf)
+			if delNextComma {
+				i, j := res.Index+len(res.Raw), 0
+				for ; i < len(jstr); i, j = i+1, j+1 {
+					if jstr[i] <= ' ' {
+						continue
+					}
+					if jstr[i] == ',' {
+						exidx = j + 1
+					}
+					break
+				}
+			}
+		} else {
+			if stringify {
+				buf = appendStringify(buf, raw)
+			} else {
+				buf = append(buf, raw...)
+			}
+		}
+		buf = append(buf, jstr[res.Index+len(res.Raw)+exidx:]...)
+		return buf, nil
+	}
+	if del {
+		return nil, errNoChange
+	}
+	if jtype == 0 {
+		if iskey {
+			jstr = "{}"
+		} else {
+			jstr = "[]"
+		}
+	}
+	jsres := gjson.Parse(jstr)
+	var comma bool
+	for i := 1; i < len(jsres.Raw); i++ {
+		if jsres.Raw[i] <= ' ' {
+			continue
+		}
+		if jsres.Raw[i] == '}' || jsres.Raw[i] == ']' {
+			break
+		}
+		comma = true
+		break
+	}
+	if jsres.Raw[0] == '{' {
+		end := len(jsres.Raw) - 1
+		for ; end > 0; end-- {
+			if jsres.Raw[end] == '}' {
+				break
+			}
+		}
+		buf = append(buf, jsres.Raw[:end]...)
+		if comma {
+			buf = append(buf, ',')
+		}
+		buf = appendBuild(buf, false, paths, raw, stringify)
+		buf = append(buf, '}')
+		return buf, nil
+	}
+	if isappend {
+		njson := trim(jsres.Raw)
+		if njson[len(njson)-1] == ']' {
+			njson = njson[:len(njson)-1]
+		}
+		buf = append(buf, njson...)
+		if comma {
+			buf = append(buf, ',')
+		}
+		buf = appendBuild(buf, true, paths, raw, stringify)
+		buf = append(buf, ']')
+		return buf, nil
+	}
+	n, _ := atoui(paths[0])
+	buf = append(buf, '[')
+	ress := jsres.Array()
+	for i := 0; i < len(ress); i++ {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		buf = append(buf, ress[i].Raw...)
+	}
+	if len(ress) == 0 {
+		buf = appendRepeat(buf, "null,", n-len(ress))
+	} else {
+		buf = appendRepeat(buf, ",null", n-len(ress))
+		if comma {
+			buf = append(buf, ',')
+		}
+	}
+	buf = appendBuild(buf, true, paths, raw, stringify)
+	buf = append(buf, ']')
+	return buf, nil
+}
+
+// setSegments sets or deletes a raw json value for a typed segment path.
+func setSegments(jstr string, path []Segment, raw string,
+	stringify, del bool) ([]byte, error) {
+	if len(path) == 0 {
+		return []byte(jstr), &errorType{"path cannot be empty"}
+	}
+	paths := make([]pathResult, len(path))
+	for i, seg := range path {
+		switch seg.kind {
+		case KeySegment:
+			paths[i] = pathResult{
+				part:  seg.key,
+				gpart: escapeSegmentKey(seg.key),
+				force: true,
+			}
+		case IndexSegment:
+			if seg.idx < 0 {
+				return []byte(jstr),
+					&errorType{"array index cannot be negative"}
+			}
+			part := strconv.Itoa(seg.idx)
+			paths[i] = pathResult{part: part, gpart: part}
+		case AppendSegment:
+			paths[i] = pathResult{part: "-1", gpart: "-1"}
+		default:
+			return []byte(jstr), &errorType{"invalid path segment"}
+		}
+	}
+	njson, err := appendSegmentPaths(nil, jstr, paths, raw, stringify, del)
+	if err != nil {
+		return []byte(jstr), err
+	}
+	return njson, nil
+}
+
 func isOptimisticPath(path string) bool {
 	for i := 0; i < len(path); i++ {
 		if path[i] < '.' || path[i] > 'z' {
@@ -500,6 +720,130 @@ func DeleteBytes(json []byte, path string) ([]byte, error) {
 // DeleteBytesOptions deletes a value from json for the specified path, with the given options.
 func DeleteBytesOptions(json []byte, path string, options *Options) ([]byte, error) {
 	return SetBytesOptions(json, path, dtype{}, options)
+}
+
+// SegmentKind is the kind of a typed path Segment.
+type SegmentKind int
+
+const (
+	// KeySegment is a segment that addresses a literal object key.
+	KeySegment SegmentKind = iota
+	// IndexSegment is a segment that addresses a non-negative array index.
+	IndexSegment
+	// AppendSegment is a segment that appends a new element to an array.
+	AppendSegment
+)
+
+// Segment is a single typed path segment used by the SetPath, SetRawPath
+// and DeletePath family of functions. Create segments with the Key, Index
+// and Append constructors.
+//
+// Unlike the dot-syntax string paths used by Set and Delete, a Segment is
+// always interpreted literally and is never parsed as a path expression.
+type Segment struct {
+	kind SegmentKind
+	key  string
+	idx  int
+}
+
+// Key returns a Segment that addresses the literal object key name.
+// The name is used as-is and no character has a special meaning, so keys
+// such as "0", "a.b", "#", "-1" and "" are all reachable without escaping.
+func Key(name string) Segment {
+	return Segment{kind: KeySegment, key: name}
+}
+
+// Index returns a Segment that addresses the array element at idx.
+// The idx must be non-negative; using a negative index results in an
+// error when the segment is used.
+func Index(idx int) Segment {
+	return Segment{kind: IndexSegment, idx: idx}
+}
+
+// Append returns a Segment that appends a new element to the end of an
+// array. When used with DeletePath it addresses the last array element.
+func Append() Segment {
+	return Segment{kind: AppendSegment}
+}
+
+// SetPath sets a json value for the specified typed path.
+// A typed path is a series of Segment values created with the Key, Index
+// and Append constructors, for example:
+//
+//	[]Segment{Key("friends"), Index(1), Key("last")}
+//
+// Every segment is interpreted literally. A Key segment addresses the
+// exact object key it holds, an Index segment addresses a non-negative
+// array element, and an Append segment appends a new element to an array.
+//
+// Missing parent nodes are created as needed; the kind of each new
+// container is decided by the next segment, an object for a Key segment
+// and an array for an Index or Append segment. If an existing node
+// conflicts with the container kind required by a segment, an error is
+// returned and the json is left unmodified; an existing value is never
+// silently replaced by a fresh container. This also applies to
+// non-container values such as strings, numbers, booleans and null.
+//
+// When an Index segment addresses an element past the end of an array,
+// the array is extended with null elements up to and including the
+// addressed index.
+//
+// This function expects that the json is well-formed, and does not
+// validate. Invalid json will not panic, but it may return back
+// unexpected results.
+func SetPath(json string, path []Segment, value interface{}) (string, error) {
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := SetPathBytes(jsonb, path, value)
+	return string(res), err
+}
+
+// SetPathBytes sets a json value for the specified typed path.
+// If working with bytes, this method preferred over
+// SetPath(string(data), path, value)
+func SetPathBytes(json []byte, path []Segment, value interface{}) ([]byte, error) {
+	return setBytesValue(json, value,
+		func(jstr, raw string, stringify, del bool) ([]byte, error) {
+			return setSegments(jstr, path, raw, stringify, del)
+		})
+}
+
+// SetRawPath sets a raw json value for the specified typed path.
+// This function works the same as SetPath except that the value is set as
+// a raw block of json. This allows for setting premarshalled json objects.
+func SetRawPath(json string, path []Segment, value string) (string, error) {
+	res, err := setSegments(json, path, value, false, false)
+	return string(res), err
+}
+
+// SetRawPathBytes sets a raw json value for the specified typed path.
+// If working with bytes, this method preferred over
+// SetRawPath(string(data), path, value)
+func SetRawPathBytes(json []byte, path []Segment, value []byte) ([]byte, error) {
+	jstr := *(*string)(unsafe.Pointer(&json))
+	vstr := *(*string)(unsafe.Pointer(&value))
+	return setSegments(jstr, path, vstr, false, false)
+}
+
+// DeletePath deletes a value from json for the specified typed path.
+// The path follows the same literal rules as SetPath.
+//
+// An Append segment deletes the last element of an array.
+// Deleting a path that does not exist is not an error: a missing object
+// key, an array index that is out of range, or an Append segment on an
+// empty array all return the input json unchanged with a nil error.
+// A container type conflict, on the other hand, returns an error, just
+// like SetPath.
+func DeletePath(json string, path []Segment) (string, error) {
+	return SetPath(json, path, dtype{})
+}
+
+// DeletePathBytes deletes a value from json for the specified typed path.
+// If working with bytes, this method preferred over
+// DeletePath(string(data), path)
+func DeletePathBytes(json []byte, path []Segment) ([]byte, error) {
+	return SetPathBytes(json, path, dtype{})
 }
 
 type stringHeader struct {
@@ -666,6 +1010,18 @@ func SetBytesOptions(json []byte, path string, value interface{},
 		optimistic = opts.Optimistic
 		inplace = opts.ReplaceInPlace
 	}
+	return setBytesValue(json, value,
+		func(jstr, raw string, stringify, del bool) ([]byte, error) {
+			return set(jstr, path, raw, stringify, del, optimistic, inplace)
+		})
+}
+
+// setBytesValue marshals value and calls setfn to perform the actual
+// json modification. It is shared by the string path and typed segment
+// path entry points.
+func setBytesValue(json []byte, value interface{},
+	setfn func(jstr, raw string, stringify, del bool) ([]byte, error),
+) ([]byte, error) {
 	jstr := *(*string)(unsafe.Pointer(&json))
 	var res []byte
 	var err error
@@ -676,50 +1032,42 @@ func SetBytesOptions(json []byte, path string, value interface{},
 			return nil, merr
 		}
 		raw := *(*string)(unsafe.Pointer(&b))
-		res, err = set(jstr, path, raw, false, false, optimistic, inplace)
+		res, err = setfn(jstr, raw, false, false)
 	case dtype:
-		res, err = set(jstr, path, "", false, true, optimistic, inplace)
+		res, err = setfn(jstr, "", false, true)
 	case string:
-		res, err = set(jstr, path, v, true, false, optimistic, inplace)
+		res, err = setfn(jstr, v, true, false)
 	case []byte:
 		raw := *(*string)(unsafe.Pointer(&v))
-		res, err = set(jstr, path, raw, true, false, optimistic, inplace)
+		res, err = setfn(jstr, raw, true, false)
 	case bool:
 		if v {
-			res, err = set(jstr, path, "true", false, false, optimistic, inplace)
+			res, err = setfn(jstr, "true", false, false)
 		} else {
-			res, err = set(jstr, path, "false", false, false, optimistic, inplace)
+			res, err = setfn(jstr, "false", false, false)
 		}
 	case int8:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatInt(int64(v), 10), false, false)
 	case int16:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatInt(int64(v), 10), false, false)
 	case int32:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatInt(int64(v), 10), false, false)
 	case int64:
-		res, err = set(jstr, path, strconv.FormatInt(int64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatInt(int64(v), 10), false, false)
 	case uint8:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatUint(uint64(v), 10), false, false)
 	case uint16:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatUint(uint64(v), 10), false, false)
 	case uint32:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatUint(uint64(v), 10), false, false)
 	case uint64:
-		res, err = set(jstr, path, strconv.FormatUint(uint64(v), 10),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatUint(uint64(v), 10), false, false)
 	case float32:
-		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatFloat(float64(v), 'f', -1, 64),
+			false, false)
 	case float64:
-		res, err = set(jstr, path, strconv.FormatFloat(float64(v), 'f', -1, 64),
-			false, false, optimistic, inplace)
+		res, err = setfn(jstr, strconv.FormatFloat(float64(v), 'f', -1, 64),
+			false, false)
 	}
 	if err == errNoChange {
 		return json, nil

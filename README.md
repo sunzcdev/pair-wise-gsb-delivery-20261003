@@ -102,6 +102,41 @@ A colon path would look like:
 "users.:2313.name"    >> "Sara"
 ```
 
+Typed path segments
+-------------------
+
+When the path is already known as a series of components, the `SetPath`,
+`SetPathBytes`, `SetRawPath`, `SetRawPathBytes`, `DeletePath` and
+`DeletePathBytes` functions accept typed segments instead of a dot-syntax
+string. Segments are always interpreted literally and are never parsed as
+a path expression:
+
+```go
+path := []sjson.Segment{
+	sjson.Key("friends"), // literal object key; "0", "a.b", "#" and "" all work
+	sjson.Index(1),       // non-negative array index
+	sjson.Key("last"),
+}
+value, _ := sjson.SetPath(json, path, "Anderson")
+```
+
+Use `sjson.Append()` as a segment to append a new element to an array,
+or to delete its last element with `DeletePath`.
+
+Rules for typed paths:
+
+- Missing parents are created on demand; the next segment decides the
+  container, an object for `Key` and an array for `Index` or `Append`.
+- If an existing node conflicts with the container required by a segment,
+  an error is returned and the document is left unmodified. Existing
+  values, including scalars and null, are never silently replaced by a
+  fresh container.
+- Setting an `Index` past the end of an array extends it with `null`
+  elements up to and including the addressed index.
+- Deleting a path that does not exist (a missing key, an out-of-range
+  index, or `Append` on an empty array) is a no-op that returns the input
+  unchanged with a nil error.
+
 Supported types
 ---------------
 

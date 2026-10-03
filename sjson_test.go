@@ -351,3 +351,142 @@ func TestIssue61(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func testSegmentPath(t *testing.T, kind int, expect, json string,
+	path []Segment, value interface{}) {
+	t.Helper()
+	expect = sortJSON(expect)
+	var json2 string
+	var err error
+	switch kind {
+	default:
+		json2, err = SetPath(json, path, value)
+	case setRaw:
+		json2, err = SetRawPath(json, path, value.(string))
+	case setDelete:
+		json2, err = DeletePath(json, path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sortJSON(json2) != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, sortJSON(json2))
+	}
+	var json3 []byte
+	switch kind {
+	default:
+		json3, err = SetPathBytes([]byte(json), path, value)
+	case setRaw:
+		json3, err = SetRawPathBytes([]byte(json), path,
+			[]byte(value.(string)))
+	case setDelete:
+		json3, err = DeletePathBytes([]byte(json), path)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sortJSON(string(json3)) != expect {
+		t.Fatalf("expected '%v', got '%v'", expect, sortJSON(string(json3)))
+	}
+}
+
+func TestSegmentPaths(t *testing.T) {
+	// basic object traversal
+	testSegmentPath(t, setRaw,
+		`{"name":{"first":"Tom","last":"Anderson"}}`,
+		`{"name":{"first":"Tom"}}`,
+		[]Segment{Key("name"), Key("last")}, `"Anderson"`)
+	// literal keys, including ones that are special to the string syntax
+	testSegmentPath(t, setInt, `{"0":1}`, `{}`,
+		[]Segment{Key("0")}, 1)
+	testSegmentPath(t, setInt, `{"0":2}`, `{"0":1}`,
+		[]Segment{Key("0")}, 2)
+	testSegmentPath(t, setInt, `{"a.b":2}`, `{"a.b":1}`,
+		[]Segment{Key("a.b")}, 2)
+	testSegmentPath(t, setInt, `{"a":{"b":1},"a.b":2}`, `{"a":{"b":1}}`,
+		[]Segment{Key("a.b")}, 2)
+	testSegmentPath(t, setInt, `{"#":3}`, `{"#":1}`,
+		[]Segment{Key("#")}, 3)
+	testSegmentPath(t, setInt, `{"":4}`, `{}`,
+		[]Segment{Key("")}, 4)
+	testSegmentPath(t, setInt, `{"":5}`, `{"":4}`,
+		[]Segment{Key("")}, 5)
+	testSegmentPath(t, setInt, `{"-1":6}`, `{}`,
+		[]Segment{Key("-1")}, 6)
+	// missing parents take the container kind of the next segment
+	testSegmentPath(t, setRaw, `{"a":[null,null,{"b":1}]}`, ``,
+		[]Segment{Key("a"), Index(2), Key("b")}, `1`)
+	testSegmentPath(t, setRaw, `{"a":[{"b":1}]}`, ``,
+		[]Segment{Key("a"), Append(), Key("b")}, `1`)
+	testSegmentPath(t, setRaw, `[{"a":[1]}]`, ``,
+		[]Segment{Append(), Key("a"), Append()}, `1`)
+	// array index padding fills with null
+	testSegmentPath(t, setRaw, `[1,null,null,true]`, `[1]`,
+		[]Segment{Index(3)}, `true`)
+	testSegmentPath(t, setRaw, `[null,null,1]`, ``,
+		[]Segment{Index(2)}, `1`)
+	testSegmentPath(t, setRaw, `[1,true]`, `[1]`,
+		[]Segment{Index(1)}, `true`)
+	// append
+	testSegmentPath(t, setRaw, `[1,2]`, `[1]`, []Segment{Append()}, `2`)
+	testSegmentPath(t, setRaw, `[1]`, ``, []Segment{Append()}, `1`)
+	testSegmentPath(t, setRaw, `{"a":[1,2]}`, `{"a":[1]}`,
+		[]Segment{Key("a"), Append()}, `2`)
+	// delete
+	testSegmentPath(t, setDelete, `[1,3]`, `[1,2,3]`,
+		[]Segment{Index(1)}, nil)
+	testSegmentPath(t, setDelete, `{"a":{}}`, `{"a":{"b":1}}`,
+		[]Segment{Key("a"), Key("b")}, nil)
+	testSegmentPath(t, setDelete, `{"a":{"b":1}}`,
+		`{"a":{"b":1},"a.b":2}`, []Segment{Key("a.b")}, nil)
+	// delete of the Append segment removes the last element
+	testSegmentPath(t, setDelete, `[1,2]`, `[1,2,3]`,
+		[]Segment{Append()}, nil)
+	testSegmentPath(t, setDelete, `{"a":[1]}`, `{"a":[1,2]}`,
+		[]Segment{Key("a"), Append()}, nil)
+	// deleting a path that does not exist is a no-op, not an error
+	testSegmentPath(t, setDelete, `[1,2,3]`, `[1,2,3]`,
+		[]Segment{Index(5)}, nil)
+	testSegmentPath(t, setDelete, `[]`, `[]`, []Segment{Append()}, nil)
+	testSegmentPath(t, setDelete, `{"a":1}`, `{"a":1}`,
+		[]Segment{Key("b")}, nil)
+	testSegmentPath(t, setDelete, `{"a":{}}`, `{"a":{}}`,
+		[]Segment{Key("a"), Key("b")}, nil)
+}
+
+func TestSegmentPathErrors(t *testing.T) {
+	cases := []struct {
+		json string
+		path []Segment
+	}{
+		// array segment on a json object
+		{`{"a":1}`, []Segment{Index(0)}},
+		{`{"a":1}`, []Segment{Append()}},
+		// object key on a json array
+		{`[1,2]`, []Segment{Key("a")}},
+		// nested container conflicts must not replace the old subtree
+		{`{"a":{"b":1}}`, []Segment{Key("a"), Index(0)}},
+		{`{"a":[1]}`, []Segment{Key("a"), Key("b")}},
+		// non-container parents are never replaced
+		{`{"a":5}`, []Segment{Key("a"), Key("b")}},
+		{`{"a":null}`, []Segment{Key("a"), Key("b")}},
+		{`5`, []Segment{Key("a")}},
+		{`"str"`, []Segment{Append()}},
+		// empty path
+		{`{"a":1}`, nil},
+		// negative index
+		{`{"a":1}`, []Segment{Index(-1)}},
+	}
+	for i, c := range cases {
+		if res, err := SetPath(c.json, c.path, 1); err == nil {
+			t.Fatalf("case %d: expected set error for %v", i, c.json)
+		} else if res != c.json {
+			t.Fatalf("case %d: json modified on error: '%v'", i, res)
+		}
+		if res, err := DeletePath(c.json, c.path); err == nil {
+			t.Fatalf("case %d: expected delete error for %v", i, c.json)
+		} else if res != c.json {
+			t.Fatalf("case %d: json modified on error: '%v'", i, res)
+		}
+	}
+}
