@@ -99,7 +99,9 @@ func (c *Credentials) String() string {
 			Value: c.Algorithm,
 		})
 	}
-	if c.QOP != "" {
+	// the cnonce must be sent when a qop is used, and also for sess
+	// algorithms where it is required to derive the session HA1
+	if c.QOP != "" || isSess(c.Algorithm) {
 		pp = append(pp, param.Param{
 			Key:   "cnonce",
 			Value: c.Cnonce,
