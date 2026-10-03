@@ -99,7 +99,8 @@ func (c *Credentials) String() string {
 			Value: c.Algorithm,
 		})
 	}
-	if c.QOP != "" {
+	// cnonce is required with qop, and by *-sess algorithms even without qop
+	if c.Cnonce != "" && (c.QOP != "" || isSessAlgorithm(c.Algorithm)) {
 		pp = append(pp, param.Param{
 			Key:   "cnonce",
 			Value: c.Cnonce,

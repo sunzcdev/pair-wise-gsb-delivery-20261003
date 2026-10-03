@@ -61,7 +61,7 @@ func TestFindChallenge(t *testing.T) {
 	bad1 := &Challenge{
 		Realm:     "test",
 		Nonce:     "kvjkdfjs",
-		Algorithm: "MD5-sess",
+		Algorithm: "MD5-sess-sess",
 		QOP:       []string{"auth"},
 	}
 	good := &Challenge{

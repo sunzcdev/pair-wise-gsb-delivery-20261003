@@ -155,6 +155,89 @@ func TestTransportLive(t *testing.T) {
 	}
 }
 
+func TestTransportSess(t *testing.T) {
+	username := "foo"
+	password := "bar"
+	for _, tc := range []struct {
+		name string
+		algo string
+		qop  []string
+		body bool
+	}{
+		{"md5sess-auth", "MD5-sess", []string{"auth"}, false},
+		{"sha256sess-auth", "SHA-256-sess", []string{"auth"}, false},
+		{"sha512256sess-auth", "SHA-512-256-sess", []string{"auth"}, false},
+		{"sha256sess-noqop", "sha-256-sess", nil, false},
+		{"sha512256sess-authint", "SHA-512-256-sess", []string{"auth-int"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chal := &Challenge{
+				Realm:     "test",
+				Nonce:     "jgdfsijdfisd",
+				Algorithm: tc.algo,
+				QOP:       tc.qop,
+			}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				assert.NilError(t, err)
+				if tc.body {
+					assert.Equal(t, string(body), "The Body")
+				}
+				var authorized bool
+				if auth := r.Header.Get("Authorization"); auth != "" {
+					cred, err := ParseCredentials(auth)
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					// without qop, *-sess still requires a cnonce
+					assert.Assert(t, cred.Cnonce != "", "cnonce must be present")
+					cred2, err := Digest(chal, Options{
+						Method:   r.Method,
+						URI:      r.URL.RequestURI(),
+						Cnonce:   cred.Cnonce,
+						Count:    cred.Nc,
+						Username: username,
+						Password: password,
+						GetBody: func() (io.ReadCloser, error) {
+							return io.NopCloser(strings.NewReader("The Body")), nil
+						},
+					})
+					if err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					authorized = cred.Response == cred2.Response
+				}
+				if !authorized {
+					w.Header().Add("WWW-Authenticate", chal.String())
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				io.WriteString(w, "Hello World")
+			}))
+			defer ts.Close()
+			client := http.Client{
+				Transport: &Transport{Username: username, Password: password},
+			}
+			var req *http.Request
+			var err error
+			if tc.body {
+				req, err = http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("The Body"))
+			} else {
+				req, err = http.NewRequest(http.MethodGet, ts.URL, nil)
+			}
+			assert.NilError(t, err)
+			res, err := client.Do(req)
+			assert.NilError(t, err)
+			payload, err := io.ReadAll(res.Body)
+			assert.NilError(t, err)
+			res.Body.Close()
+			assert.Equal(t, string(payload), "Hello World")
+		})
+	}
+}
+
 func TestTransportNoChallenge(t *testing.T) {
 	var expired bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
