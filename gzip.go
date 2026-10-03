@@ -36,6 +36,29 @@ const (
 	DefaultMinSize = 1400
 )
 
+// CompletionStats summarizes how a single request was served. It is passed to
+// the callback registered with CompletionCallback exactly once per request,
+// after the response has been fully finalized (including the gzip trailer),
+// even if the handler panicked or hijacked the connection.
+type CompletionStats struct {
+	// UncompressedBytes is the number of bytes accepted from the handler
+	// before any compression was applied.
+	UncompressedBytes int64
+	// WrittenBytes is the number of bytes actually written to the
+	// underlying ResponseWriter. Short writes are only counted by the
+	// number of bytes really accepted, never as complete output.
+	WrittenBytes int64
+	// Encoding is the final Content-Encoding of the response, e.g. "gzip",
+	// or "identity" if the response was not compressed.
+	Encoding string
+	// FirstErr is the first error returned by Write, Flush or Close, if any.
+	FirstErr error
+	// CloseErr is the error returned while finalizing the response (the
+	// deferred Close), if any. This is where gzip trailer write failures
+	// surface, since they can only happen after the handler has returned.
+	CloseErr error
+}
+
 // gzipWriterPools stores a sync.Pool for each compression level for reuse of
 // gzip.Writers. Use poolIndex to covert a compression level to an index into
 // gzipWriterPools.
@@ -86,6 +109,28 @@ type GzipResponseWriter struct {
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+
+	closed            bool  // Close has already finalized this response.
+	uncompressedBytes int64 // Bytes accepted from the handler.
+	writtenBytes      int64 // Bytes actually written to the underlying ResponseWriter.
+	firstErr          error // First error seen by Write, Flush or Close.
+	closeErr          error // Error from the finalizing Close.
+}
+
+// writeCounter wraps an io.Writer, counting the bytes it actually accepts and
+// converting short writes without an error into io.ErrShortWrite.
+type writeCounter struct {
+	w io.Writer
+	n *int64
+}
+
+func (c writeCounter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	*c.n += int64(n)
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
 }
 
 type GzipResponseWriterWithCloseNotify struct {
@@ -98,6 +143,15 @@ func (w GzipResponseWriterWithCloseNotify) CloseNotify() <-chan bool {
 
 // Write appends data to the gzip writer.
 func (w *GzipResponseWriter) Write(b []byte) (int, error) {
+	n, err := w.write(b)
+	w.uncompressedBytes += int64(n)
+	if err != nil {
+		w.recordErr(err)
+	}
+	return n, err
+}
+
+func (w *GzipResponseWriter) write(b []byte) (int, error) {
 	// GZIP responseWriter is initialized. Use the GZIP responseWriter.
 	if w.gw != nil {
 		return w.gw.Write(b)
@@ -105,7 +159,7 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 
 	// If we have already decided not to use GZIP, immediately passthrough.
 	if w.ignore {
-		return w.ResponseWriter.Write(b)
+		return w.writeUnderlying(b)
 	}
 
 	// Save the write into a buffer for later use in GZIP responseWriter (if content is long enough) or at close with regular responseWriter.
@@ -194,15 +248,39 @@ func (w *GzipResponseWriter) startPlain() error {
 	if w.buf == nil {
 		return nil
 	}
-	n, err := w.ResponseWriter.Write(w.buf)
+	buf := w.buf
 	w.buf = nil
-	// This should never happen (per io.Writer docs), but if the write didn't
-	// accept the entire buffer but returned no specific error, we have no clue
-	// what's going on, so abort just to be safe.
-	if err == nil && n < len(w.buf) {
-		err = io.ErrShortWrite
-	}
+	_, err := w.writeUnderlying(buf)
 	return err
+}
+
+// writeUnderlying writes to the underlying ResponseWriter, tracking the number
+// of bytes it actually accepts. A short write without an error is reported as
+// io.ErrShortWrite instead of being treated as complete output.
+func (w *GzipResponseWriter) writeUnderlying(b []byte) (int, error) {
+	return writeCounter{w.ResponseWriter, &w.writtenBytes}.Write(b)
+}
+
+// recordErr saves the first error seen by Write, Flush or Close.
+func (w *GzipResponseWriter) recordErr(err error) {
+	if w.firstErr == nil {
+		w.firstErr = err
+	}
+}
+
+// completionStats snapshots the final outcome of the response.
+func (w *GzipResponseWriter) completionStats() CompletionStats {
+	encoding := w.Header().Get(contentEncoding)
+	if encoding == "" {
+		encoding = "identity"
+	}
+	return CompletionStats{
+		UncompressedBytes: w.uncompressedBytes,
+		WrittenBytes:      w.writtenBytes,
+		Encoding:          encoding,
+		FirstErr:          w.firstErr,
+		CloseErr:          w.closeErr,
+	}
 }
 
 // WriteHeader just saves the response code until close or GZIP effective writes.
@@ -218,29 +296,39 @@ func (w *GzipResponseWriter) init() {
 	// Bytes written during ServeHTTP are redirected to this gzip writer
 	// before being written to the underlying response.
 	gzw := gzipWriterPools[w.index].Get().(*gzip.Writer)
-	gzw.Reset(w.ResponseWriter)
+	gzw.Reset(writeCounter{w.ResponseWriter, &w.writtenBytes})
 	w.gw = gzw
 }
 
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
+// It is idempotent: the gzip.Writer is returned to the pool at most once, no
+// matter how many times Close is called.
 func (w *GzipResponseWriter) Close() error {
-	if w.ignore {
-		return nil
+	if w.closed {
+		return w.closeErr
 	}
+	w.closed = true
 
-	if w.gw == nil {
+	var err error
+	if w.ignore {
+		// Nothing to finalize.
+	} else if w.gw == nil {
 		// GZIP not triggered yet, write out regular response.
-		err := w.startPlain()
+		err = w.startPlain()
 		// Returns the error if any at write.
 		if err != nil {
 			err = fmt.Errorf("gziphandler: write to regular responseWriter at close gets error: %q", err.Error())
 		}
-		return err
+	} else {
+		err = w.gw.Close()
+		gzipWriterPools[w.index].Put(w.gw)
+		w.gw = nil
 	}
 
-	err := w.gw.Close()
-	gzipWriterPools[w.index].Put(w.gw)
-	w.gw = nil
+	w.closeErr = err
+	if err != nil {
+		w.recordErr(err)
+	}
 	return err
 }
 
@@ -257,7 +345,9 @@ func (w *GzipResponseWriter) Flush() {
 	}
 
 	if w.gw != nil {
-		w.gw.Flush()
+		if err := w.gw.Flush(); err != nil {
+			w.recordErr(err)
+		}
 	}
 
 	if fw, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -329,7 +419,12 @@ func GzipHandlerWithOpts(opts ...option) (func(http.Handler) http.Handler, error
 					minSize:        c.minSize,
 					contentTypes:   c.contentTypes,
 				}
-				defer gw.Close()
+				defer func() {
+					gw.Close()
+					if c.onComplete != nil {
+						c.onComplete(gw.completionStats())
+					}
+				}()
 
 				if _, ok := w.(http.CloseNotifier); ok {
 					gwcn := GzipResponseWriterWithCloseNotify{gw}
@@ -379,6 +474,7 @@ type config struct {
 	minSize      int
 	level        int
 	contentTypes []parsedContentType
+	onComplete   func(CompletionStats)
 }
 
 func (c *config) validate() error {
@@ -404,6 +500,17 @@ func MinSize(size int) option {
 func CompressionLevel(level int) option {
 	return func(c *config) {
 		c.level = level
+	}
+}
+
+// CompletionCallback registers a callback that is invoked exactly once per
+// request, after the response has been fully finalized. It runs even if the
+// handler panics (the panic still propagates) or hijacks the connection, and
+// it reports errors that only surface after the handler has returned, such as
+// a failing gzip trailer write.
+func CompletionCallback(cb func(CompletionStats)) option {
+	return func(c *config) {
+		c.onComplete = cb
 	}
 }
 

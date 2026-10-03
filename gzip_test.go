@@ -1,8 +1,10 @@
 package gziphandler
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -490,6 +492,256 @@ func TestIgnoreSubsequentWriteHeader(t *testing.T) {
 	if result.StatusCode != 500 {
 		t.Errorf("StatusCode should have been 500 but was %d", result.StatusCode)
 	}
+}
+
+var errInjected = errors.New("injected write failure")
+
+// failAfterWriter allows allow successful writes and fails every write after
+// that. A negative allow means writes never fail.
+type failAfterWriter struct {
+	header http.Header
+	allow  int
+	writes int
+}
+
+func newFailAfterWriter(allow int) *failAfterWriter {
+	return &failAfterWriter{header: http.Header{}, allow: allow}
+}
+
+func (w *failAfterWriter) Header() http.Header { return w.header }
+
+func (w *failAfterWriter) WriteHeader(int) {}
+
+func (w *failAfterWriter) Write(b []byte) (int, error) {
+	w.writes++
+	if w.allow >= 0 && w.writes > w.allow {
+		return 0, errInjected
+	}
+	return len(b), nil
+}
+
+func newGzipRequest() *http.Request {
+	r := httptest.NewRequest("GET", "/", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	return r
+}
+
+func TestCompletionCallbackNormal(t *testing.T) {
+	var calls int
+	var stats CompletionStats
+	wrapper, err := GzipHandlerWithOpts(CompletionCallback(func(s CompletionStats) {
+		calls++
+		stats = s
+	}))
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, testBody)
+	}))
+
+	rw := newFailAfterWriter(-1)
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(len(testBody)), stats.UncompressedBytes)
+	assert.Equal(t, int64(len(gzipStrLevel(testBody, gzip.DefaultCompression))), stats.WrittenBytes)
+	assert.Equal(t, "gzip", stats.Encoding)
+	assert.Nil(t, stats.FirstErr)
+	assert.Nil(t, stats.CloseErr)
+}
+
+func TestCompletionCallbackPlainResponse(t *testing.T) {
+	var calls int
+	var stats CompletionStats
+	wrapper, err := GzipHandlerWithOpts(CompletionCallback(func(s CompletionStats) {
+		calls++
+		stats = s
+	}))
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, smallTestBody)
+	}))
+
+	rw := newFailAfterWriter(-1)
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(len(smallTestBody)), stats.UncompressedBytes)
+	assert.Equal(t, int64(len(smallTestBody)), stats.WrittenBytes)
+	assert.Equal(t, "identity", stats.Encoding)
+	assert.Nil(t, stats.FirstErr)
+	assert.Nil(t, stats.CloseErr)
+}
+
+func TestCompletionCallbackTrailerFailure(t *testing.T) {
+	// Allow only the gzip header write during the handler; the writes
+	// flushing the compressed data and trailer at Close fail.
+	var calls int
+	var stats CompletionStats
+	wrapper, err := GzipHandlerWithOpts(
+		MinSize(1),
+		CompletionCallback(func(s CompletionStats) {
+			calls++
+			stats = s
+		}),
+	)
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := io.WriteString(w, "test")
+		assert.Equal(t, len("test"), n)
+		assert.Nil(t, err)
+	}))
+
+	rw := newFailAfterWriter(1)
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(len("test")), stats.UncompressedBytes)
+	assert.Equal(t, "gzip", stats.Encoding)
+	assert.Equal(t, errInjected, stats.FirstErr)
+	assert.Equal(t, errInjected, stats.CloseErr)
+	// Only the gzip header made it out before the failure.
+	assert.True(t, stats.WrittenBytes > 0)
+	assert.True(t, stats.WrittenBytes < int64(len(gzipStrLevel("test", gzip.DefaultCompression))))
+}
+
+func TestCompletionCallbackEarlyWriteFailure(t *testing.T) {
+	// Fail every write, so the handler's first Write already fails.
+	var calls int
+	var stats CompletionStats
+	wrapper, err := GzipHandlerWithOpts(
+		MinSize(1),
+		CompletionCallback(func(s CompletionStats) {
+			calls++
+			stats = s
+		}),
+	)
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.WriteString(w, "test")
+		assert.Equal(t, errInjected, err)
+	}))
+
+	rw := newFailAfterWriter(0)
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, int64(0), stats.UncompressedBytes)
+	assert.Equal(t, int64(0), stats.WrittenBytes)
+	assert.Equal(t, errInjected, stats.FirstErr)
+	assert.Equal(t, errInjected, stats.CloseErr)
+}
+
+func TestCompletionCallbackPanic(t *testing.T) {
+	var calls int
+	wrapper, err := GzipHandlerWithOpts(CompletionCallback(func(s CompletionStats) {
+		calls++
+	}))
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, testBody)
+		panic("boom")
+	}))
+
+	defer func() {
+		r := recover()
+		assert.Equal(t, "boom", r)
+		assert.Equal(t, 1, calls)
+	}()
+	handler.ServeHTTP(httptest.NewRecorder(), newGzipRequest())
+}
+
+type hijackableResponseWriter struct {
+	header   http.Header
+	hijacked bool
+}
+
+func (w *hijackableResponseWriter) Header() http.Header { return w.header }
+
+func (w *hijackableResponseWriter) WriteHeader(int) {}
+
+func (w *hijackableResponseWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+func (w *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	return nil, nil, nil
+}
+
+func TestCompletionCallbackHijack(t *testing.T) {
+	var calls int
+	wrapper, err := GzipHandlerWithOpts(CompletionCallback(func(s CompletionStats) {
+		calls++
+	}))
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _, err := w.(http.Hijacker).Hijack()
+		assert.Nil(t, err)
+	}))
+
+	rw := &hijackableResponseWriter{header: http.Header{}}
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.True(t, rw.hijacked)
+	assert.Equal(t, 1, calls)
+}
+
+// shortWriter accepts all but the last byte of every write without an error.
+type shortWriter struct {
+	header http.Header
+	total  int
+}
+
+func (w *shortWriter) Header() http.Header { return w.header }
+
+func (w *shortWriter) WriteHeader(int) {}
+
+func (w *shortWriter) Write(b []byte) (int, error) {
+	n := len(b) - 1
+	if n < 0 {
+		n = 0
+	}
+	w.total += n
+	return n, nil
+}
+
+func TestCompletionCallbackShortWrite(t *testing.T) {
+	var calls int
+	var stats CompletionStats
+	wrapper, err := GzipHandlerWithOpts(
+		MinSize(1),
+		CompletionCallback(func(s CompletionStats) {
+			calls++
+			stats = s
+		}),
+	)
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "test")
+	}))
+
+	rw := &shortWriter{header: http.Header{}}
+	handler.ServeHTTP(rw, newGzipRequest())
+
+	assert.Equal(t, 1, calls)
+	// A short write must surface as io.ErrShortWrite, not count as full output.
+	assert.Equal(t, io.ErrShortWrite, stats.FirstErr)
+	assert.Equal(t, int64(rw.total), stats.WrittenBytes)
+	assert.True(t, stats.WrittenBytes < int64(len(gzipStrLevel("test", gzip.DefaultCompression))))
+}
+
+func TestCompletionCallbackRunsOnceOnDoubleClose(t *testing.T) {
+	var calls int
+	wrapper, err := GzipHandlerWithOpts(CompletionCallback(func(s CompletionStats) {
+		calls++
+	}))
+	assert.Nil(t, err)
+	handler := wrapper(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, testBody)
+		w.(io.Closer).Close()
+	}))
+
+	handler.ServeHTTP(httptest.NewRecorder(), newGzipRequest())
+
+	assert.Equal(t, 1, calls)
 }
 
 func TestDontWriteWhenNotWrittenTo(t *testing.T) {
