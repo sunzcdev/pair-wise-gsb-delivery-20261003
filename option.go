@@ -13,6 +13,22 @@ func WithModuleLoader(moduleLoader ModuleLoader) CompilerOption {
 	}
 }
 
+// WithDependencyManifest is a compiler option to record or lock the
+// dependencies (jq modules and JSON data) actually loaded while compiling
+// the query. Pass an empty manifest created with
+// [NewDependencyManifest] to record the loaded dependencies, and pass a
+// manifest deserialized from a recorded one (for example with
+// json.Unmarshal) to lock them: the compilation fails when a dependency is
+// missing from the lock, its source or content has changed, or a locked
+// dependency is not used by the query. The module loader must implement the
+// evidence methods (see [ModuleLoader]) when this option is used; otherwise
+// the compilation reports that the dependencies cannot be locked.
+func WithDependencyManifest(manifest *DependencyManifest) CompilerOption {
+	return func(c *compiler) {
+		c.dependencyManifest = manifest
+	}
+}
+
 // WithEnvironLoader is a compiler option for environment variables loader.
 // The OS environment variables are not accessible by default due to security
 // reasons. You can specify [os.Environ] as argument if you allow to access.

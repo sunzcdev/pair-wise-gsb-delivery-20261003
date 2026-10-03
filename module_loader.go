@@ -1,6 +1,7 @@
 package gojq
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,7 +19,55 @@ import (
 //	LoadModuleWithMeta(string, map[string]any) (*Query, error)
 //	LoadJSON(string) (any, error)
 //	LoadJSONWithMeta(string, map[string]any) (any, error)
+//
+// When compiling with [WithDependencyManifest], implement the evidence
+// methods instead, so that the compiler can record the real loaded source
+// path and raw content and lock future compilations against them:
+//
+//	LoadInitModulesWithEvidence() ([]*ModuleInitEvidence, error)
+//	LoadModuleWithEvidence(string, map[string]any) (*ModuleEvidence, error)
+//	LoadJSONWithEvidence(string, map[string]any) (*JSONEvidence, error)
+//
+// Without the evidence methods, a compilation with a dependency manifest
+// fails because the dependencies cannot be locked.
 type ModuleLoader any
+
+// ModuleInitEvidence is an initialization module loaded with its content,
+// returned by LoadInitModulesWithEvidence of a [ModuleLoader].
+type ModuleInitEvidence struct {
+	// Query is the parsed initialization module.
+	Query *Query
+	// Source is the canonical source identifier of the module, such as an
+	// absolute file path.
+	Source string
+	// Content is the raw module content used for parsing Query.
+	Content []byte
+}
+
+// ModuleEvidence is a jq module loaded with its content, returned by
+// LoadModuleWithEvidence of a [ModuleLoader].
+type ModuleEvidence struct {
+	// Query is the parsed module.
+	Query *Query
+	// Source is the canonical source identifier of the module, such as an
+	// absolute file path.
+	Source string
+	// Content is the raw module content used for parsing Query.
+	Content []byte
+}
+
+// JSONEvidence is a JSON data file loaded with its content, returned by
+// LoadJSONWithEvidence of a [ModuleLoader].
+type JSONEvidence struct {
+	// Value is the decoded JSON value (a slice of the decoded values
+	// when the file contains concatenated JSON values).
+	Value any
+	// Source is the canonical source identifier of the data, such as an
+	// absolute file path.
+	Source string
+	// Content is the raw file content decoded into Value.
+	Content []byte
+}
 
 // NewModuleLoader creates a new [ModuleLoader] loading local modules in the paths.
 // Note that user can load modules outside the paths using "search" path of metadata.
@@ -38,10 +87,26 @@ type moduleLoader struct {
 }
 
 func (l *moduleLoader) LoadInitModules() ([]*Query, error) {
-	var qs []*Query
+	es, err := l.LoadInitModulesWithEvidence()
+	if err != nil {
+		return nil, err
+	}
+	qs := make([]*Query, 0, len(es))
+	for _, e := range es {
+		qs = append(qs, e.Query)
+	}
+	return qs, nil
+}
+
+func (l *moduleLoader) LoadInitModulesWithEvidence() ([]*ModuleInitEvidence, error) {
+	var es []*ModuleInitEvidence
 	for _, path := range l.paths {
 		if filepath.Base(path) != ".jq" {
 			continue
+		}
+		source := path
+		if abs, err := filepath.Abs(path); err == nil {
+			source = abs
 		}
 		fi, err := os.Stat(path)
 		if err != nil {
@@ -61,15 +126,31 @@ func (l *moduleLoader) LoadInitModules() ([]*Query, error) {
 		if err != nil {
 			return nil, &queryParseError{path, string(cnt), err}
 		}
-		qs = append(qs, q)
+		es = append(es, &ModuleInitEvidence{
+			Query:   q,
+			Source:  source,
+			Content: cnt,
+		})
 	}
-	return qs, nil
+	return es, nil
 }
 
 func (l *moduleLoader) LoadModuleWithMeta(name string, meta map[string]any) (*Query, error) {
+	e, err := l.LoadModuleWithEvidence(name, meta)
+	if err != nil {
+		return nil, err
+	}
+	return e.Query, nil
+}
+
+func (l *moduleLoader) LoadModuleWithEvidence(name string, meta map[string]any) (*ModuleEvidence, error) {
 	path, err := l.lookupModule(name, ".jq", meta)
 	if err != nil {
 		return nil, err
+	}
+	source := path
+	if abs, err := filepath.Abs(path); err == nil {
+		source = abs
 	}
 	cnt, err := os.ReadFile(path)
 	if err != nil {
@@ -79,21 +160,37 @@ func (l *moduleLoader) LoadModuleWithMeta(name string, meta map[string]any) (*Qu
 	if err != nil {
 		return nil, &queryParseError{path, string(cnt), err}
 	}
-	return q, nil
+	return &ModuleEvidence{Query: q, Source: source, Content: cnt}, nil
 }
 
 func (l *moduleLoader) LoadJSONWithMeta(name string, meta map[string]any) (any, error) {
+	e, err := l.LoadJSONWithEvidence(name, meta)
+	if err != nil {
+		return nil, err
+	}
+	return e.Value, nil
+}
+
+func (l *moduleLoader) LoadJSONWithEvidence(name string, meta map[string]any) (*JSONEvidence, error) {
 	path, err := l.lookupModule(name, ".json", meta)
 	if err != nil {
 		return nil, err
+	}
+	source := path
+	if abs, err := filepath.Abs(path); err == nil {
+		source = abs
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	cnt, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
 	vals := []any{}
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(bytes.NewReader(cnt))
 	dec.UseNumber()
 	for {
 		var val any
@@ -101,18 +198,11 @@ func (l *moduleLoader) LoadJSONWithMeta(name string, meta map[string]any) (any, 
 			if err == io.EOF {
 				break
 			}
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return nil, err
-			}
-			cnt, er := io.ReadAll(f)
-			if er != nil {
-				return nil, er
-			}
 			return nil, &jsonParseError{path, string(cnt), err}
 		}
 		vals = append(vals, val)
 	}
-	return vals, nil
+	return &JSONEvidence{Value: vals, Source: source, Content: cnt}, nil
 }
 
 func (l *moduleLoader) lookupModule(name, extension string, meta map[string]any) (string, error) {

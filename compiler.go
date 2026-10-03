@@ -12,17 +12,18 @@ import (
 )
 
 type compiler struct {
-	moduleLoader  ModuleLoader
-	environLoader func() []string
-	variables     []string
-	customFuncs   map[string]function
-	inputIter     Iter
-	codes         []*code
-	codeinfos     []codeinfo
-	builtinScope  *scopeinfo
-	scopes        []*scopeinfo
-	scopecnt      int
-	regexpCache   sync.Map
+	moduleLoader       ModuleLoader
+	dependencyManifest *DependencyManifest
+	environLoader      func() []string
+	variables          []string
+	customFuncs        map[string]function
+	inputIter          Iter
+	codes              []*code
+	codeinfos          []codeinfo
+	builtinScope       *scopeinfo
+	scopes             []*scopeinfo
+	scopecnt           int
+	regexpCache        sync.Map
 }
 
 // Code is a compiled jq query.
@@ -91,17 +92,13 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 		c.append(&code{op: opstore, v: c.pushVariable(name)})
 	}
 	if c.moduleLoader != nil {
-		if moduleLoader, ok := c.moduleLoader.(interface {
-			LoadInitModules() ([]*Query, error)
-		}); ok {
-			qs, err := moduleLoader.LoadInitModules()
-			if err != nil {
+		qs, err := c.loadInitModules()
+		if err != nil {
+			return nil, err
+		}
+		for _, q := range qs {
+			if err := c.compileModule(q, ""); err != nil {
 				return nil, err
-			}
-			for _, q := range qs {
-				if err := c.compileModule(q, ""); err != nil {
-					return nil, err
-				}
 			}
 		}
 	}
@@ -111,6 +108,9 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 	setscope()
 	c.optimizeTailRec()
 	c.optimizeCodeOps()
+	if err := c.finishDependencyManifest(); err != nil {
+		return nil, err
+	}
 	return &Code{
 		variables: c.variables,
 		codes:     c.codes,
@@ -131,28 +131,66 @@ func (c *compiler) compile(q *Query) error {
 	return nil
 }
 
+func (c *compiler) loadInitModules() ([]*Query, error) {
+	if c.dependencyManifest != nil {
+		if moduleLoader, ok := c.moduleLoader.(interface {
+			LoadInitModulesWithEvidence() ([]*ModuleInitEvidence, error)
+		}); ok {
+			es, err := moduleLoader.LoadInitModulesWithEvidence()
+			if err != nil {
+				return nil, err
+			}
+			qs := make([]*Query, 0, len(es))
+			for _, e := range es {
+				if e == nil || e.Query == nil {
+					continue
+				}
+				if err := c.recordDependency(Dependency{
+					Kind:   DependencyInitModule,
+					Source: e.Source,
+				}, e.Content); err != nil {
+					return nil, err
+				}
+				qs = append(qs, e.Query)
+			}
+			return qs, nil
+		}
+		// Loaders without initialization modules do not need to implement
+		// the evidence method. If the loader does return init modules,
+		// they cannot be locked without evidence.
+		if moduleLoader, ok := c.moduleLoader.(interface {
+			LoadInitModules() ([]*Query, error)
+		}); ok {
+			qs, err := moduleLoader.LoadInitModules()
+			if err != nil {
+				return nil, err
+			}
+			if len(qs) > 0 {
+				return nil, &dependencyEvidenceError{
+					loader: loaderTypeName(c.moduleLoader),
+					dep:    Dependency{Kind: DependencyInitModule},
+				}
+			}
+		}
+		return nil, nil
+	}
+	if moduleLoader, ok := c.moduleLoader.(interface {
+		LoadInitModules() ([]*Query, error)
+	}); ok {
+		return moduleLoader.LoadInitModules()
+	}
+	return nil, nil
+}
+
 func (c *compiler) compileImport(i *Import) error {
 	path, alias := cmp.Or(i.ImportPath, i.IncludePath), i.ImportAlias
 	if c.moduleLoader == nil {
 		return fmt.Errorf("cannot load module: %q", path)
 	}
 	if strings.HasPrefix(alias, "$") {
-		var vals any
-		var err error
-		if moduleLoader, ok := c.moduleLoader.(interface {
-			LoadJSONWithMeta(string, map[string]any) (any, error)
-		}); ok {
-			if vals, err = moduleLoader.LoadJSONWithMeta(path, i.Meta.ToValue()); err != nil {
-				return err
-			}
-		} else if moduleLoader, ok := c.moduleLoader.(interface {
-			LoadJSON(string) (any, error)
-		}); ok {
-			if vals, err = moduleLoader.LoadJSON(path); err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("module not found: %q", path)
+		vals, err := c.loadJSON(path, i.Meta.ToValue())
+		if err != nil {
+			return err
 		}
 		c.append(&code{op: oppush, v: vals})
 		c.append(&code{op: opstore, v: c.pushVariable(alias)})
@@ -160,20 +198,9 @@ func (c *compiler) compileImport(i *Import) error {
 		c.append(&code{op: opstore, v: c.pushVariable(alias + "::" + alias[1:])})
 		return nil
 	}
-	var q *Query
-	var err error
-	if moduleLoader, ok := c.moduleLoader.(interface {
-		LoadModuleWithMeta(string, map[string]any) (*Query, error)
-	}); ok {
-		if q, err = moduleLoader.LoadModuleWithMeta(path, i.Meta.ToValue()); err != nil {
-			return err
-		}
-	} else if moduleLoader, ok := c.moduleLoader.(interface {
-		LoadModule(string) (*Query, error)
-	}); ok {
-		if q, err = moduleLoader.LoadModule(path); err != nil {
-			return err
-		}
+	q, err := c.loadModule(path, i.Meta.ToValue())
+	if err != nil {
+		return err
 	}
 	c.appendCodeInfo("module " + path)
 	if err = c.compileModule(q, alias); err != nil {
@@ -181,6 +208,80 @@ func (c *compiler) compileImport(i *Import) error {
 	}
 	c.appendCodeInfo("end of module " + path)
 	return nil
+}
+
+func (c *compiler) loadModule(name string, meta map[string]any) (*Query, error) {
+	dep := Dependency{Kind: DependencyModule, Name: name}
+	if c.dependencyManifest != nil {
+		if moduleLoader, ok := c.moduleLoader.(interface {
+			LoadModuleWithEvidence(string, map[string]any) (*ModuleEvidence, error)
+		}); ok {
+			e, err := moduleLoader.LoadModuleWithEvidence(name, meta)
+			if err != nil {
+				return nil, err
+			}
+			if e == nil || e.Query == nil {
+				return nil, fmt.Errorf("module not found: %q", name)
+			}
+			dep.Source = e.Source
+			if err := c.recordDependency(dep, e.Content); err != nil {
+				return nil, err
+			}
+			return e.Query, nil
+		}
+		return nil, &dependencyEvidenceError{
+			loader: loaderTypeName(c.moduleLoader),
+			dep:    dep,
+		}
+	}
+	if moduleLoader, ok := c.moduleLoader.(interface {
+		LoadModuleWithMeta(string, map[string]any) (*Query, error)
+	}); ok {
+		return moduleLoader.LoadModuleWithMeta(name, meta)
+	}
+	if moduleLoader, ok := c.moduleLoader.(interface {
+		LoadModule(string) (*Query, error)
+	}); ok {
+		return moduleLoader.LoadModule(name)
+	}
+	return nil, nil
+}
+
+func (c *compiler) loadJSON(name string, meta map[string]any) (any, error) {
+	dep := Dependency{Kind: DependencyJSON, Name: name}
+	if c.dependencyManifest != nil {
+		if moduleLoader, ok := c.moduleLoader.(interface {
+			LoadJSONWithEvidence(string, map[string]any) (*JSONEvidence, error)
+		}); ok {
+			e, err := moduleLoader.LoadJSONWithEvidence(name, meta)
+			if err != nil {
+				return nil, err
+			}
+			if e == nil {
+				return nil, fmt.Errorf("module not found: %q", name)
+			}
+			dep.Source = e.Source
+			if err := c.recordDependency(dep, e.Content); err != nil {
+				return nil, err
+			}
+			return e.Value, nil
+		}
+		return nil, &dependencyEvidenceError{
+			loader: loaderTypeName(c.moduleLoader),
+			dep:    dep,
+		}
+	}
+	if moduleLoader, ok := c.moduleLoader.(interface {
+		LoadJSONWithMeta(string, map[string]any) (any, error)
+	}); ok {
+		return moduleLoader.LoadJSONWithMeta(name, meta)
+	}
+	if moduleLoader, ok := c.moduleLoader.(interface {
+		LoadJSON(string) (any, error)
+	}); ok {
+		return moduleLoader.LoadJSON(name)
+	}
+	return nil, fmt.Errorf("module not found: %q", name)
 }
 
 func (c *compiler) compileModule(q *Query, alias string) error {
