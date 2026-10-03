@@ -4,6 +4,8 @@ package nosurf
 
 import (
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -21,6 +23,19 @@ const (
 
 	// Max-Age in seconds for the default base cookie. 365 days.
 	MaxAge = 365 * 24 * 60 * 60
+
+	// MaxFormBytes is the maximum size, in bytes, of a
+	// URL-encoded request body that will be read while looking
+	// for the CSRF token in the form. Requests with a larger
+	// body fail the CSRF check with ErrFormTooLarge.
+	MaxFormBytes = 10 << 20 // 10 MB
+
+	// MaxMultipartMemory is the maximum number of bytes of a
+	// multipart/form-data request body that will be held in
+	// memory while looking for the CSRF token in the form.
+	// File parts beyond this threshold are stored in temporary
+	// files on disk (see the note on extractToken).
+	MaxMultipartMemory = 32 << 20 // 32 MB
 )
 
 var safeMethods = []string{"GET", "HEAD", "OPTIONS", "TRACE"}
@@ -33,6 +48,17 @@ var (
 	ErrBadOrigin = errors.New("Request was made with a disallowed origin specified in the Origin header")
 	ErrBadToken  = errors.New("The CSRF token in the cookie doesn't match the one" +
 		" received in a form/header.")
+
+	// The request body was larger than MaxFormBytes while
+	// extracting the CSRF token from a URL-encoded form.
+	ErrFormTooLarge = errors.New("The request body exceeds the limit" +
+		" for CSRF token extraction")
+	// The request body could not be read while
+	// extracting the CSRF token from the form.
+	ErrFormRead = errors.New("The request body could not be read" +
+		" while extracting the CSRF token")
+	// The request body is not a syntactically valid form.
+	ErrBadForm = errors.New("The request body could not be parsed as a form")
 
 	// Internal error. When this is raised, and the request is secure, we additionally check for Referer.
 	errNoOrigin = errors.New("Origin header was not present")
@@ -70,18 +96,34 @@ func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Extracts the "sent" token from the request
-// and returns an unmasked version of it
-func extractToken(r *http.Request) []byte {
-	// Prefer the header over form value
-	sentToken := r.Header.Get(HeaderName)
-
-	// Then POST values
-	if len(sentToken) == 0 {
-		sentToken = r.PostFormValue(FormFieldName)
+// and returns an unmasked version of it.
+//
+// If the token is given in the HeaderName header, the request body
+// is never read, so e.g. a file upload is not consumed just to look
+// for a form token. Otherwise the body is parsed as a form, subject
+// to the MaxFormBytes and MaxMultipartMemory budgets, and failures
+// to read or parse it are reported as an error distinct from
+// ErrBadToken.
+//
+// Temporary files created while parsing a multipart form belong to
+// r.MultipartForm and are NOT removed here: downstream handlers may
+// still need them. For requests served by net/http, the server
+// removes them automatically after the handler returns; any other
+// caller owns the cleanup via r.MultipartForm.RemoveAll().
+func extractToken(r *http.Request) ([]byte, error) {
+	// Prefer the header over the form value.
+	if sentToken := r.Header.Get(HeaderName); sentToken != "" {
+		return b64decode(sentToken), nil
 	}
 
+	if err := parseForm(r); err != nil {
+		return nil, err
+	}
+
+	// Then POST values
+	sentToken := r.PostForm.Get(FormFieldName)
+
 	// If all else fails, try a multipart value.
-	// PostFormValue() will already have called ParseMultipartForm()
 	if len(sentToken) == 0 && r.MultipartForm != nil {
 		vals := r.MultipartForm.Value[FormFieldName]
 		if len(vals) != 0 {
@@ -89,7 +131,81 @@ func extractToken(r *http.Request) []byte {
 		}
 	}
 
-	return b64decode(sentToken)
+	return b64decode(sentToken), nil
+}
+
+// parseForm makes the form values of r available for token
+// extraction, reading the request body if necessary.
+//
+// The body is only read for form content types and only within the
+// MaxFormBytes / MaxMultipartMemory budgets. If the form has already
+// been parsed (e.g. by a middleware that ran before CSRFHandler),
+// the existing values are reused and the body is left alone.
+func parseForm(r *http.Request) error {
+	if r.PostForm != nil || r.MultipartForm != nil {
+		// The form has already been parsed.
+		return nil
+	}
+	if r.Body == nil {
+		return nil
+	}
+
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		// Not a (valid) form content type: the token, if any,
+		// can't be in the body, so don't read it.
+		return nil
+	}
+
+	switch mediaType {
+	case "application/x-www-form-urlencoded":
+		return parseURLEncodedForm(r)
+	case "multipart/form-data":
+		if err := r.ParseMultipartForm(MaxMultipartMemory); err != nil {
+			return ErrBadForm
+		}
+	}
+
+	return nil
+}
+
+// parseURLEncodedForm reads r.Body up to MaxFormBytes and parses it
+// as a URL-encoded form, mirroring what net/http's ParseForm does,
+// but with an explicit read budget and distinct errors for
+// over-limit, unreadable and malformed bodies.
+func parseURLEncodedForm(r *http.Request) error {
+	if r.ContentLength > MaxFormBytes {
+		return ErrFormTooLarge
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, MaxFormBytes+1))
+	if err != nil {
+		return ErrFormRead
+	}
+	if int64(len(body)) > MaxFormBytes {
+		return ErrFormTooLarge
+	}
+
+	vals, err := url.ParseQuery(string(body))
+	if err != nil {
+		return ErrBadForm
+	}
+
+	r.PostForm = vals
+
+	// Mirror net/http: r.Form holds both the body parameters and
+	// the URL query, with the body taking precedence.
+	r.Form = make(url.Values, len(r.PostForm))
+	for k, v := range r.PostForm {
+		r.Form[k] = v
+	}
+	for k, v := range r.URL.Query() {
+		if _, ok := r.Form[k]; !ok {
+			r.Form[k] = v
+		}
+	}
+
+	return nil
 }
 
 // Constructs a new CSRFHandler that calls
@@ -159,7 +275,12 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Finally, we check the token itself.
-	sentToken := extractToken(r)
+	sentToken, err := extractToken(r)
+	if err != nil {
+		ctxSetReason(r, err)
+		h.handleFailure(w, r)
+		return
+	}
 
 	if !verifyToken(realToken, sentToken) {
 		ctxSetReason(r, ErrBadToken)

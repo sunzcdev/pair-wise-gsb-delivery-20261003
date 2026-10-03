@@ -101,6 +101,27 @@ verification by using one of the exemption methods:
 Later on, the token **must** be verified by manually getting the token from the cookie
 and providing the token sent in body through: `VerifyToken(tkn, tkn2 string) bool`.
 
+### Form parsing limits
+
+When the token is sent in the `X-CSRF-Token` header, `nosurf` never reads
+the request body. Otherwise it parses the body as a form to find the token,
+within an explicit read budget:
+
+* URL-encoded bodies are read up to `MaxFormBytes` (10 MB).
+* Multipart bodies are parsed with at most `MaxMultipartMemory` (32 MB)
+held in memory; larger file parts spill to temporary files on disk.
+
+Temporary files created while parsing a multipart form belong to
+`r.MultipartForm` and are never removed by `nosurf` itself, so wrapped
+handlers can still use them. For requests served by `net/http`, the server
+removes them automatically after the handler returns; other callers own
+the cleanup via `r.MultipartForm.RemoveAll()`.
+
+If the body exceeds the limit, cannot be read, or is not a valid form,
+the CSRF check fails with `ErrFormTooLarge`, `ErrFormRead` or `ErrBadForm`
+respectively (available via `nosurf.Reason(r)` in the failure handler),
+instead of the usual `ErrBadToken`.
+
 Example:
 ```go
 func HandleJson(w http.ResponseWriter, r *http.Request) {
