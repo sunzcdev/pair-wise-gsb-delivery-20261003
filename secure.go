@@ -74,6 +74,8 @@ type Options struct {
 	STSIncludeSubdomains bool
 	// If STSPreload is set to true, the `preload` flag will be appended to the Strict-Transport-Security header. Default is false.
 	STSPreload bool
+	// If ReuseRequestNonce is set to true, a CSP nonce previously set by this package on the request context is validated and reused instead of generating a new one. This allows nested Secure middleware layers to share a single nonce per request. Only internal context values set by this package are reused; values coming from the client are never trusted. Default is false, which always generates a new nonce.
+	ReuseRequestNonce bool
 	// ContentSecurityPolicy allows the Content-Security-Policy header value to be set with a custom value. Default is "".
 	ContentSecurityPolicy string
 	// ContentSecurityPolicyReportOnly allows the Content-Security-Policy-Report-Only header value to be set with a custom value. Default is "".
@@ -302,7 +304,12 @@ func (s *Secure) ProcessNoModifyRequest(w http.ResponseWriter, r *http.Request) 
 func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.Header, *http.Request, error) {
 	// Setup nonce if required.
 	if s.opt.nonceEnabled {
-		r = withCSPNonce(r, cspRandNonce())
+		nonce, err := s.cspNonceForRequest(r)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		r = withCSPNonce(r, nonce)
 	}
 
 	// Resolve the host for the request, using proxy headers if present.
