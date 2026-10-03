@@ -59,6 +59,9 @@ module Mustermann
     # @return [Mustermann::Pattern] a composite pattern
     # @see Mustermann::Pattern#|
     def |(other)
+      # Rebound patterns cannot be joined natively, since their string
+      # representation does not reflect the rebound capture names.
+      return super if rebound? or (other.is_a?(Pattern) and other.rebound?)
       return super unless converted = try_convert(other)
       return super if converted.names.any? { |name| names.include?(name) }
       self.class.new(safe_string + "|" + converted.safe_string, **converted.options)

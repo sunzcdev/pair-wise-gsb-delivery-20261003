@@ -93,6 +93,34 @@ module Mustermann
     # @return [Array<String>] list of named captures in the pattern
     def names = EMPTY_ARRAY
 
+    # Returns a new pattern with capture names rebound according to the given
+    # mapping. The pattern itself is left unchanged.
+    #
+    # This comes in handy when the same pattern fragment is used multiple times
+    # in a composed pattern, which would otherwise lead to conflicting capture
+    # names.
+    #
+    # @example
+    #   fragment = Mustermann.new('/:id')
+    #   pattern  = fragment.rename(id: :account_id) + fragment.rename(id: :file_id)
+    #   pattern.params('/42/7') # => {"account_id" => "42", "file_id" => "7"}
+    #
+    # @note This method is only implemented by certain subclasses.
+    # @param [Hash{String, Symbol => String, Symbol}] mapping old capture names mapped to new names
+    # @return [Mustermann::Pattern] new pattern with rebound capture names
+    # @raise [NotImplementedError] raised if renaming is not supported by the pattern type
+    # @raise [Mustermann::Error] raised if a new name is invalid or collides with another capture name
+    def rename(mapping = {}, **kwargs)
+      mapping = mapping.merge(kwargs) unless kwargs.empty?
+      return self if mapping.empty? or names.empty?
+      raise NotImplementedError, "renaming not supported by #{self.class}"
+    end
+
+    # @!visibility private
+    # @return [Boolean] whether or not the pattern is a copy with rebound capture names
+    # @see #rename
+    def rebound? = false
+
     # @param [String] string The string to match against
     # @return [Integer, nil] nil if pattern does not match the string, zero if it does.
     # @see http://ruby-doc.org/core-2.0/Regexp.html#method-i-3D-7E Regexp#=~

@@ -839,4 +839,25 @@ describe Mustermann::Template do
       example { pattern.peek_params("/foo bar")       .should be_nil }
     end
   end
+
+  describe :rename do
+    subject(:renamed) { Mustermann::Template.new('/{id}{?fields}').rename(id: :account_id, fields: :columns) }
+
+    example { renamed.names.should               be == %w[account_id columns] }
+    example { renamed.to_templates.should        be == ['/{account_id}{?columns}'] }
+    example { renamed.params('/42?columns=a').should be == { 'account_id' => '42', 'columns' => 'a' } }
+    example { renamed.params('/42?fields=a').should be_nil }
+
+    it 'leaves the original pattern unchanged' do
+      pattern = Mustermann::Template.new('/{id}{?fields}')
+      pattern.rename(id: :account_id)
+      pattern.names.should        be == %w[id fields]
+      pattern.to_templates.should be == ['/{id}{?fields}']
+    end
+
+    it 'keeps explode and prefix modifiers intact' do
+      renamed = Mustermann::Template.new('{/segments*}{id:3}').rename(segments: :s, id: :i)
+      renamed.to_templates.should be == ['{/s*}{i:3}']
+    end
+  end
 end

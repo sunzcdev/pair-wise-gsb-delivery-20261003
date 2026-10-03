@@ -10,6 +10,9 @@ module Mustermann
       # @!visibility private
       def +(other)
         other &&= Mustermann.new(other, type: :identity, **options)
+        # Rebound patterns cannot be joined natively, since their string
+        # representation does not reflect the rebound capture names.
+        return super if rebound? or (other.is_a?(Pattern) and other.rebound?)
         if (patterns = look_ahead(other)) && !patterns.empty?
           concat = (self + patterns.inject(:+))
           concat + other.patterns.slice(patterns.length..-1).inject(:+)

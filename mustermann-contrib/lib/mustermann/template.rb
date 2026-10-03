@@ -55,7 +55,10 @@ module Mustermann
     # @return (see Mustermann::Pattern#to_templates)
     # @see Mustermann::Pattern#to_templates
     def to_templates
-      [to_s]
+      # Rebound patterns cannot rely on the string representation, since it
+      # does not reflect the rebound capture names.
+      return [to_s] unless rebound?
+      Mustermann.dedup(generate_templates(to_ast))
     end
 
     private :compile, :map_param, :always_array?

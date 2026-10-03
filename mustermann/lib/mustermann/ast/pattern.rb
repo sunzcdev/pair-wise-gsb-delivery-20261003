@@ -6,6 +6,7 @@ require 'mustermann/ast/transformer'
 require 'mustermann/ast/validation'
 require 'mustermann/ast/template_generator'
 require 'mustermann/ast/param_scanner'
+require 'mustermann/ast/rename'
 require 'mustermann/regexp_based'
 require 'mustermann/expander'
 require 'mustermann/equality_map'
@@ -104,7 +105,7 @@ module Mustermann
       # Internal AST representation of pattern.
       # @!visibility private
       def to_ast
-        ast = self.class.ast_cache.fetch([@string, options]) do
+        ast = @ast ||= self.class.ast_cache.fetch([@string, options]) do
           ast   = parse(@string, pattern: self)
           ast &&= transform(ast)
           ast &&= set_boundaries(ast, string: @string)
@@ -112,6 +113,27 @@ module Mustermann
         end
         @param_converters ||= Mustermann.dedup(scan_params(ast, options)) if ast
         ast
+      end
+
+      # All AST-based pattern implementations support renaming captures.
+      #
+      # @example (see Mustermann::Pattern#rename)
+      # @param (see Mustermann::Pattern#rename)
+      # @return (see Mustermann::Pattern#rename)
+      # @raise (see Mustermann::Pattern#rename)
+      # @see Mustermann::Pattern#rename
+      def rename(mapping = {}, **kwargs)
+        mapping = mapping.merge(kwargs) unless kwargs.empty?
+        return self if mapping.empty?
+        mapping = mapping.to_h { |name, new_name| [name.to_s, new_name.to_s] }
+        return self if (names & mapping.keys).empty?
+
+        ast = Rename.rename(to_ast, mapping)
+        validate(ast)
+
+        copy = self.class.allocate
+        copy.send(:initialize_rebound, self, ast, mapping)
+        copy
       end
 
       # All AST-based pattern implementations support expanding.
@@ -155,7 +177,36 @@ module Mustermann
         param_converters.empty? && super
       end
 
-      private :compile, :parse, :transform, :validate, :generate_templates, :param_converters, :scan_params, :set_boundaries
+      # @!visibility private
+      # @see Mustermann::Pattern#rebound?
+      def rebound? = !!@rebound
+
+      # Initializes a fresh instance as a copy of the given pattern with a
+      # rebound AST. Shared state (string, options) is reused, all state
+      # derived from the AST is compiled from the new tree.
+      # @!visibility private
+      def initialize_rebound(source, ast, mapping)
+        @string     = source.instance_variable_get(:@string)
+        @uri_decode = source.uri_decode
+        @options    = Mustermann.dedup(rebind_options(source.options || EMPTY_HASH, mapping))
+        @ast        = ast
+        @rebound    = true
+        compile_regexps(**@options.except(:cache))
+        reset_caches(@options.fetch(:cache, true))
+      end
+
+      # Hands capture constraints on to the new capture names, without
+      # touching the constraints themselves.
+      # @!visibility private
+      def rebind_options(options, mapping)
+        capture = options[:capture]
+        return options unless capture.is_a? Hash
+        rebound = capture.to_h { |name, constraint| [mapping.fetch(name.to_s, name.to_s).to_sym, constraint] }
+        options.merge(capture: rebound)
+      end
+
+      private :compile, :parse, :transform, :validate, :generate_templates, :param_converters, :scan_params, :set_boundaries,
+        :initialize_rebound, :rebind_options
     end
   end
 end

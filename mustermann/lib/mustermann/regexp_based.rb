@@ -21,27 +21,8 @@ module Mustermann
       cache = options.delete(:cache) { true }
 
       super
-      regexp           = compile(**options)
-      @peek_regexp     = Mustermann.dedup(/\A#{regexp}/)
-      @regexp          = Mustermann.dedup(/\A#{regexp}\Z/)
-      @simple_captures = @regexp.named_captures.none? { |name, positions| positions.size > 1 || always_array?(name) }
-
-      cache_class = ObjectSpace::WeakKeyMap if defined?(ObjectSpace::WeakKeyMap)
-
-      case cache
-      when true
-        @match_cache = cache_class&.new || false
-        @peek_cache  = cache_class&.new || false
-      when false
-        @match_cache = false
-        @peek_cache  = false
-      when Hash
-        @match_cache = cache[:match] || cache_class&.new || false
-        @peek_cache  = cache[:peek]  || cache_class&.new || false
-      else
-        @match_cache = cache.new
-        @peek_cache  = cache.new
-      end
+      compile_regexps(**options)
+      reset_caches(cache)
     end
 
     # @param (see Mustermann::Pattern#peek_size)
@@ -75,6 +56,36 @@ module Mustermann
     def_delegators :regexp, :===, :=~, :names
 
     private
+
+    # Compiles the pattern regexp and the derived peek regexp.
+    # @!visibility private
+    def compile_regexps(**options)
+      regexp           = compile(**options)
+      @peek_regexp     = Mustermann.dedup(/\A#{regexp}/)
+      @regexp          = Mustermann.dedup(/\A#{regexp}\Z/)
+      @simple_captures = @regexp.named_captures.none? { |name, positions| positions.size > 1 || always_array?(name) }
+    end
+
+    # Sets up the match caches, see {#initialize} for the accepted cache values.
+    # @!visibility private
+    def reset_caches(cache)
+      cache_class = ObjectSpace::WeakKeyMap if defined?(ObjectSpace::WeakKeyMap)
+
+      case cache
+      when true
+        @match_cache = cache_class&.new || false
+        @peek_cache  = cache_class&.new || false
+      when false
+        @match_cache = false
+        @peek_cache  = false
+      when Hash
+        @match_cache = cache[:match] || cache_class&.new || false
+        @peek_cache  = cache[:peek]  || cache_class&.new || false
+      else
+        @match_cache = cache.new
+        @peek_cache  = cache.new
+      end
+    end
 
     def cache_match(cache, regexp, string)
       if cache

@@ -34,6 +34,13 @@ module Mustermann
       @names ||= Mustermann.dedup(patterns.flat_map { |p| p.respond_to?(:names) ? p.names : EMPTY_ARRAY }.uniq)
     end
 
+    # Renames the captures of all composed patterns.
+    # @see Mustermann::Pattern#rename
+    def rename(mapping = {}, **kwargs)
+      renamed = patterns.map { |pattern| pattern.rename(mapping, **kwargs) }
+      self.class.new(renamed, operator: operator)
+    end
+
     # @see Mustermann::Pattern#==
     def ==(pattern)
       patterns == patterns_from(pattern)
