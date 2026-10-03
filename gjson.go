@@ -2122,6 +2122,7 @@ type parseContext struct {
 	json  string
 	value Result
 	pipe  string
+	pipeP *program
 	piped bool
 	calcd bool
 	lines bool
@@ -2892,7 +2893,19 @@ func execStatic(json, path string) (pathOut, res string, ok bool) {
 // execModifier parses the path to find a matching modifier function.
 // The input expects that the path already starts with a '@'
 func execModifier(json, path string) (pathOut, res string, ok bool) {
-	name := path[1:]
+	name, args, pathOut, hasMod := parseModifierParts(path)
+	if hasMod {
+		return pathOut, modifiers[name](json, args), true
+	}
+	return pathOut, "", false
+}
+
+// parseModifierParts parses a path beginning with '@' into the modifier name,
+// its argument, and the remaining path. It performs no work on any JSON input,
+// so it is safe to use while compiling a reusable query plan. hasMod reports
+// whether name refers to a registered modifier.
+func parseModifierParts(path string) (name, args, pathOut string, hasMod bool) {
+	name = path[1:]
 	var hasArgs bool
 	for i := 1; i < len(path); i++ {
 		if path[i] == ':' {
@@ -2912,8 +2925,7 @@ func execModifier(json, path string) (pathOut, res string, ok bool) {
 			break
 		}
 	}
-	if fn, ok := modifiers[name]; ok {
-		var args string
+	if _, ok := modifiers[name]; ok {
 		if hasArgs {
 			var parsedArgs bool
 			switch pathOut[0] {
@@ -2943,9 +2955,9 @@ func execModifier(json, path string) (pathOut, res string, ok bool) {
 				pathOut = pathOut[i:]
 			}
 		}
-		return pathOut, fn(json, args), true
+		return name, args, pathOut, true
 	}
-	return pathOut, res, false
+	return name, args, pathOut, false
 }
 
 // unwrap removes the '[]' or '{}' characters around json
@@ -3344,10 +3356,16 @@ type sliceHeader struct {
 // results as uniquely allocated data. This operation is intended to minimize
 // copies and allocations for the large json string->[]byte.
 func getBytes(json []byte, path string) Result {
+	return evalBytes(json, func(s string) Result { return Get(s, path) })
+}
+
+// evalBytes casts the input json bytes to a string and safely returns the
+// result produced by eval as uniquely allocated data.
+func evalBytes(json []byte, eval func(string) Result) Result {
 	var result Result
 	if json != nil {
 		// unsafe cast to string
-		result = Get(*(*string)(unsafe.Pointer(&json)), path)
+		result = eval(*(*string)(unsafe.Pointer(&json)))
 		// safely get the string headers
 		rawhi := *(*stringHeader)(unsafe.Pointer(&result.Raw))
 		strhi := *(*stringHeader)(unsafe.Pointer(&result.Str))

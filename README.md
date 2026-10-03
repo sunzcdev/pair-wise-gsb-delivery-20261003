@@ -429,6 +429,32 @@ if result.Index > 0 {
 
 This is a best-effort no allocation sub slice of the original json. This method utilizes the `result.Index` field, which is the position of the raw data in the original json. It's possible that the value of `result.Index` equals zero, in which case the `result.Raw` is converted to a `[]byte`.
 
+## Reusable Query Plans
+
+When the same path is applied to many JSON documents you can compile it once
+with `Compile` and reuse the returned `*gjson.QueryPlan`. All path syntax is
+processed up front, including escaped dots, strings in queries, nested
+sub-selectors and modifiers with JSON arguments. Executing a plan returns the
+exact same `Result` that `Get` would return.
+
+```go
+plan, err := gjson.Compile(`friends.#(age>45)#.last`)
+if err != nil {
+    // err is a *gjson.PathError; err.Offset is the position in the path
+    log.Fatal(err)
+}
+for _, doc := range documents {
+    result := plan.Get(doc)
+    // or plan.GetBytes(doc) for []byte input
+    fmt.Println(result.Array())
+}
+```
+
+A `QueryPlan` is read-only and holds no per-input state, so a single plan may
+be shared between goroutines and reused indefinitely. A failed lookup or an
+empty result on one document never affects any later call. Use `MustCompile`
+when the path is a compile-time constant and known to be valid.
+
 ## Performance
 
 Benchmarks of GJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
