@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `RetryAfterHeader` converts an HTTP `Retry-After` header (delta-seconds or HTTP-date) into a `*RetryAfterError` for a `Retry` operation. The current time is supplied by the caller. Multiple header values return a parse error wrapping `ErrRetryAfterMultiple`; missing, malformed, or overflowing content returns one wrapping `ErrRetryAfterInvalid`. Both preserve the operation error via `Unwrap`. An expired HTTP-date parses to a negative duration, which `Retry` retries immediately, and delta-seconds too large for a `time.Duration` are rejected rather than overflowing.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed

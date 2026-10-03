@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -36,9 +35,11 @@ func ExampleRetry() {
 		// If we are being rate limited, return a RetryAfter to specify how long to wait.
 		// This will also reset the backoff policy.
 		if resp.StatusCode == http.StatusTooManyRequests {
-			seconds, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64)
-			if err == nil {
-				return "", backoff.RetryAfter(time.Duration(seconds)*time.Second, fmt.Errorf("rate limited: %s", resp.Status))
+			opErr := fmt.Errorf("rate limited: %s", resp.Status)
+			err := backoff.RetryAfterHeader(resp.Header.Values("Retry-After"), time.Now(), opErr)
+			if !errors.Is(err, backoff.ErrRetryAfterMultiple) &&
+				!errors.Is(err, backoff.ErrRetryAfterInvalid) {
+				return "", err
 			}
 		}
 
@@ -62,6 +63,42 @@ func ExampleRetry() {
 
 	fmt.Println(result)
 	// Output: hello
+}
+
+func ExampleRetryAfterHeader() {
+	// A fixed "now" keeps the example deterministic: the same instant is used
+	// for both representations of the wait, so an HTTP-date and its equivalent
+	// delta-seconds value parse to the identical duration and drive the same
+	// Retry schedule.
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	cause := errors.New("rate limited: 429")
+
+	date := now.Add(30 * time.Second).Format(http.TimeFormat)
+
+	show := func(values []string) {
+		err := backoff.RetryAfterHeader(values, now, cause)
+		var ra *backoff.RetryAfterError
+		switch {
+		case errors.As(err, &ra):
+			fmt.Println("wait", ra.Duration)
+		case errors.Is(err, backoff.ErrRetryAfterMultiple):
+			fmt.Println("multiple header values")
+		case errors.Is(err, backoff.ErrRetryAfterInvalid):
+			fmt.Println("invalid header")
+		}
+	}
+
+	show([]string{"30"})                                        // delta-seconds
+	show([]string{date})                                        // equivalent HTTP-date
+	show([]string{now.Add(-time.Hour).Format(http.TimeFormat)}) // negative: Retry waits 0 and retries now
+	show([]string{"1", "2"})                                    // more than one value
+	show([]string{"soon"})                                      // neither a number nor a date
+	// Output:
+	// wait 30s
+	// wait 30s
+	// wait -1h0m0s
+	// multiple header values
+	// invalid header
 }
 
 func ExampleRetry_outcomes() {
