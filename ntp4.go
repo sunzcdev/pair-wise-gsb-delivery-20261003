@@ -154,7 +154,7 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 	}
 
 	// Parse the response message.
-	m, err := parseV4Response(recvMsg)
+	m, err := parseV4Response(recvMsg, !opt.EraReferenceTime.IsZero())
 	if err != nil {
 		return nil, err
 	}
@@ -166,9 +166,54 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 
 	// Timestamp aliases for readability.
 	t1 := xmitTime
-	t2 := m.ReceiveTime.TimeV4()
-	t3 := m.TransmitTime.TimeV4()
 	t4 := recvTime
+
+	// Convert the received timestamps to absolute times. When an era
+	// reference time is provided, resolve the era of each timestamp
+	// against the same reference point so that the timestamps retain
+	// their temporal relationships, even across an era rollover.
+	// Otherwise, use the fixed 1970 threshold to infer each era.
+	var t2, t3, referenceTime time.Time
+	var era uint8
+	if !opt.EraReferenceTime.IsZero() {
+		ref := opt.EraReferenceTime
+		maxDev := opt.MaxEraDeviation
+
+		recvEra, err := m.ReceiveTime.resolveEra(ref, maxDev)
+		if err != nil {
+			return nil, err
+		}
+		xmitEra, err := m.TransmitTime.resolveEra(ref, maxDev)
+		if err != nil {
+			return nil, err
+		}
+		t2 = m.ReceiveTime.timeAtEra(recvEra)
+		t3 = m.TransmitTime.timeAtEra(xmitEra)
+		era = uint8(xmitEra)
+
+		// The resolved timestamps must preserve the order in which the
+		// server recorded them.
+		if t3.Before(t2) {
+			return nil, ErrServerTickedBackwards
+		}
+
+		// Resolve the reference time unless it holds the NTPv5 support
+		// sentinel value.
+		if opt.RequestSupportedVersions && m.ReferenceTime == v5sentinel {
+			referenceTime = ntpEra0
+		} else {
+			refEra, err := m.ReferenceTime.resolveEra(ref, maxDev)
+			if err != nil {
+				return nil, err
+			}
+			referenceTime = m.ReferenceTime.timeAtEra(refEra)
+		}
+	} else {
+		t2 = m.ReceiveTime.TimeV4()
+		t3 = m.TransmitTime.TimeV4()
+		era = inferEra(m.TransmitTime)
+		referenceTime = m.ReferenceTime.TimeV4()
+	}
 
 	// Compose the response struct.
 	r := &Response{
@@ -178,10 +223,10 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 		Precision:      toInterval(m.Precision),
 		Version:        m.getVersion(),
 		Stratum:        m.Stratum,
-		Era:            inferEra(m.TransmitTime),
+		Era:            era,
 		Timescale:      TimescaleUTC,
 		ReferenceID:    m.ReferenceID,
-		ReferenceTime:  m.ReferenceTime.TimeV4(),
+		ReferenceTime:  referenceTime,
 		RootDelay:      m.RootDelay.Duration(),
 		RootDispersion: m.RootDispersion.Duration(),
 		Leap:           m.getLeap(),

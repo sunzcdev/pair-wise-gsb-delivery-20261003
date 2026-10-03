@@ -26,6 +26,7 @@ import (
 )
 
 var (
+	ErrAmbiguousEra           = errors.New("unable to unambiguously resolve NTP era")
 	ErrAuthFailed             = errors.New("authentication MAC verification failed")
 	ErrAuthNAK                = errors.New("authentication NAK received")
 	ErrExtensionsNotSupported = errors.New("NTPV3 does not support extension fields")
@@ -175,6 +176,26 @@ type QueryOptions struct {
 	// used. Specifying this callback disables the use of kernel timestamps
 	// on platforms that would otherwise support them.
 	GetSystemTime func() time.Time
+
+	// EraReferenceTime is an optional reference time used to resolve the
+	// NTP era of the timestamps in an NTPv3/NTPv4 server response. When
+	// set, the era of each received timestamp (ReceiveTime, TransmitTime,
+	// and ReferenceTime) is chosen so that the resulting time is as close
+	// as possible to this reference time, instead of using the fixed 1970
+	// threshold. Because all timestamps from the same query are resolved
+	// against the same reference point, their temporal relationships are
+	// preserved, even for queries spanning the 2036 era rollover. If the
+	// era of a timestamp cannot be determined unambiguously, the query
+	// fails with ErrAmbiguousEra. Used only in NTPv3 and NTPv4.
+	EraReferenceTime time.Time
+
+	// MaxEraDeviation specifies the maximum allowed deviation between
+	// EraReferenceTime and a resolved response timestamp. If the closest
+	// era for a timestamp yields a time that deviates from
+	// EraReferenceTime by more than this value, the query fails with
+	// ErrAmbiguousEra. If zero, no deviation limit is applied. Used only
+	// in NTPv3 and NTPv4, and only when EraReferenceTime is set.
+	MaxEraDeviation time.Duration
 
 	// RequestReferenceID is a struct used to request reference ID bloom
 	// filter values, which are returned in the ReferenceIDFilterValues field
@@ -901,6 +922,71 @@ func inferEra(t timestamp) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// timeAtEra interprets a timestamp value as an absolute time within the
+// provided NTP era. Unlike the Time method, it accepts an era of any
+// non-negative size without overflowing the time.Duration used internally.
+func (t timestamp) timeAtEra(era int64) time.Time {
+	d := t.Duration()
+	sec := ntpEra0.Unix() + era*(int64(1)<<32) + int64(d/time.Second)
+	return time.Unix(sec, int64(d%time.Second)).UTC()
+}
+
+// resolveEra determines the NTP era of a timestamp by selecting the era
+// whose resulting time is closest to the provided reference time. If two
+// eras produce times equally close to the reference time, or if the
+// closest time deviates from the reference time by more than
+// maxDeviation (when maxDeviation is greater than zero), an
+// ErrAmbiguousEra error is returned. This function is used only for
+// NTPv3 and NTPv4 timestamps.
+func (t timestamp) resolveEra(ref time.Time, maxDeviation time.Duration) (int64, error) {
+	const eraLenSec = int64(1) << 32
+
+	// Estimate the era nearest the reference time, then examine the
+	// candidate eras surrounding it.
+	approxSec := ref.Unix() - ntpEra0.Unix() - int64(t>>32)
+	base := approxSec / eraLenSec
+	if approxSec < 0 && approxSec%eraLenSec != 0 {
+		base--
+	}
+
+	bestEra := int64(-1)
+	var bestDeviation time.Duration
+	ambiguous := false
+	for era := base - 1; era <= base+2; era++ {
+		if era < 0 {
+			continue
+		}
+		deviation := t.timeAtEra(era).Sub(ref)
+		if deviation < 0 {
+			deviation = -deviation
+		}
+		switch {
+		case bestEra < 0 || deviation < bestDeviation:
+			bestEra = era
+			bestDeviation = deviation
+			ambiguous = false
+		case deviation == bestDeviation:
+			ambiguous = true
+		}
+	}
+
+	switch {
+	case ambiguous:
+		return 0, fmt.Errorf("%w: timestamp 0x%016x is equidistant from "+
+			"two eras relative to reference time %s",
+			ErrAmbiguousEra, uint64(t), ref.Format(time.RFC3339Nano))
+	case bestEra > math.MaxUint8:
+		return 0, fmt.Errorf("%w: era %d for timestamp 0x%016x is out of "+
+			"representable range", ErrAmbiguousEra, bestEra, uint64(t))
+	case maxDeviation > 0 && bestDeviation > maxDeviation:
+		return 0, fmt.Errorf("%w: timestamp 0x%016x deviates from "+
+			"reference time %s by %s, exceeding the maximum allowed %s",
+			ErrAmbiguousEra, uint64(t), ref.Format(time.RFC3339Nano),
+			bestDeviation, maxDeviation)
+	}
+	return bestEra, nil
 }
 
 // toTimestamp converts a Time value into its 64-bit fixed-point timestamp
