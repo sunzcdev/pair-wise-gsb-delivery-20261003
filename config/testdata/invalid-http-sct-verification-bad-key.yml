@@ -1,0 +1,10 @@
+modules:
+  http_sct_verification:
+    prober: http
+    timeout: 5s
+    http:
+      sct_verification:
+        min_distinct_logs: 1
+        logs:
+          - name: "broken-log"
+            key: "not-a-public-key"

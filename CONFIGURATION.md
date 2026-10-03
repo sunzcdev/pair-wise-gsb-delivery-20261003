@@ -159,6 +159,13 @@ then a single address is selected to test, using the following logic:
   # CRLs are fetched using the proxy settings configured below.
   [ check_revoked: <boolean> | default = false ]
 
+  # Verify the Signed Certificate Timestamps (SCTs) presented by the peer, embedded
+  # in the certificate or delivered in the TLS handshake, against configured
+  # Certificate Transparency logs and emit probe_ssl_ct_* metrics.
+  # Only SCT signatures are verified; inclusion proofs are not checked.
+  # This only reports verification state, it never fails the probe.
+  [ sct_verification: <sct_verification> ]
+
   # The HTTP basic authentication credentials.
   basic_auth:
     [ username: <string> ]
@@ -271,6 +278,14 @@ tls_config:
 # Requires tls to be true, or a query_response step using starttls.
 [ check_revoked: <boolean> | default = false ]
 
+# Verify the Signed Certificate Timestamps (SCTs) presented by the peer, embedded
+# in the certificate or delivered in the TLS handshake, against configured
+# Certificate Transparency logs and emit probe_ssl_ct_* metrics.
+# Only SCT signatures are verified; inclusion proofs are not checked.
+# This only reports verification state, it never fails the probe.
+# Requires tls to be true, or a query_response step using starttls.
+[ sct_verification: <sct_verification> ]
+
 ```
 
 ### `<unix_probe>`
@@ -307,6 +322,14 @@ tls_config:
 # an unreachable CRL leaves probe_success untouched. Alert on the metrics instead.
 # Requires tls to be true, or a query_response step using starttls.
 [ check_revoked: <boolean> | default = false ]
+
+# Verify the Signed Certificate Timestamps (SCTs) presented by the peer, embedded
+# in the certificate or delivered in the TLS handshake, against configured
+# Certificate Transparency logs and emit probe_ssl_ct_* metrics.
+# Only SCT signatures are verified; inclusion proofs are not checked.
+# This only reports verification state, it never fails the probe.
+# Requires tls to be true, or a query_response step using starttls.
+[ sct_verification: <sct_verification> ]
 
 ```
 
@@ -439,6 +462,14 @@ tls_config:
 # an unreachable CRL leaves probe_success untouched. Alert on the metrics instead.
 # Requires tls to be true.
 [ check_revoked: <boolean> | default = false ]
+
+# Verify the Signed Certificate Timestamps (SCTs) presented by the peer, embedded
+# in the certificate or delivered in the TLS handshake, against configured
+# Certificate Transparency logs and emit probe_ssl_ct_* metrics.
+# Only SCT signatures are verified; inclusion proofs are not checked.
+# This only reports verification state, it never fails the probe.
+# Requires tls to be true.
+[ sct_verification: <sct_verification> ]
 ```
 
 ### `<websocket_probe>`
@@ -557,6 +588,8 @@ query_response:
 [ max_version: <string> ]
 ```
 
+### `<sct_verification>`
+
 #### `<oauth2>`
 
 OAuth 2.0 authentication using the client credentials grant type. Blackbox
@@ -584,4 +617,37 @@ token_url: <string>
 # Optional parameters to append to the token URL.
 endpoint_params:
   [ <string>: <string> ... ]
+```
+
+### `<sct_verification>`
+
+Configures verification of Signed Certificate Timestamps (SCTs, RFC 6962)
+against a local list of trusted Certificate Transparency logs. SCTs are
+collected from the leaf certificate's SCT extension and from the TLS
+handshake; the `source` label on the `probe_ssl_ct_sct_*` metrics shows at
+which layer each SCT was found.
+
+Each SCT signature is verified over the precertificate (for embedded SCTs)
+or the final certificate (for handshake SCTs) using the configured log keys.
+Inclusion proofs are not fetched from the logs; the
+`probe_ssl_ct_verification_level` metric reports the depth of the check.
+
+```yml
+# Minimum number of distinct CT logs that must have provided a valid SCT.
+# The result is exposed as probe_ssl_ct_min_distinct_logs_met.
+[ min_distinct_logs: <int> | default = 0 ]
+
+# Trusted CT logs. At least one log is required to enable the check.
+logs:
+  [ - # Human-readable name of the log, used in metric labels.
+      [ name: <string> ]
+      # The log's public key, PEM-encoded or base64-encoded DER.
+      key: <string>
+      # Optional validity window of the log (e.g. for temporal logs).
+      # SCTs signed outside the window are rejected, and a log whose window
+      # has passed is considered expired.
+      [ not_before: <timestamp> ]
+      [ not_after: <timestamp> ]
+    , ...
+  ]
 ```

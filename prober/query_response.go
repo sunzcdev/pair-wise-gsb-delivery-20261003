@@ -79,6 +79,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 	var tlsConfig *pconfig.TLSConfig
 	var checkRevoked bool
 	var useTLS bool
+	var sctVerification config.SCTVerification
 
 	switch proberName {
 	case "tcp":
@@ -86,11 +87,13 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		tlsConfig = &module.TCP.TLSConfig
 		checkRevoked = module.TCP.CheckRevoked
 		useTLS = module.TCP.TLS
+		sctVerification = module.TCP.SCTVerification
 	case "unix":
 		queryResponses = module.Unix.QueryResponse
 		tlsConfig = &module.Unix.TLSConfig
 		checkRevoked = module.Unix.CheckRevoked
 		useTLS = module.Unix.TLS
+		sctVerification = module.Unix.SCTVerification
 	}
 
 	deadline, _ := ctx.Deadline()
@@ -108,6 +111,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(&state).Unix()))
 		probeSSLLastInformation.WithLabelValues(getFingerprint(&state), getSubject(&state), getIssuer(&state), getDNSNames(&state), getSerialNumber(&state)).Set(1)
 		checkCRL(ctx, &state, checkRevoked, nil, registry, logger)
+		checkSCT(&state, sctVerification, registry, logger)
 	}
 
 	scanner := bufio.NewScanner(conn)
@@ -207,6 +211,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(&state).Unix()))
 			probeSSLLastInformation.WithLabelValues(getFingerprint(&state), getSubject(&state), getIssuer(&state), getDNSNames(&state), getSerialNumber(&state)).Set(1)
 			checkCRL(ctx, &state, checkRevoked, nil, registry, logger)
+			checkSCT(&state, sctVerification, registry, logger)
 		}
 	}
 	return true

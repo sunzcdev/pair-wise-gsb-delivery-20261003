@@ -136,6 +136,18 @@ func TestLoadBadConfigs(t *testing.T) {
 			input: "testdata/invalid-grpc-check-revoked-without-tls.yml",
 			want:  `error parsing config file: check_revoked cannot be used when tls is false`,
 		},
+		{
+			input: "testdata/invalid-http-sct-verification.yml",
+			want:  `error parsing config file: min_distinct_logs (2) is greater than the number of configured logs (1)`,
+		},
+		{
+			input: "testdata/invalid-http-sct-verification-bad-key.yml",
+			want:  `error parsing config file: CT log "broken-log": key is neither PEM-encoded nor base64-encoded DER: illegal base64 data at input byte 3`,
+		},
+		{
+			input: "testdata/invalid-tcp-sct-verification-without-tls.yml",
+			want:  `error parsing config file: sct_verification cannot be used when tls is false and no query_response step uses starttls`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

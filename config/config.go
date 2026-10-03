@@ -14,6 +14,11 @@
 package config
 
 import (
+	"crypto"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -330,6 +335,7 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCTVerification              SCTVerification         `yaml:"sct_verification,omitempty" json:"sct_verification,omitzero"`
 }
 
 type GRPCProbe struct {
@@ -337,6 +343,7 @@ type GRPCProbe struct {
 	TLS                 bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig           config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked        bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCTVerification     SCTVerification  `yaml:"sct_verification,omitempty" json:"sct_verification,omitzero"`
 	IPProtocolFallback  bool             `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
 	PreferredIPProtocol string           `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
 	Metadata            metadata.MD      `yaml:"metadata,omitempty" json:"metadata,omitempty"`
@@ -351,6 +358,95 @@ type HeaderMatch struct {
 type Label struct {
 	Name  string `yaml:"name,omitempty" json:"name,omitempty"`
 	Value string `yaml:"value,omitempty" json:"value,omitempty"`
+}
+
+// CTLog describes a single Certificate Transparency log whose SCTs are
+// trusted for SCT verification.
+type CTLog struct {
+	// Name is a human-readable identifier for the log, used in metric labels.
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	// Key is the log's public key, either PEM-encoded (PKIX) or base64-encoded DER.
+	Key string `yaml:"key,omitempty" json:"key,omitempty"`
+	// NotBefore and NotAfter optionally bound the log's validity window, e.g.
+	// for temporal logs. SCTs signed outside the window are rejected, and a
+	// log whose window has passed is considered expired.
+	NotBefore time.Time `yaml:"not_before,omitempty" json:"not_before,omitzero"`
+	NotAfter  time.Time `yaml:"not_after,omitempty" json:"not_after,omitzero"`
+}
+
+// SCTVerification configures verification of Signed Certificate Timestamps
+// (SCTs) found in the peer's certificate or delivered during the TLS
+// handshake. Only SCT signatures are verified against the configured logs;
+// inclusion proofs are not checked.
+type SCTVerification struct {
+	// MinDistinctLogs is the minimum number of distinct CT logs that must
+	// have provided a valid SCT for the check to pass.
+	MinDistinctLogs int     `yaml:"min_distinct_logs,omitempty" json:"min_distinct_logs,omitempty"`
+	Logs            []CTLog `yaml:"logs,omitempty" json:"logs,omitempty"`
+}
+
+// Enabled reports whether SCT verification is configured.
+func (s SCTVerification) Enabled() bool {
+	return len(s.Logs) > 0
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (s *SCTVerification) UnmarshalYAML(unmarshal func(any) error) error {
+	type plain SCTVerification
+	if err := unmarshal((*plain)(s)); err != nil {
+		return err
+	}
+	if s.MinDistinctLogs < 0 {
+		return errors.New("min_distinct_logs cannot be negative")
+	}
+	if s.MinDistinctLogs > len(s.Logs) {
+		return fmt.Errorf("min_distinct_logs (%d) is greater than the number of configured logs (%d)", s.MinDistinctLogs, len(s.Logs))
+	}
+	for i, log := range s.Logs {
+		if log.Key == "" {
+			return fmt.Errorf("CT log %d: key must be set", i)
+		}
+		if _, _, err := ParseCTLogKey(log.Key); err != nil {
+			return fmt.Errorf("CT log %q: %w", log.Name, err)
+		}
+		if !log.NotBefore.IsZero() && !log.NotAfter.IsZero() && !log.NotBefore.Before(log.NotAfter) {
+			return fmt.Errorf("CT log %q: not_before must be before not_after", log.Name)
+		}
+	}
+	return nil
+}
+
+// ParseCTLogKey parses a CT log public key in PEM (PKIX) or base64-encoded
+// DER form and returns the key along with the log ID, which is the SHA-256
+// hash of the DER-encoded SubjectPublicKeyInfo.
+func ParseCTLogKey(key string) (crypto.PublicKey, [32]byte, error) {
+	var der []byte
+	if block, _ := pem.Decode([]byte(key)); block != nil {
+		der = block.Bytes
+	} else {
+		b, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
+		if err != nil {
+			return nil, [32]byte{}, fmt.Errorf("key is neither PEM-encoded nor base64-encoded DER: %w", err)
+		}
+		der = b
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(der)
+	if err != nil {
+		if pkcs1, errPKCS1 := x509.ParsePKCS1PublicKey(der); errPKCS1 == nil {
+			pub = pkcs1
+		} else {
+			return nil, [32]byte{}, fmt.Errorf("parsing public key: %w", err)
+		}
+	}
+
+	// Normalize to the DER-encoded SubjectPublicKeyInfo so the log ID does
+	// not depend on the input encoding.
+	spki, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, [32]byte{}, fmt.Errorf("marshaling public key: %w", err)
+	}
+	return pub, sha256.Sum256(spki), nil
 }
 
 type QueryResponse struct {
@@ -369,13 +465,15 @@ type TCPProbe struct {
 	TLS                bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig          config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked       bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCTVerification    SCTVerification  `yaml:"sct_verification,omitempty" json:"sct_verification,omitzero"`
 }
 
 type UnixProbe struct {
-	QueryResponse []QueryResponse  `yaml:"query_response,omitempty" json:"query_response,omitempty"`
-	TLS           bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
-	TLSConfig     config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
-	CheckRevoked  bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	QueryResponse   []QueryResponse  `yaml:"query_response,omitempty" json:"query_response,omitempty"`
+	TLS             bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
+	TLSConfig       config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
+	CheckRevoked    bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	SCTVerification SCTVerification  `yaml:"sct_verification,omitempty" json:"sct_verification,omitzero"`
 }
 
 type ICMPProbe struct {
@@ -517,6 +615,9 @@ func (s *GRPCProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS {
 		return errors.New("check_revoked cannot be used when tls is false")
 	}
+	if s.SCTVerification.Enabled() && !s.TLS {
+		return errors.New("sct_verification cannot be used when tls is false")
+	}
 	return nil
 }
 
@@ -554,6 +655,9 @@ func (s *TCPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
 	}
+	if s.SCTVerification.Enabled() && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("sct_verification cannot be used when tls is false and no query_response step uses starttls")
+	}
 	return nil
 }
 
@@ -576,6 +680,9 @@ func (s *UnixProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
+	}
+	if s.SCTVerification.Enabled() && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("sct_verification cannot be used when tls is false and no query_response step uses starttls")
 	}
 	return nil
 }

@@ -1,0 +1,14 @@
+modules:
+  http_sct_verification:
+    prober: http
+    timeout: 5s
+    http:
+      sct_verification:
+        min_distinct_logs: 2
+        logs:
+          - name: "only-log"
+            key: |
+              -----BEGIN PUBLIC KEY-----
+              MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAvcrnqO50OzRzJCg1sAyIOPOoLGe
+              Sx184YBA/N6I/lg2jmvdAkpnjXt+G91tLR8hGT4tY4GJ+93kF8dEcG0kGw==
+              -----END PUBLIC KEY-----

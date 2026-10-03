@@ -212,6 +212,7 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 			probeTLSVersion.WithLabelValues(getTLSVersion(&tlsInfo.State)).Set(1)
 			probeSSLLastInformation.WithLabelValues(getFingerprint(&tlsInfo.State), getSubject(&tlsInfo.State), getIssuer(&tlsInfo.State), getDNSNames(&tlsInfo.State), getSerialNumber(&tlsInfo.State)).Set(1)
 			checkCRL(ctx, &tlsInfo.State, module.GRPC.CheckRevoked, nil, registry, logger)
+			checkSCT(&tlsInfo.State, module.GRPC.SCTVerification, registry, logger)
 		} else {
 			isSSLGauge.Set(float64(0))
 		}

@@ -1,0 +1,15 @@
+modules:
+  tcp_sct_verification_without_tls:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      tls: false
+      sct_verification:
+        min_distinct_logs: 1
+        logs:
+          - name: "test-log"
+            key: |
+              -----BEGIN PUBLIC KEY-----
+              MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEAvcrnqO50OzRzJCg1sAyIOPOoLGe
+              Sx184YBA/N6I/lg2jmvdAkpnjXt+G91tLR8hGT4tY4GJ+93kF8dEcG0kGw==
+              -----END PUBLIC KEY-----
