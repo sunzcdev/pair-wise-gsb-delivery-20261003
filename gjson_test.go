@@ -1942,6 +1942,81 @@ func TestValid(t *testing.T) {
 	assert(t, Get("[{}]", "@valid").Exists() == true)
 }
 
+func TestJoinArrays(t *testing.T) {
+	json := `{
+		"users": [
+			{"id":1,"name":"ann"},
+			{"id":2,"name":"bob"},
+			{"id":2,"name":"bea"},
+			{"id":3,"name":"cat"},
+			{"name":"nokey"},
+			{"id":null,"name":"nul"}
+		],
+		"orders": [
+			{"uid":2,"item":"x"},
+			{"uid":2,"item":"y"},
+			{"uid":1,"item":"z"},
+			{"uid":4,"item":"w"},
+			{"item":"nokey"},
+			{"uid":null,"item":"nul"}
+		]
+	}`
+	// inner join: duplicate keys produce all combinations, ordered by
+	// left occurrence first, then right occurrence.
+	assert(t, Join(json, "users", "orders", "id", "uid",
+		JoinInner, nil).String() == `[`+
+		`{"left":{"id":1,"name":"ann"},"right":{"uid":1,"item":"z"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"y"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"y"}}`+
+		`]`)
+	// left join: unmatched left records appear once with a null right.
+	assert(t, Join(json, "users", "orders", "id", "uid",
+		JoinLeft, nil).String() == `[`+
+		`{"left":{"id":1,"name":"ann"},"right":{"uid":1,"item":"z"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"y"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"y"}},`+
+		`{"left":{"id":3,"name":"cat"},"right":null},`+
+		`{"left":{"name":"nokey"},"right":null},`+
+		`{"left":{"id":null,"name":"nul"},"right":null}`+
+		`]`)
+	// explicit null keys match when the option is enabled.
+	assert(t, Join(json, "users", "orders", "id", "uid", JoinInner,
+		&JoinOptions{MatchNullKeys: true}).String() == `[`+
+		`{"left":{"id":1,"name":"ann"},"right":{"uid":1,"item":"z"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bob"},"right":{"uid":2,"item":"y"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"x"}},`+
+		`{"left":{"id":2,"name":"bea"},"right":{"uid":2,"item":"y"}},`+
+		`{"left":{"id":null,"name":"nul"},"right":{"uid":null,"item":"nul"}}`+
+		`]`)
+	// string keys and number keys never mix.
+	mixed := `{
+		"a": [{"k":"1","v":"str"},{"k":1,"v":"num"}],
+		"b": [{"k":1,"v":"num"},{"k":"1","v":"str"}]
+	}`
+	assert(t, Join(mixed, "a", "b", "k", "k", JoinInner, nil).String() == `[`+
+		`{"left":{"k":"1","v":"str"},"right":{"k":"1","v":"str"}},`+
+		`{"left":{"k":1,"v":"num"},"right":{"k":1,"v":"num"}}`+
+		`]`)
+	// an empty key path uses the element itself as the key.
+	assert(t, Join(`{"a":[1,2,2,3],"b":[2,2,4]}`, "a", "b", "", "",
+		JoinInner, nil).String() == `[`+
+		`{"left":2,"right":2},`+
+		`{"left":2,"right":2},`+
+		`{"left":2,"right":2},`+
+		`{"left":2,"right":2}`+
+		`]`)
+	// non-array paths produce an empty array, invalid mode produces null.
+	assert(t, Join(json, "users", "missing", "id", "uid",
+		JoinInner, nil).String() == `[]`)
+	assert(t, Join(json, "users", "orders", "id", "uid",
+		JoinMode("bogus"), nil).Exists() == false)
+}
+
 // https://github.com/tidwall/gjson/issues/152
 func TestJoin152(t *testing.T) {
 	var json = `{

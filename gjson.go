@@ -2503,6 +2503,161 @@ func GetManyBytes(json []byte, path ...string) []Result {
 	return res
 }
 
+// JoinMode specifies how the Join function combines the records of two
+// JSON arrays.
+type JoinMode string
+
+const (
+	// JoinInner only emits a combined record for each pair of left and
+	// right records that share a matching key.
+	JoinInner JoinMode = "inner"
+	// JoinLeft emits a combined record for each matching pair and, in
+	// addition, emits each unmatched left record exactly once with a
+	// null right side.
+	JoinLeft JoinMode = "left"
+)
+
+// JoinOptions controls the behavior of the Join function.
+type JoinOptions struct {
+	// MatchNullKeys allows records with an explicit null key to match
+	// each other. By default null keys never match, and records with a
+	// missing key never match.
+	MatchNullKeys bool
+}
+
+// Join performs a relational join between two JSON arrays found at leftPath
+// and rightPath within json. For each record, the join key is extracted
+// using leftKey for the left array and rightKey for the right array. An
+// empty key path uses the array element itself as the key.
+//
+// The result is an array of combined records of the form:
+//
+//	[{"left":{...},"right":{...}},...]
+//
+// Duplicate keys produce all matching combinations, ordered by the
+// occurrence order of the left records first and the right records second.
+// String keys and number keys are never considered equal, even when they
+// look alike ("1" does not match 1). Records with a missing key never
+// match. Whether explicit null keys match each other is controlled by the
+// JoinOptions.MatchNullKeys option.
+//
+// With JoinLeft mode, each unmatched left record is emitted once with a
+// null right side. With JoinInner mode, unmatched records are omitted.
+//
+// An empty array is returned when either path does not resolve to an
+// array, and a null result is returned when the mode is invalid.
+func Join(json, leftPath, rightPath, leftKey, rightKey string,
+	mode JoinMode, opts *JoinOptions) Result {
+	if mode != JoinInner && mode != JoinLeft {
+		return Result{}
+	}
+	var matchNull bool
+	if opts != nil {
+		matchNull = opts.MatchNullKeys
+	}
+	left := Get(json, leftPath)
+	right := Get(json, rightPath)
+	if !left.IsArray() || !right.IsArray() {
+		return Parse("[]")
+	}
+	// Index the right records by key. Each key maps to the list of right
+	// record indexes in occurrence order, so that duplicate keys on the
+	// right side are all preserved rather than overwritten.
+	var rightElems []Result
+	rightIdx := make(map[string][]int)
+	right.ForEach(func(_, elem Result) bool {
+		if h, ok := joinKeyHash(joinElemKey(elem, rightKey),
+			matchNull); ok {
+			rightIdx[h] = append(rightIdx[h], len(rightElems))
+		}
+		rightElems = append(rightElems, elem)
+		return true
+	})
+	var out []byte
+	out = append(out, '[')
+	var count int
+	left.ForEach(func(_, lelem Result) bool {
+		matched := false
+		if h, ok := joinKeyHash(joinElemKey(lelem, leftKey),
+			matchNull); ok {
+			for _, ri := range rightIdx[h] {
+				out = appendJoinPair(out, count, lelem, rightElems[ri])
+				count++
+				matched = true
+			}
+		}
+		if !matched && mode == JoinLeft {
+			out = appendJoinPair(out, count, lelem, Result{})
+			count++
+		}
+		return true
+	})
+	out = append(out, ']')
+	return Parse(bytesString(out))
+}
+
+// joinElemKey extracts the join key from an array element. An empty key
+// path selects the element itself.
+func joinElemKey(elem Result, keyPath string) Result {
+	if keyPath == "" {
+		return elem
+	}
+	return elem.Get(keyPath)
+}
+
+// joinKeyHash returns a type-identity hash for a join key. The second
+// return value is false when the key cannot participate in matching,
+// which is the case for missing keys, unmatched null keys, and
+// non-scalar keys.
+func joinKeyHash(key Result, matchNull bool) (string, bool) {
+	if !key.Exists() {
+		return "", false
+	}
+	switch key.Type {
+	case String:
+		return "s" + key.Str, true
+	case Number:
+		return "n" + strconv.FormatFloat(key.Num, 'g', -1, 64), true
+	case True:
+		return "t", true
+	case False:
+		return "f", true
+	case Null:
+		if matchNull {
+			return "0", true
+		}
+	}
+	return "", false
+}
+
+// appendJoinPair appends a single combined {"left":...,"right":...}
+// record to out. A zero right Result is emitted as null.
+func appendJoinPair(out []byte, count int, left, right Result) []byte {
+	if count > 0 {
+		out = append(out, ',')
+	}
+	out = append(out, `{"left":`...)
+	out = appendJoinRaw(out, left)
+	out = append(out, `,"right":`...)
+	if !right.Exists() {
+		out = append(out, "null"...)
+	} else {
+		out = appendJoinRaw(out, right)
+	}
+	out = append(out, '}')
+	return out
+}
+
+func appendJoinRaw(out []byte, res Result) []byte {
+	if res.Raw != "" {
+		return append(out, res.Raw...)
+	}
+	if res.Type == String {
+		return AppendJSONString(out, res.Str)
+	}
+	return append(out, res.String()...)
+}
+
 func validpayload(data []byte, i int) (outi int, ok bool) {
 	for ; i < len(data); i++ {
 		switch data[i] {
