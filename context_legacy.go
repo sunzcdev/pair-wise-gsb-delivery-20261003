@@ -17,6 +17,9 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// the response writer that tracks
+	// whether the response has been committed
+	writer *csrfResponseWriter
 }
 
 var (
@@ -98,4 +101,26 @@ func ctxClear(req *http.Request) {
 	defer cmMutex.Unlock()
 
 	delete(contextMap, req)
+}
+
+// ctxGet returns the CSRF context of the request,
+// or nil if the request has not passed through CSRFHandler.
+func ctxGet(req *http.Request) *csrfContext {
+	cmMutex.RLock()
+	defer cmMutex.RUnlock()
+
+	return contextMap[req]
+}
+
+func ctxSetWriter(req *http.Request, w *csrfResponseWriter) {
+	cmMutex.Lock()
+	defer cmMutex.Unlock()
+
+	ctx, ok := contextMap[req]
+	if !ok {
+		ctx = new(csrfContext)
+		contextMap[req] = ctx
+	}
+
+	ctx.writer = w
 }

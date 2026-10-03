@@ -16,6 +16,9 @@ type csrfContext struct {
 	token string
 	// reason for the failure of CSRF check
 	reason error
+	// the response writer that tracks
+	// whether the response has been committed
+	writer *csrfResponseWriter
 }
 
 // Token takes an HTTP request and returns
@@ -46,6 +49,19 @@ func Reason(req *http.Request) error {
 }
 
 func ctxClear(_ *http.Request) {
+}
+
+// ctxGet returns the CSRF context of the request,
+// or nil if the request has not passed through CSRFHandler.
+func ctxGet(req *http.Request) *csrfContext {
+	ctx, _ := req.Context().Value(nosurfKey).(*csrfContext)
+	return ctx
+}
+
+func ctxSetWriter(req *http.Request, w *csrfResponseWriter) {
+	if ctx := ctxGet(req); ctx != nil {
+		ctx.writer = w
+	}
 }
 
 func ctxSetToken(req *http.Request, token []byte) {

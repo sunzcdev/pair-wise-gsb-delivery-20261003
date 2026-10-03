@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -38,6 +39,16 @@ var (
 	errNoOrigin = errors.New("Origin header was not present")
 )
 
+// Reasons a token rotation (see RegenerateToken) cannot be performed.
+var (
+	// The request has not passed through CSRFHandler,
+	// so there is no CSRF context to store the new token in.
+	ErrNoContext = errors.New("nosurf: the request has not been processed by CSRFHandler, no CSRF context found")
+	// The response has already been committed (its header was written),
+	// so the cookie carrying the new token can no longer be sent to the client.
+	ErrResponseCommitted = errors.New("nosurf: the response has already been committed, the new token cookie cannot be sent")
+)
+
 type CSRFHandler struct {
 	// Handlers that CSRFHandler wraps.
 	successHandler http.Handler
@@ -67,6 +78,40 @@ type CSRFHandler struct {
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, http.StatusText(FailureCode), FailureCode)
+}
+
+// csrfResponseWriter wraps the http.ResponseWriter
+// that is passed to the wrapped handler
+// and tracks whether the response has been committed
+// (that is, whether its header has been written).
+// RegenerateToken uses this to determine
+// whether a token rotation can still be performed.
+type csrfResponseWriter struct {
+	http.ResponseWriter
+	committed bool
+}
+
+func (w *csrfResponseWriter) WriteHeader(code int) {
+	w.committed = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *csrfResponseWriter) Write(b []byte) (int, error) {
+	w.committed = true
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *csrfResponseWriter) Flush() {
+	w.committed = true
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap returns the underlying http.ResponseWriter,
+// e.g. for use with http.ResponseController.
+func (w *csrfResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 // Extracts the "sent" token from the request
@@ -125,6 +170,13 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer ctxClear(r)
 	w.Header().Add("Vary", "Cookie")
 
+	// Track whether the response gets committed,
+	// so that RegenerateToken can tell
+	// whether a token rotation is still possible.
+	trackedWriter := &csrfResponseWriter{ResponseWriter: w}
+	ctxSetWriter(r, trackedWriter)
+	w = trackedWriter
+
 	var realToken []byte
 
 	tokenCookie, err := r.Cookie(h.getCookieName())
@@ -141,7 +193,9 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// As a consequence, CSRF check will fail when comparing the tokens later on,
 	// so we don't have to fail it just yet.
 	if len(realToken) != tokenLength {
-		h.RegenerateToken(w, r)
+		// The context has just been set up and the response
+		// has not been committed yet, so this cannot fail.
+		_, _ = h.RegenerateToken(w, r)
 	} else {
 		ctxSetToken(r, realToken)
 	}
@@ -253,12 +307,41 @@ func (h *CSRFHandler) checkOrigin(selfOrigin *url.URL, r *http.Request) error {
 	return ErrBadOrigin
 }
 
-// Generates a new token, sets it on the given request and returns it
-func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) string {
+// RegenerateToken rotates the CSRF token: it generates a new token,
+// makes it available to the rest of the request via Token()
+// and sends it to the client as a cookie,
+// invalidating the token that was in use before.
+//
+// This is useful after a change of the user's privileges
+// (e.g. logging in or out), so that any previously issued token
+// can no longer be used.
+//
+// On success it returns the new (masked) token,
+// which is the same value that Token(r) returns after the call.
+// The rotation does not affect the result of the CSRF check
+// of the request currently being served:
+// that check has already been made against the previous token.
+//
+// An error is returned and no rotation is performed when:
+//   - the request has not passed through CSRFHandler (ErrNoContext), or
+//   - the response has already been committed (ErrResponseCommitted).
+//
+// Compatibility note: RegenerateToken used to return only the token
+// and could not report the failures described above.
+// To keep the old behavior, simply ignore the returned error.
+func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) (string, error) {
+	ctx := ctxGet(r)
+	if ctx == nil {
+		return "", ErrNoContext
+	}
+	if ctx.writer != nil && ctx.writer.committed {
+		return "", ErrResponseCommitted
+	}
+
 	token := generateToken()
 	h.setTokenCookie(w, r, token)
 
-	return Token(r)
+	return Token(r), nil
 }
 
 func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, token []byte) {
@@ -269,8 +352,29 @@ func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, tok
 	cookie.Name = h.getCookieName()
 	cookie.Value = b64encode(token)
 
+	// If a token cookie has already been queued during this request
+	// (e.g. the token has been rotated more than once),
+	// drop it: only the last token must be sent to the client.
+	removeSetCookieHeaders(w.Header(), cookie.Name)
 	http.SetCookie(w, &cookie)
 
+}
+
+// removeSetCookieHeaders deletes any pending Set-Cookie headers
+// for a cookie with the given name.
+func removeSetCookieHeaders(header http.Header, name string) {
+	cookies := header["Set-Cookie"]
+	if len(cookies) == 0 {
+		return
+	}
+
+	kept := cookies[:0]
+	for _, c := range cookies {
+		if i := strings.IndexByte(c, '='); i < 0 || c[:i] != name {
+			kept = append(kept, c)
+		}
+	}
+	header["Set-Cookie"] = kept
 }
 
 // Sets the handler to call in case the CSRF check

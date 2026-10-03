@@ -117,6 +117,30 @@ func HandleJson(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+### Rotating the token
+After a change of the user's privileges (e.g. logging in or out),
+the CSRF token should be rotated, so that any previously issued token
+can no longer be used:
+
+```go
+token, err := csrfHandler.RegenerateToken(w, r)
+if err != nil {
+	// The rotation could not be performed:
+	// nosurf.ErrNoContext - the request has not passed through CSRFHandler;
+	// nosurf.ErrResponseCommitted - the response has already been committed.
+}
+```
+
+On success the new token is returned and `nosurf.Token(r)` reflects it
+immediately for the rest of the request. If the token is rotated multiple
+times while serving a single response, only the last token is sent
+to the client. The rotation does not change the result of the CSRF check
+of the request being served.
+
+Compatibility note: `RegenerateToken` used to return only the token
+and could not report the failures described above.
+To keep the old behavior, simply ignore the returned error.
+
 ### Contributing
 
 0. Find an issue that bugs you / open a new one.
