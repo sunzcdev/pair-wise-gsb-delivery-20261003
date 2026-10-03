@@ -7,6 +7,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `Packet.WriteTo` and `Packet.AppendTo`: streaming BER encoders that compute
+  node lengths in a first pass and then write headers and leaf content
+  sequentially, avoiding the O(depth x subtree) copying of `Bytes` on deep
+  trees. They validate the tree up front (nil nodes, nil leaf `Data`, cycles,
+  and length overflow are errors; a shared subtree is encoded once per
+  occurrence) and stop at the first underlying short write or error.
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
