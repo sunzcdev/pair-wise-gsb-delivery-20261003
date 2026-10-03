@@ -461,6 +461,8 @@ You can override alignment rendering method via options.
 | Functional option | Type | Description |
 | ----------------- | ---- | ----------- |
 | `extension.WithTableCellAlignMethod` | `extension.TableCellAlignMethod` | Option indicates how are table cells aligned. |
+| `extension.WithTableCellSpan` | option | Enables explicit cell merging. A cell containing only `>` is merged into the cell on its left, and a cell containing only `^` is merged into the cell above. Every merged region must form a rectangle; invalid merges make the block render as a paragraph. Escaped markers and markers in code spans are ordinary text. |
+| `extension.WithTableCellMergeErrorHandler` | `extension.TableCellMergeErrorHandler` | Receives `*extension.TableCellMergeError` when cell span resolution fails. |
 
 ### Typographer extension
 

@@ -114,13 +114,35 @@ func NewTableHeader() *TableHeader {
 type TableCell struct {
 	gast.BaseBlock
 	Alignment Alignment
+
+	// Colspan is the number of columns this cell spans. It is 1 for ordinary
+	// cells and greater than 1 when adjacent cells were merged into it with
+	// the `>` cell span marker.
+	Colspan int
+
+	// Rowspan is the number of rows this cell spans. It is 1 for ordinary
+	// cells and greater than 1 when cells below were merged into it with
+	// the `^` cell span marker.
+	Rowspan int
+
+	// CoveredCells holds the cells that were merged into this origin cell.
+	// Covered cells are removed from their rows and exist only here to keep
+	// the merge coverage relationship inspectable.
+	CoveredCells []*TableCell
 }
 
 // Dump implements Node.Dump.
 func (n *TableCell) Dump(_ []byte) *gast.NodeDump {
-	return gast.NewNodeDump(n, map[string]any{
+	values := map[string]any{
 		"Alignment": n.Alignment.String(),
-	})
+	}
+	if n.Colspan > 1 {
+		values["Colspan"] = n.Colspan
+	}
+	if n.Rowspan > 1 {
+		values["Rowspan"] = n.Rowspan
+	}
+	return gast.NewNodeDump(n, values)
 }
 
 // KindTableCell is a NodeKind of the TableCell node.

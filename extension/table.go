@@ -22,6 +22,50 @@ type escapedPipeCell struct {
 	Transformed bool
 }
 
+// TableCellMergeError reports a structural error found while resolving table
+// cell span markers (the > and ^ markers enabled by WithTableCellSpan).
+type TableCellMergeError struct {
+	// Reason is one of the TableCellMergeError* constants describing the error.
+	Reason TableCellMergeErrorReason
+	// Row is the 0-based row index of the offending marker cell. Row 0 is the
+	// header row.
+	Row int
+	// Column is the 0-based column index of the offending marker cell.
+	Column int
+	// Line is the source position of the offending marker cell.
+	Line int
+}
+
+func (e *TableCellMergeError) Error() string {
+	return fmt.Sprintf("table cell span error at row %d column %d: %s", e.Row, e.Column, e.Reason)
+}
+
+// TableCellMergeErrorReason describes why cell span marker resolution failed.
+type TableCellMergeErrorReason string
+
+const (
+	// TableCellMergeErrorMergeLeftInFirstColumn indicates that a > marker
+	// appeared in the first column, where no cell exists on the left.
+	TableCellMergeErrorMergeLeftInFirstColumn TableCellMergeErrorReason = "a > marker cannot be used in the first column"
+
+	// TableCellMergeErrorMergeUpInFirstRow indicates that a ^ marker
+	// appeared in the header row, where no cell exists above.
+	TableCellMergeErrorMergeUpInFirstRow TableCellMergeErrorReason = "a ^ marker cannot be used in the first row"
+
+	// TableCellMergeErrorMergeAcrossHeaderBody indicates that a ^ marker in
+	// the first body row tried to merge across the header/body boundary.
+	TableCellMergeErrorMergeAcrossHeaderBody TableCellMergeErrorReason = "a ^ marker cannot merge across the header and body boundary"
+
+	// TableCellMergeErrorNonRectangular indicates that merged cells do not form
+	// a rectangle, producing an L-shape or overlapping merge regions.
+	TableCellMergeErrorNonRectangular TableCellMergeErrorReason = "merged cells must form a rectangle"
+)
+
+// TableCellMergeErrorHandler is notified about structural errors found while
+// resolving table cell span markers. Regardless of the handler's action, the
+// malformed table is rejected and rendered as a plain paragraph.
+type TableCellMergeErrorHandler func(*TableCellMergeError)
+
 // TableCellAlignMethod indicates how table cells are aligned in HTML format.
 type TableCellAlignMethod int
 
@@ -113,13 +157,62 @@ func classifyTableDelim(col []byte) (alignment ast.Alignment, ok bool) {
 	}
 }
 
-type tableParagraphTransformer struct {
+type tableParserConfig struct {
+	cellSpan     bool
+	onMergeError TableCellMergeErrorHandler
 }
 
-var defaultTableParagraphTransformer = &tableParagraphTransformer{}
+// TableParserOption is a functional option for the table parser extension.
+type TableParserOption interface {
+	applyTableParserOption(*tableParserConfig)
+}
 
-func newTableParagraphTransformer() parser.ParagraphTransformer {
-	return defaultTableParagraphTransformer
+type withTableCellSpan struct {
+	enabled bool
+}
+
+func (o *withTableCellSpan) applyTableParserOption(c *tableParserConfig) {
+	c.cellSpan = o.enabled
+}
+
+// WithTableCellSpan enables explicit table cell merging.
+//
+// A cell whose content is exactly > is merged into the cell on its left, and
+// a cell whose content is exactly ^ is merged into the cell above. Escaped
+// markers and markers inside code spans are treated as ordinary text. Every
+// merged region must form a rectangle.
+func WithTableCellSpan() TableParserOption {
+	return &withTableCellSpan{enabled: true}
+}
+
+type withTableCellMergeErrorHandler struct {
+	handler TableCellMergeErrorHandler
+}
+
+func (o *withTableCellMergeErrorHandler) applyTableParserOption(c *tableParserConfig) {
+	c.onMergeError = o.handler
+}
+
+// WithTableCellMergeErrorHandler sets a handler that is notified when cell
+// span marker resolution fails. It takes effect only with WithTableCellSpan.
+func WithTableCellMergeErrorHandler(handler TableCellMergeErrorHandler) TableParserOption {
+	return &withTableCellMergeErrorHandler{handler: handler}
+}
+
+type tableParagraphTransformer struct {
+	cellSpan     bool
+	onMergeError TableCellMergeErrorHandler
+}
+
+func newTableParagraphTransformer(opts ...TableParserOption) parser.ParagraphTransformer {
+	config := tableParserConfig{}
+	for _, opt := range opts {
+		opt.applyTableParserOption(&config)
+	}
+	return &tableParagraphTransformer{
+		cellSpan:     config.cellSpan,
+		onMergeError: config.onMergeError,
+	}
 }
 
 func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.Reader, pc parser.Context) {
@@ -137,6 +230,18 @@ func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.
 		if header == nil || len(alignments) != header.ChildCount() {
 			return
 		}
+		bodyRows := make([]*ast.TableRow, 0, len(lines)-i-1)
+		for j := i + 1; j < len(lines); j++ {
+			bodyRows = append(bodyRows, b.parseRow(lines[j], alignments, false, reader, pc))
+		}
+		if b.cellSpan {
+			if err := b.resolveCellSpan(header, bodyRows, reader.Source()); err != nil {
+				if b.onMergeError != nil {
+					b.onMergeError(err)
+				}
+				continue
+			}
+		}
 		table := ast.NewTable()
 		table.SetPos(ppos)
 		tableHeader := ast.NewTableHeader()
@@ -149,13 +254,13 @@ func (b *tableParagraphTransformer) Transform(node *gast.Paragraph, reader text.
 		}
 		table.AppendChild(tableHeader)
 		var body *ast.TableBody
-		for j := i + 1; j < len(lines); j++ {
+		for _, row := range bodyRows {
 			if body == nil {
 				body = ast.NewTableBody()
-				body.SetPos(lines[j].Start)
+				body.SetPos(row.Pos())
 				table.AppendChild(body)
 			}
-			body.AppendChild(b.parseRow(lines[j], alignments, false, reader, pc))
+			body.AppendChild(row)
 		}
 		node.SetSource(lines[:i-1])
 		node.Parent().InsertAfter(node, table)
@@ -259,6 +364,200 @@ func (b *tableParagraphTransformer) parseDelimiter(segment text.Segment, reader 
 		alignments = append(alignments, alignment)
 	}
 	return alignments
+}
+
+// cellSpanMarker returns > or ^ when the cell's raw content is exactly one of
+// the cell span markers. Escaped markers and markers inside code spans are not
+// trimmed by the parser, so they never match.
+func cellSpanMarker(cell *ast.TableCell, source []byte) byte {
+	segs := cell.Source()
+	if len(segs) != 1 {
+		return 0
+	}
+	raw := segs[0].Bytes(source)
+	if len(raw) != 1 {
+		return 0
+	}
+	switch raw[0] {
+	case '>', '^':
+		return raw[0]
+	}
+	return 0
+}
+
+// resolveCellSpan resolves > (merge left) and ^ (merge up) markers and applies
+// them to the AST. It returns a structural error when markers are placed at an
+// edge, cross the header/body boundary, or form a non-rectangular region.
+func (b *tableParagraphTransformer) resolveCellSpan(
+	header *ast.TableRow, bodyRows []*ast.TableRow, source []byte) *TableCellMergeError {
+	rows := make([]*ast.TableRow, 0, len(bodyRows)+1)
+	rows = append(rows, header)
+	rows = append(rows, bodyRows...)
+
+	width := 0
+	for _, row := range rows {
+		if row.ChildCount() > width {
+			width = row.ChildCount()
+		}
+	}
+
+	grid := make([][]*ast.TableCell, len(rows))
+	for r, row := range rows {
+		grid[r] = make([]*ast.TableCell, row.ChildCount())
+		c := 0
+		for cell := row.FirstChild(); cell != nil; cell = cell.NextSibling() {
+			grid[r][c] = cell.(*ast.TableCell)
+			c++
+		}
+	}
+
+	// owners[r][c] is the origin cell that owns grid position (r, c).
+	owners := make([][]*ast.TableCell, len(rows))
+	for r := range owners {
+		owners[r] = make([]*ast.TableCell, width)
+	}
+
+	mergeError := func(reason TableCellMergeErrorReason, r, c int) *TableCellMergeError {
+		err := &TableCellMergeError{
+			Reason: reason,
+			Row:    r,
+			Column: c,
+			Line:   -1,
+		}
+		if r < len(grid) && c < len(grid[r]) {
+			err.Line = grid[r][c].Pos()
+		}
+		return err
+	}
+
+	for r, row := range grid {
+		for c, cell := range row {
+			marker := cellSpanMarker(cell, source)
+			if marker == 0 {
+				owners[r][c] = cell
+				continue
+			}
+			switch marker {
+			case '>':
+				if c == 0 {
+					return mergeError(TableCellMergeErrorMergeLeftInFirstColumn, r, c)
+				}
+				owners[r][c] = owners[r][c-1]
+			case '^':
+				if r == 0 {
+					return mergeError(TableCellMergeErrorMergeUpInFirstRow, r, c)
+				}
+				if r == 1 {
+					return mergeError(TableCellMergeErrorMergeAcrossHeaderBody, r, c)
+				}
+				if c >= len(grid[r-1]) {
+					return mergeError(TableCellMergeErrorNonRectangular, r, c)
+				}
+				owners[r][c] = owners[r-1][c]
+			}
+		}
+	}
+
+	// Group covered positions by origin.
+	covered := map[*ast.TableCell][][2]int{}
+	var origins []*ast.TableCell
+	for r := range grid {
+		for c := 0; c < width; c++ {
+			if c >= len(grid[r]) {
+				continue
+			}
+			origin := owners[r][c]
+			if origin == grid[r][c] {
+				if _, ok := covered[origin]; !ok {
+					covered[origin] = nil
+					origins = append(origins, origin)
+				}
+				continue
+			}
+			if _, ok := covered[origin]; !ok {
+				origins = append(origins, origin)
+			}
+			covered[origin] = append(covered[origin], [2]int{r, c})
+		}
+	}
+
+	// Every merge region must be a rectangle.
+	for _, origin := range origins {
+		list := covered[origin]
+		if len(list) == 0 {
+			continue
+		}
+		or, oc := -1, -1
+		for r := range grid {
+			found := false
+			for c := 0; c < len(grid[r]); c++ {
+				if grid[r][c] == origin {
+					or, oc = r, c
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		maxR, maxC := or, oc
+		for _, pos := range list {
+			if pos[0] > maxR {
+				maxR = pos[0]
+			}
+			if pos[1] > maxC {
+				maxC = pos[1]
+			}
+		}
+		rowspan := maxR - or + 1
+		colspan := maxC - oc + 1
+		if len(list)+1 != rowspan*colspan {
+			// Report the first marker inside the would-be rectangle that
+			// leaves a non-rectangular hole behind it.
+			for rr := or; rr <= maxR; rr++ {
+				for cc := oc; cc <= maxC; cc++ {
+					if cc < len(grid[rr]) && owners[rr][cc] == origin &&
+						grid[rr][cc] != origin {
+						return mergeError(TableCellMergeErrorNonRectangular, rr, cc)
+					}
+				}
+			}
+			return mergeError(TableCellMergeErrorNonRectangular, maxR, maxC)
+		}
+		want := map[[2]int]bool{}
+		for rr := or; rr <= maxR; rr++ {
+			for cc := oc; cc <= maxC; cc++ {
+				want[[2]int{rr, cc}] = true
+			}
+		}
+		want[[2]int{or, oc}] = false
+		for _, pos := range list {
+			want[pos] = false
+		}
+		for rr := or; rr <= maxR; rr++ {
+			for cc := oc; cc <= maxC; cc++ {
+				if want[[2]int{rr, cc}] {
+					if cc < len(grid[rr]) {
+						if owners[rr][cc] != origin {
+							return mergeError(TableCellMergeErrorNonRectangular, rr, cc)
+						}
+						continue
+					}
+					return mergeError(TableCellMergeErrorNonRectangular, rr, cc)
+				}
+			}
+		}
+		origin.Colspan = colspan
+		origin.Rowspan = rowspan
+		origin.CoveredCells = make([]*ast.TableCell, 0, len(list))
+		for _, pos := range list {
+			r, c := pos[0], pos[1]
+			origin.CoveredCells = append(origin.CoveredCells, grid[r][c])
+			rows[r].RemoveChild(grid[r][c])
+		}
+	}
+	return nil
 }
 
 type tableASTTransformer struct {
@@ -491,6 +790,16 @@ func (r *tableHTMLRendererExtension) renderTableCell(
 				n.SetAttribute("style", text.NewMultiLineValueFromString(string(cob.Bytes()), text.IdentityDecoder))
 			}
 		}
+		if n.Colspan > 1 {
+			if _, ok := n.Attribute("colspan"); !ok {
+				_, _ = fmt.Fprintf(w, ` colspan="%d"`, n.Colspan)
+			}
+		}
+		if n.Rowspan > 1 {
+			if _, ok := n.Attribute("rowspan"); !ok {
+				_, _ = fmt.Fprintf(w, ` rowspan="%d"`, n.Rowspan)
+			}
+		}
 		if n.Attributes() != nil {
 			if tag == "td" {
 				html.RenderAttributes(w, source, n, TableTdCellAttributeFilter, rc) // <td>
@@ -506,17 +815,25 @@ func (r *tableHTMLRendererExtension) renderTableCell(
 }
 
 type tableParserExtension struct {
+	config tableParserConfig
 }
 
 // NewTableParser returns a new parser.Extension for parsing GFM tables.
-func NewTableParser() parser.Extension {
-	return &tableParserExtension{}
+func NewTableParser(opts ...TableParserOption) parser.Extension {
+	config := tableParserConfig{}
+	for _, opt := range opts {
+		opt.applyTableParserOption(&config)
+	}
+	return &tableParserExtension{config: config}
 }
 
 func (e *tableParserExtension) ParserOptions(_ *parser.Config) []parser.Option {
 	return []parser.Option{
 		parser.WithParagraphTransformers(
-			util.Prioritized(newTableParagraphTransformer(), 200),
+			util.Prioritized(newTableParagraphTransformer(
+				&withTableCellSpan{enabled: e.config.cellSpan},
+				&withTableCellMergeErrorHandler{handler: e.config.onMergeError},
+			), 200),
 		),
 		parser.WithASTTransformers(
 			util.Prioritized(defaultTableASTTransformer, 0),
