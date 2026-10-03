@@ -29,6 +29,16 @@ func (tscb *TwoStepCircuitBreaker[T]) Counts() Counts {
 	return tscb.cb.Counts()
 }
 
+// Policy returns a copy of the TwoStepCircuitBreaker policy currently in effect.
+func (tscb *TwoStepCircuitBreaker[T]) Policy() Policy {
+	return tscb.cb.Policy()
+}
+
+// UpdatePolicy validates and atomically applies a complete policy update.
+func (tscb *TwoStepCircuitBreaker[T]) UpdatePolicy(policy Policy, closedCounts ClosedCountsPolicy) error {
+	return tscb.cb.UpdatePolicy(policy, closedCounts)
+}
+
 // Allow checks if a new request can proceed.
 // If the circuit breaker allow the new request, it returns a callback
 // used to register the error object that the request will return in a separate step.

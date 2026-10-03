@@ -95,6 +95,31 @@ type Counts struct {
 on the change of the state or at the closed-state intervals.
 `Counts` ignores the results of the requests sent before clearing.
 
+Policy updates
+--------------
+
+Use `UpdatePolicy` to change the half-open request limit, open-state timeout,
+and closed-state window as one validated transaction:
+
+```go
+err := cb.UpdatePolicy(gobreaker.Policy{
+    MaxRequests:  5,
+    Interval:     30 * time.Second,
+    BucketPeriod: 3 * time.Second,
+    Timeout:      60 * time.Second,
+}, gobreaker.ResetClosedCounts)
+```
+
+- `ResetClosedCounts` clears closed-state `Counts` when the update becomes active.
+- `PreserveClosedCounts` keeps the aggregate closed-state `Counts`. When the
+  bucket layout changes, old buckets are not reused or interpreted with the new
+  ring. The carried aggregate ages out after one complete new window.
+- A request captures its generation when it starts. If a policy update occurs
+  while the request is running, its result is applied to the old generation only
+  and cannot modify the updated counters.
+- Invalid updates return `ErrInvalidPolicy` and leave the active policy, state,
+  counters, and generation unchanged.
+
 `CircuitBreaker` can wrap any function to send a request:
 
 ```go

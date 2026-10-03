@@ -5,6 +5,7 @@ package gobreaker
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -24,6 +25,8 @@ var (
 	ErrTooManyRequests = errors.New("too many requests")
 	// ErrOpenState is returned when the CB state is open
 	ErrOpenState = errors.New("circuit breaker is open")
+	// ErrInvalidPolicy is returned when a policy update contains invalid values.
+	ErrInvalidPolicy = errors.New("invalid circuit breaker policy")
 )
 
 // String implements stringer interface.
@@ -92,6 +95,25 @@ type Settings struct {
 	IsExcluded    func(err error) bool
 }
 
+// Policy contains the CircuitBreaker settings that can be changed safely after
+// construction.
+type Policy struct {
+	MaxRequests  uint32
+	Interval     time.Duration
+	BucketPeriod time.Duration
+	Timeout      time.Duration
+}
+
+// ClosedCountsPolicy selects how a policy update treats Counts in the closed state.
+type ClosedCountsPolicy int
+
+const (
+	// ResetClosedCounts clears Counts when a policy update takes effect.
+	ResetClosedCounts ClosedCountsPolicy = iota
+	// PreserveClosedCounts keeps Counts in the closed state when a policy update takes effect.
+	PreserveClosedCounts
+)
+
 // CircuitBreaker is a state machine to prevent sending requests that are likely to fail.
 type CircuitBreaker[T any] struct {
 	name          string
@@ -108,8 +130,10 @@ type CircuitBreaker[T any] struct {
 	state      State
 	generation uint64
 	counts     *rollingCounts
+	numBuckets int
 	start      time.Time
 	expiry     time.Time
+	inFlight   map[uint64]map[uint64]uint32
 }
 
 // NewCircuitBreaker returns a new CircuitBreaker configured with the given Settings.
@@ -119,34 +143,14 @@ func NewCircuitBreaker[T any](st Settings) *CircuitBreaker[T] {
 	cb.name = st.Name
 	cb.onStateChange = st.OnStateChange
 
-	if st.MaxRequests == 0 {
-		cb.maxRequests = 1
-	} else {
-		cb.maxRequests = st.MaxRequests
-	}
-
-	var numBuckets int64
-	if st.Interval <= 0 {
-		cb.interval = defaultInterval
-		cb.bucketPeriod = cb.interval
-		numBuckets = 1
-	} else if st.BucketPeriod <= 0 {
-		cb.interval = st.Interval
-		cb.bucketPeriod = cb.interval
-		numBuckets = 1
-	} else {
-		cb.interval = (st.Interval + st.BucketPeriod - 1) / st.BucketPeriod * st.BucketPeriod
-		cb.bucketPeriod = st.BucketPeriod
-		numBuckets = int64(cb.interval / cb.bucketPeriod)
-	}
-
-	cb.counts = newRollingCounts(numBuckets)
-
-	if st.Timeout <= 0 {
-		cb.timeout = defaultTimeout
-	} else {
-		cb.timeout = st.Timeout
-	}
+	policy, numBuckets := policyFromSettings(st)
+	cb.maxRequests = policy.MaxRequests
+	cb.interval = policy.Interval
+	cb.bucketPeriod = policy.BucketPeriod
+	cb.timeout = policy.Timeout
+	cb.numBuckets = numBuckets
+	cb.counts = newRollingCounts(int64(numBuckets))
+	cb.inFlight = make(map[uint64]map[uint64]uint32)
 
 	if st.ReadyToTrip == nil {
 		cb.readyToTrip = defaultReadyToTrip
@@ -186,6 +190,89 @@ func defaultIsExcluded(_ error) bool {
 	return false
 }
 
+func policyFromSettings(st Settings) (Policy, int) {
+	policy := Policy{
+		MaxRequests:  st.MaxRequests,
+		Interval:     st.Interval,
+		BucketPeriod: st.BucketPeriod,
+		Timeout:      st.Timeout,
+	}
+
+	if policy.MaxRequests == 0 {
+		policy.MaxRequests = 1
+	}
+	if policy.Interval <= 0 {
+		policy.Interval = defaultInterval
+		policy.BucketPeriod = defaultInterval
+	} else if policy.BucketPeriod <= 0 {
+		policy.BucketPeriod = policy.Interval
+	} else {
+		policy.Interval = ceilDuration(policy.Interval, policy.BucketPeriod)
+	}
+	if policy.Timeout <= 0 {
+		policy.Timeout = defaultTimeout
+	}
+
+	return policy, bucketCount(policy)
+}
+
+func validatePolicy(policy Policy) (Policy, int, error) {
+	if policy.Timeout < 0 {
+		return Policy{}, 0, fmt.Errorf("%w: timeout must not be negative", ErrInvalidPolicy)
+	}
+	if policy.Timeout == 0 {
+		policy.Timeout = defaultTimeout
+	}
+	if policy.MaxRequests == 0 {
+		policy.MaxRequests = 1
+	}
+	if policy.Interval < 0 {
+		return Policy{}, 0, fmt.Errorf("%w: interval must not be negative", ErrInvalidPolicy)
+	}
+	if policy.BucketPeriod < 0 {
+		return Policy{}, 0, fmt.Errorf("%w: bucket period must not be negative", ErrInvalidPolicy)
+	}
+	if policy.Interval == 0 {
+		if policy.BucketPeriod > 0 {
+			return Policy{}, 0, fmt.Errorf("%w: bucket period requires a positive interval", ErrInvalidPolicy)
+		}
+		policy.BucketPeriod = 0
+		return policy, 0, nil
+	}
+	if policy.BucketPeriod > 0 && policy.Interval > math.MaxInt64-(policy.BucketPeriod-1) {
+		return Policy{}, 0, fmt.Errorf("%w: interval is too large", ErrInvalidPolicy)
+	}
+
+	if policy.BucketPeriod == 0 {
+		policy.BucketPeriod = policy.Interval
+		return policy, 1, nil
+	}
+	if policy.BucketPeriod > policy.Interval {
+		return Policy{}, 0, fmt.Errorf("%w: bucket period must not exceed interval", ErrInvalidPolicy)
+	}
+
+	policy.Interval = ceilDuration(policy.Interval, policy.BucketPeriod)
+	numBuckets64 := int64(policy.Interval / policy.BucketPeriod)
+	if numBuckets64 > int64(math.MaxInt) {
+		return Policy{}, 0, fmt.Errorf("%w: bucket period is too small", ErrInvalidPolicy)
+	}
+	return policy, int(numBuckets64), nil
+}
+
+func bucketCount(policy Policy) int {
+	if policy.Interval == 0 {
+		return 0
+	}
+	if policy.BucketPeriod == 0 {
+		return 1
+	}
+	return int(policy.Interval / policy.BucketPeriod)
+}
+
+func ceilDuration(interval, bucketPeriod time.Duration) time.Duration {
+	return (interval + bucketPeriod - 1) / bucketPeriod * bucketPeriod
+}
+
 // Name returns the name of the CircuitBreaker.
 func (cb *CircuitBreaker[T]) Name() string {
 	return cb.name
@@ -207,6 +294,94 @@ func (cb *CircuitBreaker[T]) Counts() Counts {
 	defer cb.mutex.Unlock()
 
 	return cb.counts.Counts
+}
+
+// Policy returns a copy of the CircuitBreaker policy currently in effect.
+func (cb *CircuitBreaker[T]) Policy() Policy {
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	return cb.policy()
+}
+
+// UpdatePolicy validates the complete policy and applies it atomically. Requests
+// that started before the update finish against the previous generation and cannot
+// modify counters after the update.
+func (cb *CircuitBreaker[T]) UpdatePolicy(policy Policy, closedCounts ClosedCountsPolicy) error {
+	if closedCounts != ResetClosedCounts && closedCounts != PreserveClosedCounts {
+		return fmt.Errorf("%w: invalid closed counts policy", ErrInvalidPolicy)
+	}
+
+	normalized, numBuckets, err := validatePolicy(policy)
+	if err != nil {
+		return err
+	}
+
+	cb.mutex.Lock()
+	defer cb.mutex.Unlock()
+
+	now := time.Now()
+	state, _, _ := cb.currentState(now)
+	stateStart := cb.start
+	previousGeneration := cb.generation
+	layoutChanged := numBuckets != cb.numBuckets ||
+		normalized.Interval != cb.interval ||
+		normalized.BucketPeriod != cb.bucketPeriod
+
+	cb.generation++
+	cb.maxRequests = normalized.MaxRequests
+	cb.interval = normalized.Interval
+	cb.bucketPeriod = normalized.BucketPeriod
+	cb.timeout = normalized.Timeout
+	cb.numBuckets = numBuckets
+	cb.removeInFlightRequests(previousGeneration)
+
+	if state == StateClosed && closedCounts == PreserveClosedCounts && !layoutChanged {
+		return nil
+	}
+
+	carriedCounts := Counts{}
+	if state == StateClosed && closedCounts == PreserveClosedCounts {
+		carriedCounts = cb.counts.Counts
+	}
+
+	cb.counts = newRollingCounts(int64(numBuckets))
+	cb.counts.carry(carriedCounts)
+	if state == StateOpen {
+		cb.start = stateStart
+		cb.expiry = stateStart.Add(cb.timeout)
+		if !cb.expiry.After(now) {
+			cb.setState(StateHalfOpen, now)
+		}
+	} else {
+		cb.start = now
+		cb.expiry = cb.expiryForState(state, now)
+	}
+
+	return nil
+}
+
+func (cb *CircuitBreaker[T]) policy() Policy {
+	bucketPeriod := cb.bucketPeriod
+	if cb.numBuckets <= 1 {
+		bucketPeriod = 0
+	}
+	return Policy{
+		MaxRequests:  cb.maxRequests,
+		Interval:     cb.interval,
+		BucketPeriod: bucketPeriod,
+		Timeout:      cb.timeout,
+	}
+}
+
+func (cb *CircuitBreaker[T]) expiryForState(state State, now time.Time) time.Time {
+	if state == StateOpen {
+		return now.Add(cb.timeout)
+	}
+	if state == StateClosed && cb.interval > 0 && cb.numBuckets == 1 {
+		return now.Add(cb.interval)
+	}
+	return time.Time{}
 }
 
 // Execute runs the given request if the CircuitBreaker accepts it.
@@ -248,6 +423,7 @@ func (cb *CircuitBreaker[T]) beforeRequest() (uint64, uint64, error) {
 	}
 
 	cb.counts.onRequest()
+	cb.noteInFlight(generation, age)
 	return generation, age, nil
 }
 
@@ -257,6 +433,7 @@ func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error
 
 	now := time.Now()
 	state, generation, _ := cb.currentState(now)
+	defer cb.finishInFlight(previous, age)
 	if generation != previous {
 		return
 	}
@@ -271,6 +448,34 @@ func (cb *CircuitBreaker[T]) afterRequest(previous uint64, age uint64, err error
 	} else {
 		cb.onFailure(state, age, now)
 	}
+}
+
+func (cb *CircuitBreaker[T]) noteInFlight(generation, age uint64) {
+	if cb.inFlight[generation] == nil {
+		cb.inFlight[generation] = make(map[uint64]uint32)
+	}
+	cb.inFlight[generation][age]++
+}
+
+func (cb *CircuitBreaker[T]) finishInFlight(generation, age uint64) {
+	buckets := cb.inFlight[generation]
+	if buckets[age] == 0 {
+		return
+	}
+	buckets[age]--
+	if buckets[age] == 0 {
+		delete(buckets, age)
+	}
+	if len(buckets) == 0 {
+		delete(cb.inFlight, generation)
+	}
+}
+
+func (cb *CircuitBreaker[T]) removeInFlightRequests(generation uint64) {
+	for age, count := range cb.inFlight[generation] {
+		cb.counts.removeRequestsAt(age, count)
+	}
+	delete(cb.inFlight, generation)
 }
 
 func (cb *CircuitBreaker[T]) onSuccess(state State, age uint64, now time.Time) {
@@ -348,6 +553,7 @@ func (cb *CircuitBreaker[T]) setState(state State, now time.Time) {
 func (cb *CircuitBreaker[T]) toNewGeneration(now time.Time) {
 	cb.generation++
 	cb.start = now
+	delete(cb.inFlight, cb.generation-1)
 	cb.counts.clear()
 
 	var zero time.Time
