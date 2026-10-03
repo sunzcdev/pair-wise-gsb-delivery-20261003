@@ -173,6 +173,25 @@
 //	    Public: "I made it through!"
 //	}
 //
+// # Field Masks
+//
+// For partial updates, DecoderConfig.FieldMask restricts decoding to a set
+// of dot-separated field paths declared on the target structure. Selecting
+// a struct field selects its entire subtree; selecting a leaf field leaves
+// its siblings untouched. For example, given:
+//
+//	type Config struct {
+//	    Name    string
+//	    Server  Server
+//	}
+//
+// the mask []string{"server"} allows decoding all of Server, while
+// []string{"server.host"} only allows the host field of Server; every
+// other field keeps its current value, its input is ignored and no decode
+// hooks run for it. See the FieldMask documentation in DecoderConfig for
+// the exact semantics around squashed structs, pointers, maps and the
+// ErrorUnused option.
+//
 // # Custom Decoding with Unmarshaler
 //
 // Types can implement the Unmarshaler interface to control their own decoding. The interface
@@ -266,6 +285,32 @@ type DecoderConfig struct {
 	// keys in the original map that were unused in the decoding process
 	// (extra keys).
 	ErrorUnused bool
+
+	// FieldMask, if non-empty, restricts decoding to the listed field
+	// paths. Paths are dot-separated field names as seen by the decoder:
+	// the tag value when set, otherwise the field name (passed through
+	// MapFieldName). Segments are matched with MatchName.
+	//
+	// Selecting a struct field selects its entire subtree. Selecting a
+	// leaf field leaves its sibling fields untouched. Squashed (embedded)
+	// structs are transparent: their fields are addressed at the parent
+	// level, and selecting a squashed field by its own name selects its
+	// whole subtree. Pointers are traversed transparently. Maps, slices,
+	// arrays and scalar fields are leaves: selecting them includes the
+	// whole value, while selecting into them is an error.
+	//
+	// Masked-out fields are not decoded: their input is ignored, decode
+	// hooks are not invoked for them, they are not reported as unset
+	// (ErrorUnset) and any pre-existing values are preserved. Invalid
+	// mask paths are reported by NewDecoder before any input is
+	// processed.
+	FieldMask []string
+
+	// ErrorUnusedMasked controls how ErrorUnused and Metadata.Unused
+	// treat input keys that correspond to fields excluded by FieldMask.
+	// By default such keys are silently consumed. If ErrorUnusedMasked
+	// is true, they are reported like any other unused key.
+	ErrorUnusedMasked bool
 
 	// If ErrorUnset is true, then it is an error for there to exist
 	// fields in the result that were not set in the decoding process
@@ -386,6 +431,7 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+	fieldMask        *fieldMaskNode
 }
 
 // Metadata contains information about decoding a structure that
@@ -522,6 +568,14 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 	}
 	if config.DecodeHook != nil {
 		result.cachedDecodeHook = cachedDecodeHook(config.DecodeHook)
+	}
+
+	if len(config.FieldMask) > 0 {
+		mask, err := compileFieldMask(config, config.FieldMask, val.Type())
+		if err != nil {
+			return nil, err
+		}
+		result.fieldMask = mask
 	}
 
 	return result, nil
@@ -1561,6 +1615,17 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 	var errs []error
 
+	// If a field mask is configured, resolve the mask node that governs
+	// the struct being decoded. Fields outside the mask are skipped
+	// entirely: their input is not decoded and no hooks run for them.
+	var maskNode *fieldMaskNode
+	if d.fieldMask != nil {
+		maskNode = d.fieldMask.nodeFor(d.maskStructPath(name))
+		if maskNode == nil {
+			maskNode = &fieldMaskNode{}
+		}
+	}
+
 	// This slice will keep track of all the structs we'll be decoding.
 	// There can be more than one struct if there are embedded structs
 	// that are squashed.
@@ -1615,6 +1680,21 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			}
 
 			if squash {
+				// If a field mask is active and none of the promoted
+				// fields are selected, skip the squashed struct entirely.
+				// This also avoids allocating nil embedded struct
+				// pointers that no selected field belongs to.
+				if maskNode != nil && !maskNode.subtree {
+					squashType := fieldType.Type
+					if squashType.Kind() == reflect.Ptr {
+						squashType = squashType.Elem()
+					}
+					if squashType.Kind() == reflect.Struct &&
+						!maskSelectsSquashed(d.config, maskNode, squashType) {
+						continue
+					}
+				}
+
 				switch fieldVal.Kind() {
 				case reflect.Struct:
 					structs = append(structs, fieldVal)
@@ -1645,6 +1725,15 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 
 			// Build our field
 			if remain {
+				if maskNode != nil {
+					remainName := tagParts[0]
+					if remainName == "" {
+						remainName = d.config.MapFieldName(fieldType.Name)
+					}
+					if !maskNode.allows(remainName) {
+						continue
+					}
+				}
 				remainField = &field{fieldType, fieldVal}
 			} else {
 				// Normal struct field, store it away
@@ -1669,6 +1758,11 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fieldName = d.config.MapFieldName(fieldName)
 		}
 
+		// Fields excluded by the field mask are skipped entirely: their
+		// input is not decoded, no hooks run for them and they are not
+		// tracked as unset.
+		masked := maskNode != nil && !maskNode.allows(fieldName)
+
 		rawMapKey := reflect.ValueOf(fieldName)
 		rawMapVal := dataVal.MapIndex(rawMapKey)
 		if !rawMapVal.IsValid() {
@@ -1691,11 +1785,25 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			if !rawMapVal.IsValid() {
 				// There was no matching key in the map for the value in
 				// the struct. Remember it for potential errors and metadata.
+				if masked {
+					continue
+				}
 				if !(d.config.AllowUnsetPointer && fieldValue.Kind() == reflect.Ptr) {
 					targetValKeysUnused[fieldName] = struct{}{}
 				}
 				continue
 			}
+		}
+
+		if masked {
+			// The input key belongs to a masked-out field. Unless
+			// ErrorUnusedMasked is set, consume it silently so it is
+			// neither reported by ErrorUnused nor listed in
+			// Metadata.Unused.
+			if !d.config.ErrorUnusedMasked {
+				delete(dataValKeysUnused, rawMapKey.Interface())
+			}
+			continue
 		}
 
 		if !fieldValue.IsValid() {
