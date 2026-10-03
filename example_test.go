@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"time"
 
 	"github.com/cenkalti/backoff/v7"
@@ -36,9 +35,9 @@ func ExampleRetry() {
 		// If we are being rate limited, return a RetryAfter to specify how long to wait.
 		// This will also reset the backoff policy.
 		if resp.StatusCode == http.StatusTooManyRequests {
-			seconds, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 64)
+			ra, err := backoff.HTTPRetryAfter(resp.Header.Get("Retry-After"), time.Now(), fmt.Errorf("rate limited: %s", resp.Status))
 			if err == nil {
-				return "", backoff.RetryAfter(time.Duration(seconds)*time.Second, fmt.Errorf("rate limited: %s", resp.Status))
+				return "", ra
 			}
 		}
 
