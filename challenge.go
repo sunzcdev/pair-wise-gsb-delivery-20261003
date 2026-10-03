@@ -131,12 +131,19 @@ var ErrNoChallenge = errors.New("digest: no challenge found")
 
 // FindChallenge returns the first supported challenge in the headers
 func FindChallenge(h http.Header) (*Challenge, error) {
+	return findChallengeInHeader(h, "WWW-Authenticate")
+}
+
+// findChallengeInHeader returns the first supported Digest challenge in the
+// values of the provided authenticate header (e.g. WWW-Authenticate for an
+// origin or Proxy-Authenticate for a forward proxy).
+func findChallengeInHeader(h http.Header, header string) (*Challenge, error) {
 	var last error
-	for _, header := range h.Values("WWW-Authenticate") {
-		if !IsDigest(header) {
+	for _, value := range h.Values(header) {
+		if !IsDigest(value) {
 			continue
 		}
-		chal, err := ParseChallenge(header)
+		chal, err := ParseChallenge(value)
 		if err == nil && CanDigest(chal) {
 			return chal, nil
 		}

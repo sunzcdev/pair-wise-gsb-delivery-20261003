@@ -59,6 +59,51 @@ func main() {
 }
 ```
 
+## Proxy Authentication (407)
+
+Set `ProxyUsername` / `ProxyPassword` to answer a forward proxy's Digest
+challenge (`Proxy-Authenticate` / `Proxy-Authorization`). Proxy credentials are
+completely independent of the origin credentials (`Username` / `Password`): the
+two layers keep separate challenge caches and nonce counters. A single request
+may be challenged once by the proxy (407) and then once by the origin (401).
+
+Only ordinary (non-tunneled) proxy requests are supported — the request is
+authenticated against the absolute-form target. `CONNECT` tunnels are not
+handled. When no proxy credentials are configured, a `407` is returned to the
+caller unchanged.
+
+``` go
+package main
+
+import (
+	"net/http"
+
+	"github.com/icholy/digest"
+)
+
+func main() {
+	client := &http.Client{
+		Transport: &digest.Transport{
+			// origin server
+			Username: "foo",
+			Password: "bar",
+			// forward proxy
+			ProxyUsername: "proxy-user",
+			ProxyPassword: "proxy-pass",
+		},
+	}
+	res, err := client.Get("http://example.com/protected")
+	if err != nil {
+		panic(err)
+	}
+	defer res.Body.Close()
+}
+```
+
+Authentication retries must resend the request body. If the body cannot be
+replayed (a `GetBody` that errors), the transport returns
+`digest.ErrBodyNotReplayable` rather than silently sending an empty request.
+
 ## Custom Authenticate Header
 
 ``` go

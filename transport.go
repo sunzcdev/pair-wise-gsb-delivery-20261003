@@ -2,8 +2,12 @@ package digest
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 )
 
@@ -13,10 +17,44 @@ type cchal struct {
 	n int
 }
 
+// authLayer identifies one of the two authentication boundaries handled
+// by the transport: the origin server (401) or a forward proxy (407).
+type authLayer int
+
+const (
+	originLayer authLayer = iota
+	proxyLayer
+)
+
+func (l authLayer) challengeHeader() string {
+	if l == proxyLayer {
+		return "Proxy-Authenticate"
+	}
+	return "WWW-Authenticate"
+}
+
+func (l authLayer) credentialsHeader() string {
+	if l == proxyLayer {
+		return "Proxy-Authorization"
+	}
+	return "Authorization"
+}
+
 // Transport implements http.RoundTripper
 type Transport struct {
 	Username string
 	Password string
+
+	// ProxyUsername and ProxyPassword are used to answer Digest challenges
+	// from a forward proxy (Proxy-Authenticate / 407). They are independent
+	// of the origin credentials (Username / Password). When both are empty,
+	// proxy challenges are not answered and the 407 response is returned as-is.
+	//
+	// Only ordinary (non-tunneled) proxy requests are handled: the request is
+	// authenticated against its absolute-form target. CONNECT tunnels are not
+	// supported.
+	ProxyUsername string
+	ProxyPassword string
 
 	// Digest computes the digest credentials.
 	// If nil, the Digest function is used.
@@ -50,52 +88,88 @@ type Transport struct {
 	// unauthenticated request without draining the body. Applies only when uncached.
 	Probe bool
 
-	// cache of challenges indexed by host
-	cache   map[string]*cchal
-	cacheMu sync.Mutex
+	// challenges cached per layer, indexed by target host
+	originCache map[string]*cchal
+	proxyCache  map[string]*cchal
+	cacheMu     sync.Mutex
 }
 
-// save parses the digest challenge from the response
-// and adds it to the cache
-func (t *Transport) save(res *http.Response) error {
+// ErrBodyNotReplayable is returned when an authentication retry needs to
+// resend the request body but it cannot be reproduced (GetBody fails).
+// The request is never retried with an empty body.
+var ErrBodyNotReplayable = errors.New("digest: request body cannot be replayed for authentication retry")
+
+// save parses the digest challenge from the response and caches it per layer.
+func (t *Transport) save(layer authLayer, res *http.Response) error {
 	// save cookies
 	if t.Jar != nil {
 		t.Jar.SetCookies(res.Request.URL, res.Cookies())
 	}
 	// find and save digest challenge
-	find := t.FindChallenge
-	if find == nil {
-		find = FindChallenge
-	}
-	chal, err := find(res.Header)
+	chal, err := t.findChallenge(layer)(res.Header)
+	host := res.Request.URL.Hostname()
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
-	if t.cache == nil {
-		t.cache = map[string]*cchal{}
+	cache := t.layerCache(layer)
+	if *cache == nil {
+		*cache = map[string]*cchal{}
 	}
 	// TODO: if the challenge contains a domain, we should be using that
 	//       to match against outgoing requests. We're currently ignoring
 	//       it and just matching the hostname. That being said, none of
 	//       the major browsers respect the domain either.
-	host := res.Request.URL.Hostname()
 	if err != nil {
 		// if save is being invoked, the existing cached challenge didn't work
-		delete(t.cache, host)
+		delete(*cache, host)
 		return err
 	}
-	t.cache[host] = &cchal{c: chal}
+	(*cache)[host] = &cchal{c: chal}
 	return nil
 }
 
-// digest creates credentials from the cached challenge
-func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Credentials, error) {
+// findChallenge returns the challenge locator for the given layer.
+// Origin challenges honor the configurable FindChallenge hook; proxy
+// challenges always come from the Proxy-Authenticate header.
+func (t *Transport) findChallenge(layer authLayer) func(http.Header) (*Challenge, error) {
+	if layer == originLayer && t.FindChallenge != nil {
+		return t.FindChallenge
+	}
+	header := layer.challengeHeader()
+	return func(h http.Header) (*Challenge, error) {
+		return findChallengeInHeader(h, header)
+	}
+}
+
+func (t *Transport) layerCache(layer authLayer) *map[string]*cchal {
+	if layer == proxyLayer {
+		return &t.proxyCache
+	}
+	return &t.originCache
+}
+
+// proxyEnabled reports whether proxy credentials are configured.
+func (t *Transport) proxyEnabled() bool {
+	return t.ProxyUsername != "" || t.ProxyPassword != ""
+}
+
+// digest creates credentials from the cached challenge.
+func (t *Transport) digest(layer authLayer, req *http.Request, chal *Challenge, count int) (*Credentials, error) {
+	uri := req.URL.RequestURI()
+	username := t.Username
+	password := t.Password
+	if layer == proxyLayer {
+		// proxy auth covers the absolute-form request target that is forwarded
+		uri = absoluteRequestURI(req.URL)
+		username = t.ProxyUsername
+		password = t.ProxyPassword
+	}
 	opt := Options{
 		Method:   req.Method,
-		URI:      req.URL.RequestURI(),
+		URI:      uri,
 		GetBody:  req.GetBody,
 		Count:    count,
-		Username: t.Username,
-		Password: t.Password,
+		Username: username,
+		Password: password,
 	}
 	if t.Digest != nil {
 		return t.Digest(req, chal, opt)
@@ -103,51 +177,67 @@ func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Cred
 	return Digest(chal, opt)
 }
 
-// challenge returns a cached challenge and count for the provided request
-func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
+// challenge returns a cached challenge and count for the provided request.
+func (t *Transport) challenge(layer authLayer, req *http.Request) (*Challenge, int, bool) {
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
+	cache := *t.layerCache(layer)
 	host := req.URL.Hostname()
-	cc, ok := t.cache[host]
+	cc, ok := cache[host]
 	if !ok {
 		return nil, 0, false
 	}
 	if t.NoReuse {
-		delete(t.cache, host)
+		delete(cache, host)
 	}
 	cc.n++
 	return cc.c, cc.n, true
 }
 
-// prepare sets the Authorization header from a cached challenge if one exists.
-// It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// hasChallenge reports whether a challenge is cached for the layer/host.
+func (t *Transport) hasChallenge(layer authLayer, req *http.Request) bool {
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+	cache := *t.layerCache(layer)
+	_, ok := cache[req.URL.Hostname()]
+	return ok
+}
+
+// prepare sets the Authorization and Proxy-Authorization headers from the
+// independently cached challenges, when present.
+func (t *Transport) prepare(req *http.Request) error {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
 			req.AddCookie(cookie)
 		}
 	}
-	// add auth
-	chal, count, ok := t.challenge(req)
-	if !ok {
-		// no cached challenge yet: probe bodyless first when configured
-		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+	layers := []authLayer{originLayer}
+	if t.proxyEnabled() {
+		layers = append(layers, proxyLayer)
 	}
-	cred, err := t.digest(req, chal, count)
-	if err != nil {
-		return false, err
+	for _, layer := range layers {
+		chal, count, ok := t.challenge(layer, req)
+		if !ok {
+			continue
+		}
+		cred, err := t.digest(layer, req, chal, count)
+		if err != nil {
+			return err
+		}
+		if cred != nil {
+			req.Header.Set(layer.credentialsHeader(), cred.String())
+		}
 	}
-	if cred != nil {
-		req.Header.Set("Authorization", cred.String())
-	}
-	return false, nil
+	return nil
 }
 
-// RoundTrip will try to authorize the request using a cached challenge.
-// If that doesn't work and we receive a 401, we'll try again using that challenge.
+// RoundTrip authorizes the request using cached challenges for the origin
+// server and, when proxy credentials are configured, the forward proxy.
+//
+// A single logical request may be challenged once by the proxy (407) and once
+// by the origin (401); each layer keeps its own cache, nonce counter and a
+// single retry, so neither layer can loop without bound.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// use the configured transport if there is one
 	tr := t.Transport
@@ -160,60 +250,122 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// make a copy of the request
-	first, err := clone()
+	cur, err := clone()
 	if err != nil {
 		return nil, err
 	}
-	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
-	if err != nil {
-		return nil, err
-	}
-	// probe bodyless so the body is only streamed on the authenticated retry
-	if probe {
-		first.Body = nil
-		first.ContentLength = 0
-		first.GetBody = nil
-	}
-	// the first request will either succeed or return a 401
-	res, err := tr.RoundTrip(first)
-	if err != nil {
-		return res, err
-	}
-	if res.StatusCode != http.StatusUnauthorized {
-		if !probe {
+
+	var retriedOrigin, retriedProxy bool
+	// discover the origin challenge with a bodyless request when configured
+	probe := t.Probe && cur.Body != nil && cur.Body != http.NoBody &&
+		!t.hasChallenge(originLayer, cur)
+
+	for {
+		if err := t.prepare(cur); err != nil {
+			return nil, err
+		}
+		if probe {
+			cur.Body = nil
+			cur.ContentLength = 0
+			cur.GetBody = nil
+		}
+
+		res, err := tr.RoundTrip(cur)
+		if err != nil {
+			return res, err
+		}
+
+		layer := challengeLayer(res, t.proxyEnabled())
+		if layer < 0 {
+			if !probe {
+				return res, nil
+			}
+			// the bodyless probe returned something we can't answer; discard it
+			// and send the real request with the body
+			drain(res)
+			cur, err = clone()
+			if err != nil {
+				return nil, err
+			}
+			probe = false
+			continue
+		}
+
+		// this layer already consumed its single retry: return the challenge
+		// response instead of looping on it
+		if (layer == originLayer && retriedOrigin) ||
+			(layer == proxyLayer && retriedProxy) {
 			return res, nil
 		}
-		// a probe response isn't valid for the caller since the body was
-		// stripped; discard it and send the real request as-is
-		_, _ = io.Copy(io.Discard, res.Body)
-		_ = res.Body.Close()
-		second, err := clone()
+
+		// drain the challenge response before replaying the request
+		drain(res)
+
+		// learn and cache the challenge; without a usable challenge there is
+		// nothing to retry with, so surface the response as-is
+		if err := t.save(layer, res); err != nil {
+			if errors.Is(err, ErrNoChallenge) {
+				return res, nil
+			}
+			return nil, err
+		}
+		if layer == originLayer {
+			retriedOrigin = true
+			// the origin challenge is known: the real body can now be streamed
+			probe = false
+		} else {
+			retriedProxy = true
+		}
+
+		// replay the request; a body that cannot be reproduced is a hard error,
+		// never a silent empty-body retry
+		cur, err = clone()
 		if err != nil {
 			return nil, err
 		}
-		return tr.RoundTrip(second)
 	}
-	// drain and close the first message body
+}
+
+// challengeLayer maps a response status to the authentication layer it
+// challenges. Proxy challenges are only reported when proxy auth is enabled.
+func challengeLayer(res *http.Response, proxyEnabled bool) authLayer {
+	switch res.StatusCode {
+	case http.StatusUnauthorized:
+		return originLayer
+	case http.StatusProxyAuthRequired:
+		if proxyEnabled {
+			return proxyLayer
+		}
+	}
+	return -1
+}
+
+func drain(res *http.Response) {
 	_, _ = io.Copy(io.Discard, res.Body)
 	_ = res.Body.Close()
-	// save the challenge for future use
-	if err := t.save(res); err != nil {
-		if err == ErrNoChallenge {
-			return res, nil
-		}
-		return nil, err
+}
+
+// absoluteRequestURI renders the absolute-form request target used when
+// forwarding through an ordinary (non-CONNECT) proxy.
+func absoluteRequestURI(u *url.URL) string {
+	var b strings.Builder
+	scheme := u.Scheme
+	if scheme == "" {
+		scheme = "http"
 	}
-	// make a second copy of the request
-	second, err := clone()
-	if err != nil {
-		return nil, err
+	b.WriteString(scheme)
+	b.WriteString("://")
+	b.WriteString(u.Host)
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
 	}
-	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
-		return nil, err
+	b.WriteString(path)
+	if u.RawQuery != "" {
+		b.WriteByte('?')
+		b.WriteString(u.RawQuery)
 	}
-	return tr.RoundTrip(second)
+	return b.String()
 }
 
 // CloseIdleConnections delegates the call to the underlying transport.
@@ -230,9 +382,12 @@ func (t *Transport) CloseIdleConnections() {
 	}
 }
 
-// cloner returns a function which makes clones of the provided request
+// cloner returns a function which makes clones of the provided request.
 func cloner(req *http.Request) (func() (*http.Request, error), error) {
 	getbody := req.GetBody
+	// originalBody reports whether req.Body is still the untouched caller body
+	// and can be streamed on the first attempt.
+	originalBody := true
 	// if there's no GetBody function set we have to copy the body
 	// into memory to use for future clones
 	if getbody == nil {
@@ -248,18 +403,35 @@ func cloner(req *http.Request) (func() (*http.Request, error), error) {
 			if err := req.Body.Close(); err != nil {
 				return nil, err
 			}
+			originalBody = false
 			getbody = func() (io.ReadCloser, error) {
 				return io.NopCloser(bytes.NewReader(body)), nil
 			}
 		}
 	}
+	first := true
 	return func() (*http.Request, error) {
 		clone := req.Clone(req.Context())
-		body, err := getbody()
-		if err != nil {
-			return nil, err
+		if first {
+			// stream the caller's untouched body on the first attempt when we
+			// didn't have to buffer it; otherwise replay the buffered copy
+			first = false
+			if !originalBody {
+				body, err := getbody()
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", ErrBodyNotReplayable, err)
+				}
+				clone.Body = body
+			}
+		} else {
+			// authentication replay: reproduce the body, failing explicitly if
+			// it cannot be replayed instead of sending an empty request
+			body, err := getbody()
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrBodyNotReplayable, err)
+			}
+			clone.Body = body
 		}
-		clone.Body = body
 		clone.GetBody = getbody
 		return clone, nil
 	}, nil
