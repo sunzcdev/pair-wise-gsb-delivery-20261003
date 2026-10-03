@@ -24,6 +24,9 @@
     For instance, `fastjson` easily parses the following JSON array `[123, "foo", [456], {"k": "v"}, null]`.
   * `fastjson` preserves the original order of object items when calling
     [Object.Visit](https://godoc.org/github.com/valyala/fastjson#Object.Visit).
+  * May parse a stream of JSON values from an `io.Reader` with
+    [Reader](https://godoc.org/github.com/valyala/fastjson#Reader) or from a string
+    with [Scanner](https://godoc.org/github.com/valyala/fastjson#Scanner).
 
 
 ## Known limitations
@@ -33,8 +36,6 @@
     must be released before the next call to [Parse](https://godoc.org/github.com/valyala/fastjson#Parser.Parse).
     Otherwise the program may work improperly. The same applies to objects returned by [Arena](https://godoc.org/github.com/valyala/fastjson#Arena).
     Adhere recommendations from [docs](https://godoc.org/github.com/valyala/fastjson).
-  * Cannot parse JSON from `io.Reader`. There is [Scanner](https://godoc.org/github.com/valyala/fastjson#Scanner)
-    for parsing stream of JSON values from a string.
 
 
 ## Usage
@@ -217,8 +218,8 @@ BenchmarkValidate/twitter/fastjson       	    2000	   1036796 ns/op	 609.10 MB/s
 
   * Q: _`fastjson` crashes my program!_
     A: There is high probability of improper use.
-       * Make sure you don't hold references to objects recursively returned by `Parser` / `Scanner`
-         beyond the next `Parser.Parse` / `Scanner.Next` call
+       * Make sure you don't hold references to objects recursively returned by `Parser` / `Scanner` / `Reader`
+         beyond the next `Parser.Parse` / `Scanner.Next` / `Reader.Next` call
          if such restriction is mentioned in [docs](https://github.com/valyala/fastjson/issues/new).
        * Make sure you don't access `fastjson` objects from concurrently running goroutines
          if such restriction is mentioned in [docs](https://github.com/valyala/fastjson/issues/new).
