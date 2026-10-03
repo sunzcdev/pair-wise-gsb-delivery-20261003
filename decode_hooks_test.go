@@ -352,6 +352,231 @@ func TestComposeDecodeHookFunc_NilValue(t *testing.T) {
 	}
 }
 
+func TestComposableDecodeHooks(t *testing.T) {
+	t.Run("sequence passes transformed value", func(t *testing.T) {
+		type namedString string
+
+		var secondFrom reflect.Type
+		first := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			if from.Type() != reflect.TypeOf(namedString("")) {
+				return safeInterface(from), false, nil
+			}
+			return len(from.Interface().(namedString)), true, nil
+		}
+		second := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			if !from.IsValid() || from.Kind() != reflect.Int {
+				return safeInterface(from), false, nil
+			}
+			secondFrom = from.Type()
+			return from.Int() + 1, true, nil
+		}
+
+		hook := ComposeComposableDecodeHookFunc(first, second)
+		result, handled, err := hook(
+			reflect.ValueOf(namedString("hello")),
+			reflect.ValueOf(int(0)),
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if !handled {
+			t.Fatal("expected hook to handle the named type")
+		}
+		if secondFrom != reflect.TypeOf(int(0)) {
+			t.Fatalf("expected transformed int type, got %v", secondFrom)
+		}
+		if result.(int64) != 6 {
+			t.Fatalf("expected 6, got %#v", result)
+		}
+	})
+
+	t.Run("or tries next only when not applicable", func(t *testing.T) {
+		first := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			if from.Kind() != reflect.String {
+				return safeInterface(from), false, nil
+			}
+			return "first", true, nil
+		}
+		second := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			if from.Kind() != reflect.Int {
+				return safeInterface(from), false, nil
+			}
+			return "second", true, nil
+		}
+
+		hook := OrComposeComposableDecodeHookFunc(first, second)
+		result, handled, err := hook(reflect.ValueOf(int(1)), reflect.ValueOf(""))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if !handled || result != "second" {
+			t.Fatalf("expected second candidate, got %#v handled=%v", result, handled)
+		}
+
+		result, handled, err = hook(reflect.ValueOf(false), reflect.ValueOf(""))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if handled || result != false {
+			t.Fatalf("expected original value without handling, got %#v handled=%v", result, handled)
+		}
+	})
+
+	t.Run("sequence keeps failure chain", func(t *testing.T) {
+		expected := errors.New("first failed")
+		first := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			return nil, true, expected
+		}
+		second := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			t.Fatal("second hook must not run after a failure")
+			return nil, false, nil
+		}
+
+		_, _, err := ComposeComposableDecodeHookFunc(first, second)(
+			reflect.ValueOf(""),
+			reflect.ValueOf(""),
+		)
+		if !errors.Is(err, expected) {
+			t.Fatalf("expected original error, got %v", err)
+		}
+	})
+
+	t.Run("or keeps failure chain", func(t *testing.T) {
+		expected := errors.New("first failed")
+		first := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			return nil, false, expected
+		}
+		second := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			t.Fatal("second hook must not run after a failure")
+			return nil, false, nil
+		}
+
+		_, _, err := OrComposeComposableDecodeHookFunc(first, second)(
+			reflect.ValueOf(""),
+			reflect.ValueOf(""),
+		)
+		if !errors.Is(err, expected) {
+			t.Fatalf("expected original error, got %v", err)
+		}
+	})
+
+	t.Run("legacy adapter uses explicit applicability", func(t *testing.T) {
+		type namedString string
+
+		legacy := func(from reflect.Type, to reflect.Type, data any) (any, error) {
+			return data, nil
+		}
+		applies := func(from reflect.Value, to reflect.Value) bool {
+			return from.IsValid() && from.Type() == reflect.TypeOf(namedString(""))
+		}
+
+		hook := AdaptDecodeHookFunc(legacy, applies)
+		result, handled, err := hook(reflect.ValueOf(namedString("same")), reflect.ValueOf(""))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if !handled || result != namedString("same") {
+			t.Fatalf("expected handled equal result, got %#v handled=%v", result, handled)
+		}
+
+		result, handled, err = hook(reflect.ValueOf("same"), reflect.ValueOf(""))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if handled || result != "same" {
+			t.Fatalf("expected unhandled string, got %#v handled=%v", result, handled)
+		}
+	})
+
+	t.Run("legacy adapter preserves typed nil", func(t *testing.T) {
+		var input *int
+		called := false
+		legacy := func(from reflect.Type, to reflect.Type, data any) (any, error) {
+			called = true
+			return data, nil
+		}
+		applies := func(from reflect.Value, to reflect.Value) bool {
+			return from.Kind() == reflect.Ptr && from.IsNil()
+		}
+
+		result, handled, err := AdaptDecodeHookFunc(legacy, applies)(
+			reflect.ValueOf(input),
+			reflect.ValueOf((*int)(nil)),
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if !called || !handled {
+			t.Fatalf("expected handled adapted hook, called=%v handled=%v", called, handled)
+		}
+		pointer, ok := result.(*int)
+		if !ok || pointer != nil {
+			t.Fatalf("expected typed nil *int, got %#v", result)
+		}
+	})
+
+	t.Run("named hook type is supported", func(t *testing.T) {
+		type namedHook DecodeHookFuncComposable
+
+		hook := namedHook(func(from reflect.Value, to reflect.Value) (any, bool, error) {
+			return "converted", true, nil
+		})
+
+		result, err := DecodeHookExec(hook, reflect.ValueOf(""), reflect.ValueOf(""))
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if result != "converted" {
+			t.Fatalf("expected converted result, got %#v", result)
+		}
+	})
+}
+
+type composableHookError struct {
+	message string
+}
+
+func (e *composableHookError) Error() string {
+	return e.message
+}
+
+func TestComposableDecodeHookDecoderErrorChain(t *testing.T) {
+	expected := &composableHookError{message: "hook failed"}
+	hook := func(from reflect.Value, to reflect.Value) (any, bool, error) {
+		if from.Kind() == reflect.String {
+			return nil, true, expected
+		}
+		return safeInterface(from), false, nil
+	}
+
+	var result string
+	decoder, err := NewDecoder(&DecoderConfig{
+		DecodeHook: hook,
+		Result:     &result,
+	})
+	if err != nil {
+		t.Fatalf("unexpected decoder error: %s", err)
+	}
+
+	err = decoder.Decode("input")
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+	if !errors.Is(err, expected) {
+		t.Fatalf("errors.Is did not find cause: %v", err)
+	}
+
+	var decodeError *DecodeError
+	if !errors.As(err, &decodeError) {
+		t.Fatalf("errors.As did not find DecodeError: %v", err)
+	}
+
+	var cause *composableHookError
+	if !errors.As(err, &cause) || cause != expected {
+		t.Fatalf("errors.As did not find cause: %v", err)
+	}
+}
+
 // TestComposeDecodeHookFunc_DecodeNilRemain tests the specific scenario from issue #121
 // where using ComposeDecodeHookFunc with DecodeNil and ,remain tag causes a panic.
 func TestComposeDecodeHookFunc_DecodeNilRemain(t *testing.T) {

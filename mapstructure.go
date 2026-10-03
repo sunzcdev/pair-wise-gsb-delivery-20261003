@@ -237,6 +237,14 @@ type DecodeHookFuncKind func(reflect.Kind, reflect.Kind, any) (any, error)
 // values.
 type DecodeHookFuncValue func(from reflect.Value, to reflect.Value) (any, error)
 
+// DecodeHookFuncComposable is a DecodeHookFunc that explicitly reports whether
+// it transformed the input. A false result with a nil error means that the hook
+// does not apply, and composable hooks can continue with another candidate.
+type DecodeHookFuncComposable func(
+	from reflect.Value,
+	to reflect.Value,
+) (any, bool, error)
+
 // Unmarshaler is the interface implemented by types that can unmarshal
 // themselves. UnmarshalMapstructure receives the input data (potentially
 // transformed by DecodeHook) and should populate the receiver with the

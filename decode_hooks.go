@@ -29,10 +29,11 @@ func typedDecodeHook(h DecodeHookFunc) DecodeHookFunc {
 	var f1 DecodeHookFuncType
 	var f2 DecodeHookFuncKind
 	var f3 DecodeHookFuncValue
+	var f4 DecodeHookFuncComposable
 
 	// Fill in the variables into this interface and the rest is done
 	// automatically using the reflect package.
-	potential := []any{f1, f2, f3}
+	potential := []any{f1, f2, f3, f4}
 
 	v := reflect.ValueOf(h)
 	vt := v.Type()
@@ -44,6 +45,16 @@ func typedDecodeHook(h DecodeHookFunc) DecodeHookFunc {
 	}
 
 	return nil
+}
+
+func decodeHookInputValue(data any) reflect.Value {
+	if value, ok := data.(reflect.Value); ok {
+		return value
+	}
+	if data == nil {
+		return reflect.Value{}
+	}
+	return reflect.ValueOf(data)
 }
 
 // cachedDecodeHook takes a raw DecodeHookFunc (an any) and turns
@@ -68,6 +79,11 @@ func cachedDecodeHook(raw DecodeHookFunc) func(from reflect.Value, to reflect.Va
 	case DecodeHookFuncValue:
 		return func(from reflect.Value, to reflect.Value) (any, error) {
 			return f(from, to)
+		}
+	case DecodeHookFuncComposable:
+		return func(from reflect.Value, to reflect.Value) (any, error) {
+			data, _, err := f(from, to)
+			return data, err
 		}
 	default:
 		return func(from reflect.Value, to reflect.Value) (any, error) {
@@ -96,6 +112,9 @@ func DecodeHookExec(
 		return f(from.Kind(), to.Kind(), from.Interface())
 	case DecodeHookFuncValue:
 		return f(from, to)
+	case DecodeHookFuncComposable:
+		data, _, err := f(from, to)
+		return data, err
 	default:
 		return nil, errors.New("invalid decode hook signature")
 	}
@@ -121,14 +140,7 @@ func ComposeDecodeHookFunc(fs ...DecodeHookFunc) DecodeHookFunc {
 			if err != nil {
 				return nil, err
 			}
-			if v, ok := data.(reflect.Value); ok {
-				newFrom = v
-			} else if data != nil {
-				newFrom = reflect.ValueOf(data)
-			} else {
-				// Keep newFrom as invalid (zero) Value when data is nil
-				newFrom = reflect.Value{}
-			}
+			newFrom = decodeHookInputValue(data)
 		}
 
 		return data, nil
@@ -158,6 +170,77 @@ func OrComposeDecodeHookFunc(ff ...DecodeHookFunc) DecodeHookFunc {
 		}
 
 		return nil, errors.New(allErrs)
+	}
+}
+
+// ComposeComposableDecodeHookFunc creates a composable hook that runs hooks
+// in order and passes each transformed result to the next hook. Hooks that do
+// not apply are skipped; errors are returned without an additional wrapper.
+func ComposeComposableDecodeHookFunc(fs ...DecodeHookFuncComposable) DecodeHookFuncComposable {
+	return func(from reflect.Value, to reflect.Value) (any, bool, error) {
+		data := safeInterface(from)
+		current := from
+		handled := false
+
+		for _, f := range fs {
+			result, resultHandled, err := f(current, to)
+			if err != nil {
+				return nil, false, err
+			}
+			if !resultHandled {
+				continue
+			}
+
+			data = result
+			current = decodeHookInputValue(data)
+			handled = true
+		}
+
+		return data, handled, nil
+	}
+}
+
+// OrComposeComposableDecodeHookFunc creates a composable hook that tries each
+// hook until one applies. The next hook is attempted only after an explicit
+// not-applicable result; an error is returned unchanged.
+func OrComposeComposableDecodeHookFunc(fs ...DecodeHookFuncComposable) DecodeHookFuncComposable {
+	return func(from reflect.Value, to reflect.Value) (any, bool, error) {
+		data := safeInterface(from)
+
+		for _, f := range fs {
+			result, handled, err := f(from, to)
+			if err != nil {
+				return nil, false, err
+			}
+			if handled {
+				return result, true, nil
+			}
+		}
+
+		return data, false, nil
+	}
+}
+
+// AdaptDecodeHookFunc adapts a legacy hook using an explicit applicability
+// rule. Adapted hooks never infer handling by comparing the result with input.
+func AdaptDecodeHookFunc(
+	hook DecodeHookFunc,
+	applies func(from reflect.Value, to reflect.Value) bool,
+) DecodeHookFuncComposable {
+	cached := cachedDecodeHook(hook)
+
+	return func(from reflect.Value, to reflect.Value) (any, bool, error) {
+		data := safeInterface(from)
+		if !applies(from, to) {
+			return data, false, nil
+		}
+
+		result, err := cached(from, to)
+		if err != nil {
+			return nil, false, err
+		}
+
+		return result, true, nil
 	}
 }
 
