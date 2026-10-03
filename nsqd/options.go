@@ -54,6 +54,9 @@ type Options struct {
 	MaxReqTimeout   time.Duration `flag:"max-req-timeout"`
 	ClientTimeout   time.Duration
 	MaxDeferTimeout time.Duration `flag:"max-defer-timeout"`
+	// MaxTopicPendingBytes bounds the number of pending bytes a topic may
+	// hold, counting each channel's copy of a fan-out message (0 = unlimited)
+	MaxTopicPendingBytes int64 `flag:"max-topic-pending-bytes" cfg:"max_topic_pending_bytes"`
 
 	// client overridable configuration options
 	MaxHeartbeatInterval   time.Duration `flag:"max-heartbeat-interval"`
@@ -154,13 +157,14 @@ func NewOptions() *Options {
 		QueueScanWorkerPoolMax:   4,
 		QueueScanDirtyPercent:    0.25,
 
-		MsgTimeout:      60 * time.Second,
-		MaxMsgTimeout:   15 * time.Minute,
-		MaxMsgSize:      1024 * 1024,
-		MaxBodySize:     5 * 1024 * 1024,
-		MaxReqTimeout:   1 * time.Hour,
-		ClientTimeout:   60 * time.Second,
-		MaxDeferTimeout: 1 * time.Hour,
+		MsgTimeout:           60 * time.Second,
+		MaxMsgTimeout:        15 * time.Minute,
+		MaxMsgSize:           1024 * 1024,
+		MaxBodySize:          5 * 1024 * 1024,
+		MaxReqTimeout:        1 * time.Hour,
+		ClientTimeout:        60 * time.Second,
+		MaxDeferTimeout:      1 * time.Hour,
+		MaxTopicPendingBytes: 0,
 
 		MaxHeartbeatInterval:   60 * time.Second,
 		MaxRdyCount:            2500,

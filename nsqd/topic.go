@@ -15,8 +15,13 @@ import (
 
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messageCount uint64
-	messageBytes uint64
+	messageCount    uint64
+	messageBytes    uint64
+	topicPending    int64
+	fanoutReserved  int64
+	channelPending  int64
+	pendingReserved int64
+	maxPendingBytes int64
 
 	sync.RWMutex
 
@@ -30,6 +35,18 @@ type Topic struct {
 	waitGroup         util.WaitGroupWrapper
 	exitFlag          int32
 	idFactory         *guidFactory
+
+	// pending byte budget accounting (in message body bytes), maintained
+	// with 64bit atomics:
+	//   topicPending    - bytes held in the topic's own (memory/backend) queue
+	//   fanoutReserved  - bytes promised as per-channel copies that have not
+	//                     been handed to a channel yet; includes the copies
+	//                     of topic-held backlog and, for the message the pump
+	//                     is currently fanning out, the copies not yet delivered
+	//   channelPending  - bytes actually held by channels (queued, in-flight,
+	//                     deferred), equal to the sum of channel.pendingBytes
+	//   pendingReserved - bytes reserved by publish requests still in flight
+	//                     (accepted by the budget check but not committed)
 
 	ephemeral      bool
 	deleteCallback func(*Topic)
@@ -56,6 +73,7 @@ func NewTopic(topicName string, nsqd *NSQD, deleteCallback func(*Topic)) *Topic 
 		deleteCallback:    deleteCallback,
 		idFactory:         NewGUIDFactory(nsqd.getOpts().ID),
 	}
+	atomic.StoreInt64(&t.maxPendingBytes, nsqd.getOpts().MaxTopicPendingBytes)
 	if strings.HasSuffix(topicName, "#ephemeral") {
 		t.ephemeral = true
 		t.backend = newDummyBackendQueue()
@@ -121,8 +139,11 @@ func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 		deleteCallback := func(c *Channel) {
 			_ = t.DeleteExistingChannel(c.name)
 		}
-		channel = NewChannel(t.name, channelName, t.nsqd, deleteCallback)
+		channel = NewChannel(t, channelName, deleteCallback)
 		t.channelMap[channelName] = channel
+		// one new copy of every topic-held message is now promised to
+		// this channel (NSQ backlog semantics; not admission-controlled)
+		t.onChannelAdded()
 		t.nsqd.logf(LOG_INFO, "TOPIC(%s): new channel(%s)", t.name, channel.name)
 		return channel, true
 	}
@@ -164,6 +185,7 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
 	t.Lock()
 	delete(t.channelMap, channelName)
 	numChannels := len(t.channelMap)
+	t.onChannelRemoved(channel)
 	t.Unlock()
 
 	// update messagePump state
@@ -186,10 +208,17 @@ func (t *Topic) PutMessage(m *Message) error {
 	if atomic.LoadInt32(&t.exitFlag) == 1 {
 		return errors.New("exiting")
 	}
+	numChannels := len(t.channelMap)
+	cost := int64(len(m.Body)) * int64(numChannels+1)
+	if !t.reservePending(cost) {
+		return ErrPendingByteBudgetExceeded
+	}
 	err := t.put(m)
 	if err != nil {
+		t.releasePending(cost)
 		return err
 	}
+	t.commitPending(int64(len(m.Body)), int64(len(m.Body))*int64(numChannels))
 	atomic.AddUint64(&t.messageCount, 1)
 	atomic.AddUint64(&t.messageBytes, uint64(len(m.Body)))
 	return nil
@@ -204,20 +233,155 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 	}
 
 	messageTotalBytes := 0
+	numChannels := len(t.channelMap)
 
+	var cost int64
+	for _, m := range msgs {
+		cost += int64(len(m.Body)) * int64(numChannels+1)
+	}
+	if !t.reservePending(cost) {
+		return ErrPendingByteBudgetExceeded
+	}
+
+	var committed int64
 	for i, m := range msgs {
 		err := t.put(m)
 		if err != nil {
+			t.releasePending(cost - committed)
 			atomic.AddUint64(&t.messageCount, uint64(i))
 			atomic.AddUint64(&t.messageBytes, uint64(messageTotalBytes))
 			return err
 		}
+		bodyBytes := int64(len(m.Body))
+		t.commitPending(bodyBytes, bodyBytes*int64(numChannels))
+		committed += bodyBytes * int64(numChannels+1)
 		messageTotalBytes += len(m.Body)
 	}
 
 	atomic.AddUint64(&t.messageBytes, uint64(messageTotalBytes))
 	atomic.AddUint64(&t.messageCount, uint64(len(msgs)))
 	return nil
+}
+
+// ErrPendingByteBudgetExceeded is returned by a publish when accepting it
+// would exceed the topic's configured pending byte budget.
+var ErrPendingByteBudgetExceeded = errors.New("pending byte budget exceeded")
+
+// NumChannels returns the current number of channels on the topic.
+func (t *Topic) NumChannels() int {
+	t.RLock()
+	n := len(t.channelMap)
+	t.RUnlock()
+	return n
+}
+
+// reservePending atomically reserves cost bytes against the topic's
+// pending byte budget. It returns false (and reserves nothing) when the
+// budget is configured and would be exceeded.
+func (t *Topic) reservePending(cost int64) bool {
+	if atomic.LoadInt64(&t.maxPendingBytes) > 0 {
+		for {
+			reserved := atomic.LoadInt64(&t.pendingReserved)
+			used := atomic.LoadInt64(&t.topicPending) +
+				atomic.LoadInt64(&t.fanoutReserved) +
+				atomic.LoadInt64(&t.channelPending)
+			if used+reserved+cost > atomic.LoadInt64(&t.maxPendingBytes) {
+				return false
+			}
+			if atomic.CompareAndSwapInt64(&t.pendingReserved, reserved, reserved+cost) {
+				break
+			}
+		}
+	} else {
+		atomic.AddInt64(&t.pendingReserved, cost)
+	}
+	return true
+}
+
+// commitPending moves cost bytes from the in-flight reservation into the
+// pending accounting after a message was accepted by the topic queue.
+// topicBytes is the topic's own copy and fanoutBytes is the sum of the
+// per-channel copies.
+func (t *Topic) commitPending(topicBytes, fanoutBytes int64) {
+	atomic.AddInt64(&t.pendingReserved, -(topicBytes + fanoutBytes))
+	atomic.AddInt64(&t.topicPending, topicBytes)
+	atomic.AddInt64(&t.fanoutReserved, fanoutBytes)
+}
+
+// releasePending gives back a reservation that was not (or will not be)
+// committed, e.g. on validation, backend write or fan-out failure.
+func (t *Topic) releasePending(cost int64) {
+	atomic.AddInt64(&t.pendingReserved, -cost)
+}
+
+// dequeuePending moves a dequeued message's bytes out of the topic queue.
+// Its fan-out reservation stays booked while the pump fans the message
+// out: each successful delivery releases one copy, and undelivered
+// copies (fan-out failures) are released afterwards by the pump.
+func (t *Topic) dequeuePending(bodyBytes int64) {
+	atomicSubFloor(&t.topicPending, bodyBytes)
+}
+
+// onChannelAdded reserves one additional copy of every message still
+// held by the topic for a newly created channel. Per NSQ semantics, this
+// backlog delivery is not admission-controlled, so it is charged
+// directly rather than rejected.
+func (t *Topic) onChannelAdded() {
+	atomic.AddInt64(&t.fanoutReserved, atomic.LoadInt64(&t.topicPending))
+}
+
+// onChannelRemoved releases every outstanding reservation attributable
+// to the removed channel: one copy of each topic-held message plus
+// everything the channel itself held.
+func (t *Topic) onChannelRemoved(c *Channel) {
+	atomicSubFloor(&t.fanoutReserved, atomic.LoadInt64(&t.topicPending))
+	atomicSubFloor(&t.channelPending, c.PendingBytes())
+}
+
+// releaseChannelPending releases bytes no longer held by a channel
+// (consumer finish, channel empty/delete).
+func (t *Topic) releaseChannelPending(n int64) {
+	atomicSubFloor(&t.channelPending, n)
+}
+
+// releaseFanoutReservation returns fan-out bytes that never reached a
+// channel (fan-out failures).
+func (t *Topic) releaseFanoutReservation(n int64) {
+	atomicSubFloor(&t.fanoutReserved, n)
+}
+
+// atomicSubFloor subtracts n from *addr, never allowing it to become
+// negative (guards admission against any transient accounting drift).
+func atomicSubFloor(addr *int64, n int64) {
+	for {
+		v := atomic.LoadInt64(addr)
+		nv := v - n
+		if nv < 0 {
+			nv = 0
+		}
+		if atomic.CompareAndSwapInt64(addr, v, nv) {
+			return
+		}
+	}
+}
+
+// addChannelPending accounts for bytes newly held by a channel through a
+// path that did not have a fan-out reservation (requeue/deferral of
+// in-flight messages, channel-side timeouts).
+func (t *Topic) addChannelPending(n int64) {
+	atomic.AddInt64(&t.channelPending, n)
+}
+
+// PendingByteStats returns the bytes currently held (including fan-out),
+// the bytes reserved by in-flight publish requests, and the configured
+// budget (0 = unlimited).
+func (t *Topic) PendingByteStats() (used, reserved, limit int64) {
+	used = atomic.LoadInt64(&t.topicPending) +
+		atomic.LoadInt64(&t.fanoutReserved) +
+		atomic.LoadInt64(&t.channelPending)
+	reserved = atomic.LoadInt64(&t.pendingReserved)
+	limit = atomic.LoadInt64(&t.maxPendingBytes)
+	return
 }
 
 func (t *Topic) put(m *Message) error {
@@ -271,9 +435,7 @@ func (t *Topic) messagePump() {
 		break
 	}
 	t.RLock()
-	for _, c := range t.channelMap {
-		chans = append(chans, c)
-	}
+	chans = t.snapshotChannelsLocked(chans)
 	t.RUnlock()
 	if len(chans) > 0 && !t.IsPaused() {
 		memoryMsgChan = t.memoryMsgChan
@@ -293,9 +455,7 @@ func (t *Topic) messagePump() {
 		case <-t.channelUpdateChan:
 			chans = chans[:0]
 			t.RLock()
-			for _, c := range t.channelMap {
-				chans = append(chans, c)
-			}
+			chans = t.snapshotChannelsLocked(chans)
 			t.RUnlock()
 			if len(chans) == 0 || t.IsPaused() {
 				memoryMsgChan = nil
@@ -318,6 +478,10 @@ func (t *Topic) messagePump() {
 			goto exit
 		}
 
+		numChannels := len(chans)
+		t.dequeuePending(int64(len(msg.Body)))
+
+		bodyLen := int64(len(msg.Body))
 		for i, channel := range chans {
 			chanMsg := msg
 			// copy the message because each channel
@@ -330,7 +494,12 @@ func (t *Topic) messagePump() {
 				chanMsg.deferred = msg.deferred
 			}
 			if chanMsg.deferred != 0 {
-				channel.PutMessageDeferred(chanMsg, chanMsg.deferred)
+				if err := channel.PutMessageDeferred(chanMsg, chanMsg.deferred); err != nil {
+					t.nsqd.logf(LOG_ERROR,
+						"TOPIC(%s) ERROR: failed to defer msg(%s) to channel(%s) - %s",
+						t.name, msg.ID, channel.name, err)
+					continue
+				}
 				continue
 			}
 			err := channel.PutMessage(chanMsg)
@@ -340,10 +509,22 @@ func (t *Topic) messagePump() {
 					t.name, msg.ID, channel.name, err)
 			}
 		}
+		// release the whole fan-out reservation for this message; any copy
+		// that failed to reach a channel was never charged to channelPending
+		t.releaseFanoutReservation(bodyLen * int64(numChannels))
 	}
 
 exit:
 	t.nsqd.logf(LOG_INFO, "TOPIC(%s): closing ... messagePump", t.name)
+}
+
+// snapshotChannelsLocked appends the topic's current channels to chans
+// (which is truncated by the caller beforehand); the caller must hold t.
+func (t *Topic) snapshotChannelsLocked(chans []*Channel) []*Channel {
+	for _, c := range t.channelMap {
+		chans = append(chans, c)
+	}
+	return chans
 }
 
 // Delete empties the topic and all its channels and closes
@@ -421,7 +602,27 @@ func (t *Topic) Empty() error {
 	}
 
 finish:
+	// recompute the pending budget from the messages still held by
+	// channels; topic backlog was drained above (best-effort under
+	// concurrent publishes)
+	t.resyncPending()
 	return t.backend.Empty()
+}
+
+// resyncPending recomputes the pending byte counters from the pending
+// bytes reported by each channel and the topic's own queue.
+func (t *Topic) resyncPending() {
+	var channelHeld int64
+	t.RLock()
+	n := len(t.channelMap)
+	for _, c := range t.channelMap {
+		channelHeld += c.PendingBytes()
+	}
+	topicHeld := int64(len(t.memoryMsgChan))
+	t.RUnlock()
+	atomic.StoreInt64(&t.fanoutReserved, topicHeld*int64(n))
+	atomic.StoreInt64(&t.channelPending, channelHeld)
+	atomic.StoreInt64(&t.topicPending, topicHeld)
 }
 
 func (t *Topic) flush() error {

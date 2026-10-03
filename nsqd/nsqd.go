@@ -112,6 +112,10 @@ func New(opts *Options) (*NSQD, error) {
 		return nil, errors.New("--max-deflate-level must be [1,9]")
 	}
 
+	if opts.MaxTopicPendingBytes < 0 {
+		return nil, errors.New("--max-topic-pending-bytes must be >= 0")
+	}
+
 	if opts.ID < 0 || opts.ID >= 1024 {
 		return nil, errors.New("--node-id must be [0,1024)")
 	}

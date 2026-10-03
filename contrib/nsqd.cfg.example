@@ -58,6 +58,10 @@ max_req_timeout = "1h"
 ## maximum size of a single command body
 max_body_size = 5123840
 
+## maximum number of pending bytes per topic, counting one copy per
+## channel of a fanned-out message (0 = unlimited)
+max_topic_pending_bytes = 0
+
 
 ## maximum client configurable duration of time between client heartbeats
 max_heartbeat_interval = "60s"

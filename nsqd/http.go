@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -254,6 +255,9 @@ func (s *httpServer) doPUB(w http.ResponseWriter, req *http.Request, ps httprout
 	msg.deferred = deferred
 	err = topic.PutMessage(msg)
 	if err != nil {
+		if errors.Is(err, ErrPendingByteBudgetExceeded) {
+			return nil, http_api.Err{Code: 507, Text: "BACKLOG_FULL"}
+		}
 		return nil, http_api.Err{Code: 503, Text: "EXITING"}
 	}
 
@@ -332,6 +336,9 @@ func (s *httpServer) doMPUB(w http.ResponseWriter, req *http.Request, ps httprou
 
 	err = topic.PutMessages(msgs)
 	if err != nil {
+		if errors.Is(err, ErrPendingByteBudgetExceeded) {
+			return nil, http_api.Err{Code: 507, Text: "BACKLOG_FULL"}
+		}
 		return nil, http_api.Err{Code: 503, Text: "EXITING"}
 	}
 
@@ -589,11 +596,13 @@ func (s *httpServer) printStats(stats Stats, ms *memStats, health string, startT
 		} else {
 			pausedPrefix = "   "
 		}
-		fmt.Fprintf(w, "\n%s[%-15s] depth: %-5d be-depth: %-5d msgs: %-8d e2e%%: %s\n",
+		fmt.Fprintf(w, "\n%s[%-15s] depth: %-5d be-depth: %-5d pending: %-8d reserved: %-8d msgs: %-8d e2e%%: %s\n",
 			pausedPrefix,
 			t.TopicName,
 			t.Depth,
 			t.BackendDepth,
+			t.PendingBytes,
+			t.PendingBytesReserved,
 			t.MessageCount,
 			t.E2eProcessingLatency,
 		)
@@ -603,11 +612,12 @@ func (s *httpServer) printStats(stats Stats, ms *memStats, health string, startT
 			} else {
 				pausedPrefix = "      "
 			}
-			fmt.Fprintf(w, "%s[%-25s] depth: %-5d be-depth: %-5d inflt: %-4d def: %-4d re-q: %-5d timeout: %-5d msgs: %-8d e2e%%: %s\n",
+			fmt.Fprintf(w, "%s[%-25s] depth: %-5d be-depth: %-5d pending: %-8d inflt: %-4d def: %-4d re-q: %-5d timeout: %-5d msgs: %-8d e2e%%: %s\n",
 				pausedPrefix,
 				c.ChannelName,
 				c.Depth,
 				c.BackendDepth,
+				c.PendingBytes,
 				c.InFlightCount,
 				c.DeferredCount,
 				c.RequeueCount,

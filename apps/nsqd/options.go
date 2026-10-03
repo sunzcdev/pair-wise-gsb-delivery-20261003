@@ -162,6 +162,7 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	flagSet.Duration("max-req-timeout", opts.MaxReqTimeout, "maximum requeuing timeout for a message")
 	flagSet.Int64("max-body-size", opts.MaxBodySize, "maximum size of a single command body")
 	flagSet.Duration("max-defer-timeout", opts.MaxDeferTimeout, "maximum duration when deferring a message")
+	flagSet.Int64("max-topic-pending-bytes", opts.MaxTopicPendingBytes, "maximum number of pending bytes per topic (counting channel fan-out, 0 = unlimited)")
 
 	// client overridable configuration options
 	flagSet.Duration("max-heartbeat-interval", opts.MaxHeartbeatInterval, "maximum client configurable duration of time between client heartbeats")

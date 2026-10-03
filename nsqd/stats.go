@@ -18,26 +18,33 @@ type ClientStats interface {
 }
 
 type TopicStats struct {
-	TopicName    string         `json:"topic_name"`
-	Channels     []ChannelStats `json:"channels"`
-	Depth        int64          `json:"depth"`
-	BackendDepth int64          `json:"backend_depth"`
-	MessageCount uint64         `json:"message_count"`
-	MessageBytes uint64         `json:"message_bytes"`
-	Paused       bool           `json:"paused"`
+	TopicName            string         `json:"topic_name"`
+	Channels             []ChannelStats `json:"channels"`
+	Depth                int64          `json:"depth"`
+	BackendDepth         int64          `json:"backend_depth"`
+	MessageCount         uint64         `json:"message_count"`
+	MessageBytes         uint64         `json:"message_bytes"`
+	PendingBytes         int64          `json:"pending_bytes"`
+	PendingBytesReserved int64          `json:"pending_bytes_reserved"`
+	MaxPendingBytes      int64          `json:"max_pending_bytes"`
+	Paused               bool           `json:"paused"`
 
 	E2eProcessingLatency *quantile.Result `json:"e2e_processing_latency"`
 }
 
 func NewTopicStats(t *Topic, channels []ChannelStats) TopicStats {
+	used, reserved, limit := t.PendingByteStats()
 	return TopicStats{
-		TopicName:    t.name,
-		Channels:     channels,
-		Depth:        t.Depth(),
-		BackendDepth: t.backend.Depth(),
-		MessageCount: atomic.LoadUint64(&t.messageCount),
-		MessageBytes: atomic.LoadUint64(&t.messageBytes),
-		Paused:       t.IsPaused(),
+		TopicName:            t.name,
+		Channels:             channels,
+		Depth:                t.Depth(),
+		BackendDepth:         t.backend.Depth(),
+		MessageCount:         atomic.LoadUint64(&t.messageCount),
+		MessageBytes:         atomic.LoadUint64(&t.messageBytes),
+		PendingBytes:         used,
+		PendingBytesReserved: reserved,
+		MaxPendingBytes:      limit,
+		Paused:               t.IsPaused(),
 
 		E2eProcessingLatency: t.AggregateChannelE2eProcessingLatency().Result(),
 	}
@@ -50,6 +57,7 @@ type ChannelStats struct {
 	InFlightCount       int           `json:"in_flight_count"`
 	DeferredCount       int           `json:"deferred_count"`
 	MessageCount        uint64        `json:"message_count"`
+	PendingBytes        int64         `json:"pending_bytes"`
 	ZoneLocalMsgCount   uint64        `json:"zone_local_msg_count,omitempty"`
 	RegionLocalMsgCount uint64        `json:"region_local_msg_count,omitempty"`
 	GlobalMsgCount      uint64        `json:"global_msg_count,omitempty"`
@@ -77,6 +85,7 @@ func NewChannelStats(c *Channel, clients []ClientStats, clientCount int) Channel
 		InFlightCount:       inflight,
 		DeferredCount:       deferred,
 		MessageCount:        atomic.LoadUint64(&c.messageCount),
+		PendingBytes:        c.PendingBytes(),
 		ZoneLocalMsgCount:   atomic.LoadUint64(&c.zoneLocalMsgCount),
 		RegionLocalMsgCount: atomic.LoadUint64(&c.regionLocalMsgCount),
 		GlobalMsgCount:      atomic.LoadUint64(&c.globalMsgCount),

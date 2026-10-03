@@ -42,12 +42,14 @@ type Channel struct {
 	regionLocalMsgCount uint64
 	globalMsgCount      uint64
 	timeoutCount        uint64
+	pendingBytes        int64
 
 	sync.RWMutex
 
 	topicName string
 	name      string
 	nsqd      *NSQD
+	topic     *Topic
 
 	backend BackendQueue
 
@@ -78,12 +80,15 @@ type Channel struct {
 }
 
 // NewChannel creates a new instance of the Channel type and returns a pointer
-func NewChannel(topicName string, channelName string, nsqd *NSQD,
+func NewChannel(topic *Topic, channelName string,
 	deleteCallback func(*Channel)) *Channel {
+	topicName := topic.name
+	nsqd := topic.nsqd
 
 	c := &Channel{
 		topicName:                topicName,
 		name:                     channelName,
+		topic:                    topic,
 		memoryMsgChan:            nil,
 		clients:                  make(map[int64]Consumer),
 		deleteCallback:           deleteCallback,
@@ -231,7 +236,13 @@ func (c *Channel) Empty() error {
 	}
 
 finish:
-	return c.backend.Empty()
+	if err := c.backend.Empty(); err != nil {
+		return err
+	}
+	// all messages held by the channel were discarded
+	held := atomic.SwapInt64(&c.pendingBytes, 0)
+	c.topic.releaseChannelPending(held)
+	return nil
 }
 
 // flush persists all the messages in internal memory buffers to the backend
@@ -333,8 +344,30 @@ func (c *Channel) PutMessage(m *Message) error {
 	if err != nil {
 		return err
 	}
+	bodyLen := int64(len(m.Body))
+	atomic.AddInt64(&c.pendingBytes, bodyLen)
+	c.topic.addChannelPending(bodyLen)
 	atomic.AddUint64(&c.messageCount, 1)
 	return nil
+}
+
+// PutMessageDeferred adds a deferred message and accounts for its bytes
+// in the topic's pending budget.
+func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) error {
+	if err := c.StartDeferredTimeout(msg, timeout); err != nil {
+		return err
+	}
+	bodyLen := int64(len(msg.Body))
+	atomic.AddInt64(&c.pendingBytes, bodyLen)
+	c.topic.addChannelPending(bodyLen)
+	atomic.AddUint64(&c.messageCount, 1)
+	return nil
+}
+
+// PendingBytes returns the number of message body bytes currently held
+// by the channel (memory/backend queues, deferred and in-flight).
+func (c *Channel) PendingBytes() int64 {
+	return atomic.LoadInt64(&c.pendingBytes)
 }
 
 func (c *Channel) put(m *Message) error {
@@ -387,13 +420,6 @@ func (c *Channel) put(m *Message) error {
 	return nil
 }
 
-func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
-	atomic.AddUint64(&c.messageCount, 1)
-	if err := c.StartDeferredTimeout(msg, timeout); err != nil {
-		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to defer message - %s", c.name, err)
-	}
-}
-
 // TouchMessage resets the timeout for an in-flight message
 func (c *Channel) TouchMessage(clientID int64, id MessageID, clientMsgTimeout time.Duration) error {
 	msg, err := c.popInFlightMessage(clientID, id)
@@ -425,6 +451,9 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 		return err
 	}
 	c.removeFromInFlightPQ(msg)
+	bodyLen := int64(len(msg.Body))
+	atomic.AddInt64(&c.pendingBytes, -bodyLen)
+	c.topic.releaseChannelPending(bodyLen)
 	if c.e2eProcessingLatencyStream != nil {
 		c.e2eProcessingLatencyStream.Insert(msg.Timestamp)
 	}
