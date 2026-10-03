@@ -6,7 +6,65 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf16"
+	"unsafe"
 )
+
+// DuplicateKeyPolicy determines how the Parser and Scanner handle
+// JSON objects containing multiple members with the same key.
+//
+// Keys are compared after JSON unescaping, so "name" and "\u006eame"
+// refer to the same member. Duplicate detection is scoped to a single
+// object: equal keys in two distinct objects (including nested ones)
+// never conflict with each other.
+type DuplicateKeyPolicy int
+
+const (
+	// DuplicateKeyKeepAll keeps every member of an object, even when
+	// several of them share the same key.
+	//
+	// This is the default and zero-value policy. It preserves the
+	// historical behavior: Len, Visit and serialization see all the
+	// members, while Get returns the value of the first matching member.
+	DuplicateKeyKeepAll DuplicateKeyPolicy = iota
+
+	// DuplicateKeyReject rejects JSON containing an object with two or
+	// more members sharing the same key. The parse fails with a
+	// *DuplicateKeyError describing the original positions of both keys.
+	DuplicateKeyReject
+
+	// DuplicateKeyKeepFirst keeps only the first member for a duplicated
+	// key. Later members with the same key are discarded. The surviving
+	// member keeps the position of the first occurrence, so Len, Visit,
+	// Get and serialization agree on both the member count and order.
+	DuplicateKeyKeepFirst
+
+	// DuplicateKeyKeepLast keeps only the last member for a duplicated
+	// key. Earlier members with the same key are discarded. The surviving
+	// member keeps the position of the last occurrence, so Len, Visit,
+	// Get and serialization agree on both the member count and order.
+	DuplicateKeyKeepLast
+)
+
+// DuplicateKeyError is returned by Parse* and Scanner.Next when
+// DuplicateKeyReject is set and an object contains two members with the
+// same key.
+type DuplicateKeyError struct {
+	// Key is the unescaped key that appeared more than once.
+	Key string
+
+	// FirstOffset is the byte offset of the opening quote of the first
+	// occurrence of Key in the parsed input.
+	FirstOffset int
+
+	// DuplicateOffset is the byte offset of the opening quote of the
+	// second occurrence of Key in the parsed input.
+	DuplicateOffset int
+}
+
+func (e *DuplicateKeyError) Error() string {
+	return fmt.Sprintf("duplicate object key %q at byte offsets %d and %d",
+		e.Key, e.FirstOffset, e.DuplicateOffset)
+}
 
 // Parser parses JSON.
 //
@@ -20,6 +78,11 @@ type Parser struct {
 
 	// c is a cache for json values.
 	c cache
+
+	// DuplicateKeys selects how objects containing multiple members with
+	// the same key are handled. The zero value (DuplicateKeyKeepAll) keeps
+	// the historical behavior of retaining every member.
+	DuplicateKeys DuplicateKeyPolicy
 }
 
 // Parse parses s containing JSON.
@@ -31,10 +94,14 @@ func (p *Parser) Parse(s string) (*Value, error) {
 	s = skipWS(s)
 	p.b = append(p.b[:0], s...)
 	p.c.reset()
+	p.c.policy = p.DuplicateKeys
+	if len(p.b) > 0 {
+		p.c.base = uintptr(unsafe.Pointer(&p.b[0]))
+	}
 
 	v, tail, err := p.c.parseValue(b2s(p.b), 0)
 	if err != nil {
-		return nil, fmt.Errorf("cannot parse JSON: %s; unparsed tail: %q", err, startEndString(tail))
+		return nil, fmt.Errorf("cannot parse JSON: %w; unparsed tail: %q", err, startEndString(tail))
 	}
 	tail = skipWS(tail)
 	if len(tail) > 0 {
@@ -54,6 +121,24 @@ func (p *Parser) ParseBytes(b []byte) (*Value, error) {
 
 type cache struct {
 	vs []Value
+
+	// policy selects how duplicate object keys are handled.
+	policy DuplicateKeyPolicy
+
+	// base is the address of the first byte of the parsed input. It is
+	// used together with key string pointers to recover original offsets.
+	base uintptr
+}
+
+// offsetOf returns the byte offset of s within the parsed input backing
+// string. s must be a substring of the input. It returns 0 when the
+// offset cannot be determined.
+func (c *cache) offsetOf(s string) int {
+	if c.base == 0 || len(s) == 0 {
+		return 0
+	}
+	n := uintptr(unsafe.Pointer(unsafe.StringData(s))) - c.base
+	return int(n)
 }
 
 func (c *cache) reset() {
@@ -113,21 +198,21 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 	if s[0] == '{' {
 		v, tail, err := c.parseObject(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse object: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse object: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '[' {
 		v, tail, err := c.parseArray(s[1:], depth)
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse array: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse array: %w", err)
 		}
 		return v, tail, nil
 	}
 	if s[0] == '"' {
 		ss, tail, err := parseRawString(s[1:])
 		if err != nil {
-			return nil, tail, fmt.Errorf("cannot parse string: %s", err)
+			return nil, tail, fmt.Errorf("cannot parse string: %w", err)
 		}
 		v := c.getValue()
 		v.t = typeRawString
@@ -162,7 +247,7 @@ func (c *cache) parseValue(s string, depth int) (*Value, string, error) {
 
 	ns, tail, err := parseRawNumber(s)
 	if err != nil {
-		return nil, tail, fmt.Errorf("cannot parse number: %s", err)
+		return nil, tail, fmt.Errorf("cannot parse number: %w", err)
 	}
 	v := c.getValue()
 	v.t = TypeNumber
@@ -193,7 +278,7 @@ func (c *cache) parseArray(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse array value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse array value: %w", err)
 		}
 		a.a = append(a.a, v)
 
@@ -229,18 +314,37 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 	o := c.getValue()
 	o.t = TypeObject
 	o.o.reset()
-	for {
-		var err error
-		kv := o.o.getKV()
 
-		// Parse key.
+	// seen is local to this object, so duplicate detection never leaks
+	// into sibling or nested objects. It maps each unescaped key to the
+	// index of its currently retained member and the original offset of
+	// its first opening quote.
+	var seen map[string]*dupInfo
+	if c.policy != DuplicateKeyKeepAll {
+		seen = make(map[string]*dupInfo)
+	}
+	for {
+		var key string
+		var keyStart string
+
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != '"' {
 			return nil, s, fmt.Errorf(`cannot find opening '"" for object key`)
 		}
+		keyStart = s
+		var err error
+		kv := o.o.getKV()
 		kv.k, s, err = parseRawKey(s[1:])
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object key: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object key: %w", err)
+		}
+		if seen != nil {
+			// unescapeStringBestEffort mutates its backing bytes in place
+			// (they point into Parser.b). A plain string(kv.k) conversion is
+			// a no-op since kv.k is already a string, so force a real copy
+			// through a byte slice to keep the stored raw key intact.
+			keyCopy := append([]byte(nil), kv.k...)
+			key = unescapeStringBestEffort(b2s(keyCopy))
 		}
 		s = skipWS(s)
 		if len(s) == 0 || s[0] != ':' {
@@ -252,7 +356,34 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 		s = skipWS(s)
 		kv.v, s, err = c.parseValue(s, depth)
 		if err != nil {
-			return nil, s, fmt.Errorf("cannot parse object value: %s", err)
+			return nil, s, fmt.Errorf("cannot parse object value: %w", err)
+		}
+
+		slot := len(o.o.kvs) - 1
+		if seen != nil {
+			if info, ok := seen[key]; ok {
+				switch c.policy {
+				case DuplicateKeyReject:
+					return nil, s, &DuplicateKeyError{
+						Key:             key,
+						FirstOffset:     info.firstOffset,
+						DuplicateOffset: c.offsetOf(keyStart),
+					}
+				case DuplicateKeyKeepFirst:
+					// Drop the just-appended member, keeping the first one.
+					o.o.kvs = o.o.kvs[:slot]
+				case DuplicateKeyKeepLast:
+					// Replace the earlier member with this one at its own
+					// position; the abandoned slot is compacted at the end.
+					o.o.kvs[info.slot].v = nil
+					info.slot = slot
+				}
+			} else {
+				seen[key] = &dupInfo{
+					slot:        slot,
+					firstOffset: c.offsetOf(keyStart),
+				}
+			}
 		}
 		s = skipWS(s)
 		if len(s) == 0 {
@@ -263,10 +394,18 @@ func (c *cache) parseObject(s string, depth int) (*Value, string, error) {
 			continue
 		}
 		if s[0] == '}' {
+			o.o.compactIfDuplicates(c.policy == DuplicateKeyKeepLast)
 			return o, s[1:], nil
 		}
 		return nil, s, fmt.Errorf("missing ',' after object value")
 	}
+}
+
+// dupInfo records, for a duplicated key, the slot of its currently
+// retained member and the offset of its first occurrence.
+type dupInfo struct {
+	slot        int
+	firstOffset int
 }
 
 func escapeString(dst []byte, s string) []byte {
@@ -506,6 +645,31 @@ func (o *Object) getKV() *kv {
 		o.kvs = append(o.kvs, kv{})
 	}
 	return &o.kvs[len(o.kvs)-1]
+}
+
+// compactIfDuplicates drops members whose value has been superseded by a
+// later member under DuplicateKeyKeepLast. When enabled is false it is a
+// no-op, keeping the fast path for the other policies.
+func (o *Object) compactIfDuplicates(enabled bool) {
+	if !enabled {
+		return
+	}
+	kvs := o.kvs
+	dst := 0
+	for i := range kvs {
+		if kvs[i].v == nil {
+			continue
+		}
+		if dst != i {
+			kvs[dst] = kvs[i]
+		}
+		dst++
+	}
+	// Clear dropped tail entries so GC could collect referenced values.
+	for i := dst; i < len(kvs); i++ {
+		kvs[i] = kv{}
+	}
+	o.kvs = kvs[:dst]
 }
 
 func (o *Object) unescapeKeys() {

@@ -2,6 +2,8 @@ package fastjson
 
 import (
 	"errors"
+	"fmt"
+	"unsafe"
 )
 
 // Scanner scans a series of JSON values. Values may be delimited by whitespace.
@@ -28,6 +30,11 @@ type Scanner struct {
 
 	// c is used for caching JSON values.
 	c cache
+
+	// DuplicateKeys selects how objects containing multiple members with
+	// the same key are handled. The zero value (DuplicateKeyKeepAll) keeps
+	// the historical behavior of retaining every member.
+	DuplicateKeys DuplicateKeyPolicy
 }
 
 // Init initializes sc with the given s.
@@ -38,6 +45,10 @@ func (sc *Scanner) Init(s string) {
 	sc.s = b2s(sc.b)
 	sc.err = nil
 	sc.v = nil
+	sc.c.policy = sc.DuplicateKeys
+	if len(sc.b) > 0 {
+		sc.c.base = uintptr(unsafe.Pointer(&sc.b[0]))
+	}
 }
 
 // InitBytes initializes sc with the given b.
@@ -67,7 +78,7 @@ func (sc *Scanner) Next() bool {
 	sc.c.reset()
 	v, tail, err := sc.c.parseValue(sc.s, 0)
 	if err != nil {
-		sc.err = err
+		sc.err = fmt.Errorf("cannot parse JSON: %w", err)
 		return false
 	}
 
