@@ -15,6 +15,7 @@ and how users can avoid potential breakage.
 * [How does nosurf check the origin?](#how-does-nosurf-check-the-origin)
     * [1. `Sec-Fetch-Site` header](#1-sec-fetch-site-header)
     * [2. `Origin` or `Referer` headers](#2-origin-or-referer-headers)
+    * [3. Strict origin policy](#3-strict-origin-policy)
 * [What do I need to do after upgrading to 1.2.0?](#what-do-i-need-to-do-after-upgrading-to-120)
 * [What are the risks of not upgrading to 1.2.0?](#what-are-the-risks-of-not-upgrading-to-120)
 
@@ -59,6 +60,84 @@ In the unlikely case where `Origin` header does not exist,
 nosurf will perform the same validations documented above on the `Referer` header.
 
 In the very unlikely case that no `Referer` header is present either, the request will be aborted.
+
+### 3. Strict origin policy
+
+The checks described above are the default, *compatible* origin policy
+([`OriginPolicyCompat`](https://pkg.go.dev/github.com/justinas/nosurf#OriginPolicyCompat)).
+It trusts `Sec-Fetch-Site: same-origin` unconditionally and never compares the three headers against each other,
+so a forged or contradictory `Origin` header is ignored as long as one piece of evidence passes.
+
+Applications that want stricter validation may opt into
+[`OriginPolicyStrict`](https://pkg.go.dev/github.com/justinas/nosurf#OriginPolicyStrict):
+
+```go
+handler.SetOriginPolicy(nosurf.OriginPolicyStrict)
+```
+
+In strict mode, every non-safe request is classified using all of
+`Sec-Fetch-Site`, `Origin` and `Referer`, and nosurf rejects requests
+whose evidence contradicts itself. The CSRF token check remains a completely
+independent step: passing the origin checks never bypasses token validation.
+
+Each header is normalized into one of the following evidence classes:
+
+| Class | Meaning |
+| --- | --- |
+| missing | the header is not present |
+| duplicate | the header (or a comma-folded header line) contains several values |
+| null | `Origin: null`, i.e. an opaque origin |
+| malformed | the header value can not be parsed as an origin |
+| self | the value equals the website's own origin |
+| allowed | the value is accepted by the `SetIsAllowedOriginFunc` delegate |
+| foreign | the value is neither the self origin nor an allowed one |
+
+The decision table below summarizes the result for each combination.
+The first matching rule wins; structurally invalid headers
+(duplicate / null / malformed) always take precedence.
+
+| `Sec-Fetch-Site` | `Origin` | `Referer` | Result |
+| --- | --- | --- | --- |
+| `same-origin` | missing | missing | allow |
+| `same-origin` | self | self / missing | allow |
+| `same-origin` | self / missing | self | allow |
+| `same-origin` | foreign / allowed | * | reject: contradictory evidence |
+| `same-origin` | * | foreign / allowed | reject: contradictory evidence |
+| `same-site` | self | self / missing | allow |
+| `same-site` | allowed | allowed / missing | allow |
+| `same-site` | self / missing | self / allowed | allow |
+| `same-site` | foreign | * | reject: bad origin |
+| `same-site` | * | foreign | reject: bad referer |
+| `same-site` | missing | missing | reject: no referer |
+| `cross-site` | allowed | allowed / missing | allow |
+| `cross-site` | * / missing | allowed | allow |
+| `cross-site` | self | * | reject: contradictory evidence |
+| `cross-site` | * | self | reject: contradictory evidence |
+| `cross-site` | foreign | * | reject: bad origin |
+| `cross-site` | * | foreign | reject: bad referer |
+| `cross-site` | missing | missing | reject: cross-site context |
+| `none` | * | * | reject: cross-site context |
+| missing | self | self / missing | allow |
+| missing | allowed | allowed / missing | allow |
+| missing | self / missing | self / allowed | allow |
+| missing | foreign | * | reject: bad origin |
+| missing | * | foreign | reject: bad referer |
+| missing | missing | missing | reject: no referer |
+| unknown value | * | * | reject: unknown `Sec-Fetch-Site` |
+| repeated value | * | * | reject: repeated `Sec-Fetch-Site` |
+
+Notes:
+
+* A `same-origin` request can only be backed by the self origin; an allow-listed
+  but still cross-origin `Origin` contradicts the browser's claim and is rejected.
+  Cross-origin browser contexts must send `Sec-Fetch-Site: cross-site`.
+* Under `same-site` (e.g. a sibling subdomain), the foreign origin has to be
+  explicitly registered with `SetIsAllowedOriginFunc`; nosurf does not ship a
+  public-suffix list of its own.
+* `Sec-Fetch-Site: none` is produced by user-initiated navigations and opaque
+  origins and is rejected unconditionally, since its origin can not be trusted.
+* Repeated, `null` or malformed `Origin` / `Referer` values produce their own
+  dedicated failure reasons regardless of the `Sec-Fetch-Site` value.
 
 ## What do I need to do after upgrading to 1.2.0?
 

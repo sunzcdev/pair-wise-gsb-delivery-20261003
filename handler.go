@@ -63,6 +63,7 @@ type CSRFHandler struct {
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
+	originPolicy    OriginPolicy
 }
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +103,7 @@ func New(handler http.Handler) *CSRFHandler {
 		failureHandler: http.HandlerFunc(defaultFailureHandler),
 		baseCookie:     baseCookie,
 		isTLS:          func(r *http.Request) bool { return true },
+		originPolicy:   OriginPolicyCompat,
 	}
 
 	return csrf
@@ -185,13 +187,10 @@ func (h *CSRFHandler) handleFailure(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *CSRFHandler) ensureSameOrigin(r *http.Request) error {
-	selfOrigin := &url.URL{
-		Scheme: "http",
-		Host:   r.Host,
-	}
-	isTLS := h.isTLS(r)
-	if isTLS {
-		selfOrigin.Scheme = "https"
+	selfOrigin := h.buildSelfOrigin(r)
+
+	if h.originPolicy == OriginPolicyStrict {
+		return h.evaluateStrictOrigin(selfOrigin, r)
 	}
 
 	secFetchSite := r.Header.Get("Sec-Fetch-Site")
@@ -212,6 +211,19 @@ func (h *CSRFHandler) ensureSameOrigin(r *http.Request) error {
 	// This is opposite of Django's behavior, but should be fine, as neither of the three headers existing is an edge case.
 	// https://github.com/django/django/blob/8be0c0d6901669661fca578f474cd51cd284d35a/django/middleware/csrf.py#L460
 	return h.checkReferer(selfOrigin, r)
+}
+
+// buildSelfOrigin reconstructs the website's own origin for a request,
+// using the configured TLS indicator and the request's Host.
+func (h *CSRFHandler) buildSelfOrigin(r *http.Request) *url.URL {
+	selfOrigin := &url.URL{
+		Scheme: "http",
+		Host:   r.Host,
+	}
+	if h.isTLS(r) {
+		selfOrigin.Scheme = "https"
+	}
+	return selfOrigin
 }
 
 func (h *CSRFHandler) checkReferer(selfOrigin *url.URL, r *http.Request) error {
@@ -319,6 +331,22 @@ func (h *CSRFHandler) SetIsTLSFunc(f func(*http.Request) bool) {
 // In most cases, this will be used with [StaticOrigins].
 func (h *CSRFHandler) SetIsAllowedOriginFunc(f func(*url.URL) bool) {
 	h.isAllowedOrigin = f
+}
+
+// SetOriginPolicy selects how strictly the origin of non-safe requests is
+// validated. The default policy is [OriginPolicyCompat], which preserves
+// the historical behavior (Sec-Fetch-Site: same-origin is trusted on its
+// own, and Origin/Referer are not cross-checked against it).
+//
+// [OriginPolicyStrict] additionally rejects requests whose origin evidence
+// contradicts itself: repeated headers, Origin: null, a Sec-Fetch-Site
+// value that disagrees with the Origin/Referer headers, or unknown
+// Sec-Fetch-Site values. The exact behavior is documented on
+// [OriginPolicyStrict] and fixed by table-driven tests.
+//
+// The CSRF token check remains an independent step in both policies.
+func (h *CSRFHandler) SetOriginPolicy(policy OriginPolicy) {
+	h.originPolicy = policy
 }
 
 // StaticOrigins returns a delegate, suitable for passing to [CSRFHandler.SetIsAllowedOriginFunc],
