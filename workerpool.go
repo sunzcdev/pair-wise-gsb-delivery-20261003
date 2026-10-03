@@ -31,11 +31,16 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 	}
 
 	pool := &WorkerPool{
-		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
-		workerQueue: make(chan func()),
-		stopSignal:  make(chan struct{}),
-		stoppedChan: make(chan struct{}),
+		maxWorkers:   maxWorkers,
+		taskQueue:    make(chan func()),
+		keyTaskQueue: make(chan keyedTask),
+		workerQueue:  make(chan job),
+		keyDone:      make(chan any),
+		keyExit:      make(chan struct{}),
+		drainAbort:   make(chan struct{}),
+		stopSignal:   make(chan struct{}),
+		stoppedChan:  make(chan struct{}),
+		keyStates:    map[any]*keyState{},
 	}
 
 	// Start the task dispatcher.
@@ -49,15 +54,57 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 type WorkerPool struct {
 	maxWorkers   int
 	taskQueue    chan func()
-	workerQueue  chan func()
+	keyTaskQueue chan keyedTask
+	workerQueue  chan job
+	keyDone      chan any
+	keyExit      chan struct{}
+	drainAbort   chan struct{}
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
-	waitingQueue deque.Deque[func()]
+	waitingQueue deque.Deque[queuedTask]
+	keyStates    map[any]*keyState
+	busyKeys     int
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
 	waiting      atomic.Int32
 	wait         bool
+}
+
+// queuedTask is a unit of work that is runnable now: either a plain task or
+// the head task of a key whose previous task has completed. A running key has
+// at most one queuedTask in the waiting queue; the rest of its tasks remain in
+// the key's own deque and never occupy a worker slot.
+type queuedTask struct {
+	task  func()
+	key   any
+	keyed bool
+}
+
+// job is a unit of work handed to a worker. A keyed job reports its key's
+// completion to the dispatcher before the worker accepts another job, so the
+// dispatcher never dispatches a successor to a still-running key.
+type job struct {
+	task  func()
+	key   any
+	keyed bool
+}
+
+// keyedTask pairs a task with its ordering key on the keyTaskQueue channel.
+type keyedTask struct {
+	key  any
+	task func()
+}
+
+// keyState holds the per-key FIFO task deque and the running flag. All fields
+// are touched only by the dispatcher.
+type keyState struct {
+	tasks   deque.Deque[func()]
+	running bool
+	// scheduled is true while a queuedTask for this key is in the waiting
+	// queue waiting for a worker. Together with running it guards against
+	// enqueuing two runnable entries for the same key.
+	scheduled bool
 }
 
 // Size returns the maximum number of concurrent workers.
@@ -131,6 +178,31 @@ func (p *WorkerPool) Submit(task func()) {
 	}
 }
 
+// SubmitKeyed enqueues a task associated with the given comparable key,
+// without blocking. Panics if the worker pool is stopped.
+//
+// Tasks sharing a key execute strictly one at a time, in the order they were
+// submitted. Tasks with different keys may execute concurrently and share the
+// same workers as tasks submitted via Submit. A long backlog for one key never
+// blocks tasks for other keys: only the head task of each key is eligible for
+// a worker, and the remaining tasks of a busy key stay in a per-key queue
+// instead of occupying workers or the waiting queue.
+//
+// Key state is removed when the key has no running or queued task, so the
+// internal key table does not grow without bound. Stop and StopWait also
+// release all key state.
+func SubmitKeyed[K comparable](p *WorkerPool, key K, task func()) {
+	if task == nil {
+		return
+	}
+	defer func() {
+		if recover() != nil {
+			panic(ErrStopped)
+		}
+	}()
+	p.keyTaskQueue <- keyedTask{key: key, task: task}
+}
+
 // SubmitWait enqueues the given function, without blocking, and waits for it
 // to be executed. Panics if the worker pool is stopped.
 func (p *WorkerPool) SubmitWait(task func()) {
@@ -145,7 +217,9 @@ func (p *WorkerPool) SubmitWait(task func()) {
 	<-doneChan
 }
 
-// WaitingQueueSize returns the count of tasks in the waiting queue.
+// WaitingQueueSize returns the count of tasks waiting for an available
+// worker. This includes plain queued tasks and keyed tasks waiting behind
+// an in-flight task of the same key.
 func (p *WorkerPool) WaitingQueueSize() int {
 	return int(p.waiting.Load())
 }
@@ -198,6 +272,12 @@ func (p *WorkerPool) dispatch(idleTimeout time.Duration) {
 		idleTO = timeout.C
 	}
 
+	startWorker := func(j job) {
+		wg.Add(1)
+		go worker(j, p.workerQueue, p.keyDone, p.drainAbort, p.keyExit, &wg)
+		workerCount++
+	}
+
 Loop:
 	for {
 		// As long as tasks are in the waiting queue, incoming tasks are put
@@ -217,21 +297,47 @@ Loop:
 				break Loop
 			}
 			// Got a task to do.
+			nextJob := job{task: task}
 			select {
-			case p.workerQueue <- task:
+			case p.workerQueue <- nextJob:
 			default:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
-					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
-					workerCount++
+					startWorker(nextJob)
 				} else {
 					// Enqueue task to be executed by next available worker.
-					p.waitingQueue.PushBack(task)
-					p.waiting.Store(int32(p.waitingQueue.Len()))
+					p.waitingQueue.PushBack(queuedTask{task: task})
+					p.waiting.Add(1)
 				}
 			}
 			idle = false
+		case kt, ok := <-p.keyTaskQueue:
+			if !ok {
+				break Loop
+			}
+			// A key that already has a running task cannot run this one
+			// directly, even if a worker is ready; otherwise two same-key
+			// tasks could execute at once.
+			st := p.keyState(kt.key)
+			if !st.running && !st.scheduled {
+				nextJob := job{task: kt.task, key: kt.key, keyed: true}
+				select {
+				case p.workerQueue <- nextJob:
+					p.markKeyRunning(st)
+				default:
+					if workerCount < p.maxWorkers {
+						startWorker(nextJob)
+						p.markKeyRunning(st)
+					} else {
+						p.acceptKeyed(kt.key, kt.task)
+					}
+				}
+			} else {
+				p.acceptKeyed(kt.key, kt.task)
+			}
+			idle = false
+		case key := <-p.keyDone:
+			p.finishKey(key)
 		case <-idleTO:
 			// Timed out waiting for work to arrive. Kill a ready worker if
 			// pool has been idle for a whole timeout.
@@ -248,21 +354,45 @@ Loop:
 	// If instructed to wait, then run tasks that are already queued.
 	if p.wait {
 		p.runQueuedTasks()
+	} else {
+		// Stop abandons queued work: discard per-key backlogs and release
+		// in-flight keyed workers from reporting key completion.
+		p.abandonQueuedTasks()
+		close(p.drainAbort)
 	}
+	p.clearKeyState()
 
-	// Stop all remaining workers as they become ready.
+	// Retire every worker. reapWorker also services keyDone reports, since a
+	// worker finishing a keyed task reports before it is ready for the kill
+	// job and listening on only one side would deadlock.
 	for workerCount > 0 {
-		p.workerQueue <- nil
-		workerCount--
+		workerCount = p.reapWorker(workerCount)
 	}
+	// Release any worker still blocked reporting key completion.
+	close(p.keyExit)
 	wg.Wait()
 }
 
-// worker executes tasks and stops when it receives a nil task.
-func worker(task func(), workerQueue chan func(), wg *sync.WaitGroup) {
-	for task != nil {
-		task()
-		task = <-workerQueue
+// worker executes jobs and stops when it receives an empty job. After a
+// keyed job it reports the key's completion before accepting another job,
+// which is what makes same-key successors strictly serial.
+func worker(first job, workerQueue chan job, keyDone chan any, drainAbort, keyExit <-chan struct{}, wg *sync.WaitGroup) {
+	j := first
+	for j.task != nil {
+		j.task()
+		if j.keyed {
+			// Report key completion before accepting another job; this is
+			// what makes same-key tasks strictly serial. During StopWait
+			// the report is always delivered, since drainAbort is open;
+			// Stop closes drainAbort, and keyExit is closed after all
+			// workers have been retired, to abandon any straggler report.
+			select {
+			case keyDone <- j.key:
+			case <-drainAbort:
+			case <-keyExit:
+			}
+		}
+		j = <-workerQueue
 	}
 	wg.Done()
 }
@@ -284,6 +414,7 @@ func (p *WorkerPool) stop(wait bool) {
 		p.wait = wait
 		// Close task queue and wait for currently running tasks to finish.
 		close(p.taskQueue)
+		close(p.keyTaskQueue)
 	})
 	<-p.stoppedChan
 }
@@ -292,37 +423,166 @@ func (p *WorkerPool) stop(wait bool) {
 // tasks from the waiting queue as workers become available. Returns false if
 // worker pool is stopped.
 func (p *WorkerPool) processWaitingQueue() bool {
+	head := p.waitingQueue.Front()
 	select {
 	case task, ok := <-p.taskQueue:
 		if !ok {
 			return false
 		}
-		p.waitingQueue.PushBack(task)
-	case p.workerQueue <- p.waitingQueue.Front():
-		// A worker was ready, so gave task to worker.
-		p.waitingQueue.PopFront()
+		p.waitingQueue.PushBack(queuedTask{task: task})
+		p.waiting.Add(1)
+	case kt, ok := <-p.keyTaskQueue:
+		if !ok {
+			return false
+		}
+		p.acceptKeyed(kt.key, kt.task)
+	case p.workerQueue <- p.frontJob(head):
+		p.commitFront()
+	case key := <-p.keyDone:
+		p.finishKey(key)
 	}
-	p.waiting.Store(int32(p.waitingQueue.Len()))
 	return true
 }
 
+// keyState returns the dispatcher-owned state for key, creating it on first
+// use.
+func (p *WorkerPool) keyState(key any) *keyState {
+	st, ok := p.keyStates[key]
+	if !ok {
+		st = &keyState{}
+		p.keyStates[key] = st
+	}
+	return st
+}
+
+// markKeyRunning records that key's head task has been handed to a worker.
+func (p *WorkerPool) markKeyRunning(st *keyState) {
+	st.running = true
+	st.scheduled = false
+	p.busyKeys++
+}
+
+// acceptKeyed adds a keyed task to the pool: if the key is idle it becomes
+// a runnable waiting-queue entry; otherwise it queues behind the key's
+// in-flight work without consuming an entry or a worker slot.
+func (p *WorkerPool) acceptKeyed(key any, task func()) {
+	st := p.keyState(key)
+	st.tasks.PushBack(task)
+	if !st.running && !st.scheduled {
+		st.scheduled = true
+		p.waitingQueue.PushBack(queuedTask{key: key, keyed: true})
+	}
+	p.waiting.Add(1)
+}
+
+// commitFront hands the front waiting-queue entry to a worker. A keyed entry
+// pops the key's head task and marks the key running; the key's next task
+// stays parked until the running task reports completion.
+func (p *WorkerPool) commitFront() {
+	head := p.waitingQueue.PopFront()
+	if !head.keyed {
+		p.waiting.Add(-1)
+		return
+	}
+	st := p.keyStates[head.key]
+	st.tasks.PopFront()
+	st.running = true
+	st.scheduled = false
+	p.busyKeys++
+	p.waiting.Add(-1)
+}
+
+// finishKey records that the running task for key completed and, if more
+// tasks for that key remain, makes the next one runnable. When no tasks
+// remain the key state is deleted, so the key table cannot grow without
+// bound.
+func (p *WorkerPool) finishKey(key any) {
+	st, ok := p.keyStates[key]
+	if !ok {
+		return
+	}
+	st.running = false
+	p.busyKeys--
+	if st.tasks.Len() == 0 {
+		delete(p.keyStates, key)
+		return
+	}
+	st.scheduled = true
+	p.waitingQueue.PushBack(queuedTask{key: key, keyed: true})
+}
+
+// reapWorker blocks until either a worker can be retired by a kill job (it
+// returns the decremented worker count) or a keyed task reports completion
+// (serviced here, count returned unchanged). The report must be listened on
+// even while reaping or shutting down: a keyed worker reports before it is
+// ready for the kill job, so listening on only the kill channel could
+// deadlock. After the key table is cleared (shutdown), reports are
+// discarded.
+func (p *WorkerPool) reapWorker(workerCount int) int {
+	select {
+	case p.workerQueue <- job{}:
+		return workerCount - 1
+	case key := <-p.keyDone:
+		if p.keyStates != nil {
+			p.finishKey(key)
+		}
+		return workerCount
+	}
+}
+
+// killIdleWorker retires one worker immediately if one is ready.
 func (p *WorkerPool) killIdleWorker() bool {
 	select {
-	case p.workerQueue <- nil:
-		// Sent kill signal to worker.
+	case p.workerQueue <- job{}:
 		return true
 	default:
-		// No ready workers. All, if any, workers are busy.
 		return false
 	}
 }
 
-// runQueuedTasks removes each task from the waiting queue and gives it to
-// workers until queue is empty.
+// runQueuedTasks drains every queued task during StopWait. Completing a
+// keyed task may enqueue that key's next task, so keyDone reports are
+// serviced until every key has drained as well.
 func (p *WorkerPool) runQueuedTasks() {
-	for p.waitingQueue.Len() != 0 {
-		// A worker is ready, so give task to worker.
-		p.workerQueue <- p.waitingQueue.PopFront()
-		p.waiting.Store(int32(p.waitingQueue.Len()))
+	for p.waitingQueue.Len() != 0 || p.busyKeys != 0 {
+		var workerQueue chan job
+		var nextJob job
+		if p.waitingQueue.Len() != 0 {
+			workerQueue = p.workerQueue
+			nextJob = p.frontJob(p.waitingQueue.Front())
+		}
+		select {
+		case workerQueue <- nextJob:
+			p.commitFront()
+		case key := <-p.keyDone:
+			p.finishKey(key)
+		}
 	}
+}
+
+// abandonQueuedTasks drops keyed task backlogs during Stop; plain tasks are
+// left in the waiting queue, matching the existing abandonment behavior.
+func (p *WorkerPool) abandonQueuedTasks() {
+	var n int
+	for _, st := range p.keyStates {
+		n += st.tasks.Len()
+	}
+	if n > 0 {
+		p.waiting.Add(int32(-n))
+	}
+}
+
+// clearKeyState releases the dispatcher-owned key table and releases workers
+// blocked reporting key completion during shutdown.
+func (p *WorkerPool) clearKeyState() {
+	p.keyStates = nil
+	p.busyKeys = 0
+}
+
+// frontJob returns the job carried by the front waiting-queue entry.
+func (p *WorkerPool) frontJob(head queuedTask) job {
+	if head.keyed {
+		return job{task: p.keyStates[head.key].tasks.Front(), key: head.key, keyed: true}
+	}
+	return job{task: head.task}
 }

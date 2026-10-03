@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -667,6 +668,206 @@ func TestPanicDo(t *testing.T) {
 	}
 }
 
+func TestSubmitKeyed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		releaseHot := make(chan struct{})
+		hotStarted := make(chan struct{}, 16)
+
+		// Build up a large backlog for one "hot" key. The first task blocks;
+		// the rest must wait behind it strictly in order, but none of them
+		// may occupy a worker.
+		const hotBacklog = 8
+		for i := range hotBacklog {
+			i := i
+			SubmitKeyed(wp, "hot", func() {
+				hotStarted <- struct{}{}
+				if i == 0 {
+					<-releaseHot
+				}
+			})
+		}
+
+		// The hot head task must be running (blocking one worker).
+		select {
+		case <-hotStarted:
+		case <-time.After(time.Second):
+			t.Fatal("hot key head task did not start")
+		}
+
+		// Despite the hot backlog, several cold keys must each make progress
+		// concurrently, and plain Submit tasks must run in parallel too.
+		coldDone := make(chan struct{}, 3)
+		for _, key := range []string{"cold1", "cold2", "cold3"} {
+			key := key
+			SubmitKeyed(wp, key, func() {
+				coldDone <- struct{}{}
+			})
+		}
+		plainDone := make(chan struct{}, 1)
+		wp.Submit(func() { plainDone <- struct{}{} })
+
+		timeout := time.After(time.Second)
+		for range 4 {
+			select {
+			case <-coldDone:
+			case <-plainDone:
+			case <-timeout:
+				t.Fatal("independent keys were blocked by hot key backlog")
+			}
+		}
+
+		// No second hot-key task may start while the head is blocked.
+		select {
+		case <-hotStarted:
+			t.Fatal("same-key tasks ran concurrently")
+		case <-time.After(time.Millisecond):
+		}
+
+		// Release the hot head task; the backlog drains strictly in order.
+		close(releaseHot)
+		for range hotBacklog - 1 {
+			select {
+			case <-hotStarted:
+			case <-time.After(time.Second):
+				t.Fatal("hot key backlog did not drain in order")
+			}
+		}
+	})
+}
+
+func TestSubmitKeyedSerialOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(8, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		release := make(chan struct{})
+		var mu sync.Mutex
+		var ran []int
+		done := make(chan struct{}, 64)
+
+		// Saturate workers with a blocked same-key chain, then submit more
+		// same-key tasks: all must run one at a time, in submission order.
+		const n = 20
+		for i := range n {
+			i := i
+			SubmitKeyed(wp, 42, func() {
+				<-release
+				mu.Lock()
+				ran = append(ran, i)
+				mu.Unlock()
+				done <- struct{}{}
+			})
+		}
+
+		// Different keys run concurrently even while key 42 is fully blocked.
+		otherDone := make(chan struct{}, 4)
+		for k := range 4 {
+			SubmitKeyed(wp, k+100, func() { otherDone <- struct{}{} })
+		}
+		for range 4 {
+			select {
+			case <-otherDone:
+			case <-time.After(time.Second):
+				t.Fatal("other keys did not run concurrently with blocked key")
+			}
+		}
+
+		close(release)
+		for range n {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("same-key chain did not drain")
+			}
+		}
+
+		for i := range n {
+			if ran[i] != i {
+				t.Fatalf("same-key tasks ran out of order: %v", ran)
+			}
+		}
+		synctest.Wait()
+		if len(wp.keyStates) != 0 {
+			t.Fatal("key state should be reclaimed after draining")
+		}
+	})
+}
+
+func TestSubmitKeyedStopWait(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2, WithIdleTimeout(-1))
+
+		release := make(chan struct{})
+		var counter atomic.Int32
+
+		// Block the first "a" task and queue many more same-key tasks, mixed
+		// with tasks of another key. StopWait must drain all of them.
+		for range 16 {
+			SubmitKeyed(wp, "a", func() {
+				<-release
+				counter.Add(1)
+			})
+		}
+		for range 8 {
+			SubmitKeyed(wp, "b", func() { counter.Add(1) })
+		}
+
+		stopDone := make(chan struct{})
+		go func() { wp.StopWait(); close(stopDone) }()
+
+		// StopWait cannot return while tasks are blocked.
+		select {
+		case <-stopDone:
+			t.Fatal("StopWait returned before queued tasks completed")
+		case <-time.After(time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("StopWait did not drain keyed backlog")
+		}
+		if counter.Load() != 24 {
+			t.Fatal("StopWait did not execute all keyed tasks, ran", counter.Load())
+		}
+		if wp.keyStates != nil {
+			t.Fatal("StopWait did not release key state")
+		}
+	})
+}
+
+func TestSubmitKeyedStopAbandons(t *testing.T) {
+	wp := New(4, WithIdleTimeout(-1))
+
+	release := make(chan struct{})
+	started := make(chan struct{}, 16)
+
+	// One running keyed task plus a large backlog for the same key.
+	for range 12 {
+		SubmitKeyed(wp, "hot", func() {
+			started <- struct{}{}
+			<-release
+		})
+	}
+	<-started
+
+	// Stop waits for the running task to complete; release it concurrently.
+	go func() { time.Sleep(10 * time.Millisecond); close(release) }()
+	wp.Stop()
+	if wp.keyStates != nil {
+		t.Fatal("Stop did not release key state")
+	}
+
+	// Submitting after stop panics, for both keyed and plain tasks.
+	assertPanics(t, "SubmitKeyed", func() {
+		SubmitKeyed(wp, "x", func() {})
+	})
+}
+
 func assertPanics(t *testing.T, name string, f func()) {
 	t.Helper()
 	defer func() {
@@ -678,13 +879,117 @@ func assertPanics(t *testing.T, name string, f func()) {
 	f()
 }
 
+func TestSubmitKeyedStress(t *testing.T) {
+	const (
+		goroutines = 16
+		tasksPerG  = 200
+		keys       = 12
+	)
+
+	wp := New(6, WithIdleTimeout(-1))
+
+	var plainWG sync.WaitGroup
+	for range goroutines {
+		plainWG.Add(1)
+		go func() {
+			defer plainWG.Done()
+			for range tasksPerG {
+				wp.Submit(func() { time.Sleep(time.Microsecond) })
+			}
+		}()
+	}
+
+	var keyWG sync.WaitGroup
+	for g := range goroutines {
+		keyWG.Add(1)
+		go func(g int) {
+			defer keyWG.Done()
+			for i := range tasksPerG {
+				key := (g*7 + i) % keys
+				SubmitKeyed(wp, key, func() {
+					time.Sleep(time.Microsecond)
+				})
+			}
+		}(g)
+	}
+
+	plainWG.Wait()
+	keyWG.Wait()
+	wp.StopWait()
+
+	if len(wp.keyStates) != 0 {
+		t.Fatalf("key table grew without bound: %d entries", len(wp.keyStates))
+	}
+}
+
+func TestSubmitKeyedTableReclaimedOverTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(-1))
+		defer wp.Stop()
+
+		for round := range 50 {
+			done := make(chan struct{}, 16)
+			for k := range 16 {
+				SubmitKeyed(wp, k+round*1000, func() { done <- struct{}{} })
+			}
+			for range 16 {
+				<-done
+			}
+			synctest.Wait()
+			if len(wp.keyStates) != 0 {
+				t.Fatalf("key table not reclaimed after round %d: %d", round, len(wp.keyStates))
+			}
+		}
+	})
+}
+
+func TestSubmitKeyedHotKeyWithIdleReap(t *testing.T) {
+	const idleTimeout = 50 * time.Millisecond
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(idleTimeout))
+		defer wp.Stop()
+
+		release := make(chan struct{})
+		started := make(chan struct{}, 64)
+
+		// One hot key with a deep backlog; the head blocks long enough for
+		// many idle-timeout cycles to pass. Independent keys must keep
+		// advancing the whole time, and the pool must shut down cleanly.
+		for range 20 {
+			SubmitKeyed(wp, "hot", func() {
+				started <- struct{}{}
+				<-release
+			})
+		}
+		<-started
+
+		for round := range 8 {
+			done := make(chan struct{}, 3)
+			for _, key := range []int{round + 1, round + 100, round + 1000} {
+				SubmitKeyed(wp, key, func() { done <- struct{}{} })
+			}
+			for range 3 {
+				select {
+				case <-done:
+				case <-time.After(time.Second):
+					t.Fatal("independent keys stalled while idle reaper ran")
+				}
+			}
+			time.Sleep(idleTimeout)
+		}
+
+		close(release)
+		wp.StopWait()
+	})
+}
+
 func anyReady(w *WorkerPool) bool {
 	release := make(chan struct{})
 	wait := func() {
 		<-release
 	}
 	select {
-	case w.workerQueue <- wait:
+	case w.workerQueue <- job{task: wait}:
 		close(release)
 		return true
 	default:
@@ -702,7 +1007,7 @@ func countReady(w *WorkerPool) int {
 	var readyCount int
 	for i := 0; i < max; i++ {
 		select {
-		case w.workerQueue <- wait:
+		case w.workerQueue <- job{task: wait}:
 			readyCount++
 		case <-timeout:
 			i = max

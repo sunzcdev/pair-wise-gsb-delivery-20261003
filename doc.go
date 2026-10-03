@@ -55,6 +55,17 @@ waiting task, allowing a much higher number of waiting tasks. Also, using a
 waiting queue ensures that tasks are given to workers in the order the tasks
 were received.
 
+Keyed tasks
+
+SubmitKeyed associates each task with a comparable key. Tasks with the same key
+execute one at a time and in submission order, while tasks with different keys
+share the pool's workers and may run concurrently. A backlog for one key does
+not block other keys: only the head task of a key is eligible for a worker, and
+the remaining tasks of a busy key wait in a per-key queue that occupies neither
+workers nor waiting-queue entries. Key state is deleted as soon as a key drains,
+and is fully released by Stop and StopWait, so long-running pools do not retain
+an ever-growing key table.
+
 Credits
 
 This implementation builds on ideas from the following:

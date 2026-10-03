@@ -47,6 +47,20 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Keyed tasks
+
+`SubmitKeyed` runs tasks sharing a comparable key strictly one at a time in submission order, while different keys share the pool workers and may execute concurrently. A large backlog for one hot key never blocks later tasks for independent keys, since only the head task of each key occupies a worker. Key state is reclaimed automatically when the key drains, and `Stop`/`StopWait` release all key state.
+
+```go
+wp := workerpool.New(4)
+
+// Requests for the same user ID are serialized; different users run in parallel.
+workerpool.SubmitKeyed(wp, userID, func() {
+    handleRequest(userID)
+})
+```
+
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.
