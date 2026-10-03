@@ -26,6 +26,11 @@ type Message struct {
 	pri        int64
 	index      int
 	deferred   time.Duration
+
+	// publishTS records the time the message was admitted into the topic
+	// (memory queue only); used to decide whether a channel already existed
+	// when the message's fan-out bytes were reserved
+	publishTS int64
 }
 
 func NewMessage(id MessageID, body []byte) *Message {

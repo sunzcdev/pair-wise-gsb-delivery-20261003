@@ -47,6 +47,7 @@ type Channel struct {
 
 	topicName string
 	name      string
+	topic     *Topic
 	nsqd      *NSQD
 
 	backend BackendQueue
@@ -57,6 +58,18 @@ type Channel struct {
 	memoryMsgChan            chan *Message
 	exitFlag                 int32
 	exitMutex                sync.RWMutex
+
+	// pendingBytes is the number of message body bytes currently owned by
+	// this channel (memory queue, backend queue, in-flight and deferred).
+	// reservedBytes is the fan-out cost of messages still waiting in the
+	// topic's queue that was reserved against this channel.
+	//
+	// Both fields are guarded by the owning topic's budget mutex.
+	pendingBytes  int64
+	reservedBytes int64
+	// createdAt marks the channel creation time; a message published after
+	// this instant had its fan-out cost reserved for this channel
+	createdAt int64
 
 	// state tracking
 	clients        map[int64]Consumer
@@ -78,35 +91,36 @@ type Channel struct {
 }
 
 // NewChannel creates a new instance of the Channel type and returns a pointer
-func NewChannel(topicName string, channelName string, nsqd *NSQD,
-	deleteCallback func(*Channel)) *Channel {
+func NewChannel(t *Topic, channelName string, deleteCallback func(*Channel)) *Channel {
 
 	c := &Channel{
-		topicName:                topicName,
+		topicName:                t.name,
 		name:                     channelName,
+		topic:                    t,
 		memoryMsgChan:            nil,
 		clients:                  make(map[int64]Consumer),
 		deleteCallback:           deleteCallback,
-		nsqd:                     nsqd,
+		nsqd:                     t.nsqd,
 		ephemeral:                strings.HasSuffix(channelName, "#ephemeral"),
-		topologyAwareConsumption: nsqd.getOpts().HasExperiment(TopologyAwareConsumption),
+		topologyAwareConsumption: t.nsqd.getOpts().HasExperiment(TopologyAwareConsumption),
+		createdAt:                time.Now().UnixNano(),
 	}
 
-	if nsqd.getOpts().TopologyRegion != "" {
+	if t.nsqd.getOpts().TopologyRegion != "" {
 		c.regionLocalMsgChan = make(chan *Message)
 	}
-	if nsqd.getOpts().TopologyZone != "" {
+	if t.nsqd.getOpts().TopologyZone != "" {
 		c.zoneLocalMsgChan = make(chan *Message)
 	}
 
 	// avoid mem-queue if size == 0 for more consistent ordering
-	if nsqd.getOpts().MemQueueSize > 0 || c.ephemeral {
-		c.memoryMsgChan = make(chan *Message, nsqd.getOpts().MemQueueSize)
+	if t.nsqd.getOpts().MemQueueSize > 0 || c.ephemeral {
+		c.memoryMsgChan = make(chan *Message, t.nsqd.getOpts().MemQueueSize)
 	}
-	if len(nsqd.getOpts().E2EProcessingLatencyPercentiles) > 0 {
+	if len(t.nsqd.getOpts().E2EProcessingLatencyPercentiles) > 0 {
 		c.e2eProcessingLatencyStream = quantile.New(
-			nsqd.getOpts().E2EProcessingLatencyWindowTime,
-			nsqd.getOpts().E2EProcessingLatencyPercentiles,
+			t.nsqd.getOpts().E2EProcessingLatencyWindowTime,
+			t.nsqd.getOpts().E2EProcessingLatencyPercentiles,
 		)
 	}
 
@@ -116,24 +130,24 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
 		c.backend = newDummyBackendQueue()
 	} else {
 		dqLogf := func(level diskqueue.LogLevel, f string, args ...interface{}) {
-			opts := nsqd.getOpts()
+			opts := t.nsqd.getOpts()
 			lg.Logf(opts.Logger, opts.LogLevel, lg.LogLevel(level), f, args...)
 		}
 		// backend names, for uniqueness, automatically include the topic...
-		backendName := getBackendName(topicName, channelName)
+		backendName := getBackendName(t.name, channelName)
 		c.backend = diskqueue.New(
 			backendName,
-			nsqd.getOpts().DataPath,
-			nsqd.getOpts().MaxBytesPerFile,
+			t.nsqd.getOpts().DataPath,
+			t.nsqd.getOpts().MaxBytesPerFile,
 			int32(minValidMsgLength),
-			int32(nsqd.getOpts().MaxMsgSize)+minValidMsgLength,
-			nsqd.getOpts().SyncEvery,
-			nsqd.getOpts().SyncTimeout,
+			int32(t.nsqd.getOpts().MaxMsgSize)+minValidMsgLength,
+			t.nsqd.getOpts().SyncEvery,
+			t.nsqd.getOpts().SyncTimeout,
 			dqLogf,
 		)
 	}
 
-	c.nsqd.Notify(c, !c.ephemeral)
+	t.nsqd.Notify(c, !c.ephemeral)
 
 	return c
 }
@@ -215,23 +229,54 @@ func (c *Channel) Empty() error {
 	c.Lock()
 	defer c.Unlock()
 
+	// sum the bytes still buffered in memory or tracked in the in-flight /
+	// deferred heaps; disk-backed bytes are accounted for via pendingBytes
+	// when the backend is emptied below
+	c.topic.budgetMu.Lock()
+	drained := int64(0)
+	for {
+		select {
+		case msg := <-c.zoneLocalMsgChan:
+			drained += int64(len(msg.Body))
+			continue
+		case msg := <-c.regionLocalMsgChan:
+			drained += int64(len(msg.Body))
+			continue
+		case msg := <-c.memoryMsgChan:
+			drained += int64(len(msg.Body))
+			continue
+		default:
+		}
+		break
+	}
+	c.inFlightMutex.Lock()
+	for _, msg := range c.inFlightMessages {
+		drained += int64(len(msg.Body))
+	}
+	c.inFlightMutex.Unlock()
+	c.deferredMutex.Lock()
+	for _, item := range c.deferredMessages {
+		msg := item.Value.(*Message)
+		drained += int64(len(msg.Body))
+	}
+	c.deferredMutex.Unlock()
+
 	c.initPQ()
 	for _, client := range c.clients {
 		client.Empty()
 	}
 
-	for {
-		select {
-		case <-c.zoneLocalMsgChan:
-		case <-c.regionLocalMsgChan:
-		case <-c.memoryMsgChan:
-		default:
-			goto finish
-		}
+	// the backend Empty() drops everything still queued on disk; reset all
+	// accounting and return that capacity to the topic's pending budget
+	err := c.backend.Empty()
+	if err != nil {
+		c.topic.budgetMu.Unlock()
+		return err
 	}
+	c.subPendingLocked(drained + c.pendingBytes)
+	c.topic.budgetMu.Unlock()
 
-finish:
-	return c.backend.Empty()
+	return nil
 }
 
 // flush persists all the messages in internal memory buffers to the backend
@@ -329,7 +374,7 @@ func (c *Channel) PutMessage(m *Message) error {
 	if c.Exiting() {
 		return errors.New("exiting")
 	}
-	err := c.put(m)
+	_, err := c.put(m)
 	if err != nil {
 		return err
 	}
@@ -337,7 +382,55 @@ func (c *Channel) PutMessage(m *Message) error {
 	return nil
 }
 
-func (c *Channel) put(m *Message) error {
+// deliverMessage is called by the topic messagePump for every fan-out
+// delivery. It stores the message and, only once the bytes are actually
+// owned by the channel (memory queue, backend queue or deferred heap),
+// charges them against the channel and consumes the reserved fan-out share
+// when the channel already existed at publish time.
+func (c *Channel) deliverMessage(msg *Message) error {
+	size := int64(len(msg.Body))
+
+	if msg.deferred != 0 {
+		err := c.StartDeferredTimeout(msg, msg.deferred)
+		if err != nil {
+			return err
+		}
+		c.topic.budgetMu.Lock()
+		released := c.deliverLocked(msg, size)
+		if released {
+			c.topic.subReservedLocked(size)
+		}
+		c.topic.budgetMu.Unlock()
+		atomic.AddUint64(&c.messageCount, 1)
+		return nil
+	}
+
+	c.exitMutex.RLock()
+	defer c.exitMutex.RUnlock()
+	if c.Exiting() {
+		return errors.New("exiting")
+	}
+	dropped, err := c.put(msg)
+	if err != nil {
+		return err
+	}
+	c.topic.budgetMu.Lock()
+	if dropped {
+		// ephemeral channel with a full queue: nothing was stored, give the
+		// fan-out reservation back to the topic
+		c.topic.releaseChannelReservationLocked(c, size)
+	} else {
+		released := c.deliverLocked(msg, size)
+		if released {
+			c.topic.subReservedLocked(size)
+		}
+	}
+	c.topic.budgetMu.Unlock()
+	atomic.AddUint64(&c.messageCount, 1)
+	return nil
+}
+
+func (c *Channel) put(m *Message) (dropped bool, err error) {
 	if c.topologyAwareConsumption {
 		// Attempt zone local, region local and finally the memory channel
 		// we do this to ensure that we preferentially deliver messages based on toplogy
@@ -347,24 +440,24 @@ func (c *Channel) put(m *Message) error {
 		// attempt a higher priority channel can still win
 		select {
 		case c.zoneLocalMsgChan <- m:
-			return nil
+			return false, nil
 		default:
 		}
 		select {
 		case c.zoneLocalMsgChan <- m:
-			return nil
+			return false, nil
 		case c.regionLocalMsgChan <- m:
-			return nil
+			return false, nil
 		default:
 		}
 
 		select {
 		case c.zoneLocalMsgChan <- m:
-			return nil
+			return false, nil
 		case c.regionLocalMsgChan <- m:
-			return nil
+			return false, nil
 		case c.memoryMsgChan <- m:
-			return nil
+			return false, nil
 		default:
 		}
 
@@ -372,26 +465,29 @@ func (c *Channel) put(m *Message) error {
 
 		select {
 		case c.memoryMsgChan <- m:
-			return nil
+			return false, nil
 		default:
 		}
 	}
 
-	err := writeMessageToBackend(m, c.backend)
+	if c.ephemeral {
+		// ephemeral channels have no backend queue; a full memory queue drops
+		// the message
+		return true, nil
+	}
+	err = writeMessageToBackend(m, c.backend)
 	c.nsqd.SetHealth(err)
 	if err != nil {
 		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to write message to backend - %s",
 			c.name, err)
-		return err
+		return false, err
 	}
-	return nil
+	return false, nil
 }
 
-func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) {
+func (c *Channel) PutMessageDeferred(msg *Message, timeout time.Duration) error {
 	atomic.AddUint64(&c.messageCount, 1)
-	if err := c.StartDeferredTimeout(msg, timeout); err != nil {
-		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to defer message - %s", c.name, err)
-	}
+	return c.StartDeferredTimeout(msg, timeout)
 }
 
 // TouchMessage resets the timeout for an in-flight message
@@ -425,6 +521,9 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 		return err
 	}
 	c.removeFromInFlightPQ(msg)
+	c.topic.budgetMu.Lock()
+	c.subPendingLocked(int64(len(msg.Body)))
+	c.topic.budgetMu.Unlock()
 	if c.e2eProcessingLatencyStream != nil {
 		c.e2eProcessingLatencyStream.Insert(msg.Timestamp)
 	}
@@ -452,7 +551,7 @@ func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Dura
 			c.exitMutex.RUnlock()
 			return errors.New("exiting")
 		}
-		err := c.put(msg)
+		_, err = c.put(msg)
 		c.exitMutex.RUnlock()
 		return err
 	}
@@ -644,7 +743,7 @@ func (c *Channel) processDeferredQueue(t int64) bool {
 		if err != nil {
 			goto exit
 		}
-		err = c.put(msg)
+		_, err = c.put(msg)
 		if err != nil {
 			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to requeue deferred message - %s", c.name, err)
 			goto exit
@@ -685,7 +784,7 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 		if ok {
 			client.TimedOutMessage()
 		}
-		err = c.put(msg)
+		_, err = c.put(msg)
 		if err != nil {
 			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to requeue in-flight message - %s", c.name, err)
 			goto exit
@@ -694,4 +793,49 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 
 exit:
 	return dirty
+}
+
+// subPendingLocked decreases the channel's pending byte counter, clamping at
+// zero; the caller must hold the topic's budget mutex
+func (c *Channel) subPendingLocked(n int64) {
+	c.pendingBytes -= n
+	if c.pendingBytes < 0 {
+		c.pendingBytes = 0
+	}
+}
+
+// reclaimLocked releases every byte still reserved for or pending in this
+// channel (used when the channel is deleted); the caller must hold the
+// topic's budget mutex. It returns the number of pending bytes (no longer
+// counted against the topic's budget) and reserved bytes that are freed.
+func (c *Channel) reclaimLocked() (int64, int64) {
+	pending := c.pendingBytes
+	reserved := c.reservedBytes
+	c.pendingBytes = 0
+	c.reservedBytes = 0
+	return pending, reserved
+}
+
+// deliverLocked accounts for a single fan-out delivery of a message.
+//
+// If the channel already existed when the message was admitted (publishTS at
+// or before channel creation), the reserved fan-out share is consumed;
+// otherwise (channel created later, NSQ backlog semantics) the bytes are
+// charged without consuming a reservation.
+//
+// It returns true if a reservation share was released. The caller must hold
+// the topic's budget mutex.
+func (c *Channel) deliverLocked(msg *Message, size int64) bool {
+	c.pendingBytes += size
+	if msg.publishTS != 0 && msg.publishTS >= c.createdAt && c.reservedBytes >= size {
+		c.reservedBytes -= size
+		return true
+	}
+	return false
+}
+
+// pendingUsage reports the channel's current used and reserved bytes; the
+// caller must hold the topic's budget mutex
+func (c *Channel) pendingUsage() (int64, int64) {
+	return c.pendingBytes, c.reservedBytes
 }

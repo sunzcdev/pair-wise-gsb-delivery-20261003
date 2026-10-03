@@ -151,6 +151,7 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	flagSet.Int64("max-bytes-per-file", opts.MaxBytesPerFile, "number of bytes per diskqueue file before rolling")
 	flagSet.Int64("sync-every", opts.SyncEvery, "number of messages per diskqueue fsync")
 	flagSet.Duration("sync-timeout", opts.SyncTimeout, "duration of time per diskqueue fsync")
+	flagSet.Int64("max-topic-pending-bytes", opts.MaxTopicPendingBytes, "maximum pending bytes (topic queue + channel fan-out) per topic before rejecting publishes; 0 disables")
 
 	flagSet.Int("queue-scan-worker-pool-max", opts.QueueScanWorkerPoolMax, "max concurrency for checking in-flight and deferred message timeouts")
 	flagSet.Int("queue-scan-selection-count", opts.QueueScanSelectionCount, "number of channels to check per cycle (every 100ms) for in-flight and deferred timeouts")

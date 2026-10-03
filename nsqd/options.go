@@ -40,6 +40,17 @@ type Options struct {
 	SyncEvery       int64         `flag:"sync-every"`
 	SyncTimeout     time.Duration `flag:"sync-timeout"`
 
+	// MaxTopicPendingBytes is the maximum number of pending bytes a topic is
+	// allowed to accumulate before new publishes are rejected.
+	//
+	// Pending bytes include the bytes still waiting in the topic queue and the
+	// fan-out cost of every existing channel (queued, in-flight and deferred
+	// messages). Bytes reserved by in-flight publish requests are counted as
+	// well, so concurrent publishers can never over-subscribe the budget.
+	//
+	// A value of 0 disables the limit (default).
+	MaxTopicPendingBytes int64 `flag:"max-topic-pending-bytes" cfg:"max_topic_pending_bytes"`
+
 	QueueScanInterval        time.Duration
 	QueueScanRefreshInterval time.Duration
 	QueueScanSelectionCount  int `flag:"queue-scan-selection-count"`

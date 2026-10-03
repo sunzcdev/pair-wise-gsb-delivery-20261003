@@ -852,6 +852,10 @@ func (p *protocolV2) PUB(client *clientV2, params [][]byte) ([]byte, error) {
 	msg := NewMessage(topic.GenerateID(), messageBody)
 	err = topic.PutMessage(msg)
 	if err != nil {
+		if errors.Is(err, ErrPendingBudgetExceeded) {
+			return nil, protocol.NewClientErr(err, "E_PENDING_BUDGET_EXCEEDED",
+				"PUB failed "+err.Error())
+		}
 		return nil, protocol.NewFatalClientErr(err, "E_PUB_FAILED", "PUB failed "+err.Error())
 	}
 
@@ -905,6 +909,10 @@ func (p *protocolV2) MPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	// this next call (and no messages will be queued in that case)
 	err = topic.PutMessages(messages)
 	if err != nil {
+		if errors.Is(err, ErrPendingBudgetExceeded) {
+			return nil, protocol.NewClientErr(err, "E_PENDING_BUDGET_EXCEEDED",
+				"MPUB failed "+err.Error())
+		}
 		return nil, protocol.NewFatalClientErr(err, "E_MPUB_FAILED", "MPUB failed "+err.Error())
 	}
 
@@ -969,6 +977,10 @@ func (p *protocolV2) DPUB(client *clientV2, params [][]byte) ([]byte, error) {
 	msg.deferred = timeoutDuration
 	err = topic.PutMessage(msg)
 	if err != nil {
+		if errors.Is(err, ErrPendingBudgetExceeded) {
+			return nil, protocol.NewClientErr(err, "E_PENDING_BUDGET_EXCEEDED",
+				"DPUB failed "+err.Error())
+		}
 		return nil, protocol.NewFatalClientErr(err, "E_DPUB_FAILED", "DPUB failed "+err.Error())
 	}
 

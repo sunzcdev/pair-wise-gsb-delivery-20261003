@@ -77,6 +77,12 @@ func (n *NSQD) statsdLoop() {
 				stat = fmt.Sprintf("topic.%s.backend_depth", topic.TopicName)
 				_ = client.Gauge(stat, topic.BackendDepth)
 
+				stat = fmt.Sprintf("topic.%s.pending_bytes", topic.TopicName)
+				_ = client.Gauge(stat, topic.PendingBytes)
+
+				stat = fmt.Sprintf("topic.%s.reserved_bytes", topic.TopicName)
+				_ = client.Gauge(stat, topic.ReservedBytes)
+
 				for _, item := range topic.E2eProcessingLatency.Percentiles {
 					stat = fmt.Sprintf("topic.%s.e2e_processing_latency_%.0f", topic.TopicName, item["quantile"]*100.0)
 					// We can cast the value to int64 since a value of 1 is the
@@ -107,6 +113,12 @@ func (n *NSQD) statsdLoop() {
 
 					stat = fmt.Sprintf("topic.%s.channel.%s.backend_depth", topic.TopicName, channel.ChannelName)
 					_ = client.Gauge(stat, channel.BackendDepth)
+
+					stat = fmt.Sprintf("topic.%s.channel.%s.pending_bytes", topic.TopicName, channel.ChannelName)
+					_ = client.Gauge(stat, channel.PendingBytes)
+
+					stat = fmt.Sprintf("topic.%s.channel.%s.reserved_bytes", topic.TopicName, channel.ChannelName)
+					_ = client.Gauge(stat, channel.ReservedBytes)
 
 					stat = fmt.Sprintf("topic.%s.channel.%s.in_flight_count", topic.TopicName, channel.ChannelName)
 					_ = client.Gauge(stat, int64(channel.InFlightCount))

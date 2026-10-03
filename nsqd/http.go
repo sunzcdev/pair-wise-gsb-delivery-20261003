@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -254,6 +255,9 @@ func (s *httpServer) doPUB(w http.ResponseWriter, req *http.Request, ps httprout
 	msg.deferred = deferred
 	err = topic.PutMessage(msg)
 	if err != nil {
+		if errors.Is(err, ErrPendingBudgetExceeded) {
+			return nil, http_api.Err{Code: 503, Text: "PENDING_BUDGET_EXCEEDED"}
+		}
 		return nil, http_api.Err{Code: 503, Text: "EXITING"}
 	}
 
@@ -332,6 +336,9 @@ func (s *httpServer) doMPUB(w http.ResponseWriter, req *http.Request, ps httprou
 
 	err = topic.PutMessages(msgs)
 	if err != nil {
+		if errors.Is(err, ErrPendingBudgetExceeded) {
+			return nil, http_api.Err{Code: 503, Text: "PENDING_BUDGET_EXCEEDED"}
+		}
 		return nil, http_api.Err{Code: 503, Text: "EXITING"}
 	}
 
@@ -589,12 +596,14 @@ func (s *httpServer) printStats(stats Stats, ms *memStats, health string, startT
 		} else {
 			pausedPrefix = "   "
 		}
-		fmt.Fprintf(w, "\n%s[%-15s] depth: %-5d be-depth: %-5d msgs: %-8d e2e%%: %s\n",
+		fmt.Fprintf(w, "\n%s[%-15s] depth: %-5d be-depth: %-5d msgs: %-8d pending-bytes: %-10d reserved-bytes: %-10d e2e%%: %s\n",
 			pausedPrefix,
 			t.TopicName,
 			t.Depth,
 			t.BackendDepth,
 			t.MessageCount,
+			t.PendingBytes,
+			t.ReservedBytes,
 			t.E2eProcessingLatency,
 		)
 		for _, c := range t.Channels {
@@ -603,7 +612,7 @@ func (s *httpServer) printStats(stats Stats, ms *memStats, health string, startT
 			} else {
 				pausedPrefix = "      "
 			}
-			fmt.Fprintf(w, "%s[%-25s] depth: %-5d be-depth: %-5d inflt: %-4d def: %-4d re-q: %-5d timeout: %-5d msgs: %-8d e2e%%: %s\n",
+			fmt.Fprintf(w, "%s[%-25s] depth: %-5d be-depth: %-5d inflt: %-4d def: %-4d re-q: %-5d timeout: %-5d msgs: %-8d pending-bytes: %-10d reserved-bytes: %-10d e2e%%: %s\n",
 				pausedPrefix,
 				c.ChannelName,
 				c.Depth,
@@ -613,6 +622,8 @@ func (s *httpServer) printStats(stats Stats, ms *memStats, health string, startT
 				c.RequeueCount,
 				c.TimeoutCount,
 				c.MessageCount,
+				c.PendingBytes,
+				c.ReservedBytes,
 				c.E2eProcessingLatency,
 			)
 			for _, client := range c.Clients {
