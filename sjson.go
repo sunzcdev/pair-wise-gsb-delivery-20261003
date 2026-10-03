@@ -32,6 +32,16 @@ type Options struct {
 	// The Optimistic flag must be set to true and the input must be a
 	// byte slice in order to use this field.
 	ReplaceInPlace bool
+	// IncrementInitial is used only by Increment when the target path does
+	// not already exist. The value must be a valid json number and is used
+	// as the starting value before the delta is added. When nil, a missing
+	// target starts at 0.
+	IncrementInitial *string
+	// MaxResultLen is used only by Increment. It caps the length, in bytes,
+	// of the resulting number literal. If the rendered result would exceed
+	// this limit an error is returned and the json is left unchanged.
+	// A value of zero or less means DefaultIncrementMaxLen.
+	MaxResultLen int
 }
 
 type pathResult struct {

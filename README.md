@@ -54,6 +54,48 @@ This will print:
 {"name":{"first":"Janet","last":"Anderson"},"age":47}
 ```
 
+Increment a number
+------------------
+Increment adds a json number delta to the number at the specified path
+using exact decimal arithmetic (`math/big`); the target and delta are parsed
+as json number syntax and are never converted to `float64`, so integers
+larger than 2^53 and fractional amounts stay exact.
+
+The delta is a json number literal such as `"1"`, `"-0.25"` or `"1e3"`, or
+a Go integer. Only an existing json number can be incremented; `null`,
+strings and booleans are never coerced and return an error. A missing path
+starts at `0`, or at `Options.IncrementInitial` when provided.
+
+```go
+value, _ := sjson.Increment(`{"count":9007199254740993}`, "count", "1")
+println(value)
+
+// Output:
+// {"count":9007199254740994}
+
+value, _ = sjson.Increment(`{"price":1.50}`, "price", "0.25")
+println(value)
+
+// Output:
+// {"price":1.75}
+```
+
+The rendered number length is capped to avoid runaway results from large
+exponents. The limit and the initial value for a missing target are set
+through `Options`:
+
+```go
+initial := "100"
+value, err := sjson.IncrementOptions(`{}`, "total", "5", &sjson.Options{
+	IncrementInitial: &initial, // missing "total" starts at 100
+	MaxResultLen:     100,      // max bytes of the resulting number
+})
+```
+
+If the result would exceed the limit an error is returned and the json is
+left unchanged. All unrelated formatting around the target number is
+preserved.
+
 Path syntax
 -----------
 
