@@ -15,6 +15,13 @@ import (
 
 var errCloseSession = errors.New("Stop current milter processing")
 
+// Internal callback stages without an exported Stage constant.
+const (
+	stageHeader Stage = 7 // SMFIC_HEADER callback
+	stageBody   Stage = 8 // SMFIC_BODY callback
+	stageAbort  Stage = 9 // SMFIC_ABORT callback
+)
+
 // milterSession keeps session state during MTA communication
 type milterSession struct {
 	server   *Server
@@ -24,6 +31,22 @@ type milterSession struct {
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+}
+
+// runModifier creates a Modifier valid for the given callback stage and makes
+// sure it expires as soon as the callback returns, so business code can no
+// longer emit any packet through a saved Modifier.
+func (m *milterSession) runModifier(stage Stage, cb func(*Modifier) (Response, error)) (Response, error) {
+	mod := newModifier(m, stage)
+	defer mod.finish()
+	return cb(mod)
+}
+
+// runAbortModifier is like runModifier for the Abort callback.
+func (m *milterSession) runAbortModifier(cb func(*Modifier) error) error {
+	mod := newModifier(m, stageAbort)
+	defer mod.finish()
+	return cb(mod)
 }
 
 // ReadPacket reads incoming milter packet
@@ -104,11 +127,13 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			m.headers = nil
 			m.macros = nil
 		}()
-		return nil, m.backend.Abort(newModifier(m))
+		return nil, m.runAbortModifier(m.backend.Abort)
 
 	case CodeBody:
 		// body chunk
-		return m.backend.BodyChunk(msg.Data, newModifier(m))
+		return m.runModifier(stageBody, func(mod *Modifier) (Response, error) {
+			return m.backend.BodyChunk(msg.Data, mod)
+		})
 
 	case CodeConn:
 		// new connection, get hostname
@@ -136,12 +161,14 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			'6': "tcp6",
 		}
 		// run handler and return
-		return m.backend.Connect(
-			hostname,
-			family[protocolFamily],
-			port,
-			net.ParseIP(address),
-			newModifier(m))
+		return m.runModifier(StageConnect, func(mod *Modifier) (Response, error) {
+			return m.backend.Connect(
+				hostname,
+				family[protocolFamily],
+				port,
+				net.ParseIP(address),
+				mod)
+		})
 
 	case CodeMacro:
 		// define macros
@@ -163,12 +190,16 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 	case CodeEOB:
 		// call and return milter handler
-		return m.backend.Body(newModifier(m))
+		return m.runModifier(StageEOM, func(mod *Modifier) (Response, error) {
+			return m.backend.Body(mod)
+		})
 
 	case CodeHelo:
 		// helo command
 		name := strings.TrimSuffix(string(msg.Data), null)
-		return m.backend.Helo(name, newModifier(m))
+		return m.runModifier(StageHelo, func(mod *Modifier) (Response, error) {
+			return m.backend.Helo(name, mod)
+		})
 
 	case CodeHeader:
 		// make sure headers is initialized
@@ -184,19 +215,35 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		if len(headerData) == 2 {
 			m.headers.Add(headerData[0], headerData[1])
 			// call and return milter handler
-			return m.backend.Header(headerData[0], headerData[1], newModifier(m))
+			return m.runModifier(stageHeader, func(mod *Modifier) (Response, error) {
+				return m.backend.Header(headerData[0], headerData[1], mod)
+			})
 		}
 
 	case CodeMail:
 		// envelope from address
 		from := readCString(msg.Data)
-		return m.backend.MailFrom(strings.Trim(from, "<>"), newModifier(m))
+		return m.runModifier(StageMailFrom, func(mod *Modifier) (Response, error) {
+			return m.backend.MailFrom(strings.Trim(from, "<>"), mod)
+		})
 
 	case CodeEOH:
 		// end of headers
-		return m.backend.Headers(m.headers, newModifier(m))
+		return m.runModifier(StageEOH, func(mod *Modifier) (Response, error) {
+			return m.backend.Headers(m.headers, mod)
+		})
 
 	case CodeOptNeg:
+		// Intersect offered actions with the capabilities the milter wants and
+		// add the MTA's protocol exclusions, so only functionality agreed upon
+		// by both sides is negotiated.
+		if len(msg.Data) >= 4*3 {
+			offeredActions := OptAction(binary.BigEndian.Uint32(msg.Data[4:]))
+			offeredProtocol := OptProtocol(binary.BigEndian.Uint32(msg.Data[8:]))
+			m.actions &= offeredActions
+			m.protocol |= offeredProtocol
+		}
+
 		// ignore request and prepare response buffer
 		var buffer bytes.Buffer
 		// prepare response data
@@ -206,7 +253,7 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			}
 		}
 		// append requested symlist
-		if m.server.Actions&OptSetSymList != 0 {
+		if m.actions&OptSetSymList != 0 {
 			for stage, macros := range m.server.SymList {
 				binary.Write(&buffer, binary.BigEndian, stage)
 				for i, macro := range macros {
@@ -228,7 +275,9 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 	case CodeRcpt:
 		// envelope to address
 		to := readCString(msg.Data)
-		return m.backend.RcptTo(strings.Trim(to, "<>"), newModifier(m))
+		return m.runModifier(StageRcptTo, func(mod *Modifier) (Response, error) {
+			return m.backend.RcptTo(strings.Trim(to, "<>"), mod)
+		})
 
 	case CodeData:
 		// data, ignore

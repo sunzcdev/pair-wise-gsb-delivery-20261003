@@ -1,9 +1,45 @@
 // Package milter provides an interface to implement milter mail filters
 package milter
 
+import (
+	"fmt"
+	"strings"
+)
+
 // OptAction sets which actions the milter wants to perform.
 // Multiple options can be set using a bitmask.
 type OptAction uint32
+
+// String returns the SMFIF_* names of the capabilities set in the mask.
+func (a OptAction) String() string {
+	var names []string
+	for _, bit := range []struct {
+		mask OptAction
+		name string
+	}{
+		{OptAddHeader, "SMFIF_ADDHDRS"},
+		{OptChangeBody, "SMFIF_CHGBODY"},
+		{OptAddRcpt, "SMFIF_ADDRCPT"},
+		{OptRemoveRcpt, "SMFIF_DELRCPT"},
+		{OptChangeHeader, "SMFIF_CHGHDRS"},
+		{OptQuarantine, "SMFIF_QUARANTINE"},
+		{OptChangeFrom, "SMFIF_CHGFROM"},
+		{OptAddRcptWithArgs, "SMFIF_ADDRCPT_PAR"},
+		{OptSetSymList, "SMFIF_SETSYMLIST"},
+	} {
+		if a&bit.mask != 0 {
+			names = append(names, bit.name)
+		}
+		a &^= bit.mask
+	}
+	if a != 0 {
+		names = append(names, fmt.Sprintf("0x%x", uint32(a)))
+	}
+	if len(names) == 0 {
+		return "0"
+	}
+	return strings.Join(names, "|")
+}
 
 // Set which actions the milter wants to perform.
 const (
