@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 // Prefix for digest authentication headers
@@ -61,6 +63,14 @@ func CanDigest(c *Challenge) bool {
 // Digest creates credentials from a challenge and request options.
 // Note: if you want to re-use a challenge, you must increment the Count.
 func Digest(chal *Challenge, o Options) (*Credentials, error) {
+	// RFC 7616, Section 3.3: the only supported charset is UTF-8.
+	// Any other advertised charset cannot be handled.
+	if chal.Charset != "" && !strings.EqualFold(chal.Charset, "UTF-8") {
+		return nil, fmt.Errorf("digest: unsupported charset: %q", chal.Charset)
+	}
+	if !utf8.ValidString(o.Username) {
+		return nil, errors.New("digest: username is not valid UTF-8")
+	}
 	cred := &Credentials{
 		Username:  o.Username,
 		URI:       o.URI,
@@ -86,13 +96,21 @@ func Digest(chal *Challenge, o Options) (*Credentials, error) {
 	default:
 		return nil, fmt.Errorf("digest: unsupported algorithm: %q", cred.Algorithm)
 	}
-	// hash the username if requested
+	// userhash takes precedence: when enabled, the username field carries the
+	// hash of the original username and realm, and no username*/original
+	// username is sent (RFC 7616, Section 3.4.4).
 	if cred.Userhash {
 		cred.Username = hashjoin(h, o.Username, cred.Realm)
+	} else if chal.Charset != "" && strings.EqualFold(chal.Charset, "UTF-8") && !isASCII(o.Username) {
+		// RFC 7616, Section 3.4.2: non-ASCII usernames are sent with the
+		// RFC 5987 username* extended parameter instead of a quoted-string.
+		cred.ExtendedUsername = true
 	}
 	// generate the a1 hash if one was not provided
 	a1 := o.A1
 	if a1 == "" {
+		// The hash is always computed from the original username, never from
+		// its percent-encoded representation.
 		a1 = hashjoin(h, o.Username, cred.Realm, o.Password)
 	}
 	// generate the response
@@ -179,4 +197,13 @@ func cnonce() string {
 		panic(fmt.Sprintf("digest: failed to generate cnonce: %v", err))
 	}
 	return hex.EncodeToString(b[:])
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
 }

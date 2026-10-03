@@ -68,7 +68,7 @@ func parseIdent(br *bufio.Reader) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !(('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || '0' <= b && b <= '9' || b == '-') {
+		if !isTokenChar(b) {
 			if err := br.UnreadByte(); err != nil {
 				return "", err
 			}
@@ -77,6 +77,17 @@ func parseIdent(br *bufio.Reader) (string, error) {
 		ident = append(ident, b)
 	}
 	return string(ident), nil
+}
+
+// isTokenChar reports whether b is a tchar as defined by RFC 7230, Section 3.2.6.
+// This includes "*", which is needed for extended parameter names such as
+// "username*" defined by RFC 5987 / RFC 7616.
+func isTokenChar(b byte) bool {
+	switch b {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9')
 }
 
 func parseByte(br *bufio.Reader, expect byte) error {

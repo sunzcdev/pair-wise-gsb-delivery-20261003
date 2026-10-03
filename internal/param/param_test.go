@@ -93,6 +93,13 @@ func TestParam(t *testing.T) {
 				{Key: "key2", Value: "value2"},
 			},
 		},
+		{
+			input: `username*=UTF-8''%C3%A6%C3%B8%C3%A5, realm="test"`,
+			params: []Param{
+				{Key: "username*", Value: "UTF-8''%C3%A6%C3%B8%C3%A5"},
+				{Key: "realm", Value: "test", Quote: true},
+			},
+		},
 	}
 	for i, tt := range tests {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {

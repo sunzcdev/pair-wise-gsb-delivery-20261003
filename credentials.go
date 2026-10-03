@@ -11,17 +11,21 @@ import (
 
 // Credentials is a parsed version of the Authorization header
 type Credentials struct {
-	Username  string
-	Realm     string
-	Nonce     string
-	URI       string
-	Response  string
-	Algorithm string
-	Cnonce    string
-	Opaque    string
-	QOP       string
-	Nc        int
-	Userhash  bool
+	Username string
+	// ExtendedUsername reports whether Username was sent using the RFC 5987
+	// "username*" extended parameter rather than the legacy "username"
+	// quoted-string. It is never set together with Userhash.
+	ExtendedUsername bool
+	Realm            string
+	Nonce            string
+	URI              string
+	Response         string
+	Algorithm        string
+	Cnonce           string
+	Opaque           string
+	QOP              string
+	Nc               int
+	Userhash         bool
 }
 
 // ParseCredentials parses the Authorization header value into credentials
@@ -35,10 +39,27 @@ func ParseCredentials(s string) (*Credentials, error) {
 		return nil, fmt.Errorf("digest: invalid credentials: %w", err)
 	}
 	var c Credentials
+	var seen = map[string]bool{}
 	for _, p := range pp {
-		switch p.Key {
+		key := strings.ToLower(p.Key)
+		switch key {
+		case "username", "username*", "realm", "nonce", "uri", "response",
+			"algorithm", "cnonce", "opaque", "qop", "nc", "userhash":
+			if seen[key] {
+				return nil, fmt.Errorf("digest: duplicate credentials parameter: %q", p.Key)
+			}
+			seen[key] = true
+		}
+		switch key {
 		case "username":
 			c.Username = p.Value
+		case "username*":
+			username, err := decodeExtValue(p.Value)
+			if err != nil {
+				return nil, fmt.Errorf("digest: invalid username*: %w", err)
+			}
+			c.Username = username
+			c.ExtendedUsername = true
 		case "realm":
 			c.Realm = p.Value
 		case "nonce":
@@ -65,18 +86,44 @@ func ParseCredentials(s string) (*Credentials, error) {
 			c.Userhash = strings.ToLower(p.Value) == "true"
 		}
 	}
+	// "username" and "username*" carry the same value in conflicting
+	// encodings, and userhash replaces the username altogether. Reject these
+	// instead of silently picking one of them.
+	switch {
+	case seen["username"] && seen["username*"]:
+		return nil, errors.New("digest: credentials contain both \"username\" and \"username*\"")
+	case c.Userhash && seen["username*"]:
+		return nil, errors.New("digest: credentials contain both \"userhash\" and \"username*\"")
+	}
 	return &c, nil
 }
 
 // String formats the credentials into the header format
 func (c *Credentials) String() string {
 	var pp []param.Param
-	pp = append(pp,
-		param.Param{
+	switch {
+	case c.Userhash:
+		// userhash takes precedence: only the hashed username is sent.
+		pp = append(pp, param.Param{
 			Key:   "username",
 			Value: c.Username,
 			Quote: true,
-		},
+		})
+	case c.ExtendedUsername:
+		// RFC 5987 extended parameter is never quoted. The conflicting
+		// legacy "username" parameter is omitted.
+		pp = append(pp, param.Param{
+			Key:   "username*",
+			Value: encodeExtValue(c.Username),
+		})
+	default:
+		pp = append(pp, param.Param{
+			Key:   "username",
+			Value: c.Username,
+			Quote: true,
+		})
+	}
+	pp = append(pp,
 		param.Param{
 			Key:   "realm",
 			Value: c.Realm,

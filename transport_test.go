@@ -155,6 +155,56 @@ func TestTransportLive(t *testing.T) {
 	}
 }
 
+func TestTransportExtendedUsername(t *testing.T) {
+	username := `张 三"100%`
+	password := "密碼"
+	chal := &Challenge{
+		Realm:     "test",
+		Nonce:     "jgdfsijdfisd",
+		Algorithm: "MD5",
+		QOP:       []string{"auth"},
+		Charset:   "UTF-8",
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			w.Header().Add("WWW-Authenticate", chal.String())
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// the legacy "username" parameter must not be present
+		assert.Assert(t, !strings.Contains(auth, "username="), auth)
+		assert.Assert(t, strings.Contains(auth, "username*=UTF-8''"), auth)
+		cred, err := ParseCredentials(auth)
+		assert.NilError(t, err)
+		assert.Equal(t, cred.Username, username)
+		assert.Assert(t, cred.ExtendedUsername)
+		cred2, err := Digest(chal, Options{
+			Method:   r.Method,
+			URI:      r.URL.RequestURI(),
+			Cnonce:   cred.Cnonce,
+			Count:    cred.Nc,
+			Username: cred.Username,
+			Password: password,
+		})
+		assert.NilError(t, err)
+		if cred.Response != cred2.Response {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		io.WriteString(w, "Hello World")
+	}))
+	defer ts.Close()
+	client := http.Client{Transport: &Transport{Username: username, Password: password}}
+	res, err := client.Get(ts.URL)
+	assert.NilError(t, err)
+	defer res.Body.Close()
+	assert.Equal(t, res.StatusCode, http.StatusOK)
+	body, err := io.ReadAll(res.Body)
+	assert.NilError(t, err)
+	assert.Equal(t, string(body), "Hello World")
+}
+
 func TestTransportNoChallenge(t *testing.T) {
 	var expired bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
