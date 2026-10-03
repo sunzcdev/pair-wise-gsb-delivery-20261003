@@ -260,6 +260,35 @@ module Mustermann
       raise NotImplementedError, "template generation not supported by #{self.class}"
     end
 
+    # @note This method is only implemented by certain subclasses.
+    #
+    # Creates a new pattern with capture names rewritten according to the given
+    # mapping. The pattern itself is left unchanged.
+    #
+    # This comes in handy when reusing the same pattern fragment in multiple
+    # places, where the capture names would otherwise clash when combining them.
+    #
+    # @example
+    #   fragment = Mustermann.new('/:id')
+    #   account  = fragment.rename(id: :account_id) # => #<Mustermann::Sinatra:"/:account_id">
+    #   file     = fragment.rename(id: :file_id)    # => #<Mustermann::Sinatra:"/:file_id">
+    #   combined = account + file
+    #   combined.params('/42/7') # => {"account_id" => "42", "file_id" => "7"}
+    #
+    # Renaming is supported by all AST-based patterns ({Mustermann::Sinatra},
+    # {Mustermann::Rails}, {Mustermann::Template}, ...) and by
+    # {Mustermann::Composite} and {Mustermann::Concat} patterns.
+    #
+    # @param [Hash, nil] map mapping of old capture names to new capture names
+    # @param [Hash] kwargs same as map, allowing keyword syntax
+    # @return [Mustermann::Pattern] a new pattern with the captures renamed
+    # @raise [NotImplementedError] raised if renaming is not supported by the pattern
+    # @raise [ArgumentError] if a name is unknown, invalid, or the resulting
+    #   capture names would not be unique
+    def rename(map = nil, **kwargs)
+      raise NotImplementedError, "renaming not supported by #{self.class}"
+    end
+
     # @overload |(other)
     #   Creates a pattern that matches any string matching either one of the patterns.
     #   If a string is supplied, it is treated as an identity pattern.
@@ -387,7 +416,15 @@ module Mustermann
       !params.any? { |k, v| v.is_a?(Array) || always_array?(k) || (v.respond_to?(:include?) && v.include?('%')) }
     end
 
-    private :unescape, :map_param, :respond_to_special?
+    # @!visibility private
+    # Normalizes a rename mapping handed to {#rename} to a Hash mapping
+    # Strings to Strings.
+    def normalize_renames(map, kwargs)
+      renames = map ? map.to_h.merge(kwargs) : kwargs
+      renames.to_h { |key, value| [key.to_s, value.to_s] }
+    end
+
+    private :unescape, :map_param, :respond_to_special?, :normalize_renames
     private_constant :ALWAYS_ARRAY
   end
 end

@@ -6,6 +6,10 @@ Mustermann follows [Semantic Versioning 2.0](http://semver.org/). Anything docum
 
 ### Mustermann 4.0.1
 
+#### New features
+
+* Added `Mustermann::Pattern#rename`, which returns a new pattern with capture names rewritten according to a given mapping, leaving the original pattern unchanged. This makes it possible to reuse the same pattern fragment (like `/:id`) in multiple places and combine the renamed variants without capture name clashes. Supported by all AST-based patterns as well as composite and concatenated patterns.
+
 #### Performance improvements
 
 * Reduce memory usage by deduplicating internal data structures. This is especially effective when using large `Mustermann::Set` objects. [#159](https://github.com/sinatra/mustermann/issues/159) [#160](https://github.com/sinatra/mustermann/pull/160) [@byroot](https://github.com/byroot)

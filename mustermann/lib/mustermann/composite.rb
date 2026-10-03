@@ -83,6 +83,27 @@ module Mustermann
       patterns.flat_map(&:to_templates).uniq
     end
 
+    # (see Mustermann::Pattern#rename)
+    def rename(map = nil, **kwargs)
+      renames = normalize_renames(map, kwargs)
+      return self if renames.empty?
+
+      unknown = renames.keys - names
+      raise ArgumentError, "no capture named #{unknown.first.inspect} in #{inspect}" unless unknown.empty?
+
+      renamed = patterns.map do |pattern|
+        applicable = renames.select { |key, _| pattern.names.include?(key) }
+        applicable.empty? ? pattern : pattern.rename(applicable)
+      end
+
+      all_names = renamed.flat_map(&:names)
+      if duplicate = all_names.tally.find { |_, count| count > 1 }
+        raise ArgumentError, "renaming would result in duplicate capture name #{duplicate.first.inspect}"
+      end
+
+      self.class.new(*renamed, operator: operator)
+    end
+
     # @return [String] the string representation of the pattern
     def to_s = inspect
 
