@@ -3,7 +3,10 @@
 package nosurf
 
 import (
+	"bytes"
 	"errors"
+	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -21,6 +24,16 @@ const (
 
 	// Max-Age in seconds for the default base cookie. 365 days.
 	MaxAge = 365 * 24 * 60 * 60
+
+	// DefaultMaxFormBytes is the default maximum number of bytes of the
+	// request body that CSRFHandler will read while looking for the CSRF
+	// token in a form. Requests with larger bodies fail with ErrFormTooLarge.
+	DefaultMaxFormBytes = 10 << 20 // 10 MiB
+
+	// DefaultMaxFormMemory is the default maximum number of bytes kept in
+	// memory when parsing a multipart form while looking for the CSRF token.
+	// Larger file parts are spooled to temporary files on disk.
+	DefaultMaxFormMemory = 32 << 20 // 32 MiB
 )
 
 var safeMethods = []string{"GET", "HEAD", "OPTIONS", "TRACE"}
@@ -33,6 +46,17 @@ var (
 	ErrBadOrigin = errors.New("Request was made with a disallowed origin specified in the Origin header")
 	ErrBadToken  = errors.New("The CSRF token in the cookie doesn't match the one" +
 		" received in a form/header.")
+
+	// The following errors describe failures to read or parse the request
+	// form while looking for the CSRF token. They are reported instead of
+	// (and are always distinct from) ErrBadToken, which is reserved for
+	// "the token was read successfully, but doesn't match".
+	ErrFormTooLarge = errors.New("The request body exceeded the maximum size" +
+		" allowed while looking for the CSRF token in a form.")
+	ErrFormRead = errors.New("Failed to read the request body" +
+		" while looking for the CSRF token in a form.")
+	ErrFormParse = errors.New("Failed to parse the request form" +
+		" while looking for the CSRF token.")
 
 	// Internal error. When this is raised, and the request is secure, we additionally check for Referer.
 	errNoOrigin = errors.New("Origin header was not present")
@@ -63,33 +87,119 @@ type CSRFHandler struct {
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
+
+	// Read budgets for looking up the CSRF token in a form body.
+	maxFormBytes  int64
+	maxFormMemory int64
 }
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, http.StatusText(FailureCode), FailureCode)
 }
 
-// Extracts the "sent" token from the request
-// and returns an unmasked version of it
-func extractToken(r *http.Request) []byte {
-	// Prefer the header over form value
-	sentToken := r.Header.Get(HeaderName)
-
-	// Then POST values
-	if len(sentToken) == 0 {
-		sentToken = r.PostFormValue(FormFieldName)
+// extractToken extracts the "sent" token from the request
+// and returns an unmasked version of it.
+//
+// The token is looked up in this order:
+//
+//  1. The HeaderName header. If it's present, the request body
+//     is never read — important for large file uploads.
+//  2. An already-parsed form (r.PostForm / r.MultipartForm),
+//     which is reused as-is without touching the body.
+//  3. The request body, but only for POST/PUT/PATCH requests with
+//     a form Content-Type (application/x-www-form-urlencoded or
+//     multipart/form-data). Any other body is left unread.
+//
+// When the body has to be read, at most maxBytes bytes are consumed and,
+// for multipart forms, at most maxMemory bytes are kept in memory (the rest
+// is spooled to temporary files). Exceeding the byte budget, a failing body
+// reader and malformed form data are reported as ErrFormTooLarge, ErrFormRead
+// and ErrFormParse respectively — all distinct from ErrBadToken, which only
+// means "the token was read, but doesn't match".
+//
+// Temporary files created while parsing a multipart form belong to
+// r.MultipartForm and must NOT be removed here: downstream handlers may
+// still read them. For server requests, net/http removes them automatically
+// once the outermost handler returns; anyone parsing a form outside of a
+// server request (clients, tests) should call r.MultipartForm.RemoveAll()
+// when done with the files.
+func extractToken(r *http.Request, maxBytes, maxMemory int64) ([]byte, error) {
+	// Prefer the header over the form value.
+	// If it's set, the body is not read at all.
+	if sentToken := r.Header.Get(HeaderName); sentToken != "" {
+		return b64decode(sentToken), nil
 	}
 
-	// If all else fails, try a multipart value.
-	// PostFormValue() will already have called ParseMultipartForm()
-	if len(sentToken) == 0 && r.MultipartForm != nil {
-		vals := r.MultipartForm.Value[FormFieldName]
-		if len(vals) != 0 {
-			sentToken = vals[0]
+	// Reuse a form that has already been parsed upstream.
+	if r.PostForm != nil || r.MultipartForm != nil {
+		return tokenFromParsedForm(r), nil
+	}
+
+	// Only form content types on methods that carry a form body
+	// can hold the token. Anything else is left unread.
+	switch r.Method {
+	case "POST", "PUT", "PATCH":
+	default:
+		return nil, nil
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || (mediaType != "application/x-www-form-urlencoded" &&
+		mediaType != "multipart/form-data") {
+		return nil, nil
+	}
+	if r.Body == nil {
+		return nil, nil
+	}
+
+	// Read the body with a hard budget, then hand the buffered bytes to
+	// the standard library so that r.Form, r.PostForm and r.MultipartForm
+	// end up populated exactly as downstream handlers expect.
+	body, err := readFormBody(r.Body, maxBytes)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	if mediaType == "multipart/form-data" {
+		err = r.ParseMultipartForm(maxMemory)
+	} else {
+		err = r.ParseForm()
+	}
+	if err != nil {
+		return nil, ErrFormParse
+	}
+
+	return tokenFromParsedForm(r), nil
+}
+
+// tokenFromParsedForm looks up the token in an already-parsed form.
+func tokenFromParsedForm(r *http.Request) []byte {
+	if r.PostForm != nil {
+		if vals := r.PostForm[FormFieldName]; len(vals) != 0 {
+			return b64decode(vals[0])
 		}
 	}
+	if r.MultipartForm != nil {
+		if vals := r.MultipartForm.Value[FormFieldName]; len(vals) != 0 {
+			return b64decode(vals[0])
+		}
+	}
+	return nil
+}
 
-	return b64decode(sentToken)
+// readFormBody reads at most maxBytes bytes from body.
+// It returns ErrFormRead if the reader fails and ErrFormTooLarge
+// if the body exceeds the budget.
+func readFormBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	// Read one byte past the budget to detect overflow.
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, ErrFormRead
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, ErrFormTooLarge
+	}
+	return data, nil
 }
 
 // Constructs a new CSRFHandler that calls
@@ -102,6 +212,8 @@ func New(handler http.Handler) *CSRFHandler {
 		failureHandler: http.HandlerFunc(defaultFailureHandler),
 		baseCookie:     baseCookie,
 		isTLS:          func(r *http.Request) bool { return true },
+		maxFormBytes:   DefaultMaxFormBytes,
+		maxFormMemory:  DefaultMaxFormMemory,
 	}
 
 	return csrf
@@ -159,7 +271,12 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Finally, we check the token itself.
-	sentToken := extractToken(r)
+	sentToken, err := extractToken(r, h.maxFormBytes, h.maxFormMemory)
+	if err != nil {
+		ctxSetReason(r, err)
+		h.handleFailure(w, r)
+		return
+	}
 
 	if !verifyToken(realToken, sentToken) {
 		ctxSetReason(r, ErrBadToken)
@@ -283,6 +400,23 @@ func (h *CSRFHandler) SetFailureHandler(handler http.Handler) {
 // This way you can specify the Domain, Path, HttpOnly, Secure, etc.
 func (h *CSRFHandler) SetBaseCookie(cookie http.Cookie) {
 	h.baseCookie = cookie
+}
+
+// SetMaxFormBytes sets the maximum number of bytes of the request body
+// that will be read while looking for the CSRF token in a form.
+// Requests with larger bodies fail with ErrFormTooLarge.
+// The default is DefaultMaxFormBytes.
+func (h *CSRFHandler) SetMaxFormBytes(n int64) {
+	h.maxFormBytes = n
+}
+
+// SetMaxFormMemory sets the maximum number of bytes kept in memory
+// when parsing a multipart form while looking for the CSRF token.
+// Larger file parts are spooled to temporary files on disk,
+// which stay owned by r.MultipartForm (see extractToken).
+// The default is DefaultMaxFormMemory.
+func (h *CSRFHandler) SetMaxFormMemory(n int64) {
+	h.maxFormMemory = n
 }
 
 // SetIsTLSFunc sets a delegate function which determines, on a per-request basis, whether the request is made over a secure connection.
