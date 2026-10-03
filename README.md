@@ -6,6 +6,7 @@ A Go library and tools to authenticate e-mails.
 
 ## Libraries
 
+* [`arc`]: create and verify [ARC sets]
 * [`dkim`]: create and verify [DKIM signatures][DKIM]
 * [`authres`]: create and parse [Authentication-Results header fields][Authentication-Results]
 * [`dmarc`]: fetch [DMARC] records
@@ -26,6 +27,8 @@ MIT
 [DKIM]: https://tools.ietf.org/html/rfc6376
 [Authentication-Results]: https://tools.ietf.org/html/rfc7601
 [DMARC]: https://tools.ietf.org/html/rfc7489
+[ARC]: https://tools.ietf.org/html/rfc8617
+[ARC sets]: https://pkg.go.dev/github.com/emersion/go-msgauth/arc
 [`dkim`]: https://pkg.go.dev/github.com/emersion/go-msgauth/dkim
 [`authres`]: https://pkg.go.dev/github.com/emersion/go-msgauth/authres
 [`dmarc`]: https://pkg.go.dev/github.com/emersion/go-msgauth/dmarc
