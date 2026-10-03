@@ -86,6 +86,10 @@ type GzipResponseWriter struct {
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+
+	trailers http.Header // Values of declared trailers removed before the underlying WriteHeader, restored once the body has been written.
+
+	committed bool // If true, the underlying ResponseWriter has sent its header.
 }
 
 type GzipResponseWriterWithCloseNotify struct {
@@ -148,6 +152,9 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 
 // startGzip initializes a GZIP writer and writes the buffer.
 func (w *GzipResponseWriter) startGzip() error {
+	// Declared trailer values must not be sent as regular headers.
+	w.extractTrailers()
+
 	// Set the GZIP header.
 	w.Header().Set(contentEncoding, "gzip")
 
@@ -161,6 +168,7 @@ func (w *GzipResponseWriter) startGzip() error {
 		w.ResponseWriter.WriteHeader(w.code)
 		// Ensure that no other WriteHeader's happen
 		w.code = 0
+		w.committed = true
 	}
 
 	// Initialize and flush the buffer into the gzip response if there are any bytes.
@@ -170,6 +178,7 @@ func (w *GzipResponseWriter) startGzip() error {
 		// Initialize the GZIP response.
 		w.init()
 		n, err := w.gw.Write(w.buf)
+		w.committed = true
 
 		// This should never happen (per io.Writer docs), but if the write didn't
 		// accept the entire buffer but returned no specific error, we have no clue
@@ -184,10 +193,14 @@ func (w *GzipResponseWriter) startGzip() error {
 
 // startPlain writes to sent bytes and buffer the underlying ResponseWriter without gzip.
 func (w *GzipResponseWriter) startPlain() error {
+	// Declared trailer values must not be sent as regular headers.
+	w.extractTrailers()
+
 	if w.code != 0 {
 		w.ResponseWriter.WriteHeader(w.code)
 		// Ensure that no other WriteHeader's happen
 		w.code = 0
+		w.committed = true
 	}
 	w.ignore = true
 	// If Write was never called then don't call Write on the underlying ResponseWriter.
@@ -196,6 +209,7 @@ func (w *GzipResponseWriter) startPlain() error {
 	}
 	n, err := w.ResponseWriter.Write(w.buf)
 	w.buf = nil
+	w.committed = true
 	// This should never happen (per io.Writer docs), but if the write didn't
 	// accept the entire buffer but returned no specific error, we have no clue
 	// what's going on, so abort just to be safe.
@@ -203,6 +217,112 @@ func (w *GzipResponseWriter) startPlain() error {
 		err = io.ErrShortWrite
 	}
 	return err
+}
+
+// extractTrailers removes the values of any declared response trailers from
+// the header map. Because the underlying WriteHeader is delayed until the
+// response is committed, values the handler set for trailers it declared via
+// the "Trailer" header would otherwise be sent as regular headers. The
+// values are restored by restoreTrailers once the body has been written, so
+// the underlying ResponseWriter emits them as trailers at the end of the
+// response. Fields which may not appear in trailers (per RFC 7230, section
+// 4.1.2) are rejected: they are dropped from the declaration and their
+// values, if any, are left untouched as regular headers.
+func (w *GzipResponseWriter) extractTrailers() {
+	if w.trailers != nil {
+		// Already extracted.
+		return
+	}
+	w.trailers = make(http.Header)
+
+	h := w.Header()
+	declarations, ok := h["Trailer"]
+	if !ok {
+		return
+	}
+
+	var kept []string
+	for _, v := range declarations {
+		for _, name := range strings.Split(v, ",") {
+			name = http.CanonicalHeaderKey(strings.TrimSpace(name))
+			if name == "" || !validTrailerHeader(name) {
+				continue
+			}
+			kept = append(kept, name)
+			if values, ok := h[name]; ok {
+				w.trailers[name] = values
+				delete(h, name)
+			}
+		}
+	}
+
+	// Rewrite the declaration so it only contains fields which may legally
+	// appear in trailers.
+	if len(kept) == 0 {
+		delete(h, "Trailer")
+	} else {
+		h["Trailer"] = kept
+	}
+}
+
+// commitForTrailers forces the underlying header to be written if declared
+// trailer values were extracted but nothing has been sent yet (e.g. an
+// empty response). The trailer values are only restored afterwards, so the
+// underlying ResponseWriter emits them as trailers rather than headers.
+func (w *GzipResponseWriter) commitForTrailers() {
+	if len(w.trailers) > 0 && !w.committed {
+		w.ResponseWriter.WriteHeader(http.StatusOK)
+		w.committed = true
+	}
+}
+
+// restoreTrailers puts any trailer values removed by extractTrailers back
+// into the header map, so the underlying ResponseWriter sends them as
+// trailers after the body. Values the handler (re)set after extraction are
+// left untouched.
+func (w *GzipResponseWriter) restoreTrailers() {
+	h := w.Header()
+	for name, values := range w.trailers {
+		if _, ok := h[name]; !ok {
+			h[name] = values
+		}
+	}
+	w.trailers = nil
+}
+
+// badTrailer mirrors the list of header field names which may not appear in
+// trailers used by net/http. See RFC 7230, section 4.1.2.
+var badTrailer = map[string]bool{
+	"Authorization":       true,
+	"Cache-Control":       true,
+	"Connection":          true,
+	"Content-Encoding":    true,
+	"Content-Length":      true,
+	"Content-Range":       true,
+	"Content-Type":        true,
+	"Expect":              true,
+	"Host":                true,
+	"Keep-Alive":          true,
+	"Max-Forwards":        true,
+	"Pragma":              true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Proxy-Connection":    true,
+	"Range":               true,
+	"Realm":               true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Www-Authenticate":    true,
+}
+
+// validTrailerHeader reports whether name is a valid header field name to
+// appear in trailers. See RFC 7230, section 4.1.2.
+func validTrailerHeader(name string) bool {
+	if strings.HasPrefix(name, "If-") || badTrailer[name] {
+		return false
+	}
+	return true
 }
 
 // WriteHeader just saves the response code until close or GZIP effective writes.
@@ -225,12 +345,16 @@ func (w *GzipResponseWriter) init() {
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
 func (w *GzipResponseWriter) Close() error {
 	if w.ignore {
+		w.commitForTrailers()
+		w.restoreTrailers()
 		return nil
 	}
 
 	if w.gw == nil {
 		// GZIP not triggered yet, write out regular response.
 		err := w.startPlain()
+		w.commitForTrailers()
+		w.restoreTrailers()
 		// Returns the error if any at write.
 		if err != nil {
 			err = fmt.Errorf("gziphandler: write to regular responseWriter at close gets error: %q", err.Error())
@@ -241,6 +365,7 @@ func (w *GzipResponseWriter) Close() error {
 	err := w.gw.Close()
 	gzipWriterPools[w.index].Put(w.gw)
 	w.gw = nil
+	w.restoreTrailers()
 	return err
 }
 
@@ -262,6 +387,7 @@ func (w *GzipResponseWriter) Flush() {
 
 	if fw, ok := w.ResponseWriter.(http.Flusher); ok {
 		fw.Flush()
+		w.committed = true
 	}
 }
 
