@@ -121,6 +121,32 @@ E.g.,
 	r := bufio.NewReader(f)
 ```
 
+### Codecs
+
+The byte order used by `WriteTo`/`ReadFrom` and the `Marshal`/`Unmarshal`
+helpers is controlled by the package-level `LittleEndian()`/`BigEndian()`
+functions, which mutate global state. If you need a fixed byte order without
+touching the global configuration — or a hard limit on the number of bits
+accepted when decoding untrusted data — use a `Codec` instead:
+
+```Go
+	// Big-endian wire format, reject bitsets larger than 1<<20 bits.
+	codec := bitset.NewCodec(binary.BigEndian, 1<<20)
+
+	var buf bytes.Buffer
+	n, err := codec.Encode(&buf, bs)   // stream
+	data := codec.Marshal(bs)          // slice
+
+	var dst bitset.BitSet
+	n, err = codec.Decode(&buf, &dst)  // leaves trailing bytes for the caller
+	m, err := codec.Unmarshal(data, &dst) // m is the number of bytes consumed
+```
+
+Decoding is atomic: truncated input, a declared length above the limit, or
+dirty bits set beyond the declared length fail with an error and leave the
+target bitset unchanged. Codecs are safe for concurrent use and never modify
+the global byte-order configuration.
+
 ## Memory Usage
 
 The memory usage of a bitset using `N` bits is at least `N/8` bytes. The number of bits in a bitset is at least as large as one plus the greatest bit index you have accessed. Thus it is possible to run out of memory while using a bitset. If you have lots of bits, you might prefer compressed bitsets, like the [Roaring bitmaps](https://roaringbitmap.org) and its [Go implementation](https://github.com/RoaringBitmap/roaring).

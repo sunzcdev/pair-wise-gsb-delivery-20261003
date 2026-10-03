@@ -1268,6 +1268,10 @@ func (b *BitSet) BinaryStorageSize() int {
 }
 
 func readUint64Array(reader io.Reader, data []uint64) error {
+	return readUint64ArrayOrder(reader, data, binaryOrder)
+}
+
+func readUint64ArrayOrder(reader io.Reader, data []uint64, order binary.ByteOrder) error {
 	length := len(data)
 	bufferSize := 128
 	buffer := make([]byte, bufferSize*wordBytes)
@@ -1282,13 +1286,17 @@ func readUint64Array(reader io.Reader, data []uint64) error {
 			return err
 		}
 		for i := range chunk {
-			chunk[i] = uint64(binaryOrder.Uint64(buffer[8*i:]))
+			chunk[i] = uint64(order.Uint64(buffer[8*i:]))
 		}
 	}
 	return nil
 }
 
 func writeUint64Array(writer io.Writer, data []uint64) error {
+	return writeUint64ArrayOrder(writer, data, binaryOrder)
+}
+
+func writeUint64ArrayOrder(writer io.Writer, data []uint64, order binary.ByteOrder) error {
 	bufferSize := 128
 	buffer := make([]byte, bufferSize*wordBytes)
 	for i := 0; i < len(data); i += bufferSize {
@@ -1299,7 +1307,7 @@ func writeUint64Array(writer io.Writer, data []uint64) error {
 		}
 		chunk := data[i:end]
 		for i, x := range chunk {
-			binaryOrder.PutUint64(buffer[8*i:], x)
+			order.PutUint64(buffer[8*i:], x)
 		}
 		_, err := writer.Write(buffer)
 		if err != nil {
