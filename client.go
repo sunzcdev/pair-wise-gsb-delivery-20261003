@@ -589,11 +589,13 @@ func parseModifyAct(msg *Message) (*ModifyAction, error) {
 	return act, nil
 }
 
-func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action, err error) {
+// readModifyActs reads modify actions and the terminal action following the
+// EOB message, passing every modify action to emit as it arrives.
+func (s *ClientSession) readModifyActs(emit func(*ModifyAction) error) (act *Action, err error) {
 	for {
 		msg, err := readPacket(s.conn, s.readTimeout)
 		if err != nil {
-			return nil, nil, fmt.Errorf("action read: %w", err)
+			return nil, fmt.Errorf("action read: %w", err)
 		}
 		if msg.Code == 'p' /* progress */ {
 			continue
@@ -604,23 +606,104 @@ func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action
 			ActAddHeader, ActChangeFrom, ActQuarantine:
 			modifyAct, err := parseModifyAct(msg)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
-			modifyActs = append(modifyActs, *modifyAct)
+			if emit != nil {
+				if err := emit(modifyAct); err != nil {
+					return nil, err
+				}
+			}
 		default:
 			act, err = parseAction(msg)
 			if err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 
-			return modifyActs, act, nil
+			return act, nil
 		}
 	}
+}
+
+// EndOptions configures how EndWithOptions delivers modify actions received
+// in response to the EOB message. Both fields may be set at once.
+type EndOptions struct {
+	// Collector, if non-nil, buffers modify actions and commits them
+	// atomically. See ResultCollector documentation for the side-effect
+	// boundary of this mode: nothing is delivered unless the transaction
+	// ends with a successful terminal action.
+	Collector *ResultCollector
+
+	// OnModifyAction, if non-nil, is invoked for every modify action as it
+	// is received, before the terminal action is known.
+	//
+	// Side-effect boundary of this streaming mode: any side effect the
+	// callback performs (rewriting a message copy, updating a recipient
+	// list) happens before the final verdict arrives. If the milter
+	// ultimately rejects or tempfails the message, or the connection
+	// breaks mid-stream, the callback has already observed a partial
+	// action sequence and the caller is responsible for discarding or
+	// rolling back those effects.
+	//
+	// Returning a non-nil error aborts the read loop; the connection is
+	// then out of sync and the session should be closed.
+	OnModifyAction func(ModifyAction) error
+}
+
+// EndWithOptions is like End but delivers modify actions according to opts
+// instead of returning them.
+//
+// The returned Action is the terminal action sent by the milter; it is
+// returned regardless of the delivery mode. If a Collector is provided, its
+// Result method reports whether the transaction committed.
+func (s *ClientSession) EndWithOptions(opts *EndOptions) (*Action, error) {
+	if opts == nil {
+		opts = &EndOptions{}
+	}
+
+	if err := writePacket(s.conn, &Message{
+		Code: byte(CodeEOB),
+	}, s.writeTimeout); err != nil {
+		if opts.Collector != nil {
+			opts.Collector.fail(err)
+		}
+		return nil, fmt.Errorf("milter: end: %w", err)
+	}
+
+	act, err := s.readModifyActs(func(modifyAct *ModifyAction) error {
+		if opts.OnModifyAction != nil {
+			if err := opts.OnModifyAction(*modifyAct); err != nil {
+				return err
+			}
+		}
+		if opts.Collector != nil {
+			opts.Collector.add(*modifyAct)
+		}
+		return nil
+	})
+
+	if opts.Collector != nil {
+		if err != nil {
+			opts.Collector.fail(err)
+		} else {
+			opts.Collector.commit(act)
+		}
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("milter: end: %w", err)
+	}
+	return act, nil
 }
 
 // End sends the EOB message and resets session back to the state before Mail
 // call. The same ClientSession can be used to check another message arrived
 // within the same SMTP connection (Helo and Conn information is preserved).
+//
+// The returned modify actions are delivered regardless of the terminal
+// action: even if the milter rejects the message, the actions it sent before
+// the verdict are returned. Callers that only want to apply modifications
+// for accepted messages should either check the returned Action first or use
+// EndWithOptions with a ResultCollector, which commits actions atomically.
 //
 // Close should be called to conclude session.
 func (s *ClientSession) End() ([]ModifyAction, *Action, error) {
@@ -630,7 +713,11 @@ func (s *ClientSession) End() ([]ModifyAction, *Action, error) {
 		return nil, nil, fmt.Errorf("milter: end: %w", err)
 	}
 
-	modifyActs, act, err := s.readModifyActs()
+	var modifyActs []ModifyAction
+	act, err := s.readModifyActs(func(modifyAct *ModifyAction) error {
+		modifyActs = append(modifyActs, *modifyAct)
+		return nil
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("milter: end: %w", err)
 	}
