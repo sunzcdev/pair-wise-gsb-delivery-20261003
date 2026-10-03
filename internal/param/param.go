@@ -68,7 +68,7 @@ func parseIdent(br *bufio.Reader) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !(('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || '0' <= b && b <= '9' || b == '-') {
+		if !(('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || '0' <= b && b <= '9' || b == '-' || b == '*' || b == '\'' || b == '%') {
 			if err := br.UnreadByte(); err != nil {
 				return "", err
 			}

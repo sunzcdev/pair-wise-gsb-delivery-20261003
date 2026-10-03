@@ -65,6 +65,12 @@ func TestParam(t *testing.T) {
 			},
 		},
 		{
+			input: `username*=UTF-8''%E4%B8%AD%20%22%25`,
+			params: []Param{
+				{Key: "username*", Value: `UTF-8''%E4%B8%AD%20%22%25`},
+			},
+		},
+		{
 			input: `realm="If you forgot password, write", nonce="my_nonce", opaque="my_opaque", qop="auth"`,
 			params: []Param{
 				{Key: "realm", Value: "If you forgot password, write", Quote: true},

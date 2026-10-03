@@ -11,17 +11,20 @@ import (
 
 // Credentials is a parsed version of the Authorization header
 type Credentials struct {
-	Username  string
-	Realm     string
-	Nonce     string
-	URI       string
-	Response  string
-	Algorithm string
-	Cnonce    string
-	Opaque    string
-	QOP       string
-	Nc        int
-	Userhash  bool
+	Username string
+	// UsernameStar indicates the username is sent using the
+	// extended username* parameter notation from RFC 7616.
+	UsernameStar bool
+	Realm        string
+	Nonce        string
+	URI          string
+	Response     string
+	Algorithm    string
+	Cnonce       string
+	Opaque       string
+	QOP          string
+	Nc           int
+	Userhash     bool
 }
 
 // ParseCredentials parses the Authorization header value into credentials
@@ -35,10 +38,22 @@ func ParseCredentials(s string) (*Credentials, error) {
 		return nil, fmt.Errorf("digest: invalid credentials: %w", err)
 	}
 	var c Credentials
+	seen := make(map[string]bool, len(pp))
 	for _, p := range pp {
+		if seen[p.Key] {
+			return nil, fmt.Errorf("digest: duplicate parameter: %q", p.Key)
+		}
+		seen[p.Key] = true
 		switch p.Key {
 		case "username":
 			c.Username = p.Value
+		case "username*":
+			username, err := decodeUsernameStar(p.Value)
+			if err != nil {
+				return nil, err
+			}
+			c.Username = username
+			c.UsernameStar = true
 		case "realm":
 			c.Realm = p.Value
 		case "nonce":
@@ -65,18 +80,37 @@ func ParseCredentials(s string) (*Credentials, error) {
 			c.Userhash = strings.ToLower(p.Value) == "true"
 		}
 	}
+	if seen["username"] && seen["username*"] {
+		return nil, errors.New("digest: conflicting username and username* parameters")
+	}
 	return &c, nil
 }
 
 // String formats the credentials into the header format
 func (c *Credentials) String() string {
 	var pp []param.Param
-	pp = append(pp,
-		param.Param{
+	// userhash takes precedence: the hashed username is sent in the
+	// regular username parameter and the original name is omitted.
+	switch {
+	case c.Userhash:
+		pp = append(pp, param.Param{
 			Key:   "username",
 			Value: c.Username,
 			Quote: true,
-		},
+		})
+	case c.UsernameStar:
+		pp = append(pp, param.Param{
+			Key:   "username*",
+			Value: encodeUsernameStar(c.Username),
+		})
+	default:
+		pp = append(pp, param.Param{
+			Key:   "username",
+			Value: c.Username,
+			Quote: true,
+		})
+	}
+	pp = append(pp,
 		param.Param{
 			Key:   "realm",
 			Value: c.Realm,

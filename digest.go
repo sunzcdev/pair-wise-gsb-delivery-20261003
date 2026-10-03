@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 )
 
 // Prefix for digest authentication headers
@@ -55,12 +56,18 @@ func CanDigest(c *Challenge) bool {
 	default:
 		return false
 	}
+	if c.Charset != "" && !strings.EqualFold(c.Charset, "UTF-8") {
+		return false
+	}
 	return len(c.QOP) == 0 || c.SupportsQOP("auth") || c.SupportsQOP("auth-int")
 }
 
 // Digest creates credentials from a challenge and request options.
 // Note: if you want to re-use a challenge, you must increment the Count.
 func Digest(chal *Challenge, o Options) (*Credentials, error) {
+	if chal.Charset != "" && !strings.EqualFold(chal.Charset, "UTF-8") {
+		return nil, fmt.Errorf("digest: unsupported charset: %q", chal.Charset)
+	}
 	cred := &Credentials{
 		Username:  o.Username,
 		URI:       o.URI,
@@ -89,6 +96,13 @@ func Digest(chal *Challenge, o Options) (*Credentials, error) {
 	// hash the username if requested
 	if cred.Userhash {
 		cred.Username = hashjoin(h, o.Username, cred.Realm)
+	} else if chal.Charset != "" && !isASCII(o.Username) {
+		// The username cannot be represented in a quoted-string,
+		// send it using the extended username* notation.
+		if !utf8.ValidString(o.Username) {
+			return nil, fmt.Errorf("digest: username is not valid UTF-8")
+		}
+		cred.UsernameStar = true
 	}
 	// generate the a1 hash if one was not provided
 	a1 := o.A1
