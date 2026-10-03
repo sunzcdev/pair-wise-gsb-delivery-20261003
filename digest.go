@@ -50,12 +50,27 @@ type Options struct {
 
 // CanDigest checks if the algorithm and qop are supported
 func CanDigest(c *Challenge) bool {
-	switch strings.ToUpper(c.Algorithm) {
-	case "", "MD5", "SHA-256", "SHA-512", "SHA-512-256":
-	default:
+	if _, err := newHasher(c.Algorithm); err != nil {
 		return false
 	}
 	return len(c.QOP) == 0 || c.SupportsQOP("auth") || c.SupportsQOP("auth-int")
+}
+
+// newHasher creates the hash.Hash for the provided algorithm name.
+// An empty algorithm means MD5.
+func newHasher(algorithm string) (hash.Hash, error) {
+	switch strings.ToUpper(algorithm) {
+	case "", "MD5":
+		return md5.New(), nil
+	case "SHA-256":
+		return sha256.New(), nil
+	case "SHA-512":
+		return sha512.New(), nil
+	case "SHA-512-256":
+		return sha512.New512_256(), nil
+	default:
+		return nil, fmt.Errorf("digest: unsupported algorithm: %q", algorithm)
+	}
 }
 
 // Digest creates credentials from a challenge and request options.
@@ -73,18 +88,9 @@ func Digest(chal *Challenge, o Options) (*Credentials, error) {
 		Userhash:  chal.Userhash,
 	}
 	// we re-use the same hash.Hash
-	var h hash.Hash
-	switch strings.ToUpper(cred.Algorithm) {
-	case "", "MD5":
-		h = md5.New()
-	case "SHA-256":
-		h = sha256.New()
-	case "SHA-512":
-		h = sha512.New()
-	case "SHA-512-256":
-		h = sha512.New512_256()
-	default:
-		return nil, fmt.Errorf("digest: unsupported algorithm: %q", cred.Algorithm)
+	h, err := newHasher(cred.Algorithm)
+	if err != nil {
+		return nil, err
 	}
 	// hash the username if requested
 	if cred.Userhash {
