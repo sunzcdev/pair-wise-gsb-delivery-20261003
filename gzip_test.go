@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -427,6 +428,163 @@ func TestFlushBeforeWrite(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, res.StatusCode)
 	assert.Equal(t, "gzip", res.Header.Get("Content-Encoding"))
 	assert.NotEqual(t, b, w.Body.Bytes())
+}
+
+func TestGzipHandlerTrailers(t *testing.T) {
+	const (
+		largeBody = "abcdefghijklmnop"
+		smallBody = "abc"
+		trailer   = "X-Test-Trailer"
+		value     = "trailer-value"
+	)
+
+	tests := []struct {
+		name             string
+		body             string
+		flush            bool
+		flushBeforeWrite bool
+		extraWrite       bool
+		prefixed         bool
+		latePrefix       bool
+		chunkedWrite     bool
+		compressed       bool
+	}{
+		{name: "gzip normal declaration", body: strings.Repeat(largeBody, 100), compressed: true},
+		{name: "gzip prefixed declaration", body: strings.Repeat(largeBody, 100), prefixed: true, compressed: true},
+		{name: "gzip normal declaration after small first write", body: smallBody + strings.Repeat(largeBody, 100), chunkedWrite: true, compressed: true},
+		{name: "gzip prefixed declaration after small first write", body: smallBody + strings.Repeat(largeBody, 100), chunkedWrite: true, prefixed: true, compressed: true},
+		{name: "small late prefixed declaration", body: smallBody, latePrefix: true},
+		{name: "small normal declaration", body: smallBody},
+		{name: "small prefixed declaration", body: smallBody, prefixed: true},
+		{name: "flush normal declaration", body: smallBody, flush: true},
+		{name: "flush prefixed declaration", body: smallBody, flush: true, prefixed: true},
+		{name: "multiple flush normal declaration", body: smallBody, flush: true, extraWrite: true},
+		{name: "flush before write normal declaration", flushBeforeWrite: true},
+		{name: "flush before write normal declaration with body", body: smallBody, flushBeforeWrite: true},
+		{name: "flush before write prefixed declaration", flushBeforeWrite: true, prefixed: true},
+		{name: "empty normal declaration"},
+		{name: "empty prefixed declaration", prefixed: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expectedBody := test.body
+			if test.extraWrite {
+				expectedBody += smallBody
+			}
+
+			handler := GzipHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.prefixed {
+					w.Header().Set(http.TrailerPrefix+trailer, "")
+				} else if !test.latePrefix {
+					w.Header().Set(trailerHeader, trailer)
+				}
+
+				if test.flushBeforeWrite {
+					w.(http.Flusher).Flush()
+				}
+				if test.body != "" {
+					if test.chunkedWrite {
+						io.WriteString(w, smallBody)
+						io.WriteString(w, strings.TrimPrefix(test.body, smallBody))
+					} else {
+						io.WriteString(w, test.body)
+					}
+				}
+				if test.flush {
+					flusher := w.(http.Flusher)
+					flusher.Flush()
+					if test.extraWrite {
+						io.WriteString(w, smallBody)
+						flusher.Flush()
+					}
+				}
+
+				if test.prefixed || test.latePrefix {
+					w.Header().Set(http.TrailerPrefix+trailer, value)
+				} else {
+					w.Header().Set(trailer, value)
+				}
+			}))
+
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(acceptEncoding, "gzip")
+
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+
+			body, err := ioutil.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if test.compressed {
+				assert.Equal(t, "gzip", res.Header.Get(contentEncoding))
+
+				reader, err := gzip.NewReader(bytes.NewReader(body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err = ioutil.ReadAll(reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				assert.NotEqual(t, "gzip", res.Header.Get(contentEncoding))
+			}
+
+			assert.Equal(t, expectedBody, string(body))
+			assert.Empty(t, res.Header.Get(trailer))
+			assert.Equal(t, value, res.Trailer.Get(trailer))
+		})
+	}
+}
+
+func TestGzipHandlerRejectsInvalidTrailers(t *testing.T) {
+	handler := GzipHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(trailerHeader, "Content-Type, X-Test-Trailer")
+		w.Header().Set(contentType, "text/plain")
+		w.Header().Set(http.TrailerPrefix+"Transfer-Encoding", "invalid")
+		io.WriteString(w, smallTestBody)
+		w.Header().Set(http.TrailerPrefix+"Authorization", "invalid")
+		w.Header().Set("X-Test-Trailer", "valid")
+	}))
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	req, err := http.NewRequest(http.MethodGet, server.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(acceptEncoding, "gzip")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	body, err := ioutil.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, smallTestBody, string(body))
+	assert.Equal(t, "text/plain", res.Header.Get(contentType))
+	assert.Empty(t, res.Trailer.Get(contentType))
+	assert.Empty(t, res.Trailer.Get("Transfer-Encoding"))
+	assert.Empty(t, res.Trailer.Get("Authorization"))
+	assert.Equal(t, "valid", res.Trailer.Get("X-Test-Trailer"))
 }
 
 func TestImplementCloseNotifier(t *testing.T) {

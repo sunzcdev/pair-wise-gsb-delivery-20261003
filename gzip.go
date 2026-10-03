@@ -19,6 +19,7 @@ const (
 	contentEncoding = "Content-Encoding"
 	contentType     = "Content-Type"
 	contentLength   = "Content-Length"
+	trailerHeader   = "Trailer"
 )
 
 type codings map[string]float64
@@ -86,10 +87,143 @@ type GzipResponseWriter struct {
 	ignore  bool   // If true, then we immediately passthru writes to the underlying ResponseWriter.
 
 	contentTypes []parsedContentType // Only compress if the response is one of these content-types. All are accepted if empty.
+
+	headerWritten    bool     // True after the response headers have been written to the underlying ResponseWriter.
+	declaredTrailers []string // Trailer names declared before the response headers were written.
 }
 
 type GzipResponseWriterWithCloseNotify struct {
 	*GzipResponseWriter
+}
+
+var invalidTrailerHeaders = map[string]bool{
+	"Authorization":       true,
+	"Cache-Control":       true,
+	"Connection":          true,
+	"Content-Encoding":    true,
+	"Content-Length":      true,
+	"Content-Range":       true,
+	"Content-Type":        true,
+	"Expect":              true,
+	"Host":                true,
+	"Keep-Alive":          true,
+	"Max-Forwards":        true,
+	"Pragma":              true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Proxy-Connection":    true,
+	"Range":               true,
+	"Realm":               true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Www-Authenticate":    true,
+}
+
+func validTrailerHeader(name string) bool {
+	name = http.CanonicalHeaderKey(name)
+	return !strings.HasPrefix(name, "If-") && !invalidTrailerHeaders[name]
+}
+
+func (w *GzipResponseWriter) writeHeader() {
+	if w.headerWritten {
+		return
+	}
+
+	w.prepareHeaders()
+	code := w.code
+	if code == 0 {
+		code = http.StatusOK
+	}
+	w.ResponseWriter.WriteHeader(code)
+	w.code = 0
+	w.headerWritten = true
+}
+
+func (w *GzipResponseWriter) prepareHeaders() {
+	if w.headerWritten {
+		return
+	}
+
+	header := w.Header()
+	w.declaredTrailers = nil
+	var declared []string
+	seen := make(map[string]bool)
+	for _, trailerList := range header[trailerHeader] {
+		for _, name := range strings.Split(trailerList, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			if !validTrailerHeader(name) || seen[http.CanonicalHeaderKey(name)] {
+				continue
+			}
+			canonicalName := http.CanonicalHeaderKey(name)
+			seen[canonicalName] = true
+			declared = append(declared, canonicalName)
+		}
+	}
+	delete(header, trailerHeader)
+
+	for name, values := range header {
+		if !strings.HasPrefix(name, http.TrailerPrefix) {
+			continue
+		}
+		trailerName := strings.TrimPrefix(name, http.TrailerPrefix)
+		delete(header, name)
+		if !validTrailerHeader(trailerName) {
+			continue
+		}
+		canonicalName := http.CanonicalHeaderKey(trailerName)
+		prefixedName := http.TrailerPrefix + canonicalName
+		header[prefixedName] = append(header[prefixedName], values...)
+		if !seen[canonicalName] {
+			seen[canonicalName] = true
+			declared = append(declared, canonicalName)
+		}
+	}
+
+	if len(declared) > 0 {
+		header[trailerHeader] = []string{strings.Join(declared, ", ")}
+		for _, name := range declared {
+			if values := header[name]; len(values) > 0 {
+				prefixedName := http.TrailerPrefix + name
+				header[prefixedName] = append(header[prefixedName], values...)
+				delete(header, name)
+			}
+		}
+	}
+	for _, name := range declared {
+		w.declaredTrailers = append(w.declaredTrailers, name)
+	}
+}
+
+func (w *GzipResponseWriter) deliverTrailers() {
+	header := w.Header()
+	var prefixNames []string
+	for name := range header {
+		if strings.HasPrefix(name, http.TrailerPrefix) {
+			prefixNames = append(prefixNames, name)
+		}
+	}
+	for _, name := range prefixNames {
+		values := header[name]
+		delete(header, name)
+		trailerName := strings.TrimPrefix(name, http.TrailerPrefix)
+		if !validTrailerHeader(trailerName) {
+			continue
+		}
+		canonicalName := http.CanonicalHeaderKey(trailerName)
+		prefixedName := http.TrailerPrefix + canonicalName
+		header[prefixedName] = append(header[prefixedName], values...)
+	}
+	for _, name := range w.declaredTrailers {
+		if values := header[name]; len(values) > 0 {
+			prefixedName := http.TrailerPrefix + name
+			header[prefixedName] = append(header[prefixedName], values...)
+			delete(header, name)
+		}
+	}
 }
 
 func (w GzipResponseWriterWithCloseNotify) CloseNotify() <-chan bool {
@@ -140,7 +274,7 @@ func (w *GzipResponseWriter) Write(b []byte) (int, error) {
 		}
 	}
 	// If we got here, we should not GZIP this response.
-	if err := w.startPlain(); err != nil {
+	if err := w.startPlain(false); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -156,18 +290,12 @@ func (w *GzipResponseWriter) startGzip() error {
 	// See: https://github.com/golang/go/issues/14975.
 	w.Header().Del(contentLength)
 
-	// Write the header to gzip response.
-	if w.code != 0 {
-		w.ResponseWriter.WriteHeader(w.code)
-		// Ensure that no other WriteHeader's happen
-		w.code = 0
-	}
-
 	// Initialize and flush the buffer into the gzip response if there are any bytes.
 	// If there aren't any, we shouldn't initialize it yet because on Close it will
 	// write the gzip header even if nothing was ever written.
 	if len(w.buf) > 0 {
 		// Initialize the GZIP response.
+		w.writeHeader()
 		w.init()
 		n, err := w.gw.Write(w.buf)
 
@@ -183,14 +311,14 @@ func (w *GzipResponseWriter) startGzip() error {
 }
 
 // startPlain writes to sent bytes and buffer the underlying ResponseWriter without gzip.
-func (w *GzipResponseWriter) startPlain() error {
-	if w.code != 0 {
-		w.ResponseWriter.WriteHeader(w.code)
-		// Ensure that no other WriteHeader's happen
-		w.code = 0
-	}
+func (w *GzipResponseWriter) startPlain(flush bool) error {
+	w.prepareHeaders()
 	w.ignore = true
-	// If Write was never called then don't call Write on the underlying ResponseWriter.
+	if !flush && w.code == 0 && w.buf == nil {
+		// If Write was never called then don't call Write on the underlying ResponseWriter.
+		return nil
+	}
+	w.writeHeader()
 	if w.buf == nil {
 		return nil
 	}
@@ -225,12 +353,14 @@ func (w *GzipResponseWriter) init() {
 // Close will close the gzip.Writer and will put it back in the gzipWriterPool.
 func (w *GzipResponseWriter) Close() error {
 	if w.ignore {
+		w.deliverTrailers()
 		return nil
 	}
 
 	if w.gw == nil {
 		// GZIP not triggered yet, write out regular response.
-		err := w.startPlain()
+		err := w.startPlain(false)
+		w.deliverTrailers()
 		// Returns the error if any at write.
 		if err != nil {
 			err = fmt.Errorf("gziphandler: write to regular responseWriter at close gets error: %q", err.Error())
@@ -238,6 +368,7 @@ func (w *GzipResponseWriter) Close() error {
 		return err
 	}
 
+	w.deliverTrailers()
 	err := w.gw.Close()
 	gzipWriterPools[w.index].Put(w.gw)
 	w.gw = nil
@@ -249,11 +380,18 @@ func (w *GzipResponseWriter) Close() error {
 // an http.Flusher.
 func (w *GzipResponseWriter) Flush() {
 	if w.gw == nil && !w.ignore {
-		// Only flush once startGzip or startPlain has been called.
-		//
-		// Flush is thus a no-op until we're certain whether a plain
-		// or gzipped response will be served.
-		return
+		w.prepareHeaders()
+		if w.Header().Get(trailerHeader) != "" {
+			if err := w.startPlain(true); err != nil {
+				return
+			}
+		} else {
+			// Only flush once startGzip or startPlain has been called.
+			//
+			// Flush is thus a no-op until we're certain whether a plain
+			// or gzipped response will be served.
+			return
+		}
 	}
 
 	if w.gw != nil {
