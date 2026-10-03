@@ -222,6 +222,50 @@ fmt.Println(string(b))
 
 [marshal]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Marshal
 
+### Decode metadata
+
+[`UnmarshalWithMeta`][unmarshalwithmeta] and
+[`Decoder.RecordOrigins`][recordorigins] record, for each value assigned
+during decoding, where it came from in the document: the full path of the
+Go field, the original TOML key path, and the byte range of the value.
+
+```go
+doc := `
+[server]
+addr = "127.0.0.1"
+`
+
+var cfg struct {
+	Server struct {
+		Addr string
+	}
+}
+meta, err := toml.UnmarshalWithMeta([]byte(doc), &cfg)
+if err != nil {
+	panic(err)
+}
+origin, ok := meta.Lookup("server", "addr")
+if ok {
+	fmt.Println("path:", origin.Path)       // Server.Addr
+	fmt.Println("key:", origin.Key)         // [server addr]
+	fmt.Println("range:", origin.Range)     // byte range of "127.0.0.1"
+}
+```
+
+Only values actually assigned are recorded: fields that do not appear in
+the document produce no origin. Tables, dotted keys, and inline tables
+share the same path representation, and elements of arrays of tables are
+distinguished by their index (e.g. `servers[1].addr`). Quoted keys,
+including keys containing dots, are preserved as single path segments.
+Decoding the same document into a struct and into a map yields matching
+keys and ranges for the common fields. Values consumed by a custom
+`UnmarshalTOML` implementation are recorded with the `Unmarshaled` flag
+set, and their range covers the whole region of the document the
+unmarshaler received.
+
+[unmarshalwithmeta]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#UnmarshalWithMeta
+[recordorigins]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Decoder.RecordOrigins
+
 ## Unstable API
 
 This API does not yet follow the backward compatibility guarantees of this

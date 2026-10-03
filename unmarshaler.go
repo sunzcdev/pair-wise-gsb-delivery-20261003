@@ -63,6 +63,13 @@ func (d *decoder) reset() {
 	d.tableParentSlot = slotWriter{}
 	d.keyParts = d.keyParts[:0]
 	d.strict.Reset()
+	d.meta = nil
+	d.goPrefix = d.goPrefix[:0]
+	d.goNames = d.goNames[:0]
+	d.goPath = d.goPath[:0]
+	d.keyPrefix = d.keyPrefix[:0]
+	d.originKeyOffset = 0
+	d.originSuppress = 0
 }
 
 // Unmarshal deserializes a TOML document into a Go value.
@@ -75,6 +82,26 @@ func Unmarshal(data []byte, v interface{}) error {
 	return err
 }
 
+// UnmarshalWithMeta deserializes a TOML document into a Go value and
+// returns the metadata recording where each decoded value came from in the
+// document. It is a shortcut for Decoder.RecordOrigins with the default
+// options.
+//
+// The returned MetaData records, for each value actually assigned during
+// decoding, the full path of the Go field, the original TOML key path, and
+// the byte range of the value in the document.
+func UnmarshalWithMeta(data []byte, v interface{}) (*MetaData, error) {
+	d := getDecoder(false, false)
+	meta := &MetaData{}
+	d.meta = meta
+	err := d.unmarshal(data, v)
+	putDecoder(d)
+	if err != nil {
+		return nil, err
+	}
+	return meta, nil
+}
+
 // Decoder reads and decode a TOML document from an input stream.
 type Decoder struct {
 	// input
@@ -85,6 +112,9 @@ type Decoder struct {
 
 	// toggles unmarshaler interface
 	unmarshalerInterface bool
+
+	// records the origin of decoded values
+	meta *MetaData
 }
 
 // NewDecoder creates a new Decoder that will read from r.
@@ -124,6 +154,20 @@ func (d *Decoder) DisallowUnknownFields() *Decoder {
 // issued.
 func (d *Decoder) EnableUnmarshalerInterface() *Decoder {
 	d.unmarshalerInterface = true
+	return d
+}
+
+// RecordOrigins causes the Decoder to record, for each value assigned
+// during decoding, the full path of the Go field, the original TOML key
+// path, and the byte range of the value in the document. The metadata is
+// reset before decoding and populated as values are assigned.
+//
+// Only values actually assigned are recorded: fields that do not appear in
+// the document produce no origin. Values consumed by a custom Unmarshaler
+// are recorded with the Unmarshaled flag set, and their range covers the
+// whole region of the document the Unmarshaler received.
+func (d *Decoder) RecordOrigins(md *MetaData) *Decoder {
+	d.meta = md
 	return d
 }
 
@@ -175,6 +219,7 @@ func (d *Decoder) Decode(v interface{}) error {
 	}
 
 	dec := getDecoder(d.strict, d.unmarshalerInterface)
+	dec.meta = d.meta
 	err = dec.unmarshal(b, v)
 	putDecoder(dec)
 	return err
@@ -212,12 +257,20 @@ func (p *pathPart) str() string {
 // been processed (the address of the target may change as slices grow).
 type rawCapture struct {
 	names []string
+	// goNames[i] is the Go field name for names[i] (identical for map
+	// targets, the struct field names for struct targets).
+	goNames []string
 	// indexes[i] is the index to use when reaching a slice or array right
 	// before consuming names[i]. indexes[len(names)] is the index of the
 	// element when the target is an element of an array table. -1 when not
 	// relevant.
 	indexes []int
 	buf     []byte
+	// rangeStart and rangeEnd delimit the region of the document the
+	// capture covers, from the opening '[' of the first table header to the
+	// end of the last captured expression.
+	rangeStart int
+	rangeEnd   int
 }
 
 type decoder struct {
@@ -287,6 +340,39 @@ type decoder struct {
 	// keyParts is the reusable buffer holding the decoded parts of the key of
 	// the current expression in the fused generic decode path.
 	keyParts [][]byte
+
+	// meta is non-nil when origin recording is enabled (RecordOrigins).
+	meta *MetaData
+
+	// goPrefix is the Go field path prefix at the current table, recorded
+	// by walkTable (field names for structs, key names for maps, with
+	// array-table indexes).
+	goPrefix []PathSegment
+
+	// goNames[i] is the Go field name for the i-th table key part
+	// (parallel to tableKey), recorded by walkTable.
+	goNames []string
+
+	// goPath is the Go field path of the value currently being decoded,
+	// built by descend.
+	goPath []PathSegment
+
+	// originKey is the TOML key path of the value currently being decoded,
+	// set by descend.
+	originKey Key
+
+	// keyPrefix is the TOML key path prefix at the current table or inline
+	// table (without array-table indexes).
+	keyPrefix []string
+
+	// originKeyOffset is the number of leading parts of the descend path
+	// that belong to the table key (and are therefore already represented
+	// in goPrefix and keyPrefix).
+	originKeyOffset int
+
+	// originSuppress suppresses origin recording, for values that are not
+	// fields of their own (array elements).
+	originSuppress int
 }
 
 // slotWriter remembers how to store a value at some location of the target
@@ -501,12 +587,17 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 
 	d.captureIdx = -1
 	d.p.Reset(data)
+	if d.meta != nil {
+		d.meta.origins = d.meta.origins[:0]
+	}
 
 	// Fully generic targets (interface{} or map[string]interface{}) are
 	// decoded straight into native Go maps and slices, with no reflection on
 	// the document structure at all. This covers the common "decode arbitrary
 	// TOML into a map" case, including every standard benchmark dataset.
-	if !d.unmarshalerInterface {
+	// Origin recording needs the reflect-based path to track the Go field
+	// each value is assigned to, so the fused path is disabled then.
+	if !d.unmarshalerInterface && d.meta == nil {
 		if k := root.Kind(); k == reflect.Interface || (k == reflect.Map && root.Type() == mapStringInterfaceType) {
 			return d.unmarshalFused(root, data)
 		}
@@ -547,6 +638,7 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 		if nv.IsValid() {
 			root.Set(nv)
 		}
+		d.recordCaptureOrigin(&d.captures[i])
 	}
 
 	// An empty document into a generic target still initializes it.
@@ -562,7 +654,65 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	default:
 	}
 
+	// Origins of unmarshaler-interface captures are recorded at resolution
+	// time, after the key-values of the document; sort everything back into
+	// document order.
+	if d.meta != nil {
+		d.meta.sort()
+	}
+
 	return d.strict.Error(data)
+}
+
+// recordOrigin records the origin of the value at the current goPath and
+// keyPrefix, with the given byte range and unmarshaler flag.
+func (d *decoder) recordOrigin(rng ByteRange, unmarshaled bool) {
+	if d.meta == nil || d.originSuppress > 0 {
+		return
+	}
+	d.meta.record(d.goPath, d.originKey, rng, unmarshaled)
+}
+
+// recordCaptureOrigin records the origin of a value decoded by a custom
+// Unmarshaler from a raw capture, with the range covering the whole
+// captured region of the document.
+func (d *decoder) recordCaptureOrigin(c *rawCapture) {
+	if d.meta == nil {
+		return
+	}
+	path := make([]PathSegment, len(c.names))
+	key := make(Key, len(c.names))
+	for i, name := range c.names {
+		path[i] = PathSegment{Key: c.goNames[i], Index: c.indexes[i+1]}
+		key[i] = name
+	}
+	d.meta.record(path, key, ByteRange{Start: c.rangeStart, End: c.rangeEnd}, true)
+}
+
+// buildKey returns the full TOML key path for the first idx parts of path,
+// prefixing keyPrefix and skipping the table key parts.
+func (d *decoder) buildKey(path []pathPart, idx int) Key {
+	n := len(d.keyPrefix) + (idx - d.originKeyOffset)
+	key := make(Key, 0, n)
+	key = append(key, d.keyPrefix...)
+	for i := d.originKeyOffset; i < idx; i++ {
+		key = append(key, d.partString(&path[i]))
+	}
+	return key
+}
+
+// rangeOf returns the byte range of a subslice of the document.
+func (d *decoder) rangeOf(raw []byte) ByteRange {
+	r := d.p.Range(raw)
+	return ByteRange{Start: int(r.Offset), End: int(r.Offset + r.Length)}
+}
+
+// valueRange returns the byte range of a value node within the document.
+// For scalars it is the value's own raw range; for arrays and inline
+// tables (whose node Raw does not span the whole value) it is the span
+// reconstructed from the enclosing key-value expression.
+func (d *decoder) valueRange(expr *unstable.Node, value *unstable.Node) ByteRange {
+	return d.rangeOf(d.rawValue(expr, value))
 }
 
 // setAnyKey assigns the value of a key-value into the native map m, following
@@ -725,7 +875,32 @@ func (d *decoder) handleTableExpression(expr *unstable.Node, root reflect.Value,
 		d.segIdx = append(d.segIdx, -1)
 	}
 
-	return d.walkTable(root, expr, isArrayTable, first)
+	if d.meta != nil {
+		// Reset the Go field names of the table key parts; walkTable
+		// records them as it descends.
+		d.goNames = d.goNames[:0]
+		for i := 0; i < len(d.tableKey); i++ {
+			d.goNames = append(d.goNames, "")
+		}
+	}
+
+	err := d.walkTable(root, expr, isArrayTable, first)
+	if err != nil {
+		return err
+	}
+
+	if d.meta != nil {
+		// Build the Go field path prefix of the table: the field or key
+		// names recorded by walkTable, with the array-table element
+		// indexes.
+		d.goPrefix = d.goPrefix[:0]
+		for i, name := range d.goNames {
+			d.goPrefix = append(d.goPrefix, PathSegment{Key: name, Index: d.segIdx[i+1]})
+		}
+		d.keyPrefix = append(d.keyPrefix[:0], d.tableKey...)
+	}
+
+	return nil
 }
 
 // newContainerElem returns a fresh element for a slice of the given element
@@ -843,6 +1018,9 @@ walk:
 				w = slotWriter{kind: 2, m: v, k: k}
 			}
 
+			if d.meta != nil {
+				d.goNames[idx] = name
+			}
 			elem := v.MapIndex(key)
 
 			// The last part of an array table is finalized as a slice
@@ -945,6 +1123,9 @@ walk:
 				d.strict.MissingTable(expr)
 				d.skipUntilTable = true
 				return nil
+			}
+			if d.meta != nil {
+				d.goNames[idx] = f.fieldName
 			}
 			fv, err := fieldByIndexAlloc(v, f.index)
 			if err != nil {
@@ -1128,6 +1309,7 @@ func (d *decoder) appendCaptureHeader(c *rawCapture, expr *unstable.Node, skip i
 		c.buf = append(c.buf, ']')
 	}
 	c.buf = append(c.buf, '\n')
+	_, c.rangeEnd = d.tableHeaderRange(expr)
 }
 
 // rawKeySuffix returns the raw bytes of the key of the expression, skipping
@@ -1154,11 +1336,20 @@ func (d *decoder) rawKeySuffix(expr *unstable.Node, n int) []byte {
 func (d *decoder) startCapture(pathLen int, expr *unstable.Node) {
 	names := make([]string, pathLen)
 	copy(names, d.tableKey[:pathLen])
+	var goNames []string
+	if d.meta != nil {
+		goNames = make([]string, pathLen)
+		copy(goNames, d.goNames[:pathLen])
+	}
 	indexes := make([]int, pathLen+1)
 	copy(indexes, d.segIdx[:pathLen+1])
+	start, end := d.tableHeaderRange(expr)
 	d.captures = append(d.captures, rawCapture{
-		names:   names,
-		indexes: indexes,
+		names:      names,
+		goNames:    goNames,
+		indexes:    indexes,
+		rangeStart: start,
+		rangeEnd:   end,
 	})
 	d.captureIdx = len(d.captures) - 1
 	if pathLen < len(d.tableKey) {
@@ -1174,7 +1365,7 @@ func (d *decoder) startCapture(pathLen int, expr *unstable.Node) {
 // single index slot is -1 because the root is never reached through an array
 // table.
 func (d *decoder) startRootCapture() {
-	d.captures = append(d.captures, rawCapture{indexes: []int{-1}})
+	d.captures = append(d.captures, rawCapture{indexes: []int{-1}, rangeStart: 0})
 	d.captureIdx = len(d.captures) - 1
 }
 
@@ -1282,6 +1473,39 @@ func (d *decoder) captureKeyValue(expr *unstable.Node) {
 	c := &d.captures[d.captureIdx]
 	c.buf = append(c.buf, d.p.Raw(expr.Raw)...)
 	c.buf = append(c.buf, '\n')
+	c.rangeEnd = int(expr.Raw.Offset + expr.Raw.Length)
+}
+
+// tableHeaderRange returns the byte range of a table or array-table header
+// expression, from the opening '[' to just past the closing ']'.
+func (d *decoder) tableHeaderRange(expr *unstable.Node) (start, end int) {
+	doc := d.p.Data()
+	it := expr.Key()
+	idx := 0
+	for it.Next() {
+		r := it.Node().Raw
+		if idx == 0 {
+			start = int(r.Offset)
+		}
+		end = int(r.Offset + r.Length)
+		idx++
+	}
+	// The header is '[' ws key ws ']': scan back from the first key part to
+	// the opening bracket(s), and forward from the last to the closing
+	// bracket(s).
+	for start > 0 && (doc[start-1] == ' ' || doc[start-1] == '\t') {
+		start--
+	}
+	for start > 0 && doc[start-1] == '[' {
+		start--
+	}
+	for end < len(doc) && (doc[end] == ' ' || doc[end] == '\t') {
+		end++
+	}
+	for end < len(doc) && doc[end] == ']' {
+		end++
+	}
+	return start, end
 }
 
 // hasUnmarshaler reports whether v can provide an unstable.Unmarshaler,
@@ -1379,6 +1603,17 @@ func (d *decoder) handleKeyValueExpression(expr *unstable.Node, root reflect.Val
 		}
 	}
 
+	if d.meta != nil {
+		// Set up origin recording for this key-value: the Go field path
+		// starts at the table prefix, and the descend path skips the table
+		// key parts (which are already represented in the prefixes).
+		d.goPath = append(d.goPath[:0], d.goPrefix...)
+		d.originKeyOffset = 0
+		if !useCache {
+			d.originKeyOffset = len(d.tableKey)
+		}
+	}
+
 	it := expr.Key()
 	for it.Next() {
 		d.path = append(d.path, pathPart{node: it.Node()})
@@ -1411,6 +1646,9 @@ func (d *decoder) handleKeyValueExpression(expr *unstable.Node, root reflect.Val
 // means nothing should be stored (e.g. unknown field).
 func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unstable.Node, value *unstable.Node) (reflect.Value, error) {
 	if idx == len(path) {
+		if d.meta != nil {
+			d.originKey = d.buildKey(path, idx)
+		}
 		return d.assignValue(v, expr, value)
 	}
 
@@ -1430,7 +1668,12 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 	// whatever the remaining parts of the key are.
 	if d.unmarshalerInterface {
 		if u, ok := unmarshalerOf(v); ok {
-			return v, u.UnmarshalTOML(d.rawValue(expr, value))
+			raw := d.rawValue(expr, value)
+			if d.meta != nil {
+				d.originKey = d.buildKey(path, idx)
+				d.recordOrigin(d.rangeOf(raw), true)
+			}
+			return v, u.UnmarshalTOML(raw)
 		}
 	}
 
@@ -1443,7 +1686,7 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		// the value directly, skipping the reflect.Value round-trips
 		// (stringMapKey, MapIndex, New, SetMapIndex) entirely.
 		if !d.unmarshalerInterface && v.Type() == mapStringInterfaceType {
-			return d.descendStrMap(v, path, idx, value)
+			return d.descendStrMap(v, path, idx, expr, value)
 		}
 		var name string
 		var key reflect.Value
@@ -1475,6 +1718,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		default:
 			elem = reflect.New(elemType).Elem()
 		}
+		if d.meta != nil && idx >= d.originKeyOffset {
+			d.goPath = append(d.goPath, PathSegment{Key: d.partString(&part), Index: -1})
+			defer func() { d.goPath = d.goPath[:len(d.goPath)-1] }()
+		}
 		nv, err := d.descend(elem, path, idx+1, expr, value)
 		if err != nil {
 			return reflect.Value{}, err
@@ -1496,6 +1743,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			}
 			return v, nil
 		}
+		if d.meta != nil && idx >= d.originKeyOffset {
+			d.goPath = append(d.goPath, PathSegment{Key: f.fieldName, Index: -1})
+			defer func() { d.goPath = d.goPath[:len(d.goPath)-1] }()
+		}
 		fv, err := fieldByIndexAlloc(v, f.index)
 		if err != nil {
 			return reflect.Value{}, err
@@ -1505,6 +1756,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			// Leaf field: assign directly. descend's first action for a
 			// fully-consumed path is exactly this call, so skipping the extra
 			// frame is equivalent and avoids a call per scalar field.
+			if d.meta != nil {
+				d.originKey = d.buildKey(path, idx+1)
+			}
 			nv, err = d.assignValue(fv, expr, value)
 		} else {
 			nv, err = d.descend(fv, path, idx+1, expr, value)
@@ -1538,6 +1792,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			}
 			v = reflect.Append(v, reflect.New(v.Type().Elem()).Elem())
 		}
+		if d.meta != nil && idx > d.originKeyOffset && len(d.goPath) > 0 {
+			d.goPath[len(d.goPath)-1].Index = v.Len() - 1
+			defer func() { d.goPath[len(d.goPath)-1].Index = -1 }()
+		}
 		elem := v.Index(v.Len() - 1)
 		nv, err := d.descend(elem, path, idx, expr, value)
 		if err != nil {
@@ -1561,6 +1819,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			return reflect.Value{}, unstable.NewParserError(keyHighlight(d.p.Data(), part.node),
 				"cannot reach element %d of array of size %d", elemIdx, v.Len())
 		}
+		if d.meta != nil && idx > d.originKeyOffset && len(d.goPath) > 0 {
+			d.goPath[len(d.goPath)-1].Index = elemIdx
+			defer func() { d.goPath[len(d.goPath)-1].Index = -1 }()
+		}
 		elem := v.Index(elemIdx)
 		nv, err := d.descend(elem, path, idx, expr, value)
 		if err != nil {
@@ -1580,7 +1842,7 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 // value with decodeAny. It returns the map to store back at this level: a new
 // map when v was nil, otherwise v unchanged, since maps are reference types and
 // are mutated in place.
-func (d *decoder) descendStrMap(v reflect.Value, path []pathPart, idx int, value *unstable.Node) (reflect.Value, error) {
+func (d *decoder) descendStrMap(v reflect.Value, path []pathPart, idx int, expr *unstable.Node, value *unstable.Node) (reflect.Value, error) {
 	var m map[string]interface{}
 	if v.IsNil() {
 		m = make(map[string]interface{})
@@ -1593,6 +1855,21 @@ func (d *decoder) descendStrMap(v reflect.Value, path []pathPart, idx int, value
 	// non-map value at an intermediate key can only occur in a document the
 	// seen-tracker has already rejected; replacing it mirrors the reflect
 	// path (elemOrNewMap).
+	if d.meta != nil {
+		savedGoLen := len(d.goPath)
+		for i := idx; i < len(path); i++ {
+			d.goPath = append(d.goPath, PathSegment{Key: d.partString(&path[i]), Index: -1})
+		}
+		d.originKey = d.buildKey(path, len(path))
+		defer func() { d.goPath = d.goPath[:savedGoLen] }()
+
+		// Scalars and arrays are recorded here; the leaves of an inline
+		// table are recorded by decodeAny.
+		if value.Kind != unstable.InlineTable {
+			d.recordOrigin(d.valueRange(expr, value), false)
+		}
+	}
+
 	for ; idx < len(path)-1; idx++ {
 		name := d.partString(&path[idx])
 		child, _ := m[name].(map[string]interface{})
@@ -1673,7 +1950,9 @@ func (d *decoder) assignValue(v reflect.Value, expr *unstable.Node, value *unsta
 	if v.Kind() == reflect.Ptr {
 		if d.unmarshalerInterface {
 			if u, ok := unmarshalerOf(v); ok {
-				return v, u.UnmarshalTOML(d.rawValue(expr, value))
+				raw := d.rawValue(expr, value)
+				d.recordOrigin(d.rangeOf(raw), true)
+				return v, u.UnmarshalTOML(raw)
 			}
 		}
 		if v.IsNil() {
@@ -1689,8 +1968,17 @@ func (d *decoder) assignValue(v reflect.Value, expr *unstable.Node, value *unsta
 
 	if d.unmarshalerInterface {
 		if u, ok := unmarshalerOf(v); ok {
-			return v, u.UnmarshalTOML(d.rawValue(expr, value))
+			raw := d.rawValue(expr, value)
+			d.recordOrigin(d.rangeOf(raw), true)
+			return v, u.UnmarshalTOML(raw)
 		}
+	}
+
+	// Scalars and arrays are recorded here; the leaves of an inline table
+	// are recorded by assignInlineTable. The check is hoisted so that the
+	// common path (no metadata) is a single inlined nil test.
+	if d.meta != nil && value.Kind != unstable.InlineTable {
+		d.recordOrigin(d.valueRange(expr, value), false)
 	}
 
 	switch value.Kind {
@@ -1989,6 +2277,13 @@ func (d *decoder) assignLocalTime(v reflect.Value, value *unstable.Node) (reflec
 }
 
 func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unstable.Node) (reflect.Value, error) {
+	// Array elements are not fields of their own: suppress origin recording
+	// while decoding them.
+	if d.meta != nil {
+		d.originSuppress++
+		defer func() { d.originSuppress-- }()
+	}
+
 	// Count the elements to allocate the target in one go.
 	count := 0
 	cit := value.Children()
@@ -2084,6 +2379,12 @@ func (d *decoder) decodeAny(n *unstable.Node) (interface{}, error) {
 	case unstable.Bool:
 		return n.Data[0] == 't', nil
 	case unstable.Array:
+		// Array elements are not fields of their own: suppress origin
+		// recording while decoding them.
+		if d.meta != nil {
+			d.originSuppress++
+			defer func() { d.originSuppress-- }()
+		}
 		count := 0
 		cit := n.Children()
 		for cit.Next() {
@@ -2116,6 +2417,34 @@ func (d *decoder) decodeAny(n *unstable.Node) (interface{}, error) {
 			count++
 		}
 		m := make(map[string]interface{}, count)
+		if d.meta != nil {
+			savedGoLen := len(d.goPath)
+			savedKeyLen := len(d.originKey)
+			it := n.Children()
+			for it.Next() {
+				kv := it.Node()
+				// Set the leaf path and key for this key-value.
+				d.goPath = d.goPath[:savedGoLen]
+				d.originKey = d.originKey[:savedKeyLen]
+				kit := kv.Key()
+				for kit.Next() {
+					name := d.intern(kit.Node().Data)
+					d.goPath = append(d.goPath, PathSegment{Key: name, Index: -1})
+					d.originKey = append(d.originKey, name)
+				}
+				// Scalars and arrays are recorded here; nested inline
+				// tables record their own leaves.
+				if v := kv.Value(); v.Kind != unstable.InlineTable {
+					d.recordOrigin(d.valueRange(kv, v), false)
+				}
+				if err := d.setAnyKey(m, kv.Key(), kv.Value()); err != nil {
+					return nil, err
+				}
+			}
+			d.goPath = d.goPath[:savedGoLen]
+			d.originKey = d.originKey[:savedKeyLen]
+			return m, nil
+		}
 		it := n.Children()
 		for it.Next() {
 			kv := it.Node()
@@ -2169,6 +2498,18 @@ func (d *decoder) assignInlineTable(v reflect.Value, expr *unstable.Node, value 
 		return boxInto(v, nv)
 	default:
 		return reflect.Value{}, d.typeMismatchError("inline table", v.Type(), d.rawValue(expr, value))
+	}
+
+	if d.meta != nil {
+		// The leaves of the inline table are recorded with the path of the
+		// inline table itself as their prefix.
+		savedGoPrefix, savedKeyPrefix, savedOffset := d.goPrefix, d.keyPrefix, d.originKeyOffset
+		d.goPrefix = d.goPath
+		d.keyPrefix = d.originKey
+		d.originKeyOffset = 0
+		defer func() {
+			d.goPrefix, d.keyPrefix, d.originKeyOffset = savedGoPrefix, savedKeyPrefix, savedOffset
+		}()
 	}
 
 	it := value.Children()
