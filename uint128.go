@@ -78,6 +78,29 @@ func (u uint128) addOne() uint128 {
 	return uint128{u.hi + carry, lo}
 }
 
+// add returns u+v.
+func (u uint128) add(v uint128) uint128 {
+	lo, carry := bits.Add64(u.lo, v.lo, 0)
+	hi, _ := bits.Add64(u.hi, v.hi, carry)
+	return uint128{hi, lo}
+}
+
+// sub returns u-v.
+func (u uint128) sub(v uint128) uint128 {
+	lo, borrow := bits.Sub64(u.lo, v.lo, 0)
+	hi, _ := bits.Sub64(u.hi, v.hi, borrow)
+	return uint128{hi, lo}
+}
+
+// bitAt reports the value of the bit at position bit, where bit 0 is
+// the most significant bit.
+func (u uint128) bitAt(bit uint8) uint8 {
+	if bit < 64 {
+		return uint8((u.hi >> (63 - bit)) & 1)
+	}
+	return uint8((u.lo >> (127 - bit)) & 1)
+}
+
 func u64CommonPrefixLen(a, b uint64) uint8 {
 	return uint8(bits.LeadingZeros64(a ^ b))
 }

@@ -48,3 +48,35 @@ func ExampleIPSet() {
 	//   10.128.0.0/9
 	//   fed0::400/120
 }
+
+func ExampleIPSet_CoveringPrefixes() {
+	var b netipx.IPSetBuilder
+	b.AddPrefix(netip.MustParsePrefix("2001:db8::1/128"))
+	b.AddPrefix(netip.MustParsePrefix("2001:db8::2/128"))
+	s, _ := b.IPSet()
+
+	prefixes, extra, ok := s.CoveringPrefixes(1)
+	fmt.Println("feasible:", ok)
+	fmt.Println("prefixes:", prefixes)
+	fmt.Println("extra addresses:", extra)
+	// Output:
+	// feasible: true
+	// prefixes: [2001:db8::/126]
+	// extra addresses: 2
+}
+
+func ExampleIPSet_CoveringPrefixes_dualStack() {
+	var b netipx.IPSetBuilder
+	b.AddPrefix(netip.MustParsePrefix("10.0.0.0/24"))
+	b.AddPrefix(netip.MustParsePrefix("2001:db8::/32"))
+	s, _ := b.IPSet()
+
+	_, _, ok := s.CoveringPrefixes(1)
+	fmt.Println("one prefix for both families:", ok)
+
+	prefixes, extra, ok := s.CoveringPrefixes(2)
+	fmt.Println("two prefixes:", ok, prefixes, "extra:", extra)
+	// Output:
+	// one prefix for both families: false
+	// two prefixes: true [10.0.0.0/24 2001:db8::/32] extra: 0
+}
