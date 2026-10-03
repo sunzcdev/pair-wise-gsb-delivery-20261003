@@ -2,12 +2,27 @@ package digest
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"sync"
 )
 
-// cchal is a cached challenge and the number of times it's been used.
+// maxNonceCount is the largest nonce count representable in the 8-digit
+// hexadecimal nc field.
+const maxNonceCount = 0xffffffff
+
+// ErrNonceCountExhausted is reported when every nonce count for the cached
+// challenge has been allocated. The transport drops the exhausted challenge
+// and waits for the server to issue a new one rather than wrapping the
+// counter and re-using nonce count values.
+var ErrNonceCountExhausted = errors.New("digest: nonce count exhausted")
+
+// cchal is a cached challenge and the number of nonce counts allocated for
+// it. The pointer identity of the entry acts as the challenge generation:
+// installing a new entry (new challenge, nextnonce commit, exhaustion)
+// starts a new generation and invalidates the state captured by in-flight
+// requests.
 type cchal struct {
 	c *Challenge
 	n int
@@ -25,6 +40,11 @@ type Transport struct {
 	// FindChallenge extracts the challenge from the request headers.
 	// If nil, the FindChallenge function is used.
 	FindChallenge func(http.Header) (*Challenge, error)
+
+	// VerifyResponse verifies the Authentication-Info header of a successful
+	// response before its nextnonce is committed to the challenge cache.
+	// If nil, the VerifyResponseAuth function is used.
+	VerifyResponse func(*ResponseAuth) error
 
 	// Transport specifies the mechanism by which individual
 	// HTTP requests are made.
@@ -103,26 +123,46 @@ func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Cred
 	return Digest(chal, opt)
 }
 
-// challenge returns a cached challenge and count for the provided request
-func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
+// challenge allocates the next nonce count for the cached challenge of the
+// request's host. The allocation and the generation capture are atomic: the
+// returned entry identifies the challenge generation and stays valid only
+// while it remains installed in the cache.
+func (t *Transport) challenge(req *http.Request) (*cchal, int, error) {
 	t.cacheMu.Lock()
 	defer t.cacheMu.Unlock()
 	host := req.URL.Hostname()
 	cc, ok := t.cache[host]
 	if !ok {
-		return nil, 0, false
+		return nil, 0, nil
 	}
 	if t.NoReuse {
 		delete(t.cache, host)
 	}
+	if cc.n >= maxNonceCount {
+		// All nonce count values for this challenge have been allocated.
+		// Drop it and wait for the server to issue a fresh challenge
+		// instead of wrapping the counter.
+		delete(t.cache, host)
+		return nil, 0, ErrNonceCountExhausted
+	}
 	cc.n++
-	return cc.c, cc.n, true
+	return cc, cc.n, nil
 }
 
-// prepare sets the Authorization header from a cached challenge if one exists.
-// It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// authState captures the challenge generation and the credentials used to
+// authorize a request. It is used to commit Authentication-Info updates
+// carried by the corresponding response.
+type authState struct {
+	entry *cchal
+	chal  *Challenge
+	cred  *Credentials
+}
+
+// prepare sets the Authorization header from a cached challenge if one
+// exists. It returns the captured authorization state (nil when no cached
+// challenge was used) and reports whether the caller should send a bodyless
+// probe first (Probe set, request has a body, no challenge cached yet).
+func (t *Transport) prepare(req *http.Request) (*authState, bool, error) {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
@@ -130,20 +170,74 @@ func (t *Transport) prepare(req *http.Request) (bool, error) {
 		}
 	}
 	// add auth
-	chal, count, ok := t.challenge(req)
-	if !ok {
+	entry, count, err := t.challenge(req)
+	if err != nil {
+		// The cached challenge is exhausted: send the request bare and
+		// wait for the server to respond with a fresh challenge.
+		if !errors.Is(err, ErrNonceCountExhausted) {
+			return nil, false, err
+		}
+	}
+	if entry == nil {
 		// no cached challenge yet: probe bodyless first when configured
 		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+		return nil, t.Probe && bodied, nil
 	}
-	cred, err := t.digest(req, chal, count)
+	cred, err := t.digest(req, entry.c, count)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if cred != nil {
 		req.Header.Set("Authorization", cred.String())
 	}
-	return false, nil
+	return &authState{entry: entry, chal: entry.c, cred: cred}, false, nil
+}
+
+// commit applies a verified Authentication-Info nextnonce update from the
+// response to the cached challenge. The update is only committed when the
+// challenge generation captured while authorizing the request is still the
+// current generation; responses from superseded generations are discarded,
+// even when they arrive last. A committed nextnonce starts a new generation
+// and the nonce count restarts from one.
+func (t *Transport) commit(req *http.Request, state *authState, res *http.Response) {
+	if state == nil || state.cred == nil {
+		return
+	}
+	info, err := FindAuthenticationInfo(res.Header)
+	if err != nil || info == nil || info.NextNonce == "" {
+		return
+	}
+	verify := t.VerifyResponse
+	if verify == nil {
+		verify = VerifyResponseAuth
+	}
+	if err := verify(&ResponseAuth{
+		Request:     req,
+		Credentials: state.cred,
+		Challenge:   state.chal,
+		Info:        info,
+		Username:    t.Username,
+		Password:    t.Password,
+	}); err != nil {
+		return
+	}
+	host := req.URL.Hostname()
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+	if cur := t.cache[host]; cur != state.entry {
+		// The generation was superseded (new challenge, nextnonce commit,
+		// exhaustion, or NoReuse consumption): a stale response must not
+		// roll the cache back.
+		return
+	}
+	if info.NextNonce == state.entry.c.Nonce {
+		// The nonce is unchanged: keep counting on this generation.
+		return
+	}
+	// Install the nextnonce as a new generation; counting restarts at one.
+	chal := *state.entry.c
+	chal.Nonce = info.NextNonce
+	t.cache[host] = &cchal{c: &chal}
 }
 
 // RoundTrip will try to authorize the request using a cached challenge.
@@ -165,7 +259,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
+	state, probe, err := t.prepare(first)
 	if err != nil {
 		return nil, err
 	}
@@ -182,6 +276,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if res.StatusCode != http.StatusUnauthorized {
 		if !probe {
+			t.commit(first, state, res)
 			return res, nil
 		}
 		// a probe response isn't valid for the caller since the body was
@@ -210,10 +305,15 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
+	state2, _, err := t.prepare(second)
+	if err != nil {
 		return nil, err
 	}
-	return tr.RoundTrip(second)
+	res, err = tr.RoundTrip(second)
+	if err == nil && res.StatusCode != http.StatusUnauthorized {
+		t.commit(second, state2, res)
+	}
+	return res, err
 }
 
 // CloseIdleConnections delegates the call to the underlying transport.

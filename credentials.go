@@ -56,7 +56,7 @@ func ParseCredentials(s string) (*Credentials, error) {
 		case "qop":
 			c.QOP = p.Value
 		case "nc":
-			nc, err := strconv.ParseInt(p.Value, 16, 32)
+			nc, err := strconv.ParseUint(p.Value, 16, 32)
 			if err != nil {
 				return nil, fmt.Errorf("digest: invalid nc: %w", err)
 			}

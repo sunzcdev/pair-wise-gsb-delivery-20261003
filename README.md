@@ -178,6 +178,37 @@ a `401`, that response is discarded and the original request is sent as-is.
 Once a challenge is cached, requests go out authenticated on the first try as
 usual.
 
+## Nonce Rollover (Authentication-Info)
+
+Servers may attach an `Authentication-Info` header with a `nextnonce` to
+successful responses. The transport verifies the header (checking `rspauth`
+when present) and commits the `nextnonce` to its challenge cache, so
+subsequent requests use the new nonce and the nonce count restarts at one.
+
+Each request captures the challenge *generation* when its nonce count is
+allocated. A response can only commit its `nextnonce` if that generation is
+still current — a stale response arriving after a newer commit or a `401`
+challenge swap is discarded and never rolls the cache back. When every nonce
+count (8 hex digits) has been allocated, the transport drops the exhausted
+challenge and waits for the server to issue a new one instead of wrapping
+the counter.
+
+To verify the response proof yourself (e.g. for `qop=auth-int`, whose
+`rspauth` covers the response body), inject `Transport.VerifyResponse`:
+
+``` go
+client := &http.Client{
+	Transport: &digest.Transport{
+		Username: "foo",
+		Password: "bar",
+		VerifyResponse: func(ra *digest.ResponseAuth) error {
+			// inspect ra.Info.Rspauth; return an error to reject the update
+			return nil
+		},
+	},
+}
+```
+
 ## Low Level API
 
 ``` go
