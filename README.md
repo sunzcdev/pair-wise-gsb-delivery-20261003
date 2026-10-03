@@ -42,7 +42,7 @@ result, err := backoff.Retry(ctx, func() (string, error) {
 backoff until it succeeds, returns a `Permanent` error, or a limit is reached.
 See [example_test.go][example] for a fuller example, and the [package docs][godoc]
 for the available options (`WithBackOff`, `WithMaxTries`, `WithMaxElapsedTime`,
-`WithNotify`).
+`WithNotify`, and `WithClock`).
 
 If `Retry` does not fit your needs, copy it from [retry.go][retry-src] and adapt it.
 
@@ -79,6 +79,17 @@ Two independent limits cap how long `Retry` runs, and they behave differently:
 - **`WithMaxElapsedTime`** bounds only retry scheduling: it is checked between attempts, never interrupts a running operation, and is reported as `ErrMaxElapsedTime`. It counts from when `Retry` is called and includes the attempts' own runtime, so an operation that fails only after running past the limit is not retried.
 
 `WithMaxElapsedTime` defaults to 15 minutes, so **both limits are active unless you override it** — pass `backoff.WithMaxElapsedTime(0)` to rely solely on the context.
+
+### Virtual clocks
+
+By default, `Retry` and `NewTicker` use `backoff.SystemClock`. Pass `backoff.WithClock` to use a virtual clock in tests:
+
+```go
+err := backoff.Retry(ctx, operation, backoff.WithClock(testClock))
+ticker := backoff.NewTicker(backoff.NewConstantBackOff(time.Second), backoff.WithClock(testClock))
+```
+
+This makes `WithMaxElapsedTime`, backoff waits, cancellation, and Ticker scheduling deterministic without real sleeps.
 
 ## Contributing
 

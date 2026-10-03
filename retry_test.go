@@ -29,6 +29,42 @@ func (t *testTimer) C() <-chan time.Time {
 	return t.timer.C
 }
 
+type legacyTimer interface {
+	Start(time.Duration)
+	Stop()
+	C() <-chan time.Time
+}
+
+type legacyClock struct {
+	timer legacyTimer
+}
+
+func (legacyClock) Now() time.Time {
+	return time.Now()
+}
+
+func (c legacyClock) NewTimer(d time.Duration) Timer {
+	c.timer.Start(d)
+	return legacyTimerAdapter{timer: c.timer}
+}
+
+type legacyTimerAdapter struct {
+	timer legacyTimer
+}
+
+func (t legacyTimerAdapter) C() <-chan time.Time {
+	return t.timer.C()
+}
+
+func (t legacyTimerAdapter) Stop() bool {
+	t.timer.Stop()
+	return true
+}
+
+func withTimer(t legacyTimer) RetryOption {
+	return WithClock(legacyClock{timer: t})
+}
+
 func TestRetry(t *testing.T) {
 	const successOn = 3
 	var i = 0

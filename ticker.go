@@ -13,10 +13,14 @@ type Ticker struct {
 	C        <-chan time.Time
 	c        chan time.Time
 	b        BackOff
-	timer    timer
+	clock    Clock
 	stop     chan struct{}
 	stopOnce sync.Once
 }
+
+// TickerOption configures a Ticker. It is an alias for RetryOption so that
+// shared time options, notably WithClock, can be used by both.
+type TickerOption = RetryOption
 
 // NewTicker returns a new Ticker containing a channel that will send
 // the time at times specified by the BackOff argument. Ticker is
@@ -24,13 +28,21 @@ type Ticker struct {
 // method is called or BackOff stops. It is not safe to manipulate the
 // provided backoff policy (notably calling NextBackOff or Reset)
 // while the ticker is running.
-func NewTicker(b BackOff) *Ticker {
+func NewTicker(b BackOff, opts ...TickerOption) *Ticker {
+	args := &retryOptions{Clock: SystemClock{}}
+	for _, opt := range opts {
+		opt(args)
+	}
+	if args.Clock == nil {
+		args.Clock = SystemClock{}
+	}
+
 	c := make(chan time.Time)
 	t := &Ticker{
 		C:     c,
 		c:     c,
 		b:     b,
-		timer: &defaultTimer{},
+		clock: args.Clock,
 		stop:  make(chan struct{}),
 	}
 	t.b.Reset()
@@ -48,24 +60,20 @@ func (t *Ticker) run() {
 	defer close(c)
 
 	// Ticker is guaranteed to tick at least once.
-	afterC := t.send(time.Now())
+	afterTimer := t.send(t.clock.Now())
 
-	for {
-		if afterC == nil {
-			return
-		}
-
+	for afterTimer != nil {
 		select {
-		case tick := <-afterC:
-			afterC = t.send(tick)
+		case tick := <-afterTimer.C():
+			afterTimer = t.send(tick)
 		case <-t.stop:
-			t.c = nil // Prevent future ticks from being sent to the channel.
+			afterTimer.Stop()
 			return
 		}
 	}
 }
 
-func (t *Ticker) send(tick time.Time) <-chan time.Time {
+func (t *Ticker) send(tick time.Time) Timer {
 	select {
 	case t.c <- tick:
 	case <-t.stop:
@@ -78,6 +86,5 @@ func (t *Ticker) send(tick time.Time) <-chan time.Time {
 		return nil
 	}
 
-	t.timer.Start(next)
-	return t.timer.C()
+	return t.clock.NewTimer(next)
 }
