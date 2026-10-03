@@ -39,6 +39,7 @@ type Stream struct {
 	pool             pool.Pool
 	callbackerHandle conc.WaitGroup
 	queue            chan callbackCh
+	pending          chan struct{}
 
 	initOnce sync.Once
 }
@@ -61,6 +62,14 @@ type Callback func()
 // started.
 func (s *Stream) Go(f Task) {
 	s.init()
+
+	// Acquire a slot in the pending window before accepting the task.
+	// This applies backpressure to the submitter rather than to a worker,
+	// so a worker running the head task can never deadlock waiting for a
+	// slot that only the callbacker can free.
+	if s.pending != nil {
+		s.pending <- struct{}{}
+	}
 
 	// Get a channel from the cache.
 	ch := getCh()
@@ -107,6 +116,22 @@ func (s *Stream) WithMaxGoroutines(n int) *Stream {
 	return s
 }
 
+// WithMaxPending limits the number of tasks that have been submitted but
+// whose callbacks have not yet been delivered. This bounds the memory held
+// by completed callbacks that are still waiting for earlier callbacks to
+// run, independently of the number of worker goroutines. Defaults to
+// unlimited. Panics if n < 1 or if the stream has already been used.
+func (s *Stream) WithMaxPending(n int) *Stream {
+	if s.queue != nil {
+		panic("stream can not be reconfigured after calling Go() for the first time")
+	}
+	if n < 1 {
+		panic("max pending in a stream must be greater than zero")
+	}
+	s.pending = make(chan struct{}, n)
+	return s
+}
+
 func (s *Stream) init() {
 	s.initOnce.Do(func() {
 		s.queue = make(chan callbackCh, s.pool.MaxGoroutines()+1)
@@ -134,6 +159,13 @@ func (s *Stream) callbacker() {
 
 		// Return the channel to the pool of unused channels.
 		putCh(callbackCh)
+
+		// Release the pending slot. This runs even if the callback
+		// panicked, since Try recovers it, and also for tasks that
+		// panicked, since they deliver an empty callback.
+		if s.pending != nil {
+			<-s.pending
+		}
 	}
 }
 

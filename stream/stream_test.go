@@ -133,6 +133,94 @@ func TestStream(t *testing.T) {
 		}
 		require.Panics(t, s.Wait)
 	})
+
+	t.Run("max pending limits in-flight callbacks", func(t *testing.T) {
+		t.Parallel()
+		const maxPending = 4
+		s := stream.New().WithMaxGoroutines(8).WithMaxPending(maxPending)
+
+		release := make(chan struct{})
+		var inFlight atomic.Int64
+		var maxInFlight atomic.Int64
+		recordStart := func() {
+			cur := inFlight.Add(1)
+			for {
+				max := maxInFlight.Load()
+				if cur <= max || maxInFlight.CompareAndSwap(max, cur) {
+					break
+				}
+			}
+		}
+
+		// The head task blocks until released, so no callback can be
+		// delivered and the pending window fills up.
+		s.Go(func() stream.Callback {
+			<-release
+			return func() {}
+		})
+
+		// Submit from a separate goroutine since Go() blocks once the
+		// pending window is full.
+		submitted := make(chan struct{})
+		go func() {
+			defer close(submitted)
+			for i := 0; i < 100; i++ {
+				s.Go(func() stream.Callback {
+					recordStart()
+					// A large closure that would waste memory if too
+					// many completed callbacks piled up undelivered.
+					big := make([]byte, 1<<20)
+					return func() {
+						_ = big
+						inFlight.Add(-1)
+					}
+				})
+			}
+		}()
+
+		// Let the window fill while the head task is blocked.
+		time.Sleep(100 * time.Millisecond)
+		close(release)
+		<-submitted
+		s.Wait()
+
+		require.Greater(t, maxInFlight.Load(), int64(0))
+		require.LessOrEqual(t, maxInFlight.Load(), int64(maxPending))
+	})
+
+	t.Run("task panic releases pending window", func(t *testing.T) {
+		t.Parallel()
+		s := stream.New().WithMaxPending(1)
+		s.Go(func() stream.Callback {
+			panic("something really bad happened in the task")
+		})
+		// These would block forever if the panicking task did not
+		// release its pending slot.
+		for i := 0; i < 10; i++ {
+			s.Go(func() stream.Callback {
+				return func() {}
+			})
+		}
+		require.Panics(t, s.Wait)
+	})
+
+	t.Run("callback panic releases pending window", func(t *testing.T) {
+		t.Parallel()
+		s := stream.New().WithMaxPending(1)
+		s.Go(func() stream.Callback {
+			return func() {
+				panic("something really bad happened in the callback")
+			}
+		})
+		// These would block forever if the panicking callback did not
+		// release its pending slot.
+		for i := 0; i < 10; i++ {
+			s.Go(func() stream.Callback {
+				return func() {}
+			})
+		}
+		require.Panics(t, s.Wait)
+	})
 }
 
 func BenchmarkStream(b *testing.B) {
