@@ -89,6 +89,14 @@ var errorBadMAC = newTokenError(fmt.Errorf("bad message authentication code"))
 
 var errorKeyInvalid = fmt.Errorf("key was not valid")
 
+var errorKeySetSizeInvalid = fmt.Errorf("key set size limit must be at least 1")
+var errorKeySetFull = fmt.Errorf("key set already contains the maximum number of keys")
+var errorKeySetDuplicateID = fmt.Errorf("key set already contains a key with this ID")
+var errorKeySetKeyIDEmpty = fmt.Errorf("key set key ID must not be empty")
+var errorKeySetInvalidWindow = fmt.Errorf("key activation window is invalid: notBefore must be before notAfter")
+var errorKeySetNoActiveKeys = newTokenError(fmt.Errorf("no keys in the key set are currently active"))
+var errorKeySetNoKeyVerified = newTokenError(fmt.Errorf("token could not be verified with any key in the key set"))
+
 func errorDecrypt(err error) error {
 	return fmt.Errorf("the message could not be decrypted: %w", newTokenError(err))
 }
