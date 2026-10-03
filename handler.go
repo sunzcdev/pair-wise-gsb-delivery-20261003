@@ -63,6 +63,7 @@ type CSRFHandler struct {
 
 	isTLS           func(r *http.Request) bool
 	isAllowedOrigin func(r *url.URL) bool
+	originPolicy    OriginPolicy
 }
 
 func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +193,10 @@ func (h *CSRFHandler) ensureSameOrigin(r *http.Request) error {
 	isTLS := h.isTLS(r)
 	if isTLS {
 		selfOrigin.Scheme = "https"
+	}
+
+	if h.originPolicy == OriginPolicyStrict {
+		return h.ensureSameOriginStrict(selfOrigin, r)
 	}
 
 	secFetchSite := r.Header.Get("Sec-Fetch-Site")

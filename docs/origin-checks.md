@@ -15,6 +15,8 @@ and how users can avoid potential breakage.
 * [How does nosurf check the origin?](#how-does-nosurf-check-the-origin)
     * [1. `Sec-Fetch-Site` header](#1-sec-fetch-site-header)
     * [2. `Origin` or `Referer` headers](#2-origin-or-referer-headers)
+* [Strict origin policy](#strict-origin-policy)
+    * [Decision table](#decision-table)
 * [What do I need to do after upgrading to 1.2.0?](#what-do-i-need-to-do-after-upgrading-to-120)
 * [What are the risks of not upgrading to 1.2.0?](#what-are-the-risks-of-not-upgrading-to-120)
 
@@ -59,6 +61,75 @@ In the unlikely case where `Origin` header does not exist,
 nosurf will perform the same validations documented above on the `Referer` header.
 
 In the very unlikely case that no `Referer` header is present either, the request will be aborted.
+
+## Strict origin policy
+
+By default, nosurf uses the backwards-compatible policy (`OriginPolicyCompat`) described above:
+`Sec-Fetch-Site: same-origin` short-circuits the check,
+and the `Origin` and `Referer` headers are evaluated independently of each other and of `Sec-Fetch-Site`.
+
+Optionally, a strict policy can be enabled:
+
+```go
+h := nosurf.New(handler)
+h.SetOriginPolicy(nosurf.OriginPolicyStrict)
+```
+
+Under the strict policy, all origin evidence on the request is cross-checked,
+and requests carrying contradictory or ambiguous evidence are rejected:
+
+* Duplicate `Sec-Fetch-Site`, `Origin` or `Referer` headers are rejected with `ErrAmbiguousOriginHeaders`.
+* `Origin: null` (an opaque origin, e.g. a sandboxed iframe) is rejected with `ErrNullOrigin`
+  instead of being treated as a missing header.
+* A `Sec-Fetch-Site` value other than `same-origin`, `same-site`, `cross-site` or `none`
+  is rejected with `ErrUnknownSecFetchSite` (fail closed).
+* `Sec-Fetch-Site: same-site` and `Sec-Fetch-Site: cross-site` are only allowed
+  when the `Origin` (or `Referer`) is explicitly allowed via `SetIsAllowedOriginFunc`;
+  otherwise the request is rejected with `ErrCrossSiteFetch`.
+* Evidence that contradicts the `Sec-Fetch-Site` classification
+  (e.g. `Sec-Fetch-Site: same-origin` together with a cross-origin `Origin`,
+  or a matching `Origin` together with a cross-origin `Referer`)
+  is rejected with `ErrConflictingOrigin`.
+
+The CSRF token check is unaffected by this setting:
+it always runs as an independent step after the origin check.
+
+### Decision table
+
+The strict policy first classifies the `Sec-Fetch-Site` header,
+then merges the `Origin`/`Referer` evidence into a single verdict
+(`Origin` takes precedence over `Referer`, mirroring the compat policy).
+"same-origin" means the header matches the self-origin,
+"allowed" means it was accepted by the `SetIsAllowedOriginFunc` delegate.
+
+| `Sec-Fetch-Site` | Origin/Referer evidence | Decision            | Rejection reason          |
+|------------------|-------------------------|---------------------|---------------------------|
+| `same-origin`    | absent                  | allow               |                           |
+| `same-origin`    | same-origin             | allow               |                           |
+| `same-origin`    | allowed                 | reject              | `ErrConflictingOrigin`    |
+| `same-site`      | absent                  | reject              | `ErrCrossSiteFetch`       |
+| `same-site`      | same-origin             | reject              | `ErrConflictingOrigin`    |
+| `same-site`      | allowed                 | allow               |                           |
+| `cross-site`     | absent                  | reject              | `ErrCrossSiteFetch`       |
+| `cross-site`     | same-origin             | reject              | `ErrConflictingOrigin`    |
+| `cross-site`     | allowed                 | allow               |                           |
+| `none`           | absent                  | allow               |                           |
+| `none`           | same-origin             | allow               |                           |
+| `none`           | allowed                 | reject              | `ErrConflictingOrigin`    |
+| *(missing)*      | absent                  | reject              | `ErrNoReferer`            |
+| *(missing)*      | same-origin             | allow               |                           |
+| *(missing)*      | allowed                 | allow               |                           |
+| *(unknown)*      | any                     | reject              | `ErrUnknownSecFetchSite`  |
+
+Independently of the table above, the strict policy rejects the request before consulting it when:
+
+| Condition                                             | Rejection reason             |
+|-------------------------------------------------------|------------------------------|
+| Any of the three headers is present more than once    | `ErrAmbiguousOriginHeaders`  |
+| `Origin: null`                                        | `ErrNullOrigin`              |
+| `Origin` is present, cross-origin and not allowed     | `ErrBadOrigin`               |
+| `Origin` is absent, `Referer` cross-origin, not allowed | `ErrBadReferer`            |
+| `Origin` checks out, but `Referer` is cross-origin and not allowed | `ErrConflictingOrigin` |
 
 ## What do I need to do after upgrading to 1.2.0?
 
