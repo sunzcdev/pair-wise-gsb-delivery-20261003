@@ -131,6 +131,58 @@ func main() {
 ```
 
 
+## Proxy Authentication (407)
+
+Proxy credentials are configured separately from the origin credentials. When
+the forward proxy answers `407 Proxy Authentication Required` with a
+`Proxy-Authenticate` digest challenge, the transport retries with a
+`Proxy-Authorization` header. The proxy handshake is completely independent of
+the origin handshake: they use separate credentials, challenge caches, nonce
+counters and retry budgets. A single request may first be challenged by the
+proxy (`407`) and afterwards by the origin (`401`).
+
+Proxy digest credentials use the absolute-form request target
+(`http://example.com/path`), while origin credentials use the origin-form
+(`/path`). Only ordinary (non-tunneled) forwarding is handled: HTTPS requests
+that use `CONNECT` are not authenticated with digest.
+
+``` go
+package main
+
+import (
+	"net/http"
+	"net/url"
+
+	"github.com/icholy/digest"
+)
+
+func main() {
+	proxyURL, _ := url.Parse("http://proxy.local:3128")
+	client := &http.Client{
+		Transport: &digest.Transport{
+			// origin credentials (WWW-Authenticate / Authorization)
+			Username: "foo",
+			Password: "bar",
+			// proxy credentials (Proxy-Authenticate / Proxy-Authorization)
+			ProxyUsername: "proxyuser",
+			ProxyPassword: "proxypass",
+			// optional: mirrors http.Transport.Proxy and selects the proxy
+			// per request. Requests routed direct skip proxy authentication.
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+	res, err := client.Get("http://example.com/secret")
+	if err != nil {
+		panic(err)
+	}
+	defer res.Body.Close()
+}
+```
+
+If a challenged request body cannot be replayed (its `GetBody` fails), the
+request fails with `digest.ErrBodyNotReplayable` rather than being resent with
+an empty body.
+
 ## Large Request Bodies (Probe)
 
 By default the first (unauthenticated) request already carries the body, because

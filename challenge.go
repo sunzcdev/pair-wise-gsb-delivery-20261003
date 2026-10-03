@@ -126,13 +126,13 @@ func (c *Challenge) String() string {
 	return Prefix + param.Format(pp...)
 }
 
-// ErrNoChallenge indicates that no WWW-Authenticate headers were found.
+// ErrNoChallenge indicates that no authenticate headers were found.
 var ErrNoChallenge = errors.New("digest: no challenge found")
 
-// FindChallenge returns the first supported challenge in the headers
-func FindChallenge(h http.Header) (*Challenge, error) {
+// findChallenge returns the first supported challenge in the provided header values.
+func findChallenge(headers []string) (*Challenge, error) {
 	var last error
-	for _, header := range h.Values("WWW-Authenticate") {
+	for _, header := range headers {
 		if !IsDigest(header) {
 			continue
 		}
@@ -148,4 +148,14 @@ func FindChallenge(h http.Header) (*Challenge, error) {
 		return nil, last
 	}
 	return nil, ErrNoChallenge
+}
+
+// FindChallenge returns the first supported challenge in the WWW-Authenticate headers.
+func FindChallenge(h http.Header) (*Challenge, error) {
+	return findChallenge(h.Values("WWW-Authenticate"))
+}
+
+// FindProxyChallenge returns the first supported challenge in the Proxy-Authenticate headers.
+func FindProxyChallenge(h http.Header) (*Challenge, error) {
+	return findChallenge(h.Values("Proxy-Authenticate"))
 }

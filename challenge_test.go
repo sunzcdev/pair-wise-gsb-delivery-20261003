@@ -85,6 +85,30 @@ func TestFindChallenge_NotFound(t *testing.T) {
 	}
 }
 
+func TestFindProxyChallenge(t *testing.T) {
+	bad := &Challenge{
+		Realm:     "test",
+		Nonce:     "kvjkdfjs",
+		Algorithm: "MD5-sess",
+		QOP:       []string{"auth"},
+	}
+	good := &Challenge{
+		Realm:     "test",
+		Nonce:     "jgdfsijdfisd",
+		Algorithm: "MD5",
+		QOP:       []string{"auth"},
+	}
+	headers := http.Header{}
+	headers.Add("Proxy-Authenticate", bad.String())
+	headers.Add("Proxy-Authenticate", good.String())
+	chal, err := FindProxyChallenge(headers)
+	assert.NilError(t, err)
+	assert.DeepEqual(t, chal, good)
+	// proxy and origin challenges are read from distinct headers
+	_, err = FindProxyChallenge(http.Header{})
+	assert.Assert(t, errors.Is(err, ErrNoChallenge))
+}
+
 var challengeResult *Challenge
 
 func BenchmarkParseChallenge(b *testing.B) {

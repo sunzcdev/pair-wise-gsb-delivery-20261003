@@ -2,10 +2,17 @@ package digest
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sync"
 )
+
+// ErrBodyNotReplayable is returned when a challenge requires the request to be
+// replayed but its body cannot be produced again. The request is never sent
+// with an empty body in this case.
+var ErrBodyNotReplayable = errors.New("digest: request body is not replayable")
 
 // cchal is a cached challenge and the number of times it's been used.
 type cchal struct {
@@ -18,9 +25,26 @@ type Transport struct {
 	Username string
 	Password string
 
+	// ProxyUsername and ProxyPassword are the credentials used in response to
+	// a proxy's 407 Proxy Authentication Required challenge. They are kept
+	// separate from the origin credentials and cached independently.
+	//
+	// Proxy, if non-nil, reports the proxy used for a request. It mirrors
+	// http.Transport.Proxy: proxy authentication is only attempted when a
+	// proxy is configured for the request, and the proxy challenge cache is
+	// keyed by the proxy host. When Proxy is nil, proxy authentication is
+	// attempted for every request and the cache is keyed by the target host.
+	ProxyUsername string
+	ProxyPassword string
+	Proxy         func(*http.Request) (*url.URL, error)
+
 	// Digest computes the digest credentials.
 	// If nil, the Digest function is used.
 	Digest func(*http.Request, *Challenge, Options) (*Credentials, error)
+
+	// ProxyDigest computes the digest credentials for a proxy challenge.
+	// If nil, Digest is used; if that is also nil, the Digest function is used.
+	ProxyDigest func(*http.Request, *Challenge, Options) (*Credentials, error)
 
 	// FindChallenge extracts the challenge from the request headers.
 	// If nil, the FindChallenge function is used.
@@ -50,45 +74,120 @@ type Transport struct {
 	// unauthenticated request without draining the body. Applies only when uncached.
 	Probe bool
 
-	// cache of challenges indexed by host
-	cache   map[string]*cchal
-	cacheMu sync.Mutex
+	// origin challenges (WWW-Authenticate / Authorization), indexed by origin host
+	// proxy challenges (Proxy-Authenticate / Proxy-Authorization), indexed by
+	// proxy host (or target host when no Proxy selector is configured)
+	cache      map[string]*cchal
+	proxyCache map[string]*cchal
+	cacheMu    sync.Mutex
 }
 
-// save parses the digest challenge from the response
-// and adds it to the cache
-func (t *Transport) save(res *http.Response) error {
-	// save cookies
-	if t.Jar != nil {
-		t.Jar.SetCookies(res.Request.URL, res.Cookies())
+// proxyConfigured reports whether proxy authentication should be attempted
+// for the request and returns the cache key for the proxy challenge.
+//
+// Proxy authentication is opt-in: it is active when proxy credentials are
+// explicitly configured and/or when a Proxy selector is present. With neither
+// configured, 407 responses pass through untouched, preserving the
+// non-proxy behavior.
+func (t *Transport) proxyConfigured(req *http.Request) (string, bool, error) {
+	credsSet := t.ProxyUsername != "" || t.ProxyPassword != ""
+	if t.Proxy == nil {
+		if !credsSet {
+			return "", false, nil
+		}
+		// No selector but explicit credentials: attempt proxy auth for every
+		// request and key the proxy challenge cache by the target host.
+		return req.URL.Hostname(), true, nil
 	}
-	// find and save digest challenge
-	find := t.FindChallenge
-	if find == nil {
-		find = FindChallenge
+	proxyURL, err := t.Proxy(req)
+	if err != nil {
+		return "", false, err
 	}
-	chal, err := find(res.Header)
-	t.cacheMu.Lock()
-	defer t.cacheMu.Unlock()
+	if proxyURL == nil {
+		return "", false, nil
+	}
+	if !credsSet {
+		// A proxy is selected but no digest credentials were configured:
+		// leave the handshake to the underlying transport.
+		return "", false, nil
+	}
+	return proxyURL.Hostname(), true, nil
+}
+
+// layerCache returns the challenge cache for the specified authentication layer.
+func (t *Transport) layerCache(proxy bool) map[string]*cchal {
 	if t.cache == nil {
 		t.cache = map[string]*cchal{}
 	}
-	// TODO: if the challenge contains a domain, we should be using that
-	//       to match against outgoing requests. We're currently ignoring
-	//       it and just matching the hostname. That being said, none of
-	//       the major browsers respect the domain either.
-	host := res.Request.URL.Hostname()
+	if !proxy {
+		return t.cache
+	}
+	if t.proxyCache == nil {
+		t.proxyCache = map[string]*cchal{}
+	}
+	return t.proxyCache
+}
+
+// cachedChallenge returns a cached challenge and its use count for the provided host.
+func (t *Transport) cachedChallenge(host string, proxy bool) (*Challenge, int, bool) {
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+	cache := t.layerCache(proxy)
+	cc, ok := cache[host]
+	if !ok {
+		return nil, 0, false
+	}
+	if t.NoReuse {
+		delete(cache, host)
+	}
+	cc.n++
+	return cc.c, cc.n, true
+}
+
+// storeChallenge saves a challenge for the provided host.
+func (t *Transport) storeChallenge(host string, chal *Challenge, proxy bool) {
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+	t.layerCache(proxy)[host] = &cchal{c: chal}
+}
+
+// dropChallenge removes the cached challenge for the provided host. It is used
+// when a cached challenge fails to authenticate again.
+func (t *Transport) dropChallenge(host string, proxy bool) {
+	t.cacheMu.Lock()
+	defer t.cacheMu.Unlock()
+	delete(t.layerCache(proxy), host)
+}
+
+// saveChallenge parses the challenge from the response and caches it for the
+// corresponding authentication layer.
+func (t *Transport) saveChallenge(header http.Header, proxy bool, key string) error {
+	find := t.findChallengeFunc(proxy)
+	chal, err := find(header)
 	if err != nil {
 		// if save is being invoked, the existing cached challenge didn't work
-		delete(t.cache, host)
+		t.dropChallenge(key, proxy)
 		return err
 	}
-	t.cache[host] = &cchal{c: chal}
+	t.storeChallenge(key, chal, proxy)
 	return nil
 }
 
-// digest creates credentials from the cached challenge
-func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Credentials, error) {
+// findChallengeFunc returns the configured challenge finder for the layer.
+func (t *Transport) findChallengeFunc(proxy bool) func(http.Header) (*Challenge, error) {
+	if proxy {
+		return FindProxyChallenge
+	}
+	if t.FindChallenge != nil {
+		return t.FindChallenge
+	}
+	return FindChallenge
+}
+
+// credentials creates digest credentials from a cached challenge.
+// Origin authentication uses the origin-form URI; proxy authentication uses
+// the absolute-form of the target that is actually forwarded.
+func (t *Transport) credentials(req *http.Request, chal *Challenge, count int, proxy bool) (*Credentials, error) {
 	opt := Options{
 		Method:   req.Method,
 		URI:      req.URL.RequestURI(),
@@ -97,123 +196,214 @@ func (t *Transport) digest(req *http.Request, chal *Challenge, count int) (*Cred
 		Username: t.Username,
 		Password: t.Password,
 	}
-	if t.Digest != nil {
-		return t.Digest(req, chal, opt)
+	digestfn := t.Digest
+	if proxy {
+		opt.Username = t.ProxyUsername
+		opt.Password = t.ProxyPassword
+		opt.URI = absoluteURI(req.URL)
+		digestfn = t.ProxyDigest
+		if digestfn == nil {
+			digestfn = t.Digest
+		}
+	}
+	if digestfn != nil {
+		return digestfn(req, chal, opt)
 	}
 	return Digest(chal, opt)
 }
 
-// challenge returns a cached challenge and count for the provided request
-func (t *Transport) challenge(req *http.Request) (*Challenge, int, bool) {
-	t.cacheMu.Lock()
-	defer t.cacheMu.Unlock()
-	host := req.URL.Hostname()
-	cc, ok := t.cache[host]
-	if !ok {
-		return nil, 0, false
-	}
-	if t.NoReuse {
-		delete(t.cache, host)
-	}
-	cc.n++
-	return cc.c, cc.n, true
-}
-
-// prepare sets the Authorization header from a cached challenge if one exists.
+// prepare adds cookies and the cached Authorization/Proxy-Authorization headers.
 // It reports whether the caller should send a bodyless probe first (Probe set,
-// request has a body, no challenge cached yet).
-func (t *Transport) prepare(req *http.Request) (bool, error) {
+// request has a body, no challenge cached for at least one active layer).
+func (t *Transport) prepare(req *http.Request, proxyAuth bool, proxyKey string) (bool, error) {
 	// add cookies
 	if t.Jar != nil {
 		for _, cookie := range t.Jar.Cookies(req.URL) {
 			req.AddCookie(cookie)
 		}
 	}
-	// add auth
-	chal, count, ok := t.challenge(req)
-	if !ok {
-		// no cached challenge yet: probe bodyless first when configured
-		bodied := req.Body != nil && req.Body != http.NoBody
-		return t.Probe && bodied, nil
+	uncached := false
+	// add origin auth
+	if chal, count, ok := t.cachedChallenge(req.URL.Hostname(), false); ok {
+		if err := t.setAuthHeader(req, chal, count, false); err != nil {
+			return false, err
+		}
+	} else {
+		uncached = true
 	}
-	cred, err := t.digest(req, chal, count)
-	if err != nil {
-		return false, err
+	// add proxy auth
+	if proxyAuth {
+		if chal, count, ok := t.cachedChallenge(proxyKey, true); ok {
+			if err := t.setAuthHeader(req, chal, count, true); err != nil {
+				return false, err
+			}
+		} else {
+			uncached = true
+		}
 	}
-	if cred != nil {
-		req.Header.Set("Authorization", cred.String())
-	}
-	return false, nil
+	bodied := req.Body != nil && req.Body != http.NoBody
+	return t.Probe && bodied && uncached, nil
 }
 
-// RoundTrip will try to authorize the request using a cached challenge.
-// If that doesn't work and we receive a 401, we'll try again using that challenge.
+func (t *Transport) setAuthHeader(req *http.Request, chal *Challenge, count int, proxy bool) error {
+	cred, err := t.credentials(req, chal, count, proxy)
+	if err != nil {
+		return err
+	}
+	if cred != nil {
+		if proxy {
+			req.Header.Set("Proxy-Authorization", cred.String())
+		} else {
+			req.Header.Set("Authorization", cred.String())
+		}
+	}
+	return nil
+}
+
+// absoluteURI returns the absolute-form request target used when forwarding
+// a request to a proxy: scheme://host + origin-form path?query.
+func absoluteURI(u *url.URL) string {
+	var b bytes.Buffer
+	b.WriteString(u.Scheme)
+	b.WriteString("://")
+	b.WriteString(u.Host)
+	if r := u.RequestURI(); r != "" && r[0] != '/' {
+		b.WriteByte('/')
+	}
+	b.WriteString(u.RequestURI())
+	return b.String()
+}
+
+// RoundTrip sends the request using cached challenges where available. A 407
+// (Proxy Authentication Required) is answered with Proxy-Authorization and a
+// 401 (Unauthorized) with Authorization. The two layers have independent
+// challenges, caches, nonce counters and retry budgets: a single logical
+// request can be challenged by the proxy and then by the origin, but each
+// layer is retried at most once, so the handling always terminates.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// use the configured transport if there is one
 	tr := t.Transport
 	if tr == nil {
 		tr = http.DefaultTransport
 	}
-	// don't modify the original request
+	// determine whether proxy authentication is in play for this request
+	proxyKey, proxyAuth, err := t.proxyConfigured(req)
+	if err != nil {
+		return nil, err
+	}
+	// don't modify the original request or its headers. The cloner also
+	// guarantees the body can be replayed; if it cannot, fail explicitly
+	// instead of silently sending an empty request.
 	clone, err := cloner(req)
 	if err != nil {
-		return nil, err
+		return nil, errors.Join(ErrBodyNotReplayable, err)
 	}
-	// make a copy of the request
-	first, err := clone()
-	if err != nil {
-		return nil, err
-	}
-	// prepare the first request using a cached challenge
-	probe, err := t.prepare(first)
-	if err != nil {
-		return nil, err
-	}
-	// probe bodyless so the body is only streamed on the authenticated retry
-	if probe {
-		first.Body = nil
-		first.ContentLength = 0
-		first.GetBody = nil
-	}
-	// the first request will either succeed or return a 401
-	res, err := tr.RoundTrip(first)
-	if err != nil {
-		return res, err
-	}
-	if res.StatusCode != http.StatusUnauthorized {
-		if !probe {
-			return res, nil
+	// each authentication layer gets at most one challenge-driven retry
+	retried := map[authLayer]bool{}
+	var probe bool
+	for {
+		cur, err := clone()
+		if err != nil {
+			return nil, errors.Join(ErrBodyNotReplayable, err)
 		}
-		// a probe response isn't valid for the caller since the body was
-		// stripped; discard it and send the real request as-is
-		_, _ = io.Copy(io.Discard, res.Body)
-		_ = res.Body.Close()
-		second, err := clone()
+		probe, err = t.prepare(cur, proxyAuth, proxyKey)
 		if err != nil {
 			return nil, err
 		}
-		return tr.RoundTrip(second)
-	}
-	// drain and close the first message body
-	_, _ = io.Copy(io.Discard, res.Body)
-	_ = res.Body.Close()
-	// save the challenge for future use
-	if err := t.save(res); err != nil {
-		if err == ErrNoChallenge {
+		// probe bodyless so the real body is only streamed on a request that
+		// already carries credentials for every layer that challenged us
+		if probe {
+			stripBody(cur)
+		}
+		res, err := tr.RoundTrip(cur)
+		if err != nil {
+			return res, err
+		}
+		layer, challenged := challengeLayer(res.StatusCode, proxyAuth)
+		// a bodyless probe is not a valid caller response: if it was not
+		// challenged, discard it and send the real request exactly as prepared
+		if probe && !challenged {
+			drainBody(res)
+			return t.sendAsPrepared(tr, clone, proxyAuth, proxyKey)
+		}
+		if !challenged || retried[layer] {
+			// success, or a repeated challenge from a layer whose budget is
+			// spent: return the response unchanged
 			return res, nil
 		}
-		return nil, err
+		// drain and close the challenge response body
+		drainBody(res)
+		// save cookies from origin challenge responses
+		if layer == originLayer && t.Jar != nil {
+			t.Jar.SetCookies(cur.URL, res.Cookies())
+		}
+		key := req.URL.Hostname()
+		if layer == proxyLayer {
+			key = proxyKey
+		}
+		if err := t.saveChallenge(res.Header, layer == proxyLayer, key); err != nil {
+			if err == ErrNoChallenge {
+				return res, nil
+			}
+			return nil, err
+		}
+		retried[layer] = true
 	}
-	// make a second copy of the request
-	second, err := clone()
+}
+
+// sendAsPrepared sends a fresh clone with cookies and cached credentials but
+// with the real body intact, used after a bodyless probe was not challenged.
+func (t *Transport) sendAsPrepared(
+	tr http.RoundTripper,
+	clone func() (*http.Request, error),
+	proxyAuth bool,
+	proxyKey string,
+) (*http.Response, error) {
+	cur, err := clone()
 	if err != nil {
+		return nil, errors.Join(ErrBodyNotReplayable, err)
+	}
+	if _, err := t.prepare(cur, proxyAuth, proxyKey); err != nil {
 		return nil, err
 	}
-	// prepare the second request based on the new challenge
-	if _, err := t.prepare(second); err != nil {
-		return nil, err
+	return tr.RoundTrip(cur)
+}
+
+type authLayer int
+
+const (
+	originLayer authLayer = iota
+	proxyLayer
+)
+
+// challengeLayer maps a response status to an authentication layer. It reports
+// false for statuses that are not challenges (including 407 when proxy
+// authentication is not configured).
+func challengeLayer(status int, proxyAuth bool) (authLayer, bool) {
+	switch status {
+	case http.StatusProxyAuthRequired:
+		if !proxyAuth {
+			return originLayer, false
+		}
+		return proxyLayer, true
+	case http.StatusUnauthorized:
+		return originLayer, true
+	default:
+		return originLayer, false
 	}
-	return tr.RoundTrip(second)
+}
+
+// stripBody removes the body from a probe request.
+func stripBody(req *http.Request) {
+	req.Body = nil
+	req.ContentLength = 0
+	req.GetBody = nil
+}
+
+// drainBody reads and discards the response body so the connection can be reused.
+func drainBody(res *http.Response) {
+	_, _ = io.Copy(io.Discard, res.Body)
+	_ = res.Body.Close()
 }
 
 // CloseIdleConnections delegates the call to the underlying transport.
