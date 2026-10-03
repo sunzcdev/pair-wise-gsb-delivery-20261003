@@ -75,6 +75,27 @@ representation.
 [tlt]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#LocalTime
 [tldt]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#LocalDateTime
 
+### JSON Schema inference
+
+[`InferJSONSchema`][infer-json-schema] reads multiple complete TOML examples and
+returns a deterministic JSON Schema 2020-12 draft. It uses objects and
+`required`, arrays and `items`, scalar `type`, and `anyOf` for values that
+differ between examples. Object members present in every example at a path are
+required; array-table and inline-array members are merged together. Empty
+arrays remain arrays without an inferred element schema.
+
+TOML local dates, local times, local date-times, and offset date-times are
+represented as JSON strings with `x-toml-type` set to `local-date`,
+`local-time`, `local-date-time`, or `offset-date-time`, respectively.
+Inference does not add bounds, patterns, defaults, or other business
+constraints; examples alone cannot prove that a configuration is complete.
+
+```go
+schema, err := toml.InferJSONSchema(firstExample, secondExample)
+```
+
+[infer-json-schema]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#InferJSONSchema
+
 ### Commented config
 
 Since TOML is often used for configuration files, go-toml can emit documents
