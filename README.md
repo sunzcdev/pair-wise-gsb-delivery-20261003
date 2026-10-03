@@ -256,6 +256,40 @@ output.
 
 [unstable-rawmessage]: https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable#RawMessage
 
+### Decode metadata
+
+[`Decoder.WithMetadata`][enable-metadata] optionally collects the source of
+every value that is actually assigned while decoding, into an
+[`unstable.Metadata`][unstable-metadata]. Each
+[`unstable.Location`][unstable-location] carries:
+
+- the full path of the assigned Go destination, as struct field names (not
+  TOML tags) and array indexes;
+- the original TOML key path, as a slice so that a quoted key containing
+  dots (`"a.b"`) stays a single part;
+- the byte range(s) of the source in the input document.
+
+Elements of TOML array tables are distinguished by an index segment. Fields
+absent from the document produce no location. A value handled by a custom
+[`unstable.Unmarshaler`][unstable-unmarshaler] yields one location whose
+ranges cover every chunk of raw TOML passed to `UnmarshalTOML` (for example
+the several sections of a split table). The same document decoded into a
+struct and into a map reports identical TOML key paths and byte ranges for
+their common keys.
+
+```go
+m := unstable.NewMetadata()
+err := toml.NewDecoder(r).WithMetadata(m).Decode(&cfg)
+if loc, ok := m.LookupKey("server", "host"); ok {
+    r := loc.Range
+    fmt.Printf("server.host comes from bytes %d:%d\n", r.Offset, r.Offset+r.Length)
+}
+```
+
+[enable-metadata]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Decoder.WithMetadata
+[unstable-metadata]: https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable#Metadata
+[unstable-location]: https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable#Location
+
 ### Document editing
 
 The `unstable/edit` package modifies TOML documents in place while preserving

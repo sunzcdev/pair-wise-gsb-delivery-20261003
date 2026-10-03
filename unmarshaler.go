@@ -23,8 +23,9 @@ var decoderPool = sync.Pool{
 	New: func() interface{} { return &decoder{} },
 }
 
-func getDecoder(strictMode, unmarshalerInterface bool) *decoder {
+func getDecoder(strictMode, unmarshalerInterface bool, metadata *unstable.Metadata) *decoder {
 	d := decoderPool.Get().(*decoder)
+	d.meta = newMetaRecorder(metadata)
 	d.reset()
 	d.strict.Enabled = strictMode
 	d.unmarshalerInterface = unmarshalerInterface
@@ -32,6 +33,7 @@ func getDecoder(strictMode, unmarshalerInterface bool) *decoder {
 }
 
 func putDecoder(d *decoder) {
+	d.meta = nil
 	decoderPool.Put(d)
 }
 
@@ -57,19 +59,31 @@ func (d *decoder) reset() {
 			*p = 0
 		}
 	}
+	if len(d.headerCounts) > 1<<14 {
+		d.headerCounts = nil
+	} else {
+		for k := range d.headerCounts {
+			d.headerCounts[k] = 0
+		}
+	}
 	d.tableTarget = reflect.Value{}
 	d.tableTargetValid = false
 	d.tableFlush = d.tableFlush[:0]
 	d.tableParentSlot = slotWriter{}
 	d.keyParts = d.keyParts[:0]
 	d.strict.Reset()
+	if d.meta != nil {
+		d.meta.reset()
+	}
+	d.metaGoPrefix = d.metaGoPrefix[:0]
+	d.metaTomlPrefix = d.metaTomlPrefix[:0]
 }
 
 // Unmarshal deserializes a TOML document into a Go value.
 //
 // It is a shortcut for Decoder.Decode() with the default options.
 func Unmarshal(data []byte, v interface{}) error {
-	d := getDecoder(false, false)
+	d := getDecoder(false, false, nil)
 	err := d.unmarshal(data, v)
 	putDecoder(d)
 	return err
@@ -85,6 +99,9 @@ type Decoder struct {
 
 	// toggles unmarshaler interface
 	unmarshalerInterface bool
+
+	// optional collector for the source location of each assigned field
+	metadata *unstable.Metadata
 }
 
 // NewDecoder creates a new Decoder that will read from r.
@@ -124,6 +141,27 @@ func (d *Decoder) DisallowUnknownFields() *Decoder {
 // issued.
 func (d *Decoder) EnableUnmarshalerInterface() *Decoder {
 	d.unmarshalerInterface = true
+	return d
+}
+
+// WithMetadata enables the collection of decode metadata: after Decode, m
+// holds the location (full Go field path, original TOML key path, and byte
+// ranges in the source document) of every value that was actually assigned.
+// Fields absent from the document produce no location.
+//
+// Elements of TOML array tables are distinguished by an index segment in the
+// field path. Values handed to a type implementing the unstable.Unmarshaler
+// interface are recorded as a single location whose ranges cover every chunk
+// of raw TOML passed to UnmarshalTOML (a split table yields several ranges).
+//
+// The same document decoded into a struct and into a map produces matching
+// TOML key paths for their common keys.
+//
+// *Unstable:* The shape of m and of this option do not follow the
+// compatibility guarantees of semver. They can change or be removed without a
+// new major version being issued.
+func (d *Decoder) WithMetadata(m *unstable.Metadata) *Decoder {
+	d.metadata = m
 	return d
 }
 
@@ -174,7 +212,7 @@ func (d *Decoder) Decode(v interface{}) error {
 		return fmt.Errorf("toml: %w", err)
 	}
 
-	dec := getDecoder(d.strict, d.unmarshalerInterface)
+	dec := getDecoder(d.strict, d.unmarshalerInterface, d.metadata)
 	err = dec.unmarshal(b, v)
 	putDecoder(dec)
 	return err
@@ -218,6 +256,17 @@ type rawCapture struct {
 	// relevant.
 	indexes []int
 	buf     []byte
+	// ranges holds the source byte spans assembled into buf (the whole
+	// expression for key-values, the header key for attached tables), in
+	// order. Only populated when decode metadata is collected.
+	ranges []unstable.Range
+	// goSeg/tomlSeg are the metadata paths of the capture destination
+	// (including the array element index when relevant). Only populated when
+	// decode metadata is collected.
+	goSeg     []unstable.MetaSegment
+	tomlSeg   []string
+	arrayElem bool
+	elemIdx   int
 }
 
 type decoder struct {
@@ -259,6 +308,15 @@ type decoder struct {
 	// allocate a new key string.
 	arrayCounts map[string]*int
 
+	// headerCounts counts [[array table]] headers keyed by their NUL-joined
+	// key. It identifies the element index a header starts, before the
+	// target container is walked.
+	headerCounts map[string]int
+
+	// curHeaderIdx is the element index of the array table header currently
+	// being handled, or -1 for non-array-table expressions.
+	curHeaderIdx int
+
 	// Cached target of the current table, so that key-values do not need to
 	// walk the document structure from the root for every expression.
 	// tableFlush holds the write-backs to perform when leaving the table
@@ -287,6 +345,32 @@ type decoder struct {
 	// keyParts is the reusable buffer holding the decoded parts of the key of
 	// the current expression in the fused generic decode path.
 	keyParts [][]byte
+
+	// meta, when non-nil, collects the source location of every assigned
+	// value. metaGoPrefix/metaTomlPrefix replay the path to the cached
+	// table target (d.tableTarget), whose key-values start with an empty
+	// path.
+	meta           *metaRecorder
+	metaGoPrefix   []unstable.MetaSegment
+	metaTomlPrefix []string
+	// lastElemGo/lastElemToml are the stack depths before the last array
+	// element processed by assignArrayElem, used to restore the stack after
+	// each element.
+	lastElemGo   int
+	lastElemToml int
+	// lastElemContainer/lastElemNode describe whether the element just
+	// processed by assignArrayElem is itself a container, so the caller can
+	// record the container's own location once its contents are done.
+	lastElemContainer bool
+	lastElemNode      *unstable.Node
+	// metaLastName is the map key of the last part of an array table header:
+	// it is pushed only when the appended element is settled (the part
+	// denotes the slice itself).
+	metaLastName string
+	// metaSkip suppresses the automatic location recording of assignValue
+	// for the current value (used for array elements, which record their own
+	// index).
+	metaSkip bool
 }
 
 // slotWriter remembers how to store a value at some location of the target
@@ -506,7 +590,7 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	// decoded straight into native Go maps and slices, with no reflection on
 	// the document structure at all. This covers the common "decode arbitrary
 	// TOML into a map" case, including every standard benchmark dataset.
-	if !d.unmarshalerInterface {
+	if d.meta == nil && !d.unmarshalerInterface {
 		if k := root.Kind(); k == reflect.Interface || (k == reflect.Map && root.Type() == mapStringInterfaceType) {
 			return d.unmarshalFused(root, data)
 		}
@@ -540,6 +624,7 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	// Deliver the accumulated raw documents to the unmarshaler-interface
 	// targets.
 	for i := range d.captures {
+		d.recordCaptureMeta(&d.captures[i])
 		nv, err := d.resolveCapture(root, &d.captures[i], 0, false)
 		if err != nil {
 			return err
@@ -677,6 +762,9 @@ func (d *decoder) handleRootExpression(expr *unstable.Node, root reflect.Value) 
 			return nil
 		}
 		if d.captureIdx >= 0 {
+			if d.meta != nil && len(d.captures[d.captureIdx].names) > 0 {
+				d.captures[d.captureIdx].ranges = append(d.captures[d.captureIdx].ranges, expr.Raw)
+			}
 			d.captureKeyValue(expr)
 			return nil
 		}
@@ -711,18 +799,38 @@ func (d *decoder) updateTableKey(expr *unstable.Node) {
 func (d *decoder) handleTableExpression(expr *unstable.Node, root reflect.Value, isArrayTable bool, first bool) error {
 	d.updateTableKey(expr)
 
-	// Check whether this table belongs to an exisiting raw capture (split
-	// tables, or children of a table assigned to an Unmarshaler).
-	if d.unmarshalerInterface {
-		if d.resumeCapture(expr) {
-			return nil
-		}
-	}
-
-	// Reset the per-segment array indexes.
+	// Reset the per-segment array indexes before capture lookup, so that
+	// deciding whether a [[header]] starts a new array-table element uses
+	// the index of this expression, not the previous table's.
 	d.segIdx = d.segIdx[:0]
 	for i := 0; i <= len(d.tableKey); i++ {
 		d.segIdx = append(d.segIdx, -1)
+	}
+
+	// elemIndex is the zero-based position of the element started by this
+	// header among all headers with the same key, counting from zero
+	// independently of the target container.
+	d.curHeaderIdx = -1
+	if d.meta != nil && isArrayTable {
+		if d.headerCounts == nil {
+			d.headerCounts = map[string]int{}
+		}
+		key := string(d.joinPath(d.tableKey))
+		d.curHeaderIdx = d.headerCounts[key]
+		d.headerCounts[key] = d.curHeaderIdx + 1
+	}
+
+	// Check whether this table belongs to an exisiting raw capture (split
+	// tables, or children of a table assigned to an Unmarshaler).
+	if d.unmarshalerInterface {
+		idx := d.findCapture(expr, d.curHeaderIdx)
+		if idx >= 0 {
+			if d.meta != nil && len(d.captures[idx].names) > 0 {
+				d.captures[idx].ranges = append(d.captures[idx].ranges, d.captureHeaderRange(expr))
+			}
+			d.resumeCaptureAt(idx, expr)
+			return nil
+		}
 	}
 
 	return d.walkTable(root, expr, isArrayTable, first)
@@ -750,6 +858,11 @@ func (d *decoder) walkTable(root reflect.Value, expr *unstable.Node, isArrayTabl
 	v := root
 	pf := slotWriter{kind: 1, slot: root}
 	idx := 0
+	if d.meta != nil {
+		d.meta.goSeg = d.meta.goSeg[:0]
+		d.meta.tomlSeg = d.meta.tomlSeg[:0]
+		d.metaLastName = ""
+	}
 
 walk:
 	for {
@@ -766,7 +879,7 @@ walk:
 		// Tables assigned to a type implementing the unmarshaler interface
 		// are captured as raw bytes, delivered once the document is read.
 		if d.unmarshalerInterface && hasUnmarshaler(v) {
-			d.startCapture(idx, expr)
+			d.startCapture(idx, expr, false, 0)
 			return nil
 		}
 
@@ -806,6 +919,9 @@ walk:
 			}
 			n := v.Len() - 1
 			d.segIdx[idx] = n
+			if d.meta != nil {
+				d.meta.pushIndex(n)
+			}
 			elem := v.Index(n)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -820,6 +936,9 @@ walk:
 				return d.keyedError(expr, fmt.Errorf("cannot reach element %d of array of size %d", cnt-1, v.Len()))
 			}
 			d.segIdx[idx] = cnt - 1
+			if d.meta != nil {
+				d.meta.pushIndex(cnt - 1)
+			}
 			elem := v.Index(cnt - 1)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -841,6 +960,14 @@ walk:
 				}
 				key = k
 				w = slotWriter{kind: 2, m: v, k: k}
+			}
+
+			// The last part of an array table is the slice itself: its name
+			// is pushed only when the element is appended below.
+			if d.meta != nil && isArrayTable && idx == len(d.tableKey)-1 {
+				d.metaLastName = name
+			} else if d.meta != nil {
+				d.meta.pushName(mapKeyName(key, name), name)
 			}
 
 			elem := v.MapIndex(key)
@@ -944,11 +1071,22 @@ walk:
 			if !found {
 				d.strict.MissingTable(expr)
 				d.skipUntilTable = true
+				if d.meta != nil {
+					// Nothing was assigned through this header.
+					d.meta.goSeg = d.meta.goSeg[:0]
+					d.meta.tomlSeg = d.meta.tomlSeg[:0]
+				}
 				return nil
 			}
 			fv, err := fieldByIndexAlloc(v, f.index)
 			if err != nil {
 				return err
+			}
+			if d.meta != nil {
+				// Embedded fields may contribute several Go names for one
+				// TOML part; the original key contributes one TOML name.
+				d.appendFieldChain(v.Type(), f.index)
+				d.meta.pushToml(name)
 			}
 			pf = slotWriter{kind: 1, slot: fv}
 			v = fv
@@ -979,9 +1117,17 @@ walk:
 			d.storeSlot(&pf, sv)
 			d.setArrayCount(akey, len(slice))
 			d.segIdx[len(d.tableKey)] = len(slice) - 1
+			if d.meta != nil {
+				d.consumeMetaLastName()
+				d.meta.pushIndex(len(slice) - 1)
+				d.meta.record(d.captureHeaderRange(expr))
+			}
 			d.tableTarget = reflect.ValueOf(m)
 			d.tableParentSlot = slotWriter{kind: 1, slot: sv.Index(len(slice) - 1)}
 			d.tableTargetValid = true
+			if d.meta != nil {
+				d.metaGoPrefix, d.metaTomlPrefix = d.meta.prefixes()
+			}
 			return nil
 		}
 
@@ -999,8 +1145,16 @@ walk:
 			d.segIdx[len(d.tableKey)] = n
 			elem := v.Index(n)
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
-				d.startCapture(len(d.tableKey), expr)
+				if d.meta != nil {
+					d.meta.pushIndex(n)
+				}
+				d.startCapture(len(d.tableKey), expr, true, n)
 				return nil
+			}
+			if d.meta != nil {
+				d.consumeMetaLastName()
+				d.meta.pushIndex(n)
+				d.meta.record(d.captureHeaderRange(expr))
 			}
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -1017,8 +1171,16 @@ walk:
 			d.segIdx[len(d.tableKey)] = cnt
 			elem := v.Index(cnt)
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
-				d.startCapture(len(d.tableKey), expr)
+				if d.meta != nil {
+					d.meta.pushIndex(cnt)
+				}
+				d.startCapture(len(d.tableKey), expr, true, cnt)
 				return nil
+			}
+			if d.meta != nil {
+				d.consumeMetaLastName()
+				d.meta.pushIndex(cnt)
+				d.meta.record(d.captureHeaderRange(expr))
 			}
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
@@ -1066,14 +1228,25 @@ walk:
 			}
 			n := v.Len() - 1
 			d.segIdx[len(d.tableKey)] = n
+			if d.meta != nil {
+				d.meta.pushIndex(n)
+			}
 			elem := v.Index(n)
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
 			continue
 		case reflect.Map, reflect.Struct:
+			// Array-table elements were recorded when appended.
+			if d.meta != nil && !isArrayTable {
+				d.consumeMetaLastName()
+				d.meta.record(d.captureHeaderRange(expr))
+			}
 			d.tableTarget = v
 			d.tableParentSlot = pf
 			d.tableTargetValid = true
+			if d.meta != nil {
+				d.metaGoPrefix, d.metaTomlPrefix = d.meta.prefixes()
+			}
 			return nil
 		default:
 			return d.keyedError(expr, fmt.Errorf("cannot store a table in a %s", v.Kind()))
@@ -1081,9 +1254,9 @@ walk:
 	}
 }
 
-// resumeCapture looks for an existing capture this table expression belongs
-// to. It returns true if the expression was consumed.
-func (d *decoder) resumeCapture(expr *unstable.Node) bool {
+// findCapture looks for an existing capture this table expression belongs
+// to. It returns its index, or -1.
+func (d *decoder) findCapture(expr *unstable.Node, elemIndex int) int {
 	// Iterate in reverse, so that tables attach to the latest element of
 	// array tables.
 	for i := len(d.captures) - 1; i >= 0; i-- {
@@ -1092,9 +1265,12 @@ func (d *decoder) resumeCapture(expr *unstable.Node) bool {
 			continue
 		}
 		if expr.Kind == unstable.ArrayTable && len(d.tableKey) == len(c.names) {
-			// A new element of an array table is not part of the capture of
-			// the previous element.
-			continue
+			// A capture rooted at the slice (non-element) absorbs every
+			// element; a capture of one specific element only absorbs its
+			// own header.
+			if c.arrayElem && elemIndex != c.elemIdx {
+				continue
+			}
 		}
 		match := true
 		for j, p := range c.names {
@@ -1106,13 +1282,36 @@ func (d *decoder) resumeCapture(expr *unstable.Node) bool {
 		if !match {
 			continue
 		}
-		d.captureIdx = i
-		if len(d.tableKey) > len(c.names) {
-			d.appendCaptureHeader(c, expr, len(c.names))
-		}
-		return true
+		return i
 	}
-	return false
+	return -1
+}
+
+// resumeCaptureAt marks the capture at idx as the active one and appends the
+// (relativized) table header to its raw buffer.
+func (d *decoder) resumeCaptureAt(idx int, expr *unstable.Node) {
+	c := &d.captures[idx]
+	d.captureIdx = idx
+	if len(d.tableKey) > len(c.names) {
+		d.appendCaptureHeader(c, expr, len(c.names))
+	}
+}
+
+// captureHeaderRange returns the byte range spanning the key of a table
+// header (the source location recorded for a captured table).
+func (d *decoder) captureHeaderRange(expr *unstable.Node) unstable.Range {
+	var first, last unstable.Range
+	have := false
+	it := expr.Key()
+	for it.Next() {
+		r := it.Node().Raw
+		if !have {
+			first = r
+			have = true
+		}
+		last = r
+	}
+	return unstable.Range{Offset: first.Offset, Length: last.Offset + last.Length - first.Offset}
 }
 
 // appendCaptureHeader writes the table header of expr in the capture buffer,
@@ -1151,19 +1350,41 @@ func (d *decoder) rawKeySuffix(expr *unstable.Node, n int) []byte {
 
 // startCapture registers a new capture for the table at the given path
 // (prefix of tableKey).
-func (d *decoder) startCapture(pathLen int, expr *unstable.Node) {
+func (d *decoder) startCapture(pathLen int, expr *unstable.Node, arrayElem bool, elemIdx int) {
 	names := make([]string, pathLen)
 	copy(names, d.tableKey[:pathLen])
 	indexes := make([]int, pathLen+1)
 	copy(indexes, d.segIdx[:pathLen+1])
+	if arrayElem {
+		indexes[pathLen] = elemIdx
+	}
+	var g []unstable.MetaSegment
+	var t []string
+	var rng unstable.Range
+	if d.meta != nil {
+		g, t = d.meta.prefixes()
+		rng = d.captureHeaderRange(expr)
+	}
 	d.captures = append(d.captures, rawCapture{
-		names:   names,
-		indexes: indexes,
+		names:     names,
+		indexes:   indexes,
+		ranges:    appendRange(nil, rng),
+		goSeg:     g,
+		tomlSeg:   t,
+		arrayElem: arrayElem,
+		elemIdx:   elemIdx,
 	})
 	d.captureIdx = len(d.captures) - 1
 	if pathLen < len(d.tableKey) {
 		d.appendCaptureHeader(&d.captures[d.captureIdx], expr, pathLen)
 	}
+}
+
+func appendRange(r []unstable.Range, x unstable.Range) []unstable.Range {
+	if x.Length == 0 && x.Offset == 0 {
+		return r
+	}
+	return append(r, x)
 }
 
 // startRootCapture opens a capture covering the entire document, used when the
@@ -1174,7 +1395,12 @@ func (d *decoder) startCapture(pathLen int, expr *unstable.Node) {
 // single index slot is -1 because the root is never reached through an array
 // table.
 func (d *decoder) startRootCapture() {
-	d.captures = append(d.captures, rawCapture{indexes: []int{-1}})
+	c := rawCapture{indexes: []int{-1}}
+	if d.meta != nil {
+		data := d.p.Data()
+		c.ranges = []unstable.Range{{Offset: 0, Length: uint32(len(data))}}
+	}
+	d.captures = append(d.captures, c)
 	d.captureIdx = len(d.captures) - 1
 }
 
@@ -1373,7 +1599,13 @@ func (d *decoder) handleKeyValueExpression(expr *unstable.Node, root reflect.Val
 	useCache := d.tableTargetValid && len(d.tableKey) > 0
 	if useCache {
 		target = d.tableTarget
+		if d.meta != nil {
+			d.meta.setPrefixes(d.metaGoPrefix, d.metaTomlPrefix)
+		}
 	} else {
+		if d.meta != nil {
+			d.meta.setPrefixes(nil, nil)
+		}
 		for _, name := range d.tableKey {
 			d.path = append(d.path, pathPart{name: name})
 		}
@@ -1418,7 +1650,14 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		if v.IsNil() {
 			v.Set(reflect.New(v.Type().Elem()))
 		}
+		var sg, st int
+		if d.meta != nil {
+			sg, st = d.meta.save()
+		}
 		nv, err := d.descend(v.Elem(), path, idx, expr, value)
+		if d.meta != nil {
+			d.meta.restore(sg, st)
+		}
 		if err != nil || !nv.IsValid() {
 			return reflect.Value{}, err
 		}
@@ -1430,6 +1669,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 	// whatever the remaining parts of the key are.
 	if d.unmarshalerInterface {
 		if u, ok := unmarshalerOf(v); ok {
+			if d.meta != nil {
+				d.meta.record(d.metaValueRange(expr, value))
+			}
 			return v, u.UnmarshalTOML(d.rawValue(expr, value))
 		}
 	}
@@ -1442,7 +1684,7 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		// remaining dotted-key path with plain Go map operations and decode
 		// the value directly, skipping the reflect.Value round-trips
 		// (stringMapKey, MapIndex, New, SetMapIndex) entirely.
-		if !d.unmarshalerInterface && v.Type() == mapStringInterfaceType {
+		if d.meta == nil && !d.unmarshalerInterface && v.Type() == mapStringInterfaceType {
 			return d.descendStrMap(v, path, idx, value)
 		}
 		var name string
@@ -1475,7 +1717,15 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		default:
 			elem = reflect.New(elemType).Elem()
 		}
+		var sg, st int
+		if d.meta != nil {
+			sg, st = d.meta.save()
+			d.meta.pushName(mapKeyName(key, d.partString(&part)), d.partString(&part))
+		}
 		nv, err := d.descend(elem, path, idx+1, expr, value)
+		if d.meta != nil {
+			d.meta.restore(sg, st)
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -1501,6 +1751,12 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			return reflect.Value{}, err
 		}
 		var nv reflect.Value
+		var sg, st int
+		if d.meta != nil {
+			sg, st = d.meta.save()
+			d.appendFieldChain(v.Type(), f.index)
+			d.meta.pushToml(d.partString(&part))
+		}
 		if idx+1 == len(path) {
 			// Leaf field: assign directly. descend's first action for a
 			// fully-consumed path is exactly this call, so skipping the extra
@@ -1508,6 +1764,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			nv, err = d.assignValue(fv, expr, value)
 		} else {
 			nv, err = d.descend(fv, path, idx+1, expr, value)
+		}
+		if d.meta != nil {
+			d.meta.restore(sg, st)
 		}
 		if err != nil {
 			var mm *typeMismatchError
@@ -1539,7 +1798,15 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			v = reflect.Append(v, reflect.New(v.Type().Elem()).Elem())
 		}
 		elem := v.Index(v.Len() - 1)
+		var sg, st int
+		if d.meta != nil {
+			sg, st = d.meta.save()
+			d.meta.pushIndex(v.Len() - 1)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
+		if d.meta != nil {
+			d.meta.restore(sg, st)
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -1562,7 +1829,15 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 				"cannot reach element %d of array of size %d", elemIdx, v.Len())
 		}
 		elem := v.Index(elemIdx)
+		var sg, st int
+		if d.meta != nil {
+			sg, st = d.meta.save()
+			d.meta.pushIndex(elemIdx)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
+		if d.meta != nil {
+			d.meta.restore(sg, st)
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -1673,6 +1948,7 @@ func (d *decoder) assignValue(v reflect.Value, expr *unstable.Node, value *unsta
 	if v.Kind() == reflect.Ptr {
 		if d.unmarshalerInterface {
 			if u, ok := unmarshalerOf(v); ok {
+				d.metaRecord(expr, value, true)
 				return v, u.UnmarshalTOML(d.rawValue(expr, value))
 			}
 		}
@@ -1689,9 +1965,14 @@ func (d *decoder) assignValue(v reflect.Value, expr *unstable.Node, value *unsta
 
 	if d.unmarshalerInterface {
 		if u, ok := unmarshalerOf(v); ok {
+			d.metaRecord(expr, value, true)
 			return v, u.UnmarshalTOML(d.rawValue(expr, value))
 		}
 	}
+
+	// Containers record the locations of their contents themselves; a plain
+	// scalar/date at this point is the value assigned to the current path.
+	d.metaRecord(expr, value, false)
 
 	switch value.Kind {
 	case unstable.String:
@@ -1711,8 +1992,16 @@ func (d *decoder) assignValue(v reflect.Value, expr *unstable.Node, value *unsta
 	case unstable.LocalTime:
 		return d.assignLocalTime(v, value)
 	case unstable.Array:
+		if d.meta != nil {
+			// The suppression set by assignArrayElem applies only to the
+			// element itself: contents of a container record normally.
+			d.metaSkip = false
+		}
 		return d.assignArray(v, expr, value)
 	case unstable.InlineTable:
+		if d.meta != nil {
+			d.metaSkip = false
+		}
 		return d.assignInlineTable(v, expr, value)
 	default:
 		return reflect.Value{}, unstable.NewParserError(value.Data, "unsupported value kind %s", value.Kind)
@@ -2004,6 +2293,10 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 		// element in place. This avoids a reflect.New allocation per element
 		// and the repeated growth checks of reflect.Append.
 		slice := reflect.MakeSlice(v.Type(), count, count)
+		var msg, mts int
+		if d.meta != nil {
+			msg, mts = d.meta.save()
+		}
 		i := 0
 		it := value.Children()
 		for it.Next() {
@@ -2012,17 +2305,32 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				continue
 			}
 			elem := slice.Index(i)
-			nv, err := d.assignValue(elem, nil, n)
+			nv, err := d.assignArrayElem(elem, n, i)
 			if err != nil {
 				return reflect.Value{}, err
 			}
+			d.recordLastArrayElem()
 			if nv.IsValid() {
 				elem.Set(nv)
 			}
+			if d.meta != nil {
+				// Pop any segments added by the element (inline table keys)
+				// down to (but keeping) its index, so the next element
+				// starts clean. The index added a Go segment but no TOML
+				// name.
+				d.meta.restore(d.lastElemGo, d.lastElemToml)
+			}
 			i++
+		}
+		if d.meta != nil {
+			d.meta.restore(msg, mts)
 		}
 		return slice, nil
 	case reflect.Array:
+		var msg, mts int
+		if d.meta != nil {
+			msg, mts = d.meta.save()
+		}
 		it := value.Children()
 		i := 0
 		for it.Next() {
@@ -2036,18 +2344,35 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				break
 			}
 			elem := v.Index(i)
-			nv, err := d.assignValue(elem, nil, n)
+			nv, err := d.assignArrayElem(elem, n, i)
 			if err != nil {
 				return reflect.Value{}, err
 			}
+			d.recordLastArrayElem()
 			elem.Set(nv)
+			if d.meta != nil {
+				d.meta.restore(d.lastElemGo, d.lastElemToml)
+			}
 			i++
+		}
+		if d.meta != nil {
+			d.meta.restore(msg, mts)
 		}
 		return v, nil
 	case reflect.Interface:
 		// Build the []interface{} natively: each element is decoded straight
 		// into a Go value with no intermediate addressable reflect.Value and
 		// no reflect round-trip, and nested arrays recurse the same way.
+		if d.meta != nil {
+			// The reflect path keeps track of each element's location,
+			// including the contents of inline tables and nested arrays.
+			holder := reflect.MakeSlice(reflect.SliceOf(v.Type()), 0, count)
+			nv, err := d.assignArray(holder, expr, value)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			return boxInto(v, nv)
+		}
 		slice := make([]interface{}, 0, count)
 		it := value.Children()
 		for it.Next() {
@@ -2171,6 +2496,10 @@ func (d *decoder) assignInlineTable(v reflect.Value, expr *unstable.Node, value 
 		return reflect.Value{}, d.typeMismatchError("inline table", v.Type(), d.rawValue(expr, value))
 	}
 
+	var baseGo, baseToml int
+	if d.meta != nil {
+		baseGo, baseToml = d.meta.save()
+	}
 	it := value.Children()
 	for it.Next() {
 		kv := it.Node()
@@ -2183,6 +2512,9 @@ func (d *decoder) assignInlineTable(v reflect.Value, expr *unstable.Node, value 
 			path = append(path, pathPart{node: kit.Node()})
 		}
 		nv, err := d.descend(v, path, 0, kv, kv.Value())
+		if d.meta != nil {
+			d.meta.restore(baseGo, baseToml)
+		}
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -2235,8 +2567,8 @@ const foldBufSize = 68
 
 // lookup and lookupBytes keep the hot path to a single inlinable byFold lookup.
 // byFold is indexed by both the exact field/tag names and their lowercased
-// forms, so that lookup resolves the two common cases — a lowercase key, or a
-// key matching the field's own casing — directly. byName is consulted first
+// forms, so that lookup resolves the two common cases ? a lowercase key, or a
+// key matching the field's own casing ? directly. byName is consulted first
 // only for types whose fields collide under case-folding, to preserve the
 // exact-match-wins tiebreak. The buffer-fold for other casings lives
 // out-of-line so it does not bloat the hot path.
