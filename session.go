@@ -24,6 +24,12 @@ type milterSession struct {
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+
+	// stage is the current protocol stage, updated as commands are processed.
+	stage Stage
+	// modifier is the Modifier owned by the currently running backend
+	// callback, nil when no callback is running.
+	modifier *Modifier
 }
 
 // ReadPacket reads incoming milter packet
@@ -95,6 +101,17 @@ func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
 	return nil
 }
 
+// invoke runs a backend callback at the given protocol stage with a fresh
+// Modifier. The Modifier is deactivated as soon as the callback returns so
+// that references kept by the backend can no longer emit packets.
+func (m *milterSession) invoke(stage Stage, callback func(mod *Modifier) (Response, error)) (Response, error) {
+	m.stage = stage
+	mod := newModifier(m)
+	m.modifier = mod
+	defer func() { m.modifier = nil }()
+	return callback(mod)
+}
+
 // Process processes incoming milter commands
 func (m *milterSession) Process(msg *Message) (Response, error) {
 	switch Code(msg.Code) {
@@ -104,11 +121,16 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			m.headers = nil
 			m.macros = nil
 		}()
-		return nil, m.backend.Abort(newModifier(m))
+		_, err := m.invoke(m.stage, func(mod *Modifier) (Response, error) {
+			return nil, m.backend.Abort(mod)
+		})
+		return nil, err
 
 	case CodeBody:
 		// body chunk
-		return m.backend.BodyChunk(msg.Data, newModifier(m))
+		return m.invoke(m.stage, func(mod *Modifier) (Response, error) {
+			return m.backend.BodyChunk(msg.Data, mod)
+		})
 
 	case CodeConn:
 		// new connection, get hostname
@@ -136,12 +158,14 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 			'6': "tcp6",
 		}
 		// run handler and return
-		return m.backend.Connect(
-			hostname,
-			family[protocolFamily],
-			port,
-			net.ParseIP(address),
-			newModifier(m))
+		return m.invoke(StageConnect, func(mod *Modifier) (Response, error) {
+			return m.backend.Connect(
+				hostname,
+				family[protocolFamily],
+				port,
+				net.ParseIP(address),
+				mod)
+		})
 
 	case CodeMacro:
 		// define macros
@@ -163,12 +187,16 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 
 	case CodeEOB:
 		// call and return milter handler
-		return m.backend.Body(newModifier(m))
+		return m.invoke(StageEOM, func(mod *Modifier) (Response, error) {
+			return m.backend.Body(mod)
+		})
 
 	case CodeHelo:
 		// helo command
 		name := strings.TrimSuffix(string(msg.Data), null)
-		return m.backend.Helo(name, newModifier(m))
+		return m.invoke(StageHelo, func(mod *Modifier) (Response, error) {
+			return m.backend.Helo(name, mod)
+		})
 
 	case CodeHeader:
 		// make sure headers is initialized
@@ -184,19 +212,32 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 		if len(headerData) == 2 {
 			m.headers.Add(headerData[0], headerData[1])
 			// call and return milter handler
-			return m.backend.Header(headerData[0], headerData[1], newModifier(m))
+			return m.invoke(m.stage, func(mod *Modifier) (Response, error) {
+				return m.backend.Header(headerData[0], headerData[1], mod)
+			})
 		}
 
 	case CodeMail:
 		// envelope from address
 		from := readCString(msg.Data)
-		return m.backend.MailFrom(strings.Trim(from, "<>"), newModifier(m))
+		return m.invoke(StageMailFrom, func(mod *Modifier) (Response, error) {
+			return m.backend.MailFrom(strings.Trim(from, "<>"), mod)
+		})
 
 	case CodeEOH:
 		// end of headers
-		return m.backend.Headers(m.headers, newModifier(m))
+		return m.invoke(StageEOH, func(mod *Modifier) (Response, error) {
+			return m.backend.Headers(m.headers, mod)
+		})
 
 	case CodeOptNeg:
+		// Intersect our own capabilities with the ones offered by the MTA.
+		// Only actions and protocol options supported by both peers may be
+		// used afterwards.
+		if len(msg.Data) >= 12 {
+			m.actions &= OptAction(binary.BigEndian.Uint32(msg.Data[4:8]))
+			m.protocol &= OptProtocol(binary.BigEndian.Uint32(msg.Data[8:12]))
+		}
 		// ignore request and prepare response buffer
 		var buffer bytes.Buffer
 		// prepare response data
@@ -228,10 +269,13 @@ func (m *milterSession) Process(msg *Message) (Response, error) {
 	case CodeRcpt:
 		// envelope to address
 		to := readCString(msg.Data)
-		return m.backend.RcptTo(strings.Trim(to, "<>"), newModifier(m))
+		return m.invoke(StageRcptTo, func(mod *Modifier) (Response, error) {
+			return m.backend.RcptTo(strings.Trim(to, "<>"), mod)
+		})
 
 	case CodeData:
-		// data, ignore
+		// data, only track the protocol stage
+		m.stage = StageData
 
 	default:
 		// print error and close session

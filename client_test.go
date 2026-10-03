@@ -152,7 +152,7 @@ func TestMilterClient_UsualFlow(t *testing.T) {
 		NewMilter: func() Milter {
 			return &mm
 		},
-		Actions: OptAddHeader | OptChangeHeader,
+		Actions: OptAddHeader | OptChangeHeader | OptQuarantine,
 	}
 	defer s.Close()
 	local, err := net.Listen("tcp", "127.0.0.1:0")

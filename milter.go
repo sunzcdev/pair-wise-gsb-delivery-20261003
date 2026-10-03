@@ -1,6 +1,8 @@
 // Package milter provides an interface to implement milter mail filters
 package milter
 
+import "fmt"
+
 // OptAction sets which actions the milter wants to perform.
 // Multiple options can be set using a bitmask.
 type OptAction uint32
@@ -19,6 +21,32 @@ const (
 	OptAddRcptWithArgs OptAction = 1 << 7 // SMFIF_ADDRCPT_PAR
 	OptSetSymList      OptAction = 1 << 8 // SMFIF_SETSYMLIST
 )
+
+// String returns the name of a single OptAction bit, suitable for error
+// messages describing missing capabilities.
+func (a OptAction) String() string {
+	switch a {
+	case OptAddHeader:
+		return "OptAddHeader"
+	case OptChangeBody:
+		return "OptChangeBody"
+	case OptAddRcpt:
+		return "OptAddRcpt"
+	case OptRemoveRcpt:
+		return "OptRemoveRcpt"
+	case OptChangeHeader:
+		return "OptChangeHeader"
+	case OptQuarantine:
+		return "OptQuarantine"
+	case OptChangeFrom:
+		return "OptChangeFrom"
+	case OptAddRcptWithArgs:
+		return "OptAddRcptWithArgs"
+	case OptSetSymList:
+		return "OptSetSymList"
+	}
+	return fmt.Sprintf("OptAction(0x%x)", uint32(a))
+}
 
 // OptProtocol masks out unwanted parts of the SMTP transaction.
 // Multiple options can be set using a bitmask.
@@ -67,3 +95,24 @@ const (
 	StageEOM      Stage = 5 // SMFIM_EOM     (end of message (final dot))
 	StageEOH      Stage = 6 // SMFIM_EOH     (end of header)
 )
+
+// String returns the name of the protocol stage.
+func (s Stage) String() string {
+	switch s {
+	case StageConnect:
+		return "Connect"
+	case StageHelo:
+		return "Helo"
+	case StageMailFrom:
+		return "MailFrom"
+	case StageRcptTo:
+		return "RcptTo"
+	case StageData:
+		return "Data"
+	case StageEOM:
+		return "EOM"
+	case StageEOH:
+		return "EOH"
+	}
+	return fmt.Sprintf("Stage(%d)", uint32(s))
+}
