@@ -12,17 +12,19 @@ import (
 )
 
 type compiler struct {
-	moduleLoader  ModuleLoader
-	environLoader func() []string
-	variables     []string
-	customFuncs   map[string]function
-	inputIter     Iter
-	codes         []*code
-	codeinfos     []codeinfo
-	builtinScope  *scopeinfo
-	scopes        []*scopeinfo
-	scopecnt      int
-	regexpCache   sync.Map
+	moduleLoader       ModuleLoader
+	environLoader      func() []string
+	variables          []string
+	customFuncs        map[string]function
+	inputIter          Iter
+	dependencyRecorder *DependencyRecorder
+	dependencyLock     *DependencyManifest
+	codes              []*code
+	codeinfos          []codeinfo
+	builtinScope       *scopeinfo
+	scopes             []*scopeinfo
+	scopecnt           int
+	regexpCache        sync.Map
 }
 
 // Code is a compiled jq query.
@@ -98,6 +100,9 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 			if err != nil {
 				return nil, err
 			}
+			if err := c.recordInitDependencies(len(qs)); err != nil {
+				return nil, err
+			}
 			for _, q := range qs {
 				if err := c.compileModule(q, ""); err != nil {
 					return nil, err
@@ -154,6 +159,9 @@ func (c *compiler) compileImport(i *Import) error {
 		} else {
 			return fmt.Errorf("module not found: %q", path)
 		}
+		if err := c.recordDependency(DependencyKindJSON, path, i.Meta.ToValue()); err != nil {
+			return err
+		}
 		c.append(&code{op: oppush, v: vals})
 		c.append(&code{op: opstore, v: c.pushVariable(alias)})
 		c.append(&code{op: oppush, v: vals})
@@ -174,6 +182,9 @@ func (c *compiler) compileImport(i *Import) error {
 		if q, err = moduleLoader.LoadModule(path); err != nil {
 			return err
 		}
+	}
+	if err := c.recordDependency(DependencyKindModule, path, i.Meta.ToValue()); err != nil {
+		return err
 	}
 	c.appendCodeInfo("module " + path)
 	if err = c.compileModule(q, alias); err != nil {

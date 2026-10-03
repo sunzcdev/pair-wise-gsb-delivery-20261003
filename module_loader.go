@@ -1,6 +1,8 @@
 package gojq
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,6 +20,13 @@ import (
 //	LoadModuleWithMeta(string, map[string]any) (*Query, error)
 //	LoadJSON(string) (any, error)
 //	LoadJSONWithMeta(string, map[string]any) (any, error)
+//
+// To support dependency recording and locking ([WithDependencyRecorder] and
+// [WithDependencyLock]), implement the following optional evidence methods.
+// Without them, dependencies loaded through this loader cannot be locked.
+//
+//	LoadDependencyEvidence(DependencyKind, string, map[string]any) (*DependencyEvidence, error)
+//	LoadInitModulesEvidence() ([]DependencyEvidence, error)
 type ModuleLoader any
 
 // NewModuleLoader creates a new [ModuleLoader] loading local modules in the paths.
@@ -38,7 +47,27 @@ type moduleLoader struct {
 }
 
 func (l *moduleLoader) LoadInitModules() ([]*Query, error) {
+	paths, err := l.initModulePaths()
+	if err != nil {
+		return nil, err
+	}
 	var qs []*Query
+	for _, path := range paths {
+		cnt, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		q, err := parseModule(string(cnt), filepath.Dir(path))
+		if err != nil {
+			return nil, &queryParseError{path, string(cnt), err}
+		}
+		qs = append(qs, q)
+	}
+	return qs, nil
+}
+
+func (l *moduleLoader) initModulePaths() ([]string, error) {
+	var paths []string
 	for _, path := range l.paths {
 		if filepath.Base(path) != ".jq" {
 			continue
@@ -53,17 +82,9 @@ func (l *moduleLoader) LoadInitModules() ([]*Query, error) {
 		if fi.IsDir() {
 			continue
 		}
-		cnt, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		q, err := parseModule(string(cnt), filepath.Dir(path))
-		if err != nil {
-			return nil, &queryParseError{path, string(cnt), err}
-		}
-		qs = append(qs, q)
+		paths = append(paths, path)
 	}
-	return qs, nil
+	return paths, nil
 }
 
 func (l *moduleLoader) LoadModuleWithMeta(name string, meta map[string]any) (*Query, error) {
@@ -133,6 +154,57 @@ func (l *moduleLoader) lookupModule(name, extension string, meta map[string]any)
 		}
 	}
 	return "", fmt.Errorf("module not found: %q", name)
+}
+
+// LoadDependencyEvidence returns the evidence of a module or JSON data
+// loaded through this loader, used by [WithDependencyRecorder] and
+// [WithDependencyLock].
+func (l *moduleLoader) LoadDependencyEvidence(kind DependencyKind, name string, meta map[string]any) (*DependencyEvidence, error) {
+	extension := ".jq"
+	if kind == DependencyKindJSON {
+		extension = ".json"
+	}
+	path, err := l.lookupModule(name, extension, meta)
+	if err != nil {
+		return nil, err
+	}
+	return fileEvidence(name, path)
+}
+
+// LoadInitModulesEvidence returns the evidence of the init modules loaded
+// through this loader, used by [WithDependencyRecorder] and
+// [WithDependencyLock].
+func (l *moduleLoader) LoadInitModulesEvidence() ([]DependencyEvidence, error) {
+	paths, err := l.initModulePaths()
+	if err != nil {
+		return nil, err
+	}
+	evidences := make([]DependencyEvidence, 0, len(paths))
+	for _, path := range paths {
+		evidence, err := fileEvidence(path, path)
+		if err != nil {
+			return nil, err
+		}
+		evidences = append(evidences, *evidence)
+	}
+	return evidences, nil
+}
+
+func fileEvidence(name, path string) (*DependencyEvidence, error) {
+	cnt, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	source, err := filepath.Abs(path)
+	if err != nil {
+		source = path
+	}
+	sum := sha256.Sum256(cnt)
+	return &DependencyEvidence{
+		Name:   name,
+		Source: source,
+		Digest: "sha256:" + hex.EncodeToString(sum[:]),
+	}, nil
 }
 
 func parseModule(cnt, dir string) (*Query, error) {

@@ -94,3 +94,30 @@ func WithInputIter(inputIter Iter) CompilerOption {
 		c.inputIter = inputIter
 	}
 }
+
+// WithDependencyRecorder is a compiler option for recording the dependencies
+// (jq modules and JSON data) actually loaded during compilation, including
+// init modules and nested imports. After a successful compilation, call
+// [DependencyRecorder.Manifest] to obtain the manifest listing the loaded
+// dependencies with their canonical sources and content digests. The module
+// loader must provide dependency evidence (see [ModuleLoader]); otherwise
+// the compilation fails with [DependencyEvidenceError] since the dependencies
+// cannot be locked.
+func WithDependencyRecorder(recorder *DependencyRecorder) CompilerOption {
+	return func(c *compiler) {
+		c.dependencyRecorder = recorder
+	}
+}
+
+// WithDependencyLock is a compiler option for locking the dependencies (jq
+// modules and JSON data) loaded during compilation to a manifest previously
+// recorded with [WithDependencyRecorder]. The compilation fails with
+// [DependencyLockError] when a loaded dependency is not in the manifest, or
+// its source or content digest differs. The module loader must provide
+// dependency evidence (see [ModuleLoader]); otherwise the compilation fails
+// with [DependencyEvidenceError] since the dependencies cannot be locked.
+func WithDependencyLock(manifest *DependencyManifest) CompilerOption {
+	return func(c *compiler) {
+		c.dependencyLock = manifest
+	}
+}
