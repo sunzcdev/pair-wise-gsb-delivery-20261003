@@ -63,6 +63,10 @@ func (d *decoder) reset() {
 	d.tableParentSlot = slotWriter{}
 	d.keyParts = d.keyParts[:0]
 	d.strict.Reset()
+	d.reqEnabled = false
+	d.reqPath = d.reqPath[:0]
+	d.reqOrder = d.reqOrder[:0]
+	d.reqInst = nil
 }
 
 // Unmarshal deserializes a TOML document into a Go value.
@@ -150,7 +154,10 @@ func (d *Decoder) EnableUnmarshalerInterface() *Decoder {
 // If an error occurs while decoding the content of the document, this function
 // returns a toml.DecodeError, providing context about the issue. When using
 // strict mode and a field is missing, a `toml.StrictMissingError` is
-// returned. In any other case, this function returns a standard Go error.
+// returned. When a field tagged `toml:"...,required"` is not provided by the
+// document, a `toml.MissingRequiredError` is returned (joined with the
+// StrictMissingError when both occur). In any other case, this function
+// returns a standard Go error.
 //
 // # Type mapping
 //
@@ -287,6 +294,19 @@ type decoder struct {
 	// keyParts is the reusable buffer holding the decoded parts of the key of
 	// the current expression in the fused generic decode path.
 	keyParts [][]byte
+
+	// Required-field tracking. reqEnabled is true when the target type tree
+	// contains at least one field tagged `toml:"...,required"`; all the
+	// other fields stay untouched otherwise. reqPath is the path of the
+	// struct instance currently being decoded (segments carry the array
+	// element index when relevant). reqInst maps the encoded instance path
+	// to its record, and reqOrder holds the instances in registration
+	// order so that missing-field errors are reported deterministically.
+	reqEnabled bool
+	reqPath    []reqSeg
+	reqInst    map[string]*reqInstance
+	reqOrder   []*reqInstance
+	reqScratch []byte
 }
 
 // slotWriter remembers how to store a value at some location of the target
@@ -502,6 +522,14 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	d.captureIdx = -1
 	d.p.Reset(data)
 
+	// Required-field tracking only kicks in when the target type tree
+	// contains required fields; otherwise none of the decode hooks below
+	// perform any work.
+	d.reqEnabled = typeHasRequired(root.Type())
+	if d.reqEnabled {
+		d.reqRegisterInstance(root.Type(), nil)
+	}
+
 	// Fully generic targets (interface{} or map[string]interface{}) are
 	// decoded straight into native Go maps and slices, with no reflection on
 	// the document structure at all. This covers the common "decode arbitrary
@@ -562,7 +590,19 @@ func (d *decoder) unmarshal(data []byte, v interface{}) error {
 	default:
 	}
 
-	return d.strict.Error(data)
+	// Unknown-field (strict mode) and missing-required-field errors are
+	// reported together: strict errors first (in document order), then
+	// required errors (in instance registration order, fields in
+	// declaration order), so the combined output is deterministic.
+	serr := d.strict.Error(data)
+	rerr := d.missingRequiredError(data)
+	if serr != nil && rerr != nil {
+		return errors.Join(serr, rerr)
+	}
+	if serr != nil {
+		return serr
+	}
+	return rerr
 }
 
 // setAnyKey assigns the value of a key-value into the native map m, following
@@ -725,6 +765,9 @@ func (d *decoder) handleTableExpression(expr *unstable.Node, root reflect.Value,
 		d.segIdx = append(d.segIdx, -1)
 	}
 
+	// The instance path is rebuilt from scratch as the table key is walked.
+	d.reqPath = d.reqPath[:0]
+
 	return d.walkTable(root, expr, isArrayTable, first)
 }
 
@@ -807,6 +850,10 @@ walk:
 			n := v.Len() - 1
 			d.segIdx[idx] = n
 			elem := v.Index(n)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(n))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
 		case reflect.Array:
@@ -821,9 +868,17 @@ walk:
 			}
 			d.segIdx[idx] = cnt - 1
 			elem := v.Index(cnt - 1)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(cnt - 1))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
 		case reflect.Map:
+			if d.reqEnabled {
+				d.reqPushSeg(name, -1)
+				d.reqRegisterInstance(v.Type().Elem(), expr)
+			}
 			if v.IsNil() {
 				nm := reflect.MakeMap(v.Type())
 				d.storeSlot(&pf, nm)
@@ -950,6 +1005,11 @@ walk:
 			if err != nil {
 				return err
 			}
+			if d.reqEnabled {
+				d.reqProvide(&f)
+				d.reqPushSeg(f.tomlName, -1)
+				d.reqRegisterInstance(fv.Type(), expr)
+			}
 			pf = slotWriter{kind: 1, slot: fv}
 			v = fv
 			idx++
@@ -979,6 +1039,9 @@ walk:
 			d.storeSlot(&pf, sv)
 			d.setArrayCount(akey, len(slice))
 			d.segIdx[len(d.tableKey)] = len(slice) - 1
+			if d.reqEnabled {
+				d.reqAnnotate(int32(len(slice) - 1))
+			}
 			d.tableTarget = reflect.ValueOf(m)
 			d.tableParentSlot = slotWriter{kind: 1, slot: sv.Index(len(slice) - 1)}
 			d.tableTargetValid = true
@@ -998,6 +1061,10 @@ walk:
 			d.setArrayCount(akey, n+1)
 			d.segIdx[len(d.tableKey)] = n
 			elem := v.Index(n)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(n))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
 				d.startCapture(len(d.tableKey), expr)
 				return nil
@@ -1016,6 +1083,10 @@ walk:
 			d.setArrayCount(akey, cnt+1)
 			d.segIdx[len(d.tableKey)] = cnt
 			elem := v.Index(cnt)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(cnt))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			if d.unmarshalerInterface && hasUnmarshaler(elem) {
 				d.startCapture(len(d.tableKey), expr)
 				return nil
@@ -1067,6 +1138,10 @@ walk:
 			n := v.Len() - 1
 			d.segIdx[len(d.tableKey)] = n
 			elem := v.Index(n)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(n))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			pf = slotWriter{kind: 1, slot: elem}
 			v = elem
 			continue
@@ -1374,6 +1449,9 @@ func (d *decoder) handleKeyValueExpression(expr *unstable.Node, root reflect.Val
 	if useCache {
 		target = d.tableTarget
 	} else {
+		// The path is walked from the root: rebuild the instance path from
+		// scratch as descend traverses the table key parts.
+		d.reqPath = d.reqPath[:0]
 		for _, name := range d.tableKey {
 			d.path = append(d.path, pathPart{name: name})
 		}
@@ -1475,9 +1553,24 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		default:
 			elem = reflect.New(elemType).Elem()
 		}
+		pushed := false
+		if d.reqEnabled {
+			if !fastKey {
+				name = d.partString(&part)
+			}
+			d.reqPushSeg(name, -1)
+			d.reqRegisterInstance(elemType, expr)
+			pushed = true
+		}
 		nv, err := d.descend(elem, path, idx+1, expr, value)
 		if err != nil {
+			if pushed {
+				d.reqPop()
+			}
 			return reflect.Value{}, err
+		}
+		if pushed {
+			d.reqPop()
 		}
 		if nv.IsValid() {
 			if fastKey {
@@ -1500,6 +1593,18 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 		if err != nil {
 			return reflect.Value{}, err
 		}
+		pushed := false
+		if d.reqEnabled {
+			d.reqProvide(&f)
+			// The segment is needed on the instance path when the decode
+			// recurses below this field: dotted keys, inline tables, and
+			// arrays (whose elements are indexed on the segment).
+			if idx+1 < len(path) || value.Kind == unstable.InlineTable || value.Kind == unstable.Array {
+				d.reqPushSeg(f.tomlName, -1)
+				d.reqRegisterInstance(fv.Type(), expr)
+				pushed = true
+			}
+		}
 		var nv reflect.Value
 		if idx+1 == len(path) {
 			// Leaf field: assign directly. descend's first action for a
@@ -1510,6 +1615,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			nv, err = d.descend(fv, path, idx+1, expr, value)
 		}
 		if err != nil {
+			if pushed {
+				d.reqPop()
+			}
 			var mm *typeMismatchError
 			if errors.As(err, &mm) {
 				err = &unstable.ParserError{
@@ -1519,6 +1627,9 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 				}
 			}
 			return reflect.Value{}, err
+		}
+		if pushed {
+			d.reqPop()
 		}
 		if nv.IsValid() && fv.CanSet() {
 			fv.Set(nv)
@@ -1539,6 +1650,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 			v = reflect.Append(v, reflect.New(v.Type().Elem()).Elem())
 		}
 		elem := v.Index(v.Len() - 1)
+		if d.reqEnabled {
+			d.reqAnnotate(int32(v.Len() - 1))
+			d.reqRegisterInstance(elem.Type(), expr)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
 		if err != nil {
 			return reflect.Value{}, err
@@ -1562,6 +1677,10 @@ func (d *decoder) descend(v reflect.Value, path []pathPart, idx int, expr *unsta
 				"cannot reach element %d of array of size %d", elemIdx, v.Len())
 		}
 		elem := v.Index(elemIdx)
+		if d.reqEnabled {
+			d.reqAnnotate(int32(elemIdx))
+			d.reqRegisterInstance(elem.Type(), expr)
+		}
 		nv, err := d.descend(elem, path, idx, expr, value)
 		if err != nil {
 			return reflect.Value{}, err
@@ -2012,6 +2131,10 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				continue
 			}
 			elem := slice.Index(i)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(i))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			nv, err := d.assignValue(elem, nil, n)
 			if err != nil {
 				return reflect.Value{}, err
@@ -2036,6 +2159,10 @@ func (d *decoder) assignArray(v reflect.Value, expr *unstable.Node, value *unsta
 				break
 			}
 			elem := v.Index(i)
+			if d.reqEnabled {
+				d.reqAnnotate(int32(i))
+				d.reqRegisterInstance(elem.Type(), expr)
+			}
 			nv, err := d.assignValue(elem, nil, n)
 			if err != nil {
 				return reflect.Value{}, err
@@ -2221,11 +2348,16 @@ type structPlan struct {
 	byName       map[string]structField
 	byFold       map[string]structField
 	hasCollision bool
+	// required holds the TOML names of the fields tagged with
+	// `toml:"...,required"`, in declaration order.
+	required []string
 }
 
 type structField struct {
 	index     []int
 	fieldName string
+	tomlName  string
+	required  bool
 }
 
 // foldBufSize bounds the stack buffer used to lowercase keys without
@@ -2358,6 +2490,7 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 		tag, tagged := f.Tag.Lookup("toml")
 		name := f.Name
 		explicitName := ""
+		required := false
 		if tagged {
 			// A tag of exactly "-" drops the field. "-," names it "-".
 			if tag == "-" {
@@ -2367,6 +2500,13 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 			explicitName = parts[0]
 			if explicitName != "" {
 				name = explicitName
+			}
+			if len(parts) == 2 {
+				for _, opt := range strings.Split(parts[1], ",") {
+					if opt == "required" {
+						required = true
+					}
+				}
 			}
 		}
 		if f.Anonymous {
@@ -2396,9 +2536,12 @@ func addFields(plan *structPlan, t reflect.Type, prefix []int, visited map[refle
 		index := make([]int, 0, len(prefix)+1)
 		index = append(index, prefix...)
 		index = append(index, i)
-		sf := structField{index: index, fieldName: f.Name}
+		sf := structField{index: index, fieldName: f.Name, tomlName: name, required: required}
 		if _, ok := plan.byName[name]; !ok {
 			plan.byName[name] = sf
+			if required {
+				plan.required = append(plan.required, name)
+			}
 		}
 		lower := strings.ToLower(name)
 		if _, ok := plan.byFold[lower]; !ok {

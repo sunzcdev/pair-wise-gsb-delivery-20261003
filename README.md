@@ -46,6 +46,24 @@ to check for typos. [See example in the documentation][strict].
 
 [strict]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#example-Decoder.DisallowUnknownFields
 
+### Required fields
+
+Struct fields tagged with `toml:"...,required"` must be explicitly provided
+by the document. Decoding fails with a `MissingRequiredError` when a required
+field is absent, even if the target already holds a non-zero value. A field
+counts as provided as long as it appears in the document, including with a
+zero value (`false`, `0`, `""`, `[]`). Nested structs and each element of an
+array of tables are checked independently, and missing fields are reported
+with their full path (e.g. `servers[1].host`). When an optional parent table
+is absent, its own required fields are not enforced.
+
+```go
+type Config struct {
+	Host string `toml:"host,required"`
+	Port int    `toml:"port"`
+}
+```
+
 ### Contextualized errors
 
 When most decoding errors occur, go-toml returns [`DecodeError`][decode-err],

@@ -63,6 +63,50 @@ func (s *StrictMissingError) Unwrap() []error {
 	return errs
 }
 
+// MissingRequiredError occurs when the document does not provide a field
+// tagged with `toml:"...,required"`. It contains one error per missing
+// field, each carrying the full path of the missing field (with array
+// element indexes, e.g. "servers[1].host").
+//
+// Returned by Decoder.Decode and Unmarshal, regardless of strict mode. When
+// strict mode is also enabled and both kinds of errors occur, they are
+// joined into a single error (see errors.Join): unknown-field errors first,
+// then missing-required-field errors, both in deterministic order.
+type MissingRequiredError struct {
+	// One error per required field missing from the document.
+	Errors []DecodeError
+}
+
+// Error returns the canonical string for this error.
+func (e *MissingRequiredError) Error() string {
+	return "toml: document is missing required fields"
+}
+
+// String returns a human readable description of all errors.
+func (e *MissingRequiredError) String() string {
+	var buf strings.Builder
+
+	for i, err := range e.Errors {
+		if i > 0 {
+			buf.WriteString("\n---\n")
+		}
+		buf.WriteString(err.String())
+	}
+
+	return buf.String()
+}
+
+// Unwrap returns wrapped decode errors
+//
+// Implements errors.Join() interface.
+func (e *MissingRequiredError) Unwrap() []error {
+	errs := make([]error, len(e.Errors))
+	for i := range e.Errors {
+		errs[i] = &e.Errors[i]
+	}
+	return errs
+}
+
 // Key represents a TOML key as a sequence of key parts.
 type Key []string
 
