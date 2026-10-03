@@ -12,6 +12,46 @@ import (
 
 var ErrStopped = errors.New("submitting work to stopped workerpool")
 
+// Stats is a consistent snapshot of the worker pool's task and worker
+// counters. All counters are captured under a single lock, so the values
+// never describe a state the pool could not have been in.
+//
+// The counters always satisfy the following conservation relations:
+//
+//	Received == Queued + Running + Completed + Dropped
+//	Started  == Running + Completed
+//
+// Received counts only tasks accepted by the pool; tasks submitted after the
+// pool is stopped are rejected and not counted. Tasks used internally by
+// Pause are not counted.
+type Stats struct {
+	// Received is the total number of tasks accepted by the pool.
+	Received int
+	// Started is the total number of tasks handed to a worker for execution.
+	Started int
+	// Completed is the total number of tasks that finished executing. A task
+	// that panics is recovered and counted as completed.
+	Completed int
+	// Dropped is the total number of queued tasks discarded by Stop.
+	Dropped int
+	// Queued is the number of tasks currently waiting for an available
+	// worker.
+	Queued int
+	// Running is the number of tasks currently executing.
+	Running int
+	// Workers is the number of worker goroutines currently alive. Workers
+	// are created on demand and retired when idle; this is independent of
+	// the task counters above.
+	Workers int
+}
+
+// taskRequest is a task submitted to the dispatcher. Internal control tasks,
+// such as those used by Pause, are excluded from the pool's Stats.
+type taskRequest struct {
+	fn       func()
+	internal bool
+}
+
 // New creates and starts a pool of worker goroutines.
 //
 // The maxWorkers parameter specifies the maximum number of workers that can
@@ -32,7 +72,7 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 
 	pool := &WorkerPool{
 		maxWorkers:  maxWorkers,
-		taskQueue:   make(chan func()),
+		taskQueue:   make(chan taskRequest),
 		workerQueue: make(chan func()),
 		stopSignal:  make(chan struct{}),
 		stoppedChan: make(chan struct{}),
@@ -48,16 +88,18 @@ func New(maxWorkers int, options ...Option) *WorkerPool {
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
 	maxWorkers   int
-	taskQueue    chan func()
+	taskQueue    chan taskRequest
 	workerQueue  chan func()
 	stoppedChan  chan struct{}
 	stopSignal   chan struct{}
-	waitingQueue deque.Deque[func()]
+	waitingQueue deque.Deque[taskRequest]
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
 	waiting      atomic.Int32
 	wait         bool
+	statsLock    sync.Mutex
+	stats        Stats
 }
 
 // Size returns the maximum number of concurrent workers.
@@ -115,11 +157,11 @@ func (p *WorkerPool) Do(task func()) (err error) {
 		return
 	}
 	defer func() {
-		if recover() != nil {
-			err = ErrStopped
-		}
+	if recover() != nil {
+		err = ErrStopped
+	}
 	}()
-	p.taskQueue <- task
+	p.taskQueue <- taskRequest{fn: task}
 	return
 }
 
@@ -150,6 +192,14 @@ func (p *WorkerPool) WaitingQueueSize() int {
 	return int(p.waiting.Load())
 }
 
+// Stats returns a consistent snapshot of the worker pool's counters. See the
+// Stats type for the conservation relations the counters satisfy.
+func (p *WorkerPool) Stats() Stats {
+	p.statsLock.Lock()
+	defer p.statsLock.Unlock()
+	return p.stats
+}
+
 // Pause causes all workers to wait on the given Context, thereby making them
 // unavailable to run tasks. Pause returns when all workers are waiting. Tasks
 // can continue to be queued to the workerpool, but are not executed until the
@@ -171,12 +221,15 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 	ready := new(sync.WaitGroup)
 	ready.Add(p.maxWorkers)
 	for i := 0; i < p.maxWorkers; i++ {
-		p.taskQueue <- func() {
-			ready.Done()
-			select {
-			case <-ctx.Done():
-			case <-p.stopSignal:
-			}
+		p.taskQueue <- taskRequest{
+			fn: func() {
+				ready.Done()
+				select {
+				case <-ctx.Done():
+				case <-p.stopSignal:
+				}
+			},
+			internal: true,
 		}
 	}
 	// Wait for workers to all be paused
@@ -212,23 +265,33 @@ Loop:
 		}
 
 		select {
-		case task, ok := <-p.taskQueue:
+		case req, ok := <-p.taskQueue:
 			if !ok {
 				break Loop
 			}
 			// Got a task to do.
 			select {
-			case p.workerQueue <- task:
+			case p.workerQueue <- p.wrapTask(req):
+				if !req.internal {
+					p.noteStarted()
+				}
 			default:
 				// Create a new worker, if not at max.
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(p.wrapTask(req), p.workerQueue, &wg)
 					workerCount++
+					p.noteWorker(1)
+					if !req.internal {
+						p.noteStarted()
+					}
 				} else {
 					// Enqueue task to be executed by next available worker.
-					p.waitingQueue.PushBack(task)
+					p.waitingQueue.PushBack(req)
 					p.waiting.Store(int32(p.waitingQueue.Len()))
+					if !req.internal {
+						p.noteQueued()
+					}
 				}
 			}
 			idle = false
@@ -238,6 +301,7 @@ Loop:
 			if idle && workerCount > 0 {
 				if p.killIdleWorker() {
 					workerCount--
+					p.noteWorker(-1)
 				}
 			}
 			idle = true
@@ -248,14 +312,95 @@ Loop:
 	// If instructed to wait, then run tasks that are already queued.
 	if p.wait {
 		p.runQueuedTasks()
+	} else {
+		// Discard queued tasks, recording them as dropped.
+		dropped := 0
+		for i := 0; i < p.waitingQueue.Len(); i++ {
+			if !p.waitingQueue.At(i).internal {
+				dropped++
+			}
+		}
+		if dropped > 0 {
+			p.noteDropped(dropped)
+		}
+		p.waiting.Store(0)
 	}
 
 	// Stop all remaining workers as they become ready.
 	for workerCount > 0 {
 		p.workerQueue <- nil
 		workerCount--
+		p.noteWorker(-1)
 	}
 	wg.Wait()
+}
+
+// wrapTask returns the function to give to a worker. User tasks are wrapped
+// to record completion in the pool's stats and to recover from panics, so a
+// panicking task neither crashes the pool nor is lost from the accounting.
+// Internal control tasks are excluded from the stats and run unwrapped.
+func (p *WorkerPool) wrapTask(req taskRequest) func() {
+	if req.internal {
+		return req.fn
+	}
+	return func() {
+		defer func() {
+			_ = recover()
+			p.noteCompleted()
+		}()
+		req.fn()
+	}
+}
+
+// noteQueued records that a submitted task was accepted and put on the
+// waiting queue.
+func (p *WorkerPool) noteQueued() {
+	p.statsLock.Lock()
+	p.stats.Received++
+	p.stats.Queued++
+	p.statsLock.Unlock()
+}
+
+// noteStarted records that a submitted task was accepted and handed directly
+// to a worker.
+func (p *WorkerPool) noteStarted() {
+	p.statsLock.Lock()
+	p.stats.Received++
+	p.stats.Started++
+	p.stats.Running++
+	p.statsLock.Unlock()
+}
+
+// noteDequeued records that a queued task was handed to a worker.
+func (p *WorkerPool) noteDequeued() {
+	p.statsLock.Lock()
+	p.stats.Queued--
+	p.stats.Started++
+	p.stats.Running++
+	p.statsLock.Unlock()
+}
+
+// noteCompleted records that a running task finished executing.
+func (p *WorkerPool) noteCompleted() {
+	p.statsLock.Lock()
+	p.stats.Running--
+	p.stats.Completed++
+	p.statsLock.Unlock()
+}
+
+// noteDropped records that n queued tasks were discarded by Stop.
+func (p *WorkerPool) noteDropped(n int) {
+	p.statsLock.Lock()
+	p.stats.Queued -= n
+	p.stats.Dropped += n
+	p.statsLock.Unlock()
+}
+
+// noteWorker records a change in the number of live worker goroutines.
+func (p *WorkerPool) noteWorker(delta int) {
+	p.statsLock.Lock()
+	p.stats.Workers += delta
+	p.statsLock.Unlock()
 }
 
 // worker executes tasks and stops when it receives a nil task.
@@ -292,15 +437,22 @@ func (p *WorkerPool) stop(wait bool) {
 // tasks from the waiting queue as workers become available. Returns false if
 // worker pool is stopped.
 func (p *WorkerPool) processWaitingQueue() bool {
+	front := p.waitingQueue.Front()
 	select {
-	case task, ok := <-p.taskQueue:
+	case req, ok := <-p.taskQueue:
 		if !ok {
 			return false
 		}
-		p.waitingQueue.PushBack(task)
-	case p.workerQueue <- p.waitingQueue.Front():
+		p.waitingQueue.PushBack(req)
+		if !req.internal {
+			p.noteQueued()
+		}
+	case p.workerQueue <- p.wrapTask(front):
 		// A worker was ready, so gave task to worker.
 		p.waitingQueue.PopFront()
+		if !front.internal {
+			p.noteDequeued()
+		}
 	}
 	p.waiting.Store(int32(p.waitingQueue.Len()))
 	return true
@@ -322,7 +474,11 @@ func (p *WorkerPool) killIdleWorker() bool {
 func (p *WorkerPool) runQueuedTasks() {
 	for p.waitingQueue.Len() != 0 {
 		// A worker is ready, so give task to worker.
-		p.workerQueue <- p.waitingQueue.PopFront()
+		req := p.waitingQueue.PopFront()
+		p.workerQueue <- p.wrapTask(req)
+		if !req.internal {
+			p.noteDequeued()
+		}
 		p.waiting.Store(int32(p.waitingQueue.Len()))
 	}
 }

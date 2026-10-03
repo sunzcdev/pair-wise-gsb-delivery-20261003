@@ -33,6 +33,7 @@ Non-obvious invariants to preserve when changing this code:
 - `Do` detects a stopped pool by recovering from the panic caused by sending on the closed `taskQueue`; `Submit` panics on a stopped pool while `Do` returns `ErrStopped`.
 - `Stop` abandons queued tasks; `StopWait` drains them (`p.wait` flag read by the dispatcher after its loop exits). Both are safe to call multiple times via `stopOnce`, and both wait for `stoppedChan`.
 - `Pause` works by submitting `maxWorkers` blocking tasks that wait on the caller's Context or on `stopSignal`; `stopLock` orders Pause against Stop so a stop always unpauses workers before closing `taskQueue`.
+- `Stats()` returns a consistent snapshot of task/worker counters guarded by `statsLock`; every state transition updates the counters under that lock so `Received == Queued + Running + Completed + Dropped` and `Started == Running + Completed` always hold. `Received` is counted only when the dispatcher accepts a task (never for submissions rejected after stop), and Pause's internal control tasks (`taskRequest.internal`) are excluded from task counters. User tasks are wrapped (`wrapTask`) to recover panics and record completion, so a panicking task counts as completed and does not kill its worker; worker count changes (spawn, idle reap, stop drain) are tracked separately from task counts.
 
 `pacer/` is a self-contained rate limiter for staggering goroutine start times. It is independent of the pool (its tests import workerpool, not the other way around).
 

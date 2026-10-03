@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -442,6 +443,238 @@ func TestWaitingQueueSizeRace(t *testing.T) {
 		}
 		if maxMax >= goroutines*tasks {
 			t.Error("should not have seen all tasks on waiting queue")
+		}
+	})
+}
+
+func TestStats(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(3)
+		const tasks = 10
+		for range tasks {
+			wp.Submit(func() {})
+		}
+		wp.StopWait()
+
+		stats := wp.Stats()
+		if stats.Received != tasks || stats.Started != tasks || stats.Completed != tasks {
+			t.Fatalf("expected %d received/started/completed tasks, got %+v", tasks, stats)
+		}
+		if stats.Queued != 0 || stats.Running != 0 || stats.Dropped != 0 {
+			t.Fatalf("expected no queued/running/dropped tasks, got %+v", stats)
+		}
+		if stats.Workers != 0 {
+			t.Fatal("expected no workers after StopWait, got", stats.Workers)
+		}
+	})
+}
+
+func TestStatsDropped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+		const tasks = 20
+
+		release := make(chan struct{})
+		var mu sync.Mutex
+		executed := make(map[int]struct{}, tasks)
+		for id := range tasks {
+			wp.Submit(func() {
+				<-release
+				mu.Lock()
+				executed[id] = struct{}{}
+				mu.Unlock()
+			})
+		}
+
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			close(release)
+		}()
+		wp.Stop()
+
+		stats := wp.Stats()
+		if stats.Received != tasks {
+			t.Fatalf("expected %d received tasks, got %+v", tasks, stats)
+		}
+		if stats.Dropped == 0 {
+			t.Fatal("expected queued tasks to be dropped by Stop")
+		}
+		if stats.Queued != 0 || stats.Running != 0 {
+			t.Fatalf("expected no queued/running tasks after Stop, got %+v", stats)
+		}
+		if stats.Received != stats.Completed+stats.Dropped {
+			t.Fatalf("received tasks must be completed or dropped, got %+v", stats)
+		}
+		if stats.Started != len(executed) || stats.Completed != len(executed) {
+			t.Fatalf("started/completed counts do not match %d executed tasks: %+v",
+				len(executed), stats)
+		}
+	})
+}
+
+func TestStatsPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+		defer wp.Stop()
+
+		wp.Submit(func() { panic("boom") })
+		done := make(chan struct{})
+		wp.Submit(func() { close(done) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("pool did not survive panicking task")
+		}
+		synctest.Wait()
+
+		stats := wp.Stats()
+		if stats.Received != 2 || stats.Started != 2 || stats.Completed != 2 {
+			t.Fatalf("panicking task must be counted as completed, got %+v", stats)
+		}
+		if stats.Running != 0 {
+			t.Fatalf("expected no running tasks, got %+v", stats)
+		}
+	})
+}
+
+func TestStatsSubmitStopRace(t *testing.T) {
+	wp := New(4)
+
+	var accepted atomic.Int32
+	var submitters sync.WaitGroup
+	for range 8 {
+		submitters.Add(1)
+		go func() {
+			defer submitters.Done()
+			for {
+				if err := wp.Do(func() {}); err != nil {
+					return
+				}
+				accepted.Add(1)
+			}
+		}()
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	wp.Stop()
+	submitters.Wait()
+
+	stats := wp.Stats()
+	if stats.Received != int(accepted.Load()) {
+		t.Fatalf("received count %d does not match %d accepted submissions",
+			stats.Received, accepted.Load())
+	}
+	if stats.Received != stats.Completed+stats.Dropped {
+		t.Fatalf("received tasks must be completed or dropped, got %+v", stats)
+	}
+	if stats.Queued != 0 || stats.Running != 0 || stats.Workers != 0 {
+		t.Fatalf("expected no queued/running tasks or workers after Stop, got %+v", stats)
+	}
+}
+
+func TestStatsStress(t *testing.T) {
+	const (
+		workers   = 8
+		producers = 4
+		tasksEach = 250
+	)
+	const total = producers * tasksEach
+
+	wp := New(workers)
+
+	var mu sync.Mutex
+	executed := make(map[int]struct{}, total)
+
+	var produced sync.WaitGroup
+	produced.Add(producers)
+	for p := range producers {
+		go func() {
+			defer produced.Done()
+			for i := range tasksEach {
+				id := p*tasksEach + i
+				wp.Submit(func() {
+					mu.Lock()
+					executed[id] = struct{}{}
+					mu.Unlock()
+				})
+			}
+		}()
+	}
+
+	// Continuously read snapshots, verifying the conservation relations.
+	stopReading := make(chan struct{})
+	var reader sync.WaitGroup
+	reader.Add(1)
+	go func() {
+		defer reader.Done()
+		for {
+			select {
+			case <-stopReading:
+				return
+			default:
+			}
+			stats := wp.Stats()
+			if stats.Received != stats.Queued+stats.Running+stats.Completed+stats.Dropped {
+				t.Errorf("snapshot violates conservation: %+v", stats)
+				return
+			}
+			if stats.Started != stats.Running+stats.Completed {
+				t.Errorf("snapshot violates conservation: %+v", stats)
+				return
+			}
+		}
+	}()
+
+	produced.Wait()
+	wp.StopWait()
+	close(stopReading)
+	reader.Wait()
+
+	stats := wp.Stats()
+	if stats.Received != total || stats.Started != total || stats.Completed != total {
+		t.Fatalf("expected %d received/started/completed tasks, got %+v", total, stats)
+	}
+	if stats.Queued != 0 || stats.Running != 0 || stats.Dropped != 0 || stats.Workers != 0 {
+		t.Fatalf("expected no queued/running/dropped tasks or workers, got %+v", stats)
+	}
+	if len(executed) != total {
+		t.Fatalf("expected %d unique executed task IDs, got %d", total, len(executed))
+	}
+	if stats.Completed != len(executed) {
+		t.Fatalf("completed count %d does not match %d executed tasks",
+			stats.Completed, len(executed))
+	}
+}
+
+func TestStatsIdleWorkerRetirement(t *testing.T) {
+	const idleTimeout = time.Second
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4, WithIdleTimeout(idleTimeout))
+		defer wp.Stop()
+
+		done := make(chan struct{})
+		wp.Submit(func() { close(done) })
+		<-done
+		synctest.Wait()
+
+		stats := wp.Stats()
+		if stats.Workers != 1 {
+			t.Fatalf("expected 1 worker, got %+v", stats)
+		}
+		if stats.Completed != 1 || stats.Running != 0 {
+			t.Fatalf("expected 1 completed task and none running, got %+v", stats)
+		}
+
+		// Let the idle timeout retire the worker.
+		time.Sleep(idleTimeout*2 + idleTimeout/2)
+		synctest.Wait()
+
+		stats = wp.Stats()
+		if stats.Workers != 0 {
+			t.Fatalf("expected idle worker to be retired, got %+v", stats)
+		}
+		if stats.Received != 1 || stats.Completed != 1 {
+			t.Fatalf("task counts must not change when a worker retires, got %+v", stats)
 		}
 	})
 }
