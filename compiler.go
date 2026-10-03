@@ -23,6 +23,8 @@ type compiler struct {
 	scopes        []*scopeinfo
 	scopecnt      int
 	regexpCache   sync.Map
+	moduleDirs    []string
+	importChains  [][]string
 }
 
 // Code is a compiled jq query.
@@ -91,7 +93,20 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 		c.append(&code{op: opstore, v: c.pushVariable(name)})
 	}
 	if c.moduleLoader != nil {
-		if moduleLoader, ok := c.moduleLoader.(interface {
+		type initWithContextLoader interface {
+			loadInitModulesWithContext() ([]fsInitModule, error)
+		}
+		if moduleLoader, ok := c.moduleLoader.(initWithContextLoader); ok {
+			entries, err := moduleLoader.loadInitModulesWithContext()
+			if err != nil {
+				return nil, err
+			}
+			for _, entry := range entries {
+				if err := c.compileImportedModule(entry.query, "", ".jq", entry.dir); err != nil {
+					return nil, err
+				}
+			}
+		} else if moduleLoader, ok := c.moduleLoader.(interface {
 			LoadInitModules() ([]*Query, error)
 		}); ok {
 			qs, err := moduleLoader.LoadInitModules()
@@ -136,10 +151,19 @@ func (c *compiler) compileImport(i *Import) error {
 	if c.moduleLoader == nil {
 		return fmt.Errorf("cannot load module: %q", path)
 	}
+	dir := c.currentModuleDir()
+	chain := c.currentImportChain()
 	if strings.HasPrefix(alias, "$") {
 		var vals any
 		var err error
-		if moduleLoader, ok := c.moduleLoader.(interface {
+		type jsonWithContextLoader interface {
+			loadJSONWithContext(string, map[string]any, string, []string) (any, error)
+		}
+		if moduleLoader, ok := c.moduleLoader.(jsonWithContextLoader); ok {
+			if vals, err = moduleLoader.loadJSONWithContext(path, i.Meta.ToValue(), dir, chain); err != nil {
+				return err
+			}
+		} else if moduleLoader, ok := c.moduleLoader.(interface {
 			LoadJSONWithMeta(string, map[string]any) (any, error)
 		}); ok {
 			if vals, err = moduleLoader.LoadJSONWithMeta(path, i.Meta.ToValue()); err != nil {
@@ -162,7 +186,19 @@ func (c *compiler) compileImport(i *Import) error {
 	}
 	var q *Query
 	var err error
-	if moduleLoader, ok := c.moduleLoader.(interface {
+	var resolvedPath string
+	type moduleWithContextLoader interface {
+		loadModuleWithContext(string, map[string]any, string, []string) (*Query, string, string, error)
+	}
+	if moduleLoader, ok := c.moduleLoader.(moduleWithContextLoader); ok {
+		var resolvedDir string
+		if q, resolvedPath, resolvedDir, err = moduleLoader.loadModuleWithContext(path, i.Meta.ToValue(), dir, chain); err != nil {
+			return err
+		} else {
+			dir = resolvedDir
+			path = resolvedPath
+		}
+	} else if moduleLoader, ok := c.moduleLoader.(interface {
 		LoadModuleWithMeta(string, map[string]any) (*Query, error)
 	}); ok {
 		if q, err = moduleLoader.LoadModuleWithMeta(path, i.Meta.ToValue()); err != nil {
@@ -176,11 +212,39 @@ func (c *compiler) compileImport(i *Import) error {
 		}
 	}
 	c.appendCodeInfo("module " + path)
-	if err = c.compileModule(q, alias); err != nil {
+	if err = c.compileImportedModule(q, alias, path, dir); err != nil {
 		return err
 	}
 	c.appendCodeInfo("end of module " + path)
 	return nil
+}
+
+func (c *compiler) currentModuleDir() string {
+	if n := len(c.moduleDirs); n > 0 {
+		return c.moduleDirs[n-1]
+	}
+	return ""
+}
+
+func (c *compiler) currentImportChain() []string {
+	if n := len(c.importChains); n > 0 {
+		return append([]string(nil), c.importChains[n-1]...)
+	}
+	return nil
+}
+
+// compileImportedModule compiles a module loaded from path, recording its
+// logical directory so that relative imports nested inside it are anchored to
+// the module's own location.
+func (c *compiler) compileImportedModule(q *Query, alias, path, dir string) error {
+	chain := append(c.currentImportChain(), path)
+	c.moduleDirs = append(c.moduleDirs, dir)
+	c.importChains = append(c.importChains, chain)
+	defer func() {
+		c.moduleDirs = c.moduleDirs[:len(c.moduleDirs)-1]
+		c.importChains = c.importChains[:len(c.importChains)-1]
+	}()
+	return c.compileModule(q, alias)
 }
 
 func (c *compiler) compileModule(q *Query, alias string) error {
