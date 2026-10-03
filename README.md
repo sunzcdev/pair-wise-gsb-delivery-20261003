@@ -413,6 +413,20 @@ Each extension is a pair of a parser extension and an HTML renderer extension.
 - `TypographerParser`
     - This extension substitutes punctuations with typographic entities like [smartypants](https://daringfireball.net/projects/smartypants/).
     - This extension only affects parsing (it emits already-substituted text), so it has no HTML renderer half.
+- `Math(Parser|HTMLRenderer)`
+    - Parses inline `$...$` math and standalone `$$` display math blocks into dedicated AST nodes.
+    - Formula text is preserved verbatim; the built-in HTML renderer only wraps and escapes it and does not run a TeX engine.
+
+Enable the parser and renderer separately:
+
+```go
+p := parser.New(parser.WithExtensions(extension.MathParser))
+r := html.New(html.WithExtensions(extension.MathHTMLRenderer))
+```
+
+Inline math rejects whitespace immediately after the opening delimiter or immediately before the closing delimiter, and a closing delimiter followed by an ASCII digit does not close. Escaped dollar signs and dollar signs inside code spans remain ordinary text. Inline math cannot cross a blank line; unclosed inline delimiters remain ordinary text.
+
+Display math blocks use standalone `$$` lines, may contain blank lines, and preserve their raw formula bytes. The closing line may contain only indentation and trailing whitespace. The default HTML output is `<code>...</code>` for inline math and `<pre><code>...</code></pre>` for display math. Use `extension.WithMathInlineTag` and `extension.WithMathBlockTag` to configure the tags for downstream rendering.
 
 ### Attributes
 The `parser.WithAttribute` option allows you to define attributes on some elements.
