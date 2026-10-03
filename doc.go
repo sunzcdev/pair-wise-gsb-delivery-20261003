@@ -4,7 +4,8 @@
 // A decoded document is represented as a tree of [Packet] values. Decode bytes
 // with [DecodePacketErr], or stream from an [io.Reader] with [ReadPacket]; build
 // packets to encode with the New* constructors and serialize them with
-// [Packet.Bytes].
+// [Packet.Bytes], or stream the encoding to an [io.Writer] with
+// [Packet.WriteTo] / [Packet.AppendTo].
 //
 // The decoder is written to accept untrusted input: the [MaxPacketLengthBytes]
 // and [MaxNestingDepth] package variables bound allocation and recursion. Prefer

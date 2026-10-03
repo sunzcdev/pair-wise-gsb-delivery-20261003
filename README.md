@@ -49,6 +49,10 @@ instead; prefer the `Err` form. When decoding untrusted data, the
 `MaxPacketLengthBytes` and `MaxNestingDepth` package variables bound memory and
 recursion.
 
+For large or deeply nested packets, `seq.WriteTo(w)` streams the encoding to
+an `io.Writer` (and `seq.AppendTo(buf)` to a byte slice) after a single length
+pass, without copying each subtree at every depth like `Bytes()` does.
+
 See the [reference documentation](https://pkg.go.dev/github.com/go-asn1-ber/asn1-ber)
 for the full API.
 

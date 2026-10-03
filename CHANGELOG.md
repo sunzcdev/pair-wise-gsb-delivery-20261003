@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `Packet.WriteTo` (implementing `io.WriterTo`) and `Packet.AppendTo`: stream
+  the BER encoding to an `io.Writer` or byte slice after a single length
+  pass, avoiding the per-depth subtree copies that `Bytes()` makes on deep
+  trees. They reject nil child packets (`ErrNilPacket`), cycles
+  (`ErrPacketCycle`), and unrepresentable lengths (`ErrPacketTooLarge`);
+  shared subtrees are encoded once per occurrence and short writes stop
+  before any sibling is written.
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
