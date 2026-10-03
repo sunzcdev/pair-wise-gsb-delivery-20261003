@@ -37,6 +37,25 @@ This implementation allows for creating HyperLogLog sketches with arbitrary prec
 
 Users can choose the precision that best fits their use case, balancing memory usage against estimation accuracy.
 
+## Sliding Window
+
+`NewSlidingWindow` wraps `Sketch` with a fixed-width sliding window keyed on
+caller-supplied event time (the window never reads or advances a wall clock).
+Events are placed into fixed-width buckets, and a query merges only the
+buckets that still overlap the window ending at the query time. Expired
+buckets are cleared in place rather than subtracted from an aggregate sketch,
+which is important because HyperLogLog estimates do not support subtraction.
+
+* Events older than the window are dropped as late events; future events are
+  accepted and move the window forward, clearing every bucket skipped by the
+  jump.
+* Bucket state lives in a fixed-size ring whose capacity is derived from the
+  window and bucket width, so memory stays bounded even after large time
+  skips and reused ring slots never carry stale data.
+* The window length, bucket width, and precision are validated at
+  construction (`ErrorInvalidWindow`, possibly wrapping
+  `ErrorInvalidPrecision`).
+
 ## Note
 A big thank you to Prof. Shigang Chen and his team at the University of Florida who are actively conducting research around "Big Network Data".
 
