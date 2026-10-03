@@ -13,8 +13,9 @@ type Ticker struct {
 	C        <-chan time.Time
 	c        chan time.Time
 	b        BackOff
-	timer    timer
+	clock    Clock
 	stop     chan struct{}
+	done     chan struct{}
 	stopOnce sync.Once
 }
 
@@ -25,13 +26,21 @@ type Ticker struct {
 // provided backoff policy (notably calling NextBackOff or Reset)
 // while the ticker is running.
 func NewTicker(b BackOff) *Ticker {
+	return NewTickerWithClock(b, SystemClock)
+}
+
+// NewTickerWithClock works like NewTicker but uses the given Clock as the
+// source of time for scheduling ticks. Inject a controllable clock in tests to
+// verify timing deterministically without sleeping.
+func NewTickerWithClock(b BackOff, clock Clock) *Ticker {
 	c := make(chan time.Time)
 	t := &Ticker{
 		C:     c,
 		c:     c,
 		b:     b,
-		timer: &defaultTimer{},
+		clock: clock,
 		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
 	}
 	t.b.Reset()
 	go t.run()
@@ -41,43 +50,64 @@ func NewTicker(b BackOff) *Ticker {
 // Stop turns off a ticker. After Stop, no more ticks will be sent.
 func (t *Ticker) Stop() {
 	t.stopOnce.Do(func() { close(t.stop) })
+	<-t.done
 }
 
 func (t *Ticker) run() {
-	c := t.c
-	defer close(c)
+	defer close(t.c)
+	defer close(t.done)
 
-	// Ticker is guaranteed to tick at least once.
-	afterC := t.send(time.Now())
+	var prev Timer
+	var pending time.Time
+	havePending := true
+	pending = t.clock.Now() // Ticker is guaranteed to tick at least once.
+	defer func() {
+		if prev != nil {
+			prev.Stop()
+		}
+	}()
 
 	for {
-		if afterC == nil {
+		// First deliver the tick carried over from the previous iteration (or
+		// the guaranteed initial tick). Delivery is scheduled before the next
+		// wait is registered, so a controllable clock that sees no timer yet
+		// right after a tick keeps waiting instead of assuming the ticker
+		// settled.
+		if havePending {
+			if !t.deliver(pending) {
+				return
+			}
+			havePending = false
+		}
+
+		next := t.b.NextBackOff()
+		if next == Stop {
+			t.stopOnce.Do(func() { close(t.stop) })
 			return
 		}
 
+		timer := t.clock.NewTimer(next)
 		select {
-		case tick := <-afterC:
-			afterC = t.send(tick)
+		case tick := <-timer.C():
+			if prev != nil {
+				prev.Stop()
+			}
+			prev = timer
+			pending, havePending = tick, true
 		case <-t.stop:
-			t.c = nil // Prevent future ticks from being sent to the channel.
+			timer.Stop()
 			return
 		}
 	}
 }
 
-func (t *Ticker) send(tick time.Time) <-chan time.Time {
+// deliver sends one tick to C and reports whether it was delivered. It returns
+// false if Stop was called while waiting to send.
+func (t *Ticker) deliver(tick time.Time) bool {
 	select {
 	case t.c <- tick:
+		return true
 	case <-t.stop:
-		return nil
+		return false
 	}
-
-	next := t.b.NextBackOff()
-	if next == Stop {
-		t.Stop()
-		return nil
-	}
-
-	t.timer.Start(next)
-	return t.timer.C()
 }

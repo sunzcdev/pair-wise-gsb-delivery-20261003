@@ -7,27 +7,27 @@ import (
 	"io"
 	"log"
 	"math"
+	"sync"
 	"testing"
 	"time"
 )
 
-type testTimer struct {
-	timer *time.Timer
+// immediateTimer fires as soon as it is read, without sleeping.
+type immediateTimer struct{}
+
+func (immediateTimer) C() <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	ch <- time.Time{}
+	return ch
 }
 
-func (t *testTimer) Start(duration time.Duration) {
-	t.timer = time.NewTimer(0)
-}
+func (immediateTimer) Stop() bool { return false }
 
-func (t *testTimer) Stop() {
-	if t.timer != nil {
-		t.timer.Stop()
-	}
-}
+// immediateClock schedules every wait to fire immediately.
+type immediateClock struct{}
 
-func (t *testTimer) C() <-chan time.Time {
-	return t.timer.C
-}
+func (immediateClock) Now() time.Time               { return time.Now() }
+func (immediateClock) NewTimer(time.Duration) Timer { return immediateTimer{} }
 
 func TestRetry(t *testing.T) {
 	const successOn = 3
@@ -47,7 +47,7 @@ func TestRetry(t *testing.T) {
 		return false, errors.New("error")
 	}
 
-	_, err := Retry(context.Background(), f, WithBackOff(NewExponentialBackOff()), withTimer(&testTimer{}))
+	_, err := Retry(context.Background(), f, WithBackOff(NewExponentialBackOff()), WithClock(immediateClock{}))
 	if err != nil {
 		t.Errorf("unexpected error: %s", err.Error())
 	}
@@ -74,7 +74,7 @@ func TestRetryWithData(t *testing.T) {
 		return 1, errors.New("error")
 	}
 
-	res, err := Retry(context.Background(), f, WithBackOff(NewExponentialBackOff()), withTimer(&testTimer{}))
+	res, err := Retry(context.Background(), f, WithBackOff(NewExponentialBackOff()), WithClock(immediateClock{}))
 	if err != nil {
 		t.Errorf("unexpected error: %s", err.Error())
 	}
@@ -110,7 +110,7 @@ func TestRetryContext(t *testing.T) {
 		return false, fmt.Errorf("error (%d)", i)
 	}
 
-	_, err := Retry(ctx, f, WithBackOff(NewConstantBackOff(time.Millisecond)), withTimer(&testTimer{}))
+	_, err := Retry(ctx, f, WithBackOff(NewConstantBackOff(time.Millisecond)), WithClock(immediateClock{}))
 	if err == nil {
 		t.Errorf("error is unexpectedly nil")
 	}
@@ -139,7 +139,7 @@ func TestRetryContextErrorIncludesOperationError(t *testing.T) {
 		return false, opErr
 	}
 
-	_, err := Retry(ctx, f, WithBackOff(NewConstantBackOff(time.Millisecond)), withTimer(&testTimer{}))
+	_, err := Retry(ctx, f, WithBackOff(NewConstantBackOff(time.Millisecond)), WithClock(immediateClock{}))
 	if !errors.Is(err, ctxErr) {
 		t.Errorf("context error not in result: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestRetryMaxElapsedTimeErrorIncludesOperationError(t *testing.T) {
 		context.Background(),
 		func() (bool, error) { return false, opErr },
 		WithMaxElapsedTime(time.Millisecond),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if !errors.Is(err, ErrMaxElapsedTime) {
 		t.Errorf("ErrMaxElapsedTime not in result: %v", err)
@@ -174,7 +174,7 @@ func TestRetryError(t *testing.T) {
 		context.Background(),
 		func() (bool, error) { return false, opErr },
 		WithMaxTries(1),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if !errors.Is(err, ErrExhausted) {
 		t.Errorf("ErrExhausted not in result: %v", err)
@@ -200,7 +200,7 @@ func TestRetryError(t *testing.T) {
 		context.Background(),
 		func() (bool, error) { return false, opErr },
 		WithBackOff(&StopBackOff{}),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if !errors.Is(err, ErrExhausted) {
 		t.Errorf("ErrExhausted not in result on Stop: %v", err)
@@ -225,7 +225,7 @@ func TestRetryPermanent(t *testing.T) {
 				return f()
 			},
 			WithBackOff(NewExponentialBackOff()),
-			withTimer(&testTimer{}),
+			WithClock(immediateClock{}),
 		)
 
 		if shouldRetry && numRetries == 0 {
@@ -322,7 +322,7 @@ func TestRetryPermanentError(t *testing.T) {
 	_, err := Retry(
 		context.Background(),
 		func() (bool, error) { return false, Permanent(opErr) },
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if !errors.Is(err, ErrPermanent) {
 		t.Errorf("ErrPermanent not in result: %v", err)
@@ -361,24 +361,26 @@ func TestIssue177(t *testing.T) {
 	}
 }
 
-// spyTimer records the durations it is asked to wait, then fires immediately.
-type spyTimer struct {
+// spyClock records the durations it is asked to wait, then fires immediately.
+type spyClock struct {
+	mu     sync.Mutex
 	starts []time.Duration
-	timer  *time.Timer
 }
 
-func (t *spyTimer) Start(d time.Duration) {
-	t.starts = append(t.starts, d)
-	t.timer = time.NewTimer(0)
+func (c *spyClock) Now() time.Time { return time.Now() }
+
+func (c *spyClock) NewTimer(d time.Duration) Timer {
+	c.mu.Lock()
+	c.starts = append(c.starts, d)
+	c.mu.Unlock()
+	return immediateTimer{}
 }
 
-func (t *spyTimer) Stop() {
-	if t.timer != nil {
-		t.timer.Stop()
-	}
+func (c *spyClock) waits() []time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]time.Duration(nil), c.starts...)
 }
-
-func (t *spyTimer) C() <-chan time.Time { return t.timer.C }
 
 // countingBackOff records how many times it is reset and queried.
 type countingBackOff struct{ resets, nexts int }
@@ -397,7 +399,7 @@ func TestRetryContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
 	defer cancel()
 
-	_, err := Retry(ctx, func() (int, error) { return 0, opErr }, withTimer(&testTimer{}))
+	_, err := Retry(ctx, func() (int, error) { return 0, opErr }, WithClock(immediateClock{}))
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Cause is not context.DeadlineExceeded: %v", err)
@@ -423,7 +425,7 @@ func TestRetryNotify(t *testing.T) {
 				}
 				return 0, fmt.Errorf("attempt %d", calls)
 			},
-			WithBackOff(&ZeroBackOff{}), withTimer(&testTimer{}),
+			WithBackOff(&ZeroBackOff{}), WithClock(immediateClock{}),
 			WithNotify(func(e error, _ time.Duration) { got = append(got, e.Error()) }),
 		)
 		if err != nil {
@@ -440,7 +442,7 @@ func TestRetryNotify(t *testing.T) {
 		n := 0
 		_, err := Retry(context.Background(),
 			func() (int, error) { return 0, errors.New("boom") },
-			WithMaxTries(2), WithBackOff(&ZeroBackOff{}), withTimer(&testTimer{}),
+			WithMaxTries(2), WithBackOff(&ZeroBackOff{}), WithClock(immediateClock{}),
 			WithNotify(func(error, time.Duration) { n++ }),
 		)
 		if !errors.Is(err, ErrExhausted) {
@@ -455,7 +457,7 @@ func TestRetryNotify(t *testing.T) {
 		n := 0
 		_, _ = Retry(context.Background(),
 			func() (int, error) { return 0, Permanent(errors.New("nope")) },
-			withTimer(&testTimer{}),
+			WithClock(immediateClock{}),
 			WithNotify(func(error, time.Duration) { n++ }),
 		)
 		if n != 0 {
@@ -468,7 +470,7 @@ func TestRetryNotify(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		_, _ = Retry(ctx,
 			func() (int, error) { cancel(); return 0, errors.New("boom") },
-			WithBackOff(&ZeroBackOff{}), withTimer(&testTimer{}),
+			WithBackOff(&ZeroBackOff{}), WithClock(immediateClock{}),
 			WithNotify(func(error, time.Duration) { n++ }),
 		)
 		if n != 0 {
@@ -482,7 +484,7 @@ func TestRetryAfter(t *testing.T) {
 	// resets the backoff policy.
 	const retryAfter = 42 * time.Second
 	bo := &countingBackOff{}
-	tm := &spyTimer{}
+	tm := &spyClock{}
 	calls := 0
 
 	_, err := Retry(context.Background(),
@@ -495,13 +497,13 @@ func TestRetryAfter(t *testing.T) {
 		},
 		WithBackOff(bo),
 		WithMaxElapsedTime(0),
-		withTimer(tm),
+		WithClock(tm),
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(tm.starts) != 1 || tm.starts[0] != retryAfter {
-		t.Errorf("timer waits = %v, want a single wait of %v", tm.starts, retryAfter)
+	if len(tm.waits()) != 1 || tm.waits()[0] != retryAfter {
+		t.Errorf("timer waits = %v, want a single wait of %v", tm.waits(), retryAfter)
 	}
 	// Reset is called once at the start of Retry and again because of RetryAfter.
 	if bo.resets != 2 {
@@ -512,7 +514,7 @@ func TestRetryAfter(t *testing.T) {
 func TestRetryAfterPolicyStop(t *testing.T) {
 	// The policy's Stop wins over a RetryAfterError: no wait, no retry.
 	cause := errors.New("rate limited")
-	tm := &spyTimer{}
+	tm := &spyClock{}
 	calls := 0
 
 	_, err := Retry(context.Background(),
@@ -522,7 +524,7 @@ func TestRetryAfterPolicyStop(t *testing.T) {
 		},
 		WithBackOff(&StopBackOff{}),
 		WithMaxElapsedTime(0),
-		withTimer(tm),
+		WithClock(tm),
 	)
 	if !errors.Is(err, ErrExhausted) {
 		t.Fatalf("error = %v, want ErrExhausted", err)
@@ -530,15 +532,15 @@ func TestRetryAfterPolicyStop(t *testing.T) {
 	if re := AsRetryError(err); re == nil || re.LastErr != cause {
 		t.Errorf("LastErr = %v, want %v", re, cause)
 	}
-	if calls != 1 || len(tm.starts) != 0 {
-		t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.starts)
+	if calls != 1 || len(tm.waits()) != 0 {
+		t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.waits())
 	}
 }
 
 func TestRetryAfterTypedNil(t *testing.T) {
 	// A typed-nil *RetryAfterError is retried like a plain error, not a panic.
 	calls := 0
-	tm := &spyTimer{}
+	tm := &spyClock{}
 
 	res, err := Retry(context.Background(),
 		func() (int, error) {
@@ -550,13 +552,13 @@ func TestRetryAfterTypedNil(t *testing.T) {
 			return 0, rae
 		},
 		WithBackOff(NewConstantBackOff(time.Second)),
-		withTimer(tm),
+		WithClock(tm),
 	)
 	if err != nil || res != 1 {
 		t.Fatalf("Retry = (%d, %v), want (1, nil)", res, err)
 	}
-	if len(tm.starts) != 1 || tm.starts[0] != time.Second {
-		t.Errorf("timer waits = %v, want the policy's 1s", tm.starts)
+	if len(tm.waits()) != 1 || tm.waits()[0] != time.Second {
+		t.Errorf("timer waits = %v, want the policy's 1s", tm.waits())
 	}
 }
 
@@ -598,7 +600,7 @@ func TestRetryAfterCarriesError(t *testing.T) {
 		context.Background(),
 		func() (int, error) { return 0, RetryAfter(time.Second, cause) },
 		WithMaxTries(1),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if !errors.Is(err, ErrExhausted) {
 		t.Errorf("Cause = %v, want ErrExhausted", err)
@@ -617,7 +619,7 @@ func TestRetryAfterCarriesError(t *testing.T) {
 		context.Background(),
 		func() (int, error) { return 0, RetryAfter(time.Second, nil) },
 		WithMaxTries(1),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if re := AsRetryError(err); re == nil {
 		t.Fatalf("result is not a *RetryError: %v", err)
@@ -655,7 +657,7 @@ func TestRetryElapsedTimeOverflow(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			calls := 0
-			tm := &spyTimer{}
+			tm := &spyClock{}
 			_, err := Retry(context.Background(), func() (int, error) {
 				calls++
 				if calls > 1 {
@@ -663,15 +665,15 @@ func TestRetryElapsedTimeOverflow(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond) // Ensure elapsed time is non-zero.
 				return 0, tt.err
-			}, WithBackOff(tt.backOff), WithMaxElapsedTime(time.Second), withTimer(tm))
+			}, WithBackOff(tt.backOff), WithMaxElapsedTime(time.Second), WithClock(tm))
 			if !errors.Is(err, ErrMaxElapsedTime) {
 				t.Fatalf("error = %v, want ErrMaxElapsedTime", err)
 			}
 			if re := AsRetryError(err); re == nil || re.LastErr != operationErr {
 				t.Errorf("LastErr = %v, want %v", re, operationErr)
 			}
-			if calls != 1 || len(tm.starts) != 0 {
-				t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.starts)
+			if calls != 1 || len(tm.waits()) != 0 {
+				t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.waits())
 			}
 		})
 	}
@@ -680,7 +682,7 @@ func TestRetryElapsedTimeOverflow(t *testing.T) {
 func TestRetryAfterNegativeDuration(t *testing.T) {
 	// A negative delay must not extend the elapsed-time budget.
 	calls := 0
-	tm := &spyTimer{}
+	tm := &spyClock{}
 	_, err := Retry(context.Background(), func() (int, error) {
 		calls++
 		if calls > 1 {
@@ -688,29 +690,29 @@ func TestRetryAfterNegativeDuration(t *testing.T) {
 		}
 		time.Sleep(2 * time.Millisecond)
 		return 0, RetryAfter(-time.Hour, errors.New("rate limited"))
-	}, WithMaxElapsedTime(time.Millisecond), withTimer(tm))
+	}, WithMaxElapsedTime(time.Millisecond), WithClock(tm))
 	if !errors.Is(err, ErrMaxElapsedTime) {
 		t.Fatalf("error = %v, want ErrMaxElapsedTime", err)
 	}
-	if calls != 1 || len(tm.starts) != 0 {
-		t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.starts)
+	if calls != 1 || len(tm.waits()) != 0 {
+		t.Errorf("calls = %d, waits = %v; want one call and no wait", calls, tm.waits())
 	}
 }
 
 func TestRetryAfterNegativeDurationWaitsZero(t *testing.T) {
 	calls := 0
-	tm := &spyTimer{}
+	tm := &spyClock{}
 	_, err := Retry(context.Background(), func() (int, error) {
 		calls++
 		if calls > 1 {
 			return 1, nil
 		}
 		return 0, RetryAfter(Stop, errors.New("rate limited"))
-	}, withTimer(tm))
+	}, WithClock(tm))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(tm.starts) != 1 || tm.starts[0] != 0 {
-		t.Errorf("waits = %v, want a single wait of 0", tm.starts)
+	if len(tm.waits()) != 1 || tm.waits()[0] != 0 {
+		t.Errorf("waits = %v, want a single wait of 0", tm.waits())
 	}
 }

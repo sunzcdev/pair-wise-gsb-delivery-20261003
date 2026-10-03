@@ -23,7 +23,7 @@ type Notify func(error, time.Duration)
 // retryOptions holds configuration settings for the retry mechanism.
 type retryOptions struct {
 	BackOff        BackOff       // Strategy for calculating backoff periods.
-	Timer          timer         // Timer to manage retry delays.
+	Clock          Clock         // Source of time and timers.
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
@@ -44,10 +44,13 @@ func WithBackOff(b BackOff) RetryOption {
 	}
 }
 
-// withTimer sets a custom timer for managing delays between retries.
-func withTimer(t timer) RetryOption {
+// WithClock sets the source of time used to measure MaxElapsedTime and to
+// schedule the waits between attempts. The default is SystemClock, which uses
+// real wall-clock time and *time.Timer. Inject a controllable clock in tests to
+// verify timing deterministically without sleeping.
+func WithClock(c Clock) RetryOption {
 	return func(args *retryOptions) {
-		args.Timer = t
+		args.Clock = c
 	}
 }
 
@@ -115,7 +118,7 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 	// Initialize default retry options.
 	args := &retryOptions{
 		BackOff:        NewExponentialBackOff(),
-		Timer:          &defaultTimer{},
+		Clock:          SystemClock,
 		MaxElapsedTime: DefaultMaxElapsedTime,
 	}
 
@@ -124,10 +127,18 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		opt(args)
 	}
 
-	defer args.Timer.Stop()
-
-	startedAt := time.Now()
+	startedAt := args.Clock.Now()
 	args.BackOff.Reset()
+	// active is the wait of the current iteration, if any. It is stopped as
+	// soon as its value is consumed (after the next wait is registered) or when
+	// Retry returns, so a controllable clock never sees a consumed wait leak
+	// past the end of the loop.
+	var active Timer
+	defer func() {
+		if active != nil {
+			active.Stop()
+		}
+	}()
 	for numTries := uint(1); ; numTries++ {
 		// Execute the operation.
 		res, err := operation()
@@ -181,7 +192,7 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		}
 
 		// Stop retrying if maximum elapsed time exceeded.
-		if args.MaxElapsedTime > 0 && next > args.MaxElapsedTime-time.Since(startedAt) {
+		if args.MaxElapsedTime > 0 && next > args.MaxElapsedTime-args.Clock.Now().Sub(startedAt) {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrMaxElapsedTime}
 		}
 
@@ -191,10 +202,20 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		}
 
 		// Wait for the next backoff period or context cancellation.
-		args.Timer.Start(next)
+		timer := args.Clock.NewTimer(next)
+		// Register the new wait first, then discard the wait consumed by the
+		// previous iteration. The new-before-old order gives a controllable
+		// clock a stable handover: one advance chains through deadlines without
+		// mistaking the swap for the end of Retry.
+		prev := active
+		active = timer
+		if prev != nil {
+			prev.Stop()
+		}
 		select {
-		case <-args.Timer.C():
+		case <-timer.C():
 		case <-ctx.Done():
+			timer.Stop()
 			return res, &RetryError{LastErr: lastErr, Cause: context.Cause(ctx)}
 		}
 	}

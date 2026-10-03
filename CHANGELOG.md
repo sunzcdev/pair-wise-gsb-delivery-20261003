@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Clock` and `Timer` interfaces plus the default `SystemClock`, making the time source of `Retry` and `Ticker` injectable. `WithClock` configures `Retry`; `NewTickerWithClock` creates a ticker with a custom clock. A controllable clock lets tests verify `MaxElapsedTime`, backoff waits, and the cancellation race deterministically without sleeping. Defaults still use real wall-clock time and `*time.Timer`, so existing call sites are unchanged.
+
+### Changed
+
+- Every backoff wait now uses a fresh timer instead of reusing one. A timer value left unread (expired but not yet read) can therefore never wake a later wait, and a timer event from before `Ticker.Stop` can no longer start a new tick cycle.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed

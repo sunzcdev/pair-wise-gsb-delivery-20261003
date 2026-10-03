@@ -20,7 +20,7 @@ func TestRetryMaxTriesCount(t *testing.T) {
 			WithMaxTries(n),
 			WithBackOff(&ZeroBackOff{}),
 			WithMaxElapsedTime(0),
-			withTimer(&testTimer{}),
+			WithClock(immediateClock{}),
 		)
 		if calls != int(n) {
 			t.Errorf("WithMaxTries(%d): operation called %d times, want %d", n, calls, n)
@@ -48,7 +48,7 @@ func TestRetryMaxTriesUnlimited(t *testing.T) {
 		WithMaxTries(0),
 		WithBackOff(&ZeroBackOff{}),
 		WithMaxElapsedTime(0),
-		withTimer(&testTimer{}),
+		WithClock(immediateClock{}),
 	)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

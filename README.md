@@ -80,6 +80,12 @@ Two independent limits cap how long `Retry` runs, and they behave differently:
 
 `WithMaxElapsedTime` defaults to 15 minutes, so **both limits are active unless you override it** — pass `backoff.WithMaxElapsedTime(0)` to rely solely on the context.
 
+### Injecting a clock
+
+`Retry` and `Ticker` take their time — `Now()` for the elapsed-time budget and timers for the waits — from a `Clock`. The default `SystemClock` uses real time and `*time.Timer`, so existing code is unchanged. Pass `backoff.WithClock(...)` (or `backoff.NewTickerWithClock`) with a controllable clock to test timing deterministically, including `MaxElapsedTime`, backoff delays, and context cancellation, without sleeping.
+
+Each wait uses a fresh timer, so an expired value left unread can never wake a later wait, and an event from before `Ticker.Stop` cannot start a new tick.
+
 ## Contributing
 
 * I would like to keep this library as small as possible.
