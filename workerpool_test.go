@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -676,6 +677,344 @@ func assertPanics(t *testing.T, name string, f func()) {
 	}()
 
 	f()
+}
+
+// TestSubmitKeySerial verifies that tasks sharing a key execute strictly one
+// at a time in submission order.
+func TestSubmitKeySerial(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(max)
+		defer wp.Stop()
+
+		const count = 50
+		done := make(chan int, count)
+
+		var active int32
+		for i := range count {
+			SubmitKey(wp, "serial-key", func() {
+				if !atomic.CompareAndSwapInt32(&active, 0, 1) {
+					t.Error("two tasks for the same key ran concurrently")
+				}
+				done <- i
+				time.Sleep(time.Millisecond)
+				atomic.StoreInt32(&active, 0)
+			})
+		}
+
+		for i := range count {
+			select {
+			case got := <-done:
+				if got != i {
+					t.Fatalf("keyed tasks ran out of order: got %d, want %d", got, i)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for keyed task", i)
+			}
+		}
+	})
+}
+
+// TestSubmitKeyDifferentKeysParallel verifies that different keys execute
+// concurrently, sharing the pool's workers with plain Submit tasks.
+func TestSubmitKeyDifferentKeysParallel(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(3)
+		defer wp.Stop()
+
+		started := make(chan string, 3)
+		release := make(chan struct{})
+
+		run := func(name string) {
+			started <- name
+			<-release
+		}
+
+		SubmitKey(wp, "a", func() { run("a") })
+		SubmitKey(wp, "b", func() { run("b") })
+		wp.Submit(func() { run("plain") })
+
+	timeout:
+		for range 3 {
+			select {
+			case <-started:
+			case <-time.After(time.Second):
+				t.Fatal("different keys did not run in parallel")
+				break timeout
+			}
+		}
+		close(release)
+	})
+}
+
+// TestHotKeyDoesNotBlockColdKeys proves the central scheduling guarantee: a
+// blocked hot key with a large backlog occupies a single worker only; tasks
+// for independent cold keys submitted afterwards still run on other workers.
+func TestHotKeyDoesNotBlockColdKeys(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(3)
+
+		hotStarted := make(chan struct{})
+		releaseHot := make(chan struct{})
+
+		// Build a hot-key backlog: one task blocks, many more queue behind it.
+		SubmitKey(wp, "hot", func() {
+			close(hotStarted)
+			<-releaseHot
+		})
+		<-hotStarted
+		const backlog = 20
+		for range backlog {
+			SubmitKey(wp, "hot", func() { <-releaseHot })
+		}
+		synctest.Wait()
+
+		// The entire hot-key backlog is parked on the key, none of it in the
+		// shared waiting queue.
+		if wp.waitingQueue.Len() != 0 {
+			t.Fatalf("hot-key backlog leaked into waiting queue: %d", wp.waitingQueue.Len())
+		}
+		if ks := wp.keyQueues["hot"]; ks == nil || ks.pending.Len() != backlog {
+			t.Fatalf("expected %d parked hot-key tasks", backlog)
+		}
+
+		// Several independent cold keys arrive afterwards; each must run while
+		// the hot key remains blocked.
+		const coldKeys = 2
+		coldDone := make(chan string, coldKeys)
+		for _, name := range []string{"cold-1", "cold-2"} {
+			SubmitKey(wp, name, func() {
+				coldDone <- name
+			})
+		}
+
+	seen:
+		for range coldKeys {
+			select {
+			case <-coldDone:
+			case <-time.After(time.Second):
+				t.Fatal("independent cold key was blocked by hot-key backlog")
+				break seen
+			}
+		}
+
+		close(releaseHot)
+		wp.StopWait()
+
+		// StopWait drains every keyed task and removes all key state.
+		if len(wp.keyQueues) != 0 {
+			t.Fatalf("key table not cleaned up after StopWait: %d keys", len(wp.keyQueues))
+		}
+	})
+}
+
+// TestSubmitKeyStateCleanup verifies that a key's bookkeeping is removed as
+// soon as its last task completes, rather than accumulating for the pool's
+// lifetime.
+func TestSubmitKeyStateCleanup(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4)
+
+		const keys = 100
+		var wg sync.WaitGroup
+		wg.Add(keys)
+		for i := range keys {
+			SubmitKey(wp, i, func() { wg.Done() })
+		}
+		wg.Wait()
+
+		// Allow the dispatcher to process every completion notification.
+		synctest.Wait()
+		if len(wp.keyQueues) != 0 {
+			t.Fatalf("expected empty key table, have %d keys", len(wp.keyQueues))
+		}
+		if wp.keyedRunning != 0 {
+			t.Fatalf("expected zero running keyed tasks, have %d", wp.keyedRunning)
+		}
+
+		// A key reused later behaves like a fresh key.
+		done := make(chan struct{})
+		SubmitKey(wp, 0, func() { close(done) })
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("reused key did not run")
+		}
+
+		wp.StopWait()
+		if len(wp.keyQueues) != 0 {
+			t.Fatalf("key table not cleaned up after StopWait: %d keys", len(wp.keyQueues))
+		}
+	})
+}
+
+// TestStopAbandonsKeyed verifies that Stop discards parked keyed tasks but
+// lets the currently running keyed task complete, and that key state is
+// cleared.
+func TestStopAbandonsKeyed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(1)
+
+		release := make(chan struct{})
+		ran := make(chan struct{}, 8)
+
+		SubmitKey(wp, "k", func() {
+			<-release
+			ran <- struct{}{}
+		})
+		for range 8 {
+			SubmitKey(wp, "k", func() {
+				ran <- struct{}{}
+			})
+		}
+
+		stopDone := make(chan struct{})
+		go func() {
+			wp.Stop()
+			close(stopDone)
+		}()
+
+		// Stop must not return while the running task is still blocked.
+		select {
+		case <-stopDone:
+			t.Fatal("Stop returned before running task completed")
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("Stop did not return after running task completed")
+		}
+
+		// Only the single running task completed; the parked backlog was
+		// abandoned.
+		if len(ran) != 1 {
+			t.Fatalf("expected 1 completed task, got %d", len(ran))
+		}
+		if len(wp.keyQueues) != 0 {
+			t.Fatalf("key table not cleaned up after Stop: %d keys", len(wp.keyQueues))
+		}
+	})
+}
+
+// TestStopWaitDrainsKeyed verifies that StopWait executes every parked keyed
+// task, strictly in order.
+func TestStopWaitDrainsKeyed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(2)
+
+		release := make(chan struct{})
+
+		// Tie up both workers: one hot-key task blocks, one plain task blocks.
+		SubmitKey(wp, "hot", func() { <-release })
+		wp.Submit(func() { <-release })
+
+		const queued = 25
+		var mu sync.Mutex
+		var order []int
+		for i := range queued {
+			i := i
+			SubmitKey(wp, "hot", func() {
+				mu.Lock()
+				order = append(order, i)
+				mu.Unlock()
+			})
+		}
+
+		stopDone := make(chan struct{})
+		go func() {
+			wp.StopWait()
+			close(stopDone)
+		}()
+
+		select {
+		case <-stopDone:
+			t.Fatal("StopWait returned while tasks were blocked")
+		case <-time.After(10 * time.Millisecond):
+		}
+
+		close(release)
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("StopWait did not drain queued keyed tasks")
+		}
+
+		if len(order) != queued {
+			t.Fatalf("expected %d drained tasks, got %d", queued, len(order))
+		}
+		for i := range queued {
+			if order[i] != i {
+				t.Fatalf("drained keyed tasks out of order at %d: got %d", i, order[i])
+			}
+		}
+	})
+}
+
+// TestDoKeyStopped verifies the error/panic contract after the pool stops.
+func TestDoKeyStopped(t *testing.T) {
+	wp := New(1)
+	wp.Stop()
+
+	err := DoKey(wp, "k", func() {})
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("expected ErrStopped, got %v", err)
+	}
+	assertPanics(t, "SubmitKey", func() {
+		SubmitKey(wp, "k", func() {})
+	})
+}
+
+// TestPauseWithKeyed verifies keyed tasks queued while paused run after the
+// pause is lifted, with same-key serialization intact.
+func TestPauseWithKeyed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		wp := New(4)
+		defer wp.Stop()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		wp.Pause(ctx)
+
+		const count = 10
+		var active int32
+		var wg sync.WaitGroup
+		wg.Add(count)
+		for range count {
+			SubmitKey(wp, "paused-key", func() {
+				if !atomic.CompareAndSwapInt32(&active, 0, 1) {
+					t.Error("two tasks for the same key ran concurrently")
+				}
+				wg.Done()
+				atomic.StoreInt32(&active, 0)
+			})
+		}
+
+		// While paused only the first task is in the waiting queue; the rest
+		// are parked on the key.
+		synctest.Wait()
+		if wp.WaitingQueueSize() != 1 {
+			t.Fatalf("expected 1 runnable task queued, got %d", wp.WaitingQueueSize())
+		}
+
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			t.Fatal("keyed tasks ran while paused")
+		case <-time.After(time.Millisecond):
+		}
+
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("keyed tasks did not drain after unpause")
+		}
+	})
 }
 
 func anyReady(w *WorkerPool) bool {

@@ -55,6 +55,23 @@ waiting task, allowing a much higher number of waiting tasks. Also, using a
 waiting queue ensures that tasks are given to workers in the order the tasks
 were received.
 
+Keyed tasks
+
+Tasks may be associated with a comparable key using the SubmitKey or DoKey
+functions. Tasks that share a key are executed strictly one at a time, in the
+order in which they were received, while tasks with different keys and plain
+tasks submitted with Submit remain independent and may run concurrently.
+
+Serialization for a key is enforced by the dispatcher, not inside the tasks.
+Only one task per key is ever handed to a worker; all other tasks for that
+key are parked in the key's own queue. This means a blocked hot key occupies
+at most one worker: a large backlog for one key does not hold workers that
+tasks for independent keys could use. As soon as the last queued task for a
+key finishes, the key's state is removed, so the dispatcher's key table does
+not grow without bound for a long-running pool. Stop and StopWait also remove
+all key state; Stop abandons parked keyed tasks while StopWait drains them in
+order.
+
 Credits
 
 This implementation builds on ideas from the following:

@@ -47,6 +47,24 @@ func main() {
 
 [Example wrapper function](https://go.dev/play/p/BWnRhJYarZ1) to show start and finish time of submitted function.
 
+## Keyed tasks
+
+`SubmitKey` (and `DoKey`) associates a task with a comparable key. Tasks with the same key run strictly serially in submission order; tasks with different keys, and tasks submitted with `Submit`, share the pool's workers and run concurrently up to the worker limit. A blocked hot key occupies only one worker, so a large backlog for one key never prevents independent keys from being scheduled.
+
+```go
+wp := workerpool.New(4)
+
+// Updates for each user are serialized by user ID, but different users run
+// concurrently.
+for _, update := range updates {
+    workerpool.SubmitKey(wp, update.UserID, func() {
+        apply(update)
+    })
+}
+
+wp.StopWait()
+```
+
 ## Usage Note
 
 There is no upper limit on the number of tasks queued, other than the limits of system resources. If the number of inbound tasks is too many to even queue for pending processing, then the solution is outside the scope of workerpool. It should be solved by distributing workload over multiple systems, and/or storing input for pending processing in intermediate storage such as a file system, distributed message queue, etc.
