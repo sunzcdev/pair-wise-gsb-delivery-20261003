@@ -2,6 +2,7 @@ package lua
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -70,6 +71,15 @@ const (
 	ResumeYield
 	ResumeError
 )
+
+// ErrThreadClosed is returned by Resume (and by coroutine.resume) when the
+// target coroutine has been closed with CloseThread.
+var ErrThreadClosed = errors.New("cannot resume a closed thread")
+
+// ErrCloseRunningThread is returned by CloseThread when the target coroutine
+// is currently running or is an ancestor of the running coroutine. A running
+// coroutine cannot have its stack torn down from another goroutine.
+var ErrCloseRunningThread = errors.New("cannot close a running coroutine")
 
 /* }}} */
 
@@ -1943,6 +1953,15 @@ func (ls *LState) Status(th *LState) string {
 
 func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState, error, []LValue) {
 	isstarted := th.isStarted()
+	if ls.G.CurrentThread == th {
+		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a running thread"), nil
+	}
+	if th.IsClosed() {
+		return ResumeError, ErrThreadClosed, nil
+	}
+	if th.Dead {
+		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a dead thread"), nil
+	}
 	if !isstarted {
 		base := 0
 		th.stack.Push(callFrame{
@@ -1956,13 +1975,6 @@ func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState
 			Parent:     nil,
 			TailCall:   0,
 		})
-	}
-
-	if ls.G.CurrentThread == th {
-		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a running thread"), nil
-	}
-	if th.Dead {
-		return ResumeError, newApiErrorS(ApiErrorRun, "can not resume a dead thread"), nil
 	}
 	th.Parent = ls
 	ls.G.CurrentThread = th
@@ -2019,6 +2031,72 @@ func (ls *LState) XMoveTo(other *LState, n int) {
 		other.Push(ls.Get(top - i + 1))
 	}
 	ls.SetTop(top - n)
+}
+
+// CloseThread abandons the coroutine th and releases the references held by
+// its call stack and data stack. It must be called from the goroutine that
+// drives th (typically the main thread) while th is not running.
+//
+// Closing a thread that has never been started or has already finished is
+// allowed and releases its resources. Closing a thread that is currently
+// running or that is an ancestor of the running thread fails with
+// ErrCloseRunningThread: a running coroutine cannot have its stack unwound by
+// another goroutine.
+//
+// Every open upvalue on the suspended stack is sealed before the stacks are
+// released, so closures that have escaped the coroutine keep reading the last
+// values of the captured locals instead of pointing at freed registers. If th
+// owns a child context, that context is canceled. Once closed, th is dead and
+// any subsequent Resume returns ErrThreadClosed. Closing an already closed
+// thread returns ErrThreadClosed.
+func (ls *LState) CloseThread(th *LState) error {
+	if th == nil {
+		return newApiErrorS(ApiErrorRun, "cannot close a nil thread")
+	}
+	if th.IsClosed() {
+		return ErrThreadClosed
+	}
+	if th == ls.G.MainThread {
+		return ErrCloseRunningThread
+	}
+	// The current thread, and every ancestor of the current thread, is
+	// running ("normal" for ancestors) and cannot be torn down mid-execution.
+	for cur := ls.G.CurrentThread; cur != nil; cur = cur.Parent {
+		if cur == th {
+			return ErrCloseRunningThread
+		}
+	}
+
+	// Seal all open upvalues so that escaped closures capture the final local
+	// values rather than retaining registers that are about to be released.
+	// All open upvalues in a fully suspended thread refer to its live frames.
+	for uv := th.uvcache; uv != nil; uv = uv.next {
+		uv.Close()
+		// Upvalue.Close copied the live register value; drop the registry
+		// pointer so the released data stack is not kept alive.
+		uv.reg = nil
+	}
+	sp := th.stack.Sp()
+	th.uvcache = nil
+
+	// Release the references held by the data stack and the call frames.
+	for i := 0; i < sp; i++ {
+		*th.stack.At(i) = callFrame{}
+	}
+	th.stack.FreeAll()
+	th.stack = nil
+	th.currentFrame = nil
+	// Nil out the data stack slots; unlike SetTop(0) this also clears slots
+	// below the minimum top and breaks references to captured Lua values.
+	for i := range th.reg.array {
+		th.reg.array[i] = nil
+	}
+	th.reg.SetTop(0)
+	th.Parent = nil
+
+	// Mark the thread dead and cancel any child context associated with it.
+	th.kill()
+	return nil
 }
 
 /* }}} */

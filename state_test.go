@@ -2,6 +2,7 @@ package lua
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -396,6 +397,195 @@ func TestCoroutineApi1(t *testing.T) {
 	errorIfNil(t, err)
 	errorIfFalse(t, strings.Contains(err.Error(), "can not resume a dead thread"), "can not resume a dead thread")
 
+}
+
+func TestCloseThreadYielded(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+      function coro()
+        local x = 7
+        local t = {1, 2}
+        local function getx() return x end
+        local function gett() return t end
+        coroutine.yield(getx, gett)
+        x = 100
+      end
+    `)
+	fn := L.GetGlobal("coro").(*LFunction)
+	co, _ := L.NewThread()
+	st, err, values := L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeYield, st)
+	errorIfNotNil(t, err)
+	errorIfNotEqual(t, 2, len(values))
+	getx := values[0].(*LFunction)
+	gett := values[1].(*LFunction)
+
+	// Snapshot the register slot and backing registry that the open upvalue
+	// points at while the coroutine is suspended.
+	uv := getx.Upvalues[0]
+	errorIfFalse(t, !uv.IsClosed(), "upvalue must be open while yielded")
+	reg := uv.reg
+	idx := uv.index
+	errorIfNotEqual(t, LNumber(7), reg.Get(idx))
+
+	err = L.CloseThread(co)
+	errorIfNotNil(t, err)
+	errorIfFalse(t, co.IsClosed(), "closed thread must report IsClosed")
+	errorIfFalse(t, co.Dead, "closed thread must be dead")
+
+	// The upvalue is sealed: it no longer references the released registry and
+	// still exposes the last local value.
+	errorIfFalse(t, uv.IsClosed(), "upvalue must be closed after CloseThread")
+	errorIfNotEqual(t, (*registry)(nil), uv.reg)
+	errorIfNotEqual(t, LNumber(7), uv.Value())
+
+	// Escaped closures read the last local values through the main state.
+	L.Push(getx)
+	L.Call(0, 1)
+	errorIfNotEqual(t, LNumber(7), L.Get(-1))
+	L.Pop(1)
+	L.Push(gett)
+	L.Call(0, 1)
+	tb := L.Get(-1).(*LTable)
+	errorIfNotEqual(t, LNumber(1), tb.RawGetInt(1))
+	errorIfNotEqual(t, LNumber(2), tb.RawGetInt(2))
+	L.Pop(1)
+
+	// The data stack released the value the upvalue used to point at.
+	errorIfNotEqual(t, LValue(nil), reg.array[idx])
+
+	// Subsequent Resume returns the recognizable closed error.
+	st, err, values = L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeError, st)
+	errorIfFalse(t, errors.Is(err, ErrThreadClosed), "resume after close must return ErrThreadClosed")
+	errorIfNotEqual(t, 0, len(values))
+
+	// Closing twice is deterministic.
+	err = L.CloseThread(co)
+	errorIfFalse(t, errors.Is(err, ErrThreadClosed), "double close must return ErrThreadClosed")
+}
+
+func TestCloseThreadUnstartedAndDead(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+      function coro()
+        return 42
+      end
+    `)
+	fn := L.GetGlobal("coro").(*LFunction)
+
+	// A thread that has never been started can be closed.
+	co, _ := L.NewThread()
+	err := L.CloseThread(co)
+	errorIfNotNil(t, err)
+	errorIfFalse(t, co.IsClosed(), "")
+	st, err, _ := L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeError, st)
+	errorIfFalse(t, errors.Is(err, ErrThreadClosed), "")
+
+	// A thread that has finished can be closed.
+	co2, _ := L.NewThread()
+	st, err, values := L.Resume(co2, fn)
+	errorIfNotEqual(t, ResumeOK, st)
+	errorIfNotNil(t, err)
+	errorIfNotEqual(t, LNumber(42), values[0])
+	errorIfFalse(t, co2.Dead, "finished thread must be dead")
+	err = L.CloseThread(co2)
+	errorIfNotNil(t, err)
+	errorIfFalse(t, co2.IsClosed(), "")
+
+	// The main thread cannot be closed.
+	err = L.CloseThread(L)
+	errorIfFalse(t, errors.Is(err, ErrCloseRunningThread), "closing the main thread must fail")
+}
+
+func TestCloseThreadRunning(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	co, _ := L.NewThread()
+	checkClose := L.NewFunction(func(inner *LState) int {
+		// inner is the running coroutine; its parent (main) is "normal".
+		// Neither can be closed while the coroutine is executing.
+		if err := inner.CloseThread(inner); !errors.Is(err, ErrCloseRunningThread) {
+			inner.RaiseError("expected ErrCloseRunningThread, got %v", err)
+		}
+		if err := inner.CloseThread(inner.Parent); !errors.Is(err, ErrCloseRunningThread) {
+			inner.RaiseError("expected ErrCloseRunningThread for parent, got %v", err)
+		}
+		return 0
+	})
+	L.SetGlobal("checkclose", checkClose)
+	fn, err := L.LoadString(`
+		function coro()
+			checkclose()
+		end
+	`)
+	errorIfNotNil(t, err)
+	st, err, values := L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeOK, st)
+	errorIfNotNil(t, err)
+	errorIfNotEqual(t, 1, len(values))
+	errorIfNotEqual(t, LNil, values[0])
+	errorIfFalse(t, co.Dead, "finished coroutine must be dead")
+	err = L.CloseThread(co)
+	errorIfNotNil(t, err)
+	errorIfFalse(t, co.IsClosed(), "")
+}
+
+func TestCloseThreadCancelsContext(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	L.SetContext(ctx)
+	defer cancel()
+
+	co, cocancel := L.NewThread()
+	defer cocancel()
+	errorIfFalse(t, co.Context() != nil, "child thread must inherit a child context")
+
+	L.Register("myyield", func(L *LState) int {
+		return L.Yield(LNumber(1))
+	})
+	errorIfScriptFail(t, L, `
+		function coro()
+			myyield()
+		end
+	`)
+	fn := L.GetGlobal("coro").(*LFunction)
+	st, err, values := L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeYield, st)
+	errorIfNotNil(t, err)
+	errorIfNotEqual(t, LNumber(1), values[0])
+
+	childDone := co.Context().Done()
+	select {
+	case <-childDone:
+		t.Errorf("child context must not be canceled before close")
+	default:
+	}
+
+	err = L.CloseThread(co)
+	errorIfNotNil(t, err)
+	select {
+	case <-childDone:
+	default:
+		t.Errorf("child context must be canceled after close")
+	}
+	errorIfFalse(t, co.Context().Err() == context.Canceled, "child context must be canceled")
+
+	// The parent context is left intact.
+	select {
+	case <-ctx.Done():
+		t.Errorf("parent context must not be canceled")
+	default:
+	}
+
+	// Resume reports the closed error rather than a context error.
+	st, err, _ = L.Resume(co, fn)
+	errorIfNotEqual(t, ResumeError, st)
+	errorIfFalse(t, errors.Is(err, ErrThreadClosed), "")
 }
 
 func TestContextTimeout(t *testing.T) {
