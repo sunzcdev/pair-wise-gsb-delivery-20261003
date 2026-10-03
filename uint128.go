@@ -78,6 +78,37 @@ func (u uint128) addOne() uint128 {
 	return uint128{u.hi + carry, lo}
 }
 
+// add128 returns the sum u+v along with the carry bit, which is 1
+// if the sum overflowed 128 bits.
+func (u uint128) add128(v uint128) (sum uint128, carry uint64) {
+	lo, carryLo := bits.Add64(u.lo, v.lo, 0)
+	hi, carryHi := bits.Add64(u.hi, v.hi, carryLo)
+	return uint128{hi: hi, lo: lo}, carryHi
+}
+
+// sub128 returns u-v along with the borrow bit, which is 1 if u < v.
+func (u uint128) sub128(v uint128) (diff uint128, borrow uint64) {
+	lo, borrowLo := bits.Sub64(u.lo, v.lo, 0)
+	hi, borrowHi := bits.Sub64(u.hi, v.hi, borrowLo)
+	return uint128{hi: hi, lo: lo}, borrowHi
+}
+
+// add128WithCarry returns u+v+c, where c must be 0 or 1.
+func (u uint128) add128WithCarry(v uint128, c uint8) uint128 {
+	lo, carryLo := bits.Add64(u.lo, v.lo, uint64(c))
+	hi, _ := bits.Add64(u.hi, v.hi, carryLo)
+	return uint128{hi: hi, lo: lo}
+}
+
+// bitLen returns the number of bits required to represent u, and 0
+// for u == 0.
+func (u uint128) bitLen() uint {
+	if u.hi != 0 {
+		return 64 + uint(bits.Len64(u.hi))
+	}
+	return uint(bits.Len64(u.lo))
+}
+
 func u64CommonPrefixLen(a, b uint64) uint8 {
 	return uint8(bits.LeadingZeros64(a ^ b))
 }
