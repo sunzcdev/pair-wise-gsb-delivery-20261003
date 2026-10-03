@@ -3,6 +3,7 @@ package milter
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,25 @@ import (
 )
 
 var ErrUnsupportedMilterVersion = fmt.Errorf("milter: negotiate: unsupported milter version")
+
+var (
+	// ErrResultNotCommitted is returned by ClientSession.EndWithCollector when
+	// the milter reaches a non-success terminal state, sends an illegal
+	// modification action, exceeds a collector budget or the connection breaks
+	// before a success terminal was read. In all these cases the buffered
+	// modification actions are not delivered to the caller.
+	ErrResultNotCommitted = errors.New("milter: eob: result not committed")
+
+	// ErrResultTooManyBytes is returned (wrapping ErrResultNotCommitted) when
+	// the total wire size of buffered modification actions exceeds
+	// ResultCollector.MaxBytes.
+	ErrResultTooManyBytes = errors.New("milter: eob: modification actions exceed the total byte budget")
+
+	// ErrResultTooManyActions is returned (wrapping ErrResultNotCommitted) when
+	// the number of buffered modification actions exceeds
+	// ResultCollector.MaxActions.
+	ErrResultTooManyActions = errors.New("milter: eob: modification actions exceed the action count budget")
+)
 
 // Client is a wrapper for managing milter connections.
 //
@@ -589,38 +609,82 @@ func parseModifyAct(msg *Message) (*ModifyAction, error) {
 	return act, nil
 }
 
-func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action, err error) {
+// readEOBResponse reads the sequence of messages sent in response to EOB.
+//
+// Every modification action is handed to onModify as it arrives. The wireSize
+// argument is the size of the action message on the wire, including the single
+// command byte. msg is the raw message and act the parsed modification action
+// (msg.Data for header actions is resliced by the parser, see parseModifyAct).
+// 'p' (progress) messages are consumed silently. Reading stops at the first
+// accept/reject action, which is returned.
+//
+// If onModify returns an error, reading stops and the error is returned.
+func (s *ClientSession) readEOBResponse(onModify func(msg *Message, act ModifyAction, wireSize int) error) (*Action, error) {
 	for {
 		msg, err := readPacket(s.conn, s.readTimeout)
 		if err != nil {
-			return nil, nil, fmt.Errorf("action read: %w", err)
+			return nil, fmt.Errorf("action read: %w", err)
 		}
 		if msg.Code == 'p' /* progress */ {
 			continue
 		}
 
-		switch ModifyActCode(msg.Code) {
-		case ActAddRcpt, ActDelRcpt, ActReplBody, ActChangeHeader, ActInsertHeader,
-			ActAddHeader, ActChangeFrom, ActQuarantine:
-			modifyAct, err := parseModifyAct(msg)
-			if err != nil {
-				return nil, nil, err
+		if !isModifyActCode(msg.Code) {
+			// Terminal accept/reject action.
+			if ActionCode(msg.Code) != ActContinue {
+				s.needAbort = false
 			}
-			modifyActs = append(modifyActs, *modifyAct)
-		default:
-			act, err = parseAction(msg)
-			if err != nil {
-				return nil, nil, err
-			}
+			return parseAction(msg)
+		}
 
-			return modifyActs, act, nil
+		wireSize := 1 + len(msg.Data)
+		modifyAct, err := parseModifyAct(msg)
+		if err != nil {
+			return nil, err
+		}
+		if err := onModify(msg, *modifyAct, wireSize); err != nil {
+			return nil, err
 		}
 	}
+}
+
+func isModifyActCode(code byte) bool {
+	switch ModifyActCode(code) {
+	case ActAddRcpt, ActDelRcpt, ActReplBody, ActChangeHeader, ActInsertHeader,
+		ActAddHeader, ActChangeFrom, ActQuarantine:
+		return true
+	}
+	return false
+}
+
+func (s *ClientSession) readModifyActs() (modifyActs []ModifyAction, act *Action, err error) {
+	// Streaming mode with an internal accumulator: no budgets or legality
+	// checks are applied and actions are collected independently of the final
+	// verdict, see ClientSession.End.
+	act, err = s.readEOBResponse(func(_ *Message, modifyAct ModifyAction, _ int) error {
+		modifyActs = append(modifyActs, modifyAct)
+		return nil
+	})
+	return modifyActs, act, err
 }
 
 // End sends the EOB message and resets session back to the state before Mail
 // call. The same ClientSession can be used to check another message arrived
 // within the same SMTP connection (Helo and Conn information is preserved).
+//
+// End operates in streaming mode: every modification action sent by the
+// milter in response to EOB is parsed and returned as soon as it is read,
+// regardless of the final accept/reject verdict. There is no byte or action
+// count limit and no protocol-level legality validation beyond what is
+// required to parse a message. Consequently the caller can observe actions
+// for a message that is ultimately rejected or temp-failed; the returned
+// slice must not be applied unless the terminal Action indicates success.
+// The caller owns the returned slice; action payloads (e.g. ModifyAction.Body)
+// reference buffers owned by the caller once returned.
+//
+// Use EndStream to handle each action through a callback as it arrives, or
+// EndWithCollector to buffer actions and receive them only after a success
+// terminal verdict.
 //
 // Close should be called to conclude session.
 func (s *ClientSession) End() ([]ModifyAction, *Action, error) {
@@ -636,6 +700,200 @@ func (s *ClientSession) End() ([]ModifyAction, *Action, error) {
 	}
 
 	return modifyActs, act, nil
+}
+
+// EndStream sends the EOB message and invokes onModify for each modification
+// action as it is received, preserving wire order, before returning the
+// terminal accept/reject action. It behaves like End (streaming mode): there
+// are no budgets, parsed actions are not additionally validated and onModify
+// is called for all actions even if the final verdict is a rejection. The
+// effect of an action is whatever onModify does with it immediately; the
+// client library keeps no copy. If onModify returns an error, reading stops
+// and the error is returned without reading the terminal verdict; in that
+// case the session must be concluded with Abort or Close.
+//
+// A nil onModify means no modification actions are delivered (they are still
+// consumed from the connection).
+func (s *ClientSession) EndStream(onModify func(act ModifyAction) error) (*Action, error) {
+	if err := writePacket(s.conn, &Message{
+		Code: byte(CodeEOB),
+	}, s.writeTimeout); err != nil {
+		return nil, fmt.Errorf("milter: end: %w", err)
+	}
+
+	act, err := s.readEOBResponse(func(_ *Message, modifyAct ModifyAction, _ int) error {
+		if onModify == nil {
+			return nil
+		}
+		return onModify(modifyAct)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("milter: end: %w", err)
+	}
+	return act, nil
+}
+
+// ResultCollector buffers modification actions received in response to EOB
+// until the milter reaches a success terminal verdict.
+//
+// The collector is purely in-memory: it is not backed by a database or disk
+// and does not perform any network I/O of its own. It is not safe for
+// concurrent use; use a separate collector per message/session.
+type ResultCollector struct {
+	// MaxBytes bounds the total on-the-wire size (in bytes) of buffered
+	// modification actions, counting each command byte and payload. Zero
+	// means no byte budget.
+	MaxBytes int
+	// MaxActions bounds the number of buffered modification actions. Zero
+	// means no action count budget.
+	MaxActions int
+
+	// Actions holds the buffered modification actions in the order received.
+	// It is populated by EndWithCollector only when the milter reaches a
+	// success terminal verdict; otherwise it is left empty.
+	Actions []ModifyAction
+
+	totalBytes int
+}
+
+// TotalBytes returns the accumulated on-the-wire size of the buffered
+// modification actions.
+func (c *ResultCollector) TotalBytes() int {
+	return c.totalBytes
+}
+
+func (c *ResultCollector) reset() {
+	c.Actions = nil
+	c.totalBytes = 0
+}
+
+// EndWithCollector sends the EOB message and buffers modification actions in
+// c without delivering them to the caller until the milter reaches a success
+// terminal verdict (ActAccept, ActDiscard or ActContinue at EOB). Actions are
+// buffered in-memory only, in the order received.
+//
+// The buffered result is not delivered (c.Actions stays nil and an error
+// wrapping ErrResultNotCommitted is returned together with the terminal
+// action, when available) if:
+//   - the terminal verdict is ActReject, ActTempFail or ActReplyCode;
+//   - a modification action violates the milter protocol (illegal action);
+//   - the cumulative wire size exceeds c.MaxBytes (ErrResultTooManyBytes);
+//   - the number of actions exceeds c.MaxActions (ErrResultTooManyActions);
+//   - the connection breaks before the terminal verdict is read.
+//
+// On any such outcome the caller must treat the message as unchanged and
+// conclude the session with Abort or Close. On success c.Actions contains all
+// actions in wire order and can be applied as a single atomic batch; the
+// caller owns c.Actions.
+//
+// Unlike the streaming End/EndStream modes, actions never become visible to
+// the caller before the success verdict, so a later rejection or a dropped
+// connection cannot leave partially applied modifications.
+func (s *ClientSession) EndWithCollector(c *ResultCollector) (*Action, error) {
+	if err := writePacket(s.conn, &Message{
+		Code: byte(CodeEOB),
+	}, s.writeTimeout); err != nil {
+		return nil, fmt.Errorf("milter: end: %w", err)
+	}
+
+	c.reset()
+
+	act, err := s.readEOBResponse(func(msg *Message, modifyAct ModifyAction, wireSize int) error {
+		if err := validateModifyAct(msg, modifyAct); err != nil {
+			return fmt.Errorf("%w: %v", ErrResultNotCommitted, err)
+		}
+
+		c.totalBytes += wireSize
+		if c.MaxBytes > 0 && c.totalBytes > c.MaxBytes {
+			return fmt.Errorf("%w: %w", ErrResultNotCommitted, ErrResultTooManyBytes)
+		}
+		if c.MaxActions > 0 && len(c.Actions)+1 > c.MaxActions {
+			return fmt.Errorf("%w: %w", ErrResultNotCommitted, ErrResultTooManyActions)
+		}
+
+		c.Actions = append(c.Actions, modifyAct)
+		return nil
+	})
+	if err != nil {
+		// Connection break, malformed/illegal action or budget overflow: no
+		// terminal verdict was read and nothing is committed. Callback errors
+		// already wrap ErrResultNotCommitted; other read/parse errors do not.
+		c.reset()
+		if errors.Is(err, ErrResultNotCommitted) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %w", ErrResultNotCommitted, err)
+	}
+
+	if !isSuccessTerminal(act.Code) {
+		c.reset()
+		return act, fmt.Errorf("%w: terminal verdict %v", ErrResultNotCommitted, act.Code)
+	}
+
+	return act, nil
+}
+
+// isSuccessTerminal reports whether the accept/reject action represents a
+// success terminal state at EOB. ActContinue functions the same as ActAccept
+// at the end of the conversation; ActDiscard accepts the message (it is
+// accepted but not delivered). ActReject, ActTempFail and ActReplyCode are
+// non-success terminals.
+func isSuccessTerminal(code ActionCode) bool {
+	switch code {
+	case ActAccept, ActDiscard, ActContinue:
+		return true
+	}
+	return false
+}
+
+// validateModifyAct checks a modification action for milter protocol-level
+// legality in addition to what is needed to parse it. It does not enforce the
+// negotiated action mask: it is the milter's responsibility not to send
+// actions the MTA did not advertise.
+func validateModifyAct(msg *Message, act ModifyAction) error {
+	switch act.Code {
+	case ActAddRcpt, ActDelRcpt, ActQuarantine, ActChangeFrom:
+		// String fields are NUL-terminated on the wire.
+		if len(msg.Data) == 0 || msg.Data[len(msg.Data)-1] != 0x00 {
+			return fmt.Errorf("read modify action: %v: value is not NUL-terminated", act.Code)
+		}
+	}
+
+	switch act.Code {
+	case ActAddRcpt, ActDelRcpt:
+		if act.Rcpt == "" {
+			return fmt.Errorf("read modify action: empty recipient")
+		}
+	case ActChangeHeader:
+		// Per the milter protocol the index is 1-based and per header name:
+		// it refers to the occurrence of a field with the supplied name, in
+		// the order the fields were transmitted. Zero is invalid.
+		if act.HeaderIndex == 0 {
+			return fmt.Errorf("read modify action: change header index must be 1-based, got 0")
+		}
+		if act.HeaderName == "" {
+			return fmt.Errorf("read modify action: empty header name")
+		}
+	case ActInsertHeader:
+		// InsertHeader uses a 1-based index into the full header list.
+		if act.HeaderIndex == 0 {
+			return fmt.Errorf("read modify action: insert header index must be 1-based, got 0")
+		}
+		if act.HeaderName == "" {
+			return fmt.Errorf("read modify action: empty header name")
+		}
+	case ActAddHeader:
+		if act.HeaderName == "" {
+			return fmt.Errorf("read modify action: empty header name")
+		}
+	case ActChangeFrom:
+		if act.From == "" {
+			return fmt.Errorf("read modify action: empty envelope sender")
+		}
+	case ActReplBody, ActQuarantine:
+		// An empty replacement body and an empty reason are allowed.
+	}
+	return nil
 }
 
 // Abort sends Abort to the milter.
