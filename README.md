@@ -155,6 +155,30 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+# Read-only validation rules
+While parser rules run, the token has already been cryptographically verified. New code should
+implement `CheckedRule`, which only receives a read-only `CheckedToken` view of the authenticated
+claims and footer:
+
+```go
+type CheckedRule func(token CheckedToken) error
+```
+
+`CheckedToken` exposes typed, read-only access (`Get`, `GetString`, `GetTime`, the standard
+`GetSubject`/`GetIssuer`/... accessors, `Claims`, `RawClaims`, `ClaimJSON`, `ClaimsJSON`, and
+`Footer`) and has no setters. Every slice, map, and `json.RawMessage` returned is an independent
+copy, so a rule cannot use a fetched value as a back door into the token the parser ultimately
+returns.
+
+Register checked rules with `MakeCheckedParser`, `parser.SetCheckedRules`, or
+`parser.AddCheckedRule`.
+
+The legacy `Rule` type (which takes a mutable `Token`) continues to be accepted by `MakeParser`,
+`NewParser`, `parser.SetRules`, and `parser.AddRule`. For safety it now runs against an isolated
+deep copy of the verified token: calls such as `Set` or `SetFooter`, or mutating a footer the rule
+has fetched, cannot affect the token returned by `ParseV2*`/`ParseV3*`/`ParseV4*`. Legacy rules and
+checked rules may be mixed and always execute in the order they were registered.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.

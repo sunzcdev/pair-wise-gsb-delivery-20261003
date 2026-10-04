@@ -9,6 +9,13 @@ import (
 // Rule validates a given token for certain required preconditions (defined by
 // the rule itself). If validation fails a Rule MUST return an error, otherwise
 // error MUST be nil.
+//
+// Rule is the legacy, mutable rule entry point. The token it receives is an
+// isolated deep copy of the cryptographically verified token: it exposes the
+// full mutable Token API (Set, SetFooter, ...), but any changes the rule makes
+// are confined to that copy and are discarded once the rule finishes. They can
+// never affect the token the parser returns. New code should prefer the
+// read-only CheckedRule, which cannot mutate anything at all.
 type Rule func(token Token) error
 
 // ForAudience requires that the given audience matches the "aud" field of the

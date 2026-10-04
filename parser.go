@@ -9,12 +9,23 @@ import (
 // Parser is used to verify or decrypt a token, and can be provided with
 // a set of rules.
 type Parser struct {
-	rules []Rule
+	rules []CheckedRule
+}
+
+// adaptRule exposes a legacy Rule to the read-only rule pipeline. The legacy
+// rule receives a deep clone of the verified token: anything it does through
+// the mutable Token API (Set, SetFooter, mutating a footer it fetched, and so
+// on) is confined to that clone and can never reach the token the parser
+// returns. This preserves the Rule entry point while clearly isolating it.
+func adaptRule(rule Rule) CheckedRule {
+	return func(view CheckedToken) error {
+		return rule(view.(checkedToken).token.clone())
+	}
 }
 
 // NewParser returns a parser with NotExpired rule preloaded.
 func NewParser() Parser {
-	return Parser{[]Rule{NotExpired()}}
+	return Parser{[]CheckedRule{adaptRule(NotExpired())}}
 }
 
 // NewParserWithoutExpiryCheck returns a parser with no currently set rules.
@@ -25,12 +36,34 @@ func NewParserWithoutExpiryCheck() Parser {
 // NewParserForValidNow returns a parser that will require parsed tokens to be
 // valid "now".
 func NewParserForValidNow() Parser {
-	return Parser{[]Rule{ValidAt(time.Now())}}
+	return Parser{[]CheckedRule{adaptRule(ValidAt(time.Now()))}}
 }
 
 // MakeParser allows a parser to be constructed with a specified set of rules.
 func MakeParser(rules []Rule) Parser {
-	return Parser{rules}
+	return Parser{adaptRules(rules)}
+}
+
+// MakeCheckedParser allows a parser to be constructed with a specified set of
+// read-only CheckedRules.
+func MakeCheckedParser(rules []CheckedRule) Parser {
+	return Parser{cloneCheckedRules(rules)}
+}
+
+func adaptRules(rules []Rule) []CheckedRule {
+	compiled := make([]CheckedRule, len(rules))
+	for i, rule := range rules {
+		compiled[i] = adaptRule(rule)
+	}
+
+	return compiled
+}
+
+func cloneCheckedRules(rules []CheckedRule) []CheckedRule {
+	compiled := make([]CheckedRule, len(rules))
+	copy(compiled, rules)
+
+	return compiled
 }
 
 // ParseV2Local will parse and decrypt a v2 local paseto and validate against
@@ -152,17 +185,34 @@ func (p Parser) UnsafeParseFooter(protocol Protocol, tainted string) ([]byte, er
 
 // SetRules will overwrite any currently set rules with those specified.
 func (p *Parser) SetRules(rules []Rule) {
-	p.rules = rules
+	p.rules = adaptRules(rules)
+}
+
+// SetCheckedRules will overwrite any currently set rules with the specified
+// read-only CheckedRules.
+func (p *Parser) SetCheckedRules(rules []CheckedRule) {
+	p.rules = cloneCheckedRules(rules)
 }
 
 // AddRule will add the given rule(s) to any already specified.
 func (p *Parser) AddRule(rule ...Rule) {
+	for _, r := range rule {
+		p.rules = append(p.rules, adaptRule(r))
+	}
+}
+
+// AddCheckedRule will add the given read-only CheckedRule(s) to any already
+// specified. Legacy rules and checked rules can be interleaved; they always
+// run in the order they were added.
+func (p *Parser) AddCheckedRule(rule ...CheckedRule) {
 	p.rules = append(p.rules, rule...)
 }
 
 func (p Parser) validate(token Token) result.Result[Token] {
+	view := checkedTokenFrom(token)
+
 	for _, rule := range p.rules {
-		if err := rule(token); err != nil {
+		if err := rule(view); err != nil {
 			return result.Err[Token](newRuleError(err))
 		}
 	}

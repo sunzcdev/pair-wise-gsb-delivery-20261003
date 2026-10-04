@@ -12,18 +12,50 @@ type Token struct {
 	footer []byte
 }
 
+// cloneBytes returns an independent copy of data, preserving a nil result for
+// nil input. Mutating the returned slice can never affect the original.
+func cloneBytes(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+
+	clone := make([]byte, len(data))
+	copy(clone, data)
+
+	return clone
+}
+
+// cloneRawMessage returns an independent copy of value. json.RawMessage is a
+// byte slice, so simply assigning it (or ranging over a map of them) shares
+// the underlying array with the source.
+func cloneRawMessage(value json.RawMessage) json.RawMessage {
+	return json.RawMessage(cloneBytes(value))
+}
+
 // NewToken returns a token with no claims and no footer.
 func NewToken() Token {
 	return Token{make(map[string]json.RawMessage), nil}
 }
 
+// clone returns a token whose claims map, every raw claim value, and footer
+// all live in independent allocations. It hands legacy rules a token they
+// cannot use to tamper with the token the parser will deliver.
+func (t Token) clone() Token {
+	claims := make(map[string]json.RawMessage, len(t.claims))
+	for key, value := range t.claims {
+		claims[key] = cloneRawMessage(value)
+	}
+
+	return Token{claims: claims, footer: cloneBytes(t.footer)}
+}
+
 func makeToken(claims map[string]json.RawMessage, footer []byte) (*Token, error) {
 	tokenValueClaims := make(map[string]json.RawMessage)
 
-	token := Token{tokenValueClaims, footer}
+	token := Token{tokenValueClaims, cloneBytes(footer)}
 
 	for key, value := range claims {
-		token.claims[key] = value
+		token.claims[key] = cloneRawMessage(value)
 	}
 
 	return &token, nil
@@ -33,7 +65,7 @@ func makeToken(claims map[string]json.RawMessage, footer []byte) (*Token, error)
 func MakeToken(claims map[string]interface{}, footer []byte) (*Token, error) {
 	tokenValueClaims := make(map[string]json.RawMessage)
 
-	token := Token{tokenValueClaims, footer}
+	token := Token{tokenValueClaims, cloneBytes(footer)}
 
 	for key, value := range claims {
 		if err := token.Set(key, value); err != nil {
@@ -152,14 +184,16 @@ func (token Token) ClaimsJSON() []byte {
 	return data
 }
 
-// Footer returns the token's footer
+// Footer returns the token's footer. The returned slice is an independent
+// copy, so mutating it cannot change the token's authenticated contents.
 func (t Token) Footer() []byte {
-	return t.footer
+	return cloneBytes(t.footer)
 }
 
-// SetFooter sets the token's footer
+// SetFooter sets the token's footer. A copy of footer is stored, so the
+// caller later mutating the supplied slice cannot change the token.
 func (t *Token) SetFooter(footer []byte) {
-	t.footer = footer
+	t.footer = cloneBytes(footer)
 }
 
 func (t Token) packet() packet {
