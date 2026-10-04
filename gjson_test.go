@@ -2517,6 +2517,63 @@ func TestGroup(t *testing.T) {
 	res := Get(json, "@group").Raw
 	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789"}]`)
 
+	res = Get(json, `@group:shortest`).Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1}]`)
+
+	res = Get(json, `@group:{"mode":"longest","fill":null}`).Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789","val":null}]`)
+
+	res = Get(json, `@group:longest:null`).Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789","val":null}]`)
+
+	res = Get(json, `@group:strict`).Raw
+	assert(t, res == `{"error":"unequal column lengths","expected":3,"columns":["val"],"lengths":{"id":3,"val":2}}`)
+	assert(t, !strings.Contains(res, `"id":"123"`))
+
+	json = `{"a":[],"b":["x","y"],"c":["z"]}`
+	res = Get(json, `@group:{"mode":"longest","fill":null}`).Raw
+	assert(t, res == `[{"a":null,"b":"x","c":"z"},{"a":null,"b":"y","c":null}]`)
+
+	res = Get(json, `@group:shortest`).Raw
+	assert(t, res == `[]`)
+
+	res = Get(json, `@group:strict`).Raw
+	assert(t, res == `{"error":"unequal column lengths","expected":0,"columns":["b","c"],"lengths":{"a":0,"b":2,"c":1}}`)
+
+	json = `{"a\"b":[1],"c,d":[2]}`
+	res = Get(json, `@group:strict`).Raw
+	assert(t, res == `[{"a\"b":1,"c,d":2}]`)
+
+	json = `{"a\"b":[1,2],"c,d":[2]}`
+	res = Get(json, `@group:strict`).Raw
+	assert(t, res == `{"error":"unequal column lengths","expected":2,"columns":["c,d"],"lengths":{"a\"b":2,"c,d":1}}`)
+
+	json = `{"a":[1,2,3],"b":[1,2],"c":[1]}`
+	res = Get(json, `@group:strict`).Raw
+	assert(t, res == `{"error":"unequal column lengths","expected":3,"columns":["b","c"],"lengths":{"a":3,"b":2,"c":1}}`)
+
+	json = `{"id":["a"],"flag":true,"meta":{"x":1},"missing":null}`
+	res = Get(json, `@group:{"mode":"longest","fill":null}`).Raw
+	assert(t, res == `[{"id":"a"}]`)
+
+	res = Get(json, `@group:{"mode":"shortest","nonArray":"error"}`).Raw
+	assert(t, res == `{"error":"non-array object member","members":["flag","meta","missing"]}`)
+
+	res = Get(json, `@group:{"mode":"longest"}`).Raw
+	assert(t, res == `{"error":"longest mode requires a fill value"}`)
+
+	res = Get(json, `@group:longest:bad`).Raw
+	assert(t, res == `{"error":"invalid fill value"}`)
+
+	res = Get(json, `@group:{"mode":"shortest","fill":null}`).Raw
+	assert(t, res == `{"error":"fill is only valid with longest mode"}`)
+
+	res = Get(`{"a":[1],"b":[]}`, `@group:{"fill":null}`).Raw
+	assert(t, res == `[{"a":1,"b":null}]`)
+
+	res = Get(`{"a":[{},{"x":1}],"b":[1]}`, `@group:{"mode":"longest","fill":{}}`).Raw
+	assert(t, res == `[{"a":{},"b":1},{"a":{"x":1},"b":{}}]`)
+
 	json = `
 {
 	"issues": [

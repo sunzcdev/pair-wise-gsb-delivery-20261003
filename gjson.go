@@ -3292,35 +3292,266 @@ func modToStr(str, arg string) string {
 	return string(AppendJSONString(nil, str))
 }
 
+type groupColumn struct {
+	key    Result
+	values []Result
+}
+
+type groupOptions struct {
+	mode         string
+	fill         string
+	nonArray     string
+	fillProvided bool
+}
+
+func parseGroupOptions(arg string) (groupOptions, string) {
+	opts := groupOptions{mode: "shortest", nonArray: "ignore"}
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return opts, "missing mode"
+	}
+	if arg[0] != '{' {
+		if arg[0] == '"' {
+			value := Parse(arg)
+			if !Valid(arg) || value.Type != String {
+				return opts, "invalid mode"
+			}
+			arg = strings.TrimSpace(value.Str)
+		}
+		if mode, fill, ok := strings.Cut(arg, ":"); ok {
+			opts.mode = strings.TrimSpace(mode)
+			opts.fill = strings.TrimSpace(fill)
+			opts.fillProvided = true
+		} else {
+			opts.mode = arg
+		}
+	} else {
+		value := Parse(arg)
+		if !Valid(arg) || !value.IsObject() {
+			return opts, "options must be an object"
+		}
+		var modeProvided bool
+		err := ""
+		value.ForEach(func(key, value Result) bool {
+			switch key.String() {
+			case "mode", "length", "lengthMode", "unequalLengths":
+				if value.Type != String {
+					err = "mode must be a string"
+					return false
+				}
+				opts.mode = strings.TrimSpace(value.Str)
+				modeProvided = true
+			case "fill", "fillValue", "padding", "pad", "default", "defaultValue":
+				opts.fill = value.Raw
+				opts.fillProvided = true
+			case "nonArray", "nonArrays", "onNonArray", "invalidMembers":
+				if value.Type == True {
+					opts.nonArray = "error"
+				} else if value.Type == False {
+					opts.nonArray = "ignore"
+				} else if value.Type == String {
+					opts.nonArray = value.String()
+				} else {
+					err = "nonArray must be a string or boolean"
+					return false
+				}
+			case "ignoreNonArray":
+				if value.Bool() {
+					opts.nonArray = "ignore"
+				} else {
+					opts.nonArray = "error"
+				}
+			case "errorOnNonArray":
+				if value.Bool() {
+					opts.nonArray = "error"
+				} else {
+					opts.nonArray = "ignore"
+				}
+			default:
+				return true
+			}
+			return true
+		})
+		if err != "" {
+			return opts, err
+		}
+		if !modeProvided {
+			if opts.fillProvided {
+				opts.mode = "longest"
+			} else {
+				return opts, "missing mode"
+			}
+		}
+	}
+	switch opts.mode {
+	case "shortest", "strict":
+		if opts.fillProvided {
+			return opts, "fill is only valid with longest mode"
+		}
+	case "longest":
+		if !opts.fillProvided {
+			return opts, "longest mode requires a fill value"
+		}
+		if !Valid(opts.fill) {
+			return opts, "invalid fill value"
+		}
+	default:
+		return opts, "invalid mode"
+	}
+	switch opts.nonArray {
+	case "ignore", "skip":
+		opts.nonArray = "ignore"
+	case "error", "reject", "fail":
+		opts.nonArray = "error"
+	default:
+		return opts, "invalid nonArray value"
+	}
+	return opts, ""
+}
+
+func groupError(message string) string {
+	return `{"error":` + string(AppendJSONString(nil, message)) + `}`
+}
+
+func groupLengthError(columns []groupColumn, expected int) string {
+	var data []byte
+	data = append(data, `{"error":`...)
+	data = AppendJSONString(data, "unequal column lengths")
+	data = append(data, `,"expected":`...)
+	data = strconv.AppendInt(data, int64(expected), 10)
+	var mismatch []byte
+	firstColumn := true
+	for _, column := range columns {
+		if len(column.values) != expected {
+			if !firstColumn {
+				mismatch = append(mismatch, ',')
+			}
+			mismatch = append(mismatch, column.key.Raw...)
+			firstColumn = false
+		}
+	}
+	data = append(data, `,"columns":[`...)
+	data = append(data, mismatch...)
+	data = append(data, `],"lengths":{`...)
+	for i, column := range columns {
+		if i > 0 {
+			data = append(data, ',')
+		}
+		data = append(data, column.key.Raw...)
+		data = append(data, ':')
+		data = strconv.AppendInt(data, int64(len(column.values)), 10)
+	}
+	data = append(data, '}', '}')
+	return string(data)
+}
+
+func groupNonArrayError(keys []Result) string {
+	var data []byte
+	data = append(data, `{"error":`...)
+	data = AppendJSONString(data, "non-array object member")
+	data = append(data, `,"members":[`...)
+	for i, key := range keys {
+		if i > 0 {
+			data = append(data, ',')
+		}
+		data = append(data, key.Raw...)
+	}
+	data = append(data, ']', '}')
+	return string(data)
+}
+
 func modGroup(json, arg string) string {
 	res := Parse(json)
 	if !res.IsObject() {
 		return ""
 	}
-	var all [][]byte
+
+	opts := groupOptions{mode: "legacy", nonArray: "ignore"}
+	if strings.TrimSpace(arg) != "" {
+		var err string
+		opts, err = parseGroupOptions(arg)
+		if err != "" {
+			return groupError(err)
+		}
+	}
+
+	var columns []groupColumn
+	var invalidKeys []Result
 	res.ForEach(func(key, value Result) bool {
 		if !value.IsArray() {
+			if opts.nonArray == "error" {
+				invalidKeys = append(invalidKeys, key)
+			}
 			return true
 		}
-		var idx int
+		column := groupColumn{key: key}
 		value.ForEach(func(_, value Result) bool {
-			if idx == len(all) {
-				all = append(all, []byte{})
-			}
-			all[idx] = append(all[idx], ("," + key.Raw + ":" + value.Raw)...)
-			idx++
+			column.values = append(column.values, value)
 			return true
 		})
+		columns = append(columns, column)
 		return true
 	})
+
+	if len(invalidKeys) > 0 {
+		return groupNonArrayError(invalidKeys)
+	}
+
+	rowCount := 0
+	if opts.mode == "legacy" || opts.mode == "longest" {
+		for _, column := range columns {
+			if len(column.values) > rowCount {
+				rowCount = len(column.values)
+			}
+		}
+	} else if opts.mode == "shortest" {
+		for i, column := range columns {
+			if i == 0 || len(column.values) < rowCount {
+				rowCount = len(column.values)
+			}
+		}
+	} else {
+		if len(columns) > 0 {
+			firstLength := len(columns[0].values)
+			for _, column := range columns[1:] {
+				if len(column.values) != firstLength {
+					return groupLengthError(columns, firstLength)
+				}
+			}
+			rowCount = firstLength
+		}
+	}
+
 	var data []byte
 	data = append(data, '[')
-	for i, item := range all {
-		if i > 0 {
+	for row := 0; row < rowCount; row++ {
+		if row > 0 {
 			data = append(data, ',')
 		}
 		data = append(data, '{')
-		data = append(data, item[1:]...)
+		first := true
+		for _, column := range columns {
+			if row >= len(column.values) {
+				if opts.mode != "longest" {
+					continue
+				}
+				if !first {
+					data = append(data, ',')
+				}
+				data = append(data, column.key.Raw...)
+				data = append(data, ':')
+				data = append(data, opts.fill...)
+				first = false
+				continue
+			}
+			if !first {
+				data = append(data, ',')
+			}
+			data = append(data, column.key.Raw...)
+			data = append(data, ':')
+			data = append(data, column.values[row].Raw...)
+			first = false
+		}
 		data = append(data, '}')
 	}
 	data = append(data, ']')

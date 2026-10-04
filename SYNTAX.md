@@ -257,7 +257,7 @@ There are currently the following built-in modifiers:
 - `@values`: Returns an array of values for an object.
 - `@tostr`: Converts json to a string. Wraps a json string.
 - `@fromstr`: Converts a string from json. Unwraps a json string.
-- `@group`: Groups arrays of objects. See [e4fc67c](https://github.com/tidwall/gjson/commit/e4fc67c92aeebf2089fabc7872f010e340d105db).
+- `@group`: Groups arrays in an object into an array of objects. Without an argument it uses the longest array and omits missing values. Use `@group:shortest`, `@group:{"mode":"longest","fill":null}`, or `@group:strict` to control unequal lengths; set `"nonArray":"error"` to reject non-array members.
 - `@dig`: Search for a value without providing its entire path. See [e8e87f2](https://github.com/tidwall/gjson/commit/e8e87f2a00dc41f3aba5631094e21f59a8cf8cbf).
 
 #### Modifier arguments
