@@ -259,6 +259,32 @@ There are currently the following built-in modifiers:
 - `@fromstr`: Converts a string from json. Unwraps a json string.
 - `@group`: Groups arrays of objects. See [e4fc67c](https://github.com/tidwall/gjson/commit/e4fc67c92aeebf2089fabc7872f010e340d105db).
 - `@dig`: Search for a value without providing its entire path. See [e8e87f2](https://github.com/tidwall/gjson/commit/e8e87f2a00dc41f3aba5631094e21f59a8cf8cbf).
+- `@window`: Returns a window of array elements. See [Window](#window).
+
+#### Window
+
+The `@window` modifier returns a slice of an array. It accepts a json object
+with the optional integer fields `start`, `stop`, and `step`.
+
+```
+@window:{"start":1,"stop":4,"step":2}
+```
+
+The element at `stop` is not included in the result. Negative indexes count
+from the end of the array and a negative `step` iterates backwards.
+Out-of-range bounds are clamped to the valid range, they never wrap around.
+Omitted fields default to selecting the entire array in the direction of
+`step`, and `step` defaults to 1. A `step` of zero returns an error object.
+
+For example, using the JSON payload `["Sara","Alex","Jack","Pam","Tom"]`:
+
+```go
+@window                            ["Sara","Alex","Jack","Pam","Tom"]
+@window:{"start":1,"stop":4}       ["Alex","Jack","Pam"]
+@window:{"start":-3,"step":2}      ["Jack","Tom"]
+@window:{"step":-1}                ["Tom","Pam","Jack","Alex","Sara"]
+@window:{"step":0}                 {"error":"@window: step cannot be zero"}
+```
 
 #### Modifier arguments
 
