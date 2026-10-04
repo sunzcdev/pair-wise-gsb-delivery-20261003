@@ -243,11 +243,7 @@ func printPacket(out io.Writer, p *Packet, indent int, printBytes bool) {
 
 // ReadPacket reads a single Packet from the reader.
 func ReadPacket(reader io.Reader) (*Packet, error) {
-	p, _, err := readPacket(reader, 0)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return defaultDecoder.ReadPacket(reader)
 }
 
 func DecodeString(data []byte) string {
@@ -303,26 +299,19 @@ func int64Length(i int64) (numBytes int) {
 // DecodePacket decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacket(data []byte) *Packet {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
-	if err != nil {
-		return nil
-	}
-
-	return p
+	return defaultDecoder.DecodePacket(data)
 }
 
 // DecodePacketErr decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacketErr(data []byte) (*Packet, error) {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return defaultDecoder.DecodePacketErr(data)
 }
 
-// readPacket reads a single Packet from the reader, returning the number of bytes read.
-func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
+// readPacket reads a single Packet from the reader, returning the number of
+// bytes read. parentPath is the slash-separated path of ancestor identifiers,
+// used to annotate custom-codec errors.
+func (d *Decoder) readPacket(reader io.Reader, depth int, parentPath string) (*Packet, int, error) {
 	if MaxNestingDepth > 0 && depth >= MaxNestingDepth {
 		return nil, 0, fmt.Errorf("nesting depth %d exceeds maximum %d", depth, MaxNestingDepth)
 	}
@@ -344,6 +333,8 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 	p.Children = make([]*Packet, 0, 2)
 	p.Value = nil
 
+	path := joinPath(parentPath, identifier)
+
 	if p.TagType == TypeConstructed {
 		// TODO: if universal, ensure tag type is allowed to be constructed
 
@@ -362,7 +353,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			}
 
 			// Read the next packet
-			child, r, err := readPacket(reader, depth+1)
+			child, r, err := d.readPacket(reader, depth+1, path)
 			if err != nil {
 				return nil, read, unexpectedEOF(err)
 			}
@@ -410,10 +401,22 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 		content = make([]byte, 0)
 	}
 
-	if p.ClassType == ClassUniversal {
-		p.Data.Write(content)
-		p.ByteValue = content
+	// Every primitive retains its raw content octets. Types without a known
+	// representation -- or any application/context/private tag with no custom
+	// codec -- keep this data rather than dropping it because the Value type
+	// is unknown.
+	p.Data.Write(content)
+	p.ByteValue = content
 
+	key := CodecKey{ClassType: p.ClassType, TagType: p.TagType, Tag: p.Tag}
+	if codec := d.registry.lookup(p.Identifier); codec != nil {
+		// A registered custom codec takes precedence over the built-in
+		// universal rules for this exact identifier triple.
+		p.Value, err = codec.Decode(content)
+		if err != nil {
+			return nil, read, wrapCodecError(key, path, err)
+		}
+	} else if p.ClassType == ClassUniversal {
 		switch p.Tag {
 		case TagEOC:
 		case TagBoolean:
@@ -485,8 +488,6 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 		case TagCharacterString:
 		case TagBMPString:
 		}
-	} else {
-		p.Data.Write(content)
 	}
 
 	// A content-parse failure (invalid REAL, UTF-8, OID, over-long INTEGER,

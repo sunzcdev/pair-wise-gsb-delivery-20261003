@@ -10,6 +10,17 @@ All notable changes to this project are documented here. The format is based on
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
+- Instance-level primitive codec registry: `Registry`, `NewRegistry`,
+  `Registry.Register`/`MustRegister`, `NewDecoder`, and `Decoder` decode
+  methods (`ReadPacket`, `DecodePacket`, `DecodePacketErr`) select a custom
+  codec by the (class, tag type, tag) identifier triple via `CodecKey` and
+  `PrimitiveCodec` (with the `FuncCodec`/`DecodeFunc`/`EncodeFunc` helpers).
+  `Decoder.NewPrimitive` encodes a custom value back through its codec.
+  Registration conflicts and invalid keys are reported at registration time,
+  overriding a built-in universal type requires `WithUniversalOverrides`,
+  codec decode errors carry the packet path and the original error chain, and
+  decode failures never return a half-filled packet. Primitives without a
+  matching codec now always retain their raw content in `ByteValue`.
 
 ### Changed
 
