@@ -164,13 +164,40 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 		return nil, ErrServerResponseMismatch
 	}
 
+	// Compose the response struct.
+	r := newV4Response(m, xmitTime, recvTime)
+
+	// If supported versions were requested, check the response for an answer.
+	if opt.RequestSupportedVersions {
+		// Always include the version used in the query.
+		r.SupportedVersions = []int{opt.Version}
+
+		// If the server responded to the NTPv5 support request in its
+		// ReferenceTime field, add version 5 to the list and invalidate the
+		// ReferenceTime.
+		if m.ReferenceTime == v5sentinel {
+			r.SupportedVersions = append(r.SupportedVersions, 5)
+			r.ReferenceTime = ntpEra0
+		}
+	}
+
+	// If symmetric authentication was requested, authenticate the response.
+	if opt.Auth.Type != AuthNone {
+		r.authErr = verifyMAC(recvMsg, opt.Version, opt.Auth, authKey)
+	}
+
+	return r, r.authErr
+}
+
+// newV4Response composes a Response from a parsed NTPv3 or NTPv4 message
+// and the local transmit and receive timestamps.
+func newV4Response(m *messageV4, xmitTime, recvTime time.Time) *Response {
 	// Timestamp aliases for readability.
 	t1 := xmitTime
 	t2 := m.ReceiveTime.TimeV4()
 	t3 := m.TransmitTime.TimeV4()
 	t4 := recvTime
 
-	// Compose the response struct.
 	r := &Response{
 		ClockOffset:    offset(t1, t2, t3, t4),
 		RTT:            rtt(t1, t2, t3, t4),
@@ -191,20 +218,6 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 		Time:           t3,
 	}
 
-	// If supported versions were requested, check the response for an answer.
-	if opt.RequestSupportedVersions {
-		// Always include the version used in the query.
-		r.SupportedVersions = []int{opt.Version}
-
-		// If the server responded to the NTPv5 support request in its
-		// ReferenceTime field, add version 5 to the list and invalidate the
-		// ReferenceTime.
-		if m.ReferenceTime == v5sentinel {
-			r.SupportedVersions = append(r.SupportedVersions, 5)
-			r.ReferenceTime = ntpEra0
-		}
-	}
-
 	// Calculate root distance.
 	r.RootDistance = rootDistance(r.RTT, r.RootDelay, r.RootDispersion)
 
@@ -219,12 +232,7 @@ func queryV4(conn conn, opt *QueryOptions) (*Response, error) {
 		r.Flags |= FlagSynchronized
 	}
 
-	// If symmetric authentication was requested, authenticate the response.
-	if opt.Auth.Type != AuthNone {
-		r.authErr = verifyMAC(recvMsg, opt, authKey)
-	}
-
-	return r, r.authErr
+	return r
 }
 
 // buildV4Request creates an NTPv3 or NTPv4 request message.
@@ -292,11 +300,11 @@ func parseV4Response(data []byte) (*messageV4, error) {
 	return m, nil
 }
 
-func verifyMAC(buf []byte, opt *QueryOptions, key []byte) error {
+func verifyMAC(buf []byte, version int, auth AuthOptions, key []byte) error {
 	// Check for a trailing crypto-NAK (with no extension fields). Modern NTP
 	// servers no longer send crypto-NAKs, but some older ones do.
 	remain := len(buf) - msgSize
-	if opt.Version == 4 && remain == 4 {
+	if version == 4 && remain == 4 {
 		if binary.BigEndian.Uint32(buf[len(buf)-4:]) == 0 {
 			return ErrAuthNAK
 		}
@@ -304,7 +312,7 @@ func verifyMAC(buf []byte, opt *QueryOptions, key []byte) error {
 
 	// Validate that there are enough bytes at the end of the message to
 	// contain a complete MAC for the hash algorithm.
-	macLen := 4 + getMACSize(opt.Version, opt.Auth.Type)
+	macLen := 4 + getMACSize(version, auth.Type)
 	if remain < macLen || (remain%4) != 0 {
 		return ErrAuthFailed
 	}
@@ -314,14 +322,14 @@ func verifyMAC(buf []byte, opt *QueryOptions, key []byte) error {
 	payloadLen := len(buf) - macLen
 	mac := buf[payloadLen:]
 	keyID := binary.BigEndian.Uint32(mac[:4])
-	if keyID != opt.Auth.KeyID {
+	if keyID != auth.KeyID {
 		return ErrAuthFailed
 	}
 
 	// Calculate and compare digests.
 	payload := buf[:payloadLen]
 	digestRecv := mac[4:]
-	digestCalc := calcMAC(opt.Version, opt.Auth.Type, key, payload)
+	digestCalc := calcMAC(version, auth.Type, key, payload)
 	if subtle.ConstantTimeCompare(digestCalc, digestRecv) == 0 {
 		return ErrAuthFailed
 	}
