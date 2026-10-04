@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/sourcegraph/conc"
+	"github.com/sourcegraph/conc/panics"
 )
 
 // New creates a new Pool.
@@ -32,39 +33,53 @@ type Pool struct {
 	limiter  limiter
 	tasks    chan func()
 	initOnce sync.Once
+	pc       panics.Catcher
+
+	// outstanding tracks every task that has been accepted but not yet
+	// finished, including tasks submitted at runtime by running scopes. The
+	// task channel is only closed once outstanding reaches zero, which is
+	// what lets a top-level Wait cover dynamically submitted descendants.
+	outstanding sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 // Go submits a task to be run in the pool. If all goroutines in the pool
 // are busy, a call to Go() will block until the task can be started.
 func (p *Pool) Go(f func()) {
 	p.init()
+	p.submit(f, true)
+}
 
-	if p.limiter == nil {
-		// No limit on the number of goroutines.
-		select {
-		case p.tasks <- f:
-			// A goroutine was available to handle the task.
-		default:
-			// No goroutine was available to handle the task.
-			// Spawn a new one and send it the task.
-			p.handle.Go(func() {
-				p.worker(f)
-			})
-		}
-	} else {
-		select {
-		case p.limiter <- struct{}{}:
-			// If we are below our limit, spawn a new worker rather
-			// than waiting for one to become available.
-			p.handle.Go(func() {
-				p.worker(f)
-			})
-		case p.tasks <- f:
-			// A worker is available and has accepted the task.
-			return
-		}
-	}
+// GoScoped submits a task to the pool and hands it a Scope that can be used to
+// submit child tasks for the duration of the call. This makes it possible to
+// spawn a group of subtasks from inside a pool task and wait for them before
+// continuing without deadlocking a pool whose capacity is smaller than the
+// number of concurrently running parent and child tasks.
+//
+// Child tasks are submitted with the Scope's Go method and share the same
+// concurrency limit as their parents: they never run on a separate, unbounded
+// pool. When a task is blocked submitting to, or waiting on, its scope and no
+// pool worker can take over immediately, the task executes pending work
+// inline (and otherwise yields its capacity) so progress is always possible.
+//
+// The scope is automatically closed when f returns. By that point every child
+// submitted to the scope - and transitively every descendant - has completed.
+// This also holds if f panics: all children that were accepted before the
+// panic are still reaped, and the panic is propagated to the pool's Wait.
+// Once the scope has returned, a saved copy of the Scope must not be used and
+// any call to its Go method panics.
+func (p *Pool) GoScoped(f func(*Scope)) {
+	p.Go(func() {
+		scope := p.newScope()
+		defer scope.finish()
+		f(scope)
+	})
+}
 
+// ScopedGo is an alias for GoScoped.
+func (p *Pool) ScopedGo(f func(*Scope)) {
+	p.GoScoped(f)
 }
 
 // Wait cleans up spawned goroutines, propagating any panics that were
@@ -72,13 +87,27 @@ func (p *Pool) Go(f func()) {
 func (p *Pool) Wait() {
 	p.init()
 
-	close(p.tasks)
-
 	// After Wait() returns, reset the struct so tasks will be reinitialized on
 	// next use. This better matches the behavior of sync.WaitGroup
-	defer func() { p.initOnce = sync.Once{} }()
+	defer func() {
+		p.initOnce = sync.Once{}
+		p.closeOnce = sync.Once{}
+		p.pc = panics.Catcher{}
+	}()
+
+	// Close the task channel only once every accepted task - and every task
+	// it may submit through a scope - has finished. This both drains workers
+	// and guarantees no submission can race a closed channel.
+	go func() {
+		p.outstanding.Wait()
+		p.closeOnce.Do(func() { close(p.tasks) })
+	}()
 
 	p.handle.Wait()
+
+	// Propagate a panic if we caught one from a task, including tasks that
+	// were executed inline while a scope was waiting on its children.
+	p.pc.Repanic()
 }
 
 // MaxGoroutines returns the maximum size of the pool.
@@ -103,6 +132,80 @@ func (p *Pool) init() {
 	p.initOnce.Do(func() {
 		p.tasks = make(chan func())
 	})
+}
+
+// submit enqueues a task for execution. If block is true, the caller is an
+// external caller (a call to Pool.Go), so the call blocks until a worker has
+// accepted the task and it never executes the task on the calling goroutine.
+// If block is false, the caller is a task that is submitting to one of its
+// scopes, so when no worker capacity is available it assists by running the
+// task inline instead of blocking, which is what prevents nested scopes from
+// deadlocking.
+func (p *Pool) submit(f func(), block bool) {
+	p.outstanding.Add(1)
+	task := func() {
+		defer p.outstanding.Done()
+		f()
+	}
+
+	if p.limiter == nil {
+		// No limit on the number of goroutines.
+		if block {
+			// Preserve the blocking semantics of Pool.Go: wait until a worker
+			// accepts the task or, if no worker exists yet, start one.
+			select {
+			case p.tasks <- task:
+			default:
+				p.handle.Go(func() { p.worker(task) })
+			}
+			return
+		}
+
+		// Unlimited pool, submitted from inside a scope. If a worker accepts
+		// the task immediately it runs concurrently; otherwise spawn a new
+		// worker so child tasks still run in parallel with their parent.
+		select {
+		case p.tasks <- task:
+		default:
+			p.handle.Go(func() { p.worker(task) })
+		}
+		return
+	}
+
+	if block {
+		select {
+		case p.limiter <- struct{}{}:
+			// If we are below our limit, spawn a new worker rather than
+			// waiting for one to become available.
+			p.handle.Go(func() {
+				p.worker(task)
+			})
+		case p.tasks <- task:
+			// A worker is available and has accepted the task.
+		}
+		return
+	}
+
+	select {
+	case p.limiter <- struct{}{}:
+		// Below the limit: hand the task to a new worker.
+		p.handle.Go(func() {
+			p.worker(task)
+		})
+	case p.tasks <- task:
+		// A worker accepted the task.
+	default:
+		// The pool is saturated. Run the task inline rather than blocking,
+		// allowing arbitrarily deep scopes to make progress even when the
+		// pool has a capacity of one.
+		p.run(task)
+	}
+}
+
+// run executes a single task, catching any panic it raises so that it can be
+// propagated by the pool's Wait.
+func (p *Pool) run(f func()) {
+	p.pc.Try(f)
 }
 
 // panicIfInitialized will trigger a panic if a configuration method is called
@@ -153,12 +256,104 @@ func (p *Pool) worker(initialFunc func()) {
 	defer p.limiter.release()
 
 	if initialFunc != nil {
-		initialFunc()
+		p.run(initialFunc)
 	}
 
 	for f := range p.tasks {
-		f()
+		p.run(f)
 	}
+}
+
+// newScope returns a Scope tied to this pool.
+func (p *Pool) newScope() *Scope {
+	return &Scope{pool: p}
+}
+
+// Scope is a handle to the group of child tasks spawned during a single call to
+// Pool.GoScoped. It is passed to the scoped task and is the only way for that
+// task to submit children.
+//
+// A Scope must not be used after the scoped task has returned. The zero value
+// is not usable; Scope values are always created by Pool.GoScoped. A Scope
+// must not be copied after first use.
+type Scope struct {
+	pool *Pool
+
+	mu       sync.Mutex
+	children sync.WaitGroup
+	closed   bool
+}
+
+// Go submits a child task to the scope. The child shares the owning pool's
+// concurrency limit and may submit its own children with nested scopes.
+//
+// Go panics if it is called after the scope has finished. Saving the Scope
+// and using it once the scoped call has returned is therefore a programming
+// error that is always detected.
+func (s *Scope) Go(f func()) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		panic("scope: cannot submit a task after the scope has finished")
+	}
+	s.children.Add(1)
+	s.mu.Unlock()
+
+	s.pool.submit(func() {
+		defer s.children.Done()
+		f()
+	}, false)
+}
+
+// GoScoped submits a child task to the scope and hands it a nested Scope,
+// allowing arbitrarily deep scope nesting. It is the scoped counterpart to Go
+// and follows the same capacity-sharing and deadlock-avoidance rules.
+func (s *Scope) GoScoped(f func(*Scope)) {
+	s.Go(func() {
+		nested := s.pool.newScope()
+		defer nested.finish()
+		f(nested)
+	})
+}
+
+// Wait blocks until every task submitted to the scope - including descendant
+// tasks - has completed. While blocked it assists with running pending pool
+// work (or, when there is no pending work, yields its pool capacity) so that
+// the scope's children can always make progress, even in a capacity-one pool.
+//
+// It is safe to call Wait multiple times, and it is called automatically when
+// the scoped task returns, so an explicit call is only needed to wait at a
+// specific point.
+func (s *Scope) Wait() {
+	done := make(chan struct{})
+	go func() {
+		s.children.Wait()
+		close(done)
+	}()
+
+	for {
+		select {
+		case <-done:
+			return
+		case f := <-s.pool.tasks:
+			// While waiting for our children, execute other pool work instead
+			// of sitting idle. This both assists throughput and frees the
+			// logical slot our caller occupies when the pool is saturated.
+			if f != nil {
+				s.pool.run(f)
+			}
+		}
+	}
+}
+
+// finish reaps any outstanding children and then marks the scope as closed so
+// that any later use of a saved Scope is rejected.
+func (s *Scope) finish() {
+	s.Wait()
+
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
 }
 
 type limiter chan struct{}

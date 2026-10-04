@@ -19,6 +19,7 @@ go get github.com/sourcegraph/conc
 
 - Use [`conc.WaitGroup`](https://pkg.go.dev/github.com/sourcegraph/conc#WaitGroup) if you just want a safer version of `sync.WaitGroup`
 - Use [`pool.Pool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool) if you want a concurrency-limited task runner
+- Use [`pool.Pool.GoScoped`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.GoScoped) if a pool task needs to spawn and wait on child tasks that share the pool's concurrency limit
 - Use [`pool.ResultPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ResultPool) if you want a concurrent task runner that collects task results
 - Use [`pool.(Result)?ErrorPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ErrorPool) if your tasks are fallible
 - Use [`pool.(Result)?ContextPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ContextPool) if your tasks should be canceled on failure
@@ -454,6 +455,45 @@ func mapStream(
 </td>
 </tr>
 </table>
+
+# Scoped child tasks
+
+Sometimes a pool task needs to fan out into a group of subtasks and wait for
+them before continuing. Spawning those subtasks with a raw `go` statement
+defeats the pool's concurrency limit, and waiting on subtasks that all need a
+pool slot can deadlock when the pool is small (for example, when
+`WithMaxGoroutines(1)` is used).
+
+[`(*Pool).GoScoped`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.GoScoped)
+solves this by running a task with a [`pool.Scope`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Scope)
+that is only valid for the duration of that task. Children are submitted with
+`scope.Go` (or `scope.GoScoped` for nested scopes) and share the parent pool's
+concurrency limit. While a task waits on its children it helps execute pending
+pool work instead of blocking, so a capacity-one pool - and arbitrarily deep
+scope nesting - always makes progress.
+
+```go
+p := pool.New().WithMaxGoroutines(4)
+p.GoScoped(func(parent *pool.Scope) {
+    for _, item := range items {
+        item := item
+        parent.Go(func() {
+            process(item)
+        })
+    }
+    // When GoScoped returns, all of the children above have completed.
+})
+p.Wait()
+```
+
+Scopes provide structured-concurrency guarantees:
+
+- All children, and transitively all descendants, are reaped before the
+  scoped task returns and before the top-level `Wait` returns.
+- If the parent panics, every child that was already submitted is still
+  reaped; the panic is then propagated by `Wait`.
+- The scope is closed when the task returns, so saving the `Scope` and calling
+  `Go` afterwards always panics rather than leaking work out of the scope.
 
 # Status
 
