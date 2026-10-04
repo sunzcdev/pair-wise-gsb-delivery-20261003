@@ -38,10 +38,12 @@ var (
 	ErrInvalidTime            = errors.New("invalid time reported")
 	ErrInvalidTransmitTime    = errors.New("invalid transmit time in response")
 	ErrKissOfDeath            = errors.New("kiss of death received")
+	ErrPacketTooLong          = errors.New("NTP packet exceeds the maximum packet size")
 	ErrServerClockFreshness   = errors.New("server clock not fresh")
 	ErrServerNotSynchronized  = errors.New("NTPv5 server not synchronized")
 	ErrServerResponseMismatch = errors.New("server response didn't match request")
 	ErrServerTickedBackwards  = errors.New("server clock ticked backwards")
+	ErrTruncatedPacket        = errors.New("NTP packet is shorter than the 48-byte header")
 )
 
 // Internal constants

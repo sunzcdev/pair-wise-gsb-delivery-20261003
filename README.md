@@ -144,6 +144,37 @@ package's NTPv5 features are not recommended for use in production
 environments.
 
 
+## Offline packet inspection
+
+For packet capture inspection and offline testing, the package exposes a
+pure wire-format codec for NTPv3 and NTPv4 packets. It performs no network
+I/O and never promotes a decoded packet to a trusted `Response` on its own:
+```go
+packet, err := ntp.DecodePacket(capturedBytes)
+wire, err := packet.Encode()
+```
+
+The decoded `Packet` preserves the fixed 48-byte header fields exactly as
+they appear on the wire, along with any trailing bytes (extension fields,
+MAC, or padding) in uninterpreted form. Encoding a decoded packet
+reproduces the original wire bytes.
+
+To verify a decoded packet as the response to a previously issued query,
+the caller must separately supply the original request's association value,
+the four protocol timestamps, and any symmetric key authentication
+parameters:
+```go
+response, err := packet.Verify(&ntp.VerifyOptions{
+    OriginTimestamp: requestTransmitTime,
+    Timestamps:      fourTimestamps,
+    Auth:            authOptions,
+})
+```
+
+`Verify` returns an error and a nil `Response` if any check fails; a failed
+authentication check never yields a verified result.
+
+
 ## Using the NTP pool
 
 The NTP pool is a shared resource provided by the [NTP Pool
