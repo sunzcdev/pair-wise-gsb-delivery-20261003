@@ -143,6 +143,96 @@ func TestCatcher(t *testing.T) {
 		wg.Wait()
 		require.Equal(t, "50", pc.Recovered().Value)
 	})
+
+	t.Run("recovered all collects every panic in order", func(t *testing.T) {
+		t.Parallel()
+		var pc panics.Catcher
+		pc.Try(func() { panic("first") })
+		pc.Try(func() { _ = 1 })
+		pc.Try(func() { panic("second") })
+		pc.Try(func() { panic("third") })
+
+		all := pc.RecoveredAll()
+		require.Len(t, all, 3)
+		require.Equal(t, "first", all[0].Value)
+		require.Equal(t, "second", all[1].Value)
+		require.Equal(t, "third", all[2].Value)
+		for i, r := range all {
+			require.Equal(t, i, r.Seq, "Seq should match the reception order")
+			require.NotEmpty(t, r.Stack, "every recovered panic should have a stacktrace")
+			require.NotEmpty(t, r.Callers, "every recovered panic should have callers")
+		}
+
+		// Recovered still returns the first panic.
+		require.Equal(t, "first", pc.Recovered().Value)
+	})
+
+	t.Run("recovered all is nil without panics", func(t *testing.T) {
+		t.Parallel()
+		var pc panics.Catcher
+		pc.Try(func() { _ = 1 })
+		require.Nil(t, pc.RecoveredAll())
+	})
+
+	t.Run("panic nil is recovered", func(t *testing.T) {
+		t.Parallel()
+		var pc panics.Catcher
+		pc.Try(func() { panic(nil) })
+
+		all := pc.RecoveredAll()
+		require.Len(t, all, 1)
+		require.Nil(t, all[0].Value)
+		require.Equal(t, 0, all[0].Seq)
+
+		recovered := pc.Recovered()
+		require.NotNil(t, recovered)
+		require.Nil(t, recovered.Value)
+	})
+
+	t.Run("reset clears recovered panics", func(t *testing.T) {
+		t.Parallel()
+		var pc panics.Catcher
+		pc.Try(func() { panic("abort!") })
+		require.NotNil(t, pc.Recovered())
+
+		pc.Reset()
+		require.Nil(t, pc.Recovered())
+		require.Nil(t, pc.RecoveredAll())
+
+		// The catcher is reusable after a reset, and sequence numbers
+		// start over.
+		pc.Try(func() { panic("again!") })
+		all := pc.RecoveredAll()
+		require.Len(t, all, 1)
+		require.Equal(t, "again!", all[0].Value)
+		require.Equal(t, 0, all[0].Seq)
+	})
+
+	t.Run("recovered all is goroutine safe", func(t *testing.T) {
+		t.Parallel()
+		var wg sync.WaitGroup
+		var pc panics.Catcher
+		for i := 0; i < 100; i++ {
+			i := i
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pc.Try(func() { panic(i) })
+			}()
+		}
+		wg.Wait()
+
+		all := pc.RecoveredAll()
+		require.Len(t, all, 100)
+		seen := make(map[int]bool, 100)
+		for i, r := range all {
+			require.Equal(t, i, r.Seq, "Seq should match the reception order")
+			seen[r.Value.(int)] = true
+		}
+		for i := 0; i < 100; i++ {
+			require.True(t, seen[i], "panic %d should have been recovered", i)
+		}
+	})
 }
 
 func TestRecoveredAsError(t *testing.T) {
