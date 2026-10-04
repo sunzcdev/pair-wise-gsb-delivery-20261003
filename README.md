@@ -213,6 +213,34 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Increment a number
+------------------
+Increment adds a decimal delta to the json number at the specified path.
+Both the target and the delta use JSON number syntax, and the calculation
+is exact (no float64 conversion), so integers larger than 2^53 and high
+precision decimals are safe. Nulls, strings, and other types are not
+converted automatically.
+
+```go
+value, _ := sjson.Increment(`{"name":"Sara","visits":9007199254740993}`, "visits", "1")
+println(value)
+
+// Output:
+// {"name":"Sara","visits":9007199254740994}
+```
+
+Use `IncrementWithOptions` to provide an initial value for a missing path
+or to change the maximum length of the resulting number:
+
+```go
+value, _ := sjson.IncrementWithOptions(`{}`, "balance", "0.25",
+	&sjson.IncrementOptions{Initial: "100", MaxLength: 64})
+println(value)
+
+// Output:
+// {"balance":100.25}
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
