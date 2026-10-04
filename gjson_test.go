@@ -2548,6 +2548,87 @@ func TestGroup(t *testing.T) {
 	assert(t, res == `["123"]`)
 }
 
+func TestGroupModes(t *testing.T) {
+	json := `{"id":["123","456","789"],"val":[2,1]}`
+
+	// no argument preserves the legacy output
+	res := Get(json, "@group").Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789"}]`)
+
+	// shortest truncates every column to the shortest one
+	res = Get(json, "@group:shortest").Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1}]`)
+
+	// longest pads missing values with the caller-provided fill value
+	res = Get(json, `@group:{"mode":"longest","fill":0}`).Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789","val":0}]`)
+
+	// longest without an explicit fill value defaults to null
+	res = Get(json, "@group:longest").Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1},{"id":"789","val":null}]`)
+
+	// strict reports the differing column lengths and must not return a
+	// partial result made of the first few rows
+	res = Get(json, "@group:strict").Raw
+	assert(t, res == `{"error":"@group: strict mode requires equal-length columns","lengths":{"id":3,"val":2}}`)
+
+	// strict passes when all columns have the same length
+	res = Get(`{"id":["123","456"],"val":[2,1]}`, "@group:strict").Raw
+	assert(t, res == `[{"id":"123","val":2},{"id":"456","val":1}]`)
+
+	// unknown modes and options are reported
+	res = Get(json, "@group:bogus").Raw
+	assert(t, res == `{"error":"@group: unknown mode","mode":"bogus"}`)
+	res = Get(json, `@group:{"nonarray":"bogus"}`).Raw
+	assert(t, res == `{"error":"@group: unknown nonarray option","nonarray":"bogus"}`)
+}
+
+func TestGroupNonArrayMembers(t *testing.T) {
+	json := `{"id":["123","456"],"name":"shared","tags":["a","b"]}`
+
+	// non-array members are ignored by default and never become a shared
+	// reference fanned out into every row
+	res := Get(json, "@group").Raw
+	assert(t, res == `[{"id":"123","tags":"a"},{"id":"456","tags":"b"}]`)
+	res = Get(json, `@group:{"nonarray":"ignore"}`).Raw
+	assert(t, res == `[{"id":"123","tags":"a"},{"id":"456","tags":"b"}]`)
+
+	// or they can be reported as an error
+	res = Get(json, `@group:{"nonarray":"error"}`).Raw
+	assert(t, res == `{"error":"@group: non-array members not allowed","members":["name"]}`)
+}
+
+func TestGroupEdgeCases(t *testing.T) {
+	// column names containing quotes stay escaped in rows and errors
+	json := `{"a\"b":[1,2],"c":[3,4,5]}`
+	res := Get(json, "@group:shortest").Raw
+	assert(t, res == `[{"a\"b":1,"c":3},{"a\"b":2,"c":4}]`)
+	res = Get(json, "@group:strict").Raw
+	assert(t, res == `{"error":"@group: strict mode requires equal-length columns","lengths":{"a\"b":2,"c":3}}`)
+
+	// empty column arrays
+	json = `{"a":[],"b":[1,2]}`
+	res = Get(json, "@group").Raw
+	assert(t, res == `[{"b":1},{"b":2}]`)
+	res = Get(json, "@group:shortest").Raw
+	assert(t, res == `[]`)
+	res = Get(json, `@group:{"mode":"longest","fill":0}`).Raw
+	assert(t, res == `[{"a":0,"b":1},{"a":0,"b":2}]`)
+	res = Get(json, "@group:strict").Raw
+	assert(t, res == `{"error":"@group: strict mode requires equal-length columns","lengths":{"a":0,"b":2}}`)
+	res = Get(`{"a":[],"b":[]}`, "@group:strict").Raw
+	assert(t, res == `[]`)
+
+	// multiple columns ending at different positions
+	json = `{"a":[1,2,3],"b":[1,2],"c":[1]}`
+	res = Get(json, "@group:shortest").Raw
+	assert(t, res == `[{"a":1,"b":1,"c":1}]`)
+	res = Get(json, `@group:{"mode":"longest","fill":null}`).Raw
+	assert(t, res == `[{"a":1,"b":1,"c":1},{"a":2,"b":2,"c":null},{"a":3,"b":null,"c":null}]`)
+	res = Get(json, "@group:strict").Raw
+	assert(t, res == `{"error":"@group: strict mode requires equal-length columns","lengths":{"a":3,"b":2,"c":1}}`)
+}
+
 func goJSONMarshal(i interface{}) ([]byte, error) {
 	buffer := &bytes.Buffer{}
 	encoder := json.NewEncoder(buffer)

@@ -258,6 +258,13 @@ There are currently the following built-in modifiers:
 - `@tostr`: Converts json to a string. Wraps a json string.
 - `@fromstr`: Converts a string from json. Unwraps a json string.
 - `@group`: Groups arrays of objects. See [e4fc67c](https://github.com/tidwall/gjson/commit/e4fc67c92aeebf2089fabc7872f010e340d105db).
+  Accepts an optional argument controlling columns of unequal length:
+  `@group:shortest` truncates to the shortest column, `@group:longest` pads
+  missing values with `null`, `@group:strict` returns an error object listing
+  the column lengths when they differ. A json object argument allows a custom
+  fill value and non-array member handling, e.g.
+  `@group:{"mode":"longest","fill":0,"nonarray":"error"}`. Without an
+  argument the legacy output is preserved and non-array members are ignored.
 - `@dig`: Search for a value without providing its entire path. See [e8e87f2](https://github.com/tidwall/gjson/commit/e8e87f2a00dc41f3aba5631094e21f59a8cf8cbf).
 
 #### Modifier arguments

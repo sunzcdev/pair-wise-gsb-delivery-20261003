@@ -3297,30 +3297,145 @@ func modGroup(json, arg string) string {
 	if !res.IsObject() {
 		return ""
 	}
-	var all [][]byte
+	// Parse the optional argument. It may be a simple mode string such as
+	// "shortest", "longest" or "strict", or a json object with the fields
+	// "mode", "fill" and "nonarray". When no argument is given the legacy
+	// behavior is preserved: rows are emitted up to the longest column and
+	// missing values are simply omitted.
+	var mode, fill, nonarray string
+	var hasFill bool
+	arg = trim(arg)
+	if arg != "" {
+		if arg[0] == '{' {
+			opts := Parse(arg)
+			mode = opts.Get("mode").String()
+			if f := opts.Get("fill"); f.Exists() {
+				fill = f.Raw
+				hasFill = true
+			}
+			nonarray = opts.Get("nonarray").String()
+		} else {
+			mode = arg
+		}
+	}
+	switch mode {
+	case "", "shortest", "longest", "strict":
+	default:
+		return `{"error":"@group: unknown mode",` +
+			`"mode":` + string(AppendJSONString(nil, mode)) + `}`
+	}
+	switch nonarray {
+	case "", "ignore", "error":
+	default:
+		return `{"error":"@group: unknown nonarray option",` +
+			`"nonarray":` + string(AppendJSONString(nil, nonarray)) + `}`
+	}
+	type column struct {
+		key   string // raw json key, already escaped and quoted
+		name  string // unescaped key name, used for error reporting
+		items []Result
+	}
+	var cols []column
+	var scalars []string
 	res.ForEach(func(key, value Result) bool {
 		if !value.IsArray() {
+			scalars = append(scalars, key.String())
 			return true
 		}
-		var idx int
+		col := column{key: key.Raw, name: key.String()}
 		value.ForEach(func(_, value Result) bool {
-			if idx == len(all) {
-				all = append(all, []byte{})
-			}
-			all[idx] = append(all[idx], ("," + key.Raw + ":" + value.Raw)...)
-			idx++
+			col.items = append(col.items, value)
 			return true
 		})
+		cols = append(cols, col)
 		return true
 	})
+	if len(scalars) > 0 && nonarray == "error" {
+		// Non-array members must never silently fan out into every row.
+		// Report them instead of producing a grouped result.
+		var err []byte
+		err = append(err, `{"error":"@group: non-array members not allowed","members":[`...)
+		for i, name := range scalars {
+			if i > 0 {
+				err = append(err, ',')
+			}
+			err = AppendJSONString(err, name)
+		}
+		err = append(err, ']', '}')
+		return string(err)
+	}
+	var rows int
+	switch mode {
+	case "shortest":
+		for i, col := range cols {
+			if i == 0 || len(col.items) < rows {
+				rows = len(col.items)
+			}
+		}
+	case "strict":
+		// Validate all column lengths before emitting anything so a
+		// failure never leaks a partial set of rows.
+		equal := true
+		for i := 1; i < len(cols); i++ {
+			if len(cols[i].items) != len(cols[0].items) {
+				equal = false
+				break
+			}
+		}
+		if !equal {
+			var err []byte
+			err = append(err, `{"error":"@group: strict mode requires equal-length columns","lengths":{`...)
+			for i, col := range cols {
+				if i > 0 {
+					err = append(err, ',')
+				}
+				err = AppendJSONString(err, col.name)
+				err = append(err, ':')
+				err = append(err, strconv.Itoa(len(col.items))...)
+			}
+			err = append(err, '}', '}')
+			return string(err)
+		}
+		if len(cols) > 0 {
+			rows = len(cols[0].items)
+		}
+	default:
+		// Legacy and "longest" both emit up to the longest column.
+		for _, col := range cols {
+			if len(col.items) > rows {
+				rows = len(col.items)
+			}
+		}
+	}
+	if !hasFill {
+		fill = "null"
+	}
 	var data []byte
 	data = append(data, '[')
-	for i, item := range all {
+	for i := 0; i < rows; i++ {
 		if i > 0 {
 			data = append(data, ',')
 		}
 		data = append(data, '{')
-		data = append(data, item[1:]...)
+		first := true
+		for _, col := range cols {
+			var raw string
+			if i < len(col.items) {
+				raw = col.items[i].Raw
+			} else if mode == "longest" {
+				raw = fill
+			} else {
+				// Legacy behavior omits missing values.
+				continue
+			}
+			if !first {
+				data = append(data, ',')
+			}
+			first = false
+			data = append(data, col.key...)
+			data = append(data, ':')
+			data = append(data, raw...)
+		}
 		data = append(data, '}')
 	}
 	data = append(data, ']')
