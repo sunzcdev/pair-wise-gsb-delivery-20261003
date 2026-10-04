@@ -155,6 +155,31 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+## Custom Rules
+Custom validation rules can be added with `parser.AddReadOnlyRule`, which
+gives the rule a read-only view (`paseto.ReadOnlyToken`) of the authenticated
+claims and footer:
+
+```go
+parser.AddReadOnlyRule(func(token paseto.ReadOnlyToken) error {
+    data, err := token.GetString("data")
+    if err != nil {
+        return err
+    }
+    if data != "expected" {
+        return fmt.Errorf("unexpected data claim")
+    }
+    return nil
+})
+```
+
+Read-only rules cannot mutate the token delivered by the parser: the view
+exposes typed getters only, and any slices, maps, or raw JSON it returns are
+copies. The legacy `paseto.Rule` type (added with `parser.AddRule`) is still
+supported; each legacy rule is executed against an isolated deep copy, so any
+mutations it attempts are discarded. Rules of both kinds run in the order
+they were added.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.

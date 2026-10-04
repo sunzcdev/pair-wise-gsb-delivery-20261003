@@ -20,10 +20,10 @@ func NewToken() Token {
 func makeToken(claims map[string]json.RawMessage, footer []byte) (*Token, error) {
 	tokenValueClaims := make(map[string]json.RawMessage)
 
-	token := Token{tokenValueClaims, footer}
+	token := Token{tokenValueClaims, copyBytes(footer)}
 
 	for key, value := range claims {
-		token.claims[key] = value
+		token.claims[key] = copyRawMessage(value)
 	}
 
 	return &token, nil
@@ -33,7 +33,7 @@ func makeToken(claims map[string]json.RawMessage, footer []byte) (*Token, error)
 func MakeToken(claims map[string]interface{}, footer []byte) (*Token, error) {
 	tokenValueClaims := make(map[string]json.RawMessage)
 
-	token := Token{tokenValueClaims, footer}
+	token := Token{tokenValueClaims, copyBytes(footer)}
 
 	for key, value := range claims {
 		if err := token.Set(key, value); err != nil {
@@ -154,12 +154,39 @@ func (token Token) ClaimsJSON() []byte {
 
 // Footer returns the token's footer
 func (t Token) Footer() []byte {
-	return t.footer
+	return copyBytes(t.footer)
 }
 
 // SetFooter sets the token's footer
 func (t *Token) SetFooter(footer []byte) {
-	t.footer = footer
+	t.footer = copyBytes(footer)
+}
+
+// deepCopy returns a token which shares no mutable state with the original:
+// the claims map, each claim's raw JSON, and the footer are all copied.
+func (t Token) deepCopy() Token {
+	claims := make(map[string]json.RawMessage, len(t.claims))
+	for key, value := range t.claims {
+		claims[key] = copyRawMessage(value)
+	}
+
+	return Token{claims, copyBytes(t.footer)}
+}
+
+func copyBytes(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+
+	return append([]byte(nil), data...)
+}
+
+func copyRawMessage(msg json.RawMessage) json.RawMessage {
+	if msg == nil {
+		return nil
+	}
+
+	return append(json.RawMessage(nil), msg...)
 }
 
 func (t Token) packet() packet {

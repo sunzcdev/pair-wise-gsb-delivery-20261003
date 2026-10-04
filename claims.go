@@ -9,6 +9,12 @@ import (
 // Rule validates a given token for certain required preconditions (defined by
 // the rule itself). If validation fails a Rule MUST return an error, otherwise
 // error MUST be nil.
+//
+// When executed by a Parser, the token is an isolated deep copy of the parsed
+// token: any mutation performed by the rule (Set, SetFooter, or modifying
+// extracted values) is discarded and will not affect the token delivered by
+// the parser. Prefer ReadOnlyRule (via Parser.AddReadOnlyRule) for new rules,
+// which enforces read-only access at the type level.
 type Rule func(token Token) error
 
 // ForAudience requires that the given audience matches the "aud" field of the

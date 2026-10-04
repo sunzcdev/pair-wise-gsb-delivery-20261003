@@ -9,12 +9,12 @@ import (
 // Parser is used to verify or decrypt a token, and can be provided with
 // a set of rules.
 type Parser struct {
-	rules []Rule
+	rules []parserRule
 }
 
 // NewParser returns a parser with NotExpired rule preloaded.
 func NewParser() Parser {
-	return Parser{[]Rule{NotExpired()}}
+	return Parser{[]parserRule{adaptRule(NotExpired())}}
 }
 
 // NewParserWithoutExpiryCheck returns a parser with no currently set rules.
@@ -25,12 +25,15 @@ func NewParserWithoutExpiryCheck() Parser {
 // NewParserForValidNow returns a parser that will require parsed tokens to be
 // valid "now".
 func NewParserForValidNow() Parser {
-	return Parser{[]Rule{ValidAt(time.Now())}}
+	return Parser{[]parserRule{adaptRule(ValidAt(time.Now()))}}
 }
 
 // MakeParser allows a parser to be constructed with a specified set of rules.
 func MakeParser(rules []Rule) Parser {
-	return Parser{rules}
+	parser := Parser{}
+	parser.SetRules(rules)
+
+	return parser
 }
 
 // ParseV2Local will parse and decrypt a v2 local paseto and validate against
@@ -152,12 +155,36 @@ func (p Parser) UnsafeParseFooter(protocol Protocol, tainted string) ([]byte, er
 
 // SetRules will overwrite any currently set rules with those specified.
 func (p *Parser) SetRules(rules []Rule) {
-	p.rules = rules
+	p.rules = nil
+	p.AddRule(rules...)
 }
 
-// AddRule will add the given rule(s) to any already specified.
+// AddRule will add the given rule(s) to any already specified. Rules are
+// executed in the order they are added.
+//
+// Isolation: each legacy Rule is executed against an isolated deep copy of
+// the parsed token. Any mutation a rule performs (Set, SetFooter, or
+// modifying previously extracted footers or claims) is discarded and cannot
+// affect the token delivered by the parser, nor the token seen by other
+// rules. Prefer AddReadOnlyRule for new rules, which enforces this at the
+// type level.
 func (p *Parser) AddRule(rule ...Rule) {
-	p.rules = append(p.rules, rule...)
+	for _, r := range rule {
+		p.rules = append(p.rules, adaptRule(r))
+	}
+}
+
+// AddReadOnlyRule will add the given read-only rule(s) to any already
+// specified. Rules are executed in the order they are added, interleaved
+// with any legacy rules in the order both kinds were added.
+//
+// Read-only rules receive a ReadOnlyToken view of the authenticated claims
+// and footer: they can read them by type, but cannot mutate the token which
+// is delivered by the parser.
+func (p *Parser) AddReadOnlyRule(rule ...ReadOnlyRule) {
+	for _, r := range rule {
+		p.rules = append(p.rules, adaptReadOnlyRule(r))
+	}
 }
 
 func (p Parser) validate(token Token) result.Result[Token] {
@@ -168,4 +195,27 @@ func (p Parser) validate(token Token) result.Result[Token] {
 	}
 
 	return result.Ok(token)
+}
+
+// parserRule is the internal, execution-ready form of a rule. It receives
+// the parsed token and is responsible for isolating it as needed.
+type parserRule func(token Token) error
+
+// adaptRule adapts a legacy Rule for execution. The rule is run against a
+// deep copy of the token so that mutations performed by the rule (the token
+// is passed by value, but its claims map and footer would otherwise be
+// shared) cannot leak into the token delivered by the parser.
+func adaptRule(rule Rule) parserRule {
+	return func(token Token) error {
+		return rule(token.deepCopy())
+	}
+}
+
+// adaptReadOnlyRule adapts a ReadOnlyRule for execution. The read-only view
+// only exposes getters which return copies, so the parsed token can be
+// wrapped directly without copying.
+func adaptReadOnlyRule(rule ReadOnlyRule) parserRule {
+	return func(token Token) error {
+		return rule(token.ReadOnly())
+	}
 }
