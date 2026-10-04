@@ -133,6 +133,58 @@ func Get(url string) ([]byte, error) {
 
 See [example](https://github.com/sony/gobreaker/blob/master/v2/example) for details.
 
+Per-backend Container
+---------------------
+
+When talking to many backends, use `Container` to keep one `CircuitBreaker`
+per caller-provided backend key instead of a single shared breaker. A failure
+on one key trips only that key's breaker; keys are opaque strings and the
+container never derives a partition from a URL.
+
+```go
+func NewContainer[T any](settings ContainerSettings[T]) (*Container[T], error)
+
+type ContainerSettings[T any] struct {
+	MaxEntries  int
+	IdleTimeout time.Duration
+	Factory     BreakerFactory[T]
+}
+```
+
+- `MaxEntries` bounds the number of retained breakers (`0` means unlimited).
+- `IdleTimeout` is how long an unused breaker with no in-flight requests (and
+  no outstanding half-open permit) is kept before being reclaimed.
+- `Factory` builds the breaker for a new key.
+
+`Get` returns the breaker for a key, creating it on first use. When the limit
+is reached and every entry is busy, it returns `ErrContainerFull` instead of
+evicting an active breaker. Go through `Execute` or `Allow` so in-flight
+requests and unreleased half-open permits pin their breaker against reclaim;
+`Cleanup` eagerly reclaims idle entries.
+
+```go
+container, _ := gobreaker.NewContainer(gobreaker.ContainerSettings[[]byte]{
+	MaxEntries:  64,
+	IdleTimeout: 5 * time.Minute,
+	Factory: func(backend string) *gobreaker.CircuitBreaker[[]byte] {
+		return gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{
+			Name: backend,
+		})
+	},
+})
+
+func Get(backend, url string) ([]byte, error) {
+	return container.Execute(backend, func() ([]byte, error) {
+		resp, err := http.Get(url)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		return io.ReadAll(resp.Body)
+	})
+}
+```
+
 License
 -------
 
