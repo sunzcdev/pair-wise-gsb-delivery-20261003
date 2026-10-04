@@ -32,6 +32,10 @@ type Options struct {
 	// The Optimistic flag must be set to true and the input must be a
 	// byte slice in order to use this field.
 	ReplaceInPlace bool
+	// Overwrite is used by Rename to indicate that an existing member
+	// with the target name may be replaced. By default renaming onto an
+	// existing key is an error.
+	Overwrite bool
 }
 
 type pathResult struct {
@@ -740,6 +744,236 @@ func SetRawBytesOptions(json []byte, path string, value []byte,
 		inplace = opts.ReplaceInPlace
 	}
 	res, err := set(jstr, path, vstr, false, false, optimistic, inplace)
+	if err == errNoChange {
+		return json, nil
+	}
+	return res, err
+}
+
+// objectMember describes a single member of a json object. The byte
+// indexes reference the original json document.
+type objectMember struct {
+	keyStart int    // index of the opening quote of the key
+	keyEnd   int    // index just past the closing quote of the key
+	key      string // decoded key name
+	valStart int    // index of the first byte of the value
+	valEnd   int    // index just past the last byte of the value
+	comma    int    // index of the delimiting comma, or -1 for the last member
+}
+
+// scanObjectMembers enumerates the members of a top-level json object.
+// Key names are decoded literal strings and are never interpreted as
+// query expressions. The json is expected to be well-formed.
+func scanObjectMembers(jstr string) ([]objectMember, error) {
+	res := gjson.Parse(jstr)
+	if res.Type != gjson.JSON || len(res.Raw) == 0 || res.Raw[0] != '{' {
+		return nil, &errorType{"json must be an object"}
+	}
+	var members []objectMember
+	res.ForEach(func(key, value gjson.Result) bool {
+		keyStart := key.Index
+		keyEnd := keyStart + len(key.Raw)
+		valStart := value.Index
+		valEnd := valStart + len(value.Raw)
+		m := objectMember{
+			keyStart: keyStart,
+			keyEnd:   keyEnd,
+			key:      key.Str,
+			valStart: valStart,
+			valEnd:   valEnd,
+			comma:    -1,
+		}
+		// Find the delimiter (comma or closing brace) following the
+		// value at the top level of the object.
+		i := valEnd
+		for i < len(jstr) && jstr[i] <= ' ' {
+			i++
+		}
+		if i < len(jstr) && jstr[i] == ',' {
+			m.comma = i
+		}
+		members = append(members, m)
+		return true
+	})
+	return members, nil
+}
+
+// renameEdit replaces the byte range [start,end) with repl. A nil repl
+// deletes the range.
+type renameEdit struct {
+	start int
+	end   int
+	repl  []byte
+}
+
+func rename(jstr, oldName, newName string,
+	overwrite, optimistic, inplace bool) ([]byte, error) {
+	if oldName == newName {
+		return nil, errNoChange
+	}
+	members, err := scanObjectMembers(jstr)
+	if err != nil {
+		return []byte(jstr), err
+	}
+	var oldIdxs, newIdxs []int
+	for i := range members {
+		if members[i].key == oldName {
+			oldIdxs = append(oldIdxs, i)
+		}
+		if members[i].key == newName {
+			newIdxs = append(newIdxs, i)
+		}
+	}
+	if len(oldIdxs) == 0 {
+		return []byte(jstr),
+			&errorType{"key '" + oldName + "' was not found"}
+	}
+	if len(oldIdxs) > 1 {
+		return []byte(jstr),
+			&errorType{"multiple members named '" + oldName + "'"}
+	}
+	if len(newIdxs) > 1 {
+		return []byte(jstr),
+			&errorType{"multiple members named '" + newName + "'"}
+	}
+	if len(newIdxs) == 1 && !overwrite {
+		return []byte(jstr),
+			&errorType{"key '" + newName + "' already exists"}
+	}
+
+	// All validation has succeeded past this point, so the in-place
+	// optimization below cannot leave the input document half modified.
+	old := members[oldIdxs[0]]
+	encNew := appendStringify(nil, newName)
+	edits := []renameEdit{{
+		start: old.keyStart,
+		end:   old.keyEnd,
+		repl:  encNew,
+	}}
+	if len(newIdxs) == 1 {
+		target := members[newIdxs[0]]
+		if target.comma >= 0 {
+			// Drop the member and the comma that follows it.
+			edits = append(edits, renameEdit{
+				start: target.keyStart,
+				end:   target.comma + 1,
+			})
+		} else if newIdxs[0] > 0 {
+			// Last member: drop from the previous member's comma.
+			edits = append(edits, renameEdit{
+				start: members[newIdxs[0]-1].comma,
+				end:   target.valEnd,
+			})
+		} else {
+			// Only member in the object.
+			edits = append(edits, renameEdit{
+				start: target.keyStart,
+				end:   target.valEnd,
+			})
+		}
+	}
+	sort.Slice(edits, func(i, j int) bool {
+		return edits[i].start < edits[j].start
+	})
+	finalLen := len(jstr)
+	for _, e := range edits {
+		finalLen -= e.end - e.start
+		finalLen += len(e.repl)
+	}
+
+	if inplace && optimistic && finalLen <= len(jstr) {
+		jsonh := *(*stringHeader)(unsafe.Pointer(&jstr))
+		jsonbh := sliceHeader{
+			data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+		jbytes := *(*[]byte)(unsafe.Pointer(&jsonbh))
+		// Apply edits left to right. For each edit the entire tail that
+		// follows it is shifted toward its destination, then the
+		// replacement is written over the vacated prefix. Since every
+		// edit shrinks the document (or keeps its size), the shift never
+		// moves bytes toward higher indexes.
+		dst := edits[0].start
+		for i, e := range edits {
+			gapEnd := len(jstr)
+			if i+1 < len(edits) {
+				gapEnd = edits[i+1].start
+			}
+			// Relocate the unchanged gap following this edit first.
+			copy(jbytes[dst+len(e.repl):], jbytes[e.end:gapEnd])
+			copy(jbytes[dst:], e.repl)
+			dst += len(e.repl) + (gapEnd - e.end)
+		}
+		return jbytes[:finalLen], nil
+	}
+
+	buf := make([]byte, 0, finalLen)
+	prev := 0
+	for _, e := range edits {
+		buf = append(buf, jstr[prev:e.start]...)
+		buf = append(buf, e.repl...)
+		prev = e.end
+	}
+	buf = append(buf, jstr[prev:]...)
+	return buf, nil
+}
+
+// Rename renames the top-level object member named oldName to newName.
+// Unlike Set, the names are literal decoded key strings and are not
+// interpreted as query paths: empty keys or keys containing dots and
+// backslashes work as-is. The member keeps its original value and
+// position in the object.
+//
+// When overwrite is false and a member named newName already exists,
+// an error is returned. When overwrite is true, the existing member is
+// removed and the renamed member stays in its original position.
+//
+// Duplicate occurrences of either name result in an ambiguity error.
+// Renaming a key to itself is a no-op.
+func Rename(json, oldName, newName string, overwrite bool) (string, error) {
+	opts := Options{Overwrite: overwrite}
+	return RenameOptions(json, oldName, newName, &opts)
+}
+
+// RenameOptions renames a top-level object member using the given
+// options. See the Rename documentation for details. The Overwrite
+// field controls the behavior when newName already exists.
+func RenameOptions(json, oldName, newName string,
+	opts *Options) (string, error) {
+	if opts != nil && opts.ReplaceInPlace {
+		// it's not safe to replace bytes in-place for strings.
+		// copy the Options and set options.ReplaceInPlace to false.
+		nopts := *opts
+		opts = &nopts
+		opts.ReplaceInPlace = false
+	}
+	jsonh := *(*stringHeader)(unsafe.Pointer(&json))
+	jsonbh := sliceHeader{data: jsonh.data, len: jsonh.len, cap: jsonh.len}
+	jsonb := *(*[]byte)(unsafe.Pointer(&jsonbh))
+	res, err := RenameBytesOptions(jsonb, oldName, newName, opts)
+	return string(res), err
+}
+
+// RenameBytes renames a top-level object member.
+// If working with bytes, this method preferred over
+// Rename(string(data), oldName, newName, overwrite)
+func RenameBytes(json []byte, oldName, newName string,
+	overwrite bool) ([]byte, error) {
+	opts := Options{Overwrite: overwrite}
+	return RenameBytesOptions(json, oldName, newName, &opts)
+}
+
+// RenameBytesOptions renames a top-level object member with the given
+// options. See the Rename documentation for details.
+func RenameBytesOptions(json []byte, oldName, newName string,
+	opts *Options) ([]byte, error) {
+	var optimistic, inplace, overwrite bool
+	if opts != nil {
+		optimistic = opts.Optimistic
+		inplace = opts.ReplaceInPlace
+		overwrite = opts.Overwrite
+	}
+	jstr := *(*string)(unsafe.Pointer(&json))
+	res, err := rename(jstr, oldName, newName,
+		overwrite, optimistic, inplace)
 	if err == errNoChange {
 		return json, nil
 	}

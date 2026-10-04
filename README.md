@@ -213,6 +213,18 @@ println(value)
 // {"friends":["Andy"]}
 ```
 
+Rename an object key. The names are literal decoded keys rather than
+query paths, so empty keys or keys containing dots and backslashes work
+as-is. The value and the member's position are preserved. By default an
+existing target key is an error; pass `true` to replace it.
+```go
+value, _ := sjson.Rename(`{"a":1,"b":2}`, "b", "c", false)
+println(value)
+
+// Output:
+// {"a":1,"c":2}
+```
+
 ## Performance
 
 Benchmarks of SJSON alongside [encoding/json](https://golang.org/pkg/encoding/json/), 
