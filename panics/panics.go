@@ -75,7 +75,12 @@ type Recovered struct {
 
 // String renders a human-readable formatting of the panic.
 func (p *Recovered) String() string {
-	return fmt.Sprintf("panic: %v\nstacktrace:\n%s\n", p.Value, p.Stack)
+	value := p.Value
+	if value == nil {
+		// A panic(nil) has no value; newer Go runtimes describe it this way.
+		value = nilPanicValue
+	}
+	return fmt.Sprintf("panic: %v\nstacktrace:\n%s\n", value, p.Stack)
 }
 
 // AsError casts the panic into an error implementation. The implementation
