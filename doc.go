@@ -10,4 +10,10 @@
 // and [MaxNestingDepth] package variables bound allocation and recursion. Prefer
 // [DecodePacketErr] over [DecodePacket], which reports failure only by returning
 // nil.
+//
+// Applications that need custom decoding for specific tags can build a
+// [Decoder] with [NewDecoder] and register per-(class, tag type, tag)
+// primitive codecs via [WithCodec]. Each Decoder has its own registry, so
+// independent configurations never interfere; packets without a registered
+// codec decode as usual and keep their raw content.
 package ber

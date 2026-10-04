@@ -243,11 +243,7 @@ func printPacket(out io.Writer, p *Packet, indent int, printBytes bool) {
 
 // ReadPacket reads a single Packet from the reader.
 func ReadPacket(reader io.Reader) (*Packet, error) {
-	p, _, err := readPacket(reader, 0)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return defaultDecoder.ReadPacket(reader)
 }
 
 func DecodeString(data []byte) string {
@@ -303,26 +299,22 @@ func int64Length(i int64) (numBytes int) {
 // DecodePacket decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacket(data []byte) *Packet {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
-	if err != nil {
-		return nil
-	}
-
-	return p
+	return defaultDecoder.DecodePacket(data)
 }
 
 // DecodePacketErr decodes the given bytes into a single Packet
 // If a decode error is encountered, nil is returned.
 func DecodePacketErr(data []byte) (*Packet, error) {
-	p, _, err := readPacket(bytes.NewBuffer(data), 0)
-	if err != nil {
-		return nil, err
-	}
-	return p, nil
+	return defaultDecoder.DecodePacketErr(data)
 }
 
+// defaultDecoder backs the package-level decode functions. It has no custom
+// codecs, so decoding behaves exactly as it always has.
+var defaultDecoder = &Decoder{}
+
 // readPacket reads a single Packet from the reader, returning the number of bytes read.
-func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
+// path holds the identifiers of the packet's ancestors, for error messages.
+func (d *Decoder) readPacket(reader io.Reader, depth int, path []Identifier) (*Packet, int, error) {
 	if MaxNestingDepth > 0 && depth >= MaxNestingDepth {
 		return nil, 0, fmt.Errorf("nesting depth %d exceeds maximum %d", depth, MaxNestingDepth)
 	}
@@ -362,7 +354,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			}
 
 			// Read the next packet
-			child, r, err := readPacket(reader, depth+1)
+			child, r, err := d.readPacket(reader, depth+1, append(path, p.Identifier))
 			if err != nil {
 				return nil, read, unexpectedEOF(err)
 			}
@@ -408,6 +400,25 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 	} else {
 		// If length == 0, we set the ByteValue to an empty slice
 		content = make([]byte, 0)
+	}
+
+	// A registered codec takes over decoding for this (class, tag type, tag)
+	// triple. The raw content is still retained in Data and ByteValue so the
+	// packet round-trips through Bytes(). A codec error yields no packet at
+	// all -- callers never see a partially-populated packet alongside an
+	// error -- and carries the packet's path plus the codec's original error.
+	if codec := d.codecFor(p.Identifier); codec != nil {
+		p.Data.Write(content)
+		p.ByteValue = content
+
+		var value interface{}
+		value, err = codec.Decode(content)
+		if err != nil {
+			return nil, read, fmt.Errorf("ber: codec decode failed at %s: %w",
+				formatIdentifierPath(append(path, p.Identifier)), err)
+		}
+		p.Value = value
+		return p, read, nil
 	}
 
 	if p.ClassType == ClassUniversal {
