@@ -2977,6 +2977,7 @@ func init() {
 		"fromstr": modFromStr,
 		"group":   modGroup,
 		"dig":     modDig,
+		"window":  modWindow,
 	}
 }
 
@@ -3085,6 +3086,121 @@ func modReverse(json, arg string) string {
 		return bytesString(out)
 	}
 	return json
+}
+
+// @window returns a window of array elements.
+//
+//	[0,1,2,3,4,5] with {"start":1,"stop":4} -> [1,2,3]
+//
+// The arg is a json object with the optional "start", "stop", and "step"
+// fields. The "stop" index is not included in the result. Negative indexes
+// count back from the end of the array, and a negative "step" selects
+// elements in reverse order.
+//
+//	[0,1,2,3,4,5] with {"step":-1} -> [5,4,3,2,1,0]
+//
+// When omitted, "start" defaults to the first element (or the last element
+// for a negative "step"), "stop" defaults to just past the opposite end of
+// the array, and "step" defaults to 1. Out-of-range bounds are clipped to
+// the valid range and never wrap around. A "step" of zero returns an
+// identifiable error object. The original json is returned when the json is
+// not an array.
+func modWindow(json, arg string) string {
+	res := Parse(json)
+	if !res.IsArray() {
+		return json
+	}
+	var start, stop, step int
+	var hasStart, hasStop bool
+	step = 1
+	if arg != "" {
+		Parse(arg).ForEach(func(key, value Result) bool {
+			switch key.String() {
+			case "start":
+				start, hasStart = int(value.Int()), true
+			case "stop":
+				stop, hasStop = int(value.Int()), true
+			case "step":
+				step = int(value.Int())
+			}
+			return true
+		})
+	}
+	if step == 0 {
+		return `{"error":"@window: step cannot be zero"}`
+	}
+	var values []Result
+	res.ForEach(func(_, value Result) bool {
+		values = append(values, value)
+		return true
+	})
+	n := len(values)
+	if !hasStart {
+		if step > 0 {
+			start = 0
+		} else {
+			start = n - 1
+		}
+	}
+	if !hasStop {
+		if step > 0 {
+			stop = n
+		} else {
+			stop = -n - 1
+		}
+	}
+	// Resolve negative indexes relative to the end of the array.
+	if start < 0 {
+		start += n
+	}
+	if stop < 0 {
+		stop += n
+	}
+	// Clip out-of-range bounds to the valid range, without wrapping.
+	if step > 0 {
+		if start < 0 {
+			start = 0
+		} else if start > n {
+			start = n
+		}
+		if stop < 0 {
+			stop = 0
+		} else if stop > n {
+			stop = n
+		}
+	} else {
+		if start < 0 {
+			start = -1
+		} else if start > n-1 {
+			start = n - 1
+		}
+		if stop < -1 {
+			stop = -1
+		} else if stop > n-1 {
+			stop = n - 1
+		}
+	}
+	out := make([]byte, 0, len(json))
+	out = append(out, '[')
+	var idx int
+	appendValue := func(i int) {
+		if idx > 0 {
+			out = append(out, ',')
+		}
+		out = append(out, values[i].Raw...)
+		idx++
+	}
+	if step > 0 {
+		for i := start; i < stop; i += step {
+			appendValue(i)
+		}
+	} else {
+		for i := start; i > stop; i += step {
+			appendValue(i)
+		}
+	}
+	out = append(out, ']')
+	return bytesString(out)
 }
 
 // @flatten an array with child arrays.

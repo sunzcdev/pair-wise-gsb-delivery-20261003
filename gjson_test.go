@@ -1927,6 +1927,50 @@ func TestFlatten(t *testing.T) {
 	assert(t, Get(`{"9999":1234}`, "@flatten").String() == `{"9999":1234}`)
 }
 
+func TestWindow(t *testing.T) {
+	json := `[0,1,2,3,4,5]`
+	// defaults select the entire array
+	assert(t, Get(json, "@window").String() == `[0,1,2,3,4,5]`)
+	assert(t, Get(json, `@window:{}`).String() == `[0,1,2,3,4,5]`)
+	// stop is not included in the result
+	assert(t, Get(json, `@window:{"start":1,"stop":4}`).String() == `[1,2,3]`)
+	assert(t, Get(json, `@window:{"stop":3}`).String() == `[0,1,2]`)
+	assert(t, Get(json, `@window:{"start":2}`).String() == `[2,3,4,5]`)
+	// negative indexes count back from the end
+	assert(t, Get(json, `@window:{"start":-3}`).String() == `[3,4,5]`)
+	assert(t, Get(json, `@window:{"stop":-1}`).String() == `[0,1,2,3,4]`)
+	assert(t, Get(json, `@window:{"start":-4,"stop":-1}`).String() == `[2,3,4]`)
+	// stepped selection
+	assert(t, Get(json, `@window:{"step":2}`).String() == `[0,2,4]`)
+	assert(t, Get(json, `@window:{"start":1,"stop":5,"step":2}`).String() == `[1,3]`)
+	// reverse step selects elements in reverse order
+	assert(t, Get(json, `@window:{"step":-1}`).String() == `[5,4,3,2,1,0]`)
+	assert(t, Get(json, `@window:{"start":4,"stop":1,"step":-2}`).String() == `[4,2]`)
+	assert(t, Get(json, `@window:{"start":-2,"step":-1}`).String() == `[4,3,2,1,0]`)
+	// out-of-range bounds are clipped, never wrapped
+	assert(t, Get(json, `@window:{"start":-100,"stop":100}`).String() == `[0,1,2,3,4,5]`)
+	assert(t, Get(json, `@window:{"start":100}`).String() == `[]`)
+	assert(t, Get(json, `@window:{"stop":-100}`).String() == `[]`)
+	assert(t, Get(json, `@window:{"start":100,"stop":-100,"step":-1}`).String() == `[5,4,3,2,1,0]`)
+	// large steps
+	assert(t, Get(json, `@window:{"step":10}`).String() == `[0]`)
+	assert(t, Get(json, `@window:{"step":-10}`).String() == `[5]`)
+	// empty and single element arrays
+	assert(t, Get(`[]`, "@window").String() == `[]`)
+	assert(t, Get(`[]`, `@window:{"step":-1}`).String() == `[]`)
+	assert(t, Get(`[7]`, "@window").String() == `[7]`)
+	assert(t, Get(`[7]`, `@window:{"step":-1}`).String() == `[7]`)
+	assert(t, Get(`[7]`, `@window:{"start":1}`).String() == `[]`)
+	// a step of zero returns an identifiable error
+	assert(t, Get(json, `@window:{"step":0}`).Get("error").String() == "@window: step cannot be zero")
+	// non-array json is returned as-is
+	assert(t, Get(`{"a":1}`, "@window").String() == `{"a":1}`)
+	// elements keep their original Raw
+	raw := Get(`[ 1 , {"a": 2} , 3 ]`, `@window:{"start":1,"stop":2}`)
+	assert(t, raw.String() == `[{"a": 2}]`)
+	assert(t, raw.Array()[0].Raw == `{"a": 2}`)
+}
+
 func TestJoin(t *testing.T) {
 	assert(t, Get(`[{},{}]`, "@join").String() == `{}`)
 	assert(t, Get(`[{"a":1},{"b":2}]`, "@join").String() == `{"a":1,"b":2}`)
