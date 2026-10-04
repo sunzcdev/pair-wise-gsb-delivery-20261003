@@ -25,19 +25,22 @@ func OpenString(L *LState) int {
 }
 
 var strFuncs = map[string]LGFunction{
-	"byte":    strByte,
-	"char":    strChar,
-	"dump":    strDump,
-	"find":    strFind,
-	"format":  strFormat,
-	"gsub":    strGsub,
-	"len":     strLen,
-	"lower":   strLower,
-	"match":   strMatch,
-	"rep":     strRep,
-	"reverse": strReverse,
-	"sub":     strSub,
-	"upper":   strUpper,
+	"byte":     strByte,
+	"char":     strChar,
+	"dump":     strDump,
+	"find":     strFind,
+	"format":   strFormat,
+	"gsub":     strGsub,
+	"len":      strLen,
+	"lower":    strLower,
+	"match":    strMatch,
+	"pack":     strPack,
+	"packsize": strPackSize,
+	"rep":      strRep,
+	"reverse":  strReverse,
+	"sub":      strSub,
+	"unpack":   strUnpack,
+	"upper":    strUpper,
 }
 
 func strByte(L *LState) int {
