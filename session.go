@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -24,6 +25,9 @@ type milterSession struct {
 	headers  textproto.MIMEHeader
 	macros   map[string]string
 	backend  Milter
+
+	observer       Observer
+	observerPolicy ObserverFailurePolicy
 }
 
 // ReadPacket reads incoming milter packet
@@ -60,7 +64,64 @@ func readPacket(conn net.Conn, timeout time.Duration) (*Message, error) {
 
 // WritePacket sends a milter response packet to socket stream
 func (m *milterSession) WritePacket(msg *Message) error {
-	return writePacket(m.conn, msg, 0)
+	if err := writePacket(m.conn, msg, 0); err != nil {
+		return err
+	}
+	if m.observe(DirectionOutbound, msg) {
+		return errCloseSession
+	}
+	return nil
+}
+
+// observe passes a protocol event to the session observer, if any. The
+// packet has already been read from or written to the network, so the
+// observer cannot alter the exchanged bytes. It reports whether the
+// session must be closed according to the observer failure policy.
+func (m *milterSession) observe(direction Direction, msg *Message) (closeSession bool) {
+	if m.observer == nil {
+		return false
+	}
+
+	ev := ObservedEvent{
+		Direction: direction,
+		Code:      msg.Code,
+		Length:    uint32(len(msg.Data) + 1),
+	}
+	if Code(msg.Code) == CodeOptNeg {
+		ev.Actions = m.actions
+		ev.Protocol = m.protocol
+	}
+	if direction == DirectionOutbound {
+		switch ActionCode(msg.Code) {
+		case ActAccept, ActDiscard, ActReject, ActTempFail:
+			ev.Final = true
+		}
+	}
+	if m.observer.CapturePayload() {
+		// Hand the observer a private copy so that it cannot alter the
+		// bytes processed by the session state machine.
+		// The copy is never nil, even for empty payloads, so that a full
+		// recording can be told apart from a metadata-only one.
+		ev.Data = append([]byte{}, msg.Data...)
+	}
+
+	if err := observeEventSafely(m.observer, ev); err != nil {
+		log.Printf("milter: observer failure: %v", err)
+		if m.observerPolicy == ObserverFailureClose {
+			return true
+		}
+	}
+	return false
+}
+
+// observeEventSafely calls the observer, converting panics into errors.
+func observeEventSafely(obs Observer, ev ObservedEvent) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	return obs.ObserveEvent(ev)
 }
 
 func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
@@ -256,6 +317,10 @@ func (m *milterSession) HandleMilterCommands() {
 			return
 		}
 
+		if m.observe(DirectionInbound, msg) {
+			return
+		}
+
 		resp, err := m.Process(msg)
 		if err != nil {
 			if err != errCloseSession {
@@ -269,7 +334,9 @@ func (m *milterSession) HandleMilterCommands() {
 		if resp != nil {
 			// send back response message
 			if err = m.WritePacket(resp.Response()); err != nil {
-				log.Printf("Error writing packet: %v", err)
+				if err != errCloseSession {
+					log.Printf("Error writing packet: %v", err)
+				}
 				return
 			}
 

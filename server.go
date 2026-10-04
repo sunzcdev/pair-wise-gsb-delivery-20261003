@@ -108,6 +108,15 @@ type Server struct {
 	// [Server.Actions] must have the flag [OptSetSymList] set.
 	SymList map[Stage][]string
 
+	// Observer, if non-nil, receives a stream of protocol events for every
+	// session. See the Observer documentation for the concurrency and
+	// failure handling guarantees.
+	Observer Observer
+
+	// ObserverFailurePolicy determines how Observer failures are handled.
+	// The zero value logs the failure and continues serving the session.
+	ObserverFailurePolicy ObserverFailurePolicy
+
 	listeners []net.Listener
 	closed    bool
 }
@@ -128,11 +137,13 @@ func (s *Server) Serve(ln net.Listener) error {
 		}
 
 		session := milterSession{
-			server:   s,
-			actions:  s.Actions,
-			protocol: s.Protocol,
-			conn:     conn,
-			backend:  s.NewMilter(),
+			server:         s,
+			actions:        s.Actions,
+			protocol:       s.Protocol,
+			conn:           conn,
+			backend:        s.NewMilter(),
+			observer:       s.Observer,
+			observerPolicy: s.ObserverFailurePolicy,
 		}
 		go session.HandleMilterCommands()
 	}
