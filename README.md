@@ -22,6 +22,7 @@ go get github.com/sourcegraph/conc
 - Use [`pool.ResultPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ResultPool) if you want a concurrent task runner that collects task results
 - Use [`pool.(Result)?ErrorPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ErrorPool) if your tasks are fallible
 - Use [`pool.(Result)?ContextPool`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ContextPool) if your tasks should be canceled on failure
+- Use [`pool.Pool.GoScope`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.GoScope) if a task needs to spawn and wait on child work within the same pool, even when the pool size is 1
 - Use [`stream.Stream`](https://pkg.go.dev/github.com/sourcegraph/conc/stream#Stream) if you want to process an ordered stream of tasks in parallel with serial callbacks
 - Use [`iter.Map`](https://pkg.go.dev/github.com/sourcegraph/conc/iter#Map) if you want to concurrently map a slice
 - Use [`iter.ForEach`](https://pkg.go.dev/github.com/sourcegraph/conc/iter#ForEach) if you want to concurrently iterate over a slice
@@ -38,6 +39,39 @@ then configured with methods:
 - [`p.WithContext(ctx)`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#Pool.WithContext) configures the pool to run tasks that should be canceled on first error
 - [`p.WithFirstError()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ErrorPool.WithFirstError) configures error pools to only keep the first returned error rather than an aggregated error
 - [`p.WithCollectErrored()`](https://pkg.go.dev/github.com/sourcegraph/conc/pool#ResultContextPool.WithCollectErrored) configures result pools to collect results even when the task errored
+
+# Scoped child work
+
+Sometimes a task running in a pool needs to fan out into child tasks and
+wait for them before continuing. Calling `Go` on a second pool from inside a
+pool task deadlocks when the outer pool has a concurrency limit of 1: the
+parent occupies the only slot and waits for children that can never start.
+
+`Pool.GoScope` solves this by giving a task a scope-bound submitter. The
+children share the parent pool's concurrency limit, and when the task waits
+for its children its goroutine cooperatively executes queued work instead of
+holding a slot idle.
+
+- `Wait()` on the pool covers every descendant, not just top-level tasks.
+- If the parent task panics, all children that were already accepted still
+  run to completion before the panic propagates.
+- A submitter saved and used after its scope has ended panics; child work
+  cannot outlive the scope that created it.
+
+```go
+p := pool.New().WithMaxGoroutines(1)
+p.GoScope(func(parent *pool.Scope) {
+    for _, item := range items {
+        item := item
+        parent.Go(func() {
+            process(item)
+        })
+    }
+    // Children are joined automatically when this function returns, or
+    // explicitly with parent.Wait(). Scopes nest arbitrarily deeply.
+})
+p.Wait()
+```
 
 # Goals
 
