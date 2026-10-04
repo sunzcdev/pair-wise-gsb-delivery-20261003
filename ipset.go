@@ -6,6 +6,7 @@ package netipx
 
 import (
 	"fmt"
+	"io"
 	"net/netip"
 	"runtime"
 	"sort"
@@ -317,6 +318,75 @@ func (s *IPSetBuilder) IPSet() (*IPSet, error) {
 		s.errs = nil
 		return ret, errs
 	}
+}
+
+// IPSetFromSortedRanges returns an IPSet built from the IP ranges
+// produced by next, which must yield ranges in sorted order.
+//
+// next is called repeatedly to obtain the next range, and reports the
+// end of the sequence by returning io.EOF. Any other non-nil error
+// aborts construction and is returned; the range accompanying a
+// non-nil error is ignored. IPSetFromSortedRanges takes ownership of
+// next for the duration of the call: next must not be called
+// concurrently, and it is never called again once it has returned an
+// error (including io.EOF) or once IPSetFromSortedRanges has
+// returned.
+//
+// Each yielded range must be valid (see IPRange.IsValid), and the
+// From addresses must be non-decreasing in netip.Addr.Compare order.
+// In particular, all IPv4 ranges must precede all IPv6 ranges.
+// Ranges may be duplicated or contained in earlier ranges. If next
+// yields an invalid range or a range that violates the ordering
+// requirement, IPSetFromSortedRanges stops consuming next and returns
+// a nil IPSet along with an error identifying the index (starting at
+// 0) of the offending input; no partial result is returned.
+//
+// Construction is a single streaming pass that merges overlapping and
+// adjacent ranges as they arrive. It uses only a constant amount of
+// working space in addition to the memory needed for the final
+// result, and produces the same set as feeding the same ranges, in
+// any order, to an IPSetBuilder.
+func IPSetFromSortedRanges(next func() (IPRange, error)) (*IPSet, error) {
+	var rr []IPRange
+	for i := 0; ; i++ {
+		r, err := next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("netipx: reading range at index %d: %w", i, err)
+		}
+		if !r.IsValid() {
+			return nil, fmt.Errorf("netipx: invalid range %v-%v at index %d", r.From(), r.To(), i)
+		}
+		if len(rr) == 0 {
+			rr = append(rr, r)
+			continue
+		}
+		prev := &rr[len(rr)-1]
+		if r.from.Compare(prev.from) < 0 {
+			if r.from.Is4() != prev.from.Is4() {
+				return nil, fmt.Errorf("netipx: range %v at index %d out of order: IPv4 ranges must precede IPv6 ranges", r, i)
+			}
+			return nil, fmt.Errorf("netipx: range %v at index %d out of order: starts at %v, before previous start %v", r, i, r.from, prev.from)
+		}
+		switch {
+		case r.from.Compare(prev.to) <= 0:
+			// r overlaps or is contained in prev.
+			if prev.to.Less(r.to) {
+				prev.to = r.to
+			}
+		case prev.to.Next() == r.from:
+			// r is adjacent to prev. Addr.Next stays within the
+			// address family and returns the zero Addr rather than
+			// overflowing at the maximum address, which never
+			// equals the valid r.from.
+			prev.to = r.to
+		default:
+			rr = append(rr, r)
+		}
+	}
+	return &IPSet{rr: rr}, nil
 }
 
 // IPSet represents a set of IP addresses.

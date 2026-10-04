@@ -6,11 +6,14 @@ package netipx
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -746,4 +749,283 @@ func TestIPSetEqual(t *testing.T) {
 	b.AddPrefix(MustParseIPPrefix("1.1.1.0/30"))
 	b.Remove(MustParseIP("1.1.1.3"))
 	assertEqual(true)
+}
+
+// countIter returns an iterator over ranges that reports io.EOF after
+// the last element, and counts how many times it has been called.
+func countIter(ranges []IPRange, calls *int) func() (IPRange, error) {
+	return func() (IPRange, error) {
+		*calls++
+		if *calls > len(ranges) {
+			return IPRange{}, io.EOF
+		}
+		return ranges[*calls-1], nil
+	}
+}
+
+func mustRanges(strs ...string) []IPRange {
+	out := make([]IPRange, len(strs))
+	for i, s := range strs {
+		out[i] = MustParseIPRange(s)
+	}
+	return out
+}
+
+func TestIPSetFromSortedRanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		ranges []IPRange
+	}{
+		{
+			name:   "empty",
+			ranges: nil,
+		},
+		{
+			name:   "single",
+			ranges: mustRanges("10.0.0.0-10.0.0.1"),
+		},
+		{
+			name: "contained",
+			ranges: mustRanges(
+				"10.0.0.0-10.255.255.255",
+				"10.1.0.0-10.2.255.255",
+				"10.1.0.0-10.1.0.0",
+			),
+		},
+		{
+			name: "duplicates",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.0-10.0.0.4",
+			),
+		},
+		{
+			name: "same_from_growing_to",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.4",
+				"10.0.0.0-10.0.0.9",
+			),
+		},
+		{
+			name: "adjacent",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.10-10.0.0.20",
+				"10.0.0.22-10.0.0.30",
+			),
+		},
+		{
+			name: "overlap",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.5-10.0.0.20",
+			),
+		},
+		{
+			name: "ipv4_max_no_overflow",
+			ranges: mustRanges(
+				"255.255.255.254-255.255.255.255",
+				"::-::1",
+			),
+		},
+		{
+			name: "ipv6_max_no_overflow",
+			ranges: mustRanges(
+				"ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+			),
+		},
+		{
+			name: "cross_family_boundary",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.10-10.0.0.20",
+				"2001:db8::-2001:db8::9",
+				"2001:db8::a-2001:db8::20",
+			),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			got, err := IPSetFromSortedRanges(countIter(tt.ranges, &calls))
+			if err != nil {
+				t.Fatalf("IPSetFromSortedRanges: %v", err)
+			}
+			if got == nil {
+				t.Fatal("IPSetFromSortedRanges returned nil set")
+			}
+			if calls != len(tt.ranges)+1 {
+				t.Errorf("iterator called %d times, want %d (through io.EOF)", calls, len(tt.ranges)+1)
+			}
+			var b IPSetBuilder
+			for _, r := range tt.ranges {
+				b.AddRange(r)
+			}
+			want := buildIPSet(&b)
+			if !got.Equal(want) {
+				t.Errorf("got ranges %v, want %v", got.Ranges(), want.Ranges())
+			}
+		})
+	}
+}
+
+func TestIPSetFromSortedRangesErrors(t *testing.T) {
+	errBoom := errors.New("boom")
+	tests := []struct {
+		name string
+		// next yields the ranges in order, then injects injectErr at
+		// the index of injectAt (or io.EOF at the end if injectErr is
+		// nil).
+		ranges    []IPRange
+		injectAt  int
+		injectErr error
+		// wantCalls is the expected number of iterator calls; the
+		// iterator must not be called again after an error.
+		wantCalls int
+		// wantSubstrings must all appear in the error message.
+		wantSubstrings []string
+		wantIs         error
+	}{
+		{
+			name: "out_of_order",
+			ranges: mustRanges(
+				"10.0.0.2-10.0.0.9",
+				"10.0.0.1-10.0.0.3",
+				"10.0.0.10-10.0.0.20",
+			),
+			injectAt:       -1,
+			wantCalls:      2,
+			wantSubstrings: []string{"index 1", "out of order"},
+		},
+		{
+			name: "invalid_zero_range",
+			ranges: []IPRange{
+				MustParseIPRange("10.0.0.0-10.0.0.9"),
+				IPRange{},
+				MustParseIPRange("10.0.0.20-10.0.0.30"),
+			},
+			injectAt:       -1,
+			wantCalls:      2,
+			wantSubstrings: []string{"index 1", "invalid"},
+		},
+		{
+			name: "invalid_inverted_range",
+			ranges: []IPRange{
+				IPRangeFrom(mustIP("10.0.0.9"), mustIP("10.0.0.1")),
+			},
+			injectAt:       -1,
+			wantCalls:      1,
+			wantSubstrings: []string{"index 0", "invalid"},
+		},
+		{
+			name: "ipv6_before_ipv4",
+			ranges: mustRanges(
+				"2001:db8::-2001:db8::9",
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.10-10.0.0.20",
+			),
+			injectAt:       -1,
+			wantCalls:      2,
+			wantSubstrings: []string{"index 1", "IPv4", "IPv6"},
+		},
+		{
+			name: "read_error",
+			ranges: mustRanges(
+				"10.0.0.0-10.0.0.9",
+				"10.0.0.10-10.0.0.20",
+			),
+			injectAt:       1,
+			injectErr:      errBoom,
+			wantCalls:      2,
+			wantSubstrings: []string{"index 1", "boom"},
+			wantIs:         errBoom,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			next := func() (IPRange, error) {
+				i := calls
+				calls++
+				if i == tt.injectAt {
+					return IPRange{}, tt.injectErr
+				}
+				if i >= len(tt.ranges) {
+					return IPRange{}, io.EOF
+				}
+				return tt.ranges[i], nil
+			}
+			set, err := IPSetFromSortedRanges(next)
+			if err == nil {
+				t.Fatal("IPSetFromSortedRanges succeeded, want error")
+			}
+			if set != nil {
+				t.Errorf("got partial set %v, want nil", set.Ranges())
+			}
+			if calls != tt.wantCalls {
+				t.Errorf("iterator called %d times, want %d (no reads after error)", calls, tt.wantCalls)
+			}
+			for _, sub := range tt.wantSubstrings {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error %q does not contain %q", err, sub)
+				}
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("error %v does not wrap %v", err, tt.wantIs)
+			}
+		})
+	}
+}
+
+func TestIPSetFromSortedRangesStress(t *testing.T) {
+	// A large number of small, sorted, non-adjacent ranges.
+	const n = 4096
+	ranges := make([]IPRange, 0, n)
+	for i := 0; i < n; i++ {
+		from := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 0})
+		to := netip.AddrFrom4([4]byte{10, byte(i >> 8), byte(i), 10})
+		ranges = append(ranges, IPRangeFrom(from, to))
+	}
+
+	var b IPSetBuilder
+	for _, r := range ranges {
+		b.AddRange(r)
+	}
+	want := buildIPSet(&b)
+
+	var got *IPSet
+	iterAllocs := testing.AllocsPerRun(10, func() {
+		var calls int
+		var err error
+		got, err = IPSetFromSortedRanges(countIter(ranges, &calls))
+		if err != nil {
+			panic(err)
+		}
+	})
+	if !got.Equal(want) {
+		t.Fatalf("got %d ranges, want %d; first difference: got %v want %v",
+			len(got.Ranges()), len(want.Ranges()), got.Ranges()[0], want.Ranges()[0])
+	}
+
+	builderAllocs := testing.AllocsPerRun(10, func() {
+		var b IPSetBuilder
+		for _, r := range ranges {
+			b.AddRange(r)
+		}
+		if _, err := b.IPSet(); err != nil {
+			panic(err)
+		}
+	})
+
+	t.Logf("allocs: iterator=%.1f builder=%.1f", iterAllocs, builderAllocs)
+	// The streaming build only grows its result slice (amortized) and
+	// allocates no per-input storage, so it must allocate far less
+	// than the builder, which buffers and re-sorts every input range.
+	if iterAllocs >= builderAllocs {
+		t.Errorf("iterator allocs %.1f not less than builder allocs %.1f", iterAllocs, builderAllocs)
+	}
+	if iterAllocs > 30 {
+		t.Errorf("iterator allocs %.1f exceed constant-workspace bound of 30", iterAllocs)
+	}
 }
