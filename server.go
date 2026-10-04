@@ -108,6 +108,17 @@ type Server struct {
 	// [Server.Actions] must have the flag [OptSetSymList] set.
 	SymList map[Stage][]string
 
+	// Observer, if non-nil, receives an event for every protocol packet of
+	// every session. It is called from the session's own goroutine without
+	// any server-wide lock held, so a slow observer never blocks the whole
+	// service. See Recorder for a ready-made in-memory Observer.
+	Observer Observer
+
+	// ObserverErrorHandler defines how observer failures (returned errors
+	// and recovered panics) are handled. Observer failures never affect
+	// session processing. If nil, failures are logged.
+	ObserverErrorHandler func(error)
+
 	listeners []net.Listener
 	closed    bool
 }

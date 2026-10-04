@@ -60,7 +60,11 @@ func readPacket(conn net.Conn, timeout time.Duration) (*Message, error) {
 
 // WritePacket sends a milter response packet to socket stream
 func (m *milterSession) WritePacket(msg *Message) error {
-	return writePacket(m.conn, msg, 0)
+	if err := writePacket(m.conn, msg, 0); err != nil {
+		return err
+	}
+	m.observe(newOutboundEvent(msg))
+	return nil
 }
 
 func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
@@ -97,6 +101,8 @@ func writePacket(conn net.Conn, msg *Message, timeout time.Duration) error {
 
 // Process processes incoming milter commands
 func (m *milterSession) Process(msg *Message) (Response, error) {
+	m.observe(newInboundEvent(msg))
+
 	switch Code(msg.Code) {
 	case CodeAbort:
 		// abort current message and start over
