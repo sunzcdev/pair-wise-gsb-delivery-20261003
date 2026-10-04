@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- `ParseUTCTime` and `NewUTCTime` / `NewUTCTimeErr`: structured decoding and
+  construction of UTCTime values. Decoding maps two-digit years 00-49 to
+  2000-2049 and 50-99 to 1950-1999, accepts the with/without-seconds and
+  numeric-offset forms, and rejects invalid dates and trailing garbage.
+  `NewUTCTimeErr` emits the canonical UTC form with seconds and reports an
+  error for years outside 1950-2049 instead of truncating them.
+- `TagUTCTime` packets are now decoded into `time.Time` values.
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
