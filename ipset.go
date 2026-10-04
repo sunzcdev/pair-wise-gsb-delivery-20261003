@@ -319,6 +319,140 @@ func (s *IPSetBuilder) IPSet() (*IPSet, error) {
 	}
 }
 
+// IPRangeIterator yields a sequence of IPRanges in ascending order.
+//
+// The iteration protocol mirrors bufio.Scanner:
+//
+//   - Next advances to the first IPRange, and then to each subsequent
+//     IPRange. It returns false when iteration stops, either because
+//     the sequence is exhausted or because an error occurred while
+//     reading the next IPRange.
+//   - After Next returns true, Range returns the IPRange at the
+//     current position.
+//   - After Next returns false, Err returns any error that occurred
+//     while reading. A nil error means the sequence was exhausted
+//     normally.
+//
+// Next must not be called after it returns false, and Range must be
+// called only after Next has returned true. Implementations do not
+// have to be safe for concurrent use.
+type IPRangeIterator interface {
+	// Next advances the iterator to the next IPRange and reports
+	// whether one is available. It must not be called again after it
+	// returns false.
+	Next() bool
+
+	// Range returns the IPRange at the current position.
+	Range() IPRange
+
+	// Err returns the read error, if any, that caused Next to return
+	// false. It returns nil if the sequence was exhausted normally.
+	Err() error
+}
+
+// IPSetFromSortedRanges builds an immutable IPSet from an iterator
+// over IPRanges that are already in ascending order.
+//
+// The ranges must be ordered like the ranges of an already-built
+// IPSet:
+//
+//   - Each IPRange must be Valid.
+//   - Ranges must be ordered by From address; the From of each range
+//     must not be less than the From of the range that preceded it.
+//     Duplicate ranges, and ranges that are wholly contained in an
+//     earlier range, are permitted.
+//   - All IPv4 ranges must come before all IPv6 ranges; switching
+//     from IPv6 back to IPv4 is an ordering error.
+//
+// Overlapping and adjacent ranges are merged in a single pass; the
+// resulting IPSet is identical to the one IPSetBuilder produces for
+// the same valid inputs, but the inputs are not copied or sorted
+// first, so only constant extra working space is used apart from the
+// ranges stored in the returned IPSet.
+//
+// IPSetFromSortedRanges consumes it, taking ownership of the
+// iterator: it calls Next until Next returns false and then calls Err
+// once. If the iterator reports a read error, or if any yielded
+// range is invalid or out of order, IPSetFromSortedRanges stops
+// reading immediately and returns a non-nil error and a nil IPSet.
+// The error identifies the zero-based position of the offending
+// input; after a read error the iterator is not read any further.
+func IPSetFromSortedRanges(it IPRangeIterator) (*IPSet, error) {
+	var (
+		out      []IPRange
+		cur      IPRange // range being merged; appended once finalized
+		lastFrom netip.Addr
+		lastIs4  bool
+		have     bool
+		n        int // number of input ranges consumed so far
+	)
+	for it.Next() {
+		r := it.Range()
+		switch {
+		case !r.IsValid():
+			return nil, fmt.Errorf("netipx: invalid IPRange at input index %d: %v-%v", n, r.From(), r.To())
+		case have && r.from.Is4() != lastIs4:
+			// The only legal address-family transition is a single
+			// switch from IPv4 to IPv6.
+			if !lastIs4 || !r.from.Is6() {
+				return nil, fmt.Errorf("netipx: IPRange at input index %d (%v) is out of address-family order", n, r)
+			}
+		case have && r.from.Is4() == lastIs4 && r.from.Less(lastFrom):
+			return nil, fmt.Errorf("netipx: IPRange at input index %d (%v) is out of order", n, r)
+		}
+
+		if have && r.from.Is4() == lastIs4 {
+			// Same address family as the preceding inputs: merge
+			// against the pending output range.
+			switch {
+			case rangesAdjacent(cur, r):
+				cur.to = r.to
+			case cur.to.Less(r.from):
+				out = append(out, cur)
+				cur = r
+			case cur.to.Less(r.to):
+				// Partial overlap: extend the current range.
+				cur.to = r.to
+			}
+			// Otherwise r is wholly contained in cur; drop it.
+		} else {
+			// First range, or the IPv4 -> IPv6 boundary: finalize
+			// the previous family's pending range.
+			if have {
+				out = append(out, cur)
+			}
+			cur = r
+		}
+		lastFrom = r.from
+		lastIs4 = r.from.Is4()
+		have = true
+		n++
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("netipx: iterator error at input index %d: %w", n, err)
+	}
+	if have {
+		out = append(out, cur)
+	}
+	return &IPSet{rr: out}, nil
+}
+
+// rangesAdjacent reports whether b begins exactly one address after a
+// ends, without computing a.To().Next() (which overflows at the top
+// of the address space). a and b must be from the same address
+// family.
+func rangesAdjacent(a, b IPRange) bool {
+	// Compare against b.From().Prev() instead, which can only
+	// underflow at the bottom of the address space, where it cannot
+	// equal a valid a.To().
+	prior := u128From16(b.from.As16())
+	if prior.isZero() {
+		return false
+	}
+	prior = prior.subOne()
+	return u128From16(a.to.As16()) == prior
+}
+
 // IPSet represents a set of IP addresses.
 //
 // IPSet is safe for concurrent use.
