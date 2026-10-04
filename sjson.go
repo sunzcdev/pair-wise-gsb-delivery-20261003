@@ -18,7 +18,8 @@ func (err *errorType) Error() string {
 	return err.msg
 }
 
-// Options represents additional options for the Set and Delete functions.
+// Options represents additional options for the Set, Delete, and Rename
+// functions.
 type Options struct {
 	// Optimistic is a hint that the value likely exists which
 	// allows for the sjson to perform a fast-track search and replace.
@@ -32,6 +33,10 @@ type Options struct {
 	// The Optimistic flag must be set to true and the input must be a
 	// byte slice in order to use this field.
 	ReplaceInPlace bool
+	// Overwrite is used by Rename to allow replacing a member when the
+	// target key already exists. By default Rename returns an error in
+	// this case. This field has no effect on Set or Delete.
+	Overwrite bool
 }
 
 type pathResult struct {
