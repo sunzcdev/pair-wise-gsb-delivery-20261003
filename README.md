@@ -155,6 +155,37 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+# Error Handling
+All `Parser` parse methods return a classified `*paseto.ParseError` on failure.
+Use `paseto.Classify` (or `errors.As` with `*paseto.ParseError`) to determine
+the `paseto.ErrorKind` without matching error message strings:
+
+- `ErrorKindSyntax`: the token envelope is malformed (bad parts, encoding, or length)
+- `ErrorKindProtocolMismatch`: the token header doesn't match the expected protocol
+- `ErrorKindAuthentication`: signature/MAC verification or decryption failed
+- `ErrorKindClaimsDecode`: the token is authentic but its claims can't be decoded
+- `ErrorKindRule`: a validation rule rejected the token
+
+```go
+parsedToken, err := parser.ParseV4Public(publicKey, signed, nil)
+if err != nil {
+    switch kind, _ := paseto.Classify(err); kind {
+    case paseto.ErrorKindRule:
+        // log at info: valid token, rejected by policy
+    case paseto.ErrorKindAuthentication:
+        // log at warn: token failed cryptographic checks
+    default:
+        // log at error: malformed or undecodable token
+    }
+}
+```
+
+The `Error()` text of a `ParseError` is a safe summary only: it never contains
+the token, key material, or claim values. For rule failures, the failing
+rule's name and index are available via `RuleName()` and `RuleIndex()`. The
+original error chain is preserved, so `errors.Is`/`errors.As` (including
+checks against `paseto.TokenError` and `paseto.RuleError`) continue to work.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.

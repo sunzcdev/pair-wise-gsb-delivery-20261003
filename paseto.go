@@ -175,7 +175,7 @@ func newPacket(content []byte, footer []byte) packet {
 
 func (p packet) token() result.Result[Token] {
 	if token, err := NewTokenFromClaimsJSON(p.content, p.footer); err != nil {
-		return result.Err[Token](err)
+		return result.Err[Token](newTokenErrorKind(ErrorKindClaimsDecode, err))
 	} else {
 		return result.Ok(*token)
 	}

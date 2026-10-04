@@ -1,6 +1,8 @@
 package paseto
 
 import (
+	"reflect"
+	"runtime"
 	"time"
 
 	"aidanwoods.dev/go-result/result"
@@ -44,7 +46,7 @@ func (p Parser) ParseV2Local(key V2SymmetricKey, tainted string) (*Token, error)
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -61,7 +63,7 @@ func (p Parser) ParseV2Public(key V2AsymmetricPublicKey, tainted string) (*Token
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -78,7 +80,7 @@ func (p Parser) ParseV3Local(key V3SymmetricKey, tainted string, implicit []byte
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -95,7 +97,7 @@ func (p Parser) ParseV3Public(key V3AsymmetricPublicKey, tainted string, implici
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -112,7 +114,7 @@ func (p Parser) ParseV4Local(key V4SymmetricKey, tainted string, implicit []byte
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -129,7 +131,7 @@ func (p Parser) ParseV4Public(key V4AsymmetricPublicKey, tainted string, implici
 
 	var t Token
 	if err := token.Ok(&t); err != nil {
-		return nil, err
+		return nil, newParseError(err)
 	}
 
 	return &t, nil
@@ -161,11 +163,25 @@ func (p *Parser) AddRule(rule ...Rule) {
 }
 
 func (p Parser) validate(token Token) result.Result[Token] {
-	for _, rule := range p.rules {
+	for i, rule := range p.rules {
 		if err := rule(token); err != nil {
-			return result.Err[Token](newRuleError(err))
+			return result.Err[Token](newRuleError(err, ruleName(rule), i))
 		}
 	}
 
 	return result.Ok(token)
+}
+
+// ruleName returns the function name of a Rule, for use in error reporting.
+// It is a code identifier and contains no token or claim data.
+func ruleName(rule Rule) string {
+	if rule == nil {
+		return ""
+	}
+
+	if fn := runtime.FuncForPC(reflect.ValueOf(rule).Pointer()); fn != nil {
+		return fn.Name()
+	}
+
+	return ""
 }
