@@ -1,6 +1,7 @@
 package paseto
 
 import (
+	"errors"
 	"strings"
 
 	"aidanwoods.dev/go-paseto/internal/encoding"
@@ -34,7 +35,16 @@ func newMessage(protocol Protocol, token string) result.Result[message] {
 
 	msg := result.Map2(p, footer, newMessageFromPayloadAndFooter)
 
-	return msg.MapError(newTokenError)
+	// Errors already classified at their creation site pass through;
+	// anything else here is an envelope decoding failure (e.g. bad base64).
+	return msg.MapError(func(err error) error {
+		var parseErr *ParseError
+		if errors.As(err, &parseErr) {
+			return err
+		}
+
+		return newParseError(ErrorKindSyntax, newTokenError(err))
+	})
 }
 
 // Header returns the header string for a Paseto message.

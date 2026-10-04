@@ -64,11 +64,13 @@ func errorSeedLength(expected, given int) error {
 }
 
 func errorMessageParts(given int) error {
-	return newTokenError(fmt.Errorf("invalid number of message parts in token (%d)", given))
+	return newParseError(ErrorKindSyntax,
+		newTokenError(fmt.Errorf("invalid number of message parts in token (%d)", given)))
 }
 
 func errorMessageHeader(expected Protocol, givenHeader string) error {
-	return newTokenError(fmt.Errorf("message header `%s' is not valid, expected `%s'", givenHeader, expected.Header()))
+	return newParseError(ErrorKindProtocol,
+		newTokenError(fmt.Errorf("message header `%s' is not valid, expected `%s'", givenHeader, expected.Header())))
 }
 
 func errorMessageHeaderDecrypt(expected Protocol, givenHeader string) error {
@@ -83,12 +85,16 @@ var unsupportedPasetoVersion = fmt.Errorf("unsupported PASETO version")
 var unsupportedPasetoPurpose = fmt.Errorf("unsupported PASETO purpose")
 var unsupportedPayload = fmt.Errorf("unsupported payload")
 
-var errorPayloadShort = newTokenError(fmt.Errorf("payload is not long enough to be a valid PASETO message"))
-var errorBadSignature = newTokenError(fmt.Errorf("bad signature"))
-var errorBadMAC = newTokenError(fmt.Errorf("bad message authentication code"))
+var errorPayloadShort = newParseError(ErrorKindSyntax,
+	newTokenError(fmt.Errorf("payload is not long enough to be a valid PASETO message")))
+var errorBadSignature = newParseError(ErrorKindAuthentication,
+	newTokenError(fmt.Errorf("bad signature")))
+var errorBadMAC = newParseError(ErrorKindAuthentication,
+	newTokenError(fmt.Errorf("bad message authentication code")))
 
 var errorKeyInvalid = fmt.Errorf("key was not valid")
 
 func errorDecrypt(err error) error {
-	return fmt.Errorf("the message could not be decrypted: %w", newTokenError(err))
+	return newParseError(ErrorKindAuthentication,
+		fmt.Errorf("the message could not be decrypted: %w", newTokenError(err)))
 }
