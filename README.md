@@ -47,6 +47,36 @@ For usage and examples see the [documentation](https://pkg.go.dev/mod/github.com
 
 The `Decode` function has examples associated with it there.
 
+## Auditing with assignment plans
+
+For configuration auditing, `Plan` previews a decode without executing it:
+it lists which target fields would be set, zeroed, or preserved, and which
+type conversions would be applied. Planning never modifies the target and
+never runs user code — steps that would require calling a decode hook or an
+`Unmarshaler` are marked opaque instead. Once reviewed, the plan is
+executed with `Apply`:
+
+```go
+plan, err := mapstructure.Plan(&mapstructure.DecoderConfig{
+    Result:           &cfg,
+    WeaklyTypedInput: true,
+}, input)
+if err != nil {
+    // ...
+}
+
+for _, step := range plan.Steps {
+    fmt.Println(step) // e.g. "set Server.Port (int): string -> int (weak)"
+}
+
+// Reject plans that require running user code, or approve explicitly:
+err = plan.Apply(&cfg, &mapstructure.ApplyOptions{AllowOpaque: false})
+```
+
+If the input or the configuration changes after planning, `Apply` refuses
+to run and returns an error wrapping `mapstructure.ErrStalePlan`, so stale
+decisions are never applied silently.
+
 ## But Why?!
 
 Go offers fantastic standard libraries for decoding formats such as JSON.
