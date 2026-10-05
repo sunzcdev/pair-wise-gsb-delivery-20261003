@@ -107,6 +107,24 @@ def nth($n; g):
   else
     error("nth doesn't support negative index")
   end;
+def top_k_by($k; g; f):
+  if ($k | type) != "number" or ($k | isinfinite) or ($k | floor) != $k then
+    error("top_k_by count must be an integer")
+  elif $k < 0 then
+    error("top_k_by doesn't support negative count")
+  elif $k == 0 then
+    []
+  else
+    reduce g as $x ([];
+      ($x | [f]) as $key |
+      if length == $k and .[-1][0] >= $key then
+        .
+      else
+        (reduce .[] as $e (0; if $e[0] >= $key then . + 1 else . end)) as $i |
+        (.[:$i] + [[$key, $x]] + .[$i:])[:$k]
+      end
+    ) | map(.[1])
+  end;
 
 def truncate_stream(f):
   . as $n | null | f |

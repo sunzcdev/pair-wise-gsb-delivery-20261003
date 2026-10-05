@@ -4416,6 +4416,75 @@
   error: |
     limit doesn't support negative count
 
+- name: top_k_by/3 function
+  args:
+    - -c
+    - 'top_k_by(3; .[]; .), top_k_by(3; .[]; . % 3), top_k_by(0; .[]; .), top_k_by(10; .[]; .)'
+  input: '[5,1,4,2,3]'
+  expected: |
+    [5,4,3]
+    [5,2,1]
+    []
+    [5,4,3,2,1]
+
+- name: top_k_by/3 function with multiple and empty keys
+  args:
+    - -c
+    - 'top_k_by(2; .[]; .a, .b), top_k_by(2; .[]; empty)'
+  input: '[{"a":1,"b":2},{"a":1,"b":5},{"a":2,"b":0}]'
+  expected: |
+    [{"a":2,"b":0},{"a":1,"b":5}]
+    [{"a":1,"b":2},{"a":1,"b":5}]
+
+- name: top_k_by/3 function matches sort_by and slice
+  args:
+    - -c
+    - |
+      def g: range(23) | (. * 7 + 3) % 11;
+      [top_k_by(0; g; . % 3) == ([g] | reverse | sort_by(. % 3) | reverse | .[0:0]),
+       top_k_by(1; g; . % 3) == ([g] | reverse | sort_by(. % 3) | reverse | .[0:1]),
+       top_k_by(4; g; . % 3) == ([g] | reverse | sort_by(. % 3) | reverse | .[0:4]),
+       top_k_by(9; g; .) == ([g] | reverse | sort_by(.) | reverse | .[0:9]),
+       top_k_by(30; g; . % 5) == ([g] | reverse | sort_by(. % 5) | reverse | .[0:30])]
+  input: 'null'
+  expected: |
+    [true,true,true,true,true]
+
+- name: top_k_by/3 function with zero count does not consume generator
+  args:
+    - 'top_k_by(0; repeat(1); .)'
+  input: 'null'
+  expected: |
+    []
+
+- name: top_k_by/3 function with negative count
+  args:
+    - 'top_k_by(-1; range(3); .)'
+  input: 'null'
+  error: |
+    top_k_by doesn't support negative count
+
+- name: top_k_by/3 function with non-integer count
+  args:
+    - 'top_k_by(0.5; range(3); .)'
+  input: 'null'
+  error: |
+    top_k_by count must be an integer
+
+- name: top_k_by/3 function propagates generator error
+  args:
+    - 'top_k_by(2; (1, 2, error("boom"), 3); .)'
+  input: 'null'
+  error: |
+    boom
+
+- name: top_k_by/3 function propagates key filter error
+  args:
+    - 'top_k_by(2; range(4); if . == 2 then error("key error") else . end)'
+  input: 'null'
+  error: |
+    key error
+
 - name: skip/2 function
   args:
     - -c
