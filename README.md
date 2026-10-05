@@ -550,10 +550,13 @@ This extension has some options. All of them are `extension.FootnoteHTMLRenderer
 | `extension.WithLinkClass` | `[]byte \| string` |  a class for footnote links. This defaults to `footnote-ref`. |
 | `extension.WithBacklinkClass` | `[]byte \| string` |  a class for footnote backlinks. This defaults to `footnote-backref`. |
 | `extension.WithBacklinkHTML` | `[]byte \| string` |  a class for footnote backlinks. This defaults to `&#x21a9;&#xfe0e;`. |
+| `extension.WithSectionHeadingLevel` | `int` |  partitions footnote numbering by headings of the given level (1 to 6). Defaults to `0`, which keeps document-global numbering. |
 
 Some options can have special substitutions. Occurrences of “^^” in the string will be replaced by the corresponding footnote number in the HTML output. Occurrences of “%%” will be replaced by a number for the reference (footnotes can have multiple references).
 
 `extension.WithIDPrefix` and `extension.WithIDPrefixFunction` are useful if you have multiple Markdown documents displayed inside one HTML document to avoid footnote ids to clash each other.
+
+`extension.WithSectionHeadingLevel(2)` numbers footnotes independently inside each section delimited by a level-2 heading. Content before the first such heading forms a preface section, and each section renders its own endnotes right before the next heading (or at the end of the document). Numbers follow the order of the first reference within each section: repeated references to one label share its number within a section, while the same label receives separate numbers, HTML ids and backlinks in different sections. Only headings that are parsed as top-level document nodes delimit sections, so a `#` inside a code block never starts a new section.
 
 `extension.WithIDPrefix` sets fixed id prefix, so you may write codes like the following:
 
