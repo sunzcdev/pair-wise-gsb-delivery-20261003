@@ -1384,6 +1384,26 @@ module gobgp {
     uses disable-best-path-selection-config;
   }
 
+  grouping deterministic-med-config {
+    leaf deterministic-med {
+      type boolean;
+      description
+        "Compare MEDs only among paths from the same neighboring
+         AS and select the best path of each group before comparing
+         the group winners without MED, making the best path
+         selection independent of the order in which paths are
+         received.";
+    }
+  }
+
+  augment "/bgp:bgp/bgp:global/bgp:route-selection-options/bgp:config" {
+    uses deterministic-med-config;
+  }
+
+  augment "/bgp:bgp/bgp:global/bgp:route-selection-options/bgp:state" {
+    uses deterministic-med-config;
+  }
+
   augment "/bgp:bgp/bgp:global/bgp:afi-safis/bgp:afi-safi" {
       uses bgp-mp:all-afi-safi-common;
   }

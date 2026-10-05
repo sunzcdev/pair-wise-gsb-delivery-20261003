@@ -5123,6 +5123,14 @@ type RouteSelectionOptionsState struct {
 	// gobgp:disable-best-path-selection's original type is boolean.
 	// Disables best path selection process.
 	DisableBestPathSelection bool `mapstructure:"disable-best-path-selection" json:"disable-best-path-selection,omitempty"`
+	// original -> gobgp:deterministic-med
+	// gobgp:deterministic-med's original type is boolean.
+	// Compare MEDs only among paths from the same neighboring
+	// AS and select the best path of each group before comparing
+	// the group winners without MED, making the best path
+	// selection independent of the order in which paths are
+	// received.
+	DeterministicMed bool `mapstructure:"deterministic-med" json:"deterministic-med,omitempty"`
 }
 
 // struct for container bgp-mp:config.
@@ -5168,6 +5176,14 @@ type RouteSelectionOptionsConfig struct {
 	// gobgp:disable-best-path-selection's original type is boolean.
 	// Disables best path selection process.
 	DisableBestPathSelection bool `mapstructure:"disable-best-path-selection" json:"disable-best-path-selection,omitempty"`
+	// original -> gobgp:deterministic-med
+	// gobgp:deterministic-med's original type is boolean.
+	// Compare MEDs only among paths from the same neighboring
+	// AS and select the best path of each group before comparing
+	// the group winners without MED, making the best path
+	// selection independent of the order in which paths are
+	// received.
+	DeterministicMed bool `mapstructure:"deterministic-med" json:"deterministic-med,omitempty"`
 }
 
 func (lhs *RouteSelectionOptionsConfig) Equal(rhs *RouteSelectionOptionsConfig) bool {
@@ -5193,6 +5209,9 @@ func (lhs *RouteSelectionOptionsConfig) Equal(rhs *RouteSelectionOptionsConfig) 
 		return false
 	}
 	if lhs.DisableBestPathSelection != rhs.DisableBestPathSelection {
+		return false
+	}
+	if lhs.DeterministicMed != rhs.DeterministicMed {
 		return false
 	}
 	return true

@@ -316,6 +316,16 @@ func (dest *destination) Calculate(logger *slog.Logger, newPath *Path, selection
 		dest.insertSort(newPath, selectionOptions)
 	}
 
+	// In deterministic MED mode, re-derive the order of the known path
+	// list on every change: paths are grouped by neighboring AS, sorted
+	// within each group using MED, and the groups are then ordered by
+	// their winners without comparing MED. always-compare-med takes
+	// precedence over deterministic MED, since it already makes MED a
+	// global, order-independent comparison criterion.
+	if selectionOptions.DeterministicMed && !selectionOptions.AlwaysCompareMed {
+		dest.sortDeterministicMed(selectionOptions)
+	}
+
 	for _, path := range dest.knownPathList {
 		if path.localID == 0 {
 			id, err := dest.localIdMap.FindandSetZeroBit()
@@ -445,72 +455,9 @@ func (dest *destination) insertSort(newPath *Path, selectionOptions oc.RouteSele
 		//	path.
 		//	Assumes paths from NC has source equal to None.
 		//
-		path1 := newPath
-		path2 := dest.knownPathList[i]
-
-		if b := compareByLLGRStaleCommunity(path1, path2); b == path1 {
+		if b := betterPath(newPath, dest.knownPathList[i], selectionOptions, true); b == newPath {
 			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByReachableNexthop(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByLocalPref(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByLocalOrigin(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByASPath(path1, path2, selectionOptions); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByOrigin(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByMED(path1, path2, selectionOptions); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByASNumber(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByAge(path1, path2, selectionOptions); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b, _ := compareByRouterID(path1, path2, selectionOptions); b == path1 {
-			return true
-		} else if b == path2 {
-			return false
-		}
-
-		if b := compareByNeighborAddress(path1, path2); b == path1 {
-			return true
-		} else if b == path2 {
+		} else if b != nil {
 			return false
 		}
 		return true
@@ -518,6 +465,106 @@ func (dest *destination) insertSort(newPath *Path, selectionOptions oc.RouteSele
 
 	// Insert at the found position
 	dest.knownPathList = slices.Insert(dest.knownPathList, insertIdx, newPath)
+}
+
+// betterPath compares two paths following the best-path selection chain and
+// returns the preferred path, or nil when the chain cannot decide between
+// them. When compareMed is false, the MED comparison step is skipped;
+// deterministic MED processing uses this to compare the winners of different
+// neighboring-AS groups, where MED must not be used.
+func betterPath(path1, path2 *Path, selectionOptions oc.RouteSelectionOptionsConfig, compareMed bool) *Path {
+	if b := compareByLLGRStaleCommunity(path1, path2); b != nil {
+		return b
+	}
+
+	if b := compareByReachableNexthop(path1, path2); b != nil {
+		return b
+	}
+
+	if b := compareByLocalPref(path1, path2); b != nil {
+		return b
+	}
+
+	if b := compareByLocalOrigin(path1, path2); b != nil {
+		return b
+	}
+
+	if b := compareByASPath(path1, path2, selectionOptions); b != nil {
+		return b
+	}
+
+	if b := compareByOrigin(path1, path2); b != nil {
+		return b
+	}
+
+	if compareMed {
+		if b := compareByMED(path1, path2, selectionOptions); b != nil {
+			return b
+		}
+	}
+
+	if b := compareByASNumber(path1, path2); b != nil {
+		return b
+	}
+
+	if b := compareByAge(path1, path2, selectionOptions); b != nil {
+		return b
+	}
+
+	if b, _ := compareByRouterID(path1, path2, selectionOptions); b != nil {
+		return b
+	}
+
+	if b := compareByNeighborAddress(path1, path2); b != nil {
+		return b
+	}
+
+	return nil
+}
+
+// sortDeterministicMed reorders the known path list so that the best path
+// selection is deterministic and independent of the order in which paths
+// were received.
+//
+// Paths are first grouped by neighboring AS (the leftmost AS in the AS_PATH,
+// skipping confederation segments). Within a group MED is a valid comparison
+// criterion, so group members are sorted with the full best-path selection
+// chain. The winner of each group is then compared against the winners of
+// the other groups with the MED step disabled, and groups are ordered by
+// their winner. The final list concatenates the groups in that order,
+// keeping the internal order of each group.
+func (dest *destination) sortDeterministicMed(selectionOptions oc.RouteSelectionOptionsConfig) {
+	groups := make(map[uint32][]*Path)
+	for _, path := range dest.knownPathList {
+		as := firstAS(path)
+		groups[as] = append(groups[as], path)
+	}
+
+	compare := func(compareMed bool) func(a, b *Path) int {
+		return func(a, b *Path) int {
+			switch betterPath(a, b, selectionOptions, compareMed) {
+			case a:
+				return -1
+			case b:
+				return 1
+			default:
+				return 0
+			}
+		}
+	}
+
+	bests := make([]*Path, 0, len(groups))
+	for as, members := range groups {
+		slices.SortStableFunc(members, compare(true))
+		groups[as] = members
+		bests = append(bests, members[0])
+	}
+	slices.SortStableFunc(bests, compare(false))
+
+	dest.knownPathList = dest.knownPathList[:0]
+	for _, best := range bests {
+		dest.knownPathList = append(dest.knownPathList, groups[firstAS(best)]...)
+	}
 }
 
 type Update struct {
@@ -799,22 +846,6 @@ func compareByMED(path1, path2 *Path, selectionOptions oc.RouteSelectionOptionsC
 	isInternal := func() bool { return path1.GetAsPathLen() == 0 && path2.GetAsPathLen() == 0 }()
 
 	isSameAS := func() bool {
-		firstAS := func(path *Path) uint32 {
-			if asPath := path.GetAsPath(); asPath != nil {
-				for _, v := range asPath.Value {
-					asList := v.GetAS()
-					if len(asList) == 0 {
-						continue
-					}
-					switch v.GetType() {
-					case bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SET, bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SEQ:
-						continue
-					}
-					return asList[0]
-				}
-			}
-			return 0
-		}
 		return firstAS(path1) != 0 && firstAS(path1) == firstAS(path2)
 	}()
 
@@ -839,6 +870,27 @@ func compareByMED(path1, path2 *Path, selectionOptions oc.RouteSelectionOptionsC
 	} else {
 		return nil
 	}
+}
+
+// firstAS returns the neighboring AS of the given path: the leftmost AS in
+// the AS_PATH, skipping confederation segments. It returns 0 for paths
+// without any non-confederation AS (e.g. internal or locally originated
+// paths), which therefore all share the same group.
+func firstAS(path *Path) uint32 {
+	if asPath := path.GetAsPath(); asPath != nil {
+		for _, v := range asPath.Value {
+			asList := v.GetAS()
+			if len(asList) == 0 {
+				continue
+			}
+			switch v.GetType() {
+			case bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SET, bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SEQ:
+				continue
+			}
+			return asList[0]
+		}
+	}
+	return 0
 }
 
 func compareByASNumber(path1, path2 *Path) *Path {

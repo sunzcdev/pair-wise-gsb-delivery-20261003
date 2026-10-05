@@ -939,3 +939,231 @@ func TestGetChanges_NonKeyNlriOrNexthopOnlyChange(t *testing.T) {
 	best4, _, _ := u4.GetChanges(GLOBAL_RIB_NAME, 0, false, false)
 	assert.Nil(t, best4, "identical re-add should stay suppressed")
 }
+
+// newMedTestPath builds an eBGP path whose AS path consists of the peer's
+// own AS only. A nil med means the path carries no MED attribute.
+func newMedTestPath(nlri *bgp.IPAddrPrefix, as uint32, peerIP string, med *uint32, ts time.Time) *Path {
+	peer := &PeerInfo{
+		AS:      as,
+		LocalAS: 65000,
+		Address: netip.MustParseAddr(peerIP),
+		ID:      netip.MustParseAddr(peerIP),
+	}
+	attrs := []bgp.PathAttributeInterface{
+		bgp.NewPathAttributeOrigin(0),
+		bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+			bgp.NewAs4PathParam(bgp.BGP_ASPATH_ATTR_TYPE_SEQ, []uint32{as}),
+		}),
+	}
+	if med != nil {
+		attrs = append(attrs, bgp.NewPathAttributeMultiExitDisc(*med))
+	}
+	return NewPath(bgp.RF_IPv4_UC, peer, bgp.PathNLRI{NLRI: nlri}, false, attrs, ts, false)
+}
+
+// deterministicMedTestPaths builds four candidate paths for the same
+// prefix, covering same and different neighboring ASes:
+//
+//	A: AS 65001, MED 10, arrived at base+4h
+//	B: AS 65002, MED 20, arrived at base+3h
+//	C: AS 65001, MED 30, arrived at base+2h
+//	D: AS 65003, no MED, arrived at base+10h
+//
+// With deterministic MED, A wins the AS 65001 group (MED 10 < 30) and the
+// group winners A, B and D are then compared without MED, where the oldest
+// path (B) wins. The deterministic path order is therefore B, A, C, D.
+func deterministicMedTestPaths(nlri *bgp.IPAddrPrefix) map[string]*Path {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	med := func(v uint32) *uint32 { return &v }
+	return map[string]*Path{
+		"A": newMedTestPath(nlri, 65001, "10.0.0.1", med(10), base.Add(4*time.Hour)),
+		"B": newMedTestPath(nlri, 65002, "10.0.0.2", med(20), base.Add(3*time.Hour)),
+		"C": newMedTestPath(nlri, 65001, "10.0.0.3", med(30), base.Add(2*time.Hour)),
+		"D": newMedTestPath(nlri, 65003, "10.0.0.4", nil, base.Add(10*time.Hour)),
+	}
+}
+
+func pathSourceOrder(d *destination) []string {
+	order := make([]string, 0, d.GetKnownPathListLength())
+	for _, p := range d.GetAllKnownPathList() {
+		order = append(order, p.GetSource().Address.String())
+	}
+	return order
+}
+
+func permutations(names []string) [][]string {
+	if len(names) <= 1 {
+		return [][]string{names}
+	}
+	result := make([][]string, 0)
+	for i, n := range names {
+		rest := make([]string, 0, len(names)-1)
+		rest = append(rest, names[:i]...)
+		rest = append(rest, names[i+1:]...)
+		for _, p := range permutations(rest) {
+			result = append(result, append([]string{n}, p...))
+		}
+	}
+	return result
+}
+
+func TestDeterministicMedArrivalOrder(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	names := []string{"A", "B", "C", "D"}
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true}
+	want := []string{"10.0.0.2", "10.0.0.1", "10.0.0.3", "10.0.0.4"}
+
+	// The same set of paths must always produce the same best path and the
+	// same path order, regardless of the order in which paths arrived.
+	for _, order := range permutations(names) {
+		paths := deterministicMedTestPaths(nlri)
+		d := newDestination(nlri, 0)
+		for _, name := range order {
+			d.Calculate(logger, paths[name], options)
+		}
+		assert.Equal(t, "10.0.0.2", d.GetBestPath("", 0).GetSource().Address.String(), "arrival order %v", order)
+		assert.Equal(t, want, pathSourceOrder(d), "arrival order %v", order)
+	}
+
+	// Without deterministic MED, the same scenario is order-dependent: the
+	// conditional MED comparison is used as if it were a total order, so
+	// different arrival orders elect different best paths.
+	bests := make(map[string]bool)
+	for _, order := range permutations(names) {
+		paths := deterministicMedTestPaths(nlri)
+		d := newDestination(nlri, 0)
+		for _, name := range order {
+			d.Calculate(logger, paths[name], oc.RouteSelectionOptionsConfig{})
+		}
+		bests[d.GetBestPath("", 0).GetSource().Address.String()] = true
+	}
+	assert.Greater(t, len(bests), 1, "this scenario must be order-dependent without deterministic MED")
+}
+
+func TestDeterministicMedWithdrawAndReadd(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true}
+	want := []string{"10.0.0.2", "10.0.0.1", "10.0.0.3", "10.0.0.4"}
+
+	paths := deterministicMedTestPaths(nlri)
+	d := newDestination(nlri, 0)
+	for _, name := range []string{"C", "A", "D", "B"} {
+		d.Calculate(logger, paths[name], options)
+	}
+	assert.Equal(t, want, pathSourceOrder(d))
+
+	// Withdraw the best path B: the AS 65002 group disappears and A, the
+	// oldest remaining group winner, becomes best.
+	withdrawB := NewPath(bgp.RF_IPv4_UC, paths["B"].GetSource(), bgp.PathNLRI{NLRI: nlri}, true, nil, time.Now(), false)
+	d.Calculate(logger, withdrawB, options)
+	assert.Equal(t, "10.0.0.1", d.GetBestPath("", 0).GetSource().Address.String())
+	assert.Equal(t, []string{"10.0.0.1", "10.0.0.3", "10.0.0.4"}, pathSourceOrder(d))
+
+	// Re-adding B with the same attributes must restore the exact same
+	// state as before the withdrawal.
+	d.Calculate(logger, paths["B"], options)
+	assert.Equal(t, "10.0.0.2", d.GetBestPath("", 0).GetSource().Address.String())
+	assert.Equal(t, want, pathSourceOrder(d))
+}
+
+func TestDeterministicMedBatchLoad(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true}
+	want := []string{"10.0.0.2", "10.0.0.1", "10.0.0.3", "10.0.0.4"}
+
+	// Bulk load, e.g. an MRT dump or a session establishment, delivers all
+	// paths before any best path is consumed.
+	batch := newDestination(nlri, 0)
+	for _, name := range []string{"A", "B", "C", "D"} {
+		batch.Calculate(logger, deterministicMedTestPaths(nlri)[name], options)
+	}
+
+	// Incremental load with a withdraw/re-add mixed in.
+	incremental := newDestination(nlri, 0)
+	paths := deterministicMedTestPaths(nlri)
+	for _, name := range []string{"D", "B", "A", "C"} {
+		incremental.Calculate(logger, paths[name], options)
+	}
+	withdrawA := NewPath(bgp.RF_IPv4_UC, paths["A"].GetSource(), bgp.PathNLRI{NLRI: nlri}, true, nil, time.Now(), false)
+	incremental.Calculate(logger, withdrawA, options)
+	incremental.Calculate(logger, paths["A"], options)
+
+	// The same final set of paths must converge to the same best path and
+	// the same path order.
+	assert.Equal(t, want, pathSourceOrder(batch))
+	assert.Equal(t, want, pathSourceOrder(incremental))
+	assert.Equal(t, batch.GetBestPath("", 0).GetSource().Address, incremental.GetBestPath("", 0).GetSource().Address)
+}
+
+func TestDeterministicMedAlwaysCompareMed(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	names := []string{"A", "B", "C", "D"}
+	// always-compare-med takes precedence over deterministic MED: MED is
+	// compared across all paths and D, which carries no MED and is
+	// therefore treated as MED 0, wins regardless of the neighboring AS
+	// grouping.
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true, AlwaysCompareMed: true}
+
+	for _, order := range permutations(names) {
+		paths := deterministicMedTestPaths(nlri)
+		d := newDestination(nlri, 0)
+		for _, name := range order {
+			d.Calculate(logger, paths[name], options)
+		}
+		assert.Equal(t, "10.0.0.4", d.GetBestPath("", 0).GetSource().Address.String(), "arrival order %v", order)
+	}
+}
+
+func TestDeterministicMedMissingMed(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	med := func(v uint32) *uint32 { return &v }
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true}
+
+	// A missing MED is treated as MED 0, the most preferred value, when
+	// comparing paths within the same neighboring-AS group: m2 beats the
+	// older m1 inside the AS 65001 group. MED is not compared across
+	// groups, so the older group winner m3 wins overall.
+	m1 := newMedTestPath(nlri, 65001, "10.0.0.1", med(50), base.Add(1*time.Hour))
+	m2 := newMedTestPath(nlri, 65001, "10.0.0.2", nil, base.Add(9*time.Hour))
+	m3 := newMedTestPath(nlri, 65002, "10.0.0.3", med(10), base.Add(5*time.Hour))
+
+	d := newDestination(nlri, 0)
+	for _, p := range []*Path{m1, m2, m3} {
+		d.Calculate(logger, p, options)
+	}
+	assert.Equal(t, []string{"10.0.0.3", "10.0.0.2", "10.0.0.1"}, pathSourceOrder(d))
+	assert.Equal(t, "10.0.0.3", d.GetBestPath("", 0).GetSource().Address.String())
+}
+
+func TestDeterministicMedMultipath(t *testing.T) {
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.0.0/24"))
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	med := func(v uint32) *uint32 { return &v }
+	options := oc.RouteSelectionOptionsConfig{DeterministicMed: true}
+
+	// ECMP: deterministic MED only determines the order of the known path
+	// list. Multipath eligibility is still decided by comparing the
+	// sorted list against the best path, so e1 and e2, which differ only
+	// in their source peer, remain multipath eligible while f is not.
+	newPaths := func() map[string]*Path {
+		return map[string]*Path{
+			"e1": newMedTestPath(nlri, 65001, "10.0.0.1", med(10), base.Add(5*time.Hour)),
+			"e2": newMedTestPath(nlri, 65001, "10.0.0.2", med(10), base.Add(6*time.Hour)),
+			"f":  newMedTestPath(nlri, 65002, "10.0.0.3", med(1), base.Add(7*time.Hour)),
+		}
+	}
+
+	for _, order := range permutations([]string{"e1", "e2", "f"}) {
+		paths := newPaths()
+		d := newDestination(nlri, 0)
+		for _, name := range order {
+			d.Calculate(logger, paths[name], options)
+		}
+		assert.Equal(t, "10.0.0.1", d.GetBestPath("", 0).GetSource().Address.String(), "arrival order %v", order)
+		multi := d.GetMultiBestPath("")
+		assert.Len(t, multi, 2, "arrival order %v", order)
+		assert.Equal(t, "10.0.0.1", multi[0].GetSource().Address.String())
+		assert.Equal(t, "10.0.0.2", multi[1].GetSource().Address.String())
+	}
+}
