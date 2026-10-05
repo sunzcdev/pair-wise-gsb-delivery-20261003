@@ -284,6 +284,66 @@ validate := validator.New(validator.WithRequiredStructEnabled())
 | iscolor | hexcolor\|rgb\|rgba\|hsl\|hsla\|cmyk |
 | country_code | iso3166_1_alpha2\|iso3166_1_alpha3\|iso3166_1_alpha_numeric |
 
+JSON Schema export
+------
+
+`Validate.ExportJSONSchema` produces a [JSON Schema draft 2020-12](https://json-schema.org/draft/2020-12)
+document for a struct type. It deliberately translates only the tag subset
+that has an **equivalent** JSON Schema meaning; every constraint that cannot
+be represented (or only approximately) is returned in `Diagnostics` instead
+of being silently dropped. A non-empty diagnostics slice means the schema is
+intentionally partial — the Go validator remains authoritative for those
+rules.
+
+```go
+exp, err := validate.ExportJSONSchema(MyStruct{})
+// exp.Schema       *validator.Schema (marshal it with encoding/json)
+// exp.Diagnostics   []validator.SchemaDiagnostic
+```
+
+Each diagnostic carries a RFC 6901 `JSONPointer` to the affected schema node,
+the `Tag`/`Param` involved, and a human-readable `Reason`. `Kind` is:
+
+- `unsupported` — no JSON Schema keyword exists (the rule is not exported).
+- `approximate` — a keyword was emitted but its semantics do not fully match Go.
+
+### Translated subset
+
+| Feature | Tags / behaviour | JSON Schema |
+| - | - | - |
+| Field names | `json` tag name (or Go name), `json:"-"` skipped; embedded flattening & conflicts follow `encoding/json` | `properties` keys |
+| Required presence | `required` | `required` + non-zero exclusion for non-pointer scalars |
+| Pointers | `required` rejects `null`; `omitempty`/`omitnil` allow `null` | `type: ["…","null"]` |
+| String length | `len`, `min`, `max`, `gt`, `gte`, `lt`, `lte` | `minLength` / `maxLength` (runes = code points) |
+| Numeric range | `len`,`min`,`max`,`gt`,`gte`,`lt`,`lte` | `minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum` |
+| Equality / set | `eq`, `ne`, `oneof` (string & integer) | single-value `enum`, `not`+`enum`, `enum` |
+| Containers | `len/min/max` on slices & maps, `dive`, `unique` | `minItems/maxItems`, `minProperties/maxProperties`, `items`, `additionalProperties`, `uniqueItems` |
+| Map keys | `keys … endkeys` (string-keyed maps) | `propertyNames` |
+| Nested structs | named structs, cycles, slices of structs | `$defs` + `$ref`, `items` |
+| Types | string/bool/integer/number/array/object; `time.Time` as string | `type` |
+
+### Explicitly not exported (diagnosed)
+
+- Cross-field comparisons (`eqfield`, `gtfield`, `necsfield`, …) and
+  conditional presence (`required_if`, `required_with*`, `excluded_*`,
+  `skip_unless`): JSON Schema cannot compare sibling fields.
+- Format/assertion tags (`email`, `url`, `uuid*`, `ip*`, `datetime`, regex-ish
+  string checks, filesystem/network checks, …): these validate value content
+  via Go code; JSON Schema `format` is annotation-only and not asserted.
+- `numeric`/`number`/`boolean` applied to **strings** (Go string syntax vs.
+  JSON typed value), `noneof`, `unique=Field`, `oneofci`/case-insensitive
+  variants, `time.Time`-relative comparisons, OR (`|`) groups, custom
+  validators, custom type funcs, and struct-level validations.
+
+### Known semantic gap: `omitempty`
+
+`omitempty` makes Go **skip the rest of the chain** when the value is the Go
+zero value. JSON Schema keywords instead always apply to a present value, so a
+document that contains the key with a zero value (e.g. `"name": ""` with
+`omitempty,min=3`) is rejected by the schema but accepted by Go. These fields
+are flagged with an `approximate` diagnostic so consumers can keep enforcing
+them server-side.
+
 Benchmarks
 ------
 ###### Run on MacBook Pro Max M3
