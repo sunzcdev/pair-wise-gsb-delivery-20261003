@@ -2,6 +2,9 @@ package fasthttp
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"html"
@@ -1428,24 +1431,60 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 	if h.acceptByteRange {
 		hdr.setNonSpecial(strAcceptRanges, strBytes)
 		if len(byteRange) > 0 {
-			startPos, endPos, err := ParseByteRange(byteRange, contentLength)
-			if err != nil {
+			if ifRange := ctx.Request.Header.peek(strIfRange); len(ifRange) > 0 && !ff.matchesIfRange(ifRange) {
+				// The file changed since the If-Range validator was
+				// obtained: the cached ranges would be stale, so the
+				// Range header must be ignored and the whole file sent.
+				byteRange = nil
+			}
+		}
+		if len(byteRange) > 0 {
+			ranges, err := parseByteRanges(byteRange, contentLength)
+			switch {
+			case errors.Is(err, errTooManyByteRanges):
+				// Too many ranges: ignore the Range header and serve
+				// the whole file instead of a huge multipart response.
+			case err != nil:
 				_ = r.(io.Closer).Close() //nolint:forcetypeassert
 				ctx.Logger().Printf("cannot parse byte range %q for path=%q: %v", byteRange, path, err)
 				ctx.Error("Range Not Satisfiable", StatusRequestedRangeNotSatisfiable)
+				setContentRangeNotSatisfiable(hdr, contentLength)
 				return
-			}
+			default:
+				ranges = normalizeByteRanges(ranges)
+				if len(ranges) == 1 {
+					startPos, endPos := ranges[0].startPos, ranges[0].endPos
+					if err = r.(byteRangeUpdater).UpdateByteRange(startPos, endPos); err != nil { //nolint:forcetypeassert
+						_ = r.(io.Closer).Close() //nolint:forcetypeassert
+						ctx.Logger().Printf("cannot seek byte range %q for path=%q: %v", byteRange, path, err)
+						ctx.Error("Internal Server Error", StatusInternalServerError)
+						return
+					}
 
-			if err = r.(byteRangeUpdater).UpdateByteRange(startPos, endPos); err != nil { //nolint:forcetypeassert
-				_ = r.(io.Closer).Close() //nolint:forcetypeassert
-				ctx.Logger().Printf("cannot seek byte range %q for path=%q: %v", byteRange, path, err)
-				ctx.Error("Internal Server Error", StatusInternalServerError)
-				return
+					hdr.SetContentRange(startPos, endPos, contentLength)
+					contentLength = endPos - startPos + 1
+					statusCode = StatusPartialContent
+				} else {
+					boundary := randomByteRangeBoundary()
+					headers, closing, totalLen := byteRangesMultipartLayout(boundary, ff.contentType, ranges, contentLength)
+					if totalLen < contentLength {
+						// The multipart response is smaller than the
+						// whole file: stream the ranges one by one.
+						r = &fsMultiRangeReader{
+							r:       r,
+							u:       r.(byteRangeUpdater), //nolint:forcetypeassert
+							ranges:  ranges,
+							headers: headers,
+							closing: closing,
+						}
+						hdr.SetContentTypeBytes(multipartByteRangesContentType(boundary))
+						contentLength = totalLen
+						statusCode = StatusPartialContent
+					}
+					// Otherwise the multipart overhead outweighs the
+					// savings: serve the whole file instead.
+				}
 			}
-
-			hdr.SetContentRange(startPos, endPos, contentLength)
-			contentLength = endPos - startPos + 1
-			statusCode = StatusPartialContent
 		}
 	}
 
@@ -1529,6 +1568,301 @@ func ParseByteRange(byteRange []byte, contentLength int) (startPos, endPos int, 
 		return 0, 0, fmt.Errorf("the start position of byte range cannot exceed the end position. byte range %q", byteRange)
 	}
 	return startPos, endPos, nil
+}
+
+// maxByteRangeCount is the maximum number of byte ranges served in a single
+// multipart/byteranges response. Requests asking for more ranges are served
+// the whole file instead, so a single request cannot make the server emit a
+// huge number of tiny parts.
+const maxByteRangeCount = 16
+
+// errTooManyByteRanges is returned by parseByteRanges when the Range header
+// contains more than maxByteRangeCount range specs.
+var errTooManyByteRanges = errors.New("too many byte ranges")
+
+// fsByteRange is a single satisfiable byte range. endPos is inclusive.
+type fsByteRange struct {
+	startPos int
+	endPos   int
+}
+
+// parseByteRanges parses a 'Range: bytes=...' header value, which may contain
+// multiple comma-separated ranges.
+//
+// Ranges not overlapping the content are skipped. An error is returned if the
+// header is malformed, if it contains more than maxByteRangeCount ranges, or
+// if no satisfiable range remains.
+func parseByteRanges(byteRange []byte, contentLength int) ([]fsByteRange, error) {
+	b := byteRange
+	if !bytes.HasPrefix(b, strBytes) {
+		return nil, fmt.Errorf("unsupported range units: %q: expecting %q", byteRange, strBytes)
+	}
+
+	b = b[len(strBytes):]
+	if len(b) == 0 || b[0] != '=' {
+		return nil, fmt.Errorf("missing byte range in %q", byteRange)
+	}
+	b = b[1:]
+
+	var ranges []fsByteRange
+	for len(b) > 0 {
+		var spec []byte
+		if n := bytes.IndexByte(b, ','); n >= 0 {
+			spec, b = b[:n], b[n+1:]
+		} else {
+			spec, b = b, nil
+		}
+		spec = bytes.TrimSpace(spec)
+		if len(spec) == 0 {
+			// Tolerate empty list elements such as "bytes=0-1, ,3-4".
+			continue
+		}
+		if len(ranges) >= maxByteRangeCount {
+			return nil, errTooManyByteRanges
+		}
+		r, ok, err := parseByteRangeSpec(spec, contentLength)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			ranges = append(ranges, r)
+		}
+	}
+	if len(ranges) == 0 {
+		return nil, fmt.Errorf("no satisfiable byte ranges in %q", byteRange)
+	}
+	return ranges, nil
+}
+
+// parseByteRangeSpec parses a single 'start-end', 'start-' or '-suffix' byte
+// range spec and clamps it to [0, contentLength).
+//
+// ok is false when the range doesn't overlap the content.
+func parseByteRangeSpec(spec []byte, contentLength int) (r fsByteRange, ok bool, err error) {
+	n := bytes.IndexByte(spec, '-')
+	if n < 0 {
+		return r, false, fmt.Errorf("missing the end position of byte range in %q", spec)
+	}
+	if contentLength <= 0 {
+		return r, false, nil
+	}
+
+	if n == 0 {
+		// Suffix range: the last v bytes of the content.
+		v, err := ParseUint(spec[n+1:])
+		if err != nil {
+			return r, false, err
+		}
+		if v <= 0 {
+			return r, false, nil
+		}
+		startPos := max(contentLength-v, 0)
+		return fsByteRange{startPos: startPos, endPos: contentLength - 1}, true, nil
+	}
+
+	startPos, err := ParseUint(spec[:n])
+	if err != nil {
+		return r, false, err
+	}
+	if startPos >= contentLength {
+		return r, false, nil
+	}
+
+	tail := spec[n+1:]
+	if len(tail) == 0 {
+		return fsByteRange{startPos: startPos, endPos: contentLength - 1}, true, nil
+	}
+
+	endPos, err := ParseUint(tail)
+	if err != nil {
+		return r, false, err
+	}
+	if endPos >= contentLength {
+		endPos = contentLength - 1
+	}
+	if endPos < startPos {
+		return r, false, nil
+	}
+	return fsByteRange{startPos: startPos, endPos: endPos}, true, nil
+}
+
+// normalizeByteRanges sorts ranges by start position and merges overlapping
+// or adjacent ranges, so duplicated or redundant ranges are sent only once.
+func normalizeByteRanges(ranges []fsByteRange) []fsByteRange {
+	if len(ranges) < 2 {
+		return ranges
+	}
+	sort.Slice(ranges, func(i, j int) bool {
+		return ranges[i].startPos < ranges[j].startPos
+	})
+	merged := ranges[:1]
+	for _, r := range ranges[1:] {
+		last := &merged[len(merged)-1]
+		// endPos is clamped to the content length, so endPos+1 cannot overflow.
+		if r.startPos <= last.endPos+1 {
+			if r.endPos > last.endPos {
+				last.endPos = r.endPos
+			}
+			continue
+		}
+		merged = append(merged, r)
+	}
+	return merged
+}
+
+// matchesIfRange reports whether the If-Range header value still matches the
+// file, i.e. whether a ranged response may be sent instead of the whole file.
+func (ff *fsFile) matchesIfRange(ifRange []byte) bool {
+	if t, err := ParseHTTPDate(ifRange); err == nil {
+		return !ff.lastModified.Truncate(time.Second).After(t)
+	}
+	// The value is an entity tag. The file server doesn't issue entity tags,
+	// so a strong comparison cannot succeed.
+	return false
+}
+
+// setContentRangeNotSatisfiable sets 'Content-Range: bytes */contentLength',
+// which must accompany a 416 response.
+func setContentRangeNotSatisfiable(hdr *ResponseHeader, contentLength int) {
+	b := hdr.bufV[:0]
+	b = append(b, strBytes...)
+	b = append(b, " */"...)
+	b = AppendUint(b, contentLength)
+	hdr.bufV = b
+
+	hdr.setNonSpecial(strContentRange, hdr.bufV)
+}
+
+// fsMultiRangeReader streams a multipart/byteranges body for the given ranges
+// over r. Ranges are read from the file one by one, so big files are never
+// loaded into memory as a whole.
+type fsMultiRangeReader struct {
+	r       io.Reader
+	u       byteRangeUpdater
+	ranges  []fsByteRange
+	headers [][]byte
+	closing []byte
+
+	pending []byte
+	left    int
+	err     error
+}
+
+func (mr *fsMultiRangeReader) Read(p []byte) (int, error) {
+	for {
+		if len(mr.pending) > 0 {
+			n := copy(p, mr.pending)
+			mr.pending = mr.pending[n:]
+			return n, nil
+		}
+		if mr.err != nil {
+			return 0, mr.err
+		}
+		if mr.left > 0 {
+			if len(p) > mr.left {
+				p = p[:mr.left]
+			}
+			n, err := mr.r.Read(p)
+			mr.left -= n
+			if err == io.EOF {
+				if mr.left > 0 {
+					err = io.ErrUnexpectedEOF
+				} else {
+					err = nil
+				}
+			}
+			return n, err
+		}
+		mr.nextPart()
+	}
+}
+
+func (mr *fsMultiRangeReader) nextPart() {
+	if len(mr.ranges) == 0 {
+		mr.pending = mr.closing
+		mr.closing = nil
+		mr.err = io.EOF
+		return
+	}
+	rg := mr.ranges[0]
+	mr.ranges = mr.ranges[1:]
+	hdr := mr.headers[0]
+	mr.headers = mr.headers[1:]
+	if err := mr.u.UpdateByteRange(rg.startPos, rg.endPos); err != nil {
+		mr.err = err
+		return
+	}
+	mr.left = rg.endPos - rg.startPos + 1
+	mr.pending = hdr
+}
+
+func (mr *fsMultiRangeReader) Close() error {
+	if c, ok := mr.r.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+// byteRangesMultipartLayout builds the per-part headers and the closing
+// boundary for a multipart/byteranges body and returns the exact total body
+// length, so Content-Length can be set before streaming.
+func byteRangesMultipartLayout(boundary []byte, contentType string, ranges []fsByteRange, fileSize int) (headers [][]byte, closing []byte, total int) {
+	headers = make([][]byte, len(ranges))
+	for i, rg := range ranges {
+		var b []byte
+		if i > 0 {
+			b = append(b, strCRLF...)
+		}
+		b = append(b, "--"...)
+		b = append(b, boundary...)
+		b = append(b, strCRLF...)
+		b = append(b, "Content-Type: "...)
+		b = append(b, contentType...)
+		b = append(b, strCRLF...)
+		b = append(b, "Content-Range: "...)
+		b = append(b, strBytes...)
+		b = append(b, ' ')
+		b = AppendUint(b, rg.startPos)
+		b = append(b, '-')
+		b = AppendUint(b, rg.endPos)
+		b = append(b, '/')
+		b = AppendUint(b, fileSize)
+		b = append(b, strCRLFCRLF...)
+		headers[i] = b
+		total += len(b) + rg.endPos - rg.startPos + 1
+	}
+	closing = append(closing, strCRLF...)
+	closing = append(closing, "--"...)
+	closing = append(closing, boundary...)
+	closing = append(closing, "--"...)
+	closing = append(closing, strCRLF...)
+	total += len(closing)
+	return headers, closing, total
+}
+
+// multipartByteRangesContentType returns the
+// 'multipart/byteranges; boundary=...' Content-Type value.
+func multipartByteRangesContentType(boundary []byte) []byte {
+	b := make([]byte, 0, len(strMultipartByteRanges)+len(strBoundary)+len(boundary)+2)
+	b = append(b, strMultipartByteRanges...)
+	b = append(b, "; "...)
+	b = append(b, strBoundary...)
+	b = append(b, '=')
+	b = append(b, boundary...)
+	return b
+}
+
+// randomByteRangeBoundary returns a random multipart boundary.
+func randomByteRangeBoundary() []byte {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand is not expected to fail. Fall back to a time-based
+		// value to keep serving the response.
+		binary.BigEndian.PutUint64(b[:8], uint64(time.Now().UnixNano()))
+	}
+	dst := make([]byte, hex.EncodedLen(len(b)))
+	hex.Encode(dst, b[:])
+	return dst
 }
 
 func (h *fsHandler) openIndexFile(ctx *RequestCtx, dirPath string, mustCompress bool, fileEncoding string) (*fsFile, error) {
