@@ -515,6 +515,60 @@ time ./glua-without-context.exe fib.lua
 0.01s user 0.01s system 0% cpu 5.306 total
 ```
 
+#### Observing the VM with hooks
+
+A Go host can install a VM observation hook on an `LState` with `SetHook`,
+selecting any combination of call, return and line events. The hook only
+observes execution; it does not change Lua language semantics. Each event
+carries the observed function, its source, and the coroutine (`LState`) it
+occurred in, which makes hooks suitable for sampling profilers.
+
+```go
+L.SetHook(func(L *lua.LState, ev *lua.HookEvent) {
+    fmt.Printf("%s %s:%d (coroutine %p)\n", ev.Type, ev.Source, ev.Line, ev.Coroutine)
+}, lua.HookMaskCall|lua.HookMaskReturn|lua.HookMaskLine)
+```
+
+`HookEvent` fields:
+
+- `Type`: one of `HookEventCall`, `HookEventReturn`, `HookEventTailCall`, `HookEventLine`.
+- `Line`: the current source line, or `-1` when not meaningful (Go functions, call/tailcall events).
+- `Function`: the function being entered, returned from, or executed.
+- `Source`: the function's source name, or `"=[Go]"` for Go functions.
+- `Coroutine`: the coroutine (`LState`) in which the event occurred.
+
+Event ordering is defined as follows:
+
+- A Lua function entered via a `CALL` instruction or the host `Call`/`PCall`
+  APIs fires `HookEventCall` after its frame is pushed, before its first
+  instruction executes.
+- Go function entry (on any path) fires `HookEventCall` immediately before
+  the Go function is invoked and `HookEventReturn` immediately after it
+  returns normally.
+- A Lua tail call fires a single `HookEventTailCall`; no `HookEventReturn` is
+  fired for the replaced frame and no `HookEventCall` for the target. If the
+  tail call target is a Go function, `HookEventTailCall` is followed by
+  `HookEventCall` and `HookEventReturn` for that Go function.
+- `yield` fires no events; in particular the yielding Go call produces no
+  `HookEventReturn`. `resume` fires no `HookEventCall`; execution continues
+  at the suspension point and line events resume from there.
+- An error unwinding frames (e.g. across a `pcall`) produces no
+  `HookEventReturn` for the unwound frames.
+- `HookEventLine` fires before executing an instruction when the current line
+  changes, when execution jumps backward (so a loop written on a single line
+  still produces an event per iteration), or when a frame starts or resumes
+  executing.
+
+While the hook callback is running, further events are suppressed, so the
+callback may call back into Lua without being observed recursively. A panic
+raised inside the callback aborts the current Lua call and propagates like a
+Lua error: when the call is protected (`PCall`, `pcall`, coroutine resume) it
+is returned as that call's error, and observation is re-armed afterwards.
+
+Hooks are installed per `LState` (coroutine) and are not inherited by
+coroutines created with `NewThread`. Passing a nil callback or a zero mask to
+`SetHook` disables observation and restores the original fast execution path.
+
 #### Sharing Lua byte code between LStates
 
 Calling `DoFile` will load a Lua script, compile it to byte code and run the byte code in a `LState`.

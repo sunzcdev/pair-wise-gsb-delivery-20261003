@@ -64,6 +64,61 @@ func mainLoopWithContext(L *LState, baseframe *callFrame) {
 	}
 }
 
+// mainLoopWithHook is the observability variant of mainLoop. It is installed
+// by LState.SetHook and additionally delivers line events; call, tailcall and
+// return events are delivered by the opcode handlers and callGFunction. When
+// no hook is installed the plain mainLoop fast path is used instead.
+func mainLoopWithHook(L *LState, baseframe *callFrame) {
+	var inst uint32
+	var cf *callFrame
+
+	if L.stack.IsEmpty() {
+		return
+	}
+
+	L.currentFrame = L.stack.Last()
+	if L.currentFrame.Fn.IsG {
+		callGFunction(L, false)
+		return
+	}
+
+	lastFrame := L.currentFrame
+	lastPc := -1
+	lastLine := -1
+	for {
+		cf = L.currentFrame
+		if cf != lastFrame {
+			lastFrame = cf
+			lastPc = -1
+			lastLine = -1
+		}
+		pc := cf.Pc
+		inst = cf.Fn.Proto.Code[pc]
+		cf.Pc++
+		if L.hookMask&HookMaskLine != 0 && !L.inHook {
+			line := cf.Fn.Proto.DbgSourcePositions[pc]
+			// Fire on a new line, on a backward jump (so single-line loops
+			// are still observed once per iteration), or on frame entry.
+			if pc == 0 || pc <= lastPc || line != lastLine {
+				L.fireHook(HookMaskLine, HookEventLine, line, cf.Fn)
+			}
+			lastPc = pc
+			lastLine = line
+		}
+		if L.ctx != nil {
+			select {
+			case <-L.ctx.Done():
+				L.RaiseError(L.ctx.Err().Error())
+				return
+			default:
+			}
+		}
+		if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
+			return
+		}
+	}
+}
+
 // regv is the first target register to copy the return values to.
 // It can be reg.top, indicating that the copied values are going into new registers, or it can be below reg.top
 // Indicating that the values should be within the existing registers.
@@ -199,14 +254,22 @@ func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 
 func callGFunction(L *LState, tailcall bool) bool {
 	frame := L.currentFrame
+	if L.hookFn != nil {
+		L.fireHook(HookMaskCall, HookEventCall, -1, frame.Fn)
+	}
 	gfnret := frame.Fn.GFunction(L)
 	if tailcall {
 		L.currentFrame = L.RemoveCallerFrame()
 	}
 
 	if gfnret < 0 {
+		// The Go function yielded; no return event is fired.
 		switchToParentThread(L, L.GetTop(), false, false)
 		return true
+	}
+
+	if L.hookFn != nil {
+		L.fireHook(HookMaskReturn, HookEventReturn, -1, frame.Fn)
 	}
 
 	wantret := frame.NRet
@@ -1305,6 +1368,9 @@ func init() {
 				}
 				ls.currentFrame = newcf
 			}
+			if L.hookFn != nil && !callable.IsG {
+				L.fireHook(HookMaskCall, HookEventCall, -1, callable)
+			}
 			if callable.IsG && callGFunction(L, false) {
 				return 1
 			}
@@ -1366,6 +1432,9 @@ func init() {
 					Parent:     cf,
 					TailCall:   0,
 				}, lv, meta)
+				if L.hookFn != nil {
+					L.fireHook(HookMaskCall, HookEventTailCall, -1, callable)
+				}
 				if callGFunction(L, true) {
 					return 1
 				}
@@ -1386,6 +1455,9 @@ func init() {
 				if meta {
 					cf.NArgs++
 					L.reg.Insert(lv, cf.LocalBase)
+				}
+				if L.hookFn != nil {
+					L.fireHook(HookMaskCall, HookEventTailCall, -1, callable)
 				}
 				// this section is inlined by go-inline
 				// source function is 'func (ls *LState) initCallFrame(cf *callFrame) ' in '_state.go'
@@ -1564,6 +1636,10 @@ func init() {
 			n := cf.NRet
 			if cf.NRet == MultRet {
 				n = nret
+			}
+
+			if L.hookFn != nil {
+				L.fireHook(HookMaskReturn, HookEventReturn, cf.Fn.Proto.DbgSourcePositions[cf.Pc-1], cf.Fn)
 			}
 
 			if L.Parent != nil && L.stack.Sp() == 1 {

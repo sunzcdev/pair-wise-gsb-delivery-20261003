@@ -124,6 +124,68 @@ type Debug struct {
 
 /* }}} */
 
+/* Hook {{{ */
+
+// HookEventType identifies the kind of VM observation event delivered to a HookFunc.
+type HookEventType int
+
+const (
+	// HookEventCall is fired when the VM enters a function.
+	HookEventCall HookEventType = iota
+	// HookEventReturn is fired when a function returns normally.
+	HookEventReturn
+	// HookEventTailCall is fired when a Lua tail call replaces the current frame.
+	HookEventTailCall
+	// HookEventLine is fired before the VM executes an instruction on a new line.
+	HookEventLine
+)
+
+// Hook mask bits selecting which events are delivered to a HookFunc.
+const (
+	HookMaskCall = 1 << iota
+	HookMaskReturn
+	HookMaskLine
+)
+
+func (et HookEventType) String() string {
+	switch et {
+	case HookEventCall:
+		return "call"
+	case HookEventReturn:
+		return "return"
+	case HookEventTailCall:
+		return "tailcall"
+	case HookEventLine:
+		return "line"
+	}
+	return "unknown"
+}
+
+// HookEvent describes a single VM observation event. It carries the function
+// being observed, its source, and the coroutine (LState) the event occurred in,
+// which makes it suitable for sampling profilers.
+type HookEvent struct {
+	// Type is the kind of event.
+	Type HookEventType
+	// Line is the current source line, or -1 when it is not meaningful
+	// (Go functions, call and tailcall events).
+	Line int
+	// Function is the function being entered, returned from, or executed.
+	Function *LFunction
+	// Source is the function's source name, or "=[Go]" for Go functions.
+	Source string
+	// Coroutine identifies the coroutine (LState) in which the event occurred.
+	Coroutine *LState
+}
+
+// HookFunc is a VM observation callback installed with LState.SetHook.
+// It must not modify Lua language semantics; it is intended for observation
+// (e.g. sampling profilers). A panic raised inside the callback aborts the
+// current Lua call in a controlled way (see LState.SetHook).
+type HookFunc func(L *LState, event *HookEvent)
+
+/* }}} */
+
 /* callFrame {{{ */
 
 type callFrame struct {
@@ -687,7 +749,9 @@ func (ls *LState) where(level int, skipg bool) string {
 	}
 	line := ""
 	if proto != nil {
-		line = fmt.Sprintf("%v:", proto.DbgSourcePositions[cf.Pc-1])
+		if cf.Pc > 0 {
+			line = fmt.Sprintf("%v:", proto.DbgSourcePositions[cf.Pc-1])
+		}
 	}
 	return fmt.Sprintf("%v:%v", sourcename, line)
 }
@@ -773,6 +837,41 @@ func (ls *LState) kill() {
 	if ls.ctxCancelFn != nil {
 		ls.ctxCancelFn()
 	}
+}
+
+// updateMainLoop selects the main loop implementation matching the current
+// configuration. When no hook is installed the original fast execution path
+// is used.
+func (ls *LState) updateMainLoop() {
+	if ls.hookFn != nil && ls.hookMask != 0 {
+		ls.mainLoop = mainLoopWithHook
+	} else if ls.ctx != nil {
+		ls.mainLoop = mainLoopWithContext
+	} else {
+		ls.mainLoop = mainLoop
+	}
+}
+
+// fireHook delivers an event to the installed hook if the event's mask bit is
+// enabled. Events are suppressed while a hook callback is running, so a
+// callback that calls back into Lua is never observed recursively.
+func (ls *LState) fireHook(maskBit int, eventType HookEventType, line int, fn *LFunction) {
+	if ls.inHook || ls.hookFn == nil || ls.hookMask&maskBit == 0 {
+		return
+	}
+	source := "=[Go]"
+	if !fn.IsG && fn.Proto != nil {
+		source = fn.Proto.SourceName
+	}
+	ls.inHook = true
+	defer func() { ls.inHook = false }()
+	ls.hookFn(ls, &HookEvent{
+		Type:      eventType,
+		Line:      line,
+		Function:  fn,
+		Source:    source,
+		Coroutine: ls,
+	})
 }
 
 func (ls *LState) indexToReg(idx int) int {
@@ -1048,6 +1147,9 @@ func (ls *LState) callR(nargs, nret, rbase int) {
 		Parent:     ls.currentFrame,
 		TailCall:   0,
 	}, lv, meta)
+	if ls.hookFn != nil && !fn.IsG {
+		ls.fireHook(HookMaskCall, HookEventCall, -1, fn)
+	}
 	if ls.G.MainThread == nil {
 		ls.G.MainThread = ls
 		ls.G.CurrentThread = ls
@@ -2046,8 +2148,8 @@ func (ls *LState) SetMx(mx int) {
 
 // SetContext set a context ctx to this LState. The provided ctx must be non-nil.
 func (ls *LState) SetContext(ctx context.Context) {
-	ls.mainLoop = mainLoopWithContext
 	ls.ctx = ctx
+	ls.updateMainLoop()
 }
 
 // Context returns the LState's context. To change the context, use WithContext.
@@ -2058,9 +2160,66 @@ func (ls *LState) Context() context.Context {
 // RemoveContext removes the context associated with this LState and returns this context.
 func (ls *LState) RemoveContext() context.Context {
 	oldctx := ls.ctx
-	ls.mainLoop = mainLoop
 	ls.ctx = nil
+	ls.updateMainLoop()
 	return oldctx
+}
+
+// SetHook installs a VM observation hook on this LState. The observed events
+// are selected by ORing HookMaskCall, HookMaskReturn and HookMaskLine into
+// mask. Passing a nil fn or a zero mask disables observation and restores the
+// original fast execution path.
+//
+// The hook observes the VM without modifying Lua language semantics. Events
+// are ordered as follows:
+//
+//   - Lua function entered via a CALL instruction or the host Call/PCall APIs:
+//     HookEventCall fires after the callee frame is pushed, before its first
+//     instruction executes.
+//   - Go function entry (any path): HookEventCall fires immediately before the
+//     Go function is invoked and HookEventReturn fires immediately after it
+//     returns normally.
+//   - Lua tail call: a single HookEventTailCall fires; no HookEventReturn is
+//     fired for the replaced frame and no HookEventCall for the target. If the
+//     tail call target is a Go function, HookEventTailCall is followed by
+//     HookEventCall and HookEventReturn for that Go function.
+//   - yield: no events are fired; in particular the yielding Go call produces
+//     no HookEventReturn.
+//   - resume: no HookEventCall is fired for the resumed function; execution
+//     continues at the suspension point and line events resume from there.
+//   - an error unwinding frames (e.g. across a pcall) produces no
+//     HookEventReturn for the unwound frames.
+//
+// HookEventLine fires before executing an instruction when the current line
+// changes, when execution jumps backward (so a loop written on a single line
+// still produces an event per iteration), or when a frame starts or resumes
+// executing.
+//
+// While the hook callback is running, further events are suppressed, so the
+// callback may call back into Lua without being observed recursively.
+//
+// A panic raised inside the callback aborts the current Lua call and
+// propagates like a Lua error: when the call is protected (PCall, pcall,
+// coroutine resume) it is returned as that call's error. Observation is
+// re-armed afterwards.
+//
+// Hooks are installed per LState (coroutine) and are not inherited by
+// coroutines created with NewThread. The event's Coroutine field identifies
+// the coroutine that produced it.
+func (ls *LState) SetHook(fn HookFunc, mask int) {
+	ls.hookFn = fn
+	if fn == nil {
+		mask = 0
+	}
+	ls.hookMask = mask
+	ls.inHook = false
+	ls.updateMainLoop()
+}
+
+// GetHook returns the hook callback and mask currently installed on this
+// LState, or nil and 0 when observation is disabled.
+func (ls *LState) GetHook() (HookFunc, int) {
+	return ls.hookFn, ls.hookMask
 }
 
 // Converts the Lua value at the given acceptable index to the chan LValue.
