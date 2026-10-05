@@ -150,11 +150,38 @@ func ContextFootnotes(pc parser.Context) Footnotes {
 var (
 	footnoteDefsKey     = renderer.NewContextKey()
 	footnoteDefsInfoKey = renderer.NewContextKey()
+	footnoteSectionsKey = renderer.NewContextKey()
 )
 
 type defInfo struct {
 	index      int
 	references []int
+}
+
+// sectionInfo holds the footnote definitions referenced from one section and,
+// for each referenced label, the 0-based positions of the references within
+// the section.
+type sectionInfo struct {
+	// labels preserves the order of first reference within the section.
+	labels      []string
+	defByLabel  map[string]*ast.FootnoteDefinition
+	refsByLabel map[string][]*ast.FootnoteReference
+}
+
+func newSectionInfo() *sectionInfo {
+	return &sectionInfo{
+		defByLabel:  map[string]*ast.FootnoteDefinition{},
+		refsByLabel: map[string][]*ast.FootnoteReference{},
+	}
+}
+
+type sectionData struct {
+	sections   []*sectionInfo
+	allDefs    map[string]*ast.FootnoteDefinition
+	headings   map[*gast.Heading]struct{}
+	refSection map[*ast.FootnoteReference]int
+	refPos     map[*ast.FootnoteReference]int
+	flushed    int
 }
 
 // }}}
@@ -339,6 +366,12 @@ type footnoteHTMLRendererConfig struct {
 	BacklinkClass []byte
 
 	BacklinkHTML []byte
+
+	// SectionLevel, when greater than 0, enables per-section numbering.
+	// Sections are delimited by headings of this level; the content before
+	// the first such heading forms a preface section. Each section restarts
+	// footnote numbering at 1 and renders its own endnotes block.
+	SectionLevel int
 }
 
 // FootnoteHTMLRendererOption interface is a functional option interface for the extension.
@@ -439,6 +472,29 @@ func WithBacklinkHTML[T []byte | string](a T) FootnoteHTMLRendererOption {
 	return &withFootnoteBacklinkHTML{[]byte(a)}
 }
 
+type withFootnoteSectionNumbering struct {
+	value int
+}
+
+func (o *withFootnoteSectionNumbering) applyFootnoteHTMLRendererOption(c *footnoteHTMLRendererConfig) {
+	c.SectionLevel = o.value
+}
+
+// WithSectionNumbering is a functional option that numbers footnotes
+// independently within each section. Sections are delimited by headings of
+// the given level (for example, 2 for level-2 headings). Content preceding
+// the first such heading forms a preface section. Footnote definitions are
+// still resolved document-wide, but each section assigns numbers in order of
+// the first reference and renders its own endnotes block. A definition
+// referenced from multiple sections is rendered once per section, with
+// section-scoped, non-colliding ids and backlinks.
+//
+// Without this option (or with a level of 0), footnotes are numbered
+// globally, which is the default behavior.
+func WithSectionNumbering(level int) FootnoteHTMLRendererOption {
+	return &withFootnoteSectionNumbering{value: level}
+}
+
 // }}}
 
 // {{{ Renderer extension
@@ -470,17 +526,13 @@ func (r *footnoteHTMLRendererExtension) renderFootnoteReference(
 	}
 	w := writer.(util.BufWriter)
 	n := node.(*ast.FootnoteReference)
-	is := strconv.Itoa(n.Index)
-
-	defsInfo := rc.Get(footnoteDefsInfoKey).(map[string]*defInfo)
-	info := defsInfo[n.Label.Str(source)]
-	refCount := len(info.references)
+	is, refIndex, refCount, _ := r.referenceIDs(source, n, rc)
 
 	_, _ = w.WriteString(`<sup id="`)
 	_, _ = w.Write(r.idPrefix(node))
 	_, _ = w.WriteString(`fnref`)
-	if n.RefIndex > 0 {
-		_, _ = fmt.Fprintf(w, "%d", n.RefIndex)
+	if refIndex > 0 {
+		_, _ = fmt.Fprintf(w, "%d", refIndex)
 	}
 	_ = w.WriteByte(':')
 	_, _ = w.WriteString(is)
@@ -489,16 +541,47 @@ func (r *footnoteHTMLRendererExtension) renderFootnoteReference(
 	_, _ = w.WriteString(`fn:`)
 	_, _ = w.WriteString(is)
 	_, _ = w.WriteString(`" class="`)
-	_, _ = w.Write(applyFootnoteTemplate(r.config.LinkClass, n.Index, refCount))
+	_, _ = w.Write(applyFootnoteTemplate(r.config.LinkClass, displayIndex(is), refCount))
 	if len(r.config.LinkTitle) > 0 {
 		_, _ = w.WriteString(`" title="`)
-		_, _ = w.Write(util.EscapeHTML(applyFootnoteTemplate(r.config.LinkTitle, n.Index, refCount)))
+		_, _ = w.Write(util.EscapeHTML(
+			applyFootnoteTemplate(r.config.LinkTitle, displayIndex(is), refCount)))
 	}
 	_, _ = w.WriteString(`" role="doc-noteref">`)
-	_, _ = w.WriteString(is)
+	_, _ = w.WriteString(strconv.Itoa(displayIndex(is)))
 	_, _ = w.WriteString(`</a></sup>`)
 
 	return gast.WalkContinue, nil
+}
+
+// referenceIDs returns the id token for a reference, its 0-based position
+// among references to the same definition within its section, the total number
+// of such references and the 0-based section number. In global mode the
+// section number is -1 and the token is the global index.
+func (r *footnoteHTMLRendererExtension) referenceIDs(
+	source []byte, n *ast.FootnoteReference, rc renderer.Context,
+) (token string, refIndex, refCount, section int) {
+	if r.config.SectionLevel > 0 {
+		data := rc.Get(footnoteSectionsKey).(*sectionData)
+		s := data.refSection[n]
+		label := n.Label.Str(source)
+		sec := data.sections[s]
+		index := 1
+		for _, l := range sec.labels {
+			if l == label {
+				break
+			}
+			if _, ok := sec.defByLabel[l]; ok {
+				index++
+			}
+		}
+		refs := data.sections[s].refsByLabel[label]
+		return footnoteToken(index, s), data.refPos[n], len(refs), s
+	}
+	defsInfo := rc.Get(footnoteDefsInfoKey).(map[string]*defInfo)
+	info := defsInfo[n.Label.Str(source)]
+	token = strconv.Itoa(n.Index)
+	return token, n.RefIndex, len(info.references), -1
 }
 
 func (r *footnoteHTMLRendererExtension) renderFootnoteDefinition(
@@ -523,13 +606,18 @@ func (r *footnoteHTMLRendererExtension) RendererOptions(c *html.Config) []html.O
 	}
 
 	decorator := &footnoteDecorator{config: &r.config}
-	return []html.Option{
+	opts := []html.Option{
 		html.WithNodeRenderers(map[gast.NodeKind]html.NodeRenderer{
 			ast.KindFootnoteReference:  html.NodeRendererFunc(r.renderFootnoteReference),
 			ast.KindFootnoteDefinition: html.NodeRendererFunc(r.renderFootnoteDefinition),
 		}),
 		html.WithNodeRendererDecorator(gast.KindDocument, decorator.Decorate),
 	}
+	if r.config.SectionLevel > 0 {
+		opts = append(opts,
+			html.WithNodeRendererDecorator(gast.KindHeading, decorator.DecorateHeading))
+	}
+	return opts
 }
 
 // FootnoteHTMLRenderer is a default [html.Extension] for footnotes.
@@ -547,6 +635,11 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 	return html.NodeRendererFunc(func(w io.Writer, source []byte, node gast.Node,
 		entering bool, rc renderer.Context) (gast.WalkStatus, error) {
 		if entering {
+			if d.config.SectionLevel > 0 {
+				data := d.buildSections(node, source)
+				rc.Set(footnoteSectionsKey, data)
+				return next.Render(w, source, node, entering, rc)
+			}
 			defsMap := map[string]*ast.FootnoteDefinition{}
 			infos := map[string]*defInfo{}
 			_ = gast.Walk(node, func(node gast.Node, entering bool) (gast.WalkStatus, error) {
@@ -584,6 +677,12 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 		rawDefsMap := rc.Get(footnoteDefsKey)
 		rawInfos := rc.Get(footnoteDefsInfoKey)
 		if rawDefsMap == nil || rawInfos == nil {
+			if d.config.SectionLevel > 0 {
+				data := rc.Get(footnoteSectionsKey).(*sectionData)
+				if data.flushed < len(data.sections) {
+					d.flushSection(w.(util.BufWriter), source, data, data.flushed, rc)
+				}
+			}
 			return next.Render(w, source, node, entering, rc)
 		}
 		defsMap := rawDefsMap.(map[string]*ast.FootnoteDefinition)
@@ -610,30 +709,139 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 		})
 
 		bw := w.(util.BufWriter)
-		_, _ = bw.WriteString("<div class=\"footnotes\" role=\"doc-endnotes\">\n")
-		if d.config.XHTML {
-			_, _ = bw.WriteString("<hr />\n")
-		} else {
-			_, _ = bw.WriteString("<hr>\n")
-		}
-		_, _ = bw.WriteString("<ol>\n")
+		_ = d.writeEndnotesOpen(bw)
 
 		for _, entry := range referenced {
-			d.renderDefinition(bw, source, entry.node, entry.info, rc)
+			d.renderDefinition(bw, source, entry.node, entry.info, -1, rc)
 		}
 
-		_, _ = bw.WriteString("</ol>\n")
-		_, _ = bw.WriteString("</div>\n")
+		d.writeEndnotesClose(bw)
 
 		return next.Render(w, source, node, entering, rc)
 	})
 }
 
+// DecorateHeading flushes the endnotes of the preceding section before a
+// section-delimiting heading is rendered.
+func (d *footnoteDecorator) DecorateHeading(next html.NodeRenderer) html.NodeRenderer {
+	return html.NodeRendererFunc(func(w io.Writer, source []byte, node gast.Node,
+		entering bool, rc renderer.Context) (gast.WalkStatus, error) {
+		heading, ok := node.(*gast.Heading)
+		if entering && ok {
+			data := rc.Get(footnoteSectionsKey).(*sectionData)
+			if _, isBoundary := data.headings[heading]; isBoundary &&
+				data.flushed < len(data.sections) {
+				d.flushSection(w.(util.BufWriter), source, data, data.flushed, rc)
+			}
+		}
+		return next.Render(w, source, node, entering, rc)
+	})
+}
+
+// buildSections walks the parsed document and groups footnote references by
+// the section derived from parsed heading nodes. Headings inside footnote
+// definitions are skipped (the walk skips definition children), so a '#'
+// inside a code block, for example, never delimits a section.
+func (d *footnoteDecorator) buildSections(
+	doc gast.Node, source []byte,
+) *sectionData {
+	data := &sectionData{
+		sections:   []*sectionInfo{newSectionInfo()},
+		allDefs:    map[string]*ast.FootnoteDefinition{},
+		headings:   map[*gast.Heading]struct{}{},
+		refSection: map[*ast.FootnoteReference]int{},
+		refPos:     map[*ast.FootnoteReference]int{},
+	}
+	current := 0
+	_ = gast.Walk(doc, func(n gast.Node, entering bool) (gast.WalkStatus, error) {
+		if !entering {
+			return gast.WalkContinue, nil
+		}
+		if def, ok := n.(*ast.FootnoteDefinition); ok {
+			data.allDefs[def.Label.Str(source)] = def
+			return gast.WalkSkipChildren, nil
+		}
+		if heading, ok := n.(*gast.Heading); ok {
+			if heading.Level == d.config.SectionLevel {
+				data.headings[heading] = struct{}{}
+				current++
+				data.sections = append(data.sections, newSectionInfo())
+			}
+			return gast.WalkContinue, nil
+		}
+		if ref, ok := n.(*ast.FootnoteReference); ok {
+			label := ref.Label.Str(source)
+			sec := data.sections[current]
+			data.refSection[ref] = current
+			if _, exists := sec.refsByLabel[label]; !exists {
+				sec.labels = append(sec.labels, label)
+			}
+			data.refPos[ref] = len(sec.refsByLabel[label])
+			sec.refsByLabel[label] = append(sec.refsByLabel[label], ref)
+		}
+		return gast.WalkContinue, nil
+	})
+	for _, sec := range data.sections {
+		for _, label := range sec.labels {
+			if def, ok := data.allDefs[label]; ok {
+				sec.defByLabel[label] = def
+			}
+		}
+	}
+	return data
+}
+
+// flushSection renders the endnotes block of one section. Definitions are
+// ordered by their first reference within the section; unreferenced
+// definitions are not rendered.
+func (d *footnoteDecorator) flushSection(
+	bw util.BufWriter, source []byte, data *sectionData, section int, rc renderer.Context,
+) {
+	sec := data.sections[section]
+	referenced := make([]string, 0, len(sec.labels))
+	for _, label := range sec.labels {
+		if _, ok := sec.defByLabel[label]; ok {
+			referenced = append(referenced, label)
+		}
+	}
+	if len(referenced) > 0 {
+		_ = d.writeEndnotesOpen(bw)
+		for i, label := range referenced {
+			refs := sec.refsByLabel[label]
+			info := &defInfo{index: i + 1, references: make([]int, len(refs))}
+			for j := range refs {
+				info.references[j] = j
+			}
+			d.renderDefinition(bw, source, sec.defByLabel[label], info, section, rc)
+		}
+		d.writeEndnotesClose(bw)
+	}
+	data.flushed++
+}
+
+func (d *footnoteDecorator) writeEndnotesOpen(bw util.BufWriter) error {
+	if _, err := bw.WriteString("<div class=\"footnotes\" role=\"doc-endnotes\">\n"); err != nil {
+		return err
+	}
+	if d.config.XHTML {
+		_, _ = bw.WriteString("<hr />\n")
+	} else {
+		_, _ = bw.WriteString("<hr>\n")
+	}
+	_, _ = bw.WriteString("<ol>\n")
+	return nil
+}
+
+func (d *footnoteDecorator) writeEndnotesClose(bw util.BufWriter) {
+	_, _ = bw.WriteString("</ol>\n")
+	_, _ = bw.WriteString("</div>\n")
+}
+
 func (d *footnoteDecorator) renderDefinition(
 	w util.BufWriter, source []byte, def *ast.FootnoteDefinition,
-	info *defInfo, rc renderer.Context,
+	info *defInfo, section int, rc renderer.Context,
 ) {
-	is := strconv.Itoa(info.index)
+	is := footnoteToken(info.index, section)
 	_, _ = w.WriteString(`<li id="`)
 	_, _ = w.Write(d.idPrefix(def))
 	_, _ = w.WriteString(`fn:`)
@@ -651,14 +859,14 @@ func (d *footnoteDecorator) renderDefinition(
 
 	for child := def.FirstChild(); child != nil; child = child.NextSibling() {
 		if child == lastPara {
-			d.renderParagraphWithBacklinks(w, source, child, info, rc)
+			d.renderParagraphWithBacklinks(w, source, child, info, section, rc)
 		} else {
 			_ = rc.Render(w, source, child)
 		}
 	}
 
 	if lastPara == nil && len(info.references) > 0 {
-		d.renderBacklinks(w, def, info)
+		d.renderBacklinks(w, def, info, section)
 	}
 
 	_, _ = w.WriteString("</li>\n")
@@ -666,18 +874,20 @@ func (d *footnoteDecorator) renderDefinition(
 
 func (d *footnoteDecorator) renderParagraphWithBacklinks(
 	w util.BufWriter, source []byte, para gast.Node,
-	info *defInfo, rc renderer.Context,
+	info *defInfo, section int, rc renderer.Context,
 ) {
 	_, _ = w.WriteString("<p>")
 	for child := para.FirstChild(); child != nil; child = child.NextSibling() {
 		_ = rc.Render(w, source, child)
 	}
-	d.renderBacklinks(w, para, info)
+	d.renderBacklinks(w, para, info, section)
 	_, _ = w.WriteString("</p>\n")
 }
 
-func (d *footnoteDecorator) renderBacklinks(w util.BufWriter, node gast.Node, info *defInfo) {
-	is := strconv.Itoa(info.index)
+func (d *footnoteDecorator) renderBacklinks(
+	w util.BufWriter, node gast.Node, info *defInfo, section int,
+) {
+	is := footnoteToken(info.index, section)
 	refCount := len(info.references)
 	for _, refIdx := range info.references {
 		_, _ = w.WriteString(`&#160;<a href="#`)
@@ -738,6 +948,29 @@ func (p *footnoteParserExtension) ParserOptions(_ *parser.Config) []parser.Optio
 var FootnoteParser = NewFootnoteParser()
 
 // }}}
+
+// footnoteToken returns the id token identifying a footnote within the
+// document. In global mode (section < 0) it is the plain index; in section
+// mode it is prefixed with the 1-based section number, so the same label
+// referenced from multiple sections gets distinct, non-colliding ids.
+func footnoteToken(index, section int) string {
+	if section < 0 {
+		return strconv.Itoa(index)
+	}
+	return strconv.Itoa(section+1) + "-" + strconv.Itoa(index)
+}
+
+// displayIndex extracts the within-section display index from an id token.
+func displayIndex(token string) int {
+	for i := 0; i < len(token); i++ {
+		if token[i] == '-' {
+			n, _ := strconv.Atoi(token[i+1:])
+			return n
+		}
+	}
+	n, _ := strconv.Atoi(token)
+	return n
+}
 
 func applyFootnoteTemplate(b []byte, index, refCount int) []byte {
 	fast := true
