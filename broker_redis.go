@@ -819,11 +819,17 @@ func (b *RedisBroker) publish(s *shardWrapper, ch string, data []byte, opts Publ
 	idempotencyKey := opts.IdempotencyKey
 	resultKey := b.resultCacheKey(s.shard, ch, idempotencyKey)
 	var resultExpire string
+	var contentDigestHex string
+	var strictMode string
 	if idempotencyKey != "" {
 		if opts.IdempotentResultTTL != 0 {
 			resultExpire = strconv.Itoa(int(opts.IdempotentResultTTL.Seconds()))
 		} else {
 			resultExpire = strconv.Itoa(defaultIdempotentResultExpireSeconds)
+		}
+		if opts.StrictIdempotency {
+			contentDigestHex = publishContentDigestHex(data, opts)
+			strictMode = "1"
 		}
 	}
 
@@ -852,6 +858,8 @@ func (b *RedisBroker) publish(s *shardWrapper, ch string, data []byte, opts Publ
 						publishChannelStr,
 						publishCommand,
 						resultExpire,
+						contentDigestHex,
+						strictMode,
 					},
 				)
 			}
@@ -872,11 +880,13 @@ func (b *RedisBroker) publish(s *shardWrapper, ch string, data []byte, opts Publ
 						publishChannelStr,
 						publishCommand,
 						resultExpire,
+						contentDigestHex,
+						strictMode,
 					},
 				)
 			}
 		}
-		return PublishResult{}, resp.Error()
+		return PublishResult{}, mapIdempotencyConflictError(resp.Error())
 	}
 
 	historyMetaKey := b.historyMetaKey(s.shard, ch)
@@ -928,10 +938,12 @@ func (b *RedisBroker) publish(s *shardWrapper, ch string, data []byte, opts Publ
 			useDelta,
 			version,
 			versionEpoch,
+			contentDigestHex,
+			strictMode,
 		},
 	).ToArray()
 	if err != nil {
-		return PublishResult{}, err
+		return PublishResult{}, mapIdempotencyConflictError(err)
 	}
 	if len(replies) != 2 && len(replies) != 3 && len(replies) != 4 {
 		return PublishResult{}, errors.New("wrong Redis reply")

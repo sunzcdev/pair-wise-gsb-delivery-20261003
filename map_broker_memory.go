@@ -35,6 +35,10 @@ type MemoryMapBroker struct {
 
 type resultCacheEntry struct {
 	Position StreamPosition
+	// Digest is the content digest recorded with the result. It is empty for
+	// the map broker and for non-strict stream publishes persisted by older
+	// versions; an empty digest never forces a conflict.
+	Digest []byte
 	ExpireAt int64 // UnixMilli
 }
 

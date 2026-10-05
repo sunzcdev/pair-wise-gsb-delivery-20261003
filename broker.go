@@ -132,6 +132,21 @@ type PublishOptions struct {
 	// may cache these keys for some time to prevent duplicate publications. In this case
 	// the returned result is the same as from the previous publication with the same key.
 	IdempotencyKey string
+	// StrictIdempotency enables strict mode for idempotent deduplication. It only
+	// takes effect together with a non-empty IdempotencyKey.
+	//
+	// In strict mode a retry with the same IdempotencyKey within a channel is
+	// accepted only when its content (message data, tags and every option that
+	// affects the publication's interpretation — see publishContentDigest) is
+	// identical to the first request; it then returns the first request's result.
+	// If the content differs, Publish returns ErrIdempotencyConflict instead of a
+	// cached StreamPosition, and nothing enters history or reaches subscribers.
+	//
+	// With StrictIdempotency left false the behavior stays backward compatible:
+	// the first result cached under the key is returned for every retry no matter
+	// the content. Concurrent publishes of different content under one key have
+	// exactly one winner in both modes.
+	StrictIdempotency bool
 	// IdempotentResultTTL sets the time of expiration for results of idempotent publications
 	// (publications with idempotency key provided). Memory and Redis brokers implement this TTL
 	// with second precision, so don't set something less than one second here. By default,

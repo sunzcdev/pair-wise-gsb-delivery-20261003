@@ -7,11 +7,16 @@
 -- The remembered result is written after the publication and never before: it
 -- is what says a publication happened, so writing it first would let a failure
 -- leave a result claiming a publication nobody received.
-local function publish_idempotent(result_key, payload, channel, publish_command, result_key_expire)
+local function publish_idempotent(result_key, payload, channel, publish_command, result_key_expire, content_digest, strict)
     if result_key_expire ~= '' then
-        local stream_meta = redis.call("hmget", result_key, "e", "s")
-        local result_epoch, result_offset = stream_meta[1], stream_meta[2]
+        local stream_meta = redis.call("hmget", result_key, "e", "s", "d")
+        local result_epoch, result_offset, result_digest = stream_meta[1], stream_meta[2], stream_meta[3]
         if result_epoch ~= false then
+            -- A missing remembered digest means the result predates strict
+            -- mode; treat it leniently so upgrades stay compatible.
+            if strict == "1" and result_digest ~= false and result_digest ~= content_digest then
+                return redis.error_reply("IDEMPOTENCY_CONFLICT")
+            end
             return { result_offset, result_epoch }
         end
     end
@@ -22,7 +27,8 @@ local function publish_idempotent(result_key, payload, channel, publish_command,
     end
 
     if result_key_expire ~= '' then
-        redis.call("hset", result_key, "e", "")
+        -- Result and digest are committed together in one hset.
+        redis.call("hset", result_key, "e", "", "d", content_digest)
         redis.call("expire", result_key, result_key_expire)
     end
 

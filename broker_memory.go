@@ -1,6 +1,7 @@
 package centrifuge
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"fmt"
@@ -94,9 +95,16 @@ func (b *MemoryBroker) Publish(ch string, data []byte, opts PublishOptions) (Pub
 	mu.Lock()
 	defer mu.Unlock()
 
+	var contentDigest []byte
 	if opts.IdempotencyKey != "" {
+		if opts.StrictIdempotency {
+			contentDigest = publishContentDigest(data, opts)
+		}
 		if res, ok := b.getResultFromCache(ch, opts.IdempotencyKey); ok {
-			return PublishResult{StreamPosition: res, Suppressed: true, SuppressReason: SuppressReasonIdempotency}, nil
+			if opts.StrictIdempotency && len(res.Digest) > 0 && !bytes.Equal(res.Digest, contentDigest) {
+				return PublishResult{}, ErrIdempotencyConflict
+			}
+			return PublishResult{StreamPosition: res.Position, Suppressed: true, SuppressReason: SuppressReasonIdempotency}, nil
 		}
 	}
 
@@ -132,7 +140,7 @@ func (b *MemoryBroker) Publish(ch string, data []byte, opts PublishOptions) (Pub
 			if opts.IdempotentResultTTL != 0 {
 				resultExpireSeconds = int64(opts.IdempotentResultTTL.Seconds())
 			}
-			b.saveResultToCache(ch, opts.IdempotencyKey, streamTop, resultExpireSeconds)
+			b.saveResultToCache(ch, opts.IdempotencyKey, streamTop, contentDigest, resultExpireSeconds)
 		}
 		return PublishResult{StreamPosition: streamTop}, b.eventHandler.HandlePublication(ch, pub, streamTop, opts.UseDelta, prevPub)
 	}
@@ -142,27 +150,27 @@ func (b *MemoryBroker) Publish(ch string, data []byte, opts PublishOptions) (Pub
 		if opts.IdempotentResultTTL != 0 {
 			resultExpireSeconds = int64(opts.IdempotentResultTTL.Seconds())
 		}
-		b.saveResultToCache(ch, opts.IdempotencyKey, streamPosition, resultExpireSeconds)
+		b.saveResultToCache(ch, opts.IdempotencyKey, streamPosition, contentDigest, resultExpireSeconds)
 	}
 	return PublishResult{StreamPosition: streamPosition}, b.eventHandler.HandlePublication(ch, pub, StreamPosition{}, opts.UseDelta, prevPub)
 }
 
-func (b *MemoryBroker) getResultFromCache(ch string, key string) (StreamPosition, bool) {
+func (b *MemoryBroker) getResultFromCache(ch string, key string) (resultCacheEntry, bool) {
 	b.resultCacheMu.RLock()
 	defer b.resultCacheMu.RUnlock()
 	res, ok := b.resultCache[ch+"_"+key]
 	if !ok || res.ExpireAt <= time.Now().UnixMilli() {
-		return StreamPosition{}, false
+		return resultCacheEntry{}, false
 	}
-	return res.Position, true
+	return res, true
 }
 
-func (b *MemoryBroker) saveResultToCache(ch string, key string, sp StreamPosition, resultExpireSeconds int64) {
+func (b *MemoryBroker) saveResultToCache(ch string, key string, sp StreamPosition, digest []byte, resultExpireSeconds int64) {
 	b.resultCacheMu.Lock()
 	defer b.resultCacheMu.Unlock()
 	cacheKey := ch + "_" + key
 	expireAt := time.Now().UnixMilli() + resultExpireSeconds*1000
-	b.resultCache[cacheKey] = resultCacheEntry{Position: sp, ExpireAt: expireAt}
+	b.resultCache[cacheKey] = resultCacheEntry{Position: sp, Digest: digest, ExpireAt: expireAt}
 	heap.Push(&b.resultExpireQueue, &priority.Item{Value: cacheKey, Priority: expireAt})
 	if b.nextExpireCheck == 0 || b.nextExpireCheck > expireAt {
 		b.nextExpireCheck = expireAt

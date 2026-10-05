@@ -10,11 +10,18 @@ local new_epoch_if_empty = ARGV[6]
 local publish_command = ARGV[7]
 local result_key_expire = ARGV[8]
 local use_delta = ARGV[9]
+local content_digest = ARGV[10]
+local strict = ARGV[11]
 
 if result_key_expire ~= '' then
-    local cached_result = redis.call("hmget", result_key, "e", "s")
-    local result_epoch, result_offset = cached_result[1], cached_result[2]
+    local cached_result = redis.call("hmget", result_key, "e", "s", "d")
+    local result_epoch, result_offset, result_digest = cached_result[1], cached_result[2], cached_result[3]
     if result_epoch ~= false then
+        -- A missing remembered digest means the result predates strict mode;
+        -- treat it leniently so upgrades stay compatible.
+        if strict == "1" and result_digest ~= false and result_digest ~= content_digest then
+            return redis.error_reply("IDEMPOTENCY_CONFLICT")
+        end
         return { result_offset, result_epoch, "1" }
     end
 end
@@ -54,7 +61,8 @@ if channel ~= '' then
 end
 
 if result_key_expire ~= '' then
-    redis.call("hset", result_key, "e", current_epoch, "s", top_offset)
+    -- Result and digest are committed together in one hset.
+    redis.call("hset", result_key, "e", current_epoch, "s", top_offset, "d", content_digest)
     redis.call("expire", result_key, result_key_expire)
 end
 

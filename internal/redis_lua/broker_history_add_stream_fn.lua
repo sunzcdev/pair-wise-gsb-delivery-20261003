@@ -15,12 +15,17 @@ local function add_history(
     stream_key, meta_key, result_key,
     message_payload, stream_size, stream_ttl, channel, meta_expire,
     new_epoch_if_empty, publish_command, result_key_expire, use_delta,
-    version, version_epoch
+    version, version_epoch, content_digest, strict
 )
     if result_key_expire ~= '' then
-        local cached_result = redis.call("hmget", result_key, "e", "s")
-        local result_epoch, result_offset = cached_result[1], cached_result[2]
+        local cached_result = redis.call("hmget", result_key, "e", "s", "d")
+        local result_epoch, result_offset, result_digest = cached_result[1], cached_result[2], cached_result[3]
         if result_epoch ~= false then
+            -- A remembered digest absent (false) means the result predates
+            -- strict mode; treat it leniently so upgrades stay compatible.
+            if strict == "1" and result_digest ~= false and result_digest ~= content_digest then
+                return redis.error_reply("IDEMPOTENCY_CONFLICT")
+            end
             return { result_offset, result_epoch, "1", "0" }
         end
     end
@@ -103,8 +108,12 @@ local function add_history(
     -- the other way round, a failure between the two would leave a result
     -- claiming a publication nobody received, and a retry would be answered
     -- from it.
+    --
+    -- The digest is committed in the same hset as the result: a strict retry
+    -- must never see a result without the content it belongs to, or vice
+    -- versa.
     if result_key_expire ~= '' then
-        redis.call("hset", result_key, "e", current_epoch, "s", top_offset)
+        redis.call("hset", result_key, "e", current_epoch, "s", top_offset, "d", content_digest)
         redis.call("expire", result_key, result_key_expire)
     end
 
