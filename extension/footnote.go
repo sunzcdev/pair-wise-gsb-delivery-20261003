@@ -154,7 +154,12 @@ var (
 
 type defInfo struct {
 	index      int
-	references []int
+	references []referenceInfo
+}
+
+type referenceInfo struct {
+	refIndex       int
+	fromDefinition bool
 }
 
 // }}}
@@ -550,16 +555,23 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 			defsMap := map[string]*ast.FootnoteDefinition{}
 			infos := map[string]*defInfo{}
 			_ = gast.Walk(node, func(node gast.Node, entering bool) (gast.WalkStatus, error) {
-				if !entering {
-					return gast.WalkContinue, nil
-				}
-				if def, ok := node.(*ast.FootnoteDefinition); ok {
+				if def, ok := node.(*ast.FootnoteDefinition); ok && entering {
 					label := def.Label.Str(source)
 					defsMap[label] = def
 					if _, exists := infos[label]; !exists {
 						infos[label] = &defInfo{index: -1}
 					}
-					return gast.WalkSkipChildren, nil
+				}
+
+				if !entering {
+					return gast.WalkContinue, nil
+				}
+				inDefinition := false
+				for parent := node.Parent(); parent != nil; parent = parent.Parent() {
+					if _, ok := parent.(*ast.FootnoteDefinition); ok {
+						inDefinition = true
+						break
+					}
 				}
 				if ref, ok := node.(*ast.FootnoteReference); ok {
 					label := ref.Label.Str(source)
@@ -571,8 +583,12 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 					if info.index < 0 {
 						info.index = ref.Index
 					}
-					info.references = append(info.references, ref.RefIndex)
+					info.references = append(info.references, referenceInfo{
+						refIndex:       ref.RefIndex,
+						fromDefinition: inDefinition,
+					})
 				}
+
 				return gast.WalkContinue, nil
 			})
 			rc.Set(footnoteDefsKey, defsMap)
@@ -616,10 +632,17 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 		} else {
 			_, _ = bw.WriteString("<hr>\n")
 		}
-		_, _ = bw.WriteString("<ol>\n")
+		firstIndex := referenced[0].info.index
+		if firstIndex > 1 {
+			_, _ = bw.WriteString("<ol start=\"")
+			_, _ = bw.WriteString(strconv.Itoa(firstIndex))
+			_, _ = bw.WriteString("\">\n")
+		} else {
+			_, _ = bw.WriteString("<ol>\n")
+		}
 
-		for _, entry := range referenced {
-			d.renderDefinition(bw, source, entry.node, entry.info, rc)
+		for ordinal, entry := range referenced {
+			d.renderDefinition(bw, source, entry.node, entry.info, firstIndex+ordinal, rc)
 		}
 
 		_, _ = bw.WriteString("</ol>\n")
@@ -631,7 +654,7 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 
 func (d *footnoteDecorator) renderDefinition(
 	w util.BufWriter, source []byte, def *ast.FootnoteDefinition,
-	info *defInfo, rc renderer.Context,
+	info *defInfo, ordinal int, rc renderer.Context,
 ) {
 	is := strconv.Itoa(info.index)
 	_, _ = w.WriteString(`<li id="`)
@@ -642,6 +665,11 @@ func (d *footnoteDecorator) renderDefinition(
 	if def.Attributes() != nil {
 		html.RenderAttributes(w, source, def, html.ListItemAttributeFilter, rc)
 	}
+	if ordinal != info.index {
+		_, _ = w.WriteString(` value="`)
+		_, _ = w.WriteString(is)
+		_ = w.WriteByte('"')
+	}
 	_, _ = w.WriteString(">\n")
 
 	var lastPara gast.Node
@@ -651,35 +679,50 @@ func (d *footnoteDecorator) renderDefinition(
 
 	for child := def.FirstChild(); child != nil; child = child.NextSibling() {
 		if child == lastPara {
-			d.renderParagraphWithBacklinks(w, source, child, info, rc)
+			d.renderParagraphWithBacklinks(w, source, child, info, bodyReferences(info), rc)
 		} else {
 			_ = rc.Render(w, source, child)
 		}
 	}
 
-	if lastPara == nil && len(info.references) > 0 {
-		d.renderBacklinks(w, def, info)
+	if lastPara == nil {
+		if references := bodyReferences(info); len(references) > 0 {
+			d.renderBacklinks(w, def, info, references)
+		}
 	}
 
 	_, _ = w.WriteString("</li>\n")
 }
 
+func bodyReferences(info *defInfo) []referenceInfo {
+	references := make([]referenceInfo, 0, len(info.references))
+	for _, reference := range info.references {
+		if !reference.fromDefinition {
+			references = append(references, reference)
+		}
+	}
+	return references
+}
+
 func (d *footnoteDecorator) renderParagraphWithBacklinks(
 	w util.BufWriter, source []byte, para gast.Node,
-	info *defInfo, rc renderer.Context,
+	info *defInfo, references []referenceInfo, rc renderer.Context,
 ) {
 	_, _ = w.WriteString("<p>")
 	for child := para.FirstChild(); child != nil; child = child.NextSibling() {
 		_ = rc.Render(w, source, child)
 	}
-	d.renderBacklinks(w, para, info)
+	d.renderBacklinks(w, para, info, references)
 	_, _ = w.WriteString("</p>\n")
 }
 
-func (d *footnoteDecorator) renderBacklinks(w util.BufWriter, node gast.Node, info *defInfo) {
+func (d *footnoteDecorator) renderBacklinks(
+	w util.BufWriter, node gast.Node, info *defInfo, references []referenceInfo,
+) {
 	is := strconv.Itoa(info.index)
-	refCount := len(info.references)
-	for _, refIdx := range info.references {
+	refCount := len(references)
+	for _, reference := range references {
+		refIdx := reference.refIndex
 		_, _ = w.WriteString(`&#160;<a href="#`)
 		_, _ = w.Write(d.idPrefix(node))
 		_, _ = w.WriteString(`fnref`)

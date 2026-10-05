@@ -1,6 +1,8 @@
 package extension
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	gast "github.com/yuin/goldmark/v2/ast"
@@ -10,6 +12,32 @@ import (
 	"github.com/yuin/goldmark/v2/text"
 	"github.com/yuin/goldmark/v2/util"
 )
+
+func TestFootnoteDefinitionReferencesAnotherFootnote(t *testing.T) {
+	source := []byte("Text.[^outer]\n\n[^outer]: Outer [^inner].\n[^inner]: Inner.\n")
+	markdownParser := parser.New(parser.WithExtensions(NewFootnoteParser()))
+	renderer := html.New(html.WithUnsafe(), html.WithExtensions(NewFootnoteHTMLRenderer()))
+
+	var output bytes.Buffer
+	if err := renderer.Render(&output, source, markdownParser.Parse(source)); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := output.String()
+	for _, expected := range []string{
+		`<p>Outer <sup id="fnref:2"><a href="#fn:2" class="footnote-ref" role="doc-noteref">2</a></sup>.&#160;<a href="#fnref:1" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>`,
+		`<li id="fn:2">`,
+		`<p>Inner.</p>`,
+	} {
+		if !strings.Contains(rendered, expected) {
+			t.Fatalf("output %q does not contain %q", rendered, expected)
+		}
+	}
+	parts := strings.Split(rendered, `<li id="fn:`)
+	if len(parts) > 2 && strings.Contains(parts[2], `role="doc-backlink"`) {
+		t.Fatalf("definition-only footnote should not have a backlink: %q", rendered)
+	}
+}
 
 func TestFootnote(t *testing.T) {
 	markdown := testutil.NewMarkdownToStringFunc(
