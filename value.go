@@ -174,6 +174,7 @@ type Global struct {
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
 	gccount    int32
+	rand       *stateRandom
 }
 
 type LState struct {

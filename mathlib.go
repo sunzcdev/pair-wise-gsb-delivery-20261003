@@ -2,8 +2,107 @@ package lua
 
 import (
 	"math"
+	"math/bits"
 	"math/rand"
+	"sync"
 )
+
+const (
+	maxInt64RandomFloat = 9223372036854774784.0
+)
+
+type stateRandom struct {
+	mu     sync.Mutex
+	source rand.Source
+}
+
+func newStateRandom(source rand.Source) *stateRandom {
+	return &stateRandom{source: source}
+}
+
+func (r *stateRandom) seed(seed int64) {
+	r.mu.Lock()
+	r.source.Seed(seed)
+	r.mu.Unlock()
+}
+
+func (r *stateRandom) int63() int64 {
+	return r.source.Int63()
+}
+
+func (r *stateRandom) uint64() uint64 {
+	if source, ok := r.source.(rand.Source64); ok {
+		return source.Uint64()
+	}
+	return uint64(r.int63())>>31 | uint64(r.int63())<<32
+}
+
+func (r *stateRandom) int63n(n int64) int64 {
+	if n&(n-1) == 0 {
+		return r.int63() & (n - 1)
+	}
+	max := int64((1 << 63) - 1 - (1<<63)%uint64(n))
+	value := r.int63()
+	for value > max {
+		value = r.int63()
+	}
+	return value % n
+}
+
+func (r *stateRandom) uint64n(n uint64) uint64 {
+	if n <= math.MaxInt64 {
+		return uint64(r.int63n(int64(n)))
+	}
+	if n&(n-1) == 0 {
+		return r.uint64() & (n - 1)
+	}
+	hi, lo := bits.Mul64(r.uint64(), n)
+	if lo < n {
+		threshold := uint64(0) - n
+		threshold %= n
+		for lo < threshold {
+			hi, lo = bits.Mul64(r.uint64(), n)
+		}
+	}
+	return hi
+}
+
+func (r *stateRandom) float64() float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+again:
+	value := float64(r.int63()) / (1 << 63)
+	if value == 1 {
+		goto again
+	}
+	return value
+}
+
+func (r *stateRandom) interval(low, high int64) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if low == math.MinInt64 && high == math.MaxInt64 {
+		return int64(r.uint64())
+	}
+	span := uint64(high-low) + 1
+	return low + int64(r.uint64n(span))
+}
+
+func checkRandomInt(L *LState, n int) int64 {
+	value, ok := L.Get(n).(LNumber)
+	if !ok {
+		L.TypeError(n, LTNumber)
+		return 0
+	}
+	number := float64(value)
+	if math.IsNaN(number) || math.IsInf(number, 0) || number < float64(math.MinInt64) || number > maxInt64RandomFloat {
+		L.ArgError(n, "integer has no valid representation")
+		return 0
+	}
+	return int64(number)
+}
 
 func OpenMath(L *LState) int {
 	mod := L.RegisterModule(MathLibName, mathFuncs).(*LTable)
@@ -186,20 +285,28 @@ func mathRad(L *LState) int {
 func mathRandom(L *LState) int {
 	switch L.GetTop() {
 	case 0:
-		L.Push(LNumber(rand.Float64()))
+		L.Push(LNumber(L.G.rand.float64()))
 	case 1:
-		n := L.CheckInt(1)
-		L.Push(LNumber(rand.Intn(n) + 1))
+		n := checkRandomInt(L, 1)
+		if n < 1 {
+			L.ArgError(1, "interval is empty")
+			return 0
+		}
+		L.Push(LNumber(L.G.rand.interval(1, n)))
 	default:
-		min := L.CheckInt(1)
-		max := L.CheckInt(2) + 1
-		L.Push(LNumber(rand.Intn(max-min) + min))
+		min := checkRandomInt(L, 1)
+		max := checkRandomInt(L, 2)
+		if min > max {
+			L.ArgError(1, "interval is empty")
+			return 0
+		}
+		L.Push(LNumber(L.G.rand.interval(min, max)))
 	}
 	return 1
 }
 
 func mathRandomseed(L *LState) int {
-	rand.Seed(L.CheckInt64(1))
+	L.G.rand.seed(checkRandomInt(L, 1))
 	return 0
 }
 

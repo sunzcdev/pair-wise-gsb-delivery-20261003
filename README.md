@@ -213,6 +213,15 @@ An `LState` object that has been created by `*LState#NewThread()` inherits the c
 - **Options.IncludeGoStackTrace bool(default false)**
     - By default, GopherLua does not show Go stack traces when panics occur.
     - You can get Go stack traces by setting this to `true` .
+- **Options.RandomSource rand.Source(default nil)**
+    - Supplies the source used by `math.random` and `math.randomseed` for the state and all threads created from it.
+    - When nil, each top-level state gets its own private `math/rand` source. The process-wide `math/rand` source is neither read nor modified.
+    - Pass a deterministic `rand.Source` to replay a script across runs; the source is shared by coroutines of the same state.
+- **Options.RandomSeed *int64(default nil)**
+    - When non-nil, the configured source is seeded with this value while the state is created. A pointer allows seed `0` to be supplied explicitly.
+    - When nil, the default private source is seeded from the current time plus a process-wide counter, so independently created states do not normally share a sequence.
+
+For compatibility with earlier GopherLua releases, explicit seeds still use Go's `math/rand` value stream, so a state created with `RandomSeed: &seed` follows the same sequence as the old process-wide generator after `rand.Seed(seed)`. Unlike older releases, external calls to `math/rand.Seed` no longer affect Lua states, and `math.random` validates empty or out-of-range integer intervals as Lua errors instead of triggering a Go panic.
 
 ### API
 

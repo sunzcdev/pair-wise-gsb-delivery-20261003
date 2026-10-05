@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand"
 	"os"
 	"runtime"
 	"strings"
@@ -105,6 +106,12 @@ type Options struct {
 	// If `MinimizeStackMemory` is set, the call stack will be automatically grown or shrank up to a limit of
 	// `CallStackSize` in order to minimize memory usage. This does incur a slight performance penalty.
 	MinimizeStackMemory bool
+	// RandomSource supplies math.random and math.randomseed for this state's global. Threads created from
+	// the state share this source. A nil source creates an independently seeded math/rand source.
+	RandomSource rand.Source
+	// RandomSeed, when non-nil, is passed to RandomSource or the default source when the state is created.
+	// A nil value leaves the default source seeded from the current time plus a process-wide counter.
+	RandomSeed *int64
 }
 
 /* }}} */
@@ -536,13 +543,27 @@ func (rg *registry) IsFull() bool {
 
 /* Global {{{ */
 
-func newGlobal() *Global {
+var defaultRandomSeedCounter atomic.Int64
+
+func defaultStateRandomSeed() int64 {
+	return time.Now().UnixNano() + defaultRandomSeedCounter.Add(1)
+}
+
+func newGlobal(options Options) *Global {
+	randomSource := options.RandomSource
+	if randomSource == nil {
+		randomSource = rand.NewSource(defaultStateRandomSeed())
+	}
+	if options.RandomSeed != nil {
+		randomSource.Seed(*options.RandomSeed)
+	}
 	return &Global{
 		MainThread: nil,
 		Registry:   newLTable(0, 32),
 		Global:     newLTable(0, 64),
 		builtinMts: make(map[int]LValue),
 		tempFiles:  make([]*os.File, 0, 10),
+		rand:       newStateRandom(randomSource),
 	}
 }
 
@@ -564,7 +585,7 @@ func panicWithoutTraceback(L *LState) {
 func newLState(options Options) *LState {
 	al := newAllocator(32)
 	ls := &LState{
-		G:       newGlobal(),
+		G:       newGlobal(options),
 		Parent:  nil,
 		Panic:   panicWithTraceback,
 		Dead:    false,
