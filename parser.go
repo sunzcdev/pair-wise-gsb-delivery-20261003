@@ -10,6 +10,7 @@ type yySymType struct {
 	value    any
 	token    string
 	operator Operator
+	pos      srcRange
 }
 
 const tokAltOp = 57346
@@ -523,6 +524,9 @@ func yylex1(lex yyLexer, lval *yySymType) (char, token int) {
 		token = int(yyTok1[0])
 		goto out
 	}
+	if l, ok := lex.(*lexer); ok {
+		lval.pos.start, lval.pos.end = l.pos()
+	}
 	if char < len(yyTok1) {
 		token = int(yyTok1[char])
 		goto out
@@ -793,12 +797,14 @@ yydefault:
 	case 14:
 		yyDollar = yyS[yypt-5 : yypt+1]
 		{
-			yyVAL.value = &FuncDef{Name: yyDollar[2].token, Body: yyDollar[4].value.(*Query)}
+			fd := &FuncDef{Name: yyDollar[2].token, Body: yyDollar[4].value.(*Query)}
+			yyVAL.value = yylex.(*lexer).funcDefPos(fd, yyDollar[1].pos.start, yyDollar[5].pos.end)
 		}
 	case 15:
 		yyDollar = yyS[yypt-8 : yypt+1]
 		{
-			yyVAL.value = &FuncDef{yyDollar[2].token, yyDollar[4].value.([]string), yyDollar[7].value.(*Query)}
+			fd := &FuncDef{Name: yyDollar[2].token, Args: yyDollar[4].value.([]string), Body: yyDollar[7].value.(*Query)}
+			yyVAL.value = yylex.(*lexer).funcDefPos(fd, yyDollar[1].pos.start, yyDollar[8].pos.end)
 		}
 	case 16:
 		yyDollar = yyS[yypt-1 : yypt+1]
@@ -960,177 +966,226 @@ yydefault:
 	case 50:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeIdentity}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeIdentity}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 51:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeRecurse}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeRecurse}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 52:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeIndex, Index: &Index{Name: yyDollar[1].token}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeIndex, Index: &Index{Name: yyDollar[1].token}}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 53:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			suffix := yyDollar[2].value.(*Suffix)
+			l := yylex.(*lexer)
+			sv := yyDollar[2].value.(suffixValue)
+			suffix := sv.suffix
 			if suffix.Iter {
-				yyVAL.value = &Term{Type: TermTypeIdentity, SuffixList: []*Suffix{suffix}}
+				yyVAL.value = l.termPos(&Term{Type: TermTypeIdentity, SuffixList: []*Suffix{suffix}}, yyDollar[1].pos.start, sv.rng.end)
 			} else {
-				yyVAL.value = &Term{Type: TermTypeIndex, Index: suffix.Index}
+				yyVAL.value = l.termPos(&Term{Type: TermTypeIndex, Index: suffix.Index}, yyDollar[1].pos.start, sv.rng.end)
 			}
 		}
 	case 54:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeIndex, Index: &Index{Str: yyDollar[2].value.(*String)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeIndex, Index: &Index{Str: yyDollar[2].value.(*String)}}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 55:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeNull}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeNull}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 56:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeTrue}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeTrue}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 57:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFalse}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFalse}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 58:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 59:
 		yyDollar = yyS[yypt-4 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token, Args: yyDollar[3].value.([]*Query)}}
+			fn := &Func{Name: yyDollar[1].token, Args: yyDollar[3].value.([]*Query)}
+			l := yylex.(*lexer)
+			l.funcPos(fn, yyDollar[1].pos.start, yyDollar[4].pos.end)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFunc, Func: fn}, yyDollar[1].pos.start, yyDollar[4].pos.end)
 		}
 	case 60:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 61:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeObject, Object: &Object{}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeObject, Object: &Object{}}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 62:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeObject, Object: &Object{yyDollar[2].value.([]*ObjectKeyVal)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeObject, Object: &Object{yyDollar[2].value.([]*ObjectKeyVal)}}, yyDollar[1].pos.start, yyDollar[3].pos.end)
 		}
 	case 63:
 		yyDollar = yyS[yypt-4 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeObject, Object: &Object{yyDollar[2].value.([]*ObjectKeyVal)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeObject, Object: &Object{yyDollar[2].value.([]*ObjectKeyVal)}}, yyDollar[1].pos.start, yyDollar[4].pos.end)
 		}
 	case 64:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeArray, Array: &Array{}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeArray, Array: &Array{}}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 65:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeArray, Array: &Array{yyDollar[2].value.(*Query)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeArray, Array: &Array{yyDollar[2].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[3].pos.end)
 		}
 	case 66:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeNumber, Number: yyDollar[1].token}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeNumber, Number: yyDollar[1].token}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 67:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeUnary, Unary: &Unary{OpAdd, yyDollar[2].value.(*Term)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeUnary, Unary: &Unary{OpAdd, yyDollar[2].value.(*Term)}}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 68:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeUnary, Unary: &Unary{OpSub, yyDollar[2].value.(*Term)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeUnary, Unary: &Unary{OpSub, yyDollar[2].value.(*Term)}}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 69:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFormat, Format: yyDollar[1].token}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFormat, Format: yyDollar[1].token}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 70:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFormat, Format: yyDollar[1].token, Str: yyDollar[2].value.(*String)}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeFormat, Format: yyDollar[1].token, Str: yyDollar[2].value.(*String)}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 71:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeString, Str: yyDollar[1].value.(*String)}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeString, Str: yyDollar[1].value.(*String)}, yyDollar[1].pos.start, yyDollar[1].pos.end)
 		}
 	case 72:
 		yyDollar = yyS[yypt-7 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeIf, If: &If{yyDollar[2].value.(*Query), yyDollar[4].value.(*Query), yyDollar[5].value.([]*IfElif), yyDollar[6].value.(*Query)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeIf, If: &If{yyDollar[2].value.(*Query), yyDollar[4].value.(*Query), yyDollar[5].value.([]*IfElif), yyDollar[6].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[7].pos.end)
 		}
 	case 73:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeTry, Try: &Try{yyDollar[2].value.(*Query), yyDollar[3].value.(*Query)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeTry, Try: &Try{yyDollar[2].value.(*Query), yyDollar[3].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[3].pos.end)
 		}
 	case 74:
 		yyDollar = yyS[yypt-9 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeReduce, Reduce: &Reduce{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeReduce, Reduce: &Reduce{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[9].pos.end)
 		}
 	case 75:
 		yyDollar = yyS[yypt-9 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeForeach, Foreach: &Foreach{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query), nil}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeForeach, Foreach: &Foreach{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query), nil}}, yyDollar[1].pos.start, yyDollar[9].pos.end)
 		}
 	case 76:
 		yyDollar = yyS[yypt-11 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeForeach, Foreach: &Foreach{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query), yyDollar[10].value.(*Query)}}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeForeach, Foreach: &Foreach{yyDollar[2].value.(*Query), yyDollar[4].value.(*Pattern), yyDollar[6].value.(*Query), yyDollar[8].value.(*Query), yyDollar[10].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[11].pos.end)
 		}
 	case 77:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeBreak, Break: yyDollar[2].token}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeBreak, Break: yyDollar[2].token}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 78:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeQuery, Query: yyDollar[2].value.(*Query)}
+			l := yylex.(*lexer)
+			yyVAL.value = l.termPos(&Term{Type: TermTypeQuery, Query: yyDollar[2].value.(*Query)}, yyDollar[1].pos.start, yyDollar[3].pos.end)
 		}
 	case 79:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyDollar[1].value.(*Term).SuffixList = append(yyDollar[1].value.(*Term).SuffixList, &Suffix{Index: &Index{Name: yyDollar[2].token}})
+			l := yylex.(*lexer)
+			t := yyDollar[1].value.(*Term)
+			t.SuffixList = append(t.SuffixList, &Suffix{Index: &Index{Name: yyDollar[2].token}})
+			yyVAL.value = l.extendTerm(t, yyDollar[2].pos.end)
 		}
 	case 80:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyDollar[1].value.(*Term).SuffixList = append(yyDollar[1].value.(*Term).SuffixList, yyDollar[2].value.(*Suffix))
+			l := yylex.(*lexer)
+			t := yyDollar[1].value.(*Term)
+			sv := yyDollar[2].value.(suffixValue)
+			t.SuffixList = append(t.SuffixList, sv.suffix)
+			yyVAL.value = l.extendTerm(t, sv.rng.end)
 		}
 	case 81:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyDollar[1].value.(*Term).SuffixList = append(yyDollar[1].value.(*Term).SuffixList, &Suffix{Optional: true})
+			l := yylex.(*lexer)
+			t := yyDollar[1].value.(*Term)
+			t.SuffixList = append(t.SuffixList, &Suffix{Optional: true})
+			yyVAL.value = l.extendTerm(t, yyDollar[2].pos.end)
 		}
 	case 82:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyDollar[1].value.(*Term).SuffixList = append(yyDollar[1].value.(*Term).SuffixList, yyDollar[3].value.(*Suffix))
+			l := yylex.(*lexer)
+			t := yyDollar[1].value.(*Term)
+			sv := yyDollar[3].value.(suffixValue)
+			t.SuffixList = append(t.SuffixList, sv.suffix)
+			yyVAL.value = l.extendTerm(t, sv.rng.end)
 		}
 	case 83:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyDollar[1].value.(*Term).SuffixList = append(yyDollar[1].value.(*Term).SuffixList, &Suffix{Index: &Index{Str: yyDollar[3].value.(*String)}})
+			l := yylex.(*lexer)
+			t := yyDollar[1].value.(*Term)
+			t.SuffixList = append(t.SuffixList, &Suffix{Index: &Index{Str: yyDollar[3].value.(*String)}})
+			yyVAL.value = l.extendTerm(t, yyDollar[3].pos.end)
 		}
 	case 84:
 		yyDollar = yyS[yypt-1 : yypt+1]
@@ -1161,27 +1216,27 @@ yydefault:
 	case 93:
 		yyDollar = yyS[yypt-2 : yypt+1]
 		{
-			yyVAL.value = &Suffix{Iter: true}
+			yyVAL.value = yylex.(*lexer).suffixValue(&Suffix{Iter: true}, yyDollar[1].pos.start, yyDollar[2].pos.end)
 		}
 	case 94:
 		yyDollar = yyS[yypt-3 : yypt+1]
 		{
-			yyVAL.value = &Suffix{Index: &Index{Start: yyDollar[2].value.(*Query)}}
+			yyVAL.value = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: yyDollar[2].value.(*Query)}}, yyDollar[1].pos.start, yyDollar[3].pos.end)
 		}
 	case 95:
 		yyDollar = yyS[yypt-4 : yypt+1]
 		{
-			yyVAL.value = &Suffix{Index: &Index{Start: yyDollar[2].value.(*Query), IsSlice: true}}
+			yyVAL.value = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: yyDollar[2].value.(*Query), IsSlice: true}}, yyDollar[1].pos.start, yyDollar[4].pos.end)
 		}
 	case 96:
 		yyDollar = yyS[yypt-4 : yypt+1]
 		{
-			yyVAL.value = &Suffix{Index: &Index{End: yyDollar[3].value.(*Query), IsSlice: true}}
+			yyVAL.value = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{End: yyDollar[3].value.(*Query), IsSlice: true}}, yyDollar[1].pos.start, yyDollar[4].pos.end)
 		}
 	case 97:
 		yyDollar = yyS[yypt-5 : yypt+1]
 		{
-			yyVAL.value = &Suffix{Index: &Index{Start: yyDollar[2].value.(*Query), End: yyDollar[4].value.(*Query), IsSlice: true}}
+			yyVAL.value = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: yyDollar[2].value.(*Query), End: yyDollar[4].value.(*Query), IsSlice: true}}, yyDollar[1].pos.start, yyDollar[5].pos.end)
 		}
 	case 98:
 		yyDollar = yyS[yypt-1 : yypt+1]

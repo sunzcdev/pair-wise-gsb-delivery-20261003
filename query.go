@@ -17,8 +17,10 @@ func Parse(src string) (*Query, error) {
 	if yyParse(l) > 0 {
 		return nil, l.err
 	}
+	l.attachPositions(l.result)
 	return l.result, nil
 }
+
 
 // Query represents the abstract syntax tree of a jq query.
 type Query struct {

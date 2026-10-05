@@ -11,6 +11,33 @@ type ValueError interface {
 	Value() any
 }
 
+// stackError wraps a runtime error with structured stack frames.
+// Its Error method deliberately keeps the concise, original error message;
+// the frames are only reachable through [StackTracer] via errors.As.
+type stackError struct {
+	err    error
+	frames []StackFrame
+}
+
+func (err *stackError) Error() string {
+	return err.err.Error()
+}
+
+func (err *stackError) Unwrap() error {
+	return err.err
+}
+
+func (err *stackError) Value() any {
+	if e, ok := err.err.(ValueError); ok {
+		return e.Value()
+	}
+	return nil
+}
+
+func (err *stackError) StackTrace() []StackFrame {
+	return err.frames
+}
+
 type expectedObjectError struct {
 	v any
 }

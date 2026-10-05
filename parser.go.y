@@ -8,6 +8,7 @@ import "slices"
   value    any
   token    string
   operator Operator
+  pos      srcRange
 }
 
 %type<value> program header imports import meta body funcdefs funcdef funcargs query
@@ -109,11 +110,11 @@ funcdefs
 funcdef
     : tokDef tokIdent ':' query ';'
     {
-        $$ = &FuncDef{Name: $2, Body: $4.(*Query)}
+        $$ = yylex.(*lexer).funcDefPos(&FuncDef{Name: $2, Body: $4.(*Query)}, $1pos(), $5pos())
     }
     | tokDef tokIdent '(' funcargs ')' ':' query ';'
     {
-        $$ = &FuncDef{$2, $4.([]string), $7.(*Query)}
+        $$ = yylex.(*lexer).funcDefPos(&FuncDef{$2, $4.([]string), $7.(*Query)}, $1pos(), $8pos())
     }
 
 funcargs
@@ -266,144 +267,193 @@ objectpattern
 term
     : '.'
     {
-        $$ = &Term{Type: TermTypeIdentity}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeIdentity}, $1pos(), $1posend())
     }
     | tokRecurse
     {
-        $$ = &Term{Type: TermTypeRecurse}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeRecurse}, $1pos(), $1posend())
     }
     | tokIndex
     {
-        $$ = &Term{Type: TermTypeIndex, Index: &Index{Name: $1}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeIndex, Index: &Index{Name: $1}}, $1pos(), $1posend())
     }
     | '.' suffix
     {
-        suffix := $2.(*Suffix)
+        l := yylex.(*lexer)
+        sv := $2.(suffixValue)
+        suffix := sv.suffix
         if suffix.Iter {
-            $$ = &Term{Type: TermTypeIdentity, SuffixList: []*Suffix{suffix}}
+            $$ = l.termPos(&Term{Type: TermTypeIdentity, SuffixList: []*Suffix{suffix}}, $1pos(), sv.rng.end)
         } else {
-            $$ = &Term{Type: TermTypeIndex, Index: suffix.Index}
+            $$ = l.termPos(&Term{Type: TermTypeIndex, Index: suffix.Index}, $1pos(), sv.rng.end)
         }
     }
     | '.' string
     {
-        $$ = &Term{Type: TermTypeIndex, Index: &Index{Str: $2.(*String)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeIndex, Index: &Index{Str: $2.(*String)}}, $1pos(), $2posend())
     }
     | tokNull
     {
-        $$ = &Term{Type: TermTypeNull}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeNull}, $1pos(), $1posend())
     }
     | tokTrue
     {
-        $$ = &Term{Type: TermTypeTrue}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeTrue}, $1pos(), $1posend())
     }
     | tokFalse
     {
-        $$ = &Term{Type: TermTypeFalse}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeFalse}, $1pos(), $1posend())
     }
     | tokIdentModuleIdent
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeFunc, Func: &Func{Name: $1}}, $1pos(), $1posend())
     }
     | tokIdentModuleIdent '(' args ')'
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1, Args: $3.([]*Query)}}
+        l := yylex.(*lexer)
+        fn := &Func{Name: $1, Args: $3.([]*Query)}
+        l.funcPos(fn, $1pos(), $4pos())
+        $$ = l.termPos(&Term{Type: TermTypeFunc, Func: fn}, $1pos(), $4pos())
     }
     | tokVariableModuleVariable
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeFunc, Func: &Func{Name: $1}}, $1pos(), $1posend())
     }
     | '{' '}'
     {
-        $$ = &Term{Type: TermTypeObject, Object: &Object{}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeObject, Object: &Object{}}, $1pos(), $2pos())
     }
     | '{' objectkeyvals '}'
     {
-        $$ = &Term{Type: TermTypeObject, Object: &Object{$2.([]*ObjectKeyVal)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeObject, Object: &Object{$2.([]*ObjectKeyVal)}}, $1pos(), $3pos())
     }
     | '{' objectkeyvals ',' '}'
     {
-        $$ = &Term{Type: TermTypeObject, Object: &Object{$2.([]*ObjectKeyVal)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeObject, Object: &Object{$2.([]*ObjectKeyVal)}}, $1pos(), $4pos())
     }
     | '[' ']'
     {
-        $$ = &Term{Type: TermTypeArray, Array: &Array{}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeArray, Array: &Array{}}, $1pos(), $2pos())
     }
     | '[' query ']'
     {
-        $$ = &Term{Type: TermTypeArray, Array: &Array{$2.(*Query)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeArray, Array: &Array{$2.(*Query)}}, $1pos(), $3pos())
     }
     | tokNumber
     {
-        $$ = &Term{Type: TermTypeNumber, Number: $1}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeNumber, Number: $1}, $1pos(), $1posend())
     }
     | '+' term
     {
-        $$ = &Term{Type: TermTypeUnary, Unary: &Unary{OpAdd, $2.(*Term)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeUnary, Unary: &Unary{OpAdd, $2.(*Term)}}, $1pos(), $2posend())
     }
     | '-' term
     {
-        $$ = &Term{Type: TermTypeUnary, Unary: &Unary{OpSub, $2.(*Term)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeUnary, Unary: &Unary{OpSub, $2.(*Term)}}, $1pos(), $2posend())
     }
     | tokFormat
     {
-        $$ = &Term{Type: TermTypeFormat, Format: $1}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeFormat, Format: $1}, $1pos(), $1posend())
     }
     | tokFormat string
     {
-        $$ = &Term{Type: TermTypeFormat, Format: $1, Str: $2.(*String)}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeFormat, Format: $1, Str: $2.(*String)}, $1pos(), $2posend())
     }
     | string
     {
-        $$ = &Term{Type: TermTypeString, Str: $1.(*String)}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeString, Str: $1.(*String)}, $1pos(), $1posend())
     }
     | tokIf query tokThen query ifelifs ifelse tokEnd
     {
-        $$ = &Term{Type: TermTypeIf, If: &If{$2.(*Query), $4.(*Query), $5.([]*IfElif), $6.(*Query)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeIf, If: &If{$2.(*Query), $4.(*Query), $5.([]*IfElif), $6.(*Query)}}, $1pos(), $7pos())
     }
     | tokTry expr trycatch
     {
-        $$ = &Term{Type: TermTypeTry, Try: &Try{$2.(*Query), $3.(*Query)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeTry, Try: &Try{$2.(*Query), $3.(*Query)}}, $1pos(), $3posend())
     }
     | tokReduce expr tokAs pattern '(' query ';' query ')'
     {
-        $$ = &Term{Type: TermTypeReduce, Reduce: &Reduce{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeReduce, Reduce: &Reduce{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query)}}, $1pos(), $9pos())
     }
     | tokForeach expr tokAs pattern '(' query ';' query ')'
     {
-        $$ = &Term{Type: TermTypeForeach, Foreach: &Foreach{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query), nil}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeForeach, Foreach: &Foreach{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query), nil}}, $1pos(), $9pos())
     }
     | tokForeach expr tokAs pattern '(' query ';' query ';' query ')'
     {
-        $$ = &Term{Type: TermTypeForeach, Foreach: &Foreach{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query), $10.(*Query)}}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeForeach, Foreach: &Foreach{$2.(*Query), $4.(*Pattern), $6.(*Query), $8.(*Query), $10.(*Query)}}, $1pos(), $11pos())
     }
     | tokBreak tokVariable
     {
-        $$ = &Term{Type: TermTypeBreak, Break: $2}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeBreak, Break: $2}, $1pos(), $2posend())
     }
     | '(' query ')'
     {
-        $$ = &Term{Type: TermTypeQuery, Query: $2.(*Query)}
+        l := yylex.(*lexer)
+        $$ = l.termPos(&Term{Type: TermTypeQuery, Query: $2.(*Query)}, $1pos(), $3pos())
     }
     | term tokIndex
     {
-        $1.(*Term).SuffixList = append($1.(*Term).SuffixList, &Suffix{Index: &Index{Name: $2}})
+        l := yylex.(*lexer)
+        t := $1.(*Term)
+        t.SuffixList = append(t.SuffixList, &Suffix{Index: &Index{Name: $2}})
+        $$ = l.extendTerm(t, $2posend())
     }
     | term suffix
     {
-        $1.(*Term).SuffixList = append($1.(*Term).SuffixList, $2.(*Suffix))
+        l := yylex.(*lexer)
+        t := $1.(*Term)
+        sv := $2.(suffixValue)
+        t.SuffixList = append(t.SuffixList, sv.suffix)
+        $$ = l.extendTerm(t, sv.rng.end)
     }
     | term '?'
     {
-        $1.(*Term).SuffixList = append($1.(*Term).SuffixList, &Suffix{Optional: true})
+        l := yylex.(*lexer)
+        t := $1.(*Term)
+        t.SuffixList = append(t.SuffixList, &Suffix{Optional: true})
+        $$ = l.extendTerm(t, $2pos())
     }
     | term '.' suffix
     {
-        $1.(*Term).SuffixList = append($1.(*Term).SuffixList, $3.(*Suffix))
+        l := yylex.(*lexer)
+        t := $1.(*Term)
+        sv := $3.(suffixValue)
+        t.SuffixList = append(t.SuffixList, sv.suffix)
+        $$ = l.extendTerm(t, sv.rng.end)
     }
     | term '.' string
     {
-        $1.(*Term).SuffixList = append($1.(*Term).SuffixList, &Suffix{Index: &Index{Str: $3.(*String)}})
+        l := yylex.(*lexer)
+        t := $1.(*Term)
+        t.SuffixList = append(t.SuffixList, &Suffix{Index: &Index{Str: $3.(*String)}})
+        $$ = l.extendTerm(t, $3posend())
     }
 
 string
@@ -442,23 +492,23 @@ tokVariableModuleVariable
 suffix
     : '[' ']'
     {
-        $$ = &Suffix{Iter: true}
+        $$ = yylex.(*lexer).suffixValue(&Suffix{Iter: true}, $1pos(), $2pos())
     }
     | '[' query ']'
     {
-        $$ = &Suffix{Index: &Index{Start: $2.(*Query)}}
+        $$ = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: $2.(*Query)}}, $1pos(), $3pos())
     }
     | '[' query ':' ']'
     {
-        $$ = &Suffix{Index: &Index{Start: $2.(*Query), IsSlice: true}}
+        $$ = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: $2.(*Query), IsSlice: true}}, $1pos(), $4pos())
     }
     | '[' ':' query ']'
     {
-        $$ = &Suffix{Index: &Index{End: $3.(*Query), IsSlice: true}}
+        $$ = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{End: $3.(*Query), IsSlice: true}}, $1pos(), $4pos())
     }
     | '[' query ':' query ']'
     {
-        $$ = &Suffix{Index: &Index{Start: $2.(*Query), End: $4.(*Query), IsSlice: true}}
+        $$ = yylex.(*lexer).suffixValue(&Suffix{Index: &Index{Start: $2.(*Query), End: $4.(*Query), IsSlice: true}}, $1pos(), $5pos())
     }
 
 args

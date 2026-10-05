@@ -8,15 +8,84 @@ import (
 type lexer struct {
 	source    string
 	offset    int
+	start     int // start offset of the current token
 	result    *Query
 	token     string
 	tokenType int
 	inString  bool
 	err       error
+	positions *queryPositions
 }
 
 func newLexer(src string) *lexer {
 	return &lexer{source: src}
+}
+
+// pos returns the half-open byte range [start, end) of the last scanned
+// token in the source.
+func (l *lexer) pos() (start, end int) {
+	return l.start, l.offset
+}
+
+// attachPositions owns the source ranges collected while parsing by the
+// parsed root query.
+func (l *lexer) attachPositions(q *Query) {
+	if l.positions != nil {
+		positionsByQuery.Put(q, l.positions)
+	}
+}
+
+func (l *lexer) termPos(t *Term, start, end int) *Term {
+	l.ensurePositions()
+	l.positions.terms[t] = srcRange{start, end}
+	return t
+}
+
+// extendTerm widens the recorded range of an existing term to end.
+func (l *lexer) extendTerm(t *Term, end int) *Term {
+	if l.positions == nil {
+		return t
+	}
+	r := l.positions.terms[t]
+	r.end = end
+	l.positions.terms[t] = r
+	return t
+}
+
+func (l *lexer) ensurePositions() {
+	if l.positions == nil {
+		l.positions = &queryPositions{
+			terms:    map[*Term]srcRange{},
+			funcs:    map[*Func]srcRange{},
+			funcdefs: map[*FuncDef]srcRange{},
+		}
+	}
+}
+
+func (l *lexer) funcPos(f *Func, start, end int) *Func {
+	l.ensurePositions()
+	if l.positions != nil {
+		l.positions.funcs[f] = srcRange{start, end}
+	}
+	return f
+}
+
+func (l *lexer) funcDefPos(fd *FuncDef, start, end int) *FuncDef {
+	l.ensurePositions()
+	l.positions.funcdefs[fd] = srcRange{start, end}
+	return fd
+}
+
+// suffixValue pairs a suffix with its parsed source range. The range is not
+// stored on [Suffix] itself; it is consumed while building the enclosing
+// term.
+type suffixValue struct {
+	suffix *Suffix
+	rng    srcRange
+}
+
+func (l *lexer) suffixValue(s *Suffix, start, end int) suffixValue {
+	return suffixValue{s, srcRange{start, end}}
 }
 
 const eof = -1
@@ -51,6 +120,7 @@ func (l *lexer) Lex(lval *yySymType) (tokenType int) {
 		l.token = ""
 		return eof
 	}
+	l.start = l.offset
 	if l.inString {
 		tok, str := l.scanString(l.offset)
 		lval.token = str
@@ -59,6 +129,7 @@ func (l *lexer) Lex(lval *yySymType) (tokenType int) {
 	ch, iseof := l.next()
 	if iseof {
 		l.token = ""
+		l.start = l.offset
 		return eof
 	}
 	switch {
