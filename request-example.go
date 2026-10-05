@@ -639,6 +639,15 @@ func (f *memFile) Truncate(size int64) error {
 	return nil
 }
 
+// Sync is a no-op for the in-memory backend, whose contents are never
+// buffered by the process.
+func (f *memFile) Sync() error {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	return f.err
+}
+
 func (f *memFile) TransferError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

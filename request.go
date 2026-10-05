@@ -426,6 +426,30 @@ func fileput(h FileWriter, r *Request, pkt requestPacket, alloc *allocator, orde
 	return statusFromError(pkt.id(), err)
 }
 
+// filefsync handles an fsync@openssh.com request against an open handle.
+// Backends that cannot synchronize to stable storage receive
+// SSH_FX_OP_UNSUPPORTED; errors from the backend Sync call are reported
+// separately so callers can tell them apart.
+func filefsync(r *Request, pkt requestPacket) responsePacket {
+	rd, wr, rw := r.getAllReaderWriters()
+
+	var s syncer
+	switch {
+	case rw != nil:
+		s, _ = rw.(syncer)
+	case wr != nil:
+		s, _ = wr.(syncer)
+	default:
+		s, _ = rd.(syncer)
+	}
+
+	if s == nil {
+		return statusFromError(pkt.id(), ErrSSHFxOpUnsupported)
+	}
+
+	return statusFromError(pkt.id(), s.Sync())
+}
+
 // wrap OpenFileWriter handler
 func fileputget(h FileWriter, r *Request, pkt requestPacket, alloc *allocator, orderID uint32, maxTxPacket uint32) responsePacket {
 	rw := r.getWriterAtReaderAt()

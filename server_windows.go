@@ -157,6 +157,9 @@ func (s *Server) openfile(path string, flag int, mode fs.FileMode) (file, error)
 	if path == `\\.\` && s.winRoot {
 		return newWinRoot()
 	}
+	if s.openFileFn != nil {
+		return s.openFileFn(path, flag, mode)
+	}
 	return os.OpenFile(path, flag, mode)
 }
 

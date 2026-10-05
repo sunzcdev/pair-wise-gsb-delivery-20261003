@@ -34,6 +34,14 @@ type file interface {
 	Close() error
 }
 
+// syncer is an optional interface implemented by file backends that can
+// flush their buffered data to stable storage. It backs the
+// fsync@openssh.com extended request; backends that do not implement it
+// report SSH_FX_OP_UNSUPPORTED.
+type syncer interface {
+	Sync() error
+}
+
 // Server is an SSH File Transfer Protocol (sftp) server.
 // This is intended to provide the sftp subsystem to an ssh server daemon.
 // This implementation currently supports most of sftp server protocol version 3,
@@ -49,6 +57,9 @@ type Server struct {
 	workDir       string
 	winRoot       bool
 	maxTxPacket   uint32
+	// openFileFn, when set, overrides the platform openfile implementation.
+	// It is used by tests to install controllable backends.
+	openFileFn func(name string, flag int, perm fs.FileMode) (file, error)
 }
 
 func (svr *Server) nextHandle(f file) string {
@@ -209,6 +220,13 @@ func (svr *Server) sftpServerWorker(pktChan chan orderedRequest) error {
 			continue
 		}
 
+		if fpkt := fsyncPacket(pkt.requestPacket); fpkt != nil && fpkt.wait != nil {
+			fpkt.wait()
+		}
+		if cpkt, ok := pkt.requestPacket.(*sshFxpClosePacket); ok && cpkt.wait != nil {
+			cpkt.wait()
+		}
+
 		if err := handlePacket(svr, pkt); err != nil {
 			return err
 		}
@@ -341,6 +359,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 				// do not use data[:n:n] here to clamp the capacity, we allocated extra capacity above to avoid reallocations
 			}
 		}
+		if p.complete != nil {
+			p.complete()
+		}
 		if err != nil {
 			rpkt = statusFromError(p.ID, err)
 		}
@@ -350,6 +371,9 @@ func handlePacket(s *Server, p orderedRequest) error {
 		var err error = EBADF
 		if ok {
 			_, err = f.WriteAt(p.Data, int64(p.Offset))
+		}
+		if p.complete != nil {
+			p.complete()
 		}
 		rpkt = statusFromError(p.ID, err)
 	case *sshFxpExtendedPacket:

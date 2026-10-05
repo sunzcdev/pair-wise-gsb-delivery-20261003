@@ -1831,8 +1831,9 @@ func TestClientSyncGo(t *testing.T) {
 	}
 	err := testClientSync(t)
 
-	// Since Server does not support the fsync extension, we can only
-	// check that we get the right error.
+	// The system sftp-server (Go implementation variant) is not expected
+	// to negotiate the fsync extension; check that the error is reported
+	// correctly.
 	require.Error(t, err)
 
 	switch err := err.(type) {

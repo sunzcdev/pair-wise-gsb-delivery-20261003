@@ -88,6 +88,7 @@ var (
 	supportedSFTPExtensions = []sshExtensionPair{
 		{"hardlink@openssh.com", "1"},
 		{"posix-rename@openssh.com", "1"},
+		{"fsync@openssh.com", "1"},
 		{"statvfs@openssh.com", "2"},
 	}
 	sftpExtensions = supportedSFTPExtensions

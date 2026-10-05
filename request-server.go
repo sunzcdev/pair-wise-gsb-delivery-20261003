@@ -222,10 +222,24 @@ func (rs *RequestServer) Serve() error {
 func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedRequest) error {
 	for pkt := range pktChan {
 		orderID := pkt.orderID()
+		var completeIO func()
 		if epkt, ok := pkt.requestPacket.(*sshFxpExtendedPacket); ok {
 			if epkt.SpecificPacket != nil {
 				pkt.requestPacket = epkt.SpecificPacket
 			}
+		}
+
+		if fpkt := fsyncPacket(pkt.requestPacket); fpkt != nil && fpkt.wait != nil {
+			fpkt.wait()
+		}
+		if cpkt, ok := pkt.requestPacket.(*sshFxpClosePacket); ok && cpkt.wait != nil {
+			cpkt.wait()
+		}
+		switch rpkt := pkt.requestPacket.(type) {
+		case *sshFxpReadPacket:
+			completeIO = rpkt.complete
+		case *sshFxpWritePacket:
+			completeIO = rpkt.complete
 		}
 
 		var rpkt responsePacket
@@ -305,6 +319,14 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpExtendedPacketFsync:
+			handle := pkt.getHandle()
+			request, ok := rs.getRequest(handle)
+			if !ok {
+				rpkt = statusFromError(pkt.ID, EBADF)
+			} else {
+				rpkt = filefsync(request, pkt)
+			}
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)
@@ -319,6 +341,10 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 			request.close()
 		default:
 			rpkt = statusFromError(pkt.id(), ErrSSHFxOpUnsupported)
+		}
+
+		if completeIO != nil {
+			completeIO()
 		}
 
 		rs.pktMgr.readyPacket(

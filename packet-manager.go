@@ -18,6 +18,13 @@ type packetManager struct {
 	sender      packetSender // connection object
 	working     *sync.WaitGroup
 	packetCount uint32
+	// pendingIO tracks read and write requests that are still executing,
+	// keyed by order ID. Each entry records the file handle the request
+	// targets and whether it is a write: fsync barriers only wait on prior
+	// writes to the same handle, while close waits on all prior requests to
+	// the same handle. Closing done unblocks anything waiting on it.
+	pendingWritesMu sync.Mutex
+	pendingIO       map[uint32]pendingIO
 	// it is not nil if the allocator is enabled
 	alloc *allocator
 }
@@ -35,6 +42,7 @@ func newPktMgr(sender packetSender) *packetManager {
 		outgoing:  make([]orderedPacket, 0, SftpServerWorkerCount),
 		sender:    sender,
 		working:   &sync.WaitGroup{},
+		pendingIO: make(map[uint32]pendingIO),
 	}
 	go s.controller()
 	return s
@@ -94,6 +102,63 @@ func (s *packetManager) incomingPacket(pkt orderedRequest) {
 	s.requests <- pkt
 }
 
+type pendingIO struct {
+	handle string
+	write  bool
+	done   chan struct{}
+}
+
+// registerIO records that the request with the given order ID is in flight
+// against handle. It must be called before the request is handed to a
+// worker. The returned completion function unblocks any barrier waiting on
+// this request, and must be called once it has finished (whether it
+// succeeded or failed).
+func (s *packetManager) registerIO(orderID uint32, handle string, write bool) (complete func()) {
+	done := make(chan struct{})
+
+	s.pendingWritesMu.Lock()
+	s.pendingIO[orderID] = pendingIO{handle: handle, write: write, done: done}
+	s.pendingWritesMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.pendingWritesMu.Lock()
+			delete(s.pendingIO, orderID)
+			s.pendingWritesMu.Unlock()
+			close(done)
+		})
+	}
+}
+
+// waitForPriorIO blocks until every read or write request received before
+// the request with barrierOrderID and targeting handle has completed.
+func (s *packetManager) waitForPriorIO(barrierOrderID uint32, handle string, writesOnly bool) {
+	s.pendingWritesMu.Lock()
+	var pending []chan struct{}
+	for orderID, io := range s.pendingIO {
+		if orderID < barrierOrderID && io.handle == handle && (!writesOnly || io.write) {
+			pending = append(pending, io.done)
+		}
+	}
+	s.pendingWritesMu.Unlock()
+
+	for _, done := range pending {
+		<-done
+	}
+}
+
+// waitForPriorWrites blocks until every write request received before the
+// fsync request with fsyncOrderID and targeting handle has completed.
+//
+// The set of writes waited on is snapshotted at dispatch time: it contains
+// only writes with lower order IDs, so a worker handling fsync before an
+// earlier-dispatched write cannot pass the barrier, while a write dispatched
+// after the fsync does not hold the barrier up.
+func (s *packetManager) waitForPriorWrites(fsyncOrderID uint32, handle string) {
+	s.waitForPriorIO(fsyncOrderID, handle, true)
+}
+
 // register outgoing packets as being ready
 func (s *packetManager) readyPacket(pkt orderedResponse) {
 	s.responses <- pkt
@@ -119,21 +184,48 @@ func (s *packetManager) workerChan(runWorker func(chan orderedRequest),
 	}
 
 	// single worker to enforce sequential processing of everything else
-	cmdChan := make(chan orderedRequest)
+	// The buffer lets the dispatcher keep reading and dispatching read/write
+	// requests while an fsync barrier blocks the command worker, so requests
+	// on other handles are not held up behind it.
+	cmdChan := make(chan orderedRequest, SftpServerWorkerCount)
 	runWorker(cmdChan)
 
 	pktChan := make(chan orderedRequest, SftpServerWorkerCount)
 	go func() {
 		for pkt := range pktChan {
-			switch pkt.requestPacket.(type) {
-			case *sshFxpReadPacket, *sshFxpWritePacket:
+			// Extended requests are wrapped in sshFxpExtendedPacket;
+			// unwrap just enough to classify the request for scheduling
+			// while leaving the wrapper in place for the worker.
+			requestPacket := pkt.requestPacket
+			if epkt, ok := requestPacket.(*sshFxpExtendedPacket); ok && epkt.SpecificPacket != nil {
+				requestPacket = epkt.SpecificPacket
+			}
+
+			switch rpkt := requestPacket.(type) {
+			case *sshFxpReadPacket:
+				rpkt.complete = s.registerIO(pkt.orderID(), rpkt.Handle, false)
 				s.incomingPacket(pkt)
 				rwChan <- pkt
 				continue
+			case *sshFxpWritePacket:
+				rpkt.complete = s.registerIO(pkt.orderID(), rpkt.Handle, true)
+				s.incomingPacket(pkt)
+				rwChan <- pkt
+				continue
+			case *sshFxpExtendedPacketFsync:
+				// Snapshot the writes this barrier must wait on before the
+				// request is visible to the command worker.
+				orderID, handle := pkt.orderID(), rpkt.Handle
+				rpkt.wait = func() { s.waitForPriorIO(orderID, handle, true) }
+				s.incomingPacket(pkt)
+				cmdChan <- pkt
+				continue
 			case *sshFxpClosePacket:
-				// wait for reads/writes to finish when file is closed
-				// incomingPacket() call must occur after this
-				s.working.Wait()
+				// Wait for earlier reads and writes against this handle to
+				// finish before closing it. Requests on other handles keep
+				// running.
+				orderID, handle := pkt.orderID(), rpkt.Handle
+				rpkt.wait = func() { s.waitForPriorIO(orderID, handle, false) }
 			}
 			s.incomingPacket(pkt)
 			// all non-RW use sequential cmdChan

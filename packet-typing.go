@@ -31,6 +31,21 @@ type notReadOnly interface {
 	notReadOnly()
 }
 
+// fsyncPacket returns the concrete fsync packet for an fsync@openssh.com
+// extended request, whether it is still wrapped in sshFxpExtendedPacket or
+// has already been unwrapped. It returns nil for other packet types.
+func fsyncPacket(pkt requestPacket) *sshFxpExtendedPacketFsync {
+	if fpkt, ok := pkt.(*sshFxpExtendedPacketFsync); ok {
+		return fpkt
+	}
+	if epkt, ok := pkt.(*sshFxpExtendedPacket); ok {
+		if fpkt, ok := epkt.SpecificPacket.(*sshFxpExtendedPacketFsync); ok {
+			return fpkt
+		}
+	}
+	return nil
+}
+
 // // define types by adding methods
 // hasPath
 func (p *sshFxpLstatPacket) getPath() string    { return p.Path }

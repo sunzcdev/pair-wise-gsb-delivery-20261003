@@ -557,6 +557,10 @@ func (p *sshFxpFstatPacket) UnmarshalBinary(b []byte) error {
 type sshFxpClosePacket struct {
 	ID     uint32
 	Handle string
+
+	// wait, when set, blocks the server worker until every read/write
+	// request received before this close on the same handle has completed.
+	wait func()
 }
 
 func (p *sshFxpClosePacket) id() uint32 { return p.ID }
@@ -813,6 +817,10 @@ type sshFxpReadPacket struct {
 	Len    uint32
 	Offset uint64
 	Handle string
+
+	// complete, when set, is called by the server worker once the read has
+	// finished so that any waiting close barrier can proceed.
+	complete func()
 }
 
 func (p *sshFxpReadPacket) id() uint32 { return p.ID }
@@ -931,6 +939,10 @@ type sshFxpWritePacket struct {
 	Offset uint64
 	Handle string
 	Data   []byte
+
+	// complete, when set, is called by the server worker once the write has
+	// finished so that any waiting fsync barrier can proceed.
+	complete func()
 }
 
 func (p *sshFxpWritePacket) id() uint32 { return p.ID }
@@ -1339,6 +1351,8 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 	switch p.ExtendedRequest {
 	case "statvfs@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketStatVFS{}
+	case "fsync@openssh.com":
+		p.SpecificPacket = &sshFxpExtendedPacketFsync{}
 	case "posix-rename@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
@@ -1368,6 +1382,47 @@ func (p *sshFxpExtendedPacketStatVFS) UnmarshalBinary(b []byte) error {
 		return err
 	}
 	return nil
+}
+
+type sshFxpExtendedPacketFsync struct {
+	ID              uint32
+	ExtendedRequest string
+	Handle          string
+
+	// wait, when set, blocks the server worker until every write request
+	// received before this fsync on the same handle has completed.
+	wait func()
+}
+
+func (p *sshFxpExtendedPacketFsync) id() uint32     { return p.ID }
+func (p *sshFxpExtendedPacketFsync) readonly() bool { return false }
+func (p *sshFxpExtendedPacketFsync) getHandle() string {
+	return p.Handle
+}
+func (p *sshFxpExtendedPacketFsync) UnmarshalBinary(b []byte) error {
+	var err error
+	if p.ID, b, err = unmarshalUint32Safe(b); err != nil {
+		return err
+	} else if p.ExtendedRequest, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.Handle, _, err = unmarshalStringSafe(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *sshFxpExtendedPacketFsync) respond(s *Server) responsePacket {
+	f, ok := s.getHandle(p.Handle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+
+	syncer, ok := f.(syncer)
+	if !ok {
+		return statusFromError(p.ID, ErrSSHFxOpUnsupported)
+	}
+
+	return statusFromError(p.ID, syncer.Sync())
 }
 
 type sshFxpExtendedPacketPosixRename struct {
