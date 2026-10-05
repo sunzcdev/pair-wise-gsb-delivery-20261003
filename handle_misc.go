@@ -303,6 +303,9 @@ func (c *clientHandler) handleMODE(param string) error {
 	case "S":
 		c.transferMode = TransferModeStream
 		c.writeMessage(StatusOK, "Using stream mode")
+	case "B":
+		c.transferMode = TransferModeBlock
+		c.writeMessage(StatusOK, "Using block mode")
 	case "Z":
 		if c.server.settings.DeflateCompressionLevel > 0 {
 			c.transferMode = TransferModeDeflate

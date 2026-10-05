@@ -20,6 +20,8 @@ func getErrorCode(err error, defaultCode int) int {
 		return StatusActionAborted
 	case errors.Is(err, ErrFileNameNotAllowed):
 		return StatusActionNotTakenNoFile
+	case errors.Is(err, errBlockTransferIncomplete), errors.Is(err, errBlockTransferInvalid):
+		return StatusTransferAborted
 	default:
 		return defaultCode
 	}

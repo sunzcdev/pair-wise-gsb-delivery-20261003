@@ -527,7 +527,12 @@ func (c *clientHandler) handleREST(param string) error {
 			return nil
 		}
 
-		if c.transferMode == TransferModeDeflate {
+		switch c.transferMode {
+		case TransferModeBlock:
+			c.writeMessage(StatusSyntaxErrorParameters, "Resuming transfers not allowed in block mode")
+
+			return nil
+		case TransferModeDeflate:
 			c.writeMessage(StatusSyntaxErrorParameters, "Resuming transfers not allowed in deflate mode")
 
 			return nil

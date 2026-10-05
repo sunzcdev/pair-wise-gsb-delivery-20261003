@@ -41,6 +41,8 @@ type TransferMode int8
 const (
 	// TransferModeStream is the standard uncompressed transfer mode
 	TransferModeStream TransferMode = iota
+	// TransferModeBlock transfers data as independently described blocks
+	TransferModeBlock
 	// TransferModeDeflate is the compressed transfer mode using deflate algorithm
 	TransferModeDeflate
 )
@@ -115,7 +117,7 @@ type clientHandler struct {
 	debug               bool            // Show debugging info on the server side
 	transferTLS         bool            // Use TLS for transfer connection
 	controlTLS          bool            // Use TLS for control connection
-	transferMode        TransferMode    // Transfer mode (stream, deflate)
+	transferMode        TransferMode    // Transfer mode (stream, block, deflate)
 	isTransferOpen      bool            // indicate if the transfer connection is opened
 	isTransferAborted   bool            // indicate if the transfer was aborted
 	connClosed          bool            // indicates if the connection has been commanded to close
@@ -738,7 +740,10 @@ func (c *clientHandler) TransferOpen(info string) (io.ReadWriter, error) {
 
 	var transferStream io.ReadWriter = conn
 
-	if c.transferMode == TransferModeDeflate {
+	switch c.transferMode {
+	case TransferModeBlock:
+		transferStream = newBlockTransfer(conn, blockTransferSendsEOF(c.GetLastCommand()))
+	case TransferModeDeflate:
 		transferStream, err = newDeflateTransfer(transferStream, c.server.settings.DeflateCompressionLevel)
 		if err != nil {
 			c.writeMessage(StatusActionNotTaken, fmt.Sprintf("Could not switch to deflate mode: %v", err))
@@ -777,6 +782,10 @@ type TransferFinalizer interface {
 	FinalizeTransfer() error
 }
 
+type transferErrorFinalizer interface {
+	FinalizeTransferWithError(error) error
+}
+
 func (c *clientHandler) TransferClose(transfer io.ReadWriter, err error) {
 	c.transferMu.Lock()
 	defer c.transferMu.Unlock()
@@ -784,7 +793,17 @@ func (c *clientHandler) TransferClose(transfer io.ReadWriter, err error) {
 	// Check if this is a transfer stream that needs explicit finalization (e.g., deflate).
 	// TransferFinalizer.FinalizeTransfer() for deflate writes the end-of-stream marker AND flushes,
 	// so we don't need to call Flush() separately.
-	if finalizer, ok := transfer.(TransferFinalizer); ok {
+	if finalizer, ok := transfer.(transferErrorFinalizer); ok {
+		if errFinalize := finalizer.FinalizeTransferWithError(err); errFinalize != nil {
+			c.logger.Warn(
+				"Error finalizing transfer stream",
+				"err", errFinalize,
+			)
+			if err == nil {
+				err = newNetworkError("error finalizing transfer stream", errFinalize)
+			}
+		}
+	} else if finalizer, ok := transfer.(TransferFinalizer); ok {
 		if errFinalize := finalizer.FinalizeTransfer(); errFinalize != nil {
 			c.logger.Warn(
 				"Error finalizing transfer stream",
