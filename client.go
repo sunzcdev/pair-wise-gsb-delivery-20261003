@@ -3882,6 +3882,177 @@ func (c *Client) Subscribe(channel string, opts ...SubscribeOption) error {
 	return nil
 }
 
+// SubscribeBatch subscribes the client to several related channels as one
+// atomic operation: either every subscription of the batch commits, or none of
+// them does. Each channel gets the same features as with Subscribe —
+// positioning and recovery (SubscribeOptions.RecoverSince), presence and
+// real-time publications — and its own subscribe push once the batch succeeds.
+//
+// While the batch subscribes, publications of its channels are buffered (all
+// in-flight subscribes of the client share one budget, ClientQueueMaxSize). A
+// channel whose own recovery already finished receives nothing — not even the
+// publications which arrived after its sync point — before every channel of
+// the batch succeeded and all subscribe pushes are written. If a channel
+// fails, everything the batch did is rolled back: the recovery buffers, the
+// hub registrations and the presence entries of the channels already
+// subscribed.
+//
+// Like Subscribe, SubscribeBatch returns nil on a closed client, and
+// ErrorAlreadySubscribed when the client is subscribed (or subscribing) to one
+// of the channels — no channel of the batch is subscribed then.
+func (c *Client) SubscribeBatch(subs map[string]SubscribeOptions) error {
+	if len(subs) == 0 {
+		return nil
+	}
+	channels := make([]string, 0, len(subs))
+	for channel := range subs {
+		if channel == "" {
+			return fmt.Errorf("channel is empty")
+		}
+		channels = append(channels, channel)
+	}
+	// Sorted, so the batch subscribes and writes its pushes in a deterministic
+	// order.
+	slices.Sort(channels)
+
+	channelLimit := c.node.config.ClientChannelLimit
+
+	// Reserve all channels of the batch under one lock: the whole batch gets
+	// the "one in-flight subscribe per channel" guarantee of Client.Subscribe
+	// (see there) atomically, so a duplicate or concurrent subscribe on any
+	// channel rejects the batch before it did any work.
+	c.mu.Lock()
+	if c.status == statusClosed {
+		c.mu.Unlock()
+		return nil
+	}
+	if channelLimit > 0 && len(c.channels)+len(channels) > channelLimit {
+		c.mu.Unlock()
+		go func() { _ = c.close(DisconnectChannelLimit) }()
+		return nil
+	}
+	reservedGens := make(map[string]uint64, len(channels))
+	var duplicate bool
+	for _, channel := range channels {
+		if _, ok := c.channels[channel]; ok {
+			duplicate = true
+			break
+		}
+		// Also reject channels a map subscribe is loading, as Subscribe does.
+		if _, ok := c.mapSubscribing[channel]; ok {
+			duplicate = true
+			break
+		}
+		gen := c.subGenCounter.Add(1)
+		reservedGens[channel] = gen
+		c.channels[channel] = ChannelContext{subscribingCh: make(chan struct{}), subGen: gen}
+	}
+	c.mu.Unlock()
+	if duplicate {
+		// Undo the reservations made above (none of them reached the hub yet).
+		for channel, gen := range reservedGens {
+			c.onSubscribeErrorGen(channel, gen)
+		}
+		return ErrorAlreadySubscribed
+	}
+
+	subCtxMap := make(map[string]subscribeContext, len(channels))
+	// Drops the publications buffered for the subscriptions which don't reach
+	// StopBuffering below. Does nothing for the ones which did.
+	defer c.cancelServerSideBuffering(subCtxMap)
+
+	// The batch subscribes its channels one by one. A channel which is done
+	// keeps its publications buffered: its sync point passed, but nothing is
+	// written to the client before the whole batch commits below.
+	var subscribeErr error
+	for _, channel := range channels {
+		opts := subs[channel]
+		subCmd := &protocol.SubscribeRequest{
+			Channel: channel,
+		}
+		if opts.RecoverSince != nil {
+			subCmd.Recover = true
+			subCmd.Offset = opts.RecoverSince.Offset
+			subCmd.Epoch = opts.RecoverSince.Epoch
+		}
+		subCtx := c.subscribeCmd(subCmd, SubscribeReply{Options: opts}, nil, true, time.Time{}, nil)
+		subCtxMap[channel] = subCtx
+		if subCtx.disconnect != nil {
+			subscribeErr = subCtx.disconnect
+		} else if subCtx.err != nil {
+			subscribeErr = subCtx.err
+		}
+		if subscribeErr != nil {
+			break
+		}
+	}
+	if subscribeErr != nil {
+		// All-or-nothing: undo everything the batch did — the recovery buffers
+		// (the deferred cancel above), the hub registrations and the presence
+		// entries of the channels already subscribed, and the reservations of
+		// the channels never reached.
+		c.rollbackConnectServerSideSubs(subCtxMap, reservedGens)
+		return subscribeErr
+	}
+
+	// The subscribe pushes and the recovered publications go before the
+	// commit, as with Client.Subscribe: an unsubscribe waits for the subscribe
+	// until the commit, so its push can't come before them. A write error
+	// means the client is closing, the commit rolls back then.
+	subscribePushDisabled := hasFlag(c.transport.DisabledPushFlags(), PushFlagSubscribe)
+	var writeErr error
+	for _, channel := range channels {
+		if err := c.writeSubscribePush(channel, subCtxMap[channel].result, subscribePushDisabled); err != nil && writeErr == nil {
+			writeErr = err
+		}
+	}
+
+	// The commit point of the batch: every reservation becomes a subscription.
+	// A channel which can't commit — the client closed mid-batch, or its
+	// reservation was lost to the unsubscribe wait-gate timeout, which
+	// force-closes the client — is rolled back by commitSubscription itself
+	// and fails the batch; close() tears down the channels already committed.
+	var subscribingChs []chan struct{}
+	commitFailed := false
+	for _, channel := range channels {
+		subscribingCh, committed := c.commitSubscription(channel, subCtxMap[channel].channelContext, reservationChannels)
+		if !committed {
+			commitFailed = true
+			continue
+		}
+		if subscribingCh != nil {
+			subscribingChs = append(subscribingChs, subscribingCh)
+		}
+	}
+	for _, subscribingCh := range subscribingChs {
+		close(subscribingCh)
+	}
+	if commitFailed {
+		return DisconnectServerError
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	// The batch is committed and its results are written: the publications
+	// queued since each channel's sync point follow them now.
+	for _, channel := range channels {
+		if c.pubSubSync.StopBuffering(subCtxMap[channel].pubSubBuffer, c.writePendingPublication) {
+			go c.handleInsufficientState(channel, true)
+		}
+	}
+	if subscribePushDisabled {
+		return nil
+	}
+	for _, channel := range channels {
+		subCtx := subCtxMap[channel]
+		if subCtx.clientInfo != nil {
+			// Synchronous: see the comment on the same call in handleSubscribe.
+			c.publishJoinAndPresence(channel, subCtx.channelContext, subCtx.clientInfo)
+		}
+	}
+	return nil
+}
+
 // writeSubscribePush writes the subscribe push of a subscription made with
 // Client.Subscribe (unless disabled), and then the publications recovered for it,
 // in order.
