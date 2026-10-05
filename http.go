@@ -396,6 +396,111 @@ func httpWriteResponseError(bw *bufio.Writer, err error, code int, header Handsh
 	}
 }
 
+// strictResponseHeader renders h into a temporary buffer and validates the
+// resulting bytes to be a well-formed sequence of HTTP header lines that does
+// not interfere with the handshake response itself. That is, the rendered
+// bytes must not contain the response status line, nor the Upgrade,
+// Connection, Sec-WebSocket-Accept, Sec-WebSocket-Protocol or
+// Sec-WebSocket-Extensions header fields, nor any CR or LF characters that
+// could be used to inject additional response lines.
+//
+// It returns the validated bytes as a HandshakeHeader, such that a custom
+// HandshakeHeader writer is checked by its actual output and not only by its
+// declarative form. Duplicate header fields are allowed and keep their order.
+func strictResponseHeader(h HandshakeHeader) (HandshakeHeader, error) {
+	if h == nil {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		return nil, ErrHandshakeBadHeader
+	}
+	if err := httpValidateResponseHeader(buf.Bytes()); err != nil {
+		return nil, err
+	}
+	return HandshakeHeaderBytes(buf.Bytes()), nil
+}
+
+// httpValidateResponseHeader checks b to be a sequence of well-formed HTTP
+// header lines, each not overriding the fields controlled by the WebSocket
+// handshake response. The last line may be not terminated by CRLF – it will
+// be terminated by the final CRLF of the response.
+func httpValidateResponseHeader(b []byte) error {
+	for len(b) > 0 {
+		var line []byte
+		if i := bytes.Index(b, []byte(crlf)); i >= 0 {
+			line, b = b[:i], b[i+2:]
+		} else {
+			line, b = b, nil
+		}
+		if len(line) == 0 {
+			// An empty line terminates the header section of the response
+			// and thus could be used to inject arbitrary response data.
+			return ErrHandshakeBadHeader
+		}
+		if bytes.ContainsAny(line, "\r\n") {
+			// A bare CR or LF could be treated as a line ending by some
+			// HTTP implementations and thus used to inject additional
+			// response lines.
+			return ErrHandshakeBadHeader
+		}
+		k, _, ok := httpParseHeaderLine(line)
+		if !ok || !httpValidResponseHeaderKey(k) {
+			return ErrHandshakeBadHeader
+		}
+		if httpProtectedResponseHeader(k) {
+			return ErrHandshakeBadHeader
+		}
+	}
+	return nil
+}
+
+// httpProtectedResponseHeader reports whether the header field with the given
+// key is controlled by the WebSocket handshake response itself and thus must
+// not be overridden by custom headers. That is the status line companions –
+// Upgrade and Connection – the Sec-WebSocket-Accept proof and the finally
+// negotiated protocol fields.
+func httpProtectedResponseHeader(key []byte) bool {
+	for _, protected := range [...]string{
+		headerUpgrade,
+		headerConnection,
+		headerSecAccept,
+		headerSecProtocol,
+		headerSecExtensions,
+	} {
+		if bytes.EqualFold(key, strToBytes(protected)) {
+			return true
+		}
+	}
+	return false
+}
+
+// httpValidResponseHeaderKey reports whether key is a valid HTTP header field
+// name as defined by RFC7230:
+//
+//	token = 1*tchar
+//	tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+//	"^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+func httpValidResponseHeaderKey(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	for _, c := range key {
+		switch {
+		case 'a' <= c && c <= 'z',
+			'A' <= c && c <= 'Z',
+			'0' <= c && c <= '9':
+		default:
+			switch c {
+			case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func writeStatusText(bw *bufio.Writer, code int) {
 	bw.WriteString("HTTP/1.1 ")
 	bw.WriteString(strconv.Itoa(code))

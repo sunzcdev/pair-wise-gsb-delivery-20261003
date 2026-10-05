@@ -66,6 +66,18 @@ var ErrMalformedRequest = RejectConnectionError(
 	RejectionReason("malformed HTTP request"),
 )
 
+// ErrHandshakeBadHeader is returned by Upgrader (and HTTPUpgrader) to
+// indicate that the custom handshake response headers did not pass the strict
+// validation enabled by the StrictHeader option. That is, they either
+// override the response status line, the Upgrade, Connection,
+// Sec-WebSocket-Accept or the finally negotiated protocol header fields, or
+// contain CR or LF characters that could be used to inject additional
+// response lines.
+var ErrHandshakeBadHeader = RejectConnectionError(
+	RejectionStatus(http.StatusInternalServerError),
+	RejectionReason("handshake error: bad custom response header"),
+)
+
 // ErrHandshakeUpgradeRequired is returned by Upgrader to indicate that
 // connection is rejected because given WebSocket version is malformed.
 //
@@ -120,6 +132,24 @@ type HTTPUpgrader struct {
 	//
 	// Note that if present, it will be written in any result of handshake.
 	Header http.Header
+
+	// StrictHeader enables strict validation of the custom handshake
+	// response headers from the Header field before any response byte is
+	// written to the connection.
+	//
+	// When enabled, the headers must not override the response status
+	// line, the Upgrade, Connection, Sec-WebSocket-Accept or the finally
+	// negotiated protocol header fields, and must not contain CR or LF
+	// characters that could be used to inject additional response lines.
+	// Multiple header fields with the same name are allowed and keep
+	// their order.
+	//
+	// If the validation fails, the handshake fails with
+	// ErrHandshakeBadHeader and no successful response is sent.
+	//
+	// When disabled, the headers are written as is, which is the
+	// compatible default behavior.
+	StrictHeader bool
 
 	// Protocol is the select function that is used to select subprotocol from
 	// list requested by client. If this field is set, then the first matched
@@ -241,6 +271,17 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 	if h := u.Header; h != nil {
 		header[0] = HandshakeHeaderHTTP(h)
 	}
+	if u.StrictHeader {
+		// Validate the custom headers before any response byte is
+		// written to the connection. On failure drop the custom headers
+		// to not write them even into the error response.
+		if h, e := strictResponseHeader(header[0]); e != nil {
+			err = ErrHandshakeBadHeader
+			header[0] = nil
+		} else {
+			header[0] = h
+		}
+	}
 	if err == nil {
 		httpWriteResponseUpgrade(rw.Writer, strToBytes(nonce), hs, header.WriteTo)
 		err = rw.Writer.Flush()
@@ -345,6 +386,27 @@ type Upgrader struct {
 	//
 	// Note that if present, it will be written in any result of handshake.
 	Header HandshakeHeader
+
+	// StrictHeader enables strict validation of the custom handshake
+	// response headers – the Header field and the header returned by
+	// OnBeforeUpgrade – before any response byte is written to the
+	// connection.
+	//
+	// When enabled, the headers are checked by their actual rendered
+	// output, thus custom HandshakeHeader writers are validated the same
+	// way as static header mappings. The rendered headers must not
+	// override the response status line, the Upgrade, Connection,
+	// Sec-WebSocket-Accept or the finally negotiated protocol header
+	// fields, and must not contain CR or LF characters that could be
+	// used to inject additional response lines. Multiple header fields
+	// with the same name are allowed and keep their order.
+	//
+	// If the validation fails, the handshake fails with
+	// ErrHandshakeBadHeader and no successful response is sent.
+	//
+	// When disabled, the headers are written as is, which is the
+	// compatible default behavior.
+	StrictHeader bool
 
 	// OnRequest is a callback that will be called after request line
 	// successful parsing.
@@ -622,6 +684,17 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 
 	case err == nil && u.OnBeforeUpgrade != nil:
 		header[1], err = u.OnBeforeUpgrade()
+	}
+	if u.StrictHeader && (header[0] != nil || header[1] != nil) {
+		// Validate the custom headers before any response byte is
+		// written to the connection. On failure drop the custom headers
+		// to not write them even into the error response.
+		if h, e := strictResponseHeader(header); e != nil {
+			err = ErrHandshakeBadHeader
+			header = handshakeHeader{}
+		} else {
+			header = handshakeHeader{h}
+		}
 	}
 	if err != nil {
 		var code int

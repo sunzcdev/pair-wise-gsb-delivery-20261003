@@ -820,3 +820,241 @@ func mustMakeNonce() (ret []byte) {
 	initNonce(ret)
 	return ret
 }
+
+func strictHeaderUpgradeRequest(t *testing.T) *http.Request {
+	t.Helper()
+	req := mustMakeRequest("GET", "ws://example.org", http.Header{
+		headerUpgrade:    []string{"websocket"},
+		headerConnection: []string{"Upgrade"},
+		headerSecVersion: []string{"13"},
+		headerSecKey:     []string{string(mustMakeNonce())},
+	})
+	r, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(dumpRequest(req))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func strictHeaderUpgradeConn() *bytes.Buffer {
+	req := mustMakeRequest("GET", "ws://example.org", http.Header{
+		headerUpgrade:    []string{"websocket"},
+		headerConnection: []string{"Upgrade"},
+		headerSecVersion: []string{"13"},
+		headerSecKey:     []string{string(mustMakeNonce())},
+	})
+	return bytes.NewBuffer(dumpRequest(req))
+}
+
+func TestHTTPUpgraderStrictHeader(t *testing.T) {
+	t.Run("valid_duplicates_keep_order", func(t *testing.T) {
+		u := HTTPUpgrader{
+			StrictHeader: true,
+			Header: http.Header{
+				"X-Ext": []string{"a", "b", "c"},
+			},
+		}
+		res := newRecorder()
+		_, _, _, err := u.Upgrade(strictHeaderUpgradeRequest(t), res)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		b := res.Bytes()
+		if !bytes.Contains(b, []byte("101 Switching Protocols")) {
+			t.Fatalf("expected successful response, got:\n%s", b)
+		}
+		if !bytes.Contains(b, []byte("X-Ext: a\r\nX-Ext: b\r\nX-Ext: c\r\n")) {
+			t.Fatalf("expected duplicate headers to keep order, got:\n%s", b)
+		}
+	})
+
+	for _, key := range []string{
+		headerUpgrade,
+		headerConnection,
+		headerSecAccept,
+		headerSecProtocol,
+		headerSecExtensions,
+		strings.ToLower(headerUpgrade),
+		"sEc-WeBsOcKeT-aCcEpT",
+	} {
+		t.Run("forbidden/"+key, func(t *testing.T) {
+			u := HTTPUpgrader{
+				StrictHeader: true,
+				Header:       http.Header{key: []string{"x"}},
+			}
+			res := newRecorder()
+			_, _, _, err := u.Upgrade(strictHeaderUpgradeRequest(t), res)
+			if err != ErrHandshakeBadHeader {
+				t.Fatalf("expected ErrHandshakeBadHeader, got %v", err)
+			}
+			if b := res.Bytes(); bytes.Contains(b, []byte("101 Switching Protocols")) {
+				t.Fatalf("successful response was sent before failure:\n%s", b)
+			}
+		})
+	}
+
+	t.Run("crlf_value", func(t *testing.T) {
+		u := HTTPUpgrader{
+			StrictHeader: true,
+			Header:       http.Header{"X-Ext": []string{"a\r\nInjected: y"}},
+		}
+		res := newRecorder()
+		_, _, _, err := u.Upgrade(strictHeaderUpgradeRequest(t), res)
+		if err != nil && err != ErrHandshakeBadHeader {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if b := res.Bytes(); bytes.Contains(b, []byte("\r\nInjected:")) {
+			t.Fatalf("additional response line was injected:\n%s", b)
+		}
+	})
+
+	t.Run("compat_mode_unchanged", func(t *testing.T) {
+		u := HTTPUpgrader{
+			Header: http.Header{headerUpgrade: []string{"h2c"}},
+		}
+		res := newRecorder()
+		_, _, _, err := u.Upgrade(strictHeaderUpgradeRequest(t), res)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if b := res.Bytes(); !bytes.Contains(b, []byte("Upgrade: h2c\r\n")) {
+			t.Fatalf("expected compatible mode to write header as is, got:\n%s", b)
+		}
+	})
+}
+
+func TestUpgraderStrictHeader(t *testing.T) {
+	t.Run("valid_duplicates_keep_order", func(t *testing.T) {
+		u := Upgrader{
+			StrictHeader: true,
+			Header:       HandshakeHeaderString("X-Ext: a\r\nX-Ext: b\r\nX-Ext: c\r\n"),
+		}
+		conn := strictHeaderUpgradeConn()
+		_, err := u.Upgrade(conn)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Contains(conn.Bytes(), []byte("X-Ext: a\r\nX-Ext: b\r\nX-Ext: c\r\n")) {
+			t.Fatalf("expected duplicate headers to keep order, got:\n%s", conn.Bytes())
+		}
+	})
+
+	t.Run("valid_func_writer", func(t *testing.T) {
+		u := Upgrader{
+			StrictHeader: true,
+			Header: HandshakeHeaderFunc(func(w io.Writer) (int64, error) {
+				n, err := io.WriteString(w, "X-Ext: a\r\n")
+				return int64(n), err
+			}),
+		}
+		conn := strictHeaderUpgradeConn()
+		if _, err := u.Upgrade(conn); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Contains(conn.Bytes(), []byte("X-Ext: a\r\n")) {
+			t.Fatalf("expected custom header in response, got:\n%s", conn.Bytes())
+		}
+	})
+
+	for _, test := range []struct {
+		label  string
+		header HandshakeHeader
+	}{
+		{
+			label: "func_writer_forbidden",
+			header: HandshakeHeaderFunc(func(w io.Writer) (int64, error) {
+				n, err := io.WriteString(w, "Upgrade: h2c\r\n")
+				return int64(n), err
+			}),
+		},
+		{
+			label:  "bytes_forbidden_accept",
+			header: HandshakeHeaderBytes("Sec-WebSocket-Accept: forged\r\n"),
+		},
+		{
+			label:  "string_forbidden_protocol",
+			header: HandshakeHeaderString("Sec-WebSocket-Protocol: evil\r\n"),
+		},
+		{
+			label:  "string_forbidden_connection",
+			header: HandshakeHeaderString("Connection: close\r\n"),
+		},
+		{
+			label:  "empty_line_injection",
+			header: HandshakeHeaderString("X-Ext: a\r\n\r\nInjected: y\r\n"),
+		},
+		{
+			label:  "bare_lf_injection",
+			header: HandshakeHeaderString("X-Ext: a\nInjected: y\r\n"),
+		},
+		{
+			label:  "status_line_injection",
+			header: HandshakeHeaderString("HTTP/1.1 200 OK\r\nX-Ext: a\r\n"),
+		},
+		{
+			label:  "bad_key",
+			header: HandshakeHeaderString("Bad Key: x\r\n"),
+		},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			u := Upgrader{
+				StrictHeader: true,
+				Header:       test.header,
+			}
+			conn := strictHeaderUpgradeConn()
+			_, err := u.Upgrade(conn)
+			if err != ErrHandshakeBadHeader {
+				t.Fatalf("expected ErrHandshakeBadHeader, got %v", err)
+			}
+			if b := conn.Bytes(); bytes.Contains(b, []byte("101 Switching Protocols")) {
+				t.Fatalf("successful response was sent before failure:\n%s", b)
+			}
+		})
+	}
+
+	t.Run("on_before_upgrade_forbidden", func(t *testing.T) {
+		u := Upgrader{
+			StrictHeader: true,
+			OnBeforeUpgrade: func() (HandshakeHeader, error) {
+				return HandshakeHeaderString("Sec-Websocket-Protocol: evil\r\n"), nil
+			},
+		}
+		conn := strictHeaderUpgradeConn()
+		_, err := u.Upgrade(conn)
+		if err != ErrHandshakeBadHeader {
+			t.Fatalf("expected ErrHandshakeBadHeader, got %v", err)
+		}
+		if b := conn.Bytes(); bytes.Contains(b, []byte("101 Switching Protocols")) {
+			t.Fatalf("successful response was sent before failure:\n%s", b)
+		}
+	})
+
+	t.Run("on_before_upgrade_valid", func(t *testing.T) {
+		u := Upgrader{
+			StrictHeader: true,
+			OnBeforeUpgrade: func() (HandshakeHeader, error) {
+				return HandshakeHeaderString("X-Ext: a\r\n"), nil
+			},
+		}
+		conn := strictHeaderUpgradeConn()
+		if _, err := u.Upgrade(conn); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Contains(conn.Bytes(), []byte("X-Ext: a\r\n")) {
+			t.Fatalf("expected custom header in response, got:\n%s", conn.Bytes())
+		}
+	})
+
+	t.Run("compat_mode_unchanged", func(t *testing.T) {
+		u := Upgrader{
+			Header: HandshakeHeaderString("Upgrade: h2c\r\n"),
+		}
+		conn := strictHeaderUpgradeConn()
+		if _, err := u.Upgrade(conn); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Contains(conn.Bytes(), []byte("Upgrade: h2c\r\n")) {
+			t.Fatalf("expected compatible mode to write header as is, got:\n%s", conn.Bytes())
+		}
+	})
+}
