@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"os"
 	"reflect"
 	"strconv"
@@ -431,9 +432,9 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 			p.Value = DecodeString(content)
 		case TagNULL:
 		case TagObjectIdentifier:
-			var oid []int
-			if oid, err = parseObjectIdentifier(content); err == nil {
-				p.Value = OIDToString(oid)
+			var arcs []*big.Int
+			if arcs, err = parseOIDArcs(content); err == nil {
+				p.Value = oidArcsToString(arcs)
 			}
 		case TagObjectDescriptor:
 		case TagExternal:
@@ -450,9 +451,9 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 				p.Value = val
 			}
 		case TagRelativeOID:
-			var oid []int
-			if oid, err = parseRelativeObjectIdentifier(content); err == nil {
-				p.Value = OIDToString(oid)
+			var arcs []*big.Int
+			if arcs, err = parseRelativeOIDArcs(content); err == nil {
+				p.Value = oidArcsToString(arcs)
 			}
 		case TagSequence:
 		case TagSet:
@@ -795,81 +796,138 @@ func NewRelativeOID(classType Class, tagType Type, tag Tag, value interface{}, d
 	return p
 }
 
-// parseDottedInts splits a dotted-decimal OID string (e.g. "1.2.840") into its
-// integer arcs. label names the OID kind for error messages.
-func parseDottedInts(oidString, label string) ([]int, error) {
+// Limits guarding OID encode/decode against pathological inputs: a single arc
+// may hold at most maxOIDArcBits bits, and an OID may hold at most maxOIDArcs
+// arcs in total.
+const (
+	maxOIDArcBits = 512
+	maxOIDArcs    = 256
+)
+
+var (
+	bigTwo    = big.NewInt(2)
+	bigForty  = big.NewInt(40)
+	bigEighty = big.NewInt(80)
+)
+
+// parseDottedArcs splits a dotted-decimal OID string (e.g. "1.2.840") into its
+// arcs. Arcs are arbitrary-precision integers, so arcs beyond the int64 range
+// are accepted. label names the OID kind for error messages.
+func parseDottedArcs(oidString, label string) ([]*big.Int, error) {
 	parts := strings.Split(oidString, ".")
-	oid := make([]int, len(parts))
+	arcs := make([]*big.Int, len(parts))
 	for i, part := range parts {
-		val, err := strconv.Atoi(part)
-		if err != nil {
-			return nil, fmt.Errorf("invalid %s part '%s': %w", label, part, err)
+		if part == "" {
+			return nil, fmt.Errorf("invalid %s: empty arc", label)
 		}
-		oid[i] = val
+		arc, ok := new(big.Int).SetString(part, 10)
+		if !ok {
+			return nil, fmt.Errorf("invalid %s part '%s'", label, part)
+		}
+		arcs[i] = arc
 	}
-	return oid, nil
+	return arcs, nil
+}
+
+// checkOIDArcs validates the arcs of an OID or RELATIVE-OID: every arc must be
+// non-negative and within the per-arc bit-length limit, and the total arc
+// count must not exceed maxOIDArcs. label names the OID kind for error
+// messages.
+func checkOIDArcs(arcs []*big.Int, label string) error {
+	if len(arcs) > maxOIDArcs {
+		return fmt.Errorf("invalid %s: %d arcs exceeds the limit of %d", label, len(arcs), maxOIDArcs)
+	}
+	for i, arc := range arcs {
+		if arc == nil || arc.Sign() < 0 {
+			return fmt.Errorf("invalid %s: arc %d is negative", label, i)
+		}
+		if arc.BitLen() > maxOIDArcBits {
+			return fmt.Errorf("invalid %s: arc %d exceeds %d bits", label, i, maxOIDArcBits)
+		}
+	}
+	return nil
 }
 
 // encodeOID takes a string representation of an OID and returns its DER-encoded byte slice along with any error.
 func encodeOID(oidString string) ([]byte, error) {
-	oid, err := parseDottedInts(oidString, "OID")
+	arcs, err := parseDottedArcs(oidString, "OID")
 	if err != nil {
 		return nil, err
 	}
-	if len(oid) < 2 || oid[0] > 2 || (oid[0] < 2 && oid[1] >= 40) {
-		return nil, fmt.Errorf("invalid object identifier %v", oid)
+	return encodeOIDArcs(arcs)
+}
+
+// encodeOIDArcs encodes the given arcs as an OBJECT IDENTIFIER. The first two
+// arcs are validated and combined into a single subidentifier (40*arc0 + arc1)
+// using arbitrary-precision arithmetic, so a second arc beyond the int64 range
+// is encoded losslessly.
+func encodeOIDArcs(arcs []*big.Int) ([]byte, error) {
+	if err := checkOIDArcs(arcs, "OID"); err != nil {
+		return nil, err
+	}
+	if len(arcs) < 2 || arcs[0].Cmp(bigTwo) > 0 || (arcs[0].Cmp(bigTwo) < 0 && arcs[1].Cmp(bigForty) >= 0) {
+		return nil, fmt.Errorf("invalid object identifier %v", arcs)
 	}
 
 	// The first two arcs are combined into a single value: 40*arc0 + arc1.
-	encoded := appendBase128Int(nil, int64(oid[0]*40+oid[1]))
-	for i := 2; i < len(oid); i++ {
-		encoded = appendBase128Int(encoded, int64(oid[i]))
+	first := new(big.Int).Mul(arcs[0], bigForty)
+	first.Add(first, arcs[1])
+	encoded := appendBase128Big(nil, first)
+	for _, arc := range arcs[2:] {
+		encoded = appendBase128Big(encoded, arc)
 	}
 
 	return encoded, nil
 }
 
 func encodeRelativeOID(oidString string) ([]byte, error) {
-	oid, err := parseDottedInts(oidString, "RELATIVE OID")
+	arcs, err := parseDottedArcs(oidString, "RELATIVE OID")
 	if err != nil {
 		return nil, err
 	}
+	return encodeRelativeOIDArcs(arcs)
+}
+
+// encodeRelativeOIDArcs encodes the given arcs as a RELATIVE-OID, using the
+// same base-128 logic as OBJECT IDENTIFIER arcs.
+func encodeRelativeOIDArcs(arcs []*big.Int) ([]byte, error) {
+	if err := checkOIDArcs(arcs, "RELATIVE OID"); err != nil {
+		return nil, err
+	}
+	if len(arcs) == 0 {
+		return nil, errors.New("invalid RELATIVE OID: no arcs")
+	}
 
 	var encoded []byte
-	for _, arc := range oid {
-		encoded = appendBase128Int(encoded, int64(arc))
+	for _, arc := range arcs {
+		encoded = appendBase128Big(encoded, arc)
 	}
 
 	return encoded, nil
 }
 
-func appendBase128Int(dst []byte, n int64) []byte {
-	l := base128IntLength(n)
+// appendBase128Big appends the base-128 (DER subidentifier) encoding of the
+// non-negative integer n to dst. The encoding does not depend on the machine
+// word size, so values beyond the int64 range are encoded losslessly.
+func appendBase128Big(dst []byte, n *big.Int) []byte {
+	bitLen := n.BitLen()
+	if bitLen == 0 {
+		return append(dst, 0)
+	}
 
+	l := (bitLen + 6) / 7
+	buf := make([]byte, l)
+	tmp := new(big.Int).Set(n)
 	for i := l - 1; i >= 0; i-- {
-		o := byte(n >> uint(i*7))
-		o &= 0x7f
-		if i != 0 {
+		o := byte(tmp.Int64() & 0x7f)
+		if i != l-1 {
 			o |= 0x80
 		}
-
-		dst = append(dst, o)
+		buf[i] = o
+		tmp.Rsh(tmp, 7)
 	}
 
-	return dst
-}
-
-func base128IntLength(n int64) int {
-	if n == 0 {
-		return 1
-	}
-
-	l := 0
-	for i := n; i > 0; i >>= 7 {
-		l++
-	}
-
-	return l
+	return append(dst, buf...)
 }
 
 func OIDToString(oi []int) string {
@@ -887,102 +945,144 @@ func OIDToString(oi []int) string {
 	return s.String()
 }
 
-// parseBase128Ints decodes successive base-128 integers from bytes[offset:]
-// into dst starting at index i, returning the index one past the last element
-// written (the total count when i started at 0).
-func parseBase128Ints(bytes []byte, offset int, dst []int, i int) (int, error) {
-	for offset < len(bytes) {
-		v, next, err := parseBase128Int(bytes, offset)
-		if err != nil {
-			return i, err
+// oidArcsToString formats arbitrary-precision OID arcs in dotted-decimal form.
+func oidArcsToString(arcs []*big.Int) string {
+	var s strings.Builder
+	s.Grow(32)
+
+	for i, arc := range arcs {
+		if i > 0 {
+			s.WriteByte('.')
 		}
-		dst[i] = v
-		offset = next
-		i++
+		s.WriteString(arc.String())
 	}
-	return i, nil
+
+	return s.String()
 }
 
 // parseObjectIdentifier parses an OBJECT IDENTIFIER from the given bytes and
-// returns it. An object identifier is a sequence of variable length integers
-// that are assigned in a hierarchy.
+// returns its arcs as ints. It fails if any arc does not fit in an int; use
+// parseOIDArcs for arbitrary-precision arcs. An object identifier is a
+// sequence of variable length integers that are assigned in a hierarchy.
 func parseObjectIdentifier(bytes []byte) ([]int, error) {
+	arcs, err := parseOIDArcs(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return oidArcsToInts(arcs)
+}
+
+func parseRelativeObjectIdentifier(bytes []byte) ([]int, error) {
+	arcs, err := parseRelativeOIDArcs(bytes)
+	if err != nil {
+		return nil, err
+	}
+	return oidArcsToInts(arcs)
+}
+
+// oidArcsToInts converts arbitrary-precision arcs to ints, failing if any arc
+// does not fit in an int on this platform.
+func oidArcsToInts(arcs []*big.Int) ([]int, error) {
+	out := make([]int, len(arcs))
+	for i, arc := range arcs {
+		if !arc.IsInt64() {
+			return nil, errors.New("base 128 integer too large")
+		}
+		v := arc.Int64()
+		if int64(int(v)) != v {
+			return nil, errors.New("base 128 integer too large")
+		}
+		out[i] = int(v)
+	}
+	return out, nil
+}
+
+// parseOIDArcs parses an OBJECT IDENTIFIER from the given bytes and returns
+// its arcs as arbitrary-precision integers.
+func parseOIDArcs(bytes []byte) ([]*big.Int, error) {
 	if len(bytes) == 0 {
 		return nil, errors.New("zero length OBJECT IDENTIFIER")
 	}
 
-	// In the worst case, we get two elements from the first byte (which is
-	// encoded differently) and then every varint is a single byte long.
-	s := make([]int, len(bytes)+1)
+	// In the worst case, we get two elements from the first subidentifier
+	// (which is encoded differently) and then every subidentifier is a single
+	// byte long.
+	capHint := len(bytes) + 1
+	if capHint > maxOIDArcs {
+		capHint = maxOIDArcs
+	}
+	arcs := make([]*big.Int, 0, capHint)
 
-	// The first varint is 40*value1 + value2:
-	// According to this packing, value1 can take the values 0, 1 and 2 only.
-	// When value1 = 0 or value1 = 1, then value2 is <= 39. When value1 = 2,
-	// then there are no restrictions on value2.
-	v, offset, err := parseBase128Int(bytes, 0)
+	// The first subidentifier is 40*arc0 + arc1:
+	// According to this packing, arc0 can take the values 0, 1 and 2 only.
+	// When arc0 = 0 or arc0 = 1, then arc1 is <= 39. When arc0 = 2,
+	// then there are no restrictions on arc1.
+	// The first subidentifier merges two arcs (40*arc0 + arc1), so it may
+	// exceed the per-arc bit-length limit by the 7 bits needed for the merge.
+	v, offset, err := parseBase128Big(bytes, 0, maxOIDArcBits+7)
 	if err != nil {
 		return nil, err
 	}
-	if v < 80 {
-		s[0] = v / 40
-		s[1] = v % 40
+	if v.Cmp(bigEighty) < 0 {
+		q, r := new(big.Int).QuoRem(v, bigForty, new(big.Int))
+		arcs = append(arcs, q, r)
 	} else {
-		s[0] = 2
-		s[1] = v - 80
+		arcs = append(arcs, big.NewInt(2), new(big.Int).Sub(v, bigEighty))
 	}
 
-	i, err := parseBase128Ints(bytes, offset, s, 2)
-	if err != nil {
-		return nil, err
-	}
-	return s[:i], nil
+	return parseBase128Arcs(bytes, offset, arcs)
 }
 
-func parseRelativeObjectIdentifier(bytes []byte) ([]int, error) {
+// parseRelativeOIDArcs parses a RELATIVE-OID from the given bytes and returns
+// its arcs as arbitrary-precision integers.
+func parseRelativeOIDArcs(bytes []byte) ([]*big.Int, error) {
 	if len(bytes) == 0 {
 		return nil, errors.New("zero length RELATIVE OBJECT IDENTIFIER")
 	}
 
-	s := make([]int, len(bytes)+1)
-
-	i, err := parseBase128Ints(bytes, 0, s, 0)
-	if err != nil {
-		return nil, err
-	}
-	return s[:i], nil
+	return parseBase128Arcs(bytes, 0, nil)
 }
 
-// parseBase128Int parses a base-128 encoded int from the given offset in the
-// given byte slice. It returns the value and the new offset.
-func parseBase128Int(bytes []byte, initOffset int) (ret, offset int, err error) {
-	offset = initOffset
-	var ret64 int64
-	for shifted := 0; offset < len(bytes); shifted++ {
-		// 5 * 7 bits per byte == 35 bits of data
-		// Thus the representation is either non-minimal or too large for an int32
-		if shifted == 5 {
-			err = errors.New("base 128 integer too large")
-			return
+// parseBase128Arcs decodes successive base-128 subidentifiers from
+// bytes[offset:], appending them to arcs and returning the result.
+func parseBase128Arcs(bytes []byte, offset int, arcs []*big.Int) ([]*big.Int, error) {
+	for offset < len(bytes) {
+		if len(arcs) >= maxOIDArcs {
+			return nil, fmt.Errorf("object identifier has more than %d arcs", maxOIDArcs)
 		}
-		ret64 <<= 7
+		arc, next, err := parseBase128Big(bytes, offset, maxOIDArcBits)
+		if err != nil {
+			return nil, err
+		}
+		arcs = append(arcs, arc)
+		offset = next
+	}
+	return arcs, nil
+}
+
+// parseBase128Big parses a base-128 encoded integer of arbitrary precision
+// from the given offset in the given byte slice. It returns the value and the
+// new offset. The encoding must be minimal (the leading octet must not be
+// 0x80) and terminated (the final octet must have its high bit clear), and the
+// value must not exceed maxBits bits.
+func parseBase128Big(bytes []byte, offset, maxBits int) (*big.Int, int, error) {
+	ret := new(big.Int)
+	for shifted := 0; offset < len(bytes); shifted++ {
 		b := bytes[offset]
 		// integers should be minimally encoded, so the leading octet should
 		// never be 0x80
 		if shifted == 0 && b == 0x80 {
-			err = errors.New("integer is not minimally encoded")
-			return
+			return nil, 0, errors.New("integer is not minimally encoded")
 		}
-		ret64 |= int64(b & 0x7f)
+		ret.Lsh(ret, 7)
+		ret.Or(ret, big.NewInt(int64(b&0x7f)))
 		offset++
+		if ret.BitLen() > maxBits {
+			return nil, 0, errors.New("base 128 integer too large")
+		}
 		if b&0x80 == 0 {
-			ret = int(ret64)
-			// Ensure that the returned value fits in an int on all platforms
-			if ret64 > math.MaxInt32 {
-				err = errors.New("base 128 integer too large")
-			}
-			return
+			return ret, offset, nil
 		}
 	}
-	err = errors.New("truncated base 128 integer")
-	return
+	return nil, 0, errors.New("truncated base 128 integer")
 }

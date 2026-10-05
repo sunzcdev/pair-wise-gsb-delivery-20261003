@@ -14,6 +14,10 @@ All notable changes to this project are documented here. The format is based on
 ### Changed
 
 - Require Go 1.22 or newer.
+- OBJECT IDENTIFIER and RELATIVE-OID arcs are now encoded and decoded as
+  arbitrary-precision integers, so arcs beyond the int64 range round-trip
+  losslessly through the existing string API. Arcs are limited to 512 bits
+  each and 256 arcs per OID, and negative or empty arcs are rejected.
 - Constructed packets no longer populate the exported `Data` field after
   decoding or `AppendChild`. Content is now serialized lazily by `Bytes()`;
   read a constructed packet's content via `Bytes()` or by walking `Children`.
