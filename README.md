@@ -155,6 +155,53 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+# Claims Contracts
+
+For non-standard claims you can declare a reusable `ClaimsContract` describing
+which claims are allowed, which are required, and what type each one has. A
+contract is applied as a rule, so it only ever runs after a token has passed
+cryptographic verification; it does not replace validators such as
+`ForAudience`, `IssuedBy`, or `NotExpired`.
+
+Supported claim types are strings, booleans, raw JSON numbers (`NumberSpec`),
+integers (`IntegerSpec`), arrays, and nested objects. Fields are required by
+default and can be marked optional.
+
+```go
+contract, err := paseto.NewClaimsContract(map[string]paseto.FieldSpec{
+    "sub":   paseto.StringSpec(),
+    "admin": paseto.BooleanSpec().Optional(),
+    "org_id": paseto.IntegerSpec(),
+    "groups": paseto.ArraySpec(paseto.StringSpec()),
+    "metadata": paseto.ObjectSpec(map[string]paseto.FieldSpec{
+        "region": paseto.StringSpec(),
+    }),
+})
+if err != nil {
+    // a contradictory definition (reported at construction time)
+}
+
+parser := paseto.NewParser()
+parser.AddClaimsContract(contract)
+
+parsedToken, err := parser.ParseV4Public(publicKey, signed, nil)
+```
+
+Numbers are never converted through `float64` before being checked, so an
+integer larger than `2^53` (such as an ID) is preserved exactly. Read one
+back with `token.GetNumber` (a `json.Number`) or `token.GetInt64`.
+
+Unknown (undeclared) claims are accepted by default. Call
+`contract.RejectUnknownFields()` to disallow them instead; this applies to
+the top-level claims and to every nested object.
+
+On failure the returned error is a `paseto.ClaimError`, carrying the claim
+`Path` (e.g. `groups[0]` or `metadata.region`) and a `Category`
+(`MissingClaim`, `NullClaim`, `WrongType`, `UnknownClaim`, or
+`ClaimTooDeep`). A present-but-`null` value is reported separately from a
+missing one. Error messages deliberately never include the offending claim
+value.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.

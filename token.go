@@ -3,6 +3,7 @@ package paseto
 import (
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"time"
 )
 
@@ -120,6 +121,41 @@ func (t Token) GetTime(key string) (time.Time, error) {
 // time format used by common PASETO claims).
 func (t *Token) SetTime(key string, value time.Time) {
 	t.SetString(key, value.Format(time.RFC3339))
+}
+
+// GetNumber returns the value for a given key as a json.Number, or error if
+// the value is not present or is not a JSON number. The raw number is
+// retained, so it is never rounded through a float64. Use GetInt64 when an
+// exact integer is needed, or parse it yourself for other cases.
+func (t Token) GetNumber(key string) (json.Number, error) {
+	var number json.Number
+	if err := t.Get(key, &number); err != nil {
+		return "", err
+	}
+
+	return number, nil
+}
+
+// GetInt64 returns the value for a given key as an int64, or error if the
+// value is not present, is not a JSON number, is not an integer, or does not
+// fit in an int64. Integers beyond float64 precision are handled exactly.
+func (t Token) GetInt64(key string) (int64, error) {
+	number, err := t.GetNumber(key)
+	if err != nil {
+		return 0, err
+	}
+
+	r, ok := new(big.Rat).SetString(number.String())
+	if !ok || !r.IsInt() {
+		return 0, fmt.Errorf("value for key `%s' is not an integer", key)
+	}
+
+	integer := r.Num()
+	if !integer.IsInt64() {
+		return 0, fmt.Errorf("value for key `%s' is not an int64", key)
+	}
+
+	return integer.Int64(), nil
 }
 
 // Claims gets the stored claims.

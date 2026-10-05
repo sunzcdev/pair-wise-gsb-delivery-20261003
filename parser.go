@@ -160,6 +160,14 @@ func (p *Parser) AddRule(rule ...Rule) {
 	p.rules = append(p.rules, rule...)
 }
 
+// AddClaimsContract adds a rule which validates every parsed token against
+// the given claims contract. As with all rules, the contract runs only after
+// cryptographic verification has succeeded, and does not replace other rules
+// such as ForAudience, IssuedBy, or NotExpired.
+func (p *Parser) AddClaimsContract(contract *ClaimsContract) {
+	p.rules = append(p.rules, contract.Rule())
+}
+
 func (p Parser) validate(token Token) result.Result[Token] {
 	for _, rule := range p.rules {
 		if err := rule(token); err != nil {
