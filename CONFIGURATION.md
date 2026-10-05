@@ -241,6 +241,10 @@ regexp: <regex>,
 # The query sent in the TCP probe and the expected associated response.
 # "expect" matches a regular expression; it is mutually exclusive with "expect_bytes".
 # "expect_bytes" does exact byte-by-byte match; it is mutually exclusive with "expect".
+# "frame" reads one length-prefixed binary frame and asserts on fields of the
+# complete frame; it is mutually exclusive with "expect" and "expect_bytes".
+# Text and frame steps can be combined in sequence; every step consumes
+# exactly its own bytes from the connection.
 # "labels" can define labels which will be exported on metric "probe_expect_info";
 # "send" sends some content;
 # "send" and "labels.value" can contain values matched by "expect" (such as "${1}");
@@ -248,6 +252,35 @@ regexp: <regex>,
 query_response:
   [ - [ [ expect: <string> ],
         [ expect_bytes: <string> ],
+        [ frame:
+            # Locates the length field inside the frame header.
+            length_field:
+              # Byte offset of the length field within the frame header.
+              [ offset: <int> | default = 0 ]
+              # Width of the length field in bytes: 1, 2, 4 or 8.
+              size: <int>
+              # Byte order of the length field ("big" or "little").
+              [ byte_order: <string> | default = "big" ]
+              # Whether the declared length includes the frame header.
+              [ includes_header: <boolean> | default = false ]
+            # Size of the frame header in bytes. Defaults to the end of
+            # the length field (offset + size).
+            [ header_size: <int> ]
+            # Maximum accepted total frame size in bytes. Frames declaring
+            # a larger size are rejected immediately.
+            [ max_frame_size: <int> | default = 1048576 ]
+            # Assertions on fields of the complete frame. Each entry takes
+            # either "value" (an unsigned integer of "size" bytes read with
+            # "byte_order") or "bytes" (an exact byte sequence).
+            [ expect_fields:
+              [ - offset: <int>
+                  [ size: <int> ]
+                  [ byte_order: <string> | default = "big" ]
+                  [ value: <int> ]
+                  [ bytes: <string> ], ...
+              ]
+            ]
+        ],
         [ labels:
           - [ name: <string>
               value: <string>

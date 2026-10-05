@@ -14,6 +14,7 @@
 package prober
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -725,6 +726,350 @@ func TestTCPConnectionQueryResponseMatching(t *testing.T) {
 	}
 	checkRegistryLabels(expectedLabels, mfs, t)
 
+}
+
+func uint64Ptr(v uint64) *uint64 {
+	return &v
+}
+
+// The server splits the frame (including its length header) into several
+// writes; the prober must reassemble the complete frame.
+func TestTCPConnectionQueryResponseFrameSplitHeader(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Frame: &config.Frame{
+						LengthField: config.FrameLengthField{Offset: 0, Size: 2, ByteOrder: "big"},
+						ExpectFields: []config.FrameFieldExpect{
+							{Offset: 2, Size: 1, Value: uint64Ptr(7)},
+							{Offset: 3, Bytes: "hi!"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		// Frame: length 0x0004 (header not included), body 0x07 "hi!".
+		// Send it byte by byte so no single read can return the whole frame.
+		for _, b := range [][]byte{{0x00}, {0x04}, {0x07}, {'h'}, {'i'}, {'!'}} {
+			if _, err := conn.Write(b); err != nil {
+				panic(fmt.Sprintf("Error writing on socket: %s", err))
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	if !ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module failed, expected success.")
+	}
+	<-ch
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_failed_due_to_bytes": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+}
+
+// Two frames coalesced into a single write must be consumed as two
+// separate frames by two consecutive frame steps.
+func TestTCPConnectionQueryResponseFrameCoalesced(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Frame: &config.Frame{
+						LengthField:  config.FrameLengthField{Offset: 0, Size: 2},
+						ExpectFields: []config.FrameFieldExpect{{Offset: 2, Bytes: "OK"}},
+					},
+				},
+				{
+					Frame: &config.Frame{
+						LengthField:  config.FrameLengthField{Offset: 0, Size: 2},
+						ExpectFields: []config.FrameFieldExpect{{Offset: 2, Bytes: "YES"}},
+					},
+				},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		// Both frames in a single write.
+		if _, err := conn.Write([]byte{0x00, 0x02, 'O', 'K', 0x00, 0x03, 'Y', 'E', 'S'}); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	if !ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module failed, expected success.")
+	}
+	<-ch
+}
+
+// The server declares a frame larger than max_frame_size and never sends
+// the body; the prober must reject it immediately instead of waiting for
+// the body until the deadline.
+func TestTCPConnectionQueryResponseFrameOversized(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Frame: &config.Frame{
+						LengthField:  config.FrameLengthField{Offset: 0, Size: 2},
+						MaxFrameSize: 16,
+					},
+				},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		// Declare 1024 bytes of body, then hold the connection open
+		// without sending any of it.
+		if _, err := conn.Write([]byte{0x04, 0x00}); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		conn.Read(make([]byte, 1)) // Block until the prober goes away.
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	start := time.Now()
+	if ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module succeeded, expected failure.")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("TCP module took %s to reject an oversized frame, expected a fast failure.", elapsed)
+	}
+	<-ch
+}
+
+// The server declares a plausible frame length but never sends the body;
+// the probe must fail bounded by the context deadline.
+func TestTCPConnectionQueryResponseFrameMissingBody(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Frame: &config.Frame{
+						LengthField: config.FrameLengthField{Offset: 0, Size: 2},
+					},
+				},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		// Declare 100 bytes of body, then hold the connection open
+		// without sending any of it.
+		if _, err := conn.Write([]byte{0x00, 0x64}); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		conn.Read(make([]byte, 1)) // Block until the prober goes away.
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	start := time.Now()
+	if ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module succeeded, expected failure.")
+	}
+	elapsed := time.Since(start)
+	if elapsed < 1*time.Second {
+		t.Fatalf("TCP module failed after %s, expected it to wait for the missing body.", elapsed)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("TCP module took %s, expected it to stay within the 2s budget.", elapsed)
+	}
+	<-ch
+}
+
+// A frame field assertion mismatch fails the probe and sets
+// probe_failed_due_to_bytes.
+func TestTCPConnectionQueryResponseFrameFieldMismatch(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{
+					Frame: &config.Frame{
+						LengthField: config.FrameLengthField{Offset: 0, Size: 2},
+						ExpectFields: []config.FrameFieldExpect{
+							{Offset: 2, Size: 2, Value: uint64Ptr(0x0304)},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte{0x00, 0x02, 0x01, 0x02}); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	if ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module succeeded, expected failure.")
+	}
+	<-ch
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_failed_due_to_bytes": 1,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+}
+
+// Text steps and binary frame steps compose in sequence; each step must
+// consume exactly its own bytes even when the peer coalesces a text line
+// and a frame into a single write.
+func TestTCPConnectionQueryResponseFrameMixedWithText(t *testing.T) {
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("Error listening on socket: %s", err)
+	}
+	defer ln.Close()
+
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	module := config.Module{
+		TCP: config.TCPProbe{
+			IPProtocolFallback: true,
+			QueryResponse: []config.QueryResponse{
+				{Expect: config.MustNewRegexp("^READY$")},
+				{
+					Frame: &config.Frame{
+						LengthField:  config.FrameLengthField{Offset: 0, Size: 4, ByteOrder: "little", IncludesHeader: true},
+						ExpectFields: []config.FrameFieldExpect{{Offset: 4, Bytes: "PING"}},
+					},
+				},
+				{Send: "DONE"},
+				{Expect: config.MustNewRegexp("^BYE$")},
+			},
+		},
+	}
+
+	ch := make(chan (struct{}))
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(fmt.Sprintf("Error accepting on socket: %s", err))
+		}
+		defer conn.Close()
+		// Greeting line and frame (total length 8 including the 4 byte
+		// little-endian length header, body "PING") in a single write.
+		if _, err := conn.Write([]byte("READY\r\n\x08\x00\x00\x00PING")); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		if err != nil {
+			panic(fmt.Sprintf("Error reading from socket: %s", err))
+		}
+		if line != "DONE\n" {
+			panic(fmt.Sprintf("Unexpected line from prober: %q", line))
+		}
+		if _, err := conn.Write([]byte("BYE\n")); err != nil {
+			panic(fmt.Sprintf("Error writing on socket: %s", err))
+		}
+		ch <- struct{}{}
+	}()
+	registry := prometheus.NewRegistry()
+	if !ProbeTCP(testCTX, ln.Addr().String(), module, registry, promslog.NewNopLogger()) {
+		t.Fatalf("TCP module failed, expected success.")
+	}
+	<-ch
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedResults := map[string]float64{
+		"probe_failed_due_to_regex": 0,
+		"probe_failed_due_to_bytes": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
 }
 
 func TestTCPConnectionQueryResponseByteMode(t *testing.T) {

@@ -1,0 +1,10 @@
+modules:
+  tcp_test:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      query_response:
+        - frame:
+            length_field:
+              offset: 0
+              size: 3

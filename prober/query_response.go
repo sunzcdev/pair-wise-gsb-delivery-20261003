@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 
@@ -110,53 +111,58 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		checkCRL(ctx, &state, checkRevoked, nil, registry, logger)
 	}
 
-	scanner := bufio.NewScanner(conn)
+	// All reads go through a single buffered reader so that text steps
+	// (line oriented) and binary frame steps consume exactly the bytes
+	// belonging to each step, regardless of how the peer segments its
+	// writes into packets.
+	reader := bufio.NewReader(conn)
 	for i, qr := range queryResponses {
 		logger.Debug("Processing query response entry", "entry_number", i)
 		send := qr.Send
 		if qr.Expect.Regexp != nil {
 			var match []int
+			var line []byte
 			// Read lines until one of them matches the configured regexp.
-			for scanner.Scan() {
-				logger.Debug("Read line", "line", scanner.Text())
-				match = qr.Expect.FindSubmatchIndex(scanner.Bytes())
-				if match != nil {
-					logger.Debug("Regexp matched", "regexp", qr.Expect.Regexp, "line", scanner.Text())
-					break
+			for match == nil {
+				l, err := reader.ReadBytes('\n')
+				if len(l) > 0 {
+					line = bytes.TrimSuffix(bytes.TrimSuffix(l, []byte("\n")), []byte("\r"))
+					logger.Debug("Read line", "line", string(line))
+					match = qr.Expect.FindSubmatchIndex(line)
 				}
-			}
-			if scanner.Err() != nil {
-				logger.Error("Error reading from connection", "err", scanner.Err().Error())
-				return false
+				if err != nil {
+					if err == io.EOF {
+						// The peer closed the connection without
+						// sending a matching line.
+						break
+					}
+					logger.Error("Error reading from connection", "err", err.Error())
+					return false
+				}
 			}
 			if match == nil {
 				probeFailedDueToRegex.Set(1)
-				logger.Error("Regexp did not match", "regexp", qr.Expect.Regexp, "line", scanner.Text())
+				logger.Error("Regexp did not match", "regexp", qr.Expect.Regexp, "line", string(line))
 				return false
 			}
+			logger.Debug("Regexp matched", "regexp", qr.Expect.Regexp, "line", string(line))
 			probeFailedDueToRegex.Set(0)
-			send = string(qr.Expect.Expand(nil, []byte(send), scanner.Bytes(), match))
+			send = string(qr.Expect.Expand(nil, []byte(send), line, match))
 			if qr.Labels != nil {
-				probeExpectInfo(registry, &qr, scanner.Bytes(), match)
+				probeExpectInfo(registry, &qr, line, match)
 			}
 		}
 		if qr.ExpectBytes != "" {
 			expectBytes := []byte(qr.ExpectBytes)
 
-			// Try to read same number of bytes as expected.
+			// Read exactly the number of bytes expected.
 			data := make([]byte, len(expectBytes))
-			n, err := conn.Read(data)
-			if err != nil {
+			if _, err := io.ReadFull(reader, data); err != nil {
 				logger.Error("Error reading from connection", "err", err)
 				return false
 			}
 
 			logger.Debug("Read bytes", "bytes", data)
-
-			if n < len(expectBytes) {
-				logger.Error("Read less data than expected", "expected", expectBytes, "bytes", data)
-				return false
-			}
 
 			if !bytes.Equal(expectBytes, data) {
 				probeFailedDueToBytes.Set(1)
@@ -164,6 +170,20 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 				return false
 			}
 			logger.Debug("Bytes matched", "expected", expectBytes, "bytes", data)
+			probeFailedDueToBytes.Set(0)
+		}
+		if qr.Frame != nil {
+			frame, err := readFrame(reader, qr.Frame)
+			if err != nil {
+				logger.Error("Error reading frame", "err", err)
+				return false
+			}
+			logger.Debug("Read frame", "bytes", frame)
+			if err := checkFrameFields(frame, qr.Frame.ExpectFields); err != nil {
+				probeFailedDueToBytes.Set(1)
+				logger.Error("Frame fields did not match", "err", err)
+				return false
+			}
 			probeFailedDueToBytes.Set(0)
 		}
 		if send != "" {
@@ -196,7 +216,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			}
 			logger.Debug("TLS Handshake (client) succeeded.")
 			conn = net.Conn(tlsConn)
-			scanner = bufio.NewScanner(conn)
+			reader = bufio.NewReader(conn)
 
 			// Get certificate expiry.
 			state := tlsConn.ConnectionState()

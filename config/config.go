@@ -356,9 +356,37 @@ type Label struct {
 type QueryResponse struct {
 	Expect      Regexp  `yaml:"expect,omitempty" json:"expect,omitzero"`
 	ExpectBytes string  `yaml:"expect_bytes,omitempty" json:"expect_bytes,omitempty"`
+	Frame       *Frame  `yaml:"frame,omitempty" json:"frame,omitempty"`
 	Labels      []Label `yaml:"labels,omitempty" json:"labels,omitempty"`
 	Send        string  `yaml:"send,omitempty" json:"send,omitempty"`
 	StartTLS    bool    `yaml:"starttls,omitempty" json:"starttls,omitempty"`
+}
+
+// Frame describes a length-prefixed binary frame to read from the
+// connection, together with assertions on fields of the complete frame.
+type Frame struct {
+	LengthField  FrameLengthField   `yaml:"length_field" json:"length_field"`
+	HeaderSize   int                `yaml:"header_size,omitempty" json:"header_size,omitempty"`
+	MaxFrameSize int                `yaml:"max_frame_size,omitempty" json:"max_frame_size,omitempty"`
+	ExpectFields []FrameFieldExpect `yaml:"expect_fields,omitempty" json:"expect_fields,omitempty"`
+}
+
+// FrameLengthField locates the length field inside the frame header.
+type FrameLengthField struct {
+	Offset         int    `yaml:"offset,omitempty" json:"offset,omitempty"`
+	Size           int    `yaml:"size" json:"size"`
+	ByteOrder      string `yaml:"byte_order,omitempty" json:"byte_order,omitempty"`
+	IncludesHeader bool   `yaml:"includes_header,omitempty" json:"includes_header,omitempty"`
+}
+
+// FrameFieldExpect asserts on a field of a complete frame, either as an
+// unsigned integer of a fixed width or as an exact byte sequence.
+type FrameFieldExpect struct {
+	Offset    int     `yaml:"offset" json:"offset"`
+	Size      int     `yaml:"size,omitempty" json:"size,omitempty"`
+	ByteOrder string  `yaml:"byte_order,omitempty" json:"byte_order,omitempty"`
+	Value     *uint64 `yaml:"value,omitempty" json:"value,omitempty"`
+	Bytes     string  `yaml:"bytes,omitempty" json:"bytes,omitempty"`
 }
 
 type TCPProbe struct {
@@ -619,7 +647,76 @@ func (s *QueryResponse) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.Expect.Regexp != nil && s.ExpectBytes != "" {
 		return errors.New("expect and expect_bytes are mutually exclusive")
 	}
+	if s.Frame != nil {
+		if s.Expect.Regexp != nil || s.ExpectBytes != "" {
+			return errors.New("frame is mutually exclusive with expect and expect_bytes")
+		}
+		if len(s.Labels) > 0 {
+			return errors.New("labels cannot be used with frame")
+		}
+	}
 	return nil
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (s *Frame) UnmarshalYAML(unmarshal func(any) error) error {
+	type plain Frame
+	if err := unmarshal((*plain)(s)); err != nil {
+		return err
+	}
+	if s.LengthField.Offset < 0 {
+		return errors.New("frame length_field offset cannot be negative")
+	}
+	switch s.LengthField.Size {
+	case 1, 2, 4, 8:
+	default:
+		return errors.New("frame length_field size must be one of 1, 2, 4 or 8")
+	}
+	if err := checkFrameByteOrder(s.LengthField.ByteOrder); err != nil {
+		return err
+	}
+	if s.HeaderSize < 0 {
+		return errors.New("frame header_size cannot be negative")
+	}
+	if s.HeaderSize > 0 && s.HeaderSize < s.LengthField.Offset+s.LengthField.Size {
+		return errors.New("frame header_size must cover the length field")
+	}
+	if s.MaxFrameSize < 0 {
+		return errors.New("frame max_frame_size cannot be negative")
+	}
+	for _, f := range s.ExpectFields {
+		if f.Offset < 0 {
+			return errors.New("frame expect_fields offset cannot be negative")
+		}
+		if f.Value != nil && f.Bytes != "" {
+			return errors.New("frame expect_fields value and bytes are mutually exclusive")
+		}
+		if f.Value == nil && f.Bytes == "" {
+			return errors.New("frame expect_fields requires value or bytes")
+		}
+		if f.Value != nil {
+			switch f.Size {
+			case 1, 2, 4, 8:
+			default:
+				return errors.New("frame expect_fields size must be one of 1, 2, 4 or 8")
+			}
+			if err := checkFrameByteOrder(f.ByteOrder); err != nil {
+				return err
+			}
+		} else if f.Size != 0 {
+			return errors.New("frame expect_fields size can only be set together with value")
+		}
+	}
+	return nil
+}
+
+func checkFrameByteOrder(order string) error {
+	switch order {
+	case "", "big", "little":
+		return nil
+	default:
+		return fmt.Errorf("invalid frame byte_order %q, must be \"big\" or \"little\"", order)
+	}
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
