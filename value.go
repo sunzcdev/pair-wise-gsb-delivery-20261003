@@ -195,6 +195,13 @@ type LState struct {
 	mainLoop     func(*LState, *callFrame)
 	ctx          context.Context
 	ctxCancelFn  context.CancelFunc
+
+	threadID  uint64
+	hook      VMHook
+	hookMask  HookMask
+	hookOn    bool
+	hookDepth int
+	hookInfo  *HookInfo
 }
 
 func (ls *LState) String() string   { return fmt.Sprintf("thread: %p", ls) }

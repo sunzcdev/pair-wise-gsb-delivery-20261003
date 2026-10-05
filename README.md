@@ -754,6 +754,50 @@ func main() {
 }
 ```
 
+### VM observation hooks (profiling)
+
+GopherLua lets a Go host install an observation hook on an `LState` to sample
+`call`, `return` and `line` activity without changing Lua semantics. Hooks are
+observation only: they must not call Lua code or mutate the running stack, and
+events raised while a hook is running are never re-delivered to it.
+
+```go
+L.SetHook(func(ls *lua.LState, event lua.HookEvent) {
+    info := ls.CurrentHookInfo()
+    // info.Event, info.Thread, info.CoroutineID, info.What ("Lua"/"Go"/"main"),
+    // info.Source, info.LineDefined, info.LastLineDefined, info.CurrentLine
+    switch event {
+    case lua.HookCall, lua.HookGoCall:
+        // function entered
+    case lua.HookReturn, lua.HookGoReturn, lua.HookTailReturn:
+        // function returned
+    case lua.HookLine:
+        // about to execute info.CurrentLine in info.Source
+    }
+}, lua.MaskCall|lua.MaskReturn|lua.MaskLine)
+```
+
+- Masks: `MaskCall`, `MaskReturn`, `MaskTailCall`, `MaskLine`, `MaskYield`
+  (combine with bitwise OR).
+- Events: `HookCall`, `HookReturn`, `HookTailCall`, `HookTailReturn`,
+  `HookGoCall`, `HookGoReturn`, `HookLine`, `HookYield`, `HookResume`.
+- A tail call is reported as a `HookTailCall` on the caller followed by the
+  callee entry; the callee's eventual exit is a `HookTailReturn`.
+- Go function entries/exits produce `HookGoCall`/`HookGoReturn`.
+- A coroutine emits `HookResume` when it (re)starts and `HookYield` when it
+  suspends or finishes. `HookInfo.CoroutineID` is a stable, per-thread id (the
+  main thread is `1`); install the hook on each coroutine you want to observe.
+- A backward jump that lands on the same source line (a one-line loop) still
+  fires a line event on every iteration, so tight loops remain observable.
+- A protected error exit emits synthetic return events, innermost frame first,
+  for every frame the error discards.
+- A hook may terminate the current protected call by raising an error with
+  `ls.RaiseError(...)`; the error is caught by an enclosing `pcall`/`PCall` in
+  the usual way.
+- Hooks are per `LState`. Calling `L.SetHook(nil, 0)` removes the hook and
+  restores the original, hook-free fast execution loop (no per-instruction
+  overhead).
+
 ## Differences between Lua and GopherLua
 
 ### Goroutines

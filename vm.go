@@ -11,9 +11,6 @@ import (
 )
 
 func mainLoop(L *LState, baseframe *callFrame) {
-	var inst uint32
-	var cf *callFrame
-
 	if L.stack.IsEmpty() {
 		return
 	}
@@ -24,6 +21,73 @@ func mainLoop(L *LState, baseframe *callFrame) {
 		return
 	}
 
+	if L.hookOn {
+		mainLoopHooked(L, baseframe)
+	} else {
+		mainLoopFast(L, baseframe)
+	}
+}
+
+func mainLoopWithContext(L *LState, baseframe *callFrame) {
+	if L.stack.IsEmpty() {
+		return
+	}
+
+	L.currentFrame = L.stack.Last()
+	if L.currentFrame.Fn.IsG {
+		callGFunction(L, false)
+		return
+	}
+
+	if L.hookOn {
+		for {
+			var inst uint32
+			var cf *callFrame
+			cf = L.currentFrame
+			inst = cf.Fn.Proto.Code[cf.Pc]
+			cf.Pc++
+			prePC := cf.Pc
+			frame := cf
+			select {
+			case <-L.ctx.Done():
+				L.RaiseError(L.ctx.Err().Error())
+				return
+			default:
+				if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
+					return
+				}
+			}
+			// this section is inlined by go-inline
+			// source function is 'func (L *LState) observeLine(frame *callFrame, prePC int) ' in '_vm.go'
+			{
+				L.lineHook(frame == L.currentFrame && L.currentFrame.Pc <= prePC)
+			}
+		}
+	} else {
+		for {
+			var inst uint32
+			var cf *callFrame
+			cf = L.currentFrame
+			inst = cf.Fn.Proto.Code[cf.Pc]
+			cf.Pc++
+			select {
+			case <-L.ctx.Done():
+				L.RaiseError(L.ctx.Err().Error())
+				return
+			default:
+				if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
+					return
+				}
+			}
+		}
+	}
+}
+
+// mainLoopFast is the original hot dispatch loop, byte for byte: with no hook
+// installed there is no per-instruction observation overhead at all.
+func mainLoopFast(L *LState, baseframe *callFrame) {
+	var inst uint32
+	var cf *callFrame
 	for {
 		cf = L.currentFrame
 		inst = cf.Fn.Proto.Code[cf.Pc]
@@ -34,35 +98,34 @@ func mainLoop(L *LState, baseframe *callFrame) {
 	}
 }
 
-func mainLoopWithContext(L *LState, baseframe *callFrame) {
+// mainLoopHooked is the dispatch loop used while an observation hook is
+// installed. Beyond normal dispatch it reports line events, including an extra
+// observation when a backward or self jump within the same frame lands on the
+// current source line (so one-line loops stay visible to samplers).
+func mainLoopHooked(L *LState, baseframe *callFrame) {
 	var inst uint32
 	var cf *callFrame
-
-	if L.stack.IsEmpty() {
-		return
-	}
-
-	L.currentFrame = L.stack.Last()
-	if L.currentFrame.Fn.IsG {
-		callGFunction(L, false)
-		return
-	}
-
 	for {
 		cf = L.currentFrame
 		inst = cf.Fn.Proto.Code[cf.Pc]
 		cf.Pc++
-		select {
-		case <-L.ctx.Done():
-			L.RaiseError(L.ctx.Err().Error())
+		prePC := cf.Pc
+		frame := cf
+		if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
 			return
-		default:
-			if jumpTable[int(inst>>26)](L, inst, baseframe) == 1 {
-				return
-			}
+		}
+		// this section is inlined by go-inline
+		// source function is 'func (L *LState) observeLine(frame *callFrame, prePC int) ' in '_vm.go'
+		{
+			L.lineHook(frame == L.currentFrame && L.currentFrame.Pc <= prePC)
 		}
 	}
 }
+
+// observeLine delivers the line event for the instruction just dispatched.
+func (L *LState) observeLine(frame *callFrame, prePC int) { // +inline-start
+	L.lineHook(frame == L.currentFrame && L.currentFrame.Pc <= prePC)
+} // +inline-end
 
 // regv is the first target register to copy the return values to.
 // It can be reg.top, indicating that the copied values are going into new registers, or it can be below reg.top
@@ -178,6 +241,14 @@ func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 	if parent == nil {
 		L.RaiseError("can not yield from outside of a coroutine")
 	}
+	// A protected error unwind reports return events itself; a normal transfer
+	// to the parent is a yield. The event is delivered while the yielding frame
+	// is still current so that its function and location are observable.
+	if !haserror {
+		if L.hook != nil {
+			L.fireHook(HookYield)
+		}
+	}
 	L.G.CurrentThread = parent
 	L.Parent = nil
 	if !L.wrapped {
@@ -199,6 +270,13 @@ func switchToParentThread(L *LState, nargs int, haserror bool, kill bool) {
 
 func callGFunction(L *LState, tailcall bool) bool {
 	frame := L.currentFrame
+	if L.hook != nil {
+		// Every Go function entry funnels through here, including OP_CALL,
+		// callR and the direct main-loop entry. A tail call from Lua has already
+		// reported HookTailCall, but the Go callee still produces its own entry
+		// event; the matching exit is the tail return emitted below.
+		L.fireHook(HookGoCall)
+	}
 	gfnret := frame.Fn.GFunction(L)
 	if tailcall {
 		L.currentFrame = L.RemoveCallerFrame()
@@ -219,6 +297,16 @@ func callGFunction(L *LState, tailcall bool) bool {
 		return true
 	}
 
+	// Emit the return while the Go frame is still current so that the event
+	// carries the Go function and its call site, then pop and restore the
+	// caller as the active frame.
+	if L.hook != nil {
+		if tailcall {
+			L.fireHook(HookTailReturn)
+		} else {
+			L.fireHook(HookGoReturn)
+		}
+	}
 	// this section is inlined by go-inline
 	// source function is 'func (rg *registry) CopyRange(regv, start, limit, n int) ' in '_state.go'
 	{
@@ -284,6 +372,10 @@ func threadRun(L *LState) {
 				} else {
 					L.SetTop(0)
 					L.Push(lv)
+					// Protected error exit of a coroutine: emit returns for the
+					// frames the error discards. haserror suppresses the usual
+					// yield event in switchToParentThread.
+					L.unwindHooks(0)
 					switchToParentThread(L, 1, true, true)
 				}
 			} else {
@@ -1203,6 +1295,9 @@ func init() {
 				if ls.stack.IsFull() {
 					ls.RaiseError("stack overflow")
 				}
+				if cf.Parent != nil {
+					cf.CallLine = frameLine(cf.Parent)
+				}
 				ls.stack.Push(cf)
 				newcf := ls.stack.Last()
 				// this section is inlined by go-inline
@@ -1304,6 +1399,11 @@ func init() {
 					}
 				}
 				ls.currentFrame = newcf
+				// Go entries are observed centrally in callGFunction; emit the Lua entry
+				// event here so that OP_CALL, callR and host-driven calls share one path.
+				if !newcf.Fn.IsG {
+					ls.hookEnterFrame()
+				}
 			}
 			if callable.IsG && callGFunction(L, false) {
 				return 1
@@ -1353,8 +1453,13 @@ func init() {
 					}
 				}
 			}
+			// The tail call is a single control transfer: the current function
+			// "tail returns" and the callee is immediately entered. The eventual
+			// return of the callee is reported as a tail return.
+			L.hookTailCallEvent()
 			if callable.IsG {
 				luaframe := cf
+				callline := frameLine(cf)
 				L.pushCallFrame(callFrame{
 					Fn:         callable,
 					Pc:         0,
@@ -1365,6 +1470,7 @@ func init() {
 					NRet:       cf.NRet,
 					Parent:     cf,
 					TailCall:   0,
+					CallLine:   callline,
 				}, lv, meta)
 				if callGFunction(L, true) {
 					return 1
@@ -1374,6 +1480,7 @@ func init() {
 				}
 			} else {
 				base := cf.Base
+				callline := frameLine(cf)
 				cf.Fn = callable
 				cf.Pc = 0
 				cf.Base = RA
@@ -1382,6 +1489,8 @@ func init() {
 				cf.NArgs = nargs
 				cf.NRet = cf.NRet
 				cf.TailCall++
+				cf.LastLine = 0
+				cf.CallLine = callline
 				lbase := cf.LocalBase
 				if meta {
 					cf.NArgs++
@@ -1527,6 +1636,9 @@ func init() {
 				}
 				cf.Base = base
 				cf.LocalBase = base + (cf.LocalBase - lbase + 1)
+				// The callee reuses the caller frame; report its entry now that
+				// currentFrame points at the new function.
+				L.hookEnterFrame()
 			}
 			return 0
 		},
@@ -1566,6 +1678,9 @@ func init() {
 				n = nret
 			}
 
+			// Return observation: the frame is still the active frame, so the
+			// event carries the returning function and its return site.
+			L.hookLeaveFrame(cf.TailCall > 0)
 			if L.Parent != nil && L.stack.Sp() == 1 {
 				// this section is inlined by go-inline
 				// source function is 'func copyReturnValues(L *LState, regv, start, n, b int) ' in '_vm.go'

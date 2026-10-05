@@ -141,6 +141,8 @@ type callFrame struct {
 	NArgs      int
 	NRet       int
 	TailCall   int
+	LastLine   int
+	CallLine   int
 }
 
 type callFrameStack interface {
@@ -679,6 +681,7 @@ func newLState(options Options) *LState {
 		mainLoop:     mainLoop,
 		ctx:          nil,
 	}
+	ls.threadID = nextThreadID()
 	if options.MinimizeStackMemory {
 		ls.stack = newAutoGrowingCallFrameStack(options.CallStackSize)
 	} else {
@@ -1140,6 +1143,9 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 	if ls.stack.IsFull() {
 		ls.RaiseError("stack overflow")
 	}
+	if cf.Parent != nil {
+		cf.CallLine = frameLine(cf.Parent)
+	}
 	ls.stack.Push(cf)
 	newcf := ls.stack.Last()
 	// this section is inlined by go-inline
@@ -1241,6 +1247,11 @@ func (ls *LState) pushCallFrame(cf callFrame, fn LValue, meta bool) { // +inline
 		}
 	}
 	ls.currentFrame = newcf
+	// Go entries are observed centrally in callGFunction; emit the Lua entry
+	// event here so that OP_CALL, callR and host-driven calls share one path.
+	if !newcf.Fn.IsG {
+		ls.hookEnterFrame()
+	}
 } // +inline-end
 
 func (ls *LState) callR(nargs, nret, rbase int) {
@@ -2069,6 +2080,7 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 							err = rcv.(*ApiError)
 							err.(*ApiError).StackTrace = ls.stackTrace(0)
 						}
+						ls.unwindHooks(sp)
 						ls.stack.SetSp(sp)
 						ls.currentFrame = ls.stack.Last()
 						ls.reg.SetTop(base)
@@ -2079,6 +2091,10 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 			} else if len(err.(*ApiError).StackTrace) == 0 {
 				err.(*ApiError).StackTrace = ls.stackTrace(0)
 			}
+			// Protected error exit: report synthetic returns for every frame
+			// abandoned by the unwind, innermost first, before the stack is
+			// reset. This mirrors the order of normal (non-error) returns.
+			ls.unwindHooks(sp)
 			ls.stack.SetSp(sp)
 			ls.currentFrame = ls.stack.Last()
 			ls.reg.SetTop(base)
@@ -2195,6 +2211,7 @@ func (ls *LState) Resume(th *LState, fn *LFunction, args ...LValue) (ResumeState
 		}
 	}
 	top := ls.GetTop()
+	th.hookResume()
 	threadRun(th)
 	haserror := LVIsFalse(ls.Get(top + 1))
 	ret := make([]LValue, 0, ls.GetTop())
