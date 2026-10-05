@@ -63,6 +63,11 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	}
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
+	// Resolve response-end trailer hooks (e.g. content-digest) declared by
+	// response filters. Must happen before headers are committed, and is a
+	// no-op for HEAD / bodiless status codes / WebSocket upgrades.
+	trailerHooks := proxy.prepareTrailerHooks(ctx, resp)
+
 	// Announce trailers known at this point (HTTP/1.1 with pre-announced
 	// Trailer header). Setting "Trailer" before WriteHeader makes
 	// http.Server commit to chunked encoding (h1) or a trailing HEADERS
@@ -76,6 +81,8 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		}
 		w.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
 	}
+	announceTrailerHooks(w, trailerHooks)
+	ctx.headersCommitted = true
 	w.WriteHeader(resp.StatusCode)
 
 	if isWebSocketHandshake(resp.Header) {
@@ -94,16 +101,37 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var copyWriter io.Writer = w
-	// Content-Type header may also contain charset definition, so here we need to check the prefix.
-	// Transfer-Encoding can be a list of comma separated values, so we use Contains() for it.
-	if strings.HasPrefix(w.Header().Get("content-type"), "text/event-stream") ||
-		strings.Contains(w.Header().Get("transfer-encoding"), "chunked") {
-		// server-side events, flush the buffered data to the client.
-		copyWriter = &flushWriter{w: w}
+	var bytesCopied int64
+	var copyResult CopyResult
+	if len(trailerHooks) > 0 {
+		// Hooked path: distinguish read vs write failures and feed the digest
+		// hashes with exactly the bytes accepted by the client.
+		var flushEveryCopy func() error
+		if strings.HasPrefix(w.Header().Get("content-type"), "text/event-stream") ||
+			strings.Contains(w.Header().Get("transfer-encoding"), "chunked") {
+			// server-side events / chunked: flush each chunk to the client.
+			// Using an explicit flush keeps the digest hashing on the
+			// ResponseWriter rather than behind a wrapper's io.Writer view.
+			rc := http.NewResponseController(w)
+			flushEveryCopy = func() error { return rc.Flush() }
+		}
+		copyResult, _ = copyBody(w, resp.Body, trailerHooks, flushEveryCopy)
+		bytesCopied = copyResult.BytesWritten
+	} else {
+		var copyWriter io.Writer = w
+		// Content-Type header may also contain charset definition, so here we need to check the prefix.
+		// Transfer-Encoding can be a list of comma separated values, so we use Contains() for it.
+		if strings.HasPrefix(w.Header().Get("content-type"), "text/event-stream") ||
+			strings.Contains(w.Header().Get("transfer-encoding"), "chunked") {
+			// server-side events, flush the buffered data to the client.
+			copyWriter = &flushWriter{w: w}
+		}
+		nr, err := io.Copy(copyWriter, resp.Body)
+		bytesCopied = nr
+		if err != nil {
+			ctx.Warnf("Can't copy response body %v", err)
+		}
 	}
-
-	nr, err := io.Copy(copyWriter, resp.Body)
 	if err := resp.Body.Close(); err != nil {
 		ctx.Warnf("Can't close response body %v", err)
 	}
@@ -134,5 +162,12 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
-	ctx.Logf("Copied %v bytes to client error=%v", nr, err)
+
+	// Populate declared response-end trailers (e.g. content digest) from the
+	// final copy outcome. This must happen AFTER forwarding upstream trailers:
+	// the equal-count branch above copies over a freshly-cleared header map and
+	// would otherwise wipe the hook's value. Hooks see whether the stream
+	// completed intact and withhold their value otherwise. Runs once.
+	proxy.fireTrailerHooks(w, ctx, trailerHooks, copyResult)
+	ctx.Logf("Copied %v bytes to client", bytesCopied)
 }

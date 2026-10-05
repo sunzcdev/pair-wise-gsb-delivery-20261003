@@ -24,6 +24,13 @@ type ProxyCtx struct {
 	// A handle for the user to keep data in the context, from the call of ReqHandler to the
 	// call of RespHandler
 	UserData any
+	// trailerHooks are response-end hooks (e.g. content-digest trailers)
+	// declared by response filters before the headers are committed.
+	trailerHooks []*responseTrailer
+	// headersCommitted becomes true once the proxy is about to write the
+	// response status/headers to the client, after which new trailer
+	// declarations are rejected.
+	headersCommitted bool
 	// Will connect a request to a response
 	Session   int64
 	certStore CertStorage

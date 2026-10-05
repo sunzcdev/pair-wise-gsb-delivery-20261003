@@ -182,9 +182,13 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
+	// Resolve response-end trailer hooks (e.g. content-digest) declared by
+	// response filters. No-op for HEAD / bodiless status codes.
+	trailerHooks := proxy.prepareTrailerHooks(ctx, resp)
+
 	// If the body was replaced by a filter, drop Content-Length so
 	// the http2 framer can stream it without a length mismatch.
-	if resp.Body != origBody {
+	if resp.Body != origBody || len(trailerHooks) > 0 {
 		w.Header().Del("Content-Length")
 	}
 
@@ -198,10 +202,30 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 		w.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
 	}
 
+	announceTrailerHooks(w, trailerHooks)
+	ctx.headersCommitted = true
 	w.WriteHeader(resp.StatusCode)
 
+	var copyResult CopyResult
 	if resp.Body != nil {
-		if shouldFlushStreaming(resp) {
+		if len(trailerHooks) > 0 {
+			// Hooked path: track read vs write errors separately and feed
+			// the digest hashes exactly the bytes written downstream.
+			var flushEveryWrite func() error
+			if shouldFlushStreaming(resp) {
+				rc := http.NewResponseController(w)
+				flushEveryWrite = func() error { return rc.Flush() }
+			}
+			var copyErr error
+			copyResult, copyErr = copyBody(w, resp.Body, trailerHooks, flushEveryWrite)
+			if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, context.Canceled) {
+				if copyResult.WriteErr != nil {
+					ctx.Warnf("HTTP/2 MITM: error writing response body: %v", copyResult.WriteErr)
+				} else {
+					ctx.Warnf("HTTP/2 MITM: error reading response body: %v", copyResult.ReadErr)
+				}
+			}
+		} else if shouldFlushStreaming(resp) {
 			// Streaming (gRPC/Connect/SSE/chunked): flush each chunk so it reaches the
 			// client as it arrives. Mirrors net/http/httputil.ReverseProxy.flushInterval.
 			rc := http.NewResponseController(w)
@@ -251,6 +275,10 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 			}
 		}
 	}
+
+	// Response-end hooks run after upstream trailers are forwarded, so the
+	// equal-count copyHeaders above cannot wipe their values. Runs once.
+	proxy.fireTrailerHooks(w, ctx, trailerHooks, copyResult)
 }
 
 // shouldFlushStreaming reports whether resp should be forwarded with a flush after
