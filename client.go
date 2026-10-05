@@ -2295,17 +2295,18 @@ func (c *Client) onSubscribeErrorGen(channel string, expectGen uint64) {
 	}
 }
 
-// rollbackConnectServerSideSubs undoes connect-time server-side subscriptions
-// when connectCmd aborts between subscribeCmd and the finalize loop. At that
-// point each channel still holds its reservation in c.channels (finalize has
-// not replaced it) plus a hub entry, and — for channels whose own subscribe
-// succeeded — a node-level presence entry. Reservation and hub entry are
-// dropped generation-matched, exactly as the finalize loop does, so an abort
-// cannot tear down a fresh subscribe that took over the channel. Presence must
-// be removed explicitly because close() snapshots c.channels only after the
-// reservations are gone; for a channel whose own subscribe failed, subscribeCmd
-// already removed its own presence on the way out.
-func (c *Client) rollbackConnectServerSideSubs(subCtxMap map[string]subscribeContext, reservedGens map[string]uint64) {
+// rollbackServerSideSubscribes undoes server-side subscriptions when their
+// group aborts between subscribeCmd and the commit (connectCmd's finalize
+// loop, SubscribeBatch's commitBatchSubscriptions). At that point each channel
+// still holds its reservation in c.channels (the commit has not replaced it)
+// plus a hub entry, and — for channels whose own subscribe succeeded — a
+// node-level presence entry. Reservation and hub entry are dropped
+// generation-matched, exactly as the commit does, so an abort cannot tear down
+// a fresh subscribe that took over the channel. Presence must be removed
+// explicitly because close() snapshots c.channels only after the reservations
+// are gone; for a channel whose own subscribe failed, subscribeCmd already
+// removed its own presence on the way out.
+func (c *Client) rollbackServerSideSubscribes(subCtxMap map[string]subscribeContext, reservedGens map[string]uint64) {
 	for channel, subCtx := range subCtxMap {
 		c.onSubscribeErrorGen(channel, reservedGens[channel])
 		c.removeSubscribePresence(channel, subCtx.channelContext.flags)
@@ -3488,7 +3489,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 
 		if subDisconnect != nil || subError != nil {
 			c.cancelServerSideBuffering(subCtxMap)
-			c.rollbackConnectServerSideSubs(subCtxMap, reservedGens)
+			c.rollbackServerSideSubscribes(subCtxMap, reservedGens)
 			if subDisconnect != nil {
 				return subDisconnect
 			}
@@ -3502,7 +3503,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 			protoReply, err := c.getConnectPushReply(res)
 			if err != nil {
 				c.cancelServerSideBuffering(subCtxMap)
-				c.rollbackConnectServerSideSubs(subCtxMap, reservedGens)
+				c.rollbackServerSideSubscribes(subCtxMap, reservedGens)
 				c.node.logger.log(newErrorLogEntry(err, "error encoding connect", map[string]any{"error": err.Error()}))
 				return DisconnectServerError
 			}
@@ -3526,7 +3527,7 @@ func (c *Client) connectCmd(req *protocol.ConnectRequest, cmd *protocol.Command,
 		protoReply, err := c.getConnectCommandReply(res)
 		if err != nil {
 			c.cancelServerSideBuffering(subCtxMap)
-			c.rollbackConnectServerSideSubs(subCtxMap, reservedGens)
+			c.rollbackServerSideSubscribes(subCtxMap, reservedGens)
 			c.node.logger.log(newErrorLogEntry(err, "error encoding connect", map[string]any{"error": err.Error()}))
 			return DisconnectServerError
 		}

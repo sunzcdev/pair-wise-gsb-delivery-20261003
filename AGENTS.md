@@ -17,4 +17,6 @@ All buffers of a client share one limit, `ClientQueueMaxSize`, counted separatel
 
 Nothing of the channel goes to the client before its result, and nothing of an unsubscribe before the result and recovered publications. Recovered publications are always delivered.
 
-Guarded by `TestClientRecovery*`, `TestClientRecoveringSubscribeFailureCancelsBuffering`, the leak check in `TestMain` and `internal/recovery` tests.
+`Client.SubscribeBatch` subscribes a group of channels atomically: every channel's result is written first, then the group commits under one lock, then all buffers are stopped — so a publication of an already-recovered channel can't overtake the group's reply, and one failed channel rolls back the hub registrations, presence entries and buffers of the rest.
+
+Guarded by `TestClientRecovery*`, `TestClientRecoveringSubscribeFailureCancelsBuffering`, `TestClientSubscribeBatch*`, the leak check in `TestMain` and `internal/recovery` tests.
