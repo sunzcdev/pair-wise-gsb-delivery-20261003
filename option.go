@@ -30,6 +30,22 @@ func WithVariables(variables []string) CompilerOption {
 	}
 }
 
+// WithStrictNumbers is a compiler option for the strict number mode.
+// In this mode, arithmetic operations, math built-in functions, and custom
+// extension functions raise an error as soon as they produce NaN or a
+// positive or negative infinity, including such values nested in arrays and
+// objects returned by the functions. The error is an ordinary query error
+// and is catchable by try-catch; it is not raised at the JSON encoding
+// phase (where NaN is encoded as null and infinities are truncated to the
+// maximum finite float64 values in the jq compatible behavior). Integer
+// arithmetic keeps using int and *big.Int values and never loses precision.
+// By default, the option is disabled for the jq compatible behavior.
+func WithStrictNumbers() CompilerOption {
+	return func(c *compiler) {
+		c.strictNumbers = true
+	}
+}
+
 // WithFunction is a compiler option for adding a custom internal function.
 // Specify the minimum and maximum count of the function arguments. These
 // values should satisfy 0 <= minarity <= maxarity <= 30, otherwise panics.

@@ -9223,3 +9223,75 @@
   error: |
     unknown flag `--qqq'
   exit_code: 2
+
+- name: strict-numbers option default encodes nan as null
+  args:
+    - -n
+    - 'nan'
+  input: ''
+  expected: |
+    null
+
+- name: strict-numbers option default truncates infinity
+  args:
+    - -n
+    - '1e308 + 1e308'
+  input: ''
+  expected: |
+    1.7976931348623157e+308
+
+- name: strict-numbers option errors on arithmetic overflow
+  args:
+    - -n
+    - --strict-numbers
+    - '1e308 + 1e308'
+  input: ''
+  error: |
+    cannot produce infinity as the result of: +
+  exit_code: 5
+
+- name: strict-numbers option errors on math builtin nan
+  args:
+    - -n
+    - --strict-numbers
+    - '(-1) | sqrt'
+  input: ''
+  error: |
+    cannot produce NaN as the result of: sqrt
+  exit_code: 5
+
+- name: strict-numbers option errors on nested results
+  args:
+    - -n
+    - --strict-numbers
+    - '{a: [pow(10; 400)]}'
+  input: ''
+  error: |
+    cannot produce infinity as the result of: pow
+  exit_code: 5
+
+- name: strict-numbers option errors on number literal infinity
+  args:
+    - -n
+    - --strict-numbers
+    - '1e309'
+  input: ''
+  error: |
+    number literal produces infinity
+  exit_code: 5
+
+- name: strict-numbers option error caught by try
+  args:
+    - -n
+    - --strict-numbers
+    - 'try (1e308 + 1e308) catch "caught"'
+  input: ''
+  expected: '"caught"'
+
+- name: strict-numbers option keeps big integer precision
+  args:
+    - -n
+    - --strict-numbers
+    - '111111111111111111111 * 111111111111111111111'
+  input: ''
+  expected: '12345679012345679012320987654320987654321'

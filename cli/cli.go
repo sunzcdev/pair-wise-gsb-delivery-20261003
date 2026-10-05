@@ -68,6 +68,7 @@ type flagopts struct {
 	InputStream   bool              `long:"stream" description:"parse input in stream fashion"`
 	InputYAML     bool              `long:"yaml-input" description:"read input as YAML format"`
 	InputSlurp    bool              `short:"s" long:"slurp" description:"read all inputs into an array"`
+	StrictNumbers bool              `long:"strict-numbers" description:"error on NaN and infinities produced by the query"`
 	FromFile      bool              `short:"f" long:"from-file" description:"load query from file"`
 	ModulePaths   []string          `short:"L" long:"library-path" args:"dir" description:"directory to search modules from"`
 	Arg           map[string]string `long:"arg" args:"name value" description:"set a string value to a variable"`
@@ -238,7 +239,7 @@ Usage:
 	}
 	iter := cli.createInputIter(args)
 	defer iter.Close()
-	code, err := gojq.Compile(query,
+	compileOpts := []gojq.CompilerOption{
 		gojq.WithModuleLoader(gojq.NewModuleLoader(modulePaths)),
 		gojq.WithEnvironLoader(os.Environ),
 		gojq.WithVariables(cli.argnames),
@@ -255,7 +256,11 @@ Usage:
 			}(iter),
 		),
 		gojq.WithInputIter(iter),
-	)
+	}
+	if opts.StrictNumbers {
+		compileOpts = append(compileOpts, gojq.WithStrictNumbers())
+	}
+	code, err := gojq.Compile(query, compileOpts...)
 	if err != nil {
 		if err, ok := err.(interface {
 			QueryParseError() (string, string, error)

@@ -17,6 +17,7 @@ type compiler struct {
 	variables     []string
 	customFuncs   map[string]function
 	inputIter     Iter
+	strictNumbers bool
 	codes         []*code
 	codeinfos     []codeinfo
 	builtinScope  *scopeinfo
@@ -27,9 +28,10 @@ type compiler struct {
 
 // Code is a compiled jq query.
 type Code struct {
-	variables []string
-	codes     []*code
-	codeinfos []codeinfo
+	variables     []string
+	codes         []*code
+	codeinfos     []codeinfo
+	strictNumbers bool
 }
 
 // Run runs the code with the variable values (which should be in the
@@ -112,9 +114,10 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 	c.optimizeTailRec()
 	c.optimizeCodeOps()
 	return &Code{
-		variables: c.variables,
-		codes:     c.codes,
-		codeinfos: c.codeinfos,
+		variables:     c.variables,
+		codes:         c.codes,
+		codeinfos:     c.codeinfos,
+		strictNumbers: c.strictNumbers,
 	}, nil
 }
 

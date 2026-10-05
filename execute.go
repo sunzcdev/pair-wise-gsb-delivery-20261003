@@ -11,6 +11,7 @@ import (
 func (env *env) execute(bc *Code, v any, vars ...any) Iter {
 	env.codes = bc.codes
 	env.codeinfos = bc.codeinfos
+	env.strictNumbers = bc.strictNumbers
 	env.push(v)
 	for i := len(vars) - 1; i >= 0; i-- {
 		env.push(vars[i])
@@ -40,7 +41,14 @@ loop:
 		case opnop:
 			// nop
 		case oppush:
-			env.push(code.v)
+			v := code.v
+			if env.strictNumbers {
+				if f, ok := v.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
+					err = &nonFiniteNumberConstantError{f}
+					break loop
+				}
+			}
+			env.push(v)
 		case oppop:
 			env.pop()
 		case opdup:
@@ -49,7 +57,14 @@ loop:
 			env.push(v)
 		case opconst:
 			env.pop()
-			env.push(code.v)
+			v := code.v
+			if env.strictNumbers {
+				if f, ok := v.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
+					err = &nonFiniteNumberConstantError{f}
+					break loop
+				}
+			}
+			env.push(v)
 		case opload:
 			env.push(env.values[env.index(code.v.([2]int))])
 		case opstore:
@@ -186,6 +201,15 @@ loop:
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
+				}
+				if env.strictNumbers {
+					name := v[2].(string)
+					if it, ok := w.(Iter); ok {
+						w = &strictIter{it, name}
+					} else if e := checkStrictNumber(w, name); e != nil {
+						err = e
+						break loop
+					}
 				}
 				env.push(w)
 				if !env.paths.empty() && env.expdepth == 0 {
