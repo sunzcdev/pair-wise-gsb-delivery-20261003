@@ -43,6 +43,8 @@ const (
 	TransferModeStream TransferMode = iota
 	// TransferModeDeflate is the compressed transfer mode using deflate algorithm
 	TransferModeDeflate
+	// TransferModeBlock is the block transfer mode defined in RFC 959 (MODE B)
+	TransferModeBlock
 )
 
 // DataChannel is the enumerable that represents the data channel (active or passive)
@@ -745,6 +747,10 @@ func (c *clientHandler) TransferOpen(info string) (io.ReadWriter, error) {
 
 			return nil, fmt.Errorf("could not switch to deflate mode: %w", err)
 		}
+	}
+
+	if c.transferMode == TransferModeBlock {
+		transferStream = newBlockModeTransfer(transferStream)
 	}
 
 	c.isTransferOpen = true

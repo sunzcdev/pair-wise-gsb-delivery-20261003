@@ -533,6 +533,12 @@ func (c *clientHandler) handleREST(param string) error {
 			return nil
 		}
 
+		if c.transferMode == TransferModeBlock {
+			c.writeMessage(StatusSyntaxErrorParameters, "Resuming transfers not allowed in block mode")
+
+			return nil
+		}
+
 		c.ctxRest = size
 		c.writeMessage(StatusFileActionPending, "OK")
 	} else {
