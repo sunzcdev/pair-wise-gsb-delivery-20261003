@@ -47,6 +47,45 @@ For usage and examples see the [documentation](https://pkg.go.dev/mod/github.com
 
 The `Decode` function has examples associated with it there.
 
+## Planning & Auditing Decodes
+
+For configuration review workflows you can compute the assignment a decoder
+would perform without touching the target, inspect it, and only execute it
+after approval:
+
+```go
+decoder, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{Result: &cfg})
+if err != nil {
+    log.Fatal(err)
+}
+
+plan, err := decoder.Plan(input)
+if err != nil {
+    // The input cannot be decoded with the current configuration.
+    log.Fatal(err)
+}
+
+for _, op := range plan.Ops() {
+    // op.Kind is mapstructure.OpSet, OpZero, OpRetain or OpUserCode.
+    fmt.Printf("%s %s <- %v (%s)\n", op.Kind, op.Name, op.Value, op.Conversion)
+}
+```
+
+- `plan.Set()`, `plan.Zero()` and `plan.Retained()` list the fields and map
+  entries that would be written, reset or left alone. Nested maps are merged,
+  missing fields are reported as retained, and nil pointer allocations are
+  listed explicitly.
+- Hooks and types implementing `UnmarshalMapstructure` cannot be previewed
+  without running caller-supplied code. They appear as `OpUserCode` operations
+  (see `plan.UserCode()` / `plan.RequiresUserCode()`), they never execute
+  during planning, and `plan.Apply(nil)` refuses to run them. Approve them
+  deliberately with `plan.Apply(&mapstructure.ApplyOptions{AllowUserCode: true})`.
+- The plan stores only type information and detached value copies, never
+  addresses into the target object. Before applying, it re-fingerprints the
+  input, configuration and target; if any of them changed after planning,
+  `Apply` returns `mapstructure.ErrPlanStale` instead of reusing the stale
+  judgement.
+
 ## But Why?!
 
 Go offers fantastic standard libraries for decoding formats such as JSON.

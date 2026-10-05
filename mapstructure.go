@@ -386,6 +386,7 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+	planner          *planner
 }
 
 // Metadata contains information about decoding a structure that
@@ -550,6 +551,14 @@ func isNil(input any) bool {
 	return val.Kind() == reflect.Ptr && val.IsNil()
 }
 
+// markZeroed records an explicit zeroing of the named target while a plan
+// is being computed. It is a no-op during ordinary decoding.
+func (d *Decoder) markZeroed(name string) {
+	if d.planner != nil {
+		d.planner.markZero(name)
+	}
+}
+
 // Decodes an unknown data type into a specific reflection value.
 func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 	var (
@@ -561,11 +570,15 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 		// Typed nils won't match the "input == nil" below, so reset input.
 		input = nil
 	}
+	if d.planner != nil {
+		d.planner.markInputType(name, input)
+	}
 	if input == nil {
 		// If the data is nil, then we don't set anything, unless ZeroFields is set
 		// to true.
 		if d.config.ZeroFields {
 			outVal.Set(reflect.Zero(outVal.Type()))
+			d.markZeroed(name)
 
 			if d.config.Metadata != nil && name != "" {
 				d.config.Metadata.Keys = append(d.config.Metadata.Keys, name)
@@ -580,6 +593,7 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 			// If the input value is invalid, then we just set the value
 			// to be the zero value.
 			outVal.Set(reflect.Zero(outVal.Type()))
+			d.markZeroed(name)
 			if d.config.Metadata != nil && name != "" {
 				d.config.Metadata.Keys = append(d.config.Metadata.Keys, name)
 			}
@@ -599,11 +613,19 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 	}
 
 	if d.cachedDecodeHook != nil {
-		// We have a DecodeHook, so let's pre-process the input.
-		var err error
-		input, err = d.cachedDecodeHook(inputVal, outVal)
-		if err != nil {
-			return newDecodeError(name, err)
+		if d.planner != nil {
+			// Never invoke user-provided hooks during planning. Record the
+			// callback for approval and fall through to the built-in
+			// decoding logic so the surrounding assignment can still be
+			// previewed structurally.
+			d.planner.markOpaque(name, HookCallback)
+		} else {
+			// We have a DecodeHook, so let's pre-process the input.
+			var err error
+			input, err = d.cachedDecodeHook(inputVal, outVal)
+			if err != nil {
+				return newDecodeError(name, err)
+			}
 		}
 	}
 	if isNil(input) {
@@ -617,10 +639,16 @@ func (d *Decoder) decode(name string, input any, outVal reflect.Value) error {
 	unmarshaled := false
 	if !d.config.DisableUnmarshaler {
 		if unmarshaler, ok := getUnmarshaler(outVal); ok {
-			if err = unmarshaler.UnmarshalMapstructure(input); err != nil {
-				err = newDecodeError(name, err)
+			if d.planner != nil {
+				// Never invoke the Unmarshaler during planning; record the
+				// callback for approval and preview structurally instead.
+				d.planner.markOpaque(name, UnmarshalerCallback)
+			} else {
+				if err = unmarshaler.UnmarshalMapstructure(input); err != nil {
+					err = newDecodeError(name, err)
+				}
+				unmarshaled = true
 			}
-			unmarshaled = true
 		}
 	}
 
@@ -1026,6 +1054,9 @@ func (d *Decoder) decodeMap(name string, data any, val reflect.Value) error {
 		// Make a new map to hold our result
 		mapType := reflect.MapOf(valKeyType, valElemType)
 		valMap = reflect.MakeMap(mapType)
+		if d.config.ZeroFields {
+			d.markZeroed(name)
+		}
 	}
 
 	dataVal := reflect.ValueOf(data)
@@ -1322,6 +1353,7 @@ func (d *Decoder) decodePtr(name string, data any, val reflect.Value) (bool, err
 		if !val.IsNil() && val.CanSet() {
 			nilValue := reflect.New(val.Type()).Elem()
 			val.Set(nilValue)
+			d.markZeroed(name)
 		}
 
 		return true, nil
@@ -1691,6 +1723,13 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			if !rawMapVal.IsValid() {
 				// There was no matching key in the map for the value in
 				// the struct. Remember it for potential errors and metadata.
+				if d.config.ZeroFields {
+					missingName := fieldName
+					if name != "" {
+						missingName = name + "." + fieldName
+					}
+					d.markZeroed(missingName)
+				}
 				if !(d.config.AllowUnsetPointer && fieldValue.Kind() == reflect.Ptr) {
 					targetValKeysUnused[fieldName] = struct{}{}
 				}
