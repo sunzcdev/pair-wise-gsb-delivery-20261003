@@ -4,6 +4,26 @@ Contains experimental utilities and APIs for Prometheus.
 
 Packages within this module are listed below.
 
+## Delta
+
+The `delta` package derives per-interval increments of cumulative Prometheus
+metrics from `Gather` results without resetting or otherwise mutating the
+underlying metrics. Create one `delta.Reader` per reporting cadence around a
+`prometheus.Gatherer` (for example, a `*prometheus.Registry`); every successful
+`Read` reports the counter and classic histogram increments since the previous
+successful one.
+
+The reader keeps its own baseline, so multiple readers can run at different
+frequencies against the same registry independently. Non-monotonic situations
+are reported as explicit states rather than negative subtractions:
+
+- `StateCounterReset` for a counter or histogram whose cumulative value decreased.
+- `StateDisappeared` / `StateReappeared` for a series that vanishes and later returns.
+- `StateBucketsChanged` for a classic histogram whose bucket upper bounds changed.
+
+A failed `Gather` returns an error and does not advance the baseline, so the
+next successful read is diffed against the last successful one.
+
 ## Remote
 
 This module contains production quality code with explicitly unstable API. Any code in this module can change its API or be removed; use with care.
