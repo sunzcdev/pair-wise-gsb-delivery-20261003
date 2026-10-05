@@ -43,6 +43,7 @@ Try [a binary release](https://github.com/osrg/gobgp/releases/latest).
   - [SR Policy](docs/sources/lib-srpolicy.md)
 - [Graceful Restart](docs/sources/graceful-restart.md)
 - [Additional Paths](docs/sources/add-paths.md)
+- [Deterministic MED](docs/sources/deterministic-med.md)
 - [Peer Group](docs/sources/peer-group.md)
 - [Dynamic Neighbor](docs/sources/dynamic-neighbor.md)
 - [eBGP Multihop](docs/sources/ebgp-multihop.md)

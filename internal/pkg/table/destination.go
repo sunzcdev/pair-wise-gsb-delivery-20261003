@@ -198,9 +198,10 @@ func NewPeerGroupInfo(g *oc.Global, p *oc.PeerGroup) *PeerInfo {
 //   - Methods that modify state (e.g., Calculate) must NEVER be called on snapshots
 //     and ALWAYS require the caller to hold the shard lock.
 type destination struct {
-	nlri          bgp.NLRI // not mutable
-	knownPathList []*Path
-	localIdMap    *Bitmap
+	nlri             bgp.NLRI // not mutable
+	knownPathList    []*Path
+	localIdMap       *Bitmap
+	selectionOptions oc.RouteSelectionOptionsConfig
 }
 
 func newDestination(nlri bgp.NLRI, mapSize int, known ...*Path) *destination {
@@ -225,7 +226,9 @@ func (dd *destination) GetNlri() bgp.NLRI {
 // Caller must hold the appropriate shard lock when calling this on an active destination.
 // The returned snapshot can be used safely without locks.
 func (dd *destination) snapshot() *destination {
-	return newDestination(dd.nlri, 0, dd.GetAllKnownPathList()...)
+	d := newDestination(dd.nlri, 0, dd.GetAllKnownPathList()...)
+	d.selectionOptions = dd.selectionOptions
+	return d
 }
 
 // GetAllKnownPathList returns a copy of the known path list.
@@ -291,7 +294,7 @@ func (dd *destination) GetBestPath(id string, as uint32) *Path {
 // When called on an active (non-snapshot) destination, caller must hold the appropriate shard lock.
 // When called on a snapshot destination, no lock is required as the data is already a stable copy.
 func (dd *destination) GetMultiBestPath(id string) []*Path {
-	return getMultiBestPath(id, dd.knownPathList)
+	return getMultiBestPath(id, dd.knownPathList, dd.selectionOptions)
 }
 
 // Calculate computes best-path among known paths for this destination.
@@ -300,12 +303,16 @@ func (dd *destination) GetMultiBestPath(id string) []*Path {
 // INTERNAL USE ONLY: Caller MUST hold the appropriate shard lock.
 // This method must NEVER be called on snapshot destinations.
 func (dest *destination) Calculate(logger *slog.Logger, newPath *Path, selectionOptions oc.RouteSelectionOptionsConfig) (*Update, *Path) {
+	dest.selectionOptions = selectionOptions
 	oldKnownPathList := make([]*Path, len(dest.knownPathList))
 	copy(oldKnownPathList, dest.knownPathList)
 
 	var oldPath *Path
 	if newPath.IsWithdraw {
 		oldPath = dest.explicitWithdraw(logger, newPath)
+		if selectionOptions.DeterministicMed {
+			sortPaths(dest.knownPathList, selectionOptions)
+		}
 		if oldPath != nil && newPath.IsDropped() {
 			if id := oldPath.localID; id != 0 {
 				dest.localIdMap.Unflag(uint(id))
@@ -313,7 +320,12 @@ func (dest *destination) Calculate(logger *slog.Logger, newPath *Path, selection
 		}
 	} else {
 		oldPath = dest.implicitWithdraw(logger, newPath)
-		dest.insertSort(newPath, selectionOptions)
+		if selectionOptions.DeterministicMed {
+			dest.knownPathList = append(dest.knownPathList, newPath)
+			sortPaths(dest.knownPathList, selectionOptions)
+		} else {
+			dest.insertSort(newPath, selectionOptions)
+		}
 	}
 
 	for _, path := range dest.knownPathList {
@@ -332,6 +344,7 @@ func (dest *destination) Calculate(logger *slog.Logger, newPath *Path, selection
 	return &Update{
 		KnownPathList:    l,
 		OldKnownPathList: oldKnownPathList,
+		selectionOptions: selectionOptions,
 	}, oldPath
 }
 
@@ -520,9 +533,277 @@ func (dest *destination) insertSort(newPath *Path, selectionOptions oc.RouteSele
 	dest.knownPathList = slices.Insert(dest.knownPathList, insertIdx, newPath)
 }
 
+type deterministicMedGroupKey struct {
+	internal  bool
+	external  bool
+	singleton bool
+	as        uint32
+	sourceAS  uint32
+	sourceID  netip.Addr
+	address   netip.Addr
+	remoteID  uint32
+}
+
+type deterministicMedGroup struct {
+	key   deterministicMedGroupKey
+	paths []*Path
+}
+
+func firstExternalAS(path *Path) (uint32, bool) {
+	asPath := path.GetAsPath()
+	if asPath == nil {
+		return 0, false
+	}
+	for _, segment := range asPath.Value {
+		if segment.GetType() == bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SET ||
+			segment.GetType() == bgp.BGP_ASPATH_ATTR_TYPE_CONFED_SEQ {
+			continue
+		}
+		asList := segment.GetAS()
+		if len(asList) > 0 {
+			return asList[0], true
+		}
+	}
+	return 0, false
+}
+
+func deterministicMedGroupKeyFor(path *Path) deterministicMedGroupKey {
+	if path.GetAsPathLen() == 0 {
+		return deterministicMedGroupKey{internal: true}
+	}
+	if as, ok := firstExternalAS(path); ok {
+		return deterministicMedGroupKey{external: true, as: as}
+	}
+	source := path.GetSource()
+	return deterministicMedGroupKey{
+		singleton: true,
+		sourceAS:  source.AS,
+		sourceID:  source.ID,
+		address:   source.Address,
+		remoteID:  path.remoteID,
+	}
+}
+
+func compareDeterministicMedGroupKey(lhs, rhs deterministicMedGroupKey) int {
+	if lhs.singleton != rhs.singleton {
+		if lhs.singleton {
+			return -1
+		}
+		return 1
+	}
+	if lhs.internal != rhs.internal {
+		if lhs.internal {
+			return -1
+		}
+		return 1
+	}
+	if lhs.external != rhs.external {
+		if lhs.external {
+			return -1
+		}
+		return 1
+	}
+	if lhs.as < rhs.as {
+		return -1
+	}
+	if lhs.as > rhs.as {
+		return 1
+	}
+	if lhs.sourceAS != rhs.sourceAS {
+		if lhs.sourceAS < rhs.sourceAS {
+			return -1
+		}
+		return 1
+	}
+	if lhs.sourceID != rhs.sourceID {
+		return bytes.Compare(lhs.sourceID.AsSlice(), rhs.sourceID.AsSlice())
+	}
+	if lhs.address != rhs.address {
+		return lhs.address.Compare(rhs.address)
+	}
+	if lhs.remoteID < rhs.remoteID {
+		return -1
+	}
+	if lhs.remoteID > rhs.remoteID {
+		return 1
+	}
+	return 0
+}
+
+func comparePathIdentity(lhs, rhs *Path) int {
+	lhsSource := lhs.GetSource()
+	rhsSource := rhs.GetSource()
+	if lhsSource.AS != rhsSource.AS {
+		if lhsSource.AS < rhsSource.AS {
+			return -1
+		}
+		return 1
+	}
+
+	if lhsSource.ID != rhsSource.ID {
+		return bytes.Compare(lhsSource.ID.AsSlice(), rhsSource.ID.AsSlice())
+	}
+	if lhsSource.Address != rhsSource.Address {
+		return lhsSource.Address.Compare(rhsSource.Address)
+	}
+	if lhs.remoteID < rhs.remoteID {
+		return -1
+	}
+	if lhs.remoteID > rhs.remoteID {
+		return 1
+	}
+	return 0
+}
+
+func comparePathsBeforeMED(lhs, rhs *Path, selectionOptions oc.RouteSelectionOptionsConfig) int {
+	if b := compareByLLGRStaleCommunity(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByReachableNexthop(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByLocalPref(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByLocalOrigin(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByASPath(lhs, rhs, selectionOptions); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByOrigin(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	return 0
+}
+
+func comparePathsAfterMED(lhs, rhs *Path, selectionOptions oc.RouteSelectionOptionsConfig, compareAge bool) int {
+	if b := compareByASNumber(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if compareAge {
+		if b := compareByAge(lhs, rhs, selectionOptions); b == lhs {
+			return -1
+		} else if b == rhs {
+			return 1
+		}
+	}
+
+	if b, _ := compareByRouterID(lhs, rhs, selectionOptions); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	if b := compareByNeighborAddress(lhs, rhs); b == lhs {
+		return -1
+	} else if b == rhs {
+		return 1
+	}
+
+	return comparePathIdentity(lhs, rhs)
+}
+
+func compareDeterministicMedGroup(lhs, rhs deterministicMedGroup, selectionOptions oc.RouteSelectionOptionsConfig) int {
+	if cmp := comparePathsBeforeMED(lhs.paths[0], rhs.paths[0], selectionOptions); cmp != 0 {
+		return cmp
+	}
+	if cmp := comparePathsAfterMED(lhs.paths[0], rhs.paths[0], selectionOptions, false); cmp != 0 {
+		return cmp
+	}
+	return compareDeterministicMedGroupKey(lhs.key, rhs.key)
+}
+
+func sortPaths(paths []*Path, selectionOptions oc.RouteSelectionOptionsConfig) {
+	if selectionOptions.AlwaysCompareMed {
+		sort.SliceStable(paths, func(i, j int) bool {
+			return comparePathsBeforeMED(paths[i], paths[j], selectionOptions) < 0
+		})
+
+		var start int
+		for end := 1; end <= len(paths); end++ {
+			if end == len(paths) || comparePathsBeforeMED(paths[start], paths[end], selectionOptions) != 0 {
+				sort.SliceStable(paths[start:end], func(i, j int) bool {
+					lhs, rhs := paths[start+i], paths[start+j]
+					if b := compareByMED(lhs, rhs, selectionOptions); b == lhs {
+						return true
+					} else if b == rhs {
+						return false
+					}
+					return comparePathsAfterMED(lhs, rhs, selectionOptions, !selectionOptions.DeterministicMed) < 0
+				})
+				start = end
+			}
+		}
+		return
+	}
+
+	var groups []deterministicMedGroup
+	groupIndex := make(map[deterministicMedGroupKey]int)
+	for _, path := range paths {
+		key := deterministicMedGroupKeyFor(path)
+		index, ok := groupIndex[key]
+		if !ok {
+			index = len(groups)
+			groupIndex[key] = index
+			groups = append(groups, deterministicMedGroup{key: key})
+		}
+		groups[index].paths = append(groups[index].paths, path)
+	}
+
+	for index := range groups {
+		sort.SliceStable(groups[index].paths, func(i, j int) bool {
+			lhs, rhs := groups[index].paths[i], groups[index].paths[j]
+			if cmp := comparePathsBeforeMED(lhs, rhs, selectionOptions); cmp != 0 {
+				return cmp < 0
+			}
+			if b := compareByMED(lhs, rhs, selectionOptions); b == lhs {
+				return true
+			} else if b == rhs {
+				return false
+			}
+			return comparePathsAfterMED(lhs, rhs, selectionOptions, false) < 0
+		})
+	}
+
+	sort.SliceStable(groups, func(i, j int) bool {
+		return compareDeterministicMedGroup(groups[i], groups[j], selectionOptions) < 0
+	})
+
+	index := 0
+	for _, group := range groups {
+		for _, path := range group.paths {
+			paths[index] = path
+			index++
+		}
+	}
+}
+
 type Update struct {
 	KnownPathList    []*Path
 	OldKnownPathList []*Path
+	selectionOptions oc.RouteSelectionOptionsConfig
 	// Changed reports whether the path given to Table.update differs from the
 	// path it replaced. It is false when the same path is advertised again
 	// with the same attributes, which is what an inbound soft reset does.
@@ -532,8 +813,8 @@ type Update struct {
 // GetMultiBestPathDiff returns multipath delta as update and withdraw lists.
 // update includes both newly added and changed paths.
 func (u *Update) GetMultiBestPathDiff(id string) (update []*Path, withdraw []*Path) {
-	oldM := getMultiBestPath(id, u.OldKnownPathList)
-	newM := getMultiBestPath(id, u.KnownPathList)
+	oldM := getMultiBestPath(id, u.OldKnownPathList, u.selectionOptions)
+	newM := getMultiBestPath(id, u.KnownPathList, u.selectionOptions)
 	if len(oldM) == 0 && len(newM) == 0 {
 		return nil, nil
 	}
@@ -564,7 +845,18 @@ func (u *Update) GetMultiBestPathDiff(id string) (update []*Path, withdraw []*Pa
 	return update, withdraw
 }
 
-func getMultiBestPath(id string, pathList []*Path) []*Path {
+func multipathPathsEqual(best, path *Path, selectionOptions oc.RouteSelectionOptionsConfig) bool {
+	if best.Compare(path) != 0 {
+		return false
+	}
+	if selectionOptions.DeterministicMed && !selectionOptions.AlwaysCompareMed &&
+		deterministicMedGroupKeyFor(best) != deterministicMedGroupKeyFor(path) {
+		return false
+	}
+	return true
+}
+
+func getMultiBestPath(id string, pathList []*Path, selectionOptions oc.RouteSelectionOptionsConfig) []*Path {
 	// The path list of destinations in the global RIB are sorted
 	// in descending order. One of the criteria for being a better
 	// path is that it has a reachable next hop. Technically, if the
@@ -579,7 +871,7 @@ func getMultiBestPath(id string, pathList []*Path) []*Path {
 	// Attempt to find the first path that is both reachable and worse than the
 	// best path. Then return a slice paths from the best to that index.
 	index := sort.Search(len(pathList), func(i int) bool {
-		return pathList[i].IsNexthopInvalid || pathList[i].Compare(best) != 0
+		return pathList[i].IsNexthopInvalid || !multipathPathsEqual(best, pathList[i], selectionOptions)
 	})
 	return pathList[:index]
 }
@@ -657,8 +949,8 @@ func (u *Update) GetChanges(id string, as uint32, peerDown, useMultiplePaths boo
 			}
 			return false
 		}
-		oldM := getMultiBestPath(id, u.OldKnownPathList)
-		newM := getMultiBestPath(id, u.KnownPathList)
+		oldM := getMultiBestPath(id, u.OldKnownPathList, u.selectionOptions)
+		newM := getMultiBestPath(id, u.KnownPathList, u.selectionOptions)
 		if diff(oldM, newM) {
 			multi = newM
 			if len(newM) == 0 {
@@ -1005,7 +1297,7 @@ func (d *destination) Select(option ...DestinationSelectOption) *destination {
 					if best == nil {
 						best = p
 						ps = append(ps, p)
-					} else if best.Compare(p) == 0 {
+					} else if multipathPathsEqual(best, p, d.selectionOptions) {
 						ps = append(ps, p)
 					}
 				}

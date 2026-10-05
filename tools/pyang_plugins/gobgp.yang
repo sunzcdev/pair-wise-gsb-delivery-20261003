@@ -1376,12 +1376,23 @@ module gobgp {
     }
   }
 
+  grouping deterministic-med-config {
+    leaf deterministic-med {
+      type boolean;
+      description
+        "Compare MED among paths from the same neighboring AS
+        before comparing group winners.";
+    }
+  }
+
   augment "/bgp:bgp/bgp:global/bgp:route-selection-options/bgp:config" {
     uses disable-best-path-selection-config;
+    uses deterministic-med-config;
   }
 
   augment "/bgp:bgp/bgp:global/bgp:route-selection-options/bgp:state" {
     uses disable-best-path-selection-config;
+    uses deterministic-med-config;
   }
 
   augment "/bgp:bgp/bgp:global/bgp:afi-safis/bgp:afi-safi" {

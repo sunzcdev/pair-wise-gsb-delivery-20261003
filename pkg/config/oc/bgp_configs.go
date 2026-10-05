@@ -5091,6 +5091,7 @@ type RouteSelectionOptionsState struct {
 	// default behavior is to only compare MEDs for paths
 	// received from the same AS.
 	AlwaysCompareMed bool `mapstructure:"always-compare-med" json:"always-compare-med,omitempty"`
+	DeterministicMed bool `mapstructure:"deterministic-med" json:"deterministic-med,omitempty"`
 	// original -> bgp-mp:ignore-as-path-length
 	// bgp-mp:ignore-as-path-length's original type is boolean.
 	// Ignore the AS path length when selecting the best path.
@@ -5136,6 +5137,7 @@ type RouteSelectionOptionsConfig struct {
 	// default behavior is to only compare MEDs for paths
 	// received from the same AS.
 	AlwaysCompareMed bool `mapstructure:"always-compare-med" json:"always-compare-med,omitempty"`
+	DeterministicMed bool `mapstructure:"deterministic-med" json:"deterministic-med,omitempty"`
 	// original -> bgp-mp:ignore-as-path-length
 	// bgp-mp:ignore-as-path-length's original type is boolean.
 	// Ignore the AS path length when selecting the best path.
@@ -5175,6 +5177,9 @@ func (lhs *RouteSelectionOptionsConfig) Equal(rhs *RouteSelectionOptionsConfig) 
 		return false
 	}
 	if lhs.AlwaysCompareMed != rhs.AlwaysCompareMed {
+		return false
+	}
+	if lhs.DeterministicMed != rhs.DeterministicMed {
 		return false
 	}
 	if lhs.IgnoreAsPathLength != rhs.IgnoreAsPathLength {

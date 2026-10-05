@@ -142,6 +142,20 @@ func TestConfigExample(t *testing.T) {
 	}
 }
 
+func TestDeterministicMEDConfig(t *testing.T) {
+	config, err := ReadConfig(strings.NewReader(`
+[global.config]
+  as = 64512
+  router-id = "192.0.2.1"
+
+[global.route-selection-options.config]
+  deterministic-med = true
+`), "toml")
+
+	assert.NoError(t, err)
+	assert.True(t, config.Global.RouteSelectionOptions.Config.DeterministicMed)
+}
+
 func TestConfigError(t *testing.T) {
 	assert := assert.New(t)
 
