@@ -3,6 +3,7 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -98,6 +99,38 @@ func DoTimeout(req *Request, resp *Response, timeout time.Duration) error {
 // positive MaxResponseBodySize when requesting untrusted servers.
 func DoDeadline(req *Request, resp *Response, deadline time.Time) error {
 	return defaultClient.DoDeadline(req, resp, deadline)
+}
+
+// DoContext performs the given request, honoring ctx, and fills the given
+// response.
+//
+// ctx is observed while waiting for a free connection, dialing, performing the
+// TLS handshake, sending the request and reading the response. If ctx is
+// canceled or reaches its deadline, the call returns the corresponding
+// context error (context.Canceled or context.DeadlineExceeded).
+//
+// When a request timeout is also set (via Request.SetTimeout, DoTimeout or
+// DoDeadline), the earlier of the request deadline and the context deadline is
+// used; the same applies to the client's ReadTimeout and WriteTimeout.
+//
+// The function doesn't follow redirects.
+//
+// A canceled request is removed from the connection wait queue, and the
+// connection it was using is closed rather than returned to the pool. A
+// cancellation that arrives after a successful (buffered) response has
+// returned does not affect the pooled connection or any subsequent request.
+//
+// When response streaming is enabled (StreamResponseBody or
+// Response.StreamBody), ctx stays in effect while the caller reads
+// Response.BodyStream: canceling ctx interrupts an in-flight stream read and
+// prevents the connection from being reused. The caller remains responsible
+// for closing the body stream with Response.CloseBodyStream or
+// ReadCloserWithError.CloseWithError after every successful call.
+//
+// It is recommended obtaining req and resp via AcquireRequest
+// and AcquireResponse in performance-critical code.
+func DoContext(ctx context.Context, req *Request, resp *Response) error {
+	return defaultClient.DoContext(ctx, req, resp)
 }
 
 // DoRedirects performs the given http request and fills the given http response,
@@ -498,6 +531,71 @@ func (c *Client) DoDeadline(req *Request, resp *Response, deadline time.Time) er
 		return ErrTimeout
 	}
 	return c.Do(req, resp)
+}
+
+// DoContext performs the given request, honoring ctx, and fills the given
+// response.
+//
+// ctx is observed while waiting for a free connection, dialing, performing the
+// TLS handshake, sending the request and reading the response. If ctx is
+// canceled or reaches its deadline, the call returns the corresponding
+// context error (context.Canceled or context.DeadlineExceeded).
+//
+// When a request timeout is also set (via Request.SetTimeout, DoTimeout or
+// DoDeadline), the earlier of the request deadline and the context deadline is
+// used; the same applies to the client's ReadTimeout and WriteTimeout.
+//
+// The function doesn't follow redirects.
+//
+// A canceled request is removed from the connection wait queue, and the
+// connection it was using is closed rather than returned to the pool. A
+// cancellation that arrives after a successful (buffered) response has
+// returned does not affect the pooled connection or any subsequent request.
+//
+// When response streaming is enabled (StreamResponseBody or
+// Response.StreamBody), ctx stays in effect while the caller reads
+// Response.BodyStream: canceling ctx interrupts an in-flight stream read and
+// prevents the connection from being reused. The caller remains responsible
+// for closing the body stream with Response.CloseBodyStream or
+// ReadCloserWithError.CloseWithError after every successful call.
+//
+// It is recommended obtaining req and resp via AcquireRequest
+// and AcquireResponse in performance-critical code.
+func (c *Client) DoContext(ctx context.Context, req *Request, resp *Response) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	uri := req.URI()
+	if uri == nil {
+		return ErrorInvalidURI
+	}
+
+	host := uri.Host()
+
+	if bytes.ContainsRune(host, ',') {
+		return fmt.Errorf("invalid host %q: use a host client for multiple hosts", host)
+	}
+
+	isTLS := false
+	if uri.isHTTPS() {
+		isTLS = true
+	} else if !uri.isHTTP() {
+		return fmt.Errorf("unsupported protocol %q. http and https are supported", uri.Scheme())
+	}
+
+	c.mOnce.Do(func() {
+		c.m = make(map[string]*HostClient)
+		c.ms = make(map[string]*HostClient)
+	})
+	hc, err := c.hostClient(host, isTLS)
+	if err != nil {
+		return err
+	}
+
+	atomic.AddInt32(&hc.pendingClientRequests, 1)
+	defer atomic.AddInt32(&hc.pendingClientRequests, -1)
+	return hc.DoContext(ctx, req, resp)
 }
 
 // DoRedirects performs the given http request and fills the given http response,
@@ -1627,6 +1725,48 @@ func (c *HostClient) DoRedirects(req *Request, resp *Response, maxRedirectsCount
 // It is recommended obtaining req and resp via AcquireRequest
 // and AcquireResponse in performance-critical code.
 func (c *HostClient) Do(req *Request, resp *Response) error {
+	return c.doWithRetry(context.Background(), req, resp)
+}
+
+// DoContext performs the given request, honoring ctx, and sets the
+// corresponding response.
+//
+// ctx is observed while waiting for a free connection, dialing, performing the
+// TLS handshake, sending the request and reading the response. If ctx is
+// canceled or reaches its deadline, the call returns the corresponding
+// context error (context.Canceled or context.DeadlineExceeded).
+//
+// When a request timeout is also set (via Request.SetTimeout, DoTimeout or
+// DoDeadline), the earlier of the request deadline and the context deadline is
+// used; the same applies to HostClient.ReadTimeout and
+// HostClient.WriteTimeout.
+//
+// The function doesn't follow redirects.
+//
+// A canceled request is removed from the connection wait queue, and the
+// connection it was using is closed rather than returned to the pool. A
+// cancellation that arrives after a successful (buffered) response has
+// returned does not affect the pooled connection or any subsequent request on
+// the same HostClient.
+//
+// When response streaming is enabled (StreamResponseBody or
+// Response.StreamBody), ctx stays in effect while the caller reads
+// Response.BodyStream: canceling ctx interrupts an in-flight stream read and
+// forces the underlying connection closed, so it is never handed to another
+// request. The caller remains responsible for closing the body stream with
+// Response.CloseBodyStream or ReadCloserWithError.CloseWithError after every
+// successful call, including after canceling ctx.
+//
+// It is recommended obtaining req and resp via AcquireRequest
+// and AcquireResponse in performance-critical code.
+func (c *HostClient) DoContext(ctx context.Context, req *Request, resp *Response) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.doWithRetry(ctx, req, resp)
+}
+
+func (c *HostClient) doWithRetry(ctx context.Context, req *Request, resp *Response) error {
 	var (
 		err          error
 		retry        bool
@@ -1652,8 +1792,17 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		retryFunc = isIdempotent
 	}
 
+	oldCtx := req.ctx
+	req.ctx = ctx
+
 	atomic.AddInt32(&c.pendingRequests, 1)
 	for {
+		// A canceled context must never start (or retry) a round trip.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+			break
+		}
+
 		// If the original timeout was set, we need to update
 		// the one set on the request to reflect the remaining time.
 		if timeout > 0 {
@@ -1662,10 +1811,25 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 				err = ErrTimeout
 				break
 			}
+		} else if ctxDeadline, hasCtxDeadline := ctx.Deadline(); hasCtxDeadline {
+			// No explicit request timeout: let the context deadline drive
+			// the per-attempt socket deadline. Existing ReadTimeout and
+			// WriteTimeout still cap it.
+			req.timeout = time.Until(ctxDeadline)
+			if req.timeout <= 0 {
+				err = context.DeadlineExceeded
+				break
+			}
 		}
 
 		retry, err = c.do(req, resp)
 		if err == nil || !retry {
+			break
+		}
+
+		// Never retry after the context was canceled; the connection used by
+		// the failed attempt has already been closed.
+		if ctx.Err() != nil {
 			break
 		}
 
@@ -1701,6 +1865,18 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 
 	// Restore the original timeout.
 	req.timeout = timeout
+	req.ctx = oldCtx
+
+	// Prefer the context error when cancellation/expiry interrupted a failed
+	// round trip, since the underlying network op may surface that as a
+	// timeout or a connection error. A successful buffered response followed
+	// by a late cancellation stays successful; the pooled connection is
+	// protected by the cancel-watch stopped before release.
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+	}
 
 	if err == io.EOF {
 		err = ErrConnectionClosed
@@ -1842,6 +2018,10 @@ func (c *HostClient) SetMaxConns(newMaxConns int) {
 }
 
 func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
+	return c.acquireConn(context.Background(), reqTimeout, connectionClose)
+}
+
+func (c *HostClient) acquireConn(ctx context.Context, reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
 	createConn := false
 	startCleaner := false
 
@@ -1884,6 +2064,9 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		return cc, nil
 	}
 	if !createConn {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if c.MaxConnWaitTimeout <= 0 {
 			return nil, ErrNoFreeConns
 		}
@@ -1901,30 +2084,79 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 			timeout = reqTimeout
 			timeoutOverridden = true
 		}
-
-		// wait for a free connection
-		tc := AcquireTimer(timeout)
-		defer ReleaseTimer(tc)
+		if ctxDeadline, hasCtxDeadline := ctx.Deadline(); hasCtxDeadline {
+			ctxTimeout := time.Until(ctxDeadline)
+			if ctxTimeout <= 0 {
+				return nil, context.DeadlineExceeded
+			}
+			if ctxTimeout < timeout {
+				timeout = ctxTimeout
+				timeoutOverridden = true
+			}
+		}
 
 		w := &wantConn{
 			ready: make(chan struct{}, 1),
 		}
-		defer func() {
-			if err != nil {
-				w.cancel(c, err)
-			}
-		}()
 
 		c.queueForIdle(w)
 
+		tc := AcquireTimer(timeout)
+		ctxDone := ctx.Done()
+		ctxCancelDone := make(chan struct{})
+		var stopCtxWatch func() bool
+		// cancelWait removes w from the queue and marks it canceled while
+		// holding connsLock. ReleaseConn and decConnsCount only call
+		// tryDeliver while holding the same lock, so a canceled wantConn can
+		// never be handed a connection. A connection that won the race before
+		// cancellation is returned to the pool after unlocking.
+		cancelWait := func(cancelErr error) {
+			c.connsLock.Lock()
+			if c.connsWait != nil {
+				c.connsWait.remove(w)
+			}
+			connToRelease := w.markCanceled(cancelErr)
+			c.connsLock.Unlock()
+			if connToRelease != nil {
+				c.ReleaseConn(connToRelease)
+			}
+		}
+		if ctxDone != nil {
+			stopCtxWatch = context.AfterFunc(ctx, func() {
+				cancelWait(context.Canceled)
+				close(ctxCancelDone)
+			})
+		}
+
 		select {
 		case <-w.ready:
+			ReleaseTimer(tc)
+			if stopCtxWatch != nil && !stopCtxWatch() {
+				// The cancel callback was already running: it may have
+				// reclaimed a concurrently delivered connection. Wait for it
+				// and fail rather than using a conn that got pooled again.
+				<-ctxCancelDone
+				return nil, ctx.Err()
+			}
 			return w.conn, w.err
 		case <-tc.C:
-			if timeoutOverridden {
-				return nil, ErrTimeout
+			ReleaseTimer(tc)
+			cancelWait(errConnWaitTimeout(timeoutOverridden))
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if stopCtxWatch != nil {
+					<-ctxCancelDone
+				}
+				return nil, ctxErr
 			}
-			return nil, ErrNoFreeConns
+			return nil, errConnWaitTimeout(timeoutOverridden)
+		case <-ctxDone:
+			ReleaseTimer(tc)
+			if stopCtxWatch != nil {
+				<-ctxCancelDone
+			} else {
+				cancelWait(ctx.Err())
+			}
+			return nil, ctx.Err()
 		}
 	}
 
@@ -1932,7 +2164,7 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		go c.connsCleaner()
 	}
 
-	conn, err := c.dialHostHard(reqTimeout)
+	conn, err := c.dialHostHardCtx(ctx, reqTimeout)
 	if err != nil {
 		c.decConnsCount()
 		return nil, err
@@ -1940,6 +2172,13 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 	cc = acquireClientConn(conn)
 
 	return cc, nil
+}
+
+func errConnWaitTimeout(timeoutOverridden bool) error {
+	if timeoutOverridden {
+		return ErrTimeout
+	}
+	return ErrNoFreeConns
 }
 
 func (c *HostClient) queueForIdle(w *wantConn) {
@@ -1953,7 +2192,7 @@ func (c *HostClient) queueForIdle(w *wantConn) {
 }
 
 func (c *HostClient) dialConnFor(w *wantConn) {
-	conn, err := c.dialHostHard(0)
+	conn, err := c.dialHostHardCtx(context.Background(), 0)
 	if err != nil {
 		w.tryDeliver(nil, err)
 		c.decConnsCount()
@@ -2247,6 +2486,24 @@ func (c *HostClient) nextAddr() string {
 }
 
 func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err error) {
+	return c.dialHostHardCtx(context.Background(), dialTimeout)
+}
+
+// dialHostHardCtx dials one of the configured hosts while honoring ctx.
+//
+// dialTimeout is the request-derived timeout. The effective per-dial timeout
+// is the earliest of dialTimeout, the context deadline, the overall dial
+// budget (ReadTimeout + WriteTimeout or DefaultDialTimeout) and, for the TLS
+// handshake, WriteTimeout.
+//
+// If ctx is canceled while a dial or handshake is in progress, the underlying
+// socket is closed to unblock it; a socket that finishes dialing right after
+// cancellation is closed instead of being returned.
+func (c *HostClient) dialHostHardCtx(ctx context.Context, dialTimeout time.Duration) (conn net.Conn, err error) {
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// use dialTimeout to control the timeout of each dial. It does not work if dialTimeout is 0 or if
 	// c.DialTimeout has not been set and c.Dial has been set.
 	// attempt to dial all the available hosts before giving up.
@@ -2266,6 +2523,9 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 	}
 	deadline := time.Now().Add(timeout)
 	for n > 0 {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
 		addr := c.nextAddr()
 		var tlsConfig *tls.Config
 		if c.IsTLS {
@@ -2275,7 +2535,77 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 				continue
 			}
 		}
-		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout)
+
+		effectiveDialTimeout := dialTimeout
+		if ctxDeadline, hasCtxDeadline := ctx.Deadline(); hasCtxDeadline {
+			ctxTimeout := time.Until(ctxDeadline)
+			if ctxTimeout <= 0 {
+				return nil, context.DeadlineExceeded
+			}
+			if effectiveDialTimeout <= 0 || ctxTimeout < effectiveDialTimeout {
+				effectiveDialTimeout = ctxTimeout
+			}
+		}
+
+		type dialResult struct {
+			conn net.Conn
+			err  error
+		}
+		dialCh := make(chan dialResult, 1)
+		resultCh := make(chan dialResult, 1)
+		// A forwarding watcher owns dialCh. On cancellation it waits for the
+		// dial goroutine to return (the in-progress TLS handshake is
+		// interrupted by dialAddr's context hook) and closes any resulting
+		// socket so it cannot leak. This also lets a custom Dial without a
+		// timeout finish instead of blocking forever.
+		ctxDone := ctx.Done()
+		go func() {
+			select {
+			case <-ctxDone:
+				result := <-dialCh
+				if result.conn != nil {
+					result.conn.Close()
+				}
+				resultCh <- result
+			case result := <-dialCh:
+				resultCh <- result
+			}
+		}()
+		go func() {
+			dialed, dialErr := dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS,
+				tlsConfig, effectiveDialTimeout, c.WriteTimeout, ctx)
+			dialCh <- dialResult{conn: dialed, err: dialErr}
+		}()
+
+		// cleanupCtx ensures the dial goroutine and its socket do not leak
+		// after we return due to cancellation: once the dial eventually
+		// completes, the socket is closed. For a context-aware or timed dial
+		// this happens promptly; a custom Dial that ignores timeouts and
+		// blocks until a peer accepts remains blocked until it returns.
+		cleanupCtx := func() {
+			go func() {
+				result := <-resultCh
+				if result.conn != nil {
+					result.conn.Close()
+				}
+			}()
+		}
+
+		select {
+		case <-ctx.Done():
+			// Return immediately; the background cleanup reclaims the socket
+			// once the dial (or interrupted TLS handshake) finishes.
+			cleanupCtx()
+			return nil, ctx.Err()
+		case result := <-resultCh:
+			conn, err = result.conn, result.err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if conn != nil {
+				conn.Close()
+			}
+			return nil, ctxErr
+		}
 		if err == nil {
 			return conn, nil
 		}
@@ -2337,9 +2667,17 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, deadline time.T
 
 func dialAddr(
 	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool,
-	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration,
+	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration, ctx context.Context,
 ) (net.Conn, error) {
-	deadline := time.Now().Add(writeTimeout)
+	deadline := time.Time{}
+	if writeTimeout > 0 {
+		deadline = time.Now().Add(writeTimeout)
+	}
+	if ctxDeadline, hasCtxDeadline := ctx.Deadline(); hasCtxDeadline {
+		if deadline.IsZero() || ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+	}
 	conn, err := callDialFunc(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout)
 	if err != nil {
 		return nil, err
@@ -2353,10 +2691,20 @@ func dialAddr(
 	_, isTLSAlready := conn.(interface{ Handshake() error })
 
 	if isTLS && !isTLSAlready {
-		if writeTimeout == 0 {
+		if deadline.IsZero() {
+			// The handshake is performed lazily on the first read/write,
+			// where the request-level context cancellation closes the
+			// connection.
 			return tls.Client(conn, tlsConfig), nil
 		}
-		return tlsClientHandshake(conn, tlsConfig, deadline)
+		// Interrupt a handshake blocked on the peer as soon as the context
+		// is canceled, instead of waiting for the deadline.
+		stopCancel := context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		})
+		tlsConn, handshakeErr := tlsClientHandshake(conn, tlsConfig, deadline)
+		stopCancel()
+		return tlsConn, handshakeErr
 	}
 	return conn, nil
 }
@@ -2454,22 +2802,23 @@ func (w *wantConn) tryDeliver(conn *clientConn, err error) bool {
 	return true
 }
 
-// cancel marks w as no longer wanting a result (for example, due to cancellation).
-// If a connection has been delivered already, cancel returns it with c.releaseConn.
-func (w *wantConn) cancel(c *HostClient, err error) {
+// markCanceled marks w as canceled. The caller must hold HostClient.connsLock
+// so it cannot race with a concurrent tryDeliver. If a connection was already
+// delivered, it is returned for the caller to release outside the lock.
+func (w *wantConn) markCanceled(err error) *clientConn {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.markCanceledLocked(err)
+}
+
+func (w *wantConn) markCanceledLocked(err error) *clientConn {
 	if w.conn == nil && w.err == nil {
 		close(w.ready) // catch misbehavior in future delivery
 	}
-
 	conn := w.conn
 	w.conn = nil
 	w.err = err
-	w.mu.Unlock()
-
-	if conn != nil {
-		c.ReleaseConn(conn)
-	}
+	return conn
 }
 
 // A wantConnQueue is a queue of wantConns.
@@ -2539,6 +2888,35 @@ func (q *wantConnQueue) clearFront() (cleaned bool) {
 		q.popFront()
 		cleaned = true
 	}
+}
+
+// remove takes w out of the queue. It is used when a waiting request is
+// canceled, so a canceled request never stays enqueued waiting for a
+// connection that would later be delivered and dialed on its behalf.
+func (q *wantConnQueue) remove(w *wantConn) {
+	// Rebuild head (skipping already-conserved headPos entries) and tail
+	// without w, using fresh backing arrays so the two slices never alias.
+	remaining := q.len() - 1
+	if remaining < 0 {
+		remaining = 0
+	}
+	newHead := make([]*wantConn, 0, remaining)
+	newHead = append(newHead, q.head[q.headPos:]...)
+	newHead = append(newHead, q.tail...)
+
+	filtered := newHead[:0]
+	removed := false
+	for _, item := range newHead {
+		if !removed && item == w {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+
+	q.head = filtered
+	q.headPos = 0
+	q.tail = nil
 }
 
 // PipelineClient pipelines requests over a limited set of concurrent
@@ -3073,7 +3451,7 @@ func (c *pipelineConnClient) worker(chs *pipelineConnChannels) error {
 			return err
 		}
 	}
-	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout)
+	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout, context.Background())
 	if err != nil {
 		return err
 	}
@@ -3407,16 +3785,47 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	customSkipBody := resp.SkipBody
 	customStreamBody := resp.StreamBody
 
+	ctx := req.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var deadline time.Time
 	if req.timeout > 0 {
 		deadline = time.Now().Add(req.timeout)
 	}
+	if ctxDeadline, hasCtxDeadline := ctx.Deadline(); hasCtxDeadline {
+		if deadline.IsZero() || ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+	}
 
-	cc, err := hc.AcquireConn(req.timeout, req.ConnectionClose())
+	cc, err := hc.acquireConn(ctx, req.timeout, req.ConnectionClose())
 	if err != nil {
 		return false, err
 	}
 	conn := cc.c
+
+	// While the request owns the connection, a canceled context must close
+	// this exact socket so a blocked write/read is interrupted. The watch is
+	// stopped before the connection is pooled: stopWatching returning false
+	// means cancellation won a race, in which case the connection is closed
+	// and never handed back. This prevents a late cancellation from closing a
+	// connection that a subsequent request has started using.
+	//
+	// A bare context.Background() (the plain Do path) cannot be canceled, so
+	// no watch is installed; this keeps that allocation-free hot path zero
+	// allocations.
+	cancellable := ctx.Done() != nil
+	var stopWatching func() bool
+	if cancellable {
+		stopCancel := context.AfterFunc(ctx, func() {
+			_ = conn.Close()
+		})
+		stopWatching = stopCancel
+	} else {
+		stopWatching = func() bool { return true }
+	}
 
 	resp.ParseNetConn(conn)
 
@@ -3429,6 +3838,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	if err = conn.SetWriteDeadline(writeDeadline); err != nil {
+		stopWatching()
 		hc.CloseConn(cc)
 		return true, err
 	}
@@ -3457,6 +3867,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	if err != nil {
+		stopWatching()
 		hc.CloseConn(cc)
 		return true, err
 	}
@@ -3470,6 +3881,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	if err = conn.SetReadDeadline(readDeadline); err != nil {
+		stopWatching()
 		hc.CloseConn(cc)
 		return true, err
 	}
@@ -3485,6 +3897,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
 	if err != nil {
 		hc.ReleaseReader(br)
+		stopWatching()
 		hc.CloseConn(cc)
 		// Don't retry in case of ErrBodyTooLarge since we will just get the same again.
 		needRetry := err != ErrBodyTooLarge
@@ -3497,7 +3910,8 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		// re-check resp.ConnectionClose(): a caller may only decide that the
 		// connection is unusable while consuming the streamed body.
 		releaseConn := func(discard bool) {
-			if closeConn || discard || resp.ConnectionClose() {
+			watchStopped := stopWatching()
+			if !watchStopped || closeConn || discard || resp.ConnectionClose() {
 				hc.CloseConn(cc)
 			} else {
 				hc.ReleaseConn(cc)
@@ -3519,10 +3933,25 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 				releaseConn(discard)
 			},
 		}
+		// If the context is already canceled by the time headers return, make
+		// sure any in-flight or next stream read is interrupted immediately.
+		if ctx.Err() != nil {
+			_ = conn.Close()
+		}
 		return false, nil
 	}
 	hc.ReleaseReader(br)
 
+	// Stop the cancel watch first: if it already fired, the connection is
+	// unusable and must not be pooled for the next request.
+	watchStopped := stopWatching()
+	if !watchStopped {
+		hc.CloseConn(cc)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		return false, ErrConnectionClosed
+	}
 	if closeConn {
 		hc.CloseConn(cc)
 	} else {
