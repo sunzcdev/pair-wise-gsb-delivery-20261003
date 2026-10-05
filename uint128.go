@@ -77,3 +77,10 @@ func incr128(x uint128) (z uint128) {
 	z[1] = x[1] + c
 	return
 }
+
+func decr128(x uint128) (z uint128) {
+	var b uint64
+	z[0], b = bits.Sub64(x[0], 1, 0)
+	z[1] = x[1] - b
+	return
+}
