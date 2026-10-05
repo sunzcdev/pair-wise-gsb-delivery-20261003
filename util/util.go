@@ -717,9 +717,11 @@ type PrioritizedValue[T any] struct {
 // PrioritizedValues is a slice of PrioritizedValue.
 type PrioritizedValues[T comparable] []PrioritizedValue[T]
 
-// Sort sorts the PrioritizedValues in ascending order.
+// Sort sorts the PrioritizedValues in ascending order. Values with equal
+// priority keep their registration order (the sort is stable), so the first
+// registered value wins ties.
 func (s PrioritizedValues[T]) Sort() {
-	sort.Slice(s, func(i, j int) bool {
+	sort.SliceStable(s, func(i, j int) bool {
 		return s[i].Priority < s[j].Priority
 	})
 }

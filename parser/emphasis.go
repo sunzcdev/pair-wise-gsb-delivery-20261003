@@ -57,3 +57,18 @@ func (s *emphasisParser) Trigger() []byte {
 func (s *emphasisParser) Parse(_ ast.Node, block text.Reader, pc Context) ast.Node {
 	return s.f(block, 1, defaultEmphasisDelimiterProcessor, pc)
 }
+
+func (s *emphasisParser) DelimiterProcessor() DelimiterProcessor {
+	return defaultEmphasisDelimiterProcessor
+}
+
+func (s *emphasisParser) DelimiterProcessorName() string {
+	return "emphasis"
+}
+
+// DelimiterRunLengths implements [DelimiterRunLengths]. Emphasis accepts runs
+// of any length: one character yields emphasis and two or more yield strong
+// emphasis (with odd remainders nesting).
+func (s *emphasisParser) DelimiterRunLengths() (minimum, maximum int) {
+	return 1, -1
+}

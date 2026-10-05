@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/yuin/goldmark/v2/ast"
 	"github.com/yuin/goldmark/v2/text"
@@ -269,7 +270,8 @@ type parseContext struct {
 	lastDelimiter  *Delimiter
 	openedBlocks   []Block
 
-	inlineParsers *[256][]InlineParser
+	inlineParsers  *[256][]InlineParser
+	delimiterTrace *delimiterTrace
 }
 
 // NewContext returns a new Context.
@@ -340,6 +342,10 @@ func (p *parseContext) LastDelimiter() *Delimiter {
 
 func (p *parseContext) FirstDelimiter() *Delimiter {
 	return p.delimiters
+}
+
+func (p *parseContext) delimiterTraceState() *delimiterTrace {
+	return p.delimiterTrace
 }
 
 func (p *parseContext) PushDelimiter(d *Delimiter) {
@@ -494,6 +500,16 @@ type Config struct {
 	// ParseDelimiterFunc is a custom function for parsing delimiters.
 	ParseDelimiterFunc ParseDelimiterFunc
 
+	// DelimiterDiagnosticSink receives build-time diagnostics about delimiter
+	// processor registration. It is invoked at most once, during the parser's
+	// one-time initialization on the first Parse call. A nil sink disables
+	// diagnostics.
+	DelimiterDiagnosticSink func([]DelimiterDiagnostic)
+
+	// DelimiterTrace receives run-time events describing how delimiter
+	// processors are selected. A nil trace disables run-time tracing.
+	DelimiterTrace DelimiterTraceFunc
+
 	withoutDefaultParsers bool
 
 	autoHeadingID bool
@@ -573,6 +589,57 @@ func WithParseDelimiterFunc(f ParseDelimiterFunc) interface {
 	EmphasisOption
 } {
 	return &withParseDelimiterFunc{f}
+}
+
+type withDelimiterDiagnostics struct {
+	sink func([]DelimiterDiagnostic)
+}
+
+func (o *withDelimiterDiagnostics) setParserOption(c *Config) {
+	c.DelimiterDiagnosticSink = o.sink
+}
+
+// WithDelimiterDiagnostics enables build-time diagnostics for delimiter
+// processor registration. The sink is invoked at most once, during the
+// parser's one-time initialization on the first [Parser.Parse] call, with the
+// handlers that are fully shadowed by earlier handlers and can therefore never
+// be selected. Handlers that share trigger characters but accept different
+// delimiter run lengths coexist and are not reported.
+func WithDelimiterDiagnostics(sink func([]DelimiterDiagnostic)) Option {
+	return &withDelimiterDiagnostics{sink}
+}
+
+type withDelimiterTrace struct {
+	fn DelimiterTraceFunc
+}
+
+func (o *withDelimiterTrace) setParserOption(c *Config) {
+	c.DelimiterTrace = o.fn
+}
+
+// WithDelimiterTrace enables run-time tracing of delimiter processor
+// selection. Tracing is observational: it does not change parsing or the
+// resulting AST. Events never contain the parsed source text.
+//
+// The callback is never invoked while the parser holds an internal lock.
+func WithDelimiterTrace(fn DelimiterTraceFunc) Option {
+	return &withDelimiterTrace{fn}
+}
+
+// DelimiterTraceSetter is implemented by the default parser returned by [New]
+// and allows the run-time trace callback to be replaced after construction.
+type DelimiterTraceSetter interface {
+	SetDelimiterTrace(DelimiterTraceFunc)
+}
+
+// SetDelimiterTrace replaces the run-time delimiter trace callback. Passing nil
+// disables tracing. The callback is never invoked while the parser holds an
+// internal lock.
+func (p *parser) SetDelimiterTrace(fn DelimiterTraceFunc) {
+	p.traceMu.Lock()
+	p.trace = fn
+	p.traceMu.Unlock()
+	p.traceActive.Store(fn != nil)
 }
 
 // consumeText is a special AST node that represents a text length.
@@ -732,6 +799,13 @@ type parser struct {
 	config                *Config
 	initSync              sync.Once
 	triggerable           [256]bool
+	delimiterRegistry     *delimiterRegistry
+	pendingDiagnostics    []DelimiterDiagnostic
+	diagnosticSink        func([]DelimiterDiagnostic)
+	diagnosticsOnce       sync.Once
+	traceMu               sync.RWMutex
+	trace                 DelimiterTraceFunc
+	traceActive           atomic.Bool
 }
 
 type withBlockParsers struct {
@@ -850,6 +924,8 @@ func New(options ...Option) Parser {
 	p := &parser{
 		config: config,
 	}
+	p.trace = config.DelimiterTrace
+	p.traceActive.Store(p.trace != nil)
 
 	return p
 }
@@ -942,6 +1018,11 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 		for _, v := range p.config.inlineParsers {
 			p.addInlineParser(v)
 		}
+		p.delimiterRegistry = buildDelimiterRegistry(p.config.inlineParsers)
+		if p.config.DelimiterDiagnosticSink != nil {
+			p.diagnosticSink = p.config.DelimiterDiagnosticSink
+			p.pendingDiagnostics = delimiterDiagnostics(p.delimiterRegistry.entries)
+		}
 		hasSpaceParser := p.inlineParsers[' '] != nil
 		for c := range p.triggerable {
 			flags := charFlags[c]
@@ -971,6 +1052,15 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 		}
 		p.config = nil
 	})
+
+	// Deliver build-time diagnostics outside initSync: the user callback must
+	// never run while an internal lock is held.
+	p.diagnosticsOnce.Do(func() {
+		if p.diagnosticSink != nil {
+			p.diagnosticSink(p.pendingDiagnostics)
+			p.pendingDiagnostics = nil
+		}
+	})
 	reader := text.NewReader(source, p.decoder)
 	var pc Context
 	var cfg parseConfig
@@ -992,6 +1082,18 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 	}
 	if pctx, ok := pc.(*parseContext); ok {
 		pctx.inlineParsers = &p.inlineParsers
+		if p.traceActive.Load() {
+			pctx.delimiterTrace = &delimiterTrace{
+				registry: p.delimiterRegistry,
+				active:   &p.traceActive,
+				current: func() DelimiterTraceFunc {
+					p.traceMu.RLock()
+					fn := p.trace
+					p.traceMu.RUnlock()
+					return fn
+				},
+			}
+		}
 	}
 	root := ast.NewDocument()
 	p.parseBlocks(root, reader, pc)
@@ -1243,6 +1345,41 @@ func (p *parser) walkBlock(block ast.Node, cb func(node ast.Node)) {
 	cb(block)
 }
 
+// parseDelimiterInline runs a delimiter-driven inline parser while emitting
+// processor-selection trace events. It returns whatever the parser returned
+// (including nil).
+func (p *parser) parseDelimiterInline(ip InlineParser, parent ast.Node, block text.Reader,
+	pc Context, c byte, trace *delimiterTrace, source []byte) ast.Node {
+	_, info := p.delimiterRegistry.infoForInlineParser(ip)
+	line, _ := block.PeekLine()
+	_, segment := block.Position()
+	base := DelimiterTraceEvent{
+		Stage:     DelimiterStageProcessor,
+		Result:    DelimiterTried,
+		Handler:   info.Name,
+		Char:      c,
+		Priority:  info.Priority,
+		Position:  segment.Start,
+		RunLength: countRunLength(line, c),
+		Remaining: len(source) - segment.Start,
+	}
+	trace.emit(base)
+
+	node := ip.Parse(parent, block, pc)
+
+	_, afterSegment := block.Position()
+	base.Remaining = len(source) - afterSegment.Start
+	base.Consumed = afterSegment.Start - segment.Start
+	if node != nil {
+		base.Result = DelimiterConsumed
+	} else {
+		base.Result = DelimiterRejected
+		base.Reason = DelimiterReasonDeclined
+	}
+	trace.emit(base)
+	return node
+}
+
 const (
 	lineBreakHard uint8 = 1 << iota
 	lineBreakSoft
@@ -1276,6 +1413,12 @@ func (p *parser) parseBlock(block text.BlockReader, parent ast.Node, pc Context)
 	escaped := false
 	source := block.Source()
 	decoder := block.Decoder()
+	var trace *delimiterTrace
+	if p.traceActive.Load() {
+		if pctx, ok := pc.(*parseContext); ok && pctx.delimiterTrace != nil {
+			trace = pctx.delimiterTrace
+		}
+	}
 	block.Reset(parentSource)
 	for {
 	retry:
@@ -1334,7 +1477,15 @@ func (p *parser) parseBlock(block text.BlockReader, parent ast.Node, pc Context)
 						}
 						var inlineNode ast.Node
 						for _, ip := range ips {
-							inlineNode = ip.Parse(parent, block, pc)
+							if trace != nil {
+								if _, ok := ip.(DelimiterProcessorSource); ok {
+									inlineNode = p.parseDelimiterInline(ip, parent, block, pc, c, trace, source)
+								} else {
+									inlineNode = ip.Parse(parent, block, pc)
+								}
+							} else {
+								inlineNode = ip.Parse(parent, block, pc)
+							}
 							if inlineNode != nil {
 								if inlineNode.Pos() < 0 {
 									inlineNode.(interface{ SetPos(int) }).SetPos(startPosition.Start)

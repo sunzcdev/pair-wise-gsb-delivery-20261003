@@ -79,6 +79,21 @@ func (s *strikethroughParser) Parse(_ gast.Node, block text.Reader, pc parser.Co
 	return parser.ParseDelimiter(block, 1, defaultStrikethroughDelimiterProcessor, pc)
 }
 
+func (s *strikethroughParser) DelimiterProcessor() parser.DelimiterProcessor {
+	return defaultStrikethroughDelimiterProcessor
+}
+
+func (s *strikethroughParser) DelimiterProcessorName() string {
+	return "strikethrough"
+}
+
+// DelimiterRunLengths implements [parser.DelimiterRunLengths]. Strikethrough
+// accepts only one- or two-character tilde runs; longer runs are declined and
+// remain literal text.
+func (s *strikethroughParser) DelimiterRunLengths() (minimum, maximum int) {
+	return 1, 2
+}
+
 func (s *strikethroughParser) CloseBlock(_ gast.Node, _ parser.Context) {
 	// nothing to do
 }

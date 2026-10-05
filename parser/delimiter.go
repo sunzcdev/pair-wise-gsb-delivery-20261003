@@ -447,6 +447,17 @@ func ProcessDelimiters(bottom ast.Node, pc Context) {
 		return
 	}
 
+	trace, _ := pc.(interface {
+		delimiterTraceState() *delimiterTrace
+	})
+	var dt *delimiterTrace
+	if trace != nil {
+		dt = trace.delimiterTraceState()
+	}
+	if !dt.enabled() {
+		dt = nil
+	}
+
 	var closer *Delimiter
 	if b, ok := bottom.(*Delimiter); ok && b != nil {
 		closer = b.NextDelimiter
@@ -471,19 +482,84 @@ func ProcessDelimiters(bottom ast.Node, pc Context) {
 		consume := 0
 		found := false
 		maybeOpener := false
+		sawOpenOpener := false
 		var opener *Delimiter
+		closerPos := closer.Value.Index().Start
 		for opener = closer.PreviousDelimiter; opener != nil && opener != bottom &&
 			(!hasLowerBound || opener.Value.Index().Start >= lowerBound); opener = opener.PreviousDelimiter {
-			if opener.CanOpen && opener.Processor.CanOpenCloser(opener, closer) {
-				maybeOpener = true
-				consume = opener.CalcConsumption(closer)
-				if consume > 0 {
-					found = true
-					break
+			if !opener.CanOpen {
+				continue
+			}
+			sawOpenOpener = true
+			if !opener.Processor.CanOpenCloser(opener, closer) {
+				if dt != nil {
+					dt.emit(DelimiterTraceEvent{
+						Stage:           DelimiterStageCandidate,
+						Result:          DelimiterRejected,
+						Handler:         dt.processorName(opener.Processor),
+						Char:            opener.Char,
+						Position:        closerPos,
+						OpenerPosition:  opener.Value.Index().Start,
+						RunLength:       opener.Length,
+						OpenerRemaining: opener.Length,
+						CloserRemaining: closer.Length,
+						Remaining:       closer.Length,
+						Reason:          DelimiterReasonMismatch,
+					})
 				}
+				continue
+			}
+			openerPos := opener.Value.Index().Start
+			if dt != nil {
+				dt.emit(DelimiterTraceEvent{
+					Stage:          DelimiterStageCandidate,
+					Result:         DelimiterTried,
+					Handler:        dt.processorName(opener.Processor),
+					Char:           closer.Char,
+					Position:       closerPos,
+					OpenerPosition: openerPos,
+					RunLength:      closer.Length,
+					Remaining:      closer.Length,
+				})
+			}
+			maybeOpener = true
+			consume = opener.CalcConsumption(closer)
+			if consume > 0 {
+				found = true
+				break
+			}
+			if dt != nil {
+				dt.emit(DelimiterTraceEvent{
+					Stage:           DelimiterStageCandidate,
+					Result:          DelimiterRejected,
+					Handler:         dt.processorName(opener.Processor),
+					Char:            closer.Char,
+					Position:        closerPos,
+					OpenerPosition:  openerPos,
+					RunLength:       closer.Length,
+					OpenerRemaining: opener.Length,
+					CloserRemaining: closer.Length,
+					Remaining:       closer.Length,
+					Reason:          DelimiterReasonRule9,
+				})
 			}
 		}
 		if !found {
+			if dt != nil && !sawOpenOpener {
+				dt.emit(DelimiterTraceEvent{
+					Stage:           DelimiterStageCandidate,
+					Result:          DelimiterRejected,
+					Handler:         dt.processorName(closer.Processor),
+					Char:            closer.Char,
+					Position:        closerPos,
+					OpenerPosition:  -1,
+					RunLength:       closer.Length,
+					OpenerRemaining: 0,
+					CloserRemaining: closer.Length,
+					Remaining:       closer.Length,
+					Reason:          DelimiterReasonNoOpener,
+				})
+			}
 			next := closer.NextDelimiter
 			if !maybeOpener && !closer.CanOpen {
 				pc.RemoveDelimiter(closer)
@@ -492,8 +568,25 @@ func ProcessDelimiters(bottom ast.Node, pc Context) {
 			closer = next
 			continue
 		}
+		openerLengthBefore := opener.Length
+		closerLengthBefore := closer.Length
 		opener.ConsumeCharacters(consume)
 		closer.ConsumeCharacters(consume)
+		if dt != nil {
+			dt.emit(DelimiterTraceEvent{
+				Stage:           DelimiterStageCandidate,
+				Result:          DelimiterConsumed,
+				Handler:         dt.processorName(opener.Processor),
+				Char:            closer.Char,
+				Position:        closerPos,
+				OpenerPosition:  opener.Value.Index().Start,
+				RunLength:       closerLengthBefore,
+				Consumed:        consume,
+				OpenerRemaining: openerLengthBefore - consume,
+				CloserRemaining: closer.Length,
+				Remaining:       closerLengthBefore - consume,
+			})
+		}
 
 		node := opener.Processor.OnMatch(consume)
 		node.SetPos(opener.Value.Index().Start)
