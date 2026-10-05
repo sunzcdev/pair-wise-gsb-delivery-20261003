@@ -74,6 +74,14 @@ client := acmez.Client{
 If you're implementing a tls-alpn-01 solver, the `acmez` package can help. It has the constant [`ACMETLS1Protocol`](https://pkg.go.dev/github.com/mholt/acmez/v3#pkg-constants) which you can use to identify challenge handshakes by inspecting the ClientHello's ALPN extension. Simply complete the handshake using a certificate from the [`acmez.TLSALPN01ChallengeCert()`](https://pkg.go.dev/github.com/mholt/acmez/v3#TLSALPN01ChallengeCert) function to solve the challenge.
 
 
+## Stepwise (manual) issuance
+
+Some environments can't solve challenges automatically - for example, when a customer's DNS records have to be changed by hand. For those cases, the blocking `ObtainCertificate` flow is a poor fit, so the `acmez` package also offers a stepwise API:
+
+1. `BeginIssuance` creates the ACME order and returns an `IssuanceState` with the order status and the challenges to complete. The state is JSON-serializable and contains no private keys, so it can be persisted and the process can exit.
+2. The caller fulfills a challenge out-of-band (e.g. creates the TXT record shown by `DNS01TXTRecordName()`/`DNS01KeyAuthorization()`), marks it ready, and later calls `AdvanceIssuance`. Advancing reloads the persisted state, reconciles it with the CA (already-valid authorizations are kept, failed or expired ones are reported, and no new order is created), and asks the CA to validate the ready challenges.
+3. Once all authorizations are valid, `CollectCertificate` finalizes the order with a CSR and downloads the certificate chains. The certificate private key stays in the caller's custody the whole time; it is only needed to sign the CSR in this last step.
+
 
 ## History
 
