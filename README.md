@@ -313,3 +313,40 @@ go test -cover ./...
 
 Builds for pull requests are tested automatically 
 using [GitHub Actions](https://github.com/evanphx/json-patch/actions/workflows/go.yml).
+
+## Rebase two JSON patches
+
+When two users start from the same JSON document and user A has already saved
+their patch, rebase B's patch onto A's result with `RebasePatch`. Array indexes
+are translated by element identity, so inserts, deletes and moves made by A do
+not make B point at a different element.
+
+```go
+rebased, err := jsonpatch.RebasePatch(original, patchA, patchB)
+if err != nil {
+    var conflictErr *jsonpatch.ConflictError
+    if errors.As(err, &conflictErr) {
+        for _, conflict := range conflictErr.Conflicts {
+            fmt.Printf("manual conflict: A op %d, B op %d, path %s\n",
+                conflict.AOperationIndex, conflict.BOperationIndex, conflict.Path)
+        }
+    }
+    return err
+}
+
+afterA, _ := patchA.Apply(original)
+final, _ := rebased.Apply(afterA)
+```
+
+Operation indexes are zero-based.
+
+### Automatic and manual cases
+
+- Automatic, different fields: A replaces `/name` while B replaces `/age`; B is returned unchanged.
+- Automatic, array shift: original `[1,2,3]`, A inserts at `/0`, and B replaces old index `/1`; B is changed to index `/2` and still edits `2`.
+- Automatic, moved target: A moves `/items/1` to `/selected`; B's edit under the old item path becomes an edit under `/selected`.
+- Redundant: both patches remove the same field or replace it with the same value; that B operation is omitted.
+- Manual, same value: both patches replace the same leaf with different values.
+- Manual, modify/delete: A replaces or removes a node that B removes.
+- Manual, lost ancestor: A removes or replaces `/parent` while B edits `/parent/child`.
+- Manual, subtree overwrite: A changes a descendant while B replaces the whole ancestor.
