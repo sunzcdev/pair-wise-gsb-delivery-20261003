@@ -67,6 +67,25 @@ if err == nil {
 }
 ```
 
+For finer-grained control, `ValidateQuality` evaluates the response against
+a caller-supplied `QualityPolicy` limiting the RTT, root synchronization
+distance, absolute clock offset, and sample age. It returns an itemized
+`QualityReport` that distinguishes protocol-level validity (the same checks
+performed by `Validate`, including authentication failures) from the
+quality policy's per-check results. Protocol failures cannot be overridden
+by relaxing quality limits.
+```go
+report := response.ValidateQuality(ntp.QualityPolicy{
+    MaxRTT:         100 * time.Millisecond,
+    MaxRootDistance: 5 * time.Second,
+    MaxClockOffset:  500 * time.Millisecond,
+    MaxAge:          time.Minute,
+})
+if !report.Valid() {
+    // inspect report.ProtocolErr, report.PolicyErr, and report.Checks
+}
+```
+
 If you wish to customize the behavior of the NTP query, use the
 [`QueryWithOptions`](https://godoc.org/github.com/beevik/ntp#QueryWithOptions)
 function:
