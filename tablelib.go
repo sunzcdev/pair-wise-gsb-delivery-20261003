@@ -11,12 +11,13 @@ func OpenTable(L *LState) int {
 }
 
 var tableFuncs = map[string]LGFunction{
-	"getn":   tableGetN,
-	"concat": tableConcat,
-	"insert": tableInsert,
-	"maxn":   tableMaxN,
-	"remove": tableRemove,
-	"sort":   tableSort,
+	"getn":        tableGetN,
+	"concat":      tableConcat,
+	"insert":      tableInsert,
+	"maxn":        tableMaxN,
+	"remove":      tableRemove,
+	"sort":        tableSort,
+	"stable_sort": tableStableSort,
 }
 
 func tableSort(L *LState) int {
@@ -26,6 +27,35 @@ func tableSort(L *LState) int {
 		sorter.Fn = L.CheckFunction(2)
 	}
 	sort.Sort(sorter)
+	return 0
+}
+
+func tableStableSort(L *LState) int {
+	tbl := L.CheckTable(1)
+	var fn *LFunction
+	if L.GetTop() != 1 {
+		fn = L.CheckFunction(2)
+	}
+	n := tbl.Len()
+	original := make([]LValue, n)
+	for i := 0; i < n; i++ {
+		original[i] = tbl.RawGetInt(i + 1)
+	}
+	sorted := make([]LValue, n)
+	copy(sorted, original)
+	sorter := lValueArraySorter{L, fn, sorted}
+	sort.Stable(sorter)
+	if tbl.Len() != n {
+		L.RaiseError("table modified during stable_sort")
+	}
+	for i := 0; i < n; i++ {
+		if tbl.RawGetInt(i + 1) != original[i] {
+			L.RaiseError("table modified during stable_sort")
+		}
+	}
+	for i := 0; i < n; i++ {
+		tbl.RawSetInt(i+1, sorted[i])
+	}
 	return 0
 }
 

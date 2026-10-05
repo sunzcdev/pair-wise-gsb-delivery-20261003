@@ -231,3 +231,93 @@ func TestTableForEach(t *testing.T) {
 		}
 	})
 }
+
+func TestTableStableSort(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+		t = {5, 3, 4, 1, 2}
+		table.stable_sort(t)
+		assert(t[1] == 1 and t[2] == 2 and t[3] == 3 and t[4] == 4 and t[5] == 5)
+
+		t = {5, 3, 4, 1, 2}
+		table.stable_sort(t, function(a, b) return a > b end)
+		assert(t[1] == 5 and t[2] == 4 and t[3] == 3 and t[4] == 2 and t[5] == 1)
+
+		t = {3, 1, 2}
+		t.extra = "keep"
+		table.stable_sort(t)
+		assert(t[1] == 1 and t[2] == 2 and t[3] == 3 and t.extra == "keep")
+	`)
+}
+
+func TestTableStableSortStability(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+		t = {
+			{k = 2, id = 1},
+			{k = 1, id = 2},
+			{k = 2, id = 3},
+			{k = 1, id = 4},
+			{k = 2, id = 5},
+		}
+		table.stable_sort(t, function(a, b) return a.k < b.k end)
+		assert(t[1].id == 2 and t[2].id == 4)
+		assert(t[3].id == 1 and t[4].id == 3 and t[5].id == 5)
+	`)
+}
+
+func TestTableStableSortErrorRollback(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+		t = {5, 3, 4, 1, 2}
+		local calls = 0
+		local ok, err = pcall(table.stable_sort, t, function(a, b)
+			calls = calls + 1
+			if calls > 2 then error("boom") end
+			return a < b
+		end)
+		assert(not ok)
+		assert(string.find(err, "boom"))
+		assert(t[1] == 5 and t[2] == 3 and t[3] == 4 and t[4] == 1 and t[5] == 2)
+	`)
+}
+
+func TestTableStableSortComparatorModification(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+		t = {3, 1, 2}
+		local ok, err = pcall(table.stable_sort, t, function(a, b)
+			t[1] = 99
+			return a < b
+		end)
+		assert(not ok)
+		assert(string.find(err, "table modified during stable_sort"))
+		assert(t[1] == 99)
+
+		t = {3, 1, 2}
+		local ok2, err2 = pcall(table.stable_sort, t, function(a, b)
+			table.insert(t, 0)
+			return a < b
+		end)
+		assert(not ok2)
+		assert(string.find(err2, "table modified during stable_sort"))
+		assert(#t > 3)
+	`)
+}
+
+func TestTableStableSortSparseArray(t *testing.T) {
+	L := NewState()
+	defer L.Close()
+	errorIfScriptFail(t, L, `
+		t = {2, 1}
+		t[4] = 0
+		local ok, err = pcall(table.stable_sort, t)
+		assert(not ok)
+		assert(string.find(err, "attempt to compare"))
+		assert(t[1] == 2 and t[2] == 1 and t[3] == nil and t[4] == 0)
+	`)
+}
