@@ -12,6 +12,7 @@ import (
 
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
@@ -49,6 +50,7 @@ type VM struct {
 	scopePool    []Scope // Pre-allocated pool of Scope values; grows as needed but never shrinks
 	scopePoolIdx int     // Current index into scopePool for allocation
 	currScope    *Scope  // Cached pointer to the current scope (optimization)
+	settings     decimal.Settings
 }
 
 func (vm *VM) Run(program *Program, env any) (_ any, err error) {
@@ -89,6 +91,7 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 	}
 	vm.memory = 0
 	vm.ip = 0
+	vm.settings = program.settings
 
 	var fnArgsBuf []any
 
@@ -162,7 +165,12 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 			vm.push(nil)
 
 		case OpNegate:
-			v := runtime.Negate(vm.pop())
+			v := vm.pop()
+			if d, ok := v.(decimal.Decimal); ok {
+				v = d.Neg()
+			} else {
+				v = runtime.Negate(v)
+			}
 			vm.push(v)
 
 		case OpNot:
@@ -172,7 +180,15 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpEqual:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Equal(a, b))
+			if isDecimalOperand(a) || isDecimalOperand(b) {
+				equal, err := decimal.EqualWithSettings(a, b, vm.settings)
+				if err != nil {
+					panic(err)
+				}
+				vm.push(equal)
+			} else {
+				vm.push(runtime.Equal(a, b))
+			}
 
 		case OpEqualInt:
 			b := vm.pop()
@@ -241,51 +257,59 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpLess:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Less(a, b))
+			vm.push(vm.decimalCompare(a, b, func(c int) bool { return c < 0 }))
 
 		case OpMore:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.More(a, b))
+			vm.push(vm.decimalCompare(a, b, func(c int) bool { return c > 0 }))
 
 		case OpLessOrEqual:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.LessOrEqual(a, b))
+			vm.push(vm.decimalCompare(a, b, func(c int) bool { return c <= 0 }))
 
 		case OpMoreOrEqual:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.MoreOrEqual(a, b))
+			vm.push(vm.decimalCompare(a, b, func(c int) bool { return c >= 0 }))
 
 		case OpAdd:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Add(a, b))
+			vm.push(vm.decimalBinary(a, b, decimal.Add, runtime.Add))
 
 		case OpSubtract:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Subtract(a, b))
+			vm.push(vm.decimalBinary(a, b, decimal.Subtract, runtime.Subtract))
 
 		case OpMultiply:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Multiply(a, b))
+			vm.push(vm.decimalBinary(a, b, decimal.Multiply, runtime.Multiply))
 
 		case OpDivide:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Divide(a, b))
+			vm.push(vm.decimalBinary(a, b, decimal.Divide, func(a, b any) any {
+				return runtime.Divide(a, b)
+			}))
 
 		case OpModulo:
 			b := vm.pop()
 			a := vm.pop()
+			if isDecimalOperand(a) || isDecimalOperand(b) {
+				panic("invalid operation: % (decimal requires decimal division)")
+			}
 			vm.push(runtime.Modulo(a, b))
 
 		case OpExponent:
 			b := vm.pop()
 			a := vm.pop()
+			if isDecimalOperand(a) || isDecimalOperand(b) {
+				panic("invalid operation: ** (decimal exponent is not supported)")
+			}
 			vm.push(runtime.Exponent(a, b))
 
 		case OpRange:
@@ -685,6 +709,51 @@ func (vm *VM) pop() any {
 	value := vm.Stack[len(vm.Stack)-1]
 	vm.Stack = vm.Stack[:len(vm.Stack)-1]
 	return value
+}
+
+func isDecimalOperand(value any) bool {
+	_, ok := value.(decimal.Decimal)
+	return ok
+}
+
+func (vm *VM) decimalCompare(a, b any, compare func(int) bool) bool {
+	if isDecimalOperand(a) || isDecimalOperand(b) {
+		cmp, err := decimal.CompareWithSettings(a, b, vm.settings)
+		if err != nil {
+			panic(err)
+		}
+		return compare(cmp)
+	}
+	return compare(runtimeCompare(a, b))
+}
+
+func runtimeCompare(a, b any) int {
+	switch {
+	case runtime.Less(a, b):
+		return -1
+	case runtime.More(a, b):
+		return 1
+	default:
+		return 0
+	}
+}
+
+type decimalOperation func(any, any, decimal.Settings) (decimal.Decimal, error)
+type runtimeOperation func(any, any) any
+
+func (vm *VM) decimalBinary(a, b any, decimalOp decimalOperation, runtimeOp runtimeOperation) any {
+	if isDecimalOperand(a) || isDecimalOperand(b) {
+		value, err := decimalOp(a, b, vm.programSettings())
+		if err != nil {
+			panic(err)
+		}
+		return value
+	}
+	return runtimeOp(a, b)
+}
+
+func (vm *VM) programSettings() decimal.Settings {
+	return vm.settings
 }
 
 func (vm *VM) memGrow(size uint) {

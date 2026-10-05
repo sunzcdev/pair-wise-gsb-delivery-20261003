@@ -4,6 +4,7 @@ import (
 	"reflect"
 
 	"github.com/expr-lang/expr/checker/nature"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 )
 
@@ -90,6 +91,12 @@ type IntegerNode struct {
 type FloatNode struct {
 	base
 	Value float64 // Value of the float.
+}
+
+// DecimalNode represents a fixed-point decimal value.
+type DecimalNode struct {
+	base
+	Value decimal.Decimal
 }
 
 // BoolNode represents a boolean.

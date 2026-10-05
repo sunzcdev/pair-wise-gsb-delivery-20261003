@@ -6,12 +6,14 @@ import (
 	"time"
 
 	"github.com/expr-lang/expr/builtin"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 )
 
 var (
 	intType       = reflect.TypeOf(0)
 	floatType     = reflect.TypeOf(float64(0))
+	decimalType   = reflect.TypeOf(decimal.Decimal{})
 	arrayType     = reflect.TypeOf([]any{})
 	byteSliceType = reflect.TypeOf([]byte{})
 	timeType      = reflect.TypeOf(time.Time{})
@@ -69,6 +71,7 @@ type Nature struct {
 	Method    bool // If value retrieved from method. Usually used to determine amount of in arguments.
 	IsInteger bool // If it's a builtin integer or unsigned integer type.
 	IsFloat   bool // If it's a builtin float type.
+	IsDecimal bool // If it's decimal.Decimal.
 }
 
 type TypeData struct {
@@ -122,6 +125,9 @@ func (c *Cache) FromType(t reflect.Type) Nature {
 	var td *TypeData
 	var isInteger, isFloat bool
 	k := t.Kind()
+	if k == reflect.Struct && t == decimalType {
+		return Nature{Type: t, Kind: k, IsDecimal: true}
+	}
 	switch k {
 	case reflect.Struct:
 		// c can be nil when we call the package function FromType, which uses a
@@ -475,6 +481,10 @@ func (n *Nature) All(c *Cache) map[string]Nature {
 
 func (n *Nature) IsNumber() bool {
 	return n.IsInteger || n.IsFloat
+}
+
+func (n *Nature) IsNumericLike() bool {
+	return n.IsNumber() || n.IsDecimal
 }
 
 func (n *Nature) PromoteNumericNature(c *Cache, rhs Nature) Nature {

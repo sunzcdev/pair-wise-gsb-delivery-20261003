@@ -12,6 +12,7 @@ import (
 	"github.com/expr-lang/expr/checker"
 	. "github.com/expr-lang/expr/checker/nature"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/parser"
 	. "github.com/expr-lang/expr/vm"
@@ -78,6 +79,11 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 		c.debugInfo,
 		span,
 	)
+	settings := decimal.DefaultSettings()
+	if config != nil {
+		settings = config.DecimalSettings()
+	}
+	program.SetDecimalSettings(settings)
 	return
 }
 
@@ -250,6 +256,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.IntegerNode(n)
 	case *ast.FloatNode:
 		c.FloatNode(n)
+	case *ast.DecimalNode:
+		c.DecimalNode(n)
 	case *ast.BoolNode:
 		c.BoolNode(n)
 	case *ast.StringNode:
@@ -398,6 +406,10 @@ func (c *compiler) FloatNode(node *ast.FloatNode) {
 	default:
 		c.emitPush(node.Value)
 	}
+}
+
+func (c *compiler) DecimalNode(node *ast.DecimalNode) {
+	c.emitPush(node.Value.Clone())
 }
 
 func (c *compiler) BoolNode(node *ast.BoolNode) {

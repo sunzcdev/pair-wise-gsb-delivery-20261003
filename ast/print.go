@@ -25,6 +25,10 @@ func (n *FloatNode) String() string {
 	return fmt.Sprintf("%v", n.Value)
 }
 
+func (n *DecimalNode) String() string {
+	return n.Value.String() + "d"
+}
+
 func (n *BoolNode) String() string {
 	return fmt.Sprintf("%t", n.Value)
 }

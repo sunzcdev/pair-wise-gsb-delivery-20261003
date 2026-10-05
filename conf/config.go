@@ -7,6 +7,7 @@ import (
 	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/checker/nature"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/vm/runtime"
 )
 
@@ -41,23 +42,35 @@ type Config struct {
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
 	// will not parse `if` statements.
 	DisableIfOperator bool
+	DecimalScale      int
+	DecimalRounding   decimal.Rounding
 }
 
 // CreateNew creates new config with default values.
 func CreateNew() *Config {
 	c := &Config{
-		Optimize:     true,
-		ShortCircuit: true,
-		MaxNodes:     DefaultMaxNodes,
-		ConstFns:     make(map[string]reflect.Value),
-		Functions:    make(map[string]*builtin.Function),
-		Builtins:     make(map[string]*builtin.Function),
-		Disabled:     make(map[string]bool),
+		Optimize:        true,
+		ShortCircuit:    true,
+		MaxNodes:        DefaultMaxNodes,
+		ConstFns:        make(map[string]reflect.Value),
+		Functions:       make(map[string]*builtin.Function),
+		Builtins:        make(map[string]*builtin.Function),
+		Disabled:        make(map[string]bool),
+		DecimalScale:    decimal.DefaultSettings().Scale,
+		DecimalRounding: decimal.DefaultSettings().Rounding,
 	}
 	for _, f := range builtin.Builtins {
 		c.Builtins[f.Name] = f
 	}
 	return c
+}
+
+func (c *Config) DecimalSettings() decimal.Settings {
+	scale := c.DecimalScale
+	if scale < 0 {
+		scale = 0
+	}
+	return decimal.Settings{Scale: scale, Rounding: c.DecimalRounding}
 }
 
 // New creates new config with environment.

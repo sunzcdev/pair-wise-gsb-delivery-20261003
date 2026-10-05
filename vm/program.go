@@ -11,6 +11,7 @@ import (
 
 	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -28,6 +29,7 @@ type Program struct {
 	functions []Function
 	debugInfo map[string]string
 	span      *Span
+	settings  decimal.Settings
 }
 
 // NewProgram returns a new Program. It's used by the compiler.
@@ -55,6 +57,10 @@ func NewProgram(
 		debugInfo: debugInfo,
 		span:      span,
 	}
+}
+
+func (program *Program) SetDecimalSettings(settings decimal.Settings) {
+	program.settings = settings
 }
 
 // Source returns origin file.Source.

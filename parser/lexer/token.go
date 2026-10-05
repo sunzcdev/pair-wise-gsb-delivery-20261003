@@ -11,6 +11,7 @@ type Kind string
 const (
 	Identifier Kind = "Identifier"
 	Number     Kind = "Number"
+	Decimal    Kind = "Decimal"
 	String     Kind = "String"
 	Bytes      Kind = "Bytes"
 	Operator   Kind = "Operator"

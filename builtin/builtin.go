@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -196,6 +197,29 @@ var Builtins = []*Function{
 				return floatType, nil
 			}
 			return anyType, fmt.Errorf("invalid argument for float (type %s)", args[0])
+		},
+	},
+	{
+		Name: "decimal",
+		Fast: Decimal,
+		Validate: func(args []reflect.Type) (reflect.Type, error) {
+			if len(args) != 1 {
+				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+			}
+			if args[0] == nil {
+				return anyType, fmt.Errorf("invalid argument for decimal (type %s)", args[0])
+			}
+			switch kind(args[0]) {
+			case reflect.Interface:
+				return anyType, nil
+			case reflect.String, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+				return decimalBuiltinType, nil
+			case reflect.Struct:
+				if args[0] == decimalBuiltinType {
+					return decimalBuiltinType, nil
+				}
+			}
+			return anyType, fmt.Errorf("invalid argument for decimal (type %s)", args[0])
 		},
 	},
 	{
@@ -1079,3 +1103,5 @@ var Builtins = []*Function{
 		Types: types(new(func(int) int)),
 	},
 }
+
+var decimalBuiltinType = reflect.TypeOf(decimal.Decimal{})

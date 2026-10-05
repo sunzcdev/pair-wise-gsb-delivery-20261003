@@ -60,6 +60,19 @@ let arr = [1, 2, 3]; int(arr[0])
 ```
 :::
 
+## Decimal arithmetic
+
+Use [`expr.DecimalPrecision(scale, rounding)`](https://pkg.go.dev/github.com/expr-lang/expr#DecimalPrecision) to control the
+fraction digits and rounding mode used by decimal operations. The defaults are scale `2` and half-away-from-zero.
+
+```go
+program, err := expr.Compile(
+    "amount * rate",
+    expr.Env(types.Map{"amount": types.Decimal, "rate": types.Int}),
+    expr.DecimalPrecision(2, expr.RoundingHalfAwayFromZero),
+)
+```
+
 
 ## WithContext
 

@@ -30,6 +30,12 @@
         </td>
     </tr>
     <tr>
+        <td><strong>Decimal</strong></td>
+        <td>
+            <code>0.50d</code>, <code>.50d</code>, <code>1d</code>, <code>1_234.56d</code>
+        </td>
+    </tr>
+    <tr>
         <td><strong>String</strong></td>
         <td>
             <code>"foo"</code>, <code>'bar'</code>
@@ -78,6 +84,21 @@ World`
 ```
 
 Backticks strings are raw strings, they do not support escape sequences.
+
+### Decimals
+
+Decimal literals use a `d` suffix and are represented in Go by `expr.Decimal`. Decimal arithmetic uses `math/big`
+backing values and never converts operands to `float64`. Integers can be combined directly with decimals and are treated
+as exact zero-scale decimals. Floats cannot be mixed with decimals; use `decimal("...")` for explicit conversion.
+
+```expr
+0.10d + 0.20d == 0.30d
+19.99d * 3 == 59.97d
+1.5d + 1.2 // compile error
+```
+
+Decimal operation results are rounded to the configured scale using the configured rounding mode. The default is two
+fraction digits with half-away-from-zero rounding. See `expr.DecimalPrecision` in the configuration documentation.
 
 ### Bytes
 
@@ -919,6 +940,14 @@ Returns the float value of a number or a string.
 
 ```expr
 float("123.45") == 123.45
+```
+
+### decimal(v) {#decimal}
+
+Returns the exact decimal value of an integer, decimal, or decimal string. Floating-point values are rejected.
+
+```expr
+decimal("123.45") == 123.45d
 ```
 
 ### string(v) {#string}

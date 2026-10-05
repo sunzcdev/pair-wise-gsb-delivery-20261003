@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	. "github.com/expr-lang/expr/checker/nature"
+	"github.com/expr-lang/expr/decimal"
 )
 
 // Type is a type that can be used to represent a value.
@@ -28,6 +29,7 @@ var (
 	Uint64  = TypeOf(uint64(0))
 	Float   = TypeOf(float32(0))
 	Float64 = TypeOf(float64(0))
+	Decimal = TypeOf(decimal.Decimal{})
 	String  = TypeOf("")
 	Bool    = TypeOf(true)
 	Nil     = nilType{}

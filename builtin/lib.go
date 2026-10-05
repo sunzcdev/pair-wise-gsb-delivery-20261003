@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"unicode/utf8"
 
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -27,6 +28,9 @@ func Type(arg any) any {
 	if arg == nil {
 		return "nil"
 	}
+	if _, ok := arg.(decimal.Decimal); ok {
+		return "decimal"
+	}
 	v := reflect.ValueOf(arg)
 	if v.Type().Name() != "" && v.Type().PkgPath() != "" {
 		return fmt.Sprintf("%s.%s", v.Type().PkgPath(), v.Type().Name())
@@ -42,6 +46,8 @@ func Type(arg any) any {
 		return "uint"
 	case reflect.Float32, reflect.Float64:
 		return "float"
+	case reflect.Struct:
+		return "struct"
 	case reflect.String:
 		return "string"
 	case reflect.Array, reflect.Slice:
@@ -50,8 +56,6 @@ func Type(arg any) any {
 		return "map"
 	case reflect.Func:
 		return "func"
-	case reflect.Struct:
-		return "struct"
 	default:
 		return "unknown"
 	}
@@ -226,6 +230,26 @@ func Float(x any) any {
 		return f
 	default:
 		panic(fmt.Sprintf("invalid operation: float(%T)", x))
+	}
+}
+
+func Decimal(x any) any {
+	switch value := x.(type) {
+	case decimal.Decimal:
+		return value.Clone()
+	case string:
+		d, err := decimal.Parse(value)
+		if err != nil {
+			panic(fmt.Sprintf("invalid operation: decimal(%s)", value))
+		}
+		return d
+	case float32, float64:
+		panic(fmt.Sprintf("invalid operation: decimal(%T); use decimal(string(...)) for explicit conversion", x))
+	default:
+		if d, ok := decimal.FromValue(value); ok {
+			return d
+		}
+		panic(fmt.Sprintf("invalid operation: decimal(%T)", x))
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	. "github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	. "github.com/expr-lang/expr/parser/lexer"
 	"github.com/expr-lang/expr/parser/operator"
@@ -482,11 +483,22 @@ func (p *Parser) parseSecondary() Node {
 			}
 		}
 
-	case Number:
+	case Number, Decimal:
 		p.next()
 		value := strings.Replace(token.Value, "_", "", -1)
 		var node Node
 		valueLower := strings.ToLower(value)
+		if token.Kind == Decimal {
+			number, err := decimal.Parse(strings.TrimSuffix(valueLower, "d"))
+			if err != nil {
+				p.error("%v", err)
+			}
+			node = p.createNode(&DecimalNode{Value: number}, token.Location)
+			if node != nil {
+				node.SetLocation(token.Location)
+			}
+			return node
+		}
 		switch {
 		case strings.HasPrefix(valueLower, "0x"):
 			number, err := strconv.ParseInt(value, 0, 64)

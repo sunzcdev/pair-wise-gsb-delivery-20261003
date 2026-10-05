@@ -70,24 +70,37 @@ func root(l *Lexer) stateFn {
 }
 
 func number(l *Lexer) stateFn {
-	if !l.scanNumber() {
+	ok, decimalLiteral := l.scanNumber(true)
+	if !ok {
 		return l.error("bad number syntax: %q", l.word())
 	}
-	l.emit(Number)
+	emitNumber(l, decimalLiteral)
 	return root
 }
 
-func (l *Lexer) scanNumber() bool {
+func emitNumber(l *Lexer, decimalLiteral bool) {
+	if decimalLiteral {
+		l.emit(Decimal)
+	} else {
+		l.emit(Number)
+	}
+}
+
+func (l *Lexer) scanNumber(decimalSuffix bool) (bool, bool) {
 	digits := "0123456789_"
+	radix := 10
 	// Is it hex?
 	if l.accept("0") {
 		// Note: Leading 0 does not mean octal in floats.
 		if l.accept("xX") {
 			digits = "0123456789abcdefABCDEF_"
+			radix = 16
 		} else if l.accept("oO") {
 			digits = "01234567_"
+			radix = 8
 		} else if l.accept("bB") {
 			digits = "01_"
+			radix = 2
 		}
 	}
 	l.acceptRun(digits)
@@ -99,7 +112,7 @@ func (l *Lexer) scanNumber() bool {
 			// and backup() func supports only one for now. So, save and
 			// restore it here.
 			l.end = end
-			return true
+			return true, false
 		}
 		l.acceptRun(digits)
 	}
@@ -107,19 +120,28 @@ func (l *Lexer) scanNumber() bool {
 		l.accept("+-")
 		l.acceptRun(digits)
 	}
+	decimalLiteral := false
+	if decimalSuffix && radix == 10 {
+		decimalLiteral = l.accept("dD")
+	}
 	// Next thing mustn't be alphanumeric.
 	if utils.IsAlphaNumeric(l.peek()) {
 		l.next()
-		return false
+		return false, false
 	}
-	return true
+	return true, decimalLiteral
 }
 
 func dot(l *Lexer) stateFn {
 	l.next()
 	if l.accept("0123456789") {
 		l.backup()
-		return number
+		ok, decimalLiteral := l.scanNumber(true)
+		if !ok {
+			return l.error("bad number syntax: %q", l.word())
+		}
+		emitNumber(l, decimalLiteral)
+		return root
 	}
 	l.accept(".")
 	l.emit(Operator)

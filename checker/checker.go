@@ -10,6 +10,7 @@ import (
 	"github.com/expr-lang/expr/builtin"
 	. "github.com/expr-lang/expr/checker/nature"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/parser"
 )
@@ -19,6 +20,7 @@ var (
 	boolType      = reflect.TypeOf(true)
 	intType       = reflect.TypeOf(0)
 	floatType     = reflect.TypeOf(float64(0))
+	decimalType   = reflect.TypeOf(decimal.Decimal{})
 	stringType    = reflect.TypeOf("")
 	arrayType     = reflect.TypeOf([]any{})
 	mapType       = reflect.TypeOf(map[string]any{})
@@ -191,6 +193,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.config.NtCache.FromType(intType)
 	case *ast.FloatNode:
 		nt = v.config.NtCache.FromType(floatType)
+	case *ast.DecimalNode:
+		nt = v.config.NtCache.FromType(decimalType)
 	case *ast.BoolNode:
 		nt = v.config.NtCache.FromType(boolType)
 	case *ast.StringNode:
@@ -303,7 +307,7 @@ func (v *Checker) unaryNode(node *ast.UnaryNode) Nature {
 		}
 
 	case "+", "-":
-		if nt.IsNumber() {
+		if nt.IsNumber() || nt.IsDecimal {
 			return nt
 		}
 		if nt.IsUnknown(&v.config.NtCache) {
@@ -317,6 +321,30 @@ func (v *Checker) unaryNode(node *ast.UnaryNode) Nature {
 	return v.error(node, `invalid operation: %s (mismatched type %s)`, node.Operator, nt.String())
 }
 
+func decimalArithmetic(left, right Nature) bool {
+	return left.IsDecimal && (right.IsDecimal || right.IsInteger) ||
+		right.IsDecimal && (left.IsDecimal || left.IsInteger)
+}
+
+func decimalComparable(left, right Nature) bool {
+	return decimalArithmetic(left, right)
+}
+
+func decimalOrderable(left, right Nature) bool {
+	return decimalArithmetic(left, right)
+}
+
+func decimalMaybeCompatible(cache *Cache, left, right Nature) bool {
+	if !left.IsDecimal && !right.IsDecimal {
+		return false
+	}
+	return left.IsUnknown(cache) || right.IsUnknown(cache)
+}
+
+func decimalFloatMismatch(left, right Nature) bool {
+	return left.IsDecimal && right.IsFloat || right.IsDecimal && left.IsFloat
+}
+
 func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 	l := v.visit(node.Left)
 	r := v.visit(node.Right)
@@ -326,7 +354,11 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 
 	switch node.Operator {
 	case "==", "!=":
-		if l.ComparableTo(&v.config.NtCache, r) {
+		if l.IsDecimal || r.IsDecimal {
+			if (decimalComparable(l, r) || decimalMaybeCompatible(&v.config.NtCache, l, r)) && !decimalFloatMismatch(l, r) {
+				return v.config.NtCache.FromType(boolType)
+			}
+		} else if l.ComparableTo(&v.config.NtCache, r) {
 			return v.config.NtCache.FromType(boolType)
 		}
 
@@ -339,6 +371,12 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		}
 
 	case "<", ">", ">=", "<=":
+		if decimalOrderable(l, r) {
+			return v.config.NtCache.FromType(boolType)
+		}
+		if decimalFloatMismatch(l, r) {
+			return v.error(node, `invalid operation: %s (decimal cannot be compared with float)`, node.Operator)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return v.config.NtCache.FromType(boolType)
 		}
@@ -351,11 +389,17 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		if l.IsDuration() && r.IsDuration() {
 			return v.config.NtCache.FromType(boolType)
 		}
-		if l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, StringCheck, TimeCheck, DurationCheck) {
+		if decimalMaybeCompatible(&v.config.NtCache, l, r) || l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, StringCheck, TimeCheck, DurationCheck) {
 			return v.config.NtCache.FromType(boolType)
 		}
 
 	case "-":
+		if decimalFloatMismatch(l, r) {
+			return v.error(node, `invalid operation: - (decimal cannot be mixed with float)`)
+		}
+		if decimalArithmetic(l, r) {
+			return v.config.NtCache.FromType(decimalType)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return l.PromoteNumericNature(&v.config.NtCache, r)
 		}
@@ -368,11 +412,17 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		if l.IsDuration() && r.IsDuration() {
 			return v.config.NtCache.FromType(durationType)
 		}
-		if l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, TimeCheck, DurationCheck) {
+		if decimalMaybeCompatible(&v.config.NtCache, l, r) || l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, TimeCheck, DurationCheck) {
 			return Nature{}
 		}
 
 	case "*":
+		if decimalFloatMismatch(l, r) {
+			return v.error(node, `invalid operation: * (decimal cannot be mixed with float)`)
+		}
+		if decimalArithmetic(l, r) {
+			return v.config.NtCache.FromType(decimalType)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return l.PromoteNumericNature(&v.config.NtCache, r)
 		}
@@ -385,19 +435,28 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		if l.IsDuration() && r.IsDuration() {
 			return v.config.NtCache.FromType(durationType)
 		}
-		if l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, DurationCheck) {
+		if decimalMaybeCompatible(&v.config.NtCache, l, r) || l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, DurationCheck) {
 			return Nature{}
 		}
 
 	case "/":
+		if decimalFloatMismatch(l, r) {
+			return v.error(node, `invalid operation: / (decimal cannot be mixed with float)`)
+		}
+		if decimalArithmetic(l, r) {
+			return v.config.NtCache.FromType(decimalType)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return v.config.NtCache.FromType(floatType)
 		}
-		if l.MaybeCompatible(&v.config.NtCache, r, NumberCheck) {
-			return v.config.NtCache.FromType(floatType)
+		if decimalMaybeCompatible(&v.config.NtCache, l, r) || l.MaybeCompatible(&v.config.NtCache, r, NumberCheck) {
+			return Nature{}
 		}
 
 	case "**", "^":
+		if l.IsDecimal || r.IsDecimal {
+			return v.error(node, `invalid operation: ** (decimal exponent is not supported)`)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return v.config.NtCache.FromType(floatType)
 		}
@@ -406,6 +465,9 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		}
 
 	case "%":
+		if l.IsDecimal || r.IsDecimal {
+			return v.error(node, `invalid operation: %% (decimal requires decimal division)`)
+		}
 		if l.IsInteger && r.IsInteger {
 			return v.config.NtCache.FromType(intType)
 		}
@@ -414,6 +476,12 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		}
 
 	case "+":
+		if decimalFloatMismatch(l, r) {
+			return v.error(node, `invalid operation: + (decimal cannot be mixed with float)`)
+		}
+		if decimalArithmetic(l, r) {
+			return v.config.NtCache.FromType(decimalType)
+		}
 		if l.IsNumber() && r.IsNumber() {
 			return l.PromoteNumericNature(&v.config.NtCache, r)
 		}
@@ -429,7 +497,7 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 		if l.IsDuration() && r.IsDuration() {
 			return v.config.NtCache.FromType(durationType)
 		}
-		if l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, StringCheck, TimeCheck, DurationCheck) {
+		if decimalMaybeCompatible(&v.config.NtCache, l, r) || l.MaybeCompatible(&v.config.NtCache, r, NumberCheck, StringCheck, TimeCheck, DurationCheck) {
 			return Nature{}
 		}
 
