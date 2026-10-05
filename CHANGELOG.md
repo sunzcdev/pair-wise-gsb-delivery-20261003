@@ -1,5 +1,8 @@
 ## Unreleased
 
+ENHANCEMENTS:
+* Added optional plugin process supervision via `ClientConfig.Supervisor`: long-running plugins are restarted with exponential backoff after unexpected exits, bounded by a restart count and time budget. Each restart is an independent process generation; stale clients, dispensed implementations and broker connections fail with identifiable errors (`ErrPluginStaleGeneration`, `ErrPluginCrashed`, `ErrPluginSupervisorGaveUp`) instead of silently attaching to the new process.
+
 SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 

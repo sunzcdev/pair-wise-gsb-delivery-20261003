@@ -4,6 +4,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -14,6 +15,7 @@ import (
 	"net/rpc"
 	"os"
 	"os/exec"
+	"strconv"
 	"testing"
 	"time"
 
@@ -570,6 +572,57 @@ func TestHelperProcess(*testing.T) {
 
 		// Shouldn't reach here but make sure we exit anyways
 		os.Exit(0)
+	case "supervised-grpc":
+		// Serves the gRPC test plugin, then exits with a non-zero status
+		// after the given delay in milliseconds, simulating a crash. If a
+		// max-crashes count and a state file are given, the process only
+		// crashes while the number of previous launches recorded in the
+		// state file is below max-crashes; later launches serve until
+		// killed. A negative delay serves until killed.
+		delay, err := strconv.Atoi(args[0])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "bad delay: %s\n", err)
+			os.Exit(2)
+		}
+
+		crash := true
+		if len(args) > 2 {
+			maxCrashes, err := strconv.Atoi(args[1])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bad max crashes: %s\n", err)
+				os.Exit(2)
+			}
+			f, err := os.OpenFile(args[2], os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "open state file: %s\n", err)
+				os.Exit(2)
+			}
+			content, _ := io.ReadAll(f)
+			launches := bytes.Count(content, []byte("\n"))
+			_, _ = f.WriteString("x\n")
+			_ = f.Close()
+			crash = launches < maxCrashes
+		}
+
+		serveDone := make(chan struct{})
+		go func() {
+			Serve(&ServeConfig{
+				HandshakeConfig: testHandshake,
+				Plugins:         testGRPCPluginMap,
+				GRPCServer:      DefaultGRPCServer,
+			})
+			close(serveDone)
+		}()
+
+		if crash && delay >= 0 {
+			select {
+			case <-serveDone:
+				return
+			case <-time.After(time.Duration(delay) * time.Millisecond):
+			}
+			os.Exit(1)
+		}
+		<-serveDone
 	case "test-grpc-tls":
 		// Serve!
 		Serve(&ServeConfig{

@@ -96,16 +96,25 @@ type Client struct {
 	protocol          Protocol
 	logger            hclog.Logger
 	doneCtx           context.Context
-	ctxCancel         context.CancelFunc
+	ctxCancel         context.CancelCauseFunc
 	negotiatedVersion int
+
+	// killedByUser records that Kill was called, so that the process
+	// exiting is treated as a user-initiated shutdown rather than a crash.
+	killedByUser bool
+
+	// generation is incremented each time a new plugin process is
+	// started. Supervised clients use it to detect stale clients from
+	// previous process generations.
+	generation uint64
+
+	// sup supervises the plugin process and restarts it after unexpected
+	// exits. It is nil unless ClientConfig.Supervisor is set.
+	sup *clientSupervisor
 
 	// clientWaitGroup is used to manage the lifecycle of the plugin management
 	// goroutines.
 	clientWaitGroup sync.WaitGroup
-
-	// pipesWaitGroup is used to prevent the command's Wait() function from
-	// being called before we've finished reading from the stdout and stderr pipe.
-	pipesWaitGroup sync.WaitGroup
 
 	// processKilled is used for testing only, to flag when the process was
 	// forcefully killed.
@@ -134,6 +143,17 @@ func (c *Client) ID() string {
 	}
 
 	return ""
+}
+
+// Generation returns the current plugin process generation. It starts at 1
+// after the first successful Start and is incremented every time the
+// supervisor restarts the plugin process. Clients, dispensed
+// implementations and broker connections obtained from a previous
+// generation are not valid for the current one.
+func (c *Client) Generation() uint64 {
+	c.l.Lock()
+	defer c.l.Unlock()
+	return c.generation
 }
 
 // ClientConfig is the configuration used to initialize a new
@@ -274,6 +294,14 @@ type ClientConfig struct {
 	// UnixSocketConfig configures additional options for any Unix sockets
 	// that are created. Not normally required. Not supported on Windows.
 	UnixSocketConfig *UnixSocketConfig
+
+	// Supervisor, if set, enables supervision of the plugin process for
+	// long-running plugins: when the process exits without being killed
+	// via Kill, it is restarted with exponential backoff until the
+	// configured restart count or time budget is exhausted. Each restart
+	// is an independent process generation; see SupervisorConfig for
+	// details. Cannot be used with Reattach.
+	Supervisor *SupervisorConfig
 }
 
 type UnixSocketConfig struct {
@@ -430,6 +458,10 @@ func NewClient(config *ClientConfig) (c *Client) {
 		config: config,
 		logger: config.Logger,
 	}
+	if config.Supervisor != nil {
+		c.sup = newClientSupervisor(*config.Supervisor)
+		go c.sup.run(c)
+	}
 	if config.Managed {
 		managedClientsLock.Lock()
 		managedClients = append(managedClients, c)
@@ -451,10 +483,18 @@ func (c *Client) Client() (ClientProtocol, error) {
 	c.l.Lock()
 	defer c.l.Unlock()
 
+	return c.clientLocked()
+}
+
+// clientLocked returns the protocol client for the current process
+// generation, creating it if necessary. The client lock must be held and
+// the client must be started.
+func (c *Client) clientLocked() (ClientProtocol, error) {
 	if c.client != nil {
-		return c.client, nil
+		return c.wrapClientProtocolLocked(c.client), nil
 	}
 
+	var err error
 	switch c.protocol {
 	case ProtocolNetRPC:
 		c.client, err = newRPCClient(c)
@@ -471,7 +511,22 @@ func (c *Client) Client() (ClientProtocol, error) {
 		return nil, err
 	}
 
-	return c.client, nil
+	return c.wrapClientProtocolLocked(c.client), nil
+}
+
+// wrapClientProtocolLocked wraps the protocol client with a generation
+// check for supervised clients, so that clients from previous process
+// generations fail with an identifiable error. The client lock must be
+// held.
+func (c *Client) wrapClientProtocolLocked(client ClientProtocol) ClientProtocol {
+	if c.sup == nil || client == nil {
+		return client
+	}
+	return &supervisedClientProtocol{
+		inner:      client,
+		client:     c,
+		generation: c.generation,
+	}
 }
 
 // Tells whether or not the underlying process has exited.
@@ -496,12 +551,26 @@ func (c *Client) killed() bool {
 //
 // This method can safely be called multiple times.
 func (c *Client) Kill() {
-	// Grab a lock to read some private fields.
+	// Grab a lock to update and read some private fields.
 	c.l.Lock()
+	c.killedByUser = true
+	sup := c.sup
+	if sup != nil {
+		// A user-initiated Kill must never trigger a restart.
+		sup.requestStop()
+	}
 	runner := c.runner
 	addr := c.address
 	hostSocketDir := c.unixSocketCfg.socketDir
 	c.l.Unlock()
+
+	if sup != nil {
+		// Wait for the supervisor loop to stop so that no new process
+		// generation can be started while we tear down the current one.
+		// The loop is interruptible even while waiting out a backoff, so
+		// this returns promptly.
+		sup.waitStopped()
+	}
 
 	// If there is no runner or ID, there is nothing to kill.
 	if runner == nil || runner.ID() == "" {
@@ -530,7 +599,9 @@ func (c *Client) Kill() {
 	graceful := false
 	if addr != nil {
 		// Close the client to cleanly exit the process.
-		client, err := c.Client()
+		c.l.Lock()
+		client, err := c.clientLocked()
+		c.l.Unlock()
 		if err == nil {
 			err = client.Close()
 
@@ -575,16 +646,51 @@ func (c *Client) Kill() {
 // a port for RPC connections, and returning the address to connect via RPC.
 //
 // This method is safe to call multiple times. Subsequent calls have no effect.
-// Once a client has been started once, it cannot be started again, even if
-// it was killed.
+// Once a client has been started once, it cannot be started again by calling
+// Start, even if it was killed. For supervised clients, the supervisor
+// starts new process generations itself after unexpected exits.
 func (c *Client) Start() (addr net.Addr, err error) {
 	c.l.Lock()
 	defer c.l.Unlock()
+
+	if c.config.Supervisor != nil && c.config.Reattach != nil {
+		return nil, ErrSupervisorAndReattach
+	}
+
+	if c.sup != nil {
+		switch {
+		case c.killedByUser:
+			return nil, ErrPluginKilled
+		case c.sup.gaveUp:
+			return nil, fmt.Errorf("%w: %w", ErrPluginSupervisorGaveUp, c.sup.lastErr)
+		case c.sup.active || c.exited:
+			// The plugin crashed and the supervisor is waiting to
+			// restart it (or a restart attempt is in flight).
+			return nil, fmt.Errorf("%w: waiting for supervisor restart", ErrPluginCrashed)
+		}
+	}
 
 	if c.address != nil {
 		return c.address, nil
 	}
 
+	addr, err = c.startLocked()
+	if err != nil && c.sup != nil && !c.killedByUser {
+		// The initial start failed; hand over to the supervisor so it
+		// can retry with backoff according to its budget. Mark the
+		// supervisor active synchronously so that subsequent Start calls
+		// wait for the supervisor instead of racing its restart.
+		c.sup.active = true
+		c.sup.notifyCrashed(crashEvent{gen: c.generation, err: err})
+	}
+	return addr, err
+}
+
+// startLocked launches a single plugin process generation and negotiates
+// the RPC connection with it. The client lock must be held. It is called
+// by Start for the first generation and by the supervisor loop for
+// subsequent generations.
+func (c *Client) startLocked() (addr net.Addr, err error) {
 	// If one of cmd or reattach isn't set, then it is an error. We wrap
 	// this in a {} for scoping reasons, and hopeful that the escape
 	// analysis will pop the stack here.
@@ -605,6 +711,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		if c.config.SecureConfig != nil && c.config.Reattach != nil {
 			return nil, ErrSecureConfigAndReattach
+		}
+
+		if c.config.Supervisor != nil && c.config.Reattach != nil {
+			return nil, ErrSupervisorAndReattach
 		}
 
 		if c.config.GRPCBrokerMultiplex && c.config.Reattach != nil {
@@ -651,6 +761,13 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		// still use cmd as a spec to populate metadata for the external
 		// implementation to consume.
 		cmd = exec.Command("")
+	} else if c.sup != nil {
+		// Supervised clients may start many process generations, and an
+		// exec.Cmd cannot be reused once started, so build a fresh
+		// command from the configured template for each generation. This
+		// also keeps each generation's environment free of duplicates of
+		// the variables appended below.
+		cmd = cloneCmd(c.config.Cmd)
 	}
 	if !c.config.SkipHostEnv {
 		cmd.Env = append(cmd.Env, os.Environ()...)
@@ -750,33 +867,44 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		}
 	}()
 
-	// Create a context for when we kill
-	c.doneCtx, c.ctxCancel = context.WithCancel(context.Background())
+	// Create a context for when we kill. The context is per-generation: it
+	// is canceled when this process generation exits, with a cause of
+	// ErrPluginCrashed if the exit was unexpected.
+	doneCtx, ctxCancel := context.WithCancelCause(context.Background())
+	c.doneCtx, c.ctxCancel = doneCtx, ctxCancel
+
+	// pipesWaitGroup is used to prevent the command's Wait() function from
+	// being called before we've finished reading from the stdout and stderr
+	// pipe. It is per-generation so that a supervised restart never
+	// interacts with the previous generation's waiters.
+	pipesWaitGroup := new(sync.WaitGroup)
 
 	// Add two to pipesWaitGroup: one for logStderr, one for the goroutine
 	// below that consumes Stdout.  We mustn't continue to Add once we might Wait.
-	c.pipesWaitGroup.Add(2)
+	pipesWaitGroup.Add(2)
 
 	// Start goroutine that logs the stderr
 	c.clientWaitGroup.Add(1)
-	// logStderr calls c.pipesWaitGroup.Done()
-	go c.logStderr(runner.Name(), runner.Stderr())
+	// logStderr calls pipesWaitGroup.Done()
+	go c.logStderr(pipesWaitGroup, runner.Name(), runner.Stderr())
 
 	c.clientWaitGroup.Add(1)
 	go func() {
-		// ensure the context is cancelled when we're done
-		defer c.ctxCancel()
+		// ensure the context is cancelled when we're done. If the
+		// generation context was already canceled with a cause below,
+		// that cause wins.
+		defer ctxCancel(nil)
 
 		defer c.clientWaitGroup.Done()
 
 		// wait to finish reading from stdout/stderr since the stdout/stderr pipe readers
 		// will be closed by the subsequent call to cmd.Wait().
-		c.pipesWaitGroup.Wait()
+		pipesWaitGroup.Wait()
 
 		// Wait for the command to end.
-		err := runner.Wait(context.Background())
-		if err != nil {
-			c.logger.Error("plugin process exited", "plugin", runner.Name(), "id", runner.ID(), "error", err.Error())
+		waitErr := runner.Wait(context.Background())
+		if waitErr != nil {
+			c.logger.Error("plugin process exited", "plugin", runner.Name(), "id", runner.ID(), "error", waitErr.Error())
 		} else {
 			// Log and make sure to flush the logs right away
 			c.logger.Info("plugin process exited", "plugin", runner.Name(), "id", runner.ID())
@@ -784,10 +912,33 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		_ = os.Stderr.Sync()
 
-		// Set that we exited, which takes a lock
+		// Set that we exited, which takes a lock. If this goroutine
+		// belongs to a stale generation (e.g. a failed start attempt
+		// that was superseded by a supervised restart), it must not
+		// touch the client's state.
 		c.l.Lock()
-		defer c.l.Unlock()
-		c.exited = true
+		current := c.doneCtx == doneCtx
+		if current {
+			c.exited = true
+		}
+		established := c.address != nil
+		killed := c.killedByUser
+		sup := c.sup
+		gen := c.generation
+		c.l.Unlock()
+
+		if sup != nil && current && !killed && established {
+			// The plugin exited without being asked to. Cancel the
+			// generation context with an identifiable cause so that
+			// in-flight calls can tell the plugin crashed, and hand
+			// over to the supervisor for a restart decision.
+			cause := error(ErrPluginCrashed)
+			if waitErr != nil {
+				cause = fmt.Errorf("%w: %w", ErrPluginCrashed, waitErr)
+			}
+			ctxCancel(cause)
+			sup.notifyCrashed(crashEvent{gen: gen, err: waitErr})
+		}
 	}()
 
 	// Start a goroutine that is going to be reading the lines
@@ -796,7 +947,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	c.clientWaitGroup.Add(1)
 	go func() {
 		defer c.clientWaitGroup.Done()
-		defer c.pipesWaitGroup.Done()
+		defer pipesWaitGroup.Done()
 		defer close(linesCh)
 
 		scanner := bufio.NewScanner(runner.Stdout())
@@ -944,7 +1095,29 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.address = addr
+	c.generation++
 	return
+}
+
+// resetGenerationLocked clears all per-process-generation state so that a
+// new generation can be started by the supervisor. The client lock must be
+// held. The caller is responsible for closing the previous generation's
+// protocol client (returned by c.client before the reset) once the lock is
+// released.
+func (c *Client) resetGenerationLocked() {
+	c.address = nil
+	c.runner = nil
+	c.client = nil
+	c.protocol = ProtocolInvalid
+	c.exited = false
+	c.processKilled = false
+	c.negotiatedVersion = 0
+	c.grpcMuxer = nil
+	c.grpcMuxerOnce = sync.Once{}
+	if c.unixSocketCfg.socketDir != "" {
+		_ = os.RemoveAll(c.unixSocketCfg.socketDir)
+		c.unixSocketCfg.socketDir = ""
+	}
 }
 
 // loadServerCert is used by AutoMTLS to read an x.509 cert returned by the
@@ -982,7 +1155,7 @@ func (c *Client) reattach() (net.Addr, error) {
 	}
 
 	// Create a context for when we kill
-	c.doneCtx, c.ctxCancel = context.WithCancel(context.Background())
+	c.doneCtx, c.ctxCancel = context.WithCancelCause(context.Background())
 
 	c.clientWaitGroup.Add(1)
 	// Goroutine to mark exit status
@@ -990,7 +1163,7 @@ func (c *Client) reattach() (net.Addr, error) {
 		defer c.clientWaitGroup.Done()
 
 		// ensure the context is cancelled when we're done
-		defer c.ctxCancel()
+		defer c.ctxCancel(nil)
 
 		// Wait for the process to die
 		_ = r.Wait(context.Background())
@@ -1166,9 +1339,9 @@ func (c *Client) getGRPCMuxer(addr net.Addr) (*grpcmux.GRPCClientMuxer, error) {
 	return c.grpcMuxer, nil
 }
 
-func (c *Client) logStderr(name string, r io.Reader) {
+func (c *Client) logStderr(pipesWaitGroup *sync.WaitGroup, name string, r io.Reader) {
 	defer c.clientWaitGroup.Done()
-	defer c.pipesWaitGroup.Done()
+	defer pipesWaitGroup.Done()
 
 	l := c.logger.Named(filepath.Base(name))
 	loggerLevel := l.GetLevel()

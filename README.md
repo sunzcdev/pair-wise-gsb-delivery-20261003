@@ -128,6 +128,24 @@ That's it! In practice, step 2 is the most tedious and time consuming step.
 Even so, it isn't very difficult and you can see examples in the `examples/`
 directory as well as throughout our various open source projects.
 
+### Supervising long-running plugins
+
+For plugins that must run continuously, `ClientConfig.Supervisor` enables an
+optional supervisor that restarts the plugin process with exponential
+backoff when it exits without being killed via `Client.Kill`. The supervisor
+stops restarting once the configured restart count (`MaxRestarts`) or time
+budget (`Budget`) is exhausted, and a user-initiated `Kill` never triggers
+a restart.
+
+Every (re)start is an independent process generation. Clients, dispensed
+implementations, and broker connections from a previous generation are
+never silently attached to the new process: using them fails with
+`ErrPluginStaleGeneration`, and the generation context passed to
+`GRPCPlugin.GRPCClient` is canceled with `ErrPluginCrashed` as its cause.
+In-flight calls against a crashed generation fail; whether to retry them is
+up to the caller, which can obtain a client for the new generation by
+calling `Client` again.
+
 For complete API documentation, see [GoDoc](https://godoc.org/github.com/hashicorp/go-plugin).
 
 ## Roadmap
