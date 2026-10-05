@@ -239,8 +239,10 @@ regexp: <regex>,
 [ source_ip_address: <string> ]
 
 # The query sent in the TCP probe and the expected associated response.
-# "expect" matches a regular expression; it is mutually exclusive with "expect_bytes".
-# "expect_bytes" does exact byte-by-byte match; it is mutually exclusive with "expect".
+# "expect" matches a regular expression; it is mutually exclusive with "expect_bytes" and "expect_frame".
+# "expect_bytes" does exact byte-by-byte match; it is mutually exclusive with "expect" and "expect_frame".
+# "expect_frame" reads a length-prefixed binary frame and asserts fields of the
+# complete frame; it is mutually exclusive with "expect" and "expect_bytes".
 # "labels" can define labels which will be exported on metric "probe_expect_info";
 # "send" sends some content;
 # "send" and "labels.value" can contain values matched by "expect" (such as "${1}");
@@ -248,6 +250,26 @@ regexp: <regex>,
 query_response:
   [ - [ [ expect: <string> ],
         [ expect_bytes: <string> ],
+        [ expect_frame:
+            # Offset of the length field within the frame.
+            [ length_offset: <int> | default = 0 ],
+            # Width of the length field in bytes: 1, 2, 4 or 8.
+            [ length_size: <int> | default = 4 ],
+            # Byte order of the length field: "big" or "little".
+            [ length_endianness: <string> | default = "big" ],
+            # Whether the length value includes the frame header (the bytes up
+            # to and including the length field). If false, the header size is
+            # added to the length value to obtain the total frame size.
+            [ length_includes_header: <boolean> | default = false ],
+            # Largest accepted total frame size; frames announcing more are
+            # rejected immediately.
+            [ max_frame_size: <int> | default = 1048576 ],
+            # Assertions on fields of the complete frame.
+            [ fields:
+              [ - offset: <int>
+                  expect_bytes: <string> ], ...
+            ]
+        ],
         [ labels:
           - [ name: <string>
               value: <string>

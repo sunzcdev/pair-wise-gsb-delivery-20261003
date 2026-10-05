@@ -89,6 +89,18 @@ var (
 	DefaultWebsocketProbe = WebsocketProbe{
 		IPProtocolFallback: true,
 	}
+
+	// DefaultFrameExpectMaxFrameSize is the default upper bound for a single
+	// binary frame declared by the peer. It guards against peers announcing
+	// huge frames, which would otherwise make the prober allocate unbounded
+	// amounts of memory.
+	DefaultFrameExpectMaxFrameSize = 1 << 20 // 1 MiB
+
+	// DefaultFrameExpect set default value for FrameExpect
+	DefaultFrameExpect = FrameExpect{
+		LengthSize:       4,
+		LengthEndianness: "big",
+	}
 )
 
 type Config struct {
@@ -354,11 +366,37 @@ type Label struct {
 }
 
 type QueryResponse struct {
-	Expect      Regexp  `yaml:"expect,omitempty" json:"expect,omitzero"`
-	ExpectBytes string  `yaml:"expect_bytes,omitempty" json:"expect_bytes,omitempty"`
-	Labels      []Label `yaml:"labels,omitempty" json:"labels,omitempty"`
-	Send        string  `yaml:"send,omitempty" json:"send,omitempty"`
-	StartTLS    bool    `yaml:"starttls,omitempty" json:"starttls,omitempty"`
+	Expect      Regexp       `yaml:"expect,omitempty" json:"expect,omitzero"`
+	ExpectBytes string       `yaml:"expect_bytes,omitempty" json:"expect_bytes,omitempty"`
+	ExpectFrame *FrameExpect `yaml:"expect_frame,omitempty" json:"expect_frame,omitempty"`
+	Labels      []Label      `yaml:"labels,omitempty" json:"labels,omitempty"`
+	Send        string       `yaml:"send,omitempty" json:"send,omitempty"`
+	StartTLS    bool         `yaml:"starttls,omitempty" json:"starttls,omitempty"`
+}
+
+// FrameExpect describes a length-prefixed binary frame expected from the
+// target, along with byte-level assertions on fields of the complete frame.
+type FrameExpect struct {
+	// LengthOffset is the offset of the length field within the frame.
+	LengthOffset int `yaml:"length_offset,omitempty" json:"length_offset,omitempty"`
+	// LengthSize is the width of the length field in bytes (1, 2, 4 or 8).
+	LengthSize int `yaml:"length_size,omitempty" json:"length_size,omitempty"`
+	// LengthEndianness is the byte order of the length field ("big" or "little").
+	LengthEndianness string `yaml:"length_endianness,omitempty" json:"length_endianness,omitempty"`
+	// LengthIncludesHeader tells whether the length value covers the frame
+	// header (the bytes up to and including the length field) as well.
+	LengthIncludesHeader bool `yaml:"length_includes_header,omitempty" json:"length_includes_header,omitempty"`
+	// MaxFrameSize is the largest accepted total frame size. Defaults to
+	// DefaultFrameExpectMaxFrameSize.
+	MaxFrameSize int `yaml:"max_frame_size,omitempty" json:"max_frame_size,omitempty"`
+	// Fields holds assertions on fields of the complete frame.
+	Fields []FrameFieldMatch `yaml:"fields,omitempty" json:"fields,omitempty"`
+}
+
+// FrameFieldMatch asserts the bytes of a frame field at a given offset.
+type FrameFieldMatch struct {
+	Offset      int    `yaml:"offset" json:"offset"`
+	ExpectBytes string `yaml:"expect_bytes" json:"expect_bytes"`
 }
 
 type TCPProbe struct {
@@ -616,8 +654,50 @@ func (s *QueryResponse) UnmarshalYAML(unmarshal func(any) error) error {
 	if err := unmarshal((*plain)(s)); err != nil {
 		return err
 	}
-	if s.Expect.Regexp != nil && s.ExpectBytes != "" {
-		return errors.New("expect and expect_bytes are mutually exclusive")
+	matches := 0
+	for _, set := range []bool{s.Expect.Regexp != nil, s.ExpectBytes != "", s.ExpectFrame != nil} {
+		if set {
+			matches++
+		}
+	}
+	if matches > 1 {
+		return errors.New("expect, expect_bytes and expect_frame are mutually exclusive")
+	}
+	return nil
+}
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (s *FrameExpect) UnmarshalYAML(unmarshal func(any) error) error {
+	*s = DefaultFrameExpect
+	type plain FrameExpect
+	if err := unmarshal((*plain)(s)); err != nil {
+		return err
+	}
+	if s.LengthOffset < 0 {
+		return errors.New("length_offset cannot be negative")
+	}
+	switch s.LengthSize {
+	case 1, 2, 4, 8:
+		// valid
+	default:
+		return fmt.Errorf("length_size %d is not valid, must be one of 1, 2, 4 or 8", s.LengthSize)
+	}
+	switch s.LengthEndianness {
+	case "big", "little":
+		// valid
+	default:
+		return fmt.Errorf("length_endianness '%s' is not valid, must be \"big\" or \"little\"", s.LengthEndianness)
+	}
+	if s.MaxFrameSize < 0 {
+		return errors.New("max_frame_size cannot be negative")
+	}
+	for _, field := range s.Fields {
+		if field.Offset < 0 {
+			return errors.New("offset cannot be negative for frame field matchers")
+		}
+		if field.ExpectBytes == "" {
+			return errors.New("expect_bytes must be set for frame field matchers")
+		}
 	}
 	return nil
 }

@@ -117,6 +117,14 @@ func TestLoadBadConfigs(t *testing.T) {
 			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
 		},
 		{
+			input: "testdata/invalid-tcp-query-response-frame.yml",
+			want:  "error parsing config file: length_size 3 is not valid, must be one of 1, 2, 4 or 8",
+		},
+		{
+			input: "testdata/invalid-tcp-query-response-frame-mutually-exclusive.yml",
+			want:  "error parsing config file: expect, expect_bytes and expect_frame are mutually exclusive",
+		},
+		{
 			input: "testdata/invalid-unix-query-response-regexp.yml",
 			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
 		},

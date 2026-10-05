@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 
@@ -72,8 +74,13 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		Name: "probe_failed_due_to_bytes",
 		Help: "Indicates if probe failed due to bytes",
 	})
+	probeFailedDueToFrame := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_failed_due_to_frame",
+		Help: "Indicates if probe failed due to frame",
+	})
 	registry.MustRegister(probeFailedDueToRegex)
 	registry.MustRegister(probeFailedDueToBytes)
+	registry.MustRegister(probeFailedDueToFrame)
 
 	var queryResponses []config.QueryResponse
 	var tlsConfig *pconfig.TLSConfig
@@ -110,53 +117,59 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		checkCRL(ctx, &state, checkRevoked, nil, registry, logger)
 	}
 
-	scanner := bufio.NewScanner(conn)
+	// All query response steps consume the connection through a single
+	// buffered reader, so that text and binary steps can be freely mixed
+	// without losing bytes that were read ahead of the current step.
+	reader := bufio.NewReader(conn)
 	for i, qr := range queryResponses {
 		logger.Debug("Processing query response entry", "entry_number", i)
 		send := qr.Send
 		if qr.Expect.Regexp != nil {
 			var match []int
+			var line []byte
 			// Read lines until one of them matches the configured regexp.
-			for scanner.Scan() {
-				logger.Debug("Read line", "line", scanner.Text())
-				match = qr.Expect.FindSubmatchIndex(scanner.Bytes())
-				if match != nil {
-					logger.Debug("Regexp matched", "regexp", qr.Expect.Regexp, "line", scanner.Text())
+			for {
+				l, err := reader.ReadBytes('\n')
+				if len(l) > 0 {
+					line = bytes.TrimSuffix(bytes.TrimSuffix(l, []byte("\n")), []byte("\r"))
+					logger.Debug("Read line", "line", string(line))
+					match = qr.Expect.FindSubmatchIndex(line)
+					if match != nil {
+						logger.Debug("Regexp matched", "regexp", qr.Expect.Regexp, "line", string(line))
+						break
+					}
+				}
+				if err != nil {
+					if err != io.EOF {
+						logger.Error("Error reading from connection", "err", err.Error())
+						return false
+					}
 					break
 				}
 			}
-			if scanner.Err() != nil {
-				logger.Error("Error reading from connection", "err", scanner.Err().Error())
-				return false
-			}
 			if match == nil {
 				probeFailedDueToRegex.Set(1)
-				logger.Error("Regexp did not match", "regexp", qr.Expect.Regexp, "line", scanner.Text())
+				logger.Error("Regexp did not match", "regexp", qr.Expect.Regexp, "line", string(line))
 				return false
 			}
 			probeFailedDueToRegex.Set(0)
-			send = string(qr.Expect.Expand(nil, []byte(send), scanner.Bytes(), match))
+			send = string(qr.Expect.Expand(nil, []byte(send), line, match))
 			if qr.Labels != nil {
-				probeExpectInfo(registry, &qr, scanner.Bytes(), match)
+				probeExpectInfo(registry, &qr, line, match)
 			}
 		}
 		if qr.ExpectBytes != "" {
 			expectBytes := []byte(qr.ExpectBytes)
 
-			// Try to read same number of bytes as expected.
+			// Read exactly as many bytes as expected, however many reads
+			// it takes; leftover bytes stay buffered for the next step.
 			data := make([]byte, len(expectBytes))
-			n, err := conn.Read(data)
-			if err != nil {
+			if _, err := io.ReadFull(reader, data); err != nil {
 				logger.Error("Error reading from connection", "err", err)
 				return false
 			}
 
 			logger.Debug("Read bytes", "bytes", data)
-
-			if n < len(expectBytes) {
-				logger.Error("Read less data than expected", "expected", expectBytes, "bytes", data)
-				return false
-			}
 
 			if !bytes.Equal(expectBytes, data) {
 				probeFailedDueToBytes.Set(1)
@@ -165,6 +178,28 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			}
 			logger.Debug("Bytes matched", "expected", expectBytes, "bytes", data)
 			probeFailedDueToBytes.Set(0)
+		}
+		if qr.ExpectFrame != nil {
+			frame, err := readFrame(reader, qr.ExpectFrame)
+			if err != nil {
+				logger.Error("Error reading frame", "err", err)
+				return false
+			}
+			logger.Debug("Read frame", "frame_length", len(frame))
+			for _, field := range qr.ExpectFrame.Fields {
+				end := field.Offset + len(field.ExpectBytes)
+				if end > len(frame) {
+					probeFailedDueToFrame.Set(1)
+					logger.Error("Frame field out of bounds", "offset", field.Offset, "size", len(field.ExpectBytes), "frame_length", len(frame))
+					return false
+				}
+				if got := frame[field.Offset:end]; !bytes.Equal(got, []byte(field.ExpectBytes)) {
+					probeFailedDueToFrame.Set(1)
+					logger.Error("Frame field did not match", "offset", field.Offset, "expected", []byte(field.ExpectBytes), "bytes", got)
+					return false
+				}
+			}
+			probeFailedDueToFrame.Set(0)
 		}
 		if send != "" {
 			logger.Debug("Sending line", "line", send)
@@ -196,7 +231,7 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			}
 			logger.Debug("TLS Handshake (client) succeeded.")
 			conn = net.Conn(tlsConn)
-			scanner = bufio.NewScanner(conn)
+			reader = bufio.NewReader(conn)
 
 			// Get certificate expiry.
 			state := tlsConn.ConnectionState()
@@ -210,4 +245,57 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		}
 	}
 	return true
+}
+
+// readFrame reads a single length-prefixed binary frame from reader. The
+// length field location, width and byte order are described by expect, as
+// well as whether the length value includes the frame header. Reads are
+// assembled incrementally, so frames split across (or coalesced within)
+// TCP segments are handled; the connection deadline bounds the total wait.
+func readFrame(reader *bufio.Reader, expect *config.FrameExpect) ([]byte, error) {
+	headerSize := expect.LengthOffset + expect.LengthSize
+	frame := make([]byte, headerSize)
+	if _, err := io.ReadFull(reader, frame); err != nil {
+		return nil, fmt.Errorf("error reading frame header: %w", err)
+	}
+
+	lengthField := frame[expect.LengthOffset:headerSize]
+	var order binary.ByteOrder = binary.BigEndian
+	if expect.LengthEndianness == "little" {
+		order = binary.LittleEndian
+	}
+	var length uint64
+	switch expect.LengthSize {
+	case 1:
+		length = uint64(lengthField[0])
+	case 2:
+		length = uint64(order.Uint16(lengthField))
+	case 4:
+		length = uint64(order.Uint32(lengthField))
+	case 8:
+		length = order.Uint64(lengthField)
+	default:
+		return nil, fmt.Errorf("invalid length field size %d, must be one of 1, 2, 4 or 8", expect.LengthSize)
+	}
+
+	total := length
+	if !expect.LengthIncludesHeader {
+		total += uint64(headerSize)
+	}
+	if total < uint64(headerSize) {
+		return nil, fmt.Errorf("frame length %d is smaller than the frame header %d", total, headerSize)
+	}
+	maxFrameSize := expect.MaxFrameSize
+	if maxFrameSize <= 0 {
+		maxFrameSize = config.DefaultFrameExpectMaxFrameSize
+	}
+	if total > uint64(maxFrameSize) {
+		return nil, fmt.Errorf("frame length %d exceeds max_frame_size %d", total, maxFrameSize)
+	}
+
+	frame = append(frame, make([]byte, total-uint64(headerSize))...)
+	if _, err := io.ReadFull(reader, frame[headerSize:]); err != nil {
+		return nil, fmt.Errorf("error reading frame payload: %w", err)
+	}
+	return frame, nil
 }
