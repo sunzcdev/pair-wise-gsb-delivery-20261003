@@ -82,6 +82,7 @@ type Config struct {
 
 	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
 	encodedAttributes string                               // Encoded connection attributes
+	mfaCredentials    FactorCredentialProvider             // Provides credentials for additional auth factors
 	paramOrder        []string                             // Order of connection parameters parsed from the DSN
 	pubKey            *rsa.PublicKey                       // Server public key
 	timeTruncate      time.Duration                        // Truncate time.Time values to the specified duration
@@ -153,6 +154,21 @@ func TimeTruncate(d time.Duration) Option {
 func BeforeConnect(fn func(context.Context, *Config) error) Option {
 	return func(cfg *Config) error {
 		cfg.beforeConnect = fn
+		return nil
+	}
+}
+
+// MultiFactorCredentials sets the provider used to obtain credentials for
+// additional authentication factors when the server requests multi-factor
+// authentication (MySQL 8.0.27+). The password from [Config.Passwd] is only
+// used for the first factor; every additional factor is requested from the
+// provider together with the auth plugin the server selected for it.
+//
+// Credentials returned by the provider are never included in the DSN string
+// produced by [Config.FormatDSN].
+func MultiFactorCredentials(provider FactorCredentialProvider) Option {
+	return func(cfg *Config) error {
+		cfg.mfaCredentials = provider
 		return nil
 	}
 }

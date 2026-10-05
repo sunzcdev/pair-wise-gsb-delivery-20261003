@@ -37,6 +37,7 @@ const (
 const (
 	iOK           byte = 0x00
 	iAuthMoreData byte = 0x01
+	iAuthNextFactor byte = 0x02
 	iLocalInFile  byte = 0xfb
 	iEOF          byte = 0xfe
 	iERR          byte = 0xff

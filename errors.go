@@ -24,6 +24,7 @@ var (
 	ErrNativePassword    = errors.New("this user requires mysql native password authentication")
 	ErrOldPassword       = errors.New("this user requires old password authentication. If you still want to use it, please add 'allowOldPasswords=1' to your DSN. See also https://github.com/go-sql-driver/mysql/wiki/old_passwords")
 	ErrUnknownPlugin     = errors.New("this authentication plugin is not supported")
+	ErrNoFactorCredential = errors.New("authentication requires an additional factor, but no credential provider is configured")
 	ErrOldProtocol       = errors.New("MySQL server does not support required protocol 41+")
 	ErrPktSync           = errors.New("commands out of sync. You can't run this command now")
 	ErrPktSyncMul        = errors.New("commands out of sync. Did you run multiple statements at once?")

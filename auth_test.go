@@ -10,6 +10,7 @@ package mysql
 
 import (
 	"bytes"
+	"context"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -115,7 +116,7 @@ func TestAuthFastCachingSHA256PasswordCached(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -157,7 +158,7 @@ func TestAuthFastCachingSHA256PasswordEmpty(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -208,7 +209,7 @@ func TestAuthFastCachingSHA256PasswordFullRSA(t *testing.T) {
 	conn.maxReads = 3
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -261,7 +262,7 @@ func TestAuthFastCachingSHA256PasswordFullRSAWithKey(t *testing.T) {
 	conn.maxReads = 2
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -317,7 +318,7 @@ func TestAuthFastCachingSHA256PasswordFullSecure(t *testing.T) {
 	conn.maxReads = 3
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -380,7 +381,7 @@ func TestAuthFastCleartextPassword(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -423,7 +424,7 @@ func TestAuthFastCleartextPasswordEmpty(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -483,7 +484,7 @@ func TestAuthFastNativePassword(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -525,7 +526,7 @@ func TestAuthFastNativePasswordEmpty(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -569,7 +570,7 @@ func TestAuthFastSHA256PasswordEmpty(t *testing.T) {
 	conn.maxReads = 2
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -617,7 +618,7 @@ func TestAuthFastSHA256PasswordRSA(t *testing.T) {
 	conn.maxReads = 2
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -651,7 +652,7 @@ func TestAuthFastSHA256PasswordRSAWithKey(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }
@@ -699,7 +700,7 @@ func TestAuthFastSHA256PasswordSecure(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -728,7 +729,7 @@ func TestAuthSwitchCachingSHA256PasswordCached(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -761,7 +762,7 @@ func TestAuthSwitchCachingSHA256PasswordEmpty(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -797,7 +798,7 @@ func TestAuthSwitchCachingSHA256PasswordFullRSA(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -842,7 +843,7 @@ func TestAuthSwitchCachingSHA256PasswordFullRSAWithKey(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -885,7 +886,7 @@ func TestAuthSwitchCachingSHA256PasswordFullSecure(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -912,7 +913,7 @@ func TestAuthSwitchCleartextPasswordNotAllowed(t *testing.T) {
 	authData := []byte{123, 87, 15, 84, 20, 58, 37, 121, 91, 117, 51, 24, 19,
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
-	err := mc.handleAuthResult(authData, plugin)
+	err := mc.handleAuthResult(context.Background(), authData, plugin)
 	if err != ErrCleartextPassword {
 		t.Errorf("expected ErrCleartextPassword, got %v", err)
 	}
@@ -935,7 +936,7 @@ func TestAuthSwitchCleartextPassword(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -962,7 +963,7 @@ func TestAuthSwitchCleartextPasswordEmpty(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -984,7 +985,7 @@ func TestAuthSwitchNativePasswordNotAllowed(t *testing.T) {
 	authData := []byte{96, 71, 63, 8, 1, 58, 75, 12, 69, 95, 66, 60, 117, 31,
 		48, 31, 89, 39, 55, 31}
 	plugin := "caching_sha2_password"
-	err := mc.handleAuthResult(authData, plugin)
+	err := mc.handleAuthResult(context.Background(), authData, plugin)
 	if err != ErrNativePassword {
 		t.Errorf("expected ErrNativePassword, got %v", err)
 	}
@@ -1009,7 +1010,7 @@ func TestAuthSwitchNativePassword(t *testing.T) {
 		48, 31, 89, 39, 55, 31}
 	plugin := "caching_sha2_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1039,7 +1040,7 @@ func TestAuthSwitchNativePasswordEmpty(t *testing.T) {
 		48, 31, 89, 39, 55, 31}
 	plugin := "caching_sha2_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1059,7 +1060,7 @@ func TestAuthSwitchOldPasswordNotAllowed(t *testing.T) {
 	authData := []byte{95, 84, 103, 43, 61, 49, 123, 61, 91, 50, 40, 113, 35,
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
-	err := mc.handleAuthResult(authData, plugin)
+	err := mc.handleAuthResult(context.Background(), authData, plugin)
 	if err != ErrOldPassword {
 		t.Errorf("expected ErrOldPassword, got %v", err)
 	}
@@ -1075,7 +1076,7 @@ func TestOldAuthSwitchNotAllowed(t *testing.T) {
 	authData := []byte{95, 84, 103, 43, 61, 49, 123, 61, 91, 50, 40, 113, 35,
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
-	err := mc.handleAuthResult(authData, plugin)
+	err := mc.handleAuthResult(context.Background(), authData, plugin)
 	if err != ErrOldPassword {
 		t.Errorf("expected ErrOldPassword, got %v", err)
 	}
@@ -1099,7 +1100,7 @@ func TestAuthSwitchOldPassword(t *testing.T) {
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1126,7 +1127,7 @@ func TestOldAuthSwitch(t *testing.T) {
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1153,7 +1154,7 @@ func TestAuthSwitchOldPasswordEmpty(t *testing.T) {
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1180,7 +1181,7 @@ func TestOldAuthSwitchPasswordEmpty(t *testing.T) {
 		84, 96, 101, 92, 123, 121, 107}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1209,7 +1210,7 @@ func TestAuthSwitchSHA256PasswordEmpty(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1244,7 +1245,7 @@ func TestAuthSwitchSHA256PasswordRSA(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1280,7 +1281,7 @@ func TestAuthSwitchSHA256PasswordRSAWithKey(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1316,7 +1317,7 @@ func TestAuthSwitchSHA256PasswordSecure(t *testing.T) {
 		47, 43, 9, 41, 112, 67, 110}
 	plugin := "mysql_native_password"
 
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 
@@ -1375,7 +1376,7 @@ func TestEd25519Auth(t *testing.T) {
 	conn.maxReads = 1
 
 	// Handle response to auth packet
-	if err := mc.handleAuthResult(authData, plugin); err != nil {
+	if err := mc.handleAuthResult(context.Background(), authData, plugin); err != nil {
 		t.Errorf("got error: %v", err)
 	}
 }

@@ -9,6 +9,7 @@
 package mysql
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha1"
@@ -21,6 +22,28 @@ import (
 
 	"filippo.io/edwards25519"
 )
+
+// FactorCredentialProvider supplies authentication material for accounts
+// protected by multi-factor authentication. The driver calls
+// FactorCredential once for every additional factor the server requests,
+// passing the 1-based factor number (2 for the first additional factor)
+// and the name of the auth plugin the server selected for that factor.
+//
+// The password from [Config.Passwd] is only ever used for the first
+// factor; it is never reused for later factors. Credentials returned by
+// the provider are kept out of the DSN string produced by
+// [Config.FormatDSN].
+type FactorCredentialProvider interface {
+	FactorCredential(ctx context.Context, factor int, plugin string) (string, error)
+}
+
+// FactorCredentialFunc adapts a function to a [FactorCredentialProvider].
+type FactorCredentialFunc func(ctx context.Context, factor int, plugin string) (string, error)
+
+// FactorCredential implements [FactorCredentialProvider].
+func (f FactorCredentialFunc) FactorCredential(ctx context.Context, factor int, plugin string) (string, error) {
+	return f(ctx, factor, plugin)
+}
 
 // server pub keys registry
 var (
@@ -266,8 +289,8 @@ func authEd25519(scramble []byte, password string) ([]byte, error) {
 	return append(R.Bytes(), S.Bytes()...), nil
 }
 
-func (mc *mysqlConn) sendEncryptedPassword(seed []byte, pub *rsa.PublicKey) error {
-	enc, err := encryptPassword(mc.cfg.Passwd, seed, pub)
+func (mc *mysqlConn) sendEncryptedPassword(seed []byte, pub *rsa.PublicKey, passwd string) error {
+	enc, err := encryptPassword(passwd, seed, pub)
 	if err != nil {
 		return err
 	}
@@ -275,22 +298,26 @@ func (mc *mysqlConn) sendEncryptedPassword(seed []byte, pub *rsa.PublicKey) erro
 }
 
 func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
+	return mc.authWithPassword(authData, plugin, mc.cfg.Passwd)
+}
+
+func (mc *mysqlConn) authWithPassword(authData []byte, plugin, passwd string) ([]byte, error) {
 	switch plugin {
 	case "caching_sha2_password":
-		authResp := scrambleSHA256Password(authData, mc.cfg.Passwd)
+		authResp := scrambleSHA256Password(authData, passwd)
 		return authResp, nil
 
 	case "mysql_old_password":
 		if !mc.cfg.AllowOldPasswords {
 			return nil, ErrOldPassword
 		}
-		if len(mc.cfg.Passwd) == 0 {
+		if len(passwd) == 0 {
 			return nil, nil
 		}
 		// Note: there are edge cases where this should work but doesn't;
 		// this is currently "wontfix":
 		// https://github.com/go-sql-driver/mysql/issues/184
-		authResp := append(scrambleOldPassword(authData[:8], mc.cfg.Passwd), 0)
+		authResp := append(scrambleOldPassword(authData[:8], passwd), 0)
 		return authResp, nil
 
 	case "mysql_clear_password":
@@ -299,7 +326,7 @@ func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
 		}
 		// http://dev.mysql.com/doc/refman/5.7/en/cleartext-authentication-plugin.html
 		// http://dev.mysql.com/doc/refman/5.7/en/pam-authentication-plugin.html
-		return append([]byte(mc.cfg.Passwd), 0), nil
+		return append([]byte(passwd), 0), nil
 
 	case "mysql_native_password":
 		if !mc.cfg.AllowNativePasswords {
@@ -307,18 +334,18 @@ func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
 		}
 		// https://dev.mysql.com/doc/dev/mysql-server/8.4.5/page_protocol_connection_phase_authentication_methods_native_password_authentication.html
 		// Native password authentication only need and will need 20-byte challenge.
-		authResp := scramblePassword(authData[:20], mc.cfg.Passwd)
+		authResp := scramblePassword(authData[:20], passwd)
 		return authResp, nil
 
 	case "sha256_password":
-		if len(mc.cfg.Passwd) == 0 {
+		if len(passwd) == 0 {
 			return []byte{0}, nil
 		}
 		// unlike caching_sha2_password, sha256_password does not accept
 		// cleartext password on unix transport.
 		if mc.cfg.TLS != nil {
 			// write cleartext auth packet
-			return append([]byte(mc.cfg.Passwd), 0), nil
+			return append([]byte(passwd), 0), nil
 		}
 
 		pubKey := mc.cfg.pubKey
@@ -328,14 +355,14 @@ func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
 		}
 
 		// encrypted password
-		enc, err := encryptPassword(mc.cfg.Passwd, authData, pubKey)
+		enc, err := encryptPassword(passwd, authData, pubKey)
 		return enc, err
 
 	case "client_ed25519":
 		if len(authData) != 32 {
 			return nil, ErrMalformPkt
 		}
-		return authEd25519(authData, mc.cfg.Passwd)
+		return authEd25519(authData, passwd)
 
 	default:
 		mc.log("unknown auth plugin:", plugin)
@@ -343,142 +370,158 @@ func (mc *mysqlConn) auth(authData []byte, plugin string) ([]byte, error) {
 	}
 }
 
-func (mc *mysqlConn) handleAuthResult(oldAuthData []byte, plugin string) error {
-	// Read Result Packet
-	authData, newPlugin, err := mc.readAuthResult()
-	if err != nil {
-		return err
+// factorPassword returns the credential for an additional authentication
+// factor requested by the server. The password of the first factor is
+// never reused for later factors.
+func (mc *mysqlConn) factorPassword(ctx context.Context, factor int, plugin string) (string, error) {
+	provider := mc.cfg.mfaCredentials
+	if provider == nil {
+		return "", fmt.Errorf("%w: factor %d (%s)", ErrNoFactorCredential, factor, plugin)
 	}
+	return provider.FactorCredential(ctx, factor, plugin)
+}
 
-	// handle auth plugin switch, if requested
-	if newPlugin != "" {
-		// If CLIENT_PLUGIN_AUTH capability is not supported, no new cipher is
-		// sent and we have to keep using the cipher sent in the init packet.
-		if authData == nil {
-			authData = oldAuthData
-		} else {
-			// copy data from read buffer to owned slice
-			copy(oldAuthData, authData)
-		}
+func (mc *mysqlConn) handleAuthResult(ctx context.Context, oldAuthData []byte, plugin string) error {
+	// The first factor uses the password from the DSN. Credentials for
+	// additional factors are obtained from the credential provider.
+	passwd := mc.cfg.Passwd
+	factor := 1
 
-		plugin = newPlugin
-
-		authResp, err := mc.auth(authData, plugin)
-		if err != nil {
-			return err
-		}
-		if err = mc.writeAuthSwitchPacket(authResp); err != nil {
-			return err
-		}
-
+	for {
 		// Read Result Packet
-		authData, newPlugin, err = mc.readAuthResult()
+		authData, newPlugin, nextFactor, err := mc.readAuthResult()
 		if err != nil {
 			return err
 		}
 
-		// Do not allow to change the auth plugin more than once
-		if newPlugin != "" {
-			return ErrMalformPkt
+		// handle auth plugin switch and next factor requests
+		if nextFactor || newPlugin != "" {
+			if newPlugin != "" {
+				plugin = newPlugin
+			}
+
+			// If CLIENT_PLUGIN_AUTH capability is not supported, no new cipher is
+			// sent and we have to keep using the cipher sent in the init packet.
+			if authData == nil {
+				authData = oldAuthData
+			} else {
+				// copy data from read buffer to owned slice
+				copy(oldAuthData, authData)
+			}
+
+			if nextFactor {
+				factor++
+				passwd, err = mc.factorPassword(ctx, factor, plugin)
+				if err != nil {
+					return err
+				}
+			}
+
+			authResp, err := mc.authWithPassword(authData, plugin, passwd)
+			if err != nil {
+				return err
+			}
+			if err = mc.writeAuthSwitchPacket(authResp); err != nil {
+				return err
+			}
+			continue
 		}
-	}
 
-	switch plugin {
+		switch plugin {
 
-	// https://dev.mysql.com/blog-archive/preparing-your-community-connector-for-mysql-8-part-2-sha256/
-	case "caching_sha2_password":
-		switch len(authData) {
-		case 0:
-			return nil // auth successful
-		case 1:
-			switch authData[0] {
-			case cachingSha2PasswordFastAuthSuccess:
-				if err = mc.resultUnchanged().readResultOK(); err == nil {
-					return nil // auth successful
+		// https://dev.mysql.com/blog-archive/preparing-your-community-connector-for-mysql-8-part-2-sha256/
+		case "caching_sha2_password":
+			switch len(authData) {
+			case 0:
+				return nil // auth successful
+			case 1:
+				switch authData[0] {
+				case cachingSha2PasswordFastAuthSuccess:
+					// Wait for the packet concluding the authentication
+					// exchange: OK, an error, or the next factor request.
+					continue
+
+				case cachingSha2PasswordPerformFullAuthentication:
+					if mc.cfg.TLS != nil || mc.cfg.Net == "unix" {
+						// write cleartext auth packet
+						err = mc.writeAuthSwitchPacket(append([]byte(passwd), 0))
+						if err != nil {
+							return err
+						}
+					} else {
+						pubKey := mc.cfg.pubKey
+						if pubKey == nil {
+							// request public key from server
+							data, err := mc.buf.takeSmallBuffer(4 + 1)
+							if err != nil {
+								return err
+							}
+							data[4] = cachingSha2PasswordRequestPublicKey
+							err = mc.writePacket(data)
+							if err != nil {
+								return err
+							}
+
+							if data, err = mc.readPacket(); err != nil {
+								return err
+							}
+
+							if data[0] != iAuthMoreData {
+								return fmt.Errorf("unexpected resp from server for caching_sha2_password, perform full authentication")
+							}
+
+							// parse public key
+							block, rest := pem.Decode(data[1:])
+							if block == nil {
+								return fmt.Errorf("no pem data found, data: %s", rest)
+							}
+							pkix, err := x509.ParsePKIXPublicKey(block.Bytes)
+							if err != nil {
+								return err
+							}
+							pubKey = pkix.(*rsa.PublicKey)
+						}
+
+						// send encrypted password
+						err = mc.sendEncryptedPassword(oldAuthData, pubKey, passwd)
+						if err != nil {
+							return err
+						}
+					}
+					continue
+
+				default:
+					return ErrMalformPkt
 				}
-
-			case cachingSha2PasswordPerformFullAuthentication:
-				if mc.cfg.TLS != nil || mc.cfg.Net == "unix" {
-					// write cleartext auth packet
-					err = mc.writeAuthSwitchPacket(append([]byte(mc.cfg.Passwd), 0))
-					if err != nil {
-						return err
-					}
-				} else {
-					pubKey := mc.cfg.pubKey
-					if pubKey == nil {
-						// request public key from server
-						data, err := mc.buf.takeSmallBuffer(4 + 1)
-						if err != nil {
-							return err
-						}
-						data[4] = cachingSha2PasswordRequestPublicKey
-						err = mc.writePacket(data)
-						if err != nil {
-							return err
-						}
-
-						if data, err = mc.readPacket(); err != nil {
-							return err
-						}
-
-						if data[0] != iAuthMoreData {
-							return fmt.Errorf("unexpected resp from server for caching_sha2_password, perform full authentication")
-						}
-
-						// parse public key
-						block, rest := pem.Decode(data[1:])
-						if block == nil {
-							return fmt.Errorf("no pem data found, data: %s", rest)
-						}
-						pkix, err := x509.ParsePKIXPublicKey(block.Bytes)
-						if err != nil {
-							return err
-						}
-						pubKey = pkix.(*rsa.PublicKey)
-					}
-
-					// send encrypted password
-					err = mc.sendEncryptedPassword(oldAuthData, pubKey)
-					if err != nil {
-						return err
-					}
-				}
-				return mc.resultUnchanged().readResultOK()
-
 			default:
 				return ErrMalformPkt
 			}
-		default:
-			return ErrMalformPkt
-		}
 
-	case "sha256_password":
-		switch len(authData) {
-		case 0:
+		case "sha256_password":
+			switch len(authData) {
+			case 0:
+				return nil // auth successful
+			default:
+				block, _ := pem.Decode(authData)
+				if block == nil {
+					return fmt.Errorf("no Pem data found, data: %s", authData)
+				}
+
+				pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+				if err != nil {
+					return err
+				}
+
+				// send encrypted password
+				err = mc.sendEncryptedPassword(oldAuthData, pub.(*rsa.PublicKey), passwd)
+				if err != nil {
+					return err
+				}
+				continue
+			}
+
+		default:
 			return nil // auth successful
-		default:
-			block, _ := pem.Decode(authData)
-			if block == nil {
-				return fmt.Errorf("no Pem data found, data: %s", authData)
-			}
-
-			pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-			if err != nil {
-				return err
-			}
-
-			// send encrypted password
-			err = mc.sendEncryptedPassword(oldAuthData, pub.(*rsa.PublicKey))
-			if err != nil {
-				return err
-			}
-			return mc.resultUnchanged().readResultOK()
 		}
-
-	default:
-		return nil // auth successful
 	}
-
-	return err
 }

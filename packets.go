@@ -497,10 +497,10 @@ func (mc *mysqlConn) writeCommandPacketUint32(command byte, arg uint32) error {
 *                              Result Packets                                 *
 ******************************************************************************/
 
-func (mc *mysqlConn) readAuthResult() ([]byte, string, error) {
+func (mc *mysqlConn) readAuthResult() (authData []byte, plugin string, nextFactor bool, err error) {
 	data, err := mc.readPacket()
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 
 	// packet indicator
@@ -509,29 +509,31 @@ func (mc *mysqlConn) readAuthResult() ([]byte, string, error) {
 	case iOK:
 		// resultUnchanged, since auth happens before any queries or
 		// commands have been executed.
-		return nil, "", mc.resultUnchanged().handleOkPacket(data)
+		return nil, "", false, mc.resultUnchanged().handleOkPacket(data)
 
 	case iAuthMoreData:
-		return data[1:], "", err
+		return data[1:], "", false, nil
 
-	case iEOF:
-		if len(data) == 1 {
+	case iAuthNextFactor, iEOF:
+		if data[0] == iEOF && len(data) == 1 {
 			// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_old_auth_switch_request.html
-			return nil, "mysql_old_password", nil
+			return nil, "mysql_old_password", false, nil
 		}
+		// AuthSwitchRequest (0xfe) and AuthNextFactor (0x02) share the same
+		// layout: a null-terminated plugin name followed by plugin data.
 		pluginEndIndex := bytes.IndexByte(data, 0x00)
 		if pluginEndIndex < 0 {
-			return nil, "", ErrMalformPkt
+			return nil, "", false, ErrMalformPkt
 		}
 		plugin := string(data[1:pluginEndIndex])
 		authData := data[pluginEndIndex+1:]
 		if len(authData) > 0 && authData[len(authData)-1] == 0 {
 			authData = authData[:len(authData)-1]
 		}
-		return authData, plugin, nil
+		return authData, plugin, data[0] == iAuthNextFactor, nil
 
 	default: // Error otherwise
-		return nil, "", mc.handleErrorPacket(data)
+		return nil, "", false, mc.handleErrorPacket(data)
 	}
 }
 
