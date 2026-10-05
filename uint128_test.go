@@ -44,6 +44,35 @@ func TestUint128AddSub(t *testing.T) {
 	}
 }
 
+func TestUint128AddSubWide(t *testing.T) {
+	tests := []struct {
+		a, b uint128
+		want uint128
+		add  bool
+	}{
+		{uint128{1, 2}, uint128{3, 4}, uint128{4, 6}, true},
+		{uint128{1, 2}, uint128{0, 5}, uint128{0, ^uint64(0) - 2}, false},
+		{uint128{1, 0}, uint128{0, 1}, uint128{1, 1}, true},
+		{uint128{1, 0}, uint128{0, 1}, uint128{0, ^uint64(0)}, false},
+		{uint128{0, 0}, uint128{1, 0}, uint128{^uint64(0), 0}, false},
+	}
+	for _, tt := range tests {
+		var got uint128
+		if tt.add {
+			got = tt.a.add(tt.b)
+		} else {
+			got = tt.a.sub(tt.b)
+		}
+		if got != tt.want {
+			op := "-"
+			if tt.add {
+				op = "+"
+			}
+			t.Errorf("%v %s %v = %v; want %v", tt.a, op, tt.b, got, tt.want)
+		}
+	}
+}
+
 func TestBitsSetFrom(t *testing.T) {
 	tests := []struct {
 		bit  uint8

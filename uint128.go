@@ -78,6 +78,22 @@ func (u uint128) addOne() uint128 {
 	return uint128{u.hi + carry, lo}
 }
 
+// add returns u + v. Callers that care about overflow must ensure
+// that it cannot occur for their inputs.
+func (u uint128) add(v uint128) uint128 {
+	lo, carry := bits.Add64(u.lo, v.lo, 0)
+	hi, _ := bits.Add64(u.hi, v.hi, carry)
+	return uint128{hi, lo}
+}
+
+// sub returns u - v. Callers that care about underflow must ensure
+// that it cannot occur for their inputs.
+func (u uint128) sub(v uint128) uint128 {
+	lo, borrow := bits.Sub64(u.lo, v.lo, 0)
+	hi, _ := bits.Sub64(u.hi, v.hi, borrow)
+	return uint128{hi, lo}
+}
+
 func u64CommonPrefixLen(a, b uint64) uint8 {
 	return uint8(bits.LeadingZeros64(a ^ b))
 }
