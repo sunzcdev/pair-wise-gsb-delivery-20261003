@@ -132,6 +132,74 @@ type ClientDriverExtensionAvailableSpace interface {
 	GetAvailableSpace(dirName string) (int64, error)
 }
 
+// PreTransferInfo describes a transfer announced through the PRET command.
+// It is a snapshot of the transfer context at the time PRET was received, so
+// the driver can decide which data node shall serve the upcoming transfer.
+type PreTransferInfo struct {
+	// Command is the announced transfer command: RETR, STOR, APPE, LIST, NLST or MLSD.
+	Command string
+	// Path is the absolute path the transfer will operate on. It is empty for
+	// directory listings announced without an argument.
+	Path string
+	// Restart is the REST offset in effect when PRET was received.
+	Restart int64
+	// TransferType is the transfer type (ASCII or binary) in effect at PRET time.
+	TransferType TransferType
+}
+
+// TransferReservation is returned by ClientDriverExtensionPreTransfer when a
+// PRET command is accepted. It represents the resources reserved for one
+// single transfer.
+//
+// The lifecycle is:
+//   - Consumed is called when the announced transfer command actually starts
+//     and matches the reservation. It is called at most once.
+//   - The reservation is then released exactly once, either through the
+//     TransferReservationLifecycle methods (Release after a consumed transfer,
+//     Cancel when it is discarded unused) or implicitly when the connection
+//     goes away.
+//
+// All methods are called while holding no server lock, so blocking on them
+// only blocks the command they are related to.
+type TransferReservation interface {
+	// Consumed notifies the reservation that the matching transfer is starting.
+	Consumed()
+}
+
+// TransferReservationLifecycle is optionally implemented by a
+// TransferReservation to observe the end of the reservation lifecycle.
+type TransferReservationLifecycle interface {
+	// Cancel is called when the reservation is discarded without being used:
+	// a new PRET replaces it, the announced transfer no longer matches it, or
+	// the client disconnects before the transfer starts.
+	Cancel(info PreTransferInfo, reservation TransferReservation)
+
+	// Release is called once after Consumed, when the transfer attempt is over.
+	// err is non-nil if the transfer did not complete successfully.
+	Release(info PreTransferInfo, reservation TransferReservation, err error)
+}
+
+// ClientDriverExtensionPreTransfer is an optional client driver extension that
+// enables the PRET command.
+//
+// With a passive data connection the server normally learns which file is
+// about to be transferred only when the transfer command arrives, which is
+// after PASV. PRET lets a client announce the upcoming command and its path in
+// advance, so the driver can reserve resources (for example pin a data node)
+// before the data connection is established.
+//
+// When the driver implements this extension:
+//   - PRET is advertised in the FEAT response,
+//   - every RETR, STOR, APPE, LIST, NLST and MLSD command must be preceded by a
+//     matching PRET reservation,
+//   - a reservation is consumed once; when the REST offset, transfer type or
+//     path changes the client must issue a new PRET.
+type ClientDriverExtensionPreTransfer interface {
+	// PrepareTransfer is called when a PRET command is received. Returning an
+	// error rejects the PRET command without creating any reservation.
+	PrepareTransfer(cc ClientContext, info PreTransferInfo) (TransferReservation, error)
+}
+
 // AnswerCommand is a struct to answer a command to the client
 type AnswerCommand struct {
 	Code    int

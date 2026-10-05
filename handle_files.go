@@ -20,29 +20,50 @@ import (
 )
 
 func (c *clientHandler) handleSTOR(param string) error {
+	if !c.consumePreTransfer("STOR", param) {
+		return nil
+	}
+
+	var err error
+	defer func() { c.releaseConsumedPreTransfer(err) }()
+
 	info := fmt.Sprintf("STOR %v", param)
-	c.transferFile(true, false, param, info)
+	err = c.transferFile(true, false, param, info)
 
 	return nil
 }
 
 func (c *clientHandler) handleAPPE(param string) error {
+	if !c.consumePreTransfer("APPE", param) {
+		return nil
+	}
+
+	var err error
+	defer func() { c.releaseConsumedPreTransfer(err) }()
+
 	info := fmt.Sprintf("APPE %v", param)
-	c.transferFile(true, true, param, info)
+	err = c.transferFile(true, true, param, info)
 
 	return nil
 }
 
 func (c *clientHandler) handleRETR(param string) error {
+	if !c.consumePreTransfer("RETR", param) {
+		return nil
+	}
+
+	var err error
+	defer func() { c.releaseConsumedPreTransfer(err) }()
+
 	info := fmt.Sprintf("RETR %v", param)
-	c.transferFile(false, false, param, info)
+	err = c.transferFile(false, false, param, info)
 
 	return nil
 }
 
 // File transfer, read or write, seek or not, is basically the same.
 // To make sure we don't miss any step, we execute everything in order
-func (c *clientHandler) transferFile(write bool, appendFile bool, param, info string) {
+func (c *clientHandler) transferFile(write bool, appendFile bool, param, info string) error {
 	var file FileTransfer
 	var err error
 	var fileFlag int
@@ -77,7 +98,7 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 
 		c.ctxRest = 0
 
-		return
+		return err
 	}
 
 	// Try to seek on it
@@ -94,7 +115,7 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 			// we can ignore the close error here
 			c.closeUnchecked(file)
 
-			return
+			return err
 		}
 	}
 
@@ -107,7 +128,7 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 		// we can stop right here and close the file ignoring close error if any
 		c.closeUnchecked(file)
 
-		return
+		return err
 	}
 
 	err = c.doFileTransfer(fileTransferConn, file, write)
@@ -118,6 +139,8 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 
 	// closing the transfer we also send the response message to the FTP client
 	c.TransferClose(fileTransferConn, err)
+
+	return err
 }
 
 func (c *clientHandler) doFileTransfer(transferConn io.ReadWriter, file io.ReadWriter, write bool) error {

@@ -275,6 +275,10 @@ func (c *clientHandler) handleFEAT(_ string) error {
 		features = append(features, "AVBL")
 	}
 
+	if _, ok := c.driver.(ClientDriverExtensionPreTransfer); ok {
+		features = append(features, "PRET")
+	}
+
 	for _, f := range features {
 		c.writeLine(" " + f)
 	}

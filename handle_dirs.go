@@ -186,6 +186,11 @@ func (c *clientHandler) checkLISTArgs(args string) string {
 }
 
 func (c *clientHandler) handleLIST(param string) error {
+	if !c.consumePreTransfer("LIST", param) {
+		return nil
+	}
+	defer c.releaseConsumedPreTransfer(nil)
+
 	info := fmt.Sprintf("LIST %v", param)
 
 	if files, _, err := c.getFileList(param, true); err == nil || errors.Is(err, io.EOF) {
@@ -205,6 +210,11 @@ func (c *clientHandler) handleLIST(param string) error {
 }
 
 func (c *clientHandler) handleNLST(param string) error {
+	if !c.consumePreTransfer("NLST", param) {
+		return nil
+	}
+	defer c.releaseConsumedPreTransfer(nil)
+
 	info := fmt.Sprintf("NLST %v", param)
 
 	if files, parentDir, err := c.getFileList(param, true); err == nil || errors.Is(err, io.EOF) {
@@ -251,6 +261,11 @@ func (c *clientHandler) handleMLSD(param string) error {
 
 		return nil
 	}
+
+	if !c.consumePreTransfer("MLSD", param) {
+		return nil
+	}
+	defer c.releaseConsumedPreTransfer(nil)
 
 	info := fmt.Sprintf("MLSD %v", param)
 

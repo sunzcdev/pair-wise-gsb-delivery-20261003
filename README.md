@@ -43,6 +43,7 @@ If you're interested in a fully featured FTP server, you should use [sftpgo](htt
    * [AVBL](https://tools.ietf.org/html/draft-peterson-streamlined-ftp-command-extensions-10#section-4) - Available space
    * [COMB](https://help.globalscape.com/help/archive/eft6-4/mergedprojects/eft/allowingmultiparttransferscomb_command.htm) - Combine files
    * [MODE Z](https://datatracker.ietf.org/doc/html/draft-preston-ftpext-deflate-04) - Transfer compression (deflate)
+   * PRET - Pre-transfer announcement so the driver can reserve resources (data node) per file
 
 ## Quick test
 The easiest way to test this library is to use [ftpserver](https://github.com/fclairamb/ftpserver).

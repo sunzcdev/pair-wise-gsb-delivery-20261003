@@ -78,6 +78,7 @@ var commandsMap = map[string]*CommandDescription{ //nolint:gochecknoglobals
 	"RNTO":    {Fn: (*clientHandler).handleRNTO},
 	"ALLO":    {Fn: (*clientHandler).handleALLO},
 	"REST":    {Fn: (*clientHandler).handleREST},
+	"PRET":    {Fn: (*clientHandler).handlePRET},
 	"SITE":    {Fn: (*clientHandler).handleSITE},
 	"HASH":    {Fn: (*clientHandler).handleHASH},
 	"XCRC":    {Fn: (*clientHandler).handleCRC32},
