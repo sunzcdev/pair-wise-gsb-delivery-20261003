@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gobwas/httphead"
@@ -153,81 +152,18 @@ type HTTPUpgrader struct {
 // bufio.ReadWriter. On successful handshake it returns Handshake struct
 // describing handshake info.
 func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.Conn, rw *bufio.ReadWriter, hs Handshake, err error) {
+	// Validate the request and run negotiation callbacks through the same
+	// code path as Preview(), so direct upgrade and preflight rejections stay
+	// consistent. This does not hijack nor write anything.
+	plan, err := u.prepare(r)
+
 	// Hijack connection first to get the ability to write rejection errors the
 	// same way as in Upgrader.
-	conn, rw, err = hijack(w)
-	if err != nil {
-		httpError(w, err.Error(), http.StatusInternalServerError)
+	var hijackErr error
+	conn, rw, hijackErr = hijack(w)
+	if hijackErr != nil {
+		httpError(w, hijackErr.Error(), http.StatusInternalServerError)
 		return conn, rw, hs, err
-	}
-
-	// See https://tools.ietf.org/html/rfc6455#section-4.1
-	// The method of the request MUST be GET, and the HTTP version MUST be at least 1.1.
-	var nonce string
-	if r.Method != http.MethodGet {
-		err = ErrHandshakeBadMethod
-	} else if r.ProtoMajor < 1 || (r.ProtoMajor == 1 && r.ProtoMinor < 1) {
-		err = ErrHandshakeBadProtocol
-	} else if r.Host == "" {
-		err = ErrHandshakeBadHost
-	} else if u := httpGetHeader(r.Header, headerUpgradeCanonical); u != "websocket" && !strings.EqualFold(u, "websocket") {
-		err = ErrHandshakeBadUpgrade
-	} else if c := httpGetHeader(r.Header, headerConnectionCanonical); c != "Upgrade" && !strHasToken(c, "upgrade") {
-		err = ErrHandshakeBadConnection
-	} else if nonce = httpGetHeader(r.Header, headerSecKeyCanonical); len(nonce) != nonceSize {
-		err = ErrHandshakeBadSecKey
-	} else if v := httpGetHeader(r.Header, headerSecVersionCanonical); v != "13" {
-		// According to RFC6455:
-		//
-		// If this version does not match a version understood by the server,
-		// the server MUST abort the WebSocket handshake described in this
-		// section and instead send an appropriate HTTP error code (such as 426
-		// Upgrade Required) and a |Sec-WebSocket-Version| header field
-		// indicating the version(s) the server is capable of understanding.
-		//
-		// So we branching here cause empty or not present version does not
-		// meet the ABNF rules of RFC6455:
-		//
-		// version = DIGIT | (NZDIGIT DIGIT) |
-		// ("1" DIGIT DIGIT) | ("2" DIGIT DIGIT)
-		// ; Limited to 0-255 range, with no leading zeros
-		//
-		// That is, if version is really invalid – we sent 426 status, if it
-		// not present or empty – it is 400.
-		if v != "" {
-			err = ErrHandshakeUpgradeRequired
-		} else {
-			err = ErrHandshakeBadSecVersion
-		}
-	}
-	if check := u.Protocol; err == nil && check != nil {
-		ps := r.Header[headerSecProtocolCanonical]
-		for i := 0; i < len(ps) && err == nil && hs.Protocol == ""; i++ {
-			var ok bool
-			hs.Protocol, ok = strSelectProtocol(ps[i], check)
-			if !ok {
-				err = ErrMalformedRequest
-			}
-		}
-	}
-	if f := u.Negotiate; err == nil && f != nil {
-		for _, h := range r.Header[headerSecExtensionsCanonical] {
-			hs.Extensions, err = negotiateExtensions(strToBytes(h), hs.Extensions, f)
-			if err != nil {
-				break
-			}
-		}
-	}
-	// DEPRECATED path.
-	if check := u.Extension; err == nil && check != nil && u.Negotiate == nil {
-		xs := r.Header[headerSecExtensionsCanonical]
-		for i := 0; i < len(xs) && err == nil; i++ {
-			var ok bool
-			hs.Extensions, ok = btsSelectExtensions(strToBytes(xs[i]), hs.Extensions, check)
-			if !ok {
-				err = ErrMalformedRequest
-			}
-		}
 	}
 
 	// Clear deadlines set by server.
@@ -237,27 +173,15 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 		defer conn.SetWriteDeadline(noDeadline)
 	}
 
-	var header handshakeHeader
-	if h := u.Header; h != nil {
-		header[0] = HandshakeHeaderHTTP(h)
-	}
 	if err == nil {
-		httpWriteResponseUpgrade(rw.Writer, strToBytes(nonce), hs, header.WriteTo)
+		httpWriteResponseUpgrade(rw.Writer, plan.nonce, plan.Handshake, plan.headerFunc())
 		err = rw.Writer.Flush()
 	} else {
-		var code int
-		if rej, ok := err.(*ConnectionRejectedError); ok {
-			code = rej.code
-			header[1] = rej.header
-		}
-		if code == 0 {
-			code = http.StatusInternalServerError
-		}
-		httpWriteResponseError(rw.Writer, err, code, header.WriteTo)
+		writeUpgradeRejection(rw, plan, err)
 		// Do not store Flush() error to not override already existing one.
-		_ = rw.Writer.Flush()
+		return conn, rw, hs, err
 	}
-	return conn, rw, hs, err
+	return conn, rw, plan.Handshake, err
 }
 
 // Upgrader contains options for upgrading connection to websocket.

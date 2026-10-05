@@ -12,8 +12,25 @@ Upgrade to WebSocket (or WebSocket handshake) can be done in two ways.
 The first way is to use `net/http` server:
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn, _, _, err := ws.UpgradeHTTP(r, w)
-	})
+	conn, _, _, err := ws.UpgradeHTTP(r, w)
+})
+
+If a service needs to inspect the WebSocket upgrade request before handing the
+connection over, HTTPUpgrader.Preview performs a side-effect free preflight: it
+neither hijacks the connection nor writes a response. It returns a
+HandshakePlan holding the final subprotocol, negotiated extensions and
+response headers, or a *HandshakeRejection describing the rejection:
+
+	plan, err := upgrader.Preview(r)
+	if err != nil {
+		// inspect the *ws.HandshakeRejection and respond on your own
+		return
+	}
+	conn, _, _, err = plan.Upgrade(r, w)
+
+The plan is bound to the request fields that participate in validation and is
+single-use: modifying those fields invalidates it and consuming it twice is
+rejected. The negotiation callbacks are invoked only during Preview.
 
 The second and much more efficient way is so-called "zero-copy upgrade". It
 avoids redundant allocations and copying of not used headers or other request
