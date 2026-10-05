@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Heading",
+        "level": 1,
+        "headingKind": "ATX",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "value": "H",
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "List",
+        "ordered": false,
+        "marker": "-",
+        "tight": true,
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "ListItem",
+            "blankPreviousLines": true,
+            "attributes": [
+              {
+                "name": "task-status",
+                "value": "completed"
+              }
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "blankPreviousLines": true,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "done",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "ListItem",
+            "blankPreviousLines": false,
+            "attributes": [
+              {
+                "name": "task-status",
+                "value": "active"
+              }
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "todo",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Strikethrough",
+            "children": [
+              {
+                "type": "Text",
+                "value": "strike",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "FootnoteReference",
+            "label": "1",
+            "index": 1,
+            "refIndex": 0,
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "FootnoteDefinition",
+        "label": "1",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Paragraph",
+            "blankPreviousLines": true,
+            "children": [
+              {
+                "type": "Text",
+                "value": "note",
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

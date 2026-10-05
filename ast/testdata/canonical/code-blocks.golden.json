@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "CodeBlock",
+        "codeBlockKind": "Indented",
+        "value": "indented line\n",
+        "blankPreviousLines": true,
+        "children": []
+      },
+      {
+        "type": "CodeBlock",
+        "codeBlockKind": "Fenced",
+        "info": "go",
+        "value": "fenced line 1\nfenced line 2\n",
+        "blankPreviousLines": true,
+        "children": []
+      }
+    ]
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "value": "hello ",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "“",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "world",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "”",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": " ",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "–",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": " x",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "…",
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+}

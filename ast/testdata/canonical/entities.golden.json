@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "value": "a & b # Æ",
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+}

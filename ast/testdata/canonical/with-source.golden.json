@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "start": 0,
+    "stop": 21,
+    "children": [
+      {
+        "type": "Heading",
+        "level": 1,
+        "headingKind": "ATX",
+        "blankPreviousLines": true,
+        "start": 2,
+        "stop": 9,
+        "children": [
+          {
+            "type": "Text",
+            "value": "heading",
+            "start": 2,
+            "stop": 9,
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "start": 11,
+        "stop": 20,
+        "children": [
+          {
+            "type": "Text",
+            "value": "para ",
+            "start": 11,
+            "stop": 16,
+            "children": []
+          },
+          {
+            "type": "Emphasis",
+            "start": 17,
+            "stop": 19,
+            "children": [
+              {
+                "type": "Text",
+                "value": "em",
+                "start": 17,
+                "stop": 19,
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

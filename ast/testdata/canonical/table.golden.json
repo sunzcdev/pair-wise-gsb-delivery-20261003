@@ -1,0 +1,105 @@
+{
+  "version": 1,
+  "root": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Table",
+        "blankPreviousLines": false,
+        "children": [
+          {
+            "type": "TableHeader",
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableCell",
+                "alignment": "left",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "left",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "alignment": "center",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "center",
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "alignment": "right",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "right",
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "TableBody",
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableRow",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "TableCell",
+                    "alignment": "left",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Text",
+                        "value": "a",
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "alignment": "center",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Text",
+                        "value": "b",
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "alignment": "right",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Text",
+                        "value": "c",
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
