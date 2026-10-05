@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"sync"
 
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 )
 
@@ -319,6 +320,8 @@ func Len(a any) int {
 
 func Negate(i any) any {
 	switch v := i.(type) {
+	case decimal.Decimal:
+		return v.Neg()
 	case float32:
 		return -v
 	case float64:
@@ -366,6 +369,8 @@ func MakeRange(min, max int) []int {
 
 func ToInt(a any) int {
 	switch x := a.(type) {
+	case decimal.Decimal:
+		return int(x.Int64())
 	case float32:
 		return int(x)
 	case float64:
@@ -397,6 +402,8 @@ func ToInt(a any) int {
 
 func ToInt64(a any) int64 {
 	switch x := a.(type) {
+	case decimal.Decimal:
+		return x.Int64()
 	case float32:
 		return int64(x)
 	case float64:
@@ -428,6 +435,8 @@ func ToInt64(a any) int64 {
 
 func ToFloat64(a any) float64 {
 	switch x := a.(type) {
+	case decimal.Decimal:
+		return x.Float64()
 	case float32:
 		return float64(x)
 	case float64:

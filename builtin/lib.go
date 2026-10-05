@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"unicode/utf8"
 
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -59,6 +60,8 @@ func Type(arg any) any {
 
 func Abs(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return x.Abs()
 	case float32:
 		if x < 0 {
 			return -x
@@ -117,6 +120,8 @@ func Abs(x any) any {
 
 func Ceil(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return x.Round(0, decimal.RoundCeiling)
 	case float32:
 		return math.Ceil(float64(x))
 	case float64:
@@ -129,6 +134,8 @@ func Ceil(x any) any {
 
 func Floor(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return x.Round(0, decimal.RoundFloor)
 	case float32:
 		return math.Floor(float64(x))
 	case float64:
@@ -141,6 +148,8 @@ func Floor(x any) any {
 
 func Round(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return x.Round(0, decimal.RoundHalfUp)
 	case float32:
 		return math.Round(float64(x))
 	case float64:
@@ -153,6 +162,8 @@ func Round(x any) any {
 
 func Int(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return int(x.Int64())
 	case float32:
 		return int(x)
 	case float64:
@@ -194,6 +205,8 @@ func Int(x any) any {
 
 func Float(x any) any {
 	switch x := x.(type) {
+	case decimal.Decimal:
+		return x.Float64()
 	case float32:
 		return float64(x)
 	case float64:

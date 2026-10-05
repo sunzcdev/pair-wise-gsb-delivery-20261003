@@ -148,6 +148,9 @@ import (
 )
 
 func Equal(a, b interface{}) bool {
+	if r, ok := decimalEqual(a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases "==" }}
 	{{ array_equal_cases }}
@@ -179,6 +182,9 @@ func Equal(a, b interface{}) bool {
 }
 
 func Less(a, b interface{}) bool {
+	if r, ok := DecimalCompare("<", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases "<" }}
 	case string:
@@ -201,6 +207,9 @@ func Less(a, b interface{}) bool {
 }
 
 func More(a, b interface{}) bool {
+	if r, ok := DecimalCompare(">", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases ">" }}
 	case string:
@@ -223,6 +232,9 @@ func More(a, b interface{}) bool {
 }
 
 func LessOrEqual(a, b interface{}) bool {
+	if r, ok := DecimalCompare("<=", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases "<=" }}
 	case string:
@@ -245,6 +257,9 @@ func LessOrEqual(a, b interface{}) bool {
 }
 
 func MoreOrEqual(a, b interface{}) bool {
+	if r, ok := DecimalCompare(">=", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases ">=" }}
 	case string:
@@ -267,6 +282,9 @@ func MoreOrEqual(a, b interface{}) bool {
 }
 
 func Add(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("+", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases "+" }}
 	case string:
@@ -291,6 +309,9 @@ func Add(a, b interface{}) interface{} {
 }
 
 func Subtract(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("-", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases "-" }}
 	case time.Time:
@@ -310,6 +331,9 @@ func Subtract(a, b interface{}) interface{} {
 }
 
 func Multiply(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("*", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	{{ cases_with_duration "*" }}
 	}

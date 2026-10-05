@@ -7,6 +7,7 @@ import (
 	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/checker/nature"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/vm/runtime"
 )
 
@@ -36,6 +37,9 @@ type Config struct {
 	Builtins     FunctionsTable
 	Disabled     map[string]bool // disabled builtins
 	NtCache      nature.Cache
+	// DecimalContext is the precision and rounding mode used by decimal
+	// division, both at runtime and during compile-time constant folding.
+	DecimalContext decimal.Context
 	// DisableIfOperator disables the built-in `if ... { } else { }` operator syntax
 	// so that users can use a custom function named `if(...)` without conflicts.
 	// When enabled, the lexer treats `if`/`else` as identifiers and the parser
@@ -46,13 +50,14 @@ type Config struct {
 // CreateNew creates new config with default values.
 func CreateNew() *Config {
 	c := &Config{
-		Optimize:     true,
-		ShortCircuit: true,
-		MaxNodes:     DefaultMaxNodes,
-		ConstFns:     make(map[string]reflect.Value),
-		Functions:    make(map[string]*builtin.Function),
-		Builtins:     make(map[string]*builtin.Function),
-		Disabled:     make(map[string]bool),
+		Optimize:       true,
+		ShortCircuit:   true,
+		MaxNodes:       DefaultMaxNodes,
+		ConstFns:       make(map[string]reflect.Value),
+		Functions:      make(map[string]*builtin.Function),
+		Builtins:       make(map[string]*builtin.Function),
+		Disabled:       make(map[string]bool),
+		DecimalContext: decimal.DefaultContext,
 	}
 	for _, f := range builtin.Builtins {
 		c.Builtins[f.Name] = f

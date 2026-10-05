@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/expr-lang/expr/builtin"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 )
 
@@ -16,6 +17,7 @@ var (
 	byteSliceType = reflect.TypeOf([]byte{})
 	timeType      = reflect.TypeOf(time.Time{})
 	durationType  = reflect.TypeOf(time.Duration(0))
+	decimalType   = reflect.TypeOf(decimal.Decimal{})
 
 	builtinInt = map[reflect.Type]struct{}{
 		reflect.TypeOf(int(0)):     {},
@@ -69,6 +71,7 @@ type Nature struct {
 	Method    bool // If value retrieved from method. Usually used to determine amount of in arguments.
 	IsInteger bool // If it's a builtin integer or unsigned integer type.
 	IsFloat   bool // If it's a builtin float type.
+	IsDecimal bool // If it's a decimal.Decimal type.
 }
 
 type TypeData struct {
@@ -127,7 +130,9 @@ func (c *Cache) FromType(t reflect.Type) Nature {
 		// c can be nil when we call the package function FromType, which uses a
 		// nil *Cache to call this method.
 		if c != nil {
-			return c.getStruct(t)
+			nt := c.getStruct(t)
+			nt.IsDecimal = t == decimalType
+			return nt
 		}
 		fallthrough
 	case reflect.Func:
@@ -144,6 +149,7 @@ func (c *Cache) FromType(t reflect.Type) Nature {
 		TypeData:  td,
 		IsInteger: isInteger,
 		IsFloat:   isFloat,
+		IsDecimal: t == decimalType,
 	}
 }
 
@@ -558,6 +564,8 @@ func (n *Nature) ComparableTo(c *Cache, rhs Nature) bool {
 	return n.IsUnknown(c) || rhs.IsUnknown(c) ||
 		n.Nil || rhs.Nil ||
 		n.IsNumber() && rhs.IsNumber() ||
+		n.IsDecimal && (rhs.IsDecimal || rhs.IsInteger) ||
+		rhs.IsDecimal && (n.IsDecimal || n.IsInteger) ||
 		n.IsDuration() && rhs.IsDuration() ||
 		n.IsTime() && rhs.IsTime() ||
 		n.IsArray() && rhs.IsArray() ||

@@ -15,6 +15,7 @@ func Walk(node *Node, v Visitor) {
 	case *IdentifierNode:
 	case *IntegerNode:
 	case *FloatNode:
+	case *DecimalNode:
 	case *BoolNode:
 	case *StringNode:
 	case *BytesNode:

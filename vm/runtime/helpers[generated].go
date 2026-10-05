@@ -9,6 +9,9 @@ import (
 )
 
 func Equal(a, b interface{}) bool {
+	if r, ok := decimalEqual(a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -700,6 +703,9 @@ func Equal(a, b interface{}) bool {
 }
 
 func Less(a, b interface{}) bool {
+	if r, ok := DecimalCompare("<", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -1045,6 +1051,9 @@ func Less(a, b interface{}) bool {
 }
 
 func More(a, b interface{}) bool {
+	if r, ok := DecimalCompare(">", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -1390,6 +1399,9 @@ func More(a, b interface{}) bool {
 }
 
 func LessOrEqual(a, b interface{}) bool {
+	if r, ok := DecimalCompare("<=", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -1735,6 +1747,9 @@ func LessOrEqual(a, b interface{}) bool {
 }
 
 func MoreOrEqual(a, b interface{}) bool {
+	if r, ok := DecimalCompare(">=", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -2080,6 +2095,9 @@ func MoreOrEqual(a, b interface{}) bool {
 }
 
 func Add(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("+", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -2427,6 +2445,9 @@ func Add(a, b interface{}) interface{} {
 }
 
 func Subtract(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("-", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {
@@ -2769,6 +2790,9 @@ func Subtract(a, b interface{}) interface{} {
 }
 
 func Multiply(a, b interface{}) interface{} {
+	if r, ok := DecimalArith("*", a, b); ok {
+		return r
+	}
 	switch x := a.(type) {
 	case uint:
 		switch y := b.(type) {

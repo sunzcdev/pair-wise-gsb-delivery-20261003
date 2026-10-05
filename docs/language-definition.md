@@ -30,6 +30,12 @@
         </td>
     </tr>
     <tr>
+        <td><strong>Decimal</strong></td>
+        <td>
+            <code>0.5d</code>, <code>19.99d</code>, <code>2d</code>
+        </td>
+    </tr>
+    <tr>
         <td><strong>String</strong></td>
         <td>
             <code>"foo"</code>, <code>'bar'</code>
@@ -110,6 +116,45 @@ b"\101"     // []byte{65} - octal for 'A'
 Unlike string literals, bytes literals do not support `\u` or `\U` Unicode escapes.
 Use `\x` escapes for arbitrary byte values.
 :::
+
+### Decimals
+
+Number literals with a `d` suffix are exact base-10 decimals, suitable for
+monetary calculations where binary floating point is not acceptable.
+
+```expr
+0.1d + 0.2d == 0.3d // true (0.1 + 0.2 == 0.3 is false for floats)
+19.99d * 3          // 59.97
+```
+
+Decimals support `+`, `-`, `*` (always exact), `/` and the comparison
+operators. Integers are promoted to decimals automatically:
+
+```expr
+2 * 1.5d // 3.0
+```
+
+Decimals and floats are never mixed implicitly; convert explicitly with
+[decimal()](#decimal) or [float()](#float):
+
+```expr
+1.5d + 0.5          // compile error
+1.5d + decimal(0.5) // 2.0
+```
+
+Division is rounded to a configurable number of fractional decimal places
+with a configurable rounding mode. Both are set at compile time via the
+`expr.DecimalContext(precision, rounding)` option and apply identically to
+compile-time constant folding and runtime evaluation:
+
+```go
+expr.Compile(`price / 3`, expr.DecimalContext(2, decimal.RoundHalfUp))
+```
+
+Available rounding modes: `RoundDown` (towards zero), `RoundUp` (away from
+zero), `RoundHalfUp` (ties away from zero), `RoundHalfEven` (banker's
+rounding), `RoundCeiling`, `RoundFloor`. The default context is 16
+fractional places with `RoundHalfUp`.
 
 ## Operators
 
@@ -604,6 +649,14 @@ Returns the nearest integer, rounding half away from zero.
 round(1.5) == 2.0
 ```
 
+For [decimals](#decimals), `round` returns a decimal and accepts an
+optional second argument with the number of fractional decimal places:
+
+```expr
+round(2.675d, 2) // 2.68
+round(-2.5d)     // -3d
+```
+
 ## Array Functions
 
 ### all(array, predicate) {#all}
@@ -919,6 +972,17 @@ Returns the float value of a number or a string.
 
 ```expr
 float("123.45") == 123.45
+```
+
+### decimal(v) {#decimal}
+
+Converts an integer, float or string to a [decimal](#decimals). Integers
+and strings are converted exactly; floats are converted using their
+shortest decimal representation.
+
+```expr
+decimal("19.99") * 2 // 39.98
+decimal(1.5)         // 1.5d
 ```
 
 ### string(v) {#string}

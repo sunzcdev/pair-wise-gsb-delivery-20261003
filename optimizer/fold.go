@@ -1,15 +1,19 @@
 package optimizer
 
 import (
+	"fmt"
 	"math"
 
 	. "github.com/expr-lang/expr/ast"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
+	"github.com/expr-lang/expr/vm/runtime"
 )
 
 type fold struct {
-	applied bool
-	err     *file.Error
+	applied    bool
+	err        *file.Error
+	decimalCtx decimal.Context
 }
 
 func (fold *fold) Visit(node *Node) {
@@ -32,6 +36,9 @@ func (fold *fold) Visit(node *Node) {
 			if i, ok := n.Node.(*FloatNode); ok {
 				patch(&FloatNode{Value: -i.Value})
 			}
+			if d, ok := n.Node.(*DecimalNode); ok {
+				patch(&DecimalNode{Value: d.Value.Neg()})
+			}
 		case "+":
 			if i, ok := n.Node.(*IntegerNode); ok {
 				patch(&IntegerNode{Value: i.Value})
@@ -46,6 +53,9 @@ func (fold *fold) Visit(node *Node) {
 		}
 
 	case *BinaryNode:
+		if fold.foldDecimal(node, n) {
+			return
+		}
 		switch n.Operator {
 		case "+":
 			{
@@ -340,4 +350,62 @@ func toBool(n Node) *BoolNode {
 		return a
 	}
 	return nil
+}
+
+// foldDecimal folds binary operations on decimal literals. Integer literals
+// are promoted to decimals. All computations are delegated to the same
+// runtime functions the VM uses, so folded results are identical to
+// runtime results.
+func (fold *fold) foldDecimal(node *Node, n *BinaryNode) (done bool) {
+	operand := func(x Node) (any, bool) {
+		switch v := x.(type) {
+		case *DecimalNode:
+			return v.Value, true
+		case *IntegerNode:
+			return v.Value, true
+		}
+		return nil, false
+	}
+	a, aok := operand(n.Left)
+	b, bok := operand(n.Right)
+	if !aok || !bok {
+		return false
+	}
+	if _, ok := a.(decimal.Decimal); !ok {
+		if _, ok := b.(decimal.Decimal); !ok {
+			return false
+		}
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			fold.err = &file.Error{
+				Location: (*node).Location(),
+				Message:  fmt.Sprintf("%v", r),
+			}
+			done = true
+		}
+	}()
+
+	switch n.Operator {
+	case "+", "-", "*":
+		if r, ok := runtime.DecimalArith(n.Operator, a, b); ok {
+			fold.applied = true
+			patchWithType(node, &DecimalNode{Value: r.(decimal.Decimal)})
+			return true
+		}
+	case "/":
+		if r, ok := runtime.DecimalQuo(a, b, fold.decimalCtx); ok {
+			fold.applied = true
+			patchWithType(node, &DecimalNode{Value: r.(decimal.Decimal)})
+			return true
+		}
+	case "==", "!=", "<", "<=", ">", ">=":
+		if r, ok := runtime.DecimalCompare(n.Operator, a, b); ok {
+			fold.applied = true
+			patchWithType(node, &BoolNode{Value: r})
+			return true
+		}
+	}
+	return false
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/internal/deref"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -134,6 +135,9 @@ var Builtins = []*Function{
 			if len(args) != 1 {
 				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
 			}
+			if args[0] == decimalType {
+				return decimalType, nil
+			}
 			switch kind(args[0]) {
 			case reflect.Float32, reflect.Float64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Interface:
 				return args[0], nil
@@ -157,9 +161,55 @@ var Builtins = []*Function{
 	},
 	{
 		Name: "round",
-		Fast: Round,
+		Func: func(args ...any) (any, error) {
+			switch len(args) {
+			case 1:
+				return Round(args[0]), nil
+			case 2:
+				d, ok := args[0].(decimal.Decimal)
+				if !ok {
+					return nil, fmt.Errorf("invalid argument for round (type %T): two-argument round is only supported for decimal", args[0])
+				}
+				places, err := toInt(args[1])
+				if err != nil {
+					return nil, err
+				}
+				return d.Round(int32(places), decimal.RoundHalfUp), nil
+			}
+			return nil, fmt.Errorf("invalid number of arguments for round (expected 1 or 2, got %d)", len(args))
+		},
 		Validate: func(args []reflect.Type) (reflect.Type, error) {
 			return validateRoundFunc("round", args)
+		},
+	},
+	{
+		Name: "decimal",
+		Func: func(args ...any) (any, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+			}
+			d, err := decimal.Convert(args[0])
+			if err != nil {
+				return nil, err
+			}
+			return d, nil
+		},
+		Validate: func(args []reflect.Type) (reflect.Type, error) {
+			if len(args) != 1 {
+				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+			}
+			if args[0] == decimalType {
+				return decimalType, nil
+			}
+			switch kind(args[0]) {
+			case reflect.Interface:
+				return decimalType, nil
+			case reflect.Float32, reflect.Float64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				return decimalType, nil
+			case reflect.String:
+				return decimalType, nil
+			}
+			return anyType, fmt.Errorf("invalid argument for decimal (type %s)", args[0])
 		},
 	},
 	{
@@ -168,6 +218,9 @@ var Builtins = []*Function{
 		Validate: func(args []reflect.Type) (reflect.Type, error) {
 			if len(args) != 1 {
 				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+			}
+			if args[0] == decimalType {
+				return integerType, nil
 			}
 			switch kind(args[0]) {
 			case reflect.Interface:
@@ -186,6 +239,9 @@ var Builtins = []*Function{
 		Validate: func(args []reflect.Type) (reflect.Type, error) {
 			if len(args) != 1 {
 				return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+			}
+			if args[0] == decimalType {
+				return floatType, nil
 			}
 			switch kind(args[0]) {
 			case reflect.Interface:

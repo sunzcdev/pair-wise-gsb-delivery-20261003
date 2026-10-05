@@ -6,12 +6,16 @@ import (
 
 	. "github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 )
 
 func Optimize(node *Node, config *conf.Config) error {
 	Walk(node, &inArray{})
 	for limit := 1000; limit >= 0; limit-- {
-		fold := &fold{}
+		fold := &fold{decimalCtx: decimal.DefaultContext}
+		if config != nil {
+			fold.decimalCtx = config.DecimalContext
+		}
 		Walk(node, fold)
 		if fold.err != nil {
 			return fold.err
@@ -53,6 +57,7 @@ var (
 	integerType = reflect.TypeOf(0)
 	floatType   = reflect.TypeOf(float64(0))
 	stringType  = reflect.TypeOf("")
+	decimalType = reflect.TypeOf(decimal.Decimal{})
 )
 
 func patchWithType(node *Node, newNode Node) {
@@ -63,6 +68,8 @@ func patchWithType(node *Node, newNode Node) {
 		newNode.SetType(integerType)
 	case *FloatNode:
 		newNode.SetType(floatType)
+	case *DecimalNode:
+		newNode.SetType(decimalType)
 	case *StringNode:
 		newNode.SetType(stringType)
 	case *ConstantNode:

@@ -78,6 +78,9 @@ func Compile(tree *parser.Tree, config *conf.Config) (program *Program, err erro
 		c.debugInfo,
 		span,
 	)
+	if config != nil {
+		program.DecimalContext = config.DecimalContext
+	}
 	return
 }
 
@@ -250,6 +253,8 @@ func (c *compiler) compile(node ast.Node) {
 		c.IntegerNode(n)
 	case *ast.FloatNode:
 		c.FloatNode(n)
+	case *ast.DecimalNode:
+		c.emitPush(n.Value)
 	case *ast.BoolNode:
 		c.BoolNode(n)
 	case *ast.StringNode:

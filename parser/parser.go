@@ -11,6 +11,7 @@ import (
 	. "github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	. "github.com/expr-lang/expr/parser/lexer"
 	"github.com/expr-lang/expr/parser/operator"
@@ -494,6 +495,14 @@ func (p *Parser) parseSecondary() Node {
 				p.error("invalid hex literal: %v", err)
 			}
 			node = p.toIntegerNode(number)
+		case strings.HasSuffix(valueLower, "d") &&
+			!strings.HasPrefix(valueLower, "0b") &&
+			!strings.HasPrefix(valueLower, "0o"):
+			d, err := decimal.Parse(value[:len(value)-1])
+			if err != nil {
+				p.error("invalid decimal literal: %v", err)
+			}
+			node = p.createNode(&DecimalNode{Value: d}, p.current.Location)
 		case strings.ContainsAny(valueLower, ".e"):
 			number, err := strconv.ParseFloat(value, 64)
 			if err != nil {

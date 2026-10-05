@@ -276,7 +276,11 @@ func (vm *VM) Run(program *Program, env any) (_ any, err error) {
 		case OpDivide:
 			b := vm.pop()
 			a := vm.pop()
-			vm.push(runtime.Divide(a, b))
+			if r, ok := runtime.DecimalQuo(a, b, program.DecimalContext); ok {
+				vm.push(r)
+			} else {
+				vm.push(runtime.Divide(a, b))
+			}
 
 		case OpModulo:
 			b := vm.pop()

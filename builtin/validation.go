@@ -26,8 +26,20 @@ func validateAggregateFunc(name string, args []reflect.Type) (reflect.Type, erro
 }
 
 func validateRoundFunc(name string, args []reflect.Type) (reflect.Type, error) {
-	if len(args) != 1 {
+	if len(args) != 1 && !(name == "round" && len(args) == 2) {
 		return anyType, fmt.Errorf("invalid number of arguments (expected 1, got %d)", len(args))
+	}
+	if len(args) == 2 {
+		if args[0] != decimalType && kind(args[0]) != reflect.Interface {
+			return anyType, fmt.Errorf("invalid argument for %s (type %s): two-argument %s is only supported for decimal", name, args[0], name)
+		}
+		if kind(args[1]) != reflect.Int && kind(args[1]) != reflect.Interface {
+			return anyType, fmt.Errorf("invalid places argument for %s (type %s)", name, args[1])
+		}
+		return decimalType, nil
+	}
+	if args[0] == decimalType {
+		return decimalType, nil
 	}
 	switch kind(args[0]) {
 	case reflect.Float32, reflect.Float64, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Interface:

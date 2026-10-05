@@ -107,6 +107,14 @@ func (l *Lexer) scanNumber() bool {
 		l.accept("+-")
 		l.acceptRun(digits)
 	}
+	// Optional decimal suffix: 1.5d, 2d, 1e3d.
+	if l.accept("dD") {
+		if utils.IsAlphaNumeric(l.peek()) {
+			l.next()
+			return false
+		}
+		return true
+	}
 	// Next thing mustn't be alphanumeric.
 	if utils.IsAlphaNumeric(l.peek()) {
 		l.next()

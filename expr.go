@@ -11,6 +11,7 @@ import (
 	"github.com/expr-lang/expr/checker"
 	"github.com/expr-lang/expr/compiler"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/optimizer"
 	"github.com/expr-lang/expr/parser"
@@ -131,6 +132,19 @@ func WarnOnAny() Option {
 func Optimize(b bool) Option {
 	return func(c *conf.Config) {
 		c.Optimize = b
+	}
+}
+
+// DecimalContext sets the precision (number of fractional decimal places)
+// and the rounding mode used by decimal division. The same context is used
+// by compile-time constant folding and by the runtime, so both produce
+// identical results. The default is decimal.DefaultContext.
+func DecimalContext(precision int, rounding decimal.RoundingMode) Option {
+	return func(c *conf.Config) {
+		c.DecimalContext = decimal.Context{
+			Precision: int32(precision),
+			Rounding:  rounding,
+		}
 	}
 }
 

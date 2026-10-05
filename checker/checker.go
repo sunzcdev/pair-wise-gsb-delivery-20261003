@@ -10,6 +10,7 @@ import (
 	"github.com/expr-lang/expr/builtin"
 	. "github.com/expr-lang/expr/checker/nature"
 	"github.com/expr-lang/expr/conf"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/parser"
 )
@@ -19,6 +20,7 @@ var (
 	boolType      = reflect.TypeOf(true)
 	intType       = reflect.TypeOf(0)
 	floatType     = reflect.TypeOf(float64(0))
+	decimalType   = reflect.TypeOf(decimal.Decimal{})
 	stringType    = reflect.TypeOf("")
 	arrayType     = reflect.TypeOf([]any{})
 	mapType       = reflect.TypeOf(map[string]any{})
@@ -191,6 +193,8 @@ func (v *Checker) visit(node ast.Node) Nature {
 		nt = v.config.NtCache.FromType(intType)
 	case *ast.FloatNode:
 		nt = v.config.NtCache.FromType(floatType)
+	case *ast.DecimalNode:
+		nt = v.config.NtCache.FromType(decimalType)
 	case *ast.BoolNode:
 		nt = v.config.NtCache.FromType(boolType)
 	case *ast.StringNode:
@@ -306,6 +310,9 @@ func (v *Checker) unaryNode(node *ast.UnaryNode) Nature {
 		if nt.IsNumber() {
 			return nt
 		}
+		if nt.IsDecimal {
+			return nt
+		}
 		if nt.IsUnknown(&v.config.NtCache) {
 			return Nature{}
 		}
@@ -323,6 +330,12 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 
 	l = l.Deref(&v.config.NtCache)
 	r = r.Deref(&v.config.NtCache)
+
+	if l.IsDecimal || r.IsDecimal {
+		if nt, ok := v.decimalBinaryNode(node, l, r); ok {
+			return nt
+		}
+	}
 
 	switch node.Operator {
 	case "==", "!=":
@@ -506,6 +519,37 @@ func (v *Checker) binaryNode(node *ast.BinaryNode) Nature {
 	}
 
 	return v.error(node, `invalid operation: %s (mismatched types %s and %s)`, node.Operator, l.String(), r.String())
+}
+
+// decimalBinaryNode type-checks binary operations where at least one side
+// is a decimal. Integers are promoted to decimals. Mixing decimals with
+// floats is rejected and requires an explicit conversion. It returns
+// ok=false for operators without decimal-specific rules, so the generic
+// rules apply.
+func (v *Checker) decimalBinaryNode(node *ast.BinaryNode, l, r Nature) (Nature, bool) {
+	compatible := func(n Nature) bool {
+		return n.IsDecimal || n.IsInteger || n.IsUnknown(&v.config.NtCache)
+	}
+	if !compatible(l) || !compatible(r) {
+		switch node.Operator {
+		case "==", "!=", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "**", "^":
+			if l.IsFloat || r.IsFloat {
+				return v.error(node, "invalid operation: %s (mixing decimal and float requires explicit conversion with decimal() or float())", node.Operator), true
+			}
+			return v.error(node, `invalid operation: %s (mismatched types %s and %s)`, node.Operator, l.String(), r.String()), true
+		}
+		return Nature{}, false
+	}
+
+	switch node.Operator {
+	case "==", "!=", "<", "<=", ">", ">=":
+		return v.config.NtCache.FromType(boolType), true
+	case "+", "-", "*", "/":
+		return v.config.NtCache.FromType(decimalType), true
+	case "%", "**", "^":
+		return v.error(node, "invalid operation: %s (operator %s is not supported for decimal)", node.Operator, node.Operator), true
+	}
+	return Nature{}, false
 }
 
 func (v *Checker) chainNode(node *ast.ChainNode) Nature {

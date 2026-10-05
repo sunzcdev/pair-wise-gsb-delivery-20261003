@@ -11,6 +11,7 @@ import (
 
 	"github.com/expr-lang/expr/ast"
 	"github.com/expr-lang/expr/builtin"
+	"github.com/expr-lang/expr/decimal"
 	"github.com/expr-lang/expr/file"
 	"github.com/expr-lang/expr/vm/runtime"
 )
@@ -20,6 +21,11 @@ type Program struct {
 	Bytecode  []Opcode
 	Arguments []int
 	Constants []any
+
+	// DecimalContext is the precision and rounding mode used by decimal
+	// division at runtime. It is set by the compiler from the expr
+	// configuration and defaults to decimal.DefaultContext.
+	DecimalContext decimal.Context
 
 	source    file.Source
 	node      ast.Node
@@ -44,16 +50,17 @@ func NewProgram(
 	span *Span,
 ) *Program {
 	return &Program{
-		source:    source,
-		node:      node,
-		locations: locations,
-		variables: variables,
-		Constants: constants,
-		Bytecode:  bytecode,
-		Arguments: arguments,
-		functions: functions,
-		debugInfo: debugInfo,
-		span:      span,
+		DecimalContext: decimal.DefaultContext,
+		source:         source,
+		node:           node,
+		locations:      locations,
+		variables:      variables,
+		Constants:      constants,
+		Bytecode:       bytecode,
+		Arguments:      arguments,
+		functions:      functions,
+		debugInfo:      debugInfo,
+		span:           span,
 	}
 }
 
