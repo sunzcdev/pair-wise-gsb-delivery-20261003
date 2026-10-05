@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+* Add multi-factor authentication (MFA) support.
+  The new `AuthCredentialsProvider` option lets callers supply authentication
+  material per factor and per plugin. The driver now handles the server's
+  AuthNextFactor requests and mid-flow plugin switches, and only hands the
+  connection to `database/sql` after the whole authentication flow completed.
+  Without a provider, `Config.Passwd` covers only the first factor and is
+  never reused for additional factors.
+
 ## v1.10.1 (2026-09-02)
 
 * Fix `Config.FormatDSN()` dropping `Addr` when `Net` is empty.

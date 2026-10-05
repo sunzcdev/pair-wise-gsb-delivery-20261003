@@ -139,12 +139,12 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 
 	// Send Client Authentication Packet
-	authResp, err := mc.auth(authData, plugin)
+	authResp, err := mc.authForFactor(ctx, 1, authData, plugin)
 	if err != nil {
 		// try the default auth plugin, if using the requested plugin failed
 		mc.cfg.Logger.Print("could not use requested auth plugin '"+plugin+"': ", err.Error())
 		plugin = defaultAuthPlugin
-		authResp, err = mc.auth(authData, plugin)
+		authResp, err = mc.authForFactor(ctx, 1, authData, plugin)
 		if err != nil {
 			mc.cleanup()
 			return nil, err
@@ -157,7 +157,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 
 	// Handle response to auth packet, switch methods if possible
-	if err = mc.handleAuthResult(authData, plugin); err != nil {
+	if err = mc.handleAuthResult(ctx, authData, plugin); err != nil {
 		// Authentication failed and MySQL has already closed the connection
 		// (https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html#sect_protocol_connection_phase_fast_path_fails).
 		// Do not send COM_QUIT, just cleanup and return the error.

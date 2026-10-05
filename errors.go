@@ -25,6 +25,7 @@ var (
 	ErrOldPassword       = errors.New("this user requires old password authentication. If you still want to use it, please add 'allowOldPasswords=1' to your DSN. See also https://github.com/go-sql-driver/mysql/wiki/old_passwords")
 	ErrUnknownPlugin     = errors.New("this authentication plugin is not supported")
 	ErrOldProtocol       = errors.New("MySQL server does not support required protocol 41+")
+	ErrNoCredentials     = errors.New("no credentials provided for authentication factor")
 	ErrPktSync           = errors.New("commands out of sync. You can't run this command now")
 	ErrPktSyncMul        = errors.New("commands out of sync. Did you run multiple statements at once?")
 	ErrPktTooLarge       = errors.New("packet for query is too large. Try adjusting the `Config.MaxAllowedPacket`")

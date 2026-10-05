@@ -80,12 +80,13 @@ type Config struct {
 	compress       bool // Enable zlib compression
 	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
 
-	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
-	encodedAttributes string                               // Encoded connection attributes
-	paramOrder        []string                             // Order of connection parameters parsed from the DSN
-	pubKey            *rsa.PublicKey                       // Server public key
-	timeTruncate      time.Duration                        // Truncate time.Time values to the specified duration
-	charsets          []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
+	beforeConnect       func(context.Context, *Config) error // Invoked before a connection is established
+	credentialsProvider CredentialsProvider                  // Provides authentication material per factor and plugin
+	encodedAttributes   string                               // Encoded connection attributes
+	paramOrder          []string                             // Order of connection parameters parsed from the DSN
+	pubKey              *rsa.PublicKey                       // Server public key
+	timeTruncate        time.Duration                        // Truncate time.Time values to the specified duration
+	charsets            []string                             // Connection charset. When set, this will be set in SET NAMES <charset> query
 }
 
 // Functional Options Pattern
@@ -153,6 +154,24 @@ func TimeTruncate(d time.Duration) Option {
 func BeforeConnect(fn func(context.Context, *Config) error) Option {
 	return func(cfg *Config) error {
 		cfg.beforeConnect = fn
+		return nil
+	}
+}
+
+// AuthCredentialsProvider sets the CredentialsProvider used to obtain
+// authentication material for each factor of a (multi-factor) authentication
+// handshake.
+//
+// When set, the provider is consulted for every factor, including the first
+// one, and Config.Passwd is not used. When unset, Config.Passwd covers only
+// the first factor and any additional factor requested by the server fails
+// with ErrNoCredentials.
+//
+// The material returned by the provider is never included in the DSN
+// representation produced by [Config.FormatDSN].
+func AuthCredentialsProvider(p CredentialsProvider) Option {
+	return func(cfg *Config) error {
+		cfg.credentialsProvider = p
 		return nil
 	}
 }

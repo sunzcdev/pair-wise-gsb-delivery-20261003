@@ -35,11 +35,12 @@ const (
 // https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html
 
 const (
-	iOK           byte = 0x00
-	iAuthMoreData byte = 0x01
-	iLocalInFile  byte = 0xfb
-	iEOF          byte = 0xfe
-	iERR          byte = 0xff
+	iOK             byte = 0x00
+	iAuthMoreData   byte = 0x01
+	iAuthNextFactor byte = 0x02
+	iLocalInFile    byte = 0xfb
+	iEOF            byte = 0xfe
+	iERR            byte = 0xff
 )
 
 // https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
