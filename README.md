@@ -36,6 +36,7 @@ In other words, the `acmez` package is **porcelain** while the `acme` package is
 	- DNS Labeled With ACME Account ID Challenge ([draft-ietf-acme-dns-account-label-01](https://datatracker.ietf.org/doc/draft-ietf-acme-dns-account-label/01/))
 - ACME Renewal Information (ARI) support ([RFC 9773](https://datatracker.ietf.org/doc/html/rfc9773))
 - ACME profiles ([draft-aaron-acme-profiles](https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/))
+- Staged (resumable) issuance for manually-completed challenges
 
 
 ## Install
@@ -73,6 +74,16 @@ client := acmez.Client{
 
 If you're implementing a tls-alpn-01 solver, the `acmez` package can help. It has the constant [`ACMETLS1Protocol`](https://pkg.go.dev/github.com/mholt/acmez/v3#pkg-constants) which you can use to identify challenge handshakes by inspecting the ClientHello's ALPN extension. Simply complete the handshake using a certificate from the [`acmez.TLSALPN01ChallengeCert()`](https://pkg.go.dev/github.com/mholt/acmez/v3#TLSALPN01ChallengeCert) function to solve the challenge.
 
+
+## Staged issuance
+
+When challenges cannot be solved automatically — for example, when a customer's DNS records must be changed by hand — the one-shot `ObtainCertificate` call is a poor fit because it blocks until every challenge completes. For those cases, the `acmez` package offers a resumable, three-step flow:
+
+1. **`BeginOrder`** creates the order and returns an `IssuanceState` describing the order status and the challenges to complete (token, key authorization, DNS record name, etc.).
+2. **`AdvanceOrder`** is called after the challenges have been provisioned; it reconciles the saved state with the real state on the server (skipping already-valid authorizations, and reporting failed or expired ones), initiates validation, and waits for the results. It never creates a new order.
+3. **`CollectCertificate`** finalizes the order and downloads the certificate chains.
+
+The `IssuanceState` can be serialized and persisted between steps, so a process may exit and another one may resume later. It contains no private key material: the certificate key stays with the caller (only the public CSR is stored), and the account key is passed to each step.
 
 
 ## History

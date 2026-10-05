@@ -82,39 +82,18 @@ func (c *Client) ObtainCertificateForSANs(ctx context.Context, account acme.Acco
 // the exception of "Create account" because account management is outside the scope of
 // certificate issuance. The account's status MUST be "valid" in order to succeed.
 func (c *Client) ObtainCertificate(ctx context.Context, params OrderParameters) ([]acme.Certificate, error) {
-	if params.Account.Status != acme.StatusValid {
-		return nil, fmt.Errorf("account status is not valid: %s", params.Account.Status)
-	}
-	if params.CSR == nil {
-		return nil, errors.New("missing CSR source")
-	}
-	if len(params.Identifiers) == 0 {
-		return nil, errors.New("order does not list any identifiers")
+	if err := validateOrderParams(params); err != nil {
+		return nil, err
 	}
 
 	// create the ACME order
-	order := acme.Order{Profile: params.Profile, Identifiers: params.Identifiers}
-	if !params.NotBefore.IsZero() {
-		// partial seconds are not permitted
-		trunc := params.NotBefore.Truncate(time.Second)
-		order.NotBefore = &trunc
-	}
-	if !params.NotAfter.IsZero() {
-		// partial seconds are not permitted
-		trunc := params.NotAfter.Truncate(time.Second)
-		order.NotAfter = &trunc
-	}
-	if params.Replaces != nil {
-		certID, err := acme.ARIUniqueIdentifier(params.Replaces)
-		if err != nil {
-			return nil, fmt.Errorf("invalid Replaces cert value: %v", err)
-		}
-		order.Replaces = certID
+	order, err := orderFromParams(params)
+	if err != nil {
+		return nil, err
 	}
 
 	// prepare to retry the transaction multiple times if necessary
 	// until it succeeds
-	var err error
 
 	// remember which challenge types failed for which identifiers
 	// so we can retry with other challenge types
@@ -224,6 +203,45 @@ func (c *Client) ObtainCertificate(ctx context.Context, params OrderParameters) 
 	}
 
 	return certChains, nil
+}
+
+// validateOrderParams ensures the order parameters have the minimum
+// required values to begin an ACME order flow.
+func validateOrderParams(params OrderParameters) error {
+	if params.Account.Status != acme.StatusValid {
+		return fmt.Errorf("account status is not valid: %s", params.Account.Status)
+	}
+	if params.CSR == nil {
+		return errors.New("missing CSR source")
+	}
+	if len(params.Identifiers) == 0 {
+		return errors.New("order does not list any identifiers")
+	}
+	return nil
+}
+
+// orderFromParams creates the ACME order object to be sent to the
+// server from the high-level order parameters.
+func orderFromParams(params OrderParameters) (acme.Order, error) {
+	order := acme.Order{Profile: params.Profile, Identifiers: params.Identifiers}
+	if !params.NotBefore.IsZero() {
+		// partial seconds are not permitted
+		trunc := params.NotBefore.Truncate(time.Second)
+		order.NotBefore = &trunc
+	}
+	if !params.NotAfter.IsZero() {
+		// partial seconds are not permitted
+		trunc := params.NotAfter.Truncate(time.Second)
+		order.NotAfter = &trunc
+	}
+	if params.Replaces != nil {
+		certID, err := acme.ARIUniqueIdentifier(params.Replaces)
+		if err != nil {
+			return order, fmt.Errorf("invalid Replaces cert value: %v", err)
+		}
+		order.Replaces = certID
+	}
+	return order, nil
 }
 
 // validateOrderIdentifiers checks if the ACME identifiers provided for the
