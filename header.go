@@ -17,14 +17,6 @@ func parseHeaderWithParams(s string) (f string, params map[string]string, err er
 	return
 }
 
-func formatHeaderWithParams(f string, params map[string]string) string {
-	encParams := make(map[string]string)
-	for k, v := range params {
-		encParams[k] = encodeHeader(v)
-	}
-	return mime.FormatMediaType(f, encParams)
-}
-
 // HeaderFields iterates over header fields.
 type HeaderFields interface {
 	textproto.HeaderFields
@@ -50,6 +42,67 @@ func (hf *headerFields) Text() (string, error) {
 // A Header represents the key-value pairs in a message header.
 type Header struct {
 	textproto.Header
+
+	// ParamLineBudget is the maximum length, in bytes, of a header field
+	// line produced when formatting Content-Type and Content-Disposition
+	// parameters with SetContentType and SetContentDisposition. Non-ASCII
+	// parameter values that don't fit are split into RFC 2231 continuation
+	// segments. If zero, DefaultParamLineBudget is used. If negative,
+	// RFC 2231 parameter encoding is disabled.
+	ParamLineBudget int
+}
+
+// paramLineBudget returns the configured parameter line budget, or the
+// default if none is set.
+func (h *Header) paramLineBudget() int {
+	if h.ParamLineBudget == 0 {
+		return DefaultParamLineBudget
+	}
+	return h.ParamLineBudget
+}
+
+// setParamsField formats and sets a Content-Type or Content-Disposition
+// header field. If the formatted field doesn't fit in the parameter line
+// budget, it is folded into a raw header field with every line within the
+// budget.
+func (h *Header) setParamsField(key, f string, params map[string]string) {
+	budget := h.paramLineBudget()
+	value := formatParams(f, params, budget)
+
+	// textproto folds header fields at 76 bytes, so a field that fits both
+	// the budget and that limit can go through the regular path
+	limit := budget
+	if limit > DefaultParamLineBudget {
+		limit = DefaultParamLineBudget
+	}
+	if budget < 0 || len(key)+2+len(value) <= limit {
+		h.Set(key, value)
+		return
+	}
+
+	h.Del(key)
+	h.AddRaw(foldParamsField(key, value, budget))
+}
+
+// reformatParams re-formats the Content-Type and Content-Disposition header
+// fields with the header's ParamLineBudget. Fields whose parameters don't
+// need encoding are left untouched.
+func (h *Header) reformatParams() {
+	if disp, params, err := h.ContentDisposition(); err == nil && paramsNeedEncoding(params) {
+		h.SetContentDisposition(disp, params)
+	}
+	if t, params, err := h.ContentType(); err == nil && paramsNeedEncoding(params) {
+		h.SetContentType(t, params)
+	}
+}
+
+func paramsNeedEncoding(params map[string]string) bool {
+	for _, v := range params {
+		if paramNeedsEncoding(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // HeaderFromMap creates a header from a map of header fields.
@@ -59,7 +112,7 @@ type Header struct {
 // The map representation looses the ordering of the fields, the capitalization
 // of the header keys, and the whitespace of the original header.
 func HeaderFromMap(m map[string][]string) Header {
-	return Header{textproto.HeaderFromMap(m)}
+	return Header{Header: textproto.HeaderFromMap(m)}
 }
 
 // ContentType parses the Content-Type header field.
@@ -75,7 +128,7 @@ func (h *Header) ContentType() (t string, params map[string]string, err error) {
 
 // SetContentType formats the Content-Type header field.
 func (h *Header) SetContentType(t string, params map[string]string) {
-	h.Set("Content-Type", formatHeaderWithParams(t, params))
+	h.setParamsField("Content-Type", t, params)
 }
 
 // ContentDisposition parses the Content-Disposition header field, as defined in
@@ -87,7 +140,7 @@ func (h *Header) ContentDisposition() (disp string, params map[string]string, er
 // SetContentDisposition formats the Content-Disposition header field, as
 // defined in RFC 2183.
 func (h *Header) SetContentDisposition(disp string, params map[string]string) {
-	h.Set("Content-Disposition", formatHeaderWithParams(disp, params))
+	h.setParamsField("Content-Disposition", disp, params)
 }
 
 // Text parses a plaintext header field. The field charset is automatically
@@ -104,7 +157,7 @@ func (h *Header) SetText(k, v string) {
 
 // Copy creates a stand-alone copy of the header.
 func (h *Header) Copy() Header {
-	return Header{h.Header.Copy()}
+	return Header{Header: h.Header.Copy(), ParamLineBudget: h.ParamLineBudget}
 }
 
 // Fields iterates over all the header fields.

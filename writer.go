@@ -21,6 +21,14 @@ type Writer struct {
 	w  io.Writer
 	c  io.Closer
 	mw *textproto.MultipartWriter
+
+	// ParamLineBudget is the maximum length, in bytes, of a header field
+	// line produced when formatting Content-Type and Content-Disposition
+	// parameters. It is applied to the headers of parts created with
+	// CreatePart when the part's header doesn't set its own
+	// ParamLineBudget. If zero, DefaultParamLineBudget is used. If
+	// negative, RFC 2231 parameter encoding is disabled.
+	ParamLineBudget int
 }
 
 // createWriter creates a new Writer writing to w with the provided header.
@@ -120,6 +128,10 @@ func (w *Writer) CreatePart(header Header) (*Writer, error) {
 
 	// ensure that modifications are invisible to the caller
 	header = header.Copy()
+	if w.ParamLineBudget != 0 && header.ParamLineBudget == 0 {
+		header.ParamLineBudget = w.ParamLineBudget
+		header.reformatParams()
+	}
 	cw, err := createWriter(ww, &header)
 	if err != nil {
 		return nil, err

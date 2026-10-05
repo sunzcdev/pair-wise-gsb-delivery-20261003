@@ -147,7 +147,7 @@ func ReadWithOptions(r io.Reader, opts *ReadOptions) (*Entity, error) {
 
 	lr.N = math.MaxInt64
 
-	return New(Header{h}, br)
+	return New(Header{Header: h}, br)
 }
 
 // Read reads a message from r. The message's encoding and charset are
