@@ -11,12 +11,13 @@ func OpenTable(L *LState) int {
 }
 
 var tableFuncs = map[string]LGFunction{
-	"getn":   tableGetN,
-	"concat": tableConcat,
-	"insert": tableInsert,
-	"maxn":   tableMaxN,
-	"remove": tableRemove,
-	"sort":   tableSort,
+	"getn":        tableGetN,
+	"concat":      tableConcat,
+	"insert":      tableInsert,
+	"maxn":        tableMaxN,
+	"remove":      tableRemove,
+	"sort":        tableSort,
+	"stable_sort": tableStableSort,
 }
 
 func tableSort(L *LState) int {
@@ -26,6 +27,55 @@ func tableSort(L *LState) int {
 		sorter.Fn = L.CheckFunction(2)
 	}
 	sort.Sort(sorter)
+	return 0
+}
+
+func tableStableSort(L *LState) int {
+	tbl := L.CheckTable(1)
+	var fn *LFunction
+	if L.GetTop() > 1 {
+		fn = L.CheckFunction(2)
+	}
+
+	// Sparse arrays are sorted over the prefix defined by the Lua length
+	// operator, read without invoking __len (matching table.sort).
+	n := tbl.Len()
+
+	// Take two independent copies of the entire backing slice. values is
+	// the scratch area; only its [0:n) prefix is reordered. reference is
+	// never reordered and proves afterwards that the comparator did not
+	// write into the table while sorting, including trailing holes.
+	// Neither copy may alias tbl.array or the writes would hide.
+	origLen := len(tbl.array)
+	reference := make([]LValue, origLen)
+	copy(reference, tbl.array)
+	values := make([]LValue, origLen)
+	copy(values, reference)
+
+	sort.SliceStable(values[:n], func(i, j int) bool {
+		if fn != nil {
+			L.Push(fn)
+			L.Push(values[i])
+			L.Push(values[j])
+			L.Call(2, 1)
+			return LVAsBool(L.reg.Pop())
+		}
+		return lessThan(L, values[i], values[j])
+	})
+
+	// The comparator may have errored (already propagated), triggered
+	// metamethods, or written back into the table. Reject the commit if
+	// the array part changed so the comparator's writes are not lost.
+	if len(tbl.array) != origLen {
+		L.RaiseError("invalid order function for sorting (table modified during stable_sort)")
+	}
+	for i, value := range reference {
+		if tbl.array[i] != value {
+			L.RaiseError("invalid order function for sorting (table modified during stable_sort)")
+		}
+	}
+
+	copy(tbl.array, values[:n])
 	return 0
 }
 
