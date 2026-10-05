@@ -43,12 +43,7 @@ func (c *Code) Run(v any, values ...any) Iter {
 
 // RunWithContext runs the code with context.
 func (c *Code) RunWithContext(ctx context.Context, v any, values ...any) Iter {
-	if len(values) > len(c.variables) {
-		return NewIter(&tooManyVariableValuesError{})
-	} else if len(values) < len(c.variables) {
-		return NewIter(&expectedVariableError{c.variables[len(values)]})
-	}
-	return newEnv(ctx).execute(c, v, values...)
+	return c.RunWithOptions(v, values, WithRunContext(ctx))
 }
 
 type scopeinfo struct {
@@ -482,7 +477,7 @@ func (c *compiler) compileQueryUpdate(l, r *Query, op Operator) error {
 			}
 			c.append(&code{op: oppush, v: xs})
 			c.append(&code{op: opload, v: v})
-			c.append(&code{op: opcall, v: [3]any{internalFuncs["setpath"].callback, 2, "setpath"}})
+			c.append(&code{op: opcall, v: [3]any{internalFuncs["setpath"].callback.(func(any, []any) any), 2, "setpath"}})
 			return nil
 		}
 		fallthrough
@@ -610,7 +605,7 @@ func (c *compiler) compilePattern(vs [][2]int, p *Pattern) ([][2]int, error) {
 				c.append(&code{op: opload, v: v})
 				c.append(&code{op: oppush, v: nil})
 				// ref: compileCall
-				c.append(&code{op: opcall, v: [3]any{internalFuncs["_index"].callback, 2, "_index"}})
+				c.append(&code{op: opcall, v: [3]any{internalFuncs["_index"].callback.(func(any, []any) any), 2, "_index"}})
 			}
 			if name != "" {
 				if kv.Val != nil {
@@ -1355,7 +1350,7 @@ func (c *compiler) compileObjectKeyVal(v [2]int, kv *ObjectKeyVal) error {
 				c.append(&code{op: opload, v: v})
 				c.append(&code{op: oppush, v: nil})
 				// ref: compileCall
-				c.append(&code{op: opcall, v: [3]any{internalFuncs["_index"].callback, 2, "_index"}})
+				c.append(&code{op: opcall, v: [3]any{internalFuncs["_index"].callback.(func(any, []any) any), 2, "_index"}})
 			}
 		}
 	} else if kv.KeyQuery != nil {

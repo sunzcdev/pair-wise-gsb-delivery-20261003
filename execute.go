@@ -36,6 +36,10 @@ loop:
 			default:
 			}
 		}
+		if !env.chargeInstruction() {
+			pc, env.forks = len(env.codes), nil
+			return &InstructionLimitError{Limit: env.instLimit}, true
+		}
 		switch code.op {
 		case opnop:
 			// nop
@@ -182,10 +186,22 @@ loop:
 				for i := range argcnt {
 					args[i] = env.pop()
 				}
-				w := v[0].(func(any, []any) any)(x, args)
+				var w any
+				switch fn := v[0].(type) {
+				case func(any, []any) any:
+					w = fn(x, args)
+				case func(InstructionMeter, any, []any) any:
+					w = fn(env, x, args)
+				default:
+					panic(v[0])
+				}
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
+				}
+				if env.instLimit >= 0 && env.instLeft < 0 {
+					pc, env.forks = len(env.codes), nil
+					return &InstructionLimitError{Limit: env.instLimit}, true
 				}
 				env.push(w)
 				if !env.paths.empty() && env.expdepth == 0 {
@@ -304,12 +320,20 @@ loop:
 					env.push(v)
 					env.pushfork(pc)
 					env.pop()
+					if env.instLimit >= 0 && env.instLeft < 0 {
+						pc, env.forks = len(env.codes), nil
+						return &InstructionLimitError{Limit: env.instLimit}, true
+					}
 					if e, ok := w.(error); ok {
 						err = e
 						break loop
 					}
 					env.push(w)
 					continue
+				}
+				if env.instLimit >= 0 && env.instLeft < 0 {
+					pc, env.forks = len(env.codes), nil
+					return &InstructionLimitError{Limit: env.instLimit}, true
 				}
 				break loop
 			default:

@@ -37,7 +37,9 @@ const (
 type function struct {
 	argcount int
 	iter     bool
-	callback func(any, []any) any
+	// callback is either func(any, []any) any or
+	// func(InstructionMeter, any, []any) any (a metered custom function).
+	callback any
 }
 
 func (fn function) accept(cnt int) bool {
@@ -210,7 +212,8 @@ func init() {
 
 func argFunc0(f func(any) any) function {
 	return function{
-		argcount0, false, func(v any, _ []any) any {
+		argcount: argcount0,
+		callback: func(v any, _ []any) any {
 			return f(v)
 		},
 	}
@@ -218,7 +221,8 @@ func argFunc0(f func(any) any) function {
 
 func argFunc1(f func(_, _ any) any) function {
 	return function{
-		argcount1, false, func(v any, args []any) any {
+		argcount: argcount1,
+		callback: func(v any, args []any) any {
 			return f(v, args[0])
 		},
 	}
@@ -226,7 +230,8 @@ func argFunc1(f func(_, _ any) any) function {
 
 func argFunc2(f func(_, _, _ any) any) function {
 	return function{
-		argcount2, false, func(v any, args []any) any {
+		argcount: argcount2,
+		callback: func(v any, args []any) any {
 			return f(v, args[0], args[1])
 		},
 	}
@@ -234,7 +239,8 @@ func argFunc2(f func(_, _, _ any) any) function {
 
 func argFunc3(f func(_, _, _, _ any) any) function {
 	return function{
-		argcount3, false, func(v any, args []any) any {
+		argcount: argcount3,
+		callback: func(v any, args []any) any {
 			return f(v, args[0], args[1], args[2])
 		},
 	}
@@ -841,7 +847,7 @@ func funcFormat(v, x any) any {
 	if f == nil {
 		return &formatNotFoundError{format}
 	}
-	return internalFuncs[f.Name].callback(v, nil)
+	return internalFuncs[f.Name].callback.(func(any, []any) any)(v, nil)
 }
 
 var htmlEscaper = strings.NewReplacer(
