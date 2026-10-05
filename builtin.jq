@@ -33,6 +33,8 @@ def max_by(f): _max_by(map([f]));
 def sort_by(f): _sort_by(map([f]));
 def group_by(f): _group_by(map([f]));
 def unique_by(f): _unique_by(map([f]));
+def top_k($k; g): _top_k($k; g);
+def top_k_by($k; g; f): _top_k_by($k; g; f);
 
 def arrays: select(type == "array");
 def objects: select(type == "object");

@@ -937,6 +937,10 @@ func (c *compiler) compileFunc(e *Func) error {
 				c.compileModify()
 			case "_last":
 				c.compileLast()
+			case "_top_k", "_top_k_by":
+				if err := c.compileTopK(e.Name, e.Args); err != nil {
+					return err
+				}
 			}
 		}
 		if f := c.lookupBuiltin(e.Name, len(e.Args)); f != nil {
@@ -1159,6 +1163,138 @@ func (c *compiler) compileLast() {
 		&code{op: opload, v: v},
 		&code{op: opret},
 	)
+}
+
+// Appends the compiled code for the streaming `_top_k($k; g)` and
+// `_top_k_by($k; g; f)` functions. The input generator g is consumed lazily,
+// keeping at most k (value, key) pairs, and the kept values are emitted as a
+// single sorted array. The key filter f is evaluated per value with [f]
+// semantics (all its outputs are collected, an empty output is an empty key),
+// matching sort_by.
+func (c *compiler) compileTopK(name string, args []*Query) error {
+	defer c.appendBuiltin(name, len(args))()
+	scope := c.newScope()
+	hasFilter := len(args) == 3
+	// Scope slots:
+	//   0: input value
+	//   1: $k closure (f closure for top_k_by, see below)
+	//   2: g closure
+	//   3: f closure (top_k_by only)
+	//   4: validated k / running topKState
+	//   5: current generator value $v
+	//   6: collected key outputs [f] (top_k_by only)
+	// The call site pushes closures in reverse argument order, so on entry
+	// they pop as $k then g (f, $k, g for top_k_by).
+	size, input := 7, [2]int{scope.id, 0}
+	kf := [2]int{scope.id, 1}
+	gf := [2]int{scope.id, 2}
+	ff := [2]int{scope.id, 3}
+	state, vv, keys := [2]int{scope.id, 4}, [2]int{scope.id, 5}, [2]int{scope.id, 6}
+	// Store the input value and the closures passed from the call site.
+	c.appends(
+		&code{op: opscope, v: [3]int{scope.id, size, 1}},
+		&code{op: opstore, v: input},
+	)
+	if hasFilter {
+		c.appends(
+			&code{op: opstore, v: kf},
+			&code{op: opstore, v: gf},
+			&code{op: opstore, v: ff},
+		)
+	} else {
+		c.appends(
+			&code{op: opstore, v: kf},
+			&code{op: opstore, v: gf},
+		)
+	}
+	// The stored closures are bound to the caller scope; trampolines placed
+	// after the body re-enter the stored closures in this scope, and the slots
+	// are overwritten with closures pointing at the trampolines.
+	pcs := map[[2]int]int{}
+	rebind := func(dst [2]int) {
+		c.append(&code{op: oppushpc, v: pcs[dst]})
+		c.append(&code{op: opstore, v: dst})
+	}
+	dsts := [][2]int{kf, gf}
+	if hasFilter {
+		dsts = append(dsts, ff)
+	}
+	// Evaluate $k eagerly (using the caller-bound closure); a bad k or an
+	// error in $k aborts before touching the generator.
+	c.append(&code{op: opload, v: input})
+	c.append(&code{op: opload, v: kf})
+	c.append(&code{op: opcallpc})
+	c.append(&code{op: opcall, v: [3]any{internalFuncs["_top_k_validate"].callback, 0, "_top_k_validate"}})
+	c.append(&code{op: opstore, v: state})
+	c.append(&code{op: opload, v: input})
+	// With k == 0 the result is the empty array and the generator must not
+	// be consumed at all (it may be infinite or expensive).
+	c.append(&code{op: opload, v: state})
+	c.append(&code{op: opcall, v: [3]any{internalFuncs["_top_k_nonzero"].callback, 0, "_top_k_nonzero"}})
+	setJmpZero := c.lazy(func() *code {
+		return &code{op: opjumpifnot, v: len(c.codes)}
+	})
+	// Re-bind every closure to a trampoline in this scope before running g.
+	jmpBody := c.lazy(func() *code {
+		return &code{op: opjump, v: len(c.codes)}
+	})
+	for _, dst := range dsts {
+		pcs[dst] = len(c.codes)
+		c.appends(
+			&code{op: oppop},
+			&code{op: opload, v: dst},
+			&code{op: opcallpc},
+			&code{op: opret},
+		)
+	}
+	for _, dst := range dsts {
+		rebind(dst)
+	}
+	jmpBody()
+	// reduce g as $v (
+	setfork := c.lazy(func() *code {
+		return &code{op: opfork, v: len(c.codes)}
+	})
+	c.append(&code{op: opload, v: gf})
+	c.append(&code{op: opcallpc})
+	c.append(&code{op: opstore, v: vv})
+	if hasFilter {
+		// key := [$v | f]
+		c.append(&code{op: oppush, v: []any{}})
+		c.append(&code{op: opstore, v: keys})
+		c.append(&code{op: opload, v: vv})
+		setKeyFork := c.lazy(func() *code {
+			return &code{op: opfork, v: len(c.codes)}
+		})
+		f := c.newScopeDepth()
+		if err := c.compileQuery(args[2]); err != nil {
+			return err
+		}
+		f()
+		c.append(&code{op: opappend, v: keys})
+		c.append(&code{op: opbacktrack})
+		setKeyFork()
+		c.append(&code{op: oppop})
+		c.append(&code{op: opload, v: keys})
+		// stack: key
+	} else {
+		// key := $v
+		c.append(&code{op: opload, v: vv})
+	}
+	// _top_k_add($state; $v; key); the callback pops key, then $v, with the
+	// state on top, and returns the (possibly updated) state.
+	c.append(&code{op: opload, v: vv})
+	c.append(&code{op: opload, v: state})
+	c.append(&code{op: opcall, v: [3]any{internalFuncs["_top_k_add"].callback, 2, "_top_k_add"}})
+	c.append(&code{op: opstore, v: state})
+	c.append(&code{op: opbacktrack})
+	setfork()
+	c.append(&code{op: oppop})
+	setJmpZero()
+	c.append(&code{op: opload, v: state})
+	c.append(&code{op: opcall, v: [3]any{internalFuncs["_top_k_result"].callback, 0, "_top_k_result"}})
+	c.append(&code{op: opret})
+	return nil
 }
 
 func (c *compiler) funcBuiltins(any, []any) any {

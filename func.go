@@ -48,163 +48,167 @@ var internalFuncs map[string]function
 
 func init() {
 	internalFuncs = map[string]function{
-		"empty":          argFunc0(nil),
-		"path":           argFunc1(nil),
-		"env":            argFunc0(nil),
-		"builtins":       argFunc0(nil),
-		"input":          argFunc0(nil),
-		"modulemeta":     argFunc0(nil),
-		"debug":          argFunc1(nil),
-		"length":         argFunc0(funcLength),
-		"utf8bytelength": argFunc0(funcUtf8ByteLength),
-		"keys":           argFunc0(funcKeys),
-		"has":            argFunc1(funcHas),
-		"add":            argFunc0(funcAdd),
-		"toboolean":      argFunc0(funcToBoolean),
-		"tonumber":       argFunc0(funcToNumber),
-		"tostring":       argFunc0(funcToString),
-		"type":           argFunc0(funcType),
-		"reverse":        argFunc0(funcReverse),
-		"contains":       argFunc1(funcContains),
-		"inside":         argFunc1(funcInside),
-		"indices":        argFunc1(funcIndices),
-		"index":          argFunc1(funcIndex),
-		"rindex":         argFunc1(funcRindex),
-		"startswith":     argFunc1(funcStartsWith),
-		"endswith":       argFunc1(funcEndsWith),
-		"ltrimstr":       argFunc1(funcLtrimstr),
-		"rtrimstr":       argFunc1(funcRtrimstr),
-		"trimstr":        argFunc1(funcTrimstr),
-		"ltrim":          argFunc0(funcLtrim),
-		"rtrim":          argFunc0(funcRtrim),
-		"trim":           argFunc0(funcTrim),
-		"explode":        argFunc0(funcExplode),
-		"implode":        argFunc0(funcImplode),
-		"split":          argFunc1(funcSplit),
-		"join":           argFunc1(funcJoin),
-		"ascii_downcase": argFunc0(funcASCIIDowncase),
-		"ascii_upcase":   argFunc0(funcASCIIUpcase),
-		"tojson":         argFunc0(funcToJSON),
-		"fromjson":       argFunc0(funcFromJSON),
-		"format":         argFunc1(funcFormat),
-		"_tohtml":        argFunc0(funcToHTML),
-		"_touri":         argFunc0(funcToURI),
-		"_tourid":        argFunc0(funcToURId),
-		"_tocsv":         argFunc0(funcToCSV),
-		"_totsv":         argFunc0(funcToTSV),
-		"_tosh":          argFunc0(funcToSh),
-		"_tobase64":      argFunc0(funcToBase64),
-		"_tobase64d":     argFunc0(funcToBase64d),
-		"_index":         argFunc2(funcIndex2),
-		"_slice":         argFunc3(funcSlice),
-		"_plus":          argFunc0(funcOpPlus),
-		"_negate":        argFunc0(funcOpNegate),
-		"_add":           argFunc2(funcOpAdd),
-		"_subtract":      argFunc2(funcOpSub),
-		"_multiply":      argFunc2(funcOpMul),
-		"_divide":        argFunc2(funcOpDiv),
-		"_modulo":        argFunc2(funcOpMod),
-		"_alternative":   argFunc2(funcOpAlt),
-		"_equal":         argFunc2(funcOpEq),
-		"_notequal":      argFunc2(funcOpNe),
-		"_greater":       argFunc2(funcOpGt),
-		"_less":          argFunc2(funcOpLt),
-		"_greatereq":     argFunc2(funcOpGe),
-		"_lesseq":        argFunc2(funcOpLe),
-		"flatten":        {argcount0 | argcount1, false, funcFlatten},
-		"_range":         {argcount3, true, funcRange},
-		"min":            argFunc0(funcMin),
-		"_min_by":        argFunc1(funcMinBy),
-		"max":            argFunc0(funcMax),
-		"_max_by":        argFunc1(funcMaxBy),
-		"sort":           argFunc0(funcSort),
-		"_sort_by":       argFunc1(funcSortBy),
-		"_group_by":      argFunc1(funcGroupBy),
-		"unique":         argFunc0(funcUnique),
-		"_unique_by":     argFunc1(funcUniqueBy),
-		"sin":            mathFunc("sin", math.Sin),
-		"cos":            mathFunc("cos", math.Cos),
-		"tan":            mathFunc("tan", math.Tan),
-		"asin":           mathFunc("asin", math.Asin),
-		"acos":           mathFunc("acos", math.Acos),
-		"atan":           mathFunc("atan", math.Atan),
-		"sinh":           mathFunc("sinh", math.Sinh),
-		"cosh":           mathFunc("cosh", math.Cosh),
-		"tanh":           mathFunc("tanh", math.Tanh),
-		"asinh":          mathFunc("asinh", math.Asinh),
-		"acosh":          mathFunc("acosh", math.Acosh),
-		"atanh":          mathFunc("atanh", math.Atanh),
-		"floor":          mathFunc("floor", math.Floor),
-		"round":          mathFunc("round", math.Round),
-		"nearbyint":      mathFunc("nearbyint", math.RoundToEven),
-		"rint":           mathFunc("rint", math.RoundToEven),
-		"ceil":           mathFunc("ceil", math.Ceil),
-		"trunc":          mathFunc("trunc", math.Trunc),
-		"significand":    mathFunc("significand", funcSignificand),
-		"fabs":           mathFunc("fabs", math.Abs),
-		"sqrt":           mathFunc("sqrt", math.Sqrt),
-		"cbrt":           mathFunc("cbrt", math.Cbrt),
-		"exp":            mathFunc("exp", math.Exp),
-		"exp10":          mathFunc("exp10", funcExp10),
-		"exp2":           mathFunc("exp2", math.Exp2),
-		"expm1":          mathFunc("expm1", math.Expm1),
-		"frexp":          argFunc0(funcFrexp),
-		"modf":           argFunc0(funcModf),
-		"log":            mathFunc("log", math.Log),
-		"log10":          mathFunc("log10", math.Log10),
-		"log1p":          mathFunc("log1p", math.Log1p),
-		"log2":           mathFunc("log2", math.Log2),
-		"logb":           mathFunc("logb", math.Logb),
-		"gamma":          mathFunc("gamma", math.Gamma),
-		"tgamma":         mathFunc("tgamma", math.Gamma),
-		"lgamma":         mathFunc("lgamma", funcLgamma),
-		"erf":            mathFunc("erf", math.Erf),
-		"erfc":           mathFunc("erfc", math.Erfc),
-		"j0":             mathFunc("j0", math.J0),
-		"j1":             mathFunc("j1", math.J1),
-		"y0":             mathFunc("y0", math.Y0),
-		"y1":             mathFunc("y1", math.Y1),
-		"atan2":          mathFunc2("atan2", math.Atan2),
-		"copysign":       mathFunc2("copysign", math.Copysign),
-		"drem":           mathFunc2("drem", funcDrem),
-		"fdim":           mathFunc2("fdim", math.Dim),
-		"fmax":           mathFunc2("fmax", funcFmax),
-		"fmin":           mathFunc2("fmin", funcFmin),
-		"fmod":           mathFunc2("fmod", math.Mod),
-		"hypot":          mathFunc2("hypot", math.Hypot),
-		"jn":             mathFunc2("jn", funcJn),
-		"nextafter":      mathFunc2("nextafter", math.Nextafter),
-		"nexttoward":     mathFunc2("nexttoward", math.Nextafter),
-		"remainder":      mathFunc2("remainder", math.Remainder),
-		"ldexp":          mathFunc2("ldexp", funcLdexp),
-		"scalb":          mathFunc2("scalb", funcLdexp),
-		"scalbln":        mathFunc2("scalbln", funcLdexp),
-		"yn":             mathFunc2("yn", funcYn),
-		"pow":            mathFunc2("pow", math.Pow),
-		"fma":            mathFunc3("fma", math.FMA),
-		"infinite":       argFunc0(funcInfinite),
-		"isfinite":       argFunc0(funcIsfinite),
-		"isinfinite":     argFunc0(funcIsinfinite),
-		"nan":            argFunc0(funcNan),
-		"isnan":          argFunc0(funcIsnan),
-		"isnormal":       argFunc0(funcIsnormal),
-		"setpath":        argFunc2(funcSetpath),
-		"delpaths":       argFunc1(funcDelpaths),
-		"getpath":        argFunc1(funcGetpath),
-		"transpose":      argFunc0(funcTranspose),
-		"bsearch":        argFunc1(funcBsearch),
-		"gmtime":         argFunc0(funcGmtime),
-		"localtime":      argFunc0(funcLocaltime),
-		"mktime":         argFunc0(funcMktime),
-		"strftime":       argFunc1(funcStrftime),
-		"strflocaltime":  argFunc1(funcStrflocaltime),
-		"strptime":       argFunc1(funcStrptime),
-		"now":            argFunc0(funcNow),
-		"_match":         argFunc3(nil),
-		"_captures":      argFunc0(funcCaptures),
-		"error":          {argcount0 | argcount1, false, funcError},
-		"halt":           argFunc0(funcHalt),
-		"halt_error":     {argcount0 | argcount1, false, funcHaltError},
+		"empty":           argFunc0(nil),
+		"path":            argFunc1(nil),
+		"env":             argFunc0(nil),
+		"builtins":        argFunc0(nil),
+		"input":           argFunc0(nil),
+		"modulemeta":      argFunc0(nil),
+		"debug":           argFunc1(nil),
+		"length":          argFunc0(funcLength),
+		"utf8bytelength":  argFunc0(funcUtf8ByteLength),
+		"keys":            argFunc0(funcKeys),
+		"has":             argFunc1(funcHas),
+		"add":             argFunc0(funcAdd),
+		"toboolean":       argFunc0(funcToBoolean),
+		"tonumber":        argFunc0(funcToNumber),
+		"tostring":        argFunc0(funcToString),
+		"type":            argFunc0(funcType),
+		"reverse":         argFunc0(funcReverse),
+		"contains":        argFunc1(funcContains),
+		"inside":          argFunc1(funcInside),
+		"indices":         argFunc1(funcIndices),
+		"index":           argFunc1(funcIndex),
+		"rindex":          argFunc1(funcRindex),
+		"startswith":      argFunc1(funcStartsWith),
+		"endswith":        argFunc1(funcEndsWith),
+		"ltrimstr":        argFunc1(funcLtrimstr),
+		"rtrimstr":        argFunc1(funcRtrimstr),
+		"trimstr":         argFunc1(funcTrimstr),
+		"ltrim":           argFunc0(funcLtrim),
+		"rtrim":           argFunc0(funcRtrim),
+		"trim":            argFunc0(funcTrim),
+		"explode":         argFunc0(funcExplode),
+		"implode":         argFunc0(funcImplode),
+		"split":           argFunc1(funcSplit),
+		"join":            argFunc1(funcJoin),
+		"ascii_downcase":  argFunc0(funcASCIIDowncase),
+		"ascii_upcase":    argFunc0(funcASCIIUpcase),
+		"tojson":          argFunc0(funcToJSON),
+		"fromjson":        argFunc0(funcFromJSON),
+		"format":          argFunc1(funcFormat),
+		"_tohtml":         argFunc0(funcToHTML),
+		"_touri":          argFunc0(funcToURI),
+		"_tourid":         argFunc0(funcToURId),
+		"_tocsv":          argFunc0(funcToCSV),
+		"_totsv":          argFunc0(funcToTSV),
+		"_tosh":           argFunc0(funcToSh),
+		"_tobase64":       argFunc0(funcToBase64),
+		"_tobase64d":      argFunc0(funcToBase64d),
+		"_index":          argFunc2(funcIndex2),
+		"_slice":          argFunc3(funcSlice),
+		"_plus":           argFunc0(funcOpPlus),
+		"_negate":         argFunc0(funcOpNegate),
+		"_add":            argFunc2(funcOpAdd),
+		"_subtract":       argFunc2(funcOpSub),
+		"_multiply":       argFunc2(funcOpMul),
+		"_divide":         argFunc2(funcOpDiv),
+		"_modulo":         argFunc2(funcOpMod),
+		"_alternative":    argFunc2(funcOpAlt),
+		"_equal":          argFunc2(funcOpEq),
+		"_notequal":       argFunc2(funcOpNe),
+		"_greater":        argFunc2(funcOpGt),
+		"_less":           argFunc2(funcOpLt),
+		"_greatereq":      argFunc2(funcOpGe),
+		"_lesseq":         argFunc2(funcOpLe),
+		"flatten":         {argcount0 | argcount1, false, funcFlatten},
+		"_range":          {argcount3, true, funcRange},
+		"min":             argFunc0(funcMin),
+		"_min_by":         argFunc1(funcMinBy),
+		"max":             argFunc0(funcMax),
+		"_max_by":         argFunc1(funcMaxBy),
+		"sort":            argFunc0(funcSort),
+		"_sort_by":        argFunc1(funcSortBy),
+		"_group_by":       argFunc1(funcGroupBy),
+		"unique":          argFunc0(funcUnique),
+		"_unique_by":      argFunc1(funcUniqueBy),
+		"_top_k_validate": argFunc0(funcTopKValidate),
+		"_top_k_nonzero":  argFunc0(funcTopKNonzero),
+		"_top_k_add":      argFunc2(funcTopKAdd),
+		"_top_k_result":   argFunc0(funcTopKResult),
+		"sin":             mathFunc("sin", math.Sin),
+		"cos":             mathFunc("cos", math.Cos),
+		"tan":             mathFunc("tan", math.Tan),
+		"asin":            mathFunc("asin", math.Asin),
+		"acos":            mathFunc("acos", math.Acos),
+		"atan":            mathFunc("atan", math.Atan),
+		"sinh":            mathFunc("sinh", math.Sinh),
+		"cosh":            mathFunc("cosh", math.Cosh),
+		"tanh":            mathFunc("tanh", math.Tanh),
+		"asinh":           mathFunc("asinh", math.Asinh),
+		"acosh":           mathFunc("acosh", math.Acosh),
+		"atanh":           mathFunc("atanh", math.Atanh),
+		"floor":           mathFunc("floor", math.Floor),
+		"round":           mathFunc("round", math.Round),
+		"nearbyint":       mathFunc("nearbyint", math.RoundToEven),
+		"rint":            mathFunc("rint", math.RoundToEven),
+		"ceil":            mathFunc("ceil", math.Ceil),
+		"trunc":           mathFunc("trunc", math.Trunc),
+		"significand":     mathFunc("significand", funcSignificand),
+		"fabs":            mathFunc("fabs", math.Abs),
+		"sqrt":            mathFunc("sqrt", math.Sqrt),
+		"cbrt":            mathFunc("cbrt", math.Cbrt),
+		"exp":             mathFunc("exp", math.Exp),
+		"exp10":           mathFunc("exp10", funcExp10),
+		"exp2":            mathFunc("exp2", math.Exp2),
+		"expm1":           mathFunc("expm1", math.Expm1),
+		"frexp":           argFunc0(funcFrexp),
+		"modf":            argFunc0(funcModf),
+		"log":             mathFunc("log", math.Log),
+		"log10":           mathFunc("log10", math.Log10),
+		"log1p":           mathFunc("log1p", math.Log1p),
+		"log2":            mathFunc("log2", math.Log2),
+		"logb":            mathFunc("logb", math.Logb),
+		"gamma":           mathFunc("gamma", math.Gamma),
+		"tgamma":          mathFunc("tgamma", math.Gamma),
+		"lgamma":          mathFunc("lgamma", funcLgamma),
+		"erf":             mathFunc("erf", math.Erf),
+		"erfc":            mathFunc("erfc", math.Erfc),
+		"j0":              mathFunc("j0", math.J0),
+		"j1":              mathFunc("j1", math.J1),
+		"y0":              mathFunc("y0", math.Y0),
+		"y1":              mathFunc("y1", math.Y1),
+		"atan2":           mathFunc2("atan2", math.Atan2),
+		"copysign":        mathFunc2("copysign", math.Copysign),
+		"drem":            mathFunc2("drem", funcDrem),
+		"fdim":            mathFunc2("fdim", math.Dim),
+		"fmax":            mathFunc2("fmax", funcFmax),
+		"fmin":            mathFunc2("fmin", funcFmin),
+		"fmod":            mathFunc2("fmod", math.Mod),
+		"hypot":           mathFunc2("hypot", math.Hypot),
+		"jn":              mathFunc2("jn", funcJn),
+		"nextafter":       mathFunc2("nextafter", math.Nextafter),
+		"nexttoward":      mathFunc2("nexttoward", math.Nextafter),
+		"remainder":       mathFunc2("remainder", math.Remainder),
+		"ldexp":           mathFunc2("ldexp", funcLdexp),
+		"scalb":           mathFunc2("scalb", funcLdexp),
+		"scalbln":         mathFunc2("scalbln", funcLdexp),
+		"yn":              mathFunc2("yn", funcYn),
+		"pow":             mathFunc2("pow", math.Pow),
+		"fma":             mathFunc3("fma", math.FMA),
+		"infinite":        argFunc0(funcInfinite),
+		"isfinite":        argFunc0(funcIsfinite),
+		"isinfinite":      argFunc0(funcIsinfinite),
+		"nan":             argFunc0(funcNan),
+		"isnan":           argFunc0(funcIsnan),
+		"isnormal":        argFunc0(funcIsnormal),
+		"setpath":         argFunc2(funcSetpath),
+		"delpaths":        argFunc1(funcDelpaths),
+		"getpath":         argFunc1(funcGetpath),
+		"transpose":       argFunc0(funcTranspose),
+		"bsearch":         argFunc1(funcBsearch),
+		"gmtime":          argFunc0(funcGmtime),
+		"localtime":       argFunc0(funcLocaltime),
+		"mktime":          argFunc0(funcMktime),
+		"strftime":        argFunc1(funcStrftime),
+		"strflocaltime":   argFunc1(funcStrflocaltime),
+		"strptime":        argFunc1(funcStrptime),
+		"now":             argFunc0(funcNow),
+		"_match":          argFunc3(nil),
+		"_captures":       argFunc0(funcCaptures),
+		"error":           {argcount0 | argcount1, false, funcError},
+		"halt":            argFunc0(funcHalt),
+		"halt_error":      {argcount0 | argcount1, false, funcHaltError},
 	}
 }
 
@@ -1249,6 +1253,103 @@ func minMaxBy(vs, xs []any, isMin bool) any {
 
 type sortItem struct {
 	value, key any
+}
+
+// topKState is the accumulator for the streaming top_k_by family. It keeps
+// at most k (value, key) pairs whose keys are the largest seen so far. Items
+// are held in ascending key order with stable, insertion-order ties, so the
+// accumulated state is always identical to sort_by(f) | .[-k:].
+type topKState struct {
+	k       int
+	counter uint64
+	items   []*topKItem
+}
+
+// topKItem pairs a value with its sort key and a monotonic input index so the
+// retained set is ordered by (key, input order), exactly matching
+// sort_by(f) | .[-k:].
+type topKItem struct {
+	value, key any
+	index      uint64
+}
+
+func funcTopKValidate(v any) any {
+	switch n := v.(type) {
+	case int:
+		if n < 0 {
+			return &exitCodeError{value: "top_k doesn't support negative count: " + Preview(v), code: 5}
+		}
+		return &topKState{k: n}
+	case *big.Int:
+		if n.Sign() < 0 {
+			return &exitCodeError{value: "top_k doesn't support negative count: " + Preview(v), code: 5}
+		}
+		if n.IsInt64() {
+			if i := n.Int64(); i <= int64(math.MaxInt) {
+				return &topKState{k: int(i)}
+			}
+		}
+		// A value beyond the platform int bound means "keep everything"; the
+		// state cannot retain more values than the available memory anyway.
+		return &topKState{k: math.MaxInt}
+	case json.Number:
+		return funcTopKValidate(parseNumber(n))
+	case float64:
+		if math.Trunc(n) == n && math.Abs(n) < 1e15 {
+			return &topKState{k: int(n)}
+		}
+		return &exitCodeError{value: "top_k requires an integer count, got: " + Preview(v), code: 5}
+	default:
+		return &exitCodeError{value: "top_k requires an integer count, got: " + Preview(v), code: 5}
+	}
+}
+
+func funcTopKNonzero(v any) any {
+	return v.(*topKState).k != 0
+}
+
+func funcTopKAdd(v, x, key any) any {
+	state := v.(*topKState)
+	if state.k == 0 {
+		return state
+	}
+	item := &topKItem{value: x, key: key, index: state.counter}
+	state.counter++
+	if len(state.items) < state.k {
+		// Insert after all items with an equal key to keep input order.
+		i := len(state.items)
+		for ; i > 0 && lessTopK(item, state.items[i-1]); i-- {
+		}
+		state.items = slices.Insert(state.items, i, item)
+	} else if lessTopK(state.items[0], item) {
+		// The new item is larger than the smallest retained item; drop the
+		// smallest and insert the new item in (key, index) order.
+		state.items = state.items[1:]
+		i := len(state.items)
+		for ; i > 0 && lessTopK(item, state.items[i-1]); i-- {
+		}
+		state.items = slices.Insert(state.items, i, item)
+	}
+	return state
+}
+
+// lessTopK reports whether a sorts strictly before b: keys are compared with
+// the regular jq ordering, ties broken by the earlier input index. Equal
+// keys therefore keep the earlier item, matching stable sort_by semantics.
+func lessTopK(a, b *topKItem) bool {
+	if c := Compare(a.key, b.key); c != 0 {
+		return c < 0
+	}
+	return a.index < b.index
+}
+
+func funcTopKResult(v any) any {
+	items := v.(*topKState).items
+	rs := make([]any, len(items))
+	for i, item := range items {
+		rs[i] = item.value
+	}
+	return rs
 }
 
 func sortItems(name string, v, x any) ([]*sortItem, error) {
