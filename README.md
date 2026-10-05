@@ -57,6 +57,40 @@ of some key:
 
 For more usage examples please see [docs][godoc-url] or package tests.
 
+### Incremental scanning
+
+When the header value arrives in chunks (for example from a streaming
+connection), use `OptionScanner` instead of holding the whole value in
+memory:
+
+```go
+sc := httphead.NewOptionScanner(maxInput, maxOption, func(i int, name, attr, val []byte) httphead.Control {
+    // The slices are borrowed and stay valid only until the next Write or
+    // Finish call; copy them if you need to keep them longer.
+    return httphead.ControlContinue
+})
+
+for {
+    chunk, err := readNextChunk()
+    if err == io.EOF {
+        break
+    }
+    if n, err := sc.Write(chunk); err != nil {
+        // n bytes of chunk were consumed; sc.Consumed() is the absolute
+        // unconsumed position when parsing stopped early.
+        break
+    }
+}
+if err := sc.Finish(); err != nil {
+    // Malformed value, or a quote/comment/LWS was left unterminated.
+}
+```
+
+Tokens, quoted strings (with backslash escaping), comments and separators
+may be split arbitrarily between chunks; structures missing their closing
+byte are carried over instead of being rejected until `Finish`. The scanner
+never retains more than the single option currently being parsed.
+
 [godoc-image]: https://godoc.org/github.com/gobwas/httphead?status.svg
 [godoc-url]: https://godoc.org/github.com/gobwas/httphead
 [travis-image]: https://travis-ci.org/gobwas/httphead.svg?branch=master

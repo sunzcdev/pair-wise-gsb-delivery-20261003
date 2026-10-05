@@ -37,7 +37,7 @@ func ExampleParseOptions() {
 	// Output: [{foo [bar:1]} {baz []}] true
 }
 
-func ExampleParseOptionsLifetime() {
+func ExampleParseOptions_lifetime() {
 	data := []byte(`foo;bar=1,baz`)
 	options, ok := ParseOptions(data, nil)
 	copy(data, []byte(`xxx;yyy=0,zzz`))
