@@ -17,14 +17,16 @@ type env struct {
 	label     int
 	args      [32]any // len(env.args) > maxarity
 	ctx       context.Context
+	budget    *InstructionBudget
 }
 
-func newEnv(ctx context.Context) *env {
+func newEnv(ctx context.Context, budget *InstructionBudget) *env {
 	return &env{
 		stack:  newStack(),
 		paths:  newStack(),
 		scopes: newScopeStack(),
 		ctx:    ctx,
+		budget: budget,
 	}
 }
 

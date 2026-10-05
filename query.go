@@ -35,17 +35,17 @@ type Query struct {
 // Run the query.
 //
 // It is safe to call this method in goroutines, to reuse a parsed [*Query].
-func (e *Query) Run(v any) Iter {
-	return e.RunWithContext(context.Background(), v)
+func (e *Query) Run(v any, options ...RunOption) Iter {
+	return e.RunWithContext(context.Background(), v, options...)
 }
 
 // RunWithContext runs the query with context.
-func (e *Query) RunWithContext(ctx context.Context, v any) Iter {
+func (e *Query) RunWithContext(ctx context.Context, v any, options ...RunOption) Iter {
 	code, err := Compile(e)
 	if err != nil {
 		return NewIter(err)
 	}
-	return code.RunWithContext(ctx, v)
+	return code.RunWithContextOptions(ctx, v, nil, options...)
 }
 
 func (e *Query) String() string {

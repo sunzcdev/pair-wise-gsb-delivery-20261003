@@ -43,12 +43,28 @@ func (c *Code) Run(v any, values ...any) Iter {
 
 // RunWithContext runs the code with context.
 func (c *Code) RunWithContext(ctx context.Context, v any, values ...any) Iter {
+	return c.RunWithContextOptions(ctx, v, values)
+}
+
+// RunWithOptions runs the code with [RunOption]s.
+//
+// It is safe to call this method in goroutines, to reuse a compiled [*Code].
+func (c *Code) RunWithOptions(v any, values []any, options ...RunOption) Iter {
+	return c.RunWithContextOptions(context.Background(), v, values, options...)
+}
+
+// RunWithContextOptions runs the code with context and [RunOption]s.
+func (c *Code) RunWithContextOptions(ctx context.Context, v any, values []any, options ...RunOption) Iter {
 	if len(values) > len(c.variables) {
 		return NewIter(&tooManyVariableValuesError{})
 	} else if len(values) < len(c.variables) {
 		return NewIter(&expectedVariableError{c.variables[len(values)]})
 	}
-	return newEnv(ctx).execute(c, v, values...)
+	o := &runOptions{}
+	for _, option := range options {
+		option(o)
+	}
+	return newEnv(ctx, o.budget).execute(c, v, values...)
 }
 
 type scopeinfo struct {

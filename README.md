@@ -144,6 +144,7 @@ func main() {
       The `halt` function in jq not only stops the iteration, but also terminates the command execution, even if there are still input values.
       So, gojq leaves it up to the library user how to handle the halting error.
   - Note that the result iterator may emit infinite number of values; `repeat(0)` and `range(infinite)`. It may stuck with no output value; `def f: f; f`. Use `RunWithContext` when you want to limit the execution time.
+    - You can also pass [`gojq.RunOption`](https://pkg.go.dev/github.com/itchyny/gojq#RunOption)s to `query.Run` and `query.RunWithContext`. [`gojq.WithInstructionLimit`](https://pkg.go.dev/github.com/itchyny/gojq#WithInstructionLimit) bounds the number of VM instructions of a run; it counts backtracking and recursion, and is not reset for each result. When exhausted, the iterator emits an [`*gojq.InstructionLimitError`](https://pkg.go.dev/github.com/itchyny/gojq#InstructionLimitError), which is not caught by try-catch, and terminates. The internal work of built-in and custom Go functions is not metered; a custom function can consume a shared [`*gojq.InstructionBudget`](https://pkg.go.dev/github.com/itchyny/gojq#InstructionBudget) (via [`gojq.WithInstructionBudget`](https://pkg.go.dev/github.com/itchyny/gojq#WithInstructionBudget) and `Charge`) on its own.
 
 [`gojq.Compile`](https://pkg.go.dev/github.com/itchyny/gojq#Compile) allows to configure the following compiler options.
 

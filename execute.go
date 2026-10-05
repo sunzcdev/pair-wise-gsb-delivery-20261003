@@ -36,6 +36,10 @@ loop:
 			default:
 			}
 		}
+		if env.budget != nil && env.budget.tick() {
+			pc, env.forks = len(env.codes), nil
+			return &InstructionLimitError{limit: env.budget.limit, used: env.budget.used}, true
+		}
 		switch code.op {
 		case opnop:
 			// nop
@@ -90,7 +94,7 @@ loop:
 				case *tryEndError:
 					err = e.err
 					break loop
-				case nil, *breakError, *HaltError:
+				case nil, *breakError, *HaltError, *InstructionLimitError:
 					break loop
 				case ValueError:
 					env.pop()
@@ -114,7 +118,7 @@ loop:
 		case opforkalt:
 			if backtrack {
 				switch err.(type) {
-				case nil, *breakError, *HaltError:
+				case nil, *breakError, *HaltError, *InstructionLimitError:
 					break loop
 				}
 				pc, backtrack, err = code.v.(int), false, nil
@@ -348,6 +352,10 @@ loop:
 		default:
 			panic(code.op)
 		}
+	}
+	if e, ok := err.(*InstructionLimitError); ok {
+		pc, env.forks = len(env.codes), nil
+		return e, true
 	}
 	if len(env.forks) > 0 {
 		pc, backtrack = env.popfork(), true
