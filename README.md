@@ -155,6 +155,53 @@ if err != nil {
 
 If everything succeeds, the value in `parsedToken` will be equivalent to that in `token`.
 
+# Claims Contracts
+A `ClaimsContract` declares the claims a token is allowed to contain, which
+are required, and the JSON type of each one. Contracts are reusable rules:
+they only run after a token has passed cryptographic verification, and they do
+not replace validators such as `IssuedBy`, `ForAudience`, or `NotExpired`.
+
+Supported claim types are strings, booleans, raw JSON numbers (preserved as
+`json.Number`, never coerced through `float64`), integers (checked against the
+original JSON digits, so values beyond `float64` precision cannot silently
+lose precision), arrays, and nested objects.
+
+```go
+contract, err := paseto.NewClaimsContract([]paseto.ObjectField{
+    {Name: "sub", Spec: paseto.RequiredString()},
+    {Name: "admin", Spec: paseto.Boolean()},
+    {Name: "level", Spec: paseto.Integer()},
+    {Name: "roles", Spec: paseto.RequiredArray(paseto.String())},
+    {
+        Name: "meta",
+        Spec: paseto.Object([]paseto.ObjectField{
+            {Name: "org", Spec: paseto.String()},
+        }),
+    },
+}, paseto.RejectUnknownFields())
+if err != nil {
+    // contradictory or invalid contract definition
+}
+
+parser := paseto.NewParserWithoutExpiryCheck()
+parser.AddRule(contract.Rule())
+
+parsedToken, err := parser.ParseV4Local(key, encrypted, nil)
+if err != nil {
+    // errors are *paseto.ClaimError, carrying a Path (e.g. "roles[0]") and
+    // a Kind (ErrClaimMissing, ErrClaimNull, ErrClaimTypeMismatch,
+    // ErrClaimUnknown, ErrClaimTooDeep). Values are not included in error
+    // messages unless paseto.IncludeClaimValues() is enabled.
+}
+```
+
+Unknown claims are permitted by default. Pass `RejectUnknownFields()` to
+reject them; nested objects inherit that policy unless
+`RejectObjectUnknownFields()` or `AllowObjectUnknownFields()` overrides it. A
+required claim which is present but `null` is reported separately from one
+which is missing. To read the validated claims into a struct without losing
+numeric precision, use `contract.Decode(token, &output)`.
+
 # Supported Paseto Versions
 ## Version 4
 Version 4 is fully supported.
