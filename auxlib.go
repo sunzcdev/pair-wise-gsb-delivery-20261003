@@ -287,7 +287,7 @@ func (ls *LState) FindTable(obj *LTable, n string, size int) LValue {
 /* register operations {{{ */
 
 func (ls *LState) RegisterModule(name string, funcs map[string]LGFunction) LValue {
-	tb := ls.FindTable(ls.Get(RegistryIndex).(*LTable), "_LOADED", 1)
+	tb := ls.FindTable(ls.Get(RegistryIndex).(*LTable), loLoadedRegistryKey, 1)
 	mod := ls.GetField(tb, name)
 	if mod.Type() != LTTable {
 		newmod := ls.FindTable(ls.Get(GlobalsIndex).(*LTable), name, len(funcs))

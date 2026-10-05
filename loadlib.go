@@ -56,11 +56,12 @@ func OpenPackage(L *LState) int {
 		L.RawSetInt(loaders, i+1, L.NewFunction(loader))
 	}
 	L.SetField(packagemod, "loaders", loaders)
-	L.SetField(L.Get(RegistryIndex), "_LOADERS", loaders)
+	L.SetField(L.Get(RegistryIndex), loLoadersRegistryKey, loaders)
 
 	loaded := L.NewTable()
 	L.SetField(packagemod, "loaded", loaded)
-	L.SetField(L.Get(RegistryIndex), "_LOADED", loaded)
+	L.SetField(L.Get(RegistryIndex), loLoadedRegistryKey, loaded)
+	L.SetField(L.Get(RegistryIndex), loRequireGraphKey, L.NewTable())
 
 	L.SetField(packagemod, "path", LString(loGetPath(LuaPath, LuaPathDefault)))
 	L.SetField(packagemod, "cpath", emptyLString)

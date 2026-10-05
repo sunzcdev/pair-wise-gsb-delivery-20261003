@@ -359,6 +359,22 @@ m.myfunc()
 print(m.name)
 ```
 
+#### Reloading a module
+
+`ReloadModule` reloads one module through the normal package loaders and
+records `require` edges used to find dependent modules. Pass `false` to replace
+only the target module, or `true` to invalidate modules that depend on it;
+invalidated modules are loaded again when they are next required.
+
+```go
+module, err := L.ReloadModule("mymodule", true)
+```
+
+If reload fails, `package.loaded` and the internal dependency graph are restored
+to their previous state. Side effects other than those two internal structures
+are not rolled back; module code that writes globals, registry values, files, or
+other external state remains responsible for undoing those changes.
+
 #### Calling Lua from Go
 
 ```go

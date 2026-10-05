@@ -483,14 +483,14 @@ func baseXPCall(L *LState) int {
 
 func loModule(L *LState) int {
 	name := L.CheckString(1)
-	loaded := L.GetField(L.Get(RegistryIndex), "_LOADED")
-	tb := L.GetField(loaded, name)
+	loaded := loLoadedTable(L)
+	tb := loaded.RawGetString(name)
 	if _, ok := tb.(*LTable); !ok {
 		tb = L.FindTable(L.Get(GlobalsIndex).(*LTable), name, 1)
 		if tb == LNil {
 			L.RaiseError("name conflict for module: %v", name)
 		}
-		L.SetField(loaded, name, tb)
+		loaded.RawSetString(name, tb)
 	}
 	if L.GetField(tb, "_NAME") == LNil {
 		L.SetField(tb, "_M", tb)
@@ -523,32 +523,102 @@ func loModule(L *LState) int {
 
 var loopdetection = &LUserData{}
 
-func loRequire(L *LState) int {
-	name := L.CheckString(1)
-	loaded := L.GetField(L.Get(RegistryIndex), "_LOADED")
-	lv := L.GetField(loaded, name)
+const (
+	loLoadedRegistryKey  = "_LOADED"
+	loLoadersRegistryKey = "_LOADERS"
+	loRequireGraphKey    = "_REQUIRE_GRAPH"
+)
+
+func loRegistryTable(L *LState, key string, create bool) *LTable {
+	if table, ok := L.G.Registry.RawGetString(key).(*LTable); ok {
+		return table
+	}
+	if !create {
+		return nil
+	}
+	table := L.NewTable()
+	L.G.Registry.RawSetString(key, table)
+	return table
+}
+
+func loLoadedTable(L *LState) *LTable {
+	return loRegistryTable(L, loLoadedRegistryKey, true)
+}
+
+func loRequireGraph(L *LState) *LTable {
+	return loRegistryTable(L, loRequireGraphKey, true)
+}
+
+func loRecordRequireDependency(L *LState, name string) {
+	if len(L.requireStack) == 0 {
+		return
+	}
+	parent := L.requireStack[len(L.requireStack)-1]
+	if parent == name {
+		return
+	}
+	graph := loRequireGraph(L)
+	dependencies, ok := graph.RawGetString(parent).(*LTable)
+	if !ok {
+		dependencies = L.NewTable()
+		graph.RawSetString(parent, dependencies)
+	}
+	dependencies.RawSetString(name, LTrue)
+}
+
+func loRequireCycle(L *LState, name string) []string {
+	for i, module := range L.requireStack {
+		if module == name {
+			cycle := make([]string, 0, len(L.requireStack)-i+1)
+			cycle = append(cycle, L.requireStack[i:]...)
+			return append(cycle, name)
+		}
+	}
+	return nil
+}
+
+func loadModule(L *LState, name string) (LValue, error) {
+	loaded := loLoadedTable(L)
+	lv := loaded.RawGetString(name)
 	if LVAsBool(lv) {
 		if lv == loopdetection {
-			L.RaiseError("loop or previous error loading module: %s", name)
+			if cycle := loRequireCycle(L, name); cycle != nil {
+				return nil, newApiErrorS(ApiErrorRun, "circular require detected: "+strings.Join(cycle, " -> "))
+			}
+			return nil, newApiErrorS(ApiErrorRun, "loop or previous error loading module: "+name)
 		}
-		L.Push(lv)
-		return 1
+		return lv, nil
 	}
-	loaders, ok := L.GetField(L.Get(RegistryIndex), "_LOADERS").(*LTable)
-	if !ok {
-		L.RaiseError("package.loaders must be a table")
+	if cycle := loRequireCycle(L, name); cycle != nil {
+		return nil, newApiErrorS(ApiErrorRun, "circular require detected: "+strings.Join(cycle, " -> "))
 	}
+
+	loaders := loRegistryTable(L, loLoadersRegistryKey, false)
+	if loaders == nil {
+		return nil, newApiErrorS(ApiErrorRun, "package.loaders must be a table")
+	}
+
+	stackIndex := len(L.requireStack)
+	L.requireStack = append(L.requireStack, name)
+	defer func() {
+		L.requireStack = L.requireStack[:stackIndex]
+	}()
+
 	messages := []string{}
 	var modasfunc LValue
 	for i := 1; ; i++ {
-		loader := L.RawGetInt(loaders, i)
+		loader := loaders.RawGetInt(i)
 		if loader == LNil {
-			L.RaiseError("module %s not found:\n\t%s, ", name, strings.Join(messages, "\n\t"))
+			return nil, newApiErrorS(ApiErrorRun, fmt.Sprintf("module %s not found:\n\t%s, ", name, strings.Join(messages, "\n\t")))
 		}
+
 		L.Push(loader)
 		L.Push(LString(name))
-		L.Call(1, 1)
-		ret := L.reg.Pop()
+		if err := L.PCall(1, 1, nil); err != nil {
+			return nil, err
+		}
+		ret := L.Get(-1)
+		L.Pop(1)
 		switch retv := ret.(type) {
 		case *LFunction:
 			modasfunc = retv
@@ -558,21 +628,43 @@ func loRequire(L *LState) int {
 		}
 	}
 loopbreak:
-	L.SetField(loaded, name, loopdetection)
+
+	graph := loRequireGraph(L)
+	previousDependencies := graph.RawGetString(name)
+	graph.RawSetString(name, L.NewTable())
+
+	loaded.RawSetString(name, loopdetection)
 	L.Push(modasfunc)
 	L.Push(LString(name))
-	L.Call(1, 1)
-	ret := L.reg.Pop()
-	modv := L.GetField(loaded, name)
-	if ret != LNil && modv == loopdetection {
-		L.SetField(loaded, name, ret)
-		L.Push(ret)
-	} else if modv == loopdetection {
-		L.SetField(loaded, name, LTrue)
-		L.Push(LTrue)
-	} else {
-		L.Push(modv)
+	if err := L.PCall(1, 1, nil); err != nil {
+		graph.RawSetString(name, previousDependencies)
+		return nil, err
 	}
+	ret := L.Get(-1)
+	L.Pop(1)
+
+	modv := loaded.RawGetString(name)
+	if ret != LNil && modv == loopdetection {
+		loaded.RawSetString(name, ret)
+		return ret, nil
+	} else if modv == loopdetection {
+		loaded.RawSetString(name, LTrue)
+		return LTrue, nil
+	}
+	return modv, nil
+}
+
+func loRequire(L *LState) int {
+	name := L.CheckString(1)
+	loRecordRequireDependency(L, name)
+	modv, err := loadModule(L, name)
+	if err != nil {
+		if apiErr, ok := err.(*ApiError); ok {
+			panic(apiErr)
+		}
+		L.RaiseError("%s", err.Error())
+	}
+	L.Push(modv)
 	return 1
 }
 
