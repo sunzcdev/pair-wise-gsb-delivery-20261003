@@ -136,6 +136,22 @@ func TestLoadBadConfigs(t *testing.T) {
 			input: "testdata/invalid-grpc-check-revoked-without-tls.yml",
 			want:  `error parsing config file: check_revoked cannot be used when tls is false`,
 		},
+		{
+			input: "testdata/invalid-http-scenario-no-steps.yml",
+			want:  `error parsing config file: at least one step must be set for HTTP scenario`,
+		},
+		{
+			input: "testdata/invalid-http-scenario-undefined-variable.yml",
+			want:  `error parsing config file: step "fetch" references variable "token" which is not extracted by any earlier step`,
+		},
+		{
+			input: "testdata/invalid-http-scenario-duplicate-variable.yml",
+			want:  `error parsing config file: variable "token" is extracted more than once in HTTP scenario`,
+		},
+		{
+			input: "testdata/invalid-http-scenario-too-many-steps.yml",
+			want:  `error parsing config file: HTTP scenario has 21 steps, but at most 20 are allowed`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {

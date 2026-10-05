@@ -1,0 +1,18 @@
+modules:
+  http_scenario_duplicate_variable:
+    prober: http_scenario
+    timeout: 5s
+    http_scenario:
+      steps:
+      - name: login
+        url: "http://example.com/login"
+        extract:
+        - name: token
+          source: body
+          regexp: "token=(.+)"
+      - name: again
+        url: "http://example.com/again"
+        extract:
+        - name: token
+          source: header
+          key: X-Token

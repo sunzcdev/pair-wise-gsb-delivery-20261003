@@ -1,0 +1,6 @@
+modules:
+  http_scenario_no_steps:
+    prober: http_scenario
+    timeout: 5s
+    http_scenario:
+      steps: []

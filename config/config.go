@@ -44,12 +44,13 @@ import (
 var (
 	// DefaultModule set default configuration for the Module
 	DefaultModule = Module{
-		HTTP:      DefaultHTTPProbe,
-		TCP:       DefaultTCPProbe,
-		ICMP:      DefaultICMPProbe,
-		DNS:       DefaultDNSProbe,
-		Unix:      DefaultUnixProbe,
-		Websocket: DefaultWebsocketProbe,
+		HTTP:         DefaultHTTPProbe,
+		HTTPScenario: DefaultHTTPScenarioProbe,
+		TCP:          DefaultTCPProbe,
+		ICMP:         DefaultICMPProbe,
+		DNS:          DefaultDNSProbe,
+		Unix:         DefaultUnixProbe,
+		Websocket:    DefaultWebsocketProbe,
 	}
 
 	// DefaultHTTPProbe set default value for HTTPProbe
@@ -89,7 +90,18 @@ var (
 	DefaultWebsocketProbe = WebsocketProbe{
 		IPProtocolFallback: true,
 	}
+
+	// DefaultHTTPScenarioProbe set default value for HTTPScenarioProbe
+	DefaultHTTPScenarioProbe = HTTPScenarioProbe{
+		HTTPClientConfig: config.DefaultHTTPClientConfig,
+	}
 )
+
+// MaxHTTPScenarioSteps bounds the number of steps a single HTTP
+// scenario may contain. Scenarios are meant to be short health-check
+// sequences (e.g. obtain a token, then query a protected resource),
+// not full test suites.
+const MaxHTTPScenarioSteps = 20
 
 type Config struct {
 	Modules map[string]Module `yaml:"modules" json:"modules"`
@@ -294,15 +306,16 @@ func MustNewRegexp(s string) Regexp {
 }
 
 type Module struct {
-	Prober    string         `yaml:"prober,omitempty" json:"prober,omitempty"`
-	Timeout   time.Duration  `yaml:"timeout,omitempty" json:"timeout,omitempty"`
-	HTTP      HTTPProbe      `yaml:"http,omitempty" json:"http,omitzero"`
-	TCP       TCPProbe       `yaml:"tcp,omitempty" json:"tcp,omitzero"`
-	ICMP      ICMPProbe      `yaml:"icmp,omitempty" json:"icmp,omitzero"`
-	DNS       DNSProbe       `yaml:"dns,omitempty" json:"dns,omitzero"`
-	GRPC      GRPCProbe      `yaml:"grpc,omitempty" json:"grpc,omitzero"`
-	Unix      UnixProbe      `yaml:"unix,omitempty" json:"unix,omitzero"`
-	Websocket WebsocketProbe `yaml:"websocket,omitempty" json:"websocket,omitzero"`
+	Prober       string            `yaml:"prober,omitempty" json:"prober,omitempty"`
+	Timeout      time.Duration     `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	HTTP         HTTPProbe         `yaml:"http,omitempty" json:"http,omitzero"`
+	HTTPScenario HTTPScenarioProbe `yaml:"http_scenario,omitempty" json:"http_scenario,omitzero"`
+	TCP          TCPProbe          `yaml:"tcp,omitempty" json:"tcp,omitzero"`
+	ICMP         ICMPProbe         `yaml:"icmp,omitempty" json:"icmp,omitzero"`
+	DNS          DNSProbe          `yaml:"dns,omitempty" json:"dns,omitzero"`
+	GRPC         GRPCProbe         `yaml:"grpc,omitempty" json:"grpc,omitzero"`
+	Unix         UnixProbe         `yaml:"unix,omitempty" json:"unix,omitzero"`
+	Websocket    WebsocketProbe    `yaml:"websocket,omitempty" json:"websocket,omitzero"`
 }
 
 type HTTPProbe struct {
@@ -330,6 +343,52 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+}
+
+// HTTPScenarioProbe describes a multi-step HTTP health check. Steps run
+// sequentially against the probe target; each step may validate the
+// response and extract variables that later steps can reference.
+type HTTPScenarioProbe struct {
+	Steps            []ScenarioStep          `yaml:"steps,omitempty" json:"steps,omitempty"`
+	HTTPClientConfig config.HTTPClientConfig `yaml:"http_client_config,inline" json:"http_client_config,omitzero"`
+}
+
+// ScenarioStep is a single HTTP request inside a scenario.
+//
+// URL, Headers and Body may reference variables extracted by earlier
+// steps using the `${name}` syntax. Values are encoded according to
+// the position they are interpolated into: percent-encoded in URLs,
+// rejected when containing CR/LF in headers, and inserted verbatim in
+// the body.
+type ScenarioStep struct {
+	Name                       string            `yaml:"name,omitempty" json:"name,omitempty"`
+	URL                        string            `yaml:"url,omitempty" json:"url,omitempty"`
+	Method                     string            `yaml:"method,omitempty" json:"method,omitempty"`
+	Headers                    map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	Body                       string            `yaml:"body,omitempty" json:"body,omitempty"`
+	ValidStatusCodes           []int             `yaml:"valid_status_codes,omitempty" json:"valid_status_codes,omitempty"`
+	FailIfBodyMatchesRegexp    []Regexp          `yaml:"fail_if_body_matches_regexp,omitempty" json:"fail_if_body_matches_regexp,omitempty"`
+	FailIfBodyNotMatchesRegexp []Regexp          `yaml:"fail_if_body_not_matches_regexp,omitempty" json:"fail_if_body_not_matches_regexp,omitempty"`
+	FailIfHeaderMatchesRegexp  []HeaderMatch     `yaml:"fail_if_header_matches,omitempty" json:"fail_if_header_matches,omitempty"`
+	Extract                    []ScenarioExtract `yaml:"extract,omitempty" json:"extract,omitempty"`
+}
+
+// ScenarioExtract describes how to capture a variable from a step's
+// response for use by later steps.
+type ScenarioExtract struct {
+	// Name of the variable later steps reference as `${name}`.
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	// Source of the value: "body", "header" or "cookie".
+	Source string `yaml:"source,omitempty" json:"source,omitempty"`
+	// Key is the header or cookie name for those sources.
+	Key string `yaml:"key,omitempty" json:"key,omitempty"`
+	// Regexp extracts the value; the first capture group is used when
+	// present, otherwise the whole match. Required for body, optional
+	// for header and cookie (defaults to the whole value).
+	Regexp Regexp `yaml:"regexp,omitempty" json:"regexp,omitzero"`
+	// Secret values are never written to logs or metric labels and are
+	// only sent back to the origin they were captured from.
+	Secret bool `yaml:"secret,omitempty" json:"secret,omitempty"`
 }
 
 type GRPCProbe struct {
@@ -436,7 +495,7 @@ func (s *Module) UnmarshalYAML(unmarshal func(any) error) error {
 		return err
 	}
 	switch s.Prober {
-	case "http", "tcp", "icmp", "dns", "grpc", "unix", "websocket":
+	case "http", "http_scenario", "tcp", "icmp", "dns", "grpc", "unix", "websocket":
 		// valid
 		return nil
 	default:
@@ -505,6 +564,93 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 
 	return nil
+}
+
+// ScenarioVariableRefRegexp matches `${name}` variable references in
+// scenario step URL, header and body templates.
+var ScenarioVariableRefRegexp = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+var scenarioVariableNameRegexp = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// UnmarshalYAML implements the yaml.Unmarshaler interface.
+func (s *HTTPScenarioProbe) UnmarshalYAML(unmarshal func(any) error) error {
+	*s = DefaultHTTPScenarioProbe
+	type plain HTTPScenarioProbe
+	if err := unmarshal((*plain)(s)); err != nil {
+		return err
+	}
+
+	if err := s.HTTPClientConfig.Validate(); err != nil {
+		return err
+	}
+
+	if len(s.Steps) == 0 {
+		return errors.New("at least one step must be set for HTTP scenario")
+	}
+	if len(s.Steps) > MaxHTTPScenarioSteps {
+		return fmt.Errorf("HTTP scenario has %d steps, but at most %d are allowed", len(s.Steps), MaxHTTPScenarioSteps)
+	}
+
+	stepNames := map[string]bool{}
+	definedVars := map[string]bool{}
+	for i := range s.Steps {
+		step := &s.Steps[i]
+		if step.Name == "" {
+			return fmt.Errorf("step %d of HTTP scenario has no name", i+1)
+		}
+		if stepNames[step.Name] {
+			return fmt.Errorf("duplicate step name %q in HTTP scenario", step.Name)
+		}
+		stepNames[step.Name] = true
+
+		// Variable references must be produced by an earlier step, so
+		// that a scenario cannot depend on values that never exist.
+		var refs []string
+		refs = append(refs, FindScenarioVariableRefs(step.URL)...)
+		refs = append(refs, FindScenarioVariableRefs(step.Body)...)
+		for _, v := range step.Headers {
+			refs = append(refs, FindScenarioVariableRefs(v)...)
+		}
+		for _, ref := range refs {
+			if !definedVars[ref] {
+				return fmt.Errorf("step %q references variable %q which is not extracted by any earlier step", step.Name, ref)
+			}
+		}
+
+		for _, extract := range step.Extract {
+			if !scenarioVariableNameRegexp.MatchString(extract.Name) {
+				return fmt.Errorf("step %q extracts variable with invalid name %q", step.Name, extract.Name)
+			}
+			if definedVars[extract.Name] {
+				return fmt.Errorf("variable %q is extracted more than once in HTTP scenario", extract.Name)
+			}
+			switch extract.Source {
+			case "body":
+				if extract.Regexp.Regexp == nil {
+					return fmt.Errorf("step %q extracts variable %q from body without a regexp", step.Name, extract.Name)
+				}
+			case "header", "cookie":
+				if extract.Key == "" {
+					return fmt.Errorf("step %q extracts variable %q from %s without a key", step.Name, extract.Name, extract.Source)
+				}
+			default:
+				return fmt.Errorf("step %q extracts variable %q from invalid source %q (must be body, header or cookie)", step.Name, extract.Name, extract.Source)
+			}
+			definedVars[extract.Name] = true
+		}
+	}
+
+	return nil
+}
+
+// FindScenarioVariableRefs returns the names of all `${name}` variable
+// references in a scenario template.
+func FindScenarioVariableRefs(template string) []string {
+	var refs []string
+	for _, m := range ScenarioVariableRefRegexp.FindAllStringSubmatch(template, -1) {
+		refs = append(refs, m[1])
+	}
+	return refs
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.

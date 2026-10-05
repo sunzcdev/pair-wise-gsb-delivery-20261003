@@ -1,0 +1,48 @@
+modules:
+  http_scenario_too_many_steps:
+    prober: http_scenario
+    timeout: 5s
+    http_scenario:
+      steps:
+      - name: step1
+        url: "http://example.com/"
+      - name: step2
+        url: "http://example.com/"
+      - name: step3
+        url: "http://example.com/"
+      - name: step4
+        url: "http://example.com/"
+      - name: step5
+        url: "http://example.com/"
+      - name: step6
+        url: "http://example.com/"
+      - name: step7
+        url: "http://example.com/"
+      - name: step8
+        url: "http://example.com/"
+      - name: step9
+        url: "http://example.com/"
+      - name: step10
+        url: "http://example.com/"
+      - name: step11
+        url: "http://example.com/"
+      - name: step12
+        url: "http://example.com/"
+      - name: step13
+        url: "http://example.com/"
+      - name: step14
+        url: "http://example.com/"
+      - name: step15
+        url: "http://example.com/"
+      - name: step16
+        url: "http://example.com/"
+      - name: step17
+        url: "http://example.com/"
+      - name: step18
+        url: "http://example.com/"
+      - name: step19
+        url: "http://example.com/"
+      - name: step20
+        url: "http://example.com/"
+      - name: step21
+        url: "http://example.com/"

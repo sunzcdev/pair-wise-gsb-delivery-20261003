@@ -55,7 +55,7 @@ then a single address is selected to test, using the following logic:
 ### `<module>`
 ```yml
 
-  # The protocol over which the probe will take place (http, tcp, dns, icmp, grpc, unix).
+  # The protocol over which the probe will take place (http, http_scenario, tcp, dns, icmp, grpc, unix, websocket).
   prober: <prober_string>
 
   # How long the probe will wait before giving up.
@@ -63,6 +63,7 @@ then a single address is selected to test, using the following logic:
 
   # The specific probe configuration - at most one of these should be specified.
   [ http: <http_probe> ]
+  [ http_scenario: <http_scenario_probe> ]
   [ tcp: <tcp_probe> ]
   [ dns: <dns_probe> ]
   [ icmp: <icmp_probe> ]
@@ -225,6 +226,87 @@ then a single address is selected to test, using the following logic:
 header: <string>,
 regexp: <regex>,
 [ allow_missing: <boolean> | default = false ]
+```
+
+### `<http_scenario_probe>`
+
+An HTTP scenario is a short sequence of HTTP steps executed within a
+single probe, for example obtaining a temporary cookie or token and
+then accessing a resource that requires it. A scenario may contain at
+most 20 steps.
+
+Cookies are kept in a cookie jar that is created for each probe run and
+discarded afterwards; the same applies to extracted variables. Nothing
+is shared between probes.
+
+Each step may extract variables from the response which later steps
+reference with the `${name}` syntax in their URL, headers or body.
+Values are encoded according to the position they are interpolated
+into: percent-encoded in URLs, rejected when containing CR/LF in
+headers, and inserted verbatim in bodies.
+
+Variables extracted with `secret: true` are never written to logs or
+metric labels. A secret is only sent back to the origin
+(scheme://host:port) it was captured from: if a later step targeting a
+different origin references it, the step fails before any request is
+made. Cookies follow the standard RFC 6265 scoping rules of the cookie
+jar.
+
+```yml
+# The steps of the scenario, executed in order. At most 20 steps.
+steps:
+  # Name of the step, used in logs and in the
+  # probe_http_scenario_step_* metrics to identify the failing step.
+- name: <string>
+
+  # URL of the request. May be absolute, or relative to the probe
+  # target. Defaults to the probe target. May reference variables.
+  [ url: <string> ]
+
+  # HTTP method of the request.
+  [ method: <string> | default = "GET" ]
+
+  # Headers to send. Values may reference variables.
+  [ headers: [ <string>: <string> ... ] ]
+
+  # Request body. May reference variables.
+  [ body: <string> ]
+
+  # Accepted status codes for this step. Defaults to 2xx.
+  [ valid_status_codes: [<int>, ...] | default = 2xx ]
+
+  # List of regular expressions; the step fails if the body matches any.
+  [ fail_if_body_matches_regexp: [<regex>, ...] ]
+
+  # List of regular expressions; the step fails if the body does not match any.
+  [ fail_if_body_not_matches_regexp: [<regex>, ...] ]
+
+  # List of header match specifications; the step fails if a header matches.
+  [ fail_if_header_matches: [<http_header_match_spec>, ...] ]
+
+  # Variables to extract from the response for later steps.
+  extract:
+    # Name of the variable, referenced as `${name}` by later steps.
+  - name: <string>
+
+    # Where to extract the value from: body, header or cookie.
+    source: <string>
+
+    # Header or cookie name. Required for those sources.
+    [ key: <string> ]
+
+    # Regular expression applied to the source; the first capture
+    # group is used when present, otherwise the whole match. Required
+    # for the body source, optional for header and cookie.
+    [ regexp: <regex> ]
+
+    # Secret values never appear in logs or metric labels and are only
+    # sent back to the origin they were captured from.
+    [ secret: <boolean> | default = false ]
+
+# The HTTP client configuration of the scenario probe, see
+# https://prometheus.io/docs/alerting/latest/configuration/#http_config
+[ http_client_config: <http_config> ]
 ```
 
 ### `<tcp_probe>`

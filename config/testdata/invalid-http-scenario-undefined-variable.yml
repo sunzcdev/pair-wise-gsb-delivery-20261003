@@ -1,0 +1,12 @@
+modules:
+  http_scenario_undefined_variable:
+    prober: http_scenario
+    timeout: 5s
+    http_scenario:
+      steps:
+      - name: login
+        url: "http://example.com/login"
+      - name: fetch
+        url: "http://example.com/protected"
+        headers:
+          X-Token: "${token}"

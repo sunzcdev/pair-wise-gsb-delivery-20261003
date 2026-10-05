@@ -78,6 +78,25 @@ modules:
       - header: Access-Control-Allow-Origin
         regexp: '(\*|example\.com)'
         allow_missing: false
+  http_scenario_login:
+    prober: http_scenario
+    timeout: 10s
+    http_scenario:
+      steps:
+      - name: login
+        url: "http://example.com/login"
+        method: POST
+        body: "user=healthcheck"
+        extract:
+        - name: token
+          source: body
+          regexp: "token=([^&]+)"
+          secret: true
+      - name: fetch_protected
+        url: "http://example.com/protected"
+        headers:
+          X-Token: "${token}"
+        fail_if_body_not_matches_regexp: ["ok"]
   grpc_health:
     prober: grpc
     grpc:
