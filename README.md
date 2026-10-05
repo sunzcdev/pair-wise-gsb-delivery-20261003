@@ -222,6 +222,42 @@ fmt.Println(string(b))
 
 [marshal]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Marshal
 
+#### Dynamic layout
+
+The `inline` and `multiline` struct tags only apply to named struct fields;
+they cannot target the entries of a dynamically keyed map or pick a layout
+per array element. [`Encoder.SetLayoutFunc`][layout-func] installs a callback
+that receives the key path (with array indices) of every table and array
+value and chooses how it is rendered:
+
+```go
+var buf bytes.Buffer
+enc := toml.NewEncoder(&buf).
+    SetLayoutFunc(func(path []toml.LayoutStep) (toml.Layout, error) {
+        // Render any table under "metadata" as an inline table, and put
+        // each element of a "tags" array on its own line.
+        for _, step := range path {
+            if step.Key == "metadata" {
+                return toml.InlineTable(), nil
+            }
+            if step.Key == "tags" {
+                return toml.MultilineArray(), nil
+            }
+        }
+        return toml.Layout{}, nil // leave the choice to global options
+    })
+```
+
+`toml.HeaderTable()` and `toml.SinglelineArray()` force the opposite outcome,
+overriding `SetTablesInline(true)`/`SetArraysMultiline(true)` for a single
+path. The callback only changes presentation, never the encoded value. The
+priority, strongest first, is: struct tags, the layout callback, then the
+global `SetTablesInline`/`SetArraysMultiline` options. Invalid combinations
+(such as an inline document root or a `[table]` header requested inside an
+inline table) fail the encode with an error naming the path.
+
+[layout-func]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Encoder.SetLayoutFunc
+
 ## Unstable API
 
 This API does not yet follow the backward compatibility guarantees of this
