@@ -1,6 +1,10 @@
 package gojq
 
-import "strconv"
+import (
+	"math"
+	"strconv"
+	"strings"
+)
 
 // ValueError is an interface for errors with a value for internal function.
 // Return an error implementing this interface when you want to catch error
@@ -259,6 +263,41 @@ type zeroModuloError struct {
 
 func (err *zeroModuloError) Error() string {
 	return "cannot modulo " + typeErrorPreview(err.l) + " by: " + typeErrorPreview(err.r)
+}
+
+type nonFiniteNumberError struct {
+	source string
+	value  float64
+	path   []any
+}
+
+func (err *nonFiniteNumberError) Error() string {
+	var s string
+	switch {
+	case math.IsNaN(err.value):
+		s = "NaN"
+	case math.IsInf(err.value, 1):
+		s = "+Infinity"
+	default:
+		s = "-Infinity"
+	}
+	if len(err.path) > 0 {
+		var b strings.Builder
+		for _, p := range err.path {
+			b.WriteByte('.')
+			switch p := p.(type) {
+			case string:
+				b.WriteString(strconv.Quote(p))
+			default:
+				b.WriteString(Preview(p))
+			}
+		}
+		s += " at " + b.String()
+	}
+	if err.source == "" {
+		return "cannot produce a non-finite number (" + s + ")"
+	}
+	return err.source + " produced a non-finite number (" + s + ")"
 }
 
 type formatNotFoundError struct {

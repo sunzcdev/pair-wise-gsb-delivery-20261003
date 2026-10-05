@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type compiler struct {
 	variables     []string
 	customFuncs   map[string]function
 	inputIter     Iter
+	strictNumbers bool
 	codes         []*code
 	codeinfos     []codeinfo
 	builtinScope  *scopeinfo
@@ -825,7 +827,13 @@ func (c *compiler) compileTerm(e *Term) error {
 	case TermTypeArray:
 		return c.compileArray(e.Array)
 	case TermTypeNumber:
-		c.append(&code{op: opconst, v: toNumber(e.Number)})
+		v := toNumber(e.Number)
+		if c.strictNumbers {
+			if f, ok := v.(float64); ok && (math.IsNaN(f) || math.IsInf(f, 0)) {
+				return &nonFiniteNumberError{source: "number literal", value: f}
+			}
+		}
+		c.append(&code{op: opconst, v: v})
 		return nil
 	case TermTypeUnary:
 		return c.compileUnary(e.Unary)
@@ -1007,8 +1015,12 @@ func (c *compiler) compileFunc(e *Func) error {
 		}
 	}
 	if fn, ok := c.customFuncs[e.Name]; ok && fn.accept(len(e.Args)) {
+		callback := fn.callback
+		if c.strictNumbers {
+			callback = c.strictCallback(e.Name, callback)
+		}
 		if err := c.compileCallInternal(
-			[3]any{fn.callback, len(e.Args), e.Name},
+			[3]any{callback, len(e.Args), e.Name},
 			e.Args,
 			true,
 			-1,
@@ -1540,8 +1552,12 @@ func (c *compiler) compileCall(name string, args []*Query) error {
 	default:
 		indexing = -1
 	}
+	callback := fn.callback
+	if c.strictNumbers {
+		callback = c.strictCallback(name, callback)
+	}
 	if err := c.compileCallInternal(
-		[3]any{fn.callback, len(args), name},
+		[3]any{callback, len(args), name},
 		args,
 		true,
 		indexing,
@@ -1556,6 +1572,29 @@ func (c *compiler) compileCall(name string, args []*Query) error {
 
 func (c *compiler) compileCallPc(fn *funcinfo, args []*Query) error {
 	return c.compileCallInternal(fn.pc, args, false, -1)
+}
+
+// strictCallback wraps an internal function callback so that non-finite
+// numbers (NaN or infinities) in its result are reported as errors at the
+// function boundary, instead of being normalized later by the JSON encoder.
+// Iterator callbacks are wrapped to check each emitted value.
+func (c *compiler) strictCallback(
+	name string, callback func(any, []any) any,
+) func(any, []any) any {
+	source := name
+	if source != "" && source[0] == '_' {
+		source = source[1:]
+	}
+	return func(v any, args []any) any {
+		w := callback(v, args)
+		if e, ok := w.(error); ok {
+			return e
+		}
+		if iter, ok := w.(Iter); ok {
+			return &strictIter{iter: iter, source: source}
+		}
+		return strictNumberCheck(source, w)
+	}
 }
 
 func (c *compiler) compileCallInternal(

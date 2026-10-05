@@ -1,4 +1,7 @@
 # Changelog
+## Unreleased
+* implement strict number mode (`--strict-numbers` flag and `WithStrictNumbers` compiler option) to emit an error when arithmetic operations, math builtins, or custom functions produce NaN or infinities, instead of normalizing them at JSON output
+
 ## [v0.12.19](https://github.com/itchyny/gojq/compare/v0.12.18..v0.12.19) (2026-04-01)
 * fix `gsub` and `sub` when the replacement emits multiple values
 * fix `fmax`, `fmin`, `modf` functions against NaN and infinities

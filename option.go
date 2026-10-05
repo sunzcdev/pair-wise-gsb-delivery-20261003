@@ -94,3 +94,19 @@ func WithInputIter(inputIter Iter) CompilerOption {
 		c.inputIter = inputIter
 	}
 }
+
+// WithStrictNumbers is a compiler option to enable the strict number mode.
+// In this mode, producing NaN or infinities by arithmetic operators and
+// internal functions (including functions added by [WithFunction] and
+// [WithIterFunction]) raises an error at the operation boundary; the error
+// is a regular jq error, so it can be caught by try-catch. Values returned
+// from custom functions are recursively checked, including values nested in
+// arrays and objects. Integers keep their exactness in this mode; int and
+// *big.Int values are never converted to float64. Note that non-finite
+// numbers passed as input values are not checked; the mode only affects
+// values produced while running the query.
+func WithStrictNumbers() CompilerOption {
+	return func(c *compiler) {
+		c.strictNumbers = true
+	}
+}

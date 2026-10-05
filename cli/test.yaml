@@ -9223,3 +9223,136 @@
   error: |
     unknown flag `--qqq'
   exit_code: 2
+
+- name: strict numbers default mode keeps jq compatibility
+  args:
+    - -c
+    - 'nan, infinite, -infinite, 1e308*10, infinite-infinite, {a: nan}'
+  input: 'null'
+  expected: |
+    null
+    1.7976931348623157e+308
+    -1.7976931348623157e+308
+    1.7976931348623157e+308
+    null
+    {"a":null}
+
+- name: strict numbers nan literal
+  args:
+    - -c
+    - --strict-numbers
+    - 'nan'
+  input: 'null'
+  error: |
+    nan produced a non-finite number (NaN)
+  exit_code: 5
+
+- name: strict numbers infinite literal
+  args:
+    - --strict-numbers
+    - 'infinite, 1'
+  input: 'null'
+  error: |
+    infinite produced a non-finite number (+Infinity)
+  exit_code: 5
+
+- name: strict numbers arithmetic overflow multiply
+  args:
+    - -c
+    - --strict-numbers
+    - 'try (1e308*10) catch .'
+  input: 'null'
+  expected: |
+    "multiply produced a non-finite number (+Infinity)"
+
+- name: strict numbers division overflow
+  args:
+    - -c
+    - --strict-numbers
+    - 'try (1e308/1e-308) catch .'
+  input: 'null'
+  expected: |
+    "divide produced a non-finite number (+Infinity)"
+
+- name: strict numbers negative infinity
+  args:
+    - -c
+    - --strict-numbers
+    - 'try ((-1e308)*10) catch .'
+  input: 'null'
+  expected: |
+    "multiply produced a non-finite number (-Infinity)"
+
+- name: strict numbers math builtin
+  args:
+    - -c
+    - --strict-numbers
+    - 'try (-1 | sqrt) catch .'
+  input: 'null'
+  expected: |
+    "sqrt produced a non-finite number (NaN)"
+
+- name: strict numbers pow builtin
+  args:
+    - -c
+    - --strict-numbers
+    - 'try pow(1000; 1000) catch .'
+  input: 'null'
+  expected: |
+    "pow produced a non-finite number (+Infinity)"
+
+- name: strict numbers caught error does not halt
+  args:
+    - -c
+    - --strict-numbers
+    - 'try (1e308*10) catch "caught", 2'
+  input: 'null'
+  expected: |
+    "caught"
+    2
+
+- name: strict numbers number literal overflow
+  args:
+    - --strict-numbers
+    - '1e1000'
+  input: 'null'
+  error: |
+    compile error: number literal produced a non-finite number (+Infinity)
+  exit_code: 3
+
+- name: strict numbers big integers stay exact
+  args:
+    - -c
+    - --strict-numbers
+    - '1000000000000000000000000000000 as $b | [$b*$b, ($b+1)/1, $b%7]'
+  input: 'null'
+  expected: |
+    [1000000000000000000000000000000000000000000000000000000000000,1000000000000000000000000000001,1]
+
+- name: strict numbers normal results pass
+  args:
+    - -c
+    - --strict-numbers
+    - '[1.5|floor, 2.0, null, true, "x", 1e300+0]'
+  input: 'null'
+  expected: |
+    [1,2,null,true,"x",1e+300]
+
+- name: strict numbers input non-finite passes through
+  args:
+    - -c
+    - --strict-numbers
+    - '. | type'
+  input: '1e1000'
+  expected: |
+    "number"
+
+- name: strict numbers input non-finite arithmetic errors
+  args:
+    - -c
+    - --strict-numbers
+    - '. + 0'
+  input: '1e1000'
+  error: |
+    add produced a non-finite number (+Infinity)
+  exit_code: 5
