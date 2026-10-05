@@ -157,3 +157,16 @@ type ListerAt interface {
 type TransferError interface {
 	TransferError(err error)
 }
+
+// FileSyncer is an optional interface that the io.WriterAt returned by
+// FileWriter and OpenFileWriter handlers can implement to support the
+// fsync@openssh.com extension.
+//
+// When an fsync request is received, all the write requests received
+// before it on the same handle are completed first, then Sync is called
+// and its result is reported back to the client.
+// If the returned writer does not implement this interface, fsync
+// requests fail with an sshFxOPUnsupported status error.
+type FileSyncer interface {
+	Sync() error
+}

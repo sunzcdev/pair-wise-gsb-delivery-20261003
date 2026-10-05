@@ -1343,6 +1343,8 @@ func (p *sshFxpExtendedPacket) UnmarshalBinary(b []byte) error {
 		p.SpecificPacket = &sshFxpExtendedPacketPosixRename{}
 	case "hardlink@openssh.com":
 		p.SpecificPacket = &sshFxpExtendedPacketHardlink{}
+	case "fsync@openssh.com":
+		p.SpecificPacket = &sshFxpExtendedPacketFsync{}
 	default:
 		return fmt.Errorf("packet type %v: %w", p.SpecificPacket, errUnknownExtendedPacket)
 	}
@@ -1425,4 +1427,46 @@ func (p *sshFxpExtendedPacketHardlink) UnmarshalBinary(b []byte) error {
 func (p *sshFxpExtendedPacketHardlink) respond(s *Server) responsePacket {
 	err := os.Link(s.toLocalPath(p.Oldpath), s.toLocalPath(p.Newpath))
 	return statusFromError(p.ID, err)
+}
+
+type sshFxpExtendedPacketFsync struct {
+	ID              uint32
+	ExtendedRequest string
+	Handle          string
+}
+
+// https://github.com/openssh/openssh-portable/blob/master/PROTOCOL
+func (p *sshFxpExtendedPacketFsync) id() uint32 { return p.ID }
+
+// an fsync does not modify the file, it only flushes previously
+// received writes to stable storage, so it is allowed on read-only servers
+func (p *sshFxpExtendedPacketFsync) readonly() bool { return true }
+
+func (p *sshFxpExtendedPacketFsync) UnmarshalBinary(b []byte) error {
+	var err error
+	if p.ID, b, err = unmarshalUint32Safe(b); err != nil {
+		return err
+	} else if p.ExtendedRequest, b, err = unmarshalStringSafe(b); err != nil {
+		return err
+	} else if p.Handle, _, err = unmarshalStringSafe(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (p *sshFxpExtendedPacketFsync) respond(s *Server) responsePacket {
+	f, ok := s.getHandle(p.Handle)
+	if !ok {
+		return statusFromError(p.ID, EBADF)
+	}
+	syncer, ok := f.(FileSyncer)
+	if !ok {
+		return statusFromError(p.ID, ErrSSHFxOpUnsupported)
+	}
+	// all the writes received before this request on the same handle
+	// must complete before syncing to stable storage
+	if b := s.writeBarrierFor(p.Handle); b != nil {
+		b.wait()
+	}
+	return statusFromError(p.ID, syncer.Sync())
 }

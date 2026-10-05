@@ -14,6 +14,50 @@ import (
 // MaxFilelist is the max number of files to return in a readdir batch.
 var MaxFilelist int64 = 100
 
+// writeBarrier tracks, for a single open handle, the write requests
+// received by the server and the ones that completed, so that an fsync
+// request can wait until all the writes received before it have completed.
+type writeBarrier struct {
+	mu        sync.Mutex
+	cond      sync.Cond
+	received  uint64
+	completed uint64
+}
+
+func newWriteBarrier() *writeBarrier {
+	b := &writeBarrier{}
+	b.cond.L = &b.mu
+	return b
+}
+
+// writeReceived registers a write request received for the handle.
+// It must be called while the packets are still processed in receive order.
+func (b *writeBarrier) writeReceived() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.received++
+}
+
+// writeCompleted registers the completion of a received write request.
+func (b *writeBarrier) writeCompleted() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.completed++
+	b.cond.Broadcast()
+}
+
+// wait blocks until all the write requests received so far have completed.
+func (b *writeBarrier) wait() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for b.completed < b.received {
+		b.cond.Wait()
+	}
+}
+
 // state encapsulates the reader/writer/readdir from handlers.
 type state struct {
 	mu sync.RWMutex
@@ -23,6 +67,8 @@ type state struct {
 	writerAtReaderAt WriterAtReaderAt
 	listerAt         ListerAt
 	lsoffset         int64
+
+	barrier *writeBarrier
 }
 
 // copy returns a shallow copy the state.
@@ -38,7 +84,20 @@ func (s *state) copy() state {
 		writerAtReaderAt: s.writerAtReaderAt,
 		listerAt:         s.listerAt,
 		lsoffset:         s.lsoffset,
+		barrier:          s.barrier,
 	}
+}
+
+// getWriteBarrier returns the barrier tracking the writes received for
+// this handle, creating it if necessary.
+func (s *state) getWriteBarrier() *writeBarrier {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.barrier == nil {
+		s.barrier = newWriteBarrier()
+	}
+	return s.barrier
 }
 
 func (s *state) setReaderAt(rd io.ReaderAt) {
@@ -469,6 +528,35 @@ func packetData(p requestPacket, alloc *allocator, orderID uint32, maxTxPacket u
 		return p.Data, int64(p.Offset), p.Length
 	}
 	return
+}
+
+// filesync implements the fsync@openssh.com extension.
+//
+// All the write requests received before the fsync request on the same
+// handle must complete before the file is synced to stable storage,
+// so that a successful response is a reliable durability boundary.
+func filesync(r *Request, pkt *sshFxpExtendedPacketFsync) responsePacket {
+	id := pkt.ID
+
+	var syncer FileSyncer
+	if rw := r.getWriterAtReaderAt(); rw != nil {
+		syncer, _ = rw.(FileSyncer)
+	}
+	if syncer == nil {
+		if wr := r.getWriterAt(); wr != nil {
+			syncer, _ = wr.(FileSyncer)
+		}
+	}
+	if syncer == nil {
+		// the backend cannot sync this file to stable storage
+		return statusFromError(id, ErrSSHFxOpUnsupported)
+	}
+
+	// wait for the completion of all the writes received before this
+	// request, they must complete before syncing to stable storage
+	r.state.getWriteBarrier().wait()
+
+	return statusFromError(id, syncer.Sync())
 }
 
 // wrap FileCmder handler

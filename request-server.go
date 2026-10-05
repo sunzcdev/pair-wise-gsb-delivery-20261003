@@ -170,6 +170,15 @@ func (rs *RequestServer) serveLoop(pktChan chan<- orderedRequest) error {
 			}
 		}
 
+		// Register the received write requests while the packets are
+		// still processed in receive order, so that a later fsync
+		// request for the same handle can wait for their completion.
+		if wpkt, ok := pkt.(*sshFxpWritePacket); ok {
+			if req, ok := rs.getRequest(wpkt.Handle); ok {
+				req.state.getWriteBarrier().writeReceived()
+			}
+		}
+
 		pktChan <- rs.pktMgr.newOrderedRequest(pkt)
 	}
 }
@@ -305,6 +314,13 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				Filepath: cleanPathWithBase(rs.startDirectory, pkt.Path),
 			}
 			rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+		case *sshFxpExtendedPacketFsync:
+			request, ok := rs.getRequest(pkt.Handle)
+			if !ok {
+				rpkt = statusFromError(pkt.ID, EBADF)
+			} else {
+				rpkt = filesync(request, pkt)
+			}
 		case hasHandle:
 			handle := pkt.getHandle()
 			request, ok := rs.getRequest(handle)
@@ -312,6 +328,10 @@ func (rs *RequestServer) packetWorker(ctx context.Context, pktChan chan orderedR
 				rpkt = statusFromError(pkt.id(), EBADF)
 			} else {
 				rpkt = request.call(rs.Handlers, pkt, rs.pktMgr.alloc, orderID, rs.maxTxPacket)
+				if _, ok := pkt.(*sshFxpWritePacket); ok {
+					// register the write completion for the fsync barrier
+					request.state.getWriteBarrier().writeCompleted()
+				}
 			}
 		case hasPath:
 			request := requestFromPacket(ctx, pkt, rs.startDirectory)

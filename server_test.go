@@ -69,6 +69,44 @@ func checkServerAllocator(t *testing.T, server *Server) {
 	checkAllocatorAfterServerClose(t, server.pktMgr.alloc)
 }
 
+// test the fsync@openssh.com extension
+func TestServerFsync(t *testing.T) {
+	cr, sw := io.Pipe()
+	sr, cw := io.Pipe()
+	var options []ServerOption
+	options = append(options, WithServerWorkingDirectory(t.TempDir()))
+	if *testAllocator {
+		options = append(options, WithAllocator())
+	}
+	server, err := NewServer(struct {
+		io.Reader
+		io.WriteCloser
+	}{sr, sw}, options...)
+	require.NoError(t, err)
+	go server.Serve()
+	client, err := NewClientPipe(cr, cw)
+	require.NoError(t, err)
+	defer client.Close()
+	defer server.Close()
+
+	w, err := client.Create("fsync.test")
+	require.NoError(t, err)
+
+	_, err = w.Write([]byte("hello"))
+	require.NoError(t, err)
+
+	require.NoError(t, w.Sync())
+	require.NoError(t, w.Close())
+
+	// fsync on a handle that is not open must fail
+	badPacket := &sshFxpFsyncPacket{client.nextID(), "not-a-handle"}
+	typ, data, err := client.clientConn.sendPacket(context.Background(), nil, badPacket)
+	require.NoError(t, err)
+	require.Equal(t, fxp(sshFxpStatus), typ)
+	err = normaliseError(unmarshalStatus(badPacket.ID, data))
+	require.Error(t, err)
+}
+
 // test that errors are sent back when we request an invalid extended packet operation
 // this validates the following rfc draft is followed https://tools.ietf.org/html/draft-ietf-secsh-filexfer-extensions-00
 func TestInvalidExtendedPacket(t *testing.T) {

@@ -45,6 +45,7 @@ type Server struct {
 	pktMgr        *packetManager
 	openFiles     map[string]file
 	openFilesLock sync.RWMutex
+	fileBarriers  map[string]*writeBarrier
 	handleCount   int
 	workDir       string
 	winRoot       bool
@@ -57,6 +58,7 @@ func (svr *Server) nextHandle(f file) string {
 	svr.handleCount++
 	handle := strconv.Itoa(svr.handleCount)
 	svr.openFiles[handle] = f
+	svr.fileBarriers[handle] = newWriteBarrier()
 	return handle
 }
 
@@ -65,6 +67,7 @@ func (svr *Server) closeHandle(handle string) error {
 	defer svr.openFilesLock.Unlock()
 	if f, ok := svr.openFiles[handle]; ok {
 		delete(svr.openFiles, handle)
+		delete(svr.fileBarriers, handle)
 		return f.Close()
 	}
 
@@ -76,6 +79,14 @@ func (svr *Server) getHandle(handle string) (file, bool) {
 	defer svr.openFilesLock.RUnlock()
 	f, ok := svr.openFiles[handle]
 	return f, ok
+}
+
+// writeBarrierFor returns the barrier tracking the writes received for
+// the given handle, or nil if the handle is not open.
+func (svr *Server) writeBarrierFor(handle string) *writeBarrier {
+	svr.openFilesLock.RLock()
+	defer svr.openFilesLock.RUnlock()
+	return svr.fileBarriers[handle]
 }
 
 type serverRespondablePacket interface {
@@ -97,11 +108,12 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		},
 	}
 	s := &Server{
-		serverConn:  svrConn,
-		debugStream: ioutil.Discard,
-		pktMgr:      newPktMgr(svrConn),
-		openFiles:   make(map[string]file),
-		maxTxPacket: defaultMaxTxPacket,
+		serverConn:   svrConn,
+		debugStream:  ioutil.Discard,
+		pktMgr:       newPktMgr(svrConn),
+		openFiles:    make(map[string]file),
+		fileBarriers: make(map[string]*writeBarrier),
+		maxTxPacket:  defaultMaxTxPacket,
 	}
 
 	for _, o := range options {
@@ -350,6 +362,10 @@ func handlePacket(s *Server, p orderedRequest) error {
 		var err error = EBADF
 		if ok {
 			_, err = f.WriteAt(p.Data, int64(p.Offset))
+			// register the write completion for the fsync barrier
+			if b := s.writeBarrierFor(p.Handle); b != nil {
+				b.writeCompleted()
+			}
 		}
 		rpkt = statusFromError(p.ID, err)
 	case *sshFxpExtendedPacket:
@@ -416,6 +432,15 @@ func (svr *Server) Serve() error {
 				debug("makePacket err: %v", err)
 				svr.conn.Close() // shuts down recvPacket
 				break
+			}
+		}
+
+		// Register the received write requests while the packets are
+		// still processed in receive order, so that a later fsync
+		// request for the same handle can wait for their completion.
+		if wpkt, ok := pkt.(*sshFxpWritePacket); ok {
+			if b := svr.writeBarrierFor(wpkt.Handle); b != nil {
+				b.writeReceived()
 			}
 		}
 

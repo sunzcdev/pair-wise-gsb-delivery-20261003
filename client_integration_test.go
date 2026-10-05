@@ -1830,17 +1830,7 @@ func TestClientSyncGo(t *testing.T) {
 		t.Skipf("skipping without -testserver")
 	}
 	err := testClientSync(t)
-
-	// Since Server does not support the fsync extension, we can only
-	// check that we get the right error.
-	require.Error(t, err)
-
-	switch err := err.(type) {
-	case *StatusError:
-		assert.Equal(t, ErrSSHFxOpUnsupported, err.FxCode())
-	default:
-		t.Error(err)
-	}
+	assert.NoError(t, err)
 }
 
 func TestClientSyncSFTP(t *testing.T) {
