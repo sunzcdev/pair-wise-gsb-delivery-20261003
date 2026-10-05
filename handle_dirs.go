@@ -188,8 +188,19 @@ func (c *clientHandler) checkLISTArgs(args string) string {
 func (c *clientHandler) handleLIST(param string) error {
 	info := fmt.Sprintf("LIST %v", param)
 
+	finalize, ok := c.claimDirectoryTransfer("LIST", param)
+	if !ok {
+		return nil
+	}
+
+	// Until the transfer connection opens the reservation is only tentatively
+	// claimed: any earlier failure must release it again.
+	defer finalize.release()
+
 	if files, _, err := c.getFileList(param, true); err == nil || errors.Is(err, io.EOF) {
 		if tr, errTr := c.TransferOpen(info); errTr == nil {
+			finalize.commit()
+
 			err = c.dirTransferLIST(tr, files)
 			c.TransferClose(tr, err)
 
@@ -207,8 +218,17 @@ func (c *clientHandler) handleLIST(param string) error {
 func (c *clientHandler) handleNLST(param string) error {
 	info := fmt.Sprintf("NLST %v", param)
 
+	finalize, ok := c.claimDirectoryTransfer("NLST", param)
+	if !ok {
+		return nil
+	}
+
+	defer finalize.release()
+
 	if files, parentDir, err := c.getFileList(param, true); err == nil || errors.Is(err, io.EOF) {
 		if tr, errTrOpen := c.TransferOpen(info); errTrOpen == nil {
+			finalize.commit()
+
 			err = c.dirTransferNLST(tr, files, parentDir)
 			c.TransferClose(tr, err)
 
@@ -254,8 +274,17 @@ func (c *clientHandler) handleMLSD(param string) error {
 
 	info := fmt.Sprintf("MLSD %v", param)
 
+	finalize, ok := c.claimDirectoryTransfer("MLSD", param)
+	if !ok {
+		return nil
+	}
+
+	defer finalize.release()
+
 	if files, _, err := c.getFileList(param, false); err == nil || errors.Is(err, io.EOF) {
 		if tr, errTr := c.TransferOpen(info); errTr == nil {
+			finalize.commit()
+
 			err = c.dirTransferMLSD(tr, files)
 			c.TransferClose(tr, err)
 

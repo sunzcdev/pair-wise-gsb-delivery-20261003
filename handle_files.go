@@ -21,53 +21,49 @@ import (
 
 func (c *clientHandler) handleSTOR(param string) error {
 	info := fmt.Sprintf("STOR %v", param)
-	c.transferFile(true, false, param, info)
+	c.transferFile("STOR", true, false, param, info)
 
 	return nil
 }
 
 func (c *clientHandler) handleAPPE(param string) error {
 	info := fmt.Sprintf("APPE %v", param)
-	c.transferFile(true, true, param, info)
+	c.transferFile("APPE", true, true, param, info)
 
 	return nil
 }
 
 func (c *clientHandler) handleRETR(param string) error {
 	info := fmt.Sprintf("RETR %v", param)
-	c.transferFile(false, false, param, info)
+	c.transferFile("RETR", false, false, param, info)
 
 	return nil
 }
 
 // File transfer, read or write, seek or not, is basically the same.
 // To make sure we don't miss any step, we execute everything in order
-func (c *clientHandler) transferFile(write bool, appendFile bool, param, info string) {
+func (c *clientHandler) transferFile(command string, write bool, appendFile bool, param, info string) {
 	var file FileTransfer
+
 	var err error
-	var fileFlag int
 
 	path := c.absPath(param)
 
-	// We try to open the file
-	if write { //nolint:nestif // too much effort to change for now
-		fileFlag = os.O_WRONLY
-		if appendFile {
-			fileFlag |= os.O_CREATE | os.O_APPEND
-			// ignore the seek position for append mode
-			c.ctxRest = 0
-		} else {
-			fileFlag |= os.O_CREATE
-			// if this isn't a resume we add the truncate flag
-			// to be sure to overwrite an existing file
-			if c.ctxRest == 0 {
-				fileFlag |= os.O_TRUNC
-			}
-		}
-	} else {
-		fileFlag = os.O_RDONLY
+	finalize, ok := c.claimFileTransfer(command, path, appendFile)
+	if !ok {
+		return
 	}
 
+	// Until the transfer connection opens the reservation is only tentatively
+	// claimed: any earlier failure must release it again.
+	defer finalize.release()
+
+	if appendFile {
+		// ignore the seek position for append mode
+		c.ctxRest = 0
+	}
+
+	fileFlag := c.transferFileFlags(write, appendFile)
 	file, err = c.getFileHandle(path, fileFlag, c.ctxRest)
 	// If this fail, can stop right here and reset the seek position
 	if err != nil {
@@ -80,22 +76,8 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 		return
 	}
 
-	// Try to seek on it
-	if c.ctxRest != 0 {
-		_, err = file.Seek(c.ctxRest, 0)
-		// Whatever happens we should reset the seek position
-		c.ctxRest = 0
-
-		if err != nil {
-			// if we are unable to seek we can stop right here and close the file
-			if !c.isCommandAborted() {
-				c.writeMessage(getErrorCode(err, StatusActionNotTaken), "Could not seek file: "+err.Error())
-			}
-			// we can ignore the close error here
-			c.closeUnchecked(file)
-
-			return
-		}
+	if !c.seekTransferFile(file) {
+		return
 	}
 
 	fileTransferConn, err := c.TransferOpen(info)
@@ -110,6 +92,11 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 		return
 	}
 
+	// The transfer connection opened: the driver selected and reserved the
+	// data node for this connection, so the preparation is consumed from now
+	// on even if the subsequent data copy fails.
+	finalize.commit()
+
 	err = c.doFileTransfer(fileTransferConn, file, write)
 	// we ignore close error for reads
 	if errClose := file.Close(); errClose != nil && err == nil && write {
@@ -118,6 +105,71 @@ func (c *clientHandler) transferFile(write bool, appendFile bool, param, info st
 
 	// closing the transfer we also send the response message to the FTP client
 	c.TransferClose(fileTransferConn, err)
+}
+
+// claimFileTransfer matches the incoming file transfer against a pending PRET
+// reservation and returns its finalizer. It also applies the fact that REST
+// has no meaning for APPEND.
+func (c *clientHandler) claimFileTransfer(command, path string, appendFile bool) (*transferFinalizer, bool) {
+	restartOffset := c.ctxRest
+	if appendFile {
+		restartOffset = 0
+	}
+
+	return c.claimTransfer(&TransferPlan{
+		Command:       command,
+		Path:          path,
+		TransferType:  c.currentTransferType,
+		RestartOffset: restartOffset,
+	})
+}
+
+// transferFileFlags computes the open flags for a file transfer.
+func (c *clientHandler) transferFileFlags(write, appendFile bool) int {
+	if !write {
+		return os.O_RDONLY
+	}
+
+	fileFlag := os.O_WRONLY
+
+	if appendFile {
+		return fileFlag | os.O_CREATE | os.O_APPEND
+	}
+
+	fileFlag |= os.O_CREATE
+
+	// if this isn't a resume we add the truncate flag to be sure to overwrite
+	// an existing file
+	if c.ctxRest == 0 {
+		fileFlag |= os.O_TRUNC
+	}
+
+	return fileFlag
+}
+
+// seekTransferFile seeks to the announced REST offset. It reports whether the
+// transfer can proceed.
+func (c *clientHandler) seekTransferFile(file FileTransfer) bool {
+	if c.ctxRest == 0 {
+		return true
+	}
+
+	_, err := file.Seek(c.ctxRest, 0)
+	// Whatever happens we should reset the seek position
+	c.ctxRest = 0
+
+	if err != nil {
+		// if we are unable to seek we can stop right here and close the file
+		if !c.isCommandAborted() {
+			c.writeMessage(getErrorCode(err, StatusActionNotTaken), "Could not seek file: "+err.Error())
+		}
+		// we can ignore the close error here
+		c.closeUnchecked(file)
+
+		return false
+	}
+
+	return true
 }
 
 func (c *clientHandler) doFileTransfer(transferConn io.ReadWriter, file io.ReadWriter, write bool) error {
@@ -532,6 +584,10 @@ func (c *clientHandler) handleREST(param string) error {
 
 			return nil
 		}
+
+		// A REST change makes any previously announced transfer stale: the
+		// reservation was prepared without this offset and cannot be reused.
+		c.invalidatePendingTransfer()
 
 		c.ctxRest = size
 		c.writeMessage(StatusFileActionPending, "OK")

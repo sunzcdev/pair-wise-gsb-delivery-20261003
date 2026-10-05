@@ -144,6 +144,52 @@ type ClientDriverExtensionSite interface {
 	Site(param string) *AnswerCommand
 }
 
+// TransferPlan describes the transfer command that a client announced with a
+// PRET command. The driver can use it, for example, to pick a data node or to
+// reserve resources before the transfer connection is actually opened.
+type TransferPlan struct {
+	// Command is the transfer command that was announced, e.g. "RETR",
+	// "STOR", "APPE", "LIST", "NLST" or "MLSD".
+	Command string
+	// Path is the absolute path of the file or directory the transfer targets.
+	// It is the current working directory for directory listings without an
+	// explicit parameter.
+	Path string
+	// TransferType is the transfer type in effect for the upcoming transfer
+	// (binary or ASCII).
+	TransferType TransferType
+	// RestartOffset is the offset announced with a previous REST command, or 0.
+	RestartOffset int64
+}
+
+// PreparedTransfer represents the resources a driver reserved in response to a
+// PRET command. It is consumed exactly once for the matching transfer: Commit
+// is called when the transfer connection opens successfully, otherwise Release
+// is called (mismatched or changed parameters, a new PRET, a failed transfer
+// preparation/open or a client disconnect).
+type PreparedTransfer interface {
+	// Commit confirms that the reserved resources were consumed by the matching
+	// transfer. It is called when the transfer connection opens successfully.
+	Commit()
+	// Release frees the reserved resources without using them.
+	Release()
+}
+
+// ClientDriverExtensionPreTransfer is an optional extension to support the
+// "PRET" command. When the client driver implements it, the server announces
+// PRET in its FEAT response and lets the driver prepare the announced transfer
+// (for example choosing a data node based on the file path) ahead of PASV.
+//
+// The returned PreparedTransfer is only valid for the announced command and
+// path under the current transfer type and REST offset. Any change to REST,
+// the transfer type or the path, a new PRET command or a client disconnect
+// releases it again.
+type ClientDriverExtensionPreTransfer interface {
+	// PrepareTransfer is called when receiving a PRET command. Returning an
+	// error refuses the preparation and the client gets a 550 reply.
+	PrepareTransfer(plan *TransferPlan) (PreparedTransfer, error)
+}
+
 // ClientContext is implemented on the server side to provide some access to few data around the client
 type ClientContext interface {
 	// Path provides the path of the current connection

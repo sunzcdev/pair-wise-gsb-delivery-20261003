@@ -49,6 +49,7 @@ var commandsMap = map[string]*CommandDescription{ //nolint:gochecknoglobals
 	"SYST": {Fn: (*clientHandler).handleSYST, Open: true},
 	"NOOP": {Fn: (*clientHandler).handleNOOP, Open: true},
 	"OPTS": {Fn: (*clientHandler).handleOPTS, Open: true},
+	"PRET": {Fn: (*clientHandler).handlePRET},
 	"QUIT": {Fn: (*clientHandler).handleQUIT, Open: true, SpecialAction: true},
 	"AVBL": {Fn: (*clientHandler).handleAVBL},
 	"ABOR": {Fn: (*clientHandler).handleABOR, SpecialAction: true},

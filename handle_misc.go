@@ -275,6 +275,10 @@ func (c *clientHandler) handleFEAT(_ string) error {
 		features = append(features, "AVBL")
 	}
 
+	if _, ok := c.driver.(ClientDriverExtensionPreTransfer); ok {
+		features = append(features, "PRET")
+	}
+
 	for _, f := range features {
 		c.writeLine(" " + f)
 	}
@@ -286,16 +290,27 @@ func (c *clientHandler) handleTYPE(param string) error {
 	param = strings.ReplaceAll(strings.ToUpper(param), " ", "")
 	switch param {
 	case "I", "L8":
-		c.currentTransferType = TransferTypeBinary
+		c.setCurrentTransferType(TransferTypeBinary)
 		c.writeMessage(StatusOK, "Type set to binary")
 	case "A", "AN", "L7":
-		c.currentTransferType = TransferTypeASCII
+		c.setCurrentTransferType(TransferTypeASCII)
 		c.writeMessage(StatusOK, "Type set to ASCII")
 	default:
 		c.writeMessage(StatusNotImplementedParam, "Unsupported transfer type")
 	}
 
 	return nil
+}
+
+// setCurrentTransferType updates the transfer type and releases a pending PRET
+// reservation when the type actually changes: a reservation was prepared for
+// the previous type and cannot be reused.
+func (c *clientHandler) setCurrentTransferType(transferType TransferType) {
+	if c.currentTransferType != transferType {
+		defer c.invalidatePendingTransfer()
+	}
+
+	c.currentTransferType = transferType
 }
 
 func (c *clientHandler) handleMODE(param string) error {
