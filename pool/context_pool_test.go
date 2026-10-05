@@ -146,6 +146,139 @@ func TestContextPool(t *testing.T) {
 		require.ErrorIs(t, err, err1)
 	})
 
+	t.Run("cancellation cause", func(t *testing.T) {
+		t.Parallel()
+
+		err1 := errors.New("err1")
+		err2 := errors.New("err2")
+
+		t.Run("parent already canceled propagates parent cause", func(t *testing.T) {
+			t.Parallel()
+			parent, cancelParent := context.WithCancelCause(bgctx)
+			cancelParent(err1)
+
+			p := pool.New().WithContext(parent).WithCancelOnError()
+			var taskCtx context.Context
+			p.Go(func(ctx context.Context) error {
+				taskCtx = ctx
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			err := p.Wait()
+			require.ErrorIs(t, err, context.Canceled)
+			require.Same(t, err1, context.Cause(taskCtx))
+		})
+
+		t.Run("parent cancel and task errors together", func(t *testing.T) {
+			t.Parallel()
+
+			t.Run("task error wins", func(t *testing.T) {
+				parent, cancelParent := context.WithCancelCause(bgctx)
+				defer cancelParent(nil)
+
+				parentErr := errors.New("parent err")
+				wait := make(chan error)
+				ctxCh := make(chan context.Context, 1)
+				p := pool.New().WithContext(parent).WithCancelOnError()
+				p.Go(func(ctx context.Context) error {
+					ctxCh <- ctx
+					return <-wait
+				})
+				p.Go(func(ctx context.Context) error {
+					return err1
+				})
+				taskCtx := <-ctxCh
+				// Wait until the task error has canceled the pool, then race a
+				// parent cancellation against a second task error.
+				<-taskCtx.Done()
+				cancelParent(parentErr)
+				wait <- err2
+
+				err := p.Wait()
+				// Both real failures are still collected by Wait().
+				require.ErrorIs(t, err, err1)
+				require.ErrorIs(t, err, err2)
+				// The cause is the first cancellation, not overwritten by the
+				// parent cancellation or by Wait's cleanup.
+				require.Same(t, err1, context.Cause(taskCtx))
+			})
+
+			t.Run("parent cancel wins", func(t *testing.T) {
+				parent, cancelParent := context.WithCancelCause(bgctx)
+
+				start := make(chan struct{})
+				p := pool.New().WithContext(parent).WithCancelOnError()
+				var taskCtx context.Context
+				p.Go(func(ctx context.Context) error {
+					taskCtx = ctx
+					<-start
+					<-ctx.Done()
+					return ctx.Err()
+				})
+				p.Go(func(ctx context.Context) error {
+					<-start
+					<-ctx.Done()
+					return err1
+				})
+				close(start)
+				// Cancel the parent before either task can return its error.
+				cancelParent(err2)
+
+				err := p.Wait()
+				require.ErrorIs(t, err, err1)
+				require.ErrorIs(t, err, context.Canceled)
+				require.Same(t, err2, context.Cause(taskCtx))
+			})
+		})
+
+		t.Run("task returns context.Canceled", func(t *testing.T) {
+			t.Parallel()
+			p := pool.New().WithContext(bgctx).WithCancelOnError()
+			var taskCtx context.Context
+			p.Go(func(ctx context.Context) error {
+				taskCtx = ctx
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			p.Go(func(context.Context) error {
+				return context.Canceled
+			})
+			err := p.Wait()
+			require.ErrorIs(t, err, context.Canceled)
+			require.Same(t, context.Canceled, context.Cause(taskCtx))
+		})
+
+		t.Run("clean shutdown does not overwrite cause", func(t *testing.T) {
+			t.Parallel()
+			p := pool.New().WithContext(bgctx).WithCancelOnError()
+			var taskCtx context.Context
+			p.Go(func(ctx context.Context) error {
+				taskCtx = ctx
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			p.Go(func(context.Context) error {
+				return err1
+			})
+			err := p.Wait()
+			require.ErrorIs(t, err, err1)
+			// Wait's deferred cleanup must not replace the business cause.
+			require.Same(t, err1, context.Cause(taskCtx))
+		})
+
+		t.Run("successful shutdown resolves to Canceled", func(t *testing.T) {
+			t.Parallel()
+			p := pool.New().WithContext(bgctx)
+			var taskCtx context.Context
+			p.Go(func(ctx context.Context) error {
+				taskCtx = ctx
+				return nil
+			})
+			require.NoError(t, p.Wait())
+			require.Same(t, context.Canceled, context.Cause(taskCtx))
+		})
+	})
+
 	t.Run("no WithCancelOnError", func(t *testing.T) {
 		t.Parallel()
 		p := pool.New().WithContext(bgctx)

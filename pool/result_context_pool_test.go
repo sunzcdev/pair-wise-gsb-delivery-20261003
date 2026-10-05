@@ -102,6 +102,98 @@ func TestResultContextPool(t *testing.T) {
 		require.ErrorIs(t, err, err1)
 	})
 
+	t.Run("cancellation cause", func(t *testing.T) {
+		t.Parallel()
+
+		t.Run("task error is the cause", func(t *testing.T) {
+			t.Parallel()
+			ctxCh := make(chan context.Context, 1)
+			g := pool.NewWithResults[int]().WithContext(context.Background()).WithCancelOnError()
+			g.Go(func(ctx context.Context) (int, error) {
+				ctxCh <- ctx
+				<-ctx.Done()
+				return 0, ctx.Err()
+			})
+			g.Go(func(context.Context) (int, error) {
+				return 1, err1
+			})
+			taskCtx := <-ctxCh
+			res, err := g.Wait()
+			require.Empty(t, res)
+			require.ErrorIs(t, err, err1)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Same(t, err1, context.Cause(taskCtx))
+		})
+
+		t.Run("parent cancellation is the cause", func(t *testing.T) {
+			t.Parallel()
+			parent, cancel := context.WithCancelCause(context.Background())
+
+			start := make(chan struct{})
+			g := pool.NewWithResults[int]().WithContext(parent).WithCancelOnError()
+			var taskCtx context.Context
+			g.Go(func(ctx context.Context) (int, error) {
+				taskCtx = ctx
+				<-start
+				<-ctx.Done()
+				return 0, ctx.Err()
+			})
+			g.Go(func(ctx context.Context) (int, error) {
+				<-start
+				<-ctx.Done()
+				return 1, err1
+			})
+			close(start)
+			cancel(err2)
+
+			res, err := g.Wait()
+			require.Empty(t, res)
+			require.ErrorIs(t, err, err1)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Same(t, err2, context.Cause(taskCtx))
+		})
+
+		t.Run("context.Canceled task resolves cause to Canceled", func(t *testing.T) {
+			t.Parallel()
+			ctxCh := make(chan context.Context, 1)
+			g := pool.NewWithResults[int]().WithContext(context.Background()).WithCancelOnError()
+			g.Go(func(ctx context.Context) (int, error) {
+				ctxCh <- ctx
+				<-ctx.Done()
+				return 0, ctx.Err()
+			})
+			g.Go(func(context.Context) (int, error) {
+				return 1, context.Canceled
+			})
+			taskCtx := <-ctxCh
+			res, err := g.Wait()
+			require.Empty(t, res)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Same(t, context.Canceled, context.Cause(taskCtx))
+		})
+
+		t.Run("all failures are still collected", func(t *testing.T) {
+			t.Parallel()
+			wait := make(chan error)
+			g := pool.NewWithResults[int]().WithContext(context.Background()).WithCancelOnError()
+			g.Go(func(ctx context.Context) (int, error) {
+				return 1, <-wait
+			})
+			g.Go(func(context.Context) (int, error) {
+				return 2, err1
+			})
+			g.Go(func(context.Context) (int, error) {
+				return 3, err2
+			})
+			wait <- context.Canceled
+			res, err := g.Wait()
+			require.Empty(t, res)
+			require.ErrorIs(t, err, err1)
+			require.ErrorIs(t, err, err2)
+			require.ErrorIs(t, err, context.Canceled)
+		})
+	})
+
 	t.Run("WithFailFast", func(t *testing.T) {
 		t.Parallel()
 		p := pool.NewWithResults[int]().WithContext(context.Background()).WithFailFast()
