@@ -1,0 +1,9 @@
+p, viewer, data1, read, allow
+p, operator, data1, write, allow
+p, auditor, data1, audit, allow
+p, analyst_a, data2, read, allow
+p, analyst_b, data2, read, allow
+p, blocked, data1, read, deny
+
+g, operator, viewer
+g, admin, operator
