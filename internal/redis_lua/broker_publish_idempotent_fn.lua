@@ -4,14 +4,16 @@
 -- The logic is a function with one definition, and the caller supplies the key
 -- and arguments explicitly - nothing here reads KEYS or ARGV.
 --
--- The remembered result is written after the publication and never before: it
--- is what says a publication happened, so writing it first would let a failure
--- leave a result claiming a publication nobody received.
-local function publish_idempotent(result_key, payload, channel, publish_command, result_key_expire)
+-- Redis executes this whole script atomically. The content hash and result are
+-- committed with the publication, and a strict retry verifies that hash first.
+local function publish_idempotent(result_key, payload, channel, publish_command, result_key_expire, strict, content_hash)
     if result_key_expire ~= '' then
-        local stream_meta = redis.call("hmget", result_key, "e", "s")
-        local result_epoch, result_offset = stream_meta[1], stream_meta[2]
+        local cached_result = redis.call("hmget", result_key, "e", "s", "h")
+        local result_epoch, result_offset, result_hash = cached_result[1], cached_result[2], cached_result[3]
         if result_epoch ~= false then
+            if strict == "1" and result_hash ~= content_hash then
+                return redis.error_reply("__centrifuge_idempotency_conflict__")
+            end
             return { result_offset, result_epoch }
         end
     end
@@ -22,7 +24,7 @@ local function publish_idempotent(result_key, payload, channel, publish_command,
     end
 
     if result_key_expire ~= '' then
-        redis.call("hset", result_key, "e", "")
+        redis.call("hset", result_key, "e", "", "h", content_hash)
         redis.call("expire", result_key, result_key_expire)
     end
 

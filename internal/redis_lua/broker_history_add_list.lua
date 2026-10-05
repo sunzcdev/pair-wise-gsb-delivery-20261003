@@ -10,11 +10,16 @@ local new_epoch_if_empty = ARGV[6]
 local publish_command = ARGV[7]
 local result_key_expire = ARGV[8]
 local use_delta = ARGV[9]
+local strict = ARGV[10]
+local content_hash = ARGV[11]
 
 if result_key_expire ~= '' then
-    local cached_result = redis.call("hmget", result_key, "e", "s")
-    local result_epoch, result_offset = cached_result[1], cached_result[2]
+    local cached_result = redis.call("hmget", result_key, "e", "s", "h")
+    local result_epoch, result_offset, result_hash = cached_result[1], cached_result[2], cached_result[3]
     if result_epoch ~= false then
+        if strict == "1" and result_hash ~= content_hash then
+            return redis.error_reply("__centrifuge_idempotency_conflict__")
+        end
         return { result_offset, result_epoch, "1" }
     end
 end
@@ -54,7 +59,7 @@ if channel ~= '' then
 end
 
 if result_key_expire ~= '' then
-    redis.call("hset", result_key, "e", current_epoch, "s", top_offset)
+    redis.call("hset", result_key, "e", current_epoch, "s", top_offset, "h", content_hash)
     redis.call("expire", result_key, result_key_expire)
 end
 

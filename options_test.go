@@ -24,6 +24,14 @@ func TestWithIdempotencyKey(t *testing.T) {
 	require.Equal(t, "ik", opts.IdempotencyKey)
 }
 
+func TestWithStrictIdempotency(t *testing.T) {
+	t.Parallel()
+	opt := WithStrictIdempotency(true)
+	opts := &PublishOptions{}
+	opt(opts)
+	require.True(t, opts.StrictIdempotency)
+}
+
 func TestWithDelta(t *testing.T) {
 	t.Parallel()
 	opt := WithDelta(true)

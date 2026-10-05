@@ -4,6 +4,7 @@ package centrifuge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -3205,4 +3206,141 @@ func TestRedisBrokerIdempotentPublishDuringSlotMigration(t *testing.T) {
 	require.False(t, res.Suppressed, "the failed publication must not have been remembered")
 	require.Eventually(t, func() bool { return len(received()) > 0 }, 5*time.Second, 10*time.Millisecond)
 	require.Equal(t, []string{"after"}, received())
+}
+
+func TestRedisBrokerPublishStrictIdempotency(t *testing.T) {
+	t.Parallel()
+	for _, tt := range historyRedisTests {
+		t.Run(tt.Name, func(t *testing.T) {
+			node := testNode(t)
+			broker := newTestRedisBroker(t, node, tt.UseStreams, tt.UseCluster, tt.Port)
+			defer func() { _ = node.Shutdown(context.Background()) }()
+			defer stopRedisBroker(broker)
+
+			channel := uuid.NewString()
+			opts := PublishOptions{
+				HistorySize:       4,
+				HistoryTTL:        10 * time.Second,
+				IdempotencyKey:    "strict-key",
+				StrictIdempotency: true,
+				Tags:              map[string]string{"a": "1", "b": "2"},
+				ClientInfo:        &ClientInfo{ClientID: "client", UserID: "user", ConnInfo: []byte(`{"n":1}`)},
+			}
+			first, err := broker.Publish(channel, []byte("first"), opts)
+			require.NoError(t, err)
+
+			second, err := broker.Publish(channel, []byte("first"), opts)
+			require.NoError(t, err)
+			require.Equal(t, first.StreamPosition, second.StreamPosition)
+			require.True(t, second.Suppressed)
+			require.Equal(t, SuppressReasonIdempotency, second.SuppressReason)
+
+			conflicting := opts
+			conflicting.Tags = map[string]string{"b": "2", "a": "1"}
+			conflictResult, err := broker.Publish(channel, []byte("different"), conflicting)
+			require.ErrorIs(t, err, ErrIdempotencyConflict)
+			require.Equal(t, PublishResult{}, conflictResult)
+
+			pubs, _, err := broker.History(channel, HistoryOptions{Filter: HistoryFilter{Limit: -1}})
+			require.NoError(t, err)
+			require.Len(t, pubs, 1)
+			require.Equal(t, []byte("first"), pubs[0].Data)
+		})
+	}
+}
+
+func TestRedisBrokerPublishStrictIdempotencyNoHistory(t *testing.T) {
+	t.Parallel()
+	node := testNode(t)
+	broker := newTestRedisBroker(t, node, true, false, 6379)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+	defer stopRedisBroker(broker)
+
+	channel := uuid.NewString()
+	opts := PublishOptions{
+		IdempotencyKey:    "strict-no-history",
+		StrictIdempotency: true,
+		Tags:              map[string]string{"a": "1", "b": "2"},
+	}
+	_, err := broker.Publish(channel, []byte("first"), opts)
+	require.NoError(t, err)
+	_, err = broker.Publish(channel, []byte("first"), opts)
+	require.NoError(t, err)
+	_, err = broker.Publish(channel, []byte("different"), opts)
+	require.ErrorIs(t, err, ErrIdempotencyConflict)
+}
+
+func TestRedisBrokerPublishIdempotencyLegacyCompatibility(t *testing.T) {
+	t.Parallel()
+	for _, tt := range historyRedisTests {
+		t.Run(tt.Name, func(t *testing.T) {
+			node := testNode(t)
+			broker := newTestRedisBroker(t, node, tt.UseStreams, tt.UseCluster, tt.Port)
+			defer func() { _ = node.Shutdown(context.Background()) }()
+			defer stopRedisBroker(broker)
+
+			channel := uuid.NewString()
+			historyOpts := PublishOptions{HistorySize: 4, HistoryTTL: 10 * time.Second, IdempotencyKey: "key"}
+			_, err := broker.Publish(channel, []byte("first"), historyOpts)
+			require.NoError(t, err)
+			_, err = broker.Publish(channel, []byte("different"), historyOpts)
+			require.NoError(t, err)
+
+			strictOpts := historyOpts
+			strictOpts.StrictIdempotency = true
+			_, err = broker.Publish(channel, []byte("again"), strictOpts)
+			require.ErrorIs(t, err, ErrIdempotencyConflict)
+		})
+	}
+}
+
+func TestRedisBrokerPublishStrictIdempotencyConcurrentDifferentContent(t *testing.T) {
+	t.Parallel()
+	node := testNode(t)
+	broker := newTestRedisBroker(t, node, true, false, 6379)
+	defer func() { _ = node.Shutdown(context.Background()) }()
+	defer stopRedisBroker(broker)
+
+	const requests = 32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make(chan error, requests)
+	channel := uuid.NewString()
+
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := broker.Publish(channel, []byte("content-"+strconv.Itoa(i)), PublishOptions{
+				HistorySize:       100,
+				HistoryTTL:        10 * time.Second,
+				IdempotencyKey:    "same-key",
+				StrictIdempotency: true,
+			})
+			results <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrIdempotencyConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	require.Equal(t, 1, successes)
+	require.Equal(t, requests-1, conflicts)
+
+	pubs, _, err := broker.History(channel, HistoryOptions{Filter: HistoryFilter{Limit: -1}})
+	require.NoError(t, err)
+	require.Len(t, pubs, 1)
 }

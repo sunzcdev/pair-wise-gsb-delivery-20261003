@@ -94,9 +94,14 @@ func (b *MemoryBroker) Publish(ch string, data []byte, opts PublishOptions) (Pub
 	mu.Lock()
 	defer mu.Unlock()
 
+	var contentDigest string
 	if opts.IdempotencyKey != "" {
-		if res, ok := b.getResultFromCache(ch, opts.IdempotencyKey); ok {
-			return PublishResult{StreamPosition: res, Suppressed: true, SuppressReason: SuppressReasonIdempotency}, nil
+		contentDigest = publicationContentDigest(data, opts)
+		if entry, ok := b.getResultFromCache(ch, opts.IdempotencyKey); ok {
+			if opts.StrictIdempotency && entry.ContentHash != contentDigest {
+				return PublishResult{}, ErrIdempotencyConflict
+			}
+			return PublishResult{StreamPosition: entry.Position, Suppressed: true, SuppressReason: SuppressReasonIdempotency}, nil
 		}
 	}
 
@@ -127,42 +132,50 @@ func (b *MemoryBroker) Publish(ch string, data []byte, opts PublishOptions) (Pub
 		// pub is shared with concurrent History readers (subscribe-time recovery),
 		// so setting it again here — outside the lock — is a redundant write that
 		// races those reads. streamTop.Offset equals what add stamped.
+		err = b.eventHandler.HandlePublication(ch, pub, streamTop, opts.UseDelta, prevPub)
+		if err != nil {
+			return PublishResult{}, err
+		}
 		if opts.IdempotencyKey != "" {
 			resultExpireSeconds := int64(defaultIdempotentResultExpireSeconds)
 			if opts.IdempotentResultTTL != 0 {
 				resultExpireSeconds = int64(opts.IdempotentResultTTL.Seconds())
 			}
-			b.saveResultToCache(ch, opts.IdempotencyKey, streamTop, resultExpireSeconds)
+			b.saveResultToCache(ch, opts.IdempotencyKey, streamTop, contentDigest, resultExpireSeconds)
 		}
-		return PublishResult{StreamPosition: streamTop}, b.eventHandler.HandlePublication(ch, pub, streamTop, opts.UseDelta, prevPub)
+		return PublishResult{StreamPosition: streamTop}, nil
 	}
 	streamPosition := StreamPosition{}
+	err := b.eventHandler.HandlePublication(ch, pub, streamPosition, opts.UseDelta, prevPub)
+	if err != nil {
+		return PublishResult{}, err
+	}
 	if opts.IdempotencyKey != "" {
 		resultExpireSeconds := int64(defaultIdempotentResultExpireSeconds)
 		if opts.IdempotentResultTTL != 0 {
 			resultExpireSeconds = int64(opts.IdempotentResultTTL.Seconds())
 		}
-		b.saveResultToCache(ch, opts.IdempotencyKey, streamPosition, resultExpireSeconds)
+		b.saveResultToCache(ch, opts.IdempotencyKey, streamPosition, contentDigest, resultExpireSeconds)
 	}
-	return PublishResult{StreamPosition: streamPosition}, b.eventHandler.HandlePublication(ch, pub, StreamPosition{}, opts.UseDelta, prevPub)
+	return PublishResult{StreamPosition: streamPosition}, nil
 }
 
-func (b *MemoryBroker) getResultFromCache(ch string, key string) (StreamPosition, bool) {
+func (b *MemoryBroker) getResultFromCache(ch string, key string) (resultCacheEntry, bool) {
 	b.resultCacheMu.RLock()
 	defer b.resultCacheMu.RUnlock()
 	res, ok := b.resultCache[ch+"_"+key]
 	if !ok || res.ExpireAt <= time.Now().UnixMilli() {
-		return StreamPosition{}, false
+		return resultCacheEntry{}, false
 	}
-	return res.Position, true
+	return res, true
 }
 
-func (b *MemoryBroker) saveResultToCache(ch string, key string, sp StreamPosition, resultExpireSeconds int64) {
+func (b *MemoryBroker) saveResultToCache(ch string, key string, sp StreamPosition, contentDigest string, resultExpireSeconds int64) {
 	b.resultCacheMu.Lock()
 	defer b.resultCacheMu.Unlock()
 	cacheKey := ch + "_" + key
 	expireAt := time.Now().UnixMilli() + resultExpireSeconds*1000
-	b.resultCache[cacheKey] = resultCacheEntry{Position: sp, ExpireAt: expireAt}
+	b.resultCache[cacheKey] = resultCacheEntry{Position: sp, ContentHash: contentDigest, ExpireAt: expireAt}
 	heap.Push(&b.resultExpireQueue, &priority.Item{Value: cacheKey, Priority: expireAt})
 	if b.nextExpireCheck == 0 || b.nextExpireCheck > expireAt {
 		b.nextExpireCheck = expireAt

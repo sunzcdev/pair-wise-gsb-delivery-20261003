@@ -132,6 +132,11 @@ type PublishOptions struct {
 	// may cache these keys for some time to prevent duplicate publications. In this case
 	// the returned result is the same as from the previous publication with the same key.
 	IdempotencyKey string
+	// StrictIdempotency requires retries using the same IdempotencyKey to publish
+	// identical content. A different data payload, tags, client info, key, delta
+	// option, version, or other message-affecting option returns
+	// ErrIdempotencyConflict.
+	StrictIdempotency bool
 	// IdempotentResultTTL sets the time of expiration for results of idempotent publications
 	// (publications with idempotency key provided). Memory and Redis brokers implement this TTL
 	// with second precision, so don't set something less than one second here. By default,

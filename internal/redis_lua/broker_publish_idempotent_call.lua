@@ -3,4 +3,4 @@
 --
 -- KEYS[2], passed with sharded PUB/SUB, never exists and only routes the call
 -- while its slot migrates - see idempotentRouteKey.
-return publish_idempotent(KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4])
+return publish_idempotent(KEYS[1], ARGV[1], ARGV[2], ARGV[3], ARGV[4], ARGV[5], ARGV[6])

@@ -34,8 +34,9 @@ type MemoryMapBroker struct {
 }
 
 type resultCacheEntry struct {
-	Position StreamPosition
-	ExpireAt int64 // UnixMilli
+	Position    StreamPosition
+	ContentHash string
+	ExpireAt    int64 // UnixMilli
 }
 
 var _ MapBroker = (*MemoryMapBroker)(nil)

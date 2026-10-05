@@ -28,6 +28,14 @@ func WithIdempotencyKey(key string) PublishOption {
 	}
 }
 
+// WithStrictIdempotency enables strict idempotency checks for publications
+// which also provide an idempotency key.
+func WithStrictIdempotency(strict bool) PublishOption {
+	return func(opts *PublishOptions) {
+		opts.StrictIdempotency = strict
+	}
+}
+
 // WithKey sets a key for the publication. When set, the publication is associated
 // with a specific key within the channel. This may enable per-key debouncing or
 // channel level per-key batching. The key is delivered to subscribers in the Publication.

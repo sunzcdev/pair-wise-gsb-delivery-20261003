@@ -2,8 +2,10 @@ package centrifuge
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -964,4 +966,235 @@ func TestMemoryBroker_Publish_StreamlessWithCustomIdempotentTTL(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.True(t, res2.Suppressed)
+}
+
+func TestMemoryBrokerPublishStrictIdempotency(t *testing.T) {
+	t.Parallel()
+
+	contentMutators := []struct {
+		name  string
+		apply func(*PublishOptions)
+		data  []byte
+	}{
+		{"data", func(*PublishOptions) {}, []byte("different")},
+		{"tags", func(opts *PublishOptions) { opts.Tags = map[string]string{"x": "2"} }, nil},
+		{"tag_order", func(opts *PublishOptions) { opts.Tags = map[string]string{"a": "1", "x": "2"} }, nil},
+		{"client_info", func(opts *PublishOptions) {
+			opts.ClientInfo = &ClientInfo{ClientID: "client-2", UserID: "user-2", ConnInfo: []byte(`{"n":2}`)}
+		}, nil},
+		{"delta", func(opts *PublishOptions) { opts.UseDelta = true }, nil},
+		{"version", func(opts *PublishOptions) { opts.Version = 2 }, nil},
+		{"version_epoch", func(opts *PublishOptions) { opts.VersionEpoch = "epoch-2" }, nil},
+		{"key", func(opts *PublishOptions) { opts.Key = "other-key" }, nil},
+		{"removed", func(opts *PublishOptions) { opts.Removed = true }, nil},
+		{"score", func(opts *PublishOptions) { opts.score = 2 }, nil},
+		{"offset", func(opts *PublishOptions) { opts.Offset = 2 }, nil},
+		{"epoch", func(opts *PublishOptions) { opts.Epoch = "epoch-2" }, nil},
+		{"prev_data", func(opts *PublishOptions) { opts.PrevData = []byte("previous-2") }, nil},
+	}
+
+	for _, withHistory := range []bool{false, true} {
+		for _, mutation := range contentMutators {
+			name := mutation.name
+			if withHistory {
+				name = "history_" + name
+			}
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				broker := testMemoryBroker()
+				defer func() { _ = broker.node.Shutdown(context.Background()) }()
+
+				channel := "strict-" + uuid.NewString()
+				base := PublishOptions{
+					IdempotencyKey:    "same-key",
+					StrictIdempotency: true,
+					Tags:              map[string]string{"x": "1", "a": "1"},
+					ClientInfo: &ClientInfo{
+						ClientID: "client-1",
+						UserID:   "user-1",
+						ConnInfo: []byte(`{"n":1}`),
+					},
+					Version:      1,
+					VersionEpoch: "epoch-1",
+					Key:          "key-1",
+					score:        1,
+					Offset:       1,
+					Epoch:        "epoch-1",
+					PrevData:     []byte("previous-1"),
+				}
+				if withHistory {
+					base.HistorySize = 4
+					base.HistoryTTL = time.Second
+				}
+
+				data := []byte("first")
+				first, err := broker.Publish(channel, data, base)
+				require.NoError(t, err)
+
+				retry := base
+				second, err := broker.Publish(channel, data, retry)
+				require.NoError(t, err)
+				require.Equal(t, first.StreamPosition, second.StreamPosition)
+				require.True(t, second.Suppressed)
+				require.Equal(t, SuppressReasonIdempotency, second.SuppressReason)
+
+				conflicting := base
+				conflictingData := data
+				if mutation.data != nil {
+					conflictingData = mutation.data
+				}
+				mutation.apply(&conflicting)
+				conflictResult, err := broker.Publish(channel, conflictingData, conflicting)
+				require.ErrorIs(t, err, ErrIdempotencyConflict)
+				require.Equal(t, PublishResult{}, conflictResult)
+
+				pubs, _, err := broker.History(channel, HistoryOptions{Filter: HistoryFilter{Limit: -1}})
+				if withHistory {
+					require.NoError(t, err)
+					require.Len(t, pubs, 1)
+					require.Equal(t, data, pubs[0].Data)
+				} else {
+					require.NoError(t, err)
+					require.Empty(t, pubs)
+				}
+			})
+		}
+	}
+}
+
+func TestMemoryBrokerPublishStrictIdempotencyTagOrder(t *testing.T) {
+	t.Parallel()
+
+	opts1 := PublishOptions{
+		IdempotencyKey:    "tag-order",
+		StrictIdempotency: true,
+		Tags:              map[string]string{"a": "1", "b": "2", "c": "3"},
+	}
+	opts2 := opts1
+	opts2.Tags = map[string]string{"c": "3", "b": "2", "a": "1"}
+
+	require.Equal(t, publicationContentDigest([]byte("data"), opts1), publicationContentDigest([]byte("data"), opts2))
+	require.NotEqual(t, publicationContentDigest([]byte("data"), opts1), publicationContentDigest([]byte("data2"), opts1))
+}
+
+func TestMemoryBrokerPublishIdempotencyLegacyConflictCompatibility(t *testing.T) {
+	t.Parallel()
+
+	for _, strictFirst := range []bool{false, true} {
+		t.Run(strconv.FormatBool(strictFirst), func(t *testing.T) {
+			t.Parallel()
+			broker := testMemoryBroker()
+			defer func() { _ = broker.node.Shutdown(context.Background()) }()
+
+			channel := "legacy-" + uuid.NewString()
+			firstOpts := PublishOptions{IdempotencyKey: "key", StrictIdempotency: strictFirst}
+			_, err := broker.Publish(channel, []byte("first"), firstOpts)
+			require.NoError(t, err)
+
+			_, err = broker.Publish(channel, []byte("different"), PublishOptions{IdempotencyKey: "key"})
+			require.NoError(t, err)
+
+			_, err = broker.Publish(channel, []byte("again"), PublishOptions{IdempotencyKey: "key", StrictIdempotency: true})
+			require.ErrorIs(t, err, ErrIdempotencyConflict)
+		})
+	}
+}
+
+func TestMemoryBrokerPublishStrictIdempotencyIgnoresHistoryRetentionOptions(t *testing.T) {
+	t.Parallel()
+	t.Run("history_retention_options_are_not_content", func(t *testing.T) {
+		t.Parallel()
+		broker := testMemoryBroker()
+		defer func() { _ = broker.node.Shutdown(context.Background()) }()
+
+		channel := "strict-history-options-" + uuid.NewString()
+		firstOpts := PublishOptions{
+			IdempotencyKey:    "same-key",
+			StrictIdempotency: true,
+			HistorySize:       4,
+			HistoryTTL:        time.Second,
+		}
+		first, err := broker.Publish(channel, []byte("same"), firstOpts)
+		require.NoError(t, err)
+
+		retryOpts := firstOpts
+		retryOpts.HistorySize = 8
+		retryOpts.HistoryTTL = 2 * time.Second
+		second, err := broker.Publish(channel, []byte("same"), retryOpts)
+		require.NoError(t, err)
+		require.Equal(t, first.StreamPosition, second.StreamPosition)
+		require.True(t, second.Suppressed)
+	})
+}
+
+func TestMemoryBrokerPublishStrictIdempotencyExpiredKeyCanBeReused(t *testing.T) {
+	t.Parallel()
+	broker := testMemoryBroker()
+	defer func() { _ = broker.node.Shutdown(context.Background()) }()
+
+	channel := "expiry-" + uuid.NewString()
+	opts := PublishOptions{
+		IdempotencyKey:      "key",
+		StrictIdempotency:   true,
+		IdempotentResultTTL: time.Second,
+	}
+	_, err := broker.Publish(channel, []byte("first"), opts)
+	require.NoError(t, err)
+
+	_, err = broker.Publish(channel, []byte("second"), opts)
+	require.ErrorIs(t, err, ErrIdempotencyConflict)
+
+	require.Eventually(t, func() bool {
+		_, err := broker.Publish(channel, []byte("second"), opts)
+		return err == nil
+	}, 10*time.Second, 100*time.Millisecond, "key should become reusable after result TTL")
+}
+
+func TestMemoryBrokerPublishStrictIdempotencyConcurrentDifferentContent(t *testing.T) {
+	t.Parallel()
+	broker := testMemoryBroker()
+	defer func() { _ = broker.node.Shutdown(context.Background()) }()
+
+	const requests = 32
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make(chan error, requests)
+	channel := "concurrent-" + uuid.NewString()
+
+	for i := 0; i < requests; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := broker.Publish(channel, []byte("content-"+strconv.Itoa(i)), PublishOptions{
+				HistorySize:       100,
+				HistoryTTL:        10 * time.Second,
+				IdempotencyKey:    "same-key",
+				StrictIdempotency: true,
+			})
+			results <- err
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrIdempotencyConflict):
+			conflicts++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+	require.Equal(t, 1, successes)
+	require.Equal(t, requests-1, conflicts)
+
+	pubs, _, err := broker.History(channel, HistoryOptions{Filter: HistoryFilter{Limit: -1}})
+	require.NoError(t, err)
+	require.Len(t, pubs, 1)
 }

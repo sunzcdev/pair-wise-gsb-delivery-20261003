@@ -4,23 +4,22 @@
 -- The logic is a function with one definition, and the caller supplies the
 -- keys and arguments explicitly - nothing here reads KEYS or ARGV.
 --
--- Writing, publishing and remembering happen here in that order, and none of
--- them is left to the caller. What the stream holds is what went out, and what
--- went out is what the result key remembers - so a call which fails partway
--- leaves nothing half-done behind it. Remember a publication before publishing
--- it and a failure in between leaves a result claiming something nobody
--- received; remember it later and a retry carrying the same idempotency key
--- cannot tell it already happened, and writes it a second time.
+-- Redis executes this whole script atomically. The cached content hash and
+-- result are committed together only after the history entry and publication
+-- have both been prepared, so a caller never sees one without the other.
 local function add_history(
     stream_key, meta_key, result_key,
     message_payload, stream_size, stream_ttl, channel, meta_expire,
     new_epoch_if_empty, publish_command, result_key_expire, use_delta,
-    version, version_epoch
+    version, version_epoch, strict, content_hash
 )
     if result_key_expire ~= '' then
-        local cached_result = redis.call("hmget", result_key, "e", "s")
-        local result_epoch, result_offset = cached_result[1], cached_result[2]
+        local cached_result = redis.call("hmget", result_key, "e", "s", "h")
+        local result_epoch, result_offset, result_hash = cached_result[1], cached_result[2], cached_result[3]
         if result_epoch ~= false then
+            if strict == "1" and result_hash ~= content_hash then
+                return redis.error_reply("__centrifuge_idempotency_conflict__")
+            end
             return { result_offset, result_epoch, "1", "0" }
         end
     end
@@ -99,12 +98,9 @@ local function add_history(
         redis.call(publish_command, channel, payload)
     end
 
-    -- The remembered result is written after the publication, never before:
-    -- the other way round, a failure between the two would leave a result
-    -- claiming a publication nobody received, and a retry would be answered
-    -- from it.
+    -- The content hash and remembered result are committed in the same HSET.
     if result_key_expire ~= '' then
-        redis.call("hset", result_key, "e", current_epoch, "s", top_offset)
+        redis.call("hset", result_key, "e", current_epoch, "s", top_offset, "h", content_hash)
         redis.call("expire", result_key, result_key_expire)
     end
 
