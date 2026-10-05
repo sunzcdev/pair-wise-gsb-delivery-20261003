@@ -1,7 +1,9 @@
 package hyperloglog
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 )
 
@@ -112,4 +114,44 @@ func Example_insertHash() {
 
 	// Output:
 	// Estimated unique elements: 3
+}
+
+// Example_streaming frames several sketches into one stream and reads them
+// back one at a time. Frames are self-delimiting, so any number of sketches
+// can be concatenated in a file or network connection.
+func Example_streaming() {
+	first := New14()
+	second := New14()
+	for i := range 50 {
+		first.Insert([]byte(fmt.Sprintf("left-%d", i)))
+		second.Insert([]byte(fmt.Sprintf("right-%d", i)))
+	}
+
+	// Write two frames back to back. WriteTo returns the wire bytes written.
+	var stream bytes.Buffer
+	if _, err := first.WriteTo(&stream); err != nil {
+		log.Fatal(err)
+	}
+	if _, err := second.WriteTo(&stream); err != nil {
+		log.Fatal(err)
+	}
+
+	// Read frames until the clean end of the stream and merge them into one.
+	merged := New14()
+	for {
+		var frame Sketch
+		if _, err := frame.ReadFrom(&stream); err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatal(err)
+		}
+		if err := merged.Merge(&frame); err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	fmt.Printf("Frames merged into estimate: %d\n", merged.Estimate())
+
+	// Output:
+	// Frames merged into estimate: 100
 }

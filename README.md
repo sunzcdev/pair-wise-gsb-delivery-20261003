@@ -37,6 +37,31 @@ This implementation allows for creating HyperLogLog sketches with arbitrary prec
 
 Users can choose the precision that best fits their use case, balancing memory usage against estimation accuracy.
 
+## Streaming Frames
+
+To store or transport more than one sketch in a single file or stream, the
+package provides a self-delimiting outer frame around the existing binary
+encoding. A frame has a fixed header followed by the unchanged inner encoding,
+so historical inner encoding versions keep parsing unchanged:
+
+* a 4 byte magic (`HLLF`) that marks the start of a frame
+* a 1 byte outer frame version
+* a 4 byte big endian payload length
+* a 4 byte big endian CRC-32 (IEEE) checksum of the payload
+* the payload produced by `MarshalBinary`
+
+Use `(*Sketch).WriteTo` to write a frame and `(*Sketch).ReadFrom` to read one
+frame and replace the receiver. Reading a concatenated stream is a loop that
+stops on `io.EOF`; the declared payload length is capped
+(`DefaultMaxFramePayloadSize`, overridable through `ReadFrame`) so a hostile
+length cannot force a large allocation. Truncation, an unknown frame version,
+and a checksum mismatch are reported as distinct errors, and the receiver is
+only replaced after both the checksum and the inner encoding have validated.
+
+The checksum detects accidental corruption only. It is a CRC, not a message
+authentication code, so it does not protect against an adversary who can modify
+the frame.
+
 ## Note
 A big thank you to Prof. Shigang Chen and his team at the University of Florida who are actively conducting research around "Big Network Data".
 
