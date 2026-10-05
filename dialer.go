@@ -29,15 +29,24 @@ type Handshake struct {
 	// Protocol is the subprotocol selected during handshake.
 	Protocol string
 
-	// Extensions is the list of negotiated extensions.
+	// Extensions is the list of negotiated extensions as they appear in the
+	// Sec-WebSocket-Extensions header of the handshake.
 	Extensions []httphead.Option
+
+	// NegotiatedExtensions is the list of negotiated extensions together with
+	// the frame header RSV bits they claim.
+	//
+	// It is populated only when extension negotiation that declares RSV bits
+	// was configured (see Dialer.NegotiateExtensions and Upgrader fields).
+	// Otherwise use Extensions.
+	NegotiatedExtensions []NegotiatedExtension
 }
 
 // Errors used by the websocket client.
 var (
 	ErrHandshakeBadStatus      = fmt.Errorf("unexpected http status")
 	ErrHandshakeBadSubProtocol = fmt.Errorf("unexpected protocol in %q header", headerSecProtocol)
-	ErrHandshakeBadExtensions  = fmt.Errorf("unexpected extensions in %q header", headerSecProtocol)
+	ErrHandshakeBadExtensions  = fmt.Errorf("unexpected extensions in %q header", headerSecExtensions)
 )
 
 // DefaultDialer is dialer that holds no options and is used by Dial function.
@@ -79,6 +88,24 @@ type Dialer struct {
 	// See https://tools.ietf.org/html/rfc6455#section-4.1
 	// See https://tools.ietf.org/html/rfc6455#section-9.1
 	Extensions []httphead.Option
+
+	// NegotiateExtensions is the callback that declares frame header RSV bits
+	// claimed by the extensions accepted by the server.
+	//
+	// It is called for each extension returned by the server in the
+	// Sec-WebSocket-Extensions response header (which is already verified to
+	// be among those the client offered). The returned extension, together
+	// with its claimed RSV bits, becomes part of the Handshake result.
+	//
+	// The option argument is valid only during the callback call; the
+	// NegotiatedExtension returned is copied for the Handshake.
+	//
+	// After all accepted extensions are collected their RSV bit declarations
+	// are checked for conflicts before Upgrade() returns success.
+	//
+	// It does not replace Extensions offer nor the deprecated single
+	// extension negotiation paths.
+	NegotiateExtensions func(httphead.Option) (NegotiatedExtension, error)
 
 	// Header is an optional HandshakeHeader instance that could be used to
 	// write additional headers to the handshake request.
@@ -445,6 +472,22 @@ func (d Dialer) Upgrade(conn io.ReadWriter, u *url.URL) (br *bufio.Reader, hs Ha
 			err = ErrHandshakeBadSecAccept
 		default:
 			panic("unknown headers state")
+		}
+	}
+	if err == nil && d.NegotiateExtensions != nil && len(hs.Extensions) > 0 {
+		negotiated := make([]NegotiatedExtension, 0, len(hs.Extensions))
+		for _, opt := range hs.Extensions {
+			ext, e := d.NegotiateExtensions(opt)
+			if e != nil {
+				err = e
+				break
+			}
+			negotiated = append(negotiated, ext)
+		}
+		if err == nil {
+			if err = CheckExtensionConflicts(negotiated); err == nil {
+				hs.NegotiatedExtensions = negotiated
+			}
 		}
 	}
 	return br, hs, err

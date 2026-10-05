@@ -145,6 +145,23 @@ type HTTPUpgrader struct {
 	//
 	// RejectConnectionError could be used to get more control on response.
 	Negotiate func(httphead.Option) (httphead.Option, error)
+
+	// NegotiateExtensions is like Negotiate, but it receives all extensions
+	// offered by the client at once and allows accepting multiple extensions
+	// together with the frame header RSV bits each of them claims.
+	//
+	// The argument is only valid until the NegotiateExtensions callback
+	// returns.
+	//
+	// If two accepted extensions claim the same RSV bit, or an extension
+	// declares invalid bits, the upgrade fails with *ExtensionConflictError
+	// before the successful response is written.
+	//
+	// If returned error is non-nil then connection is rejected and response is
+	// sent with appropriate HTTP error code and body set to error message.
+	//
+	// RejectConnectionError could be used to get more control on response.
+	NegotiateExtensions func([]httphead.Option) ([]NegotiatedExtension, error)
 }
 
 // Upgrade upgrades http connection to the websocket connection.
@@ -216,6 +233,19 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 			if err != nil {
 				break
 			}
+		}
+	}
+	if f := u.NegotiateExtensions; err == nil && f != nil {
+		for _, h := range r.Header[headerSecExtensionsCanonical] {
+			hs.Extensions, hs.NegotiatedExtensions, err = negotiateExtensionsMany(
+				strToBytes(h), hs.Extensions, hs.NegotiatedExtensions, f,
+			)
+			if err != nil {
+				break
+			}
+		}
+		if err == nil {
+			err = CheckExtensionConflicts(hs.NegotiatedExtensions)
 		}
 	}
 	// DEPRECATED path.
@@ -336,6 +366,23 @@ type Upgrader struct {
 	//
 	// RejectConnectionError could be used to get more control on response.
 	Negotiate func(httphead.Option) (httphead.Option, error)
+
+	// NegotiateExtensions is like Negotiate, but it receives all extensions
+	// offered by the client at once and allows accepting multiple extensions
+	// together with the frame header RSV bits each of them claims.
+	//
+	// The argument is only valid until the NegotiateExtensions callback
+	// returns.
+	//
+	// If two accepted extensions claim the same RSV bit, or an extension
+	// declares invalid bits, the upgrade fails with *ExtensionConflictError
+	// before the successful response is written.
+	//
+	// If returned error is non-nil then connection is rejected and response is
+	// sent with appropriate HTTP error code and body set to error message.
+	//
+	// RejectConnectionError could be used to get more control on response.
+	NegotiateExtensions func([]httphead.Option) ([]NegotiatedExtension, error)
 
 	// Header is an optional HandshakeHeader instance that could be used to
 	// write additional headers to the handshake response.
@@ -564,6 +611,11 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 			if f := u.Negotiate; err == nil && f != nil {
 				hs.Extensions, err = negotiateExtensions(v, hs.Extensions, f)
 			}
+			if f := u.NegotiateExtensions; err == nil && f != nil {
+				hs.Extensions, hs.NegotiatedExtensions, err = negotiateExtensionsMany(
+					v, hs.Extensions, hs.NegotiatedExtensions, f,
+				)
+			}
 			// DEPRECATED path.
 			if custom, check := u.ExtensionCustom, u.Extension; u.Negotiate == nil && (custom != nil || check != nil) {
 				var ok bool
@@ -622,6 +674,9 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 
 	case err == nil && u.OnBeforeUpgrade != nil:
 		header[1], err = u.OnBeforeUpgrade()
+	}
+	if err == nil && u.NegotiateExtensions != nil {
+		err = CheckExtensionConflicts(hs.NegotiatedExtensions)
 	}
 	if err != nil {
 		var code int

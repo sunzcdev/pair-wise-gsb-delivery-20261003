@@ -262,6 +262,71 @@ func negotiateExtensions(
 	return negotiateMaybe(current, dest, f)
 }
 
+// scanOptions parses all options from the Sec-WebSocket-Extensions header
+// value h into out and returns it. Options are copied so they do not alias
+// the parsed header bytes.
+func scanOptions(h []byte, out []httphead.Option) ([]httphead.Option, bool) {
+	index := -1
+	var current httphead.Option
+	ok := httphead.ScanOptions(h, func(i int, name, attr, val []byte) httphead.Control {
+		if i != index {
+			if index != -1 {
+				out = append(out, current.Clone())
+			}
+			index = i
+			current = httphead.Option{Name: name}
+		}
+		if attr != nil {
+			current.Parameters.Set(attr, val)
+		}
+		return httphead.ControlContinue
+	})
+	if !ok {
+		return out, false
+	}
+	if index != -1 {
+		out = append(out, current.Clone())
+	}
+	return out, true
+}
+
+// negotiateExtensionsMany parses the offered extensions from header value h
+// and passes all of them at once to f, which decides which extensions are
+// accepted and which RSV bits they claim.
+//
+// It returns accepted options (to be written back into the handshake
+// response) and negotiated extensions with RSV bit declarations.
+func negotiateExtensionsMany(
+	h []byte,
+	options []httphead.Option,
+	negotiated []NegotiatedExtension,
+	f func([]httphead.Option) ([]NegotiatedExtension, error),
+) (_ []httphead.Option, _ []NegotiatedExtension, err error) {
+	var offered []httphead.Option
+	offered, ok := scanOptions(h, offered)
+	if !ok {
+		return options, negotiated, ErrMalformedRequest
+	}
+	if len(offered) == 0 {
+		return options, negotiated, nil
+	}
+	accepted, err := f(offered)
+	if err != nil {
+		return options, negotiated, err
+	}
+	for _, ext := range accepted {
+		if ext.Option.Size() == 0 {
+			continue
+		}
+		options = append(options, ext.Option.Clone())
+		negotiated = append(negotiated, NegotiatedExtension{
+			Option: ext.Option.Clone(),
+			Rsv:    ext.Rsv,
+		})
+	}
+	return options, negotiated, nil
+}
+
 func httpWriteHeader(bw *bufio.Writer, key, value string) {
 	httpWriteHeaderKey(bw, key)
 	bw.WriteString(value)
