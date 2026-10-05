@@ -399,6 +399,42 @@ func (obj JSONWebSignature) Verify(verificationKey interface{}) ([]byte, error) 
 	return obj.payload, nil
 }
 
+// Verify validates the signature on the object using the critical header
+// extensions registered on the Verifier and returns the payload. It behaves
+// like [JSONWebSignature.Verify] apart from the extensions in effect.
+func (v *Verifier) Verify(obj *JSONWebSignature, verificationKey interface{}) ([]byte, error) {
+	if err := obj.detachedVerify(obj.payload, verificationKey, v.criticals()); err != nil {
+		return nil, err
+	}
+	return obj.payload, nil
+}
+
+// DetachedVerify validates a detached signature using the critical header
+// extensions registered on the Verifier. It behaves like
+// [JSONWebSignature.DetachedVerify] apart from the extensions in effect.
+func (v *Verifier) DetachedVerify(obj *JSONWebSignature, payload []byte, verificationKey interface{}) error {
+	return obj.detachedVerify(payload, verificationKey, v.criticals())
+}
+
+// VerifyMulti validates one of potentially multiple signatures using the
+// critical header extensions registered on the Verifier. It behaves like
+// [JSONWebSignature.VerifyMulti] apart from the extensions in effect.
+func (v *Verifier) VerifyMulti(obj *JSONWebSignature, verificationKey interface{}) (int, Signature, []byte, error) {
+	idx, sig, err := obj.detachedVerifyMulti(obj.payload, verificationKey, v.criticals())
+	if err != nil {
+		return -1, Signature{}, nil, err
+	}
+	return idx, sig, obj.payload, nil
+}
+
+// DetachedVerifyMulti validates a detached signature on an object with
+// potentially multiple signers using the critical header extensions registered
+// on the Verifier. It behaves like [JSONWebSignature.DetachedVerifyMulti]
+// apart from the extensions in effect.
+func (v *Verifier) DetachedVerifyMulti(obj *JSONWebSignature, payload []byte, verificationKey interface{}) (int, Signature, error) {
+	return obj.detachedVerifyMulti(payload, verificationKey, v.criticals())
+}
+
 // UnsafePayloadWithoutVerification returns the payload without
 // verifying it. The content returned from this function cannot be
 // trusted.
@@ -414,6 +450,10 @@ func (obj JSONWebSignature) UnsafePayloadWithoutVerification() []byte {
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey interface{}) error {
+	return obj.detachedVerify(payload, verificationKey, defaultCriticalExtensions)
+}
+
+func (obj JSONWebSignature) detachedVerify(payload []byte, verificationKey interface{}, crits *criticalExtensions) error {
 	if len(obj.Signatures) > 1 {
 		return errors.New("go-jose/go-jose: too many signatures in payload; expecting only one")
 	}
@@ -435,17 +475,21 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 		// "When used, this Header Parameter MUST be integrity
 		// protected; therefore, it MUST occur only within the JWS
 		// Protected Header."
-		err = signature.header.checkNoCritical()
+		if _, ok := (*signature.header)[headerCritical]; ok {
+			return ErrUnsupportedCriticalHeader
+		}
+	}
+
+	var before, after []CriticalHeaderExtension
+	if signature.protected != nil {
+		before, after, err = crits.resolve(signature.protected)
 		if err != nil {
 			return err
 		}
 	}
 
-	if signature.protected != nil {
-		err = signature.protected.checkSupportedCritical(supportedCritical)
-		if err != nil {
-			return err
-		}
+	if err = runCriticalExtensions(before, signature.protected); err != nil {
+		return err
 	}
 
 	input, err := obj.computeAuthData(payload, &signature)
@@ -458,6 +502,10 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 	err = verifier.verifyPayload(input, signature.Signature, alg)
 	if err != nil {
 		return ErrCryptoFailure
+	}
+
+	if err = runCriticalExtensions(after, signature.protected); err != nil {
+		return err
 	}
 
 	return nil
@@ -491,6 +539,10 @@ func (obj JSONWebSignature) VerifyMulti(verificationKey interface{}) (int, Signa
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey interface{}) (int, Signature, error) {
+	return obj.detachedVerifyMulti(payload, verificationKey, defaultCriticalExtensions)
+}
+
+func (obj JSONWebSignature) detachedVerifyMulti(payload []byte, verificationKey interface{}, crits *criticalExtensions) (int, Signature, error) {
 	for i, signature := range obj.Signatures {
 		if signature.header != nil {
 			// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
@@ -498,18 +550,22 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 			// "When used, this Header Parameter MUST be integrity
 			// protected; therefore, it MUST occur only within the JWS
 			// Protected Header."
-			err := signature.header.checkNoCritical()
+			if _, ok := (*signature.header)[headerCritical]; ok {
+				continue
+			}
+		}
+
+		var before, after []CriticalHeaderExtension
+		if signature.protected != nil {
+			var err error
+			before, after, err = crits.resolve(signature.protected)
 			if err != nil {
 				continue
 			}
 		}
 
-		if signature.protected != nil {
-			// Check for only supported critical headers
-			err := signature.protected.checkSupportedCritical(supportedCritical)
-			if err != nil {
-				continue
-			}
+		if err := runCriticalExtensions(before, signature.protected); err != nil {
+			continue
 		}
 
 		// If the verification key is a JWK Set, pick a key based on this signature's
@@ -532,6 +588,10 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 		alg := headers.getSignatureAlgorithm()
 		err = verifier.verifyPayload(input, signature.Signature, alg)
 		if err != nil {
+			continue
+		}
+
+		if err := runCriticalExtensions(after, signature.protected); err != nil {
 			continue
 		}
 

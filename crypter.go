@@ -457,14 +457,30 @@ func validateContentEncryptionKeySize(cek []byte, cipher contentCipher) error {
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >10x the size of the compressed data, whichever is larger.
 func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) {
+	return obj.decrypt(decryptionKey, defaultCriticalExtensions)
+}
+
+func (obj JSONWebEncryption) decrypt(decryptionKey interface{}, crits *criticalExtensions) ([]byte, error) {
 	headers := obj.mergedHeaders(nil)
 
 	if len(obj.recipients) > 1 {
 		return nil, errors.New("go-jose/go-jose: too many recipients in payload; expecting only one")
 	}
 
-	err := headers.checkNoCritical()
+	// "crit" is integrity protected and MUST NOT be carried in the shared
+	// unprotected header.
+	if obj.unprotected != nil {
+		if _, ok := (*obj.unprotected)[headerCritical]; ok {
+			return nil, ErrUnsupportedCriticalHeader
+		}
+	}
+
+	before, after, err := crits.resolve(obj.protected)
 	if err != nil {
+		return nil, err
+	}
+
+	if err = runCriticalExtensions(before, obj.protected); err != nil {
 		return nil, err
 	}
 
@@ -518,6 +534,10 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 		return nil, err
 	}
 
+	if err = runCriticalExtensions(after, obj.protected); err != nil {
+		return nil, err
+	}
+
 	return plaintext, nil
 }
 
@@ -532,10 +552,26 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >3x the size of the compressed data, whichever is larger.
 func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Header, []byte, error) {
+	return obj.decryptMulti(decryptionKey, defaultCriticalExtensions)
+}
+
+func (obj JSONWebEncryption) decryptMulti(decryptionKey interface{}, crits *criticalExtensions) (int, Header, []byte, error) {
 	globalHeaders := obj.mergedHeaders(nil)
 
-	err := globalHeaders.checkNoCritical()
+	// "crit" is integrity protected and MUST NOT be carried in the shared
+	// unprotected header.
+	if obj.unprotected != nil {
+		if _, ok := (*obj.unprotected)[headerCritical]; ok {
+			return -1, Header{}, nil, ErrUnsupportedCriticalHeader
+		}
+	}
+
+	before, after, err := crits.resolve(obj.protected)
 	if err != nil {
+		return -1, Header{}, nil, err
+	}
+
+	if err = runCriticalExtensions(before, obj.protected); err != nil {
 		return -1, Header{}, nil, err
 	}
 
@@ -578,6 +614,14 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 	for i, recipient := range obj.recipients {
 		recipientHeaders := obj.mergedHeaders(&recipient)
 
+		// A per-recipient unprotected header MUST NOT carry "crit"; any
+		// critical parameters must be integrity protected.
+		if recipient.header != nil {
+			if _, ok := (*recipient.header)[headerCritical]; ok {
+				continue
+			}
+		}
+
 		var cek []byte
 		cek, err = decrypter.decryptKey(recipientHeaders, &recipient, generator)
 		if err != nil {
@@ -591,6 +635,10 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 		// Found a valid CEK -- let's try to decrypt.
 		plaintext, err = cipher.decrypt(cek, authData, parts)
 		if err != nil {
+			continue
+		}
+
+		if err = runCriticalExtensions(after, obj.protected); err != nil {
 			continue
 		}
 
