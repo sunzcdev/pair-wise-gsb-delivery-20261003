@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `WithClassifiedBackOff` routes each failure to a separate `BackOff` chosen by a caller-supplied `Classifier`, so failure types such as connection errors and rate-limit errors pace themselves independently. The classifier decides only whether to retry and which class's `BackOff` to use; the original error chain is never altered. A non-retriable verdict stops `Retry` with `ErrPermanent`.
+- `WithResetOnSwitch`, a `RouteOption` for `WithClassifiedBackOff`, controls whether switching to a failure class restarts its backoff sequence. The default retains each class's sequence across switches.
+- Each `Retry` call builds its own per-class `BackOff`s from the supplied factory, so concurrent calls sharing the same options do not share mutable state.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed

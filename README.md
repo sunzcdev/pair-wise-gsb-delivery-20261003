@@ -71,6 +71,50 @@ if re := backoff.AsRetryError(err); re != nil {
 
 Mark an error non-retriable with `backoff.Permanent(err)`; `Retry` stops immediately and returns a `*RetryError` whose `Cause` is `ErrPermanent` and whose `LastErr` is `err`.
 
+### Different backoff per failure type
+
+Some failures should be paced differently: a dropped connection can retry
+quickly, while a rate-limit response should back off slowly. Pass a classifier
+with `WithClassifiedBackOff`: it names the failure class and says whether it is
+retriable, and a factory supplies a separate `BackOff` for each class.
+
+```go
+const (
+	classConn = "connection"
+	classRate = "rate-limit"
+)
+
+classify := func(err error) (class backoff.ErrorClass, retry bool) {
+	switch {
+	case errors.Is(err, errConn):
+		return classConn, true
+	case errors.Is(err, errRate):
+		return classRate, true
+	default:
+		return "", false // non-retriable: stops like backoff.Permanent
+	}
+}
+
+result, err := backoff.Retry(ctx, operation,
+	backoff.WithClassifiedBackOff(classify, func(class backoff.ErrorClass) backoff.BackOff {
+		if class == classRate {
+			return backoff.NewConstantBackOff(10 * time.Second)
+		}
+		return backoff.NewConstantBackOff(100 * time.Millisecond)
+	}))
+```
+
+Each class owns its `BackOff` and keeps its own place in the backoff sequence.
+When the active class changes, the new class resumes its sequence where it left
+off; pass `backoff.WithResetOnSwitch()` to restart that class from its first
+interval instead. A `RetryAfterError` still overrides that single wait and
+resets the active class. The classifier affects only whether to retry and the
+waiting rhythm — the original error is returned unchanged as
+`RetryError.LastErr`.
+
+Every `Retry` call builds its own per-class `BackOff`s from the factory, so
+concurrent calls sharing these options never share mutable state.
+
 ### Bounding total time
 
 Two independent limits cap how long `Retry` runs, and they behave differently:

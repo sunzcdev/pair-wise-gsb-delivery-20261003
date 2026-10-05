@@ -27,6 +27,7 @@ type retryOptions struct {
 	Notify         Notify        // Optional function called before each backoff wait.
 	MaxTries       uint          // Maximum number of retry attempts.
 	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	route          *classifiedRoute
 }
 
 // RetryOption configures the behavior of Retry.
@@ -38,6 +39,9 @@ type RetryOption func(*retryOptions)
 // Retry calls Reset on the policy before the first attempt, so a previously
 // used policy may be passed. A BackOff is stateful and not safe for concurrent
 // use: give each concurrent Retry call its own BackOff rather than sharing one.
+//
+// WithClassifiedBackOff, when also supplied, takes precedence and selects a
+// separate BackOff per failure class instead of this one.
 func WithBackOff(b BackOff) RetryOption {
 	return func(args *retryOptions) {
 		args.BackOff = b
@@ -162,8 +166,19 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			return res, &RetryError{LastErr: lastErr, Cause: cerr}
 		}
 
+		// Select the BackOff that paces this retry. With a classifier, it decides
+		// whether the error is retriable and picks a class-specific BackOff;
+		// classification never alters the error being reported.
+		b := args.BackOff
+		if args.route != nil {
+			b = args.route.backOffFor(err)
+			if b == nil {
+				return res, &RetryError{LastErr: err, Cause: ErrPermanent}
+			}
+		}
+
 		// Calculate next backoff duration.
-		next := args.BackOff.NextBackOff()
+		next := b.NextBackOff()
 		if next == Stop {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
 		}
@@ -171,7 +186,11 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 		// Reset backoff if a RetryAfterError requested a specific delay.
 		if retryAfter != nil {
 			next = retryAfter.Duration
-			args.BackOff.Reset()
+			if args.route != nil {
+				args.route.resetActive()
+			} else {
+				b.Reset()
+			}
 		}
 
 		// A negative delay (e.g. a Retry-After date already in the past) means retry now.

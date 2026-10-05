@@ -150,3 +150,65 @@ func ExampleTicker() {
 	fmt.Println(result)
 	// Output: hello
 }
+
+// Failures of different kinds can be routed to independent backoff policies.
+// The classifier is supplied by the caller and decides both whether to retry
+// and which class's BackOff paces the wait.
+func ExampleWithClassifiedBackOff() {
+	var (
+		errConn = errors.New("connection refused")
+		errRate = errors.New("too many requests")
+		errAuth = errors.New("bad credentials")
+	)
+
+	const (
+		classConn = "connection"
+		classRate = "rate-limit"
+	)
+
+	classify := func(err error) (backoff.ErrorClass, bool) {
+		switch {
+		case errors.Is(err, errConn):
+			return classConn, true
+		case errors.Is(err, errRate):
+			return classRate, true
+		default:
+			// Any other error is non-retriable and stops like Permanent.
+			return "", false
+		}
+	}
+
+	// The attempt sequence below is: connection error, rate-limit error,
+	// connection error, success. Each class owns its own BackOff.
+	attempt := 0
+	operation := func() (string, error) {
+		attempt++
+		switch attempt {
+		case 1, 3:
+			return "", errConn
+		case 2:
+			return "", errRate
+		case 4:
+			return "hello", nil
+		default:
+			return "", errAuth
+		}
+	}
+
+	result, err := backoff.Retry(context.TODO(), operation,
+		backoff.WithMaxElapsedTime(0),
+		backoff.WithClassifiedBackOff(classify, func(class backoff.ErrorClass) backoff.BackOff {
+			if class == classRate {
+				return backoff.NewConstantBackOff(50 * time.Millisecond)
+			}
+			return backoff.NewConstantBackOff(10 * time.Millisecond)
+		}),
+	)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	fmt.Println(result)
+	// Output: hello
+}
