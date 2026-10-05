@@ -481,6 +481,18 @@ func (c *Client) Exited() bool {
 	return c.exited
 }
 
+// done returns a channel that is closed when the plugin process exits. It
+// returns nil if the process has not been started yet, so callers must only
+// use it after a successful Start.
+func (c *Client) done() <-chan struct{} {
+	c.l.Lock()
+	defer c.l.Unlock()
+	if c.doneCtx == nil {
+		return nil
+	}
+	return c.doneCtx.Done()
+}
+
 // killed is used in tests to check if a process failed to exit gracefully, and
 // needed to be killed.
 func (c *Client) killed() bool {

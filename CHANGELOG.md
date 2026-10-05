@@ -1,5 +1,8 @@
 ## Unreleased
 
+ENHANCEMENTS:
+* Added `Supervisor`, an optional supervisor for long-running plugins that restarts crashed plugin processes with exponential backoff, gives up after a configurable number of restarts or time budget, never restarts after a user-initiated `Kill`, and isolates every (re)start into an independent generation so stale clients and broker connections cannot silently attach to a new process
+
 SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 
