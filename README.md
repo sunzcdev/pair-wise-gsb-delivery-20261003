@@ -23,6 +23,7 @@ If you need version 4, use `go get -u gopkg.in/evanphx/json-patch.v4`
 * [Create and apply a JSON Patch](#create-and-apply-a-json-patch)
 * [Comparing JSON documents](#comparing-json-documents)
 * [Combine merge patches](#combine-merge-patches)
+* [Rebase a JSON Patch](#rebase-a-json-patch)
 
 
 # Configuration
@@ -193,6 +194,37 @@ $ go run main.go
 "original" is structurally equal to "similar"
 "original" is _not_ structurally equal to "different"
 ```
+
+## Rebase a JSON Patch
+When two users start with the same document, user A saves first and user B has
+an RFC 6902 patch. `RebasePatch` returns a transformed copy of B's patch that
+applies to A's saved document:
+
+```go
+original := []byte(`{"items":[1,2,3]}`)
+savedByA := []byte(`[{"op":"add","path":"/items/0","value":0}]`)
+patchByB := []byte(`[{"op":"replace","path":"/items/1","value":"B"}]`)
+
+rebased, err := jsonpatch.RebasePatch(original, savedByA, patchByB)
+// rebased: [{"op":"replace","path":"/items/2","value":"B"}]
+```
+
+Array elements are tracked by identity rather than just numeric indexes. This
+keeps B's operation attached to the same element after A inserts, removes, or
+moves values. If A inserts `0` at the beginning, B's edit to the original
+element `2` is retargeted from `/items/1` to `/items/2`.
+
+Safe combinations include edits to different fields, index shifts caused by
+array insertions or deletions, moves that relocate the element B refers to,
+and both sides removing the same target. In the last case the redundant
+operation is omitted from the transformed patch.
+
+Unsafe combinations return `*jsonpatch.RebaseConflict` instead of letting a
+last-write overwrite hide the disagreement. The `AOperation` and
+`BOperation` fields are 1-based indexes into the input patch arrays. Conflicts
+include A replacing B's exact target, A deleting an ancestor needed by B, A
+deleting the exact element B updates or moves, and both sides adding or moving
+different values to the same destination.
 
 ## Combine merge patches
 Given two JSON merge patch documents, it is possible to combine them into a 
