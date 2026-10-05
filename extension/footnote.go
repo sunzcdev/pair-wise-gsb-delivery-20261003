@@ -559,6 +559,24 @@ func (d *footnoteDecorator) Decorate(next html.NodeRenderer) html.NodeRenderer {
 					if _, exists := infos[label]; !exists {
 						infos[label] = &defInfo{index: -1}
 					}
+					_ = gast.Walk(def, func(node gast.Node, entering bool) (gast.WalkStatus, error) {
+						if !entering {
+							return gast.WalkContinue, nil
+						}
+						if ref, ok := node.(*ast.FootnoteReference); ok {
+							label := ref.Label.Str(source)
+							info, exists := infos[label]
+							if !exists {
+								info = &defInfo{index: -1}
+								infos[label] = info
+							}
+							if info.index < 0 {
+								info.index = ref.Index
+							}
+							info.references = append(info.references, ref.RefIndex)
+						}
+						return gast.WalkContinue, nil
+					})
 					return gast.WalkSkipChildren, nil
 				}
 				if ref, ok := node.(*ast.FootnoteReference); ok {
