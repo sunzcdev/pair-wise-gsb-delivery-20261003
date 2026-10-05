@@ -521,61 +521,6 @@ func loModule(L *LState) int {
 	return 1
 }
 
-var loopdetection = &LUserData{}
-
-func loRequire(L *LState) int {
-	name := L.CheckString(1)
-	loaded := L.GetField(L.Get(RegistryIndex), "_LOADED")
-	lv := L.GetField(loaded, name)
-	if LVAsBool(lv) {
-		if lv == loopdetection {
-			L.RaiseError("loop or previous error loading module: %s", name)
-		}
-		L.Push(lv)
-		return 1
-	}
-	loaders, ok := L.GetField(L.Get(RegistryIndex), "_LOADERS").(*LTable)
-	if !ok {
-		L.RaiseError("package.loaders must be a table")
-	}
-	messages := []string{}
-	var modasfunc LValue
-	for i := 1; ; i++ {
-		loader := L.RawGetInt(loaders, i)
-		if loader == LNil {
-			L.RaiseError("module %s not found:\n\t%s, ", name, strings.Join(messages, "\n\t"))
-		}
-		L.Push(loader)
-		L.Push(LString(name))
-		L.Call(1, 1)
-		ret := L.reg.Pop()
-		switch retv := ret.(type) {
-		case *LFunction:
-			modasfunc = retv
-			goto loopbreak
-		case LString:
-			messages = append(messages, string(retv))
-		}
-	}
-loopbreak:
-	L.SetField(loaded, name, loopdetection)
-	L.Push(modasfunc)
-	L.Push(LString(name))
-	L.Call(1, 1)
-	ret := L.reg.Pop()
-	modv := L.GetField(loaded, name)
-	if ret != LNil && modv == loopdetection {
-		L.SetField(loaded, name, ret)
-		L.Push(ret)
-	} else if modv == loopdetection {
-		L.SetField(loaded, name, LTrue)
-		L.Push(LTrue)
-	} else {
-		L.Push(modv)
-	}
-	return 1
-}
-
 /* }}} */
 
 /* hidden features {{{ */

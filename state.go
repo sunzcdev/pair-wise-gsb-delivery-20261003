@@ -638,11 +638,12 @@ func (rg *registry) IsFull() bool {
 
 func newGlobal() *Global {
 	return &Global{
-		MainThread: nil,
-		Registry:   newLTable(0, 32),
-		Global:     newLTable(0, 64),
-		builtinMts: make(map[int]LValue),
-		tempFiles:  make([]*os.File, 0, 10),
+		MainThread:  nil,
+		Registry:    newLTable(0, 32),
+		Global:      newLTable(0, 64),
+		moduleGraph: newModuleGraph(),
+		builtinMts:  make(map[int]LValue),
+		tempFiles:   make([]*os.File, 0, 10),
 	}
 }
 

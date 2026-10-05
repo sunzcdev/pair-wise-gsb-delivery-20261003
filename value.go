@@ -170,6 +170,7 @@ type Global struct {
 	CurrentThread *LState
 	Registry      *LTable
 	Global        *LTable
+	moduleGraph   *moduleGraph
 
 	builtinMts map[int]LValue
 	tempFiles  []*os.File
@@ -184,17 +185,18 @@ type LState struct {
 	Dead    bool
 	Options Options
 
-	stop         int32
-	reg          *registry
-	stack        callFrameStack
-	alloc        *allocator
-	currentFrame *callFrame
-	wrapped      bool
-	uvcache      *Upvalue
-	hasErrorFunc bool
-	mainLoop     func(*LState, *callFrame)
-	ctx          context.Context
-	ctxCancelFn  context.CancelFunc
+	stop           int32
+	reg            *registry
+	stack          callFrameStack
+	alloc          *allocator
+	currentFrame   *callFrame
+	wrapped        bool
+	uvcache        *Upvalue
+	hasErrorFunc   bool
+	mainLoop       func(*LState, *callFrame)
+	ctx            context.Context
+	ctxCancelFn    context.CancelFunc
+	loadingModules []moduleLoad
 }
 
 func (ls *LState) String() string   { return fmt.Sprintf("thread: %p", ls) }
