@@ -9,8 +9,10 @@ import (
 )
 
 func (env *env) execute(bc *Code, v any, vars ...any) Iter {
+	env.code = bc
 	env.codes = bc.codes
 	env.codeinfos = bc.codeinfos
+	env.stackTrace = bc.funcFrames != nil
 	env.push(v)
 	for i := len(vars) - 1; i >= 0; i-- {
 		env.push(vars[i])
@@ -23,6 +25,7 @@ func (env *env) Next() (any, bool) {
 	var err error
 	pc, callpc, index := env.pc, len(env.codes)-1, -1
 	backtrack, hasCtx := env.backtrack, env.ctx != context.Background()
+	tail := false
 	defer func() { env.pc, env.backtrack = pc, true }()
 loop:
 	for ; pc < len(env.codes); pc++ {
@@ -99,6 +102,7 @@ loop:
 					env.pop()
 					env.push(err.Error())
 				}
+				env.goFrame = nil
 				pc, backtrack, err = code.v.(int), false, nil
 				goto loop
 			}
@@ -117,6 +121,7 @@ loop:
 				case nil, *breakError, *HaltError:
 					break loop
 				}
+				env.goFrame = nil
 				pc, backtrack, err = code.v.(int), false, nil
 				goto loop
 			}
@@ -126,6 +131,7 @@ loop:
 				label := env.pop()
 				if e, ok := err.(*breakError); ok && e.v == label {
 					err = nil
+					env.goFrame = nil
 				}
 				break loop
 			}
@@ -137,6 +143,16 @@ loop:
 		case opbacktrack:
 			break loop
 		case opjump:
+			pc = code.v.(int)
+			goto loop
+		case opjumprec:
+			// Tail self-call compiled as a jump (see optimizeTailRec) when
+			// stack frames are enabled. It behaves exactly like opjump, but
+			// the frame of the current scope is marked as a (compressed)
+			// tail call so the trace reports one frame instead of growing.
+			if env.stackTrace && env.scopes.index >= 0 {
+				env.scopes.data[env.scopes.index].value.tail = true
+			}
 			pc = code.v.(int)
 			goto loop
 		case opjumpifnot:
@@ -175,6 +191,7 @@ loop:
 			switch v := code.v.(type) {
 			case int:
 				pc, callpc, index = v, pc, env.scopes.index
+				tail = false
 				goto loop
 			case [3]any:
 				argcnt := v[1].(int)
@@ -182,11 +199,13 @@ loop:
 				for i := range argcnt {
 					args[i] = env.pop()
 				}
+				env.goFrame = env.goCallFrame(v[2].(string), pc)
 				w := v[0].(func(any, []any) any)(x, args)
 				if e, ok := w.(error); ok {
 					err = e
 					break loop
 				}
+				env.goFrame = nil
 				env.push(w)
 				if !env.paths.empty() && env.expdepth == 0 {
 					switch v[2].(string) {
@@ -220,12 +239,14 @@ loop:
 			}
 		case opcallrec:
 			pc, callpc, index = code.v.(int), -1, env.scopes.index
+			tail = true
 			goto loop
 		case oppushpc:
 			env.push([2]int{code.v.(int), env.scopes.index})
 		case opcallpc:
 			xs := env.pop().([2]int)
 			pc, callpc, index = xs[0], pc, xs[1]
+			tail = false
 			goto loop
 		case opscope:
 			xs := code.v.([3]int)
@@ -239,12 +260,14 @@ loop:
 			} else {
 				saveindex = env.scopes.index
 			}
+			tailEntry := tail
+			tail = false
 			if outerindex = index; outerindex >= 0 {
 				if s := env.scopes.data[outerindex].value; s.id == xs[0] {
 					outerindex = s.outerindex
 				}
 			}
-			env.scopes.push(scope{xs[0], env.offset, callpc, saveindex, outerindex})
+			env.scopes.push(scope{xs[0], env.offset, callpc, saveindex, outerindex, tailEntry})
 			env.offset += xs[1]
 			if env.offset > len(env.values) {
 				vs := make([]any, env.offset*2)
@@ -306,6 +329,9 @@ loop:
 					env.pop()
 					if e, ok := w.(error); ok {
 						err = e
+						if env.stackTrace {
+							env.goFrame = env.goCallFrame("", pc)
+						}
 						break loop
 					}
 					env.push(w)
@@ -350,13 +376,97 @@ loop:
 		}
 	}
 	if len(env.forks) > 0 {
+		if err == nil {
+			env.goFrame = nil
+		}
 		pc, backtrack = env.popfork(), true
 		goto loop
 	}
 	if err != nil {
-		return err, true
+		return env.withStackFrames(err), true
 	}
 	return nil, false
+}
+
+// withStackFrames attaches the current structured stack trace to a terminal
+// error. Errors caught by try-catch never reach here; they are unwrapped by
+// opforktrybegin and turned into plain jq values, so the frames stay invisible
+// inside the language. Halt errors keep their concrete type (they are not
+// catchable) but carry the same frames.
+func (env *env) withStackFrames(err error) error {
+	if !env.stackTrace {
+		return err
+	}
+	if _, ok := err.(*tryEndError); ok {
+		return err
+	}
+	frames := env.buildStackFrames()
+	if env.goFrame != nil {
+		frames = append([]stackFrame{*env.goFrame}, frames...)
+	}
+	if len(frames) == 0 {
+		return err
+	}
+	if halt, ok := err.(*HaltError); ok {
+		halt.frames = frames
+		halt.traceCode = env.code
+		return halt
+	}
+	if _, ok := err.(StackTracer); ok {
+		return err
+	}
+	return &stackError{err: err, code: env.code, frames: frames}
+}
+
+// goCallFrame builds the innermost frame for a function implemented in Go (a
+// built-in or a function registered with WithFunction/WithIterFunction). Such
+// functions have no jq definition range; only the call site is reported.
+func (env *env) goCallFrame(name string, pc int) *stackFrame {
+	if !env.stackTrace {
+		return nil
+	}
+	frame := stackFrame{kind: FrameGoFunc, function: name, defStart: -1}
+	if info, ok := env.code.callInfos[pc]; ok {
+		info := info
+		if frame.function == "" {
+			frame.function = info.function
+		}
+		frame.call = &info
+	}
+	return &frame
+}
+
+// buildStackFrames walks the active scope chain (innermost first) and resolves
+// each frame against the compiler metadata. A tail-recursive scope carries the
+// TailCall marker; opjumprec keeps a single scope, so the list is bounded.
+func (env *env) buildStackFrames() []stackFrame {
+	if env.code == nil || env.code.funcFrames == nil {
+		return nil
+	}
+	var frames []stackFrame
+	for i := env.scopes.index; i >= 0; i = env.scopes.data[i].value.saveindex {
+		s := env.scopes.data[i].value
+		meta, ok := env.code.funcFrames[s.id]
+		if !ok {
+			continue
+		}
+		frame := stackFrame{
+			kind:     meta.kind,
+			module:   meta.module,
+			function: meta.function,
+			defStart: meta.defStart,
+			defEnd:   meta.defEnd,
+			tailCall: s.tail,
+		}
+		if s.pc >= 0 {
+			if info, ok := env.code.callInfos[s.pc]; ok {
+				info := info
+				frame.call = &info
+			}
+		}
+		frames = append(frames, frame)
+	}
+	return frames
 }
 
 func (env *env) push(v any) {

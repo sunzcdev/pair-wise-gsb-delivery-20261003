@@ -17,6 +17,7 @@ func Parse(src string) (*Query, error) {
 	if yyParse(l) > 0 {
 		return nil, l.err
 	}
+	l.result.source = &sourceInfo{contents: src}
 	return l.result, nil
 }
 
@@ -30,6 +31,7 @@ type Query struct {
 	Right    *Query
 	Patterns []*Pattern
 	Op       Operator
+	source   *sourceInfo
 }
 
 // Run the query.
@@ -139,6 +141,8 @@ type FuncDef struct {
 	Name string
 	Args []string
 	Body *Query
+	Pos  int
+	End  int
 }
 
 func (e *FuncDef) String() string {
@@ -472,6 +476,8 @@ func (e *Index) toIndices(xs []any) []any {
 type Func struct {
 	Name string
 	Args []*Query
+	Pos  int
+	End  int
 }
 
 func (e *Func) String() string {

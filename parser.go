@@ -10,6 +10,7 @@ type yySymType struct {
 	value    any
 	token    string
 	operator Operator
+	pos      int
 }
 
 const tokAltOp = 57346
@@ -793,12 +794,15 @@ yydefault:
 	case 14:
 		yyDollar = yyS[yypt-5 : yypt+1]
 		{
-			yyVAL.value = &FuncDef{Name: yyDollar[2].token, Body: yyDollar[4].value.(*Query)}
+			fd := &FuncDef{Name: yyDollar[2].token, Body: yyDollar[4].value.(*Query)}
+			fd.Pos, fd.End = yyDollar[1].pos, yyDollar[5].pos+1
+			yyVAL.value = fd
 		}
 	case 15:
 		yyDollar = yyS[yypt-8 : yypt+1]
 		{
-			yyVAL.value = &FuncDef{yyDollar[2].token, yyDollar[4].value.([]string), yyDollar[7].value.(*Query)}
+			fd := &FuncDef{yyDollar[2].token, yyDollar[4].value.([]string), yyDollar[7].value.(*Query), yyDollar[1].pos, yyDollar[8].pos + 1}
+			yyVAL.value = fd
 		}
 	case 16:
 		yyDollar = yyS[yypt-1 : yypt+1]
@@ -1005,17 +1009,17 @@ yydefault:
 	case 58:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}
+			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token, Pos: yyDollar[1].pos, End: yyDollar[1].pos + len(yyDollar[1].token)}}
 		}
 	case 59:
 		yyDollar = yyS[yypt-4 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token, Args: yyDollar[3].value.([]*Query)}}
+			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token, Args: yyDollar[3].value.([]*Query), Pos: yyDollar[1].pos, End: yyDollar[4].pos + 1}}
 		}
 	case 60:
 		yyDollar = yyS[yypt-1 : yypt+1]
 		{
-			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token}}
+			yyVAL.value = &Term{Type: TermTypeFunc, Func: &Func{Name: yyDollar[1].token, Pos: yyDollar[1].pos, End: yyDollar[1].pos + len(yyDollar[1].token)}}
 		}
 	case 61:
 		yyDollar = yyS[yypt-2 : yypt+1]

@@ -94,3 +94,21 @@ func WithInputIter(inputIter Iter) CompilerOption {
 		c.inputIter = inputIter
 	}
 }
+
+// WithStackFrames is a compiler option to attach a structured stack trace to
+// runtime errors. It is opt-in and has no effect when omitted.
+//
+// When enabled, an error returned from [Iter.Next] additionally implements
+// [StackTracer]; retrieve the frames with [errors.As]. The error message is
+// unchanged (so terminal output stays concise) and the frames are not visible
+// to try-catch: a caught value is exactly the same as without this option.
+//
+// Tail calls are compressed with an explicit marker ([StackFrame].TailCall),
+// so recursing filters do not accumulate frames. Halt errors emitted by
+// halt/halt_error are not catchable and are reported separately from ordinary
+// errors, but they also carry the stack trace.
+func WithStackFrames() CompilerOption {
+	return func(c *compiler) {
+		c.stackFrames = true
+	}
+}

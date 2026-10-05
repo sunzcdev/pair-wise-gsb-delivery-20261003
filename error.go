@@ -170,8 +170,10 @@ func (err *func2WrapError) Error() string {
 }
 
 type exitCodeError struct {
-	value any
-	code  int
+	value     any
+	code      int
+	frames    []stackFrame
+	traceCode *Code
 }
 
 func (err *exitCodeError) Error() string {
@@ -200,6 +202,16 @@ type HaltError exitCodeError
 
 func (err *HaltError) Error() string {
 	return "halt " + (*exitCodeError)(err).Error()
+}
+
+// StackFrames implements [StackTracer]. A halt error is never catchable by
+// try-catch, but with WithStackFrames an embedder can still inspect where
+// halt/halt_error fired.
+func (err *HaltError) StackFrames() []StackFrame {
+	if err.traceCode == nil {
+		return nil
+	}
+	return err.traceCode.stackFrames(err.frames)
 }
 
 // Value returns the value of the error. This implements [ValueError],

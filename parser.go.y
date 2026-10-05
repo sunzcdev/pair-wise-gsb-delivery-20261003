@@ -8,6 +8,7 @@ import "slices"
   value    any
   token    string
   operator Operator
+  pos      int
 }
 
 %type<value> program header imports import meta body funcdefs funcdef funcargs query
@@ -109,11 +110,14 @@ funcdefs
 funcdef
     : tokDef tokIdent ':' query ';'
     {
-        $$ = &FuncDef{Name: $2, Body: $4.(*Query)}
+        fd := &FuncDef{Name: $2, Body: $4.(*Query)}
+        fd.Pos, fd.End = $<pos>1, $<pos>5+1
+        $$ = fd
     }
     | tokDef tokIdent '(' funcargs ')' ':' query ';'
     {
-        $$ = &FuncDef{$2, $4.([]string), $7.(*Query)}
+        fd := &FuncDef{$2, $4.([]string), $7.(*Query), $<pos>1, $<pos>8+1}
+        $$ = fd
     }
 
 funcargs
@@ -303,15 +307,15 @@ term
     }
     | tokIdentModuleIdent
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1}}
+        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1, Pos: $<pos>1, End: $<pos>1+len($1)}}
     }
     | tokIdentModuleIdent '(' args ')'
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1, Args: $3.([]*Query)}}
+        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1, Args: $3.([]*Query), Pos: $<pos>1, End: $<pos>4+1}}
     }
     | tokVariableModuleVariable
     {
-        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1}}
+        $$ = &Term{Type: TermTypeFunc, Func: &Func{Name: $1, Pos: $<pos>1, End: $<pos>1+len($1)}}
     }
     | '{' '}'
     {

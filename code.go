@@ -29,6 +29,7 @@ const (
 	opindexarray
 	opcall
 	opcallrec
+	opjumprec
 	oppushpc
 	opcallpc
 	opscope
@@ -84,6 +85,8 @@ func (op opcode) String() string {
 		return "call"
 	case opcallrec:
 		return "callrec"
+	case opjumprec:
+		return "jumprec"
 	case oppushpc:
 		return "pushpc"
 	case opcallpc:

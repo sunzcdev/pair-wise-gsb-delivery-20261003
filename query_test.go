@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/itchyny/gojq"
 )
@@ -396,9 +397,53 @@ func TestQueryString(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	normalizeQueryPositions(q)
+	normalizeQueryPositions(r)
 	if !reflect.DeepEqual(q, r) {
 		t.Errorf("\n%v\n%v", q, r)
 	}
+}
+
+// normalizeQueryPositions clears source-position metadata (Pos/End on
+// FuncDef/Func and the unexported source pointer on Query) so that round-trip
+// comparisons ignore positions, which legitimately differ after reformatting.
+func normalizeQueryPositions(v any) {
+	var walk func(reflect.Value)
+	walk = func(x reflect.Value) {
+		switch x.Kind() {
+		case reflect.Ptr, reflect.Interface:
+			if !x.IsNil() {
+				walk(x.Elem())
+			}
+		case reflect.Struct:
+			mt := x.Type()
+			if mt.Name() == "FuncDef" || mt.Name() == "Func" {
+				if f := x.FieldByName("Pos"); f.CanSet() {
+					f.SetInt(0)
+				}
+				if f := x.FieldByName("End"); f.CanSet() {
+					f.SetInt(0)
+				}
+			}
+			for i := 0; i < x.NumField(); i++ {
+				if x.Type().Field(i).Name == "source" {
+					// Query.source is an unexported, parse-only metadata
+					// pointer; clear it so round-trip AST comparisons only
+					// depend on the language-level structure.
+					f := x.Field(i)
+					reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).
+						Elem().Set(reflect.Zero(f.Type()))
+					continue
+				}
+				walk(x.Field(i))
+			}
+		case reflect.Slice:
+			for i := 0; i < x.Len(); i++ {
+				walk(x.Index(i))
+			}
+		}
+	}
+	walk(reflect.ValueOf(v))
 }
 
 func BenchmarkRun(b *testing.B) {

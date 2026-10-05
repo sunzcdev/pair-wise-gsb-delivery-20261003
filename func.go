@@ -2124,11 +2124,11 @@ func funcError(v any, args []any) any {
 	if len(args) > 0 {
 		v = args[0]
 	}
-	return &exitCodeError{v, 5}
+	return &exitCodeError{value: v, code: 5}
 }
 
 func funcHalt(any) any {
-	return &HaltError{nil, 0}
+	return &HaltError{code: 0}
 }
 
 func funcHaltError(v any, args []any) any {
@@ -2139,7 +2139,7 @@ func funcHaltError(v any, args []any) any {
 			return &func0TypeError{"halt_error", args[0]}
 		}
 	}
-	return &HaltError{v, code}
+	return &HaltError{value: v, code: code}
 }
 
 func toInt(x any) (int, bool) {

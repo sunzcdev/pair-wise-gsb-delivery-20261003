@@ -79,7 +79,7 @@ func (env *env) debugCodes() {
 	for i, c := range env.codes {
 		pc := i
 		switch c.op {
-		case opcall, opcallrec:
+		case opcall, opcallrec, opjumprec:
 			if x, ok := c.v.(int); ok {
 				pc = x
 			}
@@ -92,7 +92,7 @@ func (env *env) debugCodes() {
 		var s string
 		if name := env.lookupInfoName(pc); name != "" {
 			switch c.op {
-			case opcall, opcallrec, opjump:
+			case opcall, opcallrec, opjump, opjumprec:
 				if !strings.HasPrefix(name, "module ") {
 					s = "\t## call " + name
 					break
@@ -127,7 +127,7 @@ func (env *env) debugState(pc int, backtrack bool) {
 		sb.WriteString(debugValue(env.stack.data[xs[i]].value))
 	}
 	switch c.op {
-	case opcall, opcallrec:
+	case opcall, opcallrec, opjumprec:
 		if x, ok := c.v.(int); ok {
 			pc = x
 		}
@@ -139,7 +139,7 @@ func (env *env) debugState(pc int, backtrack bool) {
 	}
 	if name := env.lookupInfoName(pc); name != "" {
 		switch c.op {
-		case opcall, opcallrec, opjump:
+		case opcall, opcallrec, opjump, opjumprec:
 			if !strings.HasPrefix(name, "module ") {
 				sb.WriteString("\t\t\t## call " + name)
 				break
@@ -174,7 +174,7 @@ func (env *env) debugForks(pc int, op string) {
 
 func debugOperand(c *code) string {
 	switch c.op {
-	case opcall, opcallrec:
+	case opcall, opcallrec, opjumprec:
 		switch v := c.v.(type) {
 		case int:
 			return strconv.Itoa(v)

@@ -48,9 +48,11 @@ var keywords = map[string]int{
 func (l *lexer) Lex(lval *yySymType) (tokenType int) {
 	defer func() { l.tokenType = tokenType }()
 	if len(l.source) == l.offset {
+		lval.pos = l.offset
 		l.token = ""
 		return eof
 	}
+	lval.pos = l.offset
 	if l.inString {
 		tok, str := l.scanString(l.offset)
 		lval.token = str
@@ -58,6 +60,7 @@ func (l *lexer) Lex(lval *yySymType) (tokenType int) {
 	}
 	ch, iseof := l.next()
 	if iseof {
+		lval.pos = l.offset
 		l.token = ""
 		return eof
 	}

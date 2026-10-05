@@ -23,13 +23,26 @@ type compiler struct {
 	scopes        []*scopeinfo
 	scopecnt      int
 	regexpCache   sync.Map
+	stackFrames   bool
+	sources       []sourceInfo
+	mainSource    sourceInfo
+	moduleName    string
+	funcFrames    map[int]funcFrame
+	callInfos     map[int]callInfo
+	callPos       int
+	callEnd       int
+	callActive    bool
 }
 
 // Code is a compiled jq query.
 type Code struct {
-	variables []string
-	codes     []*code
-	codeinfos []codeinfo
+	variables  []string
+	codes      []*code
+	codeinfos  []codeinfo
+	mainSource sourceInfo
+	sources    []sourceInfo
+	funcFrames map[int]funcFrame
+	callInfos  map[int]callInfo
 }
 
 // Run runs the code with the variable values (which should be in the
@@ -77,12 +90,22 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 	for _, opt := range options {
 		opt(c)
 	}
+	if c.stackFrames {
+		c.funcFrames = make(map[int]funcFrame)
+		c.callInfos = make(map[int]callInfo)
+		if q.source != nil {
+			c.mainSource = *q.source
+		}
+	}
 	c.builtinScope = c.newScope()
 	scope := c.newScope()
 	c.scopes = []*scopeinfo{scope}
 	setscope := c.lazy(func() *code {
 		return &code{op: opscope, v: [3]int{scope.id, scope.variablecnt, 0}}
 	})
+	if c.stackFrames {
+		c.funcFrames[scope.id] = funcFrame{kind: FrameTop}
+	}
 	for _, name := range c.variables {
 		if !newLexer(name).validVarName() {
 			return nil, &variableNameError{name}
@@ -111,11 +134,16 @@ func Compile(q *Query, options ...CompilerOption) (*Code, error) {
 	setscope()
 	c.optimizeTailRec()
 	c.optimizeCodeOps()
-	return &Code{
-		variables: c.variables,
-		codes:     c.codes,
-		codeinfos: c.codeinfos,
-	}, nil
+	code := &Code{
+		variables:  c.variables,
+		codes:      c.codes,
+		codeinfos:  c.codeinfos,
+		mainSource: c.mainSource,
+		sources:    c.sources,
+		funcFrames: c.funcFrames,
+		callInfos:  c.callInfos,
+	}
+	return code, nil
 }
 
 func (c *compiler) compile(q *Query) error {
@@ -175,6 +203,14 @@ func (c *compiler) compileImport(i *Import) error {
 			return err
 		}
 	}
+	if c.stackFrames && q.source != nil && q.source.contents != "" {
+		name := alias
+		if name == "" {
+			name = path
+		}
+		q.source.name = name
+		q.source.file = path
+	}
 	c.appendCodeInfo("module " + path)
 	if err = c.compileModule(q, alias); err != nil {
 		return err
@@ -190,6 +226,22 @@ func (c *compiler) compileModule(q *Query, alias string) error {
 		scope.depth--
 		scope.variables = scope.variables[:l]
 	}(len(scope.variables))
+	prevName := c.moduleName
+	if alias != "" {
+		if prevName != "" {
+			c.moduleName = prevName + "::" + alias
+		} else {
+			c.moduleName = alias
+		}
+	}
+	if c.stackFrames && c.moduleName != "" && q.source != nil && q.source.contents != "" {
+		src := *q.source
+		src.name = c.moduleName
+		c.addSource(&src)
+	}
+	defer func() {
+		c.moduleName = prevName
+	}()
 	if alias != "" {
 		defer func(l int) {
 			for _, f := range scope.funcs[l:] {
@@ -203,7 +255,7 @@ func (c *compiler) compileModule(q *Query, alias string) error {
 		}
 	}
 	for _, fd := range q.FuncDefs {
-		if err := c.compileFuncDef(fd, false); err != nil {
+		if err := c.compileFuncDef(fd, false, false); err != nil {
 			return err
 		}
 	}
@@ -305,7 +357,7 @@ func (c *compiler) newScopeDepth() func() {
 	}
 }
 
-func (c *compiler) compileFuncDef(e *FuncDef, builtin bool) error {
+func (c *compiler) compileFuncDef(e *FuncDef, builtin, lambda bool) error {
 	var scope *scopeinfo
 	if builtin {
 		scope = c.builtinScope
@@ -326,6 +378,26 @@ func (c *compiler) compileFuncDef(e *FuncDef, builtin bool) error {
 		c.scopes = []*scopeinfo{c.builtinScope, scope}
 	} else {
 		c.scopes = append(c.scopes, scope)
+	}
+	if c.stackFrames && (builtin || lambda || e.Pos >= 0) {
+		kind := FrameFunc
+		defStart, defEnd := -1, -1
+		if lambda {
+			kind = FrameLambda
+			// An inline filter argument is written at the user call site
+			// (e.g. the expression inside map(...)); use that range as the
+			// lambda definition range.
+			defStart, defEnd = c.callPos, c.callEnd
+		} else if !builtin {
+			defStart, defEnd = e.Pos, e.End
+		}
+		c.funcFrames[scope.id] = funcFrame{
+			kind:     kind,
+			module:   c.moduleName,
+			function: e.Name,
+			defStart: defStart,
+			defEnd:   defEnd,
+		}
 	}
 	defer c.lazy(func() *code {
 		return &code{op: opscope, v: [3]int{scope.id, scope.variablecnt, len(e.Args)}}
@@ -353,7 +425,11 @@ func (c *compiler) compileFuncDef(e *FuncDef, builtin bool) error {
 			c.append(&code{op: opload, v: v})
 			c.append(&code{op: opexpbegin})
 			c.append(&code{op: opload, v: w.index})
+			argCallPC := len(c.codes)
 			c.append(&code{op: opcallpc})
+			if c.stackFrames {
+				c.callInfos[argCallPC] = callInfo{module: c.moduleName, start: e.Pos, end: e.End}
+			}
 			c.appendCodeInfo(w.name)
 			c.append(&code{op: opstore, v: c.pushVariable(w.name)})
 			c.append(&code{op: opexpend})
@@ -369,7 +445,7 @@ func (c *compiler) compileFuncDef(e *FuncDef, builtin bool) error {
 
 func (c *compiler) compileQuery(e *Query) error {
 	for _, fd := range e.FuncDefs {
-		if err := c.compileFuncDef(fd, false); err != nil {
+		if err := c.compileFuncDef(fd, false, false); err != nil {
 			return err
 		}
 	}
@@ -879,6 +955,13 @@ func (c *compiler) compileIndex(e *Term, x *Index) error {
 }
 
 func (c *compiler) compileFunc(e *Func) error {
+	if c.stackFrames && e.Pos >= 0 {
+		prevPos, prevEnd, prevActive := c.callPos, c.callEnd, c.callActive
+		c.callPos, c.callEnd, c.callActive = e.Pos, e.End, true
+		defer func() {
+			c.callPos, c.callEnd, c.callActive = prevPos, prevEnd, prevActive
+		}()
+	}
 	if len(e.Args) == 0 {
 		if f, v := c.lookupFuncOrVariable(e.Name); f != nil {
 			return c.compileCallPc(f, e.Args)
@@ -888,7 +971,11 @@ func (c *compiler) compileFunc(e *Func) error {
 				c.append(&code{op: opload, v: v.index})
 			} else {
 				c.append(&code{op: opload, v: v.index})
+				callpc := len(c.codes)
 				c.append(&code{op: opcallpc})
+				if c.stackFrames && c.callActive {
+					c.callInfos[callpc] = callInfo{module: c.moduleName, start: c.callPos, end: c.callEnd}
+				}
 			}
 			return nil
 		} else if e.Name == "$ENV" || e.Name == "env" {
@@ -922,7 +1009,7 @@ func (c *compiler) compileFunc(e *Func) error {
 		var compiled bool
 		for _, fd := range fds {
 			if len(fd.Args) == len(e.Args) {
-				if err := c.compileFuncDef(fd, true); err != nil {
+				if err := c.compileFuncDef(fd, true, false); err != nil {
 					return err
 				}
 				compiled = true
@@ -1016,7 +1103,16 @@ func (c *compiler) compileFunc(e *Func) error {
 			return err
 		}
 		if fn.iter {
+			iterPC := len(c.codes)
 			c.append(&code{op: opiter})
+			if c.stackFrames && c.callActive {
+				c.callInfos[iterPC] = callInfo{
+					module:   c.moduleName,
+					function: e.Name,
+					start:    c.callPos,
+					end:      c.callEnd,
+				}
+			}
 		}
 		return nil
 	}
@@ -1562,7 +1658,9 @@ func (c *compiler) compileCallInternal(
 	fn any, args []*Query, internal bool, indexing int,
 ) error {
 	if len(args) == 0 {
+		pc := len(c.codes)
 		c.append(&code{op: opcall, v: fn})
+		c.recordCall(pc, fn)
 		return nil
 	}
 	v := c.newVariable()
@@ -1573,7 +1671,7 @@ func (c *compiler) compileCallInternal(
 	for i := len(args) - 1; i >= 0; i-- {
 		pc := len(c.codes) + 1 // skip opjump (ref: compileFuncDef)
 		name := "lambda:" + strconv.Itoa(pc)
-		if err := c.compileFuncDef(&FuncDef{Name: name, Body: args[i]}, false); err != nil {
+		if err := c.compileFuncDef(&FuncDef{Name: name, Body: args[i]}, false, true); err != nil {
 			return err
 		}
 		if internal {
@@ -1601,7 +1699,9 @@ func (c *compiler) compileCallInternal(
 			default:
 				c.append(&code{op: opload, v: v})
 				c.append(&code{op: oppushpc, v: pc})
+				callpc := len(c.codes)
 				c.append(&code{op: opcallpc})
+				c.recordCall(callpc, pc)
 			}
 		} else {
 			c.append(&code{op: oppushpc, v: pc})
@@ -1620,8 +1720,36 @@ func (c *compiler) compileCallInternal(
 	} else {
 		c.append(&code{op: opload, v: v})
 	}
+	callpc2 := len(c.codes)
 	c.append(&code{op: opcall, v: fn})
+	c.recordCall(callpc2, fn)
 	return nil
+}
+
+// recordCall attaches the current user call-site range to a call instruction
+// when it targets a jq/lambda function (an int target pc) rather than a Go
+// callback. It is a no-op for synthesized calls without a source call site.
+func (c *compiler) addSource(src *sourceInfo) {
+	for i := range c.sources {
+		if c.sources[i].name == src.name {
+			return
+		}
+	}
+	c.sources = append(c.sources, *src)
+}
+
+func (c *compiler) recordCall(pc int, target any) {
+	if !c.stackFrames || !c.callActive {
+		return
+	}
+	if _, exists := c.callInfos[pc]; exists {
+		return
+	}
+	c.callInfos[pc] = callInfo{
+		module: c.moduleName,
+		start:  c.callPos,
+		end:    c.callEnd,
+	}
 }
 
 func (c *compiler) append(code *code) {
@@ -1663,7 +1791,11 @@ L:
 					j = c.codes[j].v.(int)
 				case opret:
 					if canjump {
-						code.op = opjump
+						if c.stackFrames {
+							code.op = opjumprec
+						} else {
+							code.op = opjump
+						}
 						code.v = pcs[len(pcs)-1] + 1
 					} else {
 						code.op = opcallrec
