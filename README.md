@@ -284,6 +284,34 @@ validate := validator.New(validator.WithRequiredStructEnabled())
 | iscolor | hexcolor\|rgb\|rgba\|hsl\|hsla\|cmyk |
 | country_code | iso3166_1_alpha2\|iso3166_1_alpha3\|iso3166_1_alpha_numeric |
 
+JSON Schema Export
+------
+Frontends can reuse the backend constraints through `Validate.JSONSchemaFor`,
+which exports a struct's tags to a JSON Schema (draft 2020-12) document:
+
+```go
+type User struct {
+	Name string `json:"name" validate:"required,min=1,max=50"`
+	Age  int    `json:"age" validate:"gte=0,lte=130"`
+}
+
+export, err := validate.New().JSONSchemaFor(User{})
+// export.Schema is the JSON Schema; export.Diagnostics lists every constraint
+// that could not be translated. export.Complete() is false while such gaps exist.
+```
+
+Exactly translated tags include presence/nullability (`required`,
+`omitempty`, `omitnil`), string rune length (`len`/`min`/`max`/`gt`/`gte`/
+`lt`/`lte`), numeric ranges (inclusive bounds and strict bounds over integers),
+`oneof`/`noneof`, `eq`/`ne`, array `minItems`/`maxItems`/`uniqueItems` with
+`dive`, map `minProperties`/`maxProperties` with `dive`/`keys`/`endkeys`,
+`or` (`|`), and nested/recursive structs. Property names use the `json`
+struct tag, and diagnostics carry both an RFC 6901 JSON Pointer and the Go
+field namespace. Constraints without an equivalent (formats like `email`,
+cross-field tags, conditionals, filesystem/network checks, custom functions,
+`omitzero`, strict float bounds, etc.) are reported in `Diagnostics` rather
+than silently dropped. See the package docs and `jsonschema.go` for details.
+
 Benchmarks
 ------
 ###### Run on MacBook Pro Max M3

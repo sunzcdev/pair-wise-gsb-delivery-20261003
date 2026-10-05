@@ -563,7 +563,6 @@ Kind of like an 'enum'.
 	       noneof='red green' 'blue yellow'
 		   noneof=5 7 9
 
-
 # None Of Case Insensitive
 Works the same as noneof but is case insensitive and therefore only accepts strings.
 
@@ -1633,6 +1632,44 @@ Here is a list of the current non standard validators:
 		ensures they don't have zero length. For others, a non empty value is required.
 
 		Usage: notblank
+
+# JSON Schema Export
+
+Validate.JSONSchemaFor exports a Go struct's validation tags to a JSON Schema
+(draft 2020-12) document so frontends can reuse the same constraints:
+
+	type User struct {
+		Name string `json:"name" validate:"required,min=1,max=50"`
+		Age  int    `json:"age" validate:"gte=0,lte=130"`
+	}
+
+	export, err := validate.New().JSONSchemaFor(User{})
+	// export.Schema is the JSON Schema document; export.Diagnostics lists every
+	// constraint that could not be translated.
+
+JSON property names come from the `json` struct tag (falling back to the Go
+field name), following encoding/json. JSON Pointers in diagnostics locate the
+exact schema node, and GoNamespace gives the corresponding Go field path.
+
+Only constraints with an exact JSON Schema equivalent are emitted:
+
+  - required/omitempty/omitnil presence and nullability
+  - string rune length: len, min, max, gt, gte, lt, lte
+  - numeric range: min/gte, max/lte, and strict gt/lt for integer kinds
+  - oneof/noneof (enum), eq/ne (const/not), boolean eq/ne
+  - slices/arrays: minItems/maxItems, uniqueItems, and dive into items
+  - maps: minProperties/maxProperties, dive values, and keys/endkeys to
+    propertyNames for string keys
+  - 'or' (|) expressions via anyOf, nested structs (including recursion via
+    $defs/$ref) and pointer nullability
+
+Tags without an equivalent (formats such as email/url, cross-field tags such
+as gtefield, conditional rules such as required_if, filesystem/network checks,
+custom validators, omitzero, strict gt/lt over floats, time comparisons,
+non-string map keys, []byte, and the encoding/json ",string" option) are never
+silently dropped: each appears in export.Diagnostics with a stable reason.
+export.Complete() is true only when the schema is a faithful, equivalent
+translation. See jsonschema.go for the full reason inventory.
 
 # Panics
 
