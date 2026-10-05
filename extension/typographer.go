@@ -61,6 +61,7 @@ const (
 
 type typographerConfig struct {
 	Substitutions []string
+	SmartQuotes   SmartQuotesMode
 }
 
 func newDefaultSubstitutions() []string {
@@ -165,7 +166,12 @@ func (s *typographerParser) Parse(_ gast.Node, block text.Reader, pc parser.Cont
 			}
 		}
 	}
+	// In paragraph scoped smart quote mode, quote pairing is handled by the
+	// AST transformer; the inline parser leaves quotes as plain text nodes.
 	if c == '\'' || c == '"' {
+		if s.SmartQuotes != SmartQuotesDisabled {
+			return nil
+		}
 		before := block.PrecedingCharacter()
 		after := rune(' ')
 		if len(line) > 1 {
@@ -293,11 +299,26 @@ func NewTypographerParser(opts ...TypographerParserOption) parser.Extension {
 }
 
 func (e *typographerParserExtension) ParserOptions(_ *parser.Config) []parser.Option {
-	return []parser.Option{
+	cfg := typographerConfig{
+		Substitutions: newDefaultSubstitutions(),
+	}
+	for _, o := range e.options {
+		o(&cfg)
+	}
+	options := []parser.Option{
 		parser.WithInlineParsers(
 			util.Prioritized(newTypographerParser(e.options...), 9999),
 		),
 	}
+	if cfg.SmartQuotes != SmartQuotesDisabled {
+		var transformer parser.ASTTransformer = &smartQuotesTransformer{mode: cfg.SmartQuotes}
+		options = append(options,
+			parser.WithASTTransformers(
+				util.Prioritized(transformer, 9999),
+			),
+		)
+	}
+	return options
 }
 
 // TypographerParser is a default [parser.Extension] for replacing punctuations with typographic entities.
