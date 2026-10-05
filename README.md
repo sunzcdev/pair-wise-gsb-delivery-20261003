@@ -209,3 +209,49 @@ func main() {
   req2.Header.Set("Authorization", cred.String())
 }
 ```
+
+## Server-Side Verification
+
+`Verify` validates credentials for the restricted `SHA-256` and `qop=auth`
+combination. It does not generate or expire nonces. Before calling it, the
+server must check that the challenge nonce is valid. The supplied target must be
+the actual request target (usually `req.URL.RequestURI()`), never the `uri`
+claimed by the client.
+
+`CommitNc` is invoked only after the response digest has been verified. The
+included in-memory `NcStore` makes that commit atomic, so concurrent requests
+replaying the same nonce count can succeed at most once.
+
+``` go
+var counts = digest.NewNcStore()
+
+func handler(w http.ResponseWriter, r *http.Request) {
+    chal := currentChallenge // server-managed SHA-256 qop=auth challenge
+
+    auth, err := digest.Verify(digest.VerifyRequest{
+        Challenge: chal,
+        Method:    r.Method,
+        URI:       r.URL.RequestURI(),
+        Credentials:  r.Header.Get("Authorization"),
+        LookupSecret: func(username string, realm string) (digest.Secret, error) {
+            password, ok := lookupPassword(username, realm)
+            if !ok {
+                return digest.Secret{}, digest.ErrUnknownUser
+            }
+            return digest.Secret{Password: password}, nil
+        },
+        CommitNc: counts.CommitNc,
+    })
+    if err != nil {
+        w.WriteHeader(http.StatusUnauthorized)
+        return
+    }
+    _ = auth
+}
+```
+
+For deployments storing digested credentials, return `Secret{HA1: ha1}` instead.
+The `HA1` value is the lowercase hexadecimal SHA-256 digest of
+`username:realm:password`. Authentication errors use sentinel values such as
+`ErrUnknownUser`, `ErrInvalidDigest`, and `ErrNcReplayed`; error text never
+includes a password or HA1.
