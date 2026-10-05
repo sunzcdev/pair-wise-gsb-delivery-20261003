@@ -92,6 +92,42 @@ func main() {
 }
 ```
 
+## Algorithm Preference
+
+Servers may send multiple challenges in a single `WWW-Authenticate` field
+(e.g. `Basic` alongside several `Digest` challenges). Use a `digest.Selector`
+to pick the challenge with the most preferred supported algorithm. Challenges
+without an `algorithm` parameter are treated as MD5, the protocol default.
+
+``` go
+package main
+
+import (
+	"net/http"
+
+	"github.com/icholy/digest"
+)
+
+func main() {
+	selector := digest.Selector{Prefer: []string{"SHA-512-256", "SHA-256", "MD5"}}
+	client := &http.Client{
+		Transport: &digest.Transport{
+			Username:      "foo",
+			Password:      "bar",
+			FindChallenge: selector.Select,
+		},
+	}
+	res, err := client.Get("http://localhost:8080/multi_challenge")
+	if err != nil {
+		panic(err)
+	}
+	defer res.Body.Close()
+}
+```
+
+When no challenge is usable, `Select` returns a `*digest.SelectionError`
+describing why each challenge was rejected (never including nonce values).
+
 ## Override Digest Options
 
 ``` go

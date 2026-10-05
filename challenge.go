@@ -129,23 +129,8 @@ func (c *Challenge) String() string {
 // ErrNoChallenge indicates that no WWW-Authenticate headers were found.
 var ErrNoChallenge = errors.New("digest: no challenge found")
 
-// FindChallenge returns the first supported challenge in the headers
+// FindChallenge returns the first supported challenge in the headers.
+// It is equivalent to Selector{}.Select.
 func FindChallenge(h http.Header) (*Challenge, error) {
-	var last error
-	for _, header := range h.Values("WWW-Authenticate") {
-		if !IsDigest(header) {
-			continue
-		}
-		chal, err := ParseChallenge(header)
-		if err == nil && CanDigest(chal) {
-			return chal, nil
-		}
-		if err != nil {
-			last = err
-		}
-	}
-	if last != nil {
-		return nil, last
-	}
-	return nil, ErrNoChallenge
+	return Selector{}.Select(h)
 }
