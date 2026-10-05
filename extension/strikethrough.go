@@ -15,6 +15,10 @@ import (
 type strikethroughDelimiterProcessor struct {
 }
 
+func (p *strikethroughDelimiterProcessor) DelimiterProcessorName() string {
+	return "strikethrough"
+}
+
 func (p *strikethroughDelimiterProcessor) IsDelimiter(b byte) bool {
 	return b == '~'
 }
@@ -45,6 +49,7 @@ func WithParseDelimiterFunc(f parser.ParseDelimiterFunc) StrikethroughParserOpti
 
 type strikethroughParser struct {
 	f parser.ParseDelimiterFunc
+	r *parser.DelimiterProcessorRegistration
 }
 
 func newStrikethroughParser(opts ...StrikethroughParserOption) parser.InlineParser {
@@ -54,8 +59,16 @@ func newStrikethroughParser(opts ...StrikethroughParserOption) parser.InlinePars
 	for _, opt := range opts {
 		opt(&config)
 	}
+	r := parser.NewDelimiterProcessorRegistration(
+		"strikethrough",
+		defaultStrikethroughDelimiterProcessor,
+		[]byte{'~'},
+		parser.WithDelimiterProcessorPriority(500),
+		parser.WithDelimiterProcessorLengths(1, 2),
+	)
 	return &strikethroughParser{
 		f: config.f,
+		r: r,
 	}
 }
 
@@ -68,12 +81,14 @@ func (s *strikethroughParser) Parse(_ gast.Node, block text.Reader, pc parser.Co
 	if before == '~' {
 		return nil
 	}
-	line, _ := block.PeekLine()
+	line, segment := block.PeekLine()
 	n := 0
 	for n < len(line) && line[n] == '~' {
 		n++
 	}
 	if n > 2 {
+		parser.TraceDelimiterRunRejected(pc, s.r, '~', segment.Start, n,
+			parser.DelimiterRejectRunLength(s.r, n))
 		return nil
 	}
 	return parser.ParseDelimiter(block, 1, defaultStrikethroughDelimiterProcessor, pc)
@@ -81,6 +96,10 @@ func (s *strikethroughParser) Parse(_ gast.Node, block text.Reader, pc parser.Co
 
 func (s *strikethroughParser) CloseBlock(_ gast.Node, _ parser.Context) {
 	// nothing to do
+}
+
+func (s *strikethroughParser) DelimiterProcessorRegistration() *parser.DelimiterProcessorRegistration {
+	return s.r
 }
 
 type strikethroughHTMLRendererExtension struct {

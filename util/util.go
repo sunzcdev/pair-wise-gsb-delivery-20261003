@@ -724,6 +724,14 @@ func (s PrioritizedValues[T]) Sort() {
 	})
 }
 
+// SortStable sorts the PrioritizedValues in ascending order while keeping the
+// original order of values with equal priority.
+func (s PrioritizedValues[T]) SortStable() {
+	sort.SliceStable(s, func(i, j int) bool {
+		return s[i].Priority < s[j].Priority
+	})
+}
+
 // Remove removes the given value from this slice.
 func (s PrioritizedValues[T]) Remove(v T) PrioritizedValues[T] {
 	i := 0

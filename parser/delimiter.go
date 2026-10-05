@@ -179,7 +179,7 @@ func ParseDelimiter(block text.Reader, minimum int, processor DelimiterProcessor
 	}
 
 	// Fast path: simple emphasis
-	if canOpen && j >= minimum && (!canClose || !hasSameCharOpener(pc, c)) {
+	if !traceActive(pc) && canOpen && j >= minimum && (!canClose || !hasSameCharOpener(pc, c)) {
 		if fast := parseSimpleDelimitedText(block, line, segment, c, j, canOpen, canClose,
 			processor, pc); fast != nil {
 			return fast
@@ -190,6 +190,7 @@ func ParseDelimiter(block text.Reader, minimum int, processor DelimiterProcessor
 	node.Value = text.NewSingleLineValueFromSegment(segment.WithStop(segment.Start+j), block.Decoder())
 	block.Advance(j)
 	pc.PushDelimiter(node)
+	traceDelimiterPushed(pc, node)
 	return node
 }
 
@@ -360,6 +361,7 @@ func ParseDelimiterSimple(block text.Reader, minimum int, processor DelimiterPro
 	node.Value = text.NewSingleLineValueFromSegment(segment.WithStop(segment.Start+j), block.Decoder())
 	block.Advance(j)
 	pc.PushDelimiter(node)
+	traceDelimiterPushed(pc, node)
 	return node
 }
 
@@ -472,16 +474,28 @@ func ProcessDelimiters(bottom ast.Node, pc Context) {
 		found := false
 		maybeOpener := false
 		var opener *Delimiter
-		for opener = closer.PreviousDelimiter; opener != nil && opener != bottom &&
-			(!hasLowerBound || opener.Value.Index().Start >= lowerBound); opener = opener.PreviousDelimiter {
-			if opener.CanOpen && opener.Processor.CanOpenCloser(opener, closer) {
-				maybeOpener = true
-				consume = opener.CalcConsumption(closer)
-				if consume > 0 {
-					found = true
-					break
+		opener = closer.PreviousDelimiter
+		for opener != nil && opener != bottom &&
+			(!hasLowerBound || opener.Value.Index().Start >= lowerBound) {
+			if opener.CanOpen {
+				if opener.Processor.CanOpenCloser(opener, closer) {
+					maybeOpener = true
+					consume = opener.CalcConsumption(closer)
+					if consume > 0 {
+						found = true
+						break
+					}
+					traceDelimiterPair(pc, DelimiterTraceRejected, opener, closer, 0,
+						"rule 9 forbids the match at current run lengths")
+				} else {
+					traceDelimiterPair(pc, DelimiterTraceRejected, opener, closer, 0,
+						"processor rejected the opener-closer pair")
 				}
+			} else {
+				traceDelimiterPair(pc, DelimiterTraceRejected, opener, closer, 0,
+					"opener cannot open a span")
 			}
+			opener = opener.PreviousDelimiter
 		}
 		if !found {
 			next := closer.NextDelimiter
@@ -494,6 +508,7 @@ func ProcessDelimiters(bottom ast.Node, pc Context) {
 		}
 		opener.ConsumeCharacters(consume)
 		closer.ConsumeCharacters(consume)
+		traceDelimiterPair(pc, DelimiterTraceConsumed, opener, closer, consume, "")
 
 		node := opener.Processor.OnMatch(consume)
 		node.SetPos(opener.Value.Index().Start)

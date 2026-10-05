@@ -8,6 +8,10 @@ import (
 type emphasisDelimiterProcessor struct {
 }
 
+func (p *emphasisDelimiterProcessor) DelimiterProcessorName() string {
+	return "emphasis"
+}
+
 func (p *emphasisDelimiterProcessor) IsDelimiter(b byte) bool {
 	return b == '*' || b == '_'
 }
@@ -37,6 +41,7 @@ type EmphasisOption interface {
 
 type emphasisParser struct {
 	f ParseDelimiterFunc
+	r *DelimiterProcessorRegistration
 }
 
 // NewEmphasisParser return a new InlineParser that parses emphasises.
@@ -47,7 +52,10 @@ func NewEmphasisParser(opts ...EmphasisOption) InlineParser {
 	for _, o := range opts {
 		o.setEmphasisOption(&config)
 	}
-	return &emphasisParser{config.f}
+	return &emphasisParser{
+		f: config.f,
+		r: newEmphasisDelimiterProcessorRegistration(),
+	}
 }
 
 func (s *emphasisParser) Trigger() []byte {
@@ -56,4 +64,18 @@ func (s *emphasisParser) Trigger() []byte {
 
 func (s *emphasisParser) Parse(_ ast.Node, block text.Reader, pc Context) ast.Node {
 	return s.f(block, 1, defaultEmphasisDelimiterProcessor, pc)
+}
+
+func (s *emphasisParser) DelimiterProcessorRegistration() *DelimiterProcessorRegistration {
+	return s.r
+}
+
+func newEmphasisDelimiterProcessorRegistration() *DelimiterProcessorRegistration {
+	r := NewDelimiterProcessorRegistration(
+		"emphasis",
+		defaultEmphasisDelimiterProcessor,
+		[]byte{'*', '_'},
+		WithDelimiterProcessorPriority(500),
+	)
+	return r
 }

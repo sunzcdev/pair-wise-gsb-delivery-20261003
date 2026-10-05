@@ -269,7 +269,8 @@ type parseContext struct {
 	lastDelimiter  *Delimiter
 	openedBlocks   []Block
 
-	inlineParsers *[256][]InlineParser
+	inlineParsers  *[256][]InlineParser
+	delimiterTrace DelimiterTraceHandler
 }
 
 // NewContext returns a new Context.
@@ -493,6 +494,9 @@ type Config struct {
 
 	// ParseDelimiterFunc is a custom function for parsing delimiters.
 	ParseDelimiterFunc ParseDelimiterFunc
+
+	// delimiterDiagnostics receives build-time delimiter processor diagnostics.
+	delimiterDiagnostics DelimiterDiagnosticHandler
 
 	withoutDefaultParsers bool
 
@@ -732,6 +736,7 @@ type parser struct {
 	config                *Config
 	initSync              sync.Once
 	triggerable           [256]bool
+	delimiterDiagnostics  DelimiterDiagnosticHandler
 }
 
 type withBlockParsers struct {
@@ -904,6 +909,8 @@ type parseConfig struct {
 
 	doPP   bool
 	ppOpts []ast.PrettyPrintOption
+
+	delimiterTrace DelimiterTraceHandler
 }
 
 // ParseOption is a functional option type for the Parse method.
@@ -927,6 +934,7 @@ func WithPrettyPrint(opts ...ast.PrettyPrintOption) ParseOption {
 }
 
 func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
+	var pendingDiagnostics []DelimiterDiagnostic
 	p.initSync.Do(func() {
 		p.config.blockParsers.Sort()
 		for _, v := range p.config.blockParsers {
@@ -938,10 +946,12 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 			}
 		}
 
-		p.config.inlineParsers.Sort()
+		p.config.inlineParsers.SortStable()
 		for _, v := range p.config.inlineParsers {
 			p.addInlineParser(v)
 		}
+		p.delimiterDiagnostics = p.config.delimiterDiagnostics
+		pendingDiagnostics = buildDelimiterRegistry(p.config.inlineParsers)
 		hasSpaceParser := p.inlineParsers[' '] != nil
 		for c := range p.triggerable {
 			flags := charFlags[c]
@@ -971,6 +981,14 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 		}
 		p.config = nil
 	})
+	// User callbacks must run outside the parser's initialization lock, and the
+	// build-time configuration is stable afterwards, so diagnostics are drained
+	// here at most once.
+	if len(pendingDiagnostics) > 0 && p.delimiterDiagnostics != nil {
+		for _, d := range pendingDiagnostics {
+			p.delimiterDiagnostics(d)
+		}
+	}
 	reader := text.NewReader(source, p.decoder)
 	var pc Context
 	var cfg parseConfig
@@ -992,6 +1010,7 @@ func (p *parser) Parse(source []byte, opts ...ParseOption) ast.Node {
 	}
 	if pctx, ok := pc.(*parseContext); ok {
 		pctx.inlineParsers = &p.inlineParsers
+		pctx.delimiterTrace = cfg.delimiterTrace
 	}
 	root := ast.NewDocument()
 	p.parseBlocks(root, reader, pc)
