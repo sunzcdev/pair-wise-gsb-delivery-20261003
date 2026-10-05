@@ -13,9 +13,94 @@ import (
 // preceding NextFrame() call.
 var ErrNoFrameAdvance = errors.New("no frame advance")
 
+// ErrReaderTerminated means that Reader's observer returned an error on a
+// previous call and the Reader will not process any more frames or events.
+var ErrReaderTerminated = errors.New("reader terminated by observer error")
+
 // ErrFrameTooLarge indicates that a message of length higher than
 // MaxFrameSize was being read.
 var ErrFrameTooLarge = errors.New("frame too large")
+
+// FrameEvent describes lifecycle progress of a single WebSocket frame on the
+// wire.
+//
+// FrameSeq is a 1-based ordinal of the frame within the connection among the
+// frames whose headers were successfully received and validated. It is 0 for
+// failures that happened before a frame header could be established.
+//
+// MessageSeq is a 1-based ordinal of the data message that the frame belongs
+// to. Control frames that interleave a fragmented data message carry that
+// in-progress message ordinal; a control frame received while no data message
+// is in progress carries 0, because control frames do not open data messages.
+//
+// WireLength is the number of on-the-wire bytes belonging to this frame that
+// have been consumed at the moment the event is reported. For a header event
+// it is the frame header size; for a payload or a failure event it also
+// includes the payload bytes actually consumed so far. It is relative to the
+// frame start, so a completed frame reports its full wire size (the value
+// needed to account for per-frame overhead).
+type FrameEvent struct {
+	FrameSeq   int
+	MessageSeq int
+	OpCode     ws.OpCode
+	Length     int64
+	WireLength int64
+}
+
+// FrameObserver receives optional notifications about frame lifecycle.
+//
+// Every successfully validated frame produces exactly one HeaderEvent,
+// followed later by either one PayloadEvent (when its whole payload was
+// actually consumed) or one FailureEvent (when reading or validating the frame
+// failed before its payload was fully consumed). No PayloadEvent is reported
+// while any payload bytes remain unread.
+//
+// Control frames interleaved between fragments of a data message are reported
+// as independent frames (with their own FrameSeq), but they do not open a new
+// data message, so their MessageSeq refers to the in-progress message.
+//
+// If any of the observer methods returns a non-nil error, the Reader is
+// terminated: the returned error is propagated to the caller, no further
+// frames are processed and no further events (including events belonging to a
+// reset or a reuse of the Reader) are delivered. Subsequent Reader method
+// calls return ErrReaderTerminated.
+type FrameObserver interface {
+	OnFrameHeader(FrameEvent) error
+	OnFramePayload(FrameEvent) error
+	OnFrameFailure(FrameEvent, error) error
+}
+
+// FrameObserverFunc is an adapter to allow the use of ordinary functions as
+// independent frame event hooks. Any nil function is treated as a no-op hook.
+type FrameObserverFunc struct {
+	Header  func(FrameEvent) error
+	Payload func(FrameEvent) error
+	Failure func(FrameEvent, error) error
+}
+
+// OnFrameHeader implements FrameObserver.
+func (f FrameObserverFunc) OnFrameHeader(e FrameEvent) error {
+	if f.Header == nil {
+		return nil
+	}
+	return f.Header(e)
+}
+
+// OnFramePayload implements FrameObserver.
+func (f FrameObserverFunc) OnFramePayload(e FrameEvent) error {
+	if f.Payload == nil {
+		return nil
+	}
+	return f.Payload(e)
+}
+
+// OnFrameFailure implements FrameObserver.
+func (f FrameObserverFunc) OnFrameFailure(e FrameEvent, err error) error {
+	if f.Failure == nil {
+		return nil
+	}
+	return f.Failure(e, err)
+}
 
 // FrameHandlerFunc handles parsed frame header and its body represented by
 // io.Reader.
@@ -54,6 +139,10 @@ type Reader struct {
 	// Not setting this field means there is no limit.
 	MaxFrameSize int64
 
+	// Observer, if non-nil, receives frame lifecycle events. See FrameObserver
+	// documentation for the event ordering and termination rules.
+	Observer FrameObserver
+
 	OnContinuation FrameHandlerFunc
 	OnIntermediate FrameHandlerFunc
 
@@ -63,6 +152,13 @@ type Reader struct {
 	utf8   UTF8Reader                 // Used to check UTF8 sequences if CheckUTF8 is true.
 	tmp    [ws.MaxHeaderSize - 2]byte // Used for reading headers.
 	cr     *CipherReader              // Used by NextFrame() to unmask frame payload.
+
+	wire       countingReader // Counts bytes consumed from Source.
+	wireStart  int64          // Wire offset at which current frame header began.
+	frameSeq   int            // Ordinal of the current frame (0 before first).
+	messageSeq int            // Ordinal of the current data message (0 before first).
+	cur        FrameEvent     // Metadata of the frame being processed.
+	terminated bool           // Whether the observer terminated the Reader.
 }
 
 // NewReader creates new frame reader that reads from r keeping given state to
@@ -96,6 +192,9 @@ func NewServerSideReader(r io.Reader) *Reader {
 // The error is ErrNoFrameAdvance if no NextFrame() call was made before
 // reading next message bytes.
 func (r *Reader) Read(p []byte) (n int, err error) {
+	if err = r.alive(); err != nil {
+		return 0, err
+	}
 	if r.frame == nil {
 		if !r.fragmented() {
 			// Every new Read() must be preceded by NextFrame() call.
@@ -106,6 +205,9 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		if err != nil {
 			return 0, err
 		}
+		if err = r.alive(); err != nil {
+			return 0, err
+		}
 		if r.frame == nil {
 			// We handled intermediate control and now got nothing to read.
 			return 0, nil
@@ -114,7 +216,7 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 
 	n, err = r.frame.Read(p)
 	if err != nil && err != io.EOF {
-		return n, err
+		return n, r.failCurrent(err)
 	}
 	if err == nil && r.raw.N != 0 {
 		return n, nil
@@ -124,9 +226,11 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 	switch {
 	case r.raw.N != 0:
 		err = io.ErrUnexpectedEOF
+		err = r.failCurrent(err)
 
 	case r.fragmented():
 		err = nil
+		err = r.payloadDone()
 		r.resetFragment()
 
 	case r.CheckUTF8 && !r.utf8.Valid():
@@ -134,8 +238,12 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 		// reads may be invalid.
 		n = r.utf8.Accepted()
 		err = ErrInvalidUTF8
+		err = r.failCurrent(err)
 
 	default:
+		if fail := r.payloadDone(); fail != nil {
+			return n, fail
+		}
 		r.reset()
 		err = io.EOF
 	}
@@ -146,20 +254,26 @@ func (r *Reader) Read(p []byte) (n int, err error) {
 // Discard discards current message unread bytes.
 // It discards all frames of fragmented message.
 func (r *Reader) Discard() (err error) {
+	if err = r.alive(); err != nil {
+		return err
+	}
 	for {
 		_, err = io.Copy(ioutil.Discard, &r.raw)
 		if err != nil {
-			break
+			return r.failCurrent(err)
+		}
+		if fail := r.payloadDone(); fail != nil {
+			return fail
 		}
 		if !r.fragmented() {
 			break
 		}
 		if _, err = r.NextFrame(); err != nil {
-			break
+			return err
 		}
 	}
 	r.reset()
-	return err
+	return nil
 }
 
 // NextFrame prepares r to read next message. It returns received frame header
@@ -168,7 +282,14 @@ func (r *Reader) Discard() (err error) {
 // Note that next NextFrame() call must be done after receiving or discarding
 // all current message bytes.
 func (r *Reader) NextFrame() (hdr ws.Header, err error) {
-	hdr, err = r.readHeader(r.Source)
+	if err = r.alive(); err != nil {
+		return hdr, err
+	}
+
+	r.wire.R = r.Source
+	before := r.wire.n
+	r.wireStart = before
+	hdr, err = r.readHeader(&r.wire)
 	if err == io.EOF && r.fragmented() {
 		// If we are in fragmented state EOF means that is was totally
 		// unexpected.
@@ -183,17 +304,29 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 		err = ws.CheckHeader(hdr, r.State)
 	}
 	if err != nil {
+		// A clean EOF with no bytes consumed and no message in progress is a
+		// normal end of the connection: it is not a frame failure. Any other
+		// header read error (truncated header, unexpected EOF mid-message) is
+		// reported without associating a new frame ordinal.
+		if err != io.EOF || r.fragmented() || r.wire.n != before {
+			return hdr, r.fail(r.eventFor(hdr, r.inProgressMessageSeq(), before), err)
+		}
 		return hdr, err
 	}
 
 	if n := r.MaxFrameSize; n > 0 && hdr.Length > n {
-		return hdr, ErrFrameTooLarge
+		return hdr, r.fail(r.eventFor(hdr, r.inProgressMessageSeq(), before), ErrFrameTooLarge)
+	}
+
+	r.beginFrame(hdr)
+	if err = r.notifyHeader(); err != nil {
+		return hdr, err
 	}
 
 	// Save raw reader to use it on discarding frame without ciphering and
 	// other streaming checks.
 	r.raw = io.LimitedReader{
-		R: r.Source,
+		R: &r.wire,
 		N: hdr.Length,
 	}
 
@@ -210,7 +343,7 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 	for _, x := range r.Extensions {
 		hdr, err = x.UnsetBits(hdr)
 		if err != nil {
-			return hdr, err
+			return hdr, r.failCurrent(err)
 		}
 	}
 
@@ -223,7 +356,14 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 				// Ensure that src is empty.
 				_, err = io.Copy(ioutil.Discard, &r.raw)
 			}
-			return hdr, err
+			if err != nil {
+				return hdr, r.failCurrent(err)
+			}
+			if err = r.payloadDone(); err != nil {
+				return hdr, err
+			}
+			r.resetFrame()
+			return hdr, nil
 		}
 	} else {
 		r.opCode = hdr.OpCode
@@ -238,7 +378,9 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 
 	if hdr.OpCode == ws.OpContinuation {
 		if cb := r.OnContinuation; cb != nil {
-			err = cb(hdr, frame)
+			if cbErr := cb(hdr, frame); cbErr != nil {
+				return hdr, r.failCurrent(cbErr)
+			}
 		}
 	}
 
@@ -248,7 +390,7 @@ func (r *Reader) NextFrame() (hdr ws.Header, err error) {
 		r.State = r.State.Set(ws.StateFragmented)
 	}
 
-	return hdr, err
+	return hdr, nil
 }
 
 func (r *Reader) fragmented() bool {
@@ -267,6 +409,144 @@ func (r *Reader) reset() {
 	r.frame = nil
 	r.utf8 = UTF8Reader{}
 	r.opCode = 0
+	r.cur = FrameEvent{}
+}
+
+func (r *Reader) resetFrame() {
+	r.raw = io.LimitedReader{}
+	r.frame = nil
+	r.cur = FrameEvent{}
+}
+
+// alive reports whether the Reader may still process frames. Once the
+// observer terminates the Reader every public method is a no-op.
+func (r *Reader) alive() error {
+	if r.terminated {
+		return ErrReaderTerminated
+	}
+	return nil
+}
+
+// inProgressMessageSeq returns the ordinal of the data message currently
+// being received, or 0 when no data message is in progress.
+func (r *Reader) inProgressMessageSeq() int {
+	if r.fragmented() {
+		return r.messageSeq
+	}
+	return 0
+}
+
+// beginFrame assigns frame and message ordinals for a freshly validated
+// header and prepares the current event metadata.
+func (r *Reader) beginFrame(h ws.Header) {
+	r.frameSeq++
+
+	messageSeq := r.inProgressMessageSeq()
+	if !r.fragmented() && h.OpCode.IsData() {
+		// A fresh non-control frame that is not a continuation starts a new
+		// data message.
+		r.messageSeq++
+		messageSeq = r.messageSeq
+	}
+
+	r.cur = FrameEvent{
+		FrameSeq:   r.frameSeq,
+		MessageSeq: messageSeq,
+		OpCode:     h.OpCode,
+		Length:     h.Length,
+		WireLength: r.wire.n - r.wireStart,
+	}
+}
+
+// eventFor builds an event for a header without assigning a new frame
+// ordinal. It is used when validation fails before a frame is established.
+func (r *Reader) eventFor(h ws.Header, messageSeq int, start int64) FrameEvent {
+	return FrameEvent{
+		FrameSeq:   0,
+		MessageSeq: messageSeq,
+		OpCode:     h.OpCode,
+		Length:     h.Length,
+		WireLength: r.wire.n - start,
+	}
+}
+
+func (r *Reader) snapshotEvent() FrameEvent {
+	e := r.cur
+	e.WireLength = r.wire.n - r.wireStart
+	return e
+}
+
+// notifyHeader reports the validated header event.
+func (r *Reader) notifyHeader() error {
+	if r.Observer == nil {
+		return nil
+	}
+	e := r.snapshotEvent()
+	if err := r.Observer.OnFrameHeader(e); err != nil {
+		return r.terminate(err)
+	}
+	return nil
+}
+
+// payloadDone reports that the whole payload of the current frame was
+// actually consumed. It must be called only when r.raw.N is zero.
+func (r *Reader) payloadDone() error {
+	if r.Observer == nil || r.cur.FrameSeq == 0 {
+		return nil
+	}
+	e := r.snapshotEvent()
+	if err := r.Observer.OnFramePayload(e); err != nil {
+		return r.terminate(err)
+	}
+	return nil
+}
+
+// failCurrent reports a failure for the frame currently being processed and
+// terminates the Reader.
+func (r *Reader) failCurrent(cause error) error {
+	return r.fail(r.snapshotEvent(), cause)
+}
+
+// terminate marks the Reader as terminated due to an error returned by an
+// observer hook. It does not emit a failure event: an observer error aborts
+// observation rather than describes a frame processing failure.
+func (r *Reader) terminate(err error) error {
+	r.terminated = true
+	return err
+}
+
+// fail reports a failure event and, regardless of whether the observer
+// returns an error, terminates the Reader so that no stale or later events
+// are delivered. The error returned to the caller is the cause unless the
+// observer replaces it with its own non-nil error.
+func (r *Reader) fail(e FrameEvent, cause error) error {
+	if r.Observer == nil {
+		// Without an observer the Reader behaves as before: errors are
+		// propagated plainly and do not impose a terminal state.
+		return cause
+	}
+	if r.terminated {
+		return ErrReaderTerminated
+	}
+	r.terminated = true
+
+	if obsErr := r.Observer.OnFrameFailure(e, cause); obsErr != nil {
+		return obsErr
+	}
+	return cause
+}
+
+// countingReader wraps the source while counting every byte consumed. It
+// lets events report the wire length without copying payload bytes.
+type countingReader struct {
+	R io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (n int, err error) {
+	n, err = c.R.Read(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // readHeader reads a frame header from in.
