@@ -2,6 +2,7 @@ package fasthttp
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"html"
@@ -445,6 +446,16 @@ type FS struct {
 	// Byte range requests are disabled by default.
 	AcceptByteRange bool
 
+	// MaxByteRanges limits the number of byte ranges accepted in a single
+	// request. Overlapping or adjacent ranges are merged before the limit is
+	// enforced on the response, but this bounds how many range specs a client
+	// may send and therefore the per-request multipart framing overhead.
+	//
+	// Zero means the default limit (100). Negative values disable the limit
+	// (not recommended). Requests exceeding the limit get a
+	// 416 Range Not Satisfiable response.
+	MaxByteRanges int
+
 	// SkipCache if true, will cache no file handler.
 	//
 	// By default is false.
@@ -600,6 +611,7 @@ func (fs *FS) initRequestHandler() {
 		compressRoot:           compressRoot,
 		pathNotFound:           fs.PathNotFound,
 		acceptByteRange:        fs.AcceptByteRange,
+		maxByteRanges:          fs.MaxByteRanges,
 		compressedFileSuffixes: compressedFileSuffixes,
 	}
 
@@ -645,6 +657,7 @@ type fsHandler struct {
 	compressBrotli     bool
 	compressZstd       bool
 	acceptByteRange    bool
+	maxByteRanges      int
 }
 
 type fsFile struct {
@@ -899,6 +912,344 @@ func (r *fsSmallFileReader) WriteTo(w io.Writer) (int64, error) {
 		err = nil
 	}
 	return int64(curPos - r.startPos), err
+}
+
+// multipartByteRangesBoundary is the fixed-length prefix of the boundary
+// generated for multipart/byteranges responses.
+var multipartByteRangesBoundaryPrefix = []byte("fasthttp")
+
+// multiRangeReader streams the representation as a multipart/byteranges
+// message (RFC 7233, Appendix A). The file itself is never buffered: each
+// part's payload is read on demand from the underlying reader, which seeks
+// and limits reads itself.
+type multiRangeReader struct {
+	r             io.Reader // underlying per-part reader
+	ranges        []ByteRange
+	contentType   []byte
+	contentLength int
+	boundary      []byte
+
+	// partIndex selects the current range; chunkIndex walks the chunks
+	// produced for that range (prefix, payload, suffix) and the trailer.
+	partIndex  int
+	chunkIndex int
+
+	// header holds the prefix of the current part; payload is its file
+	// content and suffix the CRLF ending it.
+	header []byte
+	suffix []byte // CRLF between parts, or CRLF + closing boundary on the last
+
+	headerOffset int
+	suffixOffset int
+	eof          bool
+}
+
+func newMultiRangeReader(
+	r io.Reader,
+	ranges []ByteRange,
+	contentType string,
+	contentLength int,
+	boundary []byte,
+) *multiRangeReader {
+	return &multiRangeReader{
+		r:             r,
+		ranges:        ranges,
+		contentType:   []byte(contentType),
+		contentLength: contentLength,
+		boundary:      boundary,
+	}
+}
+
+const (
+	multiRangeChunkHeader = iota
+	multiRangeChunkPayload
+	multiRangeChunkSuffix
+)
+
+func (mr *multiRangeReader) Close() error {
+	if closer, ok := mr.r.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
+// SupportsBodyWriteTo marks the reader as safe for the WriteTo fast path.
+func (mr *multiRangeReader) SupportsBodyWriteTo() bool {
+	return true
+}
+
+// preparePart points the underlying reader at the current range and builds
+// the corresponding multipart part header.
+func (mr *multiRangeReader) preparePart() error {
+	br := mr.ranges[mr.partIndex]
+	if updater, ok := mr.r.(byteRangeUpdater); ok {
+		if err := updater.UpdateByteRange(br.Start, br.End); err != nil {
+			return err
+		}
+	}
+
+	h := appendMultipartPartHeader(nil, mr.boundary, mr.contentType, br, mr.contentLength)
+
+	mr.header = h
+	mr.headerOffset = 0
+	mr.suffixOffset = 0
+	mr.suffix = mr.suffix[:0]
+	mr.suffix = append(mr.suffix, strCRLF...)
+	if mr.partIndex == len(mr.ranges)-1 {
+		mr.suffix = append(mr.suffix, '-', '-')
+		mr.suffix = append(mr.suffix, mr.boundary...)
+		mr.suffix = append(mr.suffix, '-', '-')
+	}
+	mr.chunkIndex = multiRangeChunkHeader
+	return nil
+}
+
+func (mr *multiRangeReader) Read(p []byte) (int, error) {
+	if mr.eof {
+		return 0, io.EOF
+	}
+	for {
+		if mr.partIndex >= len(mr.ranges) {
+			mr.eof = true
+			return 0, io.EOF
+		}
+
+		if mr.header == nil {
+			if err := mr.preparePart(); err != nil {
+				return 0, err
+			}
+		}
+
+		switch mr.chunkIndex {
+		case multiRangeChunkHeader:
+			if mr.headerOffset < len(mr.header) {
+				n := copy(p, mr.header[mr.headerOffset:])
+				mr.headerOffset += n
+				return n, nil
+			}
+			mr.chunkIndex = multiRangeChunkPayload
+			continue
+		case multiRangeChunkPayload:
+			n, err := mr.r.Read(p)
+			if n > 0 {
+				return n, nil
+			}
+			if err != nil && err != io.EOF {
+				return 0, err
+			}
+			if n == 0 && err == nil {
+				return 0, io.ErrNoProgress
+			}
+			mr.chunkIndex = multiRangeChunkSuffix
+			continue
+		case multiRangeChunkSuffix:
+			if mr.suffixOffset < len(mr.suffix) {
+				n := copy(p, mr.suffix[mr.suffixOffset:])
+				mr.suffixOffset += n
+				return n, nil
+			}
+		}
+
+		mr.partIndex++
+		mr.header = nil
+	}
+}
+
+// WriteTo streams the whole multipart message to w without buffering the
+// file. When w is a flushing buffered writer, the buffer is drained before
+// each part payload so large file regions may take zero-copy paths such as
+// sendfile.
+func (mr *multiRangeReader) WriteTo(w io.Writer) (int64, error) {
+	mr.partIndex = 0
+	mr.eof = false
+	var written int64
+
+	writeBytes := func(b []byte) error {
+		for len(b) > 0 {
+			n, err := w.Write(b)
+			if n > 0 {
+				written += int64(n)
+				b = b[n:]
+			}
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				return io.ErrShortWrite
+			}
+		}
+		return nil
+	}
+
+	flusher, canFlush := w.(interface{ Flush() error })
+
+	for i := range mr.ranges {
+		mr.partIndex = i
+		if err := mr.preparePart(); err != nil {
+			return written, err
+		}
+		if err := writeBytes(mr.header); err != nil {
+			return written, err
+		}
+
+		// Drain buffered framing bytes before handing the file region to the
+		// writer so zero-copy transfers (e.g. sendfile) stay possible.
+		if canFlush {
+			if err := flusher.Flush(); err != nil {
+				return written, err
+			}
+		}
+
+		n, err := mr.writePayload(w)
+		written += n
+		if err != nil && err != io.EOF {
+			return written, err
+		}
+		if err := writeBytes(mr.suffix); err != nil {
+			return written, err
+		}
+	}
+	mr.eof = true
+	return written, nil
+}
+
+// writePayload streams one part's file bytes to w. The underlying reader is
+// already bounded to the part by UpdateByteRange (both bigFileReader and
+// fsSmallFileReader limit themselves), so no extra io.LimitedReader is
+// needed: this keeps sendfile-capable readers on their fast path.
+func (mr *multiRangeReader) writePayload(w io.Writer) (int64, error) {
+	// Prefer the reader's WriteTo so sendfile-capable readers keep their
+	// fast path (bigFileReader.WriteTo honors its own LimitedReader;
+	// fsSmallFileReader.WriteTo copies exactly its configured window).
+	if wt, ok := mr.r.(io.WriterTo); ok {
+		n, err := wt.WriteTo(w)
+		if err == io.EOF {
+			err = nil
+		}
+		return n, err
+	}
+
+	br := mr.ranges[mr.partIndex]
+	remaining := int64(br.End - br.Start + 1)
+	vbuf := copyBufPool.Get()
+	buf := vbuf.([]byte) //nolint:forcetypeassert
+	var written int64
+	for remaining > 0 {
+		toRead := int64(len(buf))
+		if toRead > remaining {
+			toRead = remaining
+		}
+		n, err := mr.r.Read(buf[:toRead])
+		if n > 0 {
+			nw, werr := w.Write(buf[:n])
+			written += int64(nw)
+			remaining -= int64(nw)
+			if werr != nil {
+				copyBufPool.Put(vbuf)
+				return written, werr
+			}
+			if nw != n {
+				copyBufPool.Put(vbuf)
+				return written, io.ErrShortWrite
+			}
+		}
+		if err != nil {
+			copyBufPool.Put(vbuf)
+			if err == io.EOF && remaining == 0 {
+				return written, nil
+			}
+			return written, err
+		}
+		if n == 0 && err == nil {
+			copyBufPool.Put(vbuf)
+			return written, io.ErrNoProgress
+		}
+	}
+	copyBufPool.Put(vbuf)
+	return written, nil
+}
+
+// appendMultipartPartHeader appends the framing header of a single
+// multipart/byteranges part:
+//
+//	--BOUNDARY\r\n
+//	Content-Type: <contentType>\r\n
+//	Content-Range: bytes start-end/size\r\n
+//	\r\n
+func appendMultipartPartHeader(dst, boundary, contentType []byte, br ByteRange, contentLength int) []byte {
+	dst = append(dst, '-', '-')
+	dst = append(dst, boundary...)
+	dst = append(dst, strCRLF...)
+	dst = append(dst, HeaderContentType...)
+	dst = append(dst, ':')
+	dst = append(dst, contentType...)
+	dst = append(dst, strCRLF...)
+	dst = append(dst, HeaderContentRange...)
+	dst = append(dst, ':', ' ')
+	dst = append(dst, strBytes...)
+	dst = append(dst, ' ')
+	dst = AppendUint(dst, br.Start)
+	dst = append(dst, '-')
+	dst = AppendUint(dst, br.End)
+	dst = append(dst, '/')
+	dst = AppendUint(dst, contentLength)
+	dst = append(dst, strCRLF...)
+	dst = append(dst, strCRLF...)
+	return dst
+}
+
+// multipartByteRangesSize computes the total wire size of a
+// multipart/byteranges response for the given ranges.
+func multipartByteRangesSize(ranges []ByteRange, contentType string, contentLength int, boundary []byte) int {
+	// Per-part framing is everything appendMultipartPartHeader writes plus
+	// the separating CRLF. Digit counts vary per range, so the numeric parts
+	// are added individually; all fixed pieces are folded into framingBase.
+	framingBase := 2 + len(boundary) + 2 + // "--BOUNDARY\r\n"
+		len(HeaderContentType) + 1 + len(contentType) + 2 + // "Content-Type: CT\r\n"
+		len(HeaderContentRange) + 2 + len(strBytes) + 1 + // "Content-Range: bytes "
+		1 + 1 + // '-' between offsets and '/' before the complete length
+		2 + // CRLF ending the Content-Range header line
+		2 + // blank line terminating the part headers
+		2 // CRLF separating the payload from the next boundary
+
+	total := 0
+	for _, br := range ranges {
+		total += framingBase
+		total += decimalLen(br.Start) + decimalLen(br.End) + decimalLen(contentLength)
+		total += br.End - br.Start + 1
+	}
+	// closing "--BOUNDARY--"
+	total += 2 + len(boundary) + 2
+	return total
+}
+
+// decimalLen returns the number of decimal digits in n >= 0.
+func decimalLen(n int) int {
+	if n == 0 {
+		return 1
+	}
+	d := 0
+	for n > 0 {
+		n /= 10
+		d++
+	}
+	return d
+}
+
+// newMultipartBoundary returns a cryptographically random boundary that
+// never needs quoting and is extremely unlikely to appear in the payload.
+func newMultipartBoundary() ([]byte, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return nil, err
+	}
+	const hex = "0123456789abcdef"
+	boundary := make([]byte, 0, len(multipartByteRangesBoundaryPrefix)+len(raw)*2)
+	boundary = append(boundary, multipartByteRangesBoundaryPrefix...)
+	for _, c := range raw {
+		boundary = append(boundary, hex[c>>4], hex[c&0xf])
+	}
+	return boundary, nil
 }
 
 type cacheManager interface {
@@ -1427,25 +1778,56 @@ func (h *fsHandler) handleRequest(ctx *RequestCtx) {
 	contentLength := ff.contentLength
 	if h.acceptByteRange {
 		hdr.setNonSpecial(strAcceptRanges, strBytes)
-		if len(byteRange) > 0 {
-			startPos, endPos, err := ParseByteRange(byteRange, contentLength)
+		if len(byteRange) > 0 && ifRangeMatches(ctx, ff) {
+			ranges, err := ParseByteRanges(byteRange, contentLength, h.maxByteRanges)
 			if err != nil {
-				_ = r.(io.Closer).Close() //nolint:forcetypeassert
+				if rc, ok := r.(io.Closer); ok {
+					_ = rc.Close()
+				}
 				ctx.Logger().Printf("cannot parse byte range %q for path=%q: %v", byteRange, path, err)
-				ctx.Error("Range Not Satisfiable", StatusRequestedRangeNotSatisfiable)
+				sendRangeNotSatisfiable(ctx, contentLength)
 				return
 			}
 
-			if err = r.(byteRangeUpdater).UpdateByteRange(startPos, endPos); err != nil { //nolint:forcetypeassert
-				_ = r.(io.Closer).Close() //nolint:forcetypeassert
-				ctx.Logger().Printf("cannot seek byte range %q for path=%q: %v", byteRange, path, err)
-				ctx.Error("Internal Server Error", StatusInternalServerError)
-				return
-			}
+			if len(ranges) == 1 {
+				startPos, endPos := ranges[0].Start, ranges[0].End
+				if err = r.(byteRangeUpdater).UpdateByteRange(startPos, endPos); err != nil { //nolint:forcetypeassert
+					if rc, ok := r.(io.Closer); ok {
+						_ = rc.Close()
+					}
+					ctx.Logger().Printf("cannot seek byte range %q for path=%q: %v", byteRange, path, err)
+					ctx.Error("Internal Server Error", StatusInternalServerError)
+					return
+				}
 
-			hdr.SetContentRange(startPos, endPos, contentLength)
-			contentLength = endPos - startPos + 1
-			statusCode = StatusPartialContent
+				hdr.SetContentRange(startPos, endPos, contentLength)
+				contentLength = endPos - startPos + 1
+				statusCode = StatusPartialContent
+			} else {
+				boundary, err := newMultipartBoundary()
+				if err != nil {
+					if rc, ok := r.(io.Closer); ok {
+						_ = rc.Close()
+					}
+					ctx.Logger().Printf("cannot generate multipart boundary for path=%q: %v", path, err)
+					ctx.Error("Internal Server Error", StatusInternalServerError)
+					return
+				}
+
+				mr := newMultiRangeReader(r, ranges, ff.contentType, contentLength, boundary)
+				contentLength = multipartByteRangesSize(ranges, ff.contentType, contentLength, boundary)
+
+				mt := make([]byte, 0, len(strMultipartByteranges)+len(boundary)+11)
+				mt = append(mt, strMultipartByteranges...)
+				mt = append(mt, ';', ' ')
+				mt = append(mt, strBoundary...)
+				mt = append(mt, '=')
+				mt = append(mt, boundary...)
+				hdr.SetContentTypeBytes(mt)
+
+				r = mr
+				statusCode = StatusPartialContent
+			}
 		}
 	}
 
@@ -1475,60 +1857,246 @@ type byteRangeUpdater interface {
 	UpdateByteRange(startPos, endPos int) error
 }
 
-// ParseByteRange parses 'Range: bytes=...' header value.
+// ifRangeMatches reports whether a present 'If-Range' precondition still
+// matches the representation. fasthttp serves Last-Modified timestamps but
+// no entity tags, so only the HTTP-date form may match: a matching date means
+// the Range request may be evaluated, anything else makes the server ignore
+// the Range header and return the full representation (RFC 7233 3.2/4.3).
+func ifRangeMatches(ctx *RequestCtx, ff *fsFile) bool {
+	ifRange := ctx.Request.Header.peek(strIfRange)
+	if len(ifRange) == 0 {
+		return true
+	}
+	// Entity tags (including the weak form) never match since the FS handler
+	// does not generate ETags.
+	if bytes.HasPrefix(ifRange, []byte("\"")) || bytes.HasPrefix(ifRange, []byte("W/\"")) {
+		return false
+	}
+	t, err := ParseHTTPDate(ifRange)
+	if err != nil {
+		return false
+	}
+	lastModified := ff.lastModified.Truncate(time.Second)
+	return !t.Before(lastModified) && !t.After(lastModified)
+}
+
+// sendRangeNotSatisfiable responds with 416 and the required
+// 'Content-Range: bytes */<complete-length>' header (RFC 7233, section 4.4).
+func sendRangeNotSatisfiable(ctx *RequestCtx, contentLength int) {
+	ctx.Response.Reset()
+	ctx.SetStatusCode(StatusRequestedRangeNotSatisfiable)
+	ctx.SetContentTypeBytes(defaultContentType)
+	ctx.Response.Header.setNonSpecial(strAcceptRanges, strBytes)
+
+	cr := make([]byte, 0, len(strBytes)+2+16)
+	cr = append(cr, strBytes...)
+	cr = append(cr, ' ', '*', '/')
+	cr = AppendUint(cr, contentLength)
+	ctx.Response.Header.setNonSpecial(strContentRange, cr)
+	ctx.SetBodyString("Range Not Satisfiable")
+}
+
+// ByteRange is a single byte range [Start, End] (inclusive). Both fields
+// are byte offsets within the representation, so End-Start+1 is the range
+// length.
+type ByteRange struct {
+	Start int
+	End   int
+}
+
+// maxByteRanges bounds the number of ranges accepted in a single request so
+// a client cannot force the server to build a response consisting of huge
+// numbers of tiny parts.
+const maxByteRanges = 100
+
+// ParseByteRanges parses 'Range: bytes=...' header value, which may contain
+// one or more comma-separated byte-range specs as defined by RFC 7233
+// section 2.1. At most maxRanges specs are accepted. A zero value falls
+// back to the built-in maxByteRanges limit; a negative value disables the
+// limit entirely:
+//
+//   - 'bytes=start-end' for an explicit range,
+//   - 'bytes=start-'    for an open-ended range (up to the end),
+//   - 'bytes=-suffix'   for a suffix range (last suffix bytes).
+//
+// Returned ranges are clipped to contentLength, sorted by their start
+// position and merged when they overlap or are adjacent. Range specs that do
+// not intersect the content are dropped. An error is returned only if the
+// header is malformed, more than maxByteRanges specs were given, or none of
+// the requested ranges intersects the content.
+//
+// Numeric values are parsed as unsigned 64-bit integers. Overflowing values
+// saturate instead of failing, which mirrors the open-ended semantics of
+// excessively large positions and prevents signed integer wraparound on
+// 32-bit builds.
+func ParseByteRanges(byteRange []byte, contentLength, maxRanges int) ([]ByteRange, error) {
+	if maxRanges == 0 {
+		maxRanges = maxByteRanges
+	}
+	if contentLength <= 0 {
+		return nil, fmt.Errorf("byte range %q is invalid for empty content", byteRange)
+	}
+	if !bytes.HasPrefix(byteRange, strBytes) {
+		return nil, fmt.Errorf("unsupported range units: %q: expecting %q", byteRange, strBytes)
+	}
+	b := byteRange[len(strBytes):]
+	if len(b) == 0 || b[0] != '=' {
+		return nil, fmt.Errorf("missing byte range in %q", byteRange)
+	}
+	b = b[1:]
+	if len(b) == 0 {
+		return nil, fmt.Errorf("missing byte range in %q", byteRange)
+	}
+
+	ranges := make([]ByteRange, 0, 4)
+	specCount := 0
+	for _, spec := range bytes.Split(b, []byte{','}) {
+		spec = trimByteRangeSpec(spec)
+		if len(spec) == 0 {
+			return nil, fmt.Errorf("empty byte range spec in %q", byteRange)
+		}
+		specCount++
+		if maxRanges >= 0 && specCount > maxRanges {
+			return nil, fmt.Errorf("too many byte ranges in %q: maximum allowed is %d", byteRange, maxRanges)
+		}
+
+		dash := bytes.IndexByte(spec, '-')
+		if dash < 0 {
+			return nil, fmt.Errorf("missing the end position of byte range in %q", byteRange)
+		}
+
+		if dash == 0 {
+			suffixLen, ok := parseByteRangeUint(spec[1:])
+			if !ok {
+				return nil, fmt.Errorf("invalid suffix byte range in %q", byteRange)
+			}
+			// A zero-length suffix is unsatisfiable: it denotes an empty
+			// suffix of the representation (RFC 7233, section 2.1).
+			if suffixLen == 0 {
+				continue
+			}
+			start := contentLength
+			if suffixLen < uint64(contentLength) {
+				start = int(suffixLen)
+			}
+			start = contentLength - start
+			ranges = append(ranges, ByteRange{Start: start, End: contentLength - 1})
+			continue
+		}
+
+		start, ok := parseByteRangeUint(spec[:dash])
+		if !ok {
+			return nil, fmt.Errorf("invalid start position of byte range in %q", byteRange)
+		}
+		if start >= uint64(contentLength) {
+			// This range does not intersect the representation.
+			continue
+		}
+		br := ByteRange{Start: int(start), End: contentLength - 1}
+
+		endSpec := trimByteRangeSpec(spec[dash+1:])
+		if len(endSpec) > 0 {
+			end, ok := parseByteRangeUint(endSpec)
+			if !ok {
+				return nil, fmt.Errorf("invalid end position of byte range in %q", byteRange)
+			}
+			if end < start {
+				return nil, fmt.Errorf("the start position of byte range cannot exceed the end position. byte range %q", byteRange)
+			}
+			if end < uint64(contentLength) {
+				br.End = int(end)
+			}
+		}
+		ranges = append(ranges, br)
+	}
+
+	if len(ranges) == 0 {
+		return nil, fmt.Errorf("none of the requested ranges overlap content of length %d. byte range %q", contentLength, byteRange)
+	}
+
+	return mergeByteRanges(ranges), nil
+}
+
+// trimByteRangeSpec strips optional whitespace around a byte-range spec.
+// RFC 7233 allows a single SP or HTAB around the comma separator.
+func trimByteRangeSpec(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t') {
+		b = b[1:]
+	}
+	for len(b) > 0 {
+		c := b[len(b)-1]
+		if c != ' ' && c != '\t' {
+			break
+		}
+		b = b[:len(b)-1]
+	}
+	return b
+}
+
+// parseByteRangeUint parses an unsigned decimal integer, saturating at
+// math.MaxUint64 when the value overflows instead of returning an error.
+// It returns ok=false only for empty or non-numeric input.
+func parseByteRangeUint(b []byte) (v uint64, ok bool) {
+	if len(b) == 0 {
+		return 0, false
+	}
+	const maxUint64 = uint64(1<<64 - 1)
+	const cutoff = maxUint64 / 10
+	for _, c := range b {
+		k := c - '0'
+		if k > 9 {
+			return 0, false
+		}
+		if v > cutoff || (v == cutoff && uint64(k) > maxUint64-cutoff*10) {
+			v = maxUint64
+			continue
+		}
+		v = 10*v + uint64(k)
+	}
+	return v, true
+}
+
+// mergeByteRanges sorts the given ranges by start position and merges
+// overlapping or adjacent ones, so every byte of the representation appears
+// at most once in the response.
+func mergeByteRanges(ranges []ByteRange) []ByteRange {
+	sort.Slice(ranges, func(i, j int) bool {
+		if ranges[i].Start == ranges[j].Start {
+			return ranges[i].End < ranges[j].End
+		}
+		return ranges[i].Start < ranges[j].Start
+	})
+
+	merged := ranges[:1]
+	for i := 1; i < len(ranges); i++ {
+		last := &merged[len(merged)-1]
+		cur := ranges[i]
+		// Adjacent ranges (cur.Start == last.End+1) are merged too: their
+		// multipart framing costs bytes without saving any payload.
+		if cur.Start <= last.End+1 {
+			if cur.End > last.End {
+				last.End = cur.End
+			}
+			continue
+		}
+		merged = append(merged, cur)
+	}
+	return merged
+}
+
+// ParseByteRange parses 'Range: bytes=...' header value containing a single
+// byte range.
 //
 // It follows https://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.35 .
 func ParseByteRange(byteRange []byte, contentLength int) (startPos, endPos int, err error) {
-	b := byteRange
-	if !bytes.HasPrefix(b, strBytes) {
-		return 0, 0, fmt.Errorf("unsupported range units: %q: expecting %q", byteRange, strBytes)
-	}
-
-	b = b[len(strBytes):]
-	if len(b) == 0 || b[0] != '=' {
-		return 0, 0, fmt.Errorf("missing byte range in %q", byteRange)
-	}
-	b = b[1:]
-
-	n := bytes.IndexByte(b, '-')
-	if n < 0 {
-		return 0, 0, fmt.Errorf("missing the end position of byte range in %q", byteRange)
-	}
-
-	if n == 0 {
-		v, err := ParseUint(b[n+1:])
-		if err != nil {
-			return 0, 0, err
-		}
-		if contentLength <= 0 {
-			return 0, 0, fmt.Errorf("byte range %q is invalid for empty content", byteRange)
-		}
-		startPos := max(contentLength-v, 0)
-		return startPos, contentLength - 1, nil
-	}
-
-	if startPos, err = ParseUint(b[:n]); err != nil {
+	ranges, err := ParseByteRanges(byteRange, contentLength, maxByteRanges)
+	if err != nil {
 		return 0, 0, err
 	}
-	if startPos >= contentLength {
-		return 0, 0, fmt.Errorf("the start position of byte range cannot exceed %d. byte range %q", contentLength-1, byteRange)
+	if len(ranges) != 1 {
+		return 0, 0, fmt.Errorf("expecting a single byte range in %q", byteRange)
 	}
-
-	b = b[n+1:]
-	if len(b) == 0 {
-		return startPos, contentLength - 1, nil
-	}
-
-	if endPos, err = ParseUint(b); err != nil {
-		return 0, 0, err
-	}
-	if endPos >= contentLength {
-		endPos = contentLength - 1
-	}
-	if endPos < startPos {
-		return 0, 0, fmt.Errorf("the start position of byte range cannot exceed the end position. byte range %q", byteRange)
-	}
-	return startPos, endPos, nil
+	return ranges[0].Start, ranges[0].End, nil
 }
 
 func (h *fsHandler) openIndexFile(ctx *RequestCtx, dirPath string, mustCompress bool, fileEncoding string) (*fsFile, error) {
