@@ -222,6 +222,42 @@ fmt.Println(string(b))
 
 [marshal]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Marshal
 
+`Encoder` exposes a few layout options beyond the defaults, such as
+[`SetTablesInline`][set-tables-inline], [`SetArraysMultiline`][set-arrays-multiline],
+and [`SetIndentTables`][set-indent-tables].
+
+For per-value control — including dynamically keyed maps, where a fixed struct
+tag cannot be attached — use [`SetLayoutFunc`][set-layout-func]. Its callback
+receives the value's key path and array index (a `toml.LayoutPath`, e.g.
+`servers[0].name`) and chooses, for that value, between an inline table
+(`{ ... }`), a normal `[table]`/`[[array table]]` header, and a single-line or
+multiline array. It only changes formatting, never the encoded value:
+
+```go
+enc := toml.NewEncoder(&buf).SetLayoutFunc(func(p toml.LayoutPath) (toml.Layout, error) {
+	switch {
+	case p.String() == "servers":
+		// An array of tables rendered as a multiline array of inline tables.
+		return toml.Layout{InlineTable: true, MultilineArray: true}, nil
+	case len(p) > 0 && p[len(p)-1].Key == "compact":
+		return toml.Layout{InlineTable: true}, nil
+	default:
+		return toml.Layout{}, nil // keep the default layout
+	}
+})
+```
+
+Precedence, from highest to lowest, is: struct field tags (`inline` /
+`multiline`), the `SetLayoutFunc` callback, then the global `SetTablesInline`
+and `SetArraysMultiline` options. A combination that has no valid TOML
+representation (for example a multiline array of non-inline tables) makes
+`Encode` return an error that names the offending path.
+
+[set-tables-inline]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Encoder.SetTablesInline
+[set-arrays-multiline]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Encoder.SetArraysMultiline
+[set-indent-tables]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Encoder.SetIndentTables
+[set-layout-func]: https://pkg.go.dev/github.com/pelletier/go-toml/v2#Encoder.SetLayoutFunc
+
 ## Unstable API
 
 This API does not yet follow the backward compatibility guarantees of this

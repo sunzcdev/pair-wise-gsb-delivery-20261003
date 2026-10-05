@@ -31,6 +31,8 @@ func Marshal(v interface{}) ([]byte, error) {
 	e.marshalerOn = enc.marshalerInterface
 	e.buf = e.buf[:0]
 	e.keyStack = e.keyStack[:0]
+	e.pathStack = e.pathStack[:0]
+	e.inlineCtx = false
 	e.lastWasHeader = false
 
 	err := e.encodeRoot(v)
@@ -45,6 +47,95 @@ func Marshal(v interface{}) ([]byte, error) {
 	return out, nil
 }
 
+// PathSegment is one element of a LayoutPath: either a table/field key or a
+// zero-based array index.
+//
+// Use IsIndex to tell the two apart, then read Key or Index. A PathSegment is
+// a value type and is safe to retain.
+type PathSegment struct {
+	// Key is the key of the struct field or map entry. It is meaningful only
+	// when IsIndex is false.
+	Key string
+	// Index is the zero-based position of an element inside a slice or array.
+	// It is meaningful only when IsIndex is true.
+	Index int
+	// IsIndex reports whether this segment is an array index (true) or a key
+	// (false).
+	IsIndex bool
+}
+
+// String renders the segment as it appears in a dotted key (for a key) or as
+// a bracketed index (for an array element, e.g. "[0]"). Keys that are not bare
+// TOML keys are quoted.
+func (s PathSegment) String() string {
+	if s.IsIndex {
+		return "[" + strconv.Itoa(s.Index) + "]"
+	}
+	if isBareKey(s.Key) {
+		return s.Key
+	}
+	return string(appendBasicString(nil, s.Key))
+}
+
+// LayoutPath is the key path, including array indices, of the value a
+// LayoutFunc is being asked about. The last segment is the value itself; the
+// preceding segments (if any) are its ancestors from the document root.
+//
+// A LayoutPath handed to a LayoutFunc is a private copy: retaining it (or a
+// slice of it) is safe, and the stored path is never mutated by a later
+// callback invocation or encode.
+type LayoutPath []PathSegment
+
+// String renders the path in dotted form, with array indices in brackets, for
+// example "servers[0].name" or "a.b[2][1]".
+func (p LayoutPath) String() string {
+	var b strings.Builder
+	for i, seg := range p {
+		if seg.IsIndex {
+			b.WriteString(seg.String())
+			continue
+		}
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(seg.String())
+	}
+	return b.String()
+}
+
+// Layout is the layout decision returned by a LayoutFunc for a single value.
+// The zero value means "no opinion": the value keeps the layout implied by its
+// position, struct tags, and the encoder's global options.
+//
+// A decision only changes formatting, never the encoded value.
+type Layout struct {
+	// InlineTable forces a table (a struct or map, or an element of an array
+	// of tables) to be emitted as an inline table ({ ... }) instead of a
+	// [table] or [[array table]] header. It has no effect on non-table
+	// values.
+	InlineTable bool
+	// MultilineArray forces an array to be emitted with one element per line.
+	// It has no effect on non-array values. An array of tables rendered with
+	// header tables cannot be multiline: every element would need its own
+	// [[header]], so MultilineArray requires InlineTable for such an array.
+	MultilineArray bool
+}
+
+// LayoutFunc selects the layout of individual values while encoding. It is
+// called with the value's key path and array index; see LayoutPath.
+//
+// It only chooses formatting: it cannot change the encoded value. Returning
+// the zero Layout defers to struct tags and global encoder options. Returning
+// an error aborts Encode; the returned error is wrapped with the offending
+// path. A combination that cannot be represented in TOML (currently,
+// MultilineArray on an array of non-inline tables) is reported as an error
+// that includes the path.
+//
+// The same path can be visited more than once during one encode, and a given
+// value may be encoded more than once (for example an unstable.Marshaler), so
+// the function should be deterministic.
+type LayoutFunc func(path LayoutPath) (Layout, error)
+
 // Encoder writes a TOML document to an output stream.
 type Encoder struct {
 	// output
@@ -57,6 +148,10 @@ type Encoder struct {
 	indentTables         bool
 	marshalJSONNumbers   bool
 	omitEmptySuperTables bool
+
+	// layoutFunc, when set, selects the layout of individual values by their
+	// key path and array index. Nil disables path-based layout decisions.
+	layoutFunc LayoutFunc
 
 	// toggles the unstable.Marshaler interface
 	marshalerInterface bool
@@ -90,6 +185,31 @@ func (enc *Encoder) SetTablesInline(inline bool) *Encoder {
 //	MyField `multiline:"true"`
 func (enc *Encoder) SetArraysMultiline(multiline bool) *Encoder {
 	enc.arraysMultiline = multiline
+	return enc
+}
+
+// SetLayoutFunc installs a callback that selects the layout of individual
+// values while encoding, addressed by their key path and array index. It lets
+// callers choose, per value, between an inline table ({ ... }), a normal
+// [table]/[[array table]] header, and a single-line or multiline array. This
+// covers dynamic maps, where a fixed `inline` or `multiline` struct tag cannot
+// be attached.
+//
+// Pass nil to remove a previously installed callback.
+//
+// The callback only influences formatting; it never changes the encoded
+// value. Precedence, from highest to lowest, is:
+//
+//  1. struct field tags (`toml:",inline"` / `toml:",multiline"`, and the
+//     standalone `inline:"true"` / `multiline:"true"` tags);
+//  2. this callback, consulted for values without a deciding tag;
+//  3. the global options SetTablesInline and SetArraysMultiline.
+//
+// A layout that cannot be represented in TOML — currently a multiline array
+// of non-inline tables — makes Encode return an error carrying the offending
+// path.
+func (enc *Encoder) SetLayoutFunc(f LayoutFunc) *Encoder {
+	enc.layoutFunc = f
 	return enc
 }
 
@@ -244,12 +364,34 @@ func (enc *Encoder) EnableMarshalerInterface() *Encoder {
 // emit a TOML comment before the value being annotated. Comments are ignored
 // inside inline tables. For array tables, the comment is only present before
 // the first element of the array.
+//
+// # Per-path layout
+//
+// Encoder.SetLayoutFunc installs a callback that chooses the layout of
+// individual values by their key path and array index, which is the only way
+// to control the layout of dynamically keyed maps. It can make a table inline
+// or keep it a [table]/[[array table]] header, and make an array single-line
+// or multiline. It only changes formatting, never values.
+//
+// The precedence, highest to lowest, is:
+//
+//  1. the "inline"/"multiline" struct field tags (and the standalone
+//     inline:"true"/multiline:"true" tags);
+//  2. the SetLayoutFunc callback;
+//  3. the global SetTablesInline and SetArraysMultiline options.
+//
+// A combination that cannot be represented in TOML makes Encode return an
+// error that names the offending path; a multiline array of tables is only
+// valid when the tables are inline, and members of an inline table always
+// stay on one line.
 func (enc *Encoder) Encode(v interface{}) error {
 	e := encoderStatePool.Get().(*encoderState)
 	e.Encoder = enc
 	e.marshalerOn = enc.marshalerInterface
 	e.buf = e.buf[:0]
 	e.keyStack = e.keyStack[:0]
+	e.pathStack = e.pathStack[:0]
+	e.inlineCtx = false
 	e.lastWasHeader = false
 
 	err := e.encodeRoot(v)
@@ -279,6 +421,15 @@ type encoderState struct {
 	// whole encode as a stack.
 	keyStack []string
 
+	// pathStack is the full key/index path of the value being encoded,
+	// mirroring keyStack but also recording array indices. It is the path
+	// handed to layoutFunc.
+	pathStack LayoutPath
+
+	// inlineCtx is true while emitting the members of an inline table, where
+	// every value must remain on one line. It disables multiline arrays.
+	inlineCtx bool
+
 	// entriesPool recycles entry slices across tables of the same encode.
 	entriesPool [][]entry
 
@@ -307,6 +458,13 @@ type valueOptions struct {
 	omitempty bool
 	omitzero  bool
 	commented bool
+	// layoutInline / layoutMultiline hold the decision of Encoder.layoutFunc,
+	// resolved at encode time (never from tags). layoutResolved records that
+	// the callback has already been consulted for the entry's own node, so
+	// nested value rendering does not consult it a second time.
+	layoutInline    bool
+	layoutMultiline bool
+	layoutResolved  bool
 	// rawShape is the unstable.Marshaler classification of the entry's value,
 	// resolved at encode time (not from tags). It lives here, in the byte of
 	// padding the booleans already leave, so that entry does not grow and the
@@ -680,6 +838,21 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 		}
 	}
 
+	// Resolve the layout callback once per entry, on the entry's full path, so
+	// both passes and value rendering share a single consistent decision and so
+	// contradictory layouts are reported eagerly with their path.
+	if e.layoutFunc != nil {
+		for i := range entries {
+			ent := &entries[i]
+			e.pathStack = append(e.pathStack, PathSegment{Key: ent.key})
+			err := e.resolveEntryLayout(ent)
+			e.pathStack = e.pathStack[:len(e.pathStack)-1]
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	// First pass: emit all key-values; tables are handled by the second
 	// pass.
 	for i := range entries {
@@ -692,19 +865,25 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 				// No TOML representation: omit the key.
 				continue
 			case shapeValue:
+				e.pushPathKey(ent.key)
 				if err := e.encodeKeyValue(*ent, commented, indent); err != nil {
+					e.popPath()
 					return err
 				}
+				e.popPath()
 				continue
 			case shapeTable:
 				// A table body is emitted in the second pass, unless it is
 				// forced inline (SetTablesInline / inline tag), which has no
 				// valid inline form and is reported as an error by
 				// encodeKeyValue.
-				if e.tablesInline || ent.options.inline {
+				if e.entryInline(ent) {
+					e.pushPathKey(ent.key)
 					if err := e.encodeKeyValue(*ent, commented, indent); err != nil {
+						e.popPath()
 						return err
 					}
+					e.popPath()
 				}
 				continue
 			}
@@ -712,9 +891,12 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 		if e.entryIsTable(ent) {
 			continue
 		}
+		e.pushPathKey(ent.key)
 		if err := e.encodeKeyValue(*ent, commented, indent); err != nil {
+			e.popPath()
 			return err
 		}
+		e.popPath()
 	}
 
 	// Second pass: emit the sub-tables, extending the shared key stack.
@@ -732,9 +914,13 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 				// (The forced-inline case already errored in the first pass.)
 				entCommented := commented || ent.options.commented
 				e.keyStack = append(e.keyStack, ent.key)
+				e.pushPathKey(ent.key)
 				if err := e.encodeMarshalerTable(&ent, entCommented, indent); err != nil {
+					e.popPath()
+					e.keyStack = e.keyStack[:len(e.keyStack)-1]
 					return err
 				}
+				e.popPath()
 				e.keyStack = e.keyStack[:len(e.keyStack)-1]
 				continue
 			}
@@ -744,12 +930,16 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 		}
 		entCommented := commented || ent.options.commented
 		e.keyStack = append(e.keyStack, ent.key)
+		e.pushPathKey(ent.key)
 
 		if e.isArrayOfTables(ent.value) {
 			err := e.encodeArrayTable(ent, entCommented, indent)
 			if err != nil {
+				e.popPath()
+				e.keyStack = e.keyStack[:len(e.keyStack)-1]
 				return err
 			}
+			e.popPath()
 			e.keyStack = e.keyStack[:len(e.keyStack)-1]
 			continue
 		}
@@ -759,6 +949,8 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 
 		subEntries, err := e.collectEntries(tv)
 		if err != nil {
+			e.popPath()
+			e.keyStack = e.keyStack[:len(e.keyStack)-1]
 			return err
 		}
 
@@ -770,7 +962,25 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 				// resolveMarshalerEntries skips already-classified entries,
 				// making the second call there a no-op.
 				if err := e.resolveMarshalerEntries(subEntries); err != nil {
+					e.popPath()
+					e.keyStack = e.keyStack[:len(e.keyStack)-1]
 					return err
+				}
+			}
+			if e.layoutFunc != nil {
+				// onlySubTables must see whether the sole child is forced
+				// inline by a callback, so resolve the sub-table's entry
+				// layouts before consulting it. encodeTableEntries resolves
+				// them again but skips already-resolved entries.
+				for j := range subEntries {
+					sub := &subEntries[j]
+					e.pushPathKey(sub.key)
+					if err := e.resolveEntryLayout(sub); err != nil {
+						e.popPath()
+						e.keyStack = e.keyStack[:len(e.keyStack)-1]
+						return err
+					}
+					e.popPath()
 				}
 			}
 			if e.onlySubTables(subEntries) {
@@ -788,8 +998,11 @@ func (e *encoderState) encodeTableEntries(entries []entry, commented bool, inden
 
 		err = e.encodeTableEntries(subEntries, entCommented, subIndent)
 		if err != nil {
+			e.popPath()
+			e.keyStack = e.keyStack[:len(e.keyStack)-1]
 			return err
 		}
+		e.popPath()
 		e.keyStack = e.keyStack[:len(e.keyStack)-1]
 	}
 
@@ -810,7 +1023,7 @@ func (e *encoderState) onlySubTables(entries []entry) bool {
 		if ent.options.rawShape != shapeUnknown {
 			// Classified unstable.Marshaler entry: only a table-shaped one
 			// that is not forced inline is guaranteed to emit a header.
-			if ent.options.rawShape != shapeTable || e.tablesInline || ent.options.inline {
+			if ent.options.rawShape != shapeTable || e.entryInline(ent) {
 				return false
 			}
 			continue
@@ -862,7 +1075,76 @@ func (e *encoderState) spliceRawTableBody(raw []byte, commented bool) {
 // than a key-value. Marshaler entries are routed by encodeTable before this is
 // reached, so it carries no marshaler-specific cost.
 func (e *encoderState) entryIsTable(ent *entry) bool {
-	return !e.tablesInline && !ent.options.inline && (e.isTableLike(ent.value) || e.isArrayOfTables(ent.value))
+	return !e.entryInline(ent) && (e.isTableLike(ent.value) || e.isArrayOfTables(ent.value))
+}
+
+// entryInline reports whether a table-like entry is forced to render as an
+// inline table. Precedence, highest to lowest: the inline struct tag, the
+// path layout callback, then SetTablesInline.
+func (e *encoderState) entryInline(ent *entry) bool {
+	return e.tablesInline || ent.options.inline || ent.options.layoutInline
+}
+
+// pushPathKey pushes a key segment onto the callback path stack. It is kept in
+// step with keyStack as the encoder descends into sub-tables and key-values.
+func (e *encoderState) pushPathKey(key string) {
+	e.pathStack = append(e.pathStack, PathSegment{Key: key})
+}
+
+// pushPathIndex pushes an array-index segment onto the callback path stack.
+func (e *encoderState) pushPathIndex(i int) {
+	e.pathStack = append(e.pathStack, PathSegment{Index: i, IsIndex: true})
+}
+
+// popPath removes the last segment pushed by pushPathKey/pushPathIndex.
+func (e *encoderState) popPath() {
+	e.pathStack = e.pathStack[:len(e.pathStack)-1]
+}
+
+// layoutAtCurrent invokes the layout callback for the node at e.pathStack
+// (which already ends with the node's own key or index). The path handed to
+// the callback is a private copy, so a callback that retains it keeps a stable
+// snapshot that no later encode step mutates. The zero Layout is returned
+// when no callback is installed.
+func (e *encoderState) layoutAtCurrent() (Layout, error) {
+	if e.layoutFunc == nil {
+		return Layout{}, nil
+	}
+	path := append(LayoutPath(nil), e.pathStack...)
+	lay, err := e.layoutFunc(path)
+	if err != nil {
+		return Layout{}, fmt.Errorf("toml: layout callback at %s: %w", path, err)
+	}
+	return lay, nil
+}
+
+// resolveEntryLayout consults the callback for one table entry (its key must
+// already be on e.pathStack) and records the decision on the entry so both
+// table passes and value rendering share a single, consistent result. It also
+// rejects combinations that have no TOML representation, reporting the
+// offending path.
+func (e *encoderState) resolveEntryLayout(ent *entry) error {
+	if ent.options.layoutResolved || e.layoutFunc == nil {
+		return nil
+	}
+	ent.options.layoutResolved = true
+
+	lay, err := e.layoutAtCurrent()
+	if err != nil {
+		return err
+	}
+	ent.options.layoutInline = lay.InlineTable
+	ent.options.layoutMultiline = lay.MultilineArray
+
+	// An array of tables normally emits one [[header]] per element; those are
+	// statements, not values, so they cannot wrap as a multiline array
+	// literal. Wrapping is only possible when the elements are inline
+	// tables. A multiline request without an inline layout is therefore
+	// contradictory.
+	if lay.MultilineArray && e.isArrayOfTables(ent.value) && !e.entryInline(ent) {
+		return fmt.Errorf("toml: invalid layout at %s: a multiline array of tables requires inline tables", e.pathStack)
+	}
+	return nil
 }
 
 // getEntries returns a reusable entry slice.
@@ -890,6 +1172,28 @@ func (e *encoderState) encodeArrayTable(ent entry, commented bool, indent int) e
 		// Elements are resolvable: isArrayOfTables already resolved them.
 		elem, _ := resolve(v.Index(i))
 
+		// Record the element index so the layout callback sees distinct paths
+		// for same-named fields of different array-table elements.
+		e.pushPathIndex(i)
+
+		// One element of an array of tables cannot be an inline table while
+		// the others keep their [[header]]: the elements of a single array of
+		// tables must share one representation. Only the array node can switch
+		// the whole array to inline tables, so an element-level request is
+		// reported as an impossible layout rather than being silently dropped.
+		if e.layoutFunc != nil {
+			lay, err := e.layoutAtCurrent()
+			if err != nil {
+				e.popPath()
+				return err
+			}
+			if lay.InlineTable {
+				err := fmt.Errorf("toml: invalid layout at %s: an individual array-table element cannot be inline; mark the whole array inline", e.pathStack)
+				e.popPath()
+				return err
+			}
+		}
+
 		e.writeTableHeader(comment, commented, true, indent)
 		// The comment is only present before the first element.
 		comment = ""
@@ -900,20 +1204,25 @@ func (e *encoderState) encodeArrayTable(ent entry, commented bool, indent int) e
 		if e.marshalerOn && encPropsForType(elem.Type()).marshaler != 0 {
 			raw, err := e.marshalerBytes(elem)
 			if err != nil {
+				e.popPath()
 				return err
 			}
 			trimmed := bytes.TrimSpace(raw)
 			if err := e.validateRawTableBody(elem.Type(), trimmed); err != nil {
+				e.popPath()
 				return err
 			}
 			e.spliceRawTableBody(trimmed, commented)
+			e.popPath()
 			continue
 		}
 
 		err := e.encodeTable(elem, commented, indent+1)
 		if err != nil {
+			e.popPath()
 			return err
 		}
+		e.popPath()
 	}
 	return nil
 }
@@ -1665,7 +1974,26 @@ func (e *encoderState) appendTextMarshaler(b []byte, m encoding.TextMarshaler) (
 
 // appendArray encodes a slice or array value.
 func (e *encoderState) appendArray(b []byte, v reflect.Value, opts valueOptions, indent int) ([]byte, error) {
-	multiline := opts.multiline || e.arraysMultiline
+	// For a value reached by its own table entry, the layout callback was
+	// already resolved (opts.layoutResolved). For a nested array reached while
+	// rendering a value, consult the callback here on the element's path.
+	// Members of an inline table stay single-line regardless (matching tags
+	// and SetArraysMultiline), so the callback is not consulted there either.
+	if !opts.layoutResolved && !e.inlineCtx && e.layoutFunc != nil {
+		lay, err := e.layoutAtCurrent()
+		if err != nil {
+			return nil, err
+		}
+		opts.layoutMultiline = lay.MultilineArray
+	}
+
+	multiline := opts.multiline || e.arraysMultiline || opts.layoutMultiline
+	// Members of an inline table always render on one line: the member's own
+	// tag, SetArraysMultiline, and the callback cannot split a { ... } table
+	// across lines.
+	if e.inlineCtx {
+		multiline = false
+	}
 
 	b = append(b, '[')
 	if multiline && v.Len() > 0 {
@@ -1677,8 +2005,10 @@ func (e *encoderState) appendArray(b []byte, v reflect.Value, opts valueOptions,
 			for j := 0; j <= indent; j++ {
 				b = append(b, e.indentSymbol...)
 			}
+			e.pushPathIndex(i)
 			var err error
 			b, err = e.appendValue(b, v.Index(i), valueOptions{}, indent+1)
+			e.popPath()
 			if err != nil {
 				return nil, err
 			}
@@ -1692,8 +2022,10 @@ func (e *encoderState) appendArray(b []byte, v reflect.Value, opts valueOptions,
 			if i > 0 {
 				b = append(b, ", "...)
 			}
+			e.pushPathIndex(i)
 			var err error
 			b, err = e.appendValue(b, v.Index(i), valueOptions{}, indent)
+			e.popPath()
 			if err != nil {
 				return nil, err
 			}
@@ -1709,6 +2041,10 @@ func (e *encoderState) appendInlineTable(b []byte, v reflect.Value, indent int) 
 		return nil, err
 	}
 
+	// Members of an inline table are values and must stay on one line.
+	prevInline := e.inlineCtx
+	e.inlineCtx = true
+
 	b = append(b, '{')
 	for i, ent := range entries {
 		if i > 0 {
@@ -1716,16 +2052,21 @@ func (e *encoderState) appendInlineTable(b []byte, v reflect.Value, indent int) 
 		}
 		b = e.appendKey(b, ent.key)
 		b = append(b, " = "...)
-		// multiline strings are not allowed inside inline tables: they
-		// would break the single-line requirement.
+		// Multiline strings and arrays are not allowed inside inline tables:
+		// they would break the single-line requirement.
 		opts := ent.options
 		opts.multiline = false
+		opts.layoutMultiline = false
+		e.pushPathKey(ent.key)
 		b, err = e.appendValue(b, ent.value, opts, indent)
+		e.popPath()
 		if err != nil {
+			e.inlineCtx = prevInline
 			return nil, err
 		}
 	}
 	e.putEntries(entries)
+	e.inlineCtx = prevInline
 	return append(b, '}'), nil
 }
 
