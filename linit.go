@@ -21,6 +21,8 @@ const (
 	ChannelLibName = "channel"
 	// CoroutineLibName is the name of the coroutine Library.
 	CoroutineLibName = "coroutine"
+	// Utf8LibName is the name of the utf8 Library.
+	Utf8LibName = "utf8"
 )
 
 type luaLib struct {
@@ -39,6 +41,7 @@ var luaLibs = []luaLib{
 	luaLib{DebugLibName, OpenDebug},
 	luaLib{ChannelLibName, OpenChannel},
 	luaLib{CoroutineLibName, OpenCoroutine},
+	luaLib{Utf8LibName, OpenUtf8},
 }
 
 // OpenLibs loads the built-in libraries. It is equivalent to running OpenLoad,
