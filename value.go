@@ -18,9 +18,10 @@ const (
 	LTThread
 	LTTable
 	LTChannel
+	LTGoError
 )
 
-var lValueNames = [9]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel"}
+var lValueNames = [10]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel", "userdata"}
 
 func (vt LValueType) String() string {
 	return lValueNames[int(vt)]
@@ -208,6 +209,50 @@ type LUserData struct {
 
 func (ud *LUserData) String() string   { return fmt.Sprintf("userdata: %p", ud) }
 func (ud *LUserData) Type() LValueType { return LTUserData }
+
+// LGoError is an LValue that carries a Go error across Lua protected
+// calls. It is returned to Lua code (for example via pcall or xpcall) as
+// an opaque, userdata-like value whose String method yields the safe
+// error text. Unlike other LValues it never captures an *LState, so the
+// underlying error chain remains reachable from the host through
+// errors.Is and errors.As while being safe to retain after a call.
+type LGoError struct {
+	Err       error
+	Metatable LValue
+}
+
+// NewGoError wraps a Go error into an LValue that preserves the error
+// chain. A nil error yields LNil.
+func NewGoError(err error) LValue {
+	if err == nil {
+		return LNil
+	}
+	return &LGoError{Err: err}
+}
+
+// String returns a safe textual representation of the wrapped error.
+func (e *LGoError) String() string {
+	if e == nil || e.Err == nil {
+		return "userdata: (nil)"
+	}
+	return e.Err.Error()
+}
+
+// Type reports the value as userdata so Lua scripts see it as an opaque
+// value and can attach a metatable (including __tostring) to it.
+func (e *LGoError) Type() LValueType { return LTGoError }
+
+// Error makes LGoError satisfy the Go error interface. It returns the
+// same safe text as String.
+func (e *LGoError) Error() string { return e.String() }
+
+// Unwrap exposes the wrapped error to errors.Is and errors.As.
+func (e *LGoError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 type LChannel chan LValue
 

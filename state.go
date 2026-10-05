@@ -53,6 +53,16 @@ func (e *ApiError) Error() string {
 	return e.Object.String()
 }
 
+// Unwrap preserves the original Go error chain when the error carries an
+// LGoError object (for example one raised with RaiseGoError). The Cause
+// field used by syntax and file errors is exposed as well.
+func (e *ApiError) Unwrap() error {
+	if ge, ok := e.Object.(*LGoError); ok {
+		return ge
+	}
+	return e.Cause
+}
+
 type ApiErrorType int
 
 const (
@@ -661,6 +671,24 @@ func panicWithoutTraceback(L *LState) {
 	panic(err)
 }
 
+// apiErrorFromRecover converts a value recovered from a panicking call
+// into an *ApiError. Go errors retain their chain: an error raised by a
+// Go extension function is wrapped in an LGoError object so that
+// errors.Is and errors.As keep reaching the original cause, and Lua
+// pcall/xpcall receive and forward that value verbatim.
+func apiErrorFromRecover(rcv interface{}) *ApiError {
+	switch v := rcv.(type) {
+	case *ApiError:
+		return v
+	case *LGoError:
+		return newApiError(ApiErrorRun, v)
+	case error:
+		return newApiError(ApiErrorRun, NewGoError(v))
+	default:
+		return newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
+	}
+}
+
 func newLState(options Options) *LState {
 	al := newAllocator(32)
 	ls := &LState{
@@ -978,6 +1006,8 @@ func (ls *LState) metatable(lvalue LValue, rawget bool) LValue {
 	case *LTable:
 		metatable = obj.Metatable
 	case *LUserData:
+		metatable = obj.Metatable
+	case *LGoError:
 		metatable = obj.Metatable
 	default:
 		if table, ok := ls.G.builtinMts[int(obj.Type())]; ok {
@@ -1730,6 +1760,21 @@ func (ls *LState) RaiseError(format string, args ...interface{}) {
 	ls.raiseError(1, format, args...)
 }
 
+// RaiseGoError raises the given Go error as a Lua error value. Unlike a
+// plain string error, the wrapped value preserves the original error
+// chain: once the failure is delivered back to the host through PCall,
+// CallByParam and friends, errors.Is and errors.As keep matching err.
+// Lua code receives the value as an opaque userdata-like value; if it
+// replaces it with an ordinary string, the chain is intentionally lost.
+// A nil error raises a generic error instead of doing nothing.
+func (ls *LState) RaiseGoError(err error) {
+	if err == nil {
+		ls.raiseError(1, "attempt to raise a nil error")
+		return
+	}
+	ls.Error(NewGoError(err), 0)
+}
+
 // This function is equivalent to lua_error( http://www.lua.org/manual/5.1/manual.html#lua_error ).
 func (ls *LState) Error(lv LValue, level int) {
 	if str, ok := lv.(LString); ok {
@@ -2040,15 +2085,11 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 		ls.hasErrorFunc = false
 		rcv := recover()
 		if rcv != nil {
-			if _, ok := rcv.(*ApiError); !ok {
-				err = newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
-				if ls.Options.IncludeGoStackTrace {
-					buf := make([]byte, 4096)
-					runtime.Stack(buf, false)
-					err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + "\n" + ls.stackTrace(0)
-				}
-			} else {
-				err = rcv.(*ApiError)
+			err = apiErrorFromRecover(rcv)
+			if _, ok := rcv.(*ApiError); !ok && ls.Options.IncludeGoStackTrace {
+				buf := make([]byte, 4096)
+				runtime.Stack(buf, false)
+				err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + "\n" + ls.stackTrace(0)
 			}
 			if errfunc != nil {
 				ls.Push(errfunc)
@@ -2058,15 +2099,14 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 					ls.Panic = oldpanic
 					rcv := recover()
 					if rcv != nil {
+						err = apiErrorFromRecover(rcv)
 						if _, ok := rcv.(*ApiError); !ok {
-							err = newApiErrorS(ApiErrorPanic, fmt.Sprint(rcv))
 							if ls.Options.IncludeGoStackTrace {
 								buf := make([]byte, 4096)
 								runtime.Stack(buf, false)
 								err.(*ApiError).StackTrace = strings.Trim(string(buf), "\000") + ls.stackTrace(0)
 							}
 						} else {
-							err = rcv.(*ApiError)
 							err.(*ApiError).StackTrace = ls.stackTrace(0)
 						}
 						ls.stack.SetSp(sp)
@@ -2075,7 +2115,12 @@ func (ls *LState) PCall(nargs, nret int, errfunc *LFunction) (err error) {
 					}
 				}()
 				ls.Call(1, 1)
-				err = newApiError(ApiErrorError, ls.Get(-1))
+				handlerResult := ls.Get(-1)
+				if _, ok := handlerResult.(*LGoError); ok {
+					err = newApiError(ApiErrorRun, handlerResult)
+				} else {
+					err = newApiError(ApiErrorError, handlerResult)
+				}
 			} else if len(err.(*ApiError).StackTrace) == 0 {
 				err.(*ApiError).StackTrace = ls.stackTrace(0)
 			}
@@ -2132,6 +2177,8 @@ func (ls *LState) SetMetatable(obj LValue, mt LValue) {
 	case *LTable:
 		v.Metatable = mt
 	case *LUserData:
+		v.Metatable = mt
+	case *LGoError:
 		v.Metatable = mt
 	default:
 		ls.G.builtinMts[int(obj.Type())] = mt

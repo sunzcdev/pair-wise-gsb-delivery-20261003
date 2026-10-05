@@ -138,9 +138,14 @@ func threadRun(L *LState) {
 	defer func() {
 		if rcv := recover(); rcv != nil {
 			var lv LValue
-			if v, ok := rcv.(*ApiError); ok {
+			switch v := rcv.(type) {
+			case *ApiError:
 				lv = v.Object
-			} else {
+			case *LGoError:
+				lv = v
+			case error:
+				lv = NewGoError(v)
+			default:
 				lv = LString(fmt.Sprint(rcv))
 			}
 			if parent := L.Parent; parent != nil {

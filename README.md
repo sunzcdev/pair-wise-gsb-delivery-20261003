@@ -380,6 +380,39 @@ L.Pop(1)  // remove received value
 
 If `Protect` is false, GopherLua will panic instead of returning an `error` value.
 
+#### Raising Go errors
+
+Go functions can return a failure with an intact error chain by calling
+`(*lua.LState).RaiseGoError` instead of `RaiseError`. The error is passed
+to Lua as an opaque, userdata-like value: `pcall` and `xpcall` receive
+and forward it, and `tostring` yields the safe error text. When the
+failure is delivered back to Go through a protected call (`PCall`,
+`CallByParam` with `Protect: true`, ...), the returned `error` keeps the
+original cause and works with `errors.Is` and `errors.As`.
+
+```go
+var ErrNotFound = errors.New("not found")
+
+func myGoFunction(L *lua.LState) int {
+    if err := doWork(); err != nil {
+        // the chain (fmt.Errorf("%w", ...), sentinels, typed errors) is preserved
+        L.RaiseGoError(fmt.Errorf("myGoFunction: %w", ErrNotFound))
+    }
+    return 0
+}
+
+// host side
+err := L.CallByParam(lua.P{Fn: fn, Protect: true})
+if errors.Is(err, ErrNotFound) { // true
+    // ...
+}
+```
+
+If a Lua script replaces the value with an ordinary string (for example
+`error("handled")` or an `xpcall` handler returning a string), it is no
+longer the wrapped Go error and `errors.Is`/`errors.As` cannot reach the
+original cause.
+
 #### User-Defined types
 
 You can extend GopherLua with new types written in Go.
