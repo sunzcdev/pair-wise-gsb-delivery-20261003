@@ -1,0 +1,490 @@
+{
+  "version": 1,
+  "tree": {
+    "type": "Document",
+    "position": 0,
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Table",
+        "position": 0,
+        "blankPreviousLines": false,
+        "children": [
+          {
+            "type": "TableHeader",
+            "position": 0,
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableCell",
+                "position": 1,
+                "alignment": "left",
+                "source": [
+                  [
+                    2,
+                    6
+                  ]
+                ],
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 2,
+                    "value": {
+                      "text": "left",
+                      "ranges": [
+                        [
+                          2,
+                          6
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "position": 8,
+                "alignment": "center",
+                "source": [
+                  [
+                    9,
+                    15
+                  ]
+                ],
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 9,
+                    "value": {
+                      "text": "center",
+                      "ranges": [
+                        [
+                          9,
+                          15
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "position": 17,
+                "alignment": "right",
+                "source": [
+                  [
+                    18,
+                    23
+                  ]
+                ],
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 18,
+                    "value": {
+                      "text": "right",
+                      "ranges": [
+                        [
+                          18,
+                          23
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "TableBody",
+            "position": 52,
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableRow",
+                "position": 52,
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "TableCell",
+                    "position": 53,
+                    "alignment": "left",
+                    "source": [
+                      [
+                        54,
+                        59
+                      ]
+                    ],
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Strikethrough",
+                        "position": 54,
+                        "children": [
+                          {
+                            "type": "Text",
+                            "position": 56,
+                            "value": {
+                              "text": "a",
+                              "ranges": [
+                                [
+                                  56,
+                                  57
+                                ]
+                              ]
+                            },
+                            "flags": [],
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "position": 60,
+                    "alignment": "center",
+                    "source": [
+                      [
+                        62,
+                        65
+                      ]
+                    ],
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "CodeSpan",
+                        "position": 63,
+                        "value": {
+                          "text": "c",
+                          "ranges": [
+                            [
+                              63,
+                              64
+                            ]
+                          ]
+                        },
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "position": 69,
+                    "alignment": "right",
+                    "source": [
+                      [
+                        71,
+                        72
+                      ]
+                    ],
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Text",
+                        "position": 71,
+                        "value": {
+                          "text": "1",
+                          "ranges": [
+                            [
+                              71,
+                              72
+                            ]
+                          ]
+                        },
+                        "flags": [],
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "List",
+        "position": 79,
+        "ordered": false,
+        "marker": "-",
+        "tight": true,
+        "start": null,
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "ListItem",
+            "position": 79,
+            "blankPreviousLines": true,
+            "attributes": [
+              [
+                "task-status",
+                {
+                  "text": "completed",
+                  "ranges": []
+                }
+              ]
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "position": 81,
+                "source": [
+                  [
+                    81,
+                    89
+                  ]
+                ],
+                "blankPreviousLines": true,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 85,
+                    "value": {
+                      "text": "done",
+                      "ranges": [
+                        [
+                          85,
+                          89
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "ListItem",
+            "position": 90,
+            "blankPreviousLines": false,
+            "attributes": [
+              [
+                "task-status",
+                {
+                  "text": "active",
+                  "ranges": []
+                }
+              ]
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "position": 92,
+                "source": [
+                  [
+                    92,
+                    100
+                  ]
+                ],
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 96,
+                    "value": {
+                      "text": "todo",
+                      "ranges": [
+                        [
+                          96,
+                          100
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "DefinitionList",
+        "position": 102,
+        "blankPreviousLines": false,
+        "children": [
+          {
+            "type": "DefinitionTerm",
+            "position": 102,
+            "source": [
+              [
+                102,
+                106
+              ]
+            ],
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "Text",
+                "position": 102,
+                "value": {
+                  "text": "term",
+                  "ranges": [
+                    [
+                      102,
+                      106
+                    ]
+                  ]
+                },
+                "flags": [],
+                "children": []
+              }
+            ]
+          },
+          {
+            "type": "DefinitionDescription",
+            "position": 107,
+            "tight": true,
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "Paragraph",
+                "position": 109,
+                "source": [
+                  [
+                    109,
+                    112
+                  ]
+                ],
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "position": 109,
+                    "value": {
+                      "text": "def",
+                      "ranges": [
+                        [
+                          109,
+                          112
+                        ]
+                      ]
+                    },
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "position": 114,
+        "source": [
+          [
+            114,
+            125
+          ]
+        ],
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "position": 114,
+            "value": {
+              "text": "See ",
+              "ranges": [
+                [
+                  114,
+                  118
+                ]
+              ]
+            },
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "FootnoteReference",
+            "position": 118,
+            "label": {
+              "text": "one",
+              "ranges": [
+                [
+                  120,
+                  123
+                ]
+              ]
+            },
+            "index": 1,
+            "refIndex": 0,
+            "children": []
+          },
+          {
+            "type": "Text",
+            "position": 124,
+            "value": {
+              "text": ".",
+              "ranges": [
+                [
+                  124,
+                  125
+                ]
+              ]
+            },
+            "flags": [],
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "FootnoteDefinition",
+        "position": 127,
+        "label": {
+          "text": "one",
+          "ranges": [
+            [
+              129,
+              132
+            ]
+          ]
+        },
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Paragraph",
+            "position": 135,
+            "source": [
+              [
+                135,
+                139
+              ]
+            ],
+            "blankPreviousLines": true,
+            "children": [
+              {
+                "type": "Text",
+                "position": 135,
+                "value": {
+                  "text": "note",
+                  "ranges": [
+                    [
+                      135,
+                      139
+                    ]
+                  ]
+                },
+                "flags": [],
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

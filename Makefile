@@ -14,7 +14,7 @@ bench:
 
 test:
 	(cd parser && go test -count=1 -tags=goldmark_v1_attribute .)
-	go test -count=1 -tags= -coverprofile=coverage.out -coverpkg=github.com/yuin/goldmark/v2,github.com/yuin/goldmark/v2/ast,github.com/yuin/goldmark/v2/extension,github.com/yuin/goldmark/v2/extension/ast,github.com/yuin/goldmark/v2/parser,github.com/yuin/goldmark/v2/renderer,github.com/yuin/goldmark/v2/renderer/html,github.com/yuin/goldmark/v2/text,github.com/yuin/goldmark/v2/util ./...
+	go test -count=1 -tags= -coverprofile=coverage.out -coverpkg=github.com/yuin/goldmark/v2,github.com/yuin/goldmark/v2/ast,github.com/yuin/goldmark/v2/astjson,github.com/yuin/goldmark/v2/extension,github.com/yuin/goldmark/v2/extension/ast,github.com/yuin/goldmark/v2/parser,github.com/yuin/goldmark/v2/renderer,github.com/yuin/goldmark/v2/renderer/html,github.com/yuin/goldmark/v2/text,github.com/yuin/goldmark/v2/util ./...
 
 cov: test
 	go tool cover -html=coverage.out

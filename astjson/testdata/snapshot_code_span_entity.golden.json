@@ -1,0 +1,244 @@
+{
+  "version": 1,
+  "tree": {
+    "type": "Document",
+    "position": 0,
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "LinkReferenceDefinition",
+        "position": 0,
+        "label": {
+          "text": "ref",
+          "ranges": [
+            [
+              1,
+              4
+            ]
+          ]
+        },
+        "destination": {
+          "text": "/url",
+          "ranges": [
+            [
+              7,
+              11
+            ]
+          ]
+        },
+        "title": {
+          "text": "the title",
+          "ranges": [
+            [
+              13,
+              22
+            ]
+          ]
+        },
+        "blankPreviousLines": true,
+        "children": []
+      },
+      {
+        "type": "CodeBlock",
+        "position": 25,
+        "codeBlockKind": "Fenced",
+        "value": {
+          "text": "a := 1 < 2 && 3\n",
+          "ranges": [
+            [
+              31,
+              47
+            ]
+          ]
+        },
+        "info": "go",
+        "blankPreviousLines": true,
+        "children": []
+      },
+      {
+        "type": "Paragraph",
+        "position": 52,
+        "source": [
+          [
+            52,
+            55
+          ],
+          [
+            55,
+            74
+          ]
+        ],
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "CodeSpan",
+            "position": 53,
+            "value": {
+              "text": "a b",
+              "ranges": [
+                [
+                  53,
+                  55
+                ],
+                [
+                  55,
+                  56
+                ]
+              ]
+            },
+            "children": []
+          },
+          {
+            "type": "Text",
+            "position": 57,
+            "value": {
+              "text": " & A *x",
+              "ranges": [
+                [
+                  57,
+                  73
+                ]
+              ]
+            },
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "Text",
+            "position": 73,
+            "value": {
+              "text": "*",
+              "ranges": [
+                [
+                  73,
+                  74
+                ]
+              ]
+            },
+            "flags": [],
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "position": 76,
+        "source": [
+          [
+            76,
+            94
+          ]
+        ],
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "AutoLink",
+            "position": 76,
+            "destination": {
+              "text": "mailto:user@example.com",
+              "ranges": []
+            },
+            "label": {
+              "text": "user@example.com",
+              "ranges": [
+                [
+                  77,
+                  93
+                ]
+              ]
+            },
+            "text": {
+              "text": "<user@example.com>",
+              "ranges": [
+                [
+                  76,
+                  94
+                ]
+              ]
+            },
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "position": 96,
+        "source": [
+          [
+            96,
+            105
+          ]
+        ],
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "position": 96,
+            "value": {
+              "text": "see ",
+              "ranges": [
+                [
+                  96,
+                  100
+                ]
+              ]
+            },
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "Link",
+            "position": 100,
+            "destination": {
+              "text": "/url",
+              "ranges": [
+                [
+                  7,
+                  11
+                ]
+              ]
+            },
+            "title": {
+              "text": "the title",
+              "ranges": [
+                [
+                  13,
+                  22
+                ]
+              ]
+            },
+            "reference": {
+              "kind": "Shortcut",
+              "value": {
+                "text": "ref",
+                "ranges": [
+                  [
+                    101,
+                    104
+                  ]
+                ]
+              }
+            },
+            "children": [
+              {
+                "type": "Text",
+                "position": 101,
+                "value": {
+                  "text": "ref",
+                  "ranges": [
+                    [
+                      101,
+                      104
+                    ]
+                  ]
+                },
+                "flags": [],
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

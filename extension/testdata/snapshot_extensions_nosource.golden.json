@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "tree": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "Table",
+        "blankPreviousLines": false,
+        "children": [
+          {
+            "type": "TableHeader",
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableCell",
+                "alignment": "left",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "left",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "alignment": "center",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "center",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              },
+              {
+                "type": "TableCell",
+                "alignment": "right",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "right",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "TableBody",
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "TableRow",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "TableCell",
+                    "alignment": "left",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Strikethrough",
+                        "children": [
+                          {
+                            "type": "Text",
+                            "value": "a",
+                            "flags": [],
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "alignment": "center",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "CodeSpan",
+                        "value": "c",
+                        "children": []
+                      }
+                    ]
+                  },
+                  {
+                    "type": "TableCell",
+                    "alignment": "right",
+                    "blankPreviousLines": false,
+                    "children": [
+                      {
+                        "type": "Text",
+                        "value": "1",
+                        "flags": [],
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "List",
+        "ordered": false,
+        "marker": "-",
+        "tight": true,
+        "start": null,
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "ListItem",
+            "blankPreviousLines": true,
+            "attributes": [
+              [
+                "task-status",
+                "completed"
+              ]
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "blankPreviousLines": true,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "done",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "ListItem",
+            "blankPreviousLines": false,
+            "attributes": [
+              [
+                "task-status",
+                "active"
+              ]
+            ],
+            "children": [
+              {
+                "type": "Paragraph",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "todo",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "DefinitionList",
+        "blankPreviousLines": false,
+        "children": [
+          {
+            "type": "DefinitionTerm",
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "Text",
+                "value": "term",
+                "flags": [],
+                "children": []
+              }
+            ]
+          },
+          {
+            "type": "DefinitionDescription",
+            "tight": true,
+            "blankPreviousLines": false,
+            "children": [
+              {
+                "type": "Paragraph",
+                "blankPreviousLines": false,
+                "children": [
+                  {
+                    "type": "Text",
+                    "value": "def",
+                    "flags": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "value": "See ",
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "FootnoteReference",
+            "label": "one",
+            "index": 1,
+            "refIndex": 0,
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": ".",
+            "flags": [],
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "FootnoteDefinition",
+        "label": "one",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Paragraph",
+            "blankPreviousLines": true,
+            "children": [
+              {
+                "type": "Text",
+                "value": "note",
+                "flags": [],
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "tree": {
+    "type": "Document",
+    "blankPreviousLines": true,
+    "children": [
+      {
+        "type": "LinkReferenceDefinition",
+        "label": "ref",
+        "destination": "/url",
+        "title": "the title",
+        "blankPreviousLines": true,
+        "children": []
+      },
+      {
+        "type": "CodeBlock",
+        "codeBlockKind": "Fenced",
+        "value": "a := 1 < 2 && 3\n",
+        "info": "go",
+        "blankPreviousLines": true,
+        "children": []
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "CodeSpan",
+            "value": "a b",
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": " & A *x",
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "Text",
+            "value": "*",
+            "flags": [],
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "AutoLink",
+            "destination": "mailto:user@example.com",
+            "label": "user@example.com",
+            "text": "<user@example.com>",
+            "children": []
+          }
+        ]
+      },
+      {
+        "type": "Paragraph",
+        "blankPreviousLines": true,
+        "children": [
+          {
+            "type": "Text",
+            "value": "see ",
+            "flags": [],
+            "children": []
+          },
+          {
+            "type": "Link",
+            "destination": "/url",
+            "title": "the title",
+            "reference": {
+              "kind": "Shortcut",
+              "value": "ref"
+            },
+            "children": [
+              {
+                "type": "Text",
+                "value": "ref",
+                "flags": [],
+                "children": []
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
