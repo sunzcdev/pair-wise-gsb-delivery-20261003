@@ -33,10 +33,12 @@ type Part struct {
 	// r is either a reader directly reading from mr
 	r io.Reader
 
-	n       int   // known data bytes waiting in mr.bufReader
-	total   int64 // total data bytes read already
-	err     error // error to return when n == 0
-	readErr error // read error observed from mr.bufReader
+	n           int   // known data bytes waiting in mr.bufReader
+	total       int64 // total data bytes read already
+	err         error // error to return when n == 0
+	readErr     error // read error observed from mr.bufReader
+	startOffset int64
+	bodyOffset  int64
 }
 
 // NewMultipartReader creates a new multipart reader reading from r using the
@@ -47,8 +49,10 @@ type Part struct {
 // parse such headers.
 func NewMultipartReader(r io.Reader, boundary string) *MultipartReader {
 	b := []byte("\r\n--" + boundary + "--")
+	sr := &stickyErrorReader{r: r}
 	return &MultipartReader{
-		bufReader:        bufio.NewReaderSize(&stickyErrorReader{r: r}, peekBufferSize),
+		r:                sr,
+		bufReader:        bufio.NewReaderSize(sr, peekBufferSize),
 		nl:               b[:2],
 		nlDashBoundary:   b[:len(b)-2],
 		dashBoundaryDash: b[2:],
@@ -64,6 +68,7 @@ func NewMultipartReader(r io.Reader, boundary string) *MultipartReader {
 type stickyErrorReader struct {
 	r   io.Reader
 	err error
+	n   int64
 }
 
 func (r *stickyErrorReader) Read(p []byte) (n int, _ error) {
@@ -71,6 +76,7 @@ func (r *stickyErrorReader) Read(p []byte) (n int, _ error) {
 		return 0, r.err
 	}
 	n, r.err = r.r.Read(p)
+	r.n += int64(n)
 	return n, r.err
 }
 
@@ -89,6 +95,24 @@ func (bp *Part) populateHeaders() error {
 		bp.Header = header
 	}
 	return err
+}
+
+// StartOffset returns the offset of the part's header relative to the
+// multipart body passed to NewMultipartReader.
+func (p *Part) StartOffset() int64 {
+	return p.startOffset
+}
+
+// BodyOffset returns the offset of the part's body relative to the multipart
+// body passed to NewMultipartReader.
+func (p *Part) BodyOffset() int64 {
+	return p.bodyOffset
+}
+
+// BodyEndOffset returns the offset immediately after the part's body. The body
+// must be consumed completely before calling this method.
+func (p *Part) BodyEndOffset() int64 {
+	return p.bodyOffset + p.total
 }
 
 // Read reads the body of a part, after its headers and before the
@@ -227,6 +251,7 @@ func (p *Part) Close() error {
 // isn't supported.
 type MultipartReader struct {
 	bufReader *bufio.Reader
+	r         *stickyErrorReader
 
 	currentPart *Part
 	partsRead   int
@@ -235,6 +260,10 @@ type MultipartReader struct {
 	nlDashBoundary   []byte // nl + "--boundary"
 	dashBoundaryDash []byte // "--boundary--"
 	dashBoundary     []byte // "--boundary"
+}
+
+func (r *MultipartReader) offset() int64 {
+	return r.r.n - int64(r.bufReader.Buffered())
 }
 
 // NextPart returns the next part in the multipart or an error.
@@ -264,10 +293,13 @@ func (r *MultipartReader) NextPart() (*Part, error) {
 
 		if r.isBoundaryDelimiterLine(line) {
 			r.partsRead++
+			startOffset := r.offset()
 			bp, err := newPart(r)
 			if err != nil {
 				return nil, err
 			}
+			bp.startOffset = startOffset
+			bp.bodyOffset = r.offset()
 			r.currentPart = bp
 			return bp, nil
 		}
