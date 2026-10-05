@@ -820,3 +820,238 @@ func mustMakeNonce() (ret []byte) {
 	initNonce(ret)
 	return ret
 }
+
+type protocolListCase struct {
+	label string
+
+	list     []string
+	required bool
+
+	// offer holds the Sec-WebSocket-Protocol header lines sent by the
+	// client.
+	offer []string
+
+	// protocol is the expected negotiated protocol.
+	protocol string
+	// err is the expected handshake error.
+	err error
+}
+
+var protocolListCases = []protocolListCase{
+	{
+		label:    "server_preference_order",
+		list:     []string{"c", "b"},
+		offer:    []string{"a, b, c"},
+		protocol: "c",
+	},
+	{
+		label:    "multiple_header_lines",
+		list:     []string{"d", "b"},
+		offer:    []string{"a, b", "c, d"},
+		protocol: "d",
+	},
+	{
+		label:    "duplicate_tokens",
+		list:     []string{"a", "b"},
+		offer:    []string{"b, b, a", "b, a"},
+		protocol: "a",
+	},
+	{
+		label:    "empty_tokens",
+		list:     []string{"c"},
+		offer:    []string{"a,, b,", " , c"},
+		protocol: "c",
+	},
+	{
+		label:    "only_empty_tokens",
+		list:     []string{"a"},
+		offer:    []string{", ,"},
+		protocol: "",
+	},
+	{
+		label:    "case_insensitive_match",
+		list:     []string{"chat"},
+		offer:    []string{"Chat, CHAT"},
+		protocol: "chat",
+	},
+	{
+		label:    "server_spelling_wins",
+		list:     []string{"Chat"},
+		offer:    []string{"chat"},
+		protocol: "Chat",
+	},
+	{
+		label:    "empty_list_entries_ignored",
+		list:     []string{"", "b"},
+		offer:    []string{"b"},
+		protocol: "b",
+	},
+	{
+		label:    "no_offer",
+		list:     []string{"a"},
+		offer:    nil,
+		protocol: "",
+	},
+	{
+		label:    "no_common_protocol_accepted",
+		list:     []string{"a"},
+		offer:    []string{"x, y"},
+		protocol: "",
+	},
+	{
+		label:    "no_common_protocol_rejected",
+		list:     []string{"a"},
+		required: true,
+		offer:    []string{"x, y"},
+		err:      ErrHandshakeNoCommonProtocol,
+	},
+	{
+		label:    "no_offer_rejected",
+		list:     []string{"a"},
+		required: true,
+		offer:    nil,
+		err:      ErrHandshakeNoCommonProtocol,
+	},
+	{
+		label:    "required_without_list_has_no_effect",
+		required: true,
+		offer:    []string{"x"},
+		protocol: "",
+	},
+}
+
+func makeProtocolListRequest(t *testing.T, offer []string) (*http.Request, []byte) {
+	t.Helper()
+
+	header := http.Header{
+		headerUpgrade:    []string{"websocket"},
+		headerConnection: []string{"Upgrade"},
+		headerSecVersion: []string{"13"},
+		headerSecKey:     []string{string(mustMakeNonce())},
+	}
+	for _, line := range offer {
+		header[headerSecProtocol] = append(header[headerSecProtocol], line)
+	}
+	req := mustMakeRequest("GET", "ws://example.org", header)
+	return req, dumpRequest(req)
+}
+
+func checkProtocolListResult(t *testing.T, label string, hs Handshake, err error, response []byte, test protocolListCase) {
+	t.Helper()
+
+	if err != test.err {
+		t.Fatalf("%s: error is %v; want %v", label, err, test.err)
+	}
+	if hs.Protocol != test.protocol {
+		t.Errorf("%s: handshake protocol is %q; want %q", label, hs.Protocol, test.protocol)
+	}
+	if test.err != nil {
+		if !bytes.HasPrefix(response, []byte("HTTP/1.1 400")) {
+			t.Errorf("%s: response does not start with 400 status line:\n%s", label, response)
+		}
+		return
+	}
+	if !bytes.HasPrefix(response, []byte("HTTP/1.1 101")) {
+		t.Fatalf("%s: response does not start with 101 status line:\n%s", label, response)
+	}
+	headerLine := []byte(headerSecProtocol + ": " + test.protocol + "\r\n")
+	if test.protocol == "" {
+		if bytes.Contains(response, []byte(headerSecProtocol+":")) {
+			t.Errorf("%s: response contains unexpected %q header:\n%s", label, headerSecProtocol, response)
+		}
+	} else if !bytes.Contains(response, headerLine) {
+		t.Errorf("%s: response does not contain %q header line:\n%s", label, headerLine, response)
+	}
+}
+
+func TestUpgraderProtocolList(t *testing.T) {
+	for _, test := range protocolListCases {
+		t.Run(test.label, func(t *testing.T) {
+			_, reqBytes := makeProtocolListRequest(t, test.offer)
+
+			u := Upgrader{
+				ProtocolList:     test.list,
+				ProtocolRequired: test.required,
+			}
+			conn := bytes.NewBuffer(reqBytes)
+			hs, err := u.Upgrade(conn)
+
+			checkProtocolListResult(t, test.label, hs, err, conn.Bytes(), test)
+		})
+	}
+}
+
+func TestHTTPUpgraderProtocolList(t *testing.T) {
+	for _, test := range protocolListCases {
+		t.Run(test.label, func(t *testing.T) {
+			_, reqBytes := makeProtocolListRequest(t, test.offer)
+			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			u := HTTPUpgrader{
+				ProtocolList:     test.list,
+				ProtocolRequired: test.required,
+			}
+			res := newRecorder()
+			_, _, hs, err := u.Upgrade(req, res)
+
+			checkProtocolListResult(t, test.label, hs, err, res.Bytes(), test)
+		})
+	}
+}
+
+func TestUpgraderProtocolConfigConflict(t *testing.T) {
+	_, reqBytes := makeProtocolListRequest(t, []string{"a"})
+
+	upgraders := map[string]Upgrader{
+		"protocol": {
+			Protocol:     func([]byte) bool { return true },
+			ProtocolList: []string{"a"},
+		},
+		"protocol_custom": {
+			ProtocolCustom: func([]byte) (string, bool) { return "a", true },
+			ProtocolList:   []string{"a"},
+		},
+	}
+	for label, u := range upgraders {
+		t.Run(label, func(t *testing.T) {
+			conn := bytes.NewBuffer(reqBytes)
+			_, err := u.Upgrade(conn)
+			if err != ErrProtocolConfigConflict {
+				t.Fatalf("error is %v; want %v", err, ErrProtocolConfigConflict)
+			}
+			// The conflict must be reported before any handshake I/O: no
+			// request bytes read and no response (in particular no 101)
+			// written.
+			if !bytes.Equal(conn.Bytes(), reqBytes) {
+				t.Errorf("connection buffer was touched before the conflict was reported")
+			}
+		})
+	}
+}
+
+func TestHTTPUpgraderProtocolConfigConflict(t *testing.T) {
+	_, reqBytes := makeProtocolListRequest(t, []string{"a"})
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := HTTPUpgrader{
+		Protocol:     func(string) bool { return true },
+		ProtocolList: []string{"a"},
+	}
+	res := newRecorder()
+	_, _, _, err = u.Upgrade(req, res)
+	if err != ErrProtocolConfigConflict {
+		t.Fatalf("error is %v; want %v", err, ErrProtocolConfigConflict)
+	}
+	if res.hijacked {
+		t.Errorf("connection was hijacked before the conflict was reported")
+	}
+	if act, exp := res.Code, http.StatusInternalServerError; act != exp {
+		t.Errorf("response status code is %d; want %d", act, exp)
+	}
+}

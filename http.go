@@ -214,6 +214,31 @@ func btsSelectProtocol(h []byte, check func([]byte) bool) (ret string, ok bool) 
 	return ret, ok
 }
 
+// selectProtocolFromList returns the first protocol from prefer that is also
+// offered by the client within the given Sec-WebSocket-Protocol header lines.
+// That is, the selection is driven by the server preference order, not by
+// the order of the client offer.
+//
+// Matching is case-insensitive and token-aware: tokens are compared as whole
+// header list elements, empty elements are skipped and duplicates collapse
+// naturally, since the first (most preferred) match wins. The returned value
+// is spelled exactly as in prefer.
+//
+// Empty entries in prefer are ignored.
+func selectProtocolFromList(prefer []string, lines []string) string {
+	for _, p := range prefer {
+		if p == "" {
+			continue
+		}
+		for _, line := range lines {
+			if strHasToken(line, p) {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
 func btsSelectExtensions(h []byte, selected []httphead.Option, check func(httphead.Option) bool) ([]httphead.Option, bool) {
 	s := httphead.OptionSelector{
 		Flags: httphead.SelectCopy,

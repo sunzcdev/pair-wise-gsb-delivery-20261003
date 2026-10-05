@@ -54,6 +54,20 @@ var (
 		RejectionStatus(http.StatusBadRequest),
 		RejectionReason(fmt.Sprintf("handshake error: bad %q header", headerSecVersion)),
 	)
+	ErrHandshakeNoCommonProtocol = RejectConnectionError(
+		RejectionStatus(http.StatusBadRequest),
+		RejectionReason(fmt.Sprintf("handshake error: no common subprotocol in %q header", headerSecProtocol)),
+	)
+)
+
+// ErrProtocolConfigConflict is returned by Upgrade when the upgrader is
+// configured with both a subprotocol select callback (Protocol or
+// ProtocolCustom) and ProtocolList, which are mutually exclusive.
+//
+// It is a configuration error, thus it is reported before any handshake
+// response (including 101 Switching Protocols) is written to the connection.
+var ErrProtocolConfigConflict = fmt.Errorf(
+	"subprotocol select callback and ProtocolList are mutually exclusive",
 )
 
 // ErrMalformedResponse is returned by Dialer to indicate that server response
@@ -124,7 +138,34 @@ type HTTPUpgrader struct {
 	// Protocol is the select function that is used to select subprotocol from
 	// list requested by client. If this field is set, then the first matched
 	// protocol is sent to a client as negotiated.
+	//
+	// Protocol and ProtocolList are mutually exclusive: configuring both
+	// makes Upgrade return ErrProtocolConfigConflict before any handshake
+	// response is written.
 	Protocol func(string) bool
+
+	// ProtocolList is the server-side ordered list of supported subprotocols,
+	// from the most to the least preferred. If this field is set, then the
+	// first protocol from the list that is also offered by the client is sent
+	// to the client as negotiated. That is, unlike the Protocol callback, the
+	// selection is driven by the server preference, not by the client offer
+	// order.
+	//
+	// Matching is case-insensitive; the negotiated protocol is sent back
+	// spelled exactly as in ProtocolList. Empty entries are ignored, and
+	// duplicate entries collapse naturally since the first match wins.
+	//
+	// If the client offer and ProtocolList have no protocol in common, then
+	// the handshake either proceeds without subprotocol (the default) or is
+	// rejected with ErrHandshakeNoCommonProtocol when ProtocolRequired is
+	// set.
+	ProtocolList []string
+
+	// ProtocolRequired reports whether the handshake must be rejected with
+	// ErrHandshakeNoCommonProtocol when the client offer and ProtocolList
+	// have no protocol in common. It has no effect when ProtocolList is not
+	// set.
+	ProtocolRequired bool
 
 	// Extension is the select function that is used to select extensions from
 	// list requested by client. If this field is set, then the all matched
@@ -153,6 +194,14 @@ type HTTPUpgrader struct {
 // bufio.ReadWriter. On successful handshake it returns Handshake struct
 // describing handshake info.
 func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.Conn, rw *bufio.ReadWriter, hs Handshake, err error) {
+	// Report conflicting configuration before any handshake I/O, so that
+	// the error can not be observed after a 101 response is written.
+	if u.Protocol != nil && len(u.ProtocolList) > 0 {
+		err = ErrProtocolConfigConflict
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return conn, rw, hs, err
+	}
+
 	// Hijack connection first to get the ability to write rejection errors the
 	// same way as in Upgrader.
 	conn, rw, err = hijack(w)
@@ -198,6 +247,12 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 			err = ErrHandshakeUpgradeRequired
 		} else {
 			err = ErrHandshakeBadSecVersion
+		}
+	}
+	if list := u.ProtocolList; err == nil && len(list) > 0 {
+		hs.Protocol = selectProtocolFromList(list, r.Header[headerSecProtocolCanonical])
+		if hs.Protocol == "" && u.ProtocolRequired {
+			err = ErrHandshakeNoCommonProtocol
 		}
 	}
 	if check := u.Protocol; err == nil && check != nil {
@@ -279,12 +334,40 @@ type Upgrader struct {
 	// protocol is sent to a client as negotiated.
 	//
 	// The argument is only valid until the callback returns.
+	//
+	// Protocol, ProtocolCustom and ProtocolList are mutually exclusive:
+	// configuring ProtocolList together with any of the callbacks makes
+	// Upgrade return ErrProtocolConfigConflict before any handshake response
+	// is written.
 	Protocol func([]byte) bool
 
 	// ProtocolCustrom allow user to parse Sec-WebSocket-Protocol header manually.
 	// Note that returned bytes must be valid until Upgrade returns.
 	// If ProtocolCustom is set, it used instead of Protocol function.
 	ProtocolCustom func([]byte) (string, bool)
+
+	// ProtocolList is the server-side ordered list of supported subprotocols,
+	// from the most to the least preferred. If this field is set, then the
+	// first protocol from the list that is also offered by the client is sent
+	// to the client as negotiated. That is, unlike the Protocol callback, the
+	// selection is driven by the server preference, not by the client offer
+	// order.
+	//
+	// Matching is case-insensitive; the negotiated protocol is sent back
+	// spelled exactly as in ProtocolList. Empty entries are ignored, and
+	// duplicate entries collapse naturally since the first match wins.
+	//
+	// If the client offer and ProtocolList have no protocol in common, then
+	// the handshake either proceeds without subprotocol (the default) or is
+	// rejected with ErrHandshakeNoCommonProtocol when ProtocolRequired is
+	// set.
+	ProtocolList []string
+
+	// ProtocolRequired reports whether the handshake must be rejected with
+	// ErrHandshakeNoCommonProtocol when the client offer and ProtocolList
+	// have no protocol in common. It has no effect when ProtocolList is not
+	// set.
+	ProtocolRequired bool
 
 	// Extension is a select function that is used to select extensions
 	// from list requested by client. If this field is set, then the all matched
@@ -411,6 +494,12 @@ type Upgrader struct {
 // Even when error is non-nil Upgrade will write appropriate response into
 // connection in compliance with RFC.
 func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
+	// Report conflicting configuration before any handshake I/O, so that
+	// the error can not be observed after a 101 response is written.
+	if (u.Protocol != nil || u.ProtocolCustom != nil) && len(u.ProtocolList) > 0 {
+		return hs, ErrProtocolConfigConflict
+	}
+
 	// headerSeen constants helps to report whether or not some header was seen
 	// during reading request bytes.
 	const (
@@ -496,6 +585,11 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 		// bit on.
 		headerSeen byte
 
+		// offered holds copies of the Sec-WebSocket-Protocol header lines
+		// received from the client. It is used to select a subprotocol from
+		// ProtocolList after all header lines are read.
+		offered []string
+
 		nonce = make([]byte, nonceSize)
 	)
 	for err == nil {
@@ -548,7 +642,11 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 			}
 
 		case headerSecProtocolCanonical:
-			if custom, check := u.ProtocolCustom, u.Protocol; hs.Protocol == "" && (custom != nil || check != nil) {
+			if len(u.ProtocolList) > 0 {
+				// Copy the header line, because it is only valid until the
+				// next read from br.
+				offered = append(offered, string(v))
+			} else if custom, check := u.ProtocolCustom, u.Protocol; hs.Protocol == "" && (custom != nil || check != nil) {
 				var ok bool
 				if custom != nil {
 					hs.Protocol, ok = custom(v)
@@ -622,6 +720,12 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 
 	case err == nil && u.OnBeforeUpgrade != nil:
 		header[1], err = u.OnBeforeUpgrade()
+	}
+	if err == nil && len(u.ProtocolList) > 0 {
+		hs.Protocol = selectProtocolFromList(u.ProtocolList, offered)
+		if hs.Protocol == "" && u.ProtocolRequired {
+			err = ErrHandshakeNoCommonProtocol
+		}
 	}
 	if err != nil {
 		var code int
