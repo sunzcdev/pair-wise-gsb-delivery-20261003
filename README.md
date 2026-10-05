@@ -134,6 +134,62 @@ ClockOffset: -374.811087ms
    KissCode: <empty>
 ```
 
+## Stateful polling with kiss-of-death handling
+
+The stateless `Query` and `QueryWithOptions` functions return a response for
+every well-formed server packet, including a "kiss of death" (stratum 0).
+For long-lived pollers that query the same servers repeatedly, the optional
+stateful [`Poller`](https://godoc.org/github.com/beevik/ntp#Poller) tracks
+kiss-of-death responses on a per-endpoint basis:
+
+* A `RATE` response installs a temporary cooldown. The next query to the
+  same endpoint is delayed by the server-suggested interval (taken from the
+  response's `Poll` field) and clamped to the poller's configured local
+  bounds (`MinRateBackoff`, `MaxRateBackoff`).
+* Access-denial codes `DENY` and `RSTR` block the endpoint. Further queries
+  fail immediately with an error wrapping `ErrEndpointBlocked` until the
+  endpoint is explicitly recovered with `Reset` or `ResetAll`.
+* Any other kiss code is reported as a `*KissError` but does not alter
+  future polling.
+
+Only packets that pass the request-correlation check (a response whose
+origin timestamp matches the random value sent in the request, as well as
+any configured authentication) update the state. Timeouts, network errors,
+and mismatched responses are ordinary errors and are never treated as a
+kiss of death.
+
+Concurrent calls for the same endpoint serialize: each endpoint hands out a
+single polling permit atomically, so at most one query is in flight at a
+time. Canceling the `context.Context` before the query is sent (for
+example, while waiting out a cooldown) releases the permit without
+contacting the server. Endpoint state is keyed by the normalized
+`host:port` address, so `host` and `host:123` share state.
+
+```go
+poller := ntp.NewPoller(ntp.PollerOptions{
+    QueryOptions:   ntp.QueryOptions{Timeout: 5 * time.Second},
+    MinRateBackoff: time.Second,
+    MaxRateBackoff: time.Hour,
+})
+
+response, err := poller.Query(context.Background(), "0.beevik-ntp.pool.ntp.org", nil)
+
+var kiss *ntp.KissError
+if errors.As(err, &kiss) {
+    switch {
+    case kiss.IsRate():
+        // The next Query waits until the cooldown expires.
+    case kiss.IsDeny():
+        // The endpoint stays blocked until poller.Reset(...) is called.
+    }
+}
+```
+
+The `State` method returns a snapshot of an endpoint's state
+(`Blocked`, `CooldownUntil`, `KissCode`, `InFlight`). `PollerOptions.Clock`
+accepts a custom `Clock`, allowing cooldown behavior to be exercised with
+a controllable fake clock in tests instead of waiting in real time.
+
 ## Experimental NTPv5 support
 
 This package supports the [current draft of NTP version 5

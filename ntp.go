@@ -47,13 +47,13 @@ var (
 // Internal constants
 const (
 	// Protocol constants
-	defaultVersion  = 4
-	defaultPort     = 123
-	defaultTimeout  = 5 * time.Second
-	maxDispersion   = 16 * time.Second
-	maxPollInterval = (1 << 17) * time.Second
-	maxStratum      = 16
-	msgSize         = 48
+	defaultVersion   = 4
+	defaultPortValue = 123
+	defaultTimeout   = 5 * time.Second
+	maxDispersion    = 16 * time.Second
+	maxPollInterval  = (1 << 17) * time.Second
+	maxStratum       = 16
+	msgSize          = 48
 
 	// Time constants
 	nanoPerSec = 1_000_000_000
@@ -622,7 +622,7 @@ func QueryWithOptions(remoteAddress string, opt QueryOptions) (*Response, error)
 		opt.Timeout = defaultTimeout
 	}
 	if opt.Port == 0 {
-		opt.Port = defaultPort
+		opt.Port = defaultPortValue
 	}
 
 	useKernelTime := opt.GetSystemTime == nil
