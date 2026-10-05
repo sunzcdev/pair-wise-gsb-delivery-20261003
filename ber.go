@@ -476,6 +476,7 @@ func readPacket(reader io.Reader, depth int) (*Packet, int, error) {
 				p.Value = val
 			}
 		case TagUTCTime:
+			p.Value, err = ParseUTCTime(content)
 		case TagGeneralizedTime:
 			p.Value, err = ParseGeneralizedTime(content)
 		case TagGraphicString:

@@ -7,7 +7,7 @@
 ASN.1 BER encoding and decoding for Go, with no external dependencies. This is
 the BER layer used by [go-ldap](https://github.com/go-ldap/ldap); it implements
 the subset of BER/DER needed for LDAP (RFC 4511), including integers, booleans,
-strings, object identifiers, REAL numbers, and generalized time.
+strings, object identifiers, REAL numbers, UTC time, and generalized time.
 
 ## Install
 
