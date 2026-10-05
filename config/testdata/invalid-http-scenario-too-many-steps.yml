@@ -1,0 +1,40 @@
+modules:
+  scenario:
+    prober: http
+    timeout: 5s
+    http:
+      scenario:
+        steps:
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}
+          - {url: "http://example.com/"}

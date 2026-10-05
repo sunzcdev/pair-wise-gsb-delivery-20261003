@@ -1,0 +1,9 @@
+modules:
+  scenario:
+    prober: http
+    timeout: 5s
+    http:
+      method: POST
+      scenario:
+        steps:
+          - url: "http://example.com/"

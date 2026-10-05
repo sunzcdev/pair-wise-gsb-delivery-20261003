@@ -12,6 +12,29 @@ modules:
         username: "username"
         password: "mysecret"
       body_size_limit: 1MB
+  http_scenario:
+    prober: http
+    timeout: 5s
+    http:
+      scenario:
+        steps:
+          - name: login
+            url: "http://localhost/login"
+            extract:
+              - name: session
+                source: cookie
+                key: session
+              - name: csrf
+                source: header
+                key: X-CSRF
+          - name: resource
+            method: GET
+            url: "http://localhost/resource?token=${csrf}"
+            headers:
+              X-CSRF: "${csrf}"
+            valid_status_codes: [200]
+            fail_if_body_not_matches_regexp:
+              - "ok"
   tcp_connect:
     prober: tcp
     timeout: 5s

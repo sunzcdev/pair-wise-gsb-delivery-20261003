@@ -330,6 +330,66 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	// Scenario, when set, turns the HTTP probe into a multi-step scenario:
+	// each step performs one request, checks the response and may extract
+	// variables that are made available to later steps.
+	Scenario *HTTPScenario `yaml:"scenario,omitempty" json:"scenario,omitempty"`
+}
+
+// HTTPScenario describes an ordered, finite list of HTTP requests executed
+// by a single probe run, sharing a cookie jar and a set of variables
+// extracted from earlier responses.
+type HTTPScenario struct {
+	Steps []HTTPScenarioStep `yaml:"steps,omitempty" json:"steps,omitempty"`
+}
+
+// HTTPScenarioStep is one request in an HTTPScenario.
+type HTTPScenarioStep struct {
+	// Name is used in logs and metric labels to identify the step. It is
+	// optional; the 1-based step index is always reported as well.
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	// Method defaults to GET.
+	Method string `yaml:"method,omitempty" json:"method,omitempty"`
+	// URL may be absolute or relative to the probe target. It supports
+	// ${var} placeholders.
+	URL string `yaml:"url,omitempty" json:"url,omitempty"`
+	// Headers are merged on top of the module-level HTTP headers. Values
+	// support ${var} placeholders.
+	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	// Body supports ${var} placeholders. It is encoded according to the
+	// request Content-Type.
+	Body string `yaml:"body,omitempty" json:"body,omitempty"`
+	// ValidStatusCodes defaults to 2xx.
+	ValidStatusCodes []int `yaml:"valid_status_codes,omitempty" json:"valid_status_codes,omitempty"`
+	// Timeout bounds this single step. It defaults to the remaining module
+	// timeout.
+	Timeout time.Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	// Extract assigns response values to variables usable by later steps.
+	Extract                      []HTTPScenarioExtract `yaml:"extract,omitempty" json:"extract,omitempty"`
+	FailIfBodyMatchesRegexp      []Regexp              `yaml:"fail_if_body_matches_regexp,omitempty" json:"fail_if_body_matches_regexp,omitempty"`
+	FailIfBodyNotMatchesRegexp   []Regexp              `yaml:"fail_if_body_not_matches_regexp,omitempty" json:"fail_if_body_not_matches_regexp,omitempty"`
+	FailIfHeaderMatchesRegexp    []HeaderMatch         `yaml:"fail_if_header_matches,omitempty" json:"fail_if_header_matches,omitempty"`
+	FailIfHeaderNotMatchesRegexp []HeaderMatch         `yaml:"fail_if_header_not_matches,omitempty" json:"fail_if_header_not_matches,omitempty"`
+}
+
+// HTTPScenarioExtract binds one value taken from an HTTP response to a
+// variable name.
+type HTTPScenarioExtract struct {
+	// Name is the variable name referenced as ${name} by later steps.
+	Name string `yaml:"name,omitempty" json:"name,omitempty"`
+	// Source selects where to take the value from: "body", "header" or
+	// "cookie".
+	Source string `yaml:"source,omitempty" json:"source,omitempty"`
+	// Key is the header or cookie name. Ignored for body extraction.
+	Key string `yaml:"key,omitempty" json:"key,omitempty"`
+	// Regexp, when set, must contain one capture group; the variable is set
+	// to its first captured submatch. When unset, the whole value is used.
+	Regexp Regexp `yaml:"regexp,omitempty" json:"regexp,omitzero"`
+	// Secret marks the value as sensitive. Secret values are redacted from
+	// logs, never used as metric label values and only sent to the same
+	// origin that produced them. Values extracted from cookies are always
+	// secret.
+	Secret bool `yaml:"secret,omitempty" json:"secret,omitempty"`
 }
 
 type GRPCProbe struct {
@@ -501,6 +561,83 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 		// When HTTP/3 is enabled, HTTP/2 must be explicitly disabled
 		if s.HTTPClientConfig.EnableHTTP2 {
 			return errors.New("when enable_http3 is true, enable_http2 must be set to false")
+		}
+	}
+
+	if s.Scenario != nil {
+		if err := s.validateScenario(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// maxScenarioSteps bounds the number of requests a single probe may perform.
+const maxScenarioSteps = 32
+
+var scenarioNameRegexp = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// validateScenario checks a multi-step HTTP scenario configuration.
+func (s *HTTPProbe) validateScenario() error {
+	steps := s.Scenario.Steps
+	if len(steps) == 0 {
+		return errors.New("scenario must contain at least one step")
+	}
+	if len(steps) > maxScenarioSteps {
+		return fmt.Errorf("scenario contains %d steps, at most %d are allowed", len(steps), maxScenarioSteps)
+	}
+
+	// Single-request options do not apply to multi-step scenarios.
+	if s.Method != "" {
+		return errors.New(`"method" must be configured per scenario step, not at module level, when "scenario" is set`)
+	}
+	if s.Body != "" || s.BodyFile != "" {
+		return errors.New(`"body" and "body_file" must be configured per scenario step, not at module level, when "scenario" is set`)
+	}
+	if len(s.ValidStatusCodes) != 0 {
+		return errors.New(`"valid_status_codes" must be configured per scenario step, not at module level, when "scenario" is set`)
+	}
+	if s.UseHTTP3 {
+		return errors.New(`"enable_http3" is not supported together with "scenario"`)
+	}
+
+	for i, step := range steps {
+		stepRef := fmt.Sprintf("scenario step %d", i+1)
+		if step.Name != "" && !scenarioNameRegexp.MatchString(step.Name) {
+			return fmt.Errorf("%s has invalid name %q: names may contain letters, digits and underscores and must not start with a digit", stepRef, step.Name)
+		}
+		if step.Timeout < 0 {
+			return fmt.Errorf("%s must not have a negative timeout", stepRef)
+		}
+
+		seen := map[string]struct{}{}
+		for _, extract := range step.Extract {
+			if !scenarioNameRegexp.MatchString(extract.Name) {
+				return fmt.Errorf("%s extracts an invalid variable name %q", stepRef, extract.Name)
+			}
+			if _, dup := seen[extract.Name]; dup {
+				return fmt.Errorf("%s extracts variable %q more than once", stepRef, extract.Name)
+			}
+			seen[extract.Name] = struct{}{}
+
+			switch extract.Source {
+			case "body", "header", "cookie":
+			default:
+				return fmt.Errorf("%s extracts variable %q from unknown source %q (want body, header or cookie)", stepRef, extract.Name, extract.Source)
+			}
+			if extract.Source == "header" && extract.Key == "" {
+				return fmt.Errorf("%s extracts variable %q from a header without a key", stepRef, extract.Name)
+			}
+			if extract.Source == "cookie" && extract.Key == "" {
+				return fmt.Errorf("%s extracts variable %q from a cookie without a key", stepRef, extract.Name)
+			}
+			if extract.Source == "body" && extract.Regexp.Regexp == nil {
+				return fmt.Errorf("%s extracts variable %q from the body without a regexp", stepRef, extract.Name)
+			}
+			if extract.Regexp.Regexp != nil && extract.Regexp.NumSubexp() == 0 {
+				return fmt.Errorf("%s extracts variable %q with a regexp that has no capture group", stepRef, extract.Name)
+			}
 		}
 	}
 

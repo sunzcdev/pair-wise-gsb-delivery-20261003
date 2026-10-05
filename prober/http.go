@@ -357,6 +357,10 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		})
 	)
 
+	if module.HTTP.Scenario != nil {
+		return probeHTTPScenario(ctx, target, module, registry, logger)
+	}
+
 	registry.MustRegister(durationGaugeVec)
 	registry.MustRegister(contentLengthGauge)
 	registry.MustRegister(bodyUncompressedLengthGauge)

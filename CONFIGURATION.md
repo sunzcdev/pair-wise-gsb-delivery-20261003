@@ -217,6 +217,37 @@ then a single address is selected to test, using the following logic:
   # It is mutually exclusive with `body`.
   [ body_file: <filename> ]
 
+  # A scenario turns the probe into an ordered list of HTTP requests. Each
+  # step performs one request, checks the response and may extract variables
+  # that later steps reference as ${name}. All steps share one cookie jar and
+  # one variable table for the duration of the probe; both are discarded when
+  # the probe finishes. Cookies obtained in one step are therefore sent on
+  # subsequent requests to the same host.
+  #
+  # Variables are inserted with the encoding of their location: path and
+  # fragment values are percent-escaped for paths, query values for query
+  # strings, header values are sent verbatim but may not contain CR/LF, and
+  # bodies are escaped according to Content-Type (JSON and
+  # application/x-www-form-urlencoded get the matching escaping; other
+  # content types are inserted raw). Variables are not allowed in the URL
+  # scheme, host or port.
+  #
+  # Extracted variables can be marked secret; values extracted from cookies
+  # are always secret. Secret values are redacted from logs and never used as
+  # metric label values. They are only sent to the same origin
+  # (scheme://host[:port]) that produced them: a secret referenced by a step
+  # on another origin is dropped - the step fails for a URL/body reference,
+  # or the individual header is omitted. The HTTP client additionally strips
+  # Cookie and Authorization headers when it follows a redirect to a
+  # different host.
+  #
+  # When "scenario" is set, "method", "body", "body_file" and
+  # "valid_status_codes" must be configured per step rather than at module
+  # level.
+  scenario:
+    [ steps:
+      [ - <http_scenario_step>, ... ] ]
+
 ```
 
 #### `<http_header_match_spec>`
@@ -225,6 +256,66 @@ then a single address is selected to test, using the following logic:
 header: <string>,
 regexp: <regex>,
 [ allow_missing: <boolean> | default = false ]
+```
+
+#### `<http_scenario_step>`
+
+```yml
+# Optional name used in logs and in the step_name metric label. It may
+# contain letters, digits and underscores and must not start with a digit.
+[ name: <string> ]
+
+# Request URL. May be absolute or relative to the probe target. Supports
+# ${name} placeholders in the path, query and fragment only.
+[ url: <string> ]
+
+[ method: <string> | default = GET ]
+
+# Step headers are merged on top of the module-level http headers. Values
+# support ${name} placeholders.
+headers:
+  [ <string>: <string> ... ]
+
+# Request body. Supports ${name} placeholders.
+[ body: <string> ]
+
+# Accepted status codes. Defaults to 2xx.
+[ valid_status_codes: [<int>, ...] ]
+
+# Timeout for this single step. Defaults to the remaining module timeout.
+[ timeout: <duration> ]
+
+# Response checks. See <http_probe> for their semantics.
+[ fail_if_body_matches_regexp: [ - <regex>, ... ] ]
+[ fail_if_body_not_matches_regexp: [ - <regex>, ... ] ]
+[ fail_if_header_matches: [ - <http_header_match_spec>, ... ] ]
+[ fail_if_header_not_matches: [ - <http_header_match_spec>, ... ] ]
+
+# Values extracted from the response and stored as variables.
+[ extract:
+  [ - <http_scenario_extract>, ... ] ]
+```
+
+#### `<http_scenario_extract>`
+
+```yml
+# Variable name referenced as ${name} by later steps.
+name: <string>
+
+# Where to take the value from: "body", "header" or "cookie".
+source: <string>
+
+# Header or cookie name. Required and ignored for "body".
+[ key: <string> ]
+
+# A regular expression with one capture group; the variable gets the first
+# captured submatch. Required for "body"; optional for "header" and
+# "cookie", where the whole value is used when omitted.
+[ regexp: <regex> ]
+
+# Marks the value as sensitive. Values extracted from cookies are always
+# secret.
+[ secret: <boolean> | default = false ]
 ```
 
 ### `<tcp_probe>`

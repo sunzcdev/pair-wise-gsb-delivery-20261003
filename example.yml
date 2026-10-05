@@ -57,6 +57,36 @@ modules:
     http:
       method: POST
       body_file: "/files/body.txt"
+  http_scenario_login_then_resource:
+    prober: http
+    timeout: 10s
+    http:
+      preferred_ip_protocol: "ip4"
+      scenario:
+        steps:
+          # Step 1: obtain a temporary session cookie and a CSRF token.
+          - name: login
+            method: POST
+            url: "https://app.example.com/login"
+            headers:
+              Content-Type: application/json
+            body: '{"user":"probe","password":"probe"}'
+            extract:
+              # Cookie values are always treated as secret.
+              - name: session
+                source: cookie
+                key: session
+              - name: csrf
+                source: header
+                key: X-CSRF-Token
+          # Step 2: use both to access the protected resource.
+          - name: resource
+            url: "https://app.example.com/api/status?csrf=${csrf}"
+            headers:
+              X-CSRF-Token: "${csrf}"
+            valid_status_codes: [200]
+            fail_if_body_not_matches_regexp:
+              - '"status":"ok"'
   http_basic_auth_example:
     prober: http
     timeout: 5s
