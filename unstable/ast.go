@@ -21,6 +21,14 @@ type Iterator struct {
 	node    *Node
 }
 
+// nodeArena owns the nodes of a single parsed expression. Nodes reference
+// their arena so that Child and Next can resolve node handles. It is shared
+// between Parser (which fills it while parsing) and Snapshot (which owns a
+// detached copy of one expression).
+type nodeArena struct {
+	nodes []Node
+}
+
 // Next moves the iterator forward and returns true if points to a node, false
 // otherwise.
 func (c *Iterator) Next() bool {
@@ -63,11 +71,11 @@ type Node struct {
 	Raw  Range  // Raw bytes from the input.
 	Data []byte // Node value (either allocated or referencing the input).
 
-	// References to other nodes, as 1-based indexes into the parser's arena.
+	// References to other nodes, as 1-based indexes into the arena.
 	// 0 means no node.
-	parser *Parser
-	next   int32
-	child  int32
+	arena *nodeArena
+	next  int32
+	child int32
 }
 
 // Next returns a pointer to the next node, or nil if there is no next node.
@@ -75,7 +83,7 @@ func (n *Node) Next() *Node {
 	if n.next == 0 {
 		return nil
 	}
-	return &n.parser.nodes[n.next-1]
+	return &n.arena.nodes[n.next-1]
 }
 
 // Child returns a pointer to the first child node of this node. Other children
@@ -85,7 +93,7 @@ func (n *Node) Child() *Node {
 	if n.child == 0 {
 		return nil
 	}
-	return &n.parser.nodes[n.child-1]
+	return &n.arena.nodes[n.child-1]
 }
 
 // Valid returns true if the node's kind is set (not to Invalid).

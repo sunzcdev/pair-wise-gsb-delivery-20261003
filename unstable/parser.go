@@ -51,10 +51,11 @@ func NewParserError(highlight []byte, format string, args ...interface{}) error 
 type Parser struct {
 	KeepComments bool
 
-	data  []byte
-	left  []byte
-	nodes []Node
-	err   error
+	nodeArena
+
+	data []byte
+	left []byte
+	err  error
 
 	// nesting is the current depth of nested arrays and inline tables being
 	// parsed. It guards parseVal/parseValArray/parseInlineTable against
@@ -136,12 +137,16 @@ type Shape struct {
 }
 
 func (p *Parser) position(offset int) Position {
+	return position(p.data, offset)
+}
+
+func position(data []byte, offset int) Position {
 	pos := Position{
 		Offset: offset,
 		Line:   1,
 		Column: 1,
 	}
-	b := p.data[:offset]
+	b := data[:offset]
 	for {
 		idx := bytes.IndexByte(b, '\n')
 		if idx < 0 {
@@ -182,11 +187,11 @@ func (p *Parser) push(n Node) int32 {
 		if newCap < 64 {
 			newCap = 64
 		}
-		nodes := make([]Node, len(p.nodes), newCap)
+	nodes := make([]Node, len(p.nodes), newCap)
 		copy(nodes, p.nodes)
 		p.nodes = nodes
 	}
-	n.parser = p
+	n.arena = &p.nodeArena
 	p.nodes = append(p.nodes, n)
 	return int32(len(p.nodes)) //nolint:gosec // node counts are bounded by document size
 }

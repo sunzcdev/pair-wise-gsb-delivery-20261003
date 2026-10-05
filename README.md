@@ -233,6 +233,11 @@ API subject to change.
 Parser is the unstable API that allows iterative parsing of a TOML document at
 the AST level. See https://pkg.go.dev/github.com/pelletier/go-toml/v2/unstable.
 
+`Parser.Snapshot` captures the last parsed expression into a self-contained
+`unstable.Snapshot` that stays readable (keys, values, comments, and source
+ranges) after the parser is reset to another document, while only retaining
+the bytes of that expression rather than the whole input.
+
 ### Marshaler and Unmarshaler interfaces
 
 [`unstable.Marshaler`][unstable-marshaler] and
