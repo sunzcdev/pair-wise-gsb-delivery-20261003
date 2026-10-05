@@ -54,6 +54,15 @@ var (
 		RejectionStatus(http.StatusBadRequest),
 		RejectionReason(fmt.Sprintf("handshake error: bad %q header", headerSecVersion)),
 	)
+	// ErrHandshakeBadHeader is returned when StrictHeaderCheck is enabled
+	// and the custom handshake headers do not pass the strict validation.
+	// That is, when they are malformed, try to override one of the
+	// handshake response headers or try to inject additional response
+	// lines via CR or LF characters.
+	ErrHandshakeBadHeader = RejectConnectionError(
+		RejectionStatus(http.StatusInternalServerError),
+		RejectionReason("handshake error: bad custom header"),
+	)
 )
 
 // ErrMalformedResponse is returned by Dialer to indicate that server response
@@ -120,6 +129,24 @@ type HTTPUpgrader struct {
 	//
 	// Note that if present, it will be written in any result of handshake.
 	Header http.Header
+
+	// StrictHeaderCheck enables strict validation of the custom headers
+	// written by Header into the handshake response.
+	//
+	// When enabled, the custom headers are fully rendered and validated
+	// before any successful response byte is sent: every header must be a
+	// well-formed "Key: Value" line and must not override the Upgrade,
+	// Connection, Sec-WebSocket-Accept or Sec-WebSocket-Protocol response
+	// fields, nor contain CR or LF characters that could be used to
+	// inject additional response lines. Multiple headers with the same
+	// name are allowed and keep their order.
+	//
+	// If validation fails, the handshake fails with ErrHandshakeBadHeader
+	// and the invalid headers are not written into any response.
+	//
+	// When disabled (the default), the custom headers are written as-is
+	// for backward compatibility.
+	StrictHeaderCheck bool
 
 	// Protocol is the select function that is used to select subprotocol from
 	// list requested by client. If this field is set, then the first matched
@@ -239,7 +266,21 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 
 	var header handshakeHeader
 	if h := u.Header; h != nil {
-		header[0] = HandshakeHeaderHTTP(h)
+		if u.StrictHeaderCheck {
+			strict, serr := strictHTTPHandshakeHeader(h)
+			if serr != nil {
+				// Do not let the invalid headers leak into any
+				// response and fail the handshake before any
+				// successful response byte is sent.
+				if err == nil {
+					err = serr
+				}
+			} else {
+				header[0] = strict
+			}
+		} else {
+			header[0] = HandshakeHeaderHTTP(h)
+		}
 	}
 	if err == nil {
 		httpWriteResponseUpgrade(rw.Writer, strToBytes(nonce), hs, header.WriteTo)
@@ -345,6 +386,29 @@ type Upgrader struct {
 	//
 	// Note that if present, it will be written in any result of handshake.
 	Header HandshakeHeader
+
+	// StrictHeaderCheck enables strict validation of the custom headers
+	// written by Header (and by the HandshakeHeader returned from
+	// OnBeforeUpgrade) into the handshake response.
+	//
+	// When enabled, the custom headers are fully rendered and validated
+	// before any successful response byte is sent: every header must be a
+	// well-formed "Key: Value" line and must not override the Upgrade,
+	// Connection, Sec-WebSocket-Accept or Sec-WebSocket-Protocol response
+	// fields, nor contain CR or LF characters that could be used to
+	// inject additional response lines. Multiple headers with the same
+	// name are allowed and keep their order.
+	//
+	// Note that the validation is applied to the bytes produced by the
+	// HandshakeHeader writers, so custom HandshakeHeader implementations
+	// are checked as well, not only key-value mappings.
+	//
+	// If validation fails, the handshake fails with ErrHandshakeBadHeader
+	// and the invalid headers are not written into any response.
+	//
+	// When disabled (the default), the custom headers are written as-is
+	// for backward compatibility.
+	StrictHeaderCheck bool
 
 	// OnRequest is a callback that will be called after request line
 	// successful parsing.
@@ -457,6 +521,23 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 	// Prepare stack-based handshake header list.
 	header := handshakeHeader{
 		0: u.Header,
+	}
+	if u.StrictHeaderCheck && header[0] != nil {
+		strict, serr := strictHandshakeHeader(header[0])
+		if serr != nil {
+			// Fail before any response byte is sent and do not let the
+			// invalid headers leak into the error response.
+			code := http.StatusInternalServerError
+			if rej, ok := serr.(*ConnectionRejectedError); ok && rej.code != 0 {
+				code = rej.code
+			}
+			httpWriteResponseError(bw, serr, code, nil)
+			// Do not store Flush() error to not override already
+			// existing one.
+			_ = bw.Flush()
+			return hs, serr
+		}
+		header[0] = strict
 	}
 
 	// Parse and check HTTP request.
@@ -622,6 +703,17 @@ func (u Upgrader) Upgrade(conn io.ReadWriter) (hs Handshake, err error) {
 
 	case err == nil && u.OnBeforeUpgrade != nil:
 		header[1], err = u.OnBeforeUpgrade()
+		if err == nil && u.StrictHeaderCheck && header[1] != nil {
+			var strict HandshakeHeader
+			strict, err = strictHandshakeHeader(header[1])
+			if err != nil {
+				// Do not let the invalid headers leak into the
+				// error response.
+				header[1] = nil
+			} else {
+				header[1] = strict
+			}
+		}
 	}
 	if err != nil {
 		var code int

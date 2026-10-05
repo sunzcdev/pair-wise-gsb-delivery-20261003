@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/gobwas/httphead"
 )
@@ -16,6 +17,8 @@ const (
 	colonAndSpace = ": "
 	commaAndSpace = ", "
 )
+
+var crlfBts = []byte(crlf)
 
 const (
 	textHeadUpgrade = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -394,6 +397,110 @@ func httpWriteResponseError(bw *bufio.Writer, err error, code int, header Handsh
 	default:
 		writeErrorText(bw, err)
 	}
+}
+
+// strictForbiddenResponseHeaders lists the names of the handshake response
+// headers that must not be overridden by custom headers. Note that the
+// status line can not be overridden as well: it is always written before
+// any custom header, and any attempt to inject an additional response line
+// is rejected by the strict line validation below.
+var strictForbiddenResponseHeaders = [][]byte{
+	[]byte(headerUpgrade),
+	[]byte(headerConnection),
+	[]byte(headerSecAccept),
+	[]byte(headerSecProtocol),
+}
+
+// strictHandshakeHeader renders h into a buffer and checks that the
+// resulting bytes form a well-formed sequence of HTTP header lines that is
+// safe to append to the handshake response. It returns the rendered bytes
+// ready to be written instead of h, so that validation happens before any
+// response byte is sent and custom headers keep their original order,
+// including duplicates of the same header name.
+func strictHandshakeHeader(h HandshakeHeader) (HandshakeHeader, error) {
+	var buf bytes.Buffer
+	if _, err := h.WriteTo(&buf); err != nil {
+		return nil, err
+	}
+	bts := buf.Bytes()
+	if err := checkStrictHandshakeHeader(bts); err != nil {
+		return nil, err
+	}
+	return HandshakeHeaderBytes(bts), nil
+}
+
+// strictHTTPHandshakeHeader is like strictHandshakeHeader, but additionally
+// checks the given http.Header mapping directly. That is, header keys and
+// values are validated before rendering, so that CR or LF characters inside
+// them could not be silently turned into additional response lines by the
+// rendering logic.
+func strictHTTPHandshakeHeader(h http.Header) (HandshakeHeader, error) {
+	for key, values := range h {
+		if !validStrictHeaderKey(strToBytes(key)) {
+			return nil, ErrHandshakeBadHeader
+		}
+		for _, value := range values {
+			if strings.IndexAny(value, "\r\n") != -1 {
+				return nil, ErrHandshakeBadHeader
+			}
+		}
+	}
+	return strictHandshakeHeader(HandshakeHeaderHTTP(h))
+}
+
+// checkStrictHandshakeHeader checks that bts is a sequence of well-formed
+// CRLF-terminated header lines that do not interfere with the handshake
+// response itself.
+func checkStrictHandshakeHeader(bts []byte) error {
+	for len(bts) > 0 {
+		eol := bytes.Index(bts, crlfBts)
+		if eol < 0 {
+			// Every header line must be CRLF-terminated. Otherwise the
+			// line could be glued with the bytes that follow the custom
+			// headers part of the response.
+			return ErrHandshakeBadHeader
+		}
+		if !validStrictHeaderLine(bts[:eol]) {
+			return ErrHandshakeBadHeader
+		}
+		bts = bts[eol+2:]
+	}
+	return nil
+}
+
+func validStrictHeaderLine(line []byte) bool {
+	// Note that an empty line is rejected here: it would terminate the
+	// headers section of the response prematurely, allowing the rest of
+	// the custom bytes to be interpreted as a response body (or as a
+	// beginning of a smuggled response).
+	colon := bytes.IndexByte(line, ':')
+	if colon < 0 {
+		return false
+	}
+	if !validStrictHeaderKey(btrim(line[:colon])) {
+		return false
+	}
+	// The value must not contain CR or LF characters, otherwise
+	// additional response lines could be injected.
+	value := btrim(line[colon+1:])
+	return bytes.IndexAny(value, "\r\n") == -1
+}
+
+func validStrictHeaderKey(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	for _, c := range key {
+		if !httphead.OctetTypes[c].IsToken() {
+			return false
+		}
+	}
+	for _, forbidden := range strictForbiddenResponseHeaders {
+		if bytes.EqualFold(key, forbidden) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeStatusText(bw *bufio.Writer, code int) {
