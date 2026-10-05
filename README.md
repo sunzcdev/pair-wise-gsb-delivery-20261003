@@ -690,6 +690,34 @@ channel.select(
 - **channel:close()**
     - Close the channel.
 
+##### Propagating Go errors
+
+`LState.RaiseError` only passes a formatted string back to the host, so the
+original Go error is lost. Use `LState.RaiseGoError` (or `NewGoError` with
+`LState.Error`) to raise a protected Lua error that keeps the Go error chain:
+
+```go
+var ErrNotFound = errors.New("not found")
+
+L.Register("lookup", func(L *lua.LState) int {
+    value, err := lookupThing()
+    if err != nil {
+        L.RaiseGoError(fmt.Errorf("lookup failed: %w", ErrNotFound))
+        return 0
+    }
+    L.Push(lua.LString(value))
+    return 1
+})
+
+err := L.DoString(`pcall(lookup)`)
+errors.Is(err, ErrNotFound) // true; errors.As works as well
+```
+
+Inside Lua the raised value is an ordinary error object: `pcall` and `xpcall`
+propagate it untouched, `type()` reports `"error"`, and `tostring()` returns the
+safe `err.Error()` text. Once a script replaces it with a plain string (for
+example `error(tostring(e))`), the Go chain can no longer be recovered.
+
 ##### The LState pool pattern
 
 To create per-thread LState instances, You can use the `sync.Pool` like mechanism.

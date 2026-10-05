@@ -18,9 +18,10 @@ const (
 	LTThread
 	LTTable
 	LTChannel
+	LTGoError
 )
 
-var lValueNames = [9]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel"}
+var lValueNames = [10]string{"nil", "boolean", "number", "string", "function", "userdata", "thread", "table", "channel", "error"}
 
 func (vt LValueType) String() string {
 	return lValueNames[int(vt)]
@@ -213,3 +214,50 @@ type LChannel chan LValue
 
 func (ch LChannel) String() string   { return fmt.Sprintf("channel: %p", ch) }
 func (ch LChannel) Type() LValueType { return LTChannel }
+
+// LGoError is an LValue that carries a Go error through the Lua stack.
+// It allows errors raised by Go functions to be handed back to the host
+// via PCall or CallByParam without losing the original error chain.
+//
+// The value holds only the wrapped error and never a reference to an
+// LState. In Lua it behaves like any other error object: pcall and
+// xpcall propagate it untouched and tostring returns err.Error().
+// Once a script converts it to an ordinary string (for example by
+// re-raising it through the Lua error function), the Go error chain
+// can no longer be recovered.
+type LGoError struct {
+	err error
+}
+
+// NewGoError wraps a Go error in an LValue. Passing the result to
+// LState.Error raises a protected error that errors.Is and errors.As
+// can unwrap back to err. A nil error is represented by LNil.
+func NewGoError(err error) LValue {
+	if err == nil {
+		return LNil
+	}
+	return &LGoError{err: err}
+}
+
+// String returns the safe, textual representation of the wrapped error.
+func (e *LGoError) String() string {
+	if e == nil || e.err == nil {
+		return "nil"
+	}
+	return e.err.Error()
+}
+
+// Type returns LTGoError.
+func (e *LGoError) Type() LValueType { return LTGoError }
+
+// Error makes LGoError satisfy the Go error interface and keeps the
+// textual representation identical to the wrapped error.
+func (e *LGoError) Error() string { return e.String() }
+
+// Unwrap exposes the wrapped error to errors.Is and errors.As.
+func (e *LGoError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
