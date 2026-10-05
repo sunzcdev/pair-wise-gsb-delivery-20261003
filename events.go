@@ -454,6 +454,55 @@ type PresenceCallback func(PresenceReply, error)
 // PresenceHandler called when presence request received from client.
 type PresenceHandler func(PresenceEvent, PresenceCallback)
 
+// UserPresenceJoinEvent is emitted when a user enters a channel, i.e. when the
+// number of that user's subscribed connections in the channel transitions from
+// zero to one. A user with several connections (multiple browser tabs/devices)
+// generates exactly one join: subsequent connections only increase the internal
+// counter.
+//
+// This is a server-side event for the application; it is independent from the
+// per-connection Join/Leave protocol pushes controlled by EmitJoinLeave. It is
+// only emitted for channels where user presence events are enabled in the
+// PresenceManager configuration.
+type UserPresenceJoinEvent struct {
+	// Channel the user entered.
+	Channel string
+	// UserID of the user.
+	UserID string
+	// ClientID of the connection that brought the user in (the one whose count
+	// transitioned the user from zero to one connection).
+	ClientID string
+	// Info of the connection that brought the user in.
+	Info *ClientInfo
+}
+
+// UserPresenceJoinHandler is called when a user enters a channel.
+type UserPresenceJoinHandler func(UserPresenceJoinEvent)
+
+// UserPresenceLeaveEvent is emitted when a user leaves a channel, i.e. when the
+// last of that user's subscribed connections in the channel is gone. When a
+// leave grace period is configured on the PresenceManager, the event is delayed
+// by that interval; a reconnection within the interval cancels the pending
+// leave, so a user that briefly drops and reconnects never appears to leave.
+//
+// The same counting semantics apply whether the last connection went away due
+// to an explicit unsubscribe, an abnormal disconnect, or the presence entry
+// expiring naturally because it was not refreshed. In a multi-node deployment
+// the event is emitted exactly once cluster-wide, on the node that observed the
+// transition to zero connections.
+//
+// This only reports online status transitions; it does not imply anything about
+// publications that may have been missed while the user was disconnected.
+type UserPresenceLeaveEvent struct {
+	// Channel the user left.
+	Channel string
+	// UserID of the user.
+	UserID string
+}
+
+// UserPresenceLeaveHandler is called when a user leaves a channel.
+type UserPresenceLeaveHandler func(UserPresenceLeaveEvent)
+
 // PresenceStatsEvent has channel operation called for.
 type PresenceStatsEvent struct {
 	Channel string

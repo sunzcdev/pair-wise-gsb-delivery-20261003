@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "embed"
@@ -28,6 +29,21 @@ type RedisPresenceManager struct {
 	remPresenceScript   *rueidis.Lua
 	presenceScript      *rueidis.Lua
 	presenceStatsScript *rueidis.Lua
+	userAddScript       *rueidis.Lua
+	userRemScript       *rueidis.Lua
+	userConfirmScript   *rueidis.Lua
+	userSweepScript     *rueidis.Lua
+
+	eventsOnce    sync.Once
+	closeCh       chan struct{}
+	closeOnce     sync.Once
+	pendingMu     sync.Mutex
+	pendingLeaves map[string]map[string]*redisUserLeaveTimer
+}
+
+type redisUserLeaveTimer struct {
+	token string
+	timer *time.Timer
 }
 
 // RedisPresenceManagerConfig is a config for RedisPresenceManager.
@@ -68,6 +84,31 @@ type RedisPresenceManagerConfig struct {
 	// LoadSHA1 enables loading SHA1 from Redis via SCRIPT LOAD instead of calculating
 	// it on the client side. This is useful for FIPS compliance.
 	LoadSHA1 bool
+
+	// EnableUserPresenceEvents reports whether user-level presence events must be
+	// maintained for a channel. When it returns true, the manager counts
+	// connections per user in Redis (all decisions are atomic server-side, so
+	// concurrent updates from two nodes are safe) and invokes the Node's
+	// OnUserPresenceJoin / OnUserPresenceLeave handlers on zero-to-one and
+	// one-to-zero transitions. Per-connection Join/Leave (EmitJoinLeave) is
+	// independent and stays available regardless of this option.
+	// By default user presence events are disabled.
+	EnableUserPresenceEvents func(channel string) bool
+
+	// UserLeaveGracePeriod is the interval to wait after a user's last connection
+	// in a channel disappears before emitting the user leave event. A reconnect
+	// from any node within this interval atomically cancels the pending leave and
+	// no event is emitted. Zero means the leave fires as soon as the last
+	// connection is gone. Only applies to channels for which
+	// EnableUserPresenceEvents returns true.
+	UserLeaveGracePeriod time.Duration
+
+	// UserPresenceCleanupInterval is how often the background reconciler scans
+	// presence for entries that expired naturally (never refreshed after an
+	// abnormal loss) and drives the same user leave transitions. Zero means
+	// PresenceTTL / 3. Set a negative value to disable the reconciler (not
+	// recommended: natural expiry would then only be noticed lazily).
+	UserPresenceCleanupInterval time.Duration
 }
 
 var (
@@ -82,6 +123,18 @@ var (
 
 	//go:embed internal/redis_lua/presence_stats_get.lua
 	presenceStatsScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_add.lua
+	userAddPresenceScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_rem.lua
+	userRemPresenceScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_confirm_leave.lua
+	userConfirmLeaveScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_sweep.lua
+	userSweepScriptSource string
 )
 
 // NewRedisPresenceManager creates new RedisPresenceManager.
@@ -124,11 +177,26 @@ func NewRedisPresenceManager(n *Node, config RedisPresenceManagerConfig) (*Redis
 		remPresenceScript:   rueidis.NewLuaScript(remPresenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 		presenceScript:      rueidis.NewLuaScript(presenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 		presenceStatsScript: rueidis.NewLuaScript(presenceStatsScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userAddScript:       rueidis.NewLuaScript(userAddPresenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userRemScript:       rueidis.NewLuaScript(userRemPresenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userConfirmScript:   rueidis.NewLuaScript(userConfirmLeaveScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userSweepScript:     rueidis.NewLuaScript(userSweepScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		closeCh:             make(chan struct{}),
+		pendingLeaves:       make(map[string]map[string]*redisUserLeaveTimer),
 	}
 	return m, nil
 }
 
 func (m *RedisPresenceManager) Close(_ context.Context) error {
+	m.closeOnce.Do(func() { close(m.closeCh) })
+	m.pendingMu.Lock()
+	for _, users := range m.pendingLeaves {
+		for _, pt := range users {
+			pt.timer.Stop()
+		}
+	}
+	m.pendingLeaves = make(map[string]map[string]*redisUserLeaveTimer)
+	m.pendingMu.Unlock()
 	return nil
 }
 
@@ -141,7 +209,15 @@ func (m *RedisPresenceManager) getShard(channel string) *RedisShard {
 
 // AddPresence - see PresenceManager interface description.
 func (m *RedisPresenceManager) AddPresence(ch string, uid string, info *ClientInfo) error {
-	return m.addPresence(m.getShard(ch), ch, uid, info)
+	s := m.getShard(ch)
+	if m.userEventsEnabled(ch) {
+		return m.addUserPresence(s, ch, uid, info)
+	}
+	return m.addPresence(s, ch, uid, info)
+}
+
+func (m *RedisPresenceManager) userEventsEnabled(ch string) bool {
+	return m.config.EnableUserPresenceEvents != nil && m.config.EnableUserPresenceEvents(ch)
 }
 
 func (m *RedisPresenceManager) addPresenceScriptKeysArgs(s *RedisShard, ch string, uid string, info *ClientInfo) ([]string, []string, error) {
@@ -165,6 +241,120 @@ func (m *RedisPresenceManager) addPresenceScriptKeysArgs(s *RedisShard, ch strin
 	}
 
 	return keys, args, nil
+}
+
+func (m *RedisPresenceManager) userClientMapKey(s *RedisShard, ch string) channelID {
+	if !s.isCluster {
+		return channelID(m.config.Prefix + ".presence.user.events.clients." + ch)
+	}
+	return channelID(m.config.Prefix + ".presence.user.events.clients.{" + ch + "}")
+}
+
+// userActiveKey is the per-user expiry index (zset, userID -> latest unix
+// second any of the user's connections refreshed presence). The sweeper uses it
+// to find users whose *last* connection expired, independent of the presence
+// zset which is indexed per client.
+func (m *RedisPresenceManager) userActiveKey(s *RedisShard, ch string) channelID {
+	if !s.isCluster {
+		return channelID(m.config.Prefix + ".presence.user.events.active." + ch)
+	}
+	return channelID(m.config.Prefix + ".presence.user.events.active.{" + ch + "}")
+}
+
+func (m *RedisPresenceManager) userCountKey(s *RedisShard, ch string) channelID {
+	if !s.isCluster {
+		return channelID(m.config.Prefix + ".presence.user.events.roster." + ch)
+	}
+	return channelID(m.config.Prefix + ".presence.user.events.roster.{" + ch + "}")
+}
+
+func (m *RedisPresenceManager) userPendingKey(s *RedisShard, ch string) channelID {
+	if !s.isCluster {
+		return channelID(m.config.Prefix + ".presence.user.events.pending." + ch)
+	}
+	return channelID(m.config.Prefix + ".presence.user.events.pending.{" + ch + "}")
+}
+
+func (m *RedisPresenceManager) userFireAtKey(s *RedisShard, ch string) channelID {
+	if !s.isCluster {
+		return channelID(m.config.Prefix + ".presence.user.events.fireat." + ch)
+	}
+	return channelID(m.config.Prefix + ".presence.user.events.fireat.{" + ch + "}")
+}
+
+func (m *RedisPresenceManager) userEventChannel(s *RedisShard) string {
+	idx := 0
+	for i, sh := range m.shards {
+		if sh == s {
+			idx = i
+			break
+		}
+	}
+	return m.config.Prefix + ".presence.user.events." + strconv.Itoa(idx)
+}
+
+func (m *RedisPresenceManager) addUserPresence(s *RedisShard, ch string, uid string, info *ClientInfo) error {
+	m.ensureEventsRuntime()
+
+	expire := int(m.config.PresenceTTL.Seconds())
+	infoBytes, err := infoToProto(info).MarshalVT()
+	if err != nil {
+		return err
+	}
+
+	setKey := m.presenceSetKey(s, ch)
+	hashKey := m.presenceHashKey(s, ch)
+	userSetKey := m.userSetKey(s, ch)
+	userHashKey := m.userHashKey(s, ch)
+	clientMapKey := m.userClientMapKey(s, ch)
+	activeKey := m.userActiveKey(s, ch)
+	countKey := m.userCountKey(s, ch)
+	pendingKey := m.userPendingKey(s, ch)
+	fireAtKey := m.userFireAtKey(s, ch)
+
+	keys := []string{
+		string(setKey), string(hashKey), string(userSetKey), string(userHashKey),
+		string(clientMapKey), string(activeKey), string(countKey), string(pendingKey), string(fireAtKey),
+	}
+
+	expireAt := time.Now().Unix() + int64(expire)
+	useUserMapping := m.useUserMappingArg(ch)
+	eventChannel := m.userEventChannel(s)
+
+	args := []string{
+		strconv.Itoa(expire),
+		strconv.FormatInt(expireAt, 10),
+		uid,
+		convert.BytesToString(infoBytes),
+		info.UserID,
+		useUserMapping,
+		m.useHashFieldTTLArg(),
+		"1", // enable user presence events.
+		eventChannel,
+		strconv.Itoa(expire),
+		ch,
+	}
+
+	resp := m.userAddScript.Exec(context.Background(), s.client, keys, args)
+	if rueidis.IsRedisNil(resp.Error()) {
+		return nil
+	}
+	if err := resp.Error(); err != nil {
+		return err
+	}
+	joined, err := resp.AsInt64()
+	if err != nil {
+		return err
+	}
+	if joined == 1 {
+		m.node.notifyUserPresenceJoin(UserPresenceJoinEvent{
+			Channel:  ch,
+			UserID:   info.UserID,
+			ClientID: uid,
+			Info:     info,
+		})
+	}
+	return nil
 }
 
 func (m *RedisPresenceManager) useUserMappingArg(ch string) string {
@@ -197,7 +387,11 @@ func (m *RedisPresenceManager) addPresence(s *RedisShard, ch string, uid string,
 
 // RemovePresence - see PresenceManager interface description.
 func (m *RedisPresenceManager) RemovePresence(ch string, clientID string, userID string) error {
-	return m.removePresence(m.getShard(ch), ch, clientID, userID)
+	s := m.getShard(ch)
+	if m.userEventsEnabled(ch) {
+		return m.removeUserPresence(s, ch, clientID, userID)
+	}
+	return m.removePresence(s, ch, clientID, userID)
 }
 
 func (m *RedisPresenceManager) removePresenceScriptKeysArgs(s *RedisShard, ch string, uid string, userID string) ([]string, []string, error) {
@@ -223,6 +417,56 @@ func (m *RedisPresenceManager) removePresence(s *RedisShard, ch string, clientID
 		return nil
 	}
 	return resp.Error()
+}
+
+func (m *RedisPresenceManager) removeUserPresence(s *RedisShard, ch string, clientID string, userID string) error {
+	m.ensureEventsRuntime()
+
+	setKey := m.presenceSetKey(s, ch)
+	hashKey := m.presenceHashKey(s, ch)
+	userSetKey := m.userSetKey(s, ch)
+	userHashKey := m.userHashKey(s, ch)
+	clientMapKey := m.userClientMapKey(s, ch)
+	activeKey := m.userActiveKey(s, ch)
+	countKey := m.userCountKey(s, ch)
+	pendingKey := m.userPendingKey(s, ch)
+	fireAtKey := m.userFireAtKey(s, ch)
+
+	keys := []string{
+		string(setKey), string(hashKey), string(userSetKey), string(userHashKey),
+		string(clientMapKey), string(activeKey), string(countKey), string(pendingKey), string(fireAtKey),
+	}
+
+	pendingTTL := m.config.PresenceTTL + m.config.UserLeaveGracePeriod + time.Second
+	args := []string{
+		clientID,
+		userID,
+		m.useUserMappingArg(ch),
+		m.useHashFieldTTLArg(),
+		"1", // enable user presence events.
+		m.userEventChannel(s),
+		strconv.FormatInt(m.config.UserLeaveGracePeriod.Milliseconds(), 10),
+		strconv.FormatInt(time.Now().UnixMilli(), 10),
+		strconv.Itoa(int(pendingTTL.Seconds())),
+		strconv.Itoa(int(m.config.PresenceTTL.Seconds())),
+		ch,
+	}
+
+	resp := m.userRemScript.Exec(context.Background(), s.client, keys, args)
+	if rueidis.IsRedisNil(resp.Error()) {
+		return nil
+	}
+	if err := resp.Error(); err != nil {
+		return err
+	}
+	leaveNow, err := resp.AsInt64()
+	if err != nil {
+		return err
+	}
+	if leaveNow == 1 {
+		m.node.notifyUserPresenceLeave(UserPresenceLeaveEvent{Channel: ch, UserID: userID})
+	}
+	return nil
 }
 
 // Presence - see PresenceManager interface description.

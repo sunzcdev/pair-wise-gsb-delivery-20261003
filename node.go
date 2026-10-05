@@ -84,8 +84,10 @@ type Node struct {
 	surveyMu       sync.RWMutex
 	surveyID       uint64
 
-	notificationHandler NotificationHandler
-	nodeInfoSendHandler NodeInfoSendHandler
+	notificationHandler      NotificationHandler
+	nodeInfoSendHandler      NodeInfoSendHandler
+	userPresenceJoinHandler  UserPresenceJoinHandler
+	userPresenceLeaveHandler UserPresenceLeaveHandler
 
 	emulationSurveyHandler *emulationSurveyHandler
 
@@ -2062,6 +2064,41 @@ func (n *Node) OnNotification(handler NotificationHandler) {
 // OnNodeInfoSend allows setting NodeInfoSendHandler. This should be done before Node.Run called.
 func (n *Node) OnNodeInfoSend(handler NodeInfoSendHandler) {
 	n.nodeInfoSendHandler = handler
+}
+
+// OnUserPresenceJoin allows setting UserPresenceJoinHandler. The handler is
+// called once per user/channel transition from zero to one connection, see
+// UserPresenceJoinEvent. It should be set before Node.Run is called. Only
+// channels for which user presence events are enabled on the configured
+// PresenceManager produce events.
+func (n *Node) OnUserPresenceJoin(handler UserPresenceJoinHandler) {
+	n.userPresenceJoinHandler = handler
+}
+
+// OnUserPresenceLeave allows setting UserPresenceLeaveHandler. The handler is
+// called once per user/channel transition to zero connections (after the
+// configured leave grace period), see UserPresenceLeaveEvent. It should be set
+// before Node.Run is called.
+func (n *Node) OnUserPresenceLeave(handler UserPresenceLeaveHandler) {
+	n.userPresenceLeaveHandler = handler
+}
+
+// notifyUserPresenceJoin dispatches a user-level join event. Called by
+// PresenceManager implementations when a user enters a channel. Handlers must
+// not be invoked while holding internal locks in the presence layer, hence the
+// dispatch happens through the Node.
+func (n *Node) notifyUserPresenceJoin(event UserPresenceJoinEvent) {
+	if n.userPresenceJoinHandler != nil {
+		n.userPresenceJoinHandler(event)
+	}
+}
+
+// notifyUserPresenceLeave dispatches a user-level leave event. Called by
+// PresenceManager implementations when a user leaves a channel.
+func (n *Node) notifyUserPresenceLeave(event UserPresenceLeaveEvent) {
+	if n.userPresenceLeaveHandler != nil {
+		n.userPresenceLeaveHandler(event)
+	}
 }
 
 // eventHub allows binding client event handlers.
