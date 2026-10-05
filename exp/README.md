@@ -68,3 +68,15 @@ Also contains handler methods for applications that would like to handle and sto
 ```
 
 For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/api/remote).
+
+## Delta
+
+The `delta` package derives per-interval increments of cumulative metrics (counters and classic histograms) from a `Gatherer`, without resetting or otherwise mutating the original metrics. It is intended for processes that expose the usual cumulative `/metrics` endpoint while an internal statistics backend expects increments on a fixed cadence.
+
+Each `Reader` keeps an independent baseline, so multiple readers with different cadences can observe the same registry. Discontinuities are surfaced explicitly instead of as negative subtractions:
+
+- `StatusReset`: a cumulative value went backwards (for example after a process restart).
+- `StatusDisappeared` and `StatusReappeared`: a series vanished from a successful gather and later came back.
+- `StatusBucketLayoutChanged`: a classic histogram's bucket upper bounds changed.
+
+A failed `Gather` never advances the baseline; the next successful gather is compared against the previous successful state.
