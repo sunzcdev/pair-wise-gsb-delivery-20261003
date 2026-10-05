@@ -50,12 +50,11 @@ type Options struct {
 
 // CanDigest checks if the algorithm and qop are supported
 func CanDigest(c *Challenge) bool {
-	switch strings.ToUpper(c.Algorithm) {
-	case "", "MD5", "SHA-256", "SHA-512", "SHA-512-256":
-	default:
+	algo := strings.ToUpper(c.Algorithm)
+	if algo != "" && !algorithmSupported(algo) {
 		return false
 	}
-	return len(c.QOP) == 0 || c.SupportsQOP("auth") || c.SupportsQOP("auth-int")
+	return qopSupported(c)
 }
 
 // Digest creates credentials from a challenge and request options.

@@ -59,6 +59,43 @@ func main() {
 }
 ```
 
+## Choosing a Challenge
+
+A single `WWW-Authenticate` field can carry several schemes and several
+digest challenges, for example:
+
+```
+WWW-Authenticate: Basic realm="x",
+  Digest realm="x", nonce="...", algorithm=MD5, qop="auth",
+  Digest realm="x", nonce="...", algorithm=SHA-256, qop="auth,auth-int"
+```
+
+`digest.ChallengeSelector` walks every challenge in every
+`WWW-Authenticate` field, correctly handling commas inside quoted
+strings, escaped quotes, unknown algorithms and malformed challenges.
+Set `Algorithms` to pick the strongest challenge the caller supports;
+the order is the preference order. A missing `algorithm` is treated as
+`MD5` per RFC 2617, and challenges with unsupported algorithms are never
+compared. Selection is based only on the response just received — there
+is no cross-request state.
+
+``` go
+client := &http.Client{
+	Transport: &digest.Transport{
+		Username: "foo",
+		Password: "bar",
+		FindChallenge: digest.ChallengeSelector{
+			Algorithms: []string{"SHA-512-256", "SHA-512", "SHA-256", "MD5"},
+		}.Find,
+	},
+}
+```
+
+The zero value keeps the legacy behavior (the first usable digest
+challenge wins). Use `Select` instead of `Find` to also get the reason
+each other challenge was rejected; the diagnostics never include the
+`nonce`.
+
 ## Custom Authenticate Header
 
 ``` go

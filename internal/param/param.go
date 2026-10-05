@@ -133,7 +133,7 @@ func skipWhite(br *bufio.Reader) error {
 			}
 			return err
 		}
-		if b != ' ' {
+		if b != ' ' && b != '\t' {
 			return br.UnreadByte()
 		}
 	}

@@ -3,7 +3,6 @@ package digest
 import (
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 
@@ -31,38 +30,19 @@ func (c *Challenge) SupportsQOP(qop string) bool {
 
 // ParseChallenge parses the WWW-Authenticate header challenge
 func ParseChallenge(s string) (*Challenge, error) {
-	s, ok := CutPrefix(s)
-	if !ok {
+	raw := splitAuthField(s)
+	if len(raw) == 0 || !strings.EqualFold(raw[0].scheme, "Digest") {
 		return nil, errors.New("digest: invalid challenge prefix")
 	}
-	pp, err := param.Parse(s)
+	first := raw[0]
+	if first.err != nil {
+		return nil, first.err
+	}
+	pp, err := param.Parse(first.body)
 	if err != nil {
 		return nil, fmt.Errorf("digest: invalid challenge: %w", err)
 	}
-	var c Challenge
-	for _, p := range pp {
-		switch p.Key {
-		case "realm":
-			c.Realm = p.Value
-		case "domain":
-			c.Domain = strings.Fields(p.Value)
-		case "nonce":
-			c.Nonce = p.Value
-		case "algorithm":
-			c.Algorithm = p.Value
-		case "stale":
-			c.Stale = strings.ToLower(p.Value) == "true"
-		case "opaque":
-			c.Opaque = p.Value
-		case "qop":
-			c.QOP = strings.Split(p.Value, ",")
-		case "charset":
-			c.Charset = p.Value
-		case "userhash":
-			c.Userhash = strings.ToLower(p.Value) == "true"
-		}
-	}
-	return &c, nil
+	return challengeFromParams(pp), nil
 }
 
 // String returns the foramtted header value
@@ -128,24 +108,3 @@ func (c *Challenge) String() string {
 
 // ErrNoChallenge indicates that no WWW-Authenticate headers were found.
 var ErrNoChallenge = errors.New("digest: no challenge found")
-
-// FindChallenge returns the first supported challenge in the headers
-func FindChallenge(h http.Header) (*Challenge, error) {
-	var last error
-	for _, header := range h.Values("WWW-Authenticate") {
-		if !IsDigest(header) {
-			continue
-		}
-		chal, err := ParseChallenge(header)
-		if err == nil && CanDigest(chal) {
-			return chal, nil
-		}
-		if err != nil {
-			last = err
-		}
-	}
-	if last != nil {
-		return nil, last
-	}
-	return nil, ErrNoChallenge
-}
