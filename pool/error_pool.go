@@ -53,7 +53,7 @@ func (p *ErrorPool) Wait() error {
 // signal that all goroutines should be cancelled upon the first error.
 func (p *ErrorPool) WithContext(ctx context.Context) *ContextPool {
 	p.panicIfInitialized()
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancelCause(ctx)
 	return &ContextPool{
 		errorPool: p.deref(),
 		ctx:       ctx,

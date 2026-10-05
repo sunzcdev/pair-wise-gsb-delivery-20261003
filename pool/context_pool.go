@@ -7,13 +7,17 @@ import (
 // ContextPool is a pool that runs tasks that take a context.
 // A new ContextPool should be created with `New().WithContext(ctx)`.
 //
+// When WithCancelOnError is set, the first task error cancels the shared
+// context with that error as its cause, retrievable via context.Cause. If the
+// parent context is canceled first, its cause takes precedence.
+//
 // The configuration methods (With*) will panic if they are used after calling
 // Go() for the first time.
 type ContextPool struct {
 	errorPool ErrorPool
 
 	ctx    context.Context
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 
 	cancelOnError bool
 }
@@ -29,7 +33,7 @@ func (p *ContextPool) Go(f func(ctx context.Context) error) {
 			// re-throw the caught panic.
 			defer func() {
 				if r := recover(); r != nil {
-					p.cancel()
+					p.cancel(nil)
 					panic(r)
 				}
 			}()
@@ -42,7 +46,11 @@ func (p *ContextPool) Go(f func(ctx context.Context) error) {
 			// return an error before this error was added, which breaks the
 			// expectations of WithFirstError().
 			p.errorPool.addErr(err)
-			p.cancel()
+			// Cancel with the triggering error as the cause so cooperating
+			// tasks can recover it via context.Cause. If the parent context
+			// was already canceled, the standard library ignores this cause
+			// and keeps the one reported by the parent.
+			p.cancel(err)
 			return nil
 		}
 		return err
@@ -53,7 +61,9 @@ func (p *ContextPool) Go(f func(ctx context.Context) error) {
 // returns an error if any of the tasks errored.
 func (p *ContextPool) Wait() error {
 	// Make sure we call cancel after pool is done to avoid memory leakage.
-	defer p.cancel()
+	// A nil cause can not overwrite a cause established by a task error or
+	// the parent context, since only the first cancellation wins.
+	defer p.cancel(nil)
 	return p.errorPool.Wait()
 }
 
@@ -70,6 +80,10 @@ func (p *ContextPool) WithFirstError() *ContextPool {
 // WithCancelOnError configures the pool to cancel its context as soon as
 // any task returns an error or panics. By default, the pool's context is not
 // canceled until the parent context is canceled.
+//
+// The triggering task error is set as the cancellation cause, so it can be
+// read with context.Cause by the remaining tasks. A parent cancellation always
+// wins: if the parent is already done, its cause is preserved instead.
 //
 // In this case, all errors returned from the pool after the first will
 // likely be context.Canceled - you may want to also use
