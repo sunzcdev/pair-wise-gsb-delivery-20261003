@@ -1,0 +1,12 @@
+p, employee, profile, read, allow
+p, finance_requester, report, read, allow
+p, finance_requester, report, write, allow
+p, finance_approver, report, approve, allow
+p, auditor, report, read, allow
+p, auditor, report, approve, allow
+p, finance_director, report, read, allow
+p, finance_director, report, write, allow
+p, finance_director, report, approve, allow
+p, carol, report, approve, deny
+g, junior_auditor, auditor
+g, dave, employee
