@@ -392,7 +392,7 @@ func (ctx *genericSigner) Options() SignerOptions {
 //   - HS384: 48 bytes
 //   - HS512: 64 bytes
 func (obj JSONWebSignature) Verify(verificationKey interface{}) ([]byte, error) {
-	err := obj.DetachedVerify(obj.payload, verificationKey)
+	err := obj.detachedVerify(obj.payload, verificationKey, defaultCriticalHeaderRegistry(true))
 	if err != nil {
 		return nil, err
 	}
@@ -414,6 +414,10 @@ func (obj JSONWebSignature) UnsafePayloadWithoutVerification() []byte {
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey interface{}) error {
+	return obj.detachedVerify(payload, verificationKey, defaultCriticalHeaderRegistry(true))
+}
+
+func (obj JSONWebSignature) detachedVerify(payload []byte, verificationKey interface{}, criticalHeaders *criticalHeaderRegistry) error {
 	if len(obj.Signatures) > 1 {
 		return errors.New("go-jose/go-jose: too many signatures in payload; expecting only one")
 	}
@@ -429,21 +433,15 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 		return err
 	}
 
-	if signature.header != nil {
-		// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
-		// 4.1.11. "crit" (Critical) Header Parameter
-		// "When used, this Header Parameter MUST be integrity
-		// protected; therefore, it MUST occur only within the JWS
-		// Protected Header."
-		err = signature.header.checkNoCritical()
-		if err != nil {
-			return err
-		}
+	if signature.header != nil && hasCriticalHeader(signature.header) {
+		return ErrUnsupportedCriticalHeader
 	}
 
 	if signature.protected != nil {
-		err = signature.protected.checkSupportedCritical(supportedCritical)
-		if err != nil {
+		if err := checkCriticalHeaderList(signature.protected); err != nil {
+			return err
+		}
+		if err := criticalHeaders.runCriticalHeaderExtensions(signature.protected, CriticalHeaderBeforeVerification); err != nil {
 			return err
 		}
 	}
@@ -458,6 +456,12 @@ func (obj JSONWebSignature) DetachedVerify(payload []byte, verificationKey inter
 	err = verifier.verifyPayload(input, signature.Signature, alg)
 	if err != nil {
 		return ErrCryptoFailure
+	}
+
+	if signature.protected != nil {
+		if err := criticalHeaders.runCriticalHeaderExtensions(signature.protected, CriticalHeaderAfterVerification); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -491,23 +495,20 @@ func (obj JSONWebSignature) VerifyMulti(verificationKey interface{}) (int, Signa
 // The verificationKey argument must have one of the types allowed for the
 // verificationKey argument of JSONWebSignature.Verify().
 func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey interface{}) (int, Signature, error) {
+	return obj.detachedVerifyMulti(payload, verificationKey, defaultCriticalHeaderRegistry(true))
+}
+
+func (obj JSONWebSignature) detachedVerifyMulti(payload []byte, verificationKey interface{}, criticalHeaders *criticalHeaderRegistry) (int, Signature, error) {
 	for i, signature := range obj.Signatures {
-		if signature.header != nil {
-			// Per https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11,
-			// 4.1.11. "crit" (Critical) Header Parameter
-			// "When used, this Header Parameter MUST be integrity
-			// protected; therefore, it MUST occur only within the JWS
-			// Protected Header."
-			err := signature.header.checkNoCritical()
-			if err != nil {
-				continue
-			}
+		if signature.header != nil && hasCriticalHeader(signature.header) {
+			continue
 		}
 
 		if signature.protected != nil {
-			// Check for only supported critical headers
-			err := signature.protected.checkSupportedCritical(supportedCritical)
-			if err != nil {
+			if err := checkCriticalHeaderList(signature.protected); err != nil {
+				continue
+			}
+			if err := criticalHeaders.runCriticalHeaderExtensions(signature.protected, CriticalHeaderBeforeVerification); err != nil {
 				continue
 			}
 		}
@@ -533,6 +534,12 @@ func (obj JSONWebSignature) DetachedVerifyMulti(payload []byte, verificationKey 
 		err = verifier.verifyPayload(input, signature.Signature, alg)
 		if err != nil {
 			continue
+		}
+
+		if signature.protected != nil {
+			if err := criticalHeaders.runCriticalHeaderExtensions(signature.protected, CriticalHeaderAfterVerification); err != nil {
+				continue
+			}
 		}
 
 		return i, signature, nil

@@ -112,6 +112,17 @@ func (eo *EncrypterOptions) WithType(typ ContentType) *EncrypterOptions {
 	return eo.WithHeader(HeaderType, typ)
 }
 
+// WithCritical adds the given names to the critical ("crit") protected header
+// and returns the updated EncrypterOptions.
+func (eo *EncrypterOptions) WithCritical(names ...string) *EncrypterOptions {
+	if eo.ExtraHeaders[headerCritical] == nil {
+		eo.WithHeader(headerCritical, make([]string, 0, len(names)))
+	}
+	crit := eo.ExtraHeaders[headerCritical].([]string)
+	eo.ExtraHeaders[headerCritical] = append(crit, names...)
+	return eo
+}
+
 // Recipient represents an algorithm/key to encrypt messages to.
 //
 // PBES2Count and PBES2Salt correspond with the  "p2c" and "p2s" headers used
@@ -457,15 +468,32 @@ func validateContentEncryptionKeySize(cek []byte, cipher contentCipher) error {
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >10x the size of the compressed data, whichever is larger.
 func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) {
+	return obj.decrypt(decryptionKey, defaultCriticalHeaderRegistry(false))
+}
+
+func (obj JSONWebEncryption) decrypt(decryptionKey interface{}, criticalHeaders *criticalHeaderRegistry) ([]byte, error) {
 	headers := obj.mergedHeaders(nil)
 
 	if len(obj.recipients) > 1 {
 		return nil, errors.New("go-jose/go-jose: too many recipients in payload; expecting only one")
 	}
 
-	err := headers.checkNoCritical()
-	if err != nil {
-		return nil, err
+	if hasCriticalHeader(obj.unprotected) {
+		return nil, ErrUnsupportedCriticalHeader
+	}
+
+	recipient := obj.recipients[0]
+	if recipient.header != nil && hasCriticalHeader(recipient.header) {
+		return nil, ErrUnsupportedCriticalHeader
+	}
+
+	if obj.protected != nil {
+		if err := checkCriticalHeaderList(obj.protected); err != nil {
+			return nil, err
+		}
+		if err := criticalHeaders.runCriticalHeaderExtensions(obj.protected, CriticalHeaderBeforeVerification); err != nil {
+			return nil, err
+		}
 	}
 
 	key, err := tryJWKS(decryptionKey, obj.Header)
@@ -495,7 +523,6 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 	authData := obj.computeAuthData()
 
 	var plaintext []byte
-	recipient := obj.recipients[0]
 	recipientHeaders := obj.mergedHeaders(&recipient)
 
 	cek, err := decrypter.decryptKey(recipientHeaders, &recipient, generator)
@@ -511,6 +538,12 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 	plaintext, err = cipher.decrypt(cek, authData, parts)
 	if err != nil {
 		return nil, ErrCryptoFailure
+	}
+
+	if obj.protected != nil {
+		if err := criticalHeaders.runCriticalHeaderExtensions(obj.protected, CriticalHeaderAfterVerification); err != nil {
+			return nil, err
+		}
 	}
 
 	plaintext, err = obj.decompress(plaintext)
@@ -532,11 +565,28 @@ func (obj JSONWebEncryption) Decrypt(decryptionKey interface{}) ([]byte, error) 
 // Automatically decompresses plaintext, but returns an error if the decompressed
 // data would be >250kB or >3x the size of the compressed data, whichever is larger.
 func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Header, []byte, error) {
+	return obj.decryptMulti(decryptionKey, defaultCriticalHeaderRegistry(false))
+}
+
+func (obj JSONWebEncryption) decryptMulti(decryptionKey interface{}, criticalHeaders *criticalHeaderRegistry) (int, Header, []byte, error) {
 	globalHeaders := obj.mergedHeaders(nil)
 
-	err := globalHeaders.checkNoCritical()
-	if err != nil {
-		return -1, Header{}, nil, err
+	if hasCriticalHeader(obj.unprotected) {
+		return -1, Header{}, nil, ErrUnsupportedCriticalHeader
+	}
+	for _, recipient := range obj.recipients {
+		if recipient.header != nil && hasCriticalHeader(recipient.header) {
+			return -1, Header{}, nil, ErrUnsupportedCriticalHeader
+		}
+	}
+
+	if obj.protected != nil {
+		if err := checkCriticalHeaderList(obj.protected); err != nil {
+			return -1, Header{}, nil, err
+		}
+		if err := criticalHeaders.runCriticalHeaderExtensions(obj.protected, CriticalHeaderBeforeVerification); err != nil {
+			return -1, Header{}, nil, err
+		}
 	}
 
 	key, err := tryJWKS(decryptionKey, obj.Header)
@@ -601,6 +651,12 @@ func (obj JSONWebEncryption) DecryptMulti(decryptionKey interface{}) (int, Heade
 
 	if err != nil {
 		return -1, Header{}, nil, ErrCryptoFailure
+	}
+
+	if obj.protected != nil {
+		if err := criticalHeaders.runCriticalHeaderExtensions(obj.protected, CriticalHeaderAfterVerification); err != nil {
+			return -1, Header{}, nil, err
+		}
 	}
 
 	plaintext, err = obj.decompress(plaintext)

@@ -175,11 +175,6 @@ const (
 
 )
 
-// supportedCritical is the set of supported extensions that are understood and processed.
-var supportedCritical = map[string]struct{}{
-	headerB64: {},
-}
-
 // rawHeader represents the JOSE header for JWE/JWS objects (used for parsing).
 //
 // The decoding of the constituent items is deferred because we want to marshal
@@ -337,48 +332,6 @@ func (parsed rawHeader) getJWK() (*JSONWebKey, error) {
 		return nil, err
 	}
 	return jwk, nil
-}
-
-// getCritical extracts parsed "crit" from the raw JSON. If omitted, it
-// returns an empty slice.
-func (parsed rawHeader) getCritical() ([]string, error) {
-	v := parsed[headerCritical]
-	if v == nil {
-		return nil, nil
-	}
-
-	var q []string
-	err := json.Unmarshal(*v, &q)
-	if err != nil {
-		return nil, err
-	}
-	return q, nil
-}
-
-// checkNoCritical verifies there are no critical headers present.
-func (parsed rawHeader) checkNoCritical() error {
-	if _, ok := parsed[headerCritical]; ok {
-		return ErrUnsupportedCriticalHeader
-	}
-
-	return nil
-}
-
-// checkSupportedCritical verifies there are no unsupported critical headers.
-// Supported headers are passed in as a set: map of names to empty structs
-func (parsed rawHeader) checkSupportedCritical(supported map[string]struct{}) error {
-	crit, err := parsed.getCritical()
-	if err != nil {
-		return err
-	}
-
-	for _, name := range crit {
-		if _, ok := supported[name]; !ok {
-			return ErrUnsupportedCriticalHeader
-		}
-	}
-
-	return nil
 }
 
 // getS2C extracts parsed "p2c" from the raw JSON.
