@@ -13,6 +13,8 @@ const (
 	OsLibName = "os"
 	// StringLibName is the name of the string Library.
 	StringLibName = "string"
+	// Utf8LibName is the name of the utf8 Library.
+	Utf8LibName = "utf8"
 	// MathLibName is the name of the math Library.
 	MathLibName = "math"
 	// DebugLibName is the name of the debug Library.
@@ -35,6 +37,7 @@ var luaLibs = []luaLib{
 	luaLib{IoLibName, OpenIo},
 	luaLib{OsLibName, OpenOs},
 	luaLib{StringLibName, OpenString},
+	luaLib{Utf8LibName, OpenUtf8},
 	luaLib{MathLibName, OpenMath},
 	luaLib{DebugLibName, OpenDebug},
 	luaLib{ChannelLibName, OpenChannel},
