@@ -22,11 +22,14 @@ type Notify func(error, time.Duration)
 
 // retryOptions holds configuration settings for the retry mechanism.
 type retryOptions struct {
-	BackOff        BackOff       // Strategy for calculating backoff periods.
-	Timer          timer         // Timer to manage retry delays.
-	Notify         Notify        // Optional function called before each backoff wait.
-	MaxTries       uint          // Maximum number of retry attempts.
-	MaxElapsedTime time.Duration // Maximum total time for all retries.
+	BackOff        BackOff                       // Strategy for calculating backoff periods.
+	Timer          timer                         // Timer to manage retry delays.
+	Notify         Notify                        // Optional function called before each backoff wait.
+	MaxTries       uint                          // Maximum number of retry attempts.
+	MaxElapsedTime time.Duration                 // Maximum total time for all retries.
+	Classifier     Classifier                    // Optional router to per-category backoff policies.
+	BackOffFactory func(category string) BackOff // Creates a policy per category.
+	ResetOnSwitch  bool                          // Reset a category's policy when switching away from it.
 }
 
 // RetryOption configures the behavior of Retry.
@@ -127,7 +130,14 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 	defer args.Timer.Stop()
 
 	startedAt := time.Now()
-	args.BackOff.Reset()
+	// With classification, each Retry call gets its own router and its own
+	// policy instances, so concurrent calls never share mutable state.
+	var router *categoryRouter
+	if args.Classifier != nil {
+		router = newCategoryRouter(args.Classifier, args.BackOffFactory, args.ResetOnSwitch)
+	} else {
+		args.BackOff.Reset()
+	}
 	for numTries := uint(1); ; numTries++ {
 		// Execute the operation.
 		res, err := operation()
@@ -162,16 +172,28 @@ func Retry[T any](ctx context.Context, operation Operation[T], opts ...RetryOpti
 			return res, &RetryError{LastErr: lastErr, Cause: cerr}
 		}
 
-		// Calculate next backoff duration.
-		next := args.BackOff.NextBackOff()
+		// Calculate next backoff duration, routing by error category when a
+		// classifier is configured. Classification only picks the policy; the
+		// error itself is reported unchanged.
+		var next time.Duration
+		if router != nil {
+			next = router.NextBackOff(err)
+		} else {
+			next = args.BackOff.NextBackOff()
+		}
 		if next == Stop {
 			return res, &RetryError{LastErr: lastErr, Cause: ErrExhausted}
 		}
 
-		// Reset backoff if a RetryAfterError requested a specific delay.
+		// Reset backoff if a RetryAfterError requested a specific delay. With
+		// classification, only the current category's sequence is reset.
 		if retryAfter != nil {
 			next = retryAfter.Duration
-			args.BackOff.Reset()
+			if router != nil {
+				router.ResetCurrent()
+			} else {
+				args.BackOff.Reset()
+			}
 		}
 
 		// A negative delay (e.g. a Retry-After date already in the past) means retry now.

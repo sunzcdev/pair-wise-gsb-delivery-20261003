@@ -71,6 +71,35 @@ if re := backoff.AsRetryError(err); re != nil {
 
 Mark an error non-retriable with `backoff.Permanent(err)`; `Retry` stops immediately and returns a `*RetryError` whose `Cause` is `ErrPermanent` and whose `LastErr` is `err`.
 
+### Per-category backoff
+
+`WithClassifiedBackOff` routes each failure to an independent backoff policy by error type, so e.g. connection errors and rate-limit errors keep separate retry rhythms. You provide the classifier and a factory; classification only decides whether to retry and how long to wait — the error chain is reported unchanged.
+
+```go
+classify := func(err error) string {
+	var ce *net.OpError
+	switch {
+	case errors.As(err, &ce):
+		return "conn"
+	case errors.Is(err, errRateLimited):
+		return "rate"
+	}
+	return "other"
+}
+factory := func(category string) backoff.BackOff {
+	if category == "other" {
+		return nil // nil policy: don't retry this category
+	}
+	return backoff.NewExponentialBackOff()
+}
+
+result, err := backoff.Retry(ctx, operation,
+	backoff.WithClassifiedBackOff(classify, factory,
+		backoff.WithResetOnSwitch(true)))
+```
+
+Each `Retry` call builds its own policies through the factory, so concurrent calls never share mutable backoff state. When failures switch category, each category's sequence is kept by default; `WithResetOnSwitch(true)` resets a category's sequence when switching away from it. A `Permanent` error always stops retrying before the classifier is consulted, and a `RetryAfterError` overrides the routed delay and resets only the current category's sequence.
+
 ### Bounding total time
 
 Two independent limits cap how long `Retry` runs, and they behave differently:

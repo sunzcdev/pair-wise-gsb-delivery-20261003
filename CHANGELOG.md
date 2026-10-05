@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `WithClassifiedBackOff` routes each failed attempt to an independent per-category `BackOff` via a caller-provided `Classifier`, so different failure types keep separate retry rhythms. Classification only affects whether to retry and how long to wait; the reported error chain is unchanged. Each `Retry` call builds its own policies, so concurrent calls share no mutable state. `WithResetOnSwitch` selects whether a category's sequence is kept (default) or reset when failures switch category.
+
 ## [7.0.1] - 2026-09-30
 
 ### Fixed
