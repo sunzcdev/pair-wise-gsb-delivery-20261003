@@ -86,6 +86,9 @@ type Node struct {
 
 	notificationHandler NotificationHandler
 	nodeInfoSendHandler NodeInfoSendHandler
+	// userPresenceHandler, when set, receives user-level presence transitions.
+	userPresenceHandler UserPresenceHandler
+	userPresenceMu      sync.RWMutex
 
 	emulationSurveyHandler *emulationSurveyHandler
 
@@ -329,6 +332,12 @@ func (n *Node) Run() error {
 	}
 	if err := n.broker.RegisterBrokerEventHandler(n); err != nil {
 		return err
+	}
+	// Wire user-level presence: the PresenceManager reports transitions (some
+	// deferred or expiry-driven) and the Node fans them out across nodes and
+	// invokes the registered server-side handler.
+	if upm, ok := n.presenceManager.(UserPresenceManager); ok {
+		upm.SetUserPresenceEmitter(n.dispatchUserPresence)
 	}
 	if n.mapBroker != nil {
 		if err := n.mapBroker.RegisterEventHandler(n); err != nil {
@@ -2064,6 +2073,22 @@ func (n *Node) OnNodeInfoSend(handler NodeInfoSendHandler) {
 	n.nodeInfoSendHandler = handler
 }
 
+// OnUserPresence registers a server-side handler for user-level presence
+// transitions. Unlike connection-level join/leave pushes (delivered to channel
+// subscribers), these events are coalesced per user across all of their
+// connections: one enter on the first connection and one leave after the last
+// connection (plus the configured grace period).
+//
+// The handler is invoked on every running node for a cluster-wide transition,
+// so side effects must be idempotent. This should be set before Node.Run.
+// User presence must additionally be enabled on the PresenceManager
+// implementation (for example UserPresenceGracePeriod) for events to flow.
+func (n *Node) OnUserPresence(handler UserPresenceHandler) {
+	n.userPresenceMu.Lock()
+	n.userPresenceHandler = handler
+	n.userPresenceMu.Unlock()
+}
+
 // eventHub allows binding client event handlers.
 // All eventHub methods are not goroutine-safe and supposed
 // to be called once before Node Run called.
@@ -2204,6 +2229,115 @@ func (n *Node) HandleLeave(ch string, info *ClientInfo) error {
 		panic("nil leave ClientInfo received, this must never happen")
 	}
 	return n.handleLeave(ch, info)
+}
+
+// HandleUserPresenceEnter coming from Broker.
+func (n *Node) HandleUserPresenceEnter(ch string, userID string, info *ClientInfo) error {
+	n.invokeUserPresenceHandler(UserPresenceEvent{
+		Channel: ch,
+		Type:    UserPresenceEnter,
+		UserID:  userID,
+		Info:    info,
+	})
+	return nil
+}
+
+// HandleUserPresenceLeave coming from Broker.
+func (n *Node) HandleUserPresenceLeave(ch string, userID string, info *ClientInfo) error {
+	n.invokeUserPresenceHandler(UserPresenceEvent{
+		Channel: ch,
+		Type:    UserPresenceLeave,
+		UserID:  userID,
+		Info:    info,
+	})
+	return nil
+}
+
+func (n *Node) invokeUserPresenceHandler(event UserPresenceEvent) {
+	n.userPresenceMu.RLock()
+	handler := n.userPresenceHandler
+	n.userPresenceMu.RUnlock()
+	if handler != nil {
+		handler(event)
+	}
+}
+
+// dispatchUserPresence fans a user-level transition out through the Broker so
+// every node observes it, including this one (MemoryBroker dispatches inline;
+// Redis PUB/SUB echoes back to the publisher's own subscription). The final
+// handler invocation therefore happens through HandleUserPresence*.
+func (n *Node) dispatchUserPresence(event UserPresenceEvent) {
+	info := event.Info
+	if info == nil {
+		info = &ClientInfo{UserID: event.UserID}
+	}
+	broker := n.getBroker(event.Channel)
+	if ub, ok := broker.(UserPresenceBroker); ok {
+		var err error
+		if event.Type == UserPresenceEnter {
+			err = ub.PublishUserPresenceEnter(event.Channel, event.UserID, info)
+		} else {
+			err = ub.PublishUserPresenceLeave(event.Channel, event.UserID, info)
+		}
+		if err != nil {
+			n.logger.log(newErrorLogEntry(err, "error publishing user presence event", map[string]any{
+				"channel": event.Channel,
+				"user":    event.UserID,
+			}))
+		}
+		return
+	}
+	// Broker does not support user presence fan-out: deliver locally only.
+	n.invokeUserPresenceHandler(event)
+}
+
+// addUserPresence proxies to a UserPresenceManager and fans out the transition.
+func (n *Node) addUserPresence(ch string, clientID string, info *ClientInfo) {
+	if info == nil || info.UserID == "" {
+		// Anonymous connections can't be coalesced into user presence.
+		return
+	}
+	pm, ok := n.getPresenceManager(ch).(UserPresenceManager)
+	if !ok {
+		return
+	}
+	event, fired, err := pm.AddUserPresence(ch, clientID, info)
+	if err != nil {
+		n.logger.log(newErrorLogEntry(err, "error adding user presence", map[string]any{
+			"channel": ch,
+			"user":    info.UserID,
+			"client":  clientID,
+		}))
+		return
+	}
+	if fired {
+		n.dispatchUserPresence(event)
+	}
+}
+
+// removeUserPresence proxies to a UserPresenceManager and fans out an immediate
+// transition. Deferred grace-period and natural-expiry leaves come back through
+// the manager's emitter instead.
+func (n *Node) removeUserPresence(ch string, clientID string, userID string) {
+	if userID == "" {
+		return
+	}
+	pm, ok := n.getPresenceManager(ch).(UserPresenceManager)
+	if !ok {
+		return
+	}
+	event, fired, err := pm.RemoveUserPresence(ch, clientID, userID)
+	if err != nil {
+		n.logger.log(newErrorLogEntry(err, "error removing user presence", map[string]any{
+			"channel": ch,
+			"user":    userID,
+			"client":  clientID,
+		}))
+		return
+	}
+	if fired {
+		n.dispatchUserPresence(event)
+	}
 }
 
 // HandleControl coming from Broker.

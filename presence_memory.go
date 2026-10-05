@@ -3,6 +3,7 @@ package centrifuge
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 // MemoryPresenceManager is builtin default PresenceManager which allows running
@@ -17,22 +18,31 @@ import (
 // need maximum performance and not too many online clients. Consider configuring
 // your load balancer to have one backup Centrifuge node for HA in this case.
 type MemoryPresenceManager struct {
-	node        *Node
-	config      MemoryPresenceManagerConfig
-	presenceHub *presenceHub
+	node            *Node
+	config          MemoryPresenceManagerConfig
+	presenceHub     *presenceHub
+	userPresenceHub *userPresenceHub
 }
 
 var _ PresenceManager = (*MemoryPresenceManager)(nil)
 
 // MemoryPresenceManagerConfig is a MemoryPresenceManager config.
-type MemoryPresenceManagerConfig struct{}
+type MemoryPresenceManagerConfig struct {
+	// UserPresenceGracePeriod is the delay between the moment the last
+	// connection of a user disappears from a channel and the user-level leave
+	// event. A reconnect landing in this window cancels the pending leave, so
+	// quick page reloads and network blips do not flap user presence.
+	// Zero means emit the user leave immediately.
+	UserPresenceGracePeriod time.Duration
+}
 
 // NewMemoryPresenceManager initializes MemoryPresenceManager.
 func NewMemoryPresenceManager(n *Node, c MemoryPresenceManagerConfig) (*MemoryPresenceManager, error) {
 	return &MemoryPresenceManager{
-		node:        n,
-		config:      c,
-		presenceHub: newPresenceHub(),
+		node:            n,
+		config:          c,
+		presenceHub:     newPresenceHub(),
+		userPresenceHub: newUserPresenceHub(c.UserPresenceGracePeriod),
 	}, nil
 }
 
@@ -56,8 +66,26 @@ func (m *MemoryPresenceManager) PresenceStats(ch string) (PresenceStats, error) 
 	return m.presenceHub.getStats(ch)
 }
 
-// Close is noop for now.
+var _ UserPresenceManager = (*MemoryPresenceManager)(nil)
+
+// AddUserPresence - see UserPresenceManager interface description.
+func (m *MemoryPresenceManager) AddUserPresence(ch string, clientID string, info *ClientInfo) (UserPresenceEvent, bool, error) {
+	return m.userPresenceHub.add(ch, clientID, info)
+}
+
+// RemoveUserPresence - see UserPresenceManager interface description.
+func (m *MemoryPresenceManager) RemoveUserPresence(ch string, clientID string, userID string) (UserPresenceEvent, bool, error) {
+	return m.userPresenceHub.remove(ch, clientID, userID)
+}
+
+// SetUserPresenceEmitter - see UserPresenceManager interface description.
+func (m *MemoryPresenceManager) SetUserPresenceEmitter(emit func(UserPresenceEvent)) {
+	m.userPresenceHub.emit = emit
+}
+
+// Close stops pending grace-period timers.
 func (m *MemoryPresenceManager) Close(_ context.Context) error {
+	m.userPresenceHub.close()
 	return nil
 }
 
@@ -148,4 +176,165 @@ func (h *presenceHub) getStats(ch string) (PresenceStats, error) {
 		NumClients: numClients,
 		NumUsers:   numUsers,
 	}, nil
+}
+
+// userPresenceHub keeps per-user connection counts for channels and schedules
+// deferred leave events. All state is guarded by a single mutex, and the grace
+// timer re-checks the count under the same mutex before firing, so explicit
+// unsubscribes, abnormal drops and expiry share one counting semantics.
+type userPresenceHub struct {
+	mu          sync.Mutex
+	gracePeriod time.Duration
+	emit        func(UserPresenceEvent)
+	// users maps channel -> userID -> user presence state.
+	users map[string]map[string]*userPresenceState
+}
+
+type userPresenceState struct {
+	// clients is the set of live client connections of this user in channel.
+	clients map[string]struct{}
+	// info is the ClientInfo recorded on the enter transition.
+	info *ClientInfo
+	// leaveTimer is set while a leave is pending during the grace period.
+	leaveTimer *time.Timer
+}
+
+func newUserPresenceHub(gracePeriod time.Duration) *userPresenceHub {
+	return &userPresenceHub{
+		gracePeriod: gracePeriod,
+		users:       make(map[string]map[string]*userPresenceState),
+	}
+}
+
+func (h *userPresenceHub) add(ch string, clientID string, info *ClientInfo) (UserPresenceEvent, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	userID := info.UserID
+	channelUsers, ok := h.users[ch]
+	if !ok {
+		channelUsers = make(map[string]*userPresenceState)
+		h.users[ch] = channelUsers
+	}
+
+	state, existed := channelUsers[userID]
+	if !existed {
+		state = &userPresenceState{
+			clients: make(map[string]struct{}),
+			info:    info,
+		}
+		channelUsers[userID] = state
+	} else {
+		state.info = info
+	}
+
+	_, alreadyThere := state.clients[clientID]
+	if state.leaveTimer != nil {
+		// A reconnect inside the grace window cancels the pending leave. It
+		// must not produce a duplicate enter event.
+		state.leaveTimer.Stop()
+		state.leaveTimer = nil
+	}
+	state.clients[clientID] = struct{}{}
+
+	if !existed && !alreadyThere {
+		// Genuine 0 -> 1 transition.
+		return UserPresenceEvent{
+			Channel: ch,
+			Type:    UserPresenceEnter,
+			UserID:  userID,
+			Info:    info,
+		}, true, nil
+	}
+	return UserPresenceEvent{}, false, nil
+}
+
+func (h *userPresenceHub) remove(ch string, clientID string, userID string) (UserPresenceEvent, bool, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	channelUsers, ok := h.users[ch]
+	if !ok {
+		return UserPresenceEvent{}, false, nil
+	}
+	state, ok := channelUsers[userID]
+	if !ok {
+		return UserPresenceEvent{}, false, nil
+	}
+	if _, ok := state.clients[clientID]; !ok {
+		return UserPresenceEvent{}, false, nil
+	}
+
+	delete(state.clients, clientID)
+	if len(state.clients) > 0 {
+		return UserPresenceEvent{}, false, nil
+	}
+
+	leaveEvent := UserPresenceEvent{
+		Channel: ch,
+		Type:    UserPresenceLeave,
+		UserID:  userID,
+		Info:    state.info,
+	}
+
+	if h.gracePeriod <= 0 {
+		h.deleteStateLocked(ch, userID)
+		return leaveEvent, true, nil
+	}
+
+	h.scheduleLeaveLocked(ch, userID, state)
+	return UserPresenceEvent{}, false, nil
+}
+
+func (h *userPresenceHub) scheduleLeaveLocked(ch, userID string, state *userPresenceState) {
+	state.leaveTimer = time.AfterFunc(h.gracePeriod, func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		channelUsers, ok := h.users[ch]
+		if !ok {
+			return
+		}
+		currentState, ok := channelUsers[userID]
+		if !ok || currentState.leaveTimer == nil || len(currentState.clients) > 0 {
+			// A reconnect cancelled this leave.
+			return
+		}
+
+		event := UserPresenceEvent{
+			Channel: ch,
+			Type:    UserPresenceLeave,
+			UserID:  userID,
+			Info:    currentState.info,
+		}
+		h.deleteStateLocked(ch, userID)
+		if h.emit != nil {
+			h.emit(event)
+		}
+	})
+}
+
+func (h *userPresenceHub) deleteStateLocked(ch, userID string) {
+	channelUsers, ok := h.users[ch]
+	if !ok {
+		return
+	}
+	delete(channelUsers, userID)
+	if len(channelUsers) == 0 {
+		delete(h.users, ch)
+	}
+}
+
+func (h *userPresenceHub) close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, channelUsers := range h.users {
+		for _, state := range channelUsers {
+			if state.leaveTimer != nil {
+				state.leaveTimer.Stop()
+				state.leaveTimer = nil
+			}
+		}
+	}
+	h.users = make(map[string]map[string]*userPresenceState)
 }

@@ -86,11 +86,11 @@ type brokerPubSubRunner interface {
 // By default, Redis >= 5 required (due to the fact RedisBroker uses STREAM data
 // structure to keep publication history for a channel).
 type RedisBroker struct {
-	controlRound            uint64
-	node                    *Node
-	sharding                bool
-	config                  RedisBrokerConfig
-	shards                  []*shardWrapper
+	controlRound uint64
+	node         *Node
+	sharding     bool
+	config       RedisBrokerConfig
+	shards       []*shardWrapper
 	// partitionTags is non-nil when UsePrecomputedPartitionTags is enabled;
 	// indexed by partition index, returns the hash tag string. Read-only
 	// after construction (shared with the package-level precomputed table).
@@ -1017,6 +1017,41 @@ func (b *RedisBroker) publishLeave(s *shardWrapper, ch string, info *ClientInfo)
 	return resp.Error()
 }
 
+var _ UserPresenceBroker = (*RedisBroker)(nil)
+
+// PublishUserPresenceEnter - see UserPresenceBroker.
+func (b *RedisBroker) PublishUserPresenceEnter(ch string, userID string, info *ClientInfo) error {
+	return b.publishUserPresence(b.getShard(ch), ch, userID, info, userEnterTypePrefix)
+}
+
+// PublishUserPresenceLeave - see UserPresenceBroker.
+func (b *RedisBroker) PublishUserPresenceLeave(ch string, userID string, info *ClientInfo) error {
+	return b.publishUserPresence(b.getShard(ch), ch, userID, info, userLeaveTypePrefix)
+}
+
+func (b *RedisBroker) publishUserPresence(s *shardWrapper, ch string, userID string, info *ClientInfo, prefix []byte) error {
+	infoBytes, err := infoToProto(info).MarshalVT()
+	if err != nil {
+		return err
+	}
+	message := make([]byte, 0, len(prefix)+len(userID)+1+len(infoBytes))
+	message = append(message, prefix...)
+	message = append(message, userID...)
+	message = append(message, '\n')
+	message = append(message, infoBytes...)
+
+	chID := b.messageChannelID(s.shard, ch)
+	var resp rueidis.RedisResult
+	if b.useShardedPubSub(s.shard) {
+		cmd := s.shard.client.B().Spublish().Channel(string(chID)).Message(convert.BytesToString(message)).Build()
+		resp = s.shard.client.Do(context.Background(), cmd)
+	} else {
+		cmd := s.shard.client.B().Publish().Channel(string(chID)).Message(convert.BytesToString(message)).Build()
+		resp = s.shard.client.Do(context.Background(), cmd)
+	}
+	return resp.Error()
+}
+
 // Subscribe - see Broker.Subscribe.
 func (b *RedisBroker) Subscribe(channels ...string) error {
 	if len(channels) == 0 {
@@ -1595,6 +1630,23 @@ func (b *RedisBroker) handleRedisClientMessage(isCluster bool, eventHandler Brok
 			return err
 		}
 		_ = eventHandler.HandleLeave(channel, infoFromProto(&info))
+	} else if typeOfPush == userEnterPushType || typeOfPush == userLeavePushType {
+		sep := bytes.IndexByte(pushData, '\n')
+		if sep < 0 {
+			return fmt.Errorf("malformed user presence PUB/SUB data")
+		}
+		userID := convert.BytesToString(pushData[:sep])
+		var info protocol.ClientInfo
+		if err := info.UnmarshalVT(pushData[sep+1:]); err != nil {
+			return err
+		}
+		if h, ok := eventHandler.(UserPresenceBrokerEventHandler); ok {
+			if typeOfPush == userEnterPushType {
+				_ = h.HandleUserPresenceEnter(channel, userID, infoFromProto(&info))
+			} else {
+				_ = h.HandleUserPresenceLeave(channel, userID, infoFromProto(&info))
+			}
+		}
 	}
 	return nil
 }
@@ -1837,14 +1889,20 @@ func (b *RedisBroker) historyList(s *RedisShard, ch string, filter HistoryFilter
 type pushType int
 
 const (
-	pubPushType   pushType = 0
-	joinPushType  pushType = 1
-	leavePushType pushType = 2
+	pubPushType       pushType = 0
+	joinPushType      pushType = 1
+	leavePushType     pushType = 2
+	userEnterPushType pushType = 3
+	userLeavePushType pushType = 4
 )
 
 var (
 	metaSep    = []byte("__")
 	contentSep = ":"
+	// User-level presence prefixes carry the user id and the ClientInfo payload:
+	// __ue__<userID>\n<payload> / __ul__<userID>\n<payload>.
+	userEnterTypePrefix = []byte("__ue__")
+	userLeaveTypePrefix = []byte("__ul__")
 )
 
 // See tests for supported format examples.
@@ -1879,6 +1937,24 @@ func extractPushData(data []byte) ([]byte, pushType, StreamPosition, bool, []byt
 		}
 		rest := data[len(metaSep)+nextMetaSepPos+len(metaSep):]
 		return rest, leavePushType, StreamPosition{}, false, nil, true
+	case 'u':
+		// __ue__ / __ul__ followed by "userID\npayload". The body is returned
+		// verbatim and split into user id and ClientInfo by the receive loop.
+		if len(content) < 2 {
+			return data, pubPushType, StreamPosition{}, false, nil, false
+		}
+		nextMetaSepPos := bytes.Index(data[len(metaSep):], metaSep)
+		if nextMetaSepPos <= 0 {
+			return data, pubPushType, StreamPosition{}, false, nil, false
+		}
+		rest := data[len(metaSep)+nextMetaSepPos+len(metaSep):]
+		var pType pushType
+		if content[1] == 'e' {
+			pType = userEnterPushType
+		} else {
+			pType = userLeavePushType
+		}
+		return rest, pType, StreamPosition{}, false, nil, bytes.IndexByte(rest, '\n') >= 0
 	case 'p':
 		// p1:offset:epoch__payload
 		nextMetaSepPos := bytes.Index(data[len(metaSep):], metaSep)

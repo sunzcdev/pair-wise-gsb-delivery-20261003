@@ -1405,6 +1405,7 @@ func (c *Client) setupMapPresenceAndJoin(channel string, opts SubscribeOptions) 
 				"channel": channel, "user": c.user, "client": c.uid,
 			}))
 		}
+		c.node.addUserPresence(channel, c.uid, info)
 	}
 
 	// Add map client presence if channel is configured.

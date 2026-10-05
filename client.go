@@ -856,6 +856,9 @@ func (c *Client) updateChannelPresence(ch string, chCtx ChannelContext) (attempt
 		if err != nil {
 			return true, err
 		}
+		// Refresh the user-level structures too so their TTL tracks the live
+		// connection. An already-present user yields no transition.
+		c.node.addUserPresence(ch, c.uid, info)
 	}
 
 	if channelHasFlag(chCtx.flags, flagMapClientPresence) || channelHasFlag(chCtx.flags, flagMapUserPresence) {
@@ -1015,6 +1018,7 @@ func (c *Client) removeRacedPresence(ch string, chCtx ChannelContext) {
 			c.node.logger.log(newErrorLogEntry(err, "error removing raced channel presence", map[string]any{
 				"channel": ch, "user": c.user, "client": c.uid, "error": err.Error()}))
 		}
+		c.node.removeUserPresence(ch, c.uid, c.user)
 	}
 	if chCtx.mapClientPresenceChannel != "" {
 		if _, err := c.node.MapRemove(context.Background(), chCtx.mapClientPresenceChannel, c.uid, MapRemoveOptions{}); err != nil {
@@ -4163,6 +4167,7 @@ func (c *Client) removeSubscribePresence(channel string, flags uint16) {
 		c.node.logger.log(newErrorLogEntry(err, "error removing presence on subscribe rollback", map[string]any{
 			"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
 	}
+	c.node.removeUserPresence(channel, c.uid, c.user)
 }
 
 // commitSubscription is the single consistency-critical commit point shared by
@@ -4461,6 +4466,9 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 			ctx.disconnect = &DisconnectServerError
 			return ctx
 		}
+		// User-level presence rides on the same participation flag: it shares
+		// the per-connection presence add/remove lifecycle (including TTL).
+		c.node.addUserPresence(channel, c.uid, info)
 	}
 
 	var (
@@ -5391,6 +5399,7 @@ func (c *Client) unsubscribe(channel string, unsubscribe Unsubscribe, disconnect
 			if err != nil {
 				c.node.logger.log(newErrorLogEntry(err, "error removing channel presence", map[string]any{"channel": channel, "user": c.user, "client": c.uid, "error": err.Error()}))
 			}
+			c.node.removeUserPresence(channel, c.uid, c.user)
 		}
 	}
 

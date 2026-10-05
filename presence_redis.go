@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "embed"
@@ -20,14 +21,24 @@ var _ PresenceManager = (*RedisPresenceManager)(nil)
 
 // RedisPresenceManager keeps presence in Redis thus allows scaling nodes.
 type RedisPresenceManager struct {
-	node                *Node
-	config              RedisPresenceManagerConfig
-	shards              []*RedisShard
-	sharding            bool
-	addPresenceScript   *rueidis.Lua
-	remPresenceScript   *rueidis.Lua
-	presenceScript      *rueidis.Lua
-	presenceStatsScript *rueidis.Lua
+	node                  *Node
+	config                RedisPresenceManagerConfig
+	shards                []*RedisShard
+	sharding              bool
+	addPresenceScript     *rueidis.Lua
+	remPresenceScript     *rueidis.Lua
+	presenceScript        *rueidis.Lua
+	presenceStatsScript   *rueidis.Lua
+	userAddScript         *rueidis.Lua
+	userRemScript         *rueidis.Lua
+	userConfirmScript     *rueidis.Lua
+	userExpireScript      *rueidis.Lua
+	userIdleScript        *rueidis.Lua
+	userPresenceEmitter   func(UserPresenceEvent)
+	userPresenceEmitterMu sync.RWMutex
+	userPresenceOnce      chan struct{}
+	stopCh                chan struct{}
+	stopOnce              sync.Once
 }
 
 // RedisPresenceManagerConfig is a config for RedisPresenceManager.
@@ -65,6 +76,14 @@ type RedisPresenceManagerConfig struct {
 	// to be initialized in each RedisShard using RedisShardConfig.ReplicaClientEnabled.
 	ReadFromReplica bool
 
+	// UserPresenceGracePeriod is the delay between the moment the last connection
+	// of a user disappears from a channel (explicit unsubscribe, abnormal drop or
+	// natural presence TTL expiry) and the user-level leave event. A reconnect
+	// landing in this window atomically cancels the pending leave. Zero means emit
+	// the user leave immediately. A non-zero value additionally enables the
+	// user-level presence feature (user enter/leave transitions).
+	UserPresenceGracePeriod time.Duration
+
 	// LoadSHA1 enables loading SHA1 from Redis via SCRIPT LOAD instead of calculating
 	// it on the client side. This is useful for FIPS compliance.
 	LoadSHA1 bool
@@ -82,6 +101,21 @@ var (
 
 	//go:embed internal/redis_lua/presence_stats_get.lua
 	presenceStatsScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_add.lua
+	userAddScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_rem.lua
+	userRemScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_confirm.lua
+	userConfirmScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_expire_clients.lua
+	userExpireScriptSource string
+
+	//go:embed internal/redis_lua/presence_user_idle.lua
+	userIdleScriptSource string
 )
 
 // NewRedisPresenceManager creates new RedisPresenceManager.
@@ -124,11 +158,19 @@ func NewRedisPresenceManager(n *Node, config RedisPresenceManagerConfig) (*Redis
 		remPresenceScript:   rueidis.NewLuaScript(remPresenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 		presenceScript:      rueidis.NewLuaScript(presenceScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
 		presenceStatsScript: rueidis.NewLuaScript(presenceStatsScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userAddScript:       rueidis.NewLuaScript(userAddScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userRemScript:       rueidis.NewLuaScript(userRemScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userConfirmScript:   rueidis.NewLuaScript(userConfirmScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userExpireScript:    rueidis.NewLuaScript(userExpireScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userIdleScript:      rueidis.NewLuaScript(userIdleScriptSource, rueidis.WithLoadSHA1(config.LoadSHA1)),
+		userPresenceOnce:    make(chan struct{}),
+		stopCh:              make(chan struct{}),
 	}
 	return m, nil
 }
 
 func (m *RedisPresenceManager) Close(_ context.Context) error {
+	m.stopOnce.Do(func() { close(m.stopCh) })
 	return nil
 }
 

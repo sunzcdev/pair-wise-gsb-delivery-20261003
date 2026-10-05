@@ -965,6 +965,21 @@ func TestRedisExtractPushData(t *testing.T) {
 	require.Equal(t, uint64(0), sp.Offset)
 	require.Equal(t, []byte(`\x12\nchat:index\x1aU\"\x0e{\"input\":\"__\"}*C\n\x0242\x12$37cb00a9-bcfa-4284-a1ae-607c7da3a8f4\x1a\x15{\"name\": \"Alexander\"}\"\x00`), pushData)
 
+	data = []byte("__ue__user-42\ninfo")
+	pushData, pushType, _, _, _, ok = extractPushData(data)
+	require.True(t, ok)
+	require.Equal(t, userEnterPushType, pushType)
+	require.Equal(t, []byte("user-42\ninfo"), pushData)
+
+	data = []byte("__ul__user-42\ninfo")
+	pushData, pushType, _, _, _, ok = extractPushData(data)
+	require.True(t, ok)
+	require.Equal(t, userLeavePushType, pushType)
+	require.Equal(t, []byte("user-42\ninfo"), pushData)
+
+	_, _, _, _, _, ok = extractPushData([]byte(`__ue__no-newline-info`))
+	require.False(t, ok)
+
 	data = []byte(`____\x12\nchat:index\x1aU\"\x0e{\"input\":\"__\"}*C\n\x0242\x12$37cb00a9-bcfa-4284-a1ae-607c7da3a8f4\x1a\x15{\"name\": \"Alexander\"}\"\x00`)
 	_, _, _, _, _, ok = extractPushData(data)
 	require.False(t, ok)

@@ -228,6 +228,24 @@ func (b *MemoryBroker) PublishLeave(ch string, info *ClientInfo) error {
 	return b.eventHandler.HandleLeave(ch, info)
 }
 
+var _ UserPresenceBroker = (*MemoryBroker)(nil)
+
+// PublishUserPresenceEnter - see UserPresenceBroker interface description.
+func (b *MemoryBroker) PublishUserPresenceEnter(ch string, userID string, info *ClientInfo) error {
+	if h, ok := b.eventHandler.(UserPresenceBrokerEventHandler); ok {
+		return h.HandleUserPresenceEnter(ch, userID, info)
+	}
+	return nil
+}
+
+// PublishUserPresenceLeave - see UserPresenceBroker interface description.
+func (b *MemoryBroker) PublishUserPresenceLeave(ch string, userID string, info *ClientInfo) error {
+	if h, ok := b.eventHandler.(UserPresenceBrokerEventHandler); ok {
+		return h.HandleUserPresenceLeave(ch, userID, info)
+	}
+	return nil
+}
+
 // Subscribe is noop here.
 func (b *MemoryBroker) Subscribe(_ ...string) error {
 	return nil

@@ -69,6 +69,25 @@ type BrokerEventHandler interface {
 	HandleLeave(ch string, info *ClientInfo) error
 }
 
+// UserPresenceBroker is an optional Broker extension that distributes
+// user-level presence events across all running nodes, mirroring the way
+// connection-level join/leave events are fanned out. The Node discovers this
+// capability with a type assertion, so existing Broker implementations keep
+// working unchanged (in that case user events are only delivered locally).
+type UserPresenceBroker interface {
+	// PublishUserPresenceEnter publishes a user-level enter event.
+	PublishUserPresenceEnter(ch string, userID string, info *ClientInfo) error
+	// PublishUserPresenceLeave publishes a user-level leave event.
+	PublishUserPresenceLeave(ch string, userID string, info *ClientInfo) error
+}
+
+// UserPresenceBrokerEventHandler receives user-level presence events coming
+// from the Broker PUB/SUB layer.
+type UserPresenceBrokerEventHandler interface {
+	HandleUserPresenceEnter(ch string, userID string, info *ClientInfo) error
+	HandleUserPresenceLeave(ch string, userID string, info *ClientInfo) error
+}
+
 // HistoryFilter allows filtering history according to fields set.
 type HistoryFilter struct {
 	// Since used to extract publications from stream since provided StreamPosition.
