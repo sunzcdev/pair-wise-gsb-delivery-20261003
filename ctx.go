@@ -28,6 +28,10 @@ type ProxyCtx struct {
 	Session   int64
 	certStore CertStorage
 	Proxy     *ProxyHttpServer
+
+	// respTrailerHooks holds the trailer hooks declared via
+	// DeclareResponseTrailer, emitted when the response body copy ends.
+	respTrailerHooks []ResponseTrailerHook
 }
 
 type RoundTripper interface {

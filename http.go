@@ -61,6 +61,13 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	if origBody != resp.Body {
 		resp.Header.Del("Content-Length")
 	}
+
+	// Arm the trailer hooks declared via DeclareResponseTrailer: this wraps
+	// the final body so hooks observe the bytes sent to the client, and
+	// drops Content-Length, which would make net/http silently drop the
+	// trailers. Bodiless responses (HEAD, 1xx, 204, 304) emit no trailers.
+	trailerHooks := armResponseTrailers(ctx, r, resp)
+
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
 	// Announce trailers known at this point (HTTP/1.1 with pre-announced
@@ -69,12 +76,8 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 	// frame (h2), which is required for any trailers to be forwarded.
 	// Mirrors net/http/httputil.ReverseProxy.
 	announcedTrailers := len(resp.Trailer)
-	if announcedTrailers > 0 {
-		trailerKeys := make([]string, 0, announcedTrailers)
-		for k := range resp.Trailer {
-			trailerKeys = append(trailerKeys, k)
-		}
-		w.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
+	if announcedTrailers > 0 || len(trailerHooks) > 0 {
+		w.Header().Add("Trailer", strings.Join(announcedTrailerKeys(resp.Trailer, trailerHooks), ", "))
 	}
 	w.WriteHeader(resp.StatusCode)
 
@@ -133,6 +136,15 @@ func (proxy *ProxyHttpServer) handleHttp(w http.ResponseWriter, r *http.Request)
 				}
 			}
 		}
+	}
+
+	// Run the declared trailer hooks exactly once, now that the final copy
+	// state is known, and emit the values they produced. Hooks that
+	// suppressed their value (e.g. DigestTrailer on an incomplete body)
+	// emit nothing. This must come after the upstream trailer block above:
+	// its copyHeaders call clears previously set header values.
+	for k, vs := range finishResponseTrailers(trailerHooks, ResponseEnd{BytesCopied: nr, Err: err}) {
+		w.Header()[k] = vs
 	}
 	ctx.Logf("Copied %v bytes to client error=%v", nr, err)
 }

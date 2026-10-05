@@ -180,6 +180,10 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 	resp = proxy.filterResponse(resp, ctx)
 	defer resp.Body.Close()
 
+	// Arm declared trailer hooks before headers are committed (see
+	// handleHttp in http.go): wraps the final body and drops Content-Length.
+	trailerHooks := armResponseTrailers(ctx, r, resp)
+
 	copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
 
 	// If the body was replaced by a filter, drop Content-Length so
@@ -190,16 +194,14 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 
 	// Announce pre-known trailers before WriteHeader (see handleHttp in http.go).
 	announcedTrailers := len(resp.Trailer)
-	if announcedTrailers > 0 {
-		trailerKeys := make([]string, 0, announcedTrailers)
-		for k := range resp.Trailer {
-			trailerKeys = append(trailerKeys, k)
-		}
-		w.Header().Add("Trailer", strings.Join(trailerKeys, ", "))
+	if announcedTrailers > 0 || len(trailerHooks) > 0 {
+		w.Header().Add("Trailer", strings.Join(announcedTrailerKeys(resp.Trailer, trailerHooks), ", "))
 	}
 
 	w.WriteHeader(resp.StatusCode)
 
+	var copied int64
+	var copyErr error
 	if resp.Body != nil {
 		if shouldFlushStreaming(resp) {
 			// Streaming (gRPC/Connect/SSE/chunked): flush each chunk so it reaches the
@@ -209,7 +211,10 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 			for {
 				nr, er := resp.Body.Read(buf)
 				if nr > 0 {
-					if _, ew := w.Write(buf[:nr]); ew != nil {
+					nw, ew := w.Write(buf[:nr])
+					copied += int64(nw)
+					if ew != nil {
+						copyErr = ew
 						ctx.Warnf("HTTP/2 MITM: error writing response body: %v", ew)
 						break
 					}
@@ -222,13 +227,19 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 					if er != io.EOF && !errors.Is(er, context.Canceled) {
 						ctx.Warnf("HTTP/2 MITM: error reading response body: %v", er)
 					}
+					if er != io.EOF {
+						copyErr = er
+					}
 					break
 				}
 			}
 		} else {
 			// Fixed-length response: let the h2 server batch writes for throughput.
-			if _, err := io.Copy(w, resp.Body); err != nil {
-				ctx.Warnf("HTTP/2 MITM: error writing response body: %v", err)
+			var err error
+			copied, err = io.Copy(w, resp.Body)
+			if err != nil {
+				copyErr = err
+				ctx.Warnf("HTTP/2 MITM: error copying response body: %v", err)
 			}
 		}
 	}
@@ -250,6 +261,14 @@ func (proxy *ProxyHttpServer) handleH2MitmStream(
 				}
 			}
 		}
+	}
+
+	// Run the declared trailer hooks exactly once with the final copy state
+	// and emit the values they produced (see handleHttp in http.go). This
+	// must come after the upstream trailer block above: its copyHeaders
+	// call clears previously set header values.
+	for k, vs := range finishResponseTrailers(trailerHooks, ResponseEnd{BytesCopied: copied, Err: copyErr}) {
+		w.Header()[k] = vs
 	}
 }
 

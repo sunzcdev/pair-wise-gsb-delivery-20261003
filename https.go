@@ -543,6 +543,23 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					resp = proxy.filterResponse(resp, ctx)
 					bodyModified := resp.Body != origBody
 					defer resp.Body.Close()
+
+					// Arm declared trailer hooks (see handleHttp in http.go).
+					// resp.Write only emits resp.Trailer for chunked responses,
+					// so force chunked framing and let a filler run the hooks at
+					// end of stream, storing their values into resp.Trailer for
+					// resp.Write to pick up after the body copy completes.
+					if trailerHooks := armResponseTrailers(ctx, ctx.Req, resp); len(trailerHooks) > 0 && resp.Body != nil {
+						resp.TransferEncoding = []string{"chunked"}
+						if resp.Trailer == nil {
+							resp.Trailer = make(http.Header)
+						}
+						for _, hook := range trailerHooks {
+							resp.Trailer[http.CanonicalHeaderKey(hook.TrailerName())] = nil
+						}
+						resp.Body = &trailerHookFiller{ReadCloser: resp.Body, hooks: trailerHooks, out: resp.Trailer}
+					}
+
 					if responseBodyAllowed(ctx.Req, resp) && resp.Body != http.NoBody && (bodyModified ||
 						(resp.ContentLength <= 0 && resp.Header.Get("Content-Length") == "")) {
 						// Return chunked encoded response when we don't know the length of the resp, if the body
