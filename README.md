@@ -209,3 +209,52 @@ func main() {
   req2.Header.Set("Authorization", cred.String())
 }
 ```
+
+## Server Side Validation
+
+`ServerValidator` verifies incoming digest responses. It is restricted to
+`qop=auth` and `SHA-256`, and it never generates nonces: nonce validity
+(issued/unexpired) is delegated to a callback, and nonce-count replay tracking
+is delegated to a `CounterStore`. The count is committed atomically only after
+the response digest is verified, so concurrent requests that present the same
+nonce count can succeed at most once.
+
+``` go
+validator := &digest.ServerValidator{
+    // Return the password, or a precomputed HA1 for this user/realm.
+    Lookup: func(username, realm string) (digest.Secret, error) {
+        if username != "foo" || realm != "test" {
+            return digest.Secret{}, digest.ErrUnknownUser
+        }
+        return digest.Secret{Password: "bar"}, nil
+    },
+    // Optional: reject expired or unknown nonces.
+    CheckNonce: func(nonce string) error {
+        if !nonces.Valid(nonce) {
+            return digest.ErrInvalidNonce
+        }
+        return nil
+    },
+    // In-memory store; swap for a shared store in a multi-instance deployment.
+    Counts: digest.NewMemoryCounterStore(),
+}
+
+// chal is the Challenge sent in WWW-Authenticate. The method and request target
+// come from the actual request, never from the Authorization header.
+result, err := validator.Validate(chal, req.Method, req.URL.RequestURI(), req.Header.Get("Authorization"))
+if err != nil {
+    var authErr *digest.AuthError
+    if errors.As(err, &authErr) {
+        switch {
+        case errors.Is(err, digest.ErrUnknownUser): // no such user
+        case errors.Is(err, digest.ErrBadDigest):   // wrong password/response
+        case errors.Is(err, digest.ErrReplay):      // reused nonce count
+        }
+    }
+    // respond with 401
+}
+_ = result // authenticated
+```
+
+`AuthError` messages never contain the password or the HA1 value. To implement
+your own replay store (e.g. Redis), satisfy the `CounterStore` interface.
