@@ -55,6 +55,48 @@ var validationErrors validator.ValidationErrors
 errors.As(err, &validationErrors)
  ```
 
+PATCH / Partial Update Validation
+-------
+
+`StructPartial` only receives a list of field names, which cannot express the
+difference between a field that was omitted and one that was explicitly sent
+as `null` (both collapse onto the zero value, and presence must never be
+inferred from a zero/non-zero check).
+
+`StructPatch` / `StructPatchCtx` validate an update using presence
+information plus the object's previous state:
+
+-   Only fields present in the request are validated; an explicit `null`
+    (including a nil pointer) is present and therefore still validated.
+-   `old` is the current object before the change. Cross-field rules
+    (`gtfield`, `required_if`, ...) resolve fields omitted from the request
+    against `old`, so patching only `End` still compares against the existing
+    `Start`.
+-   Presence is supplied as a `PatchFields` mask. Build it from a raw JSON
+    body with `PatchFieldsFromJSON`, or manually with `NewPatchFields`; keys
+    use Go field names and the same dotted/`[index]` notation as
+    `StructPartial`, eg. `Window.Start` or `Items[0].Name`.
+-   Custom field/struct level functions can type-assert their context to
+    `PatchFieldLevel` / `PatchLevel` to inspect presence (`IsPresent`) and
+    previous values (`OldField`, `OldTop`).
+-   Error namespaces point at the field the client submitted, or at the
+    submitted field whose cross-field rule failed.
+
+```go
+type Booking struct {
+    Window *struct {
+        Start *time.Time `validate:"required"`
+        End   *time.Time `validate:"required,gtfield=Start"`
+    } `validate:"required"`
+}
+
+fields, err := validator.PatchFieldsFromJSON(Booking{}, body)
+if err != nil { ... }
+
+// old is the record as stored before this PATCH
+err = validate.StructPatch(patch, old, fields)
+```
+
 Usage and documentation
 ------
 

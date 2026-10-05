@@ -139,6 +139,25 @@ used "eqcsfield" it could be multiple levels down. Example:
 	//       when calling validate.VarWithValue(val, field, tag) val will be
 	//       whatever you pass, struct, field...
 	//       when calling validate.Field(field, tag) val will be nil
+	//
+	// # PATCH validation
+	//
+	// StructPartial receives field names but cannot distinguish an omitted
+	// field from one explicitly sent as null, and presence must never be
+	// inferred from the zero value. StructPatch takes a PatchFields presence
+	// mask (built from a raw JSON body via PatchFieldsFromJSON) together with
+	// the object's previous state:
+	//
+	//   - only submitted fields are validated, while an explicit null (nil
+	//     pointer included) is still present and validated;
+	//   - cross-field tags resolve fields absent from the request against the
+	//     previous state, so patching only End compares against the existing
+	//     Start;
+	//   - custom functions may type-assert FieldLevel/StructLevel to
+	//     PatchFieldLevel/PatchLevel to call IsPresent, OldField and OldTop.
+	//
+	// 	fields, _ := validator.PatchFieldsFromJSON(MyStruct{}, body)
+	// 	err := validate.StructPatch(patch, current, fields)
 
 # Multiple Validators
 

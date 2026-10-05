@@ -28,10 +28,24 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+
+	// PATCH validation state (StructPatch), all inert for every other entry
+	// point so behaviour is byte-for-byte unchanged there.
+	patchFields   map[string]struct{} // full-namespaced present field paths
+	patchPrefixes map[string]struct{} // ancestor paths with present descendants
+	isPatch       bool
+	oldTop        reflect.Value // dereferenced previous state, or invalid
+	oldParent     reflect.Value // previous-state mirror of slflParent
+	oldField      reflect.Value // previous-state mirror of the current field
+	patchPrefixNs []byte        // struct namespace of the field-level parent
 }
 
-// parent and current will be the same the first run of validateStruct
-func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag) {
+// parent and current will be the same the first run of validateStruct.
+//
+// origParent / origCurrent are the previous-state ("old object") mirrors of
+// parent/current used by PATCH validation; they are invalid Values for all
+// other entry points.
+func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, origParent reflect.Value, origCurrent reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag) {
 	cs, ok := v.v.structCache.Get(typ)
 	if !ok {
 		cs = v.v.extractStructCache(current, typ.Name())
@@ -54,7 +68,11 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 			f = cs.fields[i]
 
 			if v.isPartial {
-				if v.ffn != nil {
+				if v.isPatch {
+					if !v.patchFieldPresent(structNs, f.name) {
+						continue
+					}
+				} else if v.ffn != nil {
 					// used with StructFiltered
 					if v.ffn(append(structNs, f.name...)) {
 						continue
@@ -69,7 +87,18 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 				}
 			}
 
-			v.traverseField(ctx, current, current.Field(f.idx), ns, structNs, f, f.cTags)
+			var origField reflect.Value
+			if v.isPatch {
+				v.oldField = reflect.Value{}
+				if origCurrent.IsValid() {
+					origField = origCurrent.Field(f.idx)
+					v.oldField = origField
+				}
+			}
+
+			// A field's immediate parent is this struct, so its old mirror is
+			// origCurrent.
+			v.traverseField(ctx, current, current.Field(f.idx), origCurrent, origField, ns, structNs, f, f.cTags)
 		}
 	}
 
@@ -77,6 +106,10 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 	// first iteration will have no info about nostructlevel tag, and is checked prior to
 	// calling the next iteration of validateStruct called from traverseField.
 	if cs.fn != nil {
+		if v.isPatch {
+			v.oldParent = origParent
+			v.patchPrefixNs = append(v.patchPrefixNs[0:0], structNs...)
+		}
 		v.slflParent = parent
 		v.slCurrent = current
 		v.ns = ns
@@ -87,11 +120,18 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 }
 
 // traverseField validates any field, be it a struct or single field, ensures it's validity and passes it along to be validated via it's tag options
-func (v *validate) traverseField(ctx context.Context, parent reflect.Value, current reflect.Value, ns []byte, structNs []byte, cf *cField, ct *cTag) {
+func (v *validate) traverseField(ctx context.Context, parent reflect.Value, current reflect.Value, origParent reflect.Value, origCurrent reflect.Value, ns []byte, structNs []byte, cf *cField, ct *cTag) {
 	var typ reflect.Type
 	var kind reflect.Kind
 
 	current, kind, v.fldIsPointer = v.extractTypeInternal(current, false)
+
+	if v.isPatch {
+		origCurrent = derefValue(origCurrent)
+		v.oldParent = origParent
+		v.oldField = origCurrent
+		v.patchPrefixNs = append(v.patchPrefixNs[0:0], structNs...)
+	}
 
 	var isNestedStruct bool
 
@@ -182,6 +222,11 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 
 	typ = current.Type()
 
+	if v.isPatch && (ct == nil || !ct.hasTag) && (kind == reflect.Slice || kind == reflect.Array || kind == reflect.Map) {
+		v.traversePatchCollection(ctx, parent, current, origParent, origCurrent, ns, structNs, cf, kind == reflect.Map, ct, nil)
+		return
+	}
+
 OUTER:
 	for {
 		if ct == nil || !ct.hasTag || (isNestedStruct && len(cf.name) == 0) {
@@ -198,7 +243,7 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.validateStruct(ctx, parent, current, origParent, origCurrent, typ, ns, structNs, ct)
 			}
 			return
 		}
@@ -220,7 +265,7 @@ OUTER:
 					structNs = append(append(structNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.validateStruct(ctx, parent, current, origParent, origCurrent, typ, ns, structNs, ct)
 			}
 			return
 
@@ -277,92 +322,16 @@ OUTER:
 
 		case typeDive:
 
-			ct = ct.next
-
-			// traverse slice or map here
-			// or panic ;)
-			switch kind {
-			case reflect.Slice, reflect.Array:
-
-				var i64 int64
-				reusableCF := &cField{}
-
-				for i := 0; i < current.Len(); i++ {
-					i64 = int64(i)
-
-					v.misc = append(v.misc[0:0], cf.name...)
-					v.misc = append(v.misc, '[')
-					v.misc = strconv.AppendInt(v.misc, i64, 10)
-					v.misc = append(v.misc, ']')
-
-					reusableCF.name = string(v.misc)
-
-					if cf.namesEqual {
-						reusableCF.altName = reusableCF.name
-					} else {
-						v.misc = append(v.misc[0:0], cf.altName...)
-						v.misc = append(v.misc, '[')
-						v.misc = strconv.AppendInt(v.misc, i64, 10)
-						v.misc = append(v.misc, ']')
-
-						reusableCF.altName = string(v.misc)
-					}
-					v.traverseField(ctx, parent, current.Index(i), ns, structNs, reusableCF, ct)
-				}
-
-			case reflect.Map:
-
-				var pv string
-				reusableCF := &cField{}
-
-				for _, key := range current.MapKeys() {
-					pv = fmt.Sprintf("%v", key)
-
-					v.misc = append(v.misc[0:0], cf.name...)
-					v.misc = append(v.misc, '[')
-					v.misc = append(v.misc, pv...)
-					v.misc = append(v.misc, ']')
-
-					reusableCF.name = string(v.misc)
-
-					if cf.namesEqual {
-						reusableCF.altName = reusableCF.name
-					} else {
-						v.misc = append(v.misc[0:0], cf.altName...)
-						v.misc = append(v.misc, '[')
-						v.misc = append(v.misc, pv...)
-						v.misc = append(v.misc, ']')
-
-						reusableCF.altName = string(v.misc)
-					}
-
-					if ct != nil && ct.typeof == typeKeys && ct.keys != nil {
-						v.traverseField(ctx, parent, key, ns, structNs, reusableCF, ct.keys)
-						// can be nil when just keys being validated
-						if ct.next != nil {
-							v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct.next)
-						} else {
-							// Struct fallback when map values are structs
-							val := current.MapIndex(key)
-							switch val.Kind() {
-							case reflect.Ptr:
-								if val.Elem().Kind() == reflect.Struct {
-									// Dive into the struct so its own tags run
-									v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil)
-								}
-							case reflect.Struct:
-								v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil)
-							}
-						}
-					} else {
-						v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct)
-					}
-				}
-
-			default:
+			if kind != reflect.Slice && kind != reflect.Array && kind != reflect.Map {
 				// throw error, if not a slice or map then should not have gotten here
 				// bad dive tag
 				panic("dive error! can't dive on a non slice or map")
+			}
+
+			if ct.next != nil && ct.next.typeof == typeKeys && ct.next.keys != nil {
+				v.traversePatchCollection(ctx, parent, current, origParent, origCurrent, ns, structNs, cf, kind == reflect.Map, ct.next.next, ct.next.keys)
+			} else {
+				v.traversePatchCollection(ctx, parent, current, origParent, origCurrent, ns, structNs, cf, kind == reflect.Map, ct.next, nil)
 			}
 
 			return
@@ -511,6 +480,117 @@ func appendAltName(ns []byte, altName string) string {
 		return string(ns[:n-1])
 	}
 	return string(ns)
+}
+
+// traversePatchCollection iterates the elements of a slice/array/map while
+// validating a PATCH. elementCTag is the tag chain applied to each value
+// (nil when the collection field has no tag). Elements absent from the patch
+// are skipped; previous-state mirrors are threaded through for cross-field
+// fallback.
+func (v *validate) traversePatchCollection(
+	ctx context.Context,
+	parent reflect.Value,
+	current reflect.Value,
+	origParent reflect.Value,
+	origCurrent reflect.Value,
+	ns []byte,
+	structNs []byte,
+	cf *cField,
+	isMap bool,
+	elementCTag *cTag,
+	keyCTag *cTag,
+) {
+	reusableCF := &cField{}
+
+	var origLen int
+	if !isMap && origCurrent.IsValid() && (origCurrent.Kind() == reflect.Slice || origCurrent.Kind() == reflect.Array) {
+		origLen = origCurrent.Len()
+	}
+
+	var origMap reflect.Value
+	if isMap && origCurrent.IsValid() && origCurrent.Kind() == reflect.Map {
+		origMap = origCurrent
+	}
+
+	buildName := func(index string) {
+		v.misc = append(v.misc[0:0], cf.name...)
+		v.misc = append(v.misc, '[')
+		v.misc = append(v.misc, index...)
+		v.misc = append(v.misc, ']')
+		reusableCF.name = string(v.misc)
+
+		if cf.namesEqual {
+			reusableCF.altName = reusableCF.name
+			return
+		}
+
+		v.misc = append(v.misc[0:0], cf.altName...)
+		v.misc = append(v.misc, '[')
+		v.misc = append(v.misc, index...)
+		v.misc = append(v.misc, ']')
+		reusableCF.altName = string(v.misc)
+	}
+
+	if !isMap {
+		var i64 int64
+		for i := 0; i < current.Len(); i++ {
+			i64 = int64(i)
+			index := strconv.AppendInt(v.misc[0:0], i64, 10)
+			buildName(string(index))
+
+			if v.isPatch {
+				if !v.patchElementPresent(structNs, reusableCF.name) {
+					continue
+				}
+			}
+
+			var origElem reflect.Value
+			if i < origLen {
+				origElem = origCurrent.Index(i)
+			}
+			v.traverseField(ctx, parent, current.Index(i), origParent, origElem, ns, structNs, reusableCF, elementCTag)
+		}
+		return
+	}
+
+	for _, key := range current.MapKeys() {
+		pv := fmt.Sprintf("%v", key)
+		buildName(pv)
+
+		if v.isPatch {
+			if !v.patchElementPresent(structNs, reusableCF.name) {
+				continue
+			}
+		}
+
+		if keyCTag != nil {
+			v.traverseField(ctx, parent, key, origParent, reflect.Value{}, ns, structNs, reusableCF, keyCTag)
+		}
+
+		var origVal reflect.Value
+		if origMap.IsValid() {
+			origVal = origMap.MapIndex(key)
+		}
+
+		val := current.MapIndex(key)
+
+		if elementCTag == nil {
+			// Struct fallback when map values carry no tag
+			switch val.Kind() {
+			case reflect.Ptr:
+				if val.Elem().Kind() == reflect.Struct {
+					v.traverseField(ctx, parent, val, origParent, origVal, ns, structNs, reusableCF, nil)
+				}
+			case reflect.Struct:
+				v.traverseField(ctx, parent, val, origParent, origVal, ns, structNs, reusableCF, nil)
+			default:
+				v.traverseField(ctx, parent, val, origParent, origVal, ns, structNs, reusableCF, elementCTag)
+			}
+			continue
+		}
+
+		v.traverseField(ctx, parent, val, origParent, origVal, ns, structNs, reusableCF, elementCTag)
+	}
 }
 
 func getValue(val reflect.Value) interface{} {

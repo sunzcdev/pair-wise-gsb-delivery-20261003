@@ -81,12 +81,60 @@ BEGIN:
 	}
 }
 
+// derefValue peels pointer and interface layers without applying Valuer or
+// custom type functions. It is used to keep the "old object" mirror of a
+// PATCH request aligned by Go structure (so FieldByName keeps working) even
+// when the new value gets transformed by a custom type extractor.
+func derefValue(current reflect.Value) reflect.Value {
+	for current.IsValid() {
+		switch current.Kind() {
+		case reflect.Ptr, reflect.Interface:
+			if current.IsNil() {
+				return current
+			}
+			current = current.Elem()
+		default:
+			return current
+		}
+	}
+	return current
+}
+
 // getStructFieldOKInternal traverses a struct to retrieve a specific field denoted by the provided namespace and
 // returns the field, field kind and whether is was successful in retrieving the field at all.
 //
 // NOTE: when not successful ok will be false, this can happen when a nested struct is nil and so the field
 // could not be retrieved because it didn't exist.
 func (v *validate) getStructFieldOKInternal(val reflect.Value, namespace string) (current reflect.Value, kind reflect.Kind, nullable bool, found bool) {
+	current, kind, nullable, found = v.lookupStructField(val, namespace)
+
+	// PATCH validation: cross-field rules must see the effective state, not a
+	// field that was simply omitted from the request. When the target field is
+	// absent from the patch, resolve the same path against the previous state
+	// ("old object") so, for example, patching only End still compares against
+	// the existing Start. An explicitly sent value — including explicit null,
+	// which leaves a nil pointer that lookup returns found=true for — always
+	// wins, so presence is never guessed from the value.
+	if v.isPatch && !v.patchTargetPresent(namespace) {
+		oldVal := v.patchOldBase(val)
+		if oldVal.IsValid() {
+			if oldCurrent, oldKind, oldNullable, oldFound := v.lookupStructField(oldVal, namespace); oldFound {
+				return oldCurrent, oldKind, oldNullable, true
+			}
+		}
+	}
+
+	return
+}
+
+// lookupStructField traverses a struct to retrieve a specific field denoted
+// by the provided namespace and returns the field, its kind, whether it is
+// nullable and whether retrieval succeeded.
+//
+// NOTE: when not successful ok will be false, this can happen when a nested
+// struct is nil and so the field could not be retrieved because it didn't
+// exist.
+func (v *validate) lookupStructField(val reflect.Value, namespace string) (current reflect.Value, kind reflect.Kind, nullable bool, found bool) {
 BEGIN:
 	current, kind, nullable = v.ExtractType(val)
 	if kind == reflect.Invalid {

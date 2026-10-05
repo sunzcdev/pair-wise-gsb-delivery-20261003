@@ -368,9 +368,10 @@ func (v *Validate) StructCtx(ctx context.Context, s interface{}) (err error) {
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = false
+	vd.isPatch = false
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, reflect.Value{}, reflect.Value{}, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -413,10 +414,11 @@ func (v *Validate) StructFilteredCtx(ctx context.Context, s interface{}, fn Filt
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = fn
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, reflect.Value{}, reflect.Value{}, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -461,6 +463,7 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = nil
 	vd.hasExcludes = false
 	vd.includeExclude = make(map[string]struct{})
@@ -502,7 +505,7 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 		}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, reflect.Value{}, reflect.Value{}, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -522,6 +525,97 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 // You will need to assert the error if it's not nil eg. err.(validator.ValidationErrors) to access the array of errors.
 func (v *Validate) StructExcept(s interface{}, fields ...string) error {
 	return v.StructExceptCtx(context.Background(), s, fields...)
+}
+
+// StructPatch validates the fields included in a PATCH-style update.
+//
+// Unlike StructPartial, fields carries presence information extracted from
+// the raw request (see PatchFieldsFromJSON): only fields the client actually
+// submitted are validated, so an omitted field and one explicitly sent as
+// null — including a nil pointer — are treated differently instead of both
+// collapsing onto the zero value.
+//
+// old is the object's current state before the change. It may be nil when no
+// previous state is available. Cross-field rules (gtfield, required_if,
+// custom GetStructFieldOK lookups, ...) reference the old state for fields
+// absent from the request, so patching only End still validates it against
+// the existing Start. Custom field and struct level functions can additionally
+// type-assert their context to PatchFieldLevel / PatchLevel to inspect
+// presence and previous values.
+//
+// Error namespaces always point at a field the client submitted, or at the
+// submitted field whose cross-field rule failed.
+//
+// It returns InvalidValidationError for bad values passed in and nil or
+// ValidationErrors as error otherwise.
+func (v *Validate) StructPatch(s interface{}, old interface{}, fields PatchFields) error {
+	return v.StructPatchCtx(context.Background(), s, old, fields)
+}
+
+// StructPatchCtx is the context.Context aware variant of StructPatch.
+func (v *Validate) StructPatchCtx(ctx context.Context, s interface{}, old interface{}, fields PatchFields) (err error) {
+	val := reflect.ValueOf(s)
+	top := val
+
+	if val.Kind() == reflect.Ptr && !val.IsNil() {
+		val = val.Elem()
+	}
+
+	if val.Kind() != reflect.Struct || val.Type().ConvertibleTo(timeType) {
+		return &InvalidValidationError{Type: reflect.TypeOf(s)}
+	}
+
+	var oldVal reflect.Value
+	if old != nil {
+		oldVal = reflect.ValueOf(old)
+		for oldVal.Kind() == reflect.Ptr {
+			if oldVal.IsNil() {
+				oldVal = reflect.Value{}
+				break
+			}
+			oldVal = oldVal.Elem()
+		}
+		if oldVal.IsValid() && (oldVal.Kind() != reflect.Struct || oldVal.Type().ConvertibleTo(timeType) || oldVal.Type() != val.Type()) {
+			return &InvalidValidationError{Type: reflect.TypeOf(old)}
+		}
+	}
+
+	// good to validate
+	vd := v.pool.Get().(*validate)
+	vd.top = top
+	vd.isPartial = true
+	vd.isPatch = true
+	vd.ffn = nil
+	vd.hasExcludes = false
+	vd.oldTop = oldVal
+	vd.oldParent = oldVal
+	vd.oldField = reflect.Value{}
+	vd.patchPrefixNs = vd.patchPrefixNs[0:0]
+
+	vd.patchFields = make(map[string]struct{}, len(fields))
+	vd.patchPrefixes = make(map[string]struct{}, len(fields)*2)
+	rootPrefix := val.Type().Name()
+	for f := range fields {
+		vd.patchFields[f] = struct{}{}
+		if rootPrefix != "" && !strings.HasPrefix(f, rootPrefix+".") {
+			full := rootPrefix + "." + f
+			vd.patchFields[full] = struct{}{}
+			registerPatchPrefixes(vd.patchPrefixes, full)
+		} else {
+			registerPatchPrefixes(vd.patchPrefixes, f)
+		}
+	}
+
+	vd.validateStruct(ctx, top, val, oldVal, oldVal, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+
+	if len(vd.errs) > 0 {
+		err = vd.errs
+		vd.errs = nil
+	}
+
+	v.pool.Put(vd)
+
+	return
 }
 
 // StructExceptCtx validates all fields except the ones passed in and allows passing of contextual
@@ -547,6 +641,7 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = nil
 	vd.hasExcludes = true
 	vd.includeExclude = make(map[string]struct{})
@@ -566,7 +661,7 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 		vd.includeExclude[string(vd.misc)] = struct{}{}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, reflect.Value{}, reflect.Value{}, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -620,7 +715,8 @@ func (v *Validate) VarCtx(ctx context.Context, field interface{}, tag string) (e
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
-	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, val, val, reflect.Value{}, reflect.Value{}, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -672,7 +768,8 @@ func (v *Validate) VarWithValueCtx(ctx context.Context, field interface{}, other
 	vd := v.pool.Get().(*validate)
 	vd.top = otherVal
 	vd.isPartial = false
-	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), reflect.Value{}, reflect.Value{}, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -730,7 +827,8 @@ func (v *Validate) VarWithKeyCtx(ctx context.Context, key string, field interfac
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
-	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], cField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, val, val, reflect.Value{}, reflect.Value{}, vd.ns[0:0], vd.actualNs[0:0], cField, ctag)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
