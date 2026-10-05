@@ -48,7 +48,7 @@ var testCases = []struct {
 	{File: "tests/tc20.ber", Error: "integer too large"}, // 9-byte INTEGER overflows int64
 	// Object identifiers
 	{File: "tests/tc21.ber", Error: "integer is not minimally encoded"}, // non-minimal base-128 arc
-	{File: "tests/tc22.ber", Error: "base 128 integer too large"},       // oversized base-128 arc
+	{File: "tests/tc22.ber", Error: ""},                                 // arc beyond int64, handled by the arbitrary-precision OID path
 	{File: "tests/tc23.ber", Error: errEOF},
 	{File: "tests/tc24.ber", Error: ""},
 	// Booleans

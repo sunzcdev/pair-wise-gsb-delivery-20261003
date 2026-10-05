@@ -10,6 +10,14 @@ All notable changes to this project are documented here. The format is based on
 - `NewIntegerErr`, `NewRealErr`, `NewOIDErr`, and `NewRelativeOIDErr`:
   error-returning variants of the existing constructors that report invalid
   input instead of panicking or returning `nil`.
+- Arbitrary-precision OID arcs: `OIDBigFromString`, `OIDBigToString`,
+  `EncodeOIDBig`, `DecodeOIDBig`, `EncodeRelativeOIDBig`, and
+  `DecodeRelativeOIDBig` encode and decode OBJECT IDENTIFIER and RELATIVE-OID
+  content with `*big.Int` arcs, so arcs beyond int64 round-trip losslessly.
+  The string-based constructors and the packet decoder use the same path;
+  encodings of previously representable OIDs are unchanged. Arcs are limited
+  to 512 bits each and 10000 arcs per OID, and empty, negative, non-minimally
+  encoded, and unterminated arcs are rejected.
 
 ### Changed
 
