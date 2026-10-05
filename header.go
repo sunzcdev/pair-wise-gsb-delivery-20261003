@@ -17,14 +17,6 @@ func parseHeaderWithParams(s string) (f string, params map[string]string, err er
 	return
 }
 
-func formatHeaderWithParams(f string, params map[string]string) string {
-	encParams := make(map[string]string)
-	for k, v := range params {
-		encParams[k] = encodeHeader(v)
-	}
-	return mime.FormatMediaType(f, encParams)
-}
-
 // HeaderFields iterates over header fields.
 type HeaderFields interface {
 	textproto.HeaderFields
@@ -55,7 +47,7 @@ type Header struct {
 // HeaderFromMap creates a header from a map of header fields.
 //
 // This function is provided for interoperability with the standard library.
-// If possible, ReadHeader should be used instead to avoid loosing information.
+// If possible, ReadHeader should be used to avoid loosing information.
 // The map representation looses the ordering of the fields, the capitalization
 // of the header keys, and the whitespace of the original header.
 func HeaderFromMap(m map[string][]string) Header {
@@ -74,8 +66,12 @@ func (h *Header) ContentType() (t string, params map[string]string, err error) {
 }
 
 // SetContentType formats the Content-Type header field.
-func (h *Header) SetContentType(t string, params map[string]string) {
-	h.Set("Content-Type", formatHeaderWithParams(t, params))
+//
+// Parameters containing non-ASCII characters are encoded using RFC 2231 and
+// split across continuation lines so that every physical header line respects
+// the parameter line length budget configured via WithParameterLineLen.
+func (h *Header) SetContentType(t string, params map[string]string, opts ...Option) {
+	h.setMediaTypeField("Content-Type", t, params, opts)
 }
 
 // ContentDisposition parses the Content-Disposition header field, as defined in
@@ -86,8 +82,13 @@ func (h *Header) ContentDisposition() (disp string, params map[string]string, er
 
 // SetContentDisposition formats the Content-Disposition header field, as
 // defined in RFC 2183.
-func (h *Header) SetContentDisposition(disp string, params map[string]string) {
-	h.Set("Content-Disposition", formatHeaderWithParams(disp, params))
+//
+// Parameters containing non-ASCII characters are encoded using RFC 2231 and
+// split across continuation lines so that every physical header line respects
+// the parameter line length budget configured via WithParameterLineLen. A
+// plain ASCII fallback is emitted alongside each extended parameter.
+func (h *Header) SetContentDisposition(disp string, params map[string]string, opts ...Option) {
+	h.setMediaTypeField("Content-Disposition", disp, params, opts)
 }
 
 // Text parses a plaintext header field. The field charset is automatically

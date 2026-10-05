@@ -40,11 +40,11 @@ type Writer struct {
 }
 
 // CreateWriter writes a mail header to w and creates a new Writer.
-func CreateWriter(w io.Writer, header Header) (*Writer, error) {
+func CreateWriter(w io.Writer, header Header, opts ...message.Option) (*Writer, error) {
 	header = header.Copy() // don't modify the caller's view
 	header.Set("Content-Type", "multipart/mixed")
 
-	mw, err := message.CreateWriter(w, header.Header)
+	mw, err := message.CreateWriter(w, header.Header, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -55,11 +55,11 @@ func CreateWriter(w io.Writer, header Header) (*Writer, error) {
 // CreateInlineWriter writes a mail header to w. The mail will contain an
 // inline part, allowing to represent the same text in different formats.
 // Attachments cannot be included.
-func CreateInlineWriter(w io.Writer, header Header) (*InlineWriter, error) {
+func CreateInlineWriter(w io.Writer, header Header, opts ...message.Option) (*InlineWriter, error) {
 	header = header.Copy() // don't modify the caller's view
 	header.Set("Content-Type", "multipart/alternative")
 
-	mw, err := message.CreateWriter(w, header.Header)
+	mw, err := message.CreateWriter(w, header.Header, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -71,10 +71,10 @@ func CreateInlineWriter(w io.Writer, header Header) (*InlineWriter, error) {
 // single inline part. The body of the part should be written to the returned
 // io.WriteCloser. Only one single inline part should be written, use
 // CreateWriter if you want multiple parts.
-func CreateSingleInlineWriter(w io.Writer, header Header) (io.WriteCloser, error) {
+func CreateSingleInlineWriter(w io.Writer, header Header, opts ...message.Option) (io.WriteCloser, error) {
 	header = header.Copy() // don't modify the caller's view
 	initInlineContentTransferEncoding(&header.Header)
-	return message.CreateWriter(w, header.Header)
+	return message.CreateWriter(w, header.Header, opts...)
 }
 
 // CreateInline creates a InlineWriter. One or more parts representing the same
@@ -94,18 +94,18 @@ func (w *Writer) CreateInline() (*InlineWriter, error) {
 // The body of the part should be written to the returned io.WriteCloser. Only
 // one single text part should be written, use CreateInline if you want multiple
 // text parts.
-func (w *Writer) CreateSingleInline(h InlineHeader) (io.WriteCloser, error) {
+func (w *Writer) CreateSingleInline(h InlineHeader, opts ...message.Option) (io.WriteCloser, error) {
 	h = InlineHeader{h.Header.Copy()} // don't modify the caller's view
 	initInlineHeader(&h)
-	return w.mw.CreatePart(h.Header)
+	return w.mw.CreatePart(h.Header, opts...)
 }
 
 // CreateAttachment creates a new attachment with the provided header. The body
 // of the part should be written to the returned io.WriteCloser.
-func (w *Writer) CreateAttachment(h AttachmentHeader) (io.WriteCloser, error) {
+func (w *Writer) CreateAttachment(h AttachmentHeader, opts ...message.Option) (io.WriteCloser, error) {
 	h = AttachmentHeader{h.Header.Copy()} // don't modify the caller's view
 	initAttachmentHeader(&h)
-	return w.mw.CreatePart(h.Header)
+	return w.mw.CreatePart(h.Header, opts...)
 }
 
 // Close finishes the Writer.
@@ -120,10 +120,10 @@ type InlineWriter struct {
 
 // CreatePart creates a new text part with the provided header. The body of the
 // part should be written to the returned io.WriteCloser.
-func (w *InlineWriter) CreatePart(h InlineHeader) (io.WriteCloser, error) {
+func (w *InlineWriter) CreatePart(h InlineHeader, opts ...message.Option) (io.WriteCloser, error) {
 	h = InlineHeader{h.Header.Copy()} // don't modify the caller's view
 	initInlineHeader(&h)
-	return w.mw.CreatePart(h.Header)
+	return w.mw.CreatePart(h.Header, opts...)
 }
 
 // Close finishes the InlineWriter.

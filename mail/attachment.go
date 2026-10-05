@@ -28,7 +28,12 @@ func (h *AttachmentHeader) Filename() (string, error) {
 }
 
 // SetFilename formats the attachment's filename.
-func (h *AttachmentHeader) SetFilename(filename string) {
+//
+// Non-ASCII filenames are encoded using RFC 2231 and split across
+// continuation lines according to the parameter line length budget, which can
+// be configured via message.WithParameterLineLen. A plain ASCII fallback
+// filename is emitted as well.
+func (h *AttachmentHeader) SetFilename(filename string, opts ...message.Option) {
 	dispParams := map[string]string{"filename": filename}
-	h.SetContentDisposition("attachment", dispParams)
+	h.SetContentDisposition("attachment", dispParams, opts...)
 }

@@ -53,7 +53,7 @@ func (m *multipartBody) Read(p []byte) (n int, err error) {
 		m.r = r
 
 		var err error
-		m.w, err = createWriter(w, &m.header)
+		m.w, err = createWriter(w, &m.header, nil)
 		if err != nil {
 			return 0, err
 		}

@@ -125,6 +125,36 @@ func (h *Header) AddRaw(kv []byte) {
 	h.m[k] = append(h.m[k], f)
 }
 
+// SetRaw sets the header fields associated with key to the single raw field,
+// replacing any existing values associated with key. Like AddRaw, the supplied
+// byte slice should be a complete field in the "Key: Value" form including
+// trailing CRLF. The new field is inserted at the top of the header, matching
+// Set semantics.
+func (h *Header) SetRaw(kv []byte) {
+	colon := bytes.IndexByte(kv, ':')
+	if colon == -1 {
+		panic("textproto: Header.SetRaw: missing colon")
+	}
+	k := textproto.CanonicalMIMEHeaderKey(string(trim(kv[:colon])))
+	v := trimAroundNewlines(kv[colon+1:])
+
+	if h.m == nil {
+		h.m = make(map[string][]*headerField)
+	}
+
+	// Remove existing fields with the same key.
+	delete(h.m, k)
+	for i := len(h.l) - 1; i >= 0; i-- {
+		if h.l[i].k == k {
+			h.l = append(h.l[:i], h.l[i+1:]...)
+		}
+	}
+
+	f := newHeaderField(k, v, kv)
+	h.l = append(h.l, f)
+	h.m[k] = append(h.m[k], f)
+}
+
 // Add adds the key, value pair to the header. It prepends to any existing
 // fields associated with key.
 //

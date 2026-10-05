@@ -25,7 +25,7 @@ type Writer struct {
 
 // createWriter creates a new Writer writing to w with the provided header.
 // Nothing is written to w when it is called. header is modified in-place.
-func createWriter(w io.Writer, header *Header) (*Writer, error) {
+func createWriter(w io.Writer, header *Header, opts []Option) (*Writer, error) {
 	ww := &Writer{w: w}
 
 	mediaType, mediaParams, _ := header.ContentType()
@@ -41,7 +41,7 @@ func createWriter(w io.Writer, header *Header) (*Writer, error) {
 			ww.mw.SetBoundary(mediaParams["boundary"])
 		} else {
 			mediaParams["boundary"] = ww.mw.Boundary()
-			header.SetContentType(mediaType, mediaParams)
+			header.SetContentType(mediaType, mediaParams, opts...)
 		}
 
 		header.Del("Content-Transfer-Encoding")
@@ -68,7 +68,7 @@ func createWriter(w io.Writer, header *Header) (*Writer, error) {
 // CreateWriter creates a new message writer to w. If header contains an
 // encoding, data written to the Writer will automatically be encoded with it.
 // The charset needs to be utf-8 or us-ascii.
-func CreateWriter(w io.Writer, header Header) (*Writer, error) {
+func CreateWriter(w io.Writer, header Header, opts ...Option) (*Writer, error) {
 	// Ensure that modifications are invisible to the caller
 	header = header.Copy()
 
@@ -77,7 +77,9 @@ func CreateWriter(w io.Writer, header Header) (*Writer, error) {
 		header.Set("MIME-Version", "1.0")
 	}
 
-	ww, err := createWriter(w, &header)
+	applyParameterOptions(&header, opts)
+
+	ww, err := createWriter(w, &header, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +87,33 @@ func CreateWriter(w io.Writer, header Header) (*Writer, error) {
 		return nil, err
 	}
 	return ww, nil
+}
+
+// applyParameterOptions reformats Content-Type and Content-Disposition fields
+// using the provided formatting options, so that extended parameters are
+// split into RFC 2231 continuations even when a header was built via Set.
+func applyParameterOptions(header *Header, opts []Option) {
+	if len(opts) == 0 {
+		return
+	}
+	o := resolveOptions(opts)
+	for _, field := range []struct {
+		key string
+		get func() (string, map[string]string, error)
+		set func(string, map[string]string, ...Option)
+	}{
+		{"Content-Type", header.ContentType, header.SetContentType},
+		{"Content-Disposition", header.ContentDisposition, header.SetContentDisposition},
+	} {
+		if !header.Has(field.key) {
+			continue
+		}
+		value, params, err := field.get()
+		if err != nil {
+			continue
+		}
+		field.set(value, params, WithParameterLineLen(o.paramLineLen))
+	}
 }
 
 // Write implements io.Writer.
@@ -103,7 +132,7 @@ func (w *Writer) Close() error {
 // CreatePart returns a Writer to a new part in this multipart entity. If this
 // entity is not multipart, it fails. The body of the part should be written to
 // the returned io.WriteCloser.
-func (w *Writer) CreatePart(header Header) (*Writer, error) {
+func (w *Writer) CreatePart(header Header, opts ...Option) (*Writer, error) {
 	if w.mw == nil {
 		return nil, errors.New("cannot create a part in a non-multipart message")
 	}
@@ -120,7 +149,8 @@ func (w *Writer) CreatePart(header Header) (*Writer, error) {
 
 	// ensure that modifications are invisible to the caller
 	header = header.Copy()
-	cw, err := createWriter(ww, &header)
+	applyParameterOptions(&header, opts)
+	cw, err := createWriter(ww, &header, opts)
 	if err != nil {
 		return nil, err
 	}

@@ -322,6 +322,32 @@ func TestHeader_AddRaw(t *testing.T) {
 	}
 }
 
+func TestHeader_SetRaw(t *testing.T) {
+	h := newTestHeader()
+	h.AddRaw([]byte("X-Foo: one\r\n"))
+	h.AddRaw([]byte("X-Foo: two\r\n"))
+
+	h.SetRaw([]byte("X-Foo: replaced\r\n ; continuation\r\n"))
+
+	if v := h.Get("X-Foo"); v != "replaced ; continuation" {
+		t.Errorf("Get returned wrong value: %q", v)
+	}
+
+	// SetRaw must replace every field with the same key.
+	if fields := h.Values("X-Foo"); len(fields) != 1 {
+		t.Errorf("expected a single X-Foo field, got %d: %q", len(fields), fields)
+	}
+
+	// Like Set, the new field is inserted at the top of the header.
+	var b bytes.Buffer
+	if err := WriteHeader(&b, h); err != nil {
+		t.Fatalf("WriteHeader() returned error: %v", err)
+	}
+	if !strings.HasPrefix(b.String(), "X-Foo: replaced\r\n ; continuation\r\n") {
+		t.Errorf("SetRaw field should be written first, got:\n%s", b.String())
+	}
+}
+
 func TestWriteHeader(t *testing.T) {
 	h := newTestHeader()
 
