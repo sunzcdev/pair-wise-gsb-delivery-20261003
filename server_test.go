@@ -484,6 +484,188 @@ func TestUpgrader(t *testing.T) {
 	}
 }
 
+func makeUpgradeRequestBytes(protocols []string) []byte {
+	var buf bytes.Buffer
+	buf.WriteString("GET /ws HTTP/1.1\r\n")
+	buf.WriteString("Host: example.org\r\n")
+	buf.WriteString("Upgrade: websocket\r\n")
+	buf.WriteString("Connection: Upgrade\r\n")
+	buf.WriteString("Sec-WebSocket-Version: 13\r\n")
+	buf.WriteString("Sec-WebSocket-Key: ")
+	buf.Write(mustMakeNonce())
+	buf.WriteString("\r\n")
+	for _, p := range protocols {
+		buf.WriteString("Sec-WebSocket-Protocol: ")
+		buf.WriteString(p)
+		buf.WriteString("\r\n")
+	}
+	buf.WriteString("\r\n")
+	return buf.Bytes()
+}
+
+func checkUpgradeResponsePrefix(t *testing.T, resp []byte, wantErr error) {
+	t.Helper()
+	is101 := bytes.HasPrefix(resp, []byte("HTTP/1.1 101"))
+	if wantErr == nil && !is101 {
+		t.Errorf("expected 101 response; got:\n%s", resp)
+	}
+	if wantErr != nil && is101 {
+		t.Errorf("expected non-101 response; got:\n%s", resp)
+	}
+}
+
+func TestUpgraderProtocolsPreference(t *testing.T) {
+	for _, test := range []struct {
+		label        string
+		offer        []string // Sec-WebSocket-Protocol header lines.
+		prefer       []string
+		reject       bool
+		wantProtocol string
+		wantErr      error
+	}{
+		{
+			label:        "server_preference_order",
+			offer:        []string{"a, b, c"},
+			prefer:       []string{"c", "b"},
+			wantProtocol: "c",
+		},
+		{
+			label:        "multiple_header_lines",
+			offer:        []string{"a", "b, c"},
+			prefer:       []string{"c", "a"},
+			wantProtocol: "c",
+		},
+		{
+			label:        "duplicate_tokens",
+			offer:        []string{"a, a, b, b"},
+			prefer:       []string{"b", "a"},
+			wantProtocol: "b",
+		},
+		{
+			label:        "empty_tokens",
+			offer:        []string{"a,, ,b", ""},
+			prefer:       []string{"b"},
+			wantProtocol: "b",
+		},
+		{
+			label:        "case_insensitive_match",
+			offer:        []string{"Chat, other"},
+			prefer:       []string{"chat"},
+			wantProtocol: "Chat",
+		},
+		{
+			label:        "no_common_accept",
+			offer:        []string{"a, b"},
+			prefer:       []string{"x", "y"},
+			wantProtocol: "",
+		},
+		{
+			label:   "no_common_reject",
+			offer:   []string{"a, b"},
+			prefer:  []string{"x", "y"},
+			reject:  true,
+			wantErr: ErrHandshakeNoCommonProtocol,
+		},
+		{
+			label:   "no_offer_reject",
+			prefer:  []string{"x"},
+			reject:  true,
+			wantErr: ErrHandshakeNoCommonProtocol,
+		},
+		{
+			label:   "malformed",
+			offer:   []string{"=["},
+			prefer:  []string{"a"},
+			wantErr: ErrMalformedRequest,
+		},
+	} {
+		t.Run(test.label, func(t *testing.T) {
+			req := makeUpgradeRequestBytes(test.offer)
+
+			// Raw Upgrader.
+			conn := bytes.NewBuffer(append([]byte(nil), req...))
+			u := Upgrader{
+				Protocols:              test.prefer,
+				RejectNoCommonProtocol: test.reject,
+			}
+			hs, err := u.Upgrade(conn)
+			if err != test.wantErr {
+				t.Fatalf("Upgrader: got error %v; want %v", err, test.wantErr)
+			}
+			if hs.Protocol != test.wantProtocol {
+				t.Errorf("Upgrader: got protocol %q; want %q", hs.Protocol, test.wantProtocol)
+			}
+			checkUpgradeResponsePrefix(t, conn.Bytes(), test.wantErr)
+
+			// HTTPUpgrader.
+			hreq, rerr := http.ReadRequest(bufio.NewReader(bytes.NewReader(req)))
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			hu := HTTPUpgrader{
+				Protocols:              test.prefer,
+				RejectNoCommonProtocol: test.reject,
+			}
+			res := newRecorder()
+			_, _, hhs, herr := hu.Upgrade(hreq, res)
+			if herr != test.wantErr {
+				t.Fatalf("HTTPUpgrader: got error %v; want %v", herr, test.wantErr)
+			}
+			if hhs.Protocol != test.wantProtocol {
+				t.Errorf("HTTPUpgrader: got protocol %q; want %q", hhs.Protocol, test.wantProtocol)
+			}
+			checkUpgradeResponsePrefix(t, res.Bytes(), test.wantErr)
+		})
+	}
+}
+
+func TestUpgraderProtocolConfigConflict(t *testing.T) {
+	req := makeUpgradeRequestBytes([]string{"a"})
+
+	// Raw Upgrader with Protocol callback.
+	conn := bytes.NewBuffer(req)
+	u := Upgrader{
+		Protocol:  func([]byte) bool { return true },
+		Protocols: []string{"a"},
+	}
+	if _, err := u.Upgrade(conn); err != ErrProtocolConfigConflict {
+		t.Fatalf("Upgrader: got error %v; want %v", err, ErrProtocolConfigConflict)
+	}
+	if bytes.HasPrefix(conn.Bytes(), []byte("HTTP/1.1 101")) {
+		t.Errorf("Upgrader: unexpected 101 response:\n%s", conn.Bytes())
+	}
+
+	// Raw Upgrader with ProtocolCustom callback.
+	conn = bytes.NewBuffer(req)
+	uc := Upgrader{
+		ProtocolCustom: func([]byte) (string, bool) { return "a", true },
+		Protocols:      []string{"a"},
+	}
+	if _, err := uc.Upgrade(conn); err != ErrProtocolConfigConflict {
+		t.Fatalf("Upgrader (custom): got error %v; want %v", err, ErrProtocolConfigConflict)
+	}
+	if bytes.HasPrefix(conn.Bytes(), []byte("HTTP/1.1 101")) {
+		t.Errorf("Upgrader (custom): unexpected 101 response:\n%s", conn.Bytes())
+	}
+
+	// HTTPUpgrader.
+	hreq, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(req)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hu := HTTPUpgrader{
+		Protocol:  func(string) bool { return true },
+		Protocols: []string{"a"},
+	}
+	res := newRecorder()
+	if _, _, _, err := hu.Upgrade(hreq, res); err != ErrProtocolConfigConflict {
+		t.Fatalf("HTTPUpgrader: got error %v; want %v", err, ErrProtocolConfigConflict)
+	}
+	if bytes.HasPrefix(res.Bytes(), []byte("HTTP/1.1 101")) {
+		t.Errorf("HTTPUpgrader: unexpected 101 response:\n%s", res.Bytes())
+	}
+}
+
 func BenchmarkHTTPUpgrader(b *testing.B) {
 	for _, bench := range upgradeCases {
 		bench.req.Header.Set(headerSecKey, string(bench.nonce[:]))

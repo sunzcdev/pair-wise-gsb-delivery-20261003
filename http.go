@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/gobwas/httphead"
 )
@@ -212,6 +213,44 @@ func btsSelectProtocol(h []byte, check func([]byte) bool) (ret string, ok bool) 
 		return string(selected), true
 	}
 	return ret, ok
+}
+
+// selectProtocol returns the most preferred server subprotocol that is also
+// offered by the client. The comparison is case-insensitive and the returned
+// value is the token exactly as it was offered by the client.
+func selectProtocol(prefer, offered []string) string {
+	for _, p := range prefer {
+		for _, o := range offered {
+			if strings.EqualFold(p, o) {
+				return o
+			}
+		}
+	}
+	return ""
+}
+
+// appendProtocolTokens scans comma-separated subprotocol tokens from h and
+// appends them to offered. Empty tokens are skipped and duplicate tokens are
+// ignored (compared case-insensitively). It returns false if h is malformed.
+func appendProtocolTokens(offered []string, h []byte) ([]string, bool) {
+	if len(btrim(h)) == 0 {
+		// Empty header value means that no tokens were offered.
+		return offered, true
+	}
+	ok := httphead.ScanTokens(h, func(v []byte) bool {
+		offered = appendProtocolToken(offered, v)
+		return true
+	})
+	return offered, ok
+}
+
+func appendProtocolToken(offered []string, token []byte) []string {
+	for _, o := range offered {
+		if strings.EqualFold(o, btsToString(token)) {
+			return offered
+		}
+	}
+	return append(offered, string(token))
 }
 
 func btsSelectExtensions(h []byte, selected []httphead.Option, check func(httphead.Option) bool) ([]httphead.Option, bool) {
