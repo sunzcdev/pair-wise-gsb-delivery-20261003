@@ -3,6 +3,7 @@ package fasthttp
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -497,6 +498,50 @@ func (c *Client) DoDeadline(req *Request, resp *Response, deadline time.Time) er
 	if req.timeout <= 0 {
 		return ErrTimeout
 	}
+	return c.Do(req, resp)
+}
+
+// DoContext performs the given request using the given context.
+//
+// The context controls the entire lifetime of the request: waiting for a
+// free connection, establishing the connection (including the TLS
+// handshake), sending the request and reading the response headers and
+// body. A cancelled request is removed from the connection wait queue and
+// its connection is closed, so cancellation never affects connections
+// already returned to the pool or used by subsequent requests.
+//
+// If ctx has a deadline, the earlier of the context deadline and the
+// timeout set via Request.SetTimeout, DoTimeout or DoDeadline applies.
+// Client.ReadTimeout and Client.WriteTimeout still apply as well.
+//
+// If the context is cancelled, the returned error is ctx.Err()
+// (context.Canceled or context.DeadlineExceeded).
+//
+// For streaming responses (Response.StreamBody or
+// HostClient.StreamResponseBody), the context remains in effect until the
+// response body stream is closed. The caller must close the body stream
+// (Response.CloseBodyStream) to release the connection; cancelling the
+// context before closing the stream aborts the stream and closes the
+// connection.
+//
+// Request must contain at least non-zero RequestURI with full url (including
+// scheme and host) or non-zero Host header + RequestURI.
+//
+// The function doesn't follow redirects. Use Get* for following redirects.
+//
+// Response is ignored if resp is nil.
+//
+// It is recommended obtaining req and resp via AcquireRequest
+// and AcquireResponse in performance-critical code.
+func (c *Client) DoContext(ctx context.Context, req *Request, resp *Response) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	req.ctx = ctx
+	defer func() { req.ctx = nil }()
 	return c.Do(req, resp)
 }
 
@@ -1585,6 +1630,53 @@ func (c *HostClient) DoDeadline(req *Request, resp *Response, deadline time.Time
 	return c.Do(req, resp)
 }
 
+// DoContext performs the given request using the given context.
+//
+// The context controls the entire lifetime of the request: waiting for a
+// free connection, establishing the connection (including the TLS
+// handshake), sending the request and reading the response headers and
+// body. A cancelled request is removed from the connection wait queue and
+// its connection is closed, so cancellation never affects connections
+// already returned to the pool or used by subsequent requests.
+//
+// If ctx has a deadline, the earlier of the context deadline and the
+// timeout set via Request.SetTimeout, DoTimeout or DoDeadline applies.
+// HostClient.ReadTimeout and HostClient.WriteTimeout still apply as well.
+//
+// If the context is cancelled, the returned error is ctx.Err()
+// (context.Canceled or context.DeadlineExceeded).
+//
+// For streaming responses (Response.StreamBody or
+// HostClient.StreamResponseBody), the context remains in effect until the
+// response body stream is closed. The caller must close the body stream
+// (Response.CloseBodyStream) to release the connection; cancelling the
+// context before closing the stream aborts the stream and closes the
+// connection.
+//
+// Request must contain at least non-zero RequestURI with full url (including
+// scheme and host) or non-zero Host header + RequestURI.
+//
+// The function doesn't follow redirects. Use Get* for following redirects.
+//
+// Response is ignored if resp is nil.
+//
+// ErrNoFreeConns is returned if all HostClient.MaxConns connections
+// to the host are busy.
+//
+// It is recommended obtaining req and resp via AcquireRequest
+// and AcquireResponse in performance-critical code.
+func (c *HostClient) DoContext(ctx context.Context, req *Request, resp *Response) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	req.ctx = ctx
+	defer func() { req.ctx = nil }()
+	return c.Do(req, resp)
+}
+
 // DoRedirects performs the given http request and fills the given http response,
 // following up to maxRedirectsCount redirects. When the redirect count exceeds
 // maxRedirectsCount, ErrTooManyRedirects is returned.
@@ -1667,6 +1759,14 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		retry, err = c.do(req, resp)
 		if err == nil || !retry {
 			break
+		}
+
+		// Don't retry requests whose context has been cancelled.
+		if reqCtx := req.ctx; reqCtx != nil {
+			if ctxErr := reqCtx.Err(); ctxErr != nil {
+				err = ctxErr
+				break
+			}
 		}
 
 		if hasBodyStream {
@@ -1842,6 +1942,12 @@ func (c *HostClient) SetMaxConns(newMaxConns int) {
 }
 
 func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
+	return c.acquireConn(context.Background(), reqTimeout, connectionClose)
+}
+
+// acquireConn is like AcquireConn but additionally respects ctx while
+// waiting for a free connection and while dialing.
+func (c *HostClient) acquireConn(ctx context.Context, reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
 	createConn := false
 	startCleaner := false
 
@@ -1901,6 +2007,12 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 			timeout = reqTimeout
 			timeoutOverridden = true
 		}
+		if ctxDeadline, ok := ctx.Deadline(); ok {
+			if d := time.Until(ctxDeadline); d < timeout {
+				timeout = d
+				timeoutOverridden = true
+			}
+		}
 
 		// wait for a free connection
 		tc := AcquireTimer(timeout)
@@ -1920,7 +2032,14 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		select {
 		case <-w.ready:
 			return w.conn, w.err
+		case <-ctx.Done():
+			err = ctx.Err()
+			return nil, err
 		case <-tc.C:
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				return nil, err
+			}
 			if timeoutOverridden {
 				return nil, ErrTimeout
 			}
@@ -1932,7 +2051,7 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		go c.connsCleaner()
 	}
 
-	conn, err := c.dialHostHard(reqTimeout)
+	conn, err := c.dialHostHardCtx(ctx, reqTimeout)
 	if err != nil {
 		c.decConnsCount()
 		return nil, err
@@ -2287,6 +2406,53 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 	return nil, err
 }
 
+// dialHostHardCtx is like dialHostHard but aborts the dial (including the
+// TLS handshake) when ctx is cancelled. The dial itself keeps running in
+// the background; its result connection is closed once it returns.
+func (c *HostClient) dialHostHardCtx(ctx context.Context, dialTimeout time.Duration) (conn net.Conn, err error) {
+	if ctx.Done() == nil {
+		return c.dialHostHard(dialTimeout)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if d := time.Until(ctxDeadline); d <= 0 {
+			// ctx.Err() may not be updated yet even though the deadline
+			// has already passed.
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.DeadlineExceeded
+		} else if dialTimeout <= 0 || d < dialTimeout {
+			dialTimeout = d
+		}
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan dialResult, 1)
+	go func() {
+		conn, err := c.dialHostHard(dialTimeout)
+		ch <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.conn, res.err
+	case <-ctx.Done():
+		go func() {
+			res := <-ch
+			if res.conn != nil {
+				res.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
 func (c *HostClient) cachedTLSConfig(addr string) (*tls.Config, error) {
 	c.tlsConfigMapLock.Lock()
 	if c.tlsConfigMap == nil {
@@ -2458,6 +2624,7 @@ func (w *wantConn) tryDeliver(conn *clientConn, err error) bool {
 // If a connection has been delivered already, cancel returns it with c.releaseConn.
 func (w *wantConn) cancel(c *HostClient, err error) {
 	w.mu.Lock()
+	waiting := w.conn == nil && w.err == nil
 	if w.conn == nil && w.err == nil {
 		close(w.ready) // catch misbehavior in future delivery
 	}
@@ -2469,6 +2636,16 @@ func (w *wantConn) cancel(c *HostClient, err error) {
 
 	if conn != nil {
 		c.ReleaseConn(conn)
+		return
+	}
+	if waiting {
+		// The request was cancelled while still queued, so it must not
+		// stay in the connection wait queue.
+		c.connsLock.Lock()
+		if q := c.connsWait; q != nil {
+			q.remove(w)
+		}
+		c.connsLock.Unlock()
 	}
 }
 
@@ -2526,6 +2703,22 @@ func (q *wantConnQueue) peekFront() *wantConn {
 		return q.tail[0]
 	}
 	return nil
+}
+
+// remove deletes w from the queue if it is still queued.
+func (q *wantConnQueue) remove(w *wantConn) {
+	for i := q.headPos; i < len(q.head); i++ {
+		if q.head[i] == w {
+			q.head = append(q.head[:i], q.head[i+1:]...)
+			return
+		}
+	}
+	for i := 0; i < len(q.tail); i++ {
+		if q.tail[i] == w {
+			q.tail = append(q.tail[:i], q.tail[i+1:]...)
+			return
+		}
+	}
 }
 
 // clearFront pops any wantConns that are no longer waiting from the head of the
@@ -3407,16 +3600,70 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	customSkipBody := resp.SkipBody
 	customStreamBody := resp.StreamBody
 
+	ctx := req.ctx
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+	}
+
 	var deadline time.Time
 	if req.timeout > 0 {
 		deadline = time.Now().Add(req.timeout)
 	}
+	if ctx != nil {
+		// The earlier of the request timeout and the context deadline wins.
+		if ctxDeadline, ok := ctx.Deadline(); ok && (deadline.IsZero() || ctxDeadline.Before(deadline)) {
+			deadline = ctxDeadline
+		}
+	}
 
-	cc, err := hc.AcquireConn(req.timeout, req.ConnectionClose())
+	reqTimeout := req.timeout
+	if !deadline.IsZero() {
+		if d := time.Until(deadline); reqTimeout <= 0 || d < reqTimeout {
+			reqTimeout = d
+		}
+	}
+
+	cc, err := hc.acquireConn(ctxOrBackground(ctx), reqTimeout, req.ConnectionClose())
 	if err != nil {
 		return false, err
 	}
 	conn := cc.c
+
+	// Watch for context cancellation while the connection is owned by this
+	// request. The watcher must be stopped before the connection is returned
+	// to the pool, so a late cancellation can never close a connection that
+	// a subsequent request is already using.
+	stopWatch := func() {}
+	if ctx != nil && ctx.Done() != nil {
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				conn.Close()
+			case <-stop:
+			}
+			close(done)
+		}()
+		stopped := false
+		stopWatch = func() {
+			if !stopped {
+				stopped = true
+				close(stop)
+				<-done
+			}
+		}
+	}
+	// For streaming responses the body stream takes over the watcher and
+	// stops it when the caller closes the stream.
+	watchOwnedByStream := false
+	defer func() {
+		if !watchOwnedByStream {
+			stopWatch()
+		}
+	}()
 
 	resp.ParseNetConn(conn)
 
@@ -3458,6 +3705,9 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 
 	if err != nil {
 		hc.CloseConn(cc)
+		if ctxErr := ctxErr(ctx); ctxErr != nil {
+			return false, ctxErr
+		}
 		return true, err
 	}
 
@@ -3486,6 +3736,9 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
+		if ctxErr := ctxErr(ctx); ctxErr != nil {
+			return false, ctxErr
+		}
 		// Don't retry in case of ErrBodyTooLarge since we will just get the same again.
 		needRetry := err != ErrBodyTooLarge
 		return needRetry, err
@@ -3507,6 +3760,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		// StreamBody is enabled. A Read may still be in flight when the caller
 		// closes, so interrupt it and wait before pooling anything.
 		rs := resp.bodyStream.(*requestStream) //nolint:forcetypeassert
+		watchOwnedByStream = true
 		resp.bodyStream = &clientStreamBody{
 			reader:    rs,
 			fullyRead: rs.contentLength == 0,
@@ -3514,6 +3768,9 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 				_ = conn.Close()
 			},
 			release: func(discard bool) {
+				// Stop the cancellation watcher before the connection
+				// goes back to the pool.
+				stopWatch()
 				hc.ReleaseReader(br)
 				releaseRequestStream(rs)
 				releaseConn(discard)
@@ -3523,10 +3780,32 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 	hc.ReleaseReader(br)
 
+	stopWatch()
+	if ctxErr := ctxErr(ctx); ctxErr != nil {
+		// The context was cancelled while reading the response; the watcher
+		// may have closed the connection, so don't return it to the pool.
+		hc.CloseConn(cc)
+		return false, ctxErr
+	}
+
 	if closeConn {
 		hc.CloseConn(cc)
 	} else {
 		hc.ReleaseConn(cc)
 	}
 	return false, nil
+}
+
+func ctxOrBackground(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func ctxErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
 }
