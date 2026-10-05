@@ -48,3 +48,38 @@ func ExampleIPSet() {
 	//   10.128.0.0/9
 	//   fed0::400/120
 }
+
+func ExampleAnalyzeRules() {
+	rules := []netipx.PrefixRule{
+		{Prefix: netip.MustParsePrefix("10.1.0.0/16"), Action: netipx.ActionAllow},
+		{Prefix: netip.MustParsePrefix("10.2.0.0/16"), Action: netipx.ActionDeny},
+		{Prefix: netip.MustParsePrefix("10.0.0.0/8"), Action: netipx.ActionDeny},
+		{Prefix: netip.MustParsePrefix("10.1.5.0/24"), Action: netipx.ActionAllow},
+	}
+	a, _ := netipx.AnalyzeRules(rules, netipx.ActionAllow)
+
+	for _, eff := range a.Effects() {
+		switch eff.Shadow {
+		case netipx.ShadowFull:
+			fmt.Printf("rule %d (%s): fully shadowed\n", eff.Index, eff.Rule.Prefix)
+		case netipx.ShadowPartial:
+			fmt.Printf("rule %d (%s): partially shadowed (%s blocked, %s live)\n",
+				eff.Index, eff.Rule.Prefix, eff.ShadowedAddr, eff.LiveAddr)
+		default:
+			fmt.Printf("rule %d (%s): live\n", eff.Index, eff.Rule.Prefix)
+		}
+	}
+
+	act, idx, matched := a.Lookup(netip.MustParseAddr("10.1.2.3"))
+	if matched {
+		fmt.Printf("10.1.2.3: rule %d says %s\n", idx, act)
+	} else {
+		fmt.Printf("10.1.2.3: default %s\n", act)
+	}
+	// Output:
+	// rule 0 (10.1.0.0/16): live
+	// rule 1 (10.2.0.0/16): live
+	// rule 2 (10.0.0.0/8): partially shadowed (10.1.0.0 blocked, 10.0.0.0 live)
+	// rule 3 (10.1.5.0/24): fully shadowed
+	// 10.1.2.3: rule 0 says allow
+}
