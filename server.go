@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobwas/httphead"
@@ -88,6 +89,21 @@ var ErrNotHijacker = RejectConnectionError(
 	RejectionReason("given http.ResponseWriter is not a http.Hijacker"),
 )
 
+// ErrHandshakePlanMismatch is returned by HTTPUpgrader.UpgradeWithPlan when
+// the given request does not match the request fields the HandshakePlan was
+// prepared for.
+var ErrHandshakePlanMismatch = RejectConnectionError(
+	RejectionStatus(http.StatusBadRequest),
+	RejectionReason("handshake error: request does not match the handshake plan"),
+)
+
+// ErrHandshakePlanConsumed is returned by HTTPUpgrader.UpgradeWithPlan when
+// the given HandshakePlan was already consumed by a previous upgrade.
+var ErrHandshakePlanConsumed = RejectConnectionError(
+	RejectionStatus(http.StatusBadRequest),
+	RejectionReason("handshake error: handshake plan is already consumed"),
+)
+
 // DefaultHTTPUpgrader is an HTTPUpgrader that holds no options and is used by
 // UpgradeHTTP function.
 var DefaultHTTPUpgrader HTTPUpgrader
@@ -95,6 +111,11 @@ var DefaultHTTPUpgrader HTTPUpgrader
 // UpgradeHTTP is like HTTPUpgrader{}.Upgrade().
 func UpgradeHTTP(r *http.Request, w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, Handshake, error) {
 	return DefaultHTTPUpgrader.Upgrade(r, w)
+}
+
+// PrepareHTTP is like HTTPUpgrader{}.Prepare().
+func PrepareHTTP(r *http.Request) (*HandshakePlan, error) {
+	return DefaultHTTPUpgrader.Prepare(r)
 }
 
 // DefaultUpgrader is an Upgrader that holds no options and is used by Upgrade
@@ -160,6 +181,67 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 		httpError(w, err.Error(), http.StatusInternalServerError)
 		return conn, rw, hs, err
 	}
+
+	plan, err := u.prepare(r)
+	if plan != nil {
+		hs = plan.Handshake
+	}
+	err = u.respond(conn, rw, plan, err)
+	return conn, rw, hs, err
+}
+
+// HandshakePlan is a result of a successful HTTPUpgrader.Prepare call. It
+// describes the handshake that will be performed when the plan is consumed
+// by HTTPUpgrader.UpgradeWithPlan: the negotiated subprotocol, extensions
+// and the additional response headers.
+//
+// A plan is bound to the request fields that took part in its validation
+// (method, protocol version, host and the WebSocket handshake headers). If
+// any of these fields is modified after the plan was prepared, consuming
+// the plan fails with ErrHandshakePlanMismatch.
+//
+// A plan is single-use: consuming it twice fails with
+// ErrHandshakePlanConsumed.
+type HandshakePlan struct {
+	// Handshake is the handshake info that will be reported after the
+	// upgrade: the negotiated subprotocol and extensions.
+	Handshake
+
+	// Header is the additional headers that will be written into the
+	// handshake response.
+	Header http.Header
+
+	// nonce is the Sec-WebSocket-Key value captured during Prepare.
+	nonce string
+
+	// bound is the snapshot of the request fields the plan is bound to.
+	bound planBinding
+
+	// used reports whether the plan was already consumed.
+	used int32
+}
+
+// Prepare checks r to be a valid WebSocket upgrade request and runs the
+// subprotocol and extensions negotiation, without hijacking the connection
+// and without writing anything to the response.
+//
+// On success it returns a HandshakePlan that could be consumed later by
+// UpgradeWithPlan to perform the actual upgrade. The negotiation callbacks
+// (Protocol, Negotiate, Extension) are called only here and are never
+// called again when the plan is consumed.
+//
+// On failure it returns an error describing the rejection. If the error is
+// a *ConnectionRejectedError, it carries the same HTTP status code, reason
+// and headers that Upgrade would write into the rejection response for the
+// same request.
+func (u HTTPUpgrader) Prepare(r *http.Request) (*HandshakePlan, error) {
+	return u.prepare(r)
+}
+
+// prepare runs the request validation and negotiation shared by Prepare and
+// Upgrade. It returns either a complete HandshakePlan or a rejection error.
+func (u HTTPUpgrader) prepare(r *http.Request) (plan *HandshakePlan, err error) {
+	var hs Handshake
 
 	// See https://tools.ietf.org/html/rfc6455#section-4.1
 	// The method of the request MUST be GET, and the HTTP version MUST be at least 1.1.
@@ -230,6 +312,60 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 		}
 	}
 
+	if err != nil {
+		return nil, err
+	}
+	return &HandshakePlan{
+		Handshake: hs,
+		Header:    u.Header,
+		nonce:     nonce,
+		bound:     bindHandshakeRequest(r),
+	}, nil
+}
+
+// UpgradeWithPlan upgrades http connection to the websocket connection
+// using the plan previously prepared by Prepare for the same request.
+//
+// It does not run the negotiation callbacks again: the subprotocol,
+// extensions and response headers are taken from the plan as is.
+//
+// If the request fields that took part in the plan validation were modified
+// since Prepare, the connection is rejected with ErrHandshakePlanMismatch.
+// If the plan was already consumed, the connection is rejected with
+// ErrHandshakePlanConsumed.
+func (u HTTPUpgrader) UpgradeWithPlan(r *http.Request, w http.ResponseWriter, plan *HandshakePlan) (conn net.Conn, rw *bufio.ReadWriter, hs Handshake, err error) {
+	// Hijack connection first to get the ability to write rejection errors
+	// the same way as in Upgrade.
+	conn, rw, err = hijack(w)
+	if err != nil {
+		httpError(w, err.Error(), http.StatusInternalServerError)
+		return conn, rw, hs, err
+	}
+
+	err = plan.consume(r)
+	if err == nil {
+		hs = plan.Handshake
+	}
+	err = u.respond(conn, rw, plan, err)
+	return conn, rw, hs, err
+}
+
+// consume marks the plan as consumed after checking that the request still
+// matches the fields the plan was bound to.
+func (p *HandshakePlan) consume(r *http.Request) error {
+	if p == nil || !p.bound.matches(r) {
+		return ErrHandshakePlanMismatch
+	}
+	if !atomic.CompareAndSwapInt32(&p.used, 0, 1) {
+		return ErrHandshakePlanConsumed
+	}
+	return nil
+}
+
+// respond writes the handshake response into the hijacked connection. On
+// nil err it writes the successful upgrade response described by plan,
+// otherwise it writes the rejection response for err.
+func (u HTTPUpgrader) respond(conn net.Conn, rw *bufio.ReadWriter, plan *HandshakePlan, err error) error {
 	// Clear deadlines set by server.
 	conn.SetDeadline(noDeadline)
 	if t := u.Timeout; t != 0 {
@@ -238,11 +374,15 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 	}
 
 	var header handshakeHeader
-	if h := u.Header; h != nil {
+	h := u.Header
+	if plan != nil {
+		h = plan.Header
+	}
+	if h != nil {
 		header[0] = HandshakeHeaderHTTP(h)
 	}
 	if err == nil {
-		httpWriteResponseUpgrade(rw.Writer, strToBytes(nonce), hs, header.WriteTo)
+		httpWriteResponseUpgrade(rw.Writer, strToBytes(plan.nonce), plan.Handshake, header.WriteTo)
 		err = rw.Writer.Flush()
 	} else {
 		var code int
@@ -257,7 +397,68 @@ func (u HTTPUpgrader) Upgrade(r *http.Request, w http.ResponseWriter) (conn net.
 		// Do not store Flush() error to not override already existing one.
 		_ = rw.Writer.Flush()
 	}
-	return conn, rw, hs, err
+	return err
+}
+
+// planBinding is a snapshot of the http.Request fields that take part in
+// the handshake validation and negotiation. A HandshakePlan is bound to
+// these fields and could be consumed only by a request that still matches
+// them.
+type planBinding struct {
+	method        string
+	protoMajor    int
+	protoMinor    int
+	host          string
+	upgrade       string
+	connection    string
+	secKey        string
+	secVersion    string
+	secProtocol   []string
+	secExtensions []string
+}
+
+// bindHandshakeRequest snapshots the request fields that take part in the
+// handshake validation and negotiation.
+func bindHandshakeRequest(r *http.Request) planBinding {
+	return planBinding{
+		method:        r.Method,
+		protoMajor:    r.ProtoMajor,
+		protoMinor:    r.ProtoMinor,
+		host:          r.Host,
+		upgrade:       httpGetHeader(r.Header, headerUpgradeCanonical),
+		connection:    httpGetHeader(r.Header, headerConnectionCanonical),
+		secKey:        httpGetHeader(r.Header, headerSecKeyCanonical),
+		secVersion:    httpGetHeader(r.Header, headerSecVersionCanonical),
+		secProtocol:   append([]string(nil), r.Header[headerSecProtocolCanonical]...),
+		secExtensions: append([]string(nil), r.Header[headerSecExtensionsCanonical]...),
+	}
+}
+
+// matches reports whether r still holds the same values of the bound
+// fields.
+func (b planBinding) matches(r *http.Request) bool {
+	return b.method == r.Method &&
+		b.protoMajor == r.ProtoMajor &&
+		b.protoMinor == r.ProtoMinor &&
+		b.host == r.Host &&
+		b.upgrade == httpGetHeader(r.Header, headerUpgradeCanonical) &&
+		b.connection == httpGetHeader(r.Header, headerConnectionCanonical) &&
+		b.secKey == httpGetHeader(r.Header, headerSecKeyCanonical) &&
+		b.secVersion == httpGetHeader(r.Header, headerSecVersionCanonical) &&
+		stringSliceEqual(b.secProtocol, r.Header[headerSecProtocolCanonical]) &&
+		stringSliceEqual(b.secExtensions, r.Header[headerSecExtensionsCanonical])
+}
+
+func stringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Upgrader contains options for upgrading connection to websocket.

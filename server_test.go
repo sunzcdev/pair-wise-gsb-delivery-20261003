@@ -484,6 +484,250 @@ func TestUpgrader(t *testing.T) {
 	}
 }
 
+func TestHTTPUpgraderPrepare(t *testing.T) {
+	for _, test := range upgradeCases {
+		t.Run(test.label, func(t *testing.T) {
+			if !test.removeSecKey {
+				nonce := test.nonce
+				if test.badSecKey {
+					nonce = nonce[:nonceSize-1]
+				}
+				if test.secKeyHeader == "" {
+					test.secKeyHeader = headerSecKey
+				}
+				test.req.Header[test.secKeyHeader] = []string{string(nonce)}
+			}
+
+			// Need to emulate http server read request for truth test.
+			reqBytes := dumpRequest(test.req)
+			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			u := HTTPUpgrader{
+				Protocol:  test.protocol,
+				Negotiate: test.negotiate,
+			}
+			plan, err := u.Prepare(req)
+			if err != test.err {
+				t.Fatalf(
+					"expected error to be '%v', got '%v';\non request:\n====\n%s\n====",
+					test.err, err, dumpRequest(req),
+				)
+			}
+			if test.err != nil {
+				if plan != nil {
+					t.Fatalf("expected plan to be nil on rejection")
+				}
+				// The rejection must be structured the same way as the
+				// rejection response of the direct Upgrade.
+				if rej, ok := err.(*ConnectionRejectedError); ok {
+					if act, exp := rej.StatusCode(), test.res.StatusCode; act != exp {
+						t.Fatalf("rejection status is %d; want %d (same as Upgrade)", act, exp)
+					}
+				}
+				return
+			}
+			if plan == nil {
+				t.Fatal("expected plan to be non-nil")
+			}
+			if act, exp := plan.Protocol, test.hs.Protocol; act != exp {
+				t.Errorf("plan protocol is %q; want %q", act, exp)
+			}
+			if act, exp := len(plan.Extensions), len(test.hs.Extensions); act != exp {
+				t.Errorf("plan got %d extensions; want %d", act, exp)
+			} else {
+				for i := 0; i < act; i++ {
+					if act, exp := plan.Extensions[i], test.hs.Extensions[i]; !act.Equal(exp) {
+						t.Errorf("plan %d-th extension is %s; want %s", i, act, exp)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHTTPUpgraderUpgradeWithPlan(t *testing.T) {
+	for _, test := range upgradeCases {
+		if test.err != nil {
+			continue
+		}
+		t.Run(test.label, func(t *testing.T) {
+			if !test.removeSecKey {
+				nonce := test.nonce
+				if test.secKeyHeader == "" {
+					test.secKeyHeader = headerSecKey
+				}
+				test.req.Header[test.secKeyHeader] = []string{string(nonce)}
+			}
+			test.res.Header[headerSecAccept] = []string{string(makeAccept(test.nonce))}
+
+			reqBytes := dumpRequest(test.req)
+			req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var protocolCalls, negotiateCalls int32
+			u := HTTPUpgrader{}
+			if test.protocol != nil {
+				u.Protocol = func(s string) bool {
+					atomic.AddInt32(&protocolCalls, 1)
+					return test.protocol(s)
+				}
+			}
+			if test.negotiate != nil {
+				u.Negotiate = func(o httphead.Option) (httphead.Option, error) {
+					atomic.AddInt32(&negotiateCalls, 1)
+					return test.negotiate(o)
+				}
+			}
+
+			plan, err := u.Prepare(req)
+			if err != nil {
+				t.Fatalf("unexpected Prepare error: %v", err)
+			}
+
+			// Negotiation callbacks must run during Prepare only and must
+			// not be called again when the plan is consumed.
+			protocolCallsPrepared := atomic.LoadInt32(&protocolCalls)
+			negotiateCallsPrepared := atomic.LoadInt32(&negotiateCalls)
+
+			res := newRecorder()
+			_, _, hs, err := u.UpgradeWithPlan(req, res, plan)
+			if err != nil {
+				t.Fatalf("unexpected UpgradeWithPlan error: %v", err)
+			}
+
+			if act := atomic.LoadInt32(&protocolCalls); act != protocolCallsPrepared {
+				t.Errorf("Protocol callback was called during UpgradeWithPlan")
+			}
+			if act := atomic.LoadInt32(&negotiateCalls); act != negotiateCallsPrepared {
+				t.Errorf("Negotiate callback was called during UpgradeWithPlan")
+			}
+
+			actRespBts := sortHeaders(res.Bytes())
+			expRespBts := sortHeaders(dumpResponse(test.res))
+			if !bytes.Equal(actRespBts, expRespBts) {
+				t.Fatalf(
+					"unexpected http response:\n---- act:\n%s\n---- want:\n%s\n==== on request:\n%s\n====",
+					actRespBts, expRespBts, dumpRequest(test.req),
+				)
+			}
+
+			if act, exp := hs.Protocol, test.hs.Protocol; act != exp {
+				t.Errorf("handshake protocol is %q want %q", act, exp)
+			}
+			if act, exp := len(hs.Extensions), len(test.hs.Extensions); act != exp {
+				t.Errorf("handshake got %d extensions; want %d", act, exp)
+			} else {
+				for i := 0; i < act; i++ {
+					if act, exp := hs.Extensions[i], test.hs.Extensions[i]; !act.Equal(exp) {
+						t.Errorf("handshake %d-th extension is %s; want %s", i, act, exp)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestHTTPUpgraderUpgradeWithPlanMismatch(t *testing.T) {
+	nonce := mustMakeNonce()
+	req := mustMakeRequest("GET", "ws://example.org", http.Header{
+		headerUpgrade:    []string{"websocket"},
+		headerConnection: []string{"Upgrade"},
+		headerSecVersion: []string{"13"},
+		headerSecKey:     []string{string(nonce)},
+	})
+
+	// Emulate http server request parsing to canonicalize header keys.
+	reqBytes := dumpRequest(req)
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := HTTPUpgrader{}
+	plan, err := u.Prepare(req)
+	if err != nil {
+		t.Fatalf("unexpected Prepare error: %v", err)
+	}
+
+	// Modify a request field that took part in the plan validation.
+	req.Header.Set(headerSecKey, string(mustMakeNonce()))
+
+	res := newRecorder()
+	_, _, _, err = u.UpgradeWithPlan(req, res, plan)
+	if err != ErrHandshakePlanMismatch {
+		t.Fatalf("expected error to be '%v', got '%v'", ErrHandshakePlanMismatch, err)
+	}
+
+	actRespBts := sortHeaders(res.Bytes())
+	expRespBts := sortHeaders(dumpResponse(mustMakeErrResponse(400, ErrHandshakePlanMismatch, nil)))
+	if !bytes.Equal(actRespBts, expRespBts) {
+		t.Fatalf(
+			"unexpected http response:\n---- act:\n%s\n---- want:\n%s\n====",
+			actRespBts, expRespBts,
+		)
+	}
+}
+
+func TestHTTPUpgraderUpgradeWithPlanConsumed(t *testing.T) {
+	nonce := mustMakeNonce()
+	req := mustMakeRequest("GET", "ws://example.org", http.Header{
+		headerUpgrade:    []string{"websocket"},
+		headerConnection: []string{"Upgrade"},
+		headerSecVersion: []string{"13"},
+		headerSecKey:     []string{string(nonce)},
+	})
+
+	// Emulate http server request parsing to canonicalize header keys.
+	reqBytes := dumpRequest(req)
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	u := HTTPUpgrader{
+		Header: http.Header{
+			"X-Test": []string{"hello"},
+		},
+	}
+	plan, err := u.Prepare(req)
+	if err != nil {
+		t.Fatalf("unexpected Prepare error: %v", err)
+	}
+	if act, exp := plan.Header.Get("X-Test"), "hello"; act != exp {
+		t.Fatalf("plan header X-Test is %q; want %q", act, exp)
+	}
+
+	first := newRecorder()
+	if _, _, _, err = u.UpgradeWithPlan(req, first, plan); err != nil {
+		t.Fatalf("unexpected first UpgradeWithPlan error: %v", err)
+	}
+	if act := first.Body.String(); !strings.Contains(act, "X-Test: hello\r\n") {
+		t.Fatalf("expected response to contain planned header; got:\n%s", act)
+	}
+
+	second := newRecorder()
+	_, _, _, err = u.UpgradeWithPlan(req, second, plan)
+	if err != ErrHandshakePlanConsumed {
+		t.Fatalf("expected error to be '%v', got '%v'", ErrHandshakePlanConsumed, err)
+	}
+
+	actRespBts := sortHeaders(second.Bytes())
+	expRespBts := sortHeaders(dumpResponse(mustMakeErrResponse(400, ErrHandshakePlanConsumed, http.Header{
+		"X-Test": []string{"hello"},
+	})))
+	if !bytes.Equal(actRespBts, expRespBts) {
+		t.Fatalf(
+			"unexpected http response:\n---- act:\n%s\n---- want:\n%s\n====",
+			actRespBts, expRespBts,
+		)
+	}
+}
+
 func BenchmarkHTTPUpgrader(b *testing.B) {
 	for _, bench := range upgradeCases {
 		bench.req.Header.Set(headerSecKey, string(bench.nonce[:]))
