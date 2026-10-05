@@ -233,3 +233,24 @@ Time-related information returned by the `Query` functions includes:
 The `Response` structure returned by the `Query` functions also contains a
 `Response.Validate()` function that returns an error if any of the fields
 returned by the server are invalid.
+Release v1.7.0
+==============
+
+**Changes**
+
+* Added the optional stateful `Poller` client. It tracks kiss-of-death state
+  per normalized endpoint ("host:port"): a `RATE` response defers the next
+  query by the server-suggested poll interval clamped to local minimum and
+  maximum bounds, while deny-class codes such as `DENY` and `RSTR` lock the
+  endpoint out until an explicit `Reset`.
+* Added `KissError`, `KissAction`, `ErrEndpointDenied`, `Clock`, `Timer`,
+  `PollerOptions`, `EndpointState`, `NewPoller` and the `Poller.Query`,
+  `Poller.Reset` and `Poller.State` methods.
+* The `Poller` serializes concurrent queries to the same endpoint using an
+  atomically claimed polling permit; a query canceled via its context before
+  being sent releases the permit.
+* State is updated only by responses that pass the request-correlation check.
+  Timeouts and other ordinary errors are never mistaken for kisses of death.
+
+Release v1.6.0
+==============

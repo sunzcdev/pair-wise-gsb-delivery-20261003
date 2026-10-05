@@ -95,6 +95,56 @@ include:
   default UDP dialer function.
 
 
+## Stateful polling with kiss-of-death handling
+
+The one-off `Query` functions are stateless: they return a
+[kiss of death](https://tools.ietf.org/html/rfc5905#section-7.4) response as
+an error but remember nothing about it. For a long-lived polling loop, use the
+optional stateful [`Poller`](https://godoc.org/github.com/beevik/ntp#Poller)
+instead. It tracks state independently for each normalized endpoint address
+("host:port"):
+
+* A `RATE` kiss of death postpones the next query to that endpoint until the
+  server-suggested wait (the response's `Poll` interval) has elapsed, clamped
+  to local minimum and maximum bounds via `PollerOptions.MinPollInterval` and
+  `PollerOptions.MaxPollInterval`.
+* A deny-class kiss of death, such as `DENY` or `RSTR`, locks the endpoint out
+  until you call the `Poller`'s `Reset` function explicitly.
+* Timeouts, dial failures and other ordinary errors never alter state and are
+  not reported as kisses of death. Only a response that passes the package's
+  request-correlation check (matching the random origin timestamp) updates
+  state.
+
+Concurrent queries to the same endpoint are serialized: callers atomically
+claim a single polling permit and wait their turn. A query canceled via its
+`context.Context` before its request is sent releases the permit to another
+caller.
+```go
+poller, err := ntp.NewPoller(&ntp.PollerOptions{
+    MinPollInterval: time.Second,
+    MaxPollInterval: time.Hour,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+response, err := poller.Query(context.Background(), address, nil)
+var kiss *ntp.KissError
+if errors.As(err, &kiss) {
+    switch kiss.Action {
+    case ntp.KissRate:
+        // The next query blocks until kiss.RetryAfter.
+    case ntp.KissDeny:
+        // Queries fail with ErrEndpointDenied until poller.Reset(address).
+    }
+}
+```
+
+The `Poller` measures cooldowns through its `Clock`, so tests can drive a
+controllable fake clock together with a custom in-memory `Dialer` to exercise
+the entire cooldown process without waiting real time.
+
+
 ## Logging responses
 
 To log an NTP query's response, use the response's `Log` function:
