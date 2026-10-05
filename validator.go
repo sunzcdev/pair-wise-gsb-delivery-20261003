@@ -14,6 +14,7 @@ type validate struct {
 	top            reflect.Value
 	ns             []byte
 	actualNs       []byte
+	presenceNs     []byte
 	errs           ValidationErrors
 	includeExclude map[string]struct{} // reset only if StructPartial or StructExcept are called, no need otherwise
 	ffn            FilterFunc
@@ -28,13 +29,25 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+	isPatch        bool
+	slOldParent    reflect.Value
+	slOldCurrent   reflect.Value
 }
 
 // parent and current will be the same the first run of validateStruct
-func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag) {
+func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, current reflect.Value, typ reflect.Type, ns []byte, structNs []byte, ct *cTag, oldParent reflect.Value, oldCurrent reflect.Value) {
 	cs, ok := v.v.structCache.Get(typ)
 	if !ok {
 		cs = v.v.extractStructCache(current, typ.Name())
+	}
+
+	if v.isPatch {
+		oldCurrent, _, _ = v.extractTypeInternal(oldCurrent, false)
+		if !oldCurrent.IsValid() || oldCurrent.Kind() != reflect.Struct || oldCurrent.Type() != typ {
+			oldCurrent = reflect.New(typ).Elem()
+		}
+		v.slOldParent = oldParent
+		v.slOldCurrent = oldCurrent
 	}
 
 	if len(ns) == 0 && len(cs.name) != 0 {
@@ -43,6 +56,9 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 
 		structNs = append(structNs, cs.name...)
 		structNs = append(structNs, '.')
+	}
+	if v.isPatch {
+		v.presenceNs = structNs
 	}
 
 	// ct is nil on top level struct, and structs as fields that have no tag info
@@ -69,29 +85,49 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 				}
 			}
 
-			v.traverseField(ctx, current, current.Field(f.idx), ns, structNs, f, f.cTags)
+			oldField := reflect.Value{}
+			if v.isPatch {
+				oldField = oldCurrent.Field(f.idx)
+			}
+
+			v.traverseField(ctx, current, current.Field(f.idx), ns, structNs, f, f.cTags, oldParent, oldField)
 		}
 	}
 
 	// check if any struct level validations, after all field validations already checked.
 	// first iteration will have no info about nostructlevel tag, and is checked prior to
 	// calling the next iteration of validateStruct called from traverseField.
-	if cs.fn != nil {
+	if v.isPatch {
+		if cs.patchFn != nil {
+			v.slflParent = parent
+			v.slCurrent = current
+			v.ns = ns
+			v.actualNs = structNs
+			v.presenceNs = structNs
+
+			cs.patchFn(ctx, v)
+		}
+	} else if cs.fn != nil {
 		v.slflParent = parent
 		v.slCurrent = current
 		v.ns = ns
 		v.actualNs = structNs
+		v.presenceNs = structNs
 
 		cs.fn(ctx, v)
 	}
 }
 
 // traverseField validates any field, be it a struct or single field, ensures it's validity and passes it along to be validated via it's tag options
-func (v *validate) traverseField(ctx context.Context, parent reflect.Value, current reflect.Value, ns []byte, structNs []byte, cf *cField, ct *cTag) {
+func (v *validate) traverseField(ctx context.Context, parent reflect.Value, current reflect.Value, ns []byte, structNs []byte, cf *cField, ct *cTag, oldParent reflect.Value, oldCurrent reflect.Value) {
 	var typ reflect.Type
 	var kind reflect.Kind
 
 	current, kind, v.fldIsPointer = v.extractTypeInternal(current, false)
+	if v.isPatch {
+		oldCurrent, _, _ = v.extractTypeInternal(oldCurrent, false)
+	}
+	presenceNs := v.presenceNs
 
 	var isNestedStruct bool
 
@@ -181,6 +217,9 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 	}
 
 	typ = current.Type()
+	if v.isPatch && (!oldCurrent.IsValid() || oldCurrent.Kind() != reflect.Struct || oldCurrent.Type() != typ) && kind == reflect.Struct {
+		oldCurrent = reflect.New(typ).Elem()
+	}
 
 OUTER:
 	for {
@@ -196,9 +235,11 @@ OUTER:
 						ns = append(append(ns, cf.altName...), '.')
 					}
 					structNs = append(append(structNs, cf.name...), '.')
+					presenceNs = append(append(presenceNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.presenceNs = presenceNs
+				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct, oldCurrent, oldCurrent)
 			}
 			return
 		}
@@ -218,9 +259,11 @@ OUTER:
 						ns = append(append(ns, cf.altName...), '.')
 					}
 					structNs = append(append(structNs, cf.name...), '.')
+					presenceNs = append(append(presenceNs, cf.name...), '.')
 				}
 
-				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct)
+				v.presenceNs = presenceNs
+				v.validateStruct(ctx, parent, current, typ, ns, structNs, ct, oldCurrent, oldCurrent)
 			}
 			return
 
@@ -307,7 +350,14 @@ OUTER:
 
 						reusableCF.altName = string(v.misc)
 					}
-					v.traverseField(ctx, parent, current.Index(i), ns, structNs, reusableCF, ct)
+					oldItem := reflect.Value{}
+					if v.isPatch && oldCurrent.IsValid() && oldCurrent.Kind() == reflect.Slice && i < oldCurrent.Len() {
+						oldItem = oldCurrent.Index(i)
+					}
+
+					item := current.Index(i)
+					v.presenceNs = append(append(presenceNs, reusableCF.name...), '.')
+					v.traverseField(ctx, parent, item, ns, structNs, reusableCF, ct, oldParent, oldItem)
 				}
 
 			case reflect.Map:
@@ -337,25 +387,35 @@ OUTER:
 					}
 
 					if ct != nil && ct.typeof == typeKeys && ct.keys != nil {
-						v.traverseField(ctx, parent, key, ns, structNs, reusableCF, ct.keys)
+						v.presenceNs = presenceNs
+						v.traverseField(ctx, parent, key, ns, structNs, reusableCF, ct.keys, oldParent, reflect.Value{})
 						// can be nil when just keys being validated
 						if ct.next != nil {
-							v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct.next)
+							item := current.MapIndex(key)
+							oldItem := oldMapIndex(oldCurrent, key)
+							v.presenceNs = append(append(presenceNs, reusableCF.name...), '.')
+							v.traverseField(ctx, parent, item, ns, structNs, reusableCF, ct.next, oldParent, oldItem)
 						} else {
 							// Struct fallback when map values are structs
 							val := current.MapIndex(key)
+							oldItem := oldMapIndex(oldCurrent, key)
 							switch val.Kind() {
 							case reflect.Ptr:
 								if val.Elem().Kind() == reflect.Struct {
 									// Dive into the struct so its own tags run
-									v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil)
+									v.presenceNs = append(append(presenceNs, reusableCF.name...), '.')
+									v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil, oldParent, oldItem)
 								}
 							case reflect.Struct:
-								v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil)
+								v.presenceNs = append(append(presenceNs, reusableCF.name...), '.')
+								v.traverseField(ctx, parent, val, ns, structNs, reusableCF, nil, oldParent, oldItem)
 							}
 						}
 					} else {
-						v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct)
+						item := current.MapIndex(key)
+						oldItem := oldMapIndex(oldCurrent, key)
+						v.presenceNs = append(append(presenceNs, reusableCF.name...), '.')
+						v.traverseField(ctx, parent, item, ns, structNs, reusableCF, ct, oldParent, oldItem)
 					}
 				}
 
@@ -511,6 +571,13 @@ func appendAltName(ns []byte, altName string) string {
 		return string(ns[:n-1])
 	}
 	return string(ns)
+}
+
+func oldMapIndex(m reflect.Value, key reflect.Value) reflect.Value {
+	if !m.IsValid() || m.Kind() != reflect.Map || !key.IsValid() {
+		return reflect.Value{}
+	}
+	return m.MapIndex(key)
 }
 
 func getValue(val reflect.Value) interface{} {

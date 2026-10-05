@@ -95,7 +95,7 @@ func (v *validate) Param() string {
 //
 // Deprecated: Use GetStructFieldOK2() instead which also return if the value is nullable.
 func (v *validate) GetStructFieldOK() (reflect.Value, reflect.Kind, bool) {
-	current, kind, _, found := v.getStructFieldOKInternal(v.slflParent, v.ct.param)
+	current, kind, _, found := v.getStructFieldOKInternalWithFallback(v.slflParent, v.slOldParent, v.ct.param)
 	return current, kind, found
 }
 
@@ -110,11 +110,11 @@ func (v *validate) GetStructFieldOKAdvanced(val reflect.Value, namespace string)
 
 // GetStructFieldOK2 returns Param returns param for validation against current field
 func (v *validate) GetStructFieldOK2() (reflect.Value, reflect.Kind, bool, bool) {
-	return v.getStructFieldOKInternal(v.slflParent, v.ct.param)
+	return v.getStructFieldOKInternalWithFallback(v.slflParent, v.slOldParent, v.ct.param)
 }
 
 // GetStructFieldOKAdvanced2 is the same as GetStructFieldOK except that it accepts the parent struct to start looking for
 // the field and namespace allowing more extensibility for validators.
 func (v *validate) GetStructFieldOKAdvanced2(val reflect.Value, namespace string) (reflect.Value, reflect.Kind, bool, bool) {
-	return v.getStructFieldOKInternal(val, namespace)
+	return v.getStructFieldOKInternalWithFallback(val, v.slOldParent, namespace)
 }

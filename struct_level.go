@@ -12,6 +12,19 @@ type StructLevelFunc func(sl StructLevel)
 // but also allows passing of contextual validation information via context.Context.
 type StructLevelFuncCtx func(ctx context.Context, sl StructLevel)
 
+// PatchStructLevelFunc accepts all values needed for PATCH struct validation.
+type PatchStructLevelFunc func(pl PatchLevel)
+
+// PatchStructLevelFuncCtx accepts all values needed for PATCH struct validation
+// but also allows passing of contextual validation information via context.Context.
+type PatchStructLevelFuncCtx func(ctx context.Context, pl PatchLevel)
+
+func wrapPatchStructLevelFunc(fn PatchStructLevelFunc) PatchStructLevelFuncCtx {
+	return func(ctx context.Context, pl PatchLevel) {
+		fn(pl)
+	}
+}
+
 // wrapStructLevelFunc wraps normal StructLevelFunc makes it compatible with StructLevelFuncCtx
 func wrapStructLevelFunc(fn StructLevelFunc) StructLevelFuncCtx {
 	return func(ctx context.Context, sl StructLevel) {
@@ -66,6 +79,18 @@ type StructLevel interface {
 	ReportValidationErrors(relativeNamespace, relativeActualNamespace string, errs ValidationErrors)
 }
 
+// PatchLevel contains StructLevel information plus PATCH presence and original values.
+type PatchLevel interface {
+	StructLevel
+
+	// Old returns the struct being patched.
+	Old() reflect.Value
+
+	// Present reports whether field was included in the PATCH document.
+	// A nil value for a pointer field is present and distinct from an omitted field.
+	Present(field string) bool
+}
+
 var _ StructLevel = new(validate)
 
 // Top returns the top level struct
@@ -93,6 +118,16 @@ func (v *validate) Parent() reflect.Value {
 // Current returns the current struct.
 func (v *validate) Current() reflect.Value {
 	return v.slCurrent
+}
+
+// Old returns the current struct before the PATCH was applied.
+func (v *validate) Old() reflect.Value {
+	return v.slOldCurrent
+}
+
+// Present reports whether a field was present in the PATCH document.
+func (v *validate) Present(field string) bool {
+	return v.patchDependencyPresent(field)
 }
 
 // Validator returns the main validation object, in case one want to call validations internally.

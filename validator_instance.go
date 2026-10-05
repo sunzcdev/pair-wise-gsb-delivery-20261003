@@ -85,6 +85,7 @@ type Validate struct {
 	pool                   *sync.Pool
 	tagNameFunc            TagNameFunc
 	structLevelFuncs       map[reflect.Type]StructLevelFuncCtx
+	patchStructLevelFuncs  map[reflect.Type]PatchStructLevelFuncCtx
 	customFuncs            map[reflect.Type]CustomTypeFunc
 	aliases                map[string]string
 	validations            map[string]internalValidationFuncWrapper
@@ -275,6 +276,36 @@ func (v *Validate) RegisterStructValidationCtx(fn StructLevelFuncCtx, types ...i
 	}
 }
 
+// RegisterStructValidationPatch registers a PatchStructLevelFunc that is used only by StructPatch.
+//
+// NOTE:
+// - this method is not thread-safe it is intended that these all be registered prior to any validation
+func (v *Validate) RegisterStructValidationPatch(fn PatchStructLevelFunc, types ...interface{}) {
+	v.RegisterStructValidationPatchCtx(wrapPatchStructLevelFunc(fn), types...)
+}
+
+// RegisterStructValidationPatchCtx registers a PatchStructLevelFuncCtx that is used only by StructPatch
+// and allows passing of contextual validation information via context.Context.
+//
+// NOTE:
+// - this method is not thread-safe it is intended that these all be registered prior to any validation
+func (v *Validate) RegisterStructValidationPatchCtx(fn PatchStructLevelFuncCtx, types ...interface{}) {
+	if v.patchStructLevelFuncs == nil {
+		v.patchStructLevelFuncs = make(map[reflect.Type]PatchStructLevelFuncCtx)
+	}
+
+	for _, t := range types {
+		tv := reflect.ValueOf(t)
+		if tv.Kind() == reflect.Ptr && !tv.IsNil() {
+			t = reflect.Indirect(tv).Interface()
+		} else if tv.Kind() == reflect.Ptr {
+			t = reflect.Zero(tv.Type().Elem()).Interface()
+		}
+
+		v.patchStructLevelFuncs[reflect.TypeOf(t)] = fn
+	}
+}
+
 // RegisterStructValidationMapRules registers validate map rules.
 // Be aware that map validation rules supersede those defined on a/the struct if present.
 //
@@ -368,9 +399,10 @@ func (v *Validate) StructCtx(ctx context.Context, s interface{}) (err error) {
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = false
+	vd.isPatch = false
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -413,10 +445,102 @@ func (v *Validate) StructFilteredCtx(ctx context.Context, s interface{}, fn Filt
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = fn
 	// vd.hasExcludes = false // only need to reset in StructPartial and StructExcept
 
-	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil, reflect.Value{}, reflect.Value{})
+
+	if len(vd.errs) > 0 {
+		err = vd.errs
+		vd.errs = nil
+	}
+
+	v.pool.Put(vd)
+
+	return
+}
+
+// StructPatch validates the fields present in a PATCH document while retaining access to the original value.
+// presentFields must be built from the request decoder's presence information, never from zero values.
+// Fields may be provided in a namespaced fashion, for example Nested.Field or Items[0].Name.
+func (v *Validate) StructPatch(old, patch interface{}, presentFields ...string) error {
+	return v.StructPatchCtx(context.Background(), old, patch, presentFields...)
+}
+
+// StructPatchCtx is StructPatch with context support.
+func (v *Validate) StructPatchCtx(ctx context.Context, old, patch interface{}, presentFields ...string) (err error) {
+	oldVal := reflect.ValueOf(old)
+	patchVal := reflect.ValueOf(patch)
+	oldTop := oldVal
+	patchTop := patchVal
+
+	if oldVal.Kind() == reflect.Ptr {
+		if oldVal.IsNil() {
+			return &InvalidValidationError{Type: reflect.TypeOf(old)}
+		}
+		oldVal = oldVal.Elem()
+	}
+	if patchVal.Kind() == reflect.Ptr {
+		if patchVal.IsNil() {
+			return &InvalidValidationError{Type: reflect.TypeOf(patch)}
+		}
+		patchVal = patchVal.Elem()
+	}
+
+	if oldVal.Kind() != reflect.Struct || patchVal.Kind() != reflect.Struct ||
+		oldVal.Type().ConvertibleTo(timeType) || patchVal.Type().ConvertibleTo(timeType) ||
+		!oldVal.Type().AssignableTo(patchVal.Type()) {
+		return &InvalidValidationError{Type: reflect.TypeOf(patch)}
+	}
+
+	vd := v.pool.Get().(*validate)
+	vd.top = patchTop
+	vd.isPartial = true
+	vd.isPatch = true
+	vd.ffn = nil
+	vd.hasExcludes = false
+	vd.includeExclude = make(map[string]struct{})
+	vd.presenceNs = vd.presenceNs[0:0]
+
+	typ := patchVal.Type()
+	name := typ.Name()
+
+	for _, field := range presentFields {
+		parts := strings.Split(field, namespaceSeparator)
+		if len(parts) == 0 {
+			continue
+		}
+
+		vd.misc = append(vd.misc[0:0], name...)
+		if len(vd.misc) != 0 {
+			vd.misc = append(vd.misc, '.')
+		}
+		for _, part := range parts {
+			idx := strings.Index(part, leftBracket)
+			if idx == -1 {
+				vd.misc = append(vd.misc, part...)
+				vd.includeExclude[string(vd.misc)] = struct{}{}
+				vd.misc = append(vd.misc, '.')
+				continue
+			}
+
+			for idx != -1 {
+				vd.misc = append(vd.misc, part[:idx]...)
+				vd.includeExclude[string(vd.misc)] = struct{}{}
+
+				idx2 := strings.Index(part, rightBracket) + 1
+				vd.misc = append(vd.misc, part[idx:idx2]...)
+				vd.includeExclude[string(vd.misc)] = struct{}{}
+				part = part[idx2:]
+				idx = strings.Index(part, leftBracket)
+			}
+			vd.misc = append(vd.misc, '.')
+		}
+
+	}
+
+	vd.validateStruct(ctx, patchTop, patchVal, typ, vd.ns[0:0], vd.actualNs[0:0], nil, oldTop, oldVal)
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -461,6 +585,7 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = nil
 	vd.hasExcludes = false
 	vd.includeExclude = make(map[string]struct{})
@@ -502,7 +627,7 @@ func (v *Validate) StructPartialCtx(ctx context.Context, s interface{}, fields .
 		}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -547,6 +672,7 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 	vd := v.pool.Get().(*validate)
 	vd.top = top
 	vd.isPartial = true
+	vd.isPatch = false
 	vd.ffn = nil
 	vd.hasExcludes = true
 	vd.includeExclude = make(map[string]struct{})
@@ -566,7 +692,7 @@ func (v *Validate) StructExceptCtx(ctx context.Context, s interface{}, fields ..
 		vd.includeExclude[string(vd.misc)] = struct{}{}
 	}
 
-	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil)
+	vd.validateStruct(ctx, top, val, typ, vd.ns[0:0], vd.actualNs[0:0], nil, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -620,7 +746,8 @@ func (v *Validate) VarCtx(ctx context.Context, field interface{}, tag string) (e
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
-	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -672,7 +799,8 @@ func (v *Validate) VarWithValueCtx(ctx context.Context, field interface{}, other
 	vd := v.pool.Get().(*validate)
 	vd.top = otherVal
 	vd.isPartial = false
-	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, otherVal, reflect.ValueOf(field), vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs
@@ -730,7 +858,8 @@ func (v *Validate) VarWithKeyCtx(ctx context.Context, key string, field interfac
 	vd := v.pool.Get().(*validate)
 	vd.top = val
 	vd.isPartial = false
-	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], cField, ctag)
+	vd.isPatch = false
+	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], cField, ctag, reflect.Value{}, reflect.Value{})
 
 	if len(vd.errs) > 0 {
 		err = vd.errs

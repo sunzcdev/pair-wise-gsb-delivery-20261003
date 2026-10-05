@@ -87,6 +87,25 @@ BEGIN:
 // NOTE: when not successful ok will be false, this can happen when a nested struct is nil and so the field
 // could not be retrieved because it didn't exist.
 func (v *validate) getStructFieldOKInternal(val reflect.Value, namespace string) (current reflect.Value, kind reflect.Kind, nullable bool, found bool) {
+	return v.getStructFieldOKInternalBase(val, namespace, false)
+}
+
+func (v *validate) patchDependencyPresent(namespace string) bool {
+	path := append(v.presenceNs[:len(v.presenceNs):len(v.presenceNs)], namespace...)
+	_, ok := v.includeExclude[string(path)]
+	return ok
+}
+
+func (v *validate) getStructFieldOKInternalWithFallback(val, fallback reflect.Value, namespace string) (current reflect.Value, kind reflect.Kind, nullable bool, found bool) {
+	current, kind, nullable, found = v.getStructFieldOKInternalBase(val, namespace, true)
+	if !v.isPatch || val != v.slflParent || v.patchDependencyPresent(namespace) {
+		return
+	}
+
+	return v.getStructFieldOKInternalBase(fallback, namespace, true)
+}
+
+func (v *validate) getStructFieldOKInternalBase(val reflect.Value, namespace string, allowNilTerminal bool) (current reflect.Value, kind reflect.Kind, nullable bool, found bool) {
 BEGIN:
 	current, kind, nullable = v.ExtractType(val)
 	if kind == reflect.Invalid {
@@ -100,6 +119,9 @@ BEGIN:
 
 	switch kind {
 	case reflect.Ptr, reflect.Interface:
+		if allowNilTerminal && !strings.ContainsAny(namespace, namespaceSeparator+leftBracket) {
+			found = true
+		}
 		return
 
 	case reflect.Struct:
