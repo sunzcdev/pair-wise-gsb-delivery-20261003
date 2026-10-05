@@ -541,6 +541,7 @@ func newGlobal() *Global {
 		MainThread: nil,
 		Registry:   newLTable(0, 32),
 		Global:     newLTable(0, 64),
+		rng:        newStateRNG(time.Now().UnixNano()),
 		builtinMts: make(map[int]LValue),
 		tempFiles:  make([]*os.File, 0, 10),
 	}

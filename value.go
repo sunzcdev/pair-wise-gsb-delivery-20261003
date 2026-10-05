@@ -3,6 +3,7 @@ package lua
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 )
 
@@ -170,6 +171,13 @@ type Global struct {
 	CurrentThread *LState
 	Registry      *LTable
 	Global        *LTable
+
+	// rng is the per-main-state random source backing math.random.
+	// It is never the process-global math/rand source, so independent
+	// LStates do not interfere with each other. Every coroutine created
+	// from a main state shares its Global and therefore draws from the
+	// same sequence.
+	rng *rand.Rand
 
 	builtinMts map[int]LValue
 	tempFiles  []*os.File

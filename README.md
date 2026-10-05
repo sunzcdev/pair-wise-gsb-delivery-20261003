@@ -214,6 +214,35 @@ An `LState` object that has been created by `*LState#NewThread()` inherits the c
     - By default, GopherLua does not show Go stack traces when panics occur.
     - You can get Go stack traces by setting this to `true` .
 
+### Random numbers (`math.random` / `math.randomseed`)
+
+- Each independent `NewState` owns a **private** random source. It is never
+    the process-global `math/rand` source, so separate `LState` values (and
+    the rest of your Go program) never interfere with one another.
+- Coroutines created from a main state
+    (`state.NewThread()` / `coroutine.create`, ...) share that main state's
+    global state, so they all draw from **one** shared sequence. Interleaving
+    the main state and its coroutines consumes that single sequence in call
+    order; the same state run on its own reproduces the same values.
+- The default source is seeded from the current time (`time.Now().UnixNano()`)
+    when the state is created, i.e. it is non-deterministic until seeded.
+- For deterministic replay, seed a state explicitly:
+    - from Lua: `math.randomseed(n)`
+    - from Go: `L.SetRandomSeed(n)`
+    - or inject a custom source: `L.SetRandomSource(r)` where `r` is a
+        non-nil `*math/rand.Rand`. Passing `nil` panics, as it is a host
+        programming error.
+- `math.random` integer intervals follow Lua semantics (`random(n)` →
+    `1..n`, `random(m, n)` → `m..n`). Empty/inverted intervals raise a Lua
+    error (`interval is empty`) instead of panicking Go; values never fall
+    outside the requested interval and integer draws are unbiased, including
+    spans that overflow `int64`.
+- Compatibility: previous releases implemented these functions with the
+    process-global `math/rand` source, so an unseeded program shared one
+    sequence across every state and with the host process. That behaviour is
+    intentionally removed; call `math.randomseed` / `SetRandomSeed` (or
+    `SetRandomSource`) for reproducible streams.
+
 ### API
 
 Refer to [Lua Reference Manual](http://www.lua.org/manual/5.1/) and [Go doc(LState methods)](http://godoc.org/github.com/yuin/gopher-lua) for further information.
