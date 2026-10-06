@@ -77,11 +77,39 @@ func TestValidSessionKeys_AesCm256(t *testing.T) {
 		"Session Auth Tag % 02x does not match expected % 02x", sessionAuthTag, expectedSessionAuthTag)
 }
 
-// This test asserts that calling aesCmKeyDerivation with a non-zero indexOverKdr fails
-// Currently this isn't supported, but the API makes sure we can add this in the future.
+// This test asserts that aesCmKeyDerivation with a non-zero indexOverKdr
+// ("index DIV kdr", RFC 3711 Section 4.3.1) produces the expected session keys.
+// The master key and salt are the ones from RFC 3711, Appendix B.3.
 func TestIndexOverKDR(t *testing.T) {
-	_, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, []byte{}, []byte{}, 1, 0)
-	assert.Error(t, err)
+	masterKey := []byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39}
+	masterSalt := []byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6}
+
+	expectedSessionKey := []byte{
+		0x53, 0x87, 0x0B, 0x4B, 0x8E, 0x2A, 0xF0, 0xC6, 0xF0, 0xCC, 0x8B, 0x15, 0x44, 0xC3, 0x41, 0x38,
+	}
+	expectedSessionSalt := []byte{0xC6, 0xDA, 0x1B, 0xBC, 0xDC, 0x3F, 0x42, 0x9C, 0xD8, 0x2F, 0x25, 0x93, 0xEB, 0x60}
+	expectedSessionAuthTag := []byte{
+		0xC7, 0x0D, 0x7F, 0x14, 0xE7, 0x55, 0x38, 0x0E, 0x6F, 0xF4,
+		0xED, 0x24, 0xF4, 0xF6, 0x11, 0xAA, 0xD1, 0x96, 0x85, 0xCE,
+	}
+
+	sessionKey, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 1, len(masterKey))
+	assert.NoError(t, err, "generateSessionKey failed")
+	assert.Equalf(t, expectedSessionKey, sessionKey,
+		"Session Key % 02x does not match expected % 02x", sessionKey, expectedSessionKey)
+
+	sessionSalt, err := aesCmKeyDerivation(labelSRTPSalt, masterKey, masterSalt, 1, len(masterSalt))
+	assert.NoError(t, err, "generateSessionSalt failed")
+	assert.Equalf(t, expectedSessionSalt, sessionSalt,
+		"Session Salt % 02x does not match expected % 02x", sessionSalt, expectedSessionSalt)
+
+	authKeyLen, err := ProtectionProfileAes128CmHmacSha1_80.AuthKeyLen()
+	assert.NoError(t, err)
+
+	sessionAuthTag, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, masterKey, masterSalt, 1, authKeyLen)
+	assert.NoError(t, err)
+	assert.Equalf(t, expectedSessionAuthTag, sessionAuthTag,
+		"Session Auth Tag % 02x does not match expected % 02x", sessionAuthTag, expectedSessionAuthTag)
 }
 
 func BenchmarkGenerateCounter(b *testing.B) {

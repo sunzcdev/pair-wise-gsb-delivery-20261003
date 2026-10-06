@@ -113,6 +113,8 @@ type Context struct {
 	rccMode         RCCMode
 	rocTransmitRate uint16
 
+	keyDerivationRate uint64
+
 	authTagRTPLen *int
 
 	cryptexMode CryptexMode
@@ -155,6 +157,10 @@ func CreateContext(
 		return nil, err
 	}
 
+	if err = c.checkKeyDerivationRate(); err != nil {
+		return nil, err
+	}
+
 	if c.authTagRTPLen != nil {
 		var authKeyLen int
 		authKeyLen, err = c.profile.AuthKeyLen()
@@ -189,6 +195,7 @@ func (c *Context) contextWithKey(masterKey, masterSalt []byte, profile Protectio
 		next.encryptSRTCP = c.encryptSRTCP
 		next.rccMode = c.rccMode
 		next.rocTransmitRate = c.rocTransmitRate
+		next.keyDerivationRate = c.keyDerivationRate
 		next.authTagRTPLen = c.authTagRTPLen
 		next.cryptexMode = c.cryptexMode
 
@@ -245,14 +252,22 @@ func (c *Context) createCipher(mki, masterKey, masterSalt []byte, encryptSRTP, e
 	useCryptex := c.cryptexMode != CryptexModeDisabled && encryptSRTP
 	switch c.profile {
 	case ProtectionProfileAeadAes128Gcm, ProtectionProfileAeadAes256Gcm:
+		if c.keyDerivationRate != 0 {
+			return nil, fmt.Errorf("%w: %s", errUnsupportedKDRProfile, c.profile)
+		}
+
 		return newSrtpCipherAeadAesGcm(profileWithArgs, masterKey, masterSalt, mki, encryptSRTP, encryptSRTCP, useCryptex)
 	case ProtectionProfileAes128CmHmacSha1_32,
 		ProtectionProfileAes128CmHmacSha1_80,
 		ProtectionProfileAes256CmHmacSha1_32,
 		ProtectionProfileAes256CmHmacSha1_80:
-		return newSrtpCipherAesCmHmacSha1(profileWithArgs, masterKey, masterSalt, mki, encryptSRTP, encryptSRTCP, useCryptex)
+		return newSrtpCipherAesCmHmacSha1(
+			profileWithArgs, masterKey, masterSalt, mki, encryptSRTP, encryptSRTCP, useCryptex, c.keyDerivationRate,
+		)
 	case ProtectionProfileNullHmacSha1_32, ProtectionProfileNullHmacSha1_80:
-		return newSrtpCipherAesCmHmacSha1(profileWithArgs, masterKey, masterSalt, mki, false, false, false)
+		return newSrtpCipherAesCmHmacSha1(
+			profileWithArgs, masterKey, masterSalt, mki, false, false, false, c.keyDerivationRate,
+		)
 	default:
 		return nil, fmt.Errorf("%w: %#v", errNoSuchSRTPProfile, c.profile)
 	}
@@ -460,6 +475,26 @@ func (c *Context) checkRCCMode() error {
 	}
 
 	return nil
+}
+
+// checkKeyDerivationRate rejects non-zero key derivation rates for protection
+// profiles that do not support periodic session key re-derivation.
+func (c *Context) checkKeyDerivationRate() error {
+	if c.keyDerivationRate == 0 {
+		return nil
+	}
+
+	switch c.profile {
+	case ProtectionProfileAes128CmHmacSha1_32,
+		ProtectionProfileAes128CmHmacSha1_80,
+		ProtectionProfileAes256CmHmacSha1_32,
+		ProtectionProfileAes256CmHmacSha1_80,
+		ProtectionProfileNullHmacSha1_32,
+		ProtectionProfileNullHmacSha1_80:
+		return nil
+	default:
+		return fmt.Errorf("%w: %s", errUnsupportedKDRProfile, c.profile)
+	}
 }
 
 // UpdateOptions updates Context options after it has been created.

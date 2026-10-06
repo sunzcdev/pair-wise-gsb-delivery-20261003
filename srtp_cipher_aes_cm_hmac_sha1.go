@@ -4,6 +4,7 @@
 package srtp
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -11,22 +12,65 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"hash"
+	"math/bits"
 
 	"github.com/pion/rtp"
 )
 
-type srtpCipherAesCmHmacSha1 struct {
-	protectionProfileWithArgs
+// maxKDRPeriodsCached bounds the number of key derivation periods for which
+// session keys are cached when a non-zero key derivation rate is used.
+// Evicted periods are re-derived from the master key on demand.
+const maxKDRPeriodsCached = 8
 
+// aesCmPeriodKeys holds the SRTP/SRTCP session keys derived for a single
+// key derivation period ("index DIV kdr") as defined in RFC 3711, Section 4.3.
+type aesCmPeriodKeys struct {
 	srtpSessionSalt []byte
 	srtpSessionAuth hash.Hash
 	srtpBlock       cipher.Block
-	srtpEncrypted   bool
 
 	srtcpSessionSalt []byte
 	srtcpSessionAuth hash.Hash
 	srtcpBlock       cipher.Block
-	srtcpEncrypted   bool
+}
+
+// clear releases all references to the derived key material and zeroes the
+// session salts, so the material does not linger in memory after the period
+// has been evicted from the cache.
+func (k *aesCmPeriodKeys) clear() {
+	for i := range k.srtpSessionSalt {
+		k.srtpSessionSalt[i] = 0
+	}
+	for i := range k.srtcpSessionSalt {
+		k.srtcpSessionSalt[i] = 0
+	}
+	k.srtpSessionSalt = nil
+	k.srtpSessionAuth = nil
+	k.srtpBlock = nil
+	k.srtcpSessionSalt = nil
+	k.srtcpSessionAuth = nil
+	k.srtcpBlock = nil
+}
+
+type srtpCipherAesCmHmacSha1 struct {
+	protectionProfileWithArgs
+
+	// masterKey and masterSalt are retained only when keyDerivationRate is
+	// non-zero, to derive session keys for later key derivation periods.
+	masterKey  []byte
+	masterSalt []byte
+
+	// keyDerivationRate is the kdr from RFC 3711, Section 4.3.1.
+	// Zero disables periodic re-derivation (all packets use period 0).
+	keyDerivationRate uint64
+	// kdrShift is log2(keyDerivationRate), valid when keyDerivationRate != 0.
+	kdrShift uint
+	// periodKeys caches derived session keys per key derivation period.
+	// It is bounded by maxKDRPeriodsCached.
+	periodKeys map[uint64]*aesCmPeriodKeys
+
+	srtpEncrypted  bool
+	srtcpEncrypted bool
 
 	mki []byte
 
@@ -46,6 +90,7 @@ func newSrtpCipherAesCmHmacSha1(
 	profile protectionProfileWithArgs,
 	masterKey, masterSalt, mki []byte,
 	encryptSRTP, encryptSRTCP, useCryptex bool,
+	keyDerivationRate uint64,
 ) (*srtpCipherAesCmHmacSha1, error) {
 	switch profile.ProtectionProfile {
 	case ProtectionProfileNullHmacSha1_80, ProtectionProfileNullHmacSha1_32:
@@ -59,49 +104,21 @@ func newSrtpCipherAesCmHmacSha1(
 		srtpEncrypted:             encryptSRTP,
 		srtcpEncrypted:            encryptSRTCP,
 		useCryptex:                useCryptex,
+		keyDerivationRate:         keyDerivationRate,
+		periodKeys:                map[uint64]*aesCmPeriodKeys{},
 	}
 
-	srtpSessionKey, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 0, len(masterKey))
-	if err != nil {
-		return nil, err
-	} else if srtpCipher.srtpBlock, err = aes.NewCipher(srtpSessionKey); err != nil {
-		return nil, err
+	if keyDerivationRate != 0 {
+		srtpCipher.kdrShift = uint(bits.TrailingZeros64(keyDerivationRate)) //nolint:gosec // G115
+		srtpCipher.masterKey = bytes.Clone(masterKey)
+		srtpCipher.masterSalt = bytes.Clone(masterSalt)
 	}
 
-	srtcpSessionKey, err := aesCmKeyDerivation(labelSRTCPEncryption, masterKey, masterSalt, 0, len(masterKey))
-	if err != nil {
-		return nil, err
-	} else if srtpCipher.srtcpBlock, err = aes.NewCipher(srtcpSessionKey); err != nil {
-		return nil, err
-	}
-
-	if srtpCipher.srtpSessionSalt, err = aesCmKeyDerivation(
-		labelSRTPSalt, masterKey, masterSalt, 0, len(masterSalt),
-	); err != nil {
-		return nil, err
-	} else if srtpCipher.srtcpSessionSalt, err = aesCmKeyDerivation(
-		labelSRTCPSalt, masterKey, masterSalt, 0, len(masterSalt),
-	); err != nil {
-		return nil, err
-	}
-
-	authKeyLen, err := profile.AuthKeyLen()
+	periodKeys, err := srtpCipher.derivePeriodKeys(0, masterKey, masterSalt)
 	if err != nil {
 		return nil, err
 	}
-
-	srtpSessionAuthTag, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, masterKey, masterSalt, 0, authKeyLen)
-	if err != nil {
-		return nil, err
-	}
-
-	srtcpSessionAuthTag, err := aesCmKeyDerivation(labelSRTCPAuthenticationTag, masterKey, masterSalt, 0, authKeyLen)
-	if err != nil {
-		return nil, err
-	}
-
-	srtpCipher.srtcpSessionAuth = hmac.New(sha1.New, srtcpSessionAuthTag)
-	srtpCipher.srtpSessionAuth = hmac.New(sha1.New, srtpSessionAuthTag)
+	srtpCipher.periodKeys[0] = periodKeys
 
 	mkiLen := len(mki)
 	if mkiLen > 0 {
@@ -110,6 +127,117 @@ func newSrtpCipherAesCmHmacSha1(
 	}
 
 	return srtpCipher, nil
+}
+
+// derivePeriodKeys derives the SRTP/SRTCP session keys for one key derivation
+// period from the given master key and salt.
+func (s *srtpCipherAesCmHmacSha1) derivePeriodKeys(
+	period uint64, masterKey, masterSalt []byte,
+) (*aesCmPeriodKeys, error) {
+	keys := &aesCmPeriodKeys{}
+
+	srtpSessionKey, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, period, len(masterKey))
+	if err != nil {
+		return nil, err
+	} else if keys.srtpBlock, err = aes.NewCipher(srtpSessionKey); err != nil {
+		return nil, err
+	}
+
+	srtcpSessionKey, err := aesCmKeyDerivation(labelSRTCPEncryption, masterKey, masterSalt, period, len(masterKey))
+	if err != nil {
+		return nil, err
+	} else if keys.srtcpBlock, err = aes.NewCipher(srtcpSessionKey); err != nil {
+		return nil, err
+	}
+
+	if keys.srtpSessionSalt, err = aesCmKeyDerivation(
+		labelSRTPSalt, masterKey, masterSalt, period, len(masterSalt),
+	); err != nil {
+		return nil, err
+	} else if keys.srtcpSessionSalt, err = aesCmKeyDerivation(
+		labelSRTCPSalt, masterKey, masterSalt, period, len(masterSalt),
+	); err != nil {
+		return nil, err
+	}
+
+	authKeyLen, err := s.AuthKeyLen()
+	if err != nil {
+		return nil, err
+	}
+
+	srtpSessionAuthTag, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, masterKey, masterSalt, period, authKeyLen)
+	if err != nil {
+		return nil, err
+	}
+
+	srtcpSessionAuthTag, err := aesCmKeyDerivation(
+		labelSRTCPAuthenticationTag, masterKey, masterSalt, period, authKeyLen,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	keys.srtcpSessionAuth = hmac.New(sha1.New, srtcpSessionAuthTag)
+	keys.srtpSessionAuth = hmac.New(sha1.New, srtpSessionAuthTag)
+
+	return keys, nil
+}
+
+// keyDerivationPeriod returns the key derivation period ("index DIV kdr")
+// for a packet index. The index is 2^16 * ROC + SEQ for SRTP and the
+// SRTCP index for SRTCP.
+func (s *srtpCipherAesCmHmacSha1) keyDerivationPeriod(index uint64) uint64 {
+	if s.keyDerivationRate == 0 {
+		return 0
+	}
+
+	return index >> s.kdrShift
+}
+
+// srtpPeriodKeys returns the session keys for the key derivation period of
+// the SRTP packet with the given sequence number and ROC.
+func (s *srtpCipherAesCmHmacSha1) srtpPeriodKeys(sequenceNumber uint16, roc uint32) (*aesCmPeriodKeys, error) {
+	return s.keysForPeriod(s.keyDerivationPeriod(uint64(roc)<<16 | uint64(sequenceNumber)))
+}
+
+// srtcpPeriodKeys returns the session keys for the key derivation period of
+// the SRTCP packet with the given index.
+func (s *srtpCipherAesCmHmacSha1) srtcpPeriodKeys(srtcpIndex uint32) (*aesCmPeriodKeys, error) {
+	return s.keysForPeriod(s.keyDerivationPeriod(uint64(srtcpIndex)))
+}
+
+// keysForPeriod returns the cached session keys for a key derivation period,
+// deriving and caching them if necessary. The cache is bounded: when it is
+// full, the keys of the oldest (lowest) period are released before caching
+// the new ones. Evicted periods are transparently re-derived on demand, so
+// late out-of-order packets from an older period can still be processed with
+// the keys of that period.
+func (s *srtpCipherAesCmHmacSha1) keysForPeriod(period uint64) (*aesCmPeriodKeys, error) {
+	if keys, ok := s.periodKeys[period]; ok {
+		return keys, nil
+	}
+
+	keys, err := s.derivePeriodKeys(period, s.masterKey, s.masterSalt)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(s.periodKeys) >= maxKDRPeriodsCached {
+		var oldest uint64
+		first := true
+		for p := range s.periodKeys {
+			if first || p < oldest {
+				oldest = p
+				first = false
+			}
+		}
+		s.periodKeys[oldest].clear()
+		delete(s.periodKeys, oldest)
+	}
+
+	s.periodKeys[period] = keys
+
+	return keys, nil
 }
 
 func (s *srtpCipherAesCmHmacSha1) encryptRTP(
@@ -155,13 +283,17 @@ func (s *srtpCipherAesCmHmacSha1) encryptRTP(
 func (s *srtpCipherAesCmHmacSha1) doEncryptRTP(dst []byte, header *rtp.Header, headerLen int, plaintext []byte,
 	roc uint32, rocInAuthTag bool, sameBuffer bool, payloadLen int,
 ) error {
-	encrypt := func(dst, plaintext []byte, headerLen int) error {
-		counter := generateCounter(header.SequenceNumber, roc, header.SSRC, s.srtpSessionSalt)
-
-		return xorBytesCTR(s.srtpBlock, counter[:], dst[headerLen:], plaintext[headerLen:])
+	keys, err := s.srtpPeriodKeys(header.SequenceNumber, roc)
+	if err != nil {
+		return err
 	}
 
-	var err error
+	encrypt := func(dst, plaintext []byte, headerLen int) error {
+		counter := generateCounter(header.SequenceNumber, roc, header.SSRC, keys.srtpSessionSalt)
+
+		return xorBytesCTR(keys.srtpBlock, counter[:], dst[headerLen:], plaintext[headerLen:])
+	}
+
 	switch {
 	case s.useCryptex && header.Extension:
 		err = encryptCryptexRTP(dst, plaintext, sameBuffer, header, encrypt)
@@ -182,7 +314,7 @@ func (s *srtpCipherAesCmHmacSha1) doEncryptRTP(dst []byte, header *rtp.Header, h
 	n := headerLen + payloadLen
 
 	// Generate the auth tag.
-	authTag, err := s.generateSrtpAuthTag(dst[:n], roc, rocInAuthTag)
+	authTag, err := s.generateSrtpAuthTag(keys, dst[:n], roc, rocInAuthTag)
 	if err != nil {
 		return err
 	}
@@ -216,8 +348,16 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTP(
 	actualTag := ciphertext[len(ciphertext)-authTagLen:]
 	ciphertext = ciphertext[:len(ciphertext)-len(s.mki)-authTagLen]
 
+	// Select the session keys of the key derivation period this packet
+	// belongs to. Late out-of-order packets from a previous period are
+	// authenticated and decrypted with the keys of that period.
+	keys, err := s.srtpPeriodKeys(header.SequenceNumber, roc)
+	if err != nil {
+		return nil, err
+	}
+
 	// Generate the auth tag we expect to see from the ciphertext.
-	expectedTag, err := s.generateSrtpAuthTag(ciphertext, roc, rocInAuthTag)
+	expectedTag, err := s.generateSrtpAuthTag(keys, ciphertext, roc, rocInAuthTag)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +370,7 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTP(
 
 	sameBuffer := isSameBuffer(dst, ciphertext)
 
-	err = s.doDecryptRTP(dst, ciphertext, header, headerLen, roc, sameBuffer)
+	err = s.doDecryptRTP(dst, ciphertext, header, headerLen, roc, sameBuffer, keys)
 	if err != nil {
 		return nil, err
 	}
@@ -239,12 +379,12 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTP(
 }
 
 func (s *srtpCipherAesCmHmacSha1) doDecryptRTP(dst, ciphertext []byte, header *rtp.Header, headerLen int, roc uint32,
-	sameBuffer bool,
+	sameBuffer bool, keys *aesCmPeriodKeys,
 ) error {
 	decrypt := func(dst, ciphertext []byte, headerLen int) error {
-		counter := generateCounter(header.SequenceNumber, roc, header.SSRC, s.srtpSessionSalt)
+		counter := generateCounter(header.SequenceNumber, roc, header.SSRC, keys.srtpSessionSalt)
 
-		return xorBytesCTR(s.srtpBlock, counter[:], dst[headerLen:], ciphertext[headerLen:])
+		return xorBytesCTR(keys.srtpBlock, counter[:], dst[headerLen:], ciphertext[headerLen:])
 	}
 
 	switch {
@@ -284,14 +424,19 @@ func (s *srtpCipherAesCmHmacSha1) encryptRTCP(dst, decrypted []byte, srtcpIndex 
 	dst = growBufferSize(dst, encryptedLen)
 	sameBuffer := isSameBuffer(dst, decrypted)
 
+	keys, err := s.srtcpPeriodKeys(srtcpIndex)
+	if err != nil {
+		return nil, err
+	}
+
 	if !sameBuffer {
 		copy(dst, decrypted[:srtcpHeaderSize]) // Copy the first 8 bytes (RTCP header)
 	}
 
 	// Encrypt everything after header
 	if s.srtcpEncrypted {
-		counter := generateCounter(uint16(srtcpIndex&0xffff), srtcpIndex>>16, ssrc, s.srtcpSessionSalt) //nolint:gosec // G115
-		if err = xorBytesCTR(s.srtcpBlock, counter[:], dst[srtcpHeaderSize:], decrypted[srtcpHeaderSize:]); err != nil {
+		counter := generateCounter(uint16(srtcpIndex&0xffff), srtcpIndex>>16, ssrc, keys.srtcpSessionSalt) //nolint:gosec // G115
+		if err = xorBytesCTR(keys.srtcpBlock, counter[:], dst[srtcpHeaderSize:], decrypted[srtcpHeaderSize:]); err != nil {
 			return nil, err
 		}
 
@@ -311,7 +456,7 @@ func (s *srtpCipherAesCmHmacSha1) encryptRTCP(dst, decrypted []byte, srtcpIndex 
 	n := decryptedLen + srtcpIndexSize
 
 	// Generate the authentication tag
-	authTag, err := s.generateSrtcpAuthTag(dst[:n])
+	authTag, err := s.generateSrtcpAuthTag(keys, dst[:n])
 	if err != nil {
 		return nil, err
 	}
@@ -340,7 +485,15 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTCP(dst, encrypted []byte, index, ssrc
 		return nil, errTooShortRTCP
 	}
 
-	expectedTag, err := s.generateSrtcpAuthTag(encrypted[:encryptedLen-mkiLen-authTagLen])
+	// Select the session keys of the key derivation period this packet
+	// belongs to, so late out-of-order packets from a previous period are
+	// authenticated and decrypted with the keys of that period.
+	keys, err := s.srtcpPeriodKeys(index)
+	if err != nil {
+		return nil, err
+	}
+
+	expectedTag, err := s.generateSrtcpAuthTag(keys, encrypted[:encryptedLen-mkiLen-authTagLen])
 	if err != nil {
 		return nil, err
 	}
@@ -359,8 +512,8 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTCP(dst, encrypted []byte, index, ssrc
 
 	isEncrypted := encrypted[decryptedLen]&srtcpEncryptionFlag != 0
 	if isEncrypted {
-		counter := generateCounter(uint16(index&0xffff), index>>16, ssrc, s.srtcpSessionSalt) //nolint:gosec // G115
-		err = xorBytesCTR(s.srtcpBlock, counter[:], dst[srtcpHeaderSize:], encrypted[srtcpHeaderSize:decryptedLen])
+		counter := generateCounter(uint16(index&0xffff), index>>16, ssrc, keys.srtcpSessionSalt) //nolint:gosec // G115
+		err = xorBytesCTR(keys.srtcpBlock, counter[:], dst[srtcpHeaderSize:], encrypted[srtcpHeaderSize:decryptedLen])
 	} else if !sameBuffer {
 		copy(dst[srtcpHeaderSize:], encrypted[srtcpHeaderSize:])
 	}
@@ -368,7 +521,9 @@ func (s *srtpCipherAesCmHmacSha1) decryptRTCP(dst, encrypted []byte, index, ssrc
 	return dst, err
 }
 
-func (s *srtpCipherAesCmHmacSha1) generateSrtpAuthTag(buf []byte, roc uint32, rocInAuthTag bool) ([]byte, error) {
+func (s *srtpCipherAesCmHmacSha1) generateSrtpAuthTag(
+	keys *aesCmPeriodKeys, buf []byte, roc uint32, rocInAuthTag bool,
+) ([]byte, error) {
 	// https://tools.ietf.org/html/rfc3711#section-4.2
 	// In the case of SRTP, M SHALL consist of the Authenticated
 	// Portion of the packet (as specified in Figure 1) concatenated with
@@ -383,16 +538,16 @@ func (s *srtpCipherAesCmHmacSha1) generateSrtpAuthTag(buf []byte, roc uint32, ro
 	// - Authenticated portion of the packet is everything BEFORE MKI
 	// - k_a is the session message authentication key
 	// - n_tag is the bit-length of the output authentication tag
-	s.srtpSessionAuth.Reset()
+	keys.srtpSessionAuth.Reset()
 
-	if _, err := s.srtpSessionAuth.Write(buf); err != nil {
+	if _, err := keys.srtpSessionAuth.Write(buf); err != nil {
 		return nil, err
 	}
 
 	// For SRTP only, we need to hash the rollover counter as well.
 	binary.BigEndian.PutUint32(s.authBuf[:4], roc)
 
-	_, err := s.srtpSessionAuth.Write(s.authBuf[:4])
+	_, err := keys.srtpSessionAuth.Write(s.authBuf[:4])
 	if err != nil {
 		return nil, err
 	}
@@ -408,16 +563,16 @@ func (s *srtpCipherAesCmHmacSha1) generateSrtpAuthTag(buf []byte, roc uint32, ro
 	var authTag []byte
 	if rocInAuthTag {
 		// ROC is already in buffer at [0:4], Sum will append hash starting at offset 4
-		authTag = s.srtpSessionAuth.Sum(s.authBuf[:4])[:authTagLen]
+		authTag = keys.srtpSessionAuth.Sum(s.authBuf[:4])[:authTagLen]
 	} else {
 		// No ROC prefix, Sum appends hash starting at offset 0
-		authTag = s.srtpSessionAuth.Sum(s.authBuf[:0])[:authTagLen]
+		authTag = keys.srtpSessionAuth.Sum(s.authBuf[:0])[:authTagLen]
 	}
 
 	return authTag, nil
 }
 
-func (s *srtpCipherAesCmHmacSha1) generateSrtcpAuthTag(buf []byte) ([]byte, error) {
+func (s *srtpCipherAesCmHmacSha1) generateSrtcpAuthTag(keys *aesCmPeriodKeys, buf []byte) ([]byte, error) {
 	// https://tools.ietf.org/html/rfc3711#section-4.2
 	//
 	// The pre-defined authentication transform for SRTP is HMAC-SHA1
@@ -429,9 +584,9 @@ func (s *srtpCipherAesCmHmacSha1) generateSrtcpAuthTag(buf []byte) ([]byte, erro
 	// - Authenticated portion of the packet is everything BEFORE MKI
 	// - k_a is the session message authentication key
 	// - n_tag is the bit-length of the output authentication tag
-	s.srtcpSessionAuth.Reset()
+	keys.srtcpSessionAuth.Reset()
 
-	if _, err := s.srtcpSessionAuth.Write(buf); err != nil {
+	if _, err := keys.srtcpSessionAuth.Write(buf); err != nil {
 		return nil, err
 	}
 	authTagLen, err := s.AuthTagRTCPLen()
@@ -440,7 +595,7 @@ func (s *srtpCipherAesCmHmacSha1) generateSrtcpAuthTag(buf []byte) ([]byte, erro
 	}
 
 	// Use pre-allocated buffer to avoid allocation in Sum()
-	return s.srtcpSessionAuth.Sum(s.rtcpAuthBuf[:0])[:authTagLen], nil
+	return keys.srtcpSessionAuth.Sum(s.rtcpAuthBuf[:0])[:authTagLen], nil
 }
 
 func (s *srtpCipherAesCmHmacSha1) getRTCPIndex(in []byte) uint32 {

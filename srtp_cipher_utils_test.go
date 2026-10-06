@@ -36,22 +36,26 @@ func newSrtpCipherAesCmHmacSha1WithDerivedKeys(
 		protectionProfileWithArgs: protectionProfileWithArgs{ProtectionProfile: profile},
 		srtpEncrypted:             encryptSRTP,
 		srtcpEncrypted:            encryptSRTCP,
+		periodKeys:                map[uint64]*aesCmPeriodKeys{},
 	}
+
+	periodKeys := &aesCmPeriodKeys{}
+	srtpCipher.periodKeys[0] = periodKeys
 
 	var err error
-	if srtpCipher.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
+	if periodKeys.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
 		return nil, err
 	}
 
-	if srtpCipher.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
+	if periodKeys.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
 		return nil, err
 	}
 
-	srtpCipher.srtpSessionSalt = keys.srtpSessionSalt
-	srtpCipher.srtcpSessionSalt = keys.srtcpSessionSalt
+	periodKeys.srtpSessionSalt = keys.srtpSessionSalt
+	periodKeys.srtcpSessionSalt = keys.srtcpSessionSalt
 
-	srtpCipher.srtcpSessionAuth = hmac.New(sha1.New, keys.srtcpSessionAuthTag)
-	srtpCipher.srtpSessionAuth = hmac.New(sha1.New, keys.srtpSessionAuthTag)
+	periodKeys.srtcpSessionAuth = hmac.New(sha1.New, keys.srtcpSessionAuthTag)
+	periodKeys.srtpSessionAuth = hmac.New(sha1.New, keys.srtpSessionAuthTag)
 
 	return srtpCipher, nil
 }

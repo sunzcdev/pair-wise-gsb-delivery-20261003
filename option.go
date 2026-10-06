@@ -240,3 +240,34 @@ func Cryptex(cryptexMode CryptexMode) ContextOption {
 		return nil
 	}
 }
+
+// maxKeyDerivationRate is the maximum key derivation rate allowed by RFC 3711, Section 4.3.1.
+const maxKeyDerivationRate = 1 << 24
+
+// KeyDerivationRate sets the key derivation rate (kdr) from RFC 3711, Section 4.3.1.
+// When set to a non-zero value, SRTP/SRTCP session keys are periodically re-derived from the
+// master key: the packet index (2^16 * ROC + SEQ for SRTP, the SRTCP index for SRTCP) divided
+// by kdr selects the key derivation period, so every kdr packets a fresh set of session keys
+// is used without re-negotiating the master key.
+//
+// The rate must be 0 (periodic re-derivation disabled, the default) or a power of two
+// not greater than 2^24. A non-zero rate is only supported for the AES-CM/HMAC-SHA1
+// protection profiles (including the NULL profiles, where it applies to the
+// authentication key derivation).
+//
+// The same rate applies to both SRTP and SRTCP, as required by RFC 3711.
+func KeyDerivationRate(rate uint64) ContextOption {
+	return func(c *Context) error {
+		if c.constructed {
+			return ErrContextOptionNotUpdatable
+		}
+
+		if rate != 0 && (rate > maxKeyDerivationRate || rate&(rate-1) != 0) {
+			return errInvalidKeyDerivationRate
+		}
+
+		c.keyDerivationRate = rate
+
+		return nil
+	}
+}
