@@ -25,6 +25,12 @@ const (
 	// ControlTypeSubtreeDelete - https://datatracker.ietf.org/doc/html/draft-armijo-ldap-treedelete-02
 	ControlTypeSubtreeDelete = "1.2.840.113556.1.4.805"
 
+	// ControlTypeTransaction - Lightweight Directory Access Protocol (LDAP)
+	// Transactions. The control value is the OCTET STRING transaction
+	// identifier issued by the server when a transaction is started.
+	// https://www.rfc-editor.org/rfc/rfc5805.html
+	ControlTypeTransaction = "1.3.6.1.1.21.2"
+
 	// ControlTypeServerSideSorting - https://www.ietf.org/rfc/rfc2891.txt
 	ControlTypeServerSideSorting = "1.2.840.113556.1.4.473"
 	// ControlTypeServerSideSorting - https://www.ietf.org/rfc/rfc2891.txt
@@ -158,6 +164,7 @@ var ControlTypeMap = map[string]string{
 	ControlTypeManageDsaIT:            "Manage DSA IT",
 	ControlTypeWhoAmI:                 "Who Am I",
 	ControlTypeSubtreeDelete:          "Subtree Delete Control",
+	ControlTypeTransaction:            "Transaction Specification",
 
 	ControlTypeServerSideSorting:       "Server Side Sorting",
 	ControlTypeServerSideSortingResult: "Server Side Sorting Result",
@@ -767,6 +774,16 @@ func DecodeControl(packet *ber.Packet) (Control, error) {
 		return NewControlMicrosoftServerLinkTTL(), nil
 	case ControlTypeSubtreeDelete:
 		return NewControlSubtreeDelete(), nil
+	case ControlTypeTransaction:
+		if value == nil {
+			return nil, malformedf("transaction specification control value is missing")
+		}
+		value.Description += " (Transaction Specification)"
+		identifier, err := packetData(value)
+		if err != nil {
+			return nil, fmt.Errorf("transaction identifier is not an octet string: %w", err)
+		}
+		return &ControlTransaction{Criticality: Criticality, Identifier: identifier}, nil
 	case ControlTypeServerSideSorting:
 		if value == nil {
 			return nil, malformedf("server side sorting control value is missing")

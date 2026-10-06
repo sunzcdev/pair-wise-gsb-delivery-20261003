@@ -29,6 +29,7 @@ type Client interface {
 	ModifyDN(*ModifyDNRequest) error
 	ModifyWithResult(*ModifyRequest) (*ModifyResult, error)
 	Extended(*ExtendedRequest) (*ExtendedResponse, error)
+	StartTransaction() (*Transaction, error)
 
 	Compare(dn, attribute, value string) (bool, error)
 	PasswordModify(*PasswordModifyRequest) (*PasswordModifyResult, error)
