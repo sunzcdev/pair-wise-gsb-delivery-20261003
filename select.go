@@ -13,6 +13,7 @@ type selectData struct {
 	PlaceholderFormat PlaceholderFormat
 	RunWith           BaseRunner
 	Prefixes          []Sqlizer
+	CTEs              []CTEBuilder
 	Options           []string
 	Columns           []Sqlizer
 	From              Sqlizer
@@ -76,6 +77,13 @@ func (d *selectData) toSqlRaw() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEs(d.CTEs, sql, args)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("SELECT ")
@@ -241,6 +249,12 @@ func (b SelectBuilder) Prefix(sql string, args ...interface{}) SelectBuilder {
 // PrefixExpr adds an expression to the very beginning of the query
 func (b SelectBuilder) PrefixExpr(expr Sqlizer) SelectBuilder {
 	return builder.Append(b, "Prefixes", expr).(SelectBuilder)
+}
+
+// With adds common table expressions (CTEs) to the query, rendered as a WITH
+// clause before SELECT. See CTE for how to build individual CTEs.
+func (b SelectBuilder) With(ctes ...CTEBuilder) SelectBuilder {
+	return builder.Extend(b, "CTEs", ctes).(SelectBuilder)
 }
 
 // Distinct adds a DISTINCT clause to the query.

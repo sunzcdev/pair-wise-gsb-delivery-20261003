@@ -16,6 +16,7 @@ type insertData struct {
 	PlaceholderFormat PlaceholderFormat
 	RunWith           BaseRunner
 	Prefixes          []Sqlizer
+	CTEs              []CTEBuilder
 	StatementKeyword  string
 	Options           []string
 	Into              string
@@ -69,6 +70,13 @@ func (d *insertData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEs(d.CTEs, sql, args)
+		if err != nil {
+			return
+		}
 	}
 
 	if d.StatementKeyword == "" {
@@ -234,6 +242,12 @@ func (b InsertBuilder) Prefix(sql string, args ...interface{}) InsertBuilder {
 // PrefixExpr adds an expression to the very beginning of the query
 func (b InsertBuilder) PrefixExpr(expr Sqlizer) InsertBuilder {
 	return builder.Append(b, "Prefixes", expr).(InsertBuilder)
+}
+
+// With adds common table expressions (CTEs) to the query, rendered as a WITH
+// clause before INSERT. See CTE for how to build individual CTEs.
+func (b InsertBuilder) With(ctes ...CTEBuilder) InsertBuilder {
+	return builder.Extend(b, "CTEs", ctes).(InsertBuilder)
 }
 
 // Options adds keyword options before the INTO clause of the query.

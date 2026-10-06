@@ -14,6 +14,7 @@ type updateData struct {
 	PlaceholderFormat PlaceholderFormat
 	RunWith           BaseRunner
 	Prefixes          []Sqlizer
+	CTEs              []CTEBuilder
 	Table             string
 	SetClauses        []setClause
 	From              Sqlizer
@@ -73,6 +74,13 @@ func (d *updateData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEs(d.CTEs, sql, args)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("UPDATE ")
@@ -214,6 +222,12 @@ func (b UpdateBuilder) Prefix(sql string, args ...interface{}) UpdateBuilder {
 // PrefixExpr adds an expression to the very beginning of the query
 func (b UpdateBuilder) PrefixExpr(expr Sqlizer) UpdateBuilder {
 	return builder.Append(b, "Prefixes", expr).(UpdateBuilder)
+}
+
+// With adds common table expressions (CTEs) to the query, rendered as a WITH
+// clause before UPDATE. See CTE for how to build individual CTEs.
+func (b UpdateBuilder) With(ctes ...CTEBuilder) UpdateBuilder {
+	return builder.Extend(b, "CTEs", ctes).(UpdateBuilder)
 }
 
 // Table sets the table to be updated.

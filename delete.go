@@ -13,6 +13,7 @@ type deleteData struct {
 	PlaceholderFormat PlaceholderFormat
 	RunWith           BaseRunner
 	Prefixes          []Sqlizer
+	CTEs              []CTEBuilder
 	From              string
 	WhereParts        []Sqlizer
 	OrderBys          []string
@@ -43,6 +44,13 @@ func (d *deleteData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEs(d.CTEs, sql, args)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("DELETE FROM ")
@@ -139,6 +147,12 @@ func (b DeleteBuilder) Prefix(sql string, args ...interface{}) DeleteBuilder {
 // PrefixExpr adds an expression to the very beginning of the query
 func (b DeleteBuilder) PrefixExpr(expr Sqlizer) DeleteBuilder {
 	return builder.Append(b, "Prefixes", expr).(DeleteBuilder)
+}
+
+// With adds common table expressions (CTEs) to the query, rendered as a WITH
+// clause before DELETE. See CTE for how to build individual CTEs.
+func (b DeleteBuilder) With(ctes ...CTEBuilder) DeleteBuilder {
+	return builder.Extend(b, "CTEs", ctes).(DeleteBuilder)
 }
 
 // From sets the table to be deleted from.
