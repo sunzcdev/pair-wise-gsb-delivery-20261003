@@ -36,6 +36,7 @@ In other words, the `acmez` package is **porcelain** while the `acme` package is
 	- DNS Labeled With ACME Account ID Challenge ([draft-ietf-acme-dns-account-label-01](https://datatracker.ietf.org/doc/draft-ietf-acme-dns-account-label/01/))
 - ACME Renewal Information (ARI) support ([RFC 9773](https://datatracker.ietf.org/doc/html/rfc9773))
 - ACME profiles ([draft-aaron-acme-profiles](https://datatracker.ietf.org/doc/draft-aaron-acme-profiles/))
+- Optional, pluggable CAA pre-check ([RFC 8659](https://www.rfc-editor.org/rfc/rfc8659) / [RFC 8657](https://www.rfc-editor.org/rfc/rfc8657)), honoring `issue`/`issuewild` and the `accounturi` and `validationmethods` parameters, with a replaceable DNS queryer and configurable handling of inconclusive results
 
 
 ## Install

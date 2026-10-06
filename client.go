@@ -54,6 +54,15 @@ type Client struct {
 
 	// Map of solvers keyed by name of the challenge type.
 	ChallengeSolvers map[string]Solver
+
+	// CAAChecker, if set, performs an advisory CAA pre-check before
+	// an order is created: it verifies that every DNS identifier's
+	// CAA policy allows the target CA to issue to the current account
+	// using the configured challenge types. A failed check fails fast,
+	// before challenges are set up. It is an early configuration check
+	// only; the CA still evaluates CAA authoritatively at issuance time.
+	// See RFC 8659 and RFC 8657.
+	CAAChecker *CAAChecker
 }
 
 // ObtainCertificateForSANs is a light wrapper over ObtainCertificate that generates a simple CSR
@@ -90,6 +99,12 @@ func (c *Client) ObtainCertificate(ctx context.Context, params OrderParameters) 
 	}
 	if len(params.Identifiers) == 0 {
 		return nil, errors.New("order does not list any identifiers")
+	}
+
+	// Optional advisory CAA pre-check, done before we contact the CA
+	// or set up any challenges.
+	if err := c.preCheckCAA(ctx, params.Account, params.Identifiers); err != nil {
+		return nil, err
 	}
 
 	// create the ACME order
