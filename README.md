@@ -88,6 +88,41 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Spatial joins (dual-tree traversal)
+
+`Join` finds every pair of intersecting items across two trees using a
+dual-tree traversal: node pairs whose bounding boxes do not intersect are
+pruned on both sides, so far-apart regions are never explored down to the
+leaf level. Returning `false` from the callback stops the traversal early,
+and `Join` never mutates either tree (a `Copy` stays a valid snapshot).
+
+```go
+var depots, deliveries rtree.RTreeG[string]
+// ... insert items into both trees ...
+
+depots.Join(&deliveries, rtree.JoinOptions{},
+	func(min1, max1 [2]float64, depot string,
+		min2, max2 [2]float64, delivery string) bool {
+		println(depot, "serves", delivery)
+		return true // return false to stop early
+	},
+)
+```
+
+`JoinOptions` has three flags:
+
+- `Strict`: only count pairs with overlapping interiors; rectangles that
+  merely touch on an edge or corner are excluded.
+- `Unique`: when joining a tree with itself, report each pair once instead of
+  both `(a,b)` and `(b,a)`.
+- `Self`: include `(a,a)` pairs in a self join (excluded by default); under
+  `Strict`, zero-area items such as points still do not self-match.
+
+Pair identity is the physical entry, so two items that share an identical
+rectangle or data value remain distinct. Trees with different data types can
+be joined with the generic `rtree.JoinG` (or `rtree.JoinGN` for custom
+numeric types).
+
 
 ## Algorithms
 
@@ -135,4 +170,3 @@ minimum x value.
 ## License
 
 rtree source code is available under the MIT License.
-

@@ -325,6 +325,14 @@ func (r *rect[N]) intersects(b *rect[N]) bool {
 		b.min[1] > r.max[1] || b.max[1] < r.min[1])
 }
 
+// overlaps returns true if both rects share any interior area.
+// Unlike intersects, rectangles that only touch on an edge or corner do not
+// count.
+func (r *rect[N]) overlaps(b *rect[N]) bool {
+	return r.min[0] < b.max[0] && b.min[0] < r.max[0] &&
+		r.min[1] < b.max[1] && b.min[1] < r.max[1]
+}
+
 func (n *node[N, T]) chooseLeastEnlargement(ir *rect[N]) (index int) {
 	rects := n.rects[:n.count]
 	var j = -1
@@ -455,6 +463,291 @@ func (tr *RTreeGN[N, T]) Search(min, max [2]N,
 	if target.intersects(&tr.rect) {
 		tr.root.search(&target, iter)
 	}
+}
+
+// JoinOptions controls the behavior of the dual-tree spatial join.
+// The zero value keeps boundary-touching rectangles, emits both (a,b) and
+// (b,a) directions when a tree is joined with itself, and never pairs an
+// entry with itself.
+type JoinOptions struct {
+	// Strict excludes pairs that only touch on an edge or corner. When false
+	// (the default), any rectangle intersection counts, including boundary
+	// contact.
+	Strict bool
+	// Unique only takes effect when a tree is joined with itself. When true,
+	// each pair is reported at most once, so (a,b) is not also emitted as
+	// (b,a). Pair identity is based on the physical tree entries, never on
+	// rectangle or data equality.
+	Unique bool
+	// Self only takes effect when a tree is joined with itself. When false
+	// (the default), an entry is never paired with itself. When true, self
+	// pairs are included. Under Strict they are still excluded for zero-area
+	// rectangles (points and lines).
+	Self bool
+}
+
+// Join performs a dual-tree spatial join, calling iter for every item in tr
+// whose rectangle intersects an item in other. Node pairs from either tree
+// whose bounding rectangles do not intersect are pruned, and returning false
+// from iter stops the operation early.
+//
+// When tr and other are the same tree the join is a self join; see
+// JoinOptions for how Unique and Self govern pair de-duplication and self
+// pairing. Two entries that happen to carry identical rectangles or data are
+// still distinct entries, so such pairs are never collapsed.
+//
+// The operation is read-only; a tree obtained via Copy remains an immutable
+// snapshot.
+func (tr *RTreeGN[N, T]) Join(other *RTreeGN[N, T], opts JoinOptions,
+	iter func(min1, max1 [2]N, data1 T, min2, max2 [2]N, data2 T) bool,
+) {
+	joinGN(tr, other, opts, iter)
+}
+
+// joinGN is the dual-tree join core, kept as a free function so it can be
+// shared by the cross-type wrapper while accepting trees with different data
+// types.
+func joinGN[N numeric, T1, T2 any](tr1 *RTreeGN[N, T1], tr2 *RTreeGN[N, T2],
+	opts JoinOptions,
+	iter func(min1, max1 [2]N, data1 T1, min2, max2 [2]N, data2 T2) bool,
+) {
+	if tr1 == nil || tr2 == nil || tr1.root == nil || tr2.root == nil {
+		return
+	}
+	hit := func(a, b *rect[N]) bool {
+		if opts.Strict {
+			return a.overlaps(b)
+		}
+		return a.intersects(b)
+	}
+	if !hit(&tr1.rect, &tr2.rect) {
+		return
+	}
+	sameTree := unsafe.Pointer(tr1) == unsafe.Pointer(tr2)
+	joinNodes(tr1.root, tr2.root, sameTree, sameTree && opts.Unique, opts.Self,
+		hit, iter, nil)
+}
+
+// joinNodes recursively joins two nodes from the participating trees.
+// sameTree reports whether both nodes belong to one tree, unique that
+// duplicate (reversed) pairs must be suppressed, and self_ whether an entry
+// may be paired with itself. visits, when non-nil, counts every node pair
+// considered, including ones that are later pruned, for diagnostics.
+func joinNodes[N numeric, T1, T2 any](n1 *node[N, T1], n2 *node[N, T2],
+	sameTree, unique, self_ bool,
+	hit func(a, b *rect[N]) bool,
+	iter func(min1, max1 [2]N, data1 T1, min2, max2 [2]N, data2 T2) bool,
+	visits *int,
+) bool {
+	if visits != nil {
+		*visits++
+	}
+	leaf1, leaf2 := n1.leaf(), n2.leaf()
+	r1 := n1.rects[:n1.count]
+	r2 := n2.rects[:n2.count]
+
+	if leaf1 && leaf2 {
+		items1 := n1.items()
+		items2 := n2.items()
+		sameLeaf := sameTree && unsafe.Pointer(n1) == unsafe.Pointer(n2)
+		for i := 0; i < len(r1); i++ {
+			jstart := 0
+			if sameLeaf && unique {
+				jstart = i
+			}
+			for j := jstart; j < len(r2); j++ {
+				if sameLeaf && !self_ && j == i {
+					continue
+				}
+				if !hit(&r1[i], &r2[j]) {
+					continue
+				}
+				if !iter(r1[i].min, r1[i].max, items1[i],
+					r2[j].min, r2[j].max, items2[j]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	if leaf1 || leaf2 {
+		// One side is a leaf, so descend the branch and report each leaf
+		// entry against every intersecting descendant entry.
+		if leaf1 {
+			items1 := n1.items()
+			for i := 0; i < len(r1); i++ {
+				if !joinLeftLeaf(&r1[i], items1[i], n2, hit, iter, visits) {
+					return false
+				}
+			}
+		} else {
+			items2 := n2.items()
+			for j := 0; j < len(r2); j++ {
+				if !joinRightLeaf(n1, &r2[j], items2[j], hit, iter, visits) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	// Both nodes are branches.
+	children1 := n1.children()
+	children2 := n2.children()
+	sameNode := sameTree && unsafe.Pointer(n1) == unsafe.Pointer(n2)
+	if sameNode {
+		for i := 0; i < len(r1); i++ {
+			if unique {
+				// Diagonal child carries the de-duplication and self-pair
+				// rules down; off-diagonal children hold disjoint entries,
+				// so only j > i is visited and each cross pair is unique.
+				if hit(&r1[i], &r2[i]) {
+					if !joinNodes(children1[i], children2[i], true, true,
+						self_, hit, iter, visits) {
+						return false
+					}
+				}
+				for j := i + 1; j < len(r2); j++ {
+					if !hit(&r1[i], &r2[j]) {
+						continue
+					}
+					if !joinNodes(children1[i], children2[j], true, false,
+						false, hit, iter, visits) {
+						return false
+					}
+				}
+			} else {
+				// Visit every ordered child pair, including both directions;
+				// the diagonal carries the self-pair permission down.
+				for j := 0; j < len(r2); j++ {
+					if !hit(&r1[i], &r2[j]) {
+						continue
+					}
+					if j == i {
+						if !joinNodes(children1[i], children2[j], true, false,
+							self_, hit, iter, visits) {
+							return false
+						}
+					} else {
+						if !joinNodes(children1[i], children2[j], true, false,
+							false, hit, iter, visits) {
+							return false
+						}
+					}
+				}
+			}
+		}
+		return true
+	}
+	for i := 0; i < len(r1); i++ {
+		for j := 0; j < len(r2); j++ {
+			if !hit(&r1[i], &r2[j]) {
+				continue
+			}
+			if !joinNodes(children1[i], children2[j], sameTree, unique, self_,
+				hit, iter, visits) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// joinLeftLeaf joins a single left-side leaf entry against every
+// intersecting entry in the right-side subtree rooted at n. The leaf entry
+// sits at a different depth than everything under n (or belongs to another
+// tree), so neither self pairing nor same-leaf de-duplication can apply.
+func joinLeftLeaf[N numeric, T1, T2 any](lr *rect[N], ldata T1,
+	n *node[N, T2],
+	hit func(a, b *rect[N]) bool,
+	iter func(min1, max1 [2]N, data1 T1, min2, max2 [2]N, data2 T2) bool,
+	visits *int,
+) bool {
+	if visits != nil {
+		*visits++
+	}
+	rects := n.rects[:n.count]
+	if n.leaf() {
+		items := n.items()
+		for j := 0; j < len(rects); j++ {
+			if !hit(lr, &rects[j]) {
+				continue
+			}
+			if !iter(lr.min, lr.max, ldata,
+				rects[j].min, rects[j].max, items[j]) {
+				return false
+			}
+		}
+		return true
+	}
+	children := n.children()
+	for j := 0; j < len(rects); j++ {
+		if !hit(lr, &rects[j]) {
+			continue
+		}
+		if !joinLeftLeaf(lr, ldata, children[j], hit, iter, visits) {
+			return false
+		}
+	}
+	return true
+}
+
+// joinRightLeaf joins a single right-side leaf entry against every
+// intersecting entry in the left-side subtree rooted at n. See joinLeftLeaf.
+func joinRightLeaf[N numeric, T1, T2 any](n *node[N, T1], lr *rect[N],
+	ldata T2,
+	hit func(a, b *rect[N]) bool,
+	iter func(min1, max1 [2]N, data1 T1, min2, max2 [2]N, data2 T2) bool,
+	visits *int,
+) bool {
+	if visits != nil {
+		*visits++
+	}
+	rects := n.rects[:n.count]
+	if n.leaf() {
+		items := n.items()
+		for j := 0; j < len(rects); j++ {
+			if !hit(lr, &rects[j]) {
+				continue
+			}
+			if !iter(rects[j].min, rects[j].max, items[j],
+				lr.min, lr.max, ldata) {
+				return false
+			}
+		}
+		return true
+	}
+	children := n.children()
+	for j := 0; j < len(rects); j++ {
+		if !hit(lr, &rects[j]) {
+			continue
+		}
+		if !joinRightLeaf(children[j], lr, ldata, hit, iter, visits) {
+			return false
+		}
+	}
+	return true
+}
+
+// JoinGN joins two RTreeGN trees that may carry different data types. It is
+// identical to RTreeGN.Join otherwise; see JoinOptions for the options and
+// the RTreeGN.Join docs for the de-duplication, snapshot, and early-stop
+// semantics.
+func JoinGN[N numeric, T1, T2 any](tr1 *RTreeGN[N, T1], tr2 *RTreeGN[N, T2],
+	opts JoinOptions,
+	iter func(min1, max1 [2]N, data1 T1, min2, max2 [2]N, data2 T2) bool,
+) {
+	joinGN(tr1, tr2, opts, iter)
+}
+
+// JoinG joins two RTreeG trees that carry different data types. It is
+// identical to RTreeG.Join otherwise; see JoinOptions and RTreeGN.Join.
+func JoinG[T1, T2 any](tr1 *RTreeG[T1], tr2 *RTreeG[T2], opts JoinOptions,
+	iter func(min1, max1 [2]float64, data1 T1,
+		min2, max2 [2]float64, data2 T2) bool,
+) {
+	joinGN(&tr1.base, &tr2.base, opts, iter)
 }
 
 // Scane all items in the tree
@@ -956,6 +1249,20 @@ func (tr *RTreeG[T]) Scan(iter func(min, max [2]float64, data T) bool) {
 	tr.base.Scan(iter)
 }
 
+// Join performs a dual-tree spatial join, calling iter for every intersecting
+// pair of items across the two trees while pruning non-intersecting node
+// pairs on both sides. See RTreeGN.Join and JoinOptions for boundary contact,
+// self-join de-duplication, self pairing, and early-stop semantics.
+func (tr *RTreeG[T]) Join(other *RTreeG[T], opts JoinOptions,
+	iter func(min1, max1 [2]float64, data1 T,
+		min2, max2 [2]float64, data2 T) bool,
+) {
+	if other == nil {
+		return
+	}
+	joinGN(&tr.base, &other.base, opts, iter)
+}
+
 // Copy the tree.
 // This is a copy-on-write operation and is very fast because it only performs
 // a shadowed copy.
@@ -1107,6 +1414,21 @@ func (tr *RTree) Search(
 // Scan iterates through all data in tree in no specified order.
 func (tr *RTree) Scan(iter func(min, max [2]float64, data any) bool) {
 	tr.base.Scan(iter)
+}
+
+// Join performs a dual-tree spatial join, calling iter for every
+// intersecting pair of items across the two trees while pruning
+// non-intersecting node pairs on both sides. See RTreeGN.Join and
+// JoinOptions for boundary contact, self-join de-duplication, self pairing,
+// and early-stop semantics.
+func (tr *RTree) Join(other *RTree, opts JoinOptions,
+	iter func(min1, max1 [2]float64, data1 any,
+		min2, max2 [2]float64, data2 any) bool,
+) {
+	if other == nil {
+		return
+	}
+	joinGN(&tr.base.base, &other.base.base, opts, iter)
 }
 
 // Len returns the number of items in tree
