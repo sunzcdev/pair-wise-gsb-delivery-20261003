@@ -486,6 +486,35 @@ type Server struct {
 	// bounded. Calling PostBody or Request.Body reads the entire remaining body
 	// into memory.
 	StreamRequestBody bool
+
+	// PipelineParallelism enables parallel processing of HTTP/1.x pipelined
+	// requests. It is the maximum number of in-flight requests per connection
+	// whose handlers may run concurrently. A value of zero (the default) keeps
+	// the classic, strictly serial per-connection processing.
+	//
+	// Only requests explicitly approved by AllowPipelineRequest run in parallel.
+	// Responses are always written back in the order the requests arrived.
+	// The bound also caps how many completed responses may be buffered while
+	// waiting for an earlier request to finish.
+	//
+	// When an unsafe request is encountered (a body, an upgrade, a non-GET/HEAD
+	// method, or anything AllowPipelineRequest rejects) the connection forms a
+	// serial boundary: all in-flight parallel results are flushed in order and
+	// the request is processed serially before parallel processing resumes.
+	PipelineParallelism int
+
+	// AllowPipelineRequest decides whether a single request may be processed in
+	// parallel with other pipelined requests. It is consulted after the request
+	// headers (and, when StreamRequestBody is disabled, the body) have been
+	// fully read, but before the Handler is invoked.
+	//
+	// The framework already excludes requests with a body, 'Expect:
+	// 100-continue', 'Connection: Upgrade', chunked/identity framing and methods
+	// other than GET and HEAD. This hook is the explicit, per-request opt-in.
+	//
+	// It is only called when PipelineParallelism is greater than zero. Requests
+	// for which it returns false form a serial boundary.
+	AllowPipelineRequest func(header *RequestHeader) bool
 }
 
 // TimeoutHandler creates RequestHandler, which returns StatusRequestTimeout
@@ -669,6 +698,11 @@ type RequestCtx struct {
 	connID           uint64
 	connRequestNum   uint64
 	hijackNoResponse bool
+
+	// pipelineDone, when non-nil, is closed when the owning connection is
+	// torn down while parallel pipelined handlers may still be running.
+	// It is only set for requests dispatched in parallel pipeline mode.
+	pipelineDone <-chan struct{}
 }
 
 // EarlyHints allows the server to hint to the browser what resources a page would need
@@ -940,6 +974,7 @@ func (ctx *RequestCtx) reset() {
 
 	ctx.hijackHandler = nil
 	ctx.hijackNoResponse = false
+	ctx.pipelineDone = nil
 }
 
 type firstByteReader struct {
@@ -2377,7 +2412,19 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		serverDateOnce.Do(updateServerDate)
 	}
 
+	if s.PipelineParallelism > 0 && s.AllowPipelineRequest != nil && !s.StreamRequestBody {
+		return s.serveConnWithPipelining(c, connTime, countConcurrency)
+	}
+
+	return s.serveConnSerial(c, connTime, countConcurrency)
+}
+
+// registerIdleConn records c in the server's idle connection map and schedules
+// it to be considered idle five seconds after connTime. It returns the atomic
+// timestamp used to update the connection's idle state while serving requests.
+func (s *Server) registerIdleConn(c net.Conn, connTime time.Time) *atomic.Int64 {
 	s.idleConnsMu.Lock()
+	defer s.idleConnsMu.Unlock()
 	if s.idleConns == nil {
 		s.idleConns = make(map[net.Conn]*atomic.Int64)
 	}
@@ -2395,7 +2442,22 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	// Same as net/http.Server:
 	// https://github.com/golang/go/blob/85d7bab91d9a3ed1f76842e4328973ea75efef54/src/net/http/server.go#L2834-L2836
 	idleConnTime.Store(connTime.Add(time.Second * 5).Unix())
+	return idleConnTime
+}
+
+// unregisterIdleConn removes c from the idle connection map and returns its
+// timestamp to the shared pool. It is called once when the connection ends.
+func (s *Server) unregisterIdleConn(c net.Conn) {
+	s.idleConnsMu.Lock()
+	if ic, ok := s.idleConns[c]; ok {
+		idleConnTimePool.Put(ic)
+		delete(s.idleConns, c)
+	}
 	s.idleConnsMu.Unlock()
+}
+
+func (s *Server) serveConnSerial(c net.Conn, connTime time.Time, countConcurrency bool) error {
+	idleConnTime := s.registerIdleConn(c, connTime)
 
 	serverName := s.getServerName()
 	connRequestNum := uint64(0)
@@ -2423,6 +2485,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		continueReadingRequest = true
 	)
+	var err error
 	for {
 		connRequestNum++
 
@@ -2812,13 +2875,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		s.releaseCtx(ctx)
 	}
 
-	s.idleConnsMu.Lock()
-	ic, ok := s.idleConns[c]
-	if ok {
-		idleConnTimePool.Put(ic)
-		delete(s.idleConns, c)
-	}
-	s.idleConnsMu.Unlock()
+	s.unregisterIdleConn(c)
 
 	return err
 }
@@ -3062,6 +3119,9 @@ func (ctx *RequestCtx) Deadline() (deadline time.Time, ok bool) {
 // Note: Because creating a new channel for every request is just too expensive, so
 // RequestCtx.s.done is only closed when the server is shutting down.
 func (ctx *RequestCtx) Done() <-chan struct{} {
+	if ctx.pipelineDone != nil {
+		return ctx.pipelineDone
+	}
 	if done := ctx.s.done.Load(); done != nil {
 		return *done
 	}
