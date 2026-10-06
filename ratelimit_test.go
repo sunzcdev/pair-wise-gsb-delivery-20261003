@@ -109,3 +109,33 @@ func BenchmarkLimit(b *testing.B) {
 		rl.Limit()
 	}
 }
+
+func TestReservation_usage(t *testing.T) {
+	rl := New(10, time.Minute)
+
+	// Book one future slot, willing to wait at most 2 minutes.
+	r, err := rl.Reserve(2 * time.Minute)
+	if err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if r.Cost() != 1 {
+		t.Fatalf("expected cost 1, got %d", r.Cost())
+	}
+
+	// A request beyond the burst size is rejected rather than deferred
+	// forever.
+	if _, err := rl.ReserveN(11, time.Hour); err != ErrMaxBurstExceeded {
+		t.Fatalf("expected ErrMaxBurstExceeded, got %v", err)
+	}
+
+	// Cancellation is idempotent and mutually exclusive with Consume.
+	if !r.Cancel() {
+		t.Fatal("first cancel should succeed")
+	}
+	if r.Cancel() {
+		t.Fatal("second cancel should be a no-op")
+	}
+	if r.Consume() {
+		t.Fatal("consume after cancel should be a no-op")
+	}
+}
