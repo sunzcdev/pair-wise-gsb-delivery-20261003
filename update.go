@@ -19,6 +19,8 @@ type updateData struct {
 	From              Sqlizer
 	WhereParts        []Sqlizer
 	OrderBys          []string
+	CTEs              []cte
+	WithRecursive     bool
 	Limit             string
 	Offset            string
 	Suffixes          []Sqlizer
@@ -73,6 +75,13 @@ func (d *updateData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEsSQL(sql, args, d.CTEs, d.WithRecursive)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("UPDATE ")
@@ -285,4 +294,15 @@ func (b UpdateBuilder) Suffix(sql string, args ...interface{}) UpdateBuilder {
 // SuffixExpr adds an expression to the end of the query
 func (b UpdateBuilder) SuffixExpr(expr Sqlizer) UpdateBuilder {
 	return builder.Append(b, "Suffixes", expr).(UpdateBuilder)
+}
+
+// With adds common table expressions to the query. The generated SQL starts
+// with a WITH clause containing the given ctes.
+func (b UpdateBuilder) With(ctes ...CTEBuilder) UpdateBuilder {
+	return withCTEs(b, ctes).(UpdateBuilder)
+}
+
+// WithRecursive marks the WITH clause of the query as WITH RECURSIVE.
+func (b UpdateBuilder) WithRecursive() UpdateBuilder {
+	return builder.Set(b, "WithRecursive", true).(UpdateBuilder)
 }

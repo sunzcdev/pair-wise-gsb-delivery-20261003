@@ -21,6 +21,8 @@ type selectData struct {
 	GroupBys          []string
 	HavingParts       []Sqlizer
 	OrderByParts      []Sqlizer
+	CTEs              []cte
+	WithRecursive     bool
 	Limit             string
 	Offset            string
 	Suffixes          []Sqlizer
@@ -76,6 +78,13 @@ func (d *selectData) toSqlRaw() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEsSQL(sql, args, d.CTEs, d.WithRecursive)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("SELECT ")
@@ -400,4 +409,15 @@ func (b SelectBuilder) Suffix(sql string, args ...interface{}) SelectBuilder {
 // SuffixExpr adds an expression to the end of the query
 func (b SelectBuilder) SuffixExpr(expr Sqlizer) SelectBuilder {
 	return builder.Append(b, "Suffixes", expr).(SelectBuilder)
+}
+
+// With adds common table expressions to the query. The generated SQL starts
+// with a WITH clause containing the given ctes.
+func (b SelectBuilder) With(ctes ...CTEBuilder) SelectBuilder {
+	return withCTEs(b, ctes).(SelectBuilder)
+}
+
+// WithRecursive marks the WITH clause of the query as WITH RECURSIVE.
+func (b SelectBuilder) WithRecursive() SelectBuilder {
+	return builder.Set(b, "WithRecursive", true).(SelectBuilder)
 }

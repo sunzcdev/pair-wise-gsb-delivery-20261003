@@ -21,6 +21,8 @@ type insertData struct {
 	Into              string
 	Columns           []string
 	Values            [][]interface{}
+	CTEs              []cte
+	WithRecursive     bool
 	Suffixes          []Sqlizer
 	Select            *SelectBuilder
 }
@@ -69,6 +71,13 @@ func (d *insertData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEsSQL(sql, args, d.CTEs, d.WithRecursive)
+		if err != nil {
+			return
+		}
 	}
 
 	if d.StatementKeyword == "" {
@@ -264,6 +273,17 @@ func (b InsertBuilder) Suffix(sql string, args ...interface{}) InsertBuilder {
 // SuffixExpr adds an expression to the end of the query
 func (b InsertBuilder) SuffixExpr(expr Sqlizer) InsertBuilder {
 	return builder.Append(b, "Suffixes", expr).(InsertBuilder)
+}
+
+// With adds common table expressions to the query. The generated SQL starts
+// with a WITH clause containing the given ctes.
+func (b InsertBuilder) With(ctes ...CTEBuilder) InsertBuilder {
+	return withCTEs(b, ctes).(InsertBuilder)
+}
+
+// WithRecursive marks the WITH clause of the query as WITH RECURSIVE.
+func (b InsertBuilder) WithRecursive() InsertBuilder {
+	return builder.Set(b, "WithRecursive", true).(InsertBuilder)
 }
 
 // SetMap set columns and values for insert builder from a map of column name and value

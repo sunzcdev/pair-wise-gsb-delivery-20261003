@@ -106,6 +106,29 @@ will generate with the Dollar Placeholder:
 SELECT * FROM nodes WHERE meta->'format' ?| array[$1,$2]
 ```
 
+Squirrel can build common table expressions, including recursive ones:
+
+```go
+subordinates := sq.CTE("subordinates", "id", "name", "manager_id", "depth").
+    Anchor(sq.Select("id", "name", "manager_id", "0").
+        From("employees").
+        Where(sq.Eq{"id": 1})).
+    RecursiveTerm(sq.Select("e.id", "e.name", "e.manager_id", "s.depth + 1").
+        From("employees e").
+        Join("subordinates s ON e.manager_id = s.id"))
+
+sql, args, err := sq.With(subordinates).
+    Select("id", "name", "depth").
+    From("subordinates").
+    ToSql()
+```
+
+`With` also works with writes via `InsertInto`, `Update` and `DeleteFrom`,
+and the statement builders accept `.With(...)` directly. Duplicate CTE names,
+illegal forward references and detectable column count mismatches are
+reported as errors when the SQL is generated; names defined by nested WITH
+clauses shadow outer ones.
+
 ## FAQ
 
 * **How can I build an IN query on composite keys / tuples, e.g. `WHERE (col1, col2) IN ((1,2),(3,4))`? ([#104](https://github.com/Masterminds/squirrel/issues/104))**

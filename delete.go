@@ -16,6 +16,8 @@ type deleteData struct {
 	From              string
 	WhereParts        []Sqlizer
 	OrderBys          []string
+	CTEs              []cte
+	WithRecursive     bool
 	Limit             string
 	Offset            string
 	Suffixes          []Sqlizer
@@ -43,6 +45,13 @@ func (d *deleteData) ToSql() (sqlStr string, args []interface{}, err error) {
 		}
 
 		sql.WriteString(" ")
+	}
+
+	if len(d.CTEs) > 0 {
+		args, err = appendCTEsSQL(sql, args, d.CTEs, d.WithRecursive)
+		if err != nil {
+			return
+		}
 	}
 
 	sql.WriteString("DELETE FROM ")
@@ -176,6 +185,17 @@ func (b DeleteBuilder) Suffix(sql string, args ...interface{}) DeleteBuilder {
 // SuffixExpr adds an expression to the end of the query
 func (b DeleteBuilder) SuffixExpr(expr Sqlizer) DeleteBuilder {
 	return builder.Append(b, "Suffixes", expr).(DeleteBuilder)
+}
+
+// With adds common table expressions to the query. The generated SQL starts
+// with a WITH clause containing the given ctes.
+func (b DeleteBuilder) With(ctes ...CTEBuilder) DeleteBuilder {
+	return withCTEs(b, ctes).(DeleteBuilder)
+}
+
+// WithRecursive marks the WITH clause of the query as WITH RECURSIVE.
+func (b DeleteBuilder) WithRecursive() DeleteBuilder {
+	return builder.Set(b, "WithRecursive", true).(DeleteBuilder)
 }
 
 func (b DeleteBuilder) Query() (*sql.Rows, error) {
