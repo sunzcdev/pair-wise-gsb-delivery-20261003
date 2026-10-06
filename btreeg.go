@@ -17,6 +17,7 @@ type BTreeG[T any] struct {
 	empty        T
 	max          int
 	min          int
+	aug          augmentor[T]
 }
 
 type node[T any] struct {
@@ -24,6 +25,26 @@ type node[T any] struct {
 	count    int
 	items    []T
 	children *[]*node[T]
+	aug      any
+}
+
+// augmentor maintains augmented information on each node of the tree.
+// When a BTreeG has an augmentor, the aug field of every node is kept
+// up to date across inserts, deletes, splits, rotations, merges and
+// copy-on-write operations. The augment value of a node must be a pure
+// function of the node's items and the augment values of its children,
+// and it must be immutable once computed because nodes (and thus their
+// aug values) are shared between copied trees.
+type augmentor[T any] interface {
+	augment(items []T, children *[]*node[T]) any
+}
+
+// recalc recomputes the augmented information for a single node from its
+// items and the (already up to date) augmented values of its children.
+func (tr *BTreeG[T]) recalc(n *node[T]) {
+	if tr.aug != nil {
+		n.aug = tr.aug.augment(n.items, n.children)
+	}
 }
 
 // PathHint is a utility type used with the *Hint() functions. Hints provide
@@ -210,6 +231,7 @@ func (tr *BTreeG[T]) setHint(item T, hint *PathHint) (prev T, replaced bool) {
 		tr.root = tr.newNode(true)
 		tr.root.items = append([]T{}, item)
 		tr.root.count = 1
+		tr.recalc(tr.root)
 		tr.count = 1
 		return tr.empty, false
 	}
@@ -222,6 +244,7 @@ func (tr *BTreeG[T]) setHint(item T, hint *PathHint) (prev T, replaced bool) {
 		*tr.root.children = append([]*node[T]{}, left, right)
 		tr.root.items = append([]T{}, median)
 		tr.root.updateCount()
+		tr.recalc(tr.root)
 		return tr.setHint(item, hint)
 	}
 	if replaced {
@@ -247,6 +270,7 @@ func (tr *BTreeG[T]) nodeSplit(n *node[T]) (right *node[T], median T) {
 		*right.children = (*n.children)[i+1:]
 	}
 	right.updateCount()
+	tr.recalc(right)
 
 	// left node
 	n.items[i] = tr.empty
@@ -255,6 +279,7 @@ func (tr *BTreeG[T]) nodeSplit(n *node[T]) (right *node[T], median T) {
 		*n.children = (*n.children)[: i+1 : i+1]
 	}
 	n.updateCount()
+	tr.recalc(n)
 
 	return right, median
 }
@@ -273,6 +298,7 @@ func (tr *BTreeG[T]) copy(n *node[T]) *node[T] {
 	n2 := new(node[T])
 	n2.isoid = tr.isoid
 	n2.count = n.count
+	n2.aug = n.aug
 	n2.items = make([]T, len(n.items), cap(n.items))
 	copy(n2.items, n.items)
 	if tr.copyItems {
@@ -317,6 +343,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 	if found {
 		prev = n.items[i]
 		n.items[i] = item
+		tr.recalc(n)
 		return prev, true, false
 	}
 	if n.leaf() {
@@ -327,6 +354,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 		copy(n.items[i+1:], n.items[i:])
 		n.items[i] = item
 		n.count++
+		tr.recalc(n)
 		return tr.empty, false, false
 	}
 	prev, replaced, split = tr.nodeSet(&(*n.children)[i], item, hint, depth+1)
@@ -346,6 +374,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 	if !replaced {
 		n.count++
 	}
+	tr.recalc(n)
 	return prev, replaced, false
 }
 
@@ -508,6 +537,11 @@ restart:
 				stack[k].node.count -= j
 			}
 			tr.count -= j
+			if j > 0 && tr.aug != nil {
+				for k := len(stack) - 1; k >= 0; k-- {
+					tr.recalc(stack[k].node)
+				}
+			}
 			if act == Stop {
 				return
 			}
@@ -527,6 +561,11 @@ restart:
 						stack[j].node.count--
 					}
 					tr.count--
+					if tr.aug != nil {
+						for j := len(stack) - 1; j >= 0; j-- {
+							tr.recalc(stack[j].node)
+						}
+					}
 					i--
 				} else {
 					pivot = n.items[i]
@@ -763,6 +802,11 @@ restart:
 					stack[k].node.count -= dnode.count + 1
 				}
 				tr.count -= dnode.count + 1
+				if tr.aug != nil {
+					for k := len(stack) - 1; k >= 0; k-- {
+						tr.recalc(stack[k].node)
+					}
+				}
 				if extract {
 					deleted.append(ditem, dnode)
 				}
@@ -812,6 +856,11 @@ restart:
 				stack[k].node.count -= j
 			}
 			tr.count -= j
+			if j > 0 && tr.aug != nil {
+				for k := len(stack) - 1; k >= 0; k-- {
+					tr.recalc(stack[k].node)
+				}
+			}
 			if stop {
 				return *deleted
 			}
@@ -832,6 +881,11 @@ restart:
 					stack[j].node.count--
 				}
 				tr.count--
+				if tr.aug != nil {
+					for j := len(stack) - 1; j >= 0; j-- {
+						tr.recalc(stack[j].node)
+					}
+				}
 				i--
 			} else {
 				pivot = n.items[i]
@@ -918,6 +972,7 @@ func (tr *BTreeG[T]) delete(cn **node[T], max bool, key T,
 			n.items[len(n.items)-1] = tr.empty
 			n.items = n.items[:len(n.items)-1]
 			n.count--
+			tr.recalc(n)
 			return prev, true
 		}
 		return tr.empty, false
@@ -945,6 +1000,7 @@ func (tr *BTreeG[T]) delete(cn **node[T], max bool, key T,
 	if len((*n.children)[i].items) < tr.min {
 		tr.nodeRebalance(n, i)
 	}
+	tr.recalc(n)
 	return prev, true
 }
 
@@ -1029,6 +1085,9 @@ func (tr *BTreeG[T]) nodeRebalance(n *node[T], i int) {
 			right.count -= (*left.children)[len(*left.children)-1].count
 		}
 	}
+	tr.recalc(left)
+	tr.recalc(right)
+	tr.recalc(n)
 }
 
 // Ascend the tree within the range [pivot, last]
@@ -1202,13 +1261,23 @@ func (tr *BTreeG[T]) Load(item T) (T, bool) {
 		return tr.setHint(item, nil)
 	}
 	n := tr.isoLoad(&tr.root, true)
+	var spine []*node[T]
+	if tr.aug != nil {
+		spine = make([]*node[T], 0, 8)
+	}
 	for {
 		n.count++ // optimistically update counts
+		if tr.aug != nil {
+			spine = append(spine, n)
+		}
 		if n.leaf() {
 			if len(n.items) < tr.max {
 				if tr.Less(n.items[len(n.items)-1], item) {
 					n.items = append(n.items, item)
 					tr.count++
+					for i := len(spine) - 1; i >= 0; i-- {
+						tr.recalc(spine[i])
+					}
 					return tr.empty, false
 				}
 			}
@@ -1290,9 +1359,16 @@ func (tr *BTreeG[T]) PopMin() (T, bool) {
 		return tr.empty, false
 	}
 	n := tr.isoLoad(&tr.root, true)
+	var spine []*node[T]
+	if tr.aug != nil {
+		spine = make([]*node[T], 0, 8)
+	}
 	var item T
 	for {
 		n.count-- // optimistically update counts
+		if tr.aug != nil {
+			spine = append(spine, n)
+		}
 		if n.leaf() {
 			item = n.items[0]
 			if len(n.items) == tr.min {
@@ -1304,6 +1380,9 @@ func (tr *BTreeG[T]) PopMin() (T, bool) {
 			tr.count--
 			if tr.count == 0 {
 				tr.root = nil
+			}
+			for i := len(spine) - 1; i >= 0; i-- {
+				tr.recalc(spine[i])
 			}
 			return item, true
 		}
@@ -1331,9 +1410,16 @@ func (tr *BTreeG[T]) PopMax() (T, bool) {
 		return tr.empty, false
 	}
 	n := tr.isoLoad(&tr.root, true)
+	var spine []*node[T]
+	if tr.aug != nil {
+		spine = make([]*node[T], 0, 8)
+	}
 	var item T
 	for {
 		n.count-- // optimistically update counts
+		if tr.aug != nil {
+			spine = append(spine, n)
+		}
 		if n.leaf() {
 			item = n.items[len(n.items)-1]
 			if len(n.items) == tr.min {
@@ -1344,6 +1430,9 @@ func (tr *BTreeG[T]) PopMax() (T, bool) {
 			tr.count--
 			if tr.count == 0 {
 				tr.root = nil
+			}
+			for i := len(spine) - 1; i >= 0; i-- {
+				tr.recalc(spine[i])
 			}
 			return item, true
 		}
@@ -1423,6 +1512,20 @@ outer:
 			tr.count--
 			if tr.count == 0 {
 				tr.root = nil
+			}
+			if tr.aug != nil && tr.root != nil {
+				// recalculate the augmented information along the
+				// path from the leaf back up to the root
+				var spine []*node[T]
+				rn := tr.root
+				spine = append(spine, rn)
+				for i := 0; i < len(path); i++ {
+					rn = (*rn.children)[path[i]]
+					spine = append(spine, rn)
+				}
+				for i := len(spine) - 1; i >= 0; i-- {
+					tr.recalc(spine[i])
+				}
 			}
 			return item, true
 		}
