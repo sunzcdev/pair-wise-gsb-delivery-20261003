@@ -4,6 +4,36 @@ Contains experimental utilities and APIs for Prometheus.
 
 Packages within this module are listed below.
 
+## Bounded
+
+The `bounded` package provides experimental counter and histogram vectors
+with a bounded number of admitted label combinations. The first
+`Config.Capacity` distinct label combinations get their own series; all
+further observations are merged into a shared overflow series in which the
+configured collapsible labels carry a reserved overflow value
+(`__overflow__` by default). Totals are preserved, so counters and histogram
+counts and sums stay correct even when label cardinality explodes (e.g. when
+request parameters leak into label values).
+
+```go
+    import (
+        "github.com/prometheus/client_golang/exp/bounded"
+        "github.com/prometheus/client_golang/prometheus"
+    )
+    ...
+
+    requests := bounded.NewCounterVec(
+        prometheus.CounterOpts{Name: "http_requests_total", Help: "HTTP requests."},
+        []string{"code", "request"},
+        bounded.Config{Capacity: 1000, CollapsibleLabels: []string{"request"}},
+    )
+    prometheus.MustRegister(requests)
+```
+
+Deleting an admitted combination frees its capacity slot. The overflow value
+is reserved in collapsible label positions, so the overflow series can never
+collide with a legitimate user series.
+
 ## Remote
 
 This module contains production quality code with explicitly unstable API. Any code in this module can change its API or be removed; use with care.
