@@ -25,6 +25,11 @@ const (
 	// ControlTypeSubtreeDelete - https://datatracker.ietf.org/doc/html/draft-armijo-ldap-treedelete-02
 	ControlTypeSubtreeDelete = "1.2.840.113556.1.4.805"
 
+	// ControlTypeTxnSpec is the Transaction Specification control defined in
+	// https://www.rfc-editor.org/rfc/rfc5805#section-2.2. It is attached,
+	// always critical, to each update request that belongs to a transaction.
+	ControlTypeTxnSpec = "1.3.6.1.1.21.2"
+
 	// ControlTypeServerSideSorting - https://www.ietf.org/rfc/rfc2891.txt
 	ControlTypeServerSideSorting = "1.2.840.113556.1.4.473"
 	// ControlTypeServerSideSorting - https://www.ietf.org/rfc/rfc2891.txt
@@ -158,6 +163,7 @@ var ControlTypeMap = map[string]string{
 	ControlTypeManageDsaIT:            "Manage DSA IT",
 	ControlTypeWhoAmI:                 "Who Am I",
 	ControlTypeSubtreeDelete:          "Subtree Delete Control",
+	ControlTypeTxnSpec:                "Transaction Specification",
 
 	ControlTypeServerSideSorting:       "Server Side Sorting",
 	ControlTypeServerSideSortingResult: "Server Side Sorting Result",
@@ -822,6 +828,18 @@ func DecodeControl(packet *ber.Packet) (Control, error) {
 			return nil, fmt.Errorf("failed to decode data bytes: %w", err)
 		}
 		return NewControlSyncInfo(valueChildren)
+	case ControlTypeTxnSpec:
+		if value == nil {
+			return nil, malformedf("transaction specification control value is missing")
+		}
+		value.Description += " (Transaction Specification)"
+		// The control value is an OCTET STRING whose contents are the
+		// BER-encoded transaction identifier; keep the identifier bytes.
+		identifier, err := packetData(value)
+		if err != nil {
+			return nil, err
+		}
+		return NewControlTxnSpec(identifier), nil
 	default:
 		c := new(ControlString)
 		c.ControlType = ControlType
@@ -892,6 +910,52 @@ func (c *ControlSubtreeDelete) String() string {
 		"Control Type: %s (%q)",
 		ControlTypeMap[ControlTypeSubtreeDelete],
 		ControlTypeSubtreeDelete)
+}
+
+// ControlTxnSpec implements the Transaction Specification control defined
+// in https://www.rfc-editor.org/rfc/rfc5805#section-2.2. The control is
+// attached (critical) to each update request inside a transaction. Its value
+// is the BER-encoded transaction identifier returned by Start Transaction.
+type ControlTxnSpec struct {
+	// Identifier is the BER-encoded transaction identifier returned in the
+	// Start Transaction responseValue (the contents of the OCTET STRING
+	// carrying the response value). It is opaque to the client.
+	Identifier []byte
+}
+
+// GetControlType returns the OID
+func (c *ControlTxnSpec) GetControlType() string {
+	return ControlTypeTxnSpec
+}
+
+// NewControlTxnSpec returns a critical Transaction Specification control
+// carrying the given transaction identifier.
+func NewControlTxnSpec(identifier []byte) *ControlTxnSpec {
+	return &ControlTxnSpec{Identifier: identifier}
+}
+
+// Encode returns the ber packet representation
+func (c *ControlTxnSpec) Encode() *ber.Packet {
+	packet := ber.Encode(ber.ClassUniversal, ber.TypeConstructed, ber.TagSequence, nil, "Control")
+	packet.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, ControlTypeTxnSpec, "Control Type ("+ControlTypeMap[ControlTypeTxnSpec]+")"))
+	// RFC 5805 makes the control always critical.
+	packet.AppendChild(ber.NewBoolean(ber.ClassUniversal, ber.TypePrimitive, ber.TagBoolean, true, "Criticality"))
+	// controlValue is an OCTET STRING whose contents are the BER-encoded
+	// transaction identifier, i.e. the bytes of the identifier primitive.
+	value := ber.Encode(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, nil, "Control Value (Transaction Identifier)")
+	value.Data.Write(c.Identifier)
+	packet.AppendChild(value)
+	return packet
+}
+
+// String returns a human-readable description
+func (c *ControlTxnSpec) String() string {
+	return fmt.Sprintf(
+		"Control Type: %s (%q)  Criticality: %t  Identifier: %x",
+		ControlTypeMap[ControlTypeTxnSpec],
+		ControlTypeTxnSpec,
+		true,
+		c.Identifier)
 }
 
 func encodeControls(controls []Control) *ber.Packet {
