@@ -25,12 +25,23 @@ type Meta struct {
 func (m *Meta) Validate() error {
 	if m.magic != Magic {
 		return errors.ErrInvalid
-	} else if m.version != Version {
+	} else if !m.IsSupportedVersion() {
 		return errors.ErrVersionMismatch
 	} else if m.checksum != m.Sum64() {
 		return errors.ErrChecksum
 	}
 	return nil
+}
+
+// IsSupportedVersion reports whether the meta version is understood by
+// this binary.
+func (m *Meta) IsSupportedVersion() bool {
+	return m.version == Version || m.version == VersionPageChecksum
+}
+
+// SupportsPageChecksum reports whether the database uses page checksums.
+func (m *Meta) SupportsPageChecksum() bool {
+	return m.version == VersionPageChecksum
 }
 
 // Copy copies one meta object to another.

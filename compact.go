@@ -4,6 +4,10 @@ package bbolt
 // reclaim space that the source database no longer has use for. txMaxSize can be
 // used to limit the transactions size of this process and may trigger intermittent
 // commits. A value of zero will ignore transaction sizes.
+//
+// Page checksums are controlled by the destination DB: open dst with
+// Options.PageChecksum set to create a compacted copy with page checksums
+// enabled, regardless of whether src uses them.
 // TODO: merge with: https://github.com/etcd-io/etcd/blob/b7f0f52a16dbf83f18ca1d803f7892d750366a94/mvcc/backend/backend.go#L349
 func Compact(dst, src *DB, txMaxSize int64) error {
 	// commit regularly, or we'll run out of memory for large datasets if using one transaction.

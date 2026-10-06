@@ -9,8 +9,15 @@ import (
 // MaxMmapStep is the largest step that can be taken when remapping the mmap.
 const MaxMmapStep = 1 << 30 // 1GB
 
-// Version represents the data file format version.
+// Version represents the default data file format version.
 const Version uint32 = 2
+
+// VersionPageChecksum represents the data file format version used by
+// databases created with page checksums enabled. It is only written to
+// newly created databases; existing version 2 databases are never
+// upgraded in place. Binaries which only understand Version reject such
+// files with a version mismatch error.
+const VersionPageChecksum uint32 = 3
 
 // Magic represents a marker value to indicate that a file is a Bolt DB.
 const Magic uint32 = 0xED0CDAED

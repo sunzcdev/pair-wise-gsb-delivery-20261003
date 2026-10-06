@@ -312,13 +312,15 @@ func (n *node) spill() error {
 	n.children = nil
 
 	// Split nodes into appropriate sizes. The first node will always be n.
-	var nodes = n.split(uintptr(tx.db.pageSize))
+	// The checksum trailer (if any) reduces the usable space of each page.
+	var nodes = n.split(uintptr(tx.db.pageSize - tx.db.checksumTrailerSize()))
 	for _, node := range nodes {
 		// Add node's page to the freelist if it's not new.
 		node.free()
 
-		// Allocate contiguous space for the node.
-		p, err := tx.allocate((node.size() + tx.db.pageSize - 1) / tx.db.pageSize)
+		// Allocate contiguous space for the node, reserving room for the
+		// checksum trailer at the end of the page run.
+		p, err := tx.allocate((node.size() + tx.db.checksumTrailerSize() + tx.db.pageSize - 1) / tx.db.pageSize)
 		if err != nil {
 			return err
 		}

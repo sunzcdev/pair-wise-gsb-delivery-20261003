@@ -212,7 +212,7 @@ func updateMetaField(m *common.Meta, fields map[string]uint64) bool {
 		m.SetMagic(common.Magic)
 		changed = true
 	}
-	if m.Version() != common.Version {
+	if !m.IsSupportedVersion() {
 		m.SetVersion(common.Version)
 		changed = true
 	}

@@ -61,6 +61,7 @@ New minor versions may add additional features to the API.
     - [Database backups](#database-backups)
     - [Statistics](#statistics)
     - [Read-Only Mode](#read-only-mode)
+    - [Page checksums](#page-checksums)
     - [Mobile Use (iOS/Android)](#mobile-use-iosandroid)
   - [Resources](#resources)
   - [Comparison with other databases](#comparison-with-other-databases)
@@ -690,6 +691,62 @@ if err != nil {
 	log.Fatal(err)
 }
 ```
+
+### Page checksums
+
+By default bbolt only checksums the two meta pages, so silent data
+corruption (e.g. bit flips) on data pages can go unnoticed. Setting
+`Options.PageChecksum` when creating a **new** database enables checksum
+trailers on all leaf, branch and freelist pages:
+
+```go
+db, err := bolt.Open("my.db", 0600, &bolt.Options{PageChecksum: true})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+The format and coverage rules are:
+
+* Each page run (a page plus its overflow pages) reserves its last 8 bytes
+  for an FNV-1a 64 checksum of all preceding bytes. The trailer lives at a
+  fixed location at the end of the page run and never overlaps the page
+  header, so payload bytes are never mistaken for a header or a checksum.
+* Leaf and branch pages are checksummed, including their overflow pages.
+* The freelist page is checksummed, including its overflow pages.
+* Meta pages keep using their built-in checksum and carry no trailer.
+* Free (unused) pages are not checksummed; they are stamped when they are
+  reallocated and written by a committing transaction.
+* Inline buckets are payload of their parent leaf page and are covered by
+  the parent page's checksum.
+
+Checksum-enabled databases use meta format version 3 (instead of 2):
+
+* Existing databases are never upgraded in place. Opening a database that
+  was created without page checksums with `PageChecksum: true` fails with
+  `ErrPageChecksumNotEnabled`.
+* A database created with page checksums always maintains and verifies
+  them, regardless of the option used to open it.
+* Older binaries reject checksum-enabled databases with
+  `ErrVersionMismatch`.
+
+Pages constructed by a writable transaction are stamped at commit time,
+just before they are written to disk. Verification happens when
+consistency is checked against disk content, i.e. via `Tx.Check()` (also
+used by `StrictMode`), which reports corruption as
+`page <id>: page checksum mismatch` (`ErrPageChecksum`). If the freelist
+page is corrupted, the database still opens: the freelist is rebuilt by
+scanning instead of trusting the corrupted page.
+
+`Tx.WriteTo`/`Tx.CopyFile` copy the raw file, so checksums are preserved.
+`Compact` writes through regular transactions, so the destination database
+gets checksums if and only if it was created with `PageChecksum: true`.
+
+The overhead can be measured with the `BenchmarkPageChecksum_Put` and
+`BenchmarkPageChecksum_Check` benchmarks. Stamping adds one hash pass over
+every dirty page at commit time, and `Tx.Check` adds one hash pass over
+every reachable page; normal `Get`/cursor reads do not verify checksums
+and are unaffected.
 
 ### Mobile Use (iOS/Android)
 

@@ -213,7 +213,14 @@ func (tx *Tx) Commit() (err error) {
 
 	// Free the old freelist because commit writes out a fresh freelist.
 	if tx.meta.Freelist() != common.PgidNoFreelist {
-		tx.db.freelist.Free(tx.meta.Txid(), tx.db.page(tx.meta.Freelist()))
+		p := tx.db.page(tx.meta.Freelist())
+		if !tx.db.verifyPageChecksum(p, tx.meta.Pgid()) {
+			// The old freelist page is corrupted; its overflow value
+			// cannot be trusted, so only free the head page instead of
+			// risking releasing pages which may be in use.
+			p = common.NewPage(p.Id(), common.FreelistPageFlag, 0, 0)
+		}
+		tx.db.freelist.Free(tx.meta.Txid(), p)
 	}
 
 	if !tx.db.NoFreelistSync {
@@ -285,7 +292,7 @@ func (tx *Tx) Commit() (err error) {
 func (tx *Tx) commitFreelist() error {
 	// Allocate new pages for the new free list. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
-	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
+	p, err := tx.allocate(((tx.db.freelist.EstimatedWritePageSize() + tx.db.checksumTrailerSize()) / tx.db.pageSize) + 1)
 	if err != nil {
 		tx.rollback()
 		return err
@@ -335,7 +342,14 @@ func (tx *Tx) rollback() {
 				tx.db.freelist.NoSyncReload(tx.db.freepages())
 			} else {
 				// Read free page list from freelist page.
-				tx.db.freelist.Reload(tx.db.page(tx.db.meta().Freelist()))
+				p := tx.db.page(tx.db.meta().Freelist())
+				if tx.db.verifyPageChecksum(p, tx.db.meta().Pgid()) {
+					tx.db.freelist.Reload(p)
+				} else {
+					// The persisted freelist page is corrupted; rebuild
+					// the freelist by scanning the DB instead.
+					tx.db.freelist.NoSyncReload(tx.db.scanFreePages())
+				}
 			}
 		}
 	}
@@ -533,6 +547,14 @@ func (tx *Tx) write() error {
 		rem := (uint64(p.Overflow()) + 1) * uint64(tx.db.pageSize)
 		offset := int64(p.Id()) * int64(tx.db.pageSize)
 		var written uintptr
+
+		// Stamp the checksum trailer now that the page content is final.
+		// Pages constructed by a writable transaction are only checksummed
+		// here, at commit time; verification of pages already on disk
+		// happens separately (see Tx.Check).
+		if tx.db.pageChecksum && (p.IsLeafPage() || p.IsBranchPage() || p.IsFreelistPage()) {
+			p.WriteChecksum(tx.db.pageSize)
+		}
 
 		// Write out page in "max allocation" sized chunks.
 		for {

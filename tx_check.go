@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	berrors "go.etcd.io/bbolt/errors"
 	"go.etcd.io/bbolt/internal/common"
 )
 
@@ -85,6 +86,32 @@ func (tx *Tx) check(cfg checkConfig, ch chan error) {
 		}
 
 		tx.recursivelyCheckPage(common.Pgid(cfg.pageId), reachable, freed, cfg.kvStringer, ch)
+	}
+
+	// Verify the checksum trailer of every reachable page. Pages still
+	// dirty in a writable transaction are skipped: they are constructed in
+	// memory and only get their checksum stamped at commit time in
+	// Tx.write. Pages read back from disk (e.g. after reopening the
+	// database) are always verified.
+	if tx.db.pageChecksum {
+		tx.checkPageChecksums(reachable, ch)
+	}
+}
+
+func (tx *Tx) checkPageChecksums(reachable map[common.Pgid]*common.Page, ch chan error) {
+	for id, p := range reachable {
+		// Skip meta pages (validated by their own built-in checksum) and
+		// overflow pages (covered by the checksum of their head page).
+		if id < 2 || id != p.Id() {
+			continue
+		}
+		// Skip uncommitted dirty pages, which are stamped at commit time.
+		if _, ok := tx.pages[id]; ok {
+			continue
+		}
+		if !tx.db.verifyPageChecksum(p, tx.meta.Pgid()) {
+			ch <- fmt.Errorf("page %d: %w", id, berrors.ErrPageChecksum)
+		}
 	}
 }
 

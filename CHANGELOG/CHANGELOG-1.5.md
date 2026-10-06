@@ -6,6 +6,7 @@
 ### BoltDB
 - [Fix version string not updated for v1.5.0 release](https://github.com/etcd-io/bbolt/pull/1230)
 - [Generate unified version output for both 'bbolt version' and 'bbolt -v'](https://github.com/etcd-io/bbolt/pull/1251)
+- Add opt-in page checksums for newly created databases via `Options.PageChecksum` (meta format version 3): leaf, branch, overflow and freelist pages carry a checksum trailer verified by `Tx.Check`, with `ErrPageChecksum`/`ErrPageChecksumNotEnabled` for clear failure reporting
 
 <hr>
 

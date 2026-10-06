@@ -116,6 +116,11 @@ type DB struct {
 	// Supported only on Unix via mlock/munlock syscalls.
 	Mlock bool
 
+	// pageChecksum indicates whether leaf, branch and freelist pages carry
+	// a checksum trailer. It is derived from the meta version of the
+	// database file (see Options.PageChecksum).
+	pageChecksum bool
+
 	logger Logger
 
 	path     string
@@ -192,6 +197,10 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	db.FreelistType = options.FreelistType
 	db.Mlock = options.Mlock
 	db.MaxSize = options.MaxSize
+	// Tentatively set from the options; only effective when the database
+	// file is created by this Open call. For existing files the format is
+	// re-derived from the meta page after mmap below.
+	db.pageChecksum = options.PageChecksum
 
 	// Set default values for later DB operations.
 	db.MaxBatchSize = common.DefaultMaxBatchSize
@@ -298,6 +307,16 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		_ = db.close()
 		lg.Errorf("failed to map db file (%s): %v", path, err)
 		return nil, err
+	}
+
+	// The on-disk format decides whether page checksums are used. The
+	// option only controls newly created databases; existing databases
+	// are never upgraded (or downgraded) in place.
+	db.pageChecksum = db.meta().SupportsPageChecksum()
+	if options.PageChecksum && !db.pageChecksum {
+		_ = db.close()
+		lg.Errorf("db file (%s) was created without page checksum support", path)
+		return nil, berrors.ErrPageChecksumNotEnabled
 	}
 
 	if db.PreLoadFreelist {
@@ -427,12 +446,45 @@ func (db *DB) loadFreelist() {
 			db.freelist.Init(db.freepages())
 		} else {
 			// Read free list from freelist page.
-			db.freelist.Read(db.page(db.meta().Freelist()))
+			p := db.page(db.meta().Freelist())
+			if db.verifyPageChecksum(p, db.meta().Pgid()) {
+				db.freelist.Read(p)
+			} else {
+				// The freelist page is corrupted. Its content cannot be
+				// trusted, so rebuild the freelist by scanning the DB
+				// instead of reading garbage page ids.
+				db.Logger().Errorf("page %d: %v, rebuilding freelist by scanning the db", p.Id(), berrors.ErrPageChecksum)
+				db.freelist.Init(db.scanFreePages())
+			}
 		}
 		if db.stats != nil {
 			db.stats.FreePageN = db.freelist.FreeCount()
 		}
 	})
+}
+
+// checksumTrailerSize returns the number of bytes reserved at the end of
+// each page run for the checksum trailer.
+func (db *DB) checksumTrailerSize() int {
+	if db.pageChecksum {
+		return common.PageChecksumSize
+	}
+	return 0
+}
+
+// verifyPageChecksum reports whether the page run starting at the given
+// page passes checksum verification. It always returns true when page
+// checksums are disabled or for meta pages (which are validated by their
+// own built-in checksum). Page runs reaching or exceeding the given high
+// water mark are reported as invalid.
+func (db *DB) verifyPageChecksum(p *common.Page, hwm common.Pgid) bool {
+	if !db.pageChecksum || p.IsMetaPage() {
+		return true
+	}
+	if p.Id() >= hwm || p.Id()+common.Pgid(p.Overflow()) >= hwm {
+		return false
+	}
+	return p.VerifyChecksum(db.pageSize)
 }
 
 func (db *DB) hasSyncedFreelist() bool {
@@ -654,7 +706,11 @@ func (db *DB) init() error {
 		// Initialize the meta page.
 		m := p.Meta()
 		m.SetMagic(common.Magic)
-		m.SetVersion(common.Version)
+		if db.pageChecksum {
+			m.SetVersion(common.VersionPageChecksum)
+		} else {
+			m.SetVersion(common.Version)
+		}
 		m.SetPageSize(uint32(db.pageSize))
 		m.SetFreelist(2)
 		m.SetRootBucket(common.NewInBucket(3, 0))
@@ -674,6 +730,12 @@ func (db *DB) init() error {
 	p.SetId(3)
 	p.SetFlags(common.LeafPageFlag)
 	p.SetCount(0)
+
+	// Stamp the checksum trailer on the initial freelist and leaf pages.
+	if db.pageChecksum {
+		db.pageInBuffer(buf, common.Pgid(2)).WriteChecksum(db.pageSize)
+		db.pageInBuffer(buf, common.Pgid(3)).WriteChecksum(db.pageSize)
+	}
 
 	// Write the buffer to our data file.
 	if _, err := db.ops.writeAt(buf, 0); err != nil {
@@ -1311,6 +1373,37 @@ func (db *DB) freepages() []common.Pgid {
 	return fids
 }
 
+// scanFreePages rebuilds the list of free pages by scanning the DB. The
+// page run of the persisted freelist (if any) is kept out of the result:
+// it is still referenced by the meta page and is released by the next
+// commit. This is used when the persisted freelist cannot be trusted,
+// e.g. when its checksum does not match.
+func (db *DB) scanFreePages() []common.Pgid {
+	fids := db.freepages()
+
+	m := db.meta()
+	if !m.IsFreelistPersisted() {
+		return fids
+	}
+
+	// The overflow value of the persisted freelist page may be corrupted,
+	// so clamp the excluded run to the high water mark.
+	runStart := m.Freelist()
+	runEnd := runStart + common.Pgid(db.page(runStart).Overflow())
+	if hwm := m.Pgid(); runEnd >= hwm {
+		runEnd = hwm - 1
+	}
+
+	filtered := fids[:0]
+	for _, id := range fids {
+		if id >= runStart && id <= runEnd {
+			continue
+		}
+		filtered = append(filtered, id)
+	}
+	return filtered
+}
+
 func newFreelist(freelistType FreelistType) fl.Interface {
 	if freelistType == FreelistMapType {
 		return fl.NewHashMapFreelist()
@@ -1393,6 +1486,18 @@ type Options struct {
 	// return empty structure in this case. This can be beneficial for
 	// performance under high-concurrency read-only transactions.
 	NoStatistics bool
+
+	// PageChecksum enables checksum trailers on leaf, branch and freelist
+	// pages so that silent data corruption can be detected directly.
+	//
+	// The option only takes effect when a new database file is created;
+	// existing databases are never upgraded in place. Opening a database
+	// that was created without page checksums with this option set fails
+	// with ErrPageChecksumNotEnabled. A database created with page
+	// checksums always verifies and maintains checksums, regardless of
+	// this option. Such databases use meta format version 3 and cannot be
+	// opened by older binaries (they fail with ErrVersionMismatch).
+	PageChecksum bool
 }
 
 func (o *Options) String() string {
@@ -1400,8 +1505,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t, PageChecksum: %t}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics, o.PageChecksum)
 
 }
 
