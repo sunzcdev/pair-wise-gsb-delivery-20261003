@@ -12,6 +12,7 @@ import (
 
 	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo/internal/xsync"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 // PartitionMetadata contains information about a partition and its replicas.
@@ -117,6 +118,128 @@ func (cl *Client) id2tMap() map[[16]byte]string {
 		return noid2t
 	}
 	return m
+}
+
+// pinnedNameForID returns the configured name for a pinned topic ID. It is
+// used to re-key a metadata entry the broker answered by ID with a nil name.
+func (cl *Client) pinnedNameForID(id [16]byte) (string, bool) {
+	for name, pinned := range cl.cfg.pinnedTopics {
+		if pinned == id {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// checkPinningSupportLocked verifies, after metadata is loaded, that every
+// negotiated broker can address the pinned paths by topic ID. The client both
+// produces and consumes, so metadata by ID, produce by ID, and fetch by ID
+// are all required regardless of how this particular client is used.
+func (cl *Client) checkPinningSupportLocked() error {
+	for _, req := range []struct {
+		key  int16
+		need int16
+	}{
+		{int16(kmsg.Metadata), 10},
+		{int16(kmsg.Produce), 13},
+		{int16(kmsg.Fetch), 13},
+	} {
+		if err := cl.requireKeyForPinning(req.key, req.need); err != nil {
+			return err
+		}
+	}
+	// Offsets for a pinned partition belong to that incarnation, so a group
+	// must commit/fetch them by ID too (OffsetCommit/OffsetFetch switched
+	// to TopicID in v10).
+	if cl.cfg.group != "" || cl.cfg.shareGroup != "" {
+		for _, req := range []struct {
+			key  int16
+			need int16
+		}{
+			{int16(kmsg.OffsetCommit), 10},
+			{int16(kmsg.OffsetFetch), 10},
+		} {
+			if err := cl.requireKeyForPinning(req.key, req.need); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// failPinnedMismatches marks any pinned topic whose freshly fetched metadata
+// carries a non-pinned ID. We only act on successfully-loaded topics; a topic
+// in an error state is handled by the normal load-error paths.
+func (cl *Client) failPinnedMismatches(latest map[string]*metadataTopic, producerLoad, consumerLoad topicsPartitionsData) {
+	for name, pinned := range cl.cfg.pinnedTopics {
+		mt, ok := latest[name]
+		if !ok || mt.loadErr != nil {
+			continue
+		}
+		if mt.id == pinned {
+			continue
+		}
+		err := fmt.Errorf("%w: topic %q pinned to %s but metadata reports %s",
+			ErrTopicIDMismatch, name, topicID(pinned), topicID(mt.id))
+		cl.failOnePinnedTopic(name, err, producerLoad, consumerLoad)
+	}
+}
+
+// failPinnedUnresolved fails pinned topics that are tracked but whose latest
+// metadata did not resolve under the pinned ID (an error response, or an ID
+// different from the pin). This reaches records still queued in unknownTopics
+// and consumer topics whose partitions never loaded.
+func (cl *Client) failPinnedUnresolved(latest map[string]*metadataTopic, producerLoad, consumerLoad topicsPartitionsData) {
+	for name, pinned := range cl.cfg.pinnedTopics {
+		mt, ok := latest[name]
+		if ok && mt.loadErr == nil && mt.id == pinned {
+			continue // healthy: resolved exactly to the pin
+		}
+		// Only act on topics this client actually tracks; a pin for a
+		// topic we neither produce nor consume has no queued records.
+		if producerLoad.loadTopic(name) == nil && consumerLoad.loadTopic(name) == nil {
+			continue
+		}
+		var err error
+		switch {
+		case ok && mt.loadErr != nil:
+			err = fmt.Errorf("%w: topic %q pinned to %s could not be resolved by ID: %v",
+				ErrTopicIDMismatch, name, topicID(pinned), mt.loadErr)
+		case ok:
+			err = fmt.Errorf("%w: topic %q pinned to %s but metadata reports %s",
+				ErrTopicIDMismatch, name, topicID(pinned), topicID(mt.id))
+		default:
+			err = fmt.Errorf("%w: topic %q pinned to %s was not returned by metadata",
+				ErrTopicIDMismatch, name, topicID(pinned))
+		}
+		cl.failOnePinnedTopic(name, err, producerLoad, consumerLoad)
+	}
+}
+
+// failPinnedTopics fails every pinned topic (on both the producer and
+// consumer sides) with err, used when strict pinning cannot be honored at all.
+func (cl *Client) failPinnedTopics(producerLoad, consumerLoad topicsPartitionsData, err error) {
+	for name := range cl.cfg.pinnedTopics {
+		cl.failOnePinnedTopic(name, err, producerLoad, consumerLoad)
+	}
+}
+
+// failOnePinnedTopic permanently abandons a pinned topic's produce buffers
+// and injects a terminal, non-retried error into its consume cursors.
+func (cl *Client) failOnePinnedTopic(name string, err error, producerLoad, consumerLoad topicsPartitionsData) {
+	if td := producerLoad.loadTopic(name); td != nil {
+		for _, tp := range td.partitions {
+			tp.records.abandon(err)
+		}
+		// Records queued before the topic ever loaded wait in
+		// unknownTopics; abandon does not reach those.
+		cl.failUnknownTopic(name, err)
+	}
+	if td := consumerLoad.loadTopic(name); td != nil {
+		for _, tp := range td.partitions {
+			cl.consumer.addFakeReadyForDraining(name, tp.partition(), err, "strict topic id pinning failed for this partition")
+		}
+	}
 }
 
 // waitmeta returns immediately if metadata was updated within the last second,
@@ -420,6 +543,22 @@ func (cl *Client) updateMetadata() (retryWhy multiUpdateWhy, err error) {
 
 	latest, err := cl.fetchTopicMetadata(all, reqTopics, true) // prune: yes; everything we track, so anything else is unwanted
 	if err != nil {
+		// A broker too old for ID-addressed metadata cannot honor strict
+		// pinning; surface the explicit pinning error rather than the
+		// internal sharding sentinel, and fail pinned topics instead of
+		// retrying toward a name-based fallback.
+		if len(cl.cfg.pinnedTopics) > 0 && errors.Is(err, errBrokerTooOld) {
+			supErr := fmt.Errorf("%w (metadata needs v10 for topic IDs)", ErrTopicIDPinningUnsupported)
+			cl.pinUnsupported.CompareAndSwap(nil, &pinUnsupportedReason{key: int16(kmsg.Metadata), need: 10, offered: -1})
+			cl.failPinnedTopics(tpsProducerLoad, tpsConsumer.load(), supErr)
+			// A consumer with no loaded partitions is not covered by the
+			// per-partition fail above; inject a topic-level error so poll
+			// surfaces the refusal instead of spinning silently.
+			for name := range cl.cfg.pinnedTopics {
+				cl.consumer.addFakeReadyForDraining(name, -1, supErr, "strict topic id pinning requires ID-capable metadata")
+			}
+			return nil, nil
+		}
 		cl.bumpMetadataFailForTopics( // bump load failures for all topics
 			tpsProducerLoad,
 			err,
@@ -427,6 +566,29 @@ func (cl *Client) updateMetadata() (retryWhy multiUpdateWhy, err error) {
 		return nil, err
 	}
 	groupExternal.updateLatest(latest)
+
+	// Strict topic ID pinning: if this client pins any topic, every broker
+	// we talk to must be able to address the pinned paths by ID. We check
+	// once metadata (hence ApiVersions) is known. Failing here is terminal
+	// and explicit -- we never silently retry by name.
+	if len(cl.cfg.pinnedTopics) > 0 {
+		pinnedErr := cl.checkPinningSupportLocked()
+		if pinnedErr != nil {
+			cl.failPinnedTopics(tpsProducerLoad, tpsConsumer.load(), pinnedErr)
+			return nil, nil
+		}
+		// The name->ID mapping a broker uses right now must not move a
+		// pinned name onto a non-pinned ID. This catches a topic deleted
+		// and recreated that this refresh learned about.
+		cl.failPinnedMismatches(latest, tpsProducerLoad, tpsConsumer.load())
+
+		// Pinned topics this refresh requested by ID but that did not
+		// resolve to the pin (the pinned ID is now unknown: the topic was
+		// deleted and not recreated, or recreated under a different ID)
+		// must fail their queued records instead of waiting for a name
+		// resolution that strict mode forbids.
+		cl.failPinnedUnresolved(latest, tpsProducerLoad, tpsConsumer.load())
+	}
 
 	// If regex consuming AND we issued a metadata request to forcefully
 	// create topics, we merge any topics missing into the all-request from
@@ -458,6 +620,17 @@ func (cl *Client) updateMetadata() (retryWhy multiUpdateWhy, err error) {
 		}
 		for _, mt := range latest {
 			if mt.id != noID {
+				// A pinned name never moves to a (new) ID in this map:
+				// group heartbeats and ID-based resolution must keep
+				// addressing the incarnation the client pinned. If the
+				// broker now assigns the name elsewhere, strict mode
+				// failed the topic above; keep its pinned entry.
+				if pinned, isPinned := cl.cfg.pinnedTopics[mt.topic]; isPinned && mt.id != pinned {
+					if _, keep := merged[pinned]; !keep {
+						merged[pinned] = mt.topic
+					}
+					continue
+				}
 				merged[mt.id] = mt.topic
 			}
 		}
@@ -686,10 +859,33 @@ func (cl *Client) fetchTopicMetadata(all bool, reqTopics []string, prune bool) (
 	for i := range meta.Topics {
 		topicMeta := &meta.Topics[i]
 		if topicMeta.Topic == nil {
-			cl.cfg.logger.Log(LogLevelWarn, "metadata response contained nil topic name even though we did not request with topic IDs, skipping")
-			continue
+			// We request pinned topics by ID. A broker answers an
+			// unknown ID with no name (just the ID and an error), so we
+			// re-attach the configured name to keep the topic keyed
+			// consistently in our maps. A nil name for an ID we never
+			// pinned is genuinely unexpected.
+			if pinnedName, ok := cl.pinnedNameForID(topicMeta.TopicID); ok {
+				name := pinnedName
+				topicMeta.Topic = &name
+			} else {
+				cl.cfg.logger.Log(LogLevelWarn, "metadata response contained nil topic name even though we did not request with topic IDs, skipping")
+				continue
+			}
 		}
 		topic := *topicMeta.Topic
+
+		// Strict pinning: no matter how the entry came back, its ID must
+		// equal the pin. A response naming a pinned topic with a different
+		// (or zero) ID means the name now resolves to a different
+		// incarnation, which strict mode must never adopt.
+		if wantID, pinned := cl.cfg.pinnedTopics[topic]; pinned && topicMeta.TopicID != wantID && topicMeta.ErrorCode == 0 {
+			cl.cfg.logger.Log(LogLevelWarn, "metadata for a pinned topic reports a different topic ID than the pin; refusing to adopt it (the topic was deleted and recreated under the same name)",
+				"topic", topic,
+				"pinned_id", topicID(wantID),
+				"got_id", topicID(topicMeta.TopicID),
+			)
+			topicMeta.ErrorCode = kerr.UnknownTopicID.Code
+		}
 
 		mt := &metadataTopic{
 			loadErr:    kerr.ErrorForCode(topicMeta.ErrorCode),
@@ -821,6 +1017,30 @@ func (cl *Client) mergeTopicPartitions(
 	// produced, we bump the respective error or fail everything. There is
 	// nothing to be done in a consumer.
 	if r.loadErr != nil {
+		// A pinned topic that cannot be resolved under its pinned ID is a
+		// terminal identity failure, not a transient unknown-topic bump.
+		// Fail buffered and queued records at once and surface the error
+		// to consumers rather than waiting out the retry/unknown limits.
+		if wantID, pinned := cl.cfg.pinnedTopics[topic]; pinned && (lv.id != wantID || errors.Is(r.loadErr, kerr.UnknownTopicID)) {
+			pinErr := fmt.Errorf("%w: topic %q pinned to %s", ErrTopicIDMismatch, topic, topicID(wantID))
+			// Replace the (retryable) broker error with the terminal pin
+			// error so the deferred storePartitionsUpdate fails queued
+			// records instead of merely bumping their retry count.
+			lv.loadErr = pinErr
+			r.loadErr = pinErr
+			if isProduce {
+				for _, topicPartition := range lv.partitions {
+					topicPartition.records.abandon(pinErr)
+				}
+			} else {
+				cl.consumer.addFakeReadyForDraining(topic, -1, pinErr, "strict topic id pinning could not resolve the pinned topic")
+			}
+			cl.cfg.logger.Log(LogLevelError, "strict topic id pinning: refusing a metadata load that does not resolve the topic to its pinned id",
+				"topic", topic,
+				"pinned_id", topicID(wantID),
+				"err", r.loadErr,
+			)
+		}
 		if isProduce {
 			for _, topicPartition := range lv.partitions {
 				topicPartition.records.bumpRepeatedLoadErr(lv.loadErr)

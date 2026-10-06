@@ -300,6 +300,22 @@ var (
 	//
 	// For any request, the request is failed with this error.
 	ErrClientClosed = errors.New("client closed")
+
+	// ErrTopicIDMismatch is returned for a topic pinned with [PinTopicIDs]
+	// when the topic ID the broker now reports for the pinned name differs
+	// from the pinned ID: the topic was deleted and recreated under the same
+	// name. Producing fails buffered and queued records with this error, and
+	// consuming reports it for the affected partitions. The client never
+	// adopts the replacement; purge and re-add the topic to follow it
+	// deliberately.
+	ErrTopicIDMismatch = errors.New("topic id mismatch: the topic reported for a pinned name has a different topic id, so the topic was deleted and recreated")
+
+	// ErrTopicIDPinningUnsupported is returned when strict topic ID pinning
+	// is enabled ([PinTopicIDs]) but a negotiated broker cannot address the
+	// needed requests by topic ID (metadata, produce, or fetch). Strict
+	// mode refuses to fall back to name-based addressing, because that is
+	// exactly what would let a recreated topic be used unnoticed.
+	ErrTopicIDPinningUnsupported = errors.New("topic id pinning unsupported: the negotiated broker cannot address metadata/produce/fetch by topic id, and strict mode will not fall back to addressing by name")
 )
 
 // ErrFirstReadEOF is returned for responses that immediately error with

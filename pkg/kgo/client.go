@@ -85,6 +85,13 @@ type Client struct {
 	consumer consumer
 	id2t     atomic.Value // map[[16]byte]string
 
+	// pinUnsupported is set once the client learns that a broker it talks
+	// to cannot meet the topic-ID guarantees strict pinning requires. Once
+	// set it is terminal: produce/fetch/metadata for pinned topics fail with
+	// ErrTopicIDPinningUnsupported instead of silently downgrading to
+	// name-based addressing.
+	pinUnsupported atomic.Pointer[pinUnsupportedReason]
+
 	// sawPreferredReplica is set once any broker returns a preferred read
 	// replica, which only a rack aware replica selector does; see BalanceRacks.
 	sawPreferredReplica atomic.Bool
@@ -309,6 +316,8 @@ func (cl *Client) OptValues(opt any) []any {
 		return []any{cfg.retryTimeout}
 	case namefn(AllowAutoTopicCreation):
 		return []any{cfg.allowAutoTopicCreation}
+	case namefn(PinTopicIDs):
+		return []any{cfg.pinnedTopics}
 	case namefn(BrokerMaxWriteBytes):
 		return []any{cfg.maxBrokerWriteBytes}
 	case namefn(BrokerMaxReadBytes):
@@ -1024,6 +1033,64 @@ func (cl *Client) supportsKeyVersion(key, version int16) bool {
 	return false
 }
 
+// pinUnsupportedReason records the first request key that proved a broker
+// cannot meet strict topic ID pinning, along with the version we needed and
+// the version it offered.
+type pinUnsupportedReason struct {
+	key     int16
+	need    int16
+	offered int16
+}
+
+func (r *pinUnsupportedReason) err() error {
+	return fmt.Errorf("%w (%s needs v%d, broker offers v%d)",
+		ErrTopicIDPinningUnsupported,
+		kmsg.NameForKey(r.key),
+		r.need,
+		r.offered,
+	)
+}
+
+// requireKeyForPinning returns nil if every broker the client can reach
+// supports at least need of key for the pinned topic path. If any broker
+// that has reported ApiVersions offers less, strict pinning is marked
+// terminal and the wrapped ErrTopicIDPinningUnsupported is returned.
+//
+// We require ALL known brokers rather than ANY: produce and fetch are
+// dispatched to whichever broker leads a partition, so a single old broker
+// in the cluster is enough to force a name-based request for that partition.
+// A broker we have not negotiated with yet (nil versions) is not held against
+// the cluster; it is checked when it answers.
+func (cl *Client) requireKeyForPinning(key, need int16) error {
+	if r := cl.pinUnsupported.Load(); r != nil {
+		return r.err()
+	}
+	cl.brokersMu.RLock()
+	brokers := append(slices.Clone(cl.brokers), cl.loadSeeds()...)
+	cl.brokersMu.RUnlock()
+	for _, b := range brokers {
+		v := b.loadVersions()
+		if v == nil {
+			continue
+		}
+		if offered := v.maxVersion(key); offered < need {
+			r := &pinUnsupportedReason{key: key, need: need, offered: offered}
+			if !cl.pinUnsupported.CompareAndSwap(nil, r) {
+				return cl.pinUnsupported.Load().err()
+			}
+			cl.cfg.logger.Log(LogLevelError,
+				"topic id pinning cannot be honored: a negotiated broker is too old to address the request by topic id, and strict mode will not fall back to name-based addressing",
+				"broker", logID(b.meta.NodeID),
+				"api", kmsg.NameForKey(key),
+				"need_version", need,
+				"broker_version", offered,
+			)
+			return r.err()
+		}
+	}
+	return nil
+}
+
 func (cl *Client) supportsKIP890p2() bool {
 	if !cl.supportsFeature("transaction.version", 2) {
 		return false
@@ -1118,11 +1185,25 @@ func (cl *Client) fetchMetadataByName(ctx context.Context, all bool, topics []st
 	} else {
 		for _, topic := range topics {
 			reqTopic := kmsg.NewMetadataRequestTopic()
-			reqTopic.Topic = kmsg.StringPtr(topic)
+			// Pinned topics are always addressed by their pinned ID so a
+			// delete+recreate under the same name cannot make us resolve
+			// the replacement incarnation by name.
+			if id, pinned := cl.cfg.pinnedTopics[topic]; pinned {
+				reqTopic.TopicID = id
+			} else {
+				reqTopic.Topic = kmsg.StringPtr(topic)
+			}
 			req.Topics = append(req.Topics, reqTopic)
 		}
 	}
-	return cl.fetchMetadata(ctx, req, true, prune, results)
+	fetchCtx := ctx
+	// Strict pinning addresses topics by ID, which exists only on
+	// Metadata v10+. Pin the floor so a pre-v10 broker fails the request
+	// (errBrokerTooOld) instead of silently matching the name.
+	if len(cl.cfg.pinnedTopics) > 0 && !all {
+		fetchCtx = context.WithValue(ctx, ctxPinReq, &pinReq{pinMin: true, min: 10})
+	}
+	return cl.fetchMetadata(fetchCtx, req, true, prune, results)
 }
 
 // resolveTopicMetaByID fetches metadata by TopicID and caches the results.

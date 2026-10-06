@@ -797,6 +797,7 @@ func (s *source) createReq() *fetchRequest {
 		// We copy a view of the session for the request, which allows
 		// modify source while the request may be reading its copy.
 		session: s.session,
+		pins:    s.cl.cfg.pinnedTopics,
 	}
 
 	paused := s.cl.consumer.loadPaused()
@@ -2530,6 +2531,11 @@ type fetchRequest struct {
 
 	disableIDs bool // #295: using an old IBP on new Kafka results in ApiVersions advertising 13+ while the broker does not return IDs
 
+	// pins is the client's strict topic ID pin map (nil if pinning is
+	// disabled). A topic present here is never downgraded to name-based
+	// fetching.
+	pins map[string][16]byte
+
 	// Session is a copy of the source session at the time a request is
 	// built. If the source is reset, the session it has is reset at the
 	// field level only. Our view of the original session is still valid.
@@ -2558,7 +2564,11 @@ func (f *fetchRequest) addCursor(c *cursor) {
 		f.usedOffsets[c.topic] = partitions
 		f.id2topic[c.topicID] = c.topic
 		f.topic2id[c.topic] = c.topicID
-		if c.topicID == noID {
+		// Strict pinning: a pinned topic's cursor always carries its ID
+		// (metadata locks a pinned cursor that lacks one before it reaches
+		// a fetch), so a missing ID downgrades only non-pinned topics to
+		// name-based fetching.
+		if _, pinned := f.pins[c.topic]; !pinned && c.topicID == noID {
 			f.disableIDs = true
 		}
 		f.torder = append(f.torder, c.topic)

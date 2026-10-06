@@ -1533,6 +1533,29 @@ func (cl *Client) bumpRepeatedLoadErr(err error) {
 	}
 }
 
+// failUnknownTopic permanently fails records still queued for a topic whose
+// partitions never loaded (strict topic ID pinning rejected the topic). The
+// waiter is told via its fatal channel so it does not retry or wait for a
+// later metadata update to resolve the name.
+func (cl *Client) failUnknownTopic(topic string, err error) {
+	p := &cl.producer
+	p.unknownTopicsMu.Lock()
+	unknown, exists := p.unknownTopics[topic]
+	p.unknownTopicsMu.Unlock()
+	if !exists {
+		return
+	}
+	// Signal the waiter but leave the map entry in place. The waiter owns
+	// the delete + promise of its buffered records when it wakes; deleting
+	// here first would make its re-check (nowUnknown != unknown) return
+	// without ever promising the records.
+	select {
+	case unknown.fatal <- err:
+	default:
+		close(unknown.fatal)
+	}
+}
+
 // Clears all buffered records in the client with the given error.
 //
 // - closing client

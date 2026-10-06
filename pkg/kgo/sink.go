@@ -158,7 +158,15 @@ func (s *sink) createReq(id int64, epoch int16) (*produceRequest, *kmsg.AddParti
 			moreToDrain = true
 			continue
 		}
-		if req.produceMax > 12 && recBuf.topicID == noID {
+		// Pinned topics must always be addressed by ID on produce v13+; a
+		// pinned buffer that somehow lost its ID is a hard pin failure, not
+		// a reason to downgrade to name-based v12.
+		if _, pinned := s.cl.cfg.pinnedTopics[recBuf.topic]; pinned {
+			if recBuf.topicID == noID {
+				recBuf.abandon(fmt.Errorf("%w: topic %q has no topic ID for an ID-addressed produce", ErrTopicIDPinningUnsupported, recBuf.topic))
+				continue
+			}
+		} else if req.produceMax > 12 && recBuf.topicID == noID {
 			req.produceMax = 12
 		}
 

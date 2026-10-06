@@ -116,6 +116,14 @@ type cfg struct {
 	hooks hooks
 	pools pools
 
+	// pinnedTopics maps a topic name to the single topic ID the client is
+	// allowed to use for it. A non-nil map opts in to strict topic ID
+	// pinning: metadata, producing, consuming, commits, and queued records
+	// all resolve the topic by this ID and the client refuses to keep
+	// going rather than silently adopting a different ID after the topic is
+	// deleted and recreated under the same name.
+	pinnedTopics map[string][16]byte
+
 	//////////////////////
 	// PRODUCER SECTION //
 	//////////////////////
@@ -226,6 +234,23 @@ type cfg struct {
 func (cfg *cfg) validate() error {
 	if len(cfg.seedBrokers) == 0 {
 		return errors.New("config erroneously has no seed brokers")
+	}
+
+	if len(cfg.pinnedTopics) > 0 {
+		if cfg.allowAutoTopicCreation {
+			return errors.New("cannot pin topic IDs while allowing auto topic creation: a pinned topic must already exist, so auto creation could bind the pin to an unintended topic")
+		}
+		if cfg.regex {
+			return errors.New("cannot pin topic IDs while consuming with a regex: pinned topics are addressed by an exact name configured up front, which a regex subscription cannot provide")
+		}
+		for topic, id := range cfg.pinnedTopics {
+			if topic == "" {
+				return errors.New("cannot pin a topic ID for an empty topic name")
+			}
+			if id == noID {
+				return fmt.Errorf("cannot pin the all-zero topic ID for topic %q: the all-zero ID means the broker does not support topic IDs", topic)
+			}
+		}
 	}
 
 	if cfg.maxWait == math.MinInt32 {
@@ -964,6 +989,49 @@ func RetryTimeoutFn(t func(int16) time.Duration) Opt {
 // not exist when fetching their metadata.
 func AllowAutoTopicCreation() Opt {
 	return clientOpt{func(cfg *cfg) { cfg.allowAutoTopicCreation = true }}
+}
+
+// PinTopicIDs opts in to strict topic ID pinning for the given topics. Each
+// topic is bound to the exact 16-byte topic ID (UUID) the caller already
+// knows it has; pairs are given as topic name followed by ID, e.g.
+//
+//	PinTopicIDs(map[string][16]byte{"orders": ordersID})
+//
+// A topic deleted and recreated under the same name comes back with a new
+// topic ID. Without pinning, the client eventually adopts the new incarnation
+// only after its prior metadata goes stale and produce/fetch retries re-resolve
+// by name, which can silently route new writes and reads to the replacement.
+// With pinning, the topic is addressed by the pinned ID end to end, so the
+// recreated (new ID) incarnation is never the topic the client talks to:
+//
+//   - Metadata is requested by the pinned ID. A response whose ID does not
+//     match, or that drops the topic ID, does not adopt the replacement.
+//   - Produce and fetch requests carry the pinned ID on the wire. Records
+//     already buffered but not yet sent, and any automatic retry, are failed
+//     rather than re-resolved to the new ID.
+//   - Consuming stops surfacing records from the new incarnation and reports
+//     [ErrTopicIDMismatch] for the affected partitions.
+//
+// The guarantee only holds on brokers that can address every request by
+// topic ID. Strict mode is therefore refused instead of silently downgraded
+// when a negotiated broker cannot provide ID-based metadata, produce, or
+// fetch; produce and fetch then fail with [ErrTopicIDPinningUnsupported].
+//
+// Pinned topics are matched by exact name, so this option cannot be combined
+// with [ConsumeRegex], nor with [AllowAutoTopicCreation]: a pinned topic must
+// exist already with the ID provided. Pinning the all-zero UUID is rejected.
+func PinTopicIDs(pins map[string][16]byte) Opt {
+	return clientOpt{func(cfg *cfg) {
+		if len(pins) == 0 {
+			return
+		}
+		if cfg.pinnedTopics == nil {
+			cfg.pinnedTopics = make(map[string][16]byte, len(pins))
+		}
+		for topic, id := range pins {
+			cfg.pinnedTopics[topic] = id
+		}
+	}}
 }
 
 // BrokerMaxWriteBytes upper bounds the number of bytes written to a broker
