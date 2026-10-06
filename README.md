@@ -207,6 +207,23 @@ func (b Box) Contains(lat, lng float64) bool
 Contains decides whether (lat, lng) is contained in the box. The containment
 test is inclusive of the edges and corners.
 
+#### func (Box) Cover
+
+```go
+func (b Box) Cover(maxPrecision uint, maxGrids int) ([]string, error)
+```
+Cover returns geohash prefixes forming a covering of the rectangle.
+
+maxPrecision is the finest prefix length in characters, from 1 to 12. A
+geohash cell that is completely inside the rectangle is not subdivided. The
+result never contains more than maxGrids prefixes; when refining a cell would
+exceed that budget, the coarser parent is retained instead.
+
+A rectangle with MinLng greater than MaxLng crosses the antimeridian. The
+empty prefix represents the whole-world root cell and is returned when no
+finer one-cell covering is possible. The result is sorted, contains no
+duplicates, and never contains both a prefix and one of its descendants.
+
 #### func (Box) Round
 
 ```go
