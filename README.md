@@ -106,6 +106,17 @@ will generate with the Dollar Placeholder:
 SELECT * FROM nodes WHERE meta->'format' ?| array[$1,$2]
 ```
 
+If your statements contain question marks inside string literals, quoted
+identifiers, dollar-quoted function bodies or comments, use the
+PostgreSQL-aware `sq.PostgreSQL` placeholder format instead of `sq.Dollar`.
+It lexes the statement and only numbers real placeholders, so question marks
+in those constructs no longer need manual escaping (the explicit `??` escape
+still works for JSON operators):
+
+```go
+psql := sq.StatementBuilder.PlaceholderFormat(sq.PostgreSQL)
+```
+
 ## FAQ
 
 * **How can I build an IN query on composite keys / tuples, e.g. `WHERE (col1, col2) IN ((1,2),(3,4))`? ([#104](https://github.com/Masterminds/squirrel/issues/104))**
