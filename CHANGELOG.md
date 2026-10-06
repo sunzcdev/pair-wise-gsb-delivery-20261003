@@ -1,5 +1,12 @@
 # UNRELEASED
 
+FEATURES
+
+* Add `LongestPrefixBatch` on `Tree`, `Txn`, and `Node` to resolve the
+  longest stored prefix for many query keys in one shared traversal.
+  Queries may be given in any order and may contain duplicates; results
+  map back to the input order one-to-one.
+
 # 2.0.0 (December 15th, 2022)
 
 * Update API to use generics [[GH-43](https://github.com/hashicorp/go-immutable-radix/pull/43))
