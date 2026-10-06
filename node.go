@@ -26,6 +26,19 @@ type edge[T any] struct {
 	node  *Node[T]
 }
 
+// LongestPrefixResult is the result of a longest-prefix lookup.
+type LongestPrefixResult[T any] struct {
+	// Key is the longest stored key that is a prefix of the queried key.
+	Key []byte
+
+	// Value is the value stored at Key.
+	Value T
+
+	// Found reports whether a matching key exists. It is false when there is
+	// no match, including when the tree has no empty key for an empty query.
+	Found bool
+}
+
 // Node is an immutable node in the radix tree
 type Node[T any] struct {
 	// mutateCh is closed if this node is modified
@@ -146,9 +159,17 @@ func (n *Node[T]) Get(k []byte) (T, bool) {
 // LongestPrefix is like Get, but instead of an
 // exact match, it will return the longest prefix match.
 func (n *Node[T]) LongestPrefix(k []byte) ([]byte, T, bool) {
+	return n.longestPrefix(k, nil)
+}
+
+func (n *Node[T]) longestPrefix(k []byte, visits *int) ([]byte, T, bool) {
 	var last *leafNode[T]
 	search := k
 	for {
+		if visits != nil {
+			*visits++
+		}
+
 		// Look for a leaf node
 		if n.isLeaf() {
 			last = n.leaf
@@ -177,6 +198,91 @@ func (n *Node[T]) LongestPrefix(k []byte) ([]byte, T, bool) {
 	}
 	var zero T
 	return nil, zero, false
+}
+
+// LongestPrefixes is used to perform longest-prefix lookups for multiple keys.
+// Keys may be in any order and are not modified. Results are returned in the
+// same order as keys, with one result for every duplicate key.
+func (n *Node[T]) LongestPrefixes(keys [][]byte) []LongestPrefixResult[T] {
+	return n.longestPrefixes(keys, nil)
+}
+
+func (n *Node[T]) longestPrefixes(keys [][]byte, visits *int) []LongestPrefixResult[T] {
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(i, j int) bool {
+		return bytes.Compare(keys[order[i]], keys[order[j]]) < 0
+	})
+
+	results := make([]LongestPrefixResult[T], len(keys))
+	n.longestPrefixBatch(keys, order, 0, len(order), 0, results, nil, visits)
+	return results
+}
+
+func (n *Node[T]) longestPrefixBatch(keys [][]byte, order []int, lo, hi, offset int,
+	results []LongestPrefixResult[T], last *leafNode[T], visits *int) {
+	if lo >= hi {
+		return
+	}
+	if visits != nil {
+		*visits++
+	}
+
+	if n.leaf != nil {
+		last = n.leaf
+	}
+	if last != nil {
+		for _, idx := range order[lo:hi] {
+			results[idx] = LongestPrefixResult[T]{
+				Key:   last.key,
+				Value: last.val,
+				Found: true,
+			}
+		}
+	}
+
+	exhausted := lo + sort.Search(hi-lo, func(i int) bool {
+		return len(keys[order[lo+i]]) > offset
+	})
+	if exhausted == hi {
+		return
+	}
+
+	for start := exhausted; start < hi; {
+		label := keys[order[start]][offset]
+		end := start + 1 + sort.Search(hi-start-1, func(i int) bool {
+			key := keys[order[start+1+i]]
+			return len(key) > offset && key[offset] > label
+		})
+
+		_, child := n.getEdge(label)
+		if child != nil {
+			matchStart, matchEnd := start, end
+			for i, prefixByte := range child.prefix {
+				position := offset + i
+				matchStart = matchStart + sort.Search(matchEnd-matchStart, func(i int) bool {
+					key := keys[order[matchStart+i]]
+					return len(key) > position && key[position] >= prefixByte
+				})
+				matchEnd = matchStart + sort.Search(matchEnd-matchStart, func(i int) bool {
+					key := keys[order[matchStart+i]]
+					return len(key) > position && key[position] > prefixByte
+				})
+				if matchStart >= matchEnd {
+					break
+				}
+			}
+
+			if matchStart < matchEnd {
+				child.longestPrefixBatch(keys, order, matchStart, matchEnd,
+					offset+len(child.prefix), results, last, visits)
+			}
+		}
+
+		start = end
+	}
 }
 
 // Minimum is used to return the minimum value in the tree

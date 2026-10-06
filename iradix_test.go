@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"testing/quick"
 
@@ -481,6 +482,195 @@ func TestLongestPrefix(t *testing.T) {
 		}
 		if string(m) != test.out {
 			t.Fatalf("mis-match: %v %v", m, test)
+		}
+	}
+}
+
+func TestLongestPrefixes(t *testing.T) {
+	r := New[int]()
+
+	keys := []string{
+		"",
+		"foo",
+		"foobar",
+		"foobarbaz",
+		"foobarbazzip",
+		"foozip",
+	}
+	for i, key := range keys {
+		r, _, _ = r.Insert([]byte(key), i+1)
+	}
+
+	queries := [][]byte{
+		nil,
+		[]byte("foozipzap"),
+		[]byte("foobarbaz"),
+		[]byte("a"),
+		[]byte("foo"),
+		[]byte("foobarba"),
+		[]byte("foobazzz"),
+		[]byte("foobarbaz"),
+		[]byte("foobar"),
+		[]byte(""),
+	}
+	original := make([]string, len(queries))
+	for i, query := range queries {
+		original[i] = string(query)
+	}
+
+	root := r.Root()
+	results := root.LongestPrefixes(queries)
+	if len(results) != len(queries) {
+		t.Fatalf("bad result count: %d", len(results))
+	}
+
+	for i, query := range queries {
+		expectedKey, expectedValue, expectedFound := root.LongestPrefix(query)
+		result := results[i]
+
+		if result.Found != expectedFound {
+			t.Fatalf("query %q found mismatch: %t != %t", query, result.Found, expectedFound)
+		}
+		if string(result.Key) != string(expectedKey) {
+			t.Fatalf("query %q key mismatch: %q != %q", query, result.Key, expectedKey)
+		}
+		if result.Value != expectedValue {
+			t.Fatalf("query %q value mismatch: %d != %d", query, result.Value, expectedValue)
+		}
+	}
+
+	if results[0].Found == false || len(results[0].Key) != 0 || results[0].Value != 1 {
+		t.Fatalf("empty key must be distinguishable from no match: %#v", results[0])
+	}
+	if results[3].Found == false || len(results[3].Key) != 0 || results[3].Value != 1 {
+		t.Fatalf("empty key must match every query: %#v", results[3])
+	}
+	if got := string(results[2].Key); got != "foobarbaz" {
+		t.Fatalf("exact key should win over a shorter prefix, got %q", got)
+	}
+	if got := string(results[6].Key); got != "foo" {
+		t.Fatalf("compressed-edge mismatch should return nearest valued ancestor, got %q", got)
+	}
+
+	for i, query := range queries {
+		if string(query) != original[i] {
+			t.Fatalf("input order changed at %d", i)
+		}
+	}
+
+	noMatchTree := New[int]()
+	noMatchTree, _, _ = noMatchTree.Insert([]byte("foo"), 1)
+	noMatchResults := noMatchTree.Root().LongestPrefixes([][]byte{nil, []byte("a")})
+	for i, result := range noMatchResults {
+		if result.Found || result.Key != nil || result.Value != 0 {
+			t.Fatalf("result %d should have no match: %#v", i, result)
+		}
+	}
+
+	root.LongestPrefixes([][]byte{[]byte("different"), []byte("queries")})
+	for i, query := range queries {
+		expectedKey, _, _ := root.LongestPrefix(query)
+		if string(results[i].Key) != string(expectedKey) {
+			t.Fatalf("result %d changed after another batch", i)
+		}
+	}
+}
+
+func TestLongestPrefixesSharedTraversal(t *testing.T) {
+	const (
+		commonPrefixLength = 256
+		leafCount          = 64
+		duplicates         = 4
+	)
+
+	commonPrefix := strings.Repeat("p", commonPrefixLength)
+	r := New[int]()
+	r, _, _ = r.Insert([]byte(commonPrefix), -1)
+
+	fullKeys := make([][]byte, leafCount)
+	for i := 0; i < leafCount; i++ {
+		key := []byte(fmt.Sprintf("%s-%02d", commonPrefix, i))
+		fullKeys[i] = key
+		r, _, _ = r.Insert(key, i+1)
+	}
+
+	queries := make([][]byte, leafCount*duplicates)
+	for duplicate := 0; duplicate < duplicates; duplicate++ {
+		for i := leafCount - 1; i >= 0; i-- {
+			queries[duplicate*leafCount+(leafCount-1-i)] = fullKeys[i]
+		}
+	}
+
+	root := r.Root()
+	var batchVisits int
+	results := root.longestPrefixes(queries, &batchVisits)
+
+	var singleVisits int
+	for i, query := range queries {
+		keyIndex := leafCount - 1 - (i % leafCount)
+		key, value, found := root.longestPrefix(query, &singleVisits)
+		if !found || string(key) != string(query) || value != keyIndex+1 {
+			t.Fatalf("bad match for query %d", i)
+		}
+	}
+
+	for i, result := range results {
+		expected := leafCount - 1 - (i % leafCount)
+		if !result.Found || string(result.Key) != string(fullKeys[expected]) || result.Value != expected+1 {
+			t.Fatalf("bad batch result for duplicate %d", i)
+		}
+	}
+
+	if batchVisits != 74 {
+		t.Fatalf("shared traversal visited %d nodes, want 74", batchVisits)
+	}
+	if singleVisits != len(queries)*5 {
+		t.Fatalf("single traversal visited %d nodes, want %d", singleVisits, len(queries)*5)
+	}
+}
+
+func TestLongestPrefixesRandomized(t *testing.T) {
+	for iteration := 0; iteration < 200; iteration++ {
+		r := New[int]()
+		keyCount := rand.Intn(32) + 1
+		for i := 0; i < keyCount; i++ {
+			keyLength := rand.Intn(12)
+			key := make([]byte, keyLength)
+			for j := range key {
+				key[j] = byte(rand.Intn(3))
+			}
+			r, _, _ = r.Insert(key, i+1)
+		}
+
+		queryCount := rand.Intn(64) + 1
+		queries := make([][]byte, queryCount)
+		for i := range queries {
+			if rand.Intn(5) == 0 {
+				queries[i] = nil
+				continue
+			}
+			query := make([]byte, rand.Intn(14))
+			for j := range query {
+				query[j] = byte(rand.Intn(3))
+			}
+			queries[i] = query
+		}
+
+		root := r.Root()
+		results := root.LongestPrefixes(queries)
+		if len(results) != queryCount {
+			t.Fatalf("iteration %d: bad result count", iteration)
+		}
+		for i, query := range queries {
+			expectedKey, expectedValue, expectedFound := root.LongestPrefix(query)
+			result := results[i]
+			if result.Found != expectedFound ||
+				string(result.Key) != string(expectedKey) ||
+				result.Value != expectedValue {
+				t.Fatalf("iteration %d query %q: got (%q,%d,%t), want (%q,%d,%t)",
+					iteration, query, result.Key, result.Value, result.Found,
+					expectedKey, expectedValue, expectedFound)
+			}
 		}
 	}
 }
