@@ -70,3 +70,17 @@ func ExampleDecodeIntWithPrecision() {
 	fmt.Printf("%.3f %.3f\n", lat, lng)
 	// Output: 48.600 2.000
 }
+
+func ExampleCovering() {
+	// Geohash prefixes covering 5km around a point in San Francisco,
+	// using a spherical earth model with a radius of 6371km.
+	hashes, err := geohash.Covering(37.7749, -122.4194, 5000, 6371000, geohash.CoveringConfig{
+		MaxChars: 5,
+		MaxCells: 32,
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(hashes)
+	// Output: [9q8yt 9q8yu 9q8yv 9q8yw 9q8yx 9q8yy 9q8yz 9q8zj 9q8zn 9q8zp]
+}
