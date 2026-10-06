@@ -299,6 +299,7 @@ type Client struct {
 	messageWriter    *writer
 	perChannelWriter *perChannelWriter
 	pubSubSync       recovery.PubSubSync[pendingPublication]
+	recoveryCursor   *recoveryCursorPayload
 	uid              string
 	session          string
 	user             string
@@ -374,6 +375,9 @@ func NewClient(ctx context.Context, n *Node, t Transport) (*Client, ClientCloseF
 		status:        statusConnecting,
 		eventHub:      &clientEventHub{},
 		connectedAtMS: time.Now().UnixMilli(),
+	}
+	if cursor, ok := recoveryCursorFromContext(ctx); ok {
+		client.recoveryCursor = cursor
 	}
 	client.pingPongLatency.Store(-1)
 
@@ -1420,6 +1424,18 @@ func (c *Client) IsSubscribed(ch string) bool {
 	defer c.mu.RUnlock()
 	ctx, ok := c.channels[ch]
 	return ok && channelHasFlag(ctx.flags, flagSubscribed)
+}
+
+// channelStreamPosition returns the current stream position of a subscribed
+// channel. Used by transport-level recovery cursor tracking.
+func (c *Client) channelStreamPosition(ch string) (StreamPosition, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	ctx, ok := c.channels[ch]
+	if !ok || !channelHasFlag(ctx.flags, flagSubscribed) {
+		return StreamPosition{}, false
+	}
+	return ctx.streamPosition, true
 }
 
 // Labels returns custom labels attached to the client connection.
@@ -4333,6 +4349,18 @@ func (c *Client) subscribeCmd(req *protocol.SubscribeRequest, reply SubscribeRep
 	}
 
 	channel := req.Channel
+
+	// Seed recovery from a transport-level recovery cursor (e.g. SSE) when the
+	// client did not bring its own position. The cursor only carries stream
+	// positions - it is not an authorization credential, and all the regular
+	// subscribe permission checks below still run for the channel.
+	if !req.Recover && c.recoveryCursor != nil {
+		if sp, ok := c.recoveryCursor.positionFor(c.user, channel, time.Now()); ok {
+			req.Recover = true
+			req.Offset = sp.Offset
+			req.Epoch = sp.Epoch
+		}
+	}
 
 	info := &ClientInfo{
 		ClientID: c.uid,
