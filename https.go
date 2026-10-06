@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
-	"github.com/elazarl/goproxy/internal/signer"
 	"golang.org/x/net/http2"
 )
 
@@ -796,38 +795,6 @@ func (proxy *ProxyHttpServer) NewConnectDialToProxyWithHandler(
 		}
 	}
 	return nil
-}
-
-// TLSConfigFromCA returns a TLSConfig function that generates dynamic TLS certificates
-// for each target host, signed by the given CA certificate.
-// The generated certificates are used during MITM interception (ConnectMitm).
-// If a CertStorage is set on the ProxyCtx, certificates are cached and reused to save CPU.
-func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls.Config, error) {
-	return func(host string, ctx *ProxyCtx) (*tls.Config, error) {
-		var err error
-		var cert *tls.Certificate
-
-		hostname := stripPort(host)
-		config := defaultTLSConfig.Clone()
-		ctx.Logf("signing for %s", stripPort(host))
-
-		genCert := func() (*tls.Certificate, error) {
-			return signer.SignHost(*ca, []string{hostname})
-		}
-		if ctx.certStore != nil {
-			cert, err = ctx.certStore.Fetch(hostname, genCert)
-		} else {
-			cert, err = genCert()
-		}
-
-		if err != nil {
-			ctx.Warnf("Cannot sign host certificate with provided CA: %s", err)
-			return nil, err
-		}
-
-		config.Certificates = append(config.Certificates, *cert)
-		return config, nil
-	}
 }
 
 func (proxy *ProxyHttpServer) initializeTLSconnection(
