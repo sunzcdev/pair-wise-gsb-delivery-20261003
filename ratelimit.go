@@ -29,10 +29,25 @@ type RateLimiter struct {
 
 	rate, allowance, max, unit uint64
 	lastCheck                  int64
+	now                        func() time.Time
 }
 
 // New creates a new rate limiter instance
 func New(rate int, per time.Duration) *RateLimiter {
+	return newWithClock(rate, per, systemClock{})
+}
+
+type clock interface {
+	Now() time.Time
+}
+
+type systemClock struct{}
+
+func (systemClock) Now() time.Time {
+	return time.Now()
+}
+
+func newWithClock(rate int, per time.Duration, c clock) *RateLimiter {
 	nano := uint64(per)
 	if nano < 1 {
 		nano = uint64(time.Second)
@@ -46,8 +61,8 @@ func New(rate int, per time.Duration) *RateLimiter {
 		allowance: uint64(rate) * nano, // set our allowance to max in the beginning
 		max:       uint64(rate) * nano, // remember our maximum allowance
 		unit:      nano,                // remember our unit size
-
-		lastCheck: nowNano(),
+		lastCheck: c.Now().UnixNano(),
+		now:       c.Now,
 	}
 }
 
@@ -62,7 +77,7 @@ func (rl *RateLimiter) UpdateRate(rate int) {
 
 // Limit returns true if rate was exceeded
 func (rl *RateLimiter) Limit() bool {
-	now := nowNano()
+	now := rl.nano()
 
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -104,6 +119,6 @@ func (rl *RateLimiter) Undo() {
 	}
 }
 
-func nowNano() int64 {
+func timeNowNano() int64 {
 	return time.Now().UnixNano()
 }
