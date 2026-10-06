@@ -101,6 +101,24 @@ func TestRateLimiter_Undo(t *testing.T) {
 	}
 }
 
+func TestLimitMany(t *testing.T) {
+	global := New(10, time.Minute)
+	tenant := New(10, time.Minute)
+
+	limiters := []*RateLimiter{global, tenant}
+	if limited, failed := LimitMany([]uint64{11, 1}, limiters...); !limited || failed != 0 {
+		t.Fatalf("expected index 0 to limit, got limited=%v failed=%d", limited, failed)
+	}
+
+	if limited, failed := LimitMany([]uint64{10, 10}, limiters...); limited || failed != -1 {
+		t.Fatalf("expected request to pass, got limited=%v failed=%d", limited, failed)
+	}
+
+	if limited, failed := LimitMany([]uint64{1, 1}, limiters...); !limited || failed != 0 {
+		t.Fatalf("expected exhausted buckets to limit, got limited=%v failed=%d", limited, failed)
+	}
+}
+
 func BenchmarkLimit(b *testing.B) {
 	rl := New(1000, time.Second)
 

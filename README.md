@@ -34,3 +34,25 @@ func main() {
 ### Documentation
 
 Full documentation is available on [pkg.go.dev](https://pkg.go.dev/github.com/bsm/ratelimit).
+
+### Atomic multi-bucket limits
+
+Use `LimitMany` to require capacity in several buckets at once, such as global,
+tenant, and user budgets. All costs are deducted only when every bucket can
+admit the request. The second result is the first parameter index that failed,
+or `-1` on success:
+
+```go
+costs := []uint64{1, 3, 1}
+limiters := []*ratelimit.RateLimiter{global, tenant, user}
+
+if limited, failed := ratelimit.LimitMany(costs, limiters...); limited {
+  log.Printf("rejected by bucket %d", failed)
+} else {
+  log.Println("admitted")
+}
+```
+
+The same limiter can appear more than once. Its costs are merged before the
+check, and an overflowing merged cost reports that bucket as failed without
+changing any limiter state.
