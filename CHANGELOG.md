@@ -1,3 +1,7 @@
+## Unreleased
+#### FEATURES
+- Add Sqrt method computing the square root to a requested number of decimal places with an explicit rounding mode (RoundDown, RoundCeiling, RoundFloor, RoundHalfUp, RoundHalfEven), using exact integer arithmetic only
+
 ## Decimal v1.4.0
 #### BREAKING
 - Drop support for Go version older than 1.10 [#361](https://github.com/shopspring/decimal/pull/361)
