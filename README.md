@@ -51,6 +51,43 @@ For numerical data, we recommend that you look into the encoding/binary library.
 
 Godoc documentation:  https://pkg.go.dev/github.com/bits-and-blooms/bloom/v3 
 
+## Counting Bloom Filters and Deletion
+
+A normal Bloom filter cannot safely delete an item because independent items can
+share hash locations. `CountingBloomFilter` replaces each bit with a counter.
+Every successful `Add` returns an opaque `Receipt` for that particular add:
+
+```Go
+    filter := bloom.NewCountingWithEstimates(1000, 0.01)
+    receipt, err := filter.Add([]byte("Love"))
+    if err != nil {
+        // Handle ErrCounterLimit.
+    }
+    if filter.Test([]byte("Love")) {
+        // The key may be present.
+    }
+    if err := filter.Remove(receipt); err != nil {
+        // The receipt was used, expired, or belonged to another filter.
+    }
+```
+
+Adding the same key multiple times returns independent receipts. A receipt can
+be used only once and only with the filter that issued it; there is no way to
+decrement counters directly from a key. If one of the filter's counters is at
+its limit, the complete add is rejected and no counter is changed.
+
+When one key uses several hash functions that map to the same location, that
+location is incremented and decremented once for each duplicate hash location.
+`ClearAll` removes all counters and expires all outstanding receipts.
+
+Receipts are intended for short-term deduplication. The returned receipt is an
+opaque, fixed-size capability that contains the locations for its add. `Remove`
+marks the receipt used and clears its hash payload immediately; `ClearAll`
+advances a generation so outstanding receipts become invalid. Once the caller
+drops the receipt, Go garbage collection reclaims the receipt object. The
+filter keeps no searchable receipt table, and a lost receipt cannot withdraw an
+add because the caller no longer has proof of that add.
+
 
 ## Installation
 
