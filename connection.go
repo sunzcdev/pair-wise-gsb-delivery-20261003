@@ -107,7 +107,7 @@ func (mc *mysqlConn) handleParams() error {
 	if cmdSet == "" {
 		return nil
 	}
-	return mc.exec(cmdSet)
+	return mc.exec(cmdSet, nil)
 }
 
 func (cfg *Config) setParamsCommand() string {
@@ -156,7 +156,7 @@ func (mc *mysqlConn) begin(readOnly bool) (driver.Tx, error) {
 	} else {
 		q = "START TRANSACTION"
 	}
-	err := mc.exec(q)
+	err := mc.exec(q, nil)
 	if err == nil {
 		return &mysqlTx{mc}, err
 	}
@@ -440,6 +440,10 @@ func (mc *mysqlConn) interpolateParams(query string, args []driver.Value) (strin
 }
 
 func (mc *mysqlConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	return mc.execWithAttrs(query, args, nil)
+}
+
+func (mc *mysqlConn) execWithAttrs(query string, args []driver.Value, attrs []queryAttribute) (driver.Result, error) {
 	if mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
@@ -455,7 +459,7 @@ func (mc *mysqlConn) Exec(query string, args []driver.Value) (driver.Result, err
 		query = prepared
 	}
 
-	err := mc.exec(query)
+	err := mc.exec(query, attrs)
 	if err == nil {
 		copied := mc.result
 		return &copied, err
@@ -464,10 +468,10 @@ func (mc *mysqlConn) Exec(query string, args []driver.Value) (driver.Result, err
 }
 
 // Internal function to execute commands
-func (mc *mysqlConn) exec(query string) error {
+func (mc *mysqlConn) exec(query string, attrs []queryAttribute) error {
 	handleOk := mc.clearResult()
 	// Send command
-	if err := mc.writeCommandPacketStr(comQuery, query); err != nil {
+	if err := mc.writeComQueryPacket(query, attrs); err != nil {
 		return mc.markBadConn(err)
 	}
 
@@ -493,10 +497,10 @@ func (mc *mysqlConn) exec(query string) error {
 }
 
 func (mc *mysqlConn) Query(query string, args []driver.Value) (driver.Rows, error) {
-	return mc.query(query, args)
+	return mc.query(query, args, nil)
 }
 
-func (mc *mysqlConn) query(query string, args []driver.Value) (*textRows, error) {
+func (mc *mysqlConn) query(query string, args []driver.Value, attrs []queryAttribute) (*textRows, error) {
 	handleOk := mc.clearResult()
 
 	if mc.closed.Load() {
@@ -514,7 +518,7 @@ func (mc *mysqlConn) query(query string, args []driver.Value) (*textRows, error)
 		query = prepared
 	}
 	// Send command
-	err := mc.writeCommandPacketStr(comQuery, query)
+	err := mc.writeComQueryPacket(query, attrs)
 	if err != nil {
 		return nil, mc.markBadConn(err)
 	}
@@ -549,7 +553,7 @@ func (mc *mysqlConn) query(query string, args []driver.Value) (*textRows, error)
 func (mc *mysqlConn) getSystemVar(name string) (string, error) {
 	// Send command
 	handleOk := mc.clearResult()
-	if err := mc.writeCommandPacketStr(comQuery, "SELECT @@"+name); err != nil {
+	if err := mc.writeComQueryPacket("SELECT @@"+name, nil); err != nil {
 		return "", err
 	}
 
@@ -631,7 +635,7 @@ func (mc *mysqlConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver
 		if err != nil {
 			return nil, err
 		}
-		err = mc.exec("SET TRANSACTION ISOLATION LEVEL " + level)
+		err = mc.exec("SET TRANSACTION ISOLATION LEVEL "+level, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -646,11 +650,16 @@ func (mc *mysqlConn) QueryContext(ctx context.Context, query string, args []driv
 		return nil, err
 	}
 
+	attrs, err := mc.resolveQueryAttributes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
 
-	rows, err := mc.query(query, dargs)
+	rows, err := mc.query(query, dargs, attrs)
 	if err != nil {
 		mc.finish()
 		return nil, err
@@ -665,12 +674,17 @@ func (mc *mysqlConn) ExecContext(ctx context.Context, query string, args []drive
 		return nil, err
 	}
 
+	attrs, err := mc.resolveQueryAttributes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
 	defer mc.finish()
 
-	return mc.Exec(query, dargs)
+	return mc.execWithAttrs(query, dargs, attrs)
 }
 
 func (mc *mysqlConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
@@ -699,11 +713,16 @@ func (stmt *mysqlStmt) QueryContext(ctx context.Context, args []driver.NamedValu
 		return nil, err
 	}
 
+	attrs, err := stmt.mc.resolveQueryAttributes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := stmt.mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
 
-	rows, err := stmt.query(dargs)
+	rows, err := stmt.query(dargs, attrs)
 	if err != nil {
 		stmt.mc.finish()
 		return nil, err
@@ -718,12 +737,17 @@ func (stmt *mysqlStmt) ExecContext(ctx context.Context, args []driver.NamedValue
 		return nil, err
 	}
 
+	attrs, err := stmt.mc.resolveQueryAttributes(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := stmt.mc.watchCancel(ctx); err != nil {
 		return nil, err
 	}
 	defer stmt.mc.finish()
 
-	return stmt.Exec(dargs)
+	return stmt.exec(dargs, attrs)
 }
 
 func (mc *mysqlConn) watchCancel(ctx context.Context) error {

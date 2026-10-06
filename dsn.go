@@ -80,6 +80,11 @@ type Config struct {
 	compress       bool // Enable zlib compression
 	tinyInt1IsBool bool // Treat signed TINYINT(1) as boolean
 
+	// queryAttributesIgnore silently drops query attributes (see
+	// WithQueryAttributes) when the server does not support them.
+	// The default is to fail such statements with ErrQueryAttributesUnsupported.
+	queryAttributesIgnore bool
+
 	beforeConnect     func(context.Context, *Config) error // Invoked before a connection is established
 	encodedAttributes string                               // Encoded connection attributes
 	paramOrder        []string                             // Order of connection parameters parsed from the DSN
@@ -169,6 +174,21 @@ func EnableCompression(yes bool) Option {
 func TinyInt1IsBool(yes bool) Option {
 	return func(cfg *Config) error {
 		cfg.tinyInt1IsBool = yes
+		return nil
+	}
+}
+
+// IgnoreUnsupportedQueryAttributes controls how statements carrying query
+// attributes (see [WithQueryAttributes]) are handled when the server does
+// not support the CLIENT_QUERY_ATTRIBUTES capability (e.g. MySQL < 8.0.23
+// or MariaDB).
+//
+// The default (false) fails such statements with
+// [ErrQueryAttributesUnsupported]. When set to true, the attributes are
+// silently dropped and the statement is executed without them.
+func IgnoreUnsupportedQueryAttributes(yes bool) Option {
+	return func(cfg *Config) error {
+		cfg.queryAttributesIgnore = yes
 		return nil
 	}
 }
@@ -388,6 +408,10 @@ func (cfg *Config) FormatDSN() string {
 
 	if cfg.ParseTime {
 		writeDSNParam(&buf, &hasParam, "parseTime", "true")
+	}
+
+	if cfg.queryAttributesIgnore {
+		writeDSNParam(&buf, &hasParam, "queryAttributes", "ignore")
 	}
 
 	if cfg.timeTruncate > 0 {
@@ -663,6 +687,17 @@ func parseDSNParams(cfg *Config, params string) (err error) {
 			cfg.ParseTime, isBool = readBool(value)
 			if !isBool {
 				return errors.New("invalid bool value: " + value)
+			}
+
+		// Policy for query attributes on servers without support for them
+		case "queryAttributes":
+			switch value {
+			case "error":
+				cfg.queryAttributesIgnore = false
+			case "ignore":
+				cfg.queryAttributesIgnore = true
+			default:
+				return fmt.Errorf("invalid queryAttributes value: %q (expected \"error\" or \"ignore\")", value)
 			}
 
 		// I/O read Timeout

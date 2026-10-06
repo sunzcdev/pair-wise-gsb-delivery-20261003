@@ -72,6 +72,9 @@ const (
 	clientCanHandleExpiredPasswords
 	clientSessionTrack
 	clientDeprecateEOF
+	clientOptionalResultsetMetadata
+	clientZstdCompressionAlgorithm
+	clientQueryAttributes
 )
 
 // https://mariadb.com/kb/en/connection/#capabilities

@@ -378,6 +378,15 @@ Default:        false
 `parseTime=true` changes the output type of `DATE` and `DATETIME` values to `time.Time` instead of `[]byte` / `string`
 The date or datetime like `0000-00-00 00:00:00` is converted into zero value of `time.Time`.
 
+##### `queryAttributes`
+
+```
+Type:           string
+Valid Values:   error, ignore
+Default:        error
+```
+
+Controls how statements carrying [query attributes](#query-attributes) are handled when the server does not support them (MySQL < 8.0.23 or MariaDB). With the default `error`, such statements fail with `mysql.ErrQueryAttributesUnsupported`. With `ignore`, the attributes are silently dropped and the statement is executed without them.
 
 ##### `readTimeout`
 
@@ -585,6 +594,26 @@ Other charsets / collations can be set using the [`charset`](#charset) or [`coll
 - When only the `collation` is specified, the collation is specified in the protocol handshake and the `SET NAMES` query is not sent. This can save one roundtrip, but note that the server may ignore the specified collation silently and use the server's default charset/collation instead.
 
 See http://dev.mysql.com/doc/refman/8.0/en/charset-unicode.html for more details on MySQL's Unicode support.
+
+## Query attributes
+MySQL 8.0.23+ supports [query attributes](https://dev.mysql.com/doc/refman/8.0/en/query-attributes.html): per-statement key/value pairs transmitted in the protocol itself (not as SQL comments), visible to the server via `mysql_query_attribute_string()` and the Performance Schema. This makes them suitable for database auditing, e.g. attaching a trace ID or the name of the business operation to every statement.
+
+Attributes are passed per request via the context, using `mysql.WithQueryAttributes`:
+```go
+import "github.com/go-sql-driver/mysql"
+
+ctx := mysql.WithQueryAttributes(ctx,
+	mysql.QueryAttribute{Name: "trace_id", Value: "4bf92f3577b34da6a3ce929d0e0e4736"},
+	mysql.QueryAttribute{Name: "operation", Value: "checkout"},
+)
+_, err := db.ExecContext(ctx, "UPDATE orders SET status = ? WHERE id = ?", "paid", 42)
+```
+
+Attributes apply to exactly one statement. They are never stored on the connection, so they cannot leak into subsequent statements by other callers. They work with both text queries and prepared statements, and they are distinct from statement arguments: they are not matched to `?` placeholders and don't go through `driver.NamedValue` handling.
+
+Attribute values may be `nil` (NULL), strings (empty strings included), integers, floats, booleans, byte slices and `time.Time`. Names may be empty and may be repeated.
+
+If the server does not support query attributes, statements carrying them fail with `mysql.ErrQueryAttributesUnsupported`. Set the DSN parameter [`queryAttributes=ignore`](#queryattributes) (or the `mysql.IgnoreUnsupportedQueryAttributes` option) to drop them silently instead.
 
 ## Testing / Development
 To run the driver tests you may need to adjust the configuration. See the [Testing Wiki-Page](https://github.com/go-sql-driver/mysql/wiki/Testing "Testing") for details.

@@ -23,7 +23,7 @@ func (tx *mysqlTx) Commit() (err error) {
 		}
 		return
 	}
-	err = tx.mc.exec("COMMIT")
+	err = tx.mc.exec("COMMIT", nil)
 	tx.mc = nil
 	return
 }
@@ -39,7 +39,7 @@ func (tx *mysqlTx) Rollback() (err error) {
 		}
 		return
 	}
-	err = tx.mc.exec("ROLLBACK")
+	err = tx.mc.exec("ROLLBACK", nil)
 	tx.mc = nil
 	return
 }

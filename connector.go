@@ -195,9 +195,9 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		for _, cs := range mc.cfg.charsets {
 			// ignore errors here - a charset may not exist
 			if mc.cfg.Collation != "" {
-				err = mc.exec("SET NAMES " + cs + " COLLATE " + mc.cfg.Collation)
+				err = mc.exec("SET NAMES "+cs+" COLLATE "+mc.cfg.Collation, nil)
 			} else {
-				err = mc.exec("SET NAMES " + cs)
+				err = mc.exec("SET NAMES "+cs, nil)
 			}
 			if err == nil {
 				break

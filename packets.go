@@ -289,6 +289,7 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 			clientPluginAuth |
 			clientMultiResults |
 			clientConnectAttrs |
+			clientQueryAttributes |
 			clientDeprecateEOF
 
 	if mc.cfg.ClientFoundRows {
@@ -486,6 +487,64 @@ func (mc *mysqlConn) writeCommandPacketUint32(command byte, arg uint32) error {
 
 	// Add arg [32 bit]
 	binary.LittleEndian.PutUint32(data[5:], arg)
+
+	// Send CMD packet
+	err = mc.writePacket(data)
+	mc.syncSequence()
+	return err
+}
+
+// writeComQueryPacket sends a COM_QUERY packet, attaching the given query
+// attributes.
+//
+// When the CLIENT_QUERY_ATTRIBUTES capability has been negotiated, the
+// parameter_count and parameter_set_count fields are mandatory even for
+// plain queries without attributes.
+//
+// https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query.html
+func (mc *mysqlConn) writeComQueryPacket(query string, attrs []queryAttribute) error {
+	if mc.capabilities&clientQueryAttributes == 0 {
+		return mc.writeCommandPacketStr(comQuery, query)
+	}
+
+	var attrData []byte
+	var err error
+	if len(attrs) > 0 {
+		attrData, err = encodeQueryAttributes(attrs, mc.cfg.Loc, mc.cfg.timeTruncate)
+		if err != nil {
+			return err
+		}
+	}
+
+	paramCountLen := lengthEncodedIntegerSize(uint64(len(attrs)))
+	pktLen := 1 + paramCountLen + 1 + len(attrData) + len(query)
+	data, err := mc.buf.takeBuffer(pktLen + 4)
+	if err != nil {
+		return err
+	}
+
+	// Add command byte
+	data[4] = comQuery
+	pos := 5
+
+	// parameter_count [length encoded integer]
+	tmp := appendLengthEncodedInteger(nil, uint64(len(attrs)))
+	copy(data[pos:], tmp)
+	pos += len(tmp)
+
+	// parameter_set_count [length encoded integer] (currently always 1)
+	data[pos] = 0x01
+	pos++
+
+	// query attributes: NULL bitmap, new-params-bound flag, types, names, values
+	copy(data[pos:], attrData)
+	pos += len(attrData)
+
+	// the query [rest of packet]
+	copy(data[pos:], query)
+
+	// Reset Packet Sequence
+	mc.resetSequence()
 
 	// Send CMD packet
 	err = mc.writePacket(data)
@@ -1056,7 +1115,7 @@ type stmtLongData struct {
 
 // Execute Prepared Statement
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
-func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
+func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value, attrs []queryAttribute) error {
 	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
 			"argument count mismatch (got: %d; has: %d)",
@@ -1067,15 +1126,16 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 
 	const minPktLen = 4 + 1 + 4 + 1 + 4
 	mc := stmt.mc
+	numParams := len(args) + len(attrs)
 
 	// Determine threshold dynamically to avoid packet size shortage.
-	longDataSize := max(mc.maxAllowedPacket/(stmt.paramCount+1), 64)
+	longDataSize := max(mc.maxAllowedPacket/(numParams+1), 64)
 
 	var data []byte
 	var err error
 	var longData []stmtLongData
 
-	if len(args) == 0 {
+	if numParams == 0 {
 		data, err = mc.buf.takeBuffer(minPktLen)
 	} else {
 		data, err = mc.buf.takeCompleteBuffer()
@@ -1097,16 +1157,27 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// iteration_count (uint32(1)) [4 bytes]
 	binary.LittleEndian.PutUint32(data[10:], 1)
 
-	if len(args) > 0 {
+	if numParams > 0 {
 		pos := minPktLen
 
+		// When CLIENT_QUERY_ATTRIBUTES has been negotiated, a name is sent
+		// for every parameter: an empty string for regular statement
+		// parameters and the attribute name for query attributes.
+		paramNamesLen := 0
+		if mc.capabilities&clientQueryAttributes != 0 {
+			paramNamesLen += len(args) // empty length-encoded strings
+			for _, attr := range attrs {
+				paramNamesLen += lengthEncodedIntegerSize(uint64(len(attr.name))) + len(attr.name)
+			}
+		}
+
 		var nullMask []byte
-		if maskLen, typesLen := (len(args)+7)/8, 1+2*len(args); pos+maskLen+typesLen >= cap(data) {
+		if maskLen, typesLen := (numParams+7)/8, 1+2*numParams; pos+maskLen+typesLen+paramNamesLen >= cap(data) {
 			// buffer has to be extended but we don't know by how much so
 			// we depend on append after all data with known sizes fit.
 			// We stop at that because we deal with a lot of columns here
 			// which makes the required allocation size hard to guess.
-			tmp := make([]byte, pos+maskLen+typesLen)
+			tmp := make([]byte, pos+maskLen+typesLen+paramNamesLen)
 			copy(tmp[:pos], data[:pos])
 			data = tmp
 			nullMask = data[pos : pos+maskLen]
@@ -1126,13 +1197,37 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 
 		// type of each parameter [len(args)*2 bytes]
 		paramTypes := data[pos:]
-		pos += len(args) * 2
+		pos += numParams * 2
+
+		// name of each parameter (CLIENT_QUERY_ATTRIBUTES)
+		if mc.capabilities&clientQueryAttributes != 0 {
+			for range args {
+				data[pos] = 0x00 // empty name for statement parameters
+				pos++
+			}
+			for _, attr := range attrs {
+				tmp := appendLengthEncodedInteger(nil, uint64(len(attr.name)))
+				copy(data[pos:], tmp)
+				pos += len(tmp)
+				copy(data[pos:], attr.name)
+				pos += len(attr.name)
+			}
+		}
 
 		// value of each parameter [n bytes]
 		paramValues := data[pos:pos]
 		valuesCap := cap(paramValues)
 
-		for i, arg := range args {
+		allParams := args
+		if len(attrs) > 0 {
+			allParams = make([]driver.Value, 0, numParams)
+			allParams = append(allParams, args...)
+			for _, attr := range attrs {
+				allParams = append(allParams, attr.value)
+			}
+		}
+
+		for i, arg := range allParams {
 			// build NULL-bitmap
 			if arg == nil {
 				nullMask[i/8] |= 1 << (uint(i) & 7)

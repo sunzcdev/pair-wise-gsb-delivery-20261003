@@ -30,6 +30,13 @@ var (
 	ErrPktTooLarge       = errors.New("packet for query is too large. Try adjusting the `Config.MaxAllowedPacket`")
 	ErrBusyBuffer        = errors.New("busy buffer")
 
+	// ErrQueryAttributesUnsupported is returned when query attributes are
+	// passed to a statement but the server did not negotiate the
+	// CLIENT_QUERY_ATTRIBUTES capability (e.g. MySQL < 8.0.23 or MariaDB).
+	// Set the DSN parameter `queryAttributes=ignore` to silently drop
+	// attributes on such servers instead.
+	ErrQueryAttributesUnsupported = errors.New("query attributes are not supported by the server")
+
 	// errBadConnNoWrite is used for connection errors where nothing was sent to the database yet.
 	// If this happens first in a function starting a database interaction, it should be replaced by driver.ErrBadConn
 	// to trigger a resend. Use mc.markBadConn(err) to do this.
