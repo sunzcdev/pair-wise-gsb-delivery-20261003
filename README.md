@@ -81,6 +81,20 @@ You should at least have a block size of 100k and at least a number of blocks th
 
 Another side effect of this is, that it is likely to speed up your other code, since writes to the compressor only blocks if the compressor is already compressing the number of blocks you have specified. This also means you don't have worry about buffering input to the compressor.
 
+## BGZF
+
+In addition to the gzip-compatible `Writer`, this package provides a standalone `BGZFWriter` that emits [BGZF (Blocked GNU Zip Format)](https://samtools.github.io/hts-specs/SAMv1.pdf) as used by SAM/BAM/VCF tooling. It is separate from the regular parallel gzip writer, so ordinary gzip output is unchanged.
+
+```go
+w := pgzip.NewBGZFWriter(&b)                 // or pgzip.NewBGZFWriterLevel(&b, level)
+w.SetConcurrency(65055, runtime.GOMAXPROCS(0)) // uncompressed chunk size, parallel chunks
+w.Write(data)
+off, err := w.VOffset()                     // virtual offset of completed data
+w.Close()                                   // appends the standard 28-byte EOF marker
+```
+
+Each gzip member carries the `BC` extra field with its block size (`BSIZE`), its own CRC32/ISIZE trailer, and never exceeds 65536 bytes on disk, even for incompressible input: chunks that would overflow are split into several members, in input order. Up to the configured number of chunks compress in parallel while block order is preserved. `VOffset` returns the BGZF virtual offset (compressed-file offset in the high 48 bits, uncompressed offset within the block in the low 16 bits) of data already written to completion.
+
 ## Decompression
 
 Decompression works similar to compression. That means that you simply call pgzip the same way as you would call [compress/gzip](http://golang.org/pkg/compress/gzip). 
