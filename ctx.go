@@ -38,6 +38,28 @@ type CertStorage interface {
 	Fetch(hostname string, gen func() (*tls.Certificate, error)) (*tls.Certificate, error)
 }
 
+// GenerationCertStorage is an optional extension of CertStorage for caches
+// that want to be CA-generation aware. A RotatingCA passes the current issuer
+// generation with every request, so the cache can keep certificates signed by
+// different CAs in separate slots and drop an old generation wholesale when
+// DropGeneration is invoked.
+//
+// Stores that implement only CertStorage keep working unchanged: the proxy
+// transparently prefixes cache keys with the generation number, so a legacy
+// store never serves a stale, old-CA certificate after rotation.
+type GenerationCertStorage interface {
+	FetchGeneration(hostname string, generation uint64, gen func() (*tls.Certificate, error)) (*tls.Certificate, error)
+}
+
+// GenerationCertRecycler is implemented by GenerationCertStorage
+// implementations that can release all certificates of a retired CA
+// generation. It is called once, after every handshake that used that
+// generation has finished. Implementations that do not need to reclaim old
+// generations may simply omit this method.
+type GenerationCertRecycler interface {
+	DropGeneration(generation uint64)
+}
+
 type RoundTripperFunc func(req *http.Request, ctx *ProxyCtx) (*http.Response, error)
 
 func (f RoundTripperFunc) RoundTrip(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
