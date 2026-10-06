@@ -8,6 +8,22 @@ the Request as the only parameter and they each return something different.
 These 4 interfaces are enough to handle all the SFTP traffic in a simplified
 manner.
 
+## Local filesystem backend
+
+Use `NewLocalFileHandler(root)` to serve a local directory without path-prefix
+checks. The handler keeps the root directory open and performs operations
+through directory-relative file handles. Both endpoints of renames and links
+are resolved through those handles, so replacing directories during a request
+cannot move the operation outside the root.
+
+Symbolic links are followed when their lexical target remains inside the
+virtual root. Absolute SFTP symlink targets are interpreted as virtual paths
+below `/`; links that would target outside root are rejected.
+
+The race-resistant implementation is supported on Unix and Windows. Other
+platforms fail command operations instead of presenting a weaker containment
+guarantee.
+
 The Request structure has 5 public fields which you will deal with.
 
 - Method (string) - string name of incoming call
