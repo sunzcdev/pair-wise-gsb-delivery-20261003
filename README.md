@@ -443,6 +443,138 @@ Example of how to supply options:
      enc, err := reedsolomon.New(10, 3, WithMaxGoroutines(25))
  ```
 
+# Locally Repairable Code (LRC)
+
+For object storage the overwhelmingly common failure is a **single shard** going away.
+Under a flat `(k, g)` MDS Reed-Solomon layout, rebuilding that one shard still requires
+reading `k` shards, because every parity equation spans all data. This package ships a
+separate, independent layout that makes the common case cheap while keeping global
+parity as a backstop:
+
+* The `k` data shards are partitioned into local groups.
+* Each group gets one **XOR local parity** shard.
+* `g` **global** Reed-Solomon parity shards are computed across all `k` data shards.
+
+Physical shard count is `k + groups + g`.
+
+> ⚠️ **This is not an MDS code and is not presented as one.** It is a different type,
+> deliberately kept out of the `Encoder` returned by [`New`](#usage). It does **not**
+> guarantee that any fixed number of arbitrary shard losses is always recoverable.
+> Whether a given failure set is recoverable depends on *which* shards were lost and is
+> answered exactly by `PlanFromPresent` / `CanRecover`. The trade-off is a little extra
+> storage for a large reduction in single-shard repair I/O.
+
+## Layout metadata
+
+The complete layout is captured by `LRCLayoutParams` and is JSON-serializable, so it can
+be stored next to the object and reloaded by any component that must plan a repair:
+
+```Go
+params, err := reedsolomon.NewUniformLRC(12, 3, 2) // 12 data, 3 groups of 4, 2 global
+raw, err := reedsolomon.MarshalLRCLayoutParams(params)   // save this metadata
+restored, err := reedsolomon.UnmarshalLRCLayoutParams(raw)
+codec, err := reedsolomon.NewLRCCodec(restored)
+```
+
+`NewLRC(k, groupSizes, g)` allows uneven groups. The notation below is
+`LRC(k, groupSizes, g)`; the uniform example is `LRC(12,[4,4,4],2)` with 17 physical
+shards (1.417× storage overhead).
+
+## Planning before reading
+
+`PlanRepair` / `PlanFromPresent` inspect only a presence bitmap (`nil`/zero-length means
+missing). They return a `RepairPlan` that names exactly the `ReadShards` to fetch, the
+`Strategy`, and the I/O comparison against a flat MDS stripe.
+
+The planner applies the required precedence:
+
+1. **Local tier.** If every affected group has exactly one loss among its data members
+   plus its local parity, and no global parity is missing, each loss is rebuilt inside
+   its own group. Shards from other groups and all global parities are **not** read.
+2. **Global tier.** Otherwise the planner solves a linear system: it selects `k`
+   linearly independent equations from the available data, global-parity and
+   local-parity shards over GF(2⁸). If the available rows do not span rank `k`, the loss
+   is reported as `ErrUnrecoverableLRC` rather than guessed.
+
+```Go
+shards[5] = nil // data shard D5 lost
+plan, err := codec.RepairShards(shards) // plan + execute
+fmt.Println(plan.Strategy)             // "local"
+fmt.Println(plan.ReadShards)           // only D4, D6, D7, L1
+fmt.Println(plan.ReadCount)            // 4
+```
+
+`LRC.Repair(shards, plan)` executes an already-computed plan and reads no shard outside
+`plan.ReadShards`.
+
+## Recoverable combinations (small layouts)
+
+These tables enumerate every failure subset and are produced by the helper program in
+`cmd/lrccatalog`. `D` = data, `L` = a group's local parity, `G` = global parity.
+
+### `LRC(6,[3,3],2)` — 10 shards, 1.667× overhead
+
+| Losses | Local tier | Global tier | Unrecoverable |
+|--------|-----------:|------------:|--------------:|
+| 1      | 8          | 2           | 0             |
+| 2      | 16         | 29          | 0             |
+| 3      | 0          | 118         | 2             |
+| 4      | 0          | 163         | 47            |
+| 5+     | 0          | 0           | all           |
+
+Examples:
+
+* Recoverable, local: `{D0}`, `{D3}`, `{L0}` (read 3, never touch the other group).
+* Recoverable, one loss per group: `{D0,D3}` (each group self-heals).
+* Recoverable, two in one group (global backstop): `{D0,D1}`, `{D0,L0}`.
+* Recoverable with both globals gone but locals intact: `{D0,D3,G0,G1}`.
+* **Unrecoverable:** all three members of one group, `{D0,D1,D2}` or `{D3,D4,D5}`,
+  even though only 3 of 10 shards are lost — the non-MDS gap.
+
+### `LRC(12,[4,4,4],2)` — 17 shards, 1.417× overhead
+
+| Losses | Local tier | Global tier | Unrecoverable |
+|--------|-----------:|------------:|--------------:|
+| 1      | 15         | 2           | 0             |
+| 2      | 75         | 61          | 0             |
+| 3      | 125        | 555         | 0             |
+| 4      | 0          | 2259        | 121           |
+| 5      | 0          | 3795        | 2393          |
+| 6+     | 0          | 0           | all           |
+
+Examples:
+
+* Recoverable: any single shard; `{D0,D1,D2}` (three in a group); even
+  `{D0,D1,D2,G0}` (three in a group plus one global).
+* **Unrecoverable weight-4 sets:** a whole group `{D0,D1,D2,D3}`,
+  `{D0,D1,D2,L0}` (three members + their local parity), and
+  `{D0,D1,D4,D5}` (two members lost in each of two groups — only the two global
+  equations remain for four unknowns).
+
+In short: this layout tolerates up to **3 arbitrary** losses in the `g=2`/3-group
+example, but some weight-4 patterns are fatal while other weight-4 (and occasionally
+weight-5) patterns survive. Never assume `g` (or `g + groups`) losses are always safe;
+ask `PlanFromPresent`.
+
+## Single-shard repair savings
+
+Rebuilding one data shard reads only the other members of its group plus the group's
+local parity:
+
+| Layout                     | Flat MDS reads | LRC reads | Saved |
+|----------------------------|---------------:|----------:|------:|
+| `LRC(6,[3,3],2)`           | 6              | 3         | 3 (50%) |
+| `LRC(12,[4,4,4],2)`        | 12             | 4         | 8 (67%) |
+
+For 1 MiB shards in `LRC(12,[4,4,4],2)`, a single data repair moves **4 MiB** instead of
+**12 MiB** — 8 fewer shard reads — at the cost of 5 extra parity shards of storage per
+stripe. The runnable numbers are asserted by `ExampleLRC_singleShardSavings`, and the
+full enumeration can be regenerated with:
+
+```
+go run ./cmd/lrccatalog
+```
+
 # Leopard Compatible GF16
 
 When you encode more than 256 shards the library will switch to a [Leopard-RS](https://github.com/catid/leopard) implementation.
