@@ -49,8 +49,39 @@ For numerical data, we recommend that you look into the encoding/binary library.
     filter.Add(n1)
 ```
 
-Godoc documentation:  https://pkg.go.dev/github.com/bits-and-blooms/bloom/v3 
+Godoc documentation:  https://pkg.go.dev/github.com/bits-and-blooms/bloom/v3
 
+## Counting filters and removable entries
+
+A regular Bloom filter cannot safely remove entries because one bit can belong
+to several keys. `CountingBloomFilter` replaces each bit with a byte counter
+and makes every addition accountable:
+
+```Go
+    filter := bloom.NewCountingBloomFilter(1000, 4)
+
+    receipt, err := filter.Add([]byte("Love"))
+    if errors.Is(err, bloom.ErrCounterLimit) {
+        // No counter was modified by this rejected addition.
+    }
+
+    // A second Add returns a separate receipt, even for the same key.
+    if err := filter.Remove(receipt); err != nil {
+        // The receipt was already used, belonged to another filter, or was
+        // issued before ClearAll.
+    }
+```
+
+There is no key-based remove API. A key can collide with other entries, so
+only the receipt returned for a particular addition may decrement that
+addition's counters. Duplicate hash locations for one addition are counted as
+multiple increments and reversed exactly once by its receipt.
+
+Each valid receipt uses a small internal record with the counters changed by
+that addition. `Remove` deletes the record, and `ClearAll` replaces both the
+counter slice and receipt table, releasing the old backing storage to the Go
+garbage collector. Receipt values retained by the caller are likewise collected
+once they become unreachable.
 
 ## Installation
 
