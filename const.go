@@ -72,6 +72,7 @@ const (
 	clientCanHandleExpiredPasswords
 	clientSessionTrack
 	clientDeprecateEOF
+	clientQueryAttributes capabilityFlag = 1 << 27
 )
 
 // https://mariadb.com/kb/en/connection/#capabilities

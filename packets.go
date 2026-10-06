@@ -13,13 +13,11 @@ import (
 	"crypto/tls"
 	"database/sql/driver"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"os"
 	"strconv"
-	"time"
 )
 
 // MySQL client/server protocol documentations.
@@ -289,7 +287,8 @@ func (mc *mysqlConn) initCapabilities(serverCapabilities capabilityFlag, serverE
 			clientPluginAuth |
 			clientMultiResults |
 			clientConnectAttrs |
-			clientDeprecateEOF
+			clientDeprecateEOF |
+			clientQueryAttributes
 
 	if mc.cfg.ClientFoundRows {
 		clientCapabilities |= clientFoundRows
@@ -1056,7 +1055,7 @@ type stmtLongData struct {
 
 // Execute Prepared Statement
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
-func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
+func (stmt *mysqlStmt) writeExecutePacket(args, attrValues []driver.Value, attrNames []string) error {
 	if len(args) != stmt.paramCount {
 		return fmt.Errorf(
 			"argument count mismatch (got: %d; has: %d)",
@@ -1067,20 +1066,11 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 
 	const minPktLen = 4 + 1 + 4 + 1 + 4
 	mc := stmt.mc
-
-	// Determine threshold dynamically to avoid packet size shortage.
-	longDataSize := max(mc.maxAllowedPacket/(stmt.paramCount+1), 64)
-
-	var data []byte
-	var err error
-	var longData []stmtLongData
-
-	if len(args) == 0 {
-		data, err = mc.buf.takeBuffer(minPktLen)
-	} else {
-		data, err = mc.buf.takeCompleteBuffer()
-		// In this case the len(data) == cap(data) which is used to optimise the flow below.
+	encoded, err := mc.encodeBinaryValues(args, attrValues, attrNames)
+	if err != nil {
+		return err
 	}
+	data, err := mc.buf.takeBuffer(minPktLen)
 	if err != nil {
 		return err
 	}
@@ -1097,151 +1087,21 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// iteration_count (uint32(1)) [4 bytes]
 	binary.LittleEndian.PutUint32(data[10:], 1)
 
-	if len(args) > 0 {
-		pos := minPktLen
-
-		var nullMask []byte
-		if maskLen, typesLen := (len(args)+7)/8, 1+2*len(args); pos+maskLen+typesLen >= cap(data) {
-			// buffer has to be extended but we don't know by how much so
-			// we depend on append after all data with known sizes fit.
-			// We stop at that because we deal with a lot of columns here
-			// which makes the required allocation size hard to guess.
-			tmp := make([]byte, pos+maskLen+typesLen)
-			copy(tmp[:pos], data[:pos])
-			data = tmp
-			nullMask = data[pos : pos+maskLen]
-			// No need to clean nullMask as make ensures that.
-			pos += maskLen
-		} else {
-			nullMask = data[pos : pos+maskLen]
-			for i := range nullMask {
-				nullMask[i] = 0
-			}
-			pos += maskLen
+	parameterCount := len(args) + len(attrValues)
+	if mc.capabilities&clientQueryAttributes != 0 {
+		data = appendLengthEncodedInteger(data, uint64(parameterCount))
+		if parameterCount > 0 {
+			data = appendLengthEncodedInteger(data, 1)
 		}
-
-		// newParameterBoundFlag 1 [1 byte]
-		data[pos] = 0x01
-		pos++
-
-		// type of each parameter [len(args)*2 bytes]
-		paramTypes := data[pos:]
-		pos += len(args) * 2
-
-		// value of each parameter [n bytes]
-		paramValues := data[pos:pos]
-		valuesCap := cap(paramValues)
-
-		for i, arg := range args {
-			// build NULL-bitmap
-			if arg == nil {
-				nullMask[i/8] |= 1 << (uint(i) & 7)
-				paramTypes[i+i] = byte(fieldTypeNULL)
-				paramTypes[i+i+1] = 0x00
-				continue
-			}
-
-			if v, ok := arg.(json.RawMessage); ok {
-				arg = []byte(v)
-			}
-			// cache types and values
-			switch v := arg.(type) {
-			case int64:
-				paramTypes[i+i] = byte(fieldTypeLongLong)
-				paramTypes[i+i+1] = 0x00
-				paramValues = binary.LittleEndian.AppendUint64(paramValues, uint64(v))
-
-			case uint64:
-				paramTypes[i+i] = byte(fieldTypeLongLong)
-				paramTypes[i+i+1] = 0x80 // type is unsigned
-				paramValues = binary.LittleEndian.AppendUint64(paramValues, uint64(v))
-
-			case float64:
-				paramTypes[i+i] = byte(fieldTypeDouble)
-				paramTypes[i+i+1] = 0x00
-				paramValues = binary.LittleEndian.AppendUint64(paramValues, math.Float64bits(v))
-
-			case bool:
-				paramTypes[i+i] = byte(fieldTypeTiny)
-				paramTypes[i+i+1] = 0x00
-
-				if v {
-					paramValues = append(paramValues, 0x01)
-				} else {
-					paramValues = append(paramValues, 0x00)
-				}
-
-			case []byte:
-				// Common case (non-nil value) first
-				if v != nil {
-					paramTypes[i+i] = byte(fieldTypeString)
-					paramTypes[i+i+1] = 0x00
-
-					if len(v) < longDataSize {
-						paramValues = appendLengthEncodedInteger(paramValues,
-							uint64(len(v)),
-						)
-						paramValues = append(paramValues, v...)
-					} else {
-						longData = append(longData, stmtLongData{paramID: i, data: v})
-					}
-					continue
-				}
-
-				// Handle []byte(nil) as a NULL value
-				nullMask[i/8] |= 1 << (uint(i) & 7)
-				paramTypes[i+i] = byte(fieldTypeNULL)
-				paramTypes[i+i+1] = 0x00
-
-			case string:
-				paramTypes[i+i] = byte(fieldTypeString)
-				paramTypes[i+i+1] = 0x00
-
-				if len(v) < longDataSize {
-					paramValues = appendLengthEncodedInteger(paramValues,
-						uint64(len(v)),
-					)
-					paramValues = append(paramValues, v...)
-				} else {
-					longData = append(longData, stmtLongData{paramID: i, text: v})
-				}
-
-			case time.Time:
-				paramTypes[i+i] = byte(fieldTypeString)
-				paramTypes[i+i+1] = 0x00
-
-				var a [64]byte
-				var b = a[:0]
-
-				if v.IsZero() {
-					b = append(b, "0000-00-00"...)
-				} else {
-					b, err = appendDateTime(b, v.In(mc.cfg.Loc), mc.cfg.timeTruncate)
-					if err != nil {
-						return err
-					}
-				}
-
-				paramValues = appendLengthEncodedInteger(paramValues,
-					uint64(len(b)),
-				)
-				paramValues = append(paramValues, b...)
-
-			default:
-				return fmt.Errorf("cannot convert type: %T", arg)
-			}
-		}
-
-		// Check if param values exceeded the available buffer
-		// In that case we must build the data packet with the new values buffer
-		if valuesCap != cap(paramValues) {
-			data = append(data[:pos], paramValues...)
-			mc.buf.store(data) // allow this buffer to be reused
-		}
-
-		pos += len(paramValues)
-		data = data[:pos]
 	}
+	if parameterCount > 0 {
+		data = append(data, encoded.nullMask...)
+		data = append(data, 0x01)
+		data = append(data, encoded.types...)
+		data = append(data, encoded.names...)
+		data = append(data, encoded.values...)
+	}
+	mc.buf.store(data)
 
 	// Validate the execute packet size before long data is sent.
 	if len(data)-4 > mc.maxAllowedPacket {
@@ -1252,7 +1112,7 @@ func (stmt *mysqlStmt) writeExecutePacket(args []driver.Value) error {
 	// after this point so a validation error cannot leave partial long data
 	// associated with the statement on the server.
 	mc.resetSequence()
-	for _, param := range longData {
+	for _, param := range encoded.longData {
 		if param.data != nil {
 			err = stmt.writeCommandLongData(param.paramID, param.data)
 		} else {

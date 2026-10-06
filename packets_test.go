@@ -124,7 +124,7 @@ func TestWriteExecutePacketValidatesArgsBeforeWriting(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
-	})
+	}, nil, nil)
 	if err == nil {
 		t.Fatal("expected invalid time error")
 	}
@@ -147,7 +147,7 @@ func TestWriteExecutePacketValidatesSizeBeforeWriting(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
 		int64(1),
-	})
+	}, nil, nil)
 	if err != ErrPktTooLarge {
 		t.Fatalf("unexpected error: got %v, want %v", err, ErrPktTooLarge)
 	}
@@ -167,7 +167,7 @@ func TestWriteExecutePacketSendsLongDataBeforeExecute(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64),         // 64 'a' bytes as a []byte long-data parameter.
 		string(bytes.Repeat([]byte{'b'}, 64)), // 64 'b' bytes as a string long-data parameter.
-	})
+	}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
 	err := stmt.writeExecutePacket([]driver.Value{
 		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes sent successfully as long data.
 		bytes.Repeat([]byte{'b'}, 64), // 64 'b' bytes whose long-data write fails.
-	})
+	}, nil, nil)
 	if err != errBadConnNoWrite {
 		t.Fatalf("unexpected error: got %v, want %v", err, errBadConnNoWrite)
 	}

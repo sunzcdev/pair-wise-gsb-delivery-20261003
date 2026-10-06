@@ -52,11 +52,15 @@ func (stmt *mysqlStmt) CheckNamedValue(nv *driver.NamedValue) (err error) {
 }
 
 func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return stmt.execWithAttributes(args, nil, nil)
+}
+
+func (stmt *mysqlStmt) execWithAttributes(args, attrValues []driver.Value, attrNames []string) (driver.Result, error) {
 	if stmt.mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(args, attrValues, attrNames)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
@@ -98,15 +102,15 @@ func (stmt *mysqlStmt) Exec(args []driver.Value) (driver.Result, error) {
 }
 
 func (stmt *mysqlStmt) Query(args []driver.Value) (driver.Rows, error) {
-	return stmt.query(args)
+	return stmt.queryWithAttributes(args, nil, nil)
 }
 
-func (stmt *mysqlStmt) query(args []driver.Value) (*binaryRows, error) {
+func (stmt *mysqlStmt) queryWithAttributes(args, attrValues []driver.Value, attrNames []string) (*binaryRows, error) {
 	if stmt.mc.closed.Load() {
 		return nil, driver.ErrBadConn
 	}
 	// Send command
-	err := stmt.writeExecutePacket(args)
+	err := stmt.writeExecutePacket(args, attrValues, attrNames)
 	if err != nil {
 		return nil, stmt.mc.markBadConn(err)
 	}
