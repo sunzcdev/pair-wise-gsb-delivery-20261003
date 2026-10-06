@@ -27,6 +27,7 @@ type parseContext struct {
 	caseInsensitive   map[lexer.TokenType]bool
 	symbols           map[lexer.TokenType]string
 	apply             []*contextFieldSet
+	tx                []TransactionalCapture
 	allowTrailing     bool
 }
 
@@ -69,7 +70,7 @@ func (p *parseContext) Defer(tokens []lexer.Token, strct reflect.Value, field st
 // earlier ones queued for the enclosing struct.
 func (p *parseContext) ApplyFrom(start int) error {
 	for _, apply := range p.apply[start:] {
-		if err := setField(apply.tokens, apply.strct, apply.field, apply.fieldValue); err != nil {
+		if err := setField(p, apply.tokens, apply.strct, apply.field, apply.fieldValue); err != nil {
 			return err
 		}
 	}
@@ -77,9 +78,33 @@ func (p *parseContext) ApplyFrom(start int) error {
 	return nil
 }
 
+// trackTx records a transactional capture operation applied in this context.
+func (p *parseContext) trackTx(c TransactionalCapture) {
+	p.tx = append(p.tx, c)
+}
+
+// CommitTx commits all tracked capture operations in the order they were
+// applied, which corresponds to grammar order.
+func (p *parseContext) CommitTx() {
+	for _, tx := range p.tx {
+		tx.CommitCapture()
+	}
+	p.tx = nil
+}
+
+// RollbackTx undoes all tracked capture operations in reverse order.
+func (p *parseContext) RollbackTx() {
+	for i := len(p.tx) - 1; i >= 0; i-- {
+		p.tx[i].RollbackCapture()
+	}
+	p.tx = nil
+}
+
 // Branch accepts the branch as the correct branch.
 func (p *parseContext) Accept(branch *parseContext) {
 	p.apply = append(p.apply, branch.apply...)
+	p.tx = append(p.tx, branch.tx...)
+	branch.tx = nil
 	p.PeekingLexer = branch.PeekingLexer
 	if branch.deepestErrorDepth >= p.deepestErrorDepth {
 		p.deepestErrorDepth = branch.deepestErrorDepth
@@ -92,6 +117,7 @@ func (p *parseContext) Branch() *parseContext {
 	branch := &parseContext{}
 	*branch = *p
 	branch.apply = nil
+	branch.tx = nil
 	return branch
 }
 

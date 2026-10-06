@@ -249,12 +249,15 @@ func (p *Parser[G]) ParseBytes(filename string, b []byte, options ...ParseOption
 func (p *Parser[G]) parseOne(ctx *parseContext, parseNode node, rv reflect.Value) error {
 	err := p.parseInto(ctx, parseNode, rv)
 	if err != nil {
+		ctx.RollbackTx()
 		return err
 	}
 	token := ctx.Peek()
 	if !token.EOF() && !ctx.allowTrailing {
+		ctx.RollbackTx()
 		return ctx.DeepestError(&UnexpectedTokenError{Unexpected: *token, TokenType: ctx.tokenTypeName(token.Type)})
 	}
+	ctx.CommitTx()
 	return nil
 }
 

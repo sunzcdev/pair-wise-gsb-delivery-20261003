@@ -209,6 +209,41 @@ Additionally, any field implementing the `encoding.TextUnmarshaler` interface
 will be capturable too. One caveat is that `UnmarshalText()` will be called once
 for each captured token, so eg. `@(Ident Ident Ident)` will be called three times.
 
+### Transactional captures
+
+Participle parses speculatively: a capture may be applied while exploring a
+branch of the grammar that is later rejected during backtracking. Plain
+`Capture` implementations are invoked as their match is applied and are *not*
+notified if the enclosing branch is subsequently rejected, so any side effects
+they have on state outside the AST will remain. If a capture only writes to
+its own field this is harmless, but captures that update shared application
+objects will observe updates from rejected branches.
+
+To participate in backtracking, a capture target can additionally implement
+the `TransactionalCapture` interface:
+
+```go
+type TransactionalCapture interface {
+	Capture
+	CommitCapture()
+	RollbackCapture()
+}
+```
+
+Each successful `Capture()` call is then tracked as a single operation within
+the branch that applied it:
+
+- If that branch (or any enclosing branch, or the parse as a whole) is
+  rejected, `RollbackCapture()` is called exactly once for the operation, in
+  reverse order of capture.
+- If the overall parse succeeds, `CommitCapture()` is called exactly once for
+  each surviving operation, in grammar order.
+
+The participant is responsible for saving whatever state it needs during
+`Capture()` (eg. snapshotting a length or keeping an undo record) so that
+`RollbackCapture()` can fully undo the corresponding call; Participle does
+not attempt to copy or restore participant state itself.
+
 ### Capturing boolean value
 
 By default, a boolean field is used to indicate that a match occurred, which

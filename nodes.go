@@ -273,6 +273,7 @@ func (g *group) Parse(ctx *parseContext, parent reflect.Value) (out []reflect.Va
 				out = append(out, v...) // Try to return as much of the parse tree as possible
 				return out, err
 			}
+			branch.RollbackTx()
 			break
 		}
 		out = append(out, v...)
@@ -311,6 +312,9 @@ func (l *lookaheadGroup) Parse(ctx *parseContext, parent reflect.Value) (out []r
 	// Create a branch to avoid advancing the parser as any match will be discarded
 	branch := ctx.Branch()
 	out, err = l.expr.Parse(branch, parent)
+	// The lookahead branch is always discarded, so undo any transactional
+	// captures it applied.
+	branch.RollbackTx()
 	matchedLookahead := err == nil && out != nil
 	expectingMatch := !l.negative
 	if matchedLookahead != expectingMatch {
@@ -342,6 +346,7 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 			if ctx.Stop(err, branch) {
 				return value, err
 			}
+			branch.RollbackTx()
 			// Show the closest error returned. The idea here is that the further the parser progresses
 			// without error, the more difficult it is to trace the error back to its root.
 			if branch.Cursor() >= deepestError {
@@ -357,6 +362,9 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 			}
 			ctx.Accept(branch)
 			return value, nil
+		} else {
+			// No match on this alternative; undo any transactional captures it applied.
+			branch.RollbackTx()
 		}
 	}
 	if firstError != nil {
@@ -496,6 +504,9 @@ func (n *negation) Parse(ctx *parseContext, parent reflect.Value) (out []reflect
 	}
 
 	out, err = n.node.Parse(branch, parent)
+	// The negation branch is always discarded, so undo any transactional
+	// captures it applied.
+	branch.RollbackTx()
 	if out != nil && err == nil {
 		// out being non-nil means that what we don't want is actually here, so we report nomatch
 		return nil, &UnexpectedTokenError{Unexpected: *notEOF, TokenType: ctx.tokenTypeName(notEOF.Type)}
@@ -601,7 +612,7 @@ func maybeRef(tmpl reflect.Type, strct reflect.Value) reflect.Value {
 //
 // For all other types, an attempt will be made to convert the string to the corresponding
 // type (int, float32, etc.).
-func setField(tokens []lexer.Token, strct reflect.Value, field structLexerField, fieldValue []reflect.Value) (err error) { //nolint:gocognit
+func setField(ctx *parseContext, tokens []lexer.Token, strct reflect.Value, field structLexerField, fieldValue []reflect.Value) (err error) { //nolint:gocognit
 	f := strct.FieldByIndex(field.Index)
 
 	// Any kind of pointer, hydrate it first.
@@ -640,6 +651,9 @@ func setField(tokens []lexer.Token, strct reflect.Value, field structLexerField,
 			if err != nil {
 				return Wrapf(pos, err, "failed to capture")
 			}
+			if tx, ok := d.(TransactionalCapture); ok {
+				ctx.trackTx(tx)
+			}
 			return nil
 		} else if d, ok := f.Addr().Interface().(encoding.TextUnmarshaler); ok {
 			for _, v := range fieldValue {
@@ -661,6 +675,9 @@ func setField(tokens []lexer.Token, strct reflect.Value, field structLexerField,
 				d := reflect.New(sliceElemType).Interface().(Capture)
 				if err := d.Capture([]string{v.Interface().(string)}); err != nil {
 					return Wrapf(pos, err, "failed to capture")
+				}
+				if tx, ok := d.(TransactionalCapture); ok {
+					ctx.trackTx(tx)
 				}
 				eltValue := reflect.ValueOf(d)
 				if f.Type().Elem().Kind() != reflect.Pointer {
