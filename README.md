@@ -90,6 +90,47 @@ XPath is Go package provides selecting nodes from XML, HTML or other documents u
 
 The gxpath supported three types: number, boolean, string.
 
+#### Variables
+
+Instead of splicing parameters into the expression string (and worrying about
+quoting), variables are declared at compile time and bound at evaluation time.
+
+- Variable names are QNames. A prefixed name is resolved against the
+  `WithNamespaces` mapping at compile time; two variables with the same local
+  name but different namespace URIs stay distinct. Bindings use Clark notation
+  `{namespace-uri}local-name` for the key.
+- Bindings support XPath 1.0 booleans, numbers (`float64` or any Go numeric
+  type), strings and node-sets (`xpath.NewNodeSet` / `*xpath.NodeIterator`).
+- A compiled `Expr` never stores evaluation-specific values; every
+  `EvaluateWithVariables` / `SelectWithVariables` call gets an independent
+  binding scope and fresh iterator, so one expression can be evaluated
+  concurrently with different bindings.
+- A node-set binding keeps explicit identity and document order. `NodeSet` is
+  reusable: each evaluation receives its own iterator positioned before the
+  first node, so a consumed iterator is never handed to the next call.
+
+```go
+expr, _ := xpath.Compile("$rows[position() = $idx]",
+    xpath.WithVariableDeclarations("rows", "idx"))
+
+rows := xpath.NewNodeSet(xpath.MustCompile("//row").Select(root))
+iter, err := expr.SelectWithVariables(root, xpath.Variables{
+    "rows": rows,
+    "idx":  2.0,
+})
+
+// Prefixed variable, resolved at compile time:
+expr, _ = xpath.Compile("$ns:limit",
+    xpath.WithNamespaces(map[string]string{"ns": "http://example.com"}),
+    xpath.WithVariableDeclarations("ns:limit"))
+v, _ := expr.EvaluateWithVariables(root,
+    xpath.Variables{"{http://example.com}limit": 10.0})
+```
+
+The legacy `Compile` / `CompileWithNS` / `Expr.Evaluate` / `Expr.Select`
+entry points keep working unchanged; without declarations, any `$variable`
+reference remains a compile-time error.
+
 - `path` : Selects nodes based on the path.
 
 - `a = b` : Standard comparisons.

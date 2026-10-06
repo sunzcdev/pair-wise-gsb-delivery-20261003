@@ -942,6 +942,94 @@ func (c *constantQuery) Properties() queryProp {
 	return queryProps.Position | queryProps.Count | queryProps.Cached | queryProps.Merge
 }
 
+// variableScope is carried by the iterator created for a single evaluation.
+// It exposes the variable bindings that belong to that evaluation.
+type variableScope interface {
+	scope() *scope
+}
+
+// variableQuery resolves a declared variable reference ($name). The compiled
+// expression holds only the variable identity (expanded QName); the concrete
+// value is fetched from the per-evaluation scope at Evaluate/Select time.
+//
+// Node-set bindings are always materialized as an ordered *NodeSet. Each
+// Clone (one per evaluation, and one per helper that needs a fresh cursor)
+// starts iterating at the first node, so an iterator consumed by one call is
+// never handed to the next.
+type variableQuery struct {
+	name  string
+	nodes *NodeSet
+	posit int
+}
+
+func (v *variableQuery) binding(t iterator) (interface{}, error) {
+	holder, ok := t.(variableScope)
+	if !ok || holder.scope() == nil {
+		return nil, fmt.Errorf("xpath: no binding supplied for variable $%s", displayName(v.name))
+	}
+	return holder.scope().lookup(v.name)
+}
+
+func (v *variableQuery) Select(t iterator) NodeNavigator {
+	if v.nodes == nil {
+		val, err := v.binding(t)
+		if err != nil {
+			panic(err)
+		}
+		if ns, ok := val.(*NodeSet); ok {
+			v.nodes = ns
+		} else {
+			return nil
+		}
+	}
+	if v.posit >= v.nodes.Len() {
+		return nil
+	}
+	node := v.nodes.Node(v.posit)
+	v.posit++
+	return node
+}
+
+func (v *variableQuery) Evaluate(t iterator) interface{} {
+	val, err := v.binding(t)
+	if err != nil {
+		panic(err)
+	}
+	if ns, ok := val.(*NodeSet); ok {
+		// Reset the cursor so each evaluation iterates the node-set from its
+		// start. The bound NodeSet itself is immutable and shared.
+		v.nodes = ns
+		v.posit = 0
+		return v
+	}
+	return val
+}
+
+func (v *variableQuery) Clone() query {
+	return &variableQuery{name: v.name}
+}
+
+func (v *variableQuery) ValueType() resultType {
+	return xpathResultType.Any
+}
+
+func (v *variableQuery) Properties() queryProp {
+	// A node-set variable behaves like a cached, positionable node-set so that
+	// numeric predicates and position()/last() operate on it.
+	return queryProps.Position | queryProps.Count | queryProps.Cached | queryProps.Merge
+}
+
+// position reports the ordinal of the last node handed out by Select.
+func (v *variableQuery) position() int {
+	return v.posit
+}
+
+// depth is present so positional predicates treat a node-set variable like a
+// flat axis when grouping positions by depth.
+func (v *variableQuery) depth() int {
+	return 0
+}
+
 type groupQuery struct {
 	posit int
 

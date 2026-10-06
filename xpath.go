@@ -75,6 +75,13 @@ type NodeIterator struct {
 	node   NodeNavigator
 	query  query
 	scalar bool
+	vars   *scope
+}
+
+// scope implements variableScope so variableQuery can reach the per
+// evaluation bindings through the iterator.
+func (t *NodeIterator) scope() *scope {
+	return t.vars
 }
 
 // Current returns current node which matched.
@@ -109,8 +116,9 @@ func Select(root NodeNavigator, expr string) *NodeIterator {
 
 // Expr is an XPath expression for query.
 type Expr struct {
-	s string
-	q query
+	s         string
+	q         query
+	variables []string
 }
 
 type iteratorFunc func() NodeNavigator
@@ -122,17 +130,68 @@ func (f iteratorFunc) Current() NodeNavigator {
 // Evaluate returns the result of the expression.
 // The result type of the expression is one of the follow: bool,float64,string,NodeIterator).
 func (expr *Expr) Evaluate(root NodeNavigator) interface{} {
-	val := expr.q.Evaluate(iteratorFunc(func() NodeNavigator { return root }))
-	switch val.(type) {
-	case query:
-		return &NodeIterator{query: expr.q.Clone(), node: root}
+	result, err := expr.evaluate(root, nil)
+	if err != nil {
+		// Evaluate keeps its legacy, error-free contract. An expression
+		// compiled without variable declarations can never fail to bind.
+		panic(err)
 	}
-	return val
+	return result
 }
 
 // Select selects a node set using the specified XPath expression.
 func (expr *Expr) Select(root NodeNavigator) *NodeIterator {
-	return &NodeIterator{query: expr.q.Clone(), node: root, scalar: expr.q.ValueType() == xpathResultType.Boolean}
+	iter, err := expr.select_(root, nil)
+	if err != nil {
+		panic(err)
+	}
+	return iter
+}
+
+// EvaluateWithVariables evaluates the expression using the supplied variable
+// bindings. It returns an error (rather than panicking) when a declared
+// variable is missing or a binding has an unsupported type. Each call uses an
+// independent binding scope and fresh query state, so one compiled Expr can be
+// evaluated concurrently with different Variables.
+func (expr *Expr) EvaluateWithVariables(root NodeNavigator, vars VariableResolver) (interface{}, error) {
+	return expr.evaluate(root, vars)
+}
+
+// SelectWithVariables selects a node set using the supplied variable bindings.
+// Bindings are validated up front; a missing or ill-typed binding is returned
+// as an error. The returned iterator is independent of every other call.
+func (expr *Expr) SelectWithVariables(root NodeNavigator, vars VariableResolver) (*NodeIterator, error) {
+	return expr.select_(root, vars)
+}
+
+func (expr *Expr) evaluate(root NodeNavigator, resolver VariableResolver) (interface{}, error) {
+	bindings, err := expr.validateBindings(resolver)
+	if err != nil {
+		return nil, err
+	}
+	qy := expr.q.Clone()
+	t := &NodeIterator{query: qy, node: root, vars: bindings}
+	val := qy.Evaluate(t)
+	if _, ok := val.(query); ok {
+		// Node-set result: reuse the same (already cloned, scoped) query so
+		// the iterator keeps access to the variables while selecting.
+		t.scalar = false
+		return t, nil
+	}
+	return val, nil
+}
+
+func (expr *Expr) select_(root NodeNavigator, resolver VariableResolver) (*NodeIterator, error) {
+	bindings, err := expr.validateBindings(resolver)
+	if err != nil {
+		return nil, err
+	}
+	return &NodeIterator{
+		query:  expr.q.Clone(),
+		node:   root,
+		scalar: expr.q.ValueType() == xpathResultType.Boolean,
+		vars:   bindings,
+	}, nil
 }
 
 // String returns XPath expression string.
@@ -141,23 +200,33 @@ func (expr *Expr) String() string {
 }
 
 // Compile compiles an XPath expression string.
-func Compile(expr string) (*Expr, error) {
+//
+// Without options the behavior is unchanged: any variable reference ($x)
+// makes compilation fail because no variables are declared. Use
+// WithVariableDeclarations (together with WithNamespaces for prefixed
+// variable names) to declare variables, then bind values per evaluation with
+// Expr.EvaluateWithVariables or Expr.SelectWithVariables.
+func Compile(expr string, opts ...CompileOption) (*Expr, error) {
 	if expr == "" {
 		return nil, errors.New("expr expression is nil")
 	}
-	qy, err := build(expr, nil)
+	cfg := &compileConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	qy, used, err := build(expr, cfg)
 	if err != nil {
 		return nil, err
 	}
 	if qy == nil {
-		return nil, fmt.Errorf(fmt.Sprintf("undeclared variable in XPath expression: %s", expr))
+		return nil, fmt.Errorf("undeclared variable in XPath expression: %s", expr)
 	}
-	return &Expr{s: expr, q: qy}, nil
+	return &Expr{s: expr, q: qy, variables: used}, nil
 }
 
 // MustCompile compiles an XPath expression string and ignored error.
-func MustCompile(expr string) *Expr {
-	exp, err := Compile(expr)
+func MustCompile(expr string, opts ...CompileOption) *Expr {
+	exp, err := Compile(expr, opts...)
 	if err != nil {
 		return &Expr{s: expr, q: nopQuery{}}
 	}
@@ -169,12 +238,13 @@ func CompileWithNS(expr string, namespaces map[string]string) (*Expr, error) {
 	if expr == "" {
 		return nil, errors.New("expr expression is nil")
 	}
-	qy, err := build(expr, namespaces)
+	cfg := &compileConfig{namespaces: namespaces}
+	qy, used, err := build(expr, cfg)
 	if err != nil {
 		return nil, err
 	}
 	if qy == nil {
-		return nil, fmt.Errorf(fmt.Sprintf("undeclared variable in XPath expression: %s", expr))
+		return nil, fmt.Errorf("undeclared variable in XPath expression: %s", expr)
 	}
-	return &Expr{s: expr, q: qy}, nil
+	return &Expr{s: expr, q: qy, variables: used}, nil
 }
