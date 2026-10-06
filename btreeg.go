@@ -3,7 +3,10 @@
 // license that can be found in the LICENSE file.
 package btree
 
-import "sync"
+import (
+	"reflect"
+	"sync"
+)
 
 type BTreeG[T any] struct {
 	isoid        uint64
@@ -1848,6 +1851,271 @@ func (tr *BTreeG[T]) nodeItems(cn **node[T], items []T, mut bool) []T {
 		items = append(items, n.items[i])
 	}
 	return tr.nodeItems(&(*n.children)[len(*n.children)-1], items, mut)
+}
+
+// DiffKind identifies the kind of difference reported by the DiffG
+// iterator.
+type DiffKind int
+
+const (
+	// DiffAdded indicates an item that only exists in the other tree,
+	// the one that was passed to Diff.
+	DiffAdded DiffKind = iota
+	// DiffDeleted indicates an item that only exists in the original
+	// tree, the one that Diff was called on.
+	DiffDeleted
+	// DiffModified indicates that both trees contain an item with the
+	// same key, but the two items are not equal according to the
+	// equality function that was provided to Diff.
+	DiffModified
+)
+
+// DiffG is an ordered iterator over the differences between two B-trees.
+// Use BTreeG.Diff to create a new iterator, and call Release when finished.
+type DiffG[T any] struct {
+	less    func(a, b T) bool
+	eq      func(a, b T) bool
+	a, b    *BTreeG[T]
+	ca, cb  diffCursorG[T]
+	kind    DiffKind
+	item    T // current item of tree a (DiffDeleted and DiffModified)
+	oitem   T // current item of tree b (DiffAdded and DiffModified)
+	lockedA bool
+	lockedB bool
+}
+
+type diffStackItemG[T any] struct {
+	n *node[T]
+	i int
+}
+
+// diffCursorG is a read-only, node-aware cursor over the items of a tree.
+// It follows the same stack conventions as IterG: for a leaf frame, i is
+// the index of the current item; for an internal frame, i is the index of
+// the child subtree currently being traversed, and items[i] is yielded
+// once that subtree is exhausted.
+type diffCursorG[T any] struct {
+	stack []diffStackItemG[T]
+	item  T
+	valid bool
+}
+
+// first positions the cursor on the first item of the tree.
+func (c *diffCursorG[T]) first(tr *BTreeG[T]) bool {
+	n := tr.root
+	if n == nil {
+		return false
+	}
+	for {
+		c.stack = append(c.stack, diffStackItemG[T]{n, 0})
+		if n.leaf() {
+			break
+		}
+		n = (*n.children)[0]
+	}
+	c.item = n.items[0]
+	return true
+}
+
+// ascend pops exhausted frames and positions the cursor on the next
+// available item. Returns false when the tree has been fully consumed.
+func (c *diffCursorG[T]) ascend() bool {
+	for len(c.stack) > 0 {
+		s := &c.stack[len(c.stack)-1]
+		if s.i < len(s.n.items) {
+			c.item = s.n.items[s.i]
+			return true
+		}
+		c.stack = c.stack[:len(c.stack)-1]
+	}
+	return false
+}
+
+// next advances the cursor to the next item in the tree.
+func (c *diffCursorG[T]) next() bool {
+	if len(c.stack) == 0 {
+		return false
+	}
+	s := &c.stack[len(c.stack)-1]
+	s.i++
+	if s.n.leaf() {
+		return c.ascend()
+	}
+	n := (*s.n.children)[s.i]
+	for {
+		c.stack = append(c.stack, diffStackItemG[T]{n, 0})
+		if n.leaf() {
+			break
+		}
+		n = (*n.children)[0]
+	}
+	c.item = n.items[0]
+	return true
+}
+
+// Diff returns an iterator that yields the ordered differences between the
+// receiver and the provided tree. Differences are reported in ascending
+// key order: items that only exist in the receiver are reported as
+// DiffDeleted, items that only exist in the other tree are reported as
+// DiffAdded, and items that exist in both trees with equal keys but
+// unequal values are reported as DiffModified.
+//
+// The eq function reports whether two items with equal keys are considered
+// equal. This allows for items that contain more data than what the less
+// comparator looks at, such as a key-value pair where less only compares
+// the key. If eq is nil, any two items with equal keys are considered
+// equal, and DiffModified is never reported.
+//
+// The two trees must use the same less comparator. Because comparators are
+// function values, compatibility is checked by comparing their underlying
+// code pointers, which is best-effort: distinct closures that share the
+// same code are considered compatible. If the comparators are incompatible,
+// Diff returns false and the iterator must not be used.
+//
+// Diff takes advantage of the copy-on-write node sharing performed by
+// Copy: subtrees that are shared between both trees are skipped wholesale,
+// without comparing their items, so the amount of work is proportional to
+// the number of differences rather than the size of the trees. This relies
+// on the following contract:
+//
+//   - Items must be treated as immutable while they are stored in either
+//     tree. Replacing an item with Set is fine because it copies the
+//     affected nodes, but mutating the contents of an item in place (for
+//     example through a pointer stored in the item) leaves the shared
+//     nodes untouched, and such changes will not be reported.
+//   - Neither tree may be modified while the iterator is in use. Read
+//     locks are held on both trees until Release is called.
+//
+// The Release method must be called when finished with the iterator.
+func (tr *BTreeG[T]) Diff(other *BTreeG[T], eq func(a, b T) bool,
+) (DiffG[T], bool) {
+	var iter DiffG[T]
+	if tr.less == nil || other.less == nil ||
+		reflect.ValueOf(tr.less).Pointer() !=
+			reflect.ValueOf(other.less).Pointer() {
+		return iter, false
+	}
+	iter.less = tr.less
+	if eq == nil {
+		iter.eq = func(a, b T) bool {
+			return !tr.less(a, b) && !tr.less(b, a)
+		}
+	} else {
+		iter.eq = eq
+	}
+	iter.a, iter.b = tr, other
+	iter.lockedA = tr.lock(false)
+	if other != tr {
+		iter.lockedB = other.lock(false)
+	}
+	iter.ca.valid = iter.ca.first(tr)
+	iter.cb.valid = iter.cb.first(other)
+	return iter, true
+}
+
+// skipShared advances both cursors past subtrees that are shared between
+// the two trees. When both cursors are positioned at the same offset
+// within the same shared node, the remainder of that node's subtree is
+// identical in both trees and can be skipped without further comparison.
+func (iter *DiffG[T]) skipShared() {
+	for iter.ca.valid && iter.cb.valid {
+		ia := len(iter.ca.stack) - 1
+		ib := len(iter.cb.stack) - 1
+		for ia >= 0 && ib >= 0 &&
+			iter.ca.stack[ia].n == iter.cb.stack[ib].n &&
+			iter.ca.stack[ia].i == iter.cb.stack[ib].i {
+			ia--
+			ib--
+		}
+		if ia == len(iter.ca.stack)-1 {
+			return // no shared frames
+		}
+		// The matching frames form an identical suffix of both stacks:
+		// both cursors are at the same position within a shared subtree.
+		// Drop the shared frames and continue right after the subtree.
+		iter.ca.stack = iter.ca.stack[:ia+1]
+		iter.cb.stack = iter.cb.stack[:ib+1]
+		iter.ca.valid = iter.ca.ascend()
+		iter.cb.valid = iter.cb.ascend()
+	}
+}
+
+// Next moves the iterator to the next difference between the two trees.
+// Returns false when there are no more differences.
+func (iter *DiffG[T]) Next() bool {
+	for iter.ca.valid && iter.cb.valid {
+		iter.skipShared()
+		if !iter.ca.valid || !iter.cb.valid {
+			break
+		}
+		ai, bi := iter.ca.item, iter.cb.item
+		if iter.less(ai, bi) {
+			iter.kind = DiffDeleted
+			iter.item = ai
+			iter.ca.valid = iter.ca.next()
+			return true
+		}
+		if iter.less(bi, ai) {
+			iter.kind = DiffAdded
+			iter.oitem = bi
+			iter.cb.valid = iter.cb.next()
+			return true
+		}
+		if !iter.eq(ai, bi) {
+			iter.kind = DiffModified
+			iter.item = ai
+			iter.oitem = bi
+			iter.ca.valid = iter.ca.next()
+			iter.cb.valid = iter.cb.next()
+			return true
+		}
+		iter.ca.valid = iter.ca.next()
+		iter.cb.valid = iter.cb.next()
+	}
+	if iter.ca.valid {
+		iter.kind = DiffDeleted
+		iter.item = iter.ca.item
+		iter.ca.valid = iter.ca.next()
+		return true
+	}
+	if iter.cb.valid {
+		iter.kind = DiffAdded
+		iter.oitem = iter.cb.item
+		iter.cb.valid = iter.cb.next()
+		return true
+	}
+	return false
+}
+
+// Kind returns the kind of the current difference.
+func (iter *DiffG[T]) Kind() DiffKind {
+	return iter.kind
+}
+
+// Item returns the current item of the original tree, the one that Diff
+// was called on. It is only meaningful when Kind returns DiffDeleted or
+// DiffModified.
+func (iter *DiffG[T]) Item() T {
+	return iter.item
+}
+
+// OtherItem returns the current item of the other tree, the one that was
+// passed to Diff. It is only meaningful when Kind returns DiffAdded or
+// DiffModified.
+func (iter *DiffG[T]) OtherItem() T {
+	return iter.oitem
+}
+
+// Release the iterator.
+func (iter *DiffG[T]) Release() {
+	if iter.lockedA {
+		iter.a.unlock(false)
+		iter.lockedA = false
+	}
+	if iter.lockedB {
+		iter.b.unlock(false)
+		iter.lockedB = false
+	}
 }
 
 // Clear will delete all items.

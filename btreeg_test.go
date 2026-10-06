@@ -1982,3 +1982,289 @@ func TestBenchmarkIteratorReuseWorks(t *testing.T) {
 		reusableIter.Release()
 	}
 }
+
+// testDiffItem is a key-value item used by the Diff tests. The less
+// comparator only looks at the key, while the equality function only
+// looks at the value.
+type testDiffItem struct {
+	key int
+	val int
+}
+
+func testDiffLess(a, b testDiffItem) bool {
+	return a.key < b.key
+}
+
+func testDiffEq(a, b testDiffItem) bool {
+	return a.val == b.val
+}
+
+type testDiffEntry struct {
+	kind DiffKind
+	key  int
+	oval int
+	nval int
+}
+
+func testDiffLessReversed(a, b testDiffItem) bool {
+	return a.key > b.key
+}
+
+func newTestDiffTree(degree int, items []testDiffItem) *BTreeG[testDiffItem] {
+	tr := NewBTreeGOptions(testDiffLess, Options{Degree: degree})
+	for _, item := range items {
+		tr.Set(item)
+	}
+	return tr
+}
+
+// refDiff computes the reference differences between two sorted slices of
+// items, which is what the Diff iterator is expected to produce.
+func refDiff(oldItems, newItems []testDiffItem) []testDiffEntry {
+	var out []testDiffEntry
+	i, j := 0, 0
+	for i < len(oldItems) && j < len(newItems) {
+		a, b := oldItems[i], newItems[j]
+		switch {
+		case a.key < b.key:
+			out = append(out, testDiffEntry{DiffDeleted, a.key, a.val, 0})
+			i++
+		case b.key < a.key:
+			out = append(out, testDiffEntry{DiffAdded, b.key, 0, b.val})
+			j++
+		default:
+			if a.val != b.val {
+				out = append(out,
+					testDiffEntry{DiffModified, a.key, a.val, b.val})
+			}
+			i++
+			j++
+		}
+	}
+	for ; i < len(oldItems); i++ {
+		out = append(out,
+			testDiffEntry{DiffDeleted, oldItems[i].key, oldItems[i].val, 0})
+	}
+	for ; j < len(newItems); j++ {
+		out = append(out,
+			testDiffEntry{DiffAdded, newItems[j].key, 0, newItems[j].val})
+	}
+	return out
+}
+
+func collectDiff(t *testing.T, tr1, tr2 *BTreeG[testDiffItem],
+) []testDiffEntry {
+	t.Helper()
+	iter, ok := tr1.Diff(tr2, testDiffEq)
+	if !ok {
+		t.Fatal("Diff reported incompatible comparators")
+	}
+	defer iter.Release()
+	var out []testDiffEntry
+	for iter.Next() {
+		var entry testDiffEntry
+		entry.kind = iter.Kind()
+		switch entry.kind {
+		case DiffDeleted:
+			entry.key = iter.Item().key
+			entry.oval = iter.Item().val
+		case DiffAdded:
+			entry.key = iter.OtherItem().key
+			entry.nval = iter.OtherItem().val
+		case DiffModified:
+			if iter.Item().key != iter.OtherItem().key {
+				t.Fatal("DiffModified with mismatched keys")
+			}
+			entry.key = iter.Item().key
+			entry.oval = iter.Item().val
+			entry.nval = iter.OtherItem().val
+		default:
+			t.Fatalf("unknown diff kind %d", entry.kind)
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func assertDiffEqual(t *testing.T, expected, actual []testDiffEntry) {
+	t.Helper()
+	if len(expected) != len(actual) {
+		t.Fatalf("expected %d diffs, got %d\nexpected: %v\ngot:      %v",
+			len(expected), len(actual), expected, actual)
+	}
+	for i := range expected {
+		if expected[i] != actual[i] {
+			t.Fatalf("diff %d: expected %v, got %v",
+				i, expected[i], actual[i])
+		}
+	}
+}
+
+func TestGenericDiff(t *testing.T) {
+	// A degree of 2 (2-3-4 tree) forces node merges on delete and node
+	// splits on insert with only a handful of items.
+	var base []testDiffItem
+	for i := 0; i < 30; i++ {
+		base = append(base, testDiffItem{i, i * 10})
+	}
+	tr1 := newTestDiffTree(2, base)
+	tr2 := tr1.Copy()
+
+	// Delete a run of keys, which causes nodes to merge.
+	for _, k := range []int{3, 4, 5, 6, 7} {
+		tr2.Delete(testDiffItem{key: k})
+	}
+	// Insert new keys, which causes nodes to split.
+	for _, k := range []int{100, 101, 102, 103} {
+		tr2.Set(testDiffItem{k, k})
+	}
+	// Replace the value of existing keys.
+	tr2.Set(testDiffItem{10, -10})
+	tr2.Set(testDiffItem{20, -20})
+
+	expected := refDiff(tr1.Items(), tr2.Items())
+	assertDiffEqual(t, expected, collectDiff(t, tr1, tr2))
+
+	// The same diffs in the reverse direction: keys stay in ascending
+	// order, only the kinds and values are swapped.
+	reversed := make([]testDiffEntry, len(expected))
+	for i, e := range expected {
+		switch e.kind {
+		case DiffAdded:
+			e.kind = DiffDeleted
+			e.oval, e.nval = e.nval, 0
+		case DiffDeleted:
+			e.kind = DiffAdded
+			e.nval, e.oval = e.oval, 0
+		default:
+			e.oval, e.nval = e.nval, e.oval
+		}
+		reversed[i] = e
+	}
+	assertDiffEqual(t, reversed, collectDiff(t, tr2, tr1))
+}
+
+func TestGenericDiffRandom(t *testing.T) {
+	for _, degree := range []int{2, 3, 8, 32} {
+		for i := 0; i < 20; i++ {
+			n := 1 + rand.Intn(500)
+			perm := rand.Perm(n * 2)
+			var base []testDiffItem
+			for _, k := range perm[:n] {
+				base = append(base, testDiffItem{k, rand.Int()})
+			}
+			tr1 := newTestDiffTree(degree, base)
+			tr2 := tr1.Copy()
+			// Apply random mutations to the copy.
+			for j := 0; j < n/4+1; j++ {
+				switch rand.Intn(3) {
+				case 0: // delete
+					tr2.Delete(testDiffItem{key: rand.Intn(n * 2)})
+				case 1: // insert
+					k := rand.Intn(n * 2)
+					tr2.Set(testDiffItem{k, rand.Int()})
+				default: // replace value of an existing key
+					if len(base) > 0 {
+						k := base[rand.Intn(len(base))].key
+						tr2.Set(testDiffItem{k, rand.Int()})
+					}
+				}
+			}
+			expected := refDiff(tr1.Items(), tr2.Items())
+			assertDiffEqual(t, expected, collectDiff(t, tr1, tr2))
+		}
+	}
+}
+
+func TestGenericDiffEdgeCases(t *testing.T) {
+	empty := newTestDiffTree(2, nil)
+	// empty vs empty
+	assertDiffEqual(t, nil, collectDiff(t, empty, empty.Copy()))
+	// tree vs itself
+	tr := newTestDiffTree(2, []testDiffItem{{1, 1}, {2, 2}, {3, 3}})
+	assertDiffEqual(t, nil, collectDiff(t, tr, tr))
+	// tree vs identical copy
+	assertDiffEqual(t, nil, collectDiff(t, tr, tr.Copy()))
+	// empty vs non-empty: all added
+	assertDiffEqual(t, []testDiffEntry{
+		{DiffAdded, 1, 0, 1},
+		{DiffAdded, 2, 0, 2},
+		{DiffAdded, 3, 0, 3},
+	}, collectDiff(t, empty, tr))
+	// non-empty vs empty: all deleted
+	assertDiffEqual(t, []testDiffEntry{
+		{DiffDeleted, 1, 1, 0},
+		{DiffDeleted, 2, 2, 0},
+		{DiffDeleted, 3, 3, 0},
+	}, collectDiff(t, tr, empty))
+
+	// A nil equality function never reports DiffModified.
+	tr2 := tr.Copy()
+	tr2.Set(testDiffItem{2, 22})
+	iter, ok := tr.Diff(tr2, nil)
+	if !ok {
+		t.Fatal("Diff reported incompatible comparators")
+	}
+	defer iter.Release()
+	if iter.Next() {
+		t.Fatal("expected no diffs with nil equality function")
+	}
+}
+
+func TestGenericDiffIncompatibleLess(t *testing.T) {
+	tr1 := newTestDiffTree(2, []testDiffItem{{1, 1}})
+	tr2 := NewBTreeG(testDiffLessReversed)
+	tr2.Set(testDiffItem{1, 1})
+	if _, ok := tr1.Diff(tr2, testDiffEq); ok {
+		t.Fatal("expected Diff to reject incompatible comparators")
+	}
+}
+
+func TestGenericDiffSharedSubtrees(t *testing.T) {
+	// When most of the tree is unchanged, the number of key comparisons
+	// performed by Diff should be far smaller than the number of items,
+	// because shared subtrees are skipped wholesale.
+	const N = 20000
+	var lessCalls, eqCalls int
+	less := func(a, b testDiffItem) bool {
+		lessCalls++
+		return a.key < b.key
+	}
+	tr1 := NewBTreeGOptions(less, Options{Degree: 32})
+	for i := 0; i < N; i++ {
+		tr1.Set(testDiffItem{i, i})
+	}
+	tr2 := tr1.Copy()
+	// Sprinkle a few changes across the key space.
+	for k := 0; k < N; k += 2000 {
+		tr2.Set(testDiffItem{k, ^k})         // modify value
+		tr2.Delete(testDiffItem{key: k + 1}) // delete
+		tr2.Set(testDiffItem{N + k, k})      // insert
+	}
+	lessCalls, eqCalls = 0, 0
+	eq := func(a, b testDiffItem) bool {
+		eqCalls++
+		return a.val == b.val
+	}
+	iter, ok := tr1.Diff(tr2, eq)
+	if !ok {
+		t.Fatal("Diff reported incompatible comparators")
+	}
+	var count int
+	for iter.Next() {
+		count++
+	}
+	iter.Release()
+	if count != 30 {
+		t.Fatalf("expected 30 diffs, got %d", count)
+	}
+	total := lessCalls + eqCalls
+	t.Logf("comparisons: less=%d eq=%d total=%d items=%d",
+		lessCalls, eqCalls, total, N)
+	// A full scan would compare every one of the N items. With shared
+	// subtree skipping, the work should be proportional to the number of
+	// changes, not the size of the tree.
+	if total > N/4 {
+		t.Fatalf("expected fewer than %d comparisons, got %d", N/4, total)
+	}
+}

@@ -226,6 +226,10 @@ SeekHint(key, iter, *hint)
 
 // Copy-on-write
 Copy()                  // copy the btree
+
+// Comparing trees
+Diff(other, eq)         // returns an iterator over the ordered differences
+                        // between two btrees, skipping shared subtrees
 ```
 
 #### Example
