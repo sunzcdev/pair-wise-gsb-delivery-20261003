@@ -68,3 +68,34 @@ Also contains handler methods for applications that would like to handle and sto
 ```
 
 For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/api/remote).
+
+## Bounded
+
+The `bounded` package provides cardinality-bounded Counter and Histogram vectors.
+
+A bounded vector admits up to a configured maximum number of distinct label combinations as regular series. Observations for any further combination are folded into shared overflow series, in which the values of a configured subset of labels are replaced by a reserved overflow marker. Totals are never dropped: the sum over all admitted and overflow series always equals the sum over all observations.
+
+```go
+    import (
+        "github.com/prometheus/client_golang/exp/bounded"
+        "github.com/prometheus/client_golang/prometheus"
+    )
+    ...
+
+    requests, err := bounded.NewCounterVec(bounded.CounterVecConfig{
+        Opts:           prometheus.CounterOpts{Name: "http_requests_total", Help: "HTTP requests."},
+        VariableLabels: []string{"path", "code"},
+        VecConfig: bounded.VecConfig{
+            MaxSeries:      1000,
+            FoldableLabels: []string{"path"},
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    prometheus.MustRegister(requests)
+
+    requests.WithLabelValues(r.URL.Path, "200").Inc()
+```
+
+For more details, see [go doc](https://pkg.go.dev/github.com/prometheus/client_golang/exp/bounded).
