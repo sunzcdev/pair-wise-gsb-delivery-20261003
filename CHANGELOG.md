@@ -1,6 +1,24 @@
 # UNRELEASED
 
-IMPROVEMENETS
+FEATURES
+
+* FSMs can now report an unrecoverable apply failure by returning a value
+  implementing the new optional `FSMApplyError` interface from `FSM.Apply` or
+  `BatchingFSM.ApplyBatch`. Ordinary business errors continue to be returned
+  unchanged through `ApplyFuture.Response` and do not affect the node. On an
+  `FSMApplyError` the offending entry and every later entry are treated as not
+  applied, the node transitions to the new terminal `Failed` state and stops
+  applying logs, campaigning, serving Barrier/Snapshot/Restore, and accepting
+  InstallSnapshot/AppendEntries updates. Client futures fail with an error
+  wrapping the new `ErrFSMFailed` sentinel (use `errors.Is`/`errors.As`),
+  distinguishing committed-but-failed applies from unknown outcomes
+  (`ErrLeadershipLost`/`ErrRaftShutdown`). New `Raft.FSMFailed` and
+  `Raft.FSMError` inspectors expose the state. Recovery is explicit and
+  out-of-process: repair/replace the FSM storage, restore from a known-good
+  snapshot, and create a new Raft node; swallowing the error and advancing the
+  applied index is not supported.
+
+IMPROVEMENTS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
 

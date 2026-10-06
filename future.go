@@ -41,6 +41,13 @@ type ApplyFuture interface {
 	// Note that if FSM.Apply returns an error, it will be returned by Response,
 	// and not by the Error method, so it is always important to check Response
 	// for errors from the FSM.
+	//
+	// The exception is an unrecoverable apply failure: if FSM.Apply returns a
+	// value implementing FSMApplyError, Error returns an error wrapping
+	// ErrFSMFailed (and carrying the FSMApplyError) and Response holds that same
+	// error. Use errors.Is(err, ErrFSMFailed) to distinguish "committed but
+	// failed to apply" from the unknown-outcome errors ErrLeadershipLost and
+	// ErrRaftShutdown.
 	Response() interface{}
 }
 

@@ -73,6 +73,18 @@ type SnapshotSink interface {
 func (r *Raft) runSnapshots() {
 	for {
 		select {
+		case <-r.fatalErrCh:
+			// The FSM is failed; never snapshot a state that may diverge from
+			// the committed log. Drain any user snapshot requests so callers
+			// get ErrFSMFailed, then stop.
+			for {
+				select {
+				case future := <-r.userSnapshotCh:
+					future.respond(r.FSMError())
+				default:
+					return
+				}
+			}
 		case <-randomTimeout(r.config().SnapshotInterval):
 			// Check if we should snapshot
 			if !r.shouldSnapshot() {
@@ -125,6 +137,12 @@ func (r *Raft) shouldSnapshot() bool {
 // snapshot, along with an error.
 func (r *Raft) takeSnapshot() (string, error) {
 	defer metrics.MeasureSince([]string{"raft", "snapshot", "takeSnapshot"}, time.Now())
+
+	// Refuse to snapshot a failed FSM; its state is not known to be
+	// consistent with the committed log.
+	if r.FSMFailed() {
+		return "", r.FSMError()
+	}
 
 	// Create a request for the FSM to perform a snapshot.
 	snapReq := &reqSnapshotFuture{}

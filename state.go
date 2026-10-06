@@ -22,6 +22,14 @@ const (
 	// Leader is one of the valid states of a Raft node.
 	Leader
 
+	// Failed is the terminal state of a Raft node whose FSM reported an
+	// unrecoverable error while applying a committed log entry. A node in
+	// this state has stopped applying logs, does not campaign and can not
+	// become leader. It is distinct from Shutdown: the goroutines are still
+	// alive so the failure can be inspected, but the node can only be
+	// recovered by creating a new Raft instance after repairing the FSM.
+	Failed
+
 	// Shutdown is the terminal state of a Raft node.
 	Shutdown
 )
@@ -34,6 +42,8 @@ func (s RaftState) String() string {
 		return "Candidate"
 	case Leader:
 		return "Leader"
+	case Failed:
+		return "Failed"
 	case Shutdown:
 		return "Shutdown"
 	default:

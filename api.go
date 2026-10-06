@@ -77,6 +77,17 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrFSMFailed is returned by client-facing operations after the FSM has
+	// reported an unrecoverable error while applying a committed log entry.
+	//
+	// Once this happens the node stops applying any further committed logs,
+	// does not campaign or accept leadership, and refuses Barrier, Snapshot
+	// and Restore operations. The node can not recover in-process: the
+	// operator must repair or replace the underlying storage/FSM and create a
+	// new Raft instance, typically after restoring the FSM from a known-good
+	// snapshot. Use Raft.FSMError to inspect the underlying cause.
+	ErrFSMFailed = errors.New("FSM has failed with an unrecoverable error")
 )
 
 // Raft implements a Raft node.
@@ -116,6 +127,23 @@ type Raft struct {
 
 	// fsmSnapshotCh is used to trigger a new snapshot being taken
 	fsmSnapshotCh chan *reqSnapshotFuture
+
+	// fatalErrCh is closed exactly once when the FSM reports an
+	// unrecoverable error (an FSMApplyError) while applying a committed log
+	// entry. When closed, fsmErr holds the failure that caused the node to
+	// stop applying logs. It is an unbuffered channel that is closed (never
+	// sent on) via reportFSMError, so any number of goroutines can select on
+	// it and reporting never blocks, even during shutdown.
+	fatalErrCh chan struct{}
+
+	// fsmErr holds the unrecoverable FSM error once fatalErrCh has closed.
+	// It is written before fatalErrCh is closed and must only be read after
+	// observing that closure (or via FSMError, which synchronizes on it).
+	fsmErr error
+
+	// fatalErrOnce ensures the unrecoverable FSM failure is recorded and
+	// signaled exactly once.
+	fatalErrOnce sync.Once
 
 	// lastContact is the last time we had contact from the
 	// leader node. This can be used to gauge staleness.
@@ -559,6 +587,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
+		fatalErrCh:            make(chan struct{}),
 		leaderCh:              make(chan bool, 1),
 		localID:               localID,
 		localAddr:             localAddr,
@@ -864,6 +893,12 @@ func (r *Raft) LeaderWithID() (ServerAddress, ServerID) {
 // If a user snapshot is restored while the command is in-flight, an
 // ErrAbortedByRestore is returned. In this case the write effectively failed
 // since its effects will not be present in the FSM after the restore.
+//
+// If the FSM returns an FSMApplyError while applying a committed entry, Error
+// returns an error wrapping ErrFSMFailed. Unlike ErrLeadershipLost, this is a
+// definitive outcome: the entry was committed but could not be applied to this
+// node's FSM, and the node has stopped applying further logs. Ordinary errors
+// returned by FSM.Apply are delivered through ApplyFuture.Response instead.
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return r.ApplyLog(Log{Data: cmd}, timeout)
 }
@@ -894,6 +929,8 @@ func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 		return errorFuture{ErrEnqueueTimeout}
 	case <-r.shutdownCh:
 		return errorFuture{ErrRaftShutdown}
+	case <-r.fatalErrCh:
+		return errorFuture{r.FSMError()}
 	case r.applyCh <- logFuture:
 		return logFuture
 	}
@@ -920,6 +957,8 @@ func (r *Raft) Barrier(timeout time.Duration) Future {
 		return errorFuture{ErrEnqueueTimeout}
 	case <-r.shutdownCh:
 		return errorFuture{ErrRaftShutdown}
+	case <-r.fatalErrCh:
+		return errorFuture{r.FSMError()}
 	case r.applyCh <- logFuture:
 		return logFuture
 	}
@@ -1084,6 +1123,9 @@ func (r *Raft) Snapshot() SnapshotFuture {
 	case <-r.shutdownCh:
 		future.respond(ErrRaftShutdown)
 		return future
+	case <-r.fatalErrCh:
+		future.respond(r.FSMError())
+		return future
 	}
 }
 
@@ -1119,6 +1161,8 @@ func (r *Raft) Restore(meta *SnapshotMeta, reader io.Reader, timeout time.Durati
 		return ErrEnqueueTimeout
 	case <-r.shutdownCh:
 		return ErrRaftShutdown
+	case <-r.fatalErrCh:
+		return r.FSMError()
 	case r.userRestoreCh <- restore:
 		// If the restore is ingested then wait for it to complete.
 		if err := restore.Error(); err != nil {
@@ -1149,6 +1193,33 @@ func (r *Raft) Restore(meta *SnapshotMeta, reader io.Reader, timeout time.Durati
 // State returns the state of this raft peer.
 func (r *Raft) State() RaftState {
 	return r.getState()
+}
+
+// FSMFailed reports whether the FSM has hit an unrecoverable error while
+// applying a committed log entry. When true, the node has stopped applying
+// any further logs and client operations return ErrFSMFailed (wrapping the
+// underlying FSMApplyError). This remains true for the lifetime of the Raft
+// instance; there is no in-process recovery.
+func (r *Raft) FSMFailed() bool {
+	select {
+	case <-r.fatalErrCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// FSMError is non-blocking. If the FSM has not failed it returns nil; if it
+// has, it returns an error that wraps ErrFSMFailed and carries the
+// FSMApplyError reported by the FSM. Use errors.Is(err, raft.ErrFSMFailed)
+// and errors.As to inspect the original failure.
+func (r *Raft) FSMError() error {
+	select {
+	case <-r.fatalErrCh:
+		return r.fsmErr
+	default:
+		return nil
+	}
 }
 
 // LeaderCh is used to get a channel which delivers signals on acquiring or

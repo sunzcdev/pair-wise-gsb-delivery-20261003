@@ -135,15 +135,25 @@ func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.
 // run the main thread that handles leadership and RPC requests.
 func (r *Raft) run() {
 	for {
-		// Check if we are doing a shutdown
+		// Block until either we shut down or the FSM reports an
+		// unrecoverable error. Checking at the top of the loop guarantees we
+		// never (re)enter an election or leader setup after a failure, even if
+		// a state loop transitioned to Candidate/Leader at the same instant.
 		select {
 		case <-r.shutdownCh:
 			// Clear the leader to prevent forwarding
 			r.setLeader("", "")
 			return
+		case <-r.fatalErrCh:
+			r.enterFailedState()
+			return
 		default:
 		}
 
+		// Each state loop also watches fatalErrCh and returns promptly when the
+		// FSM reports an unrecoverable error; leader teardown runs through
+		// runLeader's deferred cleanup when leaderLoop exits. We then loop back
+		// to the blocking select above and enter the terminal Failed state.
 		switch r.getState() {
 		case Follower:
 			r.runFollower()
@@ -153,6 +163,23 @@ func (r *Raft) run() {
 			r.runLeader()
 		}
 	}
+}
+
+// enterFailedState moves the node into the terminal Failed state after an
+// unrecoverable FSM error, clears leader info, notifies leadership watchers,
+// and parks until shutdown. It runs on the main goroutine.
+func (r *Raft) enterFailedState() {
+	r.setState(Failed)
+	r.setLeader("", "")
+	overrideNotifyBool(r.leaderCh, false)
+	if notify := r.config().NotifyCh; notify != nil {
+		select {
+		case notify <- false:
+		default:
+		}
+	}
+	<-r.shutdownCh
+	r.setLeader("", "")
 }
 
 // runFollower runs the main loop while in the follower state.
@@ -210,6 +237,11 @@ func (r *Raft) runFollower() {
 
 		case <-r.followerNotifyCh:
 			heartbeatTimer = time.After(0)
+
+		case <-r.fatalErrCh:
+			// The FSM failed irrecoverably; stop campaigning and return so
+			// run() can move to the terminal Failed state.
+			return
 
 		case <-heartbeatTimer:
 			r.mainThreadSaturation.working()
@@ -434,6 +466,10 @@ func (r *Raft) runCandidate() {
 			r.logger.Warn("Election timeout reached, restarting election")
 			return
 
+		case <-r.fatalErrCh:
+			// Stop campaigning after an irrecoverable FSM failure.
+			return
+
 		case <-r.shutdownCh:
 			return
 		}
@@ -515,14 +551,22 @@ func (r *Raft) runLeader() {
 			close(p.stopCh)
 		}
 
+		// Choose the error reported to in-flight client operations. An
+		// unrecoverable FSM failure is a definitive apply failure; losing
+		// leadership otherwise leaves the outcome unknown.
+		abortErr := ErrLeadershipLost
+		if r.FSMFailed() {
+			abortErr = r.FSMError()
+		}
+
 		// Respond to all inflight operations
 		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
-			e.Value.(*logFuture).respond(ErrLeadershipLost)
+			e.Value.(*logFuture).respond(abortErr)
 		}
 
 		// Respond to any pending verify requests
 		for future := range r.leaderState.notify {
-			future.respond(ErrLeadershipLost)
+			future.respond(abortErr)
 		}
 
 		// Clear all the state
@@ -688,6 +732,20 @@ func (r *Raft) leaderLoop() {
 		case <-r.leaderState.stepDown:
 			r.mainThreadSaturation.working()
 			r.setState(Follower)
+
+		case <-r.fatalErrCh:
+			r.mainThreadSaturation.working()
+			// The FSM failed irrecoverably. These entries are committed but
+			// were never handed to a healthy FSM; answer them with the FSM
+			// failure so clients can distinguish a failed apply from an
+			// unknown outcome. runLeader's deferred cleanup stops replication
+			// and tears down leader state once leaderLoop returns.
+			fatalErr := r.FSMError()
+			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
+				e.Value.(*logFuture).respond(fatalErr)
+			}
+			r.setState(Failed)
+			return
 
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
@@ -1301,6 +1359,20 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 		return
 	}
 
+	// Once the FSM has failed irrecoverably, no further committed entry may
+	// be handed to it. Fail any caller futures explicitly and leave
+	// lastApplied untouched; swallowing the error and advancing it would
+	// desynchronize the state machine from the committed log.
+	if r.FSMFailed() {
+		fatalErr := r.FSMError()
+		for idx, future := range futures {
+			if idx > lastApplied {
+				future.respond(fatalErr)
+			}
+		}
+		return
+	}
+
 	applyBatch := func(batch []*commitTuple) {
 		select {
 		case r.fsmMutateCh <- batch:
@@ -1472,6 +1544,14 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 
 	// Ignore an older term
 	if a.Term < r.getCurrentTerm() {
+		return
+	}
+
+	// A failed node does not apply logs. Acknowledge nothing new by leaving
+	// Success=false; the healthy cluster can continue with the remaining
+	// quorum while this node is taken out of service for rebuild.
+	if r.FSMFailed() {
+		resp.NoRetryBackoff = true
 		return
 	}
 
@@ -1859,6 +1939,14 @@ func (r *Raft) installSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 		r.logger.Info("ignoring installSnapshot request with older term than current term",
 			"request-term", req.Term,
 			"current-term", r.getCurrentTerm())
+		return
+	}
+
+	// A failed node must not be silently healed by an incoming snapshot:
+	// recovery is an explicit, operator-driven rebuild. Refuse so the leader
+	// does not believe the node is caught up.
+	if r.FSMFailed() {
+		rpcErr = r.FSMError()
 		return
 	}
 
