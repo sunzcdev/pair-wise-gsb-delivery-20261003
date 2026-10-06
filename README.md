@@ -12,6 +12,7 @@ An efficient [B-tree](https://en.wikipedia.org/wiki/B-tree) implementation in Go
 - `Copy()` method with copy-on-write support.
 - [Path hinting](PATH_HINT.md) optimization for operations with nearby keys.
 - Allows for array-like operations. ([Counted B-tree](https://www.chiark.greenend.org.uk/~sgtatham/algorithms/cbtree.html))
+- Interval index with subtree max-end pruning for overlap queries.
 
 ## Using
 
@@ -441,6 +442,36 @@ func main() {
 	// user:5 Janet
 	// user:3 Steve
 }
+```
+
+### Interval index
+
+`IntervalTreeG` indexes ranges (e.g. booking windows) on top of the same
+B-tree. Each node caches the maximum end of its subtree, so an overlap
+query descends only into subtrees that can contain a hit, instead of
+scanning forward from the earliest start point. Results are emitted in
+stable `(start, identity)` order; intervals have an identity independent
+of their bounds, so identical ranges coexist.
+
+Endpoints carry explicit open/closed boundary flags and may be unbounded.
+A degenerate interval (reversed ends, or equal ends with at least one open
+side) is stored but never overlaps anything. The augmentation is kept
+correct through inserts, deletes, splits, rotations, merges, bulk `Load`,
+and copy-on-write `Copy`.
+
+```go
+// coordinates and identities are ordered by cmp
+tr := btree.NewIntervalTreeG[int, string](cmpInt, cmpInt, 0)
+tr.Set(btree.Interval[int, string]{
+	Start: btree.End[int]{Value: 9, Inclusive: true},   // [9
+	End:   btree.End[int]{Value: 17, Inclusive: false}, // 17)
+	ID:    42,
+	Item:  "room A",
+})
+tr.Overlaps(query, func(iv btree.Interval[int, string]) bool {
+	fmt.Println(iv.ID, iv.Item)
+	return true // false stops iteration
+})
 ```
 
 ## Performance

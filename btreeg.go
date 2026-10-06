@@ -17,6 +17,12 @@ type BTreeG[T any] struct {
 	empty        T
 	max          int
 	min          int
+	// reaug, when set, recomputes the augmented information stored in a
+	// node's meta field from the node's own items and the meta fields of its
+	// children. It must be a pure function of the subtree contents so that
+	// copy-on-write snapshots keep working. It is nil for plain trees, in
+	// which case the meta field is never touched and there is no overhead.
+	reaug func(n *node[T])
 }
 
 type node[T any] struct {
@@ -24,6 +30,10 @@ type node[T any] struct {
 	count    int
 	items    []T
 	children *[]*node[T]
+	// meta holds optional augmented information about the whole subtree,
+	// such as the maximum interval end. It is only maintained when the
+	// owning tree has a reaug hook installed.
+	meta any
 }
 
 // PathHint is a utility type used with the *Hint() functions. Hints provide
@@ -210,6 +220,7 @@ func (tr *BTreeG[T]) setHint(item T, hint *PathHint) (prev T, replaced bool) {
 		tr.root = tr.newNode(true)
 		tr.root.items = append([]T{}, item)
 		tr.root.count = 1
+		tr.reaugNode(tr.root)
 		tr.count = 1
 		return tr.empty, false
 	}
@@ -222,6 +233,7 @@ func (tr *BTreeG[T]) setHint(item T, hint *PathHint) (prev T, replaced bool) {
 		*tr.root.children = append([]*node[T]{}, left, right)
 		tr.root.items = append([]T{}, median)
 		tr.root.updateCount()
+		tr.reaugNode(tr.root)
 		return tr.setHint(item, hint)
 	}
 	if replaced {
@@ -247,6 +259,7 @@ func (tr *BTreeG[T]) nodeSplit(n *node[T]) (right *node[T], median T) {
 		*right.children = (*n.children)[i+1:]
 	}
 	right.updateCount()
+	tr.reaugNode(right)
 
 	// left node
 	n.items[i] = tr.empty
@@ -255,6 +268,7 @@ func (tr *BTreeG[T]) nodeSplit(n *node[T]) (right *node[T], median T) {
 		*n.children = (*n.children)[: i+1 : i+1]
 	}
 	n.updateCount()
+	tr.reaugNode(n)
 
 	return right, median
 }
@@ -268,11 +282,22 @@ func (n *node[T]) updateCount() {
 	}
 }
 
+// reaugNode recomputes the augmented information of a node from its items
+// and children. No-op for plain trees. Callers must invoke this after the
+// node's items or children have changed (inserts, deletes, splits,
+// rotations and merges), bottom-up, so that the augmentation stays valid.
+func (tr *BTreeG[T]) reaugNode(n *node[T]) {
+	if tr.reaug != nil {
+		tr.reaug(n)
+	}
+}
+
 // Copy the node for safe isolation.
 func (tr *BTreeG[T]) copy(n *node[T]) *node[T] {
 	n2 := new(node[T])
 	n2.isoid = tr.isoid
 	n2.count = n.count
+	n2.meta = n.meta
 	n2.items = make([]T, len(n.items), cap(n.items))
 	copy(n2.items, n.items)
 	if tr.copyItems {
@@ -317,6 +342,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 	if found {
 		prev = n.items[i]
 		n.items[i] = item
+		tr.reaugNode(n)
 		return prev, true, false
 	}
 	if n.leaf() {
@@ -327,6 +353,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 		copy(n.items[i+1:], n.items[i:])
 		n.items[i] = item
 		n.count++
+		tr.reaugNode(n)
 		return tr.empty, false, false
 	}
 	prev, replaced, split = tr.nodeSet(&(*n.children)[i], item, hint, depth+1)
@@ -346,6 +373,7 @@ func (tr *BTreeG[T]) nodeSet(cn **node[T], item T,
 	if !replaced {
 		n.count++
 	}
+	tr.reaugNode(n)
 	return prev, replaced, false
 }
 
@@ -508,6 +536,9 @@ restart:
 				stack[k].node.count -= j
 			}
 			tr.count -= j
+			for k := len(stack) - 1; k >= 0; k-- {
+				tr.reaugNode(stack[k].node)
+			}
 			if act == Stop {
 				return
 			}
@@ -528,6 +559,9 @@ restart:
 					}
 					tr.count--
 					i--
+					for k := len(stack) - 1; k >= 0; k-- {
+						tr.reaugNode(stack[k].node)
+					}
 				} else {
 					pivot = n.items[i]
 					tr.deleteHint(n.items[i], &hint)
@@ -763,6 +797,9 @@ restart:
 					stack[k].node.count -= dnode.count + 1
 				}
 				tr.count -= dnode.count + 1
+				for k := len(stack) - 1; k >= 0; k-- {
+					tr.reaugNode(stack[k].node)
+				}
 				if extract {
 					deleted.append(ditem, dnode)
 				}
@@ -812,6 +849,9 @@ restart:
 				stack[k].node.count -= j
 			}
 			tr.count -= j
+			for k := len(stack) - 1; k >= 0; k-- {
+				tr.reaugNode(stack[k].node)
+			}
 			if stop {
 				return *deleted
 			}
@@ -832,6 +872,9 @@ restart:
 					stack[j].node.count--
 				}
 				tr.count--
+				for k := len(stack) - 1; k >= 0; k-- {
+					tr.reaugNode(stack[k].node)
+				}
 				i--
 			} else {
 				pivot = n.items[i]
@@ -918,6 +961,7 @@ func (tr *BTreeG[T]) delete(cn **node[T], max bool, key T,
 			n.items[len(n.items)-1] = tr.empty
 			n.items = n.items[:len(n.items)-1]
 			n.count--
+			tr.reaugNode(n)
 			return prev, true
 		}
 		return tr.empty, false
@@ -945,6 +989,7 @@ func (tr *BTreeG[T]) delete(cn **node[T], max bool, key T,
 	if len((*n.children)[i].items) < tr.min {
 		tr.nodeRebalance(n, i)
 	}
+	tr.reaugNode(n)
 	return prev, true
 }
 
@@ -983,6 +1028,7 @@ func (tr *BTreeG[T]) nodeRebalance(n *node[T], i int) {
 		copy((*n.children)[i+1:], (*n.children)[i+2:])
 		(*n.children)[len(*n.children)-1] = nil
 		(*n.children) = (*n.children)[:len(*n.children)-1]
+		tr.reaugNode(left)
 	} else if len(left.items) > len(right.items) {
 		// move left -> right over one slot
 
@@ -1008,6 +1054,8 @@ func (tr *BTreeG[T]) nodeRebalance(n *node[T], i int) {
 			left.count -= (*right.children)[0].count
 			right.count += (*right.children)[0].count
 		}
+		tr.reaugNode(left)
+		tr.reaugNode(right)
 	} else {
 		// move left <- right over one slot
 
@@ -1028,6 +1076,8 @@ func (tr *BTreeG[T]) nodeRebalance(n *node[T], i int) {
 			left.count += (*left.children)[len(*left.children)-1].count
 			right.count -= (*left.children)[len(*left.children)-1].count
 		}
+		tr.reaugNode(left)
+		tr.reaugNode(right)
 	}
 }
 
@@ -1202,6 +1252,7 @@ func (tr *BTreeG[T]) Load(item T) (T, bool) {
 		return tr.setHint(item, nil)
 	}
 	n := tr.isoLoad(&tr.root, true)
+	var spine []*node[T]
 	for {
 		n.count++ // optimistically update counts
 		if n.leaf() {
@@ -1209,11 +1260,16 @@ func (tr *BTreeG[T]) Load(item T) (T, bool) {
 				if tr.Less(n.items[len(n.items)-1], item) {
 					n.items = append(n.items, item)
 					tr.count++
+					tr.reaugNode(n)
+					for i := len(spine) - 1; i >= 0; i-- {
+						tr.reaugNode(spine[i])
+					}
 					return tr.empty, false
 				}
 			}
 			break
 		}
+		spine = append(spine, n)
 		n = tr.isoLoad(&(*n.children)[len(*n.children)-1], true)
 	}
 	// revert the counts
@@ -1291,7 +1347,9 @@ func (tr *BTreeG[T]) PopMin() (T, bool) {
 	}
 	n := tr.isoLoad(&tr.root, true)
 	var item T
+	var spine []*node[T]
 	for {
+		spine = append(spine, n)
 		n.count-- // optimistically update counts
 		if n.leaf() {
 			item = n.items[0]
@@ -1302,6 +1360,9 @@ func (tr *BTreeG[T]) PopMin() (T, bool) {
 			n.items[len(n.items)-1] = tr.empty
 			n.items = n.items[:len(n.items)-1]
 			tr.count--
+			for i := len(spine) - 1; i >= 0; i-- {
+				tr.reaugNode(spine[i])
+			}
 			if tr.count == 0 {
 				tr.root = nil
 			}
@@ -1332,7 +1393,9 @@ func (tr *BTreeG[T]) PopMax() (T, bool) {
 	}
 	n := tr.isoLoad(&tr.root, true)
 	var item T
+	var spine []*node[T]
 	for {
+		spine = append(spine, n)
 		n.count-- // optimistically update counts
 		if n.leaf() {
 			item = n.items[len(n.items)-1]
@@ -1342,6 +1405,9 @@ func (tr *BTreeG[T]) PopMax() (T, bool) {
 			n.items[len(n.items)-1] = tr.empty
 			n.items = n.items[:len(n.items)-1]
 			tr.count--
+			for i := len(spine) - 1; i >= 0; i-- {
+				tr.reaugNode(spine[i])
+			}
 			if tr.count == 0 {
 				tr.root = nil
 			}
@@ -1405,10 +1471,12 @@ func (tr *BTreeG[T]) DeleteAt(index int) (T, bool) {
 	}
 	var pathbuf [8]uint8 // track the path
 	path := pathbuf[:0]
+	var pathNodes []*node[T]
 	var item T
 	n := tr.isoLoad(&tr.root, true)
 outer:
 	for {
+		pathNodes = append(pathNodes, n)
 		n.count-- // optimistically update counts
 		if n.leaf() {
 			// the index is the item position
@@ -1421,6 +1489,9 @@ outer:
 			n.items[len(n.items)-1] = tr.empty
 			n.items = n.items[:len(n.items)-1]
 			tr.count--
+			for i := len(pathNodes) - 1; i >= 0; i-- {
+				tr.reaugNode(pathNodes[i])
+			}
 			if tr.count == 0 {
 				tr.root = nil
 			}
