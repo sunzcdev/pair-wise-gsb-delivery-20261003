@@ -32,6 +32,19 @@ var (
 	// Deprecated: Use the error variables defined in the bbolt/errors package.
 	ErrChecksum = errors.ErrChecksum
 
+	// ErrPageChecksum is returned when the checksum trailer of a leaf, branch
+	// or freelist page block mismatches its contents in a page-checksumming
+	// database.
+	//
+	// Deprecated: Use the error variables defined in the bbolt/errors package.
+	ErrPageChecksum = errors.ErrPageChecksum
+
+	// ErrPageChecksumNotSupported is returned when Options.PageChecksum is set
+	// while opening an existing legacy (version 2) database.
+	//
+	// Deprecated: Use the error variables defined in the bbolt/errors package.
+	ErrPageChecksumNotSupported = errors.ErrPageChecksumNotSupported
+
 	// ErrTimeout is returned when a database cannot obtain an exclusive lock
 	// on the data file after the timeout passed to Open().
 	//

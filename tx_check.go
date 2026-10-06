@@ -2,8 +2,10 @@ package bbolt
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 
+	berrors "go.etcd.io/bbolt/errors"
 	"go.etcd.io/bbolt/internal/common"
 )
 
@@ -42,7 +44,10 @@ func (tx *Tx) check(cfg checkConfig, ch chan error) {
 		}
 	}()
 	// Force loading free list if opened in ReadOnly mode.
-	tx.db.loadFreelist()
+	if err := tx.db.loadFreelist(); err != nil {
+		ch <- err
+		return
+	}
 
 	// Check if any pages are double freed.
 	freed := make(map[common.Pgid]bool)
@@ -77,6 +82,16 @@ func (tx *Tx) check(cfg checkConfig, ch chan error) {
 				ch <- fmt.Errorf("page %d: unreachable unfreed", int(i))
 			}
 		}
+
+		// In a checksumming database validate the checksum trailer of every
+		// reachable on-disk block (leaf, branch and freelist, including their
+		// overflow pages). Dirty blocks constructed by the current write
+		// transaction are not sealed yet and point into the transaction's
+		// private buffers, so they are skipped here; their checksums are
+		// sealed and validated on the write path instead.
+		if tx.db.pageChecksum {
+			tx.verifyReachablePageChecksums(reachable, ch)
+		}
 	} else {
 		// Check the db file starting from a specified pageId.
 		if cfg.pageId < 2 || cfg.pageId >= uint64(tx.meta.Pgid()) {
@@ -90,19 +105,24 @@ func (tx *Tx) check(cfg checkConfig, ch chan error) {
 
 func (tx *Tx) recursivelyCheckPage(pageId common.Pgid, reachable map[common.Pgid]*common.Page, freed map[common.Pgid]bool,
 	kvStringer KVStringer, ch chan error) {
-	tx.checkInvariantProperties(pageId, reachable, freed, kvStringer, ch)
-	tx.recursivelyCheckBucketInPage(pageId, reachable, freed, kvStringer, ch)
+	guardPageChecksumPanic(pageId, ch, func() {
+		tx.checkInvariantProperties(pageId, reachable, freed, kvStringer, ch)
+		tx.recursivelyCheckBucketInPage(pageId, reachable, freed, kvStringer, ch)
+	})
 }
 
 func (tx *Tx) recursivelyCheckBucketInPage(pageId common.Pgid, reachable map[common.Pgid]*common.Page, freed map[common.Pgid]bool,
 	kvStringer KVStringer, ch chan error) {
-	p := tx.page(pageId)
+	var p *common.Page
+	if !guardPageChecksumPanic(pageId, ch, func() { p = tx.page(pageId) }) {
+		return
+	}
 
 	switch {
 	case p.IsBranchPage():
 		for i := range p.BranchPageElements() {
 			elem := p.BranchPageElement(uint16(i))
-			tx.recursivelyCheckBucketInPage(elem.Pgid(), reachable, freed, kvStringer, ch)
+			tx.guardRecursivelyCheckBucketInPage(elem.Pgid(), reachable, freed, kvStringer, ch)
 		}
 	case p.IsLeafPage():
 		for i := range p.LeafPageElements() {
@@ -125,6 +145,31 @@ func (tx *Tx) recursivelyCheckBucketInPage(pageId common.Pgid, reachable map[com
 	}
 }
 
+func (tx *Tx) guardRecursivelyCheckBucketInPage(pageId common.Pgid, reachable map[common.Pgid]*common.Page,
+	freed map[common.Pgid]bool, kvStringer KVStringer, ch chan error) {
+	guardPageChecksumPanic(pageId, ch, func() {
+		tx.recursivelyCheckBucketInPage(pageId, reachable, freed, kvStringer, ch)
+	})
+}
+
+// guardPageChecksumPanic runs fn and converts a page checksum failure into a
+// channel error instead of letting it abort the whole Check run. It returns
+// false when such an error was reported.
+func guardPageChecksumPanic(pageId common.Pgid, ch chan error, fn func()) (completed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			if err, ok := r.(error); ok && errors.Is(err, berrors.ErrPageChecksum) {
+				ch <- err
+				completed = false
+				return
+			}
+			panic(r)
+		}
+	}()
+	fn()
+	return true
+}
+
 func (tx *Tx) recursivelyCheckBucket(b *Bucket, reachable map[common.Pgid]*common.Page, freed map[common.Pgid]bool,
 	kvStringer KVStringer, ch chan error) {
 	// Ignore inline buckets.
@@ -132,24 +177,28 @@ func (tx *Tx) recursivelyCheckBucket(b *Bucket, reachable map[common.Pgid]*commo
 		return
 	}
 
-	tx.checkInvariantProperties(b.RootPage(), reachable, freed, kvStringer, ch)
+	guardPageChecksumPanic(b.RootPage(), ch, func() {
+		tx.checkInvariantProperties(b.RootPage(), reachable, freed, kvStringer, ch)
 
-	// Check each bucket within this bucket.
-	_ = b.ForEachBucket(func(k []byte) error {
-		if child := b.Bucket(k); child != nil {
-			tx.recursivelyCheckBucket(child, reachable, freed, kvStringer, ch)
-		}
-		return nil
+		// Check each bucket within this bucket.
+		_ = b.ForEachBucket(func(k []byte) error {
+			if child := b.Bucket(k); child != nil {
+				tx.recursivelyCheckBucket(child, reachable, freed, kvStringer, ch)
+			}
+			return nil
+		})
 	})
 }
 
 func (tx *Tx) checkInvariantProperties(pageId common.Pgid, reachable map[common.Pgid]*common.Page, freed map[common.Pgid]bool,
 	kvStringer KVStringer, ch chan error) {
-	tx.forEachPage(pageId, func(p *common.Page, _ int, stack []common.Pgid) {
-		verifyPageReachable(p, tx.meta.Pgid(), stack, reachable, freed, ch)
-	})
+	guardPageChecksumPanic(pageId, ch, func() {
+		tx.forEachPage(pageId, func(p *common.Page, _ int, stack []common.Pgid) {
+			verifyPageReachable(p, tx.meta.Pgid(), stack, reachable, freed, ch)
+		})
 
-	tx.recursivelyCheckPageKeyOrder(pageId, kvStringer.KeyToString, ch)
+		tx.recursivelyCheckPageKeyOrder(pageId, kvStringer.KeyToString, ch)
+	})
 }
 
 func verifyPageReachable(p *common.Page, hwm common.Pgid, stack []common.Pgid, reachable map[common.Pgid]*common.Page, freed map[common.Pgid]bool, ch chan error) {

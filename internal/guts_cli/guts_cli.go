@@ -79,6 +79,14 @@ func WritePage(path string, pageBuf []byte) error {
 	if expectedLen != uint64(len(pageBuf)) {
 		return fmt.Errorf("WritePage: len(buf):%d != pageSize*(overflow+1):%d", len(pageBuf), expectedLen)
 	}
+	// Keep the page checksum trailer consistent when operating on a
+	// checksumming (version 3) database. The format version is read from the
+	// active meta page without mapping the file.
+	if checksummed, err := fileUsesPageChecksum(path); err != nil {
+		return err
+	} else if checksummed {
+		common.SealPageChecksum(page, int(pageSize))
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		return err
@@ -86,6 +94,16 @@ func WritePage(path string, pageBuf []byte) error {
 	defer f.Close()
 	_, err = f.WriteAt(pageBuf, int64(page.Id())*int64(pageSize))
 	return err
+}
+
+// fileUsesPageChecksum reports whether the active meta page indicates the
+// page checksumming format (version 3).
+func fileUsesPageChecksum(path string) (bool, error) {
+	m, _, err := GetActiveMetaPage(path)
+	if err != nil {
+		return false, err
+	}
+	return m.Version() >= common.PageChecksumVersion, nil
 }
 
 // ReadPageAndHWMSize reads Page size and HWM (id of the last+1 Page).

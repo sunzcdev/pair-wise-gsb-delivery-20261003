@@ -6,6 +6,7 @@
 ### BoltDB
 - [Fix version string not updated for v1.5.0 release](https://github.com/etcd-io/bbolt/pull/1230)
 - [Generate unified version output for both 'bbolt version' and 'bbolt -v'](https://github.com/etcd-io/bbolt/pull/1251)
+- Add opt-in per-page checksumming for newly created databases (`Options.PageChecksum`, format version 3). Leaf, branch and freelist blocks (including overflow continuations) carry an FNV-1a 64-bit trailer; legacy version 2 files are still read and written, and cannot be upgraded in place.
 
 <hr>
 

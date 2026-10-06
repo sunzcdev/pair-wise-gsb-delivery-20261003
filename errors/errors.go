@@ -24,6 +24,17 @@ var (
 	// ErrChecksum is returned when a checksum mismatch occurs on either of the two meta pages.
 	ErrChecksum = errors.New("checksum error")
 
+	// ErrPageChecksum is returned when the checksum trailer of a leaf, branch
+	// or freelist page block does not match its contents in a database created
+	// with page checksumming enabled.
+	ErrPageChecksum = errors.New("page checksum error")
+
+	// ErrPageChecksumNotSupported is returned when Options.PageChecksum is set
+	// while opening an existing database that was created without page
+	// checksumming (format version 2). Page checksumming can only be enabled
+	// for newly created databases; there is no in-place upgrade.
+	ErrPageChecksumNotSupported = errors.New("page checksum is not supported by the database format version")
+
 	// ErrTimeout is returned when a database cannot obtain an exclusive lock
 	// on the data file after the timeout passed to Open().
 	ErrTimeout = errors.New("timeout")

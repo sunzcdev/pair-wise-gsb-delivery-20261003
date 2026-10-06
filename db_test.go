@@ -168,9 +168,9 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 
 	// Rewrite meta pages.
 	meta0 := (*meta)(unsafe.Pointer(&buf[pageHeaderSize]))
-	meta0.version++
+	meta0.version = common.PageChecksumVersion + 1
 	meta1 := (*meta)(unsafe.Pointer(&buf[pageSize+pageHeaderSize]))
-	meta1.version++
+	meta1.version = common.PageChecksumVersion + 1
 	if err := os.WriteFile(path, buf, 0666); err != nil {
 		t.Fatal(err)
 	}

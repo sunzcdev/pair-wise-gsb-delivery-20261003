@@ -31,6 +31,7 @@ type Tx struct {
 	meta           *common.Meta
 	root           Bucket
 	pages          map[common.Pgid]*common.Page
+	verifiedBlocks map[common.Pgid]struct{}
 	stats          TxStats
 	commitHandlers []func()
 
@@ -61,6 +62,9 @@ func (tx *Tx) init(db *DB) {
 	if tx.writable {
 		tx.pages = make(map[common.Pgid]*common.Page)
 		tx.meta.IncTxid()
+	}
+	if db.pageChecksum {
+		tx.verifiedBlocks = make(map[common.Pgid]struct{})
 	}
 }
 
@@ -285,7 +289,7 @@ func (tx *Tx) Commit() (err error) {
 func (tx *Tx) commitFreelist() error {
 	// Allocate new pages for the new free list. This will overestimate
 	// the size of the freelist but not underestimate the size (which would be bad).
-	p, err := tx.allocate((tx.db.freelist.EstimatedWritePageSize() / tx.db.pageSize) + 1)
+	p, err := tx.allocate(tx.db.pagesNeededForPayload(tx.db.freelist.EstimatedWritePageSize()))
 	if err != nil {
 		tx.rollback()
 		return err
@@ -534,6 +538,14 @@ func (tx *Tx) write() error {
 		offset := int64(p.Id()) * int64(tx.db.pageSize)
 		var written uintptr
 
+		// Seal the checksum trailer before any byte is written. The pages
+		// were constructed by this transaction and have not been sealed yet,
+		// which is how their verification is distinguished from the
+		// verification of disk-backed pages after the database is reopened.
+		if tx.db.pageChecksum {
+			common.SealPageChecksum(p, tx.db.pageSize)
+		}
+
 		// Write out page in "max allocation" sized chunks.
 		for {
 			sz := rem
@@ -638,6 +650,21 @@ func (tx *Tx) page(id common.Pgid) *common.Page {
 	// Otherwise return directly from the mmap.
 	p := tx.db.page(id)
 	p.FastCheck(id)
+
+	// Verify the checksum trailer of a disk-backed block when page
+	// checksumming is enabled. The header of a block only (the first page of
+	// an overflow span) carries the type information, so overflow
+	// continuation pages are verified implicitly as part of their block.
+	// Dirty pages constructed by the current write transaction have no sealed
+	// trailer yet and are returned from tx.pages above, never from the mmap.
+	if tx.db.pageChecksum && id >= 2 {
+		if _, verified := tx.verifiedBlocks[p.Id()]; !verified {
+			if err := common.VerifyPageChecksum(p, tx.db.pageSize); err != nil {
+				panic(err)
+			}
+			tx.verifiedBlocks[p.Id()] = struct{}{}
+		}
+	}
 	return p
 }
 

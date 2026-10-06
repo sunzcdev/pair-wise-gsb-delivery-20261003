@@ -23,14 +23,31 @@ type Meta struct {
 
 // Validate checks the marker bytes and version of the meta page to ensure it matches this binary.
 func (m *Meta) Validate() error {
+	return m.validate(PageChecksumVersion)
+}
+
+// ValidateUpTo behaves like Validate but only accepts format versions up to
+// maxVersion. It is used to emulate older binaries that do not understand the
+// page checksumming format (version 3).
+func (m *Meta) ValidateUpTo(maxVersion uint32) error {
+	return m.validate(maxVersion)
+}
+
+func (m *Meta) validate(maxVersion uint32) error {
 	if m.magic != Magic {
 		return errors.ErrInvalid
-	} else if m.version != Version {
+	} else if m.version < Version || m.version > maxVersion {
 		return errors.ErrVersionMismatch
 	} else if m.checksum != m.Sum64() {
 		return errors.ErrChecksum
 	}
 	return nil
+}
+
+// PageChecksumEnabled reports whether the database represented by this meta
+// page uses the page checksumming format (version 3).
+func (m *Meta) PageChecksumEnabled() bool {
+	return m.version >= PageChecksumVersion
 }
 
 // Copy copies one meta object to another.

@@ -116,6 +116,13 @@ type DB struct {
 	// Supported only on Unix via mlock/munlock syscalls.
 	Mlock bool
 
+	// pageChecksum reports whether the on-file format uses page checksumming
+	// (format version 3). It is determined exclusively by the database format:
+	// it is true for newly created databases when Options.PageChecksum is set,
+	// and otherwise copied from the format of an existing database. There is
+	// no in-place upgrade between the two formats.
+	pageChecksum bool
+
 	logger Logger
 
 	path     string
@@ -161,6 +168,23 @@ func (db *DB) Path() string {
 	return db.path
 }
 
+// Version returns the on-file format version of the database. It returns 0 if
+// the database is not open. Version 2 is the legacy format; version 3 enables
+// page checksumming.
+func (db *DB) Version() uint32 {
+	if !db.opened || db.meta0 == nil {
+		return 0
+	}
+	return db.meta().Version()
+}
+
+// PageChecksum reports whether the database uses the page checksumming
+// format. The mode is fixed at creation time via Options.PageChecksum and
+// cannot be toggled on an existing database.
+func (db *DB) PageChecksum() bool {
+	return db.pageChecksum
+}
+
 // GoString returns the Go string representation of the database.
 func (db *DB) GoString() string {
 	return fmt.Sprintf("bolt.DB{path:%q}", db.path)
@@ -192,6 +216,7 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 	db.FreelistType = options.FreelistType
 	db.Mlock = options.Mlock
 	db.MaxSize = options.MaxSize
+	db.pageChecksum = options.PageChecksum
 
 	// Set default values for later DB operations.
 	db.MaxBatchSize = common.DefaultMaxBatchSize
@@ -300,8 +325,24 @@ func Open(path string, mode os.FileMode, options *Options) (db *DB, err error) {
 		return nil, err
 	}
 
+	// The effective checksumming mode is defined by the on-file format.
+	// Page checksumming can only be enabled for newly created databases, so
+	// requesting it on an existing version 2 database is rejected explicitly
+	// instead of silently downgrading the option.
+	db.pageChecksum = db.meta().PageChecksumEnabled()
+	if options.PageChecksum && !db.pageChecksum {
+		onDiskVersion := db.meta().Version()
+		_ = db.close()
+		lg.Errorf("page checksum requested but the existing db (%s) uses the legacy format version %d", path, onDiskVersion)
+		return nil, fmt.Errorf("opening db file (%s): %w", path, berrors.ErrPageChecksumNotSupported)
+	}
+
 	if db.PreLoadFreelist {
-		db.loadFreelist()
+		if err = db.loadFreelist(); err != nil {
+			_ = db.close()
+			lg.Errorf("failed to load freelist for db file (%s): %v", path, err)
+			return nil, err
+		}
 	}
 
 	if db.readOnly {
@@ -419,20 +460,44 @@ func (db *DB) getPageSizeFromSecondMeta() (int, bool, error) {
 // loadFreelist reads the freelist if it is synced, or reconstructs it
 // by scanning the DB if it is not synced. It assumes there are no
 // concurrent accesses being made to the freelist.
-func (db *DB) loadFreelist() {
+func (db *DB) loadFreelist() (err error) {
 	db.freelistLoad.Do(func() {
 		db.freelist = newFreelist(db.FreelistType)
 		if !db.hasSyncedFreelist() {
 			// Reconstruct free list by scanning the DB.
-			db.freelist.Init(db.freepages())
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("scan free pages: %v", r)
+					}
+				}()
+				db.freelist.Init(db.freepages())
+			}()
 		} else {
-			// Read free list from freelist page.
-			db.freelist.Read(db.page(db.meta().Freelist()))
+			// Read free list from freelist page. In a checksumming database
+			// validate the freelist block first so that silent corruption is
+			// reported as an error rather than a panic while parsing it.
+			p := db.page(db.meta().Freelist())
+			if db.pageChecksum {
+				if verifyErr := common.VerifyPageChecksum(p, db.pageSize); verifyErr != nil {
+					err = verifyErr
+					return
+				}
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("freelist page %d: %v", db.meta().Freelist(), r)
+					}
+				}()
+				db.freelist.Read(p)
+			}()
 		}
 		if db.stats != nil {
 			db.stats.FreePageN = db.freelist.FreeCount()
 		}
 	})
+	return err
 }
 
 func (db *DB) hasSyncedFreelist() bool {
@@ -654,7 +719,11 @@ func (db *DB) init() error {
 		// Initialize the meta page.
 		m := p.Meta()
 		m.SetMagic(common.Magic)
-		m.SetVersion(common.Version)
+		if db.pageChecksum {
+			m.SetVersion(common.PageChecksumVersion)
+		} else {
+			m.SetVersion(common.Version)
+		}
 		m.SetPageSize(uint32(db.pageSize))
 		m.SetFreelist(2)
 		m.SetRootBucket(common.NewInBucket(3, 0))
@@ -668,12 +737,18 @@ func (db *DB) init() error {
 	p.SetId(2)
 	p.SetFlags(common.FreelistPageFlag)
 	p.SetCount(0)
+	if db.pageChecksum {
+		common.SealPageChecksum(p, db.pageSize)
+	}
 
 	// Write an empty leaf page at page 4.
 	p = db.pageInBuffer(buf, common.Pgid(3))
 	p.SetId(3)
 	p.SetFlags(common.LeafPageFlag)
 	p.SetCount(0)
+	if db.pageChecksum {
+		common.SealPageChecksum(p, db.pageSize)
+	}
 
 	// Write the buffer to our data file.
 	if _, err := db.ops.writeAt(buf, 0); err != nil {
@@ -1079,6 +1154,15 @@ func (p panicked) Error() string {
 	return fmt.Sprintf("panic: %v", p.reason)
 }
 
+// Unwrap exposes a panic carried as an error so that errors.Is/As keep
+// working through errors recovered by Tx.Check and managed transactions.
+func (p panicked) Unwrap() error {
+	if err, ok := p.reason.(error); ok {
+		return err
+	}
+	return nil
+}
+
 func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -1159,6 +1243,23 @@ func (db *DB) meta() *common.Meta {
 	// This should never be reached, because both meta1 and meta0 were validated
 	// on mmap() and we do fsync() on every write.
 	panic("bolt.DB.meta(): invalid meta pages")
+}
+
+// pagesNeededForPayload returns the number of contiguous physical pages
+// required to hold payloadBytes of node/freelist data. A checksumming
+// database reserves PageTrailerSize bytes at the end of the resulting block,
+// so the payload capacity is one trailer short of count*pageSize.
+func (db *DB) pagesNeededForPayload(payloadBytes int) int {
+	if !db.pageChecksum {
+		return (payloadBytes + db.pageSize - 1) / db.pageSize
+	}
+	return (payloadBytes + common.PageTrailerSize + db.pageSize - 1) / db.pageSize
+}
+
+// usableBlockSize returns the payload capacity of a block spanning
+// overflow+1 pages.
+func (db *DB) usableBlockSize(overflow uint32) int {
+	return common.UsableBlockSize(db.pageSize, overflow, db.pageChecksum)
 }
 
 // allocate returns a contiguous block of memory starting at a given page.
@@ -1393,6 +1494,18 @@ type Options struct {
 	// return empty structure in this case. This can be beneficial for
 	// performance under high-concurrency read-only transactions.
 	NoStatistics bool
+
+	// PageChecksum enables per-page checksumming for a newly created
+	// database. When set, the database is written in format version 3 and
+	// every leaf, branch and freelist page block (including its overflow
+	// pages) carries an FNV-1a 64-bit checksum trailer that is verified when
+	// the block is read back.
+	//
+	// This option only takes effect when creating a new file. Opening an
+	// existing database ignores it and derives the mode from the file format;
+	// setting it to true on a legacy (version 2) database returns
+	// ErrPageChecksumNotSupported because there is no in-place upgrade.
+	PageChecksum bool
 }
 
 func (o *Options) String() string {
@@ -1400,8 +1513,8 @@ func (o *Options) String() string {
 		return "{}"
 	}
 
-	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t}",
-		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics)
+	return fmt.Sprintf("{Timeout: %s, NoGrowSync: %t, NoFreelistSync: %t, PreLoadFreelist: %t, FreelistType: %s, ReadOnly: %t, MmapFlags: %x, InitialMmapSize: %d, PageSize: %d, MaxSize: %d, NoSync: %t, OpenFile: %p, Mlock: %t, Logger: %p, NoStatistics: %t, PageChecksum: %t}",
+		o.Timeout, o.NoGrowSync, o.NoFreelistSync, o.PreLoadFreelist, o.FreelistType, o.ReadOnly, o.MmapFlags, o.InitialMmapSize, o.PageSize, o.MaxSize, o.NoSync, o.OpenFile, o.Mlock, o.Logger, o.NoStatistics, o.PageChecksum)
 
 }
 
