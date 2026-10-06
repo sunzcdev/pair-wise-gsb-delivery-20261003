@@ -45,6 +45,33 @@ Handles "List", "Stat", "Readlink" methods. Gathers/creates FileInfo structs
 with the data on the files and returns in a list (list of 1 for Stat and
 Readlink).
 
+## Local filesystem backend
+
+[LocalFileHandler] returns a complete set of [Handlers] backed by files on the
+local filesystem, confined to a single root directory:
+
+```go
+handlers, err := sftp.LocalFileHandler("/srv/sftp/root")
+if err != nil {
+    log.Fatal(err)
+}
+server := sftp.NewRequestServer(conn, handlers)
+```
+
+Every request path is resolved relative to the root by the operating system
+as part of the file operation itself, rather than by cleaning the path and
+comparing a string prefix. Consequently the backend is not vulnerable to a
+time-of-check/time-of-use swap: replacing a directory or a symlink between
+the request arriving and the file being opened cannot redirect a read, write,
+mkdir, remove, rename or link outside the root, even from another goroutine
+with local access. Relative symbolic links that resolve inside the root keep
+working, while absolute links and links that resolve outside the root are
+rejected. Both endpoints of rename and hard-link operations are confined.
+
+On platforms where the underlying `os.Root` cannot provide the full
+guarantee (plan9, js/wasm), the limitations are inherited from `os.Root`;
+see its documentation.
+
 
 ## TODO
 
