@@ -330,22 +330,44 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	OCSPStapling                 OCSPStaplingConfig      `yaml:"ocsp_stapling,omitempty" json:"ocsp_stapling,omitzero"`
 }
 
 type GRPCProbe struct {
-	Service             string           `yaml:"service,omitempty" json:"service,omitempty"`
-	TLS                 bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
-	TLSConfig           config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
-	CheckRevoked        bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
-	IPProtocolFallback  bool             `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
-	PreferredIPProtocol string           `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
-	Metadata            metadata.MD      `yaml:"metadata,omitempty" json:"metadata,omitempty"`
+	Service             string             `yaml:"service,omitempty" json:"service,omitempty"`
+	TLS                 bool               `yaml:"tls,omitempty" json:"tls,omitempty"`
+	TLSConfig           config.TLSConfig   `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
+	CheckRevoked        bool               `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	OCSPStapling        OCSPStaplingConfig `yaml:"ocsp_stapling,omitempty" json:"ocsp_stapling,omitzero"`
+	IPProtocolFallback  bool               `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
+	PreferredIPProtocol string             `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
+	Metadata            metadata.MD        `yaml:"metadata,omitempty" json:"metadata,omitempty"`
 }
 
 type HeaderMatch struct {
 	Header       string `yaml:"header,omitempty" json:"header,omitempty"`
 	Regexp       Regexp `yaml:"regexp,omitempty" json:"regexp,omitzero"`
 	AllowMissing bool   `yaml:"allow_missing,omitempty" json:"allow_missing,omitempty"`
+}
+
+// OCSPStaplingConfig configures verification of the OCSP response that the
+// TLS server staples to the handshake. The responder URL embedded in the
+// certificate is never contacted by the exporter.
+type OCSPStaplingConfig struct {
+	// Enabled inspects the stapled OCSP response and exports
+	// probe_ssl_ocsp_* metrics, without affecting probe_success.
+	Enabled bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	// Required additionally fails the probe unless the server staples a
+	// current, cryptographically valid OCSP response with "good" status.
+	Required bool `yaml:"required,omitempty" json:"required,omitempty"`
+}
+
+// Validate checks the OCSP stapling configuration on its own.
+func (s *OCSPStaplingConfig) Validate() error {
+	if s.Required && !s.Enabled {
+		return errors.New("ocsp_stapling.required can only be set when ocsp_stapling.enabled is true")
+	}
+	return nil
 }
 
 type Label struct {
@@ -362,20 +384,22 @@ type QueryResponse struct {
 }
 
 type TCPProbe struct {
-	IPProtocol         string           `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
-	IPProtocolFallback bool             `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
-	SourceIPAddress    string           `yaml:"source_ip_address,omitempty" json:"source_ip_address,omitempty"`
-	QueryResponse      []QueryResponse  `yaml:"query_response,omitempty" json:"query_response,omitempty"`
-	TLS                bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
-	TLSConfig          config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
-	CheckRevoked       bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	IPProtocol         string             `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
+	IPProtocolFallback bool               `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
+	SourceIPAddress    string             `yaml:"source_ip_address,omitempty" json:"source_ip_address,omitempty"`
+	QueryResponse      []QueryResponse    `yaml:"query_response,omitempty" json:"query_response,omitempty"`
+	TLS                bool               `yaml:"tls,omitempty" json:"tls,omitempty"`
+	TLSConfig          config.TLSConfig   `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
+	CheckRevoked       bool               `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	OCSPStapling       OCSPStaplingConfig `yaml:"ocsp_stapling,omitempty" json:"ocsp_stapling,omitzero"`
 }
 
 type UnixProbe struct {
-	QueryResponse []QueryResponse  `yaml:"query_response,omitempty" json:"query_response,omitempty"`
-	TLS           bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
-	TLSConfig     config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
-	CheckRevoked  bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	QueryResponse []QueryResponse    `yaml:"query_response,omitempty" json:"query_response,omitempty"`
+	TLS           bool               `yaml:"tls,omitempty" json:"tls,omitempty"`
+	TLSConfig     config.TLSConfig   `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
+	CheckRevoked  bool               `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	OCSPStapling  OCSPStaplingConfig `yaml:"ocsp_stapling,omitempty" json:"ocsp_stapling,omitzero"`
 }
 
 type ICMPProbe struct {
@@ -504,6 +528,10 @@ func (s *HTTPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 		}
 	}
 
+	if err := s.OCSPStapling.Validate(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -516,6 +544,12 @@ func (s *GRPCProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if s.CheckRevoked && !s.TLS {
 		return errors.New("check_revoked cannot be used when tls is false")
+	}
+	if err := s.OCSPStapling.Validate(); err != nil {
+		return err
+	}
+	if s.OCSPStapling.Enabled && !s.TLS {
+		return errors.New("ocsp_stapling cannot be used when tls is false")
 	}
 	return nil
 }
@@ -554,6 +588,12 @@ func (s *TCPProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
 	}
+	if err := s.OCSPStapling.Validate(); err != nil {
+		return err
+	}
+	if s.OCSPStapling.Enabled && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("ocsp_stapling cannot be used when tls is false and no query_response step uses starttls")
+	}
 	return nil
 }
 
@@ -576,6 +616,12 @@ func (s *UnixProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if s.CheckRevoked && !s.TLS && !usesStartTLS(s.QueryResponse) {
 		return errors.New("check_revoked cannot be used when tls is false and no query_response step uses starttls")
+	}
+	if err := s.OCSPStapling.Validate(); err != nil {
+		return err
+	}
+	if s.OCSPStapling.Enabled && !s.TLS && !usesStartTLS(s.QueryResponse) {
+		return errors.New("ocsp_stapling cannot be used when tls is false and no query_response step uses starttls")
 	}
 	return nil
 }

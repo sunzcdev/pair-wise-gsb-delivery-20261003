@@ -178,6 +178,14 @@ modules:
       tls_config:
         insecure_skip_verify: true
         ca_file: "/etc/blackbox_exporter/CA_cert.crt"
+  tcp_ocsp_required:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      tls: true
+      ocsp_stapling:
+        enabled: true
+        required: true
   icmp_example:
     prober: icmp
     timeout: 5s

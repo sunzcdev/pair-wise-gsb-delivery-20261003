@@ -4,7 +4,7 @@ BREAKING CHANGES:
 
 * [CHANGE]
 * [FEATURE]
-* [ENHANCEMENT]
+* [ENHANCEMENT] Add configurable verification of the TLS server's stapled OCSP response (`ocsp_stapling.enabled`/`required`) for the http, tcp, unix and grpc probers, with `probe_ssl_ocsp_*` metrics. The responder URL is never contacted.
 * [BUGFIX]
 * [BUGFIX] Randomize ICMP Echo ID in probes to avoid SNAT session collisions that could drop replies for some clients.
 

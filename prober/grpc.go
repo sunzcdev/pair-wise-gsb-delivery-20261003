@@ -203,6 +203,7 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 		healthCheckResponseGaugeVec.WithLabelValues(servingStatus).Set(float64(1))
 	}
 
+	ocspOK := true
 	if serverPeer != nil {
 		tlsInfo, tlsOk := serverPeer.AuthInfo.(credentials.TLSInfo)
 		if tlsOk {
@@ -212,6 +213,7 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 			probeTLSVersion.WithLabelValues(getTLSVersion(&tlsInfo.State)).Set(1)
 			probeSSLLastInformation.WithLabelValues(getFingerprint(&tlsInfo.State), getSubject(&tlsInfo.State), getIssuer(&tlsInfo.State), getDNSNames(&tlsInfo.State), getSerialNumber(&tlsInfo.State)).Set(1)
 			checkCRL(ctx, &tlsInfo.State, module.GRPC.CheckRevoked, nil, registry, logger)
+			ocspOK = checkOCSPStapling(&tlsInfo.State, module.GRPC.OCSPStapling, registry, logger)
 		} else {
 			isSSLGauge.Set(float64(0))
 		}
@@ -223,7 +225,7 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 		success = false
 	} else {
 		logger.Debug("connect the grpc server successfully")
-		success = true
+		success = ocspOK
 	}
 
 	return

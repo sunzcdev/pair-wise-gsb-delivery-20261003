@@ -1,0 +1,7 @@
+modules:
+  http_ocsp_required_not_enabled:
+    prober: http
+    timeout: 5s
+    http:
+      ocsp_stapling:
+        required: true

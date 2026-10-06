@@ -159,6 +159,13 @@ then a single address is selected to test, using the following logic:
   # CRLs are fetched using the proxy settings configured below.
   [ check_revoked: <boolean> | default = false ]
 
+  # Inspect the OCSP response that the TLS server staples to the handshake and
+  # emit probe_ssl_ocsp_* metrics (not_provided, good, revoked, unknown,
+  # expired, failed). The responder URL in the certificate is never contacted.
+  # ocsp_stapling:
+    #   [ enabled: <boolean> | default = false ]   # only collect status, never fails the probe
+    #   [ required: <boolean> | default = false ]  # fail the probe unless a current "good" response is stapled
+
   # The HTTP basic authentication credentials.
   basic_auth:
     [ username: <string> ]
@@ -271,6 +278,13 @@ tls_config:
 # Requires tls to be true, or a query_response step using starttls.
 [ check_revoked: <boolean> | default = false ]
 
+# Inspect the OCSP response stapled to the TLS handshake and emit
+# probe_ssl_ocsp_* metrics (not_provided, good, revoked, unknown, expired,
+# failed). The responder URL in the certificate is never contacted.
+# ocsp_stapling:
+  #   [ enabled: <boolean> | default = false ]   # only collect status, never fails the probe
+  #   [ required: <boolean> | default = false ]  # fail the probe unless a current "good" response is stapled
+
 ```
 
 ### `<unix_probe>`
@@ -307,6 +321,13 @@ tls_config:
 # an unreachable CRL leaves probe_success untouched. Alert on the metrics instead.
 # Requires tls to be true, or a query_response step using starttls.
 [ check_revoked: <boolean> | default = false ]
+
+# Inspect the OCSP response stapled to the TLS handshake and emit
+# probe_ssl_ocsp_* metrics (not_provided, good, revoked, unknown, expired,
+# failed). The responder URL in the certificate is never contacted.
+# ocsp_stapling:
+  #   [ enabled: <boolean> | default = false ]   # only collect status, never fails the probe
+  #   [ required: <boolean> | default = false ]  # fail the probe unless a current "good" response is stapled
 
 ```
 
@@ -439,6 +460,13 @@ tls_config:
 # an unreachable CRL leaves probe_success untouched. Alert on the metrics instead.
 # Requires tls to be true.
 [ check_revoked: <boolean> | default = false ]
+
+# Inspect the OCSP response stapled to the TLS handshake and emit
+# probe_ssl_ocsp_* metrics (not_provided, good, revoked, unknown, expired,
+# failed). The responder URL in the certificate is never contacted.
+# ocsp_stapling:
+  #   [ enabled: <boolean> | default = false ]   # only collect status, never fails the probe
+  #   [ required: <boolean> | default = false ]  # fail the probe unless a current "good" response is stapled
 ```
 
 ### `<websocket_probe>`

@@ -150,6 +150,7 @@ type crlCertOptions struct {
 	CommonName string
 	Serial     int64
 	CRLURL     string // CRL distribution point; empty means the cert has none
+	OCSPServer string // OCSP responder URL (AIA); empty means the cert has none
 	IsCA       bool   // CA certs are allowed to sign certificates and CRLs
 }
 
@@ -169,6 +170,9 @@ func generateCRLTestCert(t *testing.T, opts crlCertOptions, parent *x509.Certifi
 	}
 	if opts.CRLURL != "" {
 		template.CRLDistributionPoints = []string{opts.CRLURL}
+	}
+	if opts.OCSPServer != "" {
+		template.OCSPServer = []string{opts.OCSPServer}
 	}
 
 	key, err := rsa.GenerateKey(rand.Reader, 2048)

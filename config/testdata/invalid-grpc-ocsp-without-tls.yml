@@ -1,0 +1,8 @@
+modules:
+  grpc_ocsp_without_tls:
+    prober: grpc
+    timeout: 5s
+    grpc:
+      tls: false
+      ocsp_stapling:
+        enabled: true

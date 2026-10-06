@@ -1,0 +1,8 @@
+modules:
+  tcp_ocsp_without_tls:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      tls: false
+      ocsp_stapling:
+        enabled: true
