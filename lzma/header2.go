@@ -267,6 +267,24 @@ const (
 	stop  chunkState = 'T'
 )
 
+// String returns a string representation of the chunk state.
+func (c chunkState) String() string {
+	switch c {
+	case start:
+		return "start"
+	case stop:
+		return "stop"
+	case 'L':
+		return "lzma"
+	case 'R':
+		return "reset-required"
+	case 'U':
+		return "uncompressed"
+	default:
+		return "unknown"
+	}
+}
+
 // errors for the chunk state handling
 var (
 	errChunkType = errors.New("lzma: unexpected chunk type")
