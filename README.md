@@ -31,6 +31,7 @@
 
 #### Codecs
 - [RFC 3551](https://www.rfc-editor.org/rfc/rfc3551.html) — RTP Profile for PCMA/PCMU (G.711) and G.722 Audio
+- [RFC 4733](https://www.rfc-editor.org/rfc/rfc4733.html) — RTP Payload for DTMF Digits, Telephony Tones, and Telephony Signals
 - [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184.html) — RTP Payload Format for H.264 Video
 - [RFC 7587](https://www.rfc-editor.org/rfc/rfc7587.html) — RTP Payload Format for the Opus Audio Codec
 - [RFC 7741](https://www.rfc-editor.org/rfc/rfc7741.html) — RTP Payload Format for VP8 Video
