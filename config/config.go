@@ -330,6 +330,8 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	CheckOCSPStapling            bool                    `yaml:"check_ocsp_stapling,omitempty" json:"check_ocsp_stapling,omitempty"`
+	RequireOCSPStapling          bool                    `yaml:"require_ocsp_stapling,omitempty" json:"require_ocsp_stapling,omitempty"`
 }
 
 type GRPCProbe struct {
@@ -337,6 +339,8 @@ type GRPCProbe struct {
 	TLS                 bool             `yaml:"tls,omitempty" json:"tls,omitempty"`
 	TLSConfig           config.TLSConfig `yaml:"tls_config,omitempty" json:"tls_config,omitzero"`
 	CheckRevoked        bool             `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	CheckOCSPStapling   bool             `yaml:"check_ocsp_stapling,omitempty" json:"check_ocsp_stapling,omitempty"`
+	RequireOCSPStapling bool             `yaml:"require_ocsp_stapling,omitempty" json:"require_ocsp_stapling,omitempty"`
 	IPProtocolFallback  bool             `yaml:"ip_protocol_fallback,omitempty" json:"ip_protocol_fallback,omitempty"`
 	PreferredIPProtocol string           `yaml:"preferred_ip_protocol,omitempty" json:"preferred_ip_protocol,omitempty"`
 	Metadata            metadata.MD      `yaml:"metadata,omitempty" json:"metadata,omitempty"`
@@ -516,6 +520,9 @@ func (s *GRPCProbe) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	if s.CheckRevoked && !s.TLS {
 		return errors.New("check_revoked cannot be used when tls is false")
+	}
+	if (s.CheckOCSPStapling || s.RequireOCSPStapling) && !s.TLS {
+		return errors.New("check_ocsp_stapling and require_ocsp_stapling cannot be used when tls is false")
 	}
 	return nil
 }

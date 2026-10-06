@@ -752,6 +752,11 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(resp.TLS).Unix()))
 		probeSSLLastInformation.WithLabelValues(getFingerprint(resp.TLS), getSubject(resp.TLS), getIssuer(resp.TLS), getDNSNames(resp.TLS), getSerialNumber(resp.TLS)).Set(1)
 		checkCRL(ctx, resp.TLS, module.HTTP.CheckRevoked, &module.HTTP.HTTPClientConfig.ProxyConfig, registry, logger)
+		ocspResult := checkOCSP(resp.TLS, module.HTTP.CheckOCSPStapling || module.HTTP.RequireOCSPStapling, registry, logger)
+		if module.HTTP.RequireOCSPStapling && ocspResult.Status != ocspStatusGood {
+			logger.Error("Probe requires a valid stapled OCSP response", "status", ocspResult.Status, "err", ocspResult.Err)
+			success = false
+		}
 		if httpConfig.FailIfSSL {
 			logger.Error("Final request was over SSL")
 			success = false

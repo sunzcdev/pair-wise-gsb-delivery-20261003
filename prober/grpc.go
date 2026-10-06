@@ -79,6 +79,8 @@ func (c *gRPCHealthCheckClient) Check(ctx context.Context, service string, md me
 
 func ProbeGRPC(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (success bool) {
 
+	ocspStaplingOK := true
+
 	var (
 		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "probe_grpc_duration_seconds",
@@ -212,6 +214,11 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 			probeTLSVersion.WithLabelValues(getTLSVersion(&tlsInfo.State)).Set(1)
 			probeSSLLastInformation.WithLabelValues(getFingerprint(&tlsInfo.State), getSubject(&tlsInfo.State), getIssuer(&tlsInfo.State), getDNSNames(&tlsInfo.State), getSerialNumber(&tlsInfo.State)).Set(1)
 			checkCRL(ctx, &tlsInfo.State, module.GRPC.CheckRevoked, nil, registry, logger)
+			ocspResult := checkOCSP(&tlsInfo.State, module.GRPC.CheckOCSPStapling || module.GRPC.RequireOCSPStapling, registry, logger)
+			if module.GRPC.RequireOCSPStapling && ocspResult.Status != ocspStatusGood {
+				logger.Error("Probe requires a valid stapled OCSP response", "status", ocspResult.Status, "err", ocspResult.Err)
+				ocspStaplingOK = false
+			}
 		} else {
 			isSSLGauge.Set(float64(0))
 		}
@@ -224,6 +231,10 @@ func ProbeGRPC(ctx context.Context, target string, module config.Module, registr
 	} else {
 		logger.Debug("connect the grpc server successfully")
 		success = true
+	}
+
+	if !ocspStaplingOK {
+		success = false
 	}
 
 	return

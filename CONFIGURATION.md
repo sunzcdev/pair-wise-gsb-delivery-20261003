@@ -159,6 +159,14 @@ then a single address is selected to test, using the following logic:
   # CRLs are fetched using the proxy settings configured below.
   [ check_revoked: <boolean> | default = false ]
 
+  # Verify the OCSP response stapled by the server during the TLS handshake and emit
+  # probe_ssl_ocsp_* metrics. This only inspects the stapled response; the prober never
+  # queries the OCSP responder URLs from the certificate. With check_ocsp_stapling the
+  # status is only reported via metrics; require_ocsp_stapling additionally fails the
+  # probe unless a valid, unexpired "good" response is stapled.
+  [ check_ocsp_stapling: <boolean> | default = false ]
+  [ require_ocsp_stapling: <boolean> | default = false ]
+
   # The HTTP basic authentication credentials.
   basic_auth:
     [ username: <string> ]
@@ -439,6 +447,15 @@ tls_config:
 # an unreachable CRL leaves probe_success untouched. Alert on the metrics instead.
 # Requires tls to be true.
 [ check_revoked: <boolean> | default = false ]
+
+# Verify the OCSP response stapled by the server during the TLS handshake and emit
+# probe_ssl_ocsp_* metrics. This only inspects the stapled response; the prober never
+# queries the OCSP responder URLs from the certificate. With check_ocsp_stapling the
+# status is only reported via metrics; require_ocsp_stapling additionally fails the
+# probe unless a valid, unexpired "good" response is stapled.
+# Requires tls to be true.
+[ check_ocsp_stapling: <boolean> | default = false ]
+[ require_ocsp_stapling: <boolean> | default = false ]
 ```
 
 ### `<websocket_probe>`

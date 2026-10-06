@@ -136,6 +136,10 @@ func TestLoadBadConfigs(t *testing.T) {
 			input: "testdata/invalid-grpc-check-revoked-without-tls.yml",
 			want:  `error parsing config file: check_revoked cannot be used when tls is false`,
 		},
+		{
+			input: "testdata/invalid-grpc-require-ocsp-stapling-without-tls.yml",
+			want:  `error parsing config file: check_ocsp_stapling and require_ocsp_stapling cannot be used when tls is false`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {
