@@ -1664,6 +1664,7 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 			}
 		}
 
+		req.traceAttempt = attempts + 1
 		retry, err = c.do(req, resp)
 		if err == nil || !retry {
 			break
@@ -1841,7 +1842,7 @@ func (c *HostClient) SetMaxConns(newMaxConns int) {
 	c.connsLock.Unlock()
 }
 
-func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
+func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool, trace phaseTracker) (cc *clientConn, reused bool, err error) {
 	createConn := false
 	startCleaner := false
 
@@ -1875,17 +1876,20 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 			c.conns = c.conns[:n-1]
 		default:
 			c.connsLock.Unlock()
-			return nil, ErrConnPoolStrategyNotImpl
+			trace.gotConn(false, false, nil, ErrConnPoolStrategyNotImpl)
+			return nil, false, ErrConnPoolStrategyNotImpl
 		}
 	}
 	c.connsLock.Unlock()
 
 	if cc != nil {
-		return cc, nil
+		trace.gotConn(true, true, cc.c, nil)
+		return cc, true, nil
 	}
 	if !createConn {
 		if c.MaxConnWaitTimeout <= 0 {
-			return nil, ErrNoFreeConns
+			trace.gotConn(false, false, nil, ErrNoFreeConns)
+			return nil, false, ErrNoFreeConns
 		}
 
 		//nolint:dupword
@@ -1908,23 +1912,28 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 
 		w := &wantConn{
 			ready: make(chan struct{}, 1),
+			trace: trace,
 		}
-		defer func() {
-			if err != nil {
-				w.cancel(c, err)
-			}
-		}()
 
+		if trace.enabled() {
+			w.waitStart = trace.start(PhaseConnPoolWait)
+		}
+		waitStart := w.waitStart
 		c.queueForIdle(w)
 
 		select {
 		case <-w.ready:
-			return w.conn, w.err
+			trace.end(PhaseConnPoolWait, waitStart, w.err)
+			return w.conn, w.reused, w.err
 		case <-tc.C:
+			err = ErrNoFreeConns
 			if timeoutOverridden {
-				return nil, ErrTimeout
+				err = ErrTimeout
 			}
-			return nil, ErrNoFreeConns
+			trace.end(PhaseConnPoolWait, waitStart, err)
+			w.cancel(c, err)
+			trace.gotConn(false, false, nil, err)
+			return nil, false, err
 		}
 	}
 
@@ -1932,14 +1941,16 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		go c.connsCleaner()
 	}
 
-	conn, err := c.dialHostHard(reqTimeout)
+	conn, err := c.dialHostHard(reqTimeout, trace)
 	if err != nil {
 		c.decConnsCount()
-		return nil, err
+		trace.gotConn(false, false, nil, err)
+		return nil, false, err
 	}
 	cc = acquireClientConn(conn)
 
-	return cc, nil
+	trace.gotConn(false, false, conn, nil)
+	return cc, false, nil
 }
 
 func (c *HostClient) queueForIdle(w *wantConn) {
@@ -1953,7 +1964,7 @@ func (c *HostClient) queueForIdle(w *wantConn) {
 }
 
 func (c *HostClient) dialConnFor(w *wantConn) {
-	conn, err := c.dialHostHard(0)
+	conn, err := c.dialHostHard(0, w.trace)
 	if err != nil {
 		w.tryDeliver(nil, err)
 		c.decConnsCount()
@@ -2125,7 +2136,7 @@ func (c *HostClient) ReleaseConn(cc *clientConn) {
 		for q.len() > 0 {
 			w := q.popFront()
 			if w.waiting() {
-				delivered = w.tryDeliver(cc, nil)
+				delivered = w.deliverReused(cc)
 				// This is the last resort to hand over conCount sema.
 				// We must ensure that there are no valid waiters in connsWait
 				// when we exit this loop.
@@ -2246,7 +2257,7 @@ func (c *HostClient) nextAddr() string {
 	return addr
 }
 
-func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err error) {
+func (c *HostClient) dialHostHard(dialTimeout time.Duration, trace phaseTracker) (conn net.Conn, err error) {
 	// use dialTimeout to control the timeout of each dial. It does not work if dialTimeout is 0 or if
 	// c.DialTimeout has not been set and c.Dial has been set.
 	// attempt to dial all the available hosts before giving up.
@@ -2275,7 +2286,7 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 				continue
 			}
 		}
-		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout)
+		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout, trace)
 		if err == nil {
 			return conn, nil
 		}
@@ -2337,10 +2348,14 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, deadline time.T
 
 func dialAddr(
 	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool,
-	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration,
+	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration, trace phaseTracker,
 ) (net.Conn, error) {
 	deadline := time.Now().Add(writeTimeout)
-	conn, err := callDialFunc(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout)
+	// The default TCPDialer emits the DNS and connect phases itself via
+	// dialAddrTrace; a custom dial function performs an opaque connect (which
+	// may include its own name resolution), so it is timed as one connect
+	// phase and no DNS phase is produced.
+	conn, isTLSAlready, err := dialConn(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout, trace)
 	if err != nil {
 		return nil, err
 	}
@@ -2348,17 +2363,50 @@ func dialAddr(
 		return nil, errors.New("dialling unsuccessful: please report this bug")
 	}
 
-	// We assume that any conn that has the Handshake() method is a TLS conn already.
-	// This doesn't cover just tls.Conn but also other TLS implementations.
-	_, isTLSAlready := conn.(interface{ Handshake() error })
-
 	if isTLS && !isTLSAlready {
 		if writeTimeout == 0 {
+			if trace.enabled() {
+				// With no write deadline the handshake used to be lazy. Keep the
+				// phase semantics accurate by performing it eagerly only when
+				// tracing is on.
+				tlsConn := tls.Client(conn, tlsConfig)
+				tlsStart := trace.start(PhaseTLS)
+				if err := tlsConn.Handshake(); err != nil {
+					trace.end(PhaseTLS, tlsStart, err)
+					_ = conn.Close()
+					return nil, err
+				}
+				trace.end(PhaseTLS, tlsStart, nil)
+				return tlsConn, nil
+			}
 			return tls.Client(conn, tlsConfig), nil
 		}
-		return tlsClientHandshake(conn, tlsConfig, deadline)
+		tlsStart := trace.start(PhaseTLS)
+		tlsConn, err := tlsClientHandshake(conn, tlsConfig, deadline)
+		trace.end(PhaseTLS, tlsStart, err)
+		return tlsConn, err
 	}
 	return conn, nil
+}
+
+// dialConn establishes the raw transport connection and reports whether the
+// returned connection already carries TLS.
+func dialConn(
+	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool,
+	dialTimeout time.Duration, trace phaseTracker,
+) (conn net.Conn, isTLSAlready bool, err error) {
+	if trace.enabled() && dial == nil && dialWithTimeout == nil {
+		return dialDefaultTrace(addr, dialDualStack, isTLS, dialTimeout, trace)
+	}
+
+	connectStart := trace.start(PhaseConnect)
+	conn, err = callDialFunc(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout)
+	trace.end(PhaseConnect, connectStart, err)
+	if err != nil || conn == nil {
+		return conn, false, err
+	}
+	_, isTLSAlready = conn.(interface{ Handshake() error })
+	return conn, isTLSAlready, nil
 }
 
 func callDialFunc(
@@ -2421,10 +2469,13 @@ func AddMissingPort(addr string, isTLS bool) string {
 //
 // Inspired by net/http/transport.go.
 type wantConn struct {
-	err   error
-	ready chan struct{}
-	conn  *clientConn
-	mu    sync.Mutex // protects conn, err, close(ready)
+	err       error
+	ready     chan struct{}
+	conn      *clientConn
+	reused    bool
+	trace     phaseTracker
+	waitStart time.Time
+	mu        sync.Mutex // protects conn, err, close(ready)
 }
 
 // waiting reports whether w is still waiting for an answer (connection or error).
@@ -2439,6 +2490,15 @@ func (w *wantConn) waiting() bool {
 
 // tryDeliver attempts to deliver conn, err to w and reports whether it succeeded.
 func (w *wantConn) tryDeliver(conn *clientConn, err error) bool {
+	return w.deliver(conn, false, err)
+}
+
+// deliverReused hands an idle (reused) connection to w.
+func (w *wantConn) deliverReused(conn *clientConn) bool {
+	return w.deliver(conn, true, nil)
+}
+
+func (w *wantConn) deliver(conn *clientConn, reused bool, err error) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -2447,10 +2507,16 @@ func (w *wantConn) tryDeliver(conn *clientConn, err error) bool {
 	}
 	w.conn = conn
 	w.err = err
+	w.reused = reused
 	if w.conn == nil && w.err == nil {
 		panic("fasthttp: internal error: misuse of tryDeliver")
 	}
 	close(w.ready)
+	if w.err == nil && w.conn != nil {
+		w.trace.gotConn(reused, reused, w.conn.c, nil)
+	} else {
+		w.trace.gotConn(false, false, nil, w.err)
+	}
 	return true
 }
 
@@ -3073,7 +3139,7 @@ func (c *pipelineConnClient) worker(chs *pipelineConnChannels) error {
 			return err
 		}
 	}
-	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout)
+	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout, phaseTracker{})
 	if err != nil {
 		return err
 	}
@@ -3412,7 +3478,9 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		deadline = time.Now().Add(req.timeout)
 	}
 
-	cc, err := hc.AcquireConn(req.timeout, req.ConnectionClose())
+	trace := phaseTracker{hooks: req.traceHooks, attempt: req.traceAttempt}
+
+	cc, _, err := hc.AcquireConn(req.timeout, req.ConnectionClose(), trace)
 	if err != nil {
 		return false, err
 	}
@@ -3440,6 +3508,10 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	bw := hc.AcquireWriter(conn)
+	var writeStart time.Time
+	if trace.enabled() {
+		writeStart = trace.start(PhaseWriteRequest)
+	}
 	err = req.Write(bw)
 
 	if resetConnection {
@@ -3455,6 +3527,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
 		err = ErrTimeout
 	}
+	trace.end(PhaseWriteRequest, writeStart, err)
 
 	if err != nil {
 		hc.CloseConn(cc)
@@ -3482,6 +3555,22 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	br := hc.AcquireReader(conn)
+	if trace.enabled() {
+		ttfbStart := trace.start(PhaseWaitResponse)
+		// Block until the first response byte arrives so the wait is measured
+		// separately from parsing; Peek does not consume the byte.
+		if _, peekErr := br.Peek(1); peekErr != nil {
+			if x, ok := peekErr.(interface{ Timeout() bool }); ok && x.Timeout() {
+				peekErr = ErrTimeout
+			}
+			trace.end(PhaseWaitResponse, ttfbStart, peekErr)
+			hc.ReleaseReader(br)
+			hc.CloseConn(cc)
+			needRetry := peekErr != ErrBodyTooLarge
+			return needRetry, peekErr
+		}
+		trace.end(PhaseWaitResponse, ttfbStart, nil)
+	}
 	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
 	if err != nil {
 		hc.ReleaseReader(br)

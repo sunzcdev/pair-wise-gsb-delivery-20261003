@@ -119,6 +119,22 @@ func DialDualStackTimeout(addr string, timeout time.Duration) (net.Conn, error) 
 
 var defaultDialer = &TCPDialer{Concurrency: 1000}
 
+// dialDefaultTrace dials through the package default TCPDialer while emitting
+// DNS and connect phases on trace. It is used by the client when no custom
+// Dial/DialTimeout function is configured. A zero timeout falls back to the
+// default dial timeout, matching the untraced path.
+func dialDefaultTrace(addr string, dualStack, isTLS bool, timeout time.Duration, trace phaseTracker) (net.Conn, bool, error) {
+	if timeout <= 0 {
+		timeout = DefaultDialTimeout
+	}
+	conn, err := defaultDialer.dialTrace(AddMissingPort(addr, isTLS), dualStack, timeout, trace)
+	if err != nil {
+		return nil, false, err
+	}
+	_, isTLSAlready := conn.(interface{ Handshake() error })
+	return conn, isTLSAlready, nil
+}
+
 // Resolver represents interface of the tcp resolver.
 type Resolver interface {
 	LookupIPAddr(context.Context, string) (names []net.IPAddr, err error)
@@ -164,6 +180,15 @@ type TCPDialer struct {
 
 	// DisableDNSResolution may be used to disable DNS resolution
 	DisableDNSResolution bool
+
+	// NetDial optionally overrides the low-level TCP connection establishment
+	// after addresses are resolved. It receives the resolved address (already
+	// containing host and port) and must return a connected TCP connection.
+	//
+	// It is useful for controlling dial behavior in tests or for wrapping the
+	// underlying net.Dialer; DNS resolution timing is still reported
+	// separately. The default net.Dialer is used when NetDial is nil.
+	NetDial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // Dial dials the given TCP addr using tcp4.
@@ -190,7 +215,7 @@ type TCPDialer struct {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) Dial(addr string) (net.Conn, error) {
-	return d.dial(addr, false, DefaultDialTimeout)
+	return d.dialTrace(addr, false, DefaultDialTimeout, phaseTracker{})
 }
 
 // DialTimeout dials the given TCP addr using tcp4 using the given timeout.
@@ -215,7 +240,7 @@ func (d *TCPDialer) Dial(addr string) (net.Conn, error) {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	return d.dial(addr, false, timeout)
+	return d.dialTrace(addr, false, timeout, phaseTracker{})
 }
 
 // DialDualStack dials the given TCP addr using both tcp4 and tcp6.
@@ -243,7 +268,7 @@ func (d *TCPDialer) DialTimeout(addr string, timeout time.Duration) (net.Conn, e
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialDualStack(addr string) (net.Conn, error) {
-	return d.dial(addr, true, DefaultDialTimeout)
+	return d.dialTrace(addr, true, DefaultDialTimeout, phaseTracker{})
 }
 
 // DialDualStackTimeout dials the given TCP addr using both tcp4 and tcp6
@@ -269,7 +294,49 @@ func (d *TCPDialer) DialDualStack(addr string) (net.Conn, error) {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialDualStackTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	return d.dial(addr, true, timeout)
+	return d.dialTrace(addr, true, timeout, phaseTracker{})
+}
+
+// dialTrace is dial with per-request phase tracing. When trace is disabled it
+// behaves exactly like dial.
+func (d *TCPDialer) dialTrace(addr string, dualStack bool, timeout time.Duration, trace phaseTracker) (net.Conn, error) {
+	d.once.Do(func() {
+		if d.Concurrency > 0 {
+			d.concurrencyCh = make(chan struct{}, d.Concurrency)
+		}
+
+		if d.DNSCacheDuration == 0 {
+			d.DNSCacheDuration = DefaultDNSCacheDuration
+		}
+	})
+	deadline := time.Now().Add(timeout)
+	network := "tcp4"
+	if dualStack {
+		network = "tcp"
+	}
+	if d.DisableDNSResolution {
+		return d.tryDialTrace(network, addr, deadline, d.concurrencyCh, trace)
+	}
+	dnsStart := trace.start(PhaseDNS)
+	addrs, idx, err := d.getTCPAddrs(addr, dualStack, deadline)
+	trace.end(PhaseDNS, dnsStart, err)
+	if err != nil {
+		return nil, err
+	}
+	d.startTCPAddrsClean()
+	var conn net.Conn
+	n := uint32(len(addrs)) // #nosec G115
+	for range n {
+		conn, err = d.tryDialTrace(network, addrs[idx%n].String(), deadline, d.concurrencyCh, trace)
+		if err == nil {
+			return conn, nil
+		}
+		if errors.Is(err, ErrDialTimeout) {
+			return nil, err
+		}
+		idx++
+	}
+	return nil, err
 }
 
 // FlushDNSCache clears all cached DNS entries, forcing fresh DNS lookups on subsequent dials.
@@ -288,46 +355,9 @@ func FlushDNSCache() {
 	defaultDialer.FlushDNSCache()
 }
 
-func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (net.Conn, error) {
-	d.once.Do(func() {
-		if d.Concurrency > 0 {
-			d.concurrencyCh = make(chan struct{}, d.Concurrency)
-		}
-
-		if d.DNSCacheDuration == 0 {
-			d.DNSCacheDuration = DefaultDNSCacheDuration
-		}
-	})
-	deadline := time.Now().Add(timeout)
-	network := "tcp4"
-	if dualStack {
-		network = "tcp"
-	}
-	if d.DisableDNSResolution {
-		return d.tryDial(network, addr, deadline, d.concurrencyCh)
-	}
-	addrs, idx, err := d.getTCPAddrs(addr, dualStack, deadline)
-	if err != nil {
-		return nil, err
-	}
-	d.startTCPAddrsClean()
-	var conn net.Conn
-	n := uint32(len(addrs)) // #nosec G115
-	for range n {
-		conn, err = d.tryDial(network, addrs[idx%n].String(), deadline, d.concurrencyCh)
-		if err == nil {
-			return conn, nil
-		}
-		if errors.Is(err, ErrDialTimeout) {
-			return nil, err
-		}
-		idx++
-	}
-	return nil, err
-}
-
-func (d *TCPDialer) tryDial(
+func (d *TCPDialer) tryDialTrace(
 	network string, addr string, deadline time.Time, concurrencyCh chan struct{},
+	trace phaseTracker,
 ) (net.Conn, error) {
 	timeout := time.Until(deadline)
 	if timeout <= 0 {
@@ -353,14 +383,21 @@ func (d *TCPDialer) tryDial(
 		defer func() { <-concurrencyCh }()
 	}
 
-	dialer := net.Dialer{}
-	if d.LocalAddr != nil {
-		dialer.LocalAddr = d.LocalAddr
-	}
-
 	ctx, cancelCtx := context.WithDeadline(context.Background(), deadline)
 	defer cancelCtx()
-	conn, err := dialer.DialContext(ctx, network, addr)
+	connectStart := trace.start(PhaseConnect)
+	var conn net.Conn
+	var err error
+	if d.NetDial != nil {
+		conn, err = d.NetDial(ctx, network, addr)
+	} else {
+		dialer := net.Dialer{}
+		if d.LocalAddr != nil {
+			dialer.LocalAddr = d.LocalAddr
+		}
+		conn, err = dialer.DialContext(ctx, network, addr)
+	}
+	trace.end(PhaseConnect, connectStart, err)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, wrapDialWithUpstream(ErrDialTimeout, addr)

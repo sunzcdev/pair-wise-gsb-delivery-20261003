@@ -64,6 +64,14 @@ type Request struct {
 
 	secureErrorLogMessage bool
 
+	// traceHooks, when non-nil, enables per-request client phase tracing.
+	// It is set only through SetTraceHooks and is never copied by CopyTo.
+	traceHooks TraceHooks
+
+	// traceAttempt is the 1-based index of the in-flight attempt within the
+	// current HostClient.Do call, used to group trace events per retry.
+	traceAttempt int
+
 	// Group bool members in order to reduce Request object size.
 	parsedURI      bool
 	parsedPostArgs bool
@@ -1324,6 +1332,7 @@ func (req *Request) Reset() {
 	req.resetSkipHeader()
 	req.timeout = 0
 	req.forceResponseBodyBuffering = false
+	req.traceHooks = nil
 	req.UseHostHeader = false
 	req.DisableRedirectPathNormalizing = false
 }
@@ -3121,4 +3130,31 @@ func readCrLf(r *bufio.Reader) error {
 //	c.DoTimeout(&req, &resp, t)
 func (req *Request) SetTimeout(t time.Duration) {
 	req.timeout = t
+}
+
+// SetTraceHooks enables per-request client phase tracing and returns the
+// request so the call can be chained. Passing nil disables tracing again.
+//
+// Tracing is opt-in per request: a request without hooks incurs no tracing
+// overhead. The hooks observe connection-pool waiting, DNS resolution,
+// dialing, TLS handshake, request writing and the wait for the first response
+// byte, and keep separate events for each retry attempt.
+//
+// The provided hooks are not called concurrently for a single attempt's
+// request/response phases, but connection establishment may be reported from
+// another goroutine when the pool dials for a queued waiter; implementations
+// must therefore be safe for concurrent use. A panic inside hooks is recovered
+// and never affects the request result, retries, or connection pooling.
+//
+// The hooks (and any data they keep) must not retain the Request or Response;
+// those objects and their buffers are reused after the call. Use the copied
+// values delivered in TraceEvent and GotConnInfo instead.
+func (req *Request) SetTraceHooks(hooks TraceHooks) *Request {
+	req.traceHooks = hooks
+	return req
+}
+
+// TraceHooks returns the hooks installed with SetTraceHooks, or nil.
+func (req *Request) TraceHooks() TraceHooks {
+	return req.traceHooks
 }

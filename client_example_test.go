@@ -44,6 +44,33 @@ func useResponseBody(body []byte) {
 	// Do something with body :)
 }
 
+func ExampleRequest_SetTraceHooks() {
+	c := &fasthttp.Client{}
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.SetRequestURI("http://example.com/")
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	// Tracing is opt-in per request. The built-in RequestTrace keeps an
+	// independent, ordered event sequence for every retry attempt and only
+	// stores copied values, so it is safe to inspect after the request.
+	trace := fasthttp.NewRequestTrace()
+	req.SetTraceHooks(trace)
+
+	if err := c.Do(req, resp); err != nil {
+		log.Fatal(err)
+	}
+
+	for attempt := 1; attempt <= trace.Attempts(); attempt++ {
+		for _, ev := range trace.AttemptEvents(attempt) {
+			fmt.Printf("attempt %d %-15s %12v err=%v\n", ev.Attempt, ev.Phase, ev.Duration(), ev.Err)
+		}
+	}
+}
+
 func ExampleResponse_BodyStream() {
 	listener := fasthttputil.NewInmemoryListener()
 	server := &fasthttp.Server{
