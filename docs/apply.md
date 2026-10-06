@@ -114,3 +114,32 @@ grouping the entries that can be applied to the fsm.
 module will set the responses to the client request (`req.future.respond(nil)`). From the
 client's point of view, the future returned by `raft.Apply` should now be unblocked and
 calls to `Error()` or `Response()` should return the data at this point.
+
+## Unrecoverable FSM errors
+
+`FSM.Apply` returns an arbitrary value to the client. Many FSMs use that value to return
+ordinary business errors, so raft can not treat every error return as fatal.
+
+An FSM that can fail unrecoverably (for example because its local storage is corrupted)
+optionally implements the `FatalFSM` interface and returns a value that satisfies the
+`FatalError` interface (`FatalError() bool` returns true). When such a value is returned:
+
+1. The FSM goroutine latches an FSM failure and never calls `Apply`, `ApplyBatch` or
+   `Snapshot` on that FSM again until it is repaired.
+2. The failed index is **not** marked applied; `applied_index` is fenced at the last entry
+   applied before the failure. No later entry is ever applied on top of the corrupt state.
+3. Futures for the failed entry and everything queued behind it return
+   `ErrFSMApplyFailed`. The entry is committed (`Index()` is valid) but was not applied.
+4. The node steps down if it was leader, will not campaign while failed, and rejects new
+   `Apply`/`Barrier` requests with `ErrFSMFailed` (outcome unknown).
+5. Snapshots of the corrupt FSM are refused, so the bad state can not be compacted or
+   replicated.
+
+Clients therefore distinguish three outcomes: committed-and-applied (`Error() == nil`,
+read `Response()`), committed-but-not-applied (`errors.Is(err, ErrFSMApplyFailed)`) and
+unknown (`ErrNotLeader`, `ErrLeadershipLost`, `ErrFSMFailed`, timeouts, ...).
+
+Recovery is explicit and durable: a healthy leader repairs a failed follower with an
+`InstallSnapshot`, or the operator rebuilds the FSM from a known-good snapshot/backup and
+restarts. Only a successful `Restore` clears the latch; raft never recovers by ignoring
+the error and advancing the applied index.

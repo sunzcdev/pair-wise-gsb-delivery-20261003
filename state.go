@@ -4,6 +4,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -57,6 +58,13 @@ type raftState struct {
 
 	// Last applied log to the FSM
 	lastApplied uint64
+
+	// fsmFailed is non-zero once the FSM has reported an unrecoverable apply
+	// error. When set, fsmFailedIndex holds the last index that was applied
+	// successfully (the fence); the failed entry itself is never marked
+	// applied. Access atomically.
+	fsmFailedIdx uint64
+	fsmFailed    uint32
 
 	// protects 4 next fields
 	lastLock sync.Mutex
@@ -137,7 +145,60 @@ func (r *raftState) getLastApplied() uint64 {
 }
 
 func (r *raftState) setLastApplied(index uint64) {
+	// Never advance lastApplied past the FSM failure fence. The FSM
+	// goroutine stores the fence before flipping the failure flag, so any
+	// observer that sees the failure reads a consistent fence. This is a
+	// plain store rather than a monotonic CAS because the FSM goroutine
+	// must be able to pull lastApplied back to the fence when the main
+	// thread optimistically advanced it before the failure was observed.
+	if r.hasFSMFailed() {
+		if fence := atomic.LoadUint64(&r.fsmFailedIdx); index > fence {
+			index = fence
+		}
+	}
 	atomic.StoreUint64(&r.lastApplied, index)
+}
+
+// hasFSMFailed reports whether the FSM is latched in an unrecoverable
+// failure state. Safe to call from any goroutine.
+func (r *raftState) hasFSMFailed() bool {
+	return atomic.LoadUint32(&r.fsmFailed) != 0
+}
+
+// getFSMFailure returns the fence index (last index applied successfully)
+// and whether the FSM has failed unrecoverably.
+func (r *raftState) getFSMFailure() (lastAppliedIndex uint64, failed bool) {
+	return atomic.LoadUint64(&r.fsmFailedIdx), atomic.LoadUint32(&r.fsmFailed) != 0
+}
+
+// latchFSMFailure marks the FSM as failed at the given fence index. The
+// failed entry is never marked applied; lastSuccessfulApplied is the last
+// index known to be applied to the FSM. This is set by the FSM goroutine
+// and read by the main thread.
+func (r *raftState) latchFSMFailure(lastSuccessfulApplied uint64) {
+	// Store the fence before flipping the flag so that any observer that
+	// sees the failure always reads a consistent fence.
+	atomic.StoreUint64(&r.fsmFailedIdx, lastSuccessfulApplied)
+	atomic.StoreUint32(&r.fsmFailed, 1)
+}
+
+// clearFSMFailure resets the failure latch. It must only be called once the
+// FSM has been rebuilt from consistent state, i.e. after a successful
+// snapshot restore on the FSM goroutine.
+func (r *raftState) clearFSMFailure() {
+	atomic.StoreUint32(&r.fsmFailed, 0)
+}
+
+// failCommitTuples responds to every tuple carrying a client future with an
+// FSM-apply failure, without delivering any FSM response. It is used to drain
+// committed entries that must not be applied while the FSM has failed.
+func (r *Raft) failCommitTuples(reqs []*commitTuple, base error) {
+	for _, req := range reqs {
+		if req.future != nil {
+			req.future.response = nil
+			req.future.respond(fmt.Errorf("%w: index %d", base, req.log.Index))
+		}
+	}
 }
 
 // Start a goroutine and properly handle the race between a routine

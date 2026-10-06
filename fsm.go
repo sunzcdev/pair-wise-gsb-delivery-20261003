@@ -68,6 +68,90 @@ type BatchingFSM interface {
 	FSM
 }
 
+// FatalError marks an error returned from FSM.Apply or
+// BatchingFSM.ApplyBatch as unrecoverable. An FSM may return a value
+// implementing this interface to signal that the state machine has reached
+// an inconsistent or unusable state (for example because its local durable
+// storage is corrupted) and that Raft must stop applying committed logs to
+// it.
+//
+// A non-fatal error returned through FSM.Apply is business data: it is
+// delivered verbatim to the client as ApplyFuture.Response and application
+// of subsequent logs continues. FatalError is how an FSM distinguishes the
+// two cases without changing the existing Apply return contract.
+type FatalError interface {
+	error
+
+	// FatalError returns true if the error is unrecoverable and the node
+	// must stop applying logs to the FSM.
+	FatalError() bool
+}
+
+// FatalFSM is an optional extension of the FSM interface. An FSM that can
+// suffer an unrecoverable apply failure (for example corruption of its own
+// local storage) should implement this interface.
+//
+// When Apply returns a value for which IsFatalError reports true, Raft
+// latches an FSM failure and stops applying committed logs to the FSM until
+// the FSM is repaired. The index of the failed entry is NOT marked applied,
+// so no later entry is ever applied on top of a corrupt state. All futures
+// for entries at or after the failed index fail with ErrFSMApplyFailed.
+//
+// FSMs that do not implement this interface keep their historical
+// behaviour: every Apply return value is treated as an ordinary client
+// response, including error values.
+//
+// # Failure semantics
+//
+// Once the failure is latched the node:
+//
+//   - never calls Apply, ApplyBatch or Snapshot on the FSM again, so a
+//     corrupt state can not be compacted into a snapshot or replicated;
+//   - keeps lastApplied at the index of the last entry applied before the
+//     failure (the "fence"); it never advances the applied index by simply
+//     swallowing the error;
+//   - steps down if it was leader and will not campaign or win an election
+//     while failed, so a healthy peer can take over;
+//   - fails new Apply and Barrier requests with ErrFSMFailed (outcome
+//     unknown), while futures for already committed entries fail with
+//     ErrFSMApplyFailed (committed, not applied).
+//
+// # Recovery contract
+//
+// The failure is sticky for the lifetime of the Raft instance. Raft will
+// never silently resume applying logs. Operators must repair the FSM out of
+// band using one of the supported, durable mechanisms:
+//
+//   - In a cluster, remove/replace the corrupt node and let the healthy
+//     leader catch it up with an InstallSnapshot. A successful snapshot
+//     restore clears the latch and moves lastApplied to the snapshot index.
+//   - On a standalone node, shut it down, repair or rebuild the FSM's
+//     storage from a known-good snapshot or backup, and restart. On startup
+//     Raft restores the latest snapshot before replaying logs.
+//
+// A failed Restore (for example because the snapshot is unreadable) leaves
+// the failure latched; only a successful Restore clears it.
+type FatalFSM interface {
+	FSM
+
+	// FatalError reports whether the given value returned by Apply
+	// represents an unrecoverable failure of the FSM. resp is the exact
+	// value returned by Apply. Returning true latches the FSM failure
+	// described on the FatalError interface.
+	FatalError(resp interface{}) bool
+}
+
+// IsFatalError reports whether v is a fatal FSM error. It returns true when
+// v is a non-nil value implementing FatalError whose FatalError method
+// returns true.
+func IsFatalError(v interface{}) bool {
+	if v == nil {
+		return false
+	}
+	fatal, ok := v.(FatalError)
+	return ok && fatal.FatalError()
+}
+
 // FSMSnapshot is returned by an FSM in response to a Snapshot
 // It must be safe to invoke FSMSnapshot methods with concurrent
 // calls to Apply.
@@ -88,18 +172,44 @@ func (r *Raft) runFSM() {
 
 	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)
 	configStore, configStoreEnabled := r.fsm.(ConfigurationStore)
+	fatalFSM, fatalEnabled := r.fsm.(FatalFSM)
+
+	fsmApplyErr := func(index uint64) error {
+		return fmt.Errorf("%w: index %d", ErrFSMApplyFailed, index)
+	}
+
+	// isFatal reports whether an Apply/ApplyBatch response represents an
+	// unrecoverable FSM failure.
+	isFatal := func(resp interface{}) bool {
+		if !fatalEnabled {
+			return false
+		}
+		return fatalFSM.FatalError(resp) || IsFatalError(resp)
+	}
+
+	// latchFailure records an unrecoverable FSM failure at the given index.
+	// The failed index is deliberately not marked applied: lastIndex/lastTerm
+	// are left pointing at the last entry that was applied successfully, so
+	// no later entry is ever applied on top of the corrupt state. The main
+	// thread fences its applied index against this value.
+	latchFailure := func(req *commitTuple, resp interface{}) {
+		failedIndex := req.log.Index
+		r.logger.Error("fatal FSM apply error, stopping application to FSM",
+			"index", failedIndex,
+			"last-applied", lastIndex,
+			"error", resp)
+		r.latchFSMFailure(lastIndex)
+		// The main thread advances lastApplied optimistically when it
+		// enqueues a batch, so it may already have moved past the fence.
+		// Pull it back to the last index applied successfully here, where
+		// the true FSM position is known.
+		r.setLastApplied(lastIndex)
+		asyncNotifyCh(r.fsmFailureCh)
+	}
 
 	applySingle := func(req *commitTuple) {
 		// Apply the log if a command or config change
 		var resp interface{}
-		// Make sure we send a response
-		defer func() {
-			// Invoke the future if given
-			if req.future != nil {
-				req.future.response = resp
-				req.future.respond(nil)
-			}
-		}()
 
 		switch req.log.Type {
 		case LogCommand:
@@ -107,10 +217,25 @@ func (r *Raft) runFSM() {
 			resp = r.fsm.Apply(req.log)
 			metrics.MeasureSince([]string{"raft", "fsm", "apply"}, start)
 
+			// An unrecoverable FSM error must not be delivered as a normal
+			// response and must stop any further application.
+			if isFatal(resp) {
+				latchFailure(req, resp)
+				if req.future != nil {
+					req.future.respond(fmt.Errorf("%w: %v", fsmApplyErr(req.log.Index), resp))
+				}
+				return
+			}
+
 		case LogConfiguration:
 			if !configStoreEnabled {
-				// Return early to avoid incrementing the index and term for
-				// an unimplemented operation.
+				// Most FSMs do not store configurations directly. The entry
+				// does not advance the FSM-visible index (so a snapshot is
+				// still "nothing new" before the first command), but the
+				// client future must still be completed.
+				if req.future != nil {
+					req.future.respond(nil)
+				}
 				return
 			}
 
@@ -122,12 +247,24 @@ func (r *Raft) runFSM() {
 		// Update the indexes
 		lastIndex = req.log.Index
 		lastTerm = req.log.Term
+
+		// Invoke the future if given, delivering the ordinary FSM response.
+		if req.future != nil {
+			req.future.response = resp
+			req.future.respond(nil)
+		}
 	}
 
 	applyBatch := func(reqs []*commitTuple) {
 		if !batchingEnabled {
-			for _, ct := range reqs {
+			for index, ct := range reqs {
 				applySingle(ct)
+				// After a fatal failure stop draining the rest of the batch;
+				// the caller fails all remaining futures.
+				if r.hasFSMFailed() {
+					r.failCommitTuples(reqs[index+1:], ErrFSMApplyFailed)
+					return
+				}
 			}
 			return
 		}
@@ -142,14 +279,11 @@ func (r *Raft) runFSM() {
 			return false
 		}
 
-		var lastBatchIndex, lastBatchTerm uint64
 		sendLogs := make([]*Log, 0, len(reqs))
 		for _, req := range reqs {
 			if shouldSend(req.log) {
 				sendLogs = append(sendLogs, req.log)
 			}
-			lastBatchIndex = req.log.Index
-			lastBatchTerm = req.log.Term
 		}
 
 		var responses []interface{}
@@ -165,23 +299,44 @@ func (r *Raft) runFSM() {
 			}
 		}
 
-		// Update the indexes
-		lastIndex = lastBatchIndex
-		lastTerm = lastBatchTerm
-
+		// Walk the batch in order. A fatal response at position k means the
+		// FSM is corrupt from that index: it and every later entry fail, and
+		// the indexes only advance up to the last entry applied before the
+		// failure. Entries before the failure are responded to normally.
 		var i int
-		for _, req := range reqs {
+		var fatalAt int = -1
+		var fatalResp interface{}
+		for reqIndex, req := range reqs {
 			var resp interface{}
-			// If the log was sent to the FSM, retrieve the response.
 			if shouldSend(req.log) {
 				resp = responses[i]
+				if fatalAt < 0 && isFatal(resp) {
+					fatalAt = reqIndex
+					fatalResp = resp
+				}
 				i++
 			}
 
-			if req.future != nil {
-				req.future.response = resp
-				req.future.respond(nil)
+			if fatalAt < 0 {
+				if req.future != nil {
+					req.future.response = resp
+					req.future.respond(nil)
+				}
+				lastIndex = req.log.Index
+				lastTerm = req.log.Term
 			}
+		}
+
+		if fatalAt >= 0 {
+			failedReq := reqs[fatalAt]
+			latchFailure(failedReq, fatalResp)
+			// The fatal tuple itself carries the underlying FSM error; the
+			// entries after it are failed without an underlying cause.
+			if future := failedReq.future; future != nil {
+				future.response = nil
+				future.respond(fmt.Errorf("%w: %v", fsmApplyErr(failedReq.log.Index), fatalResp))
+			}
+			r.failCommitTuples(reqs[fatalAt+1:], ErrFSMApplyFailed)
 		}
 	}
 
@@ -210,10 +365,24 @@ func (r *Raft) runFSM() {
 		// Update the last index and term
 		lastIndex = meta.Index
 		lastTerm = meta.Term
+		// A successful restore rebuilds the FSM from consistent state, which
+		// is the supported recovery path after an unrecoverable apply error.
+		// Keep lastApplied aligned with the snapshot position so application
+		// resumes from the right place and the failure fence is dropped.
+		r.clearFSMFailure()
+		r.setLastApplied(meta.Index)
 		req.respond(nil)
 	}
 
 	snapshot := func(req *reqSnapshotFuture) {
+		// Never snapshot a corrupt FSM: the captured state is not known to
+		// represent any committed prefix, so persisting it would poison
+		// compaction and followers.
+		if failedAt, failed := r.getFSMFailure(); failed {
+			req.respond(fmt.Errorf("%w: FSM apply failed at index %d, repair it via snapshot restore", ErrFSMApplyFailed, failedAt))
+			return
+		}
+
 		// Is there something to snapshot?
 		if lastIndex == 0 {
 			req.respond(ErrNothingNewToSnapshot)
@@ -243,7 +412,13 @@ func (r *Raft) runFSM() {
 
 			switch req := ptr.(type) {
 			case []*commitTuple:
-				applyBatch(req)
+				// If the FSM has already failed, never touch it again and
+				// fail every queued entry until a restore repairs it.
+				if r.hasFSMFailed() {
+					r.failCommitTuples(req, ErrFSMApplyFailed)
+				} else {
+					applyBatch(req)
+				}
 
 			case *restoreFuture:
 				restore(req)

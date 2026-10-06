@@ -140,7 +140,7 @@ func (r *Raft) takeSnapshot() (string, error) {
 	// Wait until we get a response
 	if err := snapReq.Error(); err != nil {
 		if err != ErrNothingNewToSnapshot {
-			err = fmt.Errorf("failed to start snapshot: %v", err)
+			err = fmt.Errorf("failed to start snapshot: %w", err)
 		}
 		return "", err
 	}

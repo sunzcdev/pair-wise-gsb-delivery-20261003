@@ -1,8 +1,17 @@
 # UNRELEASED
 
-IMPROVEMENETS
+IMPROVEMENTS
 
 * Added a flag to skip legacy duplicate telemetry. [GH-630](https://github.com/hashicorp/raft/pull/630)
+* Add the optional `FatalFSM` interface and `FatalError`/`IsFatalError`
+  helpers so an FSM can report an unrecoverable apply failure separately
+  from ordinary `Apply` return errors. Raft latches the failure, fences the
+  applied index at the last applied entry, stops applying further logs and
+  taking snapshots, steps down as leader, and rejects new Apply/Barrier
+  requests; clients distinguish committed-but-not-applied
+  (`ErrFSMApplyFailed`) from unknown (`ErrFSMFailed`) outcomes. Recovery is
+  explicit via a successful snapshot restore or an out-of-band rebuild and
+  restart, never by swallowing the error and advancing the applied index.
 
 # 1.7.0 (June 5th, 2024)
 

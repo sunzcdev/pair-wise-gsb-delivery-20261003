@@ -77,6 +77,25 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrFSMApplyFailed is returned to clients when a log entry was safely
+	// committed by Raft but could not be applied to the local FSM because
+	// the FSM reported an unrecoverable error (see FatalFSM and
+	// FatalError). The node has latched an FSM failure: it no longer applies
+	// committed logs, takes snapshots, or serves Barrier until the FSM is
+	// repaired through a snapshot restore or a full rebuild and restart.
+	//
+	// This error is distinct from the business errors returned via
+	// ApplyFuture.Response: Index is valid (the entry is committed), but
+	// Response is nil because application failed.
+	ErrFSMApplyFailed = errors.New("fsm failed to apply committed log")
+
+	// ErrFSMFailed is returned by Raft operations that cannot proceed while
+	// the FSM is latched in an unrecoverable failure state, for example
+	// Apply, Barrier or Snapshot requests that arrive after the failure.
+	// The outcome of such requests is unknown: they may or may not be
+	// committed in the cluster, and they were never applied to this FSM.
+	ErrFSMFailed = errors.New("raft node has an unrecoverable FSM failure")
 )
 
 // Raft implements a Raft node.
@@ -116,6 +135,12 @@ type Raft struct {
 
 	// fsmSnapshotCh is used to trigger a new snapshot being taken
 	fsmSnapshotCh chan *reqSnapshotFuture
+
+	// fsmFailureCh is signalled by the FSM goroutine when the FSM reports
+	// an unrecoverable apply error. The main thread selects on it to step
+	// down if it is leader. It is buffered so the FSM goroutine never
+	// blocks; repeated notifications coalesce.
+	fsmFailureCh chan struct{}
 
 	// lastContact is the last time we had contact from the
 	// leader node. This can be used to gauge staleness.
@@ -559,6 +584,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		fsm:                   fsm,
 		fsmMutateCh:           make(chan interface{}, 128),
 		fsmSnapshotCh:         make(chan *reqSnapshotFuture),
+		fsmFailureCh:          make(chan struct{}, 1),
 		leaderCh:              make(chan bool, 1),
 		localID:               localID,
 		localAddr:             localAddr,
@@ -864,6 +890,20 @@ func (r *Raft) LeaderWithID() (ServerAddress, ServerID) {
 // If a user snapshot is restored while the command is in-flight, an
 // ErrAbortedByRestore is returned. In this case the write effectively failed
 // since its effects will not be present in the FSM after the restore.
+//
+// There are three distinct outcomes clients should distinguish:
+//
+//   - Committed and applied: Error() is nil and Response() is the value
+//     returned by FSM.Apply (which may itself be an ordinary, non-fatal
+//     error conveying business-level failure).
+//   - Committed but not applied because the local FSM failed unrecoverably:
+//     Error() wraps ErrFSMApplyFailed and Index() is valid. The entry is
+//     durably committed in the cluster, but this node could not apply it and
+//     has stopped applying further entries.
+//   - Unknown: Error() is a non-commit error such as ErrNotLeader,
+//     ErrLeadershipLost, ErrEnqueueTimeout, ErrRaftShutdown or
+//     ErrFSMFailed. The entry may or may not have been committed, and it was
+//     not applied on this node.
 func (r *Raft) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return r.ApplyLog(Log{Data: cmd}, timeout)
 }
@@ -888,6 +928,12 @@ func (r *Raft) ApplyLog(log Log, timeout time.Duration) ApplyFuture {
 		},
 	}
 	logFuture.init()
+
+	// Fast-fail when the local FSM has an unrecoverable failure. The command
+	// is not proposed, so its outcome is unknown rather than committed.
+	if r.hasFSMFailed() {
+		return errorFuture{ErrFSMFailed}
+	}
 
 	select {
 	case <-timer:
@@ -914,6 +960,12 @@ func (r *Raft) Barrier(timeout time.Duration) Future {
 	// Create a log future, no index or term yet
 	logFuture := &logFuture{log: Log{Type: LogBarrier}}
 	logFuture.init()
+
+	// A barrier can never complete against a failed FSM: entries after the
+	// failure fence are deliberately not applied.
+	if r.hasFSMFailed() {
+		return errorFuture{ErrFSMFailed}
+	}
 
 	select {
 	case <-timer:
@@ -1185,6 +1237,7 @@ func (r *Raft) LastContact() time.Time {
 //
 // Keys are: "state", "term", "last_log_index", "last_log_term",
 // "commit_index", "applied_index", "fsm_pending",
+// "fsm_failed",
 // "last_snapshot_index", "last_snapshot_term",
 // "latest_configuration", "last_contact", and "num_peers".
 //
@@ -1219,6 +1272,7 @@ func (r *Raft) Stats() map[string]string {
 		"commit_index":         toString(r.getCommitIndex()),
 		"applied_index":        toString(r.getLastApplied()),
 		"fsm_pending":          toString(uint64(len(r.fsmMutateCh))),
+		"fsm_failed":           strconv.FormatBool(r.hasFSMFailed()),
 		"last_snapshot_index":  toString(lastSnapIndex),
 		"last_snapshot_term":   toString(lastSnapTerm),
 		"protocol_version":     toString(uint64(r.protocolVersion)),

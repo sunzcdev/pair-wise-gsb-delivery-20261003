@@ -208,6 +208,15 @@ func (r *Raft) runFollower() {
 		case <-r.leaderNotifyCh:
 			//  Ignore since we are not the leader
 
+		case <-r.fsmFailureCh:
+			r.mainThreadSaturation.working()
+			drainNotifyCh(r.fsmFailureCh)
+			// The FSM is corrupt; remain a follower and refuse further
+			// work until repaired. Log so operators can act.
+			fence, _ := r.getFSMFailure()
+			r.logger.Error("FSM failure latched while follower; log application is stopped",
+				"last-applied", fence)
+
 		case <-r.followerNotifyCh:
 			heartbeatTimer = time.After(0)
 
@@ -220,6 +229,12 @@ func (r *Raft) runFollower() {
 			// Check if we have had a successful contact
 			lastContact := r.LastContact()
 			if time.Since(lastContact) < hbTimeout {
+				continue
+			}
+
+			// A follower with a corrupt FSM must not start an election.
+			if r.hasFSMFailed() {
+				heartbeatTimer = randomTimeout(hbTimeout)
 				continue
 			}
 
@@ -379,6 +394,11 @@ func (r *Raft) runCandidate() {
 
 			// Check if we've become the leader
 			if grantedVotes >= votesNeeded {
+				if r.hasFSMFailed() {
+					r.logger.Error("aborting election because FSM has failed")
+					r.setState(Follower)
+					return
+				}
 				r.logger.Info("election won", "term", vote.Term, "tally", grantedVotes)
 				r.setState(Leader)
 				r.setLeader(r.localAddr, r.localID)
@@ -420,6 +440,16 @@ func (r *Raft) runCandidate() {
 
 		case <-r.leaderNotifyCh:
 			//  Ignore since we are not the leader
+
+		case <-r.fsmFailureCh:
+			r.mainThreadSaturation.working()
+			drainNotifyCh(r.fsmFailureCh)
+			// Do not campaign with a corrupt FSM; drop back to follower.
+			fence, _ := r.getFSMFailure()
+			r.logger.Error("FSM failure latched while candidate; aborting candidacy",
+				"last-applied", fence)
+			r.setState(Follower)
+			return
 
 		case <-r.followerNotifyCh:
 			if electionTimeout != r.config().ElectionTimeout {
@@ -467,6 +497,14 @@ func (r *Raft) setupLeaderState() {
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
 // the leaderLoop for the hot loop.
 func (r *Raft) runLeader() {
+	// Never run as leader with a corrupt FSM. Drop back immediately so a
+	// healthy peer can lead and repair this node through snapshotting.
+	if r.hasFSMFailed() {
+		r.logger.Error("not entering leader state because FSM has failed")
+		r.setState(Follower)
+		return
+	}
+
 	r.logger.Info("entering leader state", "leader", r)
 	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
@@ -689,6 +727,18 @@ func (r *Raft) leaderLoop() {
 			r.mainThreadSaturation.working()
 			r.setState(Follower)
 
+		case <-r.fsmFailureCh:
+			r.mainThreadSaturation.working()
+			drainNotifyCh(r.fsmFailureCh)
+			// The FSM is corrupt: we can no longer safely apply committed
+			// entries, so step down to let a healthy peer take over. A
+			// healthy leader can repair this node via InstallSnapshot.
+			fence, _ := r.getFSMFailure()
+			r.logger.Error("FSM failure latched while leader; stepping down",
+				"last-applied", fence)
+			r.setState(Follower)
+			return
+
 		case future := <-r.leadershipTransferCh:
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -910,6 +960,10 @@ func (r *Raft) leaderLoop() {
 				newLog.respond(ErrLeadershipTransferInProgress)
 				continue
 			}
+			if r.hasFSMFailed() {
+				newLog.respond(ErrFSMFailed)
+				continue
+			}
 			// Group commit, gather all the ready commits
 			ready := []*logFuture{newLog}
 		GROUP_COMMIT_LOOP:
@@ -920,6 +974,13 @@ func (r *Raft) leaderLoop() {
 				default:
 					break GROUP_COMMIT_LOOP
 				}
+			}
+
+			if r.hasFSMFailed() {
+				for i := range ready {
+					ready[i].respond(ErrFSMFailed)
+				}
+				continue
 			}
 
 			// Dispatch the logs
@@ -1301,6 +1362,27 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 		return
 	}
 
+	// If the FSM has failed unrecoverably, never send it more logs. Fail
+	// any client futures at indices past the last successfully applied one
+	// so callers can distinguish "committed, apply failed" from "unknown".
+	// The applied index is fenced at the last successful index and is not
+	// advanced: swallowing the error and resuming at N+1 would corrupt the
+	// state machine.
+	if r.hasFSMFailed() {
+		fence, _ := r.getFSMFailure()
+		for idx := max(lastApplied, fence) + 1; idx <= index; idx++ {
+			if future, ok := futures[idx]; ok {
+				future.respond(fmt.Errorf("%w: index %d", ErrFSMApplyFailed, idx))
+			}
+		}
+		if lastApplied > fence {
+			r.setLastApplied(fence)
+		}
+		r.logger.Error("refusing to apply committed logs because FSM has failed",
+			"up-to-index", index, "fence-index", fence)
+		return
+	}
+
 	applyBatch := func(batch []*commitTuple) {
 		select {
 		case r.fsmMutateCh <- batch:
@@ -1359,7 +1441,13 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	}
 
 	// Update the lastApplied index and term
-	r.setLastApplied(index)
+	// The FSM goroutine applies asynchronously, so never advance past the
+	// FSM failure fence if a failure was latched while we were dispatching.
+	if fence, failed := r.getFSMFailure(); failed && index > fence {
+		r.setLastApplied(fence)
+	} else {
+		r.setLastApplied(index)
+	}
 }
 
 // processLog is invoked to process the application of a single committed log entry.
