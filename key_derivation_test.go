@@ -77,11 +77,38 @@ func TestValidSessionKeys_AesCm256(t *testing.T) {
 		"Session Auth Tag % 02x does not match expected % 02x", sessionAuthTag, expectedSessionAuthTag)
 }
 
-// This test asserts that calling aesCmKeyDerivation with a non-zero indexOverKdr fails
-// Currently this isn't supported, but the API makes sure we can add this in the future.
+// This test asserts that aesCmKeyDerivation with a non-zero indexOverKdr xors the
+// 48-bit "index DIV kdr" value into the PRF input after the label, as specified by
+// RFC 3711 section 4.3.1.
 func TestIndexOverKDR(t *testing.T) {
-	_, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, []byte{}, []byte{}, 1, 0)
-	assert.Error(t, err)
+	masterKey := []byte{0xE1, 0xF9, 0x7A, 0x0D, 0x3E, 0x01, 0x8B, 0xE0, 0xD6, 0x4F, 0xA3, 0x2C, 0x06, 0xDE, 0x41, 0x39}
+	masterSalt := []byte{0x0E, 0xC6, 0x75, 0xAD, 0x49, 0x8A, 0xFE, 0xEB, 0xB6, 0x96, 0x0B, 0x3A, 0xAB, 0xE6}
+
+	sessionKey, err := aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 1, len(masterKey))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0x53, 0x87, 0x0B, 0x4B, 0x8E, 0x2A, 0xF0, 0xC6, 0xF0, 0xCC, 0x8B, 0x15, 0x44, 0xC3, 0x41, 0x38,
+	}, sessionKey)
+
+	sessionSalt, err := aesCmKeyDerivation(labelSRTPSalt, masterKey, masterSalt, 1, len(masterSalt))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xC6, 0xDA, 0x1B, 0xBC, 0xDC, 0x3F, 0x42, 0x9C, 0xD8, 0x2F, 0x25, 0x93, 0xEB, 0x60,
+	}, sessionSalt)
+
+	sessionAuthTag, err := aesCmKeyDerivation(labelSRTPAuthenticationTag, masterKey, masterSalt, 1, 20)
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0xC7, 0x0D, 0x7F, 0x14, 0xE7, 0x55, 0x38, 0x0E, 0x6F, 0xF4,
+		0xED, 0x24, 0xF4, 0xF6, 0x11, 0xAA, 0xD1, 0x96, 0x85, 0xCE,
+	}, sessionAuthTag)
+
+	// All 48 bits of "index DIV kdr" are xored into the PRF input.
+	sessionKey, err = aesCmKeyDerivation(labelSRTPEncryption, masterKey, masterSalt, 0x010203040506, len(masterKey))
+	assert.NoError(t, err)
+	assert.Equal(t, []byte{
+		0x0E, 0x9D, 0xA0, 0xFE, 0x27, 0x1C, 0xE5, 0x24, 0xE8, 0x1E, 0xAD, 0x27, 0x80, 0x8A, 0x91, 0xD8,
+	}, sessionKey)
 }
 
 func BenchmarkGenerateCounter(b *testing.B) {

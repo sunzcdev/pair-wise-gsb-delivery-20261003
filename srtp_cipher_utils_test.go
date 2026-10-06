@@ -39,19 +39,19 @@ func newSrtpCipherAesCmHmacSha1WithDerivedKeys(
 	}
 
 	var err error
-	if srtpCipher.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
+	if srtpCipher.keys.srtpBlock, err = aes.NewCipher(keys.srtpSessionKey); err != nil {
 		return nil, err
 	}
 
-	if srtpCipher.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
+	if srtpCipher.keys.srtcpBlock, err = aes.NewCipher(keys.srtcpSessionKey); err != nil {
 		return nil, err
 	}
 
-	srtpCipher.srtpSessionSalt = keys.srtpSessionSalt
-	srtpCipher.srtcpSessionSalt = keys.srtcpSessionSalt
+	srtpCipher.keys.srtpSessionSalt = keys.srtpSessionSalt
+	srtpCipher.keys.srtcpSessionSalt = keys.srtcpSessionSalt
 
-	srtpCipher.srtcpSessionAuth = hmac.New(sha1.New, keys.srtcpSessionAuthTag)
-	srtpCipher.srtpSessionAuth = hmac.New(sha1.New, keys.srtpSessionAuthTag)
+	srtpCipher.keys.srtcpSessionAuth = hmac.New(sha1.New, keys.srtcpSessionAuthTag)
+	srtpCipher.keys.srtpSessionAuth = hmac.New(sha1.New, keys.srtpSessionAuthTag)
 
 	return srtpCipher, nil
 }

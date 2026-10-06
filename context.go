@@ -116,6 +116,10 @@ type Context struct {
 	authTagRTPLen *int
 
 	cryptexMode CryptexMode
+
+	// keyDerivationRate is the RFC 3711 key_derivation_rate. Zero (default)
+	// means session keys are derived from the master key only once.
+	keyDerivationRate uint32
 }
 
 // CreateContext creates a new SRTP Context.
@@ -191,6 +195,7 @@ func (c *Context) contextWithKey(masterKey, masterSalt []byte, profile Protectio
 		next.rocTransmitRate = c.rocTransmitRate
 		next.authTagRTPLen = c.authTagRTPLen
 		next.cryptexMode = c.cryptexMode
+		next.keyDerivationRate = c.keyDerivationRate
 
 		return nil
 	})
@@ -250,9 +255,11 @@ func (c *Context) createCipher(mki, masterKey, masterSalt []byte, encryptSRTP, e
 		ProtectionProfileAes128CmHmacSha1_80,
 		ProtectionProfileAes256CmHmacSha1_32,
 		ProtectionProfileAes256CmHmacSha1_80:
-		return newSrtpCipherAesCmHmacSha1(profileWithArgs, masterKey, masterSalt, mki, encryptSRTP, encryptSRTCP, useCryptex)
+		return newSrtpCipherAesCmHmacSha1(
+			profileWithArgs, masterKey, masterSalt, mki, encryptSRTP, encryptSRTCP, useCryptex, c.keyDerivationRate,
+		)
 	case ProtectionProfileNullHmacSha1_32, ProtectionProfileNullHmacSha1_80:
-		return newSrtpCipherAesCmHmacSha1(profileWithArgs, masterKey, masterSalt, mki, false, false, false)
+		return newSrtpCipherAesCmHmacSha1(profileWithArgs, masterKey, masterSalt, mki, false, false, false, 0)
 	default:
 		return nil, fmt.Errorf("%w: %#v", errNoSuchSRTPProfile, c.profile)
 	}

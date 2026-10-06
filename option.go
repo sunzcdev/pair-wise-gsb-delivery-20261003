@@ -240,3 +240,47 @@ func Cryptex(cryptexMode CryptexMode) ContextOption {
 		return nil
 	}
 }
+
+// maxKeyDerivationRate is the maximum key_derivation_rate allowed by RFC 3711.
+const maxKeyDerivationRate = 1 << 24
+
+// KeyDerivationRate enables periodic re-derivation of SRTP/SRTCP session keys
+// from the master key, as defined by the key_derivation_rate parameter of
+// RFC 3711 section 4.3.1. Instead of re-negotiating the master key, fresh
+// session keys are derived every keyDerivationRate packets: the session keys
+// used for a packet are selected by (packet index DIV keyDerivationRate), so
+// out-of-order packets from a previous derivation period are still decrypted
+// with the keys of their own period and remain subject to replay protection.
+//
+// The rate must be a power of two no larger than 2^24. Zero (the default)
+// disables re-derivation and derives session keys once, as before.
+//
+// This is currently supported for the AES-CM/HMAC-SHA1 protection profiles
+// only (ProtectionProfileAes128CmHmacSha1_80, ProtectionProfileAes128CmHmacSha1_32,
+// ProtectionProfileAes256CmHmacSha1_80, ProtectionProfileAes256CmHmacSha1_32).
+func KeyDerivationRate(rate uint32) ContextOption {
+	return func(c *Context) error {
+		if c.constructed {
+			return ErrContextOptionNotUpdatable
+		}
+
+		if rate != 0 && (rate > maxKeyDerivationRate || rate&(rate-1) != 0) {
+			return errInvalidKeyDerivationRate
+		}
+
+		if rate != 0 {
+			switch c.profile {
+			case ProtectionProfileAes128CmHmacSha1_80,
+				ProtectionProfileAes128CmHmacSha1_32,
+				ProtectionProfileAes256CmHmacSha1_80,
+				ProtectionProfileAes256CmHmacSha1_32:
+			default:
+				return errUnsupportedKDRProfile
+			}
+		}
+
+		c.keyDerivationRate = rate
+
+		return nil
+	}
+}
