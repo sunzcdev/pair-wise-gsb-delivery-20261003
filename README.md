@@ -74,6 +74,39 @@ client := acmez.Client{
 If you're implementing a tls-alpn-01 solver, the `acmez` package can help. It has the constant [`ACMETLS1Protocol`](https://pkg.go.dev/github.com/mholt/acmez/v3#pkg-constants) which you can use to identify challenge handshakes by inspecting the ClientHello's ALPN extension. Simply complete the handshake using a certificate from the [`acmez.TLSALPN01ChallengeCert()`](https://pkg.go.dev/github.com/mholt/acmez/v3#TLSALPN01ChallengeCert) function to solve the challenge.
 
 
+## Optional CAA precheck
+
+Waiting until every challenge is provisioned to discover that the domain's [CAA](https://www.rfc-editor.org/rfc/rfc8659) records forbid the target CA is slow and noisy. The `acmez` client can optionally run a local CAA precheck **before** creating an order or provisioning any challenges:
+
+```go
+client := acmez.Client{
+	ChallengeSolvers: map[string]acmez.Solver{
+		acme.ChallengeTypeDNS01: solver,
+	},
+	CAAPrecheck: &acmez.CAAPrecheck{
+		Enabled: true,
+		// CA identities default to the directory's meta.caaIdentities,
+		// the account URL to the account's Location, and the validation
+		// methods to the configured domain-validation solvers.
+	},
+}
+```
+
+The precheck evaluates the `issue` and `issuewild` properties, including the RFC 8657 [`accounturi`](https://www.rfc-editor.org/rfc/rfc8657#section-4.1) and [`validationmethods`](https://www.rfc-editor.org/rfc/rfc8657#section-4.2) parameters (the latter supports the RFC 8657 §3.2.2 `name` scope via `ValidationMethodNames`).
+
+DNS access goes through the replaceable [`CAAQuerier`](https://pkg.go.dev/github.com/mholt/acmez/v3#CAAQuerier) interface (the default uses `github.com/miekg/dns`), so you can point it at a custom resolver or inject records in tests without touching real DNS.
+
+Crucially, an answer that cannot be authoritatively determined is **never** assumed to permit issuance. Set `OnInconclusive` to choose the behavior:
+
+- `CAABlockOnInconclusive` (the default) stops with an error wrapping `acmez.ErrCAAInconclusive`.
+- `CAAContinueOnInconclusive` reports the identifier as inconclusive but proceeds anyway.
+
+A hard CAA denial returns an error wrapping `acmez.ErrCAABlocked`. You can also call `client.CheckCAA(...)` directly for one-off checks.
+
+> [!NOTE]
+> This precheck is only an early configuration check. It does **not** authorize issuance: the CA always performs its own authoritative CAA evaluation when finalizing the order and remains the sole decision maker.
+
+
 
 ## History
 
