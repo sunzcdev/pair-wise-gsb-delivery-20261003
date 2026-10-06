@@ -209,6 +209,43 @@ Additionally, any field implementing the `encoding.TextUnmarshaler` interface
 will be capturable too. One caveat is that `UnmarshalText()` will be called once
 for each captured token, so eg. `@(Ident Ident Ident)` will be called three times.
 
+#### Transactional captures and backtracking
+
+`Capture` is applied as soon as its enclosing production is recognised. With
+ambiguous grammars and lookahead, a production can be recognised inside a
+speculative branch that is later rejected. Plain field assignments are
+discarded automatically, but a `Capture` method that mutates state outside the
+receiver itself (a shared counter, a builder, a symbol table, ...) can leave
+that mutation behind when the branch backtracks.
+
+To opt into rollback, implement the optional `TransactionalCapture` interface
+in addition to `Capture`:
+
+```go
+type TransactionalCapture interface {
+    Capture
+    CaptureState() any
+    RestoreState(state any)
+    CommitCapture()
+}
+```
+
+`CaptureState` is called before each capture so the participant can save its
+own state, `RestoreState` is called when the enclosing branch is rejected, and
+`CommitCapture` is called once, in final syntactic order, after a successful
+parse. The participant owns the state it saves; Participle deliberately does
+not copy a `reflect.Value` and treat that as undoing deep or shared side
+effects.
+
+Custom `Parseable` implementations and `ParseTypeWith` functions that mutate
+shared state can take part in the same protocol: obtain the active
+`Transaction` from the lexer with `participle.TransactionFor(lex)` and call
+`Enlist(participant)` before mutating it, including on paths that later return
+`NextMatch`.
+
+A type implementing only `Capture` keeps the original eager behaviour and is
+not rolled back; that is the compatibility boundary.
+
 ### Capturing boolean value
 
 By default, a boolean field is used to indicate that a match occurred, which

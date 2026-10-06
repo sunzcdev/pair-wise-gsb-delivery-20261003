@@ -28,6 +28,7 @@ type parseContext struct {
 	symbols           map[lexer.TokenType]string
 	apply             []*contextFieldSet
 	allowTrailing     bool
+	tx                *Transaction
 }
 
 func newParseContext(lex *lexer.PeekingLexer, def lexer.Definition, lookahead int, caseInsensitive map[lexer.TokenType]bool) parseContext {
@@ -69,7 +70,7 @@ func (p *parseContext) Defer(tokens []lexer.Token, strct reflect.Value, field st
 // earlier ones queued for the enclosing struct.
 func (p *parseContext) ApplyFrom(start int) error {
 	for _, apply := range p.apply[start:] {
-		if err := setField(apply.tokens, apply.strct, apply.field, apply.fieldValue); err != nil {
+		if err := setField(p, apply.tokens, apply.strct, apply.field, apply.fieldValue); err != nil {
 			return err
 		}
 	}
@@ -81,9 +82,40 @@ func (p *parseContext) ApplyFrom(start int) error {
 func (p *parseContext) Accept(branch *parseContext) {
 	p.apply = append(p.apply, branch.apply...)
 	p.PeekingLexer = branch.PeekingLexer
+	if p.tx != nil {
+		p.tx.Accept()
+	}
 	if branch.deepestErrorDepth >= p.deepestErrorDepth {
 		p.deepestErrorDepth = branch.deepestErrorDepth
 		p.deepestError = branch.deepestError
+	}
+}
+
+// Reject discards a speculative branch that was not chosen, undoing any
+// transactional captures it performed.
+func (p *parseContext) Reject(branch *parseContext) {
+	if p.tx != nil {
+		p.tx.Rollback()
+	}
+}
+
+// txBegin, txAccept and txRollback are nil-safe transaction scope helpers used
+// around custom Parseable nodes.
+func (p *parseContext) txBegin() {
+	if p.tx != nil {
+		p.tx.Begin()
+	}
+}
+
+func (p *parseContext) txAccept() {
+	if p.tx != nil {
+		p.tx.Accept()
+	}
+}
+
+func (p *parseContext) txRollback() {
+	if p.tx != nil {
+		p.tx.Rollback()
 	}
 }
 
@@ -92,6 +124,9 @@ func (p *parseContext) Branch() *parseContext {
 	branch := &parseContext{}
 	*branch = *p
 	branch.apply = nil
+	if p.tx != nil {
+		p.tx.Begin()
+	}
 	return branch
 }
 

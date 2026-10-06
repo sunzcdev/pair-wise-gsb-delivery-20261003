@@ -7,6 +7,18 @@
 <a id="markdown-v2" name="v2"></a>
 ## v2
 
+v2 (unreleased) adds an optional transactional capture protocol:
+
+- A field type may implement `TransactionalCapture` (in addition to `Capture`)
+  with `CaptureState() any`, `RestoreState(any)` and `CommitCapture()`. Captures
+  made by such participants are saved before mutation, undone when an enclosing
+  branch backtracks, and committed once, in final syntactic order, on success.
+- `participle.TransactionFor(*lexer.PeekingLexer)` and `Transaction.Enlist()`
+  let custom `Parseable` types and `ParseTypeWith` functions enrol shared state
+  so mutations followed by `NextMatch` are rolled back too.
+- Types implementing only `Capture` retain the original eager, non-transactional
+  behaviour.
+
 v2 was released in November 2020. It contains the following changes, some of
 which are backwards-incompatible:
 
@@ -33,4 +45,3 @@ which are backwards-incompatible:
 - The `ebnf` lexer has been removed.
 - All future work on lexing will be put into the stateful lexer.
 - The need for `DropToken` has been removed.
-

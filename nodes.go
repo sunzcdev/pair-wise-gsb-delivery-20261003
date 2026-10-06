@@ -63,13 +63,16 @@ func (p *parseable) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Val
 	defer ctx.printTrace(p)()
 	rv := reflect.New(p.t)
 	v := rv.Interface().(Parseable)
+	ctx.txBegin()
 	err = v.Parse(&ctx.PeekingLexer)
 	if err != nil {
 		if errors.Is(err, NextMatch) {
+			ctx.txRollback()
 			return nil, nil
 		}
 		return nil, err
 	}
+	ctx.txAccept()
 	return []reflect.Value{rv.Elem()}, nil
 }
 
@@ -84,13 +87,16 @@ func (c *custom) GoString() string { return c.typ.Name() }
 
 func (c *custom) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Value, err error) {
 	defer ctx.printTrace(c)()
+	ctx.txBegin()
 	results := c.parseFn.Call([]reflect.Value{reflect.ValueOf(&ctx.PeekingLexer)})
 	if err, _ := results[1].Interface().(error); err != nil {
 		if errors.Is(err, NextMatch) {
+			ctx.txRollback()
 			return nil, nil
 		}
 		return nil, err
 	}
+	ctx.txAccept()
 	return []reflect.Value{results[0]}, nil
 }
 
@@ -273,6 +279,7 @@ func (g *group) Parse(ctx *parseContext, parent reflect.Value) (out []reflect.Va
 				out = append(out, v...) // Try to return as much of the parse tree as possible
 				return out, err
 			}
+			ctx.Reject(branch)
 			break
 		}
 		out = append(out, v...)
@@ -311,6 +318,7 @@ func (l *lookaheadGroup) Parse(ctx *parseContext, parent reflect.Value) (out []r
 	// Create a branch to avoid advancing the parser as any match will be discarded
 	branch := ctx.Branch()
 	out, err = l.expr.Parse(branch, parent)
+	ctx.Reject(branch)
 	matchedLookahead := err == nil && out != nil
 	expectingMatch := !l.negative
 	if matchedLookahead != expectingMatch {
@@ -342,6 +350,7 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 			if ctx.Stop(err, branch) {
 				return value, err
 			}
+			ctx.Reject(branch)
 			// Show the closest error returned. The idea here is that the further the parser progresses
 			// without error, the more difficult it is to trace the error back to its root.
 			if branch.Cursor() >= deepestError {
@@ -357,6 +366,8 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 			}
 			ctx.Accept(branch)
 			return value, nil
+		} else {
+			ctx.Reject(branch)
 		}
 	}
 	if firstError != nil {
@@ -492,10 +503,12 @@ func (n *negation) Parse(ctx *parseContext, parent reflect.Value) (out []reflect
 	notEOF := ctx.Peek()
 	if notEOF.EOF() {
 		// EOF cannot match a negation, which expects something
+		ctx.Reject(branch)
 		return nil, nil
 	}
 
 	out, err = n.node.Parse(branch, parent)
+	ctx.Reject(branch)
 	if out != nil && err == nil {
 		// out being non-nil means that what we don't want is actually here, so we report nomatch
 		return nil, &UnexpectedTokenError{Unexpected: *notEOF, TokenType: ctx.tokenTypeName(notEOF.Type)}
@@ -601,7 +614,7 @@ func maybeRef(tmpl reflect.Type, strct reflect.Value) reflect.Value {
 //
 // For all other types, an attempt will be made to convert the string to the corresponding
 // type (int, float32, etc.).
-func setField(tokens []lexer.Token, strct reflect.Value, field structLexerField, fieldValue []reflect.Value) (err error) { //nolint:gocognit
+func setField(ctx *parseContext, tokens []lexer.Token, strct reflect.Value, field structLexerField, fieldValue []reflect.Value) (err error) { //nolint:gocognit
 	f := strct.FieldByIndex(field.Index)
 
 	// Any kind of pointer, hydrate it first.
@@ -635,6 +648,13 @@ func setField(tokens []lexer.Token, strct reflect.Value, field structLexerField,
 			ifv := make([]string, 0, len(fieldValue))
 			for _, v := range fieldValue {
 				ifv = append(ifv, v.Interface().(string))
+			}
+			// A TransactionalCapture participates in the backtracking protocol:
+			// snapshot its own state before mutating, so a rejected branch can
+			// undo the capture. Plain Capture keeps its eager, non-transactional
+			// behaviour.
+			if tp, ok := d.(TransactionalCapture); ok && ctx.tx != nil {
+				ctx.tx.changed(tp)
 			}
 			err = d.Capture(ifv)
 			if err != nil {

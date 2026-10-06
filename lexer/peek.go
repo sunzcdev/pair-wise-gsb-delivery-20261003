@@ -5,6 +5,27 @@ type PeekingLexer struct {
 	Checkpoint
 	tokens []Token
 	elide  map[TokenType]bool
+	hooks  map[any]any
+}
+
+// Hook returns the opaque hook associated with this lexer under key, or nil if none is set.
+//
+// Hooks are carried by higher-level packages that share a PeekingLexer (such
+// as the parser) and are preserved by shallow copies of PeekingLexer. They are
+// not interpreted by the lexer package.
+func (p *PeekingLexer) Hook(key any) any {
+	if p.hooks == nil {
+		return nil
+	}
+	return p.hooks[key]
+}
+
+// SetHook associates an opaque hook with this lexer under key.
+func (p *PeekingLexer) SetHook(key, hook any) {
+	if p.hooks == nil {
+		p.hooks = map[any]any{}
+	}
+	p.hooks[key] = hook
 }
 
 // RawCursor index in the token stream.
