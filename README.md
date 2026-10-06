@@ -127,6 +127,37 @@ fmt.Println(l.Get(1)) // "baz"
 
 Builders are invalid after the call to `List()`.
 
+### Publishing read-only snapshots while building
+
+Sometimes you need to publish the current state of a list while continuing to
+build it. The `ListBuilder` provides a `Snapshot()` method that returns a
+read-only `List` without invalidating the builder:
+
+```go
+b := immutable.NewListBuilder[string]()
+b.Append("foo")
+snap := b.Snapshot()
+
+// The builder keeps growing; the snapshot is unaffected.
+b.Append("bar")
+
+fmt.Println(snap.Len()) // 1
+fmt.Println(b.Len())    // 2
+```
+
+Snapshots share structure with the builder and with each other. Mutating the
+builder after a snapshot transparently copies only the trie nodes on the path
+of the change, so snapshots remain cheap to take and stay immutable. You can
+take any number of snapshots and interleave them with further edits. The
+builder is only invalidated by the final `List()` call, which retains its
+existing contract.
+
+Snapshots do not deep copy the values stored in the builder. Values are shared
+by reference, so mutating a value in place through a pointer (e.g. a pointer to
+a struct, a slice, or a map) after it has been added will be visible through
+the builder and every snapshot that contains it. Treat stored values as
+read-only to preserve isolation between snapshots.
+
 
 ## Map
 
@@ -230,6 +261,35 @@ fmt.Println(m.Get("bar")) // "200"
 
 Builders are invalid after the call to `Map()`.
 
+### Publishing read-only snapshots while building
+
+Like `ListBuilder`, the `MapBuilder` provides a `Snapshot()` method that
+returns a read-only `Map` without invalidating the builder:
+
+```go
+b := immutable.NewMapBuilder[string, int](nil)
+b.Set("foo", 100)
+snap := b.Snapshot()
+
+// Continue editing the builder; the snapshot remains unchanged.
+b.Set("foo", 200)
+b.Set("bar", 300)
+
+v, _ := snap.Get("foo")
+fmt.Println(v) // 100
+fmt.Println(b.Len()) // 2
+```
+
+Snapshots share trie structure with the builder. Subsequent builder writes
+copy only the nodes they touch (including hash collision nodes and branch
+nodes that grow or shrink), so snapshots stay cheap and immutable. Any number
+of snapshots can be taken and interleaved with further edits; only the final
+`Map()` call invalidates the builder.
+
+As with `ListBuilder`, snapshots do not deep copy stored values. Mutating a
+value through a pointer after storing it will be visible in the builder and in
+all snapshots containing it.
+
 
 ### Implementing a custom Hasher
 
@@ -319,4 +379,3 @@ _please_ open an issue first to discuss. All pull requests without a related
 issue will be closed immediately.
 
 Please submit issues relating to bugs & documentation improvements.
-

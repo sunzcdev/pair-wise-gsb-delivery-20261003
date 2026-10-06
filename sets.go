@@ -15,8 +15,9 @@ type Set[T any] struct {
 // NewSet can also take some initial values as varargs.
 func NewSet[T any](hasher Hasher[T], values ...T) Set[T] {
 	m := NewMap[T, struct{}](hasher)
+	owner := newOwner()
 	for _, value := range values {
-		m = m.set(value, struct{}{}, true)
+		m = m.set(value, struct{}{}, owner)
 	}
 	return Set[T]{m}
 }
@@ -85,19 +86,20 @@ func (itr *SetIterator[T]) Next() (val T, ok bool) {
 }
 
 type SetBuilder[T any] struct {
-	s Set[T]
+	s     Set[T]
+	owner *owner
 }
 
 func NewSetBuilder[T any](hasher Hasher[T]) *SetBuilder[T] {
-	return &SetBuilder[T]{s: NewSet(hasher)}
+	return &SetBuilder[T]{s: Set[T]{m: NewMap[T, struct{}](hasher)}, owner: newOwner()}
 }
 
 func (s SetBuilder[T]) Set(val T) {
-	s.s.m = s.s.m.set(val, struct{}{}, true)
+	s.s.m = s.s.m.set(val, struct{}{}, s.owner)
 }
 
 func (s SetBuilder[T]) Delete(val T) {
-	s.s.m = s.s.m.delete(val, true)
+	s.s.m = s.s.m.delete(val, s.owner)
 }
 
 func (s SetBuilder[T]) Has(val T) bool {

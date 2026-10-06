@@ -63,11 +63,12 @@ type List[T any] struct {
 
 // NewList returns a new empty instance of List.
 func NewList[T any](values ...T) *List[T] {
+	owner := newOwner()
 	l := &List[T]{
-		root: &listLeafNode[T]{},
+		root: &listLeafNode[T]{owner: owner},
 	}
 	for _, value := range values {
-		l.append(value, true)
+		l = l.append(value, owner)
 	}
 	return l
 }
@@ -101,59 +102,59 @@ func (l *List[T]) Get(index int) T {
 // method will panic if index is below zero or if the index is greater than
 // or equal to the list size.
 func (l *List[T]) Set(index int, value T) *List[T] {
-	return l.set(index, value, false)
+	return l.set(index, value, nil)
 }
 
-func (l *List[T]) set(index int, value T, mutable bool) *List[T] {
+func (l *List[T]) set(index int, value T, owner *owner) *List[T] {
 	if index < 0 || index >= l.size {
 		panic(fmt.Sprintf("immutable.List.Set: index %d out of bounds", index))
 	}
 	other := l
-	if !mutable {
+	if owner == nil {
 		other = l.clone()
 	}
-	other.root = other.root.set(l.origin+index, value, mutable)
+	other.root = other.root.set(l.origin+index, value, owner)
 	return other
 }
 
 // Append returns a new list with value added to the end of the list.
 func (l *List[T]) Append(value T) *List[T] {
-	return l.append(value, false)
+	return l.append(value, nil)
 }
 
-func (l *List[T]) append(value T, mutable bool) *List[T] {
+func (l *List[T]) append(value T, owner *owner) *List[T] {
 	other := l
-	if !mutable {
+	if owner == nil {
 		other = l.clone()
 	}
 
 	// Expand list to the right if no slots remain.
 	if other.size+other.origin >= l.cap() {
-		newRoot := &listBranchNode[T]{d: other.root.depth() + 1}
+		newRoot := &listBranchNode[T]{d: other.root.depth() + 1, owner: owner}
 		newRoot.children[0] = other.root
 		other.root = newRoot
 	}
 
 	// Increase size and set the last element to the new value.
 	other.size++
-	other.root = other.root.set(other.origin+other.size-1, value, mutable)
+	other.root = other.root.set(other.origin+other.size-1, value, owner)
 	return other
 }
 
 // Prepend returns a new list with value(s) added to the beginning of the list.
 func (l *List[T]) Prepend(value T) *List[T] {
-	return l.prepend(value, false)
+	return l.prepend(value, nil)
 }
 
-func (l *List[T]) prepend(value T, mutable bool) *List[T] {
+func (l *List[T]) prepend(value T, owner *owner) *List[T] {
 	other := l
-	if !mutable {
+	if owner == nil {
 		other = l.clone()
 	}
 
 	// Expand list to the left if no slots remain.
 	if other.origin == 0 {
-		newRoot := &listBranchNode[T]{d: other.root.depth() + 1}
+		newRoot := &listBranchNode[T]{d: other.root.depth() + 1, owner: owner}
 		newRoot.children[listNodeSize-1] = other.root
 		other.root = newRoot
 		other.origin += (listNodeSize - 1) << (other.root.depth() * listNodeBits)
@@ -162,7 +163,7 @@ func (l *List[T]) prepend(value T, mutable bool) *List[T] {
 	// Increase size and move origin back. Update first element to value.
 	other.size++
 	other.origin--
-	other.root = other.root.set(other.origin, value, mutable)
+	other.root = other.root.set(other.origin, value, owner)
 	return other
 }
 
@@ -174,10 +175,10 @@ func (l *List[T]) prepend(value T, mutable bool) *List[T] {
 // Unlike Go slices, references to inaccessible elements will be automatically
 // removed so they can be garbage collected.
 func (l *List[T]) Slice(start, end int) *List[T] {
-	return l.slice(start, end, false)
+	return l.slice(start, end, nil)
 }
 
-func (l *List[T]) slice(start, end int, mutable bool) *List[T] {
+func (l *List[T]) slice(start, end int, owner *owner) *List[T] {
 	// Panics similar to Go slices.
 	if start < 0 || start > l.size {
 		panic(fmt.Sprintf("immutable.List.Slice: start index %d out of bounds", start))
@@ -194,7 +195,7 @@ func (l *List[T]) slice(start, end int, mutable bool) *List[T] {
 
 	// Create copy, if immutable.
 	other := l
-	if !mutable {
+	if owner == nil {
 		other = l.clone()
 	}
 
@@ -212,12 +213,13 @@ func (l *List[T]) slice(start, end int, mutable bool) *List[T] {
 
 		// Replace the current root with the single child & update origin offset.
 		other.origin -= i << (other.root.depth() * listNodeBits)
-		other.root = other.root.(*listBranchNode[T]).children[i]
+		child := other.root.(*listBranchNode[T]).children[i]
+		other.root = child
 	}
 
 	// Ensure all references are removed before start & after end.
-	other.root = other.root.deleteBefore(other.origin, mutable)
-	other.root = other.root.deleteAfter(other.origin+other.size-1, mutable)
+	other.root = other.root.deleteBefore(other.origin, owner)
+	other.root = other.root.deleteAfter(other.origin+other.size-1, owner)
 
 	return other
 }
@@ -231,20 +233,41 @@ func (l *List[T]) Iterator() *ListIterator[T] {
 
 // ListBuilder represents an efficient builder for creating new Lists.
 type ListBuilder[T any] struct {
-	list *List[T] // current state
+	list  *List[T] // current state
+	owner *owner   // in-place mutation token for the builder's nodes
 }
 
 // NewListBuilder returns a new instance of ListBuilder.
 func NewListBuilder[T any]() *ListBuilder[T] {
-	return &ListBuilder[T]{list: NewList[T]()}
+	return &ListBuilder[T]{list: NewList[T](), owner: newOwner()}
+}
+
+// Snapshot returns a read-only copy of the list at its current state. Unlike
+// List(), the builder remains valid and can continue to be mutated after this
+// call. Future mutations copy any nodes shared with the snapshot before they
+// are modified in place, so previously returned snapshots are never affected.
+//
+// Values are shared by reference: the returned list does not deep copy values
+// previously stored in the builder. Mutating a value in place through a pointer
+// after it has been added will be visible in both the builder and its snapshots.
+func (b *ListBuilder[T]) Snapshot() *List[T] {
+	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
+	// Rotate the owner token: the published list keeps sharing nodes tagged
+	// with the old token, while the builder now owns a fresh token. Nodes the
+	// builder mutates next therefore fail the owner check, get copied once, and
+	// are re-tagged with the new token (copy-on-write), leaving the snapshot
+	// intact.
+	b.owner = newOwner()
+	return b.list.clone()
 }
 
 // List returns the current copy of the list.
-// The builder should not be used again after the list after this call.
+// The builder should not be used again after this call.
 func (b *ListBuilder[T]) List() *List[T] {
 	assert(b.list != nil, "immutable.ListBuilder.List(): duplicate call to fetch list")
 	list := b.list
 	b.list = nil
+	b.owner = nil
 	return list
 }
 
@@ -266,26 +289,26 @@ func (b *ListBuilder[T]) Get(index int) T {
 // list size.
 func (b *ListBuilder[T]) Set(index int, value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.set(index, value, true)
+	b.list = b.list.set(index, value, b.owner)
 }
 
 // Append adds value to the end of the list.
 func (b *ListBuilder[T]) Append(value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.append(value, true)
+	b.list = b.list.append(value, b.owner)
 }
 
 // Prepend adds value to the beginning of the list.
 func (b *ListBuilder[T]) Prepend(value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.prepend(value, true)
+	b.list = b.list.prepend(value, b.owner)
 }
 
 // Slice updates the list with a sublist of elements between start and end index.
 // See List.Slice() for more details.
 func (b *ListBuilder[T]) Slice(start, end int) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.slice(start, end, true)
+	b.list = b.list.slice(start, end, b.owner)
 }
 
 // Iterator returns a new iterator for the underlying list.
@@ -305,27 +328,28 @@ const (
 type listNode[T any] interface {
 	depth() uint
 	get(index int) T
-	set(index int, v T, mutable bool) listNode[T]
+	set(index int, v T, owner *owner) listNode[T]
 
 	containsBefore(index int) bool
 	containsAfter(index int) bool
 
-	deleteBefore(index int, mutable bool) listNode[T]
-	deleteAfter(index int, mutable bool) listNode[T]
+	deleteBefore(index int, owner *owner) listNode[T]
+	deleteAfter(index int, owner *owner) listNode[T]
 }
 
 // newListNode returns a leaf node for depth zero, otherwise returns a branch node.
-func newListNode[T any](depth uint) listNode[T] {
+func newListNode[T any](depth uint, owner *owner) listNode[T] {
 	if depth == 0 {
-		return &listLeafNode[T]{}
+		return &listLeafNode[T]{owner: owner}
 	}
-	return &listBranchNode[T]{d: depth}
+	return &listBranchNode[T]{d: depth, owner: owner}
 }
 
 // listBranchNode represents a branch of a List tree at a given depth.
 type listBranchNode[T any] struct {
 	d        uint // depth
 	children [listNodeSize]listNode[T]
+	owner    *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // depth returns the depth of this branch node from the leaf.
@@ -338,24 +362,26 @@ func (n *listBranchNode[T]) get(index int) T {
 }
 
 // set recursively updates the value at index for each lower depth from the node.
-func (n *listBranchNode[T]) set(index int, v T, mutable bool) listNode[T] {
+func (n *listBranchNode[T]) set(index int, v T, owner *owner) listNode[T] {
 	idx := (index >> (n.d * listNodeBits)) & listNodeMask
 
 	// Find child for the given value in the branch. Create new if it doesn't exist.
 	child := n.children[idx]
 	if child == nil {
-		child = newListNode[T](n.depth() - 1)
+		child = newListNode[T](n.depth()-1, owner)
 	}
 
-	// Return a copy of this branch with the new child.
+	// Mutate in place if this node is owned by the caller. Otherwise return a
+	// copy of this branch with the new child so shared snapshots stay intact.
 	var other *listBranchNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 	} else {
 		tmp := *n
 		other = &tmp
+		other.owner = owner
 	}
-	other.children[idx] = child.set(index, v, mutable)
+	other.children[idx] = child.set(index, v, owner)
 	return other
 }
 
@@ -396,7 +422,7 @@ func (n *listBranchNode[T]) containsAfter(index int) bool {
 }
 
 // deleteBefore returns a new node with all elements before index removed.
-func (n *listBranchNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
+func (n *listBranchNode[T]) deleteBefore(index int, owner *owner) listNode[T] {
 	// Ignore if no nodes exist before the given index.
 	if !n.containsBefore(index) {
 		return n
@@ -406,7 +432,7 @@ func (n *listBranchNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
 	idx := (index >> (n.d * listNodeBits)) & listNodeMask
 
 	var other *listBranchNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 		for i := 0; i < idx; i++ {
 			n.children[i] = nil
@@ -414,16 +440,17 @@ func (n *listBranchNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
 	} else {
 		other = &listBranchNode[T]{d: n.d}
 		copy(other.children[idx:][:], n.children[idx:][:])
+		other.owner = owner
 	}
 
 	if other.children[idx] != nil {
-		other.children[idx] = other.children[idx].deleteBefore(index, mutable)
+		other.children[idx] = other.children[idx].deleteBefore(index, owner)
 	}
 	return other
 }
 
-// deleteBefore returns a new node with all elements before index removed.
-func (n *listBranchNode[T]) deleteAfter(index int, mutable bool) listNode[T] {
+// deleteAfter returns a new node with all elements after index removed.
+func (n *listBranchNode[T]) deleteAfter(index int, owner *owner) listNode[T] {
 	// Ignore if no nodes exist after the given index.
 	if !n.containsAfter(index) {
 		return n
@@ -433,7 +460,7 @@ func (n *listBranchNode[T]) deleteAfter(index int, mutable bool) listNode[T] {
 	idx := (index >> (n.d * listNodeBits)) & listNodeMask
 
 	var other *listBranchNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 		for i := idx + 1; i < len(n.children); i++ {
 			n.children[i] = nil
@@ -441,10 +468,11 @@ func (n *listBranchNode[T]) deleteAfter(index int, mutable bool) listNode[T] {
 	} else {
 		other = &listBranchNode[T]{d: n.d}
 		copy(other.children[:idx+1], n.children[:idx+1])
+		other.owner = owner
 	}
 
 	if other.children[idx] != nil {
-		other.children[idx] = other.children[idx].deleteAfter(index, mutable)
+		other.children[idx] = other.children[idx].deleteAfter(index, owner)
 	}
 	return other
 }
@@ -454,6 +482,7 @@ type listLeafNode[T any] struct {
 	children [listNodeSize]T
 	// bitset with ones at occupied positions, position 0 is the LSB
 	occupied uint32
+	owner    *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // depth always returns 0 for leaf nodes.
@@ -465,14 +494,15 @@ func (n *listLeafNode[T]) get(index int) T {
 }
 
 // set returns a copy of the node with the value at the index updated to v.
-func (n *listLeafNode[T]) set(index int, v T, mutable bool) listNode[T] {
+func (n *listLeafNode[T]) set(index int, v T, owner *owner) listNode[T] {
 	idx := index & listNodeMask
 	var other *listLeafNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 	} else {
 		tmp := *n
 		other = &tmp
+		other.owner = owner
 	}
 	other.children[idx] = v
 	other.occupied |= 1 << idx
@@ -493,14 +523,14 @@ func (n *listLeafNode[T]) containsAfter(index int) bool {
 }
 
 // deleteBefore returns a new node with all elements before index removed.
-func (n *listLeafNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
+func (n *listLeafNode[T]) deleteBefore(index int, owner *owner) listNode[T] {
 	if !n.containsBefore(index) {
 		return n
 	}
 
 	idx := index & listNodeMask
 	var other *listLeafNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 		var empty T
 		for i := 0; i < idx; i++ {
@@ -509,6 +539,7 @@ func (n *listLeafNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
 	} else {
 		other = &listLeafNode[T]{occupied: n.occupied}
 		copy(other.children[idx:][:], n.children[idx:][:])
+		other.owner = owner
 	}
 	// Set the first idx bits to 0.
 	other.occupied &= ^((1 << idx) - 1)
@@ -516,14 +547,14 @@ func (n *listLeafNode[T]) deleteBefore(index int, mutable bool) listNode[T] {
 }
 
 // deleteAfter returns a new node with all elements after index removed.
-func (n *listLeafNode[T]) deleteAfter(index int, mutable bool) listNode[T] {
+func (n *listLeafNode[T]) deleteAfter(index int, owner *owner) listNode[T] {
 	if !n.containsAfter(index) {
 		return n
 	}
 
 	idx := index & listNodeMask
 	var other *listLeafNode[T]
-	if mutable {
+	if owner != nil && owner == n.owner {
 		other = n
 		var empty T
 		for i := idx + 1; i < len(n.children); i++ {
@@ -532,6 +563,7 @@ func (n *listLeafNode[T]) deleteAfter(index int, mutable bool) listNode[T] {
 	} else {
 		other = &listLeafNode[T]{occupied: n.occupied}
 		copy(other.children[:idx+1][:], n.children[:idx+1][:])
+		other.owner = owner
 	}
 	// Set bits after idx to 0. idx < 31 because n.containsAfter(index) == true.
 	other.occupied &= (1 << (idx + 1)) - 1
@@ -707,8 +739,9 @@ func NewMapOf[K comparable, V any](hasher Hasher[K], entries map[K]V) *Map[K, V]
 	m := &Map[K, V]{
 		hasher: hasher,
 	}
+	owner := newOwner()
 	for k, v := range entries {
-		m.set(k, v, true)
+		m = m.set(k, v, owner)
 	}
 	return m
 }
@@ -741,10 +774,10 @@ func (m *Map[K, V]) Get(key K) (value V, ok bool) {
 // This function will return a new map even if the updated value is the same as
 // the existing value because Map does not track value equality.
 func (m *Map[K, V]) Set(key K, value V) *Map[K, V] {
-	return m.set(key, value, false)
+	return m.set(key, value, nil)
 }
 
-func (m *Map[K, V]) set(key K, value V, mutable bool) *Map[K, V] {
+func (m *Map[K, V]) set(key K, value V, owner *owner) *Map[K, V] {
 	// Set a hasher on the first value if one does not already exist.
 	hasher := m.hasher
 	if hasher == nil {
@@ -753,7 +786,7 @@ func (m *Map[K, V]) set(key K, value V, mutable bool) *Map[K, V] {
 
 	// Generate copy if necessary.
 	other := m
-	if !mutable {
+	if owner == nil {
 		other = m.clone()
 	}
 	other.hasher = hasher
@@ -761,14 +794,14 @@ func (m *Map[K, V]) set(key K, value V, mutable bool) *Map[K, V] {
 	// If the map is empty, initialize with a simple array node.
 	if m.root == nil {
 		other.size = 1
-		other.root = &mapArrayNode[K, V]{entries: []mapEntry[K, V]{{key: key, value: value}}}
+		other.root = &mapArrayNode[K, V]{entries: []mapEntry[K, V]{{key: key, value: value}}, owner: owner}
 		return other
 	}
 
 	// Otherwise copy the map and delegate insertion to the root.
 	// Resized will return true if the key does not currently exist.
 	var resized bool
-	other.root = m.root.set(key, value, 0, hasher.Hash(key), hasher, mutable, &resized)
+	other.root = m.root.set(key, value, 0, hasher.Hash(key), hasher, owner, &resized)
 	if resized {
 		other.size++
 	}
@@ -778,10 +811,10 @@ func (m *Map[K, V]) set(key K, value V, mutable bool) *Map[K, V] {
 // Delete returns a map with the given key removed.
 // Removing a non-existent key will cause this method to return the same map.
 func (m *Map[K, V]) Delete(key K) *Map[K, V] {
-	return m.delete(key, false)
+	return m.delete(key, nil)
 }
 
-func (m *Map[K, V]) delete(key K, mutable bool) *Map[K, V] {
+func (m *Map[K, V]) delete(key K, owner *owner) *Map[K, V] {
 	// Return original map if no keys exist.
 	if m.root == nil {
 		return m
@@ -789,14 +822,14 @@ func (m *Map[K, V]) delete(key K, mutable bool) *Map[K, V] {
 
 	// If the delete did not change the node then return the original map.
 	var resized bool
-	newRoot := m.root.delete(key, 0, m.hasher.Hash(key), m.hasher, mutable, &resized)
+	newRoot := m.root.delete(key, 0, m.hasher.Hash(key), m.hasher, owner, &resized)
 	if !resized {
 		return m
 	}
 
 	// Generate copy if necessary.
 	other := m
-	if !mutable {
+	if owner == nil {
 		other = m.clone()
 	}
 
@@ -815,20 +848,40 @@ func (m *Map[K, V]) Iterator() *MapIterator[K, V] {
 
 // MapBuilder represents an efficient builder for creating Maps.
 type MapBuilder[K, V any] struct {
-	m *Map[K, V] // current state
+	m     *Map[K, V] // current state
+	owner *owner     // in-place mutation token for the builder's nodes
 }
 
 // NewMapBuilder returns a new instance of MapBuilder.
 func NewMapBuilder[K, V any](hasher Hasher[K]) *MapBuilder[K, V] {
-	return &MapBuilder[K, V]{m: NewMap[K, V](hasher)}
+	return &MapBuilder[K, V]{m: NewMap[K, V](hasher), owner: newOwner()}
 }
 
-// Map returns the underlying map. Only call once.
-// Builder is invalid after call. Will panic on second invocation.
+// Snapshot returns a read-only copy of the map at its current state. Unlike
+// Map(), the builder remains valid and can continue to be mutated after this
+// call. Future mutations copy any trie nodes shared with the snapshot before
+// they are modified in place, so previously returned snapshots are never
+// affected.
+//
+// Values are shared by reference: the returned map does not deep copy values
+// previously stored in the builder. Mutating a value in place through a pointer
+// after it has been added will be visible in both the builder and its snapshots.
+func (b *MapBuilder[K, V]) Snapshot() *Map[K, V] {
+	assert(b.m != nil, "immutable.MapBuilder: builder invalid after Map() invocation")
+	// Rotate the owner token so subsequent builder mutations copy any nodes
+	// shared with the returned snapshot before modifying them in place. See
+	// ListBuilder.Snapshot() for details.
+	b.owner = newOwner()
+	return b.m.clone()
+}
+
+// Map returns the underlying map. The builder is invalid after this call and
+// will panic on any further use, including a second invocation of Map().
 func (b *MapBuilder[K, V]) Map() *Map[K, V] {
-	assert(b.m != nil, "immutable.SortedMapBuilder.Map(): duplicate call to fetch map")
+	assert(b.m != nil, "immutable.MapBuilder.Map(): duplicate call to fetch map")
 	m := b.m
 	b.m = nil
+	b.owner = nil
 	return m
 }
 
@@ -847,13 +900,13 @@ func (b *MapBuilder[K, V]) Get(key K) (value V, ok bool) {
 // Set sets the value of the given key. See Map.Set() for additional details.
 func (b *MapBuilder[K, V]) Set(key K, value V) {
 	assert(b.m != nil, "immutable.MapBuilder: builder invalid after Map() invocation")
-	b.m = b.m.set(key, value, true)
+	b.m = b.m.set(key, value, b.owner)
 }
 
 // Delete removes the given key. See Map.Delete() for additional details.
 func (b *MapBuilder[K, V]) Delete(key K) {
 	assert(b.m != nil, "immutable.MapBuilder: builder invalid after Map() invocation")
-	b.m = b.m.delete(key, true)
+	b.m = b.m.delete(key, b.owner)
 }
 
 // Iterator returns a new iterator for the underlying map.
@@ -865,8 +918,8 @@ func (b *MapBuilder[K, V]) Iterator() *MapIterator[K, V] {
 // mapNode represents any node in the map tree.
 type mapNode[K, V any] interface {
 	get(key K, shift uint, keyHash uint32, h Hasher[K]) (value V, ok bool)
-	set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V]
-	delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V]
+	set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V]
+	delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V]
 }
 
 var _ mapNode[string, any] = (*mapArrayNode[string, any])(nil)
@@ -889,6 +942,7 @@ var _ mapLeafNode[string, any] = (*mapHashCollisionNode[string, any])(nil)
 // indexed node once a given threshold size is crossed.
 type mapArrayNode[K, V any] struct {
 	entries []mapEntry[K, V]
+	owner   *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // indexOf returns the entry index of the given key. Returns -1 if key not found.
@@ -912,7 +966,7 @@ func (n *mapArrayNode[K, V]) get(key K, shift uint, keyHash uint32, h Hasher[K])
 
 // set inserts or updates the value for a given key. If the key is inserted and
 // the new size crosses the max size threshold, a bitmap indexed node is returned.
-func (n *mapArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	idx := n.indexOf(key, h)
 
 	// Mark as resized if the key doesn't exist.
@@ -923,15 +977,15 @@ func (n *mapArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h H
 	// If we are adding and it crosses the max size threshold, expand the node.
 	// We do this by continually setting the entries to a value node and expanding.
 	if idx == -1 && len(n.entries) >= maxArrayMapSize {
-		var node mapNode[K, V] = newMapValueNode(h.Hash(key), key, value)
+		var node mapNode[K, V] = newMapValueNode(h.Hash(key), key, value, nil)
 		for _, entry := range n.entries {
-			node = node.set(entry.key, entry.value, 0, h.Hash(entry.key), h, false, resized)
+			node = node.set(entry.key, entry.value, 0, h.Hash(entry.key), h, nil, resized)
 		}
 		return node
 	}
 
 	// Update in-place if mutable.
-	if mutable {
+	if owner != nil && owner == n.owner {
 		if idx != -1 {
 			n.entries[idx] = mapEntry[K, V]{key, value}
 		} else {
@@ -952,12 +1006,13 @@ func (n *mapArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h H
 		copy(other.entries, n.entries)
 		other.entries[len(other.entries)-1] = mapEntry[K, V]{key, value}
 	}
+	other.owner = owner
 	return &other
 }
 
 // delete removes the given key from the node. Returns the same node if key does
 // not exist. Returns a nil node when removing the last entry.
-func (n *mapArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	idx := n.indexOf(key, h)
 
 	// Return original node if key does not exist.
@@ -972,7 +1027,7 @@ func (n *mapArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[
 	}
 
 	// Update in-place, if mutable.
-	if mutable {
+	if owner != nil && owner == n.owner {
 		copy(n.entries[idx:], n.entries[idx+1:])
 		n.entries[len(n.entries)-1] = mapEntry[K, V]{}
 		n.entries = n.entries[:len(n.entries)-1]
@@ -983,6 +1038,7 @@ func (n *mapArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[
 	other := &mapArrayNode[K, V]{entries: make([]mapEntry[K, V], len(n.entries)-1)}
 	copy(other.entries[:idx], n.entries[:idx])
 	copy(other.entries[idx:], n.entries[idx+1:])
+	other.owner = owner
 	return other
 }
 
@@ -992,6 +1048,7 @@ func (n *mapArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[
 type mapBitmapIndexedNode[K, V any] struct {
 	bitmap uint32
 	nodes  []mapNode[K, V]
+	owner  *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // get returns the value for the given key.
@@ -1006,7 +1063,7 @@ func (n *mapBitmapIndexedNode[K, V]) get(key K, shift uint, keyHash uint32, h Ha
 
 // set inserts or updates the value for the given key. If a new key is inserted
 // and the size crosses the max size threshold then a hash array node is returned.
-func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	// Extract the index for the bit segment of the key hash.
 	keyHashFrag := (keyHash >> shift) & mapNodeMask
 
@@ -1026,15 +1083,15 @@ func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uin
 	// If the node doesn't exist then create a simple value leaf node.
 	var newNode mapNode[K, V]
 	if exists {
-		newNode = n.nodes[idx].set(key, value, shift+mapNodeBits, keyHash, h, mutable, resized)
+		newNode = n.nodes[idx].set(key, value, shift+mapNodeBits, keyHash, h, owner, resized)
 	} else {
-		newNode = newMapValueNode(keyHash, key, value)
+		newNode = newMapValueNode(keyHash, key, value, owner)
 	}
 
 	// Convert to a hash-array node once we exceed the max bitmap size.
 	// Copy each node based on their bit position within the bitmap.
 	if !exists && len(n.nodes) > maxBitmapIndexedSize {
-		var other mapHashArrayNode[K, V]
+		other := &mapHashArrayNode[K, V]{owner: owner}
 		for i := uint(0); i < uint(len(other.nodes)); i++ {
 			if n.bitmap&(uint32(1)<<i) != 0 {
 				other.nodes[i] = n.nodes[other.count]
@@ -1043,11 +1100,11 @@ func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uin
 		}
 		other.nodes[keyHashFrag] = newNode
 		other.count++
-		return &other
+		return other
 	}
 
 	// Update in-place if mutable.
-	if mutable {
+	if owner != nil && owner == n.owner {
 		if exists {
 			n.nodes[idx] = newNode
 		} else {
@@ -1059,7 +1116,7 @@ func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uin
 		return n
 	}
 
-	// If node exists at given slot then overwrite it with new node.
+	// If node exists at given slot then overwrite it with new node in a copy.
 	// Otherwise expand the node list and insert new node into appropriate position.
 	other := &mapBitmapIndexedNode[K, V]{bitmap: n.bitmap | bit}
 	if exists {
@@ -1072,13 +1129,14 @@ func (n *mapBitmapIndexedNode[K, V]) set(key K, value V, shift uint, keyHash uin
 		other.nodes[idx] = newNode
 		copy(other.nodes[idx+1:], n.nodes[idx:])
 	}
+	other.owner = owner
 	return other
 }
 
 // delete removes the key from the tree. If the key does not exist then the
 // original node is returned. If removing the last child node then a nil is
 // returned. Note that shrinking the node will not convert it to an array node.
-func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	bit := uint32(1) << ((keyHash >> shift) & mapNodeMask)
 
 	// Return original node if key does not exist.
@@ -1091,7 +1149,7 @@ func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 
 	// Delegate delete to child node.
 	child := n.nodes[idx]
-	newChild := child.delete(key, shift+mapNodeBits, keyHash, h, mutable, resized)
+	newChild := child.delete(key, shift+mapNodeBits, keyHash, h, owner, resized)
 
 	// Return original node if key doesn't exist in child.
 	if !*resized {
@@ -1106,7 +1164,7 @@ func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 		}
 
 		// Update in-place if mutable.
-		if mutable {
+		if owner != nil && owner == n.owner {
 			n.bitmap ^= bit
 			copy(n.nodes[idx:], n.nodes[idx+1:])
 			n.nodes[len(n.nodes)-1] = nil
@@ -1118,14 +1176,16 @@ func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 		other := &mapBitmapIndexedNode[K, V]{bitmap: n.bitmap ^ bit, nodes: make([]mapNode[K, V], len(n.nodes)-1)}
 		copy(other.nodes[:idx], n.nodes[:idx])
 		copy(other.nodes[idx:], n.nodes[idx+1:])
+		other.owner = owner
 		return other
 	}
 
 	// Generate copy, if necessary.
 	other := n
-	if !mutable {
+	if owner == nil || owner != n.owner {
 		other = &mapBitmapIndexedNode[K, V]{bitmap: n.bitmap, nodes: make([]mapNode[K, V], len(n.nodes))}
 		copy(other.nodes, n.nodes)
+		other.owner = owner
 	}
 
 	// Update child.
@@ -1138,11 +1198,13 @@ func (n *mapBitmapIndexedNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 type mapHashArrayNode[K, V any] struct {
 	count uint                       // number of set nodes
 	nodes [mapNodeSize]mapNode[K, V] // child node slots, may contain empties
+	owner *owner                     // if set, the node may be mutated in place by its owning builder
 }
 
 // clone returns a shallow copy of n.
-func (n *mapHashArrayNode[K, V]) clone() *mapHashArrayNode[K, V] {
+func (n *mapHashArrayNode[K, V]) clone(owner *owner) *mapHashArrayNode[K, V] {
 	other := *n
+	other.owner = owner
 	return &other
 }
 
@@ -1156,7 +1218,7 @@ func (n *mapHashArrayNode[K, V]) get(key K, shift uint, keyHash uint32, h Hasher
 }
 
 // set returns a node with the value set for the given key.
-func (n *mapHashArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapHashArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	idx := (keyHash >> shift) & mapNodeMask
 	node := n.nodes[idx]
 
@@ -1165,15 +1227,15 @@ func (n *mapHashArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32,
 	var newNode mapNode[K, V]
 	if node == nil {
 		*resized = true
-		newNode = newMapValueNode(keyHash, key, value)
+		newNode = newMapValueNode(keyHash, key, value, owner)
 	} else {
-		newNode = node.set(key, value, shift+mapNodeBits, keyHash, h, mutable, resized)
+		newNode = node.set(key, value, shift+mapNodeBits, keyHash, h, owner, resized)
 	}
 
 	// Generate copy, if necessary.
 	other := n
-	if !mutable {
-		other = n.clone()
+	if owner == nil || owner != n.owner {
+		other = n.clone(owner)
 	}
 
 	// Update child node (and update size, if new).
@@ -1187,7 +1249,7 @@ func (n *mapHashArrayNode[K, V]) set(key K, value V, shift uint, keyHash uint32,
 // delete returns a node with the given key removed. Returns the same node if
 // the key does not exist. If node shrinks to within bitmap-indexed size then
 // converts to a bitmap-indexed node.
-func (n *mapHashArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapHashArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	idx := (keyHash >> shift) & mapNodeMask
 	node := n.nodes[idx]
 
@@ -1197,14 +1259,14 @@ func (n *mapHashArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Has
 	}
 
 	// Return original node if child is unchanged.
-	newNode := node.delete(key, shift+mapNodeBits, keyHash, h, mutable, resized)
+	newNode := node.delete(key, shift+mapNodeBits, keyHash, h, owner, resized)
 	if !*resized {
 		return n
 	}
 
 	// If we remove a node and drop below a threshold, convert back to bitmap indexed node.
 	if newNode == nil && n.count <= maxBitmapIndexedSize {
-		other := &mapBitmapIndexedNode[K, V]{nodes: make([]mapNode[K, V], 0, n.count-1)}
+		other := &mapBitmapIndexedNode[K, V]{nodes: make([]mapNode[K, V], 0, n.count-1), owner: owner}
 		for i, child := range n.nodes {
 			if child != nil && uint32(i) != idx {
 				other.bitmap |= 1 << uint(i)
@@ -1216,8 +1278,8 @@ func (n *mapHashArrayNode[K, V]) delete(key K, shift uint, keyHash uint32, h Has
 
 	// Generate copy, if necessary.
 	other := n
-	if !mutable {
-		other = n.clone()
+	if owner == nil || owner != n.owner {
+		other = n.clone(owner)
 	}
 
 	// Return copy of node with child updated.
@@ -1235,14 +1297,16 @@ type mapValueNode[K, V any] struct {
 	keyHash uint32
 	key     K
 	value   V
+	owner   *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // newMapValueNode returns a new instance of mapValueNode.
-func newMapValueNode[K, V any](keyHash uint32, key K, value V) *mapValueNode[K, V] {
+func newMapValueNode[K, V any](keyHash uint32, key K, value V, owner *owner) *mapValueNode[K, V] {
 	return &mapValueNode[K, V]{
 		keyHash: keyHash,
 		key:     key,
 		value:   value,
+		owner:   owner,
 	}
 }
 
@@ -1263,34 +1327,34 @@ func (n *mapValueNode[K, V]) get(key K, shift uint, keyHash uint32, h Hasher[K])
 // the node's key then a new value node is returned. If key is not equal to the
 // node's key but has the same hash then a hash collision node is returned.
 // Otherwise the nodes are merged into a branch node.
-func (n *mapValueNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapValueNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	// If the keys match then return a new value node overwriting the value.
 	if h.Equal(n.key, key) {
 		// Update in-place if mutable.
-		if mutable {
+		if owner != nil && owner == n.owner {
 			n.value = value
 			return n
 		}
 		// Otherwise return a new copy.
-		return newMapValueNode(n.keyHash, key, value)
+		return newMapValueNode(n.keyHash, key, value, owner)
 	}
 
 	*resized = true
 
 	// Recursively merge nodes together if key hashes are different.
 	if n.keyHash != keyHash {
-		return mergeIntoNode[K, V](n, shift, keyHash, key, value)
+		return mergeIntoNode[K, V](n, shift, keyHash, key, value, owner)
 	}
 
 	// Merge into collision node if hash matches.
-	return &mapHashCollisionNode[K, V]{keyHash: keyHash, entries: []mapEntry[K, V]{
+	return &mapHashCollisionNode[K, V]{keyHash: keyHash, owner: owner, entries: []mapEntry[K, V]{
 		{key: n.key, value: n.value},
 		{key: key, value: value},
 	}}
 }
 
 // delete returns nil if the key matches the node's key. Otherwise returns the original node.
-func (n *mapValueNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapValueNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	// Return original node if the keys do not match.
 	if !h.Equal(n.key, key) {
 		return n
@@ -1306,6 +1370,7 @@ func (n *mapValueNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[
 type mapHashCollisionNode[K, V any] struct {
 	keyHash uint32 // key hash for all entries
 	entries []mapEntry[K, V]
+	owner   *owner // if set, the node may be mutated in place by its owning builder
 }
 
 // keyHashValue returns the key hash for all entries on the node.
@@ -1335,15 +1400,15 @@ func (n *mapHashCollisionNode[K, V]) get(key K, shift uint, keyHash uint32, h Ha
 }
 
 // set returns a copy of the node with key set to the given value.
-func (n *mapHashCollisionNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapHashCollisionNode[K, V]) set(key K, value V, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	// Merge node with key/value pair if this is not a hash collision.
 	if n.keyHash != keyHash {
 		*resized = true
-		return mergeIntoNode[K, V](n, shift, keyHash, key, value)
+		return mergeIntoNode[K, V](n, shift, keyHash, key, value, owner)
 	}
 
 	// Update in-place if mutable.
-	if mutable {
+	if owner != nil && owner == n.owner {
 		if idx := n.indexOf(key, h); idx == -1 {
 			*resized = true
 			n.entries = append(n.entries, mapEntry[K, V]{key, value})
@@ -1355,7 +1420,7 @@ func (n *mapHashCollisionNode[K, V]) set(key K, value V, shift uint, keyHash uin
 
 	// Append to end of node if key doesn't exist & mark resized.
 	// Otherwise copy nodes and overwrite at matching key index.
-	other := &mapHashCollisionNode[K, V]{keyHash: n.keyHash}
+	other := &mapHashCollisionNode[K, V]{keyHash: n.keyHash, owner: owner}
 	if idx := n.indexOf(key, h); idx == -1 {
 		*resized = true
 		other.entries = make([]mapEntry[K, V], len(n.entries)+1)
@@ -1372,7 +1437,7 @@ func (n *mapHashCollisionNode[K, V]) set(key K, value V, shift uint, keyHash uin
 // delete returns a node with the given key deleted. Returns the same node if
 // the key does not exist. If removing the key would shrink the node to a single
 // entry then a value node is returned.
-func (n *mapHashCollisionNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], mutable bool, resized *bool) mapNode[K, V] {
+func (n *mapHashCollisionNode[K, V]) delete(key K, shift uint, keyHash uint32, h Hasher[K], owner *owner, resized *bool) mapNode[K, V] {
 	idx := n.indexOf(key, h)
 
 	// Return original node if key is not found.
@@ -1389,11 +1454,12 @@ func (n *mapHashCollisionNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 			keyHash: n.keyHash,
 			key:     n.entries[idx^1].key,
 			value:   n.entries[idx^1].value,
+			owner:   owner,
 		}
 	}
 
 	// Remove entry in-place if mutable.
-	if mutable {
+	if owner != nil && owner == n.owner {
 		copy(n.entries[idx:], n.entries[idx+1:])
 		n.entries[len(n.entries)-1] = mapEntry[K, V]{}
 		n.entries = n.entries[:len(n.entries)-1]
@@ -1401,7 +1467,7 @@ func (n *mapHashCollisionNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 	}
 
 	// Return copy without entry if immutable.
-	other := &mapHashCollisionNode[K, V]{keyHash: n.keyHash, entries: make([]mapEntry[K, V], len(n.entries)-1)}
+	other := &mapHashCollisionNode[K, V]{keyHash: n.keyHash, entries: make([]mapEntry[K, V], len(n.entries)-1), owner: owner}
 	copy(other.entries[:idx], n.entries[:idx])
 	copy(other.entries[idx:], n.entries[idx+1:])
 	return other
@@ -1409,16 +1475,16 @@ func (n *mapHashCollisionNode[K, V]) delete(key K, shift uint, keyHash uint32, h
 
 // mergeIntoNode merges a key/value pair into an existing node.
 // Caller must verify that node's keyHash is not equal to keyHash.
-func mergeIntoNode[K, V any](node mapLeafNode[K, V], shift uint, keyHash uint32, key K, value V) mapNode[K, V] {
+func mergeIntoNode[K, V any](node mapLeafNode[K, V], shift uint, keyHash uint32, key K, value V, owner *owner) mapNode[K, V] {
 	idx1 := (node.keyHashValue() >> shift) & mapNodeMask
 	idx2 := (keyHash >> shift) & mapNodeMask
 
 	// Recursively build branch nodes to combine the node and its key.
-	other := &mapBitmapIndexedNode[K, V]{bitmap: (1 << idx1) | (1 << idx2)}
+	other := &mapBitmapIndexedNode[K, V]{bitmap: (1 << idx1) | (1 << idx2), owner: owner}
 	if idx1 == idx2 {
-		other.nodes = []mapNode[K, V]{mergeIntoNode(node, shift+mapNodeBits, keyHash, key, value)}
+		other.nodes = []mapNode[K, V]{mergeIntoNode(node, shift+mapNodeBits, keyHash, key, value, owner)}
 	} else {
-		if newNode := newMapValueNode(keyHash, key, value); idx1 < idx2 {
+		if newNode := newMapValueNode(keyHash, key, value, owner); idx1 < idx2 {
 			other.nodes = []mapNode[K, V]{node, newNode}
 		} else {
 			other.nodes = []mapNode[K, V]{newNode, node}
@@ -2457,3 +2523,13 @@ func assert(condition bool, message string) {
 		panic(message)
 	}
 }
+
+// owner is an identity token used by builders to mark trie nodes that they are
+// allowed to mutate in place. A nil owner represents a published, immutable
+// collection. When a builder publishes a snapshot or its final collection, the
+// shared nodes retain the builder's owner; later mutations copy any node whose
+// owner does not match the builder before changing it (copy-on-write).
+type owner struct{ _ byte }
+
+// newOwner returns a new, unique owner token.
+func newOwner() *owner { return &owner{} }
