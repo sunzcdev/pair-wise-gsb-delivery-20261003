@@ -110,6 +110,8 @@ const (
 	tagNumEpochTime                      = 1
 	tagNumUnsignedBignum                 = 2
 	tagNumNegativeBignum                 = 3
+	tagNumDecimalFraction                = 4
+	tagNumBigFloat                       = 5
 	tagNumExpectedLaterEncodingBase64URL = 21
 	tagNumExpectedLaterEncodingBase64    = 22
 	tagNumExpectedLaterEncodingBase16    = 23

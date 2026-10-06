@@ -40,6 +40,23 @@ Functions that simplify using CBOR Sequences (RFC 8742) include:
 Custom encoding and decoding is possible by implementing standard interfaces for
 user-defined Go types.
 
+# Exact decimal and bigfloat numbers (CBOR tags 4 and 5)
+
+Financial and scientific values that must not pass through float64 use
+[Decimal] (CBOR tag 4, m*10**e) and [BigFloat] (CBOR tag 5, m*2**e). They
+store the coefficient as *math/big.Int and the exponent verbatim, so the
+original scale is preserved; call Canonical for the normalized form.
+
+	var price cbor.Decimal            // tag 4
+	err := cbor.Unmarshal(data, &price)
+	r, err := price.Rat(nil)          // exact *big.Rat; never float64
+	d, err := cbor.RatToDecimal(big.NewRat(1, 3), nil) // ErrNotExact: 1/3 is not finite base 10
+
+Conversions to and from *math/big.Rat and *math/big.Float never round:
+values with no finite expansion in the target base return [ErrNotExact].
+[NumericLimits] bounds exponent, coefficient, and expanded-value sizes so
+hostile messages cannot force large allocations; see [DefaultLimits].
+
 Codec functions are available at package-level (using defaults options) or by
 creating modes from options at runtime.
 
