@@ -4262,7 +4262,7 @@ func TestHostClientTLSMalformedAddrFailsBeforeDial(t *testing.T) {
 		},
 	}
 
-	_, err := c.dialHostHard(time.Second)
+	_, err := c.dialHostHard(time.Second, nil)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -4284,7 +4284,7 @@ func TestHostClientTLSMalformedAddrAllowsExplicitServerName(t *testing.T) {
 		},
 	}
 
-	_, err := c.dialHostHard(time.Second)
+	_, err := c.dialHostHard(time.Second, nil)
 	if !errors.Is(err, dialErr) {
 		t.Fatalf("unexpected error: %v. Expecting %v", err, dialErr)
 	}
@@ -4303,7 +4303,7 @@ func TestHostClientTLSMalformedAddrAllowsExplicitInsecureSkipVerify(t *testing.T
 		},
 	}
 
-	_, err := c.dialHostHard(time.Second)
+	_, err := c.dialHostHard(time.Second, nil)
 	if !errors.Is(err, dialErr) {
 		t.Fatalf("unexpected error: %v. Expecting %v", err, dialErr)
 	}

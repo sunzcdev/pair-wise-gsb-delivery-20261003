@@ -1664,6 +1664,9 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 			}
 		}
 
+		if req.trace != nil {
+			req.traceAttempt = attempts + 1
+		}
 		retry, err = c.do(req, resp)
 		if err == nil || !retry {
 			break
@@ -1842,8 +1845,13 @@ func (c *HostClient) SetMaxConns(newMaxConns int) {
 }
 
 func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool) (cc *clientConn, err error) {
+	return c.acquireConn(reqTimeout, connectionClose, nil)
+}
+
+func (c *HostClient) acquireConn(reqTimeout time.Duration, connectionClose bool, tr *clientTracer) (cc *clientConn, err error) {
 	createConn := false
 	startCleaner := false
+	waitStart := tr.start()
 
 	var n int
 	c.connsLock.Lock()
@@ -1881,6 +1889,7 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 	c.connsLock.Unlock()
 
 	if cc != nil {
+		tr.emitConnWait(waitStart, true, nil)
 		return cc, nil
 	}
 	if !createConn {
@@ -1919,11 +1928,14 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 
 		select {
 		case <-w.ready:
+			tr.emitConnWait(waitStart, false, w.err)
 			return w.conn, w.err
 		case <-tc.C:
 			if timeoutOverridden {
+				tr.emitConnWait(waitStart, false, ErrTimeout)
 				return nil, ErrTimeout
 			}
+			tr.emitConnWait(waitStart, false, ErrNoFreeConns)
 			return nil, ErrNoFreeConns
 		}
 	}
@@ -1932,7 +1944,11 @@ func (c *HostClient) AcquireConn(reqTimeout time.Duration, connectionClose bool)
 		go c.connsCleaner()
 	}
 
-	conn, err := c.dialHostHard(reqTimeout)
+	// A brand new connection is about to be dialed on this goroutine:
+	// close the (near-zero) pool wait phase before the dial phases start.
+	tr.emitConnWait(waitStart, false, nil)
+
+	conn, err := c.dialHostHard(reqTimeout, tr)
 	if err != nil {
 		c.decConnsCount()
 		return nil, err
@@ -1953,7 +1969,7 @@ func (c *HostClient) queueForIdle(w *wantConn) {
 }
 
 func (c *HostClient) dialConnFor(w *wantConn) {
-	conn, err := c.dialHostHard(0)
+	conn, err := c.dialHostHard(0, nil)
 	if err != nil {
 		w.tryDeliver(nil, err)
 		c.decConnsCount()
@@ -2246,7 +2262,7 @@ func (c *HostClient) nextAddr() string {
 	return addr
 }
 
-func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err error) {
+func (c *HostClient) dialHostHard(dialTimeout time.Duration, tr *clientTracer) (conn net.Conn, err error) {
 	// use dialTimeout to control the timeout of each dial. It does not work if dialTimeout is 0 or if
 	// c.DialTimeout has not been set and c.Dial has been set.
 	// attempt to dial all the available hosts before giving up.
@@ -2275,7 +2291,7 @@ func (c *HostClient) dialHostHard(dialTimeout time.Duration) (conn net.Conn, err
 				continue
 			}
 		}
-		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout)
+		conn, err = dialAddr(addr, c.Dial, c.DialTimeout, c.DialDualStack, c.IsTLS, tlsConfig, dialTimeout, c.WriteTimeout, tr)
 		if err == nil {
 			return conn, nil
 		}
@@ -2337,10 +2353,10 @@ func tlsClientHandshake(rawConn net.Conn, tlsConfig *tls.Config, deadline time.T
 
 func dialAddr(
 	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool,
-	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration,
+	tlsConfig *tls.Config, dialTimeout, writeTimeout time.Duration, tr *clientTracer,
 ) (net.Conn, error) {
 	deadline := time.Now().Add(writeTimeout)
-	conn, err := callDialFunc(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout)
+	conn, err := callDialFunc(addr, dial, dialWithTimeout, dialDualStack, isTLS, dialTimeout, tr)
 	if err != nil {
 		return nil, err
 	}
@@ -2354,33 +2370,39 @@ func dialAddr(
 
 	if isTLS && !isTLSAlready {
 		if writeTimeout == 0 {
+			// Lazy handshake: it happens on the first write, so the TLS
+			// time is attributed to the write phase instead.
 			return tls.Client(conn, tlsConfig), nil
 		}
-		return tlsClientHandshake(conn, tlsConfig, deadline)
+		tlsStart := tr.start()
+		tlsConn, err := tlsClientHandshake(conn, tlsConfig, deadline)
+		tr.emit(TracePhaseTLS, tlsStart, err)
+		return tlsConn, err
 	}
 	return conn, nil
 }
 
 func callDialFunc(
-	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool, timeout time.Duration,
+	addr string, dial DialFunc, dialWithTimeout DialFuncWithTimeout, dialDualStack, isTLS bool, timeout time.Duration, tr *clientTracer,
 ) (net.Conn, error) {
 	if dialWithTimeout != nil {
-		return dialWithTimeout(addr, timeout)
+		start := tr.start()
+		conn, err := dialWithTimeout(addr, timeout)
+		tr.emit(TracePhaseDial, start, err)
+		return conn, err
 	}
 	if dial != nil {
-		return dial(addr)
+		start := tr.start()
+		conn, err := dial(addr)
+		tr.emit(TracePhaseDial, start, err)
+		return conn, err
 	}
 	addr = AddMissingPort(addr, isTLS)
-	if timeout > 0 {
-		if dialDualStack {
-			return DialDualStackTimeout(addr, timeout)
-		}
-		return DialTimeout(addr, timeout)
+	if timeout <= 0 {
+		timeout = DefaultDialTimeout
 	}
-	if dialDualStack {
-		return DialDualStack(addr)
-	}
-	return Dial(addr)
+	// The built-in dialer reports DNS and TCP connect phases separately.
+	return defaultDialer.dial(addr, dialDualStack, timeout, tr)
 }
 
 // AddMissingPort adds a port to a host if it is missing.
@@ -3073,7 +3095,7 @@ func (c *pipelineConnClient) worker(chs *pipelineConnChannels) error {
 			return err
 		}
 	}
-	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout)
+	conn, err := dialAddr(c.Addr, c.Dial, nil, c.DialDualStack, c.IsTLS, tlsConfig, 0, c.WriteTimeout, nil)
 	if err != nil {
 		return err
 	}
@@ -3407,12 +3429,14 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	customSkipBody := resp.SkipBody
 	customStreamBody := resp.StreamBody
 
+	tr := newClientTracer(req)
+
 	var deadline time.Time
 	if req.timeout > 0 {
 		deadline = time.Now().Add(req.timeout)
 	}
 
-	cc, err := hc.AcquireConn(req.timeout, req.ConnectionClose())
+	cc, err := hc.acquireConn(req.timeout, req.ConnectionClose(), tr)
 	if err != nil {
 		return false, err
 	}
@@ -3440,6 +3464,7 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	}
 
 	bw := hc.AcquireWriter(conn)
+	writeStart := tr.start()
 	err = req.Write(bw)
 
 	if resetConnection {
@@ -3455,6 +3480,9 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 	if x, ok := err.(interface{ Timeout() bool }); ok && x.Timeout() {
 		err = ErrTimeout
 	}
+
+	writeEnd := tr.start()
+	tr.emit(TracePhaseWrite, writeStart, err)
 
 	if err != nil {
 		hc.CloseConn(cc)
@@ -3481,8 +3509,18 @@ func (t *transport) RoundTrip(hc *HostClient, req *Request, resp *Response) (ret
 		resp.Header.DisableNormalizing()
 	}
 
-	br := hc.AcquireReader(conn)
+	readConn := conn
+	var fbConn *firstByteConn
+	if tr != nil {
+		fbConn = &firstByteConn{Conn: conn}
+		readConn = fbConn
+	}
+
+	br := hc.AcquireReader(readConn)
 	err = resp.ReadLimitBody(br, hc.MaxResponseBodySize)
+	if fbConn != nil {
+		tr.emitFirstByte(writeEnd, fbConn.firstByte, err)
+	}
 	if err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)

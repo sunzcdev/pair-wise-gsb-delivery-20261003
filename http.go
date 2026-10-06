@@ -76,6 +76,12 @@ type Request struct {
 	// by Request.CopyTo; it is scoped to the helper's synchronous Do call.
 	forceResponseBodyBuffering bool
 
+	// trace, when non-nil, enables per-phase client timing events for this
+	// request. traceAttempt is the 1-based retry attempt maintained by
+	// HostClient.Do. Neither is copied by Request.CopyTo.
+	trace        *ClientTrace
+	traceAttempt int
+
 	// Used by Server to indicate the request was received on a HTTPS endpoint.
 	// Client/HostClient shouldn't use this field but should depend on the uri.scheme instead.
 	isTLS bool
@@ -1324,6 +1330,8 @@ func (req *Request) Reset() {
 	req.resetSkipHeader()
 	req.timeout = 0
 	req.forceResponseBodyBuffering = false
+	req.trace = nil
+	req.traceAttempt = 0
 	req.UseHostHeader = false
 	req.DisableRedirectPathNormalizing = false
 }

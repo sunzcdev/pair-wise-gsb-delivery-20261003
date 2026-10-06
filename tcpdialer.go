@@ -190,7 +190,7 @@ type TCPDialer struct {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) Dial(addr string) (net.Conn, error) {
-	return d.dial(addr, false, DefaultDialTimeout)
+	return d.dial(addr, false, DefaultDialTimeout, nil)
 }
 
 // DialTimeout dials the given TCP addr using tcp4 using the given timeout.
@@ -215,7 +215,7 @@ func (d *TCPDialer) Dial(addr string) (net.Conn, error) {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	return d.dial(addr, false, timeout)
+	return d.dial(addr, false, timeout, nil)
 }
 
 // DialDualStack dials the given TCP addr using both tcp4 and tcp6.
@@ -243,7 +243,7 @@ func (d *TCPDialer) DialTimeout(addr string, timeout time.Duration) (net.Conn, e
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialDualStack(addr string) (net.Conn, error) {
-	return d.dial(addr, true, DefaultDialTimeout)
+	return d.dial(addr, true, DefaultDialTimeout, nil)
 }
 
 // DialDualStackTimeout dials the given TCP addr using both tcp4 and tcp6
@@ -269,7 +269,7 @@ func (d *TCPDialer) DialDualStack(addr string) (net.Conn, error) {
 //   - foo.bar:80
 //   - aaa.com:8080
 func (d *TCPDialer) DialDualStackTimeout(addr string, timeout time.Duration) (net.Conn, error) {
-	return d.dial(addr, true, timeout)
+	return d.dial(addr, true, timeout, nil)
 }
 
 // FlushDNSCache clears all cached DNS entries, forcing fresh DNS lookups on subsequent dials.
@@ -288,7 +288,7 @@ func FlushDNSCache() {
 	defaultDialer.FlushDNSCache()
 }
 
-func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (net.Conn, error) {
+func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration, tr *clientTracer) (net.Conn, error) {
 	d.once.Do(func() {
 		if d.Concurrency > 0 {
 			d.concurrencyCh = make(chan struct{}, d.Concurrency)
@@ -304,9 +304,9 @@ func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (ne
 		network = "tcp"
 	}
 	if d.DisableDNSResolution {
-		return d.tryDial(network, addr, deadline, d.concurrencyCh)
+		return d.tryDial(network, addr, deadline, d.concurrencyCh, tr)
 	}
-	addrs, idx, err := d.getTCPAddrs(addr, dualStack, deadline)
+	addrs, idx, err := d.getTCPAddrs(addr, dualStack, deadline, tr)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +314,7 @@ func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (ne
 	var conn net.Conn
 	n := uint32(len(addrs)) // #nosec G115
 	for range n {
-		conn, err = d.tryDial(network, addrs[idx%n].String(), deadline, d.concurrencyCh)
+		conn, err = d.tryDial(network, addrs[idx%n].String(), deadline, d.concurrencyCh, tr)
 		if err == nil {
 			return conn, nil
 		}
@@ -327,7 +327,7 @@ func (d *TCPDialer) dial(addr string, dualStack bool, timeout time.Duration) (ne
 }
 
 func (d *TCPDialer) tryDial(
-	network string, addr string, deadline time.Time, concurrencyCh chan struct{},
+	network string, addr string, deadline time.Time, concurrencyCh chan struct{}, tr *clientTracer,
 ) (net.Conn, error) {
 	timeout := time.Until(deadline)
 	if timeout <= 0 {
@@ -360,7 +360,9 @@ func (d *TCPDialer) tryDial(
 
 	ctx, cancelCtx := context.WithDeadline(context.Background(), deadline)
 	defer cancelCtx()
+	dialStart := tr.start()
 	conn, err := dialer.DialContext(ctx, network, addr)
+	tr.emit(TracePhaseDial, dialStart, err)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return nil, wrapDialWithUpstream(ErrDialTimeout, addr)
@@ -475,7 +477,7 @@ func (d *TCPDialer) tcpAddrsClean() {
 	}
 }
 
-func (d *TCPDialer) getTCPAddrs(addr string, dualStack bool, deadline time.Time) ([]net.TCPAddr, uint32, error) {
+func (d *TCPDialer) getTCPAddrs(addr string, dualStack bool, deadline time.Time, tr *clientTracer) ([]net.TCPAddr, uint32, error) {
 	item, exist := d.tcpAddrsMap.Load(addr)
 	e, ok := item.(*tcpAddrEntry)
 	if exist && ok && e != nil && time.Since(e.resolveTime) > d.DNSCacheDuration {
@@ -486,7 +488,9 @@ func (d *TCPDialer) getTCPAddrs(addr string, dualStack bool, deadline time.Time)
 	}
 
 	if e == nil {
+		resolveStart := tr.start()
 		addrs, err := resolveTCPAddrs(addr, dualStack, d.Resolver, deadline)
+		tr.emit(TracePhaseDNS, resolveStart, err)
 		if err != nil {
 			item, exist := d.tcpAddrsMap.Load(addr)
 			e, ok = item.(*tcpAddrEntry)
