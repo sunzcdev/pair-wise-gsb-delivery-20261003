@@ -113,6 +113,34 @@ A target rect is searched for from root to the leaf, and if found it's deleted. 
 
 Same as the original algorithm.
 
+### Joining two trees
+
+`Join` performs a dual-tree traversal that finds every intersecting pair of
+entries across two trees, pruning whole subtrees with the node bounding boxes
+of both sides. The callback receives one entry from each tree; return `false`
+to stop early. `Touches` controls whether boundary-only contact counts as an
+intersection. When joining a tree with itself, `Unique` avoids reporting both
+`(a, b)` and `(b, a)`, and `Self` controls whether an entry is paired with
+itself.
+
+```go
+var tr1, tr2 rtree.RTreeG[string]
+// ... insert regions into both trees ...
+tr1.Join(&tr2, &rtree.JoinOptionsG[string]{Touches: true},
+	func(min1, max1 [2]float64, a string, min2, max2 [2]float64, b string) bool {
+		println(a, "intersects", b)
+		return true // return false to stop early
+	},
+)
+
+// Self join: report each pair once, exclude self pairs
+tr1.Join(&tr1, &rtree.JoinOptionsG[string]{Unique: true},
+	func(min1, max1 [2]float64, a string, min2, max2 [2]float64, b string) bool {
+		return true
+	},
+)
+```
+
 ### Splitting
 
 This is a custom algorithm. It attempts to minimize intensive operations such as pre-sorting the children and comparing overlaps & area sizes. The desire is to do simple single axis distance calculations each child only once, with a target 50/50 chance that the child might be moved in-memory.
@@ -135,4 +163,3 @@ minimum x value.
 ## License
 
 rtree source code is available under the MIT License.
-

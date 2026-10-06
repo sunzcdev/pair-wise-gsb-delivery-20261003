@@ -325,6 +325,13 @@ func (r *rect[N]) intersects(b *rect[N]) bool {
 		b.min[1] > r.max[1] || b.max[1] < r.min[1])
 }
 
+// overlaps returns true when both rects have any positive-area overlap.
+// Unlike intersects, this excludes pairs that only touch on an edge.
+func (r *rect[N]) overlaps(b *rect[N]) bool {
+	return b.min[0] < r.max[0] && b.max[0] > r.min[0] &&
+		b.min[1] < r.max[1] && b.max[1] > r.min[1]
+}
+
 func (n *node[N, T]) chooseLeastEnlargement(ir *rect[N]) (index int) {
 	rects := n.rects[:n.count]
 	var j = -1
@@ -475,6 +482,153 @@ func (n *node[N, T]) scan(iter func(min, max [2]N, data T) bool) bool {
 		for i := 0; i < int(n.count); i++ {
 			if !n.children()[i].scan(iter) {
 				return false
+			}
+		}
+	}
+	return true
+}
+
+// JoinOptionsGN provides options for the RTreeGN Join operation.
+type JoinOptionsGN[N numeric, T any] struct {
+	// Touches indicates whether rectangles that only touch on an edge or
+	// corner, without sharing any positive-area overlap, are considered
+	// intersecting. The default (false) excludes boundary-only contacts.
+	Touches bool
+	// Unique deduplicates pairs when joining a tree with itself, so that
+	// only one of (a, b) and (b, a) is reported. It has no effect when
+	// joining two distinct trees, even when the trees hold identical
+	// entries.
+	Unique bool
+	// Self indicates whether an entry should be paired with itself during
+	// a self join. The default (false) excludes such pairs. It has no
+	// effect when joining two distinct trees.
+	Self bool
+}
+
+// Join performs a dual-tree traversal over tr and other, reporting every
+// pair of intersecting leaf entries through iter. The node bounding boxes
+// from both trees are used to prune entire subtrees at once.
+//
+// The iter callback receives the rectangle and data of one entry from each
+// tree. Returning false from iter stops the traversal early. Join is a
+// read-only operation; it performs no copy-on-write work and never alters
+// either tree or any of its Copy snapshots.
+//
+// See JoinOptionsGN for details on the Touches, Unique, and Self options.
+// The returned value is the number of node pairs visited during traversal.
+func (tr *RTreeGN[N, T]) Join(other *RTreeGN[N, T], opts *JoinOptionsGN[N, T],
+	iter func(min1, max1 [2]N, data1 T, min2, max2 [2]N, data2 T) bool,
+) (visits int) {
+	if other == nil || iter == nil || tr.root == nil || other.root == nil {
+		return 0
+	}
+	var options JoinOptionsGN[N, T]
+	if opts != nil {
+		options = *opts
+	}
+	j := joinState[N, T]{
+		opts:   options,
+		iter:   iter,
+		self:   tr == other,
+		visits: 0,
+	}
+	if !j.meet(&tr.rect, &other.rect) {
+		return 0
+	}
+	j.joinNodes(tr.root, other.root)
+	return j.visits
+}
+
+type joinState[N numeric, T any] struct {
+	opts   JoinOptionsGN[N, T]
+	iter   func(min1, max1 [2]N, data1 T, min2, max2 [2]N, data2 T) bool
+	self   bool
+	visits int
+}
+
+func (j *joinState[N, T]) meet(a, b *rect[N]) bool {
+	if j.opts.Touches {
+		return a.intersects(b)
+	}
+	return a.overlaps(b)
+}
+
+func (j *joinState[N, T]) emit(r1 *rect[N], d1 T, r2 *rect[N], d2 T) bool {
+	return j.iter(r1.min, r1.max, d1, r2.min, r2.max, d2)
+}
+
+// joinNodes pairs every entry from n1 with every intersecting entry from
+// n2. When both nodes are internal the child rectangles drive the pruning.
+// When one side is a leaf, that leaf's own bounding box is compared against
+// the children on the internal side.
+func (j *joinState[N, T]) joinNodes(n1, n2 *node[N, T]) bool {
+	j.visits++
+	rects1 := n1.rects[:n1.count]
+	rects2 := n2.rects[:n2.count]
+	if n1.leaf() && n2.leaf() {
+		items1 := n1.items()
+		items2 := n2.items()
+		sameNode := j.self && n1 == n2
+		for i := 0; i < len(rects1); i++ {
+			start := 0
+			if sameNode {
+				if j.opts.Unique && !j.opts.Self {
+					start = i + 1
+				} else if j.opts.Unique {
+					start = i
+				}
+			}
+			for k := start; k < len(rects2); k++ {
+				if sameNode && !j.opts.Unique && !j.opts.Self && k == i {
+					continue
+				}
+				if j.meet(&rects1[i], &rects2[k]) {
+					if !j.emit(&rects1[i], items1[i],
+						&rects2[k], items2[k]) {
+						return false
+					}
+				}
+			}
+		}
+		return true
+	}
+	if n1.leaf() {
+		children2 := n2.children()
+		r1 := n1.rect()
+		for k := 0; k < len(rects2); k++ {
+			if j.meet(&r1, &rects2[k]) {
+				if !j.joinNodes(n1, children2[k]) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	if n2.leaf() {
+		children1 := n1.children()
+		r2 := n2.rect()
+		for i := 0; i < len(rects1); i++ {
+			if j.meet(&rects1[i], &r2) {
+				if !j.joinNodes(children1[i], n2) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	children1 := n1.children()
+	children2 := n2.children()
+	sameNode := j.self && n1 == n2
+	for i := 0; i < len(rects1); i++ {
+		start := 0
+		if sameNode && j.opts.Unique {
+			start = i
+		}
+		for k := start; k < len(rects2); k++ {
+			if j.meet(&rects1[i], &rects2[k]) {
+				if !j.joinNodes(children1[i], children2[k]) {
+					return false
+				}
 			}
 		}
 	}
@@ -956,6 +1110,50 @@ func (tr *RTreeG[T]) Scan(iter func(min, max [2]float64, data T) bool) {
 	tr.base.Scan(iter)
 }
 
+// JoinOptions provides options for the RTreeG Join operation.
+type JoinOptionsG[T any] struct {
+	// Touches indicates whether rectangles that only touch on an edge or
+	// corner, without sharing any positive-area overlap, are considered
+	// intersecting. The default (false) excludes boundary-only contacts.
+	Touches bool
+	// Unique deduplicates pairs when joining a tree with itself, so that
+	// only one of (a, b) and (b, a) is reported. It has no effect when
+	// joining two distinct trees, even when the trees hold identical
+	// entries.
+	Unique bool
+	// Self indicates whether an entry should be paired with itself during
+	// a self join. The default (false) excludes such pairs. It has no
+	// effect when joining two distinct trees.
+	Self bool
+}
+
+// Join performs a dual-tree traversal over tr and other, reporting every
+// pair of intersecting leaf entries through iter. The node bounding boxes
+// from both trees are used to prune entire subtrees at once.
+//
+// The iter callback receives the rectangle and data of one entry from each
+// tree. Returning false from iter stops the traversal early. Join is a
+// read-only operation and never alters either tree or any Copy snapshot.
+//
+// See JoinOptionsG for details on the Touches, Unique, and Self options.
+func (tr *RTreeG[T]) Join(other *RTreeG[T], opts *JoinOptionsG[T],
+	iter func(min1, max1 [2]float64, data1 T,
+		min2, max2 [2]float64, data2 T) bool,
+) (visits int) {
+	if other == nil {
+		return 0
+	}
+	var baseOpts *JoinOptionsGN[float64, T]
+	if opts != nil {
+		baseOpts = &JoinOptionsGN[float64, T]{
+			Touches: opts.Touches,
+			Unique:  opts.Unique,
+			Self:    opts.Self,
+		}
+	}
+	return tr.base.Join(&other.base, baseOpts, iter)
+}
+
 // Copy the tree.
 // This is a copy-on-write operation and is very fast because it only performs
 // a shadowed copy.
@@ -1107,6 +1305,50 @@ func (tr *RTree) Search(
 // Scan iterates through all data in tree in no specified order.
 func (tr *RTree) Scan(iter func(min, max [2]float64, data any) bool) {
 	tr.base.Scan(iter)
+}
+
+// JoinOptions provides options for the RTree Join operation.
+type JoinOptions struct {
+	// Touches indicates whether rectangles that only touch on an edge or
+	// corner, without sharing any positive-area overlap, are considered
+	// intersecting. The default (false) excludes boundary-only contacts.
+	Touches bool
+	// Unique deduplicates pairs when joining a tree with itself, so that
+	// only one of (a, b) and (b, a) is reported. It has no effect when
+	// joining two distinct trees, even when the trees hold identical
+	// entries.
+	Unique bool
+	// Self indicates whether an entry should be paired with itself during
+	// a self join. The default (false) excludes such pairs. It has no
+	// effect when joining two distinct trees.
+	Self bool
+}
+
+// Join performs a dual-tree traversal over tr and other, reporting every
+// pair of intersecting leaf entries through iter. The node bounding boxes
+// from both trees are used to prune entire subtrees at once.
+//
+// The iter callback receives the rectangle and data of one entry from each
+// tree. Returning false from iter stops the traversal early. Join is a
+// read-only operation and never alters either tree or any Copy snapshot.
+//
+// See JoinOptions for details on the Touches, Unique, and Self options.
+func (tr *RTree) Join(other *RTree, opts *JoinOptions,
+	iter func(min1, max1 [2]float64, data1 any,
+		min2, max2 [2]float64, data2 any) bool,
+) (visits int) {
+	if other == nil {
+		return 0
+	}
+	var baseOpts *JoinOptionsG[any]
+	if opts != nil {
+		baseOpts = &JoinOptionsG[any]{
+			Touches: opts.Touches,
+			Unique:  opts.Unique,
+			Self:    opts.Self,
+		}
+	}
+	return tr.base.Join(&other.base, baseOpts, iter)
 }
 
 // Len returns the number of items in tree
