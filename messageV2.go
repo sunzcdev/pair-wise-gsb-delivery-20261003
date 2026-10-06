@@ -2,6 +2,7 @@ package pglogrepl
 
 import (
 	"encoding/binary"
+	"fmt"
 	"time"
 )
 
@@ -111,6 +112,9 @@ func (m *StreamAbortMessageV2) DecodeV2(src []byte, _ bool) (err error) {
 // inStream must be true when StreamStartMessageV2 has been read
 // it must be false after StreamStopMessageV2 has been read
 func ParseV2(data []byte, inStream bool) (m Message, err error) {
+	if len(data) == 0 {
+		return nil, shortDataError(1, 0)
+	}
 	var decoder MessageDecoder
 	msgType := MessageType(data[0])
 
@@ -174,11 +178,10 @@ func (m *LogicalDecodingMessageV2) DecodeV2(src []byte, inStream bool) (err erro
 		return m.LogicalDecodingMessage.Decode(src)
 	}
 
-	if len(src) < 18 {
-		return m.lengthError("LogicalDecodingMessage", 18, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.LogicalDecodingMessage.Decode(src)
 }
@@ -195,11 +198,10 @@ func (m *RelationMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.RelationMessage.Decode(src)
 	}
 
-	if len(src) < 11 {
-		return m.lengthError("RelationMessageV2", 11, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.RelationMessage.Decode(src)
 }
@@ -216,11 +218,10 @@ func (m *TypeMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.TypeMessage.Decode(src)
 	}
 
-	if len(src) < 10 {
-		return m.lengthError("TypeMessageV2", 10, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.TypeMessage.Decode(src)
 }
@@ -237,11 +238,10 @@ func (m *InsertMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.InsertMessage.Decode(src)
 	}
 
-	if len(src) < 12 {
-		return m.lengthError("InsertMessageV2", 12, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.InsertMessage.Decode(src)
 }
@@ -258,11 +258,10 @@ func (m *UpdateMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.UpdateMessage.Decode(src)
 	}
 
-	if len(src) < 10 {
-		return m.lengthError("UpdateMessageV2", 10, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.UpdateMessage.Decode(src)
 }
@@ -279,11 +278,10 @@ func (m *DeleteMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.DeleteMessage.Decode(src)
 	}
 
-	if len(src) < 8 {
-		return m.lengthError("DeleteMessageV2", 8, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.DeleteMessage.Decode(src)
 }
@@ -300,27 +298,22 @@ func (m *TruncateMessageV2) DecodeV2(src []byte, inStream bool) (err error) {
 		return m.TruncateMessage.Decode(src)
 	}
 
-	if len(src) < 13 {
-		return m.lengthError("TruncateMessageV2", 13, len(src))
+	src, err = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
+	if err != nil {
+		return err
 	}
-
-	src = readXidAndAdvance(src, &m.InStreamMessageV2WithXid, inStream)
 
 	return m.TruncateMessage.Decode(src)
 }
 
-func readXidAndAdvance(src []byte, mXid *InStreamMessageV2WithXid, inStream bool) []byte {
-	var xid uint32
-	var used int
-
-	if inStream {
-		xid, used = decodeUint32(src)
-		mXid.Xid = xid
+func readXidAndAdvance(src []byte, mXid *InStreamMessageV2WithXid, inStream bool) ([]byte, error) {
+	if !inStream {
+		return src, nil
 	}
 
-	return src[used:]
-}
-
-func decodeUint32(src []byte) (uint32, int) {
-	return binary.BigEndian.Uint32(src), 4
+	if err := checkDataLength(src, 4); err != nil {
+		return nil, fmt.Errorf("Xid: %w", err)
+	}
+	mXid.Xid = binary.BigEndian.Uint32(src)
+	return src[4:], nil
 }
