@@ -40,6 +40,15 @@ func predicate(q query) func(NodeNavigator) bool {
 // positionFunc is a XPath Node Set functions position().
 func positionFunc() func(query, iterator) interface{} {
 	return func(q query, t iterator) interface{} {
+		// A node-set that is not backed by a physical axis (a variable binding
+		// or a synthesized list) reports position directly from its own ordered
+		// sequence instead of by walking sibling nodes.
+		type positioner interface {
+			contextPosition(iterator) int
+		}
+		if p, ok := q.(positioner); ok {
+			return float64(p.contextPosition(t))
+		}
 		var (
 			count = 1
 			node  = t.Current().Copy()
@@ -57,6 +66,13 @@ func positionFunc() func(query, iterator) interface{} {
 // lastFunc is a XPath Node Set functions last().
 func lastFunc() func(query, iterator) interface{} {
 	return func(q query, t iterator) interface{} {
+		// See positionFunc: a non-physical node-set knows its own size.
+		type laster interface {
+			contextSize(iterator) int
+		}
+		if l, ok := q.(laster); ok {
+			return float64(l.contextSize(t))
+		}
 		var (
 			count = 0
 			node  = t.Current().Copy()

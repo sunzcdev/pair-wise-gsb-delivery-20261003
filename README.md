@@ -165,3 +165,41 @@ The gxpath supported three types: number, boolean, string.
 | `unparsed-entity-url()` | ✗         |
 
 [^1]: XPath-2.0 expression
+
+#### Variables
+
+Instead of concatenating parameters into the expression string (which is error
+prone with quoting), declare variables at compile time and bind values for each
+evaluation. A compiled expression stores only the declarations, never the
+values, so the same `*Expr` can be evaluated concurrently with different
+bindings.
+
+Variable names are QNames; their prefixes are resolved against the same
+namespace map used to compile the expression. The four XPath 1.0 types are
+supported: `bool`, `float64`, `string` and node-sets (`NodeNavigator` or an
+ordered `[]NodeNavigator`).
+
+```go
+expr, err := xpath.CompileWith("$price > 30", nil, xpath.Var("price"))
+result := expr.EvaluateWith(root, xpath.Bind(xpath.Var("price"), 35.0)) // true
+```
+
+Namespace-qualified variables with the same local name are distinct:
+
+```go
+ns := map[string]string{"a": "http://example.com/a", "b": "http://example.com/b"}
+expr, _ := xpath.CompileWith("$a:x + $b:x", ns, xpath.Var("a:x", ns), xpath.Var("b:x", ns))
+bindings := xpath.Bind(xpath.Var("a:x", ns), 1.0).Bind(xpath.Var("b:x", ns), 2.0)
+sum := expr.EvaluateWith(root, bindings) // 3
+```
+
+A node-set binding has a fixed identity and order and participates in
+`position()` and `last()`:
+
+```go
+expr, _ := xpath.CompileWith("$books[position()=2]", nil, xpath.Var("books"))
+iter := expr.SelectWith(root, xpath.Bind(xpath.Var("books"), nodes))
+```
+
+The legacy `Compile`, `CompileWithNS`, `Evaluate` and `Select` entry points
+continue to work unchanged.

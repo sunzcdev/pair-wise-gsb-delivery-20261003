@@ -41,6 +41,13 @@ var builderProps = struct {
 type builder struct {
 	parseDepth int
 	firstInput query
+	variables  map[VariableName]struct{}
+
+	// nextCluster assigns a shared iteration cluster to a variable node-set and
+	// the positional predicate ($x[position()], $x[last()]) that filters it;
+	// they reference the same build-time query and must share one cursor at
+	// evaluation. Independent references to a variable get distinct clusters.
+	nextCluster int
 }
 
 // axisPredicate creates a predicate to predicating for this axis node.
@@ -730,25 +737,29 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
 		q = &groupQuery{Input: q}
 		b.firstInput = q
 	case nodeVariable:
-		// Variables have no binding in a compiled expression, so they cannot
-		// resolve to a query. A bare "$x" already surfaces as an undeclared
-		// variable error because the nil result reaches the caller, but a
-		// variable nested in a larger expression (e.g. "$x/@attr") would be
-		// swallowed here and left as a nil sub-query that panics at select
-		// time. Report it as undeclared instead.
+		// A variable reference resolves to a query keyed only by its expanded
+		// QName. The query never holds a value, so the same compiled expression
+		// can be evaluated repeatedly with different bindings. The reference is
+		// only valid when the variable was declared for this expression.
 		n := root.(*variableNode)
-		name := n.Name
-		if n.Prefix != "" {
-			name = n.Prefix + ":" + name
+		vn := VariableName{Local: n.Name, Namespace: n.namespaceURI}
+		if _, ok := b.variables[vn]; !ok {
+			err = fmt.Errorf("undeclared variable in XPath expression: $%s", n)
+			return
 		}
-		err = fmt.Errorf("undeclared variable in XPath expression: $%s", name)
+		b.nextCluster++
+		q = newVariableQuery(vn, b.nextCluster)
+		// A node-set variable behaves like any other node-set input: expose it
+		// as the first input so positional predicates such as $x[position()]
+		// and $x[last()] resolve against the bound nodes.
+		b.firstInput = q
 	}
 	b.parseDepth--
 	return
 }
 
 // build builds a specified XPath expressions expr.
-func build(expr string, namespaces map[string]string) (q query, err error) {
+func build(expr string, namespaces map[string]string, declarations map[VariableName]struct{}) (q query, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			switch x := e.(type) {
@@ -762,7 +773,7 @@ func build(expr string, namespaces map[string]string) (q query, err error) {
 		}
 	}()
 	root := parse(expr, namespaces)
-	b := &builder{}
+	b := &builder{variables: declarations}
 	props := builderProps.None
 	return b.processNode(root, flagsEnum.None, &props)
 }

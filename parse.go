@@ -102,11 +102,6 @@ func newAxisNode(axisType string, typeTest NodeType, localName, prefix, prop str
 	return &a
 }
 
-// newVariableNode returns new variable node VariableNode.
-func newVariableNode(prefix, name string) node {
-	return &variableNode{nodeType: nodeVariable, Name: name, Prefix: prefix}
-}
-
 // newFilterNode returns a new filter node FilterNode.
 func newFilterNode(n, m node) node {
 	return &filterNode{nodeType: nodeFilter, Input: n, Condition: m}
@@ -525,7 +520,15 @@ func (p *parser) parsePrimaryExpr(n node) (opnd node) {
 	case itemDollar:
 		p.next()
 		checkItem(p.r, itemName)
-		opnd = newVariableNode(p.r.prefix, p.r.name)
+		variable := &variableNode{nodeType: nodeVariable, Name: p.r.name, Prefix: p.r.prefix}
+		if p.r.prefix != "" {
+			uri, ok := p.namespaces[p.r.prefix]
+			if !ok {
+				panic(fmt.Sprintf("prefix %s not defined.", p.r.prefix))
+			}
+			variable.namespaceURI = uri
+		}
+		opnd = variable
 		p.next()
 	case itemLParens:
 		p.next()
@@ -655,6 +658,7 @@ func (f *filterNode) String() string {
 type variableNode struct {
 	nodeType
 	Name, Prefix string
+	namespaceURI string
 }
 
 func (v *variableNode) String() string {

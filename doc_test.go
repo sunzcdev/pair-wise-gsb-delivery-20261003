@@ -7,6 +7,28 @@ import (
 	"github.com/antchfx/xpath"
 )
 
+func ExampleCompileWith() {
+	nav := &NodeNavigator{}
+
+	// Declare a variable at compile time, bind a value per evaluation.
+	expr, err := xpath.CompileWith("$price > 30", nil, xpath.Var("price"))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(expr.EvaluateWith(nav, xpath.Bind(xpath.Var("price"), 35.0)))
+	fmt.Println(expr.EvaluateWith(nav, xpath.Bind(xpath.Var("price"), 19.99)))
+
+	// Namespace-qualified variables with the same local name are distinct.
+	ns := map[string]string{"a": "http://example.com/a", "b": "http://example.com/b"}
+	add, _ := xpath.CompileWith("$a:x + $b:x", ns, xpath.Var("a:x", ns), xpath.Var("b:x", ns))
+	bindings := xpath.Bind(xpath.Var("a:x", ns), 1.0).Bind(xpath.Var("b:x", ns), 2.0)
+	fmt.Println(add.EvaluateWith(nav, bindings))
+	// Output:
+	// true
+	// false
+	// 3
+}
+
 type NodeType uint
 
 const (

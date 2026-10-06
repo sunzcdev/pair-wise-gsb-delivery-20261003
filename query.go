@@ -225,7 +225,7 @@ func (a *ancestorQuery) Properties() queryProp {
 // position returns the ordinal of the current matched node within the axis
 // traversal for the current input context node. This is required so numeric
 // predicates like [1] or [2] on the ancestor axis resolve in axis order.
-func (a *ancestorQuery) position() int {
+func (a *ancestorQuery) position(_ iterator) int {
 	return a.pos
 }
 
@@ -352,7 +352,7 @@ func (c *childQuery) Properties() queryProp {
 }
 
 // position returns a position of current NodeNavigator.
-func (c *childQuery) position() int {
+func (c *childQuery) position(_ iterator) int {
 	return c.posit
 }
 
@@ -402,7 +402,7 @@ func (c *cachedChildQuery) Evaluate(t iterator) interface{} {
 	return c
 }
 
-func (c *cachedChildQuery) position() int {
+func (c *cachedChildQuery) position(_ iterator) int {
 	return c.posit
 }
 
@@ -494,7 +494,7 @@ func (d *descendantQuery) Test(n NodeNavigator) bool {
 }
 
 // position returns a position of current NodeNavigator.
-func (d *descendantQuery) position() int {
+func (d *descendantQuery) position(_ iterator) int {
 	return d.posit
 }
 
@@ -600,7 +600,7 @@ func (f *followingQuery) Properties() queryProp {
 	return queryProps.Merge
 }
 
-func (f *followingQuery) position() int {
+func (f *followingQuery) position(_ iterator) int {
 	return f.posit
 }
 
@@ -689,7 +689,7 @@ func (p *precedingQuery) Properties() queryProp {
 	return queryProps.Merge | queryProps.Reverse
 }
 
-func (p *precedingQuery) position() int {
+func (p *precedingQuery) position(_ iterator) int {
 	return p.posit
 }
 
@@ -791,7 +791,7 @@ func (f *filterQuery) do(t iterator) bool {
 	case reflect.String:
 		return len(val.String()) > 0
 	case reflect.Float64:
-		pt := getNodePosition(f.Input)
+		pt := getNodePosition(f.Input, t)
 		return int(val.Float()) == pt
 	default:
 		if f.Predicate != nil {
@@ -801,7 +801,7 @@ func (f *filterQuery) do(t iterator) bool {
 	return false
 }
 
-func (f *filterQuery) position() int {
+func (f *filterQuery) position(_ iterator) int {
 	return f.posit
 }
 
@@ -973,8 +973,22 @@ func (g *groupQuery) Properties() queryProp {
 	return queryProps.Position
 }
 
-func (g *groupQuery) position() int {
+func (g *groupQuery) position(t iterator) int {
+	// Delegate to a positional input (e.g. a node-set variable) so ($x)[n]
+	// reads the ordinal within the bound sequence rather than the group's own
+	// counter.
+	if p, ok := g.Input.(*variableQuery); ok {
+		return p.position(t)
+	}
 	return g.posit
+}
+
+// resetCursor propagates a node-set rewind to the grouped input so constructs
+// such as ($x)[last()] can re-select after last() has counted the sequence.
+func (g *groupQuery) resetCursor(t iterator) {
+	if r, ok := g.Input.(*variableQuery); ok {
+		r.resetCursor(t)
+	}
 }
 
 // logicalQuery is an XPath logical expression.
@@ -1220,6 +1234,12 @@ func (q *lastFuncQuery) Select(t iterator) NodeNavigator {
 
 func (q *lastFuncQuery) Evaluate(t iterator) interface{} {
 	if !q.counted {
+		// Count from the start. The filter may already have advanced a shared
+		// node-set input (a variable binding) to the current candidate; rewind
+		// any resettable input so the count covers the whole sequence.
+		if r, ok := q.Input.(interface{ resetCursor(iterator) }); ok {
+			r.resetCursor(t)
+		}
 		for {
 			node := q.Input.Select(t)
 			if node == nil {
@@ -1228,6 +1248,11 @@ func (q *lastFuncQuery) Evaluate(t iterator) interface{} {
 			q.buffer = append(q.buffer, node.Copy())
 		}
 		q.counted = true
+		// Counting consumed the shared input cursor; rewind it again so the
+		// surrounding filter iterates the sequence from the beginning.
+		if r, ok := q.Input.(interface{ resetCursor(iterator) }); ok {
+			r.resetCursor(t)
+		}
 	}
 	return float64(len(q.buffer))
 }
@@ -1317,7 +1342,7 @@ func (d *descendantOverDescendantQuery) Properties() queryProp {
 	return queryProps.Merge
 }
 
-func (d *descendantOverDescendantQuery) position() int {
+func (d *descendantOverDescendantQuery) position(_ iterator) int {
 	return d.posit
 }
 
@@ -1423,12 +1448,12 @@ func getHashCode(n NodeNavigator) uint64 {
 	return h.Sum64()
 }
 
-func getNodePosition(q query) int {
+func getNodePosition(q query, t iterator) int {
 	type Position interface {
-		position() int
+		position(iterator) int
 	}
 	if count, ok := q.(Position); ok {
-		return count.position()
+		return count.position(t)
 	}
 	return 1
 }
