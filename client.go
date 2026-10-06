@@ -28,6 +28,10 @@ type Client struct {
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
+
+	inboundMu        sync.Mutex // protects inboundShared and inboundPerMethod
+	inboundShared    *inboundGate
+	inboundPerMethod map[string]*inboundGate
 }
 
 // NewClient returns a new Client to handle requests to the
@@ -55,6 +59,71 @@ func NewClientWithCodec(codec Codec) *Client {
 // If you have methods that may take a long time, other subsequent requests may time out.
 func (c *Client) SetBlocking(blocking bool) {
 	c.blocking = blocking
+}
+
+// SetInboundLimit sets the admission limit shared by all inbound requests
+// that do not have a per-method limit. It bounds how many handlers run
+// concurrently and how many requests wait for a slot. Calls beyond the
+// limit are rejected with ErrBusy; notifications are dropped and counted.
+// Responses are never subject to the limit, so reading replies cannot
+// stall behind a full inbound queue.
+func (c *Client) SetInboundLimit(limit InboundLimit) {
+	c.inboundMu.Lock()
+	c.inboundShared = newInboundGate(limit)
+	c.inboundMu.Unlock()
+}
+
+// SetMethodInboundLimit sets a dedicated admission limit for a single
+// method, taking precedence over the shared limit set by SetInboundLimit.
+// Methods without a dedicated limit share the common pool.
+func (c *Client) SetMethodInboundLimit(method string, limit InboundLimit) {
+	c.inboundMu.Lock()
+	if c.inboundPerMethod == nil {
+		c.inboundPerMethod = make(map[string]*inboundGate)
+	}
+	c.inboundPerMethod[method] = newInboundGate(limit)
+	c.inboundMu.Unlock()
+}
+
+// InboundStats returns the aggregated admission statistics of all inbound
+// limits configured on the client.
+func (c *Client) InboundStats() InboundStats {
+	c.inboundMu.Lock()
+	defer c.inboundMu.Unlock()
+	var total InboundStats
+	add := func(s InboundStats) {
+		total.Running += s.Running
+		total.Queued += s.Queued
+		total.Rejected += s.Rejected
+		total.Dropped += s.Dropped
+	}
+	if c.inboundShared != nil {
+		add(c.inboundShared.stats())
+	}
+	for _, g := range c.inboundPerMethod {
+		add(g.stats())
+	}
+	return total
+}
+
+func (c *Client) inboundGateFor(method string) *inboundGate {
+	c.inboundMu.Lock()
+	defer c.inboundMu.Unlock()
+	if g, ok := c.inboundPerMethod[method]; ok {
+		return g
+	}
+	return c.inboundShared
+}
+
+func (c *Client) closeInboundGates() {
+	c.inboundMu.Lock()
+	defer c.inboundMu.Unlock()
+	if c.inboundShared != nil {
+		c.inboundShared.close()
+	}
+	for _, g := range c.inboundPerMethod {
+		g.close()
+	}
 }
 
 // Run the client's read loop.
@@ -119,6 +188,7 @@ func (c *Client) readLoop() {
 	}
 	c.mutex.Unlock()
 	c.sending.Unlock()
+	c.closeInboundGates()
 	if err != io.EOF && !closing && !c.server {
 		debugln("rpc2: client protocol error:", err)
 	}
@@ -183,11 +253,35 @@ func (c *Client) readRequest(req *Request) error {
 
 	if c.blocking {
 		c.handleRequest(*req, method, argv)
-	} else {
-		go c.handleRequest(*req, method, argv)
+		return nil
 	}
 
-	return nil
+	// The message body is fully consumed above, so admission below never
+	// leaves the codec stream misaligned.
+	gate := c.inboundGateFor(req.Method)
+	if gate == nil {
+		go c.handleRequest(*req, method, argv)
+		return nil
+	}
+	reqCopy := *req
+	task := inboundTask{
+		seq: reqCopy.Seq,
+		run: func() { c.handleRequest(reqCopy, method, argv) },
+	}
+	if gate.admit(task) {
+		return nil
+	}
+	if req.Seq == 0 {
+		// Drop policy for notifications: discard and count.
+		gate.incDropped()
+		return nil
+	}
+	gate.incRejected()
+	resp := &Response{
+		Seq:   req.Seq,
+		Error: ErrBusy,
+	}
+	return c.codec.WriteResponse(resp, resp)
 }
 
 func (c *Client) readResponse(resp *Response) error {
