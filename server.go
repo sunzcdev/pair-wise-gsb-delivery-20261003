@@ -24,14 +24,16 @@ const (
 
 // Server responds to RPC requests made by Client.
 type Server struct {
-	handlers map[string]*handler
-	eventHub *hub.Hub
+	handlers    map[string]*handler
+	eventHub    *hub.Hub
+	inboundPool *InboundPool
 }
 
 type handler struct {
 	fn        reflect.Value
 	argType   reflect.Type
 	replyType reflect.Type
+	pool      *InboundPool
 }
 
 type connectionEvent struct {
@@ -55,10 +57,23 @@ func NewServer() *Server {
 
 // Handle registers the handler function for the given method. If a handler already exists for method, Handle panics.
 func (s *Server) Handle(method string, handlerFunc interface{}) {
-	addHandler(s.handlers, method, handlerFunc)
+	addHandler(s.handlers, method, handlerFunc, nil)
 }
 
-func addHandler(handlers map[string]*handler, mname string, handlerFunc interface{}) {
+// HandleWithPool is like Handle but executes the handler through pool
+// instead of the server's default inbound pool. The pool is shared by all
+// connections serving this method.
+func (s *Server) HandleWithPool(method string, handlerFunc interface{}, pool *InboundPool) {
+	addHandler(s.handlers, method, handlerFunc, pool)
+}
+
+// SetInboundPool sets the default inbound pool for handlers registered
+// without their own pool. It must be called before serving connections.
+func (s *Server) SetInboundPool(pool *InboundPool) {
+	s.inboundPool = pool
+}
+
+func addHandler(handlers map[string]*handler, mname string, handlerFunc interface{}, pool *InboundPool) {
 	if _, ok := handlers[mname]; ok {
 		panic("rpc2: multiple registrations for " + mname)
 	}
@@ -103,6 +118,7 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		fn:        method,
 		argType:   argType,
 		replyType: replyType,
+		pool:      pool,
 	}
 }
 
@@ -176,6 +192,7 @@ func (s *Server) ServeCodecWithState(codec Codec, state *State) {
 	c := NewClientWithCodec(codec)
 	c.server = true
 	c.handlers = s.handlers
+	c.inboundPool = s.inboundPool
 	c.State = state
 
 	s.eventHub.Publish(connectionEvent{c})

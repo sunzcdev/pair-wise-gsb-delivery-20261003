@@ -79,3 +79,26 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Limiting inbound requests
+---------------
+
+By default every inbound request runs in its own goroutine, so a slow
+method can make the peer spawn an unbounded number of goroutines.
+An `InboundPool` bounds how many handlers run concurrently and how many
+requests may wait for a slot. When the pool is full, calls are rejected
+with an `ErrServerBusy` error (testable with `errors.Is`) and
+notifications are dropped (counted by `Client.DroppedNotifications`).
+Reading replies never goes through the pool, so bidirectional calls
+cannot deadlock on a full pool.
+
+```go
+pool := rpc2.NewInboundPool(rpc2.InboundConfig{MaxConcurrent: 4, QueueSize: 16})
+
+// Default pool for all methods without their own pool.
+srv.SetInboundPool(pool)
+
+// Methods may share a pool or have dedicated limits.
+srv.HandleWithPool("add", addFn, pool)
+srv.HandleWithPool("export", exportFn, rpc2.NewInboundPool(rpc2.InboundConfig{MaxConcurrent: 1}))
+```

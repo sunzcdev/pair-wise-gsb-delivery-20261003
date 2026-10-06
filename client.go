@@ -8,6 +8,7 @@ import (
 	"log"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // Client represents an RPC Client.
@@ -28,6 +29,9 @@ type Client struct {
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
+
+	inboundPool          *InboundPool // default pool for handlers without their own
+	droppedNotifications atomic.Uint64
 }
 
 // NewClient returns a new Client to handle requests to the
@@ -71,7 +75,27 @@ func (c *Client) DisconnectNotify() chan struct{} {
 
 // Handle registers the handler function for the given method. If a handler already exists for method, Handle panics.
 func (c *Client) Handle(method string, handlerFunc interface{}) {
-	addHandler(c.handlers, method, handlerFunc)
+	addHandler(c.handlers, method, handlerFunc, nil)
+}
+
+// HandleWithPool is like Handle but executes the handler through pool
+// instead of the client's default inbound pool.
+func (c *Client) HandleWithPool(method string, handlerFunc interface{}, pool *InboundPool) {
+	addHandler(c.handlers, method, handlerFunc, pool)
+}
+
+// SetInboundPool sets the default inbound pool for handlers registered
+// without their own pool. It must be called before Run. A nil pool restores
+// the default behavior of running every request in its own goroutine.
+func (c *Client) SetInboundPool(pool *InboundPool) {
+	c.inboundPool = pool
+}
+
+// DroppedNotifications returns the number of notifications dropped because
+// the inbound pool was full. Calls are never dropped silently; they are
+// answered with ErrServerBusy instead.
+func (c *Client) DroppedNotifications() uint64 {
+	return c.droppedNotifications.Load()
 }
 
 // readLoop reads messages from codec.
@@ -183,11 +207,36 @@ func (c *Client) readRequest(req *Request) error {
 
 	if c.blocking {
 		c.handleRequest(*req, method, argv)
-	} else {
-		go c.handleRequest(*req, method, argv)
+		return nil
 	}
 
-	return nil
+	pool := method.pool
+	if pool == nil {
+		pool = c.inboundPool
+	}
+	if pool == nil {
+		go c.handleRequest(*req, method, argv)
+		return nil
+	}
+
+	// The full message (header and body) has been read at this point, so
+	// rejecting or queueing here never stalls the read loop mid-message.
+	// Responses are read independently of the pool, therefore a full pool
+	// cannot deadlock bidirectional calls.
+	reqCopy := *req // req is reused by the read loop; capture it now.
+	if pool.tryEnqueue(c.disconnect, func() { c.handleRequest(reqCopy, method, argv) }) {
+		return nil
+	}
+	if req.Seq == 0 {
+		// Notifications have no reply path; drop them explicitly and count.
+		c.droppedNotifications.Add(1)
+		return nil
+	}
+	resp := &Response{
+		Seq:   req.Seq,
+		Error: ErrServerBusy.Error(),
+	}
+	return c.codec.WriteResponse(resp, resp)
 }
 
 func (c *Client) readResponse(resp *Response) error {
@@ -213,7 +262,11 @@ func (c *Client) readResponse(resp *Response) error {
 		// We've got an error response. Give this to the request;
 		// any subsequent requests will get the ReadResponseBody
 		// error if there is one.
-		call.Error = ServerError(resp.Error)
+		if resp.Error == ErrServerBusy.Error() {
+			call.Error = ErrServerBusy
+		} else {
+			call.Error = ServerError(resp.Error)
+		}
 		err = c.codec.ReadResponseBody(nil)
 		if err != nil {
 			err = errors.New("reading error body: " + err.Error())
@@ -306,6 +359,11 @@ func (e ServerError) Error() string {
 
 // ErrShutdown is returned when the connection is closing or closed.
 var ErrShutdown = errors.New("connection is shut down")
+
+// ErrServerBusy is the error a Call receives when the remote peer rejected
+// the request because its inbound pool was full. Use errors.Is to test for
+// it. Notifications are dropped instead and counted by DroppedNotifications.
+var ErrServerBusy = errors.New("rpc2: server busy")
 
 // Call represents an active RPC.
 type Call struct {
