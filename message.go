@@ -10,7 +10,8 @@ import (
 )
 
 var (
-	errMsgNotSupported = errors.New("replication message not supported")
+	errMsgNotSupported  = errors.New("replication message not supported")
+	errMsgLengthInvalid = errors.New("replication message length is invalid")
 )
 
 // MessageType indicates the type of a logical replication message.
@@ -102,15 +103,23 @@ func (m *baseMessage) Decode(_ []byte) error {
 }
 
 func (m *baseMessage) lengthError(name string, expectedLen, actualLen int) error {
-	return fmt.Errorf("%s must have %d bytes, got %d bytes", name, expectedLen, actualLen)
+	return fmt.Errorf("%w: %s must have %d bytes, got %d bytes", errMsgLengthInvalid, name, expectedLen, actualLen)
+}
+
+func (m *baseMessage) truncatedError(name string) error {
+	return fmt.Errorf("%w: %s data is truncated", errMsgLengthInvalid, name)
 }
 
 func (m *baseMessage) decodeStringError(name, field string) error {
-	return fmt.Errorf("%s.%s decode string error", name, field)
+	return fmt.Errorf("%w: %s.%s is not null terminated", errMsgLengthInvalid, name, field)
 }
 
 func (m *baseMessage) decodeTupleDataError(name, field string, e error) error {
-	return fmt.Errorf("%s.%s decode tuple error: %s", name, field, e.Error())
+	return fmt.Errorf("%s.%s decode tuple error: %w", name, field, e)
+}
+
+func (m *baseMessage) invalidTupleDataTypeError(name, field string, actual byte) error {
+	return fmt.Errorf("%s.%s invalid tuple data type %c", name, field, actual)
 }
 
 func (m *baseMessage) invalidTupleTypeError(name, field string, e string, a byte) error {
@@ -228,7 +237,7 @@ type OriginMessage struct {
 
 // Decode decodes to message from src.
 func (m *OriginMessage) Decode(src []byte) error {
-	if len(src) < 8 {
+	if len(src) < 9 {
 		return m.lengthError("OriginMessage", 9, len(src))
 	}
 
@@ -238,6 +247,9 @@ func (m *OriginMessage) Decode(src []byte) error {
 	m.Name, used = m.decodeString(src[low:])
 	if used < 0 {
 		return m.decodeStringError("OriginMessage", "Name")
+	}
+	if low+used > len(src) {
+		return m.truncatedError("OriginMessage")
 	}
 
 	m.SetType(MessageTypeOrigin)
@@ -272,8 +284,8 @@ type RelationMessage struct {
 
 // Decode decodes to message from src.
 func (m *RelationMessage) Decode(src []byte) error {
-	if len(src) < 7 {
-		return m.lengthError("RelationMessage", 7, len(src))
+	if len(src) < 9 {
+		return m.lengthError("RelationMessage", 9, len(src))
 	}
 
 	var low, used int
@@ -292,13 +304,20 @@ func (m *RelationMessage) Decode(src []byte) error {
 	}
 	low += used
 
+	if low+3 > len(src) {
+		return m.truncatedError("RelationMessage")
+	}
 	m.ReplicaIdentity = src[low]
 	low++
 
 	m.ColumnNum, used = m.decodeUint16(src[low:])
 	low += used
 
+	m.Columns = make([]*RelationMessageColumn, 0, m.ColumnNum)
 	for i := 0; i < int(m.ColumnNum); i++ {
+		if low+10 > len(src) {
+			return m.truncatedError("RelationMessage")
+		}
 		column := new(RelationMessageColumn)
 		column.Flags = src[low]
 		low++
@@ -308,6 +327,9 @@ func (m *RelationMessage) Decode(src []byte) error {
 		}
 		low += used
 
+		if low+8 > len(src) {
+			return m.truncatedError("RelationMessage")
+		}
 		column.DataType, used = m.decodeUint32(src[low:])
 		low += used
 
@@ -399,27 +421,44 @@ type TupleData struct {
 
 // Decode decodes to message from src.
 func (m *TupleData) Decode(src []byte) (int, error) {
-	var low, used int
+	const name = "TupleData"
+	if len(src) < 2 {
+		return 0, m.truncatedError(name)
+	}
 
-	m.ColumnNum, used = m.decodeUint16(src)
-	low += used
+	var low int
 
+	m.ColumnNum = binary.BigEndian.Uint16(src)
+	low += 2
+
+	m.Columns = make([]*TupleDataColumn, 0, m.ColumnNum)
 	for i := 0; i < int(m.ColumnNum); i++ {
+		if low >= len(src) {
+			return 0, m.truncatedError(name)
+		}
+
 		column := new(TupleDataColumn)
 		column.DataType = src[low]
 		low += 1
 
 		switch column.DataType {
 		case TupleDataTypeText, TupleDataTypeBinary:
-			column.Length, used = m.decodeUint32(src[low:])
-			low += used
-
-			column.Data = make([]byte, int(column.Length))
-			for j := 0; j < int(column.Length); j++ {
-				column.Data[j] = src[low+j]
+			if low+4 > len(src) {
+				return 0, m.truncatedError(name)
 			}
+			column.Length = binary.BigEndian.Uint32(src[low:])
+			low += 4
+
+			if uint64(low)+uint64(column.Length) > uint64(len(src)) {
+				return 0, m.truncatedError(name)
+			}
+
+			column.Data = make([]byte, column.Length)
+			copy(column.Data, src[low:low+int(column.Length)])
 			low += int(column.Length)
 		case TupleDataTypeNull, TupleDataTypeToast:
+		default:
+			return 0, m.invalidTupleDataTypeError(name, fmt.Sprintf("Column[%d]", i), column.DataType)
 		}
 
 		m.Columns = append(m.Columns, column)
@@ -521,6 +560,9 @@ func (m *UpdateMessage) Decode(src []byte) (err error) {
 			return m.decodeTupleDataError("UpdateMessage", "OldTuple", err)
 		}
 		low += used
+		if low >= len(src) {
+			return m.truncatedError("UpdateMessage")
+		}
 		low++
 		fallthrough
 	case UpdateMessageTupleTypeNew:
@@ -567,8 +609,8 @@ type DeleteMessage struct {
 
 // Decode decodes a message from src.
 func (m *DeleteMessage) Decode(src []byte) (err error) {
-	if len(src) < 4 {
-		return m.lengthError("DeleteMessage", 4, len(src))
+	if len(src) < 5 {
+		return m.lengthError("DeleteMessage", 5, len(src))
 	}
 
 	var low, used int
@@ -619,13 +661,19 @@ func (m *TruncateMessage) Decode(src []byte) (err error) {
 	m.RelationNum, used = m.decodeUint32(src)
 	low += used
 
+	if uint64(low)+1+uint64(m.RelationNum)*4 > uint64(len(src)) {
+		return m.truncatedError("TruncateMessage")
+	}
+
 	m.Option = src[low]
 	low++
 
-	m.RelationIDs = make([]uint32, m.RelationNum)
+	m.RelationIDs = make([]uint32, 0, m.RelationNum)
 	for i := 0; i < int(m.RelationNum); i++ {
-		m.RelationIDs[i], used = m.decodeUint32(src[low:])
+		var relationID uint32
+		relationID, used = m.decodeUint32(src[low:])
 		low += used
+		m.RelationIDs = append(m.RelationIDs, relationID)
 	}
 
 	m.SetType(MessageTypeTruncate)
@@ -659,10 +707,20 @@ func (m *LogicalDecodingMessage) Decode(src []byte) (err error) {
 	low += used
 
 	m.Prefix, used = m.decodeString(src[low:])
+	if used < 0 {
+		return m.decodeStringError("LogicalDecodingMessage", "Prefix")
+	}
 	low += used
 
+	if low+4 > len(src) {
+		return m.truncatedError("LogicalDecodingMessage")
+	}
 	contentLength, used := m.decodeUint32(src[low:])
 	low += used
+
+	if uint64(low)+uint64(contentLength) > uint64(len(src)) {
+		return m.truncatedError("LogicalDecodingMessage")
+	}
 
 	m.Content = src[low : low+int(contentLength)]
 
@@ -673,6 +731,10 @@ func (m *LogicalDecodingMessage) Decode(src []byte) (err error) {
 
 // Parse parse a logical replication message.
 func Parse(data []byte) (m Message, err error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty data", errMsgLengthInvalid)
+	}
+
 	var decoder MessageDecoder
 	msgType := MessageType(data[0])
 	switch msgType {

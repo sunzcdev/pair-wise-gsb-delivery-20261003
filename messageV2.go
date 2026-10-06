@@ -2,6 +2,7 @@ package pglogrepl
 
 import (
 	"encoding/binary"
+	"fmt"
 	"time"
 )
 
@@ -111,6 +112,10 @@ func (m *StreamAbortMessageV2) DecodeV2(src []byte, _ bool) (err error) {
 // inStream must be true when StreamStartMessageV2 has been read
 // it must be false after StreamStopMessageV2 has been read
 func ParseV2(data []byte, inStream bool) (m Message, err error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%w: empty data", errMsgLengthInvalid)
+	}
+
 	var decoder MessageDecoder
 	msgType := MessageType(data[0])
 
