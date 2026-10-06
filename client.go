@@ -28,6 +28,11 @@ type Client struct {
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
+
+	servingMu     sync.Mutex                    // protects serving
+	serving       map[uint64]context.CancelFunc // in-flight incoming requests, by peer's sequence number
+	peerCancel    int32                         // atomic: peer announced cancellation support
+	disableCancel bool                          // disables the cancellation extension (legacy endpoint behavior)
 }
 
 // NewClient returns a new Client to handle requests to the
@@ -45,6 +50,7 @@ func NewClientWithCodec(codec Codec) *Client {
 		codec:      codec,
 		pending:    make(map[uint64]*Call),
 		handlers:   make(map[string]*handler),
+		serving:    make(map[uint64]context.CancelFunc),
 		disconnect: make(chan struct{}),
 		seq:        1, // 0 means notification.
 	}
@@ -82,6 +88,14 @@ func (c *Client) readLoop() {
 	var err error
 	var req Request
 	var resp Response
+
+	// Announce support for the cancellation extension. Sent from a
+	// separate goroutine because the write may block until the peer
+	// starts reading (e.g. on an in-memory pipe).
+	if !c.disableCancel {
+		go c.sendControl(controlMessage{Type: controlHello})
+	}
+
 	for err == nil {
 		req = Request{}
 		resp = Response{}
@@ -90,6 +104,13 @@ func (c *Client) readLoop() {
 		}
 
 		if req.Method != "" {
+			if req.Method == controlMethod && !c.disableCancel {
+				// Control frames are not dispatched to handlers.
+				if err = c.readControl(); err != nil {
+					debugln("rpc2: error reading control frame:", err.Error())
+				}
+				continue
+			}
 			// request comes to server
 			if err = c.readRequest(&req); err != nil {
 				debugln("rpc2: error reading request:", err.Error())
@@ -128,11 +149,33 @@ func (c *Client) readLoop() {
 	}
 }
 
-func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value) {
+func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value, ctx context.Context, cancel context.CancelFunc) {
+	if req.Seq != 0 {
+		defer c.unregisterServing(req.Seq)
+	}
+	defer cancel()
+
 	// Invoke the method, providing a new value for the reply.
 	replyv := reflect.New(method.replyType.Elem())
 
-	returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+	// Do not run the handler if the request was cancelled while queued.
+	if req.Seq != 0 && ctx.Err() != nil {
+		resp := &Response{
+			Seq:   req.Seq,
+			Error: context.Canceled.Error(),
+		}
+		if err := c.codec.WriteResponse(resp, replyv.Interface()); err != nil {
+			debugln("rpc2: error writing response:", err.Error())
+		}
+		return
+	}
+
+	var returnValues []reflect.Value
+	if method.hasCtx {
+		returnValues = method.fn.Call([]reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(c), argv, replyv})
+	} else {
+		returnValues = method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+	}
 
 	// Do not send response if request is a notification.
 	if req.Seq == 0 {
@@ -157,6 +200,10 @@ func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value)
 func (c *Client) readRequest(req *Request) error {
 	method, ok := c.handlers[req.Method]
 	if !ok {
+		// Read and discard the body to keep the stream aligned.
+		if err := c.codec.ReadRequestBody(nil); err != nil {
+			return err
+		}
 		resp := &Response{
 			Seq:   req.Seq,
 			Error: "rpc2: can't find method " + req.Method,
@@ -181,10 +228,18 @@ func (c *Client) readRequest(req *Request) error {
 		argv = argv.Elem()
 	}
 
+	// Track the request so a cancel frame from the peer can abort it.
+	// Notifications (Seq == 0) cannot be cancelled.
+	ctx := context.Background()
+	cancel := context.CancelFunc(func() {})
+	if req.Seq != 0 {
+		ctx, cancel = c.registerServing(req.Seq)
+	}
+
 	if c.blocking {
-		c.handleRequest(*req, method, argv)
+		c.handleRequest(*req, method, argv, ctx, cancel)
 	} else {
-		go c.handleRequest(*req, method, argv)
+		go c.handleRequest(*req, method, argv, ctx, cancel)
 	}
 
 	return nil
@@ -269,15 +324,28 @@ func (c *Client) Go(method string, args interface{}, reply interface{}, done cha
 
 // CallWithContext invokes the named function, waits for it to complete, and
 // returns its error status, or an error from Context timeout.
+//
+// If the context is cancelled before the reply arrives, the call is
+// removed from the pending set and, when both endpoints support the
+// cancellation extension, a cancel signal is sent to the peer so the
+// serving handler can observe the cancellation through its own context.
+// A reply arriving after CallWithContext has returned is read and
+// discarded; it never modifies the reply value.
 func (c *Client) CallWithContext(ctx context.Context, method string, args interface{}, reply interface{}) error {
 	call := c.Go(method, args, reply, make(chan *Call, 1))
 	select {
 	case <-call.Done:
 		return call.Error
 	case <-ctx.Done():
-		return ctx.Err()
+		if c.cancelCall(call) {
+			// We won the race against the response. The late reply
+			// will be read and discarded by the read loop.
+			return ctx.Err()
+		}
+		// The response arrived first; wait for it to be delivered.
+		<-call.Done
+		return call.Error
 	}
-	return nil
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
@@ -314,11 +382,18 @@ type Call struct {
 	Reply  interface{} // The reply from the function (*struct).
 	Error  error       // After completion, the error status.
 	Done   chan *Call  // Strobes when call is complete.
+	seq    uint64      // sequence number assigned by send
 }
 
 func (c *Client) send(call *Call) {
 	c.sending.Lock()
 	defer c.sending.Unlock()
+
+	if call.Method == controlMethod {
+		call.Error = errReservedMethod
+		call.done()
+		return
+	}
 
 	// Register this call.
 	c.mutex.Lock()
@@ -331,6 +406,7 @@ func (c *Client) send(call *Call) {
 	seq := c.seq
 	c.seq++
 	c.pending[seq] = call
+	call.seq = seq
 	c.mutex.Unlock()
 
 	// Encode and send the request.
@@ -353,6 +429,10 @@ func (c *Client) send(call *Call) {
 func (c *Client) Notify(method string, args interface{}) error {
 	c.sending.Lock()
 	defer c.sending.Unlock()
+
+	if method == controlMethod {
+		return errReservedMethod
+	}
 
 	if c.shutdown || c.closing {
 		return ErrShutdown

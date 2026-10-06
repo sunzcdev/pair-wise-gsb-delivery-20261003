@@ -71,8 +71,10 @@ func TestConcurrentResponseWrites(t *testing.T) {
 
 	// Signaled once per WriteResponse, so the test can wait for every
 	// handler's response encode to actually run before it returns.
+	// The +1 accounts for the cancellation-extension hello control frame
+	// the server-side client sends when its read loop starts.
 	var written sync.WaitGroup
-	written.Add(n)
+	written.Add(n + 1)
 
 	srv := rpc2.NewServer()
 	srv.Handle("echo", func(_ *rpc2.Client, args []int, reply *int) error {
@@ -170,9 +172,10 @@ func TestConcurrentRequestAndResponseWrites(t *testing.T) {
 	release := make(chan struct{})
 
 	// One WriteResponse and one WriteRequest (the reverse notification)
-	// per handler.
+	// per handler. The +1 accounts for the cancellation-extension hello
+	// control frame the server-side client sends when its read loop starts.
 	var written sync.WaitGroup
-	written.Add(2 * n)
+	written.Add(2*n + 1)
 
 	srv := rpc2.NewServer()
 	srv.Handle("echo", func(c *rpc2.Client, args []int, reply *int) error {

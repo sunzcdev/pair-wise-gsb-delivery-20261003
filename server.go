@@ -1,6 +1,7 @@
 package rpc2
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 // because Typeof takes an empty interface value.  This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 var typeOfClient = reflect.TypeOf((*Client)(nil))
+var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 
 const (
 	clientConnected hub.Kind = iota
@@ -32,6 +34,7 @@ type handler struct {
 	fn        reflect.Value
 	argType   reflect.Type
 	replyType reflect.Type
+	hasCtx    bool
 }
 
 type connectionEvent struct {
@@ -62,15 +65,30 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if _, ok := handlers[mname]; ok {
 		panic("rpc2: multiple registrations for " + mname)
 	}
+	if mname == controlMethod {
+		panic("rpc2: " + controlMethod + " is a reserved method name")
+	}
 
 	method := reflect.ValueOf(handlerFunc)
 	mtype := method.Type()
 	// Method needs three ins: *client, *args, *reply.
-	if mtype.NumIn() != 3 {
+	// Optionally it takes a leading context.Context argument:
+	// context, *client, *args, *reply.
+	hasCtx := false
+	numIn := mtype.NumIn()
+	if numIn == 4 && mtype.In(0) == typeOfContext {
+		hasCtx = true
+		numIn = 3
+	}
+	if numIn != 3 {
 		log.Panicln("method", mname, "has wrong number of ins:", mtype.NumIn())
 	}
 	// First arg must be a pointer to rpc2.Client.
-	clientType := mtype.In(0)
+	in := 0
+	if hasCtx {
+		in = 1
+	}
+	clientType := mtype.In(in)
 	if clientType.Kind() != reflect.Ptr {
 		log.Panicln("method", mname, "client type not a pointer:", clientType)
 	}
@@ -78,12 +96,12 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		log.Panicln("method", mname, "first argument", clientType.String(), "not *rpc2.Client")
 	}
 	// Second arg need not be a pointer.
-	argType := mtype.In(1)
+	argType := mtype.In(in + 1)
 	if !isExportedOrBuiltinType(argType) {
 		log.Panicln(mname, "argument type not exported:", argType)
 	}
 	// Third arg must be a pointer.
-	replyType := mtype.In(2)
+	replyType := mtype.In(in + 2)
 	if replyType.Kind() != reflect.Ptr {
 		log.Panicln("method", mname, "reply type not a pointer:", replyType)
 	}
@@ -103,6 +121,7 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		fn:        method,
 		argType:   argType,
 		replyType: replyType,
+		hasCtx:    hasCtx,
 	}
 }
 
