@@ -1,6 +1,7 @@
 package rpc2
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 // because Typeof takes an empty interface value.  This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 var typeOfClient = reflect.TypeOf((*Client)(nil))
+var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 
 const (
 	clientConnected hub.Kind = iota
@@ -29,9 +31,10 @@ type Server struct {
 }
 
 type handler struct {
-	fn        reflect.Value
-	argType   reflect.Type
-	replyType reflect.Type
+	fn         reflect.Value
+	argType    reflect.Type
+	replyType  reflect.Type
+	useContext bool
 }
 
 type connectionEvent struct {
@@ -62,13 +65,12 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if _, ok := handlers[mname]; ok {
 		panic("rpc2: multiple registrations for " + mname)
 	}
+	if mname == HelloMethod || mname == CancelMethod {
+		panic("rpc2: method name " + mname + " is reserved")
+	}
 
 	method := reflect.ValueOf(handlerFunc)
 	mtype := method.Type()
-	// Method needs three ins: *client, *args, *reply.
-	if mtype.NumIn() != 3 {
-		log.Panicln("method", mname, "has wrong number of ins:", mtype.NumIn())
-	}
 	// First arg must be a pointer to rpc2.Client.
 	clientType := mtype.In(0)
 	if clientType.Kind() != reflect.Ptr {
@@ -77,13 +79,31 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if clientType != typeOfClient {
 		log.Panicln("method", mname, "first argument", clientType.String(), "not *rpc2.Client")
 	}
-	// Second arg need not be a pointer.
-	argType := mtype.In(1)
+
+	// Handler has one of the two forms:
+	//   func(*Client, *args, *reply) error
+	//   func(*Client, context.Context, *args, *reply) error
+	var argType reflect.Type
+	useContext := false
+	switch mtype.NumIn() {
+	case 3:
+		argType = mtype.In(1)
+	case 4:
+		if mtype.In(1) != typeOfContext {
+			log.Panicln("method", mname, "second argument", mtype.In(1).String(), "not context.Context")
+		}
+		argType = mtype.In(2)
+		useContext = true
+	default:
+		log.Panicln("method", mname, "has wrong number of ins:", mtype.NumIn())
+	}
+
+	// Arg need not be a pointer.
 	if !isExportedOrBuiltinType(argType) {
 		log.Panicln(mname, "argument type not exported:", argType)
 	}
-	// Third arg must be a pointer.
-	replyType := mtype.In(2)
+	// Reply must be a pointer.
+	replyType := mtype.In(mtype.NumIn() - 1)
 	if replyType.Kind() != reflect.Ptr {
 		log.Panicln("method", mname, "reply type not a pointer:", replyType)
 	}
@@ -100,9 +120,10 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		log.Panicln("method", mname, "returns", returnType.String(), "not error")
 	}
 	handlers[mname] = &handler{
-		fn:        method,
-		argType:   argType,
-		replyType: replyType,
+		fn:         method,
+		argType:    argType,
+		replyType:  replyType,
+		useContext: useContext,
 	}
 }
 

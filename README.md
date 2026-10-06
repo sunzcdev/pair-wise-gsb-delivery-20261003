@@ -9,6 +9,20 @@ That means server can call the methods of client.
 This is not possible with net/rpc package.
 In order to do this it adds a `*Client` argument to method signatures.
 
+Features
+--------
+
+- Bi-directional RPC calls.
+- Handler with optional `context.Context` argument:
+  `func(*Client, context.Context, *Args, *Reply) error`.
+  Its context is canceled when the caller cancels the call.
+- `CallWithContext` returns immediately when the context is done.
+  When both endpoints support cancellation, a cancel frame carrying the
+  request number is sent to the peer; handlers and endpoints that do not
+  support the extension keep working unchanged.
+- Late replies to canceled calls are read and discarded so the stream stays
+  aligned; the caller's reply value is never modified after it returns.
+
 Install
 --------
 

@@ -63,12 +63,19 @@ func NewJSONCodec(conn io.ReadWriteCloser) rpc2.Codec {
 
 // serverRequest and clientResponse combined
 type message struct {
-	Method string           `json:"method"`
-	Params *json.RawMessage `json:"params"`
-	Id     *json.RawMessage `json:"id"`
-	Result *json.RawMessage `json:"result"`
-	Error  interface{}      `json:"error"`
+	Method       string           `json:"method"`
+	Params       *json.RawMessage `json:"params"`
+	Id           *json.RawMessage `json:"id"`
+	Result       *json.RawMessage `json:"result"`
+	Error        interface{}      `json:"error"`
+	Capabilities *capabilities    `json:"capabilities,omitempty"`
 }
+
+type capabilities struct {
+	Cancel bool `json:"cancel"`
+}
+
+var localCapabilities = capabilities{Cancel: true}
 
 // Unmarshal to
 type serverRequest struct {
@@ -84,14 +91,16 @@ type clientResponse struct {
 
 // to Marshal
 type serverResponse struct {
-	Id     *json.RawMessage `json:"id"`
-	Result interface{}      `json:"result"`
-	Error  interface{}      `json:"error"`
+	Id           *json.RawMessage `json:"id"`
+	Result       interface{}      `json:"result"`
+	Error        interface{}      `json:"error"`
+	Capabilities *capabilities    `json:"capabilities,omitempty"`
 }
 type clientRequest struct {
-	Method string      `json:"method"`
-	Params interface{} `json:"params"`
-	Id     *uint64     `json:"id"`
+	Method       string        `json:"method"`
+	Params       interface{}   `json:"params"`
+	Id           *uint64       `json:"id"`
+	Capabilities *capabilities `json:"capabilities,omitempty"`
 }
 
 func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
@@ -113,6 +122,7 @@ func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
 		// internal uint64 and save JSON on the side.
 		if c.serverRequest.Id == nil {
 			// Notification
+			req.Seq = 0
 		} else {
 			c.mutex.Lock()
 			c.seq++
@@ -120,6 +130,10 @@ func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
 			c.serverRequest.Id = nil
 			req.Seq = c.seq
 			c.mutex.Unlock()
+		}
+		req.Capabilities = rpc2.Capabilities{}
+		if c.msg.Capabilities != nil {
+			req.Capabilities.Cancel = c.msg.Capabilities.Cancel
 		}
 	} else {
 		// response comes to client
@@ -148,6 +162,10 @@ func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
 				x = "unspecified error"
 			}
 			resp.Error = x
+		}
+		resp.Capabilities = rpc2.Capabilities{}
+		if c.msg.Capabilities != nil {
+			resp.Capabilities.Cancel = c.msg.Capabilities.Cancel
 		}
 	}
 	return nil
@@ -187,10 +205,16 @@ func (c *jsonCodec) ReadResponseBody(x interface{}) error {
 }
 
 func (c *jsonCodec) WriteRequest(r *rpc2.Request, param interface{}) error {
-	req := &clientRequest{Method: r.Method}
+	req := &clientRequest{Method: r.Method, Capabilities: &localCapabilities}
 
-	// Check if param is a slice of any kind
-	if param != nil && reflect.TypeOf(param).Kind() == reflect.Slice {
+	if r.Method == rpc2.CancelMethod {
+		// Cancel frames carry the request number directly.
+		if cr, ok := param.(*rpc2.CancelRequest); ok {
+			req.Params = cr
+		} else {
+			req.Params = param
+		}
+	} else if param != nil && reflect.TypeOf(param).Kind() == reflect.Slice {
 		// If it's a slice, leave as is
 		req.Params = param
 	} else {
@@ -228,6 +252,7 @@ func (c *jsonCodec) WriteResponse(r *rpc2.Response, x interface{}) error {
 		b = &null
 	}
 	resp := serverResponse{Id: b}
+	resp.Capabilities = &localCapabilities
 	if r.Error == "" {
 		resp.Result = x
 	} else {

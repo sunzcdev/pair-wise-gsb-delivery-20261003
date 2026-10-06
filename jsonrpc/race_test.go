@@ -18,32 +18,32 @@ import (
 // has actually run, letting -race miss it.
 type countingCodec struct {
 	rpc2.Codec
-	wg *sync.WaitGroup
+	writes atomic.Int64
 }
 
 func (c *countingCodec) WriteRequest(r *rpc2.Request, body interface{}) error {
-	defer c.wg.Done()
+	defer c.writes.Add(1)
 	return c.Codec.WriteRequest(r, body)
 }
 
 func (c *countingCodec) WriteResponse(r *rpc2.Response, body interface{}) error {
-	defer c.wg.Done()
+	defer c.writes.Add(1)
 	return c.Codec.WriteResponse(r, body)
 }
 
-// waitOrTimeout waits for wg, failing the test if it takes longer than d.
-func waitOrTimeout(t *testing.T, wg *sync.WaitGroup, d time.Duration, msg string) {
+// waitForWrites fails the test unless at least n writes are observed before d.
+// It uses an atomic counter instead of a fixed-size WaitGroup so protocol
+// bookkeeping frames (such as the one-shot capability hello) are counted too.
+func waitForWrites(t *testing.T, codec *countingCodec, n int64, d time.Duration, msg string) {
 	t.Helper()
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(d):
-		t.Fatal(msg)
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if codec.writes.Load() >= n {
+			return
+		}
+		time.Sleep(time.Millisecond)
 	}
+	t.Fatalf("%s (observed %d writes, want >= %d)", msg, codec.writes.Load(), n)
 }
 
 // TestConcurrentResponseWrites checks that responses written by concurrently
@@ -69,11 +69,6 @@ func TestConcurrentResponseWrites(t *testing.T) {
 	arrived.Add(n)
 	release := make(chan struct{})
 
-	// Signaled once per WriteResponse, so the test can wait for every
-	// handler's response encode to actually run before it returns.
-	var written sync.WaitGroup
-	written.Add(n)
-
 	srv := rpc2.NewServer()
 	srv.Handle("echo", func(_ *rpc2.Client, args []int, reply *int) error {
 		*reply = args[0]
@@ -84,6 +79,7 @@ func TestConcurrentResponseWrites(t *testing.T) {
 
 	serverConn := make(chan net.Conn, 1)
 	acceptErr := make(chan error, 1)
+	serverCodec := &countingCodec{}
 	go func() {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -91,7 +87,8 @@ func TestConcurrentResponseWrites(t *testing.T) {
 			return
 		}
 		serverConn <- conn
-		srv.ServeCodec(&countingCodec{Codec: NewJSONCodec(conn), wg: &written})
+		serverCodec.Codec = NewJSONCodec(conn)
+		srv.ServeCodec(serverCodec)
 	}()
 
 	conn, err := net.Dial("tcp4", lis.Addr().String())
@@ -129,7 +126,7 @@ func TestConcurrentResponseWrites(t *testing.T) {
 
 	(<-serverConn).Close()
 	close(release)
-	waitOrTimeout(t, &written, 5*time.Second, "timed out waiting for responses to be written")
+	waitForWrites(t, serverCodec, n, 5*time.Second, "timed out waiting for responses to be written")
 	wg.Wait()
 }
 
@@ -169,11 +166,6 @@ func TestConcurrentRequestAndResponseWrites(t *testing.T) {
 	arrived.Add(n)
 	release := make(chan struct{})
 
-	// One WriteResponse and one WriteRequest (the reverse notification)
-	// per handler.
-	var written sync.WaitGroup
-	written.Add(2 * n)
-
 	srv := rpc2.NewServer()
 	srv.Handle("echo", func(c *rpc2.Client, args []int, reply *int) error {
 		*reply = args[0]
@@ -189,6 +181,7 @@ func TestConcurrentRequestAndResponseWrites(t *testing.T) {
 
 	acceptErr := make(chan error, 1)
 	bconn := make(chan *breakableConn, 1)
+	sc := &countingCodec{}
 	go func() {
 		conn, err := lis.Accept()
 		if err != nil {
@@ -197,7 +190,8 @@ func TestConcurrentRequestAndResponseWrites(t *testing.T) {
 		}
 		bc := &breakableConn{Conn: conn}
 		bconn <- bc
-		srv.ServeCodec(&countingCodec{Codec: NewJSONCodec(bc), wg: &written})
+		sc.Codec = NewJSONCodec(bc)
+		srv.ServeCodec(sc)
 	}()
 
 	conn, err := net.Dial("tcp4", lis.Addr().String())
@@ -236,7 +230,7 @@ func TestConcurrentRequestAndResponseWrites(t *testing.T) {
 	bc := <-bconn
 	bc.broken.Store(true)
 	close(release)
-	waitOrTimeout(t, &written, 5*time.Second, "timed out waiting for writes to complete")
+	waitForWrites(t, sc, 2*n, 5*time.Second, "timed out waiting for writes to complete")
 
 	// Now that every racy write has been counted, actually close the
 	// connection so the client's pending, response-less Calls unblock.
