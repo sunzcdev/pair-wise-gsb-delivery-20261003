@@ -48,6 +48,7 @@ func (ctx *ProxyCtx) RoundTrip(req *http.Request) (*http.Response, error) {
 	if ctx.RoundTripper != nil {
 		return ctx.RoundTripper.RoundTrip(req, ctx)
 	}
+	req = ctx.Proxy.withDialTarget(ctx, req)
 	return ctx.Proxy.Tr.RoundTrip(req)
 }
 

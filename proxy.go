@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 
 	"golang.org/x/net/http2"
 )
@@ -69,9 +70,38 @@ type ProxyHttpServer struct {
 	// Accept-Encoding header. To disable this behavior, set
 	// Tr.DisableCompression to true.
 	KeepAcceptEncoding bool
+	// TargetIPPolicy, when non-nil, is consulted with the IP address the
+	// proxy actually connected to, right after each outbound TCP dial and
+	// before any byte is exchanged. It covers plain HTTP requests (through
+	// Tr) and CONNECT tunnels, and protects against DNS rebinding, where a
+	// hostname re-resolves to a forbidden IP at dial time. Allowed TLS
+	// connections keep the original hostname for SNI and certificate
+	// verification: the dial address is never rewritten.
+	//
+	// The policy receives verified == false when the proxy cannot observe
+	// the real target IP: custom dialers (ProxyCtx.Dialer, ConnectDial,
+	// ConnectDialWithReq) and upstream proxies (Tr.Proxy, ConnectDial from
+	// NewConnectDialToProxy) hide the final destination behind the next
+	// hop. An unverified connection must not be treated as allowed;
+	// NewCIDRBlocklistPolicy rejects them by default.
+	//
+	// Limitations:
+	//   - Set TargetIPPolicy before serving requests. When it is set, the
+	//     proxy wraps Tr.DialContext; a legacy Tr.Dial is then ignored,
+	//     following net/http precedence rules.
+	//   - A custom RoundTripper, Tr.DialTLSContext or Tr.DialContext set
+	//     after the first request bypass the check; compose the policy
+	//     into such custom stacks yourself.
+	//
+	// See NewCIDRBlocklistPolicy for a ready-to-use implementation.
+	TargetIPPolicy TargetIPPolicy
 	// h2Server is the HTTP/2 server instance used for MITM.
 	// It is shared across all connections.
 	h2Server *http2.Server
+	// trDialMu and trDialWrapped guard the lazy, one-time wrapping of
+	// Tr.DialContext for TargetIPPolicy enforcement.
+	trDialMu      sync.Mutex
+	trDialWrapped *http.Transport
 }
 
 func hasPort(s string) bool {

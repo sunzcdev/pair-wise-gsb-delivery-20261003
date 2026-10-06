@@ -166,15 +166,28 @@ func (proxy *ProxyHttpServer) dial(ctx *ProxyCtx, network, addr string) (c net.C
 }
 
 func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
-	if proxy.ConnectDialWithReq == nil && proxy.ConnectDial == nil {
-		return proxy.dial(ctx, network, addr)
+	// verified tells the TargetIPPolicy whether the remote address of the
+	// returned connection is guaranteed to be the real target IP. Custom
+	// dial hooks (ConnectDial, ConnectDialWithReq, ProxyCtx.Dialer) are
+	// opaque to the proxy: they may tunnel through an upstream proxy, in
+	// which case the remote address is the next hop, not the target.
+	verified := false
+	switch {
+	case proxy.ConnectDialWithReq != nil:
+		c, err = proxy.ConnectDialWithReq(ctx.Req, network, addr)
+	case proxy.ConnectDial != nil:
+		c, err = proxy.ConnectDial(network, addr)
+	default:
+		c, err = proxy.dial(ctx, network, addr)
+		verified = ctx.Dialer == nil
 	}
-
-	if proxy.ConnectDialWithReq != nil {
-		return proxy.ConnectDialWithReq(ctx.Req, network, addr)
+	if err != nil {
+		return nil, err
 	}
-
-	return proxy.ConnectDial(network, addr)
+	if err := proxy.checkTargetIP(ctx, c, verified); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 type halfClosable interface {
