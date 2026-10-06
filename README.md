@@ -64,6 +64,31 @@ func main() {
 }
 ```
 
+## Square root
+
+`Sqrt` computes a square root rounded to a target number of decimal places
+using a chosen rounding mode. The whole computation is done with
+arbitrary-precision integers (no `float64`), and the last digit is chosen by
+an exact comparison of the squared rounding midpoint against the radicand, so
+the result is auditable rather than an approximation that "looked stable".
+
+Supported modes are `SqrtRoundToZero`, `SqrtRoundAwayFromZero`,
+`SqrtRoundCeil` (toward +Inf), `SqrtRoundFloor` (toward -Inf),
+`SqrtRoundHalfUp` and `SqrtRoundHalfEven`.
+
+Requests are bounded by `SqrtMaxPrecision`, `SqrtMaxExponent` and
+`SqrtMaxCoeffDigits`; negative radicands and out-of-range precision return an
+error.
+
+```go
+d := decimal.RequireFromString("2")
+
+r, err := d.Sqrt(2, decimal.SqrtRoundHalfEven) // "1.41"
+
+tie := decimal.RequireFromString("2.002225") // sqrt is exactly 1.415
+up, _ := tie.Sqrt(2, decimal.SqrtRoundHalfUp) // "1.42"
+```
+
 ## Alternative libraries
 
 When working with decimal numbers, you might face problems this library is not perfectly suited for. 

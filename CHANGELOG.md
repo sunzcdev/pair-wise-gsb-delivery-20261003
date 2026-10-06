@@ -1,3 +1,8 @@
+## Unreleased
+
+#### FEATURES
+- Add `Sqrt(precision, mode)` for an exact, float64-free, auditable square root with rounding towards zero, away from zero, +Inf, -Inf, half-up and half-even modes; resource use is bounded by `SqrtMaxPrecision`, `SqrtMaxExponent` and `SqrtMaxCoeffDigits`.
+
 ## Decimal v1.4.0
 #### BREAKING
 - Drop support for Go version older than 1.10 [#361](https://github.com/shopspring/decimal/pull/361)
