@@ -127,6 +127,34 @@ fmt.Println(l.Get(1)) // "baz"
 
 Builders are invalid after the call to `List()`.
 
+### Publishing read-only snapshots while building
+
+Sometimes you need to publish an intermediate, read-only view of a collection
+while continuing to add data to the same builder. The `Snapshot()` method
+returns the current `List` (or `Map`) without invalidating the builder:
+
+```go
+b := immutable.NewListBuilder[string]()
+b.Append("foo")
+snap1 := b.Snapshot() // read-only: ["foo"]
+
+b.Append("bar")
+snap2 := b.Snapshot() // read-only: ["foo" "bar"]
+
+fmt.Println(snap1.Len()) // 1
+fmt.Println(snap2.Len()) // 2
+```
+
+Later mutations are never visible on earlier snapshots: after the first
+snapshot, the builder copies only the internal trie nodes touched by each
+write while continuing to share unchanged nodes. Snapshots may be taken any
+number of times and interleaved with writes. The terminating `List()` /
+`Map()` call remains single-use and invalidates the builder as before.
+
+Only the collection structure is isolated. Stored values are not deep copied,
+so mutating a mutable value (such as a pointer, slice, or map) that was added
+to the builder is also visible through every snapshot that contains it.
+
 
 ## Map
 
@@ -230,6 +258,10 @@ fmt.Println(m.Get("bar")) // "200"
 
 Builders are invalid after the call to `Map()`.
 
+As with `ListBuilder`, `MapBuilder` also exposes a non-terminating
+`Snapshot()` method for publishing read-only maps while continuing to build.
+See "Publishing read-only snapshots while building" under the List section.
+
 
 ### Implementing a custom Hasher
 
@@ -319,4 +351,3 @@ _please_ open an issue first to discuss. All pull requests without a related
 issue will be closed immediately.
 
 Please submit issues relating to bugs & documentation improvements.
-

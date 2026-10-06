@@ -231,7 +231,8 @@ func (l *List[T]) Iterator() *ListIterator[T] {
 
 // ListBuilder represents an efficient builder for creating new Lists.
 type ListBuilder[T any] struct {
-	list *List[T] // current state
+	list   *List[T] // current state
+	shared bool     // true after a Snapshot has been published
 }
 
 // NewListBuilder returns a new instance of ListBuilder.
@@ -239,13 +240,37 @@ func NewListBuilder[T any]() *ListBuilder[T] {
 	return &ListBuilder[T]{list: NewList[T]()}
 }
 
-// List returns the current copy of the list.
-// The builder should not be used again after the list after this call.
+// List returns the current copy of the list and terminates the builder.
+// The builder must not be used again after this call. Use Snapshot instead if
+// you need to publish the current state while continuing to build.
 func (b *ListBuilder[T]) List() *List[T] {
 	assert(b.list != nil, "immutable.ListBuilder.List(): duplicate call to fetch list")
 	list := b.list
 	b.list = nil
 	return list
+}
+
+// Snapshot returns a read-only List holding the builder's current state.
+//
+// Unlike List, Snapshot does not terminate the builder: it may continue to be
+// used and any later Append, Prepend, Set, or Slice call is never visible on
+// the returned list. Snapshots may be taken any number of times and may be
+// interleaved with further writes. To isolate the published data, every
+// builder mutation after the first snapshot copies only the trie nodes on the
+// modified path—nodes shared with previously published snapshots are never
+// mutated in place.
+//
+// Only the collection structure is isolated. Element values are shared by
+// reference and are not deep copied: the builder, the returned list, and every
+// other snapshot continue to hold the same value instances. If a stored value
+// is itself mutable (such as a pointer, slice, or map), mutating it after it
+// has been added is visible through the builder and all snapshots that contain
+// it. Store immutable values or defensively copy mutable values before adding
+// them if value-level isolation is required.
+func (b *ListBuilder[T]) Snapshot() *List[T] {
+	assert(b.list != nil, "immutable.ListBuilder.Snapshot(): builder invalid after List() invocation")
+	b.shared = true
+	return b.list
 }
 
 // Len returns the number of elements in the underlying list.
@@ -266,26 +291,26 @@ func (b *ListBuilder[T]) Get(index int) T {
 // list size.
 func (b *ListBuilder[T]) Set(index int, value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.set(index, value, true)
+	b.list = b.list.set(index, value, !b.shared)
 }
 
 // Append adds value to the end of the list.
 func (b *ListBuilder[T]) Append(value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.append(value, true)
+	b.list = b.list.append(value, !b.shared)
 }
 
 // Prepend adds value to the beginning of the list.
 func (b *ListBuilder[T]) Prepend(value T) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.prepend(value, true)
+	b.list = b.list.prepend(value, !b.shared)
 }
 
 // Slice updates the list with a sublist of elements between start and end index.
 // See List.Slice() for more details.
 func (b *ListBuilder[T]) Slice(start, end int) {
 	assert(b.list != nil, "immutable.ListBuilder: builder invalid after List() invocation")
-	b.list = b.list.slice(start, end, true)
+	b.list = b.list.slice(start, end, !b.shared)
 }
 
 // Iterator returns a new iterator for the underlying list.
@@ -815,7 +840,8 @@ func (m *Map[K, V]) Iterator() *MapIterator[K, V] {
 
 // MapBuilder represents an efficient builder for creating Maps.
 type MapBuilder[K, V any] struct {
-	m *Map[K, V] // current state
+	m      *Map[K, V] // current state
+	shared bool       // true after a Snapshot has been published
 }
 
 // NewMapBuilder returns a new instance of MapBuilder.
@@ -825,11 +851,37 @@ func NewMapBuilder[K, V any](hasher Hasher[K]) *MapBuilder[K, V] {
 
 // Map returns the underlying map. Only call once.
 // Builder is invalid after call. Will panic on second invocation.
+// Use Snapshot instead if you need to publish the current state while
+// continuing to build.
 func (b *MapBuilder[K, V]) Map() *Map[K, V] {
 	assert(b.m != nil, "immutable.SortedMapBuilder.Map(): duplicate call to fetch map")
 	m := b.m
 	b.m = nil
 	return m
+}
+
+// Snapshot returns a read-only Map holding the builder's current state.
+//
+// Unlike Map, Snapshot does not terminate the builder: it may continue to be
+// used and any later Set or Delete call is never visible on the returned map.
+// Snapshots may be taken any number of times and may be interleaved with
+// further writes. To isolate the published data, every builder mutation after
+// the first snapshot copies only the HAMT nodes on the modified path—this
+// includes hash collision nodes and node growth or shrinkage triggered by
+// inserts and deletes. Nodes shared with previously published snapshots are
+// never mutated in place.
+//
+// Only the collection structure is isolated. Keys and values are shared by
+// reference and are not deep copied: the builder, the returned map, and every
+// other snapshot continue to hold the same key and value instances. If a
+// stored key or value is itself mutable (such as a pointer, slice, or map),
+// mutating it after it has been added is visible through the builder and all
+// snapshots that contain it. Store immutable keys and values or defensively
+// copy mutable ones before adding them if entry-level isolation is required.
+func (b *MapBuilder[K, V]) Snapshot() *Map[K, V] {
+	assert(b.m != nil, "immutable.MapBuilder.Snapshot(): builder invalid after Map() invocation")
+	b.shared = true
+	return b.m
 }
 
 // Len returns the number of elements in the underlying map.
@@ -847,13 +899,13 @@ func (b *MapBuilder[K, V]) Get(key K) (value V, ok bool) {
 // Set sets the value of the given key. See Map.Set() for additional details.
 func (b *MapBuilder[K, V]) Set(key K, value V) {
 	assert(b.m != nil, "immutable.MapBuilder: builder invalid after Map() invocation")
-	b.m = b.m.set(key, value, true)
+	b.m = b.m.set(key, value, !b.shared)
 }
 
 // Delete removes the given key. See Map.Delete() for additional details.
 func (b *MapBuilder[K, V]) Delete(key K) {
 	assert(b.m != nil, "immutable.MapBuilder: builder invalid after Map() invocation")
-	b.m = b.m.delete(key, true)
+	b.m = b.m.delete(key, !b.shared)
 }
 
 // Iterator returns a new iterator for the underlying map.
