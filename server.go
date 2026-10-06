@@ -486,6 +486,44 @@ type Server struct {
 	// bounded. Calling PostBody or Request.Body reads the entire remaining body
 	// into memory.
 	StreamRequestBody bool
+
+	// MaxPipelinedConcurrency is the maximum number of requests received
+	// on a single connection that may be processed concurrently.
+	//
+	// Responses are always written in the order the requests were
+	// received, regardless of the order in which their handlers finish.
+	// Responses completed out of order are buffered until all earlier
+	// responses have been written; the number of in-flight requests per
+	// connection never exceeds MaxPipelinedConcurrency.
+	//
+	// Only requests explicitly allowed by AllowPipelinedRequest (by
+	// default GET and HEAD requests) and carrying no request body are
+	// eligible. Requests with a body, 'Expect: 100-continue', connection
+	// upgrades and requests closing the connection form a serial
+	// boundary: all earlier pipelined responses are written and flushed
+	// before such a request is handled, so the order of responses
+	// already sent is never changed.
+	//
+	// Handlers of eligible requests run concurrently and must be safe
+	// for concurrent use. A handler may observe connection teardown via
+	// RequestCtx.Done, which is closed when the connection is closed
+	// while the handler is still running. Handlers that hijack the
+	// connection or write to it directly (e.g. via EarlyHints) must be
+	// excluded using AllowPipelinedRequest.
+	//
+	// Values less than or equal to 1 (the default) disable concurrent
+	// processing: requests on a connection are handled one at a time.
+	MaxPipelinedConcurrency int
+
+	// AllowPipelinedRequest reports whether a fully received request may
+	// be processed concurrently with other pipelined requests on the
+	// same connection. It is consulted only when
+	// MaxPipelinedConcurrency > 1 and only for requests without a body,
+	// without an 'Expect: 100-continue' header and without connection
+	// upgrade headers.
+	//
+	// If nil, only GET and HEAD requests are eligible.
+	AllowPipelinedRequest func(ctx *RequestCtx) bool
 }
 
 // TimeoutHandler creates RequestHandler, which returns StatusRequestTimeout
@@ -660,6 +698,11 @@ type RequestCtx struct {
 	hijackHandler HijackHandler
 	formValueFunc FormValueFunc
 	fbr           firstByteReader
+
+	// connDone is non-nil only for requests processed concurrently under
+	// Server.MaxPipelinedConcurrency. It is closed when the connection
+	// is torn down while the handler may still be running.
+	connDone <-chan struct{}
 
 	// Incoming request.
 	//
@@ -923,6 +966,7 @@ func (ctx *RequestCtx) reset() {
 	ctx.remoteAddr = nil
 	ctx.time = zeroTime
 	ctx.c = nil
+	ctx.connDone = nil
 
 	// Don't reset ctx.s!
 	// We have a pool per server so the next time this ctx is used it
@@ -2423,7 +2467,22 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		continueReadingRequest = true
 	)
+
+	// pl is nil unless MaxPipelinedConcurrency > 1 and at least one
+	// request eligible for concurrent pipelined processing was received
+	// on this connection.
+	var pl *pipelineState
+
 	for {
+		if pl != nil && pl.terminated() {
+			// The pipeline writer stopped serving this connection
+			// (write error, 'Connection: close' response or hijack).
+			if err == nil {
+				err = pl.writeErr
+			}
+			break
+		}
+
 		connRequestNum++
 
 		if connRequestNum == 1 {
@@ -2542,6 +2601,10 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 				if err == nil {
 					if err = ctx.Request.parseURI(); err != nil {
+						if pl != nil {
+							// Write all earlier pipelined responses first.
+							pl.barrier()
+						}
 						bw = s.writeErrorResponse(bw, ctx, serverName, err)
 						break
 					}
@@ -2565,6 +2628,13 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		}
 
 		if err != nil {
+			if pl != nil && pl.hijack.Load() != nil {
+				// A pipelined handler hijacked the connection and woke
+				// the read loop up with a past read deadline; the read
+				// error is an artifact of that.
+				err = nil
+				break
+			}
 			if err == io.EOF {
 				err = nil
 			} else if nr, ok := err.(ErrNothingRead); ok {
@@ -2581,6 +2651,10 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			}
 
 			if err != nil {
+				if pl != nil {
+					// Write all earlier pipelined responses first.
+					pl.barrier()
+				}
 				bw = s.writeErrorResponse(bw, ctx, serverName, err)
 			}
 			break
@@ -2589,6 +2663,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		// 'Expect: 100-continue' request handling.
 		// See https://www.rfc-editor.org/rfc/rfc9110.html#field.expect for details.
 		if ctx.Request.MayContinue() {
+			if pl != nil {
+				// The interim '100 Continue' response must not
+				// overtake earlier pipelined responses.
+				pl.barrier()
+			}
 			// Allow the ability to deny reading the incoming request body.
 			if s.ExpectHandler != nil {
 				if expectStatus := s.ExpectHandler(ctx); expectStatus != StatusContinue {
@@ -2644,6 +2723,10 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 					br = nil
 				}
 				if err != nil {
+					if pl != nil {
+						// Write all earlier pipelined responses first.
+						pl.barrier()
+					}
 					bw = s.writeErrorResponse(bw, ctx, serverName, err)
 					break
 				}
@@ -2674,6 +2757,68 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			reqSecond = reqTime.Unix()
 		}
 		ctx.time = reqTime
+
+		if s.MaxPipelinedConcurrency > 1 && continueReadingRequest && !connectionClose &&
+			!(s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn)) && // #nosec G115
+			(pl == nil || !pl.terminated()) &&
+			s.isPipelinableRequest(ctx) {
+			if pl == nil {
+				if bw != nil && bw.Buffered() > 0 {
+					// Flush earlier serial responses before the
+					// pipeline writer starts writing to the
+					// connection.
+					if err = bw.Flush(); err != nil {
+						break
+					}
+				}
+				pl = newPipelineState(s.MaxPipelinedConcurrency)
+				pl.wg.Add(1)
+				go s.pipelineWriter(c, pl, idleConnTime)
+			}
+
+			// Block while the maximum number of in-flight requests is
+			// reached; this bounds the buffering of responses that
+			// completed out of order.
+			select {
+			case pl.slots <- struct{}{}:
+			case <-pl.done:
+			}
+			if pl.terminated() {
+				// The writer stopped while waiting for a free slot.
+				err = pl.writeErr
+				break
+			}
+
+			t := &pipelineTask{
+				ctx:          ctx,
+				finished:     make(chan struct{}),
+				writeTimeout: writeTimeout,
+				serverName:   serverName,
+				isHTTP11:     isHTTP11,
+				reqSecond:    reqSecond,
+			}
+			ctx.connDone = pl.done
+			pl.queue <- t
+			go s.runPipelinedTask(t)
+
+			// The pipelined task owns ctx now; use a fresh one for the
+			// next request.
+			ctx = s.acquireCtx(c)
+			ctx.connTime = connTime
+
+			if s.stop.Load() == 1 {
+				err = nil
+				break
+			}
+			continue
+		}
+
+		// Requests that can't be pipelined form a serial boundary: all
+		// earlier pipelined responses are written and flushed before
+		// this request is handled, preserving response order.
+		if pl != nil {
+			pl.barrier()
+		}
 
 		// If a client denies a request the handler should not be called
 		if continueReadingRequest {
@@ -2712,26 +2857,8 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		}
 
 		connectionClose = connectionClose ||
-			(s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn)) || // #nosec G115
-			ctx.Response.Header.ConnectionClose() ||
-			(s.CloseOnShutdown && s.stop.Load() == 1)
-		if connectionClose {
-			ctx.Response.Header.SetConnectionClose()
-		} else if !isHTTP11 {
-			// Set 'Connection: keep-alive' response header for HTTP/1.0 request.
-			// There is no need in setting this header for http/1.1, since in http/1.1
-			// connections are keep-alive by default.
-			ctx.Response.Header.setNonSpecial(strConnection, strKeepAlive)
-		}
-		if !isHTTP11 {
-			// HTTP/1.0 clients can't read chunked encoding, so let
-			// Response.Write keep Content-Length framing for them.
-			ctx.Response.Header.noHTTP11 = true
-		}
-
-		if serverName != "" && len(ctx.Response.Header.Server()) == 0 {
-			ctx.Response.Header.SetServer(serverName)
-		}
+			(s.MaxRequestsPerConn > 0 && connRequestNum >= uint64(s.MaxRequestsPerConn)) // #nosec G115
+		connectionClose = s.finalizeResponse(ctx, serverName, isHTTP11, connectionClose)
 
 		if !hijackNoResponse {
 			if bw == nil {
@@ -2746,7 +2873,10 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			// This benchmark will send 16 pipelined requests. It is faster to pack as many responses
 			// in a TCP packet and send it back at once than waiting for a flush every request.
 			// In real world circumstances this behaviour could be argued as being wrong.
-			if br == nil || br.Buffered() == 0 || connectionClose || (s.ReduceMemoryUsage && hijackHandler == nil) {
+			// When concurrent pipelining is active the response must
+			// always be flushed: the pipeline writer may start writing
+			// later responses to the connection at any time.
+			if br == nil || br.Buffered() == 0 || connectionClose || pl != nil || (s.ReduceMemoryUsage && hijackHandler == nil) {
 				err = bw.Flush()
 				if err != nil {
 					break
@@ -2800,6 +2930,13 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			err = nil
 			break
 		}
+	}
+
+	if pl != nil {
+		// Signal connection teardown to all still running pipelined
+		// handlers and wait for the writer to flush all remaining
+		// responses in request order.
+		br, err = s.shutdownPipeline(c, pl, br, err)
 	}
 
 	if br != nil {
@@ -3059,9 +3196,16 @@ func (ctx *RequestCtx) Deadline() (deadline time.Time, ok bool) {
 // context should be canceled. Done may return nil if this context can
 // never be canceled. Successive calls to Done return the same value.
 //
+// For requests processed concurrently under Server.MaxPipelinedConcurrency
+// the returned channel is closed when the connection is torn down while
+// the handler is still running.
+//
 // Note: Because creating a new channel for every request is just too expensive, so
 // RequestCtx.s.done is only closed when the server is shutting down.
 func (ctx *RequestCtx) Done() <-chan struct{} {
+	if ctx.connDone != nil {
+		return ctx.connDone
+	}
 	if done := ctx.s.done.Load(); done != nil {
 		return *done
 	}
