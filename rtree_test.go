@@ -949,3 +949,288 @@ func TestNearby(t *testing.T) {
 	})
 
 }
+
+type replaceMover struct {
+	id int
+}
+
+func replaceMoverEq(a, b replaceMover) bool {
+	return a.id == b.id
+}
+
+// scanMovers returns a map of mover id to its rect min corner.
+func scanMovers(tr *RTreeG[replaceMover]) map[int][2]float64 {
+	m := make(map[int][2]float64)
+	tr.Scan(func(min, max [2]float64, data replaceMover) bool {
+		if min != max {
+			panic("expected point rect")
+		}
+		m[data.id] = min
+		return true
+	})
+	return m
+}
+
+func expectMovers(t *testing.T, tr *RTreeG[replaceMover],
+	want map[int][2]float64, label string,
+) {
+	t.Helper()
+	got := scanMovers(tr)
+	if len(got) != len(want) {
+		t.Fatalf("%s: expected %d items, got %d", label, len(want), len(got))
+	}
+	for id, min := range want {
+		if got[id] != min {
+			t.Fatalf("%s: mover %d expected at %v, got %v",
+				label, id, min, got[id])
+		}
+	}
+	if err := rSane(tr); err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+}
+
+func TestReplaceAllSwap(t *testing.T) {
+	// Two objects exchange positions in a single frame.
+	var tr RTreeG[replaceMover]
+	a, b := replaceMover{1}, replaceMover{2}
+	p1 := [2]float64{0, 0}
+	p2 := [2]float64{10, 10}
+	tr.Insert(p1, p1, a)
+	tr.Insert(p2, p2, b)
+	before := tr.Copy()
+	tr2, conflicts := tr.ReplaceAll([]ReplaceOp[float64, replaceMover]{
+		{OldMin: p1, OldMax: p1, OldData: a, Eq: replaceMoverEq,
+			NewMin: p2, NewMax: p2, NewData: a},
+		{OldMin: p2, OldMax: p2, OldData: b, Eq: replaceMoverEq,
+			NewMin: p1, NewMax: p1, NewData: b},
+	})
+	if conflicts != nil {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	expectMovers(t, tr2, map[int][2]float64{1: p2, 2: p1}, "swapped")
+	// The original tree and the pre-taken copy still show the old frame.
+	expectMovers(t, &tr, map[int][2]float64{1: p1, 2: p2}, "original")
+	expectMovers(t, before, map[int][2]float64{1: p1, 2: p2}, "copy")
+}
+
+func TestReplaceAllOutOfBounds(t *testing.T) {
+	// A single object moves out of the root bounding box; the bounds of
+	// the new tree must reflect the new frame only.
+	var tr RTreeG[replaceMover]
+	a := replaceMover{1}
+	p1 := [2]float64{0, 0}
+	p2 := [2]float64{1000, 1000}
+	tr.Insert(p1, p1, a)
+	tr2, conflicts := tr.ReplaceAll([]ReplaceOp[float64, replaceMover]{
+		{OldMin: p1, OldMax: p1, OldData: a, Eq: replaceMoverEq,
+			NewMin: p2, NewMax: p2, NewData: a},
+	})
+	if conflicts != nil {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	min, max := tr2.Bounds()
+	if min != p2 || max != p2 {
+		t.Fatalf("expected bounds %v-%v, got %v-%v", p2, p2, min, max)
+	}
+	min, max = tr.Bounds()
+	if min != p1 || max != p1 {
+		t.Fatalf("original bounds changed: %v-%v", min, max)
+	}
+	expectMovers(t, tr2, map[int][2]float64{1: p2}, "moved")
+}
+
+func TestReplaceAllEmptyThenFill(t *testing.T) {
+	// Every entry is replaced, so the new tree passes through empty while
+	// being built. The intermediate state must never be published.
+	var tr RTreeG[replaceMover]
+	const N = 1000
+	oldFrame := make(map[int][2]float64)
+	newFrame := make(map[int][2]float64)
+	var ops []ReplaceOp[float64, replaceMover]
+	for i := 0; i < N; i++ {
+		p := [2]float64{float64(i), float64(i)}
+		q := [2]float64{float64(i * 2), float64(i * 2)}
+		tr.Insert(p, p, replaceMover{i})
+		oldFrame[i] = p
+		newFrame[i] = q
+		ops = append(ops, ReplaceOp[float64, replaceMover]{
+			OldMin: p, OldMax: p, OldData: replaceMover{i},
+			Eq:     replaceMoverEq,
+			NewMin: q, NewMax: q, NewData: replaceMover{i},
+		})
+	}
+	before := tr.Copy()
+	tr2, conflicts := tr.ReplaceAll(ops)
+	if conflicts != nil {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	if tr2.Len() != N {
+		t.Fatalf("expected %d items, got %d", N, tr2.Len())
+	}
+	expectMovers(t, tr2, newFrame, "new frame")
+	expectMovers(t, &tr, oldFrame, "original")
+	expectMovers(t, before, oldFrame, "copy")
+}
+
+func TestReplaceAllIdentity(t *testing.T) {
+	// Two objects share the exact same rectangle but have different
+	// identities. The identity rule must select the right one; deleting
+	// the first entry at the coordinates is not acceptable.
+	var tr RTreeG[replaceMover]
+	a, b := replaceMover{1}, replaceMover{2}
+	p := [2]float64{5, 5}
+	q := [2]float64{50, 50}
+	tr.Insert(p, p, a)
+	tr.Insert(p, p, b)
+	tr2, conflicts := tr.ReplaceAll([]ReplaceOp[float64, replaceMover]{
+		{OldMin: p, OldMax: p, OldData: b, Eq: replaceMoverEq,
+			NewMin: q, NewMax: q, NewData: b},
+	})
+	if conflicts != nil {
+		t.Fatalf("unexpected conflicts: %v", conflicts)
+	}
+	expectMovers(t, tr2, map[int][2]float64{1: p, 2: q}, "identity")
+	expectMovers(t, &tr, map[int][2]float64{1: p, 2: p}, "original")
+
+	// An op keyed to a non-existent identity at an existing rectangle
+	// must fail and leave both entries untouched.
+	before := tr.Copy()
+	tr3, conflicts := tr.ReplaceAll([]ReplaceOp[float64, replaceMover]{
+		{OldMin: p, OldMax: p, OldData: replaceMover{3}, Eq: replaceMoverEq,
+			NewMin: q, NewMax: q, NewData: replaceMover{3}},
+	})
+	if tr3 != nil {
+		t.Fatal("expected nil tree on conflict")
+	}
+	if len(conflicts) != 1 || conflicts[0].Kind != ReplaceMissing ||
+		conflicts[0].Index != 0 {
+		t.Fatalf("expected one ReplaceMissing conflict, got %v", conflicts)
+	}
+	expectMovers(t, &tr, map[int][2]float64{1: p, 2: p}, "original")
+	expectMovers(t, before, map[int][2]float64{1: p, 2: p}, "copy")
+}
+
+func TestReplaceAllConflicts(t *testing.T) {
+	var tr RTreeG[replaceMover]
+	a, b := replaceMover{1}, replaceMover{2}
+	p1 := [2]float64{0, 0}
+	p2 := [2]float64{10, 10}
+	tr.Insert(p1, p1, a)
+	tr.Insert(p2, p2, b)
+	before := tr.Copy()
+	bad := [2]float64{100, 100}
+	// op 0: valid; op 1: same entry as op 0 (duplicate); op 2: missing
+	// old entry; op 3: invalid new rect (min > max).
+	tr2, conflicts := tr.ReplaceAll([]ReplaceOp[float64, replaceMover]{
+		{OldMin: p1, OldMax: p1, OldData: a, Eq: replaceMoverEq,
+			NewMin: bad, NewMax: bad, NewData: a},
+		{OldMin: p1, OldMax: p1, OldData: a, Eq: replaceMoverEq,
+			NewMin: bad, NewMax: bad, NewData: a},
+		{OldMin: [2]float64{7, 7}, OldMax: [2]float64{7, 7},
+			OldData: replaceMover{9}, Eq: replaceMoverEq,
+			NewMin: bad, NewMax: bad, NewData: replaceMover{9}},
+		{OldMin: p2, OldMax: p2, OldData: b, Eq: replaceMoverEq,
+			NewMin: [2]float64{5, 0}, NewMax: [2]float64{4, 0}, NewData: b},
+	})
+	if tr2 != nil {
+		t.Fatal("expected nil tree on conflict")
+	}
+	if len(conflicts) != 3 {
+		t.Fatalf("expected 3 conflicts, got %d: %v", len(conflicts), conflicts)
+	}
+	kinds := make(map[int]ReplaceConflictKind)
+	for _, c := range conflicts {
+		kinds[c.Index] = c.Kind
+	}
+	if kinds[1] != ReplaceDuplicate {
+		t.Fatalf("op 1: expected ReplaceDuplicate, got %v", kinds[1])
+	}
+	if kinds[2] != ReplaceMissing {
+		t.Fatalf("op 2: expected ReplaceMissing, got %v", kinds[2])
+	}
+	if kinds[3] != ReplaceInvalidRect {
+		t.Fatalf("op 3: expected ReplaceInvalidRect, got %v", kinds[3])
+	}
+	// The failed batch must not have touched anything.
+	want := map[int][2]float64{1: p1, 2: p2}
+	expectMovers(t, &tr, want, "original")
+	expectMovers(t, before, want, "copy")
+}
+
+func TestReplaceAllConcurrentReaders(t *testing.T) {
+	// Readers holding the original tree or a previously obtained copy must
+	// only ever observe complete frames while new frames are published.
+	const N = 500
+	const frames = 50
+	pos := func(i, f int) [2]float64 {
+		return [2]float64{float64(i*frames + f), float64(i*frames + f)}
+	}
+	var tr RTreeG[replaceMover]
+	for i := 0; i < N; i++ {
+		tr.Insert(pos(i, 0), pos(i, 0), replaceMover{i})
+	}
+	frame0 := tr.Copy()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	reader := func(readerTr *RTreeG[replaceMover]) {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			seen := 0
+			readerTr.Scan(func(min, max [2]float64, data replaceMover) bool {
+				if min != pos(data.id, 0) {
+					panic("reader observed a half-applied frame")
+				}
+				seen++
+				return true
+			})
+			if seen != N {
+				panic("reader observed a half-applied frame")
+			}
+		}
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go reader(&tr)
+		go reader(frame0)
+	}
+	cur := &tr
+	for f := 1; f <= frames; f++ {
+		ops := make([]ReplaceOp[float64, replaceMover], N)
+		for i := 0; i < N; i++ {
+			ops[i] = ReplaceOp[float64, replaceMover]{
+				OldMin: pos(i, f-1), OldMax: pos(i, f-1),
+				OldData: replaceMover{i}, Eq: replaceMoverEq,
+				NewMin: pos(i, f), NewMax: pos(i, f),
+				NewData: replaceMover{i},
+			}
+		}
+		next, conflicts := cur.ReplaceAll(ops)
+		if conflicts != nil {
+			t.Fatalf("frame %d: unexpected conflicts: %v", f, conflicts)
+		}
+		// Each published tree must be a complete frame.
+		seen := 0
+		next.Scan(func(min, max [2]float64, data replaceMover) bool {
+			if min != pos(data.id, f) {
+				t.Fatalf("frame %d: mover %d at %v", f, data.id, min)
+			}
+			seen++
+			return true
+		})
+		if seen != N {
+			t.Fatalf("frame %d: expected %d items, got %d", f, N, seen)
+		}
+		cur = next
+	}
+	close(stop)
+	wg.Wait()
+	if err := rSane(cur); err != nil {
+		t.Fatal(err)
+	}
+}

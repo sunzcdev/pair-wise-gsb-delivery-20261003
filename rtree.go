@@ -715,6 +715,127 @@ func (tr *RTreeGN[N, T]) Replace(
 	}
 }
 
+// ReplaceOp describes a single entry replacement within a ReplaceAll batch.
+// The old entry is located by its rectangle and an identity match rule:
+// Eq compares the stored data with OldData, and a nil Eq falls back to the
+// default comparison used by Delete. Entries that share the same rectangle
+// but have different identities are distinguished by Eq, never by position.
+type ReplaceOp[N numeric, T any] struct {
+	OldMin, OldMax [2]N            // rectangle of the entry to replace
+	OldData        T               // identity key of the entry to replace
+	Eq             func(T, T) bool // identity match rule, nil for default
+	NewMin, NewMax [2]N            // rectangle of the replacement entry
+	NewData        T               // data of the replacement entry
+}
+
+// ReplaceConflictKind describes why a ReplaceOp could not be applied.
+type ReplaceConflictKind int
+
+const (
+	// ReplaceMissing indicates that no entry matched the old rectangle and
+	// identity rule.
+	ReplaceMissing ReplaceConflictKind = iota
+	// ReplaceDuplicate indicates that the matching entry was already
+	// claimed by an earlier op in the same batch.
+	ReplaceDuplicate
+	// ReplaceInvalidRect indicates that the new rectangle is invalid,
+	// ie min is greater than max on some axis.
+	ReplaceInvalidRect
+)
+
+// ReplaceConflict describes a single failed ReplaceOp within a ReplaceAll
+// batch. Index is the position of the op in the input slice.
+type ReplaceConflict[N numeric, T any] struct {
+	Index int
+	Kind  ReplaceConflictKind
+	Op    ReplaceOp[N, T]
+}
+
+// ReplaceAll atomically replaces many entries in a single operation, such as
+// when a location service publishes an entire frame of position updates.
+//
+// Every old entry is first matched against the tree. Only when all of them
+// match, and all new rectangles are valid, is a new tree generated and
+// returned; readers holding the receiver or a previously obtained Copy keep
+// seeing the complete pre-update frame and never observe a half-applied
+// batch. Two ops claiming the same entry are reported as ReplaceDuplicate.
+//
+// On any failure the returned tree is nil and the complete list of conflicts
+// is returned; the receiver and all previously obtained copies are left
+// unchanged.
+func (tr *RTreeGN[N, T]) ReplaceAll(ops []ReplaceOp[N, T],
+) (*RTreeGN[N, T], []ReplaceConflict[N, T]) {
+	type entry struct {
+		rect    rect[N]
+		data    T
+		claimed bool
+	}
+	var entries []entry
+	tr.Scan(func(min, max [2]N, data T) bool {
+		entries = append(entries, entry{rect: rect[N]{min, max}, data: data})
+		return true
+	})
+	var conflicts []ReplaceConflict[N, T]
+	for i := range ops {
+		op := &ops[i]
+		if !(op.NewMin[0] <= op.NewMax[0] && op.NewMin[1] <= op.NewMax[1]) {
+			conflicts = append(conflicts, ReplaceConflict[N, T]{
+				Index: i, Kind: ReplaceInvalidRect, Op: *op,
+			})
+		}
+		ir := rect[N]{op.OldMin, op.OldMax}
+		matched := false
+		duplicate := false
+		for j := range entries {
+			if !ir.contains(&entries[j].rect) {
+				continue
+			}
+			var eq bool
+			if op.Eq != nil {
+				eq = op.Eq(entries[j].data, op.OldData)
+			} else {
+				eq = compare(entries[j].data, op.OldData)
+			}
+			if !eq {
+				continue
+			}
+			if entries[j].claimed {
+				duplicate = true
+				continue
+			}
+			entries[j].claimed = true
+			matched = true
+			break
+		}
+		if !matched {
+			kind := ReplaceMissing
+			if duplicate {
+				kind = ReplaceDuplicate
+			}
+			conflicts = append(conflicts, ReplaceConflict[N, T]{
+				Index: i, Kind: kind, Op: *op,
+			})
+		}
+	}
+	if len(conflicts) > 0 {
+		return nil, conflicts
+	}
+	// All ops matched. Build the new frame on a copy-on-write clone so the
+	// receiver and its existing copies are never mutated. All old entries
+	// are deleted first, then all new entries are inserted; the tree may
+	// pass through empty in between, but that state is never published.
+	tr2 := tr.Copy()
+	for i := range ops {
+		op := &ops[i]
+		tr2.delete(op.OldMin, op.OldMax, op.OldData, op.Eq)
+	}
+	for i := range ops {
+		op := &ops[i]
+		tr2.Insert(op.NewMin, op.NewMax, op.NewData)
+	}
+	return tr2, nil
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeGN[N, T]) Bounds() (min, max [2]N) {
 	return tr.rect.min, tr.rect.max
@@ -988,6 +1109,19 @@ func (tr *RTreeG[T]) Replace(
 	)
 }
 
+// ReplaceAll atomically replaces many entries in a single operation and
+// returns the new tree. On any conflict the returned tree is nil, the
+// complete list of conflicts is returned, and the receiver along with all
+// previously obtained copies are left unchanged.
+func (tr *RTreeG[T]) ReplaceAll(ops []ReplaceOp[float64, T],
+) (*RTreeG[T], []ReplaceConflict[float64, T]) {
+	base, conflicts := tr.base.ReplaceAll(ops)
+	if base == nil {
+		return nil, conflicts
+	}
+	return &RTreeG[T]{*base}, nil
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeG[T]) Bounds() (min, max [2]float64) {
 	return tr.base.Bounds()
@@ -1094,6 +1228,19 @@ func (tr *RTree) Replace(
 		oldMin, oldMax, oldData,
 		newMin, newMax, newData,
 	)
+}
+
+// ReplaceAll atomically replaces many entries in a single operation and
+// returns the new tree. On any conflict the returned tree is nil, the
+// complete list of conflicts is returned, and the receiver along with all
+// previously obtained copies are left unchanged.
+func (tr *RTree) ReplaceAll(ops []ReplaceOp[float64, any],
+) (*RTree, []ReplaceConflict[float64, any]) {
+	base, conflicts := tr.base.ReplaceAll(ops)
+	if base == nil {
+		return nil, conflicts
+	}
+	return &RTree{base: *base}, nil
 }
 
 // Search the structure for items that intersects the rect param
