@@ -73,7 +73,17 @@ type parser struct {
 	r          *scanner
 	d          int
 	namespaces map[string]string
+	// stepInput is the preceding node-set when a function call is parsed as
+	// a location-path step; nil for an ordinary primary expression.
+	stepInput node
 }
+
+// implicitStepInput marks a function-step whose input is the implicit
+// context node (the first function in "f(...)/x"), rather than an explicit
+// preceding operand.
+type implicitStepInput struct{}
+
+func (implicitStepInput) Type() nodeType { return nodeRoot }
 
 // newOperatorNode returns new operator node OperatorNode.
 func newOperatorNode(op string, left, right node) node {
@@ -333,6 +343,14 @@ func (p *parser) parsePathExpr(n node) node {
 	var opnd node
 	if isPrimaryExpr(p.r) {
 		opnd = p.parseFilterExpr(n)
+		// A function-call primary expression followed by '/' is the first
+		// step of a relative function path (e.g. "biz:f(.)/x"); its input is
+		// the implicit context node, represented by a nil builder input.
+		if p.r.typ == itemSlash || p.r.typ == itemSlashSlash {
+			if fn, ok := opnd.(*functionNode); ok {
+				fn.StepInput = implicitStepInput{}
+			}
+		}
 		switch p.r.typ {
 		case itemSlash:
 			p.next()
@@ -429,6 +447,20 @@ func (p *parser) parseStep(n node) (opnd node) {
 		matchType := ElementNode
 		if axisType == "attribute" {
 			matchType = AttributeNode
+		}
+		// A function call can be a step on the child axis
+		// (e.g. "item/biz:classify(@code)"). Node-type tests such as
+		// text() and node() remain node tests; any other name followed by
+		// '(' is a FunctionCall primary expression carrying the preceding
+		// node-set as its input.
+		if p.r.typ == itemName && p.r.canBeFunc && !isNodeType(p.r) {
+			p.stepInput = n
+			opnd = p.parsePrimaryExpr(n)
+			p.stepInput = nil
+			for p.r.typ == itemLBracket {
+				opnd = newFilterNode(opnd, p.parsePredicate(opnd))
+			}
+			return opnd
 		}
 		opnd = p.parseNodeTest(n, axisType, matchType)
 	}
@@ -560,7 +592,9 @@ func (p *parser) parseMethod(n node) node {
 		}
 	}
 	p.skipItem(itemRParens)
-	return newFunctionNode(name, prefix, args)
+	fn := newFunctionNode(name, prefix, args).(*functionNode)
+	fn.StepInput = p.stepInput
+	return fn
 }
 
 // Parse parsing the XPath express string expr and returns a tree node.
@@ -670,6 +704,10 @@ type functionNode struct {
 	Args     []node
 	Prefix   string
 	FuncName string // function name
+	// StepInput is set when the function call is used directly as a step on
+	// a location path (e.g. "a/biz:f(.)"); nil for ordinary primary
+	// expressions. It supplies the preceding node-set.
+	StepInput node
 }
 
 func (f *functionNode) String() string {

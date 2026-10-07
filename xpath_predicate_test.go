@@ -37,7 +37,7 @@ func TestPositionalCondition(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := positionalCondition(tt.node); got != tt.want {
+			if got := (&builder{}).positionalCondition(tt.node); got != tt.want {
 				t.Errorf("positionalCondition(%s) = %v, want %v", tt.name, got, tt.want)
 			}
 		})

@@ -41,6 +41,8 @@ var builderProps = struct {
 type builder struct {
 	parseDepth int
 	firstInput query
+	namespaces map[string]string
+	registry   *FunctionRegistry
 }
 
 // axisPredicate creates a predicate to predicating for this axis node.
@@ -172,19 +174,28 @@ func canBeNumber(q query) bool {
 
 // positionalCondition reports whether a condition AST node produces a numeric
 // or positional result.
-func positionalCondition(n node) bool {
+func (b *builder) positionalCondition(n node) bool {
 	switch v := n.(type) {
 	case *operandNode:
 		_, ok := v.Val.(float64)
 		return ok
 	case *functionNode:
+		if v.Prefix != "" {
+			if uri, ok := b.namespaces[v.Prefix]; ok && b.registry != nil {
+				if spec := b.registry.Lookup(uri, v.FuncName); spec != nil {
+					rt := spec.Return.resultType()
+					return rt == xpathResultType.Number || rt == xpathResultType.Any
+				}
+			}
+			return false
+		}
 		switch v.FuncName {
 		case "position", "last", "count", "sum", "string-length", "number",
 			"floor", "ceiling", "round":
 			return true
 		}
 		for _, arg := range v.Args {
-			if positionalCondition(arg) {
+			if b.positionalCondition(arg) {
 				return true
 			}
 		}
@@ -194,7 +205,7 @@ func positionalCondition(n node) bool {
 		case "+", "-", "*", "div", "mod":
 			return true
 		}
-		return positionalCondition(v.Left) || positionalCondition(v.Right)
+		return b.positionalCondition(v.Left) || b.positionalCondition(v.Right)
 	default:
 		return false
 	}
@@ -207,7 +218,7 @@ func (b *builder) processFilter(root *filterNode, flags flag, props *builderProp
 	// Inspect the condition AST to decide whether to set flagsEnum.Filter.
 	// Positional predicates cannot be compiled into a descendantQuery.
 	inputFlags := flags
-	if positionalCondition(root.Condition) {
+	if b.positionalCondition(root.Condition) {
 		inputFlags |= flagsEnum.Filter
 	}
 
@@ -340,6 +351,21 @@ func (b *builder) processFunction(root *functionNode, props *builderProp) (query
 	*props = builderProps.None
 
 	var qyOutput query
+
+	// Extension functions are QName calls prefix:local-name() where prefix
+	// is bound to a namespace URI supplied at compile time and the registry
+	// carries a function for (URI, local-name). Built-in functions live in
+	// the default (empty-prefix) namespace, so a prefixed call never shadows
+	// one. Resolution happens before argument compilation so that signature
+	// problems are reported even when an argument itself fails to build.
+	if root.Prefix != "" {
+		spec, err := b.resolveExtension(root)
+		if err != nil {
+			return nil, err
+		}
+		return b.processExtensionFunction(root, spec, props)
+	}
+
 	switch root.FuncName {
 	case "lower-case":
 		arg, err := b.processNode(root.Args[0], flagsEnum.None, props)
@@ -637,6 +663,125 @@ func (b *builder) processFunction(root *functionNode, props *builderProp) (query
 	return qyOutput, nil
 }
 
+// resolveExtension maps a prefixed function QName to the spec registered for
+// its namespace URI. Prefix binding and registry lookup are compile-time
+// errors: an unbound prefix or unregistered function must fail compilation
+// rather than evaluation.
+func (b *builder) resolveExtension(root *functionNode) (*FunctionSpec, error) {
+	if b.namespaces == nil {
+		return nil, fmt.Errorf("xpath: extension function %s:%s() used without namespace declarations",
+			root.Prefix, root.FuncName)
+	}
+	uri, ok := b.namespaces[root.Prefix]
+	if !ok {
+		return nil, fmt.Errorf("xpath: prefix %q not defined for extension function %s:%s()",
+			root.Prefix, root.Prefix, root.FuncName)
+	}
+	if b.registry == nil {
+		return nil, fmt.Errorf("xpath: extension function {%s}%s() is not registered",
+			uri, root.FuncName)
+	}
+	spec := b.registry.Lookup(uri, root.FuncName)
+	if spec == nil {
+		return nil, fmt.Errorf("xpath: extension function {%s}%s() is not registered",
+			uri, root.FuncName)
+	}
+	return spec, nil
+}
+
+// processExtensionFunction compiles a call to a registered extension
+// function, performing the signature checks decidable at compile time:
+// argument count (arity is fixed) and rejection of statically scalar
+// arguments where a node-set is required. Dynamic XPath conversions between
+// boolean/number/string are legal in both directions and are applied at
+// evaluation time.
+func (b *builder) processExtensionFunction(root *functionNode, spec *FunctionSpec, props *builderProp) (query, error) {
+	if len(root.Args) != len(spec.Params) {
+		return nil, fmt.Errorf("xpath: extension function {%s}%s() requires %d argument(s), got %d",
+			spec.NamespaceURI, spec.LocalName, len(spec.Params), len(root.Args))
+	}
+
+	// A function used directly as a location-path step must return a node
+	// set: path steps contribute nodes, never scalars. This is a static
+	// signature problem and is reported at compile time.
+	if root.StepInput != nil && spec.Return != ExtensionNodeSet {
+		return nil, fmt.Errorf(
+			"xpath: extension function {%s}%s() used as a path step must return node-set, returns %s",
+			spec.NamespaceURI, spec.LocalName, spec.Return)
+	}
+
+	var stepInput query
+	isStep := root.StepInput != nil
+	if root.StepInput != nil {
+		if _, implicit := root.StepInput.(implicitStepInput); implicit {
+			// First function of a function-path: input is the implicit
+			// context node. A nil input query already means "context".
+			stepInput = &contextQuery{}
+		} else {
+			var err error
+			stepProps := builderProps.None
+			stepInput, err = b.processNode(root.StepInput, flagsEnum.None, &stepProps)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Capture the enclosing node-set axis before argument compilation, just
+	// like position()/last(): building an argument resets firstInput.
+	input := b.firstInput
+
+	args := make([]query, len(root.Args))
+	for i, argNode := range root.Args {
+		arg, err := b.processNode(argNode, flagsEnum.None, props)
+		if err != nil {
+			return nil, err
+		}
+		paramType := spec.Params[i]
+		if paramType == ExtensionNodeSet {
+			if !nodeSetAssignable(arg.ValueType()) {
+				return nil, fmt.Errorf(
+					"xpath: extension function {%s}%s() parameter %d expects node-set, expression has static type %s",
+					spec.NamespaceURI, spec.LocalName, i+1, resultTypeName(arg.ValueType()))
+			}
+		}
+		args[i] = arg
+	}
+
+	fq := &extensionFuncQuery{
+		spec:  spec,
+		args:  args,
+		input: input,
+	}
+	if isStep {
+		return &functionStepQuery{Input: stepInput, Function: fq}, nil
+	}
+	return fq, nil
+}
+
+// nodeSetAssignable reports whether a static XPath type can be supplied where
+// a node-set parameter is declared. XPath 1.0 has no scalar-to-node-set
+// conversion, so boolean/number/string arguments are rejected at compile
+// time; node-set and any-typed expressions are accepted.
+func nodeSetAssignable(t resultType) bool {
+	return t == xpathResultType.NodeSet || t == xpathResultType.Any
+}
+
+func resultTypeName(t resultType) string {
+	switch t {
+	case xpathResultType.Boolean:
+		return "boolean"
+	case xpathResultType.Number:
+		return "number"
+	case xpathResultType.String:
+		return "string"
+	case xpathResultType.NodeSet:
+		return "node-set"
+	default:
+		return "any"
+	}
+}
+
 func (b *builder) processOperator(root *operatorNode, props *builderProp) (query, error) {
 	var (
 		leftProp  builderProp
@@ -748,7 +893,7 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
 }
 
 // build builds a specified XPath expressions expr.
-func build(expr string, namespaces map[string]string) (q query, err error) {
+func build(expr string, namespaces map[string]string, registry *FunctionRegistry) (q query, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			switch x := e.(type) {
@@ -762,7 +907,7 @@ func build(expr string, namespaces map[string]string) (q query, err error) {
 		}
 	}()
 	root := parse(expr, namespaces)
-	b := &builder{}
+	b := &builder{namespaces: namespaces, registry: registry}
 	props := builderProps.None
 	return b.processNode(root, flagsEnum.None, &props)
 }

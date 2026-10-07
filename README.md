@@ -165,3 +165,77 @@ The gxpath supported three types: number, boolean, string.
 | `unparsed-entity-url()` | ✗         |
 
 [^1]: XPath-2.0 expression
+
+# Extension Functions
+
+Business logic can be exposed to XPath rules as **expression-scoped
+extension functions**. A function is identified by a namespace URI and a
+local name, and invoked with a QName (`prefix:local-name()`).
+
+Functions are registered on a `FunctionRegistry` passed to
+`CompileWithExtensions`. The registry is per compiled expression — there is
+no package-global function table — so two registries can register the same
+QName with different implementations without interfering with each other.
+
+```go
+registry := xpath.NewFunctionRegistry()
+err := registry.Register(&xpath.FunctionSpec{
+    NamespaceURI: "http://example.com/business",
+    LocalName:    "classify",
+    // Fixed arity: one string argument, string result.
+    Params: []xpath.ExtensionType{xpath.ExtensionString},
+    Return: xpath.ExtensionString,
+    Func: func(ctx xpath.ExtensionContext, args []interface{}) (interface{}, error) {
+        code := args[0].(string)          // XPath string() conversion already applied
+        _ = ctx.ContextNode               // copy of the current node
+        _ = ctx.Position                  // 1-based position in the context node-set
+        _ = ctx.Last                      // size of the context node-set
+        caller, _ := ctx.CallerContext.(*Request) // value passed to Eval
+        return lookupClassification(caller, code)
+    },
+})
+
+// Bind the "biz" prefix to the function namespace and compile.
+ns := map[string]string{"biz": "http://example.com/business"}
+expr, err := xpath.CompileWithExtensions(`//item[biz:classify(@code) = 'premium']`, ns, registry)
+
+// Evaluate with an optional, opaque caller context (nil is allowed).
+result, err := expr.Eval(navigator, request)
+```
+
+Types use the XPath 1.0 conversion rules at runtime:
+
+- `ExtensionBoolean` (`bool`), `ExtensionNumber` (`float64`),
+  `ExtensionString` (`string`), `ExtensionNodeSet` (`[]NodeNavigator`), and
+  `ExtensionAny` (the dynamic value's Go form).
+- Scalar arguments are converted with `boolean()`, `number()`, or
+  `string()`; a node-set argument receives the materialized
+  `[]NodeNavigator`. Passing a statically scalar expression where a node-set
+  is declared is a compile-time error, as is an arity mismatch or an
+  unbound prefix / unregistered function.
+- Scalar and node-set results are both supported. A node-set-returning
+  function may itself be used as a path step
+  (`biz:related(.)/price`); a scalar function may not.
+
+### Errors
+
+An error returned by a function is never folded into `false` or an empty
+result. It aborts evaluation as `*xpath.ExtensionError` (use `errors.As` /
+`errors.Is` to reach the underlying error). For scalar expressions
+`Eval` returns the error; for node-set iteration use
+`SelectWithContext` and check `NodeIterator.Err()` after `MoveNext()`
+returns false.
+
+Because every `Eval`/`SelectWithContext` call clones the internal query
+tree, a failed evaluation does not poison the compiled expression: the same
+`*Expr` can be reused with different data or caller contexts afterwards.
+
+### Node ownership
+
+The `ExtensionContext.ContextNode` and every navigator in a node-set
+argument are copies owned by the engine; user code may navigate them freely.
+Navigators returned in a node-set result must point at nodes in the source
+document (the caller owns the document and must keep it alive for the
+evaluation). The engine copies each returned navigator while streaming
+results, so a function may return freshly positioned navigators whose
+underlying nodes remain owned by the document.
