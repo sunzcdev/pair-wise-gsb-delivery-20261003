@@ -215,6 +215,23 @@ func (tr *BTree) Load(item any) (prev any) {
 	return v
 }
 
+// BulkLoad atomically replaces the contents of the tree with the items
+// produced by iter. The iterator must yield items in strictly ascending order
+// according to the tree's less function; the total count does not need to be
+// known in advance.
+//
+// Duplicate keys are handled according to opts.Duplicates (RejectDuplicates,
+// KeepFirst, or KeepLast). On error the receiver is left untouched and any
+// earlier Copy remains usable. See BTreeG.BulkLoad for full details.
+func (tr *BTree) BulkLoad(iter func(yield func(item any) bool),
+	opts *BulkOptions,
+) (BulkStats, error) {
+	if iter == nil {
+		return BulkStats{}, ErrNilIterator
+	}
+	return tr.base.BulkLoad(iter, opts)
+}
+
 // Min returns the minimum item in tree.
 // Returns nil if the tree has no items.
 func (tr *BTree) Min() any {

@@ -73,6 +73,22 @@ func (tr *Set[K]) Load(key K) {
 	tr.base.Load(key, struct{}{})
 }
 
+// BulkLoad atomically replaces the contents of the set with the keys produced
+// by iter. The iterator must yield keys in strictly ascending order; the total
+// count does not need to be known in advance. See Map.BulkLoad for details.
+func (tr *Set[K]) BulkLoad(iter func(yield func(key K) bool),
+	opts *BulkOptions,
+) (BulkStats, error) {
+	if iter == nil {
+		return BulkStats{}, ErrNilIterator
+	}
+	return tr.base.BulkLoad(func(yield func(key K, value struct{}) bool) {
+		iter(func(key K) bool {
+			return yield(key, struct{}{})
+		})
+	}, opts)
+}
+
 // Min returns the minimum item in tree.
 // Returns nil if the treex has no items.
 func (tr *Set[K]) Min() (K, bool) {

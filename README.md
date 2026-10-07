@@ -59,6 +59,12 @@ DeleteAt(index)    // deletes the item at index
 
 // Bulk-loading
 Load(key, value)   // load presorted items into tree
+
+// Atomic bulk build from a streaming iterator (no size needed up front).
+// Duplicate keys can be rejected, or resolved by keeping the first or last
+// occurrence. The old tree and any of its Copy()s stay usable until the new
+// tree is fully built and validated. Returns comparison/allocations stats.
+BulkLoad(iter func(yield func(key, value any) bool), opts *BulkOptions) (BulkStats, error)
 ```
 
 #### Example
@@ -215,6 +221,7 @@ DeleteAt(index)         // deletes the item at index
 
 // Bulk-loading
 Load(item)              // load presorted items into tree
+BulkLoad(iter, *BulkOptions) (BulkStats, error) // atomic streaming bulk build
 
 // Path hinting
 SetHint(item, *hint)    // insert or replace an existing item
@@ -338,6 +345,7 @@ DeleteAt(index)         // deletes the item at index
 
 // Bulk-loading
 Load(item)              // load presorted items into tree
+BulkLoad(iter, *BulkOptions) (BulkStats, error) // atomic streaming bulk build
 
 // Path hinting
 SetHint(item, *hint)    // insert or replace an existing item
