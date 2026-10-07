@@ -74,6 +74,12 @@ func QuerySelector(top *Node, selector *xpath.Expr) *Node {
 // NodeNavigator is for navigating JSON document.
 type NodeNavigator struct {
 	root, cur *Node
+
+	// view is non-nil when this navigator is bound to a restricted View.
+	// root then holds the virtual root of that view and every navigation
+	// axis is stopped at the view boundary. A nil view means the navigator
+	// covers the whole document as before.
+	view *View
 }
 
 func (a *NodeNavigator) Current() *Node {
@@ -81,6 +87,11 @@ func (a *NodeNavigator) Current() *Node {
 }
 
 func (a *NodeNavigator) NodeType() xpath.NodeType {
+	if a.view != nil && a.cur == a.root {
+		// The virtual root of a restricted view is presented to XPath with
+		// the same node type convention as a regular document root.
+		return xpath.RootNode
+	}
 	switch a.cur.Type {
 	case TextNode:
 		return xpath.TextNode
@@ -128,6 +139,10 @@ func (a *NodeNavigator) MoveToRoot() {
 }
 
 func (a *NodeNavigator) MoveToParent() bool {
+	if a.view != nil && a.cur == a.root {
+		// The virtual root has no parent inside the view.
+		return false
+	}
 	if n := a.cur.Parent; n != nil {
 		a.cur = n
 		return true
@@ -148,6 +163,10 @@ func (a *NodeNavigator) MoveToChild() bool {
 }
 
 func (a *NodeNavigator) MoveToFirst() bool {
+	if a.view != nil && a.cur == a.root {
+		// The virtual root is the only top-level node of its view.
+		return true
+	}
 	for n := a.cur.PrevSibling; n != nil; n = n.PrevSibling {
 		a.cur = n
 	}
@@ -159,6 +178,10 @@ func (a *NodeNavigator) String() string {
 }
 
 func (a *NodeNavigator) MoveToNext() bool {
+	if a.view != nil && a.cur == a.root {
+		// The virtual root has no following sibling inside the view.
+		return false
+	}
 	if n := a.cur.NextSibling; n != nil {
 		a.cur = n
 		return true
@@ -167,6 +190,10 @@ func (a *NodeNavigator) MoveToNext() bool {
 }
 
 func (a *NodeNavigator) MoveToPrevious() bool {
+	if a.view != nil && a.cur == a.root {
+		// The virtual root has no preceding sibling inside the view.
+		return false
+	}
 	if n := a.cur.PrevSibling; n != nil {
 		a.cur = n
 		return true
@@ -176,7 +203,7 @@ func (a *NodeNavigator) MoveToPrevious() bool {
 
 func (a *NodeNavigator) MoveTo(other xpath.NodeNavigator) bool {
 	node, ok := other.(*NodeNavigator)
-	if !ok || node.root != a.root {
+	if !ok || node.view != a.view {
 		return false
 	}
 	a.cur = node.cur

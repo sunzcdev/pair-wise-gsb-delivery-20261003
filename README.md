@@ -216,6 +216,32 @@ list, err := jsonquery.QueryAll(doc, "*")
 
 Convert current JSON object to XML format.
 
+#### Restricted views
+
+A `View` restricts XPath navigation to a single subtree without cutting or
+copying the original tree. The given node becomes the virtual root of the
+view: absolute paths resolve from it, and the parent, ancestor and sibling
+axes cannot reach anything outside it. Nodes returned by a view query are
+still the original nodes, and multiple views (even over the same node) are
+independent and safe to use in parallel.
+
+```go
+doc, err := jsonquery.Parse(strings.NewReader(jsonStream))
+if err != nil {
+	panic(err)
+}
+
+bicycle := jsonquery.FindOne(doc, "/store/bicycle")
+view := jsonquery.NewView(bicycle)
+
+// Absolute paths start at the virtual root.
+color := view.FindOne("/color")
+
+// Ancestors and siblings never leak nodes outside the view.
+fmt.Println(view.FindAll("color/ancestor::node()")) // only the virtual root
+fmt.Println(view.FindAll("preceding-sibling::*"))   // empty
+```
+
 ## Example of how to convert JSON object to XML file
 
 ```json
