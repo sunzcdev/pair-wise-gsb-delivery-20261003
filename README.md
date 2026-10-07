@@ -46,6 +46,25 @@ qs := []float64{0.5, 0.75, 0.9, 1}
 quantiles, err := sketch.GetValuesAtQuantiles(qs)
 ```
 
+Count the values above a threshold, as needed for SLO alerts on the fraction
+of requests exceeding a latency budget. Because a bin only stores a value
+range, the weight of the bin that straddles the threshold is kept as
+uncertain instead of being assigned to a representative value. The result
+gives the weight that is definitely above the threshold, the weight that may
+be above it and the total weight.
+
+```go
+counts, err := sketch.CountAboveThreshold(0.5)          // strictly greater
+// counts, err := sketch.CountAtOrAboveThreshold(0.5)   // greater than or equal
+definitelyAbove := counts.DefinitelyAbove()
+possiblyAbove := counts.PossiblyAbove()
+total := counts.Total()
+```
+
+The true count above the threshold is guaranteed to be in
+`[DefinitelyAbove, PossiblyAbove]`, and both bounds are non-increasing as the
+threshold grows.
+
 Merge another `DDSketch` into `sketch`.
 
 ```go

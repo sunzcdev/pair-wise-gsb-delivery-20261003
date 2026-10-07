@@ -181,6 +181,14 @@ func (s *CollapsingHighestDenseStore) Clear() {
 	s.isCollapsed = false
 }
 
+// IsCollapsed returns true if bins have been collapsed because the number of
+// distinct indices exceeded maxNumBins. When collapsed, the bin at MaxIndex no
+// longer stands for a single index: it also accumulates every higher index that
+// has been folded into it.
+func (s *CollapsingHighestDenseStore) IsCollapsed() bool {
+	return s.isCollapsed
+}
+
 func (s *CollapsingHighestDenseStore) DecodeAndMergeWith(r *[]byte, encodingMode enc.SubFlag) error {
 	return DecodeAndMergeWith(s, r, encodingMode)
 }
