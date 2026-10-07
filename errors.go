@@ -125,4 +125,21 @@ var (
 
 	// ErrPropertySkipped marks a parser decision to skip a malformed line and continue.
 	ErrPropertySkipped = errors.New("property skipped")
+
+	// ErrVTimezoneNotFound reports that no VTIMEZONE component matches a requested TZID.
+	ErrVTimezoneNotFound = errors.New("vtimezone not found for TZID")
+	// ErrVTimezoneMissingTZID reports a VTIMEZONE component without a TZID property.
+	ErrVTimezoneMissingTZID = errors.New("vtimezone missing TZID property")
+	// ErrVTimezoneNoObservances reports a VTIMEZONE without STANDARD or DAYLIGHT sub-components.
+	ErrVTimezoneNoObservances = errors.New("vtimezone has no STANDARD or DAYLIGHT observances")
+	// ErrVTimezoneObservanceProperty reports a missing or invalid property on a STANDARD/DAYLIGHT observance.
+	ErrVTimezoneObservanceProperty = errors.New("vtimezone observance property error")
+	// ErrVTimezoneUnsupportedRule reports an RRULE construct not supported for VTIMEZONE observances.
+	ErrVTimezoneUnsupportedRule = errors.New("vtimezone unsupported recurrence rule")
+	// ErrVTimezoneContradictory reports observances whose transitions disagree with each other.
+	ErrVTimezoneContradictory = errors.New("vtimezone contradictory observances")
+	// ErrVTimezoneOutOfCoverage reports a local time outside the period described by the VTIMEZONE.
+	ErrVTimezoneOutOfCoverage = errors.New("vtimezone local time outside rule coverage")
+	// ErrVTimezoneTZIDMismatch reports a property TZID that does not match the resolver's VTIMEZONE.
+	ErrVTimezoneTZIDMismatch = errors.New("vtimezone TZID mismatch")
 )
