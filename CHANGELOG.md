@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+-   geo: add `SplitLineStringAntimeridian` to cut lon/lat line strings at the antimeridian (±180°), inserting linearly interpolated intersection points and returning ordered pieces
+
 ## [v0.13.0](https://github.com/paulmach/orb/compare/v0.12.0...v0.13.0) - 2026-03-30
 
 ### Fixed

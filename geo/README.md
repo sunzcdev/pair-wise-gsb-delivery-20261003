@@ -58,3 +58,19 @@ fmt.Printf("%0.0f meters", l)
 // Output:
 // 325 meters
 ```
+
+Splitting a line string at the antimeridian (±180° longitude), e.g. for map
+tile services that should not draw one long line across the map:
+
+```go
+ls := orb.LineString{
+    { 179, 0 },
+    { -179, 0 },
+}
+
+mls := geo.SplitLineStringAntimeridian(ls)
+
+fmt.Println(mls)
+// Output:
+// [[[179 0] [180 0]] [[-180 0] [-179 0]]]
+```
