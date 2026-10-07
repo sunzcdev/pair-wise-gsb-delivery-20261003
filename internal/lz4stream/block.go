@@ -259,6 +259,11 @@ type FrameDataBlock struct {
 	err      error  // used in concurrent mode
 }
 
+type CostConfig struct {
+	MaxCandidates int
+	MemoryBudget  int
+}
+
 func (b *FrameDataBlock) Close(f *Frame) {
 	b.Size = 0
 	b.Checksum = 0
@@ -274,6 +279,10 @@ func (b *FrameDataBlock) Close(f *Frame) {
 
 // Block compression errors are ignored since the buffer is sized appropriately.
 func (b *FrameDataBlock) Compress(f *Frame, src []byte, level lz4block.CompressionLevel) *FrameDataBlock {
+	return b.CompressWithCost(f, src, level, CostConfig{})
+}
+
+func (b *FrameDataBlock) CompressWithCost(f *Frame, src []byte, level lz4block.CompressionLevel, cost CostConfig) *FrameDataBlock {
 	data := b.data
 	if f.isLegacy() {
 		data = data[:cap(data)]
@@ -286,6 +295,11 @@ func (b *FrameDataBlock) Compress(f *Frame, src []byte, level lz4block.Compressi
 		n, _ = lz4block.CompressBlock(src, data)
 	case lz4block.CCompatFast:
 		n, _ = lz4block.CompressBlockCCompat(src, data)
+	case lz4block.CostOptimized:
+		n, _ = lz4block.CompressBlockCost(src, data, lz4block.CostOptions{
+			MaxCandidates: cost.MaxCandidates,
+			MemoryBudget:  cost.MemoryBudget,
+		})
 	default:
 		n, _ = lz4block.CompressBlockHC(src, data, level)
 	}

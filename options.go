@@ -7,6 +7,7 @@ import (
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
+	"github.com/pierrec/lz4/v4/internal/lz4stream"
 )
 
 //go:generate go run golang.org/x/tools/cmd/stringer -type=BlockSize,CompressionLevel -output options_gen.go
@@ -170,6 +171,15 @@ const (
 // see CompressorCCompat.
 const CCompatFast CompressionLevel = 1
 
+// CostOptimized selects the cost-based parser. It is not another HC depth.
+const CostOptimized CompressionLevel = CompressionLevel(lz4block.CostOptimized)
+
+var validCompressionLevels = map[CompressionLevel]struct{}{
+	Fast: {}, CCompatFast: {}, CostOptimized: {},
+	Level1: {}, Level2: {}, Level3: {}, Level4: {}, Level5: {},
+	Level6: {}, Level7: {}, Level8: {}, Level9: {},
+}
+
 // CompressionLevelOption defines the compression level (default=Fast).
 func CompressionLevelOption(level CompressionLevel) Option {
 	return func(a applier) error {
@@ -178,20 +188,39 @@ func CompressionLevelOption(level CompressionLevel) Option {
 			s := fmt.Sprintf("CompressionLevelOption(%s)", level)
 			return lz4errors.Error(s)
 		case *Writer:
-			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
-			default:
+			if _, ok := validCompressionLevels[level]; !ok {
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}
 			w.level = lz4block.CompressionLevel(level)
 			return nil
 		case *CompressingReader:
-			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
-			default:
+			if _, ok := validCompressionLevels[level]; !ok {
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}
 			w.level = lz4block.CompressionLevel(level)
+			return nil
+		}
+		return lz4errors.ErrOptionNotApplicable
+	}
+}
+
+// CostOptions configures the cost-optimized compression parser.
+type CostOptions = lz4stream.CostConfig
+
+// CostOptimizedOption configures the candidate and memory budgets used by
+// CostOptimized. It also selects that compression level.
+func CostOptimizedOption(options CostOptions) Option {
+	return func(a applier) error {
+		switch w := a.(type) {
+		case nil:
+			return lz4errors.Error("CostOptimizedOption")
+		case *Writer:
+			w.level = lz4block.CostOptimized
+			w.cost = lz4stream.CostConfig(options)
+			return nil
+		case *CompressingReader:
+			w.level = lz4block.CostOptimized
+			w.cost = lz4stream.CostConfig(options)
 			return nil
 		}
 		return lz4errors.ErrOptionNotApplicable

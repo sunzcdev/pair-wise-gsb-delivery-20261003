@@ -35,6 +35,7 @@ type Writer struct {
 	frame   *lz4stream.Frame          // frame being built
 	data    []byte                    // pending data
 	idx     int                       // size of pending data
+	cost    lz4stream.CostConfig
 	handler func(int)
 	legacy  bool
 }
@@ -132,7 +133,7 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 func (w *Writer) write(data []byte, safe bool) error {
 	if w.isNotConcurrent() {
 		block := w.frame.Blocks.Block
-		err := block.Compress(w.frame, data, w.level).Write(w.frame, w.src)
+		err := block.CompressWithCost(w.frame, data, w.level, w.cost).Write(w.frame, w.src)
 		w.handler(len(block.Data))
 		return err
 	}
@@ -140,7 +141,7 @@ func (w *Writer) write(data []byte, safe bool) error {
 	w.frame.Blocks.Blocks <- c
 	go func(c chan *lz4stream.FrameDataBlock, data []byte, safe bool) {
 		b := lz4stream.NewFrameDataBlock(w.frame)
-		c <- b.Compress(w.frame, data, w.level)
+		c <- b.CompressWithCost(w.frame, data, w.level, w.cost)
 		<-c
 		w.handler(len(b.Data))
 		b.Close(w.frame)

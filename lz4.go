@@ -197,3 +197,25 @@ const (
 	// from SizeOption.
 	ErrInvalidContentSize = lz4errors.ErrInvalidContentSize
 )
+
+// CompressorCost compresses data with a cost-optimized LZ4 parser. Existing
+// Fast and HC compression levels continue to use their original algorithms.
+// A CompressorCost is not safe for concurrent use.
+type CompressorCost struct {
+	Options CostOptions
+	c       lz4block.CompressorCost
+}
+
+func (c *CompressorCost) CompressBlock(src, dst []byte) (int, error) {
+	c.c.Options.MaxCandidates = c.Options.MaxCandidates
+	c.c.Options.MemoryBudget = c.Options.MemoryBudget
+	return c.c.CompressBlock(src, dst)
+}
+
+// CompressBlockCost compresses one block with the cost-optimized parser.
+func CompressBlockCost(src, dst []byte, options CostOptions) (int, error) {
+	return lz4block.CompressBlockCost(src, dst, lz4block.CostOptions{
+		MaxCandidates: options.MaxCandidates,
+		MemoryBudget:  options.MemoryBudget,
+	})
+}
