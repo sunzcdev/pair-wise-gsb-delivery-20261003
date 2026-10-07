@@ -34,6 +34,13 @@ type Node struct {
 
 	level int
 	value interface{}
+
+	// vparents, when set on the root of a version produced by Cursor edits,
+	// maps shared boundary nodes to their parent in that version. Shared
+	// content nodes keep their original Parent pointer (which belongs to the
+	// version that created them); the map lets navigators of a derived
+	// version follow the correct parent chain without rewriting shared nodes.
+	vparents map[*Node]*Node
 }
 
 // Gets the JSON object value.

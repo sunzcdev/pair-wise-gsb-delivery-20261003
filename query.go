@@ -11,7 +11,7 @@ var _ xpath.NodeNavigator = &NodeNavigator{}
 
 // CreateXPathNavigator creates a new xpath.NodeNavigator for the specified html.Node.
 func CreateXPathNavigator(top *Node) *NodeNavigator {
-	return &NodeNavigator{cur: top, root: top}
+	return &NodeNavigator{cur: top, root: top, vparents: top.vparents}
 }
 
 // Find is like QueryAll but will panics if `expr` cannot be parsed.
@@ -74,6 +74,7 @@ func QuerySelector(top *Node, selector *xpath.Expr) *Node {
 // NodeNavigator is for navigating JSON document.
 type NodeNavigator struct {
 	root, cur *Node
+	vparents  map[*Node]*Node
 }
 
 func (a *NodeNavigator) Current() *Node {
@@ -128,6 +129,12 @@ func (a *NodeNavigator) MoveToRoot() {
 }
 
 func (a *NodeNavigator) MoveToParent() bool {
+	if a.vparents != nil {
+		if p, ok := a.vparents[a.cur]; ok {
+			a.cur = p
+			return true
+		}
+	}
 	if n := a.cur.Parent; n != nil {
 		a.cur = n
 		return true

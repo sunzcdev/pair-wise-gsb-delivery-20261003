@@ -216,6 +216,53 @@ list, err := jsonquery.QueryAll(doc, "*")
 
 Convert current JSON object to XML format.
 
+## Persistent cursors
+
+A `Cursor` is a persistent position within a JSON document. Multiple edit
+branches can be derived from one parsed snapshot: edits never mutate the
+tree, every operation returns a new cursor, and `Root()` materializes a new
+document root that shares all untouched subtrees with the snapshot. Old
+roots and old cursors remain queryable — no full-document copy is ever made.
+
+```go
+s := `{"store":{"book":[{"title":"A","price":8.95},{"title":"B","price":12.99}]},"expensive":10}`
+doc, _ := jsonquery.Parse(strings.NewReader(s))
+base := jsonquery.NewCursor(doc)
+
+// Branch 1: a deep edit — reprice the second book.
+cur, _ := base.DownName("store")
+cur, _ = cur.DownName("book")
+cur, _ = cur.DownIndex(1)
+cur, _ = cur.DownName("price")
+rootA := cur.SetValue(5.99).Root()
+fmt.Println(jsonquery.FindOne(rootA, "//book/*[2]/price").InnerText()) // 5.99
+
+// Branch 2: a shallow edit — rename a top-level member.
+renamed, _ := base.DownName("expensive")
+rootB := renamed.Rename("costly").Root()
+fmt.Println(jsonquery.FindOne(rootB, "/costly").InnerText()) // 10
+
+// The original snapshot is untouched.
+fmt.Println(jsonquery.FindOne(doc, "//book/*[2]/price").InnerText()) // 12.99
+```
+
+Cursor operations:
+
+- `Down()` / `DownIndex(i)` / `DownName(name)` descend to a child;
+  `Up()` returns to the parent; `Next()` / `Prev()` move between siblings.
+- `Path()` reports the cursor's deterministic location (e.g.
+  `/store/book/*[2]/price`) and tracks renames and array edits.
+- `SetValue(v)` replaces the current value, `Rename(name)` renames an object
+  member, `Replace(n)` swaps in a node built with `NewElement(name, v)`.
+- `InsertChildAt(i, n)` / `AppendChild(n)` insert array items;
+  `Remove()` deletes the current node and falls back to a deterministic
+  position: the next sibling, else the previous sibling, else the parent.
+
+Only the edited path (and its siblings, whose `Parent`/`Prev`/`Next` links
+belong to the new version) is re-linked; untouched subtrees are shared with
+the snapshot, and XPath queries on each root — including parent-axis
+traversal — always stay within their own version.
+
 ## Example of how to convert JSON object to XML file
 
 ```json
