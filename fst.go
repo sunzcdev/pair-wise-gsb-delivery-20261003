@@ -15,7 +15,9 @@
 package vellum
 
 import (
+	"hash/fnv"
 	"io"
+	"sync"
 
 	"github.com/bits-and-blooms/bitset"
 )
@@ -31,6 +33,9 @@ type FST struct {
 	typ     int
 	data    []byte
 	decoder decoder
+
+	fpOnce sync.Once
+	fp     uint64
 }
 
 func new(data []byte, f io.Closer) (rv *FST, err error) {
@@ -108,6 +113,18 @@ func (f *FST) Len() int {
 // Type returns the type of this FST instance.
 func (f *FST) Type() int {
 	return f.typ
+}
+
+// fingerprint returns a hash of this FST's encoded content, computed lazily
+// on first use.  It is used to detect whether two FST instances represent
+// the same dictionary content.
+func (f *FST) fingerprint() uint64 {
+	f.fpOnce.Do(func() {
+		h := fnv.New64a()
+		_, _ = h.Write(f.data)
+		f.fp = h.Sum64()
+	})
+	return f.fp
 }
 
 // Close will unmap any mmap'd data (if managed by vellum) and it will close
