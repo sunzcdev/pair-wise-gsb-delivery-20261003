@@ -114,14 +114,18 @@ func (i MessageIntegrity) Check(msg *Message) error {
 			break
 		}
 	}
+	// Always restore the message length, even when the check fails, so that
+	// neither Raw nor Length change after verification.
+	defer func() {
+		msg.Length = length
+		msg.WriteLength()
+	}()
 	msg.Length = uint32(sizeReduced) // /nolint:gosec
 	msg.WriteLength()
 	// startOfHMAC should be first byte of integrity attribute.
 	startOfHMAC := messageHeaderSize + msg.Length - (attributeHeaderSize + messageIntegritySize)
 	b := msg.Raw[:startOfHMAC] // data before integrity attribute
 	expected := newHMAC(i, b, msg.Raw[len(msg.Raw):])
-	msg.Length = length
-	msg.WriteLength() // writing length back
 
 	return checkHMAC(val, expected)
 }
