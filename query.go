@@ -74,6 +74,9 @@ func QuerySelector(top *Node, selector *xpath.Expr) *Node {
 // NodeNavigator is for navigating JSON document.
 type NodeNavigator struct {
 	root, cur *Node
+	// parents, when non-nil, overrides stale Parent pointers of nodes that
+	// are shared between a persisted version and its ancestors. See Cursor.
+	parents map[*Node]*Node
 }
 
 func (a *NodeNavigator) Current() *Node {
@@ -128,6 +131,12 @@ func (a *NodeNavigator) MoveToRoot() {
 }
 
 func (a *NodeNavigator) MoveToParent() bool {
+	if a.parents != nil {
+		if n, ok := a.parents[a.cur]; ok {
+			a.cur = n
+			return true
+		}
+	}
 	if n := a.cur.Parent; n != nil {
 		a.cur = n
 		return true

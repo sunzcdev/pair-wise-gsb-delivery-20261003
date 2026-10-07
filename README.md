@@ -216,6 +216,45 @@ list, err := jsonquery.QueryAll(doc, "*")
 
 Convert current JSON object to XML format.
 
+## Persistent cursors (branching edits)
+
+`NewCursor` creates a persistent cursor over a parsed document. Cursors can
+descend (`Child`/`ChildElement`), move back up (`Parent`) and sideways
+(`Next`/`Prev`), and derive new versions of the document with `SetValue`,
+`Rename`, `InsertChild` and `Remove`. Each edit returns a new root via
+path-copying: unchanged subtrees are shared between versions, so branching a
+snapshot never copies the whole document, and the old root plus any cloned
+cursors keep seeing the old version.
+
+```go
+doc, _ := jsonquery.Parse(strings.NewReader(s))
+
+// Branch A: deep edit.
+a := jsonquery.NewCursor(doc)
+a.ChildElement("store")
+a.ChildElement("book")
+a.Child(0)
+a.ChildElement("price")
+a.SetValue(7.95)
+fmt.Println(a.FindOne("//book/*[1]/price").InnerText()) // 7.95
+
+// Branch B: independent shallow edit from the same snapshot.
+b := jsonquery.NewCursor(doc)
+b.ChildElement("expensive")
+b.SetValue(20)
+fmt.Println(b.FindOne("//expensive").InnerText()) // 20
+
+// The original snapshot is unchanged.
+fmt.Println(jsonquery.FindOne(doc, "//expensive").InnerText()) // 10
+```
+
+`Remove` moves the cursor to a deterministic position (the sibling shifting
+into the removed index, else the last sibling, else the parent). Because
+content nodes are shared between versions, always query branched versions
+through the cursor's own `Find`/`FindOne`/`Query`/`QueryAll` methods, which
+resolve parent links against the correct version; the package-level query
+functions remain valid for the original, unbranched tree.
+
 ## Example of how to convert JSON object to XML file
 
 ```json
