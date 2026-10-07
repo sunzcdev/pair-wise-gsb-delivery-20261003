@@ -24,6 +24,18 @@ import (
 type ReaderConfig struct {
 	DictCap      int
 	SingleStream bool
+
+	// IndexMemCap limits the amount of memory that NewReaderAt is
+	// willing to spend on the parsed indexes of all streams. If zero
+	// a default limit is used; a negative value disables the limit.
+	IndexMemCap int
+
+	// BlockDictCap limits the LZMA2 dictionary capacity of a block
+	// opened through NewReaderAt. If a block requests a larger
+	// dictionary NewReaderAt returns an error. If zero a default
+	// limit is used; a negative value allows any capacity supported by
+	// the format.
+	BlockDictCap int
 }
 
 // Verify checks the reader parameters for Validity. Zero values will be
@@ -160,7 +172,7 @@ func (c ReaderConfig) newStreamReader(xz io.Reader) (r *streamReader, err error)
 
 // readTail reads the index body and the xz footer.
 func (r *streamReader) readTail() error {
-	index, n, err := readIndexBody(r.xz, len(r.index))
+	index, n, err := readIndexBody(r.xz, len(r.index), 0)
 	if err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF

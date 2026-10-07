@@ -57,6 +57,34 @@ func main() {
 
 You can find the full documentation at [pkg.go.dev](https://pkg.go.dev/github.com/ulikunitz/xz).
 
+## Random access
+
+When the underlying data supports `io.ReaderAt` (for example an
+`*os.File` or `*bytes.Reader`) and its total size is known, the package
+can read arbitrary uncompressed intervals without decompressing the
+file from the beginning. The reader locates the streams backwards using
+their Footer and Index, supports multiple concatenated streams and the
+legal padding between them, and maps a logical uncompressed offset to
+the containing block:
+
+```go
+sr, err := xz.NewReaderAt(file, size)
+if err != nil {
+    log.Fatalf("xz.NewReaderAt error %s", err)
+}
+buf := make([]byte, 1024)
+if _, err := sr.ReadAt(buf, 4096); err != nil {
+    log.Fatalf("sr.ReadAt error %s", err)
+}
+```
+
+The index CRC, footer/header flags and the size relations between the
+index and the block headers are validated when the reader is created.
+The content checksum of a block is verified only once that block is
+actually decoded; blocks that are never read are not content-verified.
+`ReaderConfig.IndexMemCap` and `ReaderConfig.BlockDictCap` bound the
+memory used for indexes and block dictionaries.
+
 ## Using the gxz compression tool
 
 The package includes a gxz command line utility for compression and

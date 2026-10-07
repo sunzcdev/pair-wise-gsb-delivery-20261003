@@ -19,7 +19,6 @@
 ## Release v0.8
 
 1. Support parallel go routines for writing and reading xz files.
-2. Support a ReaderAt interface for xz files with small block sizes.
 3. Improve compatibility between gxz and xz
 4. Provide manual page for gxz
 

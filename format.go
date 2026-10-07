@@ -662,7 +662,12 @@ func writeIndex(w io.Writer, index []record) (n int64, err error) {
 
 // readIndexBody reads the index from the reader. It assumes that the
 // index indicator has already been read.
-func readIndexBody(r io.Reader, expectedRecordLen int) (records []record, n int64, err error) {
+//
+// If expectedRecordLen is not negative the number of records must
+// match it. If maxRecords is greater than zero the number of records
+// must not exceed it; this protects callers operating on untrusted
+// indexes from allocating unbounded memory.
+func readIndexBody(r io.Reader, expectedRecordLen, maxRecords int) (records []record, n int64, err error) {
 	crc := crc32.NewIEEE()
 	// index indicator
 	crc.Write([]byte{0})
@@ -679,7 +684,10 @@ func readIndexBody(r io.Reader, expectedRecordLen int) (records []record, n int6
 	if recLen < 0 || uint64(recLen) != u {
 		return nil, n, errors.New("xz: record number overflow")
 	}
-	if recLen != expectedRecordLen {
+	if maxRecords > 0 && recLen > maxRecords {
+		return nil, n, errors.New("xz: index exceeds record count limit")
+	}
+	if expectedRecordLen >= 0 && recLen != expectedRecordLen {
 		return nil, n, fmt.Errorf(
 			"xz: index length is %d; want %d",
 			recLen, expectedRecordLen)

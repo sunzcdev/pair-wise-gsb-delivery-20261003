@@ -85,7 +85,7 @@ func TestIndex(t *testing.T) {
 		t.Fatalf("indicator %d; want %d", c, 0)
 	}
 
-	g, m, err := readIndexBody(&buf, len(records))
+	g, m, err := readIndexBody(&buf, len(records), 0)
 	if err != nil {
 		for i, r := range g {
 			t.Logf("records[%d] %v", i, r)
