@@ -14,6 +14,8 @@ import (
 const (
 	AttrKeyCandidate        = "candidate"
 	AttrKeyEndOfCandidates  = "end-of-candidates"
+	AttrKeyICEUfrag         = "ice-ufrag"
+	AttrKeyICEPassword      = "ice-pwd"
 	AttrKeyIdentity         = "identity"
 	AttrKeyGroup            = "group"
 	AttrKeySSRC             = "ssrc"
@@ -245,6 +247,11 @@ func (d *MediaDescription) WithMediaSource(ssrc uint32, cname, streamLabel, labe
 // Deprecated: use WithICECandidate instead.
 func (d *MediaDescription) WithCandidate(value string) *MediaDescription {
 	return d.WithValueAttribute("candidate", value)
+}
+
+// WithICECandidate adds an ICE candidate to the media description.
+func (d *MediaDescription) WithICECandidate(value string) *MediaDescription {
+	return d.WithValueAttribute(AttrKeyCandidate, value)
 }
 
 // WithExtMap adds an extmap to the media description.
