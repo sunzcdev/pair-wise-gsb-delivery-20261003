@@ -10,6 +10,36 @@ func (b StatementBuilderType) Select(columns ...string) SelectBuilder {
 	return SelectBuilder(b).Columns(columns...)
 }
 
+// Union returns a SetBuilder combining two queries with UNION.
+func (b StatementBuilderType) Union(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, UnionOperator, left, right)
+}
+
+// UnionAll returns a SetBuilder combining two queries with UNION ALL.
+func (b StatementBuilderType) UnionAll(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, UnionAllOperator, left, right)
+}
+
+// Intersect returns a SetBuilder combining two queries with INTERSECT.
+func (b StatementBuilderType) Intersect(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, IntersectOperator, left, right)
+}
+
+// IntersectAll returns a SetBuilder combining two queries with INTERSECT ALL.
+func (b StatementBuilderType) IntersectAll(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, IntersectAllOperator, left, right)
+}
+
+// Except returns a SetBuilder combining two queries with EXCEPT.
+func (b StatementBuilderType) Except(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, ExceptOperator, left, right)
+}
+
+// ExceptAll returns a SetBuilder combining two queries with EXCEPT ALL.
+func (b StatementBuilderType) ExceptAll(left, right SetQuery) SetBuilder {
+	return newStatementSetBuilder(b, ExceptAllOperator, left, right)
+}
+
 // Insert returns a InsertBuilder for this StatementBuilderType.
 func (b StatementBuilderType) Insert(into string) InsertBuilder {
 	return InsertBuilder(b).Into(into)

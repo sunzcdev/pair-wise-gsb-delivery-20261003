@@ -20,6 +20,8 @@ import (
 const (
 	testSchema = `
 		CREATE TABLE squirrel_integration ( k INT, v TEXT )`
+	testSetSchema = `
+		CREATE TABLE set_orders ( order_ref TEXT, kind TEXT )`
 	testData = `
 		INSERT INTO squirrel_integration VALUES
 			(1, 'foo'),
@@ -59,9 +61,17 @@ func TestMain(m *testing.M) {
 		os.Exit(-2)
 	}
 
+	_, err = db.Exec(testSetSchema)
+	if err != nil {
+		fmt.Printf("error creating set test schema: %v\n", err)
+		os.Exit(-2)
+	}
+
 	defer func() {
 		_, err = db.Exec("DROP TABLE squirrel_integration")
 		fmt.Printf("error removing test schema: %v\n", err)
+		_, err = db.Exec("DROP TABLE set_orders")
+		fmt.Printf("error removing set test schema: %v\n", err)
 	}()
 
 	_, err = db.Exec(testData)
@@ -132,4 +142,72 @@ func TestContext(t *testing.T) {
 	ctx := context.Background()
 	_, err := s.QueryContext(ctx)
 	assert.NoError(t, err)
+}
+
+func TestSetQueryParenthesesChangeResult(t *testing.T) {
+	if driver != "postgres" {
+		t.Skip("set query parenthesization assertion targets PostgreSQL")
+	}
+
+	if _, err := sb.Delete("set_orders").Exec(); err != nil {
+		t.Fatalf("clear set_orders: %v", err)
+	}
+
+	insert := sb.Insert("set_orders").Columns("order_ref", "kind")
+	for _, row := range [][2]string{
+		{"A", "formal"},
+		{"A", "formal"},
+		{"B", "backfill"},
+		{"A", "archived"},
+	} {
+		insert = insert.Values(row[0], row[1])
+	}
+	_, err := insert.Exec()
+	if err != nil {
+		t.Fatalf("insert set_orders: %v", err)
+	}
+
+	orders := func(kind string) sqrl.SelectBuilder {
+		return sb.Select("order_ref").From("set_orders").Where("kind = ?", kind)
+	}
+
+	leftGrouped := sb.UnionAll(orders("formal"), orders("backfill")).Except(orders("archived"))
+	rightGrouped := orders("formal").UnionAll(orders("backfill").Except(orders("archived")))
+
+	_, leftArgs, err := leftGrouped.ToSql()
+	assert.NoError(t, err)
+	assert.Equal(t, []interface{}{"formal", "backfill", "archived"}, leftArgs)
+	_, rightArgs, err := rightGrouped.ToSql()
+	assert.NoError(t, err)
+	assert.Equal(t, []interface{}{"formal", "backfill", "archived"}, rightArgs)
+
+	assertSetVals(t, leftGrouped.OrderBy("1"), "B")
+	assertSetVals(t, rightGrouped.OrderBy("1"), "A", "A", "B")
+
+	leftSQL, _, err := leftGrouped.ToSql()
+	assert.NoError(t, err)
+	assert.Equal(t,
+		`((SELECT order_ref FROM set_orders WHERE kind = $1) UNION ALL (SELECT order_ref FROM set_orders WHERE kind = $2)) EXCEPT (SELECT order_ref FROM set_orders WHERE kind = $3) ORDER BY 1`,
+		leftSQL)
+
+	rightSQL, _, err := rightGrouped.ToSql()
+	assert.NoError(t, err)
+	assert.Equal(t,
+		`(SELECT order_ref FROM set_orders WHERE kind = $1) UNION ALL ((SELECT order_ref FROM set_orders WHERE kind = $2) EXCEPT (SELECT order_ref FROM set_orders WHERE kind = $3))`,
+		rightSQL)
+}
+
+func assertSetVals(t *testing.T, s sqrl.SetBuilder, expected ...string) {
+	rows, err := s.Query()
+	assert.NoError(t, err)
+	defer rows.Close()
+
+	var vals []string
+	for rows.Next() {
+		var val string
+		assert.NoError(t, rows.Scan(&val))
+		vals = append(vals, val)
+	}
+	assert.NoError(t, rows.Err())
+	assert.Equal(t, expected, vals)
 }

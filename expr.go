@@ -126,6 +126,9 @@ func Alias(expr Sqlizer, alias string) aliasExpr {
 }
 
 func (e aliasExpr) ToSql() (sql string, args []interface{}, err error) {
+	if set, ok := e.expr.(SetBuilder); ok {
+		return setAliasExpr{query: set, alias: e.alias}.ToSql()
+	}
 	sql, args, err = e.expr.ToSql()
 	if err == nil {
 		sql = fmt.Sprintf("(%s) AS %s", sql, e.alias)

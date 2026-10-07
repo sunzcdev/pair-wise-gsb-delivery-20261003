@@ -82,6 +82,24 @@ sql, _, _ := psql.Select("*").From("elephants").Where("name IN (?,?)", "Dumbo", 
 /// ...squirrel replaces them using PlaceholderFormat.
 sql == "SELECT * FROM elephants WHERE name IN ($1,$2)"
 
+Set operations are represented as a binary query tree, so nesting a builder
+explicitly controls parentheses and precedence:
+
+```go
+formal := psql.Select("order_ref").From("orders").Where("kind = ?", "formal")
+backfill := psql.Select("order_ref").From("orders").Where("kind = ?", "backfill")
+archived := psql.Select("order_ref").From("orders").Where("kind = ?", "archived")
+
+combined := psql.UnionAll(formal, backfill).Except(archived)
+paged := combined.OrderBy("order_ref").Limit(20)
+outer := psql.Select("combined.order_ref").FromSet(combined, "combined")
+```
+
+`INTERSECT`, `INTERSECT ALL`, and `EXCEPT ALL` are also supported. ORDER BY,
+LIMIT, and OFFSET on an individual branch stay inside that branch's
+parentheses; the same methods on the complete set query apply to its final
+result.
+
 
 /// You can retrieve id ...
 query := sq.Insert("nodes").
