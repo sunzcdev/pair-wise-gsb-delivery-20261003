@@ -9,6 +9,7 @@ As a radix tree, it provides the following:
    the hash function is an O(k) operation, and hash tables have very poor cache locality.
  * Minimum / Maximum value lookups
  * Ordered iteration
+ * Fuzzy key lookups by byte-wise Levenshtein edit distance (`Tree.FuzzyLookup`)
 
 A tree supports using a transaction to batch multiple updates (insert, delete)
 in a more efficient manner than performing each operation one at a time.
@@ -70,4 +71,3 @@ for key, _, ok := it.Next(); ok; key, _, ok = it.Next() {
 //  005
 //  010
 ```
-
