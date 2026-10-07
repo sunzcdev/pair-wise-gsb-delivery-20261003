@@ -88,6 +88,39 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Top-k queries with exact distances
+
+The tree stores bounding boxes, and a nearby box does not imply nearby
+geometry. `TopK` combines a caller-provided node distance lower bound with
+an exact leaf distance, and returns the k items with the smallest exact
+distance. Ties are broken by a caller-provided stable id, and items beyond
+`maxDist` are excluded.
+
+```go
+var tr rtree.RTreeG[string]
+tr.Insert([2]float64{10, 10}, [2]float64{20, 20}, "rect")
+
+items, err := tr.TopK(
+	5,             // k
+	math.Inf(1),   // maxDist, the radius upper limit
+	func(min, max [2]float64) (float64, error) {
+		// lower bound distance to any geometry inside the rect
+		return boxDistToTarget(min, max), nil
+	},
+	func(min, max [2]float64, data string) (float64, error) {
+		// exact distance to the item's actual geometry
+		return exactDistToTarget(data)
+	},
+	func(data string) uint64 {
+		// stable id used to break exact-distance ties
+		return stableID(data)
+	},
+)
+```
+
+The caller is responsible for ensuring the node distance never
+overestimates the exact distances of the contained items. NaN distances,
+negative distances, and callback errors are detected and returned.
 
 ## Algorithms
 
@@ -135,4 +168,3 @@ minimum x value.
 ## License
 
 rtree source code is available under the MIT License.
-

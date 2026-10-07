@@ -5,6 +5,8 @@
 package rtree
 
 import (
+	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -843,6 +845,214 @@ func (tr *RTreeGN[N, T]) Nearby(
 	}
 }
 
+// TopKItem is a single entry returned from a TopK query.
+type TopKItem[N numeric, T any] struct {
+	Min  [2]N // minimum boundary of the item's rectangle
+	Max  [2]N // maximum boundary of the item's rectangle
+	Data T    // the item's data
+	Dist N    // exact distance, as reported by the leafDist callback
+}
+
+// Errors returned by TopK when a distance callback reports a distance that
+// can never be valid.
+var (
+	ErrNaNDist      = errors.New("rtree: distance callback returned NaN")
+	ErrNegativeDist = errors.New("rtree: distance callback returned negative")
+)
+
+// TopK returns the k items with the smallest exact distance, ordered by
+// distance. Ties are broken by the caller-provided stable id, smaller id
+// first. Items with an exact distance greater than maxDist are excluded.
+//
+// The tree only stores bounding boxes, and a nearby box does not imply
+// nearby geometry. For this reason the caller provides two distance
+// functions:
+//
+//   - nodeDist returns a lower bound for the distance to any geometry
+//     contained in the provided rectangle. It is used to safely skip
+//     entire subtrees.
+//   - leafDist returns the exact distance to the geometry of a single
+//     item. The order of the results is based on these distances only.
+//
+// The caller is responsible for ensuring that nodeDist never overestimates
+// the exact distances of the contained items. TopK does, however, detect
+// and report distances that can never be valid: NaN, negative values, and
+// errors returned by the callbacks.
+//
+// The search stops as soon as the current candidates prove that all
+// remaining subtrees can be excluded. It never assumes that the first k
+// boxes in box-distance order are the answer.
+func (tr *RTreeGN[N, T]) TopK(
+	k int,
+	maxDist N,
+	nodeDist func(min, max [2]N) (N, error),
+	leafDist func(min, max [2]N, data T) (N, error),
+	id func(data T) uint64,
+) ([]TopKItem[N, T], error) {
+	if k <= 0 || tr.root == nil {
+		return nil, nil
+	}
+	if maxDist != maxDist {
+		return nil, ErrNaNDist
+	}
+	q := tr.qpool.Get().(*queue[N, T])
+	defer func() {
+		*q = (*q)[:0]
+		tr.qpool.Put(q)
+	}()
+	dist, err := nodeDist(tr.rect.min, tr.rect.max)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkTopKDist(dist); err != nil {
+		return nil, err
+	}
+	if dist <= maxDist {
+		q.push(qnode[N, T]{dist: dist, rect: tr.rect, node: tr.root})
+	}
+	var cands topkCandidates[N, T]
+	for len(*q) > 0 {
+		if len(cands) == k && (*q)[0].dist > cands.worst().dist {
+			// The closest remaining subtree or item is farther away than
+			// the worst of the k current candidates, so no remaining item
+			// can displace a candidate.
+			break
+		}
+		qn, _ := q.pop()
+		if qn.node == nil {
+			cands.add(topkCandidate[N, T]{
+				dist: qn.dist,
+				rect: qn.rect,
+				data: qn.data,
+				id:   id(qn.data),
+			}, k)
+			continue
+		}
+		rects := qn.node.rects[:qn.node.count]
+		if qn.node.leaf() {
+			items := qn.node.items()[:qn.node.count]
+			for i := 0; i < len(items); i++ {
+				dist, err := leafDist(rects[i].min, rects[i].max, items[i])
+				if err != nil {
+					return nil, err
+				}
+				if err := checkTopKDist(dist); err != nil {
+					return nil, err
+				}
+				if dist <= maxDist {
+					q.push(qnode[N, T]{
+						dist: dist,
+						rect: rects[i],
+						data: items[i],
+					})
+				}
+			}
+		} else {
+			children := qn.node.children()[:qn.node.count]
+			for i := 0; i < len(children); i++ {
+				dist, err := nodeDist(rects[i].min, rects[i].max)
+				if err != nil {
+					return nil, err
+				}
+				if err := checkTopKDist(dist); err != nil {
+					return nil, err
+				}
+				if dist <= maxDist {
+					q.push(qnode[N, T]{
+						dist: dist,
+						rect: rects[i],
+						node: children[i],
+					})
+				}
+			}
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		return cands[i].better(cands[j])
+	})
+	res := make([]TopKItem[N, T], len(cands))
+	for i := range cands {
+		res[i] = TopKItem[N, T]{
+			Min:  cands[i].rect.min,
+			Max:  cands[i].rect.max,
+			Data: cands[i].data,
+			Dist: cands[i].dist,
+		}
+	}
+	return res, nil
+}
+
+func checkTopKDist[N numeric](dist N) error {
+	if dist != dist {
+		return ErrNaNDist
+	}
+	if dist < 0 {
+		return ErrNegativeDist
+	}
+	return nil
+}
+
+type topkCandidate[N numeric, T any] struct {
+	dist N
+	rect rect[N]
+	data T
+	id   uint64
+}
+
+// topkCandidates is a max-heap of candidates with the worst candidate
+// (largest distance, then largest id) at the top.
+type topkCandidates[N numeric, T any] []topkCandidate[N, T]
+
+// better returns true when a should be ordered before b: smaller distance
+// first, ties broken by the smaller caller-provided id.
+func (a topkCandidate[N, T]) better(b topkCandidate[N, T]) bool {
+	if a.dist != b.dist {
+		return a.dist < b.dist
+	}
+	return a.id < b.id
+}
+
+func (c topkCandidates[N, T]) worst() topkCandidate[N, T] {
+	return c[0]
+}
+
+func (c *topkCandidates[N, T]) add(cand topkCandidate[N, T], k int) {
+	items := *c
+	if len(items) < k {
+		items = append(items, cand)
+		*c = items
+		for i := len(items) - 1; i > 0; {
+			parent := (i - 1) / 2
+			if !items[parent].better(items[i]) {
+				break
+			}
+			items[parent], items[i] = items[i], items[parent]
+			i = parent
+		}
+		return
+	}
+	if !cand.better(items[0]) {
+		return
+	}
+	items[0] = cand
+	for i := 0; ; {
+		worst := i
+		left := i*2 + 1
+		right := i*2 + 2
+		if left < len(items) && items[worst].better(items[left]) {
+			worst = left
+		}
+		if right < len(items) && items[worst].better(items[right]) {
+			worst = right
+		}
+		if worst == i {
+			break
+		}
+		items[worst], items[i] = items[i], items[worst]
+		i = worst
+	}
+}
+
 type qnode[N numeric, T any] struct {
 	dist N           // distance to
 	rect rect[N]     // item or node rect
@@ -1053,6 +1263,20 @@ func (tr *RTreeG[T]) Nearby(
 	tr.base.Nearby(dist, iter)
 }
 
+// TopK returns the k items with the smallest exact distance, ordered by
+// distance. Ties are broken by the caller-provided stable id, smaller id
+// first. Items with an exact distance greater than maxDist are excluded.
+// See RTreeGN.TopK for the full contract of the distance callbacks.
+func (tr *RTreeG[T]) TopK(
+	k int,
+	maxDist float64,
+	nodeDist func(min, max [2]float64) (float64, error),
+	leafDist func(min, max [2]float64, data T) (float64, error),
+	id func(data T) uint64,
+) ([]TopKItem[float64, T], error) {
+	return tr.base.TopK(k, maxDist, nodeDist, leafDist, id)
+}
+
 // Clear will delete all items.
 func (tr *RTreeG[T]) Clear() {
 	tr.base.Clear()
@@ -1149,6 +1373,20 @@ func (tr *RTree) Nearby(
 	iter func(min, max [2]float64, data any, dist float64) bool,
 ) {
 	tr.base.Nearby(algo, iter)
+}
+
+// TopK returns the k items with the smallest exact distance, ordered by
+// distance. Ties are broken by the caller-provided stable id, smaller id
+// first. Items with an exact distance greater than maxDist are excluded.
+// See RTreeGN.TopK for the full contract of the distance callbacks.
+func (tr *RTree) TopK(
+	k int,
+	maxDist float64,
+	nodeDist func(min, max [2]float64) (float64, error),
+	leafDist func(min, max [2]float64, data any) (float64, error),
+	id func(data any) uint64,
+) ([]TopKItem[float64, any], error) {
+	return tr.base.TopK(k, maxDist, nodeDist, leafDist, id)
 }
 
 // Copy the tree.

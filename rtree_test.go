@@ -7,6 +7,7 @@ package rtree
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"runtime"
@@ -948,4 +949,367 @@ func TestNearby(t *testing.T) {
 		}
 	})
 
+}
+
+func TestTopK(t *testing.T) {
+	t.Run("ReversedBoxOrder", func(t *testing.T) {
+		// The tree stores bounding boxes of complex geometry, and a
+		// nearby box does not imply nearby geometry. Both items are thin
+		// slivers along the x-axis and the target is the origin.
+		// "sliver-far" has the closest box, but its actual geometry sits
+		// at the far end of the sliver. "sliver-near" has a slightly
+		// farther box, yet its geometry is much closer. Taking the first
+		// k boxes in Nearby order would wrongly return "sliver-far".
+		var tr RTreeG[string]
+		tr.Insert([2]float64{2, 0}, [2]float64{100, 0.5}, "sliver-far")
+		tr.Insert([2]float64{5, 0}, [2]float64{5.5, 0.5}, "sliver-near")
+		target := [2]float64{0, 0}
+		boxDist := BoxDist[float64, string](target, target, nil)
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return boxDist(min, max, "", false), nil
+		}
+		exact := map[string]float64{
+			"sliver-far":  100 * 100, // geometry at the far endpoint
+			"sliver-near": 5 * 5,     // geometry at the near endpoint
+		}
+		leafDist := func(min, max [2]float64, data string,
+		) (float64, error) {
+			return exact[data], nil
+		}
+		ids := map[string]uint64{"sliver-far": 1, "sliver-near": 2}
+		id := func(data string) uint64 { return ids[data] }
+
+		res, err := tr.TopK(1, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Data != "sliver-near" ||
+			res[0].Dist != 25 {
+			t.Fatalf("expected [sliver-near 25], got %v", res)
+		}
+
+		res, err = tr.TopK(2, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 || res[0].Data != "sliver-near" ||
+			res[1].Data != "sliver-far" {
+			t.Fatalf("expected exact-distance order, got %v", res)
+		}
+	})
+
+	t.Run("EarlyStop", func(t *testing.T) {
+		// A small near cluster and a large far cluster. Once the near
+		// cluster provides k candidates, the far subtrees must be
+		// excluded without ever asking for their exact distances.
+		var tr RTreeG[int]
+		for i := 0; i < 3; i++ {
+			x := float64(i + 1)
+			tr.Insert([2]float64{x, 0}, [2]float64{x, 0}, i)
+		}
+		for i := 0; i < 100; i++ {
+			x := 1000 + float64(i%10)*0.1
+			y := float64(i/10) * 0.1
+			tr.Insert([2]float64{x, y}, [2]float64{x, y}, 100+i)
+		}
+		target := [2]float64{0, 0}
+		boxDist := BoxDist[float64, int](target, target, nil)
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return boxDist(min, max, 0, false), nil
+		}
+		var leafCalls int
+		leafDist := func(min, max [2]float64, data int,
+		) (float64, error) {
+			leafCalls++
+			return boxDist(min, max, data, false), nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+		res, err := tr.TopK(1, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Data != 0 || res[0].Dist != 1 {
+			t.Fatalf("expected [0 1], got %v", res)
+		}
+		if leafCalls != 3 {
+			t.Fatalf("expected 3 exact distance calls, got %d", leafCalls)
+		}
+	})
+
+	t.Run("BruteForce", func(t *testing.T) {
+		var tr RTreeG[int]
+		const n = 2000
+		target := [2]float64{12, -7}
+		boxDist := BoxDist[float64, int](target, target, nil)
+		// Exact distances are the box distance plus a small non-negative
+		// jitter, which keeps nodeDist a valid lower bound. The jitter
+		// is quantized to produce many exact-distance ties.
+		exact := make([]float64, n)
+		for i := 0; i < n; i++ {
+			r := randRect('m')
+			tr.Insert(r.min, r.max, i)
+			exact[i] = boxDist(r.min, r.max, i, false) +
+				float64(rand.Intn(4))
+		}
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return boxDist(min, max, 0, false), nil
+		}
+		leafDist := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return exact[data], nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+
+		sorted := make([]int, n)
+		for i := range sorted {
+			sorted[i] = i
+		}
+		sort.Slice(sorted, func(i, j int) bool {
+			a, b := sorted[i], sorted[j]
+			if exact[a] != exact[b] {
+				return exact[a] < exact[b]
+			}
+			return a < b
+		})
+
+		check := func(k int, maxDist float64, want []int) {
+			t.Helper()
+			res, err := tr.TopK(k, maxDist, nodeDist, leafDist, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res) != len(want) {
+				t.Fatalf("k=%d: expected %d results, got %d",
+					k, len(want), len(res))
+			}
+			for i, data := range want {
+				if res[i].Data != data || res[i].Dist != exact[data] {
+					t.Fatalf("k=%d: mismatch at %d: expected [%d %v], "+
+						"got [%d %v]", k, i, data, exact[data],
+						res[i].Data, res[i].Dist)
+				}
+			}
+		}
+		for _, k := range []int{1, 7, 64, 500, n, n + 10} {
+			m := k
+			if m > n {
+				m = n
+			}
+			check(k, math.Inf(1), sorted[:m])
+		}
+		// radius cap: only items within maxDist may be returned
+		maxDist := exact[sorted[999]]
+		var want []int
+		for _, data := range sorted {
+			if exact[data] > maxDist {
+				break
+			}
+			want = append(want, data)
+		}
+		check(n, maxDist, want)
+	})
+
+	t.Run("TieBreak", func(t *testing.T) {
+		// Equal exact distances are ordered by the caller-provided id.
+		var tr RTreeG[int]
+		tr.Insert([2]float64{0, 0}, [2]float64{1, 1}, 0)
+		tr.Insert([2]float64{2, 2}, [2]float64{3, 3}, 1)
+		tr.Insert([2]float64{4, 4}, [2]float64{5, 5}, 2)
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return 0, nil
+		}
+		leafDist := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return 10, nil
+		}
+		ids := map[int]uint64{0: 30, 1: 10, 2: 20}
+		id := func(data int) uint64 { return ids[data] }
+		res, err := tr.TopK(3, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 3 || res[0].Data != 1 || res[1].Data != 2 ||
+			res[2].Data != 0 {
+			t.Fatalf("expected id order [1 2 0], got %v", res)
+		}
+		res, err = tr.TopK(2, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 || res[0].Data != 1 || res[1].Data != 2 {
+			t.Fatalf("expected id order [1 2], got %v", res)
+		}
+	})
+
+	t.Run("MaxDist", func(t *testing.T) {
+		var tr RTreeG[int]
+		tr.Insert([2]float64{1, 0}, [2]float64{1, 0}, 1)
+		tr.Insert([2]float64{2, 0}, [2]float64{2, 0}, 2)
+		tr.Insert([2]float64{3, 0}, [2]float64{3, 0}, 3)
+		target := [2]float64{0, 0}
+		boxDist := BoxDist[float64, int](target, target, nil)
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return boxDist(min, max, 0, false), nil
+		}
+		leafDist := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return boxDist(min, max, data, false), nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+		res, err := tr.TopK(10, 4, nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 2 || res[0].Data != 1 || res[1].Data != 2 {
+			t.Fatalf("expected items within radius, got %v", res)
+		}
+		res, err = tr.TopK(10, 0.5, nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 0 {
+			t.Fatalf("expected no items within radius, got %v", res)
+		}
+	})
+
+	t.Run("EmptyTree", func(t *testing.T) {
+		var tr RTreeG[int]
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return 0, nil
+		}
+		leafDist := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return 0, nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+		res, err := tr.TopK(5, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 0 {
+			t.Fatalf("expected no results, got %v", res)
+		}
+		// non-positive k is a no-op, even on a non-empty tree
+		tr.Insert([2]float64{1, 1}, [2]float64{1, 1}, 1)
+		for _, k := range []int{0, -3} {
+			res, err := tr.TopK(k, math.Inf(1), nodeDist, leafDist, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(res) != 0 {
+				t.Fatalf("k=%d: expected no results, got %v", k, res)
+			}
+		}
+	})
+
+	t.Run("KExceedsLen", func(t *testing.T) {
+		var tr RTree
+		tr.Insert([2]float64{3, 0}, [2]float64{3, 0}, "c")
+		tr.Insert([2]float64{1, 0}, [2]float64{1, 0}, "a")
+		tr.Insert([2]float64{2, 0}, [2]float64{2, 0}, "b")
+		target := [2]float64{0, 0}
+		boxDist := BoxDist[float64, any](target, target, nil)
+		nodeDist := func(min, max [2]float64) (float64, error) {
+			return boxDist(min, max, nil, false), nil
+		}
+		leafDist := func(min, max [2]float64, data any,
+		) (float64, error) {
+			return boxDist(min, max, data, false), nil
+		}
+		id := func(data any) uint64 { return uint64(len(data.(string))) }
+		res, err := tr.TopK(10, math.Inf(1), nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 3 || res[0].Data != "a" || res[1].Data != "b" ||
+			res[2].Data != "c" {
+			t.Fatalf("expected [a b c], got %v", res)
+		}
+	})
+
+	t.Run("Errors", func(t *testing.T) {
+		var tr RTreeG[int]
+		tr.Insert([2]float64{1, 1}, [2]float64{2, 2}, 1)
+		okNode := func(min, max [2]float64) (float64, error) {
+			return 0, nil
+		}
+		okLeaf := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return 1, nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+		nanNode := func(min, max [2]float64) (float64, error) {
+			return math.NaN(), nil
+		}
+		nanLeaf := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return math.NaN(), nil
+		}
+		negNode := func(min, max [2]float64) (float64, error) {
+			return -1, nil
+		}
+		negLeaf := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return -1, nil
+		}
+		boom := errors.New("boom")
+		errNode := func(min, max [2]float64) (float64, error) {
+			return 0, boom
+		}
+		errLeaf := func(min, max [2]float64, data int,
+		) (float64, error) {
+			return 0, boom
+		}
+
+		if _, err := tr.TopK(1, 100, nanNode, okLeaf, id); !errors.Is(
+			err, ErrNaNDist) {
+			t.Fatalf("expected ErrNaNDist, got %v", err)
+		}
+		if _, err := tr.TopK(1, 100, okNode, nanLeaf, id); !errors.Is(
+			err, ErrNaNDist) {
+			t.Fatalf("expected ErrNaNDist, got %v", err)
+		}
+		if _, err := tr.TopK(1, 100, negNode, okLeaf, id); !errors.Is(
+			err, ErrNegativeDist) {
+			t.Fatalf("expected ErrNegativeDist, got %v", err)
+		}
+		if _, err := tr.TopK(1, 100, okNode, negLeaf, id); !errors.Is(
+			err, ErrNegativeDist) {
+			t.Fatalf("expected ErrNegativeDist, got %v", err)
+		}
+		if _, err := tr.TopK(1, 100, errNode, okLeaf, id); !errors.Is(
+			err, boom) {
+			t.Fatalf("expected boom, got %v", err)
+		}
+		if _, err := tr.TopK(1, 100, okNode, errLeaf, id); !errors.Is(
+			err, boom) {
+			t.Fatalf("expected boom, got %v", err)
+		}
+		if _, err := tr.TopK(1, math.NaN(), okNode, okLeaf,
+			id); !errors.Is(err, ErrNaNDist) {
+			t.Fatalf("expected ErrNaNDist, got %v", err)
+		}
+	})
+
+	t.Run("GN", func(t *testing.T) {
+		var tr RTreeGN[int, int]
+		tr.Insert([2]int{10, 10}, [2]int{10, 10}, 2)
+		tr.Insert([2]int{5, 5}, [2]int{5, 5}, 1)
+		target := [2]int{0, 0}
+		boxDist := BoxDist[int, int](target, target, nil)
+		nodeDist := func(min, max [2]int) (int, error) {
+			return boxDist(min, max, 0, false), nil
+		}
+		leafDist := func(min, max [2]int, data int) (int, error) {
+			return boxDist(min, max, data, false), nil
+		}
+		id := func(data int) uint64 { return uint64(data) }
+		res, err := tr.TopK(1, 1<<30, nodeDist, leafDist, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(res) != 1 || res[0].Data != 1 || res[0].Dist != 50 {
+			t.Fatalf("expected [1 50], got %v", res)
+		}
+	})
 }
