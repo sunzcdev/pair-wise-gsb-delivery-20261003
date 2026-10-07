@@ -30,9 +30,10 @@ var (
 )
 
 type ComponentBase struct {
-	Properties     []IANAProperty
-	Components     []Component
-	timezoneMapper TimezoneMapper
+	Properties        []IANAProperty
+	Components        []Component
+	timezoneMapper    TimezoneMapper
+	embeddedTimezones embeddedTimezoneLookup
 }
 
 func (cb *ComponentBase) UnknownPropertiesIANAProperties() []IANAProperty {
@@ -67,6 +68,15 @@ func (cb *ComponentBase) getTimezoneMapper() TimezoneMapper {
 	return cb.timezoneMapper
 }
 
+func (cb *ComponentBase) setEmbeddedTimezones(tzs embeddedTimezoneLookup) {
+	cb.embeddedTimezones = tzs
+	for _, child := range cb.Components {
+		if setter, ok := child.(embeddedTimezoneSetter); ok {
+			setter.setEmbeddedTimezones(tzs)
+		}
+	}
+}
+
 func (cb *ComponentBase) addComponent(c Component) {
 	if c == nil {
 		return
@@ -76,6 +86,11 @@ func (cb *ComponentBase) addComponent(c Component) {
 			if getter, ok := c.(timezoneMapperGetter); !ok || getter.getTimezoneMapper() == nil {
 				setter.setTimezoneMapper(cb.timezoneMapper)
 			}
+		}
+	}
+	if cb.embeddedTimezones != nil {
+		if setter, ok := c.(embeddedTimezoneSetter); ok {
+			setter.setEmbeddedTimezones(cb.embeddedTimezones)
 		}
 	}
 	cb.Components = append(cb.Components, c)
@@ -318,18 +333,27 @@ func (cb *ComponentBase) getTimeProp(componentProperty ComponentProperty, expect
 		return time.Time{}, fmt.Errorf("%w: %s", ErrPropertyNotFound, componentProperty)
 	}
 
-	if cb.timezoneMapper != nil {
-		return parseTimeValue(timeProp.BaseProperty.Value, timeProp.ICalParameters, expectAllDay, cb.timezoneMapper)
-	}
-	return parseTimeValue(timeProp.BaseProperty.Value, timeProp.ICalParameters, expectAllDay)
+	return parseTimeValue(timeProp.BaseProperty.Value, timeProp.ICalParameters, expectAllDay, cb.timeParseOps()...)
 }
 
 // parseTimeValue parses a single iCal time value string with the given parameters.
 // This is the core time parsing logic shared by getTimeProp and multi-value time getters.
 func parseTimeValue(timeVal string, params map[string][]string, expectAllDay bool, ops ...any) (time.Time, error) {
+	info, err := parseTimeValueInfo(timeVal, params, expectAllDay, ops...)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.Time, nil
+}
+
+// parseTimeValueInfo parses a single iCal time value and additionally reports
+// how a TZID parameter was resolved. TZID references are satisfied first by
+// an explicitly supplied mapper, then by a VTIMEZONE embedded in the same
+// calendar, and finally by the host timezone database.
+func parseTimeValueInfo(timeVal string, params map[string][]string, expectAllDay bool, ops ...any) (TimePropertyInfo, error) {
 	matched := timeStampVariations.FindStringSubmatch(timeVal)
 	if matched == nil {
-		return time.Time{}, fmt.Errorf("%w, got '%s'", ErrTimeValueNotMatched, timeVal)
+		return TimePropertyInfo{}, fmt.Errorf("%w, got '%s'", ErrTimeValueNotMatched, timeVal)
 	}
 	tOrZGrp := matched[2]
 	zGrp := matched[4]
@@ -337,15 +361,32 @@ func parseTimeValue(timeVal string, params map[string][]string, expectAllDay boo
 	grp3len := len(matched[3])
 
 	tzId, tzIdOk := params["TZID"]
+	info := TimePropertyInfo{}
 	var propLoc *time.Location
+	var embeddedDef *TimezoneDefinition
 	if tzIdOk {
 		if len(tzId) != 1 {
-			return time.Time{}, ErrExpectedOneTZID
+			return TimePropertyInfo{}, ErrExpectedOneTZID
 		}
-		var tzErr error
-		propLoc, tzErr = resolveTimezone(tzId[0], ops...)
-		if tzErr != nil {
-			return time.Time{}, tzErr
+		info.TZID = tzId[0]
+		mapped := applyTimezoneMappers(tzId[0], ops...)
+		if mapped != nil {
+			propLoc = mapped
+			info.Kind = TimeKindLocation
+			info.Location = mapped
+		} else if def, lookupErr := lookupEmbedded(tzId[0], ops...); lookupErr != nil {
+			return TimePropertyInfo{}, lookupErr
+		} else if def != nil {
+			embeddedDef = def
+			info.Kind = TimeKindEmbedded
+		} else {
+			loc, tzErr := time.LoadLocation(tzId[0])
+			if tzErr != nil {
+				return TimePropertyInfo{}, tzErr
+			}
+			propLoc = loc
+			info.Kind = TimeKindLocation
+			info.Location = loc
 		}
 	}
 	dateStr := matched[1]
@@ -353,39 +394,120 @@ func parseTimeValue(timeVal string, params map[string][]string, expectAllDay boo
 	if expectAllDay {
 		if grp1len > 0 {
 			if tOrZGrp == "Z" || zGrp == "Z" {
-				return time.ParseInLocation(icalDateFormatUtc, dateStr+"Z", time.UTC)
-			} else {
-				if propLoc == nil {
-					return time.ParseInLocation(icalDateFormatLocal, dateStr, time.Local)
+				info.Kind = TimeKindDate
+				t, err := time.ParseInLocation(icalDateFormatUtc, dateStr+"Z", time.UTC)
+				info.Time = t
+				return info, err
+			}
+			if propLoc == nil && embeddedDef == nil {
+				info.Kind = TimeKindDate
+				t, err := time.ParseInLocation(icalDateFormatLocal, dateStr, time.Local)
+				info.Time = t
+				return info, err
+			}
+			loc := propLoc
+			if loc == nil {
+				// DATE values carry no time of day. Keep the historical
+				// behaviour of locating them through the host database when
+				// only an embedded definition is available.
+				loaded, loadErr := time.LoadLocation(tzId[0])
+				if loadErr != nil {
+					loc = time.UTC
 				} else {
-					return time.ParseInLocation(icalDateFormatLocal, dateStr, propLoc)
+					loc = loaded
 				}
 			}
+			info.Kind = TimeKindDate
+			t, err := time.ParseInLocation(icalDateFormatLocal, dateStr, loc)
+			info.Time = t
+			return info, err
 		}
 
-		return time.Time{}, fmt.Errorf("%w, got '%s'", ErrTimeValueMatchedButUnsupportedAllDayTimeStamp, timeVal)
+		return TimePropertyInfo{}, fmt.Errorf("%w, got '%s'", ErrTimeValueMatchedButUnsupportedAllDayTimeStamp, timeVal)
+	}
+
+	setTime := func(t time.Time, err error) (TimePropertyInfo, error) {
+		info.Time = t
+		return info, err
 	}
 
 	switch {
 	case grp1len > 0 && grp3len > 0 && tOrZGrp == "T" && zGrp == "Z":
-		return time.ParseInLocation(icalTimestampFormatUtc, timeVal, time.UTC)
+		info.Kind = TimeKindUTC
+		return setTime(time.ParseInLocation(icalTimestampFormatUtc, timeVal, time.UTC))
 	case grp1len > 0 && grp3len > 0 && tOrZGrp == "T" && zGrp == "":
-		if propLoc == nil {
-			return time.ParseInLocation(icalTimestampFormatLocal, timeVal, time.Local)
-		} else {
-			return time.ParseInLocation(icalTimestampFormatLocal, timeVal, propLoc)
+		wall, err := time.ParseInLocation(icalTimestampFormatLocal, timeVal, time.UTC)
+		if err != nil {
+			return TimePropertyInfo{}, err
 		}
+		if embeddedDef != nil {
+			resolved, rerr := embeddedDef.Resolve(wall)
+			if rerr != nil {
+				return TimePropertyInfo{}, rerr
+			}
+			info.Time = resolved.Time
+			info.Embedded = &resolved
+			info.LocalTimeStatus = resolved.Status
+			return info, nil
+		}
+		if propLoc == nil {
+			info.Kind = TimeKindLocal
+			info.Time = time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), wall.Second(), wall.Nanosecond(), time.Local)
+			return info, nil
+		}
+		info.Time = time.Date(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), wall.Minute(), wall.Second(), wall.Nanosecond(), propLoc)
+		return info, nil
 	case grp1len > 0 && grp3len == 0 && tOrZGrp == "Z" && zGrp == "":
-		return time.ParseInLocation(icalDateFormatUtc, dateStr+"Z", time.UTC)
+		info.Kind = TimeKindUTC
+		return setTime(time.ParseInLocation(icalDateFormatUtc, dateStr+"Z", time.UTC))
 	case grp1len > 0 && grp3len == 0 && tOrZGrp == "" && zGrp == "":
-		if propLoc == nil {
-			return time.ParseInLocation(icalDateFormatLocal, dateStr, time.Local)
-		} else {
-			return time.ParseInLocation(icalDateFormatLocal, dateStr, propLoc)
+		if propLoc == nil && embeddedDef == nil {
+			info.Kind = TimeKindLocal
+			return setTime(time.ParseInLocation(icalDateFormatLocal, dateStr, time.Local))
 		}
+		loc := propLoc
+		if loc == nil {
+			loc = time.UTC
+		}
+		return setTime(time.ParseInLocation(icalDateFormatLocal, dateStr, loc))
 	}
 
-	return time.Time{}, fmt.Errorf("%w, got '%s'", ErrTimeValueMatchedButNotSupported, timeVal)
+	return TimePropertyInfo{}, fmt.Errorf("%w, got '%s'", ErrTimeValueMatchedButNotSupported, timeVal)
+}
+
+// applyTimezoneMappers runs the explicit TimezoneMapper options (if any) and
+// returns the first non-nil location, without falling back to the host
+// timezone database.
+func applyTimezoneMappers(tzid string, ops ...any) *time.Location {
+	for _, op := range ops {
+		switch op := op.(type) {
+		case TimezoneMapper:
+			if loc := op(tzid); loc != nil {
+				return loc
+			}
+		case func(string) *time.Location:
+			if loc := op(tzid); loc != nil {
+				return loc
+			}
+		}
+	}
+	return nil
+}
+
+// lookupEmbedded finds a VTIMEZONE definition supplied through the options.
+func lookupEmbedded(tzid string, ops ...any) (*TimezoneDefinition, error) {
+	for _, op := range ops {
+		if lookup, ok := op.(embeddedTimezoneLookup); ok {
+			def, err := lookup.lookupEmbeddedTimezone(tzid)
+			if err != nil {
+				return nil, err
+			}
+			if def != nil {
+				return def, nil
+			}
+		}
+	}
+	return nil, nil
 }
 
 func (cb *ComponentBase) GetStartAt() (time.Time, error) {
@@ -470,11 +592,7 @@ func (cb *ComponentBase) getMultiTimeProp(prop ComponentProperty) ([]time.Time, 
 			if v == "" {
 				continue
 			}
-			var ops []any
-			if cb.timezoneMapper != nil {
-				ops = append(ops, cb.timezoneMapper)
-			}
-			t, err := parseTimeValue(v, p.ICalParameters, isDateOnly, ops...)
+			t, err := parseTimeValue(v, p.ICalParameters, isDateOnly, cb.timeParseOps()...)
 			if err != nil {
 				return nil, fmt.Errorf("parsing %s value %q: %w", prop, v, err)
 			}

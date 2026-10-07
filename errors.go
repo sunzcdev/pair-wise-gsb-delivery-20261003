@@ -125,4 +125,25 @@ var (
 
 	// ErrPropertySkipped marks a parser decision to skip a malformed line and continue.
 	ErrPropertySkipped = errors.New("property skipped")
+
+	// ErrVTimezoneMissingTZID reports a VTIMEZONE component without a TZID property.
+	ErrVTimezoneMissingTZID = errors.New("VTIMEZONE missing TZID")
+	// ErrVTimezoneMissingObservance reports a VTIMEZONE component that defines no STANDARD or DAYLIGHT.
+	ErrVTimezoneMissingObservance = errors.New("VTIMEZONE has no STANDARD or DAYLIGHT observance")
+	// ErrVTimezoneMissingDTSTART reports an observance without a DTSTART property.
+	ErrVTimezoneMissingDTSTART = errors.New("VTIMEZONE observance missing DTSTART")
+	// ErrVTimezoneMissingOffset reports an observance missing TZOFFSETFROM or TZOFFSETTO.
+	ErrVTimezoneMissingOffset = errors.New("VTIMEZONE observance missing TZOFFSETFROM/TZOFFSETTO")
+	// ErrVTimezoneInvalidOffset reports a TZOFFSETFROM/TZOFFSETTO value that cannot be parsed.
+	ErrVTimezoneInvalidOffset = errors.New("invalid VTIMEZONE UTC offset")
+	// ErrVTimezoneInvalidRDATE reports an unparseable RDATE in an observance.
+	ErrVTimezoneInvalidRDATE = errors.New("invalid VTIMEZONE RDATE")
+	// ErrVTimezoneUnsupportedRDATE reports an RDATE value type other than DATE-TIME or DATE.
+	ErrVTimezoneUnsupportedRDATE = errors.New("unsupported VTIMEZONE RDATE (only DATE/DATE-TIME)")
+	// ErrVTimezoneUnsupportedRRULE reports an RRULE that cannot be evaluated inside a VTIMEZONE.
+	ErrVTimezoneUnsupportedRRULE = errors.New("unsupported VTIMEZONE RRULE")
+	// ErrVTimezoneBeforeCoverage reports a local time earlier than the earliest defined observance onset.
+	ErrVTimezoneBeforeCoverage = errors.New("local time precedes VTIMEZONE coverage")
+	// ErrVTimezoneContradiction reports an internally inconsistent set of observances.
+	ErrVTimezoneContradiction = errors.New("contradictory VTIMEZONE rules")
 )

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -418,6 +419,8 @@ type Calendar struct {
 	unknownCalendarPropertyHandler func(cal *Calendar, state string, cl *BaseProperty) error
 	propertyParser                 PropertyParser
 	timezoneMapper                 TimezoneMapper
+	embedded                       *embeddedTimezones
+	embedOnce                      sync.Once
 }
 
 func NewCalendar() *Calendar {
@@ -659,6 +662,11 @@ func (cal *Calendar) addComponent(c Component) {
 			if getter, ok := c.(timezoneMapperGetter); !ok || getter.getTimezoneMapper() == nil {
 				setter.setTimezoneMapper(cal.timezoneMapper)
 			}
+		}
+	}
+	if cal.embedded != nil {
+		if setter, ok := c.(embeddedTimezoneSetter); ok {
+			setter.setEmbeddedTimezones(cal.embedded)
 		}
 	}
 	cal.Components = append(cal.Components, c)
@@ -995,6 +1003,7 @@ func ParseCalendarWithOptions(r io.Reader, options ...any) (*Calendar, error) {
 			return nil, NewMalformedError(lineNo, -1, ErrBadCalendarState)
 		}
 	}
+	c.attachEmbeddedTimezones()
 	return c, nil
 }
 
