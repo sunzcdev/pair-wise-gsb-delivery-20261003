@@ -25,6 +25,18 @@ type WriterConfig struct {
 	NoCheckSum bool
 	// match algorithm
 	Matcher lzma.MatchAlgorithm
+
+	// DeltaDistance enables the Delta filter as the first filter
+	// of the chain when set to a value between 1 and 256. The
+	// value zero (the default) disables the filter.
+	DeltaDistance int
+	// BCJ enables the x86 branch/call/jump conversion filter. The
+	// filter is applied after Delta (if enabled) and before
+	// LZMA2.
+	BCJ bool
+	// BCJStartOffset sets the start_offset property of the x86
+	// BCJ filter. It is used only when BCJ is enabled.
+	BCJStartOffset uint32
 }
 
 // fill replaces zero values with default values.
@@ -71,12 +83,26 @@ func (c *WriterConfig) Verify() error {
 	if err := verifyFlags(c.CheckSum); err != nil {
 		return err
 	}
+	if c.DeltaDistance != 0 &&
+		(c.DeltaDistance < deltaMinDist || c.DeltaDistance > deltaMaxDist) {
+		return errors.New("xz: Delta distance out of range")
+	}
 	return nil
 }
 
-// filters creates the filter list for the given parameters.
+// filters creates the filter list for the given parameters. The
+// default configuration uses only the LZMA2 filter; Delta and x86
+// BCJ are added in the order required by the xz format when enabled.
 func (c *WriterConfig) filters() []filter {
-	return []filter{&lzmaFilter{int64(c.DictCap)}}
+	var fs []filter
+	if c.DeltaDistance != 0 {
+		fs = append(fs, &deltaFilter{dist: c.DeltaDistance})
+	}
+	if c.BCJ {
+		fs = append(fs, &x86Filter{startOffset: c.BCJStartOffset})
+	}
+	fs = append(fs, &lzmaFilter{int64(c.DictCap)})
+	return fs
 }
 
 // maxInt64 defines the maximum 64-bit signed integer.
@@ -91,13 +117,24 @@ func verifyFilters(f []filter) error {
 	if len(f) > 4 {
 		return errors.New("xz: more than four filters")
 	}
-	for _, g := range f[:len(f)-1] {
-		if g.last() {
-			return errors.New("xz: last filter is not last")
+	for i, g := range f {
+		if i < len(f)-1 {
+			switch g.id() {
+			case deltaFilterID, x86FilterID:
+			default:
+				if g.last() {
+					return errors.New(
+						"xz: LZMA2 filter is not the last")
+				}
+				return errors.New(
+					"xz: filter at wrong position in filter chain")
+			}
+			continue
 		}
-	}
-	if !f[len(f)-1].last() {
-		return errors.New("xz: wrong last filter")
+		if g.id() != lzmaFilterID {
+			return errors.New(
+				"xz: last filter must be the LZMA2 filter")
+		}
 	}
 	return nil
 }

@@ -57,6 +57,26 @@ func main() {
 
 You can find the full documentation at [pkg.go.dev](https://pkg.go.dev/github.com/ulikunitz/xz).
 
+## Filter chains
+
+By default only the LZMA2 filter is used. A `WriterConfig` can enable
+the Delta filter and the x86 branch/call/jump (BCJ) filter, which are
+applied in the order Delta, x86 BCJ, LZMA2 as required by the xz
+format. `DeltaDistance` selects the Delta distance (1–256); `BCJ`
+enables x86 conversion and `BCJStartOffset` sets its start offset.
+
+```go
+cfg := xz.WriterConfig{
+    DeltaDistance: 1,
+    BCJ:           true,
+    BCJStartOffset: 0,
+}
+w, err := cfg.NewWriter(&buf)
+```
+
+Streams containing unsupported filters are rejected with an explicit
+error rather than decoded as unfiltered data.
+
 ## Using the gxz compression tool
 
 The package includes a gxz command line utility for compression and
