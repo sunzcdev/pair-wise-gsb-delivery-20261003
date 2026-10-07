@@ -49,6 +49,32 @@ func UncompressBlockWithDict(src, dst, dict []byte) (int, error) {
 	return lz4block.UncompressBlock(src, dst, dict)
 }
 
+// UncompressBlockScatter uncompresses the source buffer into the destination
+// fragments, which are treated as one contiguous logical buffer, and returns
+// the uncompressed size.
+//
+// Use it when the output lands in fixed-size pages or otherwise non-adjacent
+// buffers: literals and matches may span fragment boundaries, and a match may
+// copy bytes written to an earlier fragment during the same call. The
+// fragments are written directly; no buffer of the combined output size is
+// allocated.
+//
+// The total length of the fragments is checked for overflow up front. On
+// error, the returned count is the number of bytes decoded so far: logical
+// offsets [0, count) may have been modified, and the rest is untouched.
+//
+// An error is returned if the source data is invalid or the fragments do not
+// provide enough room.
+func UncompressBlockScatter(src []byte, dsts ...[]byte) (int, error) {
+	return lz4block.UncompressBlockScatter(src, dsts, nil)
+}
+
+// UncompressBlockScatterWithDict is UncompressBlockScatter with an external
+// dictionary for matches that start before the beginning of the output.
+func UncompressBlockScatterWithDict(src, dict []byte, dsts ...[]byte) (int, error) {
+	return lz4block.UncompressBlockScatter(src, dsts, dict)
+}
+
 // A Compressor compresses data into the LZ4 block format.
 // It uses a fast compression algorithm.
 //
