@@ -200,6 +200,37 @@ func CompressionLevelOption(level CompressionLevel) Option {
 
 func onBlockDone(int) {}
 
+// DictHandler resolves the dictionary ID found in a frame header to the
+// dictionary contents to decode the frame with. The returned dictionary is
+// only read from; only its last 64Kb are used, as per the LZ4 window size.
+// The returned release function, if not nil, is called when the dictionary
+// is not needed anymore: when the frame is fully read, when an error occurs,
+// or when the Reader is reset.
+//
+// A handler reports a failure with a non-nil error. A handler that does not
+// know the ID should return a nil dictionary with a nil error, which makes
+// the Reader fail with ErrMissingDictionary; the release function, if any,
+// is still called.
+type DictHandler func(id uint32) (dict []byte, release func(), err error)
+
+// DictOption sets the handler used to resolve the dictionary of frames
+// carrying a dictionary ID. Frames with a dictionary ID are rejected with
+// ErrMissingDictionary if no handler is set or if the handler cannot provide
+// the dictionary. Dictionary frames are always decoded sequentially.
+func DictOption(handler DictHandler) Option {
+	return func(a applier) error {
+		switch rw := a.(type) {
+		case nil:
+			s := fmt.Sprintf("DictOption(%s)", reflect.TypeOf(handler).String())
+			return lz4errors.Error(s)
+		case *Reader:
+			rw.dictHandler = handler
+			return nil
+		}
+		return lz4errors.ErrOptionNotApplicable
+	}
+}
+
 // OnBlockDoneOption is triggered when a block has been processed. For a Writer, it is when is has been compressed,
 // for a Reader, it is when it has been uncompressed.
 func OnBlockDoneOption(handler func(size int)) Option {

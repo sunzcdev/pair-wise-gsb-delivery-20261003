@@ -2,6 +2,7 @@ package lz4
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
@@ -32,16 +33,18 @@ func newReader(r io.Reader, legacy bool) *Reader {
 
 // Reader allows reading an LZ4 stream.
 type Reader struct {
-	state   _State
-	src     io.Reader        // source reader
-	num     int              // concurrency level
-	frame   *lz4stream.Frame // frame being read
-	data    []byte           // block buffer allocated in non-concurrent mode
-	reads   chan []byte      // pending data
-	idx     int              // size of pending data
-	handler func(int)
-	cum     uint32
-	dict    []byte
+	state       _State
+	src         io.Reader        // source reader
+	num         int              // concurrency level
+	frame       *lz4stream.Frame // frame being read
+	data        []byte           // block buffer allocated in non-concurrent mode
+	reads       chan []byte      // pending data
+	idx         int              // size of pending data
+	handler     func(int)
+	cum         uint32
+	dict        []byte      // dictionary window: preset dictionary and/or accumulated history
+	dictHandler DictHandler // resolves frame dictionary IDs (DictOption)
+	dictRelease func()      // releases the current frame's dictionary
 }
 
 func (*Reader) private() {}
@@ -88,8 +91,19 @@ func (r *Reader) init() error {
 		// Instead of throwing an error to the user, silently drop concurrency
 		r.num = 1
 	}
+	// Drop any dictionary window left over from a previous frame.
+	r.dict = nil
+	if r.frame.Descriptor.Flags.DictID() {
+		if err := r.initDict(); err != nil {
+			return err
+		}
+		// The dictionary is released as soon as the frame is done, which
+		// concurrent block decoding could outlive: decode sequentially.
+		r.num = 1
+	}
 	data, err := r.frame.InitR(r.src, r.num)
 	if err != nil {
+		r.releaseDict()
 		return err
 	}
 	r.reads = data
@@ -98,6 +112,49 @@ func (r *Reader) init() error {
 	r.data = size.Get()
 	r.cum = 0
 	return nil
+}
+
+// initDict resolves the dictionary of the current frame and seeds the
+// dictionary window with it.
+func (r *Reader) initDict() error {
+	id := r.frame.Descriptor.DictID
+	if r.dictHandler == nil {
+		return fmt.Errorf("%w: ID %#x", lz4errors.ErrMissingDictionary, id)
+	}
+	dict, release, err := r.dictHandler(id)
+	if err != nil {
+		return fmt.Errorf("lz4: dictionary ID %#x: %w", id, err)
+	}
+	if len(dict) == 0 {
+		if release != nil {
+			release()
+		}
+		return fmt.Errorf("%w: ID %#x", lz4errors.ErrMissingDictionary, id)
+	}
+	// Offsets are 16 bits: only the last 64Kb of the dictionary are usable.
+	if len(dict) > 64*1024 {
+		dict = dict[len(dict)-64*1024:]
+	}
+	r.dictRelease = release
+	if r.frame.Descriptor.Flags.BlockIndependence() {
+		// Every block is decoded against the preset dictionary only.
+		r.dict = dict
+	} else {
+		// The window grows with the decoded data: copy the dictionary as
+		// it must remain untouched.
+		r.dict = append(r.dict, dict...)
+	}
+	return nil
+}
+
+// releaseDict releases the current frame's dictionary, if any, and clears
+// the dictionary window.
+func (r *Reader) releaseDict() {
+	if r.dictRelease != nil {
+		r.dictRelease()
+		r.dictRelease = nil
+	}
+	r.dict = nil
 }
 
 func (r *Reader) Read(buf []byte) (n int, err error) {
@@ -135,6 +192,7 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 				// Read Checksum.
 				err = r.frame.CloseR(r.src)
 				if err != nil {
+					r.releaseDict()
 					return
 				}
 
@@ -151,10 +209,12 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 				}
 				lz4block.Put(r.data)
 				r.data = nil
+				r.releaseDict()
 				// reset frame to release the buffer held by Block
 				r.frame.Reset(r.num)
 				return
 			default:
+				r.releaseDict()
 				return
 			}
 		}
@@ -224,6 +284,7 @@ func (r *Reader) read(buf []byte) (int, error) {
 func (r *Reader) Reset(reader io.Reader) {
 	lz4block.Put(r.data)
 	r.data = nil
+	r.releaseDict()
 	r.frame.Reset(r.num)
 	r.state.reset()
 	r.src = reader
@@ -286,6 +347,7 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			// Read Checksum.
 			err = r.frame.CloseR(r.src)
 			if err != nil {
+				r.releaseDict()
 				return
 			}
 			// Check for a new stream.
@@ -299,8 +361,10 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			goto read
 		case io.EOF:
 			err = r.frame.CloseR(r.src)
+			r.releaseDict()
 			return
 		default:
+			r.releaseDict()
 			return
 		}
 		r.handler(bn)
