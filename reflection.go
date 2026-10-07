@@ -34,6 +34,20 @@ func (f *fieldData) Parent() (Field, bool) {
 	return f.parent, f.parent != nil
 }
 
+// fieldMeta abstracts field metadata so name building (fullTag) works both
+// for load-time fields (fieldData) and plan-time fields (planField).
+type fieldMeta interface {
+	Tag(tag string) string
+	metaParent() fieldMeta
+}
+
+func (f *fieldData) metaParent() fieldMeta {
+	if f.parent == nil {
+		return nil
+	}
+	return f.parent
+}
+
 func (l *Loader) newSimpleFieldData(value reflect.Value) *fieldData {
 	return l.newFieldData(reflect.StructField{}, value, nil)
 }
@@ -51,35 +65,39 @@ func (l *Loader) newFieldData(field reflect.StructField, value reflect.Value, pa
 		field:      field,
 		isSet:      false,
 		isRequired: requiredTag == "true",
-		tags:       l.tagsForField(field),
+		tags:       tagsForField(&l.config, field),
 	}
 	return fd
 }
 
-func (l *Loader) tagsForField(field reflect.StructField) map[string]string {
+func tagsForField(cfg *Config, field reflect.StructField) map[string]string {
 	words := splitNameByWords(field.Name)
 
 	tags := map[string]string{
 		"default": field.Tag.Get("default"),
 		"usage":   field.Tag.Get("usage"),
 
-		"env":  l.makeTagValue(field, "env", words),
-		"flag": l.makeTagValue(field, "flag", words),
+		"env":  makeTagValue(cfg, field, "env", words),
+		"flag": makeTagValue(cfg, field, "flag", words),
 	}
 
-	for _, dec := range l.config.FileDecoders {
-		tags[dec.Format()] = l.makeTagValue(field, dec.Format(), words)
+	for _, dec := range cfg.FileDecoders {
+		tags[dec.Format()] = makeTagValue(cfg, field, dec.Format(), words)
 	}
 	return tags
 }
 
 func (l *Loader) fullTag(prefix string, f *fieldData, tag string) string {
+	return fullTag(&l.config, prefix, f, tag)
+}
+
+func fullTag(cfg *Config, prefix string, f fieldMeta, tag string) string {
 	sep := "."
 	if tag == "flag" {
-		sep = l.config.FlagDelimiter
+		sep = cfg.FlagDelimiter
 	}
 	if tag == "env" {
-		sep = l.config.envDelimiter
+		sep = cfg.envDelimiter
 	}
 	res := f.Tag(tag)
 	if res == "-" {
@@ -91,7 +109,7 @@ func (l *Loader) fullTag(prefix string, f *fieldData, tag string) string {
 	if before, _, ok := cut(res, ",omitempty"); ok {
 		return before
 	}
-	for p := f.parent; p != nil; p = p.parent {
+	for p := f.metaParent(); p != nil; p = p.metaParent() {
 		if p.Tag(tag) != "-" {
 			res = p.Tag(tag) + sep + res
 		}

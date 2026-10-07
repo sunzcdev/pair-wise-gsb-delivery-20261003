@@ -67,14 +67,14 @@ func makeName(name string, parent *fieldData) string {
 	return parent.name + "." + name
 }
 
-func (l *Loader) makeTagValue(field reflect.StructField, tag string, words []string) string {
+func makeTagValue(cfg *Config, field reflect.StructField, tag string, words []string) string {
 	if v := field.Tag.Get(tag); v != "" {
 		return v
 	}
 
-	for _, dec := range l.config.FileDecoders {
+	for _, dec := range cfg.FileDecoders {
 		if tag == dec.Format() {
-			if l.config.DontGenerateTags {
+			if cfg.DontGenerateTags {
 				return field.Name
 			}
 		}
@@ -157,6 +157,12 @@ type jsonDecoder struct {
 
 func (d *jsonDecoder) Init(fsys fs.FS) {
 	d.fsys = fsys
+}
+
+// CloneFileDecoder implements FileDecoderCloner so the decoder can be
+// shared by a Plan: each session gets its own copy with its own filesystem.
+func (d *jsonDecoder) CloneFileDecoder() FileDecoder {
+	return &jsonDecoder{}
 }
 
 // Format of the decoder.
