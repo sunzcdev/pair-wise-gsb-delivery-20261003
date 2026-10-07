@@ -15,6 +15,36 @@ https://www.postgresql.org/docs/current/protocol-replication.html.
 In `example/pglogrepl_demo`, there is an example demo program that connects to a database and logs all messages sent over logical replication.
 In `example/pgphysrepl_demo`, there is an example demo program that connects to a database and logs all messages sent over physical replication.
 
+## Logical Replication Protocol Versions
+
+The pgoutput plugin version is selected with the `proto_version` START_REPLICATION option and the
+wire messages must be read with the matching parser:
+
+- `proto_version '1'` &rarr; `Parse`
+- `proto_version '2'` (streamed transactions) &rarr; `ParseV2`
+- `proto_version '3'` (two-phase commits) &rarr; `ParseV3`
+
+Protocol version 3 is a superset of version 2 and adds the two-phase commit messages
+`BeginPrepare`, `Prepare`, `CommitPrepared`, `RollbackPrepared` and `StreamPrepare`. Two-phase
+messages are only emitted when the `two_phase` pgoutput option is enabled:
+
+```go
+pluginArgs := append(
+    []string{pglogrepl.ProtocolVersionArg(pglogrepl.ProtocolVersionV3)},
+    pglogrepl.TwoPhaseArgs(pglogrepl.TwoPhaseEnabled)...,
+)
+pluginArgs = append(pluginArgs, "publication_names 'my_publication'")
+
+err := pglogrepl.StartReplication(ctx, conn, slotName, startLSN, pglogrepl.StartReplicationOptions{
+    PluginArgs: pluginArgs,
+})
+```
+
+`ParseV3` takes the same `inStream` flag as `ParseV2` (true between `StreamStart` and
+`StreamStop`). Ordinary and streamed transactions from protocol versions 1 and 2 are still parsed
+correctly by `ParseV3`; `Parse` and `ParseV2` never accept the version 3 message identifiers, so an
+application that did not negotiate version 3 keeps its original behavior.
+
 ## Testing
 
 Testing requires a user with replication permission, a database to replicate, access allowed in `pg_hba.conf`, and

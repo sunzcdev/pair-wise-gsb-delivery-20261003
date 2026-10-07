@@ -281,6 +281,43 @@ type StartReplicationOptions struct {
 	PluginArgs []string
 }
 
+// Protocol versions understood by the pgoutput logical decoding plugin and by
+// the Parse/ParseV2/ParseV3 entry points of this package.
+const (
+	ProtocolVersionV1 = 1
+	ProtocolVersionV2 = 2
+	ProtocolVersionV3 = 3
+)
+
+// values accepted by the pgoutput "two_phase" streaming option.
+const (
+	TwoPhaseEnabled  = "true"
+	TwoPhaseDisabled = "false"
+)
+
+// ProtocolVersionArg returns the pgoutput "proto_version" plugin argument
+// selecting the requested logical replication protocol version. Pass the result
+// in StartReplicationOptions.PluginArgs, e.g. together with TwoPhaseArgs:
+//
+//	args := append(
+//	    []string{pglogrepl.ProtocolVersionArg(pglogrepl.ProtocolVersionV3)},
+//	    pglogrepl.TwoPhaseArgs(pglogrepl.TwoPhaseEnabled)...,
+//	)
+//
+// A server negotiated on ProtocolVersionV3 emits the two-phase commit messages
+// and must be read with ParseV3.
+func ProtocolVersionArg(version int) string {
+	return fmt.Sprintf("proto_version '%d'", version)
+}
+
+// TwoPhaseArgs returns the pgoutput plugin arguments that enable or disable
+// streaming of two-phase commits. Two-phase messages (BeginPrepare, Prepare,
+// CommitPrepared, RollbackPrepared and StreamPrepare) are only sent when
+// two_phase is enabled together with protocol version 3.
+func TwoPhaseArgs(enabled string) []string {
+	return []string{fmt.Sprintf("two_phase '%s'", enabled)}
+}
+
 type errEndTimeline struct {
 	nextTli         int64
 	nextTliStartpos LSN

@@ -46,6 +46,14 @@ func (t MessageType) String() string {
 		return "StreamCommit"
 	case MessageTypeStreamAbort:
 		return "StreamAbort"
+	case MessageTypeBeginPrepare:
+		return "BeginPrepare"
+	case MessageTypePrepare:
+		return "Prepare"
+	case MessageTypeCommitPrepared:
+		return "CommitPrepared"
+	case MessageTypeRollbackPrepared:
+		return "RollbackPrepared"
 	default:
 		return "Unknown"
 	}
@@ -67,6 +75,18 @@ const (
 	MessageTypeStreamStop   MessageType = 'E'
 	MessageTypeStreamCommit MessageType = 'c'
 	MessageTypeStreamAbort  MessageType = 'A'
+
+	// Two-phase commit messages, available since protocol version 3.
+	// See https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html.
+	MessageTypeBeginPrepare     MessageType = 'b'
+	MessageTypePrepare          MessageType = 'P'
+	MessageTypeCommitPrepared   MessageType = 'K'
+	MessageTypeRollbackPrepared MessageType = 'r'
+
+	// MessageTypeStreamPrepare shares the 'P' identifier with MessageTypePrepare.
+	// It is only emitted inside a streaming transaction and is distinguished by
+	// the inStream flag passed to ParseV3.
+	MessageTypeStreamPrepare MessageType = 'P'
 )
 
 // Message is a message received from server.

@@ -111,6 +111,10 @@ func (m *StreamAbortMessageV2) DecodeV2(src []byte, _ bool) (err error) {
 // inStream must be true when StreamStartMessageV2 has been read
 // it must be false after StreamStopMessageV2 has been read
 func ParseV2(data []byte, inStream bool) (m Message, err error) {
+	return parseV2(data, inStream)
+}
+
+func parseV2(data []byte, inStream bool) (m Message, err error) {
 	var decoder MessageDecoder
 	msgType := MessageType(data[0])
 
@@ -137,6 +141,13 @@ func ParseV2(data []byte, inStream bool) (m Message, err error) {
 		decoder = new(DeleteMessageV2)
 	case MessageTypeTruncate:
 		decoder = new(TruncateMessageV2)
+	case MessageTypeBeginPrepare, MessageTypeCommitPrepared, MessageTypeRollbackPrepared:
+		// Two-phase commit messages only exist in protocol version 3 and must
+		// not be decoded by an application unaware of the negotiated version.
+		return nil, errMsgNotSupported
+	case MessageTypePrepare:
+		// Both Prepare and StreamPrepare carry the same 'P' identifier.
+		return nil, errMsgNotSupported
 	default:
 		decoder = getCommonDecoder(msgType)
 	}
