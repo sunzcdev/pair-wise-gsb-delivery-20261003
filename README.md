@@ -16,6 +16,8 @@ Some of the package's capabilities and features:
 * Writes and reads XML to/from files, byte slices, strings and io interfaces.
 * Performs simple or complex searches with lightweight XPath-like query APIs.
 * Auto-indents XML using spaces or tabs for better readability.
+* Produces Exclusive XML Canonicalization (exc-c14n) forms of documents and
+  element subtrees.
 * Implemented in pure go; depends only on standard go libraries.
 * Built on top of the go [encoding/xml](http://golang.org/pkg/encoding/xml)
   package.

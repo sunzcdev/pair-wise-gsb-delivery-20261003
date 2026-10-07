@@ -1,3 +1,13 @@
+Unreleased
+==========
+
+**Changes**
+
+* Added `Document.ExcC14N` and `Element.ExcC14N`, which produce the
+  Exclusive XML Canonicalization 1.0 form of a document or an element
+  subtree, with support for the InclusiveNamespaces PrefixList and
+  optional comment preservation.
+
 Release 1.8.1
 =============
 

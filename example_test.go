@@ -41,6 +41,26 @@ func ExampleDocument_reading() {
 	}
 }
 
+// Canonicalize an element subtree using Exclusive XML Canonicalization 1.0.
+// Namespace declarations visibly utilized within the subtree are preserved,
+// even when they are declared by ancestors outside the subtree.
+func ExampleElement_ExcC14N() {
+	xml := `<root xmlns:n1="http://example.net"><wrap><n1:item attr="1"/></wrap></root>`
+
+	doc := NewDocument()
+	if err := doc.ReadFromString(xml); err != nil {
+		panic(err)
+	}
+
+	b, err := doc.FindElement("//wrap").ExcC14N(nil)
+	if err != nil {
+		panic(err)
+	}
+	os.Stdout.Write(b)
+	// Output:
+	// <wrap><n1:item xmlns:n1="http://example.net" attr="1"></n1:item></wrap>
+}
+
 func ExamplePath() {
 	xml := `
 <bookstore>
