@@ -270,6 +270,26 @@ func NewReleaseFromACK(ack *DHCPv4, modifiers ...Modifier) (*DHCPv4, error) {
 // FromBytes decodes a DHCPv4 packet from a sequence of bytes, and returns an
 // error if the packet is not valid.
 func FromBytes(q []byte) (*DHCPv4, error) {
+	p, _, _, opts, err := parseDHCPv4Header(q)
+	if err != nil {
+		return nil, err
+	}
+
+	p.Options = make(Options)
+	if err := p.Options.fromBytesCheckEnd(opts, true); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// parseDHCPv4Header parses the fixed BOOTP/DHCP header up to (but not
+// including) the options, validating the magic cookie.
+//
+// It returns the partially populated packet together with the raw 64-byte
+// sname and 128-byte file fields and the bytes following the magic cookie.
+// ServerHostName and BootFileName are filled from the fields as strings; the
+// audit decoder clears them when those fields are overloaded with options.
+func parseDHCPv4Header(q []byte) (*DHCPv4, []byte, []byte, []byte, error) {
 	var p DHCPv4
 	buf := uio.NewBigEndianBuffer(q)
 
@@ -298,6 +318,7 @@ func FromBytes(q []byte) (*DHCPv4, error) {
 
 	var sname [64]byte
 	buf.ReadBytes(sname[:])
+	snameRaw := sname[:]
 	length := strings.Index(string(sname[:]), "\x00")
 	if length == -1 {
 		length = 64
@@ -306,6 +327,7 @@ func FromBytes(q []byte) (*DHCPv4, error) {
 
 	var file [128]byte
 	buf.ReadBytes(file[:])
+	fileRaw := file[:]
 	length = strings.Index(string(file[:]), "\x00")
 	if length == -1 {
 		length = 128
@@ -316,17 +338,13 @@ func FromBytes(q []byte) (*DHCPv4, error) {
 	buf.ReadBytes(cookie[:])
 
 	if err := buf.Error(); err != nil {
-		return nil, err
+		return nil, nil, nil, nil, err
 	}
 	if cookie != magicCookie {
-		return nil, fmt.Errorf("malformed DHCP packet: got magic cookie %v, want %v", cookie[:], magicCookie[:])
+		return nil, nil, nil, nil, fmt.Errorf("malformed DHCP packet: got magic cookie %v, want %v", cookie[:], magicCookie[:])
 	}
 
-	p.Options = make(Options)
-	if err := p.Options.fromBytesCheckEnd(buf.Data(), true); err != nil {
-		return nil, err
-	}
-	return &p, nil
+	return &p, snameRaw, fileRaw, buf.Data(), nil
 }
 
 // FlagsToString returns a human-readable representation of the flags field.
