@@ -128,3 +128,60 @@ func (s IntervalSlice) Contain(sub IntervalSlice) bool {
 func (s IntervalSlice) Equal(o IntervalSlice) bool {
 	return slices.Equal(s, o)
 }
+
+// Subtract returns the intervals covered by s but not by o.
+// Both s and o must be normalized; the result is normalized.
+// The operation is purely interval based and never expands
+// individual transaction numbers.
+func (s IntervalSlice) Subtract(o IntervalSlice) IntervalSlice {
+	var result IntervalSlice
+
+	j := 0
+	for _, iv := range s {
+		start, stop := iv.Start, iv.Stop
+
+		for j < len(o) && o[j].Stop <= start {
+			j++
+		}
+
+		for k := j; k < len(o) && o[k].Start < stop; k++ {
+			if o[k].Start > start {
+				result = append(result, Interval{start, min(o[k].Start, stop)})
+			}
+			start = max(start, o[k].Stop)
+			if start >= stop {
+				break
+			}
+		}
+
+		if start < stop {
+			result = append(result, Interval{start, stop})
+		}
+	}
+
+	return result
+}
+
+// Intersect returns the intervals covered by both s and o.
+// Both s and o must be normalized; the result is normalized.
+// The operation is purely interval based and never expands
+// individual transaction numbers.
+func (s IntervalSlice) Intersect(o IntervalSlice) IntervalSlice {
+	var result IntervalSlice
+
+	i, j := 0, 0
+	for i < len(s) && j < len(o) {
+		start := max(s[i].Start, o[j].Start)
+		stop := min(s[i].Stop, o[j].Stop)
+		if start < stop {
+			result = append(result, Interval{start, stop})
+		}
+		if s[i].Stop < o[j].Stop {
+			i++
+		} else {
+			j++
+		}
+	}
+
+	return result
+}
