@@ -137,6 +137,15 @@ module GraphQL
           print_string(fragment_def.name)
         end
 
+        if !fragment_def.variables.empty?
+          print_string("(")
+          fragment_def.variables.each_with_index do |v, i|
+            print_variable_definition(v)
+            print_string(", ") if i < fragment_def.variables.size - 1
+          end
+          print_string(")")
+        end
+
         if fragment_def.type
           print_string(" on ")
           print_node(fragment_def.type)
@@ -149,6 +158,14 @@ module GraphQL
         print_string(indent)
         print_string("...")
         print_string(fragment_spread.name)
+        if !fragment_spread.arguments.empty?
+          print_string("(")
+          fragment_spread.arguments.each_with_index do |a, i|
+            print_argument(a)
+            print_string(", ") if i < fragment_spread.arguments.size - 1
+          end
+          print_string(")")
+        end
         print_directives(fragment_spread.directives)
       end
 

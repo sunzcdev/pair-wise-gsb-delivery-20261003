@@ -447,13 +447,32 @@ module GraphQL
         self.children_method_name = :selections
       end
 
+      # An operation-level query variable (also used by the project-specific
+      # fragment arguments extension for fragment parameter definitions).
+      class VariableDefinition < AbstractNode
+        scalar_methods :name, :type, :default_value
+        children_methods(directives: Directive)
+        # @!attribute default_value
+        #   @return [String, Integer, Float, Boolean, Array, NullValue] A Ruby value to use if no other value is provided
+
+        # @!attribute type
+        #   @return [TypeName, NonNullType, ListType] The expected type of this value
+
+        # @!attribute name
+        #   @return [String] The identifier for this variable, _without_ `$`
+
+        self.children_method_name = :variables
+      end
+
       # A reusable fragment, defined at document-level.
       class FragmentDefinition < AbstractNode
-        def initialize(name: nil, type: nil, directives: NONE, selections: NONE, filename: nil, pos: nil, source: nil, line: nil, col: nil)
+        def initialize(name: nil, type: nil, directives: NONE, selections: NONE, variables: NONE, filename: nil, pos: nil, source: nil, line: nil, col: nil)
           @name = name
           @type = type
           @directives = directives
           @selections = selections
+          # Project-specific extension: local parameter definitions (always empty unless fragment arguments are enabled)
+          @variables = variables || NONE
           @filename  = filename
           @pos = pos
           @source = source
@@ -461,22 +480,28 @@ module GraphQL
           @col = col
         end
 
-        def self.from_a(filename, line, col, name, type, directives, selections)
-          self.new(filename: filename, line: line, col: col, name: name, type: type, directives: directives, selections: selections)
+        def self.from_a(filename, line, col, name, type, directives, selections, variables = NONE)
+          self.new(filename: filename, line: line, col: col, name: name, type: type, directives: directives, selections: selections, variables: variables)
         end
 
         def marshal_dump
-          [line, col, @filename, @name, @type, @directives, @selections]
+          [line, col, @filename, @name, @type, @directives, @selections, @variables]
         end
 
         def marshal_load(values)
-          @line, @col, @filename, @name, @type, @directives, @selections = values
+          @line, @col, @filename, @name, @type, @directives, @selections, @variables =
+            if values.length == 7
+              values + [NONE]
+            else
+              values
+            end
         end
 
         scalar_methods :name, :type
         children_methods({
           selections: GraphQL::Language::Nodes::Field,
           directives: GraphQL::Language::Nodes::Directive,
+          variables: GraphQL::Language::Nodes::VariableDefinition,
         })
 
         self.children_method_name = :definitions
@@ -485,7 +510,11 @@ module GraphQL
       # Application of a named fragment in a selection
       class FragmentSpread < AbstractNode
         scalar_methods :name
-        children_methods(directives: GraphQL::Language::Nodes::Directive)
+        children_methods({
+          directives: GraphQL::Language::Nodes::Directive,
+          # Project-specific extension: arguments passed to a parameterized fragment
+          arguments: GraphQL::Language::Nodes::Argument,
+        })
 
         self.children_method_name = :selections
 
@@ -552,22 +581,6 @@ module GraphQL
 
       # A non-null type definition, denoted with `...!` (used for variable type definitions)
       class NonNullType < WrapperType
-      end
-
-      # An operation-level query variable
-      class VariableDefinition < AbstractNode
-        scalar_methods :name, :type, :default_value
-        children_methods(directives: Directive)
-        # @!attribute default_value
-        #   @return [String, Integer, Float, Boolean, Array, NullValue] A Ruby value to use if no other value is provided
-
-        # @!attribute type
-        #   @return [TypeName, NonNullType, ListType] The expected type of this value
-
-        # @!attribute name
-        #   @return [String] The identifier for this variable, _without_ `$`
-
-        self.children_method_name = :variables
       end
 
       # A query, mutation or subscription.

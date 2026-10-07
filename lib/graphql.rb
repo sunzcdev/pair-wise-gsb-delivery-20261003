@@ -45,17 +45,28 @@ This is probably a bug in GraphQL-Ruby, please report this error on GitHub: http
 
   # Turn a query string or schema definition into an AST
   # @param graphql_string [String] a GraphQL query string or schema definition
+  # @param fragment_arguments [Boolean] Set `true` to enable the project-specific
+  #   fragment arguments extension (`fragment F($n: Int) ... ...F(n: 1)`).
+  #   This extension is not part of the GraphQL specification and is disabled by default.
   # @return [GraphQL::Language::Nodes::Document]
-  def self.parse(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil)
-    default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+  def self.parse(graphql_string, trace: GraphQL::Tracing::NullTrace, filename: nil, max_tokens: nil, fragment_arguments: false)
+    default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens, fragment_arguments: fragment_arguments)
+  rescue ArgumentError => err
+    # A custom default parser may predate the project-specific fragment
+    # arguments option; retry without it so existing integrations keep working.
+    if err.message.include?("fragment_arguments")
+      default_parser.parse(graphql_string, trace: trace, filename: filename, max_tokens: max_tokens)
+    else
+      raise
+    end
   end
 
   # Read the contents of `filename` and parse them as GraphQL
   # @param filename [String] Path to a `.graphql` file containing IDL or query
   # @return [GraphQL::Language::Nodes::Document]
-  def self.parse_file(filename)
+  def self.parse_file(filename, fragment_arguments: false)
     content = File.read(filename)
-    default_parser.parse(content, filename: filename)
+    default_parser.parse(content, filename: filename, fragment_arguments: fragment_arguments)
   end
 
   # @return [Array<Array>]

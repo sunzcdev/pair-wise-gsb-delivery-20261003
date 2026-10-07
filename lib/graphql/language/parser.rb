@@ -13,22 +13,22 @@ module GraphQL
       class << self
         attr_accessor :cache
 
-        def parse(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil)
-          self.new(graphql_str, filename: filename, trace: trace, max_tokens: max_tokens).parse
+        def parse(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil, fragment_arguments: false)
+          self.new(graphql_str, filename: filename, trace: trace, max_tokens: max_tokens, fragment_arguments: fragment_arguments).parse
         end
 
-        def parse_file(filename, trace: Tracing::NullTrace)
+        def parse_file(filename, trace: Tracing::NullTrace, fragment_arguments: false)
           if cache
             cache.fetch(filename) do
-              parse(File.read(filename), filename: filename, trace: trace)
+              parse(File.read(filename), filename: filename, trace: trace, fragment_arguments: fragment_arguments)
             end
           else
-            parse(File.read(filename), filename: filename, trace: trace)
+            parse(File.read(filename), filename: filename, trace: trace, fragment_arguments: fragment_arguments)
           end
         end
       end
 
-      def initialize(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil)
+      def initialize(graphql_str, filename: nil, trace: Tracing::NullTrace, max_tokens: nil, fragment_arguments: false)
         if graphql_str.nil?
           raise GraphQL::ParseError.new("No query string was present", nil, nil, nil)
         end
@@ -36,6 +36,7 @@ module GraphQL
         @graphql_str = graphql_str
         @filename = filename
         @trace = trace
+        @fragment_arguments = fragment_arguments
         @dedup_identifiers = false
         @lines_at = nil
       end
@@ -125,6 +126,10 @@ module GraphQL
           f_name = if !at?(:ON)
             parse_name
           end
+          # Project-specific extension (not part of the GraphQL specification):
+          # `fragment F($arg: Int) on ...` is only accepted when fragment
+          # arguments are explicitly enabled.
+          fragment_variables = parse_fragment_variable_definitions
           expect_token :ON
           f_type = parse_type_name
           directives = parse_directives
@@ -135,6 +140,7 @@ module GraphQL
             type: f_type,
             directives: directives,
             selections: selections,
+            variables: fragment_variables,
             filename: @filename,
             source: self
           )
@@ -154,37 +160,7 @@ module GraphQL
             parse_name
           end
 
-          variable_definitions = if at?(:LPAREN)
-            expect_token(:LPAREN)
-            defs = []
-            while !at?(:RPAREN)
-              loc = pos
-              expect_token(:VAR_SIGN)
-              var_name = parse_name
-              expect_token(:COLON)
-              var_type = self.type || raise_parse_error("Missing type definition for variable: $#{var_name}")
-              default_value = if at?(:EQUALS)
-                advance_token
-                value
-              end
-
-              directives = parse_directives
-
-              defs << Nodes::VariableDefinition.new(
-                pos: loc,
-                name: var_name,
-                type: var_type,
-                default_value: default_value,
-                directives: directives,
-                filename: @filename,
-                source: self
-              )
-            end
-            expect_token(:RPAREN)
-            defs
-          else
-            EmptyObjects::EMPTY_ARRAY
-          end
+          variable_definitions = parse_variable_definitions
 
           directives = parse_directives
 
@@ -553,12 +529,16 @@ module GraphQL
               Nodes::InlineFragment.new(pos: loc, type: if_type, directives: directives, selections: selection_set, filename: @filename, source: self)
             else
               name = parse_name_without_on
+              # Project-specific extension (not part of the GraphQL specification):
+              # `...F(arg: 1)` is only accepted when fragment arguments are
+              # explicitly enabled.
+              arguments = parse_fragment_spread_arguments
               directives = parse_directives
 
               # Can this ever happen?
               # expect_token(:IDENTIFIER) if at?(:ON)
 
-              FragmentSpread.new(pos: loc, name: name, directives: directives, filename: @filename, source: self)
+              FragmentSpread.new(pos: loc, name: name, directives: directives, arguments: arguments, filename: @filename, source: self)
             end
           else
             loc = pos
@@ -675,6 +655,72 @@ module GraphQL
           dirs
         else
           EMPTY_ARRAY
+        end
+      end
+
+      def parse_variable_definitions
+        if at?(:LPAREN)
+          expect_token(:LPAREN)
+          defs = []
+          while !at?(:RPAREN)
+            defs << parse_variable_definition
+          end
+          expect_token(:RPAREN)
+          defs
+        else
+          EmptyObjects::EMPTY_ARRAY
+        end
+      end
+
+      def parse_variable_definition
+        loc = pos
+        expect_token(:VAR_SIGN)
+        var_name = parse_name
+        expect_token(:COLON)
+        var_type = self.type || raise_parse_error("Missing type definition for variable: $#{var_name}")
+        default_value = if at?(:EQUALS)
+          advance_token
+          value
+        end
+
+        directives = parse_directives
+
+        Nodes::VariableDefinition.new(
+          pos: loc,
+          name: var_name,
+          type: var_type,
+          default_value: default_value,
+          directives: directives,
+          filename: @filename,
+          source: self
+        )
+      end
+
+      # Project-specific extension: local parameter definitions on a fragment.
+      # Without the extension, `(` here triggers the ordinary "expected ON"
+      # parse error, preserving previous behavior exactly.
+      def parse_fragment_variable_definitions
+        if at?(:LPAREN)
+          if !@fragment_arguments
+            expect_token(:ON)
+          end
+          parse_variable_definitions
+        else
+          EmptyObjects::EMPTY_ARRAY
+        end
+      end
+
+      # Project-specific extension: arguments on a fragment spread.
+      # Without the extension, `(` here triggers the ordinary parse error,
+      # preserving previous behavior exactly.
+      def parse_fragment_spread_arguments
+        if at?(:LPAREN)
+          if !@fragment_arguments
+            expect_token(:DIR_SIGN)
+          end
+          parse_arguments
+        else
+          EmptyObjects::EMPTY_ARRAY
         end
       end
 

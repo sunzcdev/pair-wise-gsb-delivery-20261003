@@ -799,6 +799,30 @@ module GraphQL
         end
       end
 
+      # @return [Boolean] `true` if the project-specific fragment arguments extension is enabled
+      #   (`fragment F($n: Int = 10) on ... { ...F(n: 5) }`).
+      #
+      # This extension is not part of the GraphQL specification and is disabled by default.
+      def fragment_arguments?
+        defined?(@fragment_arguments) ? @fragment_arguments : find_inherited_value(:fragment_arguments?, false)
+      end
+
+      # Enable or disable the project-specific fragment arguments extension.
+      #
+      # @example
+      #   class MyAppSchema < GraphQL::Schema
+      #     fragment_arguments true
+      #   end
+      #
+      # @param new_fragment_arguments [Boolean]
+      def fragment_arguments(new_fragment_arguments = NOT_CONFIGURED)
+        if NOT_CONFIGURED.equal?(new_fragment_arguments)
+          fragment_arguments?
+        else
+          @fragment_arguments = new_fragment_arguments
+        end
+      end
+
       def default_page_size(new_default_page_size = nil)
         if new_default_page_size
           @default_page_size = new_default_page_size

@@ -16,10 +16,12 @@ module GraphQL
     class ValidationPipeline
       attr_reader :max_depth, :max_complexity, :validate_timeout_remaining
 
-      def initialize(query:, parse_error:, operation_name_error:, max_depth:, max_complexity:)
+      def initialize(query:, parse_error:, operation_name_error:, max_depth:, max_complexity:, extra_validation_errors: nil, forwarded_variable_names: nil)
         @validation_errors = []
         @parse_error = parse_error
         @operation_name_error = operation_name_error
+        @extra_validation_errors = extra_validation_errors || []
+        @forwarded_variable_names = forwarded_variable_names || []
         @query = query
         @schema = query.schema
         @max_depth = max_depth
@@ -67,10 +69,27 @@ module GraphQL
           return
         elsif @operation_name_error
           @validation_errors << @operation_name_error
+        elsif !@extra_validation_errors.empty?
+          # Errors produced while expanding project-specific extensions
+          # (e.g. fragment arguments). Stop the pipeline, like any other
+          # validation error.
+          @validation_errors.concat(@extra_validation_errors)
         else
           validator = @query.static_validator || @schema.static_validator
           validation_result = validator.validate(@query, validate: @query.validate, timeout: @schema.validate_timeout, max_errors: @schema.validate_max_errors)
-          @validation_errors.concat(validation_result[:errors])
+          errors = validation_result[:errors]
+          if !@forwarded_variable_names.empty?
+            # A variable may be "used" solely because it was forwarded into a
+            # parameterized fragment whose body didn't reference it. The
+            # ordinary validator can't see that usage after expansion, so drop
+            # the corresponding false "declared but not used" errors.
+            errors = errors.reject do |err|
+              err.is_a?(GraphQL::StaticValidation::VariablesAreUsedAndDefinedError) &&
+                err.code == GraphQL::StaticValidation::VariablesAreUsedAndDefinedError::VIOLATIONS[:VARIABLE_NOT_USED] &&
+                @forwarded_variable_names.include?(err.variable_name)
+            end
+          end
+          @validation_errors.concat(errors)
           @validate_timeout_remaining = validation_result[:remaining_timeout]
           if @validation_errors.empty?
             @validation_errors.concat(@query.variables.errors)

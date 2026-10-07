@@ -8,6 +8,8 @@
 
 ### New features
 
+- Add an opt-in, project-specific **fragment arguments** extension (not part of the GraphQL specification). Enable it with `fragment_arguments true` in a schema (or `GraphQL.parse(..., fragment_arguments: true)`), then declare typed parameters with default values on fragments (`fragment P($first: Int = 10) on ...`) and pass values at spread sites (`...P(first: 5)`). Spreads are expanded into ordinary inline fragments before validation/execution; missing parameters, unknown parameters, type mismatches, duplicate names and recursive references are reported. When the extension is off, this syntax continues to produce the same parse errors as before.
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)

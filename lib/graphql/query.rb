@@ -459,7 +459,7 @@ module GraphQL
       parse_error = nil
       @document ||= begin
         if query_string
-          GraphQL.parse(query_string, trace: self.current_trace, max_tokens: @schema.max_query_string_tokens)
+          GraphQL.parse(query_string, trace: self.current_trace, max_tokens: @schema.max_query_string_tokens, fragment_arguments: @schema.fragment_arguments?)
         end
       rescue GraphQL::ParseError => err
         parse_error = err
@@ -470,6 +470,19 @@ module GraphQL
       @fragments = {}
       @operations = {}
       if @document
+        # Expand whenever the document actually uses the extension syntax:
+        # this covers documents handed in pre-parsed with
+        # `GraphQL.parse(..., fragment_arguments: true)`, not just query
+        # strings parsed via the schema setting.
+        if document_uses_fragment_arguments?(@document)
+          expanded_document, expansion_errors, forwarded_variables = GraphQL::Language::FragmentArguments.expand(@schema, @document, context: @context)
+          @document = expanded_document
+          @fragment_argument_errors = expansion_errors
+          @fragment_argument_forwarded_variables = forwarded_variables
+        else
+          @fragment_argument_errors = EmptyObjects::EMPTY_ARRAY
+          @fragment_argument_forwarded_variables = EmptyObjects::EMPTY_ARRAY
+        end
         @document.definitions.each do |part|
           case part
           when GraphQL::Language::Nodes::FragmentDefinition
@@ -510,9 +523,39 @@ module GraphQL
         query: self,
         parse_error: parse_error,
         operation_name_error: operation_name_error,
+        extra_validation_errors: @fragment_argument_errors || EmptyObjects::EMPTY_ARRAY,
+        forwarded_variable_names: @fragment_argument_forwarded_variables || EmptyObjects::EMPTY_ARRAY,
         max_depth: @max_depth,
         max_complexity: @max_complexity
       )
+    end
+
+    # @return [Boolean] Does this document use the project-specific fragment
+    #   arguments extension anywhere?
+    def document_uses_fragment_arguments?(document)
+      document.definitions.any? do |defn|
+        case defn
+        when GraphQL::Language::Nodes::FragmentDefinition
+          !defn.variables.empty? || selections_have_argument_spreads?(defn.selections)
+        when GraphQL::Language::Nodes::OperationDefinition
+          selections_have_argument_spreads?(defn.selections)
+        else
+          false
+        end
+      end
+    end
+
+    def selections_have_argument_spreads?(selections)
+      selections.any? do |sel|
+        case sel
+        when GraphQL::Language::Nodes::FragmentSpread
+          !sel.arguments.empty?
+        when GraphQL::Language::Nodes::Field, GraphQL::Language::Nodes::InlineFragment
+          selections_have_argument_spreads?(sel.selections)
+        else
+          false
+        end
+      end
     end
 
     # Since the query string is processed at the last possible moment,

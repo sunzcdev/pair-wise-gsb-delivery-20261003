@@ -6,13 +6,18 @@ require "graphql/graphql_c_parser_ext"
 
 module GraphQL
   module CParser
-    def self.parse(query_str, filename: nil, trace: GraphQL::Tracing::NullTrace, max_tokens: nil)
+    def self.parse(query_str, filename: nil, trace: GraphQL::Tracing::NullTrace, max_tokens: nil, fragment_arguments: false)
+      if fragment_arguments
+        # Project-specific fragment arguments extension is implemented by the
+        # pure-Ruby parser only.
+        return GraphQL::Language::Parser.parse(query_str, filename: filename, trace: trace, max_tokens: max_tokens, fragment_arguments: true)
+      end
       Parser.parse(query_str, filename: filename, trace: trace, max_tokens: max_tokens)
     end
 
-    def self.parse_file(filename)
+    def self.parse_file(filename, fragment_arguments: false)
       contents = File.read(filename)
-      parse(contents, filename: filename)
+      parse(contents, filename: filename, fragment_arguments: fragment_arguments)
     end
 
     def self.tokenize_with_c(str)
@@ -87,13 +92,16 @@ module GraphQL
     end
 
     class Parser
-      def self.parse(query_str, filename: nil, trace: GraphQL::Tracing::NullTrace, max_tokens: nil)
+      def self.parse(query_str, filename: nil, trace: GraphQL::Tracing::NullTrace, max_tokens: nil, fragment_arguments: false)
+        if fragment_arguments
+          return GraphQL::Language::Parser.parse(query_str, filename: filename, trace: trace, max_tokens: max_tokens, fragment_arguments: true)
+        end
         self.new(query_str, filename, trace, max_tokens).result
       end
 
-      def self.parse_file(filename)
+      def self.parse_file(filename, fragment_arguments: false)
         contents = File.read(filename)
-        parse(contents, filename: filename)
+        parse(contents, filename: filename, fragment_arguments: fragment_arguments)
       end
 
       def initialize(query_string, filename, trace, max_tokens)
