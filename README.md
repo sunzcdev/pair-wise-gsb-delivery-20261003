@@ -79,3 +79,33 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Middleware
+----------
+
+Both `Server` and `Client` accept middleware via `Use`.
+A middleware receives a `*CallInfo` (method name, request number, notification
+flag, connection state, args and reply) and a `next` function:
+
+- inspect the call before it runs, or reject it by returning an error without
+  calling `next`;
+- observe or modify the result after `next` returns;
+- call `next` at most once per request (a second call panics).
+
+The chain is registered before serving starts and becomes immutable afterwards;
+`Use` panics once the server is serving or the client is running.
+The optional `Recover` middleware converts a handler panic into an error without
+sending the internal stack trace to the peer. Notifications never receive a
+response, even when rejected or recovered.
+
+```go
+srv := rpc2.NewServer()
+srv.Use(rpc2.Recover)
+srv.Use(func(info *rpc2.CallInfo, next rpc2.HandlerFunc) error {
+	start := time.Now()
+	err := next(info) // reject by returning an error without calling next
+	log.Printf("%s seq=%d notification=%v took=%s err=%v",
+		info.Method, info.Seq, info.Notification, time.Since(start), err)
+	return err
+})
+```

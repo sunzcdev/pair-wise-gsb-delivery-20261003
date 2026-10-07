@@ -25,6 +25,9 @@ type Client struct {
 	server     bool
 	codec      Codec
 	handlers   map[string]*handler
+	chainMu    sync.Mutex
+	mws        []Middleware
+	started    bool
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
@@ -47,6 +50,7 @@ func NewClientWithCodec(codec Codec) *Client {
 		handlers:   make(map[string]*handler),
 		disconnect: make(chan struct{}),
 		seq:        1, // 0 means notification.
+		State:      NewState(),
 	}
 }
 
@@ -60,6 +64,11 @@ func (c *Client) SetBlocking(blocking bool) {
 // Run the client's read loop.
 // You must run this method before calling any methods on the server.
 func (c *Client) Run() {
+	// Freeze the middleware chain before any request can be handled.
+	c.chainMu.Lock()
+	c.started = true
+	c.mws = append([]Middleware(nil), c.mws...)
+	c.chainMu.Unlock()
 	c.readLoop()
 }
 
@@ -72,6 +81,22 @@ func (c *Client) DisconnectNotify() chan struct{} {
 // Handle registers the handler function for the given method. If a handler already exists for method, Handle panics.
 func (c *Client) Handle(method string, handlerFunc interface{}) {
 	addHandler(c.handlers, method, handlerFunc)
+}
+
+// Use appends a Middleware to the client's middleware chain.
+// mw must have the signature "func(*CallInfo, HandlerFunc) error" or be of type
+// Middleware; otherwise Use panics at registration time.
+//
+// The chain is immutable once Run starts the read loop: calling Use after that
+// panics instead of mutating a chain that may already be executing.
+func (c *Client) Use(mw interface{}) {
+	m := asMiddleware("client", mw)
+	c.chainMu.Lock()
+	defer c.chainMu.Unlock()
+	if c.started {
+		panic("rpc2: cannot add middleware after the client started running")
+	}
+	c.mws = append(c.mws, m)
 }
 
 // readLoop reads messages from codec.
@@ -132,18 +157,35 @@ func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value)
 	// Invoke the method, providing a new value for the reply.
 	replyv := reflect.New(method.replyType.Elem())
 
-	returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+	info := &CallInfo{
+		Client:       c,
+		Method:       req.Method,
+		Seq:          req.Seq,
+		Notification: req.Seq == 0,
+		State:        c.State,
+		Args:         argv.Interface(),
+		Reply:        replyv.Interface(),
+	}
+	terminal := func(*CallInfo) error {
+		returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+		if errInter := returnValues[0].Interface(); errInter != nil {
+			return errInter.(error)
+		}
+		return nil
+	}
 
-	// Do not send response if request is a notification.
+	// Build the immutable execution chain for this request from the frozen
+	// middleware snapshot and run it.
+	err := buildChain(c.mws, terminal)(info)
+
+	// Notifications never receive a response, even when rejected or recovered.
 	if req.Seq == 0 {
 		return
 	}
 
-	// The return value for the method is an error.
-	errInter := returnValues[0].Interface()
 	errmsg := ""
-	if errInter != nil {
-		errmsg = errInter.(error).Error()
+	if err != nil {
+		errmsg = err.Error()
 	}
 	resp := &Response{
 		Seq:   req.Seq,
@@ -157,6 +199,11 @@ func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value)
 func (c *Client) readRequest(req *Request) error {
 	method, ok := c.handlers[req.Method]
 	if !ok {
+		// Notifications for unknown methods cannot be answered: read and
+		// discard the body and send nothing.
+		if req.Seq == 0 {
+			return c.codec.ReadRequestBody(nil)
+		}
 		resp := &Response{
 			Seq:   req.Seq,
 			Error: "rpc2: can't find method " + req.Method,
