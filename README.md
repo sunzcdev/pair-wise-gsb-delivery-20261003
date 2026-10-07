@@ -22,6 +22,8 @@ There are many solutions regarding configuration loading in Go. I was looking fo
   * command-line flags
 * Dependency-free (file parsers are optional).
 * Ability to walk over configuration fields.
+* Hot-reload planning: compare two parsed configs and learn which fields
+  apply immediately, require a restart or are forbidden to change.
 
 ## Install
 
@@ -78,6 +80,37 @@ if err := loader.Load(); err != nil {
 Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/master/example_test.go).
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).
+
+## Hot-reload planning
+
+`Planner` compares two already-parsed configurations and returns a `Plan`
+with fields marked hot-reloadable, restart-required or blocked.
+
+Annotate fields with struct tags:
+
+```go
+type MyConfig struct {
+    Addr  string `reload:"hot"`                    // applies without a restart
+    Port  int    `reload:"restart"`               // requires a restart
+    Token string `reload:"never" sensitive:"true"` // cannot be changed
+
+    DB struct {
+        Name string `reload_group:"db"`           // both fields must change
+        DSN  string `reload_group:"db"`           // together or it's blocked
+    }
+}
+
+plan, err := aconfig.NewPlanner().Plan(&oldCfg, &newCfg)
+plan.HotFields       // standalone fields applied immediately
+plan.RestartFields   // standalone fields requiring a restart
+plan.Groups          // groups switched together (escalated on restart member)
+plan.Blocked         // forbidden standalone changes
+plan.HasBlocked()    // true when any change (incl. a group) cannot be applied
+```
+
+Maps are compared independently of iteration order while slice order
+matters. Custom equivalence can be registered per field path or per type
+via `WithPathEqual`, `WithTypeEqual`, or by implementing `Comparer`.
 
 ## Documentation
 
