@@ -9,6 +9,7 @@ An efficient [B-tree](https://en.wikipedia.org/wiki/B-tree) implementation in Go
 - Support for [Generics](#generics) (Go 1.18+).
 - `Map` and `Set` types for ordered key-value maps and sets,
 - Fast bulk loading for pre-ordered data using the `Load()` method.
+- Atomic bulk building from a streamed iterator using the `BulkLoad()` method.
 - `Copy()` method with copy-on-write support.
 - [Path hinting](PATH_HINT.md) optimization for operations with nearby keys.
 - Allows for array-like operations. ([Counted B-tree](https://www.chiark.greenend.org.uk/~sgtatham/algorithms/cbtree.html))
@@ -20,6 +21,34 @@ To start using this package, install Go and run:
 ```sh
 $ go get github.com/tidwall/btree
 ```
+
+## Bulk building
+
+`BulkLoad` builds an entire tree from a stream of ascending items and replaces
+the previous contents only once the whole stream has been consumed and the new
+tree has been verified. The total number of items does not have to be known up
+front; items are laid out directly using the configured node capacity without
+being collected into an extra slice. Duplicate keys can be rejected or resolved
+by keeping the first or last occurrence. If the stream or the final
+verification fails, the temporary tree is discarded and the previous tree, and
+any `Copy` of it, keeps working unchanged.
+
+```go
+iter := func() (int, bool) {
+    if next >= len(rows) {
+        return 0, false
+    }
+    v := rows[next]
+    next++
+    return v, true
+}
+stats, err := tr.BulkLoad(iter, &btree.BulkOptions{
+    Duplicates: btree.KeepLast,
+})
+```
+
+`stats` reports the number of items consumed and loaded, duplicate hits,
+comparator invocations, nodes allocated and the temporary tree's peak memory.
 
 ## B-tree types
 
@@ -215,6 +244,7 @@ DeleteAt(index)         // deletes the item at index
 
 // Bulk-loading
 Load(item)              // load presorted items into tree
+BulkLoad(iter, opts)    // atomically build the whole tree from a stream
 
 // Path hinting
 SetHint(item, *hint)    // insert or replace an existing item
@@ -338,6 +368,7 @@ DeleteAt(index)         // deletes the item at index
 
 // Bulk-loading
 Load(item)              // load presorted items into tree
+BulkLoad(iter, opts)    // atomically build the whole tree from a stream
 
 // Path hinting
 SetHint(item, *hint)    // insert or replace an existing item

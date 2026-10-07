@@ -215,6 +215,19 @@ func (tr *BTree) Load(item any) (prev any) {
 	return v
 }
 
+// BulkLoad atomically builds the tree from a stream of ascending items and
+// replaces the previous contents only after every item has been consumed and
+// the resulting tree has been validated. See BTreeG.BulkLoad for the full
+// semantics: unknown item counts, duplicate policies, minimum-occupancy
+// handling for the trailing level, and keeping the previous tree (and any
+// Copy of it) usable when the build fails.
+func (tr *BTree) BulkLoad(iter func() (any, bool), opts *BulkOptions) (BulkStats, error) {
+	if iter == nil {
+		return BulkStats{}, ErrNilIterator
+	}
+	return tr.base.BulkLoad(iter, opts)
+}
+
 // Min returns the minimum item in tree.
 // Returns nil if the tree has no items.
 func (tr *BTree) Min() any {
