@@ -117,6 +117,34 @@ func ExampleDecoder_Query() {
 	// 2nd phone is 54321
 }
 
+func ExampleCompileQuery() {
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	enc.SetSortMapKeys(true)
+
+	err := enc.Encode([]map[string]interface{}{
+		{"id": 1, "status": "ok", "elapsed": 100},
+		{"id": 2, "status": "failed", "elapsed": 250},
+		{"id": 3, "status": "failed", "elapsed": 300},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	q, err := msgpack.CompileQuery("[?status==failed][:10].{id,elapsed}")
+	if err != nil {
+		panic(err)
+	}
+
+	dec := msgpack.NewDecoder(bytes.NewReader(buf.Bytes()))
+	values, err := q.Query(dec)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(values)
+	// Output: [250 2 300 3]
+}
+
 func ExampleEncoder_UseArrayEncodedStructs() {
 	type Item struct {
 		Foo string
