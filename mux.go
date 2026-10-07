@@ -56,17 +56,41 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// MaxWriteBuffer is the maximum number of payload bytes that may be
+	// queued session-wide before they are actually written to the underlying
+	// connection. When the limit is reached, stream writes either wait for
+	// space (WriteBlock is true) or return ErrSendBufferFull immediately.
+	// Control frames (SYN/FIN/NOP/UPD) keep a separate, small quota and are
+	// not counted against this limit.
+	MaxWriteBuffer int
+
+	// MaxStreamWriteBuffer is the per-stream limit on payload bytes queued
+	// but not yet written to the underlying connection. It may be set smaller
+	// than MaxWriteBuffer so that a single stream cannot fill the whole
+	// session send budget.
+	MaxStreamWriteBuffer int
+
+	// WriteBlock controls the behavior when the session or per-stream send
+	// buffer limit is reached. When true (the default), stream writes wait
+	// until space becomes available (or the write deadline fires). When false,
+	// stream writes fail immediately with ErrSendBufferFull. Control frames
+	// always block until their own deadline regardless of this setting.
+	WriteBlock bool
 }
 
 // DefaultConfig is used to return a default configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Version:           1,
-		KeepAliveInterval: 10 * time.Second,
-		KeepAliveTimeout:  30 * time.Second,
-		MaxFrameSize:      32768,
-		MaxReceiveBuffer:  4194304,
-		MaxStreamBuffer:   65536,
+		Version:              1,
+		KeepAliveInterval:    10 * time.Second,
+		KeepAliveTimeout:     30 * time.Second,
+		MaxFrameSize:         32768,
+		MaxReceiveBuffer:     4194304,
+		MaxStreamBuffer:      65536,
+		MaxWriteBuffer:       4194304,
+		MaxStreamWriteBuffer: 65536,
+		WriteBlock:           true,
 	}
 }
 
@@ -103,6 +127,27 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
+	}
+	if config.MaxWriteBuffer <= 0 {
+		return errors.New("max write buffer must be positive")
+	}
+	if config.MaxWriteBuffer < config.MaxFrameSize {
+		return errors.New("max write buffer must not be smaller than max frame size")
+	}
+	if config.MaxWriteBuffer > math.MaxInt32 {
+		return errors.New("max write buffer cannot be larger than 2147483647")
+	}
+	if config.MaxStreamWriteBuffer <= 0 {
+		return errors.New("max stream write buffer must be positive")
+	}
+	if config.MaxStreamWriteBuffer < config.MaxFrameSize {
+		return errors.New("max stream write buffer must not be smaller than max frame size")
+	}
+	if config.MaxStreamWriteBuffer > config.MaxWriteBuffer {
+		return errors.New("max stream write buffer must not be larger than max write buffer")
+	}
+	if config.MaxStreamWriteBuffer > math.MaxInt32 {
+		return errors.New("max stream write buffer cannot be larger than 2147483647")
 	}
 	return nil
 }

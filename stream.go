@@ -71,6 +71,15 @@ type stream struct {
 	numWritten uint32 // count num of bytes written
 	incr       uint32 // bytes sent since last window update
 
+	// pendingBytes counts payload bytes queued for this stream but not yet
+	// written to the underlying connection. It enforces the per-stream send
+	// buffer limit and is always a subset of the session-wide write budget.
+	// Guarded by Session.budgetLock.
+	pendingBytes int64
+	// chSpace is signaled once when pendingBytes is refunded, waking writers
+	// blocked on the per-stream send limit.
+	chSpace chan struct{}
+
 	// UPD command
 	peerConsumed          uint32        // num of bytes the peer has consumed
 	peerWindow            uint32        // peer window, initialized to 256KB, updated by peer
@@ -186,7 +195,8 @@ func newStream(id uint32, frameSize int, sess *Session) *stream {
 	s.sess = sess
 	s.die = make(chan struct{})
 	s.chFinEvent = make(chan struct{})
-	s.chWriteClosed = make(chan struct{})                             // half-close support
+	s.chWriteClosed = make(chan struct{}) // half-close support
+	s.chSpace = make(chan struct{}, 1)
 	s.peerWindow = initialPeerWindow                                  // set to initial window size
 	s.windowUpdateThreshold = uint32(sess.config.MaxStreamBuffer / 2) // cache threshold
 	// pre-allocate ring buffer to reduce allocations during data transfer
@@ -423,7 +433,7 @@ func (s *stream) sendWindowUpdate(consumed uint32) error {
 	binary.LittleEndian.PutUint32(hdr[:], consumed)
 	binary.LittleEndian.PutUint32(hdr[4:], uint32(s.sess.config.MaxStreamBuffer))
 	frame.data = hdr[:]
-	_, err := s.sess.writeFrameInternal(frame, deadline, CLSCTRL) // <-- NOTE(x): use control channel
+	_, err := s.sess.writeFrameInternal(frame, deadline, CLSCTRL, nil) // <-- NOTE(x): use control channel
 	return err
 }
 
@@ -516,7 +526,7 @@ func (s *stream) writeV1(b []byte) (n int, err error) {
 		}
 
 		frame.data = b[:size]
-		n, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA)
+		n, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA, s)
 		atomic.AddUint32(&s.numWritten, uint32(size))
 		sent += n
 		if err != nil {
@@ -604,7 +614,7 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
 				frame.data = bts[:size]
 
 				// transmit of frame
-				nw, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA)
+				nw, err := s.sess.writeFrameInternal(frame, deadline, CLSDATA, s)
 				atomic.AddUint32(&s.numWritten, uint32(size))
 				sent += nw
 				if err != nil {
@@ -662,7 +672,7 @@ func (s *stream) CloseWrite() error {
 	timer := time.NewTimer(openCloseTimeout)
 	defer timer.Stop()
 
-	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA)
+	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA, s)
 	s.tryHalfCloseCleanup()
 	return err
 }
@@ -691,7 +701,7 @@ func (s *stream) Close() error {
 	timer := time.NewTimer(openCloseTimeout)
 	defer timer.Stop()
 
-	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA) // NOTE(x): use data channel, EOF as data.
+	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA, s) // NOTE(x): use data channel, EOF as data.
 	s.sess.streamClosed(s.id)
 	return err
 }

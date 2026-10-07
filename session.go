@@ -27,6 +27,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -38,6 +39,11 @@ const (
 	minShaperNotifySize  = 16
 	maxShaperSize        = 1024
 	openCloseTimeout     = 30 * time.Second // Timeout for opening/closing streams
+	// maxControlWriteBuffer caps payload bytes of queued control frames
+	// (SYN/FIN/NOP/UPD). Control frames keep an independent small quota so
+	// that a data backlog can never prevent close notifications from being
+	// sent.
+	maxControlWriteBuffer = 64 * 1024
 )
 
 // resultChanPool reduces allocation of result channels
@@ -73,14 +79,42 @@ var (
 	ErrGoAway                    = errors.New("stream id overflows, should start a new connection")
 	ErrTimeout         net.Error = &timeoutError{}
 	ErrWouldBlock                = errors.New("operation would block on IO")
+	// ErrSendBufferFull is returned by stream writes when the session-level
+	// or per-stream send buffer limit is reached and the session is
+	// configured for non-blocking writes (Config.WriteBlock == false).
+	ErrSendBufferFull = errors.New("send buffer full")
+)
+
+// chargeKind identifies which send budget a writeRequest is charged to.
+// Every reservation is released exactly once, either by sendLoop after the
+// frame has been processed or by writeFrameInternal when the request never
+// enters the send queue.
+type chargeKind int
+
+const (
+	chargeNone chargeKind = iota
+	chargeData
+	chargeControl
 )
 
 // writeRequest represents a request to write a frame
 type writeRequest struct {
-	class  CLASSID
-	frame  Frame
-	seq    uint32
-	result chan writeResult
+	class   CLASSID
+	frame   Frame
+	seq     uint32
+	result  chan writeResult
+	charge  chargeKind  // send budget this request has been charged to
+	charges int         // payload bytes reserved from the budget
+	strm    *stream     // owning stream for per-stream accounting, nil for session frames
+	flags   *writeFlags // shared across all copies of the request in channels/queues
+}
+
+// writeFlags is shared by every copy of a writeRequest as it travels through
+// the shaper channel and queues, so that cancellation from the writer is
+// visible to sendLoop and the reservation refund happens exactly once.
+type writeFlags struct {
+	released int32 // atomic; ensures the reservation is released at most once
+	canceled int32 // atomic; set when the writer gives up (deadline/close) before the frame is sent
 }
 
 // writeResult represents the result of a write request
@@ -131,6 +165,19 @@ type Session struct {
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
+
+	// send-side backpressure accounting. writeBudget tracks payload bytes of
+	// queued data frames (PSH), controlBudget tracks payload bytes of queued
+	// control frames (SYN/FIN/NOP/UPD). The two budgets are independent so
+	// that a saturated data queue never blocks control notifications.
+	//
+	// budgetLock serializes reservation/refund of both budgets and the
+	// per-stream pending counters, eliminating reservation races; waiters
+	// sleep on edge-triggered channels while not holding the lock.
+	writeBudget   int64
+	controlBudget int64
+	budgetLock    sync.Mutex
+	chBudgetSpace chan struct{} // signaled when session data budget is released
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -149,6 +196,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chShaperPending = make(chan struct{}, 1)
 	s.chShaperConsumed = make(chan struct{}, 1)
 	s.sq = NewShaperQueue()
+	s.chBudgetSpace = make(chan struct{}, 1)
 
 	if client {
 		s.nextStreamID = 1
@@ -380,6 +428,169 @@ func (s *Session) returnTokens(n int) {
 	}
 }
 
+// notifyBudgetSpace wakes up writers waiting for send budget to become
+// available. The single-buffered channel is edge triggered, so a notification
+// is coalesced when one is already pending.
+func (s *Session) notifyBudgetSpace() {
+	select {
+	case s.chBudgetSpace <- struct{}{}:
+	default:
+	}
+}
+
+// notifyStreamSpace wakes writers blocked on a single stream's send limit.
+func notifyStreamSpace(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+// dataBudget returns the session-wide queued data payload bytes (test and
+// diagnostics helper; the value is maintained under budgetLock).
+func (s *Session) dataBudget() int64 {
+	s.budgetLock.Lock()
+	defer s.budgetLock.Unlock()
+	return s.writeBudget
+}
+
+// ctrlBudget returns the queued control payload bytes.
+func (s *Session) ctrlBudget() int64 {
+	s.budgetLock.Lock()
+	defer s.budgetLock.Unlock()
+	return s.controlBudget
+}
+
+// pending returns this stream's queued data payload bytes.
+func (s *stream) pending() int64 {
+	s.sess.budgetLock.Lock()
+	defer s.sess.budgetLock.Unlock()
+	return s.pendingBytes
+}
+
+// waitSignal blocks until one of fire channels is signaled, the deadline
+// fires or the session shuts down. A nil deadline waits indefinitely.
+func (s *Session) waitSignal(fire []<-chan struct{}, deadline <-chan time.Time) error {
+	cases := make([]reflect.SelectCase, 0, len(fire)+4)
+	for _, ch := range fire {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)})
+	}
+	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(s.die)})
+	cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(s.chSocketWriteError)})
+	if deadline != nil {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(deadline)})
+	}
+
+	chosen, _, _ := reflect.Select(cases)
+	switch {
+	case chosen < len(fire):
+		return nil
+	case chosen == len(fire):
+		return io.ErrClosedPipe
+	case chosen == len(fire)+1:
+		return s.socketWriteError.Load().(error)
+	default:
+		return ErrTimeout
+	}
+}
+
+// reserveData attempts to reserve n payload bytes from both the session-wide
+// data send budget and the per-stream budget. When block is true it waits for
+// space (or the deadline) and retries; when false it returns
+// ErrSendBufferFull without waiting.
+//
+// A successful reservation must be released exactly once via releaseRequest.
+func (s *Session) reserveData(strm *stream, n int, block bool, deadline <-chan time.Time) error {
+	limit := int64(s.config.MaxWriteBuffer)
+	streamLimit := int64(s.config.MaxStreamWriteBuffer)
+
+	for {
+		var fire []<-chan struct{}
+
+		s.budgetLock.Lock()
+		var streamPending int64
+		if strm != nil {
+			streamPending = strm.pendingBytes
+		}
+		sessionFull := s.writeBudget+int64(n) > limit
+		streamFull := strm != nil && streamPending+int64(n) > streamLimit
+
+		if !sessionFull && !streamFull {
+			s.writeBudget += int64(n)
+			if strm != nil {
+				strm.pendingBytes += int64(n)
+			}
+			s.budgetLock.Unlock()
+			return nil
+		}
+
+		if sessionFull {
+			fire = append(fire, s.chBudgetSpace)
+		}
+		if streamFull {
+			fire = append(fire, strm.chSpace)
+		}
+		s.budgetLock.Unlock()
+
+		if !block {
+			return ErrSendBufferFull
+		}
+		if err := s.waitSignal(fire, deadline); err != nil {
+			return err
+		}
+	}
+}
+
+// reserveControl reserves n payload bytes from the independent control frame
+// budget. Control frames always block: the small quota drains quickly and
+// close notifications must not be dropped just because data is backed up.
+func (s *Session) reserveControl(n int, deadline <-chan time.Time) error {
+	limit := int64(maxControlWriteBuffer)
+	for {
+		s.budgetLock.Lock()
+		if s.controlBudget+int64(n) <= limit {
+			s.controlBudget += int64(n)
+			s.budgetLock.Unlock()
+			return nil
+		}
+		s.budgetLock.Unlock()
+
+		if err := s.waitSignal([]<-chan struct{}{s.chBudgetSpace}, deadline); err != nil {
+			return err
+		}
+	}
+}
+
+// releaseRequest refunds the send budget reserved for a queued write request.
+// It is idempotent: cancellation (deadline), stream close and the eventual
+// sendLoop completion may all race for the same reservation, but the bytes
+// are refunded at most once.
+func (s *Session) releaseRequest(req *writeRequest) {
+	if req.flags == nil || !atomic.CompareAndSwapInt32(&req.flags.released, 0, 1) {
+		return
+	}
+
+	s.budgetLock.Lock()
+	switch req.charge {
+	case chargeData:
+		s.writeBudget -= int64(req.charges)
+		if req.strm != nil {
+			req.strm.pendingBytes -= int64(req.charges)
+		}
+	case chargeControl:
+		s.controlBudget -= int64(req.charges)
+	default:
+		s.budgetLock.Unlock()
+		return
+	}
+	s.budgetLock.Unlock()
+
+	s.notifyBudgetSpace()
+	if req.charge == chargeData && req.strm != nil {
+		notifyStreamSpace(req.strm.chSpace)
+	}
+}
+
 // recvLoop keeps on reading from underlying connection if tokens are available
 func (s *Session) recvLoop() {
 	var hdr rawHeader
@@ -525,7 +736,7 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL)
+			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL, nil)
 			s.notifyBucket() // force a wakeup signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.sessionIsActive, 1, 0) {
@@ -570,9 +781,30 @@ func (s *Session) shaperLoop() {
 				chShaper = nil
 			}
 		case <-s.chShaperConsumed:
-			// re-enable shaper channel
+			// sendLoop drained (part of) the queue. Re-enable the shaper
+			// channel and proactively move any buffered requests into the
+			// queue; otherwise a writer blocked on a full shaper channel and
+			// a coalesced consumed notification could stall indefinitely.
 			chShaper = s.shaper
+			s.drainShaperChannel()
 		}
+	}
+}
+
+// drainShaperChannel moves requests buffered in the shaper channel into the
+// priority queue up to its capacity, and notifies sendLoop of new pendings.
+func (s *Session) drainShaperChannel() {
+	moved := false
+	for len(s.shaper) > 0 && s.sq.Len() < maxShaperSize {
+		select {
+		case r := <-s.shaper:
+			s.sq.Push(r)
+			moved = true
+		default:
+		}
+	}
+	if moved {
+		s.notifyShaperPending()
 	}
 }
 
@@ -614,7 +846,17 @@ EVENT_LOOP:
 	for {
 		select {
 		case <-s.die:
-			return
+			// Refund reservations still held in the shaper queue. Their
+			// writers are unblocked by session shutdown, while requests left
+			// in the shaper channel are owned by their blocked writers and
+			// released on those exit paths.
+			for {
+				request, ok := s.sq.Pop()
+				if !ok {
+					return
+				}
+				s.releaseRequest(&request)
+			}
 		case <-s.chShaperPending:
 			for {
 				request, ok := s.sq.Pop()
@@ -622,6 +864,20 @@ EVENT_LOOP:
 					// notify shaperLoop to accept new requests
 					s.notifyShaperConsumed()
 					goto EVENT_LOOP
+				}
+
+				// The writer gave up waiting (write deadline or session
+				// close). Refund the reservation and skip the wire write so
+				// that a single timed-out write never corrupts the ordering
+				// or contents of other queued streams.
+				if atomic.LoadInt32(&request.flags.canceled) != 0 {
+					s.releaseRequest(&request)
+					// The writer has gone; never block the sendLoop.
+					select {
+					case request.result <- writeResult{n: 0, err: ErrTimeout}:
+					default:
+					}
+					continue
 				}
 
 				buf[0] = request.frame.ver
@@ -649,10 +905,36 @@ EVENT_LOOP:
 					err: err,
 				}
 
-				request.result <- result
+				// Refund the send budget before reporting the result so that
+				// a writer woken by the result (or by a deadline/close racing
+				// with this completion) always observes free space. The
+				// reservation is released exactly once here.
+				s.releaseRequest(&request)
+				if atomic.LoadInt32(&request.flags.canceled) != 0 {
+					// The writer timed out or left while the write was in
+					// flight. The reservation has been refunded; deliver the
+					// result best-effort to avoid blocking other streams.
+					select {
+					case request.result <- result:
+					default:
+					}
+				} else {
+					request.result <- result
+				}
 
 				// store conn error
 				if err != nil {
+					// Refund every reservation still sitting in the shaper
+					// queue before tearing down. Requests trapped in the
+					// shaper channel are released by their own blocked
+					// writers via chSocketWriteError.
+					for {
+						pending, ok := s.sq.Pop()
+						if !ok {
+							break
+						}
+						s.releaseRequest(&pending)
+					}
 					s.notifyWriteError(err)
 					return
 				}
@@ -667,45 +949,85 @@ func (s *Session) writeControlFrame(f Frame) (n int, err error) {
 	timer := time.NewTimer(openCloseTimeout)
 	defer timer.Stop()
 
-	return s.writeFrameInternal(f, timer.C, CLSCTRL)
+	return s.writeFrameInternal(f, timer.C, CLSCTRL, nil)
 }
 
 // internal writeFrame version to support deadline used in keepalive
-func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class CLASSID) (int, error) {
+func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class CLASSID, strm *stream) (int, error) {
+	// PSH payloads are charged to the session/stream data budgets; every other
+	// command is a control frame charged to the independent control budget.
+	var charge chargeKind
+	switch f.cmd {
+	case cmdPSH:
+		charge = chargeData
+	default:
+		charge = chargeControl
+	}
+
+	if charge == chargeData {
+		if err := s.reserveData(strm, len(f.data), s.config.WriteBlock, deadline); err != nil {
+			return 0, err
+		}
+	} else {
+		if err := s.reserveControl(len(f.data), deadline); err != nil {
+			return 0, err
+		}
+	}
+
 	// get result channel from pool
 	resultCh := resultChanPool.Get().(chan writeResult)
 
 	req := writeRequest{
-		class:  class,
-		frame:  f,
-		seq:    atomic.AddUint32(&s.requestID, 1),
-		result: resultCh,
+		class:   class,
+		frame:   f,
+		seq:     atomic.AddUint32(&s.requestID, 1),
+		result:  resultCh,
+		charge:  charge,
+		charges: len(f.data),
+		strm:    strm,
+		flags:   &writeFlags{},
 	}
 	select {
 	case s.shaper <- req:
 	case <-s.die:
+		s.releaseRequest(&req)
 		resultChanPool.Put(resultCh)
 		return 0, io.ErrClosedPipe
 	case <-s.chSocketWriteError:
+		s.releaseRequest(&req)
 		resultChanPool.Put(resultCh)
 		return 0, s.socketWriteError.Load().(error)
 	case <-deadline:
+		s.releaseRequest(&req)
 		resultChanPool.Put(resultCh)
 		return 0, ErrTimeout
 	}
 
 	select {
 	case result := <-resultCh:
+		// sendLoop is responsible for releasing the reservation.
 		resultChanPool.Put(resultCh)
 		return result.n, result.err
 	case <-s.die:
-		// Cannot recycle channel here - sendLoop may still write to it
+		// Cancel the queued frame: release the reservation here and let
+		// sendLoop skip the wire write. The channel is not recycled because
+		// sendLoop may still deliver a result to it.
+		atomic.StoreInt32(&req.flags.canceled, 1)
+		s.releaseRequest(&req)
 		return 0, io.ErrClosedPipe
 	case <-s.chSocketWriteError:
-		// Cannot recycle channel here - sendLoop may still write to it
+		// sendLoop exits on the write error; release the reservation here.
+		// The channel is not recycled because sendLoop may race with us.
+		atomic.StoreInt32(&req.flags.canceled, 1)
+		s.releaseRequest(&req)
 		return 0, s.socketWriteError.Load().(error)
 	case <-deadline:
-		// Cannot recycle channel here - sendLoop may still write to it
+		// Write deadline: cancel the frame so it is skipped (unless it was
+		// already on the wire), refunding the reservation exactly once.
+		// Other streams' queued frames stay intact. The channel is not
+		// recycled because sendLoop may still deliver a result to it.
+		atomic.StoreInt32(&req.flags.canceled, 1)
+		s.releaseRequest(&req)
 		return 0, ErrTimeout
 	}
 }

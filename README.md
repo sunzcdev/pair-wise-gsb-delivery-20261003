@@ -166,6 +166,11 @@ func server() {
 * `MaxFrameSize`: Maximum size of a frame.
 * `MaxReceiveBuffer`: Maximum size of the shared receive buffer.
 * `MaxStreamBuffer`: Maximum size of the per-stream buffer.
+* `MaxWriteBuffer`: Maximum payload bytes queued session-wide but not yet written to the underlying connection. When the limit is reached, data writes either wait for space (`WriteBlock=true`) or return `ErrSendBufferFull` immediately.
+* `MaxStreamWriteBuffer`: Per-stream limit on queued-but-unwritten payload bytes; may be set smaller than `MaxWriteBuffer`.
+* `WriteBlock`: When true (the default) writes wait for send-budget space up to the write deadline; when false they return `ErrSendBufferFull` immediately.
+
+Control frames (`SYN`/`FIN`/`NOP`/`UPD`) reserve a small, independent quota, so a saturated data queue never prevents close notifications from being sent.
 
 ## Reference
 
