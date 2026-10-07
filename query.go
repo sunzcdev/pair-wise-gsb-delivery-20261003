@@ -54,7 +54,16 @@ func Query(top *Node, expr string) (*Node, error) {
 
 // QuerySelectorAll searches all of the Node that matches the specified XPath selectors.
 func QuerySelectorAll(top *Node, selector *xpath.Expr) []*Node {
-	t := selector.Select(CreateXPathNavigator(top))
+	return querySelectorAll(CreateXPathNavigator(top), selector)
+}
+
+// QuerySelector returns the first matched XML Node by the specified XPath selector.
+func QuerySelector(top *Node, selector *xpath.Expr) *Node {
+	return querySelector(CreateXPathNavigator(top), selector)
+}
+
+func querySelectorAll(nav *NodeNavigator, selector *xpath.Expr) []*Node {
+	t := selector.Select(nav)
 	var elems []*Node
 	for t.MoveNext() {
 		elems = append(elems, (t.Current().(*NodeNavigator)).cur)
@@ -62,9 +71,8 @@ func QuerySelectorAll(top *Node, selector *xpath.Expr) []*Node {
 	return elems
 }
 
-// QuerySelector returns the first matched XML Node by the specified XPath selector.
-func QuerySelector(top *Node, selector *xpath.Expr) *Node {
-	t := selector.Select(CreateXPathNavigator(top))
+func querySelector(nav *NodeNavigator, selector *xpath.Expr) *Node {
+	t := selector.Select(nav)
 	if t.MoveNext() {
 		return (t.Current().(*NodeNavigator)).cur
 	}
@@ -74,6 +82,10 @@ func QuerySelector(top *Node, selector *xpath.Expr) *Node {
 // NodeNavigator is for navigating JSON document.
 type NodeNavigator struct {
 	root, cur *Node
+	// boundary, when non-nil, confines all navigation to the subtree
+	// rooted at that node. The boundary node acts as a virtual document
+	// root: the parent, ancestor and sibling axes cannot escape it.
+	boundary *Node
 }
 
 func (a *NodeNavigator) Current() *Node {
@@ -81,6 +93,11 @@ func (a *NodeNavigator) Current() *Node {
 }
 
 func (a *NodeNavigator) NodeType() xpath.NodeType {
+	if a.boundary != nil && a.cur == a.boundary {
+		// The virtual root of a restricted view is reported as a
+		// document root, consistent with a real DocumentNode.
+		return xpath.RootNode
+	}
 	switch a.cur.Type {
 	case TextNode:
 		return xpath.TextNode
@@ -128,6 +145,9 @@ func (a *NodeNavigator) MoveToRoot() {
 }
 
 func (a *NodeNavigator) MoveToParent() bool {
+	if a.cur == a.boundary {
+		return false
+	}
 	if n := a.cur.Parent; n != nil {
 		a.cur = n
 		return true
@@ -148,6 +168,9 @@ func (a *NodeNavigator) MoveToChild() bool {
 }
 
 func (a *NodeNavigator) MoveToFirst() bool {
+	if a.cur == a.boundary {
+		return false
+	}
 	for n := a.cur.PrevSibling; n != nil; n = n.PrevSibling {
 		a.cur = n
 	}
@@ -159,6 +182,9 @@ func (a *NodeNavigator) String() string {
 }
 
 func (a *NodeNavigator) MoveToNext() bool {
+	if a.cur == a.boundary {
+		return false
+	}
 	if n := a.cur.NextSibling; n != nil {
 		a.cur = n
 		return true
@@ -167,6 +193,9 @@ func (a *NodeNavigator) MoveToNext() bool {
 }
 
 func (a *NodeNavigator) MoveToPrevious() bool {
+	if a.cur == a.boundary {
+		return false
+	}
 	if n := a.cur.PrevSibling; n != nil {
 		a.cur = n
 		return true
@@ -176,7 +205,7 @@ func (a *NodeNavigator) MoveToPrevious() bool {
 
 func (a *NodeNavigator) MoveTo(other xpath.NodeNavigator) bool {
 	node, ok := other.(*NodeNavigator)
-	if !ok || node.root != a.root {
+	if !ok || node.root != a.root || node.boundary != a.boundary {
 		return false
 	}
 	a.cur = node.cur
