@@ -48,6 +48,20 @@ func (p *PeekingLexer) Range(rawStart, rawEnd RawCursor) []Token {
 	return p.tokens[rawStart:rawEnd]
 }
 
+// RawTokens returns every token produced by the lexer, including elided
+// tokens and the trailing EOF token.
+//
+// The returned slice is shared with the lexer and must not be modified.
+func (p *PeekingLexer) RawTokens() []Token {
+	return p.tokens
+}
+
+// IsElided reports whether tokens of the given type are hidden from the
+// parser (but still present in RawTokens).
+func (p *PeekingLexer) IsElided(typ TokenType) bool {
+	return p.elide[typ]
+}
+
 // Cursor position in tokens, excluding elided tokens.
 func (c Checkpoint) Cursor() int {
 	return c.cursor

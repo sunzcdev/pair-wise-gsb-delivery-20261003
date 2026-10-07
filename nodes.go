@@ -153,6 +153,14 @@ func (s *strct) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Value, 
 	sv := reflect.New(s.typ).Elem()
 	start := ctx.RawCursor()
 	applyStart := len(ctx.apply)
+	rootProduction := ctx.sourceRootDepth == 0
+	ctx.sourceRootDepth++
+	defer func() { ctx.sourceRootDepth-- }()
+	var sourceCp *sourceCheckpoint
+	if ctx.sources != nil {
+		cp := ctx.sources.checkpoint()
+		sourceCp = &cp
+	}
 	t := ctx.Peek()
 	s.maybeInjectStartToken(t, sv)
 	if out, err = s.expr.Parse(ctx, sv); err != nil {
@@ -160,16 +168,26 @@ func (s *strct) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Value, 
 		// an enclosing struct's captures may still belong to a branch that gets dropped.
 		_ = ctx.ApplyFrom(applyStart)
 		ctx.MaybeUpdateError(err)
+		ctx.rollbackToCheckpoint(sourceCp)
 		return []reflect.Value{sv}, err
 	} else if out == nil {
 		// No match, so the queue is back at applyStart: nothing to apply.
+		ctx.rollbackToCheckpoint(sourceCp)
 		return nil, nil
+	}
+	if err := ctx.ApplyFrom(applyStart); err != nil {
+		ctx.rollbackToCheckpoint(sourceCp)
+		return []reflect.Value{sv}, err
 	}
 	end := ctx.RawCursor()
 	t = ctx.RawPeek()
 	s.maybeInjectEndToken(t, sv)
 	s.maybeInjectTokens(ctx.Range(start, end), sv)
-	return []reflect.Value{sv}, ctx.ApplyFrom(applyStart)
+	if ctx.sources != nil {
+		ctx.sources.publish(ctx, sv, start, end, rootProduction)
+		sourceCp = nil
+	}
+	return []reflect.Value{sv}, nil
 }
 
 func (s *strct) maybeInjectStartToken(token *lexer.Token, v reflect.Value) {
@@ -270,16 +288,20 @@ func (g *group) Parse(ctx *parseContext, parent reflect.Value) (out []reflect.Va
 			ctx.MaybeUpdateError(err)
 			// Optional part failed to match.
 			if ctx.Stop(err, branch) {
+				ctx.rejectSourceBranch(branch)
 				out = append(out, v...) // Try to return as much of the parse tree as possible
 				return out, err
 			}
+			ctx.rejectSourceBranch(branch)
 			break
 		}
 		out = append(out, v...)
-		ctx.Accept(branch)
 		if v == nil {
+			// Branch matched nothing: discard any records it may have made.
+			ctx.rejectSourceBranch(branch)
 			break
 		}
+		ctx.Accept(branch)
 	}
 	// fmt.Printf("%d < %d < %d: out == nil? %v\n", min, matches, max, out == nil)
 	t := ctx.Peek()
@@ -338,6 +360,7 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 	for _, a := range d.nodes {
 		branch := ctx.Branch()
 		if value, err := a.Parse(branch, parent); err != nil {
+			ctx.rejectSourceBranch(branch)
 			// If this branch progressed too far and still didn't match, error out.
 			if ctx.Stop(err, branch) {
 				return value, err
@@ -357,6 +380,8 @@ func (d *disjunction) Parse(ctx *parseContext, parent reflect.Value) (out []refl
 			}
 			ctx.Accept(branch)
 			return value, nil
+		} else {
+			ctx.rejectSourceBranch(branch)
 		}
 	}
 	if firstError != nil {

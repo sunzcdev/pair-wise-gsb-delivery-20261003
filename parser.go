@@ -173,11 +173,22 @@ func (p *Parser[G]) ParseFromLexer(lex *lexer.PeekingLexer, options ...ParseOpti
 	for _, option := range options {
 		option(&ctx)
 	}
+	if ctx.sources != nil {
+		ctx.sources.attach(ctx.RawTokens(), ctx.IsElided, ctx.sourceText, ctx.hasSourceText)
+	}
 	// If the grammar implements Parseable, use it.
 	if parseable, ok := any(v).(Parseable); ok {
-		return v, p.rootParseable(&ctx, parseable)
+		err = p.rootParseable(&ctx, parseable)
+		if err == nil {
+			ctx.finishSources()
+		}
+		return v, err
 	}
-	return v, p.parseOne(&ctx, parseNode, rv)
+	err = p.parseOne(&ctx, parseNode, rv)
+	if err == nil {
+		ctx.finishSources()
+	}
+	return v, err
 }
 
 func (p *Parser[G]) setCaseInsensitiveTokens() {
@@ -205,11 +216,19 @@ func (p *Parser[G]) Parse(filename string, r io.Reader, options ...ParseOption) 
 	if filename == "" {
 		filename = lexer.NameOfReader(r)
 	}
-	lex, err := p.lex.Lex(filename, r)
+	if !sourceEnabled(options) {
+		// Preserve the streaming path when source tracking is not requested.
+		lex, err := p.lex.Lex(filename, r)
+		if err != nil {
+			return nil, err
+		}
+		return p.parse(lex, options...)
+	}
+	data, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
-	return p.parse(lex, options...)
+	return p.ParseBytes(filename, data, options...)
 }
 
 // ParseString from s into grammar v which must be of the same type as the grammar passed to
@@ -226,7 +245,7 @@ func (p *Parser[G]) ParseString(filename string, s string, options ...ParseOptio
 	if err != nil {
 		return nil, err
 	}
-	return p.parse(lex, options...)
+	return p.parse(lex, append(options, withSourceText(s))...)
 }
 
 // ParseBytes from b into grammar v which must be of the same type as the grammar passed to
@@ -243,7 +262,15 @@ func (p *Parser[G]) ParseBytes(filename string, b []byte, options ...ParseOption
 	if err != nil {
 		return nil, err
 	}
-	return p.parse(lex, options...)
+	return p.parse(lex, append(options, withSourceText(string(b)))...)
+}
+
+// withSourceText records the original input for an active SourceView.
+func withSourceText(source string) ParseOption {
+	return func(p *parseContext) {
+		p.sourceText = source
+		p.hasSourceText = true
+	}
 }
 
 func (p *Parser[G]) parseOne(ctx *parseContext, parseNode node, rv reflect.Value) error {
@@ -264,6 +291,9 @@ func (p *Parser[G]) parseInto(ctx *parseContext, _ node, rv reflect.Value) error
 	}
 	pv, err := p.typeNodes[rv.Type().Elem()].Parse(ctx, rv.Elem())
 	if len(pv) > 0 && pv[0].Type() == rv.Elem().Type() {
+		if ctx.sources != nil {
+			ctx.sources.link(rv.Elem(), pv[0])
+		}
 		rv.Elem().Set(reflect.Indirect(pv[0]))
 	}
 	if err != nil {
