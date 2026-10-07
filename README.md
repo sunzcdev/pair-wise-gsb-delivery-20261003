@@ -21,6 +21,7 @@
 	- [Example stateful lexer](#example-stateful-lexer)
 	- [Example simple/non-stateful lexer](#example-simplenon-stateful-lexer)
 	- [Experimental - code generation](#experimental---code-generation)
+- [Grammar-driven input generation](#grammar-driven-input-generation)
 - [Options](#options)
 - [Examples](#examples)
 - [Performance](#performance)
@@ -289,6 +290,43 @@ There are three ways of defining custom parsers for nodes in the grammar:
 1. Implement the [Capture](https://pkg.go.dev/github.com/alecthomas/participle/v2#Capture) interface.
 2. Implement the [Parseable](https://pkg.go.dev/github.com/alecthomas/participle/v2#Parseable) interface.
 3. Use the [ParseTypeWith](https://pkg.go.dev/github.com/alecthomas/participle/v2#ParseTypeWith) option to specify a custom parser for union interface types.
+
+## Grammar-driven input generation
+
+To produce small legal inputs for regression tests, `Parser.Generate` derives a
+sentence from the grammar. It first computes the minimum terminal cost of every
+production (a least fixed point that handles recursion), then prunes branches that
+cannot fit the remaining token budget and picks among the feasible branches using a
+seed:
+
+```go
+render := func(name string, r *rand.Rand) (string, error) {
+    switch name {
+    case "Ident":
+        return "x", nil
+    case "Number":
+        return "1", nil
+    default:
+        return "", fmt.Errorf("unknown token %s", name)
+    }
+}
+gen, err := parser.Generate(seed, maxTokens, render)
+// gen.Text is re-parsed by the parser; gen.Path records every choice made.
+```
+
+Properties:
+
+* The same seed always reproduces the same text and choice path.
+* `maxTokens` is a hard bound on the number of emitted terminals, not on
+  recursion depth; nullable repetitions terminate via a separate structural step
+  limit (`GenerateMaxSteps`) and can never push the output past the token budget.
+* Generated text is always fed back through the parser and returned only if it
+  parses.
+* When no derivation fits the budget the error wraps `participle.ErrNoDerivation`.
+* Negation and lookahead assertions cannot be synthesised. Productions that
+  implement `Parseable` (or are registered with `ParseTypeWith`) are opaque and
+  require an explicit `GenerationAdapter[P]`; the generator never fabricates
+  matches for them.
 
 
 ## Lexing
