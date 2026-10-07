@@ -550,6 +550,19 @@ type MutableGlobal interface {
 	internalapi.WazeroOnly
 }
 
+// MemoryGeneration is an opaque token produced by Memory.ReadBorrow that
+// identifies how many times a memory has been grown at the time a borrowed
+// view was taken.
+//
+// The zero value is never returned by ReadBorrow: the initial generation of a
+// memory that has never grown is 1, and each successful, non-zero
+// "memory.grow" advances it by one.
+//
+// MemoryGeneration is comparable, but has no meaning outside the Memory
+// instance that produced it. Values from different memory instances must not
+// be compared.
+type MemoryGeneration = internalapi.MemoryGeneration
+
 // Memory allows restricted access to a module's memory. Notably, this does not allow growing.
 //
 // See https://www.w3.org/TR/2019/REC-wasm-core-1-20191205/#storage%E2%91%A0
@@ -646,6 +659,79 @@ type Memory interface {
 	// use wazero.RuntimeConfig WithMemoryCapacityPages to ensure max is always
 	// allocated.
 	Read(offset, byteCount uint32) ([]byte, bool)
+
+	// ReadCopy reads byteCount bytes from the underlying buffer at the offset
+	// or returns false if out of range.
+	//
+	// Unlike Read, the returned slice is a freshly allocated copy: it is owned
+	// by the caller and is never write-through. Subsequent Wasm writes,
+	// including those caused by "memory.grow", never mutate it. This is suited
+	// to host code that processes plugin data asynchronously and needs a stable
+	// byte snapshot to retain after the host call returns.
+	//
+	// As with Read, a zero byteCount at a valid offset succeeds and returns an
+	// empty (non-nil) slice; the offset+byteCount addition is checked for
+	// overflow and out-of-range requests return false.
+	//
+	// # Shared memory
+	//
+	// The copy is taken without any locking. On shared memory another agent
+	// can mutate the source bytes while they are being copied, so ReadCopy
+	// does not provide a consistent snapshot of concurrent data. Callers that
+	// need such a guarantee must establish their own synchronization contract
+	// with the Wasm side (for example an application-level lock) before
+	// calling ReadCopy.
+	ReadCopy(offset, byteCount uint32) ([]byte, bool)
+
+	// ReadBorrow reads byteCount bytes from the underlying buffer at the
+	// offset or returns false if out of range.
+	//
+	// As with Read, the returned slice is a zero-copy view of the underlying
+	// memory, and it is write-through. ReadBorrow additionally returns a
+	// MemoryGeneration that identifies the grow state of the memory at read
+	// time. Pass it to ReadBorrowStable to find out whether the memory grew
+	// (and therefore whether the view may have been invalidated) after the
+	// view was taken:
+	//
+	//  buf, gen, ok := memory.ReadBorrow(offset, byteCount)
+	//  if !ok {
+	//      // out of range
+	//  }
+	//  // ... use buf while the guest cannot grow the memory ...
+	//  if !memory.ReadBorrowStable(offset, byteCount, gen) {
+	//      // a grow happened; discard buf and ReadBorrow again
+	//  }
+	//
+	// A zero byteCount at a valid offset succeeds and returns an empty
+	// (non-nil) slice; the offset+byteCount addition is checked for overflow
+	// and out-of-range requests return false.
+	//
+	// # Shared memory
+	//
+	// ReadBorrow only detects "memory.grow", which invalidates the view. It
+	// neither prevents nor detects ordinary concurrent writes by other
+	// agents. Callers that need a consistent view of shared memory must
+	// establish their own synchronization contract with the Wasm side.
+	ReadBorrow(offset, byteCount uint32) (buf []byte, gen MemoryGeneration, ok bool)
+
+	// ReadBorrowStable reports whether the range [offset, offset+byteCount)
+	// can still be accessed through a view previously returned by ReadBorrow
+	// with the given MemoryGeneration.
+	//
+	// It returns false if the memory grew since gen was produced (which can
+	// relocate the backing array and disconnect the view) or if the range is
+	// currently out of range. It does not check that offset and byteCount are
+	// the same values passed to ReadBorrow; callers must keep those together
+	// with the MemoryGeneration.
+	//
+	// As with the other reads, a zero byteCount at a valid offset is legal.
+	//
+	// # Shared memory
+	//
+	// A true result only means no grow happened; concurrent content writes by
+	// other agents remain possible and are the caller's responsibility to
+	// synchronize.
+	ReadBorrowStable(offset, byteCount uint32, gen MemoryGeneration) bool
 
 	// WriteByte writes a single byte to the underlying buffer at the offset in or returns false if out of range.
 	WriteByte(offset uint32, v byte) bool

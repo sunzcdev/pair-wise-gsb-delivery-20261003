@@ -64,6 +64,14 @@ type MemoryInstance struct {
 	ownerModuleEngine ModuleEngine
 
 	expBuffer experimental.LinearMemory
+
+	// growGeneration counts successful, non-zero Grow calls. It is read with
+	// atomic by ReadBorrow and updated at the end of Grow: under Mux for
+	// shared memory (which may grow concurrently), and at a point where Wasm
+	// is single-threaded otherwise. A borrowed view is only guaranteed valid
+	// while the generation observed at ReadBorrow time matches the current
+	// one.
+	growGeneration atomic.Uint64
 }
 
 // NewMemoryInstance creates a new instance based on the parameters in the SectionIDMemory.
@@ -163,6 +171,38 @@ func (m *MemoryInstance) Read(offset, byteCount uint32) ([]byte, bool) {
 		return nil, false
 	}
 	return m.Buffer[offset : offset+byteCount : offset+byteCount], true
+}
+
+// ReadCopy implements the same method as documented on api.Memory.
+func (m *MemoryInstance) ReadCopy(offset, byteCount uint32) ([]byte, bool) {
+	if !m.hasSize(offset, uint64(byteCount)) {
+		return nil, false
+	}
+	// uint64 end keeps the offset+byteCount addition overflow safe even when
+	// both arguments are near math.MaxUint32; hasSize above already proved
+	// end <= len(Buffer).
+	end := uint64(offset) + uint64(byteCount)
+	cp := make([]byte, byteCount)
+	copy(cp, m.Buffer[offset:end])
+	return cp, true
+}
+
+// ReadBorrow implements the same method as documented on api.Memory.
+func (m *MemoryInstance) ReadBorrow(offset, byteCount uint32) ([]byte, api.MemoryGeneration, bool) {
+	if !m.hasSize(offset, uint64(byteCount)) {
+		return nil, api.MemoryGeneration{}, false
+	}
+	end := uint64(offset) + uint64(byteCount)
+	buf := m.Buffer[offset:end:end]
+	return buf, internalapi.NewMemoryGeneration(m.growGeneration.Load()), true
+}
+
+// ReadBorrowStable implements the same method as documented on api.Memory.
+func (m *MemoryInstance) ReadBorrowStable(offset, byteCount uint32, gen api.MemoryGeneration) bool {
+	if internalapi.GrownMemoryGeneration(gen) != m.growGeneration.Load() {
+		return false
+	}
+	return m.hasSize(offset, uint64(byteCount))
 }
 
 // WriteByte implements the same method as documented on api.Memory.
@@ -276,6 +316,7 @@ func (m *MemoryInstance) Grow(delta uint32) (result uint32, ok bool) {
 			m.Buffer = m.Buffer[:MemoryPagesToBytesNum(newPages)]
 		}
 	}
+	m.growGeneration.Add(1)
 	m.ownerModuleEngine.MemoryGrown()
 	return currentPages, true
 }

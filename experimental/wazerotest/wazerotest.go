@@ -473,6 +473,10 @@ type Memory struct {
 	Min uint32
 	Max uint32
 
+	// growGeneration counts successful Grow calls that replaced Bytes, which
+	// disconnects any previously borrowed views.
+	growGeneration atomic.Uint64
+
 	// Lazily initialized when accessed through the module.
 	module *Module
 }
@@ -515,6 +519,16 @@ func (m *Memory) Pages() uint32 {
 
 func (m *Memory) Grow(deltaPages uint32) (previousPages uint32, ok bool) {
 	previousPages = m.Pages()
+	// A zero delta only reports the current size; it must not invalidate
+	// borrowed views.
+	if deltaPages == 0 {
+		return previousPages, true
+	}
+	// Do the addition in uint64 so a delta that would overflow the page count
+	// is rejected instead of silently shrinking the memory.
+	if uint64(previousPages)+uint64(deltaPages) > math.MaxUint32 {
+		return previousPages, false
+	}
 	numPages := previousPages + deltaPages
 	if m.Max != 0 && numPages > m.Max {
 		return previousPages, false
@@ -522,6 +536,7 @@ func (m *Memory) Grow(deltaPages uint32) (previousPages uint32, ok bool) {
 	bytes := make([]byte, PageSize*numPages)
 	copy(bytes, m.Bytes)
 	m.Bytes = bytes
+	m.growGeneration.Add(1)
 	return previousPages, true
 }
 
@@ -568,6 +583,38 @@ func (m *Memory) Read(offset, length uint32) ([]byte, bool) {
 		return nil, false
 	}
 	return m.Bytes[offset : offset+length : offset+length], true
+}
+
+// ReadCopy implements the same method as documented on api.Memory.
+func (m *Memory) ReadCopy(offset, length uint32) ([]byte, bool) {
+	if m.isOutOfRange(offset, length) {
+		return nil, false
+	}
+	// uint64 end keeps the offset+length addition overflow safe even when
+	// both arguments are near math.MaxUint32; isOutOfRange above already
+	// proved end <= len(Bytes).
+	end := uint64(offset) + uint64(length)
+	cp := make([]byte, length)
+	copy(cp, m.Bytes[offset:end])
+	return cp, true
+}
+
+// ReadBorrow implements the same method as documented on api.Memory.
+func (m *Memory) ReadBorrow(offset, length uint32) ([]byte, api.MemoryGeneration, bool) {
+	if m.isOutOfRange(offset, length) {
+		return nil, api.MemoryGeneration{}, false
+	}
+	end := uint64(offset) + uint64(length)
+	buf := m.Bytes[offset:end:end]
+	return buf, internalapi.NewMemoryGeneration(m.growGeneration.Load()), true
+}
+
+// ReadBorrowStable implements the same method as documented on api.Memory.
+func (m *Memory) ReadBorrowStable(offset, length uint32, gen api.MemoryGeneration) bool {
+	if internalapi.GrownMemoryGeneration(gen) != m.growGeneration.Load() {
+		return false
+	}
+	return !m.isOutOfRange(offset, length)
 }
 
 func (m *Memory) WriteByte(offset uint32, value byte) bool {
@@ -628,7 +675,10 @@ func (m *Memory) WriteString(offset uint32, value string) bool {
 
 func (m *Memory) isOutOfRange(offset, length uint32) bool {
 	size := m.Size()
-	return offset >= size || length > size || offset > (size-length)
+	// Match api.Memory's convention: a zero-length read at offset == size is
+	// legal (an empty slice), and the addition is done in uint64 to avoid
+	// overflow when both arguments are near math.MaxUint32.
+	return uint64(offset)+uint64(length) > uint64(size)
 }
 
 type memoryDefinition struct {
@@ -670,4 +720,5 @@ var (
 	_ api.Module   = (*Module)(nil)
 	_ api.Function = (*Function)(nil)
 	_ api.Global   = (*Global)(nil)
+	_ api.Memory   = (*Memory)(nil)
 )

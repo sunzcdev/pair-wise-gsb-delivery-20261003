@@ -499,6 +499,163 @@ func TestMemoryInstance_Read(t *testing.T) {
 	require.False(t, ok)
 }
 
+// newReadTestMemory builds a memory of the given number of pages with a
+// capacity equal to its size, so any Grow relocates the backing array.
+func newReadTestMemory(pages, max uint32) *MemoryInstance {
+	buf := make([]byte, MemoryPagesToBytesNum(pages), MemoryPagesToBytesNum(pages))
+	m := &MemoryInstance{Buffer: buf, Min: pages, Cap: pages, Max: max}
+	m.ownerModuleEngine = &mockModuleEngine{}
+	return m
+}
+
+func TestMemoryInstance_ReadCopy(t *testing.T) {
+	mem := newReadTestMemory(1, 2)
+	for i := range mem.Buffer {
+		mem.Buffer[i] = byte(i)
+	}
+
+	cp, ok := mem.ReadCopy(4, 4)
+	require.True(t, ok)
+	require.Equal(t, []byte{4, 5, 6, 7}, cp)
+
+	// The copy is owned: mutating it does not write through to the memory.
+	cp[0] = 0xff
+	require.Equal(t, byte(4), mem.Buffer[4])
+
+	// Mutating the original memory does not affect the copy.
+	mem.Buffer[5] = 0xfe
+	require.Equal(t, byte(5), cp[1])
+
+	// Growing the memory (which may relocate the backing array) keeps the
+	// copy intact.
+	before := append([]byte(nil), cp...)
+	_, ok = mem.Grow(1)
+	require.True(t, ok)
+	require.Equal(t, before, cp)
+
+	// Out of range.
+	_, ok = mem.ReadCopy(uint32(len(mem.Buffer))-2, 4)
+	require.False(t, ok)
+
+	// Zero-length read at the end of memory is legal, like Read.
+	end := uint32(len(mem.Buffer))
+	empty, ok := mem.ReadCopy(end, 0)
+	require.True(t, ok)
+	require.Equal(t, 0, len(empty))
+	require.NotNil(t, empty)
+
+	// Zero-length read past the end is still out of range.
+	_, ok = mem.ReadCopy(end+1, 0)
+	require.False(t, ok)
+
+	// Offset + byteCount overflow must be rejected instead of wrapping.
+	_, ok = mem.ReadCopy(math.MaxUint32, 2)
+	require.False(t, ok)
+	_, ok = mem.ReadCopy(math.MaxUint32, math.MaxUint32)
+	require.False(t, ok)
+}
+
+func TestMemoryInstance_ReadBorrow(t *testing.T) {
+	mem := newReadTestMemory(1, 3)
+	for i := range mem.Buffer {
+		mem.Buffer[i] = byte(i)
+	}
+
+	buf, gen, ok := mem.ReadBorrow(4, 4)
+	require.True(t, ok)
+	require.Equal(t, []byte{4, 5, 6, 7}, buf)
+
+	// A borrow keeps Read's write-through semantics.
+	buf[0] = 0xff
+	require.Equal(t, byte(0xff), mem.Buffer[4])
+	mem.Buffer[5] = 0xfe
+	require.Equal(t, byte(0xfe), buf[1])
+
+	// The view is stable until a real grow happens.
+	require.True(t, mem.ReadBorrowStable(4, 4, gen))
+
+	// Grow(0) reports the current size and does not change the generation.
+	_, ok = mem.Grow(0)
+	require.True(t, ok)
+	require.True(t, mem.ReadBorrowStable(4, 4, gen))
+
+	// A failed grow (beyond max) does not invalidate the view.
+	_, ok = mem.Grow(10)
+	require.False(t, ok)
+	require.True(t, mem.ReadBorrowStable(4, 4, gen))
+
+	// A successful grow invalidates every previously borrowed view.
+	_, ok = mem.Grow(1)
+	require.True(t, ok)
+	require.False(t, mem.ReadBorrowStable(4, 4, gen))
+
+	// Borrowing again after the grow yields a fresh, stable generation.
+	buf2, gen2, ok := mem.ReadBorrow(4, 4)
+	require.True(t, ok)
+	require.Equal(t, []byte{0xff, 0xfe, 6, 7}, buf2)
+	require.True(t, gen != gen2)
+	require.True(t, mem.ReadBorrowStable(4, 4, gen2))
+
+	// An old generation stays stale even after re-borrowing.
+	require.False(t, mem.ReadBorrowStable(4, 4, gen))
+
+	// Out of range.
+	_, _, ok = mem.ReadBorrow(uint32(len(mem.Buffer))-2, 4)
+	require.False(t, ok)
+
+	// Zero-length read at the end of memory is legal, like Read.
+	end := uint32(len(mem.Buffer))
+	empty, zeroGen, ok := mem.ReadBorrow(end, 0)
+	require.True(t, ok)
+	require.Equal(t, 0, len(empty))
+	require.NotNil(t, empty)
+	require.True(t, mem.ReadBorrowStable(end, 0, zeroGen))
+
+	// Zero-length read past the end is still out of range.
+	_, _, ok = mem.ReadBorrow(end+1, 0)
+	require.False(t, ok)
+
+	// A zero-length borrow at the end becomes unstable after growth, because
+	// its offset is now inside the new range only coincidentally: the backing
+	// view was taken at the old boundary.
+	require.True(t, mem.ReadBorrowStable(end, 0, zeroGen))
+	_, ok = mem.Grow(1)
+	require.True(t, ok)
+	require.False(t, mem.ReadBorrowStable(end, 0, zeroGen))
+
+	// Offset + byteCount overflow must be rejected instead of wrapping.
+	_, _, ok = mem.ReadBorrow(math.MaxUint32, 2)
+	require.False(t, ok)
+	require.False(t, mem.ReadBorrowStable(math.MaxUint32, 2, gen2))
+}
+
+func TestMemoryInstance_ReadBorrowStable_GrowRelocates(t *testing.T) {
+	// Capacity of one page forces a new backing array on grow beyond cap.
+	mem := newReadTestMemory(1, 3)
+
+	buf, gen, ok := mem.ReadBorrow(0, 4)
+	require.True(t, ok)
+	require.True(t, mem.ReadBorrowStable(0, 4, gen))
+
+	// Simulate a host goroutine that retained the borrow: writes through it
+	// before the grow hit the live memory.
+	buf[0] = 1
+	require.Equal(t, byte(1), mem.Buffer[0])
+
+	_, ok = mem.Grow(1)
+	require.True(t, ok)
+
+	// After the grow the stale view must not be used; ReadBorrowStable
+	// reports the invalidation even though the range itself is in bounds.
+	require.False(t, mem.ReadBorrowStable(0, 4, gen))
+
+	fresh, freshGen, ok := mem.ReadBorrow(0, 4)
+	require.True(t, ok)
+	require.True(t, mem.ReadBorrowStable(0, 4, freshGen))
+	// Data was copied into the relocated buffer by Grow.
+	require.Equal(t, byte(1), fresh[0])
+}
+
 func TestMemoryInstance_WriteUint16Le(t *testing.T) {
 	memory := &MemoryInstance{Buffer: make([]byte, 100)}
 
@@ -874,6 +1031,35 @@ func TestNewMemoryInstance_Shared(t *testing.T) {
 			require.True(t, m.Shared)
 		})
 	}
+}
+
+func TestMemoryInstance_ReadBorrow_SharedGrow(t *testing.T) {
+	// Shared memory is pre-allocated up to Max, and Grow only changes its
+	// length in place. The generation must still advance so borrowed views
+	// know a grow happened, even though the backing address is stable.
+	m := NewMemoryInstance(
+		&Memory{Min: 1, Cap: 2, Max: 2, IsMaxEncoded: true, IsShared: true},
+		nil, &mockModuleEngine{},
+	)
+	require.True(t, m.Shared)
+
+	_, gen, ok := m.ReadBorrow(0, 4)
+	require.True(t, ok)
+	require.True(t, m.ReadBorrowStable(0, 4, gen))
+
+	// Grow within the pre-allocated maximum changes only the length.
+	prev, ok := m.Grow(1)
+	require.True(t, ok)
+	require.Equal(t, uint32(1), prev)
+
+	// The range is still in bounds, but the generation moved: the borrow is
+	// known to span a grow and must be refreshed.
+	require.False(t, m.ReadBorrowStable(0, 4, gen))
+
+	_, gen2, ok := m.ReadBorrow(0, 4)
+	require.True(t, ok)
+	require.True(t, gen != gen2)
+	require.True(t, m.ReadBorrowStable(0, 4, gen2))
 }
 
 func TestMemoryInstance_WaitNotifyOnce(t *testing.T) {
