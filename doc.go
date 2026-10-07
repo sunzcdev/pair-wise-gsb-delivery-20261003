@@ -9,4 +9,7 @@
 // Also, aconfig is dependency-free, file decoders are used as separate modules (submodules to be exact) and are added to your go.mod only when used.
 //
 // Loader configuration (`Config` type) has different ways to configure loader, to skip some sources, define prefixes, fail on unknown params.
+// Planner compares two already parsed configurations and reports which field
+// changes can be hot-reloaded, which require a restart and which are forbidden,
+// honoring fields that must switch together as a group.
 package aconfig
