@@ -70,3 +70,32 @@ func ExampleDecodeIntWithPrecision() {
 	fmt.Printf("%.3f %.3f\n", lat, lng)
 	// Output: 48.600 2.000
 }
+
+func ExamplePrefixSet() {
+	regions := geohash.NewPrefixSet()
+
+	// Add the 32 one-character children of "0"; they fold into "0".
+	const alphabet = "0123456789bcdefghjkmnpqrstuvwxyz"
+	for i := 0; i < len(alphabet); i++ {
+		regions.Add("0" + string(alphabet[i]))
+	}
+	fmt.Println(regions.Len(), regions.Contains("0"))
+
+	// A descendant of a stored prefix is redundant.
+	regions.Add("0pb")
+	fmt.Println(regions.Len())
+
+	// Subtracting a cell expands the parent only to that cell's depth.
+	regions.Subtract("0pb")
+	fmt.Println(regions.Contains("0p0"), regions.Contains("0pb"))
+
+	// Adding the cell back restores the original coverage.
+	regions.Add("0pb")
+	fmt.Println(regions.Prefixes())
+
+	// Output:
+	// 1 true
+	// 1
+	// true false
+	// [0]
+}
