@@ -175,9 +175,14 @@ func (p *Parser[G]) ParseFromLexer(lex *lexer.PeekingLexer, options ...ParseOpti
 	}
 	// If the grammar implements Parseable, use it.
 	if parseable, ok := any(v).(Parseable); ok {
-		return v, p.rootParseable(&ctx, parseable)
+		err = p.rootParseable(&ctx, parseable)
+	} else {
+		err = p.parseOne(&ctx, parseNode, rv)
 	}
-	return v, p.parseOne(&ctx, parseNode, rv)
+	if err == nil && ctx.sourceView != nil {
+		ctx.sourceView.publish(&ctx)
+	}
+	return v, err
 }
 
 func (p *Parser[G]) setCaseInsensitiveTokens() {

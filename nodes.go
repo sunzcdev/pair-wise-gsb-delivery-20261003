@@ -153,6 +153,10 @@ func (s *strct) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Value, 
 	sv := reflect.New(s.typ).Elem()
 	start := ctx.RawCursor()
 	applyStart := len(ctx.apply)
+	var startPos lexer.Position
+	if ctx.sourceView != nil {
+		startPos = ctx.RawPeek().Pos
+	}
 	t := ctx.Peek()
 	s.maybeInjectStartToken(t, sv)
 	if out, err = s.expr.Parse(ctx, sv); err != nil {
@@ -169,6 +173,14 @@ func (s *strct) Parse(ctx *parseContext, _ reflect.Value) (out []reflect.Value, 
 	t = ctx.RawPeek()
 	s.maybeInjectEndToken(t, sv)
 	s.maybeInjectTokens(ctx.Range(start, end), sv)
+	if ctx.sourceView != nil {
+		ctx.sourceRecords = append(ctx.sourceRecords, SourceRecord{
+			Type:  s.typ,
+			Range: SourceRange{Start: startPos, End: t.Pos},
+			start: start,
+			end:   end,
+		})
+	}
 	return []reflect.Value{sv}, ctx.ApplyFrom(applyStart)
 }
 

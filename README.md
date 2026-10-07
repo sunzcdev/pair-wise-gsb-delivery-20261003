@@ -622,6 +622,13 @@ The third way is to elide comment tokens and capture them where they're
 semantically meaningful, such as for documentation comments. Participle supports
 explicitly matching elided tokens for this purpose.
 
+Finally, for tooling that needs to map AST nodes back to the original source
+without changing the grammar at all - eg. an editor that must preserve comments
+and whitespace - the `RecordSource()` parse option records the source range of
+every successful production into a `SourceView`. Elided tokens within each
+recorded range can then be queried, and slicing the input with a range
+reproduces the corresponding source text byte-for-byte.
+
 ## Limitations
 
 Internally, Participle is a recursive descent parser with backtracking (see

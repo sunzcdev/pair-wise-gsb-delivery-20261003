@@ -28,6 +28,8 @@ type parseContext struct {
 	symbols           map[lexer.TokenType]string
 	apply             []*contextFieldSet
 	allowTrailing     bool
+	sourceView        *SourceView
+	sourceRecords     []SourceRecord
 }
 
 func newParseContext(lex *lexer.PeekingLexer, def lexer.Definition, lookahead int, caseInsensitive map[lexer.TokenType]bool) parseContext {
@@ -80,6 +82,7 @@ func (p *parseContext) ApplyFrom(start int) error {
 // Branch accepts the branch as the correct branch.
 func (p *parseContext) Accept(branch *parseContext) {
 	p.apply = append(p.apply, branch.apply...)
+	p.sourceRecords = append(p.sourceRecords, branch.sourceRecords...)
 	p.PeekingLexer = branch.PeekingLexer
 	if branch.deepestErrorDepth >= p.deepestErrorDepth {
 		p.deepestErrorDepth = branch.deepestErrorDepth
@@ -92,6 +95,7 @@ func (p *parseContext) Branch() *parseContext {
 	branch := &parseContext{}
 	*branch = *p
 	branch.apply = nil
+	branch.sourceRecords = nil
 	return branch
 }
 

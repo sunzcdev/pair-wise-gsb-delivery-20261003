@@ -48,6 +48,27 @@ func (p *PeekingLexer) Range(rawStart, rawEnd RawCursor) []Token {
 	return p.tokens[rawStart:rawEnd]
 }
 
+// Tokens returns all tokens in the stream, including elided tokens and the
+// trailing EOF token.
+//
+// The returned slice is shared with the lexer and must not be mutated.
+func (p *PeekingLexer) Tokens() []Token {
+	return p.tokens
+}
+
+// ElideTypes returns the set of token types elided from this stream, or nil
+// if no tokens are elided.
+func (p *PeekingLexer) ElideTypes() map[TokenType]bool {
+	if p.elide == nil {
+		return nil
+	}
+	out := make(map[TokenType]bool, len(p.elide))
+	for t := range p.elide {
+		out[t] = true
+	}
+	return out
+}
+
 // Cursor position in tokens, excluding elided tokens.
 func (c Checkpoint) Cursor() int {
 	return c.cursor
