@@ -1,3 +1,19 @@
+Release 1.9.0
+=============
+
+**Changes**
+
+* Added the `Transplant`, `TransplantAt`, `TransplantSettings`, and
+  `QNameAttrs` APIs for namespace-safe subtree transplantation. Moving a
+  subtree to another part of a document now preserves the expanded meaning
+  of element and attribute names even when the destination binds the same
+  prefix to a different namespace URI or shadows the default namespace.
+  Registered QName-valued attributes (such as `xsi:type`) are rewritten
+  automatically, and both copy and move modes are supported.
+* Fixed a latent bug in `Element.Copy` and `Document.Copy` where copied
+  attributes retained a pointer to their original element, causing
+  `Attr.NamespaceURI` to resolve against the wrong tree.
+
 Release 1.8.1
 =============
 

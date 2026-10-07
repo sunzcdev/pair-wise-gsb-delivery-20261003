@@ -201,6 +201,36 @@ These are just a few examples of the things the etree package can do. See the
 [documentation](http://godoc.org/github.com/beevik/etree) for a complete
 description of its capabilities.
 
+### Moving a subtree between namespaces
+
+Moving an element subtree with `AddChild` can silently change the meaning of
+its names: a prefix such as `p` may be bound to one namespace URI in the
+source tree but to a different URI by an ancestor of the destination. The
+`Transplant` and `TransplantAt` functions build a namespace-safe copy that
+keeps every expanded element and attribute name unchanged, adding namespace
+declarations only where needed and resolving prefix conflicts and default
+namespace shadowing.
+
+Ordinary attribute values are left untouched. Register the attributes whose
+values contain QNames (such as `xsi:type`) so their prefixes are rewritten
+too:
+
+```go
+qna := etree.NewQNameAttrs()
+qna.Register("http://www.w3.org/2001/XMLSchema-instance", "type")
+
+// Copy (the source subtree is left in place).
+moved, err := etree.Transplant(target, source,
+    &etree.TransplantSettings{QNameAttrs: qna})
+
+// Move (the source subtree is removed from its original parent).
+moved, err = etree.Transplant(target, source,
+    &etree.TransplantSettings{Move: true, QNameAttrs: qna})
+```
+
+If the transplant fails, both the source and the destination trees remain
+unchanged.
+
 ### Contributing
 
 This project accepts contributions. Just fork the repo and submit a pull
