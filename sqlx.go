@@ -314,6 +314,14 @@ func (db *DB) NamedExec(query string, arg interface{}) (sql.Result, error) {
 	return NamedExec(db, query, arg)
 }
 
+// NamedExecChunks runs a slice-backed named INSERT in chunks.  Each statement
+// runs on the DB independently, so the returned result reports the range of
+// rows that succeeded and the failing range without promising atomicity.  See
+// the package level NamedExecChunks for details and the supported query shape.
+func (db *DB) NamedExecChunks(query string, arg interface{}, maxParams int) (ChunkExecResult, error) {
+	return namedExecChunks(db, BindType(db.driverName), db.Mapper, query, arg, maxParams)
+}
+
 // Select using this DB.
 // Any placeholder parameters are replaced with supplied args.
 func (db *DB) Select(dest interface{}, query string, args ...interface{}) error {
@@ -426,6 +434,14 @@ func (tx *Tx) NamedQuery(query string, arg interface{}) (*Rows, error) {
 // Any named placeholder parameters are replaced with fields from arg.
 func (tx *Tx) NamedExec(query string, arg interface{}) (sql.Result, error) {
 	return NamedExec(tx, query, arg)
+}
+
+// NamedExecChunks runs a slice-backed named INSERT in chunks using the
+// existing transaction.  The transaction is never committed or rolled back by
+// this method; the caller retains control of it.  See the package level
+// NamedExecChunks for details and the supported query shape.
+func (tx *Tx) NamedExecChunks(query string, arg interface{}, maxParams int) (ChunkExecResult, error) {
+	return namedExecChunks(tx, BindType(tx.driverName), tx.Mapper, query, arg, maxParams)
 }
 
 // Select within a transaction.

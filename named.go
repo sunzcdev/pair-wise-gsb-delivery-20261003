@@ -456,3 +456,28 @@ func NamedExec(e Ext, query string, arg interface{}) (sql.Result, error) {
 	}
 	return e.Exec(q, args...)
 }
+
+// NamedExecChunks runs a slice-backed named INSERT in multiple statements so
+// that no single statement exceeds maxParams bindvars.  It is the chunked
+// counterpart of NamedExec.
+//
+// The query must contain a single, reliably identifiable VALUES row template,
+// for example:
+//
+//	INSERT INTO t (a, b) VALUES (:a, :b)
+//
+// Bindvars outside the VALUES template are allowed and are bound once per
+// statement from the first row of that statement; a name may appear more than
+// once in a row.  Naming, input order and the driver bindvar format are
+// preserved.  Queries that cannot be split reliably return
+// ErrUnsupportedChunkQuery; a single row that alone exceeds maxParams returns
+// ErrChunkRowTooLarge.
+//
+// When e is a *Tx, the caller's transaction is used as-is and never committed
+// or rolled back here.  When e is a *DB, each statement runs independently;
+// the returned result reports the range of inputs that succeeded and the
+// failing range, with no guarantee of atomicity.  Execution stops at the first
+// failed statement.
+func NamedExecChunks(e Ext, query string, arg interface{}, maxParams int) (ChunkExecResult, error) {
+	return namedExecChunks(e, BindType(e.DriverName()), mapperFor(e), query, arg, maxParams)
+}

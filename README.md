@@ -211,3 +211,20 @@ func main() {
         VALUES (:first_name, :last_name, :email)`, personMaps)
 }
 ```
+
+Large slices may exceed the driver's bindvar limit.  `NamedExecChunks` splits
+the expansion into several statements, each carrying at most `maxParams`
+bindvars.  It needs a single `VALUES` row template; bindvars may also appear
+outside `VALUES`, and a name may repeat within a row:
+
+```go
+// Each statement carries at most 65535 bindvars.  On a *DB statements run
+// independently, so res reports the rows that succeeded and the failing range.
+res, err := db.NamedExecChunks(`INSERT INTO person (first_name, last_name, email)
+    VALUES (:first_name, :last_name, :email)`, personStructs, 65535)
+
+// Inside a transaction the existing tx is reused and never committed or
+// rolled back by NamedExecChunks.
+tx, _ := db.Beginx()
+res, err = tx.NamedExecChunks(query, personStructs, 65535)
+```
