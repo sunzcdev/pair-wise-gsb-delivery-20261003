@@ -36,6 +36,26 @@ type Stream struct {
 	*stream
 }
 
+// Phase represents a lifecycle milestone of a stream.
+//
+// Phases form a bitmask that advances monotonically: once a phase bit
+// is set it is never cleared, and each phase notification fires exactly
+// once. PhaseLocalWriteDone and PhasePeerWriteDone may be reached in
+// either order; PhaseClosed is always reached last.
+type Phase uint32
+
+const (
+	// PhaseLocalWriteDone is reached when the local write side has been
+	// closed via CloseWrite or Close, i.e. local data has been fully sent.
+	PhaseLocalWriteDone Phase = 1 << iota
+	// PhasePeerWriteDone is reached when the peer has finished writing,
+	// i.e. a FIN has been received from the remote side.
+	PhasePeerWriteDone
+	// PhaseClosed is reached when the stream has been fully closed and
+	// its resources reclaimed by the session.
+	PhaseClosed
+)
+
 // Stream implements net.Conn
 type stream struct {
 	id   uint32 // Stream identifier
@@ -61,6 +81,9 @@ type stream struct {
 	// half-close support: local write closed (sent FIN)
 	chWriteClosed   chan struct{}
 	writeClosedOnce sync.Once // Ensures chWriteClosed is closed only once
+
+	// lifecycle phases reached so far (bitmask of Phase, monotonic)
+	phase uint32
 
 	// read/write deadline
 	readDeadline  atomic.Value
@@ -649,6 +672,7 @@ func (s *stream) CloseWrite() error {
 	var once bool
 	s.writeClosedOnce.Do(func() {
 		close(s.chWriteClosed)
+		s.setPhase(PhaseLocalWriteDone)
 		once = true
 	})
 
@@ -673,6 +697,7 @@ func (s *stream) Close() error {
 	var once bool
 	s.dieOnce.Do(func() {
 		close(s.die)
+		s.setPhase(PhaseClosed)
 		once = true
 	})
 
@@ -683,6 +708,7 @@ func (s *stream) Close() error {
 	// also close the write side if not already closed
 	s.writeClosedOnce.Do(func() {
 		close(s.chWriteClosed)
+		s.setPhase(PhaseLocalWriteDone)
 	})
 
 	// send FIN in order
@@ -700,6 +726,122 @@ func (s *stream) Close() error {
 // when the stream is to be closed.
 func (s *stream) GetDieCh() <-chan struct{} {
 	return s.die
+}
+
+// setPhase marks the given phase as reached. It is idempotent and the
+// phase bitmask only ever gains bits, so phases advance monotonically.
+func (s *stream) setPhase(p Phase) {
+	for {
+		old := atomic.LoadUint32(&s.phase)
+		if old|uint32(p) == old {
+			return
+		}
+		if atomic.CompareAndSwapUint32(&s.phase, old, old|uint32(p)) {
+			return
+		}
+	}
+}
+
+// Phase returns the lifecycle phases the stream has reached so far.
+// The returned bitmask is monotonic: once a phase bit is set it is
+// never cleared. A set bit implies the corresponding PhaseChan
+// notification has already fired.
+func (s *stream) Phase() Phase {
+	return Phase(atomic.LoadUint32(&s.phase))
+}
+
+// PhaseChan returns a read-only channel that is closed exactly once when
+// the stream reaches the given phase. The argument must be exactly one of
+// PhaseLocalWriteDone, PhasePeerWriteDone or PhaseClosed; for any other
+// value nil is returned.
+//
+// The returned channel is owned by the stream's existing half-close
+// machinery: observing a phase neither spawns goroutines nor keeps the
+// stream alive, and never relies on finalizers.
+func (s *stream) PhaseChan(p Phase) <-chan struct{} {
+	switch p {
+	case PhaseLocalWriteDone:
+		return s.chWriteClosed
+	case PhasePeerWriteDone:
+		return s.chFinEvent
+	case PhaseClosed:
+		return s.die
+	}
+	return nil
+}
+
+// WaitPhase blocks until all of the given phases have been reached and
+// returns nil. If the stream or its session terminates before that (e.g.
+// the underlying connection fails), WaitPhase returns the error that
+// terminated it instead of blocking forever. Phases already reached
+// before termination still report success.
+func (s *stream) WaitPhase(p Phase) error {
+	if p&PhaseLocalWriteDone != 0 {
+		if err := s.waitPhase(s.chWriteClosed); err != nil {
+			return err
+		}
+	}
+	if p&PhasePeerWriteDone != 0 {
+		if err := s.waitPhase(s.chFinEvent); err != nil {
+			return err
+		}
+	}
+	if p&PhaseClosed != 0 {
+		if err := s.waitPhase(s.die); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitPhase blocks until ch is closed or the stream/session terminates.
+func (s *stream) waitPhase(ch <-chan struct{}) error {
+	select {
+	case <-ch:
+		return nil
+	default:
+	}
+
+	select {
+	case <-ch:
+		return nil
+	case <-s.die:
+	case <-s.sess.chSocketReadError:
+	case <-s.sess.chSocketWriteError:
+	case <-s.sess.chProtoError:
+	case <-s.sess.die:
+	}
+
+	// The phase may have completed concurrently with the termination
+	// signal; a completed phase always reports success.
+	select {
+	case <-ch:
+		return nil
+	default:
+		return s.phaseErr()
+	}
+}
+
+// phaseErr returns the reason the stream terminated before reaching a
+// phase: the underlying connection error if there is one, otherwise
+// io.ErrClosedPipe.
+func (s *stream) phaseErr() error {
+	select {
+	case <-s.sess.chSocketReadError:
+		return s.sess.socketReadError.Load().(error)
+	default:
+	}
+	select {
+	case <-s.sess.chSocketWriteError:
+		return s.sess.socketWriteError.Load().(error)
+	default:
+	}
+	select {
+	case <-s.sess.chProtoError:
+		return s.sess.protoError.Load().(error)
+	default:
+	}
+	return io.ErrClosedPipe
 }
 
 // SetReadDeadline sets the read deadline as defined by
@@ -734,7 +876,12 @@ func (s *stream) SetDeadline(t time.Time) error {
 }
 
 // session closes
-func (s *stream) sessionClose() { s.dieOnce.Do(func() { close(s.die) }) }
+func (s *stream) sessionClose() {
+	s.dieOnce.Do(func() {
+		close(s.die)
+		s.setPhase(PhaseClosed)
+	})
+}
 
 // LocalAddr satisfies net.Conn interface
 func (s *stream) LocalAddr() net.Addr {
@@ -808,6 +955,7 @@ func (s *stream) update(consumed uint32, window uint32) {
 func (s *stream) fin() {
 	s.finEventOnce.Do(func() {
 		close(s.chFinEvent)
+		s.setPhase(PhasePeerWriteDone)
 	})
 	s.tryHalfCloseCleanup()
 }
@@ -828,6 +976,7 @@ func (s *stream) tryHalfCloseCleanup() {
 
 	s.dieOnce.Do(func() {
 		close(s.die)
+		s.setPhase(PhaseClosed)
 	})
 	s.sess.streamClosed(s.id)
 }
