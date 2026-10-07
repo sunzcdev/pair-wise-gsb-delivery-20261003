@@ -774,6 +774,69 @@ func (resp *Response) BodyUncompressedWithLimit(maxBodySize int) ([]byte, error)
 	}
 }
 
+// BodyUncompressedStream returns a streaming decoder for the request body
+// based on its 'Content-Encoding' header. It is the streaming counterpart of
+// [Request.BodyUncompressed]: the whole body is not buffered, so it also
+// works for large request bodies.
+//
+// maxEncodedSize bounds the number of encoded bytes consumed from the body;
+// maxDecodedSize bounds the number of decoded bytes returned by the reader.
+// A non-positive value disables the respective bound. Exceeding them returns
+// [ErrEncodedBodyTooLarge] or [ErrBodyTooLarge] respectively, reported while
+// reading rather than after the whole body has been buffered.
+//
+// The returned reader must be closed. When the request has a body stream,
+// closing the reader closes the body stream too; the connection it came from
+// is only reusable if the original response boundary was read completely.
+// Use [ContentEncodingReader.FullyConsumed] to tell.
+func (req *Request) BodyUncompressedStreamWithLimit(maxEncodedSize, maxDecodedSize int64) (io.ReadCloser, error) {
+	body := req.bodyStream
+	if body == nil {
+		body = bytes.NewReader(req.Body())
+	}
+	return NewContentEncodingReader(body, string(req.Header.ContentEncoding()), maxEncodedSize, maxDecodedSize)
+}
+
+// BodyUncompressedStream returns a streaming decoder for the request body
+// without limiting encoded or decoded size.
+//
+// See [Request.BodyUncompressedStreamWithLimit] for details.
+func (req *Request) BodyUncompressedStream() (io.ReadCloser, error) {
+	return req.BodyUncompressedStreamWithLimit(0, 0)
+}
+
+// BodyUncompressedStream returns a streaming decoder for the response body
+// based on its 'Content-Encoding' header. It is the streaming counterpart of
+// [Response.BodyUncompressed]: the whole body is not buffered, so it also
+// works for large responses.
+//
+// maxEncodedSize bounds the number of encoded bytes consumed from the body;
+// maxDecodedSize bounds the number of decoded bytes returned by the reader.
+// A non-positive value disables the respective bound. Exceeding them returns
+// [ErrEncodedBodyTooLarge] or [ErrBodyTooLarge] respectively, reported while
+// reading rather than after the whole body has been buffered.
+//
+// The returned reader must be closed. When the response has a body stream
+// (for example when [HostClient] streamed the response), closing the reader
+// closes the body stream too; the connection it came from is only reusable if
+// the original response boundary was read completely. Use
+// [ContentEncodingReader.FullyConsumed] to tell.
+func (resp *Response) BodyUncompressedStreamWithLimit(maxEncodedSize, maxDecodedSize int64) (io.ReadCloser, error) {
+	body := resp.bodyStream
+	if body == nil {
+		body = bytes.NewReader(resp.Body())
+	}
+	return NewContentEncodingReader(body, string(resp.Header.ContentEncoding()), maxEncodedSize, maxDecodedSize)
+}
+
+// BodyUncompressedStream returns a streaming decoder for the response body
+// without limiting encoded or decoded size.
+//
+// See [Response.BodyUncompressedStreamWithLimit] for details.
+func (resp *Response) BodyUncompressedStream() (io.ReadCloser, error) {
+	return resp.BodyUncompressedStreamWithLimit(0, 0)
+}
+
 // BodyWriteTo writes request body to w.
 func (req *Request) BodyWriteTo(w io.Writer) error {
 	if req.bodyStream != nil {
