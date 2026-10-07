@@ -150,6 +150,44 @@ func NeighborsIntWithPrecision(hash uint64, bits uint) []uint64
 NeighborsIntWithPrecision returns a slice of uint64s that correspond to the
 provided hash's neighbors at the given precision.
 
+#### func  TraversePolyline
+
+```go
+func TraversePolyline(points []TraversePoint, bits, limit uint) (TraverseResult, error)
+```
+TraversePolyline returns every fixed-precision integer geohash cell intersected
+by the polyline formed by points, in first-contact order.
+
+Unlike encoding each sampled vertex, this walks the line segments analytically,
+so cells crossed between two sample points are never lost. The output is
+deduplicated while preserving first-contact order.
+
+bits is the integer-geohash precision (as used by EncodeIntWithPrecision),
+which fixes the grid: latitude is divided into 2^floor(bits/2) rows and
+longitude into 2^ceil(bits/2) columns. bits must be between 2 and 64.
+
+Conventions:
+
+- Longitude is wrapped along the shortest crossing direction. A segment whose
+longitude difference is exactly half the globe (180 degrees) is treated as
+travelling eastward.
+- A point or segment lying on a grid line belongs to both adjacent cells.
+- At a grid corner, the up to four incident cells are all emitted, ordered by
+(column, row) index.
+- Repeated or consecutive identical vertices are handled as a single contact.
+
+limit, when greater than zero, caps the number of returned cells. If more than
+limit distinct cells are intersected, TraverseResult.Truncated is set to true.
+A zero limit means unlimited.
+
+#### func  TraversePolylineString
+
+```go
+func TraversePolylineString(points []TraversePoint, chars, limit uint) (cells []string, truncated bool, err error)
+```
+TraversePolylineString is TraversePolyline with the cells returned as string
+geohashes of the given precision in characters (max 12).
+
 #### func  Validate
 
 ```go
@@ -236,3 +274,32 @@ const (
 )
 ```
 Cardinal and intercardinal directions
+
+#### type TraversePoint
+
+```go
+type TraversePoint struct {
+	Lat float64
+	Lng float64
+}
+```
+
+TraversePoint is one vertex of a polyline given as (latitude, longitude) in
+degrees.
+
+#### type TraverseResult
+
+```go
+type TraverseResult struct {
+	Cells     []uint64
+	Truncated bool
+}
+```
+
+TraverseResult reports the outcome of a polyline grid traversal.
+
+Cells holds every grid cell intersected by the polyline, deduplicated and in
+first-contact order: a cell appears at the position where the polyline first
+touches it. When Truncated is true, the caller supplied a limit and the
+traversal produced more cells than that limit; in that case Cells contains only
+the first limit entries and the result must not be treated as complete.
