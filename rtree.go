@@ -46,11 +46,12 @@ type numeric interface {
 }
 
 type RTreeGN[N numeric, T any] struct {
-	icow  uint64
-	count int
-	rect  rect[N]
-	root  *node[N, T]
-	qpool *sync.Pool
+	icow     uint64
+	count    int
+	rect     rect[N]
+	root     *node[N, T]
+	qpool    *sync.Pool
+	weightFn func(T) int64
 }
 
 type rect[N numeric] struct {
@@ -82,10 +83,12 @@ const (
 )
 
 type node[N numeric, T any] struct {
-	icow  uint64
-	kind  kind
-	count int16
-	rects [maxEntries]rect[N]
+	icow      uint64
+	kind      kind
+	count     int16
+	subCount  int64 // number of items in the subtree rooted at this node
+	subWeight int64 // total weight of the items in the subtree
+	rects     [maxEntries]rect[N]
 }
 
 func (n *node[N, T]) leaf() bool {
@@ -138,6 +141,28 @@ func (n *node[N, T]) rect() rect[N] {
 
 // Insert data into tree
 func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
+	if err := tr.InsertChecked(min, max, data); err != nil {
+		panic(err)
+	}
+}
+
+// InsertChecked is the same as Insert but returns an error instead of
+// panicking when the weight aggregation cannot be maintained, eg. when the
+// weight function returns a negative weight or the subtree weight total
+// overflows an int64.
+func (tr *RTreeGN[N, T]) InsertChecked(min, max [2]N, data T) error {
+	w := tr.weightOf(data)
+	if w < 0 {
+		return ErrNegativeWeight
+	}
+	if tr.root != nil {
+		// The root holds the largest subtree total, and all weights are
+		// non-negative, so if the root total cannot overflow then no other
+		// node total along the insert path can overflow either.
+		if _, ok := checkedAddInt64(tr.root.subWeight, w); !ok {
+			return ErrWeightOverflow
+		}
+	}
 	ir := rect[N]{min, max}
 	if tr.root == nil {
 		if tr.qpool == nil {
@@ -149,7 +174,10 @@ func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
 		tr.rect = ir
 	}
 	tr.cow(&tr.root)
-	split, grown := tr.nodeInsert(&tr.rect, tr.root, &ir, data)
+	split, grown, err := tr.nodeInsert(&tr.rect, tr.root, &ir, data, w)
+	if err != nil {
+		return err
+	}
 	if split {
 		left := tr.root
 		right := tr.splitNode(tr.rect, left)
@@ -159,11 +187,13 @@ func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
 		tr.root.children()[0] = left
 		tr.root.children()[1] = right
 		tr.root.count = 2
-		tr.Insert(min, max, data)
+		tr.root.subCount = left.subCount + right.subCount
+		tr.root.subWeight = left.subWeight + right.subWeight
+		err := tr.InsertChecked(min, max, data)
 		if orderBranches {
 			tr.root.sort()
 		}
-		return
+		return err
 	}
 	if grown {
 		tr.rect.expand(&ir)
@@ -172,6 +202,7 @@ func (tr *RTreeGN[N, T]) Insert(min, max [2]N, data T) {
 		}
 	}
 	tr.count++
+	return nil
 }
 
 func (tr *RTreeGN[N, T]) splitNode(r rect[N], left *node[N, T],
@@ -230,19 +261,25 @@ func (n *node[N, T]) rsearch(key N) int {
 }
 
 func (tr *RTreeGN[N, T]) nodeInsert(nr *rect[N], n *node[N, T], ir *rect[N],
-	data T,
-) (split, grown bool) {
+	data T, w int64,
+) (split, grown bool, err error) {
 	if n.leaf() {
 		if n.count == maxEntries {
-			return true, false
+			return true, false, nil
+		}
+		subWeight, ok := checkedAddInt64(n.subWeight, w)
+		if !ok {
+			return false, false, ErrWeightOverflow
 		}
 		items := n.items()
 		index := int(n.count)
 		n.rects[index] = *ir
 		items[index] = data
 		n.count++
+		n.subCount++
+		n.subWeight = subWeight
 		grown = !nr.contains(ir)
-		return false, grown
+		return false, grown, nil
 	}
 
 	// Choose a subtree
@@ -269,10 +306,14 @@ func (tr *RTreeGN[N, T]) nodeInsert(nr *rect[N], n *node[N, T], ir *rect[N],
 
 	children := n.children()
 	tr.cow(&children[index])
-	split, grown = tr.nodeInsert(&n.rects[index], children[index], ir, data)
+	split, grown, err = tr.nodeInsert(&n.rects[index], children[index], ir,
+		data, w)
+	if err != nil {
+		return false, false, err
+	}
 	if split {
 		if n.count == maxEntries {
-			return true, false
+			return true, false, nil
 		}
 		// split the child node
 		left := children[index]
@@ -296,8 +337,14 @@ func (tr *RTreeGN[N, T]) nodeInsert(nr *rect[N], n *node[N, T], ir *rect[N],
 			children[n.count] = right
 			n.count++
 		}
-		return tr.nodeInsert(nr, n, ir, data)
+		return tr.nodeInsert(nr, n, ir, data, w)
 	}
+	subWeight, ok := checkedAddInt64(n.subWeight, w)
+	if !ok {
+		return false, false, ErrWeightOverflow
+	}
+	n.subCount++
+	n.subWeight = subWeight
 	if grown {
 		// The child rectangle must expand to accomadate the new item.
 		n.rects[index].expand(ir)
@@ -306,7 +353,7 @@ func (tr *RTreeGN[N, T]) nodeInsert(nr *rect[N], n *node[N, T], ir *rect[N],
 		}
 		grown = !nr.contains(ir)
 	}
-	return false, grown
+	return false, grown, nil
 }
 
 func (r *rect[N]) area() N {
@@ -398,6 +445,19 @@ func (tr *RTreeGN[N, T]) moveRectAtIndexInto(from *node[N, T], index int,
 	into *node[N, T],
 ) {
 	var empty T
+	if from.leaf() {
+		w := tr.weightOf(from.items()[index])
+		from.subCount--
+		from.subWeight -= w
+		into.subCount++
+		into.subWeight += w
+	} else {
+		c := from.children()[index]
+		from.subCount -= c.subCount
+		from.subWeight -= c.subWeight
+		into.subCount += c.subCount
+		into.subWeight += c.subWeight
+	}
 	into.rects[into.count] = from.rects[index]
 	from.rects[index] = from.rects[from.count-1]
 	if from.leaf() {
@@ -587,7 +647,7 @@ func (tr *RTreeGN[N, T]) delete(min, max [2]N, data T, eq func(T, T) bool,
 		return false
 	}
 	tr.cow(&tr.root)
-	removed, _ := tr.nodeDelete(&tr.rect, tr.root, &ir, data, eq)
+	removed, _, _ := tr.nodeDelete(&tr.rect, tr.root, &ir, data, eq)
 	if !removed {
 		return false
 	}
@@ -610,7 +670,7 @@ func compare[T any](a, b T) bool {
 
 func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 	data T, eqfn func(T, T) bool,
-) (removed, shrunk bool) {
+) (removed, shrunk bool, w int64) {
 	var empty T
 	rects := n.rects[:n.count]
 	if n.leaf() {
@@ -629,17 +689,20 @@ func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 				continue
 			}
 			// found the target item to delete
+			w = tr.weightOf(items[i])
 			n.rects[i] = n.rects[n.count-1]
 			items[i] = items[n.count-1]
 			items[len(rects)-1] = empty
 			n.count--
+			n.subCount--
+			n.subWeight -= w
 			shrunk = ir.onedge(nr)
 			if shrunk {
 				*nr = n.rect()
 			}
-			return true, shrunk
+			return true, shrunk, w
 		}
-		return false, false
+		return false, false, 0
 	}
 	children := n.children()
 	for i := 0; i < len(rects); i++ {
@@ -648,10 +711,13 @@ func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 		}
 		crect := rects[i]
 		tr.cow(&children[i])
-		removed, shrunk = tr.nodeDelete(&rects[i], children[i], ir, data, eqfn)
+		removed, shrunk, w = tr.nodeDelete(&rects[i], children[i], ir, data,
+			eqfn)
 		if !removed {
 			continue
 		}
+		n.subCount--
+		n.subWeight -= w
 		if children[i].count == 0 {
 			if orderBranches {
 				copy(n.rects[i:n.count], n.rects[i+1:n.count])
@@ -663,7 +729,7 @@ func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 			children[n.count-1] = nil
 			n.count--
 			*nr = n.rect()
-			return true, true
+			return true, true, w
 		}
 		if shrunk {
 			shrunk = !rects[i].equals(&crect)
@@ -674,9 +740,9 @@ func (tr *RTreeGN[N, T]) nodeDelete(nr *rect[N], n *node[N, T], ir *rect[N],
 				_ = n.orderToRight(i)
 			}
 		}
-		return true, shrunk
+		return true, shrunk, w
 	}
-	return false, false
+	return false, false, 0
 }
 
 func (r *rect[N]) equals(b *rect[N]) bool {
@@ -710,9 +776,30 @@ func (tr *RTreeGN[N, T]) Replace(
 	oldMin, oldMax [2]N, oldData T,
 	newMin, newMax [2]N, newData T,
 ) {
-	if tr.delete(oldMin, oldMax, oldData, nil) {
-		tr.Insert(newMin, newMax, newData)
+	if err := tr.ReplaceChecked(
+		oldMin, oldMax, oldData,
+		newMin, newMax, newData,
+	); err != nil {
+		panic(err)
 	}
+}
+
+// ReplaceChecked is the same as Replace but returns an error instead of
+// panicking when the weight aggregation cannot be maintained for the new
+// item. On error the old item is restored, leaving the tree unmodified.
+func (tr *RTreeGN[N, T]) ReplaceChecked(
+	oldMin, oldMax [2]N, oldData T,
+	newMin, newMax [2]N, newData T,
+) error {
+	if tr.delete(oldMin, oldMax, oldData, nil) {
+		if err := tr.InsertChecked(newMin, newMax, newData); err != nil {
+			// Restore the old item. This cannot fail because its weight
+			// was already part of the tree totals before the delete.
+			_ = tr.InsertChecked(oldMin, oldMax, oldData)
+			return err
+		}
+	}
+	return nil
 }
 
 // Bounds returns the minimum bounding rect
