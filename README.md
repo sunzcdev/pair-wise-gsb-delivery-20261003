@@ -166,6 +166,8 @@ func server() {
 * `MaxFrameSize`: Maximum size of a frame.
 * `MaxReceiveBuffer`: Maximum size of the shared receive buffer.
 * `MaxStreamBuffer`: Maximum size of the per-stream buffer.
+* `WriteCoalesceBytes`: Minimum bytes of complete frames batched into one underlying write (0 disables coalescing together with `WriteCoalesceDelay`).
+* `WriteCoalesceDelay`: Maximum wait before a pending batch is committed; bounds the latency of a single low-traffic write.
 
 ## Reference
 

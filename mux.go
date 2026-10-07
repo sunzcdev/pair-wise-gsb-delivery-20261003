@@ -56,6 +56,18 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// WriteCoalesceBytes is the minimum number of complete-frame bytes
+	// accumulated in the send buffer that triggers one underlying write.
+	// It must be used together with WriteCoalesceDelay; leaving both zero
+	// disables write coalescing and every frame is written immediately.
+	WriteCoalesceBytes int
+
+	// WriteCoalesceDelay is the maximum time a complete frame waits in the
+	// send buffer before being committed. It bounds the added latency of a
+	// single low-traffic write; a lone small frame is never delayed beyond
+	// this duration. It must be used together with WriteCoalesceBytes.
+	WriteCoalesceDelay time.Duration
 }
 
 // DefaultConfig is used to return a default configuration
@@ -103,6 +115,18 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
+	}
+	if config.WriteCoalesceBytes < 0 {
+		return errors.New("write coalesce bytes must not be negative")
+	}
+	if config.WriteCoalesceDelay < 0 {
+		return errors.New("write coalesce delay must not be negative")
+	}
+	if (config.WriteCoalesceBytes == 0) != (config.WriteCoalesceDelay == 0) {
+		return errors.New("write coalesce bytes and delay must be both set or both zero")
+	}
+	if config.WriteCoalesceBytes > 0 && config.WriteCoalesceBytes < headerSize {
+		return errors.New("write coalesce bytes must be at least the size of a frame header")
 	}
 	return nil
 }

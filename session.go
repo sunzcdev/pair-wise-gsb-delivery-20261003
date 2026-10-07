@@ -131,9 +131,14 @@ type Session struct {
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
+	coalescer        *writeCoalescer // optional send-side frame coalescer
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
+	return newSessionWithClock(config, conn, client, realClock{})
+}
+
+func newSessionWithClock(config *Config, conn io.ReadWriteCloser, client bool, clk clock) *Session {
 	s := new(Session)
 	s.die = make(chan struct{})
 	s.conn = conn
@@ -149,6 +154,9 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chShaperPending = make(chan struct{}, 1)
 	s.chShaperConsumed = make(chan struct{}, 1)
 	s.sq = NewShaperQueue()
+	if config.WriteCoalesceBytes > 0 && config.WriteCoalesceDelay > 0 {
+		s.coalescer = newWriteCoalescer(config.WriteCoalesceBytes, config.WriteCoalesceDelay, clk)
+	}
 
 	if client {
 		s.nextStreamID = 1
@@ -594,6 +602,11 @@ func (s *Session) notifyShaperConsumed() {
 
 // sendLoop sends frames over the underlying connection
 func (s *Session) sendLoop() {
+	if s.coalescer != nil {
+		s.sendLoopCoalesced()
+		return
+	}
+
 	var buf []byte
 	var n int
 	var err error
@@ -659,6 +672,149 @@ EVENT_LOOP:
 			}
 		}
 	}
+}
+
+// sendLoopCoalesced is the sendLoop variant used when write coalescing is
+// enabled. PSH data frames are accumulated into a single write committed by
+// byte threshold or by the coalesce timer; FIN and other control frames force
+// an immediate commit of the pending batch first, then go out on their own.
+func (s *Session) sendLoopCoalesced() {
+	co := s.coalescer
+
+	for {
+		select {
+		case <-s.die:
+			// Pending frames can no longer reach the connection; report the
+			// undelivered data as an error so blocked writers do not hang.
+			if co.pendingLen() > 0 {
+				co.fail(io.ErrClosedPipe)
+			}
+			return
+		case <-co.timer.Ch():
+			// A stale tick for an already empty batch is simply ignored.
+			if co.pendingLen() > 0 {
+				if err := s.flushBatch(); err != nil {
+					s.notifyWriteError(err)
+					return
+				}
+			}
+		case <-s.chShaperPending:
+			for {
+				request, ok := s.sq.Pop()
+				if !ok {
+					// notify shaperLoop to accept new requests
+					s.notifyShaperConsumed()
+					break
+				}
+
+				// FIN and control frames must be delivered immediately and
+				// must not overtake earlier frames (the shaper pops frames
+				// in per-stream order, so flushing the batch first keeps a
+				// FIN behind that stream's earlier data).
+				if request.frame.cmd != cmdPSH {
+					if co.pendingLen() > 0 {
+						if err := s.flushBatch(); err != nil {
+							s.notifyWriteError(err)
+							return
+						}
+					}
+					if err := s.sendOne(request); err != nil {
+						s.notifyWriteError(err)
+						return
+					}
+					continue
+				}
+
+				co.append(request)
+				if co.full() {
+					if err := s.flushBatch(); err != nil {
+						s.notifyWriteError(err)
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+// writeAll writes the whole of b to the underlying connection, retrying on
+// short writes that report no error. It returns the number of bytes accepted
+// up to the failure; io.ErrShortWrite is reported when the connection makes
+// no progress (0 bytes, no error) or returns an invalid byte count, so a
+// misbehaving connection cannot stall sendLoop forever.
+func (s *Session) writeAll(b []byte) (int, error) {
+	written := 0
+	for len(b) > 0 {
+		n, err := s.conn.Write(b)
+		if n < 0 || n > len(b) {
+			return written, io.ErrShortWrite
+		}
+		written += n
+		b = b[n:]
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
+}
+
+// sendOne serializes a single frame (control frame or FIN) and writes it
+// immediately, delivering its write result to the requesting stream.
+func (s *Session) sendOne(request writeRequest) error {
+	var hdr rawHeader
+	hdr[0] = request.frame.ver
+	hdr[1] = request.frame.cmd
+	binary.LittleEndian.PutUint16(hdr[2:], uint16(len(request.frame.data)))
+	binary.LittleEndian.PutUint32(hdr[4:], request.frame.sid)
+
+	buf := make([]byte, headerSize+len(request.frame.data))
+	copy(buf, hdr[:])
+	copy(buf[headerSize:], request.frame.data)
+
+	// A control/FIN frame is only acknowledged as a whole. A partial write
+	// tears the connection down, so report no payload as committed.
+	_, err := s.writeAll(buf)
+	if err != nil {
+		request.result <- writeResult{n: 0, err: err}
+	} else {
+		request.result <- writeResult{n: len(request.frame.data), err: nil}
+	}
+	return err
+}
+
+// flushBatch commits the frames currently held by the coalescer in one
+// underlying write. On a short write or write failure the batch is split at
+// frame boundaries when accounting per-request results: a frame is reported
+// successful only when all of its bytes (header included) were written.
+func (s *Session) flushBatch() error {
+	co := s.coalescer
+	buf, reqs := co.take()
+	written, err := s.writeAll(buf)
+
+	pos := 0
+	results := make([]writeResult, len(reqs))
+	for i := range reqs {
+		req := reqs[i]
+		frameLen := headerSize + len(req.frame.data)
+		if err == nil || pos+frameLen <= written {
+			results[i] = writeResult{n: len(req.frame.data), err: nil}
+		} else {
+			results[i] = writeResult{n: 0, err: err}
+		}
+		pos += frameLen
+	}
+
+	// Reset before unblocking writers: once a writer returns, all traces of
+	// its frame must already be gone from the coalescer state.
+	co.reset()
+	for i := range reqs {
+		reqs[i].result <- results[i]
+	}
+
+	return err
 }
 
 // writeControlFrame writes the control frame to the underlying connection
