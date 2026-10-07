@@ -31,6 +31,21 @@ type bufReader interface {
 	io.ByteScanner
 }
 
+type byteScannerReader struct {
+	s io.ByteScanner
+}
+
+func (r byteScannerReader) Read(p []byte) (int, error) {
+	for i := range p {
+		c, err := r.s.ReadByte()
+		if err != nil {
+			return i, err
+		}
+		p[i] = c
+	}
+	return len(p), nil
+}
+
 //------------------------------------------------------------------------------
 
 var decPool = sync.Pool{
@@ -66,14 +81,15 @@ func Unmarshal(data []byte, v interface{}) error {
 
 // A Decoder reads and decodes MessagePack values from an input stream.
 type Decoder struct {
-	r          io.Reader
-	s          io.ByteScanner
-	mapDecoder func(*Decoder) (interface{}, error)
-	structTag  string
-	buf        []byte
-	rec        []byte
-	dict       []string
-	flags      uint32
+	r              io.Reader
+	s              io.ByteScanner
+	mapDecoder     func(*Decoder) (interface{}, error)
+	structTag      string
+	buf            []byte
+	rec            []byte
+	dict           []string
+	flags          uint32
+	useScannerRead bool
 }
 
 // NewDecoder returns a new decoder that reads from r.
@@ -112,6 +128,7 @@ func (d *Decoder) WithDict(dict []string, fn func(*Decoder) error) error {
 func (d *Decoder) ResetReader(r io.Reader) {
 	d.mapDecoder = nil
 	d.dict = nil
+	d.useScannerRead = false
 
 	if br, ok := r.(bufReader); ok {
 		d.r = br
@@ -403,12 +420,15 @@ func (d *Decoder) DecodeInterface() (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	return d.decodeInterfaceFromCode(c)
+}
 
+func (d *Decoder) decodeInterfaceFromCode(c byte) (interface{}, error) {
 	if msgpcode.IsFixedNum(c) {
 		return int8(c), nil
 	}
 	if msgpcode.IsFixedMap(c) {
-		err = d.s.UnreadByte()
+		err := d.s.UnreadByte()
 		if err != nil {
 			return nil, err
 		}
@@ -453,7 +473,7 @@ func (d *Decoder) DecodeInterface() (interface{}, error) {
 	case msgpcode.Array16, msgpcode.Array32:
 		return d.decodeSlice(c)
 	case msgpcode.Map16, msgpcode.Map32:
-		err = d.s.UnreadByte()
+		err := d.s.UnreadByte()
 		if err != nil {
 			return nil, err
 		}
@@ -476,12 +496,15 @@ func (d *Decoder) DecodeInterfaceLoose() (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
+	return d.decodeInterfaceLooseFromCode(c)
+}
 
+func (d *Decoder) decodeInterfaceLooseFromCode(c byte) (interface{}, error) {
 	if msgpcode.IsFixedNum(c) {
 		return int64(int8(c)), nil
 	}
 	if msgpcode.IsFixedMap(c) {
-		err = d.s.UnreadByte()
+		err := d.s.UnreadByte()
 		if err != nil {
 			return nil, err
 		}
@@ -511,7 +534,7 @@ func (d *Decoder) DecodeInterfaceLoose() (interface{}, error) {
 	case msgpcode.Array16, msgpcode.Array32:
 		return d.decodeSlice(c)
 	case msgpcode.Map16, msgpcode.Map32:
-		err = d.s.UnreadByte()
+		err := d.s.UnreadByte()
 		if err != nil {
 			return nil, err
 		}
@@ -530,7 +553,10 @@ func (d *Decoder) Skip() error {
 	if err != nil {
 		return err
 	}
+	return d.skipCode(c)
+}
 
+func (d *Decoder) skipCode(c byte) error {
 	if msgpcode.IsFixedNum(c) {
 		return nil
 	}
@@ -581,6 +607,25 @@ func (d *Decoder) DecodeRaw() (RawMessage, error) {
 	return msg, nil
 }
 
+func (d *Decoder) decodeRawFromCode(c byte) (RawMessage, error) {
+	rec := make([]byte, 0, 64)
+	rec = append(rec, c)
+	old := d.rec
+	oldUseScannerRead := d.useScannerRead
+	d.rec = rec
+	d.useScannerRead = true
+	err := d.skipCode(c)
+	if err != nil {
+		d.rec = old
+		d.useScannerRead = oldUseScannerRead
+		return nil, err
+	}
+	msg := append(RawMessage(nil), d.rec...)
+	d.rec = old
+	d.useScannerRead = oldUseScannerRead
+	return msg, nil
+}
+
 // PeekCode returns the next MessagePack code without advancing the reader.
 // Subpackage msgpack/codes defines the list of available msgpcode.
 func (d *Decoder) PeekCode() (byte, error) {
@@ -626,6 +671,26 @@ func (d *Decoder) readFull(b []byte) error {
 
 func (d *Decoder) readN(n int) ([]byte, error) {
 	var err error
+	if d.rec != nil {
+		if d.useScannerRead {
+			reader, ok := d.s.(io.Reader)
+			if !ok {
+				reader = byteScannerReader{s: d.s}
+			}
+			d.buf, err = readN(reader, d.buf, n)
+			if err != nil {
+				return nil, err
+			}
+			d.rec = append(d.rec, d.buf...)
+			return d.buf, nil
+		}
+		d.buf, err = readN(d.r, d.buf, n)
+		if err != nil {
+			return nil, err
+		}
+		d.rec = append(d.rec, d.buf...)
+		return d.buf, nil
+	}
 	if d.flags&disableAllocLimitFlag != 0 {
 		d.buf, err = readN(d.r, d.buf, n)
 	} else {

@@ -2,6 +2,7 @@ package msgpack
 
 import (
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 
@@ -9,6 +10,22 @@ import (
 )
 
 func (d *Decoder) skipN(n int) error {
+	if d.rec == nil && d.useScannerRead {
+		if reader, ok := d.s.(io.Reader); ok {
+			_, err := io.CopyN(io.Discard, reader, int64(n))
+			return err
+		}
+		for i := 0; i < n; i++ {
+			if _, err := d.s.ReadByte(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if d.rec == nil {
+		_, err := io.CopyN(io.Discard, d.r, int64(n))
+		return err
+	}
 	_, err := d.readN(n)
 	return err
 }
