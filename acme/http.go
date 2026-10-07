@@ -46,6 +46,21 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 		return nil, err
 	}
 
+	// Coordinated account keys (AccountKeyManager) hand us a lease that
+	// pins one key for the whole request, including every badNonce retry
+	// below. This is what keeps a rollover boundary sharp: a request that
+	// starts on the old key finishes on the old key, and a request cannot
+	// be encoded with a key that changes before it is transmitted.
+	releaseKey := func() {}
+	if leaser, ok := privateKey.(keyLeaser); ok {
+		leasedKey, release, err := leaser.leaseKey(ctx)
+		if err != nil {
+			return nil, err
+		}
+		privateKey, releaseKey = leasedKey, release
+	}
+	defer releaseKey()
+
 	var resp *http.Response
 	var err error
 
@@ -326,6 +341,27 @@ func (c *Client) httpClient() *http.Client {
 		return http.DefaultClient
 	}
 	return c.HTTPClient
+}
+
+// postKeyChangeOnce POSTs a keyChange payload exactly once. RFC 8555
+// §7.3.5 makes a keyChange unsafe to replay: if its response is lost the
+// caller must reconcile instead of firing another signed request, so this
+// deliberately bypasses the badNonce/5xx retry logic of httpPostJWS.
+func (c *Client) postKeyChangeOnce(ctx context.Context, oldKey crypto.Signer, kid string, payload json.RawMessage) error {
+	nonce, err := c.nonce(ctx)
+	if err != nil {
+		return err
+	}
+
+	encoded, err := jwsEncodeJSON(payload, oldKey, keyID(kid), nonce, c.dir.KeyChange)
+	if err != nil {
+		return fmt.Errorf("encoding keyChange: %w", err)
+	}
+
+	// httpReq does not replay a POST carrying an anti-replay nonce, so a
+	// lost response surfaces as an error rather than a second keyChange.
+	_, err = c.httpReq(ctx, http.MethodPost, c.dir.KeyChange, encoded, nil)
+	return err
 }
 
 func (c *Client) userAgent() string {

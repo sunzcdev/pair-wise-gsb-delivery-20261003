@@ -196,7 +196,9 @@ func (c *Client) AccountKeyRollover(ctx context.Context, account Account, newPri
 		return account, fmt.Errorf("encoding inner JWS: %v", err)
 	}
 
-	_, err = c.httpPostJWS(ctx, account.PrivateKey, account.Location, c.dir.KeyChange, json.RawMessage(innerJWS), nil)
+	// Send the keyChange exactly once. A lost response must trigger a
+	// reconciliation, not an automatic replay of the request (§7.3.5).
+	err = c.postKeyChangeOnce(ctx, account.PrivateKey, account.Location, json.RawMessage(innerJWS))
 	if err != nil {
 		return account, fmt.Errorf("rolling key on server: %w", err)
 	}

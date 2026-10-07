@@ -27,7 +27,7 @@ In other words, the `acmez` package is **porcelain** while the `acme` package is
 - Highly flexible and customizable
 - External Account Binding (EAB) support
 - Tested with numerous ACME CAs (more than just Let's Encrypt)
-- Implements niche aspects of RFC 8555 (such as alt cert chains and account key rollover)
+- Implements niche aspects of RFC 8555 (such as alt cert chains and coordinated account key rollover, including controlled reconciliation of a lost keyChange response)
 - Efficient solving of large SAN lists (e.g. for slow DNS record propagation)
 - Utility functions for solving challenges
 	- Device attestation challenges ([draft-acme-device-attest-02](https://datatracker.ietf.org/doc/draft-acme-device-attest/))
