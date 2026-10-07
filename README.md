@@ -280,6 +280,34 @@ That is, given a fixed overhead for the universe size (x), Roaring
 bitmaps never use more than 2 bytes per integer. You can call
 ``BoundSerializedSizeInBytes`` for a more precise estimate.
 
+### Counting a complex filter expression
+
+When a report only needs the number of rows matched by a complex boolean
+filter, materializing the result of every AND/OR/NOT is wasteful. Use
+`roaring.Count` (or `(*Bitmap).CountExpr`) to get the exact cardinality
+without building per-level intermediate bitmaps. Leaves borrow the caller's
+bitmaps, nodes support `AndOf`, `OrOf` and a `Not` that is always relative to
+the explicit finite universe (it never denotes an infinite set). Sub-
+expressions may be shared, leaves may repeat, and the universe may be empty.
+
+Evaluation streams one 16-bit container block at a time, leaf containers are
+located by binary search rather than scanned, and AND/OR short-circuit within
+a block, so working memory stays independent of the universe size. Cyclic or
+excessively deep expressions are rejected before anything is scanned.
+
+```go
+universe := roaring.NewBitmap() // the finite domain of every Not
+// ... fill universe and the leaf bitmaps ...
+
+active := roaring.Leaf(activeBM)
+inRegion := roaring.Leaf(regionBM)
+blocked := roaring.Leaf(blockedBM)
+
+matched := roaring.AndOf(active, inRegion, roaring.Not(blocked))
+n, err := roaring.Count(matched, universe)
+// n is the exact number of matching values; no intermediate bitmap is built.
+```
+
 ### 64-bit Roaring
 
 By default, roaring is used to stored unsigned 32-bit integers. However, we also offer
