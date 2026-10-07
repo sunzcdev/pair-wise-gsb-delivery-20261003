@@ -75,6 +75,38 @@ if err := loader.Load(); err != nil {
 // 4. command-line flags with the prefix `app.` if they are
 ```
 
+## Merging slices of objects by identity
+
+Files are applied as layers (see `MergeFiles`). A regular slice is replaced by
+every later layer, which makes it impossible to override just one element.
+
+A slice of structs whose element type declares an **identity field** is merged
+instead. Mark one field of the element struct with `identity:"true"`:
+
+```go
+type Pool struct {
+    Name    string `json:"name" identity:"true"`
+    MaxConn int    `json:"max_conn"`
+}
+
+type Config struct {
+    Pools []Pool `json:"pools"`
+}
+```
+
+Then a later layer is merged element by element using the identity value:
+
+* elements not mentioned by the later layer are kept,
+* elements with the same identity are updated field by field (nested fields included),
+* elements with a new identity are appended after the existing ones, in layer and input order,
+* `{"name": "old", "$delete": true}` removes the matching element.
+
+A layer that provides an empty array changes nothing, so it is different from
+deleting every element explicitly. Duplicated or missing identities inside a
+single layer are an error, and an update can never rename an existing element:
+an identity value that does not match anything is appended rather than applied.
+Regular (non-identified) slices keep the whole-slice replacement behaviour.
+
 Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/master/example_test.go).
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).

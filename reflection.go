@@ -201,6 +201,16 @@ func (l *Loader) setFieldData(field *fieldData, value interface{}) error {
 			return l.setSlice(field, l.sliceToString(value))
 		}
 
+		// A slice of structs that declares an identity field is merged with
+		// the value accumulated from earlier layers instead of being replaced.
+		id, identified, err := identityFieldOf(field.field.Type.Elem())
+		if err != nil {
+			return err
+		}
+		if identified {
+			return l.mergeIdentifiedSlice(field, value, id)
+		}
+
 		in := reflect.ValueOf(value)
 		if in.Kind() != reflect.Slice {
 			panic(fmt.Errorf("%T %v", value, value))
