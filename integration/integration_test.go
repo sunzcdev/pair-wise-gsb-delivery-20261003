@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,7 +31,9 @@ const (
 )
 
 var (
-	sb sqrl.StatementBuilderType
+	sb         sqrl.StatementBuilderType
+	dbConn     *sql.DB
+	driverName string
 )
 
 func TestMain(m *testing.M) {
@@ -52,6 +55,8 @@ func TestMain(m *testing.M) {
 		fmt.Printf("error opening database: %v\n", err)
 		os.Exit(-1)
 	}
+	dbConn = db
+	driverName = driver
 
 	_, err = db.Exec(testSchema)
 	if err != nil {
@@ -132,4 +137,75 @@ func TestContext(t *testing.T) {
 	ctx := context.Background()
 	_, err := s.QueryContext(ctx)
 	assert.NoError(t, err)
+}
+
+// runStrings executes a Sqlizer with the package runner and collects the
+// first column of every row as a string.
+func runStrings(t *testing.T, s sqrl.Sqlizer) []string {
+	query, args, err := s.ToSql()
+	assert.NoError(t, err)
+
+	rows, err := dbConn.Query(query, args...)
+	assert.NoError(t, err)
+	defer rows.Close()
+
+	var vals []string
+	for rows.Next() {
+		var v string
+		assert.NoError(t, rows.Scan(&v))
+		vals = append(vals, v)
+	}
+	assert.NoError(t, rows.Err())
+	return vals
+}
+
+// TestSetOperations verifies UNION ALL/UNION and, for PostgreSQL, that moving
+// the grouping parentheses in an EXCEPT expression changes the result when the
+// input contains duplicate rows.
+func TestSetOperations(t *testing.T) {
+	if dbConn == nil {
+		t.Skip("set operation tests require a database connection")
+	}
+
+	if driverName != "postgres" {
+		t.Skip("set operation EXCEPT semantics are pinned for the postgres dialect")
+	}
+
+	// Constant branches with deliberately duplicated rows:
+	//	formal  -> 1, 1, 2
+	//	reentry -> 1
+	//	archived -> 1
+	values := func(alias string, ids ...int) sqrl.Sqlizer {
+		q := sb.Select("column1 AS id").
+			From("(VALUES "+placeholdersGrouped(ids)+") AS "+alias, toArgs(ids)...)
+		return q
+	}
+
+	formalQ := values("formal(id)", 1, 1, 2)
+	reentryQ := values("reentry(id)", 1)
+	archivedQ := values("archived(id)", 1)
+
+	// (formal UNION ALL reentry) EXCEPT archived -> 2 only
+	left := sqrl.Except(sqrl.UnionAll(formalQ, reentryQ), archivedQ)
+	assert.Equal(t, []string{"2"}, runStrings(t, left))
+
+	// formal UNION ALL (reentry EXCEPT archived) -> 1, 1, 2
+	right := sqrl.UnionAll(formalQ, sqrl.Except(reentryQ, archivedQ))
+	assert.Equal(t, []string{"1", "1", "2"}, runStrings(t, right))
+}
+
+func placeholdersGrouped(ids []int) string {
+	groups := make([]string, len(ids))
+	for i := range ids {
+		groups[i] = "(?)"
+	}
+	return strings.Join(groups, ", ")
+}
+
+func toArgs(ids []int) []interface{} {
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
 }

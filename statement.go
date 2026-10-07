@@ -31,6 +31,43 @@ func (b StatementBuilderType) Delete(from string) DeleteBuilder {
 	return DeleteBuilder(b).From(from)
 }
 
+// newSetBuilderWith returns a SetBuilder that inherits the Runner and
+// PlaceholderFormat configured on this StatementBuilderType.
+func (b StatementBuilderType) newSetBuilderWith(operator setOperator, branches []Sqlizer) SetBuilder {
+	out := SetBuilder(builder.EmptyBuilder)
+	if f, ok := builder.Get(b, "PlaceholderFormat"); ok && f != nil {
+		out = out.PlaceholderFormat(f.(PlaceholderFormat))
+	}
+	if r, ok := builder.Get(b, "RunWith"); ok && r != nil {
+		out = builder.Set(out, "RunWith", r).(SetBuilder)
+	}
+	out = builder.Set(out, "Operator", operator).(SetBuilder)
+	out = builder.Extend(out, "Branches", sanitizeSetBranches(branches)).(SetBuilder)
+	return out
+}
+
+// Union returns a SetBuilder for this StatementBuilderType.
+//
+// See the package-level Union function for details.
+func (b StatementBuilderType) Union(branches ...Sqlizer) SetBuilder {
+	return b.newSetBuilderWith(unionOperator, branches)
+}
+
+// UnionAll returns a SetBuilder for this StatementBuilderType.
+func (b StatementBuilderType) UnionAll(branches ...Sqlizer) SetBuilder {
+	return b.newSetBuilderWith(unionAllOperator, branches)
+}
+
+// Intersect returns a SetBuilder for this StatementBuilderType.
+func (b StatementBuilderType) Intersect(branches ...Sqlizer) SetBuilder {
+	return b.newSetBuilderWith(intersectOperator, branches)
+}
+
+// Except returns a SetBuilder for this StatementBuilderType.
+func (b StatementBuilderType) Except(branches ...Sqlizer) SetBuilder {
+	return b.newSetBuilderWith(exceptOperator, branches)
+}
+
 // PlaceholderFormat sets the PlaceholderFormat field for any child builders.
 func (b StatementBuilderType) PlaceholderFormat(f PlaceholderFormat) StatementBuilderType {
 	return builder.Set(b, "PlaceholderFormat", f).(StatementBuilderType)

@@ -106,6 +106,38 @@ will generate with the Dollar Placeholder:
 SELECT * FROM nodes WHERE meta->'format' ?| array[$1,$2]
 ```
 
+## Set operations (UNION / INTERSECT / EXCEPT)
+
+`Union`, `UnionAll`, `Intersect` and `Except` combine whole queries with set
+operations. Each builder applies one operator left to right; nest builders to
+group parts with explicit parentheses, which is required when duplicate rows
+make the grouping significant.
+
+```go
+formal := sq.Select("id").From("orders").Where("kind = ?", "formal")
+reentry := sq.Select("id").From("orders").Where("kind = ?", "reentry")
+archived := sq.Select("id").From("orders").Where("archived = ?", true)
+
+// (formal UNION ALL reentry) EXCEPT archived
+query := sq.Except(sq.UnionAll(formal, reentry), archived)
+```
+
+`ORDER BY`/`LIMIT`/`OFFSET` on a branch are parenthesized so they apply to
+that branch; the same methods on the `SetBuilder` apply to the combined
+result.
+
+```go
+topReentry := reentry.OrderBy("created_at DESC").Limit(50)
+page := sq.UnionAll(formal, topReentry).OrderBy("1").Limit(100).Offset(200)
+```
+
+The whole result can be queried as a derived table with `FromSet`:
+
+```go
+sq.Select("n.id").FromSet(query, "n").Where("n.id > ?", 9)
+// SELECT n.id FROM ((...) EXCEPT ...) AS n WHERE n.id > ?
+```
+
 ## FAQ
 
 * **How can I build an IN query on composite keys / tuples, e.g. `WHERE (col1, col2) IN ((1,2),(3,4))`? ([#104](https://github.com/Masterminds/squirrel/issues/104))**
