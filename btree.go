@@ -331,6 +331,30 @@ func (tr *BTree) IsoCopy() *BTree {
 	return &BTree{base: tr.base.IsoCopy()}
 }
 
+// Split divides the tree into two trees at key. When equalToRight is true,
+// items equal to key are placed in the right tree; otherwise they are placed
+// in the left tree. The receiver and existing snapshots are not modified.
+func (tr *BTree) Split(key any, equalToRight bool) (left, right *BTree) {
+	if key == nil {
+		panic("nil key")
+	}
+	l, r := tr.base.Split(key, equalToRight)
+	return &BTree{base: l}, &BTree{base: r}
+}
+
+// Join appends right to the receiver and returns the resulting tree. Both
+// input trees and existing snapshots remain unchanged.
+func (tr *BTree) Join(right *BTree) (*BTree, error) {
+	if right == nil {
+		return nil, ErrIncompatibleJoin
+	}
+	joined, err := tr.base.Join(right.base)
+	if err != nil {
+		return nil, err
+	}
+	return &BTree{base: joined}, nil
+}
+
 // Clear will delete all items.
 func (tr *BTree) Clear() {
 	tr.base.Clear()

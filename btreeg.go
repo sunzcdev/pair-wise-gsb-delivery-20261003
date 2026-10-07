@@ -3,7 +3,21 @@
 // license that can be found in the LICENSE file.
 package btree
 
-import "sync"
+import (
+	"errors"
+	"reflect"
+	"sync"
+	"unsafe"
+)
+
+var (
+	// ErrIncompatibleJoin is returned when joining trees with different
+	// comparator identities, degrees, or item copy semantics.
+	ErrIncompatibleJoin = errors.New("incompatible btrees")
+	// ErrJoinRange is returned when the left range is not entirely before
+	// the right range.
+	ErrJoinRange = errors.New("btree join ranges overlap")
+)
 
 type BTreeG[T any] struct {
 	isoid        uint64
@@ -273,15 +287,15 @@ func (tr *BTreeG[T]) copy(n *node[T]) *node[T] {
 	n2 := new(node[T])
 	n2.isoid = tr.isoid
 	n2.count = n.count
-	n2.items = make([]T, len(n.items), cap(n.items))
+	n2.items = make([]T, len(n.items), tr.max+1)
 	copy(n2.items, n.items)
 	if tr.copyItems {
 		for i := 0; i < len(n2.items); i++ {
-			n2.items[i] = ((interface{})(n2.items[i])).(copier[T]).Copy()
+			n2.items[i] = tr.copyItem(n.items[i])
 		}
 	} else if tr.isoCopyItems {
 		for i := 0; i < len(n2.items); i++ {
-			n2.items[i] = ((interface{})(n2.items[i])).(isoCopier[T]).IsoCopy()
+			n2.items[i] = tr.copyItem(n.items[i])
 		}
 	}
 	if !n.leaf() {
@@ -290,6 +304,16 @@ func (tr *BTreeG[T]) copy(n *node[T]) *node[T] {
 		copy(*n2.children, *n.children)
 	}
 	return n2
+}
+
+func (tr *BTreeG[T]) copyItem(item T) T {
+	if tr.copyItems {
+		return ((interface{})(item)).(copier[T]).Copy()
+	}
+	if tr.isoCopyItems {
+		return ((interface{})(item)).(isoCopier[T]).IsoCopy()
+	}
+	return item
 }
 
 // isoLoad loads the provided node and, if needed, performs a copy-on-write.
@@ -1029,6 +1053,569 @@ func (tr *BTreeG[T]) nodeRebalance(n *node[T], i int) {
 			right.count -= (*left.children)[len(*left.children)-1].count
 		}
 	}
+}
+
+// Split divides the tree into two trees at key. When equalToRight is true,
+// items equal to key are placed in the right tree; otherwise they are placed
+// in the left tree. The receiver and existing snapshots are not modified.
+func (tr *BTreeG[T]) Split(key T, equalToRight bool) (left, right *BTreeG[T]) {
+	if tr.lock(true) {
+		defer tr.unlock(true)
+	}
+	sharedID := newIsoID()
+	left = tr.newPartitionTree()
+	right = tr.newPartitionTree()
+	left.isoid, right.isoid = sharedID, sharedID
+	left.count = 0
+	right.count = 0
+	tr.isoid = newIsoID()
+	if tr.root == nil {
+		return left, right
+	}
+	leftRoot, rightRoot := tr.splitNode(tr.root, key, equalToRight, left, right)
+	for leftRoot != nil && !leftRoot.leaf() && len(leftRoot.items) == 0 &&
+		len(*leftRoot.children) == 1 {
+		leftRoot = (*leftRoot.children)[0]
+	}
+	for rightRoot != nil && !rightRoot.leaf() && len(rightRoot.items) == 0 &&
+		len(*rightRoot.children) == 1 {
+		rightRoot = (*rightRoot.children)[0]
+	}
+	if leftRoot != nil && !leftRoot.leaf() && len(leftRoot.items) == 0 {
+		var nodes []*node[T]
+		for _, child := range *leftRoot.children {
+			if child != nil {
+				nodes = append(nodes, child)
+			}
+		}
+		leftRoot = left.normalizeSplitForest(nodes)
+	}
+	if rightRoot != nil && !rightRoot.leaf() && len(rightRoot.items) == 0 {
+		var nodes []*node[T]
+		for _, child := range *rightRoot.children {
+			if child != nil {
+				nodes = append(nodes, child)
+			}
+		}
+		rightRoot = right.normalizeSplitForest(nodes)
+	}
+	if leftRoot != nil && leftRoot.count == 0 {
+		leftRoot = nil
+	}
+	if rightRoot != nil && rightRoot.count == 0 {
+		rightRoot = nil
+	}
+	left.root = leftRoot
+	right.root = rightRoot
+	if leftRoot != nil {
+		left.count = leftRoot.count
+	}
+	if rightRoot != nil {
+		right.count = rightRoot.count
+	}
+	return left, right
+}
+
+func (tr *BTreeG[T]) newPartitionTree() *BTreeG[T] {
+	part := new(BTreeG[T])
+	*part = *tr
+	if tr.locks {
+		part.mu = new(sync.RWMutex)
+	}
+	part.isoid = newIsoID()
+	return part
+}
+
+func (tr *BTreeG[T]) retirePartitionID() {
+	tr.isoid = newIsoID()
+}
+
+func (tr *BTreeG[T]) splitNode(n *node[T], key T, equalToRight bool,
+	leftTree, rightTree *BTreeG[T],
+) (left, right *node[T]) {
+	i, found := tr.bsearch(n, key)
+	if n.leaf() {
+		if found && equalToRight {
+			return tr.makePartitionNode(leftTree, n.items[:i], nil),
+				tr.makePartitionNode(rightTree, n.items[i:], nil)
+		}
+		if found {
+			return tr.makePartitionNode(leftTree, n.items[:i+1], nil),
+				tr.makePartitionNode(rightTree, n.items[i+1:], nil)
+		}
+		return tr.makePartitionNode(leftTree, n.items[:i], nil),
+			tr.makePartitionNode(rightTree, n.items[i:], nil)
+	}
+
+	if found && equalToRight {
+		childLeft, childRight := tr.splitNode((*n.children)[i+1], key, true,
+			leftTree, rightTree)
+		left = tr.assembleLeftSplit((*n.children)[:i+1], n.items[:i],
+			childLeft, leftTree)
+		right = tr.assembleRightSplit(childRight, n.items[i+1:],
+			(*n.children)[i+2:], rightTree)
+		right = rightTree.prependOwnedMinNode(right, n.items[i])
+		return left, right
+	}
+	if found {
+		childLeft, childRight := tr.splitNode((*n.children)[i+1], key, false,
+			leftTree, rightTree)
+		left = tr.assembleLeftSplit((*n.children)[:i+1], n.items[:i],
+			childLeft, leftTree)
+		left = leftTree.appendOwnedMaxNode(left, n.items[i])
+		right = tr.assembleRightSplit(childRight, n.items[i+1:],
+			(*n.children)[i+2:], rightTree)
+		return left, right
+	}
+
+	childLeft, childRight := tr.splitNode((*n.children)[i], key,
+		equalToRight, leftTree, rightTree)
+	leftItems, childLeft := leftTree.absorbLeftPlaceholder(n.items[:i],
+		childLeft)
+	rightItems, childRight := rightTree.absorbRightPlaceholder(n.items[i:],
+		childRight)
+	left = tr.assembleLeftSplit((*n.children)[:i], leftItems,
+		childLeft, leftTree)
+	right = tr.assembleRightSplit(childRight, rightItems,
+		(*n.children)[i+1:], rightTree)
+	return left, right
+}
+
+func (tr *BTreeG[T]) absorbLeftPlaceholder(items []T, n *node[T],
+) ([]T, *node[T]) {
+	if n != nil && !n.leaf() && len(n.items) == 0 &&
+		len(*n.children) == 1 && len(items) > 0 {
+		item := items[len(items)-1]
+		return items[:len(items)-1],
+			tr.appendOwnedMaxNode((*n.children)[0], item)
+	}
+	return items, n
+}
+
+func (tr *BTreeG[T]) absorbRightPlaceholder(items []T, n *node[T],
+) ([]T, *node[T]) {
+	if n != nil && !n.leaf() && len(n.items) == 0 &&
+		len(*n.children) == 1 && len(items) > 0 {
+		item := items[0]
+		return items[1:], tr.prependOwnedMinNode((*n.children)[0], item)
+	}
+	return items, n
+}
+
+func (tr *BTreeG[T]) assembleLeftSplit(siblings []*node[T], items []T,
+	tail *node[T], owner *BTreeG[T],
+) *node[T] {
+	result := tail
+	for i := len(siblings) - 1; i >= 0; i-- {
+		if siblings[i] == nil {
+			if i < len(items) {
+				result = owner.prependOwnedMinNode(result, items[i])
+			}
+			continue
+		}
+		if i < len(items) {
+			result = owner.prependOwnedMinNode(result, items[i])
+		}
+		if result == nil {
+			result = siblings[i]
+		} else {
+			nodes, separator, split := owner.joinNodes(siblings[i],
+				result, owner)
+			result = owner.normalizeSplitResult(nodes, separator, split)
+		}
+	}
+	return result
+}
+
+func (tr *BTreeG[T]) assembleRightSplit(head *node[T], items []T,
+	siblings []*node[T], owner *BTreeG[T],
+) *node[T] {
+	result := head
+	for i := 0; i < len(siblings); i++ {
+		if siblings[i] == nil {
+			if i < len(items) {
+				result = owner.appendOwnedMaxNode(result, items[i])
+			}
+			continue
+		}
+		if i < len(items) {
+			result = owner.appendOwnedMaxNode(result, items[i])
+		}
+		if result == nil {
+			result = siblings[i]
+		} else {
+			nodes, separator, split := owner.joinNodes(result,
+				siblings[i], owner)
+			result = owner.normalizeSplitResult(nodes, separator, split)
+		}
+	}
+	return result
+}
+
+func (tr *BTreeG[T]) appendOwnedMaxNode(n *node[T], item T) *node[T] {
+	item = tr.copyItem(item)
+	if n == nil {
+		return tr.makePartitionNode(tr, []T{item}, nil)
+	}
+	nodes, separator, split := tr.appendMaxNode(n, item)
+	return tr.normalizeSplitResult(nodes, separator, split)
+}
+
+func (tr *BTreeG[T]) prependOwnedMinNode(n *node[T], item T) *node[T] {
+	item = tr.copyItem(item)
+	if n == nil {
+		return tr.makePartitionNode(tr, []T{item}, nil)
+	}
+	nodes, separator, split := tr.prependMinNode(n, item)
+	return tr.normalizeSplitResult(nodes, separator, split)
+}
+
+func (tr *BTreeG[T]) normalizeSplitResult(nodes []*node[T], separator T,
+	split bool,
+) *node[T] {
+	if !split {
+		return nodes[0]
+	}
+	parent := tr.newNode(false)
+	parent.items = append(parent.items, separator)
+	*parent.children = append((*parent.children)[:0], nodes...)
+	parent.updateCount()
+	return parent
+}
+
+func (tr *BTreeG[T]) normalizeSplitForest(nodes []*node[T]) *node[T] {
+	if len(nodes) == 0 {
+		return nil
+	}
+	result := nodes[0]
+	for i := 1; i < len(nodes); i++ {
+		joined, separator, split := tr.joinNodes(result, nodes[i], tr)
+		result = tr.normalizeSplitResult(joined, separator, split)
+	}
+	return result
+}
+
+func (tr *BTreeG[T]) appendMaxNode(n *node[T], item T,
+) (nodes []*node[T], separator T, split bool) {
+	item = tr.copyItem(item)
+	if n == nil {
+		n = tr.newNode(true)
+		n.items = append(n.items, item)
+		n.count = 1
+		return []*node[T]{n}, tr.empty, false
+	}
+	if n.leaf() {
+		n = tr.copy(n)
+		n.items = append(n.items, item)
+		n.count++
+		if len(n.items) <= tr.max {
+			return []*node[T]{n}, tr.empty, false
+		}
+		separator = n.items[tr.max/2]
+		left, right := tr.splitOwnedNode(n)
+		return []*node[T]{left, right}, separator, true
+	}
+	childNodes, childSep, childSplit := tr.appendMaxNode(
+		(*n.children)[len(*n.children)-1], item)
+	parent := tr.copy(n)
+	children := (*parent.children)[:len(*parent.children)-1]
+	children = append(children, childNodes...)
+	*parent.children = children
+	if childSplit {
+		parent.items = append(parent.items, childSep)
+	}
+	parent.updateCount()
+	if len(parent.items) <= tr.max {
+		return []*node[T]{parent}, tr.empty, false
+	}
+	separator = parent.items[tr.max/2]
+	left, right := tr.splitOwnedNode(parent)
+	return []*node[T]{left, right}, separator, true
+}
+
+func (tr *BTreeG[T]) prependMinNode(n *node[T], item T,
+) (nodes []*node[T], separator T, split bool) {
+	item = tr.copyItem(item)
+	if n == nil {
+		n = tr.newNode(true)
+		n.items = append(n.items, item)
+		n.count = 1
+		return []*node[T]{n}, tr.empty, false
+	}
+	if n.leaf() {
+		n = tr.copy(n)
+		n.items = append(n.items, tr.empty)
+		copy(n.items[1:], n.items[:len(n.items)-1])
+		n.items[0] = item
+		n.count++
+		if len(n.items) <= tr.max {
+			return []*node[T]{n}, tr.empty, false
+		}
+		separator = n.items[tr.max/2]
+		left, right := tr.splitOwnedNode(n)
+		return []*node[T]{left, right}, separator, true
+	}
+	childNodes, childSep, childSplit := tr.prependMinNode((*n.children)[0],
+		item)
+	parent := tr.copy(n)
+	children := append([]*node[T]{}, childNodes...)
+	children = append(children, (*parent.children)[1:]...)
+	*parent.children = children
+	if childSplit {
+		parent.items = append(parent.items, tr.empty)
+		copy(parent.items[1:], parent.items[:len(parent.items)-1])
+		parent.items[0] = childSep
+	}
+	parent.updateCount()
+	if len(parent.items) <= tr.max {
+		return []*node[T]{parent}, tr.empty, false
+	}
+	separator = parent.items[tr.max/2]
+	left, right := tr.splitOwnedNode(parent)
+	return []*node[T]{left, right}, separator, true
+}
+
+func (tr *BTreeG[T]) makePartitionNode(dst *BTreeG[T], items []T,
+	children []*node[T],
+) *node[T] {
+	if len(items) == 0 && len(children) == 0 {
+		return nil
+	}
+	n := dst.newNode(children == nil)
+	n.items = dst.makeCopiedItems(nil, items, dst)
+	if children != nil {
+		*n.children = append((*n.children)[:0], children...)
+	}
+	n.updateCount()
+	return n
+}
+
+func (tr *BTreeG[T]) makeRawNode(items []T, children []*node[T]) *node[T] {
+	if len(items) == 0 && len(children) == 0 {
+		return nil
+	}
+	n := tr.newNode(children == nil)
+	n.items = append(n.items, items...)
+	if children != nil {
+		*n.children = append((*n.children)[:0], children...)
+	}
+	n.updateCount()
+	return n
+}
+
+func (tr *BTreeG[T]) makeCopiedItems(dst, src []T, owner *BTreeG[T]) []T {
+	for i := range src {
+		dst = append(dst, owner.copyItem(src[i]))
+	}
+	return dst
+}
+
+// Join appends right to the receiver and returns the resulting tree. Both
+// input trees and existing snapshots remain unchanged. Comparators are checked
+// by function identity, and every left key must be strictly before every right
+// key.
+func (tr *BTreeG[T]) Join(right *BTreeG[T]) (*BTreeG[T], error) {
+	if tr == nil {
+		panic("nil btree")
+	}
+	if right == nil {
+		return nil, ErrIncompatibleJoin
+	}
+	same := tr == right
+	if same {
+		return nil, ErrIncompatibleJoin
+	}
+	if uintptr(unsafe.Pointer(tr)) < uintptr(unsafe.Pointer(right)) {
+		if tr.lock(true) {
+			defer tr.unlock(true)
+		}
+		if right.lock(true) {
+			defer right.unlock(true)
+		}
+	} else {
+		if right.lock(true) {
+			defer right.unlock(true)
+		}
+		if tr.lock(true) {
+			defer tr.unlock(true)
+		}
+	}
+	if err := tr.checkJoinCompatibility(right); err != nil {
+		return nil, err
+	}
+	if err := tr.checkJoinRange(right); err != nil {
+		return nil, err
+	}
+
+	result := tr.newPartitionTree()
+	result.isoid = tr.isoid
+	switch {
+	case tr.root == nil && right.root == nil:
+	case tr.root == nil:
+		result.root = right.root
+		result.count = right.count
+	case right.root == nil:
+		result.root = tr.root
+		result.count = tr.count
+	default:
+		nodes, separator, split := tr.joinNodes(tr.root, right.root, result)
+		if split {
+			result.root = result.newNode(false)
+			result.root.items = append(result.root.items, separator)
+			*result.root.children = append((*result.root.children)[:0],
+				nodes...)
+			result.root.updateCount()
+		} else {
+			result.root = nodes[0]
+			result.count = result.root.count
+		}
+	}
+	if result.root != nil {
+		result.count = result.root.count
+	}
+	tr.isoid = newIsoID()
+	right.retirePartitionID()
+	return result, nil
+}
+
+func (tr *BTreeG[T]) checkJoinCompatibility(right *BTreeG[T]) error {
+	if tr.min != right.min || tr.max != right.max ||
+		tr.copyItems != right.copyItems ||
+		tr.isoCopyItems != right.isoCopyItems ||
+		tr.less == nil || right.less == nil ||
+		reflect.ValueOf(tr.less).Pointer() !=
+			reflect.ValueOf(right.less).Pointer() {
+		return ErrIncompatibleJoin
+	}
+	return nil
+}
+
+func (tr *BTreeG[T]) checkJoinRange(right *BTreeG[T]) error {
+	if tr.root == nil || right.root == nil {
+		return nil
+	}
+	leftMax := tr.nodeMaxItem(tr.root)
+	rightMin := right.nodeMinItem(right.root)
+	if !tr.less(leftMax, rightMin) {
+		return ErrJoinRange
+	}
+	return nil
+}
+
+func (tr *BTreeG[T]) joinNodes(left, right *node[T],
+	result *BTreeG[T],
+) (nodes []*node[T], separator T, split bool) {
+	if tr.nodeHeight(left) == tr.nodeHeight(right) {
+		return tr.joinEqualNodes(left, right, result)
+	}
+	if tr.nodeHeight(left) > tr.nodeHeight(right) {
+		childNodes, childSep, childSplit := tr.joinNodes(
+			(*left.children)[len(*left.children)-1], right, result)
+		items := result.makeCopiedItems(nil, left.items, result)
+		if childSplit {
+			items = append(items, childSep)
+		}
+		children := append([]*node[T]{}, (*left.children)[:len(*left.children)-1]...)
+		children = append(children, childNodes...)
+		return result.finishJoinNode(items, children)
+	}
+	childNodes, childSep, childSplit := tr.joinNodes(left,
+		(*right.children)[0], result)
+	items := result.makeCopiedItems(nil, right.items, result)
+	if childSplit {
+		items = append([]T{childSep}, items...)
+	}
+	children := append([]*node[T]{}, childNodes...)
+	children = append(children, (*right.children)[1:]...)
+	return result.finishJoinNode(items, children)
+}
+
+func (tr *BTreeG[T]) joinEqualNodes(left, right *node[T],
+	result *BTreeG[T],
+) (nodes []*node[T], separator T, split bool) {
+	if left.leaf() {
+		items := result.makeCopiedItems(nil, left.items, result)
+		items = append(items, right.items...)
+		n := result.makeRawNode(items, nil)
+		if len(n.items) <= result.max {
+			return []*node[T]{n}, result.empty, false
+		}
+		i := len(n.items) / 2
+		separator = n.items[i]
+		lo, hi := result.splitOwnedNodeAt(n, i)
+		return []*node[T]{lo, hi}, separator, true
+	}
+
+	childNodes, childSep, childSplit := tr.joinEqualNodes(
+		(*left.children)[len(*left.children)-1], (*right.children)[0], result)
+	items := result.makeCopiedItems(nil, left.items, result)
+	if childSplit {
+		items = append(items, childSep)
+	}
+	items = append(items, right.items...)
+	children := append([]*node[T]{}, (*left.children)[:len(*left.children)-1]...)
+	children = append(children, childNodes...)
+	children = append(children, (*right.children)[1:]...)
+	return result.finishJoinNode(items, children)
+}
+
+func (tr *BTreeG[T]) finishJoinNode(items []T, children []*node[T],
+) (nodes []*node[T], separator T, split bool) {
+	n := tr.makeRawNode(items, children)
+	if len(n.items) <= tr.max {
+		return []*node[T]{n}, tr.empty, false
+	}
+	i := len(n.items) / 2
+	separator = n.items[i]
+	leftNode, rightNode := tr.splitOwnedNodeAt(n, i)
+	return []*node[T]{leftNode, rightNode}, separator, true
+}
+
+func (tr *BTreeG[T]) splitOwnedNode(n *node[T]) (left, right *node[T]) {
+	return tr.splitOwnedNodeAt(n, tr.max/2)
+}
+
+func (tr *BTreeG[T]) splitOwnedNodeAt(n *node[T], i int,
+) (left, right *node[T]) {
+	right = tr.newNode(n.leaf())
+	right.items = append(right.items, n.items[i+1:]...)
+	if !n.leaf() {
+		*right.children = append((*right.children)[:0],
+			(*n.children)[i+1:]...)
+	}
+	right.updateCount()
+
+	left = tr.newNode(n.leaf())
+	left.items = append(left.items, n.items[:i]...)
+	if !n.leaf() {
+		*left.children = append((*left.children)[:0],
+			(*n.children)[:i+1]...)
+	}
+	left.updateCount()
+	return left, right
+}
+
+func (tr *BTreeG[T]) nodeMinItem(n *node[T]) T {
+	for !n.leaf() {
+		n = (*n.children)[0]
+	}
+	return n.items[0]
+}
+
+func (tr *BTreeG[T]) nodeMaxItem(n *node[T]) T {
+	for !n.leaf() {
+		n = (*n.children)[len(*n.children)-1]
+	}
+	return n.items[len(n.items)-1]
+}
+
+func (tr *BTreeG[T]) nodeHeight(n *node[T]) int {
+	height := 1
+	for !n.leaf() {
+		height++
+		n = (*n.children)[0]
+	}
+	return height
 }
 
 // Ascend the tree within the range [pivot, last]

@@ -226,6 +226,8 @@ SeekHint(key, iter, *hint)
 
 // Copy-on-write
 Copy()                  // copy the btree
+Split(key, equalRight)  // split the btree by key
+Join(right)             // join two adjacent compatible btrees
 ```
 
 #### Example
