@@ -39,6 +39,7 @@ type Codec interface {
 type Request struct {
 	Seq    uint64 // sequence number chosen by client
 	Method string
+	Meta   Metadata // optional per-request attributes (metadata-capable codecs only)
 }
 
 // Response is a header written before every RPC return.
@@ -99,7 +100,10 @@ func (c *gobCodec) ReadResponseBody(body interface{}) error {
 func (c *gobCodec) WriteRequest(r *Request, body interface{}) (err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-	if err = c.enc.Encode(r); err != nil {
+	// Encode the plain message type on purpose: the gob codec is the
+	// legacy codec and must not put the optional metadata area on the
+	// wire, so old peers are unaffected.
+	if err = c.enc.Encode(message{Seq: r.Seq, Method: r.Method}); err != nil {
 		return
 	}
 	if err = c.enc.Encode(body); err != nil {
@@ -111,7 +115,7 @@ func (c *gobCodec) WriteRequest(r *Request, body interface{}) (err error) {
 func (c *gobCodec) WriteResponse(r *Response, body interface{}) (err error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
-	if err = c.enc.Encode(r); err != nil {
+	if err = c.enc.Encode(message{Seq: r.Seq, Error: r.Error}); err != nil {
 		return
 	}
 	if err = c.enc.Encode(body); err != nil {

@@ -1,6 +1,7 @@
 package rpc2
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -24,14 +25,17 @@ const (
 
 // Server responds to RPC requests made by Client.
 type Server struct {
-	handlers map[string]*handler
-	eventHub *hub.Hub
+	handlers          map[string]*handler
+	eventHub          *hub.Hub
+	metaIntercept     MetadataInterceptor
+	metadataWhitelist map[string]struct{}
 }
 
 type handler struct {
-	fn        reflect.Value
-	argType   reflect.Type
-	replyType reflect.Type
+	fn           reflect.Value
+	argType      reflect.Type
+	replyType    reflect.Type
+	wantsContext bool
 }
 
 type connectionEvent struct {
@@ -65,8 +69,9 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 
 	method := reflect.ValueOf(handlerFunc)
 	mtype := method.Type()
-	// Method needs three ins: *client, *args, *reply.
-	if mtype.NumIn() != 3 {
+	// Method needs three or four ins:
+	//   *client, [context.Context,] *args, *reply.
+	if mtype.NumIn() != 3 && mtype.NumIn() != 4 {
 		log.Panicln("method", mname, "has wrong number of ins:", mtype.NumIn())
 	}
 	// First arg must be a pointer to rpc2.Client.
@@ -77,13 +82,22 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if clientType != typeOfClient {
 		log.Panicln("method", mname, "first argument", clientType.String(), "not *rpc2.Client")
 	}
-	// Second arg need not be a pointer.
-	argType := mtype.In(1)
+
+	wantsContext := false
+	if mtype.NumIn() == 4 {
+		if mtype.In(1) != typeOfContext {
+			log.Panicln("method", mname, "second argument", mtype.In(1).String(), "not context.Context")
+		}
+		wantsContext = true
+	}
+
+	// Args arg need not be a pointer.
+	argType := mtype.In(mtype.NumIn() - 2)
 	if !isExportedOrBuiltinType(argType) {
 		log.Panicln(mname, "argument type not exported:", argType)
 	}
 	// Third arg must be a pointer.
-	replyType := mtype.In(2)
+	replyType := mtype.In(mtype.NumIn() - 1)
 	if replyType.Kind() != reflect.Ptr {
 		log.Panicln("method", mname, "reply type not a pointer:", replyType)
 	}
@@ -100,11 +114,14 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		log.Panicln("method", mname, "returns", returnType.String(), "not error")
 	}
 	handlers[mname] = &handler{
-		fn:        method,
-		argType:   argType,
-		replyType: replyType,
+		fn:           method,
+		argType:      argType,
+		replyType:    replyType,
+		wantsContext: wantsContext,
 	}
 }
+
+var typeOfContext = reflect.TypeOf((*context.Context)(nil)).Elem()
 
 // Is this type exported or a builtin?
 func isExportedOrBuiltinType(t reflect.Type) bool {
@@ -127,6 +144,25 @@ func (s *Server) OnConnect(f func(*Client)) {
 	s.eventHub.Subscribe(clientConnected, func(e hub.Event) {
 		go f(e.(connectionEvent).Client)
 	})
+}
+
+// SetMetadataInterceptor installs a hook that runs on every accepted
+// connection for each inbound request, before the request body is read and
+// the handler is invoked. It can validate, delete or supplement the local
+// metadata; a non-nil error rejects the request before its handler runs.
+func (s *Server) SetMetadataInterceptor(f MetadataInterceptor) {
+	s.metaIntercept = f
+}
+
+// SetMetadataWhitelist sets the default inbound metadata keys propagated on
+// nested reverse RPCs issued from the server's handlers. It is applied to
+// every accepted connection. By default nothing is propagated.
+func (s *Server) SetMetadataWhitelist(keys ...string) {
+	wl := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		wl[k] = struct{}{}
+	}
+	s.metadataWhitelist = wl
 }
 
 // OnDisconnect registers a function to run when a client disconnects.
@@ -177,6 +213,8 @@ func (s *Server) ServeCodecWithState(codec Codec, state *State) {
 	c.server = true
 	c.handlers = s.handlers
 	c.State = state
+	c.metaIntercept = s.metaIntercept
+	c.metadataWhitelist = s.metadataWhitelist
 
 	s.eventHub.Publish(connectionEvent{c})
 	c.Run()

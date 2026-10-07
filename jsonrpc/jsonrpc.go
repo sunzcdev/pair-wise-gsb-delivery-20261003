@@ -68,6 +68,7 @@ type message struct {
 	Id     *json.RawMessage `json:"id"`
 	Result *json.RawMessage `json:"result"`
 	Error  interface{}      `json:"error"`
+	Meta   *json.RawMessage `json:"meta,omitempty"`
 }
 
 // Unmarshal to
@@ -75,6 +76,7 @@ type serverRequest struct {
 	Method string           `json:"method"`
 	Params *json.RawMessage `json:"params"`
 	Id     *json.RawMessage `json:"id"`
+	Meta   *json.RawMessage `json:"meta,omitempty"`
 }
 type clientResponse struct {
 	Id     uint64           `json:"id"`
@@ -89,9 +91,10 @@ type serverResponse struct {
 	Error  interface{}      `json:"error"`
 }
 type clientRequest struct {
-	Method string      `json:"method"`
-	Params interface{} `json:"params"`
-	Id     *uint64     `json:"id"`
+	Method string        `json:"method"`
+	Params interface{}   `json:"params"`
+	Id     *uint64       `json:"id"`
+	Meta   rpc2.Metadata `json:"meta,omitempty"`
 }
 
 func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
@@ -105,6 +108,7 @@ func (c *jsonCodec) ReadHeader(req *rpc2.Request, resp *rpc2.Response) error {
 		c.serverRequest.Id = c.msg.Id
 		c.serverRequest.Method = c.msg.Method
 		c.serverRequest.Params = c.msg.Params
+		c.serverRequest.Meta = c.msg.Meta
 
 		req.Method = c.serverRequest.Method
 
@@ -179,6 +183,33 @@ func (c *jsonCodec) ReadRequestBody(x interface{}) error {
 	return err
 }
 
+// ReadRequestMetadata returns the bounded metadata area of the most
+// recently read request header. It runs before the request body is
+// decoded and before any handler executes, so a malformed "meta" value
+// rejects the request up front.
+func (c *jsonCodec) ReadRequestMetadata() (rpc2.Metadata, error) {
+	if c.serverRequest.Meta == nil {
+		return nil, nil
+	}
+	// Decode the area lazily (after the header, before the body) so a
+	// malformed "meta" value rejects this single request instead of
+	// tearing down the whole connection.
+	var md rpc2.Metadata
+	if err := json.Unmarshal(*c.serverRequest.Meta, &md); err != nil {
+		return nil, fmt.Errorf("jsonrpc: invalid metadata area: %w", err)
+	}
+	if md == nil {
+		return nil, nil
+	}
+	// Return a private copy so callers cannot mutate the codec's
+	// temporary decode buffer.
+	out := make(rpc2.Metadata, len(md))
+	for k, v := range md {
+		out[k] = v
+	}
+	return out, nil
+}
+
 func (c *jsonCodec) ReadResponseBody(x interface{}) error {
 	if x == nil {
 		return nil
@@ -187,7 +218,7 @@ func (c *jsonCodec) ReadResponseBody(x interface{}) error {
 }
 
 func (c *jsonCodec) WriteRequest(r *rpc2.Request, param interface{}) error {
-	req := &clientRequest{Method: r.Method}
+	req := &clientRequest{Method: r.Method, Meta: r.Meta}
 
 	// Check if param is a slice of any kind
 	if param != nil && reflect.TypeOf(param).Kind() == reflect.Slice {
