@@ -56,6 +56,22 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// WriteCoalesceBytes enables optional send-side write coalescing.
+	// When positive, ready frames are combined and submitted to the
+	// underlying connection with a single Write once this many bytes
+	// (headers included) are pending. 0 disables coalescing (default).
+	WriteCoalesceBytes int
+
+	// WriteCoalesceDelay is the maximum time an uncommitted batch may
+	// wait for more frames before being flushed. It must be positive
+	// when WriteCoalesceBytes is positive.
+	WriteCoalesceDelay time.Duration
+
+	// newBatchTimer creates the coalescer commit timer.
+	// It is nil in production (time.NewTimer is used) and is
+	// replaceable by tests with a controllable clock.
+	newBatchTimer func(d time.Duration) (<-chan time.Time, func())
 }
 
 // DefaultConfig is used to return a default configuration
@@ -103,6 +119,15 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
+	}
+	if config.WriteCoalesceBytes < 0 {
+		return errors.New("write coalesce bytes must not be negative")
+	}
+	if config.WriteCoalesceBytes > 0 && config.WriteCoalesceDelay <= 0 {
+		return errors.New("write coalesce delay must be positive when write coalescing is enabled")
+	}
+	if config.WriteCoalesceBytes == 0 && config.WriteCoalesceDelay != 0 {
+		return errors.New("write coalesce delay requires write coalesce bytes to be set")
 	}
 	return nil
 }

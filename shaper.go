@@ -25,6 +25,7 @@ package smux
 import (
 	"container/heap"
 	"container/list"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -67,8 +68,9 @@ func (h *shaperHeap) Pop() any {
 type shaperQueue struct {
 	count   int64 // atomic counter for fast Len() and IsEmpty()
 	streams map[uint32]*shaperHeap
-	rrList  *list.List    // list of sid (RR queue)
-	next    *list.Element // next node to pop
+	elems   map[uint32]*list.Element // sid -> element in rrList
+	rrList  *list.List               // list of sid (RR queue)
+	next    *list.Element            // next node to pop
 	mu      sync.Mutex
 }
 
@@ -83,6 +85,7 @@ var shaperHeapPool = sync.Pool{
 func NewShaperQueue() *shaperQueue {
 	return &shaperQueue{
 		streams: make(map[uint32]*shaperHeap),
+		elems:   make(map[uint32]*list.Element),
 		rrList:  list.New(),
 	}
 }
@@ -100,6 +103,7 @@ func (sq *shaperQueue) Push(req writeRequest) {
 		*h = (*h)[:0] // reset while keeping capacity
 		sq.streams[sid] = h
 		elem := sq.rrList.PushBack(sid)
+		sq.elems[sid] = elem
 		if sq.next == nil {
 			sq.next = elem
 		}
@@ -145,6 +149,7 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 			// If the heap is empty after popping, delete it.
 			if h.Len() == 0 {
 				delete(sq.streams, sid)
+				delete(sq.elems, sid)
 				sq.rrList.Remove(current)
 				// return heap to pool
 				shaperHeapPool.Put(h)
@@ -169,6 +174,65 @@ func (sq *shaperQueue) Pop() (req writeRequest, ok bool) {
 
 	// no requests found in any stream
 	return writeRequest{}, false
+}
+
+// PopStreamBefore removes and returns all pending requests of stream sid
+// whose sequence numbers precede seq, ordered by sequence number.
+// It is used by the write coalescer to guarantee that a control frame
+// (e.g. FIN) never overtakes earlier data of the same stream that is
+// still waiting in the shaper queue.
+func (sq *shaperQueue) PopStreamBefore(sid uint32, seq uint32) []writeRequest {
+	sq.mu.Lock()
+	defer sq.mu.Unlock()
+
+	h, ok := sq.streams[sid]
+	if !ok {
+		return nil
+	}
+
+	var extracted []writeRequest
+	kept := (*h)[:0]
+	for _, req := range *h {
+		if _itimediff(req.seq, seq) < 0 {
+			extracted = append(extracted, req)
+		} else {
+			kept = append(kept, req)
+		}
+	}
+	if len(extracted) == 0 {
+		return nil
+	}
+
+	*h = kept
+	heap.Init(h)
+	atomic.AddInt64(&sq.count, -int64(len(extracted)))
+
+	// if the heap is empty after extraction, remove the stream
+	if h.Len() == 0 {
+		delete(sq.streams, sid)
+		if elem, ok := sq.elems[sid]; ok {
+			if sq.next == elem {
+				next := elem.Next()
+				if next == nil {
+					next = sq.rrList.Front()
+				}
+				if next == elem { // the only element
+					next = nil
+				}
+				sq.next = next
+			}
+			sq.rrList.Remove(elem)
+			delete(sq.elems, sid)
+		}
+		// return heap to pool
+		shaperHeapPool.Put(h)
+	}
+
+	// order the extracted requests by sequence number
+	sort.Slice(extracted, func(i, j int) bool {
+		return _itimediff(extracted[j].seq, extracted[i].seq) > 0
+	})
+	return extracted
 }
 
 // IsEmpty checks if the shaperQueue is empty.

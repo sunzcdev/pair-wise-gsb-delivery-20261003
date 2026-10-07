@@ -41,10 +41,18 @@ Defines the wire format for data transmission.
 
 ### 4. Configuration (`mux.go`)
 The `Config` struct allows tuning the session.
-- **Key Fields**: `Version`, `KeepAliveInterval`, `MaxFrameSize`, `MaxReceiveBuffer`, `MaxStreamBuffer`.
+- **Key Fields**: `Version`, `KeepAliveInterval`, `MaxFrameSize`, `MaxReceiveBuffer`, `MaxStreamBuffer`, `WriteCoalesceBytes`, `WriteCoalesceDelay`.
 
 ### 5. Traffic Shaping (`shaper.go`)
 Implements traffic shaping logic to ensure fair bandwidth usage among streams.
+
+### 6. Write Coalescing (`coalesce.go`)
+Optional send-side batching (enabled via `Config.WriteCoalesceBytes`/`WriteCoalesceDelay`).
+Ready data frames are combined into a single underlying `Write`, committed by byte
+threshold or a commit timer that only guards the uncommitted batch. Control frames
+(SYN/FIN/NOP/UPD) commit the pending batch first and are written immediately, so a
+FIN never overtakes earlier data of the same stream (`shaperQueue.PopStreamBefore`).
+The wire format and per-stream ordering are unchanged.
 
 ## Development Guidelines
 
@@ -85,6 +93,7 @@ stream, _ := session.AcceptStream()
 
 ## File Structure
 - `alloc.go`: Memory allocation utilities.
+- `coalesce.go`: Optional send-side write coalescing.
 - `frame.go`: Frame definition and parsing.
 - `mux.go`: Configuration and entry points.
 - `session.go`: Session logic.

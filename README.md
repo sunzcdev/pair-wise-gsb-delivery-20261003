@@ -30,6 +30,7 @@ Smux (**S**imple **MU**ltiple**X**ing) is a multiplexing library for Golang. It 
 3. Minimized header (8 bytes), maximized payload.
 4. Built-in fair queue traffic shaping.
 5. Per-stream sliding window for congestion control (protocol version 2+).
+6. Optional send-side write coalescing to combine small frames into a single underlying write.
 
 ![smooth bandwidth curve](assets/curve.jpg)
 
@@ -166,6 +167,10 @@ func server() {
 * `MaxFrameSize`: Maximum size of a frame.
 * `MaxReceiveBuffer`: Maximum size of the shared receive buffer.
 * `MaxStreamBuffer`: Maximum size of the per-stream buffer.
+* `WriteCoalesceBytes`: Byte threshold for the optional write coalescer; ready frames are combined into a single underlying `Write` once this many bytes are pending. `0` (default) disables coalescing.
+* `WriteCoalesceDelay`: Maximum time an uncommitted batch may wait before being flushed; required when `WriteCoalesceBytes > 0`.
+
+The coalescer never changes the wire format or per-stream frame order. Control frames that need immediate handling (SYN/FIN/NOP/UPD) commit the pending batch first, so a FIN never overtakes earlier data of the same stream. Short writes are reported as `io.ErrShortWrite`, connection write failures are delivered to every pending writer, and closing the session fails an uncommitted batch with `io.ErrClosedPipe`.
 
 ## Reference
 

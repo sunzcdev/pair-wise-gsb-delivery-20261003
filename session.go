@@ -131,6 +131,10 @@ type Session struct {
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
+
+	// newBatchTimer creates the commit timer for the write coalescer;
+	// defaults to time.NewTimer, replaceable by tests via Config.
+	newBatchTimer func(d time.Duration) (<-chan time.Time, func())
 }
 
 func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
@@ -149,6 +153,15 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chShaperPending = make(chan struct{}, 1)
 	s.chShaperConsumed = make(chan struct{}, 1)
 	s.sq = NewShaperQueue()
+
+	if config.newBatchTimer != nil {
+		s.newBatchTimer = config.newBatchTimer
+	} else {
+		s.newBatchTimer = func(d time.Duration) (<-chan time.Time, func()) {
+			timer := time.NewTimer(d)
+			return timer.C, func() { timer.Stop() }
+		}
+	}
 
 	if client {
 		s.nextStreamID = 1
@@ -594,6 +607,11 @@ func (s *Session) notifyShaperConsumed() {
 
 // sendLoop sends frames over the underlying connection
 func (s *Session) sendLoop() {
+	if s.config.WriteCoalesceBytes > 0 {
+		s.sendLoopCoalesce()
+		return
+	}
+
 	var buf []byte
 	var n int
 	var err error
