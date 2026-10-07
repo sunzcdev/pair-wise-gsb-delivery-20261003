@@ -1,3 +1,7 @@
+## Unreleased
+#### FEATURES
+- Add `Context` type carrying significant-digit precision, exponent range, rounding mode and trapped conditions, with `Add`, `Sub`, `Mul` and `Div` operations that return IEEE 754-style condition flags (`Rounded`, `Inexact`, `Overflow`, `Underflow`, `DivisionByZero`) and typed `*ConditionError` errors for non-finite or trapped results
+
 ## Decimal v1.4.0
 #### BREAKING
 - Drop support for Go version older than 1.10 [#361](https://github.com/shopspring/decimal/pull/361)
