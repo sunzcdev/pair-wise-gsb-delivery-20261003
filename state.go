@@ -5,6 +5,7 @@ package memberlist
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -669,6 +670,23 @@ func (m *Memberlist) pushPull() {
 // pushPullNode does a complete state exchange with a specific node.
 func (m *Memberlist) pushPullNode(a Address, join bool) error {
 	defer metrics.MeasureSinceWithLabels([]string{"memberlist", "pushPullNode"}, time.Now(), m.metricLabels)
+
+	// When both we and the remote side implement IncrementalDelegate, first
+	// attempt a cheap incremental negotiation for periodic anti-entropy.
+	// Joins always use the full exchange since a brand-new node has no
+	// baseline to diff against. The remote side rejects an offer if it does
+	// not support negotiation, in which case we fall through to the regular
+	// full-state exchange.
+	if !join && asIncrementalDelegate(m.config.Delegate) != nil {
+		switch err := m.incrementalPushPull(a, join); {
+		case err == nil:
+			return nil
+		case errors.Is(err, errFallback), errors.Is(err, errIncrementalUnsupported):
+			// Full state exchange below.
+		default:
+			return err
+		}
+	}
 
 	// Attempt to send and receive with the node
 	remote, userState, err := m.sendAndReceiveState(a, join)

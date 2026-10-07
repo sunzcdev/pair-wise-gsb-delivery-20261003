@@ -64,6 +64,7 @@ const (
 	nackRespMsg
 	hasCrcMsg
 	errMsg
+	incSyncMsg // Incremental push/pull negotiation, handled via IncrementalDelegate
 )
 
 const (
@@ -92,6 +93,13 @@ const (
 	maxPushPullRequests    = 128              // Maximum number of concurrent push/pull requests
 
 	maxDecompressedBytes = 2 * maxPushStateBytes // Largest push/pull we will decompress: user state plus an equal node budget
+
+	// Limits for the optional incremental push/pull negotiation. They bound
+	// the work done by a single anti-entropy run so a misbehaving or very
+	// out-of-date peer cannot keep a connection alive forever.
+	maxIncrementalRounds    = 64 // Maximum number of request/response round-trips per side
+	maxIncrementalMsgBytes  = maxPushStateBytes
+	maxIncrementalSyncBytes = 4 * maxPushStateBytes // Cumulative payload bytes exchanged per sync
 )
 
 // ping request sent directly to node
@@ -184,6 +192,48 @@ type pushPullHeader struct {
 // userMsgHeader is used to encapsulate a userMsg
 type userMsgHeader struct {
 	UserMsgLen int // Encodes the byte lengh of user state
+}
+
+// incSyncOp identifies the kind of frame carried inside an incSyncMsg
+// exchanged during an incremental push/pull negotiation.
+//
+// WARNING: ONLY APPEND TO THIS LIST! The numeric values are part of the
+// protocol itself.
+type incSyncOp uint8
+
+const (
+	// incOffer carries the initiating side's opaque summary.
+	incOffer incSyncOp = iota
+
+	// incOfferAck carries the responding side's summary together with the
+	// first changes it produced for the initiator's request.
+	incOfferAck
+
+	// incRound carries a request for changes the sender still wants plus
+	// the ordered changes answering the peer's request from the previous
+	// round. Frames alternate strictly between the two sides until both
+	// requests are empty.
+	incRound
+
+	// incDone terminates the negotiation successfully. Both sides only
+	// notify their IncrementalDelegate after exchanging incDone frames.
+	incDone
+
+	// incFallback terminates the negotiation because one side's delegate
+	// can no longer serve the requested changes and requires a full sync.
+	incFallback
+)
+
+// incSyncFrame is a single frame of the incremental push/pull negotiation.
+// Every field except Op is application opaque; memberlist never inspects
+// their contents. Requested changes are delivered as an ordered list so the
+// application can define ordering between changes; Changes are applied in
+// slice order before the next round is processed.
+type incSyncFrame struct {
+	Op      incSyncOp
+	Summary []byte   `codec:",omitempty"` // Local summary, sent with incOffer/incOfferAck
+	Request []byte   `codec:",omitempty"` // Changes this sender wants next; empty means caught up
+	Changes [][]byte `codec:",omitempty"` // Ordered changes answering the peer's last request
 }
 
 // pushNodeState is used for pushPullReq when we are
@@ -353,6 +403,46 @@ func (m *Memberlist) handleConn(conn net.Conn) {
 		err = m.rawSendMsgStream(conn, out.Bytes(), streamLabel)
 		if err != nil {
 			m.logger.Printf("[ERR] memberlist: Failed to send ack: %s %s", err, LogConn(conn))
+			return
+		}
+	case incSyncMsg:
+		// Incremental push/pull negotiation. If the local delegate does not
+		// implement IncrementalDelegate, reject the offer so the initiator
+		// retries with the regular full-state push/pull on a new connection.
+		numConcurrent := m.pushPullReq.Add(1)
+		defer m.pushPullReq.Add(^uint32(0))
+
+		if numConcurrent >= maxPushPullRequests {
+			m.logger.Printf("[ERR] memberlist: Too many pending push/pull requests")
+			return
+		}
+
+		if asIncrementalDelegate(m.config.Delegate) == nil {
+			out, encErr := encode(errMsg, &errResp{incrementalUnsupportedResp},
+				m.config.MsgpackUseNewTimeFormat)
+			if encErr != nil {
+				m.logger.Printf("[ERR] memberlist: Failed to encode error response: %s", encErr)
+				return
+			}
+			if err := m.rawSendMsgStream(conn, out.Bytes(), streamLabel); err != nil {
+				m.logger.Printf("[ERR] memberlist: Failed to send error: %s %s", err, LogConn(conn))
+			}
+			return
+		}
+
+		session := m.newIncSyncSession(conn, streamLabel, false)
+		// Only a live buffered reader (no per-frame encryption or
+		// compression) may carry bytes beyond the offer frame. Decrypted or
+		// decompressed payloads are single-frame buffers and must not be
+		// reused for the next recvFrame.
+		if _, ok := bufConn.(*bufio.Reader); !ok {
+			bufConn = nil
+		}
+		if err := session.handleServerOffer(bufConn, dec); err != nil {
+			if !errors.Is(err, errFallback) {
+				m.logger.Printf("[ERR] memberlist: Failed incremental push/pull: %s %s",
+					err, LogConn(conn))
+			}
 			return
 		}
 	default:

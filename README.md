@@ -74,3 +74,21 @@ to the protocol on our issue tracker.
 ## Metrics Emission
 
 This library emits metrics using `github.com/hashicorp/go-metrics`.
+
+## Incremental Push/Pull
+
+The periodic TCP push/pull sync sends the membership state plus, when a
+`Delegate` is configured, its full `LocalState`. Applications whose delegate
+state grows large can avoid transferring that full payload on every sync by
+also implementing the optional `IncrementalDelegate` interface.
+
+When both sides of a sync implement `IncrementalDelegate`, memberlist first
+exchanges compact, application-defined summaries and then requests only the
+changes each side is missing, delivering each answer as an ordered batch. A
+sync is bounded by a maximum number of negotiation rounds and a cumulative
+byte limit; memberlist does not interpret the payload or implement any
+business merge logic. If a delegate reports that the requested changes have
+already been pruned (`ErrIncrementalFallback`) — for example when a peer has
+been offline too long — the sync transparently retries with the regular
+full-state exchange. When either side implements only `Delegate`, the
+existing full-state push/pull is used unchanged.
