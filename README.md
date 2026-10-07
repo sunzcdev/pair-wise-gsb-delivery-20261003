@@ -64,6 +64,59 @@ func main() {
 }
 ```
 
+## Fused multiply-add and dot product
+
+Rounding after every step can erase a small balance that only appears once
+large numbers have cancelled. For example, rounding the product and the addend
+separately here loses the residual entirely:
+
+```go
+x := decimal.NewFromInt(2)
+y, _ := decimal.NewFromString("500000000000000000.002")
+add, _ := decimal.NewFromString("-999999999999999999.998")
+
+// Round the product, then round the addition: the 0.006 balance is gone.
+naive := x.Mul(y).Round(2).Add(add.Round(2)).Round(2) // 0
+```
+
+`FusedMultiplyAdd` and `DotProduct` keep every product and every addition
+exact and round **once**, at the very end. The final precision and rounding
+mode are supplied explicitly through `FusedOptions`.
+
+```go
+// x*y + add, exact intermediates, a single final half-up rounding to 2 dp.
+fused, err := decimal.FusedMultiplyAdd(x, y, add, decimal.FusedOptions{
+    Precision: 2,
+    Rounding:  decimal.RoundHalfUp,
+}) // 0.01
+
+// Finite dot product sum(a[i]*b[i]), likewise rounded only once.
+total, err := decimal.DotProduct(a, b, decimal.FusedOptions{
+    Precision: 2,
+    Rounding:  decimal.RoundHalfUp,
+})
+```
+
+`Rounding` may be `RoundHalfUp`, `RoundHalfDown`, `RoundHalfEven`
+(banker's), `RoundFusedFloor`, `RoundFusedCeil`, or `RoundFusedDown`.
+`Precision` is the number of digits after the decimal point and may be negative
+to round the integer part.
+
+Because exact exponent alignment could otherwise grow an intermediate integer
+without bound (adding `10^100000` to `10^-100000` needs 200001 digits), the
+operations take a computation budget in `MaxDigits`. If it is zero,
+`DefaultFusedMaxDigits` is used. Exceeding it returns
+`ErrFusedBudgetExceeded` — the call never falls back to `float64`. Product
+exponents outside the `int32` range return `ErrFusedExponentOverflow`.
+
+Conventions:
+
+ * An empty dot product, or one whose products are all zero, returns `0`.
+ * Zero products are ignored and never force exponent alignment, so operands
+   with extreme exponents are safe as long as their product is zero.
+ * Intermediate products are normalized to remove trailing zero factors, so
+   small residuals are not confused with insignificant leading zeros.
+
 ## Alternative libraries
 
 When working with decimal numbers, you might face problems this library is not perfectly suited for. 
