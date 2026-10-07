@@ -5,19 +5,19 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
 // Loader of user configuration.
 type Loader struct {
-	config  Config
-	dst     any
-	parser  *structParser
-	fields  []*fieldData
-	fsys    fs.FS
-	flagSet *flag.FlagSet
-	errInit error
+	config   Config
+	dst      any
+	parser   *structParser
+	fields   []*fieldData
+	fsys     fs.FS
+	flagSet  *flag.FlagSet
+	includes *includeResolver
+	errInit  error
 }
 
 // Config to configure configuration loader.
@@ -331,6 +331,9 @@ func (l *Loader) loadFiles() error {
 		}
 	}
 
+	// A fresh resolver per load: every file is read at most once per load.
+	l.includes = newIncludeResolver(l)
+
 	for _, file := range l.config.Files {
 		if _, err := fs.Stat(l.fsys, file); os.IsNotExist(err) {
 			if l.config.FailOnFileNotFound {
@@ -351,18 +354,24 @@ func (l *Loader) loadFiles() error {
 }
 
 func (l *Loader) loadFile(file string) error {
-	ext := strings.ToLower(filepath.Ext(file))
-	decoder, ok := l.config.FileDecoders[ext]
-	if !ok {
-		return fmt.Errorf("file format %q is not supported", ext)
-	}
-
-	actualFields, err := decoder.DecodeFile(file)
+	// Resolve the whole include graph first: on any error (missing file,
+	// cycle, ...) nothing is applied and no field is left half-loaded.
+	files, err := l.includes.resolve(file)
 	if err != nil {
 		return err
 	}
 
-	tag := decoder.Format()
+	for _, f := range files {
+		if err := l.applyFile(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *Loader) applyFile(f resolvedFile) error {
+	tag := f.decoder.Format()
+	actualFields := f.fields
 
 	if l.config.NewParser {
 		if err := l.parser.applyLevel(tag, actualFields); err != nil {
@@ -394,7 +403,7 @@ func (l *Loader) loadFile(file string) error {
 
 	if !l.config.AllowUnknownFields {
 		for env := range actualFields {
-			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", file, env)
+			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", f.path, env)
 		}
 	}
 	return nil

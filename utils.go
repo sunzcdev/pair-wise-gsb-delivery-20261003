@@ -179,6 +179,39 @@ func (d *jsonDecoder) DecodeFile(filename string) (map[string]interface{}, error
 	return raw, nil
 }
 
+// DecodeFileIncludes implements IncludeDecoder. The optional "include" key
+// (a string or a list of strings) declares files to be loaded before this
+// one. Paths are resolved relative to the file that declares them.
+func (d *jsonDecoder) DecodeFileIncludes(filename string) (map[string]interface{}, []string, error) {
+	raw, err := d.DecodeFile(filename)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	value, ok := raw["include"]
+	if !ok {
+		return raw, nil, nil
+	}
+	delete(raw, "include")
+
+	switch value := value.(type) {
+	case string:
+		return raw, []string{value}, nil
+	case []interface{}:
+		includes := make([]string, 0, len(value))
+		for _, v := range value {
+			s, ok := v.(string)
+			if !ok {
+				return nil, nil, fmt.Errorf("include entries must be strings, got %T", v)
+			}
+			includes = append(includes, s)
+		}
+		return raw, includes, nil
+	default:
+		return nil, nil, fmt.Errorf("include must be a string or a list of strings, got %T", value)
+	}
+}
+
 func (l *Loader) sliceToString(curr interface{}) string {
 	switch curr := curr.(type) {
 	case []interface{}:

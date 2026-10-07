@@ -22,6 +22,7 @@ There are many solutions regarding configuration loading in Go. I was looking fo
   * command-line flags
 * Dependency-free (file parsers are optional).
 * Ability to walk over configuration fields.
+* Explicit file includes (JSON files support the `"include"` key, other formats can implement `aconfig.IncludeDecoder`).
 
 ## Install
 
