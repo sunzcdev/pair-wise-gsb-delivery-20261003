@@ -659,6 +659,37 @@ Schema = "schema" "{" Field* "}" .
 Enum = "enum" ident "{" ident* "}" .
 ```
 
+## Grammar analysis
+
+As a DSL grows, ordered alternatives (`a | b`) can silently hide a later
+branch behind an earlier one. Participle can compute a build-time, purely
+advisory report of which productions are [nullable](https://en.wikipedia.org/wiki/Nullable_production),
+their [FIRST](https://en.wikipedia.org/wiki/First_and_follow_sets) token sets, and the
+interactions between ordered branches:
+
+```go
+report := parser.Analysis()
+fmt.Println(report)
+```
+
+Each finding carries a severity and the production path that reaches the
+disjunction:
+
+- `definite shadowed branch` - an earlier branch structurally accepts every
+  token sequence a later branch can begin with, so the later branch is
+  unreachable.
+- `definite nullable branch` - an earlier branch can match the empty string,
+  so it is always taken.
+- `possible FIRST overlap` - two branches share a first token. This is only a
+  hint, never proof of an error: branches that share a prefix but diverge later
+  are common and often resolved by ordered choice or lookahead.
+- `unknown interaction` - a branch uses a custom `Parseable` type or a
+  `ParseTypeWith` function whose language cannot be inspected.
+
+Nullability and FIRST sets are derived by least-fixed-point iteration, so
+recursive grammars converge rather than looping. The report never changes
+parser behaviour.
+
 ## Syntax/Railroad Diagrams
 
 Participle includes a [command-line utility](https://github.com/alecthomas/participle/tree/master/cmd/railroad) to take an EBNF representation of a Participle grammar
