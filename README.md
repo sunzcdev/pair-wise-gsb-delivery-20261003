@@ -88,6 +88,29 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Bulk loading
+
+When a large, mostly static set of rectangles is available up front, use
+`Load` to build the whole tree in one pass with the Sort-Tile-Recursive (STR)
+algorithm. The entries are spatially sorted and tiled, so the resulting tree
+shape does not depend on the input order, and duplicate rectangles are kept
+as separate entries.
+
+All rectangles are validated before any nodes are created: a `NaN` coordinate
+or an inverted rectangle returns `ErrInvalidRect` and leaves the tree empty.
+`Load` also returns `ErrNotEmpty` when the tree already holds items.
+
+```go
+var tr rtree.RTreeG[int]
+err := tr.Load([]rtree.EntryG[int]{
+	{Min: [2]float64{-112.01, 33.43}, Max: [2]float64{-112.00, 33.44}, Data: 1},
+	{Min: [2]float64{-118.25, 33.94}, Max: [2]float64{-118.24, 33.95}, Data: 2},
+})
+if err != nil {
+	// handle rtree.ErrInvalidRect or rtree.ErrNotEmpty
+}
+```
+
 
 ## Algorithms
 
@@ -135,4 +158,3 @@ minimum x value.
 ## License
 
 rtree source code is available under the MIT License.
-
