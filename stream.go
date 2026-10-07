@@ -23,7 +23,9 @@
 package smux
 
 import (
+	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -61,6 +63,37 @@ type stream struct {
 	// half-close support: local write closed (sent FIN)
 	chWriteClosed   chan struct{}
 	writeClosedOnce sync.Once // Ensures chWriteClosed is closed only once
+
+	// read-only phase notification.
+	//
+	// The stream lifecycle is observed through three monotonically advancing
+	// phases, each of which is signalled exactly once:
+	//
+	//	PhaseLocalDataDrained  - the local write side has been closed and its
+	//	                         FIN handed off to the transport (CloseWrite or
+	//	                         Close), or the session ended prematurely.
+	//	PhasePeerDone          - the peer sent FIN (possibly with unread data
+	//	                         still buffered), or the stream/session ended
+	//	                         before the FIN arrived.
+	//	PhaseReclaimed         - the stream resources have been fully
+	//	                         recycled (removed from the session), or the
+	//	                         session ended prematurely.
+	//
+	// phaseMu protects phaseReached, phaseErrors and the lazily allocated
+	// phaseDone channels. Observing phases never retains the stream beyond its
+	// normal lifetime and does not rely on finalizers.
+	phaseMu      sync.Mutex
+	phaseReached [numPhases]bool
+	phaseErrors  [numPhases]error
+	phaseDone    [numPhases]chan struct{}
+
+	// lifecycle inputs consulted by the phase state machine
+	localWriteClosed    bool  // FIN handed to the transport (clean half/full close)
+	peerDone            bool  // peer FIN observed
+	recycled            bool  // removed from session and resources released
+	peerFinAfterRecycle bool  // FIN observed after Stream.Close removed the stream
+	abandoned           bool  // Session.Close dropped the stream without Stream.Close
+	fatalErr            error // underlying connection / protocol error
 
 	// read/write deadline
 	readDeadline  atomic.Value
@@ -193,6 +226,263 @@ func newStream(id uint32, frameSize int, sess *Session) *stream {
 	s.bufferRing = newBufferRing(8)
 
 	return s
+}
+
+// Phase identifies a point in a stream's lifecycle that can be observed.
+// Phases are ordered: a stream only moves forward and never goes back.
+type Phase int
+
+const (
+	// PhaseLocalDataDrained fires once the local write side has been closed
+	// and the FIN has been handed to the underlying connection
+	// (Stream.CloseWrite or Stream.Close). If the stream/session ends before
+	// the FIN is delivered, the phase still fires exactly once but carries the
+	// ending error as its reason.
+	//
+	// After this phase the local side guarantees it will send no more data.
+	PhaseLocalDataDrained Phase = iota
+
+	// PhasePeerDone fires once the peer has closed its write side (a FIN has
+	// been received, even if data is still buffered and unread). If the
+	// stream/session ends before a FIN could be observed it fires once with
+	// the ending error as its reason.
+	PhasePeerDone
+
+	// PhaseReclaimed fires once the stream has been fully recycled, that is
+	// both halves are done and the stream has been removed from the session
+	// with all its resources released. If the session ends first it fires once
+	// with the ending error as its reason.
+	PhaseReclaimed
+)
+
+const numPhases = 3
+
+func (p Phase) String() string {
+	switch p {
+	case PhaseLocalDataDrained:
+		return "LocalDataDrained"
+	case PhasePeerDone:
+		return "PeerDone"
+	case PhaseReclaimed:
+		return "Reclaimed"
+	default:
+		return "Unknown"
+	}
+}
+
+// WaitPhase blocks until the given phase (or a later phase) has been reached
+// or ctx is canceled, and returns the reason that phase finished with.
+// A nil result means the phase completed normally; a non-nil result means the
+// underlying connection or an explicit close ended the stream before the
+// phase could complete normally.
+//
+// The returned phase is guaranteed to be >= phase if err is nil; when ctx is
+// canceled before the phase fires, the context error is returned and the
+// stream lifecycle is left untouched.
+func (s *Stream) WaitPhase(ctx context.Context, phase Phase) error {
+	if phase < PhaseLocalDataDrained || phase >= numPhases {
+		return fmt.Errorf("smux: invalid phase %d", phase)
+	}
+
+	ch := s.stream.phaseChan(phase)
+
+	select {
+	case <-ch:
+		// the phase fired (cleanly or with a reason); report that reason,
+		// which is nil for a clean completion
+		return s.stream.phaseError(phase)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// PhaseChan returns a read-only channel that is closed once the given phase
+// (or a later phase) has been reached. The channel is never closed for an
+// invalid phase. Observing this channel never blocks stream teardown.
+func (s *Stream) PhaseChan(phase Phase) <-chan struct{} {
+	if phase < PhaseLocalDataDrained || phase >= numPhases {
+		return nil
+	}
+	return s.stream.phaseChan(phase)
+}
+
+// PhaseError returns nil while the given phase has not been reached. Once the
+// phase has been reached it returns the reason it finished with: nil means a
+// clean completion, any other error explains why the stream ended before the
+// phase could complete normally.
+func (s *Stream) PhaseError(phase Phase) error {
+	if phase < PhaseLocalDataDrained || phase >= numPhases {
+		return fmt.Errorf("smux: invalid phase %d", phase)
+	}
+
+	s.stream.phaseMu.Lock()
+	defer s.stream.phaseMu.Unlock()
+	if !s.stream.phaseReached[phase] {
+		return nil
+	}
+	return s.stream.phaseErrors[phase]
+}
+
+// CurrentPhase returns the highest phase reached so far. reached is false until
+// any phase fires.
+func (s *Stream) CurrentPhase() (phase Phase, reached bool, err error) {
+	s.stream.phaseMu.Lock()
+	defer s.stream.phaseMu.Unlock()
+	highest := Phase(-1)
+	for p := PhaseLocalDataDrained; p < numPhases; p++ {
+		if s.stream.phaseReached[p] {
+			highest = p
+		}
+	}
+	if highest < 0 {
+		return 0, false, nil
+	}
+	return highest, true, s.stream.phaseErrors[highest]
+}
+
+// phaseChan returns the notification channel for a phase, allocated lazily on
+// first use so streams that are never observed cost nothing extra.
+func (s *stream) phaseChan(phase Phase) chan struct{} {
+	s.phaseMu.Lock()
+	defer s.phaseMu.Unlock()
+	if s.phaseDone[phase] == nil {
+		s.phaseDone[phase] = make(chan struct{})
+		// if the phase already fired, signal it immediately
+		if s.phaseReached[phase] {
+			close(s.phaseDone[phase])
+		}
+	}
+	return s.phaseDone[phase]
+}
+
+func (s *stream) phaseError(phase Phase) error {
+	s.phaseMu.Lock()
+	defer s.phaseMu.Unlock()
+	return s.phaseErrors[phase]
+}
+
+// signal marks that the local write side has been closed. If err is non-nil
+// the FIN could not be delivered and it terminates every unfinished phase.
+func (s *stream) signalLocalWriteClosed(err error) {
+	s.phaseMu.Lock()
+	if err != nil {
+		s.fatalErr = err
+	}
+	s.localWriteClosed = true
+	s.advancePhasesLocked()
+	s.phaseMu.Unlock()
+}
+
+// signalAbandoned marks that the session was closed while the stream was still
+// in the map (Session.Close). No explicit Stream.Close happened, so unfinished
+// phases end with io.ErrClosedPipe.
+func (s *stream) signalAbandoned() {
+	s.phaseMu.Lock()
+	s.abandoned = true
+	s.advancePhasesLocked()
+	s.phaseMu.Unlock()
+}
+
+// signalRecycled marks that the stream has been removed from the session and
+// its resources have been released.
+func (s *stream) signalRecycled() {
+	s.phaseMu.Lock()
+	s.recycled = true
+	s.advancePhasesLocked()
+	s.phaseMu.Unlock()
+}
+
+// fail ends every phase that has not fired yet with the supplied reason. It is
+// invoked when the underlying connection or the session breaks, ensuring no
+// observer can block forever. A locally fully-closed stream that is simply
+// abandoned by Session.Close is treated the same way.
+func (s *stream) fail(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	s.phaseMu.Lock()
+	s.fatalErr = err
+	s.advancePhasesLocked()
+	s.phaseMu.Unlock()
+
+	// release any Read/Write that is parked waiting for events
+	s.wakeupReader()
+	s.wakeupWriter()
+}
+
+// advancePhasesLocked fires each phase exactly once as soon as its
+// precondition is met. The two half-close milestones (PhaseLocalDataDrained
+// and PhasePeerDone) are independent and may be reached in either order;
+// PhaseReclaimed is reached once both halves are settled and the stream has
+// been recycled, or once the stream/session ends and the milestones that never
+// occurred are settled with a reason.
+//
+// Callers must hold phaseMu.
+func (s *stream) advancePhasesLocked() {
+	fire := func(p Phase, reason error) {
+		if s.phaseReached[p] {
+			return
+		}
+		s.phaseReached[p] = true
+		s.phaseErrors[p] = reason
+		if ch := s.phaseDone[p]; ch != nil {
+			close(ch)
+		}
+	}
+
+	// Determine whether the lifecycle has reached a terminal state and, if
+	// so, the reason that settles any milestone which never naturally fired.
+	terminal, ended := func() (error, bool) {
+		switch {
+		case s.fatalErr != nil:
+			return s.fatalErr, true
+		case s.abandoned:
+			return io.ErrClosedPipe, true
+		case s.recycled:
+			// Stream.Close removed the stream. A peer FIN that was observed
+			// (including one racing with the close) completes the read side;
+			// otherwise the read side was torn down before the FIN arrived.
+			if s.peerDone || s.peerFinAfterRecycle {
+				return nil, true
+			}
+			return io.ErrClosedPipe, true
+		default:
+			return nil, false
+		}
+	}()
+
+	// PhaseLocalDataDrained: FIN handed to the transport, or terminal.
+	if !s.phaseReached[PhaseLocalDataDrained] && (s.localWriteClosed || ended) {
+		if s.localWriteClosed {
+			fire(PhaseLocalDataDrained, nil)
+		} else {
+			fire(PhaseLocalDataDrained, terminal)
+		}
+	}
+
+	// PhasePeerDone: peer FIN observed (possibly after recycle), or terminal.
+	if !s.phaseReached[PhasePeerDone] &&
+		(s.peerDone || s.peerFinAfterRecycle || ended) {
+		if s.peerDone || s.peerFinAfterRecycle {
+			fire(PhasePeerDone, nil)
+		} else {
+			fire(PhasePeerDone, terminal)
+		}
+	}
+
+	// PhaseReclaimed only fires at a terminal state, and is clean only when
+	// both halves actually completed and the FIN was delivered.
+	if !s.phaseReached[PhaseReclaimed] && ended {
+		cleanLocal := s.localWriteClosed
+		cleanPeer := s.peerDone || s.peerFinAfterRecycle
+		if terminal == nil && cleanLocal && cleanPeer {
+			fire(PhaseReclaimed, nil)
+		} else if s.fatalErr != nil {
+			fire(PhaseReclaimed, s.fatalErr)
+		} else {
+			fire(PhaseReclaimed, io.ErrClosedPipe)
+		}
+	}
 }
 
 // ID returns the stream's unique identifier.
@@ -663,6 +953,7 @@ func (s *stream) CloseWrite() error {
 	defer timer.Stop()
 
 	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA)
+	s.signalLocalWriteClosed(err)
 	s.tryHalfCloseCleanup()
 	return err
 }
@@ -692,7 +983,17 @@ func (s *stream) Close() error {
 	defer timer.Stop()
 
 	_, err := s.sess.writeFrameInternal(f, timer.C, CLSDATA) // NOTE(x): use data channel, EOF as data.
+	s.signalLocalWriteClosed(err)
+
+	// Full local teardown (idempotent): the read side is also abandoned and
+	// the stream is removed from the session. Any buffered data is reclaimed
+	// with the stream and subsequent Reads return EOF.
+	s.dieOnce.Do(func() {
+		close(s.die)
+	})
+	s.tryHalfCloseCleanup()
 	s.sess.streamClosed(s.id)
+	s.signalRecycled()
 	return err
 }
 
@@ -734,7 +1035,12 @@ func (s *stream) SetDeadline(t time.Time) error {
 }
 
 // session closes
-func (s *stream) sessionClose() { s.dieOnce.Do(func() { close(s.die) }) }
+func (s *stream) sessionClose() {
+	s.dieOnce.Do(func() {
+		close(s.die)
+	})
+	s.signalAbandoned()
+}
 
 // LocalAddr satisfies net.Conn interface
 func (s *stream) LocalAddr() net.Addr {
@@ -809,6 +1115,16 @@ func (s *stream) fin() {
 	s.finEventOnce.Do(func() {
 		close(s.chFinEvent)
 	})
+	s.phaseMu.Lock()
+	if s.recycled {
+		// FIN raced with Stream.Close: the stream entry is already gone, but
+		// the peer did complete its write side.
+		s.peerFinAfterRecycle = true
+	} else {
+		s.peerDone = true
+	}
+	s.advancePhasesLocked()
+	s.phaseMu.Unlock()
 	s.tryHalfCloseCleanup()
 }
 
@@ -826,10 +1142,14 @@ func (s *stream) tryHalfCloseCleanup() {
 		return
 	}
 
+	// Both halves have sent FIN: the stream is fully closed in the protocol
+	// sense. Close die and remove it from the session immediately, releasing
+	// any buffered data with it (the long-standing smux behavior).
 	s.dieOnce.Do(func() {
 		close(s.die)
 	})
 	s.sess.streamClosed(s.id)
+	s.signalRecycled()
 }
 
 // stopTimer stops the supplied timer and drains its channel if needed.

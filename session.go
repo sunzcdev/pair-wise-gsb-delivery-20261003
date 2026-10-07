@@ -159,10 +159,44 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	go s.shaperLoop()
 	go s.recvLoop()
 	go s.sendLoop()
+	go s.streamFailLoop()
 	if !config.KeepAliveDisabled {
 		go s.keepalive()
 	}
 	return s
+}
+
+// streamFailLoop terminates any unfinished stream phases when the underlying
+// connection or the protocol breaks, so observers of Stream.WaitPhase never
+// block forever waiting for events that can no longer happen. A clean
+// Session.Close simply closes s.die and exits the loop.
+func (s *Session) streamFailLoop() {
+	var err error
+	select {
+	case <-s.die:
+		return
+	case <-s.chSocketReadError:
+		err = s.socketReadError.Load().(error)
+	case <-s.chSocketWriteError:
+		err = s.socketWriteError.Load().(error)
+	case <-s.chProtoError:
+		err = s.protoError.Load().(error)
+	}
+	s.failAllStreams(err)
+}
+
+// failAllStreams ends every remaining stream with the supplied reason.
+func (s *Session) failAllStreams(err error) {
+	s.streamLock.Lock()
+	streams := make([]*stream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.streamLock.Unlock()
+
+	for _, st := range streams {
+		st.fail(err)
+	}
 }
 
 // OpenStream is used to create a new stream
@@ -371,6 +405,7 @@ func (s *Session) streamClosed(sid uint32) {
 		}
 	}
 	delete(s.streams, sid)
+	stream.signalRecycled()
 }
 
 // returnTokens is called by stream to return token after read
