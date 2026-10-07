@@ -28,6 +28,13 @@ type Client struct {
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
+
+	// Drain state, all protected by mutex.
+	draining       bool          // connection is draining: no new top-level outgoing calls
+	drainComplete  bool          // drain finished waiting and initiated the close
+	drainDone      chan struct{} // closed when the drain procedure reaches its final state
+	drainErr       error         // final result of the drain, valid after drainDone is closed
+	activeHandlers int           // number of inbound handlers currently executing
 }
 
 // NewClient returns a new Client to handle requests to the
@@ -117,6 +124,19 @@ func (c *Client) readLoop() {
 		call.Error = err
 		call.done()
 	}
+	if c.drainDone != nil {
+		// Wake up Drain waiters with a deterministic final state.
+		select {
+		case <-c.drainDone:
+		default:
+			if c.drainComplete || (c.activeHandlers == 0 && len(c.pending) == 0) {
+				c.drainErr = nil
+			} else {
+				c.drainErr = err
+			}
+			close(c.drainDone)
+		}
+	}
 	c.mutex.Unlock()
 	c.sending.Unlock()
 	if err != io.EOF && !closing && !c.server {
@@ -129,6 +149,8 @@ func (c *Client) readLoop() {
 }
 
 func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value) {
+	defer c.handlerDone()
+
 	// Invoke the method, providing a new value for the reply.
 	replyv := reflect.New(method.replyType.Elem())
 
@@ -155,6 +177,14 @@ func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value)
 }
 
 func (c *Client) readRequest(req *Request) error {
+	// Intercept the drain notification from the peer before handler lookup.
+	if req.Method == drainMethod {
+		var discard bool
+		_ = c.codec.ReadRequestBody(&discard)
+		c.peerDrain()
+		return nil
+	}
+
 	method, ok := c.handlers[req.Method]
 	if !ok {
 		resp := &Response{
@@ -181,6 +211,10 @@ func (c *Client) readRequest(req *Request) error {
 		argv = argv.Elem()
 	}
 
+	c.mutex.Lock()
+	c.activeHandlers++
+	c.mutex.Unlock()
+
 	if c.blocking {
 		c.handleRequest(*req, method, argv)
 	} else {
@@ -195,6 +229,7 @@ func (c *Client) readResponse(resp *Response) error {
 	c.mutex.Lock()
 	call := c.pending[seq]
 	delete(c.pending, seq)
+	c.drainCheckLocked()
 	c.mutex.Unlock()
 
 	var err error
@@ -328,6 +363,14 @@ func (c *Client) send(call *Call) {
 		call.done()
 		return
 	}
+	if c.draining && c.activeHandlers == 0 {
+		// Draining: only calls made while an inbound handler is running
+		// (callbacks needed by already accepted work) are allowed.
+		call.Error = ErrDraining
+		c.mutex.Unlock()
+		call.done()
+		return
+	}
 	seq := c.seq
 	c.seq++
 	c.pending[seq] = call
@@ -341,6 +384,7 @@ func (c *Client) send(call *Call) {
 		c.mutex.Lock()
 		call = c.pending[seq]
 		delete(c.pending, seq)
+		c.drainCheckLocked()
 		c.mutex.Unlock()
 		if call != nil {
 			call.Error = err
@@ -354,9 +398,16 @@ func (c *Client) Notify(method string, args interface{}) error {
 	c.sending.Lock()
 	defer c.sending.Unlock()
 
+	c.mutex.Lock()
 	if c.shutdown || c.closing {
+		c.mutex.Unlock()
 		return ErrShutdown
 	}
+	if c.draining && c.activeHandlers == 0 {
+		c.mutex.Unlock()
+		return ErrDraining
+	}
+	c.mutex.Unlock()
 
 	c.request.Seq = 0
 	c.request.Method = method

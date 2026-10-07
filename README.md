@@ -79,3 +79,29 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Graceful shutdown (Drain)
+-------------------------
+
+For rolling updates, `Drain` gracefully shuts down a connection before
+closing it:
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+err := clt.Drain(ctx)
+```
+
+Once `Drain` starts:
+
+- New outgoing calls are rejected with `rpc2.ErrDraining`.
+- The peer is notified so it also stops initiating new requests.
+- Already accepted work continues: inbound handlers keep running and are
+  still served, and calls made back to the peer from within a running
+  handler (nested callbacks) are allowed, so neither side waits for the
+  other to finish.
+
+When all accepted work completes, the connection is closed and `Drain`
+returns nil. If ctx expires, `Drain` stops waiting, closes the connection
+and returns ctx.Err(); in-flight calls are terminated with an error,
+never with a fabricated success.
