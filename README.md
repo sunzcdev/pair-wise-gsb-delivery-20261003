@@ -251,6 +251,44 @@ Please see the internal `intHasher`, `uintHasher`, `stringHasher`, and
 `byteSliceHasher` for examples.
 
 
+## Overlay
+
+The `Overlay` type wraps a large, read-mostly `Map` (the base) with thin,
+immutable update layers. It is designed for read-heavy caches that receive
+small batches of updates but want to avoid rebuilding the large base `Map` on
+every batch.
+
+Reads check the update layers first (newest first) and then the base. A layer
+can hold an explicit deletion via a tombstone, so a deleted key is
+distinguishable from a key whose value is the zero value. Layers are stacked
+until the caller-specified limit is reached; committing a batch that would
+reach that limit synchronously folds the pending layers into a new base `Map`
+(compaction). The previous base and layers are never modified, so existing
+snapshots stay valid.
+
+`maxLayers` bounds the worst-case read cost: a `Get()` performs at most
+`maxLayers - 1` layer probes plus one base probe (`maxLayers` HAMT probes in
+total), regardless of how many updates have ever been applied. Compaction
+runs on the goroutine that commits the batch; there is no background
+compaction thread.
+
+```go
+base := immutable.NewMap[string, int](nil).Set("a", 1).Set("b", 2)
+o := immutable.NewOverlay[string, int](nil, base, 4) // cap at 4 probes
+
+// Accumulate one batch of updates and commit it as a single layer.
+w := o.NewWriter()
+w.Set("c", 3)
+w.Delete("a")
+o = w.Commit() // old overlay snapshot remains readable
+
+o.Get("c")    // 3, true  (checked in the newest layer first)
+o.Get("a")    // 0, false (tombstone hides the base entry)
+o.Len()       // 2
+o.Layers()    // 1
+```
+
+
 ## Sorted Map
 
 The `SortedMap` represents an associative array that maps unique keys to values.
@@ -319,4 +357,3 @@ _please_ open an issue first to discuss. All pull requests without a related
 issue will be closed immediately.
 
 Please submit issues relating to bugs & documentation improvements.
-
