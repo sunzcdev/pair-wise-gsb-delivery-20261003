@@ -1,9 +1,6 @@
 package carddav
 
 import (
-	"fmt"
-	"strings"
-
 	"github.com/emersion/go-vcard"
 )
 
@@ -66,107 +63,14 @@ func Filter(query *AddressBookQuery, aos []AddressObject) ([]AddressObject, erro
 }
 
 // Match reports whether the provided AddressObject matches the query.
-func Match(query *AddressBookQuery, ao *AddressObject) (matched bool, err error) {
-	if query == nil {
-		return true, nil
+//
+// Match is a thin wrapper around ExplainMatch: both derive their verdict from
+// the same read-only evaluation, so the root conclusion returned here is
+// always identical to Explanation.Matched returned by ExplainMatch.
+func Match(query *AddressBookQuery, ao *AddressObject) (bool, error) {
+	explanation, err := ExplainMatch(query, ao, nil)
+	if err != nil {
+		return false, err
 	}
-
-	switch query.FilterTest {
-	default:
-		return false, fmt.Errorf("unknown query filter test %q", query.FilterTest)
-
-	case FilterAnyOf, "":
-		for _, prop := range query.PropFilters {
-			ok, err := matchPropFilter(prop, ao)
-			if err != nil {
-				return false, err
-			}
-			if ok {
-				return true, nil
-			}
-		}
-		return false, nil
-
-	case FilterAllOf:
-		for _, prop := range query.PropFilters {
-			ok, err := matchPropFilter(prop, ao)
-			if err != nil {
-				return false, err
-			}
-			if !ok {
-				return false, nil
-			}
-		}
-		return true, nil
-	}
-}
-
-func matchPropFilter(prop PropFilter, ao *AddressObject) (bool, error) {
-	// TODO: this only matches first field, there could be multiple
-	field := ao.Card.Get(prop.Name)
-	if field == nil {
-		return prop.IsNotDefined, nil
-	} else if prop.IsNotDefined {
-		return false, nil
-	}
-
-	// TODO: handle carddav.PropFilter.Params.
-	if len(prop.TextMatches) == 0 {
-		return true, nil
-	}
-
-	switch prop.Test {
-	default:
-		return false, fmt.Errorf("unknown property filter test %q", prop.Test)
-
-	case FilterAnyOf, "":
-		for _, txt := range prop.TextMatches {
-			ok, err := matchTextMatch(txt, field)
-			if err != nil {
-				return false, err
-			}
-			if ok {
-				return true, nil
-			}
-		}
-		return false, nil
-
-	case FilterAllOf:
-		for _, txt := range prop.TextMatches {
-			ok, err := matchTextMatch(txt, field)
-			if err != nil {
-				return false, err
-			}
-			if !ok {
-				return false, nil
-			}
-		}
-		return true, nil
-	}
-}
-
-func matchTextMatch(txt TextMatch, field *vcard.Field) (bool, error) {
-	// TODO: handle text-match collation attribute
-	var ok bool
-	switch txt.MatchType {
-	default:
-		return false, fmt.Errorf("unknown textmatch type %q", txt.MatchType)
-
-	case MatchEquals:
-		ok = txt.Text == field.Value
-
-	case MatchContains, "":
-		ok = strings.Contains(field.Value, txt.Text)
-
-	case MatchStartsWith:
-		ok = strings.HasPrefix(field.Value, txt.Text)
-
-	case MatchEndsWith:
-		ok = strings.HasSuffix(field.Value, txt.Text)
-	}
-
-	if txt.NegateCondition {
-		ok = !ok
-	}
-	return ok, nil
+	return explanation.Matched(), nil
 }
