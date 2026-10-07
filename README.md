@@ -251,6 +251,39 @@ Please see the internal `intHasher`, `uintHasher`, `stringHasher`, and
 `byteSliceHasher` for examples.
 
 
+## Overlay
+
+The `Overlay` represents an immutable, read-optimized view over a large base
+`Map`. It is intended for read-heavy workloads—such as configuration
+caches—where small batches of updates should not require rebuilding the base
+map. Updates are stacked as layers on top of the base; reads consult the
+layers from newest to oldest and fall through to the base map.
+
+Layers support explicit deletion via tombstone entries (`DeleteEntry`), which
+are distinct from zero values: setting a key to its zero value and deleting
+the key are observable as different operations.
+
+```go
+base := immutable.NewMap[string,int](nil)
+base = base.Set("a", 1)
+
+o := immutable.NewOverlay[string,int](base, 4) // compact after 4 layers
+o = o.Set("a", 100)   // stack a single-key layer
+o = o.Delete("a")     // stack a tombstone layer
+
+v, ok := o.Get("a")   // 0, false — tombstone hides the base value
+```
+
+Batches of updates can be applied at once with `Apply()` using a
+`Map[K, OverlayEntry[V]]`. When the number of layers exceeds the caller-specified
+maximum, the overlay is compacted synchronously: all layers are folded into a
+new base map. Because the layer count is bounded, a `Get()` performs at most
+`maxLayers+1` map lookups in the worst case. No background goroutines are used.
+
+Compaction, like all other operations, is fully immutable—existing overlays,
+layers, and base maps are never modified and remain valid snapshots.
+
+
 ## Sorted Map
 
 The `SortedMap` represents an associative array that maps unique keys to values.
@@ -319,4 +352,3 @@ _please_ open an issue first to discuss. All pull requests without a related
 issue will be closed immediately.
 
 Please submit issues relating to bugs & documentation improvements.
-
