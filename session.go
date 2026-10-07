@@ -104,6 +104,12 @@ type Session struct {
 	streams    map[uint32]*stream // all streams in this session
 	streamLock sync.Mutex         // locks streams
 
+	// inbound stream accounting. Incoming stream IDs use the parity opposite
+	// to the locally allocated IDs: a client receives even IDs and a server
+	// receives odd IDs.
+	incomingParity     uint32
+	numIncomingStreams int // total inbound streams, including those queued for AcceptStream()
+
 	die     chan struct{} // flag session has died
 	dieOnce sync.Once
 	closed  int32 // atomic flag for fast IsClosed check
@@ -139,7 +145,15 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.conn = conn
 	s.config = config
 	s.streams = make(map[uint32]*stream)
-	s.chAccepts = make(chan *stream, defaultAcceptBacklog)
+	backlog := config.MaxAcceptBacklog
+	if backlog <= 0 {
+		backlog = defaultAcceptBacklog
+	}
+	// The backlog can never exceed the total number of inbound streams.
+	if config.MaxIncomingStreams > 0 && backlog > config.MaxIncomingStreams {
+		backlog = config.MaxIncomingStreams
+	}
+	s.chAccepts = make(chan *stream, backlog)
 	s.bucket = int32(config.MaxReceiveBuffer)
 	s.bucketNotify = make(chan struct{}, 1)
 	s.shaper = make(chan writeRequest, maxShaperSize)
@@ -152,8 +166,10 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 
 	if client {
 		s.nextStreamID = 1
+		s.incomingParity = 0
 	} else {
 		s.nextStreamID = 0
+		s.incomingParity = 1
 	}
 
 	go s.shaperLoop()
@@ -192,30 +208,39 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
-		return nil, err
-	}
-
+	// Register the stream before announcing it with cmdSYN. The peer may
+	// answer immediately (e.g. refuse the stream with cmdFIN because its
+	// limits are reached); registering first makes sure such an early frame
+	// is never dropped.
 	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
 	select {
 	case <-s.chSocketReadError:
+		s.streamLock.Unlock()
 		return nil, s.socketReadError.Load().(error)
 	case <-s.chSocketWriteError:
+		s.streamLock.Unlock()
 		return nil, s.socketWriteError.Load().(error)
 	case <-s.die:
+		s.streamLock.Unlock()
 		return nil, io.ErrClosedPipe
 	default:
 		s.streams[sid] = stream
-		wrapper := &Stream{stream: stream}
-		// NOTE(x): disabled finalizer for issue #997
-		/*
-			runtime.SetFinalizer(wrapper, func(s *Stream) {
-				s.Close()
-			})
-		*/
-		return wrapper, nil
+		s.streamLock.Unlock()
 	}
+
+	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+		s.streamClosed(sid)
+		return nil, err
+	}
+
+	wrapper := &Stream{stream: stream}
+	// NOTE(x): disabled finalizer for issue #997
+	/*
+		runtime.SetFinalizer(wrapper, func(s *Stream) {
+			s.Close()
+		})
+	*/
+	return wrapper, nil
 }
 
 // Open returns a generic ReadWriteCloser
@@ -354,6 +379,31 @@ func (s *Session) RemoteAddr() net.Addr {
 	return nil
 }
 
+// incomingLimitReachedLocked reports whether a new inbound stream must be
+// refused. The limit counts every inbound stream already registered plus the
+// ones still queued for AcceptStream() (streamLock must be held).
+func (s *Session) incomingLimitReachedLocked() bool {
+	if cap(s.chAccepts) > 0 && len(s.chAccepts) >= cap(s.chAccepts) {
+		return true
+	}
+	if s.config.MaxIncomingStreams > 0 && s.numIncomingStreams >= s.config.MaxIncomingStreams {
+		return true
+	}
+	return false
+}
+
+// rejectIncomingStream explicitly refuses a stream that exceeds the limits by
+// sending cmdFIN to the peer. The stream is never registered locally, so no
+// entry or receive token is left behind.
+func (s *Session) rejectIncomingStream(sid uint32) {
+	f := newFrame(byte(s.config.Version), cmdFIN, sid)
+	if _, err := s.writeControlFrame(f); err != nil {
+		// The session is likely dying; the peer is released by the
+		// underlying connection close.
+		return
+	}
+}
+
 // notify the session that a stream has closed
 func (s *Session) streamClosed(sid uint32) {
 	s.streamLock.Lock()
@@ -369,6 +419,9 @@ func (s *Session) streamClosed(sid uint32) {
 		if atomic.AddInt32(&s.bucket, int32(n)) > 0 {
 			s.notifyBucket()
 		}
+	}
+	if sid&1 == s.incomingParity {
+		s.numIncomingStreams--
 	}
 	delete(s.streams, sid)
 }
@@ -429,11 +482,21 @@ func (s *Session) recvLoop() {
 				return
 			}
 			var accepted *stream
+			var rejectSID uint32
+			shouldReject := false
 			s.streamLock.Lock()
-			if _, ok := s.streams[sid]; !ok {
-				stream := newStream(sid, s.config.MaxFrameSize, s)
-				s.streams[sid] = stream
-				accepted = stream
+			if _, ok := s.streams[sid]; !ok && sid&1 == s.incomingParity {
+				if s.incomingLimitReachedLocked() {
+					// Refuse the stream without registering it or handing it
+					// to AcceptStream().
+					rejectSID = sid
+					shouldReject = true
+				} else {
+					stream := newStream(sid, s.config.MaxFrameSize, s)
+					s.streams[sid] = stream
+					s.numIncomingStreams++
+					accepted = stream
+				}
 			}
 			s.streamLock.Unlock()
 
@@ -442,6 +505,8 @@ func (s *Session) recvLoop() {
 				case s.chAccepts <- accepted:
 				case <-s.die:
 				}
+			} else if shouldReject {
+				s.rejectIncomingStream(rejectSID)
 			}
 
 		case cmdFIN: // stream closing

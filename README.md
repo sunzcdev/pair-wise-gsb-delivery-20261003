@@ -166,6 +166,8 @@ func server() {
 * `MaxFrameSize`: Maximum size of a frame.
 * `MaxReceiveBuffer`: Maximum size of the shared receive buffer.
 * `MaxStreamBuffer`: Maximum size of the per-stream buffer.
+* `MaxIncomingStreams`: Maximum number of streams the remote side may open, including those not yet accepted. Zero means unlimited; overflow streams are refused with FIN.
+* `MaxAcceptBacklog`: Number of streams that may wait for `AcceptStream()` (default 1024). When full, new streams are refused with FIN instead of blocking the receive loop.
 
 ## Reference
 

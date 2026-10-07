@@ -56,6 +56,22 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// MaxIncomingStreams is used to control the maximum number of
+	// streams that the remote side is allowed to open. The limit counts
+	// every inbound stream, including those not yet handed back by
+	// AcceptStream(). A zero value means no limit. Once the limit is
+	// reached, additional open requests are explicitly rejected with
+	// cmdFIN; the stream ID of a rejected stream is never reused.
+	MaxIncomingStreams int
+
+	// MaxAcceptBacklog is used to control the number of inbound streams
+	// that wait to be handed back by AcceptStream(). A zero value means
+	// the default backlog (1024). When the backlog is full, additional
+	// open requests are explicitly rejected with cmdFIN instead of
+	// blocking the receive loop, so data and window updates of streams
+	// already accepted keep flowing.
+	MaxAcceptBacklog int
 }
 
 // DefaultConfig is used to return a default configuration
@@ -103,6 +119,15 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
+	}
+	if config.MaxIncomingStreams < 0 {
+		return errors.New("max incoming streams cannot be negative")
+	}
+	if config.MaxAcceptBacklog < 0 {
+		return errors.New("max accept backlog cannot be negative")
+	}
+	if config.MaxIncomingStreams > 0 && config.MaxAcceptBacklog > config.MaxIncomingStreams {
+		return errors.New("max accept backlog cannot be larger than max incoming streams")
 	}
 	return nil
 }
