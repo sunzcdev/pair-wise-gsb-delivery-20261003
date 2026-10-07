@@ -221,6 +221,18 @@ func (s *DDSketch) IsEmpty() bool {
 	return s.zeroCount == 0 && s.positiveValueStore.IsEmpty() && s.negativeValueStore.IsEmpty()
 }
 
+// HasCollapsedBins reports whether either value store has folded bins. A
+// collapsed bin does not retain the exact value range of all observations it
+// contains, so CDF comparisons based only on the sketch are less precise.
+func (s *DDSketch) HasCollapsedBins() bool {
+	return storeHasCollapsedBins(s.positiveValueStore) || storeHasCollapsedBins(s.negativeValueStore)
+}
+
+func storeHasCollapsedBins(s store.Store) bool {
+	collapsible, ok := s.(interface{ IsCollapsed() bool })
+	return ok && collapsible.IsCollapsed()
+}
+
 // Return the maximum value that has been added to this sketch. Return a non-nil error if the sketch
 // is empty.
 func (s *DDSketch) GetMaxValue() (float64, error) {

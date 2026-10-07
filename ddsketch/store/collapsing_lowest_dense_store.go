@@ -186,6 +186,10 @@ func (s *CollapsingLowestDenseStore) Clear() {
 	s.isCollapsed = false
 }
 
+func (s *CollapsingLowestDenseStore) IsCollapsed() bool {
+	return s.isCollapsed
+}
+
 func (s *CollapsingLowestDenseStore) DecodeAndMergeWith(r *[]byte, encodingMode enc.SubFlag) error {
 	return DecodeAndMergeWith(s, r, encodingMode)
 }
