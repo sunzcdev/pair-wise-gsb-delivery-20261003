@@ -23,6 +23,35 @@ Usage:
     original := orb.LineString{}
     reduced := simplify.DouglasPeucker(threshold).Simplify(original.Clone())
 
+### Protected vertices (anchors)
+
+Road simplification often has to preserve intersections and toll/billing
+points even when they are almost collinear with the surrounding road. The
+`LineStringWithAnchors` / `RingWithAnchors` methods take a set of protected
+vertex indices that are guaranteed to survive:
+
+```go
+original := orb.LineString{}
+anchors := []int{3, 7} // intersections / billing points, kept by index
+
+// reduced holds the simplified points and indexMap gives, for every reduced
+// point, its index in the original linestring.
+reduced, indexMap := simplify.DouglasPeucker(threshold).LineStringWithAnchors(original.Clone(), anchors)
+```
+
+-   Anchors are matched by **index**, not coordinate, so duplicate
+    coordinates that represent different business points are never
+    deduplicated into one.
+-   The points between two consecutive anchors are still simplified using
+    the configured threshold.
+-   For closed rings the repeated closing point is kept and anchors that
+    straddle the closure are honoured by simplifying the segments on either
+    side of the seam independently.
+-   If an anchor index is out of range the input is returned unchanged with a
+    `nil` map; the input is not modified.
+-   `DouglasPeuckerWithAnchors(threshold, ls, anchors)` is provided as a
+    package-level convenience function.
+
 ## <a name="vis"></a>Visvalingam
 
 See Mike Bostock's explanation for
