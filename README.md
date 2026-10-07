@@ -165,3 +165,37 @@ The gxpath supported three types: number, boolean, string.
 | `unparsed-entity-url()` | ✗         |
 
 [^1]: XPath-2.0 expression
+
+## XSLT patterns (CompilePattern / Match)
+
+When routing XML messages you usually want to ask "does **this** node belong
+to a given structure?" without re-running an XPath selection from the document
+root for every node. `CompilePattern` compiles a restricted [XSLT 1.0
+pattern](https://www.w3.org/TR/1999/REC-xslt-19991116#patterns) and `Match`
+answers that question by walking only the ancestors (and, for positional
+predicates, the siblings) of the current node. The navigator passed to
+`Match` is never moved.
+
+```go
+p, err := xpath.CompilePattern("chapter/section/item[1]")
+if err != nil {
+    // unsupported pattern entry, e.g. id()/key()
+}
+if p.Match(nav) {
+    // nav is the first item that is a child of section/chapter
+}
+```
+
+Supported in the first version:
+
+- name tests (`item`), wildcards (`*`) and prefixed names (`ns:item`)
+- attribute steps (`@lang`, `@*`)
+- child and descendant separators (`/`, `//`)
+- top-level union (`a | b`)
+- positional predicates (`item[1]`, `item[position()=last()-1]`), evaluated
+  against the sibling collection required by the pattern, so `position()` and
+  `last()` reflect the matching siblings rather than always being 1
+
+Not supported and rejected at compile time: `id()`, `key()` and other
+function-call path entries, axes other than child/attribute, and predicates
+that test attribute values or node existence.

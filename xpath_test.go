@@ -652,6 +652,14 @@ func (n *TNodeNavigator) MoveTo(other NodeNavigator) bool {
 	return true
 }
 
+// IsSameNode implements the optional identity interface used by compiled
+// XSLT patterns so attribute nodes can be compared without structural
+// hashing.
+func (n *TNodeNavigator) IsSameNode(other NodeNavigator) bool {
+	node, ok := other.(*TNodeNavigator)
+	return ok && node.curr == n.curr && node.attr == n.attr
+}
+
 func createNode(data string, typ NodeType) *TNode {
 	return &TNode{Data: data, Type: typ, Attr: make([]Attribute, 0)}
 }
