@@ -274,6 +274,43 @@ These appear as separate VEVENTs with the same UID but a `RECURRENCE-ID` propert
   // override represents a cancellation).
 ```
 
+## Processing iTIP scheduling messages
+
+The `itip` sub-package merges out-of-order iTIP messages (`REQUEST`, `REPLY`,
+`CANCEL`, RFC 5546) into a server side calendar store. Versions are ordered by
+`UID` + `RECURRENCE-ID`, then `SEQUENCE`, then `DTSTAMP`; an exact redelivery
+is idempotent, and equal `SEQUENCE`/`DTSTAMP` with different content is a
+conflict. Every message yields an explicit `APPLIED`, `IGNORED` or `CONFLICT`
+result with a machine readable reason.
+
+Authorization always uses the authenticated sender supplied by your transport.
+The `ORGANIZER` property inside the ICS is cross checked but is never trusted
+to grant authority.
+
+```golang
+import "github.com/arran4/golang-ical/itip"
+
+store := itip.NewMemoryStore()
+processor := itip.NewProcessor(store)
+
+// sender comes from your authenticated transport (e.g. verified iMIP mail).
+msg, err := itip.ParseMessage(strings.NewReader(rawICS))
+if err != nil { /* parse error */ }
+
+result, err := processor.Process(itip.Sender{Email: "organizer@example.com"}, msg)
+if err != nil { /* caller/transport misuse, e.g. missing sender identity */ }
+
+switch result.Disposition {
+case itip.DispositionApplied:  // state updated (result.Duplicate for redeliveries)
+case itip.DispositionIgnored:  // stale, unknown object, or future revision
+case itip.DispositionConflict: // needs resolution; result.Reason explains why
+}
+```
+
+Multi-component calendars return one `ComponentResult` per VEVENT in
+`result.Components`, with `CONFLICT > APPLIED > IGNORED` precedence at the top
+level. Implement `itip.Store` to back the processor with a database.
+
 ## Notice
 
 Looking for a co-maintainer.
