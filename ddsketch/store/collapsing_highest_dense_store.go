@@ -185,4 +185,14 @@ func (s *CollapsingHighestDenseStore) DecodeAndMergeWith(r *[]byte, encodingMode
 	return DecodeAndMergeWith(s, r, encodingMode)
 }
 
+func (s *CollapsingHighestDenseStore) IsBinFolded(index int) (foldedBelow, foldedAbove bool) {
+	if s.isCollapsed && index == s.maxIndex {
+		// The extreme bin can aggregate indices arbitrarily higher than
+		// maxIndex; in the single-non-empty-bin degenerate case it aggregates
+		// lower indices as well.
+		return index == s.minIndex, true
+	}
+	return false, false
+}
+
 var _ Store = (*CollapsingHighestDenseStore)(nil)

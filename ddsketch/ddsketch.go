@@ -646,6 +646,18 @@ func (s *DDSketchWithExactSummaryStatistics) ForEach(f func(value, count float64
 	s.DDSketch.ForEach(f)
 }
 
+// CountAbove returns weights about the values v such that v > threshold, using
+// the exact total count tracked by the summary statistics.
+func (s *DDSketchWithExactSummaryStatistics) CountAbove(threshold float64) (ThresholdWeights, error) {
+	return s.DDSketch.countAboveThreshold(threshold, false, s.summaryStatistics.Count())
+}
+
+// CountAtOrAbove returns weights about the values v such that v >= threshold,
+// using the exact total count tracked by the summary statistics.
+func (s *DDSketchWithExactSummaryStatistics) CountAtOrAbove(threshold float64) (ThresholdWeights, error) {
+	return s.DDSketch.countAboveThreshold(threshold, true, s.summaryStatistics.Count())
+}
+
 func (s *DDSketchWithExactSummaryStatistics) Clear() {
 	s.DDSketch.Clear()
 	s.summaryStatistics.Clear()

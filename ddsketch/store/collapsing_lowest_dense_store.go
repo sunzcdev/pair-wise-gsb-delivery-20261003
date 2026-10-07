@@ -17,6 +17,10 @@ type CollapsingLowestDenseStore struct {
 	DenseStore
 	maxNumBins  int
 	isCollapsed bool
+	// fullyCollapsed is set when the store ends up containing a single bin
+	// whose count aggregates both lower and higher indices; the index label of
+	// that bin can then not be used to bound the values it contains either way.
+	fullyCollapsed bool
 }
 
 func NewCollapsingLowestDenseStore(maxNumBins int) *CollapsingLowestDenseStore {
@@ -109,6 +113,11 @@ func (s *CollapsingLowestDenseStore) adjust(newMinIndex, newMaxIndex int) {
 			s.offset = newMinIndex
 			s.minIndex = newMinIndex
 			s.bins[0] = s.count
+			if newMinIndex == newMaxIndex {
+				// With a single bin, counts from indices on both sides of its
+				// label may have been aggregated into it.
+				s.fullyCollapsed = true
+			}
 		} else {
 			shift := s.offset - newMinIndex
 			if shift < 0 {
@@ -176,18 +185,27 @@ func (s *CollapsingLowestDenseStore) Copy() Store {
 			minIndex: s.minIndex,
 			maxIndex: s.maxIndex,
 		},
-		maxNumBins:  s.maxNumBins,
-		isCollapsed: s.isCollapsed,
+		maxNumBins:     s.maxNumBins,
+		isCollapsed:    s.isCollapsed,
+		fullyCollapsed: s.fullyCollapsed,
 	}
 }
 
 func (s *CollapsingLowestDenseStore) Clear() {
 	s.DenseStore.Clear()
 	s.isCollapsed = false
+	s.fullyCollapsed = false
 }
 
 func (s *CollapsingLowestDenseStore) DecodeAndMergeWith(r *[]byte, encodingMode enc.SubFlag) error {
 	return DecodeAndMergeWith(s, r, encodingMode)
+}
+
+func (s *CollapsingLowestDenseStore) IsBinFolded(index int) (foldedBelow, foldedAbove bool) {
+	if s.fullyCollapsed && index == s.minIndex {
+		return true, true
+	}
+	return s.isCollapsed && index == s.minIndex, false
 }
 
 var _ Store = (*CollapsingLowestDenseStore)(nil)

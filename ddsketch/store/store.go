@@ -87,6 +87,19 @@ type Store interface {
 	DecodeAndMergeWith(b *[]byte, binEncodingMode enc.SubFlag) error
 }
 
+// FoldedBinStore is implemented by stores whose extreme bins may aggregate
+// counts whose original indices lie outside the reported index range, i.e.
+// collapsing stores. Consumers that need hard bounds on the value range of a
+// bin use it to widen the extents of those folded extreme bins instead of
+// assuming the bin covers a single index.
+type FoldedBinStore interface {
+	// IsBinFolded reports whether the true extent of the bin at the given
+	// index extends below its labeled index (foldedBelow) or above it
+	// (foldedAbove), because out-of-range bins have been aggregated into it.
+	// Bins that are not a folded extreme bin return false, false.
+	IsBinFolded(index int) (foldedBelow, foldedAbove bool)
+}
+
 // FromProto returns an instance of DenseStore that contains the data in the provided protobuf representation.
 func FromProto(pb *sketchpb.Store) *DenseStore {
 	store := NewDenseStore()
