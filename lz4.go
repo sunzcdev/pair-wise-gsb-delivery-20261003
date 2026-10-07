@@ -49,6 +49,25 @@ func UncompressBlockWithDict(src, dst, dict []byte) (int, error) {
 	return lz4block.UncompressBlock(src, dst, dict)
 }
 
+// UncompressBlockSlices is equivalent to UncompressBlockSlicesWithDict with a
+// nil dictionary.
+func UncompressBlockSlices(src []byte, dst [][]byte) (int, error) {
+	return lz4block.UncompressBlockSlices(src, dst, nil)
+}
+
+// UncompressBlockSlicesWithDict uncompresses the source block into dst, whose
+// slices form one logical destination in order. Literals and matches may cross
+// slice boundaries; matches may refer to dict or to bytes already written to
+// an earlier slice.
+//
+// Destination slices must not overlap. Their total length is checked for
+// overflow before decoding. On error, the returned count is the complete
+// logical prefix written, and only destination bytes covered by that prefix
+// may have been modified.
+func UncompressBlockSlicesWithDict(src []byte, dst [][]byte, dict []byte) (int, error) {
+	return lz4block.UncompressBlockSlices(src, dst, dict)
+}
+
 // A Compressor compresses data into the LZ4 block format.
 // It uses a fast compression algorithm.
 //
