@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/emersion/go-ical"
+	"github.com/emersion/go-webdav"
 )
 
 var propFindSupportedCalendarComponentRequest = `
@@ -232,4 +237,250 @@ func (t testBackend) ListCalendarObjects(ctx context.Context, path string, req *
 
 func (t testBackend) QueryCalendarObjects(ctx context.Context, path string, query *CalendarQuery) ([]CalendarObject, error) {
 	return nil, nil
+}
+
+func calSyncObject(name string) CalendarObject {
+	event := ical.NewEvent()
+	event.Name = ical.CompEvent
+	event.Props.SetText(ical.PropUID, name)
+	event.Props.SetDateTime(ical.PropDateTimeStamp, time.Unix(0, 0).UTC())
+	event.Props.SetText(ical.PropSummary, "Event "+name)
+	cal := ical.NewCalendar()
+	cal.Props.SetText(ical.PropVersion, "2.0")
+	cal.Props.SetText(ical.PropProductID, "-//test//EN")
+	cal.Children = []*ical.Component{event.Component}
+	return CalendarObject{Path: calPath + "/" + name, Data: cal}
+}
+
+func TestSyncCalendarObjects(t *testing.T) {
+	backend := newSyncTestBackend()
+	backend.put(calSyncObject("a.ics"))
+	backend.put(calSyncObject("b.ics"))
+
+	ts := httptest.NewServer(&Handler{Backend: backend})
+	defer ts.Close()
+
+	client, err := NewClient(nil, ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// Initial sync with an empty token.
+	initial, err := client.SyncCollection(ctx, calPath, &SyncQuery{})
+	if err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	if len(initial.Updated) != 2 {
+		t.Fatalf("initial sync: expected 2 updated, got %d", len(initial.Updated))
+	}
+	if len(initial.Deleted) != 0 {
+		t.Fatalf("initial sync: expected 0 deleted, got %d", len(initial.Deleted))
+	}
+	if initial.SyncToken != backend.makeToken(2) {
+		t.Fatalf("initial sync: token = %q, want %q", initial.SyncToken, backend.makeToken(2))
+	}
+
+	// Delete a.ics, recreate it, delete b.ics.
+	backend.del(calPath + "/a.ics")
+	backend.put(calSyncObject("a.ics"))
+	backend.del(calPath + "/b.ics")
+
+	inc, err := client.SyncCollection(ctx, calPath, &SyncQuery{SyncToken: initial.SyncToken})
+	if err != nil {
+		t.Fatalf("incremental sync: %v", err)
+	}
+
+	updated := map[string]bool{}
+	for _, o := range inc.Updated {
+		updated[o.Path] = true
+	}
+	if !updated[calPath+"/a.ics"] {
+		t.Errorf("incremental sync: recreated a.ics missing from updated: %v", updated)
+	}
+	deleted := map[string]bool{}
+	for _, p := range inc.Deleted {
+		deleted[p] = true
+	}
+	if !deleted[calPath+"/b.ics"] {
+		t.Errorf("incremental sync: b.ics missing from deleted: %v", inc.Deleted)
+	}
+
+	// A token minted for calPath used against another existing collection
+	// triggers the valid-sync-token precondition (403).
+	_, err = client.SyncCollection(ctx, calPath2, &SyncQuery{SyncToken: initial.SyncToken})
+	if err == nil {
+		t.Fatal("expected error for foreign token, got nil")
+	}
+	if !strings.Contains(err.Error(), "403") {
+		t.Fatalf("foreign token: expected 403, got %v", err)
+	}
+
+	// A garbage token triggers the same 403.
+	_, err = client.SyncCollection(ctx, calPath, &SyncQuery{SyncToken: "nonsense"})
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("invalid token: expected 403, got %v", err)
+	}
+}
+
+func TestSyncCalendarOptions(t *testing.T) {
+	backend := newSyncTestBackend()
+	ts := httptest.NewServer(&Handler{Backend: backend})
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodOptions, ts.URL+calPath, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if !strings.Contains(resp.Header.Get("Dav"), "sync-token") {
+		t.Errorf("calendar missing sync-token DAV class: %q", resp.Header.Get("Dav"))
+	}
+
+	// A backend without the sync extension keeps the original declaration.
+	plain := httptest.NewServer(&Handler{Backend: testBackend{}})
+	defer plain.Close()
+
+	req2, _ := http.NewRequest(http.MethodOptions, plain.URL+calPath, nil)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if strings.Contains(resp2.Header.Get("Dav"), "sync-token") {
+		t.Errorf("plain backend unexpectedly advertised sync-token: %q", resp2.Header.Get("Dav"))
+	}
+}
+
+// syncTestBackend is a testBackend extended with RFC 6578 sync support.
+type syncTestBackend struct {
+	testBackend
+	mu      sync.Mutex
+	path    string
+	token   int
+	events  []syncTestEvent
+	objects map[string]CalendarObject
+}
+
+type syncTestEvent struct {
+	revision int
+	path     string
+	deleted  bool
+	object   *CalendarObject
+}
+
+const calPath = "/user/calendars/sync"
+
+func newSyncTestBackend() *syncTestBackend {
+	return &syncTestBackend{
+		testBackend: testBackend{calendars: []Calendar{{Path: calPath}, {Path: calPath2}}},
+		path:        calPath,
+		objects:     make(map[string]CalendarObject),
+	}
+}
+
+const calPath2 = "/user/calendars/sync-other"
+
+func (b *syncTestBackend) makeToken(revision int) string {
+	return fmt.Sprintf("%s#%d", b.path, revision)
+}
+
+func parseCalToken(collection, token string) (int, bool) {
+	i := strings.IndexByte(token, '#')
+	if i < 0 || token[:i] != collection {
+		return 0, false
+	}
+	rev, err := strconv.Atoi(token[i+1:])
+	if err != nil {
+		return 0, false
+	}
+	return rev, true
+}
+
+func (b *syncTestBackend) put(obj CalendarObject) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.token++
+	obj.ModTime = time.Unix(int64(b.token), 0).UTC()
+	obj.ETag = fmt.Sprintf("etag-%d", b.token)
+	b.objects[obj.Path] = obj
+	b.events = append(b.events, syncTestEvent{revision: b.token, path: obj.Path, object: &obj})
+}
+
+func (b *syncTestBackend) del(path string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.token++
+	delete(b.objects, path)
+	b.events = append(b.events, syncTestEvent{revision: b.token, path: path, deleted: true})
+}
+
+func (b *syncTestBackend) CurrentCalendarSyncToken(ctx context.Context, path string) (string, error) {
+	if path != b.path && path != calPath2 {
+		return "", webdav.NewHTTPError(http.StatusNotFound, fmt.Errorf("not found"))
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return fmt.Sprintf("%s#%d", path, b.token), nil
+}
+
+func (b *syncTestBackend) GetCalendarObject(ctx context.Context, path string, req *CalendarCompRequest) (*CalendarObject, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if obj, ok := b.objects[path]; ok {
+		return &obj, nil
+	}
+	return nil, webdav.NewHTTPError(http.StatusNotFound, fmt.Errorf("not found"))
+}
+
+func (b *syncTestBackend) SyncCalendarObjects(ctx context.Context, path string, req *SyncQuery) (*SyncResponse, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if path != b.path && path != calPath2 {
+		return nil, webdav.NewHTTPError(http.StatusNotFound, fmt.Errorf("not found"))
+	}
+
+	result := &SyncResponse{SyncToken: fmt.Sprintf("%s#%d", path, b.token)}
+
+	if req.SyncToken == "" {
+		paths := make([]string, 0, len(b.objects))
+		for p := range b.objects {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		for _, p := range paths {
+			result.Updated = append(result.Updated, b.objects[p])
+		}
+		return result, nil
+	}
+
+	baseline, ok := parseCalToken(path, req.SyncToken)
+	if !ok || baseline < 0 || baseline > b.token {
+		return nil, webdav.NewValidSyncTokenError()
+	}
+
+	// Collapse events in (baseline, token] to each member's final state.
+	final := map[string]syncTestEvent{}
+	var order []string
+	for _, ev := range b.events {
+		if ev.revision <= baseline {
+			continue
+		}
+		if _, seen := final[ev.path]; !seen {
+			order = append(order, ev.path)
+		}
+		final[ev.path] = ev
+	}
+	for _, p := range order {
+		ev := final[p]
+		if ev.deleted {
+			result.Deleted = append(result.Deleted, p)
+		} else {
+			result.Updated = append(result.Updated, *ev.object)
+		}
+	}
+	return result, nil
 }

@@ -41,6 +41,31 @@ type Backend interface {
 	webdav.UserPrincipalBackend
 }
 
+// SyncAddressBookBackend is an optional Backend extension providing support
+// for the sync-collection REPORT defined in RFC 6578 on address book
+// collections. Backends which do not implement it keep their original
+// behavior: the server does not advertise the "sync-token" DAV class and
+// sync-collection REPORT requests result in an error.
+type SyncAddressBookBackend interface {
+	// CurrentAddressBookSyncToken returns the current sync token of the
+	// address book collection. It backs the DAV:current-sync-token live
+	// property.
+	CurrentAddressBookSyncToken(ctx context.Context, path string) (string, error)
+
+	// SyncAddressObjects synchronizes an address book collection.
+	//
+	// An empty SyncToken requests an initial synchronization; otherwise the
+	// changes since the given token are returned. An unknown or expired
+	// token MUST result in an error created with
+	// webdav.NewValidSyncTokenError.
+	//
+	// When a Limit is set and more changes are available, the result's
+	// SyncToken must be a continuation token pinned to the snapshot taken at
+	// the start of the operation; the final page carries the snapshot's
+	// committed token.
+	SyncAddressObjects(ctx context.Context, path string, req *SyncQuery) (*SyncResponse, error)
+}
+
 // Handler handles CardDAV HTTP requests. It can be used to create a CardDAV
 // server.
 type Handler struct {
@@ -94,6 +119,8 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
 		return h.handleQuery(r, w, report.Query)
 	} else if report.Multiget != nil {
 		return h.handleMultiget(r.Context(), w, report.Multiget)
+	} else if report.Sync != nil {
+		return h.handleSyncCollection(r, w, report.Sync)
 	}
 	return internal.HTTPErrorf(http.StatusBadRequest, "carddav: expected addressbook-query or addressbook-multiget element in REPORT request")
 }
@@ -251,6 +278,75 @@ func (h *Handler) handleMultiget(ctx context.Context, w http.ResponseWriter, mul
 	return internal.ServeMultiStatus(w, ms)
 }
 
+func (h *Handler) handleSyncCollection(r *http.Request, w http.ResponseWriter, query *internal.SyncCollectionQuery) error {
+	syncBackend, ok := h.Backend.(SyncAddressBookBackend)
+	if !ok {
+		return internal.HTTPErrorf(http.StatusMethodNotAllowed, "carddav: sync-collection REPORT is not supported")
+	}
+
+	if query.SyncLevel != internal.SyncLevel1 {
+		return internal.NewSyncLevelError()
+	}
+
+	if _, err := h.Backend.GetAddressBook(r.Context(), r.URL.Path); err != nil {
+		return err
+	}
+
+	var dataReq AddressDataRequest
+	if query.Prop != nil {
+		var addressData addressDataReq
+		if err := query.Prop.Decode(&addressData); err != nil && !internal.IsNotFound(err) {
+			return err
+		}
+		decoded, err := decodeAddressDataReq(&addressData)
+		if err != nil {
+			return err
+		}
+		dataReq = *decoded
+	}
+
+	var limit int
+	if query.Limit != nil {
+		limit = int(query.Limit.NResults)
+	}
+
+	result, err := syncBackend.SyncAddressObjects(r.Context(), r.URL.Path, &SyncQuery{
+		DataRequest: dataReq,
+		SyncToken:   query.SyncToken,
+		Limit:       limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	propfind := &internal.PropFind{Prop: query.Prop}
+	if query.Prop == nil {
+		propfind.AllProp = &struct{}{}
+	}
+
+	b := backend{
+		Backend: h.Backend,
+		Prefix:  strings.TrimSuffix(h.Prefix, "/"),
+	}
+
+	resps := make([]internal.Response, 0, len(result.Updated)+len(result.Deleted))
+	for i := range result.Updated {
+		ao := &result.Updated[i]
+		resp, err := b.propFindAddressObject(r.Context(), propfind, ao)
+		if err != nil {
+			return err
+		}
+		resps = append(resps, *resp)
+	}
+	for _, path := range result.Deleted {
+		resps = append(resps, *internal.NewDeletedResponse(path))
+	}
+
+	ms := internal.NewMultiStatus(resps...)
+	ms.SyncToken = result.SyncToken
+	return internal.ServeMultiStatus(w, ms)
+}
+
 type backend struct {
 	Backend Backend
 	Prefix  string
@@ -284,7 +380,13 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeAddressObject {
 		// Note: some clients assume the address book is read-only when
 		// DELETE/MKCOL are missing
-		return caps, []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}, nil
+		allow := []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}
+		if b.resourceTypeAtPath(r.URL.Path) == resourceTypeAddressBook {
+			if _, ok := b.Backend.(SyncAddressBookBackend); ok {
+				caps = append(caps, string(webdav.CapabilitySyncCollection))
+			}
+		}
+		return caps, allow, nil
 	}
 
 	var dataReq AddressDataRequest
@@ -498,6 +600,16 @@ func (b *backend) propFindAddressBook(ctx context.Context, propfind *internal.Pr
 			},
 		}),
 		internal.CurrentUserPrivilegeSetName: internal.PropFindValue(internal.NewCurrentUserPrivilegeSet(ab.ReadOnly)),
+	}
+
+	if syncBackend, ok := b.Backend.(SyncAddressBookBackend); ok {
+		props[internal.CurrentSyncTokenName] = func(*internal.RawXMLValue) (interface{}, error) {
+			token, err := syncBackend.CurrentAddressBookSyncToken(ctx, ab.Path)
+			if err != nil {
+				return nil, err
+			}
+			return &internal.CurrentSyncToken{SyncToken: internal.SyncToken{Value: token}}, nil
+		}
 	}
 
 	if ab.Name != "" {

@@ -445,7 +445,8 @@ func (c *Client) SyncCollection(ctx context.Context, path string, query *SyncQue
 	for _, resp := range ms.Responses {
 		p, err := resp.Path()
 		if err != nil {
-			if err, ok := err.(*internal.HTTPError); ok && err.Code == http.StatusNotFound {
+			var httpErr *internal.HTTPError
+			if errors.As(err, &httpErr) && httpErr.Code == http.StatusNotFound {
 				ret.Deleted = append(ret.Deleted, p)
 			} else {
 				errs = append(errs, err)

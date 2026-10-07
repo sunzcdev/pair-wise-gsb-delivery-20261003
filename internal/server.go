@@ -99,6 +99,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			err = h.handlePropfind(w, r)
 		case "PROPPATCH":
 			err = h.handleProppatch(w, r)
+		case "REPORT":
+			err = h.handleReport(w, r)
 		case "MKCOL":
 			err = h.Backend.Mkcol(r)
 			if err == nil {
@@ -248,6 +250,21 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) error 
 
 	ms := NewMultiStatus(*resp)
 	return ServeMultiStatus(w, ms)
+}
+
+// ReportBackend is an optional Backend extension for servers supporting
+// REPORT requests. Backends which do not implement it keep the original
+// behavior: REPORT results in a 405 Method Not Allowed response.
+type ReportBackend interface {
+	Report(w http.ResponseWriter, r *http.Request) error
+}
+
+func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
+	reportBackend, ok := h.Backend.(ReportBackend)
+	if !ok {
+		return HTTPErrorf(http.StatusMethodNotAllowed, "webdav: unsupported method")
+	}
+	return reportBackend.Report(w, r)
 }
 
 func parseDestination(h http.Header) (*Href, error) {

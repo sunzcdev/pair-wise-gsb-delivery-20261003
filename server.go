@@ -75,7 +75,14 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 		allow = append(allow, http.MethodHead, http.MethodGet, http.MethodPut)
 	}
 
-	return nil, allow, nil
+	if fi.IsDir {
+		if _, ok := b.FileSystem.(SyncCollectionFileSystem); ok {
+			caps = append(caps, string(CapabilitySyncCollection))
+			allow = append(allow, "REPORT")
+		}
+	}
+
+	return caps, allow, nil
 }
 
 func (b *backend) HeadGet(w http.ResponseWriter, r *http.Request) error {
@@ -132,14 +139,14 @@ func (b *backend) PropFind(r *http.Request, propfind *internal.PropFind, depth i
 
 		resps = make([]internal.Response, len(children))
 		for i, child := range children {
-			resp, err := b.propFindFile(propfind, &child)
+			resp, err := b.propFindFile(r.Context(), propfind, &child)
 			if err != nil {
 				return nil, err
 			}
 			resps[i] = *resp
 		}
 	} else {
-		resp, err := b.propFindFile(propfind, fi)
+		resp, err := b.propFindFile(r.Context(), propfind, fi)
 		if err != nil {
 			return nil, err
 		}
@@ -150,7 +157,7 @@ func (b *backend) PropFind(r *http.Request, propfind *internal.PropFind, depth i
 	return internal.NewMultiStatus(resps...), nil
 }
 
-func (b *backend) propFindFile(propfind *internal.PropFind, fi *FileInfo) (*internal.Response, error) {
+func (b *backend) propFindFile(ctx context.Context, propfind *internal.PropFind, fi *FileInfo) (*internal.Response, error) {
 	props := make(map[xml.Name]internal.PropFindFunc)
 
 	props[internal.ResourceTypeName] = func(*internal.RawXMLValue) (interface{}, error) {
@@ -159,6 +166,18 @@ func (b *backend) propFindFile(propfind *internal.PropFind, fi *FileInfo) (*inte
 			types = append(types, internal.CollectionName)
 		}
 		return internal.NewResourceType(types...), nil
+	}
+
+	if fi.IsDir {
+		if syncFS, ok := b.FileSystem.(SyncCollectionFileSystem); ok {
+			props[internal.CurrentSyncTokenName] = func(*internal.RawXMLValue) (interface{}, error) {
+				token, err := syncFS.CurrentSyncToken(ctx, fi.Path)
+				if err != nil {
+					return nil, err
+				}
+				return &internal.CurrentSyncToken{SyncToken: internal.SyncToken{Value: token}}, nil
+			}
+		}
 	}
 
 	if !fi.IsDir {

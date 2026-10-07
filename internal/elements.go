@@ -26,6 +26,10 @@ var (
 
 	CurrentUserPrincipalName    = xml.Name{Namespace, "current-user-principal"}
 	CurrentUserPrivilegeSetName = xml.Name{Namespace, "current-user-privilege-set"}
+
+	CurrentSyncTokenName = xml.Name{Namespace, "current-sync-token"}
+	SyncCollectionName   = xml.Name{Namespace, "sync-collection"}
+	ValidSyncTokenName   = xml.Name{Namespace, "valid-sync-token"}
 )
 
 type Status struct {
@@ -139,6 +143,18 @@ func NewErrorResponse(path string, err error) *Response {
 		Status:              &Status{Code: code},
 		ResponseDescription: err.Error(),
 		Error:               errElt,
+	}
+}
+
+// NewDeletedResponse returns a response describing a resource that has been
+// removed, as used in RFC 6578 sync-collection responses.
+//
+// See https://tools.ietf.org/html/rfc6578#section-6.2.
+func NewDeletedResponse(path string) *Response {
+	href := Href{Path: path}
+	return &Response{
+		Hrefs:  []Href{href},
+		Status: &Status{Code: http.StatusNotFound},
 	}
 }
 
@@ -451,6 +467,20 @@ type SyncCollectionQuery struct {
 	Limit     *Limit   `xml:"limit,omitempty"`
 	SyncLevel string   `xml:"sync-level"`
 	Prop      *Prop    `xml:"prop"`
+}
+
+// CurrentSyncToken is the DAV:current-sync-token live property defined in
+// https://tools.ietf.org/html/rfc6578#section-5.1.
+type CurrentSyncToken struct {
+	XMLName   xml.Name  `xml:"DAV: current-sync-token"`
+	SyncToken SyncToken `xml:"sync-token"`
+}
+
+// SyncToken wraps the sync token value as defined in
+// https://tools.ietf.org/html/rfc6578#section-6.1.
+type SyncToken struct {
+	XMLName xml.Name `xml:"DAV: sync-token"`
+	Value   string   `xml:",chardata"`
 }
 
 // https://tools.ietf.org/html/rfc5323#section-5.17

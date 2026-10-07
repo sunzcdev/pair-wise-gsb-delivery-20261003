@@ -44,6 +44,31 @@ type Backend interface {
 	webdav.UserPrincipalBackend
 }
 
+// SyncCalendarBackend is an optional Backend extension providing support for
+// the sync-collection REPORT defined in RFC 6578 on calendar collections.
+// Backends which do not implement it keep their original behavior: the
+// server does not advertise the "sync-token" DAV class and sync-collection
+// REPORT requests result in an error.
+type SyncCalendarBackend interface {
+	// CurrentCalendarSyncToken returns the current sync token of the
+	// calendar collection. It backs the DAV:current-sync-token live
+	// property.
+	CurrentCalendarSyncToken(ctx context.Context, path string) (string, error)
+
+	// SyncCalendarObjects synchronizes a calendar collection.
+	//
+	// An empty SyncToken requests an initial synchronization; otherwise the
+	// changes since the given token are returned. An unknown or expired
+	// token MUST result in an error created with
+	// webdav.NewValidSyncTokenError.
+	//
+	// When a Limit is set and more changes are available, the result's
+	// SyncToken must be a continuation token pinned to the snapshot taken at
+	// the start of the operation; the final page carries the snapshot's
+	// committed token.
+	SyncCalendarObjects(ctx context.Context, path string, req *SyncQuery) (*SyncResponse, error)
+}
+
 // Handler handles CalDAV HTTP requests. It can be used to create a CalDAV
 // server.
 type Handler struct {
@@ -97,6 +122,8 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
 		return h.handleQuery(r, w, report.Query)
 	} else if report.Multiget != nil {
 		return h.handleMultiget(r.Context(), w, report.Multiget)
+	} else if report.Sync != nil {
+		return h.handleSyncCollection(r, w, report.Sync)
 	}
 	return internal.HTTPErrorf(http.StatusBadRequest, "caldav: expected calendar-query or calendar-multiget element in REPORT request")
 }
@@ -287,6 +314,75 @@ func (h *Handler) handleMultiget(ctx context.Context, w http.ResponseWriter, mul
 	return internal.ServeMultiStatus(w, ms)
 }
 
+func (h *Handler) handleSyncCollection(r *http.Request, w http.ResponseWriter, query *internal.SyncCollectionQuery) error {
+	syncBackend, ok := h.Backend.(SyncCalendarBackend)
+	if !ok {
+		return internal.HTTPErrorf(http.StatusMethodNotAllowed, "caldav: sync-collection REPORT is not supported")
+	}
+
+	if query.SyncLevel != internal.SyncLevel1 {
+		return internal.NewSyncLevelError()
+	}
+
+	if _, err := h.Backend.GetCalendar(r.Context(), r.URL.Path); err != nil {
+		return err
+	}
+
+	var dataReq CalendarCompRequest
+	if query.Prop != nil {
+		var calendarData calendarDataReq
+		if err := query.Prop.Decode(&calendarData); err != nil && !internal.IsNotFound(err) {
+			return err
+		}
+		decoded, err := decodeCalendarDataReq(&calendarData)
+		if err != nil {
+			return err
+		}
+		dataReq = *decoded
+	}
+
+	var limit int
+	if query.Limit != nil {
+		limit = int(query.Limit.NResults)
+	}
+
+	result, err := syncBackend.SyncCalendarObjects(r.Context(), r.URL.Path, &SyncQuery{
+		CompRequest: dataReq,
+		SyncToken:   query.SyncToken,
+		Limit:       limit,
+	})
+	if err != nil {
+		return err
+	}
+
+	propfind := &internal.PropFind{Prop: query.Prop}
+	if query.Prop == nil {
+		propfind.AllProp = &struct{}{}
+	}
+
+	b := backend{
+		Backend: h.Backend,
+		Prefix:  strings.TrimSuffix(h.Prefix, "/"),
+	}
+
+	resps := make([]internal.Response, 0, len(result.Updated)+len(result.Deleted))
+	for i := range result.Updated {
+		co := &result.Updated[i]
+		resp, err := b.propFindCalendarObject(r.Context(), propfind, co)
+		if err != nil {
+			return err
+		}
+		resps = append(resps, *resp)
+	}
+	for _, path := range result.Deleted {
+		resps = append(resps, *internal.NewDeletedResponse(path))
+	}
+
+	ms := internal.NewMultiStatus(resps...)
+	ms.SyncToken = result.SyncToken
+	return internal.ServeMultiStatus(w, ms)
+}
+
 type backend struct {
 	Backend Backend
 	Prefix  string
@@ -318,7 +414,13 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 	caps = []string{"calendar-access"}
 
 	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeCalendarObject {
-		return caps, []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}, nil
+		allow := []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}
+		if b.resourceTypeAtPath(r.URL.Path) == resourceTypeCalendar {
+			if _, ok := b.Backend.(SyncCalendarBackend); ok {
+				caps = append(caps, string(webdav.CapabilitySyncCollection))
+			}
+		}
+		return caps, allow, nil
 	}
 
 	var dataReq CalendarCompRequest
@@ -547,6 +649,16 @@ func (b *backend) propFindCalendar(ctx context.Context, propfind *internal.PropF
 			}, nil
 		},
 		internal.CurrentUserPrivilegeSetName: internal.PropFindValue(internal.NewCurrentUserPrivilegeSet(cal.ReadOnly)),
+	}
+
+	if syncBackend, ok := b.Backend.(SyncCalendarBackend); ok {
+		props[internal.CurrentSyncTokenName] = func(*internal.RawXMLValue) (interface{}, error) {
+			token, err := syncBackend.CurrentCalendarSyncToken(ctx, cal.Path)
+			if err != nil {
+				return nil, err
+			}
+			return &internal.CurrentSyncToken{SyncToken: internal.SyncToken{Value: token}}, nil
+		}
 	}
 
 	if cal.Name != "" {
