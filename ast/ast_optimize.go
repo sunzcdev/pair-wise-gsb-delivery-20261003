@@ -270,10 +270,11 @@ func cloneExpr(expr Expression) Expression {
 	switch expr := expr.(type) {
 	case *ActionExpr:
 		return &ActionExpr{
-			Code:   expr.Code,
-			Expr:   cloneExpr(expr.Expr),
-			FuncIx: expr.FuncIx,
-			p:      expr.p,
+			Code:     expr.Code,
+			Expr:     cloneExpr(expr.Expr),
+			FuncIx:   expr.FuncIx,
+			Deferred: expr.Deferred,
+			p:        expr.p,
 		}
 	case *AndExpr:
 		return &AndExpr{

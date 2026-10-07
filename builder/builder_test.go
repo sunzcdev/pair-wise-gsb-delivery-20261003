@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"bytes"
 	"io"
 	"strings"
 	"testing"
@@ -36,5 +37,26 @@ func TestBuildParser(t *testing.T) {
 	}
 	if err := BuildParser(io.Discard, g); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBuildDelayedActionFlag(t *testing.T) {
+	const grammar = `
+start = "a" ~{ return "x", nil }
+`
+	p := bootstrap.NewParser()
+	g, err := p.Parse("", strings.NewReader(grammar))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := BuildParser(&buf, g); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), "deferred: true") {
+		t.Fatal("generated parser is missing the deferred: true action flag")
+	}
+	if !strings.Contains(buf.String(), "registerDeferred") {
+		t.Fatal("generated parser is missing the deferred action runtime")
 	}
 }

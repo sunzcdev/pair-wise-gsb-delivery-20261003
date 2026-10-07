@@ -1,0 +1,27 @@
+{
+package deferredleftrecopt
+}
+
+start = e:expr EOF {
+	return e, nil
+}
+
+// A left-recursive rule. The base case atom registers a delayed action.
+// During seed growth the same atom is re-evaluated via memoization, but the
+// action corresponding to the final accepted expansion must be registered
+// exactly once per atom in the input (not once per growth attempt).
+expr = e:expr "+" t:term ~{
+	return "add", nil
+} / t:term {
+	return t, nil
+}
+
+term = a:atom ~{
+	return "term:" + a.(string), nil
+}
+
+atom = [0-9]+ {
+	return string(c.text), nil
+}
+
+EOF = !.

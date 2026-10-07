@@ -310,6 +310,29 @@ parser will return. E.g.:
 		return string(c.text), nil
 	}
 
+A delayed action is an action code block preceded by a tilde "~". Where a
+plain action runs its Go code as soon as the expression matches, a delayed
+action does not execute any side effect during parsing. Instead the first
+value returned by its code block is registered on the parser. The registered
+operations are handed to the caller only once, after the whole parse
+succeeds, in grammar order. This is useful to record dependencies or emit
+events only for the input path that is ultimately accepted, without having to
+guess afterwards (for example from a global store) which actions belonged to
+a branch that was tried and later discarded by backtracking.
+	RuleA = "A" ~{
+		// the returned value is registered, not executed now
+		return "saw-A", nil
+	}
+Registrations made inside a branch that fails are discarded, and actions
+reached from inside a positive "&" or negative "!" lookahead are never
+committed. The caller receives the surviving operations by passing a
+DeferredCommitter callback through the SetDeferredCommitter option of the
+generated Parse function. If the committer reports an error partway through,
+the returned *DeferredCommitError reports the number of actions already
+committed (the committed boundary); the parser does not roll back external
+side effects already performed by the callback. Plain actions (without "~")
+keep their existing, immediate behavior.
+
 Predicate code blocks are code blocks declared immediately after the and "&"
 or the not "!" operators. Like action code blocks, predicate code blocks
 are turned into a method on the "*current" type in the generated source code.

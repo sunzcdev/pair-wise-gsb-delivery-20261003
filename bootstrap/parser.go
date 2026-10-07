@@ -240,12 +240,21 @@ func (p *Parser) actionExpr() ast.Expression {
 	}
 	act.Expr = expr
 
+	// an optional '~' marks the action as delayed
+	if p.tok.id == tilde {
+		act.Deferred = true
+		p.read()
+	}
+
 	if p.tok.id == code {
 		act.Code = ast.NewCodeBlock(p.tok.pos, p.tok.lit)
 		p.read()
 	}
 
 	if act.Code == nil {
+		if act.Deferred {
+			p.errs.add(p.tok.pos, errors.New("delayed action marker '~' without code block"))
+		}
 		return expr
 	}
 	return act

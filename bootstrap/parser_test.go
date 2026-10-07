@@ -3,6 +3,8 @@ package bootstrap
 import (
 	"strings"
 	"testing"
+
+	"github.com/mna/pigeon/ast"
 )
 
 var parseValidCases = []string{
@@ -92,6 +94,33 @@ func TestParseInvalid(t *testing.T) {
 			if want != got {
 				t.Errorf("%d: error %d: want %q, got %q", i, j, want, got)
 			}
+		}
+	}
+}
+
+func TestParseDelayedAction(t *testing.T) {
+	cases := []struct {
+		gram     string
+		deferred bool
+	}{
+		{`R = "a" { return nil, nil }`, false},
+		{`R = "a" ~{ return nil, nil }`, true},
+		{`R = "a"~{ return nil, nil }`, true},
+	}
+	p := NewParser()
+	for i, c := range cases {
+		g, err := p.Parse("", strings.NewReader(c.gram))
+		if err != nil {
+			t.Errorf("%d: unexpected error: %v", i, err)
+			continue
+		}
+		act, ok := g.Rules[0].Expr.(*ast.ActionExpr)
+		if !ok {
+			t.Errorf("%d: want *ast.ActionExpr, got %T", i, g.Rules[0].Expr)
+			continue
+		}
+		if act.Deferred != c.deferred {
+			t.Errorf("%d: Deferred = %v, want %v", i, act.Deferred, c.deferred)
 		}
 	}
 }

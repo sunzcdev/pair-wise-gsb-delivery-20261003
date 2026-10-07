@@ -34,6 +34,7 @@ const (
 	dot         tid = '.'  // any matcher '.'
 	ampersand   tid = '&'  // and-predicate '&'
 	exclamation tid = '!'  // not-predicate '!'
+	tilde       tid = '~'  // delayed action marker '~'
 	question    tid = '?'  // zero-or-one '?'
 	plus        tid = '+'  // one-or-more '+'
 	star        tid = '*'  // zero-or-more '*'
@@ -60,6 +61,7 @@ var lookup = map[tid]string{
 	dot:         "dot",
 	ampersand:   "ampersand",
 	exclamation: "exclamation",
+	tilde:       "tilde",
 	question:    "question",
 	plus:        "plus",
 	star:        "star",

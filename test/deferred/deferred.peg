@@ -1,0 +1,31 @@
+{
+package deferred
+}
+
+// Input records one action for each accepted item.
+Input ← items:Item+ EOF {
+	return items, nil
+}
+
+// Item tries a branch that fails late (after registering a delayed action)
+// before succeeding with a different branch. Both branches share the same
+// prefix; only the winning action must survive.
+Item ← FailLate / Win
+
+// FailLate matches a letter and registers an action, but then requires a
+// trailing 'z' that is not present, so the registration rolls back and the
+// ordered choice falls through to Win.
+FailLate ← ([a-z] "z") ~{ return "late", nil }
+
+// Win matches a single letter and registers a committed action.
+Win ← [a-y] ~{
+	return "win:" + string(c.text), nil
+}
+
+// Positive and negative lookahead reaching delayed actions never commit.
+Peek ← (&(TaggedA)) "a"
+PeekNot ← (!(TaggedZ)) "a"
+TaggedA ← "a" ~{ return "peek-and", nil }
+TaggedZ ← "z" ~{ return "peek-not", nil }
+
+EOF ← !.

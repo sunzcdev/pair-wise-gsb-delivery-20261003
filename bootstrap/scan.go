@@ -92,7 +92,7 @@ func (s *Scanner) Scan() (Token, bool) {
 				break
 			}
 			fallthrough
-		case ':', ';', '(', ')', '.', '&', '!', '?', '+', '*', '\n':
+		case ':', ';', '(', ')', '.', '&', '!', '?', '+', '*', '~', '\n':
 			tok.id = tid(r)
 			tok.lit = string(r)
 		default:

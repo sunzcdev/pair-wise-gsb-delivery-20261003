@@ -266,6 +266,9 @@ func (b *builder) writeActionExpr(act *ast.ActionExpr) {
 	pos := act.Pos()
 	b.writelnf("\tpos: position{line: %d, col: %d, offset: %d},", pos.Line, pos.Col, pos.Off)
 	b.writelnf("\trun: (*parser).call%s,", b.funcName(act.FuncIx))
+	if act.Deferred {
+		b.writelnf("\tdeferred: true,")
+	}
 	b.writef("\texpr: ")
 	b.writeExpr(act.Expr)
 	b.writelnf("},")

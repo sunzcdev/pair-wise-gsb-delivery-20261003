@@ -266,6 +266,13 @@ type ActionExpr struct {
 	Code   *CodeBlock
 	FuncIx int
 
+	// Deferred is true for delayed actions, written as ~{ ... } in the
+	// grammar. A delayed action does not run its code when the expression
+	// matches. Instead, the value returned by the code block is registered
+	// on the parser and is committed, in syntax order, only if the whole
+	// parse succeeds.
+	Deferred bool
+
 	Nullable bool
 }
 

@@ -79,7 +79,7 @@ ChoiceExpr ← first:ActionExpr rest:( __ "/" __ ActionExpr )* {
     return choice, nil
 }
 
-ActionExpr ← expr:SeqExpr code:( __ CodeBlock )? {
+ActionExpr ← expr:SeqExpr code:( __ deferred:'~'? CodeBlock )? {
     if code == nil {
         return expr, nil
     }
@@ -88,7 +88,8 @@ ActionExpr ← expr:SeqExpr code:( __ CodeBlock )? {
     act := ast.NewActionExpr(pos)
     act.Expr = expr.(ast.Expression)
     codeSlice := toAnySlice(code)
-    act.Code = codeSlice[1].(*ast.CodeBlock)
+    act.Deferred = codeSlice[1] != nil
+    act.Code = codeSlice[2].(*ast.CodeBlock)
 
     return act, nil
 }
@@ -336,4 +337,3 @@ EOL ← '\n'
 EOS ← __ ';' / _ SingleLineComment? EOL / __ EOF
 
 EOF ← !.
-

@@ -166,6 +166,78 @@ func InitState(key string, value any) Option {
 
 // {{ end }} ==template==
 
+// DeferredAction is an operation registered while a delayed action
+// (~{ ... } in the grammar) matches. Delayed actions do not execute their
+// side effects during parsing. Instead, the value they return, available
+// in the Value field, is collected and handed to the parser caller only if
+// the whole parse succeeds.
+type DeferredAction struct {
+	// Value is the value returned by the delayed action code block.
+	Value any
+
+	// Rule is the name of the rule in which the action was registered.
+	Rule string
+
+	// PosLine, PosCol and PosOffset locate the action expression in the
+	// grammar source, for diagnostics.
+	PosLine   int
+	PosCol    int
+	PosOffset int
+}
+
+// DeferredCommitter is the callback invoked with the delayed actions that
+// belong to the accepted parse path, in grammar (syntax) order. It is
+// invoked only when parsing succeeds.
+//
+// The callback must return the number of actions that were successfully
+// committed when an error occurs. Actions are committed one after another,
+// so a returned value of n means that the first n actions committed
+// successfully and that the action at index n failed with the returned
+// error. Returning nil means every action committed successfully.
+//
+// The parser never rolls back external side effects already performed by
+// the callback; it only reports the committed boundary.
+type DeferredCommitter func(actions []DeferredAction) (committed int, err error)
+
+// DeferredCommitError reports that parsing succeeded but the deferred
+// action commit callback failed. It implements the error interface and
+// unwraps to the error returned by the callback.
+type DeferredCommitError struct {
+	// Inner is the error returned by the DeferredCommitter.
+	Inner error
+
+	// Committed is the number of actions that had already committed
+	// successfully when Inner was returned (the committed boundary).
+	Committed int
+
+	// Total is the number of actions that were to be committed.
+	Total int
+}
+
+// Error implements the error interface.
+func (e *DeferredCommitError) Error() string {
+	return fmt.Sprintf("deferred action commit failed after %d of %d actions: %v",
+		e.Committed, e.Total, e.Inner)
+}
+
+// Unwrap returns the error wrapped by the commit failure.
+func (e *DeferredCommitError) Unwrap() error {
+	return e.Inner
+}
+
+// SetDeferredCommitter creates an Option to set the callback invoked with
+// the delayed actions registered on the accepted parse path. Actions are
+// passed in grammar (syntax) order and the callback is invoked only once,
+// after a successful parse. See DeferredCommitter for the contract on the
+// returned values.
+func SetDeferredCommitter(commit DeferredCommitter) Option {
+	return func(p *parser) Option {
+		old := p.commitDeferred
+		p.commitDeferred = commit
+		return SetDeferredCommitter(old)
+	}
+}
+
 // ParseFile parses the file identified by filename.
 func ParseFile(filename string, opts ...Option) (i any, err error) { //{{ if .Nolint }} nolint: deadcode {{else}} ==template== {{ end }}
 	f, err := os.Open(filename)
@@ -266,9 +338,10 @@ type choiceExpr struct {
 
 // {{ if .Nolint }} nolint: structcheck {{else}} ==template== {{ end }}
 type actionExpr struct {
-	pos  position
-	expr any
-	run  func(*parser) (any, error)
+	pos      position
+	expr     any
+	run      func(*parser) (any, error)
+	deferred bool
 }
 
 // {{ if .Nolint }} nolint: structcheck {{else}} ==template== {{ end }}
@@ -408,6 +481,12 @@ func (e errList) Error() string {
 	}
 }
 
+// Unwrap returns the accumulated errors so that errors.Is and errors.As
+// traverse every error in the list.
+func (e errList) Unwrap() []error {
+	return []error(e)
+}
+
 // parserError wraps an error with a prefix indicating the rule in which
 // the error occurred. The original error is stored in the Inner field.
 type parserError struct {
@@ -420,6 +499,11 @@ type parserError struct {
 // Error returns the error message.
 func (p *parserError) Error() string {
 	return p.prefix + ": " + p.Inner.Error()
+}
+
+// Unwrap returns the error wrapped by the parser error.
+func (p *parserError) Unwrap() error {
+	return p.Inner
 }
 
 // newParser creates a parser with the specified input source and options.
@@ -467,6 +551,12 @@ type resultTuple struct {
 	v   any
 	b   bool
 	end savepoint
+	// deferred holds the delayed actions registered while evaluating the
+	// memoized node, relative to the deferred list at entry. They are
+	// replayed when the memoized result is reused, so that the accepted
+	// path keeps its actions in grammar order even though the node itself
+	// is not re-executed.
+	deferred []DeferredAction
 }
 
 // {{ if .Nolint }} nolint: varcheck {{else}} ==template== {{ end }}
@@ -530,6 +620,17 @@ type parser struct {
 	vstack []map[string]any
 	// rule stack, allows identification of the current rule in errors
 	rstack []*rule
+
+	// deferred holds the delayed actions registered so far along the
+	// current parse path. Registrations from branches that end up failing
+	// are discarded via deferredMark and restoreDeferred.
+	deferred []DeferredAction
+	// deferredMark is a stack of snapshots into deferred, one per
+	// backtracking scope (rule, sequence, choice alternative, ...).
+	deferredMark []int
+	// commitDeferred, if set, receives the surviving actions of the
+	// accepted parse path in grammar order.
+	commitDeferred DeferredCommitter
 
 	// parse fail
 	maxFailPos            position
@@ -714,6 +815,69 @@ func (p *parser) restore(pt savepoint) {
 	p.pt = pt
 }
 
+// beginDeferred records the current size of the deferred action list so
+// that the actions registered inside a backtracking scope can be discarded
+// if that scope fails or is speculative (a lookahead).
+func (p *parser) beginDeferred() {
+	p.deferredMark = append(p.deferredMark, len(p.deferred))
+}
+
+// endDeferred drops the most recent deferred scope marker. Actions
+// registered inside the scope are kept.
+func (p *parser) endDeferred() {
+	if n := len(p.deferredMark); n > 0 {
+		p.deferredMark = p.deferredMark[:n-1]
+	}
+}
+
+// restoreDeferred truncates the deferred action list back to the size
+// recorded by the matching beginDeferred, discarding actions registered in
+// a scope that failed or that was a speculative lookahead, and pops the
+// marker.
+func (p *parser) restoreDeferred() {
+	if n := len(p.deferredMark); n > 0 {
+		mark := p.deferredMark[n-1]
+		p.deferredMark = p.deferredMark[:n-1]
+		if mark < len(p.deferred) {
+			p.deferred = p.deferred[:mark]
+		}
+	}
+}
+
+// registerDeferred collects the value returned by a delayed action so it
+// can be committed later, provided the current parse path is accepted.
+func (p *parser) registerDeferred(pos position, val any) {
+	rule := ""
+	if n := len(p.rstack); n > 0 {
+		rule = p.rstack[n-1].name
+	}
+	p.deferred = append(p.deferred, DeferredAction{
+		Value:     val,
+		Rule:      rule,
+		PosLine:   pos.line,
+		PosCol:    pos.col,
+		PosOffset: pos.offset,
+	})
+}
+
+// snapshotDeferred returns the deferred actions registered since mark.
+// The returned slice is an independent copy so it survives later
+// backtracking truncation; it is stored alongside memoized results.
+func (p *parser) snapshotDeferred(mark int) []DeferredAction {
+	if mark >= len(p.deferred) {
+		return nil
+	}
+	acts := make([]DeferredAction, len(p.deferred)-mark)
+	copy(acts, p.deferred[mark:])
+	return acts
+}
+
+// replayDeferred re-appends the deferred actions produced by a memoized
+// expression hit to the current parse path.
+func (p *parser) replayDeferred(acts []DeferredAction) {
+	p.deferred = append(p.deferred, acts...)
+}
+
 // ==template== {{ if or .GlobalState (not .Optimize) }}
 
 // Cloner is implemented by any value that has a Clone method, which returns a
@@ -837,6 +1001,9 @@ func (p *parser) parse(g *grammar) (val any, err error) {
 				default:
 					p.addErr(fmt.Errorf("%v", e))
 				}
+				// A panic aborts the parse, so delayed actions are never
+				// committed.
+				p.deferred = nil
 				err = p.errs.err()
 			}
 		}()
@@ -876,7 +1043,38 @@ func (p *parser) parse(g *grammar) (val any, err error) {
 
 		return nil, p.errs.err()
 	}
+
+	if commitErr := p.commitDeferredActions(); commitErr != nil {
+		p.addErr(commitErr)
+	}
 	return val, p.errs.err()
+}
+
+// commitDeferredActions hands the delayed actions collected on the accepted
+// parse path to the configured committer, in grammar order. It is called
+// only after a successful parse. External side effects already performed by
+// the committer are never rolled back; a failure reports the committed
+// boundary through a *DeferredCommitError.
+func (p *parser) commitDeferredActions() error {
+	if p.commitDeferred == nil || len(p.deferred) == 0 {
+		return nil
+	}
+	actions := p.deferred
+	committed, err := p.commitDeferred(actions)
+	if err == nil {
+		return nil
+	}
+	if committed < 0 {
+		committed = 0
+	}
+	if committed > len(actions) {
+		committed = len(actions)
+	}
+	return &DeferredCommitError{
+		Inner:     err,
+		Committed: committed,
+		Total:     len(actions),
+	}
 }
 
 func listJoin(list []string, sep string, lastSep string) string {
@@ -896,6 +1094,8 @@ func (p *parser) parseRuleRecursiveLeader(rule *rule) (any, bool) {
 	result, ok := p.getMemoized(rule)
 	if ok {
 		p.restore(result.end)
+		// Reuse the actions registered by the stored winning expansion.
+		p.replayDeferred(result.deferred)
 		return result.v, result.b
 	}
 
@@ -906,16 +1106,22 @@ func (p *parser) parseRuleRecursiveLeader(rule *rule) (any, bool) {
 	// {{ end }} ==template==
 
 	var (
-		depth      = 0
-		startMark  = p.pt
-		lastResult = resultTuple{nil, false, startMark}
-		lastErrors = *p.errs
+		depth        = 0
+		startMark    = p.pt
+		deferredBase = len(p.deferred)
+		lastResult   = resultTuple{v: nil, b: false, end: startMark}
+		lastErrors   = *p.errs
 	)
 
 	for {
 		// ==template== {{ if or .GlobalState (not .Optimize) }}
 		lastState := p.cloneState()
 		// {{ end }} ==template==
+		// Each growth attempt must register the delayed actions of its
+		// own accepted expansion. Reset to the actions present before the
+		// rule so a growing seed does not accumulate the same final
+		// actions once per attempt.
+		p.deferred = p.deferred[:deferredBase]
 		p.setMemoized(startMark, rule, lastResult)
 		val, ok := p.parseRule(rule)
 		endMark := p.pt
@@ -930,16 +1136,21 @@ func (p *parser) parseRuleRecursiveLeader(rule *rule) (any, bool) {
 			// ==template== {{ if or .GlobalState (not .Optimize) }}
 			p.restoreState(lastState)
 			// {{ end }} ==template==
+			// discard the actions registered by the failed/non-growing
+			// try and restore those of the current best expansion
+			p.deferred = append(p.deferred[:deferredBase], lastResult.deferred...)
 			*p.errs = lastErrors
 			break
 		}
-		lastResult = resultTuple{val, ok, endMark}
+		lastResult = resultTuple{v: val, b: ok, end: endMark,
+			deferred: p.snapshotDeferred(deferredBase)}
 		lastErrors = *p.errs
 		p.restore(startMark)
 		depth++
 	}
 
 	p.restore(lastResult.end)
+	p.deferred = append(p.deferred[:deferredBase], lastResult.deferred...)
 	p.setMemoized(startMark, rule, lastResult)
 	return lastResult.v, lastResult.b
 }
@@ -955,12 +1166,18 @@ func (p *parser) parseRuleMemoize(rule *rule) (any, bool) {
 	res, ok := p.getMemoized(rule)
 	if ok {
 		p.restore(res.end)
+		p.replayDeferred(res.deferred)
 		return res.v, res.b
 	}
 
 	startMark := p.pt
+	deferredBase := len(p.deferred)
 	val, ok := p.parseRule(rule)
-	p.setMemoized(startMark, rule, resultTuple{val, ok, p.pt})
+	tuple := resultTuple{v: val, b: ok, end: p.pt}
+	if ok {
+		tuple.deferred = p.snapshotDeferred(deferredBase)
+	}
+	p.setMemoized(startMark, rule, tuple)
 
 	return val, ok
 }
@@ -1024,7 +1241,13 @@ func (p *parser) parseRuleWrap(rule *rule) (any, bool) {
 func (p *parser) parseRule(rule *rule) (any, bool) {
 	p.rstack = append(p.rstack, rule)
 	p.pushV()
+	p.beginDeferred()
 	val, ok := p.parseExprWrap(rule.expr)
+	if ok {
+		p.endDeferred()
+	} else {
+		p.restoreDeferred()
+	}
 	p.popV()
 	p.rstack = p.rstack[:len(p.rstack)-1]
 	return val, ok
@@ -1033,6 +1256,7 @@ func (p *parser) parseRule(rule *rule) (any, bool) {
 func (p *parser) parseExprWrap(expr any) (any, bool) {
 	// ==template== {{ if not .Optimize }}
 	var pt savepoint
+	deferredBase := len(p.deferred)
 
 	// ==template== {{ if .LeftRecursion }}
 	isLeftRecursion := p.rstack[len(p.rstack)-1].leftRecursive
@@ -1043,6 +1267,7 @@ func (p *parser) parseExprWrap(expr any) (any, bool) {
 		res, ok := p.getMemoized(expr)
 		if ok {
 			p.restore(res.end)
+			p.replayDeferred(res.deferred)
 			return res.v, res.b
 		}
 		pt = p.pt
@@ -1057,7 +1282,11 @@ func (p *parser) parseExprWrap(expr any) (any, bool) {
 	// {{ else }}
 	if p.memoize {
 	// {{ end }} ==template==
-		p.setMemoized(pt, expr, resultTuple{val, ok, p.pt})
+		tuple := resultTuple{v: val, b: ok, end: p.pt}
+		if ok {
+			tuple.deferred = p.snapshotDeferred(deferredBase)
+		}
+		p.setMemoized(pt, expr, tuple)
 	}
 	// {{ end }} ==template==
 	return val, ok
@@ -1140,7 +1369,15 @@ func (p *parser) parseActionExpr(act *actionExpr) (any, bool) {
 		p.restoreState(state)
 		// {{ end }} ==template==
 
-		val = actVal
+		if act.deferred {
+			// A delayed action only registers the value it produced; the
+			// operation is committed later, on the accepted path. The
+			// expression value is left untouched so labels and enclosing
+			// actions see the matched sub-expression as usual.
+			p.registerDeferred(act.pos, actVal)
+		} else {
+			val = actVal
+		}
 	}
 	// ==template== {{ if not .Optimize }}
 	if ok && p.debug {
@@ -1183,12 +1420,17 @@ func (p *parser) parseAndExpr(and *andExpr) (any, bool) {
 	// ==template== {{ if or .GlobalState (not .Optimize) }}
 	state := p.cloneState()
 	// {{ end }} ==template==
+	p.beginDeferred()
 	p.pushV()
 	_, ok := p.parseExprWrap(and.expr)
 	p.popV()
 	// ==template== {{ if or .GlobalState (not .Optimize) }}
 	p.restoreState(state)
 	// {{ end }} ==template==
+	// and-predicates are speculative: they consume no input and must not
+	// commit actions, so any registration is discarded regardless of the
+	// predicate result.
+	p.restoreDeferred()
 	p.restore(pt)
 
 	return nil, ok
@@ -1326,11 +1568,14 @@ func (p *parser) parseChoiceExpr(ch *choiceExpr) (any, bool) {
 		// ==template== {{ if or .GlobalState (not .Optimize) }}
 		state := p.cloneState()
 		// {{ end }} ==template==
+		// discard registrations made by an alternative that does not win
+		p.beginDeferred()
 
 		p.pushV()
 		val, ok := p.parseExprWrap(alt)
 		p.popV()
 		if ok {
+			p.endDeferred()
 			// ==template== {{ if not .Optimize }}
 			p.incChoiceAltCnt(ch, altI)
 			// {{ end }} ==template==
@@ -1339,6 +1584,7 @@ func (p *parser) parseChoiceExpr(ch *choiceExpr) (any, bool) {
 		// ==template== {{ if or .GlobalState (not .Optimize) }}
 		p.restoreState(state)
 		// {{ end }} ==template==
+		p.restoreDeferred()
 	}
 	// ==template== {{ if not .Optimize }}
 	p.incChoiceAltCnt(ch, choiceNoMatch)
@@ -1420,6 +1666,7 @@ func (p *parser) parseNotExpr(not *notExpr) (any, bool) {
 	// ==template== {{ if or .GlobalState (not .Optimize) }}
 	state := p.cloneState()
 	// {{ end }} ==template==
+	p.beginDeferred()
 	p.pushV()
 	p.maxFailInvertExpected = !p.maxFailInvertExpected
 	_, ok := p.parseExprWrap(not.expr)
@@ -1428,6 +1675,9 @@ func (p *parser) parseNotExpr(not *notExpr) (any, bool) {
 	// ==template== {{ if or .GlobalState (not .Optimize) }}
 	p.restoreState(state)
 	// {{ end }} ==template==
+	// not-predicates are speculative and consume no input: registrations
+	// made while evaluating the inner expression are never committed.
+	p.restoreDeferred()
 	p.restore(pt)
 
 	return nil, !ok
@@ -1443,16 +1693,19 @@ func (p *parser) parseOneOrMoreExpr(expr *oneOrMoreExpr) (any, bool) {
 	var vals []any
 
 	for {
+		p.beginDeferred()
 		p.pushV()
 		val, ok := p.parseExprWrap(expr.expr)
 		p.popV()
 		if !ok {
+			p.restoreDeferred()
 			if len(vals) == 0 {
 				// did not match once, no match
 				return nil, false
 			}
 			return vals, true
 		}
+		p.endDeferred()
 		vals = append(vals, val)
 	}
 }
@@ -1504,17 +1757,20 @@ func (p *parser) parseSeqExpr(seq *seqExpr) (any, bool) {
 	// ==template== {{ if or .GlobalState (not .Optimize) }}
 	state := p.cloneState()
 	// {{ end }} ==template==
+	p.beginDeferred()
 	for _, expr := range seq.exprs {
 		val, ok := p.parseExprWrap(expr)
 		if !ok {
 			// ==template== {{ if or .GlobalState (not .Optimize) }}
 			p.restoreState(state)
 			// {{ end }} ==template==
+			p.restoreDeferred()
 			p.restore(pt)
 			return nil, false
 		}
 		vals = append(vals, val)
 	}
+	p.endDeferred()
 	return vals, true
 }
 
@@ -1565,12 +1821,17 @@ func (p *parser) parseZeroOrMoreExpr(expr *zeroOrMoreExpr) (any, bool) {
 	var vals []any
 
 	for {
+		p.beginDeferred()
 		p.pushV()
 		val, ok := p.parseExprWrap(expr.expr)
 		p.popV()
 		if !ok {
+			// the failed probe matches zero repetitions: it is not part
+			// of the accepted path, drop its registrations
+			p.restoreDeferred()
 			return vals, true
 		}
+		p.endDeferred()
 		vals = append(vals, val)
 	}
 }
@@ -1582,9 +1843,15 @@ func (p *parser) parseZeroOrOneExpr(expr *zeroOrOneExpr) (any, bool) {
 	}
 
 	// {{ end }} ==template==
+	p.beginDeferred()
 	p.pushV()
-	val, _ := p.parseExprWrap(expr.expr)
+	val, ok := p.parseExprWrap(expr.expr)
 	p.popV()
+	if ok {
+		p.endDeferred()
+	} else {
+		p.restoreDeferred()
+	}
 	// whether it matched or not, consider it a match
 	return val, true
 }
