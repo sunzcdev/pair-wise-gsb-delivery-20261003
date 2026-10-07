@@ -67,6 +67,15 @@ type Schema struct {
 	// passes a nil slab, so scalar decodes stay allocation-free even when GC
 	// has drained the pool. false is the safe default.
 	slabFree bool
+
+	// cmpOnce lazily compiles the schema-based binary comparator used by
+	// [Schema.Compare]. It is not built at parse time because record
+	// comparators compile inside sync.Once closures, the same pattern their
+	// skippers use (skip.go), which lets a record name itself. cmpfn and
+	// cmpErr are meaningful only after cmpOnce fires.
+	cmpOnce sync.Once
+	cmpfn   cmpfn
+	cmpErr  error
 }
 
 // customWiring bundles the per-node custom-type artifacts. We allocate one
@@ -164,6 +173,29 @@ type fieldNode struct {
 	node       *schemaNode
 	defaultVal any
 	hasDefault bool
+	// order is the field's sort order, encoded as orderAsc/orderDesc/
+	// orderIgnore. An absent "order" attribute is ascending, as in Java.
+	// It drives the schema-based binary comparator (compare.go).
+	order uint8
+}
+
+// Record field sort orders, stored compactly on fieldNode.order. orderAsc is
+// the zero value so a field built without an explicit "order" compares
+// ascending.
+const (
+	orderAsc uint8 = iota
+	orderDesc
+	orderIgnore
+)
+
+// fieldOrderCode maps a validated order token to its stored code. The parser
+// rejects every other token, so an absent token (the empty string) defaults
+// to ascending rather than keying this map.
+var fieldOrderCode = map[string]uint8{
+	"":           orderAsc,
+	"ascending":  orderAsc,
+	"descending": orderDesc,
+	"ignore":     orderIgnore,
 }
 
 type parseOptLax struct{ fn func(string) error }
@@ -2695,6 +2727,7 @@ func (b *builder) buildRecord(o *aobject) error {
 			nameVal: reflect.ValueOf(of.Name),
 			aliases: fieldAliases[i],
 			node:    bf.node,
+			order:   fieldOrderCode[of.Order],
 		}
 		if isFwdRef {
 			fix := recordFieldFixup{
