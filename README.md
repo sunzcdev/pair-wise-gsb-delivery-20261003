@@ -165,3 +165,38 @@ The gxpath supported three types: number, boolean, string.
 | `unparsed-entity-url()` | ✗         |
 
 [^1]: XPath-2.0 expression
+
+# XSLT Pattern Matching
+
+For message routing you often only need to know whether the *current* node
+belongs to a structure, rather than selecting nodes by evaluating a path from
+the document root. `CompilePattern` compiles an XSLT 1.0 pattern once and
+`Pattern.Match` answers that question by walking the current node's ancestor
+chain and its same-level siblings only; it never searches the whole tree.
+
+```go
+pat, err := xpath.CompilePattern("order/item[last()]/@priority")
+if err != nil {
+    log.Fatal(err)
+}
+if pat.Match(nav) {
+    // the current node matches the pattern
+}
+```
+
+Use `CompilePatternWithNS(expr, namespaces)` to bind namespace prefixes.
+
+Supported XSLT 1.0 pattern subset:
+
+- name tests and the `*` wildcard (including `prefix:*`),
+- attribute steps via `@name` or `attribute::name`,
+- child steps separated by `/` and descendant steps separated by `//`,
+- union alternatives separated by `|`,
+- predicates, including positional predicates such as `[1]`,
+  `[position()=2]` and `[last()]`.
+
+Pattern entry forms such as `id()` and `key()` are not supported and are
+rejected at compile time. Inside predicates, `position()` and `last()` refer
+to the sibling collection required by the enclosing pattern step (the
+parent's children, or the owning element's attributes, filtered by that
+step's node test).

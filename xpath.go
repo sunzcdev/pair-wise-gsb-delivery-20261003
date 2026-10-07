@@ -70,6 +70,14 @@ type NodeNavigator interface {
 	MoveTo(NodeNavigator) bool
 }
 
+// NodeComparer is an optional interface implemented by navigators that can
+// compare two positions for node identity. Pattern matching uses it to track
+// the candidate node inside a sibling collection when available, falling back
+// to structural comparison otherwise.
+type NodeComparer interface {
+	IsSameNode(other NodeNavigator) bool
+}
+
 // NodeIterator holds all matched Node object.
 type NodeIterator struct {
 	node   NodeNavigator

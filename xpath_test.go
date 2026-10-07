@@ -652,6 +652,15 @@ func (n *TNodeNavigator) MoveTo(other NodeNavigator) bool {
 	return true
 }
 
+// IsSameNode implements NodeComparer for exact identity in pattern matching.
+func (n *TNodeNavigator) IsSameNode(other NodeNavigator) bool {
+	node, ok := other.(*TNodeNavigator)
+	if !ok {
+		return false
+	}
+	return n.curr == node.curr && n.attr == node.attr
+}
+
 func createNode(data string, typ NodeType) *TNode {
 	return &TNode{Data: data, Type: typ, Attr: make([]Attribute, 0)}
 }

@@ -742,6 +742,9 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
 			name = n.Prefix + ":" + name
 		}
 		err = fmt.Errorf("undeclared variable in XPath expression: $%s", name)
+	case nodeContextNumber:
+		n := root.(*contextNumberNode)
+		q = &contextNumberQuery{ctx: n.ctx, kind: n.kind}
 	}
 	b.parseDepth--
 	return

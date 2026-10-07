@@ -67,6 +67,7 @@ const (
 	nodeVariable
 	nodeConstantOperand
 	nodeGroup
+	nodeContextNumber
 )
 
 type parser struct {
