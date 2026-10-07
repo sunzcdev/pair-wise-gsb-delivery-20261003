@@ -20,4 +20,5 @@ const (
 	ErrEndOfStream                   Error = "lz4: end of stream reached"
 	ErrInvalidFrameDescriptor        Error = "lz4: invalid or unsupported frame descriptor"
 	ErrInvalidContentSize            Error = "lz4: content size mismatch"
+	ErrDictionaryNotFound            Error = "lz4: dictionary not found"
 )

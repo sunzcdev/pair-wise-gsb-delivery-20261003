@@ -414,8 +414,8 @@ func malformedCases(t testing.TB) []malformedCase {
 		{"descriptor/reservedBDLow", cat(magic, desc(F, bd64K|0x01), endMark), nil, lz4.ErrInvalidFrameDescriptor},
 		{"descriptor/reservedBDMid", cat(magic, desc(F, bd64K|0x08), endMark), nil, lz4.ErrInvalidFrameDescriptor},
 		{"descriptor/reservedBDHigh", cat(magic, desc(F, bd64K|0x80), endMark), nil, lz4.ErrInvalidFrameDescriptor},
-		{"descriptor/dictID", cat(magic, desc(F|flgDict, bd64K, 1, 2, 3, 4), endMark), nil, lz4.ErrInvalidFrameDescriptor},
-		{"descriptor/dictIDAndSize", cat(magic, desc(F|flgDict|flgSize, bd64K, cat(le64(0), le32(7))...), endMark), nil, lz4.ErrInvalidFrameDescriptor},
+		{"descriptor/dictID", cat(magic, desc(F|flgDict, bd64K, 1, 2, 3, 4), endMark), nil, lz4.ErrDictionaryNotFound},
+		{"descriptor/dictIDAndSize", cat(magic, desc(F|flgDict|flgSize, bd64K, cat(le64(0), le32(7))...), endMark), nil, lz4.ErrDictionaryNotFound},
 
 		{"block/tooBigRaw", cat(hdr, le32(uint32(lz4.Block64Kb)+1|1<<31)), nil, lz4.ErrOptionInvalidBlockSize},
 		{"block/tooBigCompressed", cat(hdr, le32(uint32(lz4.Block64Kb)+1)), nil, lz4.ErrOptionInvalidBlockSize},

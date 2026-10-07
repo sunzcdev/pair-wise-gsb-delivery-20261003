@@ -200,6 +200,56 @@ func CompressionLevelOption(level CompressionLevel) Option {
 
 func onBlockDone(int) {}
 
+// FrameDictionary is a read-only preset dictionary returned by a
+// DictionaryResolver.
+//
+// Data must stay valid and must not be modified until Release is called:
+// the decoder reads it, possibly while decompressing multiple blocks. The
+// LZ4 block format references at most 64KiB of history, so only the final
+// 64KiB of Data is used; a longer Data is accepted and its head is ignored.
+//
+// Release, if non-nil, is called once when the Reader is done with the
+// dictionary: at a normal frame end, on any error while reading the frame,
+// or on Reset. A resolver that returns an error must return a nil release
+// function; it is not called.
+type FrameDictionary struct {
+	Data    []byte
+	Release func()
+}
+
+// DictionaryResolver looks up the preset dictionary identified by a frame's
+// dictionary ID. It is called once per frame that declares an ID, after the
+// frame header has been parsed and verified. The ID is an opaque key: the
+// library never validates Data against it, and the frame's content checksum
+// remains the only integrity check.
+//
+// A nil dictionary and nil error indicate that the ID is unknown; the frame
+// is then rejected with ErrDictionaryNotFound. A non-nil error rejects the
+// frame with that error.
+type DictionaryResolver func(id uint32) (*FrameDictionary, error)
+
+// DictionaryResolverOption sets the resolver used to load preset dictionaries
+// for frames that carry a dictionary ID. Without one, such frames fail with
+// ErrDictionaryNotFound. The option only applies to a Reader.
+func DictionaryResolverOption(resolver DictionaryResolver) Option {
+	return func(a applier) error {
+		switch rw := a.(type) {
+		case nil:
+			s := "DictionaryResolverOption("
+			if resolver == nil {
+				s += "nil"
+			} else {
+				s += reflect.TypeOf(resolver).String()
+			}
+			return lz4errors.Error(s + ")")
+		case *Reader:
+			rw.resolveDict = resolver
+			return nil
+		}
+		return lz4errors.ErrOptionNotApplicable
+	}
+}
+
 // OnBlockDoneOption is triggered when a block has been processed. For a Writer, it is when is has been compressed,
 // for a Reader, it is when it has been uncompressed.
 func OnBlockDoneOption(handler func(size int)) Option {

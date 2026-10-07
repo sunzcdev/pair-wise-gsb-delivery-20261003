@@ -48,6 +48,7 @@ func (f *Frame) Reset(num int) {
 	f.Magic = 0
 	f.Descriptor.Checksum = 0
 	f.Descriptor.ContentSize = 0
+	f.Descriptor.DictionaryID = 0
 	_ = f.Blocks.close(f, num)
 	f.Checksum = 0
 }
@@ -162,9 +163,10 @@ func (f *Frame) CloseR(src io.Reader) (err error) {
 }
 
 type FrameDescriptor struct {
-	Flags       DescriptorFlags
-	ContentSize uint64
-	Checksum    uint8
+	Flags        DescriptorFlags
+	ContentSize  uint64
+	DictionaryID uint32
+	Checksum     uint8
 }
 
 func (fd *FrameDescriptor) initW() {
@@ -226,6 +228,15 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 	if fd.Flags.Size() {
 		fd.ContentSize = binary.LittleEndian.Uint64(buf[2:])
 	}
+	if fd.Flags.dictID() {
+		// The dictionary ID immediately follows the flags (and optional
+		// content size); the checksum byte follows it.
+		off := 2
+		if fd.Flags.Size() {
+			off += 8
+		}
+		fd.DictionaryID = binary.LittleEndian.Uint32(buf[off:])
+	}
 	fd.Checksum = buf[len(buf)-1] // the checksum is the last byte
 	buf = buf[:len(buf)-1]        // all descriptor fields except checksum
 	if c := descriptorChecksum(buf); fd.Checksum != c {
@@ -237,11 +248,6 @@ func (fd *FrameDescriptor) initR(f *Frame, src io.Reader) error {
 	}
 	if fd.Flags&descriptorReserved != 0 {
 		return fmt.Errorf("%w: reserved bits %#04x set", lz4errors.ErrInvalidFrameDescriptor, uint16(fd.Flags&descriptorReserved))
-	}
-	if fd.Flags.dictID() {
-		// Frame dictionaries are not supported: decoding without one would
-		// produce garbage.
-		return fmt.Errorf("%w: dictionary ID %#x", lz4errors.ErrInvalidFrameDescriptor, binary.LittleEndian.Uint32(buf[len(buf)-4:]))
 	}
 	if idx := fd.Flags.BlockSizeIndex(); !idx.IsValid() {
 		return lz4errors.ErrOptionInvalidBlockSize
@@ -258,6 +264,10 @@ const (
 )
 
 func (x DescriptorFlags) dictID() bool { return x&descriptorDictID != 0 }
+
+// DictionaryID reports whether the frame descriptor carries a preset
+// dictionary ID. Its value is stored in the FrameDescriptor.
+func (x DescriptorFlags) DictionaryID() bool { return x.dictID() }
 
 func descriptorChecksum(buf []byte) byte {
 	return byte(xxh32.ChecksumZero(buf) >> 8)

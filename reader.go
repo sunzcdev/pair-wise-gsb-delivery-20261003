@@ -2,12 +2,18 @@ package lz4
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 
 	"github.com/pierrec/lz4/v4/internal/lz4block"
 	"github.com/pierrec/lz4/v4/internal/lz4errors"
 	"github.com/pierrec/lz4/v4/internal/lz4stream"
 )
+
+// dictWindowSize is the amount of history an LZ4 block can reference:
+// block offsets are 16 bits, so only the final 64KiB of a preset
+// dictionary is ever used.
+const dictWindowSize = 64 * 1024
 
 var readerStates = []aState{
 	noState:     newState,
@@ -18,6 +24,10 @@ var readerStates = []aState{
 }
 
 // NewReader returns a new LZ4 frame decoder.
+//
+// Frames that carry a preset dictionary ID require a DictionaryResolver,
+// configured with DictionaryResolverOption; without one they fail with
+// ErrDictionaryNotFound.
 func NewReader(r io.Reader) *Reader {
 	return newReader(r, false)
 }
@@ -41,7 +51,13 @@ type Reader struct {
 	idx     int              // size of pending data
 	handler func(int)
 	cum     uint32
-	dict    []byte
+	// dict is the working history passed to the block decoder. For a frame
+	// with a preset dictionary it starts with a private copy of the
+	// dictionary's final 64KiB; in linked blocks it grows with the decoded
+	// blocks. It is never the resolver's slice, so append may reuse it.
+	dict        []byte
+	resolveDict DictionaryResolver
+	releaseDict func()
 }
 
 func (*Reader) private() {}
@@ -83,10 +99,21 @@ func (r *Reader) init() error {
 	if err != nil {
 		return err
 	}
-	if !r.frame.Descriptor.Flags.BlockIndependence() {
-		// We can't decompress dependent blocks concurrently.
-		// Instead of throwing an error to the user, silently drop concurrency
+	// A new frame starts with no history from any previous frame.
+	r.dict = nil
+	r.releaseDict = nil
+	if !r.frame.Descriptor.Flags.BlockIndependence() ||
+		r.frame.Descriptor.Flags.DictionaryID() {
+		// Dependent blocks build on previously decoded blocks, and a frame
+		// with a preset dictionary needs the same dictionary for every block
+		// plus a well-defined release point: neither can be decompressed
+		// concurrently. Silently drop concurrency rather than failing.
 		r.num = 1
+		if r.frame.Descriptor.Flags.DictionaryID() {
+			if err = r.loadDictionary(r.frame.Descriptor.DictionaryID); err != nil {
+				return err
+			}
+		}
 	}
 	data, err := r.frame.InitR(r.src, r.num)
 	if err != nil {
@@ -98,6 +125,42 @@ func (r *Reader) init() error {
 	r.data = size.Get()
 	r.cum = 0
 	return nil
+}
+
+// loadDictionary resolves the frame's preset dictionary by ID and takes a
+// private, owned copy of its usable window. The dictionary ID is treated as
+// an opaque key: its contents are never validated against it. The resolver's
+// release function is retained until the frame ends, errors, or is reset.
+func (r *Reader) loadDictionary(id uint32) error {
+	if r.resolveDict == nil {
+		return fmt.Errorf("%w: ID %#x", lz4errors.ErrDictionaryNotFound, id)
+	}
+	d, err := r.resolveDict(id)
+	if err != nil {
+		return err
+	}
+	if d == nil {
+		return fmt.Errorf("%w: ID %#x", lz4errors.ErrDictionaryNotFound, id)
+	}
+	r.releaseDict = d.Release
+	window := d.Data
+	if len(window) > dictWindowSize {
+		// Only the final 64KiB can ever be referenced.
+		window = window[len(window)-dictWindowSize:]
+	}
+	// Copy into r-owned storage so appending decoded blocks never writes
+	// into the resolver's read-only buffer.
+	r.dict = append(r.dict, window...)
+	return nil
+}
+
+// releaseFrameDict releases the current frame's preset dictionary, if any.
+// It is safe to call repeatedly and between frames.
+func (r *Reader) releaseFrameDict() {
+	if r.releaseDict != nil {
+		r.releaseDict()
+		r.releaseDict = nil
+	}
 }
 
 func (r *Reader) Read(buf []byte) (n int, err error) {
@@ -135,6 +198,7 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 				// Read Checksum.
 				err = r.frame.CloseR(r.src)
 				if err != nil {
+					r.releaseFrameDict()
 					return
 				}
 
@@ -149,12 +213,14 @@ func (r *Reader) Read(buf []byte) (n int, err error) {
 				if er := r.frame.CloseR(r.src); er != nil {
 					err = er
 				}
+				r.releaseFrameDict()
 				lz4block.Put(r.data)
 				r.data = nil
 				// reset frame to release the buffer held by Block
 				r.frame.Reset(r.num)
 				return
 			default:
+				r.releaseFrameDict()
 				return
 			}
 		}
@@ -224,6 +290,8 @@ func (r *Reader) read(buf []byte) (int, error) {
 func (r *Reader) Reset(reader io.Reader) {
 	lz4block.Put(r.data)
 	r.data = nil
+	r.releaseFrameDict()
+	r.dict = nil
 	r.frame.Reset(r.num)
 	r.state.reset()
 	r.src = reader
@@ -286,6 +354,7 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			// Read Checksum.
 			err = r.frame.CloseR(r.src)
 			if err != nil {
+				r.releaseFrameDict()
 				return
 			}
 			// Check for a new stream.
@@ -299,14 +368,17 @@ func (r *Reader) WriteTo(w io.Writer) (n int64, err error) {
 			goto read
 		case io.EOF:
 			err = r.frame.CloseR(r.src)
+			r.releaseFrameDict()
 			return
 		default:
+			r.releaseFrameDict()
 			return
 		}
 		r.handler(bn)
 		bn, err = w.Write(dst)
 		n += int64(bn)
 		if err != nil {
+			r.releaseFrameDict()
 			return
 		}
 	}
