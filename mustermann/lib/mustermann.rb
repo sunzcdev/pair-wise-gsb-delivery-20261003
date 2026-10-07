@@ -156,3 +156,5 @@ module Mustermann
   # @!visibility private
   EMPTY_HASH = dedup({})
 end
+
+require 'mustermann/incremental'

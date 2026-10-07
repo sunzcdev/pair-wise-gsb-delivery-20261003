@@ -192,6 +192,31 @@ params, size = patter.peek_params(path_info)  # params == { "prefix" => "foo" }
 rest         = path_info[size..-1]            # => "/bar"
 ```
 
+<a name="-incremental-matching"></a>
+## Incremental Matching
+
+When a path arrives in chunks (for example from a streaming backend), an incremental session lets you feed the input piece by piece and tells you after every chunk whether it can still match, without ever rescanning the part you already fed.
+
+``` ruby
+require 'mustermann'
+
+session = Mustermann::Incremental.new('/:user/files/*path')
+session.feed('/ann')      # => #<Mustermann::Incremental::Result :continue>
+session.feed('a/files/x') # => #<Mustermann::Incremental::Result :continue>
+session.finish            # => #<Mustermann::Incremental::Result :match>
+session.params            # => {"user"=>"anna", "path"=>"x"}
+```
+
+A session goes through three kinds of results:
+
+* `:continue` – the input so far can still be extended to a match.
+* `:mismatch` – the input can never match, no matter what follows.
+* After `finish`: `:match` (with `params`) or `:incomplete` (the input ended in the middle of the pattern, a percent escape or a UTF-8 character).
+
+Percent escapes and multi-byte UTF-8 characters may be split across chunks arbitrarily, and feeding a path byte by byte yields the same params as feeding it all at once. Sessions are created via `Mustermann::Incremental.new` or `Pattern#incremental` and never share mutable state with each other.
+
+Only literal characters, separators, named captures, splats and optional segments are supported. Patterns using unions, URI template expressions, look-aheads, capture constraints, the `:except` or `:capture` options, or non-AST pattern types are rejected with `Mustermann::Incremental::UnsupportedPatternError` when the session is created.
+
 <a name="-expanding"></a>
 ## Expanding
 
