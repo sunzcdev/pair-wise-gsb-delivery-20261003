@@ -38,6 +38,11 @@ const (
 	minShaperNotifySize  = 16
 	maxShaperSize        = 1024
 	openCloseTimeout     = 30 * time.Second // Timeout for opening/closing streams
+
+	// maxPendingCtrlBytes is a small dedicated budget for queued control
+	// frames (SYN/FIN/NOP/UPD), so that data frames saturating the pending
+	// budget can never starve control frames such as close notifications.
+	maxPendingCtrlBytes = 65536
 )
 
 // resultChanPool reduces allocation of result channels
@@ -73,6 +78,7 @@ var (
 	ErrGoAway                    = errors.New("stream id overflows, should start a new connection")
 	ErrTimeout         net.Error = &timeoutError{}
 	ErrWouldBlock                = errors.New("operation would block on IO")
+	ErrBackpressure              = errors.New("backpressure: pending buffer full")
 )
 
 // writeRequest represents a request to write a frame
@@ -81,6 +87,12 @@ type writeRequest struct {
 	frame  Frame
 	seq    uint32
 	result chan writeResult
+
+	// pending budget reserved by this request, released exactly once when
+	// the frame has been written, has failed to write, or is discarded.
+	pendBytes  int64
+	pendCtrl   bool
+	pendStream *stream
 }
 
 // writeResult represents the result of a write request
@@ -126,8 +138,15 @@ type Session struct {
 	sessionIsActive int32        // flag session is active
 	acceptDeadline  atomic.Value // deadline for Accept()
 
+	// queued but not yet sent bytes, see acquirePending/releasePending
+	pendingDataBytes int64 // payload bytes of queued cmdPSH frames
+	pendingCtrlBytes int64 // bytes of queued control frames
+	pendingMu        sync.Mutex
+	pendingWait      chan struct{} // broadcast channel, closed when pending space is freed
+
 	requestID        uint32            // Monotonic increasing write request ID
 	shaper           chan writeRequest // a shaper for writing
+	shaperDone       chan struct{}     // closed when shaperLoop exits
 	sq               *shaperQueue
 	chShaperPending  chan struct{}
 	chShaperConsumed chan struct{}
@@ -148,6 +167,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.chProtoError = make(chan struct{})
 	s.chShaperPending = make(chan struct{}, 1)
 	s.chShaperConsumed = make(chan struct{}, 1)
+	s.shaperDone = make(chan struct{})
 	s.sq = NewShaperQueue()
 
 	if client {
@@ -274,6 +294,14 @@ func (s *Session) Close() error {
 		s.streams[k].sessionClose()
 	}
 	s.streamLock.Unlock()
+
+	// wait for shaperLoop to exit, so that no request can be moved from
+	// the shaper channel into the shaper queue while draining.
+	<-s.shaperDone
+
+	// release the pending budget of frames that will never be sent
+	s.drainPendingWrites()
+
 	return s.conn.Close()
 }
 
@@ -525,7 +553,7 @@ func (s *Session) keepalive() {
 	for {
 		select {
 		case <-tickerPing.C:
-			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL)
+			s.writeFrameInternal(newFrame(byte(s.config.Version), cmdNOP, 0), tickerPing.C, CLSCTRL, nil)
 			s.notifyBucket() // force a wakeup signal to the recvLoop
 		case <-tickerTimeout.C:
 			if !atomic.CompareAndSwapInt32(&s.sessionIsActive, 1, 0) {
@@ -547,6 +575,7 @@ func (s *Session) keepalive() {
 // its best to keep fair bandwidth among streams.
 func (s *Session) shaperLoop() {
 	chShaper := s.shaper
+	defer close(s.shaperDone)
 
 	for {
 		select {
@@ -589,6 +618,145 @@ func (s *Session) notifyShaperConsumed() {
 	select {
 	case s.chShaperConsumed <- struct{}{}:
 	default:
+	}
+}
+
+// pendingSpaceWaitCh returns the current generation channel which is closed
+// to broadcast that pending budget has been released.
+func (s *Session) pendingSpaceWaitCh() <-chan struct{} {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pendingWait == nil {
+		s.pendingWait = make(chan struct{})
+	}
+	return s.pendingWait
+}
+
+// notifyPendingSpace wakes up all goroutines waiting for pending budget.
+func (s *Session) notifyPendingSpace() {
+	s.pendingMu.Lock()
+	if s.pendingWait != nil {
+		close(s.pendingWait)
+		s.pendingWait = nil
+	}
+	s.pendingMu.Unlock()
+}
+
+// acquirePending reserves n bytes of pending budget for a frame that is
+// about to be queued for sending. Control frames share a small dedicated
+// budget, data frames are limited by MaxPendingBytes(session-wide) and
+// MaxStreamPendingBytes(per-stream). Depending on PendingPolicy, it either
+// waits for space or fails immediately with ErrBackpressure.
+func (s *Session) acquirePending(st *stream, n int64, ctrl bool, deadline <-chan time.Time) error {
+	var sessCtr *int64
+	var sessLimit int64
+	if ctrl {
+		sessCtr = &s.pendingCtrlBytes
+		sessLimit = maxPendingCtrlBytes
+	} else {
+		sessCtr = &s.pendingDataBytes
+		sessLimit = int64(s.config.MaxPendingBytes)
+	}
+
+	var streamCtr *int64
+	var streamLimit int64
+	if !ctrl && st != nil {
+		streamCtr = &st.pendingBytes
+		streamLimit = int64(s.config.MaxStreamPendingBytes)
+	}
+
+	// fast path: no limits configured, account only
+	if sessLimit <= 0 && streamLimit <= 0 {
+		atomic.AddInt64(sessCtr, n)
+		if streamCtr != nil {
+			atomic.AddInt64(streamCtr, n)
+		}
+		return nil
+	}
+
+	for {
+		// grab the wait channel before attempting to reserve, so that a
+		// release happening in between cannot be missed.
+		waitCh := s.pendingSpaceWaitCh()
+
+		// account first, then validate against the limits; the counters are
+		// always maintained so that releasePending stays symmetric.
+		newSess := atomic.AddInt64(sessCtr, n)
+		var newStream int64
+		if streamCtr != nil {
+			newStream = atomic.AddInt64(streamCtr, n)
+		}
+		if (sessLimit <= 0 || newSess <= sessLimit) && (streamLimit <= 0 || newStream <= streamLimit) {
+			return nil
+		}
+
+		// over the limit, roll back and wait for space or fail fast
+		atomic.AddInt64(sessCtr, -n)
+		if streamCtr != nil {
+			atomic.AddInt64(streamCtr, -n)
+		}
+
+		if s.config.PendingPolicy == PendingFailFast {
+			return ErrBackpressure
+		}
+
+		var stDie, stWriteClosed <-chan struct{}
+		if st != nil {
+			stDie = st.die
+			stWriteClosed = st.chWriteClosed
+		}
+		select {
+		case <-waitCh:
+		case <-deadline:
+			return ErrTimeout
+		case <-s.die:
+			return io.ErrClosedPipe
+		case <-s.chSocketWriteError:
+			return s.socketWriteError.Load().(error)
+		case <-stDie:
+			return io.ErrClosedPipe
+		case <-stWriteClosed:
+			return io.ErrClosedPipe
+		}
+	}
+}
+
+// releasePending returns the pending budget reserved by req. It is called
+// exactly once per request: by sendLoop after the frame has been written
+// (or failed to write), by the writer itself if the request could not be
+// queued, or by drainPendingWrites when the session is closed.
+func (s *Session) releasePending(req *writeRequest) {
+	if req.pendBytes <= 0 {
+		return
+	}
+	if req.pendCtrl {
+		atomic.AddInt64(&s.pendingCtrlBytes, -req.pendBytes)
+	} else {
+		atomic.AddInt64(&s.pendingDataBytes, -req.pendBytes)
+		if req.pendStream != nil {
+			atomic.AddInt64(&req.pendStream.pendingBytes, -req.pendBytes)
+		}
+	}
+	s.notifyPendingSpace()
+}
+
+// drainPendingWrites releases the pending budget of all frames still queued
+// for sending. It is called when the session is closed; every queued request
+// is released exactly once since each is removed from exactly one queue.
+func (s *Session) drainPendingWrites() {
+	for {
+		select {
+		case req := <-s.shaper:
+			s.releasePending(&req)
+		default:
+			for {
+				req, ok := s.sq.Pop()
+				if !ok {
+					return
+				}
+				s.releasePending(&req)
+			}
+		}
 	}
 }
 
@@ -649,6 +817,9 @@ EVENT_LOOP:
 					err: err,
 				}
 
+				// the frame has been consumed by the connection, release
+				// its pending budget before notifying the writer.
+				s.releasePending(&request)
 				request.result <- result
 
 				// store conn error
@@ -667,36 +838,57 @@ func (s *Session) writeControlFrame(f Frame) (n int, err error) {
 	timer := time.NewTimer(openCloseTimeout)
 	defer timer.Stop()
 
-	return s.writeFrameInternal(f, timer.C, CLSCTRL)
+	return s.writeFrameInternal(f, timer.C, CLSCTRL, nil)
 }
 
 // internal writeFrame version to support deadline used in keepalive
-func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class CLASSID) (int, error) {
-	// get result channel from pool
-	resultCh := resultChanPool.Get().(chan writeResult)
-
+//
+// st is the stream a data frame belongs to (nil for session-level control
+// frames), it is used for per-stream pending accounting.
+func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class CLASSID, st *stream) (int, error) {
 	req := writeRequest{
 		class:  class,
 		frame:  f,
 		seq:    atomic.AddUint32(&s.requestID, 1),
-		result: resultCh,
+		result: resultChanPool.Get().(chan writeResult),
 	}
+
+	// Reserve pending budget while the frame is queued for sending. Data
+	// frames are accounted by their payload size, control frames share a
+	// small dedicated budget so they cannot be starved by data frames.
+	if f.cmd == cmdPSH {
+		req.pendBytes = int64(len(f.data))
+		req.pendStream = st
+	} else {
+		req.pendBytes = headerSize + int64(len(f.data))
+		req.pendCtrl = true
+	}
+	if req.pendBytes > 0 {
+		if err := s.acquirePending(st, req.pendBytes, req.pendCtrl, deadline); err != nil {
+			resultChanPool.Put(req.result)
+			return 0, err
+		}
+	}
+
 	select {
 	case s.shaper <- req:
 	case <-s.die:
-		resultChanPool.Put(resultCh)
+		s.releasePending(&req)
+		resultChanPool.Put(req.result)
 		return 0, io.ErrClosedPipe
 	case <-s.chSocketWriteError:
-		resultChanPool.Put(resultCh)
+		s.releasePending(&req)
+		resultChanPool.Put(req.result)
 		return 0, s.socketWriteError.Load().(error)
 	case <-deadline:
-		resultChanPool.Put(resultCh)
+		s.releasePending(&req)
+		resultChanPool.Put(req.result)
 		return 0, ErrTimeout
 	}
 
 	select {
-	case result := <-resultCh:
-		resultChanPool.Put(resultCh)
+	case result := <-req.result:
+		resultChanPool.Put(req.result)
 		return result.n, result.err
 	case <-s.die:
 		// Cannot recycle channel here - sendLoop may still write to it

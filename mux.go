@@ -56,7 +56,36 @@ type Config struct {
 	// MaxStreamBuffer is used to control the maximum
 	// number of data per stream
 	MaxStreamBuffer int
+
+	// MaxPendingBytes is the session-level limit of payload bytes that have
+	// been queued for sending but not yet written to the underlying
+	// connection. When the limit is reached, writes behave according to
+	// PendingPolicy. 0 means unlimited.
+	MaxPendingBytes int
+
+	// MaxStreamPendingBytes is the per-stream limit of payload bytes queued
+	// for sending but not yet written to the underlying connection, it must
+	// not be larger than MaxPendingBytes. 0 means unlimited.
+	MaxStreamPendingBytes int
+
+	// PendingPolicy determines how Write behaves when MaxPendingBytes or
+	// MaxStreamPendingBytes has been reached.
+	PendingPolicy PendingPolicy
 }
+
+// PendingPolicy determines how Write behaves when the pending
+// (queued but not yet sent) limits are reached.
+type PendingPolicy int
+
+const (
+	// PendingWait blocks the writer until pending space is freed, the write
+	// deadline expires or the stream/session is closed.
+	PendingWait PendingPolicy = iota
+
+	// PendingFailFast makes Write return ErrBackpressure immediately when
+	// the pending limits are reached.
+	PendingFailFast
+)
 
 // DefaultConfig is used to return a default configuration
 func DefaultConfig() *Config {
@@ -67,6 +96,7 @@ func DefaultConfig() *Config {
 		MaxFrameSize:      32768,
 		MaxReceiveBuffer:  4194304,
 		MaxStreamBuffer:   65536,
+		MaxPendingBytes:   4194304,
 	}
 }
 
@@ -103,6 +133,24 @@ func VerifyConfig(config *Config) error {
 	}
 	if config.MaxStreamBuffer > math.MaxInt32 {
 		return errors.New("max stream buffer cannot be larger than 2147483647")
+	}
+	if config.MaxPendingBytes < 0 {
+		return errors.New("max pending bytes must not be negative")
+	}
+	if config.MaxPendingBytes > math.MaxInt32 {
+		return errors.New("max pending bytes cannot be larger than 2147483647")
+	}
+	if config.MaxStreamPendingBytes < 0 {
+		return errors.New("max stream pending bytes must not be negative")
+	}
+	if config.MaxStreamPendingBytes > math.MaxInt32 {
+		return errors.New("max stream pending bytes cannot be larger than 2147483647")
+	}
+	if config.MaxPendingBytes > 0 && config.MaxStreamPendingBytes > config.MaxPendingBytes {
+		return errors.New("max stream pending bytes must not be larger than max pending bytes")
+	}
+	if config.PendingPolicy != PendingWait && config.PendingPolicy != PendingFailFast {
+		return errors.New("invalid pending policy")
 	}
 	return nil
 }

@@ -30,6 +30,7 @@ Smux (**S**imple **MU**ltiple**X**ing) is a multiplexing library for Golang. It 
 3. Minimized header (8 bytes), maximized payload.
 4. Built-in fair queue traffic shaping.
 5. Per-stream sliding window for congestion control (protocol version 2+).
+6. Session-level and per-stream pending(send) buffer limits with configurable backpressure, control frames always keep a dedicated budget.
 
 ![smooth bandwidth curve](assets/curve.jpg)
 
