@@ -129,5 +129,19 @@ func Test_preceding_sibling(t *testing.T) {
 }
 
 func Test_namespace(t *testing.T) {
-	// TODO
+	// The built-in TNodeNavigator does not implement the optional
+	// NamespaceNavigator capability. Querying the namespace axis on such a
+	// legacy adapter is an explicit failure rather than an empty result.
+	expr, err := Compile(`//employee/namespace::*`)
+	assertNoErr(t, err)
+	assertPanic(t, func() {
+		iter := expr.Select(createNavigator(employee_example))
+		for iter.MoveNext() {
+		}
+	})
+
+	// The named test must fail the same way.
+	assertPanic(t, func() {
+		selectNodes(employee_example, `//employee/namespace::xml`)
+	})
 }

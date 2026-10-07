@@ -288,6 +288,76 @@ func (a *attributeQuery) Properties() queryProp {
 	return queryProps.Merge
 }
 
+// namespaceQuery is an XPath namespace node query.(namespace::*)
+//
+// The namespace axis contains one namespace node for every namespace
+// binding in scope on the context element: declarations of the element,
+// non-shadowed declarations inherited from ancestors, and the implicit
+// "xml" prefix. Adapters expose the bindings through the optional
+// NamespaceNavigator capability; an adapter that does not implement it
+// cannot answer the query, so evaluation fails explicitly instead of
+// returning an empty node-set.
+type namespaceQuery struct {
+	name     string
+	iterator func() NodeNavigator
+
+	Input     query
+	Predicate func(NodeNavigator) bool
+}
+
+func (q *namespaceQuery) Select(t iterator) NodeNavigator {
+	for {
+		if q.iterator == nil {
+			node := q.Input.Select(t)
+			if node == nil {
+				return nil
+			}
+			node = node.Copy()
+			nav, ok := node.(NamespaceNavigator)
+			if !ok {
+				panic(ErrNamespaceAxisUnsupported)
+			}
+			q.iterator = func() NodeNavigator {
+				for {
+					if !nav.MoveToNextNamespace() {
+						return nil
+					}
+					if q.Predicate(nav) {
+						return nav
+					}
+				}
+			}
+		}
+
+		if node := q.iterator(); node != nil {
+			return node
+		}
+		q.iterator = nil
+	}
+}
+
+func (q *namespaceQuery) Evaluate(t iterator) interface{} {
+	q.Input.Evaluate(t)
+	q.iterator = nil
+	return q
+}
+
+func (q *namespaceQuery) Test(n NodeNavigator) bool {
+	return q.Predicate(n)
+}
+
+func (q *namespaceQuery) Clone() query {
+	return &namespaceQuery{name: q.name, Input: q.Input.Clone(), Predicate: q.Predicate}
+}
+
+func (q *namespaceQuery) ValueType() resultType {
+	return xpathResultType.NodeSet
+}
+
+func (q *namespaceQuery) Properties() queryProp {
+	return queryProps.Merge
+}
+
 // childQuery is an XPath child node query.(child::*)
 type childQuery struct {
 	name     string
@@ -1381,7 +1451,7 @@ func (m *mergeQuery) Properties() queryProp {
 func getHashCode(n NodeNavigator) uint64 {
 	var sb bytes.Buffer
 	switch n.NodeType() {
-	case AttributeNode, TextNode, CommentNode:
+	case AttributeNode, TextNode, CommentNode, NamespaceNode:
 		sb.WriteString(n.LocalName())
 		sb.WriteByte('=')
 		sb.WriteString(n.Value())
@@ -1392,6 +1462,13 @@ func getHashCode(n NodeNavigator) uint64 {
 		}
 		sb.WriteByte('-')
 		sb.WriteString(strconv.Itoa(d))
+		// A namespace node belongs to the element on which the binding is in
+		// scope: include that element's position in the identity. Without it
+		// the same prefix bound to the same URI on two different elements
+		// would collapse into one node in union/ancestor de-duplication.
+		if n.NodeType() == NamespaceNode {
+			sb.WriteString("-ns-")
+		}
 		for n.MoveToParent() {
 			d = 1
 			for n.MoveToPrevious() {

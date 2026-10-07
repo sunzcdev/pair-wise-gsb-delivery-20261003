@@ -24,9 +24,56 @@ const (
 	// CommentNode is a comment node, such as <!-- my comment -->
 	CommentNode
 
+	// NamespaceNode is an in-scope namespace binding of an element, such as
+	// the nodes exposed by the XPath namespace:: axis. A namespace node's
+	// LocalName is the bound prefix ("" for the default namespace) and its
+	// Value is the namespace URI.
+	NamespaceNode
+
 	// allNode is any types of node, used by xpath package only to predicate match.
 	allNode
 )
+
+// ErrNamespaceAxisUnsupported is the error raised when an expression queries
+// the namespace:: axis against a NodeNavigator adapter that does not
+// implement the optional NamespaceNavigator capability. The namespace axis
+// needs the in-scope namespace bindings of an element, which a legacy
+// adapter cannot provide; evaluating it would silently yield a wrong (empty)
+// result, so the query panics with this sentinel instead. It follows the
+// same fail-fast convention the package uses for other run-time errors.
+var ErrNamespaceAxisUnsupported = errors.New("xpath: namespace axis is not supported by this NodeNavigator (adapter does not implement NamespaceNavigator)")
+
+// NamespaceNavigator is an optional capability of NodeNavigator for the
+// XPath namespace:: axis. It is a backward-compatible extension: existing
+// NodeNavigator implementations keep working unchanged, and querying the
+// namespace axis on such an adapter surfaces ErrNamespaceAxisUnsupported
+// instead of returning an empty node-set.
+//
+// MoveToNextNamespace enumerates the namespace nodes in scope for the
+// current element. The first call moves to the first in-scope namespace
+// binding; returning false means there are no more. An implementation must:
+//
+//   - return every namespace binding in scope for the element, including
+//     those inherited from ancestor elements (prefix shadowing resolves to
+//     the nearest declaration),
+//   - omit the default namespace when it is undeclared with xmlns="",
+//   - always include the implicit binding xml ->
+//     http://www.w3.org/XML/1998/namespace,
+//   - yield each in-scope prefix at most once.
+//
+// While positioned on a namespace node, NodeType reports NamespaceNode,
+// LocalName the bound prefix ("" for the default namespace), Prefix an
+// empty string and Value the namespace URI. MoveToParent moves back to the
+// queried element. Copy and MoveTo preserve the namespace-node position so
+// that the node acts as a complete, stable query result.
+type NamespaceNavigator interface {
+	NodeNavigator
+
+	// MoveToNextNamespace moves to the next namespace node in scope for the
+	// current element. It returns false when there are no more namespace
+	// nodes.
+	MoveToNextNamespace() bool
+}
 
 // NodeNavigator provides cursor model for navigating XML data.
 type NodeNavigator interface {

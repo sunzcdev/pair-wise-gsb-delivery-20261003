@@ -86,6 +86,16 @@ XPath is Go package provides selecting nodes from XML, HTML or other documents u
 
 - `self::*` : Selects the current node. '.' is equivalent to 'self::node()'.
 
+- `namespace::*` : Selects the namespace nodes in scope for the current
+  element: declarations on the element, non-shadowed declarations inherited
+  from ancestors (the nearest declaration of a prefix wins), and the
+  implicit `xml` prefix. A namespace node's local name is the bound prefix
+  (`""` for the default namespace) and its string value is the namespace
+  URI; `xmlns=""` removes the default namespace from scope. This axis is an
+  optional `NodeNavigator` capability: the navigator must additionally
+  implement the `NamespaceNavigator` interface (`MoveToNextNamespace()`),
+  otherwise evaluating the axis returns `ErrNamespaceAxisUnsupported`.
+
 #### Expressions
 
 The gxpath supported three types: number, boolean, string.

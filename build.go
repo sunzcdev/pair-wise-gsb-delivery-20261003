@@ -155,7 +155,7 @@ func (b *builder) processAxis(root *axisNode, flags flag, props *builderProp) (q
 	case "self":
 		qyOutput = &selfQuery{Input: qyInput, Predicate: predicate}
 	case "namespace":
-		// haha,what will you do someting??
+		qyOutput = &namespaceQuery{name: root.LocalName, Input: qyInput, Predicate: predicate}
 	default:
 		err = fmt.Errorf("unknown axe type: %s", root.AxisType)
 		return nil, err

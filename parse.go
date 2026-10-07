@@ -429,6 +429,8 @@ func (p *parser) parseStep(n node) (opnd node) {
 		matchType := ElementNode
 		if axisType == "attribute" {
 			matchType = AttributeNode
+		} else if axisType == "namespace" {
+			matchType = NamespaceNode
 		}
 		opnd = p.parseNodeTest(n, axisType, matchType)
 	}
