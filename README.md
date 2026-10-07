@@ -78,6 +78,28 @@ _, _ = io.Copy(os.Stdout, zr)
 
 Contributions are very welcome for bug fixing, performance improvements...!
 
+### Offline cost-optimal compression
+
+For offline log archival, where the compression ratio matters more than
+speed, select the opt-in `Optimal` level:
+
+```go
+zw := lz4.NewWriter(w)
+defer zw.Close()
+_ = zw.Apply(lz4.OptimalOption(lz4.OptimalParams{}))
+```
+
+Unlike the greedy HC levels, which walk a hash chain to a fixed depth and
+keep the longest match, the Optimal parser searches explicit match
+candidates and chooses each sequence with backward dynamic programming over
+the actual LZ4 block encoding cost (token, literal run, offset and
+match-length extension bytes). It is bounded by `OptimalParams`:
+`Candidates` bounds the candidate search, `MemoryBudget` bounds the scratch
+tables, and `Gap`, `Lookahead` and `ShortMatch` bound the parser work. When
+the memory budget cannot fit the tables for a block, it deterministically
+degrades to the Level9 HC algorithm. The Fast, CCompatFast and Level1-9
+modes are unchanged.
+
 - Open an issue with a proper description
 - Send a pull request with appropriate test case(s)
 

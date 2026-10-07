@@ -18,6 +18,7 @@ func _() {
 	var x [1]struct{}
 	_ = x[lz4block.CompressionLevel(Fast)-lz4block.Fast]
 	_ = x[lz4block.CompressionLevel(CCompatFast)-lz4block.CCompatFast]
+	_ = x[lz4block.CompressionLevel(Optimal)-lz4block.Optimal]
 	_ = x[Block64Kb-BlockSize(lz4block.Block64Kb)]
 	_ = x[Block256Kb-BlockSize(lz4block.Block256Kb)]
 	_ = x[Block1Mb-BlockSize(lz4block.Block1Mb)]
@@ -161,6 +162,47 @@ func (c *CompressorHC) CompressBlock(src, dst []byte) (int, error) {
 // This function is deprecated. Use a CompressorHC instead.
 func CompressBlockHC(src, dst []byte, depth CompressionLevel, _, _ []int) (int, error) {
 	return lz4block.CompressBlockHC(src, dst, lz4block.CompressionLevel(depth))
+}
+
+// A CompressorOptimal compresses data into the LZ4 block format with a
+// cost-optimal parser, designed for offline archival where the compression
+// ratio matters more than speed.
+//
+// Unlike the greedy HC levels, which search up to a fixed chain depth and
+// keep the longest match, CompressorOptimal evaluates each searched match
+// candidate with dynamic programming over the exact LZ4 block encoding cost
+// (token, literal run, offset and match-length extension bytes). It is
+// bounded by Params: Candidates bounds the candidate search, MemoryBudget
+// bounds the scratch memory, and the other fields bound the parser work.
+// When the memory budget cannot fit the tables for an input, it
+// deterministically degrades to the Level9 HC algorithm.
+//
+// A CompressorOptimal is not safe for concurrent use by multiple goroutines.
+//
+// Use a Writer with CompressionLevelOption(Optimal) to compress into the LZ4
+// stream format; configure the parser with OptimalOption.
+type CompressorOptimal struct {
+	// Params configures the candidate search, memory budget and parser
+	// bounds. The zero value uses the defaults.
+	Params OptimalParams
+	c      lz4block.CompressorOptimal
+}
+
+// CompressBlock compresses the source buffer src into the destination dst.
+//
+// If compression is successful, the first return value is the size of the
+// compressed data, which is always >0. If dst has length at least
+// CompressBlockBound(len(src)), compression always succeeds or falls back to
+// the HC algorithm. Otherwise, the first return value is zero if the data is
+// incompressible or does not fit in dst.
+func (c *CompressorOptimal) CompressBlock(src, dst []byte) (int, error) {
+	return c.c.CompressBlock(src, dst, lz4block.OptimalParams(c.Params))
+}
+
+// CompressBlockOptimal is equivalent to CompressorOptimal.CompressBlock with
+// the given params.
+func CompressBlockOptimal(src, dst []byte, params OptimalParams) (int, error) {
+	return lz4block.CompressBlockOptimal(src, dst, lz4block.OptimalParams(params))
 }
 
 const (

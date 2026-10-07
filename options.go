@@ -170,6 +170,42 @@ const (
 // see CompressorCCompat.
 const CCompatFast CompressionLevel = 1
 
+// Optimal selects the cost-optimal parser, an opt-in mode for offline
+// archival: it searches explicit match candidates within a memory budget and
+// parses the block by LZ4 encoding cost. See CompressorOptimal and
+// OptimalOption. It is slower than the HC levels but can compress more; when
+// the memory budget does not fit an input, it deterministically degrades to
+// Level9. The other levels keep their existing algorithms.
+const Optimal CompressionLevel = 2
+
+// OptimalParams configures the Optimal compression level. The zero value
+// uses the defaults. See CompressorOptimal for the semantics.
+type OptimalParams = lz4block.OptimalParams
+
+// OptimalOption selects the Optimal compression level and configures its
+// candidate search, memory budget and parser bounds. Passing it also sets the
+// compression level, so there is no need to also pass
+// CompressionLevelOption(Optimal).
+func OptimalOption(params OptimalParams) Option {
+	return func(a applier) error {
+		switch w := a.(type) {
+		case nil:
+			s := fmt.Sprintf("OptimalOption(MemoryBudget=%d,Candidates=%d,Gap=%d,Lookahead=%d,ShortMatch=%d)",
+				params.MemoryBudget, params.Candidates, params.Gap, params.Lookahead, params.ShortMatch)
+			return lz4errors.Error(s)
+		case *Writer:
+			w.level = lz4block.Optimal
+			w.optimalParams = lz4block.OptimalParams(params)
+			return nil
+		case *CompressingReader:
+			w.level = lz4block.Optimal
+			w.optimalParams = lz4block.OptimalParams(params)
+			return nil
+		}
+		return lz4errors.ErrOptionNotApplicable
+	}
+}
+
 // CompressionLevelOption defines the compression level (default=Fast).
 func CompressionLevelOption(level CompressionLevel) Option {
 	return func(a applier) error {
@@ -179,7 +215,7 @@ func CompressionLevelOption(level CompressionLevel) Option {
 			return lz4errors.Error(s)
 		case *Writer:
 			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
+			case Fast, CCompatFast, Optimal, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
 			default:
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}
@@ -187,7 +223,7 @@ func CompressionLevelOption(level CompressionLevel) Option {
 			return nil
 		case *CompressingReader:
 			switch level {
-			case Fast, CCompatFast, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
+			case Fast, CCompatFast, Optimal, Level1, Level2, Level3, Level4, Level5, Level6, Level7, Level8, Level9:
 			default:
 				return fmt.Errorf("%w: %d", lz4errors.ErrOptionInvalidCompressionLevel, level)
 			}

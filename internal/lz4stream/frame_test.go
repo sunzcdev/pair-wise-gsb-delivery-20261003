@@ -90,7 +90,7 @@ func TestFrameDataBlock(t *testing.T) {
 			f.Descriptor.Flags.BlockSizeIndexSet(lz4block.Index(size))
 
 			block := NewFrameDataBlock(f)
-			block.Compress(f, []byte(data), lz4block.Fast)
+			block.Compress(f, []byte(data), lz4block.Fast, lz4block.OptimalParams{})
 			if err := block.Write(f, zbuf); err != nil {
 				t.Fatal(err)
 			}

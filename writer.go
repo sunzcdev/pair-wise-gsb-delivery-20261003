@@ -28,15 +28,16 @@ func NewWriter(w io.Writer) *Writer {
 
 // Writer allows writing an LZ4 stream.
 type Writer struct {
-	state   _State
-	src     io.Writer                 // destination writer
-	level   lz4block.CompressionLevel // how hard to try
-	num     int                       // concurrency level
-	frame   *lz4stream.Frame          // frame being built
-	data    []byte                    // pending data
-	idx     int                       // size of pending data
-	handler func(int)
-	legacy  bool
+	state         _State
+	src           io.Writer                 // destination writer
+	level         lz4block.CompressionLevel // how hard to try
+	optimalParams lz4block.OptimalParams
+	num           int              // concurrency level
+	frame         *lz4stream.Frame // frame being built
+	data          []byte           // pending data
+	idx           int              // size of pending data
+	handler       func(int)
+	legacy        bool
 }
 
 func (*Writer) private() {}
@@ -132,7 +133,7 @@ func (w *Writer) Write(buf []byte) (n int, err error) {
 func (w *Writer) write(data []byte, safe bool) error {
 	if w.isNotConcurrent() {
 		block := w.frame.Blocks.Block
-		err := block.Compress(w.frame, data, w.level).Write(w.frame, w.src)
+		err := block.Compress(w.frame, data, w.level, w.optimalParams).Write(w.frame, w.src)
 		w.handler(len(block.Data))
 		return err
 	}
@@ -140,7 +141,7 @@ func (w *Writer) write(data []byte, safe bool) error {
 	w.frame.Blocks.Blocks <- c
 	go func(c chan *lz4stream.FrameDataBlock, data []byte, safe bool) {
 		b := lz4stream.NewFrameDataBlock(w.frame)
-		c <- b.Compress(w.frame, data, w.level)
+		c <- b.Compress(w.frame, data, w.level, w.optimalParams)
 		<-c
 		w.handler(len(b.Data))
 		b.Close(w.frame)

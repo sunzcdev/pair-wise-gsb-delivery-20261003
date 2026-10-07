@@ -273,7 +273,7 @@ func (b *FrameDataBlock) Close(f *Frame) {
 }
 
 // Block compression errors are ignored since the buffer is sized appropriately.
-func (b *FrameDataBlock) Compress(f *Frame, src []byte, level lz4block.CompressionLevel) *FrameDataBlock {
+func (b *FrameDataBlock) Compress(f *Frame, src []byte, level lz4block.CompressionLevel, optimal lz4block.OptimalParams) *FrameDataBlock {
 	data := b.data
 	if f.isLegacy() {
 		data = data[:cap(data)]
@@ -286,6 +286,8 @@ func (b *FrameDataBlock) Compress(f *Frame, src []byte, level lz4block.Compressi
 		n, _ = lz4block.CompressBlock(src, data)
 	case lz4block.CCompatFast:
 		n, _ = lz4block.CompressBlockCCompat(src, data)
+	case lz4block.Optimal:
+		n, _ = lz4block.CompressBlockOptimal(src, data, optimal)
 	default:
 		n, _ = lz4block.CompressBlockHC(src, data, level)
 	}

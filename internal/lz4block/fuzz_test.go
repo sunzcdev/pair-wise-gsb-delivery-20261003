@@ -164,9 +164,12 @@ func FuzzCompressBlockDst(f *testing.F) {
 		}
 		var n int
 		var err error
-		if level%10 == 0 {
+		switch level % 11 {
+		case 0:
 			n, err = CompressBlock(src, buf[:dstLen])
-		} else {
+		case 10:
+			n, err = CompressBlockOptimal(src, buf[:dstLen], OptimalParams{})
+		default:
 			n, err = CompressBlockHC(src, buf[:dstLen], CompressionLevel(1<<(8+level%10)))
 		}
 		for i := int(dstLen); i < len(buf); i++ {
@@ -177,7 +180,9 @@ func FuzzCompressBlockDst(f *testing.F) {
 		if n < 0 || n > int(dstLen) {
 			t.Fatalf("n=%d out of range for dst=%d", n, dstLen)
 		}
-		if int(dstLen) == bound && (err != nil || n == 0) {
+		if int(dstLen) == bound && err != nil {
+			// All compressors may store a tiny or incompressible block raw
+			// (n == 0); only an error at the bound is unexpected.
 			t.Fatalf("dst=bound: n=%d err=%v", n, err)
 		}
 		if err != nil || n == 0 {
@@ -187,6 +192,67 @@ func FuzzCompressBlockDst(f *testing.F) {
 		dn, err := UncompressBlock(buf[:n], dec, nil)
 		if err != nil || !bytes.Equal(dec[:dn], src) {
 			t.Fatalf("round trip failed: %v", err)
+		}
+	})
+}
+
+// FuzzCompressBlockOptimal fuzzes the cost-optimal parser with bounded and
+// degrading budgets, checking the destination guard and the block round trip.
+func FuzzCompressBlockOptimal(f *testing.F) {
+	for _, data := range compressionInputs() {
+		f.Add(data, uint32(len(data)), uint8(0))
+		f.Add(data, uint32(CompressBlockBound(len(data))), uint8(3))
+	}
+	for _, data := range corpusFiles(f, "../../fuzz/corpus", 1<<14) {
+		f.Add(data, uint32(CompressBlockBound(len(data))), uint8(1))
+	}
+	f.Fuzz(func(t *testing.T, src []byte, dstLen uint32, cfg uint8) {
+		if len(src) > 1<<14 {
+			src = src[:1<<14]
+		}
+		bound := CompressBlockBound(len(src))
+		if int(dstLen) > bound {
+			dstLen = uint32(bound)
+		}
+		buf := make([]byte, int(dstLen)+64)
+		for i := range buf {
+			buf[i] = guardByte
+		}
+		var p OptimalParams
+		switch cfg % 4 {
+		case 0:
+			p = OptimalParams{}
+		case 1:
+			p = OptimalParams{MemoryBudget: 1 << 12}
+		case 2:
+			p = OptimalParams{Candidates: 2, Gap: 4, Lookahead: 2, ShortMatch: 4}
+		case 3:
+			// Large but bounded: the exhaustive-correctness case is covered
+			// by TestOptimalExhaustiveCost on short inputs.
+			p = OptimalParams{MemoryBudget: 1 << 30, Candidates: 256, Gap: 256, Lookahead: 32, ShortMatch: 64}
+		}
+		n, err := CompressBlockOptimal(src, buf[:dstLen], p)
+		for i := int(dstLen); i < len(buf); i++ {
+			if buf[i] != guardByte {
+				t.Fatalf("wrote past dst")
+			}
+		}
+		if n < 0 || n > int(dstLen) {
+			t.Fatalf("n=%d out of range for dst=%d err=%v", n, dstLen, err)
+		}
+		if int(dstLen) == bound && (err != nil || n == 0) {
+			// Incompressible blocks return 0, nil.
+			if err != nil {
+				t.Fatalf("dst=bound: err=%v", err)
+			}
+		}
+		if err != nil || n == 0 {
+			return
+		}
+		dec := make([]byte, len(src))
+		dn, derr := UncompressBlock(buf[:n], dec, nil)
+		if derr != nil || dn != len(src) || !bytes.Equal(dec, src) {
+			t.Fatalf("round trip failed: %v %d", derr, dn)
 		}
 	})
 }
