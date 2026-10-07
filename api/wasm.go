@@ -107,6 +107,11 @@ const (
 	//
 	// Note: The usage of this type is toggled with api.CoreFeatureBulkMemoryOperations.
 	ValueTypeExternref ValueType = 0x6f
+
+	// ValueTypeFuncref is a funcref type, used as the element type of tables.
+	//
+	// Note: The usage of this type is toggled with api.CoreFeatureReferenceTypes.
+	ValueTypeFuncref ValueType = 0x70
 )
 
 // ValueTypeName returns the type name of the given ValueType as a string.
@@ -125,6 +130,8 @@ func ValueTypeName(t ValueType) string {
 		return "f64"
 	case ValueTypeExternref:
 		return "externref"
+	case ValueTypeFuncref:
+		return "funcref"
 	}
 	return "unknown"
 }
