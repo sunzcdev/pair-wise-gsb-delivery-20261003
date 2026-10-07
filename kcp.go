@@ -239,6 +239,14 @@ type KCP struct {
 	snd_buf   *RingBuffer[segment] // send buffer: segments in-flight (sent but unacknowledged)
 	rcv_buf   *segmentHeap         // receive buffer: out-of-order segments awaiting reordering
 
+	// Send budget accounting.
+	// snd_bytes tracks the total payload bytes held in snd_queue + snd_buf,
+	// including bytes merged into the tail segment in stream mode.
+	// The two limits are optional: 0 means unlimited (default behavior).
+	snd_bytes                int
+	snd_queue_limit_bytes    int
+	snd_queue_limit_segments int
+
 	acklist []ackItem // pending ACKs to be flushed
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
@@ -379,56 +387,107 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	return
 }
 
-// Send is user/upper level send, returns below zero for error
-func (kcp *KCP) Send(buffer []byte) int {
-	var count int
+// SendResult is the outcome of a KCP.Send call.
+type SendResult int
+
+const (
+	// SendOK means the message was fully admitted to the send queue
+	// (including the case of an empty message, which needs no queueing).
+	SendOK SendResult = 0
+	// SendCongested is a temporary rejection: the configured send-queue
+	// budget (bytes or segments) is exhausted. The caller must retry later,
+	// after in-flight data has been acknowledged. The send queue is left
+	// completely untouched.
+	SendCongested SendResult = -1
+	// SendMsgTooLarge is a permanent rejection for this message: it either
+	// needs more than 255 fragments (a KCP protocol hard limit) or it can
+	// never fit into the configured send-queue budget even once the queue
+	// drains to empty. The send queue is left completely untouched.
+	SendMsgTooLarge SendResult = -2
+)
+
+func (r SendResult) String() string {
+	switch r {
+	case SendOK:
+		return "SendOK"
+	case SendCongested:
+		return "SendCongested"
+	case SendMsgTooLarge:
+		return "SendMsgTooLarge"
+	default:
+		return "SendUnknown"
+	}
+}
+
+// Send admits a user/upper-level message into the send queue.
+//
+// The call is atomic: it is either fully admitted or it leaves the send
+// queue completely unchanged (including stream-mode bytes that could have
+// been merged into the tail segment).
+func (kcp *KCP) Send(buffer []byte) SendResult {
 	if len(buffer) == 0 {
-		return -1
+		return SendOK
 	}
 
 	kcp.debugLog(IKCP_LOG_SEND, "stream", kcp.stream, "conv", kcp.conv, "datalen", len(buffer))
 
-	// append to previous segment in streaming mode (if possible)
+	mss := int(kcp.mss)
+
+	// In stream mode, up to the tail segment's remaining capacity can be
+	// merged into it; every other byte requires a fresh segment.
+	extend := 0
 	if kcp.stream != 0 {
-		if n := kcp.snd_queue.Len(); n > 0 {
-			for seg := range kcp.snd_queue.ForEachReverse {
-				if len(seg.data) < int(kcp.mss) {
-					capacity := int(kcp.mss) - len(seg.data)
-					extend := min(len(buffer), capacity)
-
-					// grow slice, the underlying cap is guaranteed to
-					// be larger than kcp.mss
-					oldlen := len(seg.data)
-					seg.data = seg.data[:oldlen+extend]
-					copy(seg.data[oldlen:], buffer)
-					buffer = buffer[extend:]
-				}
-				break
+		for seg := range kcp.snd_queue.ForEachReverse {
+			if len(seg.data) < mss {
+				extend = min(len(buffer), mss-len(seg.data))
 			}
-		}
-
-		if len(buffer) == 0 {
-			return 0
+			break
 		}
 	}
 
-	if len(buffer) <= int(kcp.mss) {
-		count = 1
-	} else {
-		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
+	addBytes := len(buffer)
+	addSegments := (len(buffer) - extend + mss - 1) / mss
+
+	// KCP encodes the fragment index in a single byte: a message may occupy at
+	// most 255 segments after stream-mode merging.
+	if addSegments > 255 {
+		return SendMsgTooLarge
 	}
 
-	if count > 255 {
-		return -2
+	// Optional budget enforcement. A message that cannot fit even against
+	// an empty queue is permanently too large; otherwise the rejection is
+	// temporary congestion.
+	if kcp.snd_queue_limit_segments > 0 {
+		if addSegments > kcp.snd_queue_limit_segments {
+			return SendMsgTooLarge
+		}
+		if kcp.snd_queue.Len()+kcp.snd_buf.Len()+addSegments > kcp.snd_queue_limit_segments {
+			return SendCongested
+		}
+	}
+	if kcp.snd_queue_limit_bytes > 0 {
+		if addBytes > kcp.snd_queue_limit_bytes {
+			return SendMsgTooLarge
+		}
+		if kcp.snd_bytes+addBytes > kcp.snd_queue_limit_bytes {
+			return SendCongested
+		}
 	}
 
-	if count == 0 {
-		count = 1
+	// Stream mode: fill the tail segment's remaining capacity first.
+	if extend > 0 {
+		for seg := range kcp.snd_queue.ForEachReverse {
+			oldlen := len(seg.data)
+			seg.data = seg.data[:oldlen+extend]
+			copy(seg.data[oldlen:], buffer)
+			buffer = buffer[extend:]
+			break
+		}
 	}
 
+	count := addSegments
 	for i := 0; i < count; i++ {
-		var size int
-		size = min(len(buffer), int(kcp.mss))
+		size := min(len(buffer), mss)
 		seg := kcp.newSegment(size)
 		copy(seg.data, buffer[:size])
 		if kcp.stream == 0 { // message mode
@@ -440,7 +499,8 @@ func (kcp *KCP) Send(buffer []byte) int {
 		kcp.snd_queue.Push(seg)
 		buffer = buffer[size:]
 	}
-	return 0
+	kcp.snd_bytes += addBytes
+	return SendOK
 }
 
 // update_ack updates the smoothed RTT and RTO based on a new RTT sample.
@@ -488,6 +548,9 @@ func (kcp *KCP) parse_ack(sn uint32) {
 
 	for seg := range kcp.snd_buf.ForEach {
 		if sn == seg.sn {
+			if seg.acked == 0 {
+				kcp.snd_bytes -= len(seg.data)
+			}
 			// mark and free space, but leave the segment here,
 			// and wait until `una` to delete this, then we don't
 			// have to shift the segments behind forward,
@@ -532,6 +595,9 @@ func (kcp *KCP) parse_una(una uint32) int {
 	count := 0
 	for seg := range kcp.snd_buf.ForEach {
 		if _itimediff(una, seg.sn) > 0 {
+			if seg.acked == 0 {
+				kcp.snd_bytes -= len(seg.data)
+			}
 			kcp.recycleSegment(seg)
 			count++
 		} else {
@@ -1134,6 +1200,48 @@ func (kcp *KCP) WndSize(sndwnd, rcvwnd int) int {
 // WaitSnd gets how many packet is waiting to be sent
 func (kcp *KCP) WaitSnd() int {
 	return kcp.snd_buf.Len() + kcp.snd_queue.Len()
+}
+
+// WaitSndBytes gets the number of payload bytes currently held in the send
+// queue and the send buffer (snd_queue + snd_buf). Bytes merged into the tail
+// segment in stream mode are counted as well.
+func (kcp *KCP) WaitSndBytes() int {
+	return kcp.snd_bytes
+}
+
+// SetSendQueueLimit optionally bounds the total amount of outstanding send
+// data kept in snd_queue + snd_buf. A value of 0 for either argument means
+// "no limit" for that dimension (the default). Limits are shared by queued
+// and in-flight segments; the budget is released as segments are
+// acknowledged. Retransmissions never consume extra budget.
+//
+// Returns 0 on success and -1 when either argument is negative.
+// Lowering a limit below the current usage is allowed; the excess drains
+// normally and new sends are rejected until enough budget is released.
+func (kcp *KCP) SetSendQueueLimit(segments, bytes int) int {
+	if segments < 0 || bytes < 0 {
+		return -1
+	}
+	kcp.snd_queue_limit_segments = segments
+	kcp.snd_queue_limit_bytes = bytes
+	return 0
+}
+
+// canSend reports whether the upper layer may admit more data: the sliding
+// window must have a free slot and every configured send-queue budget
+// (segments and payload bytes) must have room.
+func (kcp *KCP) canSend() bool {
+	if kcp.WaitSnd() >= int(kcp.snd_wnd) {
+		return false
+	}
+	if kcp.snd_queue_limit_segments > 0 &&
+		kcp.snd_buf.Len()+kcp.snd_queue.Len() >= kcp.snd_queue_limit_segments {
+		return false
+	}
+	if kcp.snd_queue_limit_bytes > 0 && kcp.snd_bytes >= kcp.snd_queue_limit_bytes {
+		return false
+	}
+	return true
 }
 
 // SetLogger configures the trace logger

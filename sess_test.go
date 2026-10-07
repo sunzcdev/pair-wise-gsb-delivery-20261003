@@ -1653,3 +1653,89 @@ func TestSendOOB_Errors(t *testing.T) {
 		t.Errorf("expected 'OOB payload too large', got %v", err)
 	}
 }
+
+// TestSetSendQueueLimitSession verifies the session API end-to-end:
+// writes block under congestion and resume after ACKs, while permanently
+// oversized messages return ErrMsgTooLarge.
+func TestSetSendQueueLimitSession(t *testing.T) {
+	port := nextPort()
+	l := echoServer(port, nil)
+	defer l.Close()
+
+	cli, err := dialEcho(port, nil)
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close()
+
+	cli.SetWindowSize(128, 128)
+	// tiny byte budget: below a single mss-sized write chunk, so the first
+	// chunk of a normal-sized Write can never fit and must fail permanently
+	if !cli.SetSendQueueLimit(4, 100) {
+		t.Fatal("SetSendQueueLimit rejected valid arguments")
+	}
+	if cli.SetSendQueueLimit(-1, 0) {
+		t.Fatal("SetSendQueueLimit accepted negative segments")
+	}
+
+	// a message whose first mss-sized chunk alone exceeds the byte budget is
+	// permanently rejected (rather than blocking as temporary congestion)
+	oversized := make([]byte, 1376)
+	if _, err := cli.Write(oversized); err == nil {
+		t.Fatal("oversized Write should fail")
+	} else if !errors.Is(err, ErrMsgTooLarge) {
+		t.Fatalf("oversized Write error = %v, want ErrMsgTooLarge", err)
+	}
+
+	// raise the limit so normal traffic flows again; a fitting write succeeds
+	// and is echoed back (ACKs continuously release the budget)
+	cli.SetSendQueueLimit(0, 0)
+	buf := make([]byte, 1376)
+	n, err := cli.Write(buf)
+	if err != nil || n != len(buf) {
+		t.Fatalf("fitting Write = (%d, %v)", n, err)
+	}
+	rbuf := make([]byte, 1376)
+	cli.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if _, err := io.ReadFull(cli, rbuf); err != nil {
+		t.Fatalf("echo read: %v", err)
+	}
+}
+
+// TestSetSendQueueLimitBlocking verifies that a write exceeding the configured
+// budget blocks (temporary congestion) and resumes automatically once ACKs
+// release the budget, rather than returning an error.
+func TestSetSendQueueLimitBlocking(t *testing.T) {
+	port := nextPort()
+	l := sinkServer(port)
+	defer l.Close()
+
+	cli, err := dialSink(port)
+	if err != nil {
+		panic(err)
+	}
+	defer cli.Close()
+
+	// cap outstanding data at 4 segments
+	cli.SetSendQueueLimit(4, 4*1376)
+	cli.SetWriteDeadline(time.Now().Add(30 * time.Second))
+
+	done := make(chan int, 1)
+	go func() {
+		n, err := cli.Write(make([]byte, 100*1376)) // 100 segments
+		if err != nil {
+			done <- -1
+			return
+		}
+		done <- n
+	}()
+
+	select {
+	case n := <-done:
+		if n != 100*1376 {
+			t.Fatalf("Write returned %d, want %d", n, 100*1376)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Write blocked forever: budget was not released on ACKs")
+	}
+}
