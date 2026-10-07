@@ -430,6 +430,9 @@ func (p *parser) parseStep(n node) (opnd node) {
 		if axisType == "attribute" {
 			matchType = AttributeNode
 		}
+		if axisType == "namespace" {
+			matchType = NamespaceNode
+		}
 		opnd = p.parseNodeTest(n, axisType, matchType)
 	}
 	for p.r.typ == itemLBracket {

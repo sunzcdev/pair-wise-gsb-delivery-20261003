@@ -773,6 +773,265 @@ func (s *selfQuery) Properties() queryProp {
 	return queryProps.Merge
 }
 
+// namespaceQuery is an XPath namespace axis node query.(namespace::*)
+type namespaceQuery struct {
+	name     string
+	posit    int
+	iterator func() NodeNavigator
+
+	Input     query
+	Predicate func(NodeNavigator) bool
+}
+
+func (q *namespaceQuery) Select(t iterator) NodeNavigator {
+	for {
+		if q.iterator == nil {
+			q.posit = 0
+			node := q.Input.Select(t)
+			if node == nil {
+				return nil
+			}
+			node = node.Copy()
+			// The namespace axis is defined for element nodes only. A
+			// navigator that does not implement NamespaceScopeNavigator
+			// yields an empty node-set for the axis.
+			var bindings []NamespaceBinding
+			var scope NamespaceScopeNavigator
+			if node.NodeType() == ElementNode {
+				if ns, ok := node.(NamespaceScopeNavigator); ok {
+					scope = ns
+					bindings = resolveInScopeNamespaces(ns.InScopeNamespaces())
+				}
+			}
+			i := 0
+			q.iterator = func() NodeNavigator {
+				for i < len(bindings) {
+					b := bindings[i]
+					i++
+					n := &namespaceNodeNavigator{
+						elem:   node.Copy(),
+						prefix: b.Prefix,
+						uri:    b.URI,
+						id:     scope.NamespaceNodeID(b.Prefix),
+						onNS:   true,
+					}
+					if q.Predicate(n) {
+						return n
+					}
+				}
+				return nil
+			}
+		}
+
+		if node := q.iterator(); node != nil {
+			q.posit++
+			return node
+		}
+		q.iterator = nil
+	}
+}
+
+func (q *namespaceQuery) Evaluate(t iterator) interface{} {
+	q.Input.Evaluate(t)
+	q.iterator = nil
+	return q
+}
+
+func (q *namespaceQuery) Test(n NodeNavigator) bool {
+	return q.Predicate(n)
+}
+
+func (q *namespaceQuery) Clone() query {
+	return &namespaceQuery{name: q.name, Input: q.Input.Clone(), Predicate: q.Predicate}
+}
+
+func (q *namespaceQuery) ValueType() resultType {
+	return xpathResultType.NodeSet
+}
+
+func (q *namespaceQuery) Properties() queryProp {
+	return queryProps.Merge
+}
+
+// position returns a position of current NodeNavigator.
+func (q *namespaceQuery) position() int {
+	return q.posit
+}
+
+// resolveInScopeNamespaces normalizes the namespace bindings reported by a
+// NamespaceScopeNavigator into the node-set of the namespace axis:
+// duplicate prefixes are resolved in favour of the last (innermost)
+// binding, a binding with an empty URI cancels the binding for its prefix
+// (default-namespace undeclaration, xmlns=""), and the implicit binding of
+// the "xml" prefix is appended when missing.
+func resolveInScopeNamespaces(decls []NamespaceBinding) []NamespaceBinding {
+	var out []NamespaceBinding
+	index := make(map[string]int)
+	for _, decl := range decls {
+		i, ok := index[decl.Prefix]
+		switch {
+		case decl.URI == "":
+			if ok {
+				out = append(out[:i], out[i+1:]...)
+				for prefix, j := range index {
+					if j > i {
+						index[prefix] = j - 1
+					}
+				}
+				delete(index, decl.Prefix)
+			}
+		case ok:
+			out[i].URI = decl.URI
+		default:
+			index[decl.Prefix] = len(out)
+			out = append(out, decl)
+		}
+	}
+	if _, ok := index["xml"]; !ok {
+		out = append(out, NamespaceBinding{Prefix: "xml", URI: xmlNamespaceURI})
+	}
+	return out
+}
+
+// namespaceNodeNavigator exposes an in-scope namespace binding of an
+// element as a full XPath namespace node. While positioned on the
+// namespace node (onNS) it reports the binding's prefix as its name and
+// the bound URI as its string-value; its parent, and every other axis, is
+// resolved against the element the binding is in scope for, so the parent
+// of a namespace node is always the element the namespace axis was
+// evaluated on rather than the ancestor that declared the binding.
+type namespaceNodeNavigator struct {
+	elem   NodeNavigator
+	prefix string
+	uri    string
+	id     uint64
+	onNS   bool
+}
+
+func (n *namespaceNodeNavigator) NodeType() NodeType {
+	if n.onNS {
+		return NamespaceNode
+	}
+	return n.elem.NodeType()
+}
+
+func (n *namespaceNodeNavigator) LocalName() string {
+	if n.onNS {
+		return n.prefix
+	}
+	return n.elem.LocalName()
+}
+
+func (n *namespaceNodeNavigator) Prefix() string {
+	if n.onNS {
+		return ""
+	}
+	return n.elem.Prefix()
+}
+
+func (n *namespaceNodeNavigator) Value() string {
+	if n.onNS {
+		return n.uri
+	}
+	return n.elem.Value()
+}
+
+func (n *namespaceNodeNavigator) Copy() NodeNavigator {
+	m := *n
+	m.elem = n.elem.Copy()
+	return &m
+}
+
+func (n *namespaceNodeNavigator) MoveToRoot() {
+	n.onNS = false
+	n.elem.MoveToRoot()
+}
+
+func (n *namespaceNodeNavigator) MoveToParent() bool {
+	if n.onNS {
+		n.onNS = false
+		return true
+	}
+	return n.elem.MoveToParent()
+}
+
+func (n *namespaceNodeNavigator) MoveToNextAttribute() bool {
+	if n.onNS {
+		return false
+	}
+	return n.elem.MoveToNextAttribute()
+}
+
+func (n *namespaceNodeNavigator) MoveToChild() bool {
+	if n.onNS {
+		return false
+	}
+	return n.elem.MoveToChild()
+}
+
+func (n *namespaceNodeNavigator) MoveToFirst() bool {
+	if n.onNS {
+		return false
+	}
+	return n.elem.MoveToFirst()
+}
+
+func (n *namespaceNodeNavigator) MoveToNext() bool {
+	if n.onNS {
+		return false
+	}
+	return n.elem.MoveToNext()
+}
+
+func (n *namespaceNodeNavigator) MoveToPrevious() bool {
+	if n.onNS {
+		return false
+	}
+	return n.elem.MoveToPrevious()
+}
+
+func (n *namespaceNodeNavigator) MoveTo(other NodeNavigator) bool {
+	if o, ok := other.(*namespaceNodeNavigator); ok {
+		if !n.elem.MoveTo(o.elem) {
+			return false
+		}
+		n.prefix, n.uri, n.id, n.onNS = o.prefix, o.uri, o.id, o.onNS
+		return true
+	}
+	// Allow moving back onto a plain node of the underlying document.
+	if n.elem.MoveTo(other) {
+		n.onNS = false
+		return true
+	}
+	return false
+}
+
+// namespaceNodeID returns the stable identity of the namespace node, used
+// by getHashCode for node-set de-duplication.
+func (n *namespaceNodeNavigator) namespaceNodeID() uint64 {
+	return n.id
+}
+
+// InScopeNamespaces delegates to the underlying element so that namespace
+// axis steps keep working after moving from a namespace node to its parent
+// element.
+func (n *namespaceNodeNavigator) InScopeNamespaces() []NamespaceBinding {
+	if n.onNS {
+		return nil
+	}
+	if ns, ok := n.elem.(NamespaceScopeNavigator); ok {
+		return ns.InScopeNamespaces()
+	}
+	return nil
+}
+
+func (n *namespaceNodeNavigator) NamespaceNodeID(prefix string) uint64 {
+	if ns, ok := n.elem.(NamespaceScopeNavigator); ok {
+		return ns.NamespaceNodeID(prefix)
+	}
+	return 0
+}
+
 // filterQuery is an XPath query for predicate filter.
 type filterQuery struct {
 	Input      query
@@ -817,8 +1076,15 @@ func (f *filterQuery) Select(t iterator) NodeNavigator {
 		}
 		node = node.Copy()
 
-		t.Current().MoveTo(node)
-		if f.do(t) {
+		it := t
+		if !t.Current().MoveTo(node) {
+			// The iterator's navigator cannot represent the matched node
+			// (for example a namespace node produced by the namespace
+			// axis); evaluate the predicate against a shim iterator
+			// positioned at the node instead.
+			it = iteratorFunc(func() NodeNavigator { return node })
+		}
+		if f.do(it) {
 			// fix https://github.com/antchfx/htmlquery/issues/26
 			// Calculate and keep the each of matching node's position in the same depth.
 			level := getNodeDepth(f.Input)
@@ -1400,27 +1666,53 @@ func getHashCode(n NodeNavigator) uint64 {
 			sb.WriteByte('-')
 			sb.WriteString(strconv.Itoa(d))
 		}
+	case NamespaceNode:
+		sb.WriteString("namespace::")
+		sb.WriteString(n.LocalName())
+		sb.WriteByte('=')
+		sb.WriteString(n.Value())
+		type namespaceNodeIdentifier interface {
+			namespaceNodeID() uint64
+		}
+		if ni, ok := n.(namespaceNodeIdentifier); ok {
+			sb.WriteByte('#')
+			sb.WriteString(strconv.FormatUint(ni.namespaceNodeID(), 16))
+			break
+		}
+		// Namespace nodes without a stable identity fall back to the
+		// identity of their parent element, which the namespace axis
+		// defines as the element the binding is in scope for.
+		if n.MoveToParent() {
+			writeElementHash(&sb, n)
+		}
 	case ElementNode:
-		sb.WriteString(n.Prefix() + n.LocalName())
-		d := 1
+		writeElementHash(&sb, n)
+	}
+	h := fnv.New64a()
+	h.Write(sb.Bytes())
+	return h.Sum64()
+}
+
+// writeElementHash writes the structural identity of the element n is
+// positioned on: its qualified name and its sibling position at every
+// level up to the root.
+func writeElementHash(sb *bytes.Buffer, n NodeNavigator) {
+	sb.WriteString(n.Prefix() + n.LocalName())
+	d := 1
+	for n.MoveToPrevious() {
+		d++
+	}
+	sb.WriteByte('-')
+	sb.WriteString(strconv.Itoa(d))
+
+	for n.MoveToParent() {
+		d = 1
 		for n.MoveToPrevious() {
 			d++
 		}
 		sb.WriteByte('-')
 		sb.WriteString(strconv.Itoa(d))
-
-		for n.MoveToParent() {
-			d = 1
-			for n.MoveToPrevious() {
-				d++
-			}
-			sb.WriteByte('-')
-			sb.WriteString(strconv.Itoa(d))
-		}
 	}
-	h := fnv.New64a()
-	h.Write(sb.Bytes())
-	return h.Sum64()
 }
 
 func getNodePosition(q query) int {

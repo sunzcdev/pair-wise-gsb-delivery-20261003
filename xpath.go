@@ -24,9 +24,52 @@ const (
 	// CommentNode is a comment node, such as <!-- my comment -->
 	CommentNode
 
+	// NamespaceNode is a namespace node, such as xmlns:foo="uri", exposed
+	// through the XPath namespace axis (namespace::).
+	NamespaceNode
+
 	// allNode is any types of node, used by xpath package only to predicate match.
 	allNode
 )
+
+// xmlNamespaceURI is the namespace URI that the "xml" prefix is always
+// bound to, as defined by the XML namespaces specification.
+const xmlNamespaceURI = "http://www.w3.org/XML/1998/namespace"
+
+// NamespaceBinding describes a single namespace binding in scope on an
+// element: Prefix is the namespace prefix ("" for the default namespace)
+// and URI is the namespace URI the prefix is bound to.
+type NamespaceBinding struct {
+	Prefix string
+	URI    string
+}
+
+// NamespaceScopeNavigator is an optional, backward-compatible extension to
+// NodeNavigator. A NodeNavigator that also implements it enables the XPath
+// namespace axis (namespace::) on element nodes: the axis is populated from
+// the in-scope namespace bindings reported by InScopeNamespaces, and each
+// binding becomes a full namespace node whose name is the prefix, whose
+// string-value is the namespace URI, whose parent is the element the
+// binding is in scope for, and whose identity (used for node-set
+// de-duplication) is given by NamespaceNodeID.
+//
+// Navigators that do not implement NamespaceScopeNavigator evaluate
+// namespace axis steps to an empty node-set.
+type NamespaceScopeNavigator interface {
+	// InScopeNamespaces reports the namespace bindings in scope for the
+	// current element, including bindings inherited from ancestor elements
+	// with prefix shadowing and default-namespace undeclaration (xmlns="")
+	// already resolved. The implicit binding of the "xml" prefix is added
+	// by the xpath package when missing, so implementations may omit it.
+	InScopeNamespaces() []NamespaceBinding
+
+	// NamespaceNodeID returns a stable identity for the namespace node of
+	// the given prefix on the current element. Identities must be equal
+	// for the same prefix on the same element (across navigator copies)
+	// and distinct for namespace nodes of different elements, even when
+	// their prefix and URI are equal.
+	NamespaceNodeID(prefix string) uint64
+}
 
 // NodeNavigator provides cursor model for navigating XML data.
 type NodeNavigator interface {

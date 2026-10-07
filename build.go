@@ -155,7 +155,10 @@ func (b *builder) processAxis(root *axisNode, flags flag, props *builderProp) (q
 	case "self":
 		qyOutput = &selfQuery{Input: qyInput, Predicate: predicate}
 	case "namespace":
-		// haha,what will you do someting??
+		// The namespace axis is populated from the in-scope namespace
+		// bindings of each element node. Navigators that do not implement
+		// NamespaceScopeNavigator evaluate it to an empty node-set.
+		qyOutput = &namespaceQuery{name: root.LocalName, Input: qyInput, Predicate: predicate}
 	default:
 		err = fmt.Errorf("unknown axe type: %s", root.AxisType)
 		return nil, err
@@ -266,6 +269,11 @@ func (b *builder) processFilter(root *filterNode, flags flag, props *builderProp
 					axisQuery.Input = rootQuery
 				}
 			case *attributeQuery:
+				if _, ok := axisQuery.Input.(*contextQuery); !ok {
+					parent = axisQuery.Input
+					axisQuery.Input = rootQuery
+				}
+			case *namespaceQuery:
 				if _, ok := axisQuery.Input.(*contextQuery); !ok {
 					parent = axisQuery.Input
 					axisQuery.Input = rootQuery
