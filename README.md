@@ -71,3 +71,30 @@ for key, _, ok := it.Next(); ok; key, _, ok = it.Next() {
 //  010
 ```
 
+Prefix rule view (`rules` subpackage)
+=====================================
+
+The `rules` subpackage layers an "effective rule" view over the tree when a
+prefix may carry several rules and entries may stop inheritance from their
+parents. It is not a plain longest-prefix lookup: for a queried key it walks
+exactly the entries on the key's path (siblings never participate), applies
+barriers that clear inherited rules, and returns the surviving rule plus an
+explanation of every rule shadowed along the way. Higher priority wins; ties
+are broken by the smaller stable rule ID.
+
+Updates use one immutable snapshot and a transactional batch:
+
+```go
+snap := rules.New().Batch().
+    SetRules(nil, []rules.Rule{{ID: "default", Priority: 100}}).
+    Replace([]byte("api/"), []rules.Rule{{ID: "api", Priority: 5}}, true). // barrier
+    Commit()
+
+d := snap.Decide([]byte("api/v2/users"))
+// d.Hit, d.Effective, d.MatchPrefix
+// d.Shadows  - why each ancestor rule lost (barrier or outranked)
+// d.Barriers - barriers crossed and how many rules each cleared
+
+next := snap.Batch().SetRules([]byte("api/"), nil).Commit()
+// snap keeps its previous decision; next is a new immutable snapshot.
+```
