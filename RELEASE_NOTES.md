@@ -1,3 +1,19 @@
+Next release
+============
+
+**Changes**
+
+* Added the `TransplantChild` function, which inserts an element subtree
+  into another element (by copy or by move) while preserving the expanded
+  names of all elements, attributes, and registered QName attribute values.
+  Namespace prefix conflicts and default namespace shadowing at the
+  destination are resolved by adding a minimal set of namespace
+  declarations to the transplanted subtree.
+
+* Fixed `Element.Copy` so that copied attributes point back to the copied
+  element, allowing `Attr.NamespaceURI` to resolve correctly on copied
+  subtrees.
+
 Release 1.8.1
 =============
 

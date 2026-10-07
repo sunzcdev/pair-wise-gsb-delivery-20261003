@@ -1360,6 +1360,9 @@ func (e *Element) dup(parent *Element) Token {
 		ne.Child[i] = t.dup(ne)
 	}
 	copy(ne.Attr, e.Attr)
+	for i := range ne.Attr {
+		ne.Attr[i].element = ne
+	}
 	return ne
 }
 
