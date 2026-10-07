@@ -25,6 +25,7 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -591,10 +592,81 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 //
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
 func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
-	snd_una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
 		return -1
 	}
+	return kcp.input(data, pktType, ackNoDelay)
+}
+
+// InputError describes why a datagram was rejected by InputStrict.
+// Offset is the byte offset of the offending segment within the datagram,
+// Reason explains the validation failure.
+type InputError struct {
+	Offset int
+	Reason string
+}
+
+func (e *InputError) Error() string {
+	return fmt.Sprintf("kcp: invalid segment at offset %d: %s", e.Offset, e.Reason)
+}
+
+// validateDatagram checks every segment of a datagram against the KCP wire
+// format without touching any state: segment headers must be complete, the
+// conversation id must match, the command must be known, the declared payload
+// length must fit, and no trailing garbage may remain after the last segment.
+func validateDatagram(data []byte, conv uint32) *InputError {
+	if len(data) < IKCP_OVERHEAD {
+		return &InputError{Offset: 0, Reason: "datagram shorter than segment header"}
+	}
+
+	offset := 0
+	for len(data) > 0 {
+		if len(data) < IKCP_OVERHEAD {
+			return &InputError{Offset: offset, Reason: "truncated segment header"}
+		}
+
+		_ = data[IKCP_OVERHEAD-1] // BCE hint
+		segConv := binary.LittleEndian.Uint32(data)
+		cmd := data[4]
+		length := binary.LittleEndian.Uint32(data[20:])
+
+		if segConv != conv {
+			return &InputError{Offset: offset, Reason: "conversation id mismatch"}
+		}
+		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
+			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
+			return &InputError{Offset: offset, Reason: "unknown command"}
+		}
+		if uint64(length) > uint64(len(data)-IKCP_OVERHEAD) {
+			return &InputError{Offset: offset, Reason: "truncated segment payload"}
+		}
+
+		consumed := IKCP_OVERHEAD + int(length)
+		offset += consumed
+		data = data[consumed:]
+	}
+	return nil
+}
+
+// InputStrict feeds a datagram into the kcp state machine atomically: the
+// whole datagram is validated first, and only applied if every segment is
+// well-formed. On validation failure a *InputError is returned and the kcp
+// state is guaranteed to be untouched - no remote window update, no
+// acknowledgement processing and no received data is queued.
+//
+// For well-formed datagrams InputStrict behaves exactly like Input.
+func (kcp *KCP) InputStrict(data []byte, pktType PacketType, ackNoDelay bool) error {
+	if err := validateDatagram(data, kcp.conv); err != nil {
+		return err
+	}
+	kcp.input(data, pktType, ackNoDelay)
+	return nil
+}
+
+// input applies a datagram to the kcp state machine, it shares the segment
+// parsing loop between Input and InputStrict.
+func (kcp *KCP) input(data []byte, pktType PacketType, ackNoDelay bool) int {
+	snd_una := kcp.snd_una
 
 	var latest uint32 // the latest ack packet
 	var updateRTT int
