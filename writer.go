@@ -19,6 +19,12 @@ type WriterConfig struct {
 	DictCap    int
 	BufSize    int
 	BlockSize  int64
+	// Filters defines the filters before the final LZMA2 filter.
+	// Supported filters are *DeltaFilter and *X86Filter. At most
+	// three pre-filters are allowed and at most one Delta filter
+	// may be used. If the field is nil, the default configuration
+	// with only the LZMA2 filter is used.
+	Filters []Filter
 	// checksum method: CRC32, CRC64 or SHA256 (default: CRC64)
 	CheckSum byte
 	// Forces NoChecksum (default: false)
@@ -71,12 +77,62 @@ func (c *WriterConfig) Verify() error {
 	if err := verifyFlags(c.CheckSum); err != nil {
 		return err
 	}
+	if len(c.Filters) > maxFilters-1 {
+		return errors.New("xz: more than four filters")
+	}
+	seenDelta := false
+	for _, g := range c.Filters {
+		h := toFilter(g)
+		switch f := h.(type) {
+		case nil:
+			return errors.New("xz: unsupported filter type")
+		case *DeltaFilter:
+			if seenDelta {
+				return errors.New(
+					"xz: multiple Delta filters not supported")
+			}
+			seenDelta = true
+			d := f.Distance
+			if d == 0 {
+				d = minDeltaDistance
+			}
+			if d < minDeltaDistance || d > maxDeltaDistance {
+				return errors.New("xz: delta distance out of range")
+			}
+		case *X86Filter:
+		}
+	}
 	return nil
 }
 
 // filters creates the filter list for the given parameters.
-func (c *WriterConfig) filters() []filter {
-	return []filter{&lzmaFilter{int64(c.DictCap)}}
+func (c *WriterConfig) filters() ([]filter, error) {
+	if len(c.Filters) > maxFilters-1 {
+		return nil, errors.New("xz: more than four filters")
+	}
+	f := make([]filter, 0, len(c.Filters)+1)
+	seenDelta := false
+	for _, g := range c.Filters {
+		h := toFilter(g)
+		if h == nil {
+			return nil, errors.New("xz: unsupported filter type")
+		}
+		switch q := h.(type) {
+		case *DeltaFilter:
+			if seenDelta {
+				return nil, errors.New(
+					"xz: multiple Delta filters not supported")
+			}
+			seenDelta = true
+			if err := q.verify(); err != nil {
+				return nil, err
+			}
+		case *X86Filter:
+		}
+		f = append(f, h)
+	}
+	f = append(f, &lzmaFilter{int64(c.DictCap)})
+	return f, nil
 }
 
 // maxInt64 defines the maximum 64-bit signed integer.
@@ -91,13 +147,30 @@ func verifyFilters(f []filter) error {
 	if len(f) > 4 {
 		return errors.New("xz: more than four filters")
 	}
-	for _, g := range f[:len(f)-1] {
+	seenDelta := false
+	for i, g := range f[:len(f)-1] {
+		switch g.id() {
+		case deltaFilterID:
+			if seenDelta {
+				return errors.New(
+					"xz: multiple Delta filters not supported")
+			}
+			seenDelta = true
+		case x86FilterID:
+		default:
+			return fmt.Errorf(
+				"xz: unsupported filter id %#x at position %d",
+				g.id(), i)
+		}
 		if g.last() {
 			return errors.New("xz: last filter is not last")
 		}
 	}
 	if !f[len(f)-1].last() {
 		return errors.New("xz: wrong last filter")
+	}
+	if f[len(f)-1].id() != lzmaFilterID {
+		return errors.New("xz: last filter must be the LZMA2 filter")
 	}
 	return nil
 }
@@ -283,10 +356,14 @@ type blockWriter struct {
 
 // newBlockWriter creates a new block writer.
 func (c *WriterConfig) newBlockWriter(xz io.Writer, hash hash.Hash) (bw *blockWriter, err error) {
+	filters, err := c.filters()
+	if err != nil {
+		return nil, err
+	}
 	bw = &blockWriter{
 		cxz:       countingWriter{w: xz},
 		blockSize: c.BlockSize,
-		filters:   c.filters(),
+		filters:   filters,
 		hash:      hash,
 	}
 	bw.w, err = c.newFilterWriteCloser(&bw.cxz, bw.filters)

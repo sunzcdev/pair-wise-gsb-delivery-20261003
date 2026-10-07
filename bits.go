@@ -49,6 +49,14 @@ func putUvarint(p []byte, x uint64) int {
 	return i + 1
 }
 
+// appendUvarint appends the uvarint representation of x to b and
+// returns the extended buffer.
+func appendUvarint(b []byte, x uint64) []byte {
+	var p [10]byte
+	n := putUvarint(p[:], x)
+	return append(b, p[:n]...)
+}
+
 // errOverflow indicates an overflow of the 64-bit unsigned integer.
 var errOverflowU64 = errors.New("xz: uvarint overflows 64-bit unsigned integer")
 

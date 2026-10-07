@@ -57,6 +57,25 @@ func main() {
 
 You can find the full documentation at [pkg.go.dev](https://pkg.go.dev/github.com/ulikunitz/xz).
 
+## Filter chains
+
+In addition to the mandatory LZMA2 filter the package supports the
+Delta filter and the x86 BCJ (Branch/Call/Jump) filter as non-last
+filters of a block. Configure them in [xz.WriterConfig](https://pkg.go.dev/github.com/ulikunitz/xz#WriterConfig):
+
+```go
+w, err := xz.WriterConfig{
+    Filters: []xz.Filter{
+        &xz.DeltaFilter{Distance: 1},
+        &xz.X86Filter{},
+    },
+}.NewWriter(out)
+```
+
+The reader automatically detects the filters stored in the xz block
+header. Unsupported filter IDs are reported as errors rather than being
+silently treated as uncompressed data.
+
 ## Using the gxz compression tool
 
 The package includes a gxz command line utility for compression and

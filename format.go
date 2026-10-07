@@ -434,13 +434,14 @@ func (h *blockHeader) MarshalBinary() (data []byte, err error) {
 	}
 	for i, f := range h.filters {
 		if i < len(h.filters)-1 {
-			if f.id() == lzmaFilterID {
-				return nil, errors.New(
-					"xz: LZMA2 filter is not the last")
+			// LZMA2 must be the last filter in the chain.
+			if f.last() {
+				return nil, errors.New("xz: " +
+					"non-last filter must not be an LZMA2 filter")
 			}
 		} else {
 			// last filter
-			if f.id() != lzmaFilterID {
+			if !f.last() {
 				return nil, errors.New("xz: " +
 					"last filter must be the LZMA2 filter")
 			}
@@ -524,7 +525,7 @@ type filter interface {
 }
 
 // readFilter reads a block filter from the block header. At this point
-// in time only the LZMA2 filter is supported.
+// in time the LZMA2, Delta and x86 BCJ filters are supported.
 func readFilter(r io.Reader) (f filter, err error) {
 	br := lzma.ByteReader(r)
 
@@ -533,40 +534,70 @@ func readFilter(r io.Reader) (f filter, err error) {
 	if err != nil {
 		return nil, err
 	}
+	// size of properties
+	size, _, err := readUvarint(br)
+	if err != nil {
+		return nil, err
+	}
+	// Property size for the supported filters is at most 4 bytes.
+	// Limit it to keep memory usage bounded for unsupported filters.
+	if size > maxFilterPropsSize {
+		return nil, errors.New("xz: filter properties too large")
+	}
+	data := make([]byte, size)
+	if _, err = io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
 
-	var data []byte
 	switch id {
 	case lzmaFilterID:
-		data = make([]byte, lzmaFilterLen)
-		data[0] = lzmaFilterID
-		if _, err = io.ReadFull(r, data[1:]); err != nil {
-			return nil, err
+		if size != 1 {
+			return nil, errors.New(
+				"xz: wrong LZMA2 filter properties size")
 		}
 		f = new(lzmaFilter)
+	case deltaFilterID:
+		f = new(DeltaFilter)
+	case x86FilterID:
+		f = new(X86Filter)
 	default:
 		if id >= minReservedID {
 			return nil, errors.New(
 				"xz: reserved filter id in block stream header")
 		}
-		return nil, errors.New("xz: invalid filter id")
+		return nil, fmt.Errorf(
+			"xz: unsupported filter id %#x", id)
 	}
-	if err = f.UnmarshalBinary(data); err != nil {
+	// Prepend filter ID and properties size as expected by the
+	// UnmarshalBinary methods. Both values fit in a single byte for
+	// the supported filters.
+	hdr := make([]byte, 0, 2+len(data))
+	hdr = appendUvarint(hdr, id)
+	hdr = appendUvarint(hdr, size)
+	hdr = append(hdr, data...)
+	if err = f.UnmarshalBinary(hdr); err != nil {
 		return nil, err
 	}
 	return f, err
 }
 
-// readFilters reads count filters. At this point in time only the count
-// 1 is supported.
+// maxFilterPropsSize limits the properties size accepted for a single
+// filter in a block header.
+const maxFilterPropsSize = 1024
+
+// readFilters reads count filters.
 func readFilters(r io.Reader, count int) (filters []filter, err error) {
-	if count != 1 {
+	if count < minFilters || count > maxFilters {
 		return nil, errors.New("xz: unsupported filter count")
 	}
-	f, err := readFilter(r)
-	if err != nil {
-		return nil, err
+	filters = make([]filter, count)
+	for i := range filters {
+		filters[i], err = readFilter(r)
+		if err != nil {
+			return nil, err
+		}
 	}
-	return []filter{f}, err
+	return filters, nil
 }
 
 /*** Index ***/
