@@ -499,6 +499,190 @@ func TestMemoryInstance_Read(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestMemoryInstance_ReadCopy(t *testing.T) {
+	var _ experimental.CopyingMemory = &MemoryInstance{}
+
+	mem := &MemoryInstance{Buffer: []byte{1, 2, 3, 4, 16, 0, 0, 0}, Min: 1}
+
+	copied, ok := mem.ReadCopy(4, 4)
+	require.True(t, ok)
+	require.Equal(t, []byte{16, 0, 0, 0}, copied)
+
+	// The copy is owned: mutating it does not reach the backing memory.
+	copied[3] = 4
+	require.Equal(t, []byte{16, 0, 0, 4}, copied)
+	require.Equal(t, []byte{1, 2, 3, 4, 16, 0, 0, 0}, mem.Buffer)
+
+	// Mutating the backing memory after the copy does not affect the copy.
+	mem.Buffer[4] = 99
+	require.Equal(t, []byte{16, 0, 0, 4}, copied)
+
+	// Out of range reads fail and return no bytes.
+	_, ok = mem.ReadCopy(5, 4)
+	require.False(t, ok)
+	_, ok = mem.ReadCopy(9, 4)
+	require.False(t, ok)
+}
+
+func TestMemoryInstance_ReadCopy_ZeroLengthEnd(t *testing.T) {
+	mem := &MemoryInstance{Buffer: make([]byte, 8), Min: 1}
+
+	// A zero-length read at the very end is legal, matching Read.
+	copied, ok := mem.ReadCopy(uint32(len(mem.Buffer)), 0)
+	require.True(t, ok)
+	require.NotNil(t, copied)
+	require.Equal(t, 0, len(copied))
+
+	// But one byte past the end, even with zero length, is not.
+	_, ok = mem.ReadCopy(uint32(len(mem.Buffer))+1, 0)
+	require.False(t, ok)
+}
+
+func TestMemoryInstance_ReadCopy_MaxBoundaryOverflow(t *testing.T) {
+	mem := &MemoryInstance{Buffer: make([]byte, 8), Min: 1}
+
+	// offset+byteCount must not be allowed to wrap in uint32.
+	_, ok := mem.ReadCopy(math.MaxUint32-1, 4)
+	require.False(t, ok)
+	_, ok = mem.ReadCopy(math.MaxUint32, 1)
+	require.False(t, ok)
+
+	// The largest end offset representable by uint32 (exclusive) is valid only
+	// when the backing memory is that large; here it merely must not wrap.
+	_, ok = mem.ReadCopy(math.MaxUint32, 0)
+	require.False(t, ok)
+}
+
+func TestMemoryInstance_ReadBorrow(t *testing.T) {
+	var _ experimental.BorrowedMemory = &MemoryInstance{}
+
+	buffer := make([]byte, MemoryPageSize, 2*MemoryPageSize)
+	copy(buffer, []byte{1, 2, 3, 4, 16, 0, 0, 0})
+	mem := &MemoryInstance{Buffer: buffer, Min: 1, Cap: 2, Max: 2}
+	mem.ownerModuleEngine = &mockModuleEngine{}
+
+	// Initially the memory has never grown, so the generation is zero.
+	view, gen, ok := mem.ReadBorrow(4, 4)
+	require.True(t, ok)
+	require.Equal(t, experimental.MemoryGeneration(0), gen)
+	require.Equal(t, []byte{16, 0, 0, 0}, view)
+	require.False(t, mem.GrownSince(gen))
+
+	// Like Read, the view is write-through to live memory.
+	view[3] = 4
+	require.Equal(t, []byte{1, 2, 3, 4, 16, 0, 0, 4}, mem.Buffer[:8])
+
+	// A zero-delta Grow is well-defined and must not advance the generation.
+	_, ok = mem.Grow(0)
+	require.True(t, ok)
+	require.False(t, mem.GrownSince(gen))
+
+	// A real Grow advances the generation, invalidating the old view.
+	prev, ok := mem.Grow(1) // 1 page -> 2 pages; capacity already reserved.
+	require.True(t, ok)
+	require.Equal(t, uint32(1), prev)
+	require.True(t, mem.GrownSince(gen))
+
+	// A fresh borrow observes the new generation and is immediately current.
+	view2, gen2, ok := mem.ReadBorrow(4, 4)
+	require.True(t, ok)
+	require.True(t, gen2 > gen)
+	require.False(t, mem.GrownSince(gen2))
+	require.Equal(t, []byte{16, 0, 0, 4}, view2)
+
+	// A failed grow (exceeds max) must not advance the generation.
+	_, ok = mem.Grow(1)
+	require.False(t, ok)
+	require.False(t, mem.GrownSince(gen2))
+}
+
+func TestMemoryInstance_ReadBorrow_GrowMovesBuffer(t *testing.T) {
+	// Non-shared, capacity-bound growth may reallocate the backing array, so a
+	// pre-grow view aliases the old allocation. The generation surfaces this.
+	mem := &MemoryInstance{Buffer: make([]byte, 0, MemoryPageSize), Cap: 1, Max: 2}
+	mem.ownerModuleEngine = &mockModuleEngine{}
+
+	// Seed the first page and borrow it before forcing a reallocating grow.
+	_, ok := mem.Grow(1)
+	require.True(t, ok)
+	mem.Buffer[0] = 7
+
+	oldView, gen, ok := mem.ReadBorrow(0, 1)
+	require.True(t, ok)
+	require.Equal(t, byte(7), oldView[0])
+
+	// Growing past capacity (1 -> 2 pages) reallocates the backing slice.
+	_, ok = mem.Grow(1)
+	require.True(t, ok)
+	require.True(t, mem.GrownSince(gen))
+
+	// The stale view must not be used; a re-read recovers a current view at the
+	// new generation.
+	mem.Buffer[0] = 9
+	newView, gen2, ok := mem.ReadBorrow(0, 1)
+	require.True(t, ok)
+	require.True(t, gen2 > gen)
+	require.False(t, mem.GrownSince(gen2))
+	require.Equal(t, byte(9), newView[0])
+}
+
+func TestMemoryInstance_ReadBorrow_Bounds(t *testing.T) {
+	mem := &MemoryInstance{Buffer: make([]byte, 8), Min: 1}
+
+	// Zero-length read at the end is legal and reports the current generation.
+	view, gen, ok := mem.ReadBorrow(uint32(len(mem.Buffer)), 0)
+	require.True(t, ok)
+	require.NotNil(t, view)
+	require.Equal(t, 0, len(view))
+	require.False(t, mem.GrownSince(gen))
+
+	if _, _, ok := mem.ReadBorrow(uint32(len(mem.Buffer))+1, 0); ok {
+		t.Fatal("expected zero-length read past end to fail")
+	}
+
+	// offset+byteCount must not wrap in uint32.
+	_, _, ok = mem.ReadBorrow(math.MaxUint32-1, 4)
+	require.False(t, ok)
+	_, _, ok = mem.ReadBorrow(math.MaxUint32, 1)
+	require.False(t, ok)
+}
+
+func TestMemoryInstance_ReadBorrow_SharedFixedBuffer(t *testing.T) {
+	// Shared memory grows in place: the backing address never moves, only the
+	// length is atomically extended. The generation still advances, letting a
+	// borrower tell that a previously held, in-bounds view now covers more live
+	// memory after a Grow.
+	maxPages := uint32(2)
+	maxBytes := MemoryPagesToBytesNum(maxPages)
+	expBuffer := &fixedAddressBuffer{buf: make([]byte, 0, maxBytes)}
+	mem := &MemoryInstance{
+		Buffer: expBuffer.Reallocate(uint64(MemoryPageSize)),
+		Min:    1, Cap: 1, Max: maxPages,
+		Shared:    true,
+		expBuffer: expBuffer,
+	}
+	mem.ownerModuleEngine = &mockModuleEngine{}
+
+	mem.Buffer[0] = 1
+	view, gen, ok := mem.ReadBorrow(0, 1)
+	require.True(t, ok)
+	require.Equal(t, byte(1), view[0])
+	require.False(t, mem.GrownSince(gen))
+
+	// Grow in place: the view's backing array is the same fixed allocation.
+	prev, ok := mem.Grow(1)
+	require.True(t, ok)
+	require.Equal(t, uint32(1), prev)
+	require.Equal(t, uint32(2), mem.Pages())
+	require.True(t, mem.GrownSince(gen))
+
+	// A re-read returns the current generation and reaches grown memory.
+	view2, gen2, ok := mem.ReadBorrow(0, MemoryPageSize+1)
+	require.True(t, ok)
+	require.False(t, mem.GrownSince(gen2))
+	require.Equal(t, byte(1), view2[0])
+}
+
 func TestMemoryInstance_WriteUint16Le(t *testing.T) {
 	memory := &MemoryInstance{Buffer: make([]byte, 100)}
 
@@ -1036,5 +1220,22 @@ func (b *sliceBuffer) Reallocate(size uint64) []byte {
 	} else {
 		b.buf = b.buf[:size]
 	}
+	return b.buf
+}
+
+// fixedAddressBuffer is a test LinearMemory whose backing array address never
+// changes: only the slice length is adjusted within the preallocated capacity.
+// It models a shared-memory allocator.
+type fixedAddressBuffer struct {
+	buf []byte
+}
+
+func (b *fixedAddressBuffer) Free() {}
+
+func (b *fixedAddressBuffer) Reallocate(size uint64) []byte {
+	if size > uint64(cap(b.buf)) {
+		return nil
+	}
+	b.buf = b.buf[:size]
 	return b.buf
 }

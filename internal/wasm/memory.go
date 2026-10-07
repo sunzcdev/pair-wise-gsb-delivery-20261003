@@ -32,6 +32,13 @@ const (
 // compile-time check to ensure MemoryInstance implements api.Memory
 var _ api.Memory = &MemoryInstance{}
 
+// compile-time checks to ensure MemoryInstance implements the experimental
+// stable-copy and generation-tracked borrow read helpers.
+var (
+	_ experimental.CopyingMemory  = &MemoryInstance{}
+	_ experimental.BorrowedMemory = &MemoryInstance{}
+)
+
 type waiters struct {
 	mux sync.Mutex
 	l   *list.List
@@ -64,6 +71,13 @@ type MemoryInstance struct {
 	ownerModuleEngine ModuleEngine
 
 	expBuffer experimental.LinearMemory
+
+	// generation is incremented on every successful, non-zero Grow. It backs
+	// experimental.BorrowedMemory, allowing callers to detect when a borrowed
+	// view has been invalidated by a capacity change. It is read and written
+	// atomically so that, for shared memory, generations are visible across
+	// threads without holding Mux.
+	generation atomic.Uint64
 }
 
 // NewMemoryInstance creates a new instance based on the parameters in the SectionIDMemory.
@@ -163,6 +177,32 @@ func (m *MemoryInstance) Read(offset, byteCount uint32) ([]byte, bool) {
 		return nil, false
 	}
 	return m.Buffer[offset : offset+byteCount : offset+byteCount], true
+}
+
+// ReadCopy implements the same method as documented on experimental.CopyingMemory.
+func (m *MemoryInstance) ReadCopy(offset, byteCount uint32) ([]byte, bool) {
+	end, ok := m.bounds(offset, byteCount)
+	if !ok {
+		return nil, false
+	}
+	copied := make([]byte, byteCount)
+	copy(copied, m.Buffer[offset:end])
+	return copied, true
+}
+
+// ReadBorrow implements the same method as documented on experimental.BorrowedMemory.
+func (m *MemoryInstance) ReadBorrow(offset, byteCount uint32) ([]byte, experimental.MemoryGeneration, bool) {
+	gen := experimental.MemoryGeneration(m.generation.Load())
+	end, ok := m.bounds(offset, byteCount)
+	if !ok {
+		return nil, gen, false
+	}
+	return m.Buffer[offset:end:end], gen, true
+}
+
+// GrownSince implements the same method as documented on experimental.BorrowedMemory.
+func (m *MemoryInstance) GrownSince(gen experimental.MemoryGeneration) bool {
+	return m.generation.Load() > uint64(gen)
 }
 
 // WriteByte implements the same method as documented on api.Memory.
@@ -276,6 +316,13 @@ func (m *MemoryInstance) Grow(delta uint32) (result uint32, ok bool) {
 			m.Buffer = m.Buffer[:MemoryPagesToBytesNum(newPages)]
 		}
 	}
+	// A successful, non-zero Grow changed the length/capacity: advance the
+	// generation so BorrowedMemory holders can detect the invalidation of
+	// previously borrowed views. delta==0 and failed grows return earlier, so
+	// reaching here implies the generation must advance. For shared memory the
+	// new length was already published above; the atomic Add here makes sure a
+	// goroutine that observes the new generation also observes that length.
+	m.generation.Add(1)
 	m.ownerModuleEngine.MemoryGrown()
 	return currentPages, true
 }
@@ -334,6 +381,23 @@ func memoryBytesNumToPages(bytesNum uint64) (pages uint32) {
 // Note: This is always fine, because memory can grow, but never shrink.
 func (m *MemoryInstance) hasSize(offset uint32, byteCount uint64) bool {
 	return uint64(offset)+byteCount <= uint64(len(m.Buffer)) // uint64 prevents overflow on add
+}
+
+// bounds returns the exclusive end index for a read of byteCount bytes at
+// offset, or ok=false if the range is invalid.
+//
+// The offset+byteCount addition is checked in uint64 so a uint32 wrap cannot
+// make an out-of-range read appear valid. A zero byteCount read is legal for
+// any offset up to and including the current memory size, matching the
+// existing Read convention.
+func (m *MemoryInstance) bounds(offset, byteCount uint32) (end uint32, ok bool) {
+	end64 := uint64(offset) + uint64(byteCount)
+	if end64 > uint64(len(m.Buffer)) {
+		return 0, false
+	}
+	// end64 <= len(m.Buffer), and the backing slice is at most 4GiB
+	// (MemoryLimitPages * MemoryPageSize), so this never truncates.
+	return uint32(end64), true
 }
 
 // readUint32Le implements ReadUint32Le without using a context. This is extracted as both ints and floats are stored in
