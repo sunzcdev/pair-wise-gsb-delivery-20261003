@@ -28,6 +28,9 @@ type Client struct {
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
+
+	metadataFunc      MetadataFunc
+	metadataWhitelist map[string]struct{}
 }
 
 // NewClient returns a new Client to handle requests to the
@@ -55,6 +58,26 @@ func NewClientWithCodec(codec Codec) *Client {
 // If you have methods that may take a long time, other subsequent requests may time out.
 func (c *Client) SetBlocking(blocking bool) {
 	c.blocking = blocking
+}
+
+// SetMetadataFunc installs a hook that runs for every incoming request
+// before its handler. It receives the peer-submitted metadata and may
+// validate, remove or add locally confirmed attributes. Returning an error
+// rejects the call without executing the handler. It must be called before
+// serving starts.
+func (c *Client) SetMetadataFunc(f MetadataFunc) {
+	c.metadataFunc = f
+}
+
+// SetMetadataWhitelist restricts automatic forwarding of peer-submitted
+// metadata on nested (reverse) calls made from inside a handler to the
+// given keys. By default no attribute is propagated to a reverse call.
+func (c *Client) SetMetadataWhitelist(keys ...string) {
+	wl := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		wl[k] = struct{}{}
+	}
+	c.metadataWhitelist = wl
 }
 
 // Run the client's read loop.
@@ -128,11 +151,18 @@ func (c *Client) readLoop() {
 	}
 }
 
-func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value) {
+func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value, callCtx context.Context) {
 	// Invoke the method, providing a new value for the reply.
 	replyv := reflect.New(method.replyType.Elem())
 
-	returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+	in := []reflect.Value{reflect.ValueOf(c), argv, replyv}
+	if method.hasContext {
+		if callCtx == nil {
+			callCtx = context.Background()
+		}
+		in = append(in, reflect.ValueOf(callCtx))
+	}
+	returnValues := method.fn.Call(in)
 
 	// Do not send response if request is a notification.
 	if req.Seq == 0 {
@@ -174,20 +204,73 @@ func (c *Client) readRequest(req *Request) error {
 		argIsValue = true
 	}
 	// argv guaranteed to be a pointer now.
-	if err := c.codec.ReadRequestBody(argv.Interface()); err != nil {
+
+	// Per-request metadata is read before the body, when the codec carries
+	// one. Invalid metadata must not keep the body frame unread.
+	var peerMD Metadata
+	metaCodec, hasMetadata := c.codec.(MetadataCodec)
+	var metaErr error
+	if hasMetadata {
+		peerMD, metaErr = metaCodec.ReadRequestMetadata()
+	}
+
+	bodyDst := argv.Interface()
+	if metaErr != nil {
+		bodyDst = nil
+	}
+	if err := c.codec.ReadRequestBody(bodyDst); err != nil {
 		return err
 	}
+
+	if metaErr != nil {
+		// Malformed or out-of-bounds metadata: reject before the handler can
+		// run, then keep serving subsequent requests on this connection.
+		c.rejectRequest(*req, metaErr)
+		return nil
+	}
+
 	if argIsValue {
 		argv = argv.Elem()
 	}
 
+	callCtx := context.Background()
+	if hasMetadata {
+		localMD := peerMD.clone()
+		if c.metadataFunc != nil {
+			confirmed, err := c.metadataFunc(callCtx, c, req.Method, peerMD.clone())
+			if err != nil {
+				c.rejectRequest(*req, err)
+				return nil
+			}
+			if confirmed != nil {
+				localMD = confirmed
+			}
+		}
+		callCtx = withMetadataViews(callCtx, peerMD, localMD)
+	}
+
 	if c.blocking {
-		c.handleRequest(*req, method, argv)
+		c.handleRequest(*req, method, argv, callCtx)
 	} else {
-		go c.handleRequest(*req, method, argv)
+		go c.handleRequest(*req, method, argv, callCtx)
 	}
 
 	return nil
+}
+
+// rejectRequest replies with cause for a request whose metadata was rejected.
+// Notifications (Seq == 0) receive no response.
+func (c *Client) rejectRequest(req Request, cause error) {
+	if req.Seq == 0 {
+		return
+	}
+	resp := &Response{
+		Seq:   req.Seq,
+		Error: cause.Error(),
+	}
+	if err := c.codec.WriteResponse(resp, resp); err != nil {
+		debugln("rpc2: error writing rejection response:", err.Error())
+	}
 }
 
 func (c *Client) readResponse(resp *Response) error {
@@ -247,10 +330,22 @@ func (c *Client) Close() error {
 // the same Call object.  If done is nil, Go will allocate a new channel.
 // If non-nil, done must be buffered or Go will deliberately crash.
 func (c *Client) Go(method string, args interface{}, reply interface{}, done chan *Call) *Call {
+	return c.GoWithContext(context.Background(), method, args, reply, done)
+}
+
+// GoWithContext is like Go but schedules metadata attached to ctx (see
+// NewOutgoingContext) for the outgoing request when the codec supports it.
+// When no outgoing metadata is present and the call originates inside a
+// handler, only keys allowed by the client metadata whitelist are forwarded.
+func (c *Client) GoWithContext(ctx context.Context, method string, args interface{}, reply interface{}, done chan *Call) *Call {
 	call := new(Call)
 	call.Method = method
 	call.Args = args
 	call.Reply = reply
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	call.ctx = ctx
 	if done == nil {
 		done = make(chan *Call, 10) // buffered.
 	} else {
@@ -270,14 +365,13 @@ func (c *Client) Go(method string, args interface{}, reply interface{}, done cha
 // CallWithContext invokes the named function, waits for it to complete, and
 // returns its error status, or an error from Context timeout.
 func (c *Client) CallWithContext(ctx context.Context, method string, args interface{}, reply interface{}) error {
-	call := c.Go(method, args, reply, make(chan *Call, 1))
+	call := c.GoWithContext(ctx, method, args, reply, make(chan *Call, 1))
 	select {
 	case <-call.Done:
 		return call.Error
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	return nil
 }
 
 // Call invokes the named function, waits for it to complete, and returns its error status.
@@ -314,6 +408,8 @@ type Call struct {
 	Reply  interface{} // The reply from the function (*struct).
 	Error  error       // After completion, the error status.
 	Done   chan *Call  // Strobes when call is complete.
+	ctx    context.Context
+	md     Metadata // per-request metadata, set before send
 }
 
 func (c *Client) send(call *Call) {
@@ -336,7 +432,12 @@ func (c *Client) send(call *Call) {
 	// Encode and send the request.
 	c.request.Seq = seq
 	c.request.Method = call.Method
-	err := c.codec.WriteRequest(&c.request, call.Args)
+	var err error
+	if mc, ok := c.codec.(MetadataCodec); ok {
+		err = mc.WriteRequestWithMetadata(&c.request, call.Args, c.outgoingMetadata(call))
+	} else {
+		err = c.codec.WriteRequest(&c.request, call.Args)
+	}
 	if err != nil {
 		c.mutex.Lock()
 		call = c.pending[seq]
@@ -347,6 +448,36 @@ func (c *Client) send(call *Call) {
 			call.done()
 		}
 	}
+}
+
+// outgoingMetadata resolves the metadata to attach to call: values set with
+// NewOutgoingContext win; otherwise only the whitelisted keys of the
+// peer-submitted metadata on the parent call are propagated. Nested reverse
+// calls therefore never copy attributes implicitly.
+func (c *Client) outgoingMetadata(call *Call) Metadata {
+	if md, explicit := FromOutgoingContext(call.ctx); explicit {
+		return md
+	}
+	if len(c.metadataWhitelist) == 0 {
+		return nil
+	}
+	incoming, ok := FromIncomingContext(call.ctx)
+	if !ok || len(incoming) == 0 {
+		return nil
+	}
+	out := Metadata{}
+	for k, vs := range incoming {
+		if _, allowed := c.metadataWhitelist[k]; !allowed {
+			continue
+		}
+		cp := make([]string, len(vs))
+		copy(cp, vs)
+		out[k] = cp
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Notify sends a request to the receiver but does not wait for a return value.

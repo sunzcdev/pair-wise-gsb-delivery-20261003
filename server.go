@@ -1,6 +1,7 @@
 package rpc2
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -24,14 +25,17 @@ const (
 
 // Server responds to RPC requests made by Client.
 type Server struct {
-	handlers map[string]*handler
-	eventHub *hub.Hub
+	handlers          map[string]*handler
+	eventHub          *hub.Hub
+	metadataFunc      MetadataFunc
+	metadataWhitelist map[string]struct{}
 }
 
 type handler struct {
-	fn        reflect.Value
-	argType   reflect.Type
-	replyType reflect.Type
+	fn         reflect.Value
+	argType    reflect.Type
+	replyType  reflect.Type
+	hasContext bool
 }
 
 type connectionEvent struct {
@@ -66,7 +70,9 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	method := reflect.ValueOf(handlerFunc)
 	mtype := method.Type()
 	// Method needs three ins: *client, *args, *reply.
-	if mtype.NumIn() != 3 {
+	// An optional fourth context.Context argument receives the per-call
+	// context carrying peer-submitted and locally confirmed metadata.
+	if mtype.NumIn() != 3 && mtype.NumIn() != 4 {
 		log.Panicln("method", mname, "has wrong number of ins:", mtype.NumIn())
 	}
 	// First arg must be a pointer to rpc2.Client.
@@ -91,6 +97,13 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if !isExportedOrBuiltinType(replyType) {
 		log.Panicln("method", mname, "reply type not exported:", replyType)
 	}
+	hasContext := false
+	if mtype.NumIn() == 4 {
+		if ctxType := mtype.In(3); ctxType != reflect.TypeOf((*context.Context)(nil)).Elem() {
+			log.Panicln("method", mname, "fourth argument", ctxType.String(), "not context.Context")
+		}
+		hasContext = true
+	}
 	// Method needs one out.
 	if mtype.NumOut() != 1 {
 		log.Panicln("method", mname, "has wrong number of outs:", mtype.NumOut())
@@ -100,9 +113,10 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 		log.Panicln("method", mname, "returns", returnType.String(), "not error")
 	}
 	handlers[mname] = &handler{
-		fn:        method,
-		argType:   argType,
-		replyType: replyType,
+		fn:         method,
+		argType:    argType,
+		replyType:  replyType,
+		hasContext: hasContext,
 	}
 }
 
@@ -134,6 +148,25 @@ func (s *Server) OnDisconnect(f func(*Client)) {
 	s.eventHub.Subscribe(clientDisconnected, func(e hub.Event) {
 		go f(e.(disconnectionEvent).Client)
 	})
+}
+
+// SetMetadataFunc installs a server-side hook that validates, removes or
+// supplements locally confirmed attributes for every request before its
+// handler runs. Returning an error rejects the request without running the
+// handler.
+func (s *Server) SetMetadataFunc(f MetadataFunc) {
+	s.metadataFunc = f
+}
+
+// SetMetadataWhitelist limits the metadata keys forwarded on reverse calls
+// made from inside server handlers. By default no attribute crosses a
+// nested call automatically.
+func (s *Server) SetMetadataWhitelist(keys ...string) {
+	wl := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		wl[k] = struct{}{}
+	}
+	s.metadataWhitelist = wl
 }
 
 // Accept accepts connections on the listener and serves requests
@@ -177,6 +210,8 @@ func (s *Server) ServeCodecWithState(codec Codec, state *State) {
 	c.server = true
 	c.handlers = s.handlers
 	c.State = state
+	c.metadataFunc = s.metadataFunc
+	c.metadataWhitelist = s.metadataWhitelist
 
 	s.eventHub.Publish(connectionEvent{c})
 	c.Run()

@@ -79,3 +79,37 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Per-request metadata
+----------------------
+
+`NewMetadataCodec` frames each message with a bounded per-request metadata
+area (at most `MaxMetadataKeys` entries and `MaxMetadataLen` bytes). Plain
+codecs such as `NewGobCodec` are unaffected. Handlers may take an optional
+fourth `context.Context` argument and read the values submitted by the peer
+and the values confirmed locally:
+
+```go
+srv := rpc2.NewServer()
+srv.SetMetadataFunc(func(ctx context.Context, c *rpc2.Client, method string, peer rpc2.Metadata) (rpc2.Metadata, error) {
+    if _, ok := peer.Get("tenant"); !ok {
+        return nil, errors.New("missing tenant")
+    }
+    local := peer.Clone()
+    delete(local, "x-internal")
+    local["local-only"] = []string{"confirmed"}
+    return local, nil
+})
+srv.Handle("work", func(c *rpc2.Client, args *Args, reply *Reply, ctx context.Context) error {
+    peer, _ := rpc2.FromIncomingContext(ctx)
+    local, _ := rpc2.FromLocalContext(ctx)
+    // Maps returned here are copies; mutating them cannot affect other calls.
+    return nil
+})
+```
+
+Clients attach metadata with `NewOutgoingContext` and `CallWithContext`.
+Nested reverse calls do not copy metadata automatically; only keys in the
+server/client whitelist (`SetMetadataWhitelist`) or selected explicitly with
+`PropagateMetadata` cross the nesting. Invalid metadata is rejected before the
+handler runs.
