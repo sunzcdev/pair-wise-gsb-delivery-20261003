@@ -102,6 +102,51 @@ func EncodeWithPrecision(lat, lng float64, chars uint) string
 EncodeWithPrecision encodes the point (lat, lng) as a string geohash with the
 specified number of characters of precision (max 12).
 
+#### func  Line
+
+```go
+func Line(points []Point, chars, limit uint) (hashes []string, complete bool, err error)
+```
+Line is the string-geohash form of LineIntWithPrecision, with chars base-32
+characters (5 bits each, max 12).
+
+#### func  LineInt
+
+```go
+func LineInt(points []Point, limit uint) (hashes []uint64, complete bool, err error)
+```
+LineInt is LineIntWithPrecision at full 64-bit precision.
+
+#### func  LineIntWithPrecision
+
+```go
+func LineIntWithPrecision(points []Point, bits, limit uint) (hashes []uint64, complete bool, err error)
+```
+LineIntWithPrecision returns the fixed-precision integer geohashes of all grid
+cells intersected by the polyline connecting the given points.
+
+The result is an exact super-cover line traversal: every cell touched by any
+segment is reported, including cells touched only at a corner or along a grid
+edge. This is not an approximation by fixed-distance sampling.
+
+Cells are emitted in the order the polyline first reaches them, with each
+distinct cell appearing at most once. At a parameter value at which several
+cells are reached simultaneously, for example a segment passing exactly
+through a grid corner, the newly reached cells are ordered by increasing
+latitude row and then increasing longitude column in the unwrapped coordinate
+frame.
+
+Consecutive vertices are joined in longitude along the shortest crossing: the
+longitude delta lies in (-180, 180] degrees, so a delta of exactly 180 degrees
+is taken to cross eastward, per the documented half-turn convention.
+
+If limit is positive it caps the number of returned cells. When the polyline
+intersects more than limit cells the function stops at the limit and returns
+complete=false; otherwise complete=true. A limit of zero means unlimited.
+
+bits is the total number of precision bits, with longitude as the most
+significant bit.
+
 #### func  Neighbor
 
 ```go
@@ -236,3 +281,16 @@ const (
 )
 ```
 Cardinal and intercardinal directions
+
+#### type Point
+
+```go
+type Point struct {
+	Lat float64
+	Lng float64
+}
+```
+
+Point is a latitude/longitude pair in degrees. Latitude is in [-90, 90] and
+longitude in [-180, 180]; both +180 and -180 are accepted longitudes and
+identified as the antimeridian.
