@@ -1,0 +1,84 @@
+[
+ {
+  "name": "w3c-simple-visibility",
+  "xml": "<foo:Function foo:Class=\"Bar\" xmlns:foo=\"http://www.foo.org/\"/>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\" foo:Class=\"Bar\"></foo:Function>"
+ },
+ {
+  "name": "w3c-rendered-parent",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo foo:Class=\"Bar\"/></foo:Function>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo foo:Class=\"Bar\"></foo></foo:Function>"
+ },
+ {
+  "name": "w3c-attr-order",
+  "xml": "<e5 xmlns=\"http://b.org/\" xmlns:a=\"http://a.org/\" xmlns:c=\"http://c.org/\" xmlns:b=\"http://b.org/\" c:attr=\"x\" a:attr=\"y\" b:attr=\"z\" />",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<e5 xmlns=\"http://b.org/\" xmlns:a=\"http://a.org/\" xmlns:b=\"http://b.org/\" xmlns:c=\"http://c.org/\" a:attr=\"y\" b:attr=\"z\" c:attr=\"x\"></e5>"
+ },
+ {
+  "name": "w3c-xml-prefix",
+  "xml": "<e:Include xml:lang=\"en-US\" xmlns:e=\"http://www.w3.org/2001/04/xmlenc#\"/>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<e:Include xmlns:e=\"http://www.w3.org/2001/04/xmlenc#\" xml:lang=\"en-US\"></e:Include>"
+ },
+ {
+  "name": "w3c-default-unused",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\" xmlns=\"http://www.bar.org/\"/>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\"></foo:Function>"
+ },
+ {
+  "name": "w3c-default-used",
+  "xml": "<Function xmlns=\"http://www.bar.org/\"/>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<Function xmlns=\"http://www.bar.org/\"></Function>"
+ },
+ {
+  "name": "w3c-default-unbound",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\" xmlns=\"http://www.bar.org/\"><bar xmlns=\"\">other</bar></foo:Function>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><bar>other</bar></foo:Function>"
+ },
+ {
+  "name": "w3c-descendant-render",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo:SomethingComplex><foo:SomethingInner foo:Id=\"5\"/></foo:SomethingComplex></foo:Function>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo:SomethingComplex><foo:SomethingInner foo:Id=\"5\"></foo:SomethingInner></foo:SomethingComplex></foo:Function>"
+ },
+ {
+  "name": "w3c-sibling-rerender",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo:Something><foo:Inner foo:Id=\"1\"/></foo:Something><foo:Other><foo:Inner foo:Id=\"2\"/></foo:Other></foo:Function>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [],
+  "expected": "<foo:Function xmlns:foo=\"http://www.foo.org/\"><foo:Something><foo:Inner foo:Id=\"1\"></foo:Inner></foo:Something><foo:Other><foo:Inner foo:Id=\"2\"></foo:Inner></foo:Other></foo:Function>"
+ },
+ {
+  "name": "w3c-inclusive-render",
+  "xml": "<foo:Function xmlns:foo=\"http://www.foo.org/\" xmlns:bar=\"http://www.bar.org/\"><foo:Something><bar:Other/></foo:Something></foo:Function>",
+  "mode": "doc",
+  "with_comments": false,
+  "inclusive": [
+   "bar"
+  ],
+  "expected": "<foo:Function xmlns:bar=\"http://www.bar.org/\" xmlns:foo=\"http://www.foo.org/\"><foo:Something><bar:Other></bar:Other></foo:Something></foo:Function>"
+ }
+]

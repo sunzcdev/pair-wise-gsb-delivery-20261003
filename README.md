@@ -195,6 +195,37 @@ Note that this example uses the `FindElementsPathSeq` function, which takes as
 an argument a pre-compiled path object. Use precompiled paths when you plan to
 search with the same path more than once.
 
+### Exclusive XML Canonicalization
+
+The package provides a separate API implementing the W3C Exclusive XML
+Canonicalization 1.0 algorithms
+([xml-exc-c14n](https://www.w3.org/2001/10/xml-exc-c14n/)), commonly used by
+XML Signature. This is distinct from the `CanonicalText` and
+`CanonicalAttrVal` write options, which only adjust character escaping:
+`ExclusiveC14N` performs the full algorithm, including exclusive namespace
+propagation, `InclusiveNamespaces` prefix lists, namespace/attribute
+ordering, character references, and optional comment retention.
+
+```go
+// Canonicalize a whole document.
+out, err := etree.NewExclusiveC14N().CanonicalizeDocument(doc)
+
+// Canonicalize a single subtree. Ancestor namespace context is read but
+// never modified, so prefix declarations declared only above the subtree
+// are emitted on the subtree root when they are visibly used.
+out, err = etree.NewExclusiveC14N().CanonicalizeElement(el)
+
+// Retain comments and force prefixes into the inclusive namespace context.
+c := etree.NewExclusiveC14NWithComments().
+    SetInclusivePrefixes("ds", "#default")
+out, err = c.CanonicalizeDocument(doc)
+```
+
+The `WriteDocumentTo` and `WriteElementTo` methods stream the result to an
+`io.Writer`. Relative namespace URIs and other inputs forbidden by the
+canonicalization specification cause one of the `ErrC14N*` errors to be
+returned.
+
 ### Other features
 
 These are just a few examples of the things the etree package can do. See the

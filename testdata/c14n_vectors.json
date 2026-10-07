@@ -1,0 +1,545 @@
+{
+ "cases": [
+  {
+   "name": "w3c-ex1",
+   "xml": "<n0:local xmlns:n0=\"http://www.w3.org/\" xmlns:n3=\"ftp://example.org\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\" ></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<n0:local xmlns:n0=\"http://www.w3.org/\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\"></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>"
+  },
+  {
+   "name": "w3c-ex2",
+   "xml": "<n0:local xmlns:n0=\"http://www.w3.org/\" xmlns:n3=\"ftp://example.org\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\" ></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "n1",
+    "n2"
+   ],
+   "expected": "<n0:local xmlns:n0=\"http://www.w3.org/\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\"></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>"
+  },
+  {
+   "name": "w3c-ex1-c",
+   "xml": "<n0:local xmlns:n0=\"http://www.w3.org/\" xmlns:n3=\"ftp://example.org\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\" ></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<n0:local xmlns:n0=\"http://www.w3.org/\">\n  <n1:elem2 xmlns:n1=\"http://example.net\" xml:lang=\"en\">\n    <n3:stuff xmlns:n3=\"ftp://example.org\"></n3:stuff>\n  </n1:elem2>\n  <n2:elem3 xmlns:n2=\"http://example.com/test\">\n    <n4:stuff xmlns:n4=\"http://example.com/test\"></n4:stuff>\n  </n2:elem3>\n  <n1:elem4 xmlns:n1=\"http://example.net/\"></n1:elem4>\n</n0:local>"
+  },
+  {
+   "name": "default",
+   "xml": "<root xmlns=\"urn:def\"><x xmlns=\"\">y</x></root>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<root xmlns=\"urn:def\"><x xmlns=\"\">y</x></root>"
+  },
+  {
+   "name": "subtree-child",
+   "xml": "<root xmlns:a=\"urn:a\"><wrap><a:child attr=\"v\"/></wrap></root>",
+   "mode": "subtree",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<a:child xmlns:a=\"urn:a\" attr=\"v\"></a:child>",
+   "path": "0.0"
+  },
+  {
+   "name": "subtree-wrap",
+   "xml": "<root xmlns:a=\"urn:a\"><wrap><a:child attr=\"v\"/></wrap></root>",
+   "mode": "subtree",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<wrap><a:child xmlns:a=\"urn:a\" attr=\"v\"></a:child></wrap>",
+   "path": "0"
+  },
+  {
+   "name": "subtree-default",
+   "xml": "<root xmlns=\"urn:def\"><child><x/></child></root>",
+   "mode": "subtree",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<child xmlns=\"urn:def\"><x></x></child>",
+   "path": "0"
+  },
+  {
+   "name": "incl-subtree",
+   "xml": "<root xmlns:a=\"urn:a\"><wrap><inner><a:z/></inner></wrap></root>",
+   "mode": "subtree",
+   "with_comments": false,
+   "inclusive": [
+    "a"
+   ],
+   "expected": "<wrap xmlns:a=\"urn:a\"><inner><a:z></a:z></inner></wrap>",
+   "path": "0"
+  },
+  {
+   "name": "rebound",
+   "xml": "<a:r xmlns:a=\"urn:1\"><a:x xmlns:a=\"urn:2\"><a:y/></a:x></a:r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<a:r xmlns:a=\"urn:1\"><a:x xmlns:a=\"urn:2\"><a:y></a:y></a:x></a:r>"
+  },
+  {
+   "name": "attrsort",
+   "xml": "<r xmlns=\"urn:z\" xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" z=\"0\" a:x=\"1\" b:y=\"2\" a:a=\"3\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns=\"urn:z\" xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" z=\"0\" a:a=\"3\" a:x=\"1\" b:y=\"2\"></r>"
+  },
+  {
+   "name": "xmlprefix",
+   "xml": "<r xml:lang=\"en\"><x xml:space=\"preserve\"/></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xml:lang=\"en\"><x xml:space=\"preserve\"></x></r>"
+  },
+  {
+   "name": "escape",
+   "xml": "<r a=\"1&#x9;2&#xA;3&#xD;4\">x &amp; y &lt; &gt; z\rq</r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r a=\"1&#x9;2&#xA;3&#xD;4\">x &amp; y &lt; &gt; z\nq</r>"
+  },
+  {
+   "name": "comments",
+   "xml": "<r><!-- c1 --><x><!-- c2 --></x></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><x></x></r>"
+  },
+  {
+   "name": "comments-on",
+   "xml": "<r><!-- c1 --><x><!-- c2 --></x></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><!-- c1 --><x><!-- c2 --></x></r>"
+  },
+  {
+   "name": "cdata",
+   "xml": "<r><![CDATA[a < b & c]]></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r>a &lt; b &amp; c</r>"
+  },
+  {
+   "name": "docpi",
+   "xml": "<?pi target?><r/>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<?pi target?>\n<r></r>"
+  },
+  {
+   "name": "docpi-multi",
+   "xml": "<?app inst?><?app2 x?><r/>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<?app inst?>\n<?app2 x?>\n<r></r>"
+  },
+  {
+   "name": "doccomment",
+   "xml": "<?app inst?><!--c--><r/><!--d-->",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<?app inst?>\n<!--c-->\n<r></r>\n<!--d-->"
+  },
+  {
+   "name": "crcdata",
+   "xml": "<r>a&#xD;b</r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r>a&#xD;b</r>"
+  },
+  {
+   "name": "picomment-inner",
+   "xml": "<r><?p v?><!--c--></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><?p v?><!--c--></r>"
+  },
+  {
+   "name": "attrprefix",
+   "xml": "<r xmlns:a=\"urn:a\" a:k=\"1\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:a=\"urn:a\" a:k=\"1\"></r>"
+  },
+  {
+   "name": "siblings",
+   "xml": "<r xmlns:a=\"urn:a\"><w><a:x/></w><z><a:y/></z></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><w><a:x xmlns:a=\"urn:a\"></a:x></w><z><a:y xmlns:a=\"urn:a\"></a:y></z></r>"
+  },
+  {
+   "name": "inclinused",
+   "xml": "<r xmlns:a=\"urn:a\"><x/></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "a"
+   ],
+   "expected": "<r xmlns:a=\"urn:a\"><x></x></r>"
+  },
+  {
+   "name": "emptydefault",
+   "xml": "<r xmlns=\"urn:d\"><x xmlns=\"\"><y/></x></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns=\"urn:d\"><x xmlns=\"\"><y></y></x></r>"
+  },
+  {
+   "name": "rd1",
+   "xml": "<r xmlns:a=\"urn:1\"><w xmlns:a=\"urn:2\"><a:x/></w></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><w><a:x xmlns:a=\"urn:2\"></a:x></w></r>"
+  },
+  {
+   "name": "rd2",
+   "xml": "<a:r xmlns:a=\"urn:1\"><w xmlns:a=\"urn:2\"><a:x/></w></a:r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<a:r xmlns:a=\"urn:1\"><w><a:x xmlns:a=\"urn:2\"></a:x></w></a:r>"
+  },
+  {
+   "name": "rd3",
+   "xml": "<r xmlns:a=\"urn:1\"><w xmlns:a=\"urn:2\"><a:x xmlns:a=\"urn:3\"/></w></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><w><a:x xmlns:a=\"urn:3\"></a:x></w></r>"
+  },
+  {
+   "name": "hashdefault",
+   "xml": "<r xmlns=\"urn:d\"><x><y/></x></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "#default"
+   ],
+   "expected": "<r xmlns=\"urn:d\"><x><y></y></x></r>"
+  },
+  {
+   "name": "xsi",
+   "xml": "<r xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"t\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"t\"></r>"
+  },
+  {
+   "name": "i4",
+   "xml": "<r><w xmlns:a=\"urn:a\"><a:x/></w></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "a"
+   ],
+   "expected": "<r><w xmlns:a=\"urn:a\"><a:x></a:x></w></r>"
+  },
+  {
+   "name": "s1",
+   "xml": "<r xmlns:a=\"urn:a\" a:b=\"1\" xml:lang=\"en\" z=\"2\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:a=\"urn:a\" z=\"2\" xml:lang=\"en\" a:b=\"1\"></r>"
+  },
+  {
+   "name": "s2",
+   "xml": "<r xmlns:a=\"urn:a\" xmlns:h=\"http://x\" h:b=\"1\" a:a=\"2\" n=\"3\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:a=\"urn:a\" xmlns:h=\"http://x\" n=\"3\" h:b=\"1\" a:a=\"2\"></r>"
+  },
+  {
+   "name": "s3",
+   "xml": "<r xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xml:lang=\"en\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xml:lang=\"en\"></r>"
+  },
+  {
+   "name": "pi-escape",
+   "xml": "<r><?pi a&#xD;b&#xA;c&#x9;d&e<f?></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><?pi a&#xD;b&#xA;c&#x9;d&e<f?></r>"
+  },
+  {
+   "name": "comment-escape",
+   "xml": "<r><!--a&#xD;b&#xA;c&#x9;d&e<f--></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><!--a&#xD;b&#xA;c&#x9;d&e<f--></r>"
+  },
+  {
+   "name": "default-prefixed-mix",
+   "xml": "<a:r xmlns:a=\"urn:a\" xmlns=\"urn:d\"><x xmlns=\"urn:d2\"/></a:r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<a:r xmlns:a=\"urn:a\"><x xmlns=\"urn:d2\"></x></a:r>"
+  },
+  {
+   "name": "attrsort2",
+   "xml": "<r xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" a:z=\"1\" b:z=\"2\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" a:z=\"1\" b:z=\"2\"></r>"
+  },
+  {
+   "name": "mixed-text",
+   "xml": "<r> a <x/> b </r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r> a <x></x> b </r>"
+  },
+  {
+   "name": "whitespace-leaf",
+   "xml": "<r>  </r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r>  </r>"
+  },
+  {
+   "name": "unicode",
+   "xml": "<r xml:lang=\"zh\">éè</r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xml:lang=\"zh\">éè</r>"
+  },
+  {
+   "name": "xml-style",
+   "xml": "<?xml-stylesheet href=\"x\" type=\"t/xsl\"?><r/>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<?xml-stylesheet href=\"x\" type=\"t/xsl\"?>\n<r></r>"
+  },
+  {
+   "name": "cr-comment",
+   "xml": "<r><!--a&#xD;b--></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><!--a&#xD;b--></r>"
+  },
+  {
+   "name": "literal-cr-comment",
+   "xml": "<r><!--a\rb--></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><!--a\nb--></r>"
+  },
+  {
+   "name": "pi-inside-text",
+   "xml": "<r>a<?p v?>b</r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r>a<?p v?>b</r>"
+  },
+  {
+   "name": "incl-rebind",
+   "xml": "<a:r xmlns:a=\"urn:1\"><w><a:x xmlns:a=\"urn:2\"/></w></a:r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "a"
+   ],
+   "expected": "<a:r xmlns:a=\"urn:1\"><w><a:x xmlns:a=\"urn:2\"></a:x></w></a:r>"
+  },
+  {
+   "name": "pi-cr-tab",
+   "xml": "<r><?pi a\rb&#x9;c?></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><?pi a\nb&#x9;c?></r>"
+  },
+  {
+   "name": "crlfattr",
+   "xml": "<r a=\"x&#xD;&#xA;y&#x9;z\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r a=\"x&#xD;&#xA;y&#x9;z\"></r>"
+  },
+  {
+   "name": "n12",
+   "xml": "<?a?>\n<!--b-->\n<?c?>\n<r/>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<?a?>\n<!--b-->\n<?c?>\n<r></r>"
+  },
+  {
+   "name": "incl-empty-unused",
+   "xml": "<r xmlns:a=\"urn:a\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [
+    "a"
+   ],
+   "expected": "<r xmlns:a=\"urn:a\"></r>"
+  },
+  {
+   "name": "default-unbind-deep",
+   "xml": "<r xmlns=\"urn:d\"><x xmlns=\"\"><y/></x></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns=\"urn:d\"><x xmlns=\"\"><y></y></x></r>"
+  },
+  {
+   "name": "pi-leading-ws",
+   "xml": "<r><?pi    hello world?></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><?pi hello world?></r>"
+  },
+  {
+   "name": "pi-empty",
+   "xml": "<r><?pi?></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><?pi?></r>"
+  },
+  {
+   "name": "comment-pad",
+   "xml": "<r><!--hello--></r>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r><!--hello--></r>"
+  },
+  {
+   "name": "no-comment-default",
+   "xml": "<!--c--><r/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r></r>"
+  },
+  {
+   "name": "xml-decl",
+   "xml": "<?xml version=\"1.0\"?><r/>",
+   "mode": "doc",
+   "with_comments": true,
+   "inclusive": [],
+   "expected": "<r></r>"
+  },
+  {
+   "name": "doctype",
+   "xml": "<!DOCTYPE r [<!ELEMENT r EMPTY>]><r/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r></r>"
+  },
+  {
+   "name": "multi-ns-same-elem",
+   "xml": "<r xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" xmlns:c=\"urn:c\" a:x=\"1\" c:y=\"2\" b:z=\"3\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" xmlns:c=\"urn:c\" a:x=\"1\" b:z=\"3\" c:y=\"2\"></r>"
+  },
+  {
+   "name": "nested-default",
+   "xml": "<r xmlns=\"urn:d1\"><x xmlns=\"urn:d2\"><y/></x></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r xmlns=\"urn:d1\"><x xmlns=\"urn:d2\"><y></y></x></r>"
+  },
+  {
+   "name": "xml-lang-sort",
+   "xml": "<r a=\"1\" xml:lang=\"en\" b=\"2\"/>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r a=\"1\" b=\"2\" xml:lang=\"en\"></r>"
+  },
+  {
+   "name": "branch-redeclare",
+   "xml": "<r xmlns:a=\"urn:a\"><x><a:u/></x><y><a:v/></y></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><x><a:u xmlns:a=\"urn:a\"></a:u></x><y><a:v xmlns:a=\"urn:a\"></a:v></y></r>"
+  },
+  {
+   "name": "intermediate-rebind",
+   "xml": "<r xmlns:a=\"urn:1\"><w xmlns:a=\"urn:2\"><u/><v><a:x/></v></w></r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r><w><u></u><v><a:x xmlns:a=\"urn:2\"></a:x></v></w></r>"
+  },
+  {
+   "name": "c14n-text-entities",
+   "xml": "<r>&lt;&gt;&amp;&quot;&apos;&#x9;&#xA;&#xD;</r>",
+   "mode": "doc",
+   "with_comments": false,
+   "inclusive": [],
+   "expected": "<r>&lt;&gt;&amp;\"'\t\n&#xD;</r>"
+  }
+ ],
+ "errors": [
+  {
+   "name": "relative-used",
+   "xml": "<r xmlns:a=\"rel/x\"><a:x/></r>"
+  },
+  {
+   "name": "relative-unused",
+   "xml": "<r xmlns:a=\"rel/x\"><x/></r>"
+  },
+  {
+   "name": "relative-ancestor-subtree",
+   "xml": "<r xmlns:a=\"rel/x\"><w><x/></w></r>"
+  },
+  {
+   "name": "relative-default",
+   "xml": "<r xmlns=\"rel/x\"><x/></r>"
+  },
+  {
+   "name": "xmlns-xmlns",
+   "xml": "<r xmlns:xmlns=\"http://www.w3.org/2000/xmlns/\"/>"
+  },
+  {
+   "name": "bad-xml-ns",
+   "xml": "<r xmlns:xml=\"wrong\" xml:lang=\"en\"/>"
+  }
+ ]
+}
