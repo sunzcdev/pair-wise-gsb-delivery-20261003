@@ -8,6 +8,7 @@ func DialectOptions() *goqu.SQLDialectOptions {
 	do := goqu.DefaultDialectOptions()
 	do.PlaceHolderFragment = []byte("$")
 	do.IncludePlaceholderNum = true
+	do.SupportsMerge = true
 	return do
 }
 

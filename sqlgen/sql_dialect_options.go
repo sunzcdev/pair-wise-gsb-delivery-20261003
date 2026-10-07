@@ -44,6 +44,15 @@ type (
 		// Set to true if window function are supported in SELECT statement. (DEFAULT=true)
 		SupportsWindowFunction bool
 
+		// Set to true if the dialect supports the MERGE statement. (DEFAULT=false)
+		SupportsMerge bool
+		// Set to true if WHEN MATCHED THEN UPDATE is supported. (DEFAULT=true)
+		SupportsMergeMatchedUpdate bool
+		// Set to true if WHEN MATCHED THEN DELETE is supported. (DEFAULT=true)
+		SupportsMergeMatchedDelete bool
+		// Set to true if WHEN NOT MATCHED THEN INSERT is supported. (DEFAULT=true)
+		SupportsMergeNotMatchedInsert bool
+
 		// Set to true if the dialect requires join tables in UPDATE to be in a FROM clause (DEFAULT=true).
 		UseFromClauseForMultipleUpdateTables bool
 
@@ -60,6 +69,22 @@ type (
 		SelectClause []byte
 		// The DELETE fragment to use when generating sql. (DEFAULT=[]byte("DELETE"))
 		DeleteClause []byte
+		// The MERGE fragment to use when generating sql. (DEFAULT=[]byte("MERGE INTO"))
+		MergeClause []byte
+		// The INSERT keyword used by a MERGE action. (DEFAULT=[]byte("INSERT"))
+		MergeInsertKeyword []byte
+		// The terminator written after a MERGE statement. (DEFAULT=[]byte(";"))
+		MergeTerminator []byte
+		// The USING fragment for the MERGE source. (DEFAULT=[]byte(" USING "))
+		MergeUsingFragment []byte
+		// The WHEN MATCHED fragment. (DEFAULT=[]byte(" WHEN MATCHED"))
+		WhenMatchedFragment []byte
+		// The WHEN NOT MATCHED fragment. (DEFAULT=[]byte(" WHEN NOT MATCHED"))
+		WhenNotMatchedFragment []byte
+		// The AND fragment appended to a conditional WHEN clause. (DEFAULT=[]byte(" AND "))
+		WhenAndFragment []byte
+		// The THEN fragment. (DEFAULT=[]byte(" THEN "))
+		ThenMergeFragment []byte
 		// The TRUNCATE fragment to use when generating sql. (DEFAULT=[]byte("TRUNCATE"))
 		TruncateClause []byte
 		// The WITH fragment to use when generating sql. (DEFAULT=[]byte("WITH "))
@@ -324,6 +349,9 @@ type (
 		// 		TruncateSQLFragment,
 		// 	})
 		TruncateSQLOrder []SQLFragmentType
+
+		// The order of SQL fragments when creating a MERGE statement
+		MergeSQLOrder []SQLFragmentType
 	}
 )
 
@@ -353,6 +381,11 @@ const (
 	DeleteBeginSQLFragment
 	TruncateSQLFragment
 	WindowSQLFragment
+	MergeBeginSQLFragment
+	MergeTargetSQLFragment
+	MergeUsingSQLFragment
+	MergeOnSQLFragment
+	MergeActionsSQLFragment
 )
 
 //nolint:gocyclo // simple type to string conversion
@@ -402,6 +435,16 @@ func (sf SQLFragmentType) String() string {
 		return "TruncateSQLFragment"
 	case WindowSQLFragment:
 		return "WindowSQLFragment"
+	case MergeBeginSQLFragment:
+		return "MergeBeginSQLFragment"
+	case MergeTargetSQLFragment:
+		return "MergeTargetSQLFragment"
+	case MergeUsingSQLFragment:
+		return "MergeUsingSQLFragment"
+	case MergeOnSQLFragment:
+		return "MergeOnSQLFragment"
+	case MergeActionsSQLFragment:
+		return "MergeActionsSQLFragment"
 	}
 	return fmt.Sprintf("%d", sf)
 }
@@ -409,21 +452,25 @@ func (sf SQLFragmentType) String() string {
 //nolint:funlen
 func DefaultDialectOptions() *SQLDialectOptions {
 	return &SQLDialectOptions{
-		SupportsOrderByOnDelete:     false,
-		SupportsDeleteTableHint:     false,
-		SupportsOrderByOnUpdate:     false,
-		SupportsLimitOnDelete:       false,
-		SupportsLimitOnUpdate:       false,
-		SupportsReturn:              true,
-		SupportsConflictUpdateWhere: true,
-		SupportsInsertIgnoreSyntax:  false,
-		SupportsConflictTarget:      true,
-		SupportsWithCTE:             true,
-		SupportsWithCTERecursive:    true,
-		SupportsDistinctOn:          true,
-		WrapCompoundsInParens:       true,
-		SupportsWindowFunction:      true,
-		SupportsLateral:             true,
+		SupportsOrderByOnDelete:       false,
+		SupportsDeleteTableHint:       false,
+		SupportsOrderByOnUpdate:       false,
+		SupportsLimitOnDelete:         false,
+		SupportsLimitOnUpdate:         false,
+		SupportsReturn:                true,
+		SupportsConflictUpdateWhere:   true,
+		SupportsInsertIgnoreSyntax:    false,
+		SupportsConflictTarget:        true,
+		SupportsWithCTE:               true,
+		SupportsWithCTERecursive:      true,
+		SupportsDistinctOn:            true,
+		WrapCompoundsInParens:         true,
+		SupportsWindowFunction:        true,
+		SupportsLateral:               true,
+		SupportsMerge:                 false,
+		SupportsMergeMatchedUpdate:    true,
+		SupportsMergeMatchedDelete:    true,
+		SupportsMergeNotMatchedInsert: true,
 
 		SupportsMultipleUpdateTables:         true,
 		UseFromClauseForMultipleUpdateTables: true,
@@ -434,6 +481,14 @@ func DefaultDialectOptions() *SQLDialectOptions {
 		SelectClause:              []byte("SELECT"),
 		DeleteClause:              []byte("DELETE"),
 		TruncateClause:            []byte("TRUNCATE"),
+		MergeClause:               []byte("MERGE INTO"),
+		MergeInsertKeyword:        []byte("INSERT"),
+		MergeTerminator:           []byte(";"),
+		MergeUsingFragment:        []byte(" USING "),
+		WhenMatchedFragment:       []byte(" WHEN MATCHED"),
+		WhenNotMatchedFragment:    []byte(" WHEN NOT MATCHED"),
+		WhenAndFragment:           []byte(" AND "),
+		ThenMergeFragment:         []byte(" THEN "),
 		WithFragment:              []byte("WITH "),
 		RecursiveFragment:         []byte("RECURSIVE "),
 		CascadeFragment:           []byte(" CASCADE"),
@@ -602,6 +657,14 @@ func DefaultDialectOptions() *SQLDialectOptions {
 		},
 		TruncateSQLOrder: []SQLFragmentType{
 			TruncateSQLFragment,
+		},
+		MergeSQLOrder: []SQLFragmentType{
+			MergeBeginSQLFragment,
+			MergeTargetSQLFragment,
+			MergeUsingSQLFragment,
+			MergeOnSQLFragment,
+			MergeActionsSQLFragment,
+			ReturningSQLFragment,
 		},
 	}
 }

@@ -20,6 +20,7 @@ type (
 		ToInsertSQL(b sb.SQLBuilder, clauses exp.InsertClauses)
 		ToDeleteSQL(b sb.SQLBuilder, clauses exp.DeleteClauses)
 		ToTruncateSQL(b sb.SQLBuilder, clauses exp.TruncateClauses)
+		ToMergeSQL(b sb.SQLBuilder, clauses exp.MergeClauses)
 	}
 	// The default adapter. This class should be used when building a new adapter. When creating a new adapter you can
 	// either override methods, or more typically update default values.
@@ -32,6 +33,7 @@ type (
 		insertGen      sqlgen.InsertSQLGenerator
 		deleteGen      sqlgen.DeleteSQLGenerator
 		truncateGen    sqlgen.TruncateSQLGenerator
+		mergeGen       sqlgen.MergeSQLGenerator
 	}
 )
 
@@ -75,6 +77,7 @@ func newDialect(dialect string, do *SQLDialectOptions) SQLDialect {
 		insertGen:      sqlgen.NewInsertSQLGenerator(dialect, do),
 		deleteGen:      sqlgen.NewDeleteSQLGenerator(dialect, do),
 		truncateGen:    sqlgen.NewTruncateSQLGenerator(dialect, do),
+		mergeGen:       sqlgen.NewMergeSQLGenerator(dialect, do),
 	}
 }
 
@@ -100,4 +103,8 @@ func (d *sqlDialect) ToDeleteSQL(b sb.SQLBuilder, clauses exp.DeleteClauses) {
 
 func (d *sqlDialect) ToTruncateSQL(b sb.SQLBuilder, clauses exp.TruncateClauses) {
 	d.truncateGen.Generate(b, clauses)
+}
+
+func (d *sqlDialect) ToMergeSQL(b sb.SQLBuilder, clauses exp.MergeClauses) {
+	d.mergeGen.Generate(b, clauses)
 }

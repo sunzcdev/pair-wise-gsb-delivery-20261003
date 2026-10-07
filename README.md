@@ -70,6 +70,7 @@ We tried a few other sql builders but each was a thin wrapper around sql fragmen
 * [Insert Dataset](./docs/inserting.md) - Docs and examples about creating and executing INSERT sql statements.
 * [Update Dataset](./docs/updating.md) - Docs and examples about creating and executing UPDATE sql statements.
 * [Delete Dataset](./docs/deleting.md) - Docs and examples about creating and executing DELETE sql statements.
+* [Merge Dataset](./docs/merging.md) - Docs and examples about creating and executing MERGE sql statements (PostgreSQL/SQL Server).
 * [Prepared Statements](./docs/interpolation.md) - Docs about interpolation and prepared statements in `goqu`.
 * [Database](./docs/database.md) - Docs and examples of using a Database to execute queries in `goqu`
 * [Working with time.Time](./docs/time.md) - Docs on how to use alternate time locations.
@@ -303,7 +304,6 @@ MYSQL_VERSION=8 POSTGRES_VERSION=13.4 SQLSERVER_VERSION=2017-CU8-ubuntu GO_VERSI
 ## License
 
 `goqu` is released under the [MIT License](http://www.opensource.org/licenses/MIT).
-
 
 
 
