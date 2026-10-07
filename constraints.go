@@ -283,40 +283,13 @@ func parseConstraint(c string) (*constraint, error) {
 			return nil, fmt.Errorf("improper constraint: %q", c)
 		}
 
-		cs := &constraint{
-			orig:     m[2],
-			origfunc: m[1],
-		}
-
-		ver := m[2]
-		minorDirty := false
-		patchDirty := false
-		dirty := false
-		if isX(m[3]) || m[3] == "" {
-			ver = fmt.Sprintf("0.0.0%s", m[6])
-			dirty = true
-		} else if isX(strings.TrimPrefix(m[4], ".")) || m[4] == "" {
-			minorDirty = true
-			dirty = true
-			ver = fmt.Sprintf("%s.0.0%s", m[3], m[6])
-		} else if isX(strings.TrimPrefix(m[5], ".")) || m[5] == "" {
-			dirty = true
-			patchDirty = true
-			ver = fmt.Sprintf("%s%s.0%s", m[3], m[4], m[6])
-		}
-
-		con, err := NewVersion(ver)
+		cs, err := constraintFromMatch(m)
 		if err != nil {
 
 			// The constraintRegex should catch any regex parsing errors. So,
 			// we should never get here.
 			return nil, errors.New("constraint parser error")
 		}
-
-		cs.con = con
-		cs.minorDirty = minorDirty
-		cs.patchDirty = patchDirty
-		cs.dirty = dirty
 
 		return cs, nil
 	}
@@ -339,6 +312,46 @@ func parseConstraint(c string) (*constraint, error) {
 		patchDirty: false,
 		dirty:      true,
 	}
+	return cs, nil
+}
+
+// constraintFromMatch builds a constraint from the submatches of
+// constraintRegex. Unlike parseConstraint it returns the underlying version
+// parsing error so callers such as NewConstraintWithDiagnostics can report
+// why a version is invalid.
+func constraintFromMatch(m []string) (*constraint, error) {
+	cs := &constraint{
+		orig:     m[2],
+		origfunc: m[1],
+	}
+
+	ver := m[2]
+	minorDirty := false
+	patchDirty := false
+	dirty := false
+	if isX(m[3]) || m[3] == "" {
+		ver = fmt.Sprintf("0.0.0%s", m[6])
+		dirty = true
+	} else if isX(strings.TrimPrefix(m[4], ".")) || m[4] == "" {
+		minorDirty = true
+		dirty = true
+		ver = fmt.Sprintf("%s.0.0%s", m[3], m[6])
+	} else if isX(strings.TrimPrefix(m[5], ".")) || m[5] == "" {
+		dirty = true
+		patchDirty = true
+		ver = fmt.Sprintf("%s%s.0%s", m[3], m[4], m[6])
+	}
+
+	con, err := NewVersion(ver)
+	if err != nil {
+		return nil, fmt.Errorf("invalid version %q in constraint: %w", m[2], err)
+	}
+
+	cs.con = con
+	cs.minorDirty = minorDirty
+	cs.patchDirty = patchDirty
+	cs.dirty = dirty
+
 	return cs, nil
 }
 

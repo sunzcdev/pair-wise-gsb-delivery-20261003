@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added NewConstraintWithDiagnostics which parses constraints like
+  NewConstraint but reports problems as diagnostics carrying the error kind,
+  the || branch index, and byte offsets into the original input. On success
+  it also returns the source span of every parsed comparison. Hyphen ranges
+  are parsed in place so positions always refer to the original text rather
+  than the internally rewritten >= / <= form.
+
 ## 3.4.0 (2025-06-27)
 
 ### Added
