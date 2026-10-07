@@ -1,0 +1,23 @@
+{
+package deferredactions
+}
+
+// Input exercises backtracking (AB fails after registering "a1" and is
+// rolled back before A matches) and predicates (the registration inside
+// the & predicate is never committed).
+Input ← items:(AB / A)+ EOF {
+	return nil, nil
+}
+
+AB ← ('a' { c.deferAction("a1"); return nil, nil }) ('b' { c.deferAction("ab"); return nil, nil }) 'c'
+
+A ← &('a' { c.deferAction("la"); return nil, nil }) ('a' { c.deferAction("a"); return nil, nil })
+
+// Memo exercises the interaction with the Memoize option: Tok is parsed
+// once, memoized, and its deferred action must be replayed (exactly
+// once) when the memoized result is reused by the second alternative.
+Memo ← Tok 'b' / Tok 'c'
+
+Tok ← 'a' { c.deferAction("tok"); return string(c.text), nil }
+
+EOF ← !.

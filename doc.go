@@ -389,6 +389,33 @@ of pigeon and should not be used nor modified. Those keys are treated as
 internal implementation details and therefore there are no guarantees given in
 regards of API stability.
 
+Deferred actions
+
+Action code blocks run while parsing, so on a grammar with backtracking they
+may execute on branches that are later abandoned. When an action is only
+needed for its side effect on the final, accepted parse (e.g. recording a
+dependency), it can be registered as a deferred action instead of being
+executed immediately, by calling (*current).deferAction with an arbitrary
+data value from an action, predicate or state change code block:
+	Rule = "a" {
+		c.deferAction("saw-a")
+		return nil, nil
+	}
+
+During parsing, deferAction only records the operation and its data. If the
+whole parse succeeds, the registered actions are committed by calling the
+commit function set with the DeferredActions option, once per action, in
+registration (syntactic) order. Registrations made on a branch that is
+abandoned by backtracking are discarded, registrations made inside and (&)
+and not (!) predicate expressions are never committed, and left-recursion
+seed growth does not register the same final action more than once. If the
+parse fails, no deferred action is committed.
+
+If the commit function returns an error, the commit loop stops and the
+Parse* call returns a *DeferredCommitError whose Committed field indicates
+how many actions were successfully committed. Actions already committed are
+not rolled back, their side effects are left as-is.
+
 Left recursion
 
 With options -support-left-recursion pigeon supports left recursion. E.g.:
@@ -459,6 +486,7 @@ as a package with public functions to parse input text. The exported API is:
 	- ParseReader(string, io.Reader, ...Option) (any, error)
 	- AllowInvalidUTF8(bool) Option
 	- Debug(bool) Option
+	- DeferredActions(func(DeferredAction) error) Option
 	- Entrypoint(string) Option
 	- GlobalStore(string, any) Option
 	- MaxExpressions(uint64) Option

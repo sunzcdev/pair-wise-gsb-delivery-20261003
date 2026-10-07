@@ -1,0 +1,16 @@
+{
+package leftrec
+}
+
+// Input exercises left-recursion seed growth: each growth iteration
+// re-parses the rule, the deferred actions of the final (longest)
+// iteration must be registered exactly once, in syntactic order.
+Input ← Sum EOF {
+	return nil, nil
+}
+
+Sum ← Sum '+' Num { c.deferAction("add:" + string(c.text)); return nil, nil } / Num
+
+Num ← [0-9]+ { c.deferAction("num:" + string(c.text)); return nil, nil }
+
+EOF ← !.
