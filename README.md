@@ -659,6 +659,34 @@ Schema = "schema" "{" Field* "}" .
 Enum = "enum" ident "{" ident* "}" .
 ```
 
+## Grammar comparison
+
+When evolving a grammar you can produce a structural change report for
+maintainers with `participle.CompareGrammars(oldParser, newParser)`. It returns
+a `*GrammarReport` listing productions that were added, removed, or modified.
+Each modification is broken down by kind:
+
+- `TokenChange` &mdash; a literal or named lexer token changed.
+- `QuantifierChange` &mdash; a cardinality modifier (`?`, `*`, `+`, `!`) changed.
+- `SequenceChange` &mdash; an element was added, removed, replaced, or wrapped.
+- `OrderedBranchChange` &mdash; alternatives of an ordered choice were
+  reordered (always significant in a PEG).
+
+Productions are identified by their declared type name, and tokens by their
+declared lexer symbol, so the comparison is stable across builds and does not
+depend on matching rendered EBNF line strings. Recursive references and custom
+(`ParseTypeWith`) parsers are opaque nodes compared by declared identity only,
+so cyclic grammars are compared without infinite expansion. Whitespace and
+presentational differences are ignored.
+
+```go
+report, err := participle.CompareGrammars(oldParser, newParser)
+if err != nil { ... }
+if report.Changed() {
+    fmt.Print(report.String())
+}
+```
+
 ## Syntax/Railroad Diagrams
 
 Participle includes a [command-line utility](https://github.com/alecthomas/participle/tree/master/cmd/railroad) to take an EBNF representation of a Participle grammar
