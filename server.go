@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"reflect"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -26,6 +27,10 @@ const (
 type Server struct {
 	handlers map[string]*handler
 	eventHub *hub.Hub
+
+	mu      sync.Mutex
+	mws     []Middleware
+	started bool
 }
 
 type handler struct {
@@ -56,6 +61,19 @@ func NewServer() *Server {
 // Handle registers the handler function for the given method. If a handler already exists for method, Handle panics.
 func (s *Server) Handle(method string, handlerFunc interface{}) {
 	addHandler(s.handlers, method, handlerFunc)
+}
+
+// Use appends middleware to the server's execution chain. Middlewares run
+// in registration order around every incoming request, including
+// notifications. Use must be called before the server starts serving;
+// once serving has begun the chain is immutable and Use panics.
+func (s *Server) Use(mws ...Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		panic("rpc2: cannot register middleware after server has started serving")
+	}
+	s.mws = append(s.mws, mws...)
 }
 
 func addHandler(handlers map[string]*handler, mname string, handlerFunc interface{}) {
@@ -172,10 +190,18 @@ func (s *Server) ServeCodec(codec Codec) {
 func (s *Server) ServeCodecWithState(codec Codec, state *State) {
 	defer codec.Close()
 
+	s.mu.Lock()
+	s.started = true
+	// Snapshot the middleware chain so it stays immutable for the
+	// lifetime of this connection.
+	mws := append([]Middleware(nil), s.mws...)
+	s.mu.Unlock()
+
 	// Client also handles the incoming connections.
 	c := NewClientWithCodec(codec)
 	c.server = true
 	c.handlers = s.handlers
+	c.mws = mws
 	c.State = state
 
 	s.eventHub.Publish(connectionEvent{c})

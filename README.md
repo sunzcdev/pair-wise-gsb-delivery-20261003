@@ -79,3 +79,34 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Middleware
+----------
+
+Cross-cutting concerns (authentication, timing, argument validation, ...)
+can be factored out of handlers into a middleware chain. Middlewares run
+in registration order around every incoming request, including
+notifications, and see the method name, request sequence number,
+notification flag and the connection (`ctx.Client.State`). A middleware
+may reject the request before it reaches the handler by returning an
+error without calling `next`, or observe the reply and error after `next`
+returns. Calling `next` more than once panics.
+
+```go
+srv := rpc2.NewServer()
+srv.Use(rpc2.Recovery()) // converts handler panics into a generic error
+srv.Use(func(next rpc2.HandlerFunc) rpc2.HandlerFunc {
+	return func(ctx *rpc2.Context) error {
+		start := time.Now()
+		err := next(ctx) // call the rest of the chain exactly once
+		log.Printf("%s took %s (err=%v)", ctx.Method, time.Since(start), err)
+		return err
+	}
+})
+```
+
+Register middleware with `Use` before serving; the chain is immutable
+once the server starts. `rpc2.Recovery()` is optional: without it a
+panicking handler crashes the serving goroutine. Recovered panics are
+reported to the peer as the generic `rpc2.ErrInternal`; panic details and
+stack traces are never sent over the wire.

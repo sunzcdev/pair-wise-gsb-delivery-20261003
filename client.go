@@ -25,6 +25,7 @@ type Client struct {
 	server     bool
 	codec      Codec
 	handlers   map[string]*handler
+	mws        []Middleware
 	disconnect chan struct{}
 	State      *State // additional information to associate with client
 	blocking   bool   // whether to block request handling
@@ -72,6 +73,13 @@ func (c *Client) DisconnectNotify() chan struct{} {
 // Handle registers the handler function for the given method. If a handler already exists for method, Handle panics.
 func (c *Client) Handle(method string, handlerFunc interface{}) {
 	addHandler(c.handlers, method, handlerFunc)
+}
+
+// Use appends middleware to the client's execution chain for requests
+// initiated by the remote peer. Middlewares run in registration order.
+// Use must be called before Run; the chain is immutable while serving.
+func (c *Client) Use(mws ...Middleware) {
+	c.mws = append(c.mws, mws...)
 }
 
 // readLoop reads messages from codec.
@@ -132,18 +140,35 @@ func (c *Client) handleRequest(req Request, method *handler, argv reflect.Value)
 	// Invoke the method, providing a new value for the reply.
 	replyv := reflect.New(method.replyType.Elem())
 
-	returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), argv, replyv})
+	ctx := &Context{
+		Client:       c,
+		Method:       req.Method,
+		Seq:          req.Seq,
+		Notification: req.Seq == 0,
+		Args:         argv.Interface(),
+		Reply:        replyv.Interface(),
+		argv:         argv,
+	}
+
+	terminal := func(ctx *Context) error {
+		returnValues := method.fn.Call([]reflect.Value{reflect.ValueOf(c), ctx.argv, replyv})
+		// The return value for the method is an error.
+		if errInter := returnValues[0].Interface(); errInter != nil {
+			return errInter.(error)
+		}
+		return nil
+	}
+
+	err := runChain(c.mws, terminal, ctx)
 
 	// Do not send response if request is a notification.
 	if req.Seq == 0 {
 		return
 	}
 
-	// The return value for the method is an error.
-	errInter := returnValues[0].Interface()
 	errmsg := ""
-	if errInter != nil {
-		errmsg = errInter.(error).Error()
+	if err != nil {
+		errmsg = err.Error()
 	}
 	resp := &Response{
 		Seq:   req.Seq,
