@@ -1,6 +1,7 @@
 package xpath
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -75,11 +76,17 @@ type NodeIterator struct {
 	node   NodeNavigator
 	query  query
 	scalar bool
+	ctx    context.Context
 }
 
 // Current returns current node which matched.
 func (t *NodeIterator) Current() NodeNavigator {
 	return t.node
+}
+
+// callerContext returns the caller-provided context, if any.
+func (t *NodeIterator) callerContext() context.Context {
+	return t.ctx
 }
 
 // MoveNext moves Navigator to the next match node.
@@ -121,6 +128,8 @@ func (f iteratorFunc) Current() NodeNavigator {
 
 // Evaluate returns the result of the expression.
 // The result type of the expression is one of the follow: bool,float64,string,NodeIterator).
+// An extension function that reports an error panics with a *FunctionError;
+// use EvaluateWithContext to receive it as a returned error instead.
 func (expr *Expr) Evaluate(root NodeNavigator) interface{} {
 	val := expr.q.Evaluate(iteratorFunc(func() NodeNavigator { return root }))
 	switch val.(type) {
@@ -130,9 +139,40 @@ func (expr *Expr) Evaluate(root NodeNavigator) interface{} {
 	return val
 }
 
+// EvaluateWithContext is like Evaluate, but carries ctx to extension
+// functions (see FunctionContext) and returns an extension function failure
+// as a *FunctionError error instead of panicking. The compiled expression
+// remains safe to reuse after a returned error.
+func (expr *Expr) EvaluateWithContext(ctx context.Context, root NodeNavigator) (val interface{}, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if fe, ok := r.(*FunctionError); ok {
+				val, err = nil, fe
+				return
+			}
+			panic(r)
+		}
+	}()
+	it := &contextIterator{iterator: iteratorFunc(func() NodeNavigator { return root }), ctx: ctx}
+	val = expr.q.Evaluate(it)
+	switch val.(type) {
+	case query:
+		return &NodeIterator{query: expr.q.Clone(), node: root, ctx: ctx}, nil
+	}
+	return val, nil
+}
+
 // Select selects a node set using the specified XPath expression.
 func (expr *Expr) Select(root NodeNavigator) *NodeIterator {
 	return &NodeIterator{query: expr.q.Clone(), node: root, scalar: expr.q.ValueType() == xpathResultType.Boolean}
+}
+
+// SelectWithContext is like Select, but carries ctx to extension functions
+// (see FunctionContext). An extension function failure during iteration
+// panics with a *FunctionError, because NodeIterator.MoveNext cannot return
+// an error.
+func (expr *Expr) SelectWithContext(ctx context.Context, root NodeNavigator) *NodeIterator {
+	return &NodeIterator{query: expr.q.Clone(), node: root, scalar: expr.q.ValueType() == xpathResultType.Boolean, ctx: ctx}
 }
 
 // String returns XPath expression string.
@@ -142,17 +182,7 @@ func (expr *Expr) String() string {
 
 // Compile compiles an XPath expression string.
 func Compile(expr string) (*Expr, error) {
-	if expr == "" {
-		return nil, errors.New("expr expression is nil")
-	}
-	qy, err := build(expr, nil)
-	if err != nil {
-		return nil, err
-	}
-	if qy == nil {
-		return nil, fmt.Errorf(fmt.Sprintf("undeclared variable in XPath expression: %s", expr))
-	}
-	return &Expr{s: expr, q: qy}, nil
+	return compile(expr, nil, nil)
 }
 
 // MustCompile compiles an XPath expression string and ignored error.
@@ -166,10 +196,22 @@ func MustCompile(expr string) *Expr {
 
 // CompileWithNS compiles an XPath expression string, using given namespaces map.
 func CompileWithNS(expr string, namespaces map[string]string) (*Expr, error) {
+	return compile(expr, namespaces, nil)
+}
+
+// CompileWithFunctions compiles an XPath expression string, resolving
+// namespace prefixes with the namespaces map and extension function calls
+// with the funcs registry. The registry is bound to the compiled expression
+// only, so each expression instance can use its own set of functions.
+func CompileWithFunctions(expr string, namespaces map[string]string, funcs *FunctionRegistry) (*Expr, error) {
+	return compile(expr, namespaces, funcs)
+}
+
+func compile(expr string, namespaces map[string]string, funcs *FunctionRegistry) (*Expr, error) {
 	if expr == "" {
 		return nil, errors.New("expr expression is nil")
 	}
-	qy, err := build(expr, namespaces)
+	qy, err := build(expr, namespaces, funcs)
 	if err != nil {
 		return nil, err
 	}

@@ -41,6 +41,9 @@ var builderProps = struct {
 type builder struct {
 	parseDepth int
 	firstInput query
+
+	namespaces map[string]string
+	funcs      *FunctionRegistry
 }
 
 // axisPredicate creates a predicate to predicating for this axis node.
@@ -632,9 +635,58 @@ func (b *builder) processFunction(root *functionNode, props *builderProp) (query
 		}
 		qyOutput = &functionQuery{Func: stringJoinFunc(input, arg1)}
 	default:
+		def, err := b.extensionFuncDef(root)
+		if err != nil {
+			return nil, err
+		}
+		if def != nil {
+			return b.processExtensionFunc(def, root, props)
+		}
 		return nil, fmt.Errorf("not yet support this function %s()", root.FuncName)
 	}
 	return qyOutput, nil
+}
+
+// extensionFuncDef resolves a function call node against the extension
+// function registry, mapping the call's prefix to a namespace URI.
+func (b *builder) extensionFuncDef(root *functionNode) (*ExtensionFunction, error) {
+	if b.funcs == nil {
+		return nil, nil
+	}
+	var uri string
+	if root.Prefix != "" {
+		u, ok := b.namespaces[root.Prefix]
+		if !ok {
+			return nil, fmt.Errorf("prefix %s not defined.", root.Prefix)
+		}
+		uri = u
+	}
+	return b.funcs.lookup(uri, root.FuncName), nil
+}
+
+// processExtensionFunc builds a query for a registered extension function,
+// checking the signature issues that can be determined at compile time.
+func (b *builder) processExtensionFunc(def *ExtensionFunction, root *functionNode, props *builderProp) (query, error) {
+	if len(root.Args) != len(def.Args) {
+		return nil, fmt.Errorf("xpath: function %s() expects %d argument(s), but got %d",
+			root.FuncName, len(def.Args), len(root.Args))
+	}
+	args := make([]query, len(root.Args))
+	for i, argNode := range root.Args {
+		// XPath defines no conversion from a scalar to a node-set, so a
+		// constant operand can never satisfy a node-set parameter.
+		if def.Args[i] == NodeSetType {
+			if _, ok := argNode.(*operandNode); ok {
+				return nil, fmt.Errorf("xpath: function %s() argument %d must be a node-set", root.FuncName, i+1)
+			}
+		}
+		arg, err := b.processNode(argNode, flagsEnum.None, props)
+		if err != nil {
+			return nil, err
+		}
+		args[i] = arg
+	}
+	return &extensionFuncQuery{Input: b.firstInput, def: def, args: args}, nil
 }
 
 func (b *builder) processOperator(root *operatorNode, props *builderProp) (query, error) {
@@ -748,7 +800,7 @@ func (b *builder) processNode(root node, flags flag, props *builderProp) (q quer
 }
 
 // build builds a specified XPath expressions expr.
-func build(expr string, namespaces map[string]string) (q query, err error) {
+func build(expr string, namespaces map[string]string, funcs *FunctionRegistry) (q query, err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			switch x := e.(type) {
@@ -762,7 +814,7 @@ func build(expr string, namespaces map[string]string) (q query, err error) {
 		}
 	}()
 	root := parse(expr, namespaces)
-	b := &builder{}
+	b := &builder{namespaces: namespaces, funcs: funcs}
 	props := builderProps.None
 	return b.processNode(root, flagsEnum.None, &props)
 }

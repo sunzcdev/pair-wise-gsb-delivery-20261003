@@ -165,3 +165,61 @@ The gxpath supported three types: number, boolean, string.
 | `unparsed-entity-url()` | ✗         |
 
 [^1]: XPath-2.0 expression
+
+# Extension Functions
+
+Business logic (e.g. looking up a standard category by code) can be exposed
+to XPath expressions through extension functions. Functions are registered
+on a `FunctionRegistry` that is passed to `CompileWithFunctions`, so the
+binding is per compiled expression — there is no package-level global map,
+and different requests can compile the same expression text against
+different registries (and different implementations of the same name).
+
+A function is identified by a namespace URI and a local name, and declares
+its arity, parameter types and result type:
+
+```go
+reg := xpath.NewFunctionRegistry()
+err := reg.Register(xpath.ExtensionFunction{
+	NamespaceURI: "urn:example:ext",
+	Name:         "classify",
+	Args:         []xpath.DataType{xpath.StringType}, // arity = len(Args)
+	Result:       xpath.StringType,
+	Func: func(fc *xpath.FunctionContext, args []interface{}) (interface{}, error) {
+		category, err := lookupCategory(args[0].(string))
+		if err != nil {
+			return nil, err // surfaced to the caller, never folded into false
+		}
+		return category, nil
+	},
+})
+
+exp, err := xpath.CompileWithFunctions(
+	`//item[ext:classify(@code) = 'fruit']`,
+	map[string]string{"ext": "urn:example:ext"},
+	reg,
+)
+```
+
+- **Compile-time checks**: arity mismatches, unresolvable prefixes, unknown
+  functions and scalar constants passed to node-set parameters are reported
+  by `CompileWithFunctions`.
+- **Runtime conversion**: arguments are converted to their declared types
+  following the XPath type conversion rules (`string()`, `number()`,
+  `boolean()`); node-set arguments arrive as `[]NodeNavigator`.
+- **Context**: `FunctionContext` provides the caller's `context.Context`
+  (via `Expr.EvaluateWithContext` / `Expr.SelectWithContext`), the current
+  node, and its 1-based position and the size of the context node list.
+- **Errors**: a returned error aborts evaluation wrapped in a
+  `*FunctionError` (use `errors.Is`/`errors.As` on the original). It is
+  returned by `EvaluateWithContext`, and panics from plain `Evaluate` or
+  during `NodeIterator` traversal. The compiled expression stays reusable
+  after an error.
+- **Results**: scalar results are `bool`, `float64` or `string`; a
+  `NodeSetType` result is `[]NodeNavigator`.
+
+**Node ownership**: node-set arguments are copies owned by the function.
+Node-set results transfer ownership to the engine, which may move and copy
+the returned navigators during evaluation — the function must not retain or
+mutate them after returning. The `FunctionContext.Node` navigator is owned
+by the engine; call `Copy()` before retaining it beyond the call.
