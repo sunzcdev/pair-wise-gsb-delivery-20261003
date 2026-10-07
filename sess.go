@@ -367,6 +367,18 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 	var timeout *time.Timer
 	var c <-chan time.Time
 
+	// nothing to write; KCP rejects zero-length messages, so return immediately
+	empty := true
+	for _, b := range v {
+		if len(b) > 0 {
+			empty = false
+			break
+		}
+	}
+	if empty {
+		return 0, nil
+	}
+
 RESET_TIMER:
 	if twd, ok := s.wd.Load().(time.Time); ok && !twd.IsZero() {
 		if timeout == nil {
@@ -396,33 +408,58 @@ RESET_TIMER:
 		s.mu.Lock()
 
 		// make sure write do not overflow the max sliding window on both side
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		// or any optional send-queue byte/segment limit.
+		accepted := 0
+		if s.kcp.sndCanSend() {
 			// transmit all data sequentially, make sure every packet size is within 'mss'
-			for _, b := range v {
-				n += len(b)
-				// handle each slice for packet splitting
-				for {
-					if len(b) <= int(s.kcp.mss) {
-						s.kcp.Send(b)
-						break
-					} else {
-						s.kcp.Send(b[:s.kcp.mss])
-						b = b[s.kcp.mss:]
-					}
+			for len(v) > 0 {
+				b := v[0]
+				if len(b) == 0 {
+					v = v[1:]
+					continue
+				}
+
+				size := len(b)
+				if size > int(s.kcp.mss) {
+					size = int(s.kcp.mss)
+				}
+
+				// Send is all-or-nothing and applies backpressure: a chunk that
+				// would exceed the sliding window or an optional send-queue
+				// limit is rejected with SendCongested and the queue is left
+				// unchanged, so we simply retry the remaining bytes later.
+				if r := s.kcp.Send(b[:size]); r == SendCongested {
+					break
+				} else if r != SendOK {
+					s.mu.Unlock()
+					return n, errors.WithStack(errInvalidOperation)
+				}
+
+				accepted += size
+				n += size
+				b = b[size:]
+				if len(b) == 0 {
+					v = v[1:]
+				} else {
+					v[0] = b
 				}
 			}
+		}
 
-			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
+		// if anything was accepted this round, flush it and return when done.
+		if n > 0 || accepted > 0 {
+			if accepted > 0 && (s.kcp.WaitSnd() >= int(s.kcp.snd_wnd) || !s.writeDelay) {
 				// put the packets on wire immediately if the inflight window is full
 				// or if we've specified write no delay(NO merging of outgoing bytes)
 				// we don't have to wait until the periodical update() procedure uncorks.
 				s.kcp.flush(IKCP_FLUSH_FULL)
 			}
-			s.mu.Unlock()
-			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
-			return n, nil
+
+			if len(v) == 0 {
+				s.mu.Unlock()
+				atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
+				return n, nil
+			}
 		}
 
 		s.mu.Unlock()
@@ -530,6 +567,21 @@ func (s *UDPSession) SetWriteDelay(delay bool) {
 func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 	s.mu.Lock()
 	s.kcp.WndSize(sndwnd, rcvwnd)
+	s.mu.Unlock()
+}
+
+// SetSndQueueLimits caps the locally buffered, not-yet-acknowledged send data.
+// maxnseg bounds the number of KCP segments and maxbytes the total payload
+// bytes, each counted across the send queue and in-flight send buffer. A value
+// of 0 disables that limit (default: both unlimited).
+//
+// This is local backpressure only: it does not change the KCP sliding window or
+// the on-wire format. When a limit is reached, Write/WriteBuffers block until
+// acknowledgements free budget, instead of growing the send queue without
+// bound. See KCP.SetSndQueueLimits for details.
+func (s *UDPSession) SetSndQueueLimits(maxnseg, maxbytes int) {
+	s.mu.Lock()
+	s.kcp.SetSndQueueLimits(maxnseg, maxbytes)
 	s.mu.Unlock()
 }
 
@@ -805,8 +857,7 @@ func (s *UDPSession) update() {
 	default:
 		s.mu.Lock()
 		interval := s.kcp.flush(IKCP_FLUSH_FULL)
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if s.kcp.sndCanSend() {
 			s.notifyWriteEvent()
 		}
 		s.mu.Unlock()
@@ -1082,9 +1133,8 @@ func (s *UDPSession) kcpInput(data []byte) {
 		}
 
 		// to notify the writers if the window size allows to send more packets
-		// and the remote window size is not full.
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		// the remote window size is not full, and any send-queue limits admit more.
+		if s.kcp.sndCanSend() {
 			s.notifyWriteEvent()
 		}
 
@@ -1112,8 +1162,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 			s.notifyReadEvent()
 		}
 
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if s.kcp.sndCanSend() {
 			s.notifyWriteEvent()
 		}
 		return

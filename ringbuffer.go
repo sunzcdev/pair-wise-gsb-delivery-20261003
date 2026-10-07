@@ -90,6 +90,18 @@ func (r *RingBuffer[T]) Peek() (*T, bool) {
 	return &r.elements[r.head], true
 }
 
+// Tail returns the element at the tail (the most recently pushed element)
+// without removing it. It returns the zero value and false if the ring is empty.
+func (r *RingBuffer[T]) Tail() (*T, bool) {
+	if r.Len() == 0 {
+		return nil, false
+	}
+	if r.tail == 0 {
+		return &r.elements[len(r.elements)-1], true
+	}
+	return &r.elements[r.tail-1], true
+}
+
 // Discard discards the first N elements from the ring buffer.
 // Returns the number of elements that are actually discarded (<= n).
 func (r *RingBuffer[T]) Discard(n int) int {
