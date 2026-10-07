@@ -20,6 +20,7 @@ There are many solutions regarding configuration loading in Go. I was looking fo
   * files (JSON, YAML, TOML, DotENV, HCL)
   * environment variables
   * command-line flags
+* Explicit file includes (files can reference other files, see `FileDecoderIncludes`).
 * Dependency-free (file parsers are optional).
 * Ability to walk over configuration fields.
 

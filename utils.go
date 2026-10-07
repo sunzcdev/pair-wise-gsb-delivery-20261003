@@ -179,6 +179,33 @@ func (d *jsonDecoder) DecodeFile(filename string) (map[string]interface{}, error
 	return raw, nil
 }
 
+// Includes implements FileDecoderIncludes. It reads the "include" key, which
+// must be a string or a list of strings, and removes it from the fields.
+func (d *jsonDecoder) Includes(fields map[string]interface{}) ([]string, error) {
+	raw, ok := fields["include"]
+	if !ok {
+		return nil, nil
+	}
+	delete(fields, "include")
+
+	switch raw := raw.(type) {
+	case string:
+		return []string{raw}, nil
+	case []interface{}:
+		includes := make([]string, 0, len(raw))
+		for _, item := range raw {
+			include, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("include entries must be strings, got %T", item)
+			}
+			includes = append(includes, include)
+		}
+		return includes, nil
+	default:
+		return nil, fmt.Errorf("include must be a string or a list of strings, got %T", raw)
+	}
+}
+
 func (l *Loader) sliceToString(curr interface{}) string {
 	switch curr := curr.(type) {
 	case []interface{}:

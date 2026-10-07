@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -108,6 +109,21 @@ type FileDecoder interface {
 	Format() string
 	DecodeFile(filename string) (map[string]any, error)
 	// Init(fsys fs.FS)
+}
+
+// FileDecoderIncludes is an optional extension of FileDecoder that enables
+// explicit includes: a config file can reference other config files.
+//
+// Referenced files are resolved relative to the directory of the file that
+// references them and are loaded before it, so the referencing file overrides
+// its dependencies. Each file is decoded at most once per Load call, cyclic
+// includes are reported with the full reference chain and paths cannot escape
+// the root of the configured file system.
+type FileDecoderIncludes interface {
+	// Includes returns the files referenced by the decoded content of a
+	// config file. It may remove include-related keys from fields, so they
+	// are not treated as unknown fields.
+	Includes(fields map[string]any) ([]string, error)
 }
 
 // Field of the user configuration structure.
@@ -331,6 +347,7 @@ func (l *Loader) loadFiles() error {
 		}
 	}
 
+	files := make([]string, 0, len(l.config.Files))
 	for _, file := range l.config.Files {
 		if _, err := fs.Stat(l.fsys, file); os.IsNotExist(err) {
 			if l.config.FailOnFileNotFound {
@@ -339,31 +356,138 @@ func (l *Loader) loadFiles() error {
 			continue
 		}
 
-		if err := l.loadFile(file); err != nil {
-			return err
-		}
-
+		files = append(files, file)
 		if !l.config.MergeFiles {
 			break
+		}
+	}
+
+	// Decode all files (resolving includes) before applying any of them,
+	// so a failure doesn't leave the destination half-loaded.
+	decoded, err := l.decodeFiles(files)
+	if err != nil {
+		return err
+	}
+	for _, file := range decoded {
+		if err := l.applyFile(file); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (l *Loader) loadFile(file string) error {
-	ext := strings.ToLower(filepath.Ext(file))
+// decodedFile holds a decoded config file ready to be applied.
+type decodedFile struct {
+	name   string
+	tag    string
+	fields map[string]any
+}
+
+// includeState tracks the include resolution of a single loadFiles call.
+type includeState struct {
+	visited map[string]bool // canonical names of fully resolved files
+	onStack map[string]int  // canonical name -> index in stack
+	stack   []string        // canonical names of files being resolved
+}
+
+func (l *Loader) decodeFiles(files []string) ([]decodedFile, error) {
+	state := &includeState{
+		visited: map[string]bool{},
+		onStack: map[string]int{},
+	}
+
+	var decoded []decodedFile
+	for _, file := range files {
+		name, err := normalizeFilePath("", file)
+		if err != nil {
+			return nil, err
+		}
+		if err := l.decodeFile(name, state, &decoded); err != nil {
+			return nil, err
+		}
+	}
+	return decoded, nil
+}
+
+func (l *Loader) decodeFile(name string, state *includeState, decoded *[]decodedFile) error {
+	if state.visited[name] {
+		return nil
+	}
+	if _, ok := state.onStack[name]; ok {
+		chain := append(append([]string{}, state.stack...), name)
+		return fmt.Errorf("include cycle detected: %s", strings.Join(chain, " -> "))
+	}
+
+	ext := strings.ToLower(filepath.Ext(name))
 	decoder, ok := l.config.FileDecoders[ext]
 	if !ok {
 		return fmt.Errorf("file format %q is not supported", ext)
 	}
 
-	actualFields, err := decoder.DecodeFile(file)
+	actualFields, err := decoder.DecodeFile(name)
 	if err != nil {
 		return err
 	}
 
-	tag := decoder.Format()
+	state.onStack[name] = len(state.stack)
+	state.stack = append(state.stack, name)
+	defer func() {
+		delete(state.onStack, name)
+		state.stack = state.stack[:len(state.stack)-1]
+	}()
 
+	if inc, ok := decoder.(FileDecoderIncludes); ok {
+		includes, err := inc.Includes(actualFields)
+		if err != nil {
+			return fmt.Errorf("includes of %q: %w", name, err)
+		}
+		dir := path.Dir(name)
+		for _, include := range includes {
+			dep, err := normalizeFilePath(dir, include)
+			if err != nil {
+				return fmt.Errorf("include %q in file %q: %w", include, name, err)
+			}
+			if err := l.decodeFile(dep, state, decoded); err != nil {
+				return err
+			}
+		}
+	}
+
+	state.visited[name] = true
+	*decoded = append(*decoded, decodedFile{
+		name:   name,
+		tag:    decoder.Format(),
+		fields: actualFields,
+	})
+	return nil
+}
+
+// normalizeFilePath resolves name relative to dir (the directory of the
+// referencing file, empty for top-level files) and returns its canonical
+// slash-separated form. Different relative spellings of the same file
+// produce the same result. Paths starting with "/" are treated as relative
+// to the file system root. The result never escapes the file system root.
+func normalizeFilePath(dir, name string) (string, error) {
+	name = strings.ReplaceAll(name, `\`, "/")
+
+	var cleaned string
+	if strings.HasPrefix(name, "/") {
+		cleaned = path.Clean(name)
+	} else {
+		cleaned = path.Clean(path.Join(dir, name))
+	}
+	cleaned = strings.TrimPrefix(cleaned, "/")
+
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("path %q escapes the config file system root", name)
+	}
+	return cleaned, nil
+}
+
+func (l *Loader) applyFile(file decodedFile) error {
+	actualFields := file.fields
+
+	tag := file.tag
 	if l.config.NewParser {
 		if err := l.parser.applyLevel(tag, actualFields); err != nil {
 			return fmt.Errorf("apply %s: %w", tag, err)
@@ -394,7 +518,7 @@ func (l *Loader) loadFile(file string) error {
 
 	if !l.config.AllowUnknownFields {
 		for env := range actualFields {
-			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", file, env)
+			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", file.name, env)
 		}
 	}
 	return nil
