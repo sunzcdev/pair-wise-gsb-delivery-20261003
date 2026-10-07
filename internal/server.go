@@ -253,11 +253,11 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) error 
 func parseDestination(h http.Header) (*Href, error) {
 	destHref := h.Get("Destination")
 	if destHref == "" {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: missing Destination header in MOVE request")
+		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: missing Destination header in COPY or MOVE request")
 	}
 	dest, err := url.Parse(destHref)
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: marlformed Destination header in MOVE request: %v", err)
+		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: malformed Destination header in COPY or MOVE request: %v", err)
 	}
 	return (*Href)(dest), nil
 }
@@ -272,7 +272,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
 	if s := r.Header.Get("Overwrite"); s != "" {
 		overwrite, err = ParseOverwrite(s)
 		if err != nil {
-			return err
+			return HTTPErrorf(http.StatusBadRequest, "%v", err)
 		}
 	}
 
@@ -280,7 +280,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
 	if s := r.Header.Get("Depth"); s != "" {
 		depth, err = ParseDepth(s)
 		if err != nil {
-			return err
+			return HTTPErrorf(http.StatusBadRequest, "%v", err)
 		}
 	}
 

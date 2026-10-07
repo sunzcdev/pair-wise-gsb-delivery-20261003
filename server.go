@@ -291,24 +291,46 @@ func (b *backend) Mkcol(r *http.Request) error {
 }
 
 func (b *backend) Copy(r *http.Request, dest *internal.Href, recursive, overwrite bool) (created bool, err error) {
-	options := CopyOptions{
-		NoRecursive: !recursive,
-		NoOverwrite: !overwrite,
+	params, err := b.resolveCopyMove(r, dest, false, recursive, overwrite)
+	if err != nil {
+		return false, err
 	}
-	created, err = b.FileSystem.Copy(r.Context(), r.URL.Path, dest.Path, &options)
-	if os.IsExist(err) {
-		return false, &internal.HTTPError{http.StatusPreconditionFailed, err}
-	}
-	return created, err
+	return b.executeCopyMove(r, params)
 }
 
 func (b *backend) Move(r *http.Request, dest *internal.Href, overwrite bool) (created bool, err error) {
-	options := MoveOptions{
-		NoOverwrite: !overwrite,
+	params, err := b.resolveCopyMove(r, dest, true, true, overwrite)
+	if err != nil {
+		return false, err
 	}
-	created, err = b.FileSystem.Move(r.Context(), r.URL.Path, dest.Path, &options)
+	return b.executeCopyMove(r, params)
+}
+
+// executeCopyMove hands the resolved operation to the backend exactly once.
+// Backends implementing AtomicCopyMover perform the operation atomically;
+// other backends fall back to the legacy Copy and Move methods, which remain
+// responsible for their own consistency.
+func (b *backend) executeCopyMove(r *http.Request, params *CopyMoveParams) (bool, error) {
+	if mover, ok := b.FileSystem.(AtomicCopyMover); ok {
+		return mover.CopyMove(r.Context(), params)
+	}
+
+	if params.Move {
+		options := MoveOptions{NoOverwrite: !params.Overwrite}
+		created, err := b.FileSystem.Move(r.Context(), params.Src, params.Dst, &options)
+		if os.IsExist(err) {
+			return false, &internal.HTTPError{Code: http.StatusPreconditionFailed, Err: err}
+		}
+		return created, err
+	}
+
+	options := CopyOptions{
+		NoRecursive: !params.Recursive,
+		NoOverwrite: !params.Overwrite,
+	}
+	created, err := b.FileSystem.Copy(r.Context(), params.Src, params.Dst, &options)
 	if os.IsExist(err) {
-		return false, &internal.HTTPError{http.StatusPreconditionFailed, err}
+		return false, &internal.HTTPError{Code: http.StatusPreconditionFailed, Err: err}
 	}
 	return created, err
 }
