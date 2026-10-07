@@ -41,7 +41,25 @@ import (
 // It automatically retries in the case of network, I/O, or badNonce errors.
 func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 	kid, endpoint string, input, output any) (*http.Response, error) {
+	return c.postJWS(ctx, privateKey, kid, endpoint, input, output, true)
+}
 
+// httpPostJWSNonIdempotent is like httpPostJWS, but for requests that are NOT
+// safe to replay (for example, keyChange). It retries only after a definitive
+// badNonce rejection, which proves the server did not process the request.
+// Network, I/O, and 5xx errors are returned to the caller without retrying,
+// since the request may have been processed before the failure was observed;
+// replaying it could then have additional, unwanted effects.
+func (c *Client) httpPostJWSNonIdempotent(ctx context.Context, privateKey crypto.Signer,
+	kid, endpoint string, input, output any) (*http.Response, error) {
+	return c.postJWS(ctx, privateKey, kid, endpoint, input, output, false)
+}
+
+// postJWS implements httpPostJWS and httpPostJWSNonIdempotent. If idempotent
+// is false, errors that leave the request's outcome ambiguous (network, I/O,
+// and 5xx errors) are not retried.
+func (c *Client) postJWS(ctx context.Context, privateKey crypto.Signer,
+	kid, endpoint string, input, output any, idempotent bool) (*http.Response, error) {
 	if err := c.provision(ctx); err != nil {
 		return nil, err
 	}
@@ -77,7 +95,7 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 			return nil, fmt.Errorf("encoding payload: %v", err)
 		}
 
-		resp, err = c.httpReq(ctx, http.MethodPost, endpoint, encodedPayload, output)
+		resp, err = c.httpReqWithRetry(ctx, http.MethodPost, endpoint, encodedPayload, output, idempotent)
 		if err == nil {
 			return resp, nil
 		}
@@ -104,8 +122,10 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 		}
 
 		// internal server errors *could* just be a hiccup and it may be worth
-		// trying again, but not nearly so many times as for other reasons
-		if resp != nil && resp.StatusCode >= 500 {
+		// trying again, but not nearly so many times as for other reasons;
+		// non-idempotent requests are never retried in this case since the
+		// server may have applied the request before failing
+		if idempotent && resp != nil && resp.StatusCode >= 500 {
 			internalServerErrors++
 			if internalServerErrors < maxInternalServerErrors {
 				continue
@@ -130,6 +150,14 @@ func (c *Client) httpPostJWS(ctx context.Context, privateKey crypto.Signer,
 // If there are any network or I/O errors, the request will be retried as safely and resiliently as
 // possible.
 func (c *Client) httpReq(ctx context.Context, method, endpoint string, joseJSONPayload []byte, output any) (*http.Response, error) {
+	return c.httpReqWithRetry(ctx, method, endpoint, joseJSONPayload, output, true)
+}
+
+// httpReqWithRetry is httpReq with control over whether network, I/O, and
+// server-internal errors are retried. Callers issuing non-idempotent requests
+// should pass allowRetries=false so an ambiguous failure is surfaced to them
+// instead of being masked by a replay of the request.
+func (c *Client) httpReqWithRetry(ctx context.Context, method, endpoint string, joseJSONPayload []byte, output any, allowRetries bool) (*http.Response, error) {
 	// even if the caller doesn't specify an output, we still use a
 	// buffer to store possible error response (we reset it later)
 	buf := bufPool.Get().(*bytes.Buffer)
@@ -139,7 +167,10 @@ func (c *Client) httpReq(ctx context.Context, method, endpoint string, joseJSONP
 	var err error
 
 	// potentially retry the request if there's network, I/O, or server internal errors
-	const maxAttempts = 3
+	maxAttempts := 3
+	if !allowRetries {
+		maxAttempts = 1
+	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			// traffic calming ahead

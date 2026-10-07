@@ -176,6 +176,14 @@ type keyChangeRequest struct {
 // "To change the key associated with an account, the client sends a
 // request to the server containing signatures by both the old and new
 // keys." §7.3.5
+//
+// This method performs a single, uncoordinated rollover: it sends the
+// keyChange request and, on success, returns a copy of the account with
+// the new key. It does not synchronize with other goroutines that may
+// be using the account's old key concurrently, and it cannot tell
+// committed rollovers apart from lost responses. If the same account is
+// shared by multiple goroutines, use KeyRollover to coordinate the
+// rollover with in-flight requests instead.
 func (c *Client) AccountKeyRollover(ctx context.Context, account Account, newPrivateKey crypto.Signer) (Account, error) {
 	if err := c.provision(ctx); err != nil {
 		return account, err
@@ -196,7 +204,11 @@ func (c *Client) AccountKeyRollover(ctx context.Context, account Account, newPri
 		return account, fmt.Errorf("encoding inner JWS: %v", err)
 	}
 
-	_, err = c.httpPostJWS(ctx, account.PrivateKey, account.Location, c.dir.KeyChange, json.RawMessage(innerJWS), nil)
+	// keyChange is not idempotent: if the response is lost, replaying the
+	// request would either fail confusingly (the old key is no longer
+	// accepted) or mask the fact that the first attempt committed, so we
+	// must not retry on ambiguous errors
+	_, err = c.httpPostJWSNonIdempotent(ctx, account.PrivateKey, account.Location, c.dir.KeyChange, json.RawMessage(innerJWS), nil)
 	if err != nil {
 		return account, fmt.Errorf("rolling key on server: %w", err)
 	}
