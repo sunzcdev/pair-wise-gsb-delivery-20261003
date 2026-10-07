@@ -331,6 +331,30 @@ func (tr *BTree) IsoCopy() *BTree {
 	return &BTree{base: tr.base.IsoCopy()}
 }
 
+// Split splits the tree into two trees at the provided key. All items that
+// are less than the key remain in the original tree, and all items that are
+// greater than or equal to the key are moved into a new tree, which is
+// returned.
+//
+// This is a structural operation that only touches the O(log n) nodes along
+// the split path. Copy-on-write is preserved, so trees previously derived
+// with Copy or IsoCopy are not affected.
+func (tr *BTree) Split(key any) *BTree {
+	return &BTree{base: tr.base.Split(key)}
+}
+
+// Join moves all items from the other tree into this tree, concatenating
+// the two trees. Every item in this tree must compare less than every item
+// in the other tree. The other tree is left empty on success.
+//
+// This is a structural operation that only visits the O(log n) nodes along
+// the joining spines. An error is returned, leaving both trees unmodified,
+// when the trees use different comparators or degrees, or when their key
+// ranges overlap.
+func (tr *BTree) Join(other *BTree) error {
+	return tr.base.Join(other.base)
+}
+
 // Clear will delete all items.
 func (tr *BTree) Clear() {
 	tr.base.Clear()

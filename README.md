@@ -10,6 +10,9 @@ An efficient [B-tree](https://en.wikipedia.org/wiki/B-tree) implementation in Go
 - `Map` and `Set` types for ordered key-value maps and sets,
 - Fast bulk loading for pre-ordered data using the `Load()` method.
 - `Copy()` method with copy-on-write support.
+- Structural `Split()` and `Join()` operations for sharding, which split a
+tree into two by key and concatenate adjacent trees back together in
+logarithmic time.
 - [Path hinting](PATH_HINT.md) optimization for operations with nearby keys.
 - Allows for array-like operations. ([Counted B-tree](https://www.chiark.greenend.org.uk/~sgtatham/algorithms/cbtree.html))
 
@@ -226,6 +229,10 @@ SeekHint(key, iter, *hint)
 
 // Copy-on-write
 Copy()                  // copy the btree
+
+// Structural split & join for sharding
+Split(key)              // move items >= key into a new tree, keep items < key
+Join(other)             // concatenate a tree with greater keys into this one
 ```
 
 #### Example

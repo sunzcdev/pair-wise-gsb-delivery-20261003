@@ -3,7 +3,11 @@
 // license that can be found in the LICENSE file.
 package btree
 
-import "sync"
+import (
+	"errors"
+	"reflect"
+	"sync"
+)
 
 type BTreeG[T any] struct {
 	isoid        uint64
@@ -1857,6 +1861,466 @@ func (tr *BTreeG[T]) Clear() {
 	}
 	tr.root = nil
 	tr.count = 0
+}
+
+// Split splits the tree into two trees at the provided key. All items that
+// are less than the key remain in the original tree, and all items that are
+// greater than or equal to the key are moved into a new tree, which is
+// returned. In other words, an item that compares equal to the key is placed
+// in the right (returned) tree.
+//
+// This is a structural operation: it only touches the O(log n) nodes along
+// the split path and reuses all unaffected nodes, making it dramatically
+// faster than deleting and reinserting items one by one. It performs the
+// same copy-on-write as the other mutating operations, so trees previously
+// derived with Copy or IsoCopy are not affected.
+func (tr *BTreeG[T]) Split(key T) *BTreeG[T] {
+	if tr.lock(true) {
+		defer tr.unlock(true)
+	}
+	tr.init(0)
+	rtr := new(BTreeG[T])
+	rtr.isoid = newIsoID()
+	rtr.locks = tr.locks
+	if rtr.locks {
+		rtr.mu = new(sync.RWMutex)
+	}
+	rtr.less = tr.less
+	rtr.min, rtr.max = tr.min, tr.max
+	rtr.copyItems = tr.copyItems
+	rtr.isoCopyItems = tr.isoCopyItems
+	if tr.root != nil {
+		var l, r *node[T]
+		l, r = tr.splitNode(&tr.root, key, rtr)
+		tr.root = l
+		tr.count = 0
+		if l != nil {
+			tr.count = l.count
+		}
+		rtr.root = r
+		rtr.count = 0
+		if r != nil {
+			rtr.count = r.count
+		}
+	}
+	return rtr
+}
+
+// splitNode splits the subtree at *cn into two trees: the l result holds all
+// items less than key and the r result holds all items greater than or equal
+// to key. Nodes on the split path are copied-on-write; all other nodes are
+// shared with the original tree. Nodes created for the right side belong to
+// the rtr tree.
+func (tr *BTreeG[T]) splitNode(cn **node[T], key T, rtr *BTreeG[T],
+) (l, r *node[T]) {
+	n := tr.isoLoad(cn, true)
+	i, found := tr.bsearch(n, key)
+	if n.leaf() {
+		// items[:i] stay, items[i:] move. This is correct whether or not
+		// the key was found because equal items go to the right side.
+		if i < len(n.items) {
+			r = rtr.newNode(true)
+			r.items = append([]T{}, n.items[i:]...)
+			r.count = len(r.items)
+			for j := i; j < len(n.items); j++ {
+				n.items[j] = tr.empty
+			}
+			n.items = n.items[:i]
+			n.count = i
+		}
+		if i > 0 {
+			l = n
+		}
+		return l, r
+	}
+	var cl, cr *node[T]
+	if found {
+		// The equal item goes right. The child to its left goes entirely
+		// left, and the equal item itself becomes the first separator of
+		// the right side assembly below (cr stays nil).
+		cl = (*n.children)[i]
+	} else {
+		cl, cr = tr.splitNode(&(*n.children)[i], key, rtr)
+	}
+	// Reassemble the left side from the subtrees children[0..i-1], the
+	// separators items[0..i-1] and the final subtree cl.
+	l = cl
+	for j := i - 1; j >= 0; j-- {
+		l = tr.join2((*n.children)[j], n.items[j], l)
+	}
+	// Reassemble the right side from the first subtree cr, the separators
+	// items[i..] and the subtrees children[i+1..].
+	r = cr
+	for j := i + 1; j < len(*n.children); j++ {
+		r = rtr.join2(r, n.items[j-1], (*n.children)[j])
+	}
+	return l, r
+}
+
+// nodeHeight returns the height of the subtree rooted at n.
+// A leaf node has a height of one.
+func nodeHeight[T any](n *node[T]) int {
+	h := 1
+	for !n.leaf() {
+		n = (*n.children)[0]
+		h++
+	}
+	return h
+}
+
+// join2 combines the l subtree, the sep separator item and the r subtree
+// into a single tree, where all items in l are less than sep and all items
+// in r are greater than or equal to sep. Either subtree may be nil (empty).
+// Only the O(log n) nodes along the taller spine are visited; everything
+// else is shared. Shared nodes are copied-on-write before being mutated.
+func (tr *BTreeG[T]) join2(l *node[T], sep T, r *node[T]) *node[T] {
+	if l == nil && r == nil {
+		n := tr.newNode(true)
+		n.items = append([]T{}, sep)
+		n.count = 1
+		return n
+	}
+	var hl, hr int
+	if l != nil {
+		hl = nodeHeight(l)
+	}
+	if r != nil {
+		hr = nodeHeight(r)
+	}
+	if hl == hr {
+		root, _ := tr.join2equal(l, sep, r)
+		return root
+	}
+	if hl > hr {
+		root := l
+		if tr.nodeJoinRight(&root, sep, r, hl, hr) {
+			// The root was full. Split it and retry with the new root.
+			left := tr.isoLoad(&root, true)
+			right, median := tr.nodeSplit(left)
+			nroot := tr.newNode(false)
+			nroot.items = append([]T{}, median)
+			*nroot.children = append([]*node[T]{}, left, right)
+			nroot.updateCount()
+			root = nroot
+			tr.nodeJoinRight(&root, sep, r, hl+1, hr)
+		}
+		return root
+	}
+	root := r
+	if tr.nodeJoinLeft(&root, l, sep, hl, hr) {
+		// The root was full. Split it and retry with the new root.
+		right := tr.isoLoad(&root, true)
+		rnode, median := tr.nodeSplit(right)
+		nroot := tr.newNode(false)
+		nroot.items = append([]T{}, median)
+		*nroot.children = append([]*node[T]{}, right, rnode)
+		nroot.updateCount()
+		root = nroot
+		tr.nodeJoinLeft(&root, l, sep, hl, hr+1)
+	}
+	return root
+}
+
+// nodeJoinRight inserts the sep item and the r subtree into the right spine
+// of *cn, where *cn has height h (> hr) and all of its items are less than
+// sep, and r has height hr with all of its items greater than or equal to
+// sep. A nil r (hr == 0) simply inserts sep as the new maximum item.
+// Returns true when *cn is full and must be split by the caller first.
+func (tr *BTreeG[T]) nodeJoinRight(cn **node[T], sep T, r *node[T],
+	h, hr int,
+) (split bool) {
+	n := tr.isoLoad(cn, true)
+	// The number of items that will be added below. Note that join2equal
+	// may mutate r in place, so the count must be captured upfront.
+	added := 1
+	if r != nil {
+		added += r.count
+	}
+	if h == hr+1 {
+		if r == nil {
+			// Insert sep as the new maximum item.
+			if len(n.items) == tr.max {
+				return true
+			}
+			n.items = append(n.items, sep)
+			n.count++
+			return false
+		}
+		// Attach r to the right of the last child.
+		last := len(*n.children) - 1
+		if len(n.items) == tr.max &&
+			len((*n.children)[last].items)+1+len(r.items) > tr.max {
+			// The attachment cannot merge into the last child and this
+			// node has no room to absorb it. The caller must split this
+			// node first. This check must happen before join2equal,
+			// which may mutate r, so that a retry never operates on
+			// already mutated nodes.
+			return true
+		}
+		merged, two := tr.join2equal((*n.children)[last], sep, r)
+		if !two {
+			(*n.children)[last] = merged
+			n.count += added
+			return false
+		}
+		n.items = append(n.items, merged.items[0])
+		(*n.children)[last] = (*merged.children)[0]
+		*n.children = append(*n.children, (*merged.children)[1])
+		n.count += added
+		return false
+	}
+	last := len(*n.children) - 1
+	if tr.nodeJoinRight(&(*n.children)[last], sep, r, h-1, hr) {
+		if len(n.items) == tr.max {
+			return true
+		}
+		right, median := tr.nodeSplit((*n.children)[last])
+		*n.children = append(*n.children, right)
+		n.items = append(n.items, median)
+		return tr.nodeJoinRight(cn, sep, r, h, hr)
+	}
+	n.count += added
+	return false
+}
+
+// nodeJoinLeft inserts the l subtree and the sep item into the left spine
+// of *cn, where *cn has height h (> hl) and all of its items are greater
+// than or equal to sep, and l has height hl with all of its items less than
+// sep. A nil l (hl == 0) simply inserts sep as the new minimum item.
+// Returns true when *cn is full and must be split by the caller first.
+func (tr *BTreeG[T]) nodeJoinLeft(cn **node[T], l *node[T], sep T,
+	hl, h int,
+) (split bool) {
+	n := tr.isoLoad(cn, true)
+	// The number of items that will be added below. Note that join2equal
+	// may mutate l in place, so the count must be captured upfront.
+	added := 1
+	if l != nil {
+		added += l.count
+	}
+	if h == hl+1 {
+		if l == nil {
+			// Insert sep as the new minimum item.
+			if len(n.items) == tr.max {
+				return true
+			}
+			n.items = append(n.items, tr.empty)
+			copy(n.items[1:], n.items)
+			n.items[0] = sep
+			n.count++
+			return false
+		}
+		// Attach l to the left of the first child.
+		if len(n.items) == tr.max &&
+			len(l.items)+1+len((*n.children)[0].items) > tr.max {
+			// The attachment cannot merge into the first child and this
+			// node has no room to absorb it. The caller must split this
+			// node first. This check must happen before join2equal,
+			// which may mutate l, so that a retry never operates on
+			// already mutated nodes.
+			return true
+		}
+		merged, two := tr.join2equal(l, sep, (*n.children)[0])
+		if !two {
+			(*n.children)[0] = merged
+			n.count += added
+			return false
+		}
+		n.items = append(n.items, tr.empty)
+		copy(n.items[1:], n.items)
+		n.items[0] = merged.items[0]
+		(*n.children)[0] = (*merged.children)[0]
+		*n.children = append(*n.children, nil)
+		copy((*n.children)[2:], (*n.children)[1:])
+		(*n.children)[1] = (*merged.children)[1]
+		n.count += added
+		return false
+	}
+	if tr.nodeJoinLeft(&(*n.children)[0], l, sep, hl, h-1) {
+		if len(n.items) == tr.max {
+			return true
+		}
+		right, median := tr.nodeSplit((*n.children)[0])
+		*n.children = append(*n.children, nil)
+		copy((*n.children)[2:], (*n.children)[1:])
+		(*n.children)[1] = right
+		n.items = append(n.items, tr.empty)
+		copy(n.items[1:], n.items)
+		n.items[0] = median
+		return tr.nodeJoinLeft(cn, l, sep, hl, h)
+	}
+	n.count += added
+	return false
+}
+
+// join2equal combines the l and r subtrees, which both have the same height,
+// and the sep separator item into a single tree. It either returns a single
+// node of the same height (two == false), or a new root one level higher
+// holding two nodes that each have at least min items (two == true).
+func (tr *BTreeG[T]) join2equal(l *node[T], sep T, r *node[T],
+) (root *node[T], two bool) {
+	if len(l.items)+1+len(r.items) <= tr.max {
+		// The combined items fit into a single node.
+		l = tr.isoLoad(&l, true)
+		l.items = append(l.items, sep)
+		l.items = append(l.items, r.items...)
+		if !l.leaf() {
+			*l.children = append(*l.children, (*r.children)...)
+		}
+		l.count += r.count + 1
+		return l, false
+	}
+	if len(l.items) < tr.min || len(r.items) < tr.min {
+		// One of the two nodes is an underfull root (a root is allowed
+		// to have fewer than min items). Rebalance the items so that
+		// both nodes satisfy the occupancy invariant before they become
+		// children of the new root.
+		l = tr.isoLoad(&l, true)
+		r = tr.isoLoad(&r, true)
+		if len(l.items) < tr.min {
+			// Move items from the front of r to the back of l,
+			// rotating through the separator.
+			k := tr.min - len(l.items)
+			l.items = append(l.items, sep)
+			l.items = append(l.items, r.items[:k-1]...)
+			sep = r.items[k-1]
+			if !l.leaf() {
+				*l.children = append(*l.children, (*r.children)[:k]...)
+				copy((*r.children)[:], (*r.children)[k:])
+				for i := len(*r.children) - k; i < len(*r.children); i++ {
+					(*r.children)[i] = nil
+				}
+				*r.children = (*r.children)[:len(*r.children)-k]
+			}
+			copy(r.items[:], r.items[k:])
+			for i := len(r.items) - k; i < len(r.items); i++ {
+				r.items[i] = tr.empty
+			}
+			r.items = r.items[:len(r.items)-k]
+		} else {
+			// Move items from the back of l to the front of r,
+			// rotating through the separator.
+			k := tr.min - len(r.items)
+			items := make([]T, 0, len(r.items)+k)
+			items = append(items, l.items[len(l.items)-k+1:]...)
+			items = append(items, sep)
+			items = append(items, r.items...)
+			sep = l.items[len(l.items)-k]
+			for i := len(l.items) - k; i < len(l.items); i++ {
+				l.items[i] = tr.empty
+			}
+			l.items = l.items[:len(l.items)-k]
+			r.items = items
+			if !l.leaf() {
+				lc := *l.children
+				children := make([]*node[T], 0, len(*r.children)+k)
+				children = append(children, lc[len(lc)-k:]...)
+				children = append(children, (*r.children)...)
+				for i := len(lc) - k; i < len(lc); i++ {
+					lc[i] = nil
+				}
+				*l.children = lc[:len(lc)-k]
+				*r.children = children
+			}
+		}
+		l.updateCount()
+		r.updateCount()
+	}
+	root = tr.newNode(false)
+	root.items = append([]T{}, sep)
+	*root.children = append([]*node[T]{}, l, r)
+	root.count = l.count + r.count + 1
+	return root, true
+}
+
+// Join moves all items from the other tree into this tree, concatenating the
+// two trees. Every item in this tree must compare less than every item in
+// the other tree, which is exactly what Split produces for adjacent shards.
+// The other tree is left empty on success.
+//
+// This is a structural operation: it only visits the O(log n) nodes along
+// the joining spines and reuses all other nodes, making it dramatically
+// faster than reinserting items one by one. Shared nodes are copied-on-write
+// before being mutated, so trees previously derived with Copy or IsoCopy
+// (from either tree) are not affected.
+//
+// An error is returned, leaving both trees unmodified, when the trees use
+// different comparator functions or different degrees, or when their key
+// ranges overlap. Comparator compatibility is checked by comparing function
+// pointers, which is a best-effort check: two distinct function values that
+// happen to compare items the same way are still rejected.
+func (tr *BTreeG[T]) Join(other *BTreeG[T]) error {
+	if other == nil || other == tr {
+		return errors.New("btree: cannot join a tree with itself")
+	}
+	// Lock both trees in a deterministic order to avoid deadlock.
+	if tr.locks && other.locks {
+		if reflect.ValueOf(tr).Pointer() < reflect.ValueOf(other).Pointer() {
+			tr.mu.Lock()
+			other.mu.Lock()
+		} else {
+			other.mu.Lock()
+			tr.mu.Lock()
+		}
+		defer func() {
+			tr.mu.Unlock()
+			other.mu.Unlock()
+		}()
+	} else if tr.locks {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+	} else if other.locks {
+		other.mu.Lock()
+		defer other.mu.Unlock()
+	}
+	tr.init(0)
+	other.init(0)
+	if tr.min != other.min || tr.max != other.max {
+		return errors.New("btree: cannot join trees with different degrees")
+	}
+	if reflect.ValueOf(tr.less).Pointer() != reflect.ValueOf(other.less).Pointer() {
+		return errors.New("btree: cannot join trees with different comparators")
+	}
+	if tr.count > 0 && other.count > 0 {
+		// Verify that the key ranges do not overlap or touch.
+		n := tr.root
+		for !n.leaf() {
+			n = (*n.children)[len(*n.children)-1]
+		}
+		maxl := n.items[len(n.items)-1]
+		n = other.root
+		for !n.leaf() {
+			n = (*n.children)[0]
+		}
+		minr := n.items[0]
+		if !tr.less(maxl, minr) {
+			return errors.New("btree: cannot join trees with overlapping " +
+				"key ranges")
+		}
+	}
+	if other.count == 0 {
+		return nil
+	}
+	if tr.count == 0 {
+		tr.root = other.root
+		tr.count = other.count
+		other.root = nil
+		other.count = 0
+		return nil
+	}
+	// Pop the maximum item of this tree and use it as the separator
+	// between the two trees.
+	n := tr.root
+	for !n.leaf() {
+		n = (*n.children)[len(*n.children)-1]
+	}
+	sep := n.items[len(n.items)-1]
+	tr.deleteHint(sep, nil)
+	tr.root = tr.join2(tr.root, sep, other.root)
+	tr.count = tr.root.count
+	other.root = nil
+	other.count = 0
+	return nil
 }
 
 // Generic BTree
