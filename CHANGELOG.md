@@ -1,3 +1,8 @@
+## Unreleased
+
+#### FEATURES
+- Add FusedContext with FMA and DotProduct: exact intermediate products and sums with a single final rounding, an explicit rounding mode, and a configurable digit budget that returns an error instead of falling back to float64
+
 ## Decimal v1.4.0
 #### BREAKING
 - Drop support for Go version older than 1.10 [#361](https://github.com/shopspring/decimal/pull/361)
