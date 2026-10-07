@@ -75,6 +75,40 @@ if err := loader.Load(); err != nil {
 // 4. command-line flags with the prefix `app.` if they are
 ```
 
+## Reusable parsing plan
+
+When the same configuration structure is loaded many times (for example a
+short-lived task service) the reflection scan and name validation can be done
+once and reused. `PlanFor` builds an immutable plan bound to the structure type
+and the options that affect names; each session supplies its own target, files,
+environment and arguments:
+
+```go
+plan, err := aconfig.PlanFor(&MyConfig{}, aconfig.PlanConfig{
+	EnvPrefix:  "APP",
+	FlagPrefix: "app",
+})
+if err != nil {
+	panic(err) // bad types or duplicated names are reported once, here
+}
+
+session, err := plan.NewSession(&cfg, aconfig.SessionConfig{
+	Files: []string{"/etc/myapp/config.json"},
+	// Envs/Args default to os.Environ()/os.Args[1:] when nil.
+})
+if err != nil {
+	panic(err)
+}
+if err := session.Load(); err != nil {
+	// A failed session never pollutes the plan; create another one and retry.
+}
+```
+
+The plan keeps no target, "set" markers, parsed flags or previous error, so
+sessions are independent and can run concurrently. Stateful file decoders
+implement `aconfig.CloneableFileDecoder`; decoders that cannot be copied or
+cloned are rejected by `PlanFor` instead of being shared unsafely.
+
 Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/master/example_test.go).
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).

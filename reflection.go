@@ -17,6 +17,9 @@ type fieldData struct {
 	isSet      bool
 	isRequired bool
 	tags       map[string]string
+	// resolvedTags means tags already include the parent chain; fullTag must
+	// not climb parents again. Used by sessions created from an immutable Plan.
+	resolvedTags bool
 }
 
 func (f *fieldData) Name() string {
@@ -90,6 +93,9 @@ func (l *Loader) fullTag(prefix string, f *fieldData, tag string) string {
 	}
 	if before, _, ok := cut(res, ",omitempty"); ok {
 		return before
+	}
+	if f.resolvedTags {
+		return prefix + res
 	}
 	for p := f.parent; p != nil; p = p.parent {
 		if p.Tag(tag) != "-" {
