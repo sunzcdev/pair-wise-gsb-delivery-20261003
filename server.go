@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 
@@ -290,7 +291,86 @@ func (b *backend) Mkcol(r *http.Request) error {
 	return err
 }
 
+// normalizeCopyMovePath canonicalizes a URL path so that two paths can be
+// compared reliably. Percent-encoded characters have already been decoded by
+// net/http and net/url. The path is made absolute and cleaned, which strips
+// any trailing slash: a collection "/a/" and the non-collection notation
+// "/a" thus denote the same resource.
+func normalizeCopyMovePath(p string) string {
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return path.Clean(p)
+}
+
+func splitPathSegments(p string) []string {
+	p = strings.Trim(p, "/")
+	if p == "" {
+		return nil
+	}
+	return strings.Split(p, "/")
+}
+
+// isDescendantPath reports whether child is strictly contained in parent.
+// Paths are compared segment by segment: a raw string prefix check would
+// wrongly consider "/ab" to be inside "/a".
+func isDescendantPath(parent, child string) bool {
+	parentSegs := splitPathSegments(parent)
+	childSegs := splitPathSegments(child)
+	if len(childSegs) <= len(parentSegs) {
+		return false
+	}
+	for i, seg := range parentSegs {
+		if childSegs[i] != seg {
+			return false
+		}
+	}
+	return true
+}
+
+// prepareCopyMove builds the operation plan for a COPY or MOVE request: it
+// stats the source, validates the source/destination relationship and checks
+// that the destination parent collection exists. Once it succeeds, the
+// request can be committed to the storage backend in a single call.
+func (b *backend) prepareCopyMove(ctx context.Context, src, dst string, move, recursive bool) error {
+	fi, err := b.FileSystem.Stat(ctx, src)
+	if err != nil {
+		return err
+	}
+
+	srcPath := normalizeCopyMovePath(src)
+	dstPath := normalizeCopyMovePath(dst)
+
+	if srcPath == dstPath {
+		return internal.HTTPErrorf(http.StatusForbidden, "webdav: source and destination are the same resource")
+	}
+
+	if fi.IsDir && isDescendantPath(srcPath, dstPath) {
+		if move {
+			return internal.HTTPErrorf(http.StatusForbidden, "webdav: cannot move a collection into one of its own descendants")
+		}
+		if recursive {
+			return internal.HTTPErrorf(http.StatusConflict, "webdav: cannot recursively copy a collection into one of its own descendants")
+		}
+	}
+
+	parent := path.Dir(dstPath)
+	parentInfo, err := b.FileSystem.Stat(ctx, parent)
+	if internal.IsNotFound(err) {
+		return internal.HTTPErrorf(http.StatusConflict, "webdav: destination parent collection does not exist")
+	} else if err != nil {
+		return err
+	}
+	if !parentInfo.IsDir {
+		return internal.HTTPErrorf(http.StatusConflict, "webdav: destination parent is not a collection")
+	}
+	return nil
+}
+
 func (b *backend) Copy(r *http.Request, dest *internal.Href, recursive, overwrite bool) (created bool, err error) {
+	if err := b.prepareCopyMove(r.Context(), r.URL.Path, dest.Path, false, recursive); err != nil {
+		return false, err
+	}
 	options := CopyOptions{
 		NoRecursive: !recursive,
 		NoOverwrite: !overwrite,
@@ -303,6 +383,9 @@ func (b *backend) Copy(r *http.Request, dest *internal.Href, recursive, overwrit
 }
 
 func (b *backend) Move(r *http.Request, dest *internal.Href, overwrite bool) (created bool, err error) {
+	if err := b.prepareCopyMove(r.Context(), r.URL.Path, dest.Path, true, true); err != nil {
+		return false, err
+	}
 	options := MoveOptions{
 		NoOverwrite: !overwrite,
 	}

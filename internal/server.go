@@ -253,18 +253,37 @@ func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) error 
 func parseDestination(h http.Header) (*Href, error) {
 	destHref := h.Get("Destination")
 	if destHref == "" {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: missing Destination header in MOVE request")
+		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: missing Destination header")
 	}
 	dest, err := url.Parse(destHref)
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: marlformed Destination header in MOVE request: %v", err)
+		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: malformed Destination header: %v", err)
 	}
 	return (*Href)(dest), nil
+}
+
+// resolveDestination verifies that a parsed Destination header identifies a
+// resource served by this server and carries an absolute path.
+func resolveDestination(r *http.Request, dest *Href) error {
+	u := (*url.URL)(dest)
+	if u.Scheme != "" && u.Scheme != "http" && u.Scheme != "https" {
+		return HTTPErrorf(http.StatusBadRequest, "webdav: unsupported scheme in Destination header")
+	}
+	if u.Host != "" && !strings.EqualFold(u.Host, r.Host) {
+		return HTTPErrorf(http.StatusBadGateway, "webdav: destination belongs to a different server")
+	}
+	if !strings.HasPrefix(u.Path, "/") {
+		return HTTPErrorf(http.StatusBadRequest, "webdav: expected absolute path in Destination header")
+	}
+	return nil
 }
 
 func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
 	dest, err := parseDestination(r.Header)
 	if err != nil {
+		return err
+	}
+	if err := resolveDestination(r, dest); err != nil {
 		return err
 	}
 
