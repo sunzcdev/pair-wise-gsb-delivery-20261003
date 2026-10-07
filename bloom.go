@@ -109,12 +109,21 @@ func FromWithM(data []uint64, m, k uint) *BloomFilter {
 // baseHashes returns the four hash values of data that are used to create k
 // hashes
 func baseHashes(data []byte) [4]uint64 {
+	if baseHashesHook != nil {
+		baseHashesHook()
+	}
 	var d digest128 // murmur hashing
 	hash1, hash2, hash3, hash4 := d.sum256(data)
 	return [4]uint64{
 		hash1, hash2, hash3, hash4,
 	}
 }
+
+// baseHashesHook, when non-nil, is invoked once per baseHashes call. It is
+// used by tests to count hash computations (e.g. to prove that batch queries
+// do not re-hash per partition). It is not safe to set it concurrently with
+// hashing.
+var baseHashesHook func()
 
 // location returns the ith hashed location using the four base hash values
 func location(h [4]uint64, i uint) uint64 {
