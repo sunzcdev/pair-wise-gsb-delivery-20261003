@@ -104,6 +104,238 @@ func (o Options) FromBytes(data []byte) error {
 	return o.fromBytesCheckEnd(data, false)
 }
 
+// OptionField identifies one of the option-carrying fields of a DHCPv4 packet.
+//
+// Per RFC 2131 section 4.1 "Extending BOOTP options", the usual options area
+// may be supplemented by the legacy "file" and "sname" fields when the
+// "option overload" option is present.
+type OptionField uint8
+
+const (
+	// FieldOptions is the regular DHCPv4 options area that starts right
+	// after the magic cookie.
+	FieldOptions OptionField = iota
+	// FieldFile is the legacy BOOTP "file" field (128 bytes) reused to carry
+	// options when option overload is in effect.
+	FieldFile
+	// FieldSName is the legacy BOOTP "sname" field (64 bytes) reused to
+	// carry options when option overload is in effect.
+	FieldSName
+)
+
+// String returns a human-readable name for the option field.
+func (f OptionField) String() string {
+	switch f {
+	case FieldFile:
+		return "file"
+	case FieldSName:
+		return "sname"
+	default:
+		return "options"
+	}
+}
+
+// FragmentKind distinguishes ordinary options from the single-byte Pad and End
+// markers, which carry no length or value.
+type FragmentKind uint8
+
+const (
+	// FragmentOption is a regular TLV option (code, length, value).
+	FragmentOption FragmentKind = iota
+	// FragmentPad is a single-byte Pad marker (code 0).
+	FragmentPad
+	// FragmentEnd is a single-byte End marker (code 255).
+	FragmentEnd
+)
+
+// String returns a human-readable name for the fragment kind.
+func (k FragmentKind) String() string {
+	switch k {
+	case FragmentPad:
+		return "pad"
+	case FragmentEnd:
+		return "end"
+	default:
+		return "option"
+	}
+}
+
+// OptionFragment is a single raw option as found on the wire, before any
+// merging is applied.
+//
+// Unlike the merged Options map it preserves Pad and End markers, unknown
+// option codes, every duplicate occurrence and the order in which fragments
+// actually appeared.
+//
+// Every byte slice referenced by an OptionFragment is copied, so the evidence
+// stays valid even if the input buffer is reused after decoding.
+type OptionFragment struct {
+	// Code is the raw option code. It is 0 for Pad and 255 for End.
+	Code uint8
+	// Kind distinguishes regular TLV options from Pad and End markers.
+	Kind FragmentKind
+	// Value is the raw, uninterpreted value of the option. It is nil for
+	// Pad and End and empty (but non-nil) for a zero-length option.
+	Value []byte
+	// Field is the packet field this fragment was decoded from.
+	Field OptionField
+	// Offset is the byte offset of the option code relative to the start
+	// of Field.
+	Offset int
+	// PacketOffset is the byte offset of the option code relative to the
+	// start of the whole packet for the packet-level audit entry point; it
+	// equals Offset for Options.AuditFromBytes.
+	PacketOffset int
+	// Order is the zero-based position of this fragment in the raw stream
+	// across all parsed fields. It reflects wire order, not the sorted key
+	// order used when re-serializing.
+	Order int
+	// Part is the zero-based occurrence index of this fragment among
+	// fragments sharing the same Code, indicating its place in the merged
+	// value per RFC 3396. It is 0 for the first occurrence.
+	Part int
+}
+
+// OptionAudit is the evidence returned by an audit decode: the merged logical
+// options together with every raw fragment they came from.
+type OptionAudit struct {
+	// Options holds the merged logical option values, exactly as the
+	// regular FromBytes decoder produces them.
+	Options Options
+	// Fragments lists every raw fragment in wire order, including Pad,
+	// End, unknown and duplicated options.
+	Fragments []OptionFragment
+	// Trailing holds the raw bytes found after the End marker in a field,
+	// keyed by the field the bytes belong to. Nil for fields without a
+	// trailing payload.
+	Trailing map[OptionField][]byte
+	// Complete reports whether the decoded content is a complete,
+	// non-truncated option stream. When false, Options must not be assumed
+	// to describe the full message.
+	Complete bool
+
+	// parts counts occurrences of each option code for Part assignment.
+	parts map[uint8]int
+}
+
+func (a *OptionAudit) addFragment(f OptionFragment) {
+	if a.parts == nil {
+		a.parts = make(map[uint8]int)
+	}
+	f.Order = len(a.Fragments)
+	f.Part = a.parts[f.Code]
+	a.parts[f.Code]++
+	a.Fragments = append(a.Fragments, f)
+}
+
+// decodeField parses a single option-carrying field. It appends the raw
+// fragments to audit.Fragments and merges ordinary option values into
+// audit.Options.
+//
+// base is the packet-level offset of field's first byte, used to compute
+// PacketOffset. requireEnd controls whether a missing End marker is an error.
+//
+// On a truncated fragment a precise error is returned together with the
+// prefix fragments already decoded.
+func (a *OptionAudit) decodeField(field OptionField, base int, fieldData []byte, requireEnd bool) (sawEnd bool, err error) {
+	pos := 0
+	for pos < len(fieldData) {
+		offset := pos
+		code := fieldData[pos]
+		pos++
+
+		frag := OptionFragment{
+			Code:         code,
+			Field:        field,
+			Offset:       offset,
+			PacketOffset: base + offset,
+		}
+
+		if code == optPad {
+			frag.Kind = FragmentPad
+			a.addFragment(frag)
+			continue
+		}
+		if code == optEnd {
+			frag.Kind = FragmentEnd
+			a.addFragment(frag)
+			trailing := fieldData[pos:]
+			if len(trailing) > 0 {
+				if a.Trailing == nil {
+					a.Trailing = make(map[OptionField][]byte)
+				}
+				a.Trailing[field] = append([]byte(nil), trailing...)
+			}
+			return true, nil
+		}
+
+		frag.Kind = FragmentOption
+		if pos >= len(fieldData) {
+			frag.Value = []byte{}
+			a.addFragment(frag)
+			return false, fmt.Errorf("option code %d at %s offset %d: length byte is missing (truncated)", code, field, offset)
+		}
+		length := int(fieldData[pos])
+		pos++
+
+		start := pos
+		if pos+length > len(fieldData) {
+			// Keep the truncated fragment as evidence, carrying only the
+			// bytes actually present. It is deliberately not merged into
+			// Options so the logical value never claims completeness.
+			available := make([]byte, len(fieldData)-start)
+			copy(available, fieldData[start:])
+			frag.Value = available
+			a.addFragment(frag)
+			return false, fmt.Errorf("option code %d at %s offset %d declares length %d but only %d value bytes remain (truncated)",
+				code, field, offset, length, len(fieldData)-start)
+		}
+
+		value := make([]byte, length)
+		copy(value, fieldData[start:start+length])
+		frag.Value = value
+		pos += length
+		a.addFragment(frag)
+
+		// RFC 2131 section 4.1 / RFC 3396: repeated instances of the
+		// same option are concatenated into one value, in wire order and
+		// across overloaded fields.
+		a.Options[code] = append(a.Options[code], value...)
+	}
+
+	if requireEnd {
+		return false, io.ErrUnexpectedEOF
+	}
+	return false, nil
+}
+
+// AuditFromBytes parses a sequence of option bytes and returns both the merged
+// logical options and the raw fragment evidence used to build them.
+//
+// The sequence should not contain the DHCP magic cookie. This entry point is
+// field-agnostic: every fragment is attributed to FieldOptions and its
+// PacketOffset equals its Offset. Use FromBytesWithAudit to decode a full
+// packet including option-overload fields.
+//
+// Pad, End, unknown and duplicated options are all preserved as fragments.
+// A truncated fragment yields a precise error plus the fragments and merged
+// prefix that could still be decoded, and Complete is left false.
+//
+// The returned byte slices do not alias data, so they remain stable after the
+// input buffer is reused.
+func (o Options) AuditFromBytes(data []byte) (*OptionAudit, error) {
+	audit := &OptionAudit{Options: o}
+	if audit.Options == nil {
+		audit.Options = make(Options)
+	}
+	if len(data) == 0 {
+		return audit, nil
+	}
+	sawEnd, err := audit.decodeField(FieldOptions, 0, data, false)
+	audit.Complete = err == nil && sawEnd
+	return audit, err
+}
+
 const (
 	optPad       = 0
 	optAgentInfo = 82

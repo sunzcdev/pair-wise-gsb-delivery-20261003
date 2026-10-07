@@ -267,9 +267,20 @@ func NewReleaseFromACK(ack *DHCPv4, modifiers ...Modifier) (*DHCPv4, error) {
 	)...)
 }
 
-// FromBytes decodes a DHCPv4 packet from a sequence of bytes, and returns an
-// error if the packet is not valid.
-func FromBytes(q []byte) (*DHCPv4, error) {
+const (
+	// snameOffset is the packet offset of the 64-byte legacy "sname" field.
+	snameOffset = 44
+	// fileOffset is the packet offset of the 128-byte legacy "file" field.
+	fileOffset = snameOffset + 64
+	// optionsOffset is the packet offset at which the magic cookie and the
+	// options area begin.
+	optionsOffset = fileOffset + 128
+)
+
+// parseHeader decodes the fixed BOOTP/DHCP header up to (but not including)
+// the options area. It returns the validated packet and the remaining bytes
+// starting at the magic cookie.
+func parseHeader(q []byte) (*DHCPv4, []byte, error) {
 	var p DHCPv4
 	buf := uio.NewBigEndianBuffer(q)
 
@@ -316,17 +327,106 @@ func FromBytes(q []byte) (*DHCPv4, error) {
 	buf.ReadBytes(cookie[:])
 
 	if err := buf.Error(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if cookie != magicCookie {
-		return nil, fmt.Errorf("malformed DHCP packet: got magic cookie %v, want %v", cookie[:], magicCookie[:])
+		return nil, nil, fmt.Errorf("malformed DHCP packet: got magic cookie %v, want %v", cookie[:], magicCookie[:])
 	}
+	return &p, buf.Data(), nil
+}
 
-	p.Options = make(Options)
-	if err := p.Options.fromBytesCheckEnd(buf.Data(), true); err != nil {
+// FromBytes decodes a DHCPv4 packet from a sequence of bytes, and returns an
+// error if the packet is not valid.
+func FromBytes(q []byte) (*DHCPv4, error) {
+	p, rest, err := parseHeader(q)
+	if err != nil {
 		return nil, err
 	}
-	return &p, nil
+	p.Options = make(Options)
+	if err := p.Options.fromBytesCheckEnd(rest, true); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// FromBytesWithAudit decodes a DHCPv4 packet and returns both the decoded
+// packet (with merged logical options) and the raw option-fragment evidence.
+//
+// Unlike FromBytes it also follows the "option overload" option (RFC 2131
+// section 4.1), parsing the reused "file" and "sname" fields as additional
+// option areas in the mandated order: options, then file, then sname. Every
+// fragment records the field it belongs to, its byte offset (relative to the
+// field and to the whole packet), its wire order and its position within the
+// merged option.
+//
+// Pad, End and unknown options are retained as fragments; bytes following the
+// End marker of any field are exposed via the audit's Trailing map. Fragment
+// order reflects the raw packet and never the sorted order produced by
+// re-serializing.
+//
+// On a truncated fragment a precise error and the still-usable prefix
+// evidence are returned and Complete is false; in that case the packet's
+// options must not be treated as a complete message. The returned evidence
+// owns its bytes and remains stable if q is later reused.
+func FromBytesWithAudit(q []byte) (*DHCPv4, *OptionAudit, error) {
+	p, rest, err := parseHeader(q)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	audit := &OptionAudit{Options: make(Options)}
+
+	// Preserve the historical empty-options behavior: no error when the
+	// packet carries no options at all.
+	if len(rest) == 0 {
+		p.Options = audit.Options
+		return p, audit, nil
+	}
+
+	sawEnd, err := audit.decodeField(FieldOptions, optionsOffset, rest, true)
+	if err != nil {
+		audit.Complete = false
+		p.Options = audit.Options
+		return p, audit, err
+	}
+
+	// RFC 2131 section 4.1: an option-overload value of 1 makes the "file"
+	// field hold options, 2 makes "sname" hold options and 3 both. Options
+	// are interpreted in the order options, file, sname.
+	type fieldSpec struct {
+		field OptionField
+		base  int
+		data  []byte
+	}
+	overload := audit.Options[OptionOptionOverload.Code()]
+	specs := []fieldSpec{}
+	if len(overload) > 0 {
+		flag := overload[len(overload)-1]
+		p.ServerHostName = ""
+		p.BootFileName = ""
+		if flag == 1 || flag == 3 {
+			specs = append(specs, fieldSpec{FieldFile, fileOffset, q[fileOffset : fileOffset+128]})
+		}
+		if flag == 2 || flag == 3 {
+			specs = append(specs, fieldSpec{FieldSName, snameOffset, q[snameOffset : snameOffset+64]})
+		}
+	}
+
+	complete := sawEnd
+	for i, spec := range specs {
+		isLast := i == len(specs)-1
+		end, derr := audit.decodeField(spec.field, spec.base, spec.data, isLast)
+		if derr != nil {
+			audit.Complete = false
+			p.Options = audit.Options
+			return p, audit, derr
+		}
+		complete = end
+	}
+
+	audit.Complete = complete
+	p.Options = audit.Options
+	return p, audit, nil
 }
 
 // FlagsToString returns a human-readable representation of the flags field.
