@@ -46,6 +46,16 @@ func (t MessageType) String() string {
 		return "StreamCommit"
 	case MessageTypeStreamAbort:
 		return "StreamAbort"
+	case MessageTypeBeginPrepare:
+		return "BeginPrepare"
+	case MessageTypePrepare:
+		return "Prepare"
+	case MessageTypeCommitPrepared:
+		return "CommitPrepared"
+	case MessageTypeRollbackPrepared:
+		return "RollbackPrepared"
+	case MessageTypeStreamPrepare:
+		return "StreamPrepare"
 	default:
 		return "Unknown"
 	}
@@ -67,6 +77,12 @@ const (
 	MessageTypeStreamStop   MessageType = 'E'
 	MessageTypeStreamCommit MessageType = 'c'
 	MessageTypeStreamAbort  MessageType = 'A'
+	// Protocol version 3 (two-phase) message types.
+	MessageTypeBeginPrepare     MessageType = 'b'
+	MessageTypePrepare          MessageType = 'P'
+	MessageTypeCommitPrepared   MessageType = 'K'
+	MessageTypeRollbackPrepared MessageType = 'r'
+	MessageTypeStreamPrepare    MessageType = 'p'
 )
 
 // Message is a message received from server.

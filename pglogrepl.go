@@ -281,6 +281,26 @@ type StartReplicationOptions struct {
 	PluginArgs []string
 }
 
+// Names of the START_REPLICATION plugin arguments understood by the built-in
+// pgoutput plugin. See
+// https://www.postgresql.org/docs/current/protocol-logical-replication.html
+const (
+	PluginArgProtoVersion = "proto_version"
+	PluginArgStreaming    = "streaming"
+	PluginArgTwoPhase     = "two_phase"
+)
+
+// TwoPhasePluginArgs returns the pgoutput plugin arguments required to decode
+// two-phase commit messages: protocol version 3 with streaming and two_phase
+// enabled. Messages received with these arguments must be parsed with ParseV3.
+func TwoPhasePluginArgs() []string {
+	return []string{
+		PluginArgProtoVersion + " '3'",
+		PluginArgStreaming + " 'on'",
+		PluginArgTwoPhase + " 'on'",
+	}
+}
+
 type errEndTimeline struct {
 	nextTli         int64
 	nextTliStartpos LSN
