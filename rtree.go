@@ -5,6 +5,7 @@
 package rtree
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -715,6 +716,208 @@ func (tr *RTreeGN[N, T]) Replace(
 	}
 }
 
+// ReplaceItem describes a single replacement in a ReplaceItems batch.
+// The old entry is identified by OldMin, OldMax, and OldData, using the
+// identity match rule (or value equality when no rule is given).
+// The matched entry is rewritten to NewMin, NewMax, and NewData.
+type ReplaceItemGN[N numeric, T any] struct {
+	OldMin  [2]N
+	OldMax  [2]N
+	OldData T
+	NewMin  [2]N
+	NewMax  [2]N
+	NewData T
+}
+
+// Conflict reason flags reported by ReplaceItems.
+const (
+	replaceConflictInvalidNewRect = 1 << iota
+	replaceConflictMissing
+	replaceConflictDuplicate
+)
+
+// ReplaceConflict describes a single item that could not be applied by
+// ReplaceItems. An item may carry more than one reason, for example an
+// existing entry whose new rectangle is also invalid.
+type ReplaceConflictGN[N numeric, T any] struct {
+	// Index is the position of the failing item within the ReplaceItems input.
+	Index int
+	// Item is a copy of the failing input item.
+	Item ReplaceItemGN[N, T]
+	// InvalidNewRect indicates that the new rectangle is malformed, such as
+	// having a minimum value greater than the maximum value.
+	InvalidNewRect bool
+	// Missing indicates that no existing entry matches the old rectangle and
+	// identity.
+	Missing bool
+	// Duplicate indicates that the same entry was referenced by more than one
+	// item in the batch.
+	Duplicate bool
+}
+
+// ReplaceError is returned by ReplaceItems when one or more items cannot be
+// applied. The original tree is left completely unchanged.
+type ReplaceErrorGN[N numeric, T any] struct {
+	Conflicts []ReplaceConflictGN[N, T]
+}
+
+func (e *ReplaceErrorGN[N, T]) Error() string {
+	return fmt.Sprintf("rtree: %d item(s) failed to replace", len(e.Conflicts))
+}
+
+// ReplaceItems atomically replaces many items in one operation.
+//
+// Each item pairs an old entry (located by OldMin/OldMax/OldData) with a new
+// rectangle and data. The eq function defines identity; when nil, ordinary
+// Go value equality is used. Entries sharing the same rectangle but carrying
+// different identities are treated as distinct entries.
+//
+// The operation is all-or-nothing: every old entry must match exactly one
+// distinct tree entry, no entry may be operated on twice, and every new
+// rectangle must be valid. Only then is a brand new tree returned; the
+// receiver and any trees previously obtained with Copy stay untouched, so
+// readers can never observe a partially updated frame.
+//
+// On failure the returned tree is nil and the error is *ReplaceError listing
+// every conflicting item.
+func (tr *RTreeGN[N, T]) ReplaceItems(
+	items []ReplaceItemGN[N, T],
+	eq func(T, T) bool,
+) (*RTreeGN[N, T], error) {
+	// Per-item failure flags. Everything is validated against the receiver
+	// before any copy-on-write node is touched, so a failed call mutates
+	// nothing.
+	flags := make([]byte, len(items))
+	for i := range items {
+		if !validRect(items[i].NewMin, items[i].NewMax) {
+			flags[i] |= replaceConflictInvalidNewRect
+		}
+	}
+
+	// Group the requested operations by (old rect, identity). Operations in
+	// the same group are interchangeable with respect to matching, but each
+	// one still needs a distinct tree entry.
+	groups := make([]replaceGroup[N, T], 0, len(items))
+	for i := range items {
+		ir := rect[N]{items[i].OldMin, items[i].OldMax}
+		g := -1
+		for j := range groups {
+			if groups[j].ir.equals(&ir) &&
+				dataEqual(groups[j].data, items[i].OldData, eq) {
+				g = j
+				break
+			}
+		}
+		if g == -1 {
+			g = len(groups)
+			groups = append(groups, replaceGroup[N, T]{
+				ir:   ir,
+				data: items[i].OldData,
+			})
+		}
+		groups[g].ops = append(groups[g].ops, i)
+	}
+
+	for g := range groups {
+		group := &groups[g]
+		var nslots int
+		if tr.root != nil && tr.rect.contains(&group.ir) {
+			tr.root.countSlots(&group.ir, group.data, eq, &nslots)
+		}
+		for j, op := range group.ops {
+			if j >= nslots {
+				if nslots == 0 {
+					flags[op] |= replaceConflictMissing
+				} else {
+					flags[op] |= replaceConflictDuplicate
+				}
+			}
+		}
+	}
+
+	var conflicts []ReplaceConflictGN[N, T]
+	for i := range flags {
+		if flags[i] == 0 {
+			continue
+		}
+		c := ReplaceConflictGN[N, T]{Index: i, Item: items[i]}
+		if flags[i]&replaceConflictInvalidNewRect != 0 {
+			c.InvalidNewRect = true
+		}
+		if flags[i]&replaceConflictMissing != 0 {
+			c.Missing = true
+		}
+		if flags[i]&replaceConflictDuplicate != 0 {
+			c.Duplicate = true
+		}
+		conflicts = append(conflicts, c)
+	}
+	if len(conflicts) != 0 {
+		return nil, &ReplaceErrorGN[N, T]{Conflicts: conflicts}
+	}
+
+	// All entries matched. Build the next frame on a shadow copy and publish
+	// it only once the whole batch is applied.
+	next := tr.Copy()
+	for i := range items {
+		next.delete(items[i].OldMin, items[i].OldMax, items[i].OldData, eq)
+	}
+	for i := range items {
+		next.Insert(items[i].NewMin, items[i].NewMax, items[i].NewData)
+	}
+	return next, nil
+}
+
+type replaceGroup[N numeric, T any] struct {
+	ir   rect[N]
+	data T
+	ops  []int
+}
+
+// countSlots counts every leaf entry whose rectangle exactly equals ir and
+// whose data matches by the eq identity rule. The search only descends into
+// children whose bounds contain ir.
+func (n *node[N, T]) countSlots(ir *rect[N], data T, eq func(T, T) bool,
+	count *int,
+) {
+	if n.leaf() {
+		items := n.items()
+		for i := 0; i < int(n.count); i++ {
+			if !n.rects[i].equals(ir) {
+				continue
+			}
+			if dataEqual(items[i], data, eq) {
+				*count++
+			}
+		}
+		return
+	}
+	children := n.children()
+	for i := 0; i < int(n.count); i++ {
+		if n.rects[i].contains(ir) {
+			children[i].countSlots(ir, data, eq, count)
+		}
+	}
+}
+
+func dataEqual[T any](a, b T, eq func(T, T) bool) bool {
+	if eq != nil {
+		return eq(a, b)
+	}
+	return compare(a, b)
+}
+
+// validRect reports whether min/max describe a well-formed rectangle.
+// A NaN boundary or a minimum greater than the maximum is invalid.
+func validRect[N numeric](min, max [2]N) bool {
+	for i := 0; i < 2; i++ {
+		if min[i] != min[i] || max[i] != max[i] || min[i] > max[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeGN[N, T]) Bounds() (min, max [2]N) {
 	return tr.rect.min, tr.rect.max
@@ -988,6 +1191,97 @@ func (tr *RTreeG[T]) Replace(
 	)
 }
 
+// ReplaceItem describes a single replacement in an RTreeG.ReplaceItems batch.
+type ReplaceItem[T any] struct {
+	OldMin  [2]float64
+	OldMax  [2]float64
+	OldData T
+	NewMin  [2]float64
+	NewMax  [2]float64
+	NewData T
+}
+
+// ReplaceConflict describes a single item that could not be applied by
+// ReplaceItems.
+type ReplaceConflict[T any] struct {
+	// Index is the position of the failing item within the ReplaceItems input.
+	Index int
+	// Item is a copy of the failing input item.
+	Item ReplaceItem[T]
+	// InvalidNewRect indicates that the new rectangle is malformed, such as
+	// having a minimum value greater than the maximum value.
+	InvalidNewRect bool
+	// Missing indicates that no existing entry matches the old rectangle and
+	// identity.
+	Missing bool
+	// Duplicate indicates that the same entry was referenced by more than one
+	// item in the batch.
+	Duplicate bool
+}
+
+// ReplaceError is returned by ReplaceItems when one or more items cannot be
+// applied. The original tree is left completely unchanged.
+type ReplaceError[T any] struct {
+	Conflicts []ReplaceConflict[T]
+}
+
+func (e *ReplaceError[T]) Error() string {
+	return fmt.Sprintf("rtree: %d item(s) failed to replace", len(e.Conflicts))
+}
+
+// ReplaceItems atomically replaces many items and returns a new tree.
+// See RTreeGN.ReplaceItems for the full semantics: every old entry must match
+// a distinct tree entry by rectangle and identity, no entry may be operated
+// on twice, and every new rectangle must be valid. On failure nil and a
+// *ReplaceError are returned and the receiver is left unchanged.
+func (tr *RTreeG[T]) ReplaceItems(
+	items []ReplaceItem[T],
+	eq func(T, T) bool,
+) (*RTreeG[T], error) {
+	next, err := tr.base.ReplaceItems(itemsToGN(items), eq)
+	if err != nil {
+		return nil, errorFromGN[T](err)
+	}
+	return &RTreeG[T]{base: *next}, nil
+}
+
+func itemsToGN[T any](items []ReplaceItem[T]) []ReplaceItemGN[float64, T] {
+	gitems := make([]ReplaceItemGN[float64, T], len(items))
+	for i := range items {
+		gitems[i] = ReplaceItemGN[float64, T]{
+			OldMin:  items[i].OldMin,
+			OldMax:  items[i].OldMax,
+			OldData: items[i].OldData,
+			NewMin:  items[i].NewMin,
+			NewMax:  items[i].NewMax,
+			NewData: items[i].NewData,
+		}
+	}
+	return gitems
+}
+
+func errorFromGN[T any](err error) *ReplaceError[T] {
+	gerr := err.(*ReplaceErrorGN[float64, T])
+	cerr := &ReplaceError[T]{}
+	for _, gc := range gerr.Conflicts {
+		cerr.Conflicts = append(cerr.Conflicts, ReplaceConflict[T]{
+			Index: gc.Index,
+			Item: ReplaceItem[T]{
+				OldMin:  gc.Item.OldMin,
+				OldMax:  gc.Item.OldMax,
+				OldData: gc.Item.OldData,
+				NewMin:  gc.Item.NewMin,
+				NewMax:  gc.Item.NewMax,
+				NewData: gc.Item.NewData,
+			},
+			InvalidNewRect: gc.InvalidNewRect,
+			Missing:        gc.Missing,
+			Duplicate:      gc.Duplicate,
+		})
+	}
+	return cerr
+}
+
 // Bounds returns the minimum bounding rect
 func (tr *RTreeG[T]) Bounds() (min, max [2]float64) {
 	return tr.base.Bounds()
@@ -1094,6 +1388,22 @@ func (tr *RTree) Replace(
 		oldMin, oldMax, oldData,
 		newMin, newMax, newData,
 	)
+}
+
+// ReplaceItems atomically replaces many items and returns a new tree.
+// Every old entry must match a distinct tree entry by rectangle and
+// identity, no entry may be operated on twice, and every new rectangle must
+// be valid. On failure nil and a *ReplaceError are returned and the receiver
+// is left unchanged.
+func (tr *RTree) ReplaceItems(
+	items []ReplaceItem[any],
+	eq func(any, any) bool,
+) (*RTree, error) {
+	nextGN, err := tr.base.base.ReplaceItems(itemsToGN(items), eq)
+	if err != nil {
+		return nil, errorFromGN[any](err)
+	}
+	return &RTree{base: RTreeG[any]{base: *nextGN}}, nil
 }
 
 // Search the structure for items that intersects the rect param
