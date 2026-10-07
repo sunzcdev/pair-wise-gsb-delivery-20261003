@@ -86,6 +86,19 @@ func (dts *dialectTestSuite) TestToTruncateSQL() {
 	tm.AssertExpectations(dts.T())
 }
 
+func (dts *dialectTestSuite) TestToMergeSQL() {
+	opts := DefaultDialectOptions()
+	mm := new(mocks.MergeSQLGenerator)
+	d := sqlDialect{dialect: "test", dialectOptions: opts, mergeGen: mm}
+
+	b := sb.NewSQLBuilder(true)
+	mc := exp.NewMergeClauses()
+	mm.On("Generate", b, mc).Return(nil).Once()
+
+	d.ToMergeSQL(b, mc)
+	mm.AssertExpectations(dts.T())
+}
+
 func TestSQLDialect(t *testing.T) {
 	suite.Run(t, new(dialectTestSuite))
 }

@@ -36,6 +36,11 @@ func (_m *SQLDialect) ToInsertSQL(b sb.SQLBuilder, clauses exp.InsertClauses) {
 	_m.Called(b, clauses)
 }
 
+// ToMergeSQL provides a mock function with given fields: b, clauses
+func (_m *SQLDialect) ToMergeSQL(b sb.SQLBuilder, clauses exp.MergeClauses) {
+	_m.Called(b, clauses)
+}
+
 // ToSelectSQL provides a mock function with given fields: b, clauses
 func (_m *SQLDialect) ToSelectSQL(b sb.SQLBuilder, clauses exp.SelectClauses) {
 	_m.Called(b, clauses)

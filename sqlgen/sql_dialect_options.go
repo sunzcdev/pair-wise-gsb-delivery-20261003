@@ -44,6 +44,15 @@ type (
 		// Set to true if window function are supported in SELECT statement. (DEFAULT=true)
 		SupportsWindowFunction bool
 
+		// Set to true if the dialect supports MERGE statements. (DEFAULT=true)
+		SupportsMerge bool
+		// Set to true if the dialect supports the DELETE action in a MERGE WHEN MATCHED branch.
+		// (DEFAULT=true)
+		SupportsMergeMatchedDelete bool
+		// Set to true if the dialect supports the RETURNING clause on a MERGE statement.
+		// (DEFAULT=true)
+		SupportsMergeReturn bool
+
 		// Set to true if the dialect requires join tables in UPDATE to be in a FROM clause (DEFAULT=true).
 		UseFromClauseForMultipleUpdateTables bool
 
@@ -267,6 +276,27 @@ type (
 		// The SQL fragment to use for CONFLICT DO UPDATE (Default=[]byte(" DO UPDATE SET"))
 		ConflictDoUpdateFragment []byte
 
+		// The MERGE fragment to use when generating merge sql. (Default=[]byte("MERGE INTO"))
+		MergeClause []byte
+		// The SQL USING clause fragment for the MERGE source. (Default=[]byte(" USING "))
+		MergeUsingFragment []byte
+		// The SQL WHEN MATCHED clause fragment. (Default=[]byte("WHEN MATCHED"))
+		MergeWhenMatchedFragment []byte
+		// The SQL WHEN NOT MATCHED clause fragment. (Default=[]byte("WHEN NOT MATCHED"))
+		MergeWhenNotMatchedFragment []byte
+		// The SQL AND fragment used for MERGE branch search conditions. (Default=[]byte(" AND "))
+		MergeAndFragment []byte
+		// The SQL UPDATE fragment within a MERGE branch. (Default=[]byte("UPDATE SET "))
+		MergeUpdateFragment []byte
+		// The SQL DELETE fragment within a MERGE branch. (Default=[]byte("DELETE"))
+		MergeDeleteFragment []byte
+		// The SQL INSERT fragment within a MERGE branch. (Default=[]byte("INSERT"))
+		MergeInsertFragment []byte
+		// The SQL DO NOTHING fragment within a MERGE branch. (Default=[]byte("DO NOTHING"))
+		MergeDoNothingFragment []byte
+		// The fragment appended to a completed MERGE statement. (Default=[]byte(""))
+		MergeStatementEnd []byte
+
 		// The order of SQL fragments when creating a SELECT statement
 		// (Default=[]SQLFragmentType{
 		// 		CommonTableSQLFragment,
@@ -324,6 +354,9 @@ type (
 		// 		TruncateSQLFragment,
 		// 	})
 		TruncateSQLOrder []SQLFragmentType
+
+		// The order of SQL fragments when creating a MERGE statement
+		MergeSQLOrder []SQLFragmentType
 	}
 )
 
@@ -353,6 +386,11 @@ const (
 	DeleteBeginSQLFragment
 	TruncateSQLFragment
 	WindowSQLFragment
+	MergeBeginSQLFragment
+	MergeTargetSQLFragment
+	MergeSourceSQLFragment
+	MergeOnSQLFragment
+	MergeBranchesSQLFragment
 )
 
 //nolint:gocyclo // simple type to string conversion
@@ -402,6 +440,16 @@ func (sf SQLFragmentType) String() string {
 		return "TruncateSQLFragment"
 	case WindowSQLFragment:
 		return "WindowSQLFragment"
+	case MergeBeginSQLFragment:
+		return "MergeBeginSQLFragment"
+	case MergeTargetSQLFragment:
+		return "MergeTargetSQLFragment"
+	case MergeSourceSQLFragment:
+		return "MergeSourceSQLFragment"
+	case MergeOnSQLFragment:
+		return "MergeOnSQLFragment"
+	case MergeBranchesSQLFragment:
+		return "MergeBranchesSQLFragment"
 	}
 	return fmt.Sprintf("%d", sf)
 }
@@ -428,67 +476,81 @@ func DefaultDialectOptions() *SQLDialectOptions {
 		SupportsMultipleUpdateTables:         true,
 		UseFromClauseForMultipleUpdateTables: true,
 
-		UpdateClause:              []byte("UPDATE"),
-		InsertClause:              []byte("INSERT INTO"),
-		InsertIgnoreClause:        []byte("INSERT IGNORE INTO"),
-		SelectClause:              []byte("SELECT"),
-		DeleteClause:              []byte("DELETE"),
-		TruncateClause:            []byte("TRUNCATE"),
-		WithFragment:              []byte("WITH "),
-		RecursiveFragment:         []byte("RECURSIVE "),
-		CascadeFragment:           []byte(" CASCADE"),
-		RestrictFragment:          []byte(" RESTRICT"),
-		DefaultValuesFragment:     []byte(" DEFAULT VALUES"),
-		ValuesFragment:            []byte(" VALUES "),
-		IdentityFragment:          []byte(" IDENTITY"),
-		SetFragment:               []byte(" SET "),
-		DistinctFragment:          []byte("DISTINCT"),
-		ReturningFragment:         []byte(" RETURNING "),
-		FromFragment:              []byte(" FROM"),
-		UsingFragment:             []byte(" USING "),
-		OnFragment:                []byte(" ON "),
-		WhereFragment:             []byte(" WHERE "),
-		GroupByFragment:           []byte(" GROUP BY "),
-		HavingFragment:            []byte(" HAVING "),
-		WindowFragment:            []byte(" WINDOW "),
-		WindowPartitionByFragment: []byte("PARTITION BY "),
-		WindowOrderByFragment:     []byte("ORDER BY "),
-		WindowOverFragment:        []byte(" OVER "),
-		OrderByFragment:           []byte(" ORDER BY "),
-		FetchFragment:             []byte(" "),
-		LimitFragment:             []byte(" LIMIT "),
-		OffsetFragment:            []byte(" OFFSET "),
-		ForUpdateFragment:         []byte(" FOR UPDATE "),
-		ForNoKeyUpdateFragment:    []byte(" FOR NO KEY UPDATE "),
-		ForShareFragment:          []byte(" FOR SHARE "),
-		ForKeyShareFragment:       []byte(" FOR KEY SHARE "),
-		OfFragment:                []byte("OF "),
-		NowaitFragment:            []byte("NOWAIT"),
-		SkipLockedFragment:        []byte("SKIP LOCKED"),
-		LateralFragment:           []byte("LATERAL "),
-		AsFragment:                []byte(" AS "),
-		AscFragment:               []byte(" ASC"),
-		DescFragment:              []byte(" DESC"),
-		NullsFirstFragment:        []byte(" NULLS FIRST"),
-		NullsLastFragment:         []byte(" NULLS LAST"),
-		AndFragment:               []byte(" AND "),
-		OrFragment:                []byte(" OR "),
-		UnionFragment:             []byte(" UNION "),
-		UnionAllFragment:          []byte(" UNION ALL "),
-		IntersectFragment:         []byte(" INTERSECT "),
-		IntersectAllFragment:      []byte(" INTERSECT ALL "),
-		ConflictFragment:          []byte(" ON CONFLICT"),
-		ConflictDoUpdateFragment:  []byte(" DO UPDATE SET "),
-		ConflictDoNothingFragment: []byte(" DO NOTHING"),
-		CastFragment:              []byte("CAST"),
-		CaseFragment:              []byte("CASE "),
-		WhenFragment:              []byte(" WHEN "),
-		ThenFragment:              []byte(" THEN "),
-		ElseFragment:              []byte(" ELSE "),
-		EndFragment:               []byte(" END"),
-		Null:                      []byte("NULL"),
-		True:                      []byte("TRUE"),
-		False:                     []byte("FALSE"),
+		SupportsMerge:              true,
+		SupportsMergeMatchedDelete: true,
+		SupportsMergeReturn:        true,
+
+		UpdateClause:                []byte("UPDATE"),
+		InsertClause:                []byte("INSERT INTO"),
+		InsertIgnoreClause:          []byte("INSERT IGNORE INTO"),
+		SelectClause:                []byte("SELECT"),
+		DeleteClause:                []byte("DELETE"),
+		TruncateClause:              []byte("TRUNCATE"),
+		WithFragment:                []byte("WITH "),
+		RecursiveFragment:           []byte("RECURSIVE "),
+		CascadeFragment:             []byte(" CASCADE"),
+		RestrictFragment:            []byte(" RESTRICT"),
+		DefaultValuesFragment:       []byte(" DEFAULT VALUES"),
+		ValuesFragment:              []byte(" VALUES "),
+		IdentityFragment:            []byte(" IDENTITY"),
+		SetFragment:                 []byte(" SET "),
+		DistinctFragment:            []byte("DISTINCT"),
+		ReturningFragment:           []byte(" RETURNING "),
+		FromFragment:                []byte(" FROM"),
+		UsingFragment:               []byte(" USING "),
+		OnFragment:                  []byte(" ON "),
+		WhereFragment:               []byte(" WHERE "),
+		GroupByFragment:             []byte(" GROUP BY "),
+		HavingFragment:              []byte(" HAVING "),
+		WindowFragment:              []byte(" WINDOW "),
+		WindowPartitionByFragment:   []byte("PARTITION BY "),
+		WindowOrderByFragment:       []byte("ORDER BY "),
+		WindowOverFragment:          []byte(" OVER "),
+		OrderByFragment:             []byte(" ORDER BY "),
+		FetchFragment:               []byte(" "),
+		LimitFragment:               []byte(" LIMIT "),
+		OffsetFragment:              []byte(" OFFSET "),
+		ForUpdateFragment:           []byte(" FOR UPDATE "),
+		ForNoKeyUpdateFragment:      []byte(" FOR NO KEY UPDATE "),
+		ForShareFragment:            []byte(" FOR SHARE "),
+		ForKeyShareFragment:         []byte(" FOR KEY SHARE "),
+		OfFragment:                  []byte("OF "),
+		NowaitFragment:              []byte("NOWAIT"),
+		SkipLockedFragment:          []byte("SKIP LOCKED"),
+		LateralFragment:             []byte("LATERAL "),
+		AsFragment:                  []byte(" AS "),
+		AscFragment:                 []byte(" ASC"),
+		DescFragment:                []byte(" DESC"),
+		NullsFirstFragment:          []byte(" NULLS FIRST"),
+		NullsLastFragment:           []byte(" NULLS LAST"),
+		AndFragment:                 []byte(" AND "),
+		OrFragment:                  []byte(" OR "),
+		UnionFragment:               []byte(" UNION "),
+		UnionAllFragment:            []byte(" UNION ALL "),
+		IntersectFragment:           []byte(" INTERSECT "),
+		IntersectAllFragment:        []byte(" INTERSECT ALL "),
+		ConflictFragment:            []byte(" ON CONFLICT"),
+		ConflictDoUpdateFragment:    []byte(" DO UPDATE SET "),
+		ConflictDoNothingFragment:   []byte(" DO NOTHING"),
+		MergeClause:                 []byte("MERGE INTO"),
+		MergeUsingFragment:          []byte(" USING "),
+		MergeWhenMatchedFragment:    []byte("WHEN MATCHED"),
+		MergeWhenNotMatchedFragment: []byte("WHEN NOT MATCHED"),
+		MergeAndFragment:            []byte(" AND "),
+		MergeUpdateFragment:         []byte("UPDATE SET "),
+		MergeDeleteFragment:         []byte("DELETE"),
+		MergeInsertFragment:         []byte("INSERT"),
+		MergeDoNothingFragment:      []byte("DO NOTHING"),
+		MergeStatementEnd:           []byte(""),
+		CastFragment:                []byte("CAST"),
+		CaseFragment:                []byte("CASE "),
+		WhenFragment:                []byte(" WHEN "),
+		ThenFragment:                []byte(" THEN "),
+		ElseFragment:                []byte(" ELSE "),
+		EndFragment:                 []byte(" END"),
+		Null:                        []byte("NULL"),
+		True:                        []byte("TRUE"),
+		False:                       []byte("FALSE"),
 
 		PlaceHolderFragment: []byte("?"),
 		QuoteRune:           '"',
@@ -602,6 +664,15 @@ func DefaultDialectOptions() *SQLDialectOptions {
 		},
 		TruncateSQLOrder: []SQLFragmentType{
 			TruncateSQLFragment,
+		},
+		MergeSQLOrder: []SQLFragmentType{
+			CommonTableSQLFragment,
+			MergeBeginSQLFragment,
+			MergeTargetSQLFragment,
+			MergeSourceSQLFragment,
+			MergeOnSQLFragment,
+			MergeBranchesSQLFragment,
+			ReturningSQLFragment,
 		},
 	}
 }

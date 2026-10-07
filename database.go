@@ -144,6 +144,10 @@ func (d *Database) Truncate(table ...interface{}) *TruncateDataset {
 	return newTruncateDataset(d.dialect, d.queryFactory()).Table(table...)
 }
 
+func (d *Database) Merge(table interface{}) *MergeDataset {
+	return newMergeDataset(d.dialect, d.queryFactory()).Target(table)
+}
+
 // Sets the logger for to use when logging queries
 func (d *Database) Logger(logger Logger) {
 	d.logger = logger
@@ -499,6 +503,10 @@ func (td *TxDatabase) Delete(table interface{}) *DeleteDataset {
 
 func (td *TxDatabase) Truncate(table ...interface{}) *TruncateDataset {
 	return newTruncateDataset(td.dialect, td.queryFactory()).Table(table...)
+}
+
+func (td *TxDatabase) Merge(table interface{}) *MergeDataset {
+	return newMergeDataset(td.dialect, td.queryFactory()).Target(table)
 }
 
 // Sets the logger

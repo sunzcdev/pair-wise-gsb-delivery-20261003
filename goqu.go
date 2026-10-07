@@ -57,6 +57,11 @@ func (dw DialectWrapper) Truncate(table ...interface{}) *TruncateDataset {
 	return Truncate(table...).WithDialect(dw.dialect)
 }
 
+// Create a new dataset for creating MERGE sql statements
+func (dw DialectWrapper) Merge(table interface{}) *MergeDataset {
+	return Merge(table).WithDialect(dw.dialect)
+}
+
 func (dw DialectWrapper) DB(db SQLDatabase) *Database {
 	return newDatabase(dw.dialect, db)
 }

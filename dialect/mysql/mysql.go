@@ -21,6 +21,9 @@ func DialectOptions() *goqu.SQLDialectOptions {
 	opts.SupportsDistinctOn = false
 	opts.SupportsWindowFunction = false
 	opts.SupportsDeleteTableHint = true
+	opts.SupportsMerge = false
+	opts.SupportsMergeMatchedDelete = false
+	opts.SupportsMergeReturn = false
 
 	opts.UseFromClauseForMultipleUpdateTables = false
 
