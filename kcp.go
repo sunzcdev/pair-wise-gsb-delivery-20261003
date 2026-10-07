@@ -25,6 +25,8 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
+	"errors"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -251,6 +253,27 @@ type ackItem struct {
 	sn uint32
 	ts uint32
 }
+
+// DatagramError describes why a strictly-validated datagram was rejected.
+//
+// Offset is the byte offset within the input datagram where the malformed
+// segment starts (or 0 when the whole datagram is too short).
+type DatagramError struct {
+	Offset int   // byte offset of the malformed segment
+	Reason error // one of the ErrDatagram* sentinels
+}
+
+func (e *DatagramError) Error() string {
+	return "kcp input: " + e.Reason.Error() + " at offset " + strconv.Itoa(e.Offset)
+}
+
+// Reasons returned by InputStrict.
+var (
+	ErrDatagramTooShort     = errors.New("datagram too short")
+	ErrDatagramConvMismatch = errors.New("conversation id mismatch")
+	ErrDatagramTruncated    = errors.New("segment truncated")
+	ErrDatagramBadCommand   = errors.New("unknown command")
+)
 
 // NewKCP create a new kcp state machine
 //
@@ -590,47 +613,151 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 // codecs.
 //
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
+//
+// This keeps the legacy, best-effort semantics: segments up to the first
+// malformed one are applied, and a trailing remainder shorter than a header is
+// silently ignored. Prefer InputStrict when the whole datagram must be
+// accepted or rejected atomically.
+//
+// Returns 0 on success (including an ignored short tail); -1 on conversation
+// mismatch (or a datagram shorter than one header), -2 on a truncated
+// payload, -3 on an unknown command.
 func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
-	snd_una := kcp.snd_una
-	if len(data) < IKCP_OVERHEAD {
+	segments, err := parseInputSegments(data, kcp.conv, false)
+	if len(segments) > 0 {
+		kcp.applySegments(segments, pktType, ackNoDelay)
+	}
+	if err != nil {
+		return legacyErrorCode(err)
+	}
+	return 0
+}
+
+// InputStrict validates the entire datagram before touching any KCP state.
+//
+// Every segment's length, command, conversation id and the datagram tail are
+// verified first; only when the whole datagram is well-formed are the segments
+// applied, producing exactly the same state transitions as Input on a valid
+// datagram. On rejection no state is changed: the remote window is not
+// updated, acknowledged send segments are not removed and receive data is not
+// queued.
+//
+// The returned *DatagramError reports the byte offset of the malformed
+// segment and the reason.
+func (kcp *KCP) InputStrict(data []byte, pktType PacketType, ackNoDelay bool) error {
+	segments, err := parseInputSegments(data, kcp.conv, true)
+	if err != nil {
+		return err
+	}
+	kcp.applySegments(segments, pktType, ackNoDelay)
+	return nil
+}
+
+// legacyErrorCode maps parse failures onto the historical Input return codes.
+func legacyErrorCode(err *DatagramError) int {
+	switch err.Reason {
+	case ErrDatagramConvMismatch:
+		return -1
+	case ErrDatagramTooShort:
+		return -1
+	case ErrDatagramTruncated:
+		return -2
+	case ErrDatagramBadCommand:
+		return -3
+	default:
 		return -1
 	}
+}
+
+// parseInputSegments walks all segments of a datagram without touching KCP
+// state. It is a pure parser/validator shared by both entry points.
+//
+// In strict mode every segment must be well formed; otherwise a
+// *DatagramError is returned (with the byte offset relative to the start of
+// data) and no segments are returned.
+//
+// In legacy mode the historical Input behavior is reproduced: a trailing
+// remainder shorter than one header is ignored, and on an in-stream failure
+// every successfully parsed segment (including the ones parsed *before* the
+// failure is detected) is returned together with the error so the caller can
+// apply it before reporting the negative return code.
+func parseInputSegments(data []byte, conv uint32, strict bool) (segments []segment, perr *DatagramError) {
+	if len(data) < IKCP_OVERHEAD {
+		return nil, &DatagramError{Offset: 0, Reason: ErrDatagramTooShort}
+	}
+
+	rest := data
+	for len(rest) > 0 {
+		offset := len(data) - len(rest)
+		if len(rest) < IKCP_OVERHEAD {
+			// legacy Input stopped the loop here and returned success
+			if strict {
+				return nil, &DatagramError{Offset: offset, Reason: ErrDatagramTruncated}
+			}
+			break
+		}
+
+		_ = rest[IKCP_OVERHEAD-1] // BCE hint
+		seg := segment{
+			conv: binary.LittleEndian.Uint32(rest),
+			cmd:  rest[4],
+			frg:  rest[5],
+			wnd:  binary.LittleEndian.Uint16(rest[6:]),
+			ts:   binary.LittleEndian.Uint32(rest[8:]),
+			sn:   binary.LittleEndian.Uint32(rest[12:]),
+			una:  binary.LittleEndian.Uint32(rest[16:]),
+		}
+		length := binary.LittleEndian.Uint32(rest[20:])
+		rest = rest[IKCP_OVERHEAD:]
+
+		if seg.conv != conv {
+			err := &DatagramError{Offset: offset, Reason: ErrDatagramConvMismatch}
+			if strict {
+				return nil, err
+			}
+			return segments, err
+		}
+
+		if len(rest) < int(length) {
+			err := &DatagramError{Offset: offset, Reason: ErrDatagramTruncated}
+			if strict {
+				return nil, err
+			}
+			return segments, err
+		}
+
+		if seg.cmd != IKCP_CMD_PUSH && seg.cmd != IKCP_CMD_ACK &&
+			seg.cmd != IKCP_CMD_WASK && seg.cmd != IKCP_CMD_WINS {
+			err := &DatagramError{Offset: offset, Reason: ErrDatagramBadCommand}
+			if strict {
+				return nil, err
+			}
+			return segments, err
+		}
+
+		seg.data = rest[:length] // delayed data copying happens in parse_data
+		segments = append(segments, seg)
+		rest = rest[length:]
+	}
+	return segments, nil
+}
+
+// applySegments feeds a fully parsed datagram into the KCP state machine.
+// This is the single state-transition path shared by Input and InputStrict.
+func (kcp *KCP) applySegments(segments []segment, pktType PacketType, ackNoDelay bool) {
+	snd_una := kcp.snd_una
 
 	var latest uint32 // the latest ack packet
 	var updateRTT int
 	var inSegs uint64
 	var flushSegments int // signal to flush segments
 
-	for {
-		if len(data) < int(IKCP_OVERHEAD) {
-			break
-		}
+	for _, seg := range segments {
+		conv, cmd := seg.conv, seg.cmd
+		frg, wnd, ts, sn, una := seg.frg, seg.wnd, seg.ts, seg.sn, seg.una
+		length := uint32(len(seg.data))
 
-		_ = data[IKCP_OVERHEAD-1] // BCE hint
-		conv := binary.LittleEndian.Uint32(data)
-		cmd := data[4]
-		frg := data[5]
-		wnd := binary.LittleEndian.Uint16(data[6:])
-		ts := binary.LittleEndian.Uint32(data[8:])
-		sn := binary.LittleEndian.Uint32(data[12:])
-		una := binary.LittleEndian.Uint32(data[16:])
-		length := binary.LittleEndian.Uint32(data[20:])
-		data = data[IKCP_OVERHEAD:]
-
-		if conv != kcp.conv {
-			return -1
-		}
-
-		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
-
-		if len(data) < int(length) {
-			return -2
-		}
-
-		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
-			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
-			return -3
-		}
+		kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", length)
 
 		// only trust window updates from regular packets. i.e: latest update
 		if pktType == IKCP_PACKET_REGULAR {
@@ -653,11 +780,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
 				kcp.ack_push(sn, ts)
 				if _itimediff(sn, kcp.rcv_nxt) >= 0 {
-					repeat = kcp.parse_data(segment{
-						conv: conv, cmd: cmd, frg: frg, wnd: wnd,
-						ts: ts, sn: sn, una: una,
-						data: data[:length], // delayed data copying
-					})
+					repeat = kcp.parse_data(seg)
 				}
 			}
 			if pktType == IKCP_PACKET_REGULAR && repeat {
@@ -671,12 +794,9 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			kcp.debugLog(IKCP_LOG_IN_WASK, "conv", conv, "wnd", wnd, "ts", ts)
 		case IKCP_CMD_WINS:
 			kcp.debugLog(IKCP_LOG_IN_WINS, "conv", conv, "wnd", wnd, "ts", ts)
-		default:
-			return -3
 		}
 
 		inSegs++
-		data = data[length:]
 	}
 	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
 
@@ -735,7 +855,6 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 	} else if ackNoDelay && len(kcp.acklist) > 0 { // testing(xtaci): ack immediately if acNoDelay is set
 		kcp.flush(IKCP_FLUSH_ACKONLY)
 	}
-	return 0
 }
 
 func (kcp *KCP) wnd_unused() uint16 {
