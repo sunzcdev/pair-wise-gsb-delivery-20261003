@@ -326,10 +326,14 @@ const (
 	escapeNormal escapeMode = iota
 	escapeCanonicalText
 	escapeCanonicalAttr
+	escapeV10Text
+	escapeV10Attr
+	escapeV11Text
+	escapeV11Attr
 )
 
 // escapeString writes an escaped version of a string to the writer.
-func escapeString(w Writer, s string, m escapeMode) {
+func escapeString(w Writer, s string, m escapeMode, version XMLVersion) {
 	var esc []byte
 	last := 0
 	for i := 0; i < len(s); {
@@ -346,31 +350,38 @@ func escapeString(w Writer, s string, m escapeMode) {
 			}
 			esc = []byte("&gt;")
 		case '\'':
-			if m != escapeNormal {
+			if m != escapeNormal && m != escapeV10Attr && m != escapeV11Attr {
 				continue
 			}
 			esc = []byte("&apos;")
 		case '"':
-			if m == escapeCanonicalText {
+			if m == escapeCanonicalText || m == escapeV10Text || m == escapeV11Text {
 				continue
 			}
 			esc = []byte("&quot;")
 		case '\t':
-			if m != escapeCanonicalAttr {
+			if m != escapeCanonicalAttr && m != escapeV10Attr && m != escapeV11Attr {
 				continue
 			}
 			esc = []byte("&#x9;")
 		case '\n':
-			if m != escapeCanonicalAttr {
+			if m != escapeCanonicalAttr && m != escapeV10Attr && m != escapeV11Attr {
 				continue
 			}
 			esc = []byte("&#xA;")
 		case '\r':
-			if m == escapeNormal {
+			if m == escapeNormal && version == VersionAuto {
 				continue
 			}
 			esc = []byte("&#xD;")
 		default:
+			if version == Version10 || version == Version11 {
+				if e := escapeVersionedRune(m, r); e != nil {
+					esc = e
+					break
+				}
+				continue
+			}
 			if !isInCharacterRange(r) || (r == 0xFFFD && width == 1) {
 				esc = []byte("\uFFFD")
 				break
@@ -461,7 +472,7 @@ func sanitizeDirective(w Writer, s string) {
 	}
 
 	// The contents are unbalanced, so escape every character in the string.
-	escapeString(w, s, escapeNormal)
+	escapeString(w, s, escapeNormal, VersionAuto)
 }
 
 // isDirectiveBalanced returns true if the interpreted portion of an XML

@@ -1,3 +1,30 @@
+Release (unreleased)
+====================
+
+**Changes**
+
+* Added explicit XML version selection through the new `Version` fields of
+  `ReadSettings` and `WriteSettings`, plus the `XMLVersion` type with
+  `VersionAuto`, `Version10` and `Version11` values.
+* The new versioned reader implements the W3C XML 1.0 (5th edition) and
+  XML 1.1 (2nd edition) character, character-reference, name and
+  restricted-character rules directly, rather than relying solely on
+  `encoding/xml`. It normalizes CR and CRLF line endings under both
+  versions and NEL (U+0085) and LINE SEPARATOR (U+2028) under XML 1.1,
+  while leaving numeric character references unnormalized. Literal
+  characters and character references are handled separately, so input is
+  never repaired with blind string replacement.
+* The new versioned writer emits a declaration consistent with the selected
+  version, references XML 1.1 restricted characters and line endings that
+  require it, and returns an error identifying the tree path and byte
+  offset of any value that cannot legally be serialized.
+* Versioned mode currently supports only UTF-8, DTD-free documents.
+  Encountering a DOCTYPE returns the new `ErrDTD` sentinel, and the
+  `CharsetReader`, `Permissive` and `AutoClose` read settings are rejected
+  in that mode.
+* The default `VersionAuto` mode preserves the package's existing
+  `encoding/xml`-based behavior.
+
 Release 1.8.1
 =============
 

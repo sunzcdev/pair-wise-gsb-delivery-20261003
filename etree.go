@@ -39,6 +39,16 @@ var cdataPrefix = []byte("<![CDATA[")
 // ReadSettings determine the default behavior of the Document's ReadFrom*
 // functions.
 type ReadSettings struct {
+	// Version selects the XML recommendation used to interpret the input.
+	// The default value VersionAuto preserves the package's historical
+	// behavior and reads documents through encoding/xml. Set it to
+	// Version10 or Version11 to select strict, version-aware parsing. In
+	// that mode only UTF-8, DTD-free documents are supported: a DOCTYPE
+	// declaration returns ErrDTD, and CharsetReader, Permissive and
+	// AutoClose options are not supported. The document's XML declaration
+	// must match the selected version. Default: VersionAuto.
+	Version XMLVersion
+
 	// CharsetReader, if non-nil, defines a function to generate
 	// charset-conversion readers, converting from the provided non-UTF-8
 	// charset into UTF-8. If nil, the ReadFrom* functions will use a
@@ -109,6 +119,18 @@ func (s *ReadSettings) dup() ReadSettings {
 
 // WriteSettings determine the behavior of the Document's WriteTo* functions.
 type WriteSettings struct {
+	// Version selects the XML recommendation used to serialize the
+	// document. The default value VersionAuto preserves the package's
+	// historical serialization behavior. Set it to Version10 or Version11
+	// for strict serialization under the selected version's rules: values
+	// that cannot legally be represented produce an *InvalidValueError
+	// identifying the tree location; XML 1.1 restricted characters in
+	// element text and attribute values are emitted as numeric character
+	// references. An existing "<?xml?>" declaration is validated against
+	// the selected version; DTD (DOCTYPE) directives are rejected.
+	// Default: VersionAuto.
+	Version XMLVersion
+
 	// CanonicalEndTags forces the production of XML end tags, even for
 	// elements that have no child elements. Default: false.
 	CanonicalEndTags bool
@@ -361,6 +383,9 @@ func (d *Document) SetRoot(e *Element) {
 // ReadFrom reads XML from the reader 'r' into this document. The function
 // returns the number of bytes read and any error encountered.
 func (d *Document) ReadFrom(r io.Reader) (n int64, err error) {
+	if d.ReadSettings.Version == Version10 || d.ReadSettings.Version == Version11 {
+		return d.Element.readFromVersioned(r, d.ReadSettings)
+	}
 	if d.ReadSettings.ValidateInput {
 		b, err := io.ReadAll(r)
 		if err != nil {
@@ -389,6 +414,10 @@ func (d *Document) ReadFromFile(filepath string) error {
 
 // ReadFromBytes reads XML from the byte slice 'b' into the this document.
 func (d *Document) ReadFromBytes(b []byte) error {
+	if d.ReadSettings.Version == Version10 || d.ReadSettings.Version == Version11 {
+		_, err := d.Element.readFromVersioned(bytes.NewReader(b), d.ReadSettings)
+		return err
+	}
 	if d.ReadSettings.ValidateInput {
 		if err := validateXML(bytes.NewReader(b), d.ReadSettings); err != nil {
 			return err
@@ -400,6 +429,10 @@ func (d *Document) ReadFromBytes(b []byte) error {
 
 // ReadFromString reads XML from the string 's' into this document.
 func (d *Document) ReadFromString(s string) error {
+	if d.ReadSettings.Version == Version10 || d.ReadSettings.Version == Version11 {
+		_, err := d.Element.readFromVersioned(strings.NewReader(s), d.ReadSettings)
+		return err
+	}
 	if d.ReadSettings.ValidateInput {
 		if err := validateXML(strings.NewReader(s), d.ReadSettings); err != nil {
 			return err
@@ -444,13 +477,65 @@ func newDecoder(r io.Reader, settings ReadSettings) *xml.Decoder {
 // WriteTo serializes the document out to the writer 'w'. The function returns
 // the number of bytes written and any error encountered.
 func (d *Document) WriteTo(w io.Writer) (n int64, err error) {
+	writeSettings := d.writeSettingsEffective()
+
+	// Strict tree validation runs only when the caller explicitly selected
+	// an XML version. A version merely inherited from the document's
+	// declaration changes escaping (e.g. NEL/LS handling) but preserves the
+	// legacy writer's permissiveness for directive tokens.
+	if d.WriteSettings.Version != VersionAuto {
+		if err := validateDocumentVersion(&d.Element, writeSettings.Version); err != nil {
+			return 0, err
+		}
+	}
 	xw := newXmlWriter(w)
 	b := bufio.NewWriter(xw)
 	for _, c := range d.Child {
-		c.WriteTo(b, &d.WriteSettings)
+		c.WriteTo(b, writeSettings)
 	}
 	err, n = b.Flush(), xw.bytes
 	return
+}
+
+// writeSettingsEffective returns the settings used for serialization. When
+// WriteSettings.Version is VersionAuto but the tree carries an XML
+// declaration, the declaration's version determines the serialization
+// rules so that the emitted declaration and the document's escaping and
+// validity checks cannot disagree.
+func (d *Document) writeSettingsEffective() *WriteSettings {
+	s := d.WriteSettings
+	if s.Version != VersionAuto {
+		return &s
+	}
+	if v := d.declaredVersion(); v != VersionAuto {
+		s.Version = v
+	}
+	return &s
+}
+
+// declaredVersion returns the version named by the document's XML
+// declaration, or VersionAuto when there is none or it cannot be parsed.
+func (d *Document) declaredVersion() XMLVersion {
+	for _, t := range d.Child {
+		if pi, ok := t.(*ProcInst); ok && pi.Target == "xml" {
+			attrs, err := parsePseudoAttributes(strings.TrimPrefix(pi.Inst, " "))
+			if err != nil {
+				return VersionAuto
+			}
+			for _, a := range attrs {
+				if a.key == "version" {
+					switch a.value {
+					case "1.0":
+						return Version10
+					case "1.1":
+						return Version11
+					}
+				}
+			}
+			return VersionAuto
+		}
+	}
+	return VersionAuto
 }
 
 // WriteToFile serializes the document out to the file at path 'filepath'.
@@ -1550,12 +1635,25 @@ func (a *Attr) WriteTo(w Writer, s *WriteSettings) {
 		w.WriteString(`="`)
 	}
 	var m escapeMode
-	if s.CanonicalAttrVal && !s.AttrSingleQuote {
+	switch {
+	case s.Version == Version11:
+		if s.CanonicalAttrVal && !s.AttrSingleQuote {
+			m = escapeCanonicalAttr
+		} else {
+			m = escapeV11Attr
+		}
+	case s.Version == Version10:
+		if s.CanonicalAttrVal && !s.AttrSingleQuote {
+			m = escapeCanonicalAttr
+		} else {
+			m = escapeV10Attr
+		}
+	case s.CanonicalAttrVal && !s.AttrSingleQuote:
 		m = escapeCanonicalAttr
-	} else {
+	default:
 		m = escapeNormal
 	}
-	escapeString(w, a.Value, m)
+	escapeString(w, a.Value, m, s.Version)
 	if s.AttrSingleQuote {
 		w.WriteByte('\'')
 	} else {
@@ -1675,12 +1773,25 @@ func (c *CharData) WriteTo(w Writer, s *WriteSettings) {
 		w.WriteString(`]]>`)
 	} else {
 		var m escapeMode
-		if s.CanonicalText {
+		switch {
+		case s.Version == Version11:
+			if s.CanonicalText {
+				m = escapeCanonicalText
+			} else {
+				m = escapeV11Text
+			}
+		case s.Version == Version10:
+			if s.CanonicalText {
+				m = escapeCanonicalText
+			} else {
+				m = escapeV10Text
+			}
+		case s.CanonicalText:
 			m = escapeCanonicalText
-		} else {
+		default:
 			m = escapeNormal
 		}
-		escapeString(w, c.Data, m)
+		escapeString(w, c.Data, m, s.Version)
 	}
 }
 

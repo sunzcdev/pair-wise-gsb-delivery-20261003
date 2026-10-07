@@ -22,6 +22,37 @@ Some of the package's capabilities and features:
 
 The etree package is compatible with go versions 1.23 and later.
 
+### Selecting an XML version
+
+By default etree reads and writes documents through `encoding/xml`, which
+only supports XML 1.0. Documents produced by cooperating systems that
+declare `version="1.1"` may contain character references and line endings
+(NEL `U+0085`, LINE SEPARATOR `U+2028`) that an XML 1.0 parser cannot
+accept; simply rewriting the declaration to 1.0 does not make them legal.
+
+Set `ReadSettings.Version` (and optionally `WriteSettings.Version`) to
+`etree.Version10` or `etree.Version11` to select the W3C XML
+recommendation explicitly. The versioned reader enforces that version's
+character, character-reference, name and restricted-character rules,
+normalizes CR/CRLF (and NEL/LS under XML 1.1) line endings, and
+distinguishes literal characters from numeric character references without
+blind string replacement. The versioned writer emits a declaration
+consistent with its rules, references characters that require it, and
+returns a positioned error for values that cannot be represented.
+
+The first versioned release supports only UTF-8, DTD-free documents: a
+DOCTYPE returns `etree.ErrDTD`, and the `CharsetReader`, `Permissive` and
+`AutoClose` settings are not available in that mode. The default
+`VersionAuto` keeps the package's historical behavior unchanged.
+
+```go
+doc := etree.NewDocument()
+doc.ReadSettings.Version = etree.Version11
+if err := doc.ReadFromString(`<?xml version="1.1"?><msg>a&#x1;b</msg>`); err != nil {
+    log.Fatal(err)
+}
+```
+
 ### Creating an XML document
 
 The following example creates an XML document from scratch using the etree
