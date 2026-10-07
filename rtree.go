@@ -944,6 +944,20 @@ func (tr *RTreeG[T]) Len() int {
 	return tr.base.Len()
 }
 
+// Load performs a one-time bulk (packed) load of all items into the tree
+// using the Sort-Tile-Recursive (STR) algorithm. The leaves and branches are
+// packed from spatially sorted entries, so the input order does not affect the
+// resulting tree shape, and duplicate rectangles are retained as distinct
+// entries.
+//
+// Every item is validated before any node is built: an item with a NaN
+// coordinate or an inverted (min > max) rectangle causes Load to return
+// ErrInvalidRect without mutating the tree. Loading zero items clears the
+// tree. Any previous contents are replaced.
+func (tr *RTreeG[T]) Load(items []Item[float64, T]) error {
+	return tr.base.Load(items)
+}
+
 // Search for items in tree that intersect the provided rectangle
 func (tr *RTreeG[T]) Search(min, max [2]float64,
 	iter func(min, max [2]float64, data T) bool,
@@ -1081,6 +1095,20 @@ func (tr *RTree) Insert(min, max [2]float64, data any) {
 // Delete an item from the structure
 func (tr *RTree) Delete(min, max [2]float64, data any) {
 	tr.base.Delete(min, max, data)
+}
+
+// Load performs a one-time bulk (packed) load of all items into the tree
+// using the Sort-Tile-Recursive (STR) algorithm. The leaves and branches are
+// packed from spatially sorted entries, so the input order does not affect the
+// resulting tree shape, and duplicate rectangles are retained as distinct
+// entries.
+//
+// Every item is validated before any node is built: an item with a NaN
+// coordinate or an inverted (min > max) rectangle causes Load to return
+// ErrInvalidRect without mutating the tree. Loading zero items clears the
+// tree. Any previous contents are replaced.
+func (tr *RTree) Load(items []Item[float64, any]) error {
+	return tr.base.Load(items)
 }
 
 // Replace an item in the structure. This is effectively just a Delete

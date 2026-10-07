@@ -88,6 +88,31 @@ tr.Search([2]float32{-112.1, 33.4}, [2]float32{-112.0, 33.5},
 tr.Delete([2]float32{-112.0078, 33.4373}, [2]float32{-112.0078, 33.4373}, "PHX")
 ```
 
+### Bulk loading
+
+When all items are known up front (for example loading 100,000 static bounding
+boxes at startup), `Load` builds the whole tree in one pass using the
+Sort-Tile-Recursive (STR) algorithm. Entries are spatially sorted before
+leaves and branches are packed, so the input order does not affect the
+resulting tree shape, and duplicate rectangles are kept as distinct entries.
+
+```go
+items := []rtree.Item[float64, string]{
+    {Min: [2]float64{10, 10}, Max: [2]float64{20, 20}, Data: "rect1"},
+    {Min: [2]float64{10, 10}, Max: [2]float64{20, 20}, Data: "rect2"}, // duplicate rect
+}
+var tr rtree.RTreeG[string]
+if err := tr.Load(items); err != nil {
+    // err is rtree.ErrInvalidRect when an item has a NaN coordinate or an
+    // inverted (min > max) rectangle; the tree is left untouched.
+    log.Fatal(err)
+}
+```
+
+`Load` is available on `RTreeGN`, `RTreeG`, and `RTree`. It validates every
+item before building anything, so invalid input never leaves a half-built
+tree. Loading zero items clears the tree; loading over an existing tree
+replaces its contents.
 
 ## Algorithms
 
@@ -135,4 +160,3 @@ minimum x value.
 ## License
 
 rtree source code is available under the MIT License.
-
