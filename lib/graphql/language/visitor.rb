@@ -230,6 +230,8 @@ module GraphQL
         Language::Nodes::EnumValueDefinition,
         Language::Nodes::Field,
         Language::Nodes::FieldDefinition,
+        Language::Nodes::FragmentArgument,
+        Language::Nodes::FragmentArgumentDefinition,
         Language::Nodes::FragmentDefinition,
         Language::Nodes::FragmentSpread,
         Language::Nodes::InlineFragment,

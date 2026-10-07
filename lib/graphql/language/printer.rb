@@ -137,6 +137,15 @@ module GraphQL
           print_string(fragment_def.name)
         end
 
+        if fragment_def.respond_to?(:fragment_arguments) && fragment_def.fragment_arguments.any?
+          print_string("(")
+          fragment_def.fragment_arguments.each_with_index do |arg, i|
+            print_fragment_argument_definition(arg)
+            print_string(", ") if i < fragment_def.fragment_arguments.size - 1
+          end
+          print_string(")")
+        end
+
         if fragment_def.type
           print_string(" on ")
           print_node(fragment_def.type)
@@ -145,10 +154,33 @@ module GraphQL
         print_selections(fragment_def.selections, indent: indent)
       end
 
+      def print_fragment_argument_definition(arg_def)
+        print_string("$")
+        print_string(arg_def.name)
+        print_string(": ")
+        print_node(arg_def.type)
+        unless arg_def.default_value.nil?
+          print_string(" = ")
+          print_node(arg_def.default_value)
+        end
+        arg_def.directives.each do |dir|
+          print_string(" ")
+          print_directive(dir)
+        end
+      end
+
       def print_fragment_spread(fragment_spread, indent: "")
         print_string(indent)
         print_string("...")
         print_string(fragment_spread.name)
+        if fragment_spread.respond_to?(:fragment_arguments) && fragment_spread.fragment_arguments.any?
+          print_string("(")
+          fragment_spread.fragment_arguments.each_with_index do |arg, i|
+            print_argument(arg)
+            print_string(", ") if i < fragment_spread.fragment_arguments.size - 1
+          end
+          print_string(")")
+        end
         print_directives(fragment_spread.directives)
       end
 

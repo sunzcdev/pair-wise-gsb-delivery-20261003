@@ -283,6 +283,9 @@ module GraphQL
 
           def generate_initialize
             return if method_defined?(:marshal_load, false) # checking for `:initialize` doesn't work right
+            # This extension node defines its own initializer (accepts the
+            # same shape as VariableDefinition without being one).
+            return if name == "GraphQL::Language::Nodes::FragmentArgumentDefinition"
 
             scalar_method_names = @scalar_methods
             # TODO: These probably should be scalar methods, but `types` returns an array
@@ -308,7 +311,7 @@ module GraphQL
               assignments = scalar_method_names.map { |m| m == :description ? "@#{m} = #{m} && -#{m}" : "@#{m} = #{m}" } +
                 children_method_names.map { |m| "@#{m} = #{m}.freeze" }
 
-              if name.end_with?("Definition") && name != "FragmentDefinition"
+              if name.end_with?("Definition") && name != "FragmentDefinition" && name != "FragmentArgumentDefinition"
                 arguments << "definition_pos: nil"
                 assignments << "@definition_pos = definition_pos"
               end
@@ -447,13 +450,85 @@ module GraphQL
         self.children_method_name = :selections
       end
 
+      # A project extension (not part of the GraphQL spec): the actual argument
+      # value attached to a parameterized fragment spread, eg `...MyFrag(first: 10)`.
+      # Kept as a standalone node (rather than subclassing {Argument}) so it does
+      # not change generic node-class enumeration or visitors.
+      class FragmentArgument < AbstractNode
+        def initialize(name: nil, value: nil, line: nil, col: nil, pos: nil, filename: nil, source: nil)
+          @name = name
+          @value = value
+          @line = line
+          @col = col
+          @pos = pos
+          @filename = filename
+          @source = source
+        end
+
+        def marshal_dump
+          [line, col, @filename, @name, @value]
+        end
+
+        def marshal_load(values)
+          @line, @col, @filename, @name, @value = values
+        end
+
+        scalar_methods :name, :value
+        children_methods(false)
+
+        self.children_method_name = :fragment_arguments
+
+        def children
+          @children ||= Array(@value).flatten.select { |v| v.is_a?(AbstractNode) }
+        end
+      end
+
+      # A project extension (not part of the GraphQL spec): typed, default-valued
+      # parameters declared on a fragment definition. Only parsed when the
+      # `fragment_arguments` schema extension is enabled.
+      #
+      # Structurally identical to {VariableDefinition} (defined later in this
+      # file, which is why this is a standalone node rather than a subclass).
+      # Visitors don't need to enter it -- the extension desugars documents
+      # before validation -- so it keeps the standard children/merge machinery
+      # out of generic node enumeration.
+      class FragmentArgumentDefinition < AbstractNode
+        attr_reader :type, :default_value, :directives
+
+        def initialize(name: nil, type: nil, default_value: nil, directives: NONE, line: nil, col: nil, pos: nil, filename: nil, source: nil)
+          @name = name
+          @type = type
+          @default_value = default_value
+          @directives = directives
+          @line = line
+          @col = col
+          @pos = pos
+          @filename = filename
+          @source = source
+        end
+
+        def marshal_dump
+          [line, col, @filename, @name, @type, @default_value, @directives]
+        end
+
+        def marshal_load(values)
+          @line, @col, @filename, @name, @type, @default_value, @directives = values
+        end
+
+        scalar_methods :name
+        children_methods(false)
+
+        self.children_method_name = :fragment_arguments
+      end
+
       # A reusable fragment, defined at document-level.
       class FragmentDefinition < AbstractNode
-        def initialize(name: nil, type: nil, directives: NONE, selections: NONE, filename: nil, pos: nil, source: nil, line: nil, col: nil)
+        def initialize(name: nil, type: nil, directives: NONE, selections: NONE, fragment_arguments: NONE, filename: nil, pos: nil, source: nil, line: nil, col: nil)
           @name = name
           @type = type
           @directives = directives
           @selections = selections
+          @fragment_arguments = fragment_arguments
           @filename  = filename
           @pos = pos
           @source = source
@@ -461,16 +536,16 @@ module GraphQL
           @col = col
         end
 
-        def self.from_a(filename, line, col, name, type, directives, selections)
-          self.new(filename: filename, line: line, col: col, name: name, type: type, directives: directives, selections: selections)
+        def self.from_a(filename, line, col, name, type, directives, selections, fragment_arguments = NONE) # rubocop:disable Metrics/ParameterLists
+          self.new(filename: filename, line: line, col: col, name: name, type: type, directives: directives, selections: selections, fragment_arguments: fragment_arguments)
         end
 
         def marshal_dump
-          [line, col, @filename, @name, @type, @directives, @selections]
+          [line, col, @filename, @name, @type, @directives, @selections, @fragment_arguments]
         end
 
         def marshal_load(values)
-          @line, @col, @filename, @name, @type, @directives, @selections = values
+          @line, @col, @filename, @name, @type, @directives, @selections, @fragment_arguments = values
         end
 
         scalar_methods :name, :type
@@ -480,10 +555,44 @@ module GraphQL
         })
 
         self.children_method_name = :definitions
+
+        # Project extension: local parameter declarations (`fragment F(...) on`).
+        # Kept out of {#children} because the extension desugars these away
+        # before standard validation sees the document.
+        # @return [Array<FragmentArgumentDefinition>]
+        attr_reader :fragment_arguments
+
+        # @return [Boolean] True when this fragment declares local parameters
+        def parameterized?
+          @fragment_arguments.any?
+        end
       end
 
       # Application of a named fragment in a selection
       class FragmentSpread < AbstractNode
+        def initialize(name: nil, directives: NONE, fragment_arguments: NONE, filename: nil, pos: nil, source: nil, line: nil, col: nil)
+          @name = name
+          @directives = directives
+          @fragment_arguments = fragment_arguments
+          @filename = filename
+          @pos = pos
+          @source = source
+          @line = line
+          @col = col
+        end
+
+        def self.from_a(filename, line, col, name, directives, fragment_arguments = NONE)
+          self.new(filename: filename, line: line, col: col, name: name, directives: directives, fragment_arguments: fragment_arguments)
+        end
+
+        def marshal_dump
+          [line, col, @filename, @name, @directives, @fragment_arguments]
+        end
+
+        def marshal_load(values)
+          @line, @col, @filename, @name, @directives, @fragment_arguments = values
+        end
+
         scalar_methods :name
         children_methods(directives: GraphQL::Language::Nodes::Directive)
 
@@ -491,6 +600,15 @@ module GraphQL
 
         # @!attribute name
         #   @return [String] The identifier of the fragment to apply, corresponds with {FragmentDefinition#name}
+
+        # Project extension: actual values passed to a parameterized fragment.
+        # @return [Array<FragmentArgument>]
+        attr_reader :fragment_arguments
+
+        # @return [Boolean] True when this spread passes arguments to a parameterized fragment
+        def with_arguments?
+          @fragment_arguments.any?
+        end
       end
 
       # An unnamed fragment, defined directly in the query with `... {  }`

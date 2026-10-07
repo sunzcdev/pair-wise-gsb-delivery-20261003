@@ -8,6 +8,8 @@
 
 ### New features
 
+- Add an opt-in `fragment_arguments` extension: fragments may declare typed local parameters with default values, and spreads may pass arguments. Enable with `use GraphQL::FragmentArguments`. _This is a project extension, not part of the current GraphQL specification._
+
 ### Bug fixes
 
 # 2.6.11 (21 Sep 2026)
