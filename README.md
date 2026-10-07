@@ -23,6 +23,40 @@ There are many solutions regarding configuration loading in Go. I was looking fo
 * Dependency-free (file parsers are optional).
 * Ability to walk over configuration fields.
 
+## Merging config files
+
+With `MergeFiles: true` several files are combined layer by layer (later files
+override earlier ones). Struct fields are merged field by field.
+
+A slice of structs is normally replaced wholesale. To merge such a slice
+element-by-element instead, declare its identity field with the `merge` tag:
+
+```go
+type Config struct {
+	Pools []Pool `json:"pools" merge:"name"`
+}
+
+type Pool struct {
+	Name string `json:"name"`
+	Host string `json:"host"`
+	Port int    `json:"port"`
+}
+```
+
+Given the identity field, overlay layers follow these rules:
+
+* elements are matched by the identity value;
+* elements absent from the overlay are kept, their unmentioned fields preserved;
+* elements with a new identity are appended (in layer and input order);
+* an element is removed with the `$delete` marker: `{"name": "a", "$delete": true}`;
+* duplicate identities inside a single layer is an error;
+* the identity cannot be changed by a property update;
+* output order follows the base layer, new items are appended.
+
+An empty array `[]` means "no changes" and is different from deleting every
+element. Plain slices (primitives, or struct slices without `merge`) keep the
+original replacement behavior.
+
 ## Install
 
 Go version 1.14+

@@ -38,6 +38,7 @@ type parsedField struct {
 	tags         map[string]string
 	hasChilds    bool
 	isRequired   bool
+	schema       *fieldSchema
 }
 
 func (pf *parsedField) String() string {
@@ -191,6 +192,8 @@ func (sp *structParser) parseStructHelper(parent *parsedField, structValue refle
 		if err != nil {
 			return nil, err
 		}
+		// Building the schema also validates the optional merge tag.
+		pfield.schema = fieldSchemaFor(field)
 
 		// do not set defaultValue for struct or pointer type without a default value
 		// if fieldType.Kind() == reflect.Struct ||
@@ -408,8 +411,26 @@ func (sp *structParser) applyLevelHelper2(fields map[string]any, tag string, val
 			} else {
 				pfield.value = value
 			}
+		case map[any]any:
+			normalized := normalizeMap(value)
+			if pfield.hasChilds {
+				pfieldValue, ok := pfield.value.(map[string]any)
+				if !ok {
+					fmt.Printf("ouch %T (%+v)\n", pfield.value, pfield.value)
+					continue
+				}
+				if err := sp.applyLevelHelper2(pfieldValue, tag, normalized); err != nil {
+					return err
+				}
+			} else {
+				pfield.value = normalized
+			}
 		default:
-			pfield.value = value
+			merged, err := mergeValues(pfield.value, value, pfield.schema, pfield.namefull)
+			if err != nil {
+				return err
+			}
+			pfield.value = merged
 		}
 
 		delete(values, tagValue)
