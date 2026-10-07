@@ -23,6 +23,7 @@
 package smux
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -167,6 +168,41 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	// OpenStream keeps its historical deadline (openCloseTimeout) and is
+	// implemented on top of OpenStreamContext for backward compatibility.
+	timer := time.NewTimer(openCloseTimeout)
+	defer timer.Stop()
+	return s.openStream(context.Background(), timer.C)
+}
+
+// OpenStreamContext is used to create a new stream, honoring ctx while waiting
+// for the SYN control frame to be submitted and while registering the local
+// stream.
+//
+// Cancellation is handled according to how far the open handshake has progressed:
+//
+//   - If the SYN frame has not been submitted to the writer yet, it returns
+//     ctx.Err() and nothing is sent: the peer never learns about the stream.
+//   - If the SYN frame has already been submitted (or written) but the local
+//     stream has not been returned, it still returns ctx.Err(), but a FIN is
+//     queued behind the SYN so the protocol-visible stream is closed on the
+//     peer instead of leaving an orphaned remote stream.
+//   - Once the stream is returned to the caller, cancellation of ctx has no
+//     effect; ownership of the stream is transferred to the caller.
+//
+// Stream identifiers are allocated monotonically and are never reused, even
+// for attempts that fail or get cancelled before the stream is returned.
+func (s *Session) OpenStreamContext(ctx context.Context) (*Stream, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.openStream(ctx, nil)
+}
+
+// openStream implements OpenStream / OpenStreamContext. When deadline is nil,
+// only ctx is observed for cancellation; otherwise deadline mirrors the
+// historical openCloseTimeout behavior of OpenStream.
+func (s *Session) openStream(ctx context.Context, deadline <-chan time.Time) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, io.ErrClosedPipe
 	}
@@ -192,19 +228,42 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+	// Submit the SYN control frame, tracking whether it reached the writer.
+	committed, _, err := s.writeControlFrameContext(
+		newFrame(byte(s.config.Version), cmdSYN, sid),
+		ctx, deadline)
+	if err != nil {
+		// The peer may already have seen the SYN when the call was interrupted
+		// after submission: close that protocol-visible stream with a FIN.
+		// If the SYN was never submitted, nothing was sent and no cleanup is
+		// required.
+		if committed {
+			s.abortOpeningStream(sid)
+		}
 		return nil, err
 	}
 
+	// The SYN is now protocol-visible. From here on, any failure to return the
+	// local stream must be paired with a FIN so the peer does not keep an
+	// orphaned stream around.
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
 	select {
 	case <-s.chSocketReadError:
+		s.abortOpeningStream(sid)
 		return nil, s.socketReadError.Load().(error)
 	case <-s.chSocketWriteError:
+		s.abortOpeningStream(sid)
 		return nil, s.socketWriteError.Load().(error)
 	case <-s.die:
+		s.abortOpeningStream(sid)
 		return nil, io.ErrClosedPipe
+	case <-ctx.Done():
+		s.abortOpeningStream(sid)
+		return nil, ctx.Err()
+	case <-deadline:
+		s.abortOpeningStream(sid)
+		return nil, ErrTimeout
 	default:
 		s.streams[sid] = stream
 		wrapper := &Stream{stream: stream}
@@ -215,6 +274,28 @@ func (s *Session) OpenStream() (*Stream, error) {
 			})
 		*/
 		return wrapper, nil
+	}
+}
+
+// abortOpeningStream tears down a stream whose SYN was already made visible to
+// the peer but which was never handed to the local caller. It queues a FIN
+// behind the SYN on the data class so it cannot overtake the SYN, and never
+// inserts the stream into the local map. The send is best-effort and
+// non-blocking: if the session is dying or the writer is saturated, the peer
+// reclaims the stream through its own connection failure handling.
+func (s *Session) abortOpeningStream(sid uint32) {
+	frame := newFrame(byte(s.config.Version), cmdFIN, sid)
+	resultCh := make(chan writeResult, 1)
+	req := writeRequest{
+		class:  CLSDATA,
+		frame:  frame,
+		seq:    atomic.AddUint32(&s.requestID, 1),
+		result: resultCh,
+	}
+	select {
+	case s.shaper <- req:
+	case <-s.die:
+	case <-s.chSocketWriteError:
 	}
 }
 
@@ -668,6 +749,62 @@ func (s *Session) writeControlFrame(f Frame) (n int, err error) {
 	defer timer.Stop()
 
 	return s.writeFrameInternal(f, timer.C, CLSCTRL)
+}
+
+// writeControlFrameContext writes a control frame while honoring ctx and an
+// optional deadline. The boolean result reports whether the request was
+// committed to the writer. When committed is true, the SYN may already be on
+// the wire (or queued ahead of the writer) even if err is non-nil, so the
+// caller must complete the protocol-visible cleanup (send FIN). When committed
+// is false, nothing about the frame is visible to the peer.
+//
+// Unlike writeFrameInternal, the result channel of a committed-but-interrupted
+// request is deliberately abandoned: sendLoop always performs a non-blocking
+// send into its buffered channel, so neither sendLoop nor shaperLoop blocks,
+// and the garbage collector reclaims the orphaned channel.
+func (s *Session) writeControlFrameContext(f Frame, ctx context.Context, deadline <-chan time.Time) (committed bool, n int, err error) {
+	resultCh := resultChanPool.Get().(chan writeResult)
+
+	req := writeRequest{
+		class:  CLSCTRL,
+		frame:  f,
+		seq:    atomic.AddUint32(&s.requestID, 1),
+		result: resultCh,
+	}
+	select {
+	case s.shaper <- req:
+		committed = true
+	case <-s.die:
+		resultChanPool.Put(resultCh)
+		return false, 0, io.ErrClosedPipe
+	case <-s.chSocketWriteError:
+		resultChanPool.Put(resultCh)
+		return false, 0, s.socketWriteError.Load().(error)
+	case <-ctx.Done():
+		resultChanPool.Put(resultCh)
+		return false, 0, ctx.Err()
+	case <-deadline:
+		resultChanPool.Put(resultCh)
+		return false, 0, ErrTimeout
+	}
+
+	select {
+	case result := <-resultCh:
+		resultChanPool.Put(resultCh)
+		return true, result.n, result.err
+	case <-s.die:
+		// Cannot recycle channel here - sendLoop may still write to it
+		return true, 0, io.ErrClosedPipe
+	case <-s.chSocketWriteError:
+		// Cannot recycle channel here - sendLoop may still write to it
+		return true, 0, s.socketWriteError.Load().(error)
+	case <-ctx.Done():
+		// Cannot recycle channel here - sendLoop may still write to it
+		return true, 0, ctx.Err()
+	case <-deadline:
+		// Cannot recycle channel here - sendLoop may still write to it
+		return true, 0, ErrTimeout
+	}
 }
 
 // internal writeFrame version to support deadline used in keepalive
