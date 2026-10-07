@@ -60,6 +60,10 @@ type Config struct {
 	// When false error is returned only when FlagPrefix isn't empty.
 	AllowUnknownFlags bool
 
+	// AllowDeleteDefaults set to true allows layers (see LoadLayers) to delete
+	// fields that have a default value. By default such deletions fail.
+	AllowDeleteDefaults bool
+
 	// DontGenerateTags disables tag generation for JSON, YAML, TOML file formats.
 	DontGenerateTags bool
 

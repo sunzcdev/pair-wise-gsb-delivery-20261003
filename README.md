@@ -22,6 +22,7 @@ There are many solutions regarding configuration loading in Go. I was looking fo
   * command-line flags
 * Dependency-free (file parsers are optional).
 * Ability to walk over configuration fields.
+* Layered merge with explicit deletion markers (see `LoadLayers`).
 
 ## Install
 
@@ -78,6 +79,27 @@ if err := loader.Load(); err != nil {
 Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/master/example_test.go).
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).
+
+## Layered loading
+
+`LoadLayers` is an optional entry point that merges ordered layers of values
+on top of the defaults (no files, envs or flags are read). A layer may revoke
+values from lower-priority sources with the `Delete` marker, and a higher
+layer can set the field again. An empty string stays a legal value, and the
+destination is not modified when an error is returned.
+
+```go
+err := loader.LoadLayers(
+	aconfig.Layer{Values: map[string]any{"host": "base", "port": 80}},
+	aconfig.Layer{Values: map[string]any{"port": aconfig.Delete{}}}, // revoke port
+	aconfig.Layer{Values: map[string]any{"port": 8080}},             // set it again
+)
+```
+
+Deleting a field that has a default value fails unless
+`Config.AllowDeleteDefaults` is set. Maps are merged key-wise (a key can be
+removed with `Delete`), slices are replaced, and nested structs are merged
+field-wise.
 
 ## Documentation
 
