@@ -192,6 +192,31 @@ params, size = patter.peek_params(path_info)  # params == { "prefix" => "foo" }
 rest         = path_info[size..-1]            # => "/bar"
 ```
 
+<a name="-incremental-matching"></a>
+## Incremental Matching
+
+When a long path arrives in several chunks (for instance from a streaming backend), an incremental session lets you check after every chunk whether the data received so far can still lead to a match, without rescanning the input received so far. Every chunk is processed exactly once, so the total work stays proportional to the input length no matter how many chunks arrive.
+
+``` ruby
+require 'mustermann'
+
+session = Mustermann::Incremental.new(Mustermann.new('/:name(/*rest)?'))
+session << '/foo'   # => :continue (can still match)
+session << '/bar'   # => :continue
+session << 'x'      # => :mismatch (no input starting with '/foo/barx' can match)
+
+result = session.finish
+result.status       # => :match or :mismatch
+result.matched?     # => true or false
+result.params       # => { 'name' => 'foo', 'rest' => 'bar' } if it matched
+```
+
+Feeding returns `:continue` while the input can still lead to a match and `:mismatch` once that is no longer possible; `finish` reports the third, final state via the returned result object. Feeding the same path byte by byte or in one go yields the same params.
+
+Percent escapes and multi-byte UTF-8 characters may be split across chunk boundaries. Truncated input that can only be detected once no more data will arrive (a dangling `%` escape or an incomplete UTF-8 character) is reported by `finish` raising `Mustermann::Incremental::IncompleteInputError`; bytes that are not valid UTF-8 at all raise `Mustermann::Incremental::InvalidInputError` while feeding.
+
+Sessions support patterns made up of literals, captures, optional segments and splats. Patterns using other features (unions, look-aheads, URI template expressions, the `capture` or `except` options, non-AST pattern types, ...) are rejected with `Mustermann::Incremental::UnsupportedPatternError` when the session is created. Each session keeps its own captures, so any number of sessions can be advanced independently, even for the same pattern.
+
 <a name="-expanding"></a>
 ## Expanding
 

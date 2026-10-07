@@ -6,6 +6,10 @@ Mustermann follows [Semantic Versioning 2.0](http://semver.org/). Anything docum
 
 ### Mustermann 4.0.1
 
+#### New features
+
+* Added `Mustermann::Incremental`, a streaming matcher that can decide while a path arrives in chunks whether it can still match a pattern, without rescanning the input received so far. Supports literals, captures, optional segments and splats; percent escapes and UTF-8 characters may span chunk boundaries. Unsupported patterns are rejected when the session is created.
+
 #### Performance improvements
 
 * Reduce memory usage by deduplicating internal data structures. This is especially effective when using large `Mustermann::Set` objects. [#159](https://github.com/sinatra/mustermann/issues/159) [#160](https://github.com/sinatra/mustermann/pull/160) [@byroot](https://github.com/byroot)
