@@ -200,6 +200,8 @@
 //     [Schema.String] returns the original JSON
 //   - Single Object Encoding: [Schema.AppendSingleObject],
 //     [Schema.DecodeSingleObject]
+//   - Binary Comparison: [Schema.CompareBinary] orders two encoded values
+//     by the Avro sort rules without decoding them
 //   - Fingerprinting: [Schema.Canonical], [Schema.Fingerprint], [NewRabin]
 //   - Object Container Files: the [github.com/twmb/avro/ocf] sub-package
 //

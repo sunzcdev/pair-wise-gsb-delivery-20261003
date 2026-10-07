@@ -9352,6 +9352,17 @@ var foreignBufferDecodeSites = map[string]string{
 	"deserInterface: d.deser: d.encodedDefault": "the schema's pre-encoded default, shared by every decode of this resolution; AliasInput's contract forbids writing to anything a decode returns, which is what makes handing it out sound",
 	"deserMap: d.deser: d.encodedDefault":       "same buffer and same rule as deserInterface",
 	"deserStruct: d.deser: d.encodedDefault":    "same buffer and same rule as deserInterface; a struct target is not a different contract",
+
+	// The binary comparator's skip arms. a and b are the caller's own
+	// CompareBinary inputs advanced past consumed values, and the compare
+	// path never materializes a value out of either, so there is no decoded
+	// value that could alias the buffer whichever aliasing option is set.
+	"cmpRecord: r.fields[i].skip: a": "CompareBinary's own input, and comparison decodes nothing: no value can point into it",
+	"cmpRecord: r.fields[i].skip: b": "same buffer and same rule as the a side",
+	"cmpArray: itemSkip: a":          "same rule: CompareBinary's own input, never decoded into a value",
+	"cmpArray: itemSkip: b":          "same rule: CompareBinary's own input, never decoded into a value",
+	"cmpUnion: branchSkips[idxA]: a": "same rule: CompareBinary's own input, never decoded into a value",
+	"cmpUnion: branchSkips[idxB]: b": "same rule: CompareBinary's own input, never decoded into a value",
 }
 
 // fallbackImporter tries compiled export data first and re-asks a source

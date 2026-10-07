@@ -9611,6 +9611,9 @@ var minBytesCallSites = []minBytesCallSite{
 		why: "the resolver rebuilds the bound against the WRITER's wire format for a resolved array and map"},
 	{file: "skip.go", entry: "Resolve when a writer field is dropped",
 		why: "the skip compiled for a dropped writer field derives the same two bounds"},
+	{file: "compare.go", entry: "Schema.CompareBinary",
+		why: "the comparator's array arm derives the same per-item minimum for its block-count bound, " +
+			"on the one walk the schema's comparator build shares across its lazily compiled records"},
 	{file: "deser.go", entry: "n/a, not callers",
 		why: "the definition plus the one real delegation: schemaMinBytes " +
 			"spins up a fresh walk and calls minBytesOf on it for a single standalone node"},
@@ -9688,6 +9691,7 @@ func TestInvariant_DagCostMatrixDrivesEveryEntryPoint(t *testing.T) {
 		`t, cell, "Resolve/dropped-field-skip"`, // the skip compiled for a dropped writer field
 		`t, cell, "Resolve/kept-field"`,         // the resolver's rebuild of a kept container
 		`t, cell, "ocf-header/schema-parse"`,    // the container reader's, schema read from the file
+		`t, cell, "CompareBinary"`,              // the binary comparator's array arm, on the schema's comparator walk
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the cost matrix no longer drives %q; every rowed entry point needs a cell", want)
@@ -9742,6 +9746,18 @@ func TestInvariant_EveryMinBytesEntryPointIsBounded(t *testing.T) {
 	wantEveryMagnitudeTerminates(t, cell, "ocf-header/schema-parse", func(depth int) func() error {
 		s := dagAt(depth)
 		return func() error { _, err := Parse(s); return err }
+	})
+
+	// CompareBinary: the comparator's array arm derives the per-item
+	// minimum on the schema's one comparator walk at first compare. The
+	// parse belongs to the caller, so it sits in build, and the compare of
+	// an empty array still runs the whole derivation.
+	wantEveryMagnitudeTerminates(t, cell, "CompareBinary", func(depth int) func() error {
+		s := MustParse(dagAt(depth))
+		return func() error {
+			_, _, _, err := s.CompareBinary([]byte{0}, []byte{0})
+			return err
+		}
 	})
 }
 
@@ -9867,6 +9883,15 @@ func TestInvariant_WideCyclicWalkReachesEveryEntryPoint(t *testing.T) {
 		w := MustParse(`{"type":"record","name":"T","fields":[{"name":"x","type":` + s + `},{"name":"y","type":"int"}]}`)
 		r := MustParse(`{"type":"record","name":"T","fields":[{"name":"y","type":"int"}]}`)
 		return func() error { _, err := Resolve(w, r); return err }
+	})
+	// The binary comparator's array arm derives the same bound on the
+	// schema's comparator walk at first compare.
+	wantEveryMagnitudeTerminates(t, cell, "CompareBinary/wide-scc", func(width int) func() error {
+		s := MustParse(at(width))
+		return func() error {
+			_, _, _, err := s.CompareBinary([]byte{0}, []byte{0})
+			return err
+		}
 	})
 	// ocf-header: the executable cell lives in ocf/dos_battery_test.go
 	// (package avro cannot import ocf); this pins the parse that reaches it.
@@ -10671,6 +10696,21 @@ var minBytesConstructionSites = []minBytesConstructionSite{
 			drive: func(n int) error {
 				var c SchemaCache
 				_, err := c.Parse(nContainersOverWiredSCC(n, reachLevels))
+				return err
+			}}}},
+
+	{file: "compare.go", context: "buildCmp(s.node, newMinBytesWalk())",
+		scope: "the schema's compiled comparator, built once on first CompareBinary and shared across " +
+			"every record and container comparator that compiles lazily at compare time — the same " +
+			"shape as the parse's skipWalk, one phase of its own",
+		factors: []reachFactor{{name: "records compiled per schema (lazy, at first compare)", values: reachCounts,
+			drive: func(n int) error {
+				s, err := Parse(nRecordsOverSCC(n, reachLevels))
+				if err != nil {
+					return err
+				}
+				wire := nRecordsOverSCCWire(n, reachLevels)
+				_, _, _, err = s.CompareBinary(wire, wire)
 				return err
 			}}}},
 

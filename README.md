@@ -28,6 +28,7 @@ For the "why" of this project, see the [Why](#why) section.
 - [Object Container Files](#object-container-files)
 - [JSON Encoding](#json-encoding)
 - [Single Object Encoding](#single-object-encoding)
+- [Binary Comparison](#binary-comparison)
 - [Fingerprinting](#fingerprinting)
 - [Errors](#errors)
 - [Performance](#performance)
@@ -683,6 +684,27 @@ schema := registry.Lookup(fp) // your schema registry
 _, err = schema.Decode(payload, &user)
 ```
 
+## Binary Comparison
+
+`CompareBinary` orders two Avro binary values against the schema's sort
+order — the Avro specification's rules, including record field `ascending`,
+`descending`, and `ignore` — without decoding either value into a Go value.
+It suits a sort or merge service that already holds encoded keys. Exactly
+one value is read from each buffer; trailing bytes are returned, not an
+error.
+
+```go
+order, restA, restB, err := schema.CompareBinary(a, b)
+// order is -1, 0, or +1; restA/restB are the unread tails of a and b.
+```
+
+Maps have no defined order: a schema whose comparison would consult a map
+fails with `ErrNotComparable`, while a map under an `ignore`-ordered field
+is skipped like any other ignored value. Corrupt input (truncation, a
+length that overruns the buffer, an out-of-range union or enum index,
+excessive nesting) returns the error instead of an order. Ignored fields
+are skipped in place, so an ignored megabyte blob costs no allocation.
+
 ## Fingerprinting
 
 `Canonical` returns the [Parsing Canonical Form](https://avro.apache.org/docs/current/specification/#parsing-canonical-form-for-schemas)
@@ -709,6 +731,8 @@ Encode and decode errors can be inspected with `errors.As`:
 - **`*ShortBufferError`**: input truncated mid-value.
 - **`*CompatibilityError`**: schema evolution incompatibility (from `Resolve`
   or `CheckCompatibility`).
+- **`ErrNotComparable`**: the schema has no defined sort order (a map in a
+  compared position), from `CompareBinary`.
 
 ## Performance
 

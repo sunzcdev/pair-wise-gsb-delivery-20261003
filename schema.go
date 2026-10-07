@@ -67,6 +67,14 @@ type Schema struct {
 	// passes a nil slab, so scalar decodes stay allocation-free even when GC
 	// has drained the pool. false is the safe default.
 	slabFree bool
+
+	// cmpOnce/cmp/cmpErr cache the compiled binary comparator, built on
+	// first CompareBinary rather than at parse, the same reason soe hashing
+	// is deferred: most schemas are never compared. A schema holding a map
+	// in a compared position caches the build error in cmpErr.
+	cmpOnce sync.Once
+	cmp     cmpfn
+	cmpErr  error
 }
 
 // customWiring bundles the per-node custom-type artifacts. We allocate one
@@ -164,6 +172,11 @@ type fieldNode struct {
 	node       *schemaNode
 	defaultVal any
 	hasDefault bool
+	// order is the field's sort order: "ascending" (also the zero value,
+	// the spec default), "descending", or "ignore". Parse validates any
+	// written value against exactly these three spellings. Only the binary
+	// comparator (compare.go) consults it.
+	order string
 }
 
 type parseOptLax struct{ fn func(string) error }
@@ -2695,6 +2708,7 @@ func (b *builder) buildRecord(o *aobject) error {
 			nameVal: reflect.ValueOf(of.Name),
 			aliases: fieldAliases[i],
 			node:    bf.node,
+			order:   of.Order,
 		}
 		if isFwdRef {
 			fix := recordFieldFixup{
