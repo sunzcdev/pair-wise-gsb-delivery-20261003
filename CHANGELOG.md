@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added `NewConstraintWithPositions`, a position-aware constraint parser that
+  returns original-input byte ranges for every comparison and structured
+  `ConstraintDiagnostic` values (kind, branch, span) for parse failures. It
+  preserves `NewConstraint`, `Check`, and `String` behavior; hyphen ranges are
+  reported using the user-written range rather than the synthesized
+  `>=`/`<=` operators.
+
 ## 3.4.0 (2025-06-27)
 
 ### Added

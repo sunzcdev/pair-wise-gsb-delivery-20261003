@@ -8,6 +8,9 @@ Specifically it provides the ability to:
   - Check if a semantic version fits within a set of constraints
   - Optionally work with a `v` prefix
 
+Position-aware parsing is available via NewConstraintWithPositions, which
+returns byte ranges and structured diagnostics for editor tooling.
+
 # Parsing Semantic Versions
 
 There are two functions that can parse semantic versions. The `StrictNewVersion`
