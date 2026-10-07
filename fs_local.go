@@ -2,6 +2,7 @@ package webdav
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/emersion/go-webdav/internal"
 )
@@ -125,29 +127,31 @@ func (fs LocalFileSystem) ReadDir(ctx context.Context, name string, recursive bo
 	return l, errFromOS(err)
 }
 
-func checkConditionalMatches(fi *FileInfo, ifMatch, ifNoneMatch ConditionalMatch) error {
-	etag := ""
-	if fi != nil {
-		etag = fi.ETag
-	}
+// localFSSerial serializes the "validate conditions, then commit" critical
+// sections of LocalFileSystem so that conditional requests are evaluated
+// atomically with respect to one another. Stat-then-write sequences outside
+// of this lock would race: two clients presenting the same stale If-Match
+// tag could otherwise both succeed.
+var localFSSerial sync.Mutex
 
-	if ifMatch.IsSet() {
-		if ok, err := ifMatch.MatchETag(etag); err != nil {
-			return NewHTTPError(http.StatusBadRequest, err)
-		} else if !ok {
-			return NewHTTPError(http.StatusPreconditionFailed, fmt.Errorf("If-Match condition failed"))
+// createTempFile creates a new, uniquely-named file in the same directory
+// as dst with 0666 permissions (subject to the process umask, like
+// os.Create). Staging in the destination directory makes the final rename
+// atomic and same-volume.
+func createTempFile(dir, prefix string) (*os.File, error) {
+	var randBytes [8]byte
+	for attempt := 0; attempt < 100; attempt++ {
+		if _, err := rand.Read(randBytes[:]); err != nil {
+			return nil, err
 		}
-	}
-
-	if ifNoneMatch.IsSet() {
-		if ok, err := ifNoneMatch.MatchETag(etag); err != nil {
-			return NewHTTPError(http.StatusBadRequest, err)
-		} else if ok {
-			return NewHTTPError(http.StatusPreconditionFailed, fmt.Errorf("If-None-Match condition failed"))
+		p := filepath.Join(dir, fmt.Sprintf(".%s%x.tmp", prefix, randBytes[:]))
+		f, err := os.OpenFile(p, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
+		if os.IsExist(err) {
+			continue
 		}
+		return f, err
 	}
-
-	return nil
+	return nil, errors.New("webdav: couldn't create unique temporary file")
 }
 
 func (fs LocalFileSystem) Create(ctx context.Context, name string, body io.ReadCloser, opts *CreateOptions) (fi *FileInfo, created bool, err error) {
@@ -155,34 +159,60 @@ func (fs LocalFileSystem) Create(ctx context.Context, name string, body io.ReadC
 	if err != nil {
 		return nil, false, err
 	}
-	fi, _ = fs.Stat(ctx, name)
-	created = fi == nil
 
-	if err := checkConditionalMatches(fi, opts.IfMatch, opts.IfNoneMatch); err != nil {
-		return nil, false, err
-	}
-
-	wc, err := os.Create(p)
+	// Stage the payload outside the commit critical section. A failing
+	// condition never truncates the destination and leaves no resource
+	// behind at the target path; the staging file is cleaned up on error.
+	dir := filepath.Dir(p)
+	tmp, err := createTempFile(dir, filepath.Base(p)+".")
 	if err != nil {
 		return nil, false, errFromOS(err)
 	}
-	defer wc.Close()
+	tmpPath := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmpPath)
+		}
+	}()
 
-	if _, err := io.Copy(wc, body); err != nil {
-		os.Remove(p)
+	if _, err := io.Copy(tmp, body); err != nil {
+		tmp.Close()
 		return nil, false, err
 	}
-	if err := wc.Close(); err != nil {
-		os.Remove(p)
+	if err := tmp.Close(); err != nil {
 		return nil, false, err
 	}
+
+	localFSSerial.Lock()
+	defer localFSSerial.Unlock()
+
+	current, statErr := os.Stat(p)
+	exists := statErr == nil
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return nil, false, errFromOS(statErr)
+	}
+
+	if opts != nil {
+		var currentET ETag
+		if exists {
+			currentET = ETag{OpaqueTag: fileInfoFromOS(name, current).ETag}
+		}
+		if err := opts.ConditionalPut.Check(currentET, exists); err != nil {
+			return nil, false, err
+		}
+	}
+
+	if err := os.Rename(tmpPath, p); err != nil {
+		return nil, false, errFromOS(err)
+	}
+	committed = true
 
 	fi, err = fs.Stat(ctx, name)
 	if err != nil {
 		return nil, false, err
 	}
-
-	return fi, created, err
+	return fi, !exists, nil
 }
 
 func (fs LocalFileSystem) RemoveAll(ctx context.Context, name string, opts *RemoveAllOptions) error {
@@ -191,15 +221,22 @@ func (fs LocalFileSystem) RemoveAll(ctx context.Context, name string, opts *Remo
 		return err
 	}
 
+	localFSSerial.Lock()
+	defer localFSSerial.Unlock()
+
 	// WebDAV semantics are that it should return a "404 Not Found" error in
-	// case the resource doesn't exist. We need to Stat before RemoveAll.
-	fi, err := fs.Stat(ctx, name)
+	// case the resource doesn't exist. The condition is evaluated against
+	// the same stat snapshot that RemoveAll commits against.
+	current, err := os.Stat(p)
 	if err != nil {
 		return errFromOS(err)
 	}
 
-	if err := checkConditionalMatches(fi, opts.IfMatch, opts.IfNoneMatch); err != nil {
-		return err
+	if opts != nil {
+		currentET := ETag{OpaqueTag: fileInfoFromOS(name, current).ETag}
+		if err := opts.ConditionalPut.Check(currentET, true); err != nil {
+			return err
+		}
 	}
 
 	return errFromOS(os.RemoveAll(p))

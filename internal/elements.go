@@ -385,7 +385,13 @@ type GetETag struct {
 type ETag string
 
 func (etag *ETag) UnmarshalText(b []byte) error {
-	s, err := strconv.Unquote(string(b))
+	s := string(b)
+	// Weak entity-tags use the "W/" prefix defined in RFC 7232. Only the
+	// opaque-tag is stored, matching how server-supplied ETags are exposed.
+	if strings.HasPrefix(s, "W/") || strings.HasPrefix(s, "w/") {
+		s = s[2:]
+	}
+	s, err := strconv.Unquote(s)
 	if err != nil {
 		return fmt.Errorf("webdav: failed to unquote ETag: %v", err)
 	}

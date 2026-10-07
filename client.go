@@ -196,13 +196,24 @@ func (fw *fileWriter) Close() error {
 }
 
 // Create writes a file's contents.
-func (c *Client) Create(ctx context.Context, name string) (io.WriteCloser, error) {
+//
+// If options is non-nil and carries conditional headers, they are sent as
+// If-Match/If-None-Match; the server must evaluate them atomically.
+func (c *Client) Create(ctx context.Context, name string, options *CreateOptions) (io.WriteCloser, error) {
 	pr, pw := io.Pipe()
 
 	req, err := c.ic.NewRequest(http.MethodPut, name, pr)
 	if err != nil {
 		pw.Close()
 		return nil, err
+	}
+	if options != nil {
+		if options.IfMatch.IsSet() {
+			req.Header.Set("If-Match", options.IfMatch.String())
+		}
+		if options.IfNoneMatch.IsSet() {
+			req.Header.Set("If-None-Match", options.IfNoneMatch.String())
+		}
 	}
 
 	done := make(chan error, 1)

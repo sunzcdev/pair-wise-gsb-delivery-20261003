@@ -19,12 +19,7 @@ import (
 
 // TODO if nothing more Caldav-specific needs to be added this should be merged with carddav.PutAddressObjectOptions
 type PutCalendarObjectOptions struct {
-	// IfNoneMatch indicates that the client does not want to overwrite
-	// an existing resource.
-	IfNoneMatch webdav.ConditionalMatch
-	// IfMatch provides the ETag of the resource that the client intends
-	// to overwrite, can be ""
-	IfMatch webdav.ConditionalMatch
+	webdav.ConditionalPut
 }
 
 // Backend is a CalDAV server backend.
@@ -660,13 +655,13 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 }
 
 func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
-	ifNoneMatch := webdav.ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := webdav.ConditionalMatch(r.Header.Get("If-Match"))
-
-	opts := PutCalendarObjectOptions{
-		IfNoneMatch: ifNoneMatch,
-		IfMatch:     ifMatch,
+	// Parse conditions before decoding the (potentially large) iCalendar
+	// payload so that a malformed header is rejected with a 400 response.
+	cond, err := webdav.ParseConditionalPutHeaders(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"))
+	if err != nil {
+		return internal.HTTPErrorf(http.StatusBadRequest, "%v", err)
 	}
+	opts := PutCalendarObjectOptions{ConditionalPut: cond}
 
 	t, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil {
