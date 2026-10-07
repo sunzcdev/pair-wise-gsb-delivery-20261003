@@ -77,6 +77,34 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrAddressMigrationNotPrepared is returned by CommitServerAddress when
+	// no PrepareServerAddress migration has been successfully completed for the
+	// given server on this leader term.
+	ErrAddressMigrationNotPrepared = errors.New("no prepared address migration for server")
+
+	// ErrAddressMigrationMismatch is returned by PrepareServerAddress when the
+	// endpoint contacted at the new address does not identify itself as the
+	// server being migrated. The cluster configuration is left untouched, so the
+	// operation can be retried with a corrected address.
+	ErrAddressMigrationMismatch = errors.New("new address is served by a different server")
+
+	// ErrAddressMigrationStale is returned by CommitServerAddress when the
+	// prepared migration can no longer be safely committed, for example because
+	// the cluster configuration changed since PrepareServerAddress succeeded or
+	// the prepared address is now used by another member. The migration must be
+	// prepared again before it can be committed.
+	ErrAddressMigrationStale = errors.New("prepared address migration is stale")
+
+	// ErrAddressMigrationInProgress is returned when a second migration is
+	// prepared for the same server before the outstanding one is committed or
+	// aborted.
+	ErrAddressMigrationInProgress = errors.New("address migration already in progress for server")
+
+	// ErrProbeUnsupported is returned by PrepareServerAddress when the
+	// configured transport cannot verify the identity of the server at the new
+	// address.
+	ErrProbeUnsupported = errors.New("transport does not support server identity probes")
 )
 
 // Raft implements a Raft node.
@@ -154,6 +182,14 @@ type Raft struct {
 
 	// Used to request the leader to make configuration changes.
 	configurationChangeCh chan *configurationChangeFuture
+
+	// addressMigrationCh is used to request the prepare/commit/abort of a
+	// server address migration (ServerID unchanged, address changes).
+	addressMigrationCh chan *addressMigrationRequest
+
+	// addressProbeCh delivers asynchronous identity probe results back to the
+	// leader main loop.
+	addressProbeCh chan *addressProbeResult
 
 	// Tracks the latest configuration and latest committed configuration from
 	// the log/snapshot.
@@ -578,6 +614,8 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		bootstrapCh:           make(chan *bootstrapFuture),
 		observers:             make(map[uint64]*Observer),
 		leadershipTransferCh:  make(chan *leadershipTransferFuture, 1),
+		addressMigrationCh:    make(chan *addressMigrationRequest),
+		addressProbeCh:        make(chan *addressProbeResult, 16),
 		leaderNotifyCh:        make(chan struct{}, 1),
 		followerNotifyCh:      make(chan struct{}, 1),
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
@@ -1052,6 +1090,127 @@ func (r *Raft) DemoteVoter(id ServerID, prevIndex uint64, timeout time.Duration)
 		serverID:  id,
 		prevIndex: prevIndex,
 	}, timeout)
+}
+
+// PrepareServerAddress verifies that the server currently known by id and
+// oldAddress is also reachable at newAddress, without changing the cluster
+// configuration. The leader opens a read-only identity probe against
+// newAddress: the endpoint must identify itself with the same ServerID and be
+// in the leader's current term. A shadow replication routine is then started
+// against newAddress so the follower can be brought up to date, but it never
+// contributes a vote or replication progress to the cluster.
+//
+// This must be run on the leader. If the endpoint at newAddress belongs to a
+// different server, ErrAddressMigrationMismatch is returned and the cluster is
+// left untouched. Prepared state is term-local: if leadership changes the
+// migration must be prepared again against the new leader.
+//
+// Use CommitServerAddress to switch the official address once the probe
+// succeeds, or AbortServerAddress to release the prepared migration.
+func (r *Raft) PrepareServerAddress(id ServerID, oldAddress, newAddress ServerAddress, timeout time.Duration) Future {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+
+	future := &addressMigrationFuture{}
+	future.init()
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+
+	req := &addressMigrationRequest{
+		phase:      migrationPrepare,
+		serverID:   id,
+		oldAddress: oldAddress,
+		newAddress: newAddress,
+		future:     future,
+	}
+
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case r.addressMigrationCh <- req:
+		return future
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
+}
+
+// CommitServerAddress switches the official cluster address of the server with
+// the given id to newAddress. A successful PrepareServerAddress for the same
+// id and newAddress must have run on this leader term; otherwise
+// ErrAddressMigrationNotPrepared is returned.
+//
+// The commit re-validates that the cluster configuration has not changed since
+// the prepare phase and that newAddress is not used by another member, then
+// appends the standard configuration entry (equivalent to AddVoter with the
+// new address). In-flight replication against the old address is detached so a
+// late AppendEntries response can neither be counted as a second vote nor
+// advance the follower's replication progress. This must be run on the leader.
+func (r *Raft) CommitServerAddress(id ServerID, oldAddress, newAddress ServerAddress, timeout time.Duration) IndexFuture {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+
+	future := &addressMigrationFuture{}
+	future.init()
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+
+	req := &addressMigrationRequest{
+		phase:      migrationCommit,
+		serverID:   id,
+		oldAddress: oldAddress,
+		newAddress: newAddress,
+		future:     future,
+	}
+
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case r.addressMigrationCh <- req:
+		return future
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
+}
+
+// AbortServerAddress discards a prepared address migration for the given
+// server, stopping the shadow replication routine against the prepared
+// address. It is a no-op if no migration is prepared. The cluster
+// configuration is never modified. This must be run on the leader.
+func (r *Raft) AbortServerAddress(id ServerID, timeout time.Duration) Future {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+
+	future := &addressMigrationFuture{}
+	future.init()
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		timer = time.After(timeout)
+	}
+
+	req := &addressMigrationRequest{
+		phase:    migrationAbort,
+		serverID: id,
+		future:   future,
+	}
+
+	select {
+	case <-timer:
+		return errorFuture{ErrEnqueueTimeout}
+	case r.addressMigrationCh <- req:
+		return future
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
 }
 
 // Shutdown is used to stop the Raft background routines.

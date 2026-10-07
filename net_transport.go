@@ -25,6 +25,7 @@ const (
 	rpcInstallSnapshot
 	rpcTimeoutNow
 	rpcRequestPreVote
+	rpcVerifyServer
 
 	// DefaultTimeoutScale is the default TimeoutScale in a NetworkTransport.
 	DefaultTimeoutScale = 256 * 1024 // 256KB
@@ -477,6 +478,24 @@ func (n *NetworkTransport) RequestPreVote(id ServerID, target ServerAddress, arg
 	return n.genericRPC(id, target, rpcRequestPreVote, args, resp)
 }
 
+// VerifyServer implements the WithServerProbe interface.
+func (n *NetworkTransport) VerifyServer(id ServerID, target ServerAddress, args *VerifyServerRequest, resp *VerifyServerResponse) error {
+	return n.genericRPC(id, target, rpcVerifyServer, args, resp)
+}
+
+// EvictPeer implements the WithConnectionPoolEviction interface. It closes and
+// removes any idle pooled connections to the given address.
+func (n *NetworkTransport) EvictPeer(address ServerAddress) {
+	n.connPoolLock.Lock()
+	defer n.connPoolLock.Unlock()
+
+	conns := n.connPool[address]
+	for _, conn := range conns {
+		_ = conn.Release()
+	}
+	delete(n.connPool, address)
+}
+
 // genericRPC handles a simple request/response RPC.
 func (n *NetworkTransport) genericRPC(id ServerID, target ServerAddress, rpcType uint8, args interface{}, resp interface{}) error {
 	// Get a conn
@@ -710,6 +729,13 @@ func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, en
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "TimeoutNow"}}
+	case rpcVerifyServer:
+		var req VerifyServerRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "VerifyServer"}}
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}

@@ -221,3 +221,31 @@ type TimeoutNowResponse struct {
 func (r *TimeoutNowResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
+
+// VerifyServerRequest is a read-only RPC used while migrating a server's
+// address. It asks the responder to identify itself without changing any Raft
+// state (term, leader or logs), so the sender can confirm that a new endpoint
+// belongs to the same ServerID before committing the address change.
+type VerifyServerRequest struct {
+	RPCHeader
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *VerifyServerRequest) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// VerifyServerResponse identifies the server that answered a
+// VerifyServerRequest. Term is the responder's current term, allowing the
+// leader to notice a newer election while the migration was in flight.
+type VerifyServerResponse struct {
+	RPCHeader
+
+	// Newer term if the verifier is out of date.
+	Term uint64
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *VerifyServerResponse) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}

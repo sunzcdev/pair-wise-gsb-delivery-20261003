@@ -90,9 +90,42 @@ type followerReplication struct {
 	// should step down based on information from a follower.
 	stepDown chan struct{}
 
+	// probe marks a shadow replication routine started by
+	// PrepareServerAddress against a not-yet-committed address. Its responses
+	// never advance replication progress, contribute votes, or influence
+	// leadership verification.
+	probe bool
+
+	// detached is set when this routine's address is no longer the official
+	// address of the peer (an address migration has been committed, the peer
+	// was removed, or leadership was lost). All subsequent responses are
+	// ignored. This prevents a late AppendEntries response arriving over an
+	// old connection from being counted as an additional vote or advancing the
+	// follower's match index.
+	detached atomic.Bool
+
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
+}
+
+// reportMatch advances replication progress for the peer unless this routine
+// is a probe or has been detached, in which case the response must be
+// discarded.
+func (s *followerReplication) reportMatch(index uint64) {
+	if s.probe || s.detached.Load() {
+		return
+	}
+	s.commitment.match(s.peer.ID, index)
+}
+
+// reportLeader resolves leadership-verification futures unless this routine is
+// a probe or has been detached.
+func (s *followerReplication) reportLeader(leader bool) {
+	if s.probe || s.detached.Load() {
+		return
+	}
+	s.notifyAll(leader)
 }
 
 // notifyAll is used to notify all the waiting verify futures
@@ -215,6 +248,12 @@ START:
 		}
 	}
 
+	// A detached routine only drains work already in flight; it must not open
+	// new requests against an address that is no longer official.
+	if s.detached.Load() {
+		return true
+	}
+
 	s.peerLock.RLock()
 	peer = s.peer
 	s.peerLock.RUnlock()
@@ -238,6 +277,13 @@ START:
 	// Check for a newer term, stop running
 	if resp.Term > req.Term {
 		r.handleStaleTerm(s)
+		return true
+	}
+
+	// The peer moved address (or this routine is a discarded shadow) while the
+	// RPC was in flight; the response belongs to a stale connection and must
+	// not influence progress, failures or leadership.
+	if s.detached.Load() {
 		return true
 	}
 
@@ -286,7 +332,9 @@ SEND_SNAP:
 	if stop, err := r.sendLatestSnapshot(s); stop {
 		return true
 	} else if err != nil {
-		r.logger.Error("failed to send snapshot to", "peer", peer, "error", err)
+		if !s.detached.Load() {
+			r.logger.Error("failed to send snapshot to", "peer", peer, "error", err)
+		}
 		return
 	}
 
@@ -361,6 +409,11 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 		return true, nil
 	}
 
+	// Discard responses from a routine whose address is no longer official.
+	if s.detached.Load() {
+		return true, nil
+	}
+
 	// Update the last contact
 	s.setLastContact()
 
@@ -368,13 +421,13 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 	if resp.Success {
 		// Update the indexes
 		atomic.StoreUint64(&s.nextIndex, meta.Index+1)
-		s.commitment.match(peer.ID, meta.Index)
+		s.reportMatch(meta.Index)
 
 		// Clear any failures
 		s.failures = 0
 
 		// Notify we are still leader
-		s.notifyAll(true)
+		s.reportLeader(true)
 	} else {
 		s.failures++
 		r.logger.Warn("installSnapshot rejected to", "peer", peer.ID, "id", snapID)
@@ -404,16 +457,26 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			return
 		}
 
+		// Do not keep heartbeating an address that is no longer official.
+		if s.detached.Load() {
+			return
+		}
+
 		s.peerLock.RLock()
 		peer := s.peer
 		s.peerLock.RUnlock()
 
 		start := time.Now()
 		if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+			if s.detached.Load() {
+				return
+			}
 			nextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)
 			r.logger.Error("failed to heartbeat to", "peer", peer.Address, "backoff time",
 				nextBackoffTime, "error", err)
-			r.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})
+			if !s.probe {
+				r.observe(FailedHeartbeatObservation{PeerID: peer.ID, LastContact: s.LastContact()})
+			}
 			failures++
 			select {
 			case <-time.After(nextBackoffTime):
@@ -421,8 +484,13 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 				return
 			}
 		} else {
+			if s.detached.Load() {
+				return
+			}
 			if failures > 0 {
-				r.observe(ResumedHeartbeatObservation{PeerID: peer.ID})
+				if !s.probe {
+					r.observe(ResumedHeartbeatObservation{PeerID: peer.ID})
+				}
 			}
 			s.setLastContact()
 			failures = 0
@@ -434,7 +502,7 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 				metrics.MeasureSince([]string{"raft", "replication", "heartbeat", string(peer.ID)}, start)
 			}
 
-			s.notifyAll(resp.Success)
+			s.reportLeader(resp.Success)
 		}
 	}
 }
@@ -447,6 +515,12 @@ func (r *Raft) pipelineReplicate(s *followerReplication) error {
 	s.peerLock.RLock()
 	peer := s.peer
 	s.peerLock.RUnlock()
+
+	// Do not open a pipeline for a detached or probe routine. Probe routines
+	// stay on the synchronous path so their responses can be filtered simply.
+	if s.detached.Load() || s.probe {
+		return ErrPipelineReplicationNotSupported
+	}
 
 	// Create a new pipeline
 	pipeline, err := r.trans.AppendEntriesPipeline(peer.ID, peer.Address)
@@ -550,6 +624,11 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 				return
 			}
 
+			// Ignore responses from a routine that lost its address.
+			if s.detached.Load() {
+				return
+			}
+
 			// Update the last contact
 			s.setLastContact()
 
@@ -644,8 +723,11 @@ func appendStats(peer string, start time.Time, logs float32, skipLegacy bool) {
 
 // handleStaleTerm is used when a follower indicates that we have a stale term.
 func (r *Raft) handleStaleTerm(s *followerReplication) {
+	if s.detached.Load() {
+		return
+	}
 	r.logger.Error("peer has newer term, stopping replication", "peer", s.peer)
-	s.notifyAll(false) // No longer leader
+	s.reportLeader(false) // No longer leader
 	asyncNotifyCh(s.stepDown)
 }
 
@@ -657,9 +739,9 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
 	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
 		atomic.StoreUint64(&s.nextIndex, last.Index+1)
-		s.commitment.match(s.peer.ID, last.Index)
+		s.reportMatch(last.Index)
 	}
 
 	// Notify still leader
-	s.notifyAll(true)
+	s.reportLeader(true)
 }

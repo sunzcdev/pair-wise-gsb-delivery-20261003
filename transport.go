@@ -88,6 +88,25 @@ type WithClose interface {
 	Close() error
 }
 
+// WithServerProbe is an interface that a transport may provide to verify that
+// an endpoint is served by a particular Raft node before switching the
+// cluster's official address for that ServerID. The RPC must be read-only: the
+// responder reports its identity (RPCHeader.ID) and current term without
+// changing its term, leader or log state.
+type WithServerProbe interface {
+	// VerifyServer sends a read-only identity probe to the target address.
+	VerifyServer(id ServerID, target ServerAddress, args *VerifyServerRequest, resp *VerifyServerResponse) error
+}
+
+// WithConnectionPoolEviction is an interface that a connection-pooling
+// transport may provide. EvictPeer closes any idle pooled connections
+// associated with the given address so that subsequent RPCs dial the current
+// endpoint. This is used after an address migration is committed to avoid
+// reusing a stale connection to the previous endpoint.
+type WithConnectionPoolEviction interface {
+	EvictPeer(address ServerAddress)
+}
+
 // LoopbackTransport is an interface that provides a loopback transport suitable for testing
 // e.g. InmemTransport. It's there so we don't have to rewrite tests.
 type LoopbackTransport interface {

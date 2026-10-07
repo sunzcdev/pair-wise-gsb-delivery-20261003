@@ -95,6 +95,14 @@ type leaderState struct {
 	replState                    map[ServerID]*followerReplication
 	notify                       map[*verifyFuture]struct{}
 	stepDown                     chan struct{}
+
+	// migrations holds address migrations prepared on this leader term that
+	// have not been committed or aborted yet, keyed by migrating ServerID.
+	migrations map[ServerID]*addressMigration
+
+	// replicationHints seeds the nextIndex of a freshly created replication
+	// routine with the progress of the prepare-phase shadow routine.
+	replicationHints map[ServerID]uint64
 }
 
 // setLeader is used to modify the current leader Address and ID of the cluster
@@ -175,6 +183,17 @@ func (r *Raft) runFollower() {
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
+
+		case m := <-r.addressMigrationCh:
+			r.mainThreadSaturation.working()
+			// Reject any operations since we are not the leader
+			m.future.respond(ErrNotLeader)
+
+		case result := <-r.addressProbeCh:
+			r.mainThreadSaturation.working()
+			// A probe started by a term in which we were leader but we are
+			// no longer the leader; its result is discarded.
+			result.req.future.respond(ErrNotLeader)
 
 		case a := <-r.applyCh:
 			r.mainThreadSaturation.working()
@@ -389,6 +408,17 @@ func (r *Raft) runCandidate() {
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
+		case m := <-r.addressMigrationCh:
+			r.mainThreadSaturation.working()
+			// Reject any operations since we are not the leader
+			m.future.respond(ErrNotLeader)
+
+		case result := <-r.addressProbeCh:
+			r.mainThreadSaturation.working()
+			// Probe results are only meaningful on the leader that issued
+			// them; discard them while campaigning.
+			result.req.future.respond(ErrNotLeader)
+
 		case a := <-r.applyCh:
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
@@ -462,6 +492,8 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
 	r.leaderState.stepDown = make(chan struct{}, 1)
+	r.leaderState.migrations = make(map[ServerID]*addressMigration)
+	r.leaderState.replicationHints = make(map[ServerID]uint64)
 }
 
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
@@ -515,6 +547,20 @@ func (r *Raft) runLeader() {
 			close(p.stopCh)
 		}
 
+		// Stop any prepare-phase shadow replication and fail outstanding
+		// migration prepares; they are scoped to this leader term and must be
+		// prepared again against the new leader.
+		r.stopAllMigrationShadows()
+
+		// Drain any identity probe result already buffered so its goroutine
+		// does not block on the leader-only result channel. Probes that finish
+		// later select on shutdownCh (or are discarded when a new term starts).
+		select {
+		case result := <-r.addressProbeCh:
+			result.req.future.respond(ErrLeadershipLost)
+		default:
+		}
+
 		// Respond to all inflight operations
 		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
 			e.Value.(*logFuture).respond(ErrLeadershipLost)
@@ -532,6 +578,7 @@ func (r *Raft) runLeader() {
 		r.leaderState.replState = nil
 		r.leaderState.notify = nil
 		r.leaderState.stepDown = nil
+		r.leaderState.replicationHints = nil
 
 		// If we are stepping down for some reason, no known leader.
 		// We may have stepped down due to an RPC call, which would
@@ -595,6 +642,11 @@ func (r *Raft) startStopReplication() {
 		s, ok := r.leaderState.replState[server.ID]
 		if !ok {
 			r.logger.Info("added peer, starting replication", "peer", server.ID)
+			nextIndex := lastIdx + 1
+			if hint, ok := r.leaderState.replicationHints[server.ID]; ok {
+				nextIndex = hint
+				delete(r.leaderState.replicationHints, server.ID)
+			}
 			s = &followerReplication{
 				peer:                server,
 				commitment:          r.leaderState.commitment,
@@ -602,7 +654,7 @@ func (r *Raft) startStopReplication() {
 				triggerCh:           make(chan struct{}, 1),
 				triggerDeferErrorCh: make(chan *deferError, 1),
 				currentTerm:         r.getCurrentTerm(),
-				nextIndex:           lastIdx + 1,
+				nextIndex:           nextIndex,
 				lastContact:         time.Now(),
 				notify:              make(map[*verifyFuture]struct{}),
 				notifyCh:            make(chan struct{}, 1),
@@ -659,6 +711,18 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 	if r.configurations.latestIndex == r.configurations.committedIndex &&
 		r.getCommitIndex() >= r.leaderState.commitment.startIndex {
 		return r.configurationChangeCh
+	}
+	return nil
+}
+
+// addressMigrationChIfStable returns r.addressMigrationCh when the cluster
+// configuration is stable, mirroring configurationChangeChIfStable: a
+// prepare or commit must not race an uncommitted configuration entry. This
+// must only be called from the main thread.
+func (r *Raft) addressMigrationChIfStable() chan *addressMigrationRequest {
+	if r.configurations.latestIndex == r.configurations.committedIndex &&
+		r.getCommitIndex() >= r.leaderState.commitment.startIndex {
+		return r.addressMigrationCh
 	}
 	return nil
 }
@@ -898,6 +962,26 @@ func (r *Raft) leaderLoop() {
 				continue
 			}
 			r.appendConfigurationEntry(future)
+
+		case request := <-r.addressMigrationChIfStable():
+			r.mainThreadSaturation.working()
+			if r.getLeadershipTransferInProgress() {
+				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
+				request.future.respond(ErrLeadershipTransferInProgress)
+				continue
+			}
+			switch request.phase {
+			case migrationPrepare:
+				r.prepareServerAddress(request)
+			case migrationCommit:
+				r.commitServerAddress(request)
+			case migrationAbort:
+				r.abortServerAddress(request)
+			}
+
+		case result := <-r.addressProbeCh:
+			r.mainThreadSaturation.working()
+			r.handleAddressProbe(result)
 
 		case b := <-r.bootstrapCh:
 			r.mainThreadSaturation.working()
@@ -1422,12 +1506,27 @@ func (r *Raft) processRPC(rpc RPC) {
 		r.installSnapshot(rpc, cmd)
 	case *TimeoutNowRequest:
 		r.timeoutNow(rpc, cmd)
+	case *VerifyServerRequest:
+		r.verifyServer(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
 			"command", hclog.Fmt("%#v", rpc.Command))
 
 		rpc.Respond(nil, errors.New(rpcUnexpectedCommandError))
 	}
+}
+
+// verifyServer handles a read-only identity probe used during address
+// migration. It never mutates Raft state: the responder reports its ServerID
+// and current term so the leader can confirm the endpoint is the expected
+// server without altering terms, leadership or logs. This must only be called
+// from the main thread.
+func (r *Raft) verifyServer(rpc RPC, v *VerifyServerRequest) {
+	resp := &VerifyServerResponse{
+		RPCHeader: r.getRPCHeader(),
+		Term:      r.getCurrentTerm(),
+	}
+	rpc.Respond(resp, nil)
 }
 
 // processHeartbeat is a special handler used just for heartbeat requests
