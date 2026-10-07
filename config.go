@@ -118,6 +118,20 @@ type Config struct {
 	// usage.
 	PushPullInterval time.Duration
 
+	// DeltaSyncMaxRounds bounds the number of digest/request negotiation
+	// rounds performed in each direction of an incremental push/pull. It
+	// only takes effect when the configured Delegate implements the
+	// optional DeltaDelegate interface; other delegates keep using the
+	// classic full-state push/pull. A value of zero uses a sensible
+	// default.
+	DeltaSyncMaxRounds int
+
+	// DeltaSyncMaxBytes bounds the total number of application payload
+	// bytes (digests, requests, changes and full snapshots) exchanged in
+	// both directions during a single incremental push/pull. A value of
+	// zero defaults to the same limit a classic push/pull enforces.
+	DeltaSyncMaxBytes int
+
 	// ProbeInterval and ProbeTimeout are used to configure probing
 	// behavior for memberlist.
 	//

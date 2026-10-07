@@ -64,6 +64,7 @@ const (
 	nackRespMsg
 	hasCrcMsg
 	errMsg
+	deltaSyncMsg
 )
 
 const (
