@@ -23,6 +23,7 @@
 package smux
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -73,6 +74,9 @@ var (
 	ErrGoAway                    = errors.New("stream id overflows, should start a new connection")
 	ErrTimeout         net.Error = &timeoutError{}
 	ErrWouldBlock                = errors.New("operation would block on IO")
+	// errFrameCanceled is delivered by sendLoop for a frame whose submission
+	// was withdrawn by OpenStreamContext before it reached the wire.
+	errFrameCanceled = errors.New("frame write canceled")
 )
 
 // writeRequest represents a request to write a frame
@@ -81,6 +85,59 @@ type writeRequest struct {
 	frame  Frame
 	seq    uint32
 	result chan writeResult
+	cancel *frameCancel // optional cancellation coordination (SYN frames)
+}
+
+// frameCancel coordinates cancellation of a single frame between the caller
+// and the sendLoop. The lifecycle is:
+//
+//	queued  - waiting in the shaper queue, the frame has not touched the wire
+//	writing - sendLoop is about to call Write, so the frame is committed
+//
+// A frame is considered committed as soon as sendLoop transitions the state
+// to "writing"; at that point the Write may complete even if the caller no
+// longer waits for the result.
+type frameCancel struct {
+	mu    sync.Mutex
+	state frameState
+}
+
+type frameState int
+
+const (
+	frameQueued frameState = iota
+	frameWriting
+	frameWithdrawn
+)
+
+// newFrameCancel creates the cancellation coordinator for one frame.
+func newFrameCancel() *frameCancel {
+	return &frameCancel{state: frameQueued}
+}
+
+// beginWrite is invoked by sendLoop right before writing the frame.
+// It reports true when the frame was withdrawn while still queued, in which
+// case the Write must be skipped.
+func (fc *frameCancel) beginWrite() (withdrawn bool) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.state == frameWithdrawn {
+		return true
+	}
+	fc.state = frameWriting
+	return false
+}
+
+// tryWithdraw attempts to remove a queued frame before it reaches the wire.
+// It reports true when the frame is guaranteed not to have been written.
+func (fc *frameCancel) tryWithdraw() bool {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.state != frameQueued {
+		return false
+	}
+	fc.state = frameWithdrawn
+	return true
 }
 
 // writeResult represents the result of a write request
@@ -167,28 +224,10 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
-	if s.IsClosed() {
-		return nil, io.ErrClosedPipe
+	sid, err := s.allocStreamID()
+	if err != nil {
+		return nil, err
 	}
-
-	// generate stream id
-	s.nextStreamIDLock.Lock()
-	if s.goAway > 0 {
-		s.nextStreamIDLock.Unlock()
-		return nil, ErrGoAway
-	}
-
-	// check for stream id overflow
-	if s.nextStreamID+2 < s.nextStreamID {
-		s.goAway = 1
-		s.nextStreamIDLock.Unlock()
-		return nil, ErrGoAway
-	}
-
-	// allocate next stream id
-	s.nextStreamID += 2
-	sid := s.nextStreamID
-	s.nextStreamIDLock.Unlock()
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
@@ -216,6 +255,136 @@ func (s *Session) OpenStream() (*Stream, error) {
 		*/
 		return wrapper, nil
 	}
+}
+
+// OpenStreamContext is used to create a new stream. It behaves like
+// OpenStream but abandons the open request when ctx is canceled before the
+// stream is returned to the caller.
+//
+// The cancellation point matters:
+//
+//   - If the SYN frame has not been submitted to the wire, no frame is sent
+//     and no remote stream is created.
+//   - If the SYN frame has been submitted but the stream has not been
+//     returned yet, a FIN frame is sent to release the stream that is now
+//     visible to the peer.
+//   - Once the stream has been returned, ctx is no longer consulted; the
+//     caller owns the returned stream and closes it as usual.
+//
+// A stream identifier is consumed on every attempt and is never reused.
+// The call returns exactly one result: it never returns both a stream and
+// an error.
+func (s *Session) OpenStreamContext(ctx context.Context) (*Stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if s.IsClosed() {
+		return nil, io.ErrClosedPipe
+	}
+
+	sid, err := s.allocStreamID()
+	if err != nil {
+		return nil, err
+	}
+
+	stream := newStream(sid, s.config.MaxFrameSize, s)
+
+	committed, werr := s.writeControlFrameContext(newFrame(byte(s.config.Version), cmdSYN, sid), ctx)
+	if werr != nil {
+		if committed {
+			// The peer has observed the SYN; release the remote stream with
+			// FIN so it does not outlive the abandoned local open request.
+			s.abandonOpenedStream(sid)
+		}
+		if werr == errFrameCanceled {
+			// The SYN was withdrawn before the write; surface the context
+			// or deadline reason that triggered the withdrawal.
+			if e := ctx.Err(); e != nil {
+				werr = e
+			} else {
+				werr = ErrTimeout
+			}
+		}
+		return nil, werr
+	}
+
+	// The SYN is on the wire but the stream has not been returned yet.
+	// A cancellation in this tiny window must still release the remote stream.
+	select {
+	case <-ctx.Done():
+		s.abandonOpenedStream(sid)
+		return nil, ctx.Err()
+	default:
+	}
+
+	select {
+	case <-s.chSocketReadError:
+		s.abandonOpenedStream(sid)
+		return nil, s.socketReadError.Load().(error)
+	case <-s.chSocketWriteError:
+		s.abandonOpenedStream(sid)
+		return nil, s.socketWriteError.Load().(error)
+	case <-s.die:
+		s.abandonOpenedStream(sid)
+		return nil, io.ErrClosedPipe
+	default:
+	}
+
+	s.streamLock.Lock()
+	defer s.streamLock.Unlock()
+	select {
+	case <-s.chSocketReadError:
+		return nil, s.socketReadError.Load().(error)
+	case <-s.chSocketWriteError:
+		return nil, s.socketWriteError.Load().(error)
+	case <-s.die:
+		return nil, io.ErrClosedPipe
+	default:
+		s.streams[sid] = stream
+		wrapper := &Stream{stream: stream}
+		return wrapper, nil
+	}
+}
+
+// allocStreamID reserves the next odd/even stream identifier. Allocated
+// identifiers are never reused, even when the open request is abandoned.
+func (s *Session) allocStreamID() (uint32, error) {
+	if s.IsClosed() {
+		return 0, io.ErrClosedPipe
+	}
+
+	s.nextStreamIDLock.Lock()
+	defer s.nextStreamIDLock.Unlock()
+	if s.goAway > 0 {
+		return 0, ErrGoAway
+	}
+
+	// check for stream id overflow
+	if s.nextStreamID+2 < s.nextStreamID {
+		s.goAway = 1
+		return 0, ErrGoAway
+	}
+
+	// allocate next stream id
+	s.nextStreamID += 2
+	return s.nextStreamID, nil
+}
+
+// abandonOpenedStream releases a stream whose SYN has already been observed
+// by the peer but which was never returned to (or registered for) a local
+// caller. A FIN closes the stream in protocol terms; no local map entry
+// exists, so there is nothing to delete locally.
+func (s *Session) abandonOpenedStream(sid uint32) {
+	f := newFrame(byte(s.config.Version), cmdFIN, sid)
+	// Cleanup runs asynchronously so a blocked writer does not stall the
+	// canceled OpenStreamContext caller. The FIN shares the stream's shaper
+	// queue, hence it is never transmitted ahead of the SYN. If the session
+	// is gone the peer reclaims all streams together with the connection.
+	go func() {
+		if _, err := s.writeControlFrame(f); err != nil {
+			return
+		}
+	}()
 }
 
 // Open returns a generic ReadWriteCloser
@@ -624,6 +793,13 @@ EVENT_LOOP:
 					goto EVENT_LOOP
 				}
 
+				// The frame was withdrawn by its caller while it was still
+				// waiting in the queue, so it never reaches the wire.
+				if request.cancel != nil && request.cancel.beginWrite() {
+					request.result <- writeResult{err: errFrameCanceled}
+					continue
+				}
+
 				buf[0] = request.frame.ver
 				buf[1] = request.frame.cmd
 				binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
@@ -668,6 +844,101 @@ func (s *Session) writeControlFrame(f Frame) (n int, err error) {
 	defer timer.Stop()
 
 	return s.writeFrameInternal(f, timer.C, CLSCTRL)
+}
+
+// writeControlFrameContext submits a control frame while allowing ctx to
+// cancel the submission before the frame reaches the wire. It reports
+// whether the frame was committed to the write phase: a committed frame
+// may already be visible to the peer and therefore requires protocol-level
+// cleanup by the caller on error.
+func (s *Session) writeControlFrameContext(f Frame, ctx context.Context) (committed bool, err error) {
+	timer := time.NewTimer(openCloseTimeout)
+	defer timer.Stop()
+
+	// get result channel from pool
+	resultCh := resultChanPool.Get().(chan writeResult)
+
+	fc := newFrameCancel()
+	req := writeRequest{
+		class:  CLSCTRL,
+		frame:  f,
+		seq:    atomic.AddUint32(&s.requestID, 1),
+		result: resultCh,
+		cancel: fc,
+	}
+
+	// queue the SYN; any of the abort conditions unblocks the submission
+	select {
+	case s.shaper <- req:
+	case <-ctx.Done():
+		committed, err = s.resolveCanceledFrame(fc, resultCh, ctx.Err())
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-timer.C:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, ErrTimeout)
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-s.die:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, io.ErrClosedPipe)
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-s.chSocketWriteError:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, s.socketWriteError.Load().(error))
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	}
+
+	// The frame is queued; wait for the write result or an abort.
+	select {
+	case result := <-resultCh:
+		resultChanPool.Put(resultCh)
+		if result.err == errFrameCanceled {
+			return false, errFrameCanceled
+		}
+		return result.err == nil, result.err
+	case <-ctx.Done():
+		committed, err = s.resolveCanceledFrame(fc, resultCh, ctx.Err())
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-timer.C:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, ErrTimeout)
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-s.die:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, io.ErrClosedPipe)
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	case <-s.chSocketWriteError:
+		committed, err = s.resolveCanceledFrame(fc, resultCh, s.socketWriteError.Load().(error))
+		s.drainAndRecycle(resultCh)
+		return committed, err
+	}
+}
+
+// resolveCanceledFrame determines whether a frame hit the wire when its
+// waiter aborts. If it can be withdrawn from the queue it is guaranteed not
+// to have been written; otherwise the write has reached (or is entering)
+// the write phase and the frame is treated as committed.
+func (s *Session) resolveCanceledFrame(fc *frameCancel, resultCh chan writeResult, err error) (bool, error) {
+	if fc.tryWithdraw() {
+		return false, err
+	}
+	return true, err
+}
+
+// drainAndRecycle waits for the sendLoop result after the waiter has left
+// and returns the result channel to the pool. It is required even for a
+// withdrawn frame, since sendLoop publishes a synthetic result when it
+// encounters one.
+func (s *Session) drainAndRecycle(resultCh chan writeResult) {
+	go func() {
+		select {
+		case <-resultCh:
+			resultChanPool.Put(resultCh)
+		case <-s.die:
+		case <-s.chSocketWriteError:
+		}
+	}()
 }
 
 // internal writeFrame version to support deadline used in keepalive

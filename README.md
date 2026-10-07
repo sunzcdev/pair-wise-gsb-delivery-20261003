@@ -156,6 +156,27 @@ func server() {
 
 ```
 
+### Opening a stream with a context
+
+`OpenStreamContext` opens a stream with a `context.Context`. If the context
+is canceled before the stream is returned, smux abandons the open request:
+
+* If the SYN has not reached the wire, no frame is sent and no remote stream
+  is created.
+* If the SYN is already on its way, a FIN is sent to release the stream the
+  peer has observed.
+* After the stream is returned the context is no longer consulted; close the
+  returned stream as usual.
+
+Stream identifiers are never reused, and a canceled open always returns an
+error without a stream.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+stream, err := session.OpenStreamContext(ctx)
+```
+
 ## Configuration
 
 `smux.Config` allows tuning the session parameters:
