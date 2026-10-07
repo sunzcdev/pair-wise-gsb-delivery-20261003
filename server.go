@@ -17,7 +17,15 @@ type FileSystem interface {
 	Open(ctx context.Context, name string) (io.ReadCloser, error)
 	Stat(ctx context.Context, name string) (*FileInfo, error)
 	ReadDir(ctx context.Context, name string, recursive bool) ([]FileInfo, error)
+	// Create creates or replaces a file. When opts.Conditions is set, the
+	// filesystem must evaluate the If-Match / If-None-Match conditions
+	// atomically with the commit (see webdav.CheckConditionsAtomic). A
+	// filesystem that cannot do so must return an error wrapping
+	// ErrConditionsNotSupported rather than performing a non-atomic
+	// stat-then-write.
 	Create(ctx context.Context, name string, body io.ReadCloser, opts *CreateOptions) (fileInfo *FileInfo, created bool, err error)
+	// RemoveAll deletes a resource. The same atomic-conditions contract as
+	// for Create applies to opts.Conditions.
 	RemoveAll(ctx context.Context, name string, opts *RemoveAllOptions) error
 	Mkdir(ctx context.Context, name string) error
 	Copy(ctx context.Context, name, dest string, options *CopyOptions) (created bool, err error)
@@ -50,6 +58,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func NewHTTPError(statusCode int, cause error) error {
 	return &internal.HTTPError{Code: statusCode, Err: cause}
 }
+
+// HTTPError is an error carrying an HTTP status code.
+type HTTPError = internal.HTTPError
 
 type backend struct {
 	FileSystem FileSystem
@@ -237,15 +248,18 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 }
 
 func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
-	ifNoneMatch := ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := ConditionalMatch(r.Header.Get("If-Match"))
-
-	opts := CreateOptions{
-		IfNoneMatch: ifNoneMatch,
-		IfMatch:     ifMatch,
-	}
-	fi, created, err := b.FileSystem.Create(r.Context(), r.URL.Path, r.Body, &opts)
+	// Parse conditional headers before the backend reads the (potentially
+	// large) request body: malformed headers are rejected up front with 400.
+	conds, err := ParseRequestConditions(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"))
 	if err != nil {
+		return err
+	}
+
+	fi, created, err := b.FileSystem.Create(r.Context(), r.URL.Path, r.Body, &CreateOptions{Conditions: conds})
+	if err != nil {
+		if IsConditionsNotSupported(err) {
+			return NewHTTPError(http.StatusNotImplemented, err)
+		}
 		return err
 	}
 
@@ -269,14 +283,15 @@ func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (b *backend) Delete(r *http.Request) error {
-	ifNoneMatch := ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := ConditionalMatch(r.Header.Get("If-Match"))
-
-	opts := RemoveAllOptions{
-		IfNoneMatch: ifNoneMatch,
-		IfMatch:     ifMatch,
+	conds, err := ParseRequestConditions(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"))
+	if err != nil {
+		return err
 	}
-	return b.FileSystem.RemoveAll(r.Context(), r.URL.Path, &opts)
+	err = b.FileSystem.RemoveAll(r.Context(), r.URL.Path, &RemoveAllOptions{Conditions: conds})
+	if IsConditionsNotSupported(err) {
+		return NewHTTPError(http.StatusNotImplemented, err)
+	}
+	return err
 }
 
 func (b *backend) Mkcol(r *http.Request) error {

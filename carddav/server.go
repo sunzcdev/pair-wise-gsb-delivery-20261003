@@ -17,12 +17,10 @@ import (
 )
 
 type PutAddressObjectOptions struct {
-	// IfNoneMatch indicates that the client does not want to overwrite
-	// an existing resource.
-	IfNoneMatch webdav.ConditionalMatch
-	// IfMatch provides the ETag of the resource that the client intends
-	// to overwrite, can be ""
-	IfMatch webdav.ConditionalMatch
+	// Conditions holds the parsed If-Match and If-None-Match headers. The
+	// backend must evaluate them atomically when committing the object; see
+	// webdav.ErrConditionsNotSupported.
+	Conditions webdav.Conditions
 }
 
 // Backend is a CardDAV server backend.
@@ -35,6 +33,12 @@ type Backend interface {
 	GetAddressObject(ctx context.Context, path string, req *AddressDataRequest) (*AddressObject, error)
 	ListAddressObjects(ctx context.Context, path string, req *AddressDataRequest) ([]AddressObject, error)
 	QueryAddressObjects(ctx context.Context, path string, query *AddressBookQuery) ([]AddressObject, error)
+	// PutAddressObject creates or replaces an address object. When
+	// opts.Conditions is set, the backend must evaluate the If-Match /
+	// If-None-Match conditions atomically with the commit (use
+	// webdav.CheckConditionsAtomic). A backend unable to do so must return an
+	// error wrapping webdav.ErrConditionsNotSupported instead of performing a
+	// non-atomic stat-then-write.
 	PutAddressObject(ctx context.Context, path string, card vcard.Card, opts *PutAddressObjectOptions) (*AddressObject, error)
 	DeleteAddressObject(ctx context.Context, path string) error
 
@@ -645,12 +649,11 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 }
 
 func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
-	ifNoneMatch := webdav.ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := webdav.ConditionalMatch(r.Header.Get("If-Match"))
-
-	opts := PutAddressObjectOptions{
-		IfNoneMatch: ifNoneMatch,
-		IfMatch:     ifMatch,
+	// Parse conditional headers before decoding the (potentially large)
+	// vCard body: malformed headers are rejected up front with 400.
+	conds, err := webdav.ParseRequestConditions(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"))
+	if err != nil {
+		return err
 	}
 
 	t, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -670,8 +673,11 @@ func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	// TODO: add support for the CARDDAV:no-uid-conflict error
-	ao, err := b.Backend.PutAddressObject(r.Context(), r.URL.Path, card, &opts)
+	ao, err := b.Backend.PutAddressObject(r.Context(), r.URL.Path, card, &PutAddressObjectOptions{Conditions: conds})
 	if err != nil {
+		if webdav.IsConditionsNotSupported(err) {
+			return webdav.NewHTTPError(http.StatusNotImplemented, err)
+		}
 		return err
 	}
 	if ao.ETag != "" {

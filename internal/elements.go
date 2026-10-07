@@ -385,11 +385,21 @@ type GetETag struct {
 type ETag string
 
 func (etag *ETag) UnmarshalText(b []byte) error {
-	s, err := strconv.Unquote(string(b))
+	s := string(b)
+	weak := false
+	if strings.HasPrefix(s, "W/") || strings.HasPrefix(s, "w/") {
+		weak = true
+		s = s[2:]
+	}
+	unquoted, err := strconv.Unquote(s)
 	if err != nil {
 		return fmt.Errorf("webdav: failed to unquote ETag: %v", err)
 	}
-	*etag = ETag(s)
+	if weak {
+		*etag = ETag("W/" + unquoted)
+	} else {
+		*etag = ETag(unquoted)
+	}
 	return nil
 }
 
@@ -398,7 +408,11 @@ func (etag ETag) MarshalText() ([]byte, error) {
 }
 
 func (etag ETag) String() string {
-	return fmt.Sprintf("%q", string(etag))
+	s := string(etag)
+	if weak := strings.HasPrefix(s, "W/"); weak {
+		return "W/" + strconv.Quote(s[2:])
+	}
+	return strconv.Quote(s)
 }
 
 // https://tools.ietf.org/html/rfc4918#section-14.5

@@ -384,9 +384,14 @@ func (c *Client) GetAddressObject(ctx context.Context, path string) (*AddressObj
 	return ao, nil
 }
 
-func (c *Client) PutAddressObject(ctx context.Context, path string, card vcard.Card) (*AddressObject, error) {
-	// TODO: add support for If-None-Match and If-Match
+// PutAddressObjectClientOptions holds options for Client.PutAddressObject.
+type PutAddressObjectClientOptions struct {
+	// Conditions sends If-Match/If-None-Match headers. The server evaluates
+	// them atomically when committing the object.
+	Conditions webdav.Conditions
+}
 
+func (c *Client) PutAddressObject(ctx context.Context, path string, card vcard.Card, opts *PutAddressObjectClientOptions) (*AddressObject, error) {
 	// TODO: some servers want a Content-Length header, so we can't stream the
 	// request body here. See the Radicale issue:
 	// https://github.com/Kozea/Radicale/issues/1016
@@ -408,6 +413,14 @@ func (c *Client) PutAddressObject(ctx context.Context, path string, card vcard.C
 		return nil, err
 	}
 	req.Header.Set("Content-Type", vcard.MIMEType)
+	if opts != nil {
+		if v := opts.Conditions.IfMatch.String(); v != "" {
+			req.Header.Set("If-Match", v)
+		}
+		if v := opts.Conditions.IfNoneMatch.String(); v != "" {
+			req.Header.Set("If-None-Match", v)
+		}
+	}
 
 	resp, err := c.ic.Do(req.WithContext(ctx))
 	if err != nil {

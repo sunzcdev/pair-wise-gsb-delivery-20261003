@@ -432,9 +432,14 @@ func (c *Client) GetCalendarObject(ctx context.Context, path string) (*CalendarO
 	return co, nil
 }
 
-func (c *Client) PutCalendarObject(ctx context.Context, path string, cal *ical.Calendar) (*CalendarObject, error) {
-	// TODO: add support for If-None-Match and If-Match
+// PutCalendarObjectClientOptions holds options for Client.PutCalendarObject.
+type PutCalendarObjectClientOptions struct {
+	// Conditions sends If-Match/If-None-Match headers. The server evaluates
+	// them atomically when committing the object.
+	Conditions webdav.Conditions
+}
 
+func (c *Client) PutCalendarObject(ctx context.Context, path string, cal *ical.Calendar, opts *PutCalendarObjectClientOptions) (*CalendarObject, error) {
 	// TODO: some servers want a Content-Length header, so we can't stream the
 	// request body here. See the Radicale issue:
 	// https://github.com/Kozea/Radicale/issues/1016
@@ -449,6 +454,14 @@ func (c *Client) PutCalendarObject(ctx context.Context, path string, cal *ical.C
 		return nil, err
 	}
 	req.Header.Set("Content-Type", ical.MIMEType)
+	if opts != nil {
+		if v := opts.Conditions.IfMatch.String(); v != "" {
+			req.Header.Set("If-Match", v)
+		}
+		if v := opts.Conditions.IfNoneMatch.String(); v != "" {
+			req.Header.Set("If-None-Match", v)
+		}
+	}
 
 	resp, err := c.ic.Do(req.WithContext(ctx))
 	if err != nil {

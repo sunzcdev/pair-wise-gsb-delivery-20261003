@@ -125,64 +125,93 @@ func (fs LocalFileSystem) ReadDir(ctx context.Context, name string, recursive bo
 	return l, errFromOS(err)
 }
 
-func checkConditionalMatches(fi *FileInfo, ifMatch, ifNoneMatch ConditionalMatch) error {
-	etag := ""
-	if fi != nil {
-		etag = fi.ETag
-	}
-
-	if ifMatch.IsSet() {
-		if ok, err := ifMatch.MatchETag(etag); err != nil {
-			return NewHTTPError(http.StatusBadRequest, err)
-		} else if !ok {
-			return NewHTTPError(http.StatusPreconditionFailed, fmt.Errorf("If-Match condition failed"))
-		}
-	}
-
-	if ifNoneMatch.IsSet() {
-		if ok, err := ifNoneMatch.MatchETag(etag); err != nil {
-			return NewHTTPError(http.StatusBadRequest, err)
-		} else if ok {
-			return NewHTTPError(http.StatusPreconditionFailed, fmt.Errorf("If-None-Match condition failed"))
-		}
-	}
-
-	return nil
-}
-
 func (fs LocalFileSystem) Create(ctx context.Context, name string, body io.ReadCloser, opts *CreateOptions) (fi *FileInfo, created bool, err error) {
 	p, err := fs.localPath(name)
 	if err != nil {
 		return nil, false, err
 	}
-	fi, _ = fs.Stat(ctx, name)
-	created = fi == nil
 
-	if err := checkConditionalMatches(fi, opts.IfMatch, opts.IfNoneMatch); err != nil {
+	conds := Conditions{}
+	if opts != nil {
+		conds = opts.Conditions
+	}
+
+	// Hold a cross-process lock for the whole stat/check/commit sequence so
+	// the conditional evaluation is atomic: two concurrent writers using the
+	// same old ETag cannot both observe the old state and overwrite each
+	// other. The lock lives outside the served tree.
+	lock, err := lockPath(p)
+	if err != nil {
+		return nil, false, err
+	}
+	defer lock.unlock()
+
+	var currentETag ETag
+	existing, statErr := os.Stat(p)
+	switch {
+	case statErr == nil:
+		if existing.IsDir() {
+			return nil, false, NewHTTPError(http.StatusConflict, os.ErrExist)
+		}
+		currentETag, err = ParseETag(fileInfoFromOS(name, existing).ETag)
+		if err != nil {
+			return nil, false, err
+		}
+	case os.IsNotExist(statErr):
+		// resource doesn't exist, conditions are evaluated with exists=false
+	default:
+		return nil, false, errFromOS(statErr)
+	}
+
+	if err := CheckConditionsAtomic(conds, statErr == nil, currentETag); err != nil {
 		return nil, false, err
 	}
 
-	wc, err := os.Create(p)
+	// Write to a sibling temporary file first and only rename it into place
+	// once the whole body is persisted: a failed or rejected request never
+	// leaves a partial (or any newly created) resource behind.
+	tmp, err := os.CreateTemp(filepath.Dir(p), ".webdav-tmp-*")
 	if err != nil {
 		return nil, false, errFromOS(err)
 	}
-	defer wc.Close()
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
 
-	if _, err := io.Copy(wc, body); err != nil {
-		os.Remove(p)
+	if statErr == nil {
+		if err := tmp.Chmod(existing.Mode()); err != nil {
+			return nil, false, errFromOS(err)
+		}
+	} else {
+		// New files default to 0644 (readable), matching the mode os.Create
+		// would typically produce with a 022 umask.
+		if err := tmp.Chmod(0644); err != nil {
+			return nil, false, errFromOS(err)
+		}
+	}
+
+	if _, err := io.Copy(tmp, body); err != nil {
 		return nil, false, err
 	}
-	if err := wc.Close(); err != nil {
-		os.Remove(p)
-		return nil, false, err
+	if err := tmp.Close(); err != nil {
+		return nil, false, errFromOS(err)
 	}
+
+	if err := os.Rename(tmpName, p); err != nil {
+		return nil, false, errFromOS(err)
+	}
+	cleanup = false
 
 	fi, err = fs.Stat(ctx, name)
 	if err != nil {
 		return nil, false, err
 	}
-
-	return fi, created, err
+	return fi, os.IsNotExist(statErr), nil
 }
 
 func (fs LocalFileSystem) RemoveAll(ctx context.Context, name string, opts *RemoveAllOptions) error {
@@ -191,15 +220,40 @@ func (fs LocalFileSystem) RemoveAll(ctx context.Context, name string, opts *Remo
 		return err
 	}
 
-	// WebDAV semantics are that it should return a "404 Not Found" error in
-	// case the resource doesn't exist. We need to Stat before RemoveAll.
-	fi, err := fs.Stat(ctx, name)
-	if err != nil {
-		return errFromOS(err)
+	conds := Conditions{}
+	if opts != nil {
+		conds = opts.Conditions
 	}
 
-	if err := checkConditionalMatches(fi, opts.IfMatch, opts.IfNoneMatch); err != nil {
+	lock, err := lockPath(p)
+	if err != nil {
 		return err
+	}
+	defer lock.unlock()
+
+	// WebDAV semantics are that it should return a "404 Not Found" error in
+	// case the resource doesn't exist. Stat and evaluate conditions while
+	// holding the lock, then remove, so the check is atomic.
+	existing, statErr := os.Stat(p)
+	switch {
+	case statErr == nil:
+		var currentETag ETag
+		if !existing.IsDir() {
+			currentETag, err = ParseETag(fileInfoFromOS(name, existing).ETag)
+			if err != nil {
+				return err
+			}
+		}
+		if err := CheckConditionsAtomic(conds, true, currentETag); err != nil {
+			return err
+		}
+	case os.IsNotExist(statErr):
+		if err := CheckConditionsAtomic(conds, false, ETag{}); err != nil {
+			return err
+		}
+		return NewHTTPError(http.StatusNotFound, os.ErrNotExist)
+	default:
+		return errFromOS(statErr)
 	}
 
 	return errFromOS(os.RemoveAll(p))

@@ -17,14 +17,11 @@ import (
 	"github.com/emersion/go-webdav/internal"
 )
 
-// TODO if nothing more Caldav-specific needs to be added this should be merged with carddav.PutAddressObjectOptions
 type PutCalendarObjectOptions struct {
-	// IfNoneMatch indicates that the client does not want to overwrite
-	// an existing resource.
-	IfNoneMatch webdav.ConditionalMatch
-	// IfMatch provides the ETag of the resource that the client intends
-	// to overwrite, can be ""
-	IfMatch webdav.ConditionalMatch
+	// Conditions holds the parsed If-Match and If-None-Match headers. The
+	// backend must evaluate them atomically when committing the object; see
+	// webdav.ErrConditionsNotSupported.
+	Conditions webdav.Conditions
 }
 
 // Backend is a CalDAV server backend.
@@ -38,6 +35,12 @@ type Backend interface {
 	GetCalendarObject(ctx context.Context, path string, req *CalendarCompRequest) (*CalendarObject, error)
 	ListCalendarObjects(ctx context.Context, path string, req *CalendarCompRequest) ([]CalendarObject, error)
 	QueryCalendarObjects(ctx context.Context, path string, query *CalendarQuery) ([]CalendarObject, error)
+	// PutCalendarObject creates or replaces a calendar object. When
+	// opts.Conditions is set, the backend must evaluate the If-Match /
+	// If-None-Match conditions atomically with the commit (use
+	// webdav.CheckConditionsAtomic). A backend unable to do so must return an
+	// error wrapping webdav.ErrConditionsNotSupported instead of performing a
+	// non-atomic stat-then-write.
 	PutCalendarObject(ctx context.Context, path string, calendar *ical.Calendar, opts *PutCalendarObjectOptions) (*CalendarObject, error)
 	DeleteCalendarObject(ctx context.Context, path string) error
 
@@ -660,12 +663,11 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 }
 
 func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
-	ifNoneMatch := webdav.ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := webdav.ConditionalMatch(r.Header.Get("If-Match"))
-
-	opts := PutCalendarObjectOptions{
-		IfNoneMatch: ifNoneMatch,
-		IfMatch:     ifMatch,
+	// Parse conditional headers before decoding the (potentially large)
+	// iCalendar body: malformed headers are rejected up front with 400.
+	conds, err := webdav.ParseRequestConditions(r.Header.Get("If-Match"), r.Header.Get("If-None-Match"))
+	if err != nil {
+		return err
 	}
 
 	t, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -684,8 +686,11 @@ func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
 		return internal.HTTPErrorf(http.StatusBadRequest, "caldav: failed to parse iCalendar: %v", err)
 	}
 
-	co, err := b.Backend.PutCalendarObject(r.Context(), r.URL.Path, cal, &opts)
+	co, err := b.Backend.PutCalendarObject(r.Context(), r.URL.Path, cal, &PutCalendarObjectOptions{Conditions: conds})
 	if err != nil {
+		if webdav.IsConditionsNotSupported(err) {
+			return webdav.NewHTTPError(http.StatusNotImplemented, err)
+		}
 		return err
 	}
 
