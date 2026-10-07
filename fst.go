@@ -16,6 +16,7 @@ package vellum
 
 import (
 	"io"
+	"sync"
 
 	"github.com/bits-and-blooms/bitset"
 )
@@ -31,6 +32,9 @@ type FST struct {
 	typ     int
 	data    []byte
 	decoder decoder
+
+	hashOnce sync.Once
+	hash     []byte
 }
 
 func new(data []byte, f io.Closer) (rv *FST, err error) {
