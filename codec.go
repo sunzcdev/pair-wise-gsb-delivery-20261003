@@ -3,6 +3,7 @@ package rpc2
 import (
 	"bufio"
 	"encoding/gob"
+	"errors"
 	"io"
 	"sync"
 )
@@ -123,3 +124,17 @@ func (c *gobCodec) WriteResponse(r *Response, body interface{}) (err error) {
 func (c *gobCodec) Close() error {
 	return c.rwc.Close()
 }
+
+// CloseWrite shuts down the write side of the underlying connection if it
+// supports it, used for graceful drain.
+func (c *gobCodec) CloseWrite() error {
+	type writeCloser interface {
+		CloseWrite() error
+	}
+	if wc, ok := c.rwc.(writeCloser); ok {
+		return wc.CloseWrite()
+	}
+	return errHalfCloseUnsupported
+}
+
+var errHalfCloseUnsupported = errors.New("rpc2: codec does not support half close")

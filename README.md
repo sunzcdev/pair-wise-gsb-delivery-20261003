@@ -79,3 +79,32 @@ func main() {
 	fmt.Println("add result:", rep)
 }
 ```
+
+Graceful shutdown (Drain)
+-------------------------
+
+`Drain(ctx)` performs a rolling restart friendly shutdown: it first drains
+RPC connections, then closes them.
+
+After Drain starts the client rejects new locally initiated calls with
+`ErrDraining`, and asks a capable peer (via a go-away notification) to stop
+starting new requests. Already admitted inbound handlers and already
+outstanding outbound requests keep running to completion.
+
+Handlers are still allowed to call back into the peer for work that was
+already admitted (the bidirectional case); these nested callbacks are what
+handlers need to finish, so both peers can drain simultaneously without
+waiting on each other's close.
+
+Drain blocks until the connection is idle and the mutual drain handshake
+finishes, or `ctx` expires. A timeout only ends the wait and closes the
+connection; it never fabricates successful replies - calls that cannot
+finish fail with a real error.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := clt.Drain(ctx); err != nil {
+    log.Print("rpc2 drain: ", err)
+}
+```

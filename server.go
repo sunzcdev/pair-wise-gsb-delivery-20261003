@@ -62,6 +62,9 @@ func addHandler(handlers map[string]*handler, mname string, handlerFunc interfac
 	if _, ok := handlers[mname]; ok {
 		panic("rpc2: multiple registrations for " + mname)
 	}
+	if mname == goAwayMethod || mname == drainReadyMethod {
+		panic("rpc2: method name " + mname + " is reserved for drain notifications")
+	}
 
 	method := reflect.ValueOf(handlerFunc)
 	mtype := method.Type()
