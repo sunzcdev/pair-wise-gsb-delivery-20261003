@@ -39,6 +39,20 @@ var cdataPrefix = []byte("<![CDATA[")
 // ReadSettings determine the default behavior of the Document's ReadFrom*
 // functions.
 type ReadSettings struct {
+	// Version selects the XML version rules used to parse input. When set to
+	// Version10 or Version11, a strict, self-contained parser is used instead
+	// of the Go standard library's encoding/xml decoder. The strict parser
+	// supports only UTF-8 documents without a DTD; DTDs are rejected with
+	// ErrUnsupportedDTD. The version of an input's XML declaration, if
+	// present, must match this value.
+	//
+	// In strict modes the CharsetReader, Entity, Permissive, AutoClose,
+	// PreserveCData, PreserveDuplicateAttrs and ValidateInput settings are
+	// ignored.
+	//
+	// Default: VersionUnspecified (legacy encoding/xml behavior).
+	Version XMLVersion
+
 	// CharsetReader, if non-nil, defines a function to generate
 	// charset-conversion readers, converting from the provided non-UTF-8
 	// charset into UTF-8. If nil, the ReadFrom* functions will use a
@@ -109,6 +123,24 @@ func (s *ReadSettings) dup() ReadSettings {
 
 // WriteSettings determine the behavior of the Document's WriteTo* functions.
 type WriteSettings struct {
+	// Version selects the XML version rules used to serialize the document.
+	// When set to Version10 or Version11, values in the tree are validated
+	// against the selected version before any output is produced. Illegal
+	// values produce a TreeError identifying the offending node.
+	//
+	// If a "<?xml ...?>" processing instruction exists, it must be the first
+	// child of the document, must declare the same version, must use
+	// encoding="UTF-8", and may not declare a DTD-level feature. When no XML
+	// declaration exists, one is emitted automatically. XML 1.1
+	// restricted characters (when legal) are serialized as character
+	// references; line-ending characters in attribute values and the NEL
+	// (U+0085) and line separator (U+2028) characters are also serialized as
+	// character references to preserve them through line ending
+	// normalization.
+	//
+	// Default: VersionUnspecified (legacy writer, no XML declaration).
+	Version XMLVersion
+
 	// CanonicalEndTags forces the production of XML end tags, even for
 	// elements that have no child elements. Default: false.
 	CanonicalEndTags bool
@@ -361,6 +393,9 @@ func (d *Document) SetRoot(e *Element) {
 // ReadFrom reads XML from the reader 'r' into this document. The function
 // returns the number of bytes read and any error encountered.
 func (d *Document) ReadFrom(r io.Reader) (n int64, err error) {
+	if d.ReadSettings.Version.valid() {
+		return d.Element.readFromStrict(r, d.ReadSettings)
+	}
 	if d.ReadSettings.ValidateInput {
 		b, err := io.ReadAll(r)
 		if err != nil {
@@ -389,6 +424,10 @@ func (d *Document) ReadFromFile(filepath string) error {
 
 // ReadFromBytes reads XML from the byte slice 'b' into the this document.
 func (d *Document) ReadFromBytes(b []byte) error {
+	if d.ReadSettings.Version.valid() {
+		_, err := d.ReadFrom(bytes.NewReader(b))
+		return err
+	}
 	if d.ReadSettings.ValidateInput {
 		if err := validateXML(bytes.NewReader(b), d.ReadSettings); err != nil {
 			return err
@@ -400,6 +439,10 @@ func (d *Document) ReadFromBytes(b []byte) error {
 
 // ReadFromString reads XML from the string 's' into this document.
 func (d *Document) ReadFromString(s string) error {
+	if d.ReadSettings.Version.valid() {
+		_, err := d.ReadFrom(strings.NewReader(s))
+		return err
+	}
 	if d.ReadSettings.ValidateInput {
 		if err := validateXML(strings.NewReader(s), d.ReadSettings); err != nil {
 			return err
@@ -444,6 +487,9 @@ func newDecoder(r io.Reader, settings ReadSettings) *xml.Decoder {
 // WriteTo serializes the document out to the writer 'w'. The function returns
 // the number of bytes written and any error encountered.
 func (d *Document) WriteTo(w io.Writer) (n int64, err error) {
+	if d.WriteSettings.Version.valid() {
+		return d.writeToStrict(w)
+	}
 	xw := newXmlWriter(w)
 	b := bufio.NewWriter(xw)
 	for _, c := range d.Child {

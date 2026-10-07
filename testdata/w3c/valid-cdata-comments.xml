@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<root>
+  <!-- a comment with dashes inside, this is legal -->
+  <![CDATA[raw <>& data]]>
+  <split><![CDATA[abc]]>tail</split>
+</root>

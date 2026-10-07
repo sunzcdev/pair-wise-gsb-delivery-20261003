@@ -1,4 +1,34 @@
 Release 1.8.1
+Release 1.9.0
+=============
+
+**Features**
+
+* Added strict XML 1.0 and XML 1.1 read and write modes, selected through
+  the new `ReadSettings.Version` and `WriteSettings.Version` fields. The
+  strict modes are hand-written UTF-8 parsers that do not rely on
+  encoding/xml.
+
+* XML 1.1 mode implements the second edition's character and name rules,
+  requires restricted characters (such as U+0001-U+001F and U+007F-U+009F)
+  to appear as character references, and normalizes CR, CR/LF, NEL (U+0085)
+  and line separator (U+2028) line endings. Character references are
+  distinguished from raw characters; no blind string substitution is
+  performed on the input.
+
+* The strict modes support only UTF-8, DTD-free documents. DTDs and other
+  markup declarations are rejected with `ErrUnsupportedDTD`, and non-UTF-8
+  encodings are rejected.
+
+* Strict writes validate the element tree before producing any output and
+  return a `TreeError` identifying the path of the illegal value. Raw
+  characters that cannot survive line ending normalization (CR, and NEL/LS
+  in XML 1.1) are serialized as character references.
+
+* Read errors in strict modes return a `SyntaxError` carrying byte offset,
+  line and column.
+
+Release 1.8.1
 =============
 
 **Fixes**

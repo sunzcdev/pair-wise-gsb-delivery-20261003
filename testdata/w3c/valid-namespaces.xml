@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<bk:bookstore xmlns:bk="urn:example:book" xmlns="urn:example:default">
+  <bk:book bk:category="fiction">
+    <title xml:lang="en">Namespaces 101</title>
+  </bk:book>
+</bk:bookstore>

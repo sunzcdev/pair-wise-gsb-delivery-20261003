@@ -201,6 +201,29 @@ These are just a few examples of the things the etree package can do. See the
 [documentation](http://godoc.org/github.com/beevik/etree) for a complete
 description of its capabilities.
 
+### Strict XML 1.0 and 1.1 modes
+
+By default etree reads and writes documents using the same behavior as the
+Go standard library's `encoding/xml` package. Set `ReadSettings.Version` to
+`Version10` or `Version11` to opt into a strict, self-contained parser that
+implements the W3C XML recommendation for that version:
+
+```go
+doc := etree.NewDocument()
+doc.ReadSettings.Version = etree.Version11
+if err := doc.ReadFromFile("doc.xml"); err != nil {
+    panic(err)
+}
+```
+
+The strict modes accept only UTF-8 documents without a DTD. XML 1.1 mode
+accepts character references to restricted characters (such as `&#x1;`),
+rejects those characters when they appear raw, and normalizes CR, CR/LF, NEL
+(U+0085) and line separator (U+2028) line endings. Set
+`WriteSettings.Version` to the same value to emit an XML declaration and
+validate the tree while serializing; illegal values return an error that
+identifies the offending node.
+
 ### Contributing
 
 This project accepts contributions. Just fork the repo and submit a pull
