@@ -101,6 +101,11 @@ const (
 	// AddStaging makes a server a Voter.
 	// Deprecated: AddStaging was actually AddVoter. Use AddVoter instead.
 	AddStaging = 0 // explicit 0 to preserve the old value.
+	// UpdateVoterAddress changes the address of an existing Voter while
+	// preserving its ServerID and vote. Unlike AddVoter it fails if the server
+	// is not already a Voter, and it rejects a no-op change to the same
+	// address. It is the commit step of an address migration.
+	UpdateVoterAddress ConfigurationChangeCommand = 5
 )
 
 func (c ConfigurationChangeCommand) String() string {
@@ -115,6 +120,8 @@ func (c ConfigurationChangeCommand) String() string {
 		return "RemoveServer"
 	case Promote:
 		return "Promote"
+	case UpdateVoterAddress:
+		return "UpdateVoterAddress"
 	}
 	return "ConfigurationChangeCommand"
 }
@@ -290,6 +297,24 @@ func nextConfiguration(current Configuration, currentIndex uint64, change config
 				configuration.Servers[i].Suffrage = Voter
 				break
 			}
+		}
+	case UpdateVoterAddress:
+		found := false
+		for i, server := range configuration.Servers {
+			if server.ID == change.serverID {
+				if server.Suffrage != Voter {
+					return Configuration{}, fmt.Errorf("server %v is not a voter and its address cannot be migrated", change.serverID)
+				}
+				if server.Address == change.serverAddress {
+					return Configuration{}, ErrServerAddressUnchanged
+				}
+				configuration.Servers[i].Address = change.serverAddress
+				found = true
+				break
+			}
+		}
+		if !found {
+			return Configuration{}, fmt.Errorf("server %v is not in the configuration", change.serverID)
 		}
 	}
 

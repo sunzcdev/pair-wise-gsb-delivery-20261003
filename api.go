@@ -77,6 +77,20 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrServerAddressMismatch is returned by PrepareServerAddress when the
+	// node reachable at the candidate address reports a different ServerID
+	// than the one being migrated.
+	ErrServerAddressMismatch = errors.New("server identity mismatch at candidate address")
+
+	// ErrServerAddressUnchanged is returned by CommitServerAddress when the
+	// new address is identical to the address already in the configuration.
+	ErrServerAddressUnchanged = errors.New("server address is already current")
+
+	// ErrAddressMigrationNotSupported is returned by PrepareServerAddress when
+	// the configured transport cannot verify the identity of a node at an
+	// address outside the current configuration.
+	ErrAddressMigrationNotSupported = errors.New("transport does not support server address verification")
 )
 
 // Raft implements a Raft node.
@@ -208,6 +222,10 @@ type Raft struct {
 	// leadershipTransferCh is used to start a leadership transfer from outside of
 	// the main thread.
 	leadershipTransferCh chan *leadershipTransferFuture
+
+	// verifyServerCh is used to run server identity verification on the main
+	// thread as the first phase of a voter address migration.
+	verifyServerCh chan *verifyServerFuture
 
 	// leaderNotifyCh is used to tell leader that config has changed
 	leaderNotifyCh chan struct{}
@@ -578,6 +596,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		bootstrapCh:           make(chan *bootstrapFuture),
 		observers:             make(map[uint64]*Observer),
 		leadershipTransferCh:  make(chan *leadershipTransferFuture, 1),
+		verifyServerCh:        make(chan *verifyServerFuture),
 		leaderNotifyCh:        make(chan struct{}, 1),
 		followerNotifyCh:      make(chan struct{}, 1),
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
@@ -1051,6 +1070,55 @@ func (r *Raft) DemoteVoter(id ServerID, prevIndex uint64, timeout time.Duration)
 		command:   DemoteVoter,
 		serverID:  id,
 		prevIndex: prevIndex,
+	}, timeout)
+}
+
+// PrepareServerAddress is the first phase of migrating a voter from its
+// current address to a new endpoint without changing its ServerID. It contacts
+// the candidate address and verifies that the node answering there identifies
+// itself with exactly the given server ID. Nothing in the cluster
+// configuration is changed; call CommitServerAddress only after this succeeds.
+// This must be run on the leader or it will fail. The operation fails safely
+// (and can be retried) if the candidate address answers with a different
+// identity, if leadership changes, or if the transport cannot reach the
+// candidate address within timeout.
+func (r *Raft) PrepareServerAddress(id ServerID, newAddress ServerAddress, timeout time.Duration) Future {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+
+	future := &verifyServerFuture{
+		id:         id,
+		newAddress: newAddress,
+		timeout:    timeout,
+	}
+	future.init()
+	select {
+	case r.verifyServerCh <- future:
+		return future
+	case <-r.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
+}
+
+// CommitServerAddress is the second phase of a voter address migration. It
+// appends a configuration entry that replaces the address of the voter with
+// the given server ID while leaving its identity, suffrage and vote intact.
+// PrepareServerAddress should be invoked successfully before committing. This
+// must be run on the leader or it will fail; if leadership changed since the
+// prepare phase the call returns ErrNotLeader and the cluster is left on the
+// old address, so the migration may simply be re-attempted against the new
+// leader. For prevIndex and timeout, see AddVoter.
+func (r *Raft) CommitServerAddress(id ServerID, newAddress ServerAddress, prevIndex uint64, timeout time.Duration) IndexFuture {
+	if r.protocolVersion < 3 {
+		return errorFuture{ErrUnsupportedProtocol}
+	}
+
+	return r.requestConfigChange(configurationChangeRequest{
+		command:       UpdateVoterAddress,
+		serverID:      id,
+		serverAddress: newAddress,
+		prevIndex:     prevIndex,
 	}, timeout)
 }
 

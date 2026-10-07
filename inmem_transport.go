@@ -137,6 +137,19 @@ func (i *InmemTransport) RequestPreVote(id ServerID, target ServerAddress, args 
 	return nil
 }
 
+// VerifyServer implements the WithServerVerification interface.
+func (i *InmemTransport) VerifyServer(id ServerID, target ServerAddress, args *VerifyServerRequest, resp *VerifyServerResponse) error {
+	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	if err != nil {
+		return err
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*VerifyServerResponse)
+	*resp = *out
+	return nil
+}
+
 // InstallSnapshot implements the Transport interface.
 func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
 	rpcResp, err := i.makeRPC(target, args, data, 10*i.timeout)
@@ -225,16 +238,7 @@ func (i *InmemTransport) Disconnect(peer ServerAddress) {
 	delete(i.peers, peer)
 
 	// Disconnect any pipelines
-	n := len(i.pipelines)
-	for idx := 0; idx < n; idx++ {
-		if i.pipelines[idx].peerAddr == peer {
-			_ = i.pipelines[idx].Close()
-			i.pipelines[idx], i.pipelines[n-1] = i.pipelines[n-1], nil
-			idx--
-			n--
-		}
-	}
-	i.pipelines = i.pipelines[:n]
+	i.closePipelinesForPeerLocked(peer)
 }
 
 // DisconnectAll is used to remove all routes to peers.
@@ -248,6 +252,30 @@ func (i *InmemTransport) DisconnectAll() {
 		_ = pipeline.Close()
 	}
 	i.pipelines = nil
+}
+
+// EvictConnection implements the WithConnectionEviction interface. It closes
+// any pipelines established to the given address without removing the route to
+// the peer, so that subsequent RPCs establish a fresh in-memory channel.
+func (i *InmemTransport) EvictConnection(peer ServerAddress) {
+	i.Lock()
+	defer i.Unlock()
+	i.closePipelinesForPeerLocked(peer)
+}
+
+// closePipelinesForPeerLocked closes every pooled pipeline targeting the given
+// peer address. The caller must hold i.Lock().
+func (i *InmemTransport) closePipelinesForPeerLocked(peer ServerAddress) {
+	n := len(i.pipelines)
+	for idx := 0; idx < n; idx++ {
+		if i.pipelines[idx].peerAddr == peer {
+			_ = i.pipelines[idx].Close()
+			i.pipelines[idx], i.pipelines[n-1] = i.pipelines[n-1], nil
+			idx--
+			n--
+		}
+	}
+	i.pipelines = i.pipelines[:n]
 }
 
 // Close is used to permanently disable the transport

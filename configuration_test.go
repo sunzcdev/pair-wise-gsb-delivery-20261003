@@ -328,3 +328,65 @@ func TestConfiguration_encodeDecodeConfiguration(t *testing.T) {
 		t.Fatalf("mismatch %v %v", sampleConfiguration, decoded)
 	}
 }
+
+func TestConfiguration_nextConfiguration_UpdateVoterAddress(t *testing.T) {
+	current := Configuration{Servers: []Server{
+		{Suffrage: Voter, ID: ServerID("id1"), Address: ServerAddress("old1")},
+		{Suffrage: Voter, ID: ServerID("id2"), Address: ServerAddress("addr2")},
+	}}
+
+	req := configurationChangeRequest{
+		command:       UpdateVoterAddress,
+		serverID:      ServerID("id1"),
+		serverAddress: ServerAddress("new1"),
+	}
+	next, err := nextConfiguration(current, 1, req)
+	require.NoError(t, err)
+	require.Len(t, next.Servers, 2)
+	require.Equal(t, ServerAddress("new1"), next.Servers[0].Address)
+	require.Equal(t, ServerID("id1"), next.Servers[0].ID)
+	require.Equal(t, Voter, next.Servers[0].Suffrage)
+	require.Equal(t, ServerAddress("addr2"), next.Servers[1].Address)
+}
+
+func TestConfiguration_nextConfiguration_UpdateVoterAddress_SameAddress(t *testing.T) {
+	current := Configuration{Servers: []Server{
+		{Suffrage: Voter, ID: ServerID("id1"), Address: ServerAddress("addr1")},
+	}}
+	req := configurationChangeRequest{
+		command:       UpdateVoterAddress,
+		serverID:      ServerID("id1"),
+		serverAddress: ServerAddress("addr1"),
+	}
+	_, err := nextConfiguration(current, 1, req)
+	require.ErrorIs(t, err, ErrServerAddressUnchanged)
+}
+
+func TestConfiguration_nextConfiguration_UpdateVoterAddress_NotVoter(t *testing.T) {
+	req := configurationChangeRequest{
+		command:       UpdateVoterAddress,
+		serverID:      ServerID("id0"),
+		serverAddress: ServerAddress("new0"),
+	}
+	_, err := nextConfiguration(sampleConfiguration, 1, req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not a voter")
+}
+
+func TestConfiguration_nextConfiguration_UpdateVoterAddress_Unknown(t *testing.T) {
+	req := configurationChangeRequest{
+		command:       UpdateVoterAddress,
+		serverID:      ServerID("nope"),
+		serverAddress: ServerAddress("new"),
+	}
+	_, err := nextConfiguration(sampleConfiguration, 1, req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not in the configuration")
+}
+
+func TestConfigurationChangeCommand_UpdateVoterAddress_Value(t *testing.T) {
+	// The on-the-wire value must remain stable; AddStaging's explicit "= 0"
+	// resets the iota sequence, so UpdateVoterAddress is assigned explicitly.
+	require.Equal(t, ConfigurationChangeCommand(5), UpdateVoterAddress)
+	require.Equal(t, "UpdateVoterAddress", UpdateVoterAddress.String())
+}

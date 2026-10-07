@@ -76,6 +76,25 @@ type WithPreVote interface {
 	RequestPreVote(id ServerID, target ServerAddress, args *RequestPreVoteRequest, resp *RequestPreVoteResponse) error
 }
 
+// WithServerVerification is an interface that a transport may provide which
+// allows a server to be asked to identify itself at an address that is not
+// (yet) part of the cluster configuration. It is used by
+// PrepareServerAddress to validate a candidate migration endpoint.
+type WithServerVerification interface {
+	// VerifyServer asks the node at the target address to identify itself.
+	VerifyServer(id ServerID, target ServerAddress, args *VerifyServerRequest, resp *VerifyServerResponse) error
+}
+
+// WithConnectionEviction is an interface that a transport may provide to drop
+// pooled connections to a given address. It is used after a committed address
+// migration to make sure no stale connections to the old endpoint linger in
+// the transport's connection pool.
+type WithConnectionEviction interface {
+	// EvictConnection closes and removes any pooled connections (including
+	// pipelines) targeting the given address.
+	EvictConnection(addr ServerAddress)
+}
+
 // WithClose is an interface that a transport may provide which
 // allows a transport to be shut down cleanly when a Raft instance
 // shuts down.

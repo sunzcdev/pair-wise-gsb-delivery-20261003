@@ -19,9 +19,10 @@ import (
 )
 
 const (
-	minCheckInterval          = 10 * time.Millisecond
-	oldestLogGaugeInterval    = 10 * time.Second
-	rpcUnexpectedCommandError = "unexpected command"
+	minCheckInterval           = 10 * time.Millisecond
+	oldestLogGaugeInterval     = 10 * time.Second
+	defaultVerifyServerTimeout = 5 * time.Second
+	rpcUnexpectedCommandError  = "unexpected command"
 )
 
 var (
@@ -195,6 +196,11 @@ func (r *Raft) runFollower() {
 			r.mainThreadSaturation.working()
 			// Reject any operations since we are not the leader
 			l.respond(ErrNotLeader)
+
+		case vs := <-r.verifyServerCh:
+			r.mainThreadSaturation.working()
+			// Reject any operations since we are not the leader
+			vs.respond(ErrNotLeader)
 
 		case c := <-r.configurationsCh:
 			r.mainThreadSaturation.working()
@@ -409,6 +415,11 @@ func (r *Raft) runCandidate() {
 			// Reject any operations since we are not the leader
 			l.respond(ErrNotLeader)
 
+		case vs := <-r.verifyServerCh:
+			r.mainThreadSaturation.working()
+			// Reject any operations since we are not the leader
+			vs.respond(ErrNotLeader)
+
 		case c := <-r.configurationsCh:
 			r.mainThreadSaturation.working()
 			c.configurations = r.configurations.Clone()
@@ -583,6 +594,10 @@ func (r *Raft) runLeader() {
 func (r *Raft) startStopReplication() {
 	inConfig := make(map[ServerID]bool, len(r.configurations.latest.Servers))
 	lastIdx := r.getLastIndex()
+	// oldAddresses accumulates the endpoints that a still-present voter has
+	// migrated away from, so their pooled connections can be evicted once the
+	// new configuration is in place.
+	var oldAddresses []ServerAddress
 
 	// Start replication goroutines that need starting
 	for _, server := range r.configurations.latest.Servers {
@@ -620,10 +635,41 @@ func (r *Raft) startStopReplication() {
 			s.peerLock.RUnlock()
 
 			if peer.Address != server.Address {
-				r.logger.Info("updating peer", "peer", server.ID)
-				s.peerLock.Lock()
-				s.peer = server
-				s.peerLock.Unlock()
+				r.logger.Info("peer migrated to a new address, restarting replication",
+					"peer", server.ID, "old-address", peer.Address, "new-address", server.Address)
+
+				// Retire the routine and any in-flight RPCs bound to the old
+				// endpoint. Responses still arriving on those connections are
+				// dropped by the abandoned flag so they can neither be counted
+				// as a second vote nor advance progress for the new address.
+				oldAddresses = append(oldAddresses, peer.Address)
+				s.abandon()
+				select {
+				case s.stopCh <- lastIdx:
+				default:
+				}
+				close(s.stopCh)
+				delete(r.leaderState.replState, server.ID)
+
+				// Start a fresh replication routine at the new endpoint.
+				s = &followerReplication{
+					peer:                server,
+					commitment:          r.leaderState.commitment,
+					stopCh:              make(chan uint64, 1),
+					triggerCh:           make(chan struct{}, 1),
+					triggerDeferErrorCh: make(chan *deferError, 1),
+					currentTerm:         r.getCurrentTerm(),
+					nextIndex:           lastIdx + 1,
+					lastContact:         time.Now(),
+					notify:              make(map[*verifyFuture]struct{}),
+					notifyCh:            make(chan struct{}, 1),
+					stepDown:            r.leaderState.stepDown,
+				}
+				r.leaderState.replState[server.ID] = s
+				r.goFunc(func() { r.replicate(s) })
+				asyncNotifyCh(s.triggerCh)
+				r.observe(PeerObservation{Peer: server, Removed: true})
+				r.observe(PeerObservation{Peer: server, Removed: false})
 			}
 		}
 	}
@@ -643,6 +689,15 @@ func (r *Raft) startStopReplication() {
 
 	// Update peers metric
 	metrics.SetGauge([]string{"raft", "peers"}, float32(len(r.configurations.latest.Servers)))
+
+	// Drop idle connections (and pipelines) still pooled against endpoints
+	// that voters migrated away from, so later traffic can never be sent down
+	// a stale connection to the old node.
+	for _, addr := range oldAddresses {
+		if evictor, ok := r.trans.(WithConnectionEviction); ok {
+			evictor.EvictConnection(addr)
+		}
+	}
 }
 
 // configurationChangeChIfStable returns r.configurationChangeCh if it's safe
@@ -890,6 +945,15 @@ func (r *Raft) leaderLoop() {
 			future.configurations = r.configurations.Clone()
 			future.respond(nil)
 
+		case vs := <-r.verifyServerCh:
+			r.mainThreadSaturation.working()
+			if r.getLeadershipTransferInProgress() {
+				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
+				vs.respond(ErrLeadershipTransferInProgress)
+				continue
+			}
+			r.verifyServer(vs)
+
 		case future := <-r.configurationChangeChIfStable():
 			r.mainThreadSaturation.working()
 			if r.getLeadershipTransferInProgress() {
@@ -959,6 +1023,86 @@ func (r *Raft) leaderLoop() {
 			return
 		}
 	}
+}
+
+// verifyServer performs the prepare phase of a voter address migration: it
+// validates that the given server ID exists in the latest configuration, then
+// asks the node at the candidate address to identify itself. The network call
+// is performed in a background goroutine so the main loop is never blocked;
+// any fresher term reported by the remote node makes us step down, and the
+// operation fails (recoverably) without touching the configuration. This must
+// only be called from the leader's main loop.
+func (r *Raft) verifyServer(future *verifyServerFuture) {
+	var server *Server
+	for i := range r.configurations.latest.Servers {
+		if r.configurations.latest.Servers[i].ID == future.id {
+			server = &r.configurations.latest.Servers[i]
+			break
+		}
+	}
+	if server == nil {
+		future.respond(fmt.Errorf("server %v is not in the configuration", future.id))
+		return
+	}
+	if server.Address == future.newAddress {
+		future.respond(ErrServerAddressUnchanged)
+		return
+	}
+
+	verifyingTrans, ok := r.trans.(WithServerVerification)
+	if !ok {
+		future.respond(ErrAddressMigrationNotSupported)
+		return
+	}
+
+	term := r.getCurrentTerm()
+	timeout := future.timeout
+	if timeout <= 0 {
+		timeout = defaultVerifyServerTimeout
+	}
+	stepDownCh := r.leaderState.stepDown
+
+	r.goFunc(func() {
+		req := &VerifyServerRequest{
+			RPCHeader: r.getRPCHeader(),
+			Term:      term,
+			ServerID:  future.id,
+		}
+		var resp VerifyServerResponse
+		callErrCh := make(chan error, 1)
+		go func() {
+			callErrCh <- verifyingTrans.VerifyServer(future.id, future.newAddress, req, &resp)
+		}()
+
+		var err error
+		select {
+		case err = <-callErrCh:
+		case <-time.After(timeout):
+			err = fmt.Errorf("timed out verifying server %v at %v", future.id, future.newAddress)
+		case <-r.shutdownCh:
+			err = ErrRaftShutdown
+		}
+		if err == nil {
+			switch {
+			case resp.Term > term:
+				// The candidate answered from a later term; we may have been
+				// deposed. Step down and fail so the caller retries against
+				// the current leader.
+				asyncNotifyCh(stepDownCh)
+				err = fmt.Errorf("server %v responded with newer term %d while verifying address", future.id, resp.Term)
+			case !resp.Success:
+				err = fmt.Errorf("server %v refused identity verification at %v", future.id, future.newAddress)
+			case ServerID(resp.ID) != future.id:
+				r.logger.Warn("address migration rejected: identity mismatch at candidate address",
+					"server-id", future.id,
+					"candidate-address", future.newAddress,
+					"observed-id", ServerID(resp.ID))
+				err = fmt.Errorf("%w: expected %v but %v identifies itself as %v",
+					ErrServerAddressMismatch, future.id, future.newAddress, ServerID(resp.ID))
+			}
+		}
+		future.respond(err)
+	})
 }
 
 // verifyLeader must be called from the main thread for safety.
@@ -1422,6 +1566,8 @@ func (r *Raft) processRPC(rpc RPC) {
 		r.installSnapshot(rpc, cmd)
 	case *TimeoutNowRequest:
 		r.timeoutNow(rpc, cmd)
+	case *VerifyServerRequest:
+		r.verifyServerRPC(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
 			"command", hclog.Fmt("%#v", rpc.Command))
@@ -2234,6 +2380,20 @@ func (r *Raft) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	r.setState(Candidate)
 	r.candidateFromLeadershipTransfer.Store(true)
 	rpc.Respond(&TimeoutNowResponse{}, nil)
+}
+
+// verifyServerRPC handles an incoming identity verification request during the
+// prepare phase of an address migration. It is deliberately read-only: it
+// never changes term, state, configuration or leadership. It simply reports
+// whether this node is the server the initiator is looking for, along with our
+// current term so the initiator can detect that it has been deposed.
+func (r *Raft) verifyServerRPC(rpc RPC, req *VerifyServerRequest) {
+	resp := &VerifyServerResponse{
+		RPCHeader: r.getRPCHeader(),
+		Term:      r.getCurrentTerm(),
+		Success:   req.ServerID == r.localID,
+	}
+	rpc.Respond(resp, nil)
 }
 
 // setLatestConfiguration stores the latest configuration and updates a copy of it.

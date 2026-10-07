@@ -25,6 +25,7 @@ const (
 	rpcInstallSnapshot
 	rpcTimeoutNow
 	rpcRequestPreVote
+	rpcVerifyServer
 
 	// DefaultTimeoutScale is the default TimeoutScale in a NetworkTransport.
 	DefaultTimeoutScale = 256 * 1024 // 256KB
@@ -329,6 +330,25 @@ func (n *NetworkTransport) CloseStreams() {
 	n.streamCtxLock.Unlock()
 }
 
+// EvictConnection implements the WithConnectionEviction interface. It closes
+// and removes any idle connections pooled for the given address, without
+// affecting connections to other peers or active RPCs. This is used after an
+// address migration so that later RPCs to a recycled address cannot be sent
+// down a connection that terminates at the old endpoint.
+func (n *NetworkTransport) EvictConnection(addr ServerAddress) {
+	n.connPoolLock.Lock()
+	defer n.connPoolLock.Unlock()
+
+	conns, ok := n.connPool[addr]
+	if !ok {
+		return
+	}
+	for _, conn := range conns {
+		_ = conn.Release()
+	}
+	delete(n.connPool, addr)
+}
+
 // Close is used to stop the network transport.
 func (n *NetworkTransport) Close() error {
 	n.shutdownLock.Lock()
@@ -475,6 +495,11 @@ func (n *NetworkTransport) RequestVote(id ServerID, target ServerAddress, args *
 // RequestPreVote implements the Transport interface.
 func (n *NetworkTransport) RequestPreVote(id ServerID, target ServerAddress, args *RequestPreVoteRequest, resp *RequestPreVoteResponse) error {
 	return n.genericRPC(id, target, rpcRequestPreVote, args, resp)
+}
+
+// VerifyServer implements the WithServerVerification interface.
+func (n *NetworkTransport) VerifyServer(id ServerID, target ServerAddress, args *VerifyServerRequest, resp *VerifyServerResponse) error {
+	return n.genericRPC(id, target, rpcVerifyServer, args, resp)
 }
 
 // genericRPC handles a simple request/response RPC.
@@ -710,6 +735,13 @@ func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, en
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "TimeoutNow"}}
+	case rpcVerifyServer:
+		var req VerifyServerRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "VerifyServer"}}
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}

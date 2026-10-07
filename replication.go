@@ -90,6 +90,15 @@ type followerReplication struct {
 	// should step down based on information from a follower.
 	stepDown chan struct{}
 
+	// abandoned is atomically set when this replication routine has been
+	// superseded, e.g. because the follower's address was migrated. Any
+	// AppendEntries response that arrives afterwards belongs to a connection
+	// targeting the old endpoint and must be ignored: it must neither update
+	// the follower's replication progress nor count as a vote, otherwise a
+	// delayed response could be tallied as a second ballot or corrupt the
+	// progress of the same ServerID at its new address.
+	abandoned int32
+
 	// allowPipeline is used to determine when to pipeline the AppendEntries RPCs.
 	// It is private to this replication goroutine.
 	allowPipeline bool
@@ -115,6 +124,23 @@ func (s *followerReplication) cleanNotify(v *verifyFuture) {
 	s.notifyLock.Lock()
 	delete(s.notify, v)
 	s.notifyLock.Unlock()
+}
+
+// abandon marks this replication routine as superseded and drops any pending
+// leadership-verification votes without casting a ballot, so a delayed
+// response on an old connection can never be tallied as a second vote.
+func (s *followerReplication) abandon() {
+	atomic.StoreInt32(&s.abandoned, 1)
+
+	s.notifyLock.Lock()
+	s.notify = make(map[*verifyFuture]struct{})
+	s.notifyLock.Unlock()
+}
+
+// isAbandoned reports whether a newer replication routine for the same
+// ServerID has taken over.
+func (s *followerReplication) isAbandoned() bool {
+	return atomic.LoadInt32(&s.abandoned) != 0
 }
 
 // LastContact returns the time of last contact.
@@ -143,6 +169,9 @@ func (r *Raft) replicate(s *followerReplication) {
 RPC:
 	shouldStop := false
 	for !shouldStop {
+		if s.isAbandoned() {
+			return
+		}
 		select {
 		case maxIndex := <-s.stopCh:
 			// Make a best effort to replicate up to this index
@@ -229,11 +258,22 @@ START:
 	// Make the RPC call
 	start = time.Now()
 	if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+		if s.isAbandoned() {
+			return true
+		}
 		r.logger.Error("failed to appendEntries to", "peer", peer, "error", err)
 		s.failures++
 		return
 	}
 	appendStats(string(peer.ID), start, float32(len(req.Entries)), r.noLegacyTelemetry)
+
+	// The peer may have been migrated to a new address while this RPC was in
+	// flight on a connection to the old endpoint. Drop the delayed response
+	// entirely: it must not influence term handling, contact time, progress or
+	// verification votes.
+	if s.isAbandoned() {
+		return true
+	}
 
 	// Check for a newer term, stop running
 	if resp.Term > req.Term {
@@ -343,12 +383,19 @@ func (r *Raft) sendLatestSnapshot(s *followerReplication) (bool, error) {
 	start := time.Now()
 	var resp InstallSnapshotResponse
 	if err := r.trans.InstallSnapshot(peer.ID, peer.Address, &req, &resp, snapshot); err != nil {
+		if s.isAbandoned() {
+			return true, nil
+		}
 		r.logger.Error("failed to install snapshot", "peer", peer.ID, "id", snapID, "error", err)
 		s.failures++
 		return false, err
 	}
 	labels := []metrics.Label{{Name: "peer_id", Value: string(peer.ID)}}
 	metrics.MeasureSinceWithLabels([]string{"raft", "replication", "installSnapshot"}, start, labels)
+
+	if s.isAbandoned() {
+		return true, nil
+	}
 
 	if !r.noLegacyTelemetry {
 		// Duplicated information. Kept for backward compatibility.
@@ -404,12 +451,21 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 			return
 		}
 
+		// Stop heartbeating once a newer routine (e.g. after an address
+		// migration) has taken over for this peer.
+		if s.isAbandoned() {
+			return
+		}
+
 		s.peerLock.RLock()
 		peer := s.peer
 		s.peerLock.RUnlock()
 
 		start := time.Now()
 		if err := r.trans.AppendEntries(peer.ID, peer.Address, &req, &resp); err != nil {
+			if s.isAbandoned() {
+				return
+			}
 			nextBackoffTime := cappedExponentialBackoff(failureWait, failures, maxFailureScale, r.config().HeartbeatTimeout/2)
 			r.logger.Error("failed to heartbeat to", "peer", peer.Address, "backoff time",
 				nextBackoffTime, "error", err)
@@ -421,6 +477,9 @@ func (r *Raft) heartbeat(s *followerReplication, stopCh chan struct{}) {
 				return
 			}
 		} else {
+			if s.isAbandoned() {
+				return
+			}
 			if failures > 0 {
 				r.observe(ResumedHeartbeatObservation{PeerID: peer.ID})
 			}
@@ -543,6 +602,13 @@ func (r *Raft) pipelineDecode(s *followerReplication, p AppendPipeline, stopCh, 
 
 			req, resp := ready.Request(), ready.Response()
 			appendStats(string(peer.ID), ready.Start(), float32(len(req.Entries)), r.noLegacyTelemetry)
+
+			// Responses arriving after the peer migrated to a new address
+			// belong to an old pipeline and must not advance progress or
+			// trigger a step-down.
+			if s.isAbandoned() {
+				return
+			}
 
 			// Check for a newer term, stop running
 			if resp.Term > req.Term {

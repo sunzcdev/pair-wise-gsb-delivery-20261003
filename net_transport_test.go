@@ -908,3 +908,49 @@ func TestNetworkTransport_ListenBackoff(t *testing.T) {
 	require.True(t, numLogs > 10)
 	require.True(t, numLogs < 13)
 }
+
+func TestNetworkTransport_EvictConnection(t *testing.T) {
+	trans1, err := NewTCPTransportWithLogger("localhost:0", nil, 2, time.Second, newTestLogger(t))
+	require.NoError(t, err)
+	defer trans1.Close()
+
+	trans2, err := NewTCPTransportWithLogger("localhost:0", nil, 2, time.Second, newTestLogger(t))
+	require.NoError(t, err)
+	defer trans2.Close()
+
+	// Serve one AppendEntries so trans2 pools a connection to trans1.
+	go func() {
+		select {
+		case rpc := <-trans1.Consumer():
+			rpc.Respond(&AppendEntriesResponse{Success: true}, nil)
+		case <-time.After(time.Second):
+		}
+	}()
+
+	var out AppendEntriesResponse
+	require.NoError(t, trans2.AppendEntries("id1", trans1.LocalAddr(),
+		&AppendEntriesRequest{Term: 1}, &out))
+	require.True(t, out.Success)
+
+	trans2.connPoolLock.Lock()
+	require.NotEmpty(t, trans2.connPool[trans1.LocalAddr()])
+	trans2.connPoolLock.Unlock()
+
+	trans2.EvictConnection(trans1.LocalAddr())
+
+	trans2.connPoolLock.Lock()
+	require.Empty(t, trans2.connPool[trans1.LocalAddr()])
+	trans2.connPoolLock.Unlock()
+
+	// Fresh RPC still works after eviction.
+	go func() {
+		select {
+		case rpc := <-trans1.Consumer():
+			rpc.Respond(&AppendEntriesResponse{Success: true}, nil)
+		case <-time.After(time.Second):
+		}
+	}()
+	require.NoError(t, trans2.AppendEntries("id1", trans1.LocalAddr(),
+		&AppendEntriesRequest{Term: 1}, &out))
+	require.True(t, out.Success)
+}

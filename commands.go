@@ -221,3 +221,39 @@ type TimeoutNowResponse struct {
 func (r *TimeoutNowResponse) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
+
+// VerifyServerRequest is the command used by a leader to verify that the node
+// reachable at a candidate address really is the server with the expected
+// ServerID, before committing an address migration for that server.
+type VerifyServerRequest struct {
+	RPCHeader
+
+	// Term is the term of the leader initiating the verification.
+	Term uint64
+
+	// ServerID is the identity the initiator expects the remote node to
+	// report back.
+	ServerID ServerID
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *VerifyServerRequest) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// VerifyServerResponse is the response returned from a VerifyServerRequest.
+// The responder's own ServerID is carried in the RPCHeader.
+type VerifyServerResponse struct {
+	RPCHeader
+
+	// Newer term if the initiator is out of date.
+	Term uint64
+
+	// Success is true when the responder is the server named in the request.
+	Success bool
+}
+
+// GetRPCHeader - See WithRPCHeader.
+func (r *VerifyServerResponse) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}

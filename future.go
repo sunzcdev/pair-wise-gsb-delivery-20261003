@@ -252,6 +252,17 @@ type leadershipTransferFuture struct {
 	Address *ServerAddress
 }
 
+// verifyServerFuture is used to run the prepare phase of a voter address
+// migration: it verifies that the node reachable at newAddress identifies
+// itself with the given server ID.
+type verifyServerFuture struct {
+	deferError
+
+	id         ServerID
+	newAddress ServerAddress
+	timeout    time.Duration
+}
+
 // configurationsFuture is used to retrieve the current configurations. This is
 // used to allow safe access to this information outside of the main thread.
 type configurationsFuture struct {
