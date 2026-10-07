@@ -94,8 +94,10 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
 		return h.handleQuery(r, w, report.Query)
 	} else if report.Multiget != nil {
 		return h.handleMultiget(r.Context(), w, report.Multiget)
+	} else if report.Sync != nil {
+		return h.handleSyncCollection(r, w, report.Sync)
 	}
-	return internal.HTTPErrorf(http.StatusBadRequest, "carddav: expected addressbook-query or addressbook-multiget element in REPORT request")
+	return internal.HTTPErrorf(http.StatusBadRequest, "carddav: expected addressbook-query, addressbook-multiget or sync-collection element in REPORT request")
 }
 
 func decodePropFilter(el *propFilter) (*PropFilter, error) {
@@ -251,6 +253,86 @@ func (h *Handler) handleMultiget(ctx context.Context, w http.ResponseWriter, mul
 	return internal.ServeMultiStatus(w, ms)
 }
 
+func (h *Handler) handleSyncCollection(r *http.Request, w http.ResponseWriter, req *internal.SyncCollectionQuery) error {
+	syncBackend, ok := h.Backend.(SyncCollectionBackend)
+	if !ok {
+		return internal.HTTPErrorf(http.StatusNotImplemented, "carddav: sync-collection not supported by backend")
+	}
+
+	b := backend{
+		Backend: h.Backend,
+		Prefix:  strings.TrimSuffix(h.Prefix, "/"),
+	}
+	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeAddressBook {
+		return internal.HTTPErrorf(http.StatusForbidden, "carddav: sync-collection is only supported on address book collections")
+	}
+
+	// RFC 6578 section 3.3: sync-level is mandatory and only level 1 is
+	// supported; the Depth header is ignored.
+	switch req.SyncLevel {
+	case "1":
+	default:
+		return internal.HTTPErrorf(http.StatusBadRequest, "carddav: unsupported DAV:sync-level %q", req.SyncLevel)
+	}
+
+	var dataReq AddressDataRequest
+	if req.Prop != nil {
+		var addressData addressDataReq
+		if err := req.Prop.Decode(&addressData); err == nil {
+			decoded, err := decodeAddressDataReq(&addressData)
+			if err != nil {
+				return err
+			}
+			dataReq = *decoded
+		} else if !internal.IsNotFound(err) {
+			return err
+		}
+	}
+
+	q := &SyncQuery{
+		DataRequest: dataReq,
+		SyncToken:   req.SyncToken,
+	}
+	if req.Limit != nil {
+		q.Limit = int(req.Limit.NResults)
+	}
+
+	result, err := syncBackend.SyncCollection(r.Context(), r.URL.Path, q)
+	if err != nil {
+		return err
+	}
+
+	propfind := &internal.PropFind{Prop: req.Prop}
+	if req.Prop == nil {
+		propfind.AllProp = &struct{}{}
+	}
+
+	var resps []internal.Response
+	for i := range result.Updated {
+		ao := &result.Updated[i]
+		resp, err := b.propFindAddressObject(r.Context(), propfind, ao)
+		if err != nil {
+			return err
+		}
+		resps = append(resps, *resp)
+	}
+	for _, path := range result.Deleted {
+		// RFC 6578 section 6.3: removed members are reported with an explicit
+		// 404 response status, not with propstat errors.
+		resps = append(resps, internal.Response{
+			Hrefs:  []internal.Href{{Path: path}},
+			Status: &internal.Status{Code: http.StatusNotFound},
+		})
+	}
+
+	ms := internal.NewMultiStatus(resps...)
+	ms.SyncToken = result.SyncToken
+	if result.MoreResults {
+		ms.MoreResults = &struct{}{}
+	}
+	return internal.ServeMultiStatus(w, ms)
+}
+
 type backend struct {
 	Backend Backend
 	Prefix  string
@@ -282,6 +364,11 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 	caps = []string{"addressbook"}
 
 	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeAddressObject {
+		if _, ok := b.Backend.(SyncCollectionBackend); ok && b.resourceTypeAtPath(r.URL.Path) == resourceTypeAddressBook {
+			if _, err := b.Backend.GetAddressBook(r.Context(), r.URL.Path); err == nil {
+				caps = append(caps, "sync-collection")
+			}
+		}
 		// Note: some clients assume the address book is read-only when
 		// DELETE/MKCOL are missing
 		return caps, []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}, nil
@@ -514,6 +601,16 @@ func (b *backend) propFindAddressBook(ctx context.Context, propfind *internal.Pr
 		props[maxResourceSizeName] = internal.PropFindValue(&maxResourceSize{
 			Size: ab.MaxResourceSize,
 		})
+	}
+
+	if syncBackend, ok := b.Backend.(SyncCollectionBackend); ok {
+		props[internal.SyncTokenName] = func(*internal.RawXMLValue) (interface{}, error) {
+			token, err := syncBackend.CurrentSyncToken(ctx, ab.Path)
+			if err != nil {
+				return nil, err
+			}
+			return &internal.SyncToken{Token: token}, nil
+		}
 	}
 
 	return internal.NewPropFindResponse(ab.Path, propfind, props)

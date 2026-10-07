@@ -2,6 +2,7 @@
 package internal
 
 import (
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"net/http"
@@ -95,6 +96,23 @@ func IsNotFound(err error) bool {
 
 func HTTPErrorf(code int, format string, a ...interface{}) *HTTPError {
 	return &HTTPError{code, fmt.Errorf(format, a...)}
+}
+
+// InvalidSyncTokenError wraps err into an HTTP 403 error carrying the
+// DAV:valid-sync-token precondition, as defined in RFC 6578 section 3.2.
+// Backends should return this error when the provided sync token is unknown,
+// has expired, or belongs to a different collection.
+func InvalidSyncTokenError(err error) *HTTPError {
+	if err == nil {
+		err = fmt.Errorf("webdav: invalid sync token")
+	}
+	name := xml.Name{Space: Namespace, Local: "valid-sync-token"}
+	return &HTTPError{
+		Code: http.StatusForbidden,
+		Err: &Error{
+			Raw: []RawXMLValue{*NewRawXMLElement(name, nil, nil)},
+		},
+	}
 }
 
 func (err *HTTPError) Error() string {

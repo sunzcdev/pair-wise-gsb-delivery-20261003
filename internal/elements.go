@@ -26,6 +26,9 @@ var (
 
 	CurrentUserPrincipalName    = xml.Name{Namespace, "current-user-principal"}
 	CurrentUserPrivilegeSetName = xml.Name{Namespace, "current-user-privilege-set"}
+
+	SyncCollectionName = xml.Name{Namespace, "sync-collection"}
+	SyncTokenName      = xml.Name{Namespace, "sync-token"}
 )
 
 type Status struct {
@@ -98,6 +101,10 @@ type MultiStatus struct {
 	Responses           []Response `xml:"response"`
 	ResponseDescription string     `xml:"responsedescription,omitempty"`
 	SyncToken           string     `xml:"sync-token,omitempty"`
+	// MoreResults is set when the server limited the number of responses and
+	// the client needs to issue another sync-collection REPORT to obtain the
+	// rest of the changes. See RFC 6578 section 6.2.
+	MoreResults *struct{} `xml:"more-results,omitempty"`
 }
 
 func NewMultiStatus(resps ...Response) *MultiStatus {
@@ -442,6 +449,13 @@ type Remove struct {
 type Set struct {
 	XMLName xml.Name `xml:"DAV: set"`
 	Prop    Prop     `xml:"prop"`
+}
+
+// SyncToken is the DAV:sync-token live property defined in RFC 6578
+// section 3.
+type SyncToken struct {
+	XMLName xml.Name `xml:"DAV: sync-token"`
+	Token   string   `xml:",chardata"`
 }
 
 // https://tools.ietf.org/html/rfc6578#section-6.1

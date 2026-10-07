@@ -97,8 +97,10 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
 		return h.handleQuery(r, w, report.Query)
 	} else if report.Multiget != nil {
 		return h.handleMultiget(r.Context(), w, report.Multiget)
+	} else if report.Sync != nil {
+		return h.handleSyncCollection(r, w, report.Sync)
 	}
-	return internal.HTTPErrorf(http.StatusBadRequest, "caldav: expected calendar-query or calendar-multiget element in REPORT request")
+	return internal.HTTPErrorf(http.StatusBadRequest, "caldav: expected calendar-query, calendar-multiget or sync-collection element in REPORT request")
 }
 
 func decodeParamFilter(el *paramFilter) (*ParamFilter, error) {
@@ -287,6 +289,86 @@ func (h *Handler) handleMultiget(ctx context.Context, w http.ResponseWriter, mul
 	return internal.ServeMultiStatus(w, ms)
 }
 
+func (h *Handler) handleSyncCollection(r *http.Request, w http.ResponseWriter, req *internal.SyncCollectionQuery) error {
+	syncBackend, ok := h.Backend.(SyncCollectionBackend)
+	if !ok {
+		return internal.HTTPErrorf(http.StatusNotImplemented, "caldav: sync-collection not supported by backend")
+	}
+
+	b := backend{
+		Backend: h.Backend,
+		Prefix:  strings.TrimSuffix(h.Prefix, "/"),
+	}
+	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeCalendar {
+		return internal.HTTPErrorf(http.StatusForbidden, "caldav: sync-collection is only supported on calendar collections")
+	}
+
+	// RFC 6578 section 3.3: sync-level is mandatory and only level 1 is
+	// supported; the Depth header is ignored.
+	switch req.SyncLevel {
+	case "1":
+	default:
+		return internal.HTTPErrorf(http.StatusBadRequest, "caldav: unsupported DAV:sync-level %q", req.SyncLevel)
+	}
+
+	var dataReq CalendarCompRequest
+	var calendarData calendarDataReq
+	if req.Prop != nil {
+		if err := req.Prop.Decode(&calendarData); err == nil {
+			decoded, err := decodeCalendarDataReq(&calendarData)
+			if err != nil {
+				return err
+			}
+			dataReq = *decoded
+		} else if !internal.IsNotFound(err) {
+			return err
+		}
+	}
+
+	q := &SyncQuery{
+		CompRequest: dataReq,
+		SyncToken:   req.SyncToken,
+	}
+	if req.Limit != nil {
+		q.Limit = int(req.Limit.NResults)
+	}
+
+	result, err := syncBackend.SyncCollection(r.Context(), r.URL.Path, q)
+	if err != nil {
+		return err
+	}
+
+	propfind := &internal.PropFind{Prop: req.Prop}
+	if req.Prop == nil {
+		propfind.AllProp = &struct{}{}
+	}
+
+	var resps []internal.Response
+	for i := range result.Updated {
+		co := &result.Updated[i]
+		resp, err := b.propFindCalendarObject(r.Context(), propfind, co)
+		if err != nil {
+			return err
+		}
+		resps = append(resps, *resp)
+	}
+	for _, path := range result.Deleted {
+		// RFC 6578 section 6.3: removed members are reported with an explicit
+		// 404 response status, not with propstat errors.
+		resps = append(resps, internal.Response{
+			Hrefs:  []internal.Href{{Path: path}},
+			Status: &internal.Status{Code: http.StatusNotFound},
+		})
+	}
+
+	ms := internal.NewMultiStatus(resps...)
+	ms.SyncToken = result.SyncToken
+	if result.MoreResults {
+		ms.MoreResults = &struct{}{}
+	}
+	return internal.ServeMultiStatus(w, ms)
+}
+
 type backend struct {
 	Backend Backend
 	Prefix  string
@@ -318,6 +400,11 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 	caps = []string{"calendar-access"}
 
 	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeCalendarObject {
+		if _, ok := b.Backend.(SyncCollectionBackend); ok && b.resourceTypeAtPath(r.URL.Path) == resourceTypeCalendar {
+			if _, err := b.Backend.GetCalendar(r.Context(), r.URL.Path); err == nil {
+				caps = append(caps, "sync-collection")
+			}
+		}
 		return caps, []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}, nil
 	}
 
@@ -563,6 +650,16 @@ func (b *backend) propFindCalendar(ctx context.Context, propfind *internal.PropF
 		props[maxResourceSizeName] = internal.PropFindValue(&maxResourceSize{
 			Size: cal.MaxResourceSize,
 		})
+	}
+
+	if syncBackend, ok := b.Backend.(SyncCollectionBackend); ok {
+		props[internal.SyncTokenName] = func(*internal.RawXMLValue) (interface{}, error) {
+			token, err := syncBackend.CurrentSyncToken(ctx, cal.Path)
+			if err != nil {
+				return nil, err
+			}
+			return &internal.SyncToken{Token: token}, nil
+		}
 	}
 
 	// TODO: CALDAV:calendar-timezone, CALDAV:supported-calendar-component-set, CALDAV:min-date-time, CALDAV:max-date-time, CALDAV:max-instances, CALDAV:max-attendees-per-instance

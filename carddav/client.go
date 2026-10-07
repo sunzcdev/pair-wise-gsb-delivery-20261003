@@ -440,7 +440,7 @@ func (c *Client) SyncCollection(ctx context.Context, path string, query *SyncQue
 		return nil, err
 	}
 
-	ret := &SyncResponse{SyncToken: ms.SyncToken}
+	ret := &SyncResponse{SyncToken: ms.SyncToken, MoreResults: ms.MoreResults != nil}
 	var errs []error
 	for _, resp := range ms.Responses {
 		p, err := resp.Path()

@@ -4,6 +4,7 @@
 package caldav
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -142,9 +143,40 @@ type SyncQuery struct {
 	Limit       int // <= 0 means unlimited
 }
 
-// SyncResponse contains the returned sync-token for next time
+// SyncResponse contains the result of a sync-collection REPORT.
+//
+// Updated contains the calendar object resources that have been added or
+// modified. Deleted contains the paths of resources that have been removed.
+// The distinction is conveyed in the protocol by an explicit response status,
+// as required by RFC 6578 section 6.3.
 type SyncResponse struct {
-	SyncToken string
-	Updated   []CalendarObject
-	Deleted   []string
+	SyncToken   string
+	Updated     []CalendarObject
+	Deleted     []string
+	MoreResults bool
+}
+
+// SyncCollectionBackend is an optional Backend extension adding support for
+// the RFC 6578 sync-collection REPORT. A Backend that doesn't implement this
+// interface keeps its previous behavior: the server doesn't advertise the
+// "sync-collection" DAV feature and rejects sync-collection requests.
+type SyncCollectionBackend interface {
+	// SyncCollection synchronizes the calendar collection at path. An empty
+	// syncToken requests an initial synchronization; a non-empty token
+	// requests the changes that happened since the token was issued. The
+	// limit, when positive, bounds the number of returned changes and forces
+	// MoreResults to be true when more pages remain.
+	SyncCollection(ctx context.Context, path string, query *SyncQuery) (*SyncResponse, error)
+
+	// CurrentSyncToken returns the current sync token of the calendar
+	// collection at path. It backs the DAV:sync-token live property.
+	CurrentSyncToken(ctx context.Context, path string) (string, error)
+}
+
+// InvalidSyncTokenError wraps err into an HTTP 403 error carrying the
+// DAV:valid-sync-token precondition (RFC 6578 section 3.2). Backends should
+// return it when the sync token is unknown, expired, or was issued for another
+// collection.
+func InvalidSyncTokenError(err error) error {
+	return internal.InvalidSyncTokenError(err)
 }
