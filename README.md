@@ -212,6 +212,49 @@ list, err := jsonquery.QueryAll(doc, "*")
 
 - `FindOne` will panic error and interrupt your program if give xpath query expr is not valid.
 
+#### Projection plans
+
+The reporting layer can project each selected record into fixed columns once,
+instead of calling `FindOne` repeatedly. Compile a row-selection XPath and a
+set of relative column XPaths into a reusable `ProjectionPlan`. Each column
+declares whether it is required, its expected type, and whether it collects a
+single value or every matched node. A plan stores only compiled expressions,
+so it can be reused for different documents without retaining node pointers
+from a previous document.
+
+```go
+plan, err := jsonquery.CompileProjection("/store/book/*", []jsonquery.Column{
+    {Name: "title", XPath: "title", Required: true, Type: jsonquery.TypeString},
+    {Name: "price", XPath: "price", Required: true, Type: jsonquery.TypeNumber},
+    {Name: "isbn", XPath: "isbn", Type: jsonquery.TypeString, Default: ""},
+    {Name: "authors", XPath: "author/*", Multi: true, Type: jsonquery.TypeString},
+    // Conversions only happen when a rule is explicitly selected.
+    {Name: "priceText", XPath: "price", Type: jsonquery.TypeString, Convert: jsonquery.AsText},
+})
+if err != nil {
+    panic(err)
+}
+
+for _, row := range plan.Project(doc) {
+    if row.Failed() {
+        // Other rows are still projected; inspect row.Diagnostics per row.
+        continue
+    }
+    values := row.Values() // map in column declaration order: title, price, ...
+    _ = values
+}
+```
+
+- A single-value column that matches more than one node records a
+  `DiagMultiple` diagnostic for that row and column.
+- A missing required column records a `DiagMissing` diagnostic; an optional
+  column without a default is simply unset.
+- An explicit JSON `null` is kept as a set `nil` value and is never replaced by
+  the column default; use `Cell.Set` to distinguish it from a missing value.
+- Without a `Convert` rule the native JSON value is checked against `Type` and
+  mismatches record a `DiagType` diagnostic; values are never coerced
+  implicitly.
+
 #### OutputXML()
 
 Convert current JSON object to XML format.
