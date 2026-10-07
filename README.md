@@ -166,6 +166,8 @@ func server() {
 * `MaxFrameSize`: Maximum size of a frame.
 * `MaxReceiveBuffer`: Maximum size of the shared receive buffer.
 * `MaxStreamBuffer`: Maximum size of the per-stream buffer.
+* `MaxIncomingStreams`: Maximum number of peer-initiated streams, including those queued for `AcceptStream`. Excess streams are explicitly rejected with a FIN. 0 means no limit.
+* `MaxAcceptBacklog`: Maximum number of incoming streams queued for `AcceptStream`. 0 means the default backlog (1024).
 
 ## Reference
 

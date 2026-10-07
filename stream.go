@@ -41,6 +41,8 @@ type stream struct {
 	id   uint32 // Stream identifier
 	sess *Session
 
+	isIncoming bool // peer-initiated stream, accounted in Session.numIncoming
+
 	bufferRing bufferRing // ring buffer for ordered incoming data
 
 	bufferLock sync.Mutex // Mutex to protect access to buffers

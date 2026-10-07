@@ -104,6 +104,9 @@ type Session struct {
 	streams    map[uint32]*stream // all streams in this session
 	streamLock sync.Mutex         // locks streams
 
+	numIncoming int                 // peer-initiated streams, including those pending accept
+	rejected    map[uint32]struct{} // rejected stream ids, never reused within this session
+
 	die     chan struct{} // flag session has died
 	dieOnce sync.Once
 	closed  int32 // atomic flag for fast IsClosed check
@@ -139,7 +142,12 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.conn = conn
 	s.config = config
 	s.streams = make(map[uint32]*stream)
-	s.chAccepts = make(chan *stream, defaultAcceptBacklog)
+	s.rejected = make(map[uint32]struct{})
+	backlog := config.MaxAcceptBacklog
+	if backlog <= 0 {
+		backlog = defaultAcceptBacklog
+	}
+	s.chAccepts = make(chan *stream, backlog)
 	s.bucket = int32(config.MaxReceiveBuffer)
 	s.bucketNotify = make(chan struct{}, 1)
 	s.shaper = make(chan writeRequest, maxShaperSize)
@@ -192,30 +200,40 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
-		return nil, err
-	}
-
+	// register the stream before sending the SYN, so that frames racing
+	// back for this stream (e.g. an immediate FIN rejection) are not
+	// dropped before the stream is visible to recvLoop.
 	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
 	select {
 	case <-s.chSocketReadError:
+		s.streamLock.Unlock()
 		return nil, s.socketReadError.Load().(error)
 	case <-s.chSocketWriteError:
+		s.streamLock.Unlock()
 		return nil, s.socketWriteError.Load().(error)
 	case <-s.die:
+		s.streamLock.Unlock()
 		return nil, io.ErrClosedPipe
 	default:
 		s.streams[sid] = stream
-		wrapper := &Stream{stream: stream}
-		// NOTE(x): disabled finalizer for issue #997
-		/*
-			runtime.SetFinalizer(wrapper, func(s *Stream) {
-				s.Close()
-			})
-		*/
-		return wrapper, nil
 	}
+	s.streamLock.Unlock()
+
+	if _, err := s.writeControlFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+		s.streamLock.Lock()
+		delete(s.streams, sid)
+		s.streamLock.Unlock()
+		return nil, err
+	}
+
+	wrapper := &Stream{stream: stream}
+	// NOTE(x): disabled finalizer for issue #997
+	/*
+		runtime.SetFinalizer(wrapper, func(s *Stream) {
+			s.Close()
+		})
+	*/
+	return wrapper, nil
 }
 
 // Open returns a generic ReadWriteCloser
@@ -370,7 +388,23 @@ func (s *Session) streamClosed(sid uint32) {
 			s.notifyBucket()
 		}
 	}
+	if stream.isIncoming {
+		s.numIncoming--
+	}
 	delete(s.streams, sid)
+}
+
+// incomingLimitReachedLocked reports whether a new incoming stream would
+// exceed the configured limits. s.streamLock must be held.
+//
+// The pending-accept check compares against the accept queue capacity, so a
+// subsequent send to s.chAccepts by recvLoop (the only producer) can never
+// block: AcceptStream only drains the queue.
+func (s *Session) incomingLimitReachedLocked() bool {
+	if s.config.MaxIncomingStreams > 0 && s.numIncoming >= s.config.MaxIncomingStreams {
+		return true
+	}
+	return len(s.chAccepts) >= cap(s.chAccepts)
 }
 
 // returnTokens is called by stream to return token after read
@@ -429,15 +463,33 @@ func (s *Session) recvLoop() {
 				return
 			}
 			var accepted *stream
+			var reject bool
 			s.streamLock.Lock()
 			if _, ok := s.streams[sid]; !ok {
-				stream := newStream(sid, s.config.MaxFrameSize, s)
-				s.streams[sid] = stream
-				accepted = stream
+				if _, dup := s.rejected[sid]; dup {
+					// this stream id has been rejected before and must not
+					// be reused, reject it again explicitly.
+					reject = true
+				} else if s.incomingLimitReachedLocked() {
+					// incoming limits reached, explicitly reject the
+					// stream instead of stalling recvLoop.
+					s.rejected[sid] = struct{}{}
+					reject = true
+				} else {
+					stream := newStream(sid, s.config.MaxFrameSize, s)
+					stream.isIncoming = true
+					s.streams[sid] = stream
+					s.numIncoming++
+					accepted = stream
+				}
 			}
 			s.streamLock.Unlock()
 
-			if accepted != nil {
+			if reject {
+				// explicit rejection: notify the peer with a FIN frame,
+				// so the peer's stream fails fast instead of hanging.
+				s.writeControlFrame(newFrame(byte(s.config.Version), cmdFIN, sid))
+			} else if accepted != nil {
 				select {
 				case s.chAccepts <- accepted:
 				case <-s.die:
@@ -451,6 +503,11 @@ func (s *Session) recvLoop() {
 			}
 			s.streamLock.Lock()
 			st := s.streams[sid]
+			if st == nil {
+				// the peer has closed a rejected stream, its id
+				// can be garbage collected now.
+				delete(s.rejected, sid)
+			}
 			s.streamLock.Unlock()
 			if st != nil {
 				st.fin() // fin unblocks the readers and writers
