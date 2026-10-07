@@ -57,6 +57,39 @@ func main() {
 
 You can find the full documentation at [pkg.go.dev](https://pkg.go.dev/github.com/ulikunitz/xz).
 
+## Random access
+
+When the compressed data is available as an `io.ReaderAt` together
+with its size (for instance an `*os.File` or a `*bytes.Reader`),
+`NewRandomReader` provides random access without decompressing the
+whole file. It scans the stream footers and indexes backwards, so it
+supports multiple concatenated streams and the legal inter-stream
+padding. Index CRC-32 checksums, footer and header checksums, block
+headers and all size relations are validated when the reader is
+created.
+
+```go
+rr, err := xz.NewRandomReader(f, size)
+if err != nil {
+    log.Fatalf("NewRandomReader error %s", err)
+}
+p := make([]byte, 100)
+// reads and verifies only the blocks covering [5000, 5100)
+n, err := rr.ReadAt(p, 5000)
+```
+
+`ReadAt` maps the logical uncompressed offset to the correct block and
+returns blocks in order when the requested interval spans more than
+one block. A read block is fully decompressed and its block check
+(CRC-32, CRC-64 or SHA-256) is verified before the requested bytes are
+returned. Blocks that the request doesn't touch are not decompressed
+and their content checks are not verified.
+
+`RandomReaderConfig` limits the memory used for indexes
+(`MaxIndexMemory`), LZMA2 dictionaries (`MaxDictCap`) and a single
+decompressed block (`MaxBlockMemory`); files that announce overflowing
+or contradictory lengths are rejected.
+
 ## Using the gxz compression tool
 
 The package includes a gxz command line utility for compression and

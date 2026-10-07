@@ -51,3 +51,30 @@ func ExampleWriter() {
 	}
 	// Output:
 }
+
+func ExampleNewRandomReader() {
+	// A file provides io.ReaderAt together with its size.
+	f, err := os.Open("fox.xz")
+	if err != nil {
+		log.Fatalf("os.Open error %s", err)
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		log.Fatalf("f.Stat error %s", err)
+	}
+
+	// The layout is recovered from the stream footers and indexes;
+	// only the blocks overlapping the request are decompressed.
+	rr, err := xz.NewRandomReader(f, fi.Size())
+	if err != nil {
+		log.Fatalf("NewRandomReader error %s", err)
+	}
+	p := make([]byte, 5)
+	if _, err = rr.ReadAt(p, 4); err != nil {
+		log.Fatalf("ReadAt error %s", err)
+	}
+	fmt.Printf("%s", p)
+	// Output:
+	// quick
+}

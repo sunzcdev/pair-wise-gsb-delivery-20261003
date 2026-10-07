@@ -20,6 +20,7 @@
 
 1. Support parallel go routines for writing and reading xz files.
 2. Support a ReaderAt interface for xz files with small block sizes.
+   Implemented by RandomReader, NewRandomReader and RandomReaderConfig.
 3. Improve compatibility between gxz and xz
 4. Provide manual page for gxz
 
