@@ -10245,6 +10245,10 @@ var budgetedWalks = []budgetedWalk{
 		factors:       "distinct (reader,writer) pairs x (children + per-container min-bytes)",
 		binds:         "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
 		reachingPaths: "one: ctx (seen + minBytes) created in Resolve, threaded through the whole resolution"},
+	{fn: "compile", file: "transcode.go", class: schemaDAG,
+		factors:       "distinct (reader,writer) node pairs x children-per-pair (record fields, union branches, container items)",
+		binds:         "the tCompile.seen map[nodePair]*tbox memo, threaded from Transcode with no defer-delete; a back edge closes through a trampoline placeholder, so each pair compiles once and a recursive schema terminates",
+		reachingPaths: "one: tCompile (seen) created in Transcode, threaded through the whole plan compile; the plan is reused read-only across independent Append/Write calls"},
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
 		factors: "nodes emitted x bytes per node",
 		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection. " +

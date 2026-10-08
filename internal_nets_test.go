@@ -845,12 +845,14 @@ var censusRegistry = []censusQuestion{
 			{repr: "CheckCompatibility, writer field to reader slot", site: "checkRecordFieldClaimsUnique", file: "compat.go"},
 			{repr: "Resolve, writer field to reader slot", site: "resolveRecord", file: "resolve.go"},
 			{repr: "JSON object decode, JSON key to reader slot", site: "iterateRecordFields", file: "json_decode.go"},
+			{repr: "Transcode, writer field to reader slot", site: "compileRecord", file: "transcode.go"},
 		},
 		tells: []censusTell{
 			{pattern: `make([]bool,`, files: []string{
 				"compat.go",      // claimed
 				"resolve.go",     // readerMatched
 				"json_decode.go", // seen
+				"transcode.go",   // matched
 				// Not an answerer, registered so the guard does not flag it:
 				// this tracks which struct fields carry an omitzero directive,
 				// which is a property of the Go type and claims no slot.

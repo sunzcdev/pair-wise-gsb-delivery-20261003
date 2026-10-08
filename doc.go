@@ -104,6 +104,21 @@
 // If you only want to check whether two schemas are compatible, use
 // [CheckCompatibility].
 //
+// # Binary transcoding
+//
+// Upgrading a consumer to a new schema does not require a Go value in the
+// middle. [Transcode] compiles a plan that rewrites writer-schema binary
+// directly into reader-schema binary, applying the same resolution rules:
+// field reordering and aliases, added defaults, numeric and string/bytes
+// promotions, enum defaults, and union-branch remapping. Sub-values that are
+// identical on both wires are copied verbatim; fields that genuinely need to
+// move are buffered up to the [WithReorderBuffer] limit. A failure carries
+// the dotted path and the number of bytes already written; a plain
+// [io.Writer] destination is not rolled back:
+//
+//	tr, err := avro.Transcode(writerSchema, readerSchema)
+//	out, rest, err := tr.Append(nil, writerBytes)
+//
 // A null union branch decodes to the target's Go zero value, replacing any
 // prior value. Use *T if you need to tell null from zero.
 //
