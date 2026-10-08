@@ -79,6 +79,54 @@ Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).
 
+## Plugins and namespaces
+
+Different plugins can own their own configuration structures while the core
+keeps rejecting misspelled fields. A plugin is registered with a unique
+namespace, a single field prefix and a pointer to its config struct.
+
+Prefixes are validated for conflicts against each other and the core
+configuration before any source is read. The prefix is used by every source:
+it is the top-level key in files, the environment segment (`APP_AUTH_TOKEN`)
+and the flag segment (`--app.auth.token`). Fields of different plugins never
+share storage, and `required` is enforced only for enabled plugins.
+
+```go
+type AuthConfig struct {
+	Token string `required:"true"`
+}
+
+var authCfg AuthConfig
+
+loader := aconfig.LoaderFor(&cfg, aconfig.Config{
+	EnvPrefix:  "APP",
+	FlagPrefix: "app",
+	Files:      []string{"config.json"},
+	Plugins: []aconfig.PluginSpec{
+		{Namespace: "auth", Prefix: "auth", Config: &authCfg, Enabled: true},
+	},
+	// RejectDisabledPluginConfig (default) fails when a disabled plugin
+	// receives a value; IgnoreDisabledPluginConfig drops such values.
+	DisabledPluginPolicy: aconfig.RejectDisabledPluginConfig,
+})
+
+// enable/disable a plugin before Load
+if err := loader.SetPluginEnabled("auth", true); err != nil {
+	panic(err)
+}
+if err := loader.Load(); err != nil {
+	panic(err)
+}
+
+// config.json: {"auth": {"token": "secret"}}
+// env:         APP_AUTH_TOKEN=secret
+// flags:       --app.auth.token secret
+_ = authCfg.Token
+```
+
+A failed `Load` never publishes a partial result: every destination (core and
+plugins) is rolled back to its state before loading.
+
 ## Documentation
 
 See [these docs][pkg-url].

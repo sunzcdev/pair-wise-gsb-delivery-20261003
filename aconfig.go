@@ -11,13 +11,15 @@ import (
 
 // Loader of user configuration.
 type Loader struct {
-	config  Config
-	dst     any
-	parser  *structParser
-	fields  []*fieldData
-	fsys    fs.FS
-	flagSet *flag.FlagSet
-	errInit error
+	config       Config
+	dst          any
+	parser       *structParser
+	fields       []*fieldData
+	plugins      []*preparedPlugin
+	fsys         fs.FS
+	flagSet      *flag.FlagSet
+	errInit      error
+	coreSnapshot any
 }
 
 // Config to configure configuration loader.
@@ -101,6 +103,16 @@ type Config struct {
 
 	// SliceSeparator hold the separator for slice values. Default is ",".
 	SliceSeparator string
+
+	// Plugins registers configuration structures under their own namespaces.
+	// Every plugin reserves a prefix used by files, environment variables
+	// and flags. Namespaces are validated for conflicts before any source
+	// is read; fields of different plugins never share storage.
+	Plugins []PluginSpec
+
+	// DisabledPluginPolicy defines how values provided for a registered but
+	// disabled plugin are handled. Defaults to RejectDisabledPluginConfig.
+	DisabledPluginPolicy DisabledPluginPolicy
 }
 
 // FileDecoder is used to read config from files. See aconfig submodules.
@@ -180,27 +192,31 @@ func (l *Loader) init() {
 			return
 		}
 	} else {
+		if len(l.config.Plugins) > 0 {
+			// Snapshot before parsing: parsing may allocate pointer
+			// fields, and a failed Load must roll them back too.
+			l.coreSnapshot = snapshot(l.dst)
+		}
 		l.fields = l.getFields(l.dst)
+	}
+
+	if l.config.NewParser {
+		if len(l.config.Plugins) > 0 {
+			l.errInit = fmt.Errorf("plugins are not supported with NewParser enabled")
+			return
+		}
+	} else if err := l.initPluginsLegacy(); err != nil {
+		l.errInit = err
+		return
 	}
 
 	l.flagSet = flag.NewFlagSet(l.config.FlagPrefix, flag.ContinueOnError)
 	if !l.config.SkipFlags {
-		names := make(map[string]bool, len(l.fields))
 		if l.config.NewParser {
 			l.flagSet = l.parser.flagSet
-		} else {
-			for _, field := range l.fields {
-				flagName := l.fullTag(l.config.FlagPrefix, field, "flag")
-				if flagName == "" {
-					continue
-				}
-				if names[flagName] && !l.config.AllowDuplicates {
-					l.errInit = fmt.Errorf("duplicate flag %q", flagName)
-					return
-				}
-				names[flagName] = true
-				l.flagSet.String(flagName, field.Tag("default"), field.Tag("usage"))
-			}
+		} else if err := l.registerLegacyFlags(); err != nil {
+			l.errInit = err
+			return
 		}
 	}
 
@@ -236,12 +252,23 @@ func (l *Loader) Load() error {
 		return fmt.Errorf("init loader: %w", l.errInit)
 	}
 	if err := l.loadConfig(); err != nil {
+		if len(l.plugins) > 0 {
+			// Never publish a partial release: roll every destination
+			// back to the state captured before parsing.
+			l.restorePlugins()
+			// Rebuild metadata so a retry starts with clean isSet
+			// markers and fresh snapshots.
+			l.reparseLegacy()
+		}
 		return fmt.Errorf("load config: %w", err)
 	}
 	return nil
 }
 
 func (l *Loader) loadConfig() error {
+	if len(l.plugins) > 0 {
+		return l.loadConfigWithPlugins()
+	}
 	if err := l.parseFlags(); err != nil {
 		return err
 	}

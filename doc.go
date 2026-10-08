@@ -9,4 +9,9 @@
 // Also, aconfig is dependency-free, file decoders are used as separate modules (submodules to be exact) and are added to your go.mod only when used.
 //
 // Loader configuration (`Config` type) has different ways to configure loader, to skip some sources, define prefixes, fail on unknown params.
+//
+// Plugins may register their own configuration structures under unique namespaces
+// via Config.Plugins. Namespaces reserve a field prefix in every source, are
+// validated for conflicts before sources are read, and are loaded atomically:
+// a failed Load rolls the core and every plugin back to their previous state.
 package aconfig
