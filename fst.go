@@ -191,6 +191,27 @@ func (f *FST) Search(aut Automaton, startKeyInclusive, endKeyExclusive []byte) (
 	return newIterator(f, startKeyInclusive, endKeyExclusive, aut)
 }
 
+// PrefixRange returns a read-only iterator over keys beginning with prefix
+// whose associated uint64 value is within the inclusive interval
+// [minVal, maxVal], enumerated in lexicographic key order.
+//
+// It builds in-memory, state-level residual output statistics once for the
+// call and uses them to prune branches that cannot satisfy the interval.  The
+// FST file/bytes are never modified.  For multiple queries over the same FST,
+// build the statistics once with NewStateStats and call
+// StateStats.RangeIterator instead.
+//
+// An empty interval (minVal > maxVal) is valid and yields no results;
+// minVal zero and maxVal math.MaxUint64 are also supported.  A nil prefix
+// enumerates the entire FST.
+func (f *FST) PrefixRange(prefix []byte, minVal, maxVal uint64) (*RangeIterator, error) {
+	stats, err := NewStateStats(f)
+	if err != nil {
+		return nil, err
+	}
+	return stats.RangeIterator(prefix, minVal, maxVal)
+}
+
 // Debug is only intended for debug purposes, it simply asks the underlying
 // decoder visit each state, and pass it to the provided callback.
 func (f *FST) Debug(callback func(int, interface{}) error) error {
