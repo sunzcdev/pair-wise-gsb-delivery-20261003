@@ -863,6 +863,10 @@ var censusRegistry = []censusQuestion{
 				// tier's own ambiguity rule (Q20) resolves a duplicate claim
 				// there. That is a different question with a different remedy.
 				"schema.go",
+				// Binary transcoder: compileRecord's matched slice answers
+				// the identical question (writer field -> reader slot), a
+				// fourth wire over the same resolution rule.
+				"transcode_plan.go",
 			}},
 		},
 	},

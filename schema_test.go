@@ -9611,6 +9611,8 @@ var minBytesCallSites = []minBytesCallSite{
 		why: "the resolver rebuilds the bound against the WRITER's wire format for a resolved array and map"},
 	{file: "skip.go", entry: "Resolve when a writer field is dropped",
 		why: "the skip compiled for a dropped writer field derives the same two bounds"},
+	{file: "transcode_types.go", entry: "NewTranscoder, the binary transcoder's array/map plan",
+		why: "a transcoded array/map rebuilds the block bound against the WRITER's wire format (the body it frames is writer-shaped), the same writer-side derivation resolveArray/resolveMap make"},
 	{file: "deser.go", entry: "n/a, not callers",
 		why: "the definition plus the one real delegation: schemaMinBytes " +
 			"spins up a fresh walk and calls minBytesOf on it for a single standalone node"},
@@ -10245,6 +10247,14 @@ var budgetedWalks = []budgetedWalk{
 		factors:       "distinct (reader,writer) pairs x (children + per-container min-bytes)",
 		binds:         "ctx.seen pair memo (pairs) + ctx.minBytes shared walk (the container min-bytes factor)",
 		reachingPaths: "one: ctx (seen + minBytes) created in Resolve, threaded through the whole resolution"},
+	{fn: "compile", file: "transcode_plan.go", class: schemaDAG,
+		factors:       "distinct (reader,writer) node pairs x children-per-pair + per-container min-bytes",
+		binds:         "xcCompiler.seen map[nodePair]*xcEntry memo with an in-progress/open state and a trampoline closure bound once the graph exists (each pair compiled once, so recursive plan compilation terminates) + xcCompiler.mbw shared minBytesWalk for the block-bound guards its verbatim skippers and array/map converters use",
+		reachingPaths: "one: the compiler (seen + mbw) created in NewTranscoder, threaded through the whole plan; the canonical-equal fast path in NewTranscoder builds only the root skipper's walk"},
+	{fn: "NewTranscoder", file: "transcode.go", class: schemaDAG,
+		factors:       "distinct (reader,writer) node pairs x children-per-pair (the seen map the compiler owns)",
+		binds:         "the same xcCompiler.seen pair memo the compile row describes; NewTranscoder is the entry point that constructs it",
+		reachingPaths: "one: the compiler created in NewTranscoder (the map[nodePair] literal is on the constructor here, the recursive walk in transcode_plan.go)"},
 	{fn: "toJSONWalk", file: "schema_node.go", class: schemaDAG,
 		factors: "nodes emitted x bytes per node",
 		binds: "walkBudget (nodes + bytes), charged by takeNode at the TOP of every entry so a DAG re-descent still spends budget; visited is only cycle detection. " +
@@ -10709,6 +10719,26 @@ var minBytesConstructionSites = []minBytesConstructionSite{
 					return err
 				}},
 		}},
+
+	{file: "transcode.go", context: "mbw:  newMinBytesWalk(),",
+		scope: "the binary transcoder compiler's xcCompiler.mbw, shared across ONE NewTranscoder plan: every verbatim skipper and the dropped-field / array / map block-bound guards it derives join this one walk rather than recompiling per node",
+		factors: []reachFactor{
+			{name: "containers per transcode plan", values: reachCounts,
+				drive: func(n int) error {
+					scc := nContainersOverSCC(n, reachLevels)
+					w := MustParse(scc)
+					r := MustParse(strings.Replace(scc,
+						`{"type":"record","name":"Root","fields":[`,
+						`{"type":"record","name":"Root","fields":[{"name":"extra","type":"int","default":0},`, 1))
+					_, err := NewTranscoder(w, r)
+					return err
+				}},
+		}},
+
+	{file: "transcode.go", context: "mbw := newMinBytesWalk()",
+		scope:  "the canonical-equal fast path's one root skipper walk — a single node (the root), outside the compiler, with no per-container sharing, the same fresh-per-node shape as standalone schemaMinBytes",
+		exempt: "shared across nothing: it builds the skipper for one whole value only, and NewTranscoder returns immediately afterward, so there is no container count for a cell to drive",
+	},
 }
 
 // nRecordsOverSCC references one record definition nrecs times, each reference

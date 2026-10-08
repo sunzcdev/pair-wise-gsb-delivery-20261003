@@ -115,6 +115,29 @@
 // you need large integers to round-trip exactly, keep the reader schema long
 // and decode into an int64.
 //
+// # Binary transcode without Go values
+//
+// When an upgraded consumer expects the new schema's binary encoding but you
+// hold bytes written with the old one, [NewTranscoder] compiles a plan that
+// rewrites writer binary directly into reader binary without decoding into
+// Go objects first. It applies the same resolution rules as [Resolve]:
+// field reordering and aliases, added defaults, removed fields, numeric
+// promotion, enum defaults, and union branch remapping.
+//
+// Subvalues with identical wire bytes are passed through as zero-copy
+// views of the input. A field that must move because the reader reordered
+// its record is the only thing buffered, and only for the duration of that
+// record; bound the buffer with [WithMaxBufferedBytes]. The compiled
+// [*Transcoder] is immutable and safe to share across goroutines, so one
+// plan serves unlimited independent conversions:
+//
+//	tc, err := avro.NewTranscoder(writerSchema, readerSchema)
+//	readerBytes, rest, err := tc.Transcode(writerBytes)
+//
+// On failure the error is a [*TranscodeError] carrying the schema path and
+// the number of bytes already written. Writing to a plain [io.Writer] via
+// [Transcoder.TranscodeTo] cannot roll back, so already-flushed bytes stay.
+//
 // # Struct tags
 //
 // Use the "avro" struct tag to control field mapping and schema inference.
