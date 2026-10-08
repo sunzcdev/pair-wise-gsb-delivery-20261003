@@ -371,6 +371,15 @@ func (l *Loader) loadFile(file string) error {
 		return nil
 	}
 
+	if err := l.applyDecodedFields(tag, file, actualFields); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyDecodedFields maps decoded file values onto the loader fields.
+// Keys remaining in actualFields afterwards are unknown fields.
+func (l *Loader) applyDecodedFields(tag, file string, actualFields map[string]any) error {
 	for _, field := range l.fields {
 		name := l.fullTag("", field, tag)
 		if name == "" {
@@ -393,8 +402,8 @@ func (l *Loader) loadFile(file string) error {
 	}
 
 	if !l.config.AllowUnknownFields {
-		for env := range actualFields {
-			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", file, env)
+		for name := range actualFields {
+			return fmt.Errorf("unknown field in file %q: %s (see AllowUnknownFields config param)", file, name)
 		}
 	}
 	return nil

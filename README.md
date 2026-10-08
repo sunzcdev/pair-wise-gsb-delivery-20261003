@@ -79,6 +79,83 @@ Also see examples: [examples_test.go](https://github.com/cristalhq/aconfig/blob/
 
 Integration with `spf13/cobra` [playground](https://play.golang.org/p/OsCR8qTCN0H).
 
+## Plugin namespaces
+
+When a service is built from plugins that each declare their own config
+structure, use a `Registry`. Every plugin registers its structure together
+with a namespace. All namespaces are checked for conflicts before anything is
+read; afterwards every source is read once and split between the core and the
+enabled plugins.
+
+```go
+type CacheConfig struct {
+	Port int `default:"6379"`
+}
+type MetricsConfig struct {
+	Port int `default:"9090"`
+}
+
+var core MyConfig
+var cache CacheConfig
+var metrics MetricsConfig
+
+registry := aconfig.NewRegistry(&core, aconfig.Config{
+	EnvPrefix:  "APP",
+	FlagPrefix: "app",
+	Files:      []string{"config.json"},
+})
+
+cachePlugin, err := registry.RegisterPlugin("cache", &cache)
+if err != nil {
+	panic(err)
+}
+if _, err := registry.RegisterPlugin("metrics", &metrics); err != nil {
+	panic(err)
+}
+
+// Plugins can be toggled before loading.
+// registry.Disable("cache")
+
+flags, err := registry.Flags() // shared flag set: app.port, app.cache.port, ...
+if err != nil {
+	panic(err)
+}
+_ = flags
+
+if err := registry.Load(); err != nil {
+	panic(err)
+}
+```
+
+Fields are isolated by namespace, so plugins safely reuse the same field
+names:
+
+```json
+{
+	"port": 8080,
+	"cache":   { "port": 6379 },
+	"metrics": { "port": 9090 }
+}
+```
+
+```sh
+export APP_CACHE_PORT=6400   # cache only
+# app.cache.port=6500        # flag form
+```
+
+Rules enforced by the registry:
+
+- duplicate namespaces, a namespace colliding with a core field, or the same
+  env/flag name claimed twice are rejected before loading;
+- an unregistered namespace in a file/env/flag and an unknown core field are
+  still rejected (same strictness as a plain loader);
+- fields with equal names in different plugins never overwrite each other;
+- `required` (and `AllFieldRequired`) is checked only for enabled plugins;
+- configuration sent to a disabled plugin is an error by default
+  (`DisabledConfigError`); use `SetDisabledConfigPolicy(DisabledConfigIgnore)`
+  to silently drop it;
+- loading is atomic: on any error none of the destinations are modified.
+
 ## Documentation
 
 See [these docs][pkg-url].
