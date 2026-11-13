@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Collection
 from builtins import type as Type
+from dataclasses import dataclass, field
 
 import logging
 import typing as t
@@ -20,6 +21,7 @@ from sqlglot.errors import (
     ErrorLevel as ErrorLevel,
     ParseError as ParseError,
     TokenError as TokenError,
+    TranspileIssue as TranspileIssue,
     UnsupportedError as UnsupportedError,
 )
 from sqlglot.expressions import (
@@ -72,6 +74,20 @@ except ImportError:
 
 pretty = False
 """Whether to format generated SQL by default."""
+
+
+@dataclass
+class TranspileResult:
+    """The outcome of transpiling a single SQL statement in issue-collection mode.
+
+    Attributes:
+        sql: The transpiled SQL statement, or None if `strict` mode was requested and
+            semantic losses were found, in which case no executable SQL is returned.
+        issues: The structured semantic losses encountered while transpiling the statement.
+    """
+
+    sql: str | None
+    issues: list[TranspileIssue] = field(default_factory=list)
 
 
 def tokenize(sql: str, read: DialectType = None, dialect: DialectType = None) -> list[Token]:
@@ -200,3 +216,50 @@ def transpile(
         write.generate(expression, copy=False, **opts) if expression else ""
         for expression in parse(sql, read, error_level=error_level)
     ]
+
+
+def transpile_with_issues(
+    sql: str,
+    read: DialectType = None,
+    write: DialectType = None,
+    identity: bool = True,
+    error_level: ErrorLevel | None = None,
+    strict: bool = False,
+    **opts: Unpack[GeneratorArgs],
+) -> list[TranspileResult]:
+    """
+    Transpiles the given SQL string like `transpile`, but also collects every semantic loss
+    (dropped, approximated, or unexpressible constructs) as a structured `TranspileIssue`,
+    so callers can decide whether the result is safe to ship.
+
+    Args:
+        sql: the SQL code string to transpile.
+        read: the source dialect used to parse the input string (eg. "spark", "hive", "presto", "mysql").
+            See `sqlglot.dialects.Dialects` for options.
+        write: the target dialect into which the input should be transformed (eg. "spark", "hive",
+            "presto", "mysql"). See `sqlglot.dialects.Dialects` for options.
+        identity: if set to `True` and if the target dialect is not specified the source dialect will
+            be used as both: the source and the target dialect.
+        error_level: the desired error level of the parser.
+        strict: if set to `True` and any semantic loss was collected for a statement, the
+            corresponding result's `sql` is None instead of executable SQL.
+        **opts: other `sqlglot.generator.Generator` options.
+
+    Returns:
+        A list of `TranspileResult`, one per transpiled statement.
+    """
+    write = (read if write is None else write) if identity else write
+    write = Dialect.get_or_raise(write)
+
+    results = []
+    for expression in parse(sql, read, error_level=error_level):
+        if not expression:
+            results.append(TranspileResult(sql=""))
+            continue
+
+        generator = write.generator(collect_issues=True, **opts)
+        out = generator.generate(expression, copy=False)
+        issues = generator.unsupported_issues
+        results.append(TranspileResult(sql=None if strict and issues else out, issues=issues))
+
+    return results

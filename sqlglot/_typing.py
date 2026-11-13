@@ -54,6 +54,7 @@ class GeneratorNoDialectArgs(t.TypedDict, total=False):
     normalize_functions: str | bool | None
     unsupported_level: ErrorLevel
     max_unsupported: int
+    collect_issues: bool
     leading_comma: bool
     max_text_width: int
     comments: bool

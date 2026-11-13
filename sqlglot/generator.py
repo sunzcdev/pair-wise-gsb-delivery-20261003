@@ -8,7 +8,7 @@ from decimal import Decimal
 from functools import reduce, wraps
 
 from sqlglot import exp
-from sqlglot.errors import ErrorLevel, UnsupportedError, concat_messages
+from sqlglot.errors import ErrorLevel, TranspileIssue, UnsupportedError, concat_messages
 from sqlglot.expressions import apply_index_offset
 from sqlglot.expressions.core import maybe_parse
 from sqlglot.helper import csv, name_sequence, seq_get
@@ -117,6 +117,10 @@ class Generator:
         max_unsupported: Maximum number of unsupported messages to include in a raised UnsupportedError.
             This is only relevant if unsupported_level is ErrorLevel.RAISE.
             Default: 3
+        collect_issues: Whether to record every semantic loss encountered during generation as a
+            structured `TranspileIssue` in `unsupported_issues`. Repeated visits to the same AST
+            node only register a given issue once.
+            Default: False
         leading_comma: Whether the comma is leading or trailing in select expressions.
             This is only relevant when generating in pretty mode.
             Default: False
@@ -919,11 +923,15 @@ class Generator:
         "normalize_functions",
         "unsupported_level",
         "max_unsupported",
+        "collect_issues",
         "leading_comma",
         "max_text_width",
         "comments",
         "dialect",
         "unsupported_messages",
+        "unsupported_issues",
+        "_issue_dedup",
+        "_node_stack",
         "_escaped_quote_end",
         "_escaped_byte_quote_end",
         "_escaped_identifier_end",
@@ -945,6 +953,7 @@ class Generator:
         normalize_functions: str | bool | None = None,
         unsupported_level: ErrorLevel = ErrorLevel.WARN,
         max_unsupported: int = 3,
+        collect_issues: bool = False,
         leading_comma: bool = False,
         max_text_width: int = 80,
         comments: bool = True,
@@ -960,6 +969,7 @@ class Generator:
         self._indent = indent
         self.unsupported_level = unsupported_level
         self.max_unsupported = max_unsupported
+        self.collect_issues = collect_issues
         self.leading_comma = leading_comma
         self.max_text_width = max_text_width
         self.comments = comments
@@ -971,6 +981,9 @@ class Generator:
         )
 
         self.unsupported_messages: list[str] = []
+        self.unsupported_issues: list[TranspileIssue] = []
+        self._issue_dedup: set[tuple[int, str]] = set()
+        self._node_stack: list[exp.Expr] = []
         self._escaped_quote_end: str = (
             self.dialect.tokenizer_class.STRING_ESCAPES[0] + self.dialect.QUOTE_END
         )
@@ -1014,6 +1027,8 @@ class Generator:
         expression = self.preprocess(expression)
 
         self.unsupported_messages = []
+        self.unsupported_issues = []
+        self._issue_dedup = set()
         sql = self.sql(expression).strip()
 
         if self.pretty:
@@ -1060,13 +1075,51 @@ class Generator:
                 diagnostic
                 or UNSUPPORTED_TEMPLATE.format(
                     arg_name, expression.__class__.__name__, self.dialect.__class__.__name__
-                )
+                ),
+                expression,
             )
 
-    def unsupported(self, message: str) -> None:
+    def unsupported(self, message: str, expression: exp.Expr | None = None) -> None:
         if self.unsupported_level == ErrorLevel.IMMEDIATE:
             raise UnsupportedError(message)
         self.unsupported_messages.append(message)
+        if self.collect_issues:
+            self._record_issue(message, expression)
+
+    def _record_issue(self, message: str, expression: exp.Expr | None = None) -> None:
+        if expression is None:
+            expression = self._node_stack[-1] if self._node_stack else None
+
+        dedup_key = (id(expression), message) if expression is not None else (-1, message)
+        if dedup_key in self._issue_dedup:
+            return
+        self._issue_dedup.add(dedup_key)
+
+        self.unsupported_issues.append(
+            TranspileIssue(
+                message=message,
+                dialect=self.dialect.__class__.__name__,
+                expression=expression.__class__.__name__ if expression is not None else None,
+                line=expression.meta_get("line") if expression is not None else None,
+                col=expression.meta_get("col") if expression is not None else None,
+                path=self._structural_path(expression) if expression is not None else None,
+            )
+        )
+
+    def _structural_path(self, expression: exp.Expr) -> str:
+        parts = []
+        node: exp.Expr | None = expression
+        while node is not None:
+            part = node.__class__.__name__
+            if node.parent is not None:
+                part = (
+                    f"{node.arg_key}[{node.index}].{part}"
+                    if node.index is not None
+                    else f"{node.arg_key}.{part}"
+                )
+            parts.append(part)
+            node = node.parent
+        return ".".join(reversed(parts))
 
     def sep(self, sep: str = " ") -> str:
         return f"{sep.strip()}\n" if self.pretty else sep
@@ -1189,16 +1242,25 @@ class Generator:
 
         handler = self._dispatch.get(expression.__class__)
 
-        if handler:
-            sql = handler(self, expression)
-        elif isinstance(expression, exp.Func):
-            sql = self.function_fallback_sql(expression)
-        elif isinstance(expression, exp.Property):
-            sql = self.property_sql(expression)
+        if self.collect_issues:
+            self._node_stack.append(expression)
+            try:
+                sql = self._sql(expression, handler)
+            finally:
+                self._node_stack.pop()
         else:
-            raise ValueError(f"Unsupported expression type {expression.__class__.__name__}")
+            sql = self._sql(expression, handler)
 
         return self.maybe_comment(sql, expression) if self.comments and comment else sql
+
+    def _sql(self, expression: exp.Expr, handler: t.Callable[..., str] | None) -> str:
+        if handler:
+            return handler(self, expression)
+        if isinstance(expression, exp.Func):
+            return self.function_fallback_sql(expression)
+        if isinstance(expression, exp.Property):
+            return self.property_sql(expression)
+        raise ValueError(f"Unsupported expression type {expression.__class__.__name__}")
 
     def uncache_sql(self, expression: exp.Uncache) -> str:
         table = self.sql(expression, "this")

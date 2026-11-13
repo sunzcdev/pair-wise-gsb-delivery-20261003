@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import typing as t
+from dataclasses import dataclass
 from enum import auto
 from collections.abc import Sequence
 from sqlglot.helper import AutoName
@@ -28,6 +29,34 @@ class ErrorLevel(AutoName):
 
 class SqlglotError(Exception):
     pass
+
+
+@dataclass
+class TranspileIssue:
+    """A structured record of a semantic loss encountered during transpilation.
+
+    Instances of this class describe a single point in the source query where the
+    target dialect dropped, approximated, or could not express the source semantics.
+
+    Attributes:
+        message: Description of the specific semantic loss.
+        dialect: The target dialect the SQL was being generated for.
+        expression: The class name of the source AST node the issue refers to, if known.
+        line: The 1-based line of the source node in the original SQL, if the node was
+            parsed from text. Never fabricated - stays None for hand-built ASTs.
+        col: The column of the source node in the original SQL, under the same rules
+            as `line`.
+        path: A structural path (e.g. "Select.expressions[0].Anonymous") locating the
+            source node within the AST. Serves as a substitute for `line`/`col` when
+            the node has no precise source position.
+    """
+
+    message: str
+    dialect: str
+    expression: str | None = None
+    line: int | None = None
+    col: int | None = None
+    path: str | None = None
 
 
 class UnsupportedError(SqlglotError):

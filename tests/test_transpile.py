@@ -2,7 +2,8 @@ import os
 import unittest
 from unittest import mock
 
-from sqlglot import parse_one, transpile
+from sqlglot import exp, parse_one, transpile, transpile_with_issues
+from sqlglot.dialects.dialect import Dialect
 from sqlglot.errors import ErrorLevel, ParseError, UnsupportedError
 from sqlglot.helper import logger as helper_logger
 from sqlglot.parser import logger as parser_logger
@@ -1202,6 +1203,74 @@ WHERE
         with self.assertRaises(UnsupportedError) as ctx:
             unsupported(ErrorLevel.IMMEDIATE)
         self.assertEqual(str(ctx.exception).count(error), 1)
+
+    def test_transpile_with_issues(self):
+        result = transpile_with_issues("SELECT b'abc'", read="bigquery", write="sqlite")[0]
+        self.assertEqual(result.sql, "SELECT")
+        self.assertEqual(len(result.issues), 1)
+
+        issue = result.issues[0]
+        self.assertEqual(issue.message, "Byte strings are not supported for SQLite")
+        self.assertEqual(issue.dialect, "SQLite")
+        self.assertEqual(issue.expression, "ByteString")
+        self.assertEqual((issue.line, issue.col), (1, 13))
+        self.assertEqual(issue.path, "Select.expressions[0].ByteString")
+
+    def test_transpile_with_issues_multiple(self):
+        result = transpile_with_issues(
+            "SELECT /*+ BROADCAST(t) */ x FROM t EXCEPT ALL SELECT y FROM s",
+            read="spark",
+            write="snowflake",
+        )[0]
+        messages = [issue.message for issue in result.issues]
+        self.assertEqual(len(result.issues), 2)
+        self.assertIn("Hints are not supported", messages)
+        self.assertIn("EXCEPT ALL is not supported", messages)
+        self.assertTrue(all(issue.dialect == "Snowflake" for issue in result.issues))
+
+    def test_transpile_with_issues_dedup(self):
+        generator = Dialect.get_or_raise("snowflake").generator(collect_issues=True)
+        node = parse_one("SELECT 1")
+
+        generator.unsupported("loss", node)
+        generator.unsupported("loss", node)
+        generator.unsupported("other loss", node)
+
+        self.assertEqual(
+            [issue.message for issue in generator.unsupported_issues], ["loss", "other loss"]
+        )
+
+    def test_transpile_with_issues_handmade_ast(self):
+        tree = exp.select("*").from_("t")
+        tree.set("hint", exp.Hint(expressions=[exp.to_identifier("BROADCAST")]))
+
+        generator = Dialect.get_or_raise("snowflake").generator(collect_issues=True)
+        generator.generate(tree)
+
+        issue = generator.unsupported_issues[0]
+        self.assertEqual(issue.message, "Hints are not supported")
+        self.assertIsNone(issue.line)
+        self.assertIsNone(issue.col)
+        self.assertEqual(issue.path, "Select.hint.Hint")
+
+    def test_transpile_with_issues_strict(self):
+        result = transpile_with_issues(
+            "SELECT /*+ BROADCAST(t) */ * FROM t", read="spark", write="snowflake", strict=True
+        )[0]
+        self.assertIsNone(result.sql)
+        self.assertEqual(len(result.issues), 1)
+
+        # Non-strict mode keeps the current behavior of returning executable SQL
+        result = transpile_with_issues(
+            "SELECT /*+ BROADCAST(t) */ * FROM t", read="spark", write="snowflake"
+        )[0]
+        self.assertEqual(result.sql, "SELECT * FROM t")
+        self.assertEqual(len(result.issues), 1)
+
+    def test_transpile_with_issues_lossless_rename(self):
+        result = transpile_with_issues("SELECT POW(2, 3)", read="mysql", write="postgres")[0]
+        self.assertEqual(result.sql, "SELECT POWER(2, 3)")
+        self.assertEqual(result.issues, [])
 
     def test_recursion(self):
         sql = "1 AND 2 OR 3 AND " * 1000
