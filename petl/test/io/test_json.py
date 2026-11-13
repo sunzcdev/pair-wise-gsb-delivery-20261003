@@ -535,3 +535,124 @@ def test_fromdicts_generator_dicts_attribute_is_consumable(dicts_generator):
     assert next(it) == {'foo': 'a', 'bar': 1}
     assert len(list(it)) == 2
     assert list(actual.dicts) == []
+
+
+@pytest.fixture(params=[False, True])
+def dicts_source(request):
+    records = [
+        {'user': {'name': 'a', 'tags': ['x', 'y']}, 'id': 1},
+        {'user': {'name': 'b', 'tags': []}, 'id': 2},
+        {'user': {'name': None}, 'id': 3},
+    ]
+    if request.param:
+        return (record for record in records)
+    return records
+
+
+def test_fromdicts_paths_projection(dicts_source):
+    paths = OrderedDict([
+        ('name', ('user', 'name')),
+        ('first_tag', ('user', 'tags', 0)),
+        ('missing_key', ('user', 'email')),
+    ])
+    table = fromdicts(dicts_source, paths=paths, missing='?',
+                      on_index='missing')
+    expected = [('name', 'first_tag', 'missing_key'),
+                ('a', 'x', '?'),
+                ('b', '?', '?'),
+                (None, '?', '?')]
+    assert [tuple(row) for row in table] == expected
+    assert [tuple(row) for row in table] == expected
+
+
+def test_fromdicts_paths_column_order_fixed():
+    records = [{'b': 1, 'a': 2}, {'b': 3, 'a': 4}]
+    paths = OrderedDict([('z', ('b',)), ('y', ('a',))])
+    table = fromdicts(records, paths=paths)
+    assert list(table) == [('z', 'y'), (1, 2), (3, 4)]
+
+
+def test_fromdicts_paths_dotted_key_literal():
+    records = [{'a.b': {'c.d': 1}}]
+    table = fromdicts(records, paths={'out': ('a.b', 'c.d')})
+    assert list(table) == [('out',), (1,)]
+
+
+def test_fromdicts_paths_bare_segment():
+    records = [{'foo': 1}, {'foo': 2}]
+    table = fromdicts(records, paths={'bar': 'foo'})
+    assert list(table) == [('bar',), (1,), (2,)]
+
+
+def test_fromdicts_paths_null_preserved_and_missing_default():
+    records = [{'a': {'b': None}}, {'a': {}}]
+    table = fromdicts(records, paths={'b': ('a', 'b')}, missing='?')
+    assert list(table) == [('b',), (None,), ('?',)]
+
+
+def test_fromdicts_paths_scalar_error():
+    records = [{'a': {'b': {'c': 1}}}, {'a': 5}]
+    table = fromdicts(records, paths={'out': ('a', 'b', 'c')})
+    with pytest.raises(ValueError, match="object 1.*segment 'b'"):
+        list(table)
+
+
+def test_fromdicts_paths_scalar_missing():
+    records = [{'a': {'b': 1}}, {'a': 5}]
+    table = fromdicts(records, paths={'out': ('a', 'b')}, missing='?',
+                      on_scalar='missing')
+    assert list(table) == [('out',), (1,), ('?',)]
+
+
+def test_fromdicts_paths_index_error():
+    records = [{'a': [1]}, {'a': [2]}]
+    table = fromdicts(records, paths={'out': ('a', 1)})
+    with pytest.raises(ValueError, match='object 0.*index 1'):
+        list(table)
+
+
+def test_fromdicts_paths_index_missing():
+    records = [{'a': [1]}, {'a': [2, 3]}]
+    table = fromdicts(records, paths={'out': ('a', 1)}, missing='?',
+                      on_index='missing')
+    assert list(table) == [('out',), ('?',), (3,)]
+
+
+def test_fromdicts_paths_shared_prefix_independent():
+    records = [{'user': {'name': 'a', 'tags': ['x']}}]
+    paths = OrderedDict([
+        ('name', ('user', 'name')),
+        ('tag', ('user', 'tags', 0)),
+        ('user', ('user',)),
+    ])
+    table = fromdicts(records, paths=paths)
+    expected = [('name', 'tag', 'user'), ('a', 'x', {'name': 'a', 'tags': ['x']})]
+    assert list(table) == expected
+    assert records == [{'user': {'name': 'a', 'tags': ['x']}}]
+
+
+def test_fromdicts_paths_generator_not_exhausted_for_header():
+    consumed = []
+
+    def source():
+        for record in [{'a': 1}, {'a': 2}]:
+            consumed.append(record)
+            yield record
+
+    table = fromdicts(source(), paths={'a': ('a',)})
+    rows = iter(table)
+    assert next(rows) == ('a',)
+    assert consumed == []
+    assert list(rows) == [(1,), (2,)]
+    assert list(table) == [('a',), (1,), (2,)]
+
+
+def test_fromdicts_paths_and_header_conflict():
+    with pytest.raises(ValueError, match='header or paths'):
+        fromdicts([{'a': 1}], header=['a'], paths={'a': ('a',)})
+
+
+@pytest.mark.parametrize('arg', ['on_scalar', 'on_index'])
+def test_fromdicts_paths_invalid_mode(arg):
+    with pytest.raises(ValueError, match=arg):
+        fromdicts([{'a': 1}], paths={'a': ('a',)}, **{arg: 'bogus'})

@@ -10,7 +10,7 @@ from json.encoder import JSONEncoder
 from os import unlink
 from tempfile import NamedTemporaryFile
 
-from petl.compat import PY2
+from petl.compat import PY2, string_types
 from petl.compat import pickle
 from petl.io.sources import read_source_from_arg, write_source_from_arg
 # internal dependencies
@@ -141,7 +141,8 @@ class JsonView(Table):
                     f.detach()
 
 
-def fromdicts(dicts, header=None, sample=1000, missing=None):
+def fromdicts(dicts, header=None, sample=1000, missing=None, paths=None,
+              on_scalar='error', on_index='error'):
     """
     View a sequence of Python :class:`dict` as a table. E.g.::
 
@@ -192,6 +193,40 @@ def fromdicts(dicts, header=None, sample=1000, missing=None):
 
     See also :func:`petl.io.json.fromjson`.
 
+    Alternatively, nested structures can be projected with the `paths`
+    argument, a mapping of output column name to a sequence of path
+    segments. Each path segment is either an object key or a non-negative
+    array index; keys containing dots are used as-is, no expression
+    evaluation takes place. The output columns follow the order the
+    projections are defined in, and the objects are not sampled for field
+    discovery. E.g.::
+
+        >>> import petl as etl
+        >>> dicts = [{"user": {"name": "a", "tags": ["x", "y"]}},
+        ...          {"user": {"name": "b", "tags": []}},
+        ...          {"user": {"name": None}}]
+        >>> table1 = etl.fromdicts(dicts, paths={
+        ...     'name': ('user', 'name'),
+        ...     'first_tag': ('user', 'tags', 0),
+        ... }, missing='?', on_index='missing')
+        >>> table1
+        +------+-----------+
+        | name | first_tag |
+        +======+===========+
+        | 'a'  | 'x'       |
+        +------+-----------+
+        | 'b'  | '?'       |
+        +------+-----------+
+        | None | '?'       |
+        +------+-----------+
+
+    A path that is absent from an object yields `missing`, while an
+    existing null value is kept as `None`. If a scalar value is found
+    before the end of a path, or an array index is out of bounds, the
+    `on_scalar` and `on_index` arguments select whether an error is
+    raised (the default) or `missing` is used. Errors report the index
+    of the offending object and the path segment that failed.
+
     .. versionchanged:: 1.1.0
 
     If no `header` is specified, fields will be discovered by sampling keys
@@ -213,8 +248,15 @@ def fromdicts(dicts, header=None, sample=1000, missing=None):
     instead of `itertools.tee` due to high memory usage.
 
     """
+    if paths is not None and header is not None:
+        raise ValueError('specify either header or paths, not both')
+    for name, value in (('on_scalar', on_scalar), ('on_index', on_index)):
+        if value not in ('error', 'missing'):
+            raise ValueError("%s must be 'error' or 'missing', got %r"
+                             % (name, value))
     view = DictsGeneratorView if inspect.isgenerator(dicts) else DictsView
-    return view(dicts, header=header, sample=sample, missing=missing)
+    return view(dicts, header=header, sample=sample, missing=missing,
+                paths=paths, on_scalar=on_scalar, on_index=on_index)
 
 
 class _DictsAttr(object):
@@ -264,17 +306,29 @@ class _DictsAttr(object):
 
 class DictsView(Table):
 
-    def __init__(self, dicts, header=None, sample=1000, missing=None):
+    def __init__(self, dicts, header=None, sample=1000, missing=None,
+                 paths=None, on_scalar='error', on_index='error'):
         self._dicts = dicts
         self._header = header
         self.sample = sample
         self.missing = missing
+        self._paths = paths
+        self._pathspec = None
+        self.on_scalar = on_scalar
+        self.on_index = on_index
 
     def __iter__(self):
-        if self._header is not None:
-            self._header = tuple(self._header)
-        for row in iterdicts(self._dicts, self._header, self.sample, self.missing):  # noqa: UP028 - Python 2 compatibility
-            yield row
+        if self._paths is not None:
+            if self._pathspec is None:
+                self._pathspec = _normalize_paths(self._paths)
+            for row in iterprojected(self._dicts, self._pathspec, self.missing,
+                                     self.on_scalar, self.on_index):
+                yield row
+        else:
+            if self._header is not None:
+                self._header = tuple(self._header)
+            for row in iterdicts(self._dicts, self._header, self.sample, self.missing):  # noqa: UP028 - Python 2 compatibility
+                yield row
 
     @property
     def dicts(self):
@@ -290,13 +344,19 @@ class DictsView(Table):
 
 class DictsGeneratorView(DictsView):
 
-    def __init__(self, dicts, header=None, sample=1000, missing=None):
-        super(DictsGeneratorView, self).__init__(dicts, header, sample, missing)
+    def __init__(self, dicts, header=None, sample=1000, missing=None,
+                 paths=None, on_scalar='error', on_index='error'):
+        super(DictsGeneratorView, self).__init__(
+            dicts, header, sample, missing, paths, on_scalar, on_index)
         self._filecache = None
         self._cached = 0
 
     def __iter__(self):
-        if self._header is None:
+        if self._paths is not None:
+            if self._pathspec is None:
+                self._pathspec = _normalize_paths(self._paths)
+            self._header = tuple(column for column, _ in self._pathspec)
+        elif self._header is None:
             self._determine_header()
         else:
             self._header = tuple(self._header)
@@ -309,23 +369,32 @@ class DictsGeneratorView(DictsView):
                 self._filecache = NamedTemporaryFile(delete=False, mode='wb+', buffering=0)
 
         position = 0
+        position_index = 0
         it = iter(self._dicts)
         while True:
             if position < self._cached:
                 self._filecache.seek(position)
                 row = pickle.load(self._filecache)
                 position = self._filecache.tell()
+                position_index += 1
                 yield row
                 continue
             try:
                 o = next(it)
             except StopIteration:
                 break
-            row = tuple(o.get(f, self.missing) for f in self._header)
+            row = self._make_row(o, position_index)
+            position_index += 1
             self._filecache.seek(self._cached)
             pickle.dump(row, self._filecache, protocol=-1)
             self._cached = position = self._filecache.tell()
             yield row
+
+    def _make_row(self, o, index):
+        if self._paths is not None:
+            return _project_row(o, self._pathspec, self.missing,
+                                self.on_scalar, self.on_index, index)
+        return tuple(o.get(f, self.missing) for f in self._header)
 
     def _determine_header(self):
         it = iter(self._dicts)
@@ -385,6 +454,67 @@ def iterdicts(dicts, header, sample, missing):
     # generate data rows
     for o in it:
         yield tuple(o.get(f, missing) for f in header)
+
+
+def _normalize_paths(paths):
+    # accept a mapping of column -> path segments, or an iterable of
+    # (column, path) pairs; a bare segment is treated as a single-step path
+    if hasattr(paths, 'items'):
+        items = paths.items()
+    else:
+        items = paths
+    normalized = list()
+    for column, path in items:
+        if isinstance(path, string_types) or not hasattr(path, '__iter__'):
+            path = (path,)
+        else:
+            path = tuple(path)
+        normalized.append((column, path))
+    return tuple(normalized)
+
+
+def _resolve_path(obj, path, missing, on_scalar, on_index, index):
+    current = obj
+    for segment in path:
+        if isinstance(current, dict):
+            if segment in current:
+                current = current[segment]
+            else:
+                return missing
+        elif isinstance(current, (list, tuple)):
+            if isinstance(segment, int) and not isinstance(segment, bool):
+                if 0 <= segment < len(current):
+                    current = current[segment]
+                elif on_index == 'missing':
+                    return missing
+                else:
+                    raise ValueError(
+                        'object %d: array index %r out of bounds for '
+                        'array of length %d' % (index, segment, len(current)))
+            elif on_scalar == 'missing':
+                return missing
+            else:
+                raise ValueError(
+                    'object %d: cannot index array with path segment %r'
+                    % (index, segment))
+        elif on_scalar == 'missing':
+            return missing
+        else:
+            raise ValueError(
+                'object %d: cannot descend into scalar value %r with path '
+                'segment %r' % (index, current, segment))
+    return current
+
+
+def _project_row(obj, pathspec, missing, on_scalar, on_index, index):
+    return tuple(_resolve_path(obj, path, missing, on_scalar, on_index, index)
+                 for _, path in pathspec)
+
+
+def iterprojected(dicts, pathspec, missing, on_scalar, on_index):
+    yield tuple(column for column, _ in pathspec)
+    for index, o in enumerate(dicts):
+        yield _project_row(o, pathspec, missing, on_scalar, on_index, index)
 
 
 def tojson(table, source=None, prefix=None, suffix=None, *args, **kwargs):
