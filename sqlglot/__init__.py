@@ -14,6 +14,12 @@ import logging
 import typing as t
 
 from sqlglot import expressions as exp
+from sqlglot.analyzer import (
+    AnalysisStatus as AnalysisStatus,
+    Catalog as Catalog,
+    StatementResult as StatementResult,
+    analyze_script as analyze_script,
+)
 from sqlglot.dialects.dialect import Dialect as Dialect, Dialects as Dialects
 from sqlglot.diff import diff as diff
 from sqlglot.errors import (
