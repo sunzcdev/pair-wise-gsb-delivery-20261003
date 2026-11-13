@@ -254,6 +254,20 @@ class TestDate(unittest.TestCase):
             None
         ))
 
+    def test_cast_relative_with_source_time(self):
+        date_type = Date(source_time=datetime.datetime(2024, 12, 31, 18, 30))
+
+        self.assertEqual(date_type.cast('yesterday'), datetime.date(2024, 12, 30))
+        self.assertEqual(date_type.cast('today'), datetime.date(2024, 12, 31))
+        self.assertEqual(date_type.cast('next monday'), datetime.date(2025, 1, 6))
+        self.assertEqual(date_type.cast('3/1/1994'), datetime.date(1994, 3, 1))
+
+    def test_cast_relative_with_source_time_across_month(self):
+        date_type = Date(source_time=datetime.datetime(2024, 1, 31))
+
+        self.assertEqual(date_type.cast('yesterday'), datetime.date(2024, 1, 30))
+        self.assertEqual(date_type.cast('next monday'), datetime.date(2024, 2, 5))
+
     def test_cast_format(self):
         date_type = Date(date_format='%m-%d-%Y')
 
@@ -309,6 +323,7 @@ class TestDate(unittest.TestCase):
         from_pickle = pickle.loads(pickle.dumps(self.type))
         self.assertEqual(from_pickle.date_format, self.type.date_format)
         self.assertEqual(from_pickle.locale, self.type.locale)
+        self.assertEqual(from_pickle.source_time, self.type.source_time)
         self.assertIsInstance(from_pickle._constants, parsedatetime.Constants)
         self.assertIsInstance(from_pickle._parser, parsedatetime.Calendar)
 
@@ -384,6 +399,28 @@ class TestDateTime(unittest.TestCase):
             None
         ))
 
+    def test_cast_relative_with_source_time(self):
+        datetime_type = DateTime(source_time=datetime.datetime(2024, 12, 31, 23, 30))
+
+        self.assertEqual(datetime_type.cast('yesterday'), datetime.datetime(2024, 12, 30))
+        self.assertEqual(datetime_type.cast('today'), datetime.datetime(2024, 12, 31))
+        self.assertEqual(datetime_type.cast('next monday'), datetime.datetime(2025, 1, 6))
+        self.assertEqual(datetime_type.cast('3/1/1994 12:30 PM'), datetime.datetime(1994, 3, 1, 12, 30))
+
+    def test_cast_relative_with_source_time_across_month(self):
+        datetime_type = DateTime(source_time=datetime.datetime(2024, 1, 31))
+
+        self.assertEqual(datetime_type.cast('yesterday'), datetime.datetime(2024, 1, 30))
+        self.assertEqual(datetime_type.cast('next monday'), datetime.datetime(2024, 2, 5))
+
+    def test_cast_relative_with_source_time_uses_local_date(self):
+        tzinfo = ZoneInfo('America/Los_Angeles')
+        source_time = datetime.datetime(2025, 1, 1, 7, 30, tzinfo=datetime.timezone.utc)
+        datetime_type = DateTime(timezone=tzinfo, source_time=source_time)
+
+        self.assertEqual(datetime_type.cast('today').date(), datetime.date(2024, 12, 31))
+        self.assertEqual(datetime_type.cast('yesterday').date(), datetime.date(2024, 12, 30))
+
     def test_cast_format(self):
         datetime_type = DateTime(datetime_format='%m-%d-%Y %I:%M %p')
 
@@ -448,9 +485,19 @@ class TestDateTime(unittest.TestCase):
         self.assertEqual(from_pickle.datetime_format, self.type.datetime_format)
         self.assertEqual(from_pickle.timezone, self.type.timezone)
         self.assertEqual(from_pickle.locale, self.type.locale)
+        self.assertEqual(from_pickle.source_time, self.type.source_time)
         self.assertEqual(from_pickle._source_time, self.type._source_time)
         self.assertIsInstance(from_pickle._constants, parsedatetime.Constants)
         self.assertIsInstance(from_pickle._parser, parsedatetime.Calendar)
+
+    def test_pickle_preserves_source_time(self):
+        source_time = datetime.datetime(2024, 12, 31)
+        datetime_type = DateTime(source_time=source_time)
+        from_pickle = pickle.loads(pickle.dumps(datetime_type))
+
+        self.assertEqual(from_pickle.source_time, source_time)
+        self.assertEqual(from_pickle._source_time, source_time)
+        self.assertEqual(from_pickle.cast('yesterday'), datetime.datetime(2024, 12, 30))
 
 
 class TestTimeDelta(unittest.TestCase):

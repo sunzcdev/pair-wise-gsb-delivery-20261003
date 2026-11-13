@@ -19,12 +19,22 @@ class Date(DataType):
     :param locale:
         A locale specification such as :code:`en_US` or :code:`de_DE` to use
         for parsing formatted dates.
+    :param source_time:
+        An optional reference date or datetime to use when interpreting
+        relative dates such as "yesterday" or "next Monday". If not specified,
+        the historical behavior of using the earliest possible date is
+        preserved.
     """
-    def __init__(self, date_format=None, locale=None, **kwargs):
+    def __init__(self, date_format=None, locale=None, source_time=None, reference_time=None, **kwargs):
+        if source_time is None:
+            source_time = reference_time
+
         super().__init__(**kwargs)
 
         self.date_format = date_format
         self.locale = locale
+        self.source_time = source_time
+        self._source_time = source_time
 
         self._constants = parsedatetime.Constants(localeID=self.locale)
         self._parser = parsedatetime.Calendar(constants=self._constants, version=parsedatetime.VERSION_CONTEXT_STYLE)
@@ -46,12 +56,19 @@ class Date(DataType):
         of the parsedatetime Calendar class.
         """
         self.__dict__.update(ndict)
+        if 'source_time' not in self.__dict__:
+            self.source_time = None
+        if '_source_time' not in self.__dict__:
+            self._source_time = None
         self._constants = parsedatetime.Constants(localeID=self.locale)
         self._parser = parsedatetime.Calendar(constants=self._constants, version=parsedatetime.VERSION_CONTEXT_STYLE)
 
-    def cast(self, d):
+    def cast(self, d, source_time=None, reference_time=None):
         """
         Cast a single value to a :class:`datetime.date`.
+
+        A reference date or datetime may be passed to override the value
+        configured on this instance for relative dates.
 
         If both `date_format` and `locale` have been specified
         in the `agate.Date` instance, the `cast()` function
@@ -85,8 +102,26 @@ class Date(DataType):
 
             return dt.date()
 
+        if source_time is None:
+            source_time = reference_time
+
+        if source_time is None:
+            source_time = self.source_time
+
+        if source_time is None:
+            source_time = self._source_time
+
+        if source_time is None:
+            source_time = ZERO_DT
+        elif isinstance(source_time, datetime):
+            pass
+        elif isinstance(source_time, date):
+            source_time = datetime.combine(source_time, time.min)
+        else:
+            raise TypeError('source_time must be a date or datetime.')
+
         try:
-            (value, ctx, _, _, matched_text), = self._parser.nlp(d, sourceTime=ZERO_DT)
+            (value, ctx, _, _, matched_text), = self._parser.nlp(d, sourceTime=source_time)
         except (TypeError, ValueError, OverflowError):
             raise CastError('Value "%s" does not match date format.' % d)
         else:

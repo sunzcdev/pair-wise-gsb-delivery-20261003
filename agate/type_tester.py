@@ -55,37 +55,79 @@ class TypeTester:
     :param null_values:
         If :code:`types` is :code:`None`, a sequence of values which should be
         cast to :code:`None` when encountered by the default data types.
+    :param source_time:
+        An optional reference date or datetime to use when interpreting
+        relative dates and times. It is applied to both type inference and the
+        resulting data types, so all values in a batch use the same reference.
     """
-    def __init__(self, force={}, limit=None, types=None, null_values=DEFAULT_NULL_VALUES):
+    def __init__(self, force={}, limit=None, types=None, null_values=DEFAULT_NULL_VALUES, source_time=None,
+                 reference_time=None):
+        if source_time is None:
+            source_time = reference_time
+
         self._force = force
         self._limit = limit
+        self.source_time = source_time
+        self._source_time = source_time
+        self._null_values = null_values
 
         if types:
-            self._possible_types = types
+            self._possible_types = [
+                self._with_source_time(column_type, source_time) for column_type in types
+            ]
         else:
             # In order of preference
             self._possible_types = [
                 Boolean(null_values=null_values),
                 Number(null_values=null_values),
                 TimeDelta(null_values=null_values),
-                Date(null_values=null_values),
-                DateTime(null_values=null_values),
+                Date(null_values=null_values, source_time=source_time),
+                DateTime(null_values=null_values, source_time=source_time),
                 Text(null_values=null_values)
             ]
 
-    def run(self, rows, column_names):
+    def _with_source_time(self, column_type, source_time):
+        if source_time is None or not isinstance(column_type, (Date, DateTime)):
+            return column_type
+
+        column_type = copy(column_type)
+        column_type.source_time = source_time
+        column_type._source_time = source_time
+        return column_type
+
+    def run(self, rows, column_names, source_time=None, reference_time=None):
         """
         Apply type inference to the provided data and return an array of
         column types.
 
         :param rows:
             The data as a sequence of any sequences: tuples, lists, etc.
+        :param source_time:
+            An optional reference date or datetime for this batch. Overrides
+            the value passed to the constructor without changing the tester.
         """
+        if source_time is None:
+            source_time = reference_time
+
+        if source_time is None:
+            source_time = self.source_time
+
+        if source_time is None:
+            source_time = self._source_time
+
+        possible_types = [
+            self._with_source_time(column_type, source_time) for column_type in self._possible_types
+        ]
+        force = {
+            name: self._with_source_time(column_type, source_time)
+            for name, column_type in self._force.items()
+        }
+
         num_columns = len(column_names)
-        hypotheses = [set(self._possible_types) for i in range(num_columns)]
+        hypotheses = [set(possible_types) for i in range(num_columns)]
         force_indices = []
 
-        for name in self._force.keys():
+        for name in force.keys():
             try:
                 force_indices.append(column_names.index(name))
             except ValueError:
@@ -117,13 +159,13 @@ class TypeTester:
 
         for i in range(num_columns):
             if i in force_indices:
-                column_types.append(self._force[column_names[i]])
+                column_types.append(force[column_names[i]])
                 continue
 
             h = hypotheses[i]
 
             # Select in prefer order
-            for t in self._possible_types:
+            for t in possible_types:
                 if t in h:
                     column_types.append(t)
                     break

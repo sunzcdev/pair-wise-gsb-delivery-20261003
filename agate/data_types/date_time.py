@@ -20,18 +20,31 @@ class DateTime(DataType):
     :param locale:
         A locale specification such as :code:`en_US` or :code:`de_DE` to use
         for parsing formatted datetimes.
+    :param source_time:
+        An optional reference date or datetime to use when interpreting
+        relative dates and times such as "yesterday" or "next Monday". If a
+        timezone is specified, an aware source time is converted to that
+        timezone before being interpreted.
     """
-    def __init__(self, datetime_format=None, timezone=None, locale=None, **kwargs):
+    def __init__(self, datetime_format=None, timezone=None, locale=None, source_time=None, reference_time=None,
+                 **kwargs):
+        if source_time is None:
+            source_time = reference_time
+
         super().__init__(**kwargs)
 
         self.datetime_format = datetime_format
         self.timezone = timezone
         self.locale = locale
 
-        now = datetime.datetime.now()
-        self._source_time = datetime.datetime(
-            now.year, now.month, now.day, 0, 0, 0, 0, None
-        )
+        self.source_time = source_time
+        if source_time is None:
+            now = datetime.datetime.now()
+            self._source_time = datetime.datetime(
+                now.year, now.month, now.day, 0, 0, 0, 0, None
+            )
+        else:
+            self._source_time = source_time
         self._constants = parsedatetime.Constants(localeID=self.locale)
         self._parser = parsedatetime.Calendar(constants=self._constants, version=parsedatetime.VERSION_CONTEXT_STYLE)
 
@@ -52,12 +65,17 @@ class DateTime(DataType):
         of the parsedatetime Calendar class.
         """
         self.__dict__.update(ndict)
+        if 'source_time' not in self.__dict__:
+            self.source_time = None
         self._constants = parsedatetime.Constants(localeID=self.locale)
         self._parser = parsedatetime.Calendar(constants=self._constants, version=parsedatetime.VERSION_CONTEXT_STYLE)
 
-    def cast(self, d):
+    def cast(self, d, source_time=None, reference_time=None):
         """
         Cast a single value to a :class:`datetime.datetime`.
+
+        A reference date or datetime may be passed to override the value
+        configured on this instance for relative dates.
 
         If both `date_format` and `locale` have been specified
         in the `agate.DateTime` instance, the `cast()` function
@@ -92,14 +110,16 @@ class DateTime(DataType):
 
             return dt
 
+        source_time = self._get_source_time(source_time, reference_time)
+
         try:
-            (_, _, _, _, matched_text), = self._parser.nlp(d, sourceTime=self._source_time)
+            (_, _, _, _, matched_text), = self._parser.nlp(d, sourceTime=source_time)
         except Exception:
             matched_text = None
         else:
             value, ctx = self._parser.parseDT(
                 d,
-                sourceTime=self._source_time,
+                sourceTime=source_time,
                 tzinfo=self.timezone
             )
 
@@ -116,6 +136,27 @@ class DateTime(DataType):
             pass
 
         raise CastError('Can not parse value "%s" as datetime.' % d)
+
+    def _get_source_time(self, source_time=None, reference_time=None):
+        if source_time is None:
+            source_time = reference_time
+
+        if source_time is None:
+            source_time = self.source_time
+
+        if source_time is None:
+            return self._source_time
+
+        if isinstance(source_time, datetime.datetime):
+            if self.timezone is not None and source_time.tzinfo is not None:
+                source_time = source_time.astimezone(self.timezone)
+
+            return source_time
+
+        if isinstance(source_time, datetime.date):
+            return datetime.datetime.combine(source_time, datetime.time.min)
+
+        raise TypeError('source_time must be a date or datetime.')
 
     def csvify(self, d):
         if d is None:

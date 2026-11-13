@@ -1,3 +1,4 @@
+import datetime
 import unittest
 
 from agate.data_types import Boolean, Date, DateTime, Number, Text, TimeDelta
@@ -213,3 +214,38 @@ class TestTypeTester(unittest.TestCase):
 
         self.assertIsInstance(inferred[0], Number)
         self.assertEqual(str(inferred[0].locale), 'de_DE')
+
+    def test_source_time(self):
+        tester = TypeTester(source_time=datetime.datetime(2024, 12, 31, 23, 30))
+        rows = [
+            ('yesterday',),
+            ('next monday',),
+        ]
+
+        inferred = tester.run(rows, ['one'])
+
+        self.assertIsInstance(inferred[0], Date)
+        self.assertEqual(inferred[0].cast('yesterday'), datetime.date(2024, 12, 30))
+        self.assertEqual(inferred[0].cast('next monday'), datetime.date(2025, 1, 6))
+
+    def test_source_time_is_independent_per_run(self):
+        tester = TypeTester()
+        rows = [
+            ('yesterday',),
+            ('next monday',),
+        ]
+
+        first = tester.run(rows, ['one'], source_time=datetime.datetime(2024, 1, 31))
+        second = tester.run(rows, ['one'], source_time=datetime.datetime(2024, 2, 1))
+        third = tester.run(rows, ['one'], source_time=datetime.datetime(2024, 12, 31))
+        fourth = tester.run(rows, ['one'], source_time=datetime.datetime(2025, 1, 1))
+
+        self.assertEqual(first[0].cast('yesterday'), datetime.date(2024, 1, 30))
+        self.assertEqual(first[0].cast('next monday'), datetime.date(2024, 2, 5))
+        self.assertEqual(second[0].cast('yesterday'), datetime.date(2024, 1, 31))
+        self.assertEqual(second[0].cast('next monday'), datetime.date(2024, 2, 5))
+        self.assertEqual(third[0].cast('yesterday'), datetime.date(2024, 12, 30))
+        self.assertEqual(third[0].cast('next monday'), datetime.date(2025, 1, 6))
+        self.assertEqual(fourth[0].cast('yesterday'), datetime.date(2024, 12, 31))
+        self.assertEqual(fourth[0].cast('next monday'), datetime.date(2025, 1, 6))
+        self.assertIsNone(tester._source_time)
