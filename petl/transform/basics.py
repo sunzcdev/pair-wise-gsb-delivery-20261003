@@ -391,6 +391,185 @@ def itercat(sources, missing, header):
             yield tuple(outrow)
 
 
+def catcontract(*tables, **kwargs):
+    """
+    Concatenate tables against a fixed column contract, given by the
+    `header` keyword argument. Unlike :func:`cat`, the output fields are
+    always exactly the fields given in `header`, in the given order, so the
+    output is safe to pass to a fixed downstream interface. E.g.::
+
+        >>> import petl as etl
+        >>> table1 = [['foo', 'bar'],
+        ...           [1, 'A'],
+        ...           [2, 'B']]
+        >>> table2 = [['baz', 'bar'],
+        ...           [True, 'C'],
+        ...           [False, 'D']]
+        >>> table3 = etl.catcontract(table1, table2,
+        ...                          header=['foo', 'bar', 'baz'])
+        >>> table3
+        +------+-----+-------+
+        | foo  | bar | baz   |
+        +======+=====+=======+
+        |    1 | 'A' | None  |
+        +------+-----+-------+
+        |    2 | 'B' | None  |
+        +------+-----+-------+
+        | None | 'C' | True  |
+        +------+-----+-------+
+        | None | 'D' | False |
+        +------+-----+-------+
+
+    The `aliases` keyword argument accepts a dictionary mapping source
+    field names to target field names, so tables using different names for
+    the same logical field can be concatenated, e.g.::
+
+        >>> table4 = [['FOO', 'bar'],
+        ...           [3, 'E']]
+        >>> table5 = etl.catcontract(table1, table4,
+        ...                          header=['foo', 'bar'],
+        ...                          aliases={'FOO': 'foo'})
+        >>> table5
+        +-----+-----+
+        | foo | bar |
+        +=====+=====+
+        |   1 | 'A' |
+        +-----+-----+
+        |   2 | 'B' |
+        +-----+-----+
+        |   3 | 'E' |
+        +-----+-----+
+
+    Fields found in an input table that do not map to any target field are
+    handled according to the `unknown` keyword argument. By default
+    (`unknown='reject'`) a `ValueError` is raised, reporting the index of
+    the offending input table and the unknown fields. With
+    `unknown='collect'` the unknown fields and their values are collected
+    into a dictionary, placed in the column named by the `extras_field`
+    keyword argument (default `'extras'`), which is appended to the output
+    header if not already present in `header`, e.g.::
+
+        >>> table6 = etl.catcontract(table1, table2,
+        ...                          header=['foo', 'bar'],
+        ...                          unknown='collect')
+        >>> table6
+        +------+-----+----------------+
+        | foo  | bar | extras         |
+        +======+=====+================+
+        |    1 | 'A' | None           |
+        +------+-----+----------------+
+        |    2 | 'B' | None           |
+        +------+-----+----------------+
+        | None | 'C' | {'baz': True}  |
+        +------+-----+----------------+
+        | None | 'D' | {'baz': False} |
+        +------+-----+----------------+
+
+    The header of each input table is validated before any of its data rows
+    are emitted. If two source fields map to the same target field (either
+    directly or via `aliases`), a `ValueError` is raised reporting the
+    index of the input table and the conflicting fields, rather than
+    silently overwriting one value with the other.
+
+    Target fields missing from an input table are padded with the value of
+    the `missing` keyword argument (default `None`). Note that explicit
+    `None` values in the input data are always preserved as-is.
+
+    The input tables may be one-shot iterators; the header row is peeked
+    without discarding any data rows. The output header is always emitted,
+    even if none of the input tables yield any rows.
+
+    """
+
+    return CatContractView(tables, **kwargs)
+
+
+Table.catcontract = catcontract
+
+
+class CatContractView(Table):
+
+    def __init__(self, sources, header=None, aliases=None, unknown='reject',
+                 extras_field='extras', missing=None):
+        self.sources = sources
+        self._header = header
+        self._aliases = aliases
+        self._unknown = unknown
+        self._extras_field = extras_field
+        self._missing = missing
+
+    def __iter__(self):
+        return itercatcontract(self.sources, self._header, self._aliases,
+                               self._unknown, self._extras_field,
+                               self._missing)
+
+
+def itercatcontract(sources, header, aliases, unknown, extras_field, missing):
+    if header is None:
+        raise ValueError('catcontract(): a header of target fields is '
+                         'required')
+    if unknown not in ('reject', 'collect'):
+        raise ValueError("catcontract(): unknown must be 'reject' or "
+                         "'collect', got %r" % (unknown,))
+    aliases = dict(aliases) if aliases else {}
+    outhdr = list(header)
+    bad_aliases = dict((k, v) for k, v in aliases.items() if v not in outhdr)
+    if bad_aliases:
+        raise ValueError('catcontract(): alias targets not present in the '
+                         'target header: %r' % (bad_aliases,))
+    collect = unknown == 'collect'
+    if collect and extras_field not in outhdr:
+        outhdr.append(extras_field)
+    outpos = dict((f, i) for i, f in enumerate(outhdr))
+    yield tuple(outhdr)
+
+    for index, source in enumerate(sources):
+        it = iter(source)
+        try:
+            hdr = list(next(it))
+        except StopIteration:
+            # no header row, no data
+            continue
+
+        # map each source field to its target field
+        targets = [aliases.get(f, f) for f in hdr]
+
+        # reject two source fields mapping to the same target field
+        seen = dict()
+        for f, t in zip(hdr, targets):
+            if t in outpos:
+                if t in seen:
+                    raise ValueError(
+                        'catcontract(): input table at index %s: source '
+                        'fields %r and %r both map to target field %r'
+                        % (index, seen[t], f, t))
+                seen[t] = f
+
+        # handle fields not present in the target header
+        positions = [(i, outpos[t])
+                     for i, t in enumerate(targets) if t in outpos]
+        extra_positions = [(i, f)
+                           for i, (f, t) in enumerate(zip(hdr, targets))
+                           if t not in outpos]
+        if extra_positions and not collect:
+            raise ValueError(
+                'catcontract(): input table at index %s: unknown fields %r '
+                'not present in the target header'
+                % (index, [f for _, f in extra_positions]))
+
+        # now construct and yield the data rows
+        for row in it:
+            outrow = [missing] * len(outhdr)
+            for i, j in positions:
+                if i < len(row):
+                    outrow[j] = row[i]
+            if collect and extra_positions:
+                extras = dict((f, row[i] if i < len(row) else missing)
+                              for i, f in extra_positions)
+                outrow[outpos[extras_field]] = extras
+            yield tuple(outrow)
+
+
 def stack(*tables, **kwargs):
     """Concatenate tables, without trying to match headers. E.g.::
 

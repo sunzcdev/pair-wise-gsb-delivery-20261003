@@ -7,7 +7,7 @@ from petl.test.helpers import ieq
 from petl.util import expr, empty, coalesce
 from petl.transform.basics import cut, cat, addfield, rowslice, head, tail, \
     cutout, skipcomments, annex, addrownumbers, addcolumn, \
-    addfieldusingcontext, movefield, stack, addfields
+    addfieldusingcontext, movefield, stack, addfields, catcontract
 
 
 def test_cut():
@@ -255,6 +255,170 @@ def test_cat_dupfields():
               (3, 3, None),
               (4, 4, True),
               (5, 5, False))
+    ieq(expect, actual)
+
+
+def test_catcontract():
+    table1 = (('foo', 'bar'),
+              (1, 'A'),
+              (2, 'B'))
+    table2 = (('bar', 'baz'),
+              ('C', True),
+              ('D', False))
+
+    # fixed target field order, missing fields padded
+    actual = catcontract(table1, table2, header=['foo', 'bar', 'baz'])
+    expect = (('foo', 'bar', 'baz'),
+              (1, 'A', None),
+              (2, 'B', None),
+              (None, 'C', True),
+              (None, 'D', False))
+    ieq(expect, actual)
+
+    # custom missing value
+    actual = catcontract(table1, table2, header=['foo', 'bar', 'baz'],
+                         missing='?')
+    expect = (('foo', 'bar', 'baz'),
+              (1, 'A', '?'),
+              (2, 'B', '?'),
+              ('?', 'C', True),
+              ('?', 'D', False))
+    ieq(expect, actual)
+
+    # explicit None values are preserved
+    table3 = (('foo', 'bar'),
+              (None, 'A'))
+    actual = catcontract(table3, header=['foo', 'bar', 'baz'])
+    expect = (('foo', 'bar', 'baz'),
+              (None, 'A', None))
+    ieq(expect, actual)
+
+    # aliases map source fields to target fields
+    table4 = (('FOO', 'bar'),
+              (3, 'E'))
+    actual = catcontract(table1, table4, header=['foo', 'bar'],
+                         aliases={'FOO': 'foo'})
+    expect = (('foo', 'bar'),
+              (1, 'A'),
+              (2, 'B'),
+              (3, 'E'))
+    ieq(expect, actual)
+
+    # alias targets must be in the target header
+    with pytest.raises(ValueError):
+        list(catcontract(table1, header=['foo', 'bar'],
+                         aliases={'foo': 'quux'}))
+
+    # header is required
+    with pytest.raises(ValueError):
+        list(catcontract(table1))
+
+
+def test_catcontract_short_rows():
+    table1 = (('foo', 'bar', 'baz'),
+              (1, 'A'),
+              (2,))
+    actual = catcontract(table1, header=['foo', 'bar', 'baz'])
+    expect = (('foo', 'bar', 'baz'),
+              (1, 'A', None),
+              (2, None, None))
+    ieq(expect, actual)
+
+
+def test_catcontract_conflicting_fields():
+    # two source fields mapping to the same target field are rejected
+    table1 = (('foo', 'FOO'),
+              (1, 2))
+    with pytest.raises(ValueError) as excinfo:
+        list(catcontract(table1, header=['foo'],
+                         aliases={'FOO': 'foo'}))
+    assert 'index 0' in str(excinfo.value)
+    assert 'FOO' in str(excinfo.value)
+    assert 'foo' in str(excinfo.value)
+
+    # duplicates in the source header itself are also rejected
+    table2 = (('foo', 'foo'),
+              (1, 2))
+    with pytest.raises(ValueError) as excinfo:
+        list(catcontract(table2, header=['foo']))
+    assert 'index 0' in str(excinfo.value)
+
+    # error reports the input table index
+    table3 = (('foo',), (1,))
+    with pytest.raises(ValueError) as excinfo:
+        list(catcontract(table3, table1, header=['foo'],
+                         aliases={'FOO': 'foo'}))
+    assert 'index 1' in str(excinfo.value)
+
+
+def test_catcontract_unknown_reject():
+    table1 = (('foo', 'bar'),
+              (1, 'A'))
+    table2 = (('bar', 'baz'),
+              ('C', True))
+    with pytest.raises(ValueError) as excinfo:
+        list(catcontract(table1, table2, header=['foo', 'bar']))
+    assert 'index 1' in str(excinfo.value)
+    assert 'baz' in str(excinfo.value)
+
+    # invalid unknown policy
+    with pytest.raises(ValueError):
+        list(catcontract(table1, header=['foo'], unknown='bogus'))
+
+
+def test_catcontract_unknown_collect():
+    table1 = (('foo', 'bar'),
+              (1, 'A'),
+              (2, 'B'))
+    table2 = (('bar', 'baz'),
+              ('C', True),
+              ('D', False))
+    actual = catcontract(table1, table2, header=['foo', 'bar'],
+                         unknown='collect')
+    expect = (('foo', 'bar', 'extras'),
+              (1, 'A', None),
+              (2, 'B', None),
+              (None, 'C', {'baz': True}),
+              (None, 'D', {'baz': False}))
+    ieq(expect, actual)
+
+    # custom extras field name, already present in the header
+    actual = catcontract(table1, table2, header=['foo', 'bar', 'extra'],
+                         unknown='collect', extras_field='extra')
+    expect = (('foo', 'bar', 'extra'),
+              (1, 'A', None),
+              (2, 'B', None),
+              (None, 'C', {'baz': True}),
+              (None, 'D', {'baz': False}))
+    ieq(expect, actual)
+
+
+def test_catcontract_iterators():
+    # one-shot iterators must not lose the first data row
+    table1 = iter([['foo', 'bar'], [1, 'A'], [2, 'B']])
+    table2 = iter([['bar', 'baz'], ['C', True]])
+    actual = catcontract(table1, table2, header=['foo', 'bar', 'baz'])
+    expect = (('foo', 'bar', 'baz'),
+              (1, 'A', None),
+              (2, 'B', None),
+              (None, 'C', True))
+    ieq(expect, actual)
+
+
+def test_catcontract_empty():
+    # target header is complete even if no input yields any rows
+    actual = catcontract(empty(), empty(), header=['foo', 'bar'])
+    expect = (('foo', 'bar'),)
+    ieq(expect, actual)
+
+    actual = catcontract(header=['foo', 'bar'])
+    expect = (('foo', 'bar'),)
+    ieq(expect, actual)
+
+    # header-only tables contribute no data rows
+    table1 = (('foo', 'bar'),)
+    actual = catcontract(table1, header=['foo', 'bar', 'baz'])
+    expect = (('foo', 'bar', 'baz'),)
     ieq(expect, actual)
 
 

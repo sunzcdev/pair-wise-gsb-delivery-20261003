@@ -1,8 +1,8 @@
 from __future__ import absolute_import, print_function, division
 
-from petl.transform.basics import cut, cutout, movefield, cat, annex, \
-    addfield, addfieldusingcontext, addrownumbers, addcolumn, rowslice, head, \
-    tail, skipcomments, stack, addfields
+from petl.transform.basics import cut, cutout, movefield, cat, catcontract, \
+    annex, addfield, addfieldusingcontext, addrownumbers, addcolumn, \
+    rowslice, head, tail, skipcomments, stack, addfields
 
 from petl.transform.headers import rename, setheader, extendheader, \
     pushheader, skip, skiplast, prefixheader, suffixheader, sortheader
