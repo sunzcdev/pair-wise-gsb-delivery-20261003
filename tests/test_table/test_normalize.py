@@ -63,6 +63,67 @@ class TestNormalize(AgateTestCase):
         self.assertColumnNames(normalized_table, ['one', 'property', 'value'])
         self.assertColumnTypes(normalized_table, [Number, Text, Text])
 
+    def test_normalize_type_tester_not_mutated(self):
+        table = Table(self.rows, self.column_names, self.column_types)
+
+        type_tester = TypeTester(force={'value': Text()})
+        original_force = dict(type_tester._force)
+
+        table.normalize('one', 'three', column_types=type_tester)
+
+        self.assertEqual(type_tester._force, original_force)
+        self.assertNotIn('one', type_tester._force)
+
+    def test_normalize_type_tester_reused_across_tables(self):
+        number_table = Table(self.rows, self.column_names, self.column_types)
+        text_table = Table(
+            (
+                ('1', 'c', '4', 'a'),
+                ('2', 'e', '3', 'b'),
+                (None, 'g', '2', 'c')
+            ),
+            self.column_names,
+            [self.text_type, self.text_type, self.text_type, self.text_type]
+        )
+
+        tester = TypeTester()
+
+        shared_number = number_table.normalize('one', 'three', column_types=tester)
+        shared_text = text_table.normalize('one', 'three', column_types=tester)
+
+        fresh_number = number_table.normalize('one', 'three', column_types=TypeTester())
+        fresh_text = text_table.normalize('one', 'three', column_types=TypeTester())
+
+        self.assertEqual(tester._force, {})
+        self.assertColumnTypes(shared_number, [type(t) for t in fresh_number.column_types])
+        self.assertColumnTypes(shared_text, [type(t) for t in fresh_text.column_types])
+        self.assertIsInstance(shared_number.column_types[0], Number)
+        self.assertIsInstance(shared_text.column_types[0], Text)
+
+    def test_normalize_type_tester_force_takes_priority(self):
+        table = Table(self.rows, self.column_names, self.column_types)
+
+        type_tester = TypeTester(force={'one': Text()})
+        original_force = type_tester._force
+
+        normalized_table = table.normalize('one', 'three', column_types=type_tester)
+
+        # The caller's explicit force wins over the key type inferred internally.
+        self.assertColumnTypes(normalized_table, [Text, Text, Number])
+        self.assertIs(type_tester._force, original_force)
+        self.assertIsInstance(type_tester._force['one'], Text)
+
+    def test_normalize_type_tester_empty_table_restored(self):
+        table = Table((), self.column_names, self.column_types)
+
+        type_tester = TypeTester(force={'value': Text()})
+        original_force = dict(type_tester._force)
+
+        table.normalize('one', 'three', column_types=type_tester)
+
+        self.assertEqual(type_tester._force, original_force)
+        self.assertNotIn('one', type_tester._force)
+
     def test_normalize_multiple_fields(self):
         table = Table(self.rows, self.column_names, self.column_types)
 

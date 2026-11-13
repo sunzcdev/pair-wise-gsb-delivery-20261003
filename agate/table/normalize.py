@@ -83,11 +83,18 @@ def normalize(self, key, properties, property_column='property', value_column='v
 
     if column_types is None or isinstance(column_types, TypeTester):
         tester = TypeTester() if column_types is None else column_types
+        original_force = tester._force
         force_update = dict(zip(key, key_column_types))
-        force_update.update(tester._force)
-        tester._force = force_update
+        force_update.update(original_force)
 
-        new_column_types = tester.run(new_rows, new_column_names)
+        # The inferred key types belong to this operation only. Temporarily
+        # apply them on top of the caller's force mapping, then restore it so a
+        # TypeTester reused on another table never sees this table's keys.
+        tester._force = force_update
+        try:
+            new_column_types = tester.run(new_rows, new_column_names)
+        finally:
+            tester._force = original_force
     else:
         new_column_types = key_column_types + list(column_types)
 
